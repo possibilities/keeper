@@ -47,5 +47,5 @@ Per test:
 - [ ] Test runs green locally with `bun test --isolate test/integration.test.ts`
 
 ## Done summary
-
+Added test/integration.test.ts: an end-to-end smoke that spawns the daemon, pipes a SessionStart/UPS/Stop/SessionEnd sequence through the events-writer hook, and polls the jobs projection to verify the wake-worker→reducer path fires (state→ended, mode→plan, cursor caught up, clean exit 0 on SIGTERM).
 ## Evidence
