@@ -53,5 +53,5 @@ Handle `{ type: "shutdown" }` from parent → set `shutdown` flag, exit the loop
 - [ ] Responds to `{ type: "shutdown" }` by closing db and exiting cleanly
 
 ## Done summary
-
+Added src/wake-worker.ts: a Bun Worker that opens its own read-only bun:sqlite connection and polls PRAGMA data_version every 50ms in autocommit, posting contentless { kind: wake } messages on any change and shutting down cleanly on { type: shutdown }. workerData carries only the dbPath. Added round-trip unit tests.
 ## Evidence
