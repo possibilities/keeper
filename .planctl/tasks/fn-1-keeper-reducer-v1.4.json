@@ -1,0 +1,12 @@
+{
+  "created_at": "2026-05-19T20:15:06Z",
+  "depends_on": [
+    "fn-1-keeper-reducer-v1.2"
+  ],
+  "epic": "fn-1-keeper-reducer-v1",
+  "id": "fn-1-keeper-reducer-v1.4",
+  "priority": null,
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Reducer state machine",
+  "updated_at": "2026-05-19T20:19:57Z"
+}

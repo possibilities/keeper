@@ -1,0 +1,13 @@
+{
+  "created_at": "2026-05-19T20:15:09Z",
+  "depends_on": [
+    "fn-1-keeper-reducer-v1.3",
+    "fn-1-keeper-reducer-v1.6"
+  ],
+  "epic": "fn-1-keeper-reducer-v1",
+  "id": "fn-1-keeper-reducer-v1.7",
+  "priority": null,
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "End to end integration test",
+  "updated_at": "2026-05-19T20:20:05Z"
+}

@@ -1,0 +1,27 @@
+{
+  "auditor_done_at": null,
+  "branch_name": "fn-1-keeper-reducer-v1",
+  "bundles": [
+    "sketch/keeper-reducer-v1"
+  ],
+  "close_reason": null,
+  "closer_done_at": null,
+  "created_at": "2026-05-19T20:14:56Z",
+  "depends_on_epics": [],
+  "epic_review_status": "unknown",
+  "epic_reviewed_at": null,
+  "id": "fn-1-keeper-reducer-v1",
+  "last_validated_at": "2026-05-19T20:21:12Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Keeper reducer v1",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-19T20:21:12Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null
+}
