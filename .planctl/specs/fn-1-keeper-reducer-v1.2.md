@@ -46,5 +46,5 @@
 - [ ] Unit test asserts schema shape on a tmp DB
 
 ## Done summary
-
+Added openDb() + Stmts + shared types: WAL/busy_timeout/FK PRAGMAs per connection, idempotent schema bootstrap for events/jobs/reducer_state/meta, KEEPER_DB env override, readonly flag, 9-test schema-shape suite.
 ## Evidence
