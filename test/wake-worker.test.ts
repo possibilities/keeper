@@ -46,9 +46,11 @@ test("watchLoop posts a wake when another connection commits", async () => {
   // A SEPARATE writer connection commits — data_version only moves for the
   // reader when a different connection writes.
   const writer = openDb(dbPath).db;
-  writer.exec(
-    "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (1, 's', 'Stop', 'lifecycle', '{}')",
-  );
+  writer
+    .query(
+      "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (1, 's', 'Stop', 'lifecycle', '{}')",
+    )
+    .run();
 
   // Give the 25ms poll a few cycles to observe the commit.
   await Bun.sleep(120);
