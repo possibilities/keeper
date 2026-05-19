@@ -1,0 +1,6 @@
+{
+  "name": "keeper",
+  "description": "Write one row per Claude Code hook invocation into keeper.db for the reducer daemon to fold",
+  "version": "0.0.0",
+  "author": {"name": "arthack"}
+}
