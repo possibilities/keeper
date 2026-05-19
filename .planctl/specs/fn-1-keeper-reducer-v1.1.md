@@ -36,5 +36,5 @@ Mirror arthack's canonical Bun TS app shape (see `dashctl/package.json`). Create
 - [ ] `.gitignore` excludes `node_modules/` and local state
 
 ## Done summary
-
+Bootstrapped keeper Bun TypeScript project: package.json with verb-phrase description, strict tsconfig (daemon-only — no DOM/JSX), biome.json, .gitignore. bun install, bun run typecheck, and bun test --isolate all green.
 ## Evidence
