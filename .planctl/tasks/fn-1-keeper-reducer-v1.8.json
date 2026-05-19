@@ -1,4 +1,5 @@
 {
+  "bundles": [],
   "created_at": "2026-05-19T20:15:10Z",
   "depends_on": [
     "fn-1-keeper-reducer-v1.6"
@@ -6,7 +7,12 @@
   "epic": "fn-1-keeper-reducer-v1",
   "id": "fn-1-keeper-reducer-v1.8",
   "priority": null,
+  "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
   "title": "LaunchAgent plist and README",
-  "updated_at": "2026-05-19T20:20:06Z"
+  "updated_at": "2026-05-19T23:50:02Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-19T23:50:02Z"
 }

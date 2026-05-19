@@ -67,5 +67,5 @@ Per the user's locked decision: **no `install` verb.** Treat the plist as a temp
 - [ ] Install steps in README produce a working keeper (manually verified end-to-end on this machine)
 
 ## Done summary
-
+Added README (what keeper is/is-NOT, manual install/uninstall, architecture, inspect), CLAUDE.md codebase map with event-sourcing invariants + DO-NOT list, AGENTS.md symlink to CLAUDE.md, and plist/arthack.keeperd.plist LaunchAgent template (plutil -lint clean).
 ## Evidence
