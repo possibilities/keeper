@@ -64,5 +64,5 @@ After any jobs write: `UPDATE jobs SET last_event_id=?, updated_at=? WHERE job_i
 - [ ] Test suite covers every transition above + idempotency + crash-mid-fold rollback
 
 ## Done summary
-
+Added src/reducer.ts (applyEvent + drain) folding hook events into the jobs projection with exactly-once cursor advance in a single BEGIN IMMEDIATE transaction, plus 31-test suite covering every transition, sticky-ended, idempotency, and crash-mid-fold rollback.
 ## Evidence
