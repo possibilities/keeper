@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for the keeper reducer daemon (keeperd).
+
+  This is a TEMPLATE, not an installed agent: keeper ships no `install` verb.
+  See README.md "Install" for the manual symlink + `launchctl bootstrap` steps.
+
+  Paths are hard-coded absolute because launchd does NOT source your shell rc,
+  so `bun` cannot be found by name. The values below assume:
+    - bun installed via Homebrew on Apple Silicon: /opt/homebrew/bin/bun
+      (Intel Macs: /usr/local/bin/bun — edit ProgramArguments + PATH below)
+    - the repo checked out at /Users/mike/code/keeper
+    - state under /Users/mike/.local/state/keeper
+  Edit these for your own username / arch before bootstrapping.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>arthack.keeperd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/bun</string>
+		<string>run</string>
+		<string>/Users/mike/code/keeper/src/daemon.ts</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+		<key>ThrottleInterval</key>
+		<integer>10</integer>
+	</dict>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/mike/code/keeper</string>
+	<key>StandardOutPath</key>
+	<string>/Users/mike/.local/state/keeper/server.stdout</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/mike/.local/state/keeper/server.stderr</string>
+</dict>
+</plist>
