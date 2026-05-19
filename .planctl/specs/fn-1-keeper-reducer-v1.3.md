@@ -48,5 +48,5 @@
 - [ ] `pid = process.ppid` recorded on every row
 
 ## Done summary
-
+Added keeper plugin manifest, hooks.json registering all 10 v1 hook events, and events-writer.ts that INSERTs one row per hook invocation with all 15 columns populated; always exits 0 with stderr log on failure.
 ## Evidence
