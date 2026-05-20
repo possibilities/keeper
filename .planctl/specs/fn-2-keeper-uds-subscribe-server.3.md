@@ -52,5 +52,5 @@ Add the realtime layer to the server worker built in `.2`: an independent `data_
 - [ ] Tests (writer-commit → single patch via `retryUntil`; no-op tick → no patch; multi-conn fan-out) + `bun run lint` + `bun run typecheck` pass
 
 ## Done summary
-
+Added the realtime layer to the server worker: an autocommit data_version poll loop (pollLoop, ~50ms) that drives a state-based diff (diffTick) — per-connection patch pushes keyed on last_event_id > lastSent, shared union re-read per tick, automatic coalescing, backpressured sockets skipped without stalling fan-out. startServer now exposes a live connection registry the loop iterates.
 ## Evidence
