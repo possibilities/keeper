@@ -11,7 +11,7 @@ import {
   encodeFrame,
   extractLines,
   LineBuffer,
-  MAX_LINE_BYTES,
+  MAX_LINE_LENGTH,
   OversizedLineError,
   type ServerFrame,
 } from "../src/protocol";
@@ -130,17 +130,17 @@ describe("extractLines", () => {
   });
 
   test("throws OversizedLineError when remainder exceeds cap with no newline", () => {
-    const huge = "x".repeat(MAX_LINE_BYTES + 1);
+    const huge = "x".repeat(MAX_LINE_LENGTH + 1);
     expect(() => extractLines(huge, "")).toThrow(OversizedLineError);
   });
 
   test("throws OversizedLineError when a completed line exceeds cap", () => {
-    const huge = `${"x".repeat(MAX_LINE_BYTES + 1)}\n`;
+    const huge = `${"x".repeat(MAX_LINE_LENGTH + 1)}\n`;
     expect(() => extractLines(huge, "")).toThrow(OversizedLineError);
   });
 
   test("accumulated remainder across chunks triggers the cap", () => {
-    const half = "x".repeat(MAX_LINE_BYTES / 2 + 1);
+    const half = "x".repeat(MAX_LINE_LENGTH / 2 + 1);
     const first = extractLines(half, "");
     expect(first.lines).toEqual([]);
     expect(() => extractLines(half, first.remaining)).toThrow(
@@ -159,12 +159,12 @@ describe("LineBuffer", () => {
   test("threads remainder across push calls", () => {
     const buf = new LineBuffer();
     expect(buf.push('{"type":"que')).toEqual([]);
-    expect(buf.pendingBytes()).toBeGreaterThan(0);
+    expect(buf.pendingLength()).toBeGreaterThan(0);
 
     const lines = buf.push('ry","id":"x"}\n');
     expect(lines).toHaveLength(1);
     expect(JSON.parse(lines[0])).toEqual({ type: "query", id: "x" });
-    expect(buf.pendingBytes()).toBe(0);
+    expect(buf.pendingLength()).toBe(0);
   });
 
   test("yields all complete frames in one push", () => {
@@ -179,7 +179,7 @@ describe("LineBuffer", () => {
 
   test("propagates OversizedLineError", () => {
     const buf = new LineBuffer();
-    const huge = "x".repeat(MAX_LINE_BYTES + 1);
+    const huge = "x".repeat(MAX_LINE_LENGTH + 1);
     expect(() => buf.push(huge)).toThrow(OversizedLineError);
   });
 });

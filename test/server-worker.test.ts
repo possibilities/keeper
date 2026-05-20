@@ -88,7 +88,7 @@ function dispatchInit(): ConnState {
     // lines), but the field must exist to satisfy the type.
     buffer: {
       push: () => [],
-      pendingBytes: () => 0,
+      pendingLength: () => 0,
     } as unknown as ConnState["buffer"],
     watched: new Set<string>(),
     lastSent: new Map<string, number>(),

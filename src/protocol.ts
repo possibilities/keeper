@@ -132,12 +132,13 @@ export type Frame = ClientFrame | ServerFrame;
 // ---------------------------------------------------------------------------
 
 /**
- * Maximum size in bytes of a single NDJSON line (a line === a frame). A
- * remainder that grows past this without a `\n` is a protocol error — even on
- * a local socket an unbounded line is a memory-pressure vector. 1 MiB is the
- * same cap used by the reference implementation (theodo-group/debug-that).
+ * Maximum length in characters (UTF-16 code units) of a single NDJSON line (a
+ * line === a frame). A remainder that grows past this without a `\n` is a
+ * protocol error — even on a local socket an unbounded line is a memory-pressure
+ * vector. 1 Mi code units is the same cap used by the reference implementation
+ * (theodo-group/debug-that).
  */
-export const MAX_LINE_BYTES = 1024 * 1024;
+export const MAX_LINE_LENGTH = 1024 * 1024;
 
 /**
  * Encode a frame as a single NDJSON line (trailing `\n` included). The output
@@ -159,7 +160,7 @@ export interface ExtractResult {
 }
 
 /**
- * Error thrown when the accumulated remainder exceeds `MAX_LINE_BYTES`
+ * Error thrown when the accumulated remainder exceeds `MAX_LINE_LENGTH`
  * without producing a newline. The caller should treat this as a fatal
  * protocol error for the connection (close it, optionally send an `error`
  * frame first if the channel is still writable).
@@ -167,7 +168,7 @@ export interface ExtractResult {
 export class OversizedLineError extends Error {
   constructor(public readonly size: number) {
     super(
-      `NDJSON line exceeded ${MAX_LINE_BYTES} bytes (got ${size}); closing connection`,
+      `NDJSON line exceeded ${MAX_LINE_LENGTH} characters (got ${size}); closing connection`,
     );
     this.name = "OversizedLineError";
   }
@@ -177,7 +178,7 @@ export class OversizedLineError extends Error {
  * Split a new chunk into complete NDJSON lines, carrying the partial tail.
  * Strips a trailing `\r` from each line (handles CRLF clients on the off
  * chance one shows up). Throws `OversizedLineError` if the accumulated
- * remainder exceeds `MAX_LINE_BYTES` without a newline.
+ * remainder exceeds `MAX_LINE_LENGTH` without a newline.
  *
  * Usage:
  *   let buf = "";
@@ -196,7 +197,7 @@ export function extractLines(
   // Fast path: no newline in this chunk. Enforce the cap on the carry.
   const firstNl = combined.indexOf("\n");
   if (firstNl === -1) {
-    if (combined.length > MAX_LINE_BYTES) {
+    if (combined.length > MAX_LINE_LENGTH) {
       throw new OversizedLineError(combined.length);
     }
     return { lines: [], remaining: combined };
@@ -211,7 +212,7 @@ export function extractLines(
     if (line.length > 0 && line.charCodeAt(line.length - 1) === 0x0d) {
       line = line.slice(0, -1);
     }
-    if (line.length > MAX_LINE_BYTES) {
+    if (line.length > MAX_LINE_LENGTH) {
       throw new OversizedLineError(line.length);
     }
     lines.push(line);
@@ -220,7 +221,7 @@ export function extractLines(
   }
 
   const remaining = combined.slice(start);
-  if (remaining.length > MAX_LINE_BYTES) {
+  if (remaining.length > MAX_LINE_LENGTH) {
     throw new OversizedLineError(remaining.length);
   }
   return { lines, remaining };
@@ -241,8 +242,8 @@ export class LineBuffer {
     return lines;
   }
 
-  /** Current pending tail size in bytes (UTF-16 code units; fine for the cap check). */
-  pendingBytes(): number {
+  /** Current pending tail length in characters (UTF-16 code units), matching the cap check. */
+  pendingLength(): number {
     return this.remainder.length;
   }
 }
