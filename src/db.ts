@@ -216,27 +216,27 @@ function migrate(db: Database): void {
       "INSERT OR IGNORE INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 0, unixepoch('now', 'subsec'))",
     );
 
-    // Read current schema_version (NULL on first boot) and apply forward-only
-    // ALTER blocks before stamping the new version. v1 has no ALTERs yet —
-    // the slot exists so future tasks add them without rework.
-    const row = db
-      .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-      .get() as { value: string } | null;
-    const current = row ? Number.parseInt(row.value, 10) : 0;
-
-    if (current < 2) {
-      // v1→v2: add the `title` + `title_history` columns to `jobs`. ADD COLUMN
-      // does not rewrite existing rows, so prior `jobs` rows backfill to
-      // `title=NULL` / `title_history='[]'` — matching the zero-event
-      // projection. Column defs match CREATE_JOBS (keep the two in sync).
-      addColumnIfMissing(db, "jobs", "title", "TEXT");
-      addColumnIfMissing(
-        db,
-        "jobs",
-        "title_history",
-        "TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(title_history))",
-      );
-    }
+    // Apply forward-only schema changes, then stamp the new version. These run
+    // on EVERY boot and are NOT gated on the stored schema_version: each step is
+    // idempotent (addColumnIfMissing reads PRAGMA table_info and no-ops when the
+    // column exists), so schema convergence is driven by the table's actual
+    // shape, not by trusting the version number. This is deliberate — a version
+    // stamped ahead of the real schema (e.g. an interrupted/premature migration)
+    // would otherwise skip its ALTERs forever and wedge the reducer. A
+    // non-idempotent step (a data backfill, a destructive change) would still
+    // need a version guard; add that guard locally to the step that needs it.
+    //
+    // v1→v2: add the `title` + `title_history` columns to `jobs`. ADD COLUMN
+    // does not rewrite existing rows, so prior `jobs` rows backfill to
+    // `title=NULL` / `title_history='[]'` — matching the zero-event projection.
+    // Column defs match CREATE_JOBS (keep the two in sync).
+    addColumnIfMissing(db, "jobs", "title", "TEXT");
+    addColumnIfMissing(
+      db,
+      "jobs",
+      "title_history",
+      "TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(title_history))",
+    );
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
