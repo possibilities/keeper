@@ -1,5 +1,7 @@
 {
+  "auditor_done_at": "2026-05-20T05:22:00Z",
   "branch_name": "fn-3-keeper-v2-audit-follow-ups-crash-gap",
+  "closer_done_at": "2026-05-20T05:22:00Z",
   "created_at": "2026-05-20T04:50:35Z",
   "depends_on_epics": [
     "fn-2-keeper-uds-subscribe-server"
@@ -9,10 +11,10 @@
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
-  "status": "open",
+  "status": "done",
   "title": "Keeper V2 audit follow-ups: crash gap + line-cap semantics",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-20T04:53:41Z"
+  "updated_at": "2026-05-20T05:22:00Z"
 }
