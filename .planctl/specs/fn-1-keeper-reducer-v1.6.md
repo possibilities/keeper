@@ -45,5 +45,5 @@ Main entry point. Sequence:
 - [ ] Boot drain handles a pre-seeded `events` table (catch-up after downtime)
 
 ## Done summary
-
+Added src/daemon.ts: keeperd main entry point. Boots writer, runs boot drain to completion before spawning the wake worker, folds on each wake via a coalescing wake-pending flag (no missed events, no re-entrant drain), SIGTERM/SIGINT clean shutdown exits 0, any unrecoverable error exits 1 for launchd restart. import.meta.main guard keeps it import-safe; added test/daemon.test.ts covering boot-drain catch-up, idempotency, and multi-batch drain.
 ## Evidence
