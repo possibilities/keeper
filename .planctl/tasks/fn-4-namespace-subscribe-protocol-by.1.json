@@ -1,0 +1,10 @@
+{
+  "created_at": "2026-05-20T05:17:58Z",
+  "depends_on": [],
+  "epic": "fn-4-namespace-subscribe-protocol-by",
+  "id": "fn-4-namespace-subscribe-protocol-by.1",
+  "priority": null,
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Route subscribe protocol through collection descriptor",
+  "updated_at": "2026-05-20T05:19:13Z"
+}
