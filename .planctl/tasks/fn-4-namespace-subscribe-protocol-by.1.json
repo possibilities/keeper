@@ -1,10 +1,16 @@
 {
+  "bundles": [],
   "created_at": "2026-05-20T05:17:58Z",
   "depends_on": [],
   "epic": "fn-4-namespace-subscribe-protocol-by",
   "id": "fn-4-namespace-subscribe-protocol-by.1",
   "priority": null,
+  "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "Route subscribe protocol through collection descriptor",
-  "updated_at": "2026-05-20T05:19:13Z"
+  "updated_at": "2026-05-20T05:52:34Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-20T05:52:34Z"
 }

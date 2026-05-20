@@ -67,5 +67,5 @@ Namespace the read surface by a `collection` field so `jobs` becomes the first o
 - [ ] CLAUDE.md (directory layout: new `src/collections.ts` bullet, server-worker/protocol entries; module entry points table) and README.md (architecture + "what keeper is" wording) updated to describe the namespaced collection surface.
 
 ## Done summary
-
+Namespaced the UDS read surface by collection: new src/collections.ts CollectionDescriptor registry (getCollection/selectByIds) drives runQuery + diffTick; protocol frames carry a required collection, go generic over Row, and patch payload renamed job→row; unknown collection errors without disturbing the live subscription. selectJobsByIds folded into selectByIds. Docs + all suites updated; typecheck/lint/97 tests green.
 ## Evidence
