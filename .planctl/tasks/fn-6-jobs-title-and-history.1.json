@@ -1,10 +1,16 @@
 {
+  "bundles": [],
   "created_at": "2026-05-20T16:23:01Z",
   "depends_on": [],
   "epic": "fn-6-jobs-title-and-history",
   "id": "fn-6-jobs-title-and-history.1",
   "priority": null,
+  "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "mine session title into jobs",
-  "updated_at": "2026-05-20T16:24:15Z"
+  "updated_at": "2026-05-20T16:54:30Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-20T16:54:30Z"
 }

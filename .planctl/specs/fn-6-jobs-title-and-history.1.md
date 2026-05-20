@@ -55,5 +55,5 @@ Add a `title` + `title_history` attribute to the `jobs` entity, folded from the 
 - [ ] `bun test --isolate` passes, including new reducer (append/revert/unchanged/malformed/re-fold), db (schema_version=2, v1→v2 migration), and server round-trip (array shape) cases.
 
 ## Done summary
-
+Added title + title_history to the jobs projection: schema (SCHEMA_VERSION 2 + idempotent v1->v2 ADD COLUMN migration), a re-fold-deterministic reducer fold from session_title (append-on-change, reverts re-append, no dedup), JSON-array decode at both read seams (page SELECT + selectByIds via a shared decodeRow), Job type + README/CLAUDE.md docs, and new reducer/db/server tests. Full bun test --isolate green (124 pass).
 ## Evidence
