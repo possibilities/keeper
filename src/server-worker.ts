@@ -4,10 +4,12 @@
  * protocol from `src/protocol.ts`, its OWN read-only DB connection, and the
  * `<state-dir>/keeperd.lock` ownership lock.
  *
- * This task (`.2`) ships the transport + lifecycle + dispatch shell up to a
- * one-shot `query → result`. The live `data_version` poll → diff → `patch`
- * loop lands in task `.3`; the per-connection `lastSent` map and watched-set
- * seeded here are the substrate that loop will read.
+ * Task `.2` shipped the transport + lifecycle + dispatch shell up to a one-shot
+ * `query → result`. Task `.3` adds the realtime layer: an independent
+ * `data_version` poll (`pollLoop`) that turns committed `jobs` changes into
+ * per-entity `patch` pushes via a state-based diff (`diffTick`) keyed on each
+ * connection's `lastSent` map + watched-set (seeded from the same read that
+ * produced the `result` page).
  *
  * Conventions mirror `src/wake-worker.ts`:
  * - `isMainThread`-guarded body — a plain `import` from a test is inert.
@@ -41,13 +43,14 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
-import { openDb, resolveSockPath } from "./db";
+import { openDb, resolveSockPath, selectJobsByIds } from "./db";
 import {
   type ClientFrame,
   type ErrorFrame,
   encodeFrame,
   LineBuffer,
   OversizedLineError,
+  type PatchFrame,
   type QueryFrame,
   type ResultFrame,
   type ServerFrame,
@@ -62,6 +65,8 @@ export interface ServerWorkerData {
   dbPath: string;
   sockPath?: string;
   lockPath?: string;
+  /** Realtime poll cadence in ms (defaults to `DEFAULT_POLL_MS`, floored at 25). */
+  pollMs?: number;
 }
 
 /** Message posted to the parent when the listener is bound and serving. */
@@ -73,6 +78,14 @@ export interface ReadyMessage {
 export interface ShutdownMessage {
   type: "shutdown";
 }
+
+/**
+ * Poll cadence (ms) for the realtime `data_version` loop. Mirrors the wake
+ * worker's defaults — 50 ms is the sweet spot, floored at 25 ms to avoid
+ * burning a core.
+ */
+export const DEFAULT_POLL_MS = 50;
+const MIN_POLL_MS = 25;
 
 /** Default page size when a `query` omits `limit`; the hard cap is the same. */
 export const DEFAULT_LIMIT = 100;
@@ -456,6 +469,138 @@ function flush(sock: Writable, buf: Uint8Array, startOffset: number): void {
 }
 
 // ---------------------------------------------------------------------------
+// Realtime poll → diff → patch
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the singleton world rev once per tick. Same shape as `readWorldRev` but
+ * named for the poll path so the call site reads as "rev stamped on this
+ * tick's frames".
+ */
+function readWorldRevOnce(db: Database): number {
+  return readWorldRev(db);
+}
+
+/**
+ * Compute the union of every connection's watched ids. The poll loop does ONE
+ * shared `selectJobsByIds(union)` re-read per tick, then fans the rows out to
+ * each connection — so N connections watching overlapping pages cost one query,
+ * not N.
+ */
+function unionWatched(conns: Iterable<Writable>): string[] {
+  const union = new Set<string>();
+  for (const sock of conns) {
+    for (const id of sock.data.watched) {
+      union.add(id);
+    }
+  }
+  return [...union];
+}
+
+/**
+ * Run ONE realtime tick across all connections.
+ *
+ * 1. Read world rev once → stamped on every `patch` emitted this tick.
+ * 2. Read the union of all watched ids once (shared re-read).
+ * 3. For each connection, for each watched `job_id`: push a `patch {rev, job}`
+ *    ONLY when `job.last_event_id > lastSent[job_id]`, then bump `lastSent`.
+ *    No patch when equal — the diff is state-based, so multiple folds between
+ *    ticks collapse to one push (automatic coalescing, no event queue).
+ *
+ * Backpressure: a connection with a pending (backpressured) write is SKIPPED
+ * for the tick — never blocking fan-out to other connections, and crucially
+ * `lastSent` is NOT advanced for the skipped rows, so the next tick re-reflects
+ * current state and nothing is lost.
+ *
+ * Reads `jobs` only (never `events`). The self-correcting race — a poll landing
+ * after a hook `events` INSERT but before the reducer folds — sees no `jobs`
+ * change; the fold is itself a commit that re-bumps `data_version`, so the next
+ * poll catches it.
+ *
+ * Exported so the loop can be driven directly in tests without a real socket.
+ */
+export function diffTick(db: Database, conns: Iterable<Writable>): void {
+  const list = [...conns];
+  if (list.length === 0) {
+    return;
+  }
+
+  const ids = unionWatched(list);
+  if (ids.length === 0) {
+    return;
+  }
+
+  const rev = readWorldRevOnce(db);
+  const rows = selectJobsByIds(db, ids);
+  // Index by job_id for per-connection fan-out.
+  const byId = new Map<string, (typeof rows)[number]>();
+  for (const row of rows) {
+    byId.set(row.job_id, row);
+  }
+
+  for (const sock of list) {
+    // Slow consumer: a still-pending write means this socket is backpressured.
+    // Skip it for the tick (don't advance lastSent); the next tick re-diffs.
+    if (sock.data.pending) {
+      continue;
+    }
+    const patches: PatchFrame[] = [];
+    for (const id of sock.data.watched) {
+      const job = byId.get(id);
+      if (!job) {
+        // The row vanished (jobs rows are never deleted in v1, but stay
+        // defensive): nothing to diff, leave lastSent untouched.
+        continue;
+      }
+      const last = sock.data.lastSent.get(id) ?? -1;
+      if (job.last_event_id !== null && job.last_event_id > last) {
+        patches.push({ type: "patch", rev, job });
+        sock.data.lastSent.set(id, job.last_event_id);
+      }
+    }
+    if (patches.length > 0) {
+      writeFrames(sock, patches);
+    }
+  }
+}
+
+/**
+ * Realtime poll loop. Polls `PRAGMA data_version` every `pollMs`; on any change
+ * from the last seen value, runs `diffTick` against the live connection set.
+ *
+ * CRITICAL: the poll connection stays in autocommit — NO surrounding `BEGIN`,
+ * or `data_version` freezes for this connection and we go blind to new commits.
+ * `getConns` is called per tick so connections opened/closed mid-loop are
+ * picked up. Resolves once `isShutdown()` returns true.
+ *
+ * Exported alongside `diffTick` so the worker `main` wires it and tests can run
+ * it against a real two-connection DB.
+ */
+export async function pollLoop(
+  db: Database,
+  getConns: () => Iterable<Writable>,
+  isShutdown: () => boolean,
+  pollMs: number = DEFAULT_POLL_MS,
+): Promise<void> {
+  const interval = Math.max(MIN_POLL_MS, pollMs);
+  // Naked autocommit read — no BEGIN, or the counter freezes for this conn.
+  const query = db.query("PRAGMA data_version");
+  let last = (query.get() as { data_version: number }).data_version;
+
+  while (!isShutdown()) {
+    await Bun.sleep(interval);
+    if (isShutdown()) {
+      break;
+    }
+    const cur = (query.get() as { data_version: number }).data_version;
+    if (cur !== last) {
+      last = cur;
+      diffTick(db, getConns());
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Worker server lifecycle
 // ---------------------------------------------------------------------------
 
@@ -465,6 +610,13 @@ function flush(sock: Writable, buf: Uint8Array, startOffset: number): void {
  */
 export interface RunningServer {
   listener: import("bun").UnixSocketListener<ConnState>;
+  /**
+   * The live connection set. The realtime `pollLoop` reads this each tick so
+   * connections opened/closed mid-loop are picked up; entries are `Writable`
+   * (each carries its `ConnState` on `.data`) so `diffTick` / `writeFrames`
+   * compose without a real-socket shim.
+   */
+  conns: Set<Writable>;
   stop(): void;
 }
 
@@ -487,11 +639,17 @@ export function startServer(
   // is already ours, so unlinking here can't race another instance.
   unlinkIfExists(sockPath);
 
+  // Live connection registry. The realtime pollLoop iterates this each tick;
+  // open() adds, close() removes. Entries are the sockets themselves (typed as
+  // Writable so diffTick/writeFrames compose).
+  const conns = new Set<Writable>();
+
   const listener = Bun.listen<ConnState>({
     unix: sockPath,
     socket: {
       open(socket) {
         socket.data = newConnState();
+        conns.add(socket as unknown as Writable);
       },
       data(socket, chunk) {
         handleData(db, socket, chunk);
@@ -500,7 +658,9 @@ export function startServer(
         resumePending(socket as unknown as Writable);
       },
       close(socket) {
-        // Drop per-connection state; nothing process-global to release here.
+        // Drop the connection from the fan-out set, then release per-connection
+        // state; nothing process-global to release here.
+        conns.delete(socket as unknown as Writable);
         socket.data.pending = null;
         socket.data.watched.clear();
         socket.data.lastSent.clear();
@@ -521,6 +681,7 @@ export function startServer(
 
   return {
     listener,
+    conns,
     stop() {
       // Release the socket HERE — it's owned by the process, not the Worker
       // thread; the daemon's worker.terminate() won't release it.
@@ -626,7 +787,10 @@ function main(): void {
     process.exit(1);
   }
 
+  let stopping = false;
+
   const shutdown = (): void => {
+    stopping = true; // resolves the poll loop on its next iteration check
     server.stop();
     try {
       db.close();
@@ -640,6 +804,26 @@ function main(): void {
     if (msg && msg.type === "shutdown") {
       shutdown();
     }
+  });
+
+  // Realtime layer: poll data_version and fan committed jobs changes out as
+  // per-entity patches. Runs on the worker's own read-only connection (the same
+  // one serving queries — both are autocommit reads, safe to share). A crash in
+  // the loop is unrecoverable: no self-heal, exit non-zero → LaunchAgent
+  // restart.
+  pollLoop(
+    db,
+    () => server.conns,
+    () => stopping,
+    data.pollMs,
+  ).catch((err) => {
+    console.error("[server-worker] poll loop crashed:", err);
+    try {
+      server.stop();
+    } catch {
+      // best-effort
+    }
+    process.exit(1);
   });
 
   parentPort.postMessage({ kind: "ready" } satisfies ReadyMessage);

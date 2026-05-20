@@ -24,13 +24,20 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
-import type { QueryFrame, ResultFrame, ServerFrame } from "../src/protocol";
+import type {
+  PatchFrame,
+  QueryFrame,
+  ResultFrame,
+  ServerFrame,
+} from "../src/protocol";
 import {
   acquireLock,
   type ConnState,
+  diffTick,
   dispatchLine,
   isPidAlive,
   LockHeldError,
+  pollLoop,
   resumePending,
   runQuery,
   startServer,
@@ -371,4 +378,259 @@ test("spawned Worker shuts down cleanly and removes the socket file", async () =
   expect(result).toBe("exited");
   expect(existsSync(sockPath)).toBe(false);
   expect(existsSync(lockPath)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// realtime poll → diff → patch
+// ---------------------------------------------------------------------------
+
+/**
+ * A fake socket that records every frame written to it (decoded from the
+ * NDJSON bytes `writeFrames` produces). Drives `diffTick` deterministically
+ * without a real `Bun.Socket`. `accept` controls backpressure: when false,
+ * `write()` returns 0 so the frame stays pending and the connection is skipped.
+ */
+function fakeSock(): Writable & {
+  frames: ServerFrame[];
+  accept: boolean;
+} {
+  const sock = {
+    data: dispatchInit(),
+    accept: true,
+    frames: [] as ServerFrame[],
+    write(data: Uint8Array, off = 0, len = data.length - off): number {
+      if (!this.accept) {
+        return 0; // backpressure: nothing accepted, remainder stashed
+      }
+      const text = Buffer.from(data.subarray(off, off + len)).toString("utf8");
+      for (const line of text.split("\n")) {
+        if (line.length > 0) {
+          this.frames.push(JSON.parse(line) as ServerFrame);
+        }
+      }
+      return len;
+    },
+  };
+  return sock;
+}
+
+/** Seed a connection's watched-set + lastSent from the rows it would page. */
+function watch(sock: Writable, seed: Record<string, number>): void {
+  sock.data.watched = new Set(Object.keys(seed));
+  sock.data.lastSent = new Map(Object.entries(seed));
+}
+
+/** Bump a job's last_event_id (and updated_at) — simulates a reducer fold. */
+function advanceJob(db: Database, job_id: string, last_event_id: number): void {
+  db.query(
+    "UPDATE jobs SET last_event_id = ?, updated_at = updated_at + 1 WHERE job_id = ?",
+  ).run(last_event_id, job_id);
+}
+
+/** Set the world rev so emitted frames carry a known `rev`. */
+function setWorldRev(db: Database, rev: number): void {
+  db.query("UPDATE reducer_state SET last_event_id = ? WHERE id = 1").run(rev);
+}
+
+async function retryUntil<T>(
+  predicate: () => T | null | undefined,
+  timeoutMs = 2000,
+  cadenceMs = 25,
+): Promise<T | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = predicate();
+    if (value) {
+      return value;
+    }
+    if (Date.now() >= deadline) {
+      return null;
+    }
+    await Bun.sleep(cadenceMs);
+  }
+}
+
+test("diffTick pushes one patch when a watched row advances; rev is stamped", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  setWorldRev(db, 42);
+  const sock = fakeSock();
+  watch(sock, { a: 5 }); // seeded from the snapshot read
+
+  advanceJob(db, "a", 6); // reducer folded a new event for `a`
+  diffTick(db, [sock]);
+
+  expect(sock.frames).toHaveLength(1);
+  const patch = sock.frames[0] as PatchFrame;
+  expect(patch.type).toBe("patch");
+  expect(patch.job.job_id).toBe("a");
+  expect(patch.job.last_event_id).toBe(6);
+  expect(patch.rev).toBe(42);
+  // lastSent advanced to the pushed value.
+  expect(sock.data.lastSent.get("a")).toBe(6);
+  db.close();
+});
+
+test("diffTick emits nothing when no watched row advanced (no-op tick)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  seedJob(db, "other", { last_event_id: 1 });
+  const sock = fakeSock();
+  watch(sock, { a: 5 });
+
+  // An unrelated job folds — the watched id is unchanged.
+  advanceJob(db, "other", 9);
+  diffTick(db, [sock]);
+
+  expect(sock.frames).toHaveLength(0);
+  db.close();
+});
+
+test("diffTick does not double-send: a second tick with no change emits nothing", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const sock = fakeSock();
+  watch(sock, { a: 5 });
+
+  advanceJob(db, "a", 6);
+  diffTick(db, [sock]);
+  expect(sock.frames).toHaveLength(1);
+
+  // Immediate re-tick, no further fold → no new patch.
+  diffTick(db, [sock]);
+  expect(sock.frames).toHaveLength(1);
+  db.close();
+});
+
+test("diffTick fans out only to connections watching the changed id", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  seedJob(db, "b", { last_event_id: 1 });
+  const watcherA = fakeSock();
+  watch(watcherA, { a: 1 });
+  const watcherB = fakeSock();
+  watch(watcherB, { b: 1 });
+
+  // Only `a` advances.
+  advanceJob(db, "a", 2);
+  diffTick(db, [watcherA, watcherB]);
+
+  expect(watcherA.frames).toHaveLength(1);
+  expect((watcherA.frames[0] as PatchFrame).job.job_id).toBe("a");
+  expect(watcherB.frames).toHaveLength(0);
+  db.close();
+});
+
+test("diffTick coalesces multiple folds between ticks into one patch", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  const sock = fakeSock();
+  watch(sock, { a: 1 });
+
+  // Three folds land before the tick observes them; state-based diff collapses.
+  advanceJob(db, "a", 2);
+  advanceJob(db, "a", 3);
+  advanceJob(db, "a", 4);
+  diffTick(db, [sock]);
+
+  expect(sock.frames).toHaveLength(1);
+  expect((sock.frames[0] as PatchFrame).job.last_event_id).toBe(4);
+  db.close();
+});
+
+test("diffTick skips a backpressured socket without stalling others; lastSent not advanced", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  const slow = fakeSock();
+  watch(slow, { a: 1 });
+  const fast = fakeSock();
+  watch(fast, { a: 1 });
+
+  // Pre-stash a pending write on `slow` so diffTick sees it as backpressured.
+  slow.data.pending = { bytes: new Uint8Array([1]), offset: 0 };
+
+  advanceJob(db, "a", 2);
+  diffTick(db, [slow, fast]);
+
+  // Fast connection still got its patch.
+  expect(fast.frames).toHaveLength(1);
+  // Slow connection was skipped: no NEW patch frame appended by the diff, and
+  // lastSent stayed at 1 so the next tick re-reflects current state.
+  expect(slow.frames).toHaveLength(0);
+  expect(slow.data.lastSent.get("a")).toBe(1);
+  db.close();
+});
+
+test("pollLoop drives a patch to a subscriber after a separate writer commits", async () => {
+  // Reader connection runs the poll loop (autocommit, observes other conns'
+  // commits). A separate writer connection commits a jobs change.
+  const { db: reader } = openDb(dbPath, { readonly: true });
+  const { db: writer } = openDb(dbPath, { readonly: false });
+
+  seedJob(writer, "a", { last_event_id: 1 });
+  setWorldRev(writer, 7);
+
+  const sock = fakeSock();
+  watch(sock, { a: 1 });
+
+  let stop = false;
+  const loop = pollLoop(
+    reader,
+    () => [sock],
+    () => stop,
+    25,
+  );
+
+  // Writer commits an advance on the watched row (bumps data_version for the
+  // reader's poll connection).
+  advanceJob(writer, "a", 2);
+
+  const got = await retryUntil(() =>
+    sock.frames.length > 0 ? sock.frames[0] : null,
+  );
+  stop = true;
+  await loop;
+
+  expect(got).not.toBeNull();
+  const patch = got as PatchFrame;
+  expect(patch.type).toBe("patch");
+  expect(patch.job.job_id).toBe("a");
+  expect(patch.job.last_event_id).toBe(2);
+  expect(patch.rev).toBe(7);
+
+  reader.close();
+  writer.close();
+});
+
+test("pollLoop emits no patch when the committed change misses every watched id", async () => {
+  const { db: reader } = openDb(dbPath, { readonly: true });
+  const { db: writer } = openDb(dbPath, { readonly: false });
+
+  seedJob(writer, "a", { last_event_id: 1 });
+  seedJob(writer, "unwatched", { last_event_id: 1 });
+
+  const sock = fakeSock();
+  watch(sock, { a: 1 });
+
+  let stop = false;
+  const loop = pollLoop(
+    reader,
+    () => [sock],
+    () => stop,
+    25,
+  );
+
+  // Commit advances a job nobody watches → data_version bumps, but the diff
+  // finds no watched-row change.
+  advanceJob(writer, "unwatched", 5);
+
+  // Give the loop several poll cycles to (not) emit.
+  await Bun.sleep(200);
+  stop = true;
+  await loop;
+
+  expect(sock.frames).toHaveLength(0);
+
+  reader.close();
+  writer.close();
 });
