@@ -8,10 +8,10 @@
  * It opens one `query` for a 10-row page of `jobs`, holds that page's row SET
  * (frozen membership — rows never enter/leave a live page), and renders it as a
  * YAML stream: each frame is a YAML document (leading `---`) listing every job
- * as `{ name, state }`. As `patch` frames advance individual rows, the page is
- * updated in place and a NEW frame is printed — but ONLY when the rendered
- * name/state projection actually changed, so a `last_event_id`-only bump (no
- * visible delta) prints nothing.
+ * as a full entity (every served column, in column order). As `patch` frames
+ * advance individual rows, the page is updated in place and a NEW frame is
+ * printed whenever the rendered page changes (a patch carries the full updated
+ * row, so any column move — `state`, `mode`, `last_event_id`, … — reframes).
  *
  * The `meta` (total/membership-staleness) signal is rendered as a SEPARATE
  * "temporary frame": a `...`-fenced comment block, distinct from the `---` job
@@ -22,9 +22,6 @@
  * `LineBuffer` to de-frame) and `resolveSockPath()` so it stays a faithful
  * mirror of the contract, and it honors the read-only fence: it only ever sends
  * `query` / `unsubscribe`.
- *
- * NOTE: the `jobs` collection has no `name` column; "name" is the `job_id`
- * (the Claude Code session id), which is the page's primary key.
  *
  * Usage:
  *   bun scripts/keeper-frames.ts [--sock <path>]
@@ -54,9 +51,26 @@ Usage: bun scripts/keeper-frames.ts [--sock <path>]
   --help          Show this help
 
 Renders a 10-row page of jobs as a YAML stream: one frame per change, each frame
-a YAML document (--- separated) of { name, state } objects. The total/membership
+a YAML document (--- separated) of full job entities. The total/membership
 "meta" signal prints as a separate ...-fenced note (the frozen page never reflows).
 `;
+
+/** Render one value as a YAML scalar (bare when safe, else single-quoted). */
+function yamlScalar(v: unknown): string {
+  if (v === null || v === undefined) {
+    return "null";
+  }
+  if (typeof v === "number" || typeof v === "boolean") {
+    return String(v);
+  }
+  const s = String(v);
+  // Bare scalar only when it can't be mistaken for YAML syntax; otherwise quote
+  // (single-quote, doubling embedded quotes — the YAML escape for `'`).
+  if (s !== "" && /^[A-Za-z0-9_./@:+-]+$/.test(s) && !/^[-:?]/.test(s)) {
+    return s;
+  }
+  return `'${s.replace(/'/g, "''")}'`;
+}
 
 function die(message: string): never {
   process.stderr.write(`keeper-frames: ${message}\n`);
@@ -82,25 +96,29 @@ async function main(): Promise<void> {
   const log = (s: string) => process.stdout.write(`${s}\n`);
 
   // The frozen page, in server-sent order, plus a by-id index. The order array
-  // fixes render order at result time; the map holds the live cells that
-  // `patch` frames advance. `name` is the pk (`job_id`); `state` is the cell we
-  // render and diff frames on.
+  // fixes render order at result time; the map holds the full live rows that
+  // `patch` frames advance, keyed by pk (`job_id`).
   const order: string[] = [];
-  const byId = new Map<string, { name: string; state: string }>();
-  // The last main frame's body, so a patch that doesn't move any rendered
-  // name/state prints nothing (dedupe `last_event_id`-only bumps).
+  const byId = new Map<string, Record<string, unknown>>();
+  // The last frame's body, so a byte-identical re-send prints nothing.
   let lastBody: string | null = null;
   let gotResult = false;
 
-  /** Project the frozen page into a YAML document body (no leading `---`). */
+  /**
+   * Project the frozen page into a YAML document body (no leading `---`): each
+   * row is a list item carrying every served column in column order. Object key
+   * order is the SELECT column order (preserved through JSON parse).
+   */
   function renderBody(): string {
     if (order.length === 0) {
       return "[]"; // empty page → an empty YAML sequence
     }
     return order
       .map((id) => {
-        const row = byId.get(id);
-        return `- name: ${row?.name ?? id}\n  state: ${row?.state ?? "?"}`;
+        const row = byId.get(id) ?? { job_id: id };
+        return Object.entries(row)
+          .map(([k, v], i) => `${i === 0 ? "- " : "  "}${k}: ${yamlScalar(v)}`)
+          .join("\n");
       })
       .join("\n");
   }
@@ -125,7 +143,7 @@ async function main(): Promise<void> {
       for (const row of frame.rows) {
         const id = String(row.job_id);
         order.push(id);
-        byId.set(id, { name: id, state: String(row.state ?? "?") });
+        byId.set(id, row);
       }
       gotResult = true;
       // Force the first frame even if the page is empty.
@@ -133,10 +151,9 @@ async function main(): Promise<void> {
       emitFrameIfChanged();
     } else if (frame.type === "patch") {
       const id = String(frame.row.job_id);
-      const existing = byId.get(id);
       // Frozen membership: a patch only ever updates a row already in the page.
-      if (existing) {
-        byId.set(id, { name: id, state: String(frame.row.state ?? "?") });
+      if (byId.has(id)) {
+        byId.set(id, frame.row);
         emitFrameIfChanged();
       }
     } else if (frame.type === "meta") {
