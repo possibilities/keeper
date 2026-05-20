@@ -45,5 +45,5 @@ Wire the completed server worker into the daemon supervisor and prove the whole 
 - [ ] Full `bun test --isolate` suite + `bun run lint` + `bun run typecheck` pass
 
 ## Done summary
-
+Wired the UDS server worker into the daemon supervisor (spawn after migrate/boot-drain, onerror->fatalExit, two-worker shutdown awaiting both close events) and proved the full pipeline with an e2e test: real daemon + in-test Bun.connect client de-framing via protocol.ts -> query->result then patch after a fold; SIGTERM removes the socket.
 ## Evidence
