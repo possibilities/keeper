@@ -51,5 +51,5 @@ Docs + one JSDoc comment; no runtime code changes. Confirm `AGENTS.md` still res
 - [ ] Still-true constraints (no mutations / reactor / write-path) are narrowed, not deleted
 
 ## Done summary
-
+Narrowed CLAUDE.md + README V1 no-UDS fences to V2: read-only subscribe-server reality (no client mutations/reactor/write-path), added server-worker.ts/protocol.ts to layout + entry-points, a durable Worker contract subsection, second-worker architecture, and KEEPER_SOCK docs in README + plist. daemon.ts JSDoc was already V2-complete.
 ## Evidence
