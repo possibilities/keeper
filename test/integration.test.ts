@@ -370,6 +370,10 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
     }
     expect(result.id).toBe("q1");
     expect(result.collection).toBe("jobs");
+    // The result carries the filtered-set total (≥ the one job we folded).
+    expect(typeof result.total).toBe("number");
+    expect(result.total).toBeGreaterThanOrEqual(1);
+    const baselineTotal = result.total;
     expect(result.rows.some((r) => r.job_id === sessionId)).toBe(true);
     const watchedRow = result.rows.find((r) => r.job_id === sessionId);
     if (!watchedRow) {
@@ -404,6 +408,45 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
     // UserPromptSubmit carried permission_mode 'plan'.
     expect(patch.row.mode).toBe("plan");
     expect(patch.rev).toBeGreaterThanOrEqual(patch.row.last_event_id as number);
+
+    // --- a NEW session enters the (unfiltered) set → a live `meta` with the
+    // incremented total. Frozen membership means the new row is NOT pushed; the
+    // meta is just the "set changed" count signal. ---
+    const otherSession = "sess-subscribe-e2e-2";
+    await fireHook({
+      hook_event_name: "SessionStart",
+      session_id: otherSession,
+      cwd: "/tmp/work2",
+      permission_mode: "default",
+    });
+
+    const meta = await retryUntil(
+      () =>
+        client.frames.find(
+          (f) =>
+            f.type === "meta" &&
+            f.collection === "jobs" &&
+            f.total > baselineTotal,
+        ) ?? null,
+    );
+    if (!meta || meta.type !== "meta") {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(`meta never arrived.\nstdout:\n${out}\nstderr:\n${err}`);
+    }
+    expect(meta.total).toBe(baselineTotal + 1);
+    // The new member's row never arrived as a patch (frozen membership).
+    expect(
+      client.frames.some(
+        (f) => f.type === "patch" && f.row.job_id === otherSession,
+      ),
+    ).toBe(false);
+
+    // --- and a leave decrements it. End the new session → SessionEnd folds it
+    // to `ended`, but it remains a row (state sticky) so the unfiltered total is
+    // unchanged. To prove a decrement, filter is the cleaner lever — but this
+    // e2e watches the unfiltered set, where rows are never deleted in v1. The
+    // decrement path is covered by the diffTick unit tests (row leave / delete).
   } finally {
     client.socket.end();
   }

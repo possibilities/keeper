@@ -37,26 +37,38 @@ file is the in-codebase map for AI agents working in the repo.
   - `src/server-worker.ts` — Worker thread; owns the read-only UDS subscribe
     server. Own read-only connection + `data_version` poll, a `keeperd.lock`
     PID-liveness ownership lock, and an NDJSON-over-UDS listener that serves
-    `query → result` then fans changes out as per-entity `patch` frames.
-    `runQuery` / `diffTick` route by collection name through a
-    `CollectionDescriptor` (`src/collections.ts`) — no `jobs`-specific table /
-    column / filter literal remains in either. `isMainThread`-guarded.
+    `query → result` then fans changes out as per-entity `patch` frames. On each
+    tick `diffTick` runs a SECOND pass: it groups subscriptions by filter
+    signature, runs ONE descriptor-parameterized COUNT+membership-token per
+    distinct filter, and emits a `meta` frame when a subscription's `total` or
+    membership token moved (a row entered/left the filtered set) — backpressure-
+    skipping a pending conn without advancing its `lastTotal`/`lastToken`, same
+    discipline as the patch path. `runQuery` / `diffTick` route by collection
+    name through a `CollectionDescriptor` (`src/collections.ts`) — no
+    `jobs`-specific table / column / filter literal remains in either; a shared
+    `resolveFilter` builds the WHERE once and threads it to both the page SELECT
+    and the count so they can't drift. `isMainThread`-guarded.
   - `src/collections.ts` — the collection registry that namespaces the read
     surface. A `CollectionDescriptor` holds everything collection-specific
     (table, served columns, pk, the per-row `version` column the diff fires on,
     the sort allowlist + default sort, and the filter-key → SQL-column map);
     `REGISTRY` / `getCollection` resolve a wire `collection` name to its
-    descriptor, and `selectByIds(db, descriptor, ids)` is the
-    descriptor-parameterized by-id read. `jobs` is the first/only descriptor
-    today (its `filters` include the pk `job_id` for detail-page single-item
-    subscribe). The descriptor is the SOLE identifier-injection gate: only its
-    constants are interpolated into SQL; wire filter keys are resolved by map
-    lookup, never interpolated.
-  - `src/protocol.ts` — the wire protocol: `query` / `result` / `patch` frame
-    shapes (every frame names a `collection`; `result` / `patch` are generic
-    over `Row`; `patch` carries `row`; `query.collection` is required), NDJSON
-    line framing (buffer-until-`\n` + max-line cap), and the page/diff helpers
-    shared by the server worker.
+    descriptor, `selectByIds(db, descriptor, ids)` is the
+    descriptor-parameterized by-id read, and `countAndToken(db, descriptor,
+    whereClause, params)` is the descriptor-parameterized count-query — the
+    filtered-set `COUNT(*)` plus a `group_concat(pk)` membership token (ordered
+    by pk, empty-set normalized to `total=0`/`token=""`) that the `meta` signal
+    diffs on. `jobs` is the first/only descriptor today (its `filters` include
+    the pk `job_id` for detail-page single-item subscribe). The descriptor is
+    the SOLE identifier-injection gate: only its constants are interpolated into
+    SQL; wire filter keys are resolved by map lookup, never interpolated.
+  - `src/protocol.ts` — the wire protocol: `query` / `result` / `patch` / `meta`
+    frame shapes (every frame names a `collection`; `result` / `patch` are
+    generic over `Row`; `result` carries `total` — the filtered-set size; `patch`
+    carries `row`; `meta` is a membership-staleness signal carrying the new
+    `total` but no row; `query.collection` is required), NDJSON line framing
+    (buffer-until-`\n` + max-line cap), and the page/diff helpers shared by the
+    server worker.
   - `src/types.ts` — `Event`, `Job`, `ReducerState` row shapes.
   - `src/version.ts` — `VERSION` constant.
 - `plugin/` — the Claude Code hook plugin (symlink target for
@@ -78,9 +90,9 @@ file is the in-codebase map for AI agents working in the repo.
 | `src/reducer.ts` | `drain()` / `applyEvent()` | fold events → jobs |
 | `src/db.ts` | `openDb()` / `resolveDbPath()` | schema + PRAGMAs + stmts |
 | `src/wake-worker.ts` | Worker default body | `data_version` poll → wake |
-| `src/server-worker.ts` | Worker default body | UDS subscribe server: query → result + live patches, routed by collection |
-| `src/collections.ts` | `getCollection()` / `selectByIds()` | collection registry + descriptor-parameterized by-id read |
-| `src/protocol.ts` | `encodeFrame()` / `LineBuffer` / frame types | NDJSON wire protocol (collection-namespaced frames) |
+| `src/server-worker.ts` | Worker default body | UDS subscribe server: query → result (+ `total`) + live patches + `meta` staleness signal, routed by collection |
+| `src/collections.ts` | `getCollection()` / `selectByIds()` / `countAndToken()` | collection registry + descriptor-parameterized by-id read + count/membership-token query |
+| `src/protocol.ts` | `encodeFrame()` / `LineBuffer` / frame types | NDJSON wire protocol (collection-namespaced `query`/`result`/`patch`/`meta` frames) |
 | `plugin/hooks/events-writer.ts` | `main()` | one event row per hook |
 
 ## State machine
@@ -122,9 +134,12 @@ The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
   wait.
 - **`data_version` polling is every reader's change primitive** — not just the
   wake worker. The server worker re-reads its watched `jobs` rows on each
-  `data_version` tick and diffs `last_event_id` to emit patches; like the wake
-  worker it must stay in autocommit (no `BEGIN`), or `data_version` freezes for
-  that connection. Never a `fs.watch`/FSEvents file watcher (see DO NOT).
+  `data_version` tick and diffs `last_event_id` to emit patches; the SAME tick
+  also runs a per-filter COUNT+membership-token to emit `meta` staleness signals
+  (frozen membership is unchanged — `meta` reports the count moved, it does not
+  stream the new members). Like the wake worker the poll connection must stay in
+  autocommit (no `BEGIN`), or `data_version` freezes for that connection. Never a
+  `fs.watch`/FSEvents file watcher (see DO NOT).
 - **Schema migrations are forward-only** via the `meta(schema_version)` row +
   the ALTER slot in `migrate()`. Bump `SCHEMA_VERSION` only when adding an
   ALTER; never reduce, never branch.

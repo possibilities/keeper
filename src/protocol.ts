@@ -23,11 +23,19 @@
  *              time. `rev = reducer_state.last_event_id`. This frame doubles
  *              as the initial subscription state; subsequent patches arrive
  *              with monotonically non-decreasing `rev` values. Echoes the
- *              `collection` the page was read from.
+ *              `collection` the page was read from. Carries `total` — the size
+ *              of the FULL filtered set (ignoring limit/offset) so a paginated
+ *              client can render "showing rows.length of total".
  * - `patch`  — a single row in the page has advanced (its per-row `version`
  *              column moved forward). The full updated `row` is included so the
  *              client never needs to re-query to render the change. Echoes the
  *              `collection`.
+ * - `meta`   — a membership-staleness signal for the active subscription: the
+ *              filtered-set `total` and/or the set's membership changed since
+ *              the last frame sent on this connection. Carries the new `total`
+ *              but NOT the changed rows — it's a "set changed, refresh" nudge,
+ *              not a live membership stream (frozen membership is unchanged).
+ *              Echoes the `collection`.
  * - `error`  — protocol or query error. `code` is a short tag; `message` is
  *              human-readable. `collection` is echoed when attributable to a
  *              named collection (e.g. `unknown_collection`).
@@ -43,10 +51,10 @@
  * Forward-compat: unknown frame fields are ignored, so older clients keep
  * working as the vocabulary grows.
  *
- * INVARIANT: `rev` is present on EVERY server frame (result, patch, error
- * with a known world-rev). Downstream consumers depend on a single monotonic
- * cursor for ordering. `rev` is the GLOBAL reducer cursor — distinct from a
- * collection's per-row `version` column the diff fires on.
+ * INVARIANT: `rev` is present on EVERY server frame (result, patch, meta,
+ * error with a known world-rev). Downstream consumers depend on a single
+ * monotonic cursor for ordering. `rev` is the GLOBAL reducer cursor — distinct
+ * from a collection's per-row `version` column the diff fires on.
  */
 
 /** The generic served-row shape; a collection's columns determine the keys. */
@@ -101,12 +109,18 @@ export interface UnsubscribeFrame {
  * `reducer_state.last_event_id` at the moment the page was read; subsequent
  * `patch` frames carry monotonically non-decreasing `rev`. `collection` echoes
  * the queried collection. Rows are generic (`R`, defaulting to `Row`).
+ *
+ * `total` is the size of the FULL filtered set (the query's WHERE, ignoring
+ * limit/offset), so a paginated client can render "showing `rows.length` of
+ * `total`". It seeds the subscription's membership baseline; subsequent `meta`
+ * frames report when it (or the set's membership) moves.
  */
 export interface ResultFrame<R extends Row = Row> {
   type: "result";
   id?: string;
   collection: string;
   rev: number;
+  total: number;
   rows: R[];
 }
 
@@ -120,6 +134,26 @@ export interface PatchFrame<R extends Row = Row> {
   collection: string;
   rev: number;
   row: R;
+}
+
+/**
+ * Server → client: a membership-staleness signal for the active subscription.
+ * Emitted when the filtered-set `total` and/or the set's membership (the
+ * identities of the matching rows, fingerprinted by pk) changed since the last
+ * frame sent on this connection — i.e. a row entered or left the filtered set,
+ * NOT merely a cell update of an already-matching row (that's `patch`'s job).
+ *
+ * It carries the new `total` but NOT the changed rows: frozen membership means
+ * the live page does not reflow under the client. A `meta` frame is a "the set
+ * changed, re-query if you care" nudge, not a live membership stream. `rev` is
+ * the same world-rev stamped on the tick's patches; `collection` echoes the
+ * subscription's collection. Mirrors `patch` in carrying no `id`.
+ */
+export interface MetaFrame {
+  type: "meta";
+  collection: string;
+  rev: number;
+  total: number;
 }
 
 /**
@@ -148,7 +182,7 @@ export interface ErrorFrame {
 export type ClientFrame = QueryFrame | UnsubscribeFrame;
 
 /** Discriminated union of frames the server may send. */
-export type ServerFrame = ResultFrame | PatchFrame | ErrorFrame;
+export type ServerFrame = ResultFrame | PatchFrame | MetaFrame | ErrorFrame;
 
 /** Any NDJSON frame (either direction). */
 export type Frame = ClientFrame | ServerFrame;

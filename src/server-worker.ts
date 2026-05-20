@@ -5,11 +5,14 @@
  * `<state-dir>/keeperd.lock` ownership lock.
  *
  * Task `.2` shipped the transport + lifecycle + dispatch shell up to a one-shot
- * `query → result`. Task `.3` adds the realtime layer: an independent
+ * `query → result`. Task `.3` added the realtime layer: an independent
  * `data_version` poll (`pollLoop`) that turns committed `jobs` changes into
  * per-entity `patch` pushes via a state-based diff (`diffTick`) keyed on each
  * connection's `lastSent` map + watched-set (seeded from the same read that
- * produced the `result` page).
+ * produced the `result` page). A third beat layers on top: each tick also runs
+ * a per-filter `countAndToken` and emits a `meta` frame when a subscription's
+ * filtered-set `total` or membership token moved (a row entered/left the set) —
+ * a count/staleness signal, NOT a live membership stream (the page stays frozen).
  *
  * Conventions mirror `src/wake-worker.ts`:
  * - `isMainThread`-guarded body — a plain `import` from a test is inert.
@@ -45,6 +48,7 @@ import { dirname } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import {
   type CollectionDescriptor,
+  countAndToken,
   getCollection,
   type Row,
   selectByIds,
@@ -110,17 +114,29 @@ export const MAX_LIMIT = 500;
  *   `data_version` tick.
  * - `lastSent` maps pk → the collection's version column as last pushed to this
  *   client, so the diff emits a `patch` exactly once per advance.
+ * - `where` is the resolved filter (clause + bound params) the active query was
+ *   built from — `null` until the first successful `query`, reset on
+ *   `unsubscribe`. `diffTick` reuses it for the membership COUNT+token so the
+ *   count can never drift from the page that produced it.
+ * - `lastTotal` / `lastToken` are the filtered-set size + membership
+ *   fingerprint last reflected to this client (seeded from the same read that
+ *   produced the `result`'s `total`); the diff emits a `meta` frame only when
+ *   either moves. `null` until the first `query`, reset on `unsubscribe`.
  * - `pending` holds a backpressured tail: the UTF-8 bytes not yet accepted by
  *   the socket, resumed in `drain`.
  *
  * One active subscription per connection: a re-query fully REPLACES
- * `collection` + `watched` + `lastSent` (list → detail navigation).
+ * `collection` + `watched` + `lastSent` + `where` + `lastTotal` + `lastToken`
+ * (list → detail navigation).
  */
 export interface ConnState {
   buffer: LineBuffer;
   collection: string | null;
   watched: Set<string>;
   lastSent: Map<string, number>;
+  where: ResolvedFilter | null;
+  lastTotal: number | null;
+  lastToken: string | null;
   pending: { bytes: Uint8Array; offset: number } | null;
 }
 
@@ -130,6 +146,9 @@ function newConnState(): ConnState {
     collection: null,
     watched: new Set(),
     lastSent: new Map(),
+    where: null,
+    lastTotal: null,
+    lastToken: null,
     pending: null,
   };
 }
@@ -230,6 +249,47 @@ function unlinkIfExists(path: string): void {
 // ---------------------------------------------------------------------------
 
 /**
+ * A resolved exact-match filter: the SQL `WHERE` fragment ("" or "WHERE ...")
+ * and its bound parameters. Built ONCE per query (`resolveFilter`) and threaded
+ * to BOTH the page SELECT and the membership COUNT+token, so the two can never
+ * drift apart.
+ */
+export interface ResolvedFilter {
+  clause: string;
+  params: (string | number)[];
+}
+
+/**
+ * Resolve a `query` frame's wire `filter` map into a SQL `WHERE` clause + bound
+ * params, by descriptor map lookup. A wire filter key is only honored if the
+ * descriptor declares it (→ a trusted SQL column); the value is bound (`?`). A
+ * key absent from `descriptor.filters` is silently ignored (forward-compat).
+ *
+ * The descriptor is the SOLE identifier-injection gate: only declared columns
+ * are interpolated; wire keys are never interpolated, values always bound.
+ */
+export function resolveFilter(
+  descriptor: CollectionDescriptor,
+  filter: Record<string, string | number> | undefined,
+): ResolvedFilter {
+  const where: string[] = [];
+  const params: (string | number)[] = [];
+  if (filter) {
+    for (const [key, col] of Object.entries(descriptor.filters)) {
+      const value = filter[key];
+      if (value != null) {
+        where.push(`${col} = ?`);
+        params.push(value);
+      }
+    }
+  }
+  return {
+    clause: where.length > 0 ? `WHERE ${where.join(" AND ")}` : "",
+    params,
+  };
+}
+
+/**
  * Page a collection for a `query` frame. Returns the ordered rows plus the
  * world-rev read in the same logical snapshot — both feed the `result` frame
  * and seed the connection's watched-set / `lastSent`. A well-formed `query`
@@ -249,11 +309,19 @@ function unlinkIfExists(path: string): void {
  * Sort direction: when the frame omits `dir`, default to the descriptor's
  * default dir only when the chosen column equals the default column (preserving
  * jobs' "updated_at → desc"), else `asc`.
+ *
+ * `total`: the filtered-set size (the WHERE only, ignoring limit/offset) plus a
+ * membership token are read via ONE `countAndToken` over the SAME resolved
+ * filter that built the page SELECT — so the count can't drift from the page,
+ * and the result's `total` and the subscription's seeded `lastTotal`/`lastToken`
+ * (see `runSubscription`) come from one snapshot. The optional `out` collects
+ * the resolved filter + count so the caller seeds ConnState without a re-read.
  */
 export function runQuery(
   db: Database,
   worldRev: number,
   frame: QueryFrame,
+  out?: { where: ResolvedFilter; total: number; token: string },
 ): ResultFrame | ErrorFrame {
   const descriptor = getCollection(frame.collection);
   if (!descriptor) {
@@ -284,38 +352,41 @@ export function runQuery(
       ? Math.floor(frame.offset)
       : 0;
 
-  // Build WHERE by map lookup: a wire filter key is only honored if the
-  // descriptor declares it (→ a trusted SQL column); the value is bound. A
-  // key absent from descriptor.filters is silently ignored (forward-compat).
-  const where: string[] = [];
-  const params: (string | number)[] = [];
-  if (frame.filter) {
-    for (const [key, col] of Object.entries(descriptor.filters)) {
-      const value = frame.filter[key];
-      if (value != null) {
-        where.push(`${col} = ?`);
-        params.push(value);
-      }
-    }
-  }
-  const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  // Resolve the filter ONCE (descriptor map lookup, bound values) and thread it
+  // to BOTH the page SELECT and the membership count below — they can't drift.
+  const where = resolveFilter(descriptor, frame.filter);
+
+  // Filtered-set size + membership token, over the WHERE only (no limit/offset).
+  const { total, token } = countAndToken(
+    db,
+    descriptor,
+    where.clause,
+    where.params,
+  );
 
   // table/columns/pk/sortCol/dir are descriptor constants, never wire text —
   // safe to interpolate. filter values + limit/offset are bound.
   const sql = `
     SELECT ${descriptor.columns.join(", ")}
       FROM ${descriptor.table}
-      ${whereClause}
+      ${where.clause}
      ORDER BY ${sortCol} ${dir.toUpperCase()}, ${descriptor.pk} ASC
      LIMIT ? OFFSET ?
   `;
-  const rows = db.prepare(sql).all(...params, limit, offset) as Row[];
+  const rows = db.prepare(sql).all(...where.params, limit, offset) as Row[];
+
+  if (out) {
+    out.where = where;
+    out.total = total;
+    out.token = token;
+  }
 
   return {
     type: "result",
     ...(frame.id !== undefined ? { id: frame.id } : {}),
     collection: descriptor.name,
     rev: worldRev,
+    total,
     rows,
   };
 }
@@ -379,15 +450,24 @@ export function dispatchLine(
         ];
       }
       const worldRev = readWorldRev(db);
-      const out = runQuery(db, worldRev, frame);
+      // `seed` collects the resolved filter + count from the SAME read that
+      // produced the result's `total`, so the result→first-tick boundary emits
+      // no spurious `meta`. (The page-read-vs-count-read snapshot race is
+      // accepted — it self-heals on the next tick.)
+      const seed = {} as {
+        where: ResolvedFilter;
+        total: number;
+        token: string;
+      };
+      const out = runQuery(db, worldRev, frame, seed);
       if (out.type !== "result") {
         // unknown_collection (or any error): do NOT mutate the subscription.
         return [out];
       }
       const descriptor = getCollection(out.collection) as CollectionDescriptor;
       // Replace the subscription atomically (one synchronous block, no await):
-      // collection + watched + lastSent, keyed by the descriptor's pk/version,
-      // so no diffTick interleaves stale rows.
+      // collection + watched + lastSent + the membership baseline, keyed by the
+      // descriptor's pk/version, so no diffTick interleaves stale rows.
       conn.collection = out.collection;
       conn.watched = new Set(out.rows.map((r) => String(r[descriptor.pk])));
       conn.lastSent = new Map(
@@ -396,12 +476,18 @@ export function dispatchLine(
           r[descriptor.version] as number,
         ]),
       );
+      conn.where = seed.where;
+      conn.lastTotal = seed.total;
+      conn.lastToken = seed.token;
       return [out];
     }
     case "unsubscribe": {
       conn.collection = null;
       conn.watched = new Set();
       conn.lastSent = new Map();
+      conn.where = null;
+      conn.lastTotal = null;
+      conn.lastToken = null;
       return [];
     }
     default: {
@@ -567,11 +653,19 @@ function unionWatched(conns: Iterable<Writable>): string[] {
  *    row}` ONLY when `row[descriptor.version] > lastSent[id]`, then bump
  *    `lastSent`. No patch when equal — the diff is state-based, so multiple
  *    folds between ticks collapse to one push (coalescing, no event queue).
+ * 5. SECOND pass — membership staleness. Group the live (non-null collection,
+ *    non-null `where`) connections by filter signature `[collection, clause,
+ *    params]`, run ONE `countAndToken` per distinct signature (mirroring the
+ *    one-`selectByIds`-per-collection sharing above), and fan `{total, token}`
+ *    out: emit a `meta` frame to each conn whose `total` or `token` moved since
+ *    its last, then advance `lastTotal`/`lastToken`. This is the count signal —
+ *    NOT a membership stream; the changed rows are never sent (frozen page).
  *
  * Backpressure: a connection with a pending (backpressured) write is SKIPPED
  * for the tick — never blocking fan-out to other connections, and crucially
- * `lastSent` is NOT advanced for the skipped rows, so the next tick re-reflects
- * current state and nothing is lost.
+ * `lastSent` (patch pass) and `lastTotal`/`lastToken` (meta pass) are NOT
+ * advanced for a skipped conn, so the next tick re-reflects current state and
+ * nothing is lost.
  *
  * Reads the collection table only (never `events`). The self-correcting race —
  * a poll landing after a hook `events` INSERT but before the reducer folds —
@@ -648,6 +742,61 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       }
       if (patches.length > 0) {
         writeFrames(sock, patches);
+      }
+    }
+  }
+
+  // Second pass: membership-staleness `meta`. Group the live connections (a
+  // non-null collection AND a resolved `where`) by filter signature so two
+  // conns paging/sorting the same filter share ONE countAndToken; signature
+  // folds in the bound params (so state=working vs state=stopped don't share)
+  // and excludes sort/limit/offset (so different pages of one filter do share).
+  const byFilter = new Map<
+    string,
+    {
+      descriptor: CollectionDescriptor;
+      where: ResolvedFilter;
+      conns: Writable[];
+    }
+  >();
+  for (const sock of list) {
+    const name = sock.data.collection;
+    const where = sock.data.where;
+    if (name === null || where === null) {
+      continue;
+    }
+    const descriptor = getCollection(name);
+    if (!descriptor) {
+      continue;
+    }
+    const sig = JSON.stringify([name, where.clause, where.params]);
+    const group = byFilter.get(sig);
+    if (group) {
+      group.conns.push(sock);
+    } else {
+      byFilter.set(sig, { descriptor, where, conns: [sock] });
+    }
+  }
+
+  for (const { descriptor, where, conns } of byFilter.values()) {
+    const { total, token } = countAndToken(
+      db,
+      descriptor,
+      where.clause,
+      where.params,
+    );
+    for (const sock of conns) {
+      // Backpressure: skip a pending conn WITHOUT advancing its baseline, so
+      // the signal re-fires next tick (mirrors the patch pass).
+      if (sock.data.pending) {
+        continue;
+      }
+      if (total !== sock.data.lastTotal || token !== sock.data.lastToken) {
+        writeFrames(sock, [
+          { type: "meta", collection: descriptor.name, rev, total },
+        ]);
+        sock.data.lastTotal = total;
+        sock.data.lastToken = token;
       }
     }
   }
@@ -754,6 +903,9 @@ export function startServer(
         socket.data.collection = null;
         socket.data.watched.clear();
         socket.data.lastSent.clear();
+        socket.data.where = null;
+        socket.data.lastTotal = null;
+        socket.data.lastToken = null;
       },
       error(_socket, err) {
         console.error("[server-worker] socket error:", err);

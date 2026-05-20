@@ -23,10 +23,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Row } from "../src/collections";
+import { countAndToken, JOBS_DESCRIPTOR, type Row } from "../src/collections";
 import { openDb } from "../src/db";
 import type {
   ErrorFrame,
+  MetaFrame,
   PatchFrame,
   ResultFrame,
   ServerFrame,
@@ -39,6 +40,7 @@ import {
   isPidAlive,
   LockHeldError,
   pollLoop,
+  resolveFilter,
   resumePending,
   runQuery,
   startServer,
@@ -94,6 +96,9 @@ function dispatchInit(): ConnState {
     collection: null,
     watched: new Set<string>(),
     lastSent: new Map<string, number>(),
+    where: null,
+    lastTotal: null,
+    lastToken: null,
     pending: null,
   };
 }
@@ -549,17 +554,36 @@ function fakeSock(): Writable & {
 
 /**
  * Seed a connection's active collection + watched-set + lastSent from the rows
- * it would page. `diffTick` groups by `collection` and skips null-collection
- * conns, so the active collection must be set for the diff to visit the conn.
+ * it would page, PLUS the membership baseline (`where` + `lastTotal` +
+ * `lastToken`) the meta pass diffs against. `diffTick` groups by `collection`
+ * and skips null-collection conns, so the active collection must be set for the
+ * diff to visit the conn. The baseline is computed from the live DB so a pure
+ * cell update (membership unchanged) is a meta-pass no-op for these tests.
+ *
+ * `filter` is the wire filter the subscription was built from (`{}` =
+ * unfiltered, the jobs default). The membership baseline is seeded from the SAME
+ * resolved filter / countAndToken the server would have used.
  */
 function watch(
+  db: Database,
   sock: Writable,
   seed: Record<string, number>,
+  filter: Record<string, string | number> = {},
   collection = "jobs",
 ): void {
   sock.data.collection = collection;
   sock.data.watched = new Set(Object.keys(seed));
   sock.data.lastSent = new Map(Object.entries(seed));
+  const where = resolveFilter(JOBS_DESCRIPTOR, filter);
+  const { total, token } = countAndToken(
+    db,
+    JOBS_DESCRIPTOR,
+    where.clause,
+    where.params,
+  );
+  sock.data.where = where;
+  sock.data.lastTotal = total;
+  sock.data.lastToken = token;
 }
 
 /** Bump a job's last_event_id (and updated_at) — simulates a reducer fold. */
@@ -597,7 +621,7 @@ test("diffTick pushes one patch when a watched row advances; rev is stamped", ()
   seedJob(db, "a", { last_event_id: 5 });
   setWorldRev(db, 42);
   const sock = fakeSock();
-  watch(sock, { a: 5 }); // seeded from the snapshot read
+  watch(db, sock, { a: 5 }); // seeded from the snapshot read
 
   advanceJob(db, "a", 6); // reducer folded a new event for `a`
   diffTick(db, [sock]);
@@ -619,7 +643,7 @@ test("diffTick emits nothing when no watched row advanced (no-op tick)", () => {
   seedJob(db, "a", { last_event_id: 5 });
   seedJob(db, "other", { last_event_id: 1 });
   const sock = fakeSock();
-  watch(sock, { a: 5 });
+  watch(db, sock, { a: 5 });
 
   // An unrelated job folds — the watched id is unchanged.
   advanceJob(db, "other", 9);
@@ -633,7 +657,7 @@ test("diffTick does not double-send: a second tick with no change emits nothing"
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "a", { last_event_id: 5 });
   const sock = fakeSock();
-  watch(sock, { a: 5 });
+  watch(db, sock, { a: 5 });
 
   advanceJob(db, "a", 6);
   diffTick(db, [sock]);
@@ -650,9 +674,9 @@ test("diffTick fans out only to connections watching the changed id", () => {
   seedJob(db, "a", { last_event_id: 1 });
   seedJob(db, "b", { last_event_id: 1 });
   const watcherA = fakeSock();
-  watch(watcherA, { a: 1 });
+  watch(db, watcherA, { a: 1 });
   const watcherB = fakeSock();
-  watch(watcherB, { b: 1 });
+  watch(db, watcherB, { b: 1 });
 
   // Only `a` advances.
   advanceJob(db, "a", 2);
@@ -668,7 +692,7 @@ test("diffTick coalesces multiple folds between ticks into one patch", () => {
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "a", { last_event_id: 1 });
   const sock = fakeSock();
-  watch(sock, { a: 1 });
+  watch(db, sock, { a: 1 });
 
   // Three folds land before the tick observes them; state-based diff collapses.
   advanceJob(db, "a", 2);
@@ -685,9 +709,9 @@ test("diffTick skips a backpressured socket without stalling others; lastSent no
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "a", { last_event_id: 1 });
   const slow = fakeSock();
-  watch(slow, { a: 1 });
+  watch(db, slow, { a: 1 });
   const fast = fakeSock();
-  watch(fast, { a: 1 });
+  watch(db, fast, { a: 1 });
 
   // Pre-stash a pending write on `slow` so diffTick sees it as backpressured.
   slow.data.pending = { bytes: new Uint8Array([1]), offset: 0 };
@@ -717,7 +741,7 @@ test("diffTick never visits a null-collection connection", () => {
   idle.data.lastSent = new Map([["a", 1]]);
 
   const active = fakeSock();
-  watch(active, { a: 1 });
+  watch(db, active, { a: 1 });
 
   advanceJob(db, "a", 2);
   diffTick(db, [idle, active]);
@@ -734,9 +758,9 @@ test("diffTick groups connections by collection (one selectByIds per group)", ()
   seedJob(db, "a", { last_event_id: 1 });
   // Two conns on the same collection watching the same id → one shared re-read.
   const w1 = fakeSock();
-  watch(w1, { a: 1 });
+  watch(db, w1, { a: 1 });
   const w2 = fakeSock();
-  watch(w2, { a: 1 });
+  watch(db, w2, { a: 1 });
 
   advanceJob(db, "a", 2);
   diffTick(db, [w1, w2]);
@@ -758,7 +782,7 @@ test("pollLoop drives a patch to a subscriber after a separate writer commits", 
   setWorldRev(writer, 7);
 
   const sock = fakeSock();
-  watch(sock, { a: 1 });
+  watch(writer, sock, { a: 1 });
 
   let stop = false;
   const loop = pollLoop(
@@ -798,7 +822,7 @@ test("pollLoop emits no patch when the committed change misses every watched id"
   seedJob(writer, "unwatched", { last_event_id: 1 });
 
   const sock = fakeSock();
-  watch(sock, { a: 1 });
+  watch(writer, sock, { a: 1 });
 
   let stop = false;
   const loop = pollLoop(
@@ -821,4 +845,261 @@ test("pollLoop emits no patch when the committed change misses every watched id"
 
   reader.close();
   writer.close();
+});
+
+// ---------------------------------------------------------------------------
+// total + membership token (countAndToken)
+// ---------------------------------------------------------------------------
+
+/** Delete a job — simulates a row leaving the filtered set. */
+function deleteJob(db: Database, job_id: string): void {
+  db.query("DELETE FROM jobs WHERE job_id = ?").run(job_id);
+}
+
+/** First (and only) meta frame on a fake socket, or null. */
+function firstMeta(sock: { frames: ServerFrame[] }): MetaFrame | null {
+  const f = sock.frames.find((x) => x.type === "meta");
+  return (f as MetaFrame | undefined) ?? null;
+}
+
+test("runQuery returns total = filtered-set size, independent of limit/offset", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  for (let i = 0; i < 5; i++) {
+    seedJob(db, `j${i}`, { updated_at: i });
+  }
+  // limit/offset trim the page but NOT the total.
+  const res = asResult(
+    runQuery(db, 0, { type: "query", collection: "jobs", limit: 2, offset: 1 }),
+  );
+  expect(res.rows).toHaveLength(2);
+  expect(res.total).toBe(5);
+  db.close();
+});
+
+test("runQuery total reflects the filter (not the whole table)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "w1", { state: "working" });
+  seedJob(db, "w2", { state: "working" });
+  seedJob(db, "s1", { state: "stopped" });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      filter: { state: "working" },
+    }),
+  );
+  expect(res.total).toBe(2);
+  db.close();
+});
+
+test("countAndToken: token is STABLE across a cell update of a matching row", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  seedJob(db, "b", { last_event_id: 1 });
+  const before = countAndToken(db, JOBS_DESCRIPTOR, "", []);
+  // A pure cell update (last_event_id / updated_at) — membership is unchanged.
+  advanceJob(db, "a", 9);
+  const after = countAndToken(db, JOBS_DESCRIPTOR, "", []);
+  expect(after.total).toBe(before.total);
+  expect(after.token).toBe(before.token);
+  db.close();
+});
+
+test("countAndToken: token CHANGES on a row entering the set", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a");
+  const before = countAndToken(db, JOBS_DESCRIPTOR, "", []);
+  seedJob(db, "b"); // enters
+  const after = countAndToken(db, JOBS_DESCRIPTOR, "", []);
+  expect(after.total).toBe(before.total + 1);
+  expect(after.token).not.toBe(before.token);
+  db.close();
+});
+
+test("countAndToken: token CHANGES on a row leaving the set", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a");
+  seedJob(db, "b");
+  const before = countAndToken(db, JOBS_DESCRIPTOR, "", []);
+  deleteJob(db, "b"); // leaves
+  const after = countAndToken(db, JOBS_DESCRIPTOR, "", []);
+  expect(after.total).toBe(before.total - 1);
+  expect(after.token).not.toBe(before.token);
+  db.close();
+});
+
+test("countAndToken: balanced swap changes token but not total", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a");
+  seedJob(db, "b");
+  const before = countAndToken(db, JOBS_DESCRIPTOR, "", []);
+  // One row leaves as another enters — count steady, membership different.
+  deleteJob(db, "b");
+  seedJob(db, "c");
+  const after = countAndToken(db, JOBS_DESCRIPTOR, "", []);
+  expect(after.total).toBe(before.total);
+  expect(after.token).not.toBe(before.token);
+  db.close();
+});
+
+test("countAndToken: empty set normalizes to total=0 / token=''", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  // No jobs match the filter.
+  const where = resolveFilter(JOBS_DESCRIPTOR, { state: "nonesuch" });
+  const res = countAndToken(db, JOBS_DESCRIPTOR, where.clause, where.params);
+  expect(res.total).toBe(0);
+  expect(res.token).toBe("");
+  db.close();
+});
+
+test("countAndToken: token is order-stable regardless of insertion order", () => {
+  // Same identity set inserted in different orders → same token (ORDER BY pk).
+  const { db: db1 } = openDb(dbPath, { readonly: false });
+  seedJob(db1, "c");
+  seedJob(db1, "a");
+  seedJob(db1, "b");
+  const t1 = countAndToken(db1, JOBS_DESCRIPTOR, "", []).token;
+  db1.close();
+  // Fresh DB, reversed insertion order.
+  rmSync(tmpDir, { recursive: true, force: true });
+  tmpDir = mkdtempSync(join(tmpdir(), "keeper-server-test-"));
+  dbPath = join(tmpDir, "keeper.db");
+  openDb(dbPath).db.close();
+  const { db: db2 } = openDb(dbPath, { readonly: false });
+  seedJob(db2, "b");
+  seedJob(db2, "a");
+  seedJob(db2, "c");
+  const t2 = countAndToken(db2, JOBS_DESCRIPTOR, "", []).token;
+  db2.close();
+  expect(t1).toBe(t2);
+});
+
+// ---------------------------------------------------------------------------
+// diffTick → meta (membership staleness)
+// ---------------------------------------------------------------------------
+
+test("diffTick emits a meta when total grows (a row enters the set)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  setWorldRev(db, 5);
+  const sock = fakeSock();
+  watch(db, sock, { a: 1 }); // baseline total=1, token over {a}
+
+  seedJob(db, "b", { last_event_id: 1 }); // enters the unfiltered set
+  diffTick(db, [sock]);
+
+  const meta = firstMeta(sock);
+  expect(meta).not.toBeNull();
+  expect(meta?.collection).toBe("jobs");
+  expect(meta?.total).toBe(2);
+  expect(meta?.rev).toBe(5);
+  // Baseline advanced — a second no-change tick is silent.
+  expect(sock.data.lastTotal).toBe(2);
+  diffTick(db, [sock]);
+  expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(1);
+  db.close();
+});
+
+test("diffTick emits a meta on a balanced swap (token-only change, total steady)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  seedJob(db, "b", { last_event_id: 1 });
+  const sock = fakeSock();
+  watch(db, sock, { a: 1 }); // baseline total=2
+
+  // One leaves, one enters — total stays 2, membership differs.
+  deleteJob(db, "b");
+  seedJob(db, "c", { last_event_id: 1 });
+  diffTick(db, [sock]);
+
+  const meta = firstMeta(sock);
+  expect(meta).not.toBeNull();
+  expect(meta?.total).toBe(2);
+  db.close();
+});
+
+test("diffTick emits NO meta on a pure cell update (only a patch)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  const sock = fakeSock();
+  watch(db, sock, { a: 1 });
+
+  advanceJob(db, "a", 2); // cell update of a matching row
+  diffTick(db, [sock]);
+
+  expect(sock.frames.filter((f) => f.type === "patch")).toHaveLength(1);
+  expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(0);
+  db.close();
+});
+
+test("diffTick emits no meta when nothing about membership changed", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  seedJob(db, "other", { last_event_id: 1 });
+  const sock = fakeSock();
+  watch(db, sock, { a: 1 }); // unfiltered baseline total=2
+
+  // An unrelated cell update — membership of the unfiltered set is unchanged.
+  advanceJob(db, "other", 9);
+  diffTick(db, [sock]);
+
+  expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(0);
+  db.close();
+});
+
+test("diffTick shares one count across two conns on the same filter; both advance", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "w1", { state: "working" });
+  const w1 = fakeSock();
+  watch(db, w1, { w1: 1 }, { state: "working" });
+  const w2 = fakeSock();
+  watch(db, w2, { w1: 1 }, { state: "working" });
+
+  // A new working job enters the shared filter.
+  seedJob(db, "w2", { state: "working" });
+  diffTick(db, [w1, w2]);
+
+  expect(firstMeta(w1)?.total).toBe(2);
+  expect(firstMeta(w2)?.total).toBe(2);
+  expect(w1.data.lastTotal).toBe(2);
+  expect(w2.data.lastTotal).toBe(2);
+  db.close();
+});
+
+test("diffTick distinguishes filters: a working-only conn ignores a stopped enter", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "w1", { state: "working" });
+  const working = fakeSock();
+  watch(db, working, { w1: 1 }, { state: "working" });
+
+  // A STOPPED job enters — it does not match the working filter.
+  seedJob(db, "s1", { state: "stopped" });
+  diffTick(db, [working]);
+
+  expect(working.frames.filter((f) => f.type === "meta")).toHaveLength(0);
+  db.close();
+});
+
+test("diffTick backpressure: a pending conn gets no meta and does NOT advance; next tick delivers", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  const sock = fakeSock();
+  watch(db, sock, { a: 1 }); // baseline total=1
+
+  // Backpressured: a pending write is stashed.
+  sock.data.pending = { bytes: new Uint8Array([1]), offset: 0 };
+
+  seedJob(db, "b", { last_event_id: 1 }); // membership grows to 2
+  diffTick(db, [sock]);
+
+  // Skipped: no meta, baseline NOT advanced.
+  expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(0);
+  expect(sock.data.lastTotal).toBe(1);
+
+  // Unblock and re-tick: the signal is re-derived from current state.
+  sock.data.pending = null;
+  diffTick(db, [sock]);
+  expect(firstMeta(sock)?.total).toBe(2);
+  expect(sock.data.lastTotal).toBe(2);
+  db.close();
 });

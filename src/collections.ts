@@ -132,3 +132,62 @@ export function selectByIds(
   const stmt = db.prepare(sql);
   return stmt.all(...ids) as Row[];
 }
+
+/** A filtered set's size + a membership fingerprint over its pk identities. */
+export interface CountAndToken {
+  /** `COUNT(*)` over the full filtered set (the WHERE only — no limit/offset). */
+  total: number;
+  /**
+   * A fingerprint of the matching rows' pk IDENTITIES (never mutable columns),
+   * ordered by pk so it's stable tick-to-tick. Changes iff a row enters/leaves
+   * the filtered set (incl. a balanced swap: one in, one out, `total` steady).
+   * The empty set normalizes to `""` so it compares cleanly against a populated
+   * set's token.
+   */
+  token: string;
+}
+
+/**
+ * Compute a filtered set's `total` plus a membership `token` in ONE query. The
+ * caller passes the already-resolved `whereClause` ("" or "WHERE ...") and its
+ * bound `params` — the SAME pair that built the page SELECT — so the count can
+ * never drift from the page (a drift would mean "X of N" where X isn't a subset
+ * of N).
+ *
+ * The token is `group_concat(<pk>)` over the matching pk identities, computed
+ * via the portable subquery form `SELECT group_concat(pk) FROM (SELECT pk ...
+ * ORDER BY pk)`. The inner `ORDER BY <pk>` is REQUIRED: SQLite `group_concat`
+ * order is otherwise arbitrary (plan-dependent), and an unstable token fires
+ * phantom `meta` frames every tick. Ordering by the pk (the stable identity),
+ * not the display sort, keeps the token a pure membership fingerprint. The
+ * subquery form (rather than SQLite-3.44+ `group_concat(pk ORDER BY pk)`) drops
+ * a runtime-version dependency at zero cost on a tiny table.
+ *
+ * `group_concat` over zero rows returns `NULL`; we normalize that to `""` so an
+ * empty filtered set has a stable `token=""` / `total=0` that diffs cleanly.
+ *
+ * Injection: only `descriptor.table` / `descriptor.pk` are interpolated
+ * (trusted constants); the filter `params` are bound (`?`). The descriptor stays
+ * the SOLE SQL-identifier injection gate — see the file-top invariant.
+ */
+export function countAndToken(
+  db: Database,
+  descriptor: CollectionDescriptor,
+  whereClause: string,
+  params: readonly (string | number)[],
+): CountAndToken {
+  const sql = `
+    SELECT COUNT(*) AS n, group_concat(${descriptor.pk}) AS token
+      FROM (
+        SELECT ${descriptor.pk}
+          FROM ${descriptor.table}
+          ${whereClause}
+         ORDER BY ${descriptor.pk}
+      )
+  `;
+  const row = db.prepare(sql).get(...params) as {
+    n: number;
+    token: string | null;
+  };
+  return { total: row.n, token: row.token ?? "" };
+}

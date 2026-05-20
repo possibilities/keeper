@@ -25,19 +25,27 @@ page that doubles as a live subscription. `jobs` is the first and default
 collection; the surface is built so additional collections register without
 touching the wire protocol or the diff machinery. Page membership is frozen at
 query time, but each row's cells stream `patch` frames as the reducer folds new
-events. The server is just another reader — its own read-only connection, its
-own `data_version` poll — and the socket is **read-only**: there is no client
-write path. No consumer ships yet; the documented protocol is the target for a
-future TUI.
+events. The `result` page also carries a `total` (the filtered-set size,
+ignoring limit/offset) and the server emits a third frame, `meta`, when that set
+changes — a row enters or leaves the filter — so a paginated client can render
+"showing X of N" and a non-disruptive "set changed, refresh" nudge without the
+list reflowing under the cursor. The server is just another reader — its own
+read-only connection, its own `data_version` poll — and the socket is
+**read-only**: there is no client write path. No consumer ships yet; the
+documented protocol is the target for a future TUI.
 
 ## What keeper is NOT
 
 Keeper's read surface is intentionally narrow. Explicit non-goals:
 
 - **No client mutations, no reactor, no write path through the socket** — the
-  UDS server is read-only subscribe (`query` → `result` + `patch`). The socket
-  never carries a command into keeper; consumers may still read the SQLite
-  projection directly.
+  UDS server is read-only subscribe (`query` → `result` + `patch` + `meta`). The
+  socket never carries a command into keeper; consumers may still read the
+  SQLite projection directly.
+- **No live membership stream** — `meta.total` signals that the filtered set's
+  size or membership *changed*, but it does NOT deliver the new members. Frozen
+  membership stands: the live page never reflows. `meta` is a count/staleness
+  nudge ("re-query if you care"), not a live insert/remove/reorder feed.
 - **No UI** — `sqlite3` is the inspection surface.
 - **No multi-machine** — single host, single DB file.
 - **No name scraping, no transcript tailing** — keeper reads hook payloads only.
@@ -144,9 +152,16 @@ and everything collection-specific (which table to read, which columns to serve,
 which column the diff fires on) is described by a registry entry rather than
 hardcoded — `jobs` is the first such collection. On each `data_version` tick the
 server re-reads its watched rows, diffs the per-row version column, and pushes
-`patch` frames to subscribed clients. The two workers are fully independent
-readers; main supervises both lifecycles but routes neither's traffic, and
-either worker's `error` event escalates the whole process to a clean restart.
+`patch` frames to subscribed clients. The same tick also runs a second pass: it
+groups subscriptions by filter signature, runs one `COUNT(*)` + membership-token
+query per distinct filter (the token is a `group_concat` over the matching pk
+identities, ordered by pk so it's stable and fingerprints membership, not cell
+values), and emits a `meta` frame to any subscription whose `total` or token
+moved — the count/staleness signal, sharing one query across same-filter clients
+exactly as the patch pass shares one re-read per collection. The two workers are
+fully independent readers; main supervises both lifecycles but routes neither's
+traffic, and either worker's `error` event escalates the whole process to a clean
+restart.
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).

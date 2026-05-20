@@ -12,6 +12,7 @@ import {
   extractLines,
   LineBuffer,
   MAX_LINE_LENGTH,
+  type MetaFrame,
   OversizedLineError,
   type PatchFrame,
   type ResultFrame,
@@ -52,16 +53,19 @@ describe("encodeFrame", () => {
     expect(JSON.parse(line)).toEqual(frame);
   });
 
-  test("round-trips a result frame with collection + rev + rows", () => {
+  test("round-trips a result frame with collection + rev + total + rows", () => {
     const frame: ResultFrame = {
       type: "result",
       id: "q1",
       collection: "jobs",
       rev: 99,
+      total: 7,
       rows: [sampleJob],
     };
     const line = encodeFrame(frame).slice(0, -1);
-    expect(JSON.parse(line)).toEqual(frame);
+    const parsed = JSON.parse(line) as ResultFrame;
+    expect(parsed).toEqual(frame);
+    expect(parsed.total).toBe(7);
   });
 
   test("round-trips a patch frame with collection + rev + row", () => {
@@ -73,6 +77,20 @@ describe("encodeFrame", () => {
     };
     const line = encodeFrame(frame).slice(0, -1);
     expect(JSON.parse(line)).toEqual(frame);
+  });
+
+  test("round-trips a meta frame with collection + rev + total", () => {
+    const frame: MetaFrame = {
+      type: "meta",
+      collection: "jobs",
+      rev: 103,
+      total: 12,
+    };
+    const line = encodeFrame(frame).slice(0, -1);
+    const parsed = JSON.parse(line) as MetaFrame;
+    expect(parsed).toEqual(frame);
+    expect(parsed.type).toBe("meta");
+    expect(parsed.total).toBe(12);
   });
 });
 
