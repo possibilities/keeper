@@ -6,6 +6,7 @@
  * reducer_state seeded, readonly flag honored, env-var override honored.
  */
 
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -161,7 +162,68 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("1");
+  expect(row.value).toBe("2");
+  db.close();
+});
+
+test("jobs has title + title_history columns with the right defaults", () => {
+  const { db } = openDb(dbPath);
+  const cols = db.prepare("PRAGMA table_info(jobs)").all() as {
+    name: string;
+    dflt_value: string | null;
+    notnull: number;
+  }[];
+  const title = cols.find((c) => c.name === "title");
+  const history = cols.find((c) => c.name === "title_history");
+  expect(title).toBeDefined();
+  expect(title?.notnull).toBe(0); // nullable
+  expect(history).toBeDefined();
+  expect(history?.notnull).toBe(1); // NOT NULL
+  // A fresh row reads the zero-event defaults.
+  db.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('z', 1, 0, 1)",
+  ).run();
+  const r = db
+    .prepare("SELECT title, title_history FROM jobs WHERE job_id = 'z'")
+    .get() as { title: string | null; title_history: string };
+  expect(r.title).toBeNull();
+  expect(r.title_history).toBe("[]");
+  db.close();
+});
+
+test("v1 DB migrates to v2: existing rows backfill title_history=[]", () => {
+  // Build a v1-shaped DB by hand: no title columns, schema_version='1'.
+  const v1 = new Database(dbPath, { create: true });
+  v1.exec(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      mode TEXT NOT NULL DEFAULT 'act',
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL
+    )
+  `);
+  v1.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v1.exec("INSERT INTO meta (key, value) VALUES ('schema_version', '1')");
+  v1.exec(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('old', 1, 5, 1)",
+  );
+  v1.close();
+
+  // Reopen via openDb — migrate() runs the v1→v2 ALTERs.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("2");
+  const row = db
+    .prepare("SELECT title, title_history FROM jobs WHERE job_id = 'old'")
+    .get() as { title: string | null; title_history: string };
+  expect(row.title).toBeNull();
+  expect(row.title_history).toBe("[]");
   db.close();
 });
 
@@ -249,6 +311,36 @@ test("selectByIds returns matching rows for a multi-id set", () => {
   const c = rows.find((r) => r.job_id === "c");
   expect(c?.cwd).toBeNull();
   expect(c?.pid).toBeNull();
+  db.close();
+});
+
+test("selectByIds decodes title_history to a real array (and [] when title-less)", () => {
+  const { db } = openDb(dbPath);
+  const ts = 1_700_000_000;
+  db.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title, title_history) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run(
+    "titled",
+    ts,
+    1,
+    ts,
+    "fix-osc",
+    JSON.stringify(["keeper-009", "fix-osc"]),
+  );
+  // A title-less job seeded via the schema default ('[]').
+  db.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES (?, ?, ?, ?)",
+  ).run("bare", ts, 1, ts);
+
+  const rows = selectByIds(db, JOBS_DESCRIPTOR, ["titled", "bare"]);
+  const titled = rows.find((r) => r.job_id === "titled");
+  const bare = rows.find((r) => r.job_id === "bare");
+  expect(titled?.title).toBe("fix-osc");
+  expect(Array.isArray(titled?.title_history)).toBe(true);
+  expect(titled?.title_history).toEqual(["keeper-009", "fix-osc"]);
+  expect(bare?.title).toBeNull();
+  expect(Array.isArray(bare?.title_history)).toBe(true);
+  expect(bare?.title_history).toEqual([]);
   db.close();
 });
 

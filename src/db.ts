@@ -22,7 +22,7 @@ import { dirname, join } from "node:path";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -105,7 +105,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     mode TEXT NOT NULL DEFAULT 'act',
     state TEXT NOT NULL DEFAULT 'stopped',
     last_event_id INTEGER,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    title TEXT,
+    title_history TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(title_history))
 )
 `;
 
@@ -173,6 +175,28 @@ function applyPragmas(db: Database): void {
 }
 
 /**
+ * Add a column to a table only if it isn't already present. The migrate block
+ * runs on EVERY boot, and on a fresh DB the CREATE TABLE already defines the
+ * new columns — so an unconditional `ALTER TABLE ... ADD COLUMN` would throw
+ * "duplicate column name". Reading `PRAGMA table_info` makes the ALTER an
+ * idempotent no-op when the column exists (forward-only: we never drop).
+ */
+function addColumnIfMissing(
+  db: Database,
+  table: string,
+  column: string,
+  columnDef: string,
+): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as {
+    name: string;
+  }[];
+  if (cols.some((c) => c.name === column)) {
+    return;
+  }
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${columnDef}`);
+}
+
+/**
  * Run schema bootstrap + forward-only ALTER block. Writer-only. Wrapped in a
  * single transaction so a half-applied schema can never persist across a
  * crashed boot.
@@ -200,8 +224,18 @@ function migrate(db: Database): void {
       .get() as { value: string } | null;
     const current = row ? Number.parseInt(row.value, 10) : 0;
 
-    if (current < 1) {
-      // Reserved slot for v1→v2 ALTERs. Add lines here as the schema grows.
+    if (current < 2) {
+      // v1→v2: add the `title` + `title_history` columns to `jobs`. ADD COLUMN
+      // does not rewrite existing rows, so prior `jobs` rows backfill to
+      // `title=NULL` / `title_history='[]'` — matching the zero-event
+      // projection. Column defs match CREATE_JOBS (keep the two in sync).
+      addColumnIfMissing(db, "jobs", "title", "TEXT");
+      addColumnIfMissing(
+        db,
+        "jobs",
+        "title_history",
+        "TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(title_history))",
+      );
     }
 
     db.prepare(

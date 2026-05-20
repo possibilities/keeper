@@ -97,6 +97,36 @@ function extractPermissionMode(event: Event): string | null {
 }
 
 /**
+ * Extract the top-level `session_title` from an event's `data` blob. Mirrors
+ * {@link extractPermissionMode}: try/catch around `JSON.parse(event.data)`,
+ * skip-and-log via `console.error` on a malformed blob (the cursor still
+ * advances upstream so one bad row never wedges the reducer). `session_title`
+ * is NOT lifted to an events column — the raw blob is its only carrier.
+ *
+ * Run event-agnostically like the mode rule (not gated to UserPromptSubmit); in
+ * practice only UserPromptSubmit carries it. Returns the title only when it is a
+ * non-empty string, else `null`.
+ */
+function extractSessionTitle(event: Event): string | null {
+  if (event.data && event.data.length > 0) {
+    try {
+      const parsed = JSON.parse(event.data) as { session_title?: unknown };
+      const title = parsed.session_title;
+      if (typeof title === "string" && title.length > 0) {
+        return title;
+      }
+    } catch (err) {
+      // Malformed JSON: skip-and-log. The cursor still advances upstream so the
+      // reducer never wedges on one bad row.
+      console.error(
+        `keeper reducer: failed to parse data blob for event id=${event.id} session=${event.session_id}: ${err}`,
+      );
+    }
+  }
+  return null;
+}
+
+/**
  * Apply the jobs-side projection for one event. Runs INSIDE the open
  * transaction opened by {@link applyEvent}; performs zero cursor work.
  *
@@ -161,6 +191,39 @@ function projectJobsRow(db: Database, event: Event): void {
       "UPDATE jobs SET mode = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
       [mapMode(permissionMode), event.id, ts, jobId],
     );
+  }
+
+  // Title rule: a `session_title` in the data blob folds into `jobs.title` and
+  // appends to `jobs.title_history`, layered on top of any lifecycle/mode write
+  // above. Like the mode rule it runs on ANY event and has no `state != 'ended'`
+  // guard (no title-bearing events arrive post-SessionEnd anyway).
+  //
+  // Re-fold determinism: the append compares the incoming title against the
+  // PERSISTED `title` (read in-txn), never an accumulator. When the title is
+  // unchanged we skip the write entirely (no `last_event_id` bump) — so a
+  // rebuild-from-scratch reproduces identical history. Reverts re-append (A→B→A
+  // yields ["A","B","A"]); we compare only against the current tail, NO dedup.
+  // No row → no-op.
+  const title = extractSessionTitle(event);
+  if (title != null) {
+    const row = db
+      .query("SELECT title, title_history FROM jobs WHERE job_id = ?")
+      .get(jobId) as { title: string | null; title_history: string } | null;
+    if (row != null && row.title !== title) {
+      let history: string[];
+      try {
+        const parsed = JSON.parse(row.title_history) as unknown;
+        history = Array.isArray(parsed) ? (parsed as string[]) : [];
+      } catch {
+        // A corrupt persisted history never wedges the fold — restart from [].
+        history = [];
+      }
+      history.push(title);
+      db.run(
+        "UPDATE jobs SET title = ?, title_history = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
+        [title, JSON.stringify(history), event.id, ts, jobId],
+      );
+    }
   }
 }
 

@@ -51,10 +51,13 @@ file is the in-codebase map for AI agents working in the repo.
   - `src/collections.ts` — the collection registry that namespaces the read
     surface. A `CollectionDescriptor` holds everything collection-specific
     (table, served columns, pk, the per-row `version` column the diff fires on,
-    the sort allowlist + default sort, and the filter-key → SQL-column map);
+    the sort allowlist + default sort, the filter-key → SQL-column map, and
+    `jsonColumns` — the set of JSON-TEXT columns `decodeRow` parses into real
+    values at the read boundary, e.g. `title_history`);
     `REGISTRY` / `getCollection` resolve a wire `collection` name to its
     descriptor, `selectByIds(db, descriptor, ids)` is the
-    descriptor-parameterized by-id read, and `countAndToken(db, descriptor,
+    descriptor-parameterized by-id read (it `decodeRow`s its rows, so the diff
+    path and the page SELECT agree on the decoded shape), and `countAndToken(db, descriptor,
     whereClause, params)` is the descriptor-parameterized count-query — the
     filtered-set `COUNT(*)` plus a `group_concat(pk)` membership token (ordered
     by pk, empty-set normalized to `total=0`/`token=""`) that the `meta` signal
@@ -102,7 +105,13 @@ The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
 
 - `SessionStart` → `INSERT OR IGNORE` a new job row (schema defaults
   `mode='act'`, `state='stopped'` — the zero-event reading).
-- `UserPromptSubmit` → `state = 'working'` (skipped when already `ended`).
+- `UserPromptSubmit` → `state = 'working'` (skipped when already `ended`). Also
+  carries `session_title` in its `data` blob: when present and **different from
+  the persisted `title`**, the reducer does a read-modify-write — `SELECT title,
+  title_history`, push the new title onto the parsed history (natural order,
+  reverts re-append, NO dedup), and `UPDATE title + title_history`. Unchanged
+  title → no write (re-fold determinism: compare against the persisted tail, not
+  an accumulator). Runs event-agnostically like the mode rule (no `ended` guard).
 - `Stop` → `state = 'stopped'` (skipped when already `ended`).
 - `SessionEnd` → `state = 'ended'`, sticky thereafter (always lands).
 - ANY event carrying `permission_mode` → `mode = 'plan' | 'act'`, layered on
@@ -118,8 +127,9 @@ The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
   idempotently. This is the exactly-once-per-event guarantee — never split the
   two writes across transactions.
 - **Defaults match the zero-event projection.** A row inserted by
-  `SessionStart` reads `mode='act'`, `state='stopped'` before any further
-  event. Keep schema defaults and the reducer's no-op branches in sync.
+  `SessionStart` reads `mode='act'`, `state='stopped'`, `title=NULL`,
+  `title_history='[]'` before any further event. Keep schema defaults and the
+  reducer's no-op branches in sync.
 - **One drain code path serves boot and steady-state.** `drainToCompletion`
   loops `drain()` until it returns 0; the boot catch-up and every wake use it.
   Do not add a separate boot path.

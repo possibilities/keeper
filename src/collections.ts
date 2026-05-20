@@ -42,6 +42,10 @@ export type { Row };
  * - `defaultSort` — the fallback sort when none/an unknown column is requested.
  * - `filters` — wire filter-key → SQL column. MUST include the pk so a
  *   detail-page single-item subscribe (`filter:{<pk>}`) works.
+ * - `jsonColumns` — columns stored as JSON TEXT that {@link decodeRow} parses
+ *   into real values at the read boundary (so `result` and `patch` frames serve
+ *   an array/object, not a JSON string). A parse failure / NULL falls back to
+ *   `[]` per row (honors "one bad row never wedges a reader").
  */
 export interface CollectionDescriptor {
   name: string;
@@ -52,6 +56,7 @@ export interface CollectionDescriptor {
   sortable: ReadonlySet<string>;
   defaultSort: { column: string; dir: "asc" | "desc" };
   filters: Readonly<Record<string, string>>;
+  jsonColumns: ReadonlySet<string>;
 }
 
 /**
@@ -73,6 +78,8 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "state",
     "last_event_id",
     "updated_at",
+    "title",
+    "title_history",
   ],
   pk: "job_id",
   version: "last_event_id",
@@ -86,6 +93,10 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
   ]),
   defaultSort: { column: "updated_at", dir: "desc" },
   filters: { state: "state", mode: "mode", cwd: "cwd", job_id: "job_id" },
+  // `title` is read-only display this phase — NOT in `sortable`/`filters`.
+  // `title_history` is stored as JSON TEXT and decoded to an array at the read
+  // boundary (both row-producing reads call `decodeRow`).
+  jsonColumns: new Set(["title_history"]),
 };
 
 /** The registry, keyed by wire-facing collection name. One entry today. */
@@ -130,7 +141,43 @@ export function selectByIds(
   // Per-call prepare: the statement shape is arity-dependent and page sizes are
   // small (capped well below MAX_IN_PARAMS), so compile cost is negligible.
   const stmt = db.prepare(sql);
-  return stmt.all(...ids) as Row[];
+  const rows = stmt.all(...ids) as Row[];
+  // Decode JSON-TEXT columns (e.g. `title_history`) so the diff/patch path
+  // serves the same array shape as the page SELECT in `runQuery`.
+  return rows.map((row) => decodeRow(descriptor, row));
+}
+
+/**
+ * Decode a row's JSON-TEXT columns into real values at the read boundary. For
+ * each name in `descriptor.jsonColumns`, replaces the row's stored TEXT with
+ * `JSON.parse`'d output so the wire frame serves an array/object — not a JSON
+ * string. A NULL/empty cell or a parse failure falls back to `[]` for that
+ * column (one bad row never wedges a reader). Returns a new row; the input is
+ * left untouched.
+ *
+ * MUST be called at BOTH row-producing reads (the page SELECT in
+ * `runQuery` and `selectByIds` on the diff path) so `result` and `patch` frames
+ * agree on the decoded shape — a divergence would serve `title_history` as a
+ * string on one path and an array on the other.
+ */
+export function decodeRow(descriptor: CollectionDescriptor, row: Row): Row {
+  if (descriptor.jsonColumns.size === 0) {
+    return row;
+  }
+  const out: Row = { ...row };
+  for (const col of descriptor.jsonColumns) {
+    const raw = out[col];
+    if (typeof raw === "string" && raw.length > 0) {
+      try {
+        out[col] = JSON.parse(raw);
+        continue;
+      } catch {
+        // fall through to the [] fallback
+      }
+    }
+    out[col] = [];
+  }
+  return out;
 }
 
 /** A filtered set's size + a membership fingerprint over its pk identities. */

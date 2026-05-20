@@ -223,6 +223,57 @@ test("runQuery resolves the pk filter for a detail-page single-item subscribe", 
   db.close();
 });
 
+/** Seed a job carrying a title + a JSON-TEXT title_history (the stored shape). */
+function seedTitledJob(
+  db: Database,
+  job_id: string,
+  title: string,
+  history: string[],
+): void {
+  db.query(
+    `INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title, title_history)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(job_id, 1, 0, 1, title, JSON.stringify(history));
+}
+
+test("runQuery result rows decode title_history to a real array; title-less reads []", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedTitledJob(db, "titled", "fix-osc", ["keeper-009", "fix-osc"]);
+  seedJob(db, "bare", { updated_at: 0 }); // schema default '[]'
+  const res = asResult(runQuery(db, 0, { type: "query", collection: "jobs" }));
+  const titled = res.rows.find((r) => jobId(r) === "titled");
+  const bare = res.rows.find((r) => jobId(r) === "bare");
+  expect(titled?.title).toBe("fix-osc");
+  expect(Array.isArray(titled?.title_history)).toBe(true);
+  expect(titled?.title_history).toEqual(["keeper-009", "fix-osc"]);
+  expect(bare?.title).toBeNull();
+  expect(Array.isArray(bare?.title_history)).toBe(true);
+  expect(bare?.title_history).toEqual([]);
+  db.close();
+});
+
+test("diffTick patch row decodes title_history to a real array (parity with result)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedTitledJob(db, "a", "foo", ["foo"]);
+  setWorldRev(db, 42);
+  const sock = fakeSock();
+  watch(db, sock, { a: 0 }); // seeded from a snapshot read at version 0
+
+  // Reducer folds a title change: bump last_event_id + rewrite title_history.
+  db.query(
+    "UPDATE jobs SET title = 'bar', title_history = ?, last_event_id = 6, updated_at = updated_at + 1 WHERE job_id = 'a'",
+  ).run(JSON.stringify(["foo", "bar"]));
+  diffTick(db, [sock]);
+
+  expect(sock.frames).toHaveLength(1);
+  const patch = sock.frames[0] as PatchFrame;
+  expect(patch.type).toBe("patch");
+  expect(patch.row.title).toBe("bar");
+  expect(Array.isArray(patch.row.title_history)).toBe(true);
+  expect(patch.row.title_history).toEqual(["foo", "bar"]);
+  db.close();
+});
+
 test("runQuery ignores a wire filter key not declared by the descriptor", () => {
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "a", { updated_at: 2 });

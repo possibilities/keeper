@@ -7,7 +7,8 @@ TypeScript hook plugin writes one row per Claude Code hook invocation into a
 SQLite `events` table — the durable, append-only log. A long-running Bun daemon
 (`keeperd`, managed by a macOS LaunchAgent) tails that table and folds new
 events into a minimal `jobs` projection: one row per session, carrying the live
-`state` (`working` / `stopped` / `ended`) and `mode` (`act` / `plan`).
+`state` (`working` / `stopped` / `ended`), `mode` (`act` / `plan`), and a
+human-readable `title` (plus a `title_history` log of every title it has held).
 
 The architecture is deliberately small. Keeper is built on Bun + `bun:sqlite`
 with zero third-party runtime dependencies. The daemon detects new events by
@@ -171,7 +172,7 @@ list, see [CLAUDE.md](./CLAUDE.md).
 ```sh
 # Recent jobs:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT job_id, state, mode, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
+  'SELECT job_id, state, mode, title, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
 
 # Raw event log tail:
 sqlite3 ~/.local/state/keeper/keeper.db \

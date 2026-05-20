@@ -49,6 +49,7 @@ import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import {
   type CollectionDescriptor,
   countAndToken,
+  decodeRow,
   getCollection,
   type Row,
   selectByIds,
@@ -373,7 +374,10 @@ export function runQuery(
      ORDER BY ${sortCol} ${dir.toUpperCase()}, ${descriptor.pk} ASC
      LIMIT ? OFFSET ?
   `;
-  const rows = db.prepare(sql).all(...where.params, limit, offset) as Row[];
+  const rawRows = db.prepare(sql).all(...where.params, limit, offset) as Row[];
+  // Decode JSON-TEXT columns (e.g. `title_history`) so `result` rows carry the
+  // same array shape as the diff/patch path (`selectByIds`).
+  const rows = rawRows.map((row) => decodeRow(descriptor, row));
 
   if (out) {
     out.where = where;

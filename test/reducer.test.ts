@@ -105,6 +105,8 @@ function getJob(jobId = "sess-a") {
     state: string;
     last_event_id: number;
     updated_at: number;
+    title: string | null;
+    title_history: string;
   } | null;
 }
 
@@ -282,6 +284,129 @@ test("malformed data blob logs to stderr and advances cursor without halting", (
   } finally {
     console.error = originalError;
   }
+});
+
+// ---------------------------------------------------------------------------
+// Title fold (session_title → title / title_history)
+// ---------------------------------------------------------------------------
+
+/** A UserPromptSubmit carrying a session_title in its data blob. */
+function titleEvent(title: string, session_id = "sess-a"): number {
+  return insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id,
+    data: JSON.stringify({ session_title: title }),
+  });
+}
+
+test("first session_title seeds title and title_history", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  titleEvent("foo");
+  drainAll();
+  const job = getJob();
+  expect(job?.title).toBe("foo");
+  expect(JSON.parse(job?.title_history ?? "null")).toEqual(["foo"]);
+});
+
+test("title change appends; a revert re-appends (no dedup)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  titleEvent("foo");
+  titleEvent("bar");
+  titleEvent("foo"); // revert — re-appends
+  drainAll();
+  const job = getJob();
+  expect(job?.title).toBe("foo");
+  expect(JSON.parse(job?.title_history ?? "null")).toEqual([
+    "foo",
+    "bar",
+    "foo",
+  ]);
+});
+
+test("unchanged title fires no write (last_event_id unchanged by the title rule)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  // Carry the title on a non-lifecycle event so ONLY the title rule could write
+  // (a UserPromptSubmit would bump last_event_id via its own state-rule).
+  insertEvent({
+    hook_event: "Notification",
+    data: JSON.stringify({ session_title: "foo" }),
+  });
+  drainAll();
+  const afterFirst = getJob();
+  const lastId = afterFirst?.last_event_id ?? 0;
+
+  // A second identical title on another non-lifecycle event — the title rule
+  // must skip the write (no last_event_id bump, no append).
+  const repeatId = insertEvent({
+    hook_event: "Notification",
+    data: JSON.stringify({ session_title: "foo" }),
+  });
+  drainAll();
+  const afterRepeat = getJob();
+  expect(afterRepeat?.last_event_id).toBe(lastId);
+  expect(afterRepeat?.last_event_id).toBeLessThan(repeatId);
+  expect(JSON.parse(afterRepeat?.title_history ?? "null")).toEqual(["foo"]);
+  // The cursor still advanced past the no-op title event.
+  expect(getCursor()).toBe(repeatId);
+});
+
+test("title-bearing event for a non-existent job is a no-op", () => {
+  // No SessionStart for "ghost" — the title rule's SELECT finds no row.
+  const id = titleEvent("foo", "ghost");
+  drainAll();
+  expect(getJob("ghost")).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("malformed data blob with a session_title still skip-and-logs and advances", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  const errors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.join(" "));
+  };
+  try {
+    const badId = insertEvent({
+      hook_event: "UserPromptSubmit",
+      data: '{"session_title": "foo"', // truncated — invalid JSON
+    });
+    drainAll();
+    // No title written (the parse failed) but the cursor advanced.
+    expect(getJob()?.title).toBeNull();
+    expect(getCursor()).toBe(badId);
+    expect(errors.some((e) => e.includes("failed to parse data blob"))).toBe(
+      true,
+    );
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("title fold re-folds idempotently: draining from scratch yields identical history", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  titleEvent("foo");
+  titleEvent("bar");
+  titleEvent("foo");
+  drainAll();
+  const once = getJob();
+  expect(JSON.parse(once?.title_history ?? "null")).toEqual([
+    "foo",
+    "bar",
+    "foo",
+  ]);
+
+  // Rewind the cursor and projection, then re-fold the SAME event stream from
+  // scratch — the persisted-tail comparison must reproduce identical history.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const twice = getJob();
+  expect(twice?.title).toBe("foo");
+  expect(JSON.parse(twice?.title_history ?? "null")).toEqual([
+    "foo",
+    "bar",
+    "foo",
+  ]);
 });
 
 // ---------------------------------------------------------------------------

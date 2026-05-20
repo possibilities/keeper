@@ -38,7 +38,12 @@ export interface Event {
  * One row of the `jobs` projection. `job_id` is the Claude Code session id —
  * v1 holds the simplifying invariant of "one session per job". Defaults match
  * the zero-event projection (`mode='act'`, `state='stopped'`) so an empty
- * row inserted by `SessionStart` reads correctly before any further events.
+ * row inserted by `SessionStart` reads correctly before any further events
+ * (`title=NULL`, `title_history=[]`).
+ *
+ * `title_history` is the DECODED shape at the read boundary — stored as JSON
+ * TEXT in SQLite, parsed into a real array by `decodeRow` (`src/collections.ts`)
+ * before it reaches a `result` / `patch` frame.
  */
 export interface Job {
   job_id: string;
@@ -49,6 +54,8 @@ export interface Job {
   state: string;
   last_event_id: number;
   updated_at: number;
+  title: string | null;
+  title_history: string[];
 }
 
 /**
