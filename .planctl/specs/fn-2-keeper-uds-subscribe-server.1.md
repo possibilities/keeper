@@ -49,5 +49,5 @@ Build the pure, socket-free foundation the server worker stands on, so it can be
 - [ ] `bun test`, `bun run lint`, `bun run typecheck` pass
 
 ## Done summary
-
+Added src/protocol.ts (NDJSON frame unions + encodeFrame/extractLines/LineBuffer with CRLF strip + 1 MiB cap) and db helpers resolveSockPath, selectWorldRev, selectJobsByIds (empty-set short-circuit, MAX_IN_PARAMS guard). 33 unit tests cover round-trip, partial/multi-chunk framing, oversized-line, env override, multi-id read, bind-var cap.
 ## Evidence
