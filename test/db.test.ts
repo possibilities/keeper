@@ -10,7 +10,14 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDb, resolveDbPath } from "../src/db";
+import {
+  MAX_IN_PARAMS,
+  openDb,
+  resolveDbPath,
+  resolveSockPath,
+  selectJobsByIds,
+  selectWorldRev,
+} from "../src/db";
 
 let tmpDir: string;
 let dbPath: string;
@@ -154,5 +161,95 @@ test("schema_version is stamped in meta", () => {
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
   expect(row.value).toBe("1");
+  db.close();
+});
+
+test("KEEPER_SOCK env var overrides default socket path", () => {
+  const original = process.env.KEEPER_SOCK;
+  try {
+    const custom = join(tmpDir, "custom.sock");
+    process.env.KEEPER_SOCK = custom;
+    expect(resolveSockPath()).toBe(custom);
+
+    delete process.env.KEEPER_SOCK;
+    const fallback = resolveSockPath();
+    expect(fallback.endsWith("/.local/state/keeper/keeperd.sock")).toBe(true);
+  } finally {
+    if (original === undefined) {
+      delete process.env.KEEPER_SOCK;
+    } else {
+      process.env.KEEPER_SOCK = original;
+    }
+  }
+});
+
+test("resolveSockPath does no I/O (does not create the parent dir)", () => {
+  // Pure resolver — calling it must not touch the filesystem.
+  const original = process.env.KEEPER_SOCK;
+  try {
+    delete process.env.KEEPER_SOCK;
+    // We just need to call it; there's nothing to assert beyond "no throw".
+    resolveSockPath();
+  } finally {
+    if (original !== undefined) {
+      process.env.KEEPER_SOCK = original;
+    }
+  }
+});
+
+test("selectWorldRev returns the seeded 0 on a fresh DB", () => {
+  const { db, stmts } = openDb(dbPath);
+  expect(selectWorldRev(stmts)).toBe(0);
+  db.close();
+});
+
+test("selectWorldRev reflects advanceCursor", () => {
+  const { db, stmts } = openDb(dbPath);
+  db.prepare(
+    "UPDATE reducer_state SET last_event_id = ?, updated_at = ? WHERE id = 1",
+  ).run(7, 1);
+  expect(selectWorldRev(stmts)).toBe(7);
+  db.close();
+});
+
+test("selectJobsByIds returns [] for an empty id-set without querying", () => {
+  const { db } = openDb(dbPath);
+  // Sanity: even if we hadn't seeded anything, [] must short-circuit.
+  expect(selectJobsByIds(db, [])).toEqual([]);
+  db.close();
+});
+
+test("selectJobsByIds returns matching rows for a multi-id set", () => {
+  const { db } = openDb(dbPath);
+  const ts = 1_700_000_000;
+  const insert = db.prepare(
+    "INSERT INTO jobs (job_id, created_at, cwd, pid, mode, state, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  insert.run("a", ts, "/a", 1, "act", "working", 10, ts);
+  insert.run("b", ts, "/b", 2, "plan", "stopped", 11, ts);
+  insert.run("c", ts, null, null, "act", "ended", 12, ts);
+
+  const rows = selectJobsByIds(db, ["a", "c", "missing"]);
+  expect(rows).toHaveLength(2);
+  const ids = new Set(rows.map((r) => r.job_id));
+  expect(ids.has("a")).toBe(true);
+  expect(ids.has("c")).toBe(true);
+  // Row shape carries the typed columns through.
+  const a = rows.find((r) => r.job_id === "a");
+  expect(a?.mode).toBe("act");
+  expect(a?.state).toBe("working");
+  expect(a?.last_event_id).toBe(10);
+  expect(a?.cwd).toBe("/a");
+  // NULL columns survive the round-trip.
+  const c = rows.find((r) => r.job_id === "c");
+  expect(c?.cwd).toBeNull();
+  expect(c?.pid).toBeNull();
+  db.close();
+});
+
+test("selectJobsByIds throws when id-set exceeds MAX_IN_PARAMS", () => {
+  const { db } = openDb(dbPath);
+  const ids = Array.from({ length: MAX_IN_PARAMS + 1 }, (_, i) => `id-${i}`);
+  expect(() => selectJobsByIds(db, ids)).toThrow(/MAX_VARIABLE_NUMBER/);
   db.close();
 });

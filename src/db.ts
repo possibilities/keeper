@@ -17,6 +17,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import type { Job } from "./types";
 
 /**
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
@@ -37,6 +38,30 @@ export function resolveDbPath(): string {
   }
   return join(homedir(), ".local", "state", "keeper", "keeper.db");
 }
+
+/**
+ * Resolve the keeper UDS path. `KEEPER_SOCK` env var wins (override pattern
+ * mirrors `resolveDbPath` — used by tests and any future inspect tooling);
+ * otherwise default to `~/.local/state/keeper/keeperd.sock`, a sibling of the
+ * DB file. The server worker is responsible for ensuring the parent directory
+ * exists before bind; this resolver is pure and does no I/O.
+ */
+export function resolveSockPath(): string {
+  const override = process.env.KEEPER_SOCK;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "keeperd.sock");
+}
+
+/**
+ * SQLite default `SQLITE_MAX_VARIABLE_NUMBER` is 999 — `IN (?,?,...)` binds
+ * one variable per id. Callers of `selectJobsByIds` must chunk past this cap
+ * or cap their input. The server-worker page sizes (default limit ~100,
+ * hard-capped well below 999) make a single query the common case, but the
+ * constant is exported so chunking callers don't have to magic-number it.
+ */
+export const MAX_IN_PARAMS = 999;
 
 const CREATE_EVENTS = `
 CREATE TABLE IF NOT EXISTS events (
@@ -103,12 +128,18 @@ CREATE TABLE IF NOT EXISTS meta (
  * Prepared statements used by hook + reducer hot paths. Keep these tiny and
  * pre-bound — the hook runs once per Claude Code event and cold-start latency
  * is part of the SessionEnd 1.5s timeout budget.
+ *
+ * `selectWorldRev` reads the singleton `reducer_state.last_event_id` and is
+ * the canonical source of `rev` on server frames. `selectJobsByIds` is the
+ * shared variable-binding read used by the server worker; it's NOT preparable
+ * here (one statement per arity) so it lives as a helper function instead.
  */
 export interface Stmts {
   insertEvent: ReturnType<Database["prepare"]>;
   selectEventsAfter: ReturnType<Database["prepare"]>;
   upsertJob: ReturnType<Database["prepare"]>;
   advanceCursor: ReturnType<Database["prepare"]>;
+  selectWorldRev: ReturnType<Database["prepare"]>;
 }
 
 export interface OpenDbOptions {
@@ -218,7 +249,63 @@ function prepareStmts(db: Database): Stmts {
     advanceCursor: db.prepare(
       "UPDATE reducer_state SET last_event_id = ?, updated_at = ? WHERE id = 1",
     ),
+    selectWorldRev: db.prepare(
+      "SELECT last_event_id FROM reducer_state WHERE id = 1",
+    ),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Read helpers for the server worker
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the singleton world rev (`reducer_state.last_event_id`). Returns 0 on
+ * the empty-row corner case — fresh DBs always seed `(1, 0, ts)` so in
+ * practice the SELECT lands a row, but the fallback keeps callers branch-free.
+ *
+ * Cheap (one row, no scan); the server worker calls this on every poll tick.
+ */
+export function selectWorldRev(stmts: Stmts): number {
+  const row = stmts.selectWorldRev.get() as { last_event_id: number } | null;
+  return row ? row.last_event_id : 0;
+}
+
+/**
+ * Read a set of `jobs` rows by id. Returns rows in the order SQLite emits
+ * them (NOT necessarily the input order) — the caller is responsible for
+ * reordering if rendering order matters.
+ *
+ * Short-circuits to `[]` on an empty id-set: a bare `IN ()` is a SQL syntax
+ * error in SQLite, and the cheapest correct behavior is to skip the query.
+ *
+ * SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 999 (`MAX_IN_PARAMS`);
+ * larger id-sets MUST be chunked by the caller. We throw a typed error rather
+ * than silently truncating — a truncation here would surface as missing
+ * patches downstream and be hard to chase.
+ */
+export function selectJobsByIds(db: Database, ids: readonly string[]): Job[] {
+  if (ids.length === 0) {
+    return [];
+  }
+  if (ids.length > MAX_IN_PARAMS) {
+    throw new Error(
+      `selectJobsByIds: id-set of ${ids.length} exceeds SQLITE_MAX_VARIABLE_NUMBER (${MAX_IN_PARAMS}); chunk the caller`,
+    );
+  }
+  const placeholders = ids.map(() => "?").join(",");
+  const sql = `
+    SELECT job_id, created_at, cwd, pid, mode, state, last_event_id, updated_at
+      FROM jobs
+     WHERE job_id IN (${placeholders})
+  `;
+  // Per-call prepare is fine — server-worker page sizes are small (default
+  // limit ~100, capped well below MAX_IN_PARAMS), the statement shape is
+  // arity-dependent so a cached prepared form would itself need a cache, and
+  // SQLite's compile cost on a trivial SELECT is negligible. If this ever
+  // becomes hot, add an LRU keyed by arity.
+  const stmt = db.prepare(sql);
+  return stmt.all(...ids) as Job[];
 }
 
 /**
