@@ -23,10 +23,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Row } from "../src/collections";
 import { openDb } from "../src/db";
 import type {
+  ErrorFrame,
   PatchFrame,
-  QueryFrame,
   ResultFrame,
   ServerFrame,
 } from "../src/protocol";
@@ -90,6 +91,7 @@ function dispatchInit(): ConnState {
       push: () => [],
       pendingLength: () => 0,
     } as unknown as ConnState["buffer"],
+    collection: null,
     watched: new Set<string>(),
     lastSent: new Map<string, number>(),
     pending: null,
@@ -146,16 +148,30 @@ test("isPidAlive is true for the current process", () => {
 // query → result
 // ---------------------------------------------------------------------------
 
+/** Narrow a runQuery return to a ResultFrame, failing the test if it's an error. */
+function asResult(frame: ResultFrame | ErrorFrame): ResultFrame {
+  if (frame.type !== "result") {
+    throw new Error(`expected result, got ${frame.type} (${frame.code})`);
+  }
+  return frame;
+}
+
+/** A row's job_id as a string (rows are generic `Row` post-namespacing). */
+function jobId(row: Row): string {
+  return String(row.job_id);
+}
+
 test("runQuery returns rows ordered by updated_at desc by default", () => {
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "a", { updated_at: 10 });
   seedJob(db, "b", { updated_at: 30 });
   seedJob(db, "c", { updated_at: 20 });
 
-  const res = runQuery(db, 7, { type: "query" } as QueryFrame);
+  const res = asResult(runQuery(db, 7, { type: "query", collection: "jobs" }));
   expect(res.type).toBe("result");
+  expect(res.collection).toBe("jobs");
   expect(res.rev).toBe(7);
-  expect(res.rows.map((r) => r.job_id)).toEqual(["b", "c", "a"]);
+  expect(res.rows.map(jobId)).toEqual(["b", "c", "a"]);
   db.close();
 });
 
@@ -165,8 +181,10 @@ test("runQuery honors limit + offset", () => {
     seedJob(db, `j${i}`, { updated_at: i });
   }
   // desc by updated_at: j4,j3,j2,j1,j0. limit 2 offset 1 → j3,j2.
-  const res = runQuery(db, 0, { type: "query", limit: 2, offset: 1 });
-  expect(res.rows.map((r) => r.job_id)).toEqual(["j3", "j2"]);
+  const res = asResult(
+    runQuery(db, 0, { type: "query", collection: "jobs", limit: 2, offset: 1 }),
+  );
+  expect(res.rows.map(jobId)).toEqual(["j3", "j2"]);
   db.close();
 });
 
@@ -174,19 +192,74 @@ test("runQuery applies a state filter", () => {
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "w", { state: "working", updated_at: 2 });
   seedJob(db, "s", { state: "stopped", updated_at: 1 });
-  const res = runQuery(db, 0, {
-    type: "query",
-    filter: { state: "working" },
-  });
-  expect(res.rows.map((r) => r.job_id)).toEqual(["w"]);
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      filter: { state: "working" },
+    }),
+  );
+  expect(res.rows.map(jobId)).toEqual(["w"]);
   db.close();
 });
 
-test("runQuery echoes the query id onto the result", () => {
+test("runQuery resolves the pk filter for a detail-page single-item subscribe", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { updated_at: 2 });
+  seedJob(db, "b", { updated_at: 1 });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      filter: { job_id: "a" },
+    }),
+  );
+  expect(res.rows.map(jobId)).toEqual(["a"]);
+  db.close();
+});
+
+test("runQuery ignores a wire filter key not declared by the descriptor", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { updated_at: 2 });
+  seedJob(db, "b", { updated_at: 1 });
+  // `pid` is not in JOBS_DESCRIPTOR.filters → ignored, never interpolated; the
+  // page is unfiltered (no throw, no injection).
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      filter: { pid: 999 },
+    }),
+  );
+  expect(res.rows.map(jobId)).toEqual(["a", "b"]);
+  db.close();
+});
+
+test("runQuery returns unknown_collection for a well-formed unknown collection", () => {
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "a");
-  const res = runQuery(db, 1, { type: "query", id: "q1" });
+  const frame = runQuery(db, 3, {
+    type: "query",
+    collection: "plans",
+    id: "q9",
+  });
+  expect(frame.type).toBe("error");
+  const err = frame as ErrorFrame;
+  expect(err.code).toBe("unknown_collection");
+  expect(err.collection).toBe("plans");
+  expect(err.id).toBe("q9");
+  expect(err.rev).toBe(3);
+  db.close();
+});
+
+test("runQuery echoes the query id + collection onto the result", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a");
+  const res = asResult(
+    runQuery(db, 1, { type: "query", collection: "jobs", id: "q1" }),
+  );
   expect(res.id).toBe("q1");
+  expect(res.collection).toBe("jobs");
   db.close();
 });
 
@@ -194,12 +267,15 @@ test("runQuery falls back to updated_at for an unknown sort column", () => {
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "a", { updated_at: 1 });
   seedJob(db, "b", { updated_at: 2 });
-  const res = runQuery(db, 0, {
-    type: "query",
-    sort: { column: "drop table jobs" },
-  });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      sort: { column: "drop table jobs" },
+    }),
+  );
   // Default desc by updated_at → b before a (no SQL injection, no throw).
-  expect(res.rows.map((r) => r.job_id)).toEqual(["b", "a"]);
+  expect(res.rows.map(jobId)).toEqual(["b", "a"]);
   db.close();
 });
 
@@ -207,34 +283,87 @@ test("runQuery falls back to updated_at for an unknown sort column", () => {
 // dispatch
 // ---------------------------------------------------------------------------
 
-test("dispatchLine query seeds the watched-set + lastSent", () => {
+test("dispatchLine query seeds the collection + watched-set + lastSent", () => {
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "a", { last_event_id: 5 });
   seedJob(db, "b", { last_event_id: 9 });
   const conn = newConn();
-  const frames = dispatchLine(db, conn, JSON.stringify({ type: "query" }));
+  const frames = dispatchLine(
+    db,
+    conn,
+    JSON.stringify({ type: "query", collection: "jobs" }),
+  );
   expect(frames).toHaveLength(1);
   expect((frames[0] as ResultFrame).type).toBe("result");
+  expect(conn.collection).toBe("jobs");
   expect([...conn.watched].sort()).toEqual(["a", "b"]);
   expect(conn.lastSent.get("a")).toBe(5);
   expect(conn.lastSent.get("b")).toBe(9);
   db.close();
 });
 
-test("dispatchLine unsubscribe clears the watched-set", () => {
+test("dispatchLine unsubscribe clears collection + watched-set", () => {
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "a");
   const conn = newConn();
-  dispatchLine(db, conn, JSON.stringify({ type: "query" }));
+  dispatchLine(db, conn, JSON.stringify({ type: "query", collection: "jobs" }));
   expect(conn.watched.size).toBe(1);
+  expect(conn.collection).toBe("jobs");
   const frames = dispatchLine(
     db,
     conn,
     JSON.stringify({ type: "unsubscribe" }),
   );
   expect(frames).toHaveLength(0);
+  expect(conn.collection).toBeNull();
   expect(conn.watched.size).toBe(0);
   expect(conn.lastSent.size).toBe(0);
+  db.close();
+});
+
+test("dispatchLine query with absent/empty/non-string collection → bad_frame", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a");
+  const conn = newConn();
+  for (const bad of [
+    JSON.stringify({ type: "query" }), // absent
+    JSON.stringify({ type: "query", collection: "" }), // empty
+    JSON.stringify({ type: "query", collection: 42 }), // non-string
+  ]) {
+    const frames = dispatchLine(db, conn, bad);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].type).toBe("error");
+    expect((frames[0] as ErrorFrame).code).toBe("bad_frame");
+    // No subscription was ever established.
+    expect(conn.collection).toBeNull();
+  }
+  db.close();
+});
+
+test("dispatchLine unknown collection → unknown_collection AND prior subscription survives", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conn = newConn();
+  // Establish a live subscription first.
+  dispatchLine(db, conn, JSON.stringify({ type: "query", collection: "jobs" }));
+  expect(conn.collection).toBe("jobs");
+  expect([...conn.watched]).toEqual(["a"]);
+
+  // A well-formed query naming an unregistered collection errors WITHOUT
+  // touching the existing subscription.
+  const frames = dispatchLine(
+    db,
+    conn,
+    JSON.stringify({ type: "query", collection: "plans", id: "q2" }),
+  );
+  expect(frames).toHaveLength(1);
+  expect(frames[0].type).toBe("error");
+  expect((frames[0] as ErrorFrame).code).toBe("unknown_collection");
+  expect((frames[0] as ErrorFrame).collection).toBe("plans");
+  // Prior subscription intact.
+  expect(conn.collection).toBe("jobs");
+  expect([...conn.watched]).toEqual(["a"]);
+  expect(conn.lastSent.get("a")).toBe(5);
   db.close();
 });
 
@@ -247,7 +376,11 @@ test("dispatchLine returns an error frame for malformed JSON (connection survive
   expect((frames[0] as { code: string }).code).toBe("bad_frame");
   // A subsequent valid frame still works → connection state intact.
   seedJob(db, "a");
-  const ok = dispatchLine(db, conn, JSON.stringify({ type: "query" }));
+  const ok = dispatchLine(
+    db,
+    conn,
+    JSON.stringify({ type: "query", collection: "jobs" }),
+  );
   expect(ok[0].type).toBe("result");
   db.close();
 });
@@ -414,8 +547,17 @@ function fakeSock(): Writable & {
   return sock;
 }
 
-/** Seed a connection's watched-set + lastSent from the rows it would page. */
-function watch(sock: Writable, seed: Record<string, number>): void {
+/**
+ * Seed a connection's active collection + watched-set + lastSent from the rows
+ * it would page. `diffTick` groups by `collection` and skips null-collection
+ * conns, so the active collection must be set for the diff to visit the conn.
+ */
+function watch(
+  sock: Writable,
+  seed: Record<string, number>,
+  collection = "jobs",
+): void {
+  sock.data.collection = collection;
   sock.data.watched = new Set(Object.keys(seed));
   sock.data.lastSent = new Map(Object.entries(seed));
 }
@@ -463,8 +605,9 @@ test("diffTick pushes one patch when a watched row advances; rev is stamped", ()
   expect(sock.frames).toHaveLength(1);
   const patch = sock.frames[0] as PatchFrame;
   expect(patch.type).toBe("patch");
-  expect(patch.job.job_id).toBe("a");
-  expect(patch.job.last_event_id).toBe(6);
+  expect(patch.collection).toBe("jobs");
+  expect(jobId(patch.row)).toBe("a");
+  expect(patch.row.last_event_id).toBe(6);
   expect(patch.rev).toBe(42);
   // lastSent advanced to the pushed value.
   expect(sock.data.lastSent.get("a")).toBe(6);
@@ -516,7 +659,7 @@ test("diffTick fans out only to connections watching the changed id", () => {
   diffTick(db, [watcherA, watcherB]);
 
   expect(watcherA.frames).toHaveLength(1);
-  expect((watcherA.frames[0] as PatchFrame).job.job_id).toBe("a");
+  expect(jobId((watcherA.frames[0] as PatchFrame).row)).toBe("a");
   expect(watcherB.frames).toHaveLength(0);
   db.close();
 });
@@ -534,7 +677,7 @@ test("diffTick coalesces multiple folds between ticks into one patch", () => {
   diffTick(db, [sock]);
 
   expect(sock.frames).toHaveLength(1);
-  expect((sock.frames[0] as PatchFrame).job.last_event_id).toBe(4);
+  expect((sock.frames[0] as PatchFrame).row.last_event_id).toBe(4);
   db.close();
 });
 
@@ -558,6 +701,50 @@ test("diffTick skips a backpressured socket without stalling others; lastSent no
   // lastSent stayed at 1 so the next tick re-reflects current state.
   expect(slow.frames).toHaveLength(0);
   expect(slow.data.lastSent.get("a")).toBe(1);
+  db.close();
+});
+
+test("diffTick never visits a null-collection connection", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+
+  // A conn with NO active subscription: watched is populated but collection is
+  // null (e.g. after unsubscribe but a stale watched-set lingered). It must be
+  // skipped — no patch, watched untouched.
+  const idle = fakeSock();
+  idle.data.collection = null;
+  idle.data.watched = new Set(["a"]);
+  idle.data.lastSent = new Map([["a", 1]]);
+
+  const active = fakeSock();
+  watch(active, { a: 1 });
+
+  advanceJob(db, "a", 2);
+  diffTick(db, [idle, active]);
+
+  // Active conn got its patch; idle (null-collection) conn was never visited.
+  expect(active.frames).toHaveLength(1);
+  expect(idle.frames).toHaveLength(0);
+  expect(idle.data.lastSent.get("a")).toBe(1);
+  db.close();
+});
+
+test("diffTick groups connections by collection (one selectByIds per group)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  // Two conns on the same collection watching the same id → one shared re-read.
+  const w1 = fakeSock();
+  watch(w1, { a: 1 });
+  const w2 = fakeSock();
+  watch(w2, { a: 1 });
+
+  advanceJob(db, "a", 2);
+  diffTick(db, [w1, w2]);
+
+  expect(w1.frames).toHaveLength(1);
+  expect(w2.frames).toHaveLength(1);
+  expect((w1.frames[0] as PatchFrame).collection).toBe("jobs");
+  expect((w2.frames[0] as PatchFrame).collection).toBe("jobs");
   db.close();
 });
 
@@ -594,8 +781,9 @@ test("pollLoop drives a patch to a subscriber after a separate writer commits", 
   expect(got).not.toBeNull();
   const patch = got as PatchFrame;
   expect(patch.type).toBe("patch");
-  expect(patch.job.job_id).toBe("a");
-  expect(patch.job.last_event_id).toBe(2);
+  expect(patch.collection).toBe("jobs");
+  expect(jobId(patch.row)).toBe("a");
+  expect(patch.row.last_event_id).toBe(2);
   expect(patch.rev).toBe(7);
 
   reader.close();

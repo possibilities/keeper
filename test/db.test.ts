@@ -10,14 +10,15 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { JOBS_DESCRIPTOR, selectByIds } from "../src/collections";
 import {
   MAX_IN_PARAMS,
   openDb,
   resolveDbPath,
   resolveSockPath,
-  selectJobsByIds,
   selectWorldRev,
 } from "../src/db";
+import type { Job } from "../src/types";
 
 let tmpDir: string;
 let dbPath: string;
@@ -212,14 +213,14 @@ test("selectWorldRev reflects advanceCursor", () => {
   db.close();
 });
 
-test("selectJobsByIds returns [] for an empty id-set without querying", () => {
+test("selectByIds returns [] for an empty id-set without querying", () => {
   const { db } = openDb(dbPath);
   // Sanity: even if we hadn't seeded anything, [] must short-circuit.
-  expect(selectJobsByIds(db, [])).toEqual([]);
+  expect(selectByIds(db, JOBS_DESCRIPTOR, [])).toEqual([]);
   db.close();
 });
 
-test("selectJobsByIds returns matching rows for a multi-id set", () => {
+test("selectByIds returns matching rows for a multi-id set", () => {
   const { db } = openDb(dbPath);
   const ts = 1_700_000_000;
   const insert = db.prepare(
@@ -229,7 +230,11 @@ test("selectJobsByIds returns matching rows for a multi-id set", () => {
   insert.run("b", ts, "/b", 2, "plan", "stopped", 11, ts);
   insert.run("c", ts, null, null, "act", "ended", 12, ts);
 
-  const rows = selectJobsByIds(db, ["a", "c", "missing"]);
+  const rows = selectByIds(db, JOBS_DESCRIPTOR, [
+    "a",
+    "c",
+    "missing",
+  ]) as unknown as Job[];
   expect(rows).toHaveLength(2);
   const ids = new Set(rows.map((r) => r.job_id));
   expect(ids.has("a")).toBe(true);
@@ -247,9 +252,11 @@ test("selectJobsByIds returns matching rows for a multi-id set", () => {
   db.close();
 });
 
-test("selectJobsByIds throws when id-set exceeds MAX_IN_PARAMS", () => {
+test("selectByIds throws when id-set exceeds MAX_IN_PARAMS", () => {
   const { db } = openDb(dbPath);
   const ids = Array.from({ length: MAX_IN_PARAMS + 1 }, (_, i) => `id-${i}`);
-  expect(() => selectJobsByIds(db, ids)).toThrow(/MAX_VARIABLE_NUMBER/);
+  expect(() => selectByIds(db, JOBS_DESCRIPTOR, ids)).toThrow(
+    /MAX_VARIABLE_NUMBER/,
+  );
   db.close();
 });

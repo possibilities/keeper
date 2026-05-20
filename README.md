@@ -19,13 +19,16 @@ transaction as every projection write, so the fold is exactly-once-per-event
 and the boot drain re-converges idempotently after any downtime or crash.
 
 Keeper also exposes a **read-only NDJSON-over-UDS subscribe server** as a second
-Worker thread. A client sends a `query` (sort/limit/offset/filter) and gets back
-an ordered page of jobs that doubles as a live subscription: the page membership
-is frozen at query time, but each row's cells stream `patch` frames as the
-reducer folds new events. The server is just another reader — its own read-only
-connection, its own `data_version` poll — and the socket is **read-only**: there
-is no client write path. No consumer ships yet; the documented protocol is the
-target for a future TUI.
+Worker thread. The read surface is **namespaced by collection**: a client names
+a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
+page that doubles as a live subscription. `jobs` is the first and default
+collection; the surface is built so additional collections register without
+touching the wire protocol or the diff machinery. Page membership is frozen at
+query time, but each row's cells stream `patch` frames as the reducer folds new
+events. The server is just another reader — its own read-only connection, its
+own `data_version` poll — and the socket is **read-only**: there is no client
+write path. No consumer ships yet; the documented protocol is the target for a
+future TUI.
 
 ## What keeper is NOT
 
@@ -136,11 +139,14 @@ A **second** Worker thread runs the read-only UDS subscribe server. It mirrors
 the wake worker's archetype — its own read-only connection, its own
 `data_version` poll — but instead of waking the reducer it owns an external
 endpoint: a Unix-domain socket (guarded by a PID-liveness lock file) speaking
-NDJSON. On each `data_version` tick it re-reads its watched `jobs` rows, diffs
-`last_event_id`, and pushes `patch` frames to subscribed clients. The two
-workers are fully independent readers; main supervises both lifecycles but
-routes neither's traffic, and either worker's `error` event escalates the whole
-process to a clean restart.
+NDJSON. The surface is namespaced by collection: each query names a collection,
+and everything collection-specific (which table to read, which columns to serve,
+which column the diff fires on) is described by a registry entry rather than
+hardcoded — `jobs` is the first such collection. On each `data_version` tick the
+server re-reads its watched rows, diffs the per-row version column, and pushes
+`patch` frames to subscribed clients. The two workers are fully independent
+readers; main supervises both lifecycles but routes neither's traffic, and
+either worker's `error` event escalates the whole process to a clean restart.
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).

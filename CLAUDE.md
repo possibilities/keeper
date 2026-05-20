@@ -37,11 +37,26 @@ file is the in-codebase map for AI agents working in the repo.
   - `src/server-worker.ts` — Worker thread; owns the read-only UDS subscribe
     server. Own read-only connection + `data_version` poll, a `keeperd.lock`
     PID-liveness ownership lock, and an NDJSON-over-UDS listener that serves
-    `query → result` then fans `jobs` changes out as per-entity `patch` frames.
-    `isMainThread`-guarded.
+    `query → result` then fans changes out as per-entity `patch` frames.
+    `runQuery` / `diffTick` route by collection name through a
+    `CollectionDescriptor` (`src/collections.ts`) — no `jobs`-specific table /
+    column / filter literal remains in either. `isMainThread`-guarded.
+  - `src/collections.ts` — the collection registry that namespaces the read
+    surface. A `CollectionDescriptor` holds everything collection-specific
+    (table, served columns, pk, the per-row `version` column the diff fires on,
+    the sort allowlist + default sort, and the filter-key → SQL-column map);
+    `REGISTRY` / `getCollection` resolve a wire `collection` name to its
+    descriptor, and `selectByIds(db, descriptor, ids)` is the
+    descriptor-parameterized by-id read. `jobs` is the first/only descriptor
+    today (its `filters` include the pk `job_id` for detail-page single-item
+    subscribe). The descriptor is the SOLE identifier-injection gate: only its
+    constants are interpolated into SQL; wire filter keys are resolved by map
+    lookup, never interpolated.
   - `src/protocol.ts` — the wire protocol: `query` / `result` / `patch` frame
-    shapes, NDJSON line framing (buffer-until-`\n` + max-line cap), and the
-    page/diff helpers shared by the server worker.
+    shapes (every frame names a `collection`; `result` / `patch` are generic
+    over `Row`; `patch` carries `row`; `query.collection` is required), NDJSON
+    line framing (buffer-until-`\n` + max-line cap), and the page/diff helpers
+    shared by the server worker.
   - `src/types.ts` — `Event`, `Job`, `ReducerState` row shapes.
   - `src/version.ts` — `VERSION` constant.
 - `plugin/` — the Claude Code hook plugin (symlink target for
@@ -63,8 +78,9 @@ file is the in-codebase map for AI agents working in the repo.
 | `src/reducer.ts` | `drain()` / `applyEvent()` | fold events → jobs |
 | `src/db.ts` | `openDb()` / `resolveDbPath()` | schema + PRAGMAs + stmts |
 | `src/wake-worker.ts` | Worker default body | `data_version` poll → wake |
-| `src/server-worker.ts` | Worker default body | UDS subscribe server: query → result + live patches |
-| `src/protocol.ts` | `encodeFrame()` / `LineBuffer` / frame types | NDJSON wire protocol |
+| `src/server-worker.ts` | Worker default body | UDS subscribe server: query → result + live patches, routed by collection |
+| `src/collections.ts` | `getCollection()` / `selectByIds()` | collection registry + descriptor-parameterized by-id read |
+| `src/protocol.ts` | `encodeFrame()` / `LineBuffer` / frame types | NDJSON wire protocol (collection-namespaced frames) |
 | `plugin/hooks/events-writer.ts` | `main()` | one event row per hook |
 
 ## State machine

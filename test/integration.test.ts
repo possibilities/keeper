@@ -354,8 +354,10 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
 
   const client = await connectClient(sockPath);
   try {
-    // --- query → result: ordered page, frozen membership, world rev. ---
-    client.send({ type: "query", id: "q1" });
+    // --- query → result: ordered page, frozen membership, world rev. The
+    // query now carries a required `collection`; result/patch echo it and the
+    // patch payload is `row` (not `job`). ---
+    client.send({ type: "query", collection: "jobs", id: "q1" });
     const result = await retryUntil(
       () => client.frames.find((f) => f.type === "result") ?? null,
     );
@@ -367,12 +369,13 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
       );
     }
     expect(result.id).toBe("q1");
+    expect(result.collection).toBe("jobs");
     expect(result.rows.some((r) => r.job_id === sessionId)).toBe(true);
     const watchedRow = result.rows.find((r) => r.job_id === sessionId);
     if (!watchedRow) {
       throw new Error("unreachable: row presence asserted above");
     }
-    const baselineEventId = watchedRow.last_event_id;
+    const baselineEventId = watchedRow.last_event_id as number;
 
     // --- fold a change to the watched row → expect a patch (live cell). ---
     await fireHook({
@@ -386,8 +389,8 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
         client.frames.find(
           (f) =>
             f.type === "patch" &&
-            f.job.job_id === sessionId &&
-            f.job.last_event_id > baselineEventId,
+            f.row.job_id === sessionId &&
+            (f.row.last_event_id as number) > baselineEventId,
         ) ?? null,
     );
     if (!patch || patch.type !== "patch") {
@@ -395,11 +398,12 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
       const err = await readStream(daemon.stderr);
       throw new Error(`patch never arrived.\nstdout:\n${out}\nstderr:\n${err}`);
     }
-    expect(patch.job.job_id).toBe(sessionId);
-    expect(patch.job.state).toBe("working");
+    expect(patch.collection).toBe("jobs");
+    expect(patch.row.job_id).toBe(sessionId);
+    expect(patch.row.state).toBe("working");
     // UserPromptSubmit carried permission_mode 'plan'.
-    expect(patch.job.mode).toBe("plan");
-    expect(patch.rev).toBeGreaterThanOrEqual(patch.job.last_event_id);
+    expect(patch.row.mode).toBe("plan");
+    expect(patch.rev).toBeGreaterThanOrEqual(patch.row.last_event_id as number);
   } finally {
     client.socket.end();
   }

@@ -22,27 +22,44 @@
  * - `result` — the snapshot page (rows in order) plus the world-rev at query
  *              time. `rev = reducer_state.last_event_id`. This frame doubles
  *              as the initial subscription state; subsequent patches arrive
- *              with monotonically non-decreasing `rev` values.
- * - `patch`  — a single row in the page has advanced (its `last_event_id`
- *              moved forward). The full updated `Job` row is included so the
- *              client never needs to re-query to render the change.
+ *              with monotonically non-decreasing `rev` values. Echoes the
+ *              `collection` the page was read from.
+ * - `patch`  — a single row in the page has advanced (its per-row `version`
+ *              column moved forward). The full updated `row` is included so the
+ *              client never needs to re-query to render the change. Echoes the
+ *              `collection`.
  * - `error`  — protocol or query error. `code` is a short tag; `message` is
- *              human-readable.
+ *              human-readable. `collection` is echoed when attributable to a
+ *              named collection (e.g. `unknown_collection`).
+ *
+ * Collections: every frame names a `collection` (resolved against the registry
+ * in `src/collections.ts`); `jobs` is the first/default. Rows are generic
+ * (`Row`), shaped by the collection's column list.
+ *
+ * Frozen membership: a live page's row SET is fixed at query time — cells
+ * stream (a row's columns update via `patch`) but rows never enter or leave the
+ * page. The diff never re-evaluates the WHERE for move-in/move-out.
+ *
+ * Forward-compat: unknown frame fields are ignored, so older clients keep
+ * working as the vocabulary grows.
  *
  * INVARIANT: `rev` is present on EVERY server frame (result, patch, error
  * with a known world-rev). Downstream consumers depend on a single monotonic
- * cursor for ordering.
+ * cursor for ordering. `rev` is the GLOBAL reducer cursor — distinct from a
+ * collection's per-row `version` column the diff fires on.
  */
 
-import type { Job } from "./types";
+/** The generic served-row shape; a collection's columns determine the keys. */
+export type Row = Record<string, unknown>;
 
 // ---------------------------------------------------------------------------
 // Frame types
 // ---------------------------------------------------------------------------
 
 /**
- * Sort spec for a `query` frame. `column` names a sortable `jobs` column;
- * `dir` defaults to `"asc"` server-side when omitted.
+ * Sort spec for a `query` frame. `column` names a sortable column of the
+ * target collection (validated against the collection's allowlist); `dir`
+ * defaults server-side when omitted.
  */
 export interface QuerySort {
   column: string;
@@ -50,31 +67,27 @@ export interface QuerySort {
 }
 
 /**
- * Filter spec for a `query` frame. Field shape is intentionally open-ended in
- * v1: the server applies what it understands and ignores unknown keys (so
- * older clients keep working as the filter vocabulary grows). Concrete v1
- * filters: `state`, `mode`, `cwd` (exact match).
- */
-export interface QueryFilter {
-  state?: string;
-  mode?: string;
-  cwd?: string;
-}
-
-/**
  * Client → server: request an ordered page (and start a subscription).
  *
- * `id` is opaque to the server — when present, it's echoed on the matching
- * `result` / `error` frame for correlation. `unsubscribe` can target a
- * specific id to drop just that subscription if a client multiplexes.
+ * `collection` (required) names the collection to page (resolved against the
+ * registry in `src/collections.ts`; e.g. `"jobs"`). `id` is opaque to the
+ * server — when present, it's echoed on the matching `result` / `error` frame
+ * for correlation. `unsubscribe` can target a specific id to drop just that
+ * subscription if a client multiplexes.
+ *
+ * `filter` is an exact-match map of filter-key → value. The server resolves
+ * each key against the collection's declared filters (unknown keys are ignored
+ * for forward-compat) and binds the value; keys are never interpolated. Values
+ * are `string | number`.
  */
 export interface QueryFrame {
   type: "query";
+  collection: string;
   id?: string;
   sort?: QuerySort;
   limit?: number;
   offset?: number;
-  filter?: QueryFilter;
+  filter?: Record<string, string | number>;
 }
 
 /** Client → server: stop emitting patches for `id` (or all, if omitted). */
@@ -86,33 +99,46 @@ export interface UnsubscribeFrame {
 /**
  * Server → client: the snapshot page for a `query`. `rev` is the
  * `reducer_state.last_event_id` at the moment the page was read; subsequent
- * `patch` frames carry monotonically non-decreasing `rev`.
+ * `patch` frames carry monotonically non-decreasing `rev`. `collection` echoes
+ * the queried collection. Rows are generic (`R`, defaulting to `Row`).
  */
-export interface ResultFrame {
+export interface ResultFrame<R extends Row = Row> {
   type: "result";
   id?: string;
+  collection: string;
   rev: number;
-  rows: Job[];
+  rows: R[];
 }
 
 /**
- * Server → client: one row in the active page has advanced. `job` is the
+ * Server → client: one row in the active page has advanced. `row` is the
  * full updated row (not a delta) so the client renders without re-querying.
+ * `collection` echoes the collection the row belongs to.
  */
-export interface PatchFrame {
+export interface PatchFrame<R extends Row = Row> {
   type: "patch";
+  collection: string;
   rev: number;
-  job: Job;
+  row: R;
 }
 
 /**
- * Server → client: protocol or query error. `code` is a short stable tag
- * (e.g. `"bad_frame"`, `"oversized_line"`, `"bad_query"`). `id` is set when
- * the error is attributable to a specific client frame.
+ * Server → client: protocol or query error. `code` is a short stable tag:
+ * - `"bad_frame"` — malformed/unparseable frame, or a `query` whose
+ *   `collection` is absent / empty / non-string.
+ * - `"unknown_collection"` — a well-formed `query` naming a collection with no
+ *   registered descriptor; carries `collection` and leaves any existing
+ *   subscription intact.
+ * - `"oversized_line"` — a line exceeded the NDJSON cap (connection closes).
+ * - `"unknown_type"` — an unsupported frame `type`.
+ *
+ * `id` is set when the error is attributable to a specific client frame;
+ * `collection` is set when attributable to a named collection.
  */
 export interface ErrorFrame {
   type: "error";
   id?: string;
+  collection?: string;
   rev: number;
   code: string;
   message: string;

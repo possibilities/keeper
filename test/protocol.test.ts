@@ -13,11 +13,15 @@ import {
   LineBuffer,
   MAX_LINE_LENGTH,
   OversizedLineError,
-  type ServerFrame,
+  type PatchFrame,
+  type ResultFrame,
+  type Row,
 } from "../src/protocol";
-import type { Job } from "../src/types";
 
-const sampleJob: Job = {
+// A `jobs` row as a generic served `Row`. The protocol layer is row-shape
+// agnostic (generic over `Row`); these round-trips only assert JSON equality,
+// so a plain Row literal is all the wire contract needs.
+const sampleJob: Row = {
   job_id: "job-1",
   created_at: 1_700_000_000,
   cwd: "/tmp/x",
@@ -30,13 +34,14 @@ const sampleJob: Job = {
 
 describe("encodeFrame", () => {
   test("appends a trailing newline", () => {
-    const out = encodeFrame({ type: "query" });
+    const out = encodeFrame({ type: "query", collection: "jobs" });
     expect(out.endsWith("\n")).toBe(true);
   });
 
-  test("round-trips a query frame", () => {
+  test("round-trips a query frame (carries collection + filter)", () => {
     const frame: ClientFrame = {
       type: "query",
+      collection: "jobs",
       id: "q1",
       sort: { column: "updated_at", dir: "desc" },
       limit: 50,
@@ -47,10 +52,11 @@ describe("encodeFrame", () => {
     expect(JSON.parse(line)).toEqual(frame);
   });
 
-  test("round-trips a result frame with rev + rows", () => {
-    const frame: ServerFrame = {
+  test("round-trips a result frame with collection + rev + rows", () => {
+    const frame: ResultFrame = {
       type: "result",
       id: "q1",
+      collection: "jobs",
       rev: 99,
       rows: [sampleJob],
     };
@@ -58,11 +64,12 @@ describe("encodeFrame", () => {
     expect(JSON.parse(line)).toEqual(frame);
   });
 
-  test("round-trips a patch frame with rev", () => {
-    const frame: ServerFrame = {
+  test("round-trips a patch frame with collection + rev + row", () => {
+    const frame: PatchFrame = {
       type: "patch",
+      collection: "jobs",
       rev: 101,
-      job: { ...sampleJob, last_event_id: 50 },
+      row: { ...sampleJob, last_event_id: 50 },
     };
     const line = encodeFrame(frame).slice(0, -1);
     expect(JSON.parse(line)).toEqual(frame);
@@ -96,8 +103,13 @@ describe("extractLines", () => {
   });
 
   test("splits two frames in one chunk", () => {
-    const chunk = `${encodeFrame({ type: "query", id: "a" })}${encodeFrame({
+    const chunk = `${encodeFrame({
       type: "query",
+      collection: "jobs",
+      id: "a",
+    })}${encodeFrame({
+      type: "query",
+      collection: "jobs",
       id: "b",
     })}`;
     const r = extractLines(chunk, "");
@@ -108,8 +120,13 @@ describe("extractLines", () => {
   });
 
   test("two frames + partial third in one chunk", () => {
-    const chunk = `${encodeFrame({ type: "query", id: "a" })}${encodeFrame({
+    const chunk = `${encodeFrame({
       type: "query",
+      collection: "jobs",
+      id: "a",
+    })}${encodeFrame({
+      type: "query",
+      collection: "jobs",
       id: "b",
     })}{"type":"que`;
     const r = extractLines(chunk, "");
@@ -169,8 +186,13 @@ describe("LineBuffer", () => {
 
   test("yields all complete frames in one push", () => {
     const buf = new LineBuffer();
-    const chunk = `${encodeFrame({ type: "query", id: "a" })}${encodeFrame({
+    const chunk = `${encodeFrame({
       type: "query",
+      collection: "jobs",
+      id: "a",
+    })}${encodeFrame({
+      type: "query",
+      collection: "jobs",
       id: "b",
     })}`;
     const lines = buf.push(chunk);

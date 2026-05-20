@@ -43,7 +43,13 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
-import { openDb, resolveSockPath, selectJobsByIds } from "./db";
+import {
+  type CollectionDescriptor,
+  getCollection,
+  type Row,
+  selectByIds,
+} from "./collections";
+import { openDb, resolveSockPath } from "./db";
 import {
   type ClientFrame,
   type ErrorFrame,
@@ -55,7 +61,6 @@ import {
   type ResultFrame,
   type ServerFrame,
 } from "./protocol";
-import type { Job } from "./types";
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only path
@@ -91,30 +96,29 @@ const MIN_POLL_MS = 25;
 export const DEFAULT_LIMIT = 100;
 /** Maximum page size — kept well below `MAX_IN_PARAMS` so a page is one query. */
 export const MAX_LIMIT = 500;
-/** Columns clients may sort by (allowlist — anything else falls back). */
-const SORTABLE_COLUMNS = new Set([
-  "updated_at",
-  "created_at",
-  "last_event_id",
-  "job_id",
-  "state",
-  "mode",
-]);
 
 /**
  * Per-connection state, carried on `socket.data` (typed via the
  * `Bun.listen<ConnState>` generic).
  *
  * - `buffer` line-buffers inbound chunks until a `\n` lands (NDJSON framing).
- * - `watched` is the frozen page membership seeded by the latest `query` — the
- *   set task `.3` re-reads + diffs on every `data_version` tick.
- * - `lastSent` maps `job_id → last_event_id` as last pushed to this client, so
- *   `.3` emits a `patch` exactly once per advance.
+ * - `collection` is the active subscription's collection name (`null` until the
+ *   first successful `query`; reset to `null` on `unsubscribe`). `diffTick`
+ *   groups connections by it and skips `null`-collection conns.
+ * - `watched` is the frozen page membership (keyed by the collection's pk)
+ *   seeded by the latest `query` — the set re-read + diffed on every
+ *   `data_version` tick.
+ * - `lastSent` maps pk → the collection's version column as last pushed to this
+ *   client, so the diff emits a `patch` exactly once per advance.
  * - `pending` holds a backpressured tail: the UTF-8 bytes not yet accepted by
  *   the socket, resumed in `drain`.
+ *
+ * One active subscription per connection: a re-query fully REPLACES
+ * `collection` + `watched` + `lastSent` (list → detail navigation).
  */
 export interface ConnState {
   buffer: LineBuffer;
+  collection: string | null;
   watched: Set<string>;
   lastSent: Map<string, number>;
   pending: { bytes: Uint8Array; offset: number } | null;
@@ -123,6 +127,7 @@ export interface ConnState {
 function newConnState(): ConnState {
   return {
     buffer: new LineBuffer(),
+    collection: null,
     watched: new Set(),
     lastSent: new Map(),
     pending: null,
@@ -225,30 +230,52 @@ function unlinkIfExists(path: string): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Page the `jobs` projection for a `query` frame. Returns the ordered rows plus
- * the world-rev read in the same logical snapshot — both feed the `result`
- * frame and seed the connection's watched-set / `lastSent`.
+ * Page a collection for a `query` frame. Returns the ordered rows plus the
+ * world-rev read in the same logical snapshot — both feed the `result` frame
+ * and seed the connection's watched-set / `lastSent`. A well-formed `query`
+ * naming an unregistered collection returns an `unknown_collection` ErrorFrame
+ * (carrying `collection` + `id`) rather than throwing.
  *
- * Ordering, filtering, and paging happen in SQL so the page is read in one go.
- * Sort column is allowlisted (`SORTABLE_COLUMNS`) to avoid SQL injection via
- * the column name; an unknown column falls back to `updated_at`. Direction
- * defaults to `desc` for `updated_at` (most-recent-first) and otherwise honors
- * the frame, defaulting to `asc`.
+ * Everything collection-specific routes through the descriptor: table, column
+ * list, pk, the sort allowlist, the default sort, and the filter map. Ordering,
+ * filtering, and paging happen in SQL so the page is read in one go.
+ *
+ * Injection: the sort column is validated against `descriptor.sortable` (an
+ * unknown column falls back to `descriptor.defaultSort`); table/columns/pk/sort
+ * col are descriptor constants, safe to interpolate. Wire `filter` keys are
+ * resolved via `descriptor.filters` by map lookup (never interpolated); values
+ * and limit/offset are bound (`?`).
+ *
+ * Sort direction: when the frame omits `dir`, default to the descriptor's
+ * default dir only when the chosen column equals the default column (preserving
+ * jobs' "updated_at → desc"), else `asc`.
  */
 export function runQuery(
   db: Database,
   worldRev: number,
   frame: QueryFrame,
-): ResultFrame {
+): ResultFrame | ErrorFrame {
+  const descriptor = getCollection(frame.collection);
+  if (!descriptor) {
+    return {
+      type: "error",
+      ...(frame.id !== undefined ? { id: frame.id } : {}),
+      collection: frame.collection,
+      rev: worldRev,
+      code: "unknown_collection",
+      message: `no such collection: ${frame.collection}`,
+    };
+  }
+
   const sortCol =
-    frame.sort && SORTABLE_COLUMNS.has(frame.sort.column)
+    frame.sort && descriptor.sortable.has(frame.sort.column)
       ? frame.sort.column
-      : "updated_at";
+      : descriptor.defaultSort.column;
   const dir =
     frame.sort?.dir === "asc" || frame.sort?.dir === "desc"
       ? frame.sort.dir
-      : sortCol === "updated_at"
-        ? "desc"
+      : sortCol === descriptor.defaultSort.column
+        ? descriptor.defaultSort.dir
         : "asc";
 
   const limit = clampLimit(frame.limit);
@@ -257,36 +284,37 @@ export function runQuery(
       ? Math.floor(frame.offset)
       : 0;
 
+  // Build WHERE by map lookup: a wire filter key is only honored if the
+  // descriptor declares it (→ a trusted SQL column); the value is bound. A
+  // key absent from descriptor.filters is silently ignored (forward-compat).
   const where: string[] = [];
   const params: (string | number)[] = [];
-  if (frame.filter?.state) {
-    where.push("state = ?");
-    params.push(frame.filter.state);
-  }
-  if (frame.filter?.mode) {
-    where.push("mode = ?");
-    params.push(frame.filter.mode);
-  }
-  if (frame.filter?.cwd) {
-    where.push("cwd = ?");
-    params.push(frame.filter.cwd);
+  if (frame.filter) {
+    for (const [key, col] of Object.entries(descriptor.filters)) {
+      const value = frame.filter[key];
+      if (value != null) {
+        where.push(`${col} = ?`);
+        params.push(value);
+      }
+    }
   }
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
 
-  // sortCol + dir are both allowlisted constants, never user text — safe to
-  // interpolate. limit/offset are bound.
+  // table/columns/pk/sortCol/dir are descriptor constants, never wire text —
+  // safe to interpolate. filter values + limit/offset are bound.
   const sql = `
-    SELECT job_id, created_at, cwd, pid, mode, state, last_event_id, updated_at
-      FROM jobs
+    SELECT ${descriptor.columns.join(", ")}
+      FROM ${descriptor.table}
       ${whereClause}
-     ORDER BY ${sortCol} ${dir.toUpperCase()}, job_id ASC
+     ORDER BY ${sortCol} ${dir.toUpperCase()}, ${descriptor.pk} ASC
      LIMIT ? OFFSET ?
   `;
-  const rows = db.prepare(sql).all(...params, limit, offset) as Job[];
+  const rows = db.prepare(sql).all(...params, limit, offset) as Row[];
 
   return {
     type: "result",
     ...(frame.id !== undefined ? { id: frame.id } : {}),
+    collection: descriptor.name,
     rev: worldRev,
     rows,
   };
@@ -333,16 +361,45 @@ export function dispatchLine(
 
   switch (frame.type) {
     case "query": {
+      // `collection` is required and must be a non-empty string. Absent / empty
+      // / non-string → bad_frame; a well-formed string naming no descriptor →
+      // unknown_collection (decided inside runQuery). Either error leaves the
+      // existing subscription intact.
+      if (
+        typeof frame.collection !== "string" ||
+        frame.collection.length === 0
+      ) {
+        return [
+          errorFrame(
+            db,
+            "bad_frame",
+            "query frame missing non-empty string `collection`",
+            frame.id,
+          ),
+        ];
+      }
       const worldRev = readWorldRev(db);
-      const result = runQuery(db, worldRev, frame);
-      // Seed the watched-set + lastSent for the live subscription (task .3).
-      conn.watched = new Set(result.rows.map((r) => r.job_id));
+      const out = runQuery(db, worldRev, frame);
+      if (out.type !== "result") {
+        // unknown_collection (or any error): do NOT mutate the subscription.
+        return [out];
+      }
+      const descriptor = getCollection(out.collection) as CollectionDescriptor;
+      // Replace the subscription atomically (one synchronous block, no await):
+      // collection + watched + lastSent, keyed by the descriptor's pk/version,
+      // so no diffTick interleaves stale rows.
+      conn.collection = out.collection;
+      conn.watched = new Set(out.rows.map((r) => String(r[descriptor.pk])));
       conn.lastSent = new Map(
-        result.rows.map((r) => [r.job_id, r.last_event_id]),
+        out.rows.map((r) => [
+          String(r[descriptor.pk]),
+          r[descriptor.version] as number,
+        ]),
       );
-      return [result];
+      return [out];
     }
     case "unsubscribe": {
+      conn.collection = null;
       conn.watched = new Set();
       conn.lastSent = new Map();
       return [];
@@ -482,10 +539,10 @@ function readWorldRevOnce(db: Database): number {
 }
 
 /**
- * Compute the union of every connection's watched ids. The poll loop does ONE
- * shared `selectJobsByIds(union)` re-read per tick, then fans the rows out to
- * each connection — so N connections watching overlapping pages cost one query,
- * not N.
+ * Compute the union of watched ids across a set of connections (all of which
+ * share one collection). The poll loop does ONE shared `selectByIds(union)`
+ * re-read per collection group per tick, then fans the rows out — so N
+ * connections watching overlapping pages cost one query, not N.
  */
 function unionWatched(conns: Iterable<Writable>): string[] {
   const union = new Set<string>();
@@ -500,22 +557,26 @@ function unionWatched(conns: Iterable<Writable>): string[] {
 /**
  * Run ONE realtime tick across all connections.
  *
- * 1. Read world rev once → stamped on every `patch` emitted this tick.
- * 2. Read the union of all watched ids once (shared re-read).
- * 3. For each connection, for each watched `job_id`: push a `patch {rev, job}`
- *    ONLY when `job.last_event_id > lastSent[job_id]`, then bump `lastSent`.
- *    No patch when equal — the diff is state-based, so multiple folds between
- *    ticks collapse to one push (automatic coalescing, no event queue).
+ * 1. Read world rev once → the GLOBAL reducer cursor stamped on every `patch`
+ *    emitted this tick. Distinct from the per-row `version` column the diff
+ *    fires on (for jobs both happen to be `last_event_id`; do not conflate).
+ * 2. Group connections by active collection (skip `null`-collection conns).
+ * 3. Per group: read the union of watched ids once via `selectByIds` and index
+ *    by the descriptor's pk.
+ * 4. For each connection, for each watched id: push a `patch {collection, rev,
+ *    row}` ONLY when `row[descriptor.version] > lastSent[id]`, then bump
+ *    `lastSent`. No patch when equal — the diff is state-based, so multiple
+ *    folds between ticks collapse to one push (coalescing, no event queue).
  *
  * Backpressure: a connection with a pending (backpressured) write is SKIPPED
  * for the tick — never blocking fan-out to other connections, and crucially
  * `lastSent` is NOT advanced for the skipped rows, so the next tick re-reflects
  * current state and nothing is lost.
  *
- * Reads `jobs` only (never `events`). The self-correcting race — a poll landing
- * after a hook `events` INSERT but before the reducer folds — sees no `jobs`
- * change; the fold is itself a commit that re-bumps `data_version`, so the next
- * poll catches it.
+ * Reads the collection table only (never `events`). The self-correcting race —
+ * a poll landing after a hook `events` INSERT but before the reducer folds —
+ * sees no projection change; the fold is itself a commit that re-bumps
+ * `data_version`, so the next poll catches it.
  *
  * Exported so the loop can be driven directly in tests without a real socket.
  */
@@ -525,41 +586,69 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
     return;
   }
 
-  const ids = unionWatched(list);
-  if (ids.length === 0) {
+  // Group connections by their active collection; null-collection conns (no
+  // live subscription) are never visited.
+  const byCollection = new Map<string, Writable[]>();
+  for (const sock of list) {
+    const name = sock.data.collection;
+    if (name === null) {
+      continue;
+    }
+    const group = byCollection.get(name);
+    if (group) {
+      group.push(sock);
+    } else {
+      byCollection.set(name, [sock]);
+    }
+  }
+  if (byCollection.size === 0) {
     return;
   }
 
   const rev = readWorldRevOnce(db);
-  const rows = selectJobsByIds(db, ids);
-  // Index by job_id for per-connection fan-out.
-  const byId = new Map<string, (typeof rows)[number]>();
-  for (const row of rows) {
-    byId.set(row.job_id, row);
-  }
 
-  for (const sock of list) {
-    // Slow consumer: a still-pending write means this socket is backpressured.
-    // Skip it for the tick (don't advance lastSent); the next tick re-diffs.
-    if (sock.data.pending) {
+  for (const [name, group] of byCollection) {
+    const descriptor = getCollection(name);
+    if (!descriptor) {
+      // A subscription whose collection vanished from the registry (shouldn't
+      // happen — the registry is static): nothing to diff.
       continue;
     }
-    const patches: PatchFrame[] = [];
-    for (const id of sock.data.watched) {
-      const job = byId.get(id);
-      if (!job) {
-        // The row vanished (jobs rows are never deleted in v1, but stay
-        // defensive): nothing to diff, leave lastSent untouched.
+    const ids = unionWatched(group);
+    if (ids.length === 0) {
+      continue;
+    }
+    const rows = selectByIds(db, descriptor, ids);
+    // Index by the descriptor's pk for per-connection fan-out.
+    const byId = new Map<string, Row>();
+    for (const row of rows) {
+      byId.set(String(row[descriptor.pk]), row);
+    }
+
+    for (const sock of group) {
+      // Slow consumer: a still-pending write means this socket is
+      // backpressured. Skip it (don't advance lastSent); the next tick re-diffs.
+      if (sock.data.pending) {
         continue;
       }
-      const last = sock.data.lastSent.get(id) ?? -1;
-      if (job.last_event_id !== null && job.last_event_id > last) {
-        patches.push({ type: "patch", rev, job });
-        sock.data.lastSent.set(id, job.last_event_id);
+      const patches: PatchFrame[] = [];
+      for (const id of sock.data.watched) {
+        const row = byId.get(id);
+        if (!row) {
+          // The row vanished (rows are never deleted in v1, but stay
+          // defensive): nothing to diff, leave lastSent untouched.
+          continue;
+        }
+        const version = row[descriptor.version] as number | null;
+        const last = sock.data.lastSent.get(id) ?? -1;
+        if (version !== null && version > last) {
+          patches.push({ type: "patch", collection: name, rev, row });
+          sock.data.lastSent.set(id, version);
+        }
       }
-    }
-    if (patches.length > 0) {
-      writeFrames(sock, patches);
+      if (patches.length > 0) {
+        writeFrames(sock, patches);
+      }
     }
   }
 }
@@ -662,6 +751,7 @@ export function startServer(
         // state; nothing process-global to release here.
         conns.delete(socket as unknown as Writable);
         socket.data.pending = null;
+        socket.data.collection = null;
         socket.data.watched.clear();
         socket.data.lastSent.clear();
       },

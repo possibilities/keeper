@@ -17,7 +17,6 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { Job } from "./types";
 
 /**
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
@@ -56,10 +55,11 @@ export function resolveSockPath(): string {
 
 /**
  * SQLite default `SQLITE_MAX_VARIABLE_NUMBER` is 999 — `IN (?,?,...)` binds
- * one variable per id. Callers of `selectJobsByIds` must chunk past this cap
- * or cap their input. The server-worker page sizes (default limit ~100,
- * hard-capped well below 999) make a single query the common case, but the
- * constant is exported so chunking callers don't have to magic-number it.
+ * one variable per id. Callers of `selectByIds` (`src/collections.ts`) must
+ * chunk past this cap or cap their input. The server-worker page sizes
+ * (default limit ~100, hard-capped well below 999) make a single query the
+ * common case, but the constant is exported so chunking callers don't have to
+ * magic-number it.
  */
 export const MAX_IN_PARAMS = 999;
 
@@ -130,9 +130,9 @@ CREATE TABLE IF NOT EXISTS meta (
  * is part of the SessionEnd 1.5s timeout budget.
  *
  * `selectWorldRev` reads the singleton `reducer_state.last_event_id` and is
- * the canonical source of `rev` on server frames. `selectJobsByIds` is the
- * shared variable-binding read used by the server worker; it's NOT preparable
- * here (one statement per arity) so it lives as a helper function instead.
+ * the canonical source of `rev` on server frames. The shared variable-binding
+ * read used by the server worker lives in `src/collections.ts` as
+ * `selectByIds` (one statement per arity, descriptor-parameterized).
  */
 export interface Stmts {
   insertEvent: ReturnType<Database["prepare"]>;
@@ -269,43 +269,6 @@ function prepareStmts(db: Database): Stmts {
 export function selectWorldRev(stmts: Stmts): number {
   const row = stmts.selectWorldRev.get() as { last_event_id: number } | null;
   return row ? row.last_event_id : 0;
-}
-
-/**
- * Read a set of `jobs` rows by id. Returns rows in the order SQLite emits
- * them (NOT necessarily the input order) — the caller is responsible for
- * reordering if rendering order matters.
- *
- * Short-circuits to `[]` on an empty id-set: a bare `IN ()` is a SQL syntax
- * error in SQLite, and the cheapest correct behavior is to skip the query.
- *
- * SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 999 (`MAX_IN_PARAMS`);
- * larger id-sets MUST be chunked by the caller. We throw a typed error rather
- * than silently truncating — a truncation here would surface as missing
- * patches downstream and be hard to chase.
- */
-export function selectJobsByIds(db: Database, ids: readonly string[]): Job[] {
-  if (ids.length === 0) {
-    return [];
-  }
-  if (ids.length > MAX_IN_PARAMS) {
-    throw new Error(
-      `selectJobsByIds: id-set of ${ids.length} exceeds SQLITE_MAX_VARIABLE_NUMBER (${MAX_IN_PARAMS}); chunk the caller`,
-    );
-  }
-  const placeholders = ids.map(() => "?").join(",");
-  const sql = `
-    SELECT job_id, created_at, cwd, pid, mode, state, last_event_id, updated_at
-      FROM jobs
-     WHERE job_id IN (${placeholders})
-  `;
-  // Per-call prepare is fine — server-worker page sizes are small (default
-  // limit ~100, capped well below MAX_IN_PARAMS), the statement shape is
-  // arity-dependent so a cached prepared form would itself need a cache, and
-  // SQLite's compile cost on a trivial SELECT is negligible. If this ever
-  // becomes hot, add an LRU keyed by arity.
-  const stmt = db.prepare(sql);
-  return stmt.all(...ids) as Job[];
 }
 
 /**
