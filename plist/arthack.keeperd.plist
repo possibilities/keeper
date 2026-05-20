@@ -28,6 +28,12 @@
 	<dict>
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<!--
+		  The subscribe server's UDS defaults to keeperd.sock in the state dir
+		  below (sibling of StandardOutPath / keeper.db). Uncomment to override:
+		  <key>KEEPER_SOCK</key>
+		  <string>/Users/mike/.local/state/keeper/keeperd.sock</string>
+		-->
 	</dict>
 	<key>RunAtLoad</key>
 	<true/>
