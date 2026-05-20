@@ -79,5 +79,5 @@ Add/extend unit + integration coverage:
 - [ ] `bun test --isolate` passes (protocol, server-worker, integration suites green).
 
 ## Done summary
-
+Added a live filtered-set total on result frames and a new additive meta membership-staleness frame: per-tick countAndToken (portable group_concat(pk) subquery ordered by pk, empty-set normalized) through the descriptor injection gate, folded into diffTick as a filter-signature-grouped second pass with patch-path backpressure discipline. Token stable on cell updates, changes on enter/leave/balanced-swap. Docs + script + protocol/server-worker/collections + tests updated; no schema migration, no write path.
 ## Evidence
