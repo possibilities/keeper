@@ -52,5 +52,5 @@ The keystone: a **subsystem worker** that owns a UDS listener, per-connection st
 - [ ] `bun test`, `bun run lint`, `bun run typecheck` pass
 
 ## Done summary
-
+Added src/server-worker.ts: a Bun Worker owning a UDS listener with its own readonly DB connection, lock-file ownership (pid + liveness, steal-stale/refuse-live), NDJSON dispatch up to one-shot query→result, partial-write+drain backpressure, and clean shutdown that releases socket+lock. 18 new tests; full suite + lint + typecheck green.
 ## Evidence
