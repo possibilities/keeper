@@ -9,26 +9,36 @@
  *   2. Boot drain: `while (drain(db, BATCH) > 0) {}` — fold every unfolded event
  *      using the SAME code path as steady-state. After downtime this catches the
  *      projection up before the daemon goes live.
- *   3. Spawn the wake worker. It opens its own read-only connection and polls
- *      `PRAGMA data_version`, posting a contentless `{ kind: "wake" }` whenever
- *      another connection commits.
+ *   3. Spawn TWO worker threads (both AFTER migrate + boot drain, so their
+ *      read-only `openDb` connections never race a missing/un-migrated DB):
+ *      - the wake worker — opens its own read-only connection, polls
+ *        `PRAGMA data_version`, and posts a contentless `{ kind: "wake" }`
+ *        whenever another connection commits.
+ *      - the server worker — owns the UDS read surface: its own read-only
+ *        connection, the `keeperd.lock` ownership lock, an NDJSON listener, and
+ *        its own `data_version` poll that fans `jobs` changes out as patches.
  *   4. Steady state: every wake triggers a full drain loop. Wakes that arrive
  *      mid-drain coalesce into the next pass via a single "wake pending" flag —
  *      no event is missed (drain always re-reads from the cursor) and drain is
  *      never invoked re-entrantly.
- *   5. SIGTERM: post `{ type: "shutdown" }` to the worker, await its termination
- *      with a short deadline, close the db, exit 0. This is the ONLY clean exit.
+ *   5. SIGTERM: post `{ type: "shutdown" }` to BOTH workers, await both `close`
+ *      events against a short deadline, terminate both, close the db, exit 0.
+ *      This is the ONLY clean exit. The server worker releases its socket + lock
+ *      inside its own shutdown handler (the socket is process-owned, so
+ *      `terminate()` alone would leak it).
  *
- * Crash policy (single recovery path): ANY unrecoverable error — a worker
+ * Crash policy (single recovery path): ANY unrecoverable error — either worker's
  * `error` event, an unhandled rejection, or a fold throw that escapes the
  * per-event guard — calls `process.exit(1)`. The LaunchAgent
  * `KeepAlive.SuccessfulExit = false` then restarts us. We deliberately keep ONE
- * well-tested recovery path rather than attempting in-process self-heal.
+ * well-tested recovery path rather than attempting in-process self-heal — no
+ * in-process respawn of either worker.
  */
 
 import type { Database } from "bun:sqlite";
 import { openDb, resolveDbPath } from "./db";
 import { DEFAULT_BATCH_SIZE, drain } from "./reducer";
+import type { ServerWorkerData } from "./server-worker";
 import type {
   ShutdownMessage,
   WakeMessage,
@@ -121,6 +131,25 @@ function runDaemon(): void {
     fatalExit();
   };
 
+  // Spawn the server worker in the SAME post-migration window: its read-only
+  // `openDb` would fail loud against a missing/un-migrated DB. It binds the UDS,
+  // acquires the ownership lock, and runs its own `data_version` poll — fully
+  // decoupled from the reducer. `dbPath` is the only required field; sock/lock
+  // paths default to `resolveSockPath()` worker-side (KEEPER_SOCK honored there).
+  const serverWorker = new Worker(
+    new URL("./server-worker.ts", import.meta.url).href,
+    {
+      workerData: { dbPath } satisfies ServerWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  // Same crash policy as the wake worker: any thread failure → fatalExit → exit
+  // 1 → launchd restart. No in-process respawn.
+  serverWorker.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] server worker error:", err.message ?? err);
+    fatalExit();
+  };
+
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -152,16 +181,29 @@ function runDaemon(): void {
     shuttingDown = true;
 
     worker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
+    serverWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
 
-    // Bun surfaces worker exit via the "close" event. Race it against a deadline
-    // so a wedged worker can't block our clean shutdown forever.
-    const exited = new Promise<void>((resolve) => {
-      worker.addEventListener("close", () => resolve());
-    });
-    await Promise.race([exited, Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS)]);
+    // Bun surfaces worker exit via the "close" event. Await BOTH workers'
+    // close (the server worker releases its socket + lock in its own shutdown
+    // handler — that teardown must land, or the socket leaks into the next
+    // boot), raced against a single shared deadline so a wedged worker can't
+    // block our clean shutdown forever.
+    const exited = (w: Worker): Promise<void> =>
+      new Promise<void>((resolve) => {
+        w.addEventListener("close", () => resolve());
+      });
+    await Promise.race([
+      Promise.all([exited(worker), exited(serverWorker)]),
+      Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS),
+    ]);
 
     try {
       worker.terminate();
+    } catch {
+      // best-effort if it already exited
+    }
+    try {
+      serverWorker.terminate();
     } catch {
       // best-effort if it already exited
     }

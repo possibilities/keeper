@@ -17,11 +17,12 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { openDb } from "../src/db";
+import { encodeFrame, LineBuffer, type ServerFrame } from "../src/protocol";
 
 /** Repo root — this file lives at <root>/test, so one level up. */
 const ROOT = join(import.meta.dir, "..");
@@ -30,11 +31,15 @@ const HOOK_ENTRY = join(ROOT, "plugin", "hooks", "events-writer.ts");
 
 let tmpDir: string;
 let dbPath: string;
+let sockPath: string;
 let daemon: Subprocess<"ignore", "pipe", "pipe"> | null = null;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-integration-test-"));
   dbPath = join(tmpDir, "keeper.db");
+  // BOTH KEEPER_DB and KEEPER_SOCK live in the tmpdir: a test that set only
+  // KEEPER_DB would bind the REAL default socket and collide across isolates.
+  sockPath = join(tmpDir, "keeperd.sock");
   daemon = null;
 });
 
@@ -47,6 +52,17 @@ afterEach(async () => {
       await daemon.exited;
     } catch {
       // already gone
+    }
+  }
+  // A SIGKILLed daemon never runs its socket-release teardown, so unlink the
+  // socket (+ lock) here too — a leftover would collide with the next isolate.
+  for (const p of [sockPath, `${sockPath}.lock`]) {
+    try {
+      if (existsSync(p)) {
+        unlinkSync(p);
+      }
+    } catch {
+      // best-effort
     }
   }
   rmSync(tmpDir, { recursive: true, force: true });
@@ -110,9 +126,11 @@ test("end-to-end: hook writes → wake worker → reducer folds → jobs project
   const sessionId = "sess-e2e";
 
   // Spawn the daemon as a real process so the wake worker actually runs.
+  // KEEPER_SOCK points at the tmpdir so the server worker can't bind the real
+  // default socket (which would collide across isolates).
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
-    env: { ...process.env, KEEPER_DB: dbPath },
+    env: { ...process.env, KEEPER_DB: dbPath, KEEPER_SOCK: sockPath },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -249,4 +267,148 @@ test("end-to-end: hook writes → wake worker → reducer folds → jobs project
   daemon.kill("SIGTERM");
   const exitCode = await daemon.exited;
   expect(exitCode).toBe(0);
+}, 15000);
+
+/**
+ * Connect to the daemon's UDS as an in-test client (the ONLY thing that ever
+ * connects — no consumer ships this epic). De-frames inbound NDJSON with the
+ * SAME `LineBuffer` the server uses, accumulating decoded `ServerFrame`s into a
+ * shared array the test polls via `retryUntil`. Returns the live socket plus
+ * the frame sink and a `send` that encodes a client frame onto the wire.
+ */
+async function connectClient(unix: string): Promise<{
+  socket: import("bun").Socket<undefined>;
+  frames: ServerFrame[];
+  send(frame: object): void;
+}> {
+  const frames: ServerFrame[] = [];
+  const buffer = new LineBuffer();
+  const socket = await Bun.connect({
+    unix,
+    socket: {
+      data(_sock, chunk) {
+        // Reuse the protocol de-framer: arbitrary chunk boundaries → lines.
+        for (const line of buffer.push(chunk.toString("utf8"))) {
+          if (line.trim().length > 0) {
+            frames.push(JSON.parse(line) as ServerFrame);
+          }
+        }
+      },
+    },
+  });
+  return {
+    socket,
+    frames,
+    send(frame: object): void {
+      socket.write(encodeFrame(frame as never));
+    },
+  };
+}
+
+test("end-to-end: UDS subscribe server — query→result, then patch after a fold", async () => {
+  const sessionId = "sess-subscribe-e2e";
+
+  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+    cwd: ROOT,
+    env: { ...process.env, KEEPER_DB: dbPath, KEEPER_SOCK: sockPath },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  // Boot: writer conn + boot drain + spawn both workers + bind the socket. The
+  // server worker binds AFTER migrate, so poll for the socket file rather than
+  // racing it with a fixed sleep.
+  const bound = await retryUntil(
+    () => (existsSync(sockPath) ? true : null),
+    3000,
+  );
+  if (!bound) {
+    const out = await readStream(daemon.stdout);
+    const err = await readStream(daemon.stderr);
+    throw new Error(`socket never bound.\nstdout:\n${out}\nstderr:\n${err}`);
+  }
+
+  // Fold one job so the query has a row to page + watch.
+  await fireHook({
+    hook_event_name: "SessionStart",
+    session_id: sessionId,
+    cwd: "/tmp/work",
+    permission_mode: "default",
+  });
+
+  // Wait for the reducer to project the job (read-only observer mirrors the
+  // server's own view) before we query, so the result page is non-empty.
+  const reader = openDb(dbPath, { readonly: true }).db;
+  const projected = await retryUntil(() => {
+    const row = reader
+      .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
+      .get(sessionId) as { last_event_id: number } | null;
+    return row ? row : null;
+  });
+  reader.close();
+  if (!projected) {
+    const out = await readStream(daemon.stdout);
+    const err = await readStream(daemon.stderr);
+    throw new Error(`job never projected.\nstdout:\n${out}\nstderr:\n${err}`);
+  }
+
+  const client = await connectClient(sockPath);
+  try {
+    // --- query → result: ordered page, frozen membership, world rev. ---
+    client.send({ type: "query", id: "q1" });
+    const result = await retryUntil(
+      () => client.frames.find((f) => f.type === "result") ?? null,
+    );
+    if (!result || result.type !== "result") {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `result never arrived.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+    expect(result.id).toBe("q1");
+    expect(result.rows.some((r) => r.job_id === sessionId)).toBe(true);
+    const watchedRow = result.rows.find((r) => r.job_id === sessionId);
+    if (!watchedRow) {
+      throw new Error("unreachable: row presence asserted above");
+    }
+    const baselineEventId = watchedRow.last_event_id;
+
+    // --- fold a change to the watched row → expect a patch (live cell). ---
+    await fireHook({
+      hook_event_name: "UserPromptSubmit",
+      session_id: sessionId,
+      permission_mode: "plan",
+    });
+
+    const patch = await retryUntil(
+      () =>
+        client.frames.find(
+          (f) =>
+            f.type === "patch" &&
+            f.job.job_id === sessionId &&
+            f.job.last_event_id > baselineEventId,
+        ) ?? null,
+    );
+    if (!patch || patch.type !== "patch") {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(`patch never arrived.\nstdout:\n${out}\nstderr:\n${err}`);
+    }
+    expect(patch.job.job_id).toBe(sessionId);
+    expect(patch.job.state).toBe("working");
+    // UserPromptSubmit carried permission_mode 'plan'.
+    expect(patch.job.mode).toBe("plan");
+    expect(patch.rev).toBeGreaterThanOrEqual(patch.job.last_event_id);
+  } finally {
+    client.socket.end();
+  }
+
+  // --- clean shutdown: SIGTERM removes the socket file + exits 0. ---
+  daemon.kill("SIGTERM");
+  const exitCode = await daemon.exited;
+  expect(exitCode).toBe(0);
+  // The server worker's shutdown handler unlinks the socket (it's process-owned;
+  // terminate() alone wouldn't release it).
+  expect(existsSync(sockPath)).toBe(false);
 }, 15000);
