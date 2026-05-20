@@ -55,13 +55,25 @@ a YAML document (--- separated) of full job entities. The total/membership
 "meta" signal prints as a separate ...-fenced note (the frozen page never reflows).
 `;
 
-/** Render one value as a YAML scalar (bare when safe, else single-quoted). */
+/**
+ * Render one value as YAML. Scalars are bare when safe, else single-quoted;
+ * arrays and objects (e.g. a decoded `title_history`) render as flow
+ * sequences / mappings with each element recursed through this same function,
+ * so a list column shows as `[a, b]` rather than a comma-flattened string.
+ */
 function yamlScalar(v: unknown): string {
   if (v === null || v === undefined) {
     return "null";
   }
   if (typeof v === "number" || typeof v === "boolean") {
     return String(v);
+  }
+  if (Array.isArray(v)) {
+    return `[${v.map(yamlScalar).join(", ")}]`;
+  }
+  if (typeof v === "object") {
+    const entries = Object.entries(v as Record<string, unknown>);
+    return `{${entries.map(([k, val]) => `${k}: ${yamlScalar(val)}`).join(", ")}}`;
   }
   const s = String(v);
   // Bare scalar only when it can't be mistaken for YAML syntax; otherwise quote
