@@ -1,0 +1,10 @@
+{
+  "created_at": "2026-05-20T14:45:00Z",
+  "depends_on": [],
+  "epic": "fn-5-live-subscribe-total-signal",
+  "id": "fn-5-live-subscribe-total-signal.1",
+  "priority": null,
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Emit live total and meta",
+  "updated_at": "2026-05-20T14:46:20Z"
+}
