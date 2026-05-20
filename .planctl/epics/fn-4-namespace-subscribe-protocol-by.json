@@ -1,5 +1,6 @@
 {
   "branch_name": "fn-4-namespace-subscribe-protocol-by",
+  "closer_done_at": "2026-05-20T11:13:05Z",
   "created_at": "2026-05-20T05:17:36Z",
   "depends_on_epics": [
     "fn-3-keeper-v2-audit-follow-ups-crash-gap"
@@ -9,10 +10,10 @@
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
-  "status": "open",
+  "status": "done",
   "title": "Namespace subscribe protocol by collection",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-20T05:20:06Z"
+  "updated_at": "2026-05-20T11:13:05Z"
 }
