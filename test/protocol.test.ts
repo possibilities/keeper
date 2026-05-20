@@ -27,10 +27,10 @@ const sampleJob: Row = {
   created_at: 1_700_000_000,
   cwd: "/tmp/x",
   pid: 1234,
-  mode: "act",
   state: "working",
   last_event_id: 42,
   updated_at: 1_700_000_001,
+  title: "fix-osc",
 };
 
 describe("encodeFrame", () => {

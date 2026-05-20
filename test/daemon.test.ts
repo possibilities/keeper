@@ -66,10 +66,9 @@ test("boot drain folds a pre-seeded events table to completion", () => {
 
   // Projection reflects the folded lifecycle.
   const jobA = db
-    .query("SELECT state, mode FROM jobs WHERE job_id = 'sess-a'")
-    .get() as { state: string; mode: string };
+    .query("SELECT state FROM jobs WHERE job_id = 'sess-a'")
+    .get() as { state: string };
   expect(jobA.state).toBe("stopped");
-  expect(jobA.mode).toBe("plan");
 
   const jobB = db
     .query("SELECT state FROM jobs WHERE job_id = 'sess-b'")

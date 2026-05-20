@@ -162,39 +162,39 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("2");
+  expect(row.value).toBe("3");
   db.close();
 });
 
-test("jobs has title + title_history columns with the right defaults", () => {
+test("jobs has a nullable title column and no mode/title_history columns", () => {
   const { db } = openDb(dbPath);
   const cols = db.prepare("PRAGMA table_info(jobs)").all() as {
     name: string;
     dflt_value: string | null;
     notnull: number;
   }[];
+  const names = cols.map((c) => c.name);
   const title = cols.find((c) => c.name === "title");
-  const history = cols.find((c) => c.name === "title_history");
   expect(title).toBeDefined();
   expect(title?.notnull).toBe(0); // nullable
-  expect(history).toBeDefined();
-  expect(history?.notnull).toBe(1); // NOT NULL
-  // A fresh row reads the zero-event defaults.
+  // mode + title_history are retired — neither column exists.
+  expect(names).not.toContain("mode");
+  expect(names).not.toContain("title_history");
+  // A fresh row reads the zero-event default: title NULL.
   db.prepare(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('z', 1, 0, 1)",
   ).run();
   const r = db
-    .prepare("SELECT title, title_history FROM jobs WHERE job_id = 'z'")
-    .get() as { title: string | null; title_history: string };
+    .prepare("SELECT title FROM jobs WHERE job_id = 'z'")
+    .get() as { title: string | null };
   expect(r.title).toBeNull();
-  expect(r.title_history).toBe("[]");
   db.close();
 });
 
-test("v1 DB migrates to v2: existing rows backfill title_history=[]", () => {
-  // Build a v1-shaped DB by hand: no title columns, schema_version='1'.
-  const v1 = new Database(dbPath, { create: true });
-  v1.exec(`
+test("v2 DB migrates to v3: mode + title_history dropped, title preserved", () => {
+  // Build a v2-shaped DB by hand: mode + title + title_history, version '2'.
+  const v2 = new Database(dbPath, { create: true });
+  v2.exec(`
     CREATE TABLE jobs (
       job_id TEXT PRIMARY KEY,
       created_at REAL NOT NULL,
@@ -203,27 +203,35 @@ test("v1 DB migrates to v2: existing rows backfill title_history=[]", () => {
       mode TEXT NOT NULL DEFAULT 'act',
       state TEXT NOT NULL DEFAULT 'stopped',
       last_event_id INTEGER,
-      updated_at REAL NOT NULL
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_history TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(title_history))
     )
   `);
-  v1.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  v1.exec("INSERT INTO meta (key, value) VALUES ('schema_version', '1')");
-  v1.exec(
-    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('old', 1, 5, 1)",
+  v2.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v2.exec("INSERT INTO meta (key, value) VALUES ('schema_version', '2')");
+  v2.exec(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, mode, title, title_history) VALUES ('old', 1, 5, 1, 'plan', 'fix-osc', '[\"a\",\"fix-osc\"]')",
   );
-  v1.close();
+  v2.close();
 
-  // Reopen via openDb — migrate() runs the v1→v2 ALTERs.
+  // Reopen via openDb — migrate() runs the v2→v3 column drops.
   const { db } = openDb(dbPath);
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("2");
+  expect(ver.value).toBe("3");
+  const names = (db.prepare("PRAGMA table_info(jobs)").all() as {
+    name: string;
+  }[]).map((c) => c.name);
+  expect(names).not.toContain("mode");
+  expect(names).not.toContain("title_history");
+  // The live title survives the drop; the rest of the row is intact.
   const row = db
-    .prepare("SELECT title, title_history FROM jobs WHERE job_id = 'old'")
-    .get() as { title: string | null; title_history: string };
-  expect(row.title).toBeNull();
-  expect(row.title_history).toBe("[]");
+    .prepare("SELECT title, state, last_event_id FROM jobs WHERE job_id = 'old'")
+    .get() as { title: string | null; state: string; last_event_id: number };
+  expect(row.title).toBe("fix-osc");
+  expect(row.last_event_id).toBe(5);
   db.close();
 });
 
@@ -286,11 +294,11 @@ test("selectByIds returns matching rows for a multi-id set", () => {
   const { db } = openDb(dbPath);
   const ts = 1_700_000_000;
   const insert = db.prepare(
-    "INSERT INTO jobs (job_id, created_at, cwd, pid, mode, state, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
   );
-  insert.run("a", ts, "/a", 1, "act", "working", 10, ts);
-  insert.run("b", ts, "/b", 2, "plan", "stopped", 11, ts);
-  insert.run("c", ts, null, null, "act", "ended", 12, ts);
+  insert.run("a", ts, "/a", 1, "working", 10, ts);
+  insert.run("b", ts, "/b", 2, "stopped", 11, ts);
+  insert.run("c", ts, null, null, "ended", 12, ts);
 
   const rows = selectByIds(db, JOBS_DESCRIPTOR, [
     "a",
@@ -303,7 +311,6 @@ test("selectByIds returns matching rows for a multi-id set", () => {
   expect(ids.has("c")).toBe(true);
   // Row shape carries the typed columns through.
   const a = rows.find((r) => r.job_id === "a");
-  expect(a?.mode).toBe("act");
   expect(a?.state).toBe("working");
   expect(a?.last_event_id).toBe(10);
   expect(a?.cwd).toBe("/a");
@@ -314,20 +321,13 @@ test("selectByIds returns matching rows for a multi-id set", () => {
   db.close();
 });
 
-test("selectByIds decodes title_history to a real array (and [] when title-less)", () => {
+test("selectByIds serves title and no title_history key", () => {
   const { db } = openDb(dbPath);
   const ts = 1_700_000_000;
   db.prepare(
-    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title, title_history) VALUES (?, ?, ?, ?, ?, ?)",
-  ).run(
-    "titled",
-    ts,
-    1,
-    ts,
-    "fix-osc",
-    JSON.stringify(["keeper-009", "fix-osc"]),
-  );
-  // A title-less job seeded via the schema default ('[]').
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title) VALUES (?, ?, ?, ?, ?)",
+  ).run("titled", ts, 1, ts, "fix-osc");
+  // A title-less job (title defaults to NULL).
   db.prepare(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES (?, ?, ?, ?)",
   ).run("bare", ts, 1, ts);
@@ -336,11 +336,9 @@ test("selectByIds decodes title_history to a real array (and [] when title-less)
   const titled = rows.find((r) => r.job_id === "titled");
   const bare = rows.find((r) => r.job_id === "bare");
   expect(titled?.title).toBe("fix-osc");
-  expect(Array.isArray(titled?.title_history)).toBe(true);
-  expect(titled?.title_history).toEqual(["keeper-009", "fix-osc"]);
   expect(bare?.title).toBeNull();
-  expect(Array.isArray(bare?.title_history)).toBe(true);
-  expect(bare?.title_history).toEqual([]);
+  // title_history is retired — it is not a served column.
+  expect("title_history" in (titled ?? {})).toBe(false);
   db.close();
 });
 

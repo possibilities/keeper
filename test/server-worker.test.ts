@@ -58,21 +58,19 @@ function seedJob(
   job_id: string,
   opts: Partial<{
     state: string;
-    mode: string;
     cwd: string;
     last_event_id: number;
     updated_at: number;
   }> = {},
 ): void {
   db.query(
-    `INSERT INTO jobs (job_id, created_at, cwd, pid, mode, state, last_event_id, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     job_id,
     1,
     opts.cwd ?? null,
     null,
-    opts.mode ?? "act",
     opts.state ?? "stopped",
     opts.last_event_id ?? 0,
     opts.updated_at ?? 1,
@@ -223,54 +221,46 @@ test("runQuery resolves the pk filter for a detail-page single-item subscribe", 
   db.close();
 });
 
-/** Seed a job carrying a title + a JSON-TEXT title_history (the stored shape). */
-function seedTitledJob(
-  db: Database,
-  job_id: string,
-  title: string,
-  history: string[],
-): void {
+/** Seed a job carrying a title (the live display column). */
+function seedTitledJob(db: Database, job_id: string, title: string): void {
   db.query(
-    `INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title, title_history)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(job_id, 1, 0, 1, title, JSON.stringify(history));
+    `INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(job_id, 1, 0, 1, title);
 }
 
-test("runQuery result rows decode title_history to a real array; title-less reads []", () => {
+test("runQuery result rows serve title; title-less reads null and no title_history", () => {
   const { db } = openDb(dbPath, { readonly: false });
-  seedTitledJob(db, "titled", "fix-osc", ["keeper-009", "fix-osc"]);
-  seedJob(db, "bare", { updated_at: 0 }); // schema default '[]'
+  seedTitledJob(db, "titled", "fix-osc");
+  seedJob(db, "bare", { updated_at: 0 });
   const res = asResult(runQuery(db, 0, { type: "query", collection: "jobs" }));
   const titled = res.rows.find((r) => jobId(r) === "titled");
   const bare = res.rows.find((r) => jobId(r) === "bare");
   expect(titled?.title).toBe("fix-osc");
-  expect(Array.isArray(titled?.title_history)).toBe(true);
-  expect(titled?.title_history).toEqual(["keeper-009", "fix-osc"]);
   expect(bare?.title).toBeNull();
-  expect(Array.isArray(bare?.title_history)).toBe(true);
-  expect(bare?.title_history).toEqual([]);
+  // title_history is retired — not a served column.
+  expect("title_history" in (titled ?? {})).toBe(false);
   db.close();
 });
 
-test("diffTick patch row decodes title_history to a real array (parity with result)", () => {
+test("diffTick patch row carries the updated title (parity with result)", () => {
   const { db } = openDb(dbPath, { readonly: false });
-  seedTitledJob(db, "a", "foo", ["foo"]);
+  seedTitledJob(db, "a", "foo");
   setWorldRev(db, 42);
   const sock = fakeSock();
   watch(db, sock, { a: 0 }); // seeded from a snapshot read at version 0
 
-  // Reducer folds a title change: bump last_event_id + rewrite title_history.
+  // Reducer folds a title change: bump last_event_id + rewrite title.
   db.query(
-    "UPDATE jobs SET title = 'bar', title_history = ?, last_event_id = 6, updated_at = updated_at + 1 WHERE job_id = 'a'",
-  ).run(JSON.stringify(["foo", "bar"]));
+    "UPDATE jobs SET title = 'bar', last_event_id = 6, updated_at = updated_at + 1 WHERE job_id = 'a'",
+  ).run();
   diffTick(db, [sock]);
 
   expect(sock.frames).toHaveLength(1);
   const patch = sock.frames[0] as PatchFrame;
   expect(patch.type).toBe("patch");
   expect(patch.row.title).toBe("bar");
-  expect(Array.isArray(patch.row.title_history)).toBe(true);
-  expect(patch.row.title_history).toEqual(["foo", "bar"]);
+  expect("title_history" in patch.row).toBe(false);
   db.close();
 });
 

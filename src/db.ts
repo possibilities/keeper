@@ -9,8 +9,10 @@
  * - Prepared statements used by the hook and reducer.
  *
  * Schema migrations are forward-only via a `meta(schema_version)` row plus
- * idempotent CREATE TABLE / CREATE INDEX IF NOT EXISTS. No destructive
- * migrations in v1.
+ * idempotent steps: CREATE TABLE / CREATE INDEX IF NOT EXISTS, plus
+ * `addColumnIfMissing` / `dropColumnIfPresent` ALTERs that converge on the
+ * table's actual shape. Destructive steps (DROP COLUMN) are allowed only when
+ * idempotent — they no-op once the column is gone, so re-running is safe.
  */
 
 import { Database } from "bun:sqlite";
@@ -22,7 +24,7 @@ import { dirname, join } from "node:path";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -102,12 +104,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at REAL NOT NULL,
     cwd TEXT,
     pid INTEGER,
-    mode TEXT NOT NULL DEFAULT 'act',
     state TEXT NOT NULL DEFAULT 'stopped',
     last_event_id INTEGER,
     updated_at REAL NOT NULL,
-    title TEXT,
-    title_history TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(title_history))
+    title TEXT
 )
 `;
 
@@ -197,6 +197,24 @@ function addColumnIfMissing(
 }
 
 /**
+ * Drop a column only if it is still present. The mirror of
+ * {@link addColumnIfMissing}: reading `PRAGMA table_info` first makes the DROP an
+ * idempotent no-op once the column is gone, so the step can run on EVERY boot
+ * (a fresh DB whose CREATE TABLE already omits the column simply skips it). This
+ * is a destructive step, but an idempotent one — it converges on the column's
+ * actual absence, never re-running and never failing on a second boot.
+ */
+function dropColumnIfPresent(db: Database, table: string, column: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as {
+    name: string;
+  }[];
+  if (!cols.some((c) => c.name === column)) {
+    return;
+  }
+  db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+}
+
+/**
  * Run schema bootstrap + forward-only ALTER block. Writer-only. Wrapped in a
  * single transaction so a half-applied schema can never persist across a
  * crashed boot.
@@ -226,17 +244,20 @@ function migrate(db: Database): void {
     // non-idempotent step (a data backfill, a destructive change) would still
     // need a version guard; add that guard locally to the step that needs it.
     //
-    // v1→v2: add the `title` + `title_history` columns to `jobs`. ADD COLUMN
-    // does not rewrite existing rows, so prior `jobs` rows backfill to
-    // `title=NULL` / `title_history='[]'` — matching the zero-event projection.
-    // Column defs match CREATE_JOBS (keep the two in sync).
+    // v1→v2: add the `title` column to `jobs`. ADD COLUMN does not rewrite
+    // existing rows, so prior `jobs` rows backfill to `title=NULL` — matching
+    // the zero-event projection. Column def matches CREATE_JOBS.
     addColumnIfMissing(db, "jobs", "title", "TEXT");
-    addColumnIfMissing(
-      db,
-      "jobs",
-      "title_history",
-      "TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(title_history))",
-    );
+
+    // v2→v3: drop the `mode` and `title_history` columns from `jobs` — the
+    // plan/act mode projection and the title-history array are both retired.
+    // Idempotent (drops only if present), so this runs every boot and converges
+    // whether the DB is a fresh v3 (CREATE TABLE already omits them) or an older
+    // v1/v2 DB that still carries them. `events.permission_mode` and the
+    // `session_title` data-blob field are untouched — only the `jobs`
+    // projections of them are removed.
+    dropColumnIfPresent(db, "jobs", "mode");
+    dropColumnIfPresent(db, "jobs", "title_history");
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -270,12 +291,11 @@ function prepareStmts(db: Database): Stmts {
     `),
     upsertJob: db.prepare(`
       INSERT INTO jobs (
-        job_id, created_at, cwd, pid, mode, state, last_event_id, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        job_id, created_at, cwd, pid, state, last_event_id, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(job_id) DO UPDATE SET
         cwd = COALESCE(excluded.cwd, jobs.cwd),
         pid = COALESCE(excluded.pid, jobs.pid),
-        mode = excluded.mode,
         state = excluded.state,
         last_event_id = excluded.last_event_id,
         updated_at = excluded.updated_at

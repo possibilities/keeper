@@ -63,7 +63,7 @@ export interface CollectionDescriptor {
  * The `jobs` descriptor — the first collection. Mirrors what `runQuery` /
  * `diffTick` / `selectJobsByIds` hardcoded before namespacing: the current
  * SELECT list, the `SORTABLE_COLUMNS` allowlist, the `updated_at desc` default,
- * and the `state`/`mode`/`cwd` filters PLUS `job_id` (the pk — for detail-page
+ * and the `state`/`cwd` filters PLUS `job_id` (the pk — for detail-page
  * single-item subscribe).
  */
 export const JOBS_DESCRIPTOR: CollectionDescriptor = {
@@ -74,12 +74,10 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "created_at",
     "cwd",
     "pid",
-    "mode",
     "state",
     "last_event_id",
     "updated_at",
     "title",
-    "title_history",
   ],
   pk: "job_id",
   version: "last_event_id",
@@ -89,14 +87,13 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "last_event_id",
     "job_id",
     "state",
-    "mode",
   ]),
   defaultSort: { column: "updated_at", dir: "desc" },
-  filters: { state: "state", mode: "mode", cwd: "cwd", job_id: "job_id" },
-  // `title` is read-only display this phase — NOT in `sortable`/`filters`.
-  // `title_history` is stored as JSON TEXT and decoded to an array at the read
-  // boundary (both row-producing reads call `decodeRow`).
-  jsonColumns: new Set(["title_history"]),
+  filters: { state: "state", cwd: "cwd", job_id: "job_id" },
+  // `title` is read-only display this phase — NOT in `sortable`/`filters`. No
+  // JSON-TEXT columns are served today (`title_history` was retired), so
+  // `decodeRow` short-circuits on the empty set.
+  jsonColumns: new Set([]),
 };
 
 /** The registry, keyed by wire-facing collection name. One entry today. */
@@ -142,8 +139,8 @@ export function selectByIds(
   // small (capped well below MAX_IN_PARAMS), so compile cost is negligible.
   const stmt = db.prepare(sql);
   const rows = stmt.all(...ids) as Row[];
-  // Decode JSON-TEXT columns (e.g. `title_history`) so the diff/patch path
-  // serves the same array shape as the page SELECT in `runQuery`.
+  // Decode any JSON-TEXT columns so the diff/patch path serves the same shape
+  // as the page SELECT in `runQuery` (a no-op while `jsonColumns` is empty).
   return rows.map((row) => decodeRow(descriptor, row));
 }
 
@@ -157,8 +154,9 @@ export function selectByIds(
  *
  * MUST be called at BOTH row-producing reads (the page SELECT in
  * `runQuery` and `selectByIds` on the diff path) so `result` and `patch` frames
- * agree on the decoded shape — a divergence would serve `title_history` as a
- * string on one path and an array on the other.
+ * agree on the decoded shape — a divergence would serve a JSON-TEXT column as a
+ * string on one path and a parsed value on the other. No collection registers a
+ * `jsonColumn` today, so this is dormant generic infrastructure.
  */
 export function decodeRow(descriptor: CollectionDescriptor, row: Row): Row {
   if (descriptor.jsonColumns.size === 0) {

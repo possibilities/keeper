@@ -5,7 +5,7 @@
  * - one transaction per fold with cursor advance,
  * - drain() batching + idempotency on re-run,
  * - all four lifecycle transitions + sticky-`ended`,
- * - mode updates from permission_mode on any event,
+ * - title updates from session_title on any event,
  * - unknown/no-op event types advance the cursor without touching jobs,
  * - malformed data blob logs to stderr and advances the cursor (no halt),
  * - crash-mid-fold rolls back BOTH the jobs write and the cursor advance.
@@ -101,12 +101,10 @@ function getJob(jobId = "sess-a") {
     created_at: number;
     cwd: string | null;
     pid: number | null;
-    mode: string;
     state: string;
     last_event_id: number;
     updated_at: number;
     title: string | null;
-    title_history: string;
   } | null;
 }
 
@@ -131,13 +129,12 @@ function drainAll(): number {
 // Per-transition tests (one per row in the state-machine table)
 // ---------------------------------------------------------------------------
 
-test("SessionStart inserts a job with default mode/state", () => {
+test("SessionStart inserts a job with default state", () => {
   insertEvent({ hook_event: "SessionStart" });
   drainAll();
   const job = getJob();
   expect(job).not.toBeNull();
   expect(job?.state).toBe("stopped");
-  expect(job?.mode).toBe("act");
   expect(job?.cwd).toBe("/tmp/work");
   expect(job?.pid).toBe(4242);
 });
@@ -162,30 +159,6 @@ test("SessionEnd moves state to ended", () => {
   insertEvent({ hook_event: "SessionEnd" });
   drainAll();
   expect(getJob()?.state).toBe("ended");
-});
-
-test("mode updates from permission_mode column on any event", () => {
-  insertEvent({ hook_event: "SessionStart" });
-  insertEvent({ hook_event: "PreToolUse", permission_mode: "plan" });
-  drainAll();
-  expect(getJob()?.mode).toBe("plan");
-});
-
-test("mode collapses non-plan permission_mode to act", () => {
-  insertEvent({ hook_event: "SessionStart", permission_mode: "plan" });
-  insertEvent({ hook_event: "PostToolUse", permission_mode: "acceptEdits" });
-  drainAll();
-  expect(getJob()?.mode).toBe("act");
-});
-
-test("mode is read from data blob when column is null", () => {
-  insertEvent({ hook_event: "SessionStart" });
-  insertEvent({
-    hook_event: "Notification",
-    data: JSON.stringify({ permission_mode: "plan" }),
-  });
-  drainAll();
-  expect(getJob()?.mode).toBe("plan");
 });
 
 test("no-op event types advance cursor without touching jobs", () => {
@@ -261,8 +234,8 @@ test("duplicate SessionStart for same session_id is a no-op", () => {
 
 test("malformed data blob logs to stderr and advances cursor without halting", () => {
   insertEvent({ hook_event: "SessionStart" });
-  // Notification with a permission_mode column NULL forces the data-blob path;
-  // a non-JSON blob must be caught + logged, not thrown.
+  // A non-JSON data blob hits the title rule's JSON.parse; it must be caught +
+  // logged, not thrown.
   const errors: string[] = [];
   const originalError = console.error;
   console.error = (...args: unknown[]) => {
@@ -287,7 +260,7 @@ test("malformed data blob logs to stderr and advances cursor without halting", (
 });
 
 // ---------------------------------------------------------------------------
-// Title fold (session_title → title / title_history)
+// Title fold (session_title → title)
 // ---------------------------------------------------------------------------
 
 /** A UserPromptSubmit carrying a session_title in its data blob. */
@@ -299,28 +272,20 @@ function titleEvent(title: string, session_id = "sess-a"): number {
   });
 }
 
-test("first session_title seeds title and title_history", () => {
+test("first session_title seeds title", () => {
   insertEvent({ hook_event: "SessionStart" });
   titleEvent("foo");
   drainAll();
-  const job = getJob();
-  expect(job?.title).toBe("foo");
-  expect(JSON.parse(job?.title_history ?? "null")).toEqual(["foo"]);
+  expect(getJob()?.title).toBe("foo");
 });
 
-test("title change appends; a revert re-appends (no dedup)", () => {
+test("title follows the latest session_title (last-write-wins)", () => {
   insertEvent({ hook_event: "SessionStart" });
   titleEvent("foo");
   titleEvent("bar");
-  titleEvent("foo"); // revert — re-appends
+  titleEvent("foo"); // revert — title just follows the latest value
   drainAll();
-  const job = getJob();
-  expect(job?.title).toBe("foo");
-  expect(JSON.parse(job?.title_history ?? "null")).toEqual([
-    "foo",
-    "bar",
-    "foo",
-  ]);
+  expect(getJob()?.title).toBe("foo");
 });
 
 test("unchanged title fires no write (last_event_id unchanged by the title rule)", () => {
@@ -336,7 +301,7 @@ test("unchanged title fires no write (last_event_id unchanged by the title rule)
   const lastId = afterFirst?.last_event_id ?? 0;
 
   // A second identical title on another non-lifecycle event — the title rule
-  // must skip the write (no last_event_id bump, no append).
+  // must skip the write (no last_event_id bump).
   const repeatId = insertEvent({
     hook_event: "Notification",
     data: JSON.stringify({ session_title: "foo" }),
@@ -345,7 +310,7 @@ test("unchanged title fires no write (last_event_id unchanged by the title rule)
   const afterRepeat = getJob();
   expect(afterRepeat?.last_event_id).toBe(lastId);
   expect(afterRepeat?.last_event_id).toBeLessThan(repeatId);
-  expect(JSON.parse(afterRepeat?.title_history ?? "null")).toEqual(["foo"]);
+  expect(afterRepeat?.title).toBe("foo");
   // The cursor still advanced past the no-op title event.
   expect(getCursor()).toBe(repeatId);
 });
@@ -382,31 +347,20 @@ test("malformed data blob with a session_title still skip-and-logs and advances"
   }
 });
 
-test("title fold re-folds idempotently: draining from scratch yields identical history", () => {
+test("title fold re-folds idempotently: draining from scratch yields identical title", () => {
   insertEvent({ hook_event: "SessionStart" });
   titleEvent("foo");
   titleEvent("bar");
   titleEvent("foo");
   drainAll();
-  const once = getJob();
-  expect(JSON.parse(once?.title_history ?? "null")).toEqual([
-    "foo",
-    "bar",
-    "foo",
-  ]);
+  expect(getJob()?.title).toBe("foo");
 
   // Rewind the cursor and projection, then re-fold the SAME event stream from
-  // scratch — the persisted-tail comparison must reproduce identical history.
+  // scratch — the persisted-title comparison must reproduce the identical title.
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   drainAll();
-  const twice = getJob();
-  expect(twice?.title).toBe("foo");
-  expect(JSON.parse(twice?.title_history ?? "null")).toEqual([
-    "foo",
-    "bar",
-    "foo",
-  ]);
+  expect(getJob()?.title).toBe("foo");
 });
 
 // ---------------------------------------------------------------------------
@@ -503,7 +457,7 @@ test("re-draining after full consumption is idempotent", () => {
   expect(getCursor()).toBe(cursor1);
 });
 
-test("full lifecycle folds to ended with mode flips along the way", () => {
+test("full lifecycle folds to ended", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "UserPromptSubmit", permission_mode: "plan" });
   insertEvent({ hook_event: "PreToolUse", tool_name: "Read" });
@@ -513,6 +467,5 @@ test("full lifecycle folds to ended with mode flips along the way", () => {
 
   const job = getJob();
   expect(job?.state).toBe("ended");
-  expect(job?.mode).toBe("act");
   expect(getCursor()).toBe(endId);
 });

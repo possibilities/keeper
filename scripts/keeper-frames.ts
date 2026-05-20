@@ -11,7 +11,7 @@
  * as a full entity (every served column, in column order). As `patch` frames
  * advance individual rows, the page is updated in place and a NEW frame is
  * printed whenever the rendered page changes (a patch carries the full updated
- * row, so any column move — `state`, `mode`, `last_event_id`, … — reframes).
+ * row, so any column move — `state`, `title`, `last_event_id`, … — reframes).
  *
  * The `meta` (total/membership-staleness) signal is rendered as a SEPARATE
  * "temporary frame": a `...`-fenced comment block, distinct from the `---` job
@@ -57,7 +57,7 @@ a YAML document (--- separated) of full job entities. The total/membership
 
 /**
  * Render one value as YAML. Scalars are bare when safe, else single-quoted;
- * arrays and objects (e.g. a decoded `title_history`) render as flow
+ * arrays and objects (any future decoded JSON-TEXT column) render as flow
  * sequences / mappings with each element recursed through this same function,
  * so a list column shows as `[a, b]` rather than a comma-flattened string.
  */

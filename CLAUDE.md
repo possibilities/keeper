@@ -53,7 +53,8 @@ file is the in-codebase map for AI agents working in the repo.
     (table, served columns, pk, the per-row `version` column the diff fires on,
     the sort allowlist + default sort, the filter-key → SQL-column map, and
     `jsonColumns` — the set of JSON-TEXT columns `decodeRow` parses into real
-    values at the read boundary, e.g. `title_history`);
+    values at the read boundary; no collection registers one today, so it is
+    dormant generic infrastructure);
     `REGISTRY` / `getCollection` resolve a wire `collection` name to its
     descriptor, `selectByIds(db, descriptor, ids)` is the
     descriptor-parameterized by-id read (it `decodeRow`s its rows, so the diff
@@ -103,21 +104,22 @@ file is the in-codebase map for AI agents working in the repo.
 The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
 `session_id` (== `job_id` in v1):
 
-- `SessionStart` → `INSERT OR IGNORE` a new job row (schema defaults
-  `mode='act'`, `state='stopped'` — the zero-event reading).
+- `SessionStart` → `INSERT OR IGNORE` a new job row (schema default
+  `state='stopped'` — the zero-event reading).
 - `UserPromptSubmit` → `state = 'working'` (skipped when already `ended`). Also
   carries `session_title` in its `data` blob: when present and **different from
-  the persisted `title`**, the reducer does a read-modify-write — `SELECT title,
-  title_history`, push the new title onto the parsed history (natural order,
-  reverts re-append, NO dedup), and `UPDATE title + title_history`. Unchanged
-  title → no write (re-fold determinism: compare against the persisted tail, not
-  an accumulator). Runs event-agnostically like the mode rule (no `ended` guard).
+  the persisted `title`**, the reducer `UPDATE`s `title` (last-write-wins
+  against the persisted value). Unchanged title → no write (re-fold determinism:
+  compare against the persisted `title`, not an accumulator). Runs
+  event-agnostically (no `ended` guard).
 - `Stop` → `state = 'stopped'` (skipped when already `ended`).
 - `SessionEnd` → `state = 'ended'`, sticky thereafter (always lands).
-- ANY event carrying `permission_mode` → `mode = 'plan' | 'act'`, layered on
-  top of whatever lifecycle write ran.
 - Everything else (PreToolUse, PostToolUse, Notification, Subagent*, unknown
   forward-compat events) → no jobs write; the cursor still advances.
+
+`mode` and `title_history` were retired in schema v3 — `events.permission_mode`
+is still recorded, but it is no longer projected into `jobs`, and titles are a
+single live value with no history array.
 
 ## Event-sourcing invariants
 
@@ -127,9 +129,8 @@ The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
   idempotently. This is the exactly-once-per-event guarantee — never split the
   two writes across transactions.
 - **Defaults match the zero-event projection.** A row inserted by
-  `SessionStart` reads `mode='act'`, `state='stopped'`, `title=NULL`,
-  `title_history='[]'` before any further event. Keep schema defaults and the
-  reducer's no-op branches in sync.
+  `SessionStart` reads `state='stopped'`, `title=NULL` before any further event.
+  Keep schema defaults and the reducer's no-op branches in sync.
 - **One drain code path serves boot and steady-state.** `drainToCompletion`
   loops `drain()` until it returns 0; the boot catch-up and every wake use it.
   Do not add a separate boot path.
@@ -151,8 +152,10 @@ The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
   autocommit (no `BEGIN`), or `data_version` freezes for that connection. Never a
   `fs.watch`/FSEvents file watcher (see DO NOT).
 - **Schema migrations are forward-only** via the `meta(schema_version)` row +
-  the ALTER slot in `migrate()`. Bump `SCHEMA_VERSION` only when adding an
-  ALTER; never reduce, never branch.
+  the ALTER slot in `migrate()`. Steps must be idempotent — `addColumnIfMissing`
+  / `dropColumnIfPresent` converge on the table's actual shape, so even a DROP is
+  safe to re-run (it no-ops once gone). Bump `SCHEMA_VERSION` only when adding an
+  ALTER; never reduce the version, never branch.
 
 ## DO NOT
 

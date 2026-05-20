@@ -209,18 +209,15 @@ test("end-to-end: hook writes → wake worker → reducer folds → jobs project
     }
     const maxEventId = lastEvent.id;
 
-    // --- jobs projection: one row, ended (terminal), mode reflects latest
-    //     permission_mode that carried one (plan from UPS; later events carry
-    //     none, so the mode sticks at 'plan'). ---
+    // --- jobs projection: one row, ended (terminal). ---
     const job = await retryUntil(() => {
       const row = reader
         .query(
-          "SELECT job_id, state, mode, last_event_id FROM jobs WHERE job_id = ?",
+          "SELECT job_id, state, last_event_id FROM jobs WHERE job_id = ?",
         )
         .get(sessionId) as {
         job_id: string;
         state: string;
-        mode: string;
         last_event_id: number;
       } | null;
       return row && row.state === "ended" ? row : null;
@@ -240,9 +237,6 @@ test("end-to-end: hook writes → wake worker → reducer folds → jobs project
     expect(jobCount).toBe(1);
 
     expect(job.state).toBe("ended");
-    // 'plan' was the most recent permission_mode in the sequence; SessionEnd
-    // carried none, so the mode is not reset.
-    expect(job.mode).toBe("plan");
 
     // --- cursor caught up to the last event. ---
     const cursor = await retryUntil(() => {
@@ -405,8 +399,6 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
     expect(patch.collection).toBe("jobs");
     expect(patch.row.job_id).toBe(sessionId);
     expect(patch.row.state).toBe("working");
-    // UserPromptSubmit carried permission_mode 'plan'.
-    expect(patch.row.mode).toBe("plan");
     expect(patch.rev).toBeGreaterThanOrEqual(patch.row.last_event_id as number);
 
     // --- a NEW session enters the (unfiltered) set → a live `meta` with the

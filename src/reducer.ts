@@ -19,7 +19,7 @@
  *   UserPromptSubmit    | state -> 'working'  (skipped when state == 'ended')
  *   Stop                | state -> 'stopped'  (skipped when state == 'ended')
  *   SessionEnd          | state -> 'ended'    (always; sticky thereafter)
- *   <any with mode>     | mode  -> 'plan'|'act' from data.permission_mode
+ *   <any with title>    | title -> data.session_title (when changed)
  *   <everything else>   | no jobs write; cursor still advances
  *
  * Terminal `ended` is sticky: once a job is ended, UserPromptSubmit/Stop are
@@ -51,57 +51,11 @@ export interface ApplyEventOptions {
 const ENDED = "ended";
 
 /**
- * Map a raw `permission_mode` payload value to the two-valued `jobs.mode`
- * domain. `'plan'` stays `'plan'`; anything else (acceptEdits, default,
- * bypassPermissions, NULL-but-present-as-string, ...) collapses to `'act'`.
- */
-function mapMode(permissionMode: string): string {
-  return permissionMode === "plan" ? "plan" : "act";
-}
-
-/**
- * Extract `permission_mode` for the mode-update rule. The column on `events` is
- * the authoritative source (the hook lifts it out of the payload). When the
- * column is NULL we fall back to parsing the `data` JSON blob's
- * `permission_mode` — guarded so a malformed blob never halts the reducer.
- *
- * Returns `null` when no permission_mode is present anywhere.
- */
-function extractPermissionMode(event: Event): string | null {
-  if (event.permission_mode != null && event.permission_mode.length > 0) {
-    return event.permission_mode;
-  }
-  if (event.data && event.data.length > 0) {
-    try {
-      const parsed = JSON.parse(event.data) as {
-        permission_mode?: unknown;
-        data?: { permission_mode?: unknown };
-      };
-      const fromTop = parsed.permission_mode;
-      if (typeof fromTop === "string" && fromTop.length > 0) {
-        return fromTop;
-      }
-      const fromNested = parsed.data?.permission_mode;
-      if (typeof fromNested === "string" && fromNested.length > 0) {
-        return fromNested;
-      }
-    } catch (err) {
-      // Malformed JSON: skip-and-log. The cursor still advances upstream so the
-      // reducer never wedges on one bad row.
-      console.error(
-        `keeper reducer: failed to parse data blob for event id=${event.id} session=${event.session_id}: ${err}`,
-      );
-    }
-  }
-  return null;
-}
-
-/**
- * Extract the top-level `session_title` from an event's `data` blob. Mirrors
- * {@link extractPermissionMode}: try/catch around `JSON.parse(event.data)`,
- * skip-and-log via `console.error` on a malformed blob (the cursor still
- * advances upstream so one bad row never wedges the reducer). `session_title`
- * is NOT lifted to an events column — the raw blob is its only carrier.
+ * Extract the top-level `session_title` from an event's `data` blob. try/catch
+ * around `JSON.parse(event.data)`, skip-and-log via `console.error` on a
+ * malformed blob (the cursor still advances upstream so one bad row never
+ * wedges the reducer). `session_title` is NOT lifted to an events column — the
+ * raw blob is its only carrier.
  *
  * Run event-agnostically like the mode rule (not gated to UserPromptSubmit); in
  * practice only UserPromptSubmit carries it. Returns the title only when it is a
@@ -130,10 +84,10 @@ function extractSessionTitle(event: Event): string | null {
  * Apply the jobs-side projection for one event. Runs INSIDE the open
  * transaction opened by {@link applyEvent}; performs zero cursor work.
  *
- * Returns nothing — all writes go straight to `db`. Each branch is independent:
- * the mode update (when a permission_mode is present) is applied on TOP of the
- * lifecycle write, so e.g. a UserPromptSubmit carrying permission_mode flips
- * both state and mode in one fold.
+ * Returns nothing — all writes go straight to `db`. The branches are
+ * independent: the title update (when a `session_title` is present) is applied
+ * on TOP of the lifecycle write, so e.g. a UserPromptSubmit carrying a new
+ * title flips both state and title in one fold.
  */
 function projectJobsRow(db: Database, event: Event): void {
   const ts = event.ts;
@@ -141,8 +95,8 @@ function projectJobsRow(db: Database, event: Event): void {
 
   switch (event.hook_event) {
     case "SessionStart":
-      // New job (or duplicate SessionStart): INSERT OR IGNORE. Defaults from
-      // the schema give mode='act', state='stopped' — the zero-event reading.
+      // New job (or duplicate SessionStart): INSERT OR IGNORE. The schema
+      // default gives state='stopped' — the zero-event reading.
       db.run(
         "INSERT OR IGNORE INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
         [jobId, ts, event.cwd, event.pid, event.id, ts],
@@ -182,46 +136,24 @@ function projectJobsRow(db: Database, event: Event): void {
       break;
   }
 
-  // Mode update rule: applies on ANY event that carries a permission_mode,
-  // layered on top of whatever lifecycle write (if any) ran above. Matches zero
-  // rows when no job exists yet — a correct no-op.
-  const permissionMode = extractPermissionMode(event);
-  if (permissionMode != null) {
-    db.run(
-      "UPDATE jobs SET mode = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
-      [mapMode(permissionMode), event.id, ts, jobId],
-    );
-  }
-
-  // Title rule: a `session_title` in the data blob folds into `jobs.title` and
-  // appends to `jobs.title_history`, layered on top of any lifecycle/mode write
-  // above. Like the mode rule it runs on ANY event and has no `state != 'ended'`
-  // guard (no title-bearing events arrive post-SessionEnd anyway).
+  // Title rule: a `session_title` in the data blob folds into `jobs.title`,
+  // layered on top of any lifecycle write above. Runs on ANY event and has no
+  // `state != 'ended'` guard (no title-bearing events arrive post-SessionEnd
+  // anyway).
   //
-  // Re-fold determinism: the append compares the incoming title against the
+  // Re-fold determinism: the write compares the incoming title against the
   // PERSISTED `title` (read in-txn), never an accumulator. When the title is
   // unchanged we skip the write entirely (no `last_event_id` bump) — so a
-  // rebuild-from-scratch reproduces identical history. Reverts re-append (A→B→A
-  // yields ["A","B","A"]); we compare only against the current tail, NO dedup.
-  // No row → no-op.
+  // rebuild-from-scratch is identical. No row → no-op.
   const title = extractSessionTitle(event);
   if (title != null) {
     const row = db
-      .query("SELECT title, title_history FROM jobs WHERE job_id = ?")
-      .get(jobId) as { title: string | null; title_history: string } | null;
+      .query("SELECT title FROM jobs WHERE job_id = ?")
+      .get(jobId) as { title: string | null } | null;
     if (row != null && row.title !== title) {
-      let history: string[];
-      try {
-        const parsed = JSON.parse(row.title_history) as unknown;
-        history = Array.isArray(parsed) ? (parsed as string[]) : [];
-      } catch {
-        // A corrupt persisted history never wedges the fold — restart from [].
-        history = [];
-      }
-      history.push(title);
       db.run(
-        "UPDATE jobs SET title = ?, title_history = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
-        [title, JSON.stringify(history), event.id, ts, jobId],
+        "UPDATE jobs SET title = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
+        [title, event.id, ts, jobId],
       );
     }
   }

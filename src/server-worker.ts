@@ -375,8 +375,8 @@ export function runQuery(
      LIMIT ? OFFSET ?
   `;
   const rawRows = db.prepare(sql).all(...where.params, limit, offset) as Row[];
-  // Decode JSON-TEXT columns (e.g. `title_history`) so `result` rows carry the
-  // same array shape as the diff/patch path (`selectByIds`).
+  // Decode any JSON-TEXT columns so `result` rows carry the same shape as the
+  // diff/patch path (`selectByIds`); a no-op while `jsonColumns` is empty.
   const rows = rawRows.map((row) => decodeRow(descriptor, row));
 
   if (out) {
