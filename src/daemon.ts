@@ -131,6 +131,15 @@ function runDaemon(): void {
     fatalExit();
   };
 
+  // A worker `process.exit(1)` (e.g. its own fatalExit) fires `close`, NOT
+  // `onerror` — so the steady-state crash path needs its own listener, or a
+  // crashing worker leaves a zombie daemon and launchd is never notified. The
+  // `!shuttingDown` guard makes this a no-op on the clean path (shutdown() sets
+  // the flag before posting `{ type: "shutdown" }`), avoiding a double exit.
+  worker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
+
   // Spawn the server worker in the SAME post-migration window: its read-only
   // `openDb` would fail loud against a missing/un-migrated DB. It binds the UDS,
   // acquires the ownership lock, and runs its own `data_version` poll — fully
@@ -149,6 +158,14 @@ function runDaemon(): void {
     console.error("[keeperd] server worker error:", err.message ?? err);
     fatalExit();
   };
+
+  // Same crash-via-`close` gap as the wake worker: a server-worker
+  // `process.exit(1)` fires `close`, not `onerror`. Without this the subscribe
+  // server could silently vanish while the reducer kept running. `!shuttingDown`
+  // makes it inert on the clean shutdown path.
+  serverWorker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
 
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
