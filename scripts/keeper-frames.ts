@@ -8,10 +8,13 @@
  * It opens one `query` for a 10-row page of `jobs`, holds that page's row SET
  * (frozen membership — rows never enter/leave a live page), and renders it as a
  * YAML stream: each frame is a YAML document (leading `---`) listing every job
- * as a full entity (every served column, in column order). As `patch` frames
- * advance individual rows, the page is updated in place and a NEW frame is
- * printed whenever the rendered page changes (a patch carries the full updated
- * row, so any column move — `state`, `title`, `last_event_id`, … — reframes).
+ * as a single collapsed string — `{basename(cwd)}·{title}·{state}`. As `patch`
+ * frames advance individual rows, the page is updated in place and a NEW frame
+ * is printed whenever the RENDERED page changes. A patch carries the full row,
+ * but only the columns that surface in the projection reframe: a move in
+ * `last_event_id` / `pid` / `updated_at` re-renders to the same string and emits
+ * nothing. The rendered output — not internal row churn — is the sole frame
+ * trigger, enforced by routing every emit through `emitFrameIfChanged`.
  *
  * The `meta` (total/membership-staleness) signal is rendered as a SEPARATE
  * "temporary frame": a `...`-fenced comment block, distinct from the `---` job
@@ -31,6 +34,7 @@
  *   --help          Show this help.
  */
 
+import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
 import {
@@ -51,8 +55,10 @@ Usage: bun scripts/keeper-frames.ts [--sock <path>]
   --help          Show this help
 
 Renders a 10-row page of jobs as a YAML stream: one frame per change, each frame
-a YAML document (--- separated) of full job entities. The total/membership
-"meta" signal prints as a separate ...-fenced note (the frozen page never reflows).
+a YAML document (--- separated) of collapsed job strings ({basename(cwd)}·{title}
+·{state}). A new frame prints only when the rendered output changes. The total/
+membership "meta" signal prints as a separate ...-fenced note (the frozen page
+never reflows).
 `;
 
 /**
@@ -117,25 +123,40 @@ async function main(): Promise<void> {
   let gotResult = false;
 
   /**
-   * Project the frozen page into a YAML document body (no leading `---`): each
-   * row is a list item carrying every served column in column order. Object key
-   * order is the SELECT column order (preserved through JSON parse).
+   * Collapse one full job row to its display string: `{basename(cwd)}·{title}·
+   * {state}`. A null/absent `cwd` or `title` projects to an empty segment (no
+   * basename of nothing). This is the SOLE place a row's columns are read for
+   * display — so it alone defines which column moves can reframe (see
+   * `emitFrameIfChanged`).
+   */
+  function projectRow(row: Record<string, unknown>): string {
+    const cwd = row.cwd == null ? "" : basename(String(row.cwd));
+    const title = row.title == null ? "" : String(row.title);
+    const state = row.state == null ? "" : String(row.state);
+    return `${cwd}·${title}·${state}`;
+  }
+
+  /**
+   * Project the frozen page into a YAML document body (no leading `---`): a flat
+   * sequence of one collapsed string per row (see `projectRow`), in server-sent
+   * order. Strings carrying `·` auto-single-quote through `yamlScalar`.
    */
   function renderBody(): string {
     if (order.length === 0) {
       return "[]"; // empty page → an empty YAML sequence
     }
     return order
-      .map((id) => {
-        const row = byId.get(id) ?? { job_id: id };
-        return Object.entries(row)
-          .map(([k, v], i) => `${i === 0 ? "- " : "  "}${k}: ${yamlScalar(v)}`)
-          .join("\n");
-      })
+      .map((id) => `- ${yamlScalar(projectRow(byId.get(id) ?? { job_id: id }))}`)
       .join("\n");
   }
 
-  /** Print a new job frame iff the rendered projection moved. */
+  /**
+   * Print a new job frame iff the rendered projection moved. This byte-compare
+   * on `renderBody()` output is the CONTRACT: a frame is emitted only when the
+   * rendered text changes — internal row churn that doesn't surface in
+   * `projectRow` is invisible by design, and stays so as the projection grows.
+   * Every emit routes through here; nothing prints a job frame directly.
+   */
   function emitFrameIfChanged(): void {
     const body = renderBody();
     if (body === lastBody) {
@@ -164,6 +185,8 @@ async function main(): Promise<void> {
     } else if (frame.type === "patch") {
       const id = String(frame.row.job_id);
       // Frozen membership: a patch only ever updates a row already in the page.
+      // The full row is stored, but emitFrameIfChanged reframes only if the
+      // projected string moved — an unprojected column change prints nothing.
       if (byId.has(id)) {
         byId.set(id, frame.row);
         emitFrameIfChanged();
