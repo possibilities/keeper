@@ -21,6 +21,11 @@
  * frames, that just notes the set changed underneath the frozen page. It is not
  * folded into the list — frozen membership means the page does not reflow.
  *
+ * After every emitted frame a second `...`-fenced note prints two per-pid /tmp
+ * paths: the full JSON state the frame was built from (the ordered page rows)
+ * and the rendered frame text itself. Both are overwritten each frame (the note
+ * carries a frame sequence number) so a frame can be inspected out-of-band.
+ *
  * Like its sibling it reuses `src/protocol.ts` (`encodeFrame` to write,
  * `LineBuffer` to de-frame) and `resolveSockPath()` so it stays a faithful
  * mirror of the contract, and it honors the read-only fence: it only ever sends
@@ -34,6 +39,7 @@
  *   --help          Show this help.
  */
 
+import { writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
@@ -58,7 +64,8 @@ Renders a 10-row page of jobs as a YAML stream: one frame per change, each frame
 a YAML document (--- separated) of collapsed job strings ({basename(cwd)}·{title}
 ·{state}). A new frame prints only when the rendered output changes. The total/
 membership "meta" signal prints as a separate ...-fenced note (the frozen page
-never reflows).
+never reflows). Every emitted frame is also mirrored to two /tmp sidecar files
+(full JSON state + rendered frame), whose paths print in a ...-fenced note.
 `;
 
 /**
@@ -166,12 +173,45 @@ async function main(): Promise<void> {
       .join("\n");
   }
 
+  // Per-frame sidecar files: the latest emitted frame is mirrored to /tmp so it
+  // can be inspected out-of-band. Per-pid so concurrent runs don't collide;
+  // overwritten each frame (the printed note carries `frameSeq` so you know
+  // which frame the file currently holds).
+  const stateSidecar = `/tmp/keeper-frames.${process.pid}.state.json`;
+  const frameSidecar = `/tmp/keeper-frames.${process.pid}.frame.yaml`;
+  let frameSeq = 0;
+
+  /**
+   * Mirror the just-emitted frame to its two sidecar files and print a
+   * `...`-fenced note with their paths (a "meta message", distinct from the
+   * server `meta` staleness frame). `stateSidecar` gets the full JSON state the
+   * frame was built from — the ordered page rows; `frameSidecar` gets the
+   * rendered frame text itself. Best-effort: a /tmp write failure logs a warning
+   * and never wedges the stream.
+   */
+  function writeSidecars(frameText: string): void {
+    frameSeq += 1;
+    const state = order.map((id) => byId.get(id) ?? { job_id: id });
+    try {
+      writeFileSync(stateSidecar, `${JSON.stringify(state, null, 2)}\n`);
+      writeFileSync(frameSidecar, `${frameText}\n`);
+    } catch (err) {
+      log(`# warn: sidecar write failed: ${(err as Error).message}`);
+    }
+    log("...");
+    log(`# frame ${frameSeq} sidecars:`);
+    log(`#   state: ${stateSidecar}`);
+    log(`#   frame: ${frameSidecar}`);
+    log("...");
+  }
+
   /**
    * Print a new job frame iff the rendered projection moved. This byte-compare
    * on `renderBody()` output is the CONTRACT: a frame is emitted only when the
    * rendered text changes — internal row churn that doesn't surface in
    * `projectRow` is invisible by design, and stays so as the projection grows.
-   * Every emit routes through here; nothing prints a job frame directly.
+   * Every emit routes through here; nothing prints a job frame directly. Each
+   * emitted frame is mirrored to its sidecar files (see `writeSidecars`).
    */
   function emitFrameIfChanged(): void {
     const body = renderBody();
@@ -179,8 +219,9 @@ async function main(): Promise<void> {
       return;
     }
     lastBody = body;
-    log("---");
-    log(body);
+    const frameText = `---\n${body}`;
+    log(frameText);
+    writeSidecars(frameText);
   }
 
   const buffer = new LineBuffer();
