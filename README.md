@@ -8,15 +8,21 @@ SQLite `events` table — the durable, append-only log. A long-running Bun daemo
 (`keeperd`, managed by a macOS LaunchAgent) tails that table and folds new
 events into a minimal `jobs` projection: one row per session, carrying the live
 `state` (`working` / `stopped` / `ended`) and a human-readable `title` (seeded
-from the session's spawn name at SessionStart, with a `title_source` recording
-its provenance).
+from the session's spawn name at SessionStart, refined by the prompt payload and
+the live transcript `custom-title`, with a `title_source` recording its
+provenance and precedence: `spawn` < `payload` < `transcript`).
 
 The architecture is deliberately small. Keeper is built on Bun + `bun:sqlite`
-with zero third-party runtime dependencies. The daemon detects new events by
-polling SQLite's `PRAGMA data_version` on a read-only connection from a Worker
-thread (the only reliable change-detection primitive on macOS — see
-[Architecture](#architecture)), then drains the log into the projection one
-short transaction per event. The reducer cursor advances in the same
+with a single third-party runtime dependency: `@parcel/watcher` (a native
+FSEvents-backed file watcher), used by the transcript-title worker. It is the one
+place keeper watches files instead of polling `data_version` — because the
+transcript JSONL is written by *another* process (Claude Code), so there is no
+keeper `data_version` to poll for it and the same-process-write blind spot that
+rules watchers out for keeper's own DB does not apply. The daemon detects new
+events in its own DB by polling SQLite's `PRAGMA data_version` on a read-only
+connection from a Worker thread (the only reliable change-detection primitive on
+macOS for keeper's DB — see [Architecture](#architecture)), then drains the log
+into the projection one short transaction per event. The reducer cursor advances in the same
 transaction as every projection write, so the fold is exactly-once-per-event
 and the boot drain re-converges idempotently after any downtime or crash.
 
@@ -50,17 +56,23 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   nudge ("re-query if you care"), not a live insert/remove/reorder feed.
 - **No UI** — `sqlite3` is the inspection surface.
 - **No multi-machine** — single host, single DB file.
-- **No general name scraping, no transcript tailing** — keeper reads hook
-  payloads only, with one scoped exception: on `SessionStart` the hook scrapes
-  the parent claude process's `--name`/`-n` spawn name (via a single `ps` of its
-  immediate parent) so a job row reads a non-NULL `title` from the first event.
-  That capture is one-shot, in-hook, and frozen into the event; ongoing/periodic
-  scraping, PPID-walking, and transcript tailing all remain out.
+- **No general name scraping; no transcript tailing in the hook** — the hook
+  reads hook payloads only, with one scoped exception: on `SessionStart` it
+  scrapes the parent claude process's `--name`/`-n` spawn name (via a single `ps`
+  of its immediate parent) so a job row reads a non-NULL `title` from the first
+  event. That capture is one-shot, in-hook, and frozen into the event;
+  ongoing/periodic scraping and PPID-walking remain out. Transcript tailing is
+  permitted in the *daemon* (keeperd's transcript worker tails the external
+  transcript tree on a watch to supply the priority-3 `transcript` title) but
+  stays forbidden in the hook.
 - **No plans / planctl_mutations** — keeper does not track planctl state.
 - **No multi-session-per-job lineage** — v1 holds `job_id === session_id` (one
   session per job).
-- **No kernel watchers** (`fs.watch` / FSEvents / kqueue) — `data_version`
-  polling is the change-detection primitive.
+- **No kernel watchers on keeper's own DB** (`fs.watch` / FSEvents / kqueue) —
+  `data_version` polling is the change-detection primitive for keeper's SQLite.
+  The one watcher keeper does run (`@parcel/watcher`, on the *external* transcript
+  tree) is the scoped exception: those files are written by another process, so
+  the same-process-write blind spot does not apply.
 - **No caught-up barrier** and no in-process self-heal — a crash exits non-zero
   and the LaunchAgent restarts the single, well-tested recovery path.
 
@@ -165,10 +177,18 @@ query per distinct filter (the token is a `group_concat` over the matching pk
 identities, ordered by pk so it's stable and fingerprints membership, not cell
 values), and emits a `meta` frame to any subscription whose `total` or token
 moved — the count/staleness signal, sharing one query across same-filter clients
-exactly as the patch pass shares one re-read per collection. The two workers are
-fully independent readers; main supervises both lifecycles but routes neither's
-traffic, and either worker's `error` event escalates the whole process to a clean
-restart.
+exactly as the patch pass shares one re-read per collection.
+
+A **third** Worker thread is the transcript-title producer: it watches the
+external transcript tree (`~/.claude/projects`) with `@parcel/watcher`,
+forward-tails each changed JSONL from a stored byte-offset, and on a
+`custom-title` line posts a `transcript-title` message to main. Main — the sole
+writer — turns that into a synthetic `TranscriptTitle` events row on its writable
+connection and pumps a wake; the reducer folds it as the priority-3 `transcript`
+title. The three workers are fully independent (the transcript worker is
+read-only / write-free — it only feeds the log via main); main supervises all
+three lifecycles but routes none of their traffic, and any worker's `error` event
+escalates the whole process to a clean restart.
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).
@@ -176,7 +196,7 @@ list, see [CLAUDE.md](./CLAUDE.md).
 ## Inspect
 
 ```sh
-# Recent jobs (title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt):
+# Recent jobs (title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, title, title_source, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
 

@@ -13,6 +13,12 @@
     - the repo checked out at /Users/mike/code/keeper
     - state under /Users/mike/.local/state/keeper
   Edit these for your own username / arch before bootstrapping.
+
+  NOTE: keeperd's transcript worker depends on the native `@parcel/watcher`
+  addon, so the deploy environment MUST have `bun install` already run with a
+  resolvable `node_modules/` under the WorkingDirectory (the repo checkout)
+  before first bootstrap. The N-API addon load is a hard `dyld` crash if missing,
+  not a catch-able error — keeperd will fail to boot, not degrade gracefully.
 -->
 <plist version="1.0">
 <dict>
