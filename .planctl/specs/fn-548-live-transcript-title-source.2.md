@@ -86,5 +86,5 @@ worker messages into synthetic events. Depends on task .1's resolver + schema.
 - [ ] `bun test --isolate`, `biome check`, `tsc --noEmit` all clean
 
 ## Done summary
-
+Added the transcript title producer: a third keeperd Worker (src/transcript-worker.ts) watching ~/.claude/projects via @parcel/watcher@2.5.6, with a pure exported TranscriptLineStream forward-tail core (offset map, per-file StringDecoder, partial-line buffer, truncation guard, malformed-skip, change-only emit, restart-seed from jobs.title). Daemon spawns it post-boot-drain, folds {kind:transcript-title} messages into synthetic TranscriptTitle events on the writable connection + pumpWakes (main stays sole writer), and tears it down on shutdown. Tests cover the pure core, native-addon smoke, Worker shutdown, and an e2e custom-title→jobs.title flip.
 ## Evidence
