@@ -82,9 +82,25 @@ function yamlScalar(v: unknown): string {
     return `{${entries.map(([k, val]) => `${k}: ${yamlScalar(val)}`).join(", ")}}`;
   }
   const s = String(v);
-  // Bare scalar only when it can't be mistaken for YAML syntax; otherwise quote
-  // (single-quote, doubling embedded quotes — the YAML escape for `'`).
-  if (s !== "" && /^[A-Za-z0-9_./@:+-]+$/.test(s) && !/^[-:?]/.test(s)) {
+  // Emit a bare (plain) scalar whenever YAML permits one — a plain scalar
+  // legally carries spaces and most characters (incl. `·`), so a value like
+  // `keeper·my task·working` needs no quotes. Quote (single-quote, doubling
+  // embedded quotes — the YAML escape for `'`) only for the cases that would
+  // otherwise be invalid or restructure the node:
+  //   - the empty string, or leading/trailing whitespace;
+  //   - a leading flow/indicator char (`![]{},|>@\`"'%` or `&*#`);
+  //   - a leading `-`/`?`/`:` that is followed by a space or ends the string
+  //     (those three are indicators only in that position);
+  //   - an embedded `": "` or trailing `:` (would start a mapping);
+  //   - an embedded `" #"` (would start a comment).
+  const needsQuote =
+    s === "" ||
+    /^\s|\s$/.test(s) ||
+    /^[![\]{},|>@`"'%&*#]/.test(s) ||
+    /^[-?:](\s|$)/.test(s) ||
+    /:(\s|$)/.test(s) ||
+    /\s#/.test(s);
+  if (!needsQuote) {
     return s;
   }
   return `'${s.replace(/'/g, "''")}'`;
