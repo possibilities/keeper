@@ -130,20 +130,20 @@ CREATE TABLE IF NOT EXISTS meta (
 `;
 
 /**
- * Prepared statements used by hook + reducer hot paths. Keep these tiny and
- * pre-bound — the hook runs once per Claude Code event and cold-start latency
- * is part of the SessionEnd 1.5s timeout budget.
+ * Prepared statements kept pre-bound on the hot paths. Keep these tiny — the
+ * hook runs once per Claude Code event and cold-start latency is part of the
+ * SessionEnd 1.5s timeout budget.
  *
- * `selectWorldRev` reads the singleton `reducer_state.last_event_id` and is
- * the canonical source of `rev` on server frames. The shared variable-binding
- * read used by the server worker lives in `src/collections.ts` as
- * `selectByIds` (one statement per arity, descriptor-parameterized).
+ * Only two statements remain: `insertEvent` (the hook's one write per
+ * invocation; also reused by keeperd's main thread for synthetic events) and
+ * `selectWorldRev` (the server worker's `rev` source). The reducer folds with
+ * inline SQL (it reads/writes by event id and wraps each fold in its own
+ * transaction), so it binds no statement from this bundle. The server worker's
+ * variable-binding by-id read lives in `src/collections.ts` as `selectByIds`
+ * (one statement per arity, descriptor-parameterized).
  */
 export interface Stmts {
   insertEvent: ReturnType<Database["prepare"]>;
-  selectEventsAfter: ReturnType<Database["prepare"]>;
-  upsertJob: ReturnType<Database["prepare"]>;
-  advanceCursor: ReturnType<Database["prepare"]>;
   selectWorldRev: ReturnType<Database["prepare"]>;
 }
 
@@ -291,10 +291,11 @@ function migrate(db: Database): void {
 }
 
 /**
- * Build the prepared-statement bundle. Shared between the hook (insertEvent)
- * and the reducer (selectEventsAfter/upsertJob/advanceCursor). Reader
- * connections get the bundle too — selectEventsAfter is read-only and the
- * write-targeting statements simply go unused.
+ * Build the prepared-statement bundle. `insertEvent` is the hook's per-event
+ * write (also reused by keeperd's main thread for synthetic events);
+ * `selectWorldRev` is the server worker's `rev` source. Reader connections get
+ * the bundle too — `selectWorldRev` is read-only and `insertEvent` simply goes
+ * unused. The reducer folds with inline SQL, so it binds nothing from here.
  */
 function prepareStmts(db: Database): Stmts {
   return {
@@ -305,29 +306,6 @@ function prepareStmts(db: Database): Stmts {
         subagent_agent_id, spawn_name
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
-    selectEventsAfter: db.prepare(`
-      SELECT id, ts, session_id, pid, hook_event, event_type, tool_name,
-             matcher, cwd, permission_mode, agent_id, agent_type,
-             stop_hook_active, data, subagent_agent_id, spawn_name
-        FROM events
-       WHERE id > ?
-       ORDER BY id ASC
-       LIMIT ?
-    `),
-    upsertJob: db.prepare(`
-      INSERT INTO jobs (
-        job_id, created_at, cwd, pid, state, last_event_id, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(job_id) DO UPDATE SET
-        cwd = COALESCE(excluded.cwd, jobs.cwd),
-        pid = COALESCE(excluded.pid, jobs.pid),
-        state = excluded.state,
-        last_event_id = excluded.last_event_id,
-        updated_at = excluded.updated_at
-    `),
-    advanceCursor: db.prepare(
-      "UPDATE reducer_state SET last_event_id = ?, updated_at = ? WHERE id = 1",
-    ),
     selectWorldRev: db.prepare(
       "SELECT last_event_id FROM reducer_state WHERE id = 1",
     ),
