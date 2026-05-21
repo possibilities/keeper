@@ -59,6 +59,7 @@ import {
   type ClientFrame,
   type ErrorFrame,
   encodeFrame,
+  type FilterValue,
   LineBuffer,
   OversizedLineError,
   type PatchFrame,
@@ -266,22 +267,38 @@ export interface ResolvedFilter {
  * descriptor declares it (→ a trusted SQL column); the value is bound (`?`). A
  * key absent from `descriptor.filters` is silently ignored (forward-compat).
  *
+ * Two value forms: a bare `string | number` is an exact match (`col = ?`); the
+ * `{ ne: value }` operator form is a not-equal exclusion (`col != ?`). The
+ * operator string (`=` / `!=`) is a fixed literal chosen here, never wire text;
+ * an operator object lacking a recognized key is ignored (forward-compat).
+ *
  * The descriptor is the SOLE identifier-injection gate: only declared columns
- * are interpolated; wire keys are never interpolated, values always bound.
+ * are interpolated; wire keys are never interpolated, operators are fixed
+ * literals, values always bound.
  */
 export function resolveFilter(
   descriptor: CollectionDescriptor,
-  filter: Record<string, string | number> | undefined,
+  filter: Record<string, FilterValue> | undefined,
 ): ResolvedFilter {
   const where: string[] = [];
   const params: (string | number)[] = [];
   if (filter) {
     for (const [key, col] of Object.entries(descriptor.filters)) {
       const value = filter[key];
-      if (value != null) {
-        where.push(`${col} = ?`);
-        params.push(value);
+      if (value == null) {
+        continue;
       }
+      if (typeof value === "object") {
+        // Operator form. `{ ne }` → `col != ?`; an unrecognized operator object
+        // is ignored so a future operator is forward-compatible.
+        if (value.ne != null) {
+          where.push(`${col} != ?`);
+          params.push(value.ne);
+        }
+        continue;
+      }
+      where.push(`${col} = ?`);
+      params.push(value);
     }
   }
   return {

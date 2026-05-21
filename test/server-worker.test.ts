@@ -27,6 +27,7 @@ import { countAndToken, JOBS_DESCRIPTOR, type Row } from "../src/collections";
 import { openDb } from "../src/db";
 import type {
   ErrorFrame,
+  FilterValue,
   MetaFrame,
   PatchFrame,
   ResultFrame,
@@ -204,6 +205,37 @@ test("runQuery applies a state filter", () => {
   );
   expect(res.rows.map(jobId)).toEqual(["w"]);
   db.close();
+});
+
+test("runQuery applies a not-equal (ne) state filter, excluding ended jobs", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "w", { state: "working", updated_at: 3 });
+  seedJob(db, "s", { state: "stopped", updated_at: 2 });
+  seedJob(db, "e", { state: "ended", updated_at: 1 });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      filter: { state: { ne: "ended" } },
+    }),
+  );
+  // Live jobs only; `total` tracks the filtered (non-ended) set, not the table.
+  expect(res.rows.map(jobId)).toEqual(["w", "s"]);
+  expect(res.total).toBe(2);
+  db.close();
+});
+
+test("resolveFilter: ne operator emits `!= ?`; unknown operator object ignored", () => {
+  const ne = resolveFilter(JOBS_DESCRIPTOR, { state: { ne: "ended" } });
+  expect(ne.clause).toBe("WHERE state != ?");
+  expect(ne.params).toEqual(["ended"]);
+  // A future/unrecognized operator object is silently dropped (forward-compat),
+  // never interpolated — same discipline as an undeclared filter key.
+  const unknown = resolveFilter(JOBS_DESCRIPTOR, {
+    state: { gt: 1 } as unknown as FilterValue,
+  });
+  expect(unknown.clause).toBe("");
+  expect(unknown.params).toEqual([]);
 });
 
 test("runQuery resolves the pk filter for a detail-page single-item subscribe", () => {
@@ -609,7 +641,7 @@ function watch(
   db: Database,
   sock: Writable,
   seed: Record<string, number>,
-  filter: Record<string, string | number> = {},
+  filter: Record<string, FilterValue> = {},
   collection = "jobs",
 ): void {
   sock.data.collection = collection;

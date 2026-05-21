@@ -83,11 +83,18 @@ export interface QuerySort {
  * for correlation. `unsubscribe` can target a specific id to drop just that
  * subscription if a client multiplexes.
  *
- * `filter` is an exact-match map of filter-key → value. The server resolves
- * each key against the collection's declared filters (unknown keys are ignored
- * for forward-compat) and binds the value; keys are never interpolated. Values
- * are `string | number`.
+ * `filter` is a map of filter-key → value. The server resolves each key against
+ * the collection's declared filters (unknown keys are ignored for
+ * forward-compat) and binds the value; keys are never interpolated. A bare
+ * `string | number` value is an exact match (`col = ?`); the `{ ne: value }`
+ * operator form is a not-equal exclusion (`col != ?`) — e.g.
+ * `filter: { state: { ne: "ended" } }` pages every job whose state isn't
+ * `ended`. The operator literal is fixed in the server, never wire text; only
+ * the value is bound. An operator object the server doesn't recognize is
+ * ignored (forward-compat).
  */
+export type FilterValue = string | number | { ne: string | number };
+
 export interface QueryFrame {
   type: "query";
   collection: string;
@@ -95,7 +102,7 @@ export interface QueryFrame {
   sort?: QuerySort;
   limit?: number;
   offset?: number;
-  filter?: Record<string, string | number>;
+  filter?: Record<string, FilterValue>;
 }
 
 /** Client → server: stop emitting patches for `id` (or all, if omitted). */

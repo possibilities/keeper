@@ -7,7 +7,11 @@
  *
  * It `query`s a 10-row page of `jobs` and renders it as a YAML stream: each
  * frame is a YAML document (leading `---`) listing every job as a single
- * collapsed string — `{basename(cwd)}·{title}·{state}`. Membership is frozen
+ * collapsed string — `{basename(cwd)}·{title}·{state}`. The query carries a
+ * server-side `state != 'ended'` filter (the `{ ne }` operator form), so ended
+ * jobs are excluded in SQL — the page is a true top-N of LIVE jobs (LIMIT
+ * counts live rows) and `total`/`meta` track exactly that set. Membership is
+ * frozen
  * WITHIN a fetched page (the server never reflows a live page), but the script
  * REFETCHES the page — on every `patch`/`meta` change signal AND on a steady
  * poll — so each fresh `result` reflects the current top-N. A NEW frame prints
@@ -301,6 +305,11 @@ async function main(): Promise<void> {
     collection: "jobs",
     id: "frames",
     limit: PAGE_LIMIT,
+    // Exclude ended jobs server-side (`state != 'ended'`). Filtering in SQL —
+    // not after the fetch — keeps LIMIT counting live rows (so the page is a
+    // true top-N of live jobs, never short) and makes `result.total` / `meta`
+    // describe exactly the set we render.
+    filter: { state: { ne: "ended" } },
   };
 
   const socket = await Bun.connect({
