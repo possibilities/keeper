@@ -199,9 +199,9 @@ async function main(): Promise<void> {
       log(`# warn: sidecar write failed: ${(err as Error).message}`);
     }
     log("...");
-    log(`# frame ${frameSeq} sidecars:`);
-    log(`#   state: ${stateSidecar}`);
-    log(`#   frame: ${frameSidecar}`);
+    log(`frame ${frameSeq} sidecars:`);
+    log(`  state: ${stateSidecar}`);
+    log(`  frame: ${frameSidecar}`);
     log("...");
   }
 
