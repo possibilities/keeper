@@ -7,7 +7,7 @@
  *
  * It `query`s a 10-row page of `jobs` and renders it as a YAML stream: each
  * frame is a YAML document (leading `---`) listing every job as a single
- * collapsed string — `{basename(cwd)}·{title}·{state}`. The query optionally
+ * collapsed string — `{basename(cwd)} · {title} · {state}`. The query optionally
  * carries a server-side `state` filter built from `--state` / `--state-ne`
  * (the bare-value equality form and the `{ ne }` operator form, respectively;
  * default is no filter and every job pages through). When a filter is in
@@ -85,8 +85,8 @@ Usage: bun scripts/keeper-frames.ts [--sock <path>] [--state <s> | --state-ne <s
   --help           Show this help
 
 Renders a 10-row page of jobs as a YAML stream: one frame per change, each frame
-a YAML document (--- separated) of collapsed job strings ({basename(cwd)}·{title}
-·{state}). The page is refetched on every change signal and on a steady poll, so
+a YAML document (--- separated) of collapsed job strings ({basename(cwd)} · {title}
+ · {state}). The page is refetched on every change signal and on a steady poll, so
 it always shows the current top-N; a new frame prints only when the rendered
 output changes. Every emitted frame is also mirrored to two /tmp sidecar files
 (full JSON state + rendered frame), whose paths print in a ...-fenced note.
@@ -115,7 +115,7 @@ function yamlScalar(v: unknown): string {
   const s = String(v);
   // Emit a bare (plain) scalar whenever YAML permits one — a plain scalar
   // legally carries spaces and most characters (incl. `·`), so a value like
-  // `keeper·my task·working` needs no quotes. Quote (single-quote, doubling
+  // `keeper · my task · working` needs no quotes. Quote (single-quote, doubling
   // embedded quotes — the YAML escape for `'`) only for the cases that would
   // otherwise be invalid or restructure the node:
   //   - the empty string, or leading/trailing whitespace;
@@ -186,8 +186,8 @@ async function main(): Promise<void> {
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
   /**
-   * Collapse one full job row to its display string: `{basename(cwd)}·{title}·
-   * {state}`. A null/absent `cwd` or `title` projects to an empty segment (no
+   * Collapse one full job row to its display string: `{basename(cwd)} · {title}
+   *  · {state}`. A null/absent `cwd` or `title` projects to an empty segment (no
    * basename of nothing). This is the SOLE place a row's columns are read for
    * display — so it alone defines which column moves can reframe (see
    * `emitFrameIfChanged`).
@@ -196,7 +196,7 @@ async function main(): Promise<void> {
     const cwd = row.cwd == null ? "" : basename(String(row.cwd));
     const title = row.title == null ? "" : String(row.title);
     const state = row.state == null ? "" : String(row.state);
-    return `${cwd}·${title}·${state}`;
+    return `${cwd} · ${title} · ${state}`;
   }
 
   /**
