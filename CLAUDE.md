@@ -138,14 +138,25 @@ file is the in-codebase map for AI agents working in the repo.
 The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
 `session_id` (== `job_id` in v1):
 
-- `SessionStart` → `INSERT OR IGNORE` a new job row (schema default
-  `state='stopped'` — the zero-event reading). Also **seeds the title** from the
-  event's `spawn_name` (the parent claude process's `--name`/`-n`, scraped by
-  the hook): when present, the insert sets `title = spawn_name` /
-  `title_source = 'spawn'` (priority 1); when NULL, `title`/`title_source` stay
-  NULL (priority 0) and Tier 0 below seeds at the first prompt. The OR IGNORE
-  no-ops on a duplicate SessionStart, so the seed lands only on first insert.
-- `UserPromptSubmit` → `state = 'working'` (skipped when already `ended`). Also
+- `SessionStart` → upsert (`INSERT … ON CONFLICT(job_id) DO UPDATE`). On a NEW
+  row the insert lands (schema default `state='stopped'` — the zero-event
+  reading) and **seeds the title** from the event's `spawn_name` (the parent
+  claude process's `--name`/`-n`, scraped by the hook): when present, the insert
+  sets `title = spawn_name` / `title_source = 'spawn'` (priority 1); when NULL,
+  `title`/`title_source` stay NULL (priority 0) and Tier 0 below seeds at the
+  first prompt. On a DUPLICATE SessionStart — a **resume** (a genuinely-ended
+  session can only return via a fresh `claude --resume` process, which fires
+  SessionStart `source=resume`, even with no interaction) — the conflict branch
+  **re-opens** a terminal row (`CASE`: `'ended' → 'stopped'`; a non-ended row's
+  state is left untouched, so a mid-session `compact`/`clear` SessionStart never
+  knocks a live job backwards) and refreshes `pid` (a resume is a new OS
+  process). `title`/`title_source` are NOT touched on conflict (precedence-owned —
+  a resume never re-seeds the spawn name over a higher source), and
+  `created_at`/`cwd`/`transcript_path` are set-once identity.
+- `UserPromptSubmit` → `state = 'working'` (**also re-opens an `ended` job** — no
+  terminal guard; a session can resume straight into a prompt with no
+  SessionStart, or a spurious mid-session `SessionEnd(reason=other)` can be
+  followed immediately by a prompt). Also
   carries `session_title` in its `data` blob — the **priority-2 `'payload'`
   title source**. The reducer writes by **precedence** (`{spawn:1, payload:2,
   transcript:3}`, NULL `title_source` = 0): it `UPDATE`s `title` + `title_source`
@@ -160,8 +171,14 @@ The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
   Folds through the SAME precedence write as `UserPromptSubmit`, so it beats
   `payload`(2)/`spawn`(1) and a later/stale `payload` never clobbers it. It
   triggers no lifecycle write (the `default` branch ignores it for `state`).
-- `Stop` → `state = 'stopped'` (skipped when already `ended`).
-- `SessionEnd` → `state = 'ended'`, sticky thereafter (always lands).
+- `Stop` → `state = 'stopped'` (skipped when already `ended` — keeps the terminal
+  guard so a stray late `Stop` can't resurrect a still-ended job; after a real
+  re-open the row is no longer `ended` and a normal post-resume `Stop` applies).
+- `SessionEnd` → `state = 'ended'` (always lands). `ended` is the **resting state
+  after an end, not a permanent trap**: a SessionStart or UserPromptSubmit
+  re-opens it (see above). keeper has no process-liveness overlay (unlike
+  jobctl's server, which keeps SQL `ended` sticky and un-ends from PID liveness)
+  — the fold IS the live view, so the re-open lives in the reducer.
 - Everything else (PreToolUse, PostToolUse, Notification, Subagent*, unknown
   forward-compat events) → no jobs write; the cursor still advances.
 

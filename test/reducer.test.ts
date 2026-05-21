@@ -4,7 +4,7 @@
  * cursor. The assertions mirror the task Acceptance list:
  * - one transaction per fold with cursor advance,
  * - drain() batching + idempotency on re-run,
- * - all four lifecycle transitions + sticky-`ended`,
+ * - all four lifecycle transitions + ended-as-resting-state / resume re-open,
  * - title updates from session_title on any event,
  * - unknown/no-op event types advance the cursor without touching jobs,
  * - malformed data blob logs to stderr and advances the cursor (no halt),
@@ -186,18 +186,20 @@ test("unknown forward-compat event type advances cursor, no jobs write", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Sticky-ended
+// Ended-as-resting-state + resume re-open
 // ---------------------------------------------------------------------------
 
-test("ended is sticky: UserPromptSubmit after SessionEnd is a no-op", () => {
+test("UserPromptSubmit after SessionEnd re-opens the job to working", () => {
+  // A prompt straight after an end (resume into a prompt with no SessionStart,
+  // or a spurious mid-session SessionEnd) means the session is alive again.
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "SessionEnd" });
   insertEvent({ hook_event: "UserPromptSubmit" });
   drainAll();
-  expect(getJob()?.state).toBe("ended");
+  expect(getJob()?.state).toBe("working");
 });
 
-test("ended is sticky: Stop after SessionEnd is a no-op", () => {
+test("Stop after SessionEnd stays ended (no stray resurrection)", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "SessionEnd" });
   insertEvent({ hook_event: "Stop" });
@@ -213,6 +215,65 @@ test("SessionEnd re-asserts ended idempotently", () => {
   expect(getJob()?.state).toBe("ended");
 });
 
+test("SessionStart re-opens an ended job (resume): ended -> stopped, pid refreshed", () => {
+  // A full lifecycle ending in SessionEnd, then a fresh `claude --resume`
+  // process fires SessionStart (new pid) with NO further interaction.
+  insertEvent({ hook_event: "SessionStart", pid: 1000, spawn_name: "my-job" });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({ hook_event: "Stop" });
+  insertEvent({ hook_event: "SessionEnd" });
+  drainAll();
+  const ended = getJob();
+  expect(ended?.state).toBe("ended");
+  const createdAt = ended?.created_at;
+
+  // Resume: a second SessionStart for the same session_id, new process pid.
+  insertEvent({ hook_event: "SessionStart", pid: 2000, spawn_name: "my-job" });
+  drainAll();
+  const reopened = getJob();
+  // Re-opened to the zero-event resting state (a later prompt flips to working).
+  expect(reopened?.state).toBe("stopped");
+  // New OS process: pid refreshed off the resume event.
+  expect(reopened?.pid).toBe(2000);
+  // Identity preserved: created_at unchanged, spawn title not re-seeded/clobbered.
+  expect(reopened?.created_at).toBe(createdAt);
+  expect(reopened?.title).toBe("my-job");
+  expect(reopened?.title_source).toBe("spawn");
+});
+
+test("SessionStart on a stopped (non-ended) job leaves state stopped", () => {
+  // The CASE only re-opens 'ended'; a resume/compact SessionStart on a stopped
+  // row is a state no-op (it still bumps pid/last_event_id).
+  insertEvent({ hook_event: "SessionStart", pid: 1000 });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  insertEvent({ hook_event: "SessionStart", pid: 2000 });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("stopped");
+  expect(job?.pid).toBe(2000);
+});
+
+test("resume re-open re-folds idempotently: rebuild-from-scratch yields stopped", () => {
+  insertEvent({ hook_event: "SessionStart", pid: 1000 });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({ hook_event: "SessionEnd" });
+  insertEvent({ hook_event: "SessionStart", pid: 2000 }); // resume
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getJob()?.pid).toBe(2000);
+
+  // The re-open is driven by the event log, not a direct jobs write, so a
+  // rewind-and-redrain must reproduce the identical final (state, pid).
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getJob()?.pid).toBe(2000);
+});
+
 // ---------------------------------------------------------------------------
 // Edge cases
 // ---------------------------------------------------------------------------
@@ -224,10 +285,12 @@ test("terminal event without prior SessionStart creates no row, advances cursor"
   expect(getCursor()).toBe(id);
 });
 
-test("duplicate SessionStart for same session_id is a no-op", () => {
+test("duplicate SessionStart on a live job leaves state + cwd untouched", () => {
   insertEvent({ hook_event: "SessionStart", cwd: "/first" });
   insertEvent({ hook_event: "UserPromptSubmit" });
-  // Second SessionStart must NOT clobber the working state via INSERT OR IGNORE.
+  // A duplicate SessionStart (compact/clear) on a NON-ended job: the upsert's
+  // CASE leaves a working state as-is, and cwd is set-once identity (not in the
+  // ON CONFLICT SET), so neither moves.
   insertEvent({ hook_event: "SessionStart", cwd: "/second" });
   drainAll();
   const job = getJob();
@@ -431,8 +494,8 @@ test("payload title with a different value updates both value and source", () =>
 
 test("a spawn-priority source never overwrites a payload title (monotonicity)", () => {
   // Establish a payload title (priority 2), then fire a DUPLICATE SessionStart
-  // carrying a spawn_name (priority 1). The INSERT OR IGNORE no-ops on the
-  // existing row, so the lower-priority spawn name can't clobber the payload.
+  // carrying a spawn_name (priority 1). The resume upsert never touches
+  // title/title_source, so the lower-priority spawn name can't clobber payload.
   insertEvent({ hook_event: "SessionStart", spawn_name: "spawn-name" });
   titleEvent("payload-name");
   drainAll();

@@ -15,18 +15,27 @@
  *
  *   event.hook_event   | jobs action
  *   -------------------|------------------------------------------------------
- *   SessionStart        | INSERT OR IGNORE a new job row; seed title from
- *                       |   spawn_name ('spawn' source) when present
- *   UserPromptSubmit    | state -> 'working'  (skipped when state == 'ended')
+ *   SessionStart        | INSERT a new job row; seed title from spawn_name
+ *                       |   ('spawn' source) when present. On a duplicate
+ *                       |   (resume) RE-OPEN a terminal row: 'ended' -> 'stopped'
+ *                       |   + refresh pid; a non-ended row's state is left as-is.
+ *   UserPromptSubmit    | state -> 'working'  (also re-opens an 'ended' job)
  *   Stop                | state -> 'stopped'  (skipped when state == 'ended')
- *   SessionEnd          | state -> 'ended'    (always; sticky thereafter)
+ *   SessionEnd          | state -> 'ended'    (always; the post-end resting state)
  *   <any with title>    | title -> data.session_title by precedence (the
  *                       |   source is 'transcript' for a TranscriptTitle event,
  *                       |   else 'payload'; write iff it outranks/ties+changes)
  *   <everything else>   | no jobs write; cursor still advances
  *
- * Terminal `ended` is sticky: once a job is ended, UserPromptSubmit/Stop are
- * no-ops. SessionEnd always lands (idempotently re-asserts 'ended').
+ * `ended` is the resting state AFTER a SessionEnd, NOT a permanent trap. A
+ * genuinely-ended session can only come back by re-attaching — a fresh
+ * `claude --resume` process fires SessionStart (source=resume) — or by submitting
+ * a prompt straight away (a UserPromptSubmit with no SessionStart, e.g. after a
+ * spurious mid-session SessionEnd); BOTH re-open the job. keeper has NO
+ * process-liveness overlay (unlike jobctl's server, which keeps SQL `ended`
+ * sticky and un-ends from PID liveness) — the fold IS the live view, so the
+ * re-open must live here. Only a stray `Stop` on a still-ended job stays a
+ * no-op. SessionEnd always lands (idempotently re-asserts 'ended').
  *
  * Title provenance/precedence: NULL=0, 'spawn'=1, 'payload'=2, 'transcript'=3.
  * A higher source wins; a lower one never clobbers a higher one (see
@@ -168,19 +177,33 @@ function projectJobsRow(db: Database, event: Event): void {
 
   switch (event.hook_event) {
     case "SessionStart":
-      // New job (or duplicate SessionStart): INSERT OR IGNORE. The schema
-      // default gives state='stopped' — the zero-event reading. Seed the title
-      // from the scraped spawn name (priority-1 'spawn' source) so the row
-      // reads a non-NULL title from the very first event; a NULL spawn_name
-      // leaves title NULL / title_source NULL (priority 0), with Tier 0 (the
-      // payload title rule below) still seeding at the first UserPromptSubmit.
-      // On a DUPLICATE SessionStart the OR IGNORE no-ops — the seed only lands
-      // on first insert, which is correct (a later higher-priority title is
-      // owned by the precedence rule, never re-seeded here). The seed also
-      // captures `transcript_path` from the SessionStart payload (guarded parse,
-      // NULL when absent/malformed) — a display/debug column, not a title.
+      // FIRST sight of a session: the INSERT seeds the row. The schema default
+      // gives state='stopped' — the zero-event reading. Seed the title from the
+      // scraped spawn name (priority-1 'spawn' source) so the row reads a
+      // non-NULL title from the very first event; a NULL spawn_name leaves title
+      // NULL / title_source NULL (priority 0), with Tier 0 (the payload title
+      // rule below) still seeding at the first UserPromptSubmit. The seed also
+      // captures `transcript_path` from the payload (guarded parse, NULL when
+      // absent/malformed) — a display/debug column, not a title.
+      //
+      // A DUPLICATE SessionStart is a RESUME: a genuinely-ended session can only
+      // be reopened by a fresh `claude --resume` process, which fires
+      // SessionStart (source=resume) — even a no-interaction resume — so this is
+      // keeper's re-open signal. ON CONFLICT re-opens a TERMINAL row (CASE:
+      // 'ended' -> 'stopped'; a mid-session compact/clear SessionStart on a
+      // working/stopped row leaves its state untouched, so it never knocks a live
+      // job backwards) and refreshes the pid (a resume is a new OS process).
+      // title/title_source are NOT touched — they stay precedence-owned, so a
+      // resume never re-seeds the priority-1 spawn name over a higher source;
+      // created_at / cwd / transcript_path are set-once identity and stay put.
       db.run(
-        "INSERT OR IGNORE INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at, title, title_source, transcript_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        `INSERT INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at, title, title_source, transcript_path)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(job_id) DO UPDATE SET
+           pid = COALESCE(excluded.pid, jobs.pid),
+           state = CASE WHEN jobs.state = '${ENDED}' THEN 'stopped' ELSE jobs.state END,
+           last_event_id = excluded.last_event_id,
+           updated_at = excluded.updated_at`,
         [
           jobId,
           ts,
@@ -196,15 +219,24 @@ function projectJobsRow(db: Database, event: Event): void {
       break;
 
     case "UserPromptSubmit":
-      // Sticky 'ended': a terminated job ignores further prompts.
+      // A prompt means the session is ALIVE — set 'working' unconditionally (no
+      // terminal guard). This is also a re-open path: a session can resume
+      // straight into a prompt with no SessionStart hook, and a spurious
+      // mid-session SessionEnd(reason=other) is sometimes followed immediately by
+      // a prompt in the SAME live process. Either way the job must leave 'ended'.
+      // (The un-end lives in the fold, not a liveness overlay — see the header.)
       db.run(
         `UPDATE jobs SET state = 'working', last_event_id = ?, updated_at = ?
-           WHERE job_id = ? AND state != '${ENDED}'`,
+           WHERE job_id = ?`,
         [event.id, ts, jobId],
       );
       break;
 
     case "Stop":
+      // Keeps the terminal guard: a stray Stop landing on a still-ended job (no
+      // intervening re-open) must not resurrect it. After a real re-open
+      // (SessionStart or UserPromptSubmit) the row is no longer 'ended', so a
+      // normal post-resume Stop applies here as usual.
       db.run(
         `UPDATE jobs SET state = 'stopped', last_event_id = ?, updated_at = ?
            WHERE job_id = ? AND state != '${ENDED}'`,
