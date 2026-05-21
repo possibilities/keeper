@@ -65,5 +65,5 @@ fn-545-shaped diff (mirror commit 5516c56) and is the epic's early proof point.
 - [ ] `bun test --isolate`, `biome check`, `tsc --noEmit` all clean
 
 ## Done summary
-
+Added priority-3 'transcript' title source: schema v4→v5 jobs.transcript_path (SessionStart-seeded), TITLE_PRIORITY transcript:3 + titleSourceForEvent resolver (precedence write unchanged), transcript_path served on jobs (display-only). Tests cover 3-source precedence, no-clobber, re-fold determinism, v4→v5 migration, and the SessionStart seed.
 ## Evidence

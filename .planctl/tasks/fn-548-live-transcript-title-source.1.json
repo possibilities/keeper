@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
   "title": "Fold foundation: schema v5 + transcript precedence",
-  "updated_at": "2026-05-21T18:09:15Z"
+  "updated_at": "2026-05-21T18:28:07Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-21T18:28:07Z"
 }
