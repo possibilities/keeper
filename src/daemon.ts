@@ -9,7 +9,7 @@
  *   2. Boot drain: `while (drain(db, BATCH) > 0) {}` — fold every unfolded event
  *      using the SAME code path as steady-state. After downtime this catches the
  *      projection up before the daemon goes live.
- *   3. Spawn TWO worker threads (both AFTER migrate + boot drain, so their
+ *   3. Spawn THREE worker threads (all AFTER migrate + boot drain, so their
  *      read-only `openDb` connections never race a missing/un-migrated DB):
  *      - the wake worker — opens its own read-only connection, polls
  *        `PRAGMA data_version`, and posts a contentless `{ kind: "wake" }`
@@ -17,15 +17,23 @@
  *      - the server worker — owns the UDS read surface: its own read-only
  *        connection, the `keeperd.lock` ownership lock, an NDJSON listener, and
  *        its own `data_version` poll that fans `jobs` changes out as patches.
+ *      - the transcript worker — watches the external transcript tree with
+ *        `@parcel/watcher`, tails each session's JSONL for the `custom-title`
+ *        line, and posts `{ kind: "transcript-title", sessionId, title }`. Main
+ *        turns that into a synthetic `TranscriptTitle` events row (priority-3
+ *        title) on its own writable connection — keeperd's first role as an
+ *        event PRODUCER. Main stays the sole writer; the worker is read-only.
  *   4. Steady state: every wake triggers a full drain loop. Wakes that arrive
  *      mid-drain coalesce into the next pass via a single "wake pending" flag —
  *      no event is missed (drain always re-reads from the cursor) and drain is
- *      never invoked re-entrantly.
- *   5. SIGTERM: post `{ type: "shutdown" }` to BOTH workers, await both `close`
- *      events against a short deadline, terminate both, close the db, exit 0.
- *      This is the ONLY clean exit. The server worker releases its socket + lock
- *      inside its own shutdown handler (the socket is process-owned, so
- *      `terminate()` alone would leak it).
+ *      never invoked re-entrantly. A `transcript-title` message inserts the
+ *      synthetic event then pumps a wake to fold it.
+ *   5. SIGTERM: post `{ type: "shutdown" }` to ALL THREE workers, await their
+ *      `close` events against a short deadline, terminate them, close the db,
+ *      exit 0. This is the ONLY clean exit. The server worker releases its
+ *      socket + lock and the transcript worker unsubscribes its watcher inside
+ *      their own shutdown handlers (those resources are process/thread-owned, so
+ *      `terminate()` alone would leak them).
  *
  * Crash policy (single recovery path): ANY unrecoverable error — either worker's
  * `error` event, an unhandled rejection, or a fold throw that escapes the
@@ -39,6 +47,10 @@ import type { Database } from "bun:sqlite";
 import { openDb, resolveDbPath } from "./db";
 import { DEFAULT_BATCH_SIZE, drain } from "./reducer";
 import type { ServerWorkerData } from "./server-worker";
+import type {
+  TranscriptTitleMessage,
+  TranscriptWorkerData,
+} from "./transcript-worker";
 import type {
   ShutdownMessage,
   WakeMessage,
@@ -74,7 +86,7 @@ function runDaemon(): void {
   process.title = "keeperd";
 
   const dbPath = resolveDbPath();
-  const { db } = openDb(dbPath);
+  const { db, stmts } = openDb(dbPath);
 
   // Step 2 — boot drain. MUST finish before the worker spawns: otherwise the
   // worker would fire wakes against a writer connection still iterating boot
@@ -167,6 +179,75 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
+  // Spawn the transcript worker in the SAME post-migration window. It watches
+  // the external transcript tree (`~/.claude/projects`) and posts a
+  // `transcript-title` message whenever it tails a `custom-title` line — making
+  // the daemon an event PRODUCER for the first time. `dbPath` is the only
+  // required field; `watchRoot` defaults to `~/.claude/projects` worker-side
+  // (overridden by the e2e test to a hermetic tmp dir).
+  const transcriptWorker = new Worker(
+    new URL("./transcript-worker.ts", import.meta.url).href,
+    {
+      workerData: {
+        dbPath,
+        ...(process.env.KEEPER_WATCH_ROOT
+          ? { watchRoot: process.env.KEEPER_WATCH_ROOT }
+          : {}),
+      } satisfies TranscriptWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  // Main stays the SOLE writer: a worker `transcript-title` message becomes a
+  // synthetic `TranscriptTitle` events row inserted on the existing WRITABLE
+  // connection, then a wake pump folds it (priority-3 'transcript' title). The
+  // insert is synchronous on the main thread and so cannot interleave with the
+  // synchronous drain inside pumpWakes. Column order matches `stmts.insertEvent`:
+  // ts, session_id, pid, hook_event, event_type, tool_name, matcher, cwd,
+  // permission_mode, agent_id, agent_type, stop_hook_active, data,
+  // subagent_agent_id, spawn_name. The title rides in `data.session_title` (the
+  // same field the reducer's title rule reads); everything else is NULL.
+  transcriptWorker.onmessage = (
+    ev: MessageEvent<TranscriptTitleMessage | undefined>,
+  ): void => {
+    const msg = ev.data;
+    if (!msg || msg.kind !== "transcript-title") {
+      return;
+    }
+    stmts.insertEvent.run(
+      Date.now() / 1000, // ts (unix seconds as REAL, matching the hook)
+      msg.sessionId, // session_id (== job_id)
+      null, // pid
+      "TranscriptTitle", // hook_event (synthetic; reducer maps → 'transcript')
+      "transcript_title", // event_type
+      null, // tool_name
+      null, // matcher
+      null, // cwd
+      null, // permission_mode
+      null, // agent_id
+      null, // agent_type
+      null, // stop_hook_active
+      JSON.stringify({ session_title: msg.title }), // data
+      null, // subagent_agent_id
+      null, // spawn_name
+    );
+    // Our own INSERT bumps data_version, so the wake worker would re-drain
+    // anyway — but pump directly so the title folds without a poll-cycle delay.
+    wakePending = true;
+    pumpWakes();
+  };
+
+  // Same crash policy as the other workers: any thread failure → fatalExit.
+  transcriptWorker.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] transcript worker error:", err.message ?? err);
+    fatalExit();
+  };
+
+  // Same crash-via-`close` gap: a transcript-worker `process.exit(1)` fires
+  // `close`, not `onerror`. `!shuttingDown` makes it inert on clean shutdown.
+  transcriptWorker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
+
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -199,10 +280,14 @@ function runDaemon(): void {
 
     worker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     serverWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
+    transcriptWorker.postMessage({
+      type: "shutdown",
+    } satisfies ShutdownMessage);
 
-    // Bun surfaces worker exit via the "close" event. Await BOTH workers'
-    // close (the server worker releases its socket + lock in its own shutdown
-    // handler — that teardown must land, or the socket leaks into the next
+    // Bun surfaces worker exit via the "close" event. Await ALL THREE workers'
+    // close (the server worker releases its socket + lock and the transcript
+    // worker unsubscribes its watcher in their own shutdown handlers — that
+    // teardown must land, or the socket / native watch leaks into the next
     // boot), raced against a single shared deadline so a wedged worker can't
     // block our clean shutdown forever.
     const exited = (w: Worker): Promise<void> =>
@@ -210,7 +295,11 @@ function runDaemon(): void {
         w.addEventListener("close", () => resolve());
       });
     await Promise.race([
-      Promise.all([exited(worker), exited(serverWorker)]),
+      Promise.all([
+        exited(worker),
+        exited(serverWorker),
+        exited(transcriptWorker),
+      ]),
       Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS),
     ]);
 
@@ -221,6 +310,11 @@ function runDaemon(): void {
     }
     try {
       serverWorker.terminate();
+    } catch {
+      // best-effort if it already exited
+    }
+    try {
+      transcriptWorker.terminate();
     } catch {
       // best-effort if it already exited
     }

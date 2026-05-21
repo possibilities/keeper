@@ -1,0 +1,512 @@
+/**
+ * Transcript worker. keeperd's THIRD Bun Worker thread (after wake + server).
+ * It is the first thing in keeper that makes the DAEMON an event *producer*:
+ * it watches the Claude Code transcript tree (`~/.claude/projects`) with
+ * `@parcel/watcher` (keeper's first runtime dep — a native FSEvents-backed
+ * addon), forward-tails each session's JSONL for the `custom-title` line, and
+ * posts `{kind:"transcript-title", sessionId, title}` to the parent. The parent
+ * (and only the parent) turns that message into a synthetic `TranscriptTitle`
+ * `events` row, which the reducer folds at the priority-3 `'transcript'` title
+ * source. The worker never writes — it opens a READ-ONLY connection (for the
+ * restart-seed) and only posts messages, keeping main the sole `jobs`-writer.
+ *
+ * Why a native file watcher here when keeper's DO-NOT bans `fs.watch`/FSEvents
+ * for its OWN SQLite DB: the ban is narrowed, NOT removed. `PRAGMA data_version`
+ * polling stays mandatory for the keeper DB (WAL writes never touch the main
+ * file; same-process writes are dropped). But the transcripts are EXTERNAL
+ * append-only files written by another process — a kernel watcher is the right
+ * primitive there. We still treat every event as "something changed, go look",
+ * never as the data: each notification triggers an `fstat` + tail from the
+ * stored offset, mirroring jobctl's `TranscriptLineStream`.
+ *
+ * Conventions mirror `src/wake-worker.ts` / `src/server-worker.ts`:
+ * - `isMainThread`-guarded body — a plain `import` from a test is inert; the
+ *   pure line-stream core is exported and drivable with no Worker or watcher.
+ * - Own read-only `openDb(path, { readonly: true })` (handles are thread-affine
+ *   and not structured-cloneable; the parent hands us only path strings via
+ *   `workerData`).
+ * - Typed message protocol: `{ kind: ... }` worker→main, `{ type: "shutdown" }`
+ *   main→worker. Exit `0` clean / `1` crash. NO in-process self-heal — only a
+ *   genuine unrecoverable failure exits non-zero (→ daemon `fatalExit` →
+ *   launchd restart, keeper's single recovery path).
+ * - Subsystem-style teardown (like server-worker's socket): the `@parcel/watcher`
+ *   subscription is an external resource the worker owns and `unsubscribe()`s in
+ *   its `{type:"shutdown"}` handler.
+ *
+ * Internal guards (skip-and-log, never escalate): a missing
+ * `~/.claude/projects` root (tolerate late appearance), per-file read errors,
+ * and torn/malformed JSONL lines all log to stderr and continue. Only an
+ * unrecoverable failure (the subscribe call itself rejecting, the addon failing
+ * to load) exits non-zero.
+ */
+
+import type { Database } from "bun:sqlite";
+import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import type { AsyncSubscription } from "@parcel/watcher";
+import { openDb } from "./db";
+
+/**
+ * Data the parent passes via `new Worker(url, { workerData })`. Only path
+ * strings cross the boundary — the Database handle and the subscription cannot.
+ */
+export interface TranscriptWorkerData {
+  dbPath: string;
+  /**
+   * The transcript tree to watch. Defaults to `~/.claude/projects`. Overridable
+   * so the e2e test can point at a hermetic tmp dir (mirrors KEEPER_DB).
+   */
+  watchRoot?: string;
+}
+
+/** Message posted to the parent on a NEW (changed) title for a session. */
+export interface TranscriptTitleMessage {
+  kind: "transcript-title";
+  sessionId: string;
+  title: string;
+}
+
+/** Message the parent sends to ask the worker to stop. */
+export interface ShutdownMessage {
+  type: "shutdown";
+}
+
+/** Bounded read chunk — tail at most this many bytes per stat→read pass. */
+const READ_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * Resolve the transcript watch root. `workerData.watchRoot` wins (tests point
+ * it at a tmp dir); otherwise `~/.claude/projects`. Pure — does no I/O.
+ */
+export function resolveWatchRoot(override?: string): string {
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".claude", "projects");
+}
+
+/** A parsed `custom-title` line: the session it targets and its new title. */
+interface CustomTitleLine {
+  sessionId: string;
+  title: string;
+}
+
+/**
+ * Match a parsed JSONL object against the `custom-title` shape:
+ * `{type:"custom-title", customTitle:<string>, sessionId:<string>}`
+ * (`customTitle` is camelCase, verified against real transcripts; the line
+ * carries `sessionId` so the worker routes by it directly). Returns the
+ * extracted `{sessionId, title}` or `null` for any other line.
+ */
+function matchCustomTitle(parsed: unknown): CustomTitleLine | null {
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+  const obj = parsed as {
+    type?: unknown;
+    customTitle?: unknown;
+    sessionId?: unknown;
+  };
+  if (obj.type !== "custom-title") {
+    return null;
+  }
+  if (typeof obj.customTitle !== "string" || obj.customTitle.length === 0) {
+    return null;
+  }
+  if (typeof obj.sessionId !== "string" || obj.sessionId.length === 0) {
+    return null;
+  }
+  return { sessionId: obj.sessionId, title: obj.customTitle };
+}
+
+/**
+ * Per-path forward-tail state: the byte offset we've consumed up to, a
+ * persistent UTF-8 decoder (so a multi-byte char split across a read-chunk
+ * boundary never decodes to U+FFFD — undici #5035, a real corruption bug), and
+ * the unterminated tail of the last read (prepended to the next read's first
+ * line). Keyed by PATH, not inode: a session fork is a new file with a new
+ * session-id filename, so a new path correctly starts at offset 0.
+ */
+interface PathState {
+  offset: number;
+  decoder: StringDecoder;
+  partial: string;
+}
+
+/**
+ * Pure, exported forward-tail line stream — the deterministic core, drivable in
+ * tests with no Worker or watcher. Ports jobctl's `TranscriptLineStream`
+ * (`run_run_server.py:6605`):
+ *
+ * - `register(path)` anchors the path's offset to current EOF (we only care
+ *   about lines appended AFTER we start watching; the restart-seed below feeds
+ *   `lastEmitted` so the first post-anchor title still emits iff it changed).
+ * - `onChange(path)` reads bounded (~64 KiB) chunks from the stored offset to
+ *   EOF, decodes through the per-file `StringDecoder`, splits on `\n`, prepends
+ *   the buffered partial, and dispatches only `\n`-terminated lines. A truncation
+ *   (`size < offset`) resets offset to 0 and clears the buffer + decoder. A
+ *   malformed line is JSON-parse-skipped-and-logged. A matched `custom-title` is
+ *   emitted via `onTitle(sessionId, title)` ONLY when the title differs from the
+ *   last emitted title for that session (change-only emit).
+ *
+ * `lastEmitted` is the in-memory change-gate, keyed by sessionId. The
+ * restart-seed (server-side: seed from `jobs.title` when `title_source ===
+ * 'transcript'`) is applied by the caller via `seedLastEmitted` before the
+ * first `onChange`, so a daemon restart doesn't re-emit a title already folded.
+ */
+export class TranscriptLineStream {
+  private readonly pathState = new Map<string, PathState>();
+  private readonly lastEmitted = new Map<string, string>();
+
+  constructor(
+    private readonly onTitle: (sessionId: string, title: string) => void,
+    private readonly log: (msg: string) => void = (m) => console.error(m),
+  ) {}
+
+  /**
+   * Seed the change-gate for a session from a prior-known title (the
+   * restart-seed). A subsequent `custom-title` line with the SAME title is then
+   * suppressed; a different one emits. Idempotent — last call wins.
+   */
+  seedLastEmitted(sessionId: string, title: string): void {
+    this.lastEmitted.set(sessionId, title);
+  }
+
+  /**
+   * Anchor a path's forward-tail offset to its current EOF. Called on first
+   * sight of a transcript file. A stat failure anchors at 0 (we'll re-tail from
+   * the start; harmless — the change-gate suppresses already-emitted titles).
+   */
+  register(path: string): void {
+    if (this.pathState.has(path)) {
+      return;
+    }
+    let size = 0;
+    try {
+      size = statSync(path).size;
+    } catch {
+      size = 0;
+    }
+    this.pathState.set(path, {
+      offset: size,
+      decoder: new StringDecoder("utf8"),
+      partial: "",
+    });
+  }
+
+  /** Drop a path from tracking (e.g. on unsubscribe). */
+  unregister(path: string): void {
+    this.pathState.delete(path);
+  }
+
+  /**
+   * Process bytes appended to `path` since the stored offset. Auto-registers a
+   * not-yet-seen path (anchoring to EOF means a freshly-created file's existing
+   * lines are skipped — we only stream appends), so a watcher "create" event is
+   * handled. A per-file read error skips-and-logs and never throws.
+   */
+  onChange(path: string): void {
+    let state = this.pathState.get(path);
+    if (!state) {
+      // First sight via a change event: anchor to EOF (skip pre-existing lines),
+      // then fall through to read any bytes appended past that anchor.
+      this.register(path);
+      state = this.pathState.get(path);
+      if (!state) {
+        return;
+      }
+    }
+
+    let size: number;
+    try {
+      size = statSync(path).size;
+    } catch (err) {
+      this.log(
+        `[transcript-worker] stat failed for ${path}: ${stringifyErr(err)}`,
+      );
+      return;
+    }
+
+    // Truncation guard: a shrunk file (rotated/rewritten) resets the tail. Path
+    // keying makes this rare (Claude Code doesn't rewrite in place), but stay
+    // defensive — reset offset to 0, clear the partial buffer + decoder.
+    if (size < state.offset) {
+      this.log(
+        `[transcript-worker] ${path} truncated (size ${size} < offset ${state.offset}); resetting`,
+      );
+      state.offset = 0;
+      state.partial = "";
+      state.decoder = new StringDecoder("utf8");
+    }
+
+    if (size <= state.offset) {
+      return; // nothing appended
+    }
+
+    let fd: number;
+    try {
+      fd = openSync(path, "r");
+    } catch (err) {
+      this.log(
+        `[transcript-worker] open failed for ${path}: ${stringifyErr(err)}`,
+      );
+      return;
+    }
+
+    try {
+      // fd discipline: open→read-to-EOF→close per change event; don't hold an fd
+      // across the deep live tree. Read in bounded chunks so a huge append never
+      // balloons memory.
+      const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+      while (state.offset < size) {
+        const want = Math.min(READ_CHUNK_BYTES, size - state.offset);
+        let got: number;
+        try {
+          got = readSync(fd, buf, 0, want, state.offset);
+        } catch (err) {
+          this.log(
+            `[transcript-worker] read failed for ${path}: ${stringifyErr(err)}`,
+          );
+          return;
+        }
+        if (got <= 0) {
+          break;
+        }
+        state.offset += got;
+        // Decode THROUGH the persistent decoder — a multi-byte char split across
+        // this chunk boundary is held back and completed on the next read,
+        // never producing a U+FFFD.
+        const text = state.decoder.write(buf.subarray(0, got));
+        this.consume(state, path, text);
+      }
+    } finally {
+      try {
+        closeSync(fd);
+      } catch {
+        // best-effort; we're done with the fd either way
+      }
+    }
+  }
+
+  /**
+   * Append decoded text to the partial buffer, then dispatch every
+   * `\n`-terminated line and retain the unterminated tail for the next read.
+   */
+  private consume(state: PathState, path: string, text: string): void {
+    state.partial += text;
+    let nl = state.partial.indexOf("\n");
+    while (nl !== -1) {
+      const line = state.partial.slice(0, nl);
+      state.partial = state.partial.slice(nl + 1);
+      this.dispatchLine(path, line);
+      nl = state.partial.indexOf("\n");
+    }
+  }
+
+  /**
+   * Parse + match one complete line. Malformed JSON skips-and-logs; a
+   * `custom-title` whose title CHANGED for its session emits via `onTitle` and
+   * advances the change-gate. A blank line or a non-`custom-title` line is a
+   * silent no-op.
+   */
+  private dispatchLine(path: string, line: string): void {
+    if (line.trim().length === 0) {
+      return;
+    }
+    // Cheap pre-filter: skip the JSON.parse for lines that can't be a title.
+    if (!line.includes("custom-title")) {
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch (err) {
+      this.log(
+        `[transcript-worker] malformed line in ${path}: ${stringifyErr(err)}`,
+      );
+      return;
+    }
+    const match = matchCustomTitle(parsed);
+    if (!match) {
+      return;
+    }
+    const prev = this.lastEmitted.get(match.sessionId);
+    if (prev === match.title) {
+      return; // change-only emit: same title already emitted
+    }
+    this.lastEmitted.set(match.sessionId, match.title);
+    this.onTitle(match.sessionId, match.title);
+  }
+}
+
+function stringifyErr(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Seed the line stream's change-gate from the keeper DB: for each job whose
+ * `title_source === 'transcript'`, the persisted `jobs.title` IS the last
+ * transcript title that won, so re-emitting it on restart would be redundant.
+ * Seed those (and only those) so the first post-restart `custom-title` line
+ * emits iff the title actually changed while the daemon was down. Jobs at a
+ * lower title source are left unset so their first transcript title emits.
+ *
+ * Read-only — uses the worker's own read-only connection. Exported for the
+ * worker `main` (and unit reach).
+ */
+export function seedFromDb(db: Database, stream: TranscriptLineStream): void {
+  const rows = db
+    .query(
+      "SELECT job_id, title FROM jobs WHERE title_source = 'transcript' AND title IS NOT NULL",
+    )
+    .all() as { job_id: string; title: string }[];
+  for (const row of rows) {
+    stream.seedLastEmitted(row.job_id, row.title);
+  }
+}
+
+/**
+ * Worker entrypoint. Opens its own read-only connection, seeds the change-gate,
+ * subscribes to the watch root, routes each change event into the line stream,
+ * and posts a `transcript-title` message per changed title. The subscription is
+ * an owned external resource — `unsubscribe()`d in the shutdown handler.
+ */
+function main(): void {
+  if (!parentPort) {
+    console.error(
+      "[transcript-worker] no parentPort — not running as a Worker",
+    );
+    process.exit(1);
+  }
+
+  const data = workerData as TranscriptWorkerData | undefined;
+  if (!data || typeof data.dbPath !== "string") {
+    console.error("[transcript-worker] missing dbPath in workerData");
+    process.exit(1);
+  }
+
+  const watchRoot = resolveWatchRoot(data.watchRoot);
+  const { db } = openDb(data.dbPath, { readonly: true });
+
+  const port = parentPort;
+  const stream = new TranscriptLineStream((sessionId, title) => {
+    port.postMessage({
+      kind: "transcript-title",
+      sessionId,
+      title,
+    } satisfies TranscriptTitleMessage);
+  });
+
+  // Restart-seed: don't re-emit a transcript title already folded into jobs.
+  try {
+    seedFromDb(db, stream);
+  } catch (err) {
+    // A seed failure is non-fatal: worst case a stale title re-emits once (the
+    // reducer's same-priority-changed-value rule makes that a no-op anyway).
+    console.error(
+      `[transcript-worker] restart-seed failed: ${stringifyErr(err)}`,
+    );
+  }
+
+  let subscription: AsyncSubscription | null = null;
+  let shuttingDown = false;
+
+  const closeDb = (): void => {
+    try {
+      db.close();
+    } catch {
+      // best-effort; exiting either way
+    }
+  };
+
+  parentPort.on("message", (msg: ShutdownMessage | undefined) => {
+    if (msg && msg.type === "shutdown") {
+      shuttingDown = true;
+      // Release the subscription (external resource), then the db, then exit
+      // clean. Mirrors server-worker's socket teardown.
+      void (async () => {
+        if (subscription) {
+          try {
+            await subscription.unsubscribe();
+          } catch {
+            // best-effort
+          }
+          subscription = null;
+        }
+        closeDb();
+        process.exit(0);
+      })();
+    }
+  });
+
+  // The watch root may not exist yet on a fresh machine. @parcel/watcher's
+  // `subscribe` REQUIRES an existing dir, so tolerate absence: skip-and-log and
+  // exit clean only on explicit shutdown. (A future late-appearance retry could
+  // poll for the dir; for now a missing root simply means no titles until the
+  // daemon restarts after the dir exists — acceptable per the task's guards.)
+  if (!existsSync(watchRoot)) {
+    console.error(
+      `[transcript-worker] watch root ${watchRoot} does not exist; not watching`,
+    );
+    // Stay alive (don't exit non-zero — a missing root is not a crash) so the
+    // shutdown handshake still works. The parentPort listener keeps the event
+    // loop alive.
+    return;
+  }
+
+  // `subscribe` is the only unrecoverable surface — a rejection (addon load
+  // failure, EPERM on the root) exits non-zero → daemon fatalExit → launchd
+  // restart. Per-file read errors and torn lines are handled INSIDE the stream
+  // (skip-and-log), never here.
+  import("@parcel/watcher")
+    .then((watcher) =>
+      watcher.subscribe(
+        watchRoot,
+        (err, events) => {
+          if (err) {
+            // A watcher-level error is logged, not fatal — the subscription
+            // stays live and the next event re-tails.
+            console.error(
+              `[transcript-worker] watcher error: ${stringifyErr(err)}`,
+            );
+            return;
+          }
+          for (const ev of events) {
+            // Treat every event as "go look" — create/update both tail from the
+            // stored offset; a delete just drops tracking. The path is the
+            // *.jsonl transcript (the ignore glob filters non-jsonl).
+            if (ev.type === "delete") {
+              stream.unregister(ev.path);
+              continue;
+            }
+            stream.onChange(ev.path);
+          }
+        },
+        { ignore: ["**/*.!(jsonl)"] },
+      ),
+    )
+    .then((sub) => {
+      if (shuttingDown) {
+        // Shutdown raced the subscribe resolution — release immediately.
+        void sub.unsubscribe();
+        return;
+      }
+      subscription = sub;
+    })
+    .catch((err) => {
+      console.error(
+        `[transcript-worker] failed to subscribe to ${watchRoot}: ${stringifyErr(err)}`,
+      );
+      closeDb();
+      process.exit(1);
+    });
+}
+
+// Only run inside a real Worker; a plain import on the main thread (tests
+// driving the pure TranscriptLineStream) is inert.
+if (!isMainThread) {
+  main();
+}

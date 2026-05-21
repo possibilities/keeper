@@ -17,7 +17,15 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
@@ -32,6 +40,7 @@ const HOOK_ENTRY = join(ROOT, "plugin", "hooks", "events-writer.ts");
 let tmpDir: string;
 let dbPath: string;
 let sockPath: string;
+let watchRoot: string;
 let daemon: Subprocess<"ignore", "pipe", "pipe"> | null = null;
 
 beforeEach(() => {
@@ -40,6 +49,10 @@ beforeEach(() => {
   // BOTH KEEPER_DB and KEEPER_SOCK live in the tmpdir: a test that set only
   // KEEPER_DB would bind the REAL default socket and collide across isolates.
   sockPath = join(tmpDir, "keeperd.sock");
+  // Hermetic transcript watch root for the transcript-worker e2e — overrides
+  // the default `~/.claude/projects` so the test never touches the real tree.
+  watchRoot = join(tmpDir, "projects");
+  mkdirSync(watchRoot, { recursive: true });
   daemon = null;
 });
 
@@ -212,9 +225,7 @@ test("end-to-end: hook writes → wake worker → reducer folds → jobs project
     // --- jobs projection: one row, ended (terminal). ---
     const job = await retryUntil(() => {
       const row = reader
-        .query(
-          "SELECT job_id, state, last_event_id FROM jobs WHERE job_id = ?",
-        )
+        .query("SELECT job_id, state, last_event_id FROM jobs WHERE job_id = ?")
         .get(sessionId) as {
         job_id: string;
         state: string;
@@ -450,4 +461,98 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
   // The server worker's shutdown handler unlinks the socket (it's process-owned;
   // terminate() alone wouldn't release it).
   expect(existsSync(sockPath)).toBe(false);
+}, 15000);
+
+test("end-to-end: transcript worker → custom-title write flips jobs.title to 'transcript'", async () => {
+  const sessionId = "sess-transcript-e2e";
+
+  // Spawn the daemon with the watch root pointed at our hermetic tmp dir so the
+  // transcript worker watches it instead of the real ~/.claude/projects.
+  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_SOCK: sockPath,
+      KEEPER_WATCH_ROOT: watchRoot,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  // Give the daemon time to boot all three workers (the transcript worker
+  // subscribes to the watch root after migrate + boot drain).
+  await Bun.sleep(400);
+
+  // Fold a SessionStart so the job row exists for the title to land on. The
+  // transcript title only updates an existing job (the title rule no-ops when
+  // no row matches).
+  await fireHook({
+    hook_event_name: "SessionStart",
+    session_id: sessionId,
+    cwd: "/tmp/work",
+    permission_mode: "default",
+  });
+
+  const { db: reader } = openDb(dbPath, { readonly: true });
+  try {
+    // Wait for the job to project before we touch the transcript.
+    const projected = await retryUntil(() => {
+      const row = reader
+        .query("SELECT job_id FROM jobs WHERE job_id = ?")
+        .get(sessionId) as { job_id: string } | null;
+      return row ? row : null;
+    });
+    if (!projected) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(`job never projected.\nstdout:\n${out}\nstderr:\n${err}`);
+    }
+
+    // Write a transcript file with a `custom-title` line under the watch root.
+    // The filename mirrors Claude Code's `<session-id>.jsonl` convention (the
+    // worker routes by the line's `sessionId`, not the path, but keep it real).
+    const transcriptPath = join(watchRoot, `${sessionId}.jsonl`);
+    // Create empty first so the worker anchors at EOF, then append the title
+    // line — exercising the live forward-tail (append-after-watch) path.
+    writeFileSync(transcriptPath, "");
+    await Bun.sleep(150);
+    appendFileSync(
+      transcriptPath,
+      `${JSON.stringify({
+        type: "custom-title",
+        customTitle: "Live Renamed Title",
+        sessionId,
+      })}\n`,
+    );
+
+    // The watcher fires → worker tails the line → posts to main → main inserts a
+    // synthetic TranscriptTitle event → reducer folds it at priority-3.
+    const titled = await retryUntil(() => {
+      const row = reader
+        .query("SELECT title, title_source FROM jobs WHERE job_id = ?")
+        .get(sessionId) as {
+        title: string | null;
+        title_source: string | null;
+      } | null;
+      return row && row.title_source === "transcript" ? row : null;
+    }, 5000);
+    if (!titled) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `transcript title never folded.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+    expect(titled.title).toBe("Live Renamed Title");
+    expect(titled.title_source).toBe("transcript");
+  } finally {
+    reader.close();
+  }
+
+  // Clean shutdown: SIGTERM → all three workers tear down → exit 0. The
+  // transcript worker unsubscribes its watcher in its shutdown handler.
+  daemon.kill("SIGTERM");
+  const exitCode = await daemon.exited;
+  expect(exitCode).toBe(0);
 }, 15000);
