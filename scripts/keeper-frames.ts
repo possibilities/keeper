@@ -7,11 +7,12 @@
  *
  * It `query`s a 10-row page of `jobs` and renders it as a YAML stream: each
  * frame is a YAML document (leading `---`) listing every job as a single
- * collapsed string — `{basename(cwd)}·{title}·{state}`. The query carries a
- * server-side `state != 'ended'` filter (the `{ ne }` operator form), so ended
- * jobs are excluded in SQL — the page is a true top-N of LIVE jobs (LIMIT
- * counts live rows) and `total`/`meta` track exactly that set. Membership is
- * frozen
+ * collapsed string — `{basename(cwd)}·{title}·{state}`. The query optionally
+ * carries a server-side `state` filter built from `--state` / `--state-ne`
+ * (the bare-value equality form and the `{ ne }` operator form, respectively;
+ * default is no filter and every job pages through). When a filter is in
+ * effect it runs in SQL, so LIMIT counts only matching rows and `total` /
+ * `meta` track exactly that set. Membership is frozen
  * WITHIN a fetched page (the server never reflows a live page), but the script
  * REFETCHES the page — on every `patch`/`meta` change signal AND on a steady
  * poll — so each fresh `result` reflects the current top-N. A NEW frame prints
@@ -75,10 +76,13 @@ const POLL_MS = 500;
 
 const HELP = `keeper-frames — primitive jobs-list UI over the keeper subscribe server
 
-Usage: bun scripts/keeper-frames.ts [--sock <path>]
+Usage: bun scripts/keeper-frames.ts [--sock <path>] [--state <s> | --state-ne <s>]
 
-  --sock <path>   Socket path override ($KEEPER_SOCK / default otherwise)
-  --help          Show this help
+  --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
+  --state <s>      Filter to jobs whose state equals <s> (e.g. working)
+  --state-ne <s>   Filter to jobs whose state is NOT <s> (e.g. ended)
+                   (--state and --state-ne are mutually exclusive; default: no filter)
+  --help           Show this help
 
 Renders a 10-row page of jobs as a YAML stream: one frame per change, each frame
 a YAML document (--- separated) of collapsed job strings ({basename(cwd)}·{title}
@@ -143,6 +147,8 @@ async function main(): Promise<void> {
     args: Bun.argv.slice(2),
     options: {
       sock: { type: "string" },
+      state: { type: "string" },
+      "state-ne": { type: "string" },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -151,6 +157,10 @@ async function main(): Promise<void> {
   if (values.help) {
     process.stdout.write(HELP);
     process.exit(0);
+  }
+
+  if (values.state !== undefined && values["state-ne"] !== undefined) {
+    die("--state and --state-ne are mutually exclusive");
   }
 
   const sockPath = values.sock ?? resolveSockPath();
@@ -300,16 +310,20 @@ async function main(): Promise<void> {
     }
   }
 
+  // Build the optional `state` filter from the CLI flags. Filtering in SQL —
+  // not after the fetch — keeps LIMIT counting matching rows (so the page is a
+  // true top-N of the filtered set, never short) and makes `result.total` /
+  // `meta` describe exactly the set we render. Default: no filter (every job).
   const query: QueryFrame = {
     type: "query",
     collection: "jobs",
     id: "frames",
     limit: PAGE_LIMIT,
-    // Exclude ended jobs server-side (`state != 'ended'`). Filtering in SQL —
-    // not after the fetch — keeps LIMIT counting live rows (so the page is a
-    // true top-N of live jobs, never short) and makes `result.total` / `meta`
-    // describe exactly the set we render.
-    filter: { state: { ne: "ended" } },
+    ...(values.state !== undefined
+      ? { filter: { state: values.state } }
+      : values["state-ne"] !== undefined
+        ? { filter: { state: { ne: values["state-ne"] } } }
+        : {}),
   };
 
   const socket = await Bun.connect({
