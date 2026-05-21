@@ -5,21 +5,29 @@
  * tap, this script renders a *page of jobs as a frame* and reprints a fresh
  * frame every time the visible projection changes.
  *
- * It opens one `query` for a 10-row page of `jobs`, holds that page's row SET
- * (frozen membership — rows never enter/leave a live page), and renders it as a
- * YAML stream: each frame is a YAML document (leading `---`) listing every job
- * as a single collapsed string — `{basename(cwd)}·{title}·{state}`. As `patch`
- * frames advance individual rows, the page is updated in place and a NEW frame
- * is printed whenever the RENDERED page changes. A patch carries the full row,
- * but only the columns that surface in the projection reframe: a move in
- * `last_event_id` / `pid` / `updated_at` re-renders to the same string and emits
- * nothing. The rendered output — not internal row churn — is the sole frame
- * trigger, enforced by routing every emit through `emitFrameIfChanged`.
+ * It `query`s a 10-row page of `jobs` and renders it as a YAML stream: each
+ * frame is a YAML document (leading `---`) listing every job as a single
+ * collapsed string — `{basename(cwd)}·{title}·{state}`. Membership is frozen
+ * WITHIN a fetched page (the server never reflows a live page), but the script
+ * REFETCHES the page — on every `patch`/`meta` change signal AND on a steady
+ * poll — so each fresh `result` reflects the current top-N. A NEW frame prints
+ * whenever the RENDERED page changes; the rendered output — not internal row
+ * churn — is the sole frame trigger, enforced by routing every emit through
+ * `emitFrameIfChanged`.
  *
- * The `meta` (total/membership-staleness) signal is rendered as a SEPARATE
- * "temporary frame": a `...`-fenced comment block, distinct from the `---` job
- * frames, that just notes the set changed underneath the frozen page. It is not
- * folded into the list — frozen membership means the page does not reflow.
+ * The script renders ONLY from `result` frames. `patch` and `meta` are treated
+ * purely as "refetch" hints (their payloads are never rendered directly), so
+ * the displayed page is always a true top-N snapshot — never a half-patched mix
+ * of fresh cells over stale membership. Refetches coalesce: at most one `query`
+ * is in flight, and a signal arriving while one is pending queues exactly one
+ * more, so a burst can't become a query storm.
+ *
+ * Why a poll and not pure push: the server can't signal a re-sort of a row that
+ * is OFF the current page — it isn't in the watched set (no `patch`) and the
+ * filtered SET membership is unchanged (no `meta`). An event-only client would
+ * never learn that such a row sorted into the top-N. The steady poll is the
+ * client's "always show the latest top-N" backstop; `patch`/`meta` just make
+ * on-page changes reflect faster than the poll interval.
  *
  * After every emitted frame a second `...`-fenced note prints two per-pid /tmp
  * paths: the full JSON state the frame was built from (the ordered page rows)
@@ -53,6 +61,14 @@ import {
 /** The page size this primitive UI pages. Fixed for now. */
 const PAGE_LIMIT = 10;
 
+/**
+ * How often (ms) the client refetches the page. The server can't signal an
+ * off-page re-sort (see file header), so this steady beat is what guarantees we
+ * eventually show the current top-N. The server's own `data_version` poll is
+ * ~50ms; this is the client's coarser "always show the latest page" cadence.
+ */
+const POLL_MS = 500;
+
 const HELP = `keeper-frames — primitive jobs-list UI over the keeper subscribe server
 
 Usage: bun scripts/keeper-frames.ts [--sock <path>]
@@ -62,9 +78,9 @@ Usage: bun scripts/keeper-frames.ts [--sock <path>]
 
 Renders a 10-row page of jobs as a YAML stream: one frame per change, each frame
 a YAML document (--- separated) of collapsed job strings ({basename(cwd)}·{title}
-·{state}). A new frame prints only when the rendered output changes. The total/
-membership "meta" signal prints as a separate ...-fenced note (the frozen page
-never reflows). Every emitted frame is also mirrored to two /tmp sidecar files
+·{state}). The page is refetched on every change signal and on a steady poll, so
+it always shows the current top-N; a new frame prints only when the rendered
+output changes. Every emitted frame is also mirrored to two /tmp sidecar files
 (full JSON state + rendered frame), whose paths print in a ...-fenced note.
 `;
 
@@ -136,14 +152,24 @@ async function main(): Promise<void> {
   const sockPath = values.sock ?? resolveSockPath();
   const log = (s: string) => process.stdout.write(`${s}\n`);
 
-  // The frozen page, in server-sent order, plus a by-id index. The order array
-  // fixes render order at result time; the map holds the full live rows that
-  // `patch` frames advance, keyed by pk (`job_id`).
+  // The current page, in server-sent order, plus a by-id index. Both are
+  // rebuilt wholesale on every `result` (each refetch replaces the page); the
+  // render reads only from them, never from `patch` payloads.
   const order: string[] = [];
   const byId = new Map<string, Record<string, unknown>>();
   // The last frame's body, so a byte-identical re-send prints nothing.
   let lastBody: string | null = null;
   let gotResult = false;
+
+  // Refetch coalescing. Membership is frozen WITHIN a page, but we re-issue the
+  // query so a fresh `result` always carries the current top-N. At most one
+  // query is in flight (`queryInFlight`); a change signal arriving while one is
+  // pending sets `refetchDirty` so we refetch exactly once more when the result
+  // lands — a burst collapses to one in-flight + one queued, never a storm.
+  let queryInFlight = false;
+  let refetchDirty = false;
+  // The steady-poll timer handle, cleared on close / SIGINT.
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
 
   /**
    * Collapse one full job row to its display string: `{basename(cwd)}·{title}·
@@ -220,10 +246,25 @@ async function main(): Promise<void> {
     writeSidecars(frameText);
   }
 
+  /**
+   * Re-issue the page query, coalesced (see `queryInFlight` / `refetchDirty`).
+   * The server replaces the subscription and replies with a fresh `result`;
+   * rendering happens only there, so we always draw the freshly fetched top-N.
+   */
+  function scheduleRefetch(): void {
+    if (queryInFlight) {
+      refetchDirty = true;
+      return;
+    }
+    queryInFlight = true;
+    socket.write(encodeFrame(query));
+  }
+
   const buffer = new LineBuffer();
 
   function handleFrame(frame: ServerFrame): void {
     if (frame.type === "result") {
+      queryInFlight = false;
       order.length = 0;
       byId.clear();
       for (const row of frame.rows) {
@@ -232,28 +273,19 @@ async function main(): Promise<void> {
         byId.set(id, row);
       }
       gotResult = true;
-      // Force the first frame even if the page is empty.
-      lastBody = null;
       emitFrameIfChanged();
-    } else if (frame.type === "patch") {
-      const id = String(frame.row.job_id);
-      // Frozen membership: a patch only ever updates a row already in the page.
-      // The full row is stored, but emitFrameIfChanged reframes only if the
-      // projected string moved — an unprojected column change prints nothing.
-      if (byId.has(id)) {
-        byId.set(id, frame.row);
-        emitFrameIfChanged();
+      // If a change arrived while this query was in flight, refetch once more so
+      // we converge on the latest page.
+      if (refetchDirty) {
+        refetchDirty = false;
+        scheduleRefetch();
       }
-    } else if (frame.type === "meta") {
-      // Temporary frame: a separate ...-fenced note, NOT a job frame. The set
-      // changed underneath the frozen page (total/membership moved); the list
-      // above is intentionally not reflowed.
-      log("...");
-      log(
-        `# meta: filtered set changed — now ${frame.total} job(s) match` +
-          ` (page shows ${order.length}), rev ${frame.rev}`,
-      );
-      log("...");
+    } else if (frame.type === "patch" || frame.type === "meta") {
+      // A watched row advanced (`patch`) or the filtered set changed (`meta`):
+      // the page may be stale. We never render these payloads directly —
+      // refetch and re-render from the fresh `result`, so the displayed page is
+      // always a true top-N snapshot, never a half-patched mix.
+      scheduleRefetch();
     } else if (frame.type === "error") {
       log(`# error ${frame.code} (rev ${frame.rev}): ${frame.message}`);
       if (!gotResult) {
@@ -275,7 +307,11 @@ async function main(): Promise<void> {
     unix: sockPath,
     socket: {
       open(sock) {
+        // First fetch, then start the steady-poll backstop. Both go through the
+        // same coalescing path so the poll never races a pending query.
+        queryInFlight = true;
         sock.write(encodeFrame(query));
+        pollTimer = setInterval(scheduleRefetch, POLL_MS);
       },
       data(_sock, chunk) {
         let lines: string[];
@@ -292,6 +328,9 @@ async function main(): Promise<void> {
         }
       },
       close() {
+        if (pollTimer) {
+          clearInterval(pollTimer);
+        }
         process.exit(gotResult ? 0 : 1);
       },
       error(_sock, err) {
@@ -307,6 +346,9 @@ async function main(): Promise<void> {
 
   // Clean unsubscribe + exit on Ctrl-C, so the server drops our subscription.
   process.on("SIGINT", () => {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+    }
     try {
       socket.write(encodeFrame({ type: "unsubscribe", id: "frames" }));
       socket.end();
