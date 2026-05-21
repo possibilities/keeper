@@ -23,8 +23,8 @@
  *
  * After every emitted frame a second `...`-fenced note prints two per-pid /tmp
  * paths: the full JSON state the frame was built from (the ordered page rows)
- * and the rendered frame text itself. Both are overwritten each frame (the note
- * carries a frame sequence number) so a frame can be inspected out-of-band.
+ * and the rendered frame text itself. Both are overwritten each frame (always
+ * the most recently printed frame) so a frame can be inspected out-of-band.
  *
  * Like its sibling it reuses `src/protocol.ts` (`encodeFrame` to write,
  * `LineBuffer` to de-frame) and `resolveSockPath()` so it stays a faithful
@@ -175,11 +175,9 @@ async function main(): Promise<void> {
 
   // Per-frame sidecar files: the latest emitted frame is mirrored to /tmp so it
   // can be inspected out-of-band. Per-pid so concurrent runs don't collide;
-  // overwritten each frame (the printed note carries `frameSeq` so you know
-  // which frame the file currently holds).
+  // overwritten each frame (always the most recently printed frame).
   const stateSidecar = `/tmp/keeper-frames.${process.pid}.state.json`;
   const frameSidecar = `/tmp/keeper-frames.${process.pid}.frame.yaml`;
-  let frameSeq = 0;
 
   /**
    * Mirror the just-emitted frame to its two sidecar files and print a
@@ -190,7 +188,6 @@ async function main(): Promise<void> {
    * and never wedges the stream.
    */
   function writeSidecars(frameText: string): void {
-    frameSeq += 1;
     const state = order.map((id) => byId.get(id) ?? { job_id: id });
     try {
       writeFileSync(stateSidecar, `${JSON.stringify(state, null, 2)}\n`);
@@ -199,9 +196,8 @@ async function main(): Promise<void> {
       log(`# warn: sidecar write failed: ${(err as Error).message}`);
     }
     log("...");
-    log(`frame ${frameSeq} sidecars:`);
-    log(`  state: ${stateSidecar}`);
-    log(`  frame: ${frameSidecar}`);
+    log(`state: ${stateSidecar}`);
+    log(`frame: ${frameSidecar}`);
     log("...");
   }
 
