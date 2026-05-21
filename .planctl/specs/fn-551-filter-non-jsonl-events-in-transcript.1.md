@@ -56,5 +56,5 @@ per the worker's testability contract.
       (no read, no emit), driven through the exported pure core.
 - [ ] `bun test --isolate` passes.
 ## Done summary
-
+Filtered non-.jsonl and directory events out of the transcript worker: the subscribe callback now skips any path not ending in .jsonl before stream.onChange, and onChange bails on a non-file path via statSync().isFile(), eliminating EISDIR stderr noise and wasted syscalls on directory change events. Corrected the stale callback comment and added two unit tests asserting non-.jsonl/directory paths produce no read and no emit.
 ## Evidence
