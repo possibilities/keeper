@@ -275,6 +275,19 @@ function titleEvent(title: string, session_id = "sess-a"): number {
   });
 }
 
+/**
+ * A synthetic TranscriptTitle event (priority-3 'transcript' source). Mirrors
+ * what keeperd's main thread inserts when the watcher sees a `custom-title`
+ * line — title carried in `data.session_title`, same field as `titleEvent`.
+ */
+function transcriptTitleEvent(title: string, session_id = "sess-a"): number {
+  return insertEvent({
+    hook_event: "TranscriptTitle",
+    session_id,
+    data: JSON.stringify({ session_title: title }),
+  });
+}
+
 test("first session_title seeds title", () => {
   insertEvent({ hook_event: "SessionStart" });
   titleEvent("foo");
@@ -448,6 +461,103 @@ test("precedence re-folds idempotently: rebuild-from-scratch yields identical (t
   const after = getJob();
   expect(after?.title).toBe("second");
   expect(after?.title_source).toBe("payload");
+});
+
+// ---------------------------------------------------------------------------
+// Transcript title source (priority 3) + transcript_path seed
+// ---------------------------------------------------------------------------
+
+test("TranscriptTitle folds at priority 3, beating payload and spawn", () => {
+  insertEvent({ hook_event: "SessionStart", spawn_name: "spawn-name" });
+  titleEvent("payload-name");
+  transcriptTitleEvent("transcript-name");
+  drainAll();
+  const job = getJob();
+  expect(job?.title).toBe("transcript-name");
+  expect(job?.title_source).toBe("transcript");
+  // The TranscriptTitle event triggers no lifecycle write — state stays at the
+  // last lifecycle event (UserPromptSubmit → working).
+  expect(job?.state).toBe("working");
+});
+
+test("a later payload title does NOT clobber a transcript title", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  transcriptTitleEvent("transcript-name");
+  drainAll();
+  expect(getJob()?.title_source).toBe("transcript");
+  // A payload (priority 2) arriving AFTER the transcript title (priority 3)
+  // with a DIFFERENT value must not write — the persisted source outranks it.
+  titleEvent("stale-payload");
+  drainAll();
+  const job = getJob();
+  expect(job?.title).toBe("transcript-name");
+  expect(job?.title_source).toBe("transcript");
+});
+
+test("transcript re-folds idempotently with synthetic + lifecycle events interleaved", () => {
+  insertEvent({ hook_event: "SessionStart", spawn_name: "seed" });
+  titleEvent("from-prompt");
+  transcriptTitleEvent("from-transcript");
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  const before = getJob();
+  expect(before?.title).toBe("from-transcript");
+  expect(before?.title_source).toBe("transcript");
+  expect(before?.state).toBe("stopped");
+
+  // Rewind + rebuild from scratch — the title MUST come from the event log, not
+  // a direct jobs write, so the rebuild reproduces identical (title, source).
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = getJob();
+  expect(after?.title).toBe("from-transcript");
+  expect(after?.title_source).toBe("transcript");
+  expect(after?.state).toBe("stopped");
+});
+
+function getTranscriptPath(jobId = "sess-a"): string | null {
+  const row = db
+    .query("SELECT transcript_path FROM jobs WHERE job_id = ?")
+    .get(jobId) as { transcript_path: string | null } | null;
+  return row?.transcript_path ?? null;
+}
+
+test("SessionStart seeds transcript_path from event.data", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    data: JSON.stringify({
+      transcript_path: "/home/u/.claude/projects/x.jsonl",
+    }),
+  });
+  drainAll();
+  expect(getTranscriptPath()).toBe("/home/u/.claude/projects/x.jsonl");
+});
+
+test("SessionStart with no transcript_path leaves it NULL", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  drainAll();
+  expect(getTranscriptPath()).toBeNull();
+});
+
+test("SessionStart with malformed data blob leaves transcript_path NULL without throwing", () => {
+  const errors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.join(" "));
+  };
+  try {
+    insertEvent({ hook_event: "SessionStart", data: "{not valid json" });
+    drainAll();
+    expect(getTranscriptPath()).toBeNull();
+    // Row still inserted; reducer did not halt.
+    expect(getJob()?.state).toBe("stopped");
+    expect(errors.some((e) => e.includes("failed to parse data blob"))).toBe(
+      true,
+    );
+  } finally {
+    console.error = originalError;
+  }
 });
 
 // ---------------------------------------------------------------------------

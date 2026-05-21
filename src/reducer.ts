@@ -20,15 +20,20 @@
  *   UserPromptSubmit    | state -> 'working'  (skipped when state == 'ended')
  *   Stop                | state -> 'stopped'  (skipped when state == 'ended')
  *   SessionEnd          | state -> 'ended'    (always; sticky thereafter)
- *   <any with title>    | title -> data.session_title ('payload' source) by
- *                       |   precedence (write iff it outranks/ties+changes)
+ *   <any with title>    | title -> data.session_title by precedence (the
+ *                       |   source is 'transcript' for a TranscriptTitle event,
+ *                       |   else 'payload'; write iff it outranks/ties+changes)
  *   <everything else>   | no jobs write; cursor still advances
  *
  * Terminal `ended` is sticky: once a job is ended, UserPromptSubmit/Stop are
  * no-ops. SessionEnd always lands (idempotently re-asserts 'ended').
  *
- * Title provenance/precedence: NULL=0, 'spawn'=1, 'payload'=2. A higher source
- * wins; a lower one never clobbers a higher one (see {@link TITLE_PRIORITY}).
+ * Title provenance/precedence: NULL=0, 'spawn'=1, 'payload'=2, 'transcript'=3.
+ * A higher source wins; a lower one never clobbers a higher one (see
+ * {@link TITLE_PRIORITY}). The synthetic `TranscriptTitle` event (inserted by
+ * keeperd's main thread, title carried in `data.session_title`) folds at
+ * priority 3 — it triggers no lifecycle write (the `default` branch ignores it)
+ * and flows only through the title rule.
  */
 
 import type { Database } from "bun:sqlite";
@@ -63,10 +68,15 @@ const ENDED = "ended";
  * (`p === pp && value changed`) — so a lower-priority source NEVER clobbers a
  * higher one, and an equal-priority re-fold is a value-only last-write-wins.
  *
- * A future transcript-supplement epic slots in as `3` with no reducer rewrite:
- * it just calls the same precedence write with `source = 'transcript'`.
+ * The transcript-supplement source slots in as `3` with no precedence-write
+ * rewrite — {@link titleSourceForEvent} maps a `TranscriptTitle` event to it
+ * and the same write block promotes the title.
  */
-const TITLE_PRIORITY: Record<string, number> = { spawn: 1, payload: 2 };
+const TITLE_PRIORITY: Record<string, number> = {
+  spawn: 1,
+  payload: 2,
+  transcript: 3,
+};
 
 /** Priority of a persisted/incoming `title_source`; NULL/unknown → 0. */
 function sourcePriority(source: string | null): number {
@@ -104,6 +114,46 @@ function extractSessionTitle(event: Event): string | null {
 }
 
 /**
+ * Resolve the title-source for an event carrying a `session_title`. A synthetic
+ * `TranscriptTitle` event (inserted by keeperd's main thread when the watcher
+ * sees a `custom-title` line) folds at the priority-3 `'transcript'` source;
+ * every other title-bearing event (in practice `UserPromptSubmit`) is the
+ * priority-2 `'payload'` source. Both reuse {@link extractSessionTitle} — the
+ * synthetic event carries its title in the same `data.session_title` field, so
+ * no second extractor exists.
+ */
+function titleSourceForEvent(event: Event): string {
+  return event.hook_event === "TranscriptTitle" ? "transcript" : "payload";
+}
+
+/**
+ * Extract the top-level `transcript_path` from a SessionStart event's `data`
+ * blob. Guarded-parse mirroring {@link extractSessionTitle}: try/catch around
+ * `JSON.parse(event.data)`, skip-and-log on a malformed blob, never throw (the
+ * cursor still advances upstream). Returns the path only when it is a non-empty
+ * absolute string, else `null` — so the SessionStart seed leaves
+ * `jobs.transcript_path` NULL when the payload omits or malforms it.
+ */
+function extractTranscriptPath(event: Event): string | null {
+  if (event.data && event.data.length > 0) {
+    try {
+      const parsed = JSON.parse(event.data) as { transcript_path?: unknown };
+      const path = parsed.transcript_path;
+      if (typeof path === "string" && path.length > 0 && path.startsWith("/")) {
+        return path;
+      }
+    } catch (err) {
+      // Malformed JSON: skip-and-log. The cursor still advances upstream so the
+      // reducer never wedges on one bad row.
+      console.error(
+        `keeper reducer: failed to parse data blob for event id=${event.id} session=${event.session_id}: ${err}`,
+      );
+    }
+  }
+  return null;
+}
+
+/**
  * Apply the jobs-side projection for one event. Runs INSIDE the open
  * transaction opened by {@link applyEvent}; performs zero cursor work.
  *
@@ -126,9 +176,11 @@ function projectJobsRow(db: Database, event: Event): void {
       // payload title rule below) still seeding at the first UserPromptSubmit.
       // On a DUPLICATE SessionStart the OR IGNORE no-ops — the seed only lands
       // on first insert, which is correct (a later higher-priority title is
-      // owned by the precedence rule, never re-seeded here).
+      // owned by the precedence rule, never re-seeded here). The seed also
+      // captures `transcript_path` from the SessionStart payload (guarded parse,
+      // NULL when absent/malformed) — a display/debug column, not a title.
       db.run(
-        "INSERT OR IGNORE INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at, title, title_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at, title, title_source, transcript_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
           jobId,
           ts,
@@ -138,6 +190,7 @@ function projectJobsRow(db: Database, event: Event): void {
           ts,
           event.spawn_name,
           event.spawn_name ? "spawn" : null,
+          extractTranscriptPath(event),
         ],
       );
       break;
@@ -176,12 +229,14 @@ function projectJobsRow(db: Database, event: Event): void {
   }
 
   // Title precedence rule: a `session_title` in the data blob folds into
-  // `jobs.title` as the priority-2 'payload' source, layered on top of any
-  // lifecycle write above. Runs on ANY event and has no `state != 'ended'`
-  // guard (no title-bearing events arrive post-SessionEnd anyway). Tier 1's
-  // 'spawn' source (priority 1) is seeded on the SessionStart insert above, not
-  // here; this rule generalizes the write so a higher-priority source promotes
-  // the title and a lower one never clobbers it.
+  // `jobs.title`, layered on top of any lifecycle write above. The source is
+  // resolved per-event by titleSourceForEvent — 'transcript' (priority 3) for a
+  // synthetic TranscriptTitle event, else 'payload' (priority 2). Runs on ANY
+  // event and has no `state != 'ended'` guard (no title-bearing events arrive
+  // post-SessionEnd anyway). Tier 1's 'spawn' source (priority 1) is seeded on
+  // the SessionStart insert above, not here; this rule generalizes the write so
+  // a higher-priority source promotes the title and a lower one never clobbers
+  // it.
   //
   // Re-fold determinism: the write compares the incoming `(title, source)`
   // against the PERSISTED `(title, title_source)` read in-txn, never an
@@ -190,7 +245,7 @@ function projectJobsRow(db: Database, event: Event): void {
   // (pure function of persisted state). No row → no-op.
   const title = extractSessionTitle(event);
   if (title != null) {
-    const source = "payload";
+    const source = titleSourceForEvent(event);
     const p = sourcePriority(source);
     const row = db
       .query("SELECT title, title_source FROM jobs WHERE job_id = ?")

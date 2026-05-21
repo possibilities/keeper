@@ -24,7 +24,7 @@ import { dirname, join } from "node:path";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -109,7 +109,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_event_id INTEGER,
     updated_at REAL NOT NULL,
     title TEXT,
-    title_source TEXT
+    title_source TEXT,
+    transcript_path TEXT
 )
 `;
 
@@ -273,6 +274,15 @@ function migrate(db: Database): void {
     // Column defs match CREATE_EVENTS / CREATE_JOBS.
     addColumnIfMissing(db, "events", "spawn_name", "TEXT");
     addColumnIfMissing(db, "jobs", "title_source", "TEXT");
+
+    // v4→v5: add `jobs.transcript_path` (the absolute path to the session's
+    // transcript JSONL, seeded from the SessionStart payload's top-level
+    // `transcript_path` field — display/debug only, never sorted/filtered). The
+    // priority-3 'transcript' title source folds from a synthetic
+    // `TranscriptTitle` event (title in `data.session_title`); it needs no new
+    // `events` column. Nullable, no backfill — ADD COLUMN leaves prior rows NULL.
+    // Column def matches CREATE_JOBS.
+    addColumnIfMissing(db, "jobs", "transcript_path", "TEXT");
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -51,10 +51,16 @@ export interface Event {
  * rule. `title_source` records its provenance and drives precedence: NULL =
  * priority 0 (the zero-event reading), `'spawn'` = 1 (seeded at SessionStart
  * from the parent argv `--name`), `'payload'` = 2 (the `UserPromptSubmit`
- * `session_title`). The reducer writes a new title iff the incoming source has a
- * higher priority than the persisted one, or the same priority with a changed
- * value — so a lower-priority source never clobbers a higher one, and the fold
- * stays a pure function of persisted state (re-fold determinism).
+ * `session_title`), `'transcript'` = 3 (the live transcript `custom-title`,
+ * folded from a synthetic `TranscriptTitle` event). The reducer writes a new
+ * title iff the incoming source has a higher priority than the persisted one,
+ * or the same priority with a changed value — so a lower-priority source never
+ * clobbers a higher one, and the fold stays a pure function of persisted state
+ * (re-fold determinism).
+ *
+ * `transcript_path` is the absolute path to the session's transcript JSONL,
+ * seeded once at SessionStart from the event payload (NULL when absent). It is
+ * display/debug only — never sorted or filtered.
  */
 export interface Job {
   job_id: string;
@@ -66,6 +72,7 @@ export interface Job {
   updated_at: number;
   title: string | null;
   title_source: string | null;
+  transcript_path: string | null;
 }
 
 /**

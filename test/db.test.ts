@@ -162,7 +162,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("4");
+  expect(row.value).toBe("5");
   db.close();
 });
 
@@ -260,12 +260,14 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   );
   v3.close();
 
-  // Reopen via openDb — migrate() runs the v3→v4 idempotent ADD COLUMNs.
+  // Reopen via openDb — migrate() runs the v3→v4 idempotent ADD COLUMNs (and on
+  // through v5: the ALTER block isn't version-gated, so a v3 DB converges
+  // straight to the current schema, stamping the current version).
   const { db } = openDb(dbPath);
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("4");
+  expect(ver.value).toBe("5");
 
   const eventNames = (
     db.prepare("PRAGMA table_info(events)").all() as {
@@ -300,13 +302,97 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   expect(job.title_source).toBeNull();
   expect(job.last_event_id).toBe(5);
 
-  // Second open is idempotent — the ADD COLUMNs no-op on the now-v4 shape.
+  // Second open is idempotent — the ADD COLUMNs no-op on the now-current shape.
   db.close();
   const { db: db2 } = openDb(dbPath);
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("4");
+  expect(ver2.value).toBe("5");
+  db2.close();
+});
+
+test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", () => {
+  // Build a v4-shaped DB by hand: jobs with title_source but no
+  // transcript_path, version '4'.
+  const v4 = new Database(dbPath, { create: true });
+  v4.exec(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      session_id TEXT NOT NULL,
+      pid INTEGER,
+      hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      tool_name TEXT,
+      matcher TEXT,
+      cwd TEXT,
+      permission_mode TEXT,
+      agent_id TEXT,
+      agent_type TEXT,
+      stop_hook_active INTEGER,
+      data TEXT NOT NULL,
+      subagent_agent_id TEXT,
+      spawn_name TEXT
+    )
+  `);
+  v4.exec(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_source TEXT
+    )
+  `);
+  v4.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v4.exec("INSERT INTO meta (key, value) VALUES ('schema_version', '4')");
+  v4.exec(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title, title_source) VALUES ('old', 1, 5, 1, 'fix-osc', 'payload')",
+  );
+  v4.close();
+
+  // Reopen via openDb — migrate() runs the v4→v5 idempotent ADD COLUMN.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("5");
+
+  const jobNames = (
+    db.prepare("PRAGMA table_info(jobs)").all() as {
+      name: string;
+    }[]
+  ).map((c) => c.name);
+  expect(jobNames).toContain("transcript_path");
+
+  // Existing rows gain the new column reading NULL; prior data is intact.
+  const job = db
+    .prepare(
+      "SELECT title, title_source, transcript_path, last_event_id FROM jobs WHERE job_id = 'old'",
+    )
+    .get() as {
+    title: string | null;
+    title_source: string | null;
+    transcript_path: string | null;
+    last_event_id: number;
+  };
+  expect(job.title).toBe("fix-osc");
+  expect(job.title_source).toBe("payload");
+  expect(job.transcript_path).toBeNull();
+  expect(job.last_event_id).toBe(5);
+
+  // Second open is idempotent — the ADD COLUMN no-ops on the now-v5 shape.
+  db.close();
+  const { db: db2 } = openDb(dbPath);
+  const ver2 = db2
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver2.value).toBe("5");
   db2.close();
 });
 
@@ -335,13 +421,13 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   v2.close();
 
   // Reopen via openDb — migrate() runs the v2→v3 column drops (and on through
-  // v4: the idempotent ALTER block is not version-gated, so a stale v2 DB
+  // v5: the idempotent ALTER block is not version-gated, so a stale v2 DB
   // converges straight to the current schema in one open).
   const { db } = openDb(dbPath);
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("4");
+  expect(ver.value).toBe("5");
   const names = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
