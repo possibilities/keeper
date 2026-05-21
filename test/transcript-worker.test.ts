@@ -18,6 +18,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import {
   appendFileSync,
+  mkdirSync,
   mkdtempSync,
   rmSync,
   truncateSync,
@@ -205,6 +206,70 @@ test("multi-byte title split across the read boundary does not corrupt (no U+FFF
   // No replacement char crept in.
   expect(emitted[0]?.includes("�")).toBe(false);
   expect(emitted[0]?.includes(emoji)).toBe(true);
+});
+
+test("a directory path reaching onChange returns early: no emit, no read-failure log", () => {
+  // Defensive guard (F1 fix): a directory path that bypasses the callback's
+  // `.jsonl` check must NOT fall through to openSync/readSync — openSync
+  // succeeds on a dir and readSync throws EISDIR, which would log a read
+  // failure. The `statSync(...).isFile()` guard bails first.
+  const dirPath = join(tmpDir, "a-directory");
+  mkdirSync(dirPath);
+  const emitted: string[] = [];
+  const logs: string[] = [];
+  const stream = new TranscriptLineStream(
+    (_s, title) => emitted.push(title),
+    (m) => logs.push(m),
+  );
+
+  // Drive the directory straight through register + onChange (the path the
+  // callback would otherwise hand it). It must produce no read and no emit.
+  stream.register(dirPath);
+  stream.onChange(dirPath);
+
+  expect(emitted).toEqual([]);
+  // No open/read-failure stderr line (EISDIR or otherwise) was logged.
+  expect(logs.some((l) => l.includes("open failed"))).toBe(false);
+  expect(logs.some((l) => l.includes("read failed"))).toBe(false);
+  expect(logs.some((l) => l.includes("EISDIR"))).toBe(false);
+});
+
+test("the callback's .jsonl filter ignores non-jsonl + directory paths (no read, no emit)", () => {
+  // Mirrors the in-callback `ev.path.endsWith(".jsonl")` guard: a non-.jsonl
+  // file and a directory must never reach onChange's read path. We drive the
+  // same predicate the worker callback uses, then assert the pure core stays
+  // untouched for the filtered paths.
+  const emitted: string[] = [];
+  const logs: string[] = [];
+  const stream = new TranscriptLineStream(
+    (_s, title) => emitted.push(title),
+    (m) => logs.push(m),
+  );
+
+  const nonJsonl = join(tmpDir, "notes.txt");
+  writeFileSync(nonJsonl, `${titleLine("sess-x", "ShouldNotEmit")}\n`);
+  const dirPath = join(tmpDir, "subdir");
+  mkdirSync(dirPath);
+  const jsonl = join(tmpDir, "sess-ok.jsonl");
+  writeFileSync(jsonl, "");
+
+  // The worker callback skips any path not ending in `.jsonl` before calling
+  // onChange — replicate that gate here.
+  for (const path of [nonJsonl, dirPath, jsonl]) {
+    if (!path.endsWith(".jsonl")) {
+      continue;
+    }
+    stream.onChange(path);
+  }
+
+  // The non-.jsonl file's title was never read or emitted.
+  expect(emitted).toEqual([]);
+  expect(logs.some((l) => l.includes("failed"))).toBe(false);
+
+  // The .jsonl file still tails normally — append a title and confirm it emits.
+  appendFileSync(jsonl, `${titleLine("sess-ok", "RealTitle")}\n`);
+  stream.onChange(jsonl);
+  expect(emitted).toEqual(["RealTitle"]);
 });
 
 // ---------------------------------------------------------------------------

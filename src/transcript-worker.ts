@@ -222,7 +222,15 @@ export class TranscriptLineStream {
 
     let size: number;
     try {
-      size = statSync(path).size;
+      const st = statSync(path);
+      // Defensive: a directory path that somehow reaches here (e.g. bypassing
+      // the callback's `.jsonl` check) must NOT fall through to openSync —
+      // openSync succeeds on a dir and readSync then throws EISDIR. Bail before
+      // any open/read so no read-failure stderr line is produced.
+      if (!st.isFile()) {
+        return;
+      }
+      size = st.size;
     } catch (err) {
       this.log(
         `[transcript-worker] stat failed for ${path}: ${stringifyErr(err)}`,
@@ -476,8 +484,16 @@ function main(): void {
           }
           for (const ev of events) {
             // Treat every event as "go look" — create/update both tail from the
-            // stored offset; a delete just drops tracking. The path is the
-            // *.jsonl transcript (the ignore glob filters non-jsonl).
+            // stored offset; a delete just drops tracking. The in-callback
+            // `.jsonl` check below (not the ignore glob alone) is what
+            // guarantees only real transcript files reach the per-file tail:
+            // the `ignore` glob does not exclude directory events, so without
+            // this check a directory change would fall through to onChange and
+            // burn statSync/openSync/readSync (readSync → EISDIR stderr noise).
+            // The glob is kept as belt-and-suspenders.
+            if (!ev.path.endsWith(".jsonl")) {
+              continue;
+            }
             if (ev.type === "delete") {
               stream.unregister(ev.path);
               continue;
