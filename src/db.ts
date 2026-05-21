@@ -24,7 +24,7 @@ import { dirname, join } from "node:path";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS events (
     agent_type TEXT,
     stop_hook_active INTEGER,
     data TEXT NOT NULL,
-    subagent_agent_id TEXT
+    subagent_agent_id TEXT,
+    spawn_name TEXT
 )
 `;
 
@@ -107,7 +108,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     state TEXT NOT NULL DEFAULT 'stopped',
     last_event_id INTEGER,
     updated_at REAL NOT NULL,
-    title TEXT
+    title TEXT,
+    title_source TEXT
 )
 `;
 
@@ -204,7 +206,11 @@ function addColumnIfMissing(
  * is a destructive step, but an idempotent one — it converges on the column's
  * actual absence, never re-running and never failing on a second boot.
  */
-function dropColumnIfPresent(db: Database, table: string, column: string): void {
+function dropColumnIfPresent(
+  db: Database,
+  table: string,
+  column: string,
+): void {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as {
     name: string;
   }[];
@@ -259,6 +265,15 @@ function migrate(db: Database): void {
     dropColumnIfPresent(db, "jobs", "mode");
     dropColumnIfPresent(db, "jobs", "title_history");
 
+    // v3→v4: add `events.spawn_name` (the parent claude process's --name/-n
+    // session name, scraped by the hook at SessionStart) and `jobs.title_source`
+    // (title provenance: NULL = priority 0 = zero-event reading, 'spawn' = 1,
+    // 'payload' = 2). Both nullable, no backfill — ADD COLUMN leaves existing
+    // rows reading NULL, which is exactly the zero-event/lowest-priority value.
+    // Column defs match CREATE_EVENTS / CREATE_JOBS.
+    addColumnIfMissing(db, "events", "spawn_name", "TEXT");
+    addColumnIfMissing(db, "jobs", "title_source", "TEXT");
+
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(String(SCHEMA_VERSION));
@@ -277,13 +292,13 @@ function prepareStmts(db: Database): Stmts {
       INSERT INTO events (
         ts, session_id, pid, hook_event, event_type, tool_name, matcher,
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-        subagent_agent_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        subagent_agent_id, spawn_name
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     selectEventsAfter: db.prepare(`
       SELECT id, ts, session_id, pid, hook_event, event_type, tool_name,
              matcher, cwd, permission_mode, agent_id, agent_type,
-             stop_hook_active, data, subagent_agent_id
+             stop_hook_active, data, subagent_agent_id, spawn_name
         FROM events
        WHERE id > ?
        ORDER BY id ASC

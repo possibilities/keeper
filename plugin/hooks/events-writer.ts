@@ -97,6 +97,54 @@ function extractSubagentAgentId(
     : null;
 }
 
+/**
+ * Parse the session spawn name out of a parent-process command line — the
+ * single whitespace-delimited token following `--name=`, `--name `, or `-n `.
+ * Pure + exported so it is unit-testable independent of the `ps` probe.
+ *
+ * The flag must sit on a flag boundary (`(?:^|\s)`) so `--rename foo` /
+ * `--username foo` can't false-match. SINGLE-TOKEN by design (locked decision):
+ * macOS `ps -o args=` space-joins argv and drops shell quoting, so a multi-word
+ * `--name "a b"` is indistinguishable from `--name a` plus a trailing arg —
+ * capturing only the first token is the only unambiguous read. Session names
+ * are compound-word single tokens by convention, so this never bites in
+ * practice. Returns null when no flag is present or the captured token is empty.
+ */
+export function nameFromArgs(args: string): string | null {
+  const m = args.match(/(?:^|\s)(?:--name[= ]|-n )(\S+)/);
+  const token = m?.[1];
+  return token && token.length > 0 ? token : null;
+}
+
+/**
+ * Scrape the spawn name from the parent process's argv via `ps`. SessionStart
+ * only — a `ps` fork on every hook would blow the cold-start/SessionEnd-timeout
+ * budget. Single-level `process.ppid` is correct: the arthack-claude launcher
+ * injects `--name <session>` directly into the immediate parent claude argv.
+ *
+ * The ENTIRE body is wrapped in try/catch returning null because
+ * `Bun.spawnSync` THROWS (ENOENT) when `ps` is missing — a bare `success`
+ * check is insufficient. `-ww` defeats width truncation; an explicit 500ms
+ * timeout means a wedged `ps` can never threaten the hook's exit-0 contract.
+ * Only the parsed name is ever returned — the raw `args=` blob (which can carry
+ * secrets like `--token=...`) is discarded.
+ */
+function spawnNameFromPpid(): string | null {
+  try {
+    const result = Bun.spawnSync(
+      ["ps", "-ww", "-p", String(process.ppid), "-o", "args="],
+      { timeout: 500 },
+    );
+    if (!result.success || result.exitCode !== 0) {
+      return null;
+    }
+    const out = (result.stdout?.toString() ?? "").trim();
+    return nameFromArgs(out);
+  } catch {
+    return null;
+  }
+}
+
 async function main(): Promise<void> {
   const raw = await readStdin();
   const data = JSON.parse(raw) as Record<string, unknown>;
@@ -140,6 +188,13 @@ async function main(): Promise<void> {
 
   const subagentAgentId = extractSubagentAgentId(hookEvent, toolName, data);
 
+  // SessionStart only: scrape the parent claude argv `--name`/`-n` so the
+  // reducer can seed `jobs.title` from the very first event. The `ps` fork is
+  // gated here (not run on every hook) to stay inside the cold-start budget;
+  // `spawnNameFromPpid` swallows every failure to null so it can never break
+  // the exit-0 contract.
+  const spawnName = hookEvent === "SessionStart" ? spawnNameFromPpid() : null;
+
   const { db, stmts } = openDb(resolveDbPath());
   try {
     // BEGIN IMMEDIATE avoids the lock-upgrade SQLITE_BUSY path: a plain BEGIN
@@ -163,6 +218,7 @@ async function main(): Promise<void> {
         stopHookActive,
         raw,
         subagentAgentId,
+        spawnName,
       );
     })();
   } finally {
@@ -174,9 +230,15 @@ async function main(): Promise<void> {
 // is "never block Claude" — a stuck or wedged events-writer that propagates a
 // non-zero exit can fail-closed the user's session, which is far worse than a
 // missing event row.
-main()
-  .then(() => process.exit(0))
-  .catch((err) => {
-    process.stderr.write(`keeper events-writer: ${err}\n`);
-    process.exit(0);
-  });
+//
+// `import.meta.main` gates the run so a plain `import` (tests pulling in the
+// pure, exported `nameFromArgs`) is inert — only direct invocation
+// (`bun plugin/hooks/events-writer.ts`, how Claude Code runs it) executes main.
+if (import.meta.main) {
+  main()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      process.stderr.write(`keeper events-writer: ${err}\n`);
+      process.exit(0);
+    });
+}

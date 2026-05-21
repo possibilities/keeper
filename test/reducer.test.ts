@@ -65,13 +65,14 @@ function insertEvent(
     stop_hook_active: overrides.stop_hook_active ?? null,
     data: overrides.data ?? "{}",
     subagent_agent_id: overrides.subagent_agent_id ?? null,
+    spawn_name: overrides.spawn_name ?? null,
   };
   db.run(
     `INSERT INTO events (
        ts, session_id, pid, hook_event, event_type, tool_name, matcher,
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-       subagent_agent_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       subagent_agent_id, spawn_name
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -87,6 +88,7 @@ function insertEvent(
       row.stop_hook_active,
       row.data,
       row.subagent_agent_id,
+      row.spawn_name,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -105,6 +107,7 @@ function getJob(jobId = "sess-a") {
     last_event_id: number;
     updated_at: number;
     title: string | null;
+    title_source: string | null;
   } | null;
 }
 
@@ -361,6 +364,90 @@ test("title fold re-folds idempotently: draining from scratch yields identical t
   db.run("DELETE FROM jobs");
   drainAll();
   expect(getJob()?.title).toBe("foo");
+});
+
+// ---------------------------------------------------------------------------
+// Title provenance / precedence (spawn_name seed + {spawn:1, payload:2})
+// ---------------------------------------------------------------------------
+
+test("SessionStart with spawn_name seeds title + title_source='spawn'", () => {
+  insertEvent({ hook_event: "SessionStart", spawn_name: "fix-osc" });
+  drainAll();
+  const job = getJob();
+  expect(job?.title).toBe("fix-osc");
+  expect(job?.title_source).toBe("spawn");
+});
+
+test("SessionStart without spawn_name leaves title NULL / title_source NULL", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  drainAll();
+  const job = getJob();
+  expect(job?.title).toBeNull();
+  expect(job?.title_source).toBeNull();
+  // Tier 0 still folds: a later payload title seeds at first UserPromptSubmit.
+  titleEvent("from-payload");
+  drainAll();
+  const after = getJob();
+  expect(after?.title).toBe("from-payload");
+  expect(after?.title_source).toBe("payload");
+});
+
+test("payload title promotes a spawn-seeded title even when the value is identical", () => {
+  // spawn (priority 1) seeds; a payload (priority 2) whose value EQUALS the
+  // spawn name must still write — the priority rose (p > pp), proving the
+  // promotion path independent of value change.
+  insertEvent({ hook_event: "SessionStart", spawn_name: "same-name" });
+  drainAll();
+  expect(getJob()?.title_source).toBe("spawn");
+  titleEvent("same-name");
+  drainAll();
+  const job = getJob();
+  expect(job?.title).toBe("same-name");
+  expect(job?.title_source).toBe("payload");
+});
+
+test("payload title with a different value updates both value and source", () => {
+  insertEvent({ hook_event: "SessionStart", spawn_name: "spawn-name" });
+  drainAll();
+  titleEvent("payload-name");
+  drainAll();
+  const job = getJob();
+  expect(job?.title).toBe("payload-name");
+  expect(job?.title_source).toBe("payload");
+});
+
+test("a spawn-priority source never overwrites a payload title (monotonicity)", () => {
+  // Establish a payload title (priority 2), then fire a DUPLICATE SessionStart
+  // carrying a spawn_name (priority 1). The INSERT OR IGNORE no-ops on the
+  // existing row, so the lower-priority spawn name can't clobber the payload.
+  insertEvent({ hook_event: "SessionStart", spawn_name: "spawn-name" });
+  titleEvent("payload-name");
+  drainAll();
+  expect(getJob()?.title).toBe("payload-name");
+  expect(getJob()?.title_source).toBe("payload");
+
+  insertEvent({ hook_event: "SessionStart", spawn_name: "other-spawn" });
+  drainAll();
+  // Unchanged: spawn (1) cannot beat payload (2).
+  expect(getJob()?.title).toBe("payload-name");
+  expect(getJob()?.title_source).toBe("payload");
+});
+
+test("precedence re-folds idempotently: rebuild-from-scratch yields identical (title, source)", () => {
+  insertEvent({ hook_event: "SessionStart", spawn_name: "seed" });
+  titleEvent("first");
+  titleEvent("second");
+  drainAll();
+  const before = getJob();
+  expect(before?.title).toBe("second");
+  expect(before?.title_source).toBe("payload");
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = getJob();
+  expect(after?.title).toBe("second");
+  expect(after?.title_source).toBe("payload");
 });
 
 // ---------------------------------------------------------------------------

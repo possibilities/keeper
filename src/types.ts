@@ -32,6 +32,13 @@ export interface Event {
   stop_hook_active: number | null;
   data: string;
   subagent_agent_id: string | null;
+  /**
+   * The parent claude process's `--name`/`-n` session name, scraped from its
+   * argv by the hook ONLY on `SessionStart` (NULL on every other event). The
+   * reducer seeds `jobs.title` from it so a row reads a non-NULL title from the
+   * very first event — before the first `UserPromptSubmit` payload title.
+   */
+  spawn_name: string | null;
 }
 
 /**
@@ -41,7 +48,13 @@ export interface Event {
  * `SessionStart` reads correctly before any further events (`title=NULL`).
  *
  * `title` is the live session title, kept up to date by the reducer's title
- * rule (last-write-wins against the persisted value).
+ * rule. `title_source` records its provenance and drives precedence: NULL =
+ * priority 0 (the zero-event reading), `'spawn'` = 1 (seeded at SessionStart
+ * from the parent argv `--name`), `'payload'` = 2 (the `UserPromptSubmit`
+ * `session_title`). The reducer writes a new title iff the incoming source has a
+ * higher priority than the persisted one, or the same priority with a changed
+ * value — so a lower-priority source never clobbers a higher one, and the fold
+ * stays a pure function of persisted state (re-fold determinism).
  */
 export interface Job {
   job_id: string;
@@ -52,6 +65,7 @@ export interface Job {
   last_event_id: number;
   updated_at: number;
   title: string | null;
+  title_source: string | null;
 }
 
 /**

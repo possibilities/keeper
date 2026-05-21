@@ -27,10 +27,15 @@ file is the in-codebase map for AI agents working in the repo.
   - `src/reducer.ts` — the fold. `drain(db, batchSize)` reads unfolded events
     and folds each via `applyEvent`, which wraps the projection write + cursor
     advance in ONE `BEGIN IMMEDIATE` transaction. Exports `DEFAULT_BATCH_SIZE`.
+    Seeds `jobs.title` from `spawn_name` at SessionStart and folds titles by
+    precedence (`{spawn:1, payload:2}`, NULL=0) — a higher-priority source wins,
+    a lower one never clobbers, comparing persisted `(title, title_source)`
+    in-txn for re-fold determinism.
   - `src/db.ts` — schema bootstrap (`events`, `jobs`, `reducer_state`, `meta`),
     connection-local PRAGMAs (`applyPragmas`), prepared statements, and
-    `openDb(path, { readonly })` / `resolveDbPath()`. Owns `SCHEMA_VERSION` and
-    the forward-only `migrate()` block.
+    `openDb(path, { readonly })` / `resolveDbPath()`. Owns `SCHEMA_VERSION`
+    (currently 4: `events.spawn_name` + `jobs.title_source`) and the
+    forward-only `migrate()` block.
   - `src/wake-worker.ts` — Worker thread; own read-only connection polling
     `PRAGMA data_version` at ~50ms, posts contentless `{ kind: "wake" }`
     messages. `isMainThread`-guarded so a plain import is inert.
@@ -66,6 +71,8 @@ file is the in-codebase map for AI agents working in the repo.
     the pk `job_id` for detail-page single-item subscribe). The descriptor is
     the SOLE identifier-injection gate: only its constants are interpolated into
     SQL; wire filter keys are resolved by map lookup, never interpolated.
+    `jobs`'s served `columns` include `title` + `title_source` (read-only
+    display/provenance — both OUT of `sortable`/`filters`).
   - `src/protocol.ts` — the wire protocol: `query` / `result` / `patch` / `meta`
     frame shapes (every frame names a `collection`; `result` / `patch` are
     generic over `Row`; `result` carries `total` — the filtered-set size; `patch`
@@ -78,13 +85,18 @@ file is the in-codebase map for AI agents working in the repo.
 - `plugin/` — the Claude Code hook plugin (symlink target for
   `~/.claude/plugins/keeper`).
   - `plugin/hooks/events-writer.ts` — the hook. Reads the payload on stdin,
-    writes one `events` row, ALWAYS exits 0.
+    writes one `events` row, ALWAYS exits 0. On `SessionStart` ONLY it scrapes
+    the parent claude argv's `--name`/`-n` into `events.spawn_name` via a
+    `Bun.spawnSync(["ps",…])` of `process.ppid` (`spawnNameFromPpid`, wrapped
+    try/catch → null so it never breaks exit-0; the `nameFromArgs` flag parser
+    is exported + unit-tested). `main()` is `import.meta.main`-guarded so a
+    plain import (tests) is inert.
   - `plugin/hooks/hooks.json` — maps every tracked hook event to the writer.
   - `plugin/.claude-plugin/plugin.json` — plugin manifest.
 - `plist/arthack.keeperd.plist` — LaunchAgent template (no install verb; see
   README for the manual symlink + `launchctl bootstrap`).
 - `test/` — `bun test --isolate` suites (db, reducer, wake-worker, daemon,
-  smoke, integration).
+  smoke, integration, events-writer).
 
 ## Module entry points
 
@@ -105,12 +117,20 @@ The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
 `session_id` (== `job_id` in v1):
 
 - `SessionStart` → `INSERT OR IGNORE` a new job row (schema default
-  `state='stopped'` — the zero-event reading).
+  `state='stopped'` — the zero-event reading). Also **seeds the title** from the
+  event's `spawn_name` (the parent claude process's `--name`/`-n`, scraped by
+  the hook): when present, the insert sets `title = spawn_name` /
+  `title_source = 'spawn'` (priority 1); when NULL, `title`/`title_source` stay
+  NULL (priority 0) and Tier 0 below seeds at the first prompt. The OR IGNORE
+  no-ops on a duplicate SessionStart, so the seed lands only on first insert.
 - `UserPromptSubmit` → `state = 'working'` (skipped when already `ended`). Also
-  carries `session_title` in its `data` blob: when present and **different from
-  the persisted `title`**, the reducer `UPDATE`s `title` (last-write-wins
-  against the persisted value). Unchanged title → no write (re-fold determinism:
-  compare against the persisted `title`, not an accumulator). Runs
+  carries `session_title` in its `data` blob — the **priority-2 `'payload'`
+  title source**. The reducer writes by **precedence** (`{spawn:1, payload:2}`,
+  NULL `title_source` = 0): it `UPDATE`s `title` + `title_source` iff the
+  incoming priority outranks the persisted one **or** ties it with a changed
+  value. A lower-priority source never clobbers a higher one. Unchanged
+  same-priority title → no write (re-fold determinism: compare against the
+  persisted `(title, title_source)` read in-txn, not an accumulator). Runs
   event-agnostically (no `ended` guard).
 - `Stop` → `state = 'stopped'` (skipped when already `ended`).
 - `SessionEnd` → `state = 'ended'`, sticky thereafter (always lands).
@@ -119,7 +139,9 @@ The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
 
 `mode` and `title_history` were retired in schema v3 — `events.permission_mode`
 is still recorded, but it is no longer projected into `jobs`, and titles are a
-single live value with no history array.
+single live value with no history array. Schema v4 added `events.spawn_name`
+(the hook's SessionStart spawn-name scrape) and `jobs.title_source` (title
+provenance/precedence), both nullable with no backfill.
 
 ## Event-sourcing invariants
 
@@ -129,8 +151,11 @@ single live value with no history array.
   idempotently. This is the exactly-once-per-event guarantee — never split the
   two writes across transactions.
 - **Defaults match the zero-event projection.** A row inserted by
-  `SessionStart` reads `state='stopped'`, `title=NULL` before any further event.
-  Keep schema defaults and the reducer's no-op branches in sync.
+  `SessionStart` reads `state='stopped'` before any further event; `title` /
+  `title_source` read NULL when the event carried no `spawn_name`, or
+  `spawn_name` / `'spawn'` when it did (the SessionStart seed is the one
+  non-NULL initial title). Keep schema defaults and the reducer's no-op /
+  seed branches in sync.
 - **One drain code path serves boot and steady-state.** `drainToCompletion`
   loops `drain()` until it returns 0; the boot catch-up and every wake use it.
   Do not add a separate boot path.
@@ -181,8 +206,16 @@ single live value with no history array.
   LaunchAgent restarts the single recovery path. Do not respawn either worker
   in-process.
 - **No prise/env-var integration, multi-session lineage, plans/planctl_mutations,
-  name scraping, harness_meta, or transcript tailing** — all explicitly out of
-  scope.
+  harness_meta, or transcript tailing** — all explicitly out of scope.
+- **Name scraping is scoped, not general.** The hook MAY scrape the parent
+  claude process's `--name`/`-n` spawn name via `ps` — but ONLY on
+  `SessionStart`, ONLY single-level `process.ppid` (no PPID-walking), and the
+  result is frozen into the immutable `events.spawn_name` of that one event
+  (the reducer seeds `jobs.title` from it). FORBIDDEN: ongoing/periodic name
+  scraping, scraping on any other hook event, PPID-walking up the process tree,
+  and any multi-session lineage inferred from process names. A future
+  transcript-supplement source is a separate (priority-3) writer in the daemon,
+  not more hook-side scraping.
 
 ## Worker contract
 

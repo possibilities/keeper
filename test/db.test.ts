@@ -162,7 +162,31 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("3");
+  expect(row.value).toBe("4");
+  db.close();
+});
+
+test("events has a nullable spawn_name column; jobs has a nullable title_source column", () => {
+  const { db } = openDb(dbPath);
+  const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
+    name: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const spawnName = eventCols.find((c) => c.name === "spawn_name");
+  expect(spawnName).toBeDefined();
+  expect(spawnName?.notnull).toBe(0);
+  expect(spawnName?.dflt_value).toBeNull();
+
+  const jobCols = db.prepare("PRAGMA table_info(jobs)").all() as {
+    name: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const titleSource = jobCols.find((c) => c.name === "title_source");
+  expect(titleSource).toBeDefined();
+  expect(titleSource?.notnull).toBe(0);
+  expect(titleSource?.dflt_value).toBeNull();
   db.close();
 });
 
@@ -184,14 +208,109 @@ test("jobs has a nullable title column and no mode/title_history columns", () =>
   db.prepare(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('z', 1, 0, 1)",
   ).run();
-  const r = db
-    .prepare("SELECT title FROM jobs WHERE job_id = 'z'")
-    .get() as { title: string | null };
+  const r = db.prepare("SELECT title FROM jobs WHERE job_id = 'z'").get() as {
+    title: string | null;
+  };
   expect(r.title).toBeNull();
   db.close();
 });
 
-test("v2 DB migrates to v3: mode + title_history dropped, title preserved", () => {
+test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL", () => {
+  // Build a v3-shaped DB by hand: events without spawn_name, jobs without
+  // title_source, version '3'.
+  const v3 = new Database(dbPath, { create: true });
+  v3.exec(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      session_id TEXT NOT NULL,
+      pid INTEGER,
+      hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      tool_name TEXT,
+      matcher TEXT,
+      cwd TEXT,
+      permission_mode TEXT,
+      agent_id TEXT,
+      agent_type TEXT,
+      stop_hook_active INTEGER,
+      data TEXT NOT NULL,
+      subagent_agent_id TEXT
+    )
+  `);
+  v3.exec(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT
+    )
+  `);
+  v3.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v3.exec("INSERT INTO meta (key, value) VALUES ('schema_version', '3')");
+  v3.exec(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (1, 'sess', 'SessionStart', 'session_start', '{}')",
+  );
+  v3.exec(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title) VALUES ('old', 1, 5, 1, 'fix-osc')",
+  );
+  v3.close();
+
+  // Reopen via openDb — migrate() runs the v3→v4 idempotent ADD COLUMNs.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("4");
+
+  const eventNames = (
+    db.prepare("PRAGMA table_info(events)").all() as {
+      name: string;
+    }[]
+  ).map((c) => c.name);
+  expect(eventNames).toContain("spawn_name");
+  const jobNames = (
+    db.prepare("PRAGMA table_info(jobs)").all() as {
+      name: string;
+    }[]
+  ).map((c) => c.name);
+  expect(jobNames).toContain("title_source");
+
+  // Existing rows gain the new columns reading NULL; prior data is intact.
+  const ev = db
+    .prepare(
+      "SELECT session_id, spawn_name FROM events WHERE session_id = 'sess'",
+    )
+    .get() as { session_id: string; spawn_name: string | null };
+  expect(ev.spawn_name).toBeNull();
+  const job = db
+    .prepare(
+      "SELECT title, title_source, last_event_id FROM jobs WHERE job_id = 'old'",
+    )
+    .get() as {
+    title: string | null;
+    title_source: string | null;
+    last_event_id: number;
+  };
+  expect(job.title).toBe("fix-osc");
+  expect(job.title_source).toBeNull();
+  expect(job.last_event_id).toBe(5);
+
+  // Second open is idempotent — the ADD COLUMNs no-op on the now-v4 shape.
+  db.close();
+  const { db: db2 } = openDb(dbPath);
+  const ver2 = db2
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver2.value).toBe("4");
+  db2.close();
+});
+
+test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   // Build a v2-shaped DB by hand: mode + title + title_history, version '2'.
   const v2 = new Database(dbPath, { create: true });
   v2.exec(`
@@ -215,20 +334,26 @@ test("v2 DB migrates to v3: mode + title_history dropped, title preserved", () =
   );
   v2.close();
 
-  // Reopen via openDb — migrate() runs the v2→v3 column drops.
+  // Reopen via openDb — migrate() runs the v2→v3 column drops (and on through
+  // v4: the idempotent ALTER block is not version-gated, so a stale v2 DB
+  // converges straight to the current schema in one open).
   const { db } = openDb(dbPath);
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("3");
-  const names = (db.prepare("PRAGMA table_info(jobs)").all() as {
-    name: string;
-  }[]).map((c) => c.name);
+  expect(ver.value).toBe("4");
+  const names = (
+    db.prepare("PRAGMA table_info(jobs)").all() as {
+      name: string;
+    }[]
+  ).map((c) => c.name);
   expect(names).not.toContain("mode");
   expect(names).not.toContain("title_history");
   // The live title survives the drop; the rest of the row is intact.
   const row = db
-    .prepare("SELECT title, state, last_event_id FROM jobs WHERE job_id = 'old'")
+    .prepare(
+      "SELECT title, state, last_event_id FROM jobs WHERE job_id = 'old'",
+    )
     .get() as { title: string | null; state: string; last_event_id: number };
   expect(row.title).toBe("fix-osc");
   expect(row.last_event_id).toBe(5);

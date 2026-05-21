@@ -78,6 +78,7 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "last_event_id",
     "updated_at",
     "title",
+    "title_source",
   ],
   pk: "job_id",
   version: "last_event_id",
@@ -90,9 +91,11 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
   ]),
   defaultSort: { column: "updated_at", dir: "desc" },
   filters: { state: "state", cwd: "cwd", job_id: "job_id" },
-  // `title` is read-only display this phase — NOT in `sortable`/`filters`. No
-  // JSON-TEXT columns are served today (`title_history` was retired), so
-  // `decodeRow` short-circuits on the empty set.
+  // `title` + `title_source` are read-only display this phase — served on
+  // `result`/`patch` (the latter for provenance debugging) but NOT in
+  // `sortable`/`filters`. No JSON-TEXT columns are served today
+  // (`title_history` was retired), so `decodeRow` short-circuits on the empty
+  // set.
   jsonColumns: new Set([]),
 };
 

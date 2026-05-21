@@ -7,7 +7,9 @@ TypeScript hook plugin writes one row per Claude Code hook invocation into a
 SQLite `events` table — the durable, append-only log. A long-running Bun daemon
 (`keeperd`, managed by a macOS LaunchAgent) tails that table and folds new
 events into a minimal `jobs` projection: one row per session, carrying the live
-`state` (`working` / `stopped` / `ended`) and a human-readable `title`.
+`state` (`working` / `stopped` / `ended`) and a human-readable `title` (seeded
+from the session's spawn name at SessionStart, with a `title_source` recording
+its provenance).
 
 The architecture is deliberately small. Keeper is built on Bun + `bun:sqlite`
 with zero third-party runtime dependencies. The daemon detects new events by
@@ -48,7 +50,12 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   nudge ("re-query if you care"), not a live insert/remove/reorder feed.
 - **No UI** — `sqlite3` is the inspection surface.
 - **No multi-machine** — single host, single DB file.
-- **No name scraping, no transcript tailing** — keeper reads hook payloads only.
+- **No general name scraping, no transcript tailing** — keeper reads hook
+  payloads only, with one scoped exception: on `SessionStart` the hook scrapes
+  the parent claude process's `--name`/`-n` spawn name (via a single `ps` of its
+  immediate parent) so a job row reads a non-NULL `title` from the first event.
+  That capture is one-shot, in-hook, and frozen into the event; ongoing/periodic
+  scraping, PPID-walking, and transcript tailing all remain out.
 - **No plans / planctl_mutations** — keeper does not track planctl state.
 - **No multi-session-per-job lineage** — v1 holds `job_id === session_id` (one
   session per job).
@@ -169,9 +176,9 @@ list, see [CLAUDE.md](./CLAUDE.md).
 ## Inspect
 
 ```sh
-# Recent jobs:
+# Recent jobs (title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt):
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT job_id, state, title, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
+  'SELECT job_id, state, title, title_source, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
 
 # Raw event log tail:
 sqlite3 ~/.local/state/keeper/keeper.db \

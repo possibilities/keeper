@@ -15,15 +15,20 @@
  *
  *   event.hook_event   | jobs action
  *   -------------------|------------------------------------------------------
- *   SessionStart        | INSERT OR IGNORE a new job row
+ *   SessionStart        | INSERT OR IGNORE a new job row; seed title from
+ *                       |   spawn_name ('spawn' source) when present
  *   UserPromptSubmit    | state -> 'working'  (skipped when state == 'ended')
  *   Stop                | state -> 'stopped'  (skipped when state == 'ended')
  *   SessionEnd          | state -> 'ended'    (always; sticky thereafter)
- *   <any with title>    | title -> data.session_title (when changed)
+ *   <any with title>    | title -> data.session_title ('payload' source) by
+ *                       |   precedence (write iff it outranks/ties+changes)
  *   <everything else>   | no jobs write; cursor still advances
  *
  * Terminal `ended` is sticky: once a job is ended, UserPromptSubmit/Stop are
  * no-ops. SessionEnd always lands (idempotently re-asserts 'ended').
+ *
+ * Title provenance/precedence: NULL=0, 'spawn'=1, 'payload'=2. A higher source
+ * wins; a lower one never clobbers a higher one (see {@link TITLE_PRIORITY}).
  */
 
 import type { Database } from "bun:sqlite";
@@ -49,6 +54,24 @@ export interface ApplyEventOptions {
 
 /** Terminal job state. Once reached, only SessionEnd re-asserts it. */
 const ENDED = "ended";
+
+/**
+ * Title-source precedence. A higher number wins. NULL `title_source` (the
+ * zero-event reading, no title written yet) maps to priority 0 via
+ * {@link sourcePriority}. The reducer writes a new title iff the incoming
+ * source outranks the persisted one (`p > pp`) OR ties it with a changed value
+ * (`p === pp && value changed`) — so a lower-priority source NEVER clobbers a
+ * higher one, and an equal-priority re-fold is a value-only last-write-wins.
+ *
+ * A future transcript-supplement epic slots in as `3` with no reducer rewrite:
+ * it just calls the same precedence write with `source = 'transcript'`.
+ */
+const TITLE_PRIORITY: Record<string, number> = { spawn: 1, payload: 2 };
+
+/** Priority of a persisted/incoming `title_source`; NULL/unknown → 0. */
+function sourcePriority(source: string | null): number {
+  return source != null ? (TITLE_PRIORITY[source] ?? 0) : 0;
+}
 
 /**
  * Extract the top-level `session_title` from an event's `data` blob. try/catch
@@ -96,10 +119,26 @@ function projectJobsRow(db: Database, event: Event): void {
   switch (event.hook_event) {
     case "SessionStart":
       // New job (or duplicate SessionStart): INSERT OR IGNORE. The schema
-      // default gives state='stopped' — the zero-event reading.
+      // default gives state='stopped' — the zero-event reading. Seed the title
+      // from the scraped spawn name (priority-1 'spawn' source) so the row
+      // reads a non-NULL title from the very first event; a NULL spawn_name
+      // leaves title NULL / title_source NULL (priority 0), with Tier 0 (the
+      // payload title rule below) still seeding at the first UserPromptSubmit.
+      // On a DUPLICATE SessionStart the OR IGNORE no-ops — the seed only lands
+      // on first insert, which is correct (a later higher-priority title is
+      // owned by the precedence rule, never re-seeded here).
       db.run(
-        "INSERT OR IGNORE INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        [jobId, ts, event.cwd, event.pid, event.id, ts],
+        "INSERT OR IGNORE INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at, title, title_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+          jobId,
+          ts,
+          event.cwd,
+          event.pid,
+          event.id,
+          ts,
+          event.spawn_name,
+          event.spawn_name ? "spawn" : null,
+        ],
       );
       break;
 
@@ -136,25 +175,37 @@ function projectJobsRow(db: Database, event: Event): void {
       break;
   }
 
-  // Title rule: a `session_title` in the data blob folds into `jobs.title`,
-  // layered on top of any lifecycle write above. Runs on ANY event and has no
-  // `state != 'ended'` guard (no title-bearing events arrive post-SessionEnd
-  // anyway).
+  // Title precedence rule: a `session_title` in the data blob folds into
+  // `jobs.title` as the priority-2 'payload' source, layered on top of any
+  // lifecycle write above. Runs on ANY event and has no `state != 'ended'`
+  // guard (no title-bearing events arrive post-SessionEnd anyway). Tier 1's
+  // 'spawn' source (priority 1) is seeded on the SessionStart insert above, not
+  // here; this rule generalizes the write so a higher-priority source promotes
+  // the title and a lower one never clobbers it.
   //
-  // Re-fold determinism: the write compares the incoming title against the
-  // PERSISTED `title` (read in-txn), never an accumulator. When the title is
-  // unchanged we skip the write entirely (no `last_event_id` bump) — so a
-  // rebuild-from-scratch is identical. No row → no-op.
+  // Re-fold determinism: the write compares the incoming `(title, source)`
+  // against the PERSISTED `(title, title_source)` read in-txn, never an
+  // accumulator. We write iff the incoming priority outranks the persisted one,
+  // or ties it with a changed value — so a rebuild-from-scratch is identical
+  // (pure function of persisted state). No row → no-op.
   const title = extractSessionTitle(event);
   if (title != null) {
+    const source = "payload";
+    const p = sourcePriority(source);
     const row = db
-      .query("SELECT title FROM jobs WHERE job_id = ?")
-      .get(jobId) as { title: string | null } | null;
-    if (row != null && row.title !== title) {
-      db.run(
-        "UPDATE jobs SET title = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
-        [title, event.id, ts, jobId],
-      );
+      .query("SELECT title, title_source FROM jobs WHERE job_id = ?")
+      .get(jobId) as {
+      title: string | null;
+      title_source: string | null;
+    } | null;
+    if (row != null) {
+      const pp = sourcePriority(row.title_source);
+      if (p > pp || (p === pp && row.title !== title)) {
+        db.run(
+          "UPDATE jobs SET title = ?, title_source = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
+          [title, source, event.id, ts, jobId],
+        );
+      }
     }
   }
 }
@@ -210,7 +261,7 @@ export function drain(db: Database, batchSize = DEFAULT_BATCH_SIZE): number {
     .query(
       `SELECT id, ts, session_id, pid, hook_event, event_type, tool_name,
               matcher, cwd, permission_mode, agent_id, agent_type,
-              stop_hook_active, data, subagent_agent_id
+              stop_hook_active, data, subagent_agent_id, spawn_name
          FROM events
         WHERE id > ?
         ORDER BY id ASC
