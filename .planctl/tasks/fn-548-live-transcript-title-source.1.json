@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-21T18:09:15Z",
+  "depends_on": [],
+  "epic": "fn-548-live-transcript-title-source",
+  "id": "fn-548-live-transcript-title-source.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Fold foundation: schema v5 + transcript precedence",
+  "updated_at": "2026-05-21T18:09:15Z"
+}
