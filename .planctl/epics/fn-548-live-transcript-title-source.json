@@ -1,4 +1,5 @@
 {
+  "auditor_done_at": "2026-05-21T19:43:09Z",
   "branch_name": "fn-548-live-transcript-title-source",
   "bundles": [],
   "closer_done_at": "2026-05-21T19:28:09Z",
@@ -15,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-21T19:28:09Z"
+  "updated_at": "2026-05-21T19:43:09Z"
 }
