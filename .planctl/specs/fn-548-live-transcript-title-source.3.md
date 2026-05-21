@@ -60,5 +60,5 @@ Docs-only; no automated tests. Verify the fence carve-out reads unambiguously an
 - [ ] AGENTS.md still resolves to CLAUDE.md (symlink intact)
 
 ## Done summary
-
+Documented the transcript title source (priority 3) across CLAUDE.md, README.md, and the plist: narrowed the kernel-watcher and transcript-tailing DO-NOT fences with an external-transcript carve-out (SQLite-DB prohibition preserved), documented the @parcel/watcher first runtime dep, the transcript-worker producer archetype + synthetic TranscriptTitle event, SCHEMA_VERSION 5 + jobs.transcript_path, and the deploy-env node_modules requirement.
 ## Evidence
