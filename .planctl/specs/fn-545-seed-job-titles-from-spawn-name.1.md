@@ -63,5 +63,5 @@ Make `jobs.title` correct as early as SessionStart by seeding it from the sessio
 - [ ] `bun test --isolate` passes, including new `nameFromArgs` unit, db v3→v4 migration, reducer precedence (seed/promotion/monotonicity/re-fold), and hook spawn_name cases.
 
 ## Done summary
-
+Seed jobs.title from the parent claude --name/-n spawn name at SessionStart (events.spawn_name, scraped via ps in the hook, SessionStart-only, exit-0-safe) and add a title-provenance precedence model (jobs.title_source: NULL=0, spawn=1, payload=2; write iff incoming priority outranks or ties+changes, comparing persisted state in-txn). Schema v3->v4 adds both nullable columns idempotently. title_source served on the jobs read surface; docs (CLAUDE.md DO-NOT fence narrowed, README) updated.
 ## Evidence
