@@ -358,6 +358,70 @@ test("scanRoot: a file changed between boot and recovery emits exactly its delta
 });
 
 // ---------------------------------------------------------------------------
+// (a'') Recursive boot scan — plan files live at <root>/<project>/.planctl/…,
+// not at <root>/.planctl. The boot scan must recurse (the live watcher does) or
+// pre-existing files are only ever folded via a live write. Heavy dirs are
+// pruned so a broad root stays cheap.
+// ---------------------------------------------------------------------------
+
+test("scanRoot: discovers .planctl nested under a project subdir", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  // The real layout: <root>/<project>/.planctl/{epics,tasks}/*.json — NOT a
+  // .planctl directly under the watched root.
+  const proj = join(tmpDir, "myproject");
+  mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
+  mkdirSync(join(proj, ".planctl", "tasks"), { recursive: true });
+  writeFileSync(
+    join(proj, ".planctl", "epics", "fn-9-nested.json"),
+    JSON.stringify({ id: "fn-9-nested", title: "Nested", status: "open" }),
+  );
+  writeFileSync(
+    join(proj, ".planctl", "tasks", "fn-9-nested.1.json"),
+    JSON.stringify({ id: "fn-9-nested.1", epic: "fn-9-nested", title: "T" }),
+  );
+
+  scanRoot(tmpDir, scanner);
+  expect(emitted.map((m) => m.id).sort()).toEqual([
+    "fn-9-nested",
+    "fn-9-nested.1",
+  ]);
+});
+
+test("scanRoot: prunes node_modules/.git so their .planctl trees are skipped", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  // A stray .planctl buried inside node_modules must NOT be scanned — pruning
+  // is what keeps a broad root (~/code) cheap and avoids vendored noise.
+  for (const heavy of ["node_modules", ".git"]) {
+    const dir = join(tmpDir, heavy, "pkg", ".planctl", "epics");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "fn-666-vendored.json"),
+      JSON.stringify({ id: "fn-666-vendored", title: "Nope", status: "open" }),
+    );
+  }
+  // A real project alongside them IS found.
+  const dir = join(tmpDir, "real", ".planctl", "epics");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "fn-7-real.json"),
+    JSON.stringify({ id: "fn-7-real", title: "Real", status: "open" }),
+  );
+
+  scanRoot(tmpDir, scanner);
+  expect(emitted.map((m) => m.id)).toEqual(["fn-7-real"]);
+});
+
+// ---------------------------------------------------------------------------
 // (b) Native addon smoke test
 // ---------------------------------------------------------------------------
 

@@ -51,7 +51,13 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  type Dirent,
+  existsSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
 import { join, sep } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
@@ -134,6 +140,26 @@ const IGNORE_GLOBS = [
   "**/.venv/**",
   "**/*.tmp",
 ];
+
+/**
+ * Directory basenames the boot scan prunes — the recursive-walk equivalent of
+ * {@link IGNORE_GLOBS}. The live `@parcel/watcher` subscribe is recursive, so
+ * the boot scan must recurse too (plan files live at
+ * `<root>/<project>/.planctl/…`, NOT at `<root>/.planctl/…`); without pruning,
+ * that walk would descend into every `node_modules`/`.git` under a broad root
+ * like `~/code` (tens of thousands of dirs). Basename match mirrors the glob
+ * set (the `*.tmp` file glob has no directory equivalent).
+ */
+const PRUNE_DIRS = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  ".next",
+  ".cache",
+  "target",
+  ".venv",
+]);
 
 /** Which `.planctl` collection a path belongs to (or none). */
 type PlanKind = "epic" | "task";
@@ -391,26 +417,63 @@ function stringifyErr(err: unknown): string {
 }
 
 /**
- * Boot scan: enumerate existing `.planctl/{epics,tasks}/*.json` files under
- * `root` and run each through the scanner. Called once after each subscribe
- * resolves so files that pre-existed the daemon's boot (or were changed while
- * keeperd was down) are picked up without waiting for a watcher event. The
- * change-gate in PlanScanner suppresses re-emits for files that already match
- * the seeded projection row. Exported for unit reach.
+ * Boot scan: recursively walk `root` for `.planctl/{epics,tasks}/*.json` files
+ * and run each through the scanner. Called once after each subscribe resolves so
+ * files that pre-existed the daemon's boot (or were changed while keeperd was
+ * down) are picked up without waiting for a watcher event. The change-gate in
+ * PlanScanner suppresses re-emits for files that already match the seeded
+ * projection row. Exported for unit reach.
+ *
+ * The walk MUST recurse: the live `@parcel/watcher` subscribe is recursive, and
+ * plan files live at `<root>/<project>/.planctl/…` — there is no `.planctl` at
+ * the root itself. A non-recursive scan finds nothing under a broad root, so
+ * only files touched while keeperd is live would ever enter the projection.
+ * {@link PRUNE_DIRS} keeps the walk cheap (skips `node_modules`/`.git`/… under a
+ * big root); a `.planctl` dir is scanned but NOT descended into; symlinked
+ * directories are not followed (`Dirent.isDirectory()` is false for a symlink),
+ * so a symlink cycle can't trap the walk.
  */
 export function scanRoot(root: string, scanner: PlanScanner): void {
-  for (const collection of ["epics", "tasks"]) {
-    const dir = join(root, ".planctl", collection);
-    if (!existsSync(dir)) {
-      continue;
-    }
-    let names: string[];
+  const stack: string[] = [root];
+  while (stack.length > 0) {
+    // biome-ignore lint/style/noNonNullAssertion: guarded by stack.length > 0
+    const dir = stack.pop()!;
+    let entries: Dirent[];
     try {
-      names = readdirSync(dir);
+      entries = readdirSync(dir, { withFileTypes: true });
     } catch (err) {
       console.error(
         `[plan-worker] boot scan failed to read ${dir}: ${stringifyErr(err)}`,
       );
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || PRUNE_DIRS.has(entry.name)) {
+        continue;
+      }
+      const full = join(dir, entry.name);
+      if (entry.name === ".planctl") {
+        scanPlanctlDir(full, scanner);
+        continue; // a `.planctl` tree has no nested `.planctl` to find
+      }
+      stack.push(full);
+    }
+  }
+}
+
+/**
+ * Enumerate one `.planctl` dir's `epics/` + `tasks/` `*.json` files and run each
+ * through the scanner. A missing `epics/` or `tasks/` subdir is fine (skip). The
+ * change-gate handles re-emit suppression.
+ */
+function scanPlanctlDir(planctlDir: string, scanner: PlanScanner): void {
+  for (const collection of ["epics", "tasks"]) {
+    const dir = join(planctlDir, collection);
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      // No epics/ or tasks/ subdir under this .planctl — nothing to scan.
       continue;
     }
     for (const name of names) {
