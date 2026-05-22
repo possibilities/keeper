@@ -116,11 +116,13 @@ Usage: bun scripts/keeper-frames.ts [--collection <name>] [--sock <path>]
   --help           Show this help
 
 Renders a 10-row page of the chosen collection as a YAML stream: one frame per
-change, each frame a YAML document (--- separated) of collapsed row strings. The
-render is collection-appropriate:
-  jobs  → {basename(cwd)} · {title} · {state}
-  epics → {basename(project_dir)} · #{epic_number} · {title} · {status}
-The epics page renders each epic's embedded tasks array as a flow sequence.
+change, each frame a YAML document (--- separated). The render is
+collection-appropriate:
+  jobs  → a flat sequence of: {basename(cwd)} · {title} · {state}
+  epics → a sequence of epic:/tasks: mapping blocks, where each epic line is
+          {basename(project_dir)} · #{epic_number} · {title} · {status}
+          and its embedded tasks list under tasks: as
+          {basename(target_repo)} · #{task_number} · {title} · {status}
 The page is refetched on every change signal and on a steady poll, so it always
 shows the current top-N; a new frame prints only when the rendered output
 changes. Every emitted frame is also mirrored to two /tmp sidecar files (full
@@ -251,37 +253,78 @@ async function main(): Promise<void> {
   let attempt = 0;
   let shuttingDown = false;
 
+  const seg = (v: unknown) => (v == null ? "" : String(v));
+
   /**
    * Collapse one full row to its display string, collection-aware:
    *   jobs  → `{basename(cwd)} · {title} · {state}`
-   *   epics → `{basename(project_dir)} · #{epic_number} · {title} · {status} · {N tasks}`
-   * A null/absent segment projects to empty (no basename of nothing). The epics
-   * line surfaces the embedded `tasks` array's length so a task add/remove (the
-   * array splice that bumps the epic's `last_event_id`) reframes the page. This
-   * is the SOLE place a row's columns are read for display — so it alone defines
-   * which column moves can reframe (see `emitFrameIfChanged`).
+   *   epics → `{basename(project_dir)} · #{epic_number} · {title} · {status}`
+   * A null/absent segment projects to empty (no basename of nothing). The epic
+   * line drops the task count — the embedded tasks render as their own nested
+   * sequence (see `projectTask` / `renderBody`). Together with `projectTask`,
+   * this defines which column moves can reframe the page (see
+   * `emitFrameIfChanged`).
    */
   function projectRow(row: Record<string, unknown>): string {
-    const seg = (v: unknown) => (v == null ? "" : String(v));
     const title = seg(row.title);
     if (collection === "epics") {
       const dir =
         row.project_dir == null ? "" : basename(String(row.project_dir));
-      const taskCount = Array.isArray(row.tasks) ? row.tasks.length : 0;
-      return `${dir} · #${seg(row.epic_number)} · ${title} · ${seg(row.status)} · ${taskCount} tasks`;
+      return `${dir} · #${seg(row.epic_number)} · ${title} · ${seg(row.status)}`;
     }
     const cwd = row.cwd == null ? "" : basename(String(row.cwd));
     return `${cwd} · ${title} · ${seg(row.state)}`;
   }
 
   /**
-   * Project the frozen page into a YAML document body (no leading `---`): a flat
-   * sequence of one collapsed string per row (see `projectRow`), in server-sent
-   * order. Strings carrying `·` auto-single-quote through `yamlScalar`.
+   * Collapse one embedded epic task to its display string, mirroring the epic
+   * line shape: `{basename(target_repo)} · #{task_number} · {title} · {status}`.
+   * A null/absent segment projects to empty. Read alongside `projectRow` so a
+   * task title/status/membership move surfaces in the frame and reframes.
+   */
+  function projectTask(task: Record<string, unknown>): string {
+    const repo =
+      task.target_repo == null ? "" : basename(String(task.target_repo));
+    return `${repo} · #${seg(task.task_number)} · ${seg(task.title)} · ${seg(task.status)}`;
+  }
+
+  /**
+   * Render one epic as a YAML mapping block: the collapsed epic line under an
+   * `epic:` key, then its embedded tasks as a nested block sequence under
+   * `tasks:` (or `tasks: []` when empty). `tasks` is a decoded array on the wire
+   * (see `decodeRow`); a non-array (malformed) cell renders as no tasks.
+   */
+  function renderEpicItem(row: Record<string, unknown>): string {
+    const lines = [`- epic: ${yamlScalar(projectRow(row))}`];
+    const tasks = Array.isArray(row.tasks) ? row.tasks : [];
+    if (tasks.length === 0) {
+      lines.push("  tasks: []");
+    } else {
+      lines.push("  tasks:");
+      for (const task of tasks) {
+        lines.push(
+          `    - ${yamlScalar(projectTask(task as Record<string, unknown>))}`,
+        );
+      }
+    }
+    return lines.join("\n");
+  }
+
+  /**
+   * Project the frozen page into a YAML document body (no leading `---`), in
+   * server-sent order. Jobs render as a flat sequence of one collapsed string
+   * per row; epics render as a sequence of `epic:`/`tasks:` mapping blocks (see
+   * `renderEpicItem`) so each epic's embedded tasks are listed. Strings carrying
+   * `·` auto-single-quote through `yamlScalar`.
    */
   function renderBody(): string {
     if (order.length === 0) {
       return "[]"; // empty page → an empty YAML sequence
+    }
+    if (collection === "epics") {
+      return order
+        .map((id) => renderEpicItem(byId.get(id) ?? { [pk]: id }))
+        .join("\n");
     }
     return order
       .map((id) => `- ${yamlScalar(projectRow(byId.get(id) ?? { [pk]: id }))}`)
