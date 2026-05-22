@@ -53,5 +53,5 @@ that has no backing file.
 - [ ] suite green
 
 ## Done summary
-
+Added a boot-reconciliation sweep to the plan worker: after every root's boot scan records its on-disk census (markSeen), sweep() retracts any projection id (epic + embedded task) with no backing file, scoped to configured roots via the epic's project_dir and run after snapshot emission. Retractions reuse the existing plan-epic-deleted/plan-task-deleted tombstone path. Guards against over-retraction (filename-keyed census so mid-rewrite parse failures count as present; out-of-scope epics never touched).
 ## Evidence
