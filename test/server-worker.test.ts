@@ -23,7 +23,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { countAndToken, JOBS_DESCRIPTOR, type Row } from "../src/collections";
+import {
+  countAndToken,
+  EPICS_DESCRIPTOR,
+  JOBS_DESCRIPTOR,
+  type Row,
+} from "../src/collections";
 import { openDb } from "../src/db";
 import type {
   ErrorFrame,
@@ -237,6 +242,29 @@ test("resolveFilter: ne operator emits `!= ?`; unknown operator object ignored",
   });
   expect(unknown.clause).toBe("");
   expect(unknown.params).toEqual([]);
+});
+
+test("resolveFilter: epics default scope applies open, is overridable, exempts pk lookups", () => {
+  // No filter → the descriptor's default `status: open` scope is applied.
+  const def = resolveFilter(EPICS_DESCRIPTOR, undefined);
+  expect(def.clause).toBe("WHERE status = ?");
+  expect(def.params).toEqual(["open"]);
+
+  // An explicit status overrides the default for that key.
+  const override = resolveFilter(EPICS_DESCRIPTOR, { status: "done" });
+  expect(override.clause).toBe("WHERE status = ?");
+  expect(override.params).toEqual(["done"]);
+
+  // A non-status filter still gets the default open scope ANDed in (status is
+  // declared before project_dir in the filter map, so it binds first).
+  const byDir = resolveFilter(EPICS_DESCRIPTOR, { project_dir: "/r" });
+  expect(byDir.clause).toBe("WHERE status = ? AND project_dir = ?");
+  expect(byDir.params).toEqual(["open", "/r"]);
+
+  // A pk lookup is exempt: it resolves one identity regardless of status.
+  const pk = resolveFilter(EPICS_DESCRIPTOR, { epic_id: "fn-2-done" });
+  expect(pk.clause).toBe("WHERE epic_id = ?");
+  expect(pk.params).toEqual(["fn-2-done"]);
 });
 
 test("runQuery resolves the pk filter for a detail-page single-item subscribe", () => {

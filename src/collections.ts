@@ -23,7 +23,7 @@
 
 import type { Database } from "bun:sqlite";
 import { MAX_IN_PARAMS } from "./db";
-import type { Row } from "./protocol";
+import type { FilterValue, Row } from "./protocol";
 
 export type { Row };
 
@@ -42,6 +42,11 @@ export type { Row };
  * - `defaultSort` — the fallback sort when none/an unknown column is requested.
  * - `filters` — wire filter-key → SQL column. MUST include the pk so a
  *   detail-page single-item subscribe (`filter:{<pk>}`) works.
+ * - `defaultFilter` — an optional base scope applied per filter-key when the wire
+ *   query leaves that key unconstrained (e.g. epics default to `status: "open"`).
+ *   A wire value for the key — bare or `{ ne }` — overrides the default, so a
+ *   client can still page any status by asking for it explicitly. Keys MUST also
+ *   appear in `filters` (they resolve through the same map-lookup gate).
  * - `jsonColumns` — columns stored as JSON TEXT that {@link decodeRow} parses
  *   into real values at the read boundary (so `result` and `patch` frames serve
  *   an array/object, not a JSON string). A parse failure / NULL falls back to
@@ -56,6 +61,7 @@ export interface CollectionDescriptor {
   sortable: ReadonlySet<string>;
   defaultSort: { column: string; dir: "asc" | "desc" };
   filters: Readonly<Record<string, string>>;
+  defaultFilter?: Readonly<Record<string, FilterValue>>;
   jsonColumns: ReadonlySet<string>;
 }
 
@@ -150,6 +156,13 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     status: "status",
     project_dir: "project_dir",
   },
+  // Default scope: an epics query with no `status` filter shows only OPEN epics
+  // (done/closed epics are filtered out of the default view). A client still
+  // pages any other status by asking for it explicitly (`filter:{status}` or
+  // `{status:{ne}}`), which overrides this default — and a pk subscribe carries
+  // its own `epic_id`, not `status`, so detail-page reads of a done epic still
+  // resolve. The view-side knob is keeper-frames' `--status` / `--status-ne`.
+  defaultFilter: { status: "open" },
   jsonColumns: new Set(["tasks"]),
 };
 

@@ -717,7 +717,9 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
     JSON.stringify({
       id: epicId,
       title: "Keeper E2E Plans Epic",
-      status: "in_progress",
+      // planctl epic statuses are open|done (EPIC_STATUSES); "open" keeps it in
+      // the epics collection's default scope so the unfiltered subscribe sees it.
+      status: "open",
       primary_repo: "/tmp/keeper-e2e-repo",
     }),
   );
@@ -810,7 +812,7 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
     expect(epic.epic_number).toBe(9);
     expect(epic.title).toBe("Keeper E2E Plans Epic");
     expect(epic.project_dir).toBe("/tmp/keeper-e2e-repo");
-    expect(epic.status).toBe("in_progress");
+    expect(epic.status).toBe("open");
     const baselineEpicEventId = epic.last_event_id;
 
     // --- tasks projection: embedded in the parent epic's `tasks` array (schema

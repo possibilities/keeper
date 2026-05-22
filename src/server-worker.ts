@@ -272,6 +272,15 @@ export interface ResolvedFilter {
  * operator string (`=` / `!=`) is a fixed literal chosen here, never wire text;
  * an operator object lacking a recognized key is ignored (forward-compat).
  *
+ * Default scope: for each key in `descriptor.defaultFilter` the wire query does
+ * NOT constrain, the descriptor's default value is applied (e.g. epics default
+ * to `status: "open"`, so an unfiltered list hides done/closed epics). A wire
+ * value for the key — bare or `{ ne }` — overrides the default for that key. A
+ * single-item pk lookup (a detail-page subscribe, `filter:{<pk>}`) is EXEMPT
+ * from defaults entirely: it targets one identity and must resolve whatever its
+ * status, so the documented "filters include the pk for detail subscribe"
+ * invariant holds even for a row outside the default scope.
+ *
  * The descriptor is the SOLE identifier-injection gate: only declared columns
  * are interpolated; wire keys are never interpolated, operators are fixed
  * literals, values always bound.
@@ -282,29 +291,48 @@ export function resolveFilter(
 ): ResolvedFilter {
   const where: string[] = [];
   const params: (string | number)[] = [];
-  if (filter) {
-    for (const [key, col] of Object.entries(descriptor.filters)) {
-      const value = filter[key];
-      if (value == null) {
-        continue;
-      }
-      if (typeof value === "object") {
-        // Operator form. `{ ne }` → `col != ?`; an unrecognized operator object
-        // is ignored so a future operator is forward-compatible.
-        if (value.ne != null) {
-          where.push(`${col} != ?`);
-          params.push(value.ne);
-        }
-        continue;
-      }
-      where.push(`${col} = ?`);
-      params.push(value);
+  // A pk lookup (detail-page single-item subscribe) bypasses the default scope.
+  const pkKey = pkFilterKey(descriptor);
+  const isPkLookup = pkKey != null && filter?.[pkKey] != null;
+  for (const [key, col] of Object.entries(descriptor.filters)) {
+    // Wire value wins; an unconstrained key falls back to the descriptor's
+    // default scope, except on a pk lookup (which is exempt from defaults).
+    const value =
+      filter?.[key] ??
+      (isPkLookup ? undefined : descriptor.defaultFilter?.[key]);
+    if (value == null) {
+      continue;
     }
+    if (typeof value === "object") {
+      // Operator form. `{ ne }` → `col != ?`; an unrecognized operator object
+      // is ignored so a future operator is forward-compatible.
+      if (value.ne != null) {
+        where.push(`${col} != ?`);
+        params.push(value.ne);
+      }
+      continue;
+    }
+    where.push(`${col} = ?`);
+    params.push(value);
   }
   return {
     clause: where.length > 0 ? `WHERE ${where.join(" AND ")}` : "",
     params,
   };
+}
+
+/**
+ * The wire filter key whose declared column IS the collection's pk (the key a
+ * detail-page single-item subscribe uses), or `undefined` if none is declared.
+ * Used to exempt a pk lookup from the default scope in {@link resolveFilter}.
+ */
+function pkFilterKey(descriptor: CollectionDescriptor): string | undefined {
+  for (const [key, col] of Object.entries(descriptor.filters)) {
+    if (col === descriptor.pk) {
+      return key;
+    }
+  }
+  return undefined;
 }
 
 /**

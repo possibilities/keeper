@@ -70,6 +70,7 @@ import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
 import {
   encodeFrame,
+  type FilterValue,
   LineBuffer,
   type QueryFrame,
   type ServerFrame,
@@ -97,7 +98,8 @@ const MAX_BACKOFF_MS = 5000;
 
 const HELP = `keeper-frames — primitive list UI over the keeper subscribe server
 
-Usage: bun scripts/keeper-frames.ts [--collection <name>] [--sock <path>] [--state <s> | --state-ne <s>]
+Usage: bun scripts/keeper-frames.ts [--collection <name>] [--sock <path>]
+       [--state <s> | --state-ne <s>] [--status <s> | --status-ne <s>]
 
   --collection <n> Collection to page (jobs|epics; default jobs)
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
@@ -105,6 +107,12 @@ Usage: bun scripts/keeper-frames.ts [--collection <name>] [--sock <path>] [--sta
   --state-ne <s>   Filter to jobs whose state is NOT <s> (e.g. ended)
                    (--state and --state-ne are mutually exclusive; default: no filter)
                    (--state/--state-ne are jobs-only; ignored for epics)
+  --status <s>     Filter to epics whose status equals <s> (e.g. done)
+  --status-ne <s>  Filter to epics whose status is NOT <s>
+                   (--status and --status-ne are mutually exclusive)
+                   (--status/--status-ne are epics-only; ignored for jobs)
+                   (default: no status flag → the server's default scope shows
+                   only OPEN epics; pass a flag to see other statuses)
   --help           Show this help
 
 Renders a 10-row page of the chosen collection as a YAML stream: one frame per
@@ -187,6 +195,8 @@ async function main(): Promise<void> {
       sock: { type: "string" },
       state: { type: "string" },
       "state-ne": { type: "string" },
+      status: { type: "string" },
+      "status-ne": { type: "string" },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -199,6 +209,9 @@ async function main(): Promise<void> {
 
   if (values.state !== undefined && values["state-ne"] !== undefined) {
     die("--state and --state-ne are mutually exclusive");
+  }
+  if (values.status !== undefined && values["status-ne"] !== undefined) {
+    die("--status and --status-ne are mutually exclusive");
   }
 
   const collection = values.collection ?? "jobs";
@@ -396,26 +409,36 @@ async function main(): Promise<void> {
     }
   }
 
-  // Build the optional `state` filter from the CLI flags. Filtering in SQL —
-  // not after the fetch — keeps LIMIT counting matching rows (so the page is a
-  // true top-N of the filtered set, never short) and makes `result.total` /
-  // `meta` describe exactly the set we render. Default: no filter (every job).
-  // The `state` filter is jobs-only — epics have no `state` column, so a
-  // state filter would be a no-op key server-side; only attach it for jobs.
-  const stateFilter =
+  // Build the optional collection-appropriate filter from the CLI flags.
+  // Filtering in SQL — not after the fetch — keeps LIMIT counting matching rows
+  // (so the page is a true top-N of the filtered set, never short) and makes
+  // `result.total` / `meta` describe exactly the set we render.
+  //   jobs  → `--state` / `--state-ne` on the `state` column (default: no filter,
+  //           every job). Jobs-only — epics have no `state` column.
+  //   epics → `--status` / `--status-ne` on the `status` column. Epics-only.
+  //           Default (no flag): send NO status filter, so the server's default
+  //           scope applies and the page shows only OPEN epics; pass `--status
+  //           <s>` (e.g. done) or `--status-ne <s>` to see other statuses.
+  const filter: { filter?: Record<string, FilterValue> } =
     collection === "jobs"
       ? values.state !== undefined
         ? { filter: { state: values.state } }
         : values["state-ne"] !== undefined
           ? { filter: { state: { ne: values["state-ne"] } } }
           : {}
-      : {};
+      : collection === "epics"
+        ? values.status !== undefined
+          ? { filter: { status: values.status } }
+          : values["status-ne"] !== undefined
+            ? { filter: { status: { ne: values["status-ne"] } } }
+            : {}
+        : {};
   const query: QueryFrame = {
     type: "query",
     collection,
     id: "frames",
     limit: PAGE_LIMIT,
-    ...stateFilter,
+    ...filter,
   };
 
   /**

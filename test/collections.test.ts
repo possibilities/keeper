@@ -105,8 +105,9 @@ test("epics default sort is epic_number desc", () => {
 
 test("runQuery pages the epics collection with the served columns + total", () => {
   const { db } = openDb(dbPath, { readonly: false });
-  seedEpic(db, "fn-2-beta", { epic_number: 2, status: "done" });
-  seedEpic(db, "fn-1-alpha", { epic_number: 1, status: "active" });
+  // Both open so the default `status: open` scope keeps them in the page.
+  seedEpic(db, "fn-2-beta", { epic_number: 2, status: "open" });
+  seedEpic(db, "fn-1-alpha", { epic_number: 1, status: "open" });
   const res = asResult(runQuery(db, 0, { type: "query", collection: "epics" }));
   expect(res.total).toBe(2);
   // Default sort epic_number desc (newest-created epic on top).
@@ -200,5 +201,54 @@ test("runQuery narrows the epics set by status filter", () => {
   );
   expect(res.total).toBe(2);
   expect(res.rows.every((r) => r.status === "active")).toBe(true);
+  db.close();
+});
+
+test("epics descriptor defaults the view scope to status open", () => {
+  expect(EPICS_DESCRIPTOR.defaultFilter).toEqual({ status: "open" });
+});
+
+test("runQuery applies the default open scope when no status filter is given", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1-open", { epic_number: 1, status: "open" });
+  seedEpic(db, "fn-2-done", { epic_number: 2, status: "done" });
+  // No filter → the default `status: open` scope hides the done epic.
+  const res = asResult(runQuery(db, 0, { type: "query", collection: "epics" }));
+  expect(res.total).toBe(1);
+  expect(res.rows.map((r) => String(r.epic_id))).toEqual(["fn-1-open"]);
+  db.close();
+});
+
+test("an explicit status filter overrides the default open scope", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1-open", { epic_number: 1, status: "open" });
+  seedEpic(db, "fn-2-done", { epic_number: 2, status: "done" });
+  // Asking for done overrides the default → only the done epic.
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "epics",
+      filter: { status: "done" },
+    }),
+  );
+  expect(res.total).toBe(1);
+  expect(res.rows.map((r) => String(r.epic_id))).toEqual(["fn-2-done"]);
+  db.close();
+});
+
+test("a pk lookup resolves a done epic despite the default open scope", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-2-done", { epic_number: 2, status: "done" });
+  // A detail-page single-item subscribe targets one identity and must resolve
+  // whatever its status — the default scope is exempt for a pk lookup.
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "epics",
+      filter: { epic_id: "fn-2-done" },
+    }),
+  );
+  expect(res.total).toBe(1);
+  expect(String(res.rows[0]!.epic_id)).toBe("fn-2-done");
   db.close();
 });
