@@ -64,5 +64,5 @@ now-always-supplied field (or the worker reads `data.watchRoot` directly).
 - [ ] README + CLAUDE.md/AGENTS.md document `claude_projects_root` as separate from `roots`
 
 ## Done summary
-
+Migrated the transcript watch root from KEEPER_WATCH_ROOT env var to a config-driven claude_projects_root key (default ~/.claude/projects), resolved on main via resolveClaudeProjectsRoot() and passed as workerData.watchRoot. The two config keys fall back independently; a still-set KEEPER_WATCH_ROOT logs a deprecation and is ignored.
 ## Evidence
