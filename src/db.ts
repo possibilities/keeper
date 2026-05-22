@@ -513,7 +513,12 @@ function migrate(db: Database): void {
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(String(SCHEMA_VERSION));
-  })();
+    // `.immediate()` issues BEGIN IMMEDIATE — grab the writer lock at BEGIN, so
+    // a CREATE/ALTER/INSERT inside cannot lose the upgrade-to-writer race to a
+    // concurrent hook write and surface as SQLITE_BUSY half-way through migrate.
+    // Failure (lock unavailable past `busy_timeout`) is now clean and total at
+    // BEGIN, never half-applied. Pairs with the same fix in `applyEvent`.
+  }).immediate();
 }
 
 /**

@@ -615,7 +615,14 @@ export function applyEvent(
       [event.id, event.ts],
     );
   });
-  fold();
+  // `.immediate()` issues BEGIN IMMEDIATE — grab the writer lock at BEGIN, not
+  // when the first write upgrades. Without this, a SELECT-then-UPDATE inside
+  // the transaction loses the snapshot-upgrade race to a concurrent hook
+  // insert and surfaces as SQLITE_BUSY_SNAPSHOT (errno 517), wedging the
+  // reducer. The cursor + projection co-advance contract is the whole point of
+  // running this as one atomic write transaction — DEFERRED breaks it under
+  // contention. See {@link migrate} for the same shape.
+  fold.immediate();
 }
 
 /**
