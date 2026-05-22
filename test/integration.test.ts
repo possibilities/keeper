@@ -973,6 +973,88 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
       expect(Array.isArray(embedded)).toBe(true);
       const folded = embedded.find((t) => t.task_id === taskId);
       expect(folded?.status).toBe("done");
+
+      // --- deletion retraction: a TaskDeleted tombstone splices the element
+      // out of the parent epic's array; the epic patches with `tasks` empty.
+      // Inserted directly (same as the snapshots above) to test the
+      // event→fold→UDS-patch chain without FSEvents delivery timing. ---
+      const epicEventIdAfterTaskPatch = taskPatch.row.last_event_id as number;
+      const { db: delTaskWriter, stmts: delTaskStmts } = openDb(dbPath);
+      delTaskStmts.insertEvent.run(
+        Date.now() / 1000,
+        taskId,
+        null,
+        "TaskDeleted",
+        "plan_snapshot",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        JSON.stringify({ epic_id: epicId }),
+        null,
+        null,
+      );
+      delTaskWriter.close();
+
+      const taskDeletePatch = await retryUntil(
+        () =>
+          client.frames.find(
+            (f) =>
+              f.type === "patch" &&
+              f.collection === "epics" &&
+              f.row.epic_id === epicId &&
+              (f.row.last_event_id as number) > epicEventIdAfterTaskPatch,
+          ) ?? null,
+        8000,
+      );
+      if (!taskDeletePatch || taskDeletePatch.type !== "patch") {
+        const out = await readStream(daemon.stdout);
+        const err = await readStream(daemon.stderr);
+        throw new Error(
+          `task-delete patch never arrived.\nstdout:\n${out}\nstderr:\n${err}`,
+        );
+      }
+      const afterDelete = taskDeletePatch.row.tasks as { task_id: string }[];
+      expect(Array.isArray(afterDelete)).toBe(true);
+      expect(afterDelete.some((t) => t.task_id === taskId)).toBe(false);
+
+      // --- an EpicDeleted tombstone removes the epic row; it leaves the page.
+      const { db: delEpicWriter, stmts: delEpicStmts } = openDb(dbPath);
+      delEpicStmts.insertEvent.run(
+        Date.now() / 1000,
+        epicId,
+        null,
+        "EpicDeleted",
+        "plan_snapshot",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        "",
+        null,
+        null,
+      );
+      delEpicWriter.close();
+
+      const epicGone = await retryUntil(() => {
+        const row = reader
+          .query("SELECT epic_id FROM epics WHERE epic_id = ?")
+          .get(epicId) as { epic_id: string } | null;
+        return row == null ? true : null;
+      }, 8000);
+      if (!epicGone) {
+        const out = await readStream(daemon.stdout);
+        const err = await readStream(daemon.stderr);
+        throw new Error(
+          `epic row never deleted.\nstdout:\n${out}\nstderr:\n${err}`,
+        );
+      }
     } finally {
       client.socket.end();
     }

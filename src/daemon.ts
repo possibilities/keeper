@@ -315,6 +315,17 @@ function runDaemon(): void {
         target_repo: msg.targetRepo,
         status: msg.status,
       });
+    } else if (msg.kind === "plan-epic-deleted") {
+      // Tombstone: the reducer deletes the `epics` row (embedded tasks vanish
+      // with it). No payload beyond the pk in session_id.
+      hookEvent = "EpicDeleted";
+      data = "";
+    } else if (msg.kind === "plan-task-deleted") {
+      // Tombstone: the reducer splices the element out of the parent epic's
+      // embedded array. The parent key rides in the `data` blob (the deleted
+      // file is gone, so the producer recovered it from the change-gate).
+      hookEvent = "TaskDeleted";
+      data = JSON.stringify({ epic_id: msg.epicId });
     } else {
       return;
     }

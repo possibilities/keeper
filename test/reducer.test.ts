@@ -1099,3 +1099,134 @@ test("from-scratch re-fold reproduces byte-identical epics rows (incl. embedded 
   const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
   expect(epicsAfter).toEqual(epicsBefore);
 });
+
+// ---------------------------------------------------------------------------
+// Plan retraction (TaskDeleted / EpicDeleted tombstones)
+// ---------------------------------------------------------------------------
+
+/** Insert a synthetic TaskDeleted tombstone (entity id in session_id, epic_id in blob). */
+function taskDeletedEvent(taskId: string, epicId: string | null): number {
+  return insertEvent({
+    hook_event: "TaskDeleted",
+    session_id: taskId,
+    data: JSON.stringify({ epic_id: epicId }),
+  });
+}
+
+/** Insert a synthetic EpicDeleted tombstone (entity id in session_id, no blob). */
+function epicDeletedEvent(epicId: string): number {
+  return insertEvent({
+    hook_event: "EpicDeleted",
+    session_id: epicId,
+    data: "",
+  });
+}
+
+test("TaskDeleted splices the element from the parent epic array and bumps last_event_id", () => {
+  epicSnapshotEvent("fn-1", { epic_number: 1, title: "E", status: "open" });
+  taskSnapshotEvent("fn-1.1", {
+    epic_id: "fn-1",
+    task_number: 1,
+    title: "One",
+  });
+  taskSnapshotEvent("fn-1.2", {
+    epic_id: "fn-1",
+    task_number: 2,
+    title: "Two",
+  });
+  const delId = taskDeletedEvent("fn-1.1", "fn-1");
+  drainAll();
+
+  // The deleted element is gone; the surviving one remains, still sorted.
+  expect(getTasks("fn-1").map((t) => t.task_id)).toEqual(["fn-1.2"]);
+  // The retraction bumps the epic's version so the read surface patches it.
+  expect(getEpic("fn-1")?.last_event_id).toBe(delId);
+  expect(getCursor()).toBe(delId);
+});
+
+test("EpicDeleted removes the epic row (embedded tasks vanish with it)", () => {
+  epicSnapshotEvent("fn-1", { epic_number: 1, title: "E", status: "open" });
+  taskSnapshotEvent("fn-1.1", {
+    epic_id: "fn-1",
+    task_number: 1,
+    title: "One",
+  });
+  const delId = epicDeletedEvent("fn-1");
+  drainAll();
+
+  expect(getEpic("fn-1")).toBeNull();
+  expect(getCursor()).toBe(delId);
+});
+
+test("TaskDeleted/EpicDeleted are idempotent no-ops on a missing target, cursor advances", () => {
+  // No epic, no task — both tombstones are no-ops but still advance the cursor.
+  const t = taskDeletedEvent("fn-9.9", "fn-9");
+  drainAll();
+  expect(getEpic("fn-9")).toBeNull();
+  expect(getCursor()).toBe(t);
+
+  const e = epicDeletedEvent("fn-9");
+  drainAll();
+  expect(getCursor()).toBe(e);
+
+  // A TaskDeleted whose element is already absent does not bump the epic row.
+  epicSnapshotEvent("fn-2", { epic_number: 2, title: "E2", status: "open" });
+  drainAll();
+  const before = getEpic("fn-2");
+  taskDeletedEvent("fn-2.5", "fn-2"); // element never existed
+  drainAll();
+  expect(getEpic("fn-2")?.last_event_id).toBe(before?.last_event_id);
+});
+
+test("TaskDeleted with a null epic_id is a no-op (can't place the splice)", () => {
+  epicSnapshotEvent("fn-1", { epic_number: 1, title: "E", status: "open" });
+  taskSnapshotEvent("fn-1.1", {
+    epic_id: "fn-1",
+    task_number: 1,
+    title: "One",
+  });
+  drainAll();
+  const before = getEpic("fn-1")?.last_event_id;
+  taskDeletedEvent("fn-1.1", null);
+  drainAll();
+  // The element stays — a null epic_id can't be placed against a parent.
+  expect(getTasks("fn-1").map((t) => t.task_id)).toEqual(["fn-1.1"]);
+  expect(getEpic("fn-1")?.last_event_id).toBe(before);
+});
+
+test("from-scratch re-fold reproduces the spliced state across a create→delete sequence", () => {
+  epicSnapshotEvent("fn-1", { epic_number: 1, title: "E", status: "open" });
+  taskSnapshotEvent("fn-1.1", {
+    epic_id: "fn-1",
+    task_number: 1,
+    title: "One",
+  });
+  taskSnapshotEvent("fn-1.2", {
+    epic_id: "fn-1",
+    task_number: 2,
+    title: "Two",
+  });
+  taskDeletedEvent("fn-1.1", "fn-1");
+  // An EpicDeleted followed by a later TaskSnapshot legitimately re-creates a
+  // shell (the task still exists on disk) — replayed in id order it lands last.
+  epicSnapshotEvent("fn-3", { epic_number: 3, title: "Gone", status: "open" });
+  epicDeletedEvent("fn-3");
+  taskSnapshotEvent("fn-3.1", {
+    epic_id: "fn-3",
+    task_number: 1,
+    title: "Reborn",
+  });
+  drainAll();
+
+  const epicsBefore = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  expect(getTasks("fn-1").map((t) => t.task_id)).toEqual(["fn-1.2"]);
+  // fn-3 was deleted then a later task re-created it as a shell.
+  expect(getTasks("fn-3").map((t) => t.task_id)).toEqual(["fn-3.1"]);
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM epics");
+  drainAll();
+
+  const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  expect(epicsAfter).toEqual(epicsBefore);
+});

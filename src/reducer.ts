@@ -343,6 +343,94 @@ function projectPlanRow(db: Database, event: Event): void {
 }
 
 /**
+ * Apply a plan-side RETRACTION for one synthetic `EpicDeleted` / `TaskDeleted`
+ * tombstone event. Runs INSIDE the open transaction opened by
+ * {@link applyEvent}; performs zero cursor work.
+ *
+ * Tombstones are the only replay-deterministic way to fold a delete: a file
+ * vanishing off disk leaves no event, so the producer emits an explicit
+ * tombstone that rides the same synthetic-event pipeline as the snapshots. A
+ * re-fold from scratch replays the create→delete sequence and reproduces the
+ * same retracted state.
+ *
+ * - `EpicDeleted`: `DELETE FROM epics WHERE epic_id = ?` — the embedded `tasks`
+ *   array vanishes with the row. The entity id rides in `event.session_id`.
+ * - `TaskDeleted`: a read-modify-write on the PARENT epic's embedded array —
+ *   splice out the element by `task_id` (the task pk in `event.session_id`),
+ *   re-sort, write back, bump `last_event_id`/`updated_at` so the retraction
+ *   `patch`es. The parent key rides in the `data` blob's `epic_id`.
+ *
+ * Both folds are idempotent no-ops on a missing target (epic / element already
+ * gone, or — for a task — a null `epic_id` we can't place against), and never
+ * throw inside the transaction (a throw rolls back the cursor and wedges the
+ * reducer); a malformed stored array folds to `[]`.
+ */
+function retractPlanRow(db: Database, event: Event): void {
+  const entityId = event.session_id;
+
+  if (event.hook_event === "EpicDeleted") {
+    // Idempotent: a missing epic matches zero rows — a correct no-op.
+    db.run("DELETE FROM epics WHERE epic_id = ?", [entityId]);
+    return;
+  }
+
+  // TaskDeleted: splice the element out of the parent epic's `tasks` array. The
+  // parent key is the blob's `epic_id` (the file is gone, so the producer
+  // recovered it from the change-gate). A null/absent epic_id can't be placed —
+  // no-op, cursor still advances upstream.
+  const snapshot = extractPlanSnapshot(event);
+  const epicId = snapshot?.epic_id ?? null;
+  if (epicId == null) {
+    return;
+  }
+
+  const epicRow = db
+    .query("SELECT tasks FROM epics WHERE epic_id = ?")
+    .get(epicId) as { tasks: string | null } | null;
+  if (epicRow == null) {
+    return; // parent already gone (e.g. EpicDeleted folded first) — no-op.
+  }
+
+  // Parse the persisted array. A malformed/NULL blob folds to `[]` — NEVER
+  // throw inside the open BEGIN IMMEDIATE transaction.
+  let tasks: { task_id: string; task_number: number | null }[] = [];
+  if (epicRow.tasks != null && epicRow.tasks.length > 0) {
+    try {
+      const parsed = JSON.parse(epicRow.tasks);
+      if (Array.isArray(parsed)) {
+        tasks = parsed;
+      }
+    } catch {
+      // malformed stored array → treat as empty, fall through.
+    }
+  }
+
+  const next = tasks.filter((t) => t.task_id !== entityId);
+  if (next.length === tasks.length) {
+    // Element wasn't present — idempotent no-op (don't bump the row, so a
+    // re-fold of an already-applied delete stays byte-identical).
+    return;
+  }
+
+  // Re-sort by the SAME (task_number, task_id) key the snapshot fold + migration
+  // backfill use, so the spliced array stays deterministically ordered.
+  next.sort((a, b) => {
+    const an = a.task_number;
+    const bn = b.task_number;
+    if (an !== bn) {
+      if (an == null) return -1;
+      if (bn == null) return 1;
+      return an - bn;
+    }
+    return a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0;
+  });
+  db.run(
+    "UPDATE epics SET tasks = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+    [JSON.stringify(next), event.id, event.ts, epicId],
+  );
+}
+
+/**
  * Apply the jobs-side projection for one event. Runs INSIDE the open
  * transaction opened by {@link applyEvent}; performs zero cursor work.
  *
@@ -502,6 +590,11 @@ export function applyEvent(
       event.hook_event === "TaskSnapshot"
     ) {
       projectPlanRow(db, event);
+    } else if (
+      event.hook_event === "EpicDeleted" ||
+      event.hook_event === "TaskDeleted"
+    ) {
+      retractPlanRow(db, event);
     } else {
       projectJobsRow(db, event);
     }

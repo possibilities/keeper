@@ -235,7 +235,7 @@ test("a vanished file (read-vs-delete race) skips-and-logs, no emit", () => {
   expect(logs.some((l) => l.includes("stat failed"))).toBe(true);
 });
 
-test("onDelete drops the change-gate so a re-created file re-emits", () => {
+test("onDelete emits a task tombstone with recovered epicId, then re-created file re-emits", () => {
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
     (m) => emitted.push(m),
@@ -246,13 +246,48 @@ test("onDelete drops the change-gate so a re-created file re-emits", () => {
   scanner.onChange(path);
   expect(emitted.length).toBe(1);
 
-  // Delete drops tracking (no emit).
+  // Delete emits a tombstone carrying the epicId recovered from the change-gate.
   scanner.onDelete(path);
+  expect(emitted.length).toBe(2);
+  expect(emitted[1]).toEqual({
+    kind: "plan-task-deleted",
+    id: "fn-3-demo.1",
+    epicId: "fn-3-demo",
+  });
+
+  // The change-gate was cleared, so the same content re-arriving re-emits.
+  scanner.onChange(path);
+  expect(emitted.length).toBe(3);
+  expect((emitted[2] as { kind: string }).kind).toBe("plan-task");
+});
+
+test("onDelete emits an epic tombstone for a deleted epic file", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  const path = writeEpic("fn-3-demo", { title: "Demo", status: "open" });
+  scanner.onChange(path);
   expect(emitted.length).toBe(1);
 
-  // The same content re-arriving now re-emits (change-gate was cleared).
-  scanner.onChange(path);
+  scanner.onDelete(path);
   expect(emitted.length).toBe(2);
+  expect(emitted[1]).toEqual({ kind: "plan-epic-deleted", id: "fn-3-demo" });
+});
+
+test("onDelete on an un-seeded path emits nothing (nothing to retract)", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  // Never folded this path → no change-gate entry → no tombstone.
+  const path = join(planctlDir("tasks"), "fn-9-never.1.json");
+  scanner.onDelete(path);
+  expect(emitted).toEqual([]);
 });
 
 test("seedFromDb suppresses a re-emit of an already-folded projection row", () => {

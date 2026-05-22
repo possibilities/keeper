@@ -107,8 +107,37 @@ export interface PlanTaskMessage {
   status: string;
 }
 
-/** Either snapshot message the worker posts to the parent. */
-export type PlanMessage = PlanEpicMessage | PlanTaskMessage;
+/**
+ * Tombstone message for a deleted `.planctl/epics/*.json` file. Main turns it
+ * into a synthetic `EpicDeleted` event; the reducer deletes the `epics` row.
+ */
+export interface PlanEpicDeletedMessage {
+  kind: "plan-epic-deleted";
+  /** Planctl epic id (the projection pk; rides in the synthetic event's session_id). */
+  id: string;
+}
+
+/**
+ * Tombstone message for a deleted `.planctl/tasks/*.json` file. Main turns it
+ * into a synthetic `TaskDeleted` event; the reducer splices the element out of
+ * the parent epic's embedded array. `epicId` is recovered from the change-gate's
+ * last-emitted snapshot for this task (the only place the parent link survives a
+ * delete, since the file is already gone).
+ */
+export interface PlanTaskDeletedMessage {
+  kind: "plan-task-deleted";
+  /** Planctl task id. */
+  id: string;
+  /** Parent epic id, recovered from the last-emitted task snapshot. */
+  epicId: string | null;
+}
+
+/** Either snapshot or tombstone message the worker posts to the parent. */
+export type PlanMessage =
+  | PlanEpicMessage
+  | PlanTaskMessage
+  | PlanEpicDeletedMessage
+  | PlanTaskDeletedMessage;
 
 /** Message the parent sends to ask the worker to stop. */
 export interface ShutdownMessage {
@@ -260,7 +289,11 @@ function asString(v: unknown): string | null {
  *   `plan-epic` / `plan-task` message via `onSnapshot` ONLY when the snapshot
  *   differs from the change-gate. A read-vs-delete race, an oversize file, or a
  *   malformed/parse failure is skip-and-logged WITHOUT emitting (keep last good).
- * - `onDelete(path)` drops the path's change-gate entry (no emit).
+ * - `onDelete(path)` emits a tombstone (`plan-epic-deleted` /
+ *   `plan-task-deleted`) so the projection retracts, then drops the path's
+ *   change-gate entry. A task tombstone recovers `epicId` from the last-emitted
+ *   snapshot (the parent link is gone with the file). A path that was never
+ *   folded (no change-gate entry) emits nothing — there is nothing to retract.
  *
  * The change-gate is keyed by the planctl id (the projection pk) and holds the
  * last-emitted serialized snapshot. `seedFromDb` (below) primes it from the
@@ -289,16 +322,47 @@ export class PlanScanner {
     this.lastEmitted.set(id, serialized);
   }
 
-  /** Drop a path from the change-gate (on a watcher `delete`). No emit. */
+  /**
+   * Process a delete for `path`. Emits a tombstone so the projection retracts,
+   * then drops the change-gate entry (so a re-created file re-emits). A path
+   * with no change-gate entry (never folded) emits nothing — nothing to retract.
+   *
+   * The deleted file is already gone, so we cannot re-read it: the id comes from
+   * the `pathToId` map and a task's parent `epicId` from the last-emitted
+   * snapshot still held in the change-gate. The tombstone is the only
+   * replay-deterministic way to fold a delete — it rides through the same
+   * synthetic-event pipeline as the snapshot messages.
+   */
   onDelete(path: string): void {
     const id = this.pathToId.get(path);
-    if (id !== undefined) {
-      this.pathToId.delete(path);
-      // The projection row stays (a deleted plan file does not retract the
-      // projection — plans are append/upsert-only here); we only stop tracking
-      // the change-gate so a re-created file re-emits.
-      this.lastEmitted.delete(id);
+    if (id === undefined) {
+      return; // never folded this path — nothing to retract.
     }
+    const kind = classifyPlanPath(path);
+    if (kind === "epic") {
+      this.onSnapshot({ kind: "plan-epic-deleted", id });
+    } else if (kind === "task") {
+      // Recover the parent epic id from the last-emitted task snapshot — the
+      // file is gone, so this is the only surviving link. Parse defensively;
+      // a missing/garbled gate value falls back to a null epicId (the reducer
+      // then no-ops, which is correct: a task we can't place can't be spliced).
+      let epicId: string | null = null;
+      const serialized = this.lastEmitted.get(id);
+      if (serialized !== undefined) {
+        try {
+          const last = JSON.parse(serialized) as Partial<PlanTaskMessage>;
+          if (typeof last.epicId === "string") {
+            epicId = last.epicId;
+          }
+        } catch {
+          // garbled gate value → null epicId, fall through.
+        }
+      }
+      this.onSnapshot({ kind: "plan-task-deleted", id, epicId });
+    }
+    // Drop the change-gate so a re-created file re-emits its snapshot.
+    this.pathToId.delete(path);
+    this.lastEmitted.delete(id);
   }
 
   /**
