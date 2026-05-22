@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-566-re-scan-on-dropped-watcher-events",
   "bundles": [],
+  "closer_done_at": "2026-05-22T15:50:41Z",
   "created_at": "2026-05-22T14:39:40Z",
   "depends_on_epics": [],
   "id": "fn-566-re-scan-on-dropped-watcher-events",
@@ -9,10 +10,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Re-scan on dropped watcher events",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-22T14:39:48Z"
+  "updated_at": "2026-05-22T15:50:41Z"
 }
