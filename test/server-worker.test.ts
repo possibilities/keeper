@@ -61,6 +61,7 @@ function seedJob(
     state: string;
     cwd: string;
     last_event_id: number;
+    created_at: number;
     updated_at: number;
   }> = {},
 ): void {
@@ -69,7 +70,7 @@ function seedJob(
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     job_id,
-    1,
+    opts.created_at ?? 1,
     opts.cwd ?? null,
     null,
     opts.state ?? "stopped",
@@ -165,11 +166,11 @@ function jobId(row: Row): string {
   return String(row.job_id);
 }
 
-test("runQuery returns rows ordered by updated_at desc by default", () => {
+test("runQuery returns rows ordered by created_at desc by default", () => {
   const { db } = openDb(dbPath, { readonly: false });
-  seedJob(db, "a", { updated_at: 10 });
-  seedJob(db, "b", { updated_at: 30 });
-  seedJob(db, "c", { updated_at: 20 });
+  seedJob(db, "a", { created_at: 10 });
+  seedJob(db, "b", { created_at: 30 });
+  seedJob(db, "c", { created_at: 20 });
 
   const res = asResult(runQuery(db, 7, { type: "query", collection: "jobs" }));
   expect(res.type).toBe("result");
@@ -182,9 +183,9 @@ test("runQuery returns rows ordered by updated_at desc by default", () => {
 test("runQuery honors limit + offset", () => {
   const { db } = openDb(dbPath, { readonly: false });
   for (let i = 0; i < 5; i++) {
-    seedJob(db, `j${i}`, { updated_at: i });
+    seedJob(db, `j${i}`, { created_at: i });
   }
-  // desc by updated_at: j4,j3,j2,j1,j0. limit 2 offset 1 → j3,j2.
+  // desc by created_at: j4,j3,j2,j1,j0. limit 2 offset 1 → j3,j2.
   const res = asResult(
     runQuery(db, 0, { type: "query", collection: "jobs", limit: 2, offset: 1 }),
   );
@@ -209,9 +210,9 @@ test("runQuery applies a state filter", () => {
 
 test("runQuery applies a not-equal (ne) state filter, excluding ended jobs", () => {
   const { db } = openDb(dbPath, { readonly: false });
-  seedJob(db, "w", { state: "working", updated_at: 3 });
-  seedJob(db, "s", { state: "stopped", updated_at: 2 });
-  seedJob(db, "e", { state: "ended", updated_at: 1 });
+  seedJob(db, "w", { state: "working", created_at: 3 });
+  seedJob(db, "s", { state: "stopped", created_at: 2 });
+  seedJob(db, "e", { state: "ended", created_at: 1 });
   const res = asResult(
     runQuery(db, 0, {
       type: "query",
@@ -341,10 +342,10 @@ test("runQuery echoes the query id + collection onto the result", () => {
   db.close();
 });
 
-test("runQuery falls back to updated_at for an unknown sort column", () => {
+test("runQuery falls back to created_at for an unknown sort column", () => {
   const { db } = openDb(dbPath, { readonly: false });
-  seedJob(db, "a", { updated_at: 1 });
-  seedJob(db, "b", { updated_at: 2 });
+  seedJob(db, "a", { created_at: 1 });
+  seedJob(db, "b", { created_at: 2 });
   const res = asResult(
     runQuery(db, 0, {
       type: "query",
@@ -352,7 +353,7 @@ test("runQuery falls back to updated_at for an unknown sort column", () => {
       sort: { column: "drop table jobs" },
     }),
   );
-  // Default desc by updated_at → b before a (no SQL injection, no throw).
+  // Default desc by created_at → b before a (no SQL injection, no throw).
   expect(res.rows.map(jobId)).toEqual(["b", "a"]);
   db.close();
 });

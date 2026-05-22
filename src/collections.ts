@@ -62,9 +62,9 @@ export interface CollectionDescriptor {
 /**
  * The `jobs` descriptor — the first collection. Mirrors what `runQuery` /
  * `diffTick` / `selectJobsByIds` hardcoded before namespacing: the current
- * SELECT list, the `SORTABLE_COLUMNS` allowlist, the `updated_at desc` default,
- * and the `state`/`cwd` filters PLUS `job_id` (the pk — for detail-page
- * single-item subscribe).
+ * SELECT list, the `SORTABLE_COLUMNS` allowlist, the `created_at desc` default
+ * (newest-created job on top), and the `state`/`cwd` filters PLUS `job_id` (the
+ * pk — for detail-page single-item subscribe).
  */
 export const JOBS_DESCRIPTOR: CollectionDescriptor = {
   name: "jobs",
@@ -90,7 +90,7 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "job_id",
     "state",
   ]),
-  defaultSort: { column: "updated_at", dir: "desc" },
+  defaultSort: { column: "created_at", dir: "desc" },
   filters: { state: "state", cwd: "cwd", job_id: "job_id" },
   // `title` + `title_source` + `transcript_path` are read-only display this
   // phase — served on `result`/`patch` (the source/path for provenance +
@@ -104,7 +104,9 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
  * The `epics` descriptor — the plans read surface's first collection. Columns
  * mirror the v6 `epics` table 1:1 (`src/db.ts` `CREATE_EPICS`). `version` is
  * `last_event_id` (the monotonic per-row column the diff fires on, bumped by the
- * snapshot fold). Sort defaults to `updated_at desc` like `jobs`. `filters`
+ * snapshot fold). Sort defaults to creation order, newest first, like `jobs`
+ * (`epic_number desc` — epics have no `created_at` column, and `epic_number` is
+ * the monotonic creation-order signal). `filters`
  * carries the pk (`epic_id` — detail-page single-item subscribe) plus the
  * natural filter columns `status` + `project_dir`. `title`/`epic_number` are
  * read-only display — served but out of `sortable`/`filters`. `project_dir`
@@ -116,8 +118,9 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
  * `columns`) AND registered in `jsonColumns` so {@link decodeRow} parses the
  * stored TEXT into a real `Task[]` at the read boundary; it is OUT of
  * `sortable`/`filters` (a nested display array, never a sort/filter key). The
- * default sort moves to `epic_number asc` — stable creation order, so a task
- * edit (which bumps the epic's `last_event_id`) never reorders the default view.
+ * default sort is `epic_number desc` — newest-created epic on top, a stable
+ * creation order, so a task edit (which bumps the epic's `last_event_id`) never
+ * reorders the default view.
  */
 export const EPICS_DESCRIPTOR: CollectionDescriptor = {
   name: "epics",
@@ -141,7 +144,7 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "epic_number",
     "status",
   ]),
-  defaultSort: { column: "epic_number", dir: "asc" },
+  defaultSort: { column: "epic_number", dir: "desc" },
   filters: {
     epic_id: "epic_id",
     status: "status",

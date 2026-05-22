@@ -92,10 +92,10 @@ test("epics descriptor: version is last_event_id; filters include pk + status; t
   expect(EPICS_DESCRIPTOR.filters.tasks).toBeUndefined();
 });
 
-test("epics default sort is epic_number asc", () => {
+test("epics default sort is epic_number desc", () => {
   expect(EPICS_DESCRIPTOR.defaultSort).toEqual({
     column: "epic_number",
-    dir: "asc",
+    dir: "desc",
   });
 });
 
@@ -109,10 +109,10 @@ test("runQuery pages the epics collection with the served columns + total", () =
   seedEpic(db, "fn-1-alpha", { epic_number: 1, status: "active" });
   const res = asResult(runQuery(db, 0, { type: "query", collection: "epics" }));
   expect(res.total).toBe(2);
-  // Default sort epic_number asc.
+  // Default sort epic_number desc (newest-created epic on top).
   expect(res.rows.map((r) => String(r.epic_id))).toEqual([
-    "fn-1-alpha",
     "fn-2-beta",
+    "fn-1-alpha",
   ]);
   // Served columns match the descriptor.
   expect(Object.keys(res.rows[0]!).sort()).toEqual(
