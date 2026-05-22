@@ -42,8 +42,9 @@ changes — a row enters or leaves the filter — so a paginated client can rend
 "showing X of N" and a non-disruptive "set changed, refresh" nudge without the
 list reflowing under the cursor. The server is just another reader — its own
 read-only connection, its own `data_version` poll — and the socket is
-**read-only**: there is no client write path. No consumer ships yet; the
-documented protocol is the target for a future TUI.
+**read-only**: there is no client write path. Two example clients ship in
+`scripts/` (`keeper-frames.ts` and `autopilot.ts`); see
+[Example clients](#example-clients) for usage.
 
 ## What keeper is NOT
 
@@ -181,9 +182,39 @@ Keeper has no `install` verb. Wire it up manually:
 
    The subscribe server binds a Unix-domain socket at
    `~/.local/state/keeper/keeperd.sock` by default (a sibling of `keeper.db`).
-   Override the path with the `KEEPER_SOCK` environment variable. No consumer
-   ships yet — nothing connects to the socket in production — so there is
-   nothing further to demo here.
+   Override the path with the `KEEPER_SOCK` environment variable. Two example
+   clients ship in `scripts/` (see [Example clients](#example-clients)).
+
+## Example clients
+
+Two scripts under `scripts/` demonstrate the read-only subscribe protocol —
+both clones of the same connection/coalescing/reconnect plumbing, differing
+only in their render layer. Run either with `bun scripts/<name>.ts --help`.
+
+- `keeper-frames.ts` — primitive list UI: pages the `jobs` (default) or
+  `epics` collection and renders a YAML frame per change. For epics it shows
+  each epic with its embedded tasks as a nested mapping block. Reconnects
+  across keeperd restarts; Ctrl-C unsubscribes cleanly.
+
+  ```sh
+  bun scripts/keeper-frames.ts                   # default: live jobs
+  bun scripts/keeper-frames.ts --collection epics  # open epics + nested tasks
+  ```
+
+- `autopilot.ts` — flat task stream across all open epics: renders one
+  one-line-per-task YAML sequence in the form
+  `- {repo} {epicRef}.{task_number} {epic title} · {task title}` (no
+  `[status]`, so status flips alone don't reframe). Same plumbing as
+  `keeper-frames.ts`.
+
+  ```sh
+  bun scripts/autopilot.ts
+  ```
+
+Both scripts mirror each emitted frame to per-pid `/tmp` sidecar files (full
+JSON state + rendered YAML) for out-of-band inspection. The shared
+subscribe-loop logic lives in each script verbatim today; extract a shared
+module once a third client appears.
 
 ## Uninstall
 
