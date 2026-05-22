@@ -25,6 +25,7 @@ import {
   buildTaskMessage,
   classifyPlanPath,
   epicNumberFromId,
+  isWithinRoots,
   type PlanMessage,
   PlanScanner,
   scanRoot,
@@ -386,6 +387,186 @@ test("seedFromDb reconstructs from epics.tasks so an embedded task is not re-emi
     "plan-task",
   );
   expect((emitted[0] as { title: string }).title).toBe("T2");
+});
+
+// ---------------------------------------------------------------------------
+// (a*) Boot reconciliation sweep — retract projection ids whose backing file
+// was deleted while the daemon was down (no live onDelete fired). Scoped to
+// configured roots via the epic's project_dir; runs after the boot scan's
+// on-disk census is complete.
+// ---------------------------------------------------------------------------
+
+test("isWithinRoots: segment-aware prefix scoping", () => {
+  expect(isWithinRoots("/a/code/proj", ["/a/code"])).toBe(true);
+  expect(isWithinRoots("/a/code", ["/a/code"])).toBe(true);
+  // A sibling that merely shares a string prefix is NOT inside.
+  expect(isWithinRoots("/a/code-x/proj", ["/a/code"])).toBe(false);
+  expect(isWithinRoots("/elsewhere/proj", ["/a/code"])).toBe(false);
+  expect(isWithinRoots(null, ["/a/code"])).toBe(false);
+  expect(isWithinRoots("", ["/a/code"])).toBe(false);
+  // Multi-root: in scope if inside ANY configured root.
+  expect(isWithinRoots("/b/src/proj", ["/a/code", "/b/src"])).toBe(true);
+});
+
+test("sweep retracts a deleted epic + embedded task, leaves present ones", () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  // Two epics, each with one task, both project_dir inside the configured root
+  // (tmpDir). On disk we keep only the SURVIVING epic's files.
+  const survivorTasks = JSON.stringify([
+    {
+      task_id: "fn-1-keep.1",
+      epic_id: "fn-1-keep",
+      task_number: 1,
+      title: "K",
+      target_repo: tmpDir,
+      status: "open",
+    },
+  ]);
+  const goneTasks = JSON.stringify([
+    {
+      task_id: "fn-2-gone.1",
+      epic_id: "fn-2-gone",
+      task_number: 1,
+      title: "G",
+      target_repo: tmpDir,
+      status: "open",
+    },
+  ]);
+  db.run(
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "fn-1-keep",
+      1,
+      "Keep",
+      tmpDir,
+      "open",
+      1,
+      0,
+      survivorTasks,
+      "fn-2-gone",
+      2,
+      "Gone",
+      tmpDir,
+      "open",
+      2,
+      0,
+      goneTasks,
+    ],
+  );
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+
+  // Only the survivor's files exist on disk. Boot scan records the census.
+  writeEpic("fn-1-keep", {
+    title: "Keep",
+    status: "open",
+    primary_repo: tmpDir,
+  });
+  writeTask("fn-1-keep.1", {
+    epic: "fn-1-keep",
+    title: "K",
+    target_repo: tmpDir,
+  });
+  scanRoot(tmpDir, scanner);
+  // Seeded survivor files are byte-identical → change-gate suppresses them.
+  expect(emitted).toEqual([]);
+
+  // Sweep: the absent epic + its embedded task are retracted; survivors untouched.
+  scanner.sweep(db, [tmpDir]);
+  db.close();
+
+  expect(emitted).toContainEqual({
+    kind: "plan-task-deleted",
+    id: "fn-2-gone.1",
+    epicId: "fn-2-gone",
+  });
+  expect(emitted).toContainEqual({
+    kind: "plan-epic-deleted",
+    id: "fn-2-gone",
+  });
+  // The surviving ids are NOT retracted.
+  expect(
+    emitted.some(
+      (m) =>
+        (m.kind === "plan-epic-deleted" && m.id === "fn-1-keep") ||
+        (m.kind === "plan-task-deleted" && m.id === "fn-1-keep.1"),
+    ),
+  ).toBe(false);
+});
+
+test("sweep never retracts an epic whose project_dir is outside the configured roots", () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  // An epic from an UNCONFIGURED root: no file on disk under tmpDir, but its
+  // project_dir is elsewhere — the sweep must leave it entirely alone (its file
+  // lives under a tree this boot never scanned).
+  const tasks = JSON.stringify([
+    {
+      task_id: "fn-9-other.1",
+      epic_id: "fn-9-other",
+      task_number: 1,
+      title: "O",
+      target_repo: "/some/other/root/proj",
+      status: "open",
+    },
+  ]);
+  db.run(
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["fn-9-other", 9, "Other", "/some/other/root/proj", "open", 1, 0, tasks],
+  );
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+  // The configured root (tmpDir) has no files; census stays empty.
+  scanRoot(tmpDir, scanner);
+  scanner.sweep(db, [tmpDir]);
+  db.close();
+
+  // Nothing retracted — the out-of-scope epic and task are untouched.
+  expect(emitted).toEqual([]);
+});
+
+test("sweep does not retract a file mid-rewrite that fails to parse", () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  db.run(
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["fn-1-keep", 1, "Keep", tmpDir, "open", 1, 0, "[]"],
+  );
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+
+  // The file EXISTS on disk but holds torn JSON (mid-rewrite). The boot scan's
+  // onChange skips-and-logs it, but markSeen records it from the filename — so
+  // the sweep treats it as present and never retracts it.
+  const epicPath = join(planctlDir("epics"), "fn-1-keep.json");
+  writeFileSync(epicPath, "{ this is not valid json");
+  scanRoot(tmpDir, scanner);
+  scanner.sweep(db, [tmpDir]);
+  db.close();
+
+  // No retraction — a parse failure on an existing file is not a deletion.
+  expect(
+    emitted.some((m) => m.kind === "plan-epic-deleted" && m.id === "fn-1-keep"),
+  ).toBe(false);
 });
 
 // ---------------------------------------------------------------------------

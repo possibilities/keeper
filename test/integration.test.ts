@@ -1068,3 +1068,203 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
   const exitCode = await daemon.exited;
   expect(exitCode).toBe(0);
 }, 30000);
+
+test("end-to-end: downtime file deletion is reconciled on restart via the boot sweep", async () => {
+  // Two epics under the configured plan root: `survivor` keeps its epic file but
+  // LOSES one of its two task files during downtime; `gone` loses its epic file
+  // AND its task file. After a restart with no live onDelete, the boot sweep
+  // must retract exactly the deleted ids and leave the survivors intact.
+  const repo = join(planRoot, "repo");
+  const survivorEpic = "fn-10-survivor";
+  const goneEpic = "fn-11-gone";
+  const keepTask = `${survivorEpic}.1`;
+  const dropTask = `${survivorEpic}.2`;
+  const goneTask = `${goneEpic}.1`;
+
+  const epicsDir = join(planRoot, ".planctl", "epics");
+  const tasksDir = join(planRoot, ".planctl", "tasks");
+  mkdirSync(epicsDir, { recursive: true });
+  mkdirSync(tasksDir, { recursive: true });
+
+  const survivorEpicFile = join(epicsDir, `${survivorEpic}.json`);
+  const goneEpicFile = join(epicsDir, `${goneEpic}.json`);
+  const keepTaskFile = join(tasksDir, `${keepTask}.json`);
+  const dropTaskFile = join(tasksDir, `${dropTask}.json`);
+  const goneTaskFile = join(tasksDir, `${goneTask}.json`);
+
+  // `primary_repo` (→ epics.project_dir) is INSIDE planRoot so the sweep scopes
+  // these epics in. Write all files BEFORE the first boot (boot scan folds them).
+  writeFileSync(
+    survivorEpicFile,
+    JSON.stringify({
+      id: survivorEpic,
+      title: "Survivor",
+      status: "open",
+      primary_repo: repo,
+    }),
+  );
+  writeFileSync(
+    goneEpicFile,
+    JSON.stringify({
+      id: goneEpic,
+      title: "Gone",
+      status: "open",
+      primary_repo: repo,
+    }),
+  );
+  writeFileSync(
+    keepTaskFile,
+    JSON.stringify({
+      id: keepTask,
+      epic: survivorEpic,
+      title: "Keep",
+      target_repo: repo,
+    }),
+  );
+  writeFileSync(
+    dropTaskFile,
+    JSON.stringify({
+      id: dropTask,
+      epic: survivorEpic,
+      title: "Drop",
+      target_repo: repo,
+    }),
+  );
+  writeFileSync(
+    goneTaskFile,
+    JSON.stringify({
+      id: goneTask,
+      epic: goneEpic,
+      title: "GoneTask",
+      target_repo: repo,
+    }),
+  );
+
+  const spawnDaemon = (): Subprocess<"ignore", "pipe", "pipe"> =>
+    Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        KEEPER_DB: dbPath,
+        KEEPER_SOCK: sockPath,
+        KEEPER_CONFIG: configPath,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+  // --- First boot: fold all plan files into the projection. ---
+  daemon = spawnDaemon();
+  const bound = await retryUntil(
+    () => (existsSync(sockPath) ? true : null),
+    3000,
+  );
+  if (!bound) {
+    const err = await readStream(daemon.stderr);
+    throw new Error(`socket never bound (first boot).\nstderr:\n${err}`);
+  }
+
+  let reader = openDb(dbPath, { readonly: true }).db;
+  try {
+    // Both epics present, survivor carries TWO embedded tasks.
+    const folded = await retryUntil(() => {
+      const rows = reader
+        .query("SELECT epic_id, tasks FROM epics ORDER BY epic_id ASC")
+        .all() as { epic_id: string; tasks: string | null }[];
+      if (rows.length < 2) {
+        return null;
+      }
+      const surv = rows.find((r) => r.epic_id === survivorEpic);
+      const survTasks = surv?.tasks ? JSON.parse(surv.tasks) : [];
+      return survTasks.length === 2 ? rows : null;
+    }, 8000);
+    if (!folded) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `plan files never folded.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+  } finally {
+    reader.close();
+  }
+
+  // --- Downtime: stop the daemon, then delete files (no live onDelete). ---
+  daemon.kill("SIGTERM");
+  expect(await daemon.exited).toBe(0);
+  for (const p of [sockPath, `${sockPath}.lock`]) {
+    if (existsSync(p)) {
+      unlinkSync(p);
+    }
+  }
+  unlinkSync(dropTaskFile); // survivor loses one task
+  unlinkSync(goneEpicFile); // gone epic's file removed
+  unlinkSync(goneTaskFile); // gone epic's task removed
+
+  // --- Restart: the boot sweep reconciles the projection to disk. ---
+  daemon = spawnDaemon();
+  const reBound = await retryUntil(
+    () => (existsSync(sockPath) ? true : null),
+    3000,
+  );
+  if (!reBound) {
+    const err = await readStream(daemon.stderr);
+    throw new Error(`socket never bound (restart).\nstderr:\n${err}`);
+  }
+
+  reader = openDb(dbPath, { readonly: true }).db;
+  try {
+    // The gone epic row is removed; the survivor keeps exactly the kept task.
+    const reconciled = await retryUntil(() => {
+      const goneRow = reader
+        .query("SELECT epic_id FROM epics WHERE epic_id = ?")
+        .get(goneEpic) as { epic_id: string } | null;
+      if (goneRow != null) {
+        return null; // gone epic not yet retracted
+      }
+      const survRow = reader
+        .query("SELECT tasks FROM epics WHERE epic_id = ?")
+        .get(survivorEpic) as { tasks: string | null } | null;
+      if (survRow == null) {
+        return null;
+      }
+      const tasks = survRow.tasks
+        ? (JSON.parse(survRow.tasks) as { task_id: string }[])
+        : [];
+      // Survivor keeps the kept task and has dropped the deleted one.
+      const hasKeep = tasks.some((t) => t.task_id === keepTask);
+      const hasDrop = tasks.some((t) => t.task_id === dropTask);
+      return hasKeep && !hasDrop ? { tasks } : null;
+    }, 10000);
+    if (!reconciled) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `projection never reconciled after restart.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+    // The retraction rode the SAME synthetic tombstone events as a live delete.
+    const tombstones = reader
+      .query(
+        "SELECT session_id, hook_event FROM events WHERE hook_event IN ('EpicDeleted', 'TaskDeleted') ORDER BY id ASC",
+      )
+      .all() as { session_id: string; hook_event: string }[];
+    expect(tombstones).toContainEqual({
+      session_id: goneEpic,
+      hook_event: "EpicDeleted",
+    });
+    expect(tombstones).toContainEqual({
+      session_id: dropTask,
+      hook_event: "TaskDeleted",
+    });
+    expect(tombstones).toContainEqual({
+      session_id: goneTask,
+      hook_event: "TaskDeleted",
+    });
+  } finally {
+    reader.close();
+  }
+
+  daemon.kill("SIGTERM");
+  expect(await daemon.exited).toBe(0);
+}, 40000);

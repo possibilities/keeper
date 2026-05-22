@@ -48,6 +48,16 @@
  * emitting. Only an unrecoverable failure (the `subscribe` call itself
  * rejecting, the addon failing to load) exits non-zero → daemon `fatalExit` →
  * launchd restart.
+ *
+ * Boot reconciliation: a file deleted while the daemon was DOWN never fires a
+ * live `onDelete`, so it would leave a permanent projection ghost. After every
+ * root's boot scan has run (the {@link PlanScanner.markSeen} on-disk census is
+ * complete), {@link PlanScanner.sweep} retracts any projection id with no
+ * backing file — scoped strictly to configured roots (via the epic's
+ * `project_dir`) and run AFTER snapshot emission so a moved/rewritten file is
+ * re-emitted, not spuriously retracted. Each retraction rides the SAME task-2
+ * tombstone path (`plan-epic-deleted` / `plan-task-deleted`) as a live delete —
+ * no new event types.
  */
 
 import type { Database } from "bun:sqlite";
@@ -305,6 +315,17 @@ export class PlanScanner {
   private readonly lastEmitted = new Map<string, string>();
   /** path → id, so a delete can drop the right change-gate entry. */
   private readonly pathToId = new Map<string, string>();
+  /**
+   * The set of planctl ids whose backing `.json` file was actually enumerated
+   * on disk by a boot scan ({@link markSeen}, called from `scanPlanctlDir` for
+   * EVERY file regardless of parse outcome). The boot-reconciliation
+   * {@link sweep} diffs the projection against this census to retract ghosts —
+   * projection ids whose file was deleted while the daemon was down (no live
+   * `onDelete` ever fired). Keyed by the FILENAME-derived id (file basename
+   * minus `.json`), NOT a parse result: a file mid-rewrite that fails to parse
+   * still has its name on disk, so it is "seen" and never spuriously retracted.
+   */
+  private readonly seenOnDisk = new Set<string>();
 
   constructor(
     private readonly onSnapshot: (msg: PlanMessage) => void,
@@ -432,6 +453,132 @@ export class PlanScanner {
     this.lastEmitted.set(msg.id, serialized);
     this.onSnapshot(msg);
   }
+
+  /**
+   * Record that a `.planctl/{epics,tasks}/*.json` file was enumerated on disk
+   * during a boot scan — the on-disk census the {@link sweep} diffs against.
+   * Called from `scanPlanctlDir` for EVERY file BEFORE `onChange`, so it counts
+   * regardless of whether the snapshot parsed or was change-gate-suppressed.
+   *
+   * The id is derived from the filename (basename minus `.json`), which equals
+   * the planctl id — keying off the name (not a parse) means a file mid-rewrite
+   * that momentarily fails to parse is still "seen" and never spuriously
+   * retracted. A non-`.json` path is ignored.
+   */
+  markSeen(path: string): void {
+    if (!path.endsWith(".json")) {
+      return;
+    }
+    const segments = path.split(sep);
+    const base = segments[segments.length - 1];
+    const id = base.slice(0, -".json".length);
+    if (id.length > 0) {
+      this.seenOnDisk.add(id);
+    }
+  }
+
+  /**
+   * Boot-reconciliation sweep. After every configured root's boot scan has run
+   * (so {@link seenOnDisk} is the complete on-disk census), retract any
+   * projection id with no backing file — a deletion that happened while the
+   * daemon was down never fired a live `onDelete`, so without this pass it would
+   * leave a permanent ghost.
+   *
+   * Over-retraction is the danger this method is built to avoid:
+   * - **Run AFTER snapshot emission** (the caller invokes it once all boot scans
+   *   finished), so a moved/rewritten file is re-emitted, not retracted.
+   * - **Scope strictly to configured roots** via the epic's `project_dir`: an
+   *   epic whose `project_dir` is outside every `root` (or NULL) is never
+   *   touched — its file lives under an unscanned tree, so absence from the
+   *   census means nothing. Embedded tasks inherit their parent epic's scope.
+   * - **Diff against the actually-enumerated census** ({@link markSeen}, keyed
+   *   by filename so a mid-rewrite parse failure still counts as present).
+   *
+   * Each retraction reuses the task-2 tombstone path (`plan-epic-deleted` /
+   * `plan-task-deleted`) so main folds it through the SAME synthetic-event
+   * pipeline as a live delete — no new event types. The change-gate entry is
+   * dropped after each tombstone, mirroring {@link onDelete}.
+   *
+   * Read-only: uses the worker's own read-only connection. A malformed stored
+   * `tasks` array folds to empty (one bad epic never wedges the sweep).
+   */
+  sweep(db: Database, roots: string[]): void {
+    const epics = db
+      .query("SELECT epic_id, project_dir, tasks FROM epics")
+      .all() as {
+      epic_id: string;
+      project_dir: string | null;
+      tasks: string | null;
+    }[];
+
+    for (const epic of epics) {
+      // Scope by the epic's project_dir: only retract ids attributable to a
+      // root we actually scanned this boot. An out-of-scope epic (and all its
+      // embedded tasks) is left entirely untouched.
+      if (!isWithinRoots(epic.project_dir, roots)) {
+        continue;
+      }
+
+      // Decode the embedded tasks first (so we sweep them whether or not the
+      // epic itself survives). A malformed/NULL array → empty.
+      let tasks: { task_id?: unknown }[] = [];
+      if (epic.tasks != null && epic.tasks.length > 0) {
+        try {
+          const parsed = JSON.parse(epic.tasks);
+          if (Array.isArray(parsed)) {
+            tasks = parsed;
+          }
+        } catch {
+          // malformed stored array → treat as empty.
+        }
+      }
+      for (const t of tasks) {
+        const taskId = typeof t.task_id === "string" ? t.task_id : null;
+        if (taskId == null || this.seenOnDisk.has(taskId)) {
+          continue;
+        }
+        this.onSnapshot({
+          kind: "plan-task-deleted",
+          id: taskId,
+          epicId: epic.epic_id,
+        });
+        this.lastEmitted.delete(taskId);
+      }
+
+      if (!this.seenOnDisk.has(epic.epic_id)) {
+        this.onSnapshot({ kind: "plan-epic-deleted", id: epic.epic_id });
+        this.lastEmitted.delete(epic.epic_id);
+      }
+    }
+  }
+}
+
+/**
+ * Is `projectDir` inside (or equal to) one of the configured `roots`? Used to
+ * scope the boot sweep so an epic from an unconfigured/unscanned root is never
+ * retracted. A NULL/empty `projectDir` is never in scope (we can't attribute it
+ * to a scanned tree). Path-segment-aware so `/a/code-x` is NOT treated as inside
+ * `/a/code`.
+ *
+ * Pure. Exported for unit reach.
+ */
+export function isWithinRoots(
+  projectDir: string | null,
+  roots: string[],
+): boolean {
+  if (projectDir == null || projectDir.length === 0) {
+    return false;
+  }
+  for (const root of roots) {
+    if (projectDir === root) {
+      return true;
+    }
+    const prefix = root.endsWith(sep) ? root : root + sep;
+    if (projectDir.startsWith(prefix)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -542,7 +689,13 @@ function scanPlanctlDir(planctlDir: string, scanner: PlanScanner): void {
     }
     for (const name of names) {
       if (name.endsWith(".json")) {
-        scanner.onChange(join(dir, name));
+        const full = join(dir, name);
+        // Record the on-disk census FIRST (filename-keyed, parse-independent),
+        // then run the snapshot read. The sweep diffs the projection against
+        // this census; marking before onChange keeps a mid-rewrite parse
+        // failure from looking "absent".
+        scanner.markSeen(full);
+        scanner.onChange(full);
       }
     }
   }
@@ -705,6 +858,28 @@ function main(): void {
   // addon (which rejects every subscribe) effectively wedges the worker, and the
   // launchd restart is the recovery. We register each subscription as it
   // resolves; if shutdown raced ahead, we release it immediately.
+  // Boot-reconciliation barrier: the sweep can only run once EVERY root's boot
+  // scan has populated the on-disk census (a ghost is "a projection id no root
+  // saw"). Count per-root boot-scan completions (success OR failure — a root
+  // whose subscribe rejected contributes nothing to the census but must not
+  // stall the barrier) and fire the sweep on the last one. `data.roots` is fixed
+  // at spawn, so the target count is known up front.
+  const rootCount = data.roots.length;
+  let bootScansDone = 0;
+  const noteBootScanDone = (): void => {
+    bootScansDone += 1;
+    if (bootScansDone < rootCount || shuttingDown) {
+      return;
+    }
+    // All roots scanned. Retract any projection ghost (file deleted while the
+    // daemon was down) — scoped to configured roots, AFTER snapshot emission.
+    try {
+      scanner.sweep(db, data.roots);
+    } catch (err) {
+      console.error(`[plan-worker] boot sweep failed: ${stringifyErr(err)}`);
+    }
+  };
+
   void import("@parcel/watcher")
     .then((watcher) => {
       for (const root of data.roots) {
@@ -712,6 +887,9 @@ function main(): void {
           console.error(
             `[plan-worker] root ${root} does not exist; not watching`,
           );
+          // A non-existent root never scans, but it still counts toward the
+          // barrier — otherwise a missing root would stall the sweep forever.
+          noteBootScanDone();
           continue;
         }
         // Per-root drop-recovery scheduler: a recoverable FSEvents drop schedules
@@ -768,6 +946,7 @@ function main(): void {
             if (shuttingDown) {
               // Shutdown raced the subscribe resolution — release immediately.
               void sub.unsubscribe();
+              noteBootScanDone();
               return;
             }
             subscriptions.push(sub);
@@ -775,6 +954,8 @@ function main(): void {
             // (or were changed while keeperd was down) without waiting for a
             // watcher event. The change-gate suppresses unchanged files.
             scanRoot(root, scanner);
+            // This root's census is now recorded; advance the sweep barrier.
+            noteBootScanDone();
           })
           .catch((err) => {
             // Per-root isolation: one root's subscribe failure must not kill the
@@ -782,6 +963,9 @@ function main(): void {
             console.error(
               `[plan-worker] failed to subscribe to ${root}: ${stringifyErr(err)}`,
             );
+            // A failed subscribe scanned nothing, but still advances the barrier
+            // so a single bad root can't stall the sweep for the others.
+            noteBootScanDone();
           });
       }
     })
