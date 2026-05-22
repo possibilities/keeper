@@ -1,9 +1,8 @@
 #!/usr/bin/env bun
 /**
  * keeper-frames — a primitive "UI" over the read-only NDJSON-over-UDS subscribe
- * server (`src/server-worker.ts`). Where `keeper-subscribe.ts` is a raw frame
- * tap, this script renders a *page of jobs as a frame* and reprints a fresh
- * frame every time the visible projection changes.
+ * server (`src/server-worker.ts`). It renders a *page of jobs as a frame* and
+ * reprints a fresh frame every time the visible projection changes.
  *
  * It `query`s a 10-row page of `jobs` and renders it as a YAML stream: each
  * frame is a YAML document (leading `---`) listing every job as a single
@@ -39,9 +38,21 @@
  * and the rendered frame text itself. Both are overwritten each frame (always
  * the most recently printed frame) so a frame can be inspected out-of-band.
  *
- * Like its sibling it reuses `src/protocol.ts` (`encodeFrame` to write,
- * `LineBuffer` to de-frame) and `resolveSockPath()` so it stays a faithful
- * mirror of the contract, and it honors the read-only fence: it only ever sends
+ * Connection is resilient. There is no socket-level readiness handshake —
+ * keeperd binds the UDS only after boot-drain completes, so "data ready"
+ * reduces to "the socket accepts a connection". On first launch the client
+ * therefore RETRIES connecting (capped backoff) until keeperd is up and
+ * accepting, and on a dropped connection (e.g. a keeperd restart) it RECONNECTS
+ * the same way instead of exiting. Every connection-lifecycle transition prints
+ * a `...`-fenced YAML note (`event: connecting|connected|waiting|disconnected`,
+ * the initial connection included) — the same out-of-band "meta message"
+ * channel as the sidecar note, distinct from the server's `meta` staleness
+ * frame. Only Ctrl-C (SIGINT) or a terminal query error (`bad_frame` /
+ * `unknown_collection` on our own `query`, which a reconnect can't fix) exits.
+ *
+ * It reuses `src/protocol.ts` (`encodeFrame` to write, `LineBuffer` to
+ * de-frame) and `resolveSockPath()` so it stays a faithful mirror of the
+ * contract, and it honors the read-only fence: it only ever sends
  * `query` / `unsubscribe`.
  *
  * Usage:
@@ -75,6 +86,15 @@ const PAGE_LIMIT = 10;
  */
 const POLL_MS = 500;
 
+/**
+ * Reconnect/connect-wait backoff. The first (re)connect attempt fires
+ * immediately; each subsequent failed attempt waits
+ * `min(INITIAL_BACKOFF_MS * 2**(attempt-1), MAX_BACKOFF_MS)` before retrying, so
+ * a not-yet-up daemon is polled gently and a restart is picked up fast.
+ */
+const INITIAL_BACKOFF_MS = 250;
+const MAX_BACKOFF_MS = 5000;
+
 const HELP = `keeper-frames — primitive list UI over the keeper subscribe server
 
 Usage: bun scripts/keeper-frames.ts [--collection <name>] [--sock <path>] [--state <s> | --state-ne <s>]
@@ -97,6 +117,10 @@ The page is refetched on every change signal and on a steady poll, so it always
 shows the current top-N; a new frame prints only when the rendered output
 changes. Every emitted frame is also mirrored to two /tmp sidecar files (full
 JSON state + rendered frame), whose paths print in a ...-fenced note.
+
+The client waits for keeperd to come up and reconnects across restarts instead
+of exiting; each connection-lifecycle change prints a ...-fenced note
+(event: connecting|connected|waiting|disconnected). Ctrl-C exits cleanly.
 `;
 
 /** Per-collection primary-key column used as the page index key. */
@@ -205,6 +229,16 @@ async function main(): Promise<void> {
   // The steady-poll timer handle, cleared on close / SIGINT.
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Connection state. `currentSock` is the live socket (null between
+  // connections, so writes route to the current one, never a closed one);
+  // `attempt` counts consecutive failed (re)connect tries for backoff (reset on
+  // a successful `open`); `shuttingDown` makes SIGINT win the race against the
+  // reconnect loop. The socket type is whatever `Bun.connect` resolves to.
+  type Sock = Awaited<ReturnType<typeof Bun.connect>>;
+  let currentSock: Sock | null = null;
+  let attempt = 0;
+  let shuttingDown = false;
+
   /**
    * Collapse one full row to its display string, collection-aware:
    *   jobs  → `{basename(cwd)} · {title} · {state}`
@@ -296,15 +330,37 @@ async function main(): Promise<void> {
    * rendering happens only there, so we always draw the freshly fetched top-N.
    */
   function scheduleRefetch(): void {
+    if (!currentSock) {
+      // Disconnected — a reconnect is in flight; the fresh `open` re-queries.
+      return;
+    }
     if (queryInFlight) {
       refetchDirty = true;
       return;
     }
     queryInFlight = true;
-    socket.write(encodeFrame(query));
+    currentSock.write(encodeFrame(query));
   }
 
-  const buffer = new LineBuffer();
+  /**
+   * Print a connection-lifecycle "meta message": a `...`-fenced YAML doc naming
+   * the `event` and any detail keys. This is the SAME out-of-band channel as the
+   * sidecar note (`writeSidecars`), distinct from the server's `meta` staleness
+   * frame — it narrates connect/disconnect/wait so a long-lived viewer's stream
+   * is self-describing across keeperd restarts. Detail values route through
+   * `yamlScalar` so a path or message quotes correctly.
+   */
+  function emitLifecycle(
+    event: string,
+    detail: Record<string, unknown> = {},
+  ): void {
+    log("...");
+    log(`event: ${event}`);
+    for (const [k, v] of Object.entries(detail)) {
+      log(`${k}: ${yamlScalar(v)}`);
+    }
+    log("...");
+  }
 
   function handleFrame(frame: ServerFrame): void {
     if (frame.type === "result") {
@@ -333,8 +389,10 @@ async function main(): Promise<void> {
     } else if (frame.type === "error") {
       log(`# error ${frame.code} (rev ${frame.rev}): ${frame.message}`);
       if (!gotResult) {
-        // A bad_frame / unknown_collection on our own query is terminal.
-        socket.end();
+        // A bad_frame / unknown_collection on our own query is terminal — a
+        // reconnect can't fix a malformed query, so don't loop on it.
+        shuttingDown = true;
+        currentSock?.end();
         process.exit(1);
       }
     }
@@ -362,60 +420,127 @@ async function main(): Promise<void> {
     ...stateFilter,
   };
 
-  const socket = await Bun.connect({
-    unix: sockPath,
-    socket: {
-      open(sock) {
-        // First fetch, then start the steady-poll backstop. Both go through the
-        // same coalescing path so the poll never races a pending query.
-        queryInFlight = true;
-        sock.write(encodeFrame(query));
-        pollTimer = setInterval(scheduleRefetch, POLL_MS);
-      },
-      data(_sock, chunk) {
-        let lines: string[];
-        try {
-          lines = buffer.push(chunk.toString("utf8"));
-        } catch (err) {
-          die(`protocol error: ${(err as Error).message}`);
-        }
-        for (const line of lines) {
-          if (line.trim().length === 0) {
-            continue;
+  /**
+   * Tear down the just-dropped connection's per-connection state so the next
+   * `open` starts clean: stop the poll, forget the live socket, and reset the
+   * page + coalescing flags. `lastBody` is cleared too, so the first frame after
+   * a reconnect always reprints (the reader sees data resume even if the page is
+   * byte-identical to the pre-disconnect one). `gotResult` is NOT reset — it is
+   * the sticky "we've seen a good page" flag the terminal-error guard reads.
+   */
+  function teardownConnection(): void {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    currentSock = null;
+    order.length = 0;
+    byId.clear();
+    lastBody = null;
+    queryInFlight = false;
+    refetchDirty = false;
+  }
+
+  /**
+   * Open one connection and wire its handlers. Resolves as soon as the socket
+   * connects (the `open` handler then drives queries); rejects if the connect
+   * fails (daemon not up yet) so `connectWithRetry` can back off. Each
+   * connection gets its OWN `LineBuffer` — a partial line from a dropped socket
+   * must never bleed into the next one.
+   */
+  async function connectOnce(): Promise<void> {
+    const buffer = new LineBuffer();
+    await Bun.connect({
+      unix: sockPath,
+      socket: {
+        open(sock) {
+          // Connected: reset backoff, adopt the socket, announce, then fetch +
+          // start the steady-poll backstop (both via the coalescing path so the
+          // poll never races a pending query).
+          attempt = 0;
+          currentSock = sock;
+          emitLifecycle("connected", { sock: sockPath });
+          queryInFlight = true;
+          sock.write(encodeFrame(query));
+          pollTimer = setInterval(scheduleRefetch, POLL_MS);
+        },
+        data(_sock, chunk) {
+          let lines: string[];
+          try {
+            lines = buffer.push(chunk.toString("utf8"));
+          } catch (err) {
+            die(`protocol error: ${(err as Error).message}`);
           }
-          handleFrame(JSON.parse(line) as ServerFrame);
-        }
+          for (const line of lines) {
+            if (line.trim().length === 0) {
+              continue;
+            }
+            handleFrame(JSON.parse(line) as ServerFrame);
+          }
+        },
+        close() {
+          // The server closed (or keeperd restarted). Unless we're exiting,
+          // tear down and reconnect through the same backoff loop — never exit.
+          if (shuttingDown) {
+            return;
+          }
+          teardownConnection();
+          emitLifecycle("disconnected", {});
+          void connectWithRetry();
+        },
+        error(_sock, err) {
+          // A transport error on a live socket; `close` follows and drives the
+          // reconnect. Just narrate it here (don't double-schedule).
+          emitLifecycle("error", { message: err.message });
+        },
       },
-      close() {
-        if (pollTimer) {
-          clearInterval(pollTimer);
-        }
-        process.exit(gotResult ? 0 : 1);
-      },
-      error(_sock, err) {
-        die(`socket error: ${err.message}`);
-      },
-    },
-  }).catch((err: Error) => {
-    die(
-      `could not connect to ${sockPath}: ${err.message}\n` +
-        `  is keeperd running? (KEEPER_SOCK overrides the path)`,
-    );
-  });
+    });
+  }
+
+  /**
+   * (Re)establish the connection, retrying with capped backoff until it
+   * succeeds or we're shutting down. This single loop serves BOTH first-launch
+   * "wait for keeperd to come up" and post-disconnect reconnect — there's no
+   * socket-level readiness signal, so an accepted connection IS "data ready".
+   */
+  async function connectWithRetry(): Promise<void> {
+    emitLifecycle("connecting", { sock: sockPath });
+    while (!shuttingDown) {
+      try {
+        await connectOnce();
+        return; // connected — `open` took over; `close` re-drives this loop
+      } catch (err) {
+        attempt += 1;
+        const delay = Math.min(
+          INITIAL_BACKOFF_MS * 2 ** (attempt - 1),
+          MAX_BACKOFF_MS,
+        );
+        emitLifecycle("waiting", {
+          attempt,
+          retry_in_ms: delay,
+          reason: (err as Error).message,
+        });
+        await Bun.sleep(delay);
+      }
+    }
+  }
 
   // Clean unsubscribe + exit on Ctrl-C, so the server drops our subscription.
   process.on("SIGINT", () => {
+    shuttingDown = true;
     if (pollTimer) {
       clearInterval(pollTimer);
     }
     try {
-      socket.write(encodeFrame({ type: "unsubscribe", id: "frames" }));
-      socket.end();
+      currentSock?.write(encodeFrame({ type: "unsubscribe", id: "frames" }));
+      currentSock?.end();
     } catch {
       // socket already gone — nothing to release
     }
     process.exit(0);
   });
+
+  await connectWithRetry();
 }
 
 await main();
