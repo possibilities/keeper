@@ -1,0 +1,20 @@
+{
+  "branch_name": "fn-572-autopilot-flat-task-client",
+  "bundles": [
+    "sketch/autopilot-flat-task-list"
+  ],
+  "created_at": "2026-05-22T22:59:20Z",
+  "depends_on_epics": [],
+  "id": "fn-572-autopilot-flat-task-client",
+  "last_validated_at": "2026-05-22T22:59:24Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "autopilot flat task client",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-22T22:59:24Z"
+}

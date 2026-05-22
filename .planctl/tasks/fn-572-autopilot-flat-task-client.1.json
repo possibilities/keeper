@@ -1,0 +1,14 @@
+{
+  "bundles": [
+    "sketch/autopilot-flat-task-list"
+  ],
+  "created_at": "2026-05-22T22:59:20Z",
+  "depends_on": [],
+  "epic": "fn-572-autopilot-flat-task-client",
+  "id": "fn-572-autopilot-flat-task-client.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "add autopilot flat task client",
+  "updated_at": "2026-05-22T22:59:20Z"
+}
