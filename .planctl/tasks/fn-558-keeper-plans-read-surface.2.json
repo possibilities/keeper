@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-22T00:22:09Z",
+  "depends_on": [
+    "fn-558-keeper-plans-read-surface.1"
+  ],
+  "epic": "fn-558-keeper-plans-read-surface",
+  "id": "fn-558-keeper-plans-read-surface.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Reducer plan snapshot fold",
+  "updated_at": "2026-05-22T00:22:09Z"
+}
