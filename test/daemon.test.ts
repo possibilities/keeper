@@ -132,3 +132,136 @@ test("boot drain spanning multiple batches catches up every event", () => {
 
   db.close();
 });
+
+/**
+ * The plan-worker → main path: a `plan-epic`/`plan-task` snapshot message
+ * becomes a synthetic `EpicSnapshot`/`TaskSnapshot` events row that main inserts
+ * on its writable connection (entity id in `session_id`, the snapshot in
+ * `data`), then folds. This mirrors exactly what `runDaemon`'s
+ * `planWorker.onmessage` branch does (insert via the same positional column
+ * order, then pump a drain) — driven directly here so no Worker is spawned.
+ */
+function insertPlanSnapshot(
+  stmts: ReturnType<typeof openDb>["stmts"],
+  hookEvent: "EpicSnapshot" | "TaskSnapshot",
+  entityId: string,
+  ts: number,
+  data: Record<string, unknown>,
+): void {
+  stmts.insertEvent.run(
+    ts, // ts
+    entityId, // session_id (the entity pk)
+    null, // pid
+    hookEvent, // hook_event
+    "plan_snapshot", // event_type
+    null, // tool_name
+    null, // matcher
+    null, // cwd
+    null, // permission_mode
+    null, // agent_id
+    null, // agent_type
+    null, // stop_hook_active
+    JSON.stringify(data), // data (the full snapshot blob)
+    null, // subagent_agent_id
+    null, // spawn_name
+  );
+}
+
+test("synthetic EpicSnapshot/TaskSnapshot events fold into epics/tasks", () => {
+  const { db, stmts } = openDb(dbPath);
+
+  insertPlanSnapshot(stmts, "EpicSnapshot", "fn-7-add-oauth", 1, {
+    epic_number: 7,
+    title: "Add OAuth",
+    project_dir: "/Users/mike/code/keeper",
+    status: "in_progress",
+  });
+  insertPlanSnapshot(stmts, "TaskSnapshot", "fn-7-add-oauth.2", 2, {
+    epic_id: "fn-7-add-oauth",
+    task_number: 2,
+    title: "Wire the callback",
+    target_repo: "/Users/mike/code/keeper",
+    status: "open",
+  });
+
+  drainToCompletion(db);
+
+  // Cursor advanced past both synthetic events.
+  const cursor = (
+    db.query("SELECT last_event_id FROM reducer_state WHERE id = 1").get() as {
+      last_event_id: number;
+    }
+  ).last_event_id;
+  expect(cursor).toBe(2);
+
+  const epic = db
+    .query(
+      "SELECT epic_number, title, project_dir, status, last_event_id FROM epics WHERE epic_id = 'fn-7-add-oauth'",
+    )
+    .get() as {
+    epic_number: number;
+    title: string;
+    project_dir: string;
+    status: string;
+    last_event_id: number;
+  };
+  expect(epic.epic_number).toBe(7);
+  expect(epic.title).toBe("Add OAuth");
+  expect(epic.project_dir).toBe("/Users/mike/code/keeper");
+  expect(epic.status).toBe("in_progress");
+  expect(epic.last_event_id).toBe(1);
+
+  const task = db
+    .query(
+      "SELECT epic_id, task_number, title, target_repo, status, last_event_id FROM tasks WHERE task_id = 'fn-7-add-oauth.2'",
+    )
+    .get() as {
+    epic_id: string;
+    task_number: number;
+    title: string;
+    target_repo: string;
+    status: string;
+    last_event_id: number;
+  };
+  expect(task.epic_id).toBe("fn-7-add-oauth");
+  expect(task.task_number).toBe(2);
+  expect(task.title).toBe("Wire the callback");
+  expect(task.target_repo).toBe("/Users/mike/code/keeper");
+  expect(task.status).toBe("open");
+  expect(task.last_event_id).toBe(2);
+
+  db.close();
+});
+
+test("a re-arrived EpicSnapshot upserts last-write-wins with monotonic last_event_id", () => {
+  const { db, stmts } = openDb(dbPath);
+
+  insertPlanSnapshot(stmts, "EpicSnapshot", "fn-7-add-oauth", 1, {
+    epic_number: 7,
+    title: "Add OAuth",
+    project_dir: "/Users/mike/code/keeper",
+    status: "open",
+  });
+  drainToCompletion(db);
+
+  // A later snapshot for the same epic (status moved on disk) upserts in place.
+  insertPlanSnapshot(stmts, "EpicSnapshot", "fn-7-add-oauth", 2, {
+    epic_number: 7,
+    title: "Add OAuth",
+    project_dir: "/Users/mike/code/keeper",
+    status: "done",
+  });
+  drainToCompletion(db);
+
+  const rows = db
+    .query(
+      "SELECT status, last_event_id FROM epics WHERE epic_id = 'fn-7-add-oauth'",
+    )
+    .all() as { status: string; last_event_id: number }[];
+  // One row (idempotent upsert), the newer snapshot won, version advanced.
+  expect(rows.length).toBe(1);
+  expect(rows[0].status).toBe("done");
+  expect(rows[0].last_event_id).toBe(2);
+
+  db.close();
+});
