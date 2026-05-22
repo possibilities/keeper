@@ -1,0 +1,20 @@
+{
+  "branch_name": "fn-568-embed-tasks-in-epics-projection",
+  "bundles": [
+    "sketch/embed-tasks-in-epic-projection"
+  ],
+  "created_at": "2026-05-22T17:48:07Z",
+  "depends_on_epics": [],
+  "id": "fn-568-embed-tasks-in-epics-projection",
+  "last_validated_at": "2026-05-22T17:48:13Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Embed tasks in epics projection",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-22T17:48:13Z"
+}
