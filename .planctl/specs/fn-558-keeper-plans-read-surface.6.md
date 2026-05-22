@@ -47,5 +47,5 @@ Capture output as evidence.
 - [ ] Read-only fence preserved: scripts send only `query`/`unsubscribe`
 
 ## Done summary
-
+Made both client scripts collection-aware: keeper-frames takes --collection (default jobs), keys by the collection pk, and renders jobs/epics/tasks-specific row lines; keeper-subscribe help documents epics/tasks filter+sort columns. Jobs default behavior unchanged; read-only fence preserved.
 ## Evidence
