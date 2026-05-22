@@ -9,6 +9,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
   "title": "Fold current title on startup",
-  "updated_at": "2026-05-22T13:37:40Z"
+  "updated_at": "2026-05-22T14:04:43Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-22T14:04:43Z"
 }

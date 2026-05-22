@@ -73,5 +73,5 @@ sole writer of synthetic `TranscriptTitle` events.
 - [ ] CLAUDE.md state-machine + worker-contract sections note the startup-fold path
 
 ## Done summary
-
+Added a startup current-title fold (scanJobsForTitles + TranscriptLineStream.scanFile) scoped via jobs.transcript_path, so a custom-title set while keeperd was down folds at boot; runs after seedFromDb so the change-gate suppresses already-folded titles (no duplicate event on restart).
 ## Evidence
