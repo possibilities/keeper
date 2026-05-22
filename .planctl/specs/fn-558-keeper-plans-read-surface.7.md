@@ -55,5 +55,5 @@ full `bun test` + `bun run typecheck` + `bun run lint` clean.
 - [ ] `bun test` + `bun run typecheck` + `bun run lint` all green
 
 ## Done summary
-
+Added a hermetic plan-worker end-to-end integration test (.planctl write → synthetic event → fold → epics/tasks projection → UDS query/result + live patch) and updated CLAUDE.md/README.md for the read-only plans surface (four workers, epics/tasks collections, SCHEMA_VERSION v6, read-only plans fence replacing the old plans/planctl_mutations ban).
 ## Evidence
