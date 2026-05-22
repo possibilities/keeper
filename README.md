@@ -76,9 +76,10 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   session per job).
 - **No kernel watchers on keeper's own DB** (`fs.watch` / FSEvents / kqueue) —
   `data_version` polling is the change-detection primitive for keeper's SQLite.
-  The one watcher keeper does run (`@parcel/watcher`, on the *external* transcript
-  tree) is the scoped exception: those files are written by another process, so
-  the same-process-write blind spot does not apply.
+  The watchers keeper does run (`@parcel/watcher`, on the *external* transcript
+  tree at the configured `claude_projects_root` and on the configured plan
+  `roots`) are the scoped exception: those files are written by another process,
+  so the same-process-write blind spot does not apply.
 - **No caught-up barrier** and no in-process self-heal — a crash exits non-zero
   and the LaunchAgent restarts the single, well-tested recovery path.
 
@@ -102,10 +103,15 @@ Keeper has no `install` verb. Wire it up manually:
    mkdir -p ~/.local/state/keeper
    ```
 
-3. **(Optional) Configure plan roots.** The plan worker watches each project
-   root for `.planctl/{epics,tasks}` trees, folding them into the `epics`/`tasks`
-   collections. Roots come from `~/.config/keeper/config.yaml`; with no config
-   file the default is the single root `~/code`. To watch more, write:
+3. **(Optional) Configure roots.** `~/.config/keeper/config.yaml` carries two
+   INDEPENDENT keys:
+
+   - `roots` — the project roots the plan worker watches for
+     `.planctl/{epics,tasks}` trees, folding them into the `epics`/`tasks`
+     collections. Default (no config): the single root `~/code`.
+   - `claude_projects_root` — the single tree the transcript worker watches for
+     session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
+     Override only if your Claude Code transcripts live elsewhere.
 
    ```sh
    mkdir -p ~/.config/keeper
@@ -113,12 +119,18 @@ Keeper has no `install` verb. Wire it up manually:
    roots:
      - ~/code
      - ~/src
+   claude_projects_root: ~/.claude/projects
    YAML
    ```
 
-   A `~`-prefixed root is expanded to `$HOME`; a non-existent root is skipped
-   (the others keep watching). A missing or malformed config falls back to the
-   default.
+   A `~`-prefixed value is expanded to `$HOME`. For `roots`, a non-existent root
+   is skipped (the others keep watching); for `claude_projects_root` a not-yet-
+   existing path is returned as-is (the worker tolerates a late-appearing tree).
+   The two keys fall back independently — a missing/malformed one never disturbs
+   the other; a missing or malformed config falls back to both defaults.
+
+   (The legacy `KEEPER_WATCH_ROOT` env var is retired; if still set, the daemon
+   logs a one-line deprecation warning and ignores it.)
 
 4. **Symlink the plugin into Claude Code** for hook auto-discovery:
 
@@ -204,8 +216,9 @@ moved — the count/staleness signal, sharing one query across same-filter clien
 exactly as the patch pass shares one re-read per collection.
 
 A **third** Worker thread is the transcript-title producer: it watches the
-external transcript tree (`~/.claude/projects`) with `@parcel/watcher`,
-forward-tails each changed JSONL from a stored byte-offset, and on a
+external transcript tree (the `claude_projects_root` from
+`~/.config/keeper/config.yaml`, default `~/.claude/projects`) with
+`@parcel/watcher`, forward-tails each changed JSONL from a stored byte-offset, and on a
 `custom-title` line posts a `transcript-title` message to main. Main — the sole
 writer — turns that into a synthetic `TranscriptTitle` events row on its writable
 connection and pumps a wake; the reducer folds it as the priority-3 `transcript`

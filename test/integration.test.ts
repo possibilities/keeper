@@ -64,10 +64,15 @@ beforeEach(() => {
   mkdirSync(planRoot, { recursive: true });
   configPath = join(tmpDir, "config.yaml");
   // Write a hermetic config pointing to planRoot (which has no .planctl/ dirs
-  // yet). Passed to EVERY daemon spawn so the plan worker never boots-scans the
-  // real ~/code tree, which would flood the daemon with synthetic events and
-  // cause FSEvents congestion in tests that don't exercise the plan worker.
-  writeFileSync(configPath, `roots:\n  - ${JSON.stringify(planRoot)}\n`);
+  // yet) AND to the hermetic transcript watch root via `claude_projects_root`.
+  // Passed to EVERY daemon spawn so the plan worker never boots-scans the real
+  // ~/code tree (which would flood the daemon with synthetic events and cause
+  // FSEvents congestion) and the transcript worker watches our tmp dir instead
+  // of the real ~/.claude/projects.
+  writeFileSync(
+    configPath,
+    `roots:\n  - ${JSON.stringify(planRoot)}\nclaude_projects_root: ${JSON.stringify(watchRoot)}\n`,
+  );
   daemon = null;
 });
 
@@ -491,8 +496,9 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
 test("end-to-end: transcript worker → custom-title write flips jobs.title to 'transcript'", async () => {
   const sessionId = "sess-transcript-e2e";
 
-  // Spawn the daemon with the watch root pointed at our hermetic tmp dir so the
-  // transcript worker watches it instead of the real ~/.claude/projects.
+  // Spawn the daemon. The hermetic watch root is supplied via the tmp config's
+  // `claude_projects_root` key (set in beforeEach), so the transcript worker
+  // watches our tmp dir instead of the real ~/.claude/projects.
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
     env: {
@@ -500,7 +506,6 @@ test("end-to-end: transcript worker → custom-title write flips jobs.title to '
       KEEPER_DB: dbPath,
       KEEPER_SOCK: sockPath,
       KEEPER_CONFIG: configPath,
-      KEEPER_WATCH_ROOT: watchRoot,
     },
     stdout: "pipe",
     stderr: "pipe",

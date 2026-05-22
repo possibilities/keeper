@@ -52,7 +52,11 @@ agents working in the repo.
     statements, and `openDb(path, { readonly })` / `resolveDbPath()` /
     `resolveConfig()` / `resolvePlanRoots()` (the plan-worker root resolver, fed
     by `~/.config/keeper/config.yaml` with a `KEEPER_CONFIG` override and a
-    default `~/code`). Owns `SCHEMA_VERSION` (currently 6: v4 added
+    default `~/code`) / `resolveClaudeProjectsRoot()` (the transcript-worker watch
+    root resolver, reading the SEPARATE `claude_projects_root` key from the SAME
+    config doc — tilde-expanded, NOT existence-filtered, default
+    `~/.claude/projects`; the two config keys fall back INDEPENDENTLY, so a
+    malformed one never disturbs the other). Owns `SCHEMA_VERSION` (currently 6: v4 added
     `events.spawn_name` + `jobs.title_source`; v5 added `jobs.transcript_path`;
     v6 added the `epics` + `tasks` plan-projection tables) and the forward-only
     `migrate()` block.
@@ -74,8 +78,10 @@ agents working in the repo.
     `resolveFilter` builds the WHERE once and threads it to both the page SELECT
     and the count so they can't drift. `isMainThread`-guarded.
   - `src/transcript-worker.ts` — Worker thread; the priority-3 transcript-title
-    producer. Recursively watches the EXTERNAL transcript tree
-    (`~/.claude/projects`) via `@parcel/watcher` (keeper's first runtime dep, a
+    producer. Recursively watches the EXTERNAL transcript tree (the
+    `claude_projects_root` resolved on main via `resolveClaudeProjectsRoot()` and
+    passed as `workerData.watchRoot`, default `~/.claude/projects`) via
+    `@parcel/watcher` (keeper's first runtime dep, a
     native FSEvents-backed addon), forward-tails each changed JSONL with a
     deterministic line stream (byte-offset map keyed by path + partial-line
     buffer + read-to-EOF + truncation guard + malformed-skip + change-only emit,
@@ -163,7 +169,7 @@ agents working in the repo.
 |---|---|---|
 | `src/daemon.ts` | `runDaemon()` (via `import.meta.main`) | process lifecycle |
 | `src/reducer.ts` | `drain()` / `applyEvent()` | fold events → jobs/epics/tasks |
-| `src/db.ts` | `openDb()` / `resolveDbPath()` / `resolvePlanRoots()` | schema + PRAGMAs + stmts + plan-root config |
+| `src/db.ts` | `openDb()` / `resolveDbPath()` / `resolvePlanRoots()` / `resolveClaudeProjectsRoot()` | schema + PRAGMAs + stmts + plan-root + transcript-root config |
 | `src/wake-worker.ts` | Worker default body | `data_version` poll → wake |
 | `src/server-worker.ts` | Worker default body | UDS subscribe server: query → result (+ `total`) + live patches + `meta` staleness signal, routed by collection |
 | `src/transcript-worker.ts` | Worker default body / `TranscriptLineStream` | watch external transcript tree → tail `custom-title` → post `transcript-title` (priority-3 producer) |

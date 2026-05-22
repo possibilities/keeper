@@ -59,12 +59,21 @@ export function resolveSockPath(): string {
 const DEFAULT_PLAN_ROOTS = ["~/code"];
 
 /**
- * Parsed keeper daemon config. Only `roots` is consumed today — the directories
- * keeperd scans/watches for `.planctl` plan trees. Forward-compatible: unknown
- * keys are ignored.
+ * Default transcript watch root when the config file is absent or carries no
+ * `claude_projects_root`. The external tree Claude Code writes session JSONL to.
+ */
+const DEFAULT_CLAUDE_PROJECTS_ROOT = "~/.claude/projects";
+
+/**
+ * Parsed keeper daemon config. `roots` are the directories keeperd
+ * scans/watches for `.planctl` plan trees; `claude_projects_root` is the single
+ * directory the transcript worker watches for session JSONL. The two keys are
+ * INDEPENDENT — a malformed/missing one never disturbs the other.
+ * Forward-compatible: unknown keys are ignored.
  */
 export interface KeeperConfig {
   roots: string[];
+  claudeProjectsRoot?: string;
 }
 
 /**
@@ -83,36 +92,49 @@ export function resolveConfigPath(): string {
 /**
  * Read + parse the keeper config YAML via the native `Bun.YAML.parse` (no new
  * dependency). A missing file, a malformed document, or a missing/invalid
- * `roots:` key all fall back to the default single root (`~/code`) — the config
- * is best-effort and must never throw past this resolver. Only string entries
- * of `roots` survive; non-string junk is dropped.
+ * `roots:` key all fall back to the default single root (`~/code`); the same
+ * goes for `claude_projects_root` (default `~/.claude/projects`). The config is
+ * best-effort and must never throw past this resolver. The two keys resolve
+ * INDEPENDENTLY from the same parsed document — a bad `roots` never disturbs
+ * `claude_projects_root` and vice-versa. Only string entries of `roots` survive;
+ * non-string junk is dropped. A non-string `claude_projects_root` falls back to
+ * the default.
  */
 export function resolveConfig(): KeeperConfig {
   const path = resolveConfigPath();
+  let roots: string[] = [...DEFAULT_PLAN_ROOTS];
+  let claudeProjectsRoot: string = DEFAULT_CLAUDE_PROJECTS_ROOT;
   try {
     if (!existsSync(path)) {
-      return { roots: [...DEFAULT_PLAN_ROOTS] };
+      return { roots, claudeProjectsRoot };
     }
     const raw = Bun.YAML.parse(readFileSync(path, "utf8")) as unknown;
-    if (
-      raw &&
-      typeof raw === "object" &&
-      Array.isArray((raw as { roots?: unknown }).roots)
-    ) {
-      const roots = (raw as { roots: unknown[] }).roots.filter(
-        (r): r is string => typeof r === "string" && r.length > 0,
-      );
-      if (roots.length > 0) {
-        return { roots };
+    if (raw && typeof raw === "object") {
+      if (Array.isArray((raw as { roots?: unknown }).roots)) {
+        const parsed = (raw as { roots: unknown[] }).roots.filter(
+          (r): r is string => typeof r === "string" && r.length > 0,
+        );
+        if (parsed.length > 0) {
+          roots = parsed;
+        }
+      }
+      const cpr = (raw as { claude_projects_root?: unknown })
+        .claude_projects_root;
+      if (typeof cpr === "string" && cpr.length > 0) {
+        claudeProjectsRoot = cpr;
       }
     }
   } catch (err) {
     console.error(
-      `[keeper] config parse failed (${path}); using default roots:`,
+      `[keeper] config parse failed (${path}); using defaults:`,
       err,
     );
+    return {
+      roots: [...DEFAULT_PLAN_ROOTS],
+      claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
+    };
   }
-  return { roots: [...DEFAULT_PLAN_ROOTS] };
+  return { roots, claudeProjectsRoot };
 }
 
 /**
@@ -146,6 +168,27 @@ export function resolvePlanRoots(): string[] {
     }
   }
   return out;
+}
+
+/**
+ * Resolve the transcript watch root to a single clean absolute path: expand a
+ * leading `~` to `$HOME`, then return it. Mirrors `resolvePlanRoots`'s tilde
+ * expander but SIMPLER — it does NOT existence-filter. The transcript root may
+ * not exist yet on a fresh machine; returning the missing path is correct, and
+ * the worker tolerates a not-yet-present root (it logs and skips the watch until
+ * the tree appears). Defaults to `~/.claude/projects`.
+ */
+export function resolveClaudeProjectsRoot(): string {
+  const home = homedir();
+  const entry =
+    resolveConfig().claudeProjectsRoot ?? DEFAULT_CLAUDE_PROJECTS_ROOT;
+  if (entry === "~") {
+    return home;
+  }
+  if (entry.startsWith("~/")) {
+    return join(home, entry.slice(2));
+  }
+  return entry;
 }
 
 /**

@@ -50,7 +50,12 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { openDb, resolveDbPath, resolvePlanRoots } from "./db";
+import {
+  openDb,
+  resolveClaudeProjectsRoot,
+  resolveDbPath,
+  resolvePlanRoots,
+} from "./db";
 import type { PlanMessage, PlanWorkerData } from "./plan-worker";
 import { DEFAULT_BATCH_SIZE, drain } from "./reducer";
 import type { ServerWorkerData } from "./server-worker";
@@ -187,19 +192,23 @@ function runDaemon(): void {
   });
 
   // Spawn the transcript worker in the SAME post-migration window. It watches
-  // the external transcript tree (`~/.claude/projects`) and posts a
-  // `transcript-title` message whenever it tails a `custom-title` line — making
-  // the daemon an event PRODUCER for the first time. `dbPath` is the only
-  // required field; `watchRoot` defaults to `~/.claude/projects` worker-side
-  // (overridden by the e2e test to a hermetic tmp dir).
+  // the external transcript tree and posts a `transcript-title` message whenever
+  // it tails a `custom-title` line — making the daemon an event PRODUCER for the
+  // first time. The watch root is resolved ON MAIN via `resolveClaudeProjectsRoot()`
+  // (config `claude_projects_root` → absolute path, default `~/.claude/projects`)
+  // and passed as the always-populated `workerData.watchRoot`, mirroring how the
+  // plan worker receives `roots: resolvePlanRoots()`.
+  if (process.env.KEEPER_WATCH_ROOT) {
+    console.error(
+      "[keeperd] KEEPER_WATCH_ROOT is deprecated and ignored; set `claude_projects_root` in ~/.config/keeper/config.yaml instead",
+    );
+  }
   const transcriptWorker = new Worker(
     new URL("./transcript-worker.ts", import.meta.url).href,
     {
       workerData: {
         dbPath,
-        ...(process.env.KEEPER_WATCH_ROOT
-          ? { watchRoot: process.env.KEEPER_WATCH_ROOT }
-          : {}),
+        watchRoot: resolveClaudeProjectsRoot(),
       } satisfies TranscriptWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );

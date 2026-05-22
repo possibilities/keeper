@@ -15,6 +15,7 @@ import { JOBS_DESCRIPTOR, selectByIds } from "../src/collections";
 import {
   MAX_IN_PARAMS,
   openDb,
+  resolveClaudeProjectsRoot,
   resolveConfig,
   resolveDbPath,
   resolvePlanRoots,
@@ -618,6 +619,100 @@ test("resolvePlanRoots: expands ~, drops non-existent, keeps the good ones", asy
     expect(roots.every((r) => r.startsWith("/"))).toBe(true);
     // One missing root did not silence the surviving ones.
     expect(roots.length).toBe(2);
+  } finally {
+    if (original === undefined) delete process.env.KEEPER_CONFIG;
+    else process.env.KEEPER_CONFIG = original;
+  }
+});
+
+test("resolveClaudeProjectsRoot: present key expands ~ to an absolute path", async () => {
+  const original = process.env.KEEPER_CONFIG;
+  try {
+    const cfg = join(tmpDir, "config.yaml");
+    writeFileSync(cfg, "claude_projects_root: ~/some/where\n");
+    process.env.KEEPER_CONFIG = cfg;
+    const { homedir } = await import("node:os");
+    expect(resolveClaudeProjectsRoot()).toBe(join(homedir(), "some/where"));
+  } finally {
+    if (original === undefined) delete process.env.KEEPER_CONFIG;
+    else process.env.KEEPER_CONFIG = original;
+  }
+});
+
+test("resolveClaudeProjectsRoot: absent key defaults to ~/.claude/projects", async () => {
+  const original = process.env.KEEPER_CONFIG;
+  try {
+    const cfg = join(tmpDir, "config.yaml");
+    // A config with only `roots`, no claude_projects_root.
+    writeFileSync(cfg, "roots:\n  - ~/code\n");
+    process.env.KEEPER_CONFIG = cfg;
+    const { homedir } = await import("node:os");
+    expect(resolveClaudeProjectsRoot()).toBe(
+      join(homedir(), ".claude", "projects"),
+    );
+  } finally {
+    if (original === undefined) delete process.env.KEEPER_CONFIG;
+    else process.env.KEEPER_CONFIG = original;
+  }
+});
+
+test("resolveClaudeProjectsRoot: missing file + malformed YAML default to ~/.claude/projects", async () => {
+  const original = process.env.KEEPER_CONFIG;
+  try {
+    const { homedir } = await import("node:os");
+    const expected = join(homedir(), ".claude", "projects");
+    // Missing file.
+    process.env.KEEPER_CONFIG = join(tmpDir, "nope.yaml");
+    expect(resolveClaudeProjectsRoot()).toBe(expected);
+    // Malformed YAML must not throw past the resolver.
+    const cfg = join(tmpDir, "config.yaml");
+    writeFileSync(cfg, "claude_projects_root:\n  - [unbalanced\n: : :\n");
+    process.env.KEEPER_CONFIG = cfg;
+    expect(resolveClaudeProjectsRoot()).toBe(expected);
+  } finally {
+    if (original === undefined) delete process.env.KEEPER_CONFIG;
+    else process.env.KEEPER_CONFIG = original;
+  }
+});
+
+test("resolveClaudeProjectsRoot: non-string value falls back to the default", async () => {
+  const original = process.env.KEEPER_CONFIG;
+  try {
+    const cfg = join(tmpDir, "config.yaml");
+    // A numeric value is not a string → default.
+    writeFileSync(cfg, "claude_projects_root: 42\n");
+    process.env.KEEPER_CONFIG = cfg;
+    const { homedir } = await import("node:os");
+    expect(resolveClaudeProjectsRoot()).toBe(
+      join(homedir(), ".claude", "projects"),
+    );
+  } finally {
+    if (original === undefined) delete process.env.KEEPER_CONFIG;
+    else process.env.KEEPER_CONFIG = original;
+  }
+});
+
+test("resolveConfig: the two keys fall back independently from one document", () => {
+  const original = process.env.KEEPER_CONFIG;
+  try {
+    const cfg = join(tmpDir, "config.yaml");
+    // `roots` is malformed/empty (non-string junk dropped → falls back), but
+    // `claude_projects_root` is a valid string and must survive untouched.
+    writeFileSync(
+      cfg,
+      "roots:\n  - 123\n  - true\nclaude_projects_root: /tmp/transcripts\n",
+    );
+    process.env.KEEPER_CONFIG = cfg;
+    const config = resolveConfig();
+    expect(config.roots).toEqual(["~/code"]);
+    expect(config.claudeProjectsRoot).toBe("/tmp/transcripts");
+
+    // Inverse: valid `roots`, malformed (non-string) claude_projects_root → the
+    // key defaults while roots survives.
+    writeFileSync(cfg, "roots:\n  - /tmp/projects\nclaude_projects_root: 99\n");
+    const config2 = resolveConfig();
+    expect(config2.roots).toEqual(["/tmp/projects"]);
+    expect(config2.claudeProjectsRoot).toBe("~/.claude/projects");
   } finally {
     if (original === undefined) delete process.env.KEEPER_CONFIG;
     else process.env.KEEPER_CONFIG = original;

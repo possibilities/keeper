@@ -56,8 +56,11 @@ import { openDb } from "./db";
 export interface TranscriptWorkerData {
   dbPath: string;
   /**
-   * The transcript tree to watch. Defaults to `~/.claude/projects`. Overridable
-   * so the e2e test can point at a hermetic tmp dir (mirrors KEEPER_DB).
+   * The transcript tree to watch. The daemon resolves it on main via
+   * `resolveClaudeProjectsRoot()` (config `claude_projects_root`, default
+   * `~/.claude/projects`) and always supplies it. Stays optional so the
+   * direct-spawn hermetic test can pass it explicitly; `resolveWatchRoot` falls
+   * back to `~/.claude/projects` if a caller omits it.
    */
   watchRoot?: string;
 }
