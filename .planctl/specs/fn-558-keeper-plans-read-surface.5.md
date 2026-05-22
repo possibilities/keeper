@@ -54,5 +54,5 @@ clean shutdown awaits the fourth worker's `close`.
 - [ ] Boot docstring updated to four workers
 
 ## Done summary
-
+Wired the plan worker as keeperd's fourth Worker: spawned with roots from resolvePlanRoots, lifecycle in all three shutdown sites + onerror/close fatalExit, and a plan-epic/plan-task onmessage branch that inserts synthetic EpicSnapshot/TaskSnapshot events on main's writable connection then pumps a fold.
 ## Evidence
