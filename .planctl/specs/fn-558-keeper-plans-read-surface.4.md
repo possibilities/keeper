@@ -52,5 +52,5 @@ test): hand-insert `epics`/`tasks` rows, `query` each collection, assert
 - [ ] Injection invariant holds: no wire text reaches SQL except via descriptor map lookup
 
 ## Done summary
-
+Registered EPICS_DESCRIPTOR + TASKS_DESCRIPTOR in REGISTRY (version=last_event_id; filters include pk + status + project_dir/epic_id/target_repo), serving both plan collections over the existing UDS subscribe server with zero server-worker.ts edits. Added test/collections.test.ts covering registry resolution, paged result + total, pk filter, and status/epic_id filters.
 ## Evidence
