@@ -14,11 +14,12 @@ provenance and precedence: `spawn` < `payload` < `transcript`).
 
 The architecture is deliberately small. Keeper is built on Bun + `bun:sqlite`
 with a single third-party runtime dependency: `@parcel/watcher` (a native
-FSEvents-backed file watcher), used by the transcript-title worker. It is the one
-place keeper watches files instead of polling `data_version` — because the
-transcript JSONL is written by *another* process (Claude Code), so there is no
-keeper `data_version` to poll for it and the same-process-write blind spot that
-rules watchers out for keeper's own DB does not apply. The daemon detects new
+FSEvents-backed file watcher), used by the transcript-title worker and the plan
+worker. It is the one place keeper watches files instead of polling
+`data_version` — because those files (transcript JSONL written by Claude Code,
+`.planctl` JSON written by planctl) are written by *another* process, so there is
+no keeper `data_version` to poll for them and the same-process-write blind spot
+that rules watchers out for keeper's own DB does not apply. The daemon detects new
 events in its own DB by polling SQLite's `PRAGMA data_version` on a read-only
 connection from a Worker thread (the only reliable change-detection primitive on
 macOS for keeper's DB — see [Architecture](#architecture)), then drains the log
@@ -30,8 +31,9 @@ Keeper also exposes a **read-only NDJSON-over-UDS subscribe server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names
 a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
 page that doubles as a live subscription. `jobs` is the first and default
-collection; the surface is built so additional collections register without
-touching the wire protocol or the diff machinery. Page membership is frozen at
+collection, joined by `epics` and `tasks` (the read-only plans surface); the
+surface is built so additional collections register without touching the wire
+protocol or the diff machinery. Page membership is frozen at
 query time, but each row's cells stream `patch` frames as the reducer folds new
 events. The `result` page also carries a `total` (the filtered-set size,
 ignoring limit/offset) and the server emits a third frame, `meta`, when that set
@@ -65,7 +67,11 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   permitted in the *daemon* (keeperd's transcript worker tails the external
   transcript tree on a watch to supply the priority-3 `transcript` title) but
   stays forbidden in the hook.
-- **No plans / planctl_mutations** — keeper does not track planctl state.
+- **No plan write path through the socket** — keeper *reads* planctl state into
+  the `epics`/`tasks` projections (a fourth, read-only producer worker watches
+  the configured roots' `.planctl/{epics,tasks}` trees), but the socket carries
+  no plan mutation and keeper never writes a `.planctl` file. The read surface is
+  read-only end to end, same fence as `jobs`.
 - **No multi-session-per-job lineage** — v1 holds `job_id === session_id` (one
   session per job).
 - **No kernel watchers on keeper's own DB** (`fs.watch` / FSEvents / kqueue) —
@@ -96,13 +102,31 @@ Keeper has no `install` verb. Wire it up manually:
    mkdir -p ~/.local/state/keeper
    ```
 
-3. **Symlink the plugin into Claude Code** for hook auto-discovery:
+3. **(Optional) Configure plan roots.** The plan worker watches each project
+   root for `.planctl/{epics,tasks}` trees, folding them into the `epics`/`tasks`
+   collections. Roots come from `~/.config/keeper/config.yaml`; with no config
+   file the default is the single root `~/code`. To watch more, write:
+
+   ```sh
+   mkdir -p ~/.config/keeper
+   cat > ~/.config/keeper/config.yaml <<'YAML'
+   roots:
+     - ~/code
+     - ~/src
+   YAML
+   ```
+
+   A `~`-prefixed root is expanded to `$HOME`; a non-existent root is skipped
+   (the others keep watching). A missing or malformed config falls back to the
+   default.
+
+4. **Symlink the plugin into Claude Code** for hook auto-discovery:
 
    ```sh
    ln -s "$PWD/plugin" ~/.claude/plugins/keeper
    ```
 
-4. **Symlink the LaunchAgent template** into `~/Library/LaunchAgents/`:
+5. **Symlink the LaunchAgent template** into `~/Library/LaunchAgents/`:
 
    ```sh
    ln -s "$PWD/plist/arthack.keeperd.plist" ~/Library/LaunchAgents/
@@ -116,14 +140,14 @@ Keeper has no `install` verb. Wire it up manually:
    `~/Library/LaunchAgents/` must be owned by you and mode `644` (symlinking a
    `644` file is fine; macOS silently ignores a plist with wrong ownership).
 
-5. **Bootstrap the daemon** (modern, post-Catalina form — do not use the old
+6. **Bootstrap the daemon** (modern, post-Catalina form — do not use the old
    `launchctl load -w`):
 
    ```sh
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.plist
    ```
 
-6. **Verify** the agent is loaded and the projection is live:
+7. **Verify** the agent is loaded and the projection is live:
 
    ```sh
    launchctl print gui/$(id -u)/arthack.keeperd | head
@@ -185,10 +209,19 @@ forward-tails each changed JSONL from a stored byte-offset, and on a
 `custom-title` line posts a `transcript-title` message to main. Main — the sole
 writer — turns that into a synthetic `TranscriptTitle` events row on its writable
 connection and pumps a wake; the reducer folds it as the priority-3 `transcript`
-title. The three workers are fully independent (the transcript worker is
-read-only / write-free — it only feeds the log via main); main supervises all
-three lifecycles but routes none of their traffic, and any worker's `error` event
-escalates the whole process to a clean restart.
+title.
+
+A **fourth** Worker thread is the plan producer: it watches each configured
+project root (from `~/.config/keeper/config.yaml`, default `~/code`) for
+`.planctl/{epics,tasks}/*.json` files with `@parcel/watcher`, safe-parses each
+changed file, and posts a `plan-epic`/`plan-task` snapshot message to main. Main
+— again the sole writer — turns each into a synthetic `EpicSnapshot`/`TaskSnapshot`
+events row and pumps a wake; the reducer folds it as an idempotent upsert into the
+`epics`/`tasks` projection (served over the same socket as new collections). It is
+the second instance of the same producer archetype as the transcript worker:
+read-only / write-free, feeding the log only via main. The four workers are fully
+independent; main supervises all four lifecycles but routes none of their traffic,
+and any worker's `error` event escalates the whole process to a clean restart.
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).
@@ -200,7 +233,13 @@ list, see [CLAUDE.md](./CLAUDE.md).
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, title, title_source, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
 
-# Raw event log tail:
+# Plans projections — epics and tasks folded from the configured `.planctl` roots:
+sqlite3 ~/.local/state/keeper/keeper.db \
+  'SELECT epic_id, epic_number, title, status FROM epics ORDER BY updated_at DESC LIMIT 10'
+sqlite3 ~/.local/state/keeper/keeper.db \
+  'SELECT task_id, epic_id, task_number, title, status FROM tasks ORDER BY updated_at DESC LIMIT 10'
+
+# Raw event log tail (synthetic EpicSnapshot/TaskSnapshot rows appear here too):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT id, hook_event, session_id FROM events ORDER BY id DESC LIMIT 10'
 

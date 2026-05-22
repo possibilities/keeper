@@ -11,8 +11,12 @@ ordered page of jobs that doubles as a live subscription — frozen membership,
 live cells. The server is just another reader (own read-only connection, own
 `data_version` poll); the client **write path stays forbidden** — no mutations,
 no reactor, no socket-driven writes. Consumers may still read the `jobs` table
-directly. See `README.md` for the elevator pitch, install, and non-goals; this
-file is the in-codebase map for AI agents working in the repo.
+directly. V3 adds a second producer worker (`plan-worker`) that folds the
+configured roots' `.planctl/{epics,tasks}` trees into two new read-only
+projections (`epics`, `tasks`) served over the same socket as additional
+collections — read-only end to end, same fence as `jobs`. See `README.md` for the
+elevator pitch, install, and non-goals; this file is the in-codebase map for AI
+agents working in the repo.
 
 **AGENTS.md symlink** — `AGENTS.md` is a symlink to this file
 (`ln -s CLAUDE.md AGENTS.md`).
@@ -21,14 +25,16 @@ file is the in-codebase map for AI agents working in the repo.
 
 - `src/` — daemon + reducer + SQLite layer.
   - `src/daemon.ts` — `keeperd` entry point (`import.meta.main` guard). Boot
-    drain → spawn all three workers (wake + server + transcript) → steady-state
-    wake loop → SIGTERM clean exit. Exports `drainToCompletion(db, batchSize)` so
-    tests drive boot drain without spawning the workers. Main is also the SOLE
-    `events` producer for synthetic rows: a `transcript-title` message from the
-    transcript worker becomes a synthetic `TranscriptTitle` event inserted on the
-    existing WRITABLE connection (via `stmts.insertEvent`), then `pumpWakes()`
-    folds it — main never writes `jobs` directly, the title flows through the
-    event log.
+    drain → spawn all four workers (wake + server + transcript + plan) →
+    steady-state wake loop → SIGTERM clean exit. Exports
+    `drainToCompletion(db, batchSize)` so tests drive boot drain without spawning
+    the workers. Main is also the SOLE `events` producer for synthetic rows: a
+    `transcript-title` message from the transcript worker becomes a synthetic
+    `TranscriptTitle` event, and a `plan-epic`/`plan-task` message from the plan
+    worker becomes a synthetic `EpicSnapshot`/`TaskSnapshot` event — each inserted
+    on the existing WRITABLE connection (via `stmts.insertEvent`), then
+    `pumpWakes()` folds it. Main never writes `jobs`/`epics`/`tasks` directly; the
+    title and the plan snapshots flow through the event log.
   - `src/reducer.ts` — the fold. `drain(db, batchSize)` reads unfolded events
     and folds each via `applyEvent`, which wraps the projection write + cursor
     advance in ONE `BEGIN IMMEDIATE` transaction. Exports `DEFAULT_BATCH_SIZE`.
@@ -36,12 +42,20 @@ file is the in-codebase map for AI agents working in the repo.
     precedence (`{spawn:1, payload:2, transcript:3}`, NULL=0) — a higher-priority
     source wins, a lower one never clobbers, comparing persisted
     `(title, title_source)` in-txn for re-fold determinism. The synthetic
-    `TranscriptTitle` event folds at the priority-3 `'transcript'` source.
-  - `src/db.ts` — schema bootstrap (`events`, `jobs`, `reducer_state`, `meta`),
-    connection-local PRAGMAs (`applyPragmas`), prepared statements, and
-    `openDb(path, { readonly })` / `resolveDbPath()`. Owns `SCHEMA_VERSION`
-    (currently 5: v4 added `events.spawn_name` + `jobs.title_source`; v5 added
-    `jobs.transcript_path`) and the forward-only `migrate()` block.
+    `TranscriptTitle` event folds at the priority-3 `'transcript'` source. The
+    synthetic `EpicSnapshot`/`TaskSnapshot` events fold as idempotent upserts into
+    the `epics`/`tasks` projections (snapshot-replace by the entity pk carried in
+    `session_id`, with `last_event_id` bumped each fold), keyed off the snapshot
+    blob in `data` — re-fold deterministic, same as the title path.
+  - `src/db.ts` — schema bootstrap (`events`, `jobs`, `epics`, `tasks`,
+    `reducer_state`, `meta`), connection-local PRAGMAs (`applyPragmas`), prepared
+    statements, and `openDb(path, { readonly })` / `resolveDbPath()` /
+    `resolveConfig()` / `resolvePlanRoots()` (the plan-worker root resolver, fed
+    by `~/.config/keeper/config.yaml` with a `KEEPER_CONFIG` override and a
+    default `~/code`). Owns `SCHEMA_VERSION` (currently 6: v4 added
+    `events.spawn_name` + `jobs.title_source`; v5 added `jobs.transcript_path`;
+    v6 added the `epics` + `tasks` plan-projection tables) and the forward-only
+    `migrate()` block.
   - `src/wake-worker.ts` — Worker thread; own read-only connection polling
     `PRAGMA data_version` at ~50ms, posts contentless `{ kind: "wake" }`
     messages. `isMainThread`-guarded so a plain import is inert.
@@ -73,6 +87,22 @@ file is the in-codebase map for AI agents working in the repo.
     `TranscriptLineStream` core + `seedFromDb` are exported and drivable with no
     Worker or watcher; the watcher subscription is the owned external resource it
     `unsubscribe()`s in its shutdown handler. `isMainThread`-guarded.
+  - `src/plan-worker.ts` — Worker thread; the SECOND producer (after transcript)
+    and keeperd's fourth worker. Watches each configured project root (from
+    `resolvePlanRoots()`) for `.planctl/{epics,tasks}/*.json` via ONE recursive
+    `@parcel/watcher` subscribe per root with aggressive POSITIVE ignore globs
+    (`node_modules`, `.git`, `dist`, … — NOT a negated glob, which parcel
+    mishandles; the `.planctl/{epics,tasks}/*.json` filter is an in-callback
+    `classifyPlanPath` check). Treats every watch event as "go look": `fstat` +
+    size-bound + safe-parse the CURRENT file, route on path+existence not
+    `event.type` (planctl writes atomically via `os.replace`). On a changed file
+    it posts a `{ kind: "plan-epic" }`/`{ kind: "plan-task" }` snapshot message to
+    main, change-gated against the last-emitted serialized snapshot so a restart
+    full-scan doesn't re-emit. READ-ONLY (own read-only connection for the
+    `seedFromDb` restart-seed; never writes the DB — main is the sole writer). The
+    pure `PlanScanner` core + `seedFromDb` are exported and drivable with no Worker
+    or watcher; each subscription is an owned external resource `unsubscribe()`d in
+    the shutdown handler. `isMainThread`-guarded.
   - `src/collections.ts` — the collection registry that namespaces the read
     surface. A `CollectionDescriptor` holds everything collection-specific
     (table, served columns, pk, the per-row `version` column the diff fires on,
@@ -87,12 +117,18 @@ file is the in-codebase map for AI agents working in the repo.
     whereClause, params)` is the descriptor-parameterized count-query — the
     filtered-set `COUNT(*)` plus a `group_concat(pk)` membership token (ordered
     by pk, empty-set normalized to `total=0`/`token=""`) that the `meta` signal
-    diffs on. `jobs` is the first/only descriptor today (its `filters` include
-    the pk `job_id` for detail-page single-item subscribe). The descriptor is
-    the SOLE identifier-injection gate: only its constants are interpolated into
-    SQL; wire filter keys are resolved by map lookup, never interpolated.
-    `jobs`'s served `columns` include `title` + `title_source` (read-only
-    display/provenance — both OUT of `sortable`/`filters`).
+    diffs on. `REGISTRY` holds three descriptors — `jobs` (pk `job_id`), `epics`
+    (pk `epic_id`), and `tasks` (pk `task_id`); the plans surface added the latter
+    two as descriptor-only entries with zero `server-worker.ts` edits, proving the
+    namespacing. Each `filters` map includes the pk for detail-page single-item
+    subscribe (`tasks` also filters `epic_id` for parent-scoped subscribe). The
+    descriptor is the SOLE identifier-injection gate: only its constants are
+    interpolated into SQL; wire filter keys are resolved by map lookup, never
+    interpolated — load-bearing for `epics`/`tasks`, whose `project_dir` /
+    `target_repo` hold opaque foreign-process JSON bound as filter VALUES, never
+    as identifiers. `jobs`'s served `columns` include `title` + `title_source`,
+    and `epics`/`tasks` serve `title` + `*_number` as read-only display (all OUT
+    of `sortable`/`filters` where they are display-only).
   - `src/protocol.ts` — the wire protocol: `query` / `result` / `patch` / `meta`
     frame shapes (every frame names a `collection`; `result` / `patch` are
     generic over `Row`; `result` carries `total` — the filtered-set size; `patch`
@@ -100,8 +136,10 @@ file is the in-codebase map for AI agents working in the repo.
     `total` but no row; `query.collection` is required), NDJSON line framing
     (buffer-until-`\n` + max-line cap), and the page/diff helpers shared by the
     server worker.
-  - `src/types.ts` — `Event`, `Job`, `ReducerState` row shapes (`Job` carries
-    `transcript_path` — display/debug only, never sorted/filtered).
+  - `src/types.ts` — `Event`, `Job`, `Epic`, `Task`, `ReducerState` row shapes
+    (`Job` carries `transcript_path` — display/debug only, never sorted/filtered;
+    `Epic`/`Task` are the plan-projection rows, folded from the synthetic
+    `EpicSnapshot`/`TaskSnapshot` events).
   - `src/version.ts` — `VERSION` constant.
 - `plugin/` — the Claude Code hook plugin (symlink target for
   `~/.claude/plugins/keeper`).
@@ -117,19 +155,20 @@ file is the in-codebase map for AI agents working in the repo.
 - `plist/arthack.keeperd.plist` — LaunchAgent template (no install verb; see
   README for the manual symlink + `launchctl bootstrap`).
 - `test/` — `bun test --isolate` suites (db, reducer, wake-worker, daemon,
-  smoke, integration, events-writer).
+  collections, plan-worker, smoke, integration, events-writer).
 
 ## Module entry points
 
 | Module | Entry | Role |
 |---|---|---|
 | `src/daemon.ts` | `runDaemon()` (via `import.meta.main`) | process lifecycle |
-| `src/reducer.ts` | `drain()` / `applyEvent()` | fold events → jobs |
-| `src/db.ts` | `openDb()` / `resolveDbPath()` | schema + PRAGMAs + stmts |
+| `src/reducer.ts` | `drain()` / `applyEvent()` | fold events → jobs/epics/tasks |
+| `src/db.ts` | `openDb()` / `resolveDbPath()` / `resolvePlanRoots()` | schema + PRAGMAs + stmts + plan-root config |
 | `src/wake-worker.ts` | Worker default body | `data_version` poll → wake |
 | `src/server-worker.ts` | Worker default body | UDS subscribe server: query → result (+ `total`) + live patches + `meta` staleness signal, routed by collection |
 | `src/transcript-worker.ts` | Worker default body / `TranscriptLineStream` | watch external transcript tree → tail `custom-title` → post `transcript-title` (priority-3 producer) |
-| `src/collections.ts` | `getCollection()` / `selectByIds()` / `countAndToken()` | collection registry + descriptor-parameterized by-id read + count/membership-token query |
+| `src/plan-worker.ts` | Worker default body / `PlanScanner` | watch external `.planctl/{epics,tasks}` trees → safe-parse → post `plan-epic`/`plan-task` snapshots (second producer) |
+| `src/collections.ts` | `getCollection()` / `selectByIds()` / `countAndToken()` | collection registry (`jobs`/`epics`/`tasks`) + descriptor-parameterized by-id read + count/membership-token query |
 | `src/protocol.ts` | `encodeFrame()` / `LineBuffer` / frame types | NDJSON wire protocol (collection-namespaced `query`/`result`/`patch`/`meta` frames) |
 | `plugin/hooks/events-writer.ts` | `main()` | one event row per hook |
 
@@ -179,13 +218,26 @@ The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
   re-opens it (see above). keeper has no process-liveness overlay (unlike
   jobctl's server, which keeps SQL `ended` sticky and un-ends from PID liveness)
   — the fold IS the live view, so the re-open lives in the reducer.
+- `EpicSnapshot` / `TaskSnapshot` (**synthetic**, inserted by keeperd's main
+  thread from the plan worker's `plan-epic`/`plan-task` messages, not the hook) →
+  these do NOT touch `jobs`; they project into the SEPARATE `epics` / `tasks`
+  tables. The `session_id` carries the entity pk (`epic_id` / `task_id`); the
+  `data` blob is the full state-on-disk snapshot. The fold is an **idempotent
+  upsert** (snapshot-replace by pk, `last_event_id` bumped each fold) — plans are
+  state-on-disk, so a full snapshot per event keeps re-fold deterministic (replay
+  reproduces identical `epics`/`tasks` rows). `tasks.status` is the producer's
+  derived value (`worker_done_at` present → `done`, else `open`). No lifecycle /
+  title interaction with `jobs`.
 - Everything else (PreToolUse, PostToolUse, Notification, Subagent*, unknown
   forward-compat events) → no jobs write; the cursor still advances.
 
 **V3: keeperd is now also a producer.** V1/V2 the hook was the sole `events`
-writer; V3 adds the transcript worker → main pipeline, where main inserts the
-synthetic `TranscriptTitle` events above. The hook remains the only writer of
-*hook* events; main is the only writer of *synthetic* events.
+writer; V3 adds the transcript worker → main pipeline (synthetic
+`TranscriptTitle` events) and the plan worker → main pipeline (synthetic
+`EpicSnapshot`/`TaskSnapshot` events) above. The hook remains the only writer of
+*hook* events; main is the only writer of *synthetic* events (both producers feed
+the log only via main's writable connection — they never write the DB
+themselves).
 
 `mode` and `title_history` were retired in schema v3 — `events.permission_mode`
 is still recorded, but it is no longer projected into `jobs`, and titles are a
@@ -194,7 +246,9 @@ single live value with no history array. Schema v4 added `events.spawn_name`
 provenance/precedence), both nullable with no backfill. Schema v5 added
 `jobs.transcript_path` (the absolute path to the session's transcript JSONL,
 seeded from a SessionStart payload — display/debug only), nullable, NULL-backfill
-on old rows.
+on old rows. Schema v6 added the `epics` + `tasks` plan-projection tables (new
+tables via `CREATE TABLE IF NOT EXISTS`, so existing rows in other tables are
+untouched — a clean forward-only step).
 
 ## Event-sourcing invariants
 
@@ -219,14 +273,16 @@ on old rows.
 - **The hook is the sole writer of *hook* events; main is the sole writer of
   *synthetic* events.** Since V3 keeperd's main thread inserts synthetic
   `TranscriptTitle` rows (from the transcript worker's `transcript-title`
-  message) on its existing writable connection via `stmts.insertEvent`, then
-  `pumpWakes()`. A synthetic event id is allocated after the session's
-  SessionStart in practice, so it folds at priority 3 over the lower-tier title.
-  Because the title lives in the immutable event log — never written straight to
-  `jobs` — a re-fold from scratch (rewind cursor, `DELETE FROM jobs`, re-drain)
-  reproduces the identical `(title, title_source)`: synthetic events replay
-  deterministically just like hook events. The transcript worker stays read-only;
-  it never writes the DB.
+  message) and synthetic `EpicSnapshot`/`TaskSnapshot` rows (from the plan
+  worker's `plan-epic`/`plan-task` messages) on its existing writable connection
+  via `stmts.insertEvent`, then `pumpWakes()`. A synthetic `TranscriptTitle` id is
+  allocated after the session's SessionStart in practice, so it folds at priority
+  3 over the lower-tier title. Because every projection-driving fact lives in the
+  immutable event log — never written straight to `jobs`/`epics`/`tasks` — a
+  re-fold from scratch (rewind cursor, `DELETE FROM jobs`/`epics`/`tasks`,
+  re-drain) reproduces the identical rows: synthetic events (titles AND plan
+  snapshots) replay deterministically just like hook events. Both producer
+  workers stay read-only; neither ever writes the DB.
 - **PRAGMAs are connection-local** — `applyPragmas` runs on every `openDb`,
   including the wake worker's and the server worker's own read-only connections.
   The hook opens a fresh connection per invocation; without `busy_timeout` it
@@ -259,25 +315,37 @@ on old rows.
   For the DB, `PRAGMA data_version` polling on a read-only connection is the only
   correct change primitive — stay in autocommit (no `BEGIN`) in the watcher, or
   `data_version` freezes for that connection. **Carve-out (V3):** native watching
-  of *external* transcript files in keeperd (`src/transcript-worker.ts`, via
-  `@parcel/watcher`) IS permitted — those files are written by *other* processes
-  (Claude Code), so the same-process-write blind spot does not apply, and there
-  is no `data_version` for a foreign file tree. Treat a watcher event as "go
-  look", never as the data: always `fstat` + forward-tail from the stored
-  byte-offset. This carve-out is for the external transcript tree ONLY — never
-  point a file watcher at keeper's own DB.
+  of *external* files in keeperd IS permitted for two trees written by *other*
+  processes — the transcript files (`src/transcript-worker.ts`, written by Claude
+  Code) and the `.planctl/{epics,tasks}` plan trees (`src/plan-worker.ts`, written
+  by planctl) — both via `@parcel/watcher`. Those files are foreign-written, so
+  the same-process-write blind spot does not apply, and there is no `data_version`
+  for a foreign file tree. Treat a watcher event as "go look", never as the data:
+  always `fstat` + (transcript) forward-tail from the stored byte-offset / (plan)
+  size-bound + safe-parse the current file. This carve-out is for those external
+  trees ONLY — never point a file watcher at keeper's own DB.
 - **No third-party deps in the hook.** Keep `plugin/hooks/events-writer.ts`'s
   import graph to `bun:sqlite` + local files only — Bun cold start is ~30ms and
   the SessionEnd hook has a 1.5s timeout budget.
 - **The hook must always exit 0.** Never let a parse/DB failure propagate a
   non-zero exit — that can fail-closed the user's session. Losing one event row
   is acceptable; wedging the agent is not. Log to stderr only.
-- **No in-process self-heal.** Any unrecoverable error — including either
-  worker's `error` event — calls `fatalExit` → `process.exit(1)` → the
-  LaunchAgent restarts the single recovery path. Do not respawn either worker
+- **No in-process self-heal.** Any unrecoverable error — including any of the
+  four workers' `error` event — calls `fatalExit` → `process.exit(1)` → the
+  LaunchAgent restarts the single recovery path. Do not respawn any worker
   in-process.
-- **No prise/env-var integration, multi-session lineage, plans/planctl_mutations,
-  or harness_meta** — all explicitly out of scope.
+- **No prise/env-var integration, multi-session lineage, or harness_meta** — all
+  explicitly out of scope.
+- **Plans are READ-ONLY, like everything else keeper serves.** keeper *reads*
+  planctl state — the plan worker (V3) watches the configured roots'
+  `.planctl/{epics,tasks}` trees and folds snapshots into the `epics`/`tasks`
+  projections served over the same socket. FORBIDDEN: any plan WRITE path — the
+  socket never carries a plan mutation, keeper never writes a `.planctl` file, and
+  no `planctl_mutations` / command surface exists. The fence is the same as
+  `jobs`: read the projection, subscribe over the socket, never mutate. (This
+  legitimizes the read-only plans projection that the original "no
+  plans/planctl_mutations" ban predated — the ban is now scoped to the *write*
+  path only.)
 - **Transcript tailing is scoped to the daemon, never the hook (V3).** keeperd's
   transcript worker MAY tail external transcript JSONL on a watch to produce
   priority-3 `TranscriptTitle` events. FORBIDDEN: transcript reading in the hook
@@ -322,11 +390,14 @@ Three archetypes:
   UDS) plus its own state (subscriptions, lock file, partial-write buffers). It
   must release its external resources inside its own shutdown handler —
   `terminate()` alone would leak the process-owned socket and lock.
-- **Producer worker** (like `transcript-worker`): observes an external source (a
-  watched file tree) and posts typed `{ kind }` messages that main turns into
-  synthetic `events` rows — it FEEDS the log but never writes the DB itself
-  (read-only or no DB connection at all; the write stays on main's connection).
-  Like the subsystem worker it owns an external resource (the watcher
-  subscription) it must release in its own shutdown handler. The
+- **Producer worker** (`transcript-worker` AND `plan-worker` — two instances):
+  observes an external source (a watched file tree) and posts typed `{ kind }`
+  messages that main turns into synthetic `events` rows — it FEEDS the log but
+  never writes the DB itself (read-only or no DB connection at all; the write
+  stays on main's connection). Like the subsystem worker it owns an external
+  resource (the watcher subscription — `plan-worker` holds an ARRAY of them, one
+  per root) it must release in its own shutdown handler. The
   source-of-truth-stays-on-main discipline keeps the event log re-fold
-  deterministic.
+  deterministic. `plan-worker` clones this contract verbatim: pure exported core
+  (`PlanScanner` + `seedFromDb`), `isMainThread` guard, read-only restart-seed
+  connection, change-gated emission, and per-root `unsubscribe()` teardown.

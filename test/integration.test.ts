@@ -41,6 +41,8 @@ let tmpDir: string;
 let dbPath: string;
 let sockPath: string;
 let watchRoot: string;
+let planRoot: string;
+let configPath: string;
 let daemon: Subprocess<"ignore", "pipe", "pipe"> | null = null;
 
 beforeEach(() => {
@@ -53,6 +55,13 @@ beforeEach(() => {
   // the default `~/.claude/projects` so the test never touches the real tree.
   watchRoot = join(tmpDir, "projects");
   mkdirSync(watchRoot, { recursive: true });
+  // Hermetic plan root for the plan-worker e2e — a tmp dir the daemon watches
+  // for `.planctl/{epics,tasks}/*.json` instead of the real `~/code`. The
+  // daemon resolves it via a tmp `KEEPER_CONFIG` YAML so the watcher can never
+  // touch the real `~/code`/`~/src` trees.
+  planRoot = join(tmpDir, "plan-root");
+  mkdirSync(planRoot, { recursive: true });
+  configPath = join(tmpDir, "config.yaml");
   daemon = null;
 });
 
@@ -556,3 +565,217 @@ test("end-to-end: transcript worker → custom-title write flips jobs.title to '
   const exitCode = await daemon.exited;
   expect(exitCode).toBe(0);
 }, 15000);
+
+test("end-to-end: plan worker → .planctl write → synthetic event → fold → epics/tasks projection + UDS subscribe", async () => {
+  const epicId = "fn-9-keeper-e2e-plans";
+  const taskId = `${epicId}.1`;
+
+  // Point the daemon's plan worker at a hermetic tmp root via a tmp config YAML
+  // (KEEPER_CONFIG override) so the watcher never touches the real ~/code/~/src.
+  writeFileSync(configPath, `roots:\n  - ${JSON.stringify(planRoot)}\n`);
+  const epicsDir = join(planRoot, ".planctl", "epics");
+  const tasksDir = join(planRoot, ".planctl", "tasks");
+  mkdirSync(epicsDir, { recursive: true });
+  mkdirSync(tasksDir, { recursive: true });
+  const epicFile = join(epicsDir, `${epicId}.json`);
+  const taskFile = join(tasksDir, `${taskId}.json`);
+
+  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_SOCK: sockPath,
+      KEEPER_CONFIG: configPath,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  // Boot: writer conn + boot drain + spawn all four workers + bind the socket.
+  // The plan worker subscribes its watch AFTER migrate, so poll for the socket
+  // file as the "daemon is up" proof before writing plan files.
+  const bound = await retryUntil(
+    () => (existsSync(sockPath) ? true : null),
+    3000,
+  );
+  if (!bound) {
+    const out = await readStream(daemon.stdout);
+    const err = await readStream(daemon.stderr);
+    throw new Error(`socket never bound.\nstdout:\n${out}\nstderr:\n${err}`);
+  }
+  // The watcher subscribe resolves slightly after the socket binds (the plan
+  // worker imports @parcel/watcher then subscribes one watch per root). Give it a
+  // generous anchor window before the first write so the create event is caught
+  // even when the full `--isolate` suite is starving the FSEvents callback.
+  await Bun.sleep(600);
+
+  // --- write the plan files → watcher fires → worker posts snapshots → main
+  // inserts synthetic EpicSnapshot/TaskSnapshot events → reducer folds them. ---
+  writeFileSync(
+    epicFile,
+    JSON.stringify({
+      id: epicId,
+      title: "Keeper E2E Plans Epic",
+      status: "in_progress",
+      primary_repo: "/tmp/keeper-e2e-repo",
+    }),
+  );
+  writeFileSync(
+    taskFile,
+    JSON.stringify({
+      id: taskId,
+      epic: epicId,
+      title: "First plans task",
+      target_repo: "/tmp/keeper-e2e-repo",
+      // No worker_done_at → derived status "open".
+    }),
+  );
+
+  const { db: reader } = openDb(dbPath, { readonly: true });
+  try {
+    // --- synthetic events land, with the right hook_event + entity key. ---
+    const events = await retryUntil(() => {
+      const rows = reader
+        .query(
+          "SELECT session_id, hook_event FROM events WHERE hook_event IN ('EpicSnapshot', 'TaskSnapshot') ORDER BY id ASC",
+        )
+        .all() as Array<{ session_id: string; hook_event: string }>;
+      return rows.length >= 2 ? rows : null;
+    }, 8000);
+    if (!events) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `synthetic plan events never landed.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+    expect(events).toContainEqual({
+      session_id: epicId,
+      hook_event: "EpicSnapshot",
+    });
+    expect(events).toContainEqual({
+      session_id: taskId,
+      hook_event: "TaskSnapshot",
+    });
+
+    // --- epics projection: one row with the folded columns. ---
+    const epic = await retryUntil(() => {
+      const row = reader
+        .query(
+          "SELECT epic_id, epic_number, title, project_dir, status, last_event_id FROM epics WHERE epic_id = ?",
+        )
+        .get(epicId) as {
+        epic_id: string;
+        epic_number: number | null;
+        title: string | null;
+        project_dir: string | null;
+        status: string | null;
+        last_event_id: number;
+      } | null;
+      return row ? row : null;
+    }, 8000);
+    if (!epic) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `epic never projected.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+    expect(epic.epic_number).toBe(9);
+    expect(epic.title).toBe("Keeper E2E Plans Epic");
+    expect(epic.project_dir).toBe("/tmp/keeper-e2e-repo");
+    expect(epic.status).toBe("in_progress");
+    const baselineEpicEventId = epic.last_event_id;
+
+    // --- tasks projection: one row with the folded columns + derived status. ---
+    const task = await retryUntil(() => {
+      const row = reader
+        .query(
+          "SELECT task_id, epic_id, task_number, title, target_repo, status FROM tasks WHERE task_id = ?",
+        )
+        .get(taskId) as {
+        task_id: string;
+        epic_id: string | null;
+        task_number: number | null;
+        title: string | null;
+        target_repo: string | null;
+        status: string | null;
+      } | null;
+      return row ? row : null;
+    }, 8000);
+    if (!task) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `task never projected.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+    expect(task.epic_id).toBe(epicId);
+    expect(task.task_number).toBe(1);
+    expect(task.title).toBe("First plans task");
+    expect(task.target_repo).toBe("/tmp/keeper-e2e-repo");
+    expect(task.status).toBe("open");
+
+    // --- UDS subscribe over the epics collection: query → result, then a live
+    // patch when the epic file changes (state-on-disk → snapshot → fold). ---
+    const client = await connectClient(sockPath);
+    try {
+      client.send({ type: "query", collection: "epics", id: "qe" });
+      const result = await retryUntil(
+        () => client.frames.find((f) => f.type === "result") ?? null,
+      );
+      if (!result || result.type !== "result") {
+        const out = await readStream(daemon.stdout);
+        const err = await readStream(daemon.stderr);
+        throw new Error(
+          `epics result never arrived.\nstdout:\n${out}\nstderr:\n${err}`,
+        );
+      }
+      expect(result.collection).toBe("epics");
+      expect(result.rows.some((r) => r.epic_id === epicId)).toBe(true);
+
+      // Rewrite the epic file with a new status → a new snapshot → fold → patch.
+      writeFileSync(
+        epicFile,
+        JSON.stringify({
+          id: epicId,
+          title: "Keeper E2E Plans Epic",
+          status: "done",
+          primary_repo: "/tmp/keeper-e2e-repo",
+        }),
+      );
+
+      const patch = await retryUntil(
+        () =>
+          client.frames.find(
+            (f) =>
+              f.type === "patch" &&
+              f.collection === "epics" &&
+              f.row.epic_id === epicId &&
+              (f.row.last_event_id as number) > baselineEpicEventId,
+          ) ?? null,
+        8000,
+      );
+      if (!patch || patch.type !== "patch") {
+        const out = await readStream(daemon.stdout);
+        const err = await readStream(daemon.stderr);
+        throw new Error(
+          `epics patch never arrived.\nstdout:\n${out}\nstderr:\n${err}`,
+        );
+      }
+      expect(patch.collection).toBe("epics");
+      expect(patch.row.status).toBe("done");
+    } finally {
+      client.socket.end();
+    }
+  } finally {
+    reader.close();
+  }
+
+  // Clean shutdown: SIGTERM → all four workers tear down → exit 0. The plan
+  // worker unsubscribes its watch in its shutdown handler.
+  daemon.kill("SIGTERM");
+  const exitCode = await daemon.exited;
+  expect(exitCode).toBe(0);
+}, 30000);
