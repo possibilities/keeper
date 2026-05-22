@@ -59,5 +59,5 @@ to fold a delete).
 - [ ] re-fold determinism holds across create→delete sequences; suite green
 
 ## Done summary
-
+Plan-file deletions now retract projection state live via synthetic tombstone events: onDelete emits plan-task-deleted (epicId recovered from the change-gate) / plan-epic-deleted, main folds them into TaskDeleted/EpicDeleted events, and the reducer splices the element from the parent epic array / deletes the epic row. Idempotent and replay-deterministic across create→delete.
 ## Evidence
