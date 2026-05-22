@@ -100,9 +100,96 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
   jsonColumns: new Set([]),
 };
 
-/** The registry, keyed by wire-facing collection name. One entry today. */
+/**
+ * The `epics` descriptor — the plans read surface's first collection. Columns
+ * mirror the v6 `epics` table 1:1 (`src/db.ts` `CREATE_EPICS`). `version` is
+ * `last_event_id` (the monotonic per-row column the diff fires on, bumped by the
+ * snapshot fold). Sort defaults to `updated_at desc` like `jobs`. `filters`
+ * carries the pk (`epic_id` — detail-page single-item subscribe) plus the
+ * natural filter columns `status` + `project_dir`. `title`/`epic_number` are
+ * read-only display — served but out of `sortable`/`filters`. `project_dir`
+ * holds opaque foreign-process JSON; it's a bound filter VALUE here, never an
+ * interpolated identifier or a filesystem-read driver.
+ */
+export const EPICS_DESCRIPTOR: CollectionDescriptor = {
+  name: "epics",
+  table: "epics",
+  columns: [
+    "epic_id",
+    "epic_number",
+    "title",
+    "project_dir",
+    "status",
+    "last_event_id",
+    "updated_at",
+  ],
+  pk: "epic_id",
+  version: "last_event_id",
+  sortable: new Set([
+    "updated_at",
+    "last_event_id",
+    "epic_id",
+    "epic_number",
+    "status",
+  ]),
+  defaultSort: { column: "updated_at", dir: "desc" },
+  filters: {
+    epic_id: "epic_id",
+    status: "status",
+    project_dir: "project_dir",
+  },
+  jsonColumns: new Set([]),
+};
+
+/**
+ * The `tasks` descriptor — the plans read surface's second collection. Columns
+ * mirror the v6 `tasks` table 1:1 (`src/db.ts` `CREATE_TASKS`). `version` is
+ * `last_event_id` (snapshot-fold-bumped). `filters` carries the pk (`task_id`)
+ * plus `epic_id` (parent-scoped subscribe), `status`, and `target_repo`.
+ * `title`/`task_number` are read-only display. `target_repo` is opaque
+ * foreign-process JSON — a bound filter VALUE, never an interpolated identifier.
+ */
+export const TASKS_DESCRIPTOR: CollectionDescriptor = {
+  name: "tasks",
+  table: "tasks",
+  columns: [
+    "task_id",
+    "epic_id",
+    "task_number",
+    "title",
+    "target_repo",
+    "status",
+    "last_event_id",
+    "updated_at",
+  ],
+  pk: "task_id",
+  version: "last_event_id",
+  sortable: new Set([
+    "updated_at",
+    "last_event_id",
+    "task_id",
+    "task_number",
+    "status",
+  ]),
+  defaultSort: { column: "updated_at", dir: "desc" },
+  filters: {
+    task_id: "task_id",
+    epic_id: "epic_id",
+    status: "status",
+    target_repo: "target_repo",
+  },
+  jsonColumns: new Set([]),
+};
+
+/**
+ * The registry, keyed by wire-facing collection name. `jobs` + the two plan
+ * collections — adding each was a descriptor + entry, zero `server-worker.ts`
+ * edits.
+ */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
+  [EPICS_DESCRIPTOR.name, EPICS_DESCRIPTOR],
+  [TASKS_DESCRIPTOR.name, TASKS_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */
