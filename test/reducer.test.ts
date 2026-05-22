@@ -772,20 +772,47 @@ function getEpic(epicId: string) {
     status: string | null;
     last_event_id: number | null;
     updated_at: number;
+    tasks: string;
   } | null;
 }
 
-function getTask(taskId: string) {
-  return db.query("SELECT * FROM tasks WHERE task_id = ?").get(taskId) as {
-    task_id: string;
-    epic_id: string | null;
-    task_number: number | null;
-    title: string | null;
-    target_repo: string | null;
-    status: string | null;
-    last_event_id: number | null;
-    updated_at: number;
-  } | null;
+/** The element shape stored in `epics.tasks` as of schema v7. */
+interface EmbeddedTask {
+  task_id: string;
+  epic_id: string | null;
+  task_number: number | null;
+  title: string | null;
+  target_repo: string | null;
+  status: string | null;
+}
+
+/** Decode an epic's embedded tasks array (schema v7). NULL/missing → []. */
+function getTasks(epicId: string): EmbeddedTask[] {
+  const row = db
+    .query("SELECT tasks FROM epics WHERE epic_id = ?")
+    .get(epicId) as { tasks: string | null } | null;
+  if (row == null || row.tasks == null || row.tasks.length === 0) {
+    return [];
+  }
+  return JSON.parse(row.tasks) as EmbeddedTask[];
+}
+
+/** Find one embedded task by id across all epics (schema v7). */
+function getTask(taskId: string): EmbeddedTask | null {
+  const rows = db.query("SELECT tasks FROM epics").all() as {
+    tasks: string | null;
+  }[];
+  for (const r of rows) {
+    if (r.tasks == null || r.tasks.length === 0) {
+      continue;
+    }
+    const arr = JSON.parse(r.tasks) as EmbeddedTask[];
+    const found = arr.find((t) => t.task_id === taskId);
+    if (found != null) {
+      return found;
+    }
+  }
+  return null;
 }
 
 test("EpicSnapshot folds into an epics row with all columns + monotonic last_event_id", () => {
@@ -805,12 +832,20 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     status: "open",
     last_event_id: id,
     updated_at: epic?.updated_at ?? 0,
+    // A first-sight EpicSnapshot defaults the embedded array to empty.
+    tasks: "[]",
   });
   expect(epic?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);
 });
 
-test("TaskSnapshot folds into a tasks row with all columns + derived status", () => {
+test("TaskSnapshot folds into the parent epic's tasks array with all element fields + derived status", () => {
+  // Seed the parent epic first so the task folds via the UPDATE path.
+  epicSnapshotEvent("fn-1-add-oauth", {
+    epic_number: 1,
+    title: "Add OAuth",
+    status: "open",
+  });
   const id = taskSnapshotEvent("fn-1-add-oauth.3", {
     epic_id: "fn-1-add-oauth",
     task_number: 3,
@@ -827,13 +862,127 @@ test("TaskSnapshot folds into a tasks row with all columns + derived status", ()
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
     status: "done",
-    last_event_id: id,
-    updated_at: task?.updated_at ?? 0,
   });
+  // The fold bumps the parent epic's last_event_id (so it patches).
+  expect(getEpic("fn-1-add-oauth")?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);
 });
 
-test("a later snapshot for the same id upserts idempotently (last-write-wins)", () => {
+test("TaskSnapshot before its epic inserts a shell row carrying the task", () => {
+  const id = taskSnapshotEvent("fn-1-add-oauth.1", {
+    epic_id: "fn-1-add-oauth",
+    task_number: 1,
+    title: "First",
+    target_repo: "/repo",
+    status: "open",
+  });
+  drainAll();
+  // A shell epic row exists: epic_id set, scalar columns NULL, tasks carrying
+  // the one task.
+  const epic = getEpic("fn-1-add-oauth");
+  expect(epic).not.toBeNull();
+  expect(epic?.epic_number).toBeNull();
+  expect(epic?.title).toBeNull();
+  expect(epic?.status).toBeNull();
+  expect(epic?.last_event_id).toBe(id);
+  expect(getTasks("fn-1-add-oauth").map((t) => t.task_id)).toEqual([
+    "fn-1-add-oauth.1",
+  ]);
+});
+
+test("a later EpicSnapshot fills the shell scalars without clobbering the tasks array", () => {
+  taskSnapshotEvent("fn-1.1", {
+    epic_id: "fn-1",
+    task_number: 1,
+    title: "T",
+    status: "open",
+  });
+  const epicId = epicSnapshotEvent("fn-1", {
+    epic_number: 1,
+    title: "Real Title",
+    status: "active",
+  });
+  drainAll();
+  const epic = getEpic("fn-1");
+  expect(epic?.title).toBe("Real Title");
+  expect(epic?.status).toBe("active");
+  expect(epic?.last_event_id).toBe(epicId);
+  // The array the shell held survives the EpicSnapshot upsert.
+  expect(getTasks("fn-1").map((t) => t.task_id)).toEqual(["fn-1.1"]);
+});
+
+test("multiple tasks sort deterministically by (task_number, task_id)", () => {
+  epicSnapshotEvent("fn-1", { epic_number: 1, title: "E", status: "open" });
+  // Inserted out of order; the fold re-sorts on every write.
+  taskSnapshotEvent("fn-1.2", { epic_id: "fn-1", task_number: 2, title: "B" });
+  taskSnapshotEvent("fn-1.1", { epic_id: "fn-1", task_number: 1, title: "A" });
+  taskSnapshotEvent("fn-1.3", { epic_id: "fn-1", task_number: 1, title: "C" });
+  drainAll();
+  // task_number asc, then task_id asc on the tie (1 < 1 → break on id).
+  expect(getTasks("fn-1").map((t) => t.task_id)).toEqual([
+    "fn-1.1",
+    "fn-1.3",
+    "fn-1.2",
+  ]);
+});
+
+test("a TaskSnapshot for an existing task replaces (not appends) the element", () => {
+  epicSnapshotEvent("fn-1", { epic_number: 1, title: "E", status: "open" });
+  taskSnapshotEvent("fn-1.1", {
+    epic_id: "fn-1",
+    task_number: 1,
+    title: "old",
+  });
+  taskSnapshotEvent("fn-1.1", {
+    epic_id: "fn-1",
+    task_number: 1,
+    title: "new",
+  });
+  drainAll();
+  const tasks = getTasks("fn-1");
+  expect(tasks.length).toBe(1);
+  expect(tasks[0]?.title).toBe("new");
+});
+
+test("a TaskSnapshot with no epic_id is skipped-and-logged (orphan), cursor advances", () => {
+  const errors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.join(" "));
+  };
+  try {
+    const orphanId = taskSnapshotEvent("orphan.1", {
+      task_number: 1,
+      title: "no parent",
+    });
+    drainAll();
+    // No epic row created for the orphan; cursor still advanced past it.
+    expect(getTask("orphan.1")).toBeNull();
+    expect(getCursor()).toBe(orphanId);
+    expect(errors.some((e) => e.includes("no epic_id"))).toBe(true);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("a malformed stored tasks array folds to [] in-txn (never throws / wedges)", () => {
+  // Plant a malformed array directly on an epic row, then fold a task into it.
+  epicSnapshotEvent("fn-1", { epic_number: 1, title: "E", status: "open" });
+  drainAll();
+  db.run("UPDATE epics SET tasks = '{not json' WHERE epic_id = 'fn-1'");
+  const id = taskSnapshotEvent("fn-1.1", {
+    epic_id: "fn-1",
+    task_number: 1,
+    title: "T",
+  });
+  drainAll();
+  // The fold treated the malformed array as [] and wrote just the new task —
+  // no throw, the cursor advanced.
+  expect(getTasks("fn-1").map((t) => t.task_id)).toEqual(["fn-1.1"]);
+  expect(getCursor()).toBe(id);
+});
+
+test("a later epic snapshot for the same id upserts idempotently (last-write-wins)", () => {
   epicSnapshotEvent("fn-1-add-oauth", {
     epic_number: 1,
     title: "Add OAuth",
@@ -902,7 +1051,16 @@ test("plan folds do not touch the jobs projection", () => {
   expect(getTask("fn-1.1")?.title).toBe("T");
 });
 
-test("from-scratch re-fold reproduces identical epics + tasks rows", () => {
+test("from-scratch re-fold reproduces byte-identical epics rows (incl. embedded tasks)", () => {
+  // A TaskSnapshot BEFORE its EpicSnapshot exercises the shell-insert path on
+  // replay; two tasks out of sort order exercise the deterministic re-sort.
+  taskSnapshotEvent("fn-1.2", {
+    epic_id: "fn-1",
+    task_number: 2,
+    title: "Second",
+    target_repo: "/repo",
+    status: "open",
+  });
   epicSnapshotEvent("fn-1", {
     epic_number: 1,
     title: "Add OAuth",
@@ -916,7 +1074,8 @@ test("from-scratch re-fold reproduces identical epics + tasks rows", () => {
     target_repo: "/repo",
     status: "done",
   });
-  // A later snapshot for the epic (upsert) to exercise the conflict branch.
+  // A later snapshot for the epic (upsert) to exercise the conflict branch —
+  // must NOT clobber the embedded tasks array.
   epicSnapshotEvent("fn-1", {
     epic_number: 1,
     title: "Add OAuth v2",
@@ -926,18 +1085,17 @@ test("from-scratch re-fold reproduces identical epics + tasks rows", () => {
   drainAll();
 
   const epicsBefore = db.query("SELECT * FROM epics ORDER BY epic_id").all();
-  const tasksBefore = db.query("SELECT * FROM tasks ORDER BY task_id").all();
+  // Sanity: the embedded array is sorted (task_number, task_id) — same key the
+  // migration backfill uses, so a migrated row equals this re-folded one.
+  expect(getTasks("fn-1").map((t) => t.task_id)).toEqual(["fn-1.1", "fn-1.2"]);
 
-  // Rewind the cursor + DELETE the projections, then re-drain. drain() replays
+  // Rewind the cursor + DELETE the projection, then re-drain. drain() replays
   // events in autoincrement-id order (not FS-arrival order), so the fold is a
   // pure function of the persisted log — the rebuilt rows must be byte-identical.
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
-  db.run("DELETE FROM tasks");
   drainAll();
 
   const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
-  const tasksAfter = db.query("SELECT * FROM tasks ORDER BY task_id").all();
   expect(epicsAfter).toEqual(epicsBefore);
-  expect(tasksAfter).toEqual(tasksBefore);
 });

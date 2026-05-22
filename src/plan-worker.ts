@@ -499,13 +499,16 @@ function scanPlanctlDir(planctlDir: string, scanner: PlanScanner): void {
  */
 export function seedFromDb(db: Database, scanner: PlanScanner): void {
   const epics = db
-    .query("SELECT epic_id, epic_number, title, project_dir, status FROM epics")
+    .query(
+      "SELECT epic_id, epic_number, title, project_dir, status, tasks FROM epics",
+    )
     .all() as {
     epic_id: string;
     epic_number: number | null;
     title: string | null;
     project_dir: string | null;
     status: string | null;
+    tasks: string | null;
   }[];
   for (const e of epics) {
     const msg: PlanEpicMessage = {
@@ -517,33 +520,46 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       status: e.status,
     };
     scanner.seed(e.epic_id, JSON.stringify(msg));
-  }
 
-  const tasks = db
-    .query(
-      "SELECT task_id, epic_id, task_number, title, target_repo, status FROM tasks",
-    )
-    .all() as {
-    task_id: string;
-    epic_id: string | null;
-    task_number: number | null;
-    title: string | null;
-    target_repo: string | null;
-    status: string | null;
-  }[];
-  for (const t of tasks) {
-    const msg: PlanTaskMessage = {
-      kind: "plan-task",
-      id: t.task_id,
-      epicId: t.epic_id,
-      number: t.task_number,
-      title: t.title,
-      targetRepo: t.target_repo,
-      // The projection stores the derived status verbatim; default to "open"
-      // for a (legacy) NULL so the reconstructed seed matches a fresh scan.
-      status: t.status ?? "open",
-    };
-    scanner.seed(t.task_id, JSON.stringify(msg));
+    // As of schema v7 each epic embeds its tasks as a JSON-array column. Decode
+    // it and reconstruct each task's seed message field-for-field to match
+    // {@link buildTaskMessage} — `taskNumberFromId` for the number,
+    // `status ?? "open"` for the derived status — or the change-gate would
+    // re-emit every plan-task on every boot. A malformed/NULL array is treated
+    // as empty (one bad row never wedges the seed).
+    let tasks: {
+      task_id: string;
+      epic_id: string | null;
+      title: string | null;
+      target_repo: string | null;
+      status: string | null;
+    }[] = [];
+    if (e.tasks != null && e.tasks.length > 0) {
+      try {
+        const parsed = JSON.parse(e.tasks);
+        if (Array.isArray(parsed)) {
+          tasks = parsed;
+        }
+      } catch {
+        // malformed stored array → treat as empty.
+      }
+    }
+    for (const t of tasks) {
+      const msg: PlanTaskMessage = {
+        kind: "plan-task",
+        id: t.task_id,
+        epicId: t.epic_id,
+        // Reconstruct the number from the id (matches buildTaskMessage), NOT
+        // the stored task_number, so a fresh scan's message is byte-identical.
+        number: taskNumberFromId(t.task_id),
+        title: t.title,
+        targetRepo: t.target_repo,
+        // The projection stores the derived status verbatim; default to "open"
+        // for a (legacy) NULL so the reconstructed seed matches a fresh scan.
+        status: t.status ?? "open",
+      };
+      scanner.seed(t.task_id, JSON.stringify(msg));
+    }
   }
 }
 

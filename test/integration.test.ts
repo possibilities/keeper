@@ -30,7 +30,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { openDb } from "../src/db";
-import { epicNumberFromId } from "../src/plan-worker";
+import { epicNumberFromId, taskNumberFromId } from "../src/plan-worker";
 import { encodeFrame, LineBuffer, type ServerFrame } from "../src/protocol";
 
 /** Repo root — this file lives at <root>/test, so one level up. */
@@ -813,21 +813,25 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
     expect(epic.status).toBe("in_progress");
     const baselineEpicEventId = epic.last_event_id;
 
-    // --- tasks projection: one row with the folded columns + derived status. ---
+    // --- tasks projection: embedded in the parent epic's `tasks` array (schema
+    // v7 — no standalone tasks table). Read the epic's array and find the task. ---
+    interface EmbeddedTask {
+      task_id: string;
+      epic_id: string | null;
+      task_number: number | null;
+      title: string | null;
+      target_repo: string | null;
+      status: string | null;
+    }
     const task = await retryUntil(() => {
       const row = reader
-        .query(
-          "SELECT task_id, epic_id, task_number, title, target_repo, status FROM tasks WHERE task_id = ?",
-        )
-        .get(taskId) as {
-        task_id: string;
-        epic_id: string | null;
-        task_number: number | null;
-        title: string | null;
-        target_repo: string | null;
-        status: string | null;
-      } | null;
-      return row ? row : null;
+        .query("SELECT tasks FROM epics WHERE epic_id = ?")
+        .get(epicId) as { tasks: string | null } | null;
+      if (row == null || row.tasks == null || row.tasks.length === 0) {
+        return null;
+      }
+      const arr = JSON.parse(row.tasks) as EmbeddedTask[];
+      return arr.find((t) => t.task_id === taskId) ?? null;
     }, 8000);
     if (!task) {
       const out = await readStream(daemon.stdout);
@@ -910,6 +914,65 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
       }
       expect(patch.collection).toBe("epics");
       expect(patch.row.status).toBe("done");
+
+      // A TaskSnapshot folds into its PARENT epic's embedded array — it arrives
+      // as a `patch` on the epic row (not its own collection). Insert a
+      // synthetic TaskSnapshot for the same task with a flipped status and
+      // assert the parent epic patches with the updated element in `tasks`.
+      const epicEventIdAfterEpicPatch = patch.row.last_event_id as number;
+      const { db: taskWriter, stmts: taskStmts } = openDb(dbPath);
+      taskStmts.insertEvent.run(
+        Date.now() / 1000,
+        taskId,
+        null,
+        "TaskSnapshot",
+        "plan_snapshot",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        JSON.stringify({
+          epic_id: epicId,
+          task_number: taskNumberFromId(taskId),
+          title: "First plans task",
+          target_repo: "/tmp/keeper-e2e-repo",
+          status: "done",
+        }),
+        null,
+        null,
+      );
+      taskWriter.close();
+
+      const taskPatch = await retryUntil(
+        () =>
+          client.frames.find(
+            (f) =>
+              f.type === "patch" &&
+              f.collection === "epics" &&
+              f.row.epic_id === epicId &&
+              (f.row.last_event_id as number) > epicEventIdAfterEpicPatch,
+          ) ?? null,
+        8000,
+      );
+      if (!taskPatch || taskPatch.type !== "patch") {
+        const out = await readStream(daemon.stdout);
+        const err = await readStream(daemon.stderr);
+        throw new Error(
+          `task-into-epic patch never arrived.\nstdout:\n${out}\nstderr:\n${err}`,
+        );
+      }
+      // The embedded array (a decoded `Task[]` on the wire) carries the task
+      // with its flipped status.
+      const embedded = taskPatch.row.tasks as {
+        task_id: string;
+        status: string;
+      }[];
+      expect(Array.isArray(embedded)).toBe(true);
+      const folded = embedded.find((t) => t.task_id === taskId);
+      expect(folded?.status).toBe("done");
     } finally {
       client.socket.end();
     }

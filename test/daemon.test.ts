@@ -167,7 +167,7 @@ function insertPlanSnapshot(
   );
 }
 
-test("synthetic EpicSnapshot/TaskSnapshot events fold into epics/tasks", () => {
+test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded)", () => {
   const { db, stmts } = openDb(dbPath);
 
   insertPlanSnapshot(stmts, "EpicSnapshot", "fn-7-add-oauth", 1, {
@@ -196,7 +196,7 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics/tasks", () => {
 
   const epic = db
     .query(
-      "SELECT epic_number, title, project_dir, status, last_event_id FROM epics WHERE epic_id = 'fn-7-add-oauth'",
+      "SELECT epic_number, title, project_dir, status, last_event_id, tasks FROM epics WHERE epic_id = 'fn-7-add-oauth'",
     )
     .get() as {
     epic_number: number;
@@ -204,31 +204,35 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics/tasks", () => {
     project_dir: string;
     status: string;
     last_event_id: number;
+    tasks: string;
   };
   expect(epic.epic_number).toBe(7);
   expect(epic.title).toBe("Add OAuth");
   expect(epic.project_dir).toBe("/Users/mike/code/keeper");
   expect(epic.status).toBe("in_progress");
-  expect(epic.last_event_id).toBe(1);
+  // Schema v7: the TaskSnapshot folds into the epic's embedded array and bumps
+  // the parent epic's last_event_id (so the epic row patches).
+  expect(epic.last_event_id).toBe(2);
 
-  const task = db
-    .query(
-      "SELECT epic_id, task_number, title, target_repo, status, last_event_id FROM tasks WHERE task_id = 'fn-7-add-oauth.2'",
-    )
-    .get() as {
+  // The task is embedded in the parent epic's `tasks` array (no standalone
+  // tasks table).
+  const tasks = JSON.parse(epic.tasks) as {
+    task_id: string;
     epic_id: string;
     task_number: number;
     title: string;
     target_repo: string;
     status: string;
-    last_event_id: number;
-  };
-  expect(task.epic_id).toBe("fn-7-add-oauth");
-  expect(task.task_number).toBe(2);
-  expect(task.title).toBe("Wire the callback");
-  expect(task.target_repo).toBe("/Users/mike/code/keeper");
-  expect(task.status).toBe("open");
-  expect(task.last_event_id).toBe(2);
+  }[];
+  expect(tasks.length).toBe(1);
+  expect(tasks[0]).toEqual({
+    task_id: "fn-7-add-oauth.2",
+    epic_id: "fn-7-add-oauth",
+    task_number: 2,
+    title: "Wire the callback",
+    target_repo: "/Users/mike/code/keeper",
+    status: "open",
+  });
 
   db.close();
 });

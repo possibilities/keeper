@@ -47,7 +47,9 @@ test("openDb creates events, jobs, reducer_state, meta tables", () => {
   expect(names.has("events")).toBe(true);
   expect(names.has("jobs")).toBe(true);
   expect(names.has("epics")).toBe(true);
-  expect(names.has("tasks")).toBe(true);
+  // Schema v7 dropped the standalone `tasks` table — tasks are embedded as a
+  // JSON-array column on `epics`.
+  expect(names.has("tasks")).toBe(false);
   expect(names.has("reducer_state")).toBe(true);
   expect(names.has("meta")).toBe(true);
   db.close();
@@ -167,7 +169,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("6");
+  expect(row.value).toBe("7");
   db.close();
 });
 
@@ -272,7 +274,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("6");
+  expect(ver.value).toBe("7");
 
   const eventNames = (
     db.prepare("PRAGMA table_info(events)").all() as {
@@ -313,7 +315,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("6");
+  expect(ver2.value).toBe("7");
   db2.close();
 });
 
@@ -366,7 +368,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("6");
+  expect(ver.value).toBe("7");
 
   const jobNames = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
@@ -397,7 +399,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("6");
+  expect(ver2.value).toBe("7");
   db2.close();
 });
 
@@ -432,7 +434,7 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("6");
+  expect(ver.value).toBe("7");
   const names = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
@@ -451,7 +453,7 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   db.close();
 });
 
-test("v5 DB migrates to v6: epics + tasks tables added, jobs rows preserved", () => {
+test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, jobs rows preserved", () => {
   // Build a v5-shaped DB by hand: events + jobs at the current v5 shape, no
   // epics/tasks tables, version '5', with a populated jobs row.
   const v5 = new Database(dbPath, { create: true });
@@ -476,14 +478,15 @@ test("v5 DB migrates to v6: epics + tasks tables added, jobs rows preserved", ()
   );
   v5.close();
 
-  // Reopen via openDb — migrate() creates the epics/tasks tables (CREATE TABLE
-  // IF NOT EXISTS) and stamps the current version. The non-version-gated block
-  // converges a v5 DB straight to v6.
+  // Reopen via openDb — migrate() creates the epics table (CREATE TABLE IF NOT
+  // EXISTS, with the embedded `tasks` column) and stamps the current version.
+  // A v5 DB never had a `tasks` table, so the v6→v7 guard's table-exists check
+  // simply skips the backfill/DROP; the convergence lands at v7.
   const { db } = openDb(dbPath);
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("6");
+  expect(ver.value).toBe("7");
 
   const tables = new Set(
     (
@@ -493,19 +496,17 @@ test("v5 DB migrates to v6: epics + tasks tables added, jobs rows preserved", ()
     ).map((t) => t.name),
   );
   expect(tables.has("epics")).toBe(true);
-  expect(tables.has("tasks")).toBe(true);
+  // Schema v7 has no standalone tasks table.
+  expect(tables.has("tasks")).toBe(false);
 
-  // New projection tables start empty.
+  // New projection table starts empty.
   const epicCount = db.prepare("SELECT count(*) AS c FROM epics").get() as {
     c: number;
   };
-  const taskCount = db.prepare("SELECT count(*) AS c FROM tasks").get() as {
-    c: number;
-  };
   expect(epicCount.c).toBe(0);
-  expect(taskCount.c).toBe(0);
 
-  // The new tables carry the expected columns.
+  // The epics table carries the expected columns, including the embedded
+  // `tasks` JSON-array column (schema v7).
   const epicCols = (
     db.prepare("PRAGMA table_info(epics)").all() as { name: string }[]
   ).map((c) => c.name);
@@ -517,19 +518,7 @@ test("v5 DB migrates to v6: epics + tasks tables added, jobs rows preserved", ()
     "status",
     "last_event_id",
     "updated_at",
-  ]);
-  const taskCols = (
-    db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[]
-  ).map((c) => c.name);
-  expect(taskCols).toEqual([
-    "task_id",
-    "epic_id",
-    "task_number",
-    "title",
-    "target_repo",
-    "status",
-    "last_event_id",
-    "updated_at",
+    "tasks",
   ]);
 
   // Prior jobs data survives untouched.
@@ -552,8 +541,115 @@ test("v5 DB migrates to v6: epics + tasks tables added, jobs rows preserved", ()
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("6");
+  expect(ver2.value).toBe("7");
   db2.close();
+});
+
+test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, task_id) order, orphan dropped, tasks table gone", () => {
+  // Build a v6-shaped DB by hand: epics + tasks tables (no embedded column),
+  // version '6'. Two epics, one with two tasks (out of sort order on disk to
+  // prove the backfill sorts), plus an orphan task with a NULL epic_id that
+  // must NOT be embedded.
+  const v6 = new Database(dbPath, { create: true });
+  v6.run(`
+    CREATE TABLE epics (
+      epic_id TEXT PRIMARY KEY,
+      epic_number INTEGER,
+      title TEXT,
+      project_dir TEXT,
+      status TEXT,
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL DEFAULT 0
+    )
+  `);
+  v6.run(`
+    CREATE TABLE tasks (
+      task_id TEXT PRIMARY KEY,
+      epic_id TEXT,
+      task_number INTEGER,
+      title TEXT,
+      target_repo TEXT,
+      status TEXT,
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL DEFAULT 0
+    )
+  `);
+  v6.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v6.run("INSERT INTO meta (key, value) VALUES ('schema_version', '6')");
+  v6.run(
+    "INSERT INTO epics (epic_id, epic_number, title, status, last_event_id, updated_at) VALUES ('fn-1-alpha', 1, 'Alpha', 'active', 10, 1)",
+  );
+  v6.run(
+    "INSERT INTO epics (epic_id, epic_number, title, status, last_event_id, updated_at) VALUES ('fn-2-beta', 2, 'Beta', 'active', 11, 1)",
+  );
+  // Two tasks for alpha inserted out of order — the backfill must sort by
+  // (task_number, task_id).
+  v6.run(
+    "INSERT INTO tasks (task_id, epic_id, task_number, title, target_repo, status, last_event_id, updated_at) VALUES ('fn-1-alpha.2', 'fn-1-alpha', 2, 'second', '/repo', 'open', 12, 1)",
+  );
+  v6.run(
+    "INSERT INTO tasks (task_id, epic_id, task_number, title, target_repo, status, last_event_id, updated_at) VALUES ('fn-1-alpha.1', 'fn-1-alpha', 1, 'first', '/repo', 'done', 13, 1)",
+  );
+  // Orphan task with NULL epic_id — dropped, not embedded.
+  v6.run(
+    "INSERT INTO tasks (task_id, epic_id, task_number, title, target_repo, status, last_event_id, updated_at) VALUES ('orphan.1', NULL, 1, 'orphan', '/repo', 'open', 14, 1)",
+  );
+  v6.close();
+
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("7");
+
+  // tasks table is gone.
+  const tables = new Set(
+    (
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all() as { name: string }[]
+    ).map((t) => t.name),
+  );
+  expect(tables.has("tasks")).toBe(false);
+
+  // alpha's tasks embedded in (task_number, task_id) order.
+  const alpha = db
+    .prepare("SELECT tasks FROM epics WHERE epic_id = 'fn-1-alpha'")
+    .get() as { tasks: string };
+  const alphaTasks = JSON.parse(alpha.tasks) as {
+    task_id: string;
+    epic_id: string;
+    task_number: number;
+    title: string;
+    target_repo: string;
+    status: string;
+  }[];
+  expect(alphaTasks.map((t) => t.task_id)).toEqual([
+    "fn-1-alpha.1",
+    "fn-1-alpha.2",
+  ]);
+  expect(alphaTasks[0]).toEqual({
+    task_id: "fn-1-alpha.1",
+    epic_id: "fn-1-alpha",
+    task_number: 1,
+    title: "first",
+    target_repo: "/repo",
+    status: "done",
+  });
+
+  // beta had no tasks — empty array.
+  const beta = db
+    .prepare("SELECT tasks FROM epics WHERE epic_id = 'fn-2-beta'")
+    .get() as { tasks: string };
+  expect(JSON.parse(beta.tasks)).toEqual([]);
+
+  // The orphan task was dropped — it never lands on any epic.
+  const allTasks = (
+    db.prepare("SELECT tasks FROM epics").all() as { tasks: string }[]
+  ).flatMap((e) => JSON.parse(e.tasks) as { task_id: string }[]);
+  expect(allTasks.some((t) => t.task_id === "orphan.1")).toBe(false);
+
+  db.close();
 });
 
 test("resolveConfig: missing file falls back to default ~/code root", () => {

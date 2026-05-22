@@ -297,6 +297,62 @@ test("seedFromDb suppresses a re-emit of an already-folded projection row", () =
   expect((emitted[0] as { status: string }).status).toBe("done");
 });
 
+test("seedFromDb reconstructs from epics.tasks so an embedded task is not re-emitted on restart", () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  // Seed an epic carrying ONE task in its embedded array — the element shape
+  // the reducer folds. `task_number` matches taskNumberFromId("fn-3-demo.1").
+  const tasks = JSON.stringify([
+    {
+      task_id: "fn-3-demo.1",
+      epic_id: "fn-3-demo",
+      task_number: 1,
+      title: "T",
+      target_repo: "/repo",
+      status: "open",
+    },
+  ]);
+  db.run(
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["fn-3-demo", 3, "Demo", "/repo", "open", 1, 0, tasks],
+  );
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+  db.close();
+
+  // The task file byte-identical to the embedded element is suppressed.
+  const taskPath = writeTask("fn-3-demo.1", {
+    epic: "fn-3-demo",
+    title: "T",
+    target_repo: "/repo",
+  });
+  scanner.onChange(taskPath);
+  expect(emitted).toEqual([]);
+
+  // A genuinely changed task (title flip) still emits.
+  writeFileSync(
+    taskPath,
+    JSON.stringify({
+      id: "fn-3-demo.1",
+      epic: "fn-3-demo",
+      title: "T2",
+      target_repo: "/repo",
+    }),
+  );
+  scanner.onChange(taskPath);
+  expect(emitted.length).toBe(1);
+  expect((emitted[0] as { kind: string; title: string }).kind).toBe(
+    "plan-task",
+  );
+  expect((emitted[0] as { title: string }).title).toBe("T2");
+});
+
 // ---------------------------------------------------------------------------
 // (a') Drop-recovery via scanRoot — the change-gated re-scan primitive the
 // per-root drop scheduler reuses. Boot scan + a simulated drop-recovery scan

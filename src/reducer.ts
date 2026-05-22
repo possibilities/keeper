@@ -239,6 +239,11 @@ function projectPlanRow(db: Database, event: Event): void {
   const entityId = event.session_id;
 
   if (event.hook_event === "EpicSnapshot") {
+    // The ON CONFLICT update lists ONLY scalar columns and NEVER `tasks`: an
+    // epic snapshot carries no task data, and a shell row inserted by a
+    // task-before-epic TaskSnapshot already holds the array. INSERT defaults
+    // `tasks='[]'` (the schema default), so the first-sight epic reads an empty
+    // array and a later epic snapshot can never clobber an array a shell holds.
     db.run(
       `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -260,29 +265,80 @@ function projectPlanRow(db: Database, event: Event): void {
       ],
     );
   } else {
-    // TaskSnapshot.
-    db.run(
-      `INSERT INTO tasks (task_id, epic_id, task_number, title, target_repo, status, last_event_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(task_id) DO UPDATE SET
-         epic_id = excluded.epic_id,
-         task_number = excluded.task_number,
-         title = excluded.title,
-         target_repo = excluded.target_repo,
-         status = excluded.status,
-         last_event_id = excluded.last_event_id,
-         updated_at = excluded.updated_at`,
-      [
-        entityId,
-        snapshot.epic_id ?? null,
-        snapshot.task_number ?? null,
-        snapshot.title ?? null,
-        snapshot.target_repo ?? null,
-        snapshot.status ?? null,
-        event.id,
-        ts,
-      ],
-    );
+    // TaskSnapshot: a read-modify-write on the PARENT epic's embedded `tasks`
+    // array. The parent key is `snapshot.epic_id` (NOT event.session_id, which
+    // is the task pk). An orphan task (null/absent epic_id) can't be placed —
+    // skip-and-log, cursor still advances upstream.
+    const epicId = snapshot.epic_id ?? null;
+    if (epicId == null) {
+      console.error(
+        `keeper reducer: TaskSnapshot event id=${event.id} task=${entityId} has no epic_id; skipping (orphan)`,
+      );
+      return;
+    }
+
+    // The element shape stored in the array — field-for-field the served Task.
+    const element = {
+      task_id: entityId,
+      epic_id: epicId,
+      task_number: snapshot.task_number ?? null,
+      title: snapshot.title ?? null,
+      target_repo: snapshot.target_repo ?? null,
+      status: snapshot.status ?? null,
+    };
+
+    const epicRow = db
+      .query("SELECT tasks FROM epics WHERE epic_id = ?")
+      .get(epicId) as { tasks: string | null } | null;
+
+    // Parse the persisted array. A malformed/NULL blob folds to `[]` — NEVER
+    // throw inside the open BEGIN IMMEDIATE transaction (a throw rolls back the
+    // cursor and wedges the reducer).
+    let tasks: (typeof element)[] = [];
+    if (epicRow != null && epicRow.tasks != null && epicRow.tasks.length > 0) {
+      try {
+        const parsed = JSON.parse(epicRow.tasks);
+        if (Array.isArray(parsed)) {
+          tasks = parsed;
+        }
+      } catch {
+        // malformed stored array → treat as empty, fall through.
+      }
+    }
+
+    // Replace-or-insert the element by task_id, then re-sort by
+    // (task_number, task_id) — the SAME deterministic key the migration backfill
+    // uses, so a migrated row equals a re-folded one. SQLite ORDER BY puts NULLs
+    // first; mirror that for task_number, then break ties on task_id ascending.
+    const next = tasks.filter((t) => t.task_id !== entityId);
+    next.push(element);
+    next.sort((a, b) => {
+      const an = a.task_number;
+      const bn = b.task_number;
+      if (an !== bn) {
+        if (an == null) return -1;
+        if (bn == null) return 1;
+        return an - bn;
+      }
+      return a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0;
+    });
+    const tasksJson = JSON.stringify(next);
+
+    if (epicRow != null) {
+      db.run(
+        "UPDATE epics SET tasks = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+        [tasksJson, event.id, ts, epicId],
+      );
+    } else {
+      // No epic row yet — insert a SHELL (epic_id set, scalar columns NULL,
+      // the array carrying this one task). A later EpicSnapshot fills the
+      // scalars without clobbering `tasks` (its ON CONFLICT omits the column).
+      db.run(
+        `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
+           VALUES (?, NULL, NULL, NULL, NULL, ?, ?, ?)`,
+        [epicId, event.id, ts, tasksJson],
+      );
+    }
   }
 }
 

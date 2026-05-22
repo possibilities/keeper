@@ -1,6 +1,8 @@
 /**
  * Keeper SQLite layer. Owns:
- * - Schema bootstrap for `events`, `jobs`, `reducer_state`, `meta`.
+ * - Schema bootstrap for `events`, `jobs`, `epics`, `reducer_state`, `meta`.
+ *   (As of schema v7 each epic embeds its tasks as a JSON-array `epics.tasks`
+ *   column; the standalone `tasks` table was dropped.)
  * - Connection-local PRAGMAs (WAL, busy_timeout, foreign_keys, synchronous,
  *   temp_store) — these MUST be re-applied on every open because they are
  *   per-connection in SQLite. The hook spawns a fresh connection per
@@ -24,7 +26,7 @@ import { dirname, join } from "node:path";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -258,26 +260,10 @@ CREATE TABLE IF NOT EXISTS epics (
     project_dir TEXT,
     status TEXT,
     last_event_id INTEGER,
-    updated_at REAL NOT NULL DEFAULT 0
+    updated_at REAL NOT NULL DEFAULT 0,
+    tasks TEXT NOT NULL DEFAULT '[]'
 )
 `;
-
-const CREATE_TASKS = `
-CREATE TABLE IF NOT EXISTS tasks (
-    task_id TEXT PRIMARY KEY,
-    epic_id TEXT,
-    task_number INTEGER,
-    title TEXT,
-    target_repo TEXT,
-    status TEXT,
-    last_event_id INTEGER,
-    updated_at REAL NOT NULL DEFAULT 0
-)
-`;
-
-const CREATE_PLANS_INDEXES = [
-  "CREATE INDEX IF NOT EXISTS idx_tasks_epic ON tasks(epic_id)",
-];
 
 const CREATE_REDUCER_STATE = `
 CREATE TABLE IF NOT EXISTS reducer_state (
@@ -399,10 +385,6 @@ function migrate(db: Database): void {
     }
     db.run(CREATE_JOBS);
     db.run(CREATE_EPICS);
-    db.run(CREATE_TASKS);
-    for (const sql of CREATE_PLANS_INDEXES) {
-      db.run(sql);
-    }
     db.run(CREATE_REDUCER_STATE);
     db.run(CREATE_META);
 
@@ -459,6 +441,59 @@ function migrate(db: Database): void {
     // ALTER, no backfill — the tables start empty and the plan reducer fills
     // them from synthetic EpicSnapshot/TaskSnapshot events. A v5 DB gains the
     // two empty tables on first open with all prior `jobs`/`events` rows intact.
+
+    // v6→v7: collapse the standalone `tasks` table into an embedded JSON-array
+    // column on `epics`. UNLIKE every step above, this carries a DATA BACKFILL
+    // + a DROP TABLE — neither is idempotent (re-running would re-backfill an
+    // already-emptied/dropped table, or splice nothing the second time). So the
+    // step is VERSION-GUARDED: it runs only when the stored schema_version is
+    // still < 7. The `tasks` column itself is added via the idempotent
+    // addColumnIfMissing so a fresh v7 DB (CREATE_EPICS already defines it) and a
+    // migrating v6 DB converge the same way; only the backfill + DROP are gated.
+    //
+    // The backfill's array ordering MUST equal the reducer's fold sort
+    // (ORDER BY task_number, task_id) — a migrated row that differs from a
+    // re-folded one would break the from-scratch re-fold determinism guard.
+    // Orphan task rows (NULL/unknown epic_id) are NOT embedded — they are
+    // dropped with the table (the per-epic subselect only matches t.epic_id =
+    // epics.epic_id).
+    addColumnIfMissing(db, "epics", "tasks", "TEXT NOT NULL DEFAULT '[]'");
+    const storedVersion = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersion < 7) {
+      const tasksTableExists =
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+          )
+          .get() != null;
+      if (tasksTableExists) {
+        db.run(
+          `UPDATE epics SET tasks = COALESCE((
+             SELECT json_group_array(json_object(
+               'task_id', task_id,
+               'epic_id', epic_id,
+               'task_number', task_number,
+               'title', title,
+               'target_repo', target_repo,
+               'status', status
+             ))
+               FROM (
+                 SELECT * FROM tasks t
+                  WHERE t.epic_id = epics.epic_id
+                  ORDER BY task_number, task_id
+               )
+           ), '[]')
+           WHERE tasks IS NULL OR tasks = '[]'`,
+        );
+        db.run("DROP TABLE IF EXISTS tasks");
+      }
+    }
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

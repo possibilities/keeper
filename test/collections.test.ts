@@ -1,11 +1,14 @@
 /**
- * Collection-registry tests for the plans read surface (`epics` / `tasks`).
+ * Collection-registry tests for the plans read surface (`epics`).
  *
- * These prove the two new `CollectionDescriptor`s serve over the existing
- * UDS subscribe machinery with ZERO `server-worker.ts` edits: each is reachable
- * via `getCollection`, `runQuery` pages it, the pk filter narrows to one row,
- * and the `status` filter narrows the set. Rows are hand-inserted (no reducer /
- * watcher needed) — the descriptor + `runQuery` path is the unit under test.
+ * These prove the `epics` `CollectionDescriptor` serves over the existing UDS
+ * subscribe machinery with ZERO `server-worker.ts` edits: it's reachable via
+ * `getCollection`, `runQuery` pages it, the pk filter narrows to one row, the
+ * `status` filter narrows the set, and (schema v7) the embedded `tasks`
+ * JSON-array column decodes to a real array at the read boundary. Rows are
+ * hand-inserted (no reducer / watcher needed) — the descriptor + `runQuery`
+ * path is the unit under test. The standalone `tasks` collection was dropped in
+ * schema v7, so it no longer resolves.
  */
 
 import type { Database } from "bun:sqlite";
@@ -13,11 +16,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  EPICS_DESCRIPTOR,
-  getCollection,
-  TASKS_DESCRIPTOR,
-} from "../src/collections";
+import { EPICS_DESCRIPTOR, getCollection } from "../src/collections";
 import { openDb } from "../src/db";
 import type { ErrorFrame, ResultFrame } from "../src/protocol";
 import { runQuery } from "../src/server-worker";
@@ -53,11 +52,12 @@ function seedEpic(
     status: string;
     last_event_id: number;
     updated_at: number;
+    tasks: string;
   }> = {},
 ): void {
   db.query(
-    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     epic_id,
     opts.epic_number ?? null,
@@ -66,34 +66,7 @@ function seedEpic(
     opts.status ?? "active",
     opts.last_event_id ?? 0,
     opts.updated_at ?? 1,
-  );
-}
-
-function seedTask(
-  db: Database,
-  task_id: string,
-  opts: Partial<{
-    epic_id: string;
-    task_number: number;
-    title: string;
-    target_repo: string;
-    status: string;
-    last_event_id: number;
-    updated_at: number;
-  }> = {},
-): void {
-  db.query(
-    `INSERT INTO tasks (task_id, epic_id, task_number, title, target_repo, status, last_event_id, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    task_id,
-    opts.epic_id ?? null,
-    opts.task_number ?? null,
-    opts.title ?? null,
-    opts.target_repo ?? null,
-    opts.status ?? "todo",
-    opts.last_event_id ?? 0,
-    opts.updated_at ?? 1,
+    opts.tasks ?? "[]",
   );
 }
 
@@ -101,22 +74,29 @@ function seedTask(
 // Registry resolution + descriptor shape
 // ---------------------------------------------------------------------------
 
-test("getCollection resolves epics + tasks to their descriptors", () => {
+test("getCollection resolves epics; the dropped tasks collection is gone", () => {
   expect(getCollection("epics")).toBe(EPICS_DESCRIPTOR);
-  expect(getCollection("tasks")).toBe(TASKS_DESCRIPTOR);
+  expect(getCollection("tasks")).toBeUndefined();
 });
 
-test("each descriptor's version is last_event_id; filters include pk + status", () => {
+test("epics descriptor: version is last_event_id; filters include pk + status; tasks is a jsonColumn out of sort/filter", () => {
   expect(EPICS_DESCRIPTOR.version).toBe("last_event_id");
   expect(EPICS_DESCRIPTOR.filters.epic_id).toBe("epic_id");
   expect(EPICS_DESCRIPTOR.filters.status).toBe("status");
   expect(EPICS_DESCRIPTOR.filters.project_dir).toBe("project_dir");
 
-  expect(TASKS_DESCRIPTOR.version).toBe("last_event_id");
-  expect(TASKS_DESCRIPTOR.filters.task_id).toBe("task_id");
-  expect(TASKS_DESCRIPTOR.filters.status).toBe("status");
-  expect(TASKS_DESCRIPTOR.filters.epic_id).toBe("epic_id");
-  expect(TASKS_DESCRIPTOR.filters.target_repo).toBe("target_repo");
+  // `tasks` is served + JSON-decoded, but never a sort/filter key.
+  expect(EPICS_DESCRIPTOR.columns).toContain("tasks");
+  expect(EPICS_DESCRIPTOR.jsonColumns.has("tasks")).toBe(true);
+  expect(EPICS_DESCRIPTOR.sortable.has("tasks")).toBe(false);
+  expect(EPICS_DESCRIPTOR.filters.tasks).toBeUndefined();
+});
+
+test("epics default sort is epic_number asc", () => {
+  expect(EPICS_DESCRIPTOR.defaultSort).toEqual({
+    column: "epic_number",
+    dir: "asc",
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -125,14 +105,14 @@ test("each descriptor's version is last_event_id; filters include pk + status", 
 
 test("runQuery pages the epics collection with the served columns + total", () => {
   const { db } = openDb(dbPath, { readonly: false });
-  seedEpic(db, "fn-1-alpha", { status: "active", updated_at: 2 });
-  seedEpic(db, "fn-2-beta", { status: "done", updated_at: 3 });
+  seedEpic(db, "fn-2-beta", { epic_number: 2, status: "done" });
+  seedEpic(db, "fn-1-alpha", { epic_number: 1, status: "active" });
   const res = asResult(runQuery(db, 0, { type: "query", collection: "epics" }));
   expect(res.total).toBe(2);
-  // Default sort updated_at desc.
+  // Default sort epic_number asc.
   expect(res.rows.map((r) => String(r.epic_id))).toEqual([
-    "fn-2-beta",
     "fn-1-alpha",
+    "fn-2-beta",
   ]);
   // Served columns match the descriptor.
   expect(Object.keys(res.rows[0]!).sort()).toEqual(
@@ -141,10 +121,59 @@ test("runQuery pages the epics collection with the served columns + total", () =
   db.close();
 });
 
+test("runQuery decodes the embedded tasks JSON-array column into a real array", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const tasks = JSON.stringify([
+    {
+      task_id: "fn-1-alpha.1",
+      epic_id: "fn-1-alpha",
+      task_number: 1,
+      title: "first",
+      target_repo: "/repo",
+      status: "open",
+    },
+    {
+      task_id: "fn-1-alpha.2",
+      epic_id: "fn-1-alpha",
+      task_number: 2,
+      title: "second",
+      target_repo: "/repo",
+      status: "done",
+    },
+  ]);
+  seedEpic(db, "fn-1-alpha", { epic_number: 1, tasks });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "epics",
+      filter: { epic_id: "fn-1-alpha" },
+    }),
+  );
+  const row = res.rows[0]!;
+  expect(Array.isArray(row.tasks)).toBe(true);
+  const arr = row.tasks as { task_id: string }[];
+  expect(arr.map((t) => t.task_id)).toEqual(["fn-1-alpha.1", "fn-1-alpha.2"]);
+  db.close();
+});
+
+test("runQuery decodes a NULL/malformed tasks column to []", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1-alpha", { epic_number: 1, tasks: "{not json" });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "epics",
+      filter: { epic_id: "fn-1-alpha" },
+    }),
+  );
+  expect(res.rows[0]!.tasks).toEqual([]);
+  db.close();
+});
+
 test("runQuery resolves the epics pk filter to a single row", () => {
   const { db } = openDb(dbPath, { readonly: false });
-  seedEpic(db, "fn-1-alpha");
-  seedEpic(db, "fn-2-beta");
+  seedEpic(db, "fn-1-alpha", { epic_number: 1 });
+  seedEpic(db, "fn-2-beta", { epic_number: 2 });
   const res = asResult(
     runQuery(db, 0, {
       type: "query",
@@ -159,9 +188,9 @@ test("runQuery resolves the epics pk filter to a single row", () => {
 
 test("runQuery narrows the epics set by status filter", () => {
   const { db } = openDb(dbPath, { readonly: false });
-  seedEpic(db, "fn-1-alpha", { status: "active" });
-  seedEpic(db, "fn-2-beta", { status: "done" });
-  seedEpic(db, "fn-3-gamma", { status: "active" });
+  seedEpic(db, "fn-1-alpha", { epic_number: 1, status: "active" });
+  seedEpic(db, "fn-2-beta", { epic_number: 2, status: "done" });
+  seedEpic(db, "fn-3-gamma", { epic_number: 3, status: "active" });
   const res = asResult(
     runQuery(db, 0, {
       type: "query",
@@ -171,66 +200,5 @@ test("runQuery narrows the epics set by status filter", () => {
   );
   expect(res.total).toBe(2);
   expect(res.rows.every((r) => r.status === "active")).toBe(true);
-  db.close();
-});
-
-// ---------------------------------------------------------------------------
-// tasks: query → result + filters
-// ---------------------------------------------------------------------------
-
-test("runQuery pages the tasks collection with the served columns + total", () => {
-  const { db } = openDb(dbPath, { readonly: false });
-  seedTask(db, "fn-1-alpha.1", { epic_id: "fn-1-alpha", updated_at: 2 });
-  seedTask(db, "fn-1-alpha.2", { epic_id: "fn-1-alpha", updated_at: 3 });
-  const res = asResult(runQuery(db, 0, { type: "query", collection: "tasks" }));
-  expect(res.total).toBe(2);
-  expect(res.rows.map((r) => String(r.task_id))).toEqual([
-    "fn-1-alpha.2",
-    "fn-1-alpha.1",
-  ]);
-  expect(Object.keys(res.rows[0]!).sort()).toEqual(
-    [...TASKS_DESCRIPTOR.columns].sort(),
-  );
-  db.close();
-});
-
-test("runQuery resolves the tasks pk filter to a single row", () => {
-  const { db } = openDb(dbPath, { readonly: false });
-  seedTask(db, "fn-1-alpha.1", { epic_id: "fn-1-alpha" });
-  seedTask(db, "fn-1-alpha.2", { epic_id: "fn-1-alpha" });
-  const res = asResult(
-    runQuery(db, 0, {
-      type: "query",
-      collection: "tasks",
-      filter: { task_id: "fn-1-alpha.2" },
-    }),
-  );
-  expect(res.total).toBe(1);
-  expect(String(res.rows[0]!.task_id)).toBe("fn-1-alpha.2");
-  db.close();
-});
-
-test("runQuery narrows the tasks set by epic_id + status filters", () => {
-  const { db } = openDb(dbPath, { readonly: false });
-  seedTask(db, "fn-1-alpha.1", { epic_id: "fn-1-alpha", status: "done" });
-  seedTask(db, "fn-1-alpha.2", { epic_id: "fn-1-alpha", status: "todo" });
-  seedTask(db, "fn-2-beta.1", { epic_id: "fn-2-beta", status: "todo" });
-  const byEpic = asResult(
-    runQuery(db, 0, {
-      type: "query",
-      collection: "tasks",
-      filter: { epic_id: "fn-1-alpha" },
-    }),
-  );
-  expect(byEpic.total).toBe(2);
-  const byStatus = asResult(
-    runQuery(db, 0, {
-      type: "query",
-      collection: "tasks",
-      filter: { epic_id: "fn-1-alpha", status: "todo" },
-    }),
-  );
-  expect(byStatus.total).toBe(1);
-  expect(String(byStatus.rows[0]!.task_id)).toBe("fn-1-alpha.2");
   db.close();
 });

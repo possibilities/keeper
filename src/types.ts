@@ -94,6 +94,12 @@ export interface ReducerState {
  * defaults to 0 in-schema. `project_dir` is an untrusted foreign-process JSON
  * field — stored opaque, never used to drive filesystem reads or interpolated
  * into SQL.
+ *
+ * As of schema v7 each epic embeds its tasks as the `tasks` array (the
+ * standalone `tasks` table was dropped). On the wire the `tasks` column is
+ * stored as JSON TEXT and decoded to a real `Task[]` at the read boundary
+ * (`decodeRow`); a task edit folds into this array and bumps the epic's
+ * `last_event_id`, so it surfaces as a `patch` on the parent epic row.
  */
 export interface Epic {
   epic_id: string;
@@ -103,12 +109,15 @@ export interface Epic {
   status: string | null;
   last_event_id: number | null;
   updated_at: number;
+  tasks: Task[];
 }
 
 /**
- * One row of the `tasks` projection. `task_id` is the planctl task id (pk);
- * `epic_id` links it to its parent epic. Folded from synthetic `TaskSnapshot`
- * events the same way `epics` is. `target_repo` is an untrusted foreign-process
+ * One task — the element shape of {@link Epic.tasks}. `task_id` is the planctl
+ * task id; `epic_id` links it to its parent epic. As of schema v7 a task is no
+ * longer a standalone projection row: the reducer folds each synthetic
+ * `TaskSnapshot` into its parent epic's embedded `tasks` array (deterministic
+ * `(task_number, task_id)` sort). `target_repo` is an untrusted foreign-process
  * JSON field — stored opaque, never used to drive filesystem reads or
  * interpolated into SQL.
  */
@@ -119,6 +128,4 @@ export interface Task {
   title: string | null;
   target_repo: string | null;
   status: string | null;
-  last_event_id: number | null;
-  updated_at: number;
 }

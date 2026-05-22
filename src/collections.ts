@@ -110,6 +110,14 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
  * read-only display — served but out of `sortable`/`filters`. `project_dir`
  * holds opaque foreign-process JSON; it's a bound filter VALUE here, never an
  * interpolated identifier or a filesystem-read driver.
+ *
+ * As of schema v7 each epic embeds its tasks as the `tasks` JSON-array column —
+ * the standalone `tasks` collection was dropped. `tasks` is served (in
+ * `columns`) AND registered in `jsonColumns` so {@link decodeRow} parses the
+ * stored TEXT into a real `Task[]` at the read boundary; it is OUT of
+ * `sortable`/`filters` (a nested display array, never a sort/filter key). The
+ * default sort moves to `epic_number asc` — stable creation order, so a task
+ * edit (which bumps the epic's `last_event_id`) never reorders the default view.
  */
 export const EPICS_DESCRIPTOR: CollectionDescriptor = {
   name: "epics",
@@ -122,6 +130,7 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "status",
     "last_event_id",
     "updated_at",
+    "tasks",
   ],
   pk: "epic_id",
   version: "last_event_id",
@@ -132,64 +141,23 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "epic_number",
     "status",
   ]),
-  defaultSort: { column: "updated_at", dir: "desc" },
+  defaultSort: { column: "epic_number", dir: "asc" },
   filters: {
     epic_id: "epic_id",
     status: "status",
     project_dir: "project_dir",
   },
-  jsonColumns: new Set([]),
+  jsonColumns: new Set(["tasks"]),
 };
 
 /**
- * The `tasks` descriptor — the plans read surface's second collection. Columns
- * mirror the v6 `tasks` table 1:1 (`src/db.ts` `CREATE_TASKS`). `version` is
- * `last_event_id` (snapshot-fold-bumped). `filters` carries the pk (`task_id`)
- * plus `epic_id` (parent-scoped subscribe), `status`, and `target_repo`.
- * `title`/`task_number` are read-only display. `target_repo` is opaque
- * foreign-process JSON — a bound filter VALUE, never an interpolated identifier.
- */
-export const TASKS_DESCRIPTOR: CollectionDescriptor = {
-  name: "tasks",
-  table: "tasks",
-  columns: [
-    "task_id",
-    "epic_id",
-    "task_number",
-    "title",
-    "target_repo",
-    "status",
-    "last_event_id",
-    "updated_at",
-  ],
-  pk: "task_id",
-  version: "last_event_id",
-  sortable: new Set([
-    "updated_at",
-    "last_event_id",
-    "task_id",
-    "task_number",
-    "status",
-  ]),
-  defaultSort: { column: "updated_at", dir: "desc" },
-  filters: {
-    task_id: "task_id",
-    epic_id: "epic_id",
-    status: "status",
-    target_repo: "target_repo",
-  },
-  jsonColumns: new Set([]),
-};
-
-/**
- * The registry, keyed by wire-facing collection name. `jobs` + the two plan
- * collections — adding each was a descriptor + entry, zero `server-worker.ts`
- * edits.
+ * The registry, keyed by wire-facing collection name. `jobs` + the `epics`
+ * plan collection (which now embeds its tasks as a JSON-array column — the
+ * standalone `tasks` collection was dropped in schema v7).
  */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
   [EPICS_DESCRIPTOR.name, EPICS_DESCRIPTOR],
-  [TASKS_DESCRIPTOR.name, TASKS_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */
@@ -246,8 +214,10 @@ export function selectByIds(
  * MUST be called at BOTH row-producing reads (the page SELECT in
  * `runQuery` and `selectByIds` on the diff path) so `result` and `patch` frames
  * agree on the decoded shape — a divergence would serve a JSON-TEXT column as a
- * string on one path and a parsed value on the other. No collection registers a
- * `jsonColumn` today, so this is dormant generic infrastructure.
+ * string on one path and a parsed value on the other. `epics.tasks` (schema v7)
+ * is the first — and currently only — registered `jsonColumn`: the embedded
+ * `Task[]` array decoded here so a `result`/`patch` epic row serves a real
+ * array, not a JSON string.
  */
 export function decodeRow(descriptor: CollectionDescriptor, row: Row): Row {
   if (descriptor.jsonColumns.size === 0) {
