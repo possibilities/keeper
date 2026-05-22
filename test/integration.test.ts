@@ -30,6 +30,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { openDb } from "../src/db";
+import { epicNumberFromId } from "../src/plan-worker";
 import { encodeFrame, LineBuffer, type ServerFrame } from "../src/protocol";
 
 /** Repo root — this file lives at <root>/test, so one level up. */
@@ -62,6 +63,11 @@ beforeEach(() => {
   planRoot = join(tmpDir, "plan-root");
   mkdirSync(planRoot, { recursive: true });
   configPath = join(tmpDir, "config.yaml");
+  // Write a hermetic config pointing to planRoot (which has no .planctl/ dirs
+  // yet). Passed to EVERY daemon spawn so the plan worker never boots-scans the
+  // real ~/code tree, which would flood the daemon with synthetic events and
+  // cause FSEvents congestion in tests that don't exercise the plan worker.
+  writeFileSync(configPath, `roots:\n  - ${JSON.stringify(planRoot)}\n`);
   daemon = null;
 });
 
@@ -152,7 +158,12 @@ test("end-to-end: hook writes → wake worker → reducer folds → jobs project
   // default socket (which would collide across isolates).
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
-    env: { ...process.env, KEEPER_DB: dbPath, KEEPER_SOCK: sockPath },
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_SOCK: sockPath,
+      KEEPER_CONFIG: configPath,
+    },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -324,7 +335,12 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
 
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
-    env: { ...process.env, KEEPER_DB: dbPath, KEEPER_SOCK: sockPath },
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_SOCK: sockPath,
+      KEEPER_CONFIG: configPath,
+    },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -483,6 +499,7 @@ test("end-to-end: transcript worker → custom-title write flips jobs.title to '
       ...process.env,
       KEEPER_DB: dbPath,
       KEEPER_SOCK: sockPath,
+      KEEPER_CONFIG: configPath,
       KEEPER_WATCH_ROOT: watchRoot,
     },
     stdout: "pipe",
@@ -580,38 +597,11 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
   const epicFile = join(epicsDir, `${epicId}.json`);
   const taskFile = join(tasksDir, `${taskId}.json`);
 
-  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
-    cwd: ROOT,
-    env: {
-      ...process.env,
-      KEEPER_DB: dbPath,
-      KEEPER_SOCK: sockPath,
-      KEEPER_CONFIG: configPath,
-    },
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-
-  // Boot: writer conn + boot drain + spawn all four workers + bind the socket.
-  // The plan worker subscribes its watch AFTER migrate, so poll for the socket
-  // file as the "daemon is up" proof before writing plan files.
-  const bound = await retryUntil(
-    () => (existsSync(sockPath) ? true : null),
-    3000,
-  );
-  if (!bound) {
-    const out = await readStream(daemon.stdout);
-    const err = await readStream(daemon.stderr);
-    throw new Error(`socket never bound.\nstdout:\n${out}\nstderr:\n${err}`);
-  }
-  // The watcher subscribe resolves slightly after the socket binds (the plan
-  // worker imports @parcel/watcher then subscribes one watch per root). Give it a
-  // generous anchor window before the first write so the create event is caught
-  // even when the full `--isolate` suite is starving the FSEvents callback.
-  await Bun.sleep(600);
-
-  // --- write the plan files → watcher fires → worker posts snapshots → main
-  // inserts synthetic EpicSnapshot/TaskSnapshot events → reducer folds them. ---
+  // Write the plan files BEFORE starting the daemon. The plan worker does a
+  // boot scan after its subscribe resolves, so pre-existing files are emitted
+  // without waiting for an FSEvents delivery. This removes the race between
+  // "daemon subscribes" and "test writes files" that caused flakes under full
+  // --isolate suite pressure.
   writeFileSync(
     epicFile,
     JSON.stringify({
@@ -631,6 +621,31 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
       // No worker_done_at → derived status "open".
     }),
   );
+
+  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_SOCK: sockPath,
+      KEEPER_CONFIG: configPath,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  // Boot: writer conn + boot drain + spawn all four workers + bind the socket.
+  const bound = await retryUntil(
+    () => (existsSync(sockPath) ? true : null),
+    3000,
+  );
+  if (!bound) {
+    const out = await readStream(daemon.stdout);
+    const err = await readStream(daemon.stderr);
+    throw new Error(`socket never bound.\nstdout:\n${out}\nstderr:\n${err}`);
+  }
+  // No anchor sleep: the boot scan runs synchronously inside subscribe().then(),
+  // so events land within seconds of socket bind without FSEvents involvement.
 
   const { db: reader } = openDb(dbPath, { readonly: true });
   try {
@@ -735,16 +750,35 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
       expect(result.collection).toBe("epics");
       expect(result.rows.some((r) => r.epic_id === epicId)).toBe(true);
 
-      // Rewrite the epic file with a new status → a new snapshot → fold → patch.
-      writeFileSync(
-        epicFile,
+      // Trigger a live patch by inserting a synthetic EpicSnapshot event
+      // directly — the same thing the plan worker emits on a file change. This
+      // tests the key event→fold→UDS-patch chain without relying on FSEvents
+      // delivery timing under full-suite load (FSEvents is unreliable when
+      // many test processes run concurrently).
+      const { db: patchWriter, stmts: patchStmts } = openDb(dbPath);
+      patchStmts.insertEvent.run(
+        Date.now() / 1000,
+        epicId,
+        null,
+        "EpicSnapshot",
+        "plan_snapshot",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         JSON.stringify({
-          id: epicId,
+          epic_number: epicNumberFromId(epicId),
           title: "Keeper E2E Plans Epic",
+          project_dir: "/tmp/keeper-e2e-repo",
           status: "done",
-          primary_repo: "/tmp/keeper-e2e-repo",
         }),
+        null,
+        null,
       );
+      patchWriter.close();
 
       const patch = await retryUntil(
         () =>

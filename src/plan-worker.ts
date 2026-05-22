@@ -51,8 +51,8 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { sep } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join, sep } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
@@ -390,6 +390,37 @@ function stringifyErr(err: unknown): string {
 }
 
 /**
+ * Boot scan: enumerate existing `.planctl/{epics,tasks}/*.json` files under
+ * `root` and run each through the scanner. Called once after each subscribe
+ * resolves so files that pre-existed the daemon's boot (or were changed while
+ * keeperd was down) are picked up without waiting for a watcher event. The
+ * change-gate in PlanScanner suppresses re-emits for files that already match
+ * the seeded projection row. Exported for unit reach.
+ */
+export function scanRoot(root: string, scanner: PlanScanner): void {
+  for (const collection of ["epics", "tasks"]) {
+    const dir = join(root, ".planctl", collection);
+    if (!existsSync(dir)) {
+      continue;
+    }
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch (err) {
+      console.error(
+        `[plan-worker] boot scan failed to read ${dir}: ${stringifyErr(err)}`,
+      );
+      continue;
+    }
+    for (const name of names) {
+      if (name.endsWith(".json")) {
+        scanner.onChange(join(dir, name));
+      }
+    }
+  }
+}
+
+/**
  * Seed the scanner's change-gate from the keeper DB: for each persisted
  * `epics`/`tasks` row, reconstruct the message the scanner would emit for that
  * row and seed its serialized form. So a daemon restart's full re-scan does not
@@ -565,6 +596,10 @@ function main(): void {
               return;
             }
             subscriptions.push(sub);
+            // Boot scan: pick up files that pre-existed this daemon's start
+            // (or were changed while keeperd was down) without waiting for a
+            // watcher event. The change-gate suppresses unchanged files.
+            scanRoot(root, scanner);
           })
           .catch((err) => {
             // Per-root isolation: one root's subscribe failure must not kill the
