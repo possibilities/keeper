@@ -292,11 +292,11 @@ export interface KeeperDb {
  * - `temp_store = MEMORY`: keeps spill files off disk.
  */
 function applyPragmas(db: Database): void {
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA synchronous = NORMAL");
-  db.exec("PRAGMA busy_timeout = 5000");
-  db.exec("PRAGMA foreign_keys = ON");
-  db.exec("PRAGMA temp_store = MEMORY");
+  db.run("PRAGMA journal_mode = WAL");
+  db.run("PRAGMA synchronous = NORMAL");
+  db.run("PRAGMA busy_timeout = 5000");
+  db.run("PRAGMA foreign_keys = ON");
+  db.run("PRAGMA temp_store = MEMORY");
 }
 
 /**
@@ -318,7 +318,7 @@ function addColumnIfMissing(
   if (cols.some((c) => c.name === column)) {
     return;
   }
-  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${columnDef}`);
+  db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${columnDef}`);
 }
 
 /**
@@ -340,7 +340,7 @@ function dropColumnIfPresent(
   if (!cols.some((c) => c.name === column)) {
     return;
   }
-  db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+  db.run(`ALTER TABLE ${table} DROP COLUMN ${column}`);
 }
 
 /**
@@ -350,21 +350,21 @@ function dropColumnIfPresent(
  */
 function migrate(db: Database): void {
   db.transaction(() => {
-    db.exec(CREATE_EVENTS);
+    db.run(CREATE_EVENTS);
     for (const sql of CREATE_EVENTS_INDEXES) {
-      db.exec(sql);
+      db.run(sql);
     }
-    db.exec(CREATE_JOBS);
-    db.exec(CREATE_EPICS);
-    db.exec(CREATE_TASKS);
+    db.run(CREATE_JOBS);
+    db.run(CREATE_EPICS);
+    db.run(CREATE_TASKS);
     for (const sql of CREATE_PLANS_INDEXES) {
-      db.exec(sql);
+      db.run(sql);
     }
-    db.exec(CREATE_REDUCER_STATE);
-    db.exec(CREATE_META);
+    db.run(CREATE_REDUCER_STATE);
+    db.run(CREATE_META);
 
     // Seed singleton cursor on first boot. Subsequent boots are no-ops.
-    db.exec(
+    db.run(
       "INSERT OR IGNORE INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 0, unixepoch('now', 'subsec'))",
     );
 

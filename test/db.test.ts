@@ -108,7 +108,7 @@ test("readonly: true opens a read-only connection", () => {
   // Open read-only and confirm writes fail.
   const reader = openDb(dbPath, { readonly: true });
   expect(() => {
-    reader.db.exec(
+    reader.db.run(
       "INSERT INTO jobs (job_id, created_at, updated_at) VALUES ('x', 0, 0)",
     );
   }).toThrow();
@@ -223,7 +223,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   // Build a v3-shaped DB by hand: events without spawn_name, jobs without
   // title_source, version '3'.
   const v3 = new Database(dbPath, { create: true });
-  v3.exec(`
+  v3.run(`
     CREATE TABLE events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts REAL NOT NULL,
@@ -242,7 +242,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
       subagent_agent_id TEXT
     )
   `);
-  v3.exec(`
+  v3.run(`
     CREATE TABLE jobs (
       job_id TEXT PRIMARY KEY,
       created_at REAL NOT NULL,
@@ -254,12 +254,12 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
       title TEXT
     )
   `);
-  v3.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  v3.exec("INSERT INTO meta (key, value) VALUES ('schema_version', '3')");
-  v3.exec(
+  v3.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v3.run("INSERT INTO meta (key, value) VALUES ('schema_version', '3')");
+  v3.run(
     "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (1, 'sess', 'SessionStart', 'session_start', '{}')",
   );
-  v3.exec(
+  v3.run(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title) VALUES ('old', 1, 5, 1, 'fix-osc')",
   );
   v3.close();
@@ -320,7 +320,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   // Build a v4-shaped DB by hand: jobs with title_source but no
   // transcript_path, version '4'.
   const v4 = new Database(dbPath, { create: true });
-  v4.exec(`
+  v4.run(`
     CREATE TABLE events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts REAL NOT NULL,
@@ -340,7 +340,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
       spawn_name TEXT
     )
   `);
-  v4.exec(`
+  v4.run(`
     CREATE TABLE jobs (
       job_id TEXT PRIMARY KEY,
       created_at REAL NOT NULL,
@@ -353,9 +353,9 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
       title_source TEXT
     )
   `);
-  v4.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  v4.exec("INSERT INTO meta (key, value) VALUES ('schema_version', '4')");
-  v4.exec(
+  v4.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v4.run("INSERT INTO meta (key, value) VALUES ('schema_version', '4')");
+  v4.run(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title, title_source) VALUES ('old', 1, 5, 1, 'fix-osc', 'payload')",
   );
   v4.close();
@@ -403,7 +403,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
 test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   // Build a v2-shaped DB by hand: mode + title + title_history, version '2'.
   const v2 = new Database(dbPath, { create: true });
-  v2.exec(`
+  v2.run(`
     CREATE TABLE jobs (
       job_id TEXT PRIMARY KEY,
       created_at REAL NOT NULL,
@@ -417,9 +417,9 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
       title_history TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(title_history))
     )
   `);
-  v2.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  v2.exec("INSERT INTO meta (key, value) VALUES ('schema_version', '2')");
-  v2.exec(
+  v2.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v2.run("INSERT INTO meta (key, value) VALUES ('schema_version', '2')");
+  v2.run(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, mode, title, title_history) VALUES ('old', 1, 5, 1, 'plan', 'fix-osc', '[\"a\",\"fix-osc\"]')",
   );
   v2.close();
@@ -454,7 +454,7 @@ test("v5 DB migrates to v6: epics + tasks tables added, jobs rows preserved", ()
   // Build a v5-shaped DB by hand: events + jobs at the current v5 shape, no
   // epics/tasks tables, version '5', with a populated jobs row.
   const v5 = new Database(dbPath, { create: true });
-  v5.exec(`
+  v5.run(`
     CREATE TABLE jobs (
       job_id TEXT PRIMARY KEY,
       created_at REAL NOT NULL,
@@ -468,9 +468,9 @@ test("v5 DB migrates to v6: epics + tasks tables added, jobs rows preserved", ()
       transcript_path TEXT
     )
   `);
-  v5.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  v5.exec("INSERT INTO meta (key, value) VALUES ('schema_version', '5')");
-  v5.exec(
+  v5.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v5.run("INSERT INTO meta (key, value) VALUES ('schema_version', '5')");
+  v5.run(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title, title_source) VALUES ('old', 1, 5, 1, 'fix-osc', 'payload')",
   );
   v5.close();
