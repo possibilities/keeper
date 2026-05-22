@@ -58,7 +58,7 @@
  * Usage:
  *   bun scripts/keeper-frames.ts [--collection <name>] [--sock <path>]
  *
- *   --collection <name>  Collection to page (jobs|epics|tasks; default jobs).
+ *   --collection <name>  Collection to page (jobs|epics; default jobs).
  *   --sock <path>        Socket path override (else $KEEPER_SOCK, else the
  *                        ~/.local/state/keeper/keeperd.sock default).
  *   --help               Show this help.
@@ -99,12 +99,12 @@ const HELP = `keeper-frames — primitive list UI over the keeper subscribe serv
 
 Usage: bun scripts/keeper-frames.ts [--collection <name>] [--sock <path>] [--state <s> | --state-ne <s>]
 
-  --collection <n> Collection to page (jobs|epics|tasks; default jobs)
+  --collection <n> Collection to page (jobs|epics; default jobs)
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
   --state <s>      Filter to jobs whose state equals <s> (e.g. working)
   --state-ne <s>   Filter to jobs whose state is NOT <s> (e.g. ended)
                    (--state and --state-ne are mutually exclusive; default: no filter)
-                   (--state/--state-ne are jobs-only; ignored for epics/tasks)
+                   (--state/--state-ne are jobs-only; ignored for epics)
   --help           Show this help
 
 Renders a 10-row page of the chosen collection as a YAML stream: one frame per
@@ -112,7 +112,7 @@ change, each frame a YAML document (--- separated) of collapsed row strings. The
 render is collection-appropriate:
   jobs  → {basename(cwd)} · {title} · {state}
   epics → {basename(project_dir)} · #{epic_number} · {title} · {status}
-  tasks → {epic_id} · #{task_number} · {title} · {status}
+The epics page renders each epic's embedded tasks array as a flow sequence.
 The page is refetched on every change signal and on a steady poll, so it always
 shows the current top-N; a new frame prints only when the rendered output
 changes. Every emitted frame is also mirrored to two /tmp sidecar files (full
@@ -127,7 +127,6 @@ of exiting; each connection-lifecycle change prints a ...-fenced note
 const PK_BY_COLLECTION: Record<string, string> = {
   jobs: "job_id",
   epics: "epic_id",
-  tasks: "task_id",
 };
 
 /**
@@ -242,10 +241,11 @@ async function main(): Promise<void> {
   /**
    * Collapse one full row to its display string, collection-aware:
    *   jobs  → `{basename(cwd)} · {title} · {state}`
-   *   epics → `{basename(project_dir)} · #{epic_number} · {title} · {status}`
-   *   tasks → `{epic_id} · #{task_number} · {title} · {status}`
-   * A null/absent segment projects to empty (no basename of nothing). This is
-   * the SOLE place a row's columns are read for display — so it alone defines
+   *   epics → `{basename(project_dir)} · #{epic_number} · {title} · {status} · {N tasks}`
+   * A null/absent segment projects to empty (no basename of nothing). The epics
+   * line surfaces the embedded `tasks` array's length so a task add/remove (the
+   * array splice that bumps the epic's `last_event_id`) reframes the page. This
+   * is the SOLE place a row's columns are read for display — so it alone defines
    * which column moves can reframe (see `emitFrameIfChanged`).
    */
   function projectRow(row: Record<string, unknown>): string {
@@ -254,10 +254,8 @@ async function main(): Promise<void> {
     if (collection === "epics") {
       const dir =
         row.project_dir == null ? "" : basename(String(row.project_dir));
-      return `${dir} · #${seg(row.epic_number)} · ${title} · ${seg(row.status)}`;
-    }
-    if (collection === "tasks") {
-      return `${seg(row.epic_id)} · #${seg(row.task_number)} · ${title} · ${seg(row.status)}`;
+      const taskCount = Array.isArray(row.tasks) ? row.tasks.length : 0;
+      return `${dir} · #${seg(row.epic_number)} · ${title} · ${seg(row.status)} · ${taskCount} tasks`;
     }
     const cwd = row.cwd == null ? "" : basename(String(row.cwd));
     return `${cwd} · ${title} · ${seg(row.state)}`;
@@ -402,7 +400,7 @@ async function main(): Promise<void> {
   // not after the fetch — keeps LIMIT counting matching rows (so the page is a
   // true top-N of the filtered set, never short) and makes `result.total` /
   // `meta` describe exactly the set we render. Default: no filter (every job).
-  // The `state` filter is jobs-only — epics/tasks have no `state` column, so a
+  // The `state` filter is jobs-only — epics have no `state` column, so a
   // state filter would be a no-op key server-side; only attach it for jobs.
   const stateFilter =
     collection === "jobs"

@@ -12,9 +12,14 @@ live cells. The server is just another reader (own read-only connection, own
 `data_version` poll); the client **write path stays forbidden** — no mutations,
 no reactor, no socket-driven writes. Consumers may still read the `jobs` table
 directly. V3 adds a second producer worker (`plan-worker`) that folds the
-configured roots' `.planctl/{epics,tasks}` trees into two new read-only
-projections (`epics`, `tasks`) served over the same socket as additional
-collections — read-only end to end, same fence as `jobs`. See `README.md` for the
+configured roots' `.planctl/{epics,tasks}` trees into a single new read-only
+`epics` projection — each epic embeds its tasks as a JSON-array `epics.tasks`
+column (schema v7; the standalone `tasks` collection + table were collapsed
+away) — served over the same socket as an additional collection, read-only end
+to end, same fence as `jobs`. The plan trees are filesystem-synchronized: file
+deletions retract projection state via synthetic tombstone events (live), and a
+boot reconciliation sweep retracts anything deleted while the daemon was down.
+See `README.md` for the
 elevator pitch, install, and non-goals; this file is the in-codebase map for AI
 agents working in the repo.
 
@@ -30,11 +35,14 @@ agents working in the repo.
     `drainToCompletion(db, batchSize)` so tests drive boot drain without spawning
     the workers. Main is also the SOLE `events` producer for synthetic rows: a
     `transcript-title` message from the transcript worker becomes a synthetic
-    `TranscriptTitle` event, and a `plan-epic`/`plan-task` message from the plan
-    worker becomes a synthetic `EpicSnapshot`/`TaskSnapshot` event — each inserted
+    `TranscriptTitle` event; a `plan-epic`/`plan-task` message from the plan
+    worker becomes a synthetic `EpicSnapshot`/`TaskSnapshot` event; and a
+    `plan-epic-deleted`/`plan-task-deleted` tombstone message from the plan worker
+    becomes a synthetic `EpicDeleted`/`TaskDeleted` event — each inserted
     on the existing WRITABLE connection (via `stmts.insertEvent`), then
-    `pumpWakes()` folds it. Main never writes `jobs`/`epics`/`tasks` directly; the
-    title and the plan snapshots flow through the event log.
+    `pumpWakes()` folds it. Main never writes `jobs`/`epics` directly; the
+    title, the plan snapshots, and the plan tombstones all flow through the event
+    log.
   - `src/reducer.ts` — the fold. `drain(db, batchSize)` reads unfolded events
     and folds each via `applyEvent`, which wraps the projection write + cursor
     advance in ONE `BEGIN IMMEDIATE` transaction. Exports `DEFAULT_BATCH_SIZE`.
@@ -43,11 +51,20 @@ agents working in the repo.
     source wins, a lower one never clobbers, comparing persisted
     `(title, title_source)` in-txn for re-fold determinism. The synthetic
     `TranscriptTitle` event folds at the priority-3 `'transcript'` source. The
-    synthetic `EpicSnapshot`/`TaskSnapshot` events fold as idempotent upserts into
-    the `epics`/`tasks` projections (snapshot-replace by the entity pk carried in
-    `session_id`, with `last_event_id` bumped each fold), keyed off the snapshot
-    blob in `data` — re-fold deterministic, same as the title path.
-  - `src/db.ts` — schema bootstrap (`events`, `jobs`, `epics`, `tasks`,
+    synthetic `EpicSnapshot` event folds as an idempotent upsert into the `epics`
+    projection (snapshot-replace by `epic_id` carried in `session_id`); the
+    synthetic `TaskSnapshot` event folds into its PARENT epic's embedded `tasks`
+    JSON-array via a read-modify-write — parse the stored array, splice the
+    element by `task_id`, re-sort by a stable key (`task_number, task_id`),
+    re-stringify, write once (all in JS inside the open transaction, no JSON1),
+    bumping the epic's `last_event_id`/`updated_at` so the change `patch`es the
+    parent. The synthetic `EpicDeleted`/`TaskDeleted` tombstone events fold as
+    retractions (`retractPlanRow`): `EpicDeleted` is a `DELETE FROM epics`,
+    `TaskDeleted` splices the element out of the parent epic's array — both
+    idempotent no-ops on a missing target. A malformed stored array folds to `[]`
+    INSIDE the transaction (never throw — a throw rolls back the cursor and wedges
+    the reducer). All plan folds are re-fold deterministic, same as the title path.
+  - `src/db.ts` — schema bootstrap (`events`, `jobs`, `epics`,
     `reducer_state`, `meta`), connection-local PRAGMAs (`applyPragmas`), prepared
     statements, and `openDb(path, { readonly })` / `resolveDbPath()` /
     `resolveConfig()` / `resolvePlanRoots()` (the plan-worker root resolver, fed
@@ -56,10 +73,14 @@ agents working in the repo.
     root resolver, reading the SEPARATE `claude_projects_root` key from the SAME
     config doc — tilde-expanded, NOT existence-filtered, default
     `~/.claude/projects`; the two config keys fall back INDEPENDENTLY, so a
-    malformed one never disturbs the other). Owns `SCHEMA_VERSION` (currently 6: v4 added
+    malformed one never disturbs the other). Owns `SCHEMA_VERSION` (currently 7: v4 added
     `events.spawn_name` + `jobs.title_source`; v5 added `jobs.transcript_path`;
-    v6 added the `epics` + `tasks` plan-projection tables) and the forward-only
-    `migrate()` block.
+    v6 added the `epics` + `tasks` plan-projection tables; v7 collapsed the
+    standalone `tasks` table into an embedded `epics.tasks` JSON-array column —
+    a version-guarded (`schema_version < 7`) non-idempotent migration: ADD COLUMN
+    `epics.tasks` → backfill via `json_group_array(json_object(...))` ordered
+    `task_number, task_id` to MATCH the reducer fold sort → `DROP TABLE IF EXISTS
+    tasks`, all in one transaction) and the forward-only `migrate()` block.
   - `src/wake-worker.ts` — Worker thread; own read-only connection polling
     `PRAGMA data_version` at ~50ms, posts contentless `{ kind: "wake" }`
     messages. `isMainThread`-guarded so a plain import is inert.
@@ -133,7 +154,19 @@ agents working in the repo.
     `event.type` (planctl writes atomically via `os.replace`). On a changed file
     it posts a `{ kind: "plan-epic" }`/`{ kind: "plan-task" }` snapshot message to
     main, change-gated against the last-emitted serialized snapshot so a restart
-    full-scan doesn't re-emit. READ-ONLY (own read-only connection for the
+    full-scan doesn't re-emit. **Delete retraction (fn-568):** on a file that has
+    VANISHED (`onDelete`), it posts a tombstone message
+    (`{ kind: "plan-epic-deleted" }`/`{ kind: "plan-task-deleted" }`) so main folds
+    a synthetic `EpicDeleted`/`TaskDeleted` and the projection retracts (the epic
+    row dropped, or the task element spliced out of its parent's array); a task
+    tombstone recovers its parent `epicId` from the last-emitted snapshot in the
+    change-gate (the file is already gone), then drops the path's change-gate
+    entry. **Boot reconciliation (fn-568):** a file deleted while the daemon was
+    DOWN never fired a live `onDelete`, so AFTER every configured root's boot scan
+    has run, a one-shot sweep retracts any projection row whose backing file is no
+    longer on disk — reusing the SAME tombstone path so the retraction folds
+    through the synthetic-event pipeline identically. READ-ONLY (own read-only
+    connection for the
     `seedFromDb` restart-seed; never writes the DB — main is the sole writer). The
     pure `PlanScanner` core + `seedFromDb` are exported and drivable with no Worker
     or watcher; each subscription is an owned external resource `unsubscribe()`d in
@@ -153,8 +186,9 @@ agents working in the repo.
     (table, served columns, pk, the per-row `version` column the diff fires on,
     the sort allowlist + default sort, the filter-key → SQL-column map, and
     `jsonColumns` — the set of JSON-TEXT columns `decodeRow` parses into real
-    values at the read boundary; no collection registers one today, so it is
-    dormant generic infrastructure);
+    values at the read boundary; `epics` registers `tasks` here so each served
+    epic carries a decoded `tasks: Task[]` array, fail-soft to `[]` on a
+    NULL/parse failure);
     `REGISTRY` / `getCollection` resolve a wire `collection` name to its
     descriptor, `selectByIds(db, descriptor, ids)` is the
     descriptor-parameterized by-id read (it `decodeRow`s its rows, so the diff
@@ -162,18 +196,20 @@ agents working in the repo.
     whereClause, params)` is the descriptor-parameterized count-query — the
     filtered-set `COUNT(*)` plus a `group_concat(pk)` membership token (ordered
     by pk, empty-set normalized to `total=0`/`token=""`) that the `meta` signal
-    diffs on. `REGISTRY` holds three descriptors — `jobs` (pk `job_id`), `epics`
-    (pk `epic_id`), and `tasks` (pk `task_id`); the plans surface added the latter
-    two as descriptor-only entries with zero `server-worker.ts` edits, proving the
+    diffs on. `REGISTRY` holds two descriptors — `jobs` (pk `job_id`) and `epics`
+    (pk `epic_id`, default sort `epic_number asc` — stable creation order, so a
+    task edit never reorders the page); the plans surface added `epics` as a
+    descriptor-only entry with zero `server-worker.ts` edits, proving the
     namespacing. Each `filters` map includes the pk for detail-page single-item
-    subscribe (`tasks` also filters `epic_id` for parent-scoped subscribe). The
+    subscribe. The
     descriptor is the SOLE identifier-injection gate: only its constants are
     interpolated into SQL; wire filter keys are resolved by map lookup, never
-    interpolated — load-bearing for `epics`/`tasks`, whose `project_dir` /
+    interpolated — load-bearing for `epics`, whose `project_dir` /
     `target_repo` hold opaque foreign-process JSON bound as filter VALUES, never
     as identifiers. `jobs`'s served `columns` include `title` + `title_source`,
-    and `epics`/`tasks` serve `title` + `*_number` as read-only display (all OUT
-    of `sortable`/`filters` where they are display-only).
+    and `epics` serves `title` + `epic_number` + the embedded `tasks` array as
+    read-only display (all OUT of `sortable`/`filters` where they are
+    display-only).
   - `src/protocol.ts` — the wire protocol: `query` / `result` / `patch` / `meta`
     frame shapes (every frame names a `collection`; `result` / `patch` are
     generic over `Row`; `result` carries `total` — the filtered-set size; `patch`
@@ -183,8 +219,10 @@ agents working in the repo.
     server worker.
   - `src/types.ts` — `Event`, `Job`, `Epic`, `Task`, `ReducerState` row shapes
     (`Job` carries `transcript_path` — display/debug only, never sorted/filtered;
-    `Epic`/`Task` are the plan-projection rows, folded from the synthetic
-    `EpicSnapshot`/`TaskSnapshot` events).
+    `Epic` is the sole plan-projection row, folded from the synthetic
+    `EpicSnapshot`/`TaskSnapshot`/`EpicDeleted`/`TaskDeleted` events; `Task` is no
+    longer a standalone projection row — it is the ELEMENT shape of `Epic.tasks`,
+    the embedded JSON array).
   - `src/version.ts` — `VERSION` constant.
 - `plugin/` — the Claude Code hook plugin (symlink target for
   `~/.claude/plugins/keeper`).
@@ -207,13 +245,13 @@ agents working in the repo.
 | Module | Entry | Role |
 |---|---|---|
 | `src/daemon.ts` | `runDaemon()` (via `import.meta.main`) | process lifecycle |
-| `src/reducer.ts` | `drain()` / `applyEvent()` | fold events → jobs/epics/tasks |
+| `src/reducer.ts` | `drain()` / `applyEvent()` | fold events → jobs / epics (tasks embedded in `epics.tasks`) |
 | `src/db.ts` | `openDb()` / `resolveDbPath()` / `resolvePlanRoots()` / `resolveClaudeProjectsRoot()` | schema + PRAGMAs + stmts + plan-root + transcript-root config |
 | `src/wake-worker.ts` | Worker default body | `data_version` poll → wake |
 | `src/server-worker.ts` | Worker default body | UDS subscribe server: query → result (+ `total`) + live patches + `meta` staleness signal, routed by collection |
 | `src/transcript-worker.ts` | Worker default body / `TranscriptLineStream` / `scanJobsForTitles` | watch external transcript tree → tail `custom-title` (+ boot scan via `jobs.transcript_path`) → post `transcript-title` (priority-3 producer) |
-| `src/plan-worker.ts` | Worker default body / `PlanScanner` | watch external `.planctl/{epics,tasks}` trees → safe-parse → post `plan-epic`/`plan-task` snapshots (second producer) |
-| `src/collections.ts` | `getCollection()` / `selectByIds()` / `countAndToken()` | collection registry (`jobs`/`epics`/`tasks`) + descriptor-parameterized by-id read + count/membership-token query |
+| `src/plan-worker.ts` | Worker default body / `PlanScanner` | watch external `.planctl/{epics,tasks}` trees → safe-parse → post `plan-epic`/`plan-task` snapshots + `plan-epic-deleted`/`plan-task-deleted` tombstones + boot reconciliation (second producer) |
+| `src/collections.ts` | `getCollection()` / `selectByIds()` / `countAndToken()` | collection registry (`jobs`/`epics`, the latter embedding `tasks`) + descriptor-parameterized by-id read + count/membership-token query |
 | `src/protocol.ts` | `encodeFrame()` / `LineBuffer` / frame types | NDJSON wire protocol (collection-namespaced `query`/`result`/`patch`/`meta` frames) |
 | `plugin/hooks/events-writer.ts` | `main()` | one event row per hook |
 
@@ -270,21 +308,39 @@ The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
   — the fold IS the live view, so the re-open lives in the reducer.
 - `EpicSnapshot` / `TaskSnapshot` (**synthetic**, inserted by keeperd's main
   thread from the plan worker's `plan-epic`/`plan-task` messages, not the hook) →
-  these do NOT touch `jobs`; they project into the SEPARATE `epics` / `tasks`
-  tables. The `session_id` carries the entity pk (`epic_id` / `task_id`); the
-  `data` blob is the full state-on-disk snapshot. The fold is an **idempotent
-  upsert** (snapshot-replace by pk, `last_event_id` bumped each fold) — plans are
-  state-on-disk, so a full snapshot per event keeps re-fold deterministic (replay
-  reproduces identical `epics`/`tasks` rows). `tasks.status` is the producer's
-  derived value (`worker_done_at` present → `done`, else `open`). No lifecycle /
-  title interaction with `jobs`.
+  these do NOT touch `jobs`; they project into the SEPARATE `epics` table (there
+  is no longer a `tasks` table — tasks are embedded). `EpicSnapshot`: the
+  `session_id` carries `epic_id`, the `data` blob is the full state-on-disk
+  snapshot, the fold is an **idempotent upsert** (snapshot-replace by `epic_id`,
+  `last_event_id` bumped each fold). `TaskSnapshot`: the `session_id` carries
+  `task_id` and the blob carries the parent `epic_id`; the fold is a
+  **read-modify-write on the parent epic's embedded `tasks` array** — parse the
+  stored array, splice the element by `task_id`, re-sort by the stable key
+  (`task_number, task_id`), re-stringify, write once (JS, no JSON1), bumping the
+  parent epic's `last_event_id`/`updated_at` so the task change `patch`es the
+  epic. Building the array from a stable sort (never append) keeps re-fold
+  deterministic — replay reproduces byte-identical `epics` rows (with embedded
+  arrays). `tasks[].status` is the producer's derived value (`worker_done_at`
+  present → `done`, else `open`). No lifecycle / title interaction with `jobs`.
+- `EpicDeleted` / `TaskDeleted` (**synthetic** tombstones, inserted by main from
+  the plan worker's `plan-epic-deleted`/`plan-task-deleted` messages — a live
+  file delete OR a boot-reconciliation retraction) → `EpicDeleted` is a
+  `DELETE FROM epics WHERE epic_id = ?` (the embedded array vanishes with the
+  row); `TaskDeleted` is a read-modify-write splicing the element out of the
+  parent epic's array by `task_id` (parent `epic_id` recovered into the blob),
+  bumping `last_event_id` so the retraction `patch`es. Both are **idempotent
+  no-ops on a missing target** and never throw inside the transaction (a malformed
+  stored array folds to `[]`). Tombstones are the only replay-deterministic delete
+  fold — a vanished file leaves no event, so a re-fold replays the create→delete
+  sequence and reproduces the retracted state.
 - Everything else (PreToolUse, PostToolUse, Notification, Subagent*, unknown
   forward-compat events) → no jobs write; the cursor still advances.
 
 **V3: keeperd is now also a producer.** V1/V2 the hook was the sole `events`
 writer; V3 adds the transcript worker → main pipeline (synthetic
 `TranscriptTitle` events) and the plan worker → main pipeline (synthetic
-`EpicSnapshot`/`TaskSnapshot` events) above. The hook remains the only writer of
+`EpicSnapshot`/`TaskSnapshot` snapshots + `EpicDeleted`/`TaskDeleted` tombstones)
+above. The hook remains the only writer of
 *hook* events; main is the only writer of *synthetic* events (both producers feed
 the log only via main's writable connection — they never write the DB
 themselves).
@@ -298,7 +354,14 @@ provenance/precedence), both nullable with no backfill. Schema v5 added
 seeded from a SessionStart payload — display/debug only), nullable, NULL-backfill
 on old rows. Schema v6 added the `epics` + `tasks` plan-projection tables (new
 tables via `CREATE TABLE IF NOT EXISTS`, so existing rows in other tables are
-untouched — a clean forward-only step).
+untouched — a clean forward-only step). Schema v7 collapsed the standalone
+`tasks` table into an embedded `epics.tasks` JSON-array column: unlike the
+idempotent ALTER steps before it, v7 is a non-idempotent data migration, so it is
+**version-guarded** (`schema_version < 7`) and runs in one transaction —
+ADD COLUMN `epics.tasks TEXT NOT NULL DEFAULT '[]'` → backfill the array from the
+old `tasks` rows via `json_group_array(json_object(...))` ordered
+`task_number, task_id` (the SAME order the reducer's fold re-sorts to, or a
+migrated row would differ from a re-folded one) → `DROP TABLE IF EXISTS tasks`.
 
 ## Event-sourcing invariants
 
@@ -323,15 +386,21 @@ untouched — a clean forward-only step).
 - **The hook is the sole writer of *hook* events; main is the sole writer of
   *synthetic* events.** Since V3 keeperd's main thread inserts synthetic
   `TranscriptTitle` rows (from the transcript worker's `transcript-title`
-  message) and synthetic `EpicSnapshot`/`TaskSnapshot` rows (from the plan
-  worker's `plan-epic`/`plan-task` messages) on its existing writable connection
+  message), synthetic `EpicSnapshot`/`TaskSnapshot` rows (from the plan worker's
+  `plan-epic`/`plan-task` messages), and synthetic `EpicDeleted`/`TaskDeleted`
+  tombstone rows (from the plan worker's `plan-epic-deleted`/`plan-task-deleted`
+  messages) on its existing writable connection
   via `stmts.insertEvent`, then `pumpWakes()`. A synthetic `TranscriptTitle` id is
   allocated after the session's SessionStart in practice, so it folds at priority
   3 over the lower-tier title. Because every projection-driving fact lives in the
-  immutable event log — never written straight to `jobs`/`epics`/`tasks` — a
-  re-fold from scratch (rewind cursor, `DELETE FROM jobs`/`epics`/`tasks`,
-  re-drain) reproduces the identical rows: synthetic events (titles AND plan
-  snapshots) replay deterministically just like hook events. Both producer
+  immutable event log — never written straight to `jobs`/`epics` — a
+  re-fold from scratch (rewind cursor, `DELETE FROM jobs`/`epics`,
+  re-drain) reproduces the identical rows: "identical rows" now means `epics`
+  rows with their embedded `tasks` arrays byte-for-byte reproduced (a
+  create→delete→re-create sequence of snapshots and tombstones replays to the same
+  array), since the array is built from a stable sort, never append. Synthetic
+  events (titles, plan snapshots, AND plan tombstones)
+  replay deterministically just like hook events. Both producer
   workers stay read-only; neither ever writes the DB.
 - **PRAGMAs are connection-local** — `applyPragmas` runs on every `openDb`,
   including the wake worker's and the server worker's own read-only connections.
@@ -347,10 +416,15 @@ untouched — a clean forward-only step).
   autocommit (no `BEGIN`), or `data_version` freezes for that connection. Never a
   `fs.watch`/FSEvents file watcher (see DO NOT).
 - **Schema migrations are forward-only** via the `meta(schema_version)` row +
-  the ALTER slot in `migrate()`. Steps must be idempotent — `addColumnIfMissing`
-  / `dropColumnIfPresent` converge on the table's actual shape, so even a DROP is
-  safe to re-run (it no-ops once gone). Bump `SCHEMA_VERSION` only when adding an
-  ALTER; never reduce the version, never branch.
+  the ALTER slot in `migrate()`. Idempotent steps (`addColumnIfMissing` /
+  `dropColumnIfPresent`) converge on the table's actual shape, so even a DROP is
+  safe to re-run unguarded (it no-ops once gone). A **non-idempotent** step (a
+  data backfill, a destructive DROP that depends on a one-time read) MUST be
+  version-guarded — v7 is the first such step: it guards on `schema_version < 7`
+  and sequences ADD COLUMN → backfill (`json_group_array`, ordered to match the
+  reducer fold sort) → `DROP TABLE IF EXISTS tasks` in one transaction, so a
+  re-run can't re-backfill an already-collapsed schema. Bump `SCHEMA_VERSION` only
+  when adding an ALTER; never reduce the version, never branch.
 
 ## DO NOT
 
@@ -402,12 +476,13 @@ untouched — a clean forward-only step).
   explicitly out of scope.
 - **Plans are READ-ONLY, like everything else keeper serves.** keeper *reads*
   planctl state — the plan worker (V3) watches the configured roots'
-  `.planctl/{epics,tasks}` trees and folds snapshots into the `epics`/`tasks`
-  projections served over the same socket. FORBIDDEN: any plan WRITE path — the
-  socket never carries a plan mutation, keeper never writes a `.planctl` file, and
-  no `planctl_mutations` / command surface exists. The fence is the same as
-  `jobs`: read the projection, subscribe over the socket, never mutate. (This
-  legitimizes the read-only plans projection that the original "no
+  `.planctl/{epics,tasks}` trees and folds snapshots into the single `epics`
+  projection (each epic embedding its tasks as a JSON array — there is no peer
+  `tasks` collection or table) served over the same socket. FORBIDDEN: any plan
+  WRITE path — the socket never carries a plan mutation, keeper never writes a
+  `.planctl` file, and no `planctl_mutations` / command surface exists. The fence
+  is the same as `jobs`: read the projection, subscribe over the socket, never
+  mutate. (This legitimizes the read-only plans projection that the original "no
   plans/planctl_mutations" ban predated — the ban is now scoped to the *write*
   path only.)
 - **Transcript tailing is scoped to the daemon, never the hook (V3).** keeperd's
@@ -473,7 +548,16 @@ Three archetypes:
   by the same change-gate so an unchanged file is not re-emitted: `plan-worker`'s
   `scanRoot` enumerates `.planctl/{epics,tasks}/*.json`, while `transcript-worker`'s
   `scanJobsForTitles` scopes to live `jobs.transcript_path` (the per-session file,
-  NOT a watch-root walk) and folds each session's current `custom-title`. Both
+  NOT a watch-root walk) and folds each session's current `custom-title`.
+  **`plan-worker` extends the producer archetype with delete handling (fn-568):**
+  beyond the additive snapshot path, its `onDelete` emits a RETRACTION tombstone
+  (`plan-epic-deleted`/`plan-task-deleted`) when a watched file vanishes, and
+  AFTER all roots' boot scans complete it runs a one-shot **boot-reconciliation
+  sweep** that retracts any projection row whose backing file is gone (catching
+  deletes that happened while the daemon was down — those fire no live `onDelete`).
+  Both the live `onDelete` and the boot sweep route through the same tombstone
+  message → synthetic `EpicDeleted`/`TaskDeleted` event → reducer retraction, so
+  deletes stay re-fold deterministic just like the additive snapshots. Both
   producers ALSO run a **second post-subscribe behavior (fn-566): drop-recovery.**
   macOS FSEvents can drop events under congestion and reports it through the
   subscribe callback's `err` arg ("...must be re-scanned"); the lost change may

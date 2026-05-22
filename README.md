@@ -31,7 +31,8 @@ Keeper also exposes a **read-only NDJSON-over-UDS subscribe server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names
 a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
 page that doubles as a live subscription. `jobs` is the first and default
-collection, joined by `epics` and `tasks` (the read-only plans surface); the
+collection, joined by `epics` (the read-only plans surface — each epic embeds its
+tasks as a JSON array, so there is no separate `tasks` collection); the
 surface is built so additional collections register without touching the wire
 protocol or the diff machinery. Page membership is frozen at
 query time, but each row's cells stream `patch` frames as the reducer folds new
@@ -68,8 +69,9 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   transcript tree on a watch to supply the priority-3 `transcript` title) but
   stays forbidden in the hook.
 - **No plan write path through the socket** — keeper *reads* planctl state into
-  the `epics`/`tasks` projections (a fourth, read-only producer worker watches
-  the configured roots' `.planctl/{epics,tasks}` trees), but the socket carries
+  the single `epics` projection, each epic embedding its tasks as a JSON array (a
+  fourth, read-only producer worker watches the configured roots'
+  `.planctl/{epics,tasks}` trees), but the socket carries
   no plan mutation and keeper never writes a `.planctl` file. The read surface is
   read-only end to end, same fence as `jobs`.
 - **No multi-session-per-job lineage** — v1 holds `job_id === session_id` (one
@@ -114,8 +116,8 @@ Keeper has no `install` verb. Wire it up manually:
    INDEPENDENT keys:
 
    - `roots` — the project roots the plan worker watches for
-     `.planctl/{epics,tasks}` trees, folding them into the `epics`/`tasks`
-     collections. Default (no config): the single root `~/code`.
+     `.planctl/{epics,tasks}` trees, folding them into the single `epics`
+     collection (tasks embedded per epic). Default (no config): the single root `~/code`.
    - `claude_projects_root` — the single tree the transcript worker watches for
      session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
      Override only if your Claude Code transcripts live elsewhere.
@@ -234,10 +236,16 @@ title.
 A **fourth** Worker thread is the plan producer: it watches each configured
 project root (from `~/.config/keeper/config.yaml`, default `~/code`) for
 `.planctl/{epics,tasks}/*.json` files with `@parcel/watcher`, safe-parses each
-changed file, and posts a `plan-epic`/`plan-task` snapshot message to main. Main
-— again the sole writer — turns each into a synthetic `EpicSnapshot`/`TaskSnapshot`
-events row and pumps a wake; the reducer folds it as an idempotent upsert into the
-`epics`/`tasks` projection (served over the same socket as new collections). It is
+changed file, and posts a `plan-epic`/`plan-task` snapshot message to main (and a
+`plan-epic-deleted`/`plan-task-deleted` tombstone when a file vanishes). Main
+— again the sole writer — turns each into a synthetic
+`EpicSnapshot`/`TaskSnapshot` (or `EpicDeleted`/`TaskDeleted`)
+events row and pumps a wake; the reducer folds an `EpicSnapshot` as an idempotent
+upsert into the single `epics` projection and a `TaskSnapshot` into its parent
+epic's embedded `tasks` JSON array (a task change `patch`es the parent epic;
+tombstones retract). File deletions are filesystem-synchronized: a live delete
+fires a tombstone, and a boot-reconciliation sweep retracts anything deleted while
+the daemon was down. It is
 the second instance of the same producer archetype as the transcript worker:
 read-only / write-free, feeding the log only via main. Both producers also
 self-recover from a *dropped-events* FSEvents overrun: on the recoverable
@@ -260,13 +268,14 @@ list, see [CLAUDE.md](./CLAUDE.md).
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, title, title_source, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
 
-# Plans projections — epics and tasks folded from the configured `.planctl` roots:
+# Plans projection — epics (each embedding its tasks as a JSON array) folded from the configured `.planctl` roots:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT epic_id, epic_number, title, status FROM epics ORDER BY updated_at DESC LIMIT 10'
+  'SELECT epic_id, epic_number, title, status FROM epics ORDER BY epic_number ASC LIMIT 10'
+# Tasks live inside epics.tasks now — unnest with json_each to list them per epic:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT task_id, epic_id, task_number, title, status FROM tasks ORDER BY updated_at DESC LIMIT 10'
+  "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(t.value, '\$.task_number') AS task_number, json_extract(t.value, '\$.title') AS title, json_extract(t.value, '\$.status') AS status FROM epics e, json_each(e.tasks) t ORDER BY e.epic_number ASC, task_number ASC LIMIT 10"
 
-# Raw event log tail (synthetic EpicSnapshot/TaskSnapshot rows appear here too):
+# Raw event log tail (synthetic EpicSnapshot/TaskSnapshot/EpicDeleted/TaskDeleted rows appear here too):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT id, hook_event, session_id FROM events ORDER BY id DESC LIMIT 10'
 
