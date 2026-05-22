@@ -206,6 +206,133 @@ export class TranscriptLineStream {
   }
 
   /**
+   * One-shot boot scan of an EXISTING file from offset 0 to a once-snapshotted
+   * size, emitting ONLY the current (last) `custom-title` per session found in
+   * the file. This is the startup current-title fold: a `custom-title` set while
+   * the daemon was down was never streamed by the live tail (which anchors each
+   * file at EOF on first sight), so without this scan a rename-while-down is
+   * permanently missed until the title changes again.
+   *
+   * Unlike `register`/`onChange`, the scan does NOT touch `pathState` — it uses a
+   * transient decoder + partial buffer local to this call. So the live watcher's
+   * EOF-anchoring on first sight of the same path is unaffected, and bytes
+   * appended after the snapshot are picked up by the normal live tail. The shared
+   * `lastEmitted` change-gate dedups across the scan and the live tail.
+   *
+   * Reuses the bounded-chunk read / `StringDecoder` / partial-line / malformed-skip
+   * machinery (`consume` → `dispatchLine`), but ACCUMULATES matches per session
+   * and emits only the final one — so intermediate historical renames don't churn
+   * the event log. A title already folded (seeded into `lastEmitted` by
+   * `seedFromDb`) is suppressed by the change-gate. Per-file errors skip-and-log;
+   * the scan never throws.
+   */
+  scanFile(path: string): void {
+    let size: number;
+    try {
+      const st = statSync(path);
+      if (!st.isFile()) {
+        return;
+      }
+      size = st.size;
+    } catch (err) {
+      this.log(
+        `[transcript-worker] boot scan stat failed for ${path}: ${stringifyErr(err)}`,
+      );
+      return;
+    }
+    if (size <= 0) {
+      return;
+    }
+
+    let fd: number;
+    try {
+      fd = openSync(path, "r");
+    } catch (err) {
+      this.log(
+        `[transcript-worker] boot scan open failed for ${path}: ${stringifyErr(err)}`,
+      );
+      return;
+    }
+
+    // Transient per-scan state — NOT stored in pathState, so the live tail still
+    // anchors this path at EOF on its first watcher sighting.
+    const decoder = new StringDecoder("utf8");
+    let partial = "";
+    // Accumulate the LAST title per session seen in this file; emit once at the
+    // end so intermediate renames don't each fire an event.
+    const lastPerSession = new Map<string, string>();
+
+    const handleLine = (line: string): void => {
+      if (line.trim().length === 0) {
+        return;
+      }
+      if (!line.includes("custom-title")) {
+        return;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch (err) {
+        this.log(
+          `[transcript-worker] boot scan malformed line in ${path}: ${stringifyErr(err)}`,
+        );
+        return;
+      }
+      const match = matchCustomTitle(parsed);
+      if (!match) {
+        return;
+      }
+      lastPerSession.set(match.sessionId, match.title);
+    };
+
+    try {
+      const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+      let offset = 0;
+      while (offset < size) {
+        const want = Math.min(READ_CHUNK_BYTES, size - offset);
+        let got: number;
+        try {
+          got = readSync(fd, buf, 0, want, offset);
+        } catch (err) {
+          this.log(
+            `[transcript-worker] boot scan read failed for ${path}: ${stringifyErr(err)}`,
+          );
+          return;
+        }
+        if (got <= 0) {
+          break;
+        }
+        offset += got;
+        partial += decoder.write(buf.subarray(0, got));
+        let nl = partial.indexOf("\n");
+        while (nl !== -1) {
+          handleLine(partial.slice(0, nl));
+          partial = partial.slice(nl + 1);
+          nl = partial.indexOf("\n");
+        }
+      }
+    } finally {
+      try {
+        closeSync(fd);
+      } catch {
+        // best-effort
+      }
+    }
+
+    // Emit the current title per session through the shared change-gate: a title
+    // already folded (seeded by seedFromDb) is suppressed; a changed one emits
+    // once and advances the gate so the live tail won't re-emit it.
+    for (const [sessionId, title] of lastPerSession) {
+      const prev = this.lastEmitted.get(sessionId);
+      if (prev === title) {
+        continue;
+      }
+      this.lastEmitted.set(sessionId, title);
+      this.onTitle(sessionId, title);
+    }
+  }
+
+  /**
    * Process bytes appended to `path` since the stored offset. Auto-registers a
    * not-yet-seen path (anchoring to EOF means a freshly-created file's existing
    * lines are skipped — we only stream appends), so a watcher "create" event is
@@ -380,6 +507,45 @@ export function seedFromDb(db: Database, stream: TranscriptLineStream): void {
 }
 
 /**
+ * Boot scan: fold the CURRENT `custom-title` for each live job, scoped via
+ * `jobs.transcript_path` (schema v5 — the absolute path to that session's
+ * transcript JSONL). A `custom-title` set while the daemon was down was never
+ * streamed by the live tail (which anchors each file at EOF on first sight), so
+ * this one-shot scan after `seedFromDb` + subscribe is what makes a
+ * rename-while-down survive a daemon restart.
+ *
+ * Scoping to `jobs.transcript_path` (NOT a recursive enumeration of the watch
+ * root) is deliberate: a transcript title only folds onto an EXISTING `jobs` row
+ * (boot drain already created them before this worker spawns), and this scopes to
+ * exactly the per-session files that matter — skipping the thousands of dead
+ * historical transcripts under the deeply-nested watch tree, and reading the real
+ * file even in multi-profile setups where it lives outside the single configured
+ * watch root. Jobs with a NULL `transcript_path` (old pre-v5 rows) can't be
+ * scanned — acceptable. Must run AFTER `seedFromDb` so an already-folded title is
+ * suppressed by the change-gate (no duplicate event on restart). Per-file errors
+ * skip-and-log inside `scanFile`; this is non-fatal.
+ *
+ * Read-only — uses the worker's own read-only connection. Exported for unit reach.
+ */
+export function scanJobsForTitles(
+  db: Database,
+  stream: TranscriptLineStream,
+): void {
+  const rows = db
+    .query("SELECT transcript_path FROM jobs WHERE transcript_path IS NOT NULL")
+    .all() as { transcript_path: string }[];
+  for (const row of rows) {
+    if (
+      typeof row.transcript_path !== "string" ||
+      row.transcript_path.length === 0
+    ) {
+      continue;
+    }
+    stream.scanFile(row.transcript_path);
+  }
+}
+
+/**
  * Worker entrypoint. Opens its own read-only connection, seeds the change-gate,
  * subscribes to the watch root, routes each change event into the line stream,
  * and posts a `transcript-title` message per changed title. The subscription is
@@ -514,6 +680,20 @@ function main(): void {
         return;
       }
       subscription = sub;
+      // Startup current-title fold: after seedFromDb (above) AND after the
+      // subscription is live, scan each live job's transcript file for its
+      // current `custom-title`. Runs synchronously to completion before any
+      // async watcher callback fires, so there is no race with the live tail and
+      // the change-gate dedups across both. Non-fatal — wrapped so a scan failure
+      // never trips the subscribe `.catch` → fatalExit (mirrors plan-worker's
+      // boot scan placement). The existsSync root guard above already gated us.
+      try {
+        scanJobsForTitles(db, stream);
+      } catch (err) {
+        console.error(
+          `[transcript-worker] startup title fold failed: ${stringifyErr(err)}`,
+        );
+      }
     })
     .catch((err) => {
       console.error(

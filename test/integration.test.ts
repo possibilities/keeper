@@ -588,6 +588,111 @@ test("end-to-end: transcript worker → custom-title write flips jobs.title to '
   expect(exitCode).toBe(0);
 }, 15000);
 
+test("end-to-end: rename-while-down → folded at boot via the startup transcript scan", async () => {
+  const sessionId = "sess-rename-while-down";
+  const transcriptPath = join(watchRoot, `${sessionId}.jsonl`);
+
+  // --- Daemon run #1: establish the job row with its transcript_path ---------
+  // The startup scan is scoped via `jobs.transcript_path`, so the row (with its
+  // path) must already exist. SessionStart captures transcript_path from the
+  // payload. Start the file EMPTY so run #1's live tail anchors at EOF and folds
+  // no title — exactly the state at a normal session start.
+  writeFileSync(transcriptPath, "");
+  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_SOCK: sockPath,
+      KEEPER_CONFIG: configPath,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  await Bun.sleep(400);
+
+  await fireHook({
+    hook_event_name: "SessionStart",
+    session_id: sessionId,
+    cwd: "/tmp/work",
+    permission_mode: "default",
+    transcript_path: transcriptPath,
+  });
+
+  const { db: reader } = openDb(dbPath, { readonly: true });
+  try {
+    const projected = await retryUntil(() => {
+      const row = reader
+        .query("SELECT transcript_path FROM jobs WHERE job_id = ?")
+        .get(sessionId) as { transcript_path: string | null } | null;
+      return row && row.transcript_path === transcriptPath ? row : null;
+    });
+    if (!projected) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `job/transcript_path never projected.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+
+    // --- Stop the daemon, THEN rename (the "while down" window) --------------
+    daemon.kill("SIGTERM");
+    const code1 = await daemon.exited;
+    expect(code1).toBe(0);
+    daemon = null;
+
+    // The custom-title written while the daemon is down — the live tail will
+    // never see this append (the daemon isn't watching). Only the boot scan of
+    // run #2 can fold it.
+    appendFileSync(
+      transcriptPath,
+      `${JSON.stringify({
+        type: "custom-title",
+        customTitle: "Renamed While Down",
+        sessionId,
+      })}\n`,
+    );
+
+    // --- Daemon run #2: the boot scan folds the current title ---------------
+    daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        KEEPER_DB: dbPath,
+        KEEPER_SOCK: sockPath,
+        KEEPER_CONFIG: configPath,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const titled = await retryUntil(() => {
+      const row = reader
+        .query("SELECT title, title_source FROM jobs WHERE job_id = ?")
+        .get(sessionId) as {
+        title: string | null;
+        title_source: string | null;
+      } | null;
+      return row && row.title_source === "transcript" ? row : null;
+    }, 5000);
+    if (!titled) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `rename-while-down title never folded at boot.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+    expect(titled.title).toBe("Renamed While Down");
+    expect(titled.title_source).toBe("transcript");
+  } finally {
+    reader.close();
+  }
+
+  daemon.kill("SIGTERM");
+  const code2 = await daemon.exited;
+  expect(code2).toBe(0);
+}, 20000);
+
 test("end-to-end: plan worker → .planctl write → synthetic event → fold → epics/tasks projection + UDS subscribe", async () => {
   const epicId = "fn-9-keeper-e2e-plans";
   const taskId = `${epicId}.1`;

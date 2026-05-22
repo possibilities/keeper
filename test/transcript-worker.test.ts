@@ -27,7 +27,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
-import { TranscriptLineStream } from "../src/transcript-worker";
+import {
+  scanJobsForTitles,
+  seedFromDb,
+  TranscriptLineStream,
+} from "../src/transcript-worker";
 
 let tmpDir: string;
 
@@ -168,6 +172,166 @@ test("seedLastEmitted suppresses a re-emit of an already-folded title", () => {
   appendFileSync(path, `${titleLine("sess-seed", "New")}\n`);
   stream.onChange(path);
   expect(emitted).toEqual(["New"]);
+});
+
+test("scanFile: a pre-existing current title emits once; a re-scan after seeding suppresses it", () => {
+  const path = join(tmpDir, "sess-scan.jsonl");
+  // A title written BEFORE any watch/register — the rename-while-down case the
+  // live tail (EOF-anchored) would miss. Only scanFile picks it up.
+  writeFileSync(path, `${titleLine("sess-scan", "Set While Down")}\n`);
+
+  const emitted: Array<{ sessionId: string; title: string }> = [];
+  const stream = new TranscriptLineStream(
+    (sessionId, title) => emitted.push({ sessionId, title }),
+    () => {},
+  );
+
+  // First boot scan: the file's current title folds once.
+  stream.scanFile(path);
+  expect(emitted).toEqual([
+    { sessionId: "sess-scan", title: "Set While Down" },
+  ]);
+
+  // A SECOND scan of the same unchanged file (e.g. another restart) after the
+  // change-gate is seeded with that title → suppressed (no duplicate).
+  const emitted2: Array<{ sessionId: string; title: string }> = [];
+  const stream2 = new TranscriptLineStream(
+    (sessionId, title) => emitted2.push({ sessionId, title }),
+    () => {},
+  );
+  stream2.seedLastEmitted("sess-scan", "Set While Down");
+  stream2.scanFile(path);
+  expect(emitted2).toEqual([]);
+});
+
+test("scanFile: only the CURRENT (last) title per session emits, no churn from intermediate renames", () => {
+  const path = join(tmpDir, "sess-multi.jsonl");
+  // Three historical renames in one file — the scan must emit only the last.
+  writeFileSync(
+    path,
+    `${titleLine("sess-multi", "First")}\n${titleLine("sess-multi", "Second")}\n${titleLine("sess-multi", "Third")}\n`,
+  );
+
+  const emitted: string[] = [];
+  const stream = new TranscriptLineStream(
+    (_s, title) => emitted.push(title),
+    () => {},
+  );
+  stream.scanFile(path);
+  expect(emitted).toEqual(["Third"]);
+});
+
+test("scanFile: a missing/empty file is a non-fatal no-op", () => {
+  const emitted: string[] = [];
+  const logs: string[] = [];
+  const stream = new TranscriptLineStream(
+    (_s, title) => emitted.push(title),
+    (m) => logs.push(m),
+  );
+
+  // Missing file → stat fails → skip-and-log, never throws.
+  stream.scanFile(join(tmpDir, "does-not-exist.jsonl"));
+  expect(emitted).toEqual([]);
+  expect(logs.some((l) => l.includes("boot scan stat failed"))).toBe(true);
+
+  // Empty file (size 0) → no emit, no log noise.
+  const emptyPath = join(tmpDir, "empty.jsonl");
+  writeFileSync(emptyPath, "");
+  stream.scanFile(emptyPath);
+  expect(emitted).toEqual([]);
+});
+
+test("scanFile then live onChange: the live tail does not re-emit the scanned title", () => {
+  const path = join(tmpDir, "sess-both.jsonl");
+  writeFileSync(path, `${titleLine("sess-both", "Current")}\n`);
+
+  const emitted: string[] = [];
+  const stream = new TranscriptLineStream(
+    (_s, title) => emitted.push(title),
+    () => {},
+  );
+
+  // Boot scan emits the current title once and advances the shared change-gate.
+  stream.scanFile(path);
+  expect(emitted).toEqual(["Current"]);
+
+  // The live watcher then sees the path for the first time: onChange anchors at
+  // EOF (scanFile didn't touch pathState), so the already-scanned line is not
+  // re-read. A genuinely new appended title still emits.
+  stream.onChange(path);
+  expect(emitted).toEqual(["Current"]);
+  appendFileSync(path, `${titleLine("sess-both", "Newer")}\n`);
+  stream.onChange(path);
+  expect(emitted).toEqual(["Current", "Newer"]);
+});
+
+test("scanJobsForTitles: scopes to jobs.transcript_path and folds the current title at boot", () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  try {
+    // A live job whose transcript file carries a title set while the daemon was
+    // down (title_source still the lower-priority 'payload', not 'transcript').
+    const transcriptPath = join(tmpDir, "boot-sess.jsonl");
+    writeFileSync(
+      transcriptPath,
+      `${titleLine("boot-sess", "Renamed While Down")}\n`,
+    );
+    db.query(
+      "INSERT INTO jobs (job_id, created_at, updated_at, title, title_source, transcript_path) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run("boot-sess", 1, 1, "old payload title", "payload", transcriptPath);
+    // A pre-v5 job with NULL transcript_path — must be skipped (can't be scanned).
+    db.query(
+      "INSERT INTO jobs (job_id, created_at, updated_at, transcript_path) VALUES (?, ?, ?, NULL)",
+    ).run("no-path-sess", 1, 1);
+
+    const emitted: Array<{ sessionId: string; title: string }> = [];
+    const stream = new TranscriptLineStream(
+      (sessionId, title) => emitted.push({ sessionId, title }),
+      () => {},
+    );
+    // Boot order: seedFromDb (no transcript-source rows here, so seeds nothing)
+    // then scanJobsForTitles.
+    seedFromDb(db, stream);
+    scanJobsForTitles(db, stream);
+
+    expect(emitted).toEqual([
+      { sessionId: "boot-sess", title: "Renamed While Down" },
+    ]);
+  } finally {
+    db.close();
+  }
+});
+
+test("scanJobsForTitles: an already-folded transcript title is NOT re-emitted on restart", () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  try {
+    // The session's title already WON at title_source='transcript' (folded by a
+    // prior daemon). The transcript file still holds that same title.
+    const transcriptPath = join(tmpDir, "folded-sess.jsonl");
+    writeFileSync(
+      transcriptPath,
+      `${titleLine("folded-sess", "Already Folded")}\n`,
+    );
+    db.query(
+      "INSERT INTO jobs (job_id, created_at, updated_at, title, title_source, transcript_path) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run("folded-sess", 1, 1, "Already Folded", "transcript", transcriptPath);
+
+    const emitted: string[] = [];
+    const stream = new TranscriptLineStream(
+      (_s, title) => emitted.push(title),
+      () => {},
+    );
+    // seedFromDb seeds the change-gate with the persisted transcript title, so
+    // the subsequent scan of the unchanged file is suppressed — no duplicate
+    // TranscriptTitle event on restart.
+    seedFromDb(db, stream);
+    scanJobsForTitles(db, stream);
+
+    expect(emitted).toEqual([]);
+  } finally {
+    db.close();
+  }
 });
 
 test("multi-byte title split across the read boundary does not corrupt (no U+FFFD)", () => {

@@ -89,10 +89,26 @@ agents working in the repo.
     split across a read boundary never corrupts), and on each `custom-title`
     line posts `{ kind: "transcript-title", sessionId, title }` to main. The
     worker is READ-ONLY and never writes the DB — main turns the message into a
-    synthetic `TranscriptTitle` event (see State machine). The pure
-    `TranscriptLineStream` core + `seedFromDb` are exported and drivable with no
-    Worker or watcher; the watcher subscription is the owned external resource it
-    `unsubscribe()`s in its shutdown handler. `isMainThread`-guarded.
+    synthetic `TranscriptTitle` event (see State machine). On boot, AFTER
+    `seedFromDb` seeds the change-gate AND after the watcher subscription resolves,
+    it runs a one-shot **startup current-title fold** (`scanJobsForTitles` →
+    `TranscriptLineStream.scanFile`): for each live job with a non-null
+    `jobs.transcript_path` (schema v5, scoped via the projection — NOT a recursive
+    watch-root enumeration), it scans that session's transcript from offset 0 to a
+    once-snapshotted size, reusing the bounded-chunk / `StringDecoder` /
+    partial-line / malformed-skip read path, and emits ONLY the current (last)
+    `custom-title` per file. This makes a `custom-title` set while the daemon was
+    down survive a restart (the live tail anchors each file at EOF on first sight
+    and would otherwise miss it). The seeded `lastEmitted` change-gate suppresses
+    an already-folded title (no duplicate event on restart); `scanFile` uses a
+    transient decoder/buffer (it does NOT touch `pathState`), so the live tail's
+    EOF-anchoring is unaffected and the scan runs to completion before any async
+    watcher callback fires (no race). Per-file errors skip-and-log; the scan is
+    non-fatal (never trips the subscribe `.catch` → `fatalExit`). The pure
+    `TranscriptLineStream` core + `seedFromDb` + `scanJobsForTitles` are exported
+    and drivable with no Worker or watcher; the watcher subscription is the owned
+    external resource it `unsubscribe()`s in its shutdown handler.
+    `isMainThread`-guarded.
   - `src/plan-worker.ts` — Worker thread; the SECOND producer (after transcript)
     and keeperd's fourth worker. Watches each configured project root (from
     `resolvePlanRoots()`) for `.planctl/{epics,tasks}/*.json` via ONE recursive
@@ -172,7 +188,7 @@ agents working in the repo.
 | `src/db.ts` | `openDb()` / `resolveDbPath()` / `resolvePlanRoots()` / `resolveClaudeProjectsRoot()` | schema + PRAGMAs + stmts + plan-root + transcript-root config |
 | `src/wake-worker.ts` | Worker default body | `data_version` poll → wake |
 | `src/server-worker.ts` | Worker default body | UDS subscribe server: query → result (+ `total`) + live patches + `meta` staleness signal, routed by collection |
-| `src/transcript-worker.ts` | Worker default body / `TranscriptLineStream` | watch external transcript tree → tail `custom-title` → post `transcript-title` (priority-3 producer) |
+| `src/transcript-worker.ts` | Worker default body / `TranscriptLineStream` / `scanJobsForTitles` | watch external transcript tree → tail `custom-title` (+ boot scan via `jobs.transcript_path`) → post `transcript-title` (priority-3 producer) |
 | `src/plan-worker.ts` | Worker default body / `PlanScanner` | watch external `.planctl/{epics,tasks}` trees → safe-parse → post `plan-epic`/`plan-task` snapshots (second producer) |
 | `src/collections.ts` | `getCollection()` / `selectByIds()` / `countAndToken()` | collection registry (`jobs`/`epics`/`tasks`) + descriptor-parameterized by-id read + count/membership-token query |
 | `src/protocol.ts` | `encodeFrame()` / `LineBuffer` / frame types | NDJSON wire protocol (collection-namespaced `query`/`result`/`patch`/`meta` frames) |
@@ -216,6 +232,11 @@ The reducer (`projectJobsRow` in `src/reducer.ts`) keys everything by
   Folds through the SAME precedence write as `UserPromptSubmit`, so it beats
   `payload`(2)/`spawn`(1) and a later/stale `payload` never clobbers it. It
   triggers no lifecycle write (the `default` branch ignores it for `state`).
+  A `TranscriptTitle` can now also emit at BOOT (not just from a live tail): the
+  transcript worker's startup current-title fold (`scanJobsForTitles`, scoped via
+  `jobs.transcript_path`) folds a `custom-title` set while the daemon was down,
+  running after `seedFromDb` so an already-folded title is suppressed by the
+  change-gate (no duplicate event on restart — re-fold determinism preserved).
 - `Stop` → `state = 'stopped'` (skipped when already `ended` — keeps the terminal
   guard so a stray late `Stop` can't resurrect a still-ended job; after a real
   re-open the row is no longer `ended` and a normal post-resume `Stop` applies).
@@ -406,4 +427,10 @@ Three archetypes:
   source-of-truth-stays-on-main discipline keeps the event log re-fold
   deterministic. `plan-worker` clones this contract verbatim: pure exported core
   (`PlanScanner` + `seedFromDb`), `isMainThread` guard, read-only restart-seed
-  connection, change-gated emission, and per-root `unsubscribe()` teardown.
+  connection, change-gated emission, and per-root `unsubscribe()` teardown. Both
+  producers also run a **one-shot boot scan** after their subscribe resolves to
+  pick up files that pre-existed (or changed during) the daemon's downtime, gated
+  by the same change-gate so an unchanged file is not re-emitted: `plan-worker`'s
+  `scanRoot` enumerates `.planctl/{epics,tasks}/*.json`, while `transcript-worker`'s
+  `scanJobsForTitles` scopes to live `jobs.transcript_path` (the per-session file,
+  NOT a watch-root walk) and folds each session's current `custom-title`.
