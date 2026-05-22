@@ -163,6 +163,130 @@ function extractTranscriptPath(event: Event): string | null {
 }
 
 /**
+ * Shape of a folded plan snapshot, extracted from a synthetic
+ * `EpicSnapshot` / `TaskSnapshot` event's `data` blob. The producer (the plan
+ * worker → main) pre-computes every field — number parsing, status derivation,
+ * the `project_dir` / `target_repo` mapping — so the reducer folds whatever the
+ * blob carries verbatim (a pure function of the persisted event). Unknown /
+ * absent fields surface as `null` so the upsert writes the zero-event reading.
+ *
+ * The fields are a union of the epic + task projection columns minus the pk
+ * (which rides in `event.session_id`, the generic entity-key overload); a given
+ * event only populates the subset its kind cares about.
+ */
+interface PlanSnapshot {
+  epic_number?: number | null;
+  task_number?: number | null;
+  title?: string | null;
+  project_dir?: string | null;
+  target_repo?: string | null;
+  epic_id?: string | null;
+  status?: string | null;
+}
+
+/**
+ * Extract the full plan snapshot from a synthetic `EpicSnapshot` /
+ * `TaskSnapshot` event's `data` blob. Guarded-parse mirroring
+ * {@link extractSessionTitle} / {@link extractTranscriptPath}: try/catch around
+ * `JSON.parse(event.data)`, skip-and-log on a malformed blob, never throw — the
+ * cursor still advances upstream, so one bad snapshot row never wedges the
+ * reducer. Returns `null` on a missing/malformed blob (the caller then makes the
+ * fold a no-op for that event).
+ *
+ * Every field is taken verbatim from the blob — the producer pre-computes
+ * number parsing + status derivation, so the reducer stays a pure function of
+ * the persisted event and a from-scratch re-fold is byte-identical.
+ */
+function extractPlanSnapshot(event: Event): PlanSnapshot | null {
+  if (event.data && event.data.length > 0) {
+    try {
+      return JSON.parse(event.data) as PlanSnapshot;
+    } catch (err) {
+      // Malformed JSON: skip-and-log. The cursor still advances upstream so the
+      // reducer never wedges on one bad row.
+      console.error(
+        `keeper reducer: failed to parse plan snapshot blob for event id=${event.id} entity=${event.session_id}: ${err}`,
+      );
+    }
+  }
+  return null;
+}
+
+/**
+ * Apply the plan-side projection for one synthetic `EpicSnapshot` /
+ * `TaskSnapshot` event. Runs INSIDE the open transaction opened by
+ * {@link applyEvent}; performs zero cursor work.
+ *
+ * The entity id rides in `event.session_id` (the generic entity-key overload —
+ * always non-NULL, guaranteed by the producer), the full snapshot rides in the
+ * `data` JSON blob. Each kind upserts its projection table with
+ * `INSERT … ON CONFLICT(<pk>) DO UPDATE` so a re-arrived snapshot is idempotent
+ * last-write-wins. `last_event_id = event.id` on every fold — the monotonic
+ * per-row `version` column the read-surface diff fires on (jobs uses the same);
+ * `updated_at = event.ts`.
+ *
+ * Plans are state-on-disk full snapshots, so unlike jobs there is no
+ * accumulating lifecycle — every column is overwritten from the blob each fold.
+ * A missing/malformed blob is a no-op (extract returned null); the cursor still
+ * advances upstream.
+ */
+function projectPlanRow(db: Database, event: Event): void {
+  const snapshot = extractPlanSnapshot(event);
+  if (snapshot == null) {
+    return;
+  }
+  const ts = event.ts;
+  const entityId = event.session_id;
+
+  if (event.hook_event === "EpicSnapshot") {
+    db.run(
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(epic_id) DO UPDATE SET
+         epic_number = excluded.epic_number,
+         title = excluded.title,
+         project_dir = excluded.project_dir,
+         status = excluded.status,
+         last_event_id = excluded.last_event_id,
+         updated_at = excluded.updated_at`,
+      [
+        entityId,
+        snapshot.epic_number ?? null,
+        snapshot.title ?? null,
+        snapshot.project_dir ?? null,
+        snapshot.status ?? null,
+        event.id,
+        ts,
+      ],
+    );
+  } else {
+    // TaskSnapshot.
+    db.run(
+      `INSERT INTO tasks (task_id, epic_id, task_number, title, target_repo, status, last_event_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(task_id) DO UPDATE SET
+         epic_id = excluded.epic_id,
+         task_number = excluded.task_number,
+         title = excluded.title,
+         target_repo = excluded.target_repo,
+         status = excluded.status,
+         last_event_id = excluded.last_event_id,
+         updated_at = excluded.updated_at`,
+      [
+        entityId,
+        snapshot.epic_id ?? null,
+        snapshot.task_number ?? null,
+        snapshot.title ?? null,
+        snapshot.target_repo ?? null,
+        snapshot.status ?? null,
+        event.id,
+        ts,
+      ],
+    );
+  }
+}
+
+/**
  * Apply the jobs-side projection for one event. Runs INSIDE the open
  * transaction opened by {@link applyEvent}; performs zero cursor work.
  *
@@ -314,7 +438,17 @@ export function applyEvent(
   options: ApplyEventOptions = {},
 ): void {
   const fold = db.transaction(() => {
-    projectJobsRow(db, event);
+    // Route synthetic plan snapshots to the plans projection; every other event
+    // (the hook lifecycle + title events) folds into jobs. Both share this one
+    // BEGIN IMMEDIATE transaction + cursor advance — there is no second reducer.
+    if (
+      event.hook_event === "EpicSnapshot" ||
+      event.hook_event === "TaskSnapshot"
+    ) {
+      projectPlanRow(db, event);
+    } else {
+      projectJobsRow(db, event);
+    }
     options.onBeforeCursorAdvance?.(event);
     db.run(
       "UPDATE reducer_state SET last_event_id = ?, updated_at = ? WHERE id = 1",
