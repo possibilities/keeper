@@ -123,9 +123,12 @@ change, each frame a YAML document (--- separated). The render is
 collection-appropriate:
   jobs  → a flat sequence of: {basename(cwd)} · {title} · {state}
   epics → a sequence of epic:/tasks: mapping blocks, where each epic line is
-          {basename(project_dir)} #{epic_number} {title} [{status}]
+          {basename(project_dir)} #{epic_number} {title} (deps #A, #B) [{status}]
           and its embedded tasks list under tasks: as
-          {task_number}) {title} [{status}]
+          {task_number}) {title} (dep #N) [{status}]
+          The (deps …) segment lists the epic numbers an epic depends on; the
+          (dep #N) segment names only the highest task a task depends on. Both
+          are omitted when there are no dependencies.
 The page is refetched on every change signal and on a steady poll, so it always
 shows the current top-N; a new frame prints only when the rendered output
 changes. Every emitted frame is also mirrored to two /tmp sidecar files (full
@@ -185,6 +188,24 @@ function yamlScalar(v: unknown): string {
     return s;
   }
   return `'${s.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Parse the leading `fn-N-…` epic number from a planctl epic id (mirrors the
+ * daemon's `epicNumberFromId`), or null for a non-matching id.
+ */
+function epicNumFromId(id: string): number | null {
+  const m = /^[a-z]+-(\d+)-/.exec(id);
+  return m ? Number.parseInt(m[1], 10) : null;
+}
+
+/**
+ * Parse the trailing `.M` task number from a planctl task id (`fn-N-slug.M` →
+ * M; mirrors the daemon's `taskNumberFromId`), or null for a non-matching id.
+ */
+function taskNumFromId(id: string): number | null {
+  const m = /\.(\d+)$/.exec(id);
+  return m ? Number.parseInt(m[1], 10) : null;
 }
 
 function die(message: string): never {
@@ -261,19 +282,32 @@ async function main(): Promise<void> {
   /**
    * Collapse one full row to its display string, collection-aware:
    *   jobs  → `{basename(cwd)} · {title} · {state}`
-   *   epics → `{basename(project_dir)} #{epic_number} {title} [{status}]`
-   * A null/absent segment projects to empty (no basename of nothing). The epic
-   * line drops the task count — the embedded tasks render as their own nested
-   * sequence (see `projectTask` / `renderBody`). Together with `projectTask`,
-   * this defines which column moves can reframe the page (see
-   * `emitFrameIfChanged`).
+   *   epics → `{basename(project_dir)} #{epic_number} {title}{deps} [{status}]`
+   * A null/absent segment projects to empty (no basename of nothing). `{deps}`
+   * is a ` (deps #3, #5)` segment from `depends_on_epics` (the epic numbers it
+   * depends on), omitted when there are none. The epic line drops the task
+   * count — the embedded tasks render as their own nested sequence (see
+   * `projectTask` / `renderBody`). Together with `projectTask`, this defines
+   * which column moves can reframe the page (see `emitFrameIfChanged`).
    */
   function projectRow(row: Record<string, unknown>): string {
     const title = seg(row.title);
     if (collection === "epics") {
       const dir =
         row.project_dir == null ? "" : basename(String(row.project_dir));
-      return `${dir} #${seg(row.epic_number)} ${title} [${seg(row.status)}]`;
+      const deps = Array.isArray(row.depends_on_epics)
+        ? row.depends_on_epics
+        : [];
+      const depsSeg =
+        deps.length === 0
+          ? ""
+          : ` (deps ${deps
+              .map((d) => {
+                const n = epicNumFromId(String(d));
+                return n == null ? String(d) : `#${n}`;
+              })
+              .join(", ")})`;
+      return `${dir} #${seg(row.epic_number)} ${title}${depsSeg} [${seg(row.status)}]`;
     }
     const cwd = row.cwd == null ? "" : basename(String(row.cwd));
     return `${cwd} · ${title} · ${seg(row.state)}`;
@@ -281,14 +315,21 @@ async function main(): Promise<void> {
 
   /**
    * Collapse one embedded epic task to its display string:
-   * `{task_number}) {title} [{status}]`. A null/absent segment projects to
-   * empty. The task's `target_repo` is omitted — it's redundant with the parent
-   * epic's `project_dir` already shown on the epic line. Read alongside
-   * `projectRow` so a task title/status/membership move surfaces in the frame
-   * and reframes.
+   * `{task_number}) {title}{dep} [{status}]`. A null/absent segment projects to
+   * empty. `{dep}` is a ` (dep #N)` segment naming the HIGHEST task it depends
+   * on (max `depends_on` task number) — only the highest is shown even when it
+   * depends on several — omitted when there are none. The task's `target_repo`
+   * is omitted — it's redundant with the parent epic's `project_dir` already
+   * shown on the epic line. Read alongside `projectRow` so a task
+   * title/status/dep/membership move surfaces in the frame and reframes.
    */
   function projectTask(task: Record<string, unknown>): string {
-    return `${seg(task.task_number)}) ${seg(task.title)} [${seg(task.status)}]`;
+    const deps = Array.isArray(task.depends_on) ? task.depends_on : [];
+    const nums = deps
+      .map((d) => taskNumFromId(String(d)))
+      .filter((n): n is number => n != null);
+    const depSeg = nums.length === 0 ? "" : ` (dep #${Math.max(...nums)})`;
+    return `${seg(task.task_number)}) ${seg(task.title)}${depSeg} [${seg(task.status)}]`;
   }
 
   /**

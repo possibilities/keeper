@@ -109,6 +109,12 @@ export interface Epic {
   status: string | null;
   last_event_id: number | null;
   updated_at: number;
+  /**
+   * Epic-level dependencies: the planctl `depends_on_epics` ids (other epics
+   * this one depends on). Stored as a JSON-TEXT array column and decoded to a
+   * real array at the read boundary (`decodeRow`).
+   */
+  depends_on_epics: string[];
   tasks: Task[];
 }
 
@@ -128,4 +134,10 @@ export interface Task {
   title: string | null;
   target_repo: string | null;
   status: string | null;
+  /**
+   * Task-level dependencies: the planctl `depends_on` task ids (other tasks this
+   * one depends on). Lives inside the parent epic's embedded `tasks` JSON array
+   * (no schema column of its own).
+   */
+  depends_on: string[];
 }

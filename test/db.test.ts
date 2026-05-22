@@ -169,7 +169,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("7");
+  expect(row.value).toBe("8");
   db.close();
 });
 
@@ -274,7 +274,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("7");
+  expect(ver.value).toBe("8");
 
   const eventNames = (
     db.prepare("PRAGMA table_info(events)").all() as {
@@ -315,7 +315,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("7");
+  expect(ver2.value).toBe("8");
   db2.close();
 });
 
@@ -368,7 +368,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("7");
+  expect(ver.value).toBe("8");
 
   const jobNames = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
@@ -399,7 +399,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("7");
+  expect(ver2.value).toBe("8");
   db2.close();
 });
 
@@ -434,7 +434,7 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("7");
+  expect(ver.value).toBe("8");
   const names = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
@@ -486,7 +486,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("7");
+  expect(ver.value).toBe("8");
 
   const tables = new Set(
     (
@@ -519,6 +519,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
     "last_event_id",
     "updated_at",
     "tasks",
+    "depends_on_epics",
   ]);
 
   // Prior jobs data survives untouched.
@@ -541,7 +542,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("7");
+  expect(ver2.value).toBe("8");
   db2.close();
 });
 
@@ -600,7 +601,7 @@ test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, tas
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("7");
+  expect(ver.value).toBe("8");
 
   // tasks table is gone.
   const tables = new Set(

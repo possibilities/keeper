@@ -773,6 +773,7 @@ function getEpic(epicId: string) {
     last_event_id: number | null;
     updated_at: number;
     tasks: string;
+    depends_on_epics: string;
   } | null;
 }
 
@@ -784,6 +785,7 @@ interface EmbeddedTask {
   title: string | null;
   target_repo: string | null;
   status: string | null;
+  depends_on: string[];
 }
 
 /** Decode an epic's embedded tasks array (schema v7). NULL/missing → []. */
@@ -834,6 +836,8 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     updated_at: epic?.updated_at ?? 0,
     // A first-sight EpicSnapshot defaults the embedded array to empty.
     tasks: "[]",
+    // No depends_on_epics in the blob → the stored column defaults to "[]".
+    depends_on_epics: "[]",
   });
   expect(epic?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);
@@ -862,6 +866,8 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
     status: "done",
+    // No depends_on in the blob → the embedded element defaults to [].
+    depends_on: [],
   });
   // The fold bumps the parent epic's last_event_id (so it patches).
   expect(getEpic("fn-1-add-oauth")?.last_event_id).toBe(id);

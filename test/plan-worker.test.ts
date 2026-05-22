@@ -113,8 +113,40 @@ test("buildEpicMessage maps primary_repo → projectDir, parses number", () => {
     title: "T",
     projectDir: "/Users/mike/code/keeper",
     status: "open",
+    dependsOnEpics: [],
   });
   expect(buildEpicMessage({})).toBeNull();
+});
+
+test("buildEpicMessage extracts depends_on_epics; non-array/garbage → []", () => {
+  expect(
+    buildEpicMessage({
+      id: "fn-9-x",
+      depends_on_epics: ["fn-3-a", "fn-5-b"],
+    })?.dependsOnEpics,
+  ).toEqual(["fn-3-a", "fn-5-b"]);
+  // Non-string elements are dropped; a non-array value yields [].
+  expect(
+    buildEpicMessage({ id: "fn-9-x", depends_on_epics: ["ok", 7, ""] })
+      ?.dependsOnEpics,
+  ).toEqual(["ok"]);
+  expect(
+    buildEpicMessage({ id: "fn-9-x", depends_on_epics: "fn-3-a" })
+      ?.dependsOnEpics,
+  ).toEqual([]);
+});
+
+test("buildTaskMessage extracts depends_on; non-array → []", () => {
+  expect(
+    buildTaskMessage({
+      id: "fn-9-x.3",
+      epic: "fn-9-x",
+      depends_on: ["fn-9-x.1", "fn-9-x.2"],
+    })?.dependsOn,
+  ).toEqual(["fn-9-x.1", "fn-9-x.2"]);
+  expect(
+    buildTaskMessage({ id: "fn-9-x.3", depends_on: null })?.dependsOn,
+  ).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------
@@ -143,6 +175,7 @@ test("onChange emits an epic snapshot then change-gates an identical re-scan", (
       title: "Demo",
       projectDir: "/repo",
       status: "open",
+      dependsOnEpics: [],
     },
   ]);
 
@@ -187,6 +220,7 @@ test("onChange emits a task snapshot with derived status + epicId", () => {
       title: "Subtask",
       targetRepo: "/repo",
       status: "open",
+      dependsOn: [],
     },
   ]);
 });

@@ -305,6 +305,7 @@ function runDaemon(): void {
         title: msg.title,
         project_dir: msg.projectDir,
         status: msg.status,
+        depends_on_epics: msg.dependsOnEpics,
       });
     } else if (msg.kind === "plan-task") {
       hookEvent = "TaskSnapshot";
@@ -314,6 +315,7 @@ function runDaemon(): void {
         title: msg.title,
         target_repo: msg.targetRepo,
         status: msg.status,
+        depends_on: msg.dependsOn,
       });
     } else if (msg.kind === "plan-epic-deleted") {
       // Tombstone: the reducer deletes the `epics` row (embedded tasks vanish

@@ -99,6 +99,8 @@ export interface PlanEpicMessage {
   /** The epic's `primary_repo` — stored opaque, never used to drive FS reads. */
   projectDir: string | null;
   status: string | null;
+  /** Epic-level deps: the planctl `depends_on_epics` ids (string array). */
+  dependsOnEpics: string[];
 }
 
 /** Snapshot message for one `.planctl/tasks/*.json` file. */
@@ -115,6 +117,8 @@ export interface PlanTaskMessage {
   targetRepo: string | null;
   /** Derived: `worker_done_at` present → "done", else "open". */
   status: string;
+  /** Task-level deps: the planctl `depends_on` task ids (string array). */
+  dependsOn: string[];
 }
 
 /**
@@ -273,6 +277,7 @@ interface RawEpic {
   title?: unknown;
   status?: unknown;
   primary_repo?: unknown;
+  depends_on_epics?: unknown;
 }
 
 /** Raw planctl task JSON shape — only the fields we project. */
@@ -282,11 +287,42 @@ interface RawTask {
   title?: unknown;
   target_repo?: unknown;
   worker_done_at?: unknown;
+  depends_on?: unknown;
 }
 
 /** Coerce a value to a non-empty string, else null. */
 function asString(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+/**
+ * Coerce a value to an array of non-empty strings, dropping non-string / empty
+ * elements; a non-array (or absent) value yields `[]`. Used for the dependency
+ * id lists (`depends_on_epics` / `depends_on`) — an untrusted foreign-process
+ * field, so one bad element never poisons the list.
+ */
+function asStringArray(v: unknown): string[] {
+  if (!Array.isArray(v)) {
+    return [];
+  }
+  return v.filter((e): e is string => typeof e === "string" && e.length > 0);
+}
+
+/**
+ * Parse a stored JSON-TEXT array column (`epics.depends_on_epics`) back into a
+ * clean `string[]` — JSON.parse then {@link asStringArray}. A NULL/empty/
+ * malformed cell yields `[]`, mirroring the read-boundary `decodeRow` tolerance,
+ * so the reconstructed seed matches a fresh scan field-for-field.
+ */
+function parseStringArrayColumn(text: string | null): string[] {
+  if (text == null || text.length === 0) {
+    return [];
+  }
+  try {
+    return asStringArray(JSON.parse(text));
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -598,6 +634,7 @@ export function buildEpicMessage(raw: RawEpic): PlanEpicMessage | null {
     title: asString(raw.title),
     projectDir: asString(raw.primary_repo),
     status: asString(raw.status),
+    dependsOnEpics: asStringArray(raw.depends_on_epics),
   };
 }
 
@@ -620,6 +657,7 @@ export function buildTaskMessage(raw: RawTask): PlanTaskMessage | null {
     title: asString(raw.title),
     targetRepo: asString(raw.target_repo),
     status: asString(raw.worker_done_at) !== null ? "done" : "open",
+    dependsOn: asStringArray(raw.depends_on),
   };
 }
 
@@ -717,7 +755,7 @@ function scanPlanctlDir(planctlDir: string, scanner: PlanScanner): void {
 export function seedFromDb(db: Database, scanner: PlanScanner): void {
   const epics = db
     .query(
-      "SELECT epic_id, epic_number, title, project_dir, status, tasks FROM epics",
+      "SELECT epic_id, epic_number, title, project_dir, status, depends_on_epics, tasks FROM epics",
     )
     .all() as {
     epic_id: string;
@@ -725,6 +763,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
     title: string | null;
     project_dir: string | null;
     status: string | null;
+    depends_on_epics: string | null;
     tasks: string | null;
   }[];
   for (const e of epics) {
@@ -735,6 +774,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       title: e.title,
       projectDir: e.project_dir,
       status: e.status,
+      dependsOnEpics: parseStringArrayColumn(e.depends_on_epics),
     };
     scanner.seed(e.epic_id, JSON.stringify(msg));
 
@@ -750,6 +790,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       title: string | null;
       target_repo: string | null;
       status: string | null;
+      depends_on?: unknown;
     }[] = [];
     if (e.tasks != null && e.tasks.length > 0) {
       try {
@@ -774,6 +815,9 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
         // The projection stores the derived status verbatim; default to "open"
         // for a (legacy) NULL so the reconstructed seed matches a fresh scan.
         status: t.status ?? "open",
+        // Same coercion as buildTaskMessage so the seed is byte-identical; a
+        // (legacy) task element without `depends_on` reconstructs to [].
+        dependsOn: asStringArray(t.depends_on),
       };
       scanner.seed(t.task_id, JSON.stringify(msg));
     }

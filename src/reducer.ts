@@ -182,6 +182,10 @@ interface PlanSnapshot {
   target_repo?: string | null;
   epic_id?: string | null;
   status?: string | null;
+  /** Epic-level deps (EpicSnapshot blob) — the planctl `depends_on_epics` ids. */
+  depends_on_epics?: string[] | null;
+  /** Task-level deps (TaskSnapshot blob) — the planctl `depends_on` task ids. */
+  depends_on?: string[] | null;
 }
 
 /**
@@ -245,13 +249,14 @@ function projectPlanRow(db: Database, event: Event): void {
     // `tasks='[]'` (the schema default), so the first-sight epic reads an empty
     // array and a later epic snapshot can never clobber an array a shell holds.
     db.run(
-      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_event_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(epic_id) DO UPDATE SET
          epic_number = excluded.epic_number,
          title = excluded.title,
          project_dir = excluded.project_dir,
          status = excluded.status,
+         depends_on_epics = excluded.depends_on_epics,
          last_event_id = excluded.last_event_id,
          updated_at = excluded.updated_at`,
       [
@@ -260,6 +265,9 @@ function projectPlanRow(db: Database, event: Event): void {
         snapshot.title ?? null,
         snapshot.project_dir ?? null,
         snapshot.status ?? null,
+        // Stored as a JSON-TEXT array column; decoded back to an array at the
+        // read boundary. A missing list folds to the empty array (schema default).
+        JSON.stringify(snapshot.depends_on_epics ?? []),
         event.id,
         ts,
       ],
@@ -278,6 +286,8 @@ function projectPlanRow(db: Database, event: Event): void {
     }
 
     // The element shape stored in the array — field-for-field the served Task.
+    // `depends_on` is last (matches the Task interface order) so a re-folded
+    // element serializes byte-identically; a missing list folds to [].
     const element = {
       task_id: entityId,
       epic_id: epicId,
@@ -285,6 +295,7 @@ function projectPlanRow(db: Database, event: Event): void {
       title: snapshot.title ?? null,
       target_repo: snapshot.target_repo ?? null,
       status: snapshot.status ?? null,
+      depends_on: snapshot.depends_on ?? [],
     };
 
     const epicRow = db

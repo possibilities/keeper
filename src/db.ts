@@ -26,7 +26,7 @@ import { dirname, join } from "node:path";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -261,7 +261,8 @@ CREATE TABLE IF NOT EXISTS epics (
     status TEXT,
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0,
-    tasks TEXT NOT NULL DEFAULT '[]'
+    tasks TEXT NOT NULL DEFAULT '[]',
+    depends_on_epics TEXT NOT NULL DEFAULT '[]'
 )
 `;
 
@@ -494,6 +495,20 @@ function migrate(db: Database): void {
         db.run("DROP TABLE IF EXISTS tasks");
       }
     }
+
+    // v7→v8: add `epics.depends_on_epics` (epic-level dependency ids, a JSON-TEXT
+    // array). Idempotent ADD COLUMN, NO backfill — the NOT NULL DEFAULT '[]'
+    // matches the zero-event projection (an epic with no deps), and the plan
+    // reducer fills it from EpicSnapshot blobs. Task-level `depends_on` needs no
+    // schema change: it lives inside the embedded `tasks` JSON array. A migrating
+    // v7 DB gains the column reading '[]'; a plan-file re-scan then repopulates
+    // real deps. Column def matches CREATE_EPICS.
+    addColumnIfMissing(
+      db,
+      "epics",
+      "depends_on_epics",
+      "TEXT NOT NULL DEFAULT '[]'",
+    );
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -148,6 +148,7 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "last_event_id",
     "updated_at",
     "tasks",
+    "depends_on_epics",
   ],
   pk: "epic_id",
   version: "last_event_id",
@@ -171,7 +172,10 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
   // its own `epic_id`, not `status`, so detail-page reads of a done epic still
   // resolve. The view-side knob is keeper-frames' `--status` / `--status-ne`.
   defaultFilter: { status: "open" },
-  jsonColumns: new Set(["tasks"]),
+  // `tasks` and `depends_on_epics` are both JSON-TEXT array columns — decoded to
+  // real arrays at the read boundary (the embedded `Task[]` and the epic-dep id
+  // list). Both are served + decoded but OUT of `sortable`/`filters`.
+  jsonColumns: new Set(["tasks", "depends_on_epics"]),
 };
 
 /**

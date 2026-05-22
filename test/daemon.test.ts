@@ -223,6 +223,7 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     title: string;
     target_repo: string;
     status: string;
+    depends_on: string[];
   }[];
   expect(tasks.length).toBe(1);
   expect(tasks[0]).toEqual({
@@ -232,7 +233,43 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
     status: "open",
+    depends_on: [],
   });
+
+  db.close();
+});
+
+test("EpicSnapshot folds depends_on_epics; TaskSnapshot folds depends_on into the embedded element", () => {
+  const { db, stmts } = openDb(dbPath);
+
+  insertPlanSnapshot(stmts, "EpicSnapshot", "fn-7-add-oauth", 1, {
+    epic_number: 7,
+    title: "Add OAuth",
+    status: "open",
+    depends_on_epics: ["fn-3-base", "fn-5-prereq"],
+  });
+  insertPlanSnapshot(stmts, "TaskSnapshot", "fn-7-add-oauth.2", 2, {
+    epic_id: "fn-7-add-oauth",
+    task_number: 2,
+    title: "Wire the callback",
+    status: "open",
+    depends_on: ["fn-7-add-oauth.1"],
+  });
+  drainToCompletion(db);
+
+  const epic = db
+    .query(
+      "SELECT depends_on_epics, tasks FROM epics WHERE epic_id = 'fn-7-add-oauth'",
+    )
+    .get() as { depends_on_epics: string; tasks: string };
+  // Epic deps are stored as a JSON-TEXT array column.
+  expect(JSON.parse(epic.depends_on_epics)).toEqual([
+    "fn-3-base",
+    "fn-5-prereq",
+  ]);
+  // Task deps ride inside the embedded element.
+  const tasks = JSON.parse(epic.tasks) as { depends_on: string[] }[];
+  expect(tasks[0]?.depends_on).toEqual(["fn-7-add-oauth.1"]);
 
   db.close();
 });

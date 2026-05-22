@@ -53,11 +53,12 @@ function seedEpic(
     last_event_id: number;
     updated_at: number;
     tasks: string;
+    depends_on_epics: string;
   }> = {},
 ): void {
   db.query(
-    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     epic_id,
     opts.epic_number ?? null,
@@ -67,6 +68,7 @@ function seedEpic(
     opts.last_event_id ?? 0,
     opts.updated_at ?? 1,
     opts.tasks ?? "[]",
+    opts.depends_on_epics ?? "[]",
   );
 }
 
@@ -154,6 +156,24 @@ test("runQuery decodes the embedded tasks JSON-array column into a real array", 
   expect(Array.isArray(row.tasks)).toBe(true);
   const arr = row.tasks as { task_id: string }[];
   expect(arr.map((t) => t.task_id)).toEqual(["fn-1-alpha.1", "fn-1-alpha.2"]);
+  db.close();
+});
+
+test("runQuery decodes the depends_on_epics JSON-array column into a real array", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-4-alpha", {
+    epic_number: 4,
+    status: "open",
+    depends_on_epics: JSON.stringify(["fn-3-base"]),
+  });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "epics",
+      filter: { epic_id: "fn-4-alpha" },
+    }),
+  );
+  expect(res.rows[0]!.depends_on_epics).toEqual(["fn-3-base"]);
   db.close();
 });
 
