@@ -47,5 +47,5 @@ sync are settled, so docs are written once against final behavior.
 - [ ] no stale `tasks`-table / `tasks`-collection prose remains; suite green
 
 ## Done summary
-
+Removed the dropped tasks collection from keeper-frames (epics page now surfaces the embedded tasks array) and updated CLAUDE.md + README for schema v7, the single embedded epics collection, tombstone deletes, and boot reconciliation; rewrote the Inspect tasks query to json_each(epics.tasks).
 ## Evidence
