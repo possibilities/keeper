@@ -244,6 +244,40 @@ test("resolveFilter: ne operator emits `!= ?`; unknown operator object ignored",
   expect(unknown.params).toEqual([]);
 });
 
+test("jobs descriptor defaults the view scope to live jobs (state != ended)", () => {
+  expect(JOBS_DESCRIPTOR.defaultFilter).toEqual({ state: { ne: "ended" } });
+});
+
+test("runQuery applies the default live scope, hiding ended jobs, unless overridden", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "w", { state: "working", created_at: 3 });
+  seedJob(db, "s", { state: "stopped", created_at: 2 });
+  seedJob(db, "e", { state: "ended", created_at: 1 });
+  // No filter → the default state != ended scope hides the ended job.
+  const live = asResult(runQuery(db, 0, { type: "query", collection: "jobs" }));
+  expect(live.total).toBe(2);
+  expect(live.rows.map(jobId)).toEqual(["w", "s"]);
+  // An explicit state filter overrides the default → only the ended job.
+  const ended = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      filter: { state: "ended" },
+    }),
+  );
+  expect(ended.rows.map(jobId)).toEqual(["e"]);
+  // A pk lookup is exempt: it resolves the ended job by id.
+  const pk = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      filter: { job_id: "e" },
+    }),
+  );
+  expect(pk.rows.map(jobId)).toEqual(["e"]);
+  db.close();
+});
+
 test("resolveFilter: epics default scope applies open, is overridable, exempts pk lookups", () => {
   // No filter → the descriptor's default `status: open` scope is applied.
   const def = resolveFilter(EPICS_DESCRIPTOR, undefined);

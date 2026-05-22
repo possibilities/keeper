@@ -70,7 +70,8 @@ export interface CollectionDescriptor {
  * `diffTick` / `selectJobsByIds` hardcoded before namespacing: the current
  * SELECT list, the `SORTABLE_COLUMNS` allowlist, the `created_at desc` default
  * (newest-created job on top), and the `state`/`cwd` filters PLUS `job_id` (the
- * pk — for detail-page single-item subscribe).
+ * pk — for detail-page single-item subscribe). The default scope hides `ended`
+ * jobs (`defaultFilter` below).
  */
 export const JOBS_DESCRIPTOR: CollectionDescriptor = {
   name: "jobs",
@@ -98,6 +99,13 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
   ]),
   defaultSort: { column: "created_at", dir: "desc" },
   filters: { state: "state", cwd: "cwd", job_id: "job_id" },
+  // Default scope: a jobs query with no `state` filter shows only LIVE jobs —
+  // working ("running") + stopped — and hides `ended` ones. Job state is exactly
+  // working|stopped|ended (see the reducer), so `state != ended` is precisely
+  // "stopped and running". A client still pages ended jobs by asking explicitly
+  // (`filter:{state:"ended"}`), which overrides this default; a pk subscribe is
+  // exempt (a detail read of an ended job still resolves).
+  defaultFilter: { state: { ne: "ended" } },
   // `title` + `title_source` + `transcript_path` are read-only display this
   // phase — served on `result`/`patch` (the source/path for provenance +
   // debugging) but NOT in `sortable`/`filters`. No JSON-TEXT columns are served today

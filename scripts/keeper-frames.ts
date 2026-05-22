@@ -105,8 +105,11 @@ Usage: bun scripts/keeper-frames.ts [--collection <name>] [--sock <path>]
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
   --state <s>      Filter to jobs whose state equals <s> (e.g. working)
   --state-ne <s>   Filter to jobs whose state is NOT <s> (e.g. ended)
-                   (--state and --state-ne are mutually exclusive; default: no filter)
+                   (--state and --state-ne are mutually exclusive)
                    (--state/--state-ne are jobs-only; ignored for epics)
+                   (default: no state flag → the server's default scope shows
+                   only LIVE jobs (working + stopped); pass --state ended to see
+                   ended jobs)
   --status <s>     Filter to epics whose status equals <s> (e.g. done)
   --status-ne <s>  Filter to epics whose status is NOT <s>
                    (--status and --status-ne are mutually exclusive)
