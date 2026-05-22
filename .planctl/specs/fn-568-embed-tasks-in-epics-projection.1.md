@@ -82,5 +82,5 @@ breaking the build, so it is one task.
 - [ ] from-scratch re-fold reproduces byte-identical `epics` rows; full `bun test --isolate` green
 
 ## Done summary
-
+Schema v7 collapses the tasks table into an embedded epics.tasks JSON-array column: reducer RMW fold (deterministic sort, shell insert, orphan skip, malformed->[] in-txn), descriptor jsonColumn decode + epic_number asc default sort, version-guarded v6->v7 backfill+DROP, and plan-worker seed reconstruction from the array.
 ## Evidence

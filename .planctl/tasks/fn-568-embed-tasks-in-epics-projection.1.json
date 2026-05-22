@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "Embed tasks in epics projection core",
-  "updated_at": "2026-05-22T17:48:07Z"
+  "updated_at": "2026-05-22T18:08:00Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-22T18:08:00Z"
 }
