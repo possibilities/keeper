@@ -85,3 +85,40 @@ export interface ReducerState {
   last_event_id: number;
   updated_at: number;
 }
+
+/**
+ * One row of the `epics` projection. `epic_id` is the planctl epic id (pk). The
+ * reducer folds synthetic `EpicSnapshot` events (full state-on-disk snapshots
+ * posted by the plan worker, written by main) into this table via idempotent
+ * upsert. Columns are nullable matching the zero-event reading; `updated_at`
+ * defaults to 0 in-schema. `project_dir` is an untrusted foreign-process JSON
+ * field — stored opaque, never used to drive filesystem reads or interpolated
+ * into SQL.
+ */
+export interface Epic {
+  epic_id: string;
+  epic_number: number | null;
+  title: string | null;
+  project_dir: string | null;
+  status: string | null;
+  last_event_id: number | null;
+  updated_at: number;
+}
+
+/**
+ * One row of the `tasks` projection. `task_id` is the planctl task id (pk);
+ * `epic_id` links it to its parent epic. Folded from synthetic `TaskSnapshot`
+ * events the same way `epics` is. `target_repo` is an untrusted foreign-process
+ * JSON field — stored opaque, never used to drive filesystem reads or
+ * interpolated into SQL.
+ */
+export interface Task {
+  task_id: string;
+  epic_id: string | null;
+  task_number: number | null;
+  title: string | null;
+  target_repo: string | null;
+  status: string | null;
+  last_event_id: number | null;
+  updated_at: number;
+}

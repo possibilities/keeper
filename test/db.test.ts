@@ -8,14 +8,16 @@
 
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JOBS_DESCRIPTOR, selectByIds } from "../src/collections";
 import {
   MAX_IN_PARAMS,
   openDb,
+  resolveConfig,
   resolveDbPath,
+  resolvePlanRoots,
   resolveSockPath,
   selectWorldRev,
 } from "../src/db";
@@ -43,6 +45,8 @@ test("openDb creates events, jobs, reducer_state, meta tables", () => {
   const names = new Set(tables.map((t) => t.name));
   expect(names.has("events")).toBe(true);
   expect(names.has("jobs")).toBe(true);
+  expect(names.has("epics")).toBe(true);
+  expect(names.has("tasks")).toBe(true);
   expect(names.has("reducer_state")).toBe(true);
   expect(names.has("meta")).toBe(true);
   db.close();
@@ -162,7 +166,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("5");
+  expect(row.value).toBe("6");
   db.close();
 });
 
@@ -267,7 +271,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("5");
+  expect(ver.value).toBe("6");
 
   const eventNames = (
     db.prepare("PRAGMA table_info(events)").all() as {
@@ -308,7 +312,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("5");
+  expect(ver2.value).toBe("6");
   db2.close();
 });
 
@@ -361,7 +365,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("5");
+  expect(ver.value).toBe("6");
 
   const jobNames = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
@@ -392,7 +396,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("5");
+  expect(ver2.value).toBe("6");
   db2.close();
 });
 
@@ -427,7 +431,7 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("5");
+  expect(ver.value).toBe("6");
   const names = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
@@ -444,6 +448,180 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   expect(row.title).toBe("fix-osc");
   expect(row.last_event_id).toBe(5);
   db.close();
+});
+
+test("v5 DB migrates to v6: epics + tasks tables added, jobs rows preserved", () => {
+  // Build a v5-shaped DB by hand: events + jobs at the current v5 shape, no
+  // epics/tasks tables, version '5', with a populated jobs row.
+  const v5 = new Database(dbPath, { create: true });
+  v5.exec(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_source TEXT,
+      transcript_path TEXT
+    )
+  `);
+  v5.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v5.exec("INSERT INTO meta (key, value) VALUES ('schema_version', '5')");
+  v5.exec(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title, title_source) VALUES ('old', 1, 5, 1, 'fix-osc', 'payload')",
+  );
+  v5.close();
+
+  // Reopen via openDb — migrate() creates the epics/tasks tables (CREATE TABLE
+  // IF NOT EXISTS) and stamps the current version. The non-version-gated block
+  // converges a v5 DB straight to v6.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("6");
+
+  const tables = new Set(
+    (
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all() as { name: string }[]
+    ).map((t) => t.name),
+  );
+  expect(tables.has("epics")).toBe(true);
+  expect(tables.has("tasks")).toBe(true);
+
+  // New projection tables start empty.
+  const epicCount = db.prepare("SELECT count(*) AS c FROM epics").get() as {
+    c: number;
+  };
+  const taskCount = db.prepare("SELECT count(*) AS c FROM tasks").get() as {
+    c: number;
+  };
+  expect(epicCount.c).toBe(0);
+  expect(taskCount.c).toBe(0);
+
+  // The new tables carry the expected columns.
+  const epicCols = (
+    db.prepare("PRAGMA table_info(epics)").all() as { name: string }[]
+  ).map((c) => c.name);
+  expect(epicCols).toEqual([
+    "epic_id",
+    "epic_number",
+    "title",
+    "project_dir",
+    "status",
+    "last_event_id",
+    "updated_at",
+  ]);
+  const taskCols = (
+    db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[]
+  ).map((c) => c.name);
+  expect(taskCols).toEqual([
+    "task_id",
+    "epic_id",
+    "task_number",
+    "title",
+    "target_repo",
+    "status",
+    "last_event_id",
+    "updated_at",
+  ]);
+
+  // Prior jobs data survives untouched.
+  const job = db
+    .prepare(
+      "SELECT title, title_source, last_event_id FROM jobs WHERE job_id = 'old'",
+    )
+    .get() as {
+    title: string | null;
+    title_source: string | null;
+    last_event_id: number;
+  };
+  expect(job.title).toBe("fix-osc");
+  expect(job.title_source).toBe("payload");
+  expect(job.last_event_id).toBe(5);
+
+  // Second open is idempotent — CREATE TABLE IF NOT EXISTS no-ops.
+  db.close();
+  const { db: db2 } = openDb(dbPath);
+  const ver2 = db2
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver2.value).toBe("6");
+  db2.close();
+});
+
+test("resolveConfig: missing file falls back to default ~/code root", () => {
+  const original = process.env.KEEPER_CONFIG;
+  try {
+    process.env.KEEPER_CONFIG = join(tmpDir, "nope.yaml");
+    expect(resolveConfig().roots).toEqual(["~/code"]);
+  } finally {
+    if (original === undefined) delete process.env.KEEPER_CONFIG;
+    else process.env.KEEPER_CONFIG = original;
+  }
+});
+
+test("resolveConfig: KEEPER_CONFIG override parses roots via Bun.YAML", () => {
+  const original = process.env.KEEPER_CONFIG;
+  try {
+    const cfg = join(tmpDir, "config.yaml");
+    writeFileSync(cfg, "roots:\n  - ~/code\n  - /tmp/projects\n");
+    process.env.KEEPER_CONFIG = cfg;
+    expect(resolveConfig().roots).toEqual(["~/code", "/tmp/projects"]);
+  } finally {
+    if (original === undefined) delete process.env.KEEPER_CONFIG;
+    else process.env.KEEPER_CONFIG = original;
+  }
+});
+
+test("resolveConfig: malformed YAML and missing roots key fall back to default", () => {
+  const original = process.env.KEEPER_CONFIG;
+  try {
+    const cfg = join(tmpDir, "config.yaml");
+    // A document with no roots key.
+    writeFileSync(cfg, "other: value\n");
+    process.env.KEEPER_CONFIG = cfg;
+    expect(resolveConfig().roots).toEqual(["~/code"]);
+    // Malformed YAML must not throw past the resolver.
+    writeFileSync(cfg, "roots:\n  - [unbalanced\n: : :\n");
+    expect(resolveConfig().roots).toEqual(["~/code"]);
+  } finally {
+    if (original === undefined) delete process.env.KEEPER_CONFIG;
+    else process.env.KEEPER_CONFIG = original;
+  }
+});
+
+test("resolvePlanRoots: expands ~, drops non-existent, keeps the good ones", async () => {
+  const original = process.env.KEEPER_CONFIG;
+  try {
+    // tmpDir exists; a sibling path does not. HOME-relative ~ expands to a real
+    // dir (homedir always exists).
+    const goodAbs = tmpDir;
+    const missingAbs = join(tmpDir, "does-not-exist");
+    const cfg = join(tmpDir, "config.yaml");
+    // Bare `~` is a YAML null literal; quote it so it survives as the string
+    // we expand to $HOME (real configs use `~/code`, a plain string).
+    writeFileSync(cfg, `roots:\n  - "~"\n  - ${goodAbs}\n  - ${missingAbs}\n`);
+    process.env.KEEPER_CONFIG = cfg;
+
+    const roots = resolvePlanRoots();
+    // ~ expanded to $HOME (an existing dir); goodAbs kept; missing dropped.
+    const { homedir } = await import("node:os");
+    expect(roots).toContain(homedir());
+    expect(roots).toContain(goodAbs);
+    expect(roots).not.toContain(missingAbs);
+    expect(roots.every((r) => r.startsWith("/"))).toBe(true);
+    // One missing root did not silence the surviving ones.
+    expect(roots.length).toBe(2);
+  } finally {
+    if (original === undefined) delete process.env.KEEPER_CONFIG;
+    else process.env.KEEPER_CONFIG = original;
+  }
 });
 
 test("KEEPER_SOCK env var overrides default socket path", () => {

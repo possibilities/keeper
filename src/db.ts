@@ -16,7 +16,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -24,7 +24,7 @@ import { dirname, join } from "node:path";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -53,6 +53,99 @@ export function resolveSockPath(): string {
     return override;
   }
   return join(homedir(), ".local", "state", "keeper", "keeperd.sock");
+}
+
+/** Default plan roots when the config file is absent or carries no `roots`. */
+const DEFAULT_PLAN_ROOTS = ["~/code"];
+
+/**
+ * Parsed keeper daemon config. Only `roots` is consumed today — the directories
+ * keeperd scans/watches for `.planctl` plan trees. Forward-compatible: unknown
+ * keys are ignored.
+ */
+export interface KeeperConfig {
+  roots: string[];
+}
+
+/**
+ * Resolve the keeper config path. `KEEPER_CONFIG` env var wins (hermetic tests
+ * point it at a tmp file); otherwise default to `~/.config/keeper/config.yaml`.
+ * Pure — does no I/O.
+ */
+export function resolveConfigPath(): string {
+  const override = process.env.KEEPER_CONFIG;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".config", "keeper", "config.yaml");
+}
+
+/**
+ * Read + parse the keeper config YAML via the native `Bun.YAML.parse` (no new
+ * dependency). A missing file, a malformed document, or a missing/invalid
+ * `roots:` key all fall back to the default single root (`~/code`) — the config
+ * is best-effort and must never throw past this resolver. Only string entries
+ * of `roots` survive; non-string junk is dropped.
+ */
+export function resolveConfig(): KeeperConfig {
+  const path = resolveConfigPath();
+  try {
+    if (!existsSync(path)) {
+      return { roots: [...DEFAULT_PLAN_ROOTS] };
+    }
+    const raw = Bun.YAML.parse(readFileSync(path, "utf8")) as unknown;
+    if (
+      raw &&
+      typeof raw === "object" &&
+      Array.isArray((raw as { roots?: unknown }).roots)
+    ) {
+      const roots = (raw as { roots: unknown[] }).roots.filter(
+        (r): r is string => typeof r === "string" && r.length > 0,
+      );
+      if (roots.length > 0) {
+        return { roots };
+      }
+    }
+  } catch (err) {
+    console.error(
+      `[keeper] config parse failed (${path}); using default roots:`,
+      err,
+    );
+  }
+  return { roots: [...DEFAULT_PLAN_ROOTS] };
+}
+
+/**
+ * Resolve the configured plan roots to clean absolute path strings: expand a
+ * leading `~` to `$HOME`, then drop any root that is not an existing directory
+ * (skip-and-log) so one bad/typo'd root never silences the others. A root that
+ * does not exist YET (created later, like the transcript root) is simply
+ * skipped on this call — re-resolving picks it up once it appears. The worker
+ * receives only absolute, currently-existing directories.
+ */
+export function resolvePlanRoots(): string[] {
+  const home = homedir();
+  const out: string[] = [];
+  for (const entry of resolveConfig().roots) {
+    const expanded =
+      entry === "~"
+        ? home
+        : entry.startsWith("~/")
+          ? join(home, entry.slice(2))
+          : entry;
+    try {
+      if (statSync(expanded).isDirectory()) {
+        out.push(expanded);
+        continue;
+      }
+      console.error(
+        `[keeper] plan root is not a directory, skipping: ${expanded}`,
+      );
+    } catch {
+      console.error(`[keeper] plan root does not exist, skipping: ${expanded}`);
+    }
+  }
+  return out;
 }
 
 /**
@@ -113,6 +206,35 @@ CREATE TABLE IF NOT EXISTS jobs (
     transcript_path TEXT
 )
 `;
+
+const CREATE_EPICS = `
+CREATE TABLE IF NOT EXISTS epics (
+    epic_id TEXT PRIMARY KEY,
+    epic_number INTEGER,
+    title TEXT,
+    project_dir TEXT,
+    status TEXT,
+    last_event_id INTEGER,
+    updated_at REAL NOT NULL DEFAULT 0
+)
+`;
+
+const CREATE_TASKS = `
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    epic_id TEXT,
+    task_number INTEGER,
+    title TEXT,
+    target_repo TEXT,
+    status TEXT,
+    last_event_id INTEGER,
+    updated_at REAL NOT NULL DEFAULT 0
+)
+`;
+
+const CREATE_PLANS_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_tasks_epic ON tasks(epic_id)",
+];
 
 const CREATE_REDUCER_STATE = `
 CREATE TABLE IF NOT EXISTS reducer_state (
@@ -233,6 +355,11 @@ function migrate(db: Database): void {
       db.exec(sql);
     }
     db.exec(CREATE_JOBS);
+    db.exec(CREATE_EPICS);
+    db.exec(CREATE_TASKS);
+    for (const sql of CREATE_PLANS_INDEXES) {
+      db.exec(sql);
+    }
     db.exec(CREATE_REDUCER_STATE);
     db.exec(CREATE_META);
 
@@ -283,6 +410,12 @@ function migrate(db: Database): void {
     // `events` column. Nullable, no backfill — ADD COLUMN leaves prior rows NULL.
     // Column def matches CREATE_JOBS.
     addColumnIfMissing(db, "jobs", "transcript_path", "TEXT");
+
+    // v5→v6: add the `epics` + `tasks` plan projection tables (created above via
+    // CREATE TABLE IF NOT EXISTS, naturally idempotent and forward-only). No
+    // ALTER, no backfill — the tables start empty and the plan reducer fills
+    // them from synthetic EpicSnapshot/TaskSnapshot events. A v5 DB gains the
+    // two empty tables on first open with all prior `jobs`/`events` rows intact.
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
