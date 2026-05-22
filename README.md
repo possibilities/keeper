@@ -81,7 +81,14 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   `roots`) are the scoped exception: those files are written by another process,
   so the same-process-write blind spot does not apply.
 - **No caught-up barrier** and no in-process self-heal — a crash exits non-zero
-  and the LaunchAgent restarts the single, well-tested recovery path.
+  and the LaunchAgent restarts the single, well-tested recovery path. The one
+  scoped exception is a *recoverable* FSEvents dropped-events signal on the
+  external watchers (the producer workers' "...must be re-scanned" error): rather
+  than escalate, the affected worker schedules a debounced, single-flight re-scan
+  of its existing change-gated boot-scan path, recovering the missed change
+  without a restart and without re-subscribing. That is data recovery, not
+  process self-heal — no worker is respawned; every other unrecoverable error
+  still exits non-zero for the LaunchAgent to restart.
 
 These are designed to be addable later without rework, but none ship in v1.
 
@@ -232,9 +239,16 @@ changed file, and posts a `plan-epic`/`plan-task` snapshot message to main. Main
 events row and pumps a wake; the reducer folds it as an idempotent upsert into the
 `epics`/`tasks` projection (served over the same socket as new collections). It is
 the second instance of the same producer archetype as the transcript worker:
-read-only / write-free, feeding the log only via main. The four workers are fully
-independent; main supervises all four lifecycles but routes none of their traffic,
-and any worker's `error` event escalates the whole process to a clean restart.
+read-only / write-free, feeding the log only via main. Both producers also
+self-recover from a *dropped-events* FSEvents overrun: on the recoverable
+"...must be re-scanned" watcher error they schedule a debounced, single-flight
+re-scan of their existing change-gated boot-scan path (per affected root for the
+plan worker), recovering the missed change in-process without a daemon restart
+and without re-subscribing. The four workers are fully independent; main
+supervises all four lifecycles but routes none of their traffic, and any worker's
+`error` event escalates the whole process to a clean restart — with that single
+scoped exception, the recoverable drop signal, which deliberately does NOT
+escalate (a re-scan throw is swallowed, never reaching the restart path).
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).

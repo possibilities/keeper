@@ -56,6 +56,7 @@ import { join, sep } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
+import { isDropError, RescanScheduler } from "./rescan";
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only path
@@ -517,6 +518,10 @@ function main(): void {
   }
 
   const subscriptions: AsyncSubscription[] = [];
+  // One drop-recovery scheduler per root (each subscribe callback closes over
+  // its own `root`). Cleared in shutdown BEFORE unsubscribe so a queued re-scan
+  // can't touch a closing DB.
+  const schedulers: RescanScheduler[] = [];
   let shuttingDown = false;
 
   const closeDb = (): void => {
@@ -530,6 +535,11 @@ function main(): void {
   parentPort.on("message", (msg: ShutdownMessage | undefined) => {
     if (msg && msg.type === "shutdown") {
       shuttingDown = true;
+      // Clear every armed re-scan timer FIRST (before unsubscribe / db close) so
+      // a pending drop-recovery scan can't fire against a closing connection.
+      for (const sched of schedulers.splice(0)) {
+        sched.cancel();
+      }
       // Release every subscription (external resources), then the db, then exit
       // clean. Mirrors transcript-worker's teardown but over an array.
       void (async () => {
@@ -561,16 +571,38 @@ function main(): void {
           );
           continue;
         }
+        // Per-root drop-recovery scheduler: a recoverable FSEvents drop schedules
+        // a debounced, single-flight re-scan of THIS root via the change-gated
+        // boot-scan primitive (scanRoot) — never an unsubscribe+re-subscribe (the
+        // subscription stays alive; re-subscribing would open a no-watch gap). The
+        // warm in-memory change-gate (PlanScanner.lastEmitted) suppresses re-emits
+        // for unchanged files, so recovery is idempotent. The scan re-checks
+        // shuttingDown so a queued scan can't touch a closing DB.
+        const rescan = new RescanScheduler(() => {
+          if (shuttingDown) {
+            return;
+          }
+          scanRoot(root, scanner);
+        });
+        schedulers.push(rescan);
         watcher
           .subscribe(
             root,
             (err, events) => {
               if (err) {
-                // A watcher-level error is logged, not fatal — the subscription
-                // stays live and the next event re-reads.
+                // Always leave a breadcrumb so a future @parcel/watcher wording
+                // change (the drop discriminator couples to its message text) is
+                // observable in the logs.
                 console.error(
                   `[plan-worker] watcher error for ${root}: ${stringifyErr(err)}`,
                 );
+                // A recoverable FSEvents drop ("...must be re-scanned"): the lost
+                // change may never re-fire, so schedule a debounced re-scan. A
+                // non-drop err keeps today's swallow-and-log (additive only — no
+                // change to fatal/escalation behavior).
+                if (isDropError(err)) {
+                  rescan.schedule();
+                }
                 return;
               }
               for (const ev of events) {

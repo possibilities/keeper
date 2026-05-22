@@ -48,6 +48,7 @@ import { StringDecoder } from "node:string_decoder";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
+import { isDropError, RescanScheduler } from "./rescan";
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only path
@@ -591,6 +592,20 @@ function main(): void {
   let subscription: AsyncSubscription | null = null;
   let shuttingDown = false;
 
+  // Drop-recovery scheduler (single root): a recoverable FSEvents drop schedules
+  // a debounced, single-flight re-scan via the change-gated boot-scan primitive
+  // (scanJobsForTitles, which routes through scanFile's TRANSIENT decoder — NEVER
+  // onChange, which would advance/re-anchor byte offsets and lose the very change
+  // we're recovering). The warm in-memory change-gate (lastEmitted) suppresses
+  // re-emits for unchanged titles, so recovery is idempotent. Cleared in shutdown
+  // before unsubscribe; the scan re-checks shuttingDown.
+  const rescan = new RescanScheduler(() => {
+    if (shuttingDown) {
+      return;
+    }
+    scanJobsForTitles(db, stream);
+  });
+
   const closeDb = (): void => {
     try {
       db.close();
@@ -602,6 +617,9 @@ function main(): void {
   parentPort.on("message", (msg: ShutdownMessage | undefined) => {
     if (msg && msg.type === "shutdown") {
       shuttingDown = true;
+      // Clear any armed re-scan timer FIRST (before unsubscribe / db close) so a
+      // pending drop-recovery scan can't fire against a closing connection.
+      rescan.cancel();
       // Release the subscription (external resource), then the db, then exit
       // clean. Mirrors server-worker's socket teardown.
       void (async () => {
@@ -644,11 +662,19 @@ function main(): void {
         watchRoot,
         (err, events) => {
           if (err) {
-            // A watcher-level error is logged, not fatal — the subscription
-            // stays live and the next event re-tails.
+            // Always leave a breadcrumb so a future @parcel/watcher wording
+            // change (the drop discriminator couples to its message text) is
+            // observable in the logs.
             console.error(
               `[transcript-worker] watcher error: ${stringifyErr(err)}`,
             );
+            // A recoverable FSEvents drop ("...must be re-scanned"): the lost
+            // title change may never re-fire (the live tail is EOF-anchored), so
+            // schedule a debounced re-scan. A non-drop err keeps today's
+            // swallow-and-log (additive only — no fatal/escalation change).
+            if (isDropError(err)) {
+              rescan.schedule();
+            }
             return;
           }
           for (const ev of events) {

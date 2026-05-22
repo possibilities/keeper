@@ -108,7 +108,20 @@ agents working in the repo.
     `TranscriptLineStream` core + `seedFromDb` + `scanJobsForTitles` are exported
     and drivable with no Worker or watcher; the watcher subscription is the owned
     external resource it `unsubscribe()`s in its shutdown handler.
-    `isMainThread`-guarded.
+    `isMainThread`-guarded. **Drop-recovery carve-out (fn-566):** macOS FSEvents
+    can drop events under congestion and signals it through the subscribe
+    callback's `err` arg (message "...must be re-scanned") — the live tail would
+    silently miss that change (no future event for the missed file). On a matched
+    drop (`isDropError` in `src/rescan.ts`, matching the substring `must be
+    re-scanned` so all three FSEvents variants recover) the callback SCHEDULES a
+    debounced, single-flight RE-SCAN (a `RescanScheduler`) that re-runs
+    `scanJobsForTitles` (routing through `scanFile`'s transient decoder — NEVER
+    `onChange`, which would re-anchor offsets and lose the recovered change),
+    reusing the warm `lastEmitted` change-gate so an unchanged file emits nothing.
+    This is NOT a self-heal — the subscription stays live, the worker never
+    re-subscribes, and a re-scan throw is swallowed to stderr (never `fatalExit`);
+    a non-drop `err` keeps the old swallow-and-log. The timer is cleared in the
+    shutdown handler before `unsubscribe()` and the scan re-checks `shuttingDown`.
   - `src/plan-worker.ts` — Worker thread; the SECOND producer (after transcript)
     and keeperd's fourth worker. Watches each configured project root (from
     `resolvePlanRoots()`) for `.planctl/{epics,tasks}/*.json` via ONE recursive
@@ -124,7 +137,17 @@ agents working in the repo.
     `seedFromDb` restart-seed; never writes the DB — main is the sole writer). The
     pure `PlanScanner` core + `seedFromDb` are exported and drivable with no Worker
     or watcher; each subscription is an owned external resource `unsubscribe()`d in
-    the shutdown handler. `isMainThread`-guarded.
+    the shutdown handler. `isMainThread`-guarded. **Drop-recovery carve-out
+    (fn-566):** same as the transcript worker — on a matched FSEvents drop
+    (`isDropError`, "...must be re-scanned") each per-root callback SCHEDULES a
+    debounced, single-flight re-scan via a PER-ROOT `RescanScheduler`
+    (`src/rescan.ts`; each callback closes over its own `root`) that re-runs
+    `scanRoot(root, scanner)` for the affected root only, reusing the warm
+    `PlanScanner.lastEmitted` change-gate so unchanged files emit nothing. Not a
+    self-heal (the subscription stays live, never re-subscribes; a throw is
+    swallowed to stderr, never `fatalExit`); a non-drop `err` keeps the old
+    swallow-and-log. Each scheduler is cleared in the shutdown handler BEFORE
+    `unsubscribe()` and the scan re-checks `shuttingDown`.
   - `src/collections.ts` — the collection registry that namespaces the read
     surface. A `CollectionDescriptor` holds everything collection-specific
     (table, served columns, pk, the per-row `version` column the diff fires on,
@@ -350,7 +373,14 @@ untouched — a clean forward-only step).
   for a foreign file tree. Treat a watcher event as "go look", never as the data:
   always `fstat` + (transcript) forward-tail from the stored byte-offset / (plan)
   size-bound + safe-parse the current file. This carve-out is for those external
-  trees ONLY — never point a file watcher at keeper's own DB.
+  trees ONLY — never point a file watcher at keeper's own DB. **Drop-recovery
+  sub-carve-out (fn-566):** the subscribe callback's `err` arg is itself a
+  meta-event — macOS FSEvents reports a dropped-events overrun there ("...must be
+  re-scanned"). A matched drop (`isDropError`) is also "go look": it schedules a
+  debounced, single-flight re-scan of the affected tree via the existing
+  change-gated boot-scan primitive (`scanJobsForTitles` / `scanRoot`), recovering
+  the lost change WITHOUT a restart and without re-subscribing. A non-drop `err`
+  stays swallow-and-log.
 - **No third-party deps in the hook.** Keep `plugin/hooks/events-writer.ts`'s
   import graph to `bun:sqlite` + local files only — Bun cold start is ~30ms and
   the SessionEnd hook has a 1.5s timeout budget.
@@ -360,7 +390,14 @@ untouched — a clean forward-only step).
 - **No in-process self-heal.** Any unrecoverable error — including any of the
   four workers' `error` event — calls `fatalExit` → `process.exit(1)` → the
   LaunchAgent restarts the single recovery path. Do not respawn any worker
-  in-process.
+  in-process. **Scoped exception (fn-566):** a RECOVERABLE FSEvents
+  dropped-events signal (the producer-worker subscribe callback's `err` carrying
+  "...must be re-scanned") is deliberately NOT escalated — it schedules a
+  debounced re-scan via the existing change-gated boot-scan primitive and the
+  subscription stays live. This is data recovery, not process self-heal: no
+  worker is respawned, no subscription re-subscribed, and a re-scan throw is
+  swallowed to stderr (never reaches `fatalExit`). Every OTHER unrecoverable
+  error still escalates as before; a non-drop watcher `err` still swallow-and-logs.
 - **No prise/env-var integration, multi-session lineage, or harness_meta** — all
   explicitly out of scope.
 - **Plans are READ-ONLY, like everything else keeper serves.** keeper *reads*
@@ -407,7 +444,10 @@ copy for the many workers to come:
   await `close`, then `terminate`). The worker does not decide when to die.
 - **No in-process self-heal.** A worker's `error` event escalates to the
   supervisor's `fatalExit`; the LaunchAgent restarts the process. Workers never
-  respawn themselves or each other.
+  respawn themselves or each other. (The producer workers' fn-566 drop-recovery
+  re-scan is NOT an exception to this — it never respawns a worker or
+  re-subscribes; it re-runs the change-gated boot scan in-place on a recoverable
+  FSEvents drop. See the Producer-worker archetype.)
 
 Three archetypes:
 
@@ -433,4 +473,19 @@ Three archetypes:
   by the same change-gate so an unchanged file is not re-emitted: `plan-worker`'s
   `scanRoot` enumerates `.planctl/{epics,tasks}/*.json`, while `transcript-worker`'s
   `scanJobsForTitles` scopes to live `jobs.transcript_path` (the per-session file,
-  NOT a watch-root walk) and folds each session's current `custom-title`.
+  NOT a watch-root walk) and folds each session's current `custom-title`. Both
+  producers ALSO run a **second post-subscribe behavior (fn-566): drop-recovery.**
+  macOS FSEvents can drop events under congestion and reports it through the
+  subscribe callback's `err` arg ("...must be re-scanned"); the lost change may
+  never re-fire. On a matched drop (`isDropError` in `src/rescan.ts`) the callback
+  schedules a debounced, single-flight re-scan (`RescanScheduler`) that RE-RUNS
+  the same boot-scan primitive (`scanRoot(root)` per affected root for
+  `plan-worker`; `scanJobsForTitles` for `transcript-worker`, routed through
+  `scanFile`'s transient decoder, never the offset-advancing `onChange`), reusing
+  the warm in-memory change-gate so recovery stays idempotent. The
+  `RescanScheduler` (timer + `inFlight` single-flight + `pending` dirty bit) is an
+  owned resource cleared in the shutdown handler BEFORE `unsubscribe()`, and the
+  scan re-checks `shuttingDown` — the same teardown discipline as the watcher
+  subscription. This is the producer-worker drop-recovery clause of the "no
+  self-heal" contract: data recovery in-place, never a re-subscribe or respawn,
+  and a re-scan throw is swallowed (never `fatalExit`).

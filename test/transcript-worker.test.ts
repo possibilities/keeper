@@ -334,6 +334,72 @@ test("scanJobsForTitles: an already-folded transcript title is NOT re-emitted on
   }
 });
 
+test("scanJobsForTitles: boot then drop-recovery over an unchanged file emits nothing the second time", () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  try {
+    const transcriptPath = join(tmpDir, "recover-sess.jsonl");
+    writeFileSync(
+      transcriptPath,
+      `${titleLine("recover-sess", "Live Rename")}\n`,
+    );
+    db.query(
+      "INSERT INTO jobs (job_id, created_at, updated_at, title, title_source, transcript_path) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run("recover-sess", 1, 1, "old payload title", "payload", transcriptPath);
+
+    const emitted: Array<{ sessionId: string; title: string }> = [];
+    const stream = new TranscriptLineStream(
+      (sessionId, title) => emitted.push({ sessionId, title }),
+      () => {},
+    );
+
+    // Boot scan: the live rename emits.
+    seedFromDb(db, stream);
+    scanJobsForTitles(db, stream);
+    expect(emitted.length).toBe(1);
+
+    // Simulated drop-recovery re-scan over the SAME warm stream: the in-memory
+    // change-gate (lastEmitted, advanced by the boot scan) suppresses the
+    // unchanged title — zero duplicate TranscriptTitle messages.
+    scanJobsForTitles(db, stream);
+    expect(emitted.length).toBe(1);
+  } finally {
+    db.close();
+  }
+});
+
+test("scanJobsForTitles: a title changed between boot and recovery emits exactly its delta", () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  try {
+    const transcriptPath = join(tmpDir, "delta-sess.jsonl");
+    writeFileSync(transcriptPath, `${titleLine("delta-sess", "First")}\n`);
+    db.query(
+      "INSERT INTO jobs (job_id, created_at, updated_at, transcript_path) VALUES (?, ?, ?, ?)",
+    ).run("delta-sess", 1, 1, transcriptPath);
+
+    const emitted: Array<{ sessionId: string; title: string }> = [];
+    const stream = new TranscriptLineStream(
+      (sessionId, title) => emitted.push({ sessionId, title }),
+      () => {},
+    );
+
+    seedFromDb(db, stream);
+    scanJobsForTitles(db, stream);
+    expect(emitted).toEqual([{ sessionId: "delta-sess", title: "First" }]);
+
+    // A drop window dropped the rename event; the file now holds a NEW current
+    // title. The recovery scan picks up exactly that delta (scanFile emits only
+    // the last title per session through the warm change-gate).
+    appendFileSync(transcriptPath, `${titleLine("delta-sess", "Second")}\n`);
+    scanJobsForTitles(db, stream);
+    expect(emitted.length).toBe(2);
+    expect(emitted[1]).toEqual({ sessionId: "delta-sess", title: "Second" });
+  } finally {
+    db.close();
+  }
+});
+
 test("multi-byte title split across the read boundary does not corrupt (no U+FFFD)", () => {
   const path = join(tmpDir, "sess-emoji.jsonl");
   writeFileSync(path, "");

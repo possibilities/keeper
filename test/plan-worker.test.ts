@@ -27,6 +27,7 @@ import {
   epicNumberFromId,
   type PlanMessage,
   PlanScanner,
+  scanRoot,
   seedFromDb,
   taskNumberFromId,
 } from "../src/plan-worker";
@@ -294,6 +295,66 @@ test("seedFromDb suppresses a re-emit of an already-folded projection row", () =
   scanner.onChange(path);
   expect(emitted.length).toBe(1);
   expect((emitted[0] as { status: string }).status).toBe("done");
+});
+
+// ---------------------------------------------------------------------------
+// (a') Drop-recovery via scanRoot — the change-gated re-scan primitive the
+// per-root drop scheduler reuses. Boot scan + a simulated drop-recovery scan
+// over the SAME warm scanner must not double-emit; a file changed between the
+// two scans emits exactly its delta.
+// ---------------------------------------------------------------------------
+
+test("scanRoot: boot then drop-recovery over unchanged files emits nothing the second time", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  writeEpic("fn-3-demo", { title: "Demo", status: "open", primary_repo: "/r" });
+  writeTask("fn-3-demo.1", { epic: "fn-3-demo", title: "T" });
+
+  // Boot scan: both files emit.
+  scanRoot(tmpDir, scanner);
+  expect(emitted.length).toBe(2);
+
+  // Simulated drop-recovery re-scan over the SAME warm scanner: change-gate
+  // (PlanScanner.lastEmitted) suppresses both — zero duplicate snapshots.
+  scanRoot(tmpDir, scanner);
+  expect(emitted.length).toBe(2);
+});
+
+test("scanRoot: a file changed between boot and recovery emits exactly its delta", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  const epicPath = writeEpic("fn-3-demo", {
+    title: "Demo",
+    status: "open",
+    primary_repo: "/r",
+  });
+  writeTask("fn-3-demo.1", { epic: "fn-3-demo", title: "T" });
+
+  scanRoot(tmpDir, scanner);
+  expect(emitted.length).toBe(2);
+
+  // Mutate ONLY the epic, then run the recovery scan: exactly one delta emits.
+  writeFileSync(
+    epicPath,
+    JSON.stringify({
+      id: "fn-3-demo",
+      title: "Demo",
+      status: "done",
+      primary_repo: "/r",
+    }),
+  );
+  scanRoot(tmpDir, scanner);
+  expect(emitted.length).toBe(3);
+  expect((emitted[2] as { id: string; status: string }).id).toBe("fn-3-demo");
+  expect((emitted[2] as { status: string }).status).toBe("done");
 });
 
 // ---------------------------------------------------------------------------
