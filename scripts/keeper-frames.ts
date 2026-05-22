@@ -45,11 +45,12 @@
  * `query` / `unsubscribe`.
  *
  * Usage:
- *   bun scripts/keeper-frames.ts [--sock <path>]
+ *   bun scripts/keeper-frames.ts [--collection <name>] [--sock <path>]
  *
- *   --sock <path>   Socket path override (else $KEEPER_SOCK, else the
- *                   ~/.local/state/keeper/keeperd.sock default).
- *   --help          Show this help.
+ *   --collection <name>  Collection to page (jobs|epics|tasks; default jobs).
+ *   --sock <path>        Socket path override (else $KEEPER_SOCK, else the
+ *                        ~/.local/state/keeper/keeperd.sock default).
+ *   --help               Show this help.
  */
 
 import { writeFileSync } from "node:fs";
@@ -74,23 +75,36 @@ const PAGE_LIMIT = 10;
  */
 const POLL_MS = 500;
 
-const HELP = `keeper-frames — primitive jobs-list UI over the keeper subscribe server
+const HELP = `keeper-frames — primitive list UI over the keeper subscribe server
 
-Usage: bun scripts/keeper-frames.ts [--sock <path>] [--state <s> | --state-ne <s>]
+Usage: bun scripts/keeper-frames.ts [--collection <name>] [--sock <path>] [--state <s> | --state-ne <s>]
 
+  --collection <n> Collection to page (jobs|epics|tasks; default jobs)
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
   --state <s>      Filter to jobs whose state equals <s> (e.g. working)
   --state-ne <s>   Filter to jobs whose state is NOT <s> (e.g. ended)
                    (--state and --state-ne are mutually exclusive; default: no filter)
+                   (--state/--state-ne are jobs-only; ignored for epics/tasks)
   --help           Show this help
 
-Renders a 10-row page of jobs as a YAML stream: one frame per change, each frame
-a YAML document (--- separated) of collapsed job strings ({basename(cwd)} · {title}
- · {state}). The page is refetched on every change signal and on a steady poll, so
-it always shows the current top-N; a new frame prints only when the rendered
-output changes. Every emitted frame is also mirrored to two /tmp sidecar files
-(full JSON state + rendered frame), whose paths print in a ...-fenced note.
+Renders a 10-row page of the chosen collection as a YAML stream: one frame per
+change, each frame a YAML document (--- separated) of collapsed row strings. The
+render is collection-appropriate:
+  jobs  → {basename(cwd)} · {title} · {state}
+  epics → {basename(project_dir)} · #{epic_number} · {title} · {status}
+  tasks → {epic_id} · #{task_number} · {title} · {status}
+The page is refetched on every change signal and on a steady poll, so it always
+shows the current top-N; a new frame prints only when the rendered output
+changes. Every emitted frame is also mirrored to two /tmp sidecar files (full
+JSON state + rendered frame), whose paths print in a ...-fenced note.
 `;
+
+/** Per-collection primary-key column used as the page index key. */
+const PK_BY_COLLECTION: Record<string, string> = {
+  jobs: "job_id",
+  epics: "epic_id",
+  tasks: "task_id",
+};
 
 /**
  * Render one value as YAML. Scalars are bare when safe, else single-quoted;
@@ -146,6 +160,7 @@ async function main(): Promise<void> {
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
     options: {
+      collection: { type: "string", default: "jobs" },
       sock: { type: "string" },
       state: { type: "string" },
       "state-ne": { type: "string" },
@@ -162,6 +177,11 @@ async function main(): Promise<void> {
   if (values.state !== undefined && values["state-ne"] !== undefined) {
     die("--state and --state-ne are mutually exclusive");
   }
+
+  const collection = values.collection ?? "jobs";
+  // The pk column the page indexes by. Unknown collections fall back to the
+  // jobs pk (the server will reject the query with unknown_collection anyway).
+  const pk = PK_BY_COLLECTION[collection] ?? "job_id";
 
   const sockPath = values.sock ?? resolveSockPath();
   const log = (s: string) => process.stdout.write(`${s}\n`);
@@ -186,17 +206,27 @@ async function main(): Promise<void> {
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
   /**
-   * Collapse one full job row to its display string: `{basename(cwd)} · {title}
-   *  · {state}`. A null/absent `cwd` or `title` projects to an empty segment (no
-   * basename of nothing). This is the SOLE place a row's columns are read for
-   * display — so it alone defines which column moves can reframe (see
-   * `emitFrameIfChanged`).
+   * Collapse one full row to its display string, collection-aware:
+   *   jobs  → `{basename(cwd)} · {title} · {state}`
+   *   epics → `{basename(project_dir)} · #{epic_number} · {title} · {status}`
+   *   tasks → `{epic_id} · #{task_number} · {title} · {status}`
+   * A null/absent segment projects to empty (no basename of nothing). This is
+   * the SOLE place a row's columns are read for display — so it alone defines
+   * which column moves can reframe (see `emitFrameIfChanged`).
    */
   function projectRow(row: Record<string, unknown>): string {
+    const seg = (v: unknown) => (v == null ? "" : String(v));
+    const title = seg(row.title);
+    if (collection === "epics") {
+      const dir =
+        row.project_dir == null ? "" : basename(String(row.project_dir));
+      return `${dir} · #${seg(row.epic_number)} · ${title} · ${seg(row.status)}`;
+    }
+    if (collection === "tasks") {
+      return `${seg(row.epic_id)} · #${seg(row.task_number)} · ${title} · ${seg(row.status)}`;
+    }
     const cwd = row.cwd == null ? "" : basename(String(row.cwd));
-    const title = row.title == null ? "" : String(row.title);
-    const state = row.state == null ? "" : String(row.state);
-    return `${cwd} · ${title} · ${state}`;
+    return `${cwd} · ${title} · ${seg(row.state)}`;
   }
 
   /**
@@ -209,7 +239,7 @@ async function main(): Promise<void> {
       return "[]"; // empty page → an empty YAML sequence
     }
     return order
-      .map((id) => `- ${yamlScalar(projectRow(byId.get(id) ?? { job_id: id }))}`)
+      .map((id) => `- ${yamlScalar(projectRow(byId.get(id) ?? { [pk]: id }))}`)
       .join("\n");
   }
 
@@ -228,7 +258,7 @@ async function main(): Promise<void> {
    * and never wedges the stream.
    */
   function writeSidecars(frameText: string): void {
-    const state = order.map((id) => byId.get(id) ?? { job_id: id });
+    const state = order.map((id) => byId.get(id) ?? { [pk]: id });
     try {
       writeFileSync(stateSidecar, `${JSON.stringify(state, null, 2)}\n`);
       writeFileSync(frameSidecar, `${frameText}\n`);
@@ -282,7 +312,7 @@ async function main(): Promise<void> {
       order.length = 0;
       byId.clear();
       for (const row of frame.rows) {
-        const id = String(row.job_id);
+        const id = String(row[pk]);
         order.push(id);
         byId.set(id, row);
       }
@@ -314,16 +344,22 @@ async function main(): Promise<void> {
   // not after the fetch — keeps LIMIT counting matching rows (so the page is a
   // true top-N of the filtered set, never short) and makes `result.total` /
   // `meta` describe exactly the set we render. Default: no filter (every job).
+  // The `state` filter is jobs-only — epics/tasks have no `state` column, so a
+  // state filter would be a no-op key server-side; only attach it for jobs.
+  const stateFilter =
+    collection === "jobs"
+      ? values.state !== undefined
+        ? { filter: { state: values.state } }
+        : values["state-ne"] !== undefined
+          ? { filter: { state: { ne: values["state-ne"] } } }
+          : {}
+      : {};
   const query: QueryFrame = {
     type: "query",
-    collection: "jobs",
+    collection,
     id: "frames",
     limit: PAGE_LIMIT,
-    ...(values.state !== undefined
-      ? { filter: { state: values.state } }
-      : values["state-ne"] !== undefined
-        ? { filter: { state: { ne: values["state-ne"] } } }
-        : {}),
+    ...stateFilter,
   };
 
   const socket = await Bun.connect({

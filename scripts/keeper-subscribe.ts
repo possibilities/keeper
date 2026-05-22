@@ -20,13 +20,20 @@
  *   bun scripts/keeper-subscribe.ts [options]
  *
  * Options:
- *   --collection <name>   Collection to page (default: "jobs").
+ *   --collection <name>   Collection to page: jobs (default), epics, or tasks.
  *   --filter <key=value>  Exact-match filter; repeatable. Unknown keys are
- *                         ignored server-side (forward-compat). For jobs:
- *                         state, mode, cwd, job_id.
- *   --sort <col[:dir]>    Sort column and direction (asc|desc). For jobs:
- *                         updated_at, created_at, last_event_id, job_id,
- *                         state, mode. Default server-side: updated_at desc.
+ *                         ignored server-side (forward-compat).
+ *                           jobs:  state, cwd, job_id
+ *                           epics: status, project_dir, epic_id
+ *                           tasks: status, target_repo, epic_id, task_id
+ *   --sort <col[:dir]>    Sort column and direction (asc|desc).
+ *                         Default server-side: updated_at desc.
+ *                           jobs:  updated_at, created_at, last_event_id,
+ *                                  job_id, state
+ *                           epics: updated_at, last_event_id, epic_id,
+ *                                  epic_number, status
+ *                           tasks: updated_at, last_event_id, task_id,
+ *                                  task_number, status
  *   --limit <n>           Page size.
  *   --offset <n>          Page offset.
  *   --sock <path>         Socket path override (else $KEEPER_SOCK, else the
@@ -56,15 +63,25 @@ const HELP = `keeper-subscribe — client for the keeper UDS subscribe server
 
 Usage: bun scripts/keeper-subscribe.ts [options]
 
-  --collection <name>   Collection to page (default: "jobs")
+  --collection <name>   Collection to page: jobs (default), epics, or tasks
   --filter <key=value>  Exact-match filter; repeatable
-  --sort <col[:dir]>    Sort column and direction (asc|desc)
+                          jobs:  state, cwd, job_id
+                          epics: status, project_dir, epic_id
+                          tasks: status, target_repo, epic_id, task_id
+  --sort <col[:dir]>    Sort column and direction (asc|desc); default updated_at desc
+                          jobs:  updated_at, created_at, last_event_id, job_id, state
+                          epics: updated_at, last_event_id, epic_id, epic_number, status
+                          tasks: updated_at, last_event_id, task_id, task_number, status
   --limit <n>           Page size
   --offset <n>          Page offset
   --sock <path>         Socket path override ($KEEPER_SOCK / default otherwise)
   --once                Print the result page and exit; skip the live watch
   --json                Emit raw frames as NDJSON instead of the table view
   --help                Show this help
+
+Examples:
+  bun scripts/keeper-subscribe.ts --collection epics --once
+  bun scripts/keeper-subscribe.ts --collection tasks --filter epic_id=fn-1 --sort task_number:asc
 `;
 
 function die(message: string): never {
