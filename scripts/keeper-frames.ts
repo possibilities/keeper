@@ -122,7 +122,7 @@ collection-appropriate:
   epics → a sequence of epic:/tasks: mapping blocks, where each epic line is
           {basename(project_dir)} · #{epic_number} · {title} · {status}
           and its embedded tasks list under tasks: as
-          {basename(target_repo)} · #{task_number} · {title} · {status}
+          #{task_number} · {title} · {status}
 The page is refetched on every change signal and on a steady poll, so it always
 shows the current top-N; a new frame prints only when the rendered output
 changes. Every emitted frame is also mirrored to two /tmp sidecar files (full
@@ -277,15 +277,15 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Collapse one embedded epic task to its display string, mirroring the epic
-   * line shape: `{basename(target_repo)} · #{task_number} · {title} · {status}`.
-   * A null/absent segment projects to empty. Read alongside `projectRow` so a
-   * task title/status/membership move surfaces in the frame and reframes.
+   * Collapse one embedded epic task to its display string:
+   * `#{task_number} · {title} · {status}`. A null/absent segment projects to
+   * empty. The task's `target_repo` is omitted — it's redundant with the parent
+   * epic's `project_dir` already shown on the epic line. Read alongside
+   * `projectRow` so a task title/status/membership move surfaces in the frame
+   * and reframes.
    */
   function projectTask(task: Record<string, unknown>): string {
-    const repo =
-      task.target_repo == null ? "" : basename(String(task.target_repo));
-    return `${repo} · #${seg(task.task_number)} · ${seg(task.title)} · ${seg(task.status)}`;
+    return `#${seg(task.task_number)} · ${seg(task.title)} · ${seg(task.status)}`;
   }
 
   /**
