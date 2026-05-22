@@ -79,5 +79,5 @@ root override pointing at a hermetic tmp dir.
 - [ ] Three-layer worker tests pass (pure core, addon smoke, spawned-worker shutdown)
 
 ## Done summary
-
+Added src/plan-worker.ts (PlanScanner pure core + seedFromDb + isMainThread-guarded watcher main) and test/plan-worker.test.ts (three-layer suite). Clones the transcript-worker producer archetype: one recursive @parcel/watcher subscription per root with positive ignore globs, in-callback .planctl/{epics,tasks}/*.json filter, fstat+bounded-read+safe-parse, change-gated plan-epic/plan-task snapshot messages, restart-seed from the epics/tasks projection.
 ## Evidence

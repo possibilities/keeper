@@ -69,5 +69,5 @@ existing `mkdtempSync` + env-override hermetic pattern.
 - [ ] `Epic`/`Task` types in `src/types.ts` match the table columns; `bun run typecheck` clean
 
 ## Done summary
-
+Bumped SCHEMA_VERSION 5→6 with idempotent CREATE TABLE for epics/tasks projection tables + tasks(epic_id) index; added resolveConfig()/resolvePlanRoots() (Bun.YAML.parse, KEEPER_CONFIG override, ~-expansion, skip-non-existent roots, default ~/code) and Epic/Task types.
 ## Evidence

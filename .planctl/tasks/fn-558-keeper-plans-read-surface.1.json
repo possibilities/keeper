@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
   "title": "Config roots, schema v6, plan types",
-  "updated_at": "2026-05-22T00:22:09Z"
+  "updated_at": "2026-05-22T00:36:00Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-22T00:36:00Z"
 }

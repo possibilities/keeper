@@ -72,5 +72,5 @@ determinism case above.
 - [ ] `projectJobsRow` / jobs folding is unchanged
 
 ## Done summary
-
+Added projectPlanRow + extractPlanSnapshot to the reducer, dispatched from applyEvent's existing fold+cursor transaction. EpicSnapshot/TaskSnapshot upsert idempotently by pk with monotonic last_event_id; malformed blobs skip-and-log; from-scratch re-fold is byte-identical. Jobs folding unchanged.
 ## Evidence
