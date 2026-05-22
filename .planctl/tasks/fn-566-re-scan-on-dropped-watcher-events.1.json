@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "Re-scan on FSEvents drop signal",
-  "updated_at": "2026-05-22T14:39:40Z"
+  "updated_at": "2026-05-22T15:39:37Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-22T15:39:37Z"
 }

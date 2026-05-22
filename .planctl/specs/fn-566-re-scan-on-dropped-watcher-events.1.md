@@ -85,5 +85,5 @@ coalescing (N drops → 1 scan) and the in-flight dirty-bit re-run directly.
 - [ ] `bun test --isolate` passes
 
 ## Done summary
-
+Both producer workers now match the FSEvents 'must be re-scanned' drop signal (isDropError) and schedule a debounced, single-flight re-scan via the existing change-gated boot-scan primitive (scanRoot per-root for plan-worker, scanJobsForTitles for transcript-worker) — recovering dropped changes in-process without a restart or re-subscribe. Added shared src/rescan.ts (isDropError + RescanScheduler), timer cleared in shutdown before unsubscribe with shuttingDown re-check, unit tests for the predicate/scheduler/no-duplicate/delta cases, and the carve-out documented across CLAUDE.md (6 spots) + README.md (2 spots).
 ## Evidence
