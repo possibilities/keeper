@@ -120,9 +120,9 @@ change, each frame a YAML document (--- separated). The render is
 collection-appropriate:
   jobs  → a flat sequence of: {basename(cwd)} · {title} · {state}
   epics → a sequence of epic:/tasks: mapping blocks, where each epic line is
-          {basename(project_dir)} · #{epic_number} · {title} · {status}
+          {basename(project_dir)} #{epic_number} {title} [{status}]
           and its embedded tasks list under tasks: as
-          #{task_number} · {title} · {status}
+          {task_number}) {title} [{status}]
 The page is refetched on every change signal and on a steady poll, so it always
 shows the current top-N; a new frame prints only when the rendered output
 changes. Every emitted frame is also mirrored to two /tmp sidecar files (full
@@ -258,7 +258,7 @@ async function main(): Promise<void> {
   /**
    * Collapse one full row to its display string, collection-aware:
    *   jobs  → `{basename(cwd)} · {title} · {state}`
-   *   epics → `{basename(project_dir)} · #{epic_number} · {title} · {status}`
+   *   epics → `{basename(project_dir)} #{epic_number} {title} [{status}]`
    * A null/absent segment projects to empty (no basename of nothing). The epic
    * line drops the task count — the embedded tasks render as their own nested
    * sequence (see `projectTask` / `renderBody`). Together with `projectTask`,
@@ -270,7 +270,7 @@ async function main(): Promise<void> {
     if (collection === "epics") {
       const dir =
         row.project_dir == null ? "" : basename(String(row.project_dir));
-      return `${dir} · #${seg(row.epic_number)} · ${title} · ${seg(row.status)}`;
+      return `${dir} #${seg(row.epic_number)} ${title} [${seg(row.status)}]`;
     }
     const cwd = row.cwd == null ? "" : basename(String(row.cwd));
     return `${cwd} · ${title} · ${seg(row.state)}`;
@@ -278,14 +278,14 @@ async function main(): Promise<void> {
 
   /**
    * Collapse one embedded epic task to its display string:
-   * `#{task_number} · {title} · {status}`. A null/absent segment projects to
+   * `{task_number}) {title} [{status}]`. A null/absent segment projects to
    * empty. The task's `target_repo` is omitted — it's redundant with the parent
    * epic's `project_dir` already shown on the epic line. Read alongside
    * `projectRow` so a task title/status/membership move surfaces in the frame
    * and reframes.
    */
   function projectTask(task: Record<string, unknown>): string {
-    return `#${seg(task.task_number)} · ${seg(task.title)} · ${seg(task.status)}`;
+    return `${seg(task.task_number)}) ${seg(task.title)} [${seg(task.status)}]`;
   }
 
   /**
