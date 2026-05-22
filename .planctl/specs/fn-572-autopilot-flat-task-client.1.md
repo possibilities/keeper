@@ -103,5 +103,5 @@ format and that Ctrl-C unsubscribes cleanly.
   `## Example clients` section documents both scripts.
 
 ## Done summary
-
+Cloned scripts/keeper-frames.ts → scripts/autopilot.ts with all plumbing preserved verbatim, hardcoded epics + flat one-line-per-task render (`{repo} {epicRef}.{task_number} {epic title} · {task title}`, no [status]), retargeted identity strings + /tmp sidecar paths, fixed README's dual 'No consumer ships yet' and added an ## Example clients section. Live run against keeperd confirmed the flat stream format.
 ## Evidence

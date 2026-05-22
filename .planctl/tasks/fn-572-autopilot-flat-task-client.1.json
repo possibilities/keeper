@@ -9,6 +9,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
   "title": "add autopilot flat task client",
-  "updated_at": "2026-05-22T22:59:20Z"
+  "updated_at": "2026-05-22T23:13:06Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-22T23:13:06Z"
 }
