@@ -209,8 +209,9 @@ type SpawnInfo = { name: string | null; startTime: string | null };
  * `process.ppid` is correct: the arthack-claude launcher injects
  * `--name <session>` directly into the immediate parent claude argv.
  *
- * Darwin: ONE `ps -o args=,lstart=` fork captures both fields (lstart is
- * 24-char fixed-width at the end; see `splitArgsLstart`). Linux: read
+ * Darwin: ONE `ps -o lstart=,args=` fork captures both fields (lstart is
+ * the 24-char fixed-width PREFIX; see `splitArgsLstart` and the
+ * column-order comment below). Linux: read
  * `/proc/$PPID/stat` field 22 (no fork; `Bun.file` is just an open+read).
  * Unknown platforms return both fields null.
  *
