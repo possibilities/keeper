@@ -75,5 +75,5 @@ Per-platform tests (defer-skip on the opposite platform):
 - [ ] All listed per-platform tests pass; deferred-skip on opposite platform
 
 ## Done summary
-
+Added src/exit-watcher-ffi.ts: bun:ffi-backed ExitWatcher with macOS (kqueue + EVFILT_PROC/EVFILT_USER) and Linux (pidfd_open + epoll + eventfd) backends, post-register liveness probe for the ESRCH race, and sliced wait() so cross-thread wake/messages land between syscalls. Tests cover struct layout, register-and-wait, race-closer, wake latency, fd-leak, and idempotent close.
 ## Evidence
