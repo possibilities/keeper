@@ -33,5 +33,5 @@ Add tests for `{ not_in: [...] }` and `{ in: [...] }` against the jobs collectio
 - [ ] No regression in existing `{ne}` / equality tests
 
 ## Done summary
-
+Added {in: [...]} and {not_in: [...]} filter operators to FilterValue and resolveFilter, mirroring the {ne} pattern with empty-list edge handling (WHERE 0 / no-clause). Five new tests cover both operators, empty-list edges, and end-to-end runQuery.
 ## Evidence
