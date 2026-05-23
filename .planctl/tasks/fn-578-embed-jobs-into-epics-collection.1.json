@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "Add jobs embedding to epics projection",
-  "updated_at": "2026-05-23T16:00:45Z"
+  "updated_at": "2026-05-23T18:47:22Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T18:47:22Z"
 }

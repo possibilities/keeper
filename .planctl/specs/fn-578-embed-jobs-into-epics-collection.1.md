@@ -320,5 +320,5 @@ all landing in one PR / one `SCHEMA_VERSION` bump:
   section's `epic.tasks`-only description.
 
 ## Done summary
-
+Schema v11 embeds plan/close-verb jobs into epics.jobs and work-verb jobs into nested task.jobs sub-arrays via a syncJobIntoEpic reducer helper that fans every plan_ref-bearing jobs write into the right array inside the same BEGIN IMMEDIATE transaction. ON CONFLICT carve-out and TaskSnapshot RMW preserve embedded jobs across plan snapshots; plan-worker seed signature strips both jobs arrays to prevent the boot feedback loop.
 ## Evidence
