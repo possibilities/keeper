@@ -10,6 +10,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "Seed sweep at boot emits Killed for dead pids",
-  "updated_at": "2026-05-23T14:13:04Z"
+  "updated_at": "2026-05-23T15:31:07Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T15:31:07Z"
 }

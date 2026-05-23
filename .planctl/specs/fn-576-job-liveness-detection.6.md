@@ -52,5 +52,5 @@ Daemon unit test: seed `jobs` with rows: (a) alive matching pid+start_time, (b) 
 - [ ] Daemon unit test covers all five seed-row cases and idempotency
 
 ## Done summary
-
+Added src/seed-sweep.ts with seedKilledSweep(db) that probes non-terminal jobs rows via isPidAlive + platform start_time re-read and emits synthetic Killed events per Q7. Wired migrate→drain→sweep→drain→spawn-workers into runDaemon; per-row probes are isolated to stderr.
 ## Evidence
