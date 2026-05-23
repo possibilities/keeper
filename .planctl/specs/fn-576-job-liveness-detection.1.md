@@ -37,5 +37,5 @@ All existing reducer + daemon + integration tests must continue to pass with `st
 - [ ] New migration unit test verifies v8→v9 + idempotent re-run
 
 ## Done summary
-
+Schema v9 adds events.start_time + jobs.start_time as nullable TEXT, with idempotent ADD COLUMN ALTERs. Converted Stmts.insertEvent from positional to named bindings () across the hook, both daemon synthetic emitters, and every test seeder — future column additions are now localized edits instead of column-shift hazards. Added a v8→v9 migration test + fresh-DB shape assertion.
 ## Evidence

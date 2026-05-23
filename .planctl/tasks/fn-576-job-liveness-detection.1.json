@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
   "title": "Schema bump and start_time column",
-  "updated_at": "2026-05-23T14:13:04Z"
+  "updated_at": "2026-05-23T14:31:17Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T14:31:17Z"
 }
