@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-23T14:13:04Z",
+  "depends_on": [
+    "fn-576-job-liveness-detection.1",
+    "fn-576-job-liveness-detection.2"
+  ],
+  "epic": "fn-576-job-liveness-detection",
+  "id": "fn-576-job-liveness-detection.6",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Seed sweep at boot emits Killed for dead pids",
+  "updated_at": "2026-05-23T14:13:04Z"
+}

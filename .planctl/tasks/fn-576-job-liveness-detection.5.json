@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-23T14:13:04Z",
+  "depends_on": [
+    "fn-576-job-liveness-detection.4"
+  ],
+  "epic": "fn-576-job-liveness-detection",
+  "id": "fn-576-job-liveness-detection.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Default jobs filter tighten to working stopped only",
+  "updated_at": "2026-05-23T14:13:04Z"
+}

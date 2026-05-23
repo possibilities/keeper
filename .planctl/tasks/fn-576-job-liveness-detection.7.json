@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-23T14:13:04Z",
+  "depends_on": [],
+  "epic": "fn-576-job-liveness-detection",
+  "id": "fn-576-job-liveness-detection.7",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "FFI spike kqueue and pidfd primitives",
+  "updated_at": "2026-05-23T14:13:04Z"
+}
