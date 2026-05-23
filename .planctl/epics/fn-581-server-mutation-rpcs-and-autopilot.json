@@ -3,6 +3,7 @@
   "bundles": [
     "sketch/autopilot-epic-blocks-with-approvals"
   ],
+  "closer_done_at": "2026-05-23T21:21:01Z",
   "created_at": "2026-05-23T18:18:22Z",
   "depends_on_epics": [
     "fn-578-embed-jobs-into-epics-collection"
@@ -13,10 +14,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Server mutation RPCs and autopilot approvals",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-23T18:19:02Z"
+  "updated_at": "2026-05-23T21:21:01Z"
 }
