@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
   "title": "Fix scrapeSpawnInfo ps docstring",
-  "updated_at": "2026-05-23T16:44:57Z"
+  "updated_at": "2026-05-23T17:06:40Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T17:06:40Z"
 }

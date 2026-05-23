@@ -49,5 +49,5 @@ No code change. No test change.
       the hook's exit-0 contract or SessionStart 1.5s budget.
 
 ## Done summary
-
+Corrected scrapeSpawnInfo JSDoc to reference 'ps -o lstart=,args=' and describe lstart as the 24-char fixed-width PREFIX, matching the actual implementation.
 ## Evidence
