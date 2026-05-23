@@ -66,5 +66,5 @@ Worker `onerror` MUST escalate to `fatalExit` (no in-process self-heal). Teardow
 - [ ] Manual verification: zombie rows disappear from `keeper-frames` default view after daemon restart
 
 ## Done summary
-
+Added src/exit-watcher.ts as the fifth Worker thread: data_version-driven diff loop keeps a kqueue/pidfd watch set in sync with candidate jobs rows, posts {kind:exit, jobId, pid, startTime} on register-time-dead or live exit; main verifies (pid, start_time) against the persisted row before inserting the synthetic Killed event. Docs sweep across README/CLAUDE.md/reducer header/keeper-frames help text; unit + integration tests cover diff filtering, FFI fd release on shutdown, kill-to-killed within 2s, and SessionStart resume re-open from killed.
 ## Evidence
