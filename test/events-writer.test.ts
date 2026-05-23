@@ -18,10 +18,14 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { nameFromArgs } from "../plugin/hooks/events-writer";
+import {
+  nameFromArgs,
+  parseLinuxStarttime,
+  splitArgsLstart,
+} from "../plugin/hooks/events-writer";
 import { openDb } from "../src/db";
 
 const ROOT = join(import.meta.dir, "..");
@@ -145,7 +149,45 @@ test("SessionStart populates events.spawn_name from the parent argv --name", asy
   }
 });
 
-test("a non-SessionStart event leaves spawn_name NULL", async () => {
+test("SessionStart populates events.start_time platform-tagged", async () => {
+  // The ps/proc probe runs against this test process's launcher — so the
+  // captured start_time is a real, live value. We don't assert the exact text
+  // (it's opaque), only that it is populated and carries the platform prefix
+  // matching the current OS.
+  const code = await fireViaLauncher("my-session", {
+    hook_event_name: "SessionStart",
+    session_id: "sess-stime",
+    cwd: "/tmp/work",
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT start_time FROM events WHERE session_id = 'sess-stime' AND hook_event = 'SessionStart'",
+      )
+      .get() as { start_time: string | null } | null;
+    expect(row?.start_time).not.toBeNull();
+    const expectedPrefix =
+      process.platform === "darwin"
+        ? "darwin:"
+        : process.platform === "linux"
+          ? "linux:"
+          : null;
+    if (expectedPrefix !== null) {
+      expect(row?.start_time?.startsWith(expectedPrefix)).toBe(true);
+      // Body after the prefix is non-empty (24-char lstart / digit jiffies).
+      expect(
+        (row?.start_time?.slice(expectedPrefix.length) ?? "").length,
+      ).toBeGreaterThan(0);
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("a non-SessionStart event leaves spawn_name AND start_time NULL", async () => {
   const code = await fireViaLauncher("my-session", {
     hook_event_name: "UserPromptSubmit",
     session_id: "sess-ups",
@@ -157,10 +199,11 @@ test("a non-SessionStart event leaves spawn_name NULL", async () => {
   try {
     const row = db
       .prepare(
-        "SELECT spawn_name FROM events WHERE session_id = 'sess-ups' AND hook_event = 'UserPromptSubmit'",
+        "SELECT spawn_name, start_time FROM events WHERE session_id = 'sess-ups' AND hook_event = 'UserPromptSubmit'",
       )
-      .get() as { spawn_name: string | null } | null;
+      .get() as { spawn_name: string | null; start_time: string | null } | null;
     expect(row?.spawn_name).toBeNull();
+    expect(row?.start_time).toBeNull();
   } finally {
     db.close();
   }
@@ -168,7 +211,9 @@ test("a non-SessionStart event leaves spawn_name NULL", async () => {
 
 test("hook exits 0 and writes a row even when the parent argv has no name", async () => {
   // No --name on the launcher argv: the scrape returns null (not a throw), the
-  // hook still writes the SessionStart row, and exits 0.
+  // hook still writes the SessionStart row, and exits 0. start_time still
+  // comes back populated — the same single probe captures it, --name absence
+  // doesn't break the lstart half.
   const code = await fireViaLauncher(null, {
     hook_event_name: "SessionStart",
     session_id: "sess-noname",
@@ -179,11 +224,172 @@ test("hook exits 0 and writes a row even when the parent argv has no name", asyn
   const { db } = openDb(dbPath, { readonly: true });
   try {
     const row = db
-      .prepare("SELECT spawn_name FROM events WHERE session_id = 'sess-noname'")
-      .get() as { spawn_name: string | null } | null;
+      .prepare(
+        "SELECT spawn_name, start_time FROM events WHERE session_id = 'sess-noname'",
+      )
+      .get() as { spawn_name: string | null; start_time: string | null } | null;
     expect(row).not.toBeNull();
     expect(row?.spawn_name).toBeNull();
+    // start_time should still populate on supported platforms; we don't strand
+    // it on the no-name path.
+    if (process.platform === "darwin" || process.platform === "linux") {
+      expect(row?.start_time).not.toBeNull();
+    }
   } finally {
     db.close();
   }
+});
+
+test("hook exits 0 with NULL start_time when the ps probe is force-broken", async () => {
+  // Force-failure path: prepend a tmpdir to PATH that shadows `ps` with a
+  // bash script exiting 1 (mimics a wedged/missing ps without removing
+  // /bin/sh). The hook MUST swallow the failure, exit 0, and write the row
+  // with start_time = NULL (and spawn_name = NULL on darwin since the same
+  // probe yields both fields). On linux this won't break the /proc reads, so
+  // the assertion only requires that the hook exits 0 and the row exists.
+  const shadowDir = join(tmpDir, "shadow-bin");
+  mkdirSync(shadowDir, { recursive: true });
+  const fakePs = join(shadowDir, "ps");
+  writeFileSync(fakePs, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+
+  // Reuse the launcher but inject the shadowed PATH via a wrapper env on the
+  // spawn. We do it inline instead of through fireViaLauncher so this test
+  // controls env without touching the shared helper.
+  const args = [
+    "bun",
+    "run",
+    launcherPath,
+    "--name",
+    "shadowed",
+    "--payload",
+    JSON.stringify({
+      hook_event_name: "SessionStart",
+      session_id: "sess-broken-ps",
+      cwd: "/tmp/work",
+    }),
+  ];
+  const proc = Bun.spawn(args, {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      PATH: `${shadowDir}:${process.env.PATH ?? ""}`,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const code = await proc.exited;
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT spawn_name, start_time FROM events WHERE session_id = 'sess-broken-ps'",
+      )
+      .get() as { spawn_name: string | null; start_time: string | null } | null;
+    expect(row).not.toBeNull();
+    if (process.platform === "darwin") {
+      // Darwin path: the single ps probe yields BOTH fields, so a broken ps
+      // strands both as NULL.
+      expect(row?.spawn_name).toBeNull();
+      expect(row?.start_time).toBeNull();
+    }
+  } finally {
+    db.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// splitArgsLstart unit (Darwin column-split)
+// ---------------------------------------------------------------------------
+
+test("splitArgsLstart peels a 24-char lstart off the leading edge", () => {
+  // Real-shape sample: 24-char lstart + ≥1 space padding + args.
+  const sample = "Sat May 23 10:46:29 2026     /bin/zsh -c source\n";
+  const got = splitArgsLstart(sample);
+  expect(got).not.toBeNull();
+  expect(got?.args).toBe("/bin/zsh -c source");
+  expect(got?.lstart).toBe("Sat May 23 10:46:29 2026");
+});
+
+test("splitArgsLstart handles single-digit day padding (space-padded)", () => {
+  // ctime(3) left-pads single-digit days with a leading space: ` 7` not `07`.
+  const sample = "Mon Jan  7 03:04:05 2025     /usr/bin/foo\n";
+  const got = splitArgsLstart(sample);
+  expect(got).not.toBeNull();
+  expect(got?.lstart).toBe("Mon Jan  7 03:04:05 2025");
+  expect(got?.args).toBe("/usr/bin/foo");
+});
+
+test("splitArgsLstart preserves args verbatim including --name flag", () => {
+  // The whole point of putting lstart FIRST: macOS ps doesn't truncate args
+  // when it's the last column, so the launcher's --name <token> survives even
+  // for long argv lines that would have been clipped under `args=,lstart=`.
+  const sample =
+    "Sat May 23 10:46:29 2026     bun run /tmp/spawn-launcher.ts --name my-session --payload xxx";
+  const got = splitArgsLstart(sample);
+  expect(got).not.toBeNull();
+  expect(got?.args).toBe(
+    "bun run /tmp/spawn-launcher.ts --name my-session --payload xxx",
+  );
+});
+
+test("splitArgsLstart rejects a malformed leading field", () => {
+  // Leading 24 chars don't match the ctime(3) shape — return null rather than
+  // feeding garbage downstream.
+  expect(splitArgsLstart("not a real lstart here /some/proc")).toBeNull();
+});
+
+test("splitArgsLstart rejects a string shorter than the lstart width", () => {
+  expect(splitArgsLstart("short")).toBeNull();
+  expect(splitArgsLstart("")).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// parseLinuxStarttime unit (Linux /proc/PID/stat field 22)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a synthetic /proc/PID/stat where fields after `(comm)` are
+ * `state, ppid, pgrp, ..., itrealvalue, starttime, ...` — placing
+ * `starttime` (overall field 22, 20th field after comm) at index 19 of
+ * the post-comm split. The helper accepts a starttime token so a test
+ * can inject a non-numeric value to exercise the validation branch.
+ */
+function buildStat(
+  comm: string,
+  starttime: string,
+  trailing = "999 888",
+): string {
+  const beforeStarttime: string[] = [];
+  // 19 placeholder fields: state, ppid, pgrp, session, tty_nr, tpgid, flags,
+  // minflt, cminflt, majflt, cmajflt, utime, stime, cutime, cstime, priority,
+  // nice, num_threads, itrealvalue. Values don't matter to the parser; they
+  // just hold positions.
+  beforeStarttime.push("S"); // state
+  for (let i = 1; i < 19; i++) {
+    beforeStarttime.push(String(i));
+  }
+  return `42 (${comm}) ${beforeStarttime.join(" ")} ${starttime} ${trailing}\n`;
+}
+
+test("parseLinuxStarttime extracts field 22 from a real-shape stat line", () => {
+  expect(parseLinuxStarttime(buildStat("my-proc", "12345"))).toBe("12345");
+});
+
+test("parseLinuxStarttime handles a comm with spaces and parens", () => {
+  // comm field can contain anything including `(` `)` ` ` — proc(5) says the
+  // canonical parser brackets on the LAST `)`. Use a comm that embeds both.
+  expect(parseLinuxStarttime(buildStat("some (nested) comm", "77777"))).toBe(
+    "77777",
+  );
+});
+
+test("parseLinuxStarttime returns null on a malformed stat line (no closing paren)", () => {
+  expect(parseLinuxStarttime("42 some comm no parens here")).toBeNull();
+});
+
+test("parseLinuxStarttime returns null when field 22 is non-numeric", () => {
+  expect(parseLinuxStarttime(buildStat("proc", "not-a-number"))).toBeNull();
 });

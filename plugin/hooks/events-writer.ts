@@ -12,8 +12,13 @@
  *   local resolver. Bun cold start is ~30ms and the SessionEnd hook has a
  *   1.5s timeout cap; every extra import is borrowed from that budget.
  * - **`pid = process.ppid`** — matches `os.getppid()` semantics in the
- *   reference python hook. Informational only; the reducer keys by
- *   `session_id`.
+ *   reference python hook. Pairs with `start_time` (captured on SessionStart
+ *   only) as a recycle-safe `(pid, start_time)` two-field identity: the bare
+ *   pid is unsafe on macOS where pid space is small and recycle can happen
+ *   within hours, so the seed sweep and exit-watcher both probe BOTH fields
+ *   before folding a row to `killed`. `start_time` is a platform-tagged opaque
+ *   string (`darwin:<lstart-text>` / `linux:<jiffies>`) — never interpreted
+ *   cross-platform; the matcher just does string equality.
  *
  * Schema parity with the python reference is intentional — the reducer reads
  * the same shape regardless of which writer landed the row.
@@ -117,31 +122,153 @@ export function nameFromArgs(args: string): string | null {
 }
 
 /**
- * Scrape the spawn name from the parent process's argv via `ps`. SessionStart
- * only — a `ps` fork on every hook would blow the cold-start/SessionEnd-timeout
- * budget. Single-level `process.ppid` is correct: the arthack-claude launcher
- * injects `--name <session>` directly into the immediate parent claude argv.
+ * Pure splitter for the macOS `ps -o lstart=,args=` combined output. The
+ * COLUMN ORDER MATTERS: `args=` must come LAST so macOS ps doesn't width-
+ * truncate it. With `-o args=,lstart=` (args first), the `-ww` flag's "no
+ * truncation" promise only applies to the FINAL output line — the args column
+ * itself still gets truncated to a hardcoded width and the trailing characters
+ * vanish, including any `--name <token>` flag past the column boundary.
+ * Putting `lstart=` first sidesteps this: lstart is fixed-width 24 chars, args
+ * trails to the end and gets the full `-ww` widening.
  *
- * The ENTIRE body is wrapped in try/catch returning null because
+ * Output shape is `<24-char-lstart><≥1-space-padding><args>` — lstart is the
+ * libc `ctime(3)`-style `Day Mon DD HH:MM:SS YYYY`. Strategy: trim leading/
+ * trailing whitespace, peel the leading 24 chars as lstart, validate the
+ * shape, the remainder (left-trimmed) is `args`. Pure + exported for unit
+ * tests so the column-split logic is verifiable without shelling out to ps.
+ */
+export function splitArgsLstart(
+  out: string,
+): { args: string; lstart: string } | null {
+  const trimmed = out.replace(/^\s+|\s+$/g, "");
+  if (trimmed.length < 24) {
+    return null;
+  }
+  const lstart = trimmed.slice(0, 24);
+  // ctime(3) shape: `Xxx Xxx D? HH:MM:SS YYYY` — 3-letter day, space,
+  // 3-letter month, space, 1-or-2-digit day padded to width 2 with leading
+  // space, space, HH:MM:SS, space, 4-digit year.
+  if (
+    !/^[A-Z][a-z]{2} [A-Z][a-z]{2} [ 0-9]\d \d{2}:\d{2}:\d{2} \d{4}$/.test(
+      lstart,
+    )
+  ) {
+    return null;
+  }
+  const args = trimmed.slice(24).replace(/^\s+/, "");
+  return { args, lstart };
+}
+
+/**
+ * Linux `/proc/$pid/stat` field-22 reader (`starttime` in clock ticks since
+ * boot — see proc(5)). Field-2 is `(comm)`, which may itself contain spaces
+ * and parens, so a naive whitespace split is unsafe; bracket on the LAST `)`
+ * then split the remainder. Returns the raw integer string or null.
+ *
+ * Pure + exported: callers pass the stat-file body so the parser is testable
+ * without a real /proc mount (mock the file content).
+ */
+export function parseLinuxStarttime(stat: string): string | null {
+  const close = stat.lastIndexOf(")");
+  if (close < 0) {
+    return null;
+  }
+  // After `(comm)` the fields are space-separated: state, ppid, pgrp, session,
+  // tty_nr, tpgid, flags, minflt, cminflt, majflt, cmajflt, utime, stime,
+  // cutime, cstime, priority, nice, num_threads, itrealvalue, starttime, ...
+  // That's 19 fields after `comm` to reach `starttime` (which is the 22nd
+  // overall: comm + state(3) ... starttime(22) → indices 0..19 after the `)`).
+  const rest = stat
+    .slice(close + 1)
+    .trim()
+    .split(/\s+/);
+  // starttime is field 22 overall; comm is field 2; so it's the (22 - 2 - 1)th
+  // index of `rest` = index 19.
+  const raw = rest[19];
+  if (raw === undefined || !/^\d+$/.test(raw)) {
+    return null;
+  }
+  return raw;
+}
+
+/**
+ * Captured parent-process identity for a SessionStart event: the `--name`
+ * token (when the launcher set one) and a platform-tagged `start_time` string
+ * (`darwin:<lstart-text>` / `linux:<jiffies>`). Either field may be null
+ * independently — name absent means the parent didn't carry `--name`, while
+ * start_time absent means the platform probe failed (unknown OS, ps error,
+ * /proc unreadable). The hook MUST stay exit-0, so every failure path lands
+ * here as `null` rather than throwing.
+ */
+type SpawnInfo = { name: string | null; startTime: string | null };
+
+/**
+ * Scrape the spawn name AND start_time from the parent process via a single
+ * platform-specific probe. SessionStart only — a `ps` fork on every hook
+ * would blow the cold-start/SessionEnd-timeout budget. Single-level
+ * `process.ppid` is correct: the arthack-claude launcher injects
+ * `--name <session>` directly into the immediate parent claude argv.
+ *
+ * Darwin: ONE `ps -o args=,lstart=` fork captures both fields (lstart is
+ * 24-char fixed-width at the end; see `splitArgsLstart`). Linux: read
+ * `/proc/$PPID/stat` field 22 (no fork; `Bun.file` is just an open+read).
+ * Unknown platforms return both fields null.
+ *
+ * The ENTIRE body is wrapped in try/catch returning `{null, null}` because
  * `Bun.spawnSync` THROWS (ENOENT) when `ps` is missing — a bare `success`
  * check is insufficient. `-ww` defeats width truncation; an explicit 500ms
  * timeout means a wedged `ps` can never threaten the hook's exit-0 contract.
- * Only the parsed name is ever returned — the raw `args=` blob (which can carry
- * secrets like `--token=...`) is discarded.
+ * Only the parsed name + opaque start_time string are returned — the raw
+ * `args=` blob (which can carry secrets like `--token=...`) is discarded.
  */
-function spawnNameFromPpid(): string | null {
+async function scrapeSpawnInfo(): Promise<SpawnInfo> {
   try {
-    const result = Bun.spawnSync(
-      ["ps", "-ww", "-p", String(process.ppid), "-o", "args="],
-      { timeout: 500 },
-    );
-    if (!result.success || result.exitCode !== 0) {
-      return null;
+    if (process.platform === "darwin") {
+      // `lstart=,args=` — args MUST come last so macOS ps doesn't truncate it
+      // mid-string (see `splitArgsLstart` for the column-order rationale).
+      const result = Bun.spawnSync(
+        ["ps", "-ww", "-p", String(process.ppid), "-o", "lstart=,args="],
+        { timeout: 500 },
+      );
+      if (!result.success || result.exitCode !== 0) {
+        return { name: null, startTime: null };
+      }
+      const out = result.stdout?.toString() ?? "";
+      const split = splitArgsLstart(out);
+      if (!split) {
+        return { name: null, startTime: null };
+      }
+      return {
+        name: nameFromArgs(split.args),
+        startTime: `darwin:${split.lstart}`,
+      };
     }
-    const out = (result.stdout?.toString() ?? "").trim();
-    return nameFromArgs(out);
+    if (process.platform === "linux") {
+      // Two reads (stat for start_time, cmdline for argv) — both /proc reads
+      // are filesystem-cheap (no fork). `Bun.file().text()` rejects on
+      // missing/unreadable files; the outer try/catch lands those as null.
+      const statText = await Bun.file(`/proc/${process.ppid}/stat`).text();
+      const startTime = parseLinuxStarttime(statText);
+      // /proc/<pid>/cmdline is NUL-separated argv — join on space to feed the
+      // existing `nameFromArgs` matcher.
+      let name: string | null = null;
+      try {
+        const cmdlineRaw = await Bun.file(
+          `/proc/${process.ppid}/cmdline`,
+        ).text();
+        const argv = cmdlineRaw.split("\0").filter((s) => s.length > 0);
+        name = nameFromArgs(argv.join(" "));
+      } catch {
+        // cmdline unreadable but stat succeeded — keep the start_time we have
+      }
+      return {
+        name,
+        startTime: startTime !== null ? `linux:${startTime}` : null,
+      };
+    }
+    return { name: null, startTime: null };
   } catch {
-    return null;
+    return { name: null, startTime: null };
   }
 }
 
@@ -188,12 +315,17 @@ async function main(): Promise<void> {
 
   const subagentAgentId = extractSubagentAgentId(hookEvent, toolName, data);
 
-  // SessionStart only: scrape the parent claude argv `--name`/`-n` so the
-  // reducer can seed `jobs.title` from the very first event. The `ps` fork is
-  // gated here (not run on every hook) to stay inside the cold-start budget;
-  // `spawnNameFromPpid` swallows every failure to null so it can never break
-  // the exit-0 contract.
-  const spawnName = hookEvent === "SessionStart" ? spawnNameFromPpid() : null;
+  // SessionStart only: scrape the parent claude argv `--name`/`-n` AND the
+  // process start_time in a single platform-specific probe, so the reducer can
+  // seed `jobs.title` from the very first event AND store the recycle-safe
+  // `(pid, start_time)` identity used downstream by the seed sweep + exit-
+  // watcher. The probe is gated here (not run on every hook) to stay inside
+  // the cold-start budget; `scrapeSpawnInfo` swallows every failure to
+  // `{null, null}` so it can never break the exit-0 contract.
+  const spawnInfo: SpawnInfo =
+    hookEvent === "SessionStart"
+      ? await scrapeSpawnInfo()
+      : { name: null, startTime: null };
 
   const { db, stmts } = openDb(resolveDbPath());
   try {
@@ -204,8 +336,9 @@ async function main(): Promise<void> {
     // any in-flight writer.
     db.transaction(() => {
       // Named bindings: a missed column on a future ALTER no longer silently
-      // shifts data into the next slot. `start_time` is captured by task 3 on
-      // SessionStart only — null for now, null on every other event by design.
+      // shifts data into the next slot. `start_time` is captured on
+      // SessionStart only as a platform-tagged opaque string — null on every
+      // other event by design.
       stmts.insertEvent.run({
         $ts: ts,
         $session_id: sessionId,
@@ -221,8 +354,8 @@ async function main(): Promise<void> {
         $stop_hook_active: stopHookActive,
         $data: raw,
         $subagent_agent_id: subagentAgentId,
-        $spawn_name: spawnName,
-        $start_time: null,
+        $spawn_name: spawnInfo.name,
+        $start_time: spawnInfo.startTime,
       });
     })();
   } finally {
