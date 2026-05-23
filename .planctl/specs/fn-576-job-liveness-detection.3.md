@@ -34,5 +34,5 @@ Extend the spawn-launcher test to verify both `name` and `start_time` come back 
 - [ ] Hook header comment updated to document (pid, start_time) two-field identity
 
 ## Done summary
-
+SessionStart hook now captures parent process start_time alongside spawn_name: macOS uses one ps fork with lstart-first column order to avoid args truncation; Linux reads /proc/PPID/stat field 22 (no fork). Result stored as platform-tagged opaque string (darwin:<lstart> / linux:<jiffies>). All failure paths return null; hook stays exit-0.
 ## Evidence

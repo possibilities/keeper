@@ -9,6 +9,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
   "title": "Hook capture start_time on SessionStart",
-  "updated_at": "2026-05-23T14:13:04Z"
+  "updated_at": "2026-05-23T14:58:22Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T14:58:22Z"
 }
