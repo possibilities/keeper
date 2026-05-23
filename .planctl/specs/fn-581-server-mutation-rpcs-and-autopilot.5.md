@@ -80,5 +80,5 @@ read-through pass for accuracy.
 - [ ] `bun test` passes with no regressions
 
 ## Done summary
-
+Documented the RPC layer + approvals sidecar across CLAUDE.md and README.md; source-file headers (protocol.ts, collections.ts, db.ts, autopilot.ts) were already aligned in prior tasks and verified consistent.
 ## Evidence
