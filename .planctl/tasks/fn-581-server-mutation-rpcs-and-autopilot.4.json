@@ -9,6 +9,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "Autopilot epic-block rewrite with approval pills",
-  "updated_at": "2026-05-23T18:18:22Z"
+  "updated_at": "2026-05-23T20:35:51Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T20:35:51Z"
 }

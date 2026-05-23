@@ -95,5 +95,5 @@ test in a follow-up task — not in this one.
 - [ ] Manual smoke checklist (in the task spec) confirmed: launch daemon, see pills change in response to `approve.ts` calls within ~50ms
 
 ## Done summary
-
+Rewrote scripts/autopilot.ts: two parallel Bun.connect subscriptions (epics + approvals sidecar) drive a single shared frame; renders newest-first - epic: <epic_id> blocks with nested - <task_id> [<pill>] task lines and a trailing virtual - close:<epic_id> [<pill>] row. Connection plumbing closure-factored into ConnectionWorker; lifecycle notes carry event_source; SIGINT cleanly stops both workers. Smoke-tested live against a running keeperd: render shape + lifecycle channel + non-terminal approvals warn-on-unknown-collection path all behave per spec.
 ## Evidence
