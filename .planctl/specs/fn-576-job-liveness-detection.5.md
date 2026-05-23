@@ -32,5 +32,5 @@ Update existing defaultFilter test to assert against the new shape. Add a test v
 - [ ] Existing explicit `{state:{ne:"ended"}}` queries still resolve
 
 ## Done summary
-
+Tightened JOBS_DESCRIPTOR.defaultFilter to {state:{not_in:["ended","killed"]}} so the default jobs view hides both terminal states. Updated comment block to four-state vocabulary and added a runQuery test verifying default-scoped queries exclude ended AND killed.
 ## Evidence
