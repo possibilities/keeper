@@ -9,6 +9,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "Reducer Killed event and state transitions",
-  "updated_at": "2026-05-23T14:13:04Z"
+  "updated_at": "2026-05-23T14:43:01Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T14:43:01Z"
 }

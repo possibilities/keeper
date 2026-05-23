@@ -40,5 +40,5 @@ Re-fold-from-cursor=0 reproduces identical jobs rows. Test cases: (a) Killed eve
 - [ ] Re-fold from cursor=0 reproduces every test row byte-identically
 
 ## Done summary
-
+Added 'killed' as a terminal-but-revivable jobs state. New Killed switch branch folds synthetic events to state='killed' on a strict (pid, start_time) match or loose pid-only match for legacy rows; safe no-op on every other input. SessionStart now seeds and COALESCEs jobs.start_time and re-opens ended OR killed rows to stopped; Stop/SessionEnd guards extended to ignore both terminal states; drain() pulls events.start_time. 18 new reducer tests cover match/mismatch/legacy/no-row/malformed/revival/terminal-guard/re-fold-determinism paths; full suite 273/273.
 ## Evidence
