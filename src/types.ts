@@ -244,3 +244,41 @@ export interface Task {
    */
   jobs: EmbeddedJob[];
 }
+
+/**
+ * One row of the `approvals` sidecar table (schema v12). Records the most
+ * recent `approve` / `reject` decision for one `(epic_id, task_key)` pair —
+ * the autopilot UI's per-task approval state.
+ *
+ * UNLIKE `Job` / `Epic` / `Task`, this is NOT a reducer projection. There is
+ * no event for an approval; rows arrive via the `set_approval` RPC (Task .3)
+ * over the server-worker's dedicated writer connection. The event-log
+ * re-fold determinism guarantee does NOT extend here: rewinding the cursor
+ * and re-folding does not reproduce `approvals` content. Absent row =
+ * "pending" — no row at scan time means the task has not been approved or
+ * rejected yet, and `clear` is implemented as a `DELETE`.
+ *
+ * Field set:
+ * - `approval_id` — real-column pk, populated by the writer as
+ *   `epic_id || ':' || task_key`. Bare column (not a compound expression in
+ *   `descriptor.pk`) so the `selectByIds` IN-list and the `countAndToken`
+ *   ORDER BY interpolate cleanly.
+ * - `epic_id` / `task_key` — the natural key the UNIQUE(epic_id, task_key)
+ *   constraint guards. `task_key` is opaque text — typically the task id
+ *   (`<epic_id>.<n>`) or the virtual `close:<epic_id>` row used by the
+ *   autopilot's per-epic close-approval pill.
+ * - `status` — CHECK-constrained enum (`approved` / `rejected`); the RPC
+ *   validates at the wire boundary and SQLite catches direct-writer typos.
+ * - `updated_at` — REAL written as `unixepoch('now','subsec')` by the RPC;
+ *   the `APPROVALS_DESCRIPTOR.version` column the diff machinery fires on.
+ *   Sub-microsecond resolution per the SQLite docs — two UPSERTs in the
+ *   same microsecond tying on `version` (and blocking the diff's
+ *   `version > lastSent` test) is vanishingly unlikely.
+ */
+export interface Approval {
+  approval_id: string;
+  epic_id: string;
+  task_key: string;
+  status: "approved" | "rejected";
+  updated_at: number;
+}

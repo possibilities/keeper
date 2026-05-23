@@ -29,7 +29,8 @@ import type { Job } from "../src/types";
  * Boot drain helper for migration tests. Schema v11's rewind-and-redrain
  * sets the cursor to 0 inside migrate; the daemon's boot drain rebuilds the
  * projection AFTER `openDb` returns. Tests that don't spin up the daemon
- * must call this explicitly to observe the re-folded state.
+ * must call this explicitly to observe the re-folded state. (v12 is a
+ * non-rewind sidecar ADD — no drain required for the v11→v12 step.)
  */
 function drainAll(db: import("bun:sqlite").Database): void {
   let n: number;
@@ -66,6 +67,8 @@ test("openDb creates events, jobs, reducer_state, meta tables", () => {
   expect(names.has("tasks")).toBe(false);
   expect(names.has("reducer_state")).toBe(true);
   expect(names.has("meta")).toBe(true);
+  // Schema v12 added the `approvals` sidecar (NOT a reducer projection).
+  expect(names.has("approvals")).toBe(true);
   db.close();
 });
 
@@ -183,7 +186,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("11");
+  expect(row.value).toBe("12");
   db.close();
 });
 
@@ -291,7 +294,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("11");
+  expect(ver.value).toBe("12");
 
   const eventNames = (
     db.prepare("PRAGMA table_info(events)").all() as {
@@ -341,7 +344,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("11");
+  expect(ver2.value).toBe("12");
   db2.close();
 });
 
@@ -394,7 +397,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("11");
+  expect(ver.value).toBe("12");
 
   const jobNames = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
@@ -420,7 +423,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("11");
+  expect(ver2.value).toBe("12");
   db2.close();
 });
 
@@ -455,7 +458,7 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("11");
+  expect(ver.value).toBe("12");
   const names = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
@@ -506,7 +509,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("11");
+  expect(ver.value).toBe("12");
 
   const tables = new Set(
     (
@@ -559,7 +562,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("11");
+  expect(ver2.value).toBe("12");
   db2.close();
 });
 
@@ -618,7 +621,7 @@ test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, tas
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("11");
+  expect(ver.value).toBe("12");
 
   // tasks table is gone (the v6→v7 backfill+DROP runs inside the same
   // transaction, before the v11 rewind clears `epics`).
@@ -738,7 +741,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("11");
+  expect(ver.value).toBe("12");
 
   // Both columns now appear.
   const eventNames = (
@@ -785,7 +788,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("11");
+  expect(ver2.value).toBe("12");
   const eventNames2 = (
     db2.prepare("PRAGMA table_info(events)").all() as { name: string }[]
   ).map((c) => c.name);
@@ -1044,7 +1047,7 @@ test("v9 DB migrates to v10: four columns added + three partial indexes + backfi
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("11");
+  expect(ver.value).toBe("12");
 
   // All four columns appear.
   const eventNames = (
@@ -1122,7 +1125,7 @@ test("v9 DB migrates to v10: four columns added + three partial indexes + backfi
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("11");
+  expect(ver2.value).toBe("12");
   // Re-verify the backfill landed identically on the second open — the
   // guard keeps the values stable.
   const jobsAfter = db2
@@ -1281,14 +1284,16 @@ test("v10 DB migrates to v11: epics.jobs added + rewind-and-redrain rebuilds emb
   v10.close();
 
   // Reopen via openDb — migrate() runs the v10→v11 ALTER (idempotent) plus
-  // the version-guarded rewind-and-redrain. The daemon's boot drain rebuilds
-  // the projection AFTER `openDb` returns; the test stands in for that drain.
+  // the version-guarded rewind-and-redrain, then the v11→v12 ALTER that adds
+  // the `approvals` sidecar; the version stamp jumps straight to v12 (the
+  // current SCHEMA_VERSION). The daemon's boot drain rebuilds the projection
+  // AFTER `openDb` returns; the test stands in for that drain.
   const { db } = openDb(dbPath);
   drainAll(db);
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("11");
+  expect(ver.value).toBe("12");
 
   // epics.jobs column present, with the NOT NULL DEFAULT '[]'.
   const epicCols = db.prepare("PRAGMA table_info(epics)").all() as {
@@ -1334,7 +1339,8 @@ test("v10 DB migrates to v11: epics.jobs added + rewind-and-redrain rebuilds emb
   expect(tasks[0]?.jobs[0]?.plan_verb).toBe("work");
 
   // Second openDb is idempotent — the rewind-and-redrain guard skips the
-  // second time (storedVersion >= 11), so the projection is left intact.
+  // second time (storedVersion >= 11), and the v11→v12 CREATE TABLE
+  // IF NOT EXISTS is naturally idempotent, so the projection is left intact.
   const epicsBefore = db.query("SELECT * FROM epics ORDER BY epic_id").all();
   const jobsBefore = db.query("SELECT * FROM jobs ORDER BY job_id").all();
   db.close();
@@ -1342,13 +1348,186 @@ test("v10 DB migrates to v11: epics.jobs added + rewind-and-redrain rebuilds emb
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("11");
+  expect(ver2.value).toBe("12");
   // No re-drain needed — the guard suppressed the rewind, so the rows
   // persist as-is.
   const epicsAfter = db2.query("SELECT * FROM epics ORDER BY epic_id").all();
   const jobsAfter = db2.query("SELECT * FROM jobs ORDER BY job_id").all();
   expect(epicsAfter).toEqual(epicsBefore);
   expect(jobsAfter).toEqual(jobsBefore);
+  db2.close();
+});
+
+test("v11 DB migrates to v12: approvals sidecar table added with the right shape + constraints + idempotent re-open", () => {
+  // Build a v11-shaped DB by hand: events + jobs + epics at the v11 shape (no
+  // `approvals` table), version '11'. The v11→v12 step is a non-rewind
+  // CREATE TABLE IF NOT EXISTS — pre-existing projection rows must survive.
+  const v11 = new Database(dbPath, { create: true });
+  v11.run(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      session_id TEXT NOT NULL,
+      pid INTEGER,
+      hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      tool_name TEXT,
+      matcher TEXT,
+      cwd TEXT,
+      permission_mode TEXT,
+      agent_id TEXT,
+      agent_type TEXT,
+      stop_hook_active INTEGER,
+      data TEXT NOT NULL,
+      subagent_agent_id TEXT,
+      spawn_name TEXT,
+      start_time TEXT,
+      slash_command TEXT,
+      skill_name TEXT
+    )
+  `);
+  v11.run(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_source TEXT,
+      transcript_path TEXT,
+      start_time TEXT,
+      plan_verb TEXT,
+      plan_ref TEXT
+    )
+  `);
+  v11.run(`
+    CREATE TABLE epics (
+      epic_id TEXT PRIMARY KEY,
+      epic_number INTEGER,
+      title TEXT,
+      project_dir TEXT,
+      status TEXT,
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL DEFAULT 0,
+      tasks TEXT NOT NULL DEFAULT '[]',
+      depends_on_epics TEXT NOT NULL DEFAULT '[]',
+      jobs TEXT NOT NULL DEFAULT '[]'
+    )
+  `);
+  v11.run(`
+    CREATE TABLE reducer_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_event_id INTEGER NOT NULL DEFAULT 0,
+      updated_at REAL NOT NULL
+    )
+  `);
+  v11.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v11.run("INSERT INTO meta (key, value) VALUES ('schema_version', '11')");
+  v11.run(
+    "INSERT INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 42, 1)",
+  );
+  // Seed a pre-existing projection row so we can prove the v11→v12 ADD does
+  // NOT clobber it (the v11→v12 step is a non-rewind CREATE TABLE IF NOT
+  // EXISTS — sibling tables stay intact).
+  v11
+    .prepare(
+      "INSERT INTO epics (epic_id, epic_number, title, status, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .run("fn-1-foo", 1, "Foo", "open", 7, 1);
+  v11.close();
+
+  // Reopen via openDb — migrate() runs the v11→v12 CREATE TABLE
+  // IF NOT EXISTS and stamps the new version. No drain needed (v11→v12 is a
+  // non-rewind sidecar ADD).
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("12");
+
+  // approvals table exists; PRAGMA table_info reflects the exact column shape
+  // (approval_id PK, epic_id NOT NULL, task_key NOT NULL, status NOT NULL,
+  // updated_at NOT NULL).
+  const cols = db.prepare("PRAGMA table_info(approvals)").all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    pk: number;
+  }[];
+  const byName = new Map(cols.map((c) => [c.name, c]));
+  expect(byName.size).toBe(5);
+  expect(byName.get("approval_id")?.type).toBe("TEXT");
+  expect(byName.get("approval_id")?.pk).toBe(1);
+  expect(byName.get("epic_id")?.type).toBe("TEXT");
+  expect(byName.get("epic_id")?.notnull).toBe(1);
+  expect(byName.get("task_key")?.type).toBe("TEXT");
+  expect(byName.get("task_key")?.notnull).toBe(1);
+  expect(byName.get("status")?.type).toBe("TEXT");
+  expect(byName.get("status")?.notnull).toBe(1);
+  expect(byName.get("updated_at")?.type).toBe("REAL");
+  expect(byName.get("updated_at")?.notnull).toBe(1);
+
+  // CHECK and UNIQUE present on the persisted DDL.
+  const ddl = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
+    )
+    .get() as { sql: string };
+  expect(ddl.sql).toContain("CHECK(status IN ('approved', 'rejected'))");
+  expect(ddl.sql).toContain("UNIQUE(epic_id, task_key)");
+
+  // Pre-existing projection rows survived the migration intact.
+  const epic = db
+    .prepare("SELECT title, status, last_event_id FROM epics WHERE epic_id = ?")
+    .get("fn-1-foo") as {
+    title: string;
+    status: string;
+    last_event_id: number;
+  };
+  expect(epic.title).toBe("Foo");
+  expect(epic.status).toBe("open");
+  expect(epic.last_event_id).toBe(7);
+
+  // CHECK constraint rejects an out-of-enum status via direct INSERT.
+  expect(() =>
+    db
+      .prepare(
+        "INSERT INTO approvals (approval_id, epic_id, task_key, status, updated_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run("fn-1-foo:.1", "fn-1-foo", ".1", "invalid", 0),
+  ).toThrow();
+
+  // UNIQUE(epic_id, task_key) rejects a duplicate natural key even with a
+  // distinct `approval_id`.
+  db.prepare(
+    "INSERT INTO approvals (approval_id, epic_id, task_key, status, updated_at) VALUES (?, ?, ?, ?, ?)",
+  ).run("fn-1-foo:.1", "fn-1-foo", ".1", "approved", 1);
+  expect(() =>
+    db
+      .prepare(
+        "INSERT INTO approvals (approval_id, epic_id, task_key, status, updated_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run("other-id", "fn-1-foo", ".1", "rejected", 2),
+  ).toThrow();
+
+  // Second openDb is idempotent — CREATE TABLE IF NOT EXISTS no-ops, version
+  // stays at v12, the seeded approval row persists as-is.
+  const approvalsBefore = db
+    .query("SELECT * FROM approvals ORDER BY approval_id")
+    .all();
+  db.close();
+  const { db: db2 } = openDb(dbPath);
+  const ver2 = db2
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver2.value).toBe("12");
+  const approvalsAfter = db2
+    .query("SELECT * FROM approvals ORDER BY approval_id")
+    .all();
+  expect(approvalsAfter).toEqual(approvalsBefore);
   db2.close();
 });
 

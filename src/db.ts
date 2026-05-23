@@ -1,6 +1,8 @@
 /**
  * Keeper SQLite layer. Owns:
- * - Schema bootstrap for `events`, `jobs`, `epics`, `reducer_state`, `meta`.
+ * - Schema bootstrap for `events`, `jobs`, `epics`, `reducer_state`, `meta`,
+ *   and the `approvals` sidecar (schema v12 — NOT a reducer projection; the
+ *   event-log re-fold determinism guarantee does not touch it, by design).
  *   (As of schema v7 each epic embeds its tasks as a JSON-array `epics.tasks`
  *   column; the standalone `tasks` table was dropped.)
  * - Connection-local PRAGMAs (WAL, busy_timeout, foreign_keys, synchronous,
@@ -31,7 +33,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -314,6 +316,41 @@ CREATE TABLE IF NOT EXISTS meta (
 `;
 
 /**
+ * The `approvals` sidecar table (schema v12). Per-task approval state for the
+ * autopilot UI — a row records the most recent `approve`/`reject` decision for
+ * one `(epic_id, task_key)` pair. Absent row = "pending"; this avoids
+ * backfilling a row per task at scan time and makes `clear` a trivially-safe
+ * DELETE.
+ *
+ * `approval_id` is the real-column pk, populated by the writer (the future
+ * `set_approval` RPC, Task .3) as `epic_id || ':' || task_key`. Keeping it a
+ * bare column (not a compound expression interpolated through
+ * `descriptor.pk`) honors the `src/collections.ts` injection invariant and
+ * avoids the `WHERE epic_id || ':' || task_key IN (?,?,?)` pessimization on
+ * `selectByIds`.
+ *
+ * `status` is a CHECK-constrained enum (`approved` / `rejected`) — defense in
+ * depth alongside the RPC handler's wire-boundary validation. `updated_at` is
+ * a REAL written as `unixepoch('now','subsec')` (sub-microsecond resolution
+ * per the SQLite docs); the descriptor uses it as `version` so the diff
+ * machinery fires on every UPSERT.
+ *
+ * This is NOT a reducer projection — the event-log re-fold determinism
+ * guarantee does NOT extend to `approvals`. A fresh DB starts with the table
+ * empty; rows arrive via the `set_approval` RPC writer connection.
+ */
+const CREATE_APPROVALS = `
+CREATE TABLE IF NOT EXISTS approvals (
+    approval_id TEXT PRIMARY KEY,
+    epic_id TEXT NOT NULL,
+    task_key TEXT NOT NULL,
+    status TEXT CHECK(status IN ('approved', 'rejected')) NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(epic_id, task_key)
+)
+`;
+
+/**
  * Prepared statements kept pre-bound on the hot paths. Keep these tiny — the
  * hook runs once per Claude Code event and cold-start latency is part of the
  * SessionEnd 1.5s timeout budget.
@@ -420,6 +457,7 @@ function migrate(db: Database): void {
     db.run(CREATE_EPICS);
     db.run(CREATE_REDUCER_STATE);
     db.run(CREATE_META);
+    db.run(CREATE_APPROVALS);
 
     // Seed singleton cursor on first boot. Subsequent boots are no-ops.
     db.run(
@@ -733,6 +771,16 @@ function migrate(db: Database): void {
       db.run("DELETE FROM jobs");
       db.run("DELETE FROM epics");
     }
+
+    // v11→v12: add the `approvals` sidecar table (created above via
+    // CREATE TABLE IF NOT EXISTS, naturally idempotent and forward-only).
+    // No ALTER, no backfill — the table starts empty and the future
+    // `set_approval` RPC fills it; the empty-table bootstrap matches the
+    // zero-approval reading (absent row = "pending"). UNLIKE every step
+    // above, `approvals` is NOT a reducer projection: the event-log re-fold
+    // determinism guarantee does NOT touch it, by design. A v11 DB gains
+    // the empty table on first open with all prior `jobs`/`epics`/`events`
+    // rows intact.
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
