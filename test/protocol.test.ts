@@ -8,6 +8,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   type ClientFrame,
+  type ErrorFrame,
   encodeFrame,
   extractLines,
   LineBuffer,
@@ -17,6 +18,8 @@ import {
   type PatchFrame,
   type ResultFrame,
   type Row,
+  type RpcFrame,
+  type RpcResultFrame,
 } from "../src/protocol";
 
 // A `jobs` row as a generic served `Row`. The protocol layer is row-shape
@@ -91,6 +94,72 @@ describe("encodeFrame", () => {
     expect(parsed).toEqual(frame);
     expect(parsed.type).toBe("meta");
     expect(parsed.total).toBe(12);
+  });
+
+  test("round-trips an rpc frame with id + method + params", () => {
+    const frame: RpcFrame = {
+      type: "rpc",
+      id: "r1",
+      method: "set_approval",
+      params: { epic_id: "fn-1", task_key: "fn-1.2", status: "approved" },
+    };
+    const line = encodeFrame(frame).slice(0, -1);
+    const parsed = JSON.parse(line) as RpcFrame;
+    expect(parsed).toEqual(frame);
+    expect(parsed.id).toBe("r1");
+    expect(parsed.method).toBe("set_approval");
+  });
+
+  test("round-trips an rpc frame with no params", () => {
+    const frame: RpcFrame = {
+      type: "rpc",
+      id: "r2",
+      method: "noop",
+    };
+    const line = encodeFrame(frame).slice(0, -1);
+    expect(JSON.parse(line)).toEqual(frame);
+  });
+
+  test("round-trips an rpc_result frame with id + rev + value", () => {
+    const frame: RpcResultFrame = {
+      type: "rpc_result",
+      id: "r1",
+      rev: 17,
+      value: { ok: true, written: 1 },
+    };
+    const line = encodeFrame(frame).slice(0, -1);
+    const parsed = JSON.parse(line) as RpcResultFrame;
+    expect(parsed).toEqual(frame);
+    expect(parsed.id).toBe("r1");
+    expect(parsed.rev).toBe(17);
+  });
+
+  test("round-trips an rpc_result frame with a null value", () => {
+    const frame: RpcResultFrame = {
+      type: "rpc_result",
+      id: "r3",
+      rev: 0,
+      value: null,
+    };
+    const line = encodeFrame(frame).slice(0, -1);
+    expect(JSON.parse(line)).toEqual(frame);
+  });
+
+  test("round-trips an error frame for rpc failure codes", () => {
+    for (const code of ["unknown_method", "bad_params", "rpc_failed"]) {
+      const frame: ErrorFrame = {
+        type: "error",
+        id: "r1",
+        rev: 5,
+        code,
+        message: `rpc error: ${code}`,
+      };
+      const line = encodeFrame(frame).slice(0, -1);
+      const parsed = JSON.parse(line) as ErrorFrame;
+      expect(parsed).toEqual(frame);
+      expect(parsed.code).toBe(code);
+      expect(parsed.id).toBe("r1");
+    }
   });
 });
 

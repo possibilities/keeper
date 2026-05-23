@@ -36,20 +36,25 @@ import type {
   MetaFrame,
   PatchFrame,
   ResultFrame,
+  RpcResultFrame,
   ServerFrame,
 } from "../src/protocol";
 import {
   acquireLock,
+  BadParamsError,
   type ConnState,
   diffTick,
   dispatchLine,
   isPidAlive,
   LockHeldError,
   pollLoop,
+  RPC_REGISTRY,
+  registerRpc,
   resolveFilter,
   resumePending,
   runQuery,
   startServer,
+  unregisterRpc,
   type Writable,
   writeFrames,
 } from "../src/server-worker";
@@ -617,6 +622,263 @@ test("dispatchLine ignores a blank line", () => {
   const conn = newConn();
   expect(dispatchLine(db, conn, "   ")).toHaveLength(0);
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// rpc dispatch
+// ---------------------------------------------------------------------------
+
+/**
+ * Register a temporary RPC handler scoped to one test. Returns a teardown the
+ * test calls inside its own try/finally — beforeEach/afterEach are not
+ * granular enough since each test installs a different handler.
+ */
+function withRpc(
+  method: string,
+  handler: (db: Database, params: unknown) => unknown,
+): () => void {
+  registerRpc(method, handler);
+  return () => unregisterRpc(method);
+}
+
+test("RPC_REGISTRY is empty by default", () => {
+  expect(RPC_REGISTRY.size).toBe(0);
+});
+
+test("dispatchLine rpc → rpc_result on a registered handler (echoes id, returns handler value)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const teardown = withRpc("noop", () => ({ ok: true }));
+  try {
+    const conn = newConn();
+    const frames = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "noop" }),
+      db, // pass the writer (here, same DB) for the handler
+    );
+    expect(frames).toHaveLength(1);
+    expect(frames[0].type).toBe("rpc_result");
+    const result = frames[0] as RpcResultFrame;
+    expect(result.id).toBe("r1");
+    expect(result.value).toEqual({ ok: true });
+    expect(typeof result.rev).toBe("number");
+  } finally {
+    teardown();
+    db.close();
+  }
+});
+
+test("dispatchLine rpc handler receives the writer connection and params", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const seen: { db: Database | null; params: unknown } = {
+    db: null,
+    params: "untouched",
+  };
+  const teardown = withRpc("inspect", (handlerDb, params) => {
+    seen.db = handlerDb;
+    seen.params = params;
+    return null;
+  });
+  try {
+    const conn = newConn();
+    dispatchLine(
+      db,
+      conn,
+      JSON.stringify({
+        type: "rpc",
+        id: "r1",
+        method: "inspect",
+        params: { foo: 1, bar: "baz" },
+      }),
+      db,
+    );
+    expect(seen.db).toBe(db);
+    expect(seen.params).toEqual({ foo: 1, bar: "baz" });
+  } finally {
+    teardown();
+    db.close();
+  }
+});
+
+test("dispatchLine rpc → writer connection can INSERT and reader sees the row", () => {
+  const { db: reader } = openDb(dbPath, { readonly: true });
+  const { db: writer } = openDb(dbPath, { readonly: false });
+  const teardown = withRpc("write_marker", (handlerDb) => {
+    handlerDb.run(
+      "INSERT INTO meta (key, value) VALUES ('test_rpc_marker', 'ok') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    );
+    return { wrote: 1 };
+  });
+  try {
+    const conn = newConn();
+    const frames = dispatchLine(
+      reader,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "write_marker" }),
+      writer,
+    );
+    expect(frames).toHaveLength(1);
+    expect(frames[0].type).toBe("rpc_result");
+    // The reader (a distinct connection) sees the writer's commit.
+    const row = reader
+      .prepare("SELECT value FROM meta WHERE key = 'test_rpc_marker'")
+      .get() as { value: string } | null;
+    expect(row?.value).toBe("ok");
+  } finally {
+    teardown();
+    reader.close();
+    writer.close();
+  }
+});
+
+test("dispatchLine rpc with no registered method → unknown_method (echoes id)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const conn = newConn();
+  const frames = dispatchLine(
+    db,
+    conn,
+    JSON.stringify({ type: "rpc", id: "r1", method: "no_such_method" }),
+    db,
+  );
+  expect(frames).toHaveLength(1);
+  expect(frames[0].type).toBe("error");
+  const err = frames[0] as ErrorFrame;
+  expect(err.code).toBe("unknown_method");
+  expect(err.id).toBe("r1");
+  db.close();
+});
+
+test("dispatchLine rpc handler throw → rpc_failed (echoes id, connection survives)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const teardown = withRpc("boom", () => {
+    throw new Error("kaboom");
+  });
+  try {
+    const conn = newConn();
+    const frames = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "boom" }),
+      db,
+    );
+    expect(frames).toHaveLength(1);
+    expect(frames[0].type).toBe("error");
+    const err = frames[0] as ErrorFrame;
+    expect(err.code).toBe("rpc_failed");
+    expect(err.id).toBe("r1");
+    expect(err.message).toContain("kaboom");
+
+    // Connection survives: a follow-up query on the same conn works.
+    seedJob(db, "a");
+    const ok = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "query", collection: "jobs" }),
+    );
+    expect(ok[0].type).toBe("result");
+  } finally {
+    teardown();
+    db.close();
+  }
+});
+
+test("dispatchLine rpc handler throwing BadParamsError → bad_params (distinct from rpc_failed)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const teardown = withRpc("strict", () => {
+    throw new BadParamsError("expected `status` of approve|reject|clear");
+  });
+  try {
+    const conn = newConn();
+    const frames = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "strict", params: {} }),
+      db,
+    );
+    expect(frames).toHaveLength(1);
+    expect(frames[0].type).toBe("error");
+    const err = frames[0] as ErrorFrame;
+    expect(err.code).toBe("bad_params");
+    expect(err.id).toBe("r1");
+    expect(err.message).toContain("approve|reject|clear");
+  } finally {
+    teardown();
+    db.close();
+  }
+});
+
+test("dispatchLine rpc missing id → bad_frame (no id echoed)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const conn = newConn();
+  for (const bad of [
+    JSON.stringify({ type: "rpc", method: "noop" }), // absent id
+    JSON.stringify({ type: "rpc", id: "", method: "noop" }), // empty id
+    JSON.stringify({ type: "rpc", id: 42, method: "noop" }), // non-string id
+  ]) {
+    const frames = dispatchLine(db, conn, bad, db);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].type).toBe("error");
+    expect((frames[0] as ErrorFrame).code).toBe("bad_frame");
+    // No id was usable to echo back.
+    expect((frames[0] as ErrorFrame).id).toBeUndefined();
+  }
+  db.close();
+});
+
+test("dispatchLine rpc missing method → bad_frame (echoes id)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const conn = newConn();
+  for (const bad of [
+    JSON.stringify({ type: "rpc", id: "r1" }), // absent method
+    JSON.stringify({ type: "rpc", id: "r1", method: "" }), // empty method
+    JSON.stringify({ type: "rpc", id: "r1", method: 42 }), // non-string method
+  ]) {
+    const frames = dispatchLine(db, conn, bad, db);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].type).toBe("error");
+    expect((frames[0] as ErrorFrame).code).toBe("bad_frame");
+    expect((frames[0] as ErrorFrame).id).toBe("r1");
+  }
+  db.close();
+});
+
+test("dispatchLine rpc preserves an existing subscription (rpc does not touch ConnState)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const teardown = withRpc("noop", () => null);
+  try {
+    seedJob(db, "a", { last_event_id: 5 });
+    const conn = newConn();
+    dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "query", collection: "jobs" }),
+    );
+    expect(conn.collection).toBe("jobs");
+    expect(conn.watched.has("a")).toBe(true);
+
+    // An RPC in the middle of a live subscription must NOT touch ConnState.
+    dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "noop" }),
+      db,
+    );
+    expect(conn.collection).toBe("jobs");
+    expect(conn.watched.has("a")).toBe(true);
+    expect(conn.lastSent.get("a")).toBe(5);
+  } finally {
+    teardown();
+    db.close();
+  }
+});
+
+test("registerRpc throws on duplicate method", () => {
+  const teardown = withRpc("dup", () => null);
+  try {
+    expect(() => registerRpc("dup", () => null)).toThrow(/already registered/);
+  } finally {
+    teardown();
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -14,11 +14,21 @@
  * filtered-set `total` or membership token moved (a row entered/left the set) —
  * a count/staleness signal, NOT a live membership stream (the page stays frozen).
  *
+ * The RPC layer landed alongside: an `rpc` request frame routes through the
+ * process-global `RPC_REGISTRY` and runs the handler against a dedicated WRITER
+ * connection (opened next to the existing reader in `main()`). The registry is
+ * EMPTY by default in this task — Task .3 of epic
+ * `fn-581-server-mutation-rpcs-and-autopilot` registers the first concrete
+ * handler (`set_approval`). The two-connection split is load-bearing: the
+ * reader's `data_version` poll only sees writes from OTHER connections, so the
+ * RPC writer must be distinct from the poll reader.
+ *
  * Conventions mirror `src/wake-worker.ts`:
  * - `isMainThread`-guarded body — a plain `import` from a test is inert.
- * - Own read-only `openDb(path, { readonly: true })` (handles are thread-affine
- *   and not structured-cloneable; the parent hands us only the path string via
- *   `workerData`).
+ * - Own read-only `openDb(path, { readonly: true })` PLUS a writer-mode
+ *   `openDb(path)` (handles are thread-affine and not structured-cloneable;
+ *   the parent hands us only the path string via `workerData`). Both go
+ *   through `applyPragmas` and both release in the shutdown handler.
  * - Typed message protocol: `{ kind: ... }` worker→main, `{ type: "shutdown" }`
  *   main→worker. Exit `0` clean / `1` crash. NO in-process self-heal — any
  *   unrecoverable error is `process.exit(1)` and the LaunchAgent restarts.
@@ -65,6 +75,8 @@ import {
   type PatchFrame,
   type QueryFrame,
   type ResultFrame,
+  type RpcFrame,
+  type RpcResultFrame,
   type ServerFrame,
 } from "./protocol";
 
@@ -467,6 +479,69 @@ function clampLimit(limit: number | undefined): number {
 }
 
 // ---------------------------------------------------------------------------
+// RPC registry
+// ---------------------------------------------------------------------------
+
+/**
+ * Handler signature for a registered RPC. Invoked with the server-worker's
+ * WRITER connection (so a handler may mutate sidecar tables) and the request
+ * frame's `params` (opaque object; handlers MUST validate shape and throw a
+ * `BadParamsError` on mismatch). The return value is framed as
+ * `rpc_result.value` — shape is per-handler, opaque to the dispatch shell.
+ *
+ * Contract: a handler MAY throw. The dispatcher catches and frames the throw
+ * as an `error` frame with code `rpc_failed` (or `bad_params` for the typed
+ * `BadParamsError`). It MUST NOT call `db.close()` and MUST NOT keep
+ * connection state across invocations.
+ */
+export type RpcHandler = (db: Database, params: unknown) => unknown;
+
+/**
+ * A typed error a handler may throw when its `params` are malformed; the
+ * dispatcher catches it and frames an `error` with code `bad_params`,
+ * preserving the message. Distinct from a plain throw so the wire `code`
+ * reflects the difference between "you sent garbage" and "we crashed".
+ */
+export class BadParamsError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BadParamsError";
+  }
+}
+
+/**
+ * The RPC dispatch registry: method name → handler. EMPTY by default in this
+ * task — concrete handlers (e.g. `set_approval` from epic Task .3) register
+ * via `registerRpc` from their own modules. The registry is process-global,
+ * matching the writer connection's process-global ownership in the
+ * server-worker.
+ *
+ * Tests register temporary handlers via `registerRpc` + `unregisterRpc`
+ * (the latter is test-only — there is no runtime un-registration path).
+ */
+export const RPC_REGISTRY: Map<string, RpcHandler> = new Map();
+
+/**
+ * Register an RPC handler. Throws if `method` is already registered — a
+ * collision is a programming error, not a runtime condition the dispatcher
+ * should silently paper over.
+ */
+export function registerRpc(method: string, handler: RpcHandler): void {
+  if (RPC_REGISTRY.has(method)) {
+    throw new Error(`RPC method already registered: ${method}`);
+  }
+  RPC_REGISTRY.set(method, handler);
+}
+
+/**
+ * Remove a handler. Intended for tests that register a temporary handler and
+ * tear it down after; production registrations are install-once.
+ */
+export function unregisterRpc(method: string): void {
+  RPC_REGISTRY.delete(method);
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -477,11 +552,19 @@ function clampLimit(limit: number | undefined): number {
  * connection stays open. Each line is parsed in its own try/catch by the
  * caller too, but we keep the contract here so the unit layer can call this
  * directly.
+ *
+ * RPC dispatch: an `rpc` frame routes through `RPC_REGISTRY`. The dispatcher
+ * runs the handler under the WRITER `db` connection (passed via `writerDb`
+ * when present; falls back to the reader `db` only for read-only test wiring).
+ * Every RPC failure path returns an `error` frame, never throws —
+ * `unknown_method` on missing handler, `bad_params` on a typed
+ * `BadParamsError` throw, `rpc_failed` on any other throw.
  */
 export function dispatchLine(
   db: Database,
   conn: ConnState,
   line: string,
+  writerDb?: Database,
 ): ServerFrame[] {
   if (line.trim().length === 0) {
     return []; // blank keep-alive line — ignore
@@ -558,6 +641,9 @@ export function dispatchLine(
       conn.lastToken = null;
       return [];
     }
+    case "rpc": {
+      return dispatchRpc(db, frame as RpcFrame, writerDb);
+    }
     default: {
       const t = (frame as { type?: unknown }).type;
       return [
@@ -570,6 +656,85 @@ export function dispatchLine(
       ];
     }
   }
+}
+
+/**
+ * Dispatch a single RPC frame. Validates shape (`id` and `method` must be
+ * non-empty strings — else `bad_frame`, echoing the request id when present),
+ * looks up the method (`unknown_method` on miss), invokes the handler with
+ * the writer connection inside try/catch, and frames the return as
+ * `rpc_result` (or `error` with code `bad_params` / `rpc_failed` on throw).
+ *
+ * The `id` is echoed on every response frame so a client multiplexing
+ * in-flight RPCs can correlate by id alone. The `rev` on `rpc_result` / `error`
+ * is the world-rev at frame-construction time — handlers that wrote to the
+ * DB will see `rev` reflect their commit on the SAME reader connection used
+ * for `rev` reads (the writer commit bumps `data_version`, which the reader
+ * picks up on its next prepared-statement execution).
+ */
+function dispatchRpc(
+  db: Database,
+  frame: RpcFrame,
+  writerDb: Database | undefined,
+): ServerFrame[] {
+  // `id` must be a non-empty string — without it the client can't correlate
+  // the response, and we won't echo `undefined` to paper over the omission.
+  const rawId = (frame as { id?: unknown }).id;
+  const id = typeof rawId === "string" && rawId.length > 0 ? rawId : undefined;
+
+  if (id === undefined) {
+    return [
+      errorFrame(db, "bad_frame", "rpc frame missing non-empty string `id`"),
+    ];
+  }
+
+  if (typeof frame.method !== "string" || frame.method.length === 0) {
+    return [
+      errorFrame(
+        db,
+        "bad_frame",
+        "rpc frame missing non-empty string `method`",
+        id,
+      ),
+    ];
+  }
+
+  const handler = RPC_REGISTRY.get(frame.method);
+  if (!handler) {
+    return [
+      errorFrame(
+        db,
+        "unknown_method",
+        `no such rpc method: ${frame.method}`,
+        id,
+      ),
+    ];
+  }
+
+  // Run the handler against the WRITER connection — the server's reader is
+  // read-only and will reject INSERTs. Tests may pass `writerDb === undefined`
+  // for read-only handlers (in which case we hand the handler the reader,
+  // which is enough for a no-op).
+  const handlerDb = writerDb ?? db;
+
+  let value: unknown;
+  try {
+    value = handler(handlerDb, frame.params);
+  } catch (err) {
+    if (err instanceof BadParamsError) {
+      return [errorFrame(db, "bad_params", err.message, id)];
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return [errorFrame(db, "rpc_failed", message, id)];
+  }
+
+  const result: RpcResultFrame = {
+    type: "rpc_result",
+    id,
+    rev: readWorldRev(db),
+    value,
+  };
+  return [result];
 }
 
 function errorFrame(
@@ -931,6 +1096,15 @@ export interface RunningServer {
  * dispatch handlers. Returns a `RunningServer`. The caller owns calling
  * `stop()` on shutdown (the worker `main` and tests both do).
  *
+ * Two DB connections cross in here: `db` is the read-only reader (powers
+ * `query` / `result` / `patch` / `meta` and `data_version` polling — MUST
+ * stay autocommit per the pollLoop contract). `writerDb` is the writer-mode
+ * connection RPC handlers write through; the reader's `data_version` poll
+ * sees the writer's commits because the two are distinct connections (a same-
+ * connection write does not bump `data_version`). The lifetime of both
+ * connections belongs to the caller (`main()` opens and closes them); this
+ * function only forwards `writerDb` into the dispatch path.
+ *
  * Throws `LockHeldError` if a live instance owns the lock — the caller exits
  * non-zero.
  */
@@ -938,6 +1112,7 @@ export function startServer(
   db: Database,
   sockPath: string,
   lockPath: string,
+  writerDb?: Database,
 ): RunningServer {
   acquireLock(lockPath, sockPath);
 
@@ -958,7 +1133,7 @@ export function startServer(
         conns.add(socket as unknown as Writable);
       },
       data(socket, chunk) {
-        handleData(db, socket, chunk);
+        handleData(db, socket, chunk, writerDb);
       },
       drain(socket) {
         resumePending(socket as unknown as Writable);
@@ -1016,6 +1191,7 @@ function handleData(
   db: Database,
   socket: import("bun").Socket<ConnState>,
   chunk: Buffer,
+  writerDb?: Database,
 ): void {
   const w = socket as unknown as Writable;
   let lines: string[];
@@ -1040,7 +1216,7 @@ function handleData(
   for (const line of lines) {
     let frames: ServerFrame[];
     try {
-      frames = dispatchLine(db, socket.data, line);
+      frames = dispatchLine(db, socket.data, line, writerDb);
     } catch (err) {
       // Defensive: dispatchLine is contracted not to throw, but a DB hiccup
       // mid-query shouldn't kill the connection.
@@ -1080,17 +1256,33 @@ function main(): void {
   const sockPath = data.sockPath ?? resolveSockPath();
   const lockPath = data.lockPath ?? `${sockPath}.lock`;
 
+  // Two connections per worker:
+  //   - `db` (read-only): backs `query` / `result` / `patch` / `meta` and the
+  //     `data_version` poll loop. MUST stay autocommit — a `BEGIN` here freezes
+  //     `data_version` for the connection and the poll goes blind.
+  //   - `writerDb` (writer mode): the RPC handler write surface. Distinct
+  //     connection so the reader's `data_version` poll sees the writer's
+  //     commits (a same-connection write does not bump the counter). Goes
+  //     through `applyPragmas` like every keeper open (`busy_timeout=5000`
+  //     etc), so RPC writes block politely on hook + reducer + planctl-files
+  //     writers instead of erroring `SQLITE_BUSY`.
   const { db } = openDb(data.dbPath, { readonly: true });
+  const { db: writerDb } = openDb(data.dbPath);
 
   let server: RunningServer;
   try {
-    server = startServer(db, sockPath, lockPath);
+    server = startServer(db, sockPath, lockPath, writerDb);
   } catch (err) {
     // Lock held by a live instance, or bind failed. No self-heal — exit
     // non-zero; launchd backs off and the live owner keeps serving.
     console.error("[server-worker] failed to start:", err);
     try {
       db.close();
+    } catch {
+      // ignore
+    }
+    try {
+      writerDb.close();
     } catch {
       // ignore
     }
@@ -1104,6 +1296,11 @@ function main(): void {
     server.stop();
     try {
       db.close();
+    } catch {
+      // best-effort; exiting either way
+    }
+    try {
+      writerDb.close();
     } catch {
       // best-effort; exiting either way
     }

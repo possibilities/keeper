@@ -17,6 +17,11 @@
  *                 the server picks sensible defaults.
  * - `unsubscribe` — drop the active subscription for this connection (or the
  *                   specific query `id`); the server stops emitting patches.
+ * - `rpc`        — call a registered server-side handler that may mutate the
+ *                  DB through the server-worker's writer connection. `id` is
+ *                  required (echoed on the `rpc_result` / `error` response);
+ *                  `method` names a handler in the server's RPC registry;
+ *                  `params` is an optional opaque object the handler validates.
  *
  * Server → client:
  * - `result` — the snapshot page (rows in order) plus the world-rev at query
@@ -36,9 +41,14 @@
  *              but NOT the changed rows — it's a "set changed, refresh" nudge,
  *              not a live membership stream (frozen membership is unchanged).
  *              Echoes the `collection`.
+ * - `rpc_result` — response to a successful `rpc` call. Echoes the request's
+ *                  `id` for correlation; `value` is the handler's return,
+ *                  shaped by the handler (opaque to the framing layer).
  * - `error`  — protocol or query error. `code` is a short tag; `message` is
  *              human-readable. `collection` is echoed when attributable to a
- *              named collection (e.g. `unknown_collection`).
+ *              named collection (e.g. `unknown_collection`). For an `rpc`
+ *              failure, `id` echoes the request id and `code` is one of
+ *              `unknown_method` / `bad_params` / `rpc_failed`.
  *
  * Collections: every frame names a `collection` (resolved against the registry
  * in `src/collections.ts`); `jobs` is the first/default. Rows are generic
@@ -174,14 +184,52 @@ export interface MetaFrame {
 }
 
 /**
+ * Client → server: invoke a registered RPC handler. The server looks up
+ * `method` in its RPC registry; a missing entry yields an `error` frame with
+ * code `unknown_method`. `id` is REQUIRED (echoed on the matching
+ * `rpc_result` / `error`); `params` is an opaque object the handler is
+ * responsible for validating (a shape mismatch is conventionally a `bad_params`
+ * error from the handler).
+ *
+ * RPC handlers may write the DB through the server-worker's dedicated writer
+ * connection — the read-only subscribe surface (`query` / `unsubscribe`) is
+ * unchanged.
+ */
+export interface RpcFrame {
+  type: "rpc";
+  id: string;
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+/**
+ * Server → client: response to a successful `rpc`. `id` echoes the request
+ * for correlation; `value` is the handler's return (shape per-handler, opaque
+ * to the framing layer).
+ */
+export interface RpcResultFrame {
+  type: "rpc_result";
+  id: string;
+  rev: number;
+  value: unknown;
+}
+
+/**
  * Server → client: protocol or query error. `code` is a short stable tag:
  * - `"bad_frame"` — malformed/unparseable frame, or a `query` whose
- *   `collection` is absent / empty / non-string.
+ *   `collection` is absent / empty / non-string, or an `rpc` missing a
+ *   non-empty string `id` / `method`.
  * - `"unknown_collection"` — a well-formed `query` naming a collection with no
  *   registered descriptor; carries `collection` and leaves any existing
  *   subscription intact.
  * - `"oversized_line"` — a line exceeded the NDJSON cap (connection closes).
  * - `"unknown_type"` — an unsupported frame `type`.
+ * - `"unknown_method"` — a well-formed `rpc` naming a method with no
+ *   registered handler. Carries the request `id`.
+ * - `"bad_params"` — an `rpc` handler rejected its `params` shape. Carries the
+ *   request `id`. (Emitted from inside a handler, not the dispatch shell.)
+ * - `"rpc_failed"` — an `rpc` handler threw. The thrown message is carried in
+ *   `message`; the connection stays open. Carries the request `id`.
  *
  * `id` is set when the error is attributable to a specific client frame;
  * `collection` is set when attributable to a named collection.
@@ -196,10 +244,15 @@ export interface ErrorFrame {
 }
 
 /** Discriminated union of frames a client may send. */
-export type ClientFrame = QueryFrame | UnsubscribeFrame;
+export type ClientFrame = QueryFrame | UnsubscribeFrame | RpcFrame;
 
 /** Discriminated union of frames the server may send. */
-export type ServerFrame = ResultFrame | PatchFrame | MetaFrame | ErrorFrame;
+export type ServerFrame =
+  | ResultFrame
+  | PatchFrame
+  | MetaFrame
+  | RpcResultFrame
+  | ErrorFrame;
 
 /** Any NDJSON frame (either direction). */
 export type Frame = ClientFrame | ServerFrame;
