@@ -86,5 +86,5 @@ and validation-first.
 - [ ] `bun test` passes; manual `bun scripts/approve.ts <epic> <task> approve` against a running daemon writes the expected row
 
 ## Done summary
-
+Landed set_approval RPC handler in new src/rpc-handlers.ts module (UPSERT/DELETE on the approvals sidecar, BEGIN IMMEDIATE, wire-boundary validation via BadParamsError) and scripts/approve.ts — a thin single-shot Bun.connect CLI client. 12 handler unit tests + 1 end-to-end integration smoke (CLI → daemon → RPC → DB) cover happy/clear/validation/idempotency paths plus daemon-down failure.
 ## Evidence
