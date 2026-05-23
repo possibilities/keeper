@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-578-embed-jobs-into-epics-collection",
   "bundles": [],
+  "closer_done_at": "2026-05-23T19:02:48Z",
   "created_at": "2026-05-23T16:00:45Z",
   "depends_on_epics": [
     "fn-577-plumb-skill-and-slash-command-metadata",
@@ -12,10 +13,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Embed jobs into epics collection",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-23T16:01:20Z"
+  "updated_at": "2026-05-23T19:02:48Z"
 }
