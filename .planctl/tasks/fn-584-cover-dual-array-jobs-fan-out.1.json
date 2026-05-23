@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
   "title": "add dual-array jobs re-fold test",
-  "updated_at": "2026-05-23T19:02:40Z"
+  "updated_at": "2026-05-23T21:29:12Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T21:29:12Z"
 }

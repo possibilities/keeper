@@ -39,5 +39,5 @@ test under ~50 lines.
       directions jointly, not just each in isolation).
 
 ## Done summary
-
+Added reducer test co-populating epic.jobs (plan verb) and task.jobs (work verb) on fn-1-dual, then re-asserting both arrays survive a subsequent EpicSnapshot ON CONFLICT byte-identically.
 ## Evidence
