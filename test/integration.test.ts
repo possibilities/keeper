@@ -1274,3 +1274,193 @@ test("end-to-end: downtime file deletion is reconciled on restart via the boot s
   daemon.kill("SIGTERM");
   expect(await daemon.exited).toBe(0);
 }, 40000);
+
+test("end-to-end: exit-watcher folds a SIGKILL'd victim to killed within 2s; SessionStart resume re-opens", async () => {
+  // The Killed match in main requires (pid, start_time) to align with what the
+  // jobs row persists. The hook stamps `events.pid = process.ppid` and (on
+  // SessionStart only) `events.start_time = <scrape of process.ppid>`, so the
+  // VICTIM must be the hook's PARENT process — only then do jobs.pid +
+  // jobs.start_time describe a process we can SIGKILL and observe via the
+  // exit-watcher.
+  //
+  // Pattern (mirrors test/events-writer.test.ts): write a tiny launcher script
+  // into the tmpdir; spawn IT; once it has spawned the hook on stdin and that
+  // hook has returned (committing the SessionStart row), keep the launcher
+  // alive forever so SIGKILL targets a real, watchable pid.
+  const sessionId = "sess-victim";
+  const launcherPath = join(tmpDir, "victim-launcher.ts");
+  writeFileSync(
+    launcherPath,
+    `
+const HOOK = ${JSON.stringify(HOOK_ENTRY)};
+const payload = JSON.stringify(${JSON.stringify({
+      hook_event_name: "SessionStart",
+      session_id: sessionId,
+      cwd: "/tmp/work",
+      permission_mode: "default",
+    })});
+// Spawn the hook so this launcher IS its parent (process.ppid). Wait for it
+// to commit, then park forever so the test can SIGKILL us at a deterministic
+// moment.
+const proc = Bun.spawn(["bun", HOOK], {
+  env: { ...process.env },
+  stdin: new TextEncoder().encode(payload),
+  stdout: "inherit",
+  stderr: "inherit",
+});
+await proc.exited;
+// Tell the test we're ready (the hook row is committed) via a single stdout
+// line, then park. The launcher's pid is what jobs.pid will hold.
+process.stdout.write("READY\\n");
+await new Promise(() => {});
+`,
+  );
+
+  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_SOCK: sockPath,
+      KEEPER_CONFIG: configPath,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  // Boot drain + spawn all five workers + bind the socket.
+  const bound = await retryUntil(
+    () => (existsSync(sockPath) ? true : null),
+    3000,
+  );
+  if (!bound) {
+    const err = await readStream(daemon.stderr);
+    throw new Error(`socket never bound.\nstderr:\n${err}`);
+  }
+
+  // Spawn the victim launcher. Its pid is the hook's process.ppid, so
+  // events.pid + events.start_time describe it.
+  const victim = Bun.spawn(["bun", "run", launcherPath], {
+    cwd: ROOT,
+    env: { ...process.env, KEEPER_DB: dbPath },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const victimPid = victim.pid;
+
+  // Wait for the launcher's "READY" line — the hook's SessionStart row has
+  // committed by the time it prints. The launcher then parks forever.
+  const victimStdout = victim.stdout;
+  let readyLine = "";
+  const decoder = new TextDecoder();
+  if (victimStdout) {
+    const r = victimStdout.getReader();
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const { value, done } = await r.read();
+      if (done) break;
+      readyLine += decoder.decode(value);
+      if (readyLine.includes("READY")) {
+        break;
+      }
+    }
+    // Release the reader so the launcher's stdout buffer doesn't fill up.
+    try {
+      r.releaseLock();
+    } catch {
+      // best-effort
+    }
+  }
+  expect(readyLine).toContain("READY");
+
+  const { db: reader } = openDb(dbPath, { readonly: true });
+  try {
+    // The SessionStart row folds the job to its non-terminal seed state
+    // (`stopped` per the schema default), carrying our victim pid + start_time.
+    const projected = await retryUntil(() => {
+      const row = reader
+        .query("SELECT pid, start_time, state FROM jobs WHERE job_id = ?")
+        .get(sessionId) as {
+        pid: number | null;
+        start_time: string | null;
+        state: string;
+      } | null;
+      return row && row.pid === victimPid ? row : null;
+    });
+    if (!projected) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `victim job never projected.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+    // Non-terminal — alive enough for the exit-watcher to register.
+    expect(["working", "stopped"]).toContain(projected.state);
+    expect(projected.pid).toBe(victimPid);
+
+    // --- SIGKILL the victim → exit-watcher detects, posts to main, main
+    //     folds Killed. The whole loop must complete within 2s. ---
+    victim.kill("SIGKILL");
+    await victim.exited;
+
+    const killed = await retryUntil(
+      () => {
+        const row = reader
+          .query("SELECT state FROM jobs WHERE job_id = ?")
+          .get(sessionId) as { state: string } | null;
+        return row && row.state === "killed" ? row : null;
+      },
+      2500,
+      50,
+    );
+    if (!killed) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `victim row never folded to killed.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+    expect(killed.state).toBe("killed");
+
+    // The synthetic Killed event landed in the events log.
+    const killedEventCount = (
+      reader
+        .query(
+          "SELECT COUNT(*) AS n FROM events WHERE hook_event = 'Killed' AND session_id = ?",
+        )
+        .get(sessionId) as { n: number }
+    ).n;
+    expect(killedEventCount).toBeGreaterThanOrEqual(1);
+
+    // --- Resume: fire a fresh SessionStart for the same session_id. The
+    //     reducer's ON CONFLICT branch re-opens 'killed' → 'stopped' and
+    //     refreshes pid + start_time. We don't need a live victim for the
+    //     resume — we just need the SessionStart event to fold. ---
+    await fireHook({
+      hook_event_name: "SessionStart",
+      session_id: sessionId,
+      cwd: "/tmp/work",
+      permission_mode: "default",
+    });
+
+    const reopened = await retryUntil(() => {
+      const row = reader
+        .query("SELECT state FROM jobs WHERE job_id = ?")
+        .get(sessionId) as { state: string } | null;
+      return row && row.state !== "killed" ? row : null;
+    }, 3000);
+    if (!reopened) {
+      const out = await readStream(daemon.stdout);
+      const err = await readStream(daemon.stderr);
+      throw new Error(
+        `victim row never re-opened from killed.\nstdout:\n${out}\nstderr:\n${err}`,
+      );
+    }
+    // SessionStart re-opens a terminal row to 'stopped' (the resume seed).
+    expect(reopened.state).toBe("stopped");
+  } finally {
+    reader.close();
+  }
+
+  daemon.kill("SIGTERM");
+  expect(await daemon.exited).toBe(0);
+}, 30000);

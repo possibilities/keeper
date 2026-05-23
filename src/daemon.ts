@@ -9,8 +9,9 @@
  *   2. Boot drain: `while (drain(db, BATCH) > 0) {}` — fold every unfolded event
  *      using the SAME code path as steady-state. After downtime this catches the
  *      projection up before the daemon goes live.
- *   3. Spawn FOUR worker threads (all AFTER migrate + boot drain, so their
- *      read-only `openDb` connections never race a missing/un-migrated DB):
+ *   3. Spawn FIVE worker threads (all AFTER migrate + boot drain + seed sweep,
+ *      so their read-only `openDb` connections never race a missing/un-migrated
+ *      DB and the exit-watcher's data_version diff sees a settled projection):
  *      - the wake worker — opens its own read-only connection, polls
  *        `PRAGMA data_version`, and posts a contentless `{ kind: "wake" }`
  *        whenever another connection commits.
@@ -29,17 +30,27 @@
  *        `EpicSnapshot` / `TaskSnapshot` events row on its writable connection —
  *        the second producer-worker instance. Main stays the sole writer; the
  *        worker is read-only.
+ *      - the exit-watcher worker — owns a kqueue (macOS) / pidfd+epoll (Linux)
+ *        fd via `bun:ffi`, polls `data_version` to keep its (jobs.pid) watch set
+ *        in sync, and posts `{ kind: "exit", jobId, pid, startTime }` when a
+ *        tracked pid exits or the post-register kill-0 probe finds it already
+ *        dead. Main turns each into a synthetic `Killed` events row (after a
+ *        strict `(pid, start_time)` match against the persisted row) on its
+ *        writable connection — the third producer-worker instance. The kqueue/
+ *        epoll fd is owned by the worker thread and released in its own
+ *        shutdown handler.
  *   4. Steady state: every wake triggers a full drain loop. Wakes that arrive
  *      mid-drain coalesce into the next pass via a single "wake pending" flag —
  *      no event is missed (drain always re-reads from the cursor) and drain is
- *      never invoked re-entrantly. A `transcript-title` message inserts the
- *      synthetic event then pumps a wake to fold it.
- *   5. SIGTERM: post `{ type: "shutdown" }` to ALL FOUR workers, await their
+ *      never invoked re-entrantly. A `transcript-title` / `exit` message
+ *      inserts the synthetic event then pumps a wake to fold it.
+ *   5. SIGTERM: post `{ type: "shutdown" }` to ALL FIVE workers, await their
  *      `close` events against a short deadline, terminate them, close the db,
  *      exit 0. This is the ONLY clean exit. The server worker releases its
- *      socket + lock and the transcript + plan workers unsubscribe their
- *      watchers inside their own shutdown handlers (those resources are
- *      process/thread-owned, so `terminate()` alone would leak them).
+ *      socket + lock, the transcript + plan workers unsubscribe their watchers,
+ *      and the exit-watcher releases its kqueue/pidfd fd — all inside their
+ *      own shutdown handlers (those resources are process/thread-owned, so
+ *      `terminate()` alone would leak them).
  *
  * Crash policy (single recovery path): ANY unrecoverable error — either worker's
  * `error` event, an unhandled rejection, or a fold throw that escapes the
@@ -56,6 +67,7 @@ import {
   resolveDbPath,
   resolvePlanRoots,
 } from "./db";
+import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
 import type { PlanMessage, PlanWorkerData } from "./plan-worker";
 import { DEFAULT_BATCH_SIZE, drain } from "./reducer";
 import { seedKilledSweep } from "./seed-sweep";
@@ -377,6 +389,109 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
+  // Spawn the exit-watcher worker in the SAME post-migration window. It owns
+  // a kqueue (macOS) / pidfd+epoll (Linux) fd via `bun:ffi`, polls
+  // `data_version` to keep its watch set in sync with the candidate jobs
+  // rows, and posts `{ kind: "exit", ... }` whenever a tracked pid exits or
+  // the post-register kill-0 probe finds it already dead. Spawns AFTER seed
+  // sweep + re-drain (above) so its initial candidate-set diff reads a
+  // settled projection, not a half-folded one.
+  const exitWorker = new Worker(
+    new URL("./exit-watcher.ts", import.meta.url).href,
+    {
+      workerData: { dbPath, pollMs: 50 } satisfies ExitWatcherWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  // Main stays the SOLE writer: an `exit` message becomes a synthetic
+  // `Killed` events row inserted on the existing WRITABLE connection, then a
+  // wake pump folds it. The verifier here re-reads the persisted row and
+  // matches `(pid, start_time)` against the message's snapshot — STRICT when
+  // the row carries a stored start_time, LOOSE pid-only when the row has
+  // none (legacy / pre-schema-v9). A strict-mismatch is a race-recovered
+  // stale event (the row was re-opened with a fresh process between
+  // register and exit delivery, OR the producer races a SessionStart on the
+  // same row); we silently skip it. The reducer's Killed fold ALSO
+  // double-checks the match — this verifier is a producer-side optimization
+  // that keeps the event log tight (no Killed rows that the reducer would
+  // discard as stale).
+  exitWorker.onmessage = (ev: MessageEvent<ExitMessage | undefined>): void => {
+    const msg = ev.data;
+    if (!msg || msg.kind !== "exit") {
+      return;
+    }
+    // Re-read the row to confirm the message's pid + start_time still match
+    // what's persisted. A non-matching row means the session was re-opened
+    // (and the new process is presumably alive) — skip silently.
+    const row = db
+      .query("SELECT pid, start_time, state FROM jobs WHERE job_id = ?")
+      .get(msg.jobId) as {
+      pid: number | null;
+      start_time: string | null;
+      state: string;
+    } | null;
+    if (row == null) {
+      // Row vanished — nothing to fold against.
+      return;
+    }
+    if (row.state === "ended" || row.state === "killed") {
+      // Already terminal — the reducer's Killed terminal-guard would no-op
+      // anyway, but skip the event log churn.
+      return;
+    }
+    // Strict-match when both sides carry a start_time; loose pid-only match
+    // when EITHER side is NULL (the row is legacy / the message snapshot
+    // didn't carry one — Q7 loose-accept rule). A strict mismatch is the
+    // race-recovered case.
+    const pidMatches = row.pid != null && row.pid === msg.pid;
+    if (!pidMatches) {
+      return;
+    }
+    const startMatches =
+      row.start_time == null ||
+      msg.startTime == null ||
+      row.start_time === msg.startTime;
+    if (!startMatches) {
+      // Strict mismatch — silently skip (the producer raced a re-open).
+      return;
+    }
+    stmts.insertEvent.run({
+      $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
+      $session_id: msg.jobId, // == job_id
+      $pid: null,
+      $hook_event: "Killed", // synthetic; reducer folds → 'killed'
+      $event_type: "killed",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: JSON.stringify({ pid: msg.pid, start_time: msg.startTime }),
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+    });
+    // Our own INSERT bumps data_version, so the wake worker would re-drain
+    // anyway — but pump directly so the Killed fold lands without a poll-
+    // cycle delay.
+    wakePending = true;
+    pumpWakes();
+  };
+
+  // Same crash policy as the other workers: any thread failure → fatalExit.
+  exitWorker.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] exit-watcher worker error:", err.message ?? err);
+    fatalExit();
+  };
+
+  // Same crash-via-`close` gap: an exit-watcher `process.exit(1)` fires
+  // `close`, not `onerror`. `!shuttingDown` makes it inert on clean shutdown.
+  exitWorker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
+
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -413,11 +528,13 @@ function runDaemon(): void {
       type: "shutdown",
     } satisfies ShutdownMessage);
     planWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
+    exitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
 
-    // Bun surfaces worker exit via the "close" event. Await ALL FOUR workers'
-    // close (the server worker releases its socket + lock and the transcript +
-    // plan workers unsubscribe their watchers in their own shutdown handlers —
-    // that teardown must land, or the socket / native watches leak into the next
+    // Bun surfaces worker exit via the "close" event. Await ALL FIVE workers'
+    // close (the server worker releases its socket + lock, the transcript +
+    // plan workers unsubscribe their watchers, and the exit-watcher releases
+    // its kqueue/pidfd fd in their own shutdown handlers — that teardown must
+    // land, or the socket / native watches / kernel fd leak into the next
     // boot), raced against a single shared deadline so a wedged worker can't
     // block our clean shutdown forever.
     const exited = (w: Worker): Promise<void> =>
@@ -430,6 +547,7 @@ function runDaemon(): void {
         exited(serverWorker),
         exited(transcriptWorker),
         exited(planWorker),
+        exited(exitWorker),
       ]),
       Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS),
     ]);
@@ -451,6 +569,11 @@ function runDaemon(): void {
     }
     try {
       planWorker.terminate();
+    } catch {
+      // best-effort if it already exited
+    }
+    try {
+      exitWorker.terminate();
     } catch {
       // best-effort if it already exited
     }

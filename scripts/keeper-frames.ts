@@ -109,8 +109,9 @@ Usage: bun scripts/keeper-frames.ts [--collection <name>] [--sock <path>]
                    (--state and --state-ne are mutually exclusive)
                    (--state/--state-ne are jobs-only; ignored for epics)
                    (default: no state flag → the server's default scope shows
-                   only LIVE jobs (working + stopped); pass --state ended to see
-                   ended jobs)
+                   only LIVE jobs (working + stopped) and hides BOTH terminal
+                   states (ended + killed); pass --state ended or
+                   --state killed to see them explicitly)
   --status <s>     Filter to epics whose status equals <s> (e.g. done)
   --status-ne <s>  Filter to epics whose status is NOT <s>
                    (--status and --status-ne are mutually exclusive)

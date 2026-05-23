@@ -7,10 +7,16 @@ TypeScript hook plugin writes one row per Claude Code hook invocation into a
 SQLite `events` table — the durable, append-only log. A long-running Bun daemon
 (`keeperd`, managed by a macOS LaunchAgent) tails that table and folds new
 events into a minimal `jobs` projection: one row per session, carrying the live
-`state` (`working` / `stopped` / `ended`) and a human-readable `title` (seeded
-from the session's spawn name at SessionStart, refined by the prompt payload and
-the live transcript `custom-title`, with a `title_source` recording its
-provenance and precedence: `spawn` < `payload` < `transcript`).
+`state` (`working` / `stopped` / `ended` / `killed`) and a human-readable `title`
+(seeded from the session's spawn name at SessionStart, refined by the prompt
+payload and the live transcript `custom-title`, with a `title_source` recording
+its provenance and precedence: `spawn` < `payload` < `transcript`). The `killed`
+state is the sibling terminal state to `ended`: reached not from a SessionEnd
+hook but from synthetic `Killed` events emitted by the boot seed sweep and the
+live exit-watcher worker, which prove a session's `(pid, start_time)` is gone
+from the OUTSIDE (SIGKILL'd, terminal-pane-closed, machine reboot, hook crash).
+Both terminal states are revivable — a fresh `claude --resume` re-opens either
+one to `stopped`.
 
 The architecture is deliberately small. Keeper is built on Bun + `bun:sqlite`
 with a single third-party runtime dependency: `@parcel/watcher` (a native
@@ -283,11 +289,30 @@ self-recover from a *dropped-events* FSEvents overrun: on the recoverable
 "...must be re-scanned" watcher error they schedule a debounced, single-flight
 re-scan of their existing change-gated boot-scan path (per affected root for the
 plan worker), recovering the missed change in-process without a daemon restart
-and without re-subscribing. The four workers are fully independent; main
-supervises all four lifecycles but routes none of their traffic, and any worker's
-`error` event escalates the whole process to a clean restart — with that single
-scoped exception, the recoverable drop signal, which deliberately does NOT
-escalate (a re-scan throw is swallowed, never reaching the restart path).
+and without re-subscribing.
+
+A **fifth** Worker thread is the exit-watcher: it owns a kqueue (macOS) or
+pidfd+epoll (Linux) fd via `bun:ffi`, polls `data_version` to keep its watch
+set in sync with the candidate `jobs` rows (`state IN ('working','stopped')
+AND pid IS NOT NULL`), and posts an `exit` message whenever a tracked pid
+exits or the post-register kill-0 probe finds it already dead. Main — the
+sole writer — verifies the message's `(pid, start_time)` snapshot still
+matches the persisted row, then turns the exit into a synthetic `Killed`
+events row and pumps a wake; the reducer folds it to the `killed` state.
+This is the live-side counterpart to the boot-time seed sweep that runs
+between `migrate → drainToCompletion` and worker spawn: the sweep covers
+downtime (zombie rows already on disk), the exit-watcher covers steady state
+(processes that die while the daemon is up). It is the third producer-worker
+instance — read-only / write-free, feeding the log only via main — and its
+kqueue/pidfd fd is owned by the worker thread, released in its own shutdown
+handler.
+
+The five workers are fully independent; main supervises all five lifecycles
+but routes none of their traffic, and any worker's `error` event escalates
+the whole process to a clean restart — with that single scoped exception, the
+recoverable drop signal on the transcript and plan watchers, which
+deliberately does NOT escalate (a re-scan throw is swallowed, never reaching
+the restart path).
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).
@@ -295,9 +320,13 @@ list, see [CLAUDE.md](./CLAUDE.md).
 ## Inspect
 
 ```sh
-# Recent jobs (title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title):
+# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, title, title_source, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
+
+# Killed sessions specifically (proven-dead from outside the hook stream — SIGKILL, terminal-pane closure, reboot):
+sqlite3 ~/.local/state/keeper/keeper.db \
+  'SELECT job_id, state, pid, start_time FROM jobs WHERE state = "killed" ORDER BY updated_at DESC LIMIT 10'
 
 # Plans projection — epics (each embedding its tasks as a JSON array) folded from the configured `.planctl` roots:
 sqlite3 ~/.local/state/keeper/keeper.db \

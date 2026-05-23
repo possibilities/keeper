@@ -17,11 +17,17 @@
  *   -------------------|------------------------------------------------------
  *   SessionStart        | INSERT a new job row; seed title from spawn_name
  *                       |   ('spawn' source) when present. On a duplicate
- *                       |   (resume) RE-OPEN a terminal row: 'ended' -> 'stopped'
- *                       |   + refresh pid; a non-ended row's state is left as-is.
- *   UserPromptSubmit    | state -> 'working'  (also re-opens an 'ended' job)
- *   Stop                | state -> 'stopped'  (skipped when state == 'ended')
- *   SessionEnd          | state -> 'ended'    (always; the post-end resting state)
+ *                       |   (resume) RE-OPEN a terminal row: 'ended' or
+ *                       |   'killed' -> 'stopped' + refresh pid + start_time;
+ *                       |   a non-terminal row's state is left as-is.
+ *   UserPromptSubmit    | state -> 'working'  (also re-opens 'ended' or 'killed')
+ *   Stop                | state -> 'stopped'  (skipped on 'ended' or 'killed')
+ *   SessionEnd          | state -> 'ended'    (skipped on 'killed' — the kill
+ *                       |   signal carries proven-dead evidence and outranks)
+ *   Killed              | state -> 'killed'   (synthetic; folds iff persisted
+ *                       |   (pid, start_time) matches the event payload, OR
+ *                       |   the persisted start_time is NULL — legacy loose
+ *                       |   match. Race-recovered mismatches are no-ops.)
  *   <any with title>    | title -> data.session_title by precedence (the
  *                       |   source is 'transcript' for a TranscriptTitle event,
  *                       |   else 'payload'; write iff it outranks/ties+changes)
@@ -31,11 +37,16 @@
  * genuinely-ended session can only come back by re-attaching — a fresh
  * `claude --resume` process fires SessionStart (source=resume) — or by submitting
  * a prompt straight away (a UserPromptSubmit with no SessionStart, e.g. after a
- * spurious mid-session SessionEnd); BOTH re-open the job. keeper has NO
- * process-liveness overlay (unlike jobctl's server, which keeps SQL `ended`
- * sticky and un-ends from PID liveness) — the fold IS the live view, so the
- * re-open must live here. Only a stray `Stop` on a still-ended job stays a
- * no-op. SessionEnd always lands (idempotently re-asserts 'ended').
+ * spurious mid-session SessionEnd); BOTH re-open the job. `killed` is the
+ * sibling terminal state reached via a synthetic `Killed` event — emitted by
+ * the boot seed sweep (`src/seed-sweep.ts`) and the live exit-watcher worker
+ * (`src/exit-watcher.ts`) when a `(pid, start_time)` pair is proven dead from
+ * outside the hook stream. Both terminal states are revivable on the same
+ * SessionStart / UserPromptSubmit re-open paths; only a stray `Stop` on a
+ * still-terminal job stays a no-op. The `Killed` event folds normally — it is
+ * a deterministic function of its payload + the persisted (pid, start_time),
+ * with no liveness re-probe inside the fold (re-probing would break re-fold
+ * determinism — the producer is the ONLY place that probes liveness).
  *
  * Title provenance/precedence: NULL=0, 'spawn'=1, 'payload'=2, 'transcript'=3.
  * A higher source wins; a lower one never clobbers a higher one (see

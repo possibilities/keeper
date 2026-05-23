@@ -3,7 +3,7 @@ keeper — event-sourced Claude Code control-data daemon (Bun + bun:sqlite).
 The hook plugin writes one `events` row per Claude Code hook invocation; the
 `keeperd` daemon folds those events into the `jobs` (and `epics`) projections and
 serves them read-only over a UDS subscribe socket. For the system map — the
-event log, reducer, the four worker threads, and the wire protocol — see
+event log, reducer, the five worker threads, and the wire protocol — see
 `README.md` `## Architecture`.
 
 **AGENTS.md symlink** — `AGENTS.md` is a symlink to this file
@@ -32,7 +32,18 @@ event log, reducer, the four worker threads, and the wire protocol — see
   (rewind cursor, `DELETE FROM jobs`/`epics`, re-drain) reproduces byte-identical
   rows, including `epics` rows with their embedded `tasks` arrays (built from a
   stable sort, never append). The producer workers feed the log only via main's
-  writable connection; they never write the DB.
+  writable connection; they never write the DB. Synthetic events covered by
+  this rule: `TranscriptTitle` (transcript worker), `EpicSnapshot` /
+  `TaskSnapshot` / `EpicDeleted` / `TaskDeleted` (plan worker), `Killed`
+  (boot seed sweep + live exit-watcher worker, gated by main's
+  `(pid, start_time)` verifier before insert).
+- **Producer-only liveness probing.** The seed sweep and the exit-watcher
+  worker are the ONLY places that probe process liveness (`kill(pid,0)`,
+  kqueue `EVFILT_PROC|NOTE_EXIT`, pidfd_open + epoll, `(pid, start_time)`
+  recycle check). The reducer's `Killed` fold NEVER re-probes — it compares
+  the event payload's `(pid, start_time)` against the persisted row only.
+  A liveness re-probe inside a fold would break re-fold determinism (a
+  from-scratch re-fold would see different OS state than the original run).
 - **PRAGMAs are connection-local** — `applyPragmas` runs on every `openDb`,
   including each worker's read-only connection and the hook's fresh per-invocation
   connection. Without `busy_timeout` a connection defaults to 0 and contention
@@ -55,16 +66,26 @@ event log, reducer, the four worker threads, and the wire protocol — see
   kqueue, chokidar). *Why:* they drop same-process writes and miss WAL writes on
   macOS. Use `PRAGMA data_version` polling on a read-only connection as the only
   DB change primitive, and keep that connection in autocommit (no `BEGIN`) or
-  `data_version` freezes for it. **Carve-out:** native watching of *external*
-  trees written by *other* processes IS permitted — the transcript files
-  (`src/transcript-worker.ts`) and the `.planctl/{epics,tasks}` trees
+  `data_version` freezes for it. **Carve-out (files):** native watching of
+  *external* trees written by *other* processes IS permitted — the transcript
+  files (`src/transcript-worker.ts`) and the `.planctl/{epics,tasks}` trees
   (`src/plan-worker.ts`), both via `@parcel/watcher`. Foreign-written files have
   no same-process blind spot and no `data_version`. Treat a watcher event (and a
   matched FSEvents drop-overrun `err`, "...must be re-scanned") as "go look",
   never as the data: always `fstat` + safe-parse / forward-tail the current file.
   A drop schedules a debounced, single-flight re-scan of the affected tree via the
   change-gated boot-scan primitive — never re-subscribe, never point a watcher at
-  keeper's own DB.
+  keeper's own DB. **Carve-out (processes):** kqueue with
+  `EVFILT_PROC | NOTE_EXIT` (macOS) and `pidfd_open` + `epoll_wait` (Linux) are
+  permitted on EXTERNAL PROCESS DESCRIPTORS — the exit-watcher worker
+  (`src/exit-watcher.ts` + `src/exit-watcher-ffi.ts`) uses them to learn when a
+  tracked Claude Code session pid exits. This is distinct from the file-watcher
+  ban: a process descriptor is not a file, has no same-process write blind spot,
+  and is the only kernel-supported mechanism for "tell me when this pid exits"
+  (the alternative is N/2-ms-of-latency polling). The producer must still
+  perform a post-register `kill(pid, 0)` probe to close the EV_ADD/pidfd_open
+  ESRCH race, and the `(pid, start_time)` two-field identity guards against
+  pid recycling.
 - **No third-party deps in the hook.** Keep `plugin/hooks/events-writer.ts`'s
   import graph to `bun:sqlite` + local files only — Bun cold start is ~30ms and
   the SessionEnd hook has a 1.5s timeout budget.
@@ -107,7 +128,9 @@ Every keeper Worker thread follows the same durable contract:
 - **Supervisor-owned lifecycle** — main spawns each worker after migrate + boot
   drain and is the only one that terminates it (post `{ type: "shutdown" }`, await
   `close`, then `terminate`). A worker owning an external resource (socket, lock
-  file, watcher subscription, re-scan timer) must release it in its own shutdown
-  handler — `terminate()` alone leaks it.
+  file, watcher subscription, re-scan timer, kqueue/pidfd fd) must release it
+  in its own shutdown handler — `terminate()` alone leaks it. The exit-watcher
+  worker specifically owns its kqueue (macOS) / pidfd+epoll (Linux) fd and any
+  registered pidfds; all must be closed in the worker's shutdown handler.
 - **No in-process self-heal** — a worker's `error` event escalates to `fatalExit`;
   workers never respawn themselves or each other.
