@@ -588,15 +588,38 @@ function projectJobsRow(db: Database, event: Event): void {
       // liveness overlay — see the header.
       //
       // Pid is COALESCE-refreshed so a re-open updates to the live process's pid
-      // (mirrors SessionStart's resume path). start_time is NOT touched here:
-      // UserPromptSubmit events do not carry the platform-tagged start instant
-      // (only SessionStart does), so the persisted value stays put.
+      // (mirrors SessionStart's resume path). UserPromptSubmit events never
+      // carry start_time (only SessionStart scrapes it), so we cannot refresh
+      // it here.
+      //
+      // BUT: when the event's pid differs from the persisted pid, the resume
+      // landed in a DIFFERENT live process, and the persisted start_time now
+      // describes a dead/recycled process. Leaving it stuck breaks the
+      // recycle-safe identity invariant — `(pid, start_time)` must always
+      // describe the same live process — and the next boot's seed sweep would
+      // see `pid alive + osStart != stored start_time`, fire a synthetic Killed
+      // payload carrying the STORED stale start_time, and the reducer's strict
+      // (pid, start_time) match would fold the live row to 'killed' (the bug
+      // chain documented in fn-579-fix-stale-start-time-on-ups-resume.1).
+      //
+      // Clearing start_time to NULL on pid change activates the legacy-loose
+      // branches in both producers (`seed-sweep.ts`: "pid alive + no stored
+      // start_time → cannot prove recycle. Leave alone.") and the reducer's
+      // own Killed fold (loose pid-only match). The next SessionStart will
+      // refresh start_time to the new live value. When the event omits pid
+      // (legacy hook) or pid matches, behavior is unchanged.
+      //
+      // The CASE is a pure function of (event.pid, row.pid) — re-fold safe.
       db.run(
         `UPDATE jobs SET state = 'working',
                          pid = COALESCE(?, pid),
+                         start_time = CASE
+                           WHEN ? IS NOT NULL AND ? != pid THEN NULL
+                           ELSE start_time
+                         END,
                          last_event_id = ?, updated_at = ?
            WHERE job_id = ?`,
-        [event.pid, event.id, ts, jobId],
+        [event.pid, event.pid, event.pid, event.id, ts, jobId],
       );
       break;
 

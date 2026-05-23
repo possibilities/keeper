@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
 import { applyEvent, DEFAULT_BATCH_SIZE, drain } from "../src/reducer";
+import { seedKilledSweep } from "../src/seed-sweep";
 import type { Event } from "../src/types";
 
 let tmpDir: string;
@@ -489,7 +490,7 @@ test("SessionStart re-opens a killed row: killed -> stopped, pid+start_time refr
   expect(job?.start_time).toBe("macos:t2");
 });
 
-test("UserPromptSubmit re-opens a killed row: killed -> working, pid refreshed", () => {
+test("UserPromptSubmit re-opens a killed row with new pid: killed -> working, pid refreshed, start_time CLEARED", () => {
   insertEvent({
     hook_event: "SessionStart",
     pid: 1000,
@@ -499,14 +500,141 @@ test("UserPromptSubmit re-opens a killed row: killed -> working, pid refreshed",
   drainAll();
   expect(getJob()?.state).toBe("killed");
 
-  // A prompt arriving with a new pid (the live re-attached process) — UPS does
-  // not carry start_time, so that field is preserved.
+  // A prompt arriving with a new pid (the live re-attached process). UPS does
+  // not carry start_time, but the persisted "macos:t1" now describes a
+  // dead/recycled process — leaving it stuck would let the next boot's seed
+  // sweep emit a synthetic Killed that the reducer's strict (pid, start_time)
+  // match would fold the live row to 'killed'. The fold clears start_time to
+  // NULL on pid change so producers fall back to the legacy-loose branch
+  // ("pid alive + no stored start_time → cannot prove recycle. Leave alone.")
+  // until the next SessionStart refreshes it.
   insertEvent({ hook_event: "UserPromptSubmit", pid: 2000 });
   drainAll();
   const job = getJob();
   expect(job?.state).toBe("working");
   expect(job?.pid).toBe(2000);
+  expect(job?.start_time).toBe(null);
+});
+
+test("UserPromptSubmit with SAME pid preserves start_time (no-op on identity)", () => {
+  // When pid is unchanged, start_time still describes the live process —
+  // clearing it would be a regression (we'd lose the recycle-safe identity
+  // we already have). The fold's CASE leaves start_time alone in this branch.
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1000,
+    start_time: "macos:t1",
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", pid: 1000 });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("working");
+  expect(job?.pid).toBe(1000);
   expect(job?.start_time).toBe("macos:t1");
+});
+
+test("UserPromptSubmit with missing pid (legacy hook) preserves persisted pid + start_time", () => {
+  // Legacy hook payloads omit pid. The COALESCE leaves pid alone; the CASE's
+  // first conjunct (`event.pid IS NOT NULL`) is false, so start_time is also
+  // preserved. Behavior unchanged from pre-fix.
+  //
+  // We insert the UPS event row directly with raw SQL because the test
+  // helper's `??` defaults `pid: null` to 4242 — the bypass is the only way
+  // to express "event.pid is genuinely NULL" given that helper.
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1000,
+    start_time: "macos:t1",
+  });
+  db.run(
+    `INSERT INTO events (
+       ts, session_id, pid, hook_event, event_type, tool_name, matcher,
+       cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
+       subagent_agent_id, spawn_name, start_time
+     ) VALUES (?, 'sess-a', NULL, 'UserPromptSubmit', 'UserPromptSubmit',
+              NULL, NULL, '/tmp/work', NULL, NULL, NULL, NULL, '{}',
+              NULL, NULL, NULL)`,
+    [tsCounter++],
+  );
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("working");
+  expect(job?.pid).toBe(1000);
+  expect(job?.start_time).toBe("macos:t1");
+});
+
+test("cross-boot: kill -> UPS-resume-new-pid -> daemon restart (seed sweep) keeps row 'working'", () => {
+  // The end-to-end regression chain documented in
+  // fn-579-fix-stale-start-time-on-ups-resume.1:
+  //
+  //   1. SessionStart(pid=1000, start_time=X)  → (stopped, 1000, X)
+  //   2. Killed(pid=1000, start_time=X)        → (killed,  1000, X)
+  //   3. UserPromptSubmit(pid=process.pid)     → (working, process.pid, NULL)
+  //          ^ live pid; without the fix, start_time stayed at X.
+  //   4. seedKilledSweep against the same DB simulates daemon restart. The
+  //      row's pid is alive (we use process.pid). With start_time stuck at X
+  //      the sweep would compare osStart != X and emit a synthetic Killed
+  //      carrying the stored X — the reducer would strict-match (process.pid,
+  //      X) against the row's (process.pid, X) and fold to 'killed', silently
+  //      hiding the live resumed session from the default jobs view.
+  //
+  //   With the fix (start_time cleared to NULL on pid change in the UPS fold),
+  //   the sweep takes the legacy-loose branch ("pid alive + no stored
+  //   start_time → cannot prove recycle. Leave alone.") and emits NOTHING.
+  //   The row stays 'working' across the simulated boot.
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1000,
+    start_time: "macos:t1",
+  });
+  killedEvent(1000, "macos:t1");
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+
+  // Resume into a live process. process.pid is alive for the duration of the
+  // test, so seedKilledSweep's `isPidAlive` probe will return true.
+  const livePid = process.pid;
+  insertEvent({ hook_event: "UserPromptSubmit", pid: livePid });
+  drainAll();
+  {
+    const job = getJob();
+    expect(job?.state).toBe("working");
+    expect(job?.pid).toBe(livePid);
+    // The fix: start_time cleared, so the row is now in the loose-pid-only
+    // identity state until the next SessionStart refreshes it.
+    expect(job?.start_time).toBe(null);
+  }
+
+  // Snapshot the synthetic Killed event count before the simulated boot.
+  const killedBefore = (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM events WHERE hook_event = 'Killed' AND session_id = 'sess-a'",
+      )
+      .get() as { n: number }
+  ).n;
+
+  // Simulate daemon restart: run the seed sweep against the same DB and drain.
+  seedKilledSweep(db);
+  drainAll();
+
+  // The sweep emitted NO new Killed event (legacy-loose branch: pid alive +
+  // stored start_time is NULL → leave alone).
+  const killedAfter = (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM events WHERE hook_event = 'Killed' AND session_id = 'sess-a'",
+      )
+      .get() as { n: number }
+  ).n;
+  expect(killedAfter).toBe(killedBefore);
+
+  // And the row is still 'working' — the live resumed session survives the
+  // restart.
+  const after = getJob();
+  expect(after?.state).toBe("working");
+  expect(after?.pid).toBe(livePid);
+  expect(after?.start_time).toBe(null);
 });
 
 test("Stop on a killed row is a no-op (terminal guard)", () => {
