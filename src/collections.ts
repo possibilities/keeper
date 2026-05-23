@@ -87,6 +87,8 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "title",
     "title_source",
     "transcript_path",
+    "plan_verb",
+    "plan_ref",
   ],
   pk: "job_id",
   version: "last_event_id",
@@ -108,11 +110,15 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
   // `{in:[...]}`/`{not_in:[...]}` set), which overrides this default; a pk
   // subscribe is exempt (a detail read of an ended/killed job still resolves).
   defaultFilter: { state: { not_in: ["ended", "killed"] } },
-  // `title` + `title_source` + `transcript_path` are read-only display this
-  // phase — served on `result`/`patch` (the source/path for provenance +
-  // debugging) but NOT in `sortable`/`filters`. No JSON-TEXT columns are served today
-  // (`title_history` was retired), so `decodeRow` short-circuits on the empty
-  // set.
+  // `title` + `title_source` + `transcript_path` + `plan_verb` + `plan_ref`
+  // are read-only display this phase — served on `result`/`patch` (the
+  // source/path for provenance + debugging, the planctl verb/ref pair for
+  // associating jobs with epics/tasks) but NOT in `sortable`/`filters`. A
+  // future client query (e.g. "subscribe to all jobs for epic X") would add
+  // `plan_ref` to `filters` and rely on the partial `idx_jobs_plan_ref`
+  // index added in schema v10. No JSON-TEXT columns are served today
+  // (`title_history` was retired), so `decodeRow` short-circuits on the
+  // empty set.
   jsonColumns: new Set([]),
 };
 

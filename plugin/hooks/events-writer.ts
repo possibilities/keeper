@@ -25,6 +25,7 @@
  */
 
 import { openDb, resolveDbPath } from "../../src/db";
+import { extractSkillName, slashCommandFromPrompt } from "../../src/derivers";
 
 /**
  * Hook event names that get renamed when stored as `event_type`. Matches
@@ -316,6 +317,18 @@ async function main(): Promise<void> {
 
   const subagentAgentId = extractSubagentAgentId(hookEvent, toolName, data);
 
+  // v10: index the slash-command on UserPromptSubmit and the Skill-tool name
+  // on Pre/PostToolUse-on-Skill. Both derivers are pure, gated, and return
+  // null on anything that doesn't match the canonical shape — see
+  // `src/derivers.ts` for the regex anchoring + defensive shape checks.
+  // Module-scope derivers (compile-once regex) share one source of truth
+  // with the v9→v10 migration backfill and the reducer.
+  const slashCommand =
+    hookEvent === "UserPromptSubmit"
+      ? slashCommandFromPrompt(data.prompt)
+      : null;
+  const skillName = extractSkillName(hookEvent, toolName, data);
+
   // SessionStart only: scrape the parent claude argv `--name`/`-n` AND the
   // process start_time in a single platform-specific probe, so the reducer can
   // seed `jobs.title` from the very first event AND store the recycle-safe
@@ -357,6 +370,8 @@ async function main(): Promise<void> {
         $subagent_agent_id: subagentAgentId,
         $spawn_name: spawnInfo.name,
         $start_time: spawnInfo.startTime,
+        $slash_command: slashCommand,
+        $skill_name: skillName,
       });
     })();
   } finally {

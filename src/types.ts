@@ -48,6 +48,25 @@ export interface Event {
    * equality against a re-read at sweep time.
    */
   start_time: string | null;
+  /**
+   * Leading slash command pulled out of a `UserPromptSubmit`'s `data.prompt`
+   * by the pure {@link import("./derivers").slashCommandFromPrompt} parser
+   * (regex anchored at start-of-string, `/lowercase` then `[\w:-]` body —
+   * see `src/derivers.ts`). Captured only on UserPromptSubmit; NULL on
+   * every other event and on prompts that don't start with a lowercase-led
+   * slash token (file paths like `/Users/foo`, free-text prompts, non-string
+   * payloads). Indexed via a partial index `WHERE slash_command IS NOT NULL`
+   * so the sparse column scans cheaply.
+   */
+  slash_command: string | null;
+  /**
+   * Canonical skill name pulled out of a Pre/PostToolUse-on-Skill event's
+   * `data.tool_input.skill` by {@link import("./derivers").extractSkillName}.
+   * Gated by `hook_event ∈ {PreToolUse, PostToolUse} && tool_name === 'Skill'`;
+   * NULL on every other row. Lets consumers index Skill invocations (e.g.
+   * `WHERE skill_name LIKE 'plan:%'`) without JSON-scanning `data`.
+   */
+  skill_name: string | null;
 }
 
 /**
@@ -91,6 +110,26 @@ export interface Job {
    * to disambiguate pid recycle.
    */
   start_time: string | null;
+  /**
+   * Spawn-derived planctl verb on the strict whitelist `{plan, work, close}`,
+   * extracted from `Event.spawn_name` at SessionStart by
+   * {@link import("./derivers").planVerbRefFromSpawnName}. NULL on jobs whose
+   * spawn name didn't match the canonical `{verb}::<ref>` shape (no spawn name,
+   * `audit::`/`develop::` prefix, malformed body, extra `::` segments). Paired
+   * with {@link Job.plan_ref} — both populate together or both stay NULL. Set
+   * once at SessionStart and not touched by ON CONFLICT RESUME (mirrors
+   * `title`/`title_source` set-once identity).
+   */
+  plan_verb: string | null;
+  /**
+   * Spawn-derived planctl ref (epic id `fn-575-foo` or task id
+   * `fn-575-foo.3`), extracted alongside {@link Job.plan_verb}. Indexed via
+   * `idx_jobs_plan_ref WHERE plan_ref IS NOT NULL` for the common
+   * "find /plan: jobs" query path; `plan_verb` rides without its own index
+   * (cardinality 3 — the planner serves a `plan_verb=` filter through this
+   * partial index plus a cheap post-seek check).
+   */
+  plan_ref: string | null;
 }
 
 /**

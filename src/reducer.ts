@@ -57,6 +57,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { planVerbRefFromSpawnName } from "./derivers";
 import type { Event } from "./types";
 
 /**
@@ -553,28 +554,46 @@ function projectJobsRow(db: Database, event: Event): void {
       // title/title_source are NOT touched — they stay precedence-owned, so a
       // resume never re-seeds the priority-1 spawn name over a higher source;
       // created_at / cwd / transcript_path are set-once identity and stay put.
-      db.run(
-        `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(job_id) DO UPDATE SET
-           pid = COALESCE(excluded.pid, jobs.pid),
-           start_time = COALESCE(excluded.start_time, jobs.start_time),
-           state = CASE WHEN jobs.state IN ('${ENDED}','${KILLED}') THEN 'stopped' ELSE jobs.state END,
-           last_event_id = excluded.last_event_id,
-           updated_at = excluded.updated_at`,
-        [
-          jobId,
-          ts,
-          event.cwd,
-          event.pid,
-          event.start_time,
-          event.id,
-          ts,
+      {
+        // Derive `plan_verb`/`plan_ref` from the SessionStart spawn name via
+        // the same pure parser the v9→v10 migration backfill uses (single
+        // source of truth). NULL on every spawn name that doesn't match the
+        // strict `{plan|work|close}::<ref>` whitelist — re-fold deterministic.
+        //
+        // Set-once identity on RESUME: the ON CONFLICT branch leaves both
+        // columns untouched. A duplicate SessionStart on a non-`{plan,work,
+        // close}::` spawn (or a switch from one verb to another mid-session)
+        // never overwrites the seeded pair — mirrors the title/title_source
+        // precedence rule, where a resume never re-seeds the priority-1
+        // 'spawn' name over a higher source.
+        const { plan_verb, plan_ref } = planVerbRefFromSpawnName(
           event.spawn_name,
-          event.spawn_name ? "spawn" : null,
-          extractTranscriptPath(event),
-        ],
-      );
+        );
+        db.run(
+          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(job_id) DO UPDATE SET
+             pid = COALESCE(excluded.pid, jobs.pid),
+             start_time = COALESCE(excluded.start_time, jobs.start_time),
+             state = CASE WHEN jobs.state IN ('${ENDED}','${KILLED}') THEN 'stopped' ELSE jobs.state END,
+             last_event_id = excluded.last_event_id,
+             updated_at = excluded.updated_at`,
+          [
+            jobId,
+            ts,
+            event.cwd,
+            event.pid,
+            event.start_time,
+            event.id,
+            ts,
+            event.spawn_name,
+            event.spawn_name ? "spawn" : null,
+            extractTranscriptPath(event),
+            plan_verb,
+            plan_ref,
+          ],
+        );
+      }
       break;
 
     case "UserPromptSubmit":
@@ -814,7 +833,7 @@ export function drain(db: Database, batchSize = DEFAULT_BATCH_SIZE): number {
       `SELECT id, ts, session_id, pid, hook_event, event_type, tool_name,
               matcher, cwd, permission_mode, agent_id, agent_type,
               stop_hook_active, data, subagent_agent_id, spawn_name,
-              start_time
+              start_time, slash_command, skill_name
          FROM events
         WHERE id > ?
         ORDER BY id ASC

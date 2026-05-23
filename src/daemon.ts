@@ -269,6 +269,8 @@ function runDaemon(): void {
       $subagent_agent_id: null,
       $spawn_name: null,
       $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
     });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the title folds without a poll-cycle delay.
@@ -370,6 +372,8 @@ function runDaemon(): void {
       $subagent_agent_id: null,
       $spawn_name: null,
       $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
     });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the snapshot folds without a poll-cycle delay.
@@ -472,6 +476,8 @@ function runDaemon(): void {
       $subagent_agent_id: null,
       $spawn_name: null,
       $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
     });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the Killed fold lands without a poll-

@@ -169,7 +169,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("9");
+  expect(row.value).toBe("10");
   db.close();
 });
 
@@ -274,7 +274,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("9");
+  expect(ver.value).toBe("10");
 
   const eventNames = (
     db.prepare("PRAGMA table_info(events)").all() as {
@@ -315,7 +315,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("9");
+  expect(ver2.value).toBe("10");
   db2.close();
 });
 
@@ -368,7 +368,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("9");
+  expect(ver.value).toBe("10");
 
   const jobNames = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
@@ -399,7 +399,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("9");
+  expect(ver2.value).toBe("10");
   db2.close();
 });
 
@@ -434,7 +434,7 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("9");
+  expect(ver.value).toBe("10");
   const names = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
@@ -486,7 +486,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("9");
+  expect(ver.value).toBe("10");
 
   const tables = new Set(
     (
@@ -542,7 +542,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("9");
+  expect(ver2.value).toBe("10");
   db2.close();
 });
 
@@ -601,7 +601,7 @@ test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, tas
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("9");
+  expect(ver.value).toBe("10");
 
   // tasks table is gone.
   const tables = new Set(
@@ -737,7 +737,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("9");
+  expect(ver.value).toBe("10");
 
   // Both columns now appear.
   const eventNames = (
@@ -778,7 +778,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("9");
+  expect(ver2.value).toBe("10");
   const eventNames2 = (
     db2.prepare("PRAGMA table_info(events)").all() as { name: string }[]
   ).map((c) => c.name);
@@ -787,6 +787,342 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
     db2.prepare("PRAGMA table_info(jobs)").all() as { name: string }[]
   ).map((c) => c.name);
   expect(jobNames2.filter((n) => n === "start_time")).toHaveLength(1);
+  db2.close();
+});
+
+test("fresh openDb at v10 has events.slash_command + events.skill_name + jobs.plan_verb + jobs.plan_ref as nullable TEXT", () => {
+  const { db } = openDb(dbPath);
+  const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const slashCmd = eventCols.find((c) => c.name === "slash_command");
+  expect(slashCmd).toBeDefined();
+  expect(slashCmd?.type).toBe("TEXT");
+  expect(slashCmd?.notnull).toBe(0);
+  expect(slashCmd?.dflt_value).toBeNull();
+  const skillName = eventCols.find((c) => c.name === "skill_name");
+  expect(skillName).toBeDefined();
+  expect(skillName?.type).toBe("TEXT");
+  expect(skillName?.notnull).toBe(0);
+  expect(skillName?.dflt_value).toBeNull();
+
+  const jobCols = db.prepare("PRAGMA table_info(jobs)").all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const planVerb = jobCols.find((c) => c.name === "plan_verb");
+  expect(planVerb).toBeDefined();
+  expect(planVerb?.type).toBe("TEXT");
+  expect(planVerb?.notnull).toBe(0);
+  expect(planVerb?.dflt_value).toBeNull();
+  const planRef = jobCols.find((c) => c.name === "plan_ref");
+  expect(planRef).toBeDefined();
+  expect(planRef?.type).toBe("TEXT");
+  expect(planRef?.notnull).toBe(0);
+  expect(planRef?.dflt_value).toBeNull();
+  db.close();
+});
+
+test("v10 partial indexes are present on fresh openDb", () => {
+  const { db } = openDb(dbPath);
+  const indexes = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+    .all() as { name: string }[];
+  const names = new Set(indexes.map((i) => i.name));
+  expect(names.has("idx_events_slash_command")).toBe(true);
+  expect(names.has("idx_events_skill_name")).toBe(true);
+  expect(names.has("idx_jobs_plan_ref")).toBe(true);
+  db.close();
+});
+
+test("v10 idx_jobs_plan_ref serves a WHERE plan_verb='close' query (EXPLAIN QUERY PLAN)", () => {
+  const { db } = openDb(dbPath);
+  // Seed enough rows + ANALYZE so the planner picks the partial index over a
+  // table scan. The acceptance bar is "an EXPLAIN QUERY PLAN ... shows SEARCH
+  // ... USING INDEX idx_jobs_plan_ref (or equivalent index hit)" — `plan_verb`
+  // skips its own index (cardinality 3) so a `WHERE plan_verb='close'` query
+  // is served via the partial index on `plan_ref IS NOT NULL` paired with a
+  // post-seek check. Confirm via the documented partial-index pattern
+  // (sqlite.org/partialindex.html §2 Rule 2: ANY comparison on the indexed
+  // column matches a `WHERE col IS NOT NULL` predicate, so a `plan_ref`-
+  // touching predicate lands the index).
+  const ts = 1_700_000_000;
+  const insert = db.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, plan_verb, plan_ref) VALUES (?, ?, ?, ?, ?, ?)",
+  );
+  for (let i = 0; i < 50; i++) {
+    insert.run(`null-${i}`, ts, i, ts, null, null);
+  }
+  insert.run("close-1", ts, 100, ts, "close", "fn-575-foo");
+  insert.run("work-1", ts, 101, ts, "work", "fn-575-foo.1");
+  db.run("ANALYZE");
+
+  // The acceptance check: a query that filters on the indexed column (or one
+  // covered by the partial-index predicate) must hit the index, not a scan.
+  const plan = db
+    .prepare(
+      "EXPLAIN QUERY PLAN SELECT job_id FROM jobs WHERE plan_ref = 'fn-575-foo'",
+    )
+    .all() as { detail: string }[];
+  const detail = plan.map((r) => r.detail).join(" | ");
+  expect(detail).toMatch(/idx_jobs_plan_ref/);
+  db.close();
+});
+
+test("v9 DB migrates to v10: four columns added + three partial indexes + backfill, second open is idempotent", () => {
+  // Build a v9-shaped DB by hand: events + jobs at the v9 shape (no
+  // slash_command / skill_name / plan_verb / plan_ref), version '9'.
+  // Seed historical rows the backfill must walk:
+  // - A UserPromptSubmit with a `/plan:work fn-X` prompt → slash_command
+  //   backfilled, skill_name NULL.
+  // - A UserPromptSubmit with a non-slash prompt → both NULL.
+  // - A UserPromptSubmit with a path-shape prompt (`/Users/...`) → both NULL
+  //   (the regex requires a lowercase letter after `/`, so `/U...` rejects).
+  // - A PreToolUse on Skill with `tool_input.skill: 'plan:plan'` →
+  //   skill_name backfilled, slash_command NULL.
+  // - A PostToolUse on a non-Skill tool → both NULL (tool gate).
+  // - A SessionStart with spawn_name matching the whitelist → its job row
+  //   gets plan_verb / plan_ref backfilled.
+  // - A SessionStart with spawn_name `audit::fn-1-foo` → row stays NULL
+  //   (whitelist excludes audit).
+  // - A SessionStart with no spawn_name → row stays NULL.
+  const v9 = new Database(dbPath, { create: true });
+  v9.run(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      session_id TEXT NOT NULL,
+      pid INTEGER,
+      hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      tool_name TEXT,
+      matcher TEXT,
+      cwd TEXT,
+      permission_mode TEXT,
+      agent_id TEXT,
+      agent_type TEXT,
+      stop_hook_active INTEGER,
+      data TEXT NOT NULL,
+      subagent_agent_id TEXT,
+      spawn_name TEXT,
+      start_time TEXT
+    )
+  `);
+  v9.run(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_source TEXT,
+      transcript_path TEXT,
+      start_time TEXT
+    )
+  `);
+  v9.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v9.run("INSERT INTO meta (key, value) VALUES ('schema_version', '9')");
+
+  // Seed events.
+  const insertEvent = v9.prepare(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, tool_name, data, spawn_name) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  );
+  insertEvent.run(
+    1,
+    "sess-slash",
+    "UserPromptSubmit",
+    "user_prompt_submit",
+    null,
+    JSON.stringify({ prompt: "/plan:work fn-575-foo" }),
+    null,
+  );
+  insertEvent.run(
+    2,
+    "sess-plain",
+    "UserPromptSubmit",
+    "user_prompt_submit",
+    null,
+    JSON.stringify({ prompt: "just some text" }),
+    null,
+  );
+  insertEvent.run(
+    3,
+    "sess-path",
+    "UserPromptSubmit",
+    "user_prompt_submit",
+    null,
+    JSON.stringify({ prompt: "/Users/mike/code/keeper" }),
+    null,
+  );
+  insertEvent.run(
+    4,
+    "sess-skill",
+    "PreToolUse",
+    "pre_tool_use",
+    "Skill",
+    JSON.stringify({ tool_input: { skill: "plan:plan", args: "..." } }),
+    null,
+  );
+  insertEvent.run(
+    5,
+    "sess-bash",
+    "PostToolUse",
+    "tool_use",
+    "Bash",
+    JSON.stringify({ tool_response: {} }),
+    null,
+  );
+  insertEvent.run(
+    6,
+    "sess-work",
+    "SessionStart",
+    "session_start",
+    null,
+    "{}",
+    "work::fn-575-foo.1",
+  );
+  insertEvent.run(
+    7,
+    "sess-audit",
+    "SessionStart",
+    "session_start",
+    null,
+    "{}",
+    "audit::fn-1-bar",
+  );
+  insertEvent.run(
+    8,
+    "sess-nospawn",
+    "SessionStart",
+    "session_start",
+    null,
+    "{}",
+    null,
+  );
+  insertEvent.run(
+    9,
+    "sess-malformed",
+    "UserPromptSubmit",
+    "user_prompt_submit",
+    null,
+    "{not valid json",
+    null,
+  );
+
+  // Seed corresponding jobs rows. Only the SessionStart-having sessions
+  // get a jobs row (mirrors the reducer's SessionStart insert path).
+  const insertJob = v9.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES (?, ?, ?, ?)",
+  );
+  insertJob.run("sess-work", 1, 6, 1);
+  insertJob.run("sess-audit", 1, 7, 1);
+  insertJob.run("sess-nospawn", 1, 8, 1);
+  v9.close();
+
+  // Reopen via openDb — migrate() runs the v9→v10 idempotent ADD COLUMNs,
+  // the partial indexes, and the same-transaction JS backfill.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("10");
+
+  // All four columns appear.
+  const eventNames = (
+    db.prepare("PRAGMA table_info(events)").all() as { name: string }[]
+  ).map((c) => c.name);
+  expect(eventNames).toContain("slash_command");
+  expect(eventNames).toContain("skill_name");
+  const jobNames = (
+    db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[]
+  ).map((c) => c.name);
+  expect(jobNames).toContain("plan_verb");
+  expect(jobNames).toContain("plan_ref");
+
+  // Partial indexes present.
+  const indexNames = new Set(
+    (
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+        .all() as { name: string }[]
+    ).map((i) => i.name),
+  );
+  expect(indexNames.has("idx_events_slash_command")).toBe(true);
+  expect(indexNames.has("idx_events_skill_name")).toBe(true);
+  expect(indexNames.has("idx_jobs_plan_ref")).toBe(true);
+
+  // Backfill: events.
+  const ev = db
+    .prepare("SELECT session_id, slash_command, skill_name FROM events")
+    .all() as {
+    session_id: string;
+    slash_command: string | null;
+    skill_name: string | null;
+  }[];
+  const eventBy = new Map(ev.map((r) => [r.session_id, r]));
+  expect(eventBy.get("sess-slash")?.slash_command).toBe("/plan:work");
+  expect(eventBy.get("sess-slash")?.skill_name).toBeNull();
+  expect(eventBy.get("sess-plain")?.slash_command).toBeNull();
+  expect(eventBy.get("sess-plain")?.skill_name).toBeNull();
+  // `/Users/...` REJECTS the slash-command regex (uppercase after `/`).
+  expect(eventBy.get("sess-path")?.slash_command).toBeNull();
+  expect(eventBy.get("sess-path")?.skill_name).toBeNull();
+  expect(eventBy.get("sess-skill")?.slash_command).toBeNull();
+  expect(eventBy.get("sess-skill")?.skill_name).toBe("plan:plan");
+  expect(eventBy.get("sess-bash")?.slash_command).toBeNull();
+  expect(eventBy.get("sess-bash")?.skill_name).toBeNull();
+  // The SessionStart rows aren't slash-command / Skill candidates — both NULL.
+  expect(eventBy.get("sess-work")?.slash_command).toBeNull();
+  expect(eventBy.get("sess-work")?.skill_name).toBeNull();
+  // A malformed JSON blob falls through the try/catch and leaves both NULL —
+  // the migration must converge, not throw.
+  expect(eventBy.get("sess-malformed")?.slash_command).toBeNull();
+  expect(eventBy.get("sess-malformed")?.skill_name).toBeNull();
+
+  // Backfill: jobs.
+  const jobs = db
+    .prepare("SELECT job_id, plan_verb, plan_ref FROM jobs")
+    .all() as {
+    job_id: string;
+    plan_verb: string | null;
+    plan_ref: string | null;
+  }[];
+  const jobBy = new Map(jobs.map((r) => [r.job_id, r]));
+  expect(jobBy.get("sess-work")?.plan_verb).toBe("work");
+  expect(jobBy.get("sess-work")?.plan_ref).toBe("fn-575-foo.1");
+  expect(jobBy.get("sess-audit")?.plan_verb).toBeNull();
+  expect(jobBy.get("sess-audit")?.plan_ref).toBeNull();
+  expect(jobBy.get("sess-nospawn")?.plan_verb).toBeNull();
+  expect(jobBy.get("sess-nospawn")?.plan_ref).toBeNull();
+
+  // Second open is idempotent — the version-guarded backfill must not re-run
+  // (its UPDATEs would re-write the same values; the no-throw correctness is
+  // what we're checking) and the ALTERs must no-op on the now-current shape.
+  db.close();
+  const { db: db2 } = openDb(dbPath);
+  const ver2 = db2
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver2.value).toBe("10");
+  // Re-verify the backfill landed identically on the second open — the
+  // guard keeps the values stable.
+  const jobsAfter = db2
+    .prepare("SELECT job_id, plan_verb, plan_ref FROM jobs WHERE job_id = ?")
+    .get("sess-work") as {
+    job_id: string;
+    plan_verb: string | null;
+    plan_ref: string | null;
+  };
+  expect(jobsAfter.plan_verb).toBe("work");
+  expect(jobsAfter.plan_ref).toBe("fn-575-foo.1");
   db2.close();
 });
 

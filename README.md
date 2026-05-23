@@ -7,16 +7,27 @@ TypeScript hook plugin writes one row per Claude Code hook invocation into a
 SQLite `events` table — the durable, append-only log. A long-running Bun daemon
 (`keeperd`, managed by a macOS LaunchAgent) tails that table and folds new
 events into a minimal `jobs` projection: one row per session, carrying the live
-`state` (`working` / `stopped` / `ended` / `killed`) and a human-readable `title`
+`state` (`working` / `stopped` / `ended` / `killed`), a human-readable `title`
 (seeded from the session's spawn name at SessionStart, refined by the prompt
 payload and the live transcript `custom-title`, with a `title_source` recording
-its provenance and precedence: `spawn` < `payload` < `transcript`). The `killed`
-state is the sibling terminal state to `ended`: reached not from a SessionEnd
-hook but from synthetic `Killed` events emitted by the boot seed sweep and the
-live exit-watcher worker, which prove a session's `(pid, start_time)` is gone
-from the OUTSIDE (SIGKILL'd, terminal-pane-closed, machine reboot, hook crash).
-Both terminal states are revivable — a fresh `claude --resume` re-opens either
-one to `stopped`.
+its provenance and precedence: `spawn` < `payload` < `transcript`), and — for
+sessions spawned by planctl — a `(plan_verb, plan_ref)` pair derived at
+SessionStart from the spawn name. The verb is the strict whitelist `{plan,
+work, close}` and the ref is the targeted planctl entity (epic id like
+`fn-575-foo`, or task id like `fn-575-foo.3`); both stay NULL for sessions not
+spawned through planctl. The `killed` state is the sibling terminal state to
+`ended`: reached not from a SessionEnd hook but from synthetic `Killed` events
+emitted by the boot seed sweep and the live exit-watcher worker, which prove a
+session's `(pid, start_time)` is gone from the OUTSIDE (SIGKILL'd,
+terminal-pane-closed, machine reboot, hook crash). Both terminal states are
+revivable — a fresh `claude --resume` re-opens either one to `stopped`.
+
+The event log also indexes two sparse signals that surface across every
+session — `events.slash_command` (the leading `/foo:bar` token of a
+`UserPromptSubmit` prompt) and `events.skill_name` (the canonical name of a
+Skill-tool invocation, e.g. `plan:plan` or `arthack:check`) — so consumers can
+find `/plan:work` and `Skill` invocations cheaply without JSON-scanning the
+event `data` blob. Both are partial-indexed on `WHERE col IS NOT NULL`.
 
 The architecture is deliberately small. Keeper is built on Bun + `bun:sqlite`
 with a single third-party runtime dependency: `@parcel/watcher` (a native
@@ -320,9 +331,17 @@ list, see [CLAUDE.md](./CLAUDE.md).
 ## Inspect
 
 ```sh
-# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title):
+# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a planctl-shaped spawn name at SessionStart, NULL otherwise):
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT job_id, state, title, title_source, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
+  'SELECT job_id, state, title, title_source, plan_verb, plan_ref, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
+
+# Planctl-spawned jobs only — indexed via the partial `idx_jobs_plan_ref WHERE plan_ref IS NOT NULL` so this lands the index, not a scan:
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT job_id, plan_verb, plan_ref, state, title FROM jobs WHERE plan_verb = 'close' ORDER BY updated_at DESC LIMIT 10"
+
+# All Skill-tool plan:plan invocations across sessions — uses the partial idx_events_skill_name index:
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT session_id, datetime(ts,'unixepoch','localtime'), skill_name FROM events WHERE skill_name LIKE 'plan:%' ORDER BY id DESC LIMIT 20"
 
 # Killed sessions specifically (proven-dead from outside the hook stream — SIGKILL, terminal-pane closure, reboot):
 sqlite3 ~/.local/state/keeper/keeper.db \

@@ -21,12 +21,17 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+  extractSkillName,
+  planVerbRefFromSpawnName,
+  slashCommandFromPrompt,
+} from "./derivers";
 
 /**
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -221,7 +226,9 @@ CREATE TABLE IF NOT EXISTS events (
     data TEXT NOT NULL,
     subagent_agent_id TEXT,
     spawn_name TEXT,
-    start_time TEXT
+    start_time TEXT,
+    slash_command TEXT,
+    skill_name TEXT
 )
 `;
 
@@ -238,6 +245,26 @@ const CREATE_EVENTS_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_events_subagent_agent_id ON events(subagent_agent_id) WHERE subagent_agent_id IS NOT NULL",
 ];
 
+/**
+ * Indexes added in schema v10 that depend on columns added by the v9→v10
+ * `addColumnIfMissing` step. KEPT OUT of {@link CREATE_EVENTS_INDEXES} so
+ * the unconditional CREATE block doesn't try to index a column that doesn't
+ * exist yet on a migrating v9 DB. `migrate()` runs these AFTER the matching
+ * ADD COLUMNs in the v9→v10 block; a fresh v10 DB picks them up via the
+ * same block (the addColumnIfMissing no-ops on the freshly CREATE'd table).
+ * `WHERE col IS NOT NULL` is the canonical SQLite partial-index pattern
+ * (sqlite.org/partialindex.html §2 Rule 2): the planner auto-matches any
+ * equality/LIKE comparison on the indexed column when the predicate is
+ * `IS NOT NULL`, so a `WHERE slash_command = '/plan:work'` / `WHERE
+ * skill_name LIKE 'plan:%'` / `WHERE plan_ref = ...` query lands the index
+ * instead of a scan.
+ */
+const CREATE_V10_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_events_slash_command ON events(slash_command) WHERE slash_command IS NOT NULL",
+  "CREATE INDEX IF NOT EXISTS idx_events_skill_name ON events(skill_name) WHERE skill_name IS NOT NULL",
+  "CREATE INDEX IF NOT EXISTS idx_jobs_plan_ref ON jobs(plan_ref) WHERE plan_ref IS NOT NULL",
+];
+
 const CREATE_JOBS = `
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
@@ -250,7 +277,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     title TEXT,
     title_source TEXT,
     transcript_path TEXT,
-    start_time TEXT
+    start_time TEXT,
+    plan_verb TEXT,
+    plan_ref TEXT
 )
 `;
 
@@ -524,6 +553,146 @@ function migrate(db: Database): void {
     addColumnIfMissing(db, "events", "start_time", "TEXT");
     addColumnIfMissing(db, "jobs", "start_time", "TEXT");
 
+    // v9→v10: index slash-command + Skill-tool invocations and project the
+    // canonical `{plan,work,close}::<ref>` spawn-name verb/ref pair onto jobs
+    // rows so consumers can associate planctl invocations with sessions
+    // without JSON-scanning `events.data` blobs. Four new columns, three new
+    // partial indexes (`events.slash_command`, `events.skill_name`,
+    // `jobs.plan_ref`), plus a same-transaction backfill of every existing
+    // row via the SAME pure derivers the hook + reducer use (single source
+    // of truth — guarantees migrated rows byte-match steady-state ones).
+    //
+    // Column defs match CREATE_EVENTS / CREATE_JOBS literals so a fresh v10
+    // DB and a migrated v9→v10 DB converge to identical schema (the
+    // addColumnIfMissing/literal lockstep convention). The partial indexes
+    // are CREATE INDEX IF NOT EXISTS above; a fresh DB picks them up via
+    // CREATE_EVENTS_INDEXES/CREATE_JOBS_INDEXES, and a migrating DB picks
+    // them up on the same boot — both paths converge to the same index set.
+    addColumnIfMissing(db, "events", "slash_command", "TEXT");
+    addColumnIfMissing(db, "events", "skill_name", "TEXT");
+    addColumnIfMissing(db, "jobs", "plan_verb", "TEXT");
+    addColumnIfMissing(db, "jobs", "plan_ref", "TEXT");
+
+    // CREATE the v10 partial indexes AFTER the ADD COLUMNs they depend on.
+    // A fresh v10 DB enters this block too — the addColumnIfMissing calls
+    // above no-op (the columns already exist via CREATE_EVENTS/CREATE_JOBS
+    // literals), and these CREATE INDEX IF NOT EXISTS calls land the same
+    // index set on both a fresh-v10 and a migrating-v9 DB.
+    for (const sql of CREATE_V10_INDEXES) {
+      db.run(sql);
+    }
+
+    // Same-transaction JS-driven backfill. The slash-command anchored regex
+    // and the skill-name shape-defensive read aren't expressible in SQLite
+    // without REGEXP, so we walk events in JS and write derived columns
+    // back via UPDATEs in the same BEGIN IMMEDIATE — if any UPDATE throws
+    // the entire migration rolls back (ALTERs included), no half-state
+    // possible.
+    //
+    // Version-guarded: a non-idempotent backfill must run AT MOST once. The
+    // guard reads the meta row written by a PRIOR migrate() — on a fresh
+    // DB (or one that crashed before stamping v10) `storedVersion < 10`
+    // and the backfill runs; on a steady-state v10+ DB it skips, so a
+    // second `openDb` is a clean no-op.
+    const storedVersionV10 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV10 < 10) {
+      // Backfill events: walk every row whose hook_event is a candidate for
+      // either deriver (UserPromptSubmit → slash_command, Pre/PostToolUse
+      // → skill_name), parse the stored `data` JSON, run the same derivers
+      // the hook uses, write the two columns back. A row that doesn't match
+      // either gate stays NULL — the derivers' gates short-circuit cleanly.
+      //
+      // The blob is parsed defensively (try/catch → null on malformed JSON):
+      // historical rows include some malformed blobs, and a throw here would
+      // wedge the migration. The derivers themselves never throw — every
+      // shape-mismatch path returns null.
+      //
+      // IMPORTANT: We use `db.run(sql, params)` (sqlite3_prepare_v3 + step +
+      // finalize each call — see Bun docs `Database.run`), NOT a cached
+      // `db.prepare(...).run()` or `db.query(...).run()`. A prepared
+      // statement compiled inside the same transaction as the ALTER it
+      // depends on can pin the pre-ALTER schema metadata (the open
+      // oven-sh/bun#1332 statement-cache gotcha called out in the epic's
+      // Risks section). `db.run` is the documented uncached path and
+      // sidesteps the pin completely. Backfill volume is bounded by the
+      // historical event count, run only ONCE per DB upgrade.
+      const rows = db
+        .prepare(
+          `SELECT id, hook_event, tool_name, data
+             FROM events
+            WHERE hook_event IN ('UserPromptSubmit', 'PreToolUse', 'PostToolUse')`,
+        )
+        .all() as {
+        id: number;
+        hook_event: string;
+        tool_name: string | null;
+        data: string;
+      }[];
+      for (const row of rows) {
+        let parsed: Record<string, unknown> | null = null;
+        try {
+          parsed = JSON.parse(row.data) as Record<string, unknown>;
+        } catch {
+          // malformed blob — skip derivation, columns stay NULL
+        }
+        let slashCommand: string | null = null;
+        let skillName: string | null = null;
+        if (parsed != null) {
+          if (row.hook_event === "UserPromptSubmit") {
+            slashCommand = slashCommandFromPrompt(parsed.prompt);
+          }
+          skillName = extractSkillName(row.hook_event, row.tool_name, parsed);
+        }
+        if (slashCommand != null || skillName != null) {
+          db.run(
+            "UPDATE events SET slash_command = ?, skill_name = ? WHERE id = ?",
+            [slashCommand, skillName, row.id],
+          );
+        }
+      }
+
+      // Backfill jobs: for every job, look up its SessionStart event and run
+      // the spawn-name parser. A job with no SessionStart row in the log
+      // (orphan / hook crash) stays both-NULL. A job whose SessionStart
+      // spawn_name doesn't match the strict whitelist also stays both-NULL.
+      //
+      // The SELECT picks the EARLIEST SessionStart by ts then id — matches
+      // the reducer's first-sight upsert path (a duplicate SessionStart on
+      // ON CONFLICT RESUME doesn't touch title/title_source/plan_verb/
+      // plan_ref, so the FIRST row's spawn_name is what determines the
+      // derived pair). The UPDATE uses the same uncached `db.run` path as
+      // the events backfill above.
+      const jobRows = db.prepare("SELECT job_id FROM jobs").all() as {
+        job_id: string;
+      }[];
+      for (const job of jobRows) {
+        const ev = db
+          .prepare(
+            `SELECT spawn_name
+               FROM events
+              WHERE session_id = ? AND hook_event = 'SessionStart'
+              ORDER BY ts ASC, id ASC
+              LIMIT 1`,
+          )
+          .get(job.job_id) as { spawn_name: string | null } | null;
+        const { plan_verb, plan_ref } = planVerbRefFromSpawnName(
+          ev?.spawn_name ?? null,
+        );
+        if (plan_verb != null && plan_ref != null) {
+          db.run(
+            "UPDATE jobs SET plan_verb = ?, plan_ref = ? WHERE job_id = ?",
+            [plan_verb, plan_ref, job.job_id],
+          );
+        }
+      }
+    }
+
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(String(SCHEMA_VERSION));
@@ -556,11 +725,11 @@ function prepareStmts(db: Database): Stmts {
       INSERT INTO events (
         ts, session_id, pid, hook_event, event_type, tool_name, matcher,
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-        subagent_agent_id, spawn_name, start_time
+        subagent_agent_id, spawn_name, start_time, slash_command, skill_name
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
-        $subagent_agent_id, $spawn_name, $start_time
+        $subagent_agent_id, $spawn_name, $start_time, $slash_command, $skill_name
       )
     `),
     selectWorldRev: db.prepare(

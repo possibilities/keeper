@@ -68,13 +68,15 @@ function insertEvent(
     subagent_agent_id: overrides.subagent_agent_id ?? null,
     spawn_name: overrides.spawn_name ?? null,
     start_time: overrides.start_time ?? null,
+    slash_command: overrides.slash_command ?? null,
+    skill_name: overrides.skill_name ?? null,
   };
   db.run(
     `INSERT INTO events (
        ts, session_id, pid, hook_event, event_type, tool_name, matcher,
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-       subagent_agent_id, spawn_name, start_time
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       subagent_agent_id, spawn_name, start_time, slash_command, skill_name
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -92,6 +94,8 @@ function insertEvent(
       row.subagent_agent_id,
       row.spawn_name,
       row.start_time,
+      row.slash_command,
+      row.skill_name,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -112,6 +116,8 @@ function getJob(jobId = "sess-a") {
     title: string | null;
     title_source: string | null;
     start_time: string | null;
+    plan_verb: string | null;
+    plan_ref: string | null;
   } | null;
 }
 
@@ -883,6 +889,175 @@ test("title fold re-folds idempotently: draining from scratch yields identical t
   db.run("DELETE FROM jobs");
   drainAll();
   expect(getJob()?.title).toBe("foo");
+});
+
+// ---------------------------------------------------------------------------
+// plan_verb / plan_ref derivation (spawn_name → jobs columns, v10)
+// ---------------------------------------------------------------------------
+
+test("SessionStart with work::<ref> seeds plan_verb='work' / plan_ref=<ref>", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "work::fn-575-osc-parser.3",
+  });
+  drainAll();
+  const job = getJob();
+  expect(job?.plan_verb).toBe("work");
+  expect(job?.plan_ref).toBe("fn-575-osc-parser.3");
+});
+
+test("SessionStart with close::<epic> seeds plan_verb='close' / plan_ref=<epic>", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "close::fn-575-osc-parser",
+  });
+  drainAll();
+  const job = getJob();
+  expect(job?.plan_verb).toBe("close");
+  expect(job?.plan_ref).toBe("fn-575-osc-parser");
+});
+
+test("SessionStart with plan::<ref> seeds plan_verb='plan' / plan_ref=<ref>", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "plan::fn-100-new-thing",
+  });
+  drainAll();
+  const job = getJob();
+  expect(job?.plan_verb).toBe("plan");
+  expect(job?.plan_ref).toBe("fn-100-new-thing");
+});
+
+test("SessionStart with audit::<ref> leaves plan_verb/plan_ref NULL (whitelist excludes audit)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "audit::fn-1-foo",
+  });
+  drainAll();
+  const job = getJob();
+  expect(job?.plan_verb).toBeNull();
+  expect(job?.plan_ref).toBeNull();
+});
+
+test("SessionStart with no spawn_name leaves plan_verb/plan_ref NULL", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  drainAll();
+  const job = getJob();
+  expect(job?.plan_verb).toBeNull();
+  expect(job?.plan_ref).toBeNull();
+});
+
+test("SessionStart with malformed verb::ref::extra leaves both NULL", () => {
+  // The `$` anchor rejects extra `::` segments — the spawn name can never
+  // partial-match and land wrong data in the projection.
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "work::fn-1-foo::extra",
+  });
+  drainAll();
+  const job = getJob();
+  expect(job?.plan_verb).toBeNull();
+  expect(job?.plan_ref).toBeNull();
+});
+
+test("SessionStart with non-fn-shaped ref leaves both NULL", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "work::not-an-fn-ref",
+  });
+  drainAll();
+  const job = getJob();
+  expect(job?.plan_verb).toBeNull();
+  expect(job?.plan_ref).toBeNull();
+});
+
+test("duplicate SessionStart leaves plan_verb/plan_ref untouched (set-once identity)", () => {
+  // First SessionStart seeds (work, fn-575-foo.1). A second SessionStart with
+  // a DIFFERENT verb/ref must NOT overwrite — set-once mirrors the title /
+  // title_source precedence rule on RESUME.
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "work::fn-575-foo.1",
+    pid: 1000,
+  });
+  drainAll();
+  expect(getJob()?.plan_verb).toBe("work");
+  expect(getJob()?.plan_ref).toBe("fn-575-foo.1");
+
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "close::fn-999-other",
+    pid: 2000,
+  });
+  drainAll();
+  const job = getJob();
+  // pid refreshed via RESUME, but plan_verb / plan_ref stay at the first-sight
+  // values — even though the new spawn_name parses cleanly.
+  expect(job?.pid).toBe(2000);
+  expect(job?.plan_verb).toBe("work");
+  expect(job?.plan_ref).toBe("fn-575-foo.1");
+});
+
+test("duplicate SessionStart that clears spawn_name leaves plan_verb/plan_ref untouched", () => {
+  // RESUME with no spawn_name also must not clear the seeded pair — the ON
+  // CONFLICT branch never touches these columns, regardless of incoming value.
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "work::fn-575-foo.1",
+  });
+  drainAll();
+  expect(getJob()?.plan_verb).toBe("work");
+
+  insertEvent({ hook_event: "SessionStart" });
+  drainAll();
+  const job = getJob();
+  expect(job?.plan_verb).toBe("work");
+  expect(job?.plan_ref).toBe("fn-575-foo.1");
+});
+
+test("plan_verb/plan_ref re-fold idempotently: rewind + redrain reproduces seeded pair", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "close::fn-575-osc-parser",
+  });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  const before = getJob();
+  expect(before?.plan_verb).toBe("close");
+  expect(before?.plan_ref).toBe("fn-575-osc-parser");
+
+  // The pair is a pure function of the event log — a rewind + DELETE + redrain
+  // must reproduce identical (plan_verb, plan_ref).
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = getJob();
+  expect(after?.plan_verb).toBe("close");
+  expect(after?.plan_ref).toBe("fn-575-osc-parser");
+});
+
+test("plan_verb/plan_ref re-fold idempotency on RESUME: rewind reproduces FIRST spawn (not later)", () => {
+  // Two SessionStarts with different spawn_names. The first wins (set-once
+  // identity on RESUME). A rewind+redrain must reproduce that same first-wins
+  // outcome — the second SessionStart's spawn_name never lands in the row.
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "work::fn-1-first",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "close::fn-2-second",
+  });
+  drainAll();
+  expect(getJob()?.plan_verb).toBe("work");
+  expect(getJob()?.plan_ref).toBe("fn-1-first");
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  expect(getJob()?.plan_verb).toBe("work");
+  expect(getJob()?.plan_ref).toBe("fn-1-first");
 });
 
 // ---------------------------------------------------------------------------

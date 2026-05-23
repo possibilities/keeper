@@ -27,6 +27,11 @@ import {
   splitArgsLstart,
 } from "../plugin/hooks/events-writer";
 import { openDb } from "../src/db";
+import {
+  extractSkillName,
+  planVerbRefFromSpawnName,
+  slashCommandFromPrompt,
+} from "../src/derivers";
 
 const ROOT = join(import.meta.dir, "..");
 const HOOK_ENTRY = join(ROOT, "plugin", "hooks", "events-writer.ts");
@@ -392,4 +397,386 @@ test("parseLinuxStarttime returns null on a malformed stat line (no closing pare
 
 test("parseLinuxStarttime returns null when field 22 is non-numeric", () => {
   expect(parseLinuxStarttime(buildStat("proc", "not-a-number"))).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// slashCommandFromPrompt unit (v10 deriver)
+// ---------------------------------------------------------------------------
+
+test("slashCommandFromPrompt extracts a bare /command at start", () => {
+  expect(slashCommandFromPrompt("/foo")).toBe("/foo");
+});
+
+test("slashCommandFromPrompt extracts /plugin:command", () => {
+  expect(slashCommandFromPrompt("/plan:work fn-575-foo")).toBe("/plan:work");
+});
+
+test("slashCommandFromPrompt extracts /command-with-kebab", () => {
+  expect(slashCommandFromPrompt("/some-command and args")).toBe(
+    "/some-command",
+  );
+});
+
+test("slashCommandFromPrompt allows underscore and digits in body", () => {
+  expect(slashCommandFromPrompt("/foo_bar2 args")).toBe("/foo_bar2");
+});
+
+test("slashCommandFromPrompt stops at first non-class character", () => {
+  // The body class is `[\w:-]`; a space, `.`, `/`, `!`, etc. all stop it.
+  expect(slashCommandFromPrompt("/foo bar")).toBe("/foo");
+  expect(slashCommandFromPrompt("/foo!")).toBe("/foo");
+  expect(slashCommandFromPrompt("/foo.bar")).toBe("/foo");
+  expect(slashCommandFromPrompt("/foo/bar")).toBe("/foo");
+});
+
+test("slashCommandFromPrompt rejects /Uppercase (paths like /Users/...)", () => {
+  // Strict: requires a lowercase letter immediately after `/` so file paths
+  // can never false-match.
+  expect(slashCommandFromPrompt("/Users/mike/code/keeper")).toBeNull();
+  expect(slashCommandFromPrompt("/Library/Caches")).toBeNull();
+});
+
+test("slashCommandFromPrompt rejects a non-leading /command", () => {
+  // Anchored to start-of-string: an inline mention never matches.
+  expect(slashCommandFromPrompt("hello /plan:work fn-575")).toBeNull();
+  expect(slashCommandFromPrompt("  /foo")).toBeNull();
+});
+
+test("slashCommandFromPrompt rejects a bare slash or empty", () => {
+  expect(slashCommandFromPrompt("/")).toBeNull();
+  expect(slashCommandFromPrompt("")).toBeNull();
+});
+
+test("slashCommandFromPrompt rejects a digit-led command (/1foo)", () => {
+  // The first body char must be `[a-z]` — `/1foo` rejects (matches no path
+  // shape we want to index anyway).
+  expect(slashCommandFromPrompt("/1foo")).toBeNull();
+});
+
+test("slashCommandFromPrompt returns null on non-string input", () => {
+  // Defensive against Claude Code shape drift — see CLAUDE.md "always exit 0".
+  expect(slashCommandFromPrompt(null)).toBeNull();
+  expect(slashCommandFromPrompt(undefined)).toBeNull();
+  expect(slashCommandFromPrompt(42)).toBeNull();
+  expect(slashCommandFromPrompt({})).toBeNull();
+  expect(slashCommandFromPrompt(["/foo"])).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// extractSkillName unit (v10 deriver)
+// ---------------------------------------------------------------------------
+
+test("extractSkillName: PreToolUse + Skill + string skill → returns skill", () => {
+  expect(
+    extractSkillName("PreToolUse", "Skill", {
+      tool_input: { skill: "plan:plan" },
+    }),
+  ).toBe("plan:plan");
+});
+
+test("extractSkillName: PostToolUse + Skill + string skill → returns skill", () => {
+  expect(
+    extractSkillName("PostToolUse", "Skill", {
+      tool_input: { skill: "arthack:check" },
+    }),
+  ).toBe("arthack:check");
+});
+
+test("extractSkillName: non-Pre/PostToolUse hook returns null", () => {
+  // Every other hook (SessionStart, Stop, Notification, etc.) is gated out.
+  expect(
+    extractSkillName("SessionStart", "Skill", {
+      tool_input: { skill: "plan:plan" },
+    }),
+  ).toBeNull();
+  expect(
+    extractSkillName("UserPromptSubmit", "Skill", {
+      tool_input: { skill: "plan:plan" },
+    }),
+  ).toBeNull();
+});
+
+test("extractSkillName: PreToolUse on a non-Skill tool returns null", () => {
+  // Even with a `tool_input.skill` populated, the tool gate keeps it out —
+  // only Skill tool invocations populate the column.
+  expect(
+    extractSkillName("PreToolUse", "Bash", {
+      tool_input: { skill: "plan:plan" },
+    }),
+  ).toBeNull();
+  expect(
+    extractSkillName("PreToolUse", "Read", {
+      tool_input: { skill: "plan:plan" },
+    }),
+  ).toBeNull();
+});
+
+test("extractSkillName: missing tool_input returns null", () => {
+  expect(extractSkillName("PreToolUse", "Skill", {})).toBeNull();
+});
+
+test("extractSkillName: non-object tool_input returns null (defensive)", () => {
+  expect(
+    extractSkillName("PreToolUse", "Skill", { tool_input: "not an object" }),
+  ).toBeNull();
+  expect(
+    extractSkillName("PreToolUse", "Skill", { tool_input: 42 }),
+  ).toBeNull();
+  expect(
+    extractSkillName("PreToolUse", "Skill", { tool_input: null }),
+  ).toBeNull();
+});
+
+test("extractSkillName: non-string skill returns null (defensive)", () => {
+  expect(
+    extractSkillName("PreToolUse", "Skill", { tool_input: { skill: 42 } }),
+  ).toBeNull();
+  expect(
+    extractSkillName("PreToolUse", "Skill", {
+      tool_input: { skill: { name: "plan:plan" } },
+    }),
+  ).toBeNull();
+});
+
+test("extractSkillName: empty-string skill returns null", () => {
+  expect(
+    extractSkillName("PreToolUse", "Skill", { tool_input: { skill: "" } }),
+  ).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// planVerbRefFromSpawnName unit (v10 deriver)
+// ---------------------------------------------------------------------------
+
+test("planVerbRefFromSpawnName: work::<epic-task> → {work, ref}", () => {
+  expect(planVerbRefFromSpawnName("work::fn-575-osc-parser.3")).toEqual({
+    plan_verb: "work",
+    plan_ref: "fn-575-osc-parser.3",
+  });
+});
+
+test("planVerbRefFromSpawnName: close::<epic> → {close, epic-id}", () => {
+  expect(planVerbRefFromSpawnName("close::fn-575-osc-parser")).toEqual({
+    plan_verb: "close",
+    plan_ref: "fn-575-osc-parser",
+  });
+});
+
+test("planVerbRefFromSpawnName: plan::<ref> → {plan, ref}", () => {
+  expect(planVerbRefFromSpawnName("plan::fn-100-new-thing")).toEqual({
+    plan_verb: "plan",
+    plan_ref: "fn-100-new-thing",
+  });
+});
+
+test("planVerbRefFromSpawnName: audit::<ref> → {null, null} (whitelist)", () => {
+  // audit is NOT in the locked whitelist — adding it requires editing the
+  // regex deliberately, never silent fall-through.
+  expect(planVerbRefFromSpawnName("audit::fn-1-foo")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+});
+
+test("planVerbRefFromSpawnName: develop::<ref> → {null, null} (whitelist)", () => {
+  expect(planVerbRefFromSpawnName("develop::fn-1-foo")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+});
+
+test("planVerbRefFromSpawnName: extra ::segment rejected (no partial match)", () => {
+  // The `$` anchor rejects trailing data — a typo never partial-matches and
+  // lands wrong data in the projection.
+  expect(planVerbRefFromSpawnName("work::fn-1-foo::extra")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+});
+
+test("planVerbRefFromSpawnName: malformed ref (non-fn-shaped) rejected", () => {
+  expect(planVerbRefFromSpawnName("work::not-an-fn-ref")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+  expect(planVerbRefFromSpawnName("work::fn-no-number-here")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+});
+
+test("planVerbRefFromSpawnName: NULL or empty → {null, null}", () => {
+  expect(planVerbRefFromSpawnName(null)).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+  expect(planVerbRefFromSpawnName("")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+});
+
+test("planVerbRefFromSpawnName: free-text (no ::) rejected", () => {
+  // A bare session name like `my-job` (no `verb::ref` shape) gets both NULL.
+  expect(planVerbRefFromSpawnName("my-job")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+  expect(planVerbRefFromSpawnName("fix-osc")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+});
+
+test("planVerbRefFromSpawnName: case-sensitive verb (Work::... rejected)", () => {
+  // The verb is lowercase-only; a casing typo never lands wrong data.
+  expect(planVerbRefFromSpawnName("Work::fn-1-foo")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hook process integration (v10): slash_command + skill_name end-to-end
+// ---------------------------------------------------------------------------
+
+test("hook writes slash_command on UserPromptSubmit with /plan:work prompt", async () => {
+  const code = await fireViaLauncher("my-session", {
+    hook_event_name: "UserPromptSubmit",
+    session_id: "sess-slash",
+    cwd: "/tmp/work",
+    prompt: "/plan:work fn-575-osc-parser.3",
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT slash_command, skill_name FROM events WHERE session_id = 'sess-slash'",
+      )
+      .get() as { slash_command: string | null; skill_name: string | null };
+    expect(row.slash_command).toBe("/plan:work");
+    expect(row.skill_name).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
+test("hook leaves slash_command NULL on UserPromptSubmit with free-text prompt", async () => {
+  const code = await fireViaLauncher("my-session", {
+    hook_event_name: "UserPromptSubmit",
+    session_id: "sess-plain",
+    cwd: "/tmp/work",
+    prompt: "just a free-text prompt without a leading slash",
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT slash_command FROM events WHERE session_id = 'sess-plain'",
+      )
+      .get() as { slash_command: string | null };
+    expect(row.slash_command).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
+test("hook leaves slash_command NULL on UserPromptSubmit with /Users/... path prompt", async () => {
+  const code = await fireViaLauncher("my-session", {
+    hook_event_name: "UserPromptSubmit",
+    session_id: "sess-path",
+    cwd: "/tmp/work",
+    prompt: "/Users/mike/code/keeper",
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT slash_command FROM events WHERE session_id = 'sess-path'",
+      )
+      .get() as { slash_command: string | null };
+    expect(row.slash_command).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
+test("hook writes skill_name on PreToolUse + Skill", async () => {
+  const code = await fireViaLauncher("my-session", {
+    hook_event_name: "PreToolUse",
+    session_id: "sess-skill",
+    cwd: "/tmp/work",
+    tool_name: "Skill",
+    tool_input: { skill: "plan:plan", args: "..." },
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT slash_command, skill_name FROM events WHERE session_id = 'sess-skill'",
+      )
+      .get() as { slash_command: string | null; skill_name: string | null };
+    expect(row.slash_command).toBeNull();
+    expect(row.skill_name).toBe("plan:plan");
+  } finally {
+    db.close();
+  }
+});
+
+test("hook leaves skill_name NULL on PreToolUse + non-Skill tool", async () => {
+  const code = await fireViaLauncher("my-session", {
+    hook_event_name: "PreToolUse",
+    session_id: "sess-bash",
+    cwd: "/tmp/work",
+    tool_name: "Bash",
+    tool_input: { command: "ls" },
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare("SELECT skill_name FROM events WHERE session_id = 'sess-bash'")
+      .get() as { skill_name: string | null };
+    expect(row.skill_name).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
+test("hook writes jobs.plan_verb/plan_ref via reducer when SessionStart spawn_name matches", async () => {
+  // Fire SessionStart whose parent argv carries the canonical spawn name —
+  // the hook captures `spawn_name`, the reducer derives plan_verb/plan_ref.
+  // We open the writer DB to drive the drain (the readonly handle the other
+  // tests use doesn't include the reducer).
+  const code = await fireViaLauncher("close::fn-575-osc-parser", {
+    hook_event_name: "SessionStart",
+    session_id: "sess-close",
+    cwd: "/tmp/work",
+  });
+  expect(code).toBe(0);
+
+  // Drain via the same code path the daemon uses.
+  const { db } = openDb(dbPath);
+  try {
+    const { drainToCompletion } = await import("../src/daemon");
+    drainToCompletion(db);
+    const row = db
+      .prepare(
+        "SELECT plan_verb, plan_ref FROM jobs WHERE job_id = 'sess-close'",
+      )
+      .get() as { plan_verb: string | null; plan_ref: string | null };
+    expect(row.plan_verb).toBe("close");
+    expect(row.plan_ref).toBe("fn-575-osc-parser");
+  } finally {
+    db.close();
+  }
 });
