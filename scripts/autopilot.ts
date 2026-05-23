@@ -8,9 +8,10 @@
  * It `query`s a 10-row page of `epics` (the server's default scope —
  * `status: "open"` — applies because the query sends no `filter` key) and
  * flattens every epic's embedded tasks into a single YAML block sequence:
- * one line per task, format `{repo} {epicRef}.{task_number} {epic title} ·
- * {task title}`. Each line is self-describing so the epic context survives "in
- * the name" without any nesting. Membership is frozen WITHIN a fetched page
+ * one line per task, format `{repo} {task_id}` (e.g.
+ * `vtkeep fn-575-osc-parser-hardening-spoke-4.1`). The task slug already
+ * carries the epic + task number, so no titles are rendered. Membership is
+ * frozen WITHIN a fetched page
  * (the server never reflows a live page), but the script REFETCHES the page —
  * on every `patch`/`meta` change signal AND on a steady poll — so each fresh
  * `result` reflects the current top-N. A NEW frame prints whenever the
@@ -114,13 +115,13 @@ Usage: bun scripts/autopilot.ts [--sock <path>]
 
 Renders a flat one-line-per-task stream across all open epics as a YAML
 document, one line per task in server-sent order:
-  - {repo} {epicRef}.{task_number} {epic title} · {task title}
-where {epicRef} is the leading \`fn-N\` prefix from the epic id (e.g.
-\`fn-5-live-subscribe\` → \`fn-5\`) and {repo} is basename(project_dir). A new
-frame prints only when the rendered output changes (no [status] bracket on the
-line, so status flips alone don't reframe). Every emitted frame is mirrored to
-two /tmp sidecar files (full JSON state + rendered frame), whose paths print in
-a ...-fenced note.
+  - {repo} {task_id}
+where {task_id} is the full planctl task slug (e.g.
+\`fn-575-osc-parser-hardening-spoke-4.1\`) and {repo} is basename(project_dir).
+A new frame prints only when the rendered output changes (no titles or
+[status] bracket on the line, so title edits and status flips alone don't
+reframe). Every emitted frame is mirrored to two /tmp sidecar files (full
+JSON state + rendered frame), whose paths print in a ...-fenced note.
 
 The client waits for keeperd to come up and reconnects across restarts instead
 of exiting; each connection-lifecycle change prints a ...-fenced note
@@ -174,25 +175,6 @@ function yamlScalar(v: unknown): string {
     return s;
   }
   return `'${s.replace(/'/g, "''")}'`;
-}
-
-/**
- * Derive the `fn-N` epic-id prefix used as the `{epicRef}` segment in each
- * flat task line (e.g. `fn-5-live-subscribe-total-signal` → `fn-5`). Falls
- * back to `#{epic_number}` when the regex misses (an off-spec epic id), and
- * finally to the raw `epic_id` when even `epic_number` is null — so a null
- * `epic_number` never leaks as `#null`.
- */
-function epicRefFor(row: Record<string, unknown>): string {
-  const id = row.epic_id == null ? "" : String(row.epic_id);
-  const m = /^(.+?-\d+)/.exec(id);
-  if (m) {
-    return m[1];
-  }
-  if (row.epic_number != null) {
-    return `#${row.epic_number}`;
-  }
-  return id;
 }
 
 function die(message: string): never {
@@ -259,12 +241,12 @@ async function main(): Promise<void> {
    * Project the frozen page into a YAML document body (no leading `---`), in
    * server-sent order. Walks each epic in `order` and emits one block-sequence
    * line per task in `epic.tasks` (already sorted `(task_number, task_id)` by
-   * the reducer — no client re-sort). Each line is
-   * `- {repo} {epicRef}.{task_number} {epic title} · {task title}` routed
-   * through `yamlScalar` (so `·`, `:`, `#`, etc. quote correctly). Empty page
+   * the reducer — no client re-sort). Each line is `- {repo} {task_id}` routed
+   * through `yamlScalar` (so `·`, `:`, `#`, etc. quote correctly). The full
+   * task slug already encodes the epic + task number, so no titles are
+   * rendered — neither a title edit nor a status flip will reframe. Empty page
    * (no epics, or all epics carry zero tasks) renders `"[]"` — an empty YAML
-   * sequence — exactly like the keeper-frames source. No `[status]` bracket on
-   * the line, so a task status flip alone does NOT reframe.
+   * sequence — exactly like the keeper-frames source.
    */
   function renderBody(): string {
     const lines: string[] = [];
@@ -276,11 +258,9 @@ async function main(): Promise<void> {
       }
       const repo =
         epic.project_dir == null ? "" : basename(String(epic.project_dir));
-      const epicRef = epicRefFor(epic);
-      const epicTitle = seg(epic.title);
       for (const task of tasks) {
         const t = task as Record<string, unknown>;
-        const line = `${repo} ${epicRef}.${seg(t.task_number)} ${epicTitle} · ${seg(t.title)}`;
+        const line = `${repo} ${seg(t.task_id)}`;
         lines.push(`- ${yamlScalar(line)}`);
       }
     }
