@@ -66,8 +66,22 @@ export interface ApplyEventOptions {
   onBeforeCursorAdvance?: (event: Event) => void;
 }
 
-/** Terminal job state. Once reached, only SessionEnd re-asserts it. */
+/** Terminal job state reached via the SessionEnd hook. Sticky on re-fold. */
 const ENDED = "ended";
+
+/**
+ * Terminal-but-revivable job state. Reached by a synthetic `Killed` event
+ * (emitted by the boot seed sweep + the live exit-watcher when a `(pid,
+ * start_time)` pair is proven dead). Unlike {@link ENDED} — which comes from
+ * the SessionEnd hook — `killed` indicates we proved the process is gone from
+ * the OUTSIDE: pid no longer exists, or recycled into a different process.
+ *
+ * Revival: SessionStart and UserPromptSubmit re-open a killed row (the producer
+ * can probe a live new process for that session); every other hook event
+ * IGNORES a killed row (the row stays killed). See the Stop / SessionEnd
+ * guards below.
+ */
+const KILLED = "killed";
 
 /**
  * Title-source precedence. A higher number wins. NULL `title_source` (the
@@ -160,6 +174,56 @@ function extractTranscriptPath(event: Event): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Shape of a synthetic `Killed` event's payload — the `(pid, start_time)`
+ * recycle-safe identity the producer (boot seed sweep / live exit-watcher)
+ * proved dead. The reducer compares this verbatim against the persisted
+ * `(jobs.pid, jobs.start_time)` to decide whether the row should fold to
+ * `killed` (match) or stay put (mismatch / stale).
+ */
+interface KilledPayload {
+  pid: number;
+  start_time: string | null;
+}
+
+/**
+ * Extract the `(pid, start_time)` payload from a synthetic `Killed` event's
+ * `data` blob. Guarded-parse mirroring {@link extractSessionTitle}: try/catch
+ * around `JSON.parse(event.data)`, skip-and-log on a malformed blob, never
+ * throw — the cursor still advances upstream, and the Killed fold falls through
+ * as a safe no-op when this returns null.
+ *
+ * `pid` is required (a Killed event with no pid is meaningless — there's
+ * nothing to match against). `start_time` is optional / nullable — the producer
+ * may emit a Killed for a row whose stored start_time is NULL (legacy / loose
+ * pid-only match handled by the Killed fold).
+ */
+function extractKilledPayload(event: Event): KilledPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as {
+      pid?: unknown;
+      start_time?: unknown;
+    };
+    const pid = parsed.pid;
+    if (typeof pid !== "number" || !Number.isFinite(pid)) {
+      return null;
+    }
+    const startTime =
+      typeof parsed.start_time === "string" ? parsed.start_time : null;
+    return { pid, start_time: startTime };
+  } catch (err) {
+    // Malformed JSON: skip-and-log. The cursor still advances upstream so the
+    // reducer never wedges on one bad row.
+    console.error(
+      `keeper reducer: failed to parse Killed payload blob for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
 }
 
 /**
@@ -469,18 +533,22 @@ function projectJobsRow(db: Database, event: Event): void {
       // be reopened by a fresh `claude --resume` process, which fires
       // SessionStart (source=resume) — even a no-interaction resume — so this is
       // keeper's re-open signal. ON CONFLICT re-opens a TERMINAL row (CASE:
-      // 'ended' -> 'stopped'; a mid-session compact/clear SessionStart on a
-      // working/stopped row leaves its state untouched, so it never knocks a live
-      // job backwards) and refreshes the pid (a resume is a new OS process).
+      // 'ended' OR 'killed' -> 'stopped'; a mid-session compact/clear
+      // SessionStart on a working/stopped row leaves its state untouched, so it
+      // never knocks a live job backwards) and refreshes BOTH pid and
+      // start_time (a resume is a new OS process — fresh recycle-safe identity).
+      // The COALESCE on start_time preserves the persisted value when the
+      // incoming event has none (legacy / hook capture failure).
       // title/title_source are NOT touched — they stay precedence-owned, so a
       // resume never re-seeds the priority-1 spawn name over a higher source;
       // created_at / cwd / transcript_path are set-once identity and stay put.
       db.run(
-        `INSERT INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at, title, title_source, transcript_path)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(job_id) DO UPDATE SET
            pid = COALESCE(excluded.pid, jobs.pid),
-           state = CASE WHEN jobs.state = '${ENDED}' THEN 'stopped' ELSE jobs.state END,
+           start_time = COALESCE(excluded.start_time, jobs.start_time),
+           state = CASE WHEN jobs.state IN ('${ENDED}','${KILLED}') THEN 'stopped' ELSE jobs.state END,
            last_event_id = excluded.last_event_id,
            updated_at = excluded.updated_at`,
         [
@@ -488,6 +556,7 @@ function projectJobsRow(db: Database, event: Event): void {
           ts,
           event.cwd,
           event.pid,
+          event.start_time,
           event.id,
           ts,
           event.spawn_name,
@@ -502,40 +571,101 @@ function projectJobsRow(db: Database, event: Event): void {
       // terminal guard). This is also a re-open path: a session can resume
       // straight into a prompt with no SessionStart hook, and a spurious
       // mid-session SessionEnd(reason=other) is sometimes followed immediately by
-      // a prompt in the SAME live process. Either way the job must leave 'ended'.
-      // (The un-end lives in the fold, not a liveness overlay — see the header.)
+      // a prompt in the SAME live process. Either way the job must leave 'ended'
+      // or 'killed' — both are revivable on a fresh prompt (the producer can
+      // probe the live new process). The un-end lives in the fold, not a
+      // liveness overlay — see the header.
+      //
+      // Pid is COALESCE-refreshed so a re-open updates to the live process's pid
+      // (mirrors SessionStart's resume path). start_time is NOT touched here:
+      // UserPromptSubmit events do not carry the platform-tagged start instant
+      // (only SessionStart does), so the persisted value stays put.
       db.run(
-        `UPDATE jobs SET state = 'working', last_event_id = ?, updated_at = ?
+        `UPDATE jobs SET state = 'working',
+                         pid = COALESCE(?, pid),
+                         last_event_id = ?, updated_at = ?
            WHERE job_id = ?`,
-        [event.id, ts, jobId],
+        [event.pid, event.id, ts, jobId],
       );
       break;
 
     case "Stop":
-      // Keeps the terminal guard: a stray Stop landing on a still-ended job (no
-      // intervening re-open) must not resurrect it. After a real re-open
-      // (SessionStart or UserPromptSubmit) the row is no longer 'ended', so a
-      // normal post-resume Stop applies here as usual.
+      // Keeps the terminal guard: a stray Stop landing on a still-terminal job
+      // (no intervening re-open) must not resurrect it. The guard now covers
+      // BOTH terminal states — 'ended' (from SessionEnd) and 'killed' (from a
+      // synthetic Killed event). After a real re-open (SessionStart or
+      // UserPromptSubmit) the row is no longer terminal, so a normal post-resume
+      // Stop applies here as usual.
       db.run(
         `UPDATE jobs SET state = 'stopped', last_event_id = ?, updated_at = ?
-           WHERE job_id = ? AND state != '${ENDED}'`,
+           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
         [event.id, ts, jobId],
       );
       break;
 
     case "SessionEnd":
-      // Always lands; terminal and sticky. Matches zero rows for a terminal
-      // event with no prior SessionStart — a correct no-op.
+      // Lands on any non-terminal row. The terminal guard keeps it idempotent
+      // on 'ended' AND prevents a late SessionEnd from clobbering a 'killed'
+      // row (the killed signal is more informative because it carries the
+      // proven-dead `(pid, start_time)` evidence; an ended-after-killed write
+      // would mask it). Matches zero rows for a terminal event with no prior
+      // SessionStart — a correct no-op.
       db.run(
-        "UPDATE jobs SET state = 'ended', last_event_id = ?, updated_at = ? WHERE job_id = ?",
+        `UPDATE jobs SET state = 'ended', last_event_id = ?, updated_at = ?
+           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
         [event.id, ts, jobId],
       );
+      break;
+
+    case "Killed":
+      // Synthetic event emitted by the boot seed sweep + the live exit-watcher
+      // when a `(pid, start_time)` pair is proven dead (the bare pid is unsafe
+      // on macOS where recycle is common). The producer pre-computes the
+      // `(pid, start_time)` payload — the reducer NEVER re-probes liveness
+      // here (a re-probe inside the fold would break re-fold determinism).
+      //
+      // Match rule (Q7): fold to 'killed' iff the persisted (pid, start_time)
+      // matches the event's payload, OR the persisted start_time is NULL
+      // (legacy row — loose match on pid alone). On mismatch / missing pid /
+      // missing target row, short-circuit as a stale event — the cursor still
+      // advances (the surrounding applyEvent commits the update), no row write,
+      // no throw. NEVER throw inside the open BEGIN IMMEDIATE transaction (a
+      // throw rolls back the cursor and wedges the reducer).
+      {
+        const payload = extractKilledPayload(event);
+        if (payload == null) {
+          break; // malformed/missing payload — safe no-op.
+        }
+        const row = db
+          .query("SELECT pid, start_time FROM jobs WHERE job_id = ?")
+          .get(jobId) as {
+          pid: number | null;
+          start_time: string | null;
+        } | null;
+        if (row == null) {
+          break; // no jobs row for this session — safe no-op.
+        }
+        // Strict match when the row has a stored start_time; loose pid-only
+        // match when start_time is NULL (legacy / pre-schema-v9 row).
+        const pidMatches = row.pid != null && row.pid === payload.pid;
+        const startMatches =
+          row.start_time == null || row.start_time === payload.start_time;
+        if (!pidMatches || !startMatches) {
+          break; // stale/recycled — safe no-op.
+        }
+        db.run(
+          `UPDATE jobs SET state = 'killed', last_event_id = ?, updated_at = ?
+             WHERE job_id = ?`,
+          [event.id, ts, jobId],
+        );
+      }
       break;
 
     default:
       // PreToolUse, PostToolUse, PostToolUseFailure, Notification,
       // SubagentStart, SubagentStop, and any unknown forward-compat event:
-      // no lifecycle write. Cursor still advances upstream.
+      // no lifecycle write. Cursor still advances upstream. (No terminal guard
+      // needed — these branches never write the state column.)
       break;
   }
 
@@ -649,7 +779,8 @@ export function drain(db: Database, batchSize = DEFAULT_BATCH_SIZE): number {
     .query(
       `SELECT id, ts, session_id, pid, hook_event, event_type, tool_name,
               matcher, cwd, permission_mode, agent_id, agent_type,
-              stop_hook_active, data, subagent_agent_id, spawn_name
+              stop_hook_active, data, subagent_agent_id, spawn_name,
+              start_time
          FROM events
         WHERE id > ?
         ORDER BY id ASC

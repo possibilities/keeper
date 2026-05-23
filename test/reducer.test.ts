@@ -110,7 +110,21 @@ function getJob(jobId = "sess-a") {
     updated_at: number;
     title: string | null;
     title_source: string | null;
+    start_time: string | null;
   } | null;
+}
+
+/** Insert a synthetic Killed event carrying the (pid, start_time) payload. */
+function killedEvent(
+  pid: number,
+  start_time: string | null,
+  session_id = "sess-a",
+): number {
+  return insertEvent({
+    hook_event: "Killed",
+    session_id,
+    data: JSON.stringify({ pid, start_time }),
+  });
 }
 
 function getCursor(): number {
@@ -325,6 +339,305 @@ test("malformed data blob logs to stderr and advances cursor without halting", (
   } finally {
     console.error = originalError;
   }
+});
+
+// ---------------------------------------------------------------------------
+// Killed fold (synthetic Killed → state='killed', terminal-but-revivable)
+// ---------------------------------------------------------------------------
+
+test("Killed with matching (pid, start_time) folds to killed", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1234,
+    start_time: "macos:Wed May 22 10:00:00 2026",
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getJob()?.start_time).toBe("macos:Wed May 22 10:00:00 2026");
+
+  const killedId = killedEvent(1234, "macos:Wed May 22 10:00:00 2026");
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("killed");
+  expect(job?.last_event_id).toBe(killedId);
+  expect(getCursor()).toBe(killedId);
+});
+
+test("Killed with mismatched start_time is a safe no-op (cursor still advances)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1234,
+    start_time: "macos:Wed May 22 10:00:00 2026",
+  });
+  drainAll();
+  const beforeLastId = getJob()?.last_event_id;
+
+  // Same pid, different start_time — pid was recycled into a different process.
+  const killedId = killedEvent(1234, "macos:Fri Nov 13 12:00:00 2026");
+  drainAll();
+  const job = getJob();
+  // Row unchanged: state still 'stopped', last_event_id unchanged (no row write).
+  expect(job?.state).toBe("stopped");
+  expect(job?.last_event_id).toBe(beforeLastId ?? 0);
+  // Cursor STILL advanced past the stale Killed event (safe no-op).
+  expect(getCursor()).toBe(killedId);
+});
+
+test("Killed with mismatched pid is a safe no-op", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1234,
+    start_time: "macos:t1",
+  });
+  drainAll();
+  const beforeLastId = getJob()?.last_event_id;
+
+  const killedId = killedEvent(9999, "macos:t1");
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("stopped");
+  expect(job?.last_event_id).toBe(beforeLastId ?? 0);
+  expect(getCursor()).toBe(killedId);
+});
+
+test("Killed against legacy row (start_time NULL) loose-matches on pid alone", () => {
+  // Legacy rows whose SessionStart pre-dated schema v9 carry start_time=NULL.
+  // Per Q7, the Killed fold loose-matches on pid alone for these rows.
+  insertEvent({ hook_event: "SessionStart", pid: 1234 }); // no start_time
+  drainAll();
+  expect(getJob()?.start_time).toBeNull();
+
+  const killedId = killedEvent(1234, "macos:any-value-ignored");
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("killed");
+  expect(job?.last_event_id).toBe(killedId);
+});
+
+test("Killed for a non-existent jobs row is a safe no-op", () => {
+  const killedId = killedEvent(1234, "macos:t1", "ghost");
+  drainAll();
+  expect(getJob("ghost")).toBeNull();
+  expect(getCursor()).toBe(killedId);
+});
+
+test("Killed with malformed data blob skip-and-logs and advances cursor", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1234,
+    start_time: "macos:t1",
+  });
+  drainAll();
+  const errors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.join(" "));
+  };
+  try {
+    const badId = insertEvent({
+      hook_event: "Killed",
+      data: "{not valid json",
+    });
+    drainAll();
+    // Row unchanged; cursor advanced past the bad event.
+    expect(getJob()?.state).toBe("stopped");
+    expect(getCursor()).toBe(badId);
+    expect(errors.some((e) => e.includes("Killed payload"))).toBe(true);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("Killed with missing pid in payload is a safe no-op", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1234,
+    start_time: "macos:t1",
+  });
+  drainAll();
+  const beforeLastId = getJob()?.last_event_id;
+  const killedId = insertEvent({
+    hook_event: "Killed",
+    data: JSON.stringify({ start_time: "macos:t1" }), // no pid
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getJob()?.last_event_id).toBe(beforeLastId ?? 0);
+  expect(getCursor()).toBe(killedId);
+});
+
+test("SessionStart re-opens a killed row: killed -> stopped, pid+start_time refreshed", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1000,
+    start_time: "macos:t1",
+  });
+  killedEvent(1000, "macos:t1");
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+
+  // A fresh `claude --resume` lands a new SessionStart with a new (pid, start_time).
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 2000,
+    start_time: "macos:t2",
+  });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("stopped");
+  expect(job?.pid).toBe(2000);
+  expect(job?.start_time).toBe("macos:t2");
+});
+
+test("UserPromptSubmit re-opens a killed row: killed -> working, pid refreshed", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1000,
+    start_time: "macos:t1",
+  });
+  killedEvent(1000, "macos:t1");
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+
+  // A prompt arriving with a new pid (the live re-attached process) — UPS does
+  // not carry start_time, so that field is preserved.
+  insertEvent({ hook_event: "UserPromptSubmit", pid: 2000 });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("working");
+  expect(job?.pid).toBe(2000);
+  expect(job?.start_time).toBe("macos:t1");
+});
+
+test("Stop on a killed row is a no-op (terminal guard)", () => {
+  insertEvent({ hook_event: "SessionStart", pid: 1000, start_time: "t1" });
+  killedEvent(1000, "t1");
+  drainAll();
+  const beforeLastId = getJob()?.last_event_id;
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  // Row still killed, last_event_id unchanged (the guard skipped the write).
+  expect(getJob()?.state).toBe("killed");
+  expect(getJob()?.last_event_id).toBe(beforeLastId ?? 0);
+});
+
+test("SessionEnd on a killed row is a no-op (terminal guard, killed stays)", () => {
+  // killed carries the proven-dead (pid, start_time) evidence — more
+  // informative than ended — so a late SessionEnd must not clobber it.
+  insertEvent({ hook_event: "SessionStart", pid: 1000, start_time: "t1" });
+  killedEvent(1000, "t1");
+  drainAll();
+  const beforeLastId = getJob()?.last_event_id;
+  insertEvent({ hook_event: "SessionEnd" });
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+  expect(getJob()?.last_event_id).toBe(beforeLastId ?? 0);
+});
+
+test("PostToolUse / Notification on a killed row are no-ops (default branch, no state write)", () => {
+  insertEvent({ hook_event: "SessionStart", pid: 1000, start_time: "t1" });
+  killedEvent(1000, "t1");
+  drainAll();
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash" });
+  const lastId = insertEvent({ hook_event: "Notification" });
+  drainAll();
+  // Default branch writes no state; the row stays killed and the cursor advances.
+  expect(getJob()?.state).toBe("killed");
+  expect(getCursor()).toBe(lastId);
+});
+
+test("Killed -> SessionStart -> Stop -> SessionEnd full revival cycle folds correctly", () => {
+  insertEvent({ hook_event: "SessionStart", pid: 1000, start_time: "t1" });
+  killedEvent(1000, "t1");
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+
+  // Re-attach: new process, new identity.
+  insertEvent({ hook_event: "SessionStart", pid: 2000, start_time: "t2" });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+
+  // Live work + clean end.
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+
+  insertEvent({ hook_event: "SessionEnd" });
+  drainAll();
+  expect(getJob()?.state).toBe("ended");
+});
+
+test("Killed re-folds idempotently: rewind + redrain reproduces killed byte-identically", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1000,
+    start_time: "macos:t1",
+  });
+  killedEvent(1000, "macos:t1");
+  drainAll();
+  const before = getJob();
+  expect(before?.state).toBe("killed");
+
+  // Rewind cursor + projection; the SAME event log must replay to the same row.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = getJob();
+  expect(after).toEqual(before);
+});
+
+test("Killed re-fold determinism with interleaved revival: SessionStart -> Killed -> SessionStart", () => {
+  // A killed row revived by a SessionStart, then killed again by a new Killed
+  // event targeting the NEW (pid, start_time) — re-fold from scratch must
+  // reproduce the same final state.
+  insertEvent({ hook_event: "SessionStart", pid: 1000, start_time: "t1" });
+  killedEvent(1000, "t1");
+  insertEvent({ hook_event: "SessionStart", pid: 2000, start_time: "t2" });
+  killedEvent(2000, "t2");
+  drainAll();
+  const before = getJob();
+  expect(before?.state).toBe("killed");
+  expect(before?.pid).toBe(2000);
+  expect(before?.start_time).toBe("t2");
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = getJob();
+  expect(after).toEqual(before);
+});
+
+test("SessionStart seeds jobs.start_time from event.start_time (set-once on first sight)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1000,
+    start_time: "macos:Wed May 22 10:00:00 2026",
+  });
+  drainAll();
+  expect(getJob()?.start_time).toBe("macos:Wed May 22 10:00:00 2026");
+});
+
+test("SessionStart with no start_time leaves jobs.start_time NULL (legacy)", () => {
+  insertEvent({ hook_event: "SessionStart", pid: 1000 });
+  drainAll();
+  expect(getJob()?.start_time).toBeNull();
+});
+
+test("SessionStart resume COALESCEs start_time: persisted value preserved when new event has none", () => {
+  insertEvent({ hook_event: "SessionStart", pid: 1000, start_time: "t1" });
+  drainAll();
+  expect(getJob()?.start_time).toBe("t1");
+  // A resume SessionStart with no captured start_time MUST NOT clobber the
+  // persisted value (COALESCE(excluded.start_time, jobs.start_time)).
+  insertEvent({ hook_event: "SessionStart", pid: 2000 });
+  drainAll();
+  const job = getJob();
+  expect(job?.pid).toBe(2000);
+  expect(job?.start_time).toBe("t1");
 });
 
 // ---------------------------------------------------------------------------
