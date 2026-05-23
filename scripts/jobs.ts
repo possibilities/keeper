@@ -1,25 +1,23 @@
 #!/usr/bin/env bun
 /**
- * autopilot — a flat one-line-per-task stream over the read-only NDJSON-over-UDS
- * subscribe server (`src/server-worker.ts`), one of three example clients
- * alongside `scripts/jobs.ts` and `scripts/epics.ts`. It is a wholesale clone
- * of the sibling clients' connection / coalescing / sidecar / reconnect
- * plumbing; only the render layer differs.
+ * keeper-jobs — a primitive "UI" over the read-only NDJSON-over-UDS subscribe
+ * server (`src/server-worker.ts`). It renders a *page of jobs as a frame* and
+ * reprints a fresh frame every time the visible projection changes.
  *
- * It `query`s a 10-row page of `epics` (the server's default scope —
- * `status: "open"` — applies because the query sends no `filter` key) and
- * flattens every epic's embedded tasks into a single YAML block sequence:
- * one line per task, format `{repo} {task_id}` (e.g.
- * `vtkeep fn-575-osc-parser-hardening-spoke-4.1`). The task slug already
- * carries the epic + task number, so no titles are rendered. Membership is
- * frozen WITHIN a fetched page
- * (the server never reflows a live page), but the script REFETCHES the page —
- * on every `patch`/`meta` change signal AND on a steady poll — so each fresh
- * `result` reflects the current top-N. A NEW frame prints whenever the
- * RENDERED page changes; the rendered output — not internal row churn — is the
- * sole frame trigger, enforced by routing every emit through
- * `emitFrameIfChanged`. The line deliberately omits `[status]` so a task
- * status flip alone does not reframe.
+ * It `query`s a 10-row page of `jobs` and renders it as a YAML stream: each
+ * frame is a YAML document (leading `---`) listing every job as a single
+ * collapsed string — `{basename(cwd)} · {title} · {state}`. The query optionally
+ * carries a server-side `state` filter built from `--state` / `--state-ne`
+ * (the bare-value equality form and the `{ ne }` operator form, respectively;
+ * default is no filter and every job pages through). When a filter is in
+ * effect it runs in SQL, so LIMIT counts only matching rows and `total` /
+ * `meta` track exactly that set. Membership is frozen
+ * WITHIN a fetched page (the server never reflows a live page), but the script
+ * REFETCHES the page — on every `patch`/`meta` change signal AND on a steady
+ * poll — so each fresh `result` reflects the current top-N. A NEW frame prints
+ * whenever the RENDERED page changes; the rendered output — not internal row
+ * churn — is the sole frame trigger, enforced by routing every emit through
+ * `emitFrameIfChanged`.
  *
  * The script renders ONLY from `result` frames. `patch` and `meta` are treated
  * purely as "refetch" hints (their payloads are never rendered directly), so
@@ -56,17 +54,16 @@
  * de-frame) and `resolveSockPath()` so it stays a faithful mirror of the
  * contract, and it honors the read-only fence: it only ever sends
  * `query` / `unsubscribe`. The connection/coalescing logic mirrors the
- * sibling `scripts/jobs.ts` and `scripts/epics.ts`; the shared subscribe loop
- * is now duplicated across three clients — extract a shared module.
+ * sibling `scripts/epics.ts` and `scripts/autopilot.ts`; extract a shared
+ * module once the duplication starts costing more than the copy.
  *
  * Usage:
- *   bun scripts/autopilot.ts [--sock <path>] [--status <s> | --status-ne <s>]
+ *   bun scripts/jobs.ts [--sock <path>] [--state <s> | --state-ne <s>]
  *
  *   --sock <path>    Socket path override (else $KEEPER_SOCK, else the
  *                    ~/.local/state/keeper/keeperd.sock default).
- *   --status <s>     Filter to epics whose status equals <s> (e.g. done).
- *   --status-ne <s>  Filter to epics whose status is NOT <s>.
- *                    Default: no filter → server applies open-epic scope.
+ *   --state <s>      Filter to jobs whose state equals <s> (e.g. working).
+ *   --state-ne <s>   Filter to jobs whose state is NOT <s> (e.g. ended).
  *   --help           Show this help.
  */
 
@@ -82,7 +79,7 @@ import {
   type ServerFrame,
 } from "../src/protocol";
 
-/** The page size this client pages. Fixed for now. */
+/** The page size this primitive UI pages. Fixed for now. */
 const PAGE_LIMIT = 10;
 
 /**
@@ -102,27 +99,26 @@ const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
 
-const HELP = `autopilot — flat one-line-per-task stream over the keeper subscribe server
+const HELP = `keeper-jobs — primitive list UI over the keeper subscribe server
 
-Usage: bun scripts/autopilot.ts [--sock <path>]
-       [--status <s> | --status-ne <s>]
+Usage: bun scripts/jobs.ts [--sock <path>] [--state <s> | --state-ne <s>]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
-  --status <s>     Filter to epics whose status equals <s> (e.g. done)
-  --status-ne <s>  Filter to epics whose status is NOT <s>
-                   (--status and --status-ne are mutually exclusive)
-                   (default: no status flag → the server's default scope shows
-                   only OPEN epics; pass a flag to see other statuses)
+  --state <s>      Filter to jobs whose state equals <s> (e.g. working)
+  --state-ne <s>   Filter to jobs whose state is NOT <s> (e.g. ended)
+                   (--state and --state-ne are mutually exclusive)
+                   (default: no state flag → the server's default scope shows
+                   only LIVE jobs (working + stopped) and hides BOTH terminal
+                   states (ended + killed); pass --state ended or
+                   --state killed to see them explicitly)
   --help           Show this help
 
-Renders a flat one-line-per-task stream across all open epics as a YAML
-document, one line per task in server-sent order:
-  - {repo} {task_id}
-where {task_id} is the full planctl task slug (e.g.
-\`fn-575-osc-parser-hardening-spoke-4.1\`) and {repo} is basename(project_dir).
-A new frame prints only when the rendered output changes (no titles or
-[status] bracket on the line, so title edits and status flips alone don't
-reframe). Every emitted frame is mirrored to two /tmp sidecar files (full
+Renders a 10-row page of jobs as a YAML stream: one frame per change, each
+frame a YAML document (--- separated). The render is a flat sequence of:
+  {basename(cwd)} · {title} · {state}
+The page is refetched on every change signal and on a steady poll, so it always
+shows the current top-N; a new frame prints only when the rendered output
+changes. Every emitted frame is also mirrored to two /tmp sidecar files (full
 JSON state + rendered frame), whose paths print in a ...-fenced note.
 
 The client waits for keeperd to come up and reconnects across restarts instead
@@ -131,8 +127,8 @@ of exiting; each connection-lifecycle change prints a ...-fenced note
 `;
 
 /** The hardcoded collection and its primary key. */
-const COLLECTION = "epics";
-const pk = "epic_id";
+const COLLECTION = "jobs";
+const pk = "job_id";
 
 /**
  * Render one value as YAML. Scalars are bare when safe, else single-quoted;
@@ -180,7 +176,7 @@ function yamlScalar(v: unknown): string {
 }
 
 function die(message: string): never {
-  process.stderr.write(`autopilot: ${message}\n`);
+  process.stderr.write(`keeper-jobs: ${message}\n`);
   process.exit(2);
 }
 
@@ -189,8 +185,8 @@ async function main(): Promise<void> {
     args: Bun.argv.slice(2),
     options: {
       sock: { type: "string" },
-      status: { type: "string" },
-      "status-ne": { type: "string" },
+      state: { type: "string" },
+      "state-ne": { type: "string" },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -201,8 +197,8 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  if (values.status !== undefined && values["status-ne"] !== undefined) {
-    die("--status and --status-ne are mutually exclusive");
+  if (values.state !== undefined && values["state-ne"] !== undefined) {
+    die("--state and --state-ne are mutually exclusive");
   }
 
   const sockPath = values.sock ?? resolveSockPath();
@@ -240,43 +236,36 @@ async function main(): Promise<void> {
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
   /**
+   * Collapse one full row to its display string:
+   * `{basename(cwd)} · {title} · {state}`. A null/absent segment projects to
+   * empty (no basename of nothing). This — together with `emitFrameIfChanged`
+   * — defines which column moves can reframe the page.
+   */
+  function projectRow(row: Record<string, unknown>): string {
+    const title = seg(row.title);
+    const cwd = row.cwd == null ? "" : basename(String(row.cwd));
+    return `${cwd} · ${title} · ${seg(row.state)}`;
+  }
+
+  /**
    * Project the frozen page into a YAML document body (no leading `---`), in
-   * server-sent order. Walks each epic in `order` and emits one block-sequence
-   * line per task in `epic.tasks` (already sorted `(task_number, task_id)` by
-   * the reducer — no client re-sort). Each line is `- {repo} {task_id}` routed
-   * through `yamlScalar` (so `·`, `:`, `#`, etc. quote correctly). The full
-   * task slug already encodes the epic + task number, so no titles are
-   * rendered — neither a title edit nor a status flip will reframe. Empty page
-   * (no epics, or all epics carry zero tasks) renders `"[]"` — an empty YAML
-   * sequence — exactly like the sibling `scripts/jobs.ts` source.
+   * server-sent order. Renders as a flat sequence of one collapsed string per
+   * row. Strings carrying `·` auto-single-quote through `yamlScalar`.
    */
   function renderBody(): string {
-    const lines: string[] = [];
-    for (const id of order) {
-      const epic = byId.get(id) ?? { [pk]: id };
-      const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
-      if (tasks.length === 0) {
-        continue;
-      }
-      const repo =
-        epic.project_dir == null ? "" : basename(String(epic.project_dir));
-      for (const task of tasks) {
-        const t = task as Record<string, unknown>;
-        const line = `${repo} ${seg(t.task_id)}`;
-        lines.push(`- ${yamlScalar(line)}`);
-      }
+    if (order.length === 0) {
+      return "[]"; // empty page → an empty YAML sequence
     }
-    if (lines.length === 0) {
-      return "[]"; // empty flat line set → an empty YAML sequence
-    }
-    return lines.join("\n");
+    return order
+      .map((id) => `- ${yamlScalar(projectRow(byId.get(id) ?? { [pk]: id }))}`)
+      .join("\n");
   }
 
   // Per-frame sidecar files: the latest emitted frame is mirrored to /tmp so it
   // can be inspected out-of-band. Per-pid so concurrent runs don't collide;
   // overwritten each frame (always the most recently printed frame).
-  const stateSidecar = `/tmp/autopilot.${process.pid}.state.json`;
-  const frameSidecar = `/tmp/autopilot.${process.pid}.frame.yaml`;
+  const stateSidecar = `/tmp/keeper-jobs.${process.pid}.state.json`;
+  const frameSidecar = `/tmp/keeper-jobs.${process.pid}.frame.yaml`;
 
   /**
    * Mirror the just-emitted frame to its two sidecar files and print a
@@ -301,13 +290,12 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Print a new frame iff the rendered projection moved. This byte-compare on
-   * `renderBody()` output is the CONTRACT: a frame is emitted only when the
-   * rendered text changes — internal row churn that doesn't surface in the flat
-   * line (notably task `status`) is invisible by design, and stays so as the
-   * projection grows. Every emit routes through here; nothing prints a frame
-   * directly. Each emitted frame is mirrored to its sidecar files (see
-   * `writeSidecars`).
+   * Print a new job frame iff the rendered projection moved. This byte-compare
+   * on `renderBody()` output is the CONTRACT: a frame is emitted only when the
+   * rendered text changes — internal row churn that doesn't surface in
+   * `projectRow` is invisible by design, and stays so as the projection grows.
+   * Every emit routes through here; nothing prints a job frame directly. Each
+   * emitted frame is mirrored to its sidecar files (see `writeSidecars`).
    */
   function emitFrameIfChanged(): void {
     const body = renderBody();
@@ -394,18 +382,18 @@ async function main(): Promise<void> {
     }
   }
 
-  // Build the optional epic-status filter from the CLI flags. Filtering in SQL
+  // Build the optional jobs-state filter from the CLI flags. Filtering in SQL
   // — not after the fetch — keeps LIMIT counting matching rows (so the page is
   // a true top-N of the filtered set, never short) and makes `result.total` /
-  // `meta` describe exactly the set we render. With NO flag set we send NO
-  // `filter` key (the `{}` spread path, not `filter: {}`) so the server's
-  // default scope (`status: "open"`) applies and the page is the open-epic
-  // set.
+  // `meta` describe exactly the set we render. Default (no flag): send NO
+  // state filter, so the server's default scope applies and the page shows
+  // only LIVE jobs (working + stopped); pass `--state <s>` (e.g. ended) or
+  // `--state-ne <s>` to see terminal states.
   const filter: { filter?: Record<string, FilterValue> } =
-    values.status !== undefined
-      ? { filter: { status: values.status } }
-      : values["status-ne"] !== undefined
-        ? { filter: { status: { ne: values["status-ne"] } } }
+    values.state !== undefined
+      ? { filter: { state: values.state } }
+      : values["state-ne"] !== undefined
+        ? { filter: { state: { ne: values["state-ne"] } } }
         : {};
   const query: QueryFrame = {
     type: "query",

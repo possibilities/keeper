@@ -59,8 +59,8 @@ changes — a row enters or leaves the filter — so a paginated client can rend
 "showing X of N" and a non-disruptive "set changed, refresh" nudge without the
 list reflowing under the cursor. The server is just another reader — its own
 read-only connection, its own `data_version` poll — and the socket is
-**read-only**: there is no client write path. Two example clients ship in
-`scripts/` (`keeper-frames.ts` and `autopilot.ts`); see
+**read-only**: there is no client write path. Three example clients ship in
+`scripts/` (`jobs.ts`, `epics.ts`, and `autopilot.ts`); see
 [Example clients](#example-clients) for usage.
 
 ## What keeper is NOT
@@ -204,34 +204,42 @@ Keeper has no `install` verb. Wire it up manually:
 
 ## Example clients
 
-Two scripts under `scripts/` demonstrate the read-only subscribe protocol —
-both clones of the same connection/coalescing/reconnect plumbing, differing
-only in their render layer. Run either with `bun scripts/<name>.ts --help`.
+Three scripts under `scripts/` demonstrate the read-only subscribe protocol —
+all clones of the same connection/coalescing/reconnect plumbing, differing
+only in their render layer. Run any with `bun scripts/<name>.ts --help`.
 
-- `keeper-frames.ts` — primitive list UI: pages the `jobs` (default) or
-  `epics` collection and renders a YAML frame per change. For epics it shows
-  each epic with its embedded tasks as a nested mapping block. Reconnects
-  across keeperd restarts; Ctrl-C unsubscribes cleanly.
+- `jobs.ts` — primitive list UI over the `jobs` collection: pages 10 live jobs
+  and renders a YAML frame per change, each row a single collapsed line
+  (`{basename(cwd)} · {title} · {state}`). Reconnects across keeperd restarts;
+  Ctrl-C unsubscribes cleanly.
 
   ```sh
-  bun scripts/keeper-frames.ts                   # default: live jobs
-  bun scripts/keeper-frames.ts --collection epics  # open epics + nested tasks
+  bun scripts/jobs.ts                # default scope: live jobs
+  bun scripts/jobs.ts --state ended  # see terminal jobs explicitly
+  ```
+
+- `epics.ts` — primitive list UI over the `epics` collection: pages 10 open
+  epics and renders each epic with its embedded tasks as a nested
+  `epic:`/`tasks:` mapping block per frame.
+
+  ```sh
+  bun scripts/epics.ts               # default scope: open epics + nested tasks
+  bun scripts/epics.ts --status done # see closed epics
   ```
 
 - `autopilot.ts` — flat task stream across all open epics: renders one
-  one-line-per-task YAML sequence in the form
-  `- {repo} {epicRef}.{task_number} {epic title} · {task title}` (no
-  `[status]`, so status flips alone don't reframe). Same plumbing as
-  `keeper-frames.ts`.
+  one-line-per-task YAML sequence in the form `- {repo} {task_id}` (no
+  `[status]`, so status flips alone don't reframe). Same plumbing as the
+  sibling clients.
 
   ```sh
   bun scripts/autopilot.ts
   ```
 
-Both scripts mirror each emitted frame to per-pid `/tmp` sidecar files (full
-JSON state + rendered YAML) for out-of-band inspection. The shared
-subscribe-loop logic lives in each script verbatim today; extract a shared
-module once a third client appears.
+All three scripts mirror each emitted frame to per-pid `/tmp` sidecar files
+(full JSON state + rendered YAML) for out-of-band inspection. The shared
+subscribe-loop logic lives in each script verbatim — extract a shared module
+once the duplication starts costing more than the copy.
 
 ## Uninstall
 
