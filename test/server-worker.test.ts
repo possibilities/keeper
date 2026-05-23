@@ -312,16 +312,20 @@ test("runQuery applies an in state filter, including only listed states", () => 
   db.close();
 });
 
-test("jobs descriptor defaults the view scope to live jobs (state != ended)", () => {
-  expect(JOBS_DESCRIPTOR.defaultFilter).toEqual({ state: { ne: "ended" } });
+test("jobs descriptor defaults the view scope to live jobs (state NOT IN ended, killed)", () => {
+  expect(JOBS_DESCRIPTOR.defaultFilter).toEqual({
+    state: { not_in: ["ended", "killed"] },
+  });
 });
 
-test("runQuery applies the default live scope, hiding ended jobs, unless overridden", () => {
+test("runQuery applies the default live scope, hiding both terminal states, unless overridden", () => {
   const { db } = openDb(dbPath, { readonly: false });
-  seedJob(db, "w", { state: "working", created_at: 3 });
-  seedJob(db, "s", { state: "stopped", created_at: 2 });
-  seedJob(db, "e", { state: "ended", created_at: 1 });
-  // No filter → the default state != ended scope hides the ended job.
+  seedJob(db, "w", { state: "working", created_at: 4 });
+  seedJob(db, "s", { state: "stopped", created_at: 3 });
+  seedJob(db, "e", { state: "ended", created_at: 2 });
+  seedJob(db, "k", { state: "killed", created_at: 1 });
+  // No filter → the default state NOT IN (ended, killed) scope hides both
+  // terminal rows, leaving only working + stopped.
   const live = asResult(runQuery(db, 0, { type: "query", collection: "jobs" }));
   expect(live.total).toBe(2);
   expect(live.rows.map(jobId)).toEqual(["w", "s"]);

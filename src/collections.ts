@@ -100,12 +100,14 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
   defaultSort: { column: "created_at", dir: "desc" },
   filters: { state: "state", cwd: "cwd", job_id: "job_id" },
   // Default scope: a jobs query with no `state` filter shows only LIVE jobs —
-  // working ("running") + stopped — and hides `ended` ones. Job state is exactly
-  // working|stopped|ended (see the reducer), so `state != ended` is precisely
-  // "stopped and running". A client still pages ended jobs by asking explicitly
-  // (`filter:{state:"ended"}`), which overrides this default; a pk subscribe is
-  // exempt (a detail read of an ended job still resolves).
-  defaultFilter: { state: { ne: "ended" } },
+  // working ("running") + stopped — and hides BOTH terminal states (`ended` and
+  // `killed`). Job state is exactly working|stopped|ended|killed (see the
+  // reducer), so `state NOT IN ("ended", "killed")` is precisely "stopped and
+  // running". A client still pages terminal rows by asking explicitly
+  // (`filter:{state:"ended"}` or `filter:{state:"killed"}`, or a custom
+  // `{in:[...]}`/`{not_in:[...]}` set), which overrides this default; a pk
+  // subscribe is exempt (a detail read of an ended/killed job still resolves).
+  defaultFilter: { state: { not_in: ["ended", "killed"] } },
   // `title` + `title_source` + `transcript_path` are read-only display this
   // phase — served on `result`/`patch` (the source/path for provenance +
   // debugging) but NOT in `sortable`/`filters`. No JSON-TEXT columns are served today
