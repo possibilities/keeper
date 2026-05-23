@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
   "title": "Clear start_time on UPS pid change",
-  "updated_at": "2026-05-23T16:44:57Z"
+  "updated_at": "2026-05-23T16:58:12Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T16:58:12Z"
 }

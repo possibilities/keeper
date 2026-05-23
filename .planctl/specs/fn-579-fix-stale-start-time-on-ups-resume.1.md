@@ -100,5 +100,5 @@ describe the same live process).
       guards; no schema change.
 
 ## Done summary
-
+Reducer's UserPromptSubmit fold now clears start_time to NULL on pid change, breaking the stale-identity chain that let seed sweep re-fold resumed sessions to killed; covered by updated/new tests including a cross-boot integration test.
 ## Evidence
