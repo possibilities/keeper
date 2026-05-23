@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-23T14:13:30Z",
+  "depends_on": [],
+  "epic": "fn-577-plumb-skill-and-slash-command-metadata",
+  "id": "fn-577-plumb-skill-and-slash-command-metadata.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Add migration derivers and tests",
+  "updated_at": "2026-05-23T14:13:30Z"
+}
