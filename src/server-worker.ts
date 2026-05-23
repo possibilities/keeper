@@ -16,12 +16,13 @@
  *
  * The RPC layer landed alongside: an `rpc` request frame routes through the
  * process-global `RPC_REGISTRY` and runs the handler against a dedicated WRITER
- * connection (opened next to the existing reader in `main()`). The registry is
- * EMPTY by default in this task — Task .3 of epic
- * `fn-581-server-mutation-rpcs-and-autopilot` registers the first concrete
- * handler (`set_approval`). The two-connection split is load-bearing: the
- * reader's `data_version` poll only sees writes from OTHER connections, so the
- * RPC writer must be distinct from the poll reader.
+ * connection (opened next to the existing reader in `main()`). Concrete
+ * handlers live in `src/rpc-handlers.ts` and are installed once per worker
+ * spawn by `main()` calling `installRpcHandlers()`. As of Task .3 of epic
+ * `fn-581-server-mutation-rpcs-and-autopilot`, the registry carries one
+ * handler (`set_approval`) — the first concrete RPC. The two-connection split
+ * is load-bearing: the reader's `data_version` poll only sees writes from
+ * OTHER connections, so the RPC writer must be distinct from the poll reader.
  *
  * Conventions mirror `src/wake-worker.ts`:
  * - `isMainThread`-guarded body — a plain `import` from a test is inert.
@@ -79,6 +80,7 @@ import {
   type RpcResultFrame,
   type ServerFrame,
 } from "./protocol";
+import { installRpcHandlers } from "./rpc-handlers";
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only path
@@ -510,9 +512,11 @@ export class BadParamsError extends Error {
 }
 
 /**
- * The RPC dispatch registry: method name → handler. EMPTY by default in this
- * task — concrete handlers (e.g. `set_approval` from epic Task .3) register
- * via `registerRpc` from their own modules. The registry is process-global,
+ * The RPC dispatch registry: method name → handler. EMPTY by default at
+ * module load — concrete handlers live in `src/rpc-handlers.ts` and install
+ * themselves into this registry via `installRpcHandlers()`, which `main()`
+ * calls once per worker spawn (so a plain import from a test or a main-thread
+ * codepath leaves the registry empty). The registry is process-global,
  * matching the writer connection's process-global ownership in the
  * server-worker.
  *
@@ -1268,6 +1272,13 @@ function main(): void {
   //     writers instead of erroring `SQLITE_BUSY`.
   const { db } = openDb(data.dbPath, { readonly: true });
   const { db: writerDb } = openDb(data.dbPath);
+
+  // Install every concrete RPC handler into `RPC_REGISTRY`. Side-effect import:
+  // a plain `import` of `src/server-worker.ts` from main/test code is inert
+  // (the `isMainThread` guard skips `main()`), so the registry only fills
+  // inside a real worker spawn. Concrete handlers live in
+  // `src/rpc-handlers.ts`; this is the single install point.
+  installRpcHandlers();
 
   let server: RunningServer;
   try {

@@ -493,6 +493,161 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
   expect(existsSync(sockPath)).toBe(false);
 }, 15000);
 
+test("end-to-end: approve CLI → set_approval RPC → approvals row, then clear DELETEs it", async () => {
+  // Spawn the daemon with the same hermetic config as the other UDS tests so
+  // it never touches the real ~/code or ~/.claude/projects trees.
+  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_SOCK: sockPath,
+      KEEPER_CONFIG: configPath,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  // The server worker binds AFTER migrate; poll for the socket file rather
+  // than racing a fixed sleep.
+  const bound = await retryUntil(
+    () => (existsSync(sockPath) ? true : null),
+    3000,
+  );
+  if (!bound) {
+    const out = await readStream(daemon.stdout);
+    const err = await readStream(daemon.stderr);
+    throw new Error(`socket never bound.\nstdout:\n${out}\nstderr:\n${err}`);
+  }
+
+  const APPROVE_CLI = join(ROOT, "scripts", "approve.ts");
+
+  // --- approve: CLI exits 0 and prints the resulting row as JSON. ---
+  const approve = Bun.spawn(
+    ["bun", APPROVE_CLI, "--sock", sockPath, "epic-a", "epic-a.1", "approve"],
+    {
+      cwd: ROOT,
+      env: { ...process.env, KEEPER_DB: dbPath },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  const approveCode = await approve.exited;
+  const approveStdout = await readStream(approve.stdout);
+  const approveStderr = await readStream(approve.stderr);
+  if (approveCode !== 0) {
+    throw new Error(
+      `approve CLI exited ${approveCode}.\nstdout:\n${approveStdout}\nstderr:\n${approveStderr}`,
+    );
+  }
+  expect(approveCode).toBe(0);
+  const approveResult = JSON.parse(approveStdout.trim()) as {
+    approval_id: string;
+    epic_id: string;
+    task_key: string;
+    status: string;
+    updated_at: number;
+  };
+  expect(approveResult.approval_id).toBe("epic-a:epic-a.1");
+  expect(approveResult.status).toBe("approved");
+
+  // Direct DB verification: the row landed in the approvals sidecar. The RPC
+  // writer is a distinct connection from this read-only observer; the
+  // server-worker's read poll sees the writer's commit via data_version.
+  const { db: reader } = openDb(dbPath, { readonly: true });
+  try {
+    const row = reader
+      .prepare(
+        "SELECT approval_id, epic_id, task_key, status FROM approvals WHERE approval_id = ?",
+      )
+      .get("epic-a:epic-a.1") as {
+      approval_id: string;
+      epic_id: string;
+      task_key: string;
+      status: string;
+    } | null;
+    expect(row).not.toBeNull();
+    expect(row?.status).toBe("approved");
+
+    // --- clear: CLI exits 0, DELETEs the row. ---
+    const clear = Bun.spawn(
+      ["bun", APPROVE_CLI, "--sock", sockPath, "epic-a", "epic-a.1", "clear"],
+      {
+        cwd: ROOT,
+        env: { ...process.env, KEEPER_DB: dbPath },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const clearCode = await clear.exited;
+    const clearStdout = await readStream(clear.stdout);
+    const clearStderr = await readStream(clear.stderr);
+    if (clearCode !== 0) {
+      throw new Error(
+        `clear CLI exited ${clearCode}.\nstdout:\n${clearStdout}\nstderr:\n${clearStderr}`,
+      );
+    }
+    const clearResult = JSON.parse(clearStdout.trim()) as {
+      cleared: boolean;
+      epic_id: string;
+      task_key: string;
+    };
+    expect(clearResult).toEqual({
+      cleared: true,
+      epic_id: "epic-a",
+      task_key: "epic-a.1",
+    });
+
+    const afterClear = reader
+      .prepare("SELECT COUNT(*) AS n FROM approvals WHERE approval_id = ?")
+      .get("epic-a:epic-a.1") as { n: number };
+    expect(afterClear.n).toBe(0);
+
+    // --- bad verb: CLI exits 1, stderr names the bad verb. ---
+    const bad = Bun.spawn(
+      ["bun", APPROVE_CLI, "--sock", sockPath, "epic-a", "epic-a.1", "garbage"],
+      {
+        cwd: ROOT,
+        env: { ...process.env, KEEPER_DB: dbPath },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const badCode = await bad.exited;
+    expect(badCode).toBe(1);
+    const badStderr = await readStream(bad.stderr);
+    expect(badStderr).toContain("garbage");
+  } finally {
+    reader.close();
+  }
+
+  // --- daemon-down: CLI fails fast with stderr message, exit 1. ---
+  daemon.kill("SIGTERM");
+  expect(await daemon.exited).toBe(0);
+  // Socket file removed by the worker's shutdown handler.
+  expect(existsSync(sockPath)).toBe(false);
+
+  const down = Bun.spawn(
+    ["bun", APPROVE_CLI, "--sock", sockPath, "epic-a", "epic-a.1", "approve"],
+    {
+      cwd: ROOT,
+      env: { ...process.env, KEEPER_DB: dbPath },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  const downCode = await down.exited;
+  expect(downCode).toBe(1);
+  const downStderr = await readStream(down.stderr);
+  // The connect rejection message varies by platform/Bun version; any of
+  // these substrings proves we surfaced a useful error rather than hanging.
+  const sawConnectMsg =
+    downStderr.includes("failed to connect") ||
+    downStderr.includes("ENOENT") ||
+    downStderr.includes("ECONNREFUSED");
+  expect(sawConnectMsg).toBe(true);
+}, 15000);
+
 test("end-to-end: transcript worker → custom-title write flips jobs.title to 'transcript'", async () => {
   const sessionId = "sess-transcript-e2e";
 
