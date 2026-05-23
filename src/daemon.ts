@@ -58,6 +58,7 @@ import {
 } from "./db";
 import type { PlanMessage, PlanWorkerData } from "./plan-worker";
 import { DEFAULT_BATCH_SIZE, drain } from "./reducer";
+import { seedKilledSweep } from "./seed-sweep";
 import type { ServerWorkerData } from "./server-worker";
 import type {
   TranscriptTitleMessage,
@@ -102,7 +103,18 @@ function runDaemon(): void {
 
   // Step 2 — boot drain. MUST finish before the worker spawns: otherwise the
   // worker would fire wakes against a writer connection still iterating boot
-  // drain (harmless, drain is idempotent, but wasteful).
+  // drain (harmless, drain is idempotent, but wasteful). The pre-sweep drain
+  // also brings the `jobs` projection up to the latest persisted lifecycle
+  // BEFORE `seedKilledSweep` reads it — without this, a SessionEnd that
+  // landed mid-boot would still look like a live row to the sweep.
+  drainToCompletion(db);
+
+  // Step 2a — seed sweep. Fold dead/recycled jobs to `killed` BEFORE the
+  // workers spawn, so the projection is consistent the moment the UDS server
+  // starts serving. See `seedKilledSweep` for the Q7 match rules; the
+  // surrounding drain folds the synthetic Killed events the sweep just
+  // emitted.
+  seedKilledSweep(db);
   drainToCompletion(db);
 
   // Coalescing flag: every wake sets it; the run loop resets it before each
