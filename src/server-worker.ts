@@ -304,11 +304,30 @@ export function resolveFilter(
       continue;
     }
     if (typeof value === "object") {
-      // Operator form. `{ ne }` → `col != ?`; an unrecognized operator object
-      // is ignored so a future operator is forward-compatible.
-      if (value.ne != null) {
+      // Operator form. `{ ne }` → `col != ?`; `{ in: [...] }` → `col IN (?, ?)`;
+      // `{ not_in: [...] }` → `col NOT IN (?, ?)`. An unrecognized operator
+      // object is ignored so a future operator is forward-compatible.
+      if ("ne" in value && value.ne != null) {
         where.push(`${col} != ?`);
         params.push(value.ne);
+      } else if ("in" in value && Array.isArray(value.in)) {
+        if (value.in.length === 0) {
+          // Empty IN list matches nothing; emit an always-false guard rather
+          // than synthesizing `IN ()` (invalid SQL).
+          where.push("0");
+        } else {
+          const placeholders = value.in.map(() => "?").join(", ");
+          where.push(`${col} IN (${placeholders})`);
+          params.push(...value.in);
+        }
+      } else if ("not_in" in value && Array.isArray(value.not_in)) {
+        if (value.not_in.length === 0) {
+          // Empty NOT IN list excludes nothing; contribute no clause.
+          continue;
+        }
+        const placeholders = value.not_in.map(() => "?").join(", ");
+        where.push(`${col} NOT IN (${placeholders})`);
+        params.push(...value.not_in);
       }
       continue;
     }

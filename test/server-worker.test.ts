@@ -244,6 +244,74 @@ test("resolveFilter: ne operator emits `!= ?`; unknown operator object ignored",
   expect(unknown.params).toEqual([]);
 });
 
+test("resolveFilter: in operator emits `IN (?, ?)`, binding one param per value", () => {
+  const r = resolveFilter(JOBS_DESCRIPTOR, {
+    state: { in: ["working", "stopped"] },
+  });
+  expect(r.clause).toBe("WHERE state IN (?, ?)");
+  expect(r.params).toEqual(["working", "stopped"]);
+});
+
+test("resolveFilter: not_in operator emits `NOT IN (?, ?)`, binding one param per value", () => {
+  const r = resolveFilter(JOBS_DESCRIPTOR, {
+    state: { not_in: ["ended", "killed"] },
+  });
+  expect(r.clause).toBe("WHERE state NOT IN (?, ?)");
+  expect(r.params).toEqual(["ended", "killed"]);
+});
+
+test("resolveFilter: empty in matches nothing (WHERE 0); empty not_in matches everything (no clause)", () => {
+  // Empty IN: degenerate "match nothing" — emit an always-false guard rather
+  // than synthesizing invalid SQL `IN ()`.
+  const emptyIn = resolveFilter(JOBS_DESCRIPTOR, {
+    state: { in: [] },
+  });
+  expect(emptyIn.clause).toBe("WHERE 0");
+  expect(emptyIn.params).toEqual([]);
+  // Empty NOT IN: degenerate "exclude nothing" — contribute no clause at all.
+  const emptyNotIn = resolveFilter(JOBS_DESCRIPTOR, {
+    state: { not_in: [] },
+  });
+  expect(emptyNotIn.clause).toBe("");
+  expect(emptyNotIn.params).toEqual([]);
+});
+
+test("runQuery applies a not_in state filter, excluding terminal states", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "w", { state: "working", created_at: 4 });
+  seedJob(db, "s", { state: "stopped", created_at: 3 });
+  seedJob(db, "e", { state: "ended", created_at: 2 });
+  seedJob(db, "k", { state: "killed", created_at: 1 });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      filter: { state: { not_in: ["ended", "killed"] } },
+    }),
+  );
+  expect(res.rows.map(jobId)).toEqual(["w", "s"]);
+  expect(res.total).toBe(2);
+  db.close();
+});
+
+test("runQuery applies an in state filter, including only listed states", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "w", { state: "working", created_at: 4 });
+  seedJob(db, "s", { state: "stopped", created_at: 3 });
+  seedJob(db, "e", { state: "ended", created_at: 2 });
+  seedJob(db, "k", { state: "killed", created_at: 1 });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      filter: { state: { in: ["ended", "killed"] } },
+    }),
+  );
+  expect(res.rows.map(jobId)).toEqual(["e", "k"]);
+  expect(res.total).toBe(2);
+  db.close();
+});
+
 test("jobs descriptor defaults the view scope to live jobs (state != ended)", () => {
   expect(JOBS_DESCRIPTOR.defaultFilter).toEqual({ state: { ne: "ended" } });
 });

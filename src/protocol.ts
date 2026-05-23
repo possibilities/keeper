@@ -89,11 +89,21 @@ export interface QuerySort {
  * `string | number` value is an exact match (`col = ?`); the `{ ne: value }`
  * operator form is a not-equal exclusion (`col != ?`) — e.g.
  * `filter: { state: { ne: "ended" } }` pages every job whose state isn't
- * `ended`. The operator literal is fixed in the server, never wire text; only
- * the value is bound. An operator object the server doesn't recognize is
- * ignored (forward-compat).
+ * `ended`. The `{ in: [...] }` / `{ not_in: [...] }` operator forms are
+ * SQL `IN (...)` / `NOT IN (...)` exclusions with one bound parameter per
+ * value — e.g. `filter: { state: { not_in: ["ended", "killed"] } }` pages
+ * every job whose state isn't terminal. Edge cases: `{ in: [] }` matches
+ * nothing (resolves to a `WHERE 0` no-rows clause); `{ not_in: [] }` matches
+ * everything (contributes no clause). The operator literal is fixed in the
+ * server, never wire text; only the values are bound. An operator object the
+ * server doesn't recognize is ignored (forward-compat).
  */
-export type FilterValue = string | number | { ne: string | number };
+export type FilterValue =
+  | string
+  | number
+  | { ne: string | number }
+  | { in: (string | number)[] }
+  | { not_in: (string | number)[] };
 
 export interface QueryFrame {
   type: "query";
