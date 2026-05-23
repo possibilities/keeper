@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
   "title": "Schema v11 plus approvals collection descriptor",
-  "updated_at": "2026-05-23T18:18:22Z"
+  "updated_at": "2026-05-23T19:54:23Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T19:54:23Z"
 }

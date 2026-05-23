@@ -98,5 +98,5 @@ task_key IN (?,?,?)` pessimization the gap analysis flagged.
 - [ ] `bun test` passes with no regressions
 
 ## Done summary
-
+Added the approvals sidecar table at schema v12 (CHECK enum on status + UNIQUE(epic_id, task_key)) and registered APPROVALS_DESCRIPTOR as the third read-only collection. Bumped SCHEMA_VERSION to 12 since fn-578 took v11; the v11→v12 step is a non-rewind sidecar ADD so pre-existing projection rows survive intact.
 ## Evidence
