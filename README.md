@@ -44,33 +44,49 @@ into the projection one short transaction per event. The reducer cursor advances
 transaction as every projection write, so the fold is exactly-once-per-event
 and the boot drain re-converges idempotently after any downtime or crash.
 
-Keeper also exposes a **read-only NDJSON-over-UDS subscribe server** as a second
+Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names
 a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
-page that doubles as a live subscription. `jobs` is the first and default
-collection, joined by `epics` (the read-only plans surface — each epic embeds its
-tasks as a JSON array, so there is no separate `tasks` collection); the
-surface is built so additional collections register without touching the wire
-protocol or the diff machinery. Page membership is frozen at
-query time, but each row's cells stream `patch` frames as the reducer folds new
-events. The `result` page also carries a `total` (the filtered-set size,
-ignoring limit/offset) and the server emits a third frame, `meta`, when that set
+page that doubles as a live subscription. Three collections register today —
+`jobs` (the first and default), `epics` (the read-only plans surface — each
+epic embeds its tasks as a JSON array, so there is no separate `tasks`
+collection), and `approvals` (a sidecar carrying per-task `pending` /
+`approved` / `rejected` state, surfaced as a pill in the autopilot client).
+The surface is built so additional collections register without touching the
+wire protocol or the diff machinery. Page membership is frozen at query time,
+but each row's cells stream `patch` frames as the reducer folds new events.
+The `result` page also carries a `total` (the filtered-set size, ignoring
+limit/offset) and the server emits a third frame, `meta`, when that set
 changes — a row enters or leaves the filter — so a paginated client can render
 "showing X of N" and a non-disruptive "set changed, refresh" nudge without the
-list reflowing under the cursor. The server is just another reader — its own
-read-only connection, its own `data_version` poll — and the socket is
-**read-only**: there is no client write path. Three example clients ship in
-`scripts/` (`jobs.ts`, `epics.ts`, and `autopilot.ts`); see
+list reflowing under the cursor.
+
+The QUERY surface is read-only: the server is just another reader on its own
+read-only connection, polling `data_version` like the reducer-wake worker.
+**Mutation is a separate, scoped path:** the same socket carries `rpc` request
+frames that dispatch to registered server-side handlers, which write the DB
+through a dedicated writer connection owned by the server-worker. The first
+concrete RPC is `set_approval` (write the `approvals` sidecar); the reducer's
+`jobs` / `epics` projections and the `events` log itself stay write-only-from-
+their-canonical-owners — RPC handlers MAY write sidecars, never reducer
+projections. The `approvals` sidecar is human-driven state, NOT a reducer
+projection — a re-fold from the event log will NOT reproduce it, by design
+(see [CLAUDE.md](./CLAUDE.md)'s DO NOT list). Four example clients ship in
+`scripts/` (`jobs.ts`, `epics.ts`, `autopilot.ts`, and `approve.ts`); see
 [Example clients](#example-clients) for usage.
 
 ## What keeper is NOT
 
 Keeper's read surface is intentionally narrow. Explicit non-goals:
 
-- **No client mutations, no reactor, no write path through the socket** — the
-  UDS server is read-only subscribe (`query` → `result` + `patch` + `meta`). The
-  socket never carries a command into keeper; consumers may still read the
-  SQLite projection directly.
+- **No reactor, no general write path into the reducer** — the UDS server's
+  QUERY surface is read-only (`query` → `result` + `patch` + `meta`); the
+  reducer's `jobs` / `epics` projections and the `events` log have one
+  canonical writer each (the hook for hook events; main for synthetic
+  events). The socket DOES carry `rpc` frames, but RPC handlers may write
+  ONLY sidecar tables (currently: `approvals`, written by the `set_approval`
+  RPC through the server-worker's writer connection) — never the reducer's
+  projections. Consumers may still read any of it directly from SQLite.
 - **No live membership stream** — `meta.total` signals that the filtered set's
   size or membership *changed*, but it does NOT deliver the new members. Frozen
   membership stands: the live page never reflows. `meta` is a count/staleness
@@ -207,9 +223,12 @@ Keeper has no `install` verb. Wire it up manually:
 
 ## Example clients
 
-Three scripts under `scripts/` demonstrate the read-only subscribe protocol —
-all clones of the same connection/coalescing/reconnect plumbing, differing
-only in their render layer. Run any with `bun scripts/<name>.ts --help`.
+Four scripts under `scripts/` demonstrate the subscribe + RPC protocols.
+`jobs.ts`, `epics.ts`, and `autopilot.ts` are read-only subscribe clients
+(clones of the same connection/coalescing/reconnect plumbing, differing only
+in their render layer); `approve.ts` is the first RPC client (single-shot
+`rpc` → `rpc_result`, no subscription). Run any with `bun scripts/<name>.ts
+--help`.
 
 - `jobs.ts` — primitive list UI over the `jobs` collection: pages 10 live jobs
   and renders a YAML frame per change, each row a single collapsed line
@@ -230,19 +249,38 @@ only in their render layer. Run any with `bun scripts/<name>.ts --help`.
   bun scripts/epics.ts --status done # see closed epics
   ```
 
-- `autopilot.ts` — flat task stream across all open epics: renders one
-  one-line-per-task YAML sequence in the form `- {repo} {task_id}` (no
-  `[status]`, so status flips alone don't reframe). Same plumbing as the
-  sibling clients.
+- `autopilot.ts` — live epic-block view with per-task approval pills, riding
+  TWO simultaneous `Bun.connect` sockets: one subscribed to the `epics`
+  collection (the render skeleton, newest-first, slugs only), one subscribed
+  to the `approvals` sidecar (the pill state). Renders each epic as a YAML
+  block — `- epic: <epic_id>` over either `tasks: []` or a nested
+  `- <task_id> [<pill>]` per task, plus a trailing virtual
+  `- close:<epic_id> [<pill>]` row per epic (the per-epic close-approval slot
+  the planning workflow uses to gate closing the whole epic). Pills are
+  `[pending]` / `[approved]` / `[rejected]`; an absent `approvals` row
+  renders as `[pending]` (the schema-v12 invariant: absent row = pending).
+  The byte-compare emit gate means a pill flip reframes but a title edit or
+  status flip alone does not.
 
   ```sh
   bun scripts/autopilot.ts
   ```
 
-All three scripts mirror each emitted frame to per-pid `/tmp` sidecar files
-(full JSON state + rendered YAML) for out-of-band inspection. The shared
-subscribe-loop logic lives in each script verbatim — extract a shared module
-once the duplication starts costing more than the copy.
+- `approve.ts` — the first RPC client. Single-shot: opens a `Bun.connect`,
+  sends one `rpc` frame for `set_approval`, awaits the `rpc_result` (or
+  `error`), and exits. No subscription, no reconnect loop. The CLI accepts
+  either a task id or the virtual `close:<epic_id>` task-key.
+
+  ```sh
+  bun scripts/approve.ts <epic_id> <task_id> approve
+  bun scripts/approve.ts <epic_id> close:<epic_id> approve   # approve the close-virtual slot
+  bun scripts/approve.ts <epic_id> <task_id> clear           # delete the approval row → renders as [pending]
+  ```
+
+The three subscribe scripts mirror each emitted frame to per-pid `/tmp`
+sidecar files (full JSON state + rendered YAML) for out-of-band inspection.
+The shared subscribe-loop logic lives in each script verbatim — extract a
+shared module once the duplication starts costing more than the copy.
 
 ## Uninstall
 
@@ -376,6 +414,10 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 # Raw event log tail (synthetic EpicSnapshot/TaskSnapshot/EpicDeleted/TaskDeleted rows appear here too):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT id, hook_event, session_id FROM events ORDER BY id DESC LIMIT 10'
+
+# Approvals sidecar — human-driven state written by the `set_approval` RPC, NOT a reducer projection. Stored status enum is {approved, rejected}; absent row = the implicit "pending" default (so a `clear` is a DELETE, not a status update):
+sqlite3 ~/.local/state/keeper/keeper.db \
+  'SELECT approval_id, epic_id, task_key, status, updated_at FROM approvals ORDER BY updated_at DESC LIMIT 10'
 
 # How far the reducer has folded:
 sqlite3 ~/.local/state/keeper/keeper.db 'SELECT * FROM reducer_state'
