@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "Add migration derivers and tests",
-  "updated_at": "2026-05-23T14:13:30Z"
+  "updated_at": "2026-05-23T17:43:03Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T17:43:03Z"
 }

@@ -278,5 +278,5 @@ all landing in one PR / one `SCHEMA_VERSION` bump:
 - [ ] No new third-party deps in the hook import graph.
 
 ## Done summary
-
+Schema v10 lands events.slash_command + events.skill_name + jobs.plan_verb + jobs.plan_ref with three partial indexes, same-transaction backfill via three pure derivers in src/derivers.ts (shared by hook + reducer + migration), and full parser/migration/reducer test coverage.
 ## Evidence
