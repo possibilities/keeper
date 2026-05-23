@@ -22,7 +22,21 @@ import {
   resolveSockPath,
   selectWorldRev,
 } from "../src/db";
+import { drain } from "../src/reducer";
 import type { Job } from "../src/types";
+
+/**
+ * Boot drain helper for migration tests. Schema v11's rewind-and-redrain
+ * sets the cursor to 0 inside migrate; the daemon's boot drain rebuilds the
+ * projection AFTER `openDb` returns. Tests that don't spin up the daemon
+ * must call this explicitly to observe the re-folded state.
+ */
+function drainAll(db: import("bun:sqlite").Database): void {
+  let n: number;
+  do {
+    n = drain(db);
+  } while (n > 0);
+}
 
 let tmpDir: string;
 let dbPath: string;
@@ -169,7 +183,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("10");
+  expect(row.value).toBe("11");
   db.close();
 });
 
@@ -268,13 +282,16 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   v3.close();
 
   // Reopen via openDb — migrate() runs the v3→v4 idempotent ADD COLUMNs (and on
-  // through v5: the ALTER block isn't version-gated, so a v3 DB converges
-  // straight to the current schema, stamping the current version).
+  // through v11: the ALTER block isn't version-gated, so a v3 DB converges
+  // straight to the current schema, stamping the current version). The v11
+  // rewind-and-redrain wipes the projection; the daemon's boot drain rebuilds
+  // it AFTER `openDb` returns — tests stand in for that drain explicitly.
   const { db } = openDb(dbPath);
+  drainAll(db);
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("10");
+  expect(ver.value).toBe("11");
 
   const eventNames = (
     db.prepare("PRAGMA table_info(events)").all() as {
@@ -289,25 +306,34 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   ).map((c) => c.name);
   expect(jobNames).toContain("title_source");
 
-  // Existing rows gain the new columns reading NULL; prior data is intact.
+  // Existing event rows gain the new columns reading NULL; prior event data
+  // is intact (the event log is never wiped, only re-folded).
   const ev = db
     .prepare(
       "SELECT session_id, spawn_name FROM events WHERE session_id = 'sess'",
     )
     .get() as { session_id: string; spawn_name: string | null };
   expect(ev.spawn_name).toBeNull();
-  const job = db
+  // Schema v11 rewind-and-redrain rebuilds the `jobs` projection from the
+  // event log (the source of truth). The directly-inserted-by-the-test
+  // legacy `old` row is wiped; the `sess` SessionStart event re-folds into
+  // a fresh row. This is the v11 contract — hand-inserted jobs rows that
+  // never had a backing event are now provably forgotten.
+  const jobOld = db
+    .prepare("SELECT title FROM jobs WHERE job_id = 'old'")
+    .get() as { title: string | null } | null;
+  expect(jobOld).toBeNull();
+  const jobSess = db
     .prepare(
-      "SELECT title, title_source, last_event_id FROM jobs WHERE job_id = 'old'",
+      "SELECT title, title_source, state FROM jobs WHERE job_id = 'sess'",
     )
     .get() as {
     title: string | null;
     title_source: string | null;
-    last_event_id: number;
-  };
-  expect(job.title).toBe("fix-osc");
-  expect(job.title_source).toBeNull();
-  expect(job.last_event_id).toBe(5);
+    state: string;
+  } | null;
+  expect(jobSess).not.toBeNull();
+  expect(jobSess?.state).toBe("stopped");
 
   // Second open is idempotent — the ADD COLUMNs no-op on the now-current shape.
   db.close();
@@ -315,7 +341,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("10");
+  expect(ver2.value).toBe("11");
   db2.close();
 });
 
@@ -368,7 +394,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("10");
+  expect(ver.value).toBe("11");
 
   const jobNames = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
@@ -377,29 +403,24 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   ).map((c) => c.name);
   expect(jobNames).toContain("transcript_path");
 
-  // Existing rows gain the new column reading NULL; prior data is intact.
+  // Schema v11 rewind-and-redrain rebuilds the `jobs` projection from the
+  // event log. This v4 fixture has no events, so the directly-inserted `old`
+  // jobs row is wiped. Schema convergence + column existence is what the
+  // migration test guarantees; data preservation requires the row to have a
+  // backing event (which a real v4→v5 path would, modulo orphans).
   const job = db
-    .prepare(
-      "SELECT title, title_source, transcript_path, last_event_id FROM jobs WHERE job_id = 'old'",
-    )
-    .get() as {
-    title: string | null;
-    title_source: string | null;
-    transcript_path: string | null;
-    last_event_id: number;
-  };
-  expect(job.title).toBe("fix-osc");
-  expect(job.title_source).toBe("payload");
-  expect(job.transcript_path).toBeNull();
-  expect(job.last_event_id).toBe(5);
+    .prepare("SELECT title FROM jobs WHERE job_id = 'old'")
+    .get() as { title: string | null } | null;
+  expect(job).toBeNull();
 
-  // Second open is idempotent — the ADD COLUMN no-ops on the now-v5 shape.
+  // Second open is idempotent — the ADD COLUMN no-ops on the now-v11 shape
+  // and the rewind-and-redrain version guard suppresses re-running.
   db.close();
   const { db: db2 } = openDb(dbPath);
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("10");
+  expect(ver2.value).toBe("11");
   db2.close();
 });
 
@@ -434,7 +455,7 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("10");
+  expect(ver.value).toBe("11");
   const names = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
@@ -442,14 +463,13 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   ).map((c) => c.name);
   expect(names).not.toContain("mode");
   expect(names).not.toContain("title_history");
-  // The live title survives the drop; the rest of the row is intact.
+  // Schema v11 rewind-and-redrain wipes the directly-inserted `old` row.
+  // The fixture has no events to re-fold, so the row is provably forgotten
+  // — column drops landed correctly is what this test guarantees.
   const row = db
-    .prepare(
-      "SELECT title, state, last_event_id FROM jobs WHERE job_id = 'old'",
-    )
-    .get() as { title: string | null; state: string; last_event_id: number };
-  expect(row.title).toBe("fix-osc");
-  expect(row.last_event_id).toBe(5);
+    .prepare("SELECT title FROM jobs WHERE job_id = 'old'")
+    .get() as { title: string | null } | null;
+  expect(row).toBeNull();
   db.close();
 });
 
@@ -486,7 +506,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("10");
+  expect(ver.value).toBe("11");
 
   const tables = new Set(
     (
@@ -506,7 +526,8 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   expect(epicCount.c).toBe(0);
 
   // The epics table carries the expected columns, including the embedded
-  // `tasks` JSON-array column (schema v7).
+  // `tasks` JSON-array column (schema v7) and the embedded `jobs`
+  // JSON-array column (schema v11).
   const epicCols = (
     db.prepare("PRAGMA table_info(epics)").all() as { name: string }[]
   ).map((c) => c.name);
@@ -520,21 +541,17 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
     "updated_at",
     "tasks",
     "depends_on_epics",
+    "jobs",
   ]);
 
-  // Prior jobs data survives untouched.
+  // Schema v11 rewind-and-redrain wipes the directly-inserted `old` jobs
+  // row (no events back it). The forward-only migration converges schema
+  // shape; the v11 contract is that the event log is the sole source of
+  // truth for projection rows.
   const job = db
-    .prepare(
-      "SELECT title, title_source, last_event_id FROM jobs WHERE job_id = 'old'",
-    )
-    .get() as {
-    title: string | null;
-    title_source: string | null;
-    last_event_id: number;
-  };
-  expect(job.title).toBe("fix-osc");
-  expect(job.title_source).toBe("payload");
-  expect(job.last_event_id).toBe(5);
+    .prepare("SELECT title FROM jobs WHERE job_id = 'old'")
+    .get() as { title: string | null } | null;
+  expect(job).toBeNull();
 
   // Second open is idempotent — CREATE TABLE IF NOT EXISTS no-ops.
   db.close();
@@ -542,7 +559,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("10");
+  expect(ver2.value).toBe("11");
   db2.close();
 });
 
@@ -601,9 +618,10 @@ test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, tas
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("10");
+  expect(ver.value).toBe("11");
 
-  // tasks table is gone.
+  // tasks table is gone (the v6→v7 backfill+DROP runs inside the same
+  // transaction, before the v11 rewind clears `epics`).
   const tables = new Set(
     (
       db
@@ -613,42 +631,23 @@ test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, tas
   );
   expect(tables.has("tasks")).toBe(false);
 
-  // alpha's tasks embedded in (task_number, task_id) order.
-  const alpha = db
-    .prepare("SELECT tasks FROM epics WHERE epic_id = 'fn-1-alpha'")
-    .get() as { tasks: string };
-  const alphaTasks = JSON.parse(alpha.tasks) as {
-    task_id: string;
-    epic_id: string;
-    task_number: number;
-    title: string;
-    target_repo: string;
-    status: string;
-  }[];
-  expect(alphaTasks.map((t) => t.task_id)).toEqual([
-    "fn-1-alpha.1",
-    "fn-1-alpha.2",
-  ]);
-  expect(alphaTasks[0]).toEqual({
-    task_id: "fn-1-alpha.1",
-    epic_id: "fn-1-alpha",
-    task_number: 1,
-    title: "first",
-    target_repo: "/repo",
-    status: "done",
-  });
+  // Schema v11 rewind-and-redrain wipes `epics` after the v6→v7 backfill
+  // runs. This fixture has no events, so the previously-backfilled rows
+  // do NOT re-emerge. The migration still converges schema (tasks table
+  // dropped, embedded `tasks` + `jobs` columns added). A real v6 DB whose
+  // plan worker reads `.planctl` files re-folds the snapshots back through
+  // synthetic events on the next boot scan.
+  const epicCount = db.prepare("SELECT count(*) AS c FROM epics").get() as {
+    c: number;
+  };
+  expect(epicCount.c).toBe(0);
 
-  // beta had no tasks — empty array.
-  const beta = db
-    .prepare("SELECT tasks FROM epics WHERE epic_id = 'fn-2-beta'")
-    .get() as { tasks: string };
-  expect(JSON.parse(beta.tasks)).toEqual([]);
-
-  // The orphan task was dropped — it never lands on any epic.
-  const allTasks = (
-    db.prepare("SELECT tasks FROM epics").all() as { tasks: string }[]
-  ).flatMap((e) => JSON.parse(e.tasks) as { task_id: string }[]);
-  expect(allTasks.some((t) => t.task_id === "orphan.1")).toBe(false);
+  // The migrated schema includes the new `jobs` embedded column on epics.
+  const epicCols = (
+    db.prepare("PRAGMA table_info(epics)").all() as { name: string }[]
+  ).map((c) => c.name);
+  expect(epicCols).toContain("tasks");
+  expect(epicCols).toContain("jobs");
 
   db.close();
 });
@@ -732,12 +731,14 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   v8.close();
 
   // Reopen via openDb — migrate() runs the v8→v9 idempotent ADD COLUMNs and
-  // stamps the current version.
+  // stamps the current version. The v11 rewind-and-redrain wipes the
+  // projection; tests stand in for the daemon's boot drain explicitly.
   const { db } = openDb(dbPath);
+  drainAll(db);
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("10");
+  expect(ver.value).toBe("11");
 
   // Both columns now appear.
   const eventNames = (
@@ -749,7 +750,8 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   ).map((c) => c.name);
   expect(jobNames).toContain("start_time");
 
-  // Existing rows gain the new columns reading NULL; prior data is intact.
+  // Existing event rows gain the new columns reading NULL; the event log
+  // is preserved (only projections rewind+redrain).
   const ev = db
     .prepare(
       "SELECT spawn_name, start_time FROM events WHERE session_id = 'sess'",
@@ -757,20 +759,25 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
     .get() as { spawn_name: string | null; start_time: string | null };
   expect(ev.spawn_name).toBe("fix-osc");
   expect(ev.start_time).toBeNull();
-  const job = db
+  // Schema v11 rewind-and-redrain wipes the directly-inserted `old` row and
+  // re-folds the `sess` SessionStart event through the current reducer —
+  // which seeds title from `spawn_name` ('fix-osc') at title_source='spawn'.
+  const jobOld = db
+    .prepare("SELECT title FROM jobs WHERE job_id = 'old'")
+    .get() as { title: string | null } | null;
+  expect(jobOld).toBeNull();
+  const jobSess = db
     .prepare(
-      "SELECT title, title_source, start_time, last_event_id FROM jobs WHERE job_id = 'old'",
+      "SELECT title, title_source, start_time FROM jobs WHERE job_id = 'sess'",
     )
     .get() as {
     title: string | null;
     title_source: string | null;
     start_time: string | null;
-    last_event_id: number;
-  };
-  expect(job.title).toBe("fix-osc");
-  expect(job.title_source).toBe("spawn");
-  expect(job.start_time).toBeNull();
-  expect(job.last_event_id).toBe(5);
+  } | null;
+  expect(jobSess?.title).toBe("fix-osc");
+  expect(jobSess?.title_source).toBe("spawn");
+  expect(jobSess?.start_time).toBeNull();
 
   // Second open is idempotent — the ADD COLUMNs no-op on the now-current shape.
   db.close();
@@ -778,7 +785,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("10");
+  expect(ver2.value).toBe("11");
   const eventNames2 = (
     db2.prepare("PRAGMA table_info(events)").all() as { name: string }[]
   ).map((c) => c.name);
@@ -1028,12 +1035,16 @@ test("v9 DB migrates to v10: four columns added + three partial indexes + backfi
   v9.close();
 
   // Reopen via openDb — migrate() runs the v9→v10 idempotent ADD COLUMNs,
-  // the partial indexes, and the same-transaction JS backfill.
+  // the partial indexes, the same-transaction JS backfill, and (schema v11)
+  // the rewind-and-redrain wipe. The daemon's boot drain rebuilds the
+  // projection AFTER `openDb` returns — tests stand in for that drain
+  // explicitly so plan_verb/plan_ref show up on the re-folded jobs rows.
   const { db } = openDb(dbPath);
+  drainAll(db);
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("10");
+  expect(ver.value).toBe("11");
 
   // All four columns appear.
   const eventNames = (
@@ -1111,7 +1122,7 @@ test("v9 DB migrates to v10: four columns added + three partial indexes + backfi
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("10");
+  expect(ver2.value).toBe("11");
   // Re-verify the backfill landed identically on the second open — the
   // guard keeps the values stable.
   const jobsAfter = db2
@@ -1123,6 +1134,221 @@ test("v9 DB migrates to v10: four columns added + three partial indexes + backfi
   };
   expect(jobsAfter.plan_verb).toBe("work");
   expect(jobsAfter.plan_ref).toBe("fn-575-foo.1");
+  db2.close();
+});
+
+test("v10 DB migrates to v11: epics.jobs added + rewind-and-redrain rebuilds embedded jobs from event log", () => {
+  // Build a v10-shaped DB by hand: events + jobs + epics at the v10 shape (no
+  // `epics.jobs` column), version '10'. Seed historical events that the
+  // rewind-and-redrain must replay through the v11 reducer to land embedded
+  // jobs back into the right arrays.
+  const v10 = new Database(dbPath, { create: true });
+  v10.run(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      session_id TEXT NOT NULL,
+      pid INTEGER,
+      hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      tool_name TEXT,
+      matcher TEXT,
+      cwd TEXT,
+      permission_mode TEXT,
+      agent_id TEXT,
+      agent_type TEXT,
+      stop_hook_active INTEGER,
+      data TEXT NOT NULL,
+      subagent_agent_id TEXT,
+      spawn_name TEXT,
+      start_time TEXT,
+      slash_command TEXT,
+      skill_name TEXT
+    )
+  `);
+  v10.run(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_source TEXT,
+      transcript_path TEXT,
+      start_time TEXT,
+      plan_verb TEXT,
+      plan_ref TEXT
+    )
+  `);
+  v10.run(`
+    CREATE TABLE epics (
+      epic_id TEXT PRIMARY KEY,
+      epic_number INTEGER,
+      title TEXT,
+      project_dir TEXT,
+      status TEXT,
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL DEFAULT 0,
+      tasks TEXT NOT NULL DEFAULT '[]',
+      depends_on_epics TEXT NOT NULL DEFAULT '[]'
+    )
+  `);
+  v10.run(`
+    CREATE TABLE reducer_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_event_id INTEGER NOT NULL DEFAULT 0,
+      updated_at REAL NOT NULL
+    )
+  `);
+  v10.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v10.run("INSERT INTO meta (key, value) VALUES ('schema_version', '10')");
+  v10.run(
+    "INSERT INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 0, 1)",
+  );
+
+  // Seed events covering mixed kinds:
+  // - SessionStart with plan-verb spawn → fans into epic.jobs.
+  // - SessionStart with work-verb spawn → fans into task.jobs (shell task).
+  // - EpicSnapshot + TaskSnapshot → fill scalar columns.
+  // - A second SessionStart for a job WITHOUT plan_ref → no fan-out.
+  const insertEvent = v10.prepare(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, data, spawn_name) VALUES (?, ?, ?, ?, ?, ?)",
+  );
+  insertEvent.run(
+    1,
+    "sess-plan",
+    "SessionStart",
+    "session_start",
+    "{}",
+    "plan::fn-1-foo",
+  );
+  insertEvent.run(
+    2,
+    "sess-work",
+    "SessionStart",
+    "session_start",
+    "{}",
+    "work::fn-1-foo.2",
+  );
+  insertEvent.run(
+    3,
+    "fn-1-foo",
+    "EpicSnapshot",
+    "epic_snapshot",
+    JSON.stringify({
+      epic_number: 1,
+      title: "Foo",
+      project_dir: "/repo",
+      status: "open",
+    }),
+    null,
+  );
+  insertEvent.run(
+    4,
+    "fn-1-foo.2",
+    "TaskSnapshot",
+    "task_snapshot",
+    JSON.stringify({
+      epic_id: "fn-1-foo",
+      task_number: 2,
+      title: "Two",
+      target_repo: "/repo",
+      status: "open",
+    }),
+    null,
+  );
+  insertEvent.run(5, "sess-plain", "SessionStart", "session_start", "{}", null);
+
+  // Seed jobs + epics rows reflecting v10 reducer output (no `jobs` arrays).
+  v10
+    .prepare(
+      "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, plan_verb, plan_ref) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .run("sess-plan", 1, 1, 1, "plan", "fn-1-foo");
+  v10
+    .prepare(
+      "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, plan_verb, plan_ref) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .run("sess-work", 2, 2, 2, "work", "fn-1-foo.2");
+  v10
+    .prepare(
+      "INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .run("fn-1-foo", 1, "Foo", "/repo", "open", 3, 1);
+  v10.close();
+
+  // Reopen via openDb — migrate() runs the v10→v11 ALTER (idempotent) plus
+  // the version-guarded rewind-and-redrain. The daemon's boot drain rebuilds
+  // the projection AFTER `openDb` returns; the test stands in for that drain.
+  const { db } = openDb(dbPath);
+  drainAll(db);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("11");
+
+  // epics.jobs column present, with the NOT NULL DEFAULT '[]'.
+  const epicCols = db.prepare("PRAGMA table_info(epics)").all() as {
+    name: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const jobsCol = epicCols.find((c) => c.name === "jobs");
+  expect(jobsCol).toBeDefined();
+  expect(jobsCol?.notnull).toBe(1);
+  expect(jobsCol?.dflt_value).toBe("'[]'");
+
+  // The re-fold rebuilt epic.jobs and task.jobs from the event log.
+  const epic = db
+    .prepare(
+      "SELECT title, status, jobs, tasks FROM epics WHERE epic_id = 'fn-1-foo'",
+    )
+    .get() as {
+    title: string;
+    status: string;
+    jobs: string;
+    tasks: string;
+  };
+  expect(epic.title).toBe("Foo");
+  expect(epic.status).toBe("open");
+  // Epic-level embedded jobs: just the plan-verb session.
+  const epicJobs = JSON.parse(epic.jobs) as {
+    job_id: string;
+    plan_verb: string;
+  }[];
+  expect(epicJobs.length).toBe(1);
+  expect(epicJobs[0]?.job_id).toBe("sess-plan");
+  expect(epicJobs[0]?.plan_verb).toBe("plan");
+  // Task-level embedded jobs: the work-verb session nested inside task.2.
+  const tasks = JSON.parse(epic.tasks) as {
+    task_id: string;
+    jobs: { job_id: string; plan_verb: string }[];
+  }[];
+  expect(tasks.length).toBe(1);
+  expect(tasks[0]?.task_id).toBe("fn-1-foo.2");
+  expect(tasks[0]?.jobs.length).toBe(1);
+  expect(tasks[0]?.jobs[0]?.job_id).toBe("sess-work");
+  expect(tasks[0]?.jobs[0]?.plan_verb).toBe("work");
+
+  // Second openDb is idempotent — the rewind-and-redrain guard skips the
+  // second time (storedVersion >= 11), so the projection is left intact.
+  const epicsBefore = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const jobsBefore = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  db.close();
+  const { db: db2 } = openDb(dbPath);
+  const ver2 = db2
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver2.value).toBe("11");
+  // No re-drain needed — the guard suppressed the rewind, so the rows
+  // persist as-is.
+  const epicsAfter = db2.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const jobsAfter = db2.query("SELECT * FROM jobs ORDER BY job_id").all();
+  expect(epicsAfter).toEqual(epicsBefore);
+  expect(jobsAfter).toEqual(jobsBefore);
   db2.close();
 });
 

@@ -12,7 +12,9 @@ event log, reducer, the five worker threads, and the wire protocol — see
 ## Event-sourcing invariants
 
 - **Cursor + projection advance in the SAME `BEGIN IMMEDIATE` transaction.** Every
-  fold writes the projection (`jobs`/`epics`) and bumps
+  fold writes the projection (`jobs`/`epics`, including the `syncJobIntoEpic`
+  fan-out from a `plan_ref`-bearing jobs write into the parent epic's embedded
+  `jobs` array or the target task element's nested `jobs` sub-array) and bumps
   `reducer_state.last_event_id` in one transaction. A crash mid-fold rolls back
   both; boot drain re-folds idempotently. This is the exactly-once-per-event
   guarantee — never split the two writes across transactions.
@@ -30,8 +32,10 @@ event log, reducer, the five worker threads, and the wire protocol — see
   *synthetic* events.** Every projection-driving fact lives in the immutable event
   log — never written straight to `jobs`/`epics` — so a re-fold from scratch
   (rewind cursor, `DELETE FROM jobs`/`epics`, re-drain) reproduces byte-identical
-  rows, including `epics` rows with their embedded `tasks` arrays (built from a
-  stable sort, never append). The producer workers feed the log only via main's
+  rows, including `epics` rows with their embedded `tasks` arrays and the
+  embedded `jobs` arrays at both the epic level and nested inside each task
+  element (all built from stable sorts — `(task_number, task_id)` for tasks,
+  `(created_at desc, job_id asc)` for jobs — never append). The producer workers feed the log only via main's
   writable connection; they never write the DB. Synthetic events covered by
   this rule: `TranscriptTitle` (transcript worker), `EpicSnapshot` /
   `TaskSnapshot` / `EpicDeleted` / `TaskDeleted` (plan worker), `Killed`
@@ -102,10 +106,16 @@ event log, reducer, the five worker threads, and the wire protocol — see
   of scope.
 - **Plans are READ-ONLY**, like everything keeper serves. The plan worker watches
   the configured roots' `.planctl/{epics,tasks}` trees and folds snapshots into
-  the `epics` projection (each epic embeds its tasks as a JSON array — no peer
-  `tasks` collection or table) served over the same socket. FORBIDDEN: any plan
-  WRITE path — the socket never carries a plan mutation, keeper never writes a
-  `.planctl` file, and no command surface exists.
+  the `epics` projection (each epic embeds its tasks as a JSON array, its
+  plan/close-verb jobs as a JSON array, and each task element embeds its own
+  work-verb jobs as a nested JSON array — no peer `tasks` or `epic_jobs`
+  collection or table) served over the same socket. Jobs fan into the embedded
+  arrays from the reducer's jobs-side writes via the `syncJobIntoEpic` helper,
+  which runs INSIDE the same `BEGIN IMMEDIATE` transaction as the jobs write +
+  cursor advance, so the embedded arrays are a pure function of the event log
+  and a from-scratch re-fold reproduces them byte-identically. FORBIDDEN: any
+  plan WRITE path — the socket never carries a plan mutation, keeper never
+  writes a `.planctl` file, and no command surface exists.
 - **Transcript tailing is scoped to the daemon, never the hook.** keeperd's
   transcript worker MAY tail external transcript JSONL to produce priority-3
   `TranscriptTitle` events. FORBIDDEN: transcript reading in the hook (it stays

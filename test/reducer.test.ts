@@ -1392,6 +1392,7 @@ function getEpic(epicId: string) {
     updated_at: number;
     tasks: string;
     depends_on_epics: string;
+    jobs: string;
   } | null;
 }
 
@@ -1404,6 +1405,7 @@ interface EmbeddedTask {
   target_repo: string | null;
   status: string | null;
   depends_on: string[];
+  jobs?: unknown[];
 }
 
 /** Decode an epic's embedded tasks array (schema v7). NULL/missing → []. */
@@ -1456,6 +1458,8 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     tasks: "[]",
     // No depends_on_epics in the blob → the stored column defaults to "[]".
     depends_on_epics: "[]",
+    // No `plan_ref`-bearing jobs have folded into this epic yet → defaults to "[]".
+    jobs: "[]",
   });
   expect(epic?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);
@@ -1486,6 +1490,9 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     status: "done",
     // No depends_on in the blob → the embedded element defaults to [].
     depends_on: [],
+    // First-sight task element with no prior plan_ref-bearing jobs folded
+    // into its embedded `jobs` sub-array → defaults to [] (schema v11).
+    jobs: [],
   });
   // The fold bumps the parent epic's last_event_id (so it patches).
   expect(getEpic("fn-1-add-oauth")?.last_event_id).toBe(id);
@@ -1853,4 +1860,398 @@ test("from-scratch re-fold reproduces the spliced state across a create→delete
 
   const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
   expect(epicsAfter).toEqual(epicsBefore);
+});
+
+// ---------------------------------------------------------------------------
+// Embedded jobs (syncJobIntoEpic): schema v11
+// ---------------------------------------------------------------------------
+
+/** Helper: read an epic's embedded `jobs` array (NULL/missing → []). */
+function getEpicJobs(epicId: string): {
+  job_id: string;
+  plan_verb: string;
+  state: string;
+  title: string | null;
+  created_at: number;
+  updated_at: number;
+  last_event_id: number;
+}[] {
+  const row = db
+    .query("SELECT jobs FROM epics WHERE epic_id = ?")
+    .get(epicId) as { jobs: string | null } | null;
+  if (row == null || row.jobs == null || row.jobs.length === 0) {
+    return [];
+  }
+  return JSON.parse(row.jobs);
+}
+
+/** Helper: read a task element's embedded `jobs` sub-array (NULL/missing → []). */
+function getTaskJobs(taskId: string): {
+  job_id: string;
+  plan_verb: string;
+  state: string;
+  title: string | null;
+  created_at: number;
+  updated_at: number;
+  last_event_id: number;
+}[] {
+  const task = getTask(taskId);
+  if (task == null || !Array.isArray(task.jobs)) {
+    return [];
+  }
+  return task.jobs as ReturnType<typeof getTaskJobs>;
+}
+
+test("SessionStart with epic-level plan_ref fans into epic.jobs (verb plan)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-plan",
+    spawn_name: "plan::fn-575-osc-parser",
+  });
+  drainAll();
+  const jobs = getEpicJobs("fn-575-osc-parser");
+  expect(jobs.length).toBe(1);
+  expect(jobs[0]?.job_id).toBe("sess-plan");
+  expect(jobs[0]?.plan_verb).toBe("plan");
+  expect(jobs[0]?.state).toBe("stopped");
+  expect(jobs[0]?.title).toBe("plan::fn-575-osc-parser");
+  expect(getTasks("fn-575-osc-parser")).toEqual([]);
+});
+
+test("SessionStart with epic-level plan_ref fans into epic.jobs (verb close)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-close",
+    spawn_name: "close::fn-9-bar",
+  });
+  drainAll();
+  const jobs = getEpicJobs("fn-9-bar");
+  expect(jobs.length).toBe(1);
+  expect(jobs[0]?.plan_verb).toBe("close");
+});
+
+test("SessionStart with task-level plan_ref fans into task.jobs (verb work)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-work",
+    spawn_name: "work::fn-575-foo.3",
+  });
+  drainAll();
+  const epic = getEpic("fn-575-foo");
+  expect(epic).not.toBeNull();
+  expect(epic?.epic_number).toBeNull();
+  expect(epic?.title).toBeNull();
+  expect(getEpicJobs("fn-575-foo")).toEqual([]);
+  const tasks = getTasks("fn-575-foo");
+  expect(tasks.length).toBe(1);
+  expect(tasks[0]?.task_id).toBe("fn-575-foo.3");
+  const taskJobs = getTaskJobs("fn-575-foo.3");
+  expect(taskJobs.length).toBe(1);
+  expect(taskJobs[0]?.job_id).toBe("sess-work");
+  expect(taskJobs[0]?.plan_verb).toBe("work");
+  expect(taskJobs[0]?.state).toBe("stopped");
+});
+
+test("SessionEnd on a plan_ref job updates the embedded entry's state to ended", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-end",
+    spawn_name: "plan::fn-1-foo",
+  });
+  drainAll();
+  expect(getEpicJobs("fn-1-foo")[0]?.state).toBe("stopped");
+  insertEvent({ hook_event: "SessionEnd", session_id: "sess-end" });
+  drainAll();
+  expect(getEpicJobs("fn-1-foo")[0]?.state).toBe("ended");
+});
+
+test("UserPromptSubmit on a plan_ref job updates embedded state to working", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-ups",
+    spawn_name: "work::fn-1-foo.1",
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ups" });
+  drainAll();
+  const taskJobs = getTaskJobs("fn-1-foo.1");
+  expect(taskJobs[0]?.state).toBe("working");
+});
+
+test("title change on a plan_ref job propagates to the embedded entry", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-title",
+    spawn_name: "plan::fn-1-bar",
+  });
+  drainAll();
+  expect(getEpicJobs("fn-1-bar")[0]?.title).toBe("plan::fn-1-bar");
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-title",
+    data: JSON.stringify({ session_title: "Real Title" }),
+  });
+  drainAll();
+  expect(getEpicJobs("fn-1-bar")[0]?.title).toBe("Real Title");
+});
+
+test("Killed-mismatch path does NOT fan into the embedded entry", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-killed",
+    pid: 1234,
+    start_time: "real-start",
+    spawn_name: "close::fn-7-x",
+  });
+  drainAll();
+  const before = getEpicJobs("fn-7-x")[0];
+  expect(before?.state).toBe("stopped");
+  const beforeEventId = before?.last_event_id;
+  // A Killed event with the WRONG (pid, start_time) — stale/recycled.
+  insertEvent({
+    hook_event: "Killed",
+    session_id: "sess-killed",
+    data: JSON.stringify({ pid: 9999, start_time: "wrong-start" }),
+  });
+  drainAll();
+  // The jobs row stayed unchanged → no sync fired, embedded entry stayed put.
+  const after = getEpicJobs("fn-7-x")[0];
+  expect(after?.state).toBe("stopped");
+  expect(after?.last_event_id).toBe(beforeEventId!);
+});
+
+test("Killed matching path DOES fan into the embedded entry (state -> killed)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-killed-match",
+    pid: 1234,
+    start_time: "real-start",
+    spawn_name: "close::fn-8-y",
+  });
+  drainAll();
+  insertEvent({
+    hook_event: "Killed",
+    session_id: "sess-killed-match",
+    data: JSON.stringify({ pid: 1234, start_time: "real-start" }),
+  });
+  drainAll();
+  expect(getEpicJobs("fn-8-y")[0]?.state).toBe("killed");
+});
+
+test("an invalid plan_ref shape never throws and the cursor still advances", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-bad",
+    spawn_name: "work::not_a_ref!",
+  });
+  drainAll();
+  expect(getCursor()).toBeGreaterThan(0);
+});
+
+test("Stop on a still-terminal job does NOT fan (no write happened)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-stop-terminal",
+    spawn_name: "plan::fn-2-z",
+  });
+  insertEvent({
+    hook_event: "SessionEnd",
+    session_id: "sess-stop-terminal",
+  });
+  drainAll();
+  const beforeId = getEpicJobs("fn-2-z")[0]?.last_event_id;
+  expect(getEpicJobs("fn-2-z")[0]?.state).toBe("ended");
+  insertEvent({ hook_event: "Stop", session_id: "sess-stop-terminal" });
+  drainAll();
+  expect(getEpicJobs("fn-2-z")[0]?.state).toBe("ended");
+  expect(getEpicJobs("fn-2-z")[0]?.last_event_id).toBe(beforeId!);
+});
+
+test("multiple plan_ref jobs sort (created_at desc, job_id asc)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-a-id",
+    spawn_name: "plan::fn-1-multi",
+    ts: 1000,
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-b-id",
+    spawn_name: "plan::fn-1-multi",
+    ts: 2000,
+  });
+  drainAll();
+  const jobs = getEpicJobs("fn-1-multi");
+  expect(jobs.map((j) => j.job_id)).toEqual(["sess-b-id", "sess-a-id"]);
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "alpha",
+    spawn_name: "plan::fn-1-tie",
+    ts: 5000,
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "beta",
+    spawn_name: "plan::fn-1-tie",
+    ts: 5000,
+  });
+  drainAll();
+  expect(getEpicJobs("fn-1-tie").map((j) => j.job_id)).toEqual([
+    "alpha",
+    "beta",
+  ]);
+});
+
+test("EpicSnapshot ON CONFLICT preserves epic.jobs (carve-out works)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-shell",
+    spawn_name: "plan::fn-1-shell",
+  });
+  drainAll();
+  expect(getEpicJobs("fn-1-shell").length).toBe(1);
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-1-shell",
+    data: JSON.stringify({
+      epic_number: 1,
+      title: "Real",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  drainAll();
+  const epic = getEpic("fn-1-shell");
+  expect(epic?.title).toBe("Real");
+  expect(epic?.status).toBe("open");
+  expect(getEpicJobs("fn-1-shell").length).toBe(1);
+  expect(getEpicJobs("fn-1-shell")[0]?.job_id).toBe("sess-shell");
+});
+
+test("TaskSnapshot RMW preserves the task element's jobs sub-array", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-pre-task",
+    spawn_name: "work::fn-5-pre.2",
+  });
+  drainAll();
+  expect(getTaskJobs("fn-5-pre.2").length).toBe(1);
+  insertEvent({
+    hook_event: "TaskSnapshot",
+    session_id: "fn-5-pre.2",
+    data: JSON.stringify({
+      epic_id: "fn-5-pre",
+      task_number: 2,
+      title: "Real Task",
+      target_repo: "/repo",
+      status: "open",
+    }),
+  });
+  drainAll();
+  const task = getTask("fn-5-pre.2");
+  expect(task?.title).toBe("Real Task");
+  expect(task?.status).toBe("open");
+  expect(getTaskJobs("fn-5-pre.2").length).toBe(1);
+  expect(getTaskJobs("fn-5-pre.2")[0]?.job_id).toBe("sess-pre-task");
+});
+
+test("malformed stored epic.jobs blob folds to [] in-txn (never wedges)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-seed",
+    spawn_name: "plan::fn-99-mal",
+  });
+  drainAll();
+  db.run("UPDATE epics SET jobs = '{not json' WHERE epic_id = 'fn-99-mal'");
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-seed-2",
+    spawn_name: "plan::fn-99-mal",
+  });
+  drainAll();
+  const jobs = getEpicJobs("fn-99-mal");
+  expect(jobs.length).toBe(1);
+  expect(jobs[0]?.job_id).toBe("sess-seed-2");
+});
+
+test("from-scratch re-fold reproduces byte-identical embedded jobs arrays", () => {
+  // Mixed arrival orderings: epic-first, task-first, job-first.
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-A",
+    data: JSON.stringify({ epic_number: 1, title: "A", status: "open" }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-A",
+    spawn_name: "plan::fn-A",
+    ts: 100,
+  });
+  insertEvent({
+    hook_event: "TaskSnapshot",
+    session_id: "fn-B.1",
+    data: JSON.stringify({
+      epic_id: "fn-B",
+      task_number: 1,
+      title: "B1",
+      status: "open",
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-B",
+    spawn_name: "work::fn-B.1",
+    ts: 200,
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-C",
+    spawn_name: "work::fn-C.5",
+    ts: 300,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-C",
+    data: JSON.stringify({ epic_number: 3, title: "C", status: "open" }),
+  });
+  insertEvent({
+    hook_event: "TaskSnapshot",
+    session_id: "fn-C.5",
+    data: JSON.stringify({
+      epic_id: "fn-C",
+      task_number: 5,
+      title: "C5",
+      status: "open",
+    }),
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-A" });
+  insertEvent({ hook_event: "Stop", session_id: "sess-A" });
+  insertEvent({ hook_event: "SessionEnd", session_id: "sess-B" });
+  drainAll();
+
+  const epicsBefore = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const jobsBefore = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  drainAll();
+
+  const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const jobsAfter = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  expect(epicsAfter).toEqual(epicsBefore);
+  expect(jobsAfter).toEqual(jobsBefore);
+});
+
+test("a job with no plan_ref does not create an epic row (no fan-out)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-plain",
+  });
+  drainAll();
+  expect(getJob("sess-plain")).not.toBeNull();
+  const epicCount = db.query("SELECT count(*) AS c FROM epics").get() as {
+    c: number;
+  };
+  expect(epicCount.c).toBe(0);
 });

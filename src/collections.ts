@@ -157,6 +157,7 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "updated_at",
     "tasks",
     "depends_on_epics",
+    "jobs",
   ],
   pk: "epic_id",
   version: "last_event_id",
@@ -180,10 +181,15 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
   // its own `epic_id`, not `status`, so detail-page reads of a done epic still
   // resolve. The view-side knob is keeper-frames' `--status` / `--status-ne`.
   defaultFilter: { status: "open" },
-  // `tasks` and `depends_on_epics` are both JSON-TEXT array columns — decoded to
-  // real arrays at the read boundary (the embedded `Task[]` and the epic-dep id
-  // list). Both are served + decoded but OUT of `sortable`/`filters`.
-  jsonColumns: new Set(["tasks", "depends_on_epics"]),
+  // `tasks`, `depends_on_epics`, and `jobs` are JSON-TEXT array columns —
+  // decoded to real arrays at the read boundary. `jobs` carries the
+  // epic-level `EmbeddedJob[]` (plan/close verbs). Nested `task.jobs`
+  // (work-verb jobs on each task element) rides through the `tasks` parse —
+  // `decodeRow` returns parsed arrays whose nested objects' nested arrays
+  // are already arrays, so no separate `jsonColumns` entry is needed for
+  // the nested sub-array. All three are served + decoded but OUT of
+  // `sortable`/`filters`.
+  jsonColumns: new Set(["tasks", "depends_on_epics", "jobs"]),
 };
 
 /**

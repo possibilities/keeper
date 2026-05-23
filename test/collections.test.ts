@@ -54,11 +54,12 @@ function seedEpic(
     updated_at: number;
     tasks: string;
     depends_on_epics: string;
+    jobs: string;
   }> = {},
 ): void {
   db.query(
-    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     epic_id,
     opts.epic_number ?? null,
@@ -69,6 +70,7 @@ function seedEpic(
     opts.updated_at ?? 1,
     opts.tasks ?? "[]",
     opts.depends_on_epics ?? "[]",
+    opts.jobs ?? "[]",
   );
 }
 
@@ -174,6 +176,92 @@ test("runQuery decodes the depends_on_epics JSON-array column into a real array"
     }),
   );
   expect(res.rows[0]!.depends_on_epics).toEqual(["fn-3-base"]);
+  db.close();
+});
+
+test("runQuery decodes the embedded jobs JSON-array column into a real array", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const epicJobs = JSON.stringify([
+    {
+      job_id: "sess-plan-1",
+      plan_verb: "plan",
+      state: "stopped",
+      title: "plan a thing",
+      created_at: 100,
+      updated_at: 100,
+      last_event_id: 1,
+    },
+  ]);
+  seedEpic(db, "fn-9-jobs", {
+    epic_number: 9,
+    status: "open",
+    jobs: epicJobs,
+  });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "epics",
+      filter: { epic_id: "fn-9-jobs" },
+    }),
+  );
+  const row = res.rows[0]!;
+  expect(Array.isArray(row.jobs)).toBe(true);
+  const arr = row.jobs as { job_id: string; plan_verb: string }[];
+  expect(arr.map((j) => j.job_id)).toEqual(["sess-plan-1"]);
+  expect(arr[0]?.plan_verb).toBe("plan");
+  db.close();
+});
+
+test("runQuery nested-decodes task.jobs through the tasks JSON parse", () => {
+  // The task element carries its own `jobs` sub-array (work-verb jobs). The
+  // `tasks` column decode parses the outer array; the nested `task.jobs` rides
+  // for free (decodeRow returns parsed arrays whose nested array fields are
+  // already arrays). No separate jsonColumns entry is needed for task.jobs.
+  const { db } = openDb(dbPath, { readonly: false });
+  const tasks = JSON.stringify([
+    {
+      task_id: "fn-1-foo.1",
+      epic_id: "fn-1-foo",
+      task_number: 1,
+      title: "T1",
+      target_repo: "/repo",
+      status: "open",
+      depends_on: [],
+      jobs: [
+        {
+          job_id: "sess-work-1",
+          plan_verb: "work",
+          state: "working",
+          title: "doing T1",
+          created_at: 200,
+          updated_at: 200,
+          last_event_id: 5,
+        },
+      ],
+    },
+  ]);
+  seedEpic(db, "fn-1-foo", {
+    epic_number: 1,
+    status: "open",
+    tasks,
+  });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "epics",
+      filter: { epic_id: "fn-1-foo" },
+    }),
+  );
+  const row = res.rows[0]!;
+  expect(Array.isArray(row.tasks)).toBe(true);
+  const taskArr = row.tasks as {
+    task_id: string;
+    jobs: { job_id: string; plan_verb: string }[];
+  }[];
+  expect(taskArr.length).toBe(1);
+  expect(Array.isArray(taskArr[0]?.jobs)).toBe(true);
+  expect(taskArr[0]?.jobs[0]?.job_id).toBe("sess-work-1");
+  expect(taskArr[0]?.jobs[0]?.plan_verb).toBe("work");
   db.close();
 });
 

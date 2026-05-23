@@ -31,7 +31,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -293,7 +293,8 @@ CREATE TABLE IF NOT EXISTS epics (
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0,
     tasks TEXT NOT NULL DEFAULT '[]',
-    depends_on_epics TEXT NOT NULL DEFAULT '[]'
+    depends_on_epics TEXT NOT NULL DEFAULT '[]',
+    jobs TEXT NOT NULL DEFAULT '[]'
 )
 `;
 
@@ -691,6 +692,46 @@ function migrate(db: Database): void {
           );
         }
       }
+    }
+
+    // v10→v11: embed jobs into the `epics` projection. `epic.jobs` carries
+    // plan/close-verb jobs (`plan_ref == epic_id`); each task element inside
+    // `epic.tasks` carries its own `jobs` sub-array for work-verb jobs
+    // (`plan_ref == task_id`). The reducer fans every `plan_ref`-bearing jobs
+    // write into the correct array via `syncJobIntoEpic` (see
+    // `src/reducer.ts`). Stored as JSON-TEXT; decoded at the read boundary.
+    //
+    // Column defs match CREATE_EPICS so a fresh v11 DB and a migrated v10→v11
+    // DB converge to identical schema (the addColumnIfMissing/literal lockstep
+    // convention). Idempotent ADD COLUMN — `addColumnIfMissing` reads PRAGMA
+    // table_info and no-ops when the column exists.
+    addColumnIfMissing(db, "epics", "jobs", "TEXT NOT NULL DEFAULT '[]'");
+
+    // Version-guarded REWIND-AND-REDRAIN: rather than backfill the new
+    // embedded `jobs` arrays directly, we set the cursor back to 0 and
+    // `DELETE FROM jobs` / `DELETE FROM epics`. The boot drain (which runs
+    // unconditionally after `migrate()` returns) then replays the entire
+    // event log through the new v11 reducer — the SINGLE source of truth for
+    // the embedded-jobs composition. A migrated row equals a re-folded one
+    // byte-for-byte; no migration-specific composition logic to drift from
+    // the steady-state reducer.
+    //
+    // Non-idempotent: must run AT MOST once per DB. The guard reads the
+    // version stamped by a prior migrate() — on a fresh v11+ DB it skips
+    // cleanly, so a second `openDb` is a no-op. Cost: re-folding the entire
+    // event log inside the BEGIN IMMEDIATE — bounded by `events` row count,
+    // seconds to tens of seconds on a developer machine. One-time.
+    const storedVersionV11 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV11 < 11) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
     }
 
     db.prepare(

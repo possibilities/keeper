@@ -423,6 +423,90 @@ test("seedFromDb reconstructs from epics.tasks so an embedded task is not re-emi
   expect((emitted[0] as { title: string }).title).toBe("T2");
 });
 
+test("seedFromDb is jobs-blind: epic.jobs / task.jobs never re-emit on restart", () => {
+  // Schema v11 embeds jobs into epics. The change-gate seed signature must
+  // EXCLUDE `epic.jobs` AND `task.jobs` — otherwise every plan-file fingerprint
+  // changes whenever a job tick fans into the embedded arrays, and the boot
+  // scan re-emits a synthetic snapshot for every epic and task on every boot
+  // (the worst-case feedback loop documented in the epic's Risks section).
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+
+  // Seed an epic carrying BOTH epic-level jobs AND a task whose own embedded
+  // jobs sub-array is populated. A jobs-blind seed signature must produce the
+  // same fingerprint as the on-disk file (which has NO jobs data).
+  const tasks = JSON.stringify([
+    {
+      task_id: "fn-3-demo.1",
+      epic_id: "fn-3-demo",
+      task_number: 1,
+      title: "T",
+      target_repo: "/repo",
+      status: "open",
+      // Stored task element carries a populated jobs sub-array (live state
+      // from a work-verb session that fanned in via the reducer). MUST NOT
+      // affect the seed signature.
+      jobs: [
+        {
+          job_id: "work-session-1",
+          plan_verb: "work",
+          state: "working",
+          title: "live work",
+          created_at: 1000,
+          updated_at: 1000,
+          last_event_id: 99,
+        },
+      ],
+    },
+  ]);
+  const epicJobs = JSON.stringify([
+    {
+      job_id: "plan-session-1",
+      plan_verb: "plan",
+      state: "stopped",
+      title: "live plan",
+      created_at: 500,
+      updated_at: 500,
+      last_event_id: 7,
+    },
+  ]);
+  db.run(
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, jobs)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["fn-3-demo", 3, "Demo", "/repo", "open", 1, 0, tasks, epicJobs],
+  );
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+  db.close();
+
+  // Now write the on-disk files that match the projection's PLAN-SHAPED
+  // content (no jobs sections — plan files never carry jobs). The seed
+  // signature must match these byte-for-byte, so neither plan-epic nor
+  // plan-task emits.
+  const epicPath = writeEpic("fn-3-demo", {
+    title: "Demo",
+    status: "open",
+    primary_repo: "/repo",
+  });
+  scanner.onChange(epicPath);
+  const taskPath = writeTask("fn-3-demo.1", {
+    epic: "fn-3-demo",
+    title: "T",
+    target_repo: "/repo",
+  });
+  scanner.onChange(taskPath);
+
+  // Both files match — no re-emit. This is the boot-idempotency guarantee:
+  // jobs-driven bumps to epics.last_event_id must NEVER cause the change-gate
+  // to flag plan files as changed.
+  expect(emitted).toEqual([]);
+});
+
 // ---------------------------------------------------------------------------
 // (a*) Boot reconciliation sweep — retract projection ids whose backing file
 // was deleted while the daemon was down (no live onDelete fired). Scoped to

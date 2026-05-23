@@ -753,6 +753,15 @@ function scanPlanctlDir(planctlDir: string, scanner: PlanScanner): void {
  * worker `main` (and unit reach).
  */
 export function seedFromDb(db: Database, scanner: PlanScanner): void {
+  // The seed reconstruction MUST mirror what `buildEpicMessage` /
+  // `buildTaskMessage` produce for the same on-disk file: the change-gate
+  // compares serialized messages, so any drift re-emits a synthetic event for
+  // every plan file on every boot. The reconstructed messages carry NO `jobs`
+  // arrays — jobs are live state, NOT plan-file truth. The reducer's
+  // `syncJobIntoEpic` fan-out bumps `epics.last_event_id` and rewrites
+  // `epics.jobs` / `task.jobs` independently; including them here would feed
+  // back into the seed signature on every boot and re-emit every snapshot
+  // (the worst-case feedback loop documented in the epic's Risks section).
   const epics = db
     .query(
       "SELECT epic_id, epic_number, title, project_dir, status, depends_on_epics, tasks FROM epics",
@@ -784,6 +793,13 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
     // `status ?? "open"` for the derived status — or the change-gate would
     // re-emit every plan-task on every boot. A malformed/NULL array is treated
     // as empty (one bad row never wedges the seed).
+    //
+    // The stored task element may carry a `jobs` sub-array (schema v11) — it
+    // is intentionally NOT read here. Jobs are live state, not plan-file truth;
+    // the reconstructed task message must match what `buildTaskMessage`
+    // produces from the on-disk file (which has no `jobs`), or the change-gate
+    // re-emits every plan-task on every boot whenever a job tick fans into
+    // `task.jobs`.
     let tasks: {
       task_id: string;
       epic_id: string | null;

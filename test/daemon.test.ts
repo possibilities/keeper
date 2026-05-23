@@ -227,6 +227,7 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     target_repo: string;
     status: string;
     depends_on: string[];
+    jobs: unknown[];
   }[];
   expect(tasks.length).toBe(1);
   expect(tasks[0]).toEqual({
@@ -237,6 +238,8 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     target_repo: "/Users/mike/code/keeper",
     status: "open",
     depends_on: [],
+    // Schema v11: first-sight task element gets an empty embedded jobs sub-array.
+    jobs: [],
   });
 
   db.close();

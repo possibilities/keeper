@@ -144,6 +144,30 @@ export interface ReducerState {
 }
 
 /**
+ * The display projection of a `jobs` row embedded inside an `epics` row's
+ * `jobs` array (epic-level: verbs `plan` / `close`) or inside a task element's
+ * `jobs` sub-array (task-level: verb `work`). The reducer's `syncJobIntoEpic`
+ * helper builds these from the post-write `jobs` row whenever a `plan_ref` is
+ * non-null. Sorted `(created_at desc, job_id asc)` — total-order tiebreaker on
+ * `job_id` is non-negotiable for byte-identical re-fold (see CLAUDE.md
+ * "byte-identical re-fold" invariant).
+ *
+ * Field set is the minimal display projection: identity + verb + lifecycle
+ * state + title + the monotonic per-row version (`last_event_id`) that fires
+ * the read-surface diff. NOT a full `Job` (no pid, no cwd, no start_time —
+ * those stay on the `jobs` projection for consumers that want them).
+ */
+export interface EmbeddedJob {
+  job_id: string;
+  plan_verb: string;
+  state: string;
+  title: string | null;
+  created_at: number;
+  updated_at: number;
+  last_event_id: number;
+}
+
+/**
  * One row of the `epics` projection. `epic_id` is the planctl epic id (pk). The
  * reducer folds synthetic `EpicSnapshot` events (full state-on-disk snapshots
  * posted by the plan worker, written by main) into this table via idempotent
@@ -157,6 +181,13 @@ export interface ReducerState {
  * stored as JSON TEXT and decoded to a real `Task[]` at the read boundary
  * (`decodeRow`); a task edit folds into this array and bumps the epic's
  * `last_event_id`, so it surfaces as a `patch` on the parent epic row.
+ *
+ * As of schema v11 each epic also embeds its plan/close-verb jobs in the
+ * `jobs` array (`EmbeddedJob[]`); work-verb jobs live inside their target
+ * task element's nested `jobs` sub-array (see {@link Task.jobs}). The reducer
+ * fans a `jobs` write into the correct embedded array via `syncJobIntoEpic`
+ * whenever the row carries a `plan_ref`. Stored as JSON TEXT, decoded to a
+ * real array at the read boundary; sorted `(created_at desc, job_id asc)`.
  */
 export interface Epic {
   epic_id: string;
@@ -173,6 +204,13 @@ export interface Epic {
    */
   depends_on_epics: string[];
   tasks: Task[];
+  /**
+   * Epic-level embedded jobs: `jobs` rows whose `plan_ref` equals this
+   * `epic_id` (verbs `plan` / `close`). Work-verb jobs live in each task
+   * element's `jobs` sub-array, never here. Sorted
+   * `(created_at desc, job_id asc)`.
+   */
+  jobs: EmbeddedJob[];
 }
 
 /**
@@ -197,4 +235,12 @@ export interface Task {
    * (no schema column of its own).
    */
   depends_on: string[];
+  /**
+   * Task-level embedded jobs: `jobs` rows whose `plan_ref` equals this
+   * `task_id` (verb `work`). Lives nested inside the parent epic's embedded
+   * `tasks` array — decoded at the read boundary via the same JSON parse as
+   * `tasks` itself (no separate `jsonColumns` entry; nested decode rides for
+   * free). Sorted `(created_at desc, job_id asc)`.
+   */
+  jobs: EmbeddedJob[];
 }

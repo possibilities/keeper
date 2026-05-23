@@ -168,3 +168,58 @@ export function planVerbRefFromSpawnName(
   // biome-ignore lint/style/noNonNullAssertion: regex match guarantees both capture groups
   return { plan_verb: m[1]!, plan_ref: m[2]! };
 }
+
+/**
+ * Anchored planctl-ref → `{kind, epic_id, task_id?}` match. The strict shape:
+ *
+ *   `fn-\d+-[a-z0-9-]+` + optional `.\d+`
+ *
+ * Mirrors the ref-body half of {@link SPAWN_VERB_REF_RE} — same lowercase
+ * kebab-only character class so an uppercase or `_`-bearing ref rejects, same
+ * `$` anchor so a trailing token (`fn-1-foo.1.extra`) rejects rather than
+ * partial-matching. The optional dot-suffix is the planctl task-number tail.
+ *
+ * Module-scope so V8/JSC tier up once at process start; reused by the reducer's
+ * `syncJobIntoEpic` fan-out on every `plan_ref`-bearing jobs write.
+ */
+const PLAN_REF_RE = /^(fn-\d+-[a-z0-9-]+)(?:\.(\d+))?$/;
+
+/**
+ * The shape returned by {@link parsePlanRef}. `kind: 'epic'` carries just the
+ * epic id (verbs `plan` / `close`); `kind: 'task'` carries both the epic id and
+ * the fully-qualified task id (verb `work`). Returning `null` from
+ * {@link parsePlanRef} signals an invalid ref — the reducer's sync helper
+ * treats null as "skip the fan-out, advance the cursor, no throw."
+ */
+export type ParsedPlanRef =
+  | { kind: "epic"; epic_id: string }
+  | { kind: "task"; epic_id: string; task_id: string };
+
+/**
+ * Split a `plan_ref` into its epic / task components. An epic-form ref
+ * (`fn-575-osc-parser`) returns `{kind: 'epic', epic_id}`; a task-form ref
+ * (`fn-575-osc-parser.3`) returns `{kind: 'task', epic_id, task_id}` with the
+ * fully-qualified `task_id` (`${epic_id}.${ordinal}`). Anything else — null
+ * input, malformed shape (`fn-1-foo.`, `fn-1`, `fn--foo`, empty), uppercase
+ * letter, trailing whitespace, extra segments — returns `null`.
+ *
+ * The reducer's `syncJobIntoEpic` calls this on every `plan_ref`-bearing jobs
+ * write to decide which embedded array to fan into. A null return short-
+ * circuits the fan-out (the cursor still advances upstream — never throw).
+ */
+export function parsePlanRef(ref: string | null): ParsedPlanRef | null {
+  if (typeof ref !== "string" || ref.length === 0) {
+    return null;
+  }
+  const m = ref.match(PLAN_REF_RE);
+  if (m == null) {
+    return null;
+  }
+  // biome-ignore lint/style/noNonNullAssertion: regex match guarantees group 1
+  const epicId = m[1]!;
+  const ordinal = m[2];
+  if (ordinal !== undefined) {
+    return { kind: "task", epic_id: epicId, task_id: `${epicId}.${ordinal}` };
+  }
+  return { kind: "epic", epic_id: epicId };
+}

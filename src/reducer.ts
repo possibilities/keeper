@@ -57,7 +57,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { planVerbRefFromSpawnName } from "./derivers";
+import { parsePlanRef, planVerbRefFromSpawnName } from "./derivers";
 import type { Event } from "./types";
 
 /**
@@ -319,11 +319,12 @@ function projectPlanRow(db: Database, event: Event): void {
   const entityId = event.session_id;
 
   if (event.hook_event === "EpicSnapshot") {
-    // The ON CONFLICT update lists ONLY scalar columns and NEVER `tasks`: an
-    // epic snapshot carries no task data, and a shell row inserted by a
-    // task-before-epic TaskSnapshot already holds the array. INSERT defaults
-    // `tasks='[]'` (the schema default), so the first-sight epic reads an empty
-    // array and a later epic snapshot can never clobber an array a shell holds.
+    // The ON CONFLICT update lists ONLY scalar columns and NEVER `tasks` /
+    // `jobs`: an epic snapshot carries no task or job data, and a shell row
+    // inserted by a task-before-epic TaskSnapshot or a job-before-epic
+    // `syncJobIntoEpic` already holds those arrays. INSERT defaults both to
+    // `'[]'` (the schema default), so the first-sight epic reads empty arrays
+    // and a later epic snapshot can never clobber arrays a shell holds.
     db.run(
       `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_event_id, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -363,8 +364,20 @@ function projectPlanRow(db: Database, event: Event): void {
 
     // The element shape stored in the array — field-for-field the served Task.
     // `depends_on` is last (matches the Task interface order) so a re-folded
-    // element serializes byte-identically; a missing list folds to [].
-    const element = {
+    // element serializes byte-identically; a missing list folds to []. The
+    // embedded `jobs` sub-array is preserved from the OLD element below (a
+    // plan-file snapshot carries no job data — see the RMW preservation step
+    // before push), or defaults to `[]` for a first-sight task.
+    const element: {
+      task_id: string;
+      epic_id: string;
+      task_number: number | null;
+      title: string | null;
+      target_repo: string | null;
+      status: string | null;
+      depends_on: string[];
+      jobs: unknown[];
+    } = {
       task_id: entityId,
       epic_id: epicId,
       task_number: snapshot.task_number ?? null,
@@ -372,6 +385,7 @@ function projectPlanRow(db: Database, event: Event): void {
       target_repo: snapshot.target_repo ?? null,
       status: snapshot.status ?? null,
       depends_on: snapshot.depends_on ?? [],
+      jobs: [],
     };
 
     const epicRow = db
@@ -391,6 +405,16 @@ function projectPlanRow(db: Database, event: Event): void {
       } catch {
         // malformed stored array → treat as empty, fall through.
       }
+    }
+
+    // Preserve the OLD element's `jobs` sub-array before re-placing. Plan-file
+    // snapshots carry zero job info — they MUST NOT clobber live state. Without
+    // this read-then-attach, every plan-file edit would drop the
+    // job-association list. A first-sight task (no OLD element) keeps the
+    // default `[]` set on `element` above.
+    const oldElement = tasks.find((t) => t.task_id === entityId);
+    if (oldElement != null && Array.isArray(oldElement.jobs)) {
+      element.jobs = oldElement.jobs;
     }
 
     // Replace-or-insert the element by task_id, then re-sort by
@@ -518,6 +542,289 @@ function retractPlanRow(db: Database, event: Event): void {
 }
 
 /**
+ * The shape of an `EmbeddedJob` element stored inside an `epics.jobs` array
+ * (epic-level: verbs `plan` / `close`) or a task element's nested `jobs`
+ * sub-array (task-level: verb `work`). Mirrors {@link import("./types").EmbeddedJob}
+ * field-for-field — the wire boundary decodes the JSON-TEXT column into a
+ * real array via the same field order so this serializes byte-identically.
+ */
+interface EmbeddedJobElement {
+  job_id: string;
+  plan_verb: string;
+  state: string;
+  title: string | null;
+  created_at: number;
+  updated_at: number;
+  last_event_id: number;
+}
+
+/**
+ * The shape of the post-write `jobs` row {@link syncJobIntoEpic} reads back to
+ * build the embedded element. Mirrors the relevant subset of {@link import("./types").Job}.
+ */
+interface JobsRowForSync {
+  job_id: string;
+  plan_verb: string | null;
+  plan_ref: string | null;
+  state: string;
+  title: string | null;
+  created_at: number;
+  updated_at: number;
+  last_event_id: number;
+}
+
+/**
+ * Parse a persisted JSON-TEXT array column into an array of {@link EmbeddedJobElement}.
+ * A NULL/empty/malformed cell folds to `[]` — NEVER throws inside the open
+ * BEGIN IMMEDIATE transaction (a throw rolls back the cursor and wedges the
+ * reducer). Mirrors the guarded-parse pattern at {@link projectPlanRow}.
+ */
+function parseEmbeddedJobs(
+  text: string | null | undefined,
+): EmbeddedJobElement[] {
+  if (text == null || text.length === 0) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return parsed as EmbeddedJobElement[];
+    }
+  } catch {
+    // malformed stored array → treat as empty, fall through.
+  }
+  return [];
+}
+
+/**
+ * The deterministic embedded-jobs sort: `(created_at desc, job_id asc)`. The
+ * trailing `job_id` tiebreaker is non-negotiable — two jobs with the same
+ * `created_at` would otherwise produce non-deterministic ordering across
+ * re-folds, breaking the byte-identical re-fold invariant (CLAUDE.md
+ * "byte-identical re-fold").
+ */
+function sortEmbeddedJobs(jobs: EmbeddedJobElement[]): void {
+  jobs.sort((a, b) => {
+    if (a.created_at !== b.created_at) {
+      return b.created_at - a.created_at; // desc
+    }
+    return a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0;
+  });
+}
+
+/**
+ * Build an {@link EmbeddedJobElement} from a post-write `jobs` row. The
+ * `plan_verb` field is non-null by construction — the caller short-circuits
+ * via `parsePlanRef` before invoking this on a row whose `plan_verb` is null
+ * (a job carrying `plan_ref` always carries `plan_verb`, set-once at
+ * SessionStart together).
+ */
+function buildEmbeddedJob(row: JobsRowForSync): EmbeddedJobElement {
+  return {
+    job_id: row.job_id,
+    plan_verb: row.plan_verb ?? "",
+    state: row.state,
+    title: row.title,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    last_event_id: row.last_event_id,
+  };
+}
+
+/**
+ * Fan a `jobs` row write into the correct embedded array on the `epics`
+ * projection. Runs INSIDE the open transaction opened by {@link applyEvent};
+ * performs zero cursor work.
+ *
+ * - `plan_ref == null` → no-op (this isn't a planctl-spawned session).
+ * - `plan_ref` parses to `{kind: 'epic', epic_id}` (verbs `plan` / `close`) →
+ *   read-modify-write the parent epic's `epics.jobs` array.
+ * - `plan_ref` parses to `{kind: 'task', epic_id, task_id}` (verb `work`) →
+ *   read-modify-write the corresponding task element's nested `jobs`
+ *   sub-array inside the parent epic's `tasks`.
+ * - `plan_ref` shape mismatch → null parse → no-op, cursor still advances.
+ *
+ * Shell-row pattern: when the parent epic (or for task-level, the parent
+ * task element) does not yet exist, insert a shell row / shell task element
+ * carrying just the one new entry. Subsequent `EpicSnapshot` / `TaskSnapshot`
+ * folds preserve the embedded `jobs` arrays — the EpicSnapshot ON CONFLICT
+ * carve-out omits `jobs`, and the TaskSnapshot RMW reads the OLD element's
+ * `jobs` before re-placing.
+ *
+ * Every write bumps the epic's `last_event_id` to `eventId` so the per-row
+ * diff fires (the read surface emits a `patch` on the epic, regardless of
+ * which nested array changed). The sort `(created_at desc, job_id asc)` is
+ * applied on every write — never append — for byte-identical re-fold.
+ *
+ * NEVER throws inside the open transaction. A malformed stored array folds
+ * to `[]`; an absent epic row folds to a fresh shell.
+ */
+function syncJobIntoEpic(
+  db: Database,
+  jobsRow: JobsRowForSync,
+  eventId: number,
+  ts: number,
+): void {
+  if (jobsRow.plan_ref == null) {
+    return;
+  }
+  const parsed = parsePlanRef(jobsRow.plan_ref);
+  if (parsed == null) {
+    return; // shape mismatch — skip the fan-out, cursor still advances.
+  }
+  const element = buildEmbeddedJob(jobsRow);
+
+  if (parsed.kind === "epic") {
+    const epicRow = db
+      .query("SELECT jobs FROM epics WHERE epic_id = ?")
+      .get(parsed.epic_id) as { jobs: string | null } | null;
+    const existing = parseEmbeddedJobs(epicRow?.jobs);
+    const next = existing.filter((j) => j.job_id !== element.job_id);
+    next.push(element);
+    sortEmbeddedJobs(next);
+    const jobsJson = JSON.stringify(next);
+    if (epicRow != null) {
+      db.run(
+        "UPDATE epics SET jobs = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+        [jobsJson, eventId, ts, parsed.epic_id],
+      );
+    } else {
+      // No epic row yet — insert a shell row carrying just this new jobs
+      // entry. A later EpicSnapshot fills the scalars without clobbering
+      // `jobs` (its ON CONFLICT omits the column). Mirror the
+      // shell-row INSERT pattern from `projectPlanRow`.
+      db.run(
+        `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, jobs)
+           VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', ?)`,
+        [parsed.epic_id, eventId, ts, jobsJson],
+      );
+    }
+    return;
+  }
+
+  // kind === "task": RMW the task element's `jobs` sub-array nested in the
+  // parent epic's `tasks` array.
+  const epicRow = db
+    .query("SELECT tasks FROM epics WHERE epic_id = ?")
+    .get(parsed.epic_id) as { tasks: string | null } | null;
+
+  // The full task element shape we read+write. The plan-fold's element
+  // already carries all these fields; a shell task element initialises the
+  // scalar columns to NULL.
+  interface TaskElement {
+    task_id: string;
+    epic_id: string | null;
+    task_number: number | null;
+    title: string | null;
+    target_repo: string | null;
+    status: string | null;
+    depends_on: unknown[];
+    jobs: EmbeddedJobElement[];
+  }
+
+  let tasksArr: TaskElement[] = [];
+  if (epicRow != null && epicRow.tasks != null && epicRow.tasks.length > 0) {
+    try {
+      const parsedTasks = JSON.parse(epicRow.tasks);
+      if (Array.isArray(parsedTasks)) {
+        tasksArr = parsedTasks as TaskElement[];
+      }
+    } catch {
+      // malformed stored array → treat as empty, fall through.
+    }
+  }
+
+  // Find-or-shell the task element. A first-sight task element shells with
+  // scalar columns NULL — a later TaskSnapshot fills them without clobbering
+  // the `jobs` sub-array (the RMW preserves the OLD element's `jobs`).
+  const oldTask = tasksArr.find((t) => t.task_id === parsed.task_id);
+  const oldJobs =
+    oldTask != null && Array.isArray(oldTask.jobs) ? oldTask.jobs : [];
+  const nextTaskJobs = oldJobs.filter((j) => j.job_id !== element.job_id);
+  nextTaskJobs.push(element);
+  sortEmbeddedJobs(nextTaskJobs);
+
+  const newTaskElement: TaskElement =
+    oldTask != null
+      ? { ...oldTask, jobs: nextTaskJobs }
+      : {
+          task_id: parsed.task_id,
+          epic_id: parsed.epic_id,
+          task_number: null,
+          title: null,
+          target_repo: null,
+          status: null,
+          depends_on: [],
+          jobs: nextTaskJobs,
+        };
+
+  // Replace-or-insert the task element by task_id, then re-sort by
+  // (task_number, task_id) — the SAME deterministic key the plan fold +
+  // migration backfill use.
+  const nextTasks: TaskElement[] = tasksArr.filter(
+    (t) => t.task_id !== parsed.task_id,
+  );
+  nextTasks.push(newTaskElement);
+  nextTasks.sort((a, b) => {
+    const an = a.task_number;
+    const bn = b.task_number;
+    if (an !== bn) {
+      if (an == null) return -1;
+      if (bn == null) return 1;
+      return an - bn;
+    }
+    return a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0;
+  });
+  const tasksJson = JSON.stringify(nextTasks);
+
+  if (epicRow != null) {
+    db.run(
+      "UPDATE epics SET tasks = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+      [tasksJson, eventId, ts, parsed.epic_id],
+    );
+  } else {
+    // No epic row yet — insert a shell epic carrying the shell task element.
+    // A later EpicSnapshot fills the epic scalars; a later TaskSnapshot
+    // fills the task element's scalars (and preserves its `jobs` via the
+    // OLD-element-`jobs` RMW step).
+    db.run(
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, jobs)
+         VALUES (?, NULL, NULL, NULL, NULL, ?, ?, ?, '[]')`,
+      [parsed.epic_id, eventId, ts, tasksJson],
+    );
+  }
+}
+
+/**
+ * Read the post-write `jobs` row and fan into the embedded epic/task arrays
+ * iff `plan_ref` is non-null. The SELECT lives here (not at each call site)
+ * so the fan-out reads the LATEST state-machine state — e.g. a SessionEnd
+ * handler's UPDATE flips `state` to `ended` first, then this SELECT picks
+ * up the new state and the embedded entry's `state` updates in lockstep.
+ *
+ * Runs INSIDE the open transaction opened by {@link applyEvent}. The caller
+ * MUST gate on "an UPDATE/INSERT actually wrote" before invoking — the
+ * Killed-mismatch path (no write happened) must NOT fire sync. See the
+ * per-call-site comments in {@link projectJobsRow}.
+ */
+function syncIfPlanRef(
+  db: Database,
+  jobId: string,
+  eventId: number,
+  ts: number,
+): void {
+  const row = db
+    .query(
+      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id FROM jobs WHERE job_id = ?",
+    )
+    .get(jobId) as JobsRowForSync | null;
+  if (row == null || row.plan_ref == null) {
+    return;
+  }
+  syncJobIntoEpic(db, row, eventId, ts);
+}
+
+/**
  * Apply the jobs-side projection for one event. Runs INSIDE the open
  * transaction opened by {@link applyEvent}; performs zero cursor work.
  *
@@ -525,6 +832,13 @@ function retractPlanRow(db: Database, event: Event): void {
  * independent: the title update (when a `session_title` is present) is applied
  * on TOP of the lifecycle write, so e.g. a UserPromptSubmit carrying a new
  * title flips both state and title in one fold.
+ *
+ * Every branch that ACTUALLY writes a `jobs` row also fans the post-write
+ * row into the embedded `epics.jobs` / `task.jobs` arrays via
+ * {@link syncIfPlanRef} (gated on `plan_ref != null`). The Killed-mismatch
+ * path — which `break`s without writing — must NOT fire sync; encoded by
+ * placing the sync call inside each branch's write path, not after the
+ * switch.
  */
 function projectJobsRow(db: Database, event: Event): void {
   const ts = event.ts;
@@ -594,6 +908,7 @@ function projectJobsRow(db: Database, event: Event): void {
           ],
         );
       }
+      syncIfPlanRef(db, jobId, event.id, ts);
       break;
 
     case "UserPromptSubmit":
@@ -640,35 +955,47 @@ function projectJobsRow(db: Database, event: Event): void {
            WHERE job_id = ?`,
         [event.pid, event.pid, event.pid, event.id, ts, jobId],
       );
+      syncIfPlanRef(db, jobId, event.id, ts);
       break;
 
-    case "Stop":
+    case "Stop": {
       // Keeps the terminal guard: a stray Stop landing on a still-terminal job
       // (no intervening re-open) must not resurrect it. The guard now covers
       // BOTH terminal states — 'ended' (from SessionEnd) and 'killed' (from a
       // synthetic Killed event). After a real re-open (SessionStart or
       // UserPromptSubmit) the row is no longer terminal, so a normal post-resume
       // Stop applies here as usual.
-      db.run(
+      const res = db.run(
         `UPDATE jobs SET state = 'stopped', last_event_id = ?, updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
         [event.id, ts, jobId],
       );
+      // Sync only when the UPDATE actually wrote — a guarded no-op on a
+      // still-terminal row must NOT re-fan the embedded entry (it would
+      // re-write a stale-but-unchanged element with the new event_id).
+      if (res.changes > 0) {
+        syncIfPlanRef(db, jobId, event.id, ts);
+      }
       break;
+    }
 
-    case "SessionEnd":
+    case "SessionEnd": {
       // Lands on any non-terminal row. The terminal guard keeps it idempotent
       // on 'ended' AND prevents a late SessionEnd from clobbering a 'killed'
       // row (the killed signal is more informative because it carries the
       // proven-dead `(pid, start_time)` evidence; an ended-after-killed write
       // would mask it). Matches zero rows for a terminal event with no prior
       // SessionStart — a correct no-op.
-      db.run(
+      const res = db.run(
         `UPDATE jobs SET state = 'ended', last_event_id = ?, updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
         [event.id, ts, jobId],
       );
+      if (res.changes > 0) {
+        syncIfPlanRef(db, jobId, event.id, ts);
+      }
       break;
+    }
 
     case "Killed":
       // Synthetic event emitted by the boot seed sweep + the live exit-watcher
@@ -711,6 +1038,11 @@ function projectJobsRow(db: Database, event: Event): void {
              WHERE job_id = ?`,
           [event.id, ts, jobId],
         );
+        // Sync fires ONLY here, on the proven write path. The earlier
+        // `break` arms (malformed payload, missing row, stale mismatch) MUST
+        // NOT sync — no write happened, the embedded entry would otherwise
+        // re-write with a stale-but-unchanged element keyed to this event id.
+        syncIfPlanRef(db, jobId, event.id, ts);
       }
       break;
 
@@ -754,6 +1086,13 @@ function projectJobsRow(db: Database, event: Event): void {
           "UPDATE jobs SET title = ?, title_source = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
           [title, source, event.id, ts, jobId],
         );
+        // Title flipped → re-fan into the embedded entry so the displayed
+        // title tracks. A TranscriptTitle event's title rule is the only
+        // path that updates an EmbeddedJob's title without a lifecycle
+        // branch firing, so the sync must live here too. Gated on the
+        // title precedence-write actually happening so a no-op tier-3-vs-3
+        // identical-value title doesn't fan a stale-but-unchanged element.
+        syncIfPlanRef(db, jobId, event.id, ts);
       }
     }
   }

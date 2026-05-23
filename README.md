@@ -87,11 +87,14 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   transcript tree on a watch to supply the priority-3 `transcript` title) but
   stays forbidden in the hook.
 - **No plan write path through the socket** — keeper *reads* planctl state into
-  the single `epics` projection, each epic embedding its tasks as a JSON array (a
+  the single `epics` projection, each epic embedding its tasks as a JSON array,
+  each epic also embedding its plan/close-verb jobs as a JSON array, and each
+  task element embedding its own work-verb jobs as a nested JSON array (a
   fourth, read-only producer worker watches the configured roots'
-  `.planctl/{epics,tasks}` trees), but the socket carries
-  no plan mutation and keeper never writes a `.planctl` file. The read surface is
-  read-only end to end, same fence as `jobs`.
+  `.planctl/{epics,tasks}` trees; jobs fan in from the reducer's own jobs-side
+  writes whenever a SessionStart spawn name parses as `{plan|work|close}::<ref>`),
+  but the socket carries no plan mutation and keeper never writes a `.planctl`
+  file. The read surface is read-only end to end, same fence as `jobs`.
 - **No multi-session-per-job lineage** — v1 holds `job_id === session_id` (one
   session per job).
 - **No kernel watchers on keeper's own DB** (`fs.watch` / FSEvents / kqueue) —
@@ -299,8 +302,13 @@ changed file, and posts a `plan-epic`/`plan-task` snapshot message to main (and 
 events row and pumps a wake; the reducer folds an `EpicSnapshot` as an idempotent
 upsert into the single `epics` projection and a `TaskSnapshot` into its parent
 epic's embedded `tasks` JSON array (a task change `patch`es the parent epic;
-tombstones retract). File deletions are filesystem-synchronized: a live delete
-fires a tombstone, and a boot-reconciliation sweep retracts anything deleted while
+tombstones retract). As of schema v11 each epic also embeds its plan/close-verb
+jobs as a `jobs` JSON array, and each task element embeds its own work-verb
+jobs as a nested `jobs` sub-array — fanned in from the reducer's jobs-side
+writes whenever a SessionStart spawn name parses as `{plan|work|close}::<ref>`,
+so the single `epics` collection serves epic + tasks + associated sessions in
+one subscribe. File deletions are filesystem-synchronized: a live delete fires
+a tombstone, and a boot-reconciliation sweep retracts anything deleted while
 the daemon was down. It is
 the second instance of the same producer archetype as the transcript worker:
 read-only / write-free, feeding the log only via main. Both producers also
@@ -355,12 +363,15 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, pid, start_time FROM jobs WHERE state = "killed" ORDER BY updated_at DESC LIMIT 10'
 
-# Plans projection — epics (each embedding its tasks as a JSON array) folded from the configured `.planctl` roots:
+# Plans projection — epics (each embedding its tasks AND its plan/close-verb jobs as JSON arrays) folded from the configured `.planctl` roots:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT epic_id, epic_number, title, status FROM epics ORDER BY epic_number ASC LIMIT 10'
+  'SELECT epic_id, epic_number, title, status, json_array_length(jobs) AS epic_jobs_n FROM epics ORDER BY epic_number ASC LIMIT 10'
 # Tasks live inside epics.tasks now — unnest with json_each to list them per epic:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(t.value, '\$.task_number') AS task_number, json_extract(t.value, '\$.title') AS title, json_extract(t.value, '\$.status') AS status FROM epics e, json_each(e.tasks) t ORDER BY e.epic_number ASC, task_number ASC LIMIT 10"
+# Work-verb jobs per task — double-unnest epics.tasks then each task's embedded jobs sub-array:
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.epic_number ASC, task_id ASC LIMIT 10"
 
 # Raw event log tail (synthetic EpicSnapshot/TaskSnapshot/EpicDeleted/TaskDeleted rows appear here too):
 sqlite3 ~/.local/state/keeper/keeper.db \
