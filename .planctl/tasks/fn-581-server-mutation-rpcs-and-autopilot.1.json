@@ -7,6 +7,10 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "RPC frame plus server dispatch shell",
-  "updated_at": "2026-05-23T18:18:22Z"
+  "updated_at": "2026-05-23T19:27:11Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-23T19:27:11Z"
 }

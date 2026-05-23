@@ -83,5 +83,5 @@ end-to-end without polluting the prod registry.
 - [ ] `bun test` passes with no regressions on existing tests
 
 ## Done summary
-
+Added rpc/rpc_result frames to the NDJSON protocol and a dispatch shell in server-worker: opens a writer-mode DB connection beside the reader, exposes RPC_REGISTRY + register/unregister, and routes rpc frames via dispatchLine with bad_frame/unknown_method/bad_params/rpc_failed error codes. Registry is empty; first concrete handler lands in Task .3.
 ## Evidence
