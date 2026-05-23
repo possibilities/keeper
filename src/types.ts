@@ -39,6 +39,15 @@ export interface Event {
    * very first event — before the first `UserPromptSubmit` payload title.
    */
   spawn_name: string | null;
+  /**
+   * Opaque platform-tagged process start instant for the (pid, start_time)
+   * recycle-safe identity used by the boot seed sweep and the live exit-watcher.
+   * Captured by the hook ONLY on `SessionStart` (NULL on every other event and
+   * on every synthetic). Format is platform-tagged (macOS `lstart` string, Linux
+   * `/proc/<pid>/stat` field-22 jiffies) — never parsed, only compared for
+   * equality against a re-read at sweep time.
+   */
+  start_time: string | null;
 }
 
 /**
@@ -73,6 +82,15 @@ export interface Job {
   title: string | null;
   title_source: string | null;
   transcript_path: string | null;
+  /**
+   * Process start instant for the (pid, start_time) recycle-safe identity (see
+   * `Event.start_time`). Seeded by the reducer from the `SessionStart` event's
+   * `start_time` column (task 3); NULL on rows whose SessionStart pre-dated the
+   * schema bump or whose hook failed to capture it. Display-only at the
+   * projection layer; consumed by the boot seed sweep and the live exit-watcher
+   * to disambiguate pid recycle.
+   */
+  start_time: string | null;
 }
 
 /**

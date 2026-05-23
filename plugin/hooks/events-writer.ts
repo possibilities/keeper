@@ -203,23 +203,27 @@ async function main(): Promise<void> {
     // grabs the reserved lock up front and waits per busy_timeout (5s) for
     // any in-flight writer.
     db.transaction(() => {
-      stmts.insertEvent.run(
-        ts,
-        sessionId,
-        pid,
-        hookEvent,
-        eventType,
-        toolName,
-        matcher,
-        cwd,
-        permissionMode,
-        agentId,
-        agentType,
-        stopHookActive,
-        raw,
-        subagentAgentId,
-        spawnName,
-      );
+      // Named bindings: a missed column on a future ALTER no longer silently
+      // shifts data into the next slot. `start_time` is captured by task 3 on
+      // SessionStart only — null for now, null on every other event by design.
+      stmts.insertEvent.run({
+        $ts: ts,
+        $session_id: sessionId,
+        $pid: pid,
+        $hook_event: hookEvent,
+        $event_type: eventType,
+        $tool_name: toolName,
+        $matcher: matcher,
+        $cwd: cwd,
+        $permission_mode: permissionMode,
+        $agent_id: agentId,
+        $agent_type: agentType,
+        $stop_hook_active: stopHookActive,
+        $data: raw,
+        $subagent_agent_id: subagentAgentId,
+        $spawn_name: spawnName,
+        $start_time: null,
+      });
     })();
   } finally {
     db.close();

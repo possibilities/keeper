@@ -217,11 +217,10 @@ function runDaemon(): void {
   // synthetic `TranscriptTitle` events row inserted on the existing WRITABLE
   // connection, then a wake pump folds it (priority-3 'transcript' title). The
   // insert is synchronous on the main thread and so cannot interleave with the
-  // synchronous drain inside pumpWakes. Column order matches `stmts.insertEvent`:
-  // ts, session_id, pid, hook_event, event_type, tool_name, matcher, cwd,
-  // permission_mode, agent_id, agent_type, stop_hook_active, data,
-  // subagent_agent_id, spawn_name. The title rides in `data.session_title` (the
-  // same field the reducer's title rule reads); everything else is NULL.
+  // synchronous drain inside pumpWakes. Bindings are named — see the comment on
+  // `stmts.insertEvent` in `src/db.ts` for why. The title rides in
+  // `data.session_title` (the same field the reducer's title rule reads);
+  // everything else is NULL (synthetic — never carries a process identity).
   transcriptWorker.onmessage = (
     ev: MessageEvent<TranscriptTitleMessage | undefined>,
   ): void => {
@@ -229,23 +228,24 @@ function runDaemon(): void {
     if (!msg || msg.kind !== "transcript-title") {
       return;
     }
-    stmts.insertEvent.run(
-      Date.now() / 1000, // ts (unix seconds as REAL, matching the hook)
-      msg.sessionId, // session_id (== job_id)
-      null, // pid
-      "TranscriptTitle", // hook_event (synthetic; reducer maps → 'transcript')
-      "transcript_title", // event_type
-      null, // tool_name
-      null, // matcher
-      null, // cwd
-      null, // permission_mode
-      null, // agent_id
-      null, // agent_type
-      null, // stop_hook_active
-      JSON.stringify({ session_title: msg.title }), // data
-      null, // subagent_agent_id
-      null, // spawn_name
-    );
+    stmts.insertEvent.run({
+      $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
+      $session_id: msg.sessionId, // == job_id
+      $pid: null,
+      $hook_event: "TranscriptTitle", // synthetic; reducer maps → 'transcript'
+      $event_type: "transcript_title",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: JSON.stringify({ session_title: msg.title }),
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+    });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the title folds without a poll-cycle delay.
     wakePending = true;
@@ -286,11 +286,9 @@ function runDaemon(): void {
   // generic entity-key overload the reducer reads); the full snapshot rides in
   // `data` (the same field `extractPlanSnapshot` parses) with the producer's
   // pre-computed fields mapped to the projection's column names. Mirrors the
-  // `transcript-title` branch exactly; column order matches `stmts.insertEvent`:
-  // ts, session_id, pid, hook_event, event_type, tool_name, matcher, cwd,
-  // permission_mode, agent_id, agent_type, stop_hook_active, data,
-  // subagent_agent_id, spawn_name. Everything other than session_id/hook_event/
-  // event_type/data is NULL.
+  // `transcript-title` branch exactly; bindings are named (see `stmts.insertEvent`
+  // in `src/db.ts`). Everything other than session_id/hook_event/event_type/data
+  // is NULL (synthetic — never carries a process identity).
   planWorker.onmessage = (ev: MessageEvent<PlanMessage | undefined>): void => {
     const msg = ev.data;
     if (!msg) {
@@ -331,23 +329,24 @@ function runDaemon(): void {
     } else {
       return;
     }
-    stmts.insertEvent.run(
-      Date.now() / 1000, // ts (unix seconds as REAL, matching the hook)
-      msg.id, // session_id (the entity pk: epic_id / task_id)
-      null, // pid
-      hookEvent, // hook_event (synthetic; reducer folds into epics/tasks)
-      "plan_snapshot", // event_type
-      null, // tool_name
-      null, // matcher
-      null, // cwd
-      null, // permission_mode
-      null, // agent_id
-      null, // agent_type
-      null, // stop_hook_active
-      data, // data (the full snapshot blob)
-      null, // subagent_agent_id
-      null, // spawn_name
-    );
+    stmts.insertEvent.run({
+      $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
+      $session_id: msg.id, // the entity pk: epic_id / task_id
+      $pid: null,
+      $hook_event: hookEvent, // synthetic; reducer folds into epics/tasks
+      $event_type: "plan_snapshot",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: data, // the full snapshot blob
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+    });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the snapshot folds without a poll-cycle delay.
     wakePending = true;

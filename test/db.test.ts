@@ -169,7 +169,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("8");
+  expect(row.value).toBe("9");
   db.close();
 });
 
@@ -274,7 +274,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("8");
+  expect(ver.value).toBe("9");
 
   const eventNames = (
     db.prepare("PRAGMA table_info(events)").all() as {
@@ -315,7 +315,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("8");
+  expect(ver2.value).toBe("9");
   db2.close();
 });
 
@@ -368,7 +368,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("8");
+  expect(ver.value).toBe("9");
 
   const jobNames = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
@@ -399,7 +399,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("8");
+  expect(ver2.value).toBe("9");
   db2.close();
 });
 
@@ -434,7 +434,7 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("8");
+  expect(ver.value).toBe("9");
   const names = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
@@ -486,7 +486,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("8");
+  expect(ver.value).toBe("9");
 
   const tables = new Set(
     (
@@ -542,7 +542,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("8");
+  expect(ver2.value).toBe("9");
   db2.close();
 });
 
@@ -601,7 +601,7 @@ test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, tas
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("8");
+  expect(ver.value).toBe("9");
 
   // tasks table is gone.
   const tables = new Set(
@@ -651,6 +651,143 @@ test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, tas
   expect(allTasks.some((t) => t.task_id === "orphan.1")).toBe(false);
 
   db.close();
+});
+
+test("fresh openDb at v9 has events.start_time and jobs.start_time as nullable TEXT", () => {
+  const { db } = openDb(dbPath);
+  const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const eventStart = eventCols.find((c) => c.name === "start_time");
+  expect(eventStart).toBeDefined();
+  expect(eventStart?.type).toBe("TEXT");
+  expect(eventStart?.notnull).toBe(0);
+  expect(eventStart?.dflt_value).toBeNull();
+
+  const jobCols = db.prepare("PRAGMA table_info(jobs)").all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const jobStart = jobCols.find((c) => c.name === "start_time");
+  expect(jobStart).toBeDefined();
+  expect(jobStart?.type).toBe("TEXT");
+  expect(jobStart?.notnull).toBe(0);
+  expect(jobStart?.dflt_value).toBeNull();
+  db.close();
+});
+
+test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows preserved NULL, second open is idempotent", () => {
+  // Build a v8-shaped DB by hand: events + jobs at the v8 shape (no
+  // start_time on either), version '8', with a populated row on each table.
+  // This mirrors the prior migration tests' pattern — converging from a stale
+  // version straight to the current schema via the idempotent ALTER block.
+  const v8 = new Database(dbPath, { create: true });
+  v8.run(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      session_id TEXT NOT NULL,
+      pid INTEGER,
+      hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      tool_name TEXT,
+      matcher TEXT,
+      cwd TEXT,
+      permission_mode TEXT,
+      agent_id TEXT,
+      agent_type TEXT,
+      stop_hook_active INTEGER,
+      data TEXT NOT NULL,
+      subagent_agent_id TEXT,
+      spawn_name TEXT
+    )
+  `);
+  v8.run(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_source TEXT,
+      transcript_path TEXT
+    )
+  `);
+  v8.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v8.run("INSERT INTO meta (key, value) VALUES ('schema_version', '8')");
+  v8.run(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, data, spawn_name) VALUES (1, 'sess', 'SessionStart', 'session_start', '{}', 'fix-osc')",
+  );
+  v8.run(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title, title_source) VALUES ('old', 1, 5, 1, 'fix-osc', 'spawn')",
+  );
+  v8.close();
+
+  // Reopen via openDb — migrate() runs the v8→v9 idempotent ADD COLUMNs and
+  // stamps the current version.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("9");
+
+  // Both columns now appear.
+  const eventNames = (
+    db.prepare("PRAGMA table_info(events)").all() as { name: string }[]
+  ).map((c) => c.name);
+  expect(eventNames).toContain("start_time");
+  const jobNames = (
+    db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[]
+  ).map((c) => c.name);
+  expect(jobNames).toContain("start_time");
+
+  // Existing rows gain the new columns reading NULL; prior data is intact.
+  const ev = db
+    .prepare(
+      "SELECT spawn_name, start_time FROM events WHERE session_id = 'sess'",
+    )
+    .get() as { spawn_name: string | null; start_time: string | null };
+  expect(ev.spawn_name).toBe("fix-osc");
+  expect(ev.start_time).toBeNull();
+  const job = db
+    .prepare(
+      "SELECT title, title_source, start_time, last_event_id FROM jobs WHERE job_id = 'old'",
+    )
+    .get() as {
+    title: string | null;
+    title_source: string | null;
+    start_time: string | null;
+    last_event_id: number;
+  };
+  expect(job.title).toBe("fix-osc");
+  expect(job.title_source).toBe("spawn");
+  expect(job.start_time).toBeNull();
+  expect(job.last_event_id).toBe(5);
+
+  // Second open is idempotent — the ADD COLUMNs no-op on the now-current shape.
+  db.close();
+  const { db: db2 } = openDb(dbPath);
+  const ver2 = db2
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver2.value).toBe("9");
+  const eventNames2 = (
+    db2.prepare("PRAGMA table_info(events)").all() as { name: string }[]
+  ).map((c) => c.name);
+  expect(eventNames2.filter((n) => n === "start_time")).toHaveLength(1);
+  const jobNames2 = (
+    db2.prepare("PRAGMA table_info(jobs)").all() as { name: string }[]
+  ).map((c) => c.name);
+  expect(jobNames2.filter((n) => n === "start_time")).toHaveLength(1);
+  db2.close();
 });
 
 test("resolveConfig: missing file falls back to default ~/code root", () => {

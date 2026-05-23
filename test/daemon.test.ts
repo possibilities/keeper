@@ -148,23 +148,24 @@ function insertPlanSnapshot(
   ts: number,
   data: Record<string, unknown>,
 ): void {
-  stmts.insertEvent.run(
-    ts, // ts
-    entityId, // session_id (the entity pk)
-    null, // pid
-    hookEvent, // hook_event
-    "plan_snapshot", // event_type
-    null, // tool_name
-    null, // matcher
-    null, // cwd
-    null, // permission_mode
-    null, // agent_id
-    null, // agent_type
-    null, // stop_hook_active
-    JSON.stringify(data), // data (the full snapshot blob)
-    null, // subagent_agent_id
-    null, // spawn_name
-  );
+  stmts.insertEvent.run({
+    $ts: ts,
+    $session_id: entityId, // the entity pk
+    $pid: null,
+    $hook_event: hookEvent,
+    $event_type: "plan_snapshot",
+    $tool_name: null,
+    $matcher: null,
+    $cwd: null,
+    $permission_mode: null,
+    $agent_id: null,
+    $agent_type: null,
+    $stop_hook_active: null,
+    $data: JSON.stringify(data), // the full snapshot blob
+    $subagent_agent_id: null,
+    $spawn_name: null,
+    $start_time: null,
+  });
 }
 
 test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded)", () => {

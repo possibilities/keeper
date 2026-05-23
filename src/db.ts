@@ -26,7 +26,7 @@ import { dirname, join } from "node:path";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -220,7 +220,8 @@ CREATE TABLE IF NOT EXISTS events (
     stop_hook_active INTEGER,
     data TEXT NOT NULL,
     subagent_agent_id TEXT,
-    spawn_name TEXT
+    spawn_name TEXT,
+    start_time TEXT
 )
 `;
 
@@ -248,7 +249,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at REAL NOT NULL,
     title TEXT,
     title_source TEXT,
-    transcript_path TEXT
+    transcript_path TEXT,
+    start_time TEXT
 )
 `;
 
@@ -510,6 +512,18 @@ function migrate(db: Database): void {
       "TEXT NOT NULL DEFAULT '[]'",
     );
 
+    // v8→v9: add `events.start_time` (process start instant scraped at the
+    // SessionStart hook by task 3 — opaque platform-tagged string) and
+    // `jobs.start_time` (projection of the seeded value, surfaced to consumers
+    // for the (pid, start_time) recycle-safe identity used by the seed sweep and
+    // exit-watcher). Both nullable, no backfill — ADD COLUMN leaves prior rows
+    // reading NULL, matching the zero-event projection (a row whose SessionStart
+    // pre-dated the schema bump simply never gains liveness coverage; the Q7
+    // legacy-row rule documented in the epic handles that). Column defs match
+    // CREATE_EVENTS / CREATE_JOBS.
+    addColumnIfMissing(db, "events", "start_time", "TEXT");
+    addColumnIfMissing(db, "jobs", "start_time", "TEXT");
+
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(String(SCHEMA_VERSION));
@@ -530,12 +544,24 @@ function migrate(db: Database): void {
  */
 function prepareStmts(db: Database): Stmts {
   return {
+    // Named bindings (`$col`) instead of positional `?` — adding a column now
+    // means touching THIS statement and the CREATE TABLE definition, with every
+    // caller free to pass `$col: null` (or omit-keyed-via-spread) without
+    // re-counting positional argument lists. The previous positional shape was
+    // a column-shift hazard: a missed call site silently corrupted data
+    // (`null` shifted into the next column's slot) without throwing. The fold
+    // and the producer workers both share this statement; named bindings make
+    // future column additions a localized edit.
     insertEvent: db.prepare(`
       INSERT INTO events (
         ts, session_id, pid, hook_event, event_type, tool_name, matcher,
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-        subagent_agent_id, spawn_name
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        subagent_agent_id, spawn_name, start_time
+      ) VALUES (
+        $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
+        $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
+        $subagent_agent_id, $spawn_name, $start_time
+      )
     `),
     selectWorldRev: db.prepare(
       "SELECT last_event_id FROM reducer_state WHERE id = 1",

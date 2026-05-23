@@ -66,13 +66,14 @@ function insertEvent(
     data: overrides.data ?? "{}",
     subagent_agent_id: overrides.subagent_agent_id ?? null,
     spawn_name: overrides.spawn_name ?? null,
+    start_time: overrides.start_time ?? null,
   };
   db.run(
     `INSERT INTO events (
        ts, session_id, pid, hook_event, event_type, tool_name, matcher,
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-       subagent_agent_id, spawn_name
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       subagent_agent_id, spawn_name, start_time
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -89,6 +90,7 @@ function insertEvent(
       row.data,
       row.subagent_agent_id,
       row.spawn_name,
+      row.start_time,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {

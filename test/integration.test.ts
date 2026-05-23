@@ -872,28 +872,29 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
       // delivery timing under full-suite load (FSEvents is unreliable when
       // many test processes run concurrently).
       const { db: patchWriter, stmts: patchStmts } = openDb(dbPath);
-      patchStmts.insertEvent.run(
-        Date.now() / 1000,
-        epicId,
-        null,
-        "EpicSnapshot",
-        "plan_snapshot",
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        JSON.stringify({
+      patchStmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: epicId,
+        $pid: null,
+        $hook_event: "EpicSnapshot",
+        $event_type: "plan_snapshot",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
           epic_number: epicNumberFromId(epicId),
           title: "Keeper E2E Plans Epic",
           project_dir: "/tmp/keeper-e2e-repo",
           status: "done",
         }),
-        null,
-        null,
-      );
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+      });
       patchWriter.close();
 
       const patch = await retryUntil(
@@ -923,29 +924,30 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
       // assert the parent epic patches with the updated element in `tasks`.
       const epicEventIdAfterEpicPatch = patch.row.last_event_id as number;
       const { db: taskWriter, stmts: taskStmts } = openDb(dbPath);
-      taskStmts.insertEvent.run(
-        Date.now() / 1000,
-        taskId,
-        null,
-        "TaskSnapshot",
-        "plan_snapshot",
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        JSON.stringify({
+      taskStmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: taskId,
+        $pid: null,
+        $hook_event: "TaskSnapshot",
+        $event_type: "plan_snapshot",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
           epic_id: epicId,
           task_number: taskNumberFromId(taskId),
           title: "First plans task",
           target_repo: "/tmp/keeper-e2e-repo",
           status: "done",
         }),
-        null,
-        null,
-      );
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+      });
       taskWriter.close();
 
       const taskPatch = await retryUntil(
@@ -982,23 +984,24 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
       // event→fold→UDS-patch chain without FSEvents delivery timing. ---
       const epicEventIdAfterTaskPatch = taskPatch.row.last_event_id as number;
       const { db: delTaskWriter, stmts: delTaskStmts } = openDb(dbPath);
-      delTaskStmts.insertEvent.run(
-        Date.now() / 1000,
-        taskId,
-        null,
-        "TaskDeleted",
-        "plan_snapshot",
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        JSON.stringify({ epic_id: epicId }),
-        null,
-        null,
-      );
+      delTaskStmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: taskId,
+        $pid: null,
+        $hook_event: "TaskDeleted",
+        $event_type: "plan_snapshot",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ epic_id: epicId }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+      });
       delTaskWriter.close();
 
       const taskDeletePatch = await retryUntil(
@@ -1025,23 +1028,24 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
 
       // --- an EpicDeleted tombstone removes the epic row; it leaves the page.
       const { db: delEpicWriter, stmts: delEpicStmts } = openDb(dbPath);
-      delEpicStmts.insertEvent.run(
-        Date.now() / 1000,
-        epicId,
-        null,
-        "EpicDeleted",
-        "plan_snapshot",
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        "",
-        null,
-        null,
-      );
+      delEpicStmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: epicId,
+        $pid: null,
+        $hook_event: "EpicDeleted",
+        $event_type: "plan_snapshot",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: "",
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+      });
       delEpicWriter.close();
 
       const epicGone = await retryUntil(() => {
