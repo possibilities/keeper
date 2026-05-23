@@ -2155,6 +2155,62 @@ test("TaskSnapshot RMW preserves the task element's jobs sub-array", () => {
   expect(getTaskJobs("fn-5-pre.2")[0]?.job_id).toBe("sess-pre-task");
 });
 
+test("dual-array fan-out: epic.jobs + task.jobs co-populated, survive EpicSnapshot ON CONFLICT", () => {
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-1-dual",
+    data: JSON.stringify({ epic_number: 1, title: "Dual", status: "open" }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-dual-plan",
+    spawn_name: "plan::fn-1-dual",
+    ts: 100,
+  });
+  insertEvent({
+    hook_event: "TaskSnapshot",
+    session_id: "fn-1-dual.1",
+    data: JSON.stringify({
+      epic_id: "fn-1-dual",
+      task_number: 1,
+      title: "Dual T1",
+      status: "open",
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-dual-work",
+    spawn_name: "work::fn-1-dual.1",
+    ts: 200,
+  });
+  drainAll();
+
+  const epicJobsBefore = getEpicJobs("fn-1-dual");
+  const taskJobsBefore = getTaskJobs("fn-1-dual.1");
+  expect(epicJobsBefore.length).toBe(1);
+  expect(epicJobsBefore[0]?.job_id).toBe("sess-dual-plan");
+  expect(taskJobsBefore.length).toBe(1);
+  expect(taskJobsBefore[0]?.job_id).toBe("sess-dual-work");
+
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-1-dual",
+    data: JSON.stringify({
+      epic_number: 1,
+      title: "Dual Updated",
+      status: "open",
+    }),
+  });
+  drainAll();
+
+  const epic = getEpic("fn-1-dual");
+  expect(epic?.title).toBe("Dual Updated");
+  const epicJobsAfter = getEpicJobs("fn-1-dual");
+  const taskJobsAfter = getTaskJobs("fn-1-dual.1");
+  expect(epicJobsAfter).toEqual(epicJobsBefore);
+  expect(taskJobsAfter).toEqual(taskJobsBefore);
+});
+
 test("malformed stored epic.jobs blob folds to [] in-txn (never wedges)", () => {
   insertEvent({
     hook_event: "SessionStart",
