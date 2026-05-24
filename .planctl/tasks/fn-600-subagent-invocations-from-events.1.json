@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-24T19:59:30Z",
+  "depends_on": [],
+  "epic": "fn-600-subagent-invocations-from-events",
+  "id": "fn-600-subagent-invocations-from-events.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "foundation: schema + deriver + hook + types",
+  "updated_at": "2026-05-24T19:59:30Z"
+}
