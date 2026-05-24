@@ -1298,9 +1298,13 @@ function handleData(
     let _frameType = "unknown";
     let _collection: string | undefined;
     try {
-      const parsed = JSON.parse(line) as { type?: unknown; collection?: unknown };
+      const parsed = JSON.parse(line) as {
+        type?: unknown;
+        collection?: unknown;
+      };
       if (typeof parsed.type === "string") _frameType = parsed.type;
-      if (typeof parsed.collection === "string") _collection = parsed.collection;
+      if (typeof parsed.collection === "string")
+        _collection = parsed.collection;
     } catch {
       // dispatchLine itself will surface the bad_frame; just log unknown.
     }

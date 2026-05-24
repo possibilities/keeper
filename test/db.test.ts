@@ -1560,36 +1560,41 @@ test("v12 DB migrates to v13: epics.approval added, approvals table dropped, fil
   };
   expect(epic.title).toBe("Foo");
 
-  // CRITICAL: the sidecar table was dropped before we could read the rows
-  // from it inside the FS migration — but the SQL half ran in a separate
-  // transaction (inside migrate()) and we passed runPlanctlApprovalMigration
-  // a `db` that ALREADY has the table dropped. We need a different test
-  // shape: the FS half must run while approvals still exists. So we open a
-  // FRESH writer connection that does NOT call migrate (raw sqlite), seed
-  // the approvals table again temporarily, and call the FS migration. To
-  // keep the test simple we instead just verify the FS half's table-exists
-  // guard: with the table dropped, the FS migration runs only pass 1
-  // (backfill) and skips pass 2 (overlay). The realistic e2e path is
-  // tested via the daemon — here we exercise the two halves separately.
-
-  // Pass 1 — backfill only (table is dropped, overlay is a no-op).
+  // Realistic boot path: migrate() snapshotted the pre-DROP `approvals` rows
+  // into a connection-scoped TEMP table BEFORE the DROP fired, and
+  // runPlanctlApprovalMigration reads from that snapshot. So both passes —
+  // backfill AND overlay — land their effects, the sidecar rows are not
+  // silently lost across the DROP, and the overlay contract is honored.
   runPlanctlApprovalMigration(db, [planRoot]);
 
-  // Epic A picked up the backfill `approval: "approved"` (missing → backfill).
+  // Epic A: missing-`approval` → backfill set it to "approved", then the
+  // `close:fn-1-foo` sidecar row OVERLAID it to "rejected" (sidecar wins).
   const epicAAfter = JSON.parse(readFileSync(epicAPath, "utf8")) as {
     approval: string;
   };
-  expect(epicAAfter.approval).toBe("approved");
-  // Epic B unchanged (already had `approval`, idempotent skip).
+  expect(epicAAfter.approval).toBe("rejected");
+  // Epic B unchanged (already had `approval`, no sidecar row targets it).
   const epicBAfter = JSON.parse(readFileSync(epicBPath, "utf8")) as {
     approval: string;
   };
   expect(epicBAfter.approval).toBe("pending");
+  // Task overlays landed verbatim from the sidecar (approved / rejected).
+  const task1After = JSON.parse(readFileSync(task1Path, "utf8")) as {
+    approval: string;
+  };
+  expect(task1After.approval).toBe("approved");
+  const task2After = JSON.parse(readFileSync(task2Path, "utf8")) as {
+    approval: string;
+  };
+  expect(task2After.approval).toBe("rejected");
 
-  // Re-run is a no-op (idempotent).
+  // Re-run is a no-op (idempotent): the TEMP snapshot was dropped after the
+  // first pass and the on-disk files already carry the overlaid values.
   runPlanctlApprovalMigration(db, [planRoot]);
-  expect(JSON.parse(readFileSync(epicAPath, "utf8")).approval).toBe("approved");
+  expect(JSON.parse(readFileSync(epicAPath, "utf8")).approval).toBe("rejected");
   expect(JSON.parse(readFileSync(epicBPath, "utf8")).approval).toBe("pending");
+  expect(JSON.parse(readFileSync(task1Path, "utf8")).approval).toBe("approved");
+  expect(JSON.parse(readFileSync(task2Path, "utf8")).approval).toBe("rejected");
 
   // Second openDb is idempotent — version stays at v13, sibling rows
   // persist, schema_version unchanged.

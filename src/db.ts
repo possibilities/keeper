@@ -781,6 +781,49 @@ function migrate(db: Database): void {
       "TEXT NOT NULL DEFAULT 'pending'",
     );
 
+    // Snapshot the v12 `approvals` rows into a connection-scoped TEMP table
+    // BEFORE the DROP fires. The FS half (`runPlanctlApprovalMigration`,
+    // called by the daemon after `openDb` returns) needs to overlay those
+    // rows onto the matching epic/task plan files — but it runs OUTSIDE this
+    // transaction, after the DROP has already executed. Reading from the
+    // real `approvals` table from inside the FS pass therefore sees nothing,
+    // which silently dropped the overlay in prior boots (the bug this task
+    // fixes).
+    //
+    // TEMP tables in sqlite are connection-scoped: they live for the
+    // lifetime of THIS `db` handle and are invisible to every other
+    // connection. Creating one inside this `BEGIN IMMEDIATE` keeps the
+    // schema-migration atomicity invariant — if the transaction rolls back,
+    // the TEMP table goes with it and the DROP never landed either, so a
+    // retry re-snapshots from a still-present `approvals`. Idempotent on
+    // re-run: a fresh-v13 boot has no `approvals` (the table-exists guard
+    // skips the INSERT) and no rows to snapshot, so the FS pass overlays
+    // nothing — exactly the desired no-op.
+    //
+    // We always CREATE the TEMP table (even when `approvals` is absent) so
+    // the FS pass has a stable schema to read from; an empty table is a
+    // clean no-op. `DROP TABLE IF EXISTS` clears any leftover from a prior
+    // `migrate()` call on the same connection (e.g. tests that reopen).
+    db.run("DROP TABLE IF EXISTS temp._v13_overlay_pending");
+    db.run(`
+      CREATE TEMP TABLE _v13_overlay_pending (
+        epic_id TEXT NOT NULL,
+        task_key TEXT NOT NULL,
+        status TEXT NOT NULL
+      )
+    `);
+    const approvalsTableExists =
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
+        )
+        .get() != null;
+    if (approvalsTableExists) {
+      db.run(
+        "INSERT INTO _v13_overlay_pending (epic_id, task_key, status) SELECT epic_id, task_key, status FROM approvals",
+      );
+    }
+
     // DROP TABLE while readers live needs the EXCLUSIVE lock the surrounding
     // `BEGIN IMMEDIATE` already holds. `IF EXISTS` keeps the step a no-op on
     // a fresh-v13 DB (table never created) and on any re-run after a prior
@@ -1067,22 +1110,53 @@ export function runPlanctlApprovalMigration(
   }
 
   // Pass 2 — overlay sidecar rows onto plan files.
-  // Defensive: the `approvals` table may already be dropped (e.g. fresh-v13
-  // DB, or a re-run after a prior boot completed both halves) — the SELECT
-  // is gated on `sqlite_master` so a missing table is a no-op, not a throw.
-  const tableExists =
+  //
+  // Two sources, checked in order:
+  //   1) `temp._v13_overlay_pending` — populated by `migrate()`'s v12→v13
+  //      step BEFORE the DROP TABLE fires. This is the production path: the
+  //      daemon's `openDb` ran migrate on THIS connection, which snapshotted
+  //      pre-DROP rows into the TEMP table. After we drain it we drop it so
+  //      a re-run on the same connection is a clean no-op.
+  //   2) `approvals` — the raw v12 sidecar, used by tests that stand up a
+  //      v12-shaped DB WITHOUT running migrate (so they can exercise the FS
+  //      pass against a still-present sidecar). On a real daemon boot the
+  //      `approvals` table has already been dropped by migrate(), so this
+  //      branch only fires in those test fixtures.
+  //
+  // Defensive: both tables may be absent (e.g. fresh-v13 DB, or a re-run
+  // after a prior boot completed both halves) — the SELECT is gated on
+  // `sqlite_master` so a missing table is a no-op, not a throw.
+  // TEMP tables live in the connection's `temp` schema and are visible via
+  // `temp.sqlite_master` (NOT the main-schema `sqlite_master`).
+  const overlayTableExists =
     db
       .prepare(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
+        "SELECT name FROM temp.sqlite_master WHERE type = 'table' AND name = '_v13_overlay_pending'",
       )
       .get() != null;
-  if (!tableExists) {
-    return;
+  let rows: { epic_id: string; task_key: string; status: string }[];
+  if (overlayTableExists) {
+    rows = db
+      .prepare("SELECT epic_id, task_key, status FROM _v13_overlay_pending")
+      .all() as { epic_id: string; task_key: string; status: string }[];
+  } else {
+    const approvalsTableExists =
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
+        )
+        .get() != null;
+    if (!approvalsTableExists) {
+      return;
+    }
+    rows = db
+      .prepare("SELECT epic_id, task_key, status FROM approvals")
+      .all() as { epic_id: string; task_key: string; status: string }[];
   }
-  const rows = db
-    .prepare("SELECT epic_id, task_key, status FROM approvals")
-    .all() as { epic_id: string; task_key: string; status: string }[];
   if (rows.length === 0) {
+    if (overlayTableExists) {
+      db.run("DROP TABLE IF EXISTS temp._v13_overlay_pending");
+    }
     return;
   }
   // Build a per-root epics-dir lookup so we can locate the target file
@@ -1096,6 +1170,13 @@ export function runPlanctlApprovalMigration(
   }
   for (const row of rows) {
     overlayApprovalRow(row, epicsDirs, log);
+  }
+
+  // Drop the TEMP snapshot now that overlay is durable on disk. A second
+  // call to `runPlanctlApprovalMigration` on the same connection (e.g. a
+  // test re-invocation) is then a clean no-op — no rows to replay.
+  if (overlayTableExists) {
+    db.run("DROP TABLE IF EXISTS temp._v13_overlay_pending");
   }
 }
 
