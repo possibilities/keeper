@@ -70,5 +70,5 @@ One migration test that walks the full v13→v14 transition: fresh DB at v13, in
 - [ ] No `db.prepare(…)` inside the v14 backfill loop (uncached `db.run` only).
 
 ## Done summary
-
+Schema v14: added five sparse events.planctl_* columns + jobs.epic_links + epics.job_links JSON arrays + a (session_id, id) WHERE planctl_op IS NOT NULL partial composite index, plus a version-guarded same-transaction backfill that stamps planctl_* via extractPlanctlInvocation and re-derives epic_links/job_links via the plan-classifier pure functions. ANALYZE events seeds planner stats; all backfill UPDATEs use uncached db.run.
 ## Evidence
