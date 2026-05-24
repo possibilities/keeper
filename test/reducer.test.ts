@@ -1475,6 +1475,7 @@ function getEpic(epicId: string) {
     tasks: string;
     depends_on_epics: string;
     jobs: string;
+    job_links: string;
   } | null;
 }
 
