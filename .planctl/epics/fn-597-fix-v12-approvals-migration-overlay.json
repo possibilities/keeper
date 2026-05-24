@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-597-fix-v12-approvals-migration-overlay",
   "bundles": [],
+  "closer_done_at": "2026-05-24T16:28:07Z",
   "created_at": "2026-05-24T11:31:21Z",
   "depends_on_epics": [
     "fn-592-approval-as-planctl-field"
@@ -11,10 +12,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "fix v12 approvals migration overlay",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-24T11:31:26Z"
+  "updated_at": "2026-05-24T16:28:07Z"
 }
