@@ -43,10 +43,12 @@
  * client's "always show the latest top-N" backstop; `patch`/`meta` just make
  * on-page changes reflect faster than the poll interval.
  *
- * After every emitted frame a second `...`-fenced note prints two per-pid /tmp
- * paths: the full JSON state the frame was built from (the ordered page rows)
- * and the rendered frame text itself. Both are overwritten each frame (always
- * the most recently printed frame) so a frame can be inspected out-of-band.
+ * After every emitted frame a second `...`-fenced note prints three per-pid
+ * /tmp paths: the full JSON state the frame was built from (the ordered page
+ * rows), the rendered frame text itself, and a per-frame unified diff (`diff
+ * -u prev current`) against the previous emit. All three are overwritten each
+ * frame so a frame can be inspected out-of-band; the first frame's diff file
+ * holds a sentinel since there's no prior to diff.
  *
  * Connection is resilient. There is no socket-level readiness handshake —
  * keeperd binds the UDS only after boot-drain completes, so "data ready"
@@ -132,8 +134,9 @@ closer); it is omitted entirely when plan_verb is NULL (non-planctl
 sessions), so those lines stay ({cwd}) {title} [{state}]. The page is
 refetched on every change signal and on a steady poll, so it always shows
 the current top-N; a new frame prints only when the rendered output changes.
-Every emitted frame is also mirrored to two /tmp sidecar files (full JSON
-state + rendered frame), whose paths print in a ...-fenced note.
+Every emitted frame is also mirrored to three /tmp sidecar files (full JSON
+state, rendered frame, unified diff vs. the previous emit), whose paths
+print in a ...-fenced note.
 
 The client waits for keeperd to come up and reconnects across restarts instead
 of exiting; each connection-lifecycle change prints a ...-fenced note
@@ -264,14 +267,26 @@ async function main(): Promise<void> {
   // overwritten each frame (always the most recently printed frame).
   const stateSidecar = `/tmp/keeper-jobs.${process.pid}.state.json`;
   const frameSidecar = `/tmp/keeper-jobs.${process.pid}.frame.txt`;
+  const diffSidecar = `/tmp/keeper-jobs.${process.pid}.diff.txt`;
+  // Internal scratch path for the previous frame text — fed to `diff -u` as
+  // its "before" file. Overwritten each tick; not surfaced in the meta note.
+  const prevFrameTmp = `/tmp/keeper-jobs.${process.pid}.prev.frame.txt`;
+  // In-memory copy of the last emitted frame text, used as the "before" side
+  // of the per-frame unified diff. `null` until the first frame lands
+  // (sentinel written instead).
+  let lastFrameText: string | null = null;
 
   /**
-   * Mirror the just-emitted frame to its two sidecar files and print a
+   * Mirror the just-emitted frame to its three sidecar files and print a
    * `...`-fenced note with their paths (a "meta message", distinct from the
-   * server `meta` staleness frame). `stateSidecar` gets the full JSON state the
-   * frame was built from — the ordered page rows; `frameSidecar` gets the
-   * rendered frame text itself. Best-effort: a /tmp write failure logs a warning
-   * and never wedges the stream.
+   * server `meta` staleness frame). `stateSidecar` gets the full JSON state
+   * the frame was built from — the ordered page rows; `frameSidecar` gets
+   * the rendered frame text itself; `diffSidecar` gets `diff -u prev current`
+   * against the previous emit (or a sentinel on the first frame). The system
+   * `diff -u` exits 1 when files differ — expected here (we only get here
+   * when the body changed), so we ignore the exit code and take stdout.
+   * Best-effort: a /tmp write failure logs a warning and never wedges the
+   * stream.
    */
   function writeSidecars(frameText: string): void {
     const state = order.map((id) => byId.get(id) ?? { [pk]: id });
@@ -281,9 +296,33 @@ async function main(): Promise<void> {
     } catch (err) {
       log(`# warn: sidecar write failed: ${(err as Error).message}`);
     }
+    let diffText: string;
+    if (lastFrameText == null) {
+      diffText = "# first frame — no previous to diff against\n";
+    } else {
+      try {
+        writeFileSync(prevFrameTmp, `${lastFrameText}\n`);
+        const proc = Bun.spawnSync({
+          cmd: ["diff", "-u", prevFrameTmp, frameSidecar],
+        });
+        diffText = proc.stdout.toString();
+        if (diffText.length === 0) {
+          diffText = "# diff: no textual difference\n";
+        }
+      } catch (err) {
+        diffText = `# diff failed: ${(err as Error).message}\n`;
+      }
+    }
+    try {
+      writeFileSync(diffSidecar, diffText);
+    } catch (err) {
+      log(`# warn: diff sidecar write failed: ${(err as Error).message}`);
+    }
+    lastFrameText = frameText;
     log("...");
     log(`state: ${stateSidecar}`);
     log(`frame: ${frameSidecar}`);
+    log(`diff: ${diffSidecar}`);
     log("...");
   }
 
