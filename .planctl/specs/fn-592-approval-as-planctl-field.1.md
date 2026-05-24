@@ -34,5 +34,7 @@ Three tests: (a) `set-approval` writes the file atomically and lands the correct
 - [ ] Three new tests pass; exact serializer form (indent, key order, trailing newline) documented in this task's evidence so task `.3` can match it byte-for-byte
 
 ## Done summary
-
+Added `approval` top-level field to planctl epic and task JSON (enum: approved/rejected/pending; default 'pending' for missing/null). New top-level `planctl set-approval <epic_id> [<task_id>] <status>` verb writes the file atomically via temp+rename in the same directory; runner mutates the loaded dict so unknown top-level fields ride through untouched (forward-compat for keeperd writes in task .3). Three required test cases plus full normalize / overwrite / serializer-form coverage in apps/planctl/tests/test_set_approval.py (19/19 pass; full planctl suite 2213/2213). Canonical serializer form pinned for task .3 byte-for-byte: json.dumps(data, indent=2, sort_keys=True) + '\n' — indent=2 spaces, lexicographic key order, single trailing \n, UTF-8; atomic = tempfile.mkstemp(dir=path.parent, suffix='.tmp') -> write+fsync -> os.replace -> fsync parent dir (see /Users/mike/code/arthack/apps/cli_common/cli_common/atomic.py). NOT in VALIDATION_CLEAR_VERBS — approval is gating state, not structural.
 ## Evidence
+- Commits: arthack@35abfb24e
+- Tests: apps/planctl/tests/test_set_approval.py (19/19)

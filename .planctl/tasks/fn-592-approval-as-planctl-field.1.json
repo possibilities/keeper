@@ -4,9 +4,14 @@
   "depends_on": [],
   "epic": "fn-592-approval-as-planctl-field",
   "id": "fn-592-approval-as-planctl-field.1",
+  "preferred_backend": null,
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "planctl schema and set-approval",
-  "updated_at": "2026-05-24T00:10:12Z"
+  "updated_at": "2026-05-24T00:49:00Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-24T00:49:00Z"
 }
