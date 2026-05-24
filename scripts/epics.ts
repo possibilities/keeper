@@ -476,7 +476,7 @@ async function main(): Promise<void> {
    */
   function renderBody(): string {
     if (order.length === 0) {
-      return "(no epics)";
+      return "";
     }
     return order
       .map((id) => renderEpicBlock(byId.get(id) ?? { [pk]: id }))

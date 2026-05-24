@@ -3,17 +3,15 @@
  * keeper-board — a combined "UI" over the read-only NDJSON-over-UDS subscribe
  * server (`src/server-worker.ts`) that fuses `scripts/epics.ts` and
  * `scripts/jobs.ts` into a single stream: one frame per change, each frame is
- * the epics body + a `===` separator + the jobs body, both refreshed under
- * the same poll/connect lifecycle so they always show the same wall-clock
- * snapshot of the daemon.
+ * the epics body + a `~~~` divider line + the jobs body, both refreshed
+ * under the same poll/connect lifecycle so they always show the same
+ * wall-clock snapshot of the daemon.
  *
  * Frame shape (one `---` lead per frame):
  *
  *   ---
  *   {epics body}     ← see scripts/epics.ts for the epic-block format
- *
- *   ===
- *
+ *   ~~~
  *   {jobs body}      ← see scripts/jobs.ts for the job-line format
  *
  * One connection carries TWO `query` frames (one per collection, distinct
@@ -29,10 +27,15 @@
  *
  * First-paint policy: NO frame is emitted until BOTH collections have
  * received their first `result`. Otherwise the first paint would briefly
- * show `(no jobs)` (or `(no epics)`) below a real section, which reads as
- * a momentary lie. After the first combined frame, every subsequent
- * `result` may emit — the lastBody compare keeps the stream quiet when
- * nothing visible changed.
+ * show a real section below an empty one (or vice versa) before the other
+ * landed — which reads as a momentary lie. After the first combined frame,
+ * every subsequent `result` may emit — the lastBody compare keeps the
+ * stream quiet when nothing visible changed.
+ *
+ * Empty-section policy: an empty collection renders as NOTHING (no
+ * placeholder text). The `~~~` divider is dropped when either side is
+ * empty, so a single populated section reads as a clean block under the
+ * `---` lead, and a frame with both sides empty is just the lead.
  *
  * Filters: this combined view uses the SERVER defaults for both
  * collections — epics: `status = 'open' AND approval != 'approved'`; jobs:
@@ -99,13 +102,12 @@ Renders both views as one frame per change, each frame led by '---':
 
   ---
   {epics body}      (see scripts/epics.ts for the epic-block format)
-
-  ===
-
+  ~~~
   {jobs body}       (see scripts/jobs.ts for the job-line format)
 
 The first frame waits until BOTH collections have landed their first result,
-so first paint is never half-empty. The page is refetched on every change
+so first paint is never half-empty. An empty section renders as NOTHING (no
+placeholder text); the ~~~ divider is dropped when either side is empty. The page is refetched on every change
 signal and on a steady poll; a new frame prints only when the combined
 rendered output changes. Both subscriptions ride one connection; an
 epics-only change refetches only epics (and vice versa). Every emitted
@@ -307,7 +309,7 @@ async function main(): Promise<void> {
 
   function renderEpicsBody(): string {
     if (epics.order.length === 0) {
-      return "(no epics)";
+      return "";
     }
     return epics.order
       .map((id) => renderEpicBlock(epics.byId.get(id) ?? { [epics.pk]: id }))
@@ -327,7 +329,7 @@ async function main(): Promise<void> {
 
   function renderJobsBody(): string {
     if (jobs.order.length === 0) {
-      return "(no jobs)";
+      return "";
     }
     return jobs.order
       .map((id) => projectJobRow(jobs.byId.get(id) ?? { [jobs.pk]: id }))
@@ -335,13 +337,23 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Combined frame body: epics on top, jobs on the bottom, a `===` divider
-   * between with a blank line on each side. Same `---` lead as the sibling
-   * scripts — there's still one frame per change, just with two sections
-   * inside.
+   * Combined frame body: epics on top, jobs on the bottom, a `~~~` divider
+   * on its own line between them (no blank-line padding — the divider IS
+   * the visual break). The divider is dropped when either side is empty,
+   * so a single populated section reads as a clean block; both empty
+   * yields an empty body (the frame is just the `---` lead). Same `---`
+   * lead as the sibling scripts — there's still one frame per change.
    */
   function renderBody(): string {
-    return `${renderEpicsBody()}\n\n===\n\n${renderJobsBody()}`;
+    const e = renderEpicsBody();
+    const j = renderJobsBody();
+    if (e === "") {
+      return j;
+    }
+    if (j === "") {
+      return e;
+    }
+    return `${e}\n~~~\n${j}`;
   }
 
   const stateSidecar = `/tmp/keeper-board.${process.pid}.state.json`;

@@ -255,7 +255,7 @@ async function main(): Promise<void> {
    */
   function renderBody(): string {
     if (order.length === 0) {
-      return "(no jobs)";
+      return "";
     }
     return order
       .map((id) => projectRow(byId.get(id) ?? { [pk]: id }))
