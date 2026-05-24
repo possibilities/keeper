@@ -36,5 +36,5 @@ No tests -- prose only. Verify: (a) `grep -i 'sidecar' CLAUDE.md README.md` retu
 - [ ] No stale references to `set_approval`, "approvals sidecar" as active state, or "keeper never writes a .planctl file"
 
 ## Done summary
-
+Rewrote CLAUDE.md + README.md to match the planctl-native approval contract: RPC handlers write the approval field on .planctl files via atomic temp+rename and round-trip through the watcher; removed all stale sidecar/set_approval/schema-v12 references.
 ## Evidence
