@@ -68,6 +68,17 @@ import {
   parsePlanRef,
   planVerbRefFromSpawnName,
 } from "./derivers";
+import type { GitSnapshotPayload } from "./git-worker";
+import {
+  type ClassifierInvocation,
+  computePlanWindows,
+  deriveEpicLinks,
+  deriveJobLinks,
+  type EpicLink,
+  type JobLink,
+  normalizePlanctlOp,
+  type PlanWindow,
+} from "./plan-classifier";
 import type { Event } from "./types";
 
 /**
@@ -366,11 +377,16 @@ function projectPlanRow(db: Database, event: Event): void {
 
   if (event.hook_event === "EpicSnapshot") {
     // The ON CONFLICT update lists ONLY scalar columns and NEVER `tasks` /
-    // `jobs`: an epic snapshot carries no task or job data, and a shell row
-    // inserted by a task-before-epic TaskSnapshot or a job-before-epic
-    // `syncJobIntoEpic` already holds those arrays. INSERT defaults both to
-    // `'[]'` (the schema default), so the first-sight epic reads empty arrays
-    // and a later epic snapshot can never clobber arrays a shell holds.
+    // `jobs` / `job_links`: an epic snapshot carries no task, job, or
+    // job-link data, and a shell row inserted by a task-before-epic
+    // TaskSnapshot, a job-before-epic `syncJobIntoEpic`, or a planctl-event
+    // -before-epic `syncPlanctlLinks` already holds those arrays. INSERT
+    // defaults all three to `'[]'` (the schema default), so the first-sight
+    // epic reads empty arrays and a later epic snapshot can never clobber
+    // arrays a shell holds. The `job_links` carve-out is mandatory: without
+    // it, an approval RPC → atomic file write → file-watcher → EpicSnapshot
+    // fold would wipe the creator/refiner provenance projection on every
+    // approval flip.
     db.run(
       `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_event_id, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -600,6 +616,86 @@ function retractPlanRow(db: Database, event: Event): void {
   db.run(
     "UPDATE epics SET tasks = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
     [JSON.stringify(next), event.id, event.ts, epicId],
+  );
+}
+
+function extractGitSnapshot(event: Event): GitSnapshotPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<GitSnapshotPayload>;
+    if (
+      typeof parsed.project_dir !== "string" ||
+      parsed.project_dir.length === 0
+    ) {
+      return null;
+    }
+    return {
+      project_dir: parsed.project_dir,
+      branch: typeof parsed.branch === "string" ? parsed.branch : null,
+      head_oid: typeof parsed.head_oid === "string" ? parsed.head_oid : null,
+      upstream: typeof parsed.upstream === "string" ? parsed.upstream : null,
+      ahead: typeof parsed.ahead === "number" ? parsed.ahead : null,
+      behind: typeof parsed.behind === "number" ? parsed.behind : null,
+      dirty_files: Array.isArray(parsed.dirty_files) ? parsed.dirty_files : [],
+      orphaned_files: Array.isArray(parsed.orphaned_files)
+        ? parsed.orphaned_files
+        : [],
+      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
+    };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse git snapshot blob for event id=${event.id} project=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic git snapshot. The reducer never re-runs git; it only
+ * persists the observed payload from the event log, keeping re-fold deterministic
+ * even though the original producer observed mutable filesystem state.
+ */
+function projectGitStatus(db: Database, event: Event): void {
+  const snapshot = extractGitSnapshot(event);
+  if (snapshot == null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO git_status (
+       project_dir, branch, head_oid, upstream, ahead, behind,
+       dirty_count, orphaned_count, dirty_files, orphaned_files, jobs,
+       last_event_id, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(project_dir) DO UPDATE SET
+       branch = excluded.branch,
+       head_oid = excluded.head_oid,
+       upstream = excluded.upstream,
+       ahead = excluded.ahead,
+       behind = excluded.behind,
+       dirty_count = excluded.dirty_count,
+       orphaned_count = excluded.orphaned_count,
+       dirty_files = excluded.dirty_files,
+       orphaned_files = excluded.orphaned_files,
+       jobs = excluded.jobs,
+       last_event_id = excluded.last_event_id,
+       updated_at = excluded.updated_at`,
+    [
+      snapshot.project_dir,
+      snapshot.branch,
+      snapshot.head_oid,
+      snapshot.upstream,
+      snapshot.ahead,
+      snapshot.behind,
+      snapshot.dirty_files.length,
+      snapshot.orphaned_files.length,
+      JSON.stringify(snapshot.dirty_files),
+      JSON.stringify(snapshot.orphaned_files),
+      JSON.stringify(snapshot.jobs),
+      event.id,
+      event.ts,
+    ],
   );
 }
 
@@ -887,6 +983,307 @@ function syncIfPlanRef(
 }
 
 /**
+ * Parse a persisted JSON-TEXT array column into an array of {@link EpicLink}.
+ * A NULL/empty/malformed cell folds to `[]` — NEVER throws inside the open
+ * BEGIN IMMEDIATE transaction (a throw rolls back the cursor and wedges the
+ * reducer). Parallel to {@link parseEmbeddedJobs}.
+ */
+function parseEmbeddedLinks<T extends EpicLink | JobLink>(
+  text: string | null | undefined,
+): T[] {
+  if (text == null || text.length === 0) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return parsed as T[];
+    }
+  } catch {
+    // malformed stored array → treat as empty, fall through.
+  }
+  return [];
+}
+
+/**
+ * Deterministic sort for an embedded `epic_links` array (used on
+ * `jobs.epic_links`). Total-order ASC on the full `(kind, target)` tuple —
+ * mirrors the classifier's final sort. The classifier already sorts its
+ * output, but the fold also re-applies here so any future read-side mutation
+ * stays deterministic. Parallel to {@link sortEmbeddedJobs}.
+ *
+ * Why total-order: a single-field sort would leave equal-`kind` ties (two
+ * creators, two refiners) in implementation-defined order, breaking the
+ * byte-identical re-fold invariant.
+ */
+function sortEpicLinks(links: EpicLink[]): void {
+  links.sort((a, b) => {
+    if (a.kind < b.kind) return -1;
+    if (a.kind > b.kind) return 1;
+    if (a.target < b.target) return -1;
+    if (a.target > b.target) return 1;
+    return 0;
+  });
+}
+
+/**
+ * Deterministic sort for an embedded `job_links` array (used on
+ * `epics.job_links`). Total-order ASC on the full `(kind, job_id)` tuple —
+ * mirrors the classifier's final sort. Parallel to {@link sortEpicLinks}.
+ */
+function sortJobLinks(links: JobLink[]): void {
+  links.sort((a, b) => {
+    if (a.kind < b.kind) return -1;
+    if (a.kind > b.kind) return 1;
+    if (a.job_id < b.job_id) return -1;
+    if (a.job_id > b.job_id) return 1;
+    return 0;
+  });
+}
+
+/**
+ * Fan a planctl-CLI invocation (or a `/plan:plan` window opener) into the
+ * `jobs.epic_links` + per-touched-epic `epics.job_links` projections. Runs
+ * INSIDE the open transaction opened by {@link applyEvent}; performs zero
+ * cursor work. Parallel to {@link syncJobIntoEpic} — the triggers are
+ * disjoint (jobs-write trigger vs. planctl-event trigger) so the two fan-out
+ * helpers do NOT share code.
+ *
+ * Procedure (re-derive from scratch on every triggering event — full-replace,
+ * never delta-merge, per CLAUDE.md "byte-identical re-fold"):
+ *
+ * 1. Load every planctl invocation row for `sessionId` (the partial composite
+ *    index `(session_id, id) WHERE planctl_op IS NOT NULL` makes this cheap).
+ *    Also load every `/plan:plan` opener event for the session (locked gate:
+ *    `PreToolUse + skill_name='plan:plan'` only — `slash_command` rows would
+ *    double-fire on slash-typed invocations).
+ * 2. Compute half-open `/plan:plan` windows via {@link computePlanWindows}.
+ * 3. Compute the new `epic_links` via {@link deriveEpicLinks}.
+ * 4. Read the pre-state `jobs.epic_links` for the session.
+ * 5. Compute the pre + post epic-id union — every target that appears in
+ *    EITHER pre or post `epic_links` (a removed edge still needs its epic's
+ *    `job_links` re-derived to drop the now-stale entry).
+ * 6. UPDATE the jobs row's `epic_links` + `last_event_id` + `updated_at`.
+ * 7. For each epic id in the pre+post union, re-derive `job_links` via
+ *    {@link deriveJobLinks} over the FULL per-epic invocation/window
+ *    namespace (every session, not just this one). UPDATE the epic row;
+ *    shell-insert a missing epic row mirroring {@link syncJobIntoEpic}'s
+ *    pattern so a from-scratch re-fold reproduces every row.
+ *
+ * **Cost profile.** A session with N planctl events triggers N fan-outs, and
+ * each fan-out scans every session's planctl invocations for the per-epic
+ * `deriveJobLinks` pass. The partial composite index
+ * `idx_events_planctl_session` (db.ts schema v14) bounds the per-session scan
+ * to its own slice. Worst case: 200 planctl events × 5 touched epics × full
+ * per-epic-namespace scan. Acceptable for the current scale; if it becomes
+ * hot a future optimization could cache per-session invocations within the
+ * fold transaction.
+ *
+ * **No-op when:**
+ * - The jobs row for `sessionId` does not exist (no SessionStart yet —
+ *   skip; the jobs UPDATE matches zero rows and the per-epic re-derive is
+ *   pointless without a backing job row).
+ *
+ * NEVER throws inside the open transaction. A malformed stored array folds
+ * to `[]` via {@link parseEmbeddedLinks}; an absent epic row folds to a
+ * fresh shell.
+ */
+function syncPlanctlLinks(
+  db: Database,
+  sessionId: string,
+  eventId: number,
+  ts: number,
+): void {
+  // The session's backing jobs row must exist for an epic_links UPDATE to
+  // land. A planctl invocation in a session with no SessionStart is an
+  // orphan; we skip the jobs-side write but still re-derive every touched
+  // epic's job_links (cross-session classifier output) so symmetry holds.
+  const jobsRow = db
+    .query("SELECT epic_links FROM jobs WHERE job_id = ?")
+    .get(sessionId) as { epic_links: string | null } | null;
+
+  // Load this session's planctl invocations (ASC by event id — stable
+  // ordering for the classifier's per-window pointer advance). The partial
+  // composite index `idx_events_planctl_session (session_id, id) WHERE
+  // planctl_op IS NOT NULL` serves this with no full-table scan.
+  const invRows = db
+    .query(
+      `SELECT ts, planctl_op, planctl_target, planctl_epic_id,
+              planctl_subject_present
+         FROM events
+        WHERE session_id = ? AND planctl_op IS NOT NULL
+        ORDER BY id ASC`,
+    )
+    .all(sessionId) as {
+    ts: number;
+    planctl_op: string;
+    planctl_target: string | null;
+    planctl_epic_id: string | null;
+    planctl_subject_present: number | null;
+  }[];
+  const invocations: ClassifierInvocation[] = invRows.map((r) => ({
+    ts: r.ts,
+    op: normalizePlanctlOp(r.planctl_op),
+    target: r.planctl_target,
+    epic_id: r.planctl_epic_id,
+    subject_present: r.planctl_subject_present === 1,
+  }));
+
+  // Load this session's `/plan:plan` openers. Locked gate: PreToolUse-on-Skill
+  // with skill_name='plan:plan' only. Slash-command UserPromptSubmit rows are
+  // NOT openers — they'd double-fire on slash-typed invocations (the same
+  // /plan:plan call appears as both a slash_command UserPromptSubmit and a
+  // PreToolUse:Skill event).
+  const openerRows = db
+    .query(
+      `SELECT ts
+         FROM events
+        WHERE session_id = ?
+          AND hook_event = 'PreToolUse'
+          AND skill_name = 'plan:plan'
+        ORDER BY id ASC`,
+    )
+    .all(sessionId) as { ts: number }[];
+  const windows = computePlanWindows(openerRows.map((r) => r.ts));
+
+  // Compute the new epic_links from scratch (full-replace, never delta-merge —
+  // re-fold determinism requires that re-folding the same events produces the
+  // same JSON; delta-merge would double on re-fold).
+  const newEpicLinks = deriveEpicLinks(invocations, windows);
+  sortEpicLinks(newEpicLinks);
+
+  // Read the pre-state epic_links so we know which epics' job_links need a
+  // re-derive (every target that appears in EITHER pre or post — a removed
+  // edge still needs its epic's job_links updated to drop the stale entry).
+  const preEpicLinks =
+    jobsRow != null ? parseEmbeddedLinks<EpicLink>(jobsRow.epic_links) : [];
+  const touchedEpics = new Set<string>();
+  for (const link of preEpicLinks) {
+    touchedEpics.add(link.target);
+  }
+  for (const link of newEpicLinks) {
+    touchedEpics.add(link.target);
+  }
+
+  // UPDATE the jobs row's epic_links. Skip when the backing row does not
+  // exist (orphan invocation — no SessionStart for this session_id yet).
+  if (jobsRow != null) {
+    db.run(
+      "UPDATE jobs SET epic_links = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
+      [JSON.stringify(newEpicLinks), eventId, ts, sessionId],
+    );
+  }
+
+  if (touchedEpics.size === 0) {
+    return;
+  }
+
+  // Build the per-epic re-derive inputs: every session that has touched any of
+  // the affected epics, with its full planctl invocations + windows. The
+  // classifier's `deriveJobLinks` expects ReadOnly maps keyed by job_id.
+  //
+  // Step 1: find every distinct session_id that has at least one planctl
+  // invocation touching any of `touchedEpics` (epic id appearing as either
+  // planctl_epic_id or planctl_target). We then load each such session's FULL
+  // invocation list — not just the touching ones — because the classifier
+  // needs the full per-session ordering for its window advance.
+  const targetList = [...touchedEpics];
+  const placeholders = targetList.map(() => "?").join(",");
+  const sessionRows = db
+    .query(
+      `SELECT DISTINCT session_id
+         FROM events
+        WHERE planctl_op IS NOT NULL
+          AND (planctl_epic_id IN (${placeholders}) OR planctl_target IN (${placeholders}))`,
+    )
+    .all(...targetList, ...targetList) as { session_id: string }[];
+  // The current session might have touched an epic in pre-state that NO
+  // invocation now references (a refiner edge dropped because of suppression
+  // ordering) — make sure it's in the sweep too so its now-stale job_links
+  // entry gets pulled.
+  const sessionIds = new Set<string>(sessionRows.map((r) => r.session_id));
+  sessionIds.add(sessionId);
+
+  const invocationsBySession = new Map<string, ClassifierInvocation[]>();
+  const windowsBySession = new Map<string, PlanWindow[]>();
+  for (const sid of sessionIds) {
+    const sidInvRows = db
+      .query(
+        `SELECT ts, planctl_op, planctl_target, planctl_epic_id,
+                planctl_subject_present
+           FROM events
+          WHERE session_id = ? AND planctl_op IS NOT NULL
+          ORDER BY id ASC`,
+      )
+      .all(sid) as {
+      ts: number;
+      planctl_op: string;
+      planctl_target: string | null;
+      planctl_epic_id: string | null;
+      planctl_subject_present: number | null;
+    }[];
+    invocationsBySession.set(
+      sid,
+      sidInvRows.map((r) => ({
+        ts: r.ts,
+        op: normalizePlanctlOp(r.planctl_op),
+        target: r.planctl_target,
+        epic_id: r.planctl_epic_id,
+        subject_present: r.planctl_subject_present === 1,
+      })),
+    );
+    const sidOpenerRows = db
+      .query(
+        `SELECT ts
+           FROM events
+          WHERE session_id = ?
+            AND hook_event = 'PreToolUse'
+            AND skill_name = 'plan:plan'
+          ORDER BY id ASC`,
+      )
+      .all(sid) as { ts: number }[];
+    windowsBySession.set(
+      sid,
+      computePlanWindows(sidOpenerRows.map((r) => r.ts)),
+    );
+  }
+
+  // Step 2: re-derive job_links for each touched epic and UPDATE the epic row.
+  // Shell-insert a missing epic row — mirrors syncJobIntoEpic's pattern. A
+  // later EpicSnapshot fills the scalars without clobbering job_links (the
+  // EpicSnapshot ON CONFLICT omits the column — see projectPlanRow).
+  for (const epicId of touchedEpics) {
+    const newJobLinks = deriveJobLinks(
+      invocationsBySession,
+      windowsBySession,
+      epicId,
+    );
+    sortJobLinks(newJobLinks);
+    const jobLinksJson = JSON.stringify(newJobLinks);
+    const epicExists = db
+      .query("SELECT epic_id FROM epics WHERE epic_id = ?")
+      .get(epicId) as { epic_id: string } | null;
+    if (epicExists != null) {
+      db.run(
+        "UPDATE epics SET job_links = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+        [jobLinksJson, eventId, ts, epicId],
+      );
+    } else {
+      // Shell-insert: no epic row yet. Scalars default to NULL / "[]" matching
+      // the schema's zero-event reading. A later EpicSnapshot fills the
+      // scalars; the ON CONFLICT carve-out preserves job_links / jobs / tasks.
+      db.run(
+        `INSERT INTO epics (
+           epic_id, epic_number, title, project_dir, status,
+           last_event_id, updated_at, tasks, jobs, job_links
+         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?)`,
+        [epicId, eventId, ts, jobLinksJson],
+      );
+    }
+  }
+}
+
+/**
  * Apply the jobs-side projection for one event. Runs INSIDE the open
  * transaction opened by {@link applyEvent}; performs zero cursor work.
  *
@@ -1138,6 +1535,33 @@ function projectJobsRow(db: Database, event: Event): void {
       break;
   }
 
+  // Planctl-CLI invocation fan-out. Re-derive the session's epic_links +
+  // every touched epic's job_links from scratch via the pure classifier in
+  // `src/plan-classifier.ts`. Gated on:
+  //   `planctl_op != NULL`     — this event is a planctl-CLI Bash invocation,
+  //                              one of the windowed mutations the classifier
+  //                              folds into edges;
+  //   OR `PreToolUse + skill_name='plan:plan'`
+  //                            — this event is a `/plan:plan` window opener,
+  //                              which can change the set of windows (and
+  //                              thus which planctl events fall inside them)
+  //                              even though it carries no `planctl_op` itself.
+  //
+  // The two seams are disjoint from `syncJobIntoEpic` (jobs-write trigger):
+  // a hook event like a SessionStart with `plan_ref` fires syncIfPlanRef but
+  // not syncPlanctlLinks; a PreToolUse:Bash with a planctl command fires
+  // syncPlanctlLinks but no jobs-side write happens (default switch arm).
+  //
+  // Post-switch placement matches the title-precedence precedent below: the
+  // gate fires regardless of which `hook_event` switch arm did (or did not)
+  // do lifecycle work.
+  if (
+    event.planctl_op != null ||
+    (event.hook_event === "PreToolUse" && event.skill_name === "plan:plan")
+  ) {
+    syncPlanctlLinks(db, jobId, event.id, ts);
+  }
+
   // Title precedence rule: a `session_title` in the data blob folds into
   // `jobs.title`, layered on top of any lifecycle write above. The source is
   // resolved per-event by titleSourceForEvent — 'transcript' (priority 3) for a
@@ -1212,6 +1636,8 @@ export function applyEvent(
       event.hook_event === "TaskDeleted"
     ) {
       retractPlanRow(db, event);
+    } else if (event.hook_event === "GitSnapshot") {
+      projectGitStatus(db, event);
     } else {
       projectJobsRow(db, event);
     }
@@ -1256,7 +1682,9 @@ export function drain(db: Database, batchSize = DEFAULT_BATCH_SIZE): number {
       `SELECT id, ts, session_id, pid, hook_event, event_type, tool_name,
               matcher, cwd, permission_mode, agent_id, agent_type,
               stop_hook_active, data, subagent_agent_id, spawn_name,
-              start_time, slash_command, skill_name
+              start_time, slash_command, skill_name,
+              planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+              planctl_subject_present
          FROM events
         WHERE id > ?
         ORDER BY id ASC

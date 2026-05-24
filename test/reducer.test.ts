@@ -70,13 +70,20 @@ function insertEvent(
     start_time: overrides.start_time ?? null,
     slash_command: overrides.slash_command ?? null,
     skill_name: overrides.skill_name ?? null,
+    planctl_op: overrides.planctl_op ?? null,
+    planctl_target: overrides.planctl_target ?? null,
+    planctl_epic_id: overrides.planctl_epic_id ?? null,
+    planctl_task_id: overrides.planctl_task_id ?? null,
+    planctl_subject_present: overrides.planctl_subject_present ?? null,
   };
   db.run(
     `INSERT INTO events (
        ts, session_id, pid, hook_event, event_type, tool_name, matcher,
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-       subagent_agent_id, spawn_name, start_time, slash_command, skill_name
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+       planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+       planctl_subject_present
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -96,6 +103,11 @@ function insertEvent(
       row.start_time,
       row.slash_command,
       row.skill_name,
+      row.planctl_op,
+      row.planctl_target,
+      row.planctl_epic_id,
+      row.planctl_task_id,
+      row.planctl_subject_present,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -140,6 +152,59 @@ function getCursor(): number {
     .get() as { last_event_id: number };
   return row.last_event_id;
 }
+
+test("GitSnapshot folds into git_status and advances the cursor", () => {
+  const id = insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: "abc123",
+      upstream: "origin/main",
+      ahead: 1,
+      behind: 2,
+      dirty_files: [{ path: "src/a.ts", xy: " M" }],
+      orphaned_files: [{ path: "src/a.ts", xy: " M" }],
+      jobs: [{ job_id: "sess-a", dirty: [] }],
+    }),
+  });
+
+  expect(drain(db)).toBe(1);
+  const row = db
+    .query("SELECT * FROM git_status WHERE project_dir = ?")
+    .get("/repo") as {
+    branch: string;
+    head_oid: string;
+    upstream: string;
+    ahead: number;
+    behind: number;
+    dirty_count: number;
+    orphaned_count: number;
+    dirty_files: string;
+    orphaned_files: string;
+    jobs: string;
+    last_event_id: number;
+  } | null;
+
+  expect(row).not.toBeNull();
+  expect(row?.branch).toBe("main");
+  expect(row?.head_oid).toBe("abc123");
+  expect(row?.upstream).toBe("origin/main");
+  expect(row?.ahead).toBe(1);
+  expect(row?.behind).toBe(2);
+  expect(row?.dirty_count).toBe(1);
+  expect(row?.orphaned_count).toBe(1);
+  expect(JSON.parse(row?.dirty_files ?? "[]")).toEqual([
+    { path: "src/a.ts", xy: " M" },
+  ]);
+  expect(JSON.parse(row?.jobs ?? "[]")).toEqual([
+    { job_id: "sess-a", dirty: [] },
+  ]);
+  expect(row?.last_event_id).toBe(id);
+  expect(getCursor()).toBe(id);
+});
 
 function drainAll(): number {
   let total = 0;
@@ -2543,4 +2608,266 @@ test("a job with no plan_ref does not create an epic row (no fan-out)", () => {
     c: number;
   };
   expect(epicCount.c).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// syncPlanctlLinks fan-out (schema v14: jobs.epic_links + epics.job_links)
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert a `PreToolUse:Skill` window-opener event for `/plan:plan`. The
+ * classifier's locked gate (`PreToolUse + skill_name='plan:plan'`) is what
+ * the reducer's `syncPlanctlLinks` reads to compute window starts; slash-
+ * command `UserPromptSubmit` rows are NOT openers (they'd double-fire).
+ */
+function planPlanOpener(sessionId: string, ts?: number): number {
+  return insertEvent({
+    hook_event: "PreToolUse",
+    session_id: sessionId,
+    tool_name: "Skill",
+    skill_name: "plan:plan",
+    ts,
+  });
+}
+
+/**
+ * Insert a stamped planctl invocation event. Mirrors what the hook +
+ * `extractPlanctlInvocation` deriver would write — the test bypasses the
+ * Bash-command parser and stamps the derived columns directly so the
+ * fan-out test stays independent of the parser's edge cases.
+ */
+function planctlEvent(args: {
+  sessionId: string;
+  op: string;
+  target: string | null;
+  epicId: string | null;
+  taskId?: string | null;
+  subjectPresent: boolean;
+  ts?: number;
+}): number {
+  return insertEvent({
+    hook_event: "PreToolUse",
+    session_id: args.sessionId,
+    tool_name: "Bash",
+    ts: args.ts,
+    planctl_op: args.op,
+    planctl_target: args.target,
+    planctl_epic_id: args.epicId,
+    planctl_task_id: args.taskId ?? null,
+    planctl_subject_present: args.subjectPresent ? 1 : 0,
+  });
+}
+
+/** Read the persisted `jobs.epic_links` as a real array. */
+function getEpicLinks(sessionId: string): { kind: string; target: string }[] {
+  const row = db
+    .query("SELECT epic_links FROM jobs WHERE job_id = ?")
+    .get(sessionId) as { epic_links: string | null } | null;
+  if (row == null || row.epic_links == null) {
+    return [];
+  }
+  return JSON.parse(row.epic_links);
+}
+
+/** Read the persisted `epics.job_links` as a real array. */
+function getJobLinks(epicId: string): { kind: string; job_id: string }[] {
+  const row = db
+    .query("SELECT job_links FROM epics WHERE epic_id = ?")
+    .get(epicId) as { job_links: string | null } | null;
+  if (row == null || row.job_links == null) {
+    return [];
+  }
+  return JSON.parse(row.job_links);
+}
+
+test("syncPlanctlLinks: single-session single-window one creator emits creator edge in both directions", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-creator" });
+  planPlanOpener("sess-creator");
+  planctlEvent({
+    sessionId: "sess-creator",
+    op: "epic-create",
+    target: "fn-1-new",
+    epicId: "fn-1-new",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getEpicLinks("sess-creator")).toEqual([
+    { kind: "creator", target: "fn-1-new" },
+  ]);
+  expect(getJobLinks("fn-1-new")).toEqual([
+    { kind: "creator", job_id: "sess-creator" },
+  ]);
+});
+
+test("syncPlanctlLinks: single-session two windows creator-then-refiner-same-epic emits both edges", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-cr" });
+  // Window 1 — creator.
+  planPlanOpener("sess-cr");
+  planctlEvent({
+    sessionId: "sess-cr",
+    op: "epic-create",
+    target: "fn-2-foo",
+    epicId: "fn-2-foo",
+    subjectPresent: true,
+  });
+  // Window 2 — refiner on the same epic.
+  planPlanOpener("sess-cr");
+  planctlEvent({
+    sessionId: "sess-cr",
+    op: "epic-set-title",
+    target: "fn-2-foo",
+    epicId: "fn-2-foo",
+    subjectPresent: true,
+  });
+  drainAll();
+  // Both edges emitted; sort is (kind, target) ASC.
+  expect(getEpicLinks("sess-cr")).toEqual([
+    { kind: "creator", target: "fn-2-foo" },
+    { kind: "refiner", target: "fn-2-foo" },
+  ]);
+  expect(getJobLinks("fn-2-foo")).toEqual([
+    { kind: "creator", job_id: "sess-cr" },
+    { kind: "refiner", job_id: "sess-cr" },
+  ]);
+});
+
+test("syncPlanctlLinks: read-only verb in a window emits no edges", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-readonly" });
+  planPlanOpener("sess-readonly");
+  // A `planctl cat` is a read-only verb; `subject_present: false` mirrors the
+  // jobctl `subject is None` skip gate.
+  planctlEvent({
+    sessionId: "sess-readonly",
+    op: "cat",
+    target: "fn-3-bar",
+    epicId: "fn-3-bar",
+    subjectPresent: false,
+  });
+  drainAll();
+  expect(getEpicLinks("sess-readonly")).toEqual([]);
+  // No epic row created (the read-only invocation produced no edges, so
+  // touchedEpics is empty and the per-epic re-derive loop never fired).
+  const epicRow = db
+    .query("SELECT epic_id FROM epics WHERE epic_id = ?")
+    .get("fn-3-bar");
+  expect(epicRow).toBeNull();
+});
+
+test("syncPlanctlLinks: two sessions touching the same epic both appear in job_links", () => {
+  // Session A creates the epic.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a-fan" });
+  planPlanOpener("sess-a-fan");
+  planctlEvent({
+    sessionId: "sess-a-fan",
+    op: "epic-create",
+    target: "fn-4-multi",
+    epicId: "fn-4-multi",
+    subjectPresent: true,
+  });
+  // Session B refines it.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-b-fan" });
+  planPlanOpener("sess-b-fan");
+  planctlEvent({
+    sessionId: "sess-b-fan",
+    op: "epic-set-title",
+    target: "fn-4-multi",
+    epicId: "fn-4-multi",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getEpicLinks("sess-a-fan")).toEqual([
+    { kind: "creator", target: "fn-4-multi" },
+  ]);
+  expect(getEpicLinks("sess-b-fan")).toEqual([
+    { kind: "refiner", target: "fn-4-multi" },
+  ]);
+  expect(getJobLinks("fn-4-multi")).toEqual([
+    { kind: "creator", job_id: "sess-a-fan" },
+    { kind: "refiner", job_id: "sess-b-fan" },
+  ]);
+});
+
+test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out works)", () => {
+  // Seed a creator edge via the fan-out → a shell epic with job_links.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-carveout" });
+  planPlanOpener("sess-carveout");
+  planctlEvent({
+    sessionId: "sess-carveout",
+    op: "epic-create",
+    target: "fn-5-survive",
+    epicId: "fn-5-survive",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getJobLinks("fn-5-survive")).toEqual([
+    { kind: "creator", job_id: "sess-carveout" },
+  ]);
+  // Now fold an EpicSnapshot for the same epic — the ON CONFLICT clause
+  // MUST omit job_links (alongside jobs / tasks) so the carve-out preserves
+  // the projection. Without the carve-out an approval RPC → file write →
+  // file-watcher → snapshot fold would wipe creator/refiner provenance.
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-5-survive",
+    data: JSON.stringify({
+      epic_number: 5,
+      title: "Survive Carve-out",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  drainAll();
+  // Scalars filled, job_links preserved.
+  const epic = getEpic("fn-5-survive");
+  expect(epic?.title).toBe("Survive Carve-out");
+  expect(getJobLinks("fn-5-survive")).toEqual([
+    { kind: "creator", job_id: "sess-carveout" },
+  ]);
+});
+
+test("syncPlanctlLinks: re-fold determinism (rewind + DELETE + drain reproduces byte-identical projection)", () => {
+  // Drive a full session: two windows, a creator, a refiner, plus a
+  // cross-session refiner so both projections accumulate.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-A-det" });
+  planPlanOpener("sess-A-det");
+  planctlEvent({
+    sessionId: "sess-A-det",
+    op: "epic-create",
+    target: "fn-6-det",
+    epicId: "fn-6-det",
+    subjectPresent: true,
+  });
+  planPlanOpener("sess-A-det");
+  planctlEvent({
+    sessionId: "sess-A-det",
+    op: "task-create",
+    target: "fn-6-det.1",
+    epicId: "fn-6-det",
+    taskId: "fn-6-det.1",
+    subjectPresent: true,
+  });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-B-det" });
+  planPlanOpener("sess-B-det");
+  planctlEvent({
+    sessionId: "sess-B-det",
+    op: "epic-set-title",
+    target: "fn-6-det",
+    epicId: "fn-6-det",
+    subjectPresent: true,
+  });
+  drainAll();
+
+  const epicsBefore = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const jobsBefore = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+
+  // Rewind + delete + re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  drainAll();
+
+  const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const jobsAfter = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  expect(epicsAfter).toEqual(epicsBefore);
+  expect(jobsAfter).toEqual(jobsBefore);
 });

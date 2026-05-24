@@ -45,6 +45,7 @@ import {
   computePlanWindows,
   deriveEpicLinks,
   deriveJobLinks,
+  normalizePlanctlOp,
   type PlanWindow,
 } from "./plan-classifier";
 
@@ -1054,7 +1055,7 @@ function migrate(db: Database): void {
         }[];
         const invocations: ClassifierInvocation[] = invRows.map((r) => ({
           ts: r.ts,
-          op: r.planctl_op,
+          op: normalizePlanctlOp(r.planctl_op),
           target: r.planctl_target,
           epic_id: r.planctl_epic_id,
           subject_present: r.planctl_subject_present === 1,

@@ -71,6 +71,36 @@ export type PlanWindow = readonly [start: number, end: number];
 export const MAX_TS_SENTINEL = Number.MAX_SAFE_INTEGER;
 
 /**
+ * Normalize a keeper-side raw planctl CLI verb (`epic-create`, `task-create`,
+ * `epic-set-title`, `task-set-description`) into the namespace-stripped form
+ * the classifier was ported against (`create`, `set-title`, `set-description`).
+ *
+ * Keeper's hook stamps the raw CLI verb on the `events.planctl_op` column
+ * (see {@link import("./derivers").extractPlanctlInvocation}); jobctl's
+ * Python audit layer pre-normalizes by stripping the `epic-` / `task-`
+ * prefix before passing rows to `derive_epic_links` / `derive_job_links`.
+ * Both fan-out call sites (the live reducer's `syncPlanctlLinks` and the
+ * v13→v14 migration backfill in `src/db.ts`) MUST use this same helper so
+ * the migration's output is byte-identical to what the live reducer
+ * produces — without that, a re-fold from scratch would diverge from a
+ * migrated DB and break the "byte-identical re-fold" invariant.
+ *
+ * Pure function of the input. NEVER throws. Unknown / non-prefixed verbs
+ * pass through unchanged — `cat` stays `cat`, `done` stays `done`, etc. —
+ * so a future planctl CLI verb that doesn't follow the `<kind>-<op>` shape
+ * rides through deterministically.
+ */
+export function normalizePlanctlOp(rawOp: string): string {
+  if (rawOp.startsWith("epic-")) {
+    return rawOp.slice("epic-".length);
+  }
+  if (rawOp.startsWith("task-")) {
+    return rawOp.slice("task-".length);
+  }
+  return rawOp;
+}
+
+/**
  * One classifier-input invocation entry. Mirrors the subset of jobctl's
  * row shape that the classifier reads — `ts`, `op`, `target`, `epic_id`,
  * `subject_present`. The hook stamps these onto the `events` row via

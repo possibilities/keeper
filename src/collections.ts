@@ -100,6 +100,7 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "transcript_path",
     "plan_verb",
     "plan_ref",
+    "epic_links",
   ],
   pk: "job_id",
   version: "last_event_id",
@@ -127,10 +128,11 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
   // associating jobs with epics/tasks) but NOT in `sortable`/`filters`. A
   // future client query (e.g. "subscribe to all jobs for epic X") would add
   // `plan_ref` to `filters` and rely on the partial `idx_jobs_plan_ref`
-  // index added in schema v10. No JSON-TEXT columns are served today
-  // (`title_history` was retired), so `decodeRow` short-circuits on the
-  // empty set.
-  jsonColumns: new Set([]),
+  // index added in schema v10. `epic_links` (schema v14) is the same shape:
+  // a JSON-TEXT array decoded at the read boundary for display only — the
+  // creator/refiner cross-references the reducer's `syncPlanctlLinks`
+  // fan-out maintains for each job's planctl footprint.
+  jsonColumns: new Set(["epic_links"]),
 };
 
 /**
@@ -138,8 +140,9 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
  * mirror the v6 `epics` table 1:1 (`src/db.ts` `CREATE_EPICS`). `version` is
  * `last_event_id` (the monotonic per-row column the diff fires on, bumped by the
  * snapshot fold). Sort defaults to creation order, newest first, like `jobs`
- * (`epic_number desc` — epics have no `created_at` column, and `epic_number` is
- * the monotonic creation-order signal). `filters`
+ * (`epic_number asc` — epics have no `created_at` column, and `epic_number` is
+ * the monotonic creation-order signal, so ascending puts the oldest-created
+ * epic on top). `filters`
  * carries the pk (`epic_id` — detail-page single-item subscribe) plus the
  * natural filter columns `status` + `project_dir`. `title`/`epic_number` are
  * read-only display — served but out of `sortable`/`filters`. `project_dir`
@@ -151,7 +154,7 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
  * `columns`) AND registered in `jsonColumns` so {@link decodeRow} parses the
  * stored TEXT into a real `Task[]` at the read boundary; it is OUT of
  * `sortable`/`filters` (a nested display array, never a sort/filter key). The
- * default sort is `epic_number desc` — newest-created epic on top, a stable
+ * default sort is `epic_number asc` — oldest-created epic on top, a stable
  * creation order, so a task edit (which bumps the epic's `last_event_id`) never
  * reorders the default view.
  */
@@ -170,6 +173,7 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "tasks",
     "depends_on_epics",
     "jobs",
+    "job_links",
   ],
   pk: "epic_id",
   version: "last_event_id",
@@ -180,7 +184,7 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "epic_number",
     "status",
   ]),
-  defaultSort: { column: "epic_number", dir: "desc" },
+  defaultSort: { column: "epic_number", dir: "asc" },
   filters: {
     epic_id: "epic_id",
     status: "status",
@@ -206,15 +210,56 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     sql: "(status = ? OR approval != ?)",
     params: ["open", "approved"],
   },
-  // `tasks`, `depends_on_epics`, and `jobs` are JSON-TEXT array columns —
-  // decoded to real arrays at the read boundary. `jobs` carries the
-  // epic-level `EmbeddedJob[]` (plan/close verbs). Nested `task.jobs`
-  // (work-verb jobs on each task element) rides through the `tasks` parse —
-  // `decodeRow` returns parsed arrays whose nested objects' nested arrays
-  // are already arrays, so no separate `jsonColumns` entry is needed for
-  // the nested sub-array. All three are served + decoded but OUT of
-  // `sortable`/`filters`.
-  jsonColumns: new Set(["tasks", "depends_on_epics", "jobs"]),
+  // `tasks`, `depends_on_epics`, `jobs`, and `job_links` are JSON-TEXT array
+  // columns — decoded to real arrays at the read boundary. `jobs` carries the
+  // epic-level `EmbeddedJob[]` (plan/close verbs); `job_links` (schema v14)
+  // carries the symmetric per-epic creator/refiner cross-references the
+  // reducer's `syncPlanctlLinks` fan-out maintains from planctl-CLI
+  // invocation classifier output. Nested `task.jobs` (work-verb jobs on each
+  // task element) rides through the `tasks` parse — `decodeRow` returns
+  // parsed arrays whose nested objects' nested arrays are already arrays, so
+  // no separate `jsonColumns` entry is needed for the nested sub-array. All
+  // four are served + decoded but OUT of `sortable`/`filters`.
+  jsonColumns: new Set(["tasks", "depends_on_epics", "jobs", "job_links"]),
+};
+
+/**
+ * The `git` descriptor — one row per planctl-backed git worktree observed by
+ * the git worker. The row is a current-status snapshot plus derived per-live-job
+ * dirty/orphan buckets. It is produced by synthetic `GitSnapshot` events, so the
+ * read surface still rides the normal SQLite subscription machinery.
+ */
+export const GIT_DESCRIPTOR: CollectionDescriptor = {
+  name: "git",
+  table: "git_status",
+  columns: [
+    "project_dir",
+    "branch",
+    "head_oid",
+    "upstream",
+    "ahead",
+    "behind",
+    "dirty_count",
+    "orphaned_count",
+    "dirty_files",
+    "orphaned_files",
+    "jobs",
+    "last_event_id",
+    "updated_at",
+  ],
+  pk: "project_dir",
+  version: "last_event_id",
+  sortable: new Set([
+    "updated_at",
+    "last_event_id",
+    "project_dir",
+    "dirty_count",
+    "orphaned_count",
+    "branch",
+  ]),
+  defaultSort: { column: "project_dir", dir: "asc" },
+  filters: { project_dir: "project_dir", branch: "branch" },
+  jsonColumns: new Set(["dirty_files", "orphaned_files", "jobs"]),
 };
 
 /**
@@ -226,6 +271,7 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
   [EPICS_DESCRIPTOR.name, EPICS_DESCRIPTOR],
+  [GIT_DESCRIPTOR.name, GIT_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

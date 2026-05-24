@@ -8,6 +8,36 @@
  */
 
 /**
+ * One entry in {@link Job.epic_links} — a per-job cross-reference to an epic
+ * the job's planctl footprint touched inside a `/plan:plan` window. `kind`
+ * partitions the cross-reference: `"creator"` for a `planctl epic-create
+ * fn-N-foo` mutation; `"refiner"` for every other epic-touching mutation
+ * inside a window (subject to per-window creator suppression — see
+ * `src/plan-classifier.ts`).
+ *
+ * Mirrors `EpicLink` in `src/plan-classifier.ts` field-for-field; kept here
+ * so the projection types are self-describing without importing the
+ * classifier module.
+ */
+export interface Link {
+  kind: "creator" | "refiner";
+  target: string;
+}
+
+/**
+ * One entry in {@link Epic.job_links} — the symmetric per-epic view of
+ * {@link Link}. `kind` carries the same vocabulary; `job_id` identifies the
+ * session whose planctl footprint touched this epic inside one of its
+ * `/plan:plan` windows.
+ *
+ * Mirrors `JobLink` in `src/plan-classifier.ts` field-for-field.
+ */
+export interface JobLinkEntry {
+  kind: "creator" | "refiner";
+  job_id: string;
+}
+
+/**
  * One row of the `events` table. Lifted near-verbatim from the canonical
  * hooks-tracker.py shape; id + ts are SQLite-assigned/floats.
  *
@@ -67,6 +97,45 @@ export interface Event {
    * `WHERE skill_name LIKE 'plan:%'`) without JSON-scanning `data`.
    */
   skill_name: string | null;
+  /**
+   * Planctl-CLI verb extracted from a `PreToolUse:Bash` event's
+   * `data.tool_input.command` by
+   * {@link import("./derivers").extractPlanctlInvocation}. NULL on every row
+   * whose command does not parse as `planctl <verb> [target]` (the hook stamps
+   * NULL on misses so the partial-index `WHERE planctl_op IS NOT NULL`
+   * predicate stays selective). Examples: `epic-create`, `task-set-title`,
+   * `done`, `cat`.
+   */
+  planctl_op: string | null;
+  /**
+   * Raw planctl target argument as it appeared on the command line — typically
+   * an epic id (`fn-575-foo`) or task id (`fn-575-foo.3`), but NULL when the
+   * verb takes no argument (`planctl epics`, `planctl init`) or for unparseable
+   * shapes. Surrounding quotes are stripped; empty strings fold to NULL.
+   */
+  planctl_target: string | null;
+  /**
+   * Parsed-out planctl epic id (`fn-575-foo`) — the parent epic of either an
+   * epic-form or task-form target. NULL when `planctl_target` is NULL or did
+   * not parse as a planctl ref. Mirrors jobctl's `audit._derive_ids` shape via
+   * {@link import("./derivers").parsePlanRef}.
+   */
+  planctl_epic_id: string | null;
+  /**
+   * Parsed-out planctl task id (`fn-575-foo.3`) — non-NULL only when the
+   * target's parsed shape is `task`. NULL on epic-form targets and on
+   * unparseable / absent targets.
+   */
+  planctl_task_id: string | null;
+  /**
+   * Read-only-verb gate: stored as INTEGER (0/1) at the SQLite layer to match
+   * the schema column, lifted to JS boolean via `=== 1` at the read boundary.
+   * `false` for verbs in the read-only allowlist (`epics`, `tasks`, `cat`,
+   * etc.); `true` for every other verb. NULL when `planctl_op` is NULL.
+   * Drives creator/refiner classification: `subject_present === false`
+   * mirrors jobctl's `subject is None` skip gate.
+   */
+  planctl_subject_present: number | null;
 }
 
 /**
@@ -130,6 +199,24 @@ export interface Job {
    * partial index plus a cheap post-seek check).
    */
   plan_ref: string | null;
+  /**
+   * Cross-references derived from this job's planctl-CLI invocations,
+   * classified against its `/plan:plan` windows. Each entry has shape
+   * `{kind: "creator" | "refiner", target: <epic_id>}` — the epic this job
+   * either CREATED (a `planctl epic-create fn-N-foo` mutation inside a
+   * `/plan:plan` window) or REFINED (any other epic-touching mutation inside
+   * a window). Coexists with the spawn-name pair (`plan_verb` / `plan_ref`):
+   * spawn name records the job's OWN planctl spawn role, while `epic_links`
+   * records the cross-references the job's planctl footprint produced.
+   *
+   * Stored as a JSON-TEXT array column and decoded to a real array at the
+   * read boundary. Sorted ASC on the `(kind, target)` tuple — total-order
+   * tiebreaker is non-negotiable for byte-identical re-fold (CLAUDE.md
+   * "byte-identical re-fold" invariant). The reducer's `syncPlanctlLinks`
+   * helper re-derives this from scratch on every triggering event via the
+   * pure `deriveEpicLinks` classifier in `src/plan-classifier.ts`.
+   */
+  epic_links: Link[];
 }
 
 /**
@@ -222,6 +309,42 @@ export interface Epic {
    * `(created_at desc, job_id asc)`.
    */
   jobs: EmbeddedJob[];
+  /**
+   * Symmetric per-epic view of {@link Job.epic_links}: every job whose
+   * planctl-CLI footprint inside a `/plan:plan` window CREATED this epic
+   * (`kind === "creator"`) or REFINED it (`kind === "refiner"`). Stored as a
+   * JSON-TEXT array column and decoded to a real array at the read boundary.
+   * Sorted ASC on the `(kind, job_id)` tuple — total-order tiebreaker.
+   *
+   * Survives an `EpicSnapshot` round-trip (the ON CONFLICT clause explicitly
+   * preserves the column alongside `jobs` / `tasks`) — without this, an
+   * approval RPC → file write → file-watcher → snapshot fold would wipe the
+   * provenance projection.
+   */
+  job_links: JobLinkEntry[];
+}
+
+/**
+ * One row of the volatile git read projection. Rows are produced by synthetic
+ * `GitSnapshot` events emitted by the git worker after polling a planctl-backed
+ * git worktree with porcelain-v2 status output. The reducer folds only the
+ * persisted snapshot payload; it never shells out or re-reads filesystem state,
+ * so a from-scratch re-fold reproduces the same observed frames.
+ */
+export interface GitStatus {
+  project_dir: string;
+  branch: string | null;
+  head_oid: string | null;
+  upstream: string | null;
+  ahead: number | null;
+  behind: number | null;
+  dirty_count: number;
+  orphaned_count: number;
+  dirty_files: unknown[];
+  orphaned_files: unknown[];
+  jobs: unknown[];
+  last_event_id: number | null;
+  updated_at: number;
 }
 
 /**
