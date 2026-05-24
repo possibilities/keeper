@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-24T11:31:21Z",
+  "depends_on": [],
+  "epic": "fn-597-fix-v12-approvals-migration-overlay",
+  "id": "fn-597-fix-v12-approvals-migration-overlay.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "snapshot v12 approvals before drop",
+  "updated_at": "2026-05-24T11:31:21Z"
+}
