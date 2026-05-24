@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-579-fix-stale-start-time-on-ups-resume",
   "bundles": [],
   "closer_done_at": "2026-05-23T17:11:58Z",

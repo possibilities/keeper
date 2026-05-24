@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "auditor_done_at": "2026-05-21T20:05:55Z",
   "branch_name": "fn-551-filter-non-jsonl-events-in-transcript",
   "closer_done_at": "2026-05-21T20:05:55Z",

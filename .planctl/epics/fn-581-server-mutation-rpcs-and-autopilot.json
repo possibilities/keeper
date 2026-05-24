@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-581-server-mutation-rpcs-and-autopilot",
   "bundles": [
     "sketch/autopilot-epic-blocks-with-approvals"

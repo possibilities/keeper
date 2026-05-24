@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [
     "sketch/autopilot-flat-task-list"
   ],

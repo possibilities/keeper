@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-597-fix-v12-approvals-migration-overlay",
   "bundles": [],
   "closer_done_at": "2026-05-24T16:28:07Z",
