@@ -4,12 +4,13 @@
  * server (`src/server-worker.ts`). It renders a *page of epics as a frame* and
  * reprints a fresh frame every time the visible projection changes.
  *
- * It `query`s a 10-row page of `epics` and renders it as a YAML stream: each
- * frame is a YAML document (leading `---`) listing every epic as a mapping
- * block whose `epic:` key carries the collapsed epic line
- * (`{basename(project_dir)} #{epic_number} {title}{deps} [{status}]`) and whose
- * `tasks:` key carries the embedded tasks as a nested block sequence
- * (`{task_number}) {title}{dep} [{status}]`). The query optionally carries a
+ * It `query`s a 10-row page of `epics` and renders it as a stream of simple
+ * text blocks. Each frame is a `---`-led document; each epic is one block of
+ * plain lines — an epic header `{basename(project_dir)} {epic_number} {title}
+ * {deps} [{status}]` followed by one indented task line per embedded task,
+ * `{task_number}. {title}{dep} [{status}]` (leading space for indent). Blocks
+ * are separated by a single blank line. No YAML quoting or mapping syntax —
+ * just the same characters a human would type. The query optionally carries a
  * server-side `status` filter built from `--status` / `--status-ne` (the
  * bare-value equality form and the `{ ne }` operator form, respectively).
  * Default (no flag): send NO `filter` key so the server's default scope applies
@@ -48,11 +49,11 @@
  * therefore RETRIES connecting (capped backoff) until keeperd is up and
  * accepting, and on a dropped connection (e.g. a keeperd restart) it RECONNECTS
  * the same way instead of exiting. Every connection-lifecycle transition prints
- * a `...`-fenced YAML note (`event: connecting|connected|waiting|disconnected`,
- * the initial connection included) — the same out-of-band "meta message"
- * channel as the sidecar note, distinct from the server's `meta` staleness
- * frame. Only Ctrl-C (SIGINT) or a terminal query error (`bad_frame` /
- * `unknown_collection` on our own `query`, which a reconnect can't fix) exits.
+ * a `...`-fenced note (`event: connecting|connected|waiting|disconnected`, the
+ * initial connection included) — the same out-of-band "meta message" channel as
+ * the sidecar note, distinct from the server's `meta` staleness frame. Only
+ * Ctrl-C (SIGINT) or a terminal query error (`bad_frame` / `unknown_collection`
+ * on our own `query`, which a reconnect can't fix) exits.
  *
  * It reuses `src/protocol.ts` (`encodeFrame` to write, `LineBuffer` to
  * de-frame) and `resolveSockPath()` so it stays a faithful mirror of the
@@ -115,15 +116,14 @@ Usage: bun scripts/epics.ts [--sock <path>] [--status <s> | --status-ne <s>]
                    only OPEN epics; pass a flag to see other statuses)
   --help           Show this help
 
-Renders a 10-row page of epics as a YAML stream: one frame per change, each
-frame a YAML document (--- separated). The render is a sequence of epic:/tasks:
-mapping blocks, where each epic line is
-  {basename(project_dir)} #{epic_number} {title} (deps #A, #B) [{status}]
-and its embedded tasks list under tasks: as
-  {task_number}) {title} (dep #N) [{status}]
-The (deps …) segment lists the epic numbers an epic depends on; the (dep #N)
-segment names only the highest task a task depends on. Both are omitted when
-there are no dependencies.
+Renders a 10-row page of epics as a stream of simple text blocks: one frame
+per change, each frame led by '---'. Each epic is one block — a header line
+  {basename(project_dir)} {epic_number} {title} (deps #A, #B) [{status}]
+followed by one indented task line per embedded task,
+   {task_number}. {title} (dep #N) [{status}]
+Blocks are separated by a single blank line. The (deps …) segment lists the
+epic numbers an epic depends on; the (dep #N) segment names only the highest
+task a task depends on. Both are omitted when there are no dependencies.
 
 The page is refetched on every change signal and on a steady poll, so it always
 shows the current top-N; a new frame prints only when the rendered output
@@ -263,88 +263,62 @@ async function main(): Promise<void> {
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
   /**
-   * Collapse one full row to its display string:
-   * `{basename(project_dir)} #{epic_number} {title}{deps} [{status}]`. A
-   * null/absent segment projects to empty (no basename of nothing). `{deps}`
-   * is a ` (deps #3, #5)` segment from `depends_on_epics` (the epic numbers it
-   * depends on), omitted when there are none. The epic line drops the task
-   * count — the embedded tasks render as their own nested sequence (see
-   * `projectTask` / `renderBody`). Together with `projectTask`, this defines
-   * which column moves can reframe the page (see `emitFrameIfChanged`).
+   * Render one epic as a small text block:
+   *   {basename(project_dir)} {epic_number} {title}{deps} [{status}]
+   *   {task_number}. {title}{dep} [{status}]
+   *   {task_number}. {title}{dep} [{status}]
+   * `{deps}` is ` (deps #3, #5)` from `depends_on_epics` (omitted when empty);
+   * `{dep}` is ` (dep #N)` naming the HIGHEST task a task depends on (omitted
+   * when empty). A non-array `tasks` cell renders as no task lines. Together
+   * these two projections define which column moves can reframe the page —
+   * read alongside `emitFrameIfChanged`.
    */
-  function projectRow(row: Record<string, unknown>): string {
-    const title = seg(row.title);
+  function renderEpicBlock(row: Record<string, unknown>): string {
     const dir =
       row.project_dir == null ? "" : basename(String(row.project_dir));
-    const deps = Array.isArray(row.depends_on_epics)
+    const epicDeps = Array.isArray(row.depends_on_epics)
       ? row.depends_on_epics
       : [];
     const depsSeg =
-      deps.length === 0
+      epicDeps.length === 0
         ? ""
-        : ` (deps ${deps
+        : ` (deps ${epicDeps
             .map((d) => {
               const n = epicNumFromId(String(d));
               return n == null ? String(d) : `#${n}`;
             })
             .join(", ")})`;
-    return `${dir} #${seg(row.epic_number)} ${title}${depsSeg} [${seg(row.status)}]`;
-  }
-
-  /**
-   * Collapse one embedded epic task to its display string:
-   * `{task_number}) {title}{dep} [{status}]`. A null/absent segment projects to
-   * empty. `{dep}` is a ` (dep #N)` segment naming the HIGHEST task it depends
-   * on (max `depends_on` task number) — only the highest is shown even when it
-   * depends on several — omitted when there are none. The task's `target_repo`
-   * is omitted — it's redundant with the parent epic's `project_dir` already
-   * shown on the epic line. Read alongside `projectRow` so a task
-   * title/status/dep/membership move surfaces in the frame and reframes.
-   */
-  function projectTask(task: Record<string, unknown>): string {
-    const deps = Array.isArray(task.depends_on) ? task.depends_on : [];
-    const nums = deps
-      .map((d) => taskNumFromId(String(d)))
-      .filter((n): n is number => n != null);
-    const depSeg = nums.length === 0 ? "" : ` (dep #${Math.max(...nums)})`;
-    return `${seg(task.task_number)}) ${seg(task.title)}${depSeg} [${seg(task.status)}]`;
-  }
-
-  /**
-   * Render one epic as a YAML mapping block: the collapsed epic line under an
-   * `epic:` key, then its embedded tasks as a nested block sequence under
-   * `tasks:` (or `tasks: []` when empty). `tasks` is a decoded array on the wire
-   * (see `decodeRow`); a non-array (malformed) cell renders as no tasks.
-   */
-  function renderEpicItem(row: Record<string, unknown>): string {
-    const lines = [`- epic: ${yamlScalar(projectRow(row))}`];
+    const lines: string[] = [
+      `${dir} ${seg(row.epic_number)} ${seg(row.title)}${depsSeg} [${seg(row.status)}]`,
+    ];
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
-    if (tasks.length === 0) {
-      lines.push("  tasks: []");
-    } else {
-      lines.push("  tasks:");
-      for (const task of tasks) {
-        lines.push(
-          `    - ${yamlScalar(projectTask(task as Record<string, unknown>))}`,
-        );
-      }
+    for (const task of tasks) {
+      const t = task as Record<string, unknown>;
+      const tdeps = Array.isArray(t.depends_on) ? t.depends_on : [];
+      const tnums = tdeps
+        .map((d) => taskNumFromId(String(d)))
+        .filter((n): n is number => n != null);
+      const depSeg = tnums.length === 0 ? "" : ` (dep #${Math.max(...tnums)})`;
+      lines.push(
+        ` ${seg(t.task_number)}. ${seg(t.title)}${depSeg} [${seg(t.status)}]`,
+      );
     }
     return lines.join("\n");
   }
 
   /**
-   * Project the frozen page into a YAML document body (no leading `---`), in
-   * server-sent order. Renders as a sequence of `epic:`/`tasks:` mapping blocks
-   * (see `renderEpicItem`) so each epic's embedded tasks are listed. Strings
-   * carrying `·` auto-single-quote through `yamlScalar`.
+   * Project the frozen page into the rendered body (no leading `---`), in
+   * server-sent order. Renders as one `renderEpicBlock` per epic, blocks
+   * separated by a single blank line so the eye can pick one epic from the
+   * next.
    */
   function renderBody(): string {
     if (order.length === 0) {
-      return "[]"; // empty page → an empty YAML sequence
+      return "(no epics)";
     }
     return order
-      .map((id) => renderEpicItem(byId.get(id) ?? { [pk]: id }))
-      .join("\n");
+      .map((id) => renderEpicBlock(byId.get(id) ?? { [pk]: id }))
+      .join("\n\n");
   }
 
   // Per-frame sidecar files: the latest emitted frame is mirrored to /tmp so it
