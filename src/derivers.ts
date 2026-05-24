@@ -410,7 +410,7 @@ export function extractPlanctlInvocation(
   }
   // biome-ignore lint/style/noNonNullAssertion: regex match guarantees group 1
   const op = m[1]!;
-  let target = m[2] ?? null;
+  let target: string | null = m[2] ?? null;
   if (target !== null) {
     // Strip a single pair of surrounding quotes (either kind).
     if (
@@ -420,9 +420,9 @@ export function extractPlanctlInvocation(
     ) {
       target = target.slice(1, -1);
     }
-    if (target.length === 0) {
-      target = null;
-    }
+  }
+  if (target === "") {
+    target = null;
   }
   const parsed = target !== null ? parsePlanRef(target) : null;
   const epic_id = parsed?.epic_id ?? null;
