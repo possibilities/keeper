@@ -1,33 +1,47 @@
 #!/usr/bin/env bun
 /**
- * approve — thin RPC client over the keeper subscribe socket. Routes to
- * one of two planctl-native approval RPCs based on positional arity and
- * exits. The single-shot connection / framing / id-correlation pattern
- * is the template for future single-shot CLIs.
+ * approve — thin RPC client over the keeper subscribe socket. Takes a single
+ * planctl id, infers whether it names an epic or a task from its shape, and
+ * sends the matching approval RPC. Status defaults to `approved` so the
+ * common case is a one-arg invocation.
  *
  * Unlike the example `scripts/epics.ts` / `scripts/jobs.ts` clients, this
- * CLI is short-lived and read/write-mixed:
- * it opens one `Bun.connect`, sends ONE `rpc` frame, awaits the matching
- * `rpc_result` or `error` by `id`, prints the result, and exits. No
- * subscription, no poll, no reconnect — if the daemon is down, the
- * `Bun.connect` rejects (typically ECONNREFUSED) and the CLI fails fast
- * (`exit 1`). A user-visible "daemon not running" message is more useful
- * than a backoff loop for a one-shot mutation.
+ * CLI is short-lived and read/write-mixed: each round-trip opens a fresh
+ * `Bun.connect`, sends ONE frame, awaits the matching response by `id`,
+ * and closes. No subscription, no poll, no reconnect — if the daemon is
+ * down, `Bun.connect` rejects (typically ECONNREFUSED) and the CLI fails
+ * fast (`exit 1`). A user-visible "daemon not running" message is more
+ * useful than a backoff loop for a one-shot mutation.
  *
- * Routing.
+ * Id inference. A planctl task id is `<epic-slug>.<task_number>` (e.g.
+ * `fn-592-approval-as-planctl-field.4`); an epic id has no trailing `.N`.
+ * `approve` looks for a trailing dot-then-integer:
  *
- *   bun scripts/approve.ts <epic_id> <status>
- *     → set_epic_approval { epic_id, status }
+ *   bun scripts/approve.ts <task_id> [status]
+ *     → set_task_approval { epic_id: <derived>, task_id: <task_id>, status }
  *
- *   bun scripts/approve.ts <epic_id> <task_id> <status>
- *     → set_task_approval { epic_id, task_id, status }
+ *   bun scripts/approve.ts <epic_id> [status]
+ *     → set_epic_approval { epic_id: <epic_id>, status }
  *
- * The status vocabulary is `approved | rejected | pending` (hard cut from
- * the schema-v12 verbs; no `clear` alias). `pending` writes "pending" to
- * the planctl JSON file — the file is the canonical source of truth and
- * carries the value verbatim. There is no DELETE path; "absent row =
- * pending" is no longer the invariant (schema v13 — see the epic
- * `fn-592-approval-as-planctl-field`).
+ * `<status>` defaults to `approved` when omitted. The full vocabulary is
+ * `approved | rejected | pending` (hard cut from the schema-v12 verbs; no
+ * `clear` alias). `pending` writes "pending" to the planctl JSON file —
+ * the file is the canonical source of truth and carries the value
+ * verbatim. There is no DELETE path; "absent row = pending" is no longer
+ * the invariant (schema v13 — see the epic `fn-592-approval-as-planctl-field`).
+ *
+ * Epic-approval pre-check. When approving an EPIC (status === "approved"
+ * AND the id is an epic id), the CLI first does a pk-lookup `query` on
+ * the target epic, decodes the embedded `tasks[]` array, and refuses with
+ * exit 1 if any task has `approval !== "approved"`. This is a CLIENT-SIDE
+ * gate, not a server enforcement — the underlying `set_epic_approval` RPC
+ * still accepts the write. The check rides this CLI because the rule is
+ * "no green epic over a yellow task list", a UX invariant of this tool
+ * rather than a planctl-file invariant. Skipped when targeting a task or
+ * when setting an epic to `rejected` / `pending` (which are always
+ * allowed). The query uses `filter: { epic_id }` (a pk lookup) which the
+ * server exempts from the descriptor's default scope, so the check works
+ * even when the epic is itself already done+approved.
  *
  * Wire round-trip (mirrors `RpcFrame` / `RpcResultFrame` / `ErrorFrame` in
  * `src/protocol.ts`):
@@ -36,18 +50,17 @@
  *   server → client: { type: "rpc_result", id, rev, value }   on success
  *                  | { type: "error",      id, rev, code, message }  on failure
  *
- * The `id` is a fresh `crypto.randomUUID()` per invocation — a single-shot
- * client doesn't multiplex, but echoing the id on the response is part of
+ * Each round-trip's `id` is a fresh `crypto.randomUUID()` — neither
+ * connection multiplexes, but echoing the id on the response is part of
  * the protocol contract and the dispatcher's defensive checks rely on it.
  *
  * Usage:
- *   bun scripts/approve.ts [--sock <path>] <epic_id> <status>
- *   bun scripts/approve.ts [--sock <path>] <epic_id> <task_id> <status>
+ *   bun scripts/approve.ts [--sock <path>] <id> [status]
  *
- *   <epic_id>    Planctl epic id (e.g. `fn-592-approval-as-planctl-field`).
- *   <task_id>    Planctl task id (e.g. `fn-592-approval-as-planctl-field.4`).
- *                Optional — pass to target a task, omit to target the epic.
- *   <status>     One of: approved, rejected, pending.
+ *   <id>         Planctl epic OR task id. A trailing `.N` marks a task
+ *                (the epic_id is derived by stripping the suffix).
+ *   <status>     Optional. One of: approved, rejected, pending.
+ *                Defaults to `approved`.
  *
  *   --sock <path>  Socket path override (else $KEEPER_SOCK, else the
  *                  ~/.local/state/keeper/keeperd.sock default).
@@ -57,13 +70,19 @@
  *   0 — `rpc_result` arrived; the handler's return value is printed to
  *       stdout as a single line of JSON.
  *   1 — the daemon is down (connect failed), the server returned `error`,
- *       the response frame never arrived before the deadline, or the
- *       arguments are malformed. The human-readable reason goes to stderr.
+ *       the response frame never arrived before the deadline, the
+ *       arguments are malformed, or the epic-approval pre-check found
+ *       unapproved tasks. The human-readable reason goes to stderr.
  */
 
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
-import { encodeFrame, LineBuffer, type ServerFrame } from "../src/protocol";
+import {
+  type ClientFrame,
+  encodeFrame,
+  LineBuffer,
+  type ServerFrame,
+} from "../src/protocol";
 
 /**
  * Hard upper bound on how long the CLI waits for the `rpc_result` /
@@ -79,28 +98,35 @@ const APPROVAL_STATUSES = new Set(["approved", "rejected", "pending"]);
 
 const HELP = `approve — thin RPC client for the keeper subscribe server's planctl-native approval RPCs
 
-Usage: bun scripts/approve.ts [--sock <path>] <epic_id> <status>
-       bun scripts/approve.ts [--sock <path>] <epic_id> <task_id> <status>
+Usage: bun scripts/approve.ts [--sock <path>] <id> [status]
 
-  <epic_id>      Planctl epic id
-  <task_id>      Planctl task id (optional — omit to target the epic)
-  <status>       One of: approved, rejected, pending
+  <id>           Planctl epic OR task id. A trailing '.N' marks a task; the
+                 epic_id is derived by stripping the '.N' suffix.
+  <status>       Optional. One of: approved, rejected, pending.
+                 Defaults to 'approved'.
 
   --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)
   --help         Show this help
 
-Routing:
-  2 positionals (<epic_id> <status>)            → set_epic_approval
-  3 positionals (<epic_id> <task_id> <status>)  → set_task_approval
+Routing (inferred from <id>):
+  <epic-slug>        → set_epic_approval { epic_id, status }
+  <epic-slug>.<N>    → set_task_approval { epic_id, task_id, status }
+
+Epic-approval pre-check:
+  When the inferred call is set_epic_approval AND status == 'approved',
+  the CLI first queries the epic and refuses (exit 1) if any embedded
+  task has approval != 'approved'. Setting an epic to 'rejected' or
+  'pending', or targeting a task, skips this check.
 
 Examples:
-  bun scripts/approve.ts fn-592-approval-as-planctl-field approved
-  bun scripts/approve.ts fn-592-approval-as-planctl-field fn-592-approval-as-planctl-field.4 rejected
-  bun scripts/approve.ts fn-592-approval-as-planctl-field pending
+  bun scripts/approve.ts fn-592-approval-as-planctl-field
+  bun scripts/approve.ts fn-592-approval-as-planctl-field.4
+  bun scripts/approve.ts fn-592-approval-as-planctl-field rejected
+  bun scripts/approve.ts fn-592-approval-as-planctl-field.4 pending
 
 On success: prints the handler's return value as a single JSON line to
 stdout and exits 0. On failure (daemon down, validation error, unknown
-method, timeout): prints the reason to stderr and exits 1.
+method, timeout, pre-check fail): prints the reason to stderr and exits 1.
 `;
 
 function die(message: string): never {
@@ -120,41 +146,208 @@ function validateStatus(value: string): "approved" | "rejected" | "pending" {
 }
 
 /**
- * Decide which RPC to call from positional arity, validate args, and
- * return the wire payload. Two positionals → `set_epic_approval`; three →
- * `set_task_approval`. Anything else exits 1 with usage guidance.
+ * Decide which RPC to call from positional args, validate them, and return
+ * the wire payload. Positionals are `<id> [status]` — when `status` is
+ * omitted it defaults to `approved`. The id's shape decides the route:
+ * a trailing `.<digits>` segment names a task (the epic_id is derived by
+ * stripping the suffix); anything else is treated as an epic id.
+ *
+ * The task-id regex mirrors `taskNumFromId` in `scripts/epics.ts` and
+ * `epicNumberFromId` in the daemon — a planctl task id is the epic slug,
+ * a dot, then an integer; no other structure carries the same suffix
+ * shape in the wire vocabulary, so this is unambiguous.
  */
 function routePositionals(positionals: string[]): {
   method: "set_epic_approval" | "set_task_approval";
   params: Record<string, string>;
 } {
-  if (positionals.length === 2) {
-    const [epic_id, statusRaw] = positionals as [string, string];
-    if (epic_id.length === 0) {
-      die("epic_id must be non-empty");
-    }
-    return {
-      method: "set_epic_approval",
-      params: { epic_id, status: validateStatus(statusRaw) },
-    };
+  if (positionals.length < 1 || positionals.length > 2) {
+    die(
+      `expected 1 (<id>) or 2 (<id> <status>) positional args; got ${positionals.length}. Pass --help for usage.`,
+    );
   }
-  if (positionals.length === 3) {
-    const [epic_id, task_id, statusRaw] = positionals as [
-      string,
-      string,
-      string,
-    ];
-    if (epic_id.length === 0 || task_id.length === 0) {
-      die("epic_id and task_id must be non-empty");
-    }
+  const [id, statusRaw] = positionals as [string, string | undefined];
+  if (id.length === 0) {
+    die("id must be non-empty");
+  }
+  const status = validateStatus(statusRaw ?? "approved");
+  const taskMatch = /^(.+)\.\d+$/.exec(id);
+  if (taskMatch) {
     return {
       method: "set_task_approval",
-      params: { epic_id, task_id, status: validateStatus(statusRaw) },
+      params: { epic_id: taskMatch[1], task_id: id, status },
     };
   }
-  die(
-    `expected 2 (<epic_id> <status>) or 3 (<epic_id> <task_id> <status>) positional args; got ${positionals.length}. Pass --help for usage.`,
-  );
+  return {
+    method: "set_epic_approval",
+    params: { epic_id: id, status },
+  };
+}
+
+/**
+ * One round-trip on a fresh UDS connection: open, write `send`, wait for the
+ * server frame whose `id === matchId`, return it. Connection-local
+ * `LineBuffer` so a partial line never crosses round-trips. Resolves with
+ * the matching frame; rejects with an `Error` carrying the human-readable
+ * reason on connect-fail, transport error, malformed frame, server-side
+ * close before reply, or `RESPONSE_TIMEOUT_MS` elapsing post-connect.
+ *
+ * The `id`-correlation guard is defensive — the dispatcher today never
+ * leaks unrelated frames into an RPC's reply path, but the sibling
+ * subscribe path can interleave `patch`/`meta` and the discipline keeps
+ * this helper safe to lift if reused.
+ */
+async function roundTrip(
+  sockPath: string,
+  send: ClientFrame,
+  matchId: string,
+): Promise<ServerFrame> {
+  return new Promise<ServerFrame>((resolve, reject) => {
+    const buffer = new LineBuffer();
+    let settled = false;
+    let sock: Awaited<ReturnType<typeof Bun.connect>> | null = null;
+
+    const settle = (err: Error | null, frame: ServerFrame | null): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        sock?.end();
+      } catch {
+        // best-effort
+      }
+      if (err) {
+        reject(err);
+      } else if (frame) {
+        resolve(frame);
+      } else {
+        reject(new Error("internal: settle called with neither err nor frame"));
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      settle(
+        new Error(
+          `no response from daemon within ${RESPONSE_TIMEOUT_MS}ms (id ${matchId})`,
+        ),
+        null,
+      );
+    }, RESPONSE_TIMEOUT_MS);
+    timeout.unref?.();
+
+    Bun.connect({
+      unix: sockPath,
+      socket: {
+        open(s) {
+          sock = s;
+          s.write(encodeFrame(send));
+        },
+        data(_s, chunk) {
+          let lines: string[];
+          try {
+            lines = buffer.push(chunk.toString("utf8"));
+          } catch (err) {
+            settle(
+              new Error(`protocol error: ${(err as Error).message}`),
+              null,
+            );
+            return;
+          }
+          for (const line of lines) {
+            if (line.trim().length === 0) {
+              continue;
+            }
+            let frame: ServerFrame;
+            try {
+              frame = JSON.parse(line) as ServerFrame;
+            } catch (err) {
+              settle(
+                new Error(`malformed server frame: ${(err as Error).message}`),
+                null,
+              );
+              return;
+            }
+            if ((frame as { id?: string }).id !== matchId) {
+              continue;
+            }
+            settle(null, frame);
+            return;
+          }
+        },
+        close() {
+          settle(
+            new Error(
+              `daemon closed connection before responding (id ${matchId})`,
+            ),
+            null,
+          );
+        },
+        error(_s, err) {
+          settle(new Error(`socket error: ${err.message}`), null);
+        },
+      },
+    }).catch((err: Error) => {
+      settle(new Error(`failed to connect to ${sockPath}: ${err.message}`), null);
+    });
+  });
+}
+
+/**
+ * Epic-approval pre-check. Sends a pk-lookup `query` for the target epic
+ * (pk filter bypasses the server's default scope, so the epic is fetched
+ * regardless of its own status/approval), decodes the embedded `tasks[]`
+ * array, and dies with exit 1 if any task has `approval !== "approved"`.
+ * A task with no `approval` cell counts as not-approved per the file-is-
+ * canonical invariant (the planctl `approval` field is required schema v13).
+ *
+ * Why client-side: the rule "an epic can't be green over a yellow task
+ * list" is a UX invariant of THIS CLI, not a planctl-file invariant. The
+ * underlying `set_epic_approval` RPC still accepts the write — other
+ * callers may need to override the rule (e.g. a scripted bulk close).
+ */
+async function preCheckEpicApproval(
+  sockPath: string,
+  epicId: string,
+): Promise<void> {
+  const queryId = crypto.randomUUID();
+  let frame: ServerFrame;
+  try {
+    frame = await roundTrip(
+      sockPath,
+      {
+        type: "query",
+        collection: "epics",
+        id: queryId,
+        filter: { epic_id: epicId },
+        limit: 1,
+      },
+      queryId,
+    );
+  } catch (err) {
+    die((err as Error).message);
+  }
+  if (frame.type === "error") {
+    die(`server error ${frame.code}: ${frame.message}`);
+  }
+  if (frame.type !== "result") {
+    die(`unexpected frame type for pre-check: ${frame.type}`);
+  }
+  if (frame.rows.length === 0) {
+    die(`epic '${epicId}' not found`);
+  }
+  const row = frame.rows[0] as Record<string, unknown>;
+  const tasks = Array.isArray(row.tasks) ? row.tasks : [];
+  const unapproved = tasks
+    .map((t) => t as Record<string, unknown>)
+    .filter((t) => t.approval !== "approved")
+    .map((t) => `${String(t.task_id)}=${String(t.approval ?? "pending")}`);
+  if (unapproved.length > 0) {
+    die(
+      `cannot approve epic '${epicId}': ${unapproved.length} task(s) not approved: ${unapproved.join(", ")}`,
+    );
+  }
 }
 
 async function main(): Promise<void> {
@@ -173,175 +366,39 @@ async function main(): Promise<void> {
   }
 
   const { method, params } = routePositionals(parsed.positionals);
-
   const sockPath = parsed.values.sock ?? resolveSockPath();
-  // One fresh id per invocation. The CLI is single-shot — it never
-  // multiplexes — but the protocol requires a non-empty string id, and the
+
+  // Pre-check: only when approving an EPIC. Task-targeted RPCs and
+  // status-to-rejected/pending epic RPCs skip this step.
+  if (method === "set_epic_approval" && params.status === "approved") {
+    await preCheckEpicApproval(sockPath, params.epic_id);
+  }
+
+  // One fresh id per round-trip. The CLI never multiplexes within a
+  // connection, but the protocol requires a non-empty string id and the
   // dispatcher echoes it back so we can match the response defensively.
   const rpcId = crypto.randomUUID();
-
-  // The frame buffer + response sink are connection-scoped — a partial line
-  // from a torn connection must never bleed into a follow-up read (which we
-  // never do here, but the discipline matches sibling clients).
-  const buffer = new LineBuffer();
-  let resolved = false;
-  let exitCode = 1;
-  let stdoutPayload: string | null = null;
-
-  // The single round-trip is modeled as a Promise the connect handlers settle.
-  // `done` resolves on EITHER the matching response OR a transport error OR a
-  // timeout — never both, and never after `resolved` flips.
-  const done = new Promise<void>((resolve) => {
-    const finish = (
-      code: number,
-      out: { stdout?: string; stderr?: string },
-    ): void => {
-      if (resolved) {
-        return;
-      }
-      resolved = true;
-      exitCode = code;
-      if (out.stdout) {
-        stdoutPayload = out.stdout;
-      }
-      if (out.stderr) {
-        process.stderr.write(out.stderr);
-      }
-      resolve();
-    };
-
-    // Hard ceiling on "we connected, but no response came". 5s is generous
-    // for a local UDS round-trip; a wedged server is more useful as an
-    // error message than a hang.
-    const timeout = setTimeout(() => {
-      finish(1, {
-        stderr: `no response from daemon within ${RESPONSE_TIMEOUT_MS}ms (id ${rpcId})\n`,
-      });
-      try {
-        sock?.end();
-      } catch {
-        // best-effort
-      }
-    }, RESPONSE_TIMEOUT_MS);
-    timeout.unref?.();
-
-    let sock: Awaited<ReturnType<typeof Bun.connect>> | null = null;
-
-    Bun.connect({
-      unix: sockPath,
-      socket: {
-        open(s) {
-          sock = s;
-          // One frame, one wait. Send and let `data` handle the response.
-          s.write(
-            encodeFrame({
-              type: "rpc",
-              id: rpcId,
-              method,
-              params,
-            }),
-          );
-        },
-        data(_s, chunk) {
-          let lines: string[];
-          try {
-            lines = buffer.push(chunk.toString("utf8"));
-          } catch (err) {
-            finish(1, {
-              stderr: `protocol error: ${(err as Error).message}\n`,
-            });
-            return;
-          }
-          for (const line of lines) {
-            if (line.trim().length === 0) {
-              continue;
-            }
-            let frame: ServerFrame;
-            try {
-              frame = JSON.parse(line) as ServerFrame;
-            } catch (err) {
-              finish(1, {
-                stderr: `malformed server frame: ${(err as Error).message}\n`,
-              });
-              return;
-            }
-            // Only the matching response settles this. A stray frame (the
-            // server today never sends one without `id`-correlation in the
-            // RPC path, but stay defensive) is ignored. Errors and results
-            // both carry our `id`; mismatched ids are protocol violations.
-            const fid = (frame as { id?: string }).id;
-            if (fid !== rpcId) {
-              continue;
-            }
-            if (frame.type === "rpc_result") {
-              // Print the handler's `value` — for set_epic_approval that's
-              // `{ ok: true, epic_id, approval }`, for set_task_approval
-              // it's `{ ok: true, epic_id, task_id, approval }`. One JSON
-              // line so a caller pipes it cleanly into `jq` or another
-              // consumer.
-              finish(0, { stdout: `${JSON.stringify(frame.value)}\n` });
-              clearTimeout(timeout);
-              try {
-                _s.end();
-              } catch {
-                // best-effort
-              }
-              return;
-            }
-            if (frame.type === "error") {
-              finish(1, {
-                stderr: `server error ${frame.code}: ${frame.message}\n`,
-              });
-              clearTimeout(timeout);
-              try {
-                _s.end();
-              } catch {
-                // best-effort
-              }
-              return;
-            }
-            // Any other frame type for our id is a server bug; surface it.
-            finish(1, {
-              stderr: `unexpected frame type for id ${rpcId}: ${frame.type}\n`,
-            });
-            clearTimeout(timeout);
-            try {
-              _s.end();
-            } catch {
-              // best-effort
-            }
-            return;
-          }
-        },
-        close() {
-          // The server closed before we got a matching response (or after, in
-          // which case `resolved` is already true and `finish` is a no-op).
-          finish(1, {
-            stderr: `daemon closed connection before responding (id ${rpcId})\n`,
-          });
-          clearTimeout(timeout);
-        },
-        error(_s, err) {
-          finish(1, { stderr: `socket error: ${err.message}\n` });
-          clearTimeout(timeout);
-        },
-      },
-    }).catch((err: Error) => {
-      // Bun.connect rejection — the most common path is "daemon not up"
-      // (ECONNREFUSED on the UDS path, or ENOENT on a missing socket file).
-      // Either way: fail fast with a clear stderr message.
-      finish(1, {
-        stderr: `failed to connect to ${sockPath}: ${err.message}\n`,
-      });
-      clearTimeout(timeout);
-    });
-  });
-
-  await done;
-  if (stdoutPayload !== null) {
-    process.stdout.write(stdoutPayload);
+  let frame: ServerFrame;
+  try {
+    frame = await roundTrip(
+      sockPath,
+      { type: "rpc", id: rpcId, method, params },
+      rpcId,
+    );
+  } catch (err) {
+    die((err as Error).message);
   }
-  process.exit(exitCode);
+  if (frame.type === "rpc_result") {
+    // For set_epic_approval the value is `{ ok: true, epic_id, approval }`;
+    // for set_task_approval it's `{ ok: true, epic_id, task_id, approval }`.
+    // One JSON line so a caller pipes it cleanly into `jq`.
+    process.stdout.write(`${JSON.stringify(frame.value)}\n`);
+    process.exit(0);
+  }
+  if (frame.type === "error") {
+    die(`server error ${frame.code}: ${frame.message}`);
+  }
+  die(`unexpected frame type for id ${rpcId}: ${frame.type}`);
 }
 
 await main();
