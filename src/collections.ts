@@ -174,6 +174,12 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "depends_on_epics",
     "jobs",
     "job_links",
+    // `last_validated_at` (schema v16) — plain nullable TEXT (ISO-8601 when
+    // set). Served verbatim on `result`/`patch`; out of `sortable` /
+    // `filters` (display-only this phase) and out of `jsonColumns` (a
+    // scalar string, NOT JSON — decoding it would fall back to `[]` and
+    // corrupt the wire value).
+    "last_validated_at",
   ],
   pk: "epic_id",
   version: "last_event_id",

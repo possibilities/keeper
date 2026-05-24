@@ -117,6 +117,8 @@ test("buildEpicMessage maps primary_repo → projectDir, parses number", () => {
     // files written by old planctl that predate the field).
     approval: "pending",
     dependsOnEpics: [],
+    // Missing `last_validated_at` (schema v16) collapses to null via asString.
+    lastValidatedAt: null,
   });
   expect(buildEpicMessage({})).toBeNull();
 });
@@ -257,6 +259,7 @@ test("onChange emits an epic snapshot then change-gates an identical re-scan", (
       status: "open",
       approval: "pending",
       dependsOnEpics: [],
+      lastValidatedAt: null,
     },
   ]);
 
@@ -707,6 +710,116 @@ test("seedFromDb reconstructs approval field-identically (no synthetic re-emit o
   scanner.onChange(join(planctlDir("epics"), "fn-3-demo.json"));
   expect(emitted.length).toBe(1);
   expect((emitted[0] as { approval: string }).approval).toBe("rejected");
+});
+
+test("seedFromDb reconstructs last_validated_at field-identically (no synthetic re-emit on boot, schema v16)", () => {
+  // The boot trap: if the seed reconstruction doesn't place `lastValidatedAt`
+  // in the SAME object-literal slot as buildEpicMessage (or coerces it
+  // differently), the change-gate fires on every plan file on every boot —
+  // one synthetic EpicSnapshot per epic, forever. This test pins the
+  // byte-identity invariant by serializing BOTH sides and demanding match.
+  //
+  // Two epics cover both branches:
+  //   (a) a stored last_validated_at TEXT → reconstructed string passes through
+  //   (b) NULL stored → reconstructed `null` matches a file that omits the field
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  db.run(
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, last_event_id, updated_at, tasks, last_validated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "fn-1-val",
+      1,
+      "Demo",
+      "/repo",
+      "open",
+      "pending",
+      1,
+      0,
+      "[]",
+      "2026-05-24T00:00:00Z",
+      "fn-2-val",
+      2,
+      "Demo",
+      "/repo",
+      "open",
+      "pending",
+      1,
+      0,
+      "[]",
+      null,
+    ],
+  );
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+  db.close();
+
+  // (a) Stored validated → on-disk file carries the same value → no re-emit.
+  scanner.onChange(
+    writeEpic("fn-1-val", {
+      title: "Demo",
+      status: "open",
+      primary_repo: "/repo",
+      last_validated_at: "2026-05-24T00:00:00Z",
+    }),
+  );
+  // (b) Stored NULL → on-disk file omits the field → asString(undefined)===null
+  // matches the NULL seed → no re-emit.
+  scanner.onChange(
+    writeEpic("fn-2-val", {
+      title: "Demo",
+      status: "open",
+      primary_repo: "/repo",
+    }),
+  );
+  expect(emitted).toEqual([]);
+
+  // Direct byte-for-byte: a fresh buildEpicMessage for the same RawEpic data
+  // serializes to the SAME bytes the seed would reconstruct from the DB
+  // row. Mismatched object-literal slot position would diverge here.
+  const fromBuild = buildEpicMessage({
+    id: "fn-1-val",
+    title: "Demo",
+    status: "open",
+    primary_repo: "/repo",
+    approval: "pending",
+    last_validated_at: "2026-05-24T00:00:00Z",
+  });
+  const fromSeed = {
+    kind: "plan-epic" as const,
+    id: "fn-1-val",
+    number: 1,
+    title: "Demo",
+    projectDir: "/repo",
+    status: "open",
+    approval: "pending" as const,
+    dependsOnEpics: [],
+    lastValidatedAt: "2026-05-24T00:00:00Z",
+  };
+  expect(JSON.stringify(fromBuild)).toBe(JSON.stringify(fromSeed));
+
+  // A real change to last_validated_at DOES re-emit (proves the seed didn't
+  // blanket-suppress — the change-gate is keyed on the field).
+  writeFileSync(
+    join(planctlDir("epics"), "fn-1-val.json"),
+    JSON.stringify({
+      id: "fn-1-val",
+      title: "Demo",
+      status: "open",
+      primary_repo: "/repo",
+      last_validated_at: "2026-05-25T00:00:00Z",
+    }),
+  );
+  scanner.onChange(join(planctlDir("epics"), "fn-1-val.json"));
+  expect(emitted.length).toBe(1);
+  expect((emitted[0] as { lastValidatedAt: string }).lastValidatedAt).toBe(
+    "2026-05-25T00:00:00Z",
+  );
 });
 
 // ---------------------------------------------------------------------------

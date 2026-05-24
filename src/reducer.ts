@@ -319,6 +319,13 @@ interface PlanSnapshot {
   depends_on_epics?: string[] | null;
   /** Task-level deps (TaskSnapshot blob) — the planctl `depends_on` task ids. */
   depends_on?: string[] | null;
+  /**
+   * Planctl-native `last_validated_at` (EpicSnapshot blob — epic-level only).
+   * Plain ISO-8601 string when present; absent / NULL folds to `null` so a
+   * blob from an older daemon build (or an unvalidated epic file) reproduces
+   * the same row across re-fold. Schema column is nullable TEXT — no default.
+   */
+  last_validated_at?: string | null;
 }
 
 /**
@@ -388,8 +395,8 @@ function projectPlanRow(db: Database, event: Event): void {
     // fold would wipe the creator/refiner provenance projection on every
     // approval flip.
     db.run(
-      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_event_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_validated_at, last_event_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(epic_id) DO UPDATE SET
          epic_number = excluded.epic_number,
          title = excluded.title,
@@ -397,6 +404,7 @@ function projectPlanRow(db: Database, event: Event): void {
          status = excluded.status,
          approval = excluded.approval,
          depends_on_epics = excluded.depends_on_epics,
+         last_validated_at = excluded.last_validated_at,
          last_event_id = excluded.last_event_id,
          updated_at = excluded.updated_at`,
       [
@@ -415,6 +423,10 @@ function projectPlanRow(db: Database, event: Event): void {
         // Stored as a JSON-TEXT array column; decoded back to an array at the
         // read boundary. A missing list folds to the empty array (schema default).
         JSON.stringify(snapshot.depends_on_epics ?? []),
+        // Nullable TEXT — no DEFAULT; a missing / NULL blob value (older
+        // daemon build, or an unvalidated epic file) folds to NULL so the
+        // pre-v16 zero-event reading is preserved across re-fold.
+        snapshot.last_validated_at ?? null,
         event.id,
         ts,
       ],

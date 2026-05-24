@@ -113,6 +113,14 @@ export interface PlanEpicMessage {
   approval: Approval;
   /** Epic-level deps: the planctl `depends_on_epics` ids (string array). */
   dependsOnEpics: string[];
+  /**
+   * Planctl-native validation timestamp (top-level `last_validated_at` field
+   * on `.planctl/epics/<id>.json`). Plain ISO-8601 string when present; a
+   * missing / empty / non-string value collapses to `null` via {@link asString}
+   * — the CLAUDE.md "safe value" invariant. Drives the board UI's
+   * `[validated]` / `[unvalidated]` pill.
+   */
+  lastValidatedAt: string | null;
 }
 
 /** Snapshot message for one `.planctl/tasks/*.json` file. */
@@ -296,6 +304,7 @@ interface RawEpic {
   primary_repo?: unknown;
   approval?: unknown;
   depends_on_epics?: unknown;
+  last_validated_at?: unknown;
 }
 
 /** Raw planctl task JSON shape — only the fields we project. */
@@ -701,6 +710,7 @@ export function buildEpicMessage(
     status: asString(raw.status),
     approval,
     dependsOnEpics: asStringArray(raw.depends_on_epics),
+    lastValidatedAt: asString(raw.last_validated_at),
   };
 }
 
@@ -840,7 +850,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
   // (the worst-case feedback loop documented in the epic's Risks section).
   const epics = db
     .query(
-      "SELECT epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, tasks FROM epics",
+      "SELECT epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_validated_at, tasks FROM epics",
     )
     .all() as {
     epic_id: string;
@@ -850,6 +860,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
     status: string | null;
     approval: string | null;
     depends_on_epics: string | null;
+    last_validated_at: string | null;
     tasks: string | null;
   }[];
   for (const e of epics) {
@@ -868,6 +879,13 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       // not here, so the silent path is correct.
       approval: coerceApproval(e.approval),
       dependsOnEpics: parseStringArrayColumn(e.depends_on_epics),
+      // `last_validated_at` is a nullable TEXT column; `asString` collapses
+      // any non-string / empty-string stored value to `null`, mirroring the
+      // producer-side coercion in `buildEpicMessage`. Object-literal slot
+      // position MUST match `buildEpicMessage`'s return — the change-gate
+      // compares `JSON.stringify` output byte-for-byte, and a slot mismatch
+      // would re-emit one synthetic `EpicSnapshot` per epic every boot.
+      lastValidatedAt: asString(e.last_validated_at),
     };
     scanner.seed(e.epic_id, JSON.stringify(msg));
 

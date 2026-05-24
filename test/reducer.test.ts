@@ -1541,6 +1541,7 @@ function getEpic(epicId: string) {
     depends_on_epics: string;
     jobs: string;
     job_links: string;
+    last_validated_at: string | null;
   } | null;
 }
 
@@ -1614,6 +1615,9 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     jobs: "[]",
     // No planctl-invocation classifier edges have been folded yet → defaults to "[]".
     job_links: "[]",
+    // No `last_validated_at` in the blob → folds to NULL (the schema column is
+    // a plain nullable TEXT, no DEFAULT).
+    last_validated_at: null,
   });
   expect(epic?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);
@@ -1967,6 +1971,79 @@ test("from-scratch re-fold reproduces `approval` byte-identically across epic + 
     title: "E v2",
     status: "open",
     approval: "approved",
+  });
+  drainAll();
+
+  const before = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM epics");
+  drainAll();
+
+  const after = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
+// last_validated_at folding (schema v16 — fn-599-epic-validation-pill)
+// ---------------------------------------------------------------------------
+
+test("EpicSnapshot folds `last_validated_at` into the epics row (explicit value)", () => {
+  epicSnapshotEvent("fn-1-val", {
+    epic_number: 1,
+    title: "T",
+    status: "open",
+    last_validated_at: "2026-05-24T00:00:00Z",
+  });
+  drainAll();
+  expect(getEpic("fn-1-val")?.last_validated_at).toBe("2026-05-24T00:00:00Z");
+});
+
+test("EpicSnapshot defaults missing `last_validated_at` to NULL on the projection", () => {
+  // A blob from an older daemon build (no `last_validated_at` key) folds to
+  // NULL — the schema column is plain nullable TEXT with no DEFAULT.
+  epicSnapshotEvent("fn-2-val", {
+    epic_number: 2,
+    title: "T",
+    status: "open",
+  });
+  drainAll();
+  expect(getEpic("fn-2-val")?.last_validated_at).toBeNull();
+});
+
+test("EpicSnapshot ON CONFLICT updates `last_validated_at` (last-write-wins)", () => {
+  epicSnapshotEvent("fn-3-val", {
+    epic_number: 3,
+    title: "T",
+    status: "open",
+    last_validated_at: "2026-05-23T00:00:00Z",
+  });
+  drainAll();
+  expect(getEpic("fn-3-val")?.last_validated_at).toBe("2026-05-23T00:00:00Z");
+  epicSnapshotEvent("fn-3-val", {
+    epic_number: 3,
+    title: "T",
+    status: "open",
+    last_validated_at: "2026-05-24T00:00:00Z",
+  });
+  drainAll();
+  expect(getEpic("fn-3-val")?.last_validated_at).toBe("2026-05-24T00:00:00Z");
+});
+
+test("from-scratch re-fold reproduces `last_validated_at` byte-identically", () => {
+  // Build a history exercising explicit + missing last_validated_at values.
+  // Rewind + re-drain must reproduce the same row contents.
+  epicSnapshotEvent("fn-4-val", {
+    epic_number: 4,
+    title: "E",
+    status: "open",
+    last_validated_at: "2026-05-24T00:00:00Z",
+  });
+  // An epic with no last_validated_at — exercises the NULL default path.
+  epicSnapshotEvent("fn-5-val", {
+    epic_number: 5,
+    title: "E",
+    status: "open",
   });
   drainAll();
 

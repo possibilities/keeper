@@ -322,6 +322,14 @@ export interface Epic {
    * provenance projection.
    */
   job_links: JobLinkEntry[];
+  /**
+   * Planctl-native validation timestamp — top-level `last_validated_at` field
+   * on `.planctl/epics/<id>.json` (schema v16). Plain ISO-8601 string when
+   * present; `null` when the epic file omits the field (unvalidated) or the
+   * stored value isn't a non-empty string. Display-only at the projection
+   * layer; drives the board UI's `[validated]` / `[unvalidated]` pill.
+   */
+  last_validated_at: string | null;
 }
 
 /**

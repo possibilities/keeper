@@ -158,6 +158,18 @@ function approvalPill(v: unknown): string {
 }
 
 /**
+ * Map the epic's `last_validated_at` to a `[validated]` / `[unvalidated]`
+ * pill — mirrors `approvalPill`'s shape. The producer-side `asString`
+ * (`src/plan-worker.ts`) already collapses empty-string / non-string values
+ * to `null`, so the predicate is simply `v != null`. The pill string is
+ * fixed (not the raw timestamp); a future task may add a sortable mode if
+ * a use case appears.
+ */
+function validatedPill(v: unknown): "validated" | "unvalidated" {
+  return v != null ? "validated" : "unvalidated";
+}
+
+/**
  * Map a plan_verb to its noun-form role label for the `[{role}]` pill —
  * mirrors the sibling helpers in `scripts/epics.ts` and `scripts/jobs.ts`.
  * Returns `null` when the input is null (the caller drops the pill).
@@ -305,7 +317,7 @@ async function main(): Promise<void> {
     const epicId = seg(row[epics.pk]);
     const epicApproval = approvalPill(row.approval);
     const lines: string[] = [
-      `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg}`,
+      `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}]`,
     ];
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {

@@ -356,6 +356,7 @@ function runDaemon(): void {
         status: msg.status,
         approval: msg.approval,
         depends_on_epics: msg.dependsOnEpics,
+        last_validated_at: msg.lastValidatedAt,
       });
     } else if (msg.kind === "plan-task") {
       hookEvent = "TaskSnapshot";

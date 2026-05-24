@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -344,7 +344,8 @@ CREATE TABLE IF NOT EXISTS epics (
     tasks TEXT NOT NULL DEFAULT '[]',
     depends_on_epics TEXT NOT NULL DEFAULT '[]',
     jobs TEXT NOT NULL DEFAULT '[]',
-    job_links TEXT NOT NULL DEFAULT '[]'
+    job_links TEXT NOT NULL DEFAULT '[]',
+    last_validated_at TEXT
 )
 `;
 
@@ -1183,6 +1184,16 @@ function migrate(db: Database): void {
       // boots don't re-ANALYZE here.
       db.run("ANALYZE events");
     }
+
+    // v15→v16: project `last_validated_at` through the epics row. Nullable
+    // (no DEFAULT) — a missing field on the planctl JSON is the honest
+    // zero-event reading. Idempotent ADD COLUMN, NO backfill, NO
+    // rewind-and-redrain: the plan-worker's per-boot re-scan repopulates
+    // every epic via the change-gate diff, so a v15 DB gains the column
+    // reading NULL and gets filled from disk on the next boot scan. Column
+    // def matches CREATE_EPICS so a fresh v16 DB and a migrated v15→v16 DB
+    // converge to identical schema.
+    addColumnIfMissing(db, "epics", "last_validated_at", "TEXT");
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
