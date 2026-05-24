@@ -121,6 +121,22 @@ export const DEFAULT_LIMIT = 100;
 /** Maximum page size — kept well below `MAX_IN_PARAMS` so a page is one query. */
 export const MAX_LIMIT = 500;
 
+// ---------------------------------------------------------------------------
+// DEBUG: timing instrumentation
+// ---------------------------------------------------------------------------
+//
+// Diagnostic-only logs for chasing the "epics frame takes 5s sometimes" bug.
+// Every line is `[srv-ts] T=<epochMs> <event>` so a client log emitting the
+// same wall-clock can be diffed against it. Connection lifecycle is always
+// logged; per-call dispatch/tick timings are gated by a duration threshold
+// so the steady-state poll doesn't drown the log. Remove together with the
+// matching `[epics-ts]` instrumentation in `scripts/epics.ts` once the bug
+// is understood.
+let __nextConnId = 0;
+function srvTs(msg: string): void {
+  console.error(`[srv-ts] T=${Date.now()} ${msg}`);
+}
+
 /**
  * Per-connection state, carried on `socket.data` (typed via the
  * `Bun.listen<ConnState>` generic).
@@ -158,6 +174,8 @@ export interface ConnState {
   lastTotal: number | null;
   lastToken: string | null;
   pending: { bytes: Uint8Array; offset: number } | null;
+  /** DEBUG: per-connection sequence id for `[srv-ts]` log correlation. */
+  id?: number;
 }
 
 function newConnState(): ConnState {
@@ -1067,14 +1085,28 @@ export async function pollLoop(
   let last = (query.get() as { data_version: number }).data_version;
 
   while (!isShutdown()) {
+    const _sleepStart = Date.now();
     await Bun.sleep(interval);
+    const _sleepActual = Date.now() - _sleepStart;
+    if (_sleepActual > interval + 100) {
+      // The event loop didn't wake us on time — something held it. Likely the
+      // smoking gun for the "epics frame takes 5s" bug.
+      srvTs(
+        `poll-loop sleep overrun: requested=${interval}ms actual=${_sleepActual}ms`,
+      );
+    }
     if (isShutdown()) {
       break;
     }
     const cur = (query.get() as { data_version: number }).data_version;
     if (cur !== last) {
       last = cur;
+      const _tickStart = Date.now();
       diffTick(db, getConns());
+      const _tickDur = Date.now() - _tickStart;
+      if (_tickDur >= 20) {
+        srvTs(`poll-loop diffTick duration=${_tickDur}ms`);
+      }
     }
   }
 }
@@ -1138,15 +1170,25 @@ export function startServer(
     socket: {
       open(socket) {
         socket.data = newConnState();
+        socket.data.id = ++__nextConnId;
         conns.add(socket as unknown as Writable);
+        srvTs(`conn ${socket.data.id} open`);
       },
       data(socket, chunk) {
+        const id = socket.data.id ?? -1;
+        srvTs(`conn ${id} data chunk=${chunk.length}`);
+        const t0 = Date.now();
         handleData(db, socket, chunk, writerDb);
+        const dur = Date.now() - t0;
+        if (dur >= 5) {
+          srvTs(`conn ${id} handleData duration=${dur}ms`);
+        }
       },
       drain(socket) {
         resumePending(socket as unknown as Writable);
       },
       close(socket) {
+        srvTs(`conn ${socket.data.id ?? -1} close`);
         // Drop the connection from the fan-out set, then release per-connection
         // state; nothing process-global to release here.
         conns.delete(socket as unknown as Writable);
@@ -1223,6 +1265,17 @@ function handleData(
 
   for (const line of lines) {
     let frames: ServerFrame[];
+    // DEBUG: time each dispatchLine so we can spot a slow query / RPC.
+    const _dispatchStart = Date.now();
+    let _frameType = "unknown";
+    let _collection: string | undefined;
+    try {
+      const parsed = JSON.parse(line) as { type?: unknown; collection?: unknown };
+      if (typeof parsed.type === "string") _frameType = parsed.type;
+      if (typeof parsed.collection === "string") _collection = parsed.collection;
+    } catch {
+      // dispatchLine itself will surface the bad_frame; just log unknown.
+    }
     try {
       frames = dispatchLine(db, socket.data, line, writerDb);
     } catch (err) {
@@ -1237,8 +1290,21 @@ function handleData(
         },
       ];
     }
+    const _dispatchDur = Date.now() - _dispatchStart;
+    const _id = socket.data.id ?? -1;
+    const _collTag = _collection ? ` coll=${_collection}` : "";
+    if (_frameType === "query" || _dispatchDur >= 5) {
+      srvTs(
+        `conn ${_id} dispatch type=${_frameType}${_collTag} duration=${_dispatchDur}ms frames=${frames.length}`,
+      );
+    }
     if (frames.length > 0) {
+      const _writeStart = Date.now();
       writeFrames(w, frames);
+      const _writeDur = Date.now() - _writeStart;
+      if (_writeDur >= 5) {
+        srvTs(`conn ${_id} writeFrames duration=${_writeDur}ms`);
+      }
     }
   }
 }

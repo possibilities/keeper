@@ -231,6 +231,17 @@ async function main(): Promise<void> {
   const sockPath = values.sock ?? resolveSockPath();
   const log = (s: string) => process.stdout.write(`${s}\n`);
 
+  // DEBUG: timing instrumentation for the "epics frame takes 5s" bug.
+  // Every line is `[epics-ts] T=<epochMs> +<elapsedMs> <event>` on stderr so
+  // a same-wall-clock `[srv-ts]` log from src/server-worker.ts can be diffed
+  // against it. Remove once the bug is understood.
+  const _epicsT0 = Date.now();
+  const ts = (msg: string): void => {
+    process.stderr.write(
+      `[epics-ts] T=${Date.now()} +${Date.now() - _epicsT0}ms ${msg}\n`,
+    );
+  };
+
   // The current page, in server-sent order, plus a by-id index. Both are
   // rebuilt wholesale on every `result` (each refetch replaces the page); the
   // render reads only from them, never from `patch` payloads.
@@ -364,6 +375,7 @@ async function main(): Promise<void> {
     }
     lastBody = body;
     const frameText = `---\n${body}`;
+    ts(`frame-emit bytes=${frameText.length}`);
     log(frameText);
     writeSidecars(frameText);
   }
@@ -407,6 +419,7 @@ async function main(): Promise<void> {
   }
 
   function handleFrame(frame: ServerFrame): void {
+    ts(`frame kind=${frame.type}`);
     if (frame.type === "result") {
       queryInFlight = false;
       order.length = 0;
@@ -497,6 +510,7 @@ async function main(): Promise<void> {
       unix: sockPath,
       socket: {
         open(sock) {
+          ts("open");
           // Connected: reset backoff, adopt the socket, announce, then fetch +
           // start the steady-poll backstop (both via the coalescing path so the
           // poll never races a pending query).
@@ -504,10 +518,13 @@ async function main(): Promise<void> {
           currentSock = sock;
           emitLifecycle("connected", { sock: sockPath });
           queryInFlight = true;
-          sock.write(encodeFrame(query));
+          const encoded = encodeFrame(query);
+          sock.write(encoded);
+          ts(`query-write bytes=${encoded.length}`);
           pollTimer = setInterval(scheduleRefetch, POLL_MS);
         },
         data(_sock, chunk) {
+          ts(`data bytes=${chunk.length}`);
           let lines: string[];
           try {
             lines = buffer.push(chunk.toString("utf8"));
@@ -522,6 +539,7 @@ async function main(): Promise<void> {
           }
         },
         close() {
+          ts("close");
           // The server closed (or keeperd restarted). Unless we're exiting,
           // tear down and reconnect through the same backoff loop — never exit.
           if (shuttingDown) {
