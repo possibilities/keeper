@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-24T19:33:54Z",
+  "depends_on": [],
+  "epic": "fn-599-epic-validation-pill-and-prune-clients",
+  "id": "fn-599-epic-validation-pill-and-prune-clients.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Plumb last_validated_at and render board pill",
+  "updated_at": "2026-05-24T19:33:54Z"
+}

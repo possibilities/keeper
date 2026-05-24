@@ -1,0 +1,22 @@
+{
+  "branch_name": "fn-599-epic-validation-pill-and-prune-clients",
+  "bundles": [
+    "sketch/epics-validation-pill-and-prune-clients"
+  ],
+  "created_at": "2026-05-24T19:33:54Z",
+  "depends_on_epics": [
+    "fn-598-creator-refiner-from-planctl-invocations"
+  ],
+  "id": "fn-599-epic-validation-pill-and-prune-clients",
+  "last_validated_at": "2026-05-24T19:34:39Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Epic validation pill and prune clients",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-24T19:34:39Z"
+}
