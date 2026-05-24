@@ -74,5 +74,5 @@ Multiple fan-out tests in `test/reducer.test.ts`:
 - [ ] Re-fold determinism test passes: rewind + re-drain reproduces byte-identical projection.
 
 ## Done summary
-
+Added syncPlanctlLinks to reducer.ts: re-derives jobs.epic_links + per-touched-epic epics.job_links from scratch on every planctl-CLI invocation event (or /plan:plan window opener) via the pure classifier. Added EpicSnapshot ON CONFLICT carve-out for job_links, and shared normalizePlanctlOp helper used by both the live fan-out and the v13->v14 migration backfill so re-fold determinism holds byte-for-byte.
 ## Evidence
