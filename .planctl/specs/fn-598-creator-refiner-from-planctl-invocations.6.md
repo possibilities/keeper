@@ -70,5 +70,5 @@ Round-trip the new columns through every documented surface.
 - [ ] `planctl validate --epic <epic_id>` passes end-to-end after this task lands.
 
 ## Done summary
-
+Round-tripped epic_links + job_links columns through README sparse-signal callout/Architecture/Inspect sections, CLAUDE.md invariants (cursor-transaction + projection-driving-facts), scripts/{jobs,epics}.ts module comments, and added two collections-roundtrip tests via a new seedJob helper + seedEpic.job_links opt; all 301 unit tests pass.
 ## Evidence
