@@ -7,7 +7,7 @@
  * It `query`s a 10-row page of `jobs` and renders it as a `---`-led document
  * of one job per line in plain bracket form:
  *
- *   - ({basename(cwd)}) {title} [{state}]
+ *   ({basename(cwd)}) {title} [{state}]
  *
  * The `(...)` cwd segment is omitted when `cwd` is null/empty so the line
  * doesn't lead with empty parens. The query optionally carries a server-side
@@ -118,7 +118,7 @@ Usage: bun scripts/jobs.ts [--sock <path>] [--state <s> | --state-ne <s>]
 
 Renders a 10-row page of jobs as a stream of plain bracket-form lines: one
 frame per change, each frame led by '---'. One job per line:
-  - ({basename(cwd)}) {title} [{state}]
+  ({basename(cwd)}) {title} [{state}]
 The (...) cwd segment is omitted when cwd is null/empty. The page is
 refetched on every change signal and on a steady poll, so it always shows
 the current top-N; a new frame prints only when the rendered output changes.
@@ -196,7 +196,7 @@ async function main(): Promise<void> {
 
   /**
    * Collapse one full row to its display line:
-   * `- ({basename(cwd)}) {title} [{state}]`. A null/empty `cwd` drops the
+   * `({basename(cwd)}) {title} [{state}]`. A null/empty `cwd` drops the
    * `(...)` segment entirely (no empty parens). This — together with
    * `emitFrameIfChanged` — defines which column moves can reframe the page.
    */
@@ -204,7 +204,7 @@ async function main(): Promise<void> {
     const title = seg(row.title);
     const cwd = row.cwd == null ? "" : basename(String(row.cwd));
     const cwdSeg = cwd === "" ? "" : `(${cwd}) `;
-    return `- ${cwdSeg}${title} [${seg(row.state)}]`;
+    return `${cwdSeg}${title} [${seg(row.state)}]`;
   }
 
   /**
