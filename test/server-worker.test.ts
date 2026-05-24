@@ -399,7 +399,7 @@ test("resolveFilter: epics default OR-scope applies bare, is dropped by ANY wire
   expect(statusOnly.params).toEqual(["done"]);
 
   // An explicit approval also drops the defaultClause; page is scoped to the
-  // wire alone. `--show-approved` on autopilot rides this path.
+  // wire alone. `--show-approved` on the epics client rides this path.
   const approvalOnly = resolveFilter(EPICS_DESCRIPTOR, {
     approval: "approved",
   });

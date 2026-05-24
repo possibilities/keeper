@@ -52,7 +52,7 @@ page that doubles as a live subscription. Two collections register today —
 epic embeds its tasks as a JSON array, so there is no separate `tasks`
 collection; both the epic and each embedded task carry an `approval` field
 valued `"approved" | "rejected" | "pending"`, surfaced as a pill in the
-autopilot client). The surface is built so additional collections register
+epics client). The surface is built so additional collections register
 without touching the wire protocol or the diff machinery. Page membership is frozen at query time,
 but each row's cells stream `patch` frames as the reducer folds new events.
 The `result` page also carries a `total` (the filtered-set size, ignoring
@@ -75,9 +75,8 @@ and the `events` log keep their canonical-owner writers and re-fold
 determinism extends to approval (rewind cursor + re-drain reproduces approval
 state byte-identically). RPC handlers MAY write `.planctl` files, never
 reducer projections directly (see [CLAUDE.md](./CLAUDE.md)'s DO NOT list).
-Four example clients ship in `scripts/` (`jobs.ts`, `epics.ts`,
-`autopilot.ts`, and `approve.ts`); see [Example clients](#example-clients)
-for usage.
+Three example clients ship in `scripts/` (`jobs.ts`, `epics.ts`, and
+`approve.ts`); see [Example clients](#example-clients) for usage.
 
 ## What keeper is NOT
 
@@ -234,12 +233,11 @@ Keeper has no `install` verb. Wire it up manually:
 
 ## Example clients
 
-Four scripts under `scripts/` demonstrate the subscribe + RPC protocols.
-`jobs.ts`, `epics.ts`, and `autopilot.ts` are read-only subscribe clients
-(clones of the same connection/coalescing/reconnect plumbing, differing only
-in their render layer); `approve.ts` is the first RPC client (single-shot
-`rpc` → `rpc_result`, no subscription). Run any with `bun scripts/<name>.ts
---help`.
+Three scripts under `scripts/` demonstrate the subscribe + RPC protocols.
+`jobs.ts` and `epics.ts` are read-only subscribe clients (clones of the same
+connection/coalescing/reconnect plumbing, differing only in their render
+layer); `approve.ts` is the first RPC client (single-shot `rpc` →
+`rpc_result`, no subscription). Run any with `bun scripts/<name>.ts --help`.
 
 - `jobs.ts` — primitive list UI over the `jobs` collection: pages 10 live jobs
   and renders a YAML frame per change, each row a single collapsed line
@@ -251,30 +249,23 @@ in their render layer); `approve.ts` is the first RPC client (single-shot
   bun scripts/jobs.ts --state ended  # see terminal jobs explicitly
   ```
 
-- `epics.ts` — primitive list UI over the `epics` collection: pages 10 open
-  epics and renders each epic with its embedded tasks as a nested
-  `epic:`/`tasks:` mapping block per frame.
+- `epics.ts` — primitive list UI over the `epics` collection with per-epic
+  and per-task approval pills. Default scope is open, not-yet-approved
+  epics (server-side `{ status: "open", approval: { ne: "approved" } }`);
+  pass `--show-approved` to include approved epics and `--status` /
+  `--status-ne` to widen / narrow status. Each epic renders as a header
+  line — `{dir} {epic_number} {title} [#dep,#dep] [{status}] [{approval}]`
+  — followed by an indented slug line and one indented `{task_number}.
+  {title} [#dep,#dep] [{status}] [{approval}]` + slug line per embedded
+  task. Pills are `[approved]` / `[rejected]` / `[pending]`; a missing or
+  invalid `approval` renders as `[pending]` (the safe-value invariant).
+  The byte-compare emit gate means a pill flip reframes but a row change
+  that doesn't surface in the rendered text alone does not.
 
   ```sh
-  bun scripts/epics.ts               # default scope: open epics + nested tasks
-  bun scripts/epics.ts --status done # see closed epics
-  ```
-
-- `autopilot.ts` — live epic-block view with per-epic and per-task approval
-  pills over a single `Bun.connect` socket subscribed to the `epics`
-  collection. Approval state is read directly off `epic.approval` and each
-  embedded `task.approval`, so there is no second subscription. By default
-  the view filters out epics whose `approval === "approved"`; pass
-  `--show-approved` to include them. Renders each epic as a YAML block —
-  `- epic: <epic_id> [<pill>]` over either `tasks: []` or a nested
-  `- <task_id> [<pill>]` per task. Pills are `[pending]` / `[approved]` /
-  `[rejected]`; a missing or invalid `approval` renders as `[pending]` (the
-  safe-value invariant). The byte-compare emit gate means a pill flip
-  reframes but a title edit or status flip alone does not.
-
-  ```sh
-  bun scripts/autopilot.ts                  # default: pending/rejected epics only
-  bun scripts/autopilot.ts --show-approved  # include approved epics
+  bun scripts/epics.ts                  # default: open, not-yet-approved
+  bun scripts/epics.ts --show-approved  # include approved epics
+  bun scripts/epics.ts --status done    # see closed epics
   ```
 
 - `approve.ts` — the RPC client. Single-shot: opens a `Bun.connect`, sends
@@ -290,8 +281,8 @@ in their render layer); `approve.ts` is the first RPC client (single-shot
   bun scripts/approve.ts task <epic_id> <task_id> rejected
   ```
 
-The three subscribe scripts mirror each emitted frame to per-pid `/tmp`
-sidecar files (full JSON state + rendered YAML) for out-of-band inspection.
+The two subscribe scripts mirror each emitted frame to per-pid `/tmp`
+sidecar files (full JSON state + rendered text) for out-of-band inspection.
 The shared subscribe-loop logic lives in each script verbatim — extract a
 shared module once the duplication starts costing more than the copy.
 

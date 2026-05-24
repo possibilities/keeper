@@ -4,24 +4,37 @@
  * server (`src/server-worker.ts`). It renders a *page of epics as a frame* and
  * reprints a fresh frame every time the visible projection changes.
  *
- * It `query`s a 10-row page of `epics` and renders it as a stream of simple
- * text blocks. Each frame is a `---`-led document; each epic is one block of
- * plain lines — an epic header `{basename(project_dir)} {epic_number} {title}
- * {deps} [{status}]` followed by one indented task line per embedded task,
- * `{task_number}. {title}{dep} [{status}]` (leading space for indent). Blocks
- * are separated by a single blank line. No YAML quoting or mapping syntax —
- * just the same characters a human would type. The query optionally carries a
- * server-side `status` filter built from `--status` / `--status-ne` (the
- * bare-value equality form and the `{ ne }` operator form, respectively).
- * Default (no flag): send NO `filter` key so the server's default scope applies
- * and the page shows only OPEN epics; pass a flag to see other statuses. When a
- * filter is in effect it runs in SQL, so LIMIT counts only matching rows and
- * `total` / `meta` track exactly that set. Membership is frozen WITHIN a
- * fetched page (the server never reflows a live page), but the script
- * REFETCHES the page — on every `patch`/`meta` change signal AND on a steady
- * poll — so each fresh `result` reflects the current top-N. A NEW frame prints
- * whenever the RENDERED page changes; the rendered output — not internal row
- * churn — is the sole frame trigger, enforced by routing every emit through
+ * It `query`s the `epics` collection and renders it as a stream of simple text
+ * blocks. Each frame is a `---`-led document; each epic is one block:
+ *
+ *   {basename(project_dir)} {epic_number} {title}{deps} [{status}] [{approval}]
+ *     [{epic_id}]
+ *     {task_number}. {title}{deps} [{status}] [{approval}]
+ *        [{task_id}]
+ *
+ * `{deps}` is ` [#A,#B]` from `depends_on_epics` for the header and from
+ * `depends_on` on each embedded task; both are omitted when empty. The
+ * `[{approval}]` pill comes from the planctl-native `approval` field
+ * (top-level on the epic row, top-level on each embedded task element — schema
+ * v13) and always renders; a missing / off-enum value coerces to `pending`.
+ * The epic-slug line is indented 2 spaces under the header; the task line is
+ * indented 2 spaces; the task-slug line is indented 5 spaces (lining up with
+ * the task title for single-digit task numbers). Blocks are separated by a
+ * single blank line. No YAML — just plain bracket text.
+ *
+ * The query optionally carries a server-side filter built from `--status` /
+ * `--status-ne` (status equality / `{ ne }` operator) and `--show-approved`
+ * (drops the descriptor's `approval != approved` default by asserting an
+ * all-values `approval: { in: [...] }`). Default (no flag): send NO `filter`
+ * key so the server's default scope (`status: "open", approval: { ne:
+ * "approved" }`) applies — open, not-yet-approved epics. When a filter is in
+ * effect it runs in SQL, so LIMIT counts only matching rows and `total` /
+ * `meta` track exactly that set. Membership is frozen WITHIN a fetched page
+ * (the server never reflows a live page), but the script REFETCHES the page —
+ * on every `patch`/`meta` change signal AND on a steady poll — so each fresh
+ * `result` reflects the current top-N. A NEW frame prints whenever the
+ * RENDERED page changes; the rendered output — not internal row churn — is the
+ * sole frame trigger, enforced by routing every emit through
  * `emitFrameIfChanged`.
  *
  * The script renders ONLY from `result` frames. `patch` and `meta` are treated
@@ -59,16 +72,19 @@
  * de-frame) and `resolveSockPath()` so it stays a faithful mirror of the
  * contract, and it honors the read-only fence: it only ever sends
  * `query` / `unsubscribe`. The connection/coalescing logic mirrors the
- * sibling `scripts/jobs.ts` and `scripts/autopilot.ts`; extract a shared
- * module once the duplication starts costing more than the copy.
+ * sibling `scripts/jobs.ts`; extract a shared module once the duplication
+ * starts costing more than the copy.
  *
  * Usage:
  *   bun scripts/epics.ts [--sock <path>] [--status <s> | --status-ne <s>]
+ *                        [--show-approved]
  *
  *   --sock <path>    Socket path override (else $KEEPER_SOCK, else the
  *                    ~/.local/state/keeper/keeperd.sock default).
  *   --status <s>     Filter to epics whose status equals <s> (e.g. done).
  *   --status-ne <s>  Filter to epics whose status is NOT <s>.
+ *   --show-approved  Drop the descriptor's approval default; approved epics
+ *                    reappear in the page.
  *   --help           Show this help.
  */
 
@@ -115,23 +131,28 @@ const MAX_BACKOFF_MS = 5000;
 const HELP = `keeper-epics — primitive list UI over the keeper subscribe server
 
 Usage: bun scripts/epics.ts [--sock <path>] [--status <s> | --status-ne <s>]
+                            [--show-approved]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
   --status <s>     Filter to epics whose status equals <s> (e.g. done)
   --status-ne <s>  Filter to epics whose status is NOT <s>
                    (--status and --status-ne are mutually exclusive)
                    (default: no status flag → the server's default scope shows
-                   only OPEN epics; pass a flag to see other statuses)
+                   only open, not-yet-approved epics; pass a flag to widen)
+  --show-approved  Drop the server's approval default; approved epics reappear
+                   in the page. The status default still applies.
   --help           Show this help
 
-Renders a 10-row page of epics as a stream of simple text blocks: one frame
-per change, each frame led by '---'. Each epic is one block — a header line
-  {basename(project_dir)} {epic_number} {title} (deps #A, #B) [{status}]
-followed by one indented task line per embedded task,
-   {task_number}. {title} (dep #N) [{status}]
-Blocks are separated by a single blank line. The (deps …) segment lists the
-epic numbers an epic depends on; the (dep #N) segment names only the highest
-task a task depends on. Both are omitted when there are no dependencies.
+Renders the epics page as a stream of simple text blocks: one frame per change,
+each frame led by '---'. Each epic is one block —
+  {basename(project_dir)} {epic_number} {title} [#A,#B] [{status}] [{approval}]
+    [{epic_id}]
+    {task_number}. {title} [#X,#Y] [{status}] [{approval}]
+       [{task_id}]
+Blocks are separated by a single blank line. The [#…] segment lists the epic
+or task numbers a row depends on (omitted when empty). The [{approval}] pill
+always renders, sourced from the planctl-native 'approval' field; a missing
+or off-enum value coerces to 'pending'.
 
 The page is refetched on every change signal and on a steady poll, so it always
 shows the current top-N; a new frame prints only when the rendered output
@@ -147,49 +168,20 @@ of exiting; each connection-lifecycle change prints a ...-fenced note
 const COLLECTION = "epics";
 const pk = "epic_id";
 
+/** Approval enum vocabulary, mirrored from `src/plan-worker.ts:Approval`. */
+const APPROVAL_VALUES = new Set(["approved", "rejected", "pending"]);
+
 /**
- * Render one value as YAML. Scalars are bare when safe, else single-quoted;
- * arrays and objects (any future decoded JSON-TEXT column) render as flow
- * sequences / mappings with each element recursed through this same function,
- * so a list column shows as `[a, b]` rather than a comma-flattened string.
+ * Coerce a row's `approval` cell to the enum's display value. The plan-worker
+ * pre-coerces so a value off the enum at this layer would be a bug; we coerce
+ * defensively anyway (CLAUDE.md "safe value" invariant) so a typo never breaks
+ * the render.
  */
-function yamlScalar(v: unknown): string {
-  if (v === null || v === undefined) {
-    return "null";
+function approvalPill(v: unknown): string {
+  if (typeof v === "string" && APPROVAL_VALUES.has(v)) {
+    return v;
   }
-  if (typeof v === "number" || typeof v === "boolean") {
-    return String(v);
-  }
-  if (Array.isArray(v)) {
-    return `[${v.map(yamlScalar).join(", ")}]`;
-  }
-  if (typeof v === "object") {
-    const entries = Object.entries(v as Record<string, unknown>);
-    return `{${entries.map(([k, val]) => `${k}: ${yamlScalar(val)}`).join(", ")}}`;
-  }
-  const s = String(v);
-  // Emit a bare (plain) scalar whenever YAML permits one — a plain scalar
-  // legally carries spaces and most characters (incl. `·`), so a value like
-  // `keeper · my task · working` needs no quotes. Quote (single-quote, doubling
-  // embedded quotes — the YAML escape for `'`) only for the cases that would
-  // otherwise be invalid or restructure the node:
-  //   - the empty string, or leading/trailing whitespace;
-  //   - a leading flow/indicator char (`![]{},|>@\`"'%` or `&*#`);
-  //   - a leading `-`/`?`/`:` that is followed by a space or ends the string
-  //     (those three are indicators only in that position);
-  //   - an embedded `": "` or trailing `:` (would start a mapping);
-  //   - an embedded `" #"` (would start a comment).
-  const needsQuote =
-    s === "" ||
-    /^\s|\s$/.test(s) ||
-    /^[![\]{},|>@`"'%&*#]/.test(s) ||
-    /^[-?:](\s|$)/.test(s) ||
-    /:(\s|$)/.test(s) ||
-    /\s#/.test(s);
-  if (!needsQuote) {
-    return s;
-  }
-  return `'${s.replace(/'/g, "''")}'`;
+  return "pending";
 }
 
 /**
@@ -222,6 +214,7 @@ async function main(): Promise<void> {
       sock: { type: "string" },
       status: { type: "string" },
       "status-ne": { type: "string" },
+      "show-approved": { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -288,14 +281,16 @@ async function main(): Promise<void> {
 
   /**
    * Render one epic as a small text block:
-   *   {basename(project_dir)} {epic_number} {title}{deps} [{status}]
-   *   {task_number}. {title}{dep} [{status}]
-   *   {task_number}. {title}{dep} [{status}]
-   * `{deps}` is ` (deps #3, #5)` from `depends_on_epics` (omitted when empty);
-   * `{dep}` is ` (dep #N)` naming the HIGHEST task a task depends on (omitted
-   * when empty). A non-array `tasks` cell renders as no task lines. Together
-   * these two projections define which column moves can reframe the page —
-   * read alongside `emitFrameIfChanged`.
+   *   {basename(project_dir)} {epic_number} {title}{deps} [{status}] [{approval}]
+   *     [{epic_id}]
+   *     {task_number}. {title}{deps} [{status}] [{approval}]
+   *        [{task_id}]
+   * `{deps}` is ` [#A,#B]` joined from `depends_on_epics` (epic header) or
+   * `depends_on` (task line); omitted when empty. The `[{approval}]` pill
+   * sources from the planctl-native `approval` field and always renders. A
+   * non-array `tasks` cell renders as no task lines. Together these projections
+   * define which column moves can reframe the page — read alongside
+   * `emitFrameIfChanged`.
    */
   function renderEpicBlock(row: Record<string, unknown>): string {
     const dir =
@@ -303,17 +298,18 @@ async function main(): Promise<void> {
     const epicDeps = Array.isArray(row.depends_on_epics)
       ? row.depends_on_epics
       : [];
-    const depsSeg =
-      epicDeps.length === 0
+    const epicDepNums = epicDeps
+      .map((d) => epicNumFromId(String(d)))
+      .filter((n): n is number => n != null);
+    const epicDepsSeg =
+      epicDepNums.length === 0
         ? ""
-        : ` (deps ${epicDeps
-            .map((d) => {
-              const n = epicNumFromId(String(d));
-              return n == null ? String(d) : `#${n}`;
-            })
-            .join(", ")})`;
+        : ` [${epicDepNums.map((n) => `#${n}`).join(",")}]`;
+    const epicId = seg(row[pk]);
+    const epicApproval = approvalPill(row.approval);
     const lines: string[] = [
-      `${dir} ${seg(row.epic_number)} ${seg(row.title)}${depsSeg} [${seg(row.status)}]`,
+      `${dir} ${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${seg(row.status)}] [${epicApproval}]`,
+      `  [${epicId}]`,
     ];
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {
@@ -322,9 +318,13 @@ async function main(): Promise<void> {
       const tnums = tdeps
         .map((d) => taskNumFromId(String(d)))
         .filter((n): n is number => n != null);
-      const depSeg = tnums.length === 0 ? "" : ` (dep #${Math.max(...tnums)})`;
+      const taskDepsSeg =
+        tnums.length === 0 ? "" : ` [${tnums.map((n) => `#${n}`).join(",")}]`;
+      const taskApproval = approvalPill(t.approval);
+      const taskId = seg(t.task_id);
       lines.push(
-        ` ${seg(t.task_number)}. ${seg(t.title)}${depSeg} [${seg(t.status)}]`,
+        `  ${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.status)}] [${taskApproval}]`,
+        `     [${taskId}]`,
       );
     }
     return lines.join("\n");
@@ -349,7 +349,7 @@ async function main(): Promise<void> {
   // can be inspected out-of-band. Per-pid so concurrent runs don't collide;
   // overwritten each frame (always the most recently printed frame).
   const stateSidecar = `/tmp/keeper-epics.${process.pid}.state.json`;
-  const frameSidecar = `/tmp/keeper-epics.${process.pid}.frame.yaml`;
+  const frameSidecar = `/tmp/keeper-epics.${process.pid}.frame.txt`;
 
   /**
    * Mirror the just-emitted frame to its two sidecar files and print a
@@ -412,12 +412,14 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Print a connection-lifecycle "meta message": a `...`-fenced YAML doc naming
-   * the `event` and any detail keys. This is the SAME out-of-band channel as the
-   * sidecar note (`writeSidecars`), distinct from the server's `meta` staleness
-   * frame — it narrates connect/disconnect/wait so a long-lived viewer's stream
-   * is self-describing across keeperd restarts. Detail values route through
-   * `yamlScalar` so a path or message quotes correctly.
+   * Print a connection-lifecycle "meta message": a `...`-fenced doc naming the
+   * `event` and any detail keys. This is the SAME out-of-band channel as the
+   * sidecar note (`writeSidecars`), distinct from the server's `meta`
+   * staleness frame — it narrates connect/disconnect/wait so a long-lived
+   * viewer's stream is self-describing across keeperd restarts. Detail values
+   * are rendered as plain `String(v)`; the note is meant for humans, not a
+   * YAML parser, and lifecycle details (sock path, error message, attempt
+   * count) carry no characters that need escaping for legibility.
    */
   function emitLifecycle(
     event: string,
@@ -426,7 +428,7 @@ async function main(): Promise<void> {
     log("...");
     log(`event: ${event}`);
     for (const [k, v] of Object.entries(detail)) {
-      log(`${k}: ${yamlScalar(v)}`);
+      log(`${k}: ${String(v)}`);
     }
     log("...");
   }
@@ -468,19 +470,39 @@ async function main(): Promise<void> {
     }
   }
 
-  // Build the optional epic-status filter from the CLI flags. Filtering in SQL
-  // — not after the fetch — keeps LIMIT counting matching rows (so the page is
-  // a true top-N of the filtered set, never short) and makes `result.total` /
-  // `meta` describe exactly the set we render. With NO flag set we send NO
-  // `filter` key (the `{}` spread path, not `filter: {}`) so the server's
-  // default scope (`status: "open"`) applies and the page is the open-epic
-  // set.
+  // Build the epics filter from the CLI flags. Filtering in SQL — not after
+  // the fetch — keeps LIMIT counting matching rows (so the page is a true
+  // top-N of the filtered set, never short) and makes `result.total` / `meta`
+  // describe exactly the set we render. Per-key wire override drops the
+  // descriptor default for that key only; an unmentioned key keeps its
+  // default. So:
+  //
+  //   - no flags          → wire `filter` absent → both descriptor defaults
+  //                         apply (open + not-yet-approved epics).
+  //   - --status <s>      → wire `filter: { status: <s> }`           → status
+  //                         default dropped; approval default still applies.
+  //   - --status-ne <s>   → wire `filter: { status: { ne: <s> } }`   → status
+  //                         default dropped; approval default still applies.
+  //   - --show-approved   → wire `filter: { approval: { in: [...all] } }` →
+  //                         drops the approval default by routing the
+  //                         `approval` key into the wire payload, while
+  //                         asserting an `in`-list that names every legal
+  //                         approval value (so no real value is excluded).
+  //                         The status default still applies.
+  //
+  // The flags compose: `--show-approved --status done` sends both the
+  // explicit `status` override AND the approval-default override.
+  const filterParts: Record<string, FilterValue> = {};
+  if (values.status !== undefined) {
+    filterParts.status = values.status;
+  } else if (values["status-ne"] !== undefined) {
+    filterParts.status = { ne: values["status-ne"] };
+  }
+  if (values["show-approved"]) {
+    filterParts.approval = { in: ["approved", "rejected", "pending"] };
+  }
   const filter: { filter?: Record<string, FilterValue> } =
-    values.status !== undefined
-      ? { filter: { status: values.status } }
-      : values["status-ne"] !== undefined
-        ? { filter: { status: { ne: values["status-ne"] } } }
-        : {};
+    Object.keys(filterParts).length > 0 ? { filter: filterParts } : {};
   const query: QueryFrame = {
     type: "query",
     collection: COLLECTION,

@@ -5,8 +5,8 @@
  * exits. The single-shot connection / framing / id-correlation pattern
  * is the template for future single-shot CLIs.
  *
- * Unlike the example `scripts/autopilot.ts` / `scripts/epics.ts` /
- * `scripts/jobs.ts` clients, this CLI is short-lived and read/write-mixed:
+ * Unlike the example `scripts/epics.ts` / `scripts/jobs.ts` clients, this
+ * CLI is short-lived and read/write-mixed:
  * it opens one `Bun.connect`, sends ONE `rpc` frame, awaits the matching
  * `rpc_result` or `error` by `id`, prints the result, and exits. No
  * subscription, no poll, no reconnect — if the daemon is down, the

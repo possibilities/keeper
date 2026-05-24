@@ -186,7 +186,7 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     status: "status",
     project_dir: "project_dir",
     // `approval` (schema v13 — the fn-592-approval-as-planctl-field epic) is
-    // the autopilot-UI's default-hide-approved key. The natural-filter slot
+    // the epics-UI's default-hide-approved key. The natural-filter slot
     // matches the same `<wire key> → <SQL column>` shape as `status`; the
     // descriptor's filter machinery ANDs every key together (see
     // `resolveFilter` in `src/server-worker.ts`), so the two-key default scope
@@ -199,9 +199,9 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
   // done-AND-approved epics fall off the page by default. The predicate
   // crosses two columns, so it lives in `defaultClause` (raw SQL with bound
   // params) rather than the per-key `defaultFilter` map. ANY explicit wire
-  // filter — `--status done`, autopilot's `--show-approved`, a pk subscribe
-  // — drops this clause entirely (the wire is the user's "I know what I
-  // want" override).
+  // filter — `--status done`, `--show-approved`, a pk subscribe — drops
+  // this clause entirely (the wire is the user's "I know what I want"
+  // override).
   defaultClause: {
     sql: "(status = ? OR approval != ?)",
     params: ["open", "approved"],

@@ -201,9 +201,9 @@ export interface Epic {
    * fn-592-approval-as-planctl-field epic). A missing / invalid value coerces
    * to `"pending"` so a file written by old planctl rides through without
    * breaking re-fold determinism (defensive "safe value" fold per CLAUDE.md).
-   * Drives the autopilot UI's default-filter scope; `EPICS_DESCRIPTOR`
-   * composes `{ status: "open", approval: { ne: "approved" } }` so approved
-   * epics drop out of the default page.
+   * Drives the epics UI's default-filter scope; `EPICS_DESCRIPTOR` composes
+   * `{ status: "open", approval: { ne: "approved" } }` so approved epics
+   * drop out of the default page.
    */
   approval: "approved" | "rejected" | "pending";
   last_event_id: number | null;

@@ -54,8 +54,8 @@
  * de-frame) and `resolveSockPath()` so it stays a faithful mirror of the
  * contract, and it honors the read-only fence: it only ever sends
  * `query` / `unsubscribe`. The connection/coalescing logic mirrors the
- * sibling `scripts/epics.ts` and `scripts/autopilot.ts`; extract a shared
- * module once the duplication starts costing more than the copy.
+ * sibling `scripts/epics.ts`; extract a shared module once the duplication
+ * starts costing more than the copy.
  *
  * Usage:
  *   bun scripts/jobs.ts [--sock <path>] [--state <s> | --state-ne <s>]
