@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-24T23:35:12Z",
+  "depends_on": [],
+  "epic": "fn-602-tighten-schema-stamp-cover-cross",
+  "id": "fn-602-tighten-schema-stamp-cover-cross.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "tighten SCHEMA_VERSION=15 stamp",
+  "updated_at": "2026-05-24T23:35:12Z"
+}

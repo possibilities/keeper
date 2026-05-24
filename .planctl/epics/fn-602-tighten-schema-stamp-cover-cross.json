@@ -1,0 +1,20 @@
+{
+  "branch_name": "fn-602-tighten-schema-stamp-cover-cross",
+  "bundles": [],
+  "created_at": "2026-05-24T23:35:12Z",
+  "depends_on_epics": [
+    "fn-598-creator-refiner-from-planctl-invocations"
+  ],
+  "id": "fn-602-tighten-schema-stamp-cover-cross",
+  "last_validated_at": "2026-05-24T23:35:16Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "tighten schema stamp + cover cross-session link re-derive",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-24T23:35:16Z"
+}
