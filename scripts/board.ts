@@ -338,7 +338,7 @@ async function main(): Promise<void> {
     }
     return epics.order
       .map((id) => renderEpicBlock(epics.byId.get(id) ?? { [epics.pk]: id }))
-      .join("\n\n");
+      .join("\n+++\n");
   }
 
   // --- job rendering (mirrors scripts/jobs.ts:projectRow) ---
