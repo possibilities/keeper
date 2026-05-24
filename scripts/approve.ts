@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /**
- * approve — thin RPC client over the keeper subscribe socket. Lands one
- * `set_approval` call and exits. The FIRST concrete RPC client; the
- * connection / framing / id-correlation pattern here is the template for
- * future single-shot CLIs.
+ * approve — thin RPC client over the keeper subscribe socket. Routes to
+ * one of two planctl-native approval RPCs based on positional arity and
+ * exits. The single-shot connection / framing / id-correlation pattern
+ * is the template for future single-shot CLIs.
  *
  * Unlike the example `scripts/autopilot.ts` / `scripts/epics.ts` /
  * `scripts/jobs.ts` clients, this CLI is short-lived and read/write-mixed:
@@ -14,10 +14,25 @@
  * (`exit 1`). A user-visible "daemon not running" message is more useful
  * than a backoff loop for a one-shot mutation.
  *
+ * Routing.
+ *
+ *   bun scripts/approve.ts <epic_id> <status>
+ *     → set_epic_approval { epic_id, status }
+ *
+ *   bun scripts/approve.ts <epic_id> <task_id> <status>
+ *     → set_task_approval { epic_id, task_id, status }
+ *
+ * The status vocabulary is `approved | rejected | pending` (hard cut from
+ * the schema-v12 verbs; no `clear` alias). `pending` writes "pending" to
+ * the planctl JSON file — the file is the canonical source of truth and
+ * carries the value verbatim. There is no DELETE path; "absent row =
+ * pending" is no longer the invariant (schema v13 — see the epic
+ * `fn-592-approval-as-planctl-field`).
+ *
  * Wire round-trip (mirrors `RpcFrame` / `RpcResultFrame` / `ErrorFrame` in
  * `src/protocol.ts`):
  *
- *   client → server: { type: "rpc", id, method: "set_approval", params: ... }
+ *   client → server: { type: "rpc", id, method, params }
  *   server → client: { type: "rpc_result", id, rev, value }   on success
  *                  | { type: "error",      id, rev, code, message }  on failure
  *
@@ -26,24 +41,21 @@
  * the protocol contract and the dispatcher's defensive checks rely on it.
  *
  * Usage:
- *   bun scripts/approve.ts <epic_id> <task_key> approve|reject|clear
- *   bun scripts/approve.ts --sock <path> <epic_id> <task_key> approve
+ *   bun scripts/approve.ts [--sock <path>] <epic_id> <status>
+ *   bun scripts/approve.ts [--sock <path>] <epic_id> <task_id> <status>
  *
- *   <epic_id>    Planctl epic id (e.g. `fn-581-server-mutation-rpcs-and-autopilot`).
- *   <task_key>   Task key — usually a task slug (`<epic_id>.<n>`) or the
- *                virtual `close:<epic_id>` row used by the autopilot for
- *                the per-epic close-approval pill. Opaque text to the RPC.
- *   approve|reject|clear
- *                Maps to the wire `status` field. `clear` DELETEs the row
- *                (absent row = "pending" per the schema-v12 invariant).
+ *   <epic_id>    Planctl epic id (e.g. `fn-592-approval-as-planctl-field`).
+ *   <task_id>    Planctl task id (e.g. `fn-592-approval-as-planctl-field.4`).
+ *                Optional — pass to target a task, omit to target the epic.
+ *   <status>     One of: approved, rejected, pending.
  *
  *   --sock <path>  Socket path override (else $KEEPER_SOCK, else the
  *                  ~/.local/state/keeper/keeperd.sock default).
  *   --help         Show this help.
  *
  * Exit codes:
- *   0 — `rpc_result` arrived; the result row (or `{ cleared: true, ... }`) is
- *       printed to stdout as a single line of JSON.
+ *   0 — `rpc_result` arrived; the handler's return value is printed to
+ *       stdout as a single line of JSON.
  *   1 — the daemon is down (connect failed), the server returned `error`,
  *       the response frame never arrived before the deadline, or the
  *       arguments are malformed. The human-readable reason goes to stderr.
@@ -62,24 +74,31 @@ import { encodeFrame, LineBuffer, type ServerFrame } from "../src/protocol";
  */
 const RESPONSE_TIMEOUT_MS = 5000;
 
-const HELP = `approve — thin RPC client for the keeper subscribe server's set_approval
+/** Wire-validated approval enum, mirrored from `src/rpc-handlers.ts`. */
+const APPROVAL_STATUSES = new Set(["approved", "rejected", "pending"]);
 
-Usage: bun scripts/approve.ts [--sock <path>] <epic_id> <task_key> <verb>
+const HELP = `approve — thin RPC client for the keeper subscribe server's planctl-native approval RPCs
 
-  <epic_id>    Planctl epic id
-  <task_key>   Task slug (\`<epic_id>.<n>\`) or \`close:<epic_id>\` (the
-               virtual per-epic close-approval row)
-  <verb>       One of: approve, reject, clear
+Usage: bun scripts/approve.ts [--sock <path>] <epic_id> <status>
+       bun scripts/approve.ts [--sock <path>] <epic_id> <task_id> <status>
+
+  <epic_id>      Planctl epic id
+  <task_id>      Planctl task id (optional — omit to target the epic)
+  <status>       One of: approved, rejected, pending
 
   --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)
   --help         Show this help
 
-Examples:
-  bun scripts/approve.ts fn-581-server-mutation-rpcs-and-autopilot fn-581-server-mutation-rpcs-and-autopilot.3 approve
-  bun scripts/approve.ts fn-581 close:fn-581 reject
-  bun scripts/approve.ts fn-581 fn-581.3 clear
+Routing:
+  2 positionals (<epic_id> <status>)            → set_epic_approval
+  3 positionals (<epic_id> <task_id> <status>)  → set_task_approval
 
-On success: prints the resulting row (or { cleared: true, ... }) as JSON to
+Examples:
+  bun scripts/approve.ts fn-592-approval-as-planctl-field approved
+  bun scripts/approve.ts fn-592-approval-as-planctl-field fn-592-approval-as-planctl-field.4 rejected
+  bun scripts/approve.ts fn-592-approval-as-planctl-field pending
+
+On success: prints the handler's return value as a single JSON line to
 stdout and exits 0. On failure (daemon down, validation error, unknown
 method, timeout): prints the reason to stderr and exits 1.
 `;
@@ -89,18 +108,53 @@ function die(message: string): never {
   process.exit(1);
 }
 
-/** Map the CLI's user-facing verbs to the RPC's wire `status` field. */
-function statusFromVerb(verb: string): "approved" | "rejected" | "clear" {
-  switch (verb) {
-    case "approve":
-      return "approved";
-    case "reject":
-      return "rejected";
-    case "clear":
-      return "clear";
-    default:
-      die(`unknown verb '${verb}' (expected approve|reject|clear)`);
+/**
+ * Validate a positional `status` arg against the wire enum. Throws via
+ * `die` (exit 1) on a value off the enum.
+ */
+function validateStatus(value: string): "approved" | "rejected" | "pending" {
+  if (!APPROVAL_STATUSES.has(value)) {
+    die(`unknown status '${value}' (expected approved|rejected|pending)`);
   }
+  return value as "approved" | "rejected" | "pending";
+}
+
+/**
+ * Decide which RPC to call from positional arity, validate args, and
+ * return the wire payload. Two positionals → `set_epic_approval`; three →
+ * `set_task_approval`. Anything else exits 1 with usage guidance.
+ */
+function routePositionals(positionals: string[]): {
+  method: "set_epic_approval" | "set_task_approval";
+  params: Record<string, string>;
+} {
+  if (positionals.length === 2) {
+    const [epic_id, statusRaw] = positionals as [string, string];
+    if (epic_id.length === 0) {
+      die("epic_id must be non-empty");
+    }
+    return {
+      method: "set_epic_approval",
+      params: { epic_id, status: validateStatus(statusRaw) },
+    };
+  }
+  if (positionals.length === 3) {
+    const [epic_id, task_id, statusRaw] = positionals as [
+      string,
+      string,
+      string,
+    ];
+    if (epic_id.length === 0 || task_id.length === 0) {
+      die("epic_id and task_id must be non-empty");
+    }
+    return {
+      method: "set_task_approval",
+      params: { epic_id, task_id, status: validateStatus(statusRaw) },
+    };
+  }
+  die(
+    `expected 2 (<epic_id> <status>) or 3 (<epic_id> <task_id> <status>) positional args; got ${positionals.length}. Pass --help for usage.`,
+  );
 }
 
 async function main(): Promise<void> {
@@ -118,17 +172,7 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  const positionals = parsed.positionals;
-  if (positionals.length !== 3) {
-    die(
-      `expected 3 positional args (<epic_id> <task_key> approve|reject|clear); got ${positionals.length}. Pass --help for usage.`,
-    );
-  }
-  const [epic_id, task_key, verb] = positionals as [string, string, string];
-  if (epic_id.length === 0 || task_key.length === 0) {
-    die("epic_id and task_key must be non-empty");
-  }
-  const status = statusFromVerb(verb);
+  const { method, params } = routePositionals(parsed.positionals);
 
   const sockPath = parsed.values.sock ?? resolveSockPath();
   // One fresh id per invocation. The CLI is single-shot — it never
@@ -193,8 +237,8 @@ async function main(): Promise<void> {
             encodeFrame({
               type: "rpc",
               id: rpcId,
-              method: "set_approval",
-              params: { epic_id, task_key, status },
+              method,
+              params,
             }),
           );
         },
@@ -230,9 +274,11 @@ async function main(): Promise<void> {
               continue;
             }
             if (frame.type === "rpc_result") {
-              // Print the handler's `value` — for set_approval that's the
-              // upserted row or `{ cleared: true, ... }`. One JSON line so
-              // a caller pipes it cleanly into `jq` or another consumer.
+              // Print the handler's `value` — for set_epic_approval that's
+              // `{ ok: true, epic_id, approval }`, for set_task_approval
+              // it's `{ ok: true, epic_id, task_id, approval }`. One JSON
+              // line so a caller pipes it cleanly into `jq` or another
+              // consumer.
               finish(0, { stdout: `${JSON.stringify(frame.value)}\n` });
               clearTimeout(timeout);
               try {

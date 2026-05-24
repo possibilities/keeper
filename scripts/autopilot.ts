@@ -1,92 +1,74 @@
 #!/usr/bin/env bun
 /**
  * autopilot — live epic-block view with per-task approval pills, over the
- * read-only NDJSON-over-UDS subscribe server (`src/server-worker.ts`). It is
- * the first example client to ride TWO simultaneous `Bun.connect` sockets:
- * one subscribes to the `epics` collection (the render skeleton), one
- * subscribes to the `approvals` sidecar (schema v12 — the pill state). Two
- * connections are necessary because `dispatchLine` REPLACES the active
- * subscription on every `query` (server-worker's one-subscription-per-
- * connection contract — see `src/server-worker.ts:537-549`); multi-sub per
- * connection would require a protocol change beyond this epic's scope.
+ * read-only NDJSON-over-UDS subscribe server (`src/server-worker.ts`). One
+ * `Bun.connect` socket; one subscription to the `epics` collection. Each
+ * epic row carries its planctl-native `approval` field as a top-level
+ * column (schema v13 — see `fn-592-approval-as-planctl-field`), and each
+ * embedded task element inside `epic.tasks` carries its own `approval`
+ * field. No sidecar table, no second subscription, no virtual close-row.
  *
  * Render shape (YAML block sequence, one entry per epic in newest-first
  * `epics` order):
  *
  *   ---
- *   - epic: <epic_id>
+ *   - epic: <epic_id> [<approval>]
  *     tasks:
- *       - <task_id> [<pill>]
- *       - <task_id> [<pill>]
- *     - close:<epic_id> [<pill>]
- *   - epic: <epic_id>
+ *       - <task_id> [<approval>]
+ *       - <task_id> [<approval>]
+ *   - epic: <epic_id> [<approval>]
  *     tasks: []
- *     - close:<epic_id> [<pill>]
  *
  * Each task line shows the slug only (no titles, no `project_dir`, no
- * `[<status>]` — those were the old flat-line shape). The trailing
- * `close:<epic_id>` row is virtual — there is no task in `epic.tasks` for
- * it; it's a per-epic approval slot the planning workflow uses to gate
- * closing the whole epic, surfaced here so an operator can `approve`/
- * `reject` it via `scripts/approve.ts`. The pill is `[pending]`,
- * `[approved]`, or `[rejected]`, sourced from the approvals worker's
- * `approvalsByKey` map (key = `epic_id + ':' + task_key`); a missing row
- * renders as `[pending]` — the schema-v12 invariant (absent row =
- * pending).
+ * `[<status>]`); the trailing approval pill comes from the embedded task
+ * element's `approval` field. A missing / unknown value coerces to
+ * `pending` (a defensive guard — the plan-worker pre-coerces, so a value
+ * off the enum at this layer would be a bug).
  *
- * Two-connection design. `ConnectionWorker` is a closure factory: one call
- * returns `{ start, stop, getRows }`, each instance owning ITS OWN
- * `currentSock` / `attempt` / `pollTimer` / `queryInFlight` /
- * `refetchDirty` / `gotResult` / `order` / `byId` / `LineBuffer` + the
- * full reconnect-with-backoff loop. The renderer reads from both workers'
- * state via `getRows()`. Two singletons in `main()` — `epicsWorker` and
- * `approvalsWorker` — share one `lastBody` and one `emitFrameIfChanged`:
- * either worker's `result` or `patch`/`meta` triggers a re-eval, but the
- * byte-compare emit-gate fires only when the rendered text moves (a pill
- * flip reframes; a task title edit or status flip alone does NOT, since
- * neither is in the rendered surface).
+ * Default scope. The server's `epics` descriptor carries
+ * `defaultFilter: { status: "open", approval: { ne: "approved" } }`, so a
+ * bare query hides approved epics by default. autopilot's CLI flags
+ * compose on top of that:
  *
- * Lifecycle narration is SHARED. `emitLifecycle` carries an
- * `event_source: epics|approvals` detail key so a long-lived viewer can
- * tell which loop changed. SIGINT cleanly stops BOTH workers (unsubscribe
- * + end socket on each, clear both poll timers) before a single
- * `process.exit(0)` — no double-exit, no orphaned timers.
+ *   --show-approved   drop ONLY the `approval` default (status default
+ *                     stays); approved epics reappear.
+ *   --status <s>      pin the status default to a specific value (e.g.
+ *                     `done`).
+ *   --status-ne <s>   exclude one status value (overrides the default
+ *                     `status: "open"` scope).
  *
- * Tolerance for an old daemon. On first connect against a daemon that
- * predates Task .2's schema-v12 (no `approvals` collection), the
- * approvals worker's first frame can be an `error` with code
- * `unknown_collection`. That is NOT terminal — the per-worker
- * `gotResult` guard means a not-yet-seen-good-page error on the
- * approvals socket warns and leaves `approvalsByKey` empty; the
- * renderer treats every task as `[pending]` and epics keeps flowing.
- * A `bad_frame` / `unknown_collection` on the EPICS worker remains
- * terminal — a reconnect can't fix a malformed query and there's no
- * useful render without epics.
+ * Server filter composition. Per-key wire override drops the matching
+ * descriptor default; an unmentioned key keeps its default. So
+ * `--show-approved` sends `filter: { approval: { in: [<every enum
+ * value>] } }` — an `in`-list naming the full approval vocabulary. The
+ * presence of the `approval` key drops the descriptor default for that
+ * key; the all-values `in` payload asserts no real constraint, so every
+ * approval value passes. See `epicsFilter` below for the exact wire
+ * payload.
  *
  * Single shared sidecar. The per-pid `/tmp/autopilot.<pid>.state.json`
- * and `/tmp/autopilot.<pid>.frame.yaml` files mirror the COMBINED view
- * (epics page + approvals map), written at most once per emitted frame.
+ * and `/tmp/autopilot.<pid>.frame.yaml` files mirror the epics page,
+ * written at most once per emitted frame.
  *
  * Reuse with sibling clients: `src/protocol.ts` (`encodeFrame`,
- * `LineBuffer`), `resolveSockPath()`, the connection/coalescing logic
- * cloned from `scripts/jobs.ts` / `scripts/epics.ts`. The "extract a
- * shared module if a third client appears" comment at the original
- * autopilot.ts:55-58 is now formally triggering; this rewrite
- * closure-factors the per-connection plumbing inside autopilot.ts (not
- * a separate `scripts/lib/keeper-client.ts`) so two `ConnectionWorker`s
- * co-exist cleanly. A future task can extract once a fourth use appears.
+ * `LineBuffer`), `resolveSockPath()`, the connection / coalescing /
+ * reconnect-with-backoff loop cloned from `scripts/jobs.ts` /
+ * `scripts/epics.ts`.
  *
  * Usage:
  *   bun scripts/autopilot.ts [--sock <path>] [--status <s> | --status-ne <s>]
+ *                            [--show-approved]
  *
- *   --sock <path>    Socket path override (else $KEEPER_SOCK, else the
- *                    ~/.local/state/keeper/keeperd.sock default).
- *   --status <s>     Filter the EPICS subscription to epics whose status
- *                    equals <s> (e.g. done). Does NOT filter approvals.
- *   --status-ne <s>  Filter the EPICS subscription to epics whose status
- *                    is NOT <s>. Default: no filter → server applies
- *                    open-epic scope.
- *   --help           Show this help.
+ *   --sock <path>      Socket path override (else $KEEPER_SOCK, else the
+ *                      ~/.local/state/keeper/keeperd.sock default).
+ *   --status <s>       Filter the epics subscription to epics whose status
+ *                      equals <s> (e.g. done).
+ *   --status-ne <s>    Filter the epics subscription to epics whose status
+ *                      is NOT <s>. Default: server applies the open-epic
+ *                      scope.
+ *   --show-approved    Drop the descriptor's approval default; approved
+ *                      epics reappear. The status default still applies.
+ *   --help             Show this help.
  */
 
 import { writeFileSync } from "node:fs";
@@ -104,11 +86,11 @@ import {
 const PAGE_LIMIT = 10;
 
 /**
- * How often (ms) each worker refetches its page. The server can't signal an
- * off-page re-sort (see file header), so this steady beat is what guarantees
- * we eventually show the current top-N. The server's own `data_version`
- * poll is ~50ms; this is the client's coarser "always show the latest page"
- * cadence.
+ * How often (ms) the worker refetches its page. The server can't signal
+ * an off-page re-sort, so this steady beat is what guarantees we
+ * eventually show the current top-N. The server's own `data_version`
+ * poll is ~50ms; this is the client's coarser "always show the latest
+ * page" cadence.
  */
 const POLL_MS = 500;
 
@@ -124,41 +106,55 @@ const MAX_BACKOFF_MS = 5000;
 const HELP = `autopilot — epic-block stream with approval pills over the keeper subscribe server
 
 Usage: bun scripts/autopilot.ts [--sock <path>]
-       [--status <s> | --status-ne <s>]
+       [--status <s> | --status-ne <s>] [--show-approved]
 
-  --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
-  --status <s>     Filter the epics subscription to epics whose status
-                   equals <s> (e.g. done)
-  --status-ne <s>  Filter the epics subscription to epics whose status
-                   is NOT <s>
-                   (--status and --status-ne are mutually exclusive)
-                   (default: no status flag → the server's default scope
-                   shows only OPEN epics; pass a flag to see other statuses)
-  --help           Show this help
+  --sock <path>     Socket path override ($KEEPER_SOCK / default otherwise)
+  --status <s>      Filter the epics subscription to epics whose status
+                    equals <s> (e.g. done)
+  --status-ne <s>   Filter the epics subscription to epics whose status
+                    is NOT <s>
+                    (--status and --status-ne are mutually exclusive)
+                    (default: no status flag → the server's default scope
+                    shows only OPEN epics; pass a flag to see other statuses)
+  --show-approved   Drop the server's approval default; approved epics
+                    reappear in the page. The status default still applies.
+  --help            Show this help
 
-Renders one block per epic (newest-first) — \`- epic: <epic_id>\` over
-either \`tasks: []\` or \`tasks:\` + nested \`- <task_id> [<pill>]\`
-lines — and one trailing virtual \`- close:<epic_id> [<pill>]\` row per
-epic. Pills are sourced from a SECOND \`approvals\` subscription that runs
-in parallel; missing row = \`[pending]\` (the schema-v12 invariant). A new
-frame prints only when the rendered output changes; pill flips reframe,
-task title edits / status flips do not. Every emitted frame is mirrored
-to two /tmp sidecar files (full JSON state + rendered frame), whose paths
-print in a ...-fenced note.
+Renders one block per epic (newest-first) — \`- epic: <epic_id> [<approval>]\`
+over either \`tasks: []\` or \`tasks:\` + nested \`- <task_id> [<approval>]\`
+lines. Approval pills come from the planctl-native \`approval\` field on
+each epic / embedded task element (schema v13). A new frame prints only
+when the rendered output changes; pill flips reframe, task title edits /
+status flips do not. Every emitted frame is mirrored to two /tmp sidecar
+files (full JSON state + rendered frame), whose paths print in a
+...-fenced note.
 
-Two parallel \`Bun.connect\` sockets keep the subscriptions alive; either
-worker's \`patch\` / \`meta\` triggers a refetch + re-render. Lifecycle
-notes carry \`event_source: epics|approvals\` so a long-lived viewer can
-tell which loop changed. Both reconnect across keeperd restarts; Ctrl-C
-exits cleanly.
+One \`Bun.connect\` socket carries the subscription; \`patch\` / \`meta\`
+frames trigger a refetch + re-render. Lifecycle notes carry an
+\`event_source: epics\` detail key for parity with multi-source viewers.
+The connection reconnects across keeperd restarts; Ctrl-C exits cleanly.
 `;
 
-/** The two collection names this client streams. */
+/** The collection name this client streams. */
 const EPICS_COLLECTION = "epics";
-const APPROVALS_COLLECTION = "approvals";
-/** Primary keys of each collection (for `row[pk]` lookups). */
+/** Primary key of the collection (for `row[pk]` lookups). */
 const EPIC_PK = "epic_id";
-const APPROVAL_PK = "approval_id";
+
+/** Approval enum vocabulary, mirrored from `src/plan-worker.ts:Approval`. */
+const APPROVAL_VALUES = new Set(["approved", "rejected", "pending"]);
+
+/**
+ * Coerce a row's `approval` cell to the enum's display value. The plan-
+ * worker pre-coerces so a value off the enum at this layer would be a
+ * bug; we coerce defensively anyway (CLAUDE.md "safe value" invariant)
+ * so a typo never breaks the render.
+ */
+function approvalPill(v: unknown): string {
+  if (typeof v === "string" && APPROVAL_VALUES.has(v)) {
+    return v;
+  }
+  return "pending";
+}
 
 /**
  * Render one value as YAML. Scalars are bare when safe, else single-quoted;
@@ -224,35 +220,10 @@ function die(message: string): never {
  *                an array of decoded rows. Wholesale rebuilt on every
  *                `result`; never mutated outside the `handleFrame` path.
  *
- * Constructor params:
- *   - `name`             — `"epics"` / `"approvals"`, used as the
- *                          `event_source` tag in lifecycle notes and the
- *                          subscription id (also doubles as a debug label).
- *   - `pk`               — primary-key column of the collection, for the
- *                          `byId` index.
- *   - `query`            — the `QueryFrame` to (re)send on every connect
- *                          and every coalesced refetch. Stable for the
- *                          life of the worker.
- *   - `sockPath`         — UDS path to connect to. Resolved once in
- *                          `main()` and passed in.
- *   - `isShuttingDown`   — closure-shared "we're exiting" flag. Reading
- *                          a getter (not capturing a `let`) keeps the
- *                          worker honest about a flag flipped by SIGINT
- *                          AFTER this worker was constructed.
- *   - `onChange`         — invoked from `handleFrame` whenever the
- *                          worker's state may have moved (any `result`
- *                          completion or any `patch`/`meta` that
- *                          triggers a refetch). The shared renderer +
- *                          emit-gate runs here.
- *   - `emitLifecycle`    — shared lifecycle channel; the worker passes
- *                          its own `name` as `event_source`.
- *   - `isTerminalError`  — `true` if an `error` frame BEFORE the first
- *                          `result` should exit the process. The epics
- *                          worker passes `true` (no useful render
- *                          without epics); the approvals worker passes
- *                          `false` (an old daemon's
- *                          `unknown_collection` warns and renders
- *                          everything as `[pending]`).
+ * Kept as a closure factory (rather than collapsed inline) for two
+ * reasons: (a) a future sibling subscription could re-use the same
+ * machinery by instantiating a second worker, and (b) the per-connection
+ * state stays cleanly scoped — no module-level mutables.
  */
 type ConnectionWorker = {
   start: () => Promise<void>;
@@ -350,10 +321,7 @@ function createConnectionWorker(params: {
       if (!gotResult && isTerminalError) {
         // A bad_frame / unknown_collection on the EPICS worker is
         // terminal — a reconnect can't fix a malformed query, and
-        // there's no useful render without epics. The approvals worker
-        // passes `isTerminalError: false`, so an old daemon's
-        // `unknown_collection` just leaves `approvalsByKey` empty
-        // (every task renders as `[pending]`) and epics keeps flowing.
+        // there's no useful render without epics.
         try {
           currentSock?.end();
         } catch {
@@ -386,8 +354,7 @@ function createConnectionWorker(params: {
     queryInFlight = false;
     refetchDirty = false;
     // Notify the shared renderer that this worker's page just dropped,
-    // so a stale view (e.g. an approval pill snapshot from a previous
-    // daemon process) doesn't linger after a disconnect.
+    // so a stale view doesn't linger after a disconnect.
     onChange();
   }
 
@@ -492,6 +459,7 @@ async function main(): Promise<void> {
       sock: { type: "string" },
       status: { type: "string" },
       "status-ne": { type: "string" },
+      "show-approved": { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -510,9 +478,6 @@ async function main(): Promise<void> {
   const log = (s: string) => process.stdout.write(`${s}\n`);
 
   // The last frame's body, so a byte-identical re-send prints nothing.
-  // Shared across both workers — either worker's update walks back through
-  // `emitFrameIfChanged` and a render-text-stable update is silently
-  // swallowed.
   let lastBody: string | null = null;
 
   let shuttingDown = false;
@@ -520,15 +485,14 @@ async function main(): Promise<void> {
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
   /**
-   * Project the epics + approvals pages into a YAML document body (no
-   * leading `---`). Walks each epic in the epics worker's order
-   * (server-sent — newest-first per the default sort); for each epic emits
-   * `- epic: <epic_id>` followed by `tasks: []` or `tasks:` + nested
-   * `- <task_id> [<pill>]` lines per embedded task, then one trailing
-   * `- close:<epic_id> [<pill>]` virtual row. Pills are sourced from the
-   * approvals worker's keyed map (`approvalsByKey.get(epic_id + ':' +
-   * task_key)`); a missing row renders as `[pending]` — the schema-v12
-   * invariant.
+   * Project the epics page into a YAML document body (no leading `---`).
+   * Walks each epic in the epics worker's order (server-sent —
+   * newest-first per the default sort); for each epic emits
+   * `- epic: <epic_id> [<approval>]` followed by `tasks: []` or
+   * `tasks:` + nested `- <task_id> [<approval>]` lines per embedded
+   * task. Both pills come from the planctl-native `approval` field
+   * (top-level on the epic row, top-level on each embedded task
+   * element) — no second subscription, no virtual close-row.
    *
    * Empty epics page (no rows yet, or all epics filtered out) renders
    * `"[]"` — an empty YAML sequence — so the frame is always a valid
@@ -536,29 +500,8 @@ async function main(): Promise<void> {
    */
   function renderBody(): string {
     const epicsRows = epicsWorker.getRows();
-    const approvalsRows = approvalsWorker.getRows();
 
-    // Build the lookup once per render. Approval rows arrive on the
-    // sidecar subscription as `{ approval_id, epic_id, task_key, status,
-    // updated_at }`; we key by `epic_id:task_key` to match the spec.
-    const approvalsByKey = new Map<string, string>();
-    for (const row of approvalsRows.values()) {
-      const epic_id = seg(row.epic_id);
-      const task_key = seg(row.task_key);
-      const status = seg(row.status);
-      if (epic_id.length === 0 || task_key.length === 0) {
-        continue;
-      }
-      approvalsByKey.set(`${epic_id}:${task_key}`, status);
-    }
-
-    const pillFor = (epic_id: string, task_key: string): string => {
-      const status = approvalsByKey.get(`${epic_id}:${task_key}`);
-      // Schema-v12 invariant: absent row = "pending".
-      return status && status.length > 0 ? status : "pending";
-    };
-
-    // Use the epics worker's `order` for newest-first iteration. The
+    // Use the epics worker's order for newest-first iteration. The
     // worker rebuilds it wholesale on every `result`, so it's already
     // in server-sent order at render time.
     const epicIdsInOrder: string[] = [];
@@ -573,7 +516,8 @@ async function main(): Promise<void> {
     const lines: string[] = [];
     for (const epic_id of epicIdsInOrder) {
       const epic = epicsRows.get(epic_id) ?? { [EPIC_PK]: epic_id };
-      lines.push(`- epic: ${yamlScalar(epic_id)}`);
+      const epicPill = approvalPill(epic.approval);
+      lines.push(`- epic: ${yamlScalar(`${epic_id} [${epicPill}]`)}`);
       const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
       if (tasks.length === 0) {
         lines.push("  tasks: []");
@@ -582,18 +526,10 @@ async function main(): Promise<void> {
         for (const task of tasks) {
           const t = task as Record<string, unknown>;
           const task_id = seg(t.task_id);
-          const pill = pillFor(epic_id, task_id);
+          const pill = approvalPill(t.approval);
           lines.push(`    - ${yamlScalar(`${task_id} [${pill}]`)}`);
         }
       }
-      // Virtual per-epic close-approval row. There is no task in
-      // `epic.tasks` for it — `task_key` is the literal `close:<epic_id>`
-      // string the planning workflow uses. Emitted UNDER the same epic
-      // mapping (consistent indent with the tasks list) so a reader sees
-      // it grouped with that epic.
-      const closeKey = `close:${epic_id}`;
-      const closePill = pillFor(epic_id, closeKey);
-      lines.push(`  - ${yamlScalar(`${closeKey} [${closePill}]`)}`);
     }
     return lines.join("\n");
   }
@@ -601,24 +537,23 @@ async function main(): Promise<void> {
   // Per-frame sidecar files: the latest emitted frame is mirrored to /tmp so
   // it can be inspected out-of-band. Per-pid so concurrent runs don't
   // collide; overwritten each frame (always the most recently printed
-  // frame). The state snapshot includes BOTH workers' pages so a reader
-  // sees the full input the frame was built from.
+  // frame).
   const stateSidecar = `/tmp/autopilot.${process.pid}.state.json`;
   const frameSidecar = `/tmp/autopilot.${process.pid}.frame.yaml`;
 
   /**
    * Mirror the just-emitted frame to its two sidecar files and print a
-   * `...`-fenced note with their paths. The combined state file carries
-   * both the epics page (in server-sent order) and the approvals map (as
-   * an array of rows). Best-effort: a /tmp write failure logs a warning
-   * and never wedges the stream.
+   * `...`-fenced note with their paths. The state file carries the
+   * epics page (in server-sent order) — approval rides as the
+   * top-level `approval` column on the epic row and on each embedded
+   * task element, so a reader sees the full input the frame was built
+   * from without a second collection. Best-effort: a /tmp write
+   * failure logs a warning and never wedges the stream.
    */
   function writeSidecars(frameText: string): void {
     const epicsRows = epicsWorker.getRows();
-    const approvalsRows = approvalsWorker.getRows();
     const state = {
       epics: Array.from(epicsRows.values()),
-      approvals: Array.from(approvalsRows.values()),
     };
     try {
       writeFileSync(stateSidecar, `${JSON.stringify(state, null, 2)}\n`);
@@ -653,13 +588,13 @@ async function main(): Promise<void> {
 
   /**
    * Print a connection-lifecycle "meta message": a `...`-fenced YAML doc
-   * naming the `event`, an `event_source` (`"epics"` / `"approvals"`)
-   * detail key, and any other detail keys. This is the SAME out-of-band
-   * channel as the sidecar note (`writeSidecars`), distinct from the
-   * server's `meta` staleness frame — it narrates connect/disconnect/wait
-   * so a long-lived viewer's stream is self-describing across keeperd
-   * restarts AND across which worker changed. Detail values route through
-   * `yamlScalar` so a path or message quotes correctly.
+   * naming the `event`, an `event_source` (`"epics"`) detail key, and
+   * any other detail keys. This is the SAME out-of-band channel as the
+   * sidecar note (`writeSidecars`), distinct from the server's `meta`
+   * staleness frame — it narrates connect/disconnect/wait so a
+   * long-lived viewer's stream is self-describing across keeperd
+   * restarts. Detail values route through `yamlScalar` so a path or
+   * message quotes correctly.
    */
   function emitLifecycle(
     event: string,
@@ -675,23 +610,41 @@ async function main(): Promise<void> {
     log("...");
   }
 
-  // Build the optional epic-status filter from the CLI flags. Filtering in
-  // SQL — not after the fetch — keeps LIMIT counting matching rows (so the
-  // page is a true top-N of the filtered set, never short) and makes
-  // `result.total` / `meta` describe exactly the set we render. With NO
-  // flag set we send NO `filter` key (the `{}` spread path, not
-  // `filter: {}`) so the server's default scope (`status: "open"`) applies
-  // and the page is the open-epic set. The filter applies ONLY to the
-  // epics subscription — the approvals subscription is always unfiltered
-  // (an approval row belongs to an epic that may or may not be on the
-  // current epics page; rendering tolerates orphans by simply not looking
-  // them up).
+  // Build the epics-subscription filter. The server's `epics` descriptor
+  // carries `defaultFilter: { status: "open", approval: { ne: "approved" } }`,
+  // and per-key wire overrides drop the matching default for that key only
+  // (an unmentioned key keeps its default). So:
+  //
+  //   - no flags          → wire `filter` absent → both descriptor defaults
+  //                         apply (open + not-yet-approved epics).
+  //   - --status <s>      → wire `filter: { status: <s> }`           → status
+  //                         default dropped; approval default still applies.
+  //   - --status-ne <s>   → wire `filter: { status: { ne: <s> } }`   → status
+  //                         default dropped; approval default still applies.
+  //   - --show-approved   → wire `filter: { approval: { in: [...all] } }` →
+  //                         drops the approval default by routing the
+  //                         `approval` key into the wire payload, while
+  //                         asserting an `in`-list that names every legal
+  //                         approval value (so no real value is excluded).
+  //                         The status default still applies.
+  //
+  // The flags compose: `--show-approved --status done` sends both the
+  // explicit `status` override AND the approval-default override.
+  const filterParts: Record<string, FilterValue> = {};
+  if (values.status !== undefined) {
+    filterParts.status = values.status;
+  } else if (values["status-ne"] !== undefined) {
+    filterParts.status = { ne: values["status-ne"] };
+  }
+  if (values["show-approved"]) {
+    // Name every legal approval value. The wire goal is "present the
+    // `approval` key so the descriptor default for it drops, but assert
+    // no constraint that excludes a real value" — the all-values `in`
+    // list does that and reads as obvious intent.
+    filterParts.approval = { in: ["approved", "rejected", "pending"] };
+  }
   const epicsFilter: { filter?: Record<string, FilterValue> } =
-    values.status !== undefined
-      ? { filter: { status: values.status } }
-      : values["status-ne"] !== undefined
-        ? { filter: { status: { ne: values["status-ne"] } } }
-        : {};
+    Object.keys(filterParts).length > 0 ? { filter: filterParts } : {};
   const epicsQuery: QueryFrame = {
     type: "query",
     collection: EPICS_COLLECTION,
@@ -699,15 +652,10 @@ async function main(): Promise<void> {
     limit: PAGE_LIMIT,
     ...epicsFilter,
   };
-  const approvalsQuery: QueryFrame = {
-    type: "query",
-    collection: APPROVALS_COLLECTION,
-    id: "frames-approvals",
-    limit: PAGE_LIMIT,
-  };
 
-  // Construct both workers. They share the shutdown flag (via a getter so
-  // a flip in SIGINT is seen by both) and the lifecycle / change channels.
+  // Construct the single worker. It owns the connection lifecycle; the
+  // shared shutdown flag is read via a getter so a SIGINT after
+  // construction is honored.
   const epicsWorker = createConnectionWorker({
     name: "epics",
     pk: EPIC_PK,
@@ -718,24 +666,10 @@ async function main(): Promise<void> {
     emitLifecycle,
     isTerminalError: true,
   });
-  const approvalsWorker = createConnectionWorker({
-    name: "approvals",
-    pk: APPROVAL_PK,
-    query: approvalsQuery,
-    sockPath,
-    isShuttingDown: () => shuttingDown,
-    onChange: emitFrameIfChanged,
-    emitLifecycle,
-    // An `unknown_collection` from an old daemon on the approvals socket
-    // is NOT terminal — warn, leave `approvalsByKey` empty, render every
-    // task as `[pending]`, and let epics keep flowing.
-    isTerminalError: false,
-  });
 
-  // Single shared SIGINT handler — registering twice would queue handlers
-  // and double-exit. Stops both workers (each releases its socket + clears
-  // its poll timer; `stop()` is idempotent so re-firing is harmless) then
-  // exits once.
+  // SIGINT handler — stop the worker (releases its socket + clears its
+  // poll timer; `stop()` is idempotent so re-firing is harmless) then
+  // exit once.
   process.on("SIGINT", () => {
     shuttingDown = true;
     try {
@@ -743,18 +677,10 @@ async function main(): Promise<void> {
     } catch {
       // best-effort
     }
-    try {
-      approvalsWorker.stop();
-    } catch {
-      // best-effort
-    }
     process.exit(0);
   });
 
-  // Start both workers in parallel. Each runs its own connect-with-retry
-  // loop; the lifecycle / change channels into `main` synchronize the
-  // shared render.
-  await Promise.all([epicsWorker.start(), approvalsWorker.start()]);
+  await epicsWorker.start();
 }
 
 await main();
