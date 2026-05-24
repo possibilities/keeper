@@ -16,7 +16,11 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EPICS_DESCRIPTOR, getCollection } from "../src/collections";
+import {
+  EPICS_DESCRIPTOR,
+  GIT_DESCRIPTOR,
+  getCollection,
+} from "../src/collections";
 import { openDb } from "../src/db";
 import type { ErrorFrame, ResultFrame } from "../src/protocol";
 import { runQuery } from "../src/server-worker";
@@ -55,11 +59,12 @@ function seedEpic(
     tasks: string;
     depends_on_epics: string;
     jobs: string;
+    job_links: string;
   }> = {},
 ): void {
   db.query(
-    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs, job_links)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     epic_id,
     opts.epic_number ?? null,
@@ -71,6 +76,40 @@ function seedEpic(
     opts.tasks ?? "[]",
     opts.depends_on_epics ?? "[]",
     opts.jobs ?? "[]",
+    opts.job_links ?? "[]",
+  );
+}
+
+/**
+ * Minimal `jobs` row seeder for the descriptor's `epic_links` round-trip test.
+ * Mirrors `seedEpic`'s shape: only the schema-required columns are populated
+ * unconditionally; everything else rides defaults so the test stays narrow.
+ */
+function seedJob(
+  db: Database,
+  job_id: string,
+  opts: Partial<{
+    epic_links: string;
+    plan_verb: string;
+    plan_ref: string;
+    state: string;
+    last_event_id: number;
+  }> = {},
+): void {
+  db.query(
+    `INSERT INTO jobs (
+       job_id, created_at, updated_at, state,
+       last_event_id, plan_verb, plan_ref, epic_links
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    job_id,
+    1,
+    1,
+    opts.state ?? "stopped",
+    opts.last_event_id ?? 0,
+    opts.plan_verb ?? null,
+    opts.plan_ref ?? null,
+    opts.epic_links ?? "[]",
   );
 }
 
@@ -81,6 +120,15 @@ function seedEpic(
 test("getCollection resolves epics; the dropped tasks collection is gone", () => {
   expect(getCollection("epics")).toBe(EPICS_DESCRIPTOR);
   expect(getCollection("tasks")).toBeUndefined();
+});
+
+test("getCollection resolves the git status collection", () => {
+  expect(getCollection("git")).toBe(GIT_DESCRIPTOR);
+  expect(GIT_DESCRIPTOR.version).toBe("last_event_id");
+  expect(GIT_DESCRIPTOR.filters.project_dir).toBe("project_dir");
+  expect(GIT_DESCRIPTOR.jsonColumns.has("dirty_files")).toBe(true);
+  expect(GIT_DESCRIPTOR.jsonColumns.has("orphaned_files")).toBe(true);
+  expect(GIT_DESCRIPTOR.jsonColumns.has("jobs")).toBe(true);
 });
 
 test("epics descriptor: version is last_event_id; filters include pk + status; tasks is a jsonColumn out of sort/filter", () => {
@@ -96,11 +144,42 @@ test("epics descriptor: version is last_event_id; filters include pk + status; t
   expect(EPICS_DESCRIPTOR.filters.tasks).toBeUndefined();
 });
 
-test("epics default sort is epic_number desc", () => {
+test("epics default sort is epic_number asc", () => {
   expect(EPICS_DESCRIPTOR.defaultSort).toEqual({
     column: "epic_number",
-    dir: "desc",
+    dir: "asc",
   });
+});
+
+test("runQuery decodes the git status JSON columns", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  db.query(
+    `INSERT INTO git_status (
+       project_dir, branch, dirty_count, orphaned_count,
+       dirty_files, orphaned_files, jobs, last_event_id, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "/repo",
+    "main",
+    1,
+    1,
+    JSON.stringify([{ path: "src/a.ts", xy: " M" }]),
+    JSON.stringify([{ path: "src/a.ts", xy: " M" }]),
+    JSON.stringify([{ job_id: "sess-a", dirty: [] }]),
+    12,
+    34,
+  );
+  const res = asResult(runQuery(db, 12, { type: "query", collection: "git" }));
+  expect(res.total).toBe(1);
+  const row = res.rows[0];
+  expect(row).toBeDefined();
+  if (row == null) {
+    throw new Error("expected one git row");
+  }
+  expect(Array.isArray(row.dirty_files)).toBe(true);
+  expect(Array.isArray(row.orphaned_files)).toBe(true);
+  expect(Array.isArray(row.jobs)).toBe(true);
+  db.close();
 });
 
 // ---------------------------------------------------------------------------
@@ -114,10 +193,10 @@ test("runQuery pages the epics collection with the served columns + total", () =
   seedEpic(db, "fn-1-alpha", { epic_number: 1, status: "open" });
   const res = asResult(runQuery(db, 0, { type: "query", collection: "epics" }));
   expect(res.total).toBe(2);
-  // Default sort epic_number desc (newest-created epic on top).
+  // Default sort epic_number asc (oldest-created epic on top).
   expect(res.rows.map((r) => String(r.epic_id))).toEqual([
-    "fn-2-beta",
     "fn-1-alpha",
+    "fn-2-beta",
   ]);
   // Served columns match the descriptor.
   expect(Object.keys(res.rows[0]!).sort()).toEqual(
@@ -209,6 +288,67 @@ test("runQuery decodes the embedded jobs JSON-array column into a real array", (
   const arr = row.jobs as { job_id: string; plan_verb: string }[];
   expect(arr.map((j) => j.job_id)).toEqual(["sess-plan-1"]);
   expect(arr[0]?.plan_verb).toBe("plan");
+  db.close();
+});
+
+test("runQuery decodes the jobs.epic_links JSON-array column into a real array (creator/refiner cross-references stamped by syncPlanctlLinks)", () => {
+  // Schema v14: each `jobs` row carries an `epic_links` JSON-TEXT array
+  // (`JOBS_DESCRIPTOR.jsonColumns`) — the per-session view of the planctl
+  // invocation classifier's output. The read boundary parses it to a real
+  // array so `result`/`patch` frames serve the decoded shape (consumers
+  // never see a JSON string).
+  const { db } = openDb(dbPath, { readonly: false });
+  const links = JSON.stringify([
+    { kind: "creator", target: "fn-1-alpha" },
+    { kind: "refiner", target: "fn-2-beta" },
+  ]);
+  seedJob(db, "sess-planner-1", { epic_links: links, plan_verb: "plan" });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      filter: { job_id: "sess-planner-1" },
+    }),
+  );
+  const row = res.rows[0]!;
+  expect(Array.isArray(row.epic_links)).toBe(true);
+  const arr = row.epic_links as { kind: string; target: string }[];
+  expect(arr).toEqual([
+    { kind: "creator", target: "fn-1-alpha" },
+    { kind: "refiner", target: "fn-2-beta" },
+  ]);
+  db.close();
+});
+
+test("runQuery decodes the epics.job_links JSON-array column into a real array (symmetric per-epic view)", () => {
+  // Schema v14: each `epics` row carries a `job_links` JSON-TEXT array
+  // (`EPICS_DESCRIPTOR.jsonColumns`) — the per-epic view of the same
+  // invocation classifier output (every session whose planctl-CLI footprint
+  // created or refined this epic inside a `/plan:plan` window).
+  const { db } = openDb(dbPath, { readonly: false });
+  const links = JSON.stringify([
+    { kind: "creator", job_id: "sess-planner-1" },
+    { kind: "refiner", job_id: "sess-planner-2" },
+  ]);
+  seedEpic(db, "fn-9-links", {
+    epic_number: 9,
+    status: "open",
+    job_links: links,
+  });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "epics",
+      filter: { epic_id: "fn-9-links" },
+    }),
+  );
+  const row = res.rows[0]!;
+  expect(Array.isArray(row.job_links)).toBe(true);
+  const arr = row.job_links as { kind: string; job_id: string }[];
+  expect(arr).toEqual([
+    { kind: "creator", job_id: "sess-planner-1" },
+    { kind: "refiner", job_id: "sess-planner-2" },
+  ]);
   db.close();
 });
 
@@ -340,8 +480,8 @@ test("runQuery applies the default open-OR-not-approved scope when no filter is 
   const res = asResult(runQuery(db, 0, { type: "query", collection: "epics" }));
   expect(res.total).toBe(2);
   expect(res.rows.map((r) => String(r.epic_id))).toEqual([
-    "fn-2-done",
     "fn-1-open",
+    "fn-2-done",
   ]);
   db.close();
 });
@@ -415,12 +555,12 @@ test("runQuery applies the composed default (open OR !approved) across all combo
   // Default scope: status=open OR approval != approved. Only fn-4 falls off.
   const res = asResult(runQuery(db, 0, { type: "query", collection: "epics" }));
   expect(res.total).toBe(4);
-  // epic_number desc — fn-5, fn-3, fn-2, fn-1.
+  // epic_number asc — fn-1, fn-2, fn-3, fn-5.
   expect(res.rows.map((r) => String(r.epic_id))).toEqual([
-    "fn-5",
-    "fn-3",
-    "fn-2",
     "fn-1",
+    "fn-2",
+    "fn-3",
+    "fn-5",
   ]);
   db.close();
 });

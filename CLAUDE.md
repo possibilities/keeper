@@ -14,10 +14,13 @@ event log, reducer, the five worker threads, and the wire protocol — see
 - **Cursor + projection advance in the SAME `BEGIN IMMEDIATE` transaction.** Every
   fold writes the projection (`jobs`/`epics`, including the `syncJobIntoEpic`
   fan-out from a `plan_ref`-bearing jobs write into the parent epic's embedded
-  `jobs` array or the target task element's nested `jobs` sub-array) and bumps
-  `reducer_state.last_event_id` in one transaction. A crash mid-fold rolls back
-  both; boot drain re-folds idempotently. This is the exactly-once-per-event
-  guarantee — never split the two writes across transactions.
+  `jobs` array or the target task element's nested `jobs` sub-array, AND the
+  `syncPlanctlLinks` fan-out from a `planctl_op != NULL` event re-deriving
+  the touched session's `jobs.epic_links` and every touched epic's
+  `epics.job_links`) and bumps `reducer_state.last_event_id` in one
+  transaction. A crash mid-fold rolls back both; boot drain re-folds
+  idempotently. This is the exactly-once-per-event guarantee — never split
+  the two writes across transactions.
 - **Schema defaults match the zero-event projection.** Keep schema defaults and
   the reducer's no-op / seed branches in sync, so a re-fold from an empty table
   reproduces the same rows.
@@ -37,16 +40,33 @@ event log, reducer, the five worker threads, and the wire protocol — see
   rows, including `epics` rows with their embedded `tasks` arrays and the
   embedded `jobs` arrays at both the epic level and nested inside each task
   element (all built from stable sorts — `(task_number, task_id)` for tasks,
-  `(created_at desc, job_id asc)` for jobs — never append). The producer
-  workers feed the log only via main's writable connection; they never write
-  the DB. Synthetic events covered by this rule: `TranscriptTitle` (transcript
+  `(created_at desc, job_id asc)` for jobs — never append), AND the
+  per-session `jobs.epic_links` + per-epic `epics.job_links` link projections
+  (sorted ASC on `(kind, target)` and `(kind, job_id)` respectively — total
+  -order tiebreakers, never append). Hook-side derivers (`slashCommandFromPrompt`,
+  `extractSkillName`, `planVerbRefFromSpawnName`, `extractPlanctlInvocation`)
+  stamp the seven sparse `events` columns (`slash_command`, `skill_name`, and
+  the five-column planctl envelope `planctl_op` / `planctl_target` /
+  `planctl_epic_id` / `planctl_task_id` / `planctl_subject_present`) at hook
+  write time — all pure functions of the hook payload, shared with the
+  schema-migration backfill so a re-derive on stored events reproduces the
+  same column values. The reducer's `syncJobIntoEpic` fan-out maintains the
+  embedded `jobs` arrays from each `plan_ref`-bearing jobs write; the
+  parallel `syncPlanctlLinks` fan-out maintains `jobs.epic_links` +
+  `epics.job_links` from each `planctl_op != NULL` event by re-deriving
+  from scratch against the touched session's full planctl footprint (never
+  delta-merging, so re-fold idempotence holds). The producer workers feed
+  the log only via main's writable connection; they never write the DB.
+  Synthetic events covered by this rule: `TranscriptTitle` (transcript
   worker), `EpicSnapshot` / `TaskSnapshot` / `EpicDeleted` / `TaskDeleted`
-  (plan worker — these now carry `approval` round-tripped from the file),
-  `Killed` (boot seed sweep + live exit-watcher worker, gated by main's
-  `(pid, start_time)` verifier before insert). The RPC handlers' `.planctl`
-  writes are not projection writes; the watcher round-trips them back as
-  `EpicSnapshot`/`TaskSnapshot` events that the reducer folds — so re-fold
-  determinism extends to `approval`.
+  (plan worker — these now carry `approval` round-tripped from the file;
+  the `EpicSnapshot` ON CONFLICT clause carves out `job_links` alongside
+  the existing `tasks` / `jobs` carve-outs so an approval-RPC round-trip
+  cannot wipe the link projection), `Killed` (boot seed sweep + live
+  exit-watcher worker, gated by main's `(pid, start_time)` verifier before
+  insert). The RPC handlers' `.planctl` writes are not projection writes;
+  the watcher round-trips them back as `EpicSnapshot`/`TaskSnapshot` events
+  that the reducer folds — so re-fold determinism extends to `approval`.
 - **Producer-only liveness probing.** The seed sweep and the exit-watcher
   worker are the ONLY places that probe process liveness (`kill(pid,0)`,
   kqueue `EVFILT_PROC|NOTE_EXIT`, pidfd_open + epoll, `(pid, start_time)`

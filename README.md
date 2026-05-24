@@ -22,12 +22,20 @@ session's `(pid, start_time)` is gone from the OUTSIDE (SIGKILL'd,
 terminal-pane-closed, machine reboot, hook crash). Both terminal states are
 revivable — a fresh `claude --resume` re-opens either one to `stopped`.
 
-The event log also indexes two sparse signals that surface across every
+The event log also indexes seven sparse signals that surface across every
 session — `events.slash_command` (the leading `/foo:bar` token of a
-`UserPromptSubmit` prompt) and `events.skill_name` (the canonical name of a
-Skill-tool invocation, e.g. `plan:plan` or `arthack:check`) — so consumers can
-find `/plan:work` and `Skill` invocations cheaply without JSON-scanning the
-event `data` blob. Both are partial-indexed on `WHERE col IS NOT NULL`.
+`UserPromptSubmit` prompt), `events.skill_name` (the canonical name of a
+Skill-tool invocation, e.g. `plan:plan` or `arthack:check`), and a
+five-column planctl-invocation envelope (`planctl_op`, `planctl_target`,
+`planctl_epic_id`, `planctl_task_id`, `planctl_subject_present`) stamped on
+every `PreToolUse:Bash` row whose command parses as a `planctl <verb>
+[target]` invocation — so consumers can find `/plan:work` calls, `Skill`
+invocations, AND every planctl-CLI mutation cheaply without JSON-scanning
+the event `data` blob. The `planctl_*` columns drive the creator/refiner
+classifier (see [Architecture](#architecture)). All seven are partial-indexed
+on `WHERE col IS NOT NULL` (the planctl columns share a composite
+`(session_id, id) WHERE planctl_op IS NOT NULL` index for the per-session
+ordered scan).
 
 The architecture is deliberately small. Keeper is built on Bun + `bun:sqlite`
 with a single third-party runtime dependency: `@parcel/watcher` (a native
@@ -347,9 +355,18 @@ epic's embedded `tasks` JSON array (a task change `patch`es the parent epic;
 tombstones retract). As of schema v11 each epic also embeds its plan/close-verb
 jobs as a `jobs` JSON array, and each task element embeds its own work-verb
 jobs as a nested `jobs` sub-array — fanned in from the reducer's jobs-side
-writes whenever a SessionStart spawn name parses as `{plan|work|close}::<ref>`,
-so the single `epics` collection serves epic + tasks + associated sessions in
-one subscribe. File deletions are filesystem-synchronized: a live delete fires
+writes whenever a SessionStart spawn name parses as `{plan|work|close}::<ref>`
+(the `syncJobIntoEpic` helper), so the single `epics` collection serves epic
++ tasks + associated sessions in one subscribe. As of schema v14 a second
+fan-out rides alongside: every `planctl_op != NULL` event triggers the
+`syncPlanctlLinks` helper, which re-derives per-session `jobs.epic_links` and
+per-epic `epics.job_links` from the session's planctl-CLI footprint
+classified against its `/plan:plan` windows (creator = `epic-create`
+mutation inside a window; refiner = any other epic-touching mutation inside
+a window). Both fan-outs run INSIDE the same `BEGIN IMMEDIATE` transaction
+as the triggering event's projection write + cursor advance, so the embedded
+arrays + link projections are pure functions of the event log and a
+from-scratch re-fold reproduces them byte-identically. File deletions are filesystem-synchronized: a live delete fires
 a tombstone, and a boot-reconciliation sweep retracts anything deleted while
 the daemon was down. It is
 the second instance of the same producer archetype as the transcript worker:
@@ -400,6 +417,18 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 # All Skill-tool plan:plan invocations across sessions — uses the partial idx_events_skill_name index:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT session_id, datetime(ts,'unixepoch','localtime'), skill_name FROM events WHERE skill_name LIKE 'plan:%' ORDER BY id DESC LIMIT 20"
+
+# All planctl-CLI invocations across sessions — uses the composite partial idx_events_planctl_session index; the WHERE predicate must match the index predicate syntactically for SQLite to land the index:
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT session_id, datetime(ts,'unixepoch','localtime'), planctl_op, planctl_target FROM events WHERE planctl_op IS NOT NULL ORDER BY id DESC LIMIT 20"
+
+# Jobs that created or refined an epic during a /plan:plan window (creator/refiner classifier output — jobs.epic_links is the per-session fan-out written by syncPlanctlLinks):
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT job_id, plan_verb, plan_ref, epic_links FROM jobs WHERE json_array_length(epic_links) > 0 ORDER BY updated_at DESC LIMIT 10"
+
+# Epics by inbound-link density — every job whose planctl-CLI footprint created or refined the epic during a /plan:plan window (epics.job_links is the symmetric per-epic fan-out):
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT epic_id, epic_number, title, json_array_length(job_links) AS n FROM epics WHERE json_array_length(job_links) > 0 ORDER BY n DESC, epic_number ASC LIMIT 10"
 
 # Killed sessions specifically (proven-dead from outside the hook stream — SIGKILL, terminal-pane closure, reboot):
 sqlite3 ~/.local/state/keeper/keeper.db \

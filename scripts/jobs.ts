@@ -4,6 +4,14 @@
  * server (`src/server-worker.ts`). It renders a *page of jobs as a frame* and
  * reprints a fresh frame every time the visible projection changes.
  *
+ * As of schema v14 each served `jobs` row also carries `epic_links` — a
+ * JSON-decoded `{kind, target}[]` array of creator/refiner cross-references
+ * derived by the reducer's `syncPlanctlLinks` fan-out from the session's
+ * planctl-CLI footprint inside its `/plan:plan` windows. The field is part of
+ * the served projection (see `JOBS_DESCRIPTOR.jsonColumns`); this script does
+ * not surface it in the default render today, but a frame inspector reading
+ * the per-pid JSON sidecar can read the array as-is.
+ *
  * It `query`s a 10-row page of `jobs` and renders it as a `---`-led document
  * of one job per line in plain bracket form:
  *

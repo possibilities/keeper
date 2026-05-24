@@ -4,6 +4,14 @@
  * server (`src/server-worker.ts`). It renders a *page of epics as a frame* and
  * reprints a fresh frame every time the visible projection changes.
  *
+ * As of schema v14 each served `epics` row also carries `job_links` — a
+ * JSON-decoded `{kind, job_id}[]` array of every session whose planctl-CLI
+ * footprint inside a `/plan:plan` window created (`kind: "creator"`) or
+ * refined (`kind: "refiner"`) this epic. The field is part of the served
+ * projection (see `EPICS_DESCRIPTOR.jsonColumns`); this script does not
+ * surface it in the default render today, but a frame inspector reading the
+ * per-pid JSON sidecar can read the array as-is.
+ *
  * It `query`s the `epics` collection and renders it as a stream of simple text
  * blocks. Each frame is a `---`-led document; each epic is one block:
  *
