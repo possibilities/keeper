@@ -79,5 +79,5 @@ Re-generation is an explicit `bun run gen:fixtures` (or `python scripts/gen-plan
 - [ ] No reference to `Infinity` in `src/plan-classifier.ts` — sentinel is `Number.MAX_SAFE_INTEGER`.
 
 ## Done summary
-
+Ported jobctl's /plan:plan-windowed classifier to a pure TypeScript module (src/plan-classifier.ts) with three exports — computePlanWindows, deriveEpicLinks, deriveJobLinks — and a golden-fixture parity test (test/plan-classifier.test.ts, 23 cases from scripts/gen-plan-classifier-fixture.py). 44/44 tests pass; sentinel is Number.MAX_SAFE_INTEGER (no Infinity).
 ## Evidence
