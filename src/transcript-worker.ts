@@ -633,7 +633,9 @@ function main(): void {
     if (shuttingDown) {
       return;
     }
-    const lastSeen = lastEventAt ? new Date(lastEventAt).toISOString() : "never";
+    const lastSeen = lastEventAt
+      ? new Date(lastEventAt).toISOString()
+      : "never";
     console.error(
       `[transcript-worker] heartbeat events_received=${eventsReceived} last_event_at=${lastSeen}`,
     );
@@ -700,55 +702,52 @@ function main(): void {
   // (skip-and-log), never here.
   import("@parcel/watcher")
     .then((watcher) =>
-      watcher.subscribe(
-        watchRoot,
-        (err, events) => {
-          if (err) {
-            // Always leave a breadcrumb so a future @parcel/watcher wording
-            // change (the drop discriminator couples to its message text) is
-            // observable in the logs.
-            console.error(
-              `[transcript-worker] watcher error: ${stringifyErr(err)}`,
-            );
-            // A recoverable FSEvents drop ("...must be re-scanned"): the lost
-            // title change may never re-fire (the live tail is EOF-anchored), so
-            // schedule a debounced re-scan. A non-drop err keeps today's
-            // swallow-and-log (additive only — no fatal/escalation change).
-            if (isDropError(err)) {
-              rescan.schedule();
-            }
-            return;
+      watcher.subscribe(watchRoot, (err, events) => {
+        if (err) {
+          // Always leave a breadcrumb so a future @parcel/watcher wording
+          // change (the drop discriminator couples to its message text) is
+          // observable in the logs.
+          console.error(
+            `[transcript-worker] watcher error: ${stringifyErr(err)}`,
+          );
+          // A recoverable FSEvents drop ("...must be re-scanned"): the lost
+          // title change may never re-fire (the live tail is EOF-anchored), so
+          // schedule a debounced re-scan. A non-drop err keeps today's
+          // swallow-and-log (additive only — no fatal/escalation change).
+          if (isDropError(err)) {
+            rescan.schedule();
           }
-          // Bump the heartbeat counter so the periodic log distinguishes a
-          // healthy-but-quiet watcher from a silent-dead one. Bumped on the
-          // raw event batch (pre-filter) so we observe the FSEvents firehose,
-          // not just our matched-file slice.
-          eventsReceived += events.length;
-          lastEventAt = Date.now();
-          for (const ev of events) {
-            // Treat every event as "go look" — create/update both tail from the
-            // stored offset; a delete just drops tracking. The in-callback
-            // `.jsonl` check is the sole correctness gate: a directory change
-            // that reaches onChange is rejected by statSync's `isFile()` guard,
-            // so a directory falling through is harmless beyond a stat() call.
-            //
-            // No `ignore` glob is passed to subscribe — historically we used
-            // `{ ignore: ["**/*.!(jsonl)"] }` (a negated extglob), but plan-worker
-            // explicitly avoids that pattern style (parcel-bundler/watcher #174:
-            // parcel mishandles negated globs) and the May-2026 silent-watcher
-            // stall (see heartbeat comment) was strongly correlated with this
-            // option. Re-introduce only as positive `**/<noisy-dir>/**` globs.
-            if (!ev.path.endsWith(".jsonl")) {
-              continue;
-            }
-            if (ev.type === "delete") {
-              stream.unregister(ev.path);
-              continue;
-            }
-            stream.onChange(ev.path);
+          return;
+        }
+        // Bump the heartbeat counter so the periodic log distinguishes a
+        // healthy-but-quiet watcher from a silent-dead one. Bumped on the
+        // raw event batch (pre-filter) so we observe the FSEvents firehose,
+        // not just our matched-file slice.
+        eventsReceived += events.length;
+        lastEventAt = Date.now();
+        for (const ev of events) {
+          // Treat every event as "go look" — create/update both tail from the
+          // stored offset; a delete just drops tracking. The in-callback
+          // `.jsonl` check is the sole correctness gate: a directory change
+          // that reaches onChange is rejected by statSync's `isFile()` guard,
+          // so a directory falling through is harmless beyond a stat() call.
+          //
+          // No `ignore` glob is passed to subscribe — historically we used
+          // `{ ignore: ["**/*.!(jsonl)"] }` (a negated extglob), but plan-worker
+          // explicitly avoids that pattern style (parcel-bundler/watcher #174:
+          // parcel mishandles negated globs) and the May-2026 silent-watcher
+          // stall (see heartbeat comment) was strongly correlated with this
+          // option. Re-introduce only as positive `**/<noisy-dir>/**` globs.
+          if (!ev.path.endsWith(".jsonl")) {
+            continue;
           }
-        },
-      ),
+          if (ev.type === "delete") {
+            stream.unregister(ev.path);
+            continue;
+          }
+          stream.onChange(ev.path);
+        }
+      }),
     )
     .then((sub) => {
       if (shuttingDown) {
