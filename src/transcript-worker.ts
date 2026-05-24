@@ -606,6 +606,46 @@ function main(): void {
     scanJobsForTitles(db, stream);
   });
 
+  // Heartbeat / silent-watcher recovery. Observed (May 2026, daemon pid 83205):
+  // after a sibling-worker segfault history, the @parcel/watcher subscribe
+  // Promise resolved (boot scan ran) but the per-event callback never fired
+  // again — no `update`, no `watcher error`, just 4+ hours of silence while
+  // sessions actively renamed via `/title`. Three sessions stayed pinned to
+  // their stale payload-source title because the priority-3 transcript signal
+  // never reached the reducer. Root cause not isolated (suspect:
+  // parcel-bundler/watcher #174-style negated-glob handling, or Bun
+  // worker_threads N-API callback bridge dying after a sibling crash).
+  //
+  // Two-pronged backstop:
+  //   1. `eventsReceived` counter logged every HEARTBEAT_MS so a future stall
+  //      is visible from `tail -f server.stderr` instead of requiring DB
+  //      forensics.
+  //   2. Every HEARTBEAT_MS, unconditionally re-run scanJobsForTitles. The
+  //      scan is change-gated by `lastEmitted`, so a healthy watcher's already
+  //      emitted titles are suppressed; a silent watcher's missed renames are
+  //      caught within one tick. This is the same primitive the FSEvents-drop
+  //      path uses, so the contract (TRANSIENT decoder, never `onChange`) is
+  //      preserved.
+  const HEARTBEAT_MS = 60_000;
+  let eventsReceived = 0;
+  let lastEventAt = 0;
+  const heartbeatTimer = setInterval(() => {
+    if (shuttingDown) {
+      return;
+    }
+    const lastSeen = lastEventAt ? new Date(lastEventAt).toISOString() : "never";
+    console.error(
+      `[transcript-worker] heartbeat events_received=${eventsReceived} last_event_at=${lastSeen}`,
+    );
+    try {
+      scanJobsForTitles(db, stream);
+    } catch (err) {
+      console.error(
+        `[transcript-worker] heartbeat scan failed: ${stringifyErr(err)}`,
+      );
+    }
+  }, HEARTBEAT_MS);
+
   const closeDb = (): void => {
     try {
       db.close();
@@ -618,8 +658,10 @@ function main(): void {
     if (msg && msg.type === "shutdown") {
       shuttingDown = true;
       // Clear any armed re-scan timer FIRST (before unsubscribe / db close) so a
-      // pending drop-recovery scan can't fire against a closing connection.
+      // pending drop-recovery scan can't fire against a closing connection. The
+      // heartbeat timer carries the same constraint (its body runs scanJobsForTitles).
       rescan.cancel();
+      clearInterval(heartbeatTimer);
       // Release the subscription (external resource), then the db, then exit
       // clean. Mirrors server-worker's socket teardown.
       void (async () => {
@@ -677,15 +719,25 @@ function main(): void {
             }
             return;
           }
+          // Bump the heartbeat counter so the periodic log distinguishes a
+          // healthy-but-quiet watcher from a silent-dead one. Bumped on the
+          // raw event batch (pre-filter) so we observe the FSEvents firehose,
+          // not just our matched-file slice.
+          eventsReceived += events.length;
+          lastEventAt = Date.now();
           for (const ev of events) {
             // Treat every event as "go look" — create/update both tail from the
             // stored offset; a delete just drops tracking. The in-callback
-            // `.jsonl` check below (not the ignore glob alone) is what
-            // guarantees only real transcript files reach the per-file tail:
-            // the `ignore` glob does not exclude directory events, so without
-            // this check a directory change would fall through to onChange and
-            // burn statSync/openSync/readSync (readSync → EISDIR stderr noise).
-            // The glob is kept as belt-and-suspenders.
+            // `.jsonl` check is the sole correctness gate: a directory change
+            // that reaches onChange is rejected by statSync's `isFile()` guard,
+            // so a directory falling through is harmless beyond a stat() call.
+            //
+            // No `ignore` glob is passed to subscribe — historically we used
+            // `{ ignore: ["**/*.!(jsonl)"] }` (a negated extglob), but plan-worker
+            // explicitly avoids that pattern style (parcel-bundler/watcher #174:
+            // parcel mishandles negated globs) and the May-2026 silent-watcher
+            // stall (see heartbeat comment) was strongly correlated with this
+            // option. Re-introduce only as positive `**/<noisy-dir>/**` globs.
             if (!ev.path.endsWith(".jsonl")) {
               continue;
             }
@@ -696,7 +748,6 @@ function main(): void {
             stream.onChange(ev.path);
           }
         },
-        { ignore: ["**/*.!(jsonl)"] },
       ),
     )
     .then((sub) => {
