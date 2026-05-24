@@ -1,7 +1,7 @@
 /**
  * Keeper SQLite layer. Owns:
- * - Schema bootstrap for `events`, `jobs`, `epics`, `reducer_state`, and
- *   `meta`. (As of schema v7 each epic embeds its tasks as a JSON-array
+ * - Schema bootstrap for `events`, `jobs`, `epics`, `git_status`,
+ *   `reducer_state`, and `meta`. (As of schema v7 each epic embeds its tasks as a JSON-array
  *   `epics.tasks` column; the standalone `tasks` table was dropped. As of
  *   schema v13 the planctl-native `approval` lives as a top-level field on
  *   the planctl JSON files and rides through the EpicSnapshot/TaskSnapshot
@@ -52,7 +52,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -347,6 +347,24 @@ CREATE TABLE IF NOT EXISTS epics (
 )
 `;
 
+const CREATE_GIT_STATUS = `
+CREATE TABLE IF NOT EXISTS git_status (
+    project_dir TEXT PRIMARY KEY,
+    branch TEXT,
+    head_oid TEXT,
+    upstream TEXT,
+    ahead INTEGER,
+    behind INTEGER,
+    dirty_count INTEGER NOT NULL DEFAULT 0,
+    orphaned_count INTEGER NOT NULL DEFAULT 0,
+    dirty_files TEXT NOT NULL DEFAULT '[]',
+    orphaned_files TEXT NOT NULL DEFAULT '[]',
+    jobs TEXT NOT NULL DEFAULT '[]',
+    last_event_id INTEGER,
+    updated_at REAL NOT NULL DEFAULT 0
+)
+`;
+
 const CREATE_REDUCER_STATE = `
 CREATE TABLE IF NOT EXISTS reducer_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -467,6 +485,7 @@ function migrate(db: Database): void {
     }
     db.run(CREATE_JOBS);
     db.run(CREATE_EPICS);
+    db.run(CREATE_GIT_STATUS);
     db.run(CREATE_REDUCER_STATE);
     db.run(CREATE_META);
 
@@ -1196,11 +1215,15 @@ function prepareStmts(db: Database): Stmts {
       INSERT INTO events (
         ts, session_id, pid, hook_event, event_type, tool_name, matcher,
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-        subagent_agent_id, spawn_name, start_time, slash_command, skill_name
+        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+        planctl_subject_present
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
-        $subagent_agent_id, $spawn_name, $start_time, $slash_command, $skill_name
+        $subagent_agent_id, $spawn_name, $start_time, $slash_command, $skill_name,
+        $planctl_op, $planctl_target, $planctl_epic_id, $planctl_task_id,
+        $planctl_subject_present
       )
     `),
     selectWorldRev: db.prepare(

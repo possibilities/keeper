@@ -9,7 +9,7 @@
  *   2. Boot drain: `while (drain(db, BATCH) > 0) {}` — fold every unfolded event
  *      using the SAME code path as steady-state. After downtime this catches the
  *      projection up before the daemon goes live.
- *   3. Spawn FIVE worker threads (all AFTER migrate + boot drain + seed sweep,
+ *   3. Spawn SIX worker threads (all AFTER migrate + boot drain + seed sweep,
  *      so their read-only `openDb` connections never race a missing/un-migrated
  *      DB and the exit-watcher's data_version diff sees a settled projection):
  *      - the wake worker — opens its own read-only connection, polls
@@ -39,12 +39,17 @@
  *        writable connection — the third producer-worker instance. The kqueue/
  *        epoll fd is owned by the worker thread and released in its own
  *        shutdown handler.
+ *      - the git worker — polls planctl-backed git worktrees via
+ *        `git status --porcelain=v2 -z`, mines file-tool events from the DB,
+ *        and posts `{ kind: "git-snapshot", ... }`. Main turns each into a
+ *        synthetic `GitSnapshot` events row — the fourth producer-worker
+ *        instance.
  *   4. Steady state: every wake triggers a full drain loop. Wakes that arrive
  *      mid-drain coalesce into the next pass via a single "wake pending" flag —
  *      no event is missed (drain always re-reads from the cursor) and drain is
  *      never invoked re-entrantly. A `transcript-title` / `exit` message
  *      inserts the synthetic event then pumps a wake to fold it.
- *   5. SIGTERM: post `{ type: "shutdown" }` to ALL FIVE workers, await their
+ *   5. SIGTERM: post `{ type: "shutdown" }` to ALL SIX workers, await their
  *      `close` events against a short deadline, terminate them, close the db,
  *      exit 0. This is the ONLY clean exit. The server worker releases its
  *      socket + lock, the transcript + plan workers unsubscribe their watchers,
@@ -69,6 +74,7 @@ import {
   runPlanctlApprovalMigration,
 } from "./db";
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
+import type { GitSnapshotMessage, GitWorkerData } from "./git-worker";
 import type { PlanMessage, PlanWorkerData } from "./plan-worker";
 import { DEFAULT_BATCH_SIZE, drain } from "./reducer";
 import { seedKilledSweep } from "./seed-sweep";
@@ -285,6 +291,11 @@ function runDaemon(): void {
       $start_time: null,
       $slash_command: null,
       $skill_name: null,
+      $planctl_op: null,
+      $planctl_target: null,
+      $planctl_epic_id: null,
+      $planctl_task_id: null,
+      $planctl_subject_present: null,
     });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the title folds without a poll-cycle delay.
@@ -390,6 +401,11 @@ function runDaemon(): void {
       $start_time: null,
       $slash_command: null,
       $skill_name: null,
+      $planctl_op: null,
+      $planctl_target: null,
+      $planctl_epic_id: null,
+      $planctl_task_id: null,
+      $planctl_subject_present: null,
     });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the snapshot folds without a poll-cycle delay.
@@ -494,6 +510,11 @@ function runDaemon(): void {
       $start_time: null,
       $slash_command: null,
       $skill_name: null,
+      $planctl_op: null,
+      $planctl_target: null,
+      $planctl_epic_id: null,
+      $planctl_task_id: null,
+      $planctl_subject_present: null,
     });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the Killed fold lands without a poll-
@@ -511,6 +532,62 @@ function runDaemon(): void {
   // Same crash-via-`close` gap: an exit-watcher `process.exit(1)` fires
   // `close`, not `onerror`. `!shuttingDown` makes it inert on clean shutdown.
   exitWorker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
+
+  // Spawn the git worker after the plan/job projections are caught up. It polls
+  // git directly (no shell) and posts current snapshots; main persists each one
+  // as a synthetic event so the reducer's git_status row is replayable.
+  const gitWorker = new Worker(
+    new URL("./git-worker.ts", import.meta.url).href,
+    {
+      workerData: { dbPath, pollMs: 1000 } satisfies GitWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  gitWorker.onmessage = (
+    ev: MessageEvent<GitSnapshotMessage | undefined>,
+  ): void => {
+    const msg = ev.data;
+    if (!msg || msg.kind !== "git-snapshot") {
+      return;
+    }
+    const { kind: _kind, ...snapshot } = msg;
+    stmts.insertEvent.run({
+      $ts: Date.now() / 1000,
+      $session_id: msg.project_dir,
+      $pid: null,
+      $hook_event: "GitSnapshot",
+      $event_type: "git_snapshot",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: msg.project_dir,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: JSON.stringify(snapshot),
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $planctl_op: null,
+      $planctl_target: null,
+      $planctl_epic_id: null,
+      $planctl_task_id: null,
+      $planctl_subject_present: null,
+    });
+    wakePending = true;
+    pumpWakes();
+  };
+
+  gitWorker.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] git worker error:", err.message ?? err);
+    fatalExit();
+  };
+
+  gitWorker.addEventListener("close", () => {
     if (!shuttingDown) fatalExit();
   });
 
@@ -551,8 +628,9 @@ function runDaemon(): void {
     } satisfies ShutdownMessage);
     planWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     exitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
+    gitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
 
-    // Bun surfaces worker exit via the "close" event. Await ALL FIVE workers'
+    // Bun surfaces worker exit via the "close" event. Await ALL SIX workers'
     // close (the server worker releases its socket + lock, the transcript +
     // plan workers unsubscribe their watchers, and the exit-watcher releases
     // its kqueue/pidfd fd in their own shutdown handlers — that teardown must
@@ -570,6 +648,7 @@ function runDaemon(): void {
         exited(transcriptWorker),
         exited(planWorker),
         exited(exitWorker),
+        exited(gitWorker),
       ]),
       Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS),
     ]);
@@ -596,6 +675,11 @@ function runDaemon(): void {
     }
     try {
       exitWorker.terminate();
+    } catch {
+      // best-effort if it already exited
+    }
+    try {
+      gitWorker.terminate();
     } catch {
       // best-effort if it already exited
     }

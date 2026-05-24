@@ -752,6 +752,176 @@ test("hook leaves skill_name NULL on PreToolUse + non-Skill tool", async () => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Hook process integration (v14): planctl_* columns end-to-end
+// ---------------------------------------------------------------------------
+
+test("hook writes planctl_* columns on PreToolUse:Bash with a planctl mutation command", async () => {
+  // Mutation verb on an epic id: subject_present=1, epic_id stamped,
+  // task_id NULL (epic-form ref). Mirrors the canonical creator-side
+  // invocation shape (`planctl epic-create fn-N-foo "subject"`).
+  const code = await fireViaLauncher("my-session", {
+    hook_event_name: "PreToolUse",
+    session_id: "sess-planctl-create",
+    cwd: "/tmp/work",
+    tool_name: "Bash",
+    tool_input: { command: 'planctl epic-create fn-42-foo "the subject"' },
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        `SELECT planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+                planctl_subject_present
+           FROM events WHERE session_id = 'sess-planctl-create'`,
+      )
+      .get() as {
+      planctl_op: string | null;
+      planctl_target: string | null;
+      planctl_epic_id: string | null;
+      planctl_task_id: string | null;
+      planctl_subject_present: number | null;
+    };
+    expect(row.planctl_op).toBe("epic-create");
+    expect(row.planctl_target).toBe("fn-42-foo");
+    expect(row.planctl_epic_id).toBe("fn-42-foo");
+    expect(row.planctl_task_id).toBeNull();
+    expect(row.planctl_subject_present).toBe(1);
+  } finally {
+    db.close();
+  }
+});
+
+test("hook writes planctl_* columns on PreToolUse:Bash with a planctl read-only verb on a task ref", async () => {
+  // Read-only verb on a task-form ref: subject_present=0, epic_id + task_id
+  // both stamped. Exercises the `parsePlanRef` task-form split and the
+  // PLANCTL_READONLY_VERBS membership check.
+  const code = await fireViaLauncher("my-session", {
+    hook_event_name: "PreToolUse",
+    session_id: "sess-planctl-cat",
+    cwd: "/tmp/work",
+    tool_name: "Bash",
+    tool_input: { command: "planctl cat fn-42-foo.3" },
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        `SELECT planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+                planctl_subject_present
+           FROM events WHERE session_id = 'sess-planctl-cat'`,
+      )
+      .get() as {
+      planctl_op: string | null;
+      planctl_target: string | null;
+      planctl_epic_id: string | null;
+      planctl_task_id: string | null;
+      planctl_subject_present: number | null;
+    };
+    expect(row.planctl_op).toBe("cat");
+    expect(row.planctl_target).toBe("fn-42-foo.3");
+    expect(row.planctl_epic_id).toBe("fn-42-foo");
+    expect(row.planctl_task_id).toBe("fn-42-foo.3");
+    expect(row.planctl_subject_present).toBe(0);
+  } finally {
+    db.close();
+  }
+});
+
+test("hook leaves planctl_* columns NULL on PreToolUse:Bash with a non-planctl command", async () => {
+  // Bash command that is not a planctl invocation — all five planctl_*
+  // columns must stay NULL so the partial-index predicate keeps the
+  // index small.
+  const code = await fireViaLauncher("my-session", {
+    hook_event_name: "PreToolUse",
+    session_id: "sess-bash-ls",
+    cwd: "/tmp/work",
+    tool_name: "Bash",
+    tool_input: { command: "ls -la /tmp" },
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        `SELECT planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+                planctl_subject_present
+           FROM events WHERE session_id = 'sess-bash-ls'`,
+      )
+      .get() as {
+      planctl_op: string | null;
+      planctl_target: string | null;
+      planctl_epic_id: string | null;
+      planctl_task_id: string | null;
+      planctl_subject_present: number | null;
+    };
+    expect(row.planctl_op).toBeNull();
+    expect(row.planctl_target).toBeNull();
+    expect(row.planctl_epic_id).toBeNull();
+    expect(row.planctl_task_id).toBeNull();
+    expect(row.planctl_subject_present).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
+test("hook leaves planctl_* columns NULL on non-PreToolUse / non-Bash events", async () => {
+  // PostToolUse:Bash with a planctl command still leaves the columns NULL —
+  // the deriver is gated on `hookEvent === 'PreToolUse'`.
+  const code = await fireViaLauncher("my-session", {
+    hook_event_name: "PostToolUse",
+    session_id: "sess-planctl-post",
+    cwd: "/tmp/work",
+    tool_name: "Bash",
+    tool_input: { command: "planctl epic-create fn-1-bar" },
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT planctl_op FROM events WHERE session_id = 'sess-planctl-post'",
+      )
+      .get() as { planctl_op: string | null };
+    expect(row.planctl_op).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
+test("hook exits 0 on PreToolUse:Bash with a malformed tool_input.command (defensive)", async () => {
+  // Non-string `command` field: the deriver returns null defensively (the
+  // hook never throws, exit-0 contract preserved). Asserts via exit code +
+  // that the row landed with planctl_op NULL.
+  const code = await fireViaLauncher("my-session", {
+    hook_event_name: "PreToolUse",
+    session_id: "sess-planctl-malformed",
+    cwd: "/tmp/work",
+    tool_name: "Bash",
+    tool_input: { command: { not: "a string" } },
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT planctl_op FROM events WHERE session_id = 'sess-planctl-malformed'",
+      )
+      .get() as { planctl_op: string | null } | null;
+    expect(row).not.toBeNull();
+    expect(row?.planctl_op).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
 test("hook writes jobs.plan_verb/plan_ref via reducer when SessionStart spawn_name matches", async () => {
   // Fire SessionStart whose parent argv carries the canonical spawn name —
   // the hook captures `spawn_name`, the reducer derives plan_verb/plan_ref.

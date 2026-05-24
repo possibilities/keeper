@@ -25,7 +25,11 @@
  */
 
 import { openDb, resolveDbPath } from "../../src/db";
-import { extractSkillName, slashCommandFromPrompt } from "../../src/derivers";
+import {
+  extractPlanctlInvocation,
+  extractSkillName,
+  slashCommandFromPrompt,
+} from "../../src/derivers";
 
 /**
  * Hook event names that get renamed when stored as `event_type`. Matches
@@ -329,6 +333,27 @@ async function main(): Promise<void> {
       : null;
   const skillName = extractSkillName(hookEvent, toolName, data);
 
+  // v14: index the planctl-CLI invocation footprint on PreToolUse:Bash. The
+  // deriver is pure, gated on hook event + tool name, and defensive against
+  // any malformed `data.tool_input` shape — a null return collapses to all
+  // five params bound NULL on the prepared statement. Same module-scope
+  // regex / shared-source-of-truth pattern as `slashCommandFromPrompt` /
+  // `extractSkillName`; the v13→v14 migration backfill reuses this exact
+  // function so live + historical rows derive byte-identically.
+  const planctlInvocation = extractPlanctlInvocation(hookEvent, toolName, data);
+  const planctlOp = planctlInvocation?.op ?? null;
+  const planctlTarget = planctlInvocation?.target ?? null;
+  const planctlEpicId = planctlInvocation?.epic_id ?? null;
+  const planctlTaskId = planctlInvocation?.task_id ?? null;
+  // `subject_present` is 0/1 on disk to match the INTEGER column; NULL when
+  // the event is not a planctl invocation at all.
+  const planctlSubjectPresent =
+    planctlInvocation === null
+      ? null
+      : planctlInvocation.subject_present
+        ? 1
+        : 0;
+
   // SessionStart only: scrape the parent claude argv `--name`/`-n` AND the
   // process start_time in a single platform-specific probe, so the reducer can
   // seed `jobs.title` from the very first event AND store the recycle-safe
@@ -372,6 +397,11 @@ async function main(): Promise<void> {
         $start_time: spawnInfo.startTime,
         $slash_command: slashCommand,
         $skill_name: skillName,
+        $planctl_op: planctlOp,
+        $planctl_target: planctlTarget,
+        $planctl_epic_id: planctlEpicId,
+        $planctl_task_id: planctlTaskId,
+        $planctl_subject_present: planctlSubjectPresent,
       });
     })();
   } finally {
