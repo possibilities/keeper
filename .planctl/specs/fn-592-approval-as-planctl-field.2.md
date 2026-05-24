@@ -39,5 +39,5 @@ Add to existing test files (do not fork): (a) `buildEpicMessage` / `buildTaskMes
 - [ ] `EPICS_DESCRIPTOR` accepts `approval` as a filter and applies `{ status: "open", approval: { ne: "approved" } }` as the composed default
 
 ## Done summary
-
+Schema v13 epics.approval column + read-side plumbing: types, plan-worker coerce-and-seed (missing → 'pending' silent, invalid → 'pending' with stderr log via scanner logger sink), reducer fold on both EpicSnapshot/TaskSnapshot paths, daemon snapshot blob, EPICS_DESCRIPTOR filter + composed { status: 'open', approval: { ne: 'approved' } } default. seedFromDb reconstructs approval field-identically so boot scan does not re-emit; re-fold from scratch reproduces approval byte-identically.
 ## Evidence
