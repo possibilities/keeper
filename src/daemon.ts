@@ -535,13 +535,15 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
-  // Spawn the git worker after the plan/job projections are caught up. It polls
-  // git directly (no shell) and posts current snapshots; main persists each one
-  // as a synthetic event so the reducer's git_status row is replayable.
+  // Spawn the git worker after the plan/job projections are caught up. It is
+  // event-driven (file watcher + DB data_version wake + 60s heartbeat — see
+  // `git-worker.ts` header) and posts a snapshot only when the rendered view
+  // changes; main persists each one as a synthetic `GitSnapshot` event so the
+  // reducer's `git_status` row is replayable.
   const gitWorker = new Worker(
     new URL("./git-worker.ts", import.meta.url).href,
     {
-      workerData: { dbPath, pollMs: 1000 } satisfies GitWorkerData,
+      workerData: { dbPath } satisfies GitWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );
 
