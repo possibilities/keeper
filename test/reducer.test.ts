@@ -230,6 +230,87 @@ test("Stop after SessionEnd stays ended (no stray resurrection)", () => {
   expect(getJob()?.state).toBe("ended");
 });
 
+// ---------------------------------------------------------------------------
+// UserPromptSubmit task-notification carve-out
+// ---------------------------------------------------------------------------
+
+const TASK_NOTIFICATION_KILLED = [
+  "<task-notification>",
+  "<task-id>ba82oze4l</task-id>",
+  "<output-file>/tmp/ba82oze4l.output</output-file>",
+  "<status>killed</status>",
+  '<summary>Monitor "chatctl bus" stopped</summary>',
+  "</task-notification>",
+].join("\n");
+
+test("UserPromptSubmit with a killed task-notification leaves state stopped", () => {
+  // Reproduces the closed-terminal flash: a session sitting idle (stopped)
+  // receives a shutdown-housekeeping task-notification through the same
+  // UserPromptSubmit hook a real prompt uses. The reducer must NOT flip
+  // state to 'working' for the `<status>killed</status>` variant — the
+  // session is dying, not picking up a new prompt.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "Stop" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ prompt: TASK_NOTIFICATION_KILLED }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+});
+
+test("UserPromptSubmit with a killed task-notification still folds the session_title", () => {
+  // Modest carve-out: only the lifecycle write is skipped. A
+  // `session_title` on the task-notification still rides through the title
+  // precedence rule below the switch so the row's displayed title stays
+  // current.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({
+      prompt: TASK_NOTIFICATION_KILLED,
+      session_title: "remove-closed-epics",
+    }),
+  });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("stopped");
+  expect(job?.title).toBe("remove-closed-epics");
+  expect(job?.title_source).toBe("payload");
+});
+
+test("UserPromptSubmit with a completed task-notification still flips state to working", () => {
+  // Modesty check: `<status>completed</status>` is a real signal the model
+  // reacts to — the lifecycle write must still fire.
+  const completed = TASK_NOTIFICATION_KILLED.replace(
+    "<status>killed</status>",
+    "<status>completed</status>",
+  );
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "Stop" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ prompt: completed }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+});
+
+test("UserPromptSubmit with a killed task-notification on a terminal row stays terminal", () => {
+  // The normal UserPromptSubmit re-opens an `ended` / `killed` row to
+  // `working` — but the carve-out skips that branch, so a shutdown
+  // notification that arrives after SessionEnd / Killed never resurrects a
+  // terminal row.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "SessionEnd" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ prompt: TASK_NOTIFICATION_KILLED }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("ended");
+});
+
 test("SessionEnd re-asserts ended idempotently", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "SessionEnd" });

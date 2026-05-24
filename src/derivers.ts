@@ -170,6 +170,56 @@ export function planVerbRefFromSpawnName(
 }
 
 /**
+ * Anchored task-notification-killed envelope match. The strict shape:
+ *
+ *   `<task-notification>` ... `<status>killed</status>` ...
+ *
+ * Claude Code injects this exact envelope through the `UserPromptSubmit`
+ * hook when a backgrounded task (e.g. a `Monitor` tool process) is killed
+ * — most commonly during session shutdown after a SIGHUP from the user
+ * closing the terminal window. The model can't react to the notification
+ * if the session is also dying, so the reducer treats these as no-ops for
+ * the lifecycle state machine. Every other `UserPromptSubmit` — including
+ * task-notifications carrying `status=completed` / `status=failed`, which
+ * the model can and does react to — still flips state to `working`.
+ *
+ * `^` anchors the opener so a free-text prompt that happens to mention the
+ * substring `<task-notification>` mid-message cannot false-match. `[\s\S]*`
+ * spans the body greedily (newlines + whitespace are normal between the
+ * inner tags); the trailing literal closes the match cheaply (no nested
+ * quantifier — no catastrophic-backtracking risk).
+ *
+ * Module-scope literal so V8/JSC tier up once at process start, mirroring
+ * the other parsers in this file.
+ */
+const KILLED_TASK_NOTIFICATION_RE =
+  /^<task-notification>[\s\S]*<status>killed<\/status>/;
+
+/**
+ * Detect Claude Code's `<task-notification>…<status>killed</status>` envelope
+ * on a `UserPromptSubmit` event's `data.prompt`. Reducer-only: the lifecycle
+ * branch skips the `state = 'working'` write when this returns `true` so a
+ * shutdown-housekeeping notification doesn't briefly flip a `stopped` /
+ * terminal row into `working` right before `SessionEnd` (or the exit-watcher's
+ * synthetic `Killed`) lands.
+ *
+ * Returns `false` for any non-string or empty input. Stays a pure function
+ * of its argument so re-fold determinism is preserved — a re-fold from
+ * scratch on a fresh reducer agrees with steady-state writes byte-for-byte.
+ *
+ * Modest by design: `status=completed` / `status=failed` task-notifications
+ * are real signals the model reacts to and continue to flip state to
+ * `working`. Only the `killed` variant — which fires while the session
+ * itself is dying — is suppressed.
+ */
+export function isKilledTaskNotification(prompt: unknown): boolean {
+  if (typeof prompt !== "string" || prompt.length === 0) {
+    return false;
+  }
+  return KILLED_TASK_NOTIFICATION_RE.test(prompt);
+}
+
+/**
  * Anchored planctl-ref → `{kind, epic_id, task_id?}` match. The strict shape:
  *
  *   `fn-\d+-[a-z0-9-]+` + optional `.\d+`

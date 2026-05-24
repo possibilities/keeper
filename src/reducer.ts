@@ -21,6 +21,12 @@
  *                       |   'killed' -> 'stopped' + refresh pid + start_time;
  *                       |   a non-terminal row's state is left as-is.
  *   UserPromptSubmit    | state -> 'working'  (also re-opens 'ended' or 'killed')
+ *                       |   EXCEPT when the prompt is Claude Code's
+ *                       |   `<task-notification>…<status>killed</status>`
+ *                       |   shutdown-housekeeping envelope — those are no-ops
+ *                       |   for the lifecycle write (the title rule still
+ *                       |   runs). See `isKilledTaskNotification` in
+ *                       |   `src/derivers.ts` for the modest-scope rationale.
  *   Stop                | state -> 'stopped'  (skipped on 'ended' or 'killed')
  *   SessionEnd          | state -> 'ended'    (skipped on 'killed' — the kill
  *                       |   signal carries proven-dead evidence and outranks)
@@ -57,7 +63,11 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { parsePlanRef, planVerbRefFromSpawnName } from "./derivers";
+import {
+  isKilledTaskNotification,
+  parsePlanRef,
+  planVerbRefFromSpawnName,
+} from "./derivers";
 import type { Event } from "./types";
 
 /**
@@ -159,6 +169,36 @@ function extractSessionTitle(event: Event): string | null {
  */
 function titleSourceForEvent(event: Event): string {
   return event.hook_event === "TranscriptTitle" ? "transcript" : "payload";
+}
+
+/**
+ * Extract the top-level `prompt` from an event's `data` blob — meaningful
+ * only on `UserPromptSubmit` events. Guarded-parse mirroring
+ * {@link extractSessionTitle}: try/catch around `JSON.parse(event.data)`,
+ * skip-and-log on a malformed blob, never throw (the cursor still advances
+ * upstream so one bad row never wedges the reducer). Returns the prompt only
+ * when it is a non-empty string, else `null`.
+ *
+ * Used by the `UserPromptSubmit` lifecycle branch to detect Claude Code's
+ * `<task-notification>…<status>killed</status>` shutdown-housekeeping
+ * envelope via {@link isKilledTaskNotification} — see
+ * `src/derivers.ts` for the regex shape + modesty rationale.
+ */
+function extractPrompt(event: Event): string | null {
+  if (event.data && event.data.length > 0) {
+    try {
+      const parsed = JSON.parse(event.data) as { prompt?: unknown };
+      const prompt = parsed.prompt;
+      if (typeof prompt === "string" && prompt.length > 0) {
+        return prompt;
+      }
+    } catch (err) {
+      console.error(
+        `keeper reducer: failed to parse data blob for event id=${event.id} session=${event.session_id}: ${err}`,
+      );
+    }
+  }
+  return null;
 }
 
 /**
@@ -933,7 +973,28 @@ function projectJobsRow(db: Database, event: Event): void {
       syncIfPlanRef(db, jobId, event.id, ts);
       break;
 
-    case "UserPromptSubmit":
+    case "UserPromptSubmit": {
+      // Modest carve-out: Claude Code's shutdown sequence reports each killed
+      // backgrounded task back to the model by injecting a
+      // `<task-notification>…<status>killed</status>` envelope through this
+      // same `UserPromptSubmit` hook. That fired a brief `stopped → working`
+      // flash right before `SessionEnd` (or the exit-watcher's synthetic
+      // `Killed`) landed — see the parser + scope rationale in
+      // `src/derivers.ts` (`isKilledTaskNotification`). Suppress only the
+      // `killed` variant; `completed` / `failed` task-notifications are real
+      // signals the model reacts to and continue to flip state to `working`.
+      //
+      // The title rule below the switch is intentionally NOT skipped: a
+      // task-notification still carries a `session_title` that the title
+      // precedence rule may legitimately fold. Skipping only the lifecycle
+      // write + `syncIfPlanRef` keeps the carve-out as small as possible.
+      //
+      // Re-fold determinism: `isKilledTaskNotification` is a pure function of
+      // `event.data.prompt`, so a from-scratch re-fold agrees with the
+      // steady-state write byte-for-byte.
+      if (isKilledTaskNotification(extractPrompt(event))) {
+        break;
+      }
       // A prompt means the session is ALIVE — set 'working' unconditionally (no
       // terminal guard). This is also a re-open path: a session can resume
       // straight into a prompt with no SessionStart hook, and a spurious
@@ -979,6 +1040,7 @@ function projectJobsRow(db: Database, event: Event): void {
       );
       syncIfPlanRef(db, jobId, event.id, ts);
       break;
+    }
 
     case "Stop": {
       // Keeps the terminal guard: a stray Stop landing on a still-terminal job

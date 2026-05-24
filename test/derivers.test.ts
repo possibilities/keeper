@@ -6,7 +6,7 @@
  */
 
 import { expect, test } from "bun:test";
-import { parsePlanRef } from "../src/derivers";
+import { isKilledTaskNotification, parsePlanRef } from "../src/derivers";
 
 // ---------------------------------------------------------------------------
 // parsePlanRef
@@ -83,4 +83,62 @@ test("parsePlanRef accepts numeric slug bodies", () => {
     kind: "epic",
     epic_id: "fn-1-2",
   });
+});
+
+// ---------------------------------------------------------------------------
+// isKilledTaskNotification
+// ---------------------------------------------------------------------------
+
+const KILLED_NOTIFICATION = [
+  "<task-notification>",
+  "<task-id>ba82oze4l</task-id>",
+  "<output-file>/tmp/ba82oze4l.output</output-file>",
+  "<status>killed</status>",
+  '<summary>Monitor "chatctl bus" stopped</summary>',
+  "</task-notification>",
+].join("\n");
+
+test("isKilledTaskNotification matches the killed envelope", () => {
+  expect(isKilledTaskNotification(KILLED_NOTIFICATION)).toBe(true);
+});
+
+test("isKilledTaskNotification rejects a completed task-notification", () => {
+  const completed = KILLED_NOTIFICATION.replace(
+    "<status>killed</status>",
+    "<status>completed</status>",
+  );
+  expect(isKilledTaskNotification(completed)).toBe(false);
+});
+
+test("isKilledTaskNotification rejects a failed task-notification", () => {
+  const failed = KILLED_NOTIFICATION.replace(
+    "<status>killed</status>",
+    "<status>failed</status>",
+  );
+  expect(isKilledTaskNotification(failed)).toBe(false);
+});
+
+test("isKilledTaskNotification rejects a plain user prompt", () => {
+  expect(isKilledTaskNotification("please kill the build")).toBe(false);
+});
+
+test("isKilledTaskNotification rejects a prompt that mentions the envelope inline", () => {
+  // The opener must be anchored at start-of-string. A user pasting the
+  // literal envelope text into the middle of a prompt must not false-match.
+  expect(
+    isKilledTaskNotification(
+      `here's what I saw: ${KILLED_NOTIFICATION}\n— please debug`,
+    ),
+  ).toBe(false);
+});
+
+test("isKilledTaskNotification rejects null / non-string input", () => {
+  expect(isKilledTaskNotification(null)).toBe(false);
+  expect(isKilledTaskNotification(undefined)).toBe(false);
+  expect(isKilledTaskNotification(42)).toBe(false);
+  expect(isKilledTaskNotification({ prompt: KILLED_NOTIFICATION })).toBe(false);
+});
+
+test("isKilledTaskNotification rejects the empty string", () => {
+  expect(isKilledTaskNotification("")).toBe(false);
 });
