@@ -42,5 +42,5 @@ No new unit tests (scripts are integration CLIs). Manual verification with autop
 - [ ] Status vocabulary is `approved | rejected | pending`; no `clear`
 
 ## Done summary
-
+Rewrote autopilot.ts to a single epics subscription that reads approval pills from epic.approval and embedded task.approval (schema v13), with --show-approved disabling only the approval default filter. Rewrote approve.ts to route by positional arity (2 args -> set_epic_approval, 3 args -> set_task_approval) with vocabulary approved|rejected|pending (no clear).
 ## Evidence
