@@ -355,36 +355,38 @@ test("runQuery applies the default live scope, hiding both terminal states, unle
   db.close();
 });
 
-test("resolveFilter: epics default scope applies open+approval-ne-approved, is overridable, exempts pk lookups", () => {
-  // No filter → the descriptor's composed default `{ status: open, approval:
-  // { ne: approved } }` scope is applied (schema v13). Two clauses ANDed.
+test("resolveFilter: epics default OR-scope applies bare, is dropped by ANY wire filter, exempts pk lookups", () => {
+  // No filter → the descriptor's `defaultClause` (raw SQL with bound params)
+  // is appended. Predicate is "open OR not-yet-approved" — the cross-column
+  // OR that the per-key `defaultFilter` map can't express.
   const def = resolveFilter(EPICS_DESCRIPTOR, undefined);
-  expect(def.clause).toBe("WHERE status = ? AND approval != ?");
+  expect(def.clause).toBe("WHERE (status = ? OR approval != ?)");
   expect(def.params).toEqual(["open", "approved"]);
 
-  // An explicit status overrides the default for that key; the approval
-  // default still rides since approval was not constrained by the wire.
-  const override = resolveFilter(EPICS_DESCRIPTOR, { status: "done" });
-  expect(override.clause).toBe("WHERE status = ? AND approval != ?");
-  expect(override.params).toEqual(["done", "approved"]);
+  // An explicit status drops the defaultClause entirely (wire-not-empty is
+  // the user's "I know what I want" override). Page now shows ONLY done
+  // epics, including done+approved ones the default would have hidden.
+  const statusOnly = resolveFilter(EPICS_DESCRIPTOR, { status: "done" });
+  expect(statusOnly.clause).toBe("WHERE status = ?");
+  expect(statusOnly.params).toEqual(["done"]);
 
-  // An explicit approval overrides ITS default; status stays at the default.
-  const approvedOverride = resolveFilter(EPICS_DESCRIPTOR, {
+  // An explicit approval also drops the defaultClause; page is scoped to the
+  // wire alone. `--show-approved` on autopilot rides this path.
+  const approvalOnly = resolveFilter(EPICS_DESCRIPTOR, {
     approval: "approved",
   });
-  expect(approvedOverride.clause).toBe("WHERE status = ? AND approval = ?");
-  expect(approvedOverride.params).toEqual(["open", "approved"]);
+  expect(approvalOnly.clause).toBe("WHERE approval = ?");
+  expect(approvalOnly.params).toEqual(["approved"]);
 
-  // A non-status filter still gets BOTH defaults ANDed in.
+  // A non-default filter key (project_dir) also counts as "wire-not-empty"
+  // and drops the default — the scope is the wire's predicate alone.
   const byDir = resolveFilter(EPICS_DESCRIPTOR, { project_dir: "/r" });
-  expect(byDir.clause).toBe(
-    "WHERE status = ? AND project_dir = ? AND approval != ?",
-  );
-  expect(byDir.params).toEqual(["open", "/r", "approved"]);
+  expect(byDir.clause).toBe("WHERE project_dir = ?");
+  expect(byDir.params).toEqual(["/r"]);
 
-  // A pk lookup is exempt from ALL defaults: it resolves one identity
-  // regardless of status or approval (a detail subscribe of a done+approved
-  // epic must resolve).
+  // A pk lookup is exempt from the default: it resolves one identity
+  // regardless of status or approval (a detail subscribe of a
+  // done+approved epic must resolve).
   const pk = resolveFilter(EPICS_DESCRIPTOR, { epic_id: "fn-2-done" });
   expect(pk.clause).toBe("WHERE epic_id = ?");
   expect(pk.params).toEqual(["fn-2-done"]);

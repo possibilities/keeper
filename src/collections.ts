@@ -48,6 +48,15 @@ export type { Row };
  *   A wire value for the key — bare or `{ ne }` — overrides the default, so a
  *   client can still page any status by asking for it explicitly. Keys MUST also
  *   appear in `filters` (they resolve through the same map-lookup gate).
+ * - `defaultClause` — an optional RAW SQL fallback scope, applied when the wire
+ *   filter is entirely empty (and the lookup is not a pk lookup, which is
+ *   exempt from defaults). Used for predicates that can't be expressed as
+ *   per-key ANDs — e.g. epics default to `(status = 'open' OR approval !=
+ *   'approved')`. The `sql` string is interpolated verbatim into the WHERE so
+ *   columns / operators are the descriptor author's responsibility; `params`
+ *   are bound. ANY explicit wire filter drops the whole clause (the wire is
+ *   the user's "I know what I want" override). Distinct from `defaultFilter`
+ *   so per-key wins still apply where they make sense; the two can coexist.
  * - `jsonColumns` — columns stored as JSON TEXT that {@link decodeRow} parses
  *   into real values at the read boundary (so `result` and `patch` frames serve
  *   an array/object, not a JSON string). A parse failure / NULL falls back to
@@ -63,6 +72,7 @@ export interface CollectionDescriptor {
   defaultSort: { column: string; dir: "asc" | "desc" };
   filters: Readonly<Record<string, string>>;
   defaultFilter?: Readonly<Record<string, FilterValue>>;
+  defaultClause?: { sql: string; params: readonly (string | number)[] };
   jsonColumns: ReadonlySet<string>;
 }
 
@@ -183,17 +193,19 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // below composes for free — no new composition machinery required.
     approval: "approval",
   },
-  // Default scope: an epics query with no explicit constraint on `status` /
-  // `approval` shows only OPEN, NOT-YET-APPROVED epics — the autopilot's
-  // primary working set. Each key is overridable independently: a client may
-  // ask for a done epic OR an approved one (or both) by passing those keys
-  // explicitly; the descriptor's per-key default is dropped iff the wire
-  // value is present. A pk subscribe carries `epic_id` only and is exempt
-  // from defaults entirely, so a detail read of a done-and-approved epic
-  // still resolves. The two-key AND composition is verified by the
-  // collection-test 'runQuery applies the composed status+approval default'
-  // case below.
-  defaultFilter: { status: "open", approval: { ne: "approved" } },
+  // Default scope: an epics query with no wire filter shows every epic that
+  // is OPEN OR NOT-YET-APPROVED — the union, not the intersection. Open work
+  // (live) and unreviewed work (needs a human) are both interesting; only
+  // done-AND-approved epics fall off the page by default. The predicate
+  // crosses two columns, so it lives in `defaultClause` (raw SQL with bound
+  // params) rather than the per-key `defaultFilter` map. ANY explicit wire
+  // filter — `--status done`, autopilot's `--show-approved`, a pk subscribe
+  // — drops this clause entirely (the wire is the user's "I know what I
+  // want" override).
+  defaultClause: {
+    sql: "(status = ? OR approval != ?)",
+    params: ["open", "approved"],
+  },
   // `tasks`, `depends_on_epics`, and `jobs` are JSON-TEXT array columns —
   // decoded to real arrays at the read boundary. `jobs` carries the
   // epic-level `EmbeddedJob[]` (plan/close verbs). Nested `task.jobs`

@@ -330,6 +330,7 @@ export function resolveFilter(
   // A pk lookup (detail-page single-item subscribe) bypasses the default scope.
   const pkKey = pkFilterKey(descriptor);
   const isPkLookup = pkKey != null && filter?.[pkKey] != null;
+  const wireIsEmpty = filter == null || Object.keys(filter).length === 0;
   for (const [key, col] of Object.entries(descriptor.filters)) {
     // Wire value wins; an unconstrained key falls back to the descriptor's
     // default scope, except on a pk lookup (which is exempt from defaults).
@@ -369,6 +370,14 @@ export function resolveFilter(
     }
     where.push(`${col} = ?`);
     params.push(value);
+  }
+  // Raw `defaultClause` fallback (cross-column predicates that don't fit the
+  // per-key `defaultFilter` map). Applied only when the wire filter is
+  // entirely empty AND this is not a pk lookup — the wire is the user's "I
+  // know what I want" override; a pk subscribe is exempt from defaults.
+  if (wireIsEmpty && !isPkLookup && descriptor.defaultClause) {
+    where.push(descriptor.defaultClause.sql);
+    params.push(...descriptor.defaultClause.params);
   }
   return {
     clause: where.length > 0 ? `WHERE ${where.join(" AND ")}` : "",
