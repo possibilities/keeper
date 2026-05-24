@@ -18,11 +18,15 @@
  * process-global `RPC_REGISTRY` and runs the handler against a dedicated WRITER
  * connection (opened next to the existing reader in `main()`). Concrete
  * handlers live in `src/rpc-handlers.ts` and are installed once per worker
- * spawn by `main()` calling `installRpcHandlers()`. As of Task .3 of epic
- * `fn-581-server-mutation-rpcs-and-autopilot`, the registry carries one
- * handler (`set_approval`) — the first concrete RPC. The two-connection split
- * is load-bearing: the reader's `data_version` poll only sees writes from
- * OTHER connections, so the RPC writer must be distinct from the poll reader.
+ * spawn by `main()` calling `installRpcHandlers()`. As of schema v13 (the
+ * fn-592-approval-as-planctl-field epic) the registry carries two planctl-
+ * native approval handlers (`set_task_approval`, `set_epic_approval`) that
+ * write `.planctl/{epics,tasks}/*.json` files directly — the v12 sidecar
+ * `set_approval` handler was retired alongside the `approvals` table. The
+ * two-connection split is load-bearing: the reader's `data_version` poll
+ * only sees writes from OTHER connections, so any future SQL-mutating RPC
+ * writer must be distinct from the poll reader (today's approval handlers
+ * write files, not the DB, but the split stays for future SQL handlers).
  *
  * Conventions mirror `src/wake-worker.ts`:
  * - `isMainThread`-guarded body — a plain `import` from a test is inert.

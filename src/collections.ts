@@ -4,11 +4,10 @@
  * (`FROM jobs`), the sort allowlist, the filter branches, and the diff key
  * (`job_id` / `last_event_id`). This module pulls everything collection-specific
  * into a `CollectionDescriptor` so `runQuery` / `diffTick` route by collection
- * name instead. Three collections register today — `jobs`, `epics` (each epic
- * embeds its tasks + plan/close jobs as JSON-array columns), and `approvals`
- * (the schema-v12 sidecar for the autopilot UI's per-task approval state, NOT
- * a reducer projection). Adding a future collection is one more `REGISTRY`
- * entry with zero wire-protocol or diff-machinery change.
+ * name instead. Two collections register today — `jobs` and `epics` (each epic
+ * embeds its tasks + plan/close jobs as JSON-array columns, and as of schema
+ * v13 carries `approval` as a real column). Adding a future collection is one
+ * more `REGISTRY` entry with zero wire-protocol or diff-machinery change.
  *
  * Cross-refs:
  * - `src/db.ts` — owns `MAX_IN_PARAMS` (reused here, not redefined) and the
@@ -207,49 +206,14 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
- * The `approvals` descriptor — the autopilot UI's per-task approval state, the
- * first sidecar (NOT a reducer projection). Mirrors the `approvals` schema-v12
- * table 1:1: `approval_id` is the real-column pk (the writer populates it as
- * `epic_id || ':' || task_key` — see {@link Approval}); `updated_at` is the
- * `version` column the diff machinery fires on (REAL written by the RPC as
- * `unixepoch('now','subsec')` — sub-microsecond resolution, two UPSERTs tying
- * on `version` is vanishingly unlikely in practice). `sortable` allows the
- * `updated_at` default + `approval_id` for stable identity sort; `filters`
- * exposes the pk plus `epic_id` (the autopilot's "all approvals for this
- * epic" query) and `status` (filter to just `approved` or `rejected`). NO
- * `defaultFilter` — the autopilot subscribes to all rows; absent rows are
- * "pending" (handled at the consumer, not the SQL). NO `jsonColumns` — every
- * field is a scalar.
- */
-export const APPROVALS_DESCRIPTOR: CollectionDescriptor = {
-  name: "approvals",
-  table: "approvals",
-  columns: ["approval_id", "epic_id", "task_key", "status", "updated_at"],
-  pk: "approval_id",
-  version: "updated_at",
-  sortable: new Set(["updated_at", "approval_id"]),
-  defaultSort: { column: "updated_at", dir: "desc" },
-  filters: {
-    approval_id: "approval_id",
-    epic_id: "epic_id",
-    status: "status",
-  },
-  // No `defaultFilter`: the autopilot subscribes to ALL rows (absent row =
-  // "pending" is the consumer's reading, never expressed as SQL).
-  jsonColumns: new Set([]),
-};
-
-/**
  * The registry, keyed by wire-facing collection name. `jobs` + the `epics`
  * plan collection (which embeds its tasks + plan/close-verb jobs as JSON-array
- * columns — the standalone `tasks` collection was dropped in schema v7) +
- * the `approvals` sidecar (schema v12 — NOT a reducer projection; the
- * event-log re-fold determinism guarantee does not extend here).
+ * columns — the standalone `tasks` collection was dropped in schema v7 — and
+ * carries `approval` as a real column as of schema v13).
  */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
   [EPICS_DESCRIPTOR.name, EPICS_DESCRIPTOR],
-  [APPROVALS_DESCRIPTOR.name, APPROVALS_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

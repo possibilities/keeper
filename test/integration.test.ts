@@ -493,9 +493,40 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
   expect(existsSync(sockPath)).toBe(false);
 }, 15000);
 
-test("end-to-end: approve CLI → set_approval RPC → approvals row, then clear DELETEs it", async () => {
-  // Spawn the daemon with the same hermetic config as the other UDS tests so
-  // it never touches the real ~/code or ~/.claude/projects trees.
+test("end-to-end: set_task_approval RPC → atomic plan-file rewrite, set_epic_approval rewrites the epic file", async () => {
+  // Hermetic plan tree: write two real planctl files into the tmp planRoot
+  // so the daemon's plan worker can see them via @parcel/watcher (the
+  // watcher path is exercised more thoroughly in plan-worker.test.ts; here
+  // we just prove the RPC writes the file with the right shape).
+  const { mkdirSync, readFileSync, writeFileSync } =
+    require("node:fs") as typeof import("node:fs");
+  const { serializePlanctlJson } =
+    require("../src/db") as typeof import("../src/db");
+  const epicsDir = join(planRoot, ".planctl", "epics");
+  const tasksDir = join(planRoot, ".planctl", "tasks");
+  mkdirSync(epicsDir, { recursive: true });
+  mkdirSync(tasksDir, { recursive: true });
+  const epicPath = join(epicsDir, "fn-99-rpc-e2e.json");
+  const taskPath = join(tasksDir, "fn-99-rpc-e2e.1.json");
+  writeFileSync(
+    epicPath,
+    serializePlanctlJson({
+      id: "fn-99-rpc-e2e",
+      title: "RPC E2E",
+      status: "open",
+      approval: "pending",
+    }),
+  );
+  writeFileSync(
+    taskPath,
+    serializePlanctlJson({
+      id: "fn-99-rpc-e2e.1",
+      epic: "fn-99-rpc-e2e",
+      title: "T1",
+      approval: "pending",
+    }),
+  );
+
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
     env: {
@@ -508,8 +539,6 @@ test("end-to-end: approve CLI → set_approval RPC → approvals row, then clear
     stderr: "pipe",
   });
 
-  // The server worker binds AFTER migrate; poll for the socket file rather
-  // than racing a fixed sleep.
   const bound = await retryUntil(
     () => (existsSync(sockPath) ? true : null),
     3000,
@@ -520,132 +549,99 @@ test("end-to-end: approve CLI → set_approval RPC → approvals row, then clear
     throw new Error(`socket never bound.\nstdout:\n${out}\nstderr:\n${err}`);
   }
 
-  const APPROVE_CLI = join(ROOT, "scripts", "approve.ts");
-
-  // --- approve: CLI exits 0 and prints the resulting row as JSON. ---
-  const approve = Bun.spawn(
-    ["bun", APPROVE_CLI, "--sock", sockPath, "epic-a", "epic-a.1", "approve"],
-    {
-      cwd: ROOT,
-      env: { ...process.env, KEEPER_DB: dbPath },
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const approveCode = await approve.exited;
-  const approveStdout = await readStream(approve.stdout);
-  const approveStderr = await readStream(approve.stderr);
-  if (approveCode !== 0) {
-    throw new Error(
-      `approve CLI exited ${approveCode}.\nstdout:\n${approveStdout}\nstderr:\n${approveStderr}`,
-    );
-  }
-  expect(approveCode).toBe(0);
-  const approveResult = JSON.parse(approveStdout.trim()) as {
-    approval_id: string;
-    epic_id: string;
-    task_key: string;
-    status: string;
-    updated_at: number;
-  };
-  expect(approveResult.approval_id).toBe("epic-a:epic-a.1");
-  expect(approveResult.status).toBe("approved");
-
-  // Direct DB verification: the row landed in the approvals sidecar. The RPC
-  // writer is a distinct connection from this read-only observer; the
-  // server-worker's read poll sees the writer's commit via data_version.
-  const { db: reader } = openDb(dbPath, { readonly: true });
-  try {
-    const row = reader
-      .prepare(
-        "SELECT approval_id, epic_id, task_key, status FROM approvals WHERE approval_id = ?",
-      )
-      .get("epic-a:epic-a.1") as {
-      approval_id: string;
-      epic_id: string;
-      task_key: string;
-      status: string;
-    } | null;
-    expect(row).not.toBeNull();
-    expect(row?.status).toBe("approved");
-
-    // --- clear: CLI exits 0, DELETEs the row. ---
-    const clear = Bun.spawn(
-      ["bun", APPROVE_CLI, "--sock", sockPath, "epic-a", "epic-a.1", "clear"],
-      {
-        cwd: ROOT,
-        env: { ...process.env, KEEPER_DB: dbPath },
-        stdout: "pipe",
-        stderr: "pipe",
-      },
-    );
-    const clearCode = await clear.exited;
-    const clearStdout = await readStream(clear.stdout);
-    const clearStderr = await readStream(clear.stderr);
-    if (clearCode !== 0) {
-      throw new Error(
-        `clear CLI exited ${clearCode}.\nstdout:\n${clearStdout}\nstderr:\n${clearStderr}`,
-      );
-    }
-    const clearResult = JSON.parse(clearStdout.trim()) as {
-      cleared: boolean;
-      epic_id: string;
-      task_key: string;
-    };
-    expect(clearResult).toEqual({
-      cleared: true,
-      epic_id: "epic-a",
-      task_key: "epic-a.1",
+  // Build a one-shot RPC client (inline — no scripts/approve.ts dependency
+  // since that CLI is updated to the new RPCs in a later task).
+  async function rpc(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    const buffer = new LineBuffer();
+    const id = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      Bun.connect({
+        unix: sockPath,
+        socket: {
+          open(s) {
+            s.write(encodeFrame({ type: "rpc", id, method, params }));
+          },
+          data(s, chunk) {
+            for (const line of buffer.push(chunk.toString("utf8"))) {
+              if (line.trim().length === 0) continue;
+              const frame = JSON.parse(line) as ServerFrame;
+              if ((frame as { id?: string }).id !== id) continue;
+              if (frame.type === "rpc_result") {
+                resolve(frame.value);
+              } else if (frame.type === "error") {
+                reject(
+                  new Error(
+                    `${(frame as { code: string }).code}: ${(frame as { message: string }).message}`,
+                  ),
+                );
+              }
+              s.end();
+              return;
+            }
+          },
+          close() {
+            // resolved/rejected already, nothing to do
+          },
+          error(_s, err) {
+            reject(err);
+          },
+        },
+      }).catch(reject);
     });
-
-    const afterClear = reader
-      .prepare("SELECT COUNT(*) AS n FROM approvals WHERE approval_id = ?")
-      .get("epic-a:epic-a.1") as { n: number };
-    expect(afterClear.n).toBe(0);
-
-    // --- bad verb: CLI exits 1, stderr names the bad verb. ---
-    const bad = Bun.spawn(
-      ["bun", APPROVE_CLI, "--sock", sockPath, "epic-a", "epic-a.1", "garbage"],
-      {
-        cwd: ROOT,
-        env: { ...process.env, KEEPER_DB: dbPath },
-        stdout: "pipe",
-        stderr: "pipe",
-      },
-    );
-    const badCode = await bad.exited;
-    expect(badCode).toBe(1);
-    const badStderr = await readStream(bad.stderr);
-    expect(badStderr).toContain("garbage");
-  } finally {
-    reader.close();
   }
 
-  // --- daemon-down: CLI fails fast with stderr message, exit 1. ---
+  // --- set_task_approval: rewrites the task file's `approval` field. ---
+  const taskResult = (await rpc("set_task_approval", {
+    epic_id: "fn-99-rpc-e2e",
+    task_id: "fn-99-rpc-e2e.1",
+    status: "approved",
+  })) as { ok: boolean; epic_id: string; task_id: string; approval: string };
+  expect(taskResult).toEqual({
+    ok: true,
+    epic_id: "fn-99-rpc-e2e",
+    task_id: "fn-99-rpc-e2e.1",
+    approval: "approved",
+  });
+  const taskAfter = JSON.parse(readFileSync(taskPath, "utf8")) as {
+    approval: string;
+    title: string;
+  };
+  expect(taskAfter.approval).toBe("approved");
+  expect(taskAfter.title).toBe("T1");
+
+  // --- set_epic_approval: rewrites the epic file's `approval` field. ---
+  const epicResult = (await rpc("set_epic_approval", {
+    epic_id: "fn-99-rpc-e2e",
+    status: "rejected",
+  })) as { ok: boolean; epic_id: string; approval: string };
+  expect(epicResult).toEqual({
+    ok: true,
+    epic_id: "fn-99-rpc-e2e",
+    approval: "rejected",
+  });
+  const epicAfter = JSON.parse(readFileSync(epicPath, "utf8")) as {
+    approval: string;
+    title: string;
+  };
+  expect(epicAfter.approval).toBe("rejected");
+  expect(epicAfter.title).toBe("RPC E2E");
+
+  // --- bad enum: server returns `bad_params`, the connection survives. ---
+  await expect(
+    rpc("set_task_approval", {
+      epic_id: "fn-99-rpc-e2e",
+      task_id: "fn-99-rpc-e2e.1",
+      status: "garbage",
+    }),
+  ).rejects.toThrow(/bad_params/);
+
+  // --- clean shutdown. ---
   daemon.kill("SIGTERM");
   expect(await daemon.exited).toBe(0);
-  // Socket file removed by the worker's shutdown handler.
   expect(existsSync(sockPath)).toBe(false);
-
-  const down = Bun.spawn(
-    ["bun", APPROVE_CLI, "--sock", sockPath, "epic-a", "epic-a.1", "approve"],
-    {
-      cwd: ROOT,
-      env: { ...process.env, KEEPER_DB: dbPath },
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const downCode = await down.exited;
-  expect(downCode).toBe(1);
-  const downStderr = await readStream(down.stderr);
-  // The connect rejection message varies by platform/Bun version; any of
-  // these substrings proves we surfaced a useful error rather than hanging.
-  const sawConnectMsg =
-    downStderr.includes("failed to connect") ||
-    downStderr.includes("ENOENT") ||
-    downStderr.includes("ECONNREFUSED");
-  expect(sawConnectMsg).toBe(true);
 }, 15000);
 
 test("end-to-end: transcript worker → custom-title write flips jobs.title to 'transcript'", async () => {
@@ -876,6 +872,12 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
       // the epics collection's default scope so the unfiltered subscribe sees it.
       status: "open",
       primary_repo: "/tmp/keeper-e2e-repo",
+      // The daemon's v13 boot-time approval migration backfills `approval`
+      // to "approved" on any epic file lacking the field — which the
+      // unfiltered subscribe would then HIDE via the
+      // `{ approval: { ne: "approved" } }` default filter. We write
+      // "pending" up front to opt out of the backfill and stay in scope.
+      approval: "pending",
     }),
   );
   writeFileSync(
@@ -886,6 +888,7 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
       title: "First plans task",
       target_repo: "/tmp/keeper-e2e-repo",
       // No worker_done_at → derived status "open".
+      approval: "pending",
     }),
   );
 

@@ -66,6 +66,7 @@ import {
   resolveClaudeProjectsRoot,
   resolveDbPath,
   resolvePlanRoots,
+  runPlanctlApprovalMigration,
 } from "./db";
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
 import type { PlanMessage, PlanWorkerData } from "./plan-worker";
@@ -112,6 +113,19 @@ function runDaemon(): void {
 
   const dbPath = resolveDbPath();
   const { db, stmts } = openDb(dbPath);
+
+  // Step 1b — schema-v13 planctl approval migration (filesystem half). The
+  // SQL half (ADD COLUMN `epics.approval` + DROP TABLE `approvals`) ran
+  // inside `openDb`'s migrate(). This pass backfills `approval: "approved"`
+  // onto every existing epic plan file lacking the field and overlays each
+  // (about-to-be-dropped) approvals-table row onto the matching epic/task
+  // plan file. MUST run before the plan worker spawns: a watcher callback
+  // on a half-migrated tree would post a stale snapshot. Naturally
+  // idempotent — a missing-field check skips already-migrated files, the
+  // overlay reads from `approvals` (returns 0 rows after the DROP), and the
+  // table-exists guard skips the SELECT entirely on a fresh-v13 DB.
+  const planRoots = resolvePlanRoots();
+  runPlanctlApprovalMigration(db, planRoots);
 
   // Step 2 — boot drain. MUST finish before the worker spawns: otherwise the
   // worker would fire wakes against a writer connection still iterating boot
@@ -300,7 +314,7 @@ function runDaemon(): void {
     {
       workerData: {
         dbPath,
-        roots: resolvePlanRoots(),
+        roots: planRoots,
       } satisfies PlanWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );

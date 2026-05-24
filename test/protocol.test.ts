@@ -100,14 +100,14 @@ describe("encodeFrame", () => {
     const frame: RpcFrame = {
       type: "rpc",
       id: "r1",
-      method: "set_approval",
-      params: { epic_id: "fn-1", task_key: "fn-1.2", status: "approved" },
+      method: "set_task_approval",
+      params: { epic_id: "fn-1", task_id: "fn-1.2", status: "approved" },
     };
     const line = encodeFrame(frame).slice(0, -1);
     const parsed = JSON.parse(line) as RpcFrame;
     expect(parsed).toEqual(frame);
     expect(parsed.id).toBe("r1");
-    expect(parsed.method).toBe("set_approval");
+    expect(parsed.method).toBe("set_task_approval");
   });
 
   test("round-trips an rpc frame with no params", () => {

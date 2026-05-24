@@ -16,12 +16,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  APPROVALS_DESCRIPTOR,
-  countAndToken,
-  EPICS_DESCRIPTOR,
-  getCollection,
-} from "../src/collections";
+import { EPICS_DESCRIPTOR, getCollection } from "../src/collections";
 import { openDb } from "../src/db";
 import type { ErrorFrame, ResultFrame } from "../src/protocol";
 import { runQuery } from "../src/server-worker";
@@ -490,102 +485,9 @@ test("epics result rows carry the `approval` column", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Registry resolution + descriptor shape: approvals
+// Registry resolution: approvals collection retired in schema v13
 // ---------------------------------------------------------------------------
 
-function seedApproval(
-  db: Database,
-  approval_id: string,
-  epic_id: string,
-  task_key: string,
-  status: "approved" | "rejected",
-  updated_at: number,
-): void {
-  db.query(
-    `INSERT INTO approvals (approval_id, epic_id, task_key, status, updated_at)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(approval_id, epic_id, task_key, status, updated_at);
-}
-
-test("getCollection resolves approvals; descriptor shape matches the schema-v12 table", () => {
-  expect(getCollection("approvals")).toBe(APPROVALS_DESCRIPTOR);
-  expect(APPROVALS_DESCRIPTOR.pk).toBe("approval_id");
-  // `version` fires the diff per row; approvals UPSERTs bump `updated_at`.
-  expect(APPROVALS_DESCRIPTOR.version).toBe("updated_at");
-  expect(APPROVALS_DESCRIPTOR.defaultSort).toEqual({
-    column: "updated_at",
-    dir: "desc",
-  });
-  // pk + the two natural filter keys are exposed; nothing else.
-  expect(APPROVALS_DESCRIPTOR.filters.approval_id).toBe("approval_id");
-  expect(APPROVALS_DESCRIPTOR.filters.epic_id).toBe("epic_id");
-  expect(APPROVALS_DESCRIPTOR.filters.status).toBe("status");
-  // No defaultFilter — the autopilot subscribes to all rows.
-  expect(APPROVALS_DESCRIPTOR.defaultFilter).toBeUndefined();
-  // No JSON columns — all five fields are scalars.
-  expect(APPROVALS_DESCRIPTOR.jsonColumns.size).toBe(0);
-});
-
-test("runQuery pages the approvals collection sorted by updated_at desc; filters by epic_id and status narrow the set", () => {
-  const { db } = openDb(dbPath, { readonly: false });
-  // Two epics, three rows total: one approved + one rejected on epic-foo,
-  // one approved on epic-bar. `updated_at` increases monotonically; the
-  // default sort is `updated_at desc`, so the newest row tops the page.
-  seedApproval(db, "fn-foo:.1", "fn-foo", ".1", "approved", 100);
-  seedApproval(db, "fn-foo:.2", "fn-foo", ".2", "rejected", 200);
-  seedApproval(db, "fn-bar:.1", "fn-bar", ".1", "approved", 300);
-
-  // Unfiltered: all three rows, sorted by updated_at desc.
-  const all = asResult(
-    runQuery(db, 0, { type: "query", collection: "approvals" }),
-  );
-  expect(all.total).toBe(3);
-  expect(all.rows.map((r) => String(r.approval_id))).toEqual([
-    "fn-bar:.1",
-    "fn-foo:.2",
-    "fn-foo:.1",
-  ]);
-  // Served columns match the descriptor exactly.
-  expect(Object.keys(all.rows[0]!).sort()).toEqual(
-    [...APPROVALS_DESCRIPTOR.columns].sort(),
-  );
-
-  // epic_id filter narrows the set to the two epic-foo rows.
-  const fooRows = asResult(
-    runQuery(db, 0, {
-      type: "query",
-      collection: "approvals",
-      filter: { epic_id: "fn-foo" },
-    }),
-  );
-  expect(fooRows.total).toBe(2);
-  expect(fooRows.rows.every((r) => r.epic_id === "fn-foo")).toBe(true);
-
-  // status filter narrows the set to the two approved rows.
-  const approvedRows = asResult(
-    runQuery(db, 0, {
-      type: "query",
-      collection: "approvals",
-      filter: { status: "approved" },
-    }),
-  );
-  expect(approvedRows.total).toBe(2);
-  expect(approvedRows.rows.every((r) => r.status === "approved")).toBe(true);
-
-  db.close();
-});
-
-test("approvals countAndToken is stable across re-query when the membership is unchanged", () => {
-  const { db } = openDb(dbPath, { readonly: false });
-  seedApproval(db, "fn-foo:.1", "fn-foo", ".1", "approved", 100);
-  seedApproval(db, "fn-foo:.2", "fn-foo", ".2", "rejected", 200);
-
-  // Same (whereClause, params) pair both calls — token + total stay stable.
-  const a = countAndToken(db, APPROVALS_DESCRIPTOR, "", []);
-  const b = countAndToken(db, APPROVALS_DESCRIPTOR, "", []);
-  expect(a.total).toBe(2);
-  expect(b.total).toBe(2);
-  expect(a.token).toBe(b.token);
-  expect(a.token.length).toBeGreaterThan(0);
-  db.close();
+test("getCollection returns undefined for `approvals` (retired in schema v13)", () => {
+  expect(getCollection("approvals")).toBeUndefined();
 });

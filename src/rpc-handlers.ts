@@ -8,227 +8,296 @@
  * spawn, and tests that import the worker module piecemeal opt out by not
  * importing this file.
  *
- * Currently registers ONE handler:
+ * Currently registers TWO handlers (the planctl-native approval pair, schema
+ * v13 — see the fn-592-approval-as-planctl-field epic):
  *
- * - `set_approval` — the first concrete RPC. UPSERTs (or DELETEs, on
- *   `status: "clear"`) one row of the `approvals` sidecar (schema v12, see
- *   `src/db.ts` `CREATE_APPROVALS`). Params shape `{ epic_id, task_key,
- *   status: "approved" | "rejected" | "clear" }`. The handler is the SOLE
- *   write path into `approvals`; the autopilot UI subscribes to the
- *   `approvals` collection (read-only) and reflects the rows this RPC lands.
+ * - `set_task_approval { epic_id, task_id, status }` — mutate the `approval`
+ *   field on `<root>/.planctl/tasks/<task_id>.json` to `status`.
+ * - `set_epic_approval { epic_id, status }` — mutate the `approval` field on
+ *   `<root>/.planctl/epics/<epic_id>.json` to `status`.
  *
- * Why a separate module rather than living in `src/server-worker.ts`: the
- * server-worker file already carries the lock/dispatch/lifecycle/poll
- * machinery; piling per-RPC handler bodies into it would hide the dispatch
- * shell behind feature code. Adding a future RPC is one more handler here
- * plus one more `registerRpc(...)` call — no edit to `src/server-worker.ts`
- * required.
+ * Both handlers write the canonical planctl JSON form (see
+ * `serializePlanctlJson` in `src/db.ts`) atomically (temp file in same dir,
+ * `<final>.tmp.<pid>.<crypto.randomUUID()>` suffix, `renameSync`). The
+ * round-trip back into the projection happens via the existing
+ * `@parcel/watcher` → plan-worker → reducer pipeline; the RPC return does
+ * NOT claim the projection is updated (eventual consistency on the order
+ * of one `data_version` poll, ~50ms).
+ *
+ * Per-file serialization: the dispatcher invokes handlers synchronously on
+ * a single thread, and the handler's I/O (`readFileSync` / `writeFileSync` /
+ * `renameSync`) is itself synchronous. So two concurrent same-file writes
+ * arriving on different connections process strictly in arrival order — the
+ * single-flight property holds by virtue of JS being single-threaded on
+ * synchronous code, with no explicit lock needed. A future async-handler
+ * refactor would need to revisit this with an explicit per-file
+ * `Map<path, Promise<void>>` chain (the pattern the planning spec called
+ * out), but today's contract is sync-throughout.
  *
  * Contract a handler MUST honor:
  * - Validate `params` shape and throw `BadParamsError` on mismatch (the
  *   dispatcher frames a `bad_params` error and the connection survives).
- * - Wrap any multi-statement write in a SQLite transaction (`BEGIN
- *   IMMEDIATE` per the epic's Best practices — DEFERRED upgrades mid-txn
- *   and ignores `busy_timeout`, surfacing as spurious `SQLITE_BUSY`).
+ * - Reject path-traversal in id fields (`..`, `/`, `\`, embedded null, dot
+ *   prefixes) at the wire boundary — never trust foreign-process JSON
+ *   identifiers as filesystem path components.
  * - Return a plain JSON-stringifiable value; the dispatcher frames it as
  *   `rpc_result.value`.
  * - NEVER call `db.close()` — the connection's lifetime belongs to the
  *   server-worker's `main()`.
+ *
+ * The `db` argument is no longer used by these handlers (the file is the
+ * canonical source; the round-trip back into the DB happens via the
+ * watcher → plan-worker → reducer pipeline), but the dispatcher's
+ * `RpcHandler` signature still takes it for protocol compatibility with
+ * any future SQL-mutating RPC.
  */
 
 import type { Database } from "bun:sqlite";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { atomicWriteFile, resolvePlanRoots, serializePlanctlJson } from "./db";
 import { BadParamsError, registerRpc } from "./server-worker";
-import type { Approval } from "./types";
 
 /**
- * `set_approval` params shape: the natural key `(epic_id, task_key)` plus the
- * desired `status`. `status` is the wire-level vocabulary — `"approved"` /
- * `"rejected"` are persisted as-is; `"clear"` is the DELETE branch (absent row
- * = "pending" per the schema-v12 invariant) and never lands a stored status.
+ * The planctl-native approval enum. Wire-validated by each handler (a wire
+ * value off this enum throws `BadParamsError`). MUST match the planctl
+ * serializer (task `.1` evidence) and the plan-worker's `Approval` type.
  */
-export interface SetApprovalParams {
+export type ApprovalStatus = "approved" | "rejected" | "pending";
+
+const APPROVAL_STATUSES = new Set<ApprovalStatus>([
+  "approved",
+  "rejected",
+  "pending",
+]);
+
+/** `set_task_approval` wire params. */
+export interface SetTaskApprovalParams {
   epic_id: string;
-  task_key: string;
-  status: "approved" | "rejected" | "clear";
+  task_id: string;
+  status: ApprovalStatus;
 }
 
-/**
- * The successful return shape on the approve/reject branches: the full row
- * (post-UPSERT) so the caller renders without a re-read. Mirrors the
- * `Approval` shape from `src/types.ts` — `approval_id` is the
- * `epic_id || ':' || task_key` composition the writer derives.
- */
-export type SetApprovalUpsertResult = Approval;
-
-/**
- * The successful return shape on the clear branch: a thin acknowledgment.
- * `cleared` is always `true`; the caller pairs it with the `(epic_id,
- * task_key)` it sent. `clear` is idempotent — DELETE of a non-existent row
- * still returns this success shape (no row matched is not an error here, just
- * a no-op).
- */
-export interface SetApprovalClearResult {
-  cleared: true;
+/** `set_epic_approval` wire params. */
+export interface SetEpicApprovalParams {
   epic_id: string;
-  task_key: string;
+  status: ApprovalStatus;
 }
 
-export type SetApprovalResult =
-  | SetApprovalUpsertResult
-  | SetApprovalClearResult;
+/** Successful return shape for `set_task_approval`. */
+export interface SetTaskApprovalResult {
+  ok: true;
+  epic_id: string;
+  task_id: string;
+  approval: ApprovalStatus;
+}
+
+/** Successful return shape for `set_epic_approval`. */
+export interface SetEpicApprovalResult {
+  ok: true;
+  epic_id: string;
+  approval: ApprovalStatus;
+}
+
+// ---------------------------------------------------------------------------
+// Wire-boundary validation
+// ---------------------------------------------------------------------------
 
 /**
- * Validate the wire `params` shape into a typed object or throw
- * `BadParamsError`. All three fields are required + must be non-empty strings;
- * `status` must be one of the three literals. The dispatcher catches the
- * throw and frames a `bad_params` error.
+ * Reject any id token that could escape its target dir (`<root>/.planctl/{epics,tasks}/`)
+ * via path-traversal. We disallow path separators (`/`, `\`), embedded null
+ * bytes, and any leading-dot value (`.`, `..`, `..foo`, `.hidden`). An
+ * id-shaped token (`fn-1-foo`, `fn-1-foo.3`) sails through; a weaponizable
+ * token throws `BadParamsError`.
  *
- * Validation happens at the wire boundary in addition to the DB-layer CHECK
- * constraint on `approvals.status` — defense in depth, per the epic's Best
- * practices. The CHECK catches direct writers and schema-level corruption;
- * this handler-side gate catches typos before paying SQLite cold-start cost
- * and surfaces a typed error frame the caller can show to the human.
+ * NOTE: planctl ids are NOT validated for shape (the slug parser lives in
+ * planctl); we only enforce the safety-critical "is this a safe filename
+ * component" predicate. Wire validation, not semantic validation.
  */
-function validateSetApprovalParams(params: unknown): SetApprovalParams {
-  if (params === null || typeof params !== "object") {
-    throw new BadParamsError("set_approval: params must be an object");
-  }
-  const obj = params as Record<string, unknown>;
-
-  if (typeof obj.epic_id !== "string" || obj.epic_id.length === 0) {
-    throw new BadParamsError(
-      "set_approval: `epic_id` must be a non-empty string",
-    );
-  }
-  if (typeof obj.task_key !== "string" || obj.task_key.length === 0) {
-    throw new BadParamsError(
-      "set_approval: `task_key` must be a non-empty string",
-    );
-  }
+function rejectPathTraversal(field: string, value: string): void {
   if (
-    obj.status !== "approved" &&
-    obj.status !== "rejected" &&
-    obj.status !== "clear"
+    value.length === 0 ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    value.includes("\0") ||
+    value.startsWith(".")
   ) {
     throw new BadParamsError(
-      "set_approval: `status` must be one of approved|rejected|clear",
+      `set_*_approval: invalid \`${field}\`: rejected path-traversal or empty token`,
     );
   }
-  return {
-    epic_id: obj.epic_id,
-    task_key: obj.task_key,
-    status: obj.status,
-  };
+}
+
+function validateApprovalStatus(value: unknown): ApprovalStatus {
+  if (
+    typeof value !== "string" ||
+    !APPROVAL_STATUSES.has(value as ApprovalStatus)
+  ) {
+    throw new BadParamsError(
+      "set_*_approval: `status` must be one of approved|rejected|pending",
+    );
+  }
+  return value as ApprovalStatus;
+}
+
+function validateSetTaskApprovalParams(params: unknown): SetTaskApprovalParams {
+  if (params === null || typeof params !== "object") {
+    throw new BadParamsError("set_task_approval: params must be an object");
+  }
+  const obj = params as Record<string, unknown>;
+  if (typeof obj.epic_id !== "string" || obj.epic_id.length === 0) {
+    throw new BadParamsError(
+      "set_task_approval: `epic_id` must be a non-empty string",
+    );
+  }
+  if (typeof obj.task_id !== "string" || obj.task_id.length === 0) {
+    throw new BadParamsError(
+      "set_task_approval: `task_id` must be a non-empty string",
+    );
+  }
+  rejectPathTraversal("epic_id", obj.epic_id);
+  rejectPathTraversal("task_id", obj.task_id);
+  const status = validateApprovalStatus(obj.status);
+  return { epic_id: obj.epic_id, task_id: obj.task_id, status };
+}
+
+function validateSetEpicApprovalParams(params: unknown): SetEpicApprovalParams {
+  if (params === null || typeof params !== "object") {
+    throw new BadParamsError("set_epic_approval: params must be an object");
+  }
+  const obj = params as Record<string, unknown>;
+  if (typeof obj.epic_id !== "string" || obj.epic_id.length === 0) {
+    throw new BadParamsError(
+      "set_epic_approval: `epic_id` must be a non-empty string",
+    );
+  }
+  rejectPathTraversal("epic_id", obj.epic_id);
+  const status = validateApprovalStatus(obj.status);
+  return { epic_id: obj.epic_id, status };
+}
+
+// ---------------------------------------------------------------------------
+// Plan-file mutation
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the absolute path to a planctl JSON file by id. Walks the
+ * configured plan roots looking for the first existing file. Returns null if
+ * none of the configured roots has a matching file (the caller surfaces this
+ * as a typed error frame rather than a crash).
+ *
+ * The lookup is shallow — we try `<root>/.planctl/{epics,tasks}/<id>.json`
+ * AND `<root>/<project>/.planctl/{epics,tasks}/<id>.json` (one level deep,
+ * mirroring `runPlanctlApprovalMigration`'s lookup). A root with no
+ * `.planctl` subdir is skipped.
+ *
+ * Exported for unit reach.
+ */
+export function resolvePlanFile(
+  roots: string[],
+  collection: "epics" | "tasks",
+  id: string,
+): string | null {
+  const name = `${id}.json`;
+  for (const root of roots) {
+    // Try the root itself first.
+    const direct = join(root, ".planctl", collection, name);
+    if (existsSync(direct)) {
+      return direct;
+    }
+    // Otherwise walk one level deep — `<root>/<project>/.planctl/...`.
+    let entries: string[];
+    try {
+      entries = readdirSync(root);
+    } catch {
+      continue;
+    }
+    for (const child of entries) {
+      const candidate = join(root, child, ".planctl", collection, name);
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
 }
 
 /**
- * `set_approval` handler. UPSERTs (or DELETEs on `status: "clear"`) one row of
- * the `approvals` sidecar.
+ * Load the JSON object at `path`, mutate `approval = status` (preserving every
+ * other top-level field), serialize via `serializePlanctlJson`, atomic-write.
  *
- * Approve / reject branch:
- *   - Derive `approval_id = epic_id || ':' || task_key` (the writer is the
- *     SOLE source of truth for the composition; the schema column is bare to
- *     keep `selectByIds` / `countAndToken` cheap — see `src/db.ts`).
- *   - UPSERT via `INSERT … ON CONFLICT(epic_id, task_key) DO UPDATE SET …`
- *     (NOT `REPLACE INTO`: `REPLACE` deletes the old row and re-inserts,
- *     firing DELETE triggers and disturbing any future FK children — UPSERT
- *     updates in place per the epic's Best practices). `updated_at` is
- *     `unixepoch('now','subsec')`. CAVEAT: SQLite's `unixepoch('now','subsec')`
- *     is sub-microsecond resolution per the docs; two UPSERTs landing in the
- *     same microsecond would tie `updated_at`, and the diff machinery's
- *     `version > lastSent` test would skip the second push. Vanishingly
- *     unlikely for a human-driven approval CLI; a higher-frequency writer
- *     would need an explicit version-bump.
- *   - Re-SELECT the row inside the same transaction and return it as the
- *     `rpc_result.value` (so the caller renders without a re-read).
- *
- * Clear branch:
- *   - DELETE WHERE `(epic_id, task_key)` — leverages the UNIQUE index. A
- *     zero-row DELETE is NOT an error (absent row = "pending", which is what
- *     `clear` means); the handler returns `{ cleared: true, epic_id,
- *     task_key }` either way (idempotent). The "clear" overload of a single
- *     RPC keeps the wire surface small at the cost of obscuring DELETEs in
- *     any future audit log — acceptable tradeoff for this iteration; a
- *     future split to a peer `delete_approval` is straightforward.
- *
- * Transaction:
- *   - Wrapped in `BEGIN IMMEDIATE` (the writer-mode default is DEFERRED,
- *     which upgrades to writer mid-statement and ignores `busy_timeout`,
- *     surfacing as spurious `SQLITE_BUSY`). Both branches do a single SQLite
- *     statement, but wrapping is cheap and uniform — and the upsert branch's
- *     re-SELECT MUST see the just-written row, which is only guaranteed
- *     within the writer's own transaction.
- *
- * Throws `BadParamsError` on malformed `params`; the dispatcher catches and
- * frames `bad_params`. Any other throw (e.g. a SQLITE_BUSY past timeout)
- * falls through as `rpc_failed`. The handler NEVER calls `db.close()` —
- * the writer connection's lifetime belongs to the server-worker.
+ * Throws on read/parse/write failure — the dispatcher's `rpc_failed` path
+ * frames the error. Exported for unit reach.
  */
-export function setApprovalHandler(
-  db: Database,
-  params: unknown,
-): SetApprovalResult {
-  const { epic_id, task_key, status } = validateSetApprovalParams(params);
-
-  // BEGIN IMMEDIATE: take the writer lock up front rather than upgrading
-  // mid-statement. Avoids the "SQLITE_BUSY despite busy_timeout" foot-gun the
-  // epic's Best practices call out.
-  db.run("BEGIN IMMEDIATE");
-  try {
-    if (status === "clear") {
-      db.prepare(
-        "DELETE FROM approvals WHERE epic_id = ? AND task_key = ?",
-      ).run(epic_id, task_key);
-      db.run("COMMIT");
-      // Idempotent: a zero-row DELETE still resolves to "cleared". The caller
-      // owns the (epic_id, task_key) it sent — echo it for symmetry with the
-      // upsert branch's full-row return.
-      return { cleared: true, epic_id, task_key };
-    }
-
-    const approval_id = `${epic_id}:${task_key}`;
-    // INSERT … ON CONFLICT … DO UPDATE — never REPLACE (see the docstring's
-    // "Approve / reject branch" note). `unixepoch('now','subsec')` provides
-    // sub-µs resolution; the descriptor uses `updated_at` as `version` so the
-    // diff fires on every UPSERT (modulo the same-µs tie caveat).
-    db.prepare(
-      `INSERT INTO approvals (approval_id, epic_id, task_key, status, updated_at)
-       VALUES (?, ?, ?, ?, unixepoch('now', 'subsec'))
-       ON CONFLICT(epic_id, task_key)
-         DO UPDATE SET status = excluded.status,
-                       updated_at = excluded.updated_at`,
-    ).run(approval_id, epic_id, task_key, status);
-    // Re-SELECT inside the same transaction so the return value reflects the
-    // freshly-written row (caller renders without a re-query).
-    const row = db
-      .prepare(
-        "SELECT approval_id, epic_id, task_key, status, updated_at FROM approvals WHERE approval_id = ?",
-      )
-      .get(approval_id) as Approval | null;
-    db.run("COMMIT");
-
-    if (!row) {
-      // Should be unreachable: the UPSERT just landed the row inside this
-      // transaction. Surface a typed throw rather than `null` so the
-      // dispatcher's `rpc_failed` path engages — this would be a real bug.
-      throw new Error(
-        `set_approval: UPSERT succeeded but re-SELECT found no row for ${approval_id}`,
-      );
-    }
-    return row;
-  } catch (err) {
-    // ROLLBACK on any throw inside the transaction so the writer lock is
-    // released and the next call doesn't inherit a half-written state. The
-    // re-throw routes through the dispatcher's catch (BadParamsError →
-    // bad_params; anything else → rpc_failed).
-    try {
-      db.run("ROLLBACK");
-    } catch {
-      // Best-effort: a ROLLBACK on a never-opened or already-failed txn
-      // throws; that's fine, we're already unwinding.
-    }
-    throw err;
+export function rewriteApprovalField(
+  path: string,
+  status: ApprovalStatus,
+): void {
+  const raw = readFileSync(path, "utf8");
+  const parsed = JSON.parse(raw);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${path}: planctl file is not a JSON object`);
   }
+  (parsed as Record<string, unknown>).approval = status;
+  atomicWriteFile(path, serializePlanctlJson(parsed));
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+/**
+ * `set_task_approval` handler. Mutates the `approval` field on
+ * `<root>/.planctl/tasks/<task_id>.json` to `status`. The filename keys on
+ * the task id (not the epic id) per planctl's filename convention; `epic_id`
+ * rides as wire context for the caller's UI and is validated but NOT used
+ * to locate the file (planctl task ids encode the epic id as a prefix —
+ * `<epic_id>.<n>`).
+ *
+ * Returns `{ ok: true, epic_id, task_id, approval }`. Eventual consistency:
+ * the projection reflects the write on the next watcher → plan-worker round
+ * trip (~50ms via `@parcel/watcher` + `PRAGMA data_version` poll).
+ *
+ * The `db` argument is unused (we write the file, not the DB); kept for
+ * `RpcHandler` signature parity. The leading underscore swallows the
+ * unused-arg lint.
+ */
+export function setTaskApprovalHandler(
+  _db: Database,
+  params: unknown,
+): SetTaskApprovalResult {
+  const { epic_id, task_id, status } = validateSetTaskApprovalParams(params);
+  const roots = resolvePlanRoots();
+  const path = resolvePlanFile(roots, "tasks", task_id);
+  if (path === null) {
+    throw new Error(
+      `set_task_approval: no planctl task file found for task_id '${task_id}' in any configured plan root`,
+    );
+  }
+  rewriteApprovalField(path, status);
+  return { ok: true, epic_id, task_id, approval: status };
+}
+
+/**
+ * `set_epic_approval` handler. Mutates the `approval` field on
+ * `<root>/.planctl/epics/<epic_id>.json` to `status`. Returns
+ * `{ ok: true, epic_id, approval }`. Same eventual-consistency contract as
+ * `set_task_approval`.
+ */
+export function setEpicApprovalHandler(
+  _db: Database,
+  params: unknown,
+): SetEpicApprovalResult {
+  const { epic_id, status } = validateSetEpicApprovalParams(params);
+  const roots = resolvePlanRoots();
+  const path = resolvePlanFile(roots, "epics", epic_id);
+  if (path === null) {
+    throw new Error(
+      `set_epic_approval: no planctl epic file found for epic_id '${epic_id}' in any configured plan root`,
+    );
+  }
+  rewriteApprovalField(path, status);
+  return { ok: true, epic_id, approval: status };
 }
 
 /**
@@ -238,9 +307,10 @@ export function setApprovalHandler(
  *
  * Idempotency: `registerRpc` throws on duplicate methods (a programming
  * error, not a runtime condition); never call this twice from the same
- * process. Tests that want to drive `setApprovalHandler` directly should
- * import the handler and call it, NOT re-register it.
+ * process. Tests that want to drive a handler directly should import the
+ * handler and call it, NOT re-register it.
  */
 export function installRpcHandlers(): void {
-  registerRpc("set_approval", setApprovalHandler);
+  registerRpc("set_task_approval", setTaskApprovalHandler);
+  registerRpc("set_epic_approval", setEpicApprovalHandler);
 }
