@@ -4,20 +4,23 @@
  * server (`src/server-worker.ts`). It renders a *page of jobs as a frame* and
  * reprints a fresh frame every time the visible projection changes.
  *
- * It `query`s a 10-row page of `jobs` and renders it as a YAML stream: each
- * frame is a YAML document (leading `---`) listing every job as a single
- * collapsed string — `{basename(cwd)} · {title} · {state}`. The query optionally
- * carries a server-side `state` filter built from `--state` / `--state-ne`
- * (the bare-value equality form and the `{ ne }` operator form, respectively;
- * default is no filter and every job pages through). When a filter is in
- * effect it runs in SQL, so LIMIT counts only matching rows and `total` /
- * `meta` track exactly that set. Membership is frozen
- * WITHIN a fetched page (the server never reflows a live page), but the script
- * REFETCHES the page — on every `patch`/`meta` change signal AND on a steady
- * poll — so each fresh `result` reflects the current top-N. A NEW frame prints
- * whenever the RENDERED page changes; the rendered output — not internal row
- * churn — is the sole frame trigger, enforced by routing every emit through
- * `emitFrameIfChanged`.
+ * It `query`s a 10-row page of `jobs` and renders it as a `---`-led document
+ * of one job per line in plain bracket form:
+ *
+ *   - ({basename(cwd)}) {title} [{state}]
+ *
+ * The `(...)` cwd segment is omitted when `cwd` is null/empty so the line
+ * doesn't lead with empty parens. The query optionally carries a server-side
+ * `state` filter built from `--state` / `--state-ne` (the bare-value equality
+ * form and the `{ ne }` operator form, respectively; default is no filter
+ * and every job pages through). When a filter is in effect it runs in SQL,
+ * so LIMIT counts only matching rows and `total` / `meta` track exactly that
+ * set. Membership is frozen WITHIN a fetched page (the server never reflows
+ * a live page), but the script REFETCHES the page — on every `patch`/`meta`
+ * change signal AND on a steady poll — so each fresh `result` reflects the
+ * current top-N. A NEW frame prints whenever the RENDERED page changes; the
+ * rendered output — not internal row churn — is the sole frame trigger,
+ * enforced by routing every emit through `emitFrameIfChanged`.
  *
  * The script renders ONLY from `result` frames. `patch` and `meta` are treated
  * purely as "refetch" hints (their payloads are never rendered directly), so
@@ -44,7 +47,7 @@
  * therefore RETRIES connecting (capped backoff) until keeperd is up and
  * accepting, and on a dropped connection (e.g. a keeperd restart) it RECONNECTS
  * the same way instead of exiting. Every connection-lifecycle transition prints
- * a `...`-fenced YAML note (`event: connecting|connected|waiting|disconnected`,
+ * a `...`-fenced note (`event: connecting|connected|waiting|disconnected`,
  * the initial connection included) — the same out-of-band "meta message"
  * channel as the sidecar note, distinct from the server's `meta` staleness
  * frame. Only Ctrl-C (SIGINT) or a terminal query error (`bad_frame` /
@@ -113,13 +116,14 @@ Usage: bun scripts/jobs.ts [--sock <path>] [--state <s> | --state-ne <s>]
                    --state killed to see them explicitly)
   --help           Show this help
 
-Renders a 10-row page of jobs as a YAML stream: one frame per change, each
-frame a YAML document (--- separated). The render is a flat sequence of:
-  {basename(cwd)} · {title} · {state}
-The page is refetched on every change signal and on a steady poll, so it always
-shows the current top-N; a new frame prints only when the rendered output
-changes. Every emitted frame is also mirrored to two /tmp sidecar files (full
-JSON state + rendered frame), whose paths print in a ...-fenced note.
+Renders a 10-row page of jobs as a stream of plain bracket-form lines: one
+frame per change, each frame led by '---'. One job per line:
+  - ({basename(cwd)}) {title} [{state}]
+The (...) cwd segment is omitted when cwd is null/empty. The page is
+refetched on every change signal and on a steady poll, so it always shows
+the current top-N; a new frame prints only when the rendered output changes.
+Every emitted frame is also mirrored to two /tmp sidecar files (full JSON
+state + rendered frame), whose paths print in a ...-fenced note.
 
 The client waits for keeperd to come up and reconnects across restarts instead
 of exiting; each connection-lifecycle change prints a ...-fenced note
@@ -129,51 +133,6 @@ of exiting; each connection-lifecycle change prints a ...-fenced note
 /** The hardcoded collection and its primary key. */
 const COLLECTION = "jobs";
 const pk = "job_id";
-
-/**
- * Render one value as YAML. Scalars are bare when safe, else single-quoted;
- * arrays and objects (any future decoded JSON-TEXT column) render as flow
- * sequences / mappings with each element recursed through this same function,
- * so a list column shows as `[a, b]` rather than a comma-flattened string.
- */
-function yamlScalar(v: unknown): string {
-  if (v === null || v === undefined) {
-    return "null";
-  }
-  if (typeof v === "number" || typeof v === "boolean") {
-    return String(v);
-  }
-  if (Array.isArray(v)) {
-    return `[${v.map(yamlScalar).join(", ")}]`;
-  }
-  if (typeof v === "object") {
-    const entries = Object.entries(v as Record<string, unknown>);
-    return `{${entries.map(([k, val]) => `${k}: ${yamlScalar(val)}`).join(", ")}}`;
-  }
-  const s = String(v);
-  // Emit a bare (plain) scalar whenever YAML permits one — a plain scalar
-  // legally carries spaces and most characters (incl. `·`), so a value like
-  // `keeper · my task · working` needs no quotes. Quote (single-quote, doubling
-  // embedded quotes — the YAML escape for `'`) only for the cases that would
-  // otherwise be invalid or restructure the node:
-  //   - the empty string, or leading/trailing whitespace;
-  //   - a leading flow/indicator char (`![]{},|>@\`"'%` or `&*#`);
-  //   - a leading `-`/`?`/`:` that is followed by a space or ends the string
-  //     (those three are indicators only in that position);
-  //   - an embedded `": "` or trailing `:` (would start a mapping);
-  //   - an embedded `" #"` (would start a comment).
-  const needsQuote =
-    s === "" ||
-    /^\s|\s$/.test(s) ||
-    /^[![\]{},|>@`"'%&*#]/.test(s) ||
-    /^[-?:](\s|$)/.test(s) ||
-    /:(\s|$)/.test(s) ||
-    /\s#/.test(s);
-  if (!needsQuote) {
-    return s;
-  }
-  return `'${s.replace(/'/g, "''")}'`;
-}
 
 function die(message: string): never {
   process.stderr.write(`keeper-jobs: ${message}\n`);
@@ -236,28 +195,29 @@ async function main(): Promise<void> {
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
   /**
-   * Collapse one full row to its display string:
-   * `{basename(cwd)} · {title} · {state}`. A null/absent segment projects to
-   * empty (no basename of nothing). This — together with `emitFrameIfChanged`
-   * — defines which column moves can reframe the page.
+   * Collapse one full row to its display line:
+   * `- ({basename(cwd)}) {title} [{state}]`. A null/empty `cwd` drops the
+   * `(...)` segment entirely (no empty parens). This — together with
+   * `emitFrameIfChanged` — defines which column moves can reframe the page.
    */
   function projectRow(row: Record<string, unknown>): string {
     const title = seg(row.title);
     const cwd = row.cwd == null ? "" : basename(String(row.cwd));
-    return `${cwd} · ${title} · ${seg(row.state)}`;
+    const cwdSeg = cwd === "" ? "" : `(${cwd}) `;
+    return `- ${cwdSeg}${title} [${seg(row.state)}]`;
   }
 
   /**
-   * Project the frozen page into a YAML document body (no leading `---`), in
-   * server-sent order. Renders as a flat sequence of one collapsed string per
-   * row. Strings carrying `·` auto-single-quote through `yamlScalar`.
+   * Project the frozen page into the rendered body (no leading `---`), in
+   * server-sent order. Renders as one `projectRow` line per row, joined by
+   * newlines. No quoting — plain bracket text, mirroring `scripts/epics.ts`.
    */
   function renderBody(): string {
     if (order.length === 0) {
-      return "[]"; // empty page → an empty YAML sequence
+      return "(no jobs)";
     }
     return order
-      .map((id) => `- ${yamlScalar(projectRow(byId.get(id) ?? { [pk]: id }))}`)
+      .map((id) => projectRow(byId.get(id) ?? { [pk]: id }))
       .join("\n");
   }
 
@@ -265,7 +225,7 @@ async function main(): Promise<void> {
   // can be inspected out-of-band. Per-pid so concurrent runs don't collide;
   // overwritten each frame (always the most recently printed frame).
   const stateSidecar = `/tmp/keeper-jobs.${process.pid}.state.json`;
-  const frameSidecar = `/tmp/keeper-jobs.${process.pid}.frame.yaml`;
+  const frameSidecar = `/tmp/keeper-jobs.${process.pid}.frame.txt`;
 
   /**
    * Mirror the just-emitted frame to its two sidecar files and print a
@@ -327,12 +287,14 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Print a connection-lifecycle "meta message": a `...`-fenced YAML doc naming
-   * the `event` and any detail keys. This is the SAME out-of-band channel as the
-   * sidecar note (`writeSidecars`), distinct from the server's `meta` staleness
-   * frame — it narrates connect/disconnect/wait so a long-lived viewer's stream
-   * is self-describing across keeperd restarts. Detail values route through
-   * `yamlScalar` so a path or message quotes correctly.
+   * Print a connection-lifecycle "meta message": a `...`-fenced doc naming the
+   * `event` and any detail keys. This is the SAME out-of-band channel as the
+   * sidecar note (`writeSidecars`), distinct from the server's `meta`
+   * staleness frame — it narrates connect/disconnect/wait so a long-lived
+   * viewer's stream is self-describing across keeperd restarts. Detail values
+   * are rendered as plain `String(v)`; the note is meant for humans, not a
+   * YAML parser, and lifecycle details (sock path, error message, attempt
+   * count) carry no characters that need escaping for legibility.
    */
   function emitLifecycle(
     event: string,
@@ -341,7 +303,7 @@ async function main(): Promise<void> {
     log("...");
     log(`event: ${event}`);
     for (const [k, v] of Object.entries(detail)) {
-      log(`${k}: ${yamlScalar(v)}`);
+      log(`${k}: ${String(v)}`);
     }
     log("...");
   }
