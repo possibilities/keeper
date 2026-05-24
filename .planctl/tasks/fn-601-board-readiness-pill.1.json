@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-24T23:33:37Z",
+  "depends_on": [],
+  "epic": "fn-601-board-readiness-pill",
+  "id": "fn-601-board-readiness-pill.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "readiness pipeline and board.ts pill",
+  "updated_at": "2026-05-24T23:33:37Z"
+}
