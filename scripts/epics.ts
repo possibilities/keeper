@@ -13,7 +13,14 @@
  *        [{task_id}]
  *
  * `{deps}` is ` [#A,#B]` from `depends_on_epics` for the header and from
- * `depends_on` on each embedded task; both are omitted when empty. The
+ * `depends_on` on each embedded task; both are omitted when empty. In default
+ * mode (no `--status`/`--status-ne`/`--show-approved` flag) the epic-header
+ * `{deps}` list is filtered to deps still "on the board" — i.e. present in
+ * the current page, which IS the server's default-scope set `(status = open
+ * OR approval != approved)` because `PAGE_LIMIT = 0` fetches every row in
+ * scope. Deps that have fallen off the board (done AND approved) drop out
+ * of the pill. Under any explicit filter the page is not the on-board set
+ * so the legacy "show all deps" behavior stands. The
  * `[{approval}]` pill comes from the planctl-native `approval` field
  * (top-level on the epic row, top-level on each embedded task element — schema
  * v13) and always renders; a missing / off-enum value coerces to `pending`.
@@ -229,6 +236,16 @@ async function main(): Promise<void> {
     die("--status and --status-ne are mutually exclusive");
   }
 
+  // True when NO filter flag was passed — i.e. the wire query carries no
+  // `filter` key and the server applies its default scope `(status = 'open' OR
+  // approval != 'approved')`. With `PAGE_LIMIT = 0` the page IS that on-board
+  // set, so `byId.has(dep)` answers "is this dep still on the board?" exactly.
+  // Read by `renderEpicBlock` to filter the epic-header `{deps}` pill.
+  const onBoardOnly =
+    values.status === undefined &&
+    values["status-ne"] === undefined &&
+    !values["show-approved"];
+
   const sockPath = values.sock ?? resolveSockPath();
   const log = (s: string) => process.stdout.write(`${s}\n`);
 
@@ -298,7 +315,14 @@ async function main(): Promise<void> {
     const epicDeps = Array.isArray(row.depends_on_epics)
       ? row.depends_on_epics
       : [];
-    const epicDepNums = epicDeps
+    // In default mode the current page is the on-board set, so a dep absent
+    // from `byId` is done-AND-approved (off the board) and should drop out of
+    // the pill. Under any explicit filter the page is not the on-board set,
+    // so we can't answer the question — show every dep.
+    const epicDepsForRender = onBoardOnly
+      ? epicDeps.filter((d) => byId.has(String(d)))
+      : epicDeps;
+    const epicDepNums = epicDepsForRender
       .map((d) => epicNumFromId(String(d)))
       .filter((n): n is number => n != null);
     const epicDepsSeg =
