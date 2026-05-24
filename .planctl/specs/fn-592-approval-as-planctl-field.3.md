@@ -50,5 +50,5 @@ RPC handler tests in `test/rpc-handlers.test.ts`: (a) `set_task_approval` / `set
 - [ ] All migration tests pass on a fresh DB and on a stale-v12 DB; partial-completion re-run is a no-op
 
 ## Done summary
-
+Replaced sidecar set_approval RPC with set_task_approval + set_epic_approval that atomically rewrite .planctl/{epics,tasks}/*.json (canonical serializer matches planctl json.dumps(indent=2, sort_keys=True, ensure_ascii=True)+'\n' byte-for-byte). Schema v13: addColumnIfMissing epics.approval + DROP TABLE IF EXISTS approvals in migrate(); new runPlanctlApprovalMigration backfills 'approved' to epic files lacking the field and overlays the soon-to-be-dropped approvals rows onto epic/task files (close:<epic> → epic, otherwise task; orphans log+skip); daemon calls FS half post-openDb pre-worker-spawn. Removed APPROVALS_DESCRIPTOR + Approval interface. 451/451 tests pass.
 ## Evidence
