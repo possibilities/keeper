@@ -232,15 +232,20 @@ async function main(): Promise<void> {
   const log = (s: string) => process.stdout.write(`${s}\n`);
 
   // DEBUG: timing instrumentation for the "epics frame takes 5s" bug.
-  // Every line is `[epics-ts] T=<epochMs> +<elapsedMs> <event>` on stderr so
-  // a same-wall-clock `[srv-ts]` log from src/server-worker.ts can be diffed
-  // against it. Remove once the bug is understood.
+  // Gated behind `KEEPER_DEBUG_TS=1` so steady-state runs stay quiet; opt in
+  // when reproducing. Every line is `[epics-ts] T=<epochMs> +<elapsedMs>
+  // <event>` on stderr so a same-wall-clock `[srv-ts]` log from
+  // src/server-worker.ts can be diffed against it. Remove once the bug is
+  // understood.
   const _epicsT0 = Date.now();
-  const ts = (msg: string): void => {
-    process.stderr.write(
-      `[epics-ts] T=${Date.now()} +${Date.now() - _epicsT0}ms ${msg}\n`,
-    );
-  };
+  const _epicsTsEnabled = process.env.KEEPER_DEBUG_TS === "1";
+  const ts = _epicsTsEnabled
+    ? (msg: string): void => {
+        process.stderr.write(
+          `[epics-ts] T=${Date.now()} +${Date.now() - _epicsT0}ms ${msg}\n`,
+        );
+      }
+    : (_msg: string): void => {};
 
   // The current page, in server-sent order, plus a by-id index. Both are
   // rebuilt wholesale on every `result` (each refetch replaces the page); the
