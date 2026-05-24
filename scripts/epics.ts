@@ -7,10 +7,12 @@
  * It `query`s the `epics` collection and renders it as a stream of simple text
  * blocks. Each frame is a `---`-led document; each epic is one block:
  *
- *   {basename(project_dir)} {epic_number} {title}{deps} [{status}] [{approval}]
- *     [{epic_id}]
+ *   {basename(project_dir)} {epic_number} {title}{deps} [{status}]
  *     {task_number}. {title}{deps} [{status}] [{approval}]
  *        [{task_id}]
+ *     ...
+ *     {N+1}. Quality audit and close [{approval}]
+ *        [{epic_id}]
  *
  * `{deps}` is ` [#A,#B]` from `depends_on_epics` for the header and from
  * `depends_on` on each embedded task; both are omitted when empty. In default
@@ -23,11 +25,16 @@
  * so the legacy "show all deps" behavior stands. The
  * `[{approval}]` pill comes from the planctl-native `approval` field
  * (top-level on the epic row, top-level on each embedded task element — schema
- * v13) and always renders; a missing / off-enum value coerces to `pending`.
- * The epic-slug line is indented 2 spaces under the header; the task line is
- * indented 2 spaces; the task-slug line is indented 5 spaces (lining up with
- * the task title for single-digit task numbers). Blocks are separated by a
- * single blank line. No YAML — just plain bracket text.
+ * v13); a missing / off-enum value coerces to `pending`. The epic's approval
+ * does NOT render on the header — it rides the trailing virtual task (below),
+ * which lets the header carry just `[{status}]` and keeps the approval pill
+ * in the same column as the real-task approvals. Every epic also ends with a
+ * "Quality audit and close" virtual task (real-task-count + 1 as its number,
+ * the epic's approval as its pill, the epic_id as its slug line) — appended
+ * even when the epic has no real tasks, since the slug needs a home. Task
+ * lines are indented 2 spaces; slug lines 5 spaces (lining up with the task
+ * title for single-digit task numbers). Blocks are separated by a single blank
+ * line. No YAML — just plain bracket text.
  *
  * The query optionally carries a server-side filter built from `--status` /
  * `--status-ne` (status equality / `{ ne }` operator) and `--show-approved`
@@ -152,14 +159,19 @@ Usage: bun scripts/epics.ts [--sock <path>] [--status <s> | --status-ne <s>]
 
 Renders the epics page as a stream of simple text blocks: one frame per change,
 each frame led by '---'. Each epic is one block —
-  {basename(project_dir)} {epic_number} {title} [#A,#B] [{status}] [{approval}]
-    [{epic_id}]
+  {basename(project_dir)} {epic_number} {title} [#A,#B] [{status}]
     {task_number}. {title} [#X,#Y] [{status}] [{approval}]
        [{task_id}]
+    ...
+    {N+1}. Quality audit and close [{approval}]
+       [{epic_id}]
 Blocks are separated by a single blank line. The [#…] segment lists the epic
-or task numbers a row depends on (omitted when empty). The [{approval}] pill
-always renders, sourced from the planctl-native 'approval' field; a missing
-or off-enum value coerces to 'pending'.
+or task numbers a row depends on (omitted when empty); in default mode the
+epic-header [#…] hides deps that have fallen off the board. Every epic ends
+with a "Quality audit and close" virtual task that carries the epic's approval
+pill and the epic_id as its slug — the epic's own approval no longer renders
+on the header. On real task lines the [{approval}] pill carries the task's
+approval. A missing / off-enum approval coerces to 'pending'.
 
 The page is refetched on every change signal and on a steady poll, so it always
 shows the current top-N; a new frame prints only when the rendered output
@@ -298,16 +310,21 @@ async function main(): Promise<void> {
 
   /**
    * Render one epic as a small text block:
-   *   {basename(project_dir)} {epic_number} {title}{deps} [{status}] [{approval}]
-   *     [{epic_id}]
+   *   {basename(project_dir)} {epic_number} {title}{deps} [{status}]
    *     {task_number}. {title}{deps} [{status}] [{approval}]
    *        [{task_id}]
+   *     ...
+   *     {N+1}. Quality audit and close [{approval}]
+   *        [{epic_id}]
    * `{deps}` is ` [#A,#B]` joined from `depends_on_epics` (epic header) or
-   * `depends_on` (task line); omitted when empty. The `[{approval}]` pill
-   * sources from the planctl-native `approval` field and always renders. A
-   * non-array `tasks` cell renders as no task lines. Together these projections
-   * define which column moves can reframe the page — read alongside
-   * `emitFrameIfChanged`.
+   * `depends_on` (task line); omitted when empty. In default mode the epic-
+   * header `{deps}` is filtered to deps still on the board (present in the
+   * current page). A trailing "Quality audit and close" virtual task is
+   * appended to every epic (real-task count + 1 as its number) and carries
+   * the epic's approval pill and the epic_id as its slug — the epic header
+   * no longer renders either. A non-array `tasks` cell still renders the
+   * virtual task. Together these projections define which column moves can
+   * reframe the page — read alongside `emitFrameIfChanged`.
    */
   function renderEpicBlock(row: Record<string, unknown>): string {
     const dir =
@@ -332,8 +349,7 @@ async function main(): Promise<void> {
     const epicId = seg(row[pk]);
     const epicApproval = approvalPill(row.approval);
     const lines: string[] = [
-      `${dir} ${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${seg(row.status)}] [${epicApproval}]`,
-      `  [${epicId}]`,
+      `${dir} ${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${seg(row.status)}]`,
     ];
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {
@@ -351,6 +367,16 @@ async function main(): Promise<void> {
         `     [${taskId}]`,
       );
     }
+    // Virtual "Quality audit and close" task — appended to every epic so the
+    // approval pill and the epic_id slug both live in the same column as the
+    // real tasks. Number is `tasks.length + 1` so it slots in after the last
+    // real task (or becomes `1.` for a task-less epic). Carries no status
+    // pill — there is no underlying planctl row to take state from; the
+    // approval reflects the epic's own approval state.
+    lines.push(
+      `  ${tasks.length + 1}. Quality audit and close [${epicApproval}]`,
+      `     [${epicId}]`,
+    );
     return lines.join("\n");
   }
 
