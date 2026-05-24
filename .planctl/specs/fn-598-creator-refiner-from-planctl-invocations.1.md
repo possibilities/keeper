@@ -67,5 +67,5 @@ Table-driven cases in `test/derivers.test.ts`. Cover at minimum: empty string, n
 - [ ] Never throws under any input (verified by an "arbitrary garbage" fixture case).
 
 ## Done summary
-
+Added extractPlanctlInvocation to src/derivers.ts: pure deriver gated by PreToolUse+Bash, parses cd-prefixed and bare 'planctl <verb> [target]' commands via module-scope regex, reuses parsePlanRef for the target id-split, and flags subject_present from a 10-verb read-only allowlist (epics/tasks/cat/show/list/detect/gist/init/claim/block). 23 new table-driven tests cover gating, garbage inputs, quote stripping, trailing shell-metachar handling, all read-only verbs, and a 10KB no-backtracking fixture; 44/44 in derivers.test.ts pass.
 ## Evidence
