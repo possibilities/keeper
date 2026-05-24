@@ -1546,6 +1546,8 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     depends_on_epics: "[]",
     // No `plan_ref`-bearing jobs have folded into this epic yet → defaults to "[]".
     jobs: "[]",
+    // No planctl-invocation classifier edges have been folded yet → defaults to "[]".
+    job_links: "[]",
   });
   expect(epic?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);
