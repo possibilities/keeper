@@ -475,7 +475,11 @@ export function runQuery(
   );
 
   // table/columns/pk/sortCol/dir are descriptor constants, never wire text —
-  // safe to interpolate. filter values + limit/offset are bound.
+  // safe to interpolate. filter values + limit/offset are bound. A wire
+  // `limit: 0` ("no limit" sentinel from clampLimit) is rebound as SQLite's
+  // `LIMIT -1` — the documented "all remaining rows" form, which still
+  // honors `OFFSET` so a paged scan of the full set works the same way.
+  const sqlLimit = limit === 0 ? -1 : limit;
   const sql = `
     SELECT ${descriptor.columns.join(", ")}
       FROM ${descriptor.table}
@@ -483,7 +487,9 @@ export function runQuery(
      ORDER BY ${sortCol} ${dir.toUpperCase()}, ${descriptor.pk} ASC
      LIMIT ? OFFSET ?
   `;
-  const rawRows = db.prepare(sql).all(...where.params, limit, offset) as Row[];
+  const rawRows = db
+    .prepare(sql)
+    .all(...where.params, sqlLimit, offset) as Row[];
   // Decode any JSON-TEXT columns so `result` rows carry the same shape as the
   // diff/patch path (`selectByIds`); a no-op while `jsonColumns` is empty.
   const rows = rawRows.map((row) => decodeRow(descriptor, row));
@@ -504,9 +510,22 @@ export function runQuery(
   };
 }
 
+/**
+ * Resolve a wire `limit` to the page size used by `runQuery`:
+ *   - `undefined` / non-finite / negative → `DEFAULT_LIMIT` (the historical
+ *     default for clients that omit the field).
+ *   - `0` → `0`, the explicit "no limit" sentinel; the SELECT runs without
+ *     a row cap and the result carries the full filtered set. Watch out:
+ *     diffTick's watched-set fan-out scales linearly with page size, so the
+ *     client opts in deliberately.
+ *   - positive → clamped at `MAX_LIMIT`.
+ */
 function clampLimit(limit: number | undefined): number {
-  if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) {
+  if (typeof limit !== "number" || !Number.isFinite(limit) || limit < 0) {
     return DEFAULT_LIMIT;
+  }
+  if (limit === 0) {
+    return 0;
   }
   return Math.min(Math.floor(limit), MAX_LIMIT);
 }

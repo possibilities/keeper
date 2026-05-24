@@ -203,6 +203,34 @@ test("runQuery honors limit + offset", () => {
   db.close();
 });
 
+test("runQuery treats limit: 0 as 'no limit' — returns the full filtered set", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  // Seed more rows than the default page (DEFAULT_LIMIT is 100) so a plain
+  // unlimited query would otherwise truncate; the 'no limit' sentinel must
+  // return every row.
+  const N = 150;
+  for (let i = 0; i < N; i++) {
+    seedJob(db, `j${String(i).padStart(3, "0")}`, { created_at: i });
+  }
+  const res = asResult(
+    runQuery(db, 0, { type: "query", collection: "jobs", limit: 0 }),
+  );
+  expect(res.rows.length).toBe(N);
+  expect(res.total).toBe(N);
+  // Offset still applies under limit: 0 (LIMIT -1 OFFSET ? in SQL) so a
+  // client can still skip a prefix and take every remaining row.
+  const offset = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "jobs",
+      limit: 0,
+      offset: 10,
+    }),
+  );
+  expect(offset.rows.length).toBe(N - 10);
+  db.close();
+});
+
 test("runQuery applies a state filter", () => {
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "w", { state: "working", updated_at: 2 });

@@ -120,6 +120,15 @@ export interface QueryFrame {
   collection: string;
   id?: string;
   sort?: QuerySort;
+  /**
+   * Page size. Omitted / negative / non-finite → server's `DEFAULT_LIMIT`
+   * (100). Positive → clamped at the server's `MAX_LIMIT` (500). `0` is the
+   * explicit "no limit" sentinel: the server returns the full filtered set
+   * with NO row cap (LIMIT -1 internally; OFFSET still honored). The
+   * realtime diff fan-out scales linearly with watched-set size, so callers
+   * opt into `limit: 0` deliberately for views that need the whole
+   * collection (e.g. `scripts/epics.ts`, `scripts/autopilot.ts`).
+   */
   limit?: number;
   offset?: number;
   filter?: Record<string, FilterValue>;

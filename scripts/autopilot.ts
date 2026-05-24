@@ -82,8 +82,16 @@ import {
   type ServerFrame,
 } from "../src/protocol";
 
-/** The page size each worker pages. Fixed for now. */
-const PAGE_LIMIT = 10;
+/**
+ * `0` is the wire "no limit" sentinel — the server returns the full
+ * filtered set with no row cap (see `QueryFrame.limit` in
+ * `src/protocol.ts`). autopilot is a single-view full-collection reader,
+ * not a paginated list, so we always ask for everything that matches the
+ * scope. The realtime diff fan-out grows with watched-set size; the
+ * tradeoff is acceptable at today's volume (~640 epics total, ~5 in the
+ * default scope after approval cleanup).
+ */
+const PAGE_LIMIT = 0;
 
 /**
  * How often (ms) the worker refetches its page. The server can't signal
