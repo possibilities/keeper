@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-24T00:10:12Z",
+  "depends_on": [],
+  "epic": "fn-592-approval-as-planctl-field",
+  "id": "fn-592-approval-as-planctl-field.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "planctl schema and set-approval",
+  "updated_at": "2026-05-24T00:10:12Z"
+}
