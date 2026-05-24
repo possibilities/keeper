@@ -7,12 +7,12 @@
  * It `query`s the `epics` collection and renders it as a stream of simple text
  * blocks. Each frame is a `---`-led document; each epic is one block:
  *
- *   {basename(project_dir)} {epic_number} {title}{deps}
- *     {task_number}. {title}{deps} [{status}] [{approval}]
- *        [{task_id}]
- *     ...
- *     {N+1}. Quality audit and close [{status}] [{approval}]
- *        [{epic_id}]
+ *   ({basename(project_dir)}) {epic_number} {title}{deps}
+ *   {task_number}. {title}{deps} [{status}] [{approval}]
+ *      [{task_id}]
+ *   ...
+ *   {N+1}. Quality audit and close [{status}] [{approval}]
+ *      [{epic_id}]
  *
  * `{deps}` is ` [#A,#B]` from `depends_on_epics` for the header and from
  * `depends_on` on each embedded task; both are omitted when empty. In default
@@ -31,10 +31,10 @@
  * Every epic ends with a "Quality audit and close" virtual task
  * (real-task-count + 1 as its number, the epic's `[status] [approval]`
  * as its pill pair, the epic_id as its slug line) — appended even when
- * the epic has no real tasks, since the slug needs a home. Task
- * lines are indented 2 spaces; slug lines 5 spaces (lining up with the task
- * title for single-digit task numbers). Blocks are separated by a single blank
- * line. No YAML — just plain bracket text.
+ * the epic has no real tasks, since the slug needs a home. Task lines
+ * start at column 0; slug lines are indented 3 spaces (lining up with the
+ * task title for single-digit task numbers). Blocks are separated by a
+ * single blank line. No YAML — just plain bracket text.
  *
  * The query optionally carries a server-side filter built from `--status` /
  * `--status-ne` (status equality / `{ ne }` operator) and `--show-approved`
@@ -159,12 +159,12 @@ Usage: bun scripts/epics.ts [--sock <path>] [--status <s> | --status-ne <s>]
 
 Renders the epics page as a stream of simple text blocks: one frame per change,
 each frame led by '---'. Each epic is one block —
-  {basename(project_dir)} {epic_number} {title} [#A,#B]
-    {task_number}. {title} [#X,#Y] [{status}] [{approval}]
-       [{task_id}]
-    ...
-    {N+1}. Quality audit and close [{status}] [{approval}]
-       [{epic_id}]
+  ({basename(project_dir)}) {epic_number} {title} [#A,#B]
+  {task_number}. {title} [#X,#Y] [{status}] [{approval}]
+     [{task_id}]
+  ...
+  {N+1}. Quality audit and close [{status}] [{approval}]
+     [{epic_id}]
 Blocks are separated by a single blank line. The [#…] segment lists the epic
 or task numbers a row depends on (omitted when empty); in default mode the
 epic-header [#…] hides deps that have fallen off the board. The epic header
@@ -310,12 +310,12 @@ async function main(): Promise<void> {
 
   /**
    * Render one epic as a small text block:
-   *   {basename(project_dir)} {epic_number} {title}{deps}
-   *     {task_number}. {title}{deps} [{status}] [{approval}]
-   *        [{task_id}]
-   *     ...
-   *     {N+1}. Quality audit and close [{status}] [{approval}]
-   *        [{epic_id}]
+   *   ({basename(project_dir)}) {epic_number} {title}{deps}
+   *   {task_number}. {title}{deps} [{status}] [{approval}]
+   *      [{task_id}]
+   *   ...
+   *   {N+1}. Quality audit and close [{status}] [{approval}]
+   *      [{epic_id}]
    * `{deps}` is ` [#A,#B]` joined from `depends_on_epics` (epic header) or
    * `depends_on` (task line); omitted when empty. In default mode the epic-
    * header `{deps}` is filtered to deps still on the board (present in the
@@ -329,6 +329,9 @@ async function main(): Promise<void> {
   function renderEpicBlock(row: Record<string, unknown>): string {
     const dir =
       row.project_dir == null ? "" : basename(String(row.project_dir));
+    // Wrap the project basename in parens for the header. Omitted entirely
+    // when `project_dir` is null/empty so the header never leads with `()`.
+    const dirSeg = dir === "" ? "" : `(${dir}) `;
     const epicDeps = Array.isArray(row.depends_on_epics)
       ? row.depends_on_epics
       : [];
@@ -349,7 +352,7 @@ async function main(): Promise<void> {
     const epicId = seg(row[pk]);
     const epicApproval = approvalPill(row.approval);
     const lines: string[] = [
-      `${dir} ${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg}`,
+      `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg}`,
     ];
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {
@@ -363,8 +366,8 @@ async function main(): Promise<void> {
       const taskApproval = approvalPill(t.approval);
       const taskId = seg(t.task_id);
       lines.push(
-        `  ${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.status)}] [${taskApproval}]`,
-        `     [${taskId}]`,
+        `${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.status)}] [${taskApproval}]`,
+        `   [${taskId}]`,
       );
     }
     // Virtual "Quality audit and close" task — appended to every epic so the
@@ -376,8 +379,8 @@ async function main(): Promise<void> {
     // epic's pair keeps the virtual line shape consistent with real tasks
     // even though conceptually this is a closing card.
     lines.push(
-      `  ${tasks.length + 1}. Quality audit and close [${seg(row.status)}] [${epicApproval}]`,
-      `     [${epicId}]`,
+      `${tasks.length + 1}. Quality audit and close [${seg(row.status)}] [${epicApproval}]`,
+      `   [${epicId}]`,
     );
     return lines.join("\n");
   }
