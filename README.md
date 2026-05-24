@@ -47,13 +47,13 @@ and the boot drain re-converges idempotently after any downtime or crash.
 Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names
 a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
-page that doubles as a live subscription. Three collections register today —
-`jobs` (the first and default), `epics` (the read-only plans surface — each
+page that doubles as a live subscription. Two collections register today —
+`jobs` (the first and default) and `epics` (the read-only plans surface — each
 epic embeds its tasks as a JSON array, so there is no separate `tasks`
-collection), and `approvals` (a sidecar carrying per-task `pending` /
-`approved` / `rejected` state, surfaced as a pill in the autopilot client).
-The surface is built so additional collections register without touching the
-wire protocol or the diff machinery. Page membership is frozen at query time,
+collection; both the epic and each embedded task carry an `approval` field
+valued `"approved" | "rejected" | "pending"`, surfaced as a pill in the
+autopilot client). The surface is built so additional collections register
+without touching the wire protocol or the diff machinery. Page membership is frozen at query time,
 but each row's cells stream `patch` frames as the reducer folds new events.
 The `result` page also carries a `total` (the filtered-set size, ignoring
 limit/offset) and the server emits a third frame, `meta`, when that set
@@ -64,16 +64,20 @@ list reflowing under the cursor.
 The QUERY surface is read-only: the server is just another reader on its own
 read-only connection, polling `data_version` like the reducer-wake worker.
 **Mutation is a separate, scoped path:** the same socket carries `rpc` request
-frames that dispatch to registered server-side handlers, which write the DB
-through a dedicated writer connection owned by the server-worker. The first
-concrete RPC is `set_approval` (write the `approvals` sidecar); the reducer's
-`jobs` / `epics` projections and the `events` log itself stay write-only-from-
-their-canonical-owners — RPC handlers MAY write sidecars, never reducer
-projections. The `approvals` sidecar is human-driven state, NOT a reducer
-projection — a re-fold from the event log will NOT reproduce it, by design
-(see [CLAUDE.md](./CLAUDE.md)'s DO NOT list). Four example clients ship in
-`scripts/` (`jobs.ts`, `epics.ts`, `autopilot.ts`, and `approve.ts`); see
-[Example clients](#example-clients) for usage.
+frames that dispatch to registered server-side handlers, which write *external
+resources* through a dedicated writer owned by the server-worker. The two
+concrete RPCs are `set_task_approval` and `set_epic_approval`; each writes
+the top-level `approval` field on the target `.planctl/{epics,tasks}/<id>.json`
+file via atomic temp+rename under a per-file single-flight lock. The change
+is observed by `@parcel/watcher` and round-trips through the plan worker as
+an `EpicSnapshot` / `TaskSnapshot` event, so the reducer's `epics` projection
+and the `events` log keep their canonical-owner writers and re-fold
+determinism extends to approval (rewind cursor + re-drain reproduces approval
+state byte-identically). RPC handlers MAY write `.planctl` files, never
+reducer projections directly (see [CLAUDE.md](./CLAUDE.md)'s DO NOT list).
+Four example clients ship in `scripts/` (`jobs.ts`, `epics.ts`,
+`autopilot.ts`, and `approve.ts`); see [Example clients](#example-clients)
+for usage.
 
 ## What keeper is NOT
 
@@ -84,9 +88,12 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   reducer's `jobs` / `epics` projections and the `events` log have one
   canonical writer each (the hook for hook events; main for synthetic
   events). The socket DOES carry `rpc` frames, but RPC handlers may write
-  ONLY sidecar tables (currently: `approvals`, written by the `set_approval`
-  RPC through the server-worker's writer connection) — never the reducer's
-  projections. Consumers may still read any of it directly from SQLite.
+  only the `approval` field on external `.planctl/{epics,tasks}` JSON files
+  (via `set_task_approval` / `set_epic_approval`, atomic temp+rename, server-
+  worker-owned single-flight) — never the reducer's projections or the
+  `events` log. The change round-trips through the plan-worker file watcher,
+  so the reducer remains the sole writer of `epics`. Consumers may still
+  read any of it directly from SQLite.
 - **No live membership stream** — `meta.total` signals that the filtered set's
   size or membership *changed*, but it does NOT deliver the new members. Frozen
   membership stands: the live page never reflows. `meta` is a count/staleness
@@ -102,15 +109,19 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   permitted in the *daemon* (keeperd's transcript worker tails the external
   transcript tree on a watch to supply the priority-3 `transcript` title) but
   stays forbidden in the hook.
-- **No plan write path through the socket** — keeper *reads* planctl state into
-  the single `epics` projection, each epic embedding its tasks as a JSON array,
-  each epic also embedding its plan/close-verb jobs as a JSON array, and each
-  task element embedding its own work-verb jobs as a nested JSON array (a
-  fourth, read-only producer worker watches the configured roots'
-  `.planctl/{epics,tasks}` trees; jobs fan in from the reducer's own jobs-side
-  writes whenever a SessionStart spawn name parses as `{plan|work|close}::<ref>`),
-  but the socket carries no plan mutation and keeper never writes a `.planctl`
-  file. The read surface is read-only end to end, same fence as `jobs`.
+- **No general plan write path through the socket** — keeper *reads* planctl
+  state into the single `epics` projection, each epic embedding its tasks as a
+  JSON array, each epic also embedding its plan/close-verb jobs as a JSON
+  array, and each task element embedding its own work-verb jobs as a nested
+  JSON array (a fourth, read-only producer worker watches the configured
+  roots' `.planctl/{epics,tasks}` trees; jobs fan in from the reducer's own
+  jobs-side writes whenever a SessionStart spawn name parses as
+  `{plan|work|close}::<ref>`). The socket carries plan mutations *scoped to
+  the `approval` field only* — the `set_task_approval` / `set_epic_approval`
+  RPCs write `approval` on the target `.planctl` file via atomic temp+rename,
+  and the plan worker round-trips the change back as a snapshot event. Every
+  other field of every `.planctl` file remains read-only end to end, same
+  fence as `jobs`.
 - **No multi-session-per-job lineage** — v1 holds `job_id === session_id` (one
   session per job).
 - **No kernel watchers on keeper's own DB** (`fs.watch` / FSEvents / kqueue) —
@@ -249,32 +260,34 @@ in their render layer); `approve.ts` is the first RPC client (single-shot
   bun scripts/epics.ts --status done # see closed epics
   ```
 
-- `autopilot.ts` — live epic-block view with per-task approval pills, riding
-  TWO simultaneous `Bun.connect` sockets: one subscribed to the `epics`
-  collection (the render skeleton, newest-first, slugs only), one subscribed
-  to the `approvals` sidecar (the pill state). Renders each epic as a YAML
-  block — `- epic: <epic_id>` over either `tasks: []` or a nested
-  `- <task_id> [<pill>]` per task, plus a trailing virtual
-  `- close:<epic_id> [<pill>]` row per epic (the per-epic close-approval slot
-  the planning workflow uses to gate closing the whole epic). Pills are
-  `[pending]` / `[approved]` / `[rejected]`; an absent `approvals` row
-  renders as `[pending]` (the schema-v12 invariant: absent row = pending).
-  The byte-compare emit gate means a pill flip reframes but a title edit or
-  status flip alone does not.
+- `autopilot.ts` — live epic-block view with per-epic and per-task approval
+  pills over a single `Bun.connect` socket subscribed to the `epics`
+  collection. Approval state is read directly off `epic.approval` and each
+  embedded `task.approval`, so there is no second subscription. By default
+  the view filters out epics whose `approval === "approved"`; pass
+  `--show-approved` to include them. Renders each epic as a YAML block —
+  `- epic: <epic_id> [<pill>]` over either `tasks: []` or a nested
+  `- <task_id> [<pill>]` per task. Pills are `[pending]` / `[approved]` /
+  `[rejected]`; a missing or invalid `approval` renders as `[pending]` (the
+  safe-value invariant). The byte-compare emit gate means a pill flip
+  reframes but a title edit or status flip alone does not.
 
   ```sh
-  bun scripts/autopilot.ts
+  bun scripts/autopilot.ts                  # default: pending/rejected epics only
+  bun scripts/autopilot.ts --show-approved  # include approved epics
   ```
 
-- `approve.ts` — the first RPC client. Single-shot: opens a `Bun.connect`,
-  sends one `rpc` frame for `set_approval`, awaits the `rpc_result` (or
-  `error`), and exits. No subscription, no reconnect loop. The CLI accepts
-  either a task id or the virtual `close:<epic_id>` task-key.
+- `approve.ts` — the RPC client. Single-shot: opens a `Bun.connect`, sends
+  one `rpc` frame for `set_task_approval` or `set_epic_approval`, awaits the
+  `rpc_result` (or `error`), and exits. No subscription, no reconnect loop.
+  Approval is now a first-class planctl field, so the three valid values are
+  `approved`, `rejected`, and `pending` — there is no `clear` (set to
+  `pending` instead).
 
   ```sh
-  bun scripts/approve.ts <epic_id> <task_id> approve
-  bun scripts/approve.ts <epic_id> close:<epic_id> approve   # approve the close-virtual slot
-  bun scripts/approve.ts <epic_id> <task_id> clear           # delete the approval row → renders as [pending]
+  bun scripts/approve.ts epic <epic_id> approved
+  bun scripts/approve.ts epic <epic_id> pending            # reset to pending
+  bun scripts/approve.ts task <epic_id> <task_id> rejected
   ```
 
 The three subscribe scripts mirror each emitted frame to per-pid `/tmp`
@@ -414,10 +427,6 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 # Raw event log tail (synthetic EpicSnapshot/TaskSnapshot/EpicDeleted/TaskDeleted rows appear here too):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT id, hook_event, session_id FROM events ORDER BY id DESC LIMIT 10'
-
-# Approvals sidecar — human-driven state written by the `set_approval` RPC, NOT a reducer projection. Stored status enum is {approved, rejected}; absent row = the implicit "pending" default (so a `clear` is a DELETE, not a status update):
-sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT approval_id, epic_id, task_key, status, updated_at FROM approvals ORDER BY updated_at DESC LIMIT 10'
 
 # How far the reducer has folded:
 sqlite3 ~/.local/state/keeper/keeper.db 'SELECT * FROM reducer_state'

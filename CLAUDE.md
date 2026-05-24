@@ -29,21 +29,24 @@ event log, reducer, the five worker threads, and the wire protocol — see
   the cursor still advances** — never throw inside the fold transaction; a throw
   rolls back the cursor and wedges the reducer.
 - **The hook is the sole writer of *hook* events; main is the sole writer of
-  *synthetic* events; the server-worker is the sole writer of RPC-driven
-  sidecar tables (currently: `approvals`).** Every projection-driving fact lives
-  in the immutable event log — never written straight to `jobs`/`epics` — so a
-  re-fold from scratch (rewind cursor, `DELETE FROM jobs`/`epics`, re-drain)
-  reproduces byte-identical rows, including `epics` rows with their embedded
-  `tasks` arrays and the embedded `jobs` arrays at both the epic level and
-  nested inside each task element (all built from stable sorts —
-  `(task_number, task_id)` for tasks, `(created_at desc, job_id asc)` for jobs
-  — never append). The producer workers feed the log only via main's writable
-  connection; they never write the DB. Synthetic events covered by this rule:
-  `TranscriptTitle` (transcript worker), `EpicSnapshot` / `TaskSnapshot` /
-  `EpicDeleted` / `TaskDeleted` (plan worker), `Killed` (boot seed sweep +
-  live exit-watcher worker, gated by main's `(pid, start_time)` verifier
-  before insert). Sidecar tables are out of scope for this re-fold guarantee
-  — see the approvals bullet under DO NOT.
+  *synthetic* events; the server-worker writes the `approval` field on
+  external `.planctl` JSON files (via atomic temp+rename) and nothing else.**
+  Every projection-driving fact lives in the immutable event log — never
+  written straight to `jobs`/`epics` — so a re-fold from scratch (rewind
+  cursor, `DELETE FROM jobs`/`epics`, re-drain) reproduces byte-identical
+  rows, including `epics` rows with their embedded `tasks` arrays and the
+  embedded `jobs` arrays at both the epic level and nested inside each task
+  element (all built from stable sorts — `(task_number, task_id)` for tasks,
+  `(created_at desc, job_id asc)` for jobs — never append). The producer
+  workers feed the log only via main's writable connection; they never write
+  the DB. Synthetic events covered by this rule: `TranscriptTitle` (transcript
+  worker), `EpicSnapshot` / `TaskSnapshot` / `EpicDeleted` / `TaskDeleted`
+  (plan worker — these now carry `approval` round-tripped from the file),
+  `Killed` (boot seed sweep + live exit-watcher worker, gated by main's
+  `(pid, start_time)` verifier before insert). The RPC handlers' `.planctl`
+  writes are not projection writes; the watcher round-trips them back as
+  `EpicSnapshot`/`TaskSnapshot` events that the reducer folds — so re-fold
+  determinism extends to `approval`.
 - **Producer-only liveness probing.** The seed sweep and the exit-watcher
   worker are the ONLY places that probe process liveness (`kill(pid,0)`,
   kqueue `EVFILT_PROC|NOTE_EXIT`, pidfd_open + epoll, `(pid, start_time)`
@@ -67,31 +70,32 @@ event log, reducer, the five worker threads, and the wire protocol — see
   reactor, no general write path into the reducer.** The UDS server's QUERY
   surface is unchanged and remains read-only — a client `query` returns
   `result` + `patch` + `meta` frames over the reducer-fed projections, and
-  consumers may still read those projections from SQLite directly. The new
-  `rpc` frame type lets a client invoke a registered handler that writes the
-  DB through a dedicated writer connection owned by the server-worker; the
-  reply is an `rpc_result` (or an `error` with code `unknown_method` /
-  `bad_params` / `rpc_failed`). The single-writer invariant the rest of the
-  design rests on is preserved by *scope*, not by banning writes from the
-  socket: RPC handlers may ONLY write sidecar tables (currently: `approvals`),
-  never the reducer's `jobs` / `epics` projections or the `events` log. The
-  current concrete RPC is `set_approval`; the protocol shape, the dispatch
-  registry, and the writer-connection lifecycle are deliberately built as a
-  generic foundation, not welded to that one handler.
-- **The `approvals` sidecar is NOT a reducer projection.** It is human-driven
-  state written by the `set_approval` RPC handler on the server-worker's
-  writer connection, registered as a third read-only collection alongside
-  `jobs` and `epics`. It is EXCLUDED from the event-log re-fold determinism
-  guarantee: rewinding the reducer cursor and re-draining the log will NOT
-  reproduce the `approvals` rows, because no event in the log carries an
-  approval. Absent row = pending (the schema-v12 invariant — the stored
-  status enum is `{approved, rejected}`; no row in `approvals` for a given
-  `(epic_id, task_key)` is the implicit "pending" default, so new tasks
-  auto-default and a `clear` is a DELETE, not a status update). *Why a sidecar:* the
-  reducer-projection contract is "every fact lives in the event log"; an
-  approval is a human decision made out-of-band, with no hook to attach it
-  to. Forcing it through a synthetic event would conflate human intent with
-  observed Claude Code activity.
+  consumers may still read those projections from SQLite directly. The
+  `rpc` frame type lets a client invoke a registered handler that writes
+  *external resources* — concretely, the `approval` field on the relevant
+  `.planctl/{epics,tasks}/<id>.json` file via atomic temp+rename under a
+  per-file single-flight lock owned by the server-worker; the reply is an
+  `rpc_result` (or an `error` with code `unknown_method` / `bad_params` /
+  `rpc_failed`). RPC handlers MUST NOT write reducer projections (`jobs` /
+  `epics`), sidecar tables, or the `events` log directly: projection changes
+  round-trip through the plan-worker file watcher and the synthetic-event
+  path, so a from-scratch re-fold sees every approval change exactly as it
+  was observed. The concrete RPCs are `set_task_approval` and
+  `set_epic_approval`; the protocol shape, the dispatch registry, and the
+  writer lifecycle are built as a generic foundation, not welded to those
+  two handlers.
+- **The `approval` field is RPC-writable on `.planctl` files; everything else
+  is not.** `set_task_approval` and `set_epic_approval` write the top-level
+  `approval` field (`"approved" | "rejected" | "pending"`) on the target
+  task or epic JSON via atomic temp+rename in the same directory as the
+  target. The change is observed by `@parcel/watcher`, lifted into an
+  `EpicSnapshot` / `TaskSnapshot` event by the plan worker, and folded into
+  the `epics` projection — re-fold determinism is preserved because the
+  event log carries every approval transition. A missing or invalid
+  `approval` value folds to `"pending"` per the "safe value" invariant.
+  *Why this is the only RPC-writable field:* approval is the one piece of
+  human state that has no Claude Code hook to attach it to; every other
+  planctl field is the planner's or worker's job.
 - **No kernel file watchers ON KEEPER'S OWN SQLite DB** (`fs.watch`, FSEvents,
   kqueue, chokidar). *Why:* they drop same-process writes and miss WAL writes on
   macOS. Use `PRAGMA data_version` polling on a read-only connection as the only
@@ -130,18 +134,23 @@ event log, reducer, the five worker threads, and the wire protocol — see
   throw is swallowed to stderr.
 - **No prise/env-var integration, multi-session lineage, or harness_meta** — out
   of scope.
-- **Plans are READ-ONLY**, like everything keeper serves. The plan worker watches
-  the configured roots' `.planctl/{epics,tasks}` trees and folds snapshots into
-  the `epics` projection (each epic embeds its tasks as a JSON array, its
-  plan/close-verb jobs as a JSON array, and each task element embeds its own
-  work-verb jobs as a nested JSON array — no peer `tasks` or `epic_jobs`
-  collection or table) served over the same socket. Jobs fan into the embedded
-  arrays from the reducer's jobs-side writes via the `syncJobIntoEpic` helper,
-  which runs INSIDE the same `BEGIN IMMEDIATE` transaction as the jobs write +
-  cursor advance, so the embedded arrays are a pure function of the event log
-  and a from-scratch re-fold reproduces them byte-identically. FORBIDDEN: any
-  plan WRITE path — the socket never carries a plan mutation, keeper never
-  writes a `.planctl` file, and no command surface exists.
+- **Plans are READ-ONLY *except for the `approval` field***. The plan worker
+  watches the configured roots' `.planctl/{epics,tasks}` trees and folds
+  snapshots into the `epics` projection (each epic embeds its tasks as a JSON
+  array — both carrying `approval` — its plan/close-verb jobs as a JSON array,
+  and each task element embeds its own work-verb jobs as a nested JSON array
+  — no peer `tasks` or `epic_jobs` collection or table) served over the same
+  socket. Jobs fan into the embedded arrays from the reducer's jobs-side writes
+  via the `syncJobIntoEpic` helper, which runs INSIDE the same `BEGIN IMMEDIATE`
+  transaction as the jobs write + cursor advance, so the embedded arrays are a
+  pure function of the event log and a from-scratch re-fold reproduces them
+  byte-identically. PERMITTED: the `set_task_approval` / `set_epic_approval`
+  RPCs write the `approval` field of a target `.planctl` file via atomic
+  temp+rename; the change round-trips through `@parcel/watcher` →
+  `EpicSnapshot`/`TaskSnapshot` → reducer, so re-fold determinism extends to
+  approval. FORBIDDEN: any other plan write — no other field is RPC-writable,
+  no general plan mutation path exists, and the socket carries no plan
+  command surface beyond those two scoped approval RPCs.
 - **Transcript tailing is scoped to the daemon, never the hook.** keeperd's
   transcript worker MAY tail external transcript JSONL to produce priority-3
   `TranscriptTitle` events. FORBIDDEN: transcript reading in the hook (it stays
