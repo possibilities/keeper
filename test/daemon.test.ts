@@ -226,6 +226,7 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     title: string;
     target_repo: string;
     status: string;
+    approval: "approved" | "rejected" | "pending";
     depends_on: string[];
     jobs: unknown[];
   }[];
@@ -237,6 +238,9 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
     status: "open",
+    // Schema v13: a TaskSnapshot blob with no `approval` field folds to
+    // "pending" on the embedded element (matches plan-worker coercion).
+    approval: "pending",
     depends_on: [],
     // Schema v11: first-sight task element gets an empty embedded jobs sub-array.
     jobs: [],

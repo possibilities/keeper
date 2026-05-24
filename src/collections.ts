@@ -155,6 +155,7 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "title",
     "project_dir",
     "status",
+    "approval",
     "last_event_id",
     "updated_at",
     "tasks",
@@ -175,14 +176,25 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     epic_id: "epic_id",
     status: "status",
     project_dir: "project_dir",
+    // `approval` (schema v13 — the fn-592-approval-as-planctl-field epic) is
+    // the autopilot-UI's default-hide-approved key. The natural-filter slot
+    // matches the same `<wire key> → <SQL column>` shape as `status`; the
+    // descriptor's filter machinery ANDs every key together (see
+    // `resolveFilter` in `src/server-worker.ts`), so the two-key default scope
+    // below composes for free — no new composition machinery required.
+    approval: "approval",
   },
-  // Default scope: an epics query with no `status` filter shows only OPEN epics
-  // (done/closed epics are filtered out of the default view). A client still
-  // pages any other status by asking for it explicitly (`filter:{status}` or
-  // `{status:{ne}}`), which overrides this default — and a pk subscribe carries
-  // its own `epic_id`, not `status`, so detail-page reads of a done epic still
-  // resolve. The view-side knob is keeper-frames' `--status` / `--status-ne`.
-  defaultFilter: { status: "open" },
+  // Default scope: an epics query with no explicit constraint on `status` /
+  // `approval` shows only OPEN, NOT-YET-APPROVED epics — the autopilot's
+  // primary working set. Each key is overridable independently: a client may
+  // ask for a done epic OR an approved one (or both) by passing those keys
+  // explicitly; the descriptor's per-key default is dropped iff the wire
+  // value is present. A pk subscribe carries `epic_id` only and is exempt
+  // from defaults entirely, so a detail read of a done-and-approved epic
+  // still resolves. The two-key AND composition is verified by the
+  // collection-test 'runQuery applies the composed status+approval default'
+  // case below.
+  defaultFilter: { status: "open", approval: { ne: "approved" } },
   // `tasks`, `depends_on_epics`, and `jobs` are JSON-TEXT array columns —
   // decoded to real arrays at the read boundary. `jobs` carries the
   // epic-level `EmbeddedJob[]` (plan/close verbs). Nested `task.jobs`

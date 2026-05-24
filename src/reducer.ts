@@ -258,6 +258,12 @@ interface PlanSnapshot {
   target_repo?: string | null;
   epic_id?: string | null;
   status?: string | null;
+  /**
+   * Planctl-native approval enum (schema v13). Pre-coerced by the plan-worker
+   * to `"approved" | "rejected" | "pending"`; absent / NULL → folds to
+   * `"pending"` so an old-shape blob still rides through deterministically.
+   */
+  approval?: "approved" | "rejected" | "pending" | null;
   /** Epic-level deps (EpicSnapshot blob) — the planctl `depends_on_epics` ids. */
   depends_on_epics?: string[] | null;
   /** Task-level deps (TaskSnapshot blob) — the planctl `depends_on` task ids. */
@@ -326,13 +332,14 @@ function projectPlanRow(db: Database, event: Event): void {
     // `'[]'` (the schema default), so the first-sight epic reads empty arrays
     // and a later epic snapshot can never clobber arrays a shell holds.
     db.run(
-      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_event_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_event_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(epic_id) DO UPDATE SET
          epic_number = excluded.epic_number,
          title = excluded.title,
          project_dir = excluded.project_dir,
          status = excluded.status,
+         approval = excluded.approval,
          depends_on_epics = excluded.depends_on_epics,
          last_event_id = excluded.last_event_id,
          updated_at = excluded.updated_at`,
@@ -342,6 +349,13 @@ function projectPlanRow(db: Database, event: Event): void {
         snapshot.title ?? null,
         snapshot.project_dir ?? null,
         snapshot.status ?? null,
+        // The plan-worker pre-coerced this to the enum (or `"pending"`); a
+        // missing / NULL value in the blob — a synthetic event from an
+        // older keeperd build — folds to `"pending"` so the schema's NOT NULL
+        // default is honored AND re-fold determinism is preserved across the
+        // v12→v13 boundary (an event produced before approval existed in the
+        // pipeline reproduces a `"pending"` row, same as on the older daemon).
+        snapshot.approval ?? "pending",
         // Stored as a JSON-TEXT array column; decoded back to an array at the
         // read boundary. A missing list folds to the empty array (schema default).
         JSON.stringify(snapshot.depends_on_epics ?? []),
@@ -375,6 +389,7 @@ function projectPlanRow(db: Database, event: Event): void {
       title: string | null;
       target_repo: string | null;
       status: string | null;
+      approval: "approved" | "rejected" | "pending";
       depends_on: string[];
       jobs: unknown[];
     } = {
@@ -384,6 +399,13 @@ function projectPlanRow(db: Database, event: Event): void {
       title: snapshot.title ?? null,
       target_repo: snapshot.target_repo ?? null,
       status: snapshot.status ?? null,
+      // Pre-coerced by the plan-worker; a missing / NULL value in a legacy
+      // synthetic event folds to "pending" so re-fold determinism survives the
+      // v12→v13 boundary (same default as the schema column on the parent
+      // epic). The field is placed BEFORE `depends_on` to match the seed
+      // reconstruction order in `plan-worker.ts:seedFromDb` so an unchanged
+      // task on restart suppresses cleanly.
+      approval: snapshot.approval ?? "pending",
       depends_on: snapshot.depends_on ?? [],
       jobs: [],
     };

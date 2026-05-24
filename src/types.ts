@@ -195,6 +195,17 @@ export interface Epic {
   title: string | null;
   project_dir: string | null;
   status: string | null;
+  /**
+   * Planctl-native approval state. Top-level field on `.planctl/epics/<id>.json`
+   * valued `"approved" | "rejected" | "pending"` (schema v13 — see the
+   * fn-592-approval-as-planctl-field epic). A missing / invalid value coerces
+   * to `"pending"` so a file written by old planctl rides through without
+   * breaking re-fold determinism (defensive "safe value" fold per CLAUDE.md).
+   * Drives the autopilot UI's default-filter scope; `EPICS_DESCRIPTOR`
+   * composes `{ status: "open", approval: { ne: "approved" } }` so approved
+   * epics drop out of the default page.
+   */
+  approval: "approved" | "rejected" | "pending";
   last_event_id: number | null;
   updated_at: number;
   /**
@@ -229,6 +240,13 @@ export interface Task {
   title: string | null;
   target_repo: string | null;
   status: string | null;
+  /**
+   * Planctl-native approval state — top-level field on
+   * `.planctl/tasks/<id>.<n>.json` (schema v13). Same enum + missing/invalid
+   * coercion-to-`"pending"` semantics as {@link Epic.approval}. Lives inside the
+   * parent epic's embedded `tasks` array element (no schema column of its own).
+   */
+  approval: "approved" | "rejected" | "pending";
   /**
    * Task-level dependencies: the planctl `depends_on` task ids (other tasks this
    * one depends on). Lives inside the parent epic's embedded `tasks` JSON array

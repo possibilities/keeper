@@ -355,24 +355,36 @@ test("runQuery applies the default live scope, hiding both terminal states, unle
   db.close();
 });
 
-test("resolveFilter: epics default scope applies open, is overridable, exempts pk lookups", () => {
-  // No filter → the descriptor's default `status: open` scope is applied.
+test("resolveFilter: epics default scope applies open+approval-ne-approved, is overridable, exempts pk lookups", () => {
+  // No filter → the descriptor's composed default `{ status: open, approval:
+  // { ne: approved } }` scope is applied (schema v13). Two clauses ANDed.
   const def = resolveFilter(EPICS_DESCRIPTOR, undefined);
-  expect(def.clause).toBe("WHERE status = ?");
-  expect(def.params).toEqual(["open"]);
+  expect(def.clause).toBe("WHERE status = ? AND approval != ?");
+  expect(def.params).toEqual(["open", "approved"]);
 
-  // An explicit status overrides the default for that key.
+  // An explicit status overrides the default for that key; the approval
+  // default still rides since approval was not constrained by the wire.
   const override = resolveFilter(EPICS_DESCRIPTOR, { status: "done" });
-  expect(override.clause).toBe("WHERE status = ?");
-  expect(override.params).toEqual(["done"]);
+  expect(override.clause).toBe("WHERE status = ? AND approval != ?");
+  expect(override.params).toEqual(["done", "approved"]);
 
-  // A non-status filter still gets the default open scope ANDed in (status is
-  // declared before project_dir in the filter map, so it binds first).
+  // An explicit approval overrides ITS default; status stays at the default.
+  const approvedOverride = resolveFilter(EPICS_DESCRIPTOR, {
+    approval: "approved",
+  });
+  expect(approvedOverride.clause).toBe("WHERE status = ? AND approval = ?");
+  expect(approvedOverride.params).toEqual(["open", "approved"]);
+
+  // A non-status filter still gets BOTH defaults ANDed in.
   const byDir = resolveFilter(EPICS_DESCRIPTOR, { project_dir: "/r" });
-  expect(byDir.clause).toBe("WHERE status = ? AND project_dir = ?");
-  expect(byDir.params).toEqual(["open", "/r"]);
+  expect(byDir.clause).toBe(
+    "WHERE status = ? AND project_dir = ? AND approval != ?",
+  );
+  expect(byDir.params).toEqual(["open", "/r", "approved"]);
 
-  // A pk lookup is exempt: it resolves one identity regardless of status.
+  // A pk lookup is exempt from ALL defaults: it resolves one identity
+  // regardless of status or approval (a detail subscribe of a done+approved
+  // epic must resolve).
   const pk = resolveFilter(EPICS_DESCRIPTOR, { epic_id: "fn-2-done" });
   expect(pk.clause).toBe("WHERE epic_id = ?");
   expect(pk.params).toEqual(["fn-2-done"]);

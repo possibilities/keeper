@@ -88,6 +88,12 @@ export interface PlanWorkerData {
   roots: string[];
 }
 
+/**
+ * The planctl-native approval enum (schema v13). A missing or invalid value on
+ * the on-disk file coerces to `"pending"` — see {@link coerceApproval}.
+ */
+export type Approval = "approved" | "rejected" | "pending";
+
 /** Snapshot message for one `.planctl/epics/*.json` file. */
 export interface PlanEpicMessage {
   kind: "plan-epic";
@@ -99,6 +105,12 @@ export interface PlanEpicMessage {
   /** The epic's `primary_repo` — stored opaque, never used to drive FS reads. */
   projectDir: string | null;
   status: string | null;
+  /**
+   * Planctl-native approval enum, top-level on the epic file. Missing /
+   * invalid values fold to `"pending"` via {@link coerceApproval} (the safe
+   * value invariant — re-fold of a file written by old planctl stays stable).
+   */
+  approval: Approval;
   /** Epic-level deps: the planctl `depends_on_epics` ids (string array). */
   dependsOnEpics: string[];
 }
@@ -117,6 +129,11 @@ export interface PlanTaskMessage {
   targetRepo: string | null;
   /** Derived: `worker_done_at` present → "done", else "open". */
   status: string;
+  /**
+   * Planctl-native approval enum, top-level on the task file. Same coercion
+   * semantics as {@link PlanEpicMessage.approval}.
+   */
+  approval: Approval;
   /** Task-level deps: the planctl `depends_on` task ids (string array). */
   dependsOn: string[];
 }
@@ -277,6 +294,7 @@ interface RawEpic {
   title?: unknown;
   status?: unknown;
   primary_repo?: unknown;
+  approval?: unknown;
   depends_on_epics?: unknown;
 }
 
@@ -287,6 +305,7 @@ interface RawTask {
   title?: unknown;
   target_repo?: unknown;
   worker_done_at?: unknown;
+  approval?: unknown;
   depends_on?: unknown;
 }
 
@@ -306,6 +325,37 @@ function asStringArray(v: unknown): string[] {
     return [];
   }
   return v.filter((e): e is string => typeof e === "string" && e.length > 0);
+}
+
+/** The fixed set of valid {@link Approval} enum values. */
+const APPROVAL_VALUES: ReadonlySet<string> = new Set([
+  "approved",
+  "rejected",
+  "pending",
+]);
+
+/**
+ * Coerce a value off a plan file to the {@link Approval} enum. A valid enum
+ * string passes through; a missing field defaults silently to `"pending"`
+ * (forward-compat with files written by old planctl that predate the field);
+ * any other value (wrong type, typo, garbage) coerces to `"pending"` with a
+ * stderr log via `onInvalid` — the CLAUDE.md "safe value" invariant. The fold
+ * stays a pure function of the persisted file (re-fold determinism preserved).
+ */
+export function coerceApproval(
+  v: unknown,
+  onInvalid?: (raw: unknown) => void,
+): Approval {
+  if (v === undefined || v === null) {
+    return "pending"; // missing field — quiet default, no log
+  }
+  if (typeof v === "string" && APPROVAL_VALUES.has(v)) {
+    return v as Approval;
+  }
+  if (onInvalid) {
+    onInvalid(v);
+  }
+  return "pending";
 }
 
 /**
@@ -471,10 +521,14 @@ export class PlanScanner {
       return;
     }
 
+    // Pass the scanner's own `log` so a malformed `approval` field is logged
+    // through the same sink as every other skip-and-log (stderr in production,
+    // captured in tests). The build* functions stay pure otherwise — every
+    // other coercion result is a return value, not a side effect.
     const msg =
       kind === "epic"
-        ? buildEpicMessage(parsed as RawEpic)
-        : buildTaskMessage(parsed as RawTask);
+        ? buildEpicMessage(parsed as RawEpic, this.log)
+        : buildTaskMessage(parsed as RawTask, this.log);
     if (msg === null) {
       // No usable id — can't key the projection. Skip-and-log.
       this.log(`[plan-worker] ${path} has no usable id; skipping`);
@@ -620,13 +674,24 @@ export function isWithinRoots(
 /**
  * Build a `plan-epic` message from a parsed epic JSON, or null when the file
  * has no usable id (the projection pk). The number is derived from the id; every
- * other field is taken verbatim (coerced to string-or-null).
+ * other field is taken verbatim (coerced to string-or-null). `approval` rides
+ * through {@link coerceApproval} — a missing value silently defaults to
+ * `"pending"` (forward-compat with old planctl), an invalid one logs via `log`
+ * and falls back to `"pending"` (the CLAUDE.md "safe value" invariant).
  */
-export function buildEpicMessage(raw: RawEpic): PlanEpicMessage | null {
+export function buildEpicMessage(
+  raw: RawEpic,
+  log: (msg: string) => void = (m) => console.error(m),
+): PlanEpicMessage | null {
   const id = asString(raw.id);
   if (id === null) {
     return null;
   }
+  const approval = coerceApproval(raw.approval, (bad) =>
+    log(
+      `[plan-worker] invalid approval value on epic ${id}: ${JSON.stringify(bad)}; coercing to "pending"`,
+    ),
+  );
   return {
     kind: "plan-epic",
     id,
@@ -634,6 +699,7 @@ export function buildEpicMessage(raw: RawEpic): PlanEpicMessage | null {
     title: asString(raw.title),
     projectDir: asString(raw.primary_repo),
     status: asString(raw.status),
+    approval,
     dependsOnEpics: asStringArray(raw.depends_on_epics),
   };
 }
@@ -642,13 +708,22 @@ export function buildEpicMessage(raw: RawEpic): PlanEpicMessage | null {
  * Build a `plan-task` message from a parsed task JSON, or null when the file has
  * no usable id. The number is derived from the id; status is DERIVED
  * (`worker_done_at` present → "done" else "open" — planctl tasks carry no
- * `status` field). Other fields are taken verbatim.
+ * `status` field). Other fields are taken verbatim. `approval` matches
+ * {@link buildEpicMessage}'s coercion semantics.
  */
-export function buildTaskMessage(raw: RawTask): PlanTaskMessage | null {
+export function buildTaskMessage(
+  raw: RawTask,
+  log: (msg: string) => void = (m) => console.error(m),
+): PlanTaskMessage | null {
   const id = asString(raw.id);
   if (id === null) {
     return null;
   }
+  const approval = coerceApproval(raw.approval, (bad) =>
+    log(
+      `[plan-worker] invalid approval value on task ${id}: ${JSON.stringify(bad)}; coercing to "pending"`,
+    ),
+  );
   return {
     kind: "plan-task",
     id,
@@ -657,6 +732,7 @@ export function buildTaskMessage(raw: RawTask): PlanTaskMessage | null {
     title: asString(raw.title),
     targetRepo: asString(raw.target_repo),
     status: asString(raw.worker_done_at) !== null ? "done" : "open",
+    approval,
     dependsOn: asStringArray(raw.depends_on),
   };
 }
@@ -764,7 +840,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
   // (the worst-case feedback loop documented in the epic's Risks section).
   const epics = db
     .query(
-      "SELECT epic_id, epic_number, title, project_dir, status, depends_on_epics, tasks FROM epics",
+      "SELECT epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, tasks FROM epics",
     )
     .all() as {
     epic_id: string;
@@ -772,6 +848,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
     title: string | null;
     project_dir: string | null;
     status: string | null;
+    approval: string | null;
     depends_on_epics: string | null;
     tasks: string | null;
   }[];
@@ -783,6 +860,13 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       title: e.title,
       projectDir: e.project_dir,
       status: e.status,
+      // The schema column has NOT NULL DEFAULT 'pending'; coerce defensively
+      // anyway (legacy DB / hand-write) so the reconstructed seed matches a
+      // fresh scan of a file whose `approval` field is missing or invalid —
+      // both fold to `"pending"`. A schema-resident invalid value (someone
+      // hand-rewrote the column off-enum) would have been logged at fold time,
+      // not here, so the silent path is correct.
+      approval: coerceApproval(e.approval),
       dependsOnEpics: parseStringArrayColumn(e.depends_on_epics),
     };
     scanner.seed(e.epic_id, JSON.stringify(msg));
@@ -806,6 +890,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       title: string | null;
       target_repo: string | null;
       status: string | null;
+      approval?: unknown;
       depends_on?: unknown;
     }[] = [];
     if (e.tasks != null && e.tasks.length > 0) {
@@ -831,6 +916,11 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
         // The projection stores the derived status verbatim; default to "open"
         // for a (legacy) NULL so the reconstructed seed matches a fresh scan.
         status: t.status ?? "open",
+        // Same defensive coercion as buildTaskMessage so the seed is
+        // byte-identical with what a fresh scan would emit; a legacy task
+        // element without `approval` reconstructs to "pending" (matches the
+        // on-disk default for files predating this field).
+        approval: coerceApproval(t.approval),
         // Same coercion as buildTaskMessage so the seed is byte-identical; a
         // (legacy) task element without `depends_on` reconstructs to [].
         dependsOn: asStringArray(t.depends_on),

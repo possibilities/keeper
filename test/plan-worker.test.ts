@@ -113,6 +113,9 @@ test("buildEpicMessage maps primary_repo → projectDir, parses number", () => {
     title: "T",
     projectDir: "/Users/mike/code/keeper",
     status: "open",
+    // Missing `approval` defaults silently to "pending" (forward-compat with
+    // files written by old planctl that predate the field).
+    approval: "pending",
     dependsOnEpics: [],
   });
   expect(buildEpicMessage({})).toBeNull();
@@ -150,6 +153,83 @@ test("buildTaskMessage extracts depends_on; non-array → []", () => {
 });
 
 // ---------------------------------------------------------------------------
+// (a.approval) Approval coercion — schema v13 (fn-592-approval-as-planctl-field)
+// ---------------------------------------------------------------------------
+
+test("buildEpicMessage: valid approval enum passes through verbatim", () => {
+  for (const v of ["approved", "rejected", "pending"] as const) {
+    expect(buildEpicMessage({ id: "fn-9-x", approval: v })?.approval).toBe(v);
+  }
+});
+
+test("buildTaskMessage: valid approval enum passes through verbatim", () => {
+  for (const v of ["approved", "rejected", "pending"] as const) {
+    expect(buildTaskMessage({ id: "fn-9-x.1", approval: v })?.approval).toBe(v);
+  }
+});
+
+test("buildEpicMessage / buildTaskMessage default missing approval to 'pending' SILENTLY (no log)", () => {
+  // Missing field is the forward-compat path — files written by old planctl
+  // simply omit it. The default must not log (would spam stderr on every
+  // legacy scan).
+  const logs: string[] = [];
+  const epic = buildEpicMessage({ id: "fn-9-x" }, (l) => logs.push(l));
+  expect(epic?.approval).toBe("pending");
+  const task = buildTaskMessage({ id: "fn-9-x.1" }, (l) => logs.push(l));
+  expect(task?.approval).toBe("pending");
+  expect(logs).toEqual([]);
+});
+
+test("buildEpicMessage coerces an invalid approval value to 'pending' with a stderr log", () => {
+  const logs: string[] = [];
+  const msg = buildEpicMessage(
+    { id: "fn-9-x", approval: "approvedd" }, // typo
+    (l) => logs.push(l),
+  );
+  expect(msg?.approval).toBe("pending");
+  expect(logs.length).toBe(1);
+  expect(logs[0]).toContain("invalid approval value on epic fn-9-x");
+  expect(logs[0]).toContain('"approvedd"');
+  expect(logs[0]).toContain('coercing to "pending"');
+});
+
+test("buildTaskMessage coerces an invalid approval value (wrong type) to 'pending' with a stderr log", () => {
+  const logs: string[] = [];
+  const msg = buildTaskMessage(
+    { id: "fn-9-x.1", approval: 42 }, // number, not the enum
+    (l) => logs.push(l),
+  );
+  expect(msg?.approval).toBe("pending");
+  expect(logs.length).toBe(1);
+  expect(logs[0]).toContain("invalid approval value on task fn-9-x.1");
+  expect(logs[0]).toContain("42");
+});
+
+test("PlanScanner.onChange routes invalid approval log through its `log` sink", () => {
+  // End-to-end: the scanner's per-instance logger receives the coercion log,
+  // proving the build* signature change is wired into the actual scan path.
+  const emitted: PlanMessage[] = [];
+  const logs: string[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    (l) => logs.push(l),
+  );
+  const path = writeEpic("fn-9-x", {
+    title: "Demo",
+    status: "open",
+    approval: "approvedd", // typo
+  });
+  scanner.onChange(path);
+  // The snapshot still emits — approval safe-falls to "pending".
+  expect(emitted.length).toBe(1);
+  expect((emitted[0] as { approval: string }).approval).toBe("pending");
+  // The scanner's log captured the coercion notice.
+  expect(logs.some((l) => l.includes("invalid approval value on epic"))).toBe(
+    true,
+  );
+});
+
+// ---------------------------------------------------------------------------
 // (a) Pure-core determinism — onChange over real tmp files
 // ---------------------------------------------------------------------------
 
@@ -175,6 +255,7 @@ test("onChange emits an epic snapshot then change-gates an identical re-scan", (
       title: "Demo",
       projectDir: "/repo",
       status: "open",
+      approval: "pending",
       dependsOnEpics: [],
     },
   ]);
@@ -220,6 +301,7 @@ test("onChange emits a task snapshot with derived status + epicId", () => {
       title: "Subtask",
       targetRepo: "/repo",
       status: "open",
+      approval: "pending",
       dependsOn: [],
     },
   ]);
@@ -505,6 +587,126 @@ test("seedFromDb is jobs-blind: epic.jobs / task.jobs never re-emit on restart",
   // jobs-driven bumps to epics.last_event_id must NEVER cause the change-gate
   // to flag plan files as changed.
   expect(emitted).toEqual([]);
+});
+
+test("seedFromDb reconstructs approval field-identically (no synthetic re-emit on boot, schema v13)", () => {
+  // The boot trap (plan-worker.ts:759-764): if the seed reconstruction does
+  // not reproduce `approval` byte-identically with what `buildEpicMessage` /
+  // `buildTaskMessage` produce, every plan file re-emits a synthetic snapshot
+  // on every boot — the events table grows unboundedly. Cover BOTH:
+  //   (a) an epic + task with explicit "approved" values
+  //   (b) the legacy default "pending" pre-stored on the column
+  // The on-disk file matches in both cases → no re-emit.
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  // Two epics: explicit approved + legacy default pending. Each carries one
+  // embedded task with a matching approval to exercise the task-side path too.
+  const approvedTasks = JSON.stringify([
+    {
+      task_id: "fn-3-demo.1",
+      epic_id: "fn-3-demo",
+      task_number: 1,
+      title: "T",
+      target_repo: "/repo",
+      status: "open",
+      approval: "approved",
+    },
+  ]);
+  const pendingTasks = JSON.stringify([
+    {
+      task_id: "fn-4-demo.1",
+      epic_id: "fn-4-demo",
+      task_number: 1,
+      title: "T",
+      target_repo: "/repo",
+      status: "open",
+      approval: "pending",
+    },
+  ]);
+  db.run(
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, last_event_id, updated_at, tasks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "fn-3-demo",
+      3,
+      "Demo",
+      "/repo",
+      "open",
+      "approved",
+      1,
+      0,
+      approvedTasks,
+      "fn-4-demo",
+      4,
+      "Demo",
+      "/repo",
+      "open",
+      "pending",
+      1,
+      0,
+      pendingTasks,
+    ],
+  );
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+  db.close();
+
+  // Approved-side files match exactly → no re-emit.
+  scanner.onChange(
+    writeEpic("fn-3-demo", {
+      title: "Demo",
+      status: "open",
+      primary_repo: "/repo",
+      approval: "approved",
+    }),
+  );
+  scanner.onChange(
+    writeTask("fn-3-demo.1", {
+      epic: "fn-3-demo",
+      title: "T",
+      target_repo: "/repo",
+      approval: "approved",
+    }),
+  );
+  // Pending-side files match exactly (and the on-disk file omits `approval`
+  // entirely — `coerceApproval(undefined) === "pending"` matches the schema's
+  // NOT NULL DEFAULT 'pending') → no re-emit.
+  scanner.onChange(
+    writeEpic("fn-4-demo", {
+      title: "Demo",
+      status: "open",
+      primary_repo: "/repo",
+    }),
+  );
+  scanner.onChange(
+    writeTask("fn-4-demo.1", {
+      epic: "fn-4-demo",
+      title: "T",
+      target_repo: "/repo",
+    }),
+  );
+  expect(emitted).toEqual([]);
+
+  // A real approval flip on the approved epic DOES re-emit (proves the seed
+  // didn't blanket-suppress — the change-gate is keyed on the field).
+  writeFileSync(
+    join(planctlDir("epics"), "fn-3-demo.json"),
+    JSON.stringify({
+      id: "fn-3-demo",
+      title: "Demo",
+      status: "open",
+      primary_repo: "/repo",
+      approval: "rejected",
+    }),
+  );
+  scanner.onChange(join(planctlDir("epics"), "fn-3-demo.json"));
+  expect(emitted.length).toBe(1);
+  expect((emitted[0] as { approval: string }).approval).toBe("rejected");
 });
 
 // ---------------------------------------------------------------------------

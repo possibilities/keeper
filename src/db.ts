@@ -33,7 +33,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -292,6 +292,7 @@ CREATE TABLE IF NOT EXISTS epics (
     title TEXT,
     project_dir TEXT,
     status TEXT,
+    approval TEXT NOT NULL DEFAULT 'pending',
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0,
     tasks TEXT NOT NULL DEFAULT '[]',
@@ -781,6 +782,24 @@ function migrate(db: Database): void {
     // determinism guarantee does NOT touch it, by design. A v11 DB gains
     // the empty table on first open with all prior `jobs`/`epics`/`events`
     // rows intact.
+
+    // v12→v13: add `epics.approval` (planctl-native approval state). Top-level
+    // field on epic + task plan files (the fn-592-approval-as-planctl-field
+    // epic), folded through the synthetic EpicSnapshot/TaskSnapshot pipeline.
+    // Idempotent ADD COLUMN with `NOT NULL DEFAULT 'pending'` matching
+    // CREATE_EPICS: existing rows backfill to `'pending'`, which is also what
+    // the plan-worker emits when an old-planctl file omits the field — so a
+    // re-fold of an existing event log reproduces the same `'pending'` reading
+    // (re-fold determinism preserved). The data-overlay/backfill from the
+    // schema-v12 `approvals` sidecar — and the DROP TABLE approvals — lands in
+    // a later task (task .3 of this epic). Column def matches CREATE_EPICS so
+    // a fresh v13 DB and a migrated v12→v13 DB converge to identical schema.
+    addColumnIfMissing(
+      db,
+      "epics",
+      "approval",
+      "TEXT NOT NULL DEFAULT 'pending'",
+    );
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

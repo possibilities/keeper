@@ -1388,6 +1388,7 @@ function getEpic(epicId: string) {
     title: string | null;
     project_dir: string | null;
     status: string | null;
+    approval: string;
     last_event_id: number | null;
     updated_at: number;
     tasks: string;
@@ -1404,6 +1405,7 @@ interface EmbeddedTask {
   title: string | null;
   target_repo: string | null;
   status: string | null;
+  approval?: "approved" | "rejected" | "pending";
   depends_on: string[];
   jobs?: unknown[];
 }
@@ -1452,6 +1454,9 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     title: "Add OAuth",
     project_dir: "/Users/mike/code/keeper",
     status: "open",
+    // No `approval` in the blob → the fold defaults to "pending" (matches the
+    // schema column NOT NULL DEFAULT and the plan-worker's coercion).
+    approval: "pending",
     last_event_id: id,
     updated_at: epic?.updated_at ?? 0,
     // A first-sight EpicSnapshot defaults the embedded array to empty.
@@ -1488,6 +1493,9 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
     status: "done",
+    // No `approval` in the blob → the embedded element defaults to "pending"
+    // (matches the plan-worker's coercion + the epic-level schema default).
+    approval: "pending",
     // No depends_on in the blob → the embedded element defaults to [].
     depends_on: [],
     // First-sight task element with no prior plan_ref-bearing jobs folded
@@ -1680,6 +1688,147 @@ test("plan folds do not touch the jobs projection", () => {
   expect(getJob()?.state).toBe("working");
   expect(getEpic("fn-1")?.title).toBe("E");
   expect(getTask("fn-1.1")?.title).toBe("T");
+});
+
+// ---------------------------------------------------------------------------
+// Approval folding (schema v13 — fn-592-approval-as-planctl-field)
+// ---------------------------------------------------------------------------
+
+test("EpicSnapshot folds `approval` into the epics row (explicit value)", () => {
+  epicSnapshotEvent("fn-1-app", {
+    epic_number: 1,
+    title: "T",
+    status: "open",
+    approval: "approved",
+  });
+  drainAll();
+  expect(getEpic("fn-1-app")?.approval).toBe("approved");
+});
+
+test("EpicSnapshot defaults missing `approval` to 'pending' on the projection", () => {
+  // A blob from an older daemon build (no `approval` key) folds to the
+  // schema-default "pending" — re-fold determinism preserved.
+  epicSnapshotEvent("fn-2-app", {
+    epic_number: 2,
+    title: "T",
+    status: "open",
+  });
+  drainAll();
+  expect(getEpic("fn-2-app")?.approval).toBe("pending");
+});
+
+test("EpicSnapshot ON CONFLICT updates `approval` (last-write-wins)", () => {
+  epicSnapshotEvent("fn-3-app", {
+    epic_number: 3,
+    title: "T",
+    status: "open",
+    approval: "pending",
+  });
+  drainAll();
+  expect(getEpic("fn-3-app")?.approval).toBe("pending");
+  epicSnapshotEvent("fn-3-app", {
+    epic_number: 3,
+    title: "T",
+    status: "open",
+    approval: "approved",
+  });
+  drainAll();
+  expect(getEpic("fn-3-app")?.approval).toBe("approved");
+});
+
+test("TaskSnapshot folds `approval` into the embedded task element", () => {
+  epicSnapshotEvent("fn-4-app", { epic_number: 4, title: "E", status: "open" });
+  taskSnapshotEvent("fn-4-app.1", {
+    epic_id: "fn-4-app",
+    task_number: 1,
+    title: "T",
+    approval: "rejected",
+  });
+  drainAll();
+  expect(getTask("fn-4-app.1")?.approval).toBe("rejected");
+});
+
+test("TaskSnapshot defaults missing `approval` to 'pending' on the embedded element", () => {
+  epicSnapshotEvent("fn-5-app", { epic_number: 5, title: "E", status: "open" });
+  taskSnapshotEvent("fn-5-app.1", {
+    epic_id: "fn-5-app",
+    task_number: 1,
+    title: "T",
+  });
+  drainAll();
+  expect(getTask("fn-5-app.1")?.approval).toBe("pending");
+});
+
+test("TaskSnapshot RMW updates `approval` on an existing element without clobbering siblings", () => {
+  epicSnapshotEvent("fn-6-app", { epic_number: 6, title: "E", status: "open" });
+  taskSnapshotEvent("fn-6-app.1", {
+    epic_id: "fn-6-app",
+    task_number: 1,
+    title: "T",
+    approval: "pending",
+  });
+  taskSnapshotEvent("fn-6-app.2", {
+    epic_id: "fn-6-app",
+    task_number: 2,
+    title: "U",
+    approval: "approved",
+  });
+  drainAll();
+  // Re-snapshot task 1 with a flipped approval; task 2 stays untouched.
+  taskSnapshotEvent("fn-6-app.1", {
+    epic_id: "fn-6-app",
+    task_number: 1,
+    title: "T",
+    approval: "rejected",
+  });
+  drainAll();
+  expect(getTask("fn-6-app.1")?.approval).toBe("rejected");
+  expect(getTask("fn-6-app.2")?.approval).toBe("approved");
+});
+
+test("from-scratch re-fold reproduces `approval` byte-identically across epic + task", () => {
+  // Build a non-trivial history exercising explicit + default approval values
+  // on BOTH paths. Rewind + re-drain must reproduce the same row contents.
+  epicSnapshotEvent("fn-7-app", {
+    epic_number: 7,
+    title: "E",
+    status: "open",
+    approval: "approved",
+  });
+  taskSnapshotEvent("fn-7-app.1", {
+    epic_id: "fn-7-app",
+    task_number: 1,
+    title: "T1",
+    approval: "rejected",
+  });
+  // A task with no approval — exercises the "pending" default path.
+  taskSnapshotEvent("fn-7-app.2", {
+    epic_id: "fn-7-app",
+    task_number: 2,
+    title: "T2",
+  });
+  // A later TaskSnapshot RMW that does NOT carry approval — preserves the
+  // prior value on the element? NO: TaskSnapshot is a FULL snapshot per the
+  // plan-worker spec, so absent approval folds to "pending" (last-write-wins
+  // on the snapshot). The re-fold test only proves the deterministic shape;
+  // semantic "preservation" of approval on an RMW carrying no field is NOT
+  // intended (the plan-worker always emits the field).
+  epicSnapshotEvent("fn-7-app", {
+    epic_number: 7,
+    title: "E v2",
+    status: "open",
+    approval: "approved",
+  });
+  drainAll();
+
+  const before = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM epics");
+  drainAll();
+
+  const after = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  expect(after).toEqual(before);
 });
 
 test("from-scratch re-fold reproduces byte-identical epics rows (incl. embedded tasks)", () => {

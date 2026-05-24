@@ -329,6 +329,7 @@ function runDaemon(): void {
         title: msg.title,
         project_dir: msg.projectDir,
         status: msg.status,
+        approval: msg.approval,
         depends_on_epics: msg.dependsOnEpics,
       });
     } else if (msg.kind === "plan-task") {
@@ -339,6 +340,7 @@ function runDaemon(): void {
         title: msg.title,
         target_repo: msg.targetRepo,
         status: msg.status,
+        approval: msg.approval,
         depends_on: msg.dependsOn,
       });
     } else if (msg.kind === "plan-epic-deleted") {
