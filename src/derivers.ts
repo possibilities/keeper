@@ -1,7 +1,8 @@
 /**
  * Pure derivers shared by the hook, the reducer, AND the schema migration's
- * same-transaction backfill. Single source of truth for the three derivation
- * rules added in fn-577 (skill + slash-command metadata):
+ * same-transaction backfill. Single source of truth for the four derivation
+ * rules (three added in fn-577 + the planctl-invocation deriver added in
+ * fn-598):
  *
  * - `slashCommandFromPrompt(prompt)` — pull a leading `/foo:bar` token out of a
  *   UserPromptSubmit payload's `data.prompt` so consumers can index slash
@@ -272,4 +273,160 @@ export function parsePlanRef(ref: string | null): ParsedPlanRef | null {
     return { kind: "task", epic_id: epicId, task_id: `${epicId}.${ordinal}` };
   }
   return { kind: "epic", epic_id: epicId };
+}
+
+/**
+ * Anchored Bash-command → `{op, target}` match for the planctl-CLI invocation
+ * deriver. The strict shape:
+ *
+ *   optional `cd <path> && ` prefix
+ *   + bare `planctl` (no absolute path, no `bash -c`, no env-var prefix)
+ *   + whitespace + op (`[a-zA-Z0-9_-]+`)
+ *   + optional whitespace + target (`[^\s;&|]+`)
+ *
+ * Op character class is intentionally narrower than `\S+` — `[a-zA-Z0-9_-]+`
+ * rejects shell metachars as the op (a malformed `planctl ;rm` cannot match
+ * `;rm` as the op). Target group is `[^\s;&|]+` so a trailing `&&` / `;` / `|`
+ * after the target doesn't get swallowed into the target capture; this also
+ * means a target with embedded `&` (none exist in planctl's id grammar) would
+ * be truncated, which is the correct conservative behavior.
+ *
+ * The `cd <path> &&` prefix is permitted because planctl invocations from
+ * worker shells routinely run inside a `cd $PRIMARY_REPO && planctl …`
+ * envelope (see jobctl `_derive_ids` precedent). Absolute paths like
+ * `/usr/local/bin/planctl` do NOT match — we want only the bare CLI shape so
+ * spurious matches against an unrelated binary named `planctl` deeper in the
+ * filesystem stay out of the invocation log. `bash -c '…'` likewise does
+ * NOT match — the prefix anchor rejects the leading `bash`.
+ *
+ * Module-scope literal so V8/JSC tier up once at process start, mirroring
+ * every other parser in this file.
+ */
+const PLANCTL_COMMAND_RE =
+  /^(?:cd\s+\S+\s+&&\s+)?planctl\s+([a-zA-Z0-9_-]+)(?:\s+([^\s;&|]+))?/;
+
+/**
+ * Read-only planctl verb allowlist. Anything matching one of these verbs with
+ * a parseable target produces `subject_present: false`; everything else
+ * (mutation verbs — `epic-create`, `task-create`, `epic-set-title`, `done`,
+ * `task-set-description`, etc.) produces `subject_present: true`.
+ *
+ * Source of truth for the planctl verb surface:
+ * `apps/planctl/planctl/cli.py` — the `@cli.command(...)` and the
+ * `@epic_group.command(...)` / `@task_group.command(...)` decorators
+ * enumerate every verb. When planctl adds a new read-only verb, add it here
+ * as a one-line edit; otherwise the new verb will be misclassified as a
+ * mutation (false-positive creator/refiner link). The choice to fail-closed
+ * (mutation by default) over fail-open is deliberate: a missed mutation
+ * silently drops a creator/refiner edge, but a misclassified read-only
+ * verb generates a spurious edge — and an explicit allowlist forces every
+ * planctl verb addition through a code review of this set.
+ *
+ * Verbs included: `epics`, `tasks`, `cat`, `show`, `list`, `detect`,
+ * `gist`, `init`, `claim`, `block`. `claim` and `block` are arguably
+ * lifecycle mutations but produce no human "subject" (title / description /
+ * acceptance text) — they're operational state writes from the worker side,
+ * not planner edits, and so are treated as `subject_present: false` for
+ * creator/refiner classification purposes.
+ */
+const PLANCTL_READONLY_VERBS: ReadonlySet<string> = new Set([
+  "epics",
+  "tasks",
+  "cat",
+  "show",
+  "list",
+  "detect",
+  "gist",
+  "init",
+  "claim",
+  "block",
+]);
+
+/**
+ * The shape returned by {@link extractPlanctlInvocation}. All four-id fields
+ * (`op`, `target`, `epic_id`, `task_id`) are always present together; a `null`
+ * return from the function signals "this is not a planctl invocation we care
+ * about" (wrong hook event, wrong tool, malformed command, etc.). `target` /
+ * `epic_id` / `task_id` may individually be `null` when the verb takes no
+ * argument or when the argument is not a parseable planctl ref (`planctl
+ * epics`, `planctl init`, `planctl scaffold foo.json`).
+ *
+ * `subject_present: false` for verbs in the read-only allowlist
+ * ({@link PLANCTL_READONLY_VERBS}); `true` for every other verb with a
+ * parseable target shape. The flag drives creator/refiner classification
+ * downstream in `src/plan-classifier.ts`.
+ */
+export interface PlanctlInvocation {
+  op: string;
+  target: string | null;
+  epic_id: string | null;
+  task_id: string | null;
+  subject_present: boolean;
+}
+
+/**
+ * Extract a planctl-CLI invocation envelope from a `PreToolUse:Bash` event's
+ * `data.tool_input.command` string. Returns `null` for every non-matching
+ * hook event / tool name / data shape — the column stays NULL on unrelated
+ * rows so the partial-index `WHERE planctl_op IS NOT NULL` predicate stays
+ * selective.
+ *
+ * Gated by `hookEvent === 'PreToolUse' && toolName === 'Bash'`. Every other
+ * combination returns `null`. The command must be a bare `planctl <verb>
+ * [target]` (optionally prefixed by `cd <path> && `) — absolute paths,
+ * `bash -c '…'` wrappers, and env-var prefixes (`FOO=1 planctl …`) all
+ * return `null`.
+ *
+ * Mirrors jobctl's `audit._derive_ids` 1:1 for the `target → (epic_id,
+ * task_id)` split by reusing {@link parsePlanRef}: the spawn-name ref shape
+ * (see {@link SPAWN_VERB_REF_RE}) and the planctl-target ref shape MUST
+ * agree byte-for-byte so a re-fold from scratch reproduces the same epic
+ * links.
+ *
+ * Mirrors {@link extractSkillName}'s shape exactly: a missing `tool_input`,
+ * non-string `command`, or any other shape-mismatch path returns `null`.
+ * Claude Code occasionally puts objects in fields documented as strings —
+ * NEVER throw, the hook's exit-0 contract is non-negotiable.
+ */
+export function extractPlanctlInvocation(
+  hookEvent: string,
+  toolName: string | null,
+  data: Record<string, unknown>,
+): PlanctlInvocation | null {
+  if (hookEvent !== "PreToolUse" || toolName !== "Bash") {
+    return null;
+  }
+  const toolInput = data.tool_input;
+  if (typeof toolInput !== "object" || toolInput === null) {
+    return null;
+  }
+  const command = (toolInput as Record<string, unknown>).command;
+  if (typeof command !== "string" || command.length === 0) {
+    return null;
+  }
+  const m = command.match(PLANCTL_COMMAND_RE);
+  if (m == null) {
+    return null;
+  }
+  // biome-ignore lint/style/noNonNullAssertion: regex match guarantees group 1
+  const op = m[1]!;
+  let target = m[2] ?? null;
+  if (target !== null) {
+    // Strip a single pair of surrounding quotes (either kind).
+    if (
+      target.length >= 2 &&
+      ((target.startsWith('"') && target.endsWith('"')) ||
+        (target.startsWith("'") && target.endsWith("'")))
+    ) {
+      target = target.slice(1, -1);
+    }
+    if (target.length === 0) {
+      target = null;
+    }
+  }
+  const parsed = target !== null ? parsePlanRef(target) : null;
+  const epic_id = parsed?.epic_id ?? null;
+  const task_id = parsed?.kind === "task" ? parsed.task_id : null;
+  const subject_present = !PLANCTL_READONLY_VERBS.has(op);
+  return { op, target, epic_id, task_id, subject_present };
 }
