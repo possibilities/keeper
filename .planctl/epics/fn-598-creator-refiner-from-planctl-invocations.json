@@ -1,0 +1,20 @@
+{
+  "branch_name": "fn-598-creator-refiner-from-planctl-invocations",
+  "bundles": [
+    "sketch/keeper-creator-refiner-from-planctl-mutations"
+  ],
+  "created_at": "2026-05-24T19:14:49Z",
+  "depends_on_epics": [],
+  "id": "fn-598-creator-refiner-from-planctl-invocations",
+  "last_validated_at": "2026-05-24T19:14:58Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "creator-refiner from planctl invocations",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-24T19:14:58Z"
+}
