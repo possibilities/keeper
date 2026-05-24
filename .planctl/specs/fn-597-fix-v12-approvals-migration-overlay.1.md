@@ -53,5 +53,5 @@ isolation via `drainToCompletion`) against a v12-shaped DB with live
       is updated or removed to reflect that the gap is now closed.
 
 ## Done summary
-
+v12->v13 migration now snapshots approvals rows into a connection-scoped TEMP table inside migrate()'s transaction before DROP TABLE, so runPlanctlApprovalMigration's overlay pass actually fires on real daemon boot. Updated the v12->v13 migration test to assert the overlay lands on the realistic openDb-driven path and removed the CRITICAL TODO block documenting the gap.
 ## Evidence
