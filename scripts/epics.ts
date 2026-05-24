@@ -10,11 +10,11 @@
  *   ({basename(project_dir)}) {epic_number} {title}{deps}
  *   {task_number}. {title}{deps} [{status}] [{approval}]
  *      [{task_id}]
- *      ({label}) {title} [{state}]       ← zero or more, per embedded work-verb job
+ *      {title} [{role}] [{state}]       ← zero or more, per embedded work-verb job
  *   ...
  *   {N+1}. Quality audit and close [{status}] [{approval}]
  *      [{epic_id}]
- *      ({label}) {title} [{state}]       ← zero or more, per embedded plan/close-verb job
+ *      {title} [{role}] [{state}]       ← zero or more, per embedded plan/close-verb job
  *
  * `{deps}` is ` [#A,#B]` from `depends_on_epics` for the header and from
  * `depends_on` on each embedded task; both are omitted when empty. In default
@@ -37,13 +37,15 @@
  * is optionally followed by 3-space-indented related-job lines: work-verb
  * jobs under their target task's slug (from the task element's nested
  * `jobs` sub-array), plan/close-verb jobs under the virtual task's slug
- * (from the epic's top-level `jobs` array). `{label}` is the
+ * (from the epic's top-level `jobs` array). `{role}` is the
  * `EmbeddedJob.plan_verb` noun-form (work → worker, plan → planner,
- * close → closer; off-whitelist verb falls through to the bare verb);
- * `{title}` is the EmbeddedJob's `title`, which tracks the title's
- * natural upgrade path (spawn → payload → transcript); `{state}` is the
- * existing jobs vocabulary (working | stopped | ended | killed). The
- * arrays are pre-sorted server-side `(created_at desc, job_id asc)`;
+ * close → closer; off-whitelist verb falls through to the bare verb)
+ * rendered as a pill BETWEEN the title and the state pill, so the two
+ * trailing pills line up under one column with the task's status/approval
+ * pair above; `{title}` is the EmbeddedJob's `title`, which tracks the
+ * title's natural upgrade path (spawn → payload → transcript); `{state}`
+ * is the existing jobs vocabulary (working | stopped | ended | killed).
+ * The arrays are pre-sorted server-side `(created_at desc, job_id asc)`;
  * we render them in that order. Task lines start at column 0; slug
  * lines and job lines are indented 3 spaces. Blocks are separated by
  * a single blank line. No YAML — just plain bracket text.
@@ -174,11 +176,11 @@ each frame led by '---'. Each epic is one block —
   ({basename(project_dir)}) {epic_number} {title} [#A,#B]
   {task_number}. {title} [#X,#Y] [{status}] [{approval}]
      [{task_id}]
-     ({label}) {title} [{state}]       (zero or more, per embedded work-verb job)
+     {title} [{role}] [{state}]       (zero or more, per embedded work-verb job)
   ...
   {N+1}. Quality audit and close [{status}] [{approval}]
      [{epic_id}]
-     ({label}) {title} [{state}]       (zero or more, per embedded plan/close-verb job)
+     {title} [{role}] [{state}]       (zero or more, per embedded plan/close-verb job)
 Blocks are separated by a single blank line. The [#…] segment lists the epic
 or task numbers a row depends on (omitted when empty); in default mode the
 epic-header [#…] hides deps that have fallen off the board. The epic header
@@ -188,9 +190,9 @@ epic_id on its slug line. On real task lines those two pills carry the
 task's. A missing / off-enum approval coerces to 'pending'. Each slug line
 is optionally trailed by 3-space-indented related-job lines — work-verb jobs
 under their target task, plan/close-verb jobs under the virtual task. The
-({label}) is the job's plan_verb noun-form (work → worker, plan → planner,
-close → closer); [{state}] is the existing jobs vocabulary (working |
-stopped | ended | killed).
+[{role}] pill is the job's plan_verb noun-form (work → worker, plan →
+planner, close → closer); [{state}] is the existing jobs vocabulary
+(working | stopped | ended | killed).
 
 The page is refetched on every change signal and on a steady poll, so it always
 shows the current top-N; a new frame prints only when the rendered output
@@ -223,11 +225,11 @@ function approvalPill(v: unknown): string {
 }
 
 /**
- * Map an `EmbeddedJob.plan_verb` to its noun-form actor label so a job line
- * reads naturally (`(worker) work::… [working]`). Mirrors the whitelist in
- * `src/derivers.ts:planVerbRefFromSpawnName`. An off-whitelist or non-string
- * value falls through to the bare verb — defensive "safe value" so a future
- * fourth verb still renders.
+ * Map an `EmbeddedJob.plan_verb` to its noun-form actor label for the
+ * `[{role}]` pill on a job line (`work::… [worker] [working]`). Mirrors the
+ * whitelist in `src/derivers.ts:planVerbRefFromSpawnName`. An off-whitelist
+ * or non-string value falls through to the bare verb — defensive "safe
+ * value" so a future fourth verb still renders.
  */
 const PLAN_VERB_LABELS: Record<string, string> = {
   plan: "planner",
@@ -348,7 +350,7 @@ async function main(): Promise<void> {
   /**
    * Render the epic's embedded jobs (or a task element's nested jobs) as
    * 3-space-indented lines, one per job, sitting directly under their parent
-   * slug line. Format: `   ({label}) {title} [{state}]`. `{label}` is the
+   * slug line. Format: `   {title} [{role}] [{state}]`. `{role}` is the
    * `plan_verb` noun-form (worker/closer/planner) via {@link planVerbLabel};
    * `{title}` rides the title's natural upgrade path (spawn → payload →
    * transcript); `{state}` is the existing jobs vocabulary (working |
@@ -365,7 +367,7 @@ async function main(): Promise<void> {
     }
     return jobs.map((j) => {
       const job = j as Record<string, unknown>;
-      return `   (${planVerbLabel(job.plan_verb)}) ${seg(job.title)} [${seg(job.state)}]`;
+      return `   ${seg(job.title)} [${planVerbLabel(job.plan_verb)}] [${seg(job.state)}]`;
     });
   }
 
@@ -374,11 +376,11 @@ async function main(): Promise<void> {
    *   ({basename(project_dir)}) {epic_number} {title}{deps}
    *   {task_number}. {title}{deps} [{status}] [{approval}]
    *      [{task_id}]
-   *      ({label}) {title} [{state}]       ← zero or more, per embedded work-verb job
+   *      {title} [{role}] [{state}]       ← zero or more, per embedded work-verb job
    *   ...
    *   {N+1}. Quality audit and close [{status}] [{approval}]
    *      [{epic_id}]
-   *      ({label}) {title} [{state}]       ← zero or more, per embedded plan/close-verb job
+   *      {title} [{role}] [{state}]       ← zero or more, per embedded plan/close-verb job
    * `{deps}` is ` [#A,#B]` joined from `depends_on_epics` (epic header) or
    * `depends_on` (task line); omitted when empty. In default mode the epic-
    * header `{deps}` is filtered to deps still on the board (present in the

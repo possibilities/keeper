@@ -7,10 +7,17 @@
  * It `query`s a 10-row page of `jobs` and renders it as a `---`-led document
  * of one job per line in plain bracket form:
  *
- *   ({basename(cwd)}) {title} [{state}]
+ *   ({basename(cwd)}) {title} [{role}] [{state}]
  *
  * The `(...)` cwd segment is omitted when `cwd` is null/empty so the line
- * doesn't lead with empty parens. The query optionally carries a server-side
+ * doesn't lead with empty parens. The `[{role}]` pill is the
+ * `Job.plan_verb` noun-form (work → worker, plan → planner, close → closer;
+ * off-whitelist verb falls through to the bare verb) and is omitted when
+ * `plan_verb` is NULL — i.e. for jobs whose spawn name didn't match the
+ * canonical `{verb}::<ref>` shape, so the line stays a clean
+ * `({cwd}) {title} [{state}]` for non-planctl sessions. Same role
+ * vocabulary and pill placement as the embedded-job lines in
+ * `scripts/epics.ts`. The query optionally carries a server-side
  * `state` filter built from `--state` / `--state-ne` (the bare-value equality
  * form and the `{ ne }` operator form, respectively; default is no filter
  * and every job pages through). When a filter is in effect it runs in SQL,
@@ -118,8 +125,11 @@ Usage: bun scripts/jobs.ts [--sock <path>] [--state <s> | --state-ne <s>]
 
 Renders a 10-row page of jobs as a stream of plain bracket-form lines: one
 frame per change, each frame led by '---'. One job per line:
-  ({basename(cwd)}) {title} [{state}]
-The (...) cwd segment is omitted when cwd is null/empty. The page is
+  ({basename(cwd)}) {title} [{role}] [{state}]
+The (...) cwd segment is omitted when cwd is null/empty. The [{role}] pill
+is the job's plan_verb noun-form (work → worker, plan → planner, close →
+closer); it is omitted entirely when plan_verb is NULL (non-planctl
+sessions), so those lines stay ({cwd}) {title} [{state}]. The page is
 refetched on every change signal and on a steady poll, so it always shows
 the current top-N; a new frame prints only when the rendered output changes.
 Every emitted frame is also mirrored to two /tmp sidecar files (full JSON
@@ -133,6 +143,29 @@ of exiting; each connection-lifecycle change prints a ...-fenced note
 /** The hardcoded collection and its primary key. */
 const COLLECTION = "jobs";
 const pk = "job_id";
+
+/**
+ * Map a `Job.plan_verb` to its noun-form actor label for the `[{role}]` pill
+ * on a job line (`{title} [worker] [working]`). Mirrors the whitelist in
+ * `src/derivers.ts:planVerbRefFromSpawnName`, and the sibling helper in
+ * `scripts/epics.ts`. An off-whitelist or non-string value falls through to
+ * the bare verb — defensive "safe value" so a future fourth verb still
+ * renders. Returns `null` when `plan_verb` itself is null so the caller can
+ * omit the pill for non-planctl sessions (those jobs have no role to name).
+ */
+const PLAN_VERB_LABELS: Record<string, string> = {
+  plan: "planner",
+  work: "worker",
+  close: "closer",
+};
+
+function planVerbLabel(v: unknown): string | null {
+  if (v == null) {
+    return null;
+  }
+  const s = typeof v === "string" ? v : "";
+  return PLAN_VERB_LABELS[s] ?? s;
+}
 
 function die(message: string): never {
   process.stderr.write(`keeper-jobs: ${message}\n`);
@@ -196,15 +229,20 @@ async function main(): Promise<void> {
 
   /**
    * Collapse one full row to its display line:
-   * `({basename(cwd)}) {title} [{state}]`. A null/empty `cwd` drops the
-   * `(...)` segment entirely (no empty parens). This — together with
-   * `emitFrameIfChanged` — defines which column moves can reframe the page.
+   * `({basename(cwd)}) {title} [{role}] [{state}]`. A null/empty `cwd`
+   * drops the `(...)` segment entirely (no empty parens). The `[{role}]`
+   * pill is dropped when `plan_verb` is NULL (non-planctl session), so
+   * the line falls back to `({cwd}) {title} [{state}]`. This — together
+   * with `emitFrameIfChanged` — defines which column moves can reframe
+   * the page.
    */
   function projectRow(row: Record<string, unknown>): string {
     const title = seg(row.title);
     const cwd = row.cwd == null ? "" : basename(String(row.cwd));
     const cwdSeg = cwd === "" ? "" : `(${cwd}) `;
-    return `${cwdSeg}${title} [${seg(row.state)}]`;
+    const role = planVerbLabel(row.plan_verb);
+    const roleSeg = role == null ? "" : ` [${role}]`;
+    return `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]`;
   }
 
   /**
