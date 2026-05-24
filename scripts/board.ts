@@ -71,7 +71,7 @@
  *   --help           Show this help.
  */
 
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
@@ -106,6 +106,11 @@ const HELP = `keeper-board — combined epics + jobs UI over the keeper subscrib
 Usage: bun scripts/board.ts [--sock <path>]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
+  --clear          Clear the terminal before each frame (live-panel mode).
+                   Each frame's sidecars are written to indexed paths
+                   instead of overwriting, and a session meta file at
+                   /tmp/keeper-board.<pid>.meta.txt accumulates the full
+                   index (tab-separated: frame# state frame diff).
   --help           Show this help
 
 Renders both views as one frame per change, each frame led by '---':
@@ -229,6 +234,7 @@ async function main(): Promise<void> {
     args: Bun.argv.slice(2),
     options: {
       sock: { type: "string" },
+      clear: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -241,6 +247,8 @@ async function main(): Promise<void> {
 
   const sockPath = values.sock ?? resolveSockPath();
   const log = (s: string) => process.stdout.write(`${s}\n`);
+  const clearMode = values.clear;
+  let frameCount = 0;
 
   const epics = makeState("epics", "epics-frames", "epic_id", EPICS_PAGE_LIMIT);
   const jobs = makeState("jobs", "jobs-frames", "job_id", JOBS_PAGE_LIMIT);
@@ -404,19 +412,34 @@ async function main(): Promise<void> {
   // Internal scratch path for the previous frame text — fed to `diff -u` as
   // its "before" file. Overwritten each tick; not surfaced in the meta note.
   const prevFrameTmp = `/tmp/keeper-board.${process.pid}.prev.frame.txt`;
+  // Session-level meta file: one tab-separated line per frame (index +
+  // per-frame sidecar paths). Only written in `--clear` mode; accumulates
+  // across the session so every past frame remains inspectable.
+  const metaSidecar = `/tmp/keeper-board.${process.pid}.meta.txt`;
   // In-memory copy of the last emitted frame's body+lead, used as the
   // "before" side of the per-frame unified diff. `null` until the first
   // frame lands (sentinel written instead).
   let lastFrameText: string | null = null;
 
   function writeSidecars(frameText: string): void {
+    // In --clear mode each frame's sidecars are indexed so past frames persist;
+    // in default mode the three static paths are overwritten each frame.
+    const sState = clearMode
+      ? `/tmp/keeper-board.${process.pid}.state.${frameCount}.json`
+      : stateSidecar;
+    const sFrame = clearMode
+      ? `/tmp/keeper-board.${process.pid}.frame.${frameCount}.txt`
+      : frameSidecar;
+    const sDiff = clearMode
+      ? `/tmp/keeper-board.${process.pid}.diff.${frameCount}.txt`
+      : diffSidecar;
     const stateJson = {
       epics: epics.order.map((id) => epics.byId.get(id) ?? { [epics.pk]: id }),
       jobs: jobs.order.map((id) => jobs.byId.get(id) ?? { [jobs.pk]: id }),
     };
     try {
-      writeFileSync(stateSidecar, `${JSON.stringify(stateJson, null, 2)}\n`);
-      writeFileSync(frameSidecar, `${frameText}\n`);
+      writeFileSync(sState, `${JSON.stringify(stateJson, null, 2)}\n`);
+      writeFileSync(sFrame, `${frameText}\n`);
     } catch (err) {
       log(`# warn: sidecar write failed: ${(err as Error).message}`);
     }
@@ -432,7 +455,7 @@ async function main(): Promise<void> {
       try {
         writeFileSync(prevFrameTmp, `${lastFrameText}\n`);
         const proc = Bun.spawnSync({
-          cmd: ["diff", "-u", prevFrameTmp, frameSidecar],
+          cmd: ["diff", "-u", prevFrameTmp, sFrame],
         });
         diffText = proc.stdout.toString();
         if (diffText.length === 0) {
@@ -443,15 +466,28 @@ async function main(): Promise<void> {
       }
     }
     try {
-      writeFileSync(diffSidecar, diffText);
+      writeFileSync(sDiff, diffText);
     } catch (err) {
       log(`# warn: diff sidecar write failed: ${(err as Error).message}`);
     }
+    if (clearMode) {
+      try {
+        appendFileSync(
+          metaSidecar,
+          `${frameCount}\t${sState}\t${sFrame}\t${sDiff}\n`,
+        );
+      } catch (err) {
+        log(`# warn: meta write failed: ${(err as Error).message}`);
+      }
+    }
     lastFrameText = frameText;
     log("...");
-    log(`state: ${stateSidecar}`);
-    log(`frame: ${frameSidecar}`);
-    log(`diff: ${diffSidecar}`);
+    log(`state: ${sState}`);
+    log(`frame: ${sFrame}`);
+    log(`diff: ${sDiff}`);
+    if (clearMode) {
+      log(`meta: ${metaSidecar}`);
+    }
     log("...");
   }
 
@@ -470,6 +506,10 @@ async function main(): Promise<void> {
       return;
     }
     lastBody = body;
+    frameCount += 1;
+    if (clearMode) {
+      process.stdout.write("\x1b[2J\x1b[H");
+    }
     const frameText = `---\n${body}`;
     log(frameText);
     writeSidecars(frameText);
