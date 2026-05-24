@@ -14,6 +14,13 @@
  *   ~~~
  *   {jobs body}      ← see scripts/jobs.ts for the job-line format
  *
+ * The jobs body itself is split into two stacked sub-lists separated by a
+ * `~~~` line: jobs with NO `plan_verb` (ambient / ad-hoc sessions) on top,
+ * jobs WITH a `plan_verb` (planner/worker/closer — epic/task-bound work) on
+ * the bottom. So a fully-populated frame can carry TWO `~~~` lines — one
+ * between epics and jobs, one inside the jobs section. The empty-side drop
+ * rule (below) applies at both levels.
+ *
  * One connection carries TWO `query` frames (one per collection, distinct
  * subscription `id`s). `patch` / `meta` frames carry only `collection` (no
  * `id`), so we route refetches by collection: an epics patch refetches only
@@ -35,7 +42,10 @@
  * Empty-section policy: an empty collection renders as NOTHING (no
  * placeholder text). The `~~~` divider is dropped when either side is
  * empty, so a single populated section reads as a clean block under the
- * `---` lead, and a frame with both sides empty is just the lead.
+ * `---` lead, and a frame with both sides empty is just the lead. The
+ * same rule applies to the jobs section's internal split: if one of the
+ * two job partitions is empty, the inner `~~~` is dropped and the
+ * populated partition reads as a single flat list.
  *
  * Filters: this combined view uses the SERVER defaults for both
  * collections — epics: `status = 'open' AND approval != 'approved'`; jobs:
@@ -105,9 +115,16 @@ Renders both views as one frame per change, each frame led by '---':
   ~~~
   {jobs body}       (see scripts/jobs.ts for the job-line format)
 
+The jobs body is itself split into two stacked sub-lists separated by a '~~~'
+line: jobs with NO plan_verb (ambient sessions) on top, jobs WITH a plan_verb
+(planner/worker/closer — epic-bound work) on the bottom. A fully-populated
+frame can therefore show two '~~~' lines (one between epics and jobs, one
+inside the jobs section).
+
 The first frame waits until BOTH collections have landed their first result,
 so first paint is never half-empty. An empty section renders as NOTHING (no
-placeholder text); the ~~~ divider is dropped when either side is empty. The page is refetched on every change
+placeholder text); the ~~~ divider is dropped when either side is empty (this
+applies to the inner jobs split too). The page is refetched on every change
 signal and on a steady poll; a new frame prints only when the combined
 rendered output changes. Both subscriptions ride one connection; an
 epics-only change refetches only epics (and vice versa). Every emitted
@@ -327,13 +344,38 @@ async function main(): Promise<void> {
     return `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]`;
   }
 
+  /**
+   * Jobs body is split into two stacked sub-lists by `plan_verb` presence:
+   * no-role (ambient sessions) on top, with-role (planner/worker/closer —
+   * epic-bound work) on the bottom, joined by a `~~~` line. Within each
+   * partition we preserve server order. Same empty-side drop rule as the
+   * outer `renderBody`: a partition with zero rows yields just the other
+   * one, no divider; both empty yields `""`.
+   */
   function renderJobsBody(): string {
     if (jobs.order.length === 0) {
       return "";
     }
-    return jobs.order
-      .map((id) => projectJobRow(jobs.byId.get(id) ?? { [jobs.pk]: id }))
-      .join("\n");
+    const noRole: string[] = [];
+    const withRole: string[] = [];
+    for (const id of jobs.order) {
+      const row = jobs.byId.get(id) ?? { [jobs.pk]: id };
+      const line = projectJobRow(row);
+      if (row.plan_verb == null) {
+        noRole.push(line);
+      } else {
+        withRole.push(line);
+      }
+    }
+    const top = noRole.join("\n");
+    const bottom = withRole.join("\n");
+    if (top === "") {
+      return bottom;
+    }
+    if (bottom === "") {
+      return top;
+    }
+    return `${top}\n~~~\n${bottom}`;
   }
 
   /**
