@@ -630,13 +630,16 @@ test("end-to-end: set_task_approval RPC → atomic plan-file rewrite, set_epic_a
   expect(epicAfter.title).toBe("RPC E2E");
 
   // --- bad enum: server returns `bad_params`, the connection survives. ---
-  await expect(
-    rpc("set_task_approval", {
+  try {
+    await rpc("set_task_approval", {
       epic_id: "fn-99-rpc-e2e",
       task_id: "fn-99-rpc-e2e.1",
       status: "garbage",
-    }),
-  ).rejects.toThrow(/bad_params/);
+    });
+    throw new Error("expected rejection");
+  } catch (e) {
+    expect(String(e)).toMatch(/bad_params/);
+  }
 
   // --- clean shutdown. ---
   daemon.kill("SIGTERM");
