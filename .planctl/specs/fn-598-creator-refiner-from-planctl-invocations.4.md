@@ -53,5 +53,5 @@ Bash command (e.g. `ls`) → all five NULL.
 - [ ] Hook microbenchmark: cold-start + per-event overhead unchanged (no regression).
 
 ## Done summary
-
+Wired extractPlanctlInvocation into the events-writer hook: the deriver is called on every event next to slashCommandFromPrompt/extractSkillName, the five planctl_* params bind on the insertEvent prepared statement (which now lists the new columns), synthetic daemon inserts bind NULL, and five new hook integration tests cover mutation+task-ref+non-planctl+wrong-hook+malformed-command paths.
 ## Evidence
