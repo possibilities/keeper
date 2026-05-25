@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -255,7 +255,8 @@ CREATE TABLE IF NOT EXISTS events (
     planctl_target TEXT,
     planctl_epic_id TEXT,
     planctl_task_id TEXT,
-    planctl_subject_present INTEGER
+    planctl_subject_present INTEGER,
+    tool_use_id TEXT
 )
 `;
 
@@ -310,6 +311,67 @@ const CREATE_V10_INDEXES = [
  */
 const CREATE_V14_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_events_planctl_session ON events (session_id, id) WHERE planctl_op IS NOT NULL",
+];
+
+/**
+ * Indexes added in schema v17 that depend on the `tool_use_id` column added by
+ * the v16→v17 `addColumnIfMissing` step. Mirrors {@link CREATE_V10_INDEXES} /
+ * {@link CREATE_V14_INDEXES} structure: KEPT OUT of
+ * {@link CREATE_EVENTS_INDEXES} so the unconditional CREATE block doesn't
+ * reference a column that doesn't exist yet on a migrating v16 DB. `migrate()`
+ * runs these AFTER the matching ADD COLUMN in the v16→v17 block; a fresh v17
+ * DB picks them up via the same block (the addColumnIfMissing no-ops on the
+ * freshly CREATE'd table).
+ *
+ * `WHERE tool_use_id IS NOT NULL` is the canonical SQLite partial-index
+ * pattern (sqlite.org/partialindex.html §2 Rule 2): the planner auto-matches
+ * any equality on the indexed column when the predicate is `IS NOT NULL`, so
+ * a `WHERE tool_use_id = ?` lookup (the SubagentStart/Stop fold's bridge
+ * join, task .3) lands the index instead of a scan.
+ */
+const CREATE_V17_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_events_tool_use_id ON events(tool_use_id) WHERE tool_use_id IS NOT NULL",
+];
+
+/**
+ * Schema-v17 `subagent_invocations` projection table. Composite primary key
+ * `(job_id, agent_id, turn_seq)` mirrors the jobctl Python reference
+ * (`apps/cli_common/cli_common/subagent_invocations.py`) minus the
+ * `tokens` / `tool_use_count` fields. `turn_seq` is the per-job monotone
+ * turn counter so re-entrant subagents in a session land on distinct rows.
+ *
+ * Defaults match the zero-event projection:
+ * - `status='running'` is the SubagentStart-time value (a row is created
+ *   when SubagentStart folds; flips to `'ok'` / `'error'` on SubagentStop).
+ * - `prompt_chars=0` so a row created by SubagentStart before its matching
+ *   PreToolUse:Agent row reads zero — task .3's reducer backfills it via the
+ *   `tool_use_id` bridge.
+ *
+ * Created in the v16→v17 migration block (idempotent CREATE TABLE IF NOT
+ * EXISTS), so a migrating v16 DB and a fresh v17 DB both land the same
+ * shape. The reducer cases that populate this table arrive in task .3; this
+ * task ships the empty table + the bridge column + the partial index.
+ */
+const CREATE_SUBAGENT_INVOCATIONS = `
+CREATE TABLE IF NOT EXISTS subagent_invocations (
+    job_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    turn_seq INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    tool_use_id TEXT,
+    subagent_type TEXT,
+    description TEXT,
+    prompt_chars INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running',
+    duration_ms INTEGER,
+    last_event_id INTEGER NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (job_id, agent_id, turn_seq)
+)
+`;
+
+const CREATE_SUBAGENT_INVOCATIONS_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_subagent_invocations_job ON subagent_invocations(job_id)",
 ];
 
 const CREATE_JOBS = `
@@ -490,6 +552,10 @@ function migrate(db: Database): void {
     db.run(CREATE_GIT_STATUS);
     db.run(CREATE_REDUCER_STATE);
     db.run(CREATE_META);
+    db.run(CREATE_SUBAGENT_INVOCATIONS);
+    for (const sql of CREATE_SUBAGENT_INVOCATIONS_INDEXES) {
+      db.run(sql);
+    }
 
     // Seed singleton cursor on first boot. Subsequent boots are no-ops.
     db.run(
@@ -1195,6 +1261,111 @@ function migrate(db: Database): void {
     // converge to identical schema.
     addColumnIfMissing(db, "epics", "last_validated_at", "TEXT");
 
+    // v16→v17: add the sparse `events.tool_use_id` bridge column + the
+    // `subagent_invocations` peer table + the partial index on the bridge
+    // column. Mirrors the v9→v10 / v13→v14 sparse-column + partial-index
+    // precedent: one new top-level events column, one CREATE INDEX gated on
+    // `IS NOT NULL`, and a same-transaction backfill via uncached `db.run`.
+    //
+    // Column def matches CREATE_EVENTS literal so a fresh v17 DB and a
+    // migrated v16→v17 DB converge to identical schema (the
+    // addColumnIfMissing/literal lockstep convention). The
+    // `subagent_invocations` table itself is created unconditionally via
+    // CREATE TABLE IF NOT EXISTS above; a fresh v17 DB picks it up there,
+    // and a migrating DB picks it up on the same boot — both paths
+    // converge to the same shape. The partial index lives in
+    // CREATE_V17_INDEXES; a fresh DB picks it up via the same block, and a
+    // migrating DB picks it up on the same boot.
+    //
+    // No reducer cases yet — task .3 supplies the SubagentStart/Stop +
+    // PreToolUse:Agent / PostToolUse:Agent folds that populate the
+    // projection. The intermediate post-task-.1 state is harmless: the
+    // table exists but is empty, the events.tool_use_id column is
+    // populated forward + backfilled, and the wire collection isn't
+    // registered (task .3 adds the descriptor).
+    addColumnIfMissing(db, "events", "tool_use_id", "TEXT");
+
+    // CREATE the v17 partial index AFTER the ADD COLUMN it depends on. A
+    // fresh v17 DB enters this block too — the addColumnIfMissing above
+    // no-ops (the column already exists via the CREATE_EVENTS literal),
+    // and this CREATE INDEX IF NOT EXISTS lands the same index set on
+    // both a fresh-v17 and a migrating-v16 DB.
+    for (const sql of CREATE_V17_INDEXES) {
+      db.run(sql);
+    }
+
+    // Same-transaction backfill of `events.tool_use_id` for historical
+    // rows. Unlike the v9→v10 / v13→v14 backfills (which run derivers in
+    // JS), the tool_use_id field is a verbatim json_extract — SQLite can
+    // do this entirely in SQL via `json_extract(data, '$.tool_use_id')`.
+    // The `WHERE tool_use_id IS NULL AND json_extract(...) IS NOT NULL`
+    // guard makes the UPDATE idempotent: a re-run after a partial crash
+    // skips already-stamped rows, and a clean re-run sees no work.
+    //
+    // Uses `db.run(sql)` (uncached path — no bound params, single
+    // statement) rather than `db.prepare(...).run()` to sidestep the
+    // bun:sqlite statement-cache pin (oven-sh/bun#1332) — the same
+    // pattern documented on the v9→v10 backfill above. A throw rolls the
+    // whole migration back (ALTERs included).
+    //
+    // Version-guarded: a non-idempotent backfill on a multi-million-row
+    // events log must run AT MOST once. The guard reads the meta row
+    // written by a PRIOR migrate() — on a fresh v17 DB (or one that
+    // crashed before stamping v17) `storedVersionV17 < 17` and the
+    // backfill runs; on a steady-state v17+ DB it skips, so a second
+    // `openDb` is a clean no-op. (The events.tool_use_id IS NULL filter
+    // would make the UPDATE safe to re-run even without the guard, but
+    // the rewind-and-redrain below is non-idempotent and must be gated.)
+    const storedVersionV17 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV17 < 17) {
+      // `json_valid(data)` gates the json_extract so a malformed historical
+      // `data` blob (one that pre-dated the hook's structured-JSON
+      // contract, or that the hook stored as a non-JSON best-effort
+      // string) skips cleanly — `json_extract` raises SQLITE_ERROR on
+      // malformed JSON, which would otherwise abort the transaction and
+      // wedge the migration. The `tool_use_id IS NULL` filter keeps the
+      // UPDATE idempotent across partial-crash resume.
+      db.run(
+        `UPDATE events
+            SET tool_use_id = json_extract(data, '$.tool_use_id')
+          WHERE tool_use_id IS NULL
+            AND json_valid(data) = 1
+            AND json_extract(data, '$.tool_use_id') IS NOT NULL`,
+      );
+
+      // Seed planner stats for the new partial index so the first
+      // post-upgrade query lands the index instead of a scan
+      // (sqlite.org/lang_analyze.html — ANALYZE refreshes the
+      // `sqlite_stat1` table the planner reads). One-shot; subsequent
+      // boots don't re-ANALYZE here.
+      db.run("ANALYZE events");
+
+      // Rewind-and-redrain — same shape as the v10→v11 step. Task .3's
+      // reducer cases will populate `subagent_invocations` on the
+      // re-drain. The boot drain runs unconditionally after `migrate()`
+      // returns, so the projection is rebuilt from the event log in one
+      // pass. Until task .3 lands the live folds, the re-drain leaves
+      // `subagent_invocations` empty — the table exists but no rows
+      // populate (no cases yet). This is harmless: existing `jobs` /
+      // `epics` folds tolerate a fresh re-fold cleanly per the v10→v11
+      // precedent.
+      //
+      // Non-idempotent: must run AT MOST once per DB. The version guard
+      // above ensures this. Cost: re-folding the entire event log
+      // inside the BEGIN IMMEDIATE — bounded by `events` row count,
+      // seconds to tens of seconds on a developer machine. One-time.
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM subagent_invocations");
+    }
+
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(String(SCHEMA_VERSION));
@@ -1229,13 +1400,13 @@ function prepareStmts(db: Database): Stmts {
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
         planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-        planctl_subject_present
+        planctl_subject_present, tool_use_id
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
         $subagent_agent_id, $spawn_name, $start_time, $slash_command, $skill_name,
         $planctl_op, $planctl_target, $planctl_epic_id, $planctl_task_id,
-        $planctl_subject_present
+        $planctl_subject_present, $tool_use_id
       )
     `),
     selectWorldRev: db.prepare(

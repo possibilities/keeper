@@ -28,6 +28,7 @@ import { openDb, resolveDbPath } from "../../src/db";
 import {
   extractPlanctlInvocation,
   extractSkillName,
+  extractToolUseId,
   slashCommandFromPrompt,
 } from "../../src/derivers";
 
@@ -354,6 +355,18 @@ async function main(): Promise<void> {
         ? 1
         : 0;
 
+  // v17: index the Anthropic tool_use_id correlator on every event payload
+  // carrying it. Unlike `slashCommandFromPrompt` / `extractSkillName` /
+  // `extractPlanctlInvocation`, the deriver is NOT gated on hook event or
+  // tool name — Pre/PostToolUse + PostToolUseFailure on every tool (Bash,
+  // Read, Edit, Agent, …) carry `data.tool_use_id` and all populate the
+  // column. The partial-index `WHERE tool_use_id IS NOT NULL` predicate
+  // keeps the index small. Bridges the SubagentStart/Stop folds to their
+  // matching PreToolUse:Agent payload in the `subagent_invocations`
+  // projection (task .3 — this task only ships the column + the hook
+  // wiring; no reducer cases yet).
+  const toolUseId = extractToolUseId(data);
+
   // SessionStart only: scrape the parent claude argv `--name`/`-n` AND the
   // process start_time in a single platform-specific probe, so the reducer can
   // seed `jobs.title` from the very first event AND store the recycle-safe
@@ -402,6 +415,7 @@ async function main(): Promise<void> {
         $planctl_epic_id: planctlEpicId,
         $planctl_task_id: planctlTaskId,
         $planctl_subject_present: planctlSubjectPresent,
+        $tool_use_id: toolUseId,
       });
     })();
   } finally {

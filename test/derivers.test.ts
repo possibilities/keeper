@@ -8,6 +8,7 @@
 import { expect, test } from "bun:test";
 import {
   extractPlanctlInvocation,
+  extractToolUseId,
   isKilledTaskNotification,
   parsePlanRef,
 } from "../src/derivers";
@@ -465,4 +466,65 @@ test("extractPlanctlInvocation rejects malformed leading token (planctld)", () =
   expect(
     extractPlanctlInvocation("PreToolUse", "Bash", pre("planctld epics")),
   ).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// extractToolUseId (v17 sparse-column deriver)
+// ---------------------------------------------------------------------------
+
+test("extractToolUseId returns the string for a populated data.tool_use_id", () => {
+  expect(extractToolUseId({ tool_use_id: "toolu_abc" })).toBe("toolu_abc");
+});
+
+test("extractToolUseId returns null for a missing tool_use_id field", () => {
+  expect(extractToolUseId({})).toBeNull();
+  expect(extractToolUseId({ tool_input: { command: "x" } })).toBeNull();
+});
+
+test("extractToolUseId returns null for a non-string tool_use_id (defensive)", () => {
+  // Claude Code occasionally puts non-strings in fields documented as strings;
+  // the hook's exit-0 contract requires a null return, never a throw.
+  expect(extractToolUseId({ tool_use_id: 42 })).toBeNull();
+  expect(extractToolUseId({ tool_use_id: true })).toBeNull();
+  expect(extractToolUseId({ tool_use_id: { id: "x" } })).toBeNull();
+  expect(extractToolUseId({ tool_use_id: ["x"] })).toBeNull();
+});
+
+test("extractToolUseId returns null for an empty-string tool_use_id", () => {
+  // An empty string is treated as absence — matches the partial-index
+  // `WHERE tool_use_id IS NOT NULL` predicate's intent (don't index a
+  // useless empty value).
+  expect(extractToolUseId({ tool_use_id: "" })).toBeNull();
+});
+
+test("extractToolUseId returns null for null / non-object input (defensive)", () => {
+  expect(extractToolUseId(null)).toBeNull();
+  expect(extractToolUseId(undefined)).toBeNull();
+  expect(extractToolUseId(42)).toBeNull();
+  expect(extractToolUseId("string")).toBeNull();
+  expect(extractToolUseId(true)).toBeNull();
+});
+
+test("extractToolUseId never throws on arbitrary garbage shapes", () => {
+  const garbage: unknown[] = [
+    { tool_use_id: Symbol("x") },
+    { tool_use_id: () => "x" },
+    [],
+    new Map([["tool_use_id", "x"]]),
+  ];
+  for (const data of garbage) {
+    expect(() => extractToolUseId(data)).not.toThrow();
+  }
+});
+
+test("extractToolUseId fires regardless of hook event / tool name (broad gate)", () => {
+  // Unlike extractSkillName / extractPlanctlInvocation, this deriver has no
+  // event/tool gate — Pre/PostToolUse + PostToolUseFailure on every tool
+  // carries the field. The deriver itself only sees `data`, so any payload
+  // shape with `data.tool_use_id` populates the column. The hook caller
+  // doesn't need to gate either.
+  expect(extractToolUseId({ tool_use_id: "toolu_x" })).toBe("toolu_x");
+  // A SessionStart payload, a Notification payload, or any other event — if
+  // they carry `tool_use_id`, the column populates. (In practice they don't;
+  // the partial index stays selective.)
 });

@@ -950,3 +950,116 @@ test("hook writes jobs.plan_verb/plan_ref via reducer when SessionStart spawn_na
     db.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Hook process integration — events.tool_use_id capture (v17)
+// ---------------------------------------------------------------------------
+
+test("PreToolUse:Bash with tool_use_id populates events.tool_use_id", async () => {
+  // The hook stamps `events.tool_use_id` for every event whose `data`
+  // carries the field — no event-name / tool-name gate. PreToolUse:Bash is
+  // representative; the field rides through verbatim via extractToolUseId.
+  const code = await fireViaLauncher("any-session", {
+    hook_event_name: "PreToolUse",
+    session_id: "sess-bash-tuid",
+    tool_name: "Bash",
+    tool_use_id: "toolu_01ABCDEF",
+    tool_input: { command: "echo hello" },
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT tool_use_id FROM events WHERE session_id = 'sess-bash-tuid' AND hook_event = 'PreToolUse'",
+      )
+      .get() as { tool_use_id: string | null } | null;
+    expect(row?.tool_use_id).toBe("toolu_01ABCDEF");
+  } finally {
+    db.close();
+  }
+});
+
+test("PostToolUse:Agent with tool_use_id populates events.tool_use_id", async () => {
+  // Agent (Task tool) PostToolUse carries tool_use_id too — the field is
+  // load-bearing for the SubagentStart/Stop ↔ Pre/Post-Agent bridge in
+  // task .3's reducer.
+  const code = await fireViaLauncher("any-session", {
+    hook_event_name: "PostToolUse",
+    session_id: "sess-agent-tuid",
+    tool_name: "Agent",
+    tool_use_id: "toolu_AGENT_42",
+    tool_response: { agentId: "agent-xyz" },
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT tool_use_id, subagent_agent_id FROM events WHERE session_id = 'sess-agent-tuid' AND hook_event = 'PostToolUse'",
+      )
+      .get() as {
+      tool_use_id: string | null;
+      subagent_agent_id: string | null;
+    } | null;
+    expect(row?.tool_use_id).toBe("toolu_AGENT_42");
+    // Cross-check: extractSubagentAgentId still stamps the existing bridge
+    // column on the same row (the two derivers are independent).
+    expect(row?.subagent_agent_id).toBe("agent-xyz");
+  } finally {
+    db.close();
+  }
+});
+
+test("An event without tool_use_id leaves events.tool_use_id NULL", async () => {
+  // SessionStart / UserPromptSubmit / Notification payloads don't carry
+  // tool_use_id; the column stays NULL so the partial-index
+  // `WHERE tool_use_id IS NOT NULL` predicate keeps the index selective.
+  const code = await fireViaLauncher("any-session", {
+    hook_event_name: "UserPromptSubmit",
+    session_id: "sess-ups-notuid",
+    cwd: "/tmp",
+    prompt: "hi",
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT tool_use_id FROM events WHERE session_id = 'sess-ups-notuid'",
+      )
+      .get() as { tool_use_id: string | null } | null;
+    expect(row?.tool_use_id).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
+test("A non-string tool_use_id (defensive path) lands NULL, hook still exits 0", async () => {
+  // Claude Code shape drift: a non-string `tool_use_id` falls through
+  // extractToolUseId's defensive return and the column stays NULL. The
+  // exit-0 contract is preserved.
+  const code = await fireViaLauncher("any-session", {
+    hook_event_name: "PreToolUse",
+    session_id: "sess-bad-tuid",
+    tool_name: "Read",
+    tool_use_id: 42, // wrong shape
+    tool_input: { file_path: "/x" },
+  });
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT tool_use_id FROM events WHERE session_id = 'sess-bad-tuid'",
+      )
+      .get() as { tool_use_id: string | null } | null;
+    expect(row?.tool_use_id).toBeNull();
+  } finally {
+    db.close();
+  }
+});

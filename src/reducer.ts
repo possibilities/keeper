@@ -1696,7 +1696,7 @@ export function drain(db: Database, batchSize = DEFAULT_BATCH_SIZE): number {
               stop_hook_active, data, subagent_agent_id, spawn_name,
               start_time, slash_command, skill_name,
               planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-              planctl_subject_present
+              planctl_subject_present, tool_use_id
          FROM events
         WHERE id > ?
         ORDER BY id ASC

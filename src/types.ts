@@ -136,6 +136,18 @@ export interface Event {
    * mirrors jobctl's `subject is None` skip gate.
    */
   planctl_subject_present: number | null;
+  /**
+   * Anthropic tool_use correlator string (`toolu_...`) pulled out of every
+   * event payload's `data.tool_use_id` by
+   * {@link import("./derivers").extractToolUseId}. Populated on every
+   * Pre/PostToolUse + PostToolUseFailure row across ALL tools (Bash, Read,
+   * Edit, Agent, …) when the payload carries it; NULL on every other event
+   * row and on rows whose payload omits / misshapes the field. Indexed via a
+   * partial index `WHERE tool_use_id IS NOT NULL` so the sparse column scans
+   * cheaply. Bridges the Pre/PostToolUse → SubagentStart/Stop join in the
+   * `subagent_invocations` projection (schema v17).
+   */
+  tool_use_id: string | null;
 }
 
 /**
@@ -252,6 +264,46 @@ export interface EmbeddedJob {
   created_at: number;
   updated_at: number;
   last_event_id: number;
+}
+
+/**
+ * One row of the `subagent_invocations` peer-table projection (schema v17).
+ * Folded from the `Pre/PostToolUse:Agent` + `SubagentStart/Stop` event
+ * quartet by the reducer (task .3 — this task adds the schema slot and the
+ * `extractToolUseId` bridge column but no reducer cases yet, so the table
+ * stays empty until task .3 lands the live folds + the v16→v17 rewind
+ * re-drains).
+ *
+ * Composite primary key `(job_id, agent_id, turn_seq)` mirrors jobctl's
+ * Python reference (`apps/cli_common/cli_common/subagent_invocations.py`)
+ * minus the `tokens` / `tool_use_count` fields. `turn_seq` is the per-job
+ * monotone turn counter so re-entrant subagents within a session land on
+ * distinct rows.
+ *
+ * Defaults match the zero-event projection: `status='running'` is the
+ * SubagentStart-time value (a row is created when SubagentStart folds; it
+ * flips to `'ok'` or `'error'` on SubagentStop). `prompt_chars` defaults to
+ * 0 so a row created by SubagentStart before its matching PreToolUse:Agent
+ * row reads zero — task .3 backfills it from the PreToolUse:Agent payload
+ * via the `tool_use_id` bridge.
+ *
+ * `last_event_id` bumps on every UPDATE so the wire collection's diff
+ * version semantics emit patch frames as the row transitions
+ * `running → ok` / `running → error` and `duration_ms` populates.
+ */
+export interface SubagentInvocation {
+  job_id: string;
+  agent_id: string;
+  turn_seq: number;
+  ts: number;
+  tool_use_id: string | null;
+  subagent_type: string | null;
+  description: string | null;
+  prompt_chars: number;
+  status: "running" | "ok" | "error";
+  duration_ms: number | null;
+  last_event_id: number;
+  updated_at: number;
 }
 
 /**

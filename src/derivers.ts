@@ -171,6 +171,32 @@ export function planVerbRefFromSpawnName(
 }
 
 /**
+ * Extract the `tool_use_id` correlator from any event payload's `data`
+ * blob. Hook-side gated only on `data.tool_use_id` being a non-empty
+ * string — no event-name / tool-name filter. Pre/PostToolUse and
+ * PostToolUseFailure on every tool (Bash, Read, Edit, Agent, …) all
+ * carry the field and all populate the projection column; the broader
+ * footprint is intentional (canonical id-keyed correlator, reusable for
+ * future tool-keyed projections beyond Agent/subagent).
+ *
+ * Mirrors {@link extractSkillName}'s shape-defensive contract: a missing
+ * field, a non-string field, or an empty-string field all return `null`;
+ * never throws past the caller (the hook's exit-0 contract is
+ * non-negotiable). Pure function of the parsed `data` object so the
+ * v16→v17 migration backfill, the live hook write, and a future re-fold
+ * all derive byte-identically (re-fold determinism).
+ */
+export function extractToolUseId(data: unknown): string | null {
+  if (data === null || typeof data !== "object") {
+    return null;
+  }
+  const candidate = (data as Record<string, unknown>).tool_use_id;
+  return typeof candidate === "string" && candidate.length > 0
+    ? candidate
+    : null;
+}
+
+/**
  * Anchored task-notification-killed envelope match. The strict shape:
  *
  *   `<task-notification>` ... `<status>killed</status>` ...
