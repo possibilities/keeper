@@ -1251,6 +1251,16 @@ function migrate(db: Database): void {
       db.run("ANALYZE events");
     }
 
+    // v14→v15: registers the `git_status` table (created above by the
+    // unconditional `CREATE_GIT_STATUS` bootstrap block). The CREATE TABLE
+    // IF NOT EXISTS is idempotent and runs on every boot — no ALTER step
+    // is required here, so this block is a comment-only no-op that
+    // documents what the v15 stamp gates. Without this note the bare
+    // SCHEMA_VERSION = 15 bump would violate the CLAUDE.md invariant
+    // ("Bump SCHEMA_VERSION only when adding an ALTER block to
+    // migrate()"); a future real v14→v15 ALTER would have to land
+    // alongside this comment's removal.
+
     // v15→v16: project `last_validated_at` through the epics row. Nullable
     // (no DEFAULT) — a missing field on the planctl JSON is the honest
     // zero-event reading. Idempotent ADD COLUMN, NO backfill, NO
