@@ -75,6 +75,7 @@ function insertEvent(
     planctl_epic_id: overrides.planctl_epic_id ?? null,
     planctl_task_id: overrides.planctl_task_id ?? null,
     planctl_subject_present: overrides.planctl_subject_present ?? null,
+    tool_use_id: overrides.tool_use_id ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -82,8 +83,8 @@ function insertEvent(
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-       planctl_subject_present
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       planctl_subject_present, tool_use_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -108,6 +109,7 @@ function insertEvent(
       row.planctl_epic_id,
       row.planctl_task_id,
       row.planctl_subject_present,
+      row.tool_use_id,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -2947,4 +2949,618 @@ test("syncPlanctlLinks: re-fold determinism (rewind + DELETE + drain reproduces 
   const jobsAfter = db.query("SELECT * FROM jobs ORDER BY job_id").all();
   expect(epicsAfter).toEqual(epicsBefore);
   expect(jobsAfter).toEqual(jobsBefore);
+});
+
+// ---------------------------------------------------------------------------
+// subagent_invocations projection (schema v17, fn-600 task .3)
+//
+// Reducer arms wire SubagentStart, SubagentStop, PostToolUse:Agent, and
+// PostToolUseFailure:Agent into the peer-table projection via the per-event
+// helpers from `src/subagent-invocations.ts`. All writes ride the same
+// `BEGIN IMMEDIATE` as the cursor advance — re-fold determinism + safe
+// no-op fold on every orphan/malformed branch.
+// ---------------------------------------------------------------------------
+
+/** Read every subagent_invocations row for a job, sorted (agent_id, turn_seq). */
+function getSubagentRows(jobId = "sess-a") {
+  return db
+    .query(
+      `SELECT job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+              description, prompt_chars, status, duration_ms,
+              last_event_id, updated_at
+         FROM subagent_invocations
+        WHERE job_id = ?
+        ORDER BY agent_id, turn_seq`,
+    )
+    .all(jobId) as {
+    job_id: string;
+    agent_id: string;
+    turn_seq: number;
+    ts: number;
+    tool_use_id: string | null;
+    subagent_type: string | null;
+    description: string | null;
+    prompt_chars: number;
+    status: string;
+    duration_ms: number | null;
+    last_event_id: number;
+    updated_at: number;
+  }[];
+}
+
+test("SubagentStart opens a row with status='running' and seeds subagent_type from agent_type", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  const startId = insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-1",
+    agent_type: "Explore",
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({
+    job_id: "sess-a",
+    agent_id: "agent-1",
+    turn_seq: 0,
+    tool_use_id: null,
+    subagent_type: "Explore",
+    description: null,
+    prompt_chars: 0,
+    status: "running",
+    duration_ms: null,
+    last_event_id: startId,
+  });
+  expect(getCursor()).toBe(startId);
+});
+
+test("SubagentStart with a NULL agent_id is a safe no-op (cursor still advances)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  const startId = insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: null,
+  });
+  drainAll();
+  expect(getSubagentRows()).toHaveLength(0);
+  expect(getCursor()).toBe(startId);
+});
+
+test("SubagentStart with empty agent_type seeds subagent_type as NULL (PreToolUse-wins applies later)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-2",
+    agent_type: "",
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]?.subagent_type).toBeNull();
+});
+
+test("SubagentStart re-entrant on same agent_id increments turn_seq", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-r",
+    agent_type: "Explore",
+    ts: 1.0,
+  });
+  insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-r",
+    ts: 1.5,
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-r",
+    agent_type: "Explore",
+    ts: 2.0,
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows.map((r) => r.turn_seq)).toEqual([0, 1]);
+});
+
+test("SubagentStop closes the latest open turn with duration_ms in ms", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-d",
+    agent_type: "Explore",
+    ts: 100.0,
+  });
+  const stopId = insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-d",
+    ts: 102.5,
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({
+    status: "ok",
+    duration_ms: 2500,
+    last_event_id: stopId,
+  });
+});
+
+test("SubagentStop with no open turn is a safe no-op", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  const stopId = insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "ghost",
+  });
+  drainAll();
+  expect(getSubagentRows()).toHaveLength(0);
+  expect(getCursor()).toBe(stopId);
+});
+
+test("SubagentStop with NULL agent_id is a safe no-op", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  const stopId = insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: null,
+  });
+  drainAll();
+  expect(getSubagentRows()).toHaveLength(0);
+  expect(getCursor()).toBe(stopId);
+});
+
+test("PostToolUse:Agent folds PreToolUse metadata onto the turn-0 row via the bridge", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  // SubagentStart seeds turn-0 with subagent_type='Explore'.
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-X",
+    agent_type: "Explore",
+    ts: 10.0,
+  });
+  // PreToolUse:Agent carries the description + prompt + subagent_type.
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_abc",
+    data: JSON.stringify({
+      tool_use_id: "toolu_abc",
+      tool_input: {
+        description: "Explore the codebase for X",
+        prompt: "Find every usage of the X function and summarize.",
+        subagent_type: "Explore",
+      },
+    }),
+  });
+  // PostToolUse:Agent — bridges via subagent_agent_id column.
+  const postId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_abc",
+    subagent_agent_id: "agent-X",
+    data: JSON.stringify({
+      tool_use_id: "toolu_abc",
+      tool_response: { agentId: "agent-X" },
+    }),
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({
+    agent_id: "agent-X",
+    turn_seq: 0,
+    tool_use_id: "toolu_abc",
+    subagent_type: "Explore",
+    description: "Explore the codebase for X",
+    prompt_chars: "Find every usage of the X function and summarize.".length,
+    status: "ok",
+    last_event_id: postId,
+  });
+});
+
+test("PostToolUse:Agent PreToolUse-wins precedence: empty PreToolUse subagent_type does not overwrite seeded value", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  // Seed turn-0 with subagent_type='Explore' from SubagentStart.
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-Y",
+    agent_type: "Explore",
+  });
+  // PreToolUse:Agent payload carries an EMPTY-string subagent_type — must NOT
+  // overwrite the SubagentStart-seeded 'Explore'.
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_xyz",
+    data: JSON.stringify({
+      tool_use_id: "toolu_xyz",
+      tool_input: { subagent_type: "" },
+    }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_xyz",
+    subagent_agent_id: "agent-Y",
+    data: JSON.stringify({
+      tool_use_id: "toolu_xyz",
+      tool_response: { agentId: "agent-Y" },
+    }),
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows[0]?.subagent_type).toBe("Explore");
+});
+
+test("PostToolUse:Agent uses JSON-fallback bridge when subagent_agent_id column is NULL (pre-fn-390 row)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-legacy",
+    agent_type: "Explore",
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_leg",
+    data: JSON.stringify({
+      tool_use_id: "toolu_leg",
+      tool_input: { description: "do work" },
+    }),
+  });
+  // subagent_agent_id NULL — must fall back to data.tool_response.agentId.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_leg",
+    subagent_agent_id: null,
+    data: JSON.stringify({
+      tool_use_id: "toolu_leg",
+      tool_response: { agentId: "agent-legacy" },
+    }),
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]?.description).toBe("do work");
+  expect(rows[0]?.status).toBe("ok");
+});
+
+test("PostToolUse:Agent with no resolvable bridge is a safe no-op", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-Z",
+  });
+  // Neither subagent_agent_id nor data.tool_response.agentId resolve.
+  const postId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_noresolve",
+    subagent_agent_id: null,
+    data: JSON.stringify({ tool_use_id: "toolu_noresolve" }),
+  });
+  drainAll();
+  // Row stays at SubagentStart's seed — unchanged.
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({
+    status: "running",
+    tool_use_id: null,
+    description: null,
+  });
+  expect(getCursor()).toBe(postId);
+});
+
+test("PostToolUse:Agent with no turn-0 row (PostToolUse-before-SubagentStart ordering) is a safe no-op", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_early",
+    data: JSON.stringify({
+      tool_use_id: "toolu_early",
+      tool_input: { description: "early" },
+    }),
+  });
+  const postId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_early",
+    subagent_agent_id: "agent-noseed",
+    data: JSON.stringify({
+      tool_use_id: "toolu_early",
+      tool_response: { agentId: "agent-noseed" },
+    }),
+  });
+  drainAll();
+  expect(getSubagentRows()).toHaveLength(0);
+  expect(getCursor()).toBe(postId);
+});
+
+test("PostToolUseFailure:Agent is a safe no-op (SubagentStop carries status='ok')", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-F",
+    agent_type: "Explore",
+    ts: 50.0,
+  });
+  const failId = insertEvent({
+    hook_event: "PostToolUseFailure",
+    tool_name: "Agent",
+    tool_use_id: "toolu_fail",
+    data: JSON.stringify({ tool_use_id: "toolu_fail" }),
+  });
+  insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-F",
+    ts: 51.0,
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ status: "ok", duration_ms: 1000 });
+  // Failure event still advanced the cursor — SubagentStop advanced past it.
+  expect(getCursor()).toBeGreaterThanOrEqual(failId);
+});
+
+test("PostToolUse:Agent fires BEFORE SubagentStop (Task call ordering); SubagentStop still closes the row", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-O",
+    agent_type: "Explore",
+    ts: 100.0,
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_O",
+    data: JSON.stringify({
+      tool_use_id: "toolu_O",
+      tool_input: { description: "ordering test", prompt: "hello world" },
+    }),
+  });
+  // PostToolUse:Agent lands FIRST — flips status to 'ok'.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_O",
+    subagent_agent_id: "agent-O",
+    ts: 102.0,
+    data: JSON.stringify({
+      tool_use_id: "toolu_O",
+      tool_response: { agentId: "agent-O" },
+    }),
+  });
+  // SubagentStop lands SECOND — must still close (gate is duration_ms IS
+  // NULL, NOT status='running').
+  insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-O",
+    ts: 102.5,
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({
+    status: "ok",
+    duration_ms: 2500,
+    description: "ordering test",
+    prompt_chars: "hello world".length,
+  });
+});
+
+test("PostToolUse:Agent with malformed JSON data folds to safe no-op (no throw)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-M",
+  });
+  // Malformed JSON in data — resolveBridgeAgentId returns null. Reducer must
+  // NOT throw; cursor advances.
+  const postId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_M",
+    subagent_agent_id: null,
+    data: "{not valid json",
+  });
+  drainAll();
+  expect(getCursor()).toBe(postId);
+  // Row stays at SubagentStart seed — unchanged.
+  expect(getSubagentRows()[0]?.status).toBe("running");
+});
+
+test("Bridge lookup isolates session_id — cross-job tool_use_id collision does not contaminate", () => {
+  // Two separate sessions, same tool_use_id. The PreToolUse-payload bridge
+  // must scope to session_id, not just tool_use_id.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-b" });
+  // sess-a's subagent.
+  insertEvent({
+    hook_event: "SubagentStart",
+    session_id: "sess-a",
+    agent_id: "agent-a",
+    agent_type: "Explore",
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    session_id: "sess-a",
+    tool_name: "Agent",
+    tool_use_id: "toolu_COLLIDE",
+    data: JSON.stringify({
+      tool_use_id: "toolu_COLLIDE",
+      tool_input: { description: "from session a" },
+    }),
+  });
+  // sess-b's subagent — DIFFERENT description, same tool_use_id.
+  insertEvent({
+    hook_event: "SubagentStart",
+    session_id: "sess-b",
+    agent_id: "agent-b",
+    agent_type: "Explore",
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    session_id: "sess-b",
+    tool_name: "Agent",
+    tool_use_id: "toolu_COLLIDE",
+    data: JSON.stringify({
+      tool_use_id: "toolu_COLLIDE",
+      tool_input: { description: "from session b" },
+    }),
+  });
+  // sess-a's PostToolUse — must lift sess-a's description, NOT sess-b's.
+  insertEvent({
+    hook_event: "PostToolUse",
+    session_id: "sess-a",
+    tool_name: "Agent",
+    tool_use_id: "toolu_COLLIDE",
+    subagent_agent_id: "agent-a",
+    data: JSON.stringify({
+      tool_use_id: "toolu_COLLIDE",
+      tool_response: { agentId: "agent-a" },
+    }),
+  });
+  // sess-b's PostToolUse.
+  insertEvent({
+    hook_event: "PostToolUse",
+    session_id: "sess-b",
+    tool_name: "Agent",
+    tool_use_id: "toolu_COLLIDE",
+    subagent_agent_id: "agent-b",
+    data: JSON.stringify({
+      tool_use_id: "toolu_COLLIDE",
+      tool_response: { agentId: "agent-b" },
+    }),
+  });
+  drainAll();
+  const sessA = getSubagentRows("sess-a");
+  const sessB = getSubagentRows("sess-b");
+  expect(sessA[0]?.description).toBe("from session a");
+  expect(sessB[0]?.description).toBe("from session b");
+});
+
+test("subagent_invocations re-fold is byte-identical (rewind + DELETE + drain)", () => {
+  // Seed a full quartet plus a still-open second subagent for variety.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-A",
+    agent_type: "Explore",
+    ts: 10.0,
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_A",
+    data: JSON.stringify({
+      tool_use_id: "toolu_A",
+      tool_input: { description: "AAA", prompt: "p" },
+    }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_A",
+    subagent_agent_id: "agent-A",
+    data: JSON.stringify({
+      tool_use_id: "toolu_A",
+      tool_response: { agentId: "agent-A" },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-A",
+    ts: 12.0,
+  });
+  // Still-open second agent — must round-trip as status='running'.
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-B",
+    agent_type: "Build",
+    ts: 20.0,
+  });
+  drainAll();
+  const before = db
+    .query(
+      `SELECT * FROM subagent_invocations ORDER BY job_id, agent_id, turn_seq`,
+    )
+    .all();
+  // Rewind + DELETE + re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM subagent_invocations");
+  drainAll();
+  const after = db
+    .query(
+      `SELECT * FROM subagent_invocations ORDER BY job_id, agent_id, turn_seq`,
+    )
+    .all();
+  expect(after).toEqual(before);
+});
+
+test("subagent_invocations coexists with planctl_links fan-out — both projections populate, both deterministic on re-fold", () => {
+  // fn-598 + fn-600 coexistence: a session that runs both planctl invocations
+  // and Agent calls keeps both projections populated; both reproduce on
+  // re-fold.
+  insertEvent({ hook_event: "SessionStart" });
+  // A planctl invocation (fn-598 fan-out into jobs.epic_links /
+  // epics.job_links).
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    planctl_op: "epic-create",
+    planctl_target: "fn-1-foo",
+    planctl_epic_id: "fn-1-foo",
+    planctl_subject_present: 1,
+  });
+  // /plan:plan opener (PreToolUse:Skill) — opens the window for the planctl
+  // event above to be classified as a creator edge.
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Skill",
+    skill_name: "plan:plan",
+  });
+  // An Agent subagent invocation (fn-600 projection).
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-C",
+    agent_type: "Explore",
+    ts: 30.0,
+  });
+  insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-C",
+    ts: 31.0,
+  });
+  drainAll();
+
+  // Both projections populated.
+  const subagentBefore = db
+    .query(
+      `SELECT * FROM subagent_invocations ORDER BY job_id, agent_id, turn_seq`,
+    )
+    .all();
+  const jobsBefore = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  const epicsBefore = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  expect(subagentBefore.length).toBeGreaterThan(0);
+  expect(jobsBefore.length).toBeGreaterThan(0);
+
+  // Re-fold from scratch — both projections reproduce byte-identically.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM subagent_invocations");
+  drainAll();
+  const subagentAfter = db
+    .query(
+      `SELECT * FROM subagent_invocations ORDER BY job_id, agent_id, turn_seq`,
+    )
+    .all();
+  const jobsAfter = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  expect(subagentAfter).toEqual(subagentBefore);
+  expect(jobsAfter).toEqual(jobsBefore);
+  expect(epicsAfter).toEqual(epicsBefore);
 });

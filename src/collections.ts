@@ -269,15 +269,67 @@ export const GIT_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
+ * The `subagent_invocations` descriptor — per-job timeline of `Agent` (Task)
+ * tool invocations and their `SubagentStart` / `SubagentStop` lifecycle. The
+ * peer-table projection lives in schema v17 (`src/db.ts`'s
+ * `CREATE_SUBAGENT_INVOCATIONS`) and is populated by the reducer arms in
+ * `projectSubagentInvocationsRow` (`src/reducer.ts`). Composite pk
+ * `(job_id, agent_id, turn_seq)` — re-entrant subagents within a session land
+ * on distinct rows via the per-job monotone `turn_seq` counter.
+ *
+ * Composite-PK note: the descriptor's `pk` field expects a single column name
+ * (the diff-tick membership token + `selectByIds` lookup both index on it).
+ * `job_id` is the consumer-meaningful identity for the wire (every
+ * subscribe currently filters by `job_id`), so it carries the role; the
+ * other two pk columns ride in `columns` for display. A future
+ * detail-page subscribe on a single turn would need a composite-pk extension
+ * to the descriptor — out of scope for fn-600 (the wire surface here is
+ * per-job timeline, not per-turn detail).
+ *
+ * `version: 'last_event_id'` — the reducer bumps this on every UPDATE so the
+ * wire collection's diff fires patch frames as a row transitions
+ * `running → ok` and `duration_ms` populates on SubagentStop. `defaultSort:
+ * { ts ASC }` matches the chronological reading order. No `defaultFilter` /
+ * `defaultClause` — a subscribe returns every per-job row by default, and
+ * the UI filters/sorts on the descriptor-exposed columns.
+ */
+export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
+  name: "subagent_invocations",
+  table: "subagent_invocations",
+  columns: [
+    "job_id",
+    "agent_id",
+    "turn_seq",
+    "ts",
+    "tool_use_id",
+    "subagent_type",
+    "description",
+    "prompt_chars",
+    "status",
+    "duration_ms",
+    "last_event_id",
+    "updated_at",
+  ],
+  pk: "job_id",
+  version: "last_event_id",
+  sortable: new Set(["ts", "turn_seq", "duration_ms"]),
+  defaultSort: { column: "ts", dir: "asc" },
+  filters: { job_id: "job_id" },
+  jsonColumns: new Set(),
+};
+
+/**
  * The registry, keyed by wire-facing collection name. `jobs` + the `epics`
  * plan collection (which embeds its tasks + plan/close-verb jobs as JSON-array
  * columns — the standalone `tasks` collection was dropped in schema v7 — and
- * carries `approval` as a real column as of schema v13).
+ * carries `approval` as a real column as of schema v13) + `git` + the
+ * `subagent_invocations` per-job Agent-timeline projection (schema v17).
  */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
   [EPICS_DESCRIPTOR.name, EPICS_DESCRIPTOR],
   [GIT_DESCRIPTOR.name, GIT_DESCRIPTOR],
+  [SUBAGENT_INVOCATIONS_DESCRIPTOR.name, SUBAGENT_INVOCATIONS_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

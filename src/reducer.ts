@@ -79,6 +79,12 @@ import {
   normalizePlanctlOp,
   type PlanWindow,
 } from "./plan-classifier";
+import {
+  extractTurnSeq,
+  findBridgePreToolUse,
+  findOpenTurnForStop,
+  resolveBridgeAgentId,
+} from "./subagent-invocations";
 import type { Event } from "./types";
 
 /**
@@ -709,6 +715,214 @@ function projectGitStatus(db: Database, event: Event): void {
       event.ts,
     ],
   );
+}
+
+/**
+ * Apply the `subagent_invocations` projection for one event. Runs INSIDE the
+ * open transaction opened by {@link applyEvent}; performs zero cursor work.
+ *
+ * Wires the parser-port from `src/subagent-invocations.ts` into the per-event
+ * reducer. Four event shapes feed this projection:
+ *
+ * - `SubagentStart` opens a new turn-N row for the `(job_id, agent_id)` pair
+ *   with `status='running'`, `duration_ms=NULL`, `subagent_type` seeded from
+ *   `event.agent_type` (NULL when absent — PreToolUse-wins precedence applies
+ *   later on the PostToolUse:Agent fold).
+ * - `SubagentStop` closes the latest open turn for the pair — UPDATE sets
+ *   `duration_ms = round((event.ts - row.ts) * 1000)` (events.ts is REAL
+ *   seconds, duration_ms is integer ms — matches Python's `int(float(ts_raw)
+ *   * 1000)` convention). Sets `status='ok'` unless already terminal (`failed`
+ *   / `unknown`). Gates on `duration_ms IS NULL` ALONE — never also on
+ *   `status='running'`; PostToolUse:Agent legitimately flips status to `'ok'`
+ *   BEFORE SubagentStop lands for Task calls (Anthropic-confirmed; fn-480).
+ * - `PostToolUse` with `tool_name='Agent'` resolves the `(session_id,
+ *   tool_use_id)` bridge to an `agent_id` via {@link resolveBridgeAgentId},
+ *   then folds PreToolUse metadata (description, prompt_chars, subagent_type)
+ *   onto the turn-0 row via the PreToolUse-wins precedence rule (a non-empty
+ *   PreToolUse `subagent_type` overwrites the SubagentStart seed; an empty
+ *   value leaves the seed in place).
+ * - `PostToolUseFailure` with `tool_name='Agent'` is a Python-contract safe
+ *   no-op — no `tool_response` means no bridge resolvable, so the lifecycle
+ *   correctness rests on the matching SubagentStop's `status='ok'` write.
+ *
+ * **Never throws inside the transaction** — a throw rolls back the cursor
+ * and wedges the reducer. Every arm guards lookups and returns silently on
+ * the safe-default branch (orphan stops, malformed data, missing bridge, no
+ * turn-0 row, etc.). The cursor still advances upstream.
+ */
+function projectSubagentInvocationsRow(db: Database, event: Event): void {
+  const ts = event.ts;
+  const jobId = event.session_id;
+
+  switch (event.hook_event) {
+    case "SubagentStart": {
+      // NULL agent_id → safe no-op. Mirrors Python's
+      // `if not agent_id: return None` drop.
+      const agentId = event.agent_id;
+      if (agentId == null || agentId.length === 0) {
+        return;
+      }
+      const turnSeq = extractTurnSeq(db, jobId, agentId);
+      const seedType =
+        typeof event.agent_type === "string" && event.agent_type.length > 0
+          ? event.agent_type
+          : null;
+      // INSERT a fresh row at the seeded turn_seq. `prompt_chars=0` matches
+      // Python's `_make_turn_entry` default (a PostToolUse:Agent fold lands
+      // the real value via the PreToolUse bridge later). `status='running'`
+      // matches the schema default. NEVER OR IGNORE here — extractTurnSeq's
+      // MAX(turn_seq)+1 ensures a fresh row per SubagentStart, and a
+      // primary-key collision would be a deterministic re-fold bug worth
+      // surfacing rather than silently swallowing.
+      db.run(
+        `INSERT INTO subagent_invocations (
+           job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+           description, prompt_chars, status, duration_ms,
+           last_event_id, updated_at
+         ) VALUES (?, ?, ?, ?, NULL, ?, NULL, 0, 'running', NULL, ?, ?)`,
+        [jobId, agentId, turnSeq, ts, seedType, event.id, ts],
+      );
+      return;
+    }
+
+    case "SubagentStop": {
+      const agentId = event.agent_id;
+      if (agentId == null || agentId.length === 0) {
+        return;
+      }
+      const openTurnSeq = findOpenTurnForStop(db, jobId, agentId);
+      if (openTurnSeq == null) {
+        // Genuine orphan stop — no matching open turn. Safe no-op.
+        return;
+      }
+      // Read the open row's ts to compute duration_ms = (event.ts - row.ts)
+      // * 1000, rounded to integer ms — Python's `int(float(ts_raw) * 1000)`
+      // convention. Status stays put when already terminal ('failed' /
+      // 'unknown'); otherwise lands 'ok'.
+      const row = db
+        .query(
+          `SELECT ts, status FROM subagent_invocations
+            WHERE job_id = ? AND agent_id = ? AND turn_seq = ?`,
+        )
+        .get(jobId, agentId, openTurnSeq) as {
+        ts: number;
+        status: string;
+      } | null;
+      if (row == null) {
+        // Shouldn't happen — findOpenTurnForStop returned a turn_seq it just
+        // looked up — but a defensive no-op never hurts (re-fold safety).
+        return;
+      }
+      const durationMs = Math.round((ts - row.ts) * 1000);
+      const nextStatus =
+        row.status === "failed" || row.status === "unknown" ? row.status : "ok";
+      db.run(
+        `UPDATE subagent_invocations
+            SET duration_ms = ?, status = ?, last_event_id = ?, updated_at = ?
+          WHERE job_id = ? AND agent_id = ? AND turn_seq = ?`,
+        [durationMs, nextStatus, event.id, ts, jobId, agentId, openTurnSeq],
+      );
+      return;
+    }
+
+    case "PostToolUse": {
+      // Gate on tool_name='Agent' — non-Agent PostToolUse rows have no
+      // subagent_invocations meaning. The dispatcher above already routes
+      // here for any PostToolUse, so we filter at the arm.
+      if (event.tool_name !== "Agent") {
+        return;
+      }
+      const bridgeAgentId = resolveBridgeAgentId({
+        subagent_agent_id: event.subagent_agent_id,
+        data: event.data,
+      });
+      if (bridgeAgentId == null) {
+        return;
+      }
+      // Look up the turn-0 row for the bridged agent_id. A
+      // PostToolUse-before-SubagentStart ordering (theoretical) folds to a
+      // safe no-op — matches Python; we lose description/prompt_chars for
+      // that turn, but SubagentStop's later 'ok' stamp still lands.
+      const row = db
+        .query(
+          `SELECT status, subagent_type FROM subagent_invocations
+            WHERE job_id = ? AND agent_id = ? AND turn_seq = 0`,
+        )
+        .get(jobId, bridgeAgentId) as {
+        status: string;
+        subagent_type: string | null;
+      } | null;
+      if (row == null) {
+        return;
+      }
+
+      // Look up the PreToolUse:Agent metadata via the (session_id,
+      // tool_use_id) bridge. A missing tool_use_id, malformed data, or
+      // no-matching-PreToolUse row all fold to a defensive no-op below.
+      const toolUseId = event.tool_use_id;
+      const pre =
+        toolUseId != null && toolUseId.length > 0
+          ? findBridgePreToolUse(db, jobId, toolUseId)
+          : null;
+
+      // PreToolUse-wins precedence on subagent_type: overwrite the
+      // SubagentStart seed iff the PreToolUse value is a non-empty string.
+      // Mirrors Python's `if subagent_type:` truthiness gate.
+      const nextSubagentType =
+        pre != null &&
+        typeof pre.subagent_type === "string" &&
+        pre.subagent_type.length > 0
+          ? pre.subagent_type
+          : row.subagent_type;
+
+      // Description / prompt_chars come straight from the PreToolUse payload
+      // (truncateDescription already applied inside findBridgePreToolUse).
+      // When no PreToolUse row exists, leave description NULL and
+      // prompt_chars=0 (the SubagentStart seed defaults).
+      const nextDescription = pre != null ? pre.description : null;
+      const nextPromptChars = pre != null ? pre.prompt_chars : 0;
+
+      // Status: set 'ok' unless already terminal ('failed' / 'unknown') —
+      // mirrors SubagentStop's gate. PostToolUse:Agent fires BEFORE
+      // SubagentStop for Task calls (Anthropic-confirmed); this is the
+      // legitimate early-'ok' write.
+      const nextStatus =
+        row.status === "failed" || row.status === "unknown" ? row.status : "ok";
+
+      db.run(
+        `UPDATE subagent_invocations
+            SET tool_use_id = ?, subagent_type = ?, description = ?,
+                prompt_chars = ?, status = ?,
+                last_event_id = ?, updated_at = ?
+          WHERE job_id = ? AND agent_id = ? AND turn_seq = 0`,
+        [
+          toolUseId,
+          nextSubagentType,
+          nextDescription,
+          nextPromptChars,
+          nextStatus,
+          event.id,
+          ts,
+          jobId,
+          bridgeAgentId,
+        ],
+      );
+      return;
+    }
+
+    case "PostToolUseFailure": {
+      // Python contract: PostToolUseFailure carries no `tool_response` so no
+      // bridge is resolvable. Safe no-op; lifecycle correctness rests on
+      // SubagentStop landing 'ok' for the matching agent_id.
+      // (Gated on tool_name='Agent' for symmetry with PostToolUse, though
+      // PostToolUseFailure on non-Agent tools would also be a no-op via
+      // the missing bridge gate.)
+      return;
+    }
+
+    default:
+      return;
+  }
 }
 
 /**
@@ -1540,10 +1754,16 @@ function projectJobsRow(db: Database, event: Event): void {
       break;
 
     default:
-      // PreToolUse, PostToolUse, PostToolUseFailure, Notification,
-      // SubagentStart, SubagentStop, and any unknown forward-compat event:
-      // no lifecycle write. Cursor still advances upstream. (No terminal guard
-      // needed — these branches never write the state column.)
+      // PreToolUse, PostToolUse, PostToolUseFailure, Notification, and any
+      // unknown forward-compat event: no lifecycle write. Cursor still advances
+      // upstream. (No terminal guard needed — these branches never write the
+      // state column.) The `Pre/PostToolUse[Failure]` rows ALSO feed
+      // `projectSubagentInvocationsRow` (via the per-event dispatch in
+      // `applyEvent`); the no-op here is specifically the *jobs* projection.
+      // SubagentStart / SubagentStop, formerly listed here as no-ops, are
+      // dispatched out of `applyEvent` to `projectSubagentInvocationsRow` —
+      // they still never touch `jobs` (no lifecycle column writes), so the
+      // `jobs` arm stays a no-op for them.
       break;
   }
 
@@ -1652,6 +1872,13 @@ export function applyEvent(
       projectGitStatus(db, event);
     } else {
       projectJobsRow(db, event);
+      // The `subagent_invocations` projection rides the same transaction +
+      // cursor advance — every triggering arm is folded inside this open
+      // BEGIN IMMEDIATE so exactly-once-per-event holds across both
+      // projections. Triggering hook_events: SubagentStart, SubagentStop,
+      // PostToolUse (tool_name='Agent'), PostToolUseFailure
+      // (tool_name='Agent'). Every other event is a fast in-fn no-op.
+      projectSubagentInvocationsRow(db, event);
     }
     options.onBeforeCursorAdvance?.(event);
     db.run(
