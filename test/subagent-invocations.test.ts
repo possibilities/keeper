@@ -42,6 +42,7 @@ import {
   extractTurnSeq,
   findBridgePreToolUse,
   findOpenTurnForStop,
+  findPendingPreToolUseForStart,
   resolveBridgeAgentId,
   truncateDescription,
 } from "../src/subagent-invocations";
@@ -158,6 +159,11 @@ function driveEvent(ev: FixtureEvent): void {
   if (ev.hook_event === "SubagentStart") {
     if (!ev.agent_id) return;
     const turnSeq = extractTurnSeq(db, ev.session_id, ev.agent_id);
+    const pendingPre = findPendingPreToolUseForStart(
+      db,
+      ev.session_id,
+      ev.agent_type,
+    );
     db.run(
       `INSERT INTO subagent_invocations (
          job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
@@ -169,10 +175,10 @@ function driveEvent(ev: FixtureEvent): void {
         ev.agent_id,
         turnSeq,
         tsMs,
-        null,
+        pendingPre?.tool_use_id ?? null,
         ev.agent_type ?? null,
-        null,
-        0,
+        pendingPre?.description ?? null,
+        pendingPre?.prompt_chars ?? 0,
         "running",
         null,
         ev.id,
@@ -331,12 +337,16 @@ function projectionRows(): CanonicalRow[] {
 // ---------------------------------------------------------------------------
 
 test("fixture file loads with the expected scale", () => {
-  // Acceptance lists nine edge-case scenarios.
-  expect(FIXTURES.length).toBe(9);
+  // Acceptance lists ten edge-case scenarios (`concurrent-same-type` added
+  // alongside the SubagentStart-time FIFO bridge — pins the deterministic
+  // FIFO assignment when two pending PreToolUse:Agent rows share a
+  // subagent_type within a session).
+  expect(FIXTURES.length).toBe(10);
   const descs = FIXTURES.map((f) => f.desc);
   expect(descs).toContain("clean-close");
   expect(descs).toContain("still-running");
   expect(descs).toContain("orphan-stop");
+  expect(descs).toContain("concurrent-same-type");
   expect(descs).toContain("orphan-failure");
   expect(descs).toContain("post-before-stop");
   expect(descs).toContain("multi-turn");
@@ -711,5 +721,218 @@ describe("findOpenTurnForStop", () => {
       ["sess-x", "agent_pbs", 0, 1.0, 0, "ok", null, 1, 1.0],
     );
     expect(findOpenTurnForStop(db, "sess-x", "agent_pbs")).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findPendingPreToolUseForStart — early FIFO bridge used by SubagentStart.
+// Exercises type-match, FIFO order, already-bound skip, defensive parsing.
+// ---------------------------------------------------------------------------
+
+function insertPre(
+  id: number,
+  sessionId: string,
+  toolUseId: string | null,
+  toolInput: Record<string, unknown> | null,
+  ts: number,
+): void {
+  const data =
+    toolInput === null
+      ? "not-json"
+      : JSON.stringify({ tool_use_id: toolUseId, tool_input: toolInput });
+  db.run(
+    `INSERT INTO events (
+       id, ts, session_id, hook_event, event_type, tool_name, tool_use_id, data
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, ts, sessionId, "PreToolUse", "PreToolUse", "Agent", toolUseId, data],
+  );
+}
+
+function bind(jobId: string, agentId: string, turnSeq: number, toolUseId: string): void {
+  db.run(
+    `INSERT INTO subagent_invocations (
+       job_id, agent_id, turn_seq, ts, tool_use_id, prompt_chars, status,
+       duration_ms, last_event_id, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [jobId, agentId, turnSeq, 1.0, toolUseId, 0, "running", null, 1, 1.0],
+  );
+}
+
+describe("findPendingPreToolUseForStart", () => {
+  test("returns null when no PreToolUse:Agent exists in session", () => {
+    expect(findPendingPreToolUseForStart(db, "sess-empty", "Explore")).toBeNull();
+  });
+
+  test("returns null when agentType is null", () => {
+    insertPre(
+      1,
+      "sess-x",
+      "toolu_1",
+      { description: "d", prompt: "p", subagent_type: "Explore" },
+      1.0,
+    );
+    expect(findPendingPreToolUseForStart(db, "sess-x", null)).toBeNull();
+  });
+
+  test("returns null when agentType is empty string", () => {
+    insertPre(
+      1,
+      "sess-x",
+      "toolu_1",
+      { description: "d", prompt: "p", subagent_type: "Explore" },
+      1.0,
+    );
+    expect(findPendingPreToolUseForStart(db, "sess-x", "")).toBeNull();
+  });
+
+  test("single matching PreToolUse: returns its description / prompt_chars / tool_use_id", () => {
+    insertPre(
+      1,
+      "sess-x",
+      "toolu_solo",
+      {
+        description: "Find auth code",
+        prompt: "Search the codebase",
+        subagent_type: "Explore",
+      },
+      1.0,
+    );
+    expect(findPendingPreToolUseForStart(db, "sess-x", "Explore")).toEqual({
+      description: "Find auth code",
+      prompt_chars: 19,
+      tool_use_id: "toolu_solo",
+    });
+  });
+
+  test("FIFO order: earliest id wins among multiple same-type pending rows", () => {
+    insertPre(
+      1,
+      "sess-x",
+      "toolu_first",
+      { description: "first", prompt: "p1", subagent_type: "Explore" },
+      1.0,
+    );
+    insertPre(
+      2,
+      "sess-x",
+      "toolu_second",
+      { description: "second", prompt: "pp2", subagent_type: "Explore" },
+      2.0,
+    );
+    const result = findPendingPreToolUseForStart(db, "sess-x", "Explore");
+    expect(result?.tool_use_id).toBe("toolu_first");
+    expect(result?.description).toBe("first");
+  });
+
+  test("already-bound tool_use_id is skipped, next unbound wins", () => {
+    insertPre(
+      1,
+      "sess-x",
+      "toolu_first",
+      { description: "first", prompt: "p1", subagent_type: "Explore" },
+      1.0,
+    );
+    insertPre(
+      2,
+      "sess-x",
+      "toolu_second",
+      { description: "second", prompt: "pp2", subagent_type: "Explore" },
+      2.0,
+    );
+    // Bind toolu_first to an existing subagent_invocations row in this session.
+    bind("sess-x", "agent_prev", 0, "toolu_first");
+    const result = findPendingPreToolUseForStart(db, "sess-x", "Explore");
+    expect(result?.tool_use_id).toBe("toolu_second");
+    expect(result?.description).toBe("second");
+  });
+
+  test("type mismatch falls through to next matching row", () => {
+    insertPre(
+      1,
+      "sess-x",
+      "toolu_plan",
+      { description: "plan thing", prompt: "p", subagent_type: "Plan" },
+      1.0,
+    );
+    insertPre(
+      2,
+      "sess-x",
+      "toolu_explore",
+      { description: "explore thing", prompt: "pp", subagent_type: "Explore" },
+      2.0,
+    );
+    expect(findPendingPreToolUseForStart(db, "sess-x", "Explore")).toEqual({
+      description: "explore thing",
+      prompt_chars: 2,
+      tool_use_id: "toolu_explore",
+    });
+  });
+
+  test("cross-session isolation: PreToolUse in sess-A invisible to sess-B lookup", () => {
+    insertPre(
+      1,
+      "sess-A",
+      "toolu_A",
+      { description: "a thing", prompt: "p", subagent_type: "Explore" },
+      1.0,
+    );
+    expect(findPendingPreToolUseForStart(db, "sess-B", "Explore")).toBeNull();
+  });
+
+  test("malformed JSON skipped, next matching row wins", () => {
+    insertPre(1, "sess-x", "toolu_bad", null, 1.0);
+    insertPre(
+      2,
+      "sess-x",
+      "toolu_good",
+      { description: "good", prompt: "p", subagent_type: "Explore" },
+      2.0,
+    );
+    expect(findPendingPreToolUseForStart(db, "sess-x", "Explore")?.tool_use_id).toBe(
+      "toolu_good",
+    );
+  });
+
+  test("missing description in tool_input → result has description: null but tool_use_id set", () => {
+    insertPre(
+      1,
+      "sess-x",
+      "toolu_nodesc",
+      { prompt: "abc", subagent_type: "Explore" },
+      1.0,
+    );
+    expect(findPendingPreToolUseForStart(db, "sess-x", "Explore")).toEqual({
+      description: null,
+      prompt_chars: 3,
+      tool_use_id: "toolu_nodesc",
+    });
+  });
+
+  test("missing prompt → prompt_chars: 0 (not null)", () => {
+    insertPre(
+      1,
+      "sess-x",
+      "toolu_noprompt",
+      { description: "d", subagent_type: "Explore" },
+      1.0,
+    );
+    expect(findPendingPreToolUseForStart(db, "sess-x", "Explore")?.prompt_chars).toBe(0);
+  });
+
+  test("description over 200 chars truncates to DESCRIPTION_MAX_CHARS", () => {
+    insertPre(
+      1,
+      "sess-x",
+      "toolu_long",
+      {
+        description: "x".repeat(DESCRIPTION_MAX_CHARS + 50),
+        prompt: "p",
+        subagent_type: "Explore",
+      },
+      1.0,
+    );
+    expect(
+      findPendingPreToolUseForStart(db, "sess-x", "Explore")?.description?.length,
+    ).toBe(DESCRIPTION_MAX_CHARS);
   });
 });

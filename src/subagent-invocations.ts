@@ -237,6 +237,117 @@ export function findBridgePreToolUse(
 }
 
 /**
+ * Result of {@link findPendingPreToolUseForStart} — the three PreToolUse:Agent
+ * payload fields the SubagentStart fold lifts onto the freshly-inserted
+ * turn-N row. `tool_use_id` is always populated (the lookup uses it as the
+ * binding key); `description` is null when the PreToolUse payload had none.
+ */
+export interface PendingPreToolUseRow {
+  description: string | null;
+  prompt_chars: number;
+  tool_use_id: string;
+}
+
+/**
+ * Early FIFO bridge for the SubagentStart fold. Returns the earliest
+ * `PreToolUse:Agent` event row in this session whose `tool_input.subagent_type`
+ * matches the SubagentStart's `agent_type` AND whose `tool_use_id` has not yet
+ * been bound to any `subagent_invocations` row in this session.
+ *
+ * Why FIFO: at `SubagentStart` time Anthropic hasn't yet emitted the
+ * `(tool_use_id, agent_id)` correlator (that arrives on `PostToolUse:Agent`,
+ * after the subagent closes). So the early bridge is a heuristic — match the
+ * earliest unbound PreToolUse in this session whose `subagent_type` matches
+ * the incoming `agent_type`. Within a session Task dispatch is ordered, so
+ * FIFO assignment is correct in practice. Any mis-assignment self-corrects
+ * when `PostToolUse:Agent` lands and the authoritative `subagent_agent_id`
+ * bridge runs in {@link findBridgePreToolUse} — the canonical overwrite still
+ * wins, so steady-state rows match the no-early-bridge behavior.
+ *
+ * Re-fold determinism: the lookup reads persisted-at-fold-time state only
+ * (events rows ordered by id ASC, projection rows scoped to `job_id`). A
+ * from-scratch re-fold replays events in id-order and reproduces the same
+ * FIFO assignment byte-identically.
+ *
+ * Returns `null` when:
+ * - `agentType` is null / empty (no type to match on; conservative no-lift)
+ * - no PreToolUse:Agent row in this session matches the type and is unbound
+ * - every matching row has malformed `data` JSON (skipped per row)
+ *
+ * NEVER throws — the fold's safe-default contract holds.
+ */
+export function findPendingPreToolUseForStart(
+  db: Database,
+  sessionId: string,
+  agentType: string | null,
+): PendingPreToolUseRow | null {
+  if (agentType == null || agentType.length === 0) {
+    return null;
+  }
+  // Earliest PreToolUse:Agent in this session whose tool_use_id is not yet
+  // bound to any subagent_invocations row for this session (job_id). NOT
+  // EXISTS is the anti-join; the partial idx_events_tool_use_id + the
+  // (session_id, tool_name, hook_event) predicate keep this cheap (one
+  // session's worth of agent-tool calls is tiny). ORDER BY id ASC gives a
+  // total order that matches the fold's own event-replay order, so re-fold
+  // assignment is deterministic.
+  const rows = db
+    .prepare(
+      `SELECT tool_use_id, data
+         FROM events e
+        WHERE e.session_id = ?
+              AND e.hook_event = 'PreToolUse'
+              AND e.tool_name = 'Agent'
+              AND e.tool_use_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM subagent_invocations si
+                   WHERE si.job_id = ?
+                         AND si.tool_use_id = e.tool_use_id
+              )
+        ORDER BY e.id ASC`,
+    )
+    .all(sessionId, sessionId) as { tool_use_id: string; data: string }[];
+
+  for (const row of rows) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.data);
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null) {
+      continue;
+    }
+    const toolInput = (parsed as { tool_input?: unknown }).tool_input;
+    if (typeof toolInput !== "object" || toolInput === null) {
+      continue;
+    }
+    const ti = toolInput as {
+      description?: unknown;
+      prompt?: unknown;
+      subagent_type?: unknown;
+    };
+    if (
+      typeof ti.subagent_type !== "string" ||
+      ti.subagent_type !== agentType
+    ) {
+      continue;
+    }
+    const description =
+      typeof ti.description === "string" && ti.description.length > 0
+        ? truncateDescription(ti.description)
+        : null;
+    const promptChars = typeof ti.prompt === "string" ? ti.prompt.length : 0;
+    return {
+      description,
+      prompt_chars: promptChars,
+      tool_use_id: row.tool_use_id,
+    };
+  }
+  return null;
+}
+
+/**
  * Resolve the `subagent_agent_id` bridge with column-then-JSON fallback.
  * Mirrors Python's `_resolve_bridge_agent_id`
  * (`subagent_invocations.py:240-258`).

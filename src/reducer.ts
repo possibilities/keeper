@@ -99,6 +99,7 @@ import {
   extractTurnSeq,
   findBridgePreToolUse,
   findOpenTurnForStop,
+  findPendingPreToolUseForStart,
   resolveBridgeAgentId,
 } from "./subagent-invocations";
 import type { Event } from "./types";
@@ -802,10 +803,21 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
         typeof event.agent_type === "string" && event.agent_type.length > 0
           ? event.agent_type
           : null;
-      // INSERT a fresh row at the seeded turn_seq. `prompt_chars=0` matches
-      // Python's `_make_turn_entry` default (a PostToolUse:Agent fold lands
-      // the real value via the PreToolUse bridge later). `status='running'`
-      // matches the schema default. NEVER OR IGNORE here — extractTurnSeq's
+      // Early FIFO bridge: lift description / prompt_chars / tool_use_id
+      // from the earliest unbound PreToolUse:Agent in this session whose
+      // subagent_type matches the SubagentStart's agent_type. Surfaces the
+      // description on the board AT START instead of at SubagentStop. The
+      // canonical PostToolUse:Agent path (`subagent_agent_id`-keyed) still
+      // overwrites with the authoritative values on close, so any FIFO
+      // mis-assignment self-corrects. `null` when no type to match on or no
+      // unbound PreToolUse row qualifies — leaves the historical SubagentStart
+      // defaults (NULL / NULL / 0) in place.
+      const pendingPre = findPendingPreToolUseForStart(db, jobId, seedType);
+      const seedToolUseId = pendingPre?.tool_use_id ?? null;
+      const seedDescription = pendingPre?.description ?? null;
+      const seedPromptChars = pendingPre?.prompt_chars ?? 0;
+      // INSERT a fresh row at the seeded turn_seq. `status='running'` matches
+      // the schema default. NEVER OR IGNORE here — extractTurnSeq's
       // MAX(turn_seq)+1 ensures a fresh row per SubagentStart, and a
       // primary-key collision would be a deterministic re-fold bug worth
       // surfacing rather than silently swallowing.
@@ -814,8 +826,19 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
            job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
            description, prompt_chars, status, duration_ms,
            last_event_id, updated_at
-         ) VALUES (?, ?, ?, ?, NULL, ?, NULL, 0, 'running', NULL, ?, ?)`,
-        [jobId, agentId, turnSeq, ts, seedType, event.id, ts],
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', NULL, ?, ?)`,
+        [
+          jobId,
+          agentId,
+          turnSeq,
+          ts,
+          seedToolUseId,
+          seedType,
+          seedDescription,
+          seedPromptChars,
+          event.id,
+          ts,
+        ],
       );
       return;
     }
