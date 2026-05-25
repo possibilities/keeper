@@ -1348,6 +1348,70 @@ test("scanRoot: prunes node_modules/.git so their .planctl trees are skipped", (
   expect(emitted.map((m) => m.id)).toEqual(["fn-7-real"]);
 });
 
+test("scanRoot: primes runtimeStatusCache from state/tasks/ BEFORE the tasks/ loop — first TaskSnapshot carries the on-disk runtime_status (regression: fn-607.F1)", () => {
+  // Boot-path regression: a pre-existing `.planctl/state/tasks/<id>.state.json`
+  // must seed the runtime-status cache before the task definition file is
+  // scanned, so the FIRST emitted TaskSnapshot already carries the correct
+  // `runtime_status`. Pre-fix, scanPlanctlDir iterated only ["epics","tasks"]
+  // and never read state/, so every restart silently lied with "todo" until
+  // the next live state-file write.
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  // Set up the state file FIRST (mirrors the boot path: state file already
+  // exists on disk when the daemon comes up).
+  const planctl = join(tmpDir, ".planctl");
+  mkdirSync(join(planctl, "state", "tasks"), { recursive: true });
+  writeFileSync(
+    join(planctl, "state", "tasks", "fn-1-x.1.state.json"),
+    JSON.stringify({ status: "in_progress" }),
+  );
+
+  // Then the task definition file under the canonical tasks/ tree.
+  writeTask("fn-1-x.1", { epic: "fn-1-x", title: "T" });
+
+  scanRoot(tmpDir, scanner);
+
+  // Exactly one task snapshot, carrying the state-file value, NOT "todo".
+  const taskMsgs = emitted.filter((m) => m.kind === "plan-task");
+  expect(taskMsgs.length).toBe(1);
+  expect(
+    (taskMsgs[0] as { id: string; runtimeStatus: string }).runtimeStatus,
+  ).toBe("in_progress");
+  expect((taskMsgs[0] as { id: string }).id).toBe("fn-1-x.1");
+});
+
+test("scanRoot: invalid runtime_status in a state file skips the cache prime (task reads default 'todo')", () => {
+  // Mirrors the live `task-state` onChange arm's safe-value discipline:
+  // a bad value is logged and NOT written to the cache, so the task falls
+  // through to the planctl default "todo" rather than absorbing garbage.
+  const emitted: PlanMessage[] = [];
+  const logs: string[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    (msg) => logs.push(msg),
+  );
+
+  const planctl = join(tmpDir, ".planctl");
+  mkdirSync(join(planctl, "state", "tasks"), { recursive: true });
+  writeFileSync(
+    join(planctl, "state", "tasks", "fn-1-x.1.state.json"),
+    JSON.stringify({ status: "garbage" }),
+  );
+  writeTask("fn-1-x.1", { epic: "fn-1-x", title: "T" });
+
+  scanRoot(tmpDir, scanner);
+
+  const taskMsgs = emitted.filter((m) => m.kind === "plan-task");
+  expect(taskMsgs.length).toBe(1);
+  expect(
+    (taskMsgs[0] as { id: string; runtimeStatus: string }).runtimeStatus,
+  ).toBe("todo");
+});
+
 // ---------------------------------------------------------------------------
 // (b) Native addon smoke test
 // ---------------------------------------------------------------------------

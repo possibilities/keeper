@@ -591,6 +591,24 @@ export class PlanScanner {
   }
 
   /**
+   * Prime the per-task runtime-status cache from a boot enumeration of
+   * `.planctl/state/tasks/<task_id>.state.json` (called by `scanPlanctlDir`
+   * BEFORE the `tasks/` loop). Pure cache write — does NOT emit a snapshot,
+   * does NOT touch `pathToId`, does NOT touch the on-disk census
+   * ({@link markSeen} — state files are sidecar, not enrolled). The
+   * subsequent `tasks/` loop's `onChange` reads this cache and emits the
+   * task's first `TaskSnapshot` already carrying the correct `runtime_status`,
+   * with no redundant re-emit on a follow-up state-file write.
+   *
+   * The caller has already coerced the value through {@link coerceRuntimeStatus};
+   * this method is the un-policed cache poke. Invalid values are filtered
+   * upstream so the cache only ever holds the four-value enum vocabulary.
+   */
+  primeRuntimeStatus(taskId: string, status: string): void {
+    this.runtimeStatusCache.set(taskId, status);
+  }
+
+  /**
    * Process a delete for `path`. Emits a tombstone so the projection retracts,
    * then drops the change-gate entry (so a re-created file re-emits). A path
    * with no change-gate entry (never folded) emits nothing — nothing to retract.
@@ -1105,11 +1123,103 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
 }
 
 /**
- * Enumerate one `.planctl` dir's `epics/` + `tasks/` `*.json` files and run each
- * through the scanner. A missing `epics/` or `tasks/` subdir is fine (skip). The
+ * Enumerate one `.planctl` dir's `state/tasks/` + `epics/` + `tasks/` files
+ * and run each through the scanner. A missing subdir is fine (skip). The
  * change-gate handles re-emit suppression.
+ *
+ * The `state/tasks/` pass runs FIRST so the per-task runtime-status cache is
+ * primed before any task definition file is read: a state file existing at
+ * daemon boot (planctl's `LocalFileStateStore` writes `<id>.state.json` on
+ * every status transition) would otherwise be ignored until the next live
+ * write touched it, and the projection's `runtime_status` would silently
+ * read the cache-miss default `"todo"` for the entire window. Priming
+ * before the `tasks/` loop means the first `TaskSnapshot` emitted for each
+ * definition already carries the correct `runtime_status` and no redundant
+ * re-emit fires.
+ *
+ * State files are NOT enrolled in the on-disk census (no {@link markSeen}
+ * call) — they are a sidecar projection layered onto task ids that enrol
+ * via their definition file under `tasks/`. The boot-reconciliation sweep
+ * retracts on missing definition files; a sidecar's absence is the cache's
+ * `"todo"` default, not a tombstone.
  */
 function scanPlanctlDir(planctlDir: string, scanner: PlanScanner): void {
+  // Pass 1: prime `runtimeStatusCache` from `state/tasks/*.state.json`. A
+  // missing dir is fine (fresh clone with no state files yet). Each file is
+  // bounded-read + safe-parsed + coerced through the same guard as the live
+  // `task-state` onChange arm, so the cache only holds the four-value enum
+  // vocabulary; malformed JSON / bad-status / oversized files skip-and-log
+  // without poisoning the cache. The cache write is the only side effect:
+  // no snapshot emits here.
+  const stateDir = join(planctlDir, "state", "tasks");
+  let stateNames: string[];
+  try {
+    stateNames = readdirSync(stateDir);
+  } catch {
+    stateNames = []; // No state/tasks/ subdir — nothing to prime.
+  }
+  for (const name of stateNames) {
+    if (!name.endsWith(".state.json")) {
+      continue;
+    }
+    const taskId = name.slice(0, -".state.json".length);
+    if (taskId.length === 0) {
+      continue;
+    }
+    const full = join(stateDir, name);
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(full);
+    } catch (err) {
+      console.error(
+        `[plan-worker] boot scan stat failed for ${full}: ${stringifyErr(err)}`,
+      );
+      continue;
+    }
+    if (!st.isFile() || st.size > MAX_PLAN_FILE_BYTES) {
+      continue;
+    }
+    let text: string;
+    try {
+      text = readFileSync(full, "utf8");
+    } catch (err) {
+      console.error(
+        `[plan-worker] boot scan read failed for ${full}: ${stringifyErr(err)}`,
+      );
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (err) {
+      console.error(
+        `[plan-worker] boot scan malformed JSON in ${full}: ${stringifyErr(err)}`,
+      );
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+    const raw = parsed as { status?: unknown };
+    let primed = true;
+    const coerced = coerceRuntimeStatus(raw.status, (bad) => {
+      // Match the live onChange arm: an invalid value logs and is SKIPPED
+      // (no cache write), so the cache only holds the four-value vocabulary.
+      // The cache miss reads as the planctl default "todo" downstream.
+      console.error(
+        `[plan-worker] boot scan invalid runtime status in ${full}: ${JSON.stringify(bad)}; skipping cache prime`,
+      );
+      primed = false;
+    });
+    if (!primed) {
+      continue;
+    }
+    scanner.primeRuntimeStatus(taskId, coerced);
+  }
+
+  // Pass 2: enumerate the canonical definition trees. Tasks now read the
+  // primed cache so their first emitted snapshot carries the correct
+  // runtime_status.
   for (const collection of ["epics", "tasks"]) {
     const dir = join(planctlDir, collection);
     let names: string[];
