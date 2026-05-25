@@ -44,5 +44,5 @@ No new automated tests; docs change only. Smoke check: read the revised README +
 - [ ] No new DO NOT entries; no new sections; edits are surgical, not narrative.
 
 ## Done summary
-
+Doc edits per spec: README sparse-signals count 7->8 names events.tool_use_id; collection list 2->3 names subagent_invocations (both in 'What keeper is' and Architecture); Architecture events-table sentence cross-refs the eight sparse signals; Inspect section gains a per-job subagent_invocations timeline query and a tool_use_id count query. CLAUDE.md BEGIN IMMEDIATE bullet's projection parenthetical adds subagent_invocations.
 ## Evidence
