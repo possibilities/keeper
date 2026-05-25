@@ -73,5 +73,5 @@ Fixture regeneration is EXPLICIT script call only — never auto-regenerate in C
 - [ ] Cross-job isolation: the `cross-job-tool-use-id-collision` fixture verifies `findBridgePreToolUse` returns null when only the unrelated session has a matching tool_use_id.
 
 ## Done summary
-
+Port jobctl's subagent_invocations parser to src/subagent-invocations.ts as pure per-event helpers (extractTurnSeq, findOpenTurnForStop, findBridgePreToolUse, resolveBridgeAgentId, truncateDescription, canonicalizeRow). The buffer-less design replaces Python's in-memory maps with events-table lookups + persisted-projection reads so re-fold determinism holds. Includes the Python fixture generator, the 9-case golden JSONL, and 39 unit/parity tests passing byte-identically against the Python reference.
 ## Evidence
