@@ -98,6 +98,7 @@ import {
 import {
   extractTurnSeq,
   findBridgePreToolUse,
+  findOpenRunningInGroup,
   findOpenTurnForStop,
   findPendingPreToolUseForStart,
   resolveBridgeAgentId,
@@ -791,6 +792,43 @@ function retractGitStatus(db: Database, event: Event): void {
 }
 
 /**
+ * Sweep open `status='running'` subagent_invocations rows for a job to
+ * `status='unknown'` in a single bulk UPDATE. Called from the SessionEnd and
+ * Killed arms of {@link projectJobsRow} on the proven write path (after the
+ * jobs UPDATE landed), inside the same `BEGIN IMMEDIATE` transaction as the
+ * lifecycle write + cursor advance — exactly-once-per-event holds across both
+ * projections.
+ *
+ * Closes the lifecycle gap for orphaned subagents whose parent session died
+ * before the matching SubagentStop landed: a `running` row whose job is now
+ * `'ended'` or `'killed'` will never close on its own, so we flip its status
+ * to the indeterminate-outcome sentinel `'unknown'`. `duration_ms` stays
+ * NULL — the row truly has no known close time. The terminal-status guard in
+ * {@link projectSubagentInvocationsRow}'s SubagentStop / PostToolUse arms
+ * carves out `'unknown'`, so a late close after the sweep cannot revive the
+ * row to `'ok'`.
+ *
+ * Bulk UPDATE (not a per-row loop) so the sweep is a single SQL statement and
+ * never throws inside the open transaction (CLAUDE.md fold invariant — a
+ * throw rolls back the cursor and wedges the reducer). Matches zero rows in
+ * the common case where every subagent already closed cleanly.
+ */
+function sweepRunningSubagentsToUnknown(
+  db: Database,
+  jobId: string,
+  eventId: number,
+  ts: number,
+): void {
+  db.run(
+    `UPDATE subagent_invocations
+        SET status = 'unknown',
+            last_event_id = ?, updated_at = ?
+      WHERE job_id = ? AND status = 'running'`,
+    [eventId, ts, jobId],
+  );
+}
+
+/**
  * Apply the `subagent_invocations` projection for one event. Runs INSIDE the
  * open transaction opened by {@link applyEvent}; performs zero cursor work.
  *
@@ -804,19 +842,34 @@ function retractGitStatus(db: Database, event: Event): void {
  * - `SubagentStop` closes the latest open turn for the pair — UPDATE sets
  *   `duration_ms = round((event.ts - row.ts) * 1000)` (events.ts is REAL
  *   seconds, duration_ms is integer ms — matches Python's `int(float(ts_raw)
- *   * 1000)` convention). Sets `status='ok'` unless already terminal (`failed`
- *   / `unknown`). Gates on `duration_ms IS NULL` ALONE — never also on
- *   `status='running'`; PostToolUse:Agent legitimately flips status to `'ok'`
- *   BEFORE SubagentStop lands for Task calls (Anthropic-confirmed; fn-480).
+ *   * 1000)` convention). Sets `status='ok'` unless already terminal
+ *   (`failed` / `unknown` / `superseded`). Gates on `duration_ms IS NULL`
+ *   ALONE — never also on `status='running'`; PostToolUse:Agent legitimately
+ *   flips status to `'ok'` BEFORE SubagentStop lands for Task calls
+ *   (Anthropic-confirmed; fn-480).
  * - `PostToolUse` with `tool_name='Agent'` resolves the `(session_id,
  *   tool_use_id)` bridge to an `agent_id` via {@link resolveBridgeAgentId},
  *   then folds PreToolUse metadata (description, prompt_chars, subagent_type)
  *   onto the turn-0 row via the PreToolUse-wins precedence rule (a non-empty
  *   PreToolUse `subagent_type` overwrites the SubagentStart seed; an empty
- *   value leaves the seed in place).
- * - `PostToolUseFailure` with `tool_name='Agent'` is a Python-contract safe
- *   no-op — no `tool_response` means no bridge resolvable, so the lifecycle
- *   correctness rests on the matching SubagentStop's `status='ok'` write.
+ *   value leaves the seed in place). Once `subagent_type` is authoritative,
+ *   scans for OTHER same-`(job_id, subagent_type)` rows still `status='running'`
+ *   with a strictly earlier spawn ts and marks them `status='superseded'`
+ *   in the same transaction (the v1 supersession rule — narrow gate on
+ *   `row.ts < currentRow.ts` keeps the known-limitation false-positive of
+ *   genuine parallel same-type spawns documented but quarantined).
+ * - `PostToolUseFailure` with `tool_name='Agent'` resolves the bridge
+ *   `agent_id` from the indexed `subagent_agent_id` column (the failure
+ *   path carries no `tool_response.agentId`, so the column is the only
+ *   reliable signal). When a matching turn-0 row exists, UPDATEs its
+ *   status to `'failed'`. No terminal-status guard — the failure signal is
+ *   the most authoritative lifecycle outcome we can observe and always
+ *   wins. Orphan failures (no matching row) are a safe no-op.
+ *
+ * Outside this function: SessionEnd and Killed lifecycle events sweep open
+ * `status='running'` rows for the job to `status='unknown'` via
+ * {@link sweepRunningSubagentsToUnknown}, fired from {@link projectJobsRow}
+ * on the proven write path inside the same `BEGIN IMMEDIATE` transaction.
  *
  * **Never throws inside the transaction** — a throw rolls back the cursor
  * and wedges the reducer. Every arm guards lookups and returns silently on
@@ -909,8 +962,18 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
         return;
       }
       const durationMs = Math.round((ts - row.ts) * 1000);
+      // Terminal-status guard includes `superseded` alongside `failed` /
+      // `unknown`: a late SubagentStop landing on a row already marked
+      // superseded by a peer's PostToolUse:Agent arm must NOT flip it back
+      // to `ok`. The supersession signal is intentionally sticky — it
+      // declares the row's lifecycle was overtaken by a later same-type
+      // sibling and must outlive any subsequent close.
       const nextStatus =
-        row.status === "failed" || row.status === "unknown" ? row.status : "ok";
+        row.status === "failed" ||
+        row.status === "unknown" ||
+        row.status === "superseded"
+          ? row.status
+          : "ok";
       db.run(
         `UPDATE subagent_invocations
             SET duration_ms = ?, status = ?, last_event_id = ?, updated_at = ?
@@ -937,15 +1000,19 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
       // Look up the turn-0 row for the bridged agent_id. A
       // PostToolUse-before-SubagentStart ordering (theoretical) folds to a
       // safe no-op — matches Python; we lose description/prompt_chars for
-      // that turn, but SubagentStop's later 'ok' stamp still lands.
+      // that turn, but SubagentStop's later 'ok' stamp still lands. Also
+      // selects `ts` (the SubagentStart spawn ts) for the supersession scan
+      // below — the scan's `ts < ?` gate uses this row's spawn ts, NOT the
+      // current event's ts.
       const row = db
         .query(
-          `SELECT status, subagent_type FROM subagent_invocations
+          `SELECT status, subagent_type, ts FROM subagent_invocations
             WHERE job_id = ? AND agent_id = ? AND turn_seq = 0`,
         )
         .get(jobId, bridgeAgentId) as {
         status: string;
         subagent_type: string | null;
+        ts: number;
       } | null;
       if (row == null) {
         return;
@@ -977,12 +1044,19 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
       const nextDescription = pre != null ? pre.description : null;
       const nextPromptChars = pre != null ? pre.prompt_chars : 0;
 
-      // Status: set 'ok' unless already terminal ('failed' / 'unknown') —
-      // mirrors SubagentStop's gate. PostToolUse:Agent fires BEFORE
-      // SubagentStop for Task calls (Anthropic-confirmed); this is the
-      // legitimate early-'ok' write.
+      // Status: set 'ok' unless already terminal ('failed' / 'unknown' /
+      // 'superseded') — mirrors SubagentStop's gate. PostToolUse:Agent fires
+      // BEFORE SubagentStop for Task calls (Anthropic-confirmed); this is
+      // the legitimate early-'ok' write. The `superseded` carve-out keeps a
+      // late PostToolUse:Agent (e.g. for a row already marked superseded by
+      // a later same-type sibling's bridge fold) from flipping the
+      // supersession signal away.
       const nextStatus =
-        row.status === "failed" || row.status === "unknown" ? row.status : "ok";
+        row.status === "failed" ||
+        row.status === "unknown" ||
+        row.status === "superseded"
+          ? row.status
+          : "ok";
 
       db.run(
         `UPDATE subagent_invocations
@@ -1002,16 +1076,93 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
           bridgeAgentId,
         ],
       );
+
+      // Supersession scan: PostToolUse:Agent is the moment `subagent_type`
+      // becomes authoritative (PreToolUse-wins precedence). After resolving
+      // the bridge and stamping the row's final `subagent_type`, look for
+      // OTHER rows in the same `(job_id, subagent_type)` group that are
+      // still `status='running'` and whose SubagentStart-time `ts` is
+      // strictly less than this row's spawn ts (`row.ts`). Each match is a
+      // prior concurrent same-type sibling that this bridge fold overtook;
+      // mark them `status='superseded'` in the same `BEGIN IMMEDIATE`
+      // transaction so the supersession signal lands atomically with the
+      // bridge UPDATE above.
+      //
+      // The scan uses the bridged row's spawn ts (`row.ts`) — NOT the
+      // current event's ts — so a concurrent same-type spawn whose
+      // SubagentStart landed AFTER `row.ts` is NOT swept. This is the
+      // deliberate narrow gate: only earlier-spawned still-open peers are
+      // marked superseded. See `findOpenRunningInGroup`'s doc for the
+      // known-limitation false-positive (two parallel `Task(subagent_type=X)`
+      // calls fired in one parent message).
+      //
+      // Gate on `nextSubagentType != null` — a row with no authoritative
+      // subagent_type cannot identify a group to scan over. Use a bulk
+      // UPDATE keyed on the matched `(agent_id, turn_seq)` tuples; the
+      // helper returns an empty array in the common case (no concurrent
+      // peers), so the loop body fires zero times for sequential spawns.
+      // NEVER throw inside the transaction (CLAUDE.md fold invariant).
+      if (nextSubagentType != null) {
+        const superseded = findOpenRunningInGroup(
+          db,
+          jobId,
+          nextSubagentType,
+          bridgeAgentId,
+          row.ts,
+        );
+        for (const sup of superseded) {
+          db.run(
+            `UPDATE subagent_invocations
+                SET status = 'superseded',
+                    last_event_id = ?, updated_at = ?
+              WHERE job_id = ? AND agent_id = ? AND turn_seq = ?`,
+            [event.id, ts, jobId, sup.agent_id, sup.turn_seq],
+          );
+        }
+      }
       return;
     }
 
     case "PostToolUseFailure": {
-      // Python contract: PostToolUseFailure carries no `tool_response` so no
-      // bridge is resolvable. Safe no-op; lifecycle correctness rests on
-      // SubagentStop landing 'ok' for the matching agent_id.
-      // (Gated on tool_name='Agent' for symmetry with PostToolUse, though
-      // PostToolUseFailure on non-Agent tools would also be a no-op via
-      // the missing bridge gate.)
+      // Gate on tool_name='Agent' — non-Agent PostToolUseFailure has no
+      // subagent_invocations meaning. The bridge resolves via the
+      // `subagent_agent_id` column (the indexed bridge column hook-writers
+      // stamp on every PostToolUse[Failure]:Agent). When the bridge column
+      // is NULL — the legitimate PostToolUseFailure case, since the failure
+      // path carries no `tool_response.agentId` — we have nothing to match
+      // on and fold to a safe no-op (orphan failure). When the bridge
+      // resolves AND a matching turn-0 row exists, UPDATE its status to
+      // `'failed'`, overriding any prior non-failed value (a `'failed'`
+      // signal is more informative than a `'running'` / `'ok'` /
+      // `'unknown'` / `'superseded'` value, since it carries the
+      // tool-execution-failed evidence directly from Claude Code).
+      //
+      // No `tool_response` is needed — the `subagent_agent_id` column is
+      // enough. Orphan failures (no matching row) are a safe no-op,
+      // mirroring SubagentStop's orphan-stop branch.
+      if (event.tool_name !== "Agent") {
+        return;
+      }
+      const bridgeAgentId = resolveBridgeAgentId({
+        subagent_agent_id: event.subagent_agent_id,
+        data: event.data,
+      });
+      if (bridgeAgentId == null) {
+        return;
+      }
+      // UPDATE the matching turn-0 row directly. If no row matches, the
+      // UPDATE affects zero rows — safe no-op (orphan failure).
+      // `'failed'` always wins (no terminal-status guard) because the
+      // failure signal is the most authoritative lifecycle outcome we can
+      // observe — it's a hard tool-execution failure surfaced by Claude
+      // Code, not a derived sweep or supersession inference.
+      db.run(
+        `UPDATE subagent_invocations
+            SET status = 'failed',
+                last_event_id = ?, updated_at = ?
+          WHERE job_id = ? AND agent_id = ? AND turn_seq = 0`,
+        [event.id, ts, jobId, bridgeAgentId],
+      );
       return;
     }
 
@@ -1817,6 +1968,7 @@ function projectJobsRow(db: Database, event: Event): void {
         [event.id, ts, jobId],
       );
       if (res.changes > 0) {
+        sweepRunningSubagentsToUnknown(db, jobId, event.id, ts);
         syncIfPlanRef(db, jobId, event.id, ts);
       }
       break;
@@ -1863,6 +2015,12 @@ function projectJobsRow(db: Database, event: Event): void {
              WHERE job_id = ?`,
           [event.id, ts, jobId],
         );
+        // Sweep fires ONLY on the proven write path, mirroring sync. The
+        // earlier `break` arms (malformed payload, missing row, stale
+        // mismatch) MUST NOT sweep — no lifecycle write happened, so a
+        // sweep would be a spurious mid-life mutation of running subagent
+        // rows whose parent session is still healthy.
+        sweepRunningSubagentsToUnknown(db, jobId, event.id, ts);
         // Sync fires ONLY here, on the proven write path. The earlier
         // `break` arms (malformed payload, missing row, stale mismatch) MUST
         // NOT sync — no write happened, the embedded entry would otherwise

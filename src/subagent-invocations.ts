@@ -88,7 +88,7 @@ export interface CanonicalRow {
   description: string | null;
   duration_ms: number | null;
   prompt_chars: number;
-  status: "running" | "ok" | "failed" | "unknown";
+  status: "running" | "ok" | "failed" | "unknown" | "superseded";
   subagent_type: string | null;
   tool_use_id: string | null;
   ts: number;
@@ -155,6 +155,63 @@ export function findOpenTurnForStop(
     )
     .get(jobId, agentId) as { turn_seq: number } | null;
   return row?.turn_seq ?? null;
+}
+
+/**
+ * One element in the `findOpenRunningInGroup` result set. Returned by the
+ * supersession scan fired from the PostToolUse:Agent arm of the reducer once
+ * the bridged row's authoritative `subagent_type` is known — every earlier
+ * still-running same-group row gets marked `status='superseded'`.
+ */
+export interface OpenRunningInGroupRow {
+  agent_id: string;
+  turn_seq: number;
+}
+
+/**
+ * Find all OTHER rows in the same `(job_id, subagent_type)` group that are
+ * still `status='running'` and whose SubagentStart-time `ts` is strictly less
+ * than the given `currentTs`. Used by the PostToolUse:Agent arm to mark prior
+ * concurrent same-type subagents as `superseded` once the current row's
+ * authoritative `subagent_type` is known (PreToolUse-wins precedence).
+ *
+ * The `ts < ?` gate uses the row's SubagentStart spawn ts — NOT the current
+ * event's ts. This means a concurrent same-type spawn whose SubagentStart
+ * landed AFTER the bridged row's spawn is NOT swept (it spawned later, so it
+ * cannot have been superseded by the bridged row). This is the deliberate
+ * gate to keep the supersession arm narrow: only earlier-spawned still-open
+ * peers are marked superseded. The known false-positive — two concurrent
+ * `Task(subagent_type=X)` calls fired in one parent message where (a)'s
+ * earlier-spawned sibling gets flipped to `superseded` the instant (a)'s
+ * PostToolUse:Agent lands — is documented in the epic spec as out-of-scope
+ * for v1.
+ *
+ * Returns the `(agent_id, turn_seq)` of every match; the caller bulk-updates
+ * inside the same `BEGIN IMMEDIATE` transaction. Returns an empty array when
+ * no other open same-type rows exist (the common case — most subagents are
+ * sequential within a turn).
+ */
+export function findOpenRunningInGroup(
+  db: Database,
+  jobId: string,
+  subagentType: string,
+  excludeAgentId: string,
+  currentTs: number,
+): OpenRunningInGroupRow[] {
+  return db
+    .prepare(
+      `SELECT agent_id, turn_seq
+         FROM subagent_invocations
+        WHERE job_id = ?
+          AND subagent_type = ?
+          AND status = 'running'
+          AND ts < ?
+          AND agent_id != ?`,
+    )
+    .all(jobId, subagentType, currentTs, excludeAgentId) as Array<{
+    agent_id: string;
+    turn_seq: number;
+  }>;
 }
 
 /**

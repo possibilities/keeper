@@ -3527,7 +3527,10 @@ test("PostToolUse:Agent with no turn-0 row (PostToolUse-before-SubagentStart ord
   expect(getCursor()).toBe(postId);
 });
 
-test("PostToolUseFailure:Agent is a safe no-op (SubagentStop carries status='ok')", () => {
+test("PostToolUseFailure:Agent with no resolvable bridge is a safe no-op (orphan failure)", () => {
+  // Bridge column NULL + no data.tool_response.agentId — resolveBridgeAgentId
+  // returns null and the arm short-circuits. SubagentStop later lands the row
+  // at 'ok' as if nothing happened.
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({
     hook_event: "SubagentStart",
@@ -3552,6 +3555,523 @@ test("PostToolUseFailure:Agent is a safe no-op (SubagentStop carries status='ok'
   expect(rows[0]).toMatchObject({ status: "ok", duration_ms: 1000 });
   // Failure event still advanced the cursor — SubagentStop advanced past it.
   expect(getCursor()).toBeGreaterThanOrEqual(failId);
+});
+
+test("PostToolUseFailure:Agent with resolved bridge UPDATEs row to status='failed'", () => {
+  // The bridge `subagent_agent_id` column resolves to the matching turn-0
+  // row; UPDATE lands `status='failed'` even though a SubagentStop later
+  // tries to flip it back. The terminal-status guard in the SubagentStop arm
+  // preserves the `'failed'` signal.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-FF",
+    agent_type: "Explore",
+    ts: 60.0,
+  });
+  const failId = insertEvent({
+    hook_event: "PostToolUseFailure",
+    tool_name: "Agent",
+    tool_use_id: "toolu_ff",
+    subagent_agent_id: "agent-FF",
+    data: JSON.stringify({ tool_use_id: "toolu_ff" }),
+  });
+  insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-FF",
+    ts: 61.0,
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  // 'failed' wins — SubagentStop's terminal-status guard preserves it.
+  // duration_ms is still computed by SubagentStop (the row closes).
+  expect(rows[0]).toMatchObject({ status: "failed", duration_ms: 1000 });
+  expect(getCursor()).toBeGreaterThanOrEqual(failId);
+});
+
+test("PostToolUseFailure:Agent with non-Agent tool_name is a safe no-op", () => {
+  // Symmetry with PostToolUse arm — non-Agent rows have no
+  // subagent_invocations meaning.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-NA",
+    agent_type: "Explore",
+    ts: 70.0,
+  });
+  insertEvent({
+    hook_event: "PostToolUseFailure",
+    tool_name: "Bash",
+    tool_use_id: "toolu_bash_fail",
+    subagent_agent_id: "agent-NA",
+    data: JSON.stringify({ tool_use_id: "toolu_bash_fail" }),
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  // Untouched — still running.
+  expect(rows[0]?.status).toBe("running");
+});
+
+test("PostToolUseFailure:Agent orphan (no matching turn-0 row) is a safe no-op", () => {
+  // Bridge resolves but no SubagentStart for this agent_id ever fired — the
+  // UPDATE matches zero rows. Cursor still advances.
+  insertEvent({ hook_event: "SessionStart" });
+  const failId = insertEvent({
+    hook_event: "PostToolUseFailure",
+    tool_name: "Agent",
+    tool_use_id: "toolu_orphan",
+    subagent_agent_id: "agent-missing",
+    data: JSON.stringify({ tool_use_id: "toolu_orphan" }),
+  });
+  drainAll();
+  expect(getSubagentRows()).toHaveLength(0);
+  expect(getCursor()).toBe(failId);
+});
+
+test("SessionEnd sweeps open status='running' subagent rows to status='unknown'", () => {
+  // Two open subagents: one closed cleanly (status='ok'), one still open.
+  // SessionEnd's lifecycle write fires the sweep; the still-open row flips
+  // to 'unknown'; the closed one is untouched (status='ok' is not 'running').
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-S1",
+    agent_type: "Explore",
+    ts: 100.0,
+  });
+  insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-S1",
+    ts: 101.0,
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-S2",
+    agent_type: "Plan",
+    ts: 110.0,
+  });
+  insertEvent({ hook_event: "SessionEnd", ts: 120.0 });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(2);
+  const byAgent = Object.fromEntries(rows.map((r) => [r.agent_id, r]));
+  expect(byAgent["agent-S1"]).toMatchObject({
+    status: "ok",
+    duration_ms: 1000,
+  });
+  // The orphaned subagent — closed by the SessionEnd sweep, NOT a real
+  // SubagentStop, so duration_ms stays NULL.
+  expect(byAgent["agent-S2"]).toMatchObject({
+    status: "unknown",
+    duration_ms: null,
+  });
+});
+
+test("Killed sweeps open status='running' subagent rows to status='unknown' on the proven write path", () => {
+  // Killed fires the sweep ONLY when the (pid, start_time) match lands.
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 4242,
+    start_time: "macos:t1",
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-K",
+    agent_type: "Build",
+    ts: 200.0,
+  });
+  killedEvent(4242, "macos:t1");
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ status: "unknown", duration_ms: null });
+});
+
+test("Killed mismatch (stale pid) does NOT sweep open subagent rows", () => {
+  // (pid, start_time) mismatch — the jobs row write short-circuits, and the
+  // sweep MUST NOT fire (no lifecycle write happened).
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 4242,
+    start_time: "macos:t2",
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-K2",
+    agent_type: "Build",
+    ts: 200.0,
+  });
+  // Mismatched pid — Killed arm falls through without writing.
+  killedEvent(9999, "macos:t2");
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]?.status).toBe("running");
+});
+
+test("Late SubagentStop after SessionEnd sweep preserves status='unknown' (terminal guard)", () => {
+  // The sweep lands 'unknown'; a later SubagentStop fires — terminal-status
+  // guard preserves the 'unknown' value and refuses to flip to 'ok'.
+  // duration_ms IS still computed because the gate is `duration_ms IS NULL`
+  // alone (fn-480 invariant).
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-L",
+    agent_type: "Explore",
+    ts: 300.0,
+  });
+  insertEvent({ hook_event: "SessionEnd", ts: 310.0 });
+  insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-L",
+    ts: 311.0,
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ status: "unknown", duration_ms: 11000 });
+});
+
+test("PostToolUse:Agent marks prior same-type same-job open running row as superseded", () => {
+  // Two SubagentStarts with same subagent_type='Explore'; agent-A spawns
+  // first, agent-B spawns second. agent-B's PostToolUse:Agent fires while
+  // agent-A is still running — the bridged row's spawn ts is 102.0 (agent-B),
+  // and the scan finds agent-A's row (ts=101.0 < 102.0, status='running',
+  // same job, same subagent_type='Explore') and marks it superseded.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_sup_A",
+    data: JSON.stringify({
+      tool_use_id: "toolu_sup_A",
+      tool_input: { subagent_type: "Explore", description: "A", prompt: "pA" },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-supA",
+    agent_type: "Explore",
+    ts: 101.0,
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_sup_B",
+    data: JSON.stringify({
+      tool_use_id: "toolu_sup_B",
+      tool_input: { subagent_type: "Explore", description: "B", prompt: "pB" },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-supB",
+    agent_type: "Explore",
+    ts: 102.0,
+  });
+  // agent-B's PostToolUse:Agent — this is the supersession trigger. agent-A
+  // is still running at this point (no SubagentStop yet).
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_sup_B",
+    subagent_agent_id: "agent-supB",
+    data: JSON.stringify({
+      tool_use_id: "toolu_sup_B",
+      tool_response: { agentId: "agent-supB" },
+    }),
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  expect(rows).toHaveLength(2);
+  const byAgent = Object.fromEntries(rows.map((r) => [r.agent_id, r]));
+  // agent-A: superseded (it spawned first, still 'running' when agent-B's
+  // PostToolUse:Agent bridged).
+  expect(byAgent["agent-supA"]?.status).toBe("superseded");
+  // agent-B: ok (its own PostToolUse:Agent fold).
+  expect(byAgent["agent-supB"]?.status).toBe("ok");
+});
+
+test("PostToolUse:Agent does NOT supersede already-closed peers (status='ok'/'failed')", () => {
+  // agent-A closes cleanly (status='ok') BEFORE agent-B's PostToolUse:Agent
+  // lands. The scan's `status='running'` gate skips agent-A — no supersession.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_closed_A",
+    data: JSON.stringify({
+      tool_use_id: "toolu_closed_A",
+      tool_input: { subagent_type: "Explore", description: "A", prompt: "p" },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-closedA",
+    agent_type: "Explore",
+    ts: 201.0,
+  });
+  insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-closedA",
+    ts: 201.5,
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_closed_B",
+    data: JSON.stringify({
+      tool_use_id: "toolu_closed_B",
+      tool_input: { subagent_type: "Explore", description: "B", prompt: "p" },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-closedB",
+    agent_type: "Explore",
+    ts: 202.0,
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_closed_B",
+    subagent_agent_id: "agent-closedB",
+    data: JSON.stringify({
+      tool_use_id: "toolu_closed_B",
+      tool_response: { agentId: "agent-closedB" },
+    }),
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  const byAgent = Object.fromEntries(rows.map((r) => [r.agent_id, r]));
+  // Both remain 'ok' — supersession scan didn't fire on agent-A because its
+  // status was already 'ok' when agent-B's PostToolUse:Agent ran.
+  expect(byAgent["agent-closedA"]?.status).toBe("ok");
+  expect(byAgent["agent-closedB"]?.status).toBe("ok");
+});
+
+test("PostToolUse:Agent only supersedes same subagent_type — different types are independent", () => {
+  // agent-A is subagent_type='Explore', agent-B is subagent_type='Plan'. The
+  // group scan keys on subagent_type so agent-A is untouched by agent-B's
+  // PostToolUse:Agent.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_diffty_A",
+    data: JSON.stringify({
+      tool_use_id: "toolu_diffty_A",
+      tool_input: { subagent_type: "Explore", description: "A", prompt: "p" },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-diffA",
+    agent_type: "Explore",
+    ts: 301.0,
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_diffty_B",
+    data: JSON.stringify({
+      tool_use_id: "toolu_diffty_B",
+      tool_input: { subagent_type: "Plan", description: "B", prompt: "p" },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-diffB",
+    agent_type: "Plan",
+    ts: 302.0,
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_diffty_B",
+    subagent_agent_id: "agent-diffB",
+    data: JSON.stringify({
+      tool_use_id: "toolu_diffty_B",
+      tool_response: { agentId: "agent-diffB" },
+    }),
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  const byAgent = Object.fromEntries(rows.map((r) => [r.agent_id, r]));
+  // Different subagent_type — agent-A stays running, NOT superseded.
+  expect(byAgent["agent-diffA"]?.status).toBe("running");
+  expect(byAgent["agent-diffB"]?.status).toBe("ok");
+});
+
+test("Late SubagentStop on superseded row preserves status='superseded' (terminal guard)", () => {
+  // Reuses the supersession scenario; agent-A is superseded, then its
+  // SubagentStop fires later. Terminal guard preserves 'superseded'.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_lateA",
+    data: JSON.stringify({
+      tool_use_id: "toolu_lateA",
+      tool_input: { subagent_type: "Explore", description: "A", prompt: "p" },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-lateA",
+    agent_type: "Explore",
+    ts: 401.0,
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_lateB",
+    data: JSON.stringify({
+      tool_use_id: "toolu_lateB",
+      tool_input: { subagent_type: "Explore", description: "B", prompt: "p" },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-lateB",
+    agent_type: "Explore",
+    ts: 402.0,
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_lateB",
+    subagent_agent_id: "agent-lateB",
+    data: JSON.stringify({
+      tool_use_id: "toolu_lateB",
+      tool_response: { agentId: "agent-lateB" },
+    }),
+  });
+  // agent-A's SubagentStop lands LATER — must preserve 'superseded'.
+  insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-lateA",
+    ts: 403.0,
+  });
+  drainAll();
+  const rows = getSubagentRows();
+  const byAgent = Object.fromEntries(rows.map((r) => [r.agent_id, r]));
+  expect(byAgent["agent-lateA"]?.status).toBe("superseded");
+  // duration_ms still computes (the row closes; only the status is sticky).
+  expect(byAgent["agent-lateA"]?.duration_ms).toBe(2000);
+});
+
+test("subagent_invocations re-fold is byte-identical with new arms (failed/unknown/superseded)", () => {
+  // Exercise all three new arms in one fold + a clean-close peer, then
+  // rewind + DELETE + re-drain and assert byte-identical row set.
+  insertEvent({ hook_event: "SessionStart" });
+  // Clean close — exercises the unchanged path.
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-cln",
+    agent_type: "Build",
+    ts: 500.0,
+  });
+  insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "agent-cln",
+    ts: 501.0,
+  });
+  // PostToolUseFailure → 'failed'.
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-fld",
+    agent_type: "Explore",
+    ts: 510.0,
+  });
+  insertEvent({
+    hook_event: "PostToolUseFailure",
+    tool_name: "Agent",
+    tool_use_id: "toolu_fld",
+    subagent_agent_id: "agent-fld",
+    data: JSON.stringify({ tool_use_id: "toolu_fld" }),
+  });
+  // Supersession pair on subagent_type='Plan'.
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_sup_X",
+    data: JSON.stringify({
+      tool_use_id: "toolu_sup_X",
+      tool_input: { subagent_type: "Plan", description: "X", prompt: "p" },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-supX",
+    agent_type: "Plan",
+    ts: 520.0,
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_sup_Y",
+    data: JSON.stringify({
+      tool_use_id: "toolu_sup_Y",
+      tool_input: { subagent_type: "Plan", description: "Y", prompt: "p" },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-supY",
+    agent_type: "Plan",
+    ts: 521.0,
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_sup_Y",
+    subagent_agent_id: "agent-supY",
+    data: JSON.stringify({
+      tool_use_id: "toolu_sup_Y",
+      tool_response: { agentId: "agent-supY" },
+    }),
+  });
+  // Lifecycle sweep — open subagent + SessionEnd → 'unknown'.
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "agent-swp",
+    agent_type: "Refactor",
+    ts: 530.0,
+  });
+  insertEvent({ hook_event: "SessionEnd", ts: 540.0 });
+  drainAll();
+  const before = db
+    .query(
+      `SELECT * FROM subagent_invocations ORDER BY job_id, agent_id, turn_seq`,
+    )
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM subagent_invocations");
+  drainAll();
+  const after = db
+    .query(
+      `SELECT * FROM subagent_invocations ORDER BY job_id, agent_id, turn_seq`,
+    )
+    .all();
+  expect(JSON.stringify(after)).toBe(JSON.stringify(before));
+  // Spot-check the four expected statuses landed correctly.
+  const byAgent = Object.fromEntries(
+    (after as Array<{ agent_id: string; status: string }>).map((r) => [
+      r.agent_id,
+      r.status,
+    ]),
+  );
+  expect(byAgent["agent-cln"]).toBe("ok");
+  expect(byAgent["agent-fld"]).toBe("failed");
+  expect(byAgent["agent-supX"]).toBe("superseded");
+  expect(byAgent["agent-supY"]).toBe("ok");
+  expect(byAgent["agent-swp"]).toBe("unknown");
 });
 
 test("PostToolUse:Agent fires BEFORE SubagentStop (Task call ordering); SubagentStop still closes the row", () => {

@@ -323,7 +323,7 @@ export interface SubagentInvocation {
   subagent_type: string | null;
   description: string | null;
   prompt_chars: number;
-  status: "running" | "ok" | "failed" | "unknown";
+  status: "running" | "ok" | "failed" | "unknown" | "superseded";
   duration_ms: number | null;
   last_event_id: number;
   updated_at: number;
