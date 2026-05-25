@@ -89,6 +89,7 @@ import {
   formatPill,
   formatReasonLine,
   type ReadinessSnapshot,
+  type Verdict,
 } from "./readiness";
 
 /**
