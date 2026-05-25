@@ -385,13 +385,32 @@ async function main(): Promise<void> {
   // `null` between frames (cleared on disconnect; replaced on next emit).
   let lastReadiness: ReadinessSnapshot | null = null;
 
-  // Per-frame `job_id → SubagentInvocation[]` index — built once in
+  /**
+   * `SubagentInvocation` extended with a computed `is_replaced` flag.
+   * A row is `is_replaced` when it is `status='running'` AND a later entry
+   * exists in the same `(job_id, subagent_type)` group — meaning a newer
+   * attempt superseded it without a clean `SubagentStop`. Computed once per
+   * frame inside `emitFrameIfChanged` from the full per-job snapshot (the
+   * only point where the complete group is available; the diff/patch path
+   * only delivers changed rows so it can't compute this accurately).
+   *
+   * Rule: within each `(job_id, subagent_type)` bucket sorted by `turn_seq`
+   * ascending, any `status='running'` entry whose index is not the last in
+   * the group is replaced. The last entry is always the "current" attempt
+   * regardless of status, so it is never flagged.
+   *
+   * `null`-typed entries (unknown subagent type) are skipped — we can't
+   * group them meaningfully and they're not `plan:worker-*` spawns anyway.
+   */
+  type AnnotatedInvocation = SubagentInvocation & { is_replaced: boolean };
+
+  // Per-frame `job_id → AnnotatedInvocation[]` index — built once in
   // `emitFrameIfChanged` from `subagentInvocations.rows` and read by
   // `subagentLinesFor` when nesting under a job row. Each bucket is
   // sorted by `turn_seq asc` so the nested list reads in invocation
   // order. `null` between frames (cleared on disconnect; replaced on
   // next emit).
-  let lastSubagentIndex: Map<string, SubagentInvocation[]> | null = null;
+  let lastSubagentIndex: Map<string, AnnotatedInvocation[]> | null = null;
 
   type Sock = Awaited<ReturnType<typeof Bun.connect>>;
   let currentSock: Sock | null = null;
@@ -424,12 +443,14 @@ async function main(): Promise<void> {
     if (hits === undefined || hits.length === 0) {
       return [];
     }
-    return hits.map((inv) => {
-      const type = inv.subagent_type ?? "subagent";
-      const desc = inv.description ?? "";
-      const label = desc === "" ? type : `${type}: ${desc}`;
-      return `${indent}${label} ${subagentPill(inv.status)}`;
-    });
+    return hits
+      .filter((inv) => !inv.is_replaced)
+      .map((inv) => {
+        const type = inv.subagent_type ?? "subagent";
+        const desc = inv.description ?? "";
+        const label = desc === "" ? type : `${type}: ${desc}`;
+        return `${indent}${label} ${subagentPill(inv.status)}`;
+      });
   }
 
   function renderJobLines(jobsArr: unknown): string[] {
@@ -711,18 +732,49 @@ async function main(): Promise<void> {
     // Per-frame `job_id → invocations` index for `subagentLinesFor` —
     // re-entrant sub-agents within one session sit on the same `job_id`
     // bucket, ordered by `turn_seq asc` so the nested list reads in
-    // invocation order.
-    const subIndex = new Map<string, SubagentInvocation[]>();
+    // invocation order. Each entry is spread into an `AnnotatedInvocation`
+    // with `is_replaced` defaulting to false; the marking pass below flips
+    // it for superseded running entries.
+    const subIndex = new Map<string, AnnotatedInvocation[]>();
     for (const inv of subsTyped) {
+      const annotated: AnnotatedInvocation = { ...inv, is_replaced: false };
       const arr = subIndex.get(inv.job_id);
       if (arr === undefined) {
-        subIndex.set(inv.job_id, [inv]);
+        subIndex.set(inv.job_id, [annotated]);
       } else {
-        arr.push(inv);
+        arr.push(annotated);
       }
     }
     for (const arr of subIndex.values()) {
       arr.sort((a, b) => a.turn_seq - b.turn_seq);
+      // Mark replaced: within each (job_id, subagent_type) group, any
+      // status='running' entry that is not the last in the group is
+      // superseded by a later attempt and should be hidden by renderers.
+      // Group by subagent_type (skip null — untyped entries aren't grouped).
+      const byType = new Map<string, AnnotatedInvocation[]>();
+      for (const inv of arr) {
+        if (inv.subagent_type == null) continue;
+        let bucket = byType.get(inv.subagent_type);
+        if (bucket === undefined) {
+          bucket = [];
+          byType.set(inv.subagent_type, bucket);
+        }
+        bucket.push(inv);
+      }
+      for (const group of byType.values()) {
+        // A running entry is replaced iff there is ANY later entry in the
+        // group (by `ts`). Use ts-max rather than index position: turn_seq
+        // is per-(job_id,agent_id) and doesn't order correctly across
+        // different agent_ids when multiple sessions share a job. The entry
+        // with the maximum ts is always the "current" attempt and is never
+        // replaced regardless of its status.
+        const maxTs = Math.max(...group.map((inv) => inv.ts));
+        for (const inv of group) {
+          if (inv.status === "running" && inv.ts < maxTs) {
+            inv.is_replaced = true;
+          }
+        }
+      }
     }
     lastSubagentIndex = subIndex;
     const body = renderBody();
