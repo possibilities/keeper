@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-607-fix-plan-worker-boot-scan-to-prime",
   "bundles": [],
   "closer_done_at": "2026-05-25T22:40:36.523411Z",
