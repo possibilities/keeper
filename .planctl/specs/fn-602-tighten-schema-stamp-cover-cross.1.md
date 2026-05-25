@@ -32,5 +32,5 @@ Option 1 is the smaller diff. Either restores the invariant.
       already stamped v15.
 
 ## Done summary
-
+Added a comment-only no-op block in migrate() between the v13→v14 and v15→v16 steps documenting that the v15 stamp gates the unconditional CREATE_GIT_STATUS bootstrap (idempotent CREATE TABLE IF NOT EXISTS), restoring the 'bump only when adding an ALTER block' invariant.
 ## Evidence
