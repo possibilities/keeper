@@ -60,7 +60,8 @@ import type { Epic, Job, SubagentInvocation, Task } from "../src/types";
  * - `sub-agent-running`                — a sub-agent invocation for this row's worker is `running`.
  * - `dep-on-task`                      — an upstream task is not completed (carries the upstream id).
  * - `dep-on-epic`                      — an upstream epic's close is not completed.
- * - `single-root`                      — lost the single-root post-pass mutex.
+ * - `single-task-per-epic`             — lost the per-epic mutex (a sibling row in the same epic is non-completed).
+ * - `single-task-per-root`             — lost the per-root mutex (a row in another epic in the same project root is non-completed).
  * - `unknown`                          — defensive default for verdict/renderer mismatch.
  */
 export type BlockReason =
@@ -72,7 +73,8 @@ export type BlockReason =
   | { kind: "sub-agent-running" }
   | { kind: "dep-on-task"; upstream: string }
   | { kind: "dep-on-epic"; upstream: string }
-  | { kind: "single-root" }
+  | { kind: "single-task-per-epic" }
+  | { kind: "single-task-per-root" }
   | { kind: "unknown" };
 
 export type Verdict =
@@ -100,10 +102,11 @@ export interface ReadinessSnapshot {
  * Pure entry. Walks `epics` in iteration order (the caller is responsible
  * for handing in a deterministically-ordered map — typically the board's
  * `epics.order`-indexed `byId`). For each epic, builds per-task verdicts
- * via the 10-predicate pipeline (first-match-wins), then the synthetic
+ * via the 11-predicate pipeline (first-match-wins), then the synthetic
  * close-row verdict, then the epic header rollup. After the per-row pass,
- * `applySingleRootMutex` mutates the verdict maps for the single-root
- * predicate.
+ * `applySingleTaskPerEpicMutex` and `applySingleTaskPerRootMutex` mutate
+ * the verdict maps for the two post-pass mutex predicates (in that order
+ * — tighter scope reported first when both would apply).
  *
  * Inputs are keyed by id; both maps and arrays are accepted (an iterable
  * with stable order suffices). The function never mutates its inputs.
@@ -172,10 +175,11 @@ export function computeReadiness(
     perCloseRow.set(epic.epic_id, closeVerdict);
   }
 
-  // Single-root post-pass — mutates `perTask` / `perCloseRow` in board
-  // traversal order, then we recompute the epic header rollup using the
-  // post-mutex state.
-  applySingleRootMutex(epicsArr, perTask, perCloseRow);
+  // Post-pass mutexes — mutate `perTask` / `perCloseRow` in board traversal
+  // order. Per-epic FIRST so its tighter scope reports the reason when both
+  // would apply; per-root SECOND over the same maps.
+  applySingleTaskPerEpicMutex(epicsArr, perTask);
+  applySingleTaskPerRootMutex(epicsArr, perTask, perCloseRow);
 
   // Epic header rollup.
   for (const epic of epicsArr) {
@@ -276,7 +280,8 @@ function evaluateTask(
 
   // 9. dep-on-task-synthetic-close — not applicable to a real task.
 
-  // 10. single-root — deferred to applySingleRootMutex.
+  // 10. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
+  // 11. single-task-per-root — deferred to applySingleTaskPerRootMutex.
 
   return { tag: "ready" };
 }
@@ -342,66 +347,115 @@ function evaluateCloseRow(
     }
   }
 
-  // 10. single-root — deferred.
+  // 10. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
+  // 11. single-task-per-root — deferred to applySingleTaskPerRootMutex.
 
   return { tag: "ready" };
 }
 
 // ---------------------------------------------------------------------------
-// Single-root post-pass
+// Post-pass mutexes
 // ---------------------------------------------------------------------------
 
 /**
- * Walk every per-row verdict in board traversal order (epics in input
- * iteration order; per epic: pre-sorted tasks then the synthetic close
- * row). For each row that is currently `{ tag: "ready" }`, key on the
- * effective root: `task.target_repo ?? epic.project_dir` (BOTH null AND
- * empty-string fall through to the next fallback — mirroring
- * `scripts/autopilot.ts:206-210` exactly). The first row per root keeps
- * `ready`; every later row in the same root becomes
- * `{ tag: "blocked", reason: { kind: "single-root" } }`.
+ * Per-epic mutex (predicate 10). Walk each epic's tasks in pre-sorted order.
+ * The FIRST task whose verdict is non-completed claims the epic's slot;
+ * every LATER task in the same epic with verdict `{ tag: "ready" }` is
+ * mutated to `{ kind: "single-task-per-epic" }`. Rows already blocked
+ * (dep-on-task, job-running, etc.) keep their more-specific reason.
+ *
+ * The "occupant" check counts ANY non-completed verdict (ready, working,
+ * blocked-by-anything) — so a sibling task that is actively `job-running`
+ * or `sub-agent-running` blocks later ready siblings within the same epic.
+ *
+ * The close row is never considered here: predicate 9 already forces close
+ * to wait until every task is completed, so close can only be `ready` when
+ * no real task in the epic is non-completed → no competitor.
  *
  * Exported separately so the test suite can drive it with a hand-rolled
  * verdict map.
  */
-export function applySingleRootMutex(
+export function applySingleTaskPerEpicMutex(
+  epicsArr: Epic[],
+  perTask: Map<string, Verdict>,
+): void {
+  for (const epic of epicsArr) {
+    let occupied = false;
+    for (const task of epic.tasks) {
+      const verdict = perTask.get(task.task_id);
+      if (verdict === undefined || verdict.tag === "completed") {
+        continue;
+      }
+      if (!occupied) {
+        occupied = true;
+        continue;
+      }
+      if (verdict.tag === "ready") {
+        perTask.set(task.task_id, {
+          tag: "blocked",
+          reason: { kind: "single-task-per-epic" },
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Per-root mutex (predicate 11). Walk every per-row verdict in board
+ * traversal order (epics in input iteration order; per epic: pre-sorted
+ * tasks then the synthetic close row). Key on the effective root:
+ * `task.target_repo ?? epic.project_dir` (BOTH null AND empty-string fall
+ * through to the next fallback — mirroring `scripts/autopilot.ts:206-210`
+ * exactly). The FIRST non-completed row per root claims the slot; every
+ * LATER row in the same root with verdict `{ tag: "ready" }` is mutated to
+ * `{ kind: "single-task-per-root" }`. Same "any non-completed occupant"
+ * rule as the per-epic pass — a sibling task in the same root that is
+ * actively `job-running` (or any non-completed state) still blocks later
+ * ready rows.
+ *
+ * Exported separately so the test suite can drive it with a hand-rolled
+ * verdict map.
+ */
+export function applySingleTaskPerRootMutex(
   epicsArr: Epic[],
   perTask: Map<string, Verdict>,
   perCloseRow: Map<string, Verdict>,
 ): void {
-  const seenRoots = new Set<string>();
+  const occupiedRoots = new Set<string>();
 
   for (const epic of epicsArr) {
     const projectDir = stringOrNull(epic.project_dir);
 
     for (const task of epic.tasks) {
       const verdict = perTask.get(task.task_id);
-      if (verdict === undefined || verdict.tag !== "ready") {
+      if (verdict === undefined || verdict.tag === "completed") {
         continue;
       }
       const root = effectiveRoot(stringOrNull(task.target_repo), projectDir);
-      if (seenRoots.has(root)) {
+      if (!occupiedRoots.has(root)) {
+        occupiedRoots.add(root);
+        continue;
+      }
+      if (verdict.tag === "ready") {
         perTask.set(task.task_id, {
           tag: "blocked",
-          reason: { kind: "single-root" },
+          reason: { kind: "single-task-per-root" },
         });
-      } else {
-        seenRoots.add(root);
       }
     }
 
     // Close row uses the epic's project_dir directly (no per-row
     // `target_repo` on a synthetic close).
     const closeVerdict = perCloseRow.get(epic.epic_id);
-    if (closeVerdict !== undefined && closeVerdict.tag === "ready") {
+    if (closeVerdict !== undefined && closeVerdict.tag !== "completed") {
       const root = effectiveRoot(null, projectDir);
-      if (seenRoots.has(root)) {
+      if (!occupiedRoots.has(root)) {
+        occupiedRoots.add(root);
+      } else if (closeVerdict.tag === "ready") {
         perCloseRow.set(epic.epic_id, {
           tag: "blocked",
-          reason: { kind: "single-root" },
+          reason: { kind: "single-task-per-root" },
         });
-      } else {
-        seenRoots.add(root);
       }
     }
   }
@@ -411,7 +465,7 @@ export function applySingleRootMutex(
  * Single-root key. `target_repo` wins when non-null AND non-empty; otherwise
  * we fall through to `project_dir`. Both null/empty produces `""` — the
  * "unknown root" bucket, which collapses every rootless row into one
- * single-root slot (the safe behavior — at most one rootless row gets
+ * per-root slot (the safe behavior — at most one rootless row gets
  * `ready`, the rest block).
  *
  * MUST mirror `scripts/autopilot.ts:206-210` predicate exactly:
@@ -569,8 +623,10 @@ function formatReasonShort(reason: BlockReason): string {
       return `dep-on-task ${reason.upstream}`;
     case "dep-on-epic":
       return `dep-on-epic ${reason.upstream}`;
-    case "single-root":
-      return "single-root";
+    case "single-task-per-epic":
+      return "single-task-per-epic";
+    case "single-task-per-root":
+      return "single-task-per-root";
     case "unknown":
       return "unknown";
   }

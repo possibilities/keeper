@@ -1,12 +1,15 @@
 /**
- * Pure-function tests for `scripts/readiness.ts` — exercises the 10-predicate
- * pipeline + single-root post-pass + epic header rollup directly. No DB, no
- * reducer, no migration: build `Epic[]` / `Job` map / `SubagentInvocation[]`
- * fixtures inline and assert verdict map equality.
+ * Pure-function tests for `scripts/readiness.ts` — exercises the 11-predicate
+ * pipeline + two post-pass mutexes (per-epic, per-root) + epic header rollup
+ * directly. No DB, no reducer, no migration: build `Epic[]` / `Job` map /
+ * `SubagentInvocation[]` fixtures inline and assert verdict map equality.
  *
  * Coverage tracks `task.spec` Test notes:
  *   - Predicate-ordering matrix (every ordering edge that matters).
- *   - Single-root post-pass (multi-root, single-root, empty-string fallback).
+ *   - Per-epic mutex (multi-task-in-epic, non-completed occupant rule).
+ *   - Per-root mutex (multi-root, single-root collapse, empty-string
+ *     fallback, non-completed occupant rule, cross-epic same-root collision).
+ *   - Ordering between the two post-passes (tighter scope wins).
  *   - Epic header rollup edge cases (zero-task, all-completed-except-close,
  *     mixed states).
  *   - Missing-input defensive defaults (verdict lookup miss).
@@ -16,7 +19,8 @@
 
 import { expect, test } from "bun:test";
 import {
-  applySingleRootMutex,
+  applySingleTaskPerEpicMutex,
+  applySingleTaskPerRootMutex,
   type BlockReason,
   computeReadiness,
   formatPill,
@@ -284,8 +288,8 @@ test("predicate 7 (dep-on-task) wins over 8 (dep-on-epic)", () => {
   );
 });
 
-test("predicate 8 (dep-on-epic) wins over 10 (single-root)", () => {
-  // The dependent epic's task would otherwise compete for single-root with
+test("predicate 8 (dep-on-epic) wins over 11 (single-task-per-root)", () => {
+  // The dependent epic's task would otherwise compete for per-root with
   // the upstream epic's task; dep-on-epic should win.
   const upstreamEpic = makeEpic({
     epic_id: "fn-0-bar",
@@ -314,10 +318,10 @@ test("predicate 8 (dep-on-epic) wins over 10 (single-root)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Single-root post-pass
+// Per-epic post-pass (predicate 10)
 // ---------------------------------------------------------------------------
 
-test("single-root: two ready tasks in same target_repo → first wins, second blocks", () => {
+test("per-epic: two ready tasks in same epic → first wins, second blocks single-task-per-epic", () => {
   const t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
   const t2 = makeTask({
     task_id: "fn-1-foo.2",
@@ -328,26 +332,12 @@ test("single-root: two ready tasks in same target_repo → first wins, second bl
   const snap = run([epic]);
   expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
   expect(snap.perTask.get("fn-1-foo.2")).toEqual(
-    blocked({ kind: "single-root" }),
+    blocked({ kind: "single-task-per-epic" }),
   );
 });
 
-test("single-root: target_repo === null falls back to project_dir", () => {
-  const t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: null });
-  const t2 = makeTask({
-    task_id: "fn-1-foo.2",
-    task_number: 2,
-    target_repo: null,
-  });
-  const epic = makeEpic({ tasks: [t1, t2], project_dir: "/repo" });
-  const snap = run([epic]);
-  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
-  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
-    blocked({ kind: "single-root" }),
-  );
-});
-
-test("single-root: different roots → both ready", () => {
+test("per-epic: two ready tasks in same epic with DIFFERENT roots → second still blocks per-epic", () => {
+  // Per-epic doesn't care about roots — it's intra-epic only.
   const t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r1" });
   const t2 = makeTask({
     task_id: "fn-1-foo.2",
@@ -357,28 +347,53 @@ test("single-root: different roots → both ready", () => {
   const epic = makeEpic({ tasks: [t1, t2] });
   const snap = run([epic]);
   expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
-  expect(snap.perTask.get("fn-1-foo.2")).toEqual({ tag: "ready" });
-});
-
-test("single-root: empty-string target_repo + empty-string project_dir collapse", () => {
-  // Both rows fall through to "" — the unknown-root bucket; only one survives.
-  const t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "" });
-  const t2 = makeTask({
-    task_id: "fn-1-foo.2",
-    task_number: 2,
-    target_repo: "",
-  });
-  const epic = makeEpic({ tasks: [t1, t2], project_dir: "" });
-  const snap = run([epic]);
-  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
   expect(snap.perTask.get("fn-1-foo.2")).toEqual(
-    blocked({ kind: "single-root" }),
+    blocked({ kind: "single-task-per-epic" }),
   );
 });
 
-test("single-root: traversal order = epics input × pre-sorted tasks × close last", () => {
-  // Two epics in the same root; first epic's first task wins, every other
-  // would-be-ready row blocks.
+test("per-epic: working task in epic occupies the slot → sibling ready task blocks", () => {
+  // The broader "non-completed occupant" rule: an actively job-running task
+  // is non-completed, so it claims the epic's slot ahead of a later ready
+  // sibling.
+  const working = makeTask({
+    task_id: "fn-1-foo.1",
+    jobs: [makeEmbeddedJob({ state: "working" })],
+  });
+  const ready = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+  });
+  const epic = makeEpic({ tasks: [working, ready] });
+  const snap = run([epic]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "job-running" }),
+  );
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("per-epic: doesn't fire when only one non-completed task exists", () => {
+  // Completed siblings don't occupy the slot — they're off the board.
+  const done = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+  });
+  const ready = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
+  const epic = makeEpic({ tasks: [done, ready] });
+  const snap = run([epic]);
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual({ tag: "ready" });
+});
+
+// ---------------------------------------------------------------------------
+// Per-root post-pass (predicate 11)
+// ---------------------------------------------------------------------------
+
+test("per-root: same-root tasks in DIFFERENT epics → first wins, second blocks single-task-per-root", () => {
+  // Cross-epic competition — per-epic doesn't apply (different epics), so
+  // per-root is the only mutex that fires.
   const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
   const e1 = makeEpic({
     epic_id: "fn-1-foo",
@@ -400,7 +415,141 @@ test("single-root: traversal order = epics input × pre-sorted tasks × close la
   const snap = run([e1, e2]);
   expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
   expect(snap.perTask.get("fn-2-bar.1")).toEqual(
-    blocked({ kind: "single-root" }),
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("per-root: different roots in different epics → both ready", () => {
+  const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r1" });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/r1",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r2",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r2",
+    tasks: [e2t1],
+  });
+  const snap = run([e1, e2]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+});
+
+test("per-root: target_repo === null falls back to project_dir (cross-epic)", () => {
+  const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: null });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: null,
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/repo",
+    tasks: [e2t1],
+  });
+  const snap = run([e1, e2]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("per-root: empty-string target_repo + empty-string project_dir collapse (cross-epic)", () => {
+  // Both rows fall through to "" — the unknown-root bucket; only one survives.
+  const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "" });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "",
+    tasks: [e2t1],
+  });
+  const snap = run([e1, e2]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("per-root: working task in epic A occupies root → ready task in epic B blocks", () => {
+  // The broader "non-completed occupant" rule applied across epics: a
+  // job-running task in epic A claims its root, so a ready task in epic B
+  // sharing that root blocks single-task-per-root.
+  const working = makeTask({
+    task_id: "fn-1-foo.1",
+    target_repo: "/r",
+    jobs: [makeEmbeddedJob({ state: "working" })],
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/r",
+    tasks: [working],
+  });
+  const ready = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [ready],
+  });
+  const snap = run([e1, e2]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "job-running" }),
+  );
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Post-pass ordering — tighter scope (per-epic) wins when both apply
+// ---------------------------------------------------------------------------
+
+test("ordering: same-epic same-root collision → reported as single-task-per-epic, not per-root", () => {
+  // Two ready tasks in the same epic AND same root. Both mutexes would fire,
+  // but per-epic runs first and claims the row — per-root never sees a still-
+  // ready competitor to mutate.
+  const t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    target_repo: "/r",
+  });
+  const epic = makeEpic({ tasks: [t1, t2], project_dir: "/r" });
+  const snap = run([epic]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
   );
 });
 
@@ -579,43 +728,122 @@ test("planner-running: job_links entry on a stopped job → not running", () => 
 });
 
 // ---------------------------------------------------------------------------
-// applySingleRootMutex (direct test)
+// Post-pass mutex direct tests
 // ---------------------------------------------------------------------------
 
-test("applySingleRootMutex: standalone invocation mutates verdict maps in place", () => {
-  const t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
-  const t2 = makeTask({
-    task_id: "fn-1-foo.2",
-    task_number: 2,
-    target_repo: "/r",
-  });
+test("applySingleTaskPerEpicMutex: standalone invocation mutates verdict map in place", () => {
+  const t1 = makeTask({ task_id: "fn-1-foo.1" });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
   const epic = makeEpic({ tasks: [t1, t2] });
   const perTask = new Map<string, Verdict>([
     ["fn-1-foo.1", { tag: "ready" }],
     ["fn-1-foo.2", { tag: "ready" }],
   ]);
-  const perCloseRow = new Map<string, Verdict>();
-  applySingleRootMutex([epic], perTask, perCloseRow);
+  applySingleTaskPerEpicMutex([epic], perTask);
   expect(perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
-  expect(perTask.get("fn-1-foo.2")).toEqual(blocked({ kind: "single-root" }));
+  expect(perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
 });
 
-test("applySingleRootMutex: only ready rows are touched (blocked/completed stay put)", () => {
-  const t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
-  const t2 = makeTask({
-    task_id: "fn-1-foo.2",
-    task_number: 2,
-    target_repo: "/r",
-  });
+test("applySingleTaskPerEpicMutex: non-completed non-ready row STILL claims the epic slot", () => {
+  // The new semantics: any non-completed verdict (not just `ready`) claims
+  // the slot. A blocked-but-non-completed row occupies the epic, so the
+  // later ready row gets mutated.
+  const t1 = makeTask({ task_id: "fn-1-foo.1" });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
   const epic = makeEpic({ tasks: [t1, t2] });
   const perTask = new Map<string, Verdict>([
     ["fn-1-foo.1", blocked({ kind: "job-pending" })],
     ["fn-1-foo.2", { tag: "ready" }],
   ]);
-  applySingleRootMutex([epic], perTask, new Map());
-  // First row stays blocked; second row "wins" the root because no prior ready.
+  applySingleTaskPerEpicMutex([epic], perTask);
   expect(perTask.get("fn-1-foo.1")).toEqual(blocked({ kind: "job-pending" }));
-  expect(perTask.get("fn-1-foo.2")).toEqual({ tag: "ready" });
+  expect(perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("applySingleTaskPerEpicMutex: only ready rows are mutated (already-blocked sibling keeps its reason)", () => {
+  // First row ready → claims slot. Second row already dep-on-task blocked →
+  // stays put. Third row ready → mutated to single-task-per-epic.
+  const t1 = makeTask({ task_id: "fn-1-foo.1" });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
+  const t3 = makeTask({ task_id: "fn-1-foo.3", task_number: 3 });
+  const epic = makeEpic({ tasks: [t1, t2, t3] });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", { tag: "ready" }],
+    ["fn-1-foo.2", blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" })],
+    ["fn-1-foo.3", { tag: "ready" }],
+  ]);
+  applySingleTaskPerEpicMutex([epic], perTask);
+  expect(perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
+  );
+  expect(perTask.get("fn-1-foo.3")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("applySingleTaskPerRootMutex: standalone invocation mutates verdict maps in place", () => {
+  const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/r",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", { tag: "ready" }],
+    ["fn-2-bar.1", { tag: "ready" }],
+  ]);
+  applySingleTaskPerRootMutex([e1, e2], perTask, new Map());
+  expect(perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("applySingleTaskPerRootMutex: non-completed non-ready row STILL claims the root", () => {
+  // Cross-epic version of the same broader rule: an actively blocked row in
+  // epic A occupies root /r so a later ready row in epic B gets mutated.
+  const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/r",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", blocked({ kind: "job-running" })],
+    ["fn-2-bar.1", { tag: "ready" }],
+  ]);
+  applySingleTaskPerRootMutex([e1, e2], perTask, new Map());
+  expect(perTask.get("fn-1-foo.1")).toEqual(blocked({ kind: "job-running" }));
+  expect(perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -649,8 +877,11 @@ test("formatPill renders the three tags + every reason kind", () => {
   expect(
     formatPill(blocked({ kind: "dep-on-epic", upstream: "fn-0-bar" })),
   ).toBe("[blocked:dep-on-epic fn-0-bar]");
-  expect(formatPill(blocked({ kind: "single-root" }))).toBe(
-    "[blocked:single-root]",
+  expect(formatPill(blocked({ kind: "single-task-per-epic" }))).toBe(
+    "[blocked:single-task-per-epic]",
+  );
+  expect(formatPill(blocked({ kind: "single-task-per-root" }))).toBe(
+    "[blocked:single-task-per-root]",
   );
   expect(formatPill(blocked({ kind: "unknown" }))).toBe("[blocked:unknown]");
 });
