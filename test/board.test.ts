@@ -22,7 +22,7 @@
 
 import { expect, test } from "bun:test";
 import { projectRows } from "../scripts/board";
-import { computeReadiness } from "../scripts/readiness";
+import { computeReadiness } from "../src/readiness";
 import type {
   EmbeddedJob,
   Epic,

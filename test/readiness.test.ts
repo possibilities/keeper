@@ -1,5 +1,5 @@
 /**
- * Pure-function tests for `scripts/readiness.ts` — exercises the 11-predicate
+ * Pure-function tests for `src/readiness.ts` — exercises the 11-predicate
  * pipeline + two post-pass mutexes (per-epic, per-root) + epic header rollup
  * directly. No DB, no reducer, no migration: build `Epic[]` / `Job` map /
  * `SubagentInvocation[]` fixtures inline and assert verdict map equality.
@@ -25,7 +25,7 @@ import {
   computeReadiness,
   formatPill,
   type Verdict,
-} from "../scripts/readiness";
+} from "../src/readiness";
 import type {
   EmbeddedJob,
   Epic,

@@ -88,13 +88,13 @@ import {
   type QueryFrame,
   type ServerFrame,
 } from "../src/protocol";
-import type { Epic, Job, JobLinkEntry, SubagentInvocation } from "../src/types";
 import {
   computeReadiness,
   formatPill,
   type ReadinessSnapshot,
   type Verdict,
-} from "./readiness";
+} from "../src/readiness";
+import type { Epic, Job, JobLinkEntry, SubagentInvocation } from "../src/types";
 
 /**
  * Page sizing. Jobs paginates at 10 — a tight enough window that a single
@@ -158,7 +158,7 @@ is the raw 5-value projection enum 'running|ok|failed|unknown|superseded'.
 re-entrant attempts stays visible.
 
 The [<readiness>] pill is one of [ready], [completed], or
-[blocked:<reason>] — a pure-function verdict computed by scripts/readiness.ts
+[blocked:<reason>] — a pure-function verdict computed by src/readiness.ts
 from the (epics, jobs, subagent_invocations) snapshot. For tasks and the
 close row the pill stamps onto the indented "[<id>]" reference line beneath
 the header; for the epic header (which has no id line) it stamps at the
