@@ -66,10 +66,25 @@ test("extractFileTouches resolves Claude file-tool paths relative to the git roo
 test("extractFileTouches drops paths outside the git root", () => {
   const touches = extractFileTouches(
     {
-      tool_name: "Read",
+      tool_name: "Write",
       cwd: "/repo",
       data: JSON.stringify({
         tool_input: { file_path: "/tmp/outside.txt" },
+      }),
+    },
+    "/repo",
+  );
+
+  expect(touches).toEqual([]);
+});
+
+test("extractFileTouches ignores Read so reads don't get attributed as dirty", () => {
+  const touches = extractFileTouches(
+    {
+      tool_name: "Read",
+      cwd: "/repo",
+      data: JSON.stringify({
+        tool_input: { file_path: "src/page.tsx" },
       }),
     },
     "/repo",

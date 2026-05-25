@@ -123,7 +123,6 @@ const DB_POLL_MS = 100;
 const HEARTBEAT_MS = 60_000;
 const GIT_TIMEOUT_MS = 2000;
 const FILE_TOOL_NAMES = new Set([
-  "Read",
   "Write",
   "Edit",
   "MultiEdit",
@@ -186,8 +185,6 @@ function resolveEventPath(
 
 function touchOpForTool(toolName: string | null): string | null {
   switch (toolName) {
-    case "Read":
-      return "read";
     case "Write":
       return "write";
     case "Edit":
@@ -463,7 +460,7 @@ function touchesForJob(
          FROM events
         WHERE session_id = ?
           AND hook_event = 'PostToolUse'
-          AND tool_name IN ('Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit')
+          AND tool_name IN ('Write', 'Edit', 'MultiEdit', 'NotebookEdit')
         ORDER BY id ASC`,
     )
     .all(jobId) as EventRow[];
