@@ -2,14 +2,18 @@
  * Git status producer worker. Snapshots planctl-backed git worktrees and posts
  * a synthetic snapshot message when the rendered git view changes.
  *
- * EVENT-DRIVEN, not polled: a snapshot fires only when one of three signals
+ * EVENT-DRIVEN, not polled: a snapshot fires only when one of four signals
  * arrives — (1) a `@parcel/watcher` event on the worktree (file content
- * changed), (2) a `PRAGMA data_version` bump on keeper's own DB (new tool
- * event landed → per-job touched-set may have changed → reattribution
- * required), or (3) a 60s heartbeat safety-net. Each signal feeds a per-root
- * `RescanScheduler` (trailing-debounce + single-flight) so a flurry collapses
- * into one `git status` shell-out. The per-root `lastByRoot` JSON dedupe
- * absorbs no-op snapshots.
+ * changed), (2) a `@parcel/watcher` event on the git common-dir (commit,
+ * checkout, branch-switch, fetch — operations that mutate refs/HEAD/index
+ * without touching any worktree file, which the worktree subscription
+ * intentionally never sees because it ignores `**\/.git/**`), (3) a
+ * `PRAGMA data_version` bump on keeper's own DB (new tool event landed →
+ * per-job touched-set may have changed → reattribution required), or (4) a
+ * 60s heartbeat safety-net. Each signal feeds a per-root `RescanScheduler`
+ * (trailing-debounce + single-flight) so a flurry collapses into one
+ * `git status` shell-out. The per-root `lastByRoot` JSON dedupe absorbs
+ * no-op snapshots.
  *
  * `PRAGMA data_version` polling is the only sanctioned DB change primitive
  * per the CLAUDE.md DO-NOT — it's a sub-ms autocommit counter read, not a
@@ -26,7 +30,7 @@
 
 import type { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { isAbsolute, join, normalize, relative } from "node:path";
+import { isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
@@ -147,6 +151,30 @@ const GIT_IGNORE_GLOBS = [
   "**/target/**",
   "**/.venv/**",
   "**/*.tmp",
+];
+
+/**
+ * Positive ignore globs for the sibling `@parcel/watcher` subscription on each
+ * worktree's git common-dir. The point of that subscription is to fire on
+ * commit/checkout/branch-switch/fetch — operations that mutate `HEAD`,
+ * `index`, `refs/heads/**`, `refs/remotes/**`, or `packed-refs` without
+ * touching any worktree file. Everything below is high-churn noise that
+ * doesn't affect `git status` output: object packs (a single `git gc` emits
+ * thousands of events under `objects/`), reflogs (every ref move appends to
+ * `logs/`), user-installed hooks and git-lfs storage that we never read, and
+ * transient `*.lock` files (`index.lock`, `HEAD.lock`, `refs/heads/foo.lock`)
+ * created and removed on every git write. The 500ms scheduler debounce plus
+ * the per-root JSON dedupe in `emitSnapshot` would absorb these as no-ops,
+ * but pruning them at the watcher reduces the FSEvents pressure that itself
+ * causes drop-recovery storms.
+ */
+const GIT_DIR_IGNORE_GLOBS = [
+  "**/objects/**",
+  "**/logs/**",
+  "**/hooks/**",
+  "**/lfs/**",
+  "**/info/**",
+  "**/*.lock",
 ];
 
 function stringifyErr(err: unknown): string {
@@ -378,6 +406,27 @@ function gitRootFor(path: string): string | null {
   return existsSync(join(root, ".planctl")) ? root : null;
 }
 
+/**
+ * Absolute path to the git common-dir for `root`. Use `--git-common-dir`
+ * rather than `--git-dir` so a linked worktree (where `<root>/.git` is a
+ * gitfile pointing into `<main>/.git/worktrees/<name>/`) resolves to the
+ * main repo's `.git/` — the place where shared refs (`refs/heads/*`,
+ * `packed-refs`, `refs/remotes/*`) live. For a regular repo the two return
+ * the same path. The worktree's own per-worktree `HEAD` and `index` sit
+ * inside the common-dir at `worktrees/<name>/`, so this single subscription
+ * covers both worktree-local and shared-ref mutations.
+ *
+ * git's default output is relative to `root`; we resolve to absolute so
+ * `@parcel/watcher.subscribe` gets a stable canonical path.
+ */
+function gitCommonDirFor(root: string): string | null {
+  const out = gitOutput(["-C", root, "rev-parse", "--git-common-dir"]);
+  const value = out?.trim();
+  if (!value) return null;
+  const abs = isAbsolute(value) ? value : resolve(root, value);
+  return existsSync(abs) ? abs : null;
+}
+
 function readStatus(root: string): ParsedGitStatus | null {
   const out = gitOutput([
     "-C",
@@ -556,7 +605,17 @@ function startWorker(): void {
   const port = parentPort;
 
   const lastByRoot = new Map<string, string>();
-  const subscriptions = new Map<string, AsyncSubscription>();
+  // Each watched root holds a worktree subscription and (best-effort) a
+  // git-common-dir subscription. The git-dir sub may be null if the
+  // common-dir lookup failed or the subscribe itself rejected (logged,
+  // non-fatal — the heartbeat backstop still covers commit/checkout for
+  // that root within 60s). Co-locating the two so unsubscribe + shutdown
+  // can release them as a unit.
+  interface RootSubscriptions {
+    worktree: AsyncSubscription;
+    gitDir: AsyncSubscription | null;
+  }
+  const subscriptions = new Map<string, RootSubscriptions>();
   const schedulers = new Map<string, RescanScheduler>();
   const cwdRootCache = new Map<string, string | null>();
 
@@ -613,8 +672,11 @@ function startWorker(): void {
     if (shuttingDown || watcherModule == null) return;
     if (subscriptions.has(root)) return;
     const sched = schedulerFor(root);
+    const mod = watcherModule;
+    let worktreeSub: AsyncSubscription | null = null;
+    let gitDirSub: AsyncSubscription | null = null;
     try {
-      const sub = await watcherModule.subscribe(
+      worktreeSub = await mod.subscribe(
         root,
         (err) => {
           if (err) {
@@ -633,13 +695,56 @@ function startWorker(): void {
         { ignore: GIT_IGNORE_GLOBS },
       );
       if (shuttingDown) {
-        void sub.unsubscribe();
+        void worktreeSub.unsubscribe();
         return;
       }
-      subscriptions.set(root, sub);
+
+      // Sibling subscription on the git common-dir. The worktree sub ignores
+      // `**/.git/**` (and even without that ignore, FSEvents wouldn't fire on
+      // refs/HEAD/index churn because git uses rename-replace and lockfile
+      // dance under the gitdir). Without this, a `git commit` (which only
+      // mutates `.git/index`, `.git/HEAD`, `.git/refs/...`, `.git/objects/...`)
+      // is invisible to the worker until the 60s heartbeat — the bug the
+      // human hit. A failure here is logged and tolerated: the root stays
+      // subscribed to its worktree, and the heartbeat still covers it.
+      const commonDir = gitCommonDirFor(root);
+      if (commonDir != null) {
+        try {
+          gitDirSub = await mod.subscribe(
+            commonDir,
+            (err) => {
+              if (err) {
+                console.error(
+                  `[git-worker] git-dir watcher error for ${commonDir}: ${stringifyErr(err)}`,
+                );
+                if (isDropError(err)) sched.schedule();
+                return;
+              }
+              sched.schedule();
+            },
+            { ignore: GIT_DIR_IGNORE_GLOBS },
+          );
+        } catch (err) {
+          console.error(
+            `[git-worker] failed to subscribe to git-dir ${commonDir}: ${stringifyErr(err)}`,
+          );
+        }
+      }
+      if (shuttingDown) {
+        if (gitDirSub != null) void gitDirSub.unsubscribe();
+        void worktreeSub.unsubscribe();
+        return;
+      }
+
+      subscriptions.set(root, { worktree: worktreeSub, gitDir: gitDirSub });
       // Initial snapshot for the newly-watched root.
       emitSnapshot(root);
     } catch (err) {
+      // Only the worktree `await` can reach this catch — the git-dir branch
+      // has its own inner try/catch, and every subsequent step is sync &
+      // non-throwing. So `gitDirSub` is still null here; only `worktreeSub`
+      // needs best-effort teardown.
+      if (worktreeSub != null) void worktreeSub.unsubscribe();
       console.error(
         `[git-worker] failed to subscribe to ${root}: ${stringifyErr(err)}`,
       );
@@ -663,9 +768,16 @@ function startWorker(): void {
     if (sub != null) {
       subscriptions.delete(root);
       try {
-        await sub.unsubscribe();
+        await sub.worktree.unsubscribe();
       } catch {
         // best-effort
+      }
+      if (sub.gitDir != null) {
+        try {
+          await sub.gitDir.unsubscribe();
+        } catch {
+          // best-effort
+        }
       }
     }
     const sched = schedulers.get(root);
@@ -715,9 +827,16 @@ function startWorker(): void {
       subscriptions.clear();
       for (const sub of subs) {
         try {
-          await sub.unsubscribe();
+          await sub.worktree.unsubscribe();
         } catch {
           // best-effort
+        }
+        if (sub.gitDir != null) {
+          try {
+            await sub.gitDir.unsubscribe();
+          } catch {
+            // best-effort
+          }
         }
       }
       try {
