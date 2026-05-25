@@ -975,6 +975,7 @@ interface EmbeddedJobElement {
   created_at: number;
   updated_at: number;
   last_event_id: number;
+  rate_limited_at: number | null;
 }
 
 /**
@@ -990,6 +991,7 @@ interface JobsRowForSync {
   created_at: number;
   updated_at: number;
   last_event_id: number;
+  rate_limited_at: number | null;
 }
 
 /**
@@ -1047,6 +1049,7 @@ function buildEmbeddedJob(row: JobsRowForSync): EmbeddedJobElement {
     created_at: row.created_at,
     updated_at: row.updated_at,
     last_event_id: row.last_event_id,
+    rate_limited_at: row.rate_limited_at,
   };
 }
 
@@ -1234,7 +1237,7 @@ function syncIfPlanRef(
 ): void {
   const row = db
     .query(
-      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id FROM jobs WHERE job_id = ?",
+      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, rate_limited_at FROM jobs WHERE job_id = ?",
     )
     .get(jobId) as JobsRowForSync | null;
   if (row == null || row.plan_ref == null) {

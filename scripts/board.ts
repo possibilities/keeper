@@ -218,6 +218,21 @@ function planVerbLabel(v: unknown): string | null {
 }
 
 /**
+ * Render the optional `[limited]` pill segment from a `jobs.rate_limited_at`
+ * cell. The reducer stamps the column to a unix-seconds REAL on a synthetic
+ * `RateLimited` fold and clears it to NULL on the next `UserPromptSubmit`
+ * revival (see `src/reducer.ts`), so any non-null value means "this stoppage
+ * was rate-limit-caused, the human hasn't picked up since the quota reset."
+ * Returns the leading `' '` so the caller can append unconditionally — empty
+ * string when the field is null, ` [limited]` otherwise. The underlying
+ * lifecycle pill (`[stopped]`) is rendered separately from `jobs.state` and
+ * always shows first; this annotation stacks after it.
+ */
+function rateLimitedPillSeg(v: unknown): string {
+  return v == null ? "" : " [limited]";
+}
+
+/**
  * Map a `subagent_invocations.status` value to the nested-line pill. The
  * projection enumerates `running | ok | failed | unknown`; anything past
  * `running` reads as terminal — collapsed to `[stopped]` so the nested
@@ -423,7 +438,7 @@ async function main(): Promise<void> {
     for (const j of jobsArr) {
       const job = j as Record<string, unknown>;
       out.push(
-        `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]`,
+        `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${rateLimitedPillSeg(job.rate_limited_at)}`,
       );
       out.push(...subagentLinesFor(String(job.job_id), "      "));
     }
@@ -538,7 +553,7 @@ async function main(): Promise<void> {
     const cwdSeg = cwd === "" ? "" : `(${cwd}) `;
     const role = planVerbLabel(row.plan_verb);
     const roleSeg = role == null ? "" : ` [${role}]`;
-    return `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]`;
+    return `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${rateLimitedPillSeg(row.rate_limited_at)}`;
   }
 
   /**

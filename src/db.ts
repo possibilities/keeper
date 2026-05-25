@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -390,7 +390,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     start_time TEXT,
     plan_verb TEXT,
     plan_ref TEXT,
-    epic_links TEXT NOT NULL DEFAULT '[]'
+    epic_links TEXT NOT NULL DEFAULT '[]',
+    rate_limited_at REAL
 )
 `;
 
@@ -1371,6 +1372,48 @@ function migrate(db: Database): void {
       // above ensures this. Cost: re-folding the entire event log
       // inside the BEGIN IMMEDIATE — bounded by `events` row count,
       // seconds to tens of seconds on a developer machine. One-time.
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM subagent_invocations");
+    }
+
+    // v17→v18: add `jobs.rate_limited_at REAL` — nullable timestamp stamped
+    // by the reducer's `RateLimited` arm (synthetic event minted by main from
+    // a transcript-worker `rate-limited` message) and cleared on the next
+    // `UserPromptSubmit` revival. Column def matches CREATE_JOBS so a fresh
+    // v18 DB and a migrated v17→v18 DB converge to identical schema (the
+    // addColumnIfMissing/literal lockstep convention).
+    //
+    // Pair-step: the same column is added to the embedded `jobs` array
+    // shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
+    // `EmbeddedJob` in `src/types.ts`), so the field appears on every
+    // embedded entry — not just newly-rate-limited ones. Historical
+    // serialized arrays from v17 do NOT have the field; without a rewind,
+    // incremental `syncJobIntoEpic` writes from later events would
+    // re-serialize entries WITH the field while neighbour entries in the
+    // same array stayed WITHOUT it, breaking the byte-identical re-fold
+    // invariant (CLAUDE.md). The rewind-and-redrain below harmonizes
+    // both sides to "new schema everywhere".
+    addColumnIfMissing(db, "jobs", "rate_limited_at", "REAL");
+
+    // Non-idempotent rewind-and-redrain — same shape as the v16→v17 step.
+    // Version-guarded: re-open of an already-migrated v18+ DB skips it
+    // (the guard reads the meta row written by a PRIOR migrate(); on a
+    // fresh v18 DB or one that crashed before stamping v18,
+    // `storedVersionV18 < 18` and the rewind runs; on steady-state v18+
+    // DB it skips). The boot drain after migrate() returns rebuilds
+    // `jobs` / `epics` / `subagent_invocations` from the event log,
+    // re-emitting embedded `jobs` arrays with the new field present on
+    // every entry.
+    const storedVersionV18 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV18 < 18) {
       db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
       db.run("DELETE FROM jobs");
       db.run("DELETE FROM epics");

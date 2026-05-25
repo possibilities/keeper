@@ -101,6 +101,7 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "plan_verb",
     "plan_ref",
     "epic_links",
+    "rate_limited_at",
   ],
   pk: "job_id",
   version: "last_event_id",

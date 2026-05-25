@@ -96,6 +96,7 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     created_at: 0,
     updated_at: 0,
     last_event_id: 0,
+    rate_limited_at: null,
     ...overrides,
   };
 }

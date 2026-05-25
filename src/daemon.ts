@@ -80,6 +80,7 @@ import { DEFAULT_BATCH_SIZE, drain } from "./reducer";
 import { seedKilledSweep } from "./seed-sweep";
 import type { ServerWorkerData } from "./server-worker";
 import type {
+  RateLimitedMessage,
   TranscriptTitleMessage,
   TranscriptWorkerData,
 } from "./transcript-worker";
@@ -266,41 +267,86 @@ function runDaemon(): void {
   // `data.session_title` (the same field the reducer's title rule reads);
   // everything else is NULL (synthetic — never carries a process identity).
   transcriptWorker.onmessage = (
-    ev: MessageEvent<TranscriptTitleMessage | undefined>,
+    ev: MessageEvent<
+      TranscriptTitleMessage | RateLimitedMessage | undefined
+    >,
   ): void => {
     const msg = ev.data;
-    if (!msg || msg.kind !== "transcript-title") {
+    if (!msg) {
       return;
     }
-    stmts.insertEvent.run({
-      $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
-      $session_id: msg.sessionId, // == job_id
-      $pid: null,
-      $hook_event: "TranscriptTitle", // synthetic; reducer maps → 'transcript'
-      $event_type: "transcript_title",
-      $tool_name: null,
-      $matcher: null,
-      $cwd: null,
-      $permission_mode: null,
-      $agent_id: null,
-      $agent_type: null,
-      $stop_hook_active: null,
-      $data: JSON.stringify({ session_title: msg.title }),
-      $subagent_agent_id: null,
-      $spawn_name: null,
-      $start_time: null,
-      $slash_command: null,
-      $skill_name: null,
-      $planctl_op: null,
-      $planctl_target: null,
-      $planctl_epic_id: null,
-      $planctl_task_id: null,
-      $planctl_subject_present: null,
-    });
-    // Our own INSERT bumps data_version, so the wake worker would re-drain
-    // anyway — but pump directly so the title folds without a poll-cycle delay.
-    wakePending = true;
-    pumpWakes();
+    if (msg.kind === "transcript-title") {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
+        $session_id: msg.sessionId, // == job_id
+        $pid: null,
+        $hook_event: "TranscriptTitle", // synthetic; reducer maps → 'transcript'
+        $event_type: "transcript_title",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ session_title: msg.title }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $planctl_op: null,
+        $planctl_target: null,
+        $planctl_epic_id: null,
+        $planctl_task_id: null,
+        $planctl_subject_present: null,
+      });
+      // Our own INSERT bumps data_version, so the wake worker would re-drain
+      // anyway — but pump directly so the title folds without a poll-cycle delay.
+      wakePending = true;
+      pumpWakes();
+      return;
+    }
+    if (msg.kind === "rate-limited") {
+      // Synthetic `RateLimited` event minted from the transcript-worker
+      // signal — Claude Code wrote its `isApiErrorMessage: true,
+      // error: "rate_limit"` synthetic assistant turn to the JSONL. The
+      // reducer's RateLimited arm folds this row by flipping `jobs.state`
+      // to `'stopped'` AND stamping `jobs.rate_limited_at` to the event
+      // ts in a single transaction (re-fold-deterministic). Everything
+      // other than `session_id` / `hook_event` / `event_type` / `data` is
+      // NULL — synthetics never carry a process identity. The display
+      // text rides in `data.rate_limit_text` for downstream consumers;
+      // the reducer reads only `event.ts` and `event.id`.
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: msg.sessionId,
+        $pid: null,
+        $hook_event: "RateLimited",
+        $event_type: "rate_limited",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ rate_limit_text: msg.text }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $planctl_op: null,
+        $planctl_target: null,
+        $planctl_epic_id: null,
+        $planctl_task_id: null,
+        $planctl_subject_present: null,
+      });
+      wakePending = true;
+      pumpWakes();
+      return;
+    }
   };
 
   // Same crash policy as the other workers: any thread failure → fatalExit.

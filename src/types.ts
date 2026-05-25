@@ -229,6 +229,21 @@ export interface Job {
    * pure `deriveEpicLinks` classifier in `src/plan-classifier.ts`.
    */
   epic_links: Link[];
+  /**
+   * Unix-seconds REAL stamped by the reducer's `RateLimited` arm — the
+   * synthetic event main mints from a transcript-worker `rate-limited`
+   * message when Claude Code writes its `isApiErrorMessage: true,
+   * error: "rate_limit"` synthetic assistant turn to the transcript. The
+   * lifecycle column (`state`) is concurrently flipped to `'stopped'`, so
+   * the underlying state-machine reads correctly; `rate_limited_at` is the
+   * separate annotation that explains *why* the session is stopped. Cleared
+   * on the next `UserPromptSubmit` revival (the human picked up after the
+   * quota reset) and only on that arm — Stop / SessionEnd / Killed leave
+   * it intact, so the "this stoppage was rate-limit-caused" attribution
+   * survives the natural lifecycle that follows the rate-limit event. NULL
+   * on every job that has never been rate-limited.
+   */
+  rate_limited_at: number | null;
 }
 
 /**
@@ -264,6 +279,13 @@ export interface EmbeddedJob {
   created_at: number;
   updated_at: number;
   last_event_id: number;
+  /**
+   * Mirrors {@link Job.rate_limited_at} so a renderer reading the embedded
+   * array shows the same `[limited]` pill on the in-epic / in-task job
+   * lines that the top-level jobs collection shows on its bottom list.
+   * NULL on every entry that has never been rate-limited (the common case).
+   */
+  rate_limited_at: number | null;
 }
 
 /**

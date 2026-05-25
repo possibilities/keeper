@@ -73,6 +73,27 @@ export interface TranscriptTitleMessage {
   title: string;
 }
 
+/**
+ * Message posted to the parent on each fresh rate-limit synthetic assistant
+ * turn observed in a session's transcript. Claude Code writes this entry
+ * when the API request fails at the HTTP 429 boundary — no real model turn
+ * fires, no hook event lands, but the JSONL gains a marker line carrying
+ * `error: "rate_limit"`, `isApiErrorMessage: true`. Main mints a synthetic
+ * `RateLimited` event from this message; the reducer flips `jobs.state` to
+ * `'stopped'` AND stamps `jobs.rate_limited_at` to the event ts (see
+ * `src/reducer.ts` RateLimited arm).
+ *
+ * `text` carries Claude Code's own user-facing wording — typically
+ * `"You've hit your session limit · resets 3:20am (America/New_York)"` —
+ * for downstream display. The worker doesn't parse the reset clock; the
+ * full string rides as-is so a future renderer can surface it verbatim.
+ */
+export interface RateLimitedMessage {
+  kind: "rate-limited";
+  sessionId: string;
+  text: string;
+}
+
 /** Message the parent sends to ask the worker to stop. */
 export interface ShutdownMessage {
   type: "shutdown";
@@ -126,6 +147,65 @@ function matchCustomTitle(parsed: unknown): CustomTitleLine | null {
   return { sessionId: obj.sessionId, title: obj.customTitle };
 }
 
+/** A parsed rate-limit synthetic assistant line: session + display text. */
+interface RateLimitLine {
+  sessionId: string;
+  text: string;
+}
+
+/**
+ * Match a parsed JSONL object against the rate-limit synthetic-assistant
+ * shape that Claude Code emits when an API request fails at the HTTP 429
+ * boundary. Required gate fields (verified against a real captured line):
+ *
+ *   { type: "assistant",
+ *     error: "rate_limit",
+ *     isApiErrorMessage: true,
+ *     sessionId: <string>,
+ *     message: { content: [{type:"text", text:<reset wording>}] } }
+ *
+ * Strict gate — only the canonical rate-limit envelope matches; any other
+ * assistant turn (real or synthetic) returns `null`. `text` falls back to
+ * the empty string when the content shape is missing (still emits — the
+ * synthetic event is the load-bearing signal, the text is display-only).
+ */
+function matchRateLimit(parsed: unknown): RateLimitLine | null {
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+  const obj = parsed as {
+    type?: unknown;
+    error?: unknown;
+    isApiErrorMessage?: unknown;
+    sessionId?: unknown;
+    message?: unknown;
+  };
+  if (obj.type !== "assistant") {
+    return null;
+  }
+  if (obj.error !== "rate_limit") {
+    return null;
+  }
+  if (obj.isApiErrorMessage !== true) {
+    return null;
+  }
+  if (typeof obj.sessionId !== "string" || obj.sessionId.length === 0) {
+    return null;
+  }
+  let text = "";
+  const msg = obj.message;
+  if (msg && typeof msg === "object") {
+    const content = (msg as { content?: unknown }).content;
+    if (Array.isArray(content) && content.length > 0) {
+      const first = content[0] as { text?: unknown };
+      if (typeof first.text === "string") {
+        text = first.text;
+      }
+    }
+  }
+  return { sessionId: obj.sessionId, text };
+}
+
 /**
  * Per-path forward-tail state: the byte offset we've consumed up to, a
  * persistent UTF-8 decoder (so a multi-byte char split across a read-chunk
@@ -165,9 +245,27 @@ export class TranscriptLineStream {
   private readonly pathState = new Map<string, PathState>();
   private readonly lastEmitted = new Map<string, string>();
 
+  /**
+   * Live forward-tail driver. `onTitle` is called for each NEW (changed)
+   * `custom-title` line — change-gated by `lastEmitted`. `log` is the
+   * stderr-logger seam tests override. `onRateLimited` is called for each
+   * fresh rate-limit synthetic-assistant line — NOT change-gated (the
+   * daemon-side reducer fold is idempotent, so a defensive same-line
+   * re-emit is harmless; the worker stays simple). In practice the
+   * forward-only tail anchors each path at EOF on first sight, so a line
+   * is read at most once per worker lifetime regardless.
+   *
+   * Param order is `(onTitle, log, onRateLimited)` — `log` stays in the
+   * historical second slot so existing 2-arg test calls keep working;
+   * `onRateLimited` is the new optional third slot.
+   */
   constructor(
     private readonly onTitle: (sessionId: string, title: string) => void,
     private readonly log: (msg: string) => void = (m) => console.error(m),
+    private readonly onRateLimited: (
+      sessionId: string,
+      text: string,
+    ) => void = () => {},
   ) {}
 
   /**
@@ -455,8 +553,14 @@ export class TranscriptLineStream {
     if (line.trim().length === 0) {
       return;
     }
-    // Cheap pre-filter: skip the JSON.parse for lines that can't be a title.
-    if (!line.includes("custom-title")) {
+    // Cheap pre-filter: skip the JSON.parse for lines that can't be either
+    // a title or a rate-limit synthetic. The two needle-substrings are
+    // disjoint, so a single `includes` per shape stays branch-cheap. Most
+    // transcript lines (assistant tool_use turns, tool_result attachments)
+    // miss both and bail before JSON.parse.
+    const isTitle = line.includes("custom-title");
+    const isRateLimit = !isTitle && line.includes('"rate_limit"');
+    if (!isTitle && !isRateLimit) {
       return;
     }
     let parsed: unknown;
@@ -468,16 +572,29 @@ export class TranscriptLineStream {
       );
       return;
     }
-    const match = matchCustomTitle(parsed);
+    if (isTitle) {
+      const match = matchCustomTitle(parsed);
+      if (!match) {
+        return;
+      }
+      const prev = this.lastEmitted.get(match.sessionId);
+      if (prev === match.title) {
+        return; // change-only emit: same title already emitted
+      }
+      this.lastEmitted.set(match.sessionId, match.title);
+      this.onTitle(match.sessionId, match.title);
+      return;
+    }
+    // Rate-limit synthetic: no change-gate. The forward-only tail reads
+    // each line at most once per worker lifetime, and the reducer fold is
+    // idempotent (state + rate_limited_at stamped from the event payload),
+    // so a duplicate emit (boot scan + live tail double-fire would be the
+    // only way) folds to the same row state.
+    const match = matchRateLimit(parsed);
     if (!match) {
       return;
     }
-    const prev = this.lastEmitted.get(match.sessionId);
-    if (prev === match.title) {
-      return; // change-only emit: same title already emitted
-    }
-    this.lastEmitted.set(match.sessionId, match.title);
-    this.onTitle(match.sessionId, match.title);
+    this.onRateLimited(match.sessionId, match.text);
   }
 }
 
@@ -570,13 +687,23 @@ function main(): void {
   const { db } = openDb(data.dbPath, { readonly: true });
 
   const port = parentPort;
-  const stream = new TranscriptLineStream((sessionId, title) => {
-    port.postMessage({
-      kind: "transcript-title",
-      sessionId,
-      title,
-    } satisfies TranscriptTitleMessage);
-  });
+  const stream = new TranscriptLineStream(
+    (sessionId, title) => {
+      port.postMessage({
+        kind: "transcript-title",
+        sessionId,
+        title,
+      } satisfies TranscriptTitleMessage);
+    },
+    undefined, // `log` defaults to stderr — the worker has no override here.
+    (sessionId, text) => {
+      port.postMessage({
+        kind: "rate-limited",
+        sessionId,
+        text,
+      } satisfies RateLimitedMessage);
+    },
+  );
 
   // Restart-seed: don't re-emit a transcript title already folded into jobs.
   try {
