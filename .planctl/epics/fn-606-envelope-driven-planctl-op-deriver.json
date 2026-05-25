@@ -1,0 +1,20 @@
+{
+  "branch_name": "fn-606-envelope-driven-planctl-op-deriver",
+  "bundles": [
+    "sketch/planctl-envelope-driven-creator-refiner"
+  ],
+  "created_at": "2026-05-25T16:44:28.533661Z",
+  "depends_on_epics": [],
+  "id": "fn-606-envelope-driven-planctl-op-deriver",
+  "last_validated_at": "2026-05-25T16:44:28.589211Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "envelope-driven planctl-op deriver",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-25T16:44:28.533661Z"
+}
