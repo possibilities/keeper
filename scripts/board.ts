@@ -6,7 +6,9 @@
  * the epics body + a `~~~` divider line + the jobs body, both refreshed
  * under the same poll/connect lifecycle so they always show the same
  * wall-clock snapshot of the daemon. `subagent_invocations` rows feed the
- * readiness pill ONLY — they're not directly rendered in the body.
+ * readiness pill AND nest as indented `[running] / [stopped]` lines under
+ * the matching job row (in both the embedded-in-epic context and the
+ * bottom jobs list), keyed on `job_id` and ordered by `turn_seq asc`.
  *
  * Frame shape (one `---` lead per frame):
  *
@@ -215,6 +217,18 @@ function planVerbLabel(v: unknown): string | null {
   return PLAN_VERB_LABELS[s] ?? s;
 }
 
+/**
+ * Map a `subagent_invocations.status` value to the nested-line pill. The
+ * projection enumerates `running | ok | failed | unknown`; anything past
+ * `running` reads as terminal — collapsed to `[stopped]` so the nested
+ * grammar stays a binary live/done indicator. Terminal-outcome detail
+ * (`ok` vs `failed` vs `unknown`) lives on the row in SQLite for callers
+ * that need it; this view just signals "still spinning or not".
+ */
+function subagentPill(status: unknown): "[running]" | "[stopped]" {
+  return status === "running" ? "[running]" : "[stopped]";
+}
+
 function epicNumFromId(id: string): number | null {
   const m = /^[a-z]+-(\d+)-/.exec(id);
   return m ? Number.parseInt(m[1], 10) : null;
@@ -244,6 +258,21 @@ interface CollectionState {
   readonly query: QueryFrame;
   order: string[];
   byId: Map<string, Record<string, unknown>>;
+  /**
+   * Full row stream from the most recent `result` frame, in wire order.
+   * `byId` keys on `pk` and collapses duplicates — fine for `epics` /
+   * `jobs` (where `epic_id` / `job_id` is unique) but lossy for
+   * `subagent_invocations`, whose SQL composite identity is
+   * `(job_id, agent_id, turn_seq)` even though the descriptor exposes
+   * `job_id` alone as the wire pk (see
+   * `src/collections.ts:SUBAGENT_INVOCATIONS_DESCRIPTOR`). Callers that
+   * need every row — notably the readiness handoff for
+   * `subagent_invocations`, where two `running` invocations on one
+   * `job_id` must both reach `computeReadiness` so predicate 6
+   * (`own-progress-sub`) doesn't false-negative — read from `rows`
+   * instead of `byId.values()`.
+   */
+  rows: Record<string, unknown>[];
   gotResult: boolean;
   queryInFlight: boolean;
   refetchDirty: boolean;
@@ -262,10 +291,30 @@ function makeState(
     query: { type: "query", collection, id: subId, limit },
     order: [],
     byId: new Map(),
+    rows: [],
     gotResult: false,
     queryInFlight: false,
     refetchDirty: false,
   };
+}
+
+/**
+ * Pure helper — project a collection state into the typed row stream the
+ * readiness pipeline expects. Uses `state.rows` (not `byId.values()`) so
+ * collections with a composite SQL identity but a single-column wire pk
+ * (today: `subagent_invocations`, pk `job_id`, identity
+ * `(job_id, agent_id, turn_seq)`) deliver every received row, not just
+ * the last-write-wins one per pk value. Exported for the regression test
+ * in `test/board.test.ts`.
+ */
+export function projectRows<T>(state: { rows: readonly unknown[] }): T[] {
+  // The descriptors guarantee the row shape matches the typed projection
+  // (the server-side `decodeRow` materialises it); this cast is the same
+  // shape-trust the readiness handoff already makes. The input type is
+  // intentionally permissive (`readonly unknown[]`) so the regression
+  // test in `test/board.test.ts` can hand in a `{ rows: T[] }` literal
+  // without an upcast to `Record<string, unknown>[]`.
+  return state.rows as unknown as T[];
 }
 
 async function main(): Promise<void> {
@@ -291,14 +340,15 @@ async function main(): Promise<void> {
 
   const epics = makeState("epics", "epics-frames", "epic_id", EPICS_PAGE_LIMIT);
   const jobs = makeState("jobs", "jobs-frames", "job_id", JOBS_PAGE_LIMIT);
-  // The `subagent_invocations` descriptor's pk is `job_id` (it's a composite
-  // PK `(job_id, agent_id, turn_seq)` but the wire-facing index key is
-  // `job_id` — see `src/collections.ts:SUBAGENT_INVOCATIONS_DESCRIPTOR`).
-  // The readiness predicate 6 only ever asks "is there a running sub-agent
-  // under this worker.session_id?" — keying by `job_id` is sufficient. We
-  // store every row received under its `job_id` (multiple rows may collide;
-  // the readiness pipeline iterates the array, not the map). Page limit 0
-  // streams the full default scope — same scope-is-board reasoning as epics.
+  // The `subagent_invocations` descriptor exposes `job_id` as the wire pk
+  // even though the SQL identity is composite `(job_id, agent_id,
+  // turn_seq)` — see `src/collections.ts:SUBAGENT_INVOCATIONS_DESCRIPTOR`.
+  // `byId` collapses re-entrant sub-agents in one session (multiple rows
+  // sharing one `job_id`) to last-write-wins, so the readiness handoff in
+  // `emitFrameIfChanged` reads from `state.rows` instead — every received
+  // invocation reaches `computeReadiness` so predicate 6
+  // (`own-progress-sub`) sees every `running` sub. Page limit 0 streams
+  // the full default scope — same scope-is-board reasoning as epics.
   const subagentInvocations = makeState(
     "subagent_invocations",
     "subagent-invocations-frames",
@@ -318,6 +368,14 @@ async function main(): Promise<void> {
   // `null` between frames (cleared on disconnect; replaced on next emit).
   let lastReadiness: ReadinessSnapshot | null = null;
 
+  // Per-frame `job_id → SubagentInvocation[]` index — built once in
+  // `emitFrameIfChanged` from `subagentInvocations.rows` and read by
+  // `subagentLinesFor` when nesting under a job row. Each bucket is
+  // sorted by `turn_seq asc` so the nested list reads in invocation
+  // order. `null` between frames (cleared on disconnect; replaced on
+  // next emit).
+  let lastSubagentIndex: Map<string, SubagentInvocation[]> | null = null;
+
   type Sock = Awaited<ReturnType<typeof Bun.connect>>;
   let currentSock: Sock | null = null;
   let attempt = 0;
@@ -334,14 +392,42 @@ async function main(): Promise<void> {
    * absent from the page (it's done-AND-approved and off the board). No
    * `onBoardOnly` toggle is needed here.
    */
+  /**
+   * Per-job sub-agent lines. Reads from `lastSubagentIndex` (built once
+   * per frame in `emitFrameIfChanged` before `renderBody` runs). Each
+   * line carries `{subagent_type}: {description} [pill]` — `description`
+   * is dropped when null/empty so the pill stays anchored next to the
+   * type. `indent` is supplied per caller: embedded jobs (already three-
+   * space indented inside an epic block) get six spaces; bottom-section
+   * jobs (flush left) get three. Returns `[]` for jobs with no recorded
+   * invocations so callers can spread unconditionally.
+   */
+  function subagentLinesFor(jobId: string, indent: string): string[] {
+    const hits = lastSubagentIndex?.get(jobId);
+    if (hits === undefined || hits.length === 0) {
+      return [];
+    }
+    return hits.map((inv) => {
+      const type = inv.subagent_type ?? "subagent";
+      const desc = inv.description ?? "";
+      const label = desc === "" ? type : `${type}: ${desc}`;
+      return `${indent}${label} ${subagentPill(inv.status)}`;
+    });
+  }
+
   function renderJobLines(jobsArr: unknown): string[] {
     if (!Array.isArray(jobsArr) || jobsArr.length === 0) {
       return [];
     }
-    return jobsArr.map((j) => {
+    const out: string[] = [];
+    for (const j of jobsArr) {
       const job = j as Record<string, unknown>;
-      return `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]`;
-    });
+      out.push(
+        `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]`,
+      );
+      out.push(...subagentLinesFor(String(job.job_id), "      "));
+    }
+    return out;
   }
 
   /**
@@ -459,9 +545,11 @@ async function main(): Promise<void> {
    * Jobs body is split into two stacked sub-lists by `plan_verb` presence:
    * no-role (ambient sessions) on top, with-role (planner/worker/closer —
    * epic-bound work) on the bottom, joined by a `~~~` line. Within each
-   * partition we preserve server order. Same empty-side drop rule as the
-   * outer `renderBody`: a partition with zero rows yields just the other
-   * one, no divider; both empty yields `""`.
+   * partition we preserve server order, and each job row is followed by
+   * its `subagentLinesFor` block (three-space indent — one level under
+   * the flush-left job line). Same empty-side drop rule as the outer
+   * `renderBody`: a partition with zero rows yields just the other one,
+   * no divider; both empty yields `""`.
    */
   function renderJobsBody(): string {
     if (jobs.order.length === 0) {
@@ -471,11 +559,13 @@ async function main(): Promise<void> {
     const withRole: string[] = [];
     for (const id of jobs.order) {
       const row = jobs.byId.get(id) ?? { [jobs.pk]: id };
-      const line = projectJobRow(row);
+      const block = [projectJobRow(row), ...subagentLinesFor(id, "   ")].join(
+        "\n",
+      );
       if (row.plan_verb == null) {
-        noRole.push(line);
+        noRole.push(block);
       } else {
-        withRole.push(line);
+        withRole.push(block);
       }
     }
     const top = noRole.join("\n");
@@ -617,11 +707,30 @@ async function main(): Promise<void> {
     for (const [id, row] of jobs.byId) {
       jobsTyped.set(id, row as unknown as Job);
     }
-    const subsTyped: SubagentInvocation[] = [];
-    for (const row of subagentInvocations.byId.values()) {
-      subsTyped.push(row as unknown as SubagentInvocation);
-    }
+    // Read from `state.rows` (not `byId.values()`) so re-entrant sub-agents
+    // sharing one `job_id` all reach `computeReadiness` — `byId` keys on
+    // the wire pk (`job_id`) and collapses them last-write-wins, which
+    // would false-negative predicate 6 (`own-progress-sub`). See
+    // `projectRows` and the `CollectionState.rows` docstring.
+    const subsTyped = projectRows<SubagentInvocation>(subagentInvocations);
     lastReadiness = computeReadiness(epicsTyped, jobsTyped, subsTyped);
+    // Per-frame `job_id → invocations` index for `subagentLinesFor` —
+    // re-entrant sub-agents within one session sit on the same `job_id`
+    // bucket, ordered by `turn_seq asc` so the nested list reads in
+    // invocation order.
+    const subIndex = new Map<string, SubagentInvocation[]>();
+    for (const inv of subsTyped) {
+      const arr = subIndex.get(inv.job_id);
+      if (arr === undefined) {
+        subIndex.set(inv.job_id, [inv]);
+      } else {
+        arr.push(inv);
+      }
+    }
+    for (const arr of subIndex.values()) {
+      arr.sort((a, b) => a.turn_seq - b.turn_seq);
+    }
+    lastSubagentIndex = subIndex;
     const body = renderBody();
     if (body === lastBody) {
       return;
@@ -684,6 +793,12 @@ async function main(): Promise<void> {
       state.queryInFlight = false;
       state.order.length = 0;
       state.byId.clear();
+      // Re-snapshot `rows` from this frame — the readiness handoff reads
+      // from here (not `byId.values()`) so that collections with a
+      // composite SQL identity but a single-column wire pk (today:
+      // `subagent_invocations`) deliver every row instead of collapsing
+      // duplicates last-write-wins. See `CollectionState.rows`.
+      state.rows = frame.rows.slice();
       for (const row of frame.rows) {
         const id = String(row[state.pk]);
         state.order.push(id);
@@ -730,12 +845,14 @@ async function main(): Promise<void> {
     for (const s of states) {
       s.order.length = 0;
       s.byId.clear();
+      s.rows.length = 0;
       s.queryInFlight = false;
       s.refetchDirty = false;
       s.gotResult = false;
     }
     lastBody = null;
     lastReadiness = null;
+    lastSubagentIndex = null;
   }
 
   async function connectOnce(): Promise<void> {
@@ -824,4 +941,8 @@ async function main(): Promise<void> {
   await connectWithRetry();
 }
 
-await main();
+// Entry-point guard — only run when invoked as a script, not when imported
+// (the test suite imports `projectRows` from this module).
+if (import.meta.main) {
+  await main();
+}
