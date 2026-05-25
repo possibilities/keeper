@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-05-25T15:38:06.358967Z",
   "depends_on": [
@@ -14,8 +14,8 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "simplify board native status pills",
-  "updated_at": "2026-05-25T17:04:51.749919Z",
+  "updated_at": "2026-05-25T19:46:22.136006Z",
   "work_review_status": "unknown",
   "work_reviewed_at": null,
-  "worker_done_at": null
+  "worker_done_at": "2026-05-25T19:46:22.136006Z"
 }

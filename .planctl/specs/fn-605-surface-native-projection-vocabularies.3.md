@@ -71,5 +71,5 @@ Update `README.md` lines 258-284 (board.ts client description) to drop the `is_r
 - [ ] Visual smoke against a live daemon shows expected pills on at least one task row and one subagent row
 
 ## Done summary
-
+Deleted subagentPill + AnnotatedInvocation + is_replaced marking pass. Task rows now render [runtime_status] [worker_phase] [approval] (three native pills); subagent lines stamp the raw 5-value enum verbatim including [superseded]. HELP + README refreshed; readiness.ts already consumed worker_phase from task .1.
 ## Evidence
