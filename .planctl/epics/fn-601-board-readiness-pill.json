@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-601-board-readiness-pill",
   "bundles": [
     "sketch/board-readiness-pill"
