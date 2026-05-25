@@ -89,7 +89,6 @@ import type { Epic, Job, SubagentInvocation } from "../src/types";
 import {
   computeReadiness,
   formatPill,
-  formatReasonLine,
   type ReadinessSnapshot,
   type Verdict,
 } from "./readiness";
@@ -144,9 +143,12 @@ epic file — flipped by 'planctl validate --epic <id>'.
 
 The [<readiness>] pill is one of [ready], [completed], or
 [blocked:<reason>] — a pure-function verdict computed by scripts/readiness.ts
-from the (epics, jobs, subagent_invocations) snapshot. A blocked row is
-followed by a "   (reason: <reason>)" continuation line so the cause is
-visible without scanning the upstream rows.
+from the (epics, jobs, subagent_invocations) snapshot. For tasks and the
+close row the pill stamps onto the indented "[<id>]" reference line beneath
+the header; for the epic header (which has no id line) it stamps at the
+end of the header itself. The bracket payload carries the full reason
+(including any "dep-on-task <upstream>" id) so blocked rows need no
+separate continuation.
 
 The jobs body is itself split into two stacked sub-lists separated by a '~~~'
 line: jobs with NO plan_verb (ambient sessions) on top, jobs WITH a plan_verb
@@ -464,25 +466,6 @@ async function main(): Promise<void> {
     return map.get(id) ?? { tag: "blocked", reason: { kind: "unknown" } };
   }
 
-  /**
-   * Render a row with the readiness pill appended after the existing
-   * `[status] [approval]` segment, and — when the verdict is blocked —
-   * a continuation line `   (reason: <reason text>)` underneath. The
-   * `baseLine` carries everything before the pill so the caller composes
-   * the pill in the same expression that already carries the row's pills.
-   */
-  function appendReadinessLines(
-    out: string[],
-    baseLine: string,
-    verdict: Verdict,
-  ): void {
-    out.push(`${baseLine} ${formatPill(verdict)}`);
-    const reason = formatReasonLine(verdict);
-    if (reason !== null) {
-      out.push(`   (reason: ${reason})`);
-    }
-  }
-
   function renderEpicBlock(row: Record<string, unknown>): string {
     const dir =
       row.project_dir == null ? "" : basename(String(row.project_dir));
@@ -501,11 +484,9 @@ async function main(): Promise<void> {
     const epicId = seg(row[epics.pk]);
     const epicApproval = approvalPill(row.approval);
     const lines: string[] = [];
-    const epicHeaderBase = `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}]`;
-    appendReadinessLines(
-      lines,
-      epicHeaderBase,
-      verdictFromMap(lastReadiness?.perEpic, epicId),
+    const epicVerdict = verdictFromMap(lastReadiness?.perEpic, epicId);
+    lines.push(
+      `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}] ${formatPill(epicVerdict)}`,
     );
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {
@@ -518,21 +499,19 @@ async function main(): Promise<void> {
         tnums.length === 0 ? "" : ` [${tnums.map((n) => `#${n}`).join(",")}]`;
       const taskApproval = approvalPill(t.approval);
       const taskId = seg(t.task_id);
-      const taskRowBase = `${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.status)}] [${taskApproval}]`;
-      appendReadinessLines(
-        lines,
-        taskRowBase,
-        verdictFromMap(lastReadiness?.perTask, taskId),
+      const taskVerdict = verdictFromMap(lastReadiness?.perTask, taskId);
+      lines.push(
+        `${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.status)}] [${taskApproval}]`,
+        `   [${taskId}] ${formatPill(taskVerdict)}`,
+        ...renderJobLines(t.jobs),
       );
-      lines.push(`   [${taskId}]`, ...renderJobLines(t.jobs));
     }
-    const closeRowBase = `X. Quality audit and close [${seg(row.status)}] [${epicApproval}]`;
-    appendReadinessLines(
-      lines,
-      closeRowBase,
-      verdictFromMap(lastReadiness?.perCloseRow, epicId),
+    const closeVerdict = verdictFromMap(lastReadiness?.perCloseRow, epicId);
+    lines.push(
+      `X. Quality audit and close [${seg(row.status)}] [${epicApproval}]`,
+      `   [${epicId}] ${formatPill(closeVerdict)}`,
+      ...renderJobLines(row.jobs),
     );
-    lines.push(`   [${epicId}]`, ...renderJobLines(row.jobs));
     return lines.join("\n");
   }
 

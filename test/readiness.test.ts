@@ -20,7 +20,6 @@ import {
   type BlockReason,
   computeReadiness,
   formatPill,
-  formatReasonLine,
   type Verdict,
 } from "../scripts/readiness";
 import type {
@@ -615,7 +614,7 @@ test("applySingleRootMutex: only ready rows are touched (blocked/completed stay 
 });
 
 // ---------------------------------------------------------------------------
-// formatPill / formatReasonLine
+// formatPill
 // ---------------------------------------------------------------------------
 
 test("formatPill renders the three tags + every reason kind", () => {
@@ -649,17 +648,6 @@ test("formatPill renders the three tags + every reason kind", () => {
     "[blocked:single-root]",
   );
   expect(formatPill(blocked({ kind: "unknown" }))).toBe("[blocked:unknown]");
-});
-
-test("formatReasonLine: null for non-blocked, plain reason for blocked", () => {
-  expect(formatReasonLine({ tag: "ready" })).toBeNull();
-  expect(formatReasonLine({ tag: "completed" })).toBeNull();
-  expect(formatReasonLine(blocked({ kind: "single-root" }))).toBe(
-    "single-root",
-  );
-  expect(
-    formatReasonLine(blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" })),
-  ).toBe("dep-on-task fn-1-foo.1");
 });
 
 // ---------------------------------------------------------------------------

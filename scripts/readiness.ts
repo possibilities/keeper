@@ -564,15 +564,3 @@ function formatReasonShort(reason: BlockReason): string {
   }
 }
 
-/**
- * Render the continuation-line reason text shown UNDER a blocked row.
- * For non-blocked verdicts this returns `null` — caller drops the line.
- * Same string as the pill's bracket payload, but free of bracket framing
- * so the renderer can wrap it in `(reason: ...)`.
- */
-export function formatReasonLine(verdict: Verdict): string | null {
-  if (verdict.tag !== "blocked") {
-    return null;
-  }
-  return formatReasonShort(verdict.reason);
-}
