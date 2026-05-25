@@ -711,7 +711,7 @@ def _run_case(case: dict) -> dict:
         for ev in events:
             by_session.setdefault(ev["session_id"], []).append(ev)
         expected: list[dict] = []
-        for _sid, evs in by_session.items():
+        for evs in by_session.values():
             evs_sorted = sorted(evs, key=lambda e: (e["ts"], e["id"]))
             py_rows = [_py_row(ev) for ev in evs_sorted]
             entries = parse_rows(py_rows, group_by=None)
