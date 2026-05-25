@@ -74,7 +74,7 @@ import {
   runPlanctlApprovalMigration,
 } from "./db";
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
-import type { GitSnapshotMessage, GitWorkerData } from "./git-worker";
+import type { GitWorkerData, GitWorkerMessage } from "./git-worker";
 import type { PlanMessage, PlanWorkerData } from "./plan-worker";
 import { DEFAULT_BATCH_SIZE, drain } from "./reducer";
 import { seedKilledSweep } from "./seed-sweep";
@@ -549,18 +549,30 @@ function runDaemon(): void {
   );
 
   gitWorker.onmessage = (
-    ev: MessageEvent<GitSnapshotMessage | undefined>,
+    ev: MessageEvent<GitWorkerMessage | undefined>,
   ): void => {
     const msg = ev.data;
-    if (!msg || msg.kind !== "git-snapshot") {
+    if (!msg) return;
+    let hookEvent: string;
+    let data: string;
+    if (msg.kind === "git-snapshot") {
+      hookEvent = "GitSnapshot";
+      const { kind: _kind, ...snapshot } = msg;
+      data = JSON.stringify(snapshot);
+    } else if (msg.kind === "git-root-dropped") {
+      // Tombstone: the reducer DELETEs the `git_status` row whose primary key
+      // is `project_dir`. No payload beyond the pk in `session_id` — matches
+      // the EpicDeleted / TaskDeleted shape so re-fold reproduces the deletion.
+      hookEvent = "GitRootDropped";
+      data = "";
+    } else {
       return;
     }
-    const { kind: _kind, ...snapshot } = msg;
     stmts.insertEvent.run({
       $ts: Date.now() / 1000,
       $session_id: msg.project_dir,
       $pid: null,
-      $hook_event: "GitSnapshot",
+      $hook_event: hookEvent,
       $event_type: "git_snapshot",
       $tool_name: null,
       $matcher: null,
@@ -569,7 +581,7 @@ function runDaemon(): void {
       $agent_id: null,
       $agent_type: null,
       $stop_hook_active: null,
-      $data: JSON.stringify(snapshot),
+      $data: data,
       $subagent_agent_id: null,
       $spawn_name: null,
       $start_time: null,

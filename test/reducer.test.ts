@@ -208,6 +208,53 @@ test("GitSnapshot folds into git_status and advances the cursor", () => {
   expect(getCursor()).toBe(id);
 });
 
+test("GitRootDropped DELETEs the git_status row and advances the cursor", () => {
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: ".planctl/epics/x.json", xy: " D" }],
+      orphaned_files: [{ path: ".planctl/epics/x.json", xy: " D" }],
+      jobs: [],
+    }),
+  });
+  const dropId = insertEvent({
+    hook_event: "GitRootDropped",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: "",
+  });
+
+  expect(drainAll()).toBe(2);
+  const row = db
+    .query("SELECT * FROM git_status WHERE project_dir = ?")
+    .get("/repo");
+  expect(row).toBeNull();
+  expect(getCursor()).toBe(dropId);
+});
+
+test("GitRootDropped on an unknown project_dir is a safe no-op", () => {
+  const id = insertEvent({
+    hook_event: "GitRootDropped",
+    session_id: "/never-folded",
+    cwd: "/never-folded",
+    data: "",
+  });
+  expect(drainAll()).toBe(1);
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM git_status").get() as { n: number }
+  ).n;
+  expect(count).toBe(0);
+  expect(getCursor()).toBe(id);
+});
+
 function drainAll(): number {
   let total = 0;
   let n: number;

@@ -388,9 +388,13 @@ export interface Epic {
 /**
  * One row of the volatile git read projection. Rows are produced by synthetic
  * `GitSnapshot` events emitted by the git worker after polling a planctl-backed
- * git worktree with porcelain-v2 status output. The reducer folds only the
- * persisted snapshot payload; it never shells out or re-reads filesystem state,
- * so a from-scratch re-fold reproduces the same observed frames.
+ * git worktree with porcelain-v2 status output, and retracted by synthetic
+ * `GitRootDropped` tombstone events the git worker emits when a worktree stops
+ * being planctl-backed (e.g. its `.planctl/` directory was removed) and the
+ * watcher is being torn down. The reducer folds only the persisted snapshot
+ * payload (or the tombstone's `project_dir` pk in `session_id`); it never
+ * shells out or re-reads filesystem state, so a from-scratch re-fold reproduces
+ * the same observed frames — including the retraction.
  */
 export interface GitStatus {
   project_dir: string;

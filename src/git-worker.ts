@@ -17,7 +17,11 @@
  *
  * This worker is an event PRODUCER only: it owns no writable DB connection and
  * never mutates projections. Main inserts a `GitSnapshot` event, and the
- * reducer folds that persisted payload into `git_status`.
+ * reducer folds that persisted payload into `git_status`. When a watched root
+ * stops being planctl-backed (its `.planctl/` directory was removed), the
+ * worker also posts a `GitRootDropped` tombstone message from `unsubscribeRoot`
+ * — main lifts it into a synthetic `GitRootDropped` event whose reducer fold
+ * DELETEs the projection row, keeping `git_status` in sync with the worktree.
  */
 
 import type { Database } from "bun:sqlite";
@@ -73,6 +77,21 @@ export interface GitSnapshotPayload {
 export interface GitSnapshotMessage extends GitSnapshotPayload {
   kind: "git-snapshot";
 }
+
+/**
+ * Tombstone message: a watched root has stopped being planctl-backed (its
+ * `.planctl/` directory disappeared, so `gitRootFor()` now returns null) and
+ * the worker is unsubscribing. Main lifts this into a synthetic
+ * `GitRootDropped` event whose reducer fold DELETEs the corresponding
+ * `git_status` row — without it the projection would leak the final pre-drop
+ * snapshot forever (the reducer's `projectGitStatus` is UPSERT-only).
+ */
+export interface GitRootDroppedMessage {
+  kind: "git-root-dropped";
+  project_dir: string;
+}
+
+export type GitWorkerMessage = GitSnapshotMessage | GitRootDroppedMessage;
 
 interface ParsedGitStatus {
   branch: string | null;
@@ -593,6 +612,18 @@ function startWorker(): void {
   }
 
   async function unsubscribeRoot(root: string): Promise<void> {
+    // Tombstone first — main lifts this into a synthetic GitRootDropped event
+    // whose reducer fold DELETEs the projection row. Posting before teardown
+    // keeps the producer-only contract: the event log is the sole driver of
+    // git_status changes, so re-fold determinism extends to retractions.
+    // Skip during shutdown — main has already cleared its onmessage handler
+    // and posting would be a no-op that just races the worker's exit path.
+    if (!shuttingDown) {
+      port.postMessage({
+        kind: "git-root-dropped",
+        project_dir: root,
+      } satisfies GitRootDroppedMessage);
+    }
     const sub = subscriptions.get(root);
     if (sub != null) {
       subscriptions.delete(root);

@@ -21,6 +21,10 @@
  *                       |   'killed' -> 'stopped' + refresh pid + start_time;
  *                       |   a non-terminal row's state is left as-is.
  *   UserPromptSubmit    | state -> 'working'  (also re-opens 'ended' or 'killed')
+ *                       |   AND clears rate_limited_at to NULL — a fresh
+ *                       |   prompt means the human picked up after the quota
+ *                       |   reset, so the "this stoppage was rate-limited"
+ *                       |   annotation no longer applies.
  *                       |   EXCEPT when the prompt is Claude Code's
  *                       |   `<task-notification>…<status>killed</status>`
  *                       |   shutdown-housekeeping envelope — those are no-ops
@@ -34,6 +38,18 @@
  *                       |   (pid, start_time) matches the event payload, OR
  *                       |   the persisted start_time is NULL — legacy loose
  *                       |   match. Race-recovered mismatches are no-ops.)
+ *   RateLimited         | state -> 'stopped' AND rate_limited_at -> event.ts
+ *                       |   (synthetic; skipped on 'ended' or 'killed' — same
+ *                       |   terminal guard as Stop. Minted by main from a
+ *                       |   transcript-worker `rate-limited` message when
+ *                       |   Claude Code writes its isApiErrorMessage/rate_limit
+ *                       |   synthetic assistant turn to the transcript. The
+ *                       |   lifecycle column tracks "is the session running"
+ *                       |   honestly — the API request failed at the boundary,
+ *                       |   no work is happening — and rate_limited_at carries
+ *                       |   the separate "*why* it's stopped" annotation that
+ *                       |   survives Stop/SessionEnd/Killed and only clears on
+ *                       |   the next UserPromptSubmit revival.)
  *   <any with title>    | title -> data.session_title by precedence (the
  *                       |   source is 'transcript' for a TranscriptTitle event,
  *                       |   else 'payload'; write iff it outranks/ties+changes)
@@ -715,6 +731,25 @@ function projectGitStatus(db: Database, event: Event): void {
       event.ts,
     ],
   );
+}
+
+/**
+ * Fold one synthetic `GitRootDropped` tombstone. The git-worker posts this
+ * from `unsubscribeRoot()` when a watched worktree stops being planctl-backed
+ * (its `.planctl/` directory was removed); without it, `projectGitStatus`'s
+ * UPSERT-only path would leak the final pre-drop snapshot row forever.
+ *
+ * The primary key (`project_dir`) rides in `event.session_id`. An empty /
+ * missing pk is a safe no-op — the invariant says fold must never throw
+ * inside the cursor-advance transaction. DELETE is idempotent: re-folding
+ * over a row that's already gone matches zero rows, not an error.
+ */
+function retractGitStatus(db: Database, event: Event): void {
+  const projectDir = event.session_id;
+  if (projectDir == null || projectDir.length === 0) {
+    return;
+  }
+  db.run("DELETE FROM git_status WHERE project_dir = ?", [projectDir]);
 }
 
 /**
@@ -1650,8 +1685,14 @@ function projectJobsRow(db: Database, event: Event): void {
       // (legacy hook) or pid matches, behavior is unchanged.
       //
       // The CASE is a pure function of (event.pid, row.pid) — re-fold safe.
+      // Also clears `rate_limited_at` to NULL on every revival: a fresh
+      // prompt means the human picked up after the quota reset, so the
+      // "this stoppage was rate-limited" annotation no longer applies. The
+      // clear is unconditional (cheap, no-op when already NULL) and pure —
+      // a from-scratch re-fold sees the same write.
       db.run(
         `UPDATE jobs SET state = 'working',
+                         rate_limited_at = NULL,
                          pid = COALESCE(?, pid),
                          start_time = CASE
                            WHEN ? IS NOT NULL AND ? != pid THEN NULL
@@ -1752,6 +1793,39 @@ function projectJobsRow(db: Database, event: Event): void {
         syncIfPlanRef(db, jobId, event.id, ts);
       }
       break;
+
+    case "RateLimited": {
+      // Synthetic event minted by main from a transcript-worker
+      // `rate-limited` message — fired when Claude Code writes its
+      // `isApiErrorMessage: true, error: "rate_limit"` synthetic assistant
+      // turn to the transcript. The API request failed at the boundary
+      // (HTTP 429) and no real model turn occurred, so the session is
+      // effectively stopped even though no `Stop` hook ever fired.
+      //
+      // Flips `state` to 'stopped' AND stamps `rate_limited_at` to the
+      // event ts in a single UPDATE — both columns must move together, so
+      // the board pill pair (`[stopped] [limited]`) is byte-identical
+      // under a from-scratch re-fold. Same terminal guard as Stop: a stray
+      // RateLimited on an already-terminal row must NOT resurrect it (and
+      // also must not stamp the annotation onto a row whose lifecycle is
+      // already `ended` / `killed` for unrelated reasons — the rate-limit
+      // signal is by definition mid-life).
+      const res = db.run(
+        `UPDATE jobs SET state = 'stopped',
+                         rate_limited_at = ?,
+                         last_event_id = ?,
+                         updated_at = ?
+           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
+        [ts, event.id, ts, jobId],
+      );
+      // Sync only when the UPDATE actually wrote — a guarded no-op on a
+      // still-terminal row must NOT re-fan the embedded entry (it would
+      // re-write a stale-but-unchanged element with the new event_id).
+      if (res.changes > 0) {
+        syncIfPlanRef(db, jobId, event.id, ts);
+      }
+      break;
+    }
 
     default:
       // PreToolUse, PostToolUse, PostToolUseFailure, Notification, and any
@@ -1870,6 +1944,8 @@ export function applyEvent(
       retractPlanRow(db, event);
     } else if (event.hook_event === "GitSnapshot") {
       projectGitStatus(db, event);
+    } else if (event.hook_event === "GitRootDropped") {
+      retractGitStatus(db, event);
     } else {
       projectJobsRow(db, event);
       // The `subagent_invocations` projection rides the same transaction +
