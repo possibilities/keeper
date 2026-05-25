@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-607-fix-plan-worker-boot-scan-to-prime",
   "bundles": [],
+  "closer_done_at": "2026-05-25T22:40:36.523411Z",
   "created_at": "2026-05-25T19:58:55.410367Z",
   "depends_on_epics": [
     "fn-605-surface-native-projection-vocabularies"
@@ -11,10 +12,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "fix plan-worker boot scan to prime state/tasks cache",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-25T19:58:55.410367Z"
+  "updated_at": "2026-05-25T22:40:36.523411Z"
 }
