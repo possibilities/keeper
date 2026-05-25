@@ -92,7 +92,7 @@ interface MockConnectResult {
  */
 function makeMockConnect(): MockConnectResult {
   const socketRef: { current: MockSocket | null } = { current: null };
-  const factory: ConnectFactory = (_path, handlers) => {
+  const factory: ConnectFactory = async (_path, handlers) => {
     let resolveDone: (() => void) | null = null;
     const done = new Promise<void>((resolve) => {
       resolveDone = resolve;
@@ -138,7 +138,8 @@ function makeMockConnect(): MockConnectResult {
     // semantics resolve after `open` fires; doing it in this order is
     // shape-equivalent for the helper.
     handlers.open(sock);
-    return done.then(() => sock);
+    await done;
+    return sock;
   };
   return { factory, socketRef };
 }
