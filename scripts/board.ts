@@ -1,18 +1,17 @@
 #!/usr/bin/env bun
 /**
  * keeper-board — a combined "UI" over the read-only NDJSON-over-UDS subscribe
- * server (`src/server-worker.ts`) that fuses `scripts/epics.ts` and
- * `scripts/jobs.ts` into a single stream: one frame per change, each frame is
- * the epics body + a `~~~` divider line + the jobs body, both refreshed
- * under the same poll/connect lifecycle so they always show the same
- * wall-clock snapshot of the daemon.
+ * server (`src/server-worker.ts`) that streams the epics and jobs collections
+ * as one frame per change: each frame is the epics body + a `~~~` divider
+ * line + the jobs body, both refreshed under the same poll/connect lifecycle
+ * so they always show the same wall-clock snapshot of the daemon.
  *
  * Frame shape (one `---` lead per frame):
  *
  *   ---
- *   {epics body}     ← see scripts/epics.ts for the epic-block format
+ *   {epics body}     ← one block per epic, see `renderEpicBlock` below
  *   ~~~
- *   {jobs body}      ← see scripts/jobs.ts for the job-line format
+ *   {jobs body}      ← one row per job, see `projectJobRow` below
  *
  * The jobs body itself is split into two stacked sub-lists separated by a
  * `~~~` line: jobs with NO `plan_verb` (ambient / ad-hoc sessions) on top,
@@ -30,7 +29,7 @@
  * refetch in the other; the rendered body is recomputed from BOTH whenever
  * either lands a fresh `result`. The combined body is byte-compared against
  * the last printed frame, so internal row churn that doesn't surface in the
- * render is invisible (same contract as the sibling scripts).
+ * render is invisible.
  *
  * First-paint policy: NO frame is emitted until BOTH collections have
  * received their first `result`. Otherwise the first paint would briefly
@@ -47,21 +46,19 @@
  * two job partitions is empty, the inner `~~~` is dropped and the
  * populated partition reads as a single flat list.
  *
- * Filters: this combined view uses the SERVER defaults for both
- * collections — epics: `status = 'open' AND approval != 'approved'`; jobs:
- * live only (`working + stopped`, terminal states hidden). That's the
- * common-case "board" view; for explicit filters keep using the sibling
- * scripts (they may go away once this view replaces them).
+ * Filters: this view uses the SERVER defaults for both collections — epics:
+ * `status = 'open' AND approval != 'approved'`; jobs: live only
+ * (`working + stopped`, terminal states hidden). That's the common-case
+ * "board" view; for explicit filters drop down to a custom subscribe client.
  *
- * Connection / poll / sidecar / SIGINT semantics mirror the sibling
- * scripts: capped-backoff connect+retry, post-disconnect reconnect, one
- * `...`-fenced lifecycle note per transition, THREE combined sidecar files
- * (state JSON + frame text + per-frame unified diff against the previous
- * emit) overwritten each frame. The diff is `diff -u prev current` via the
- * system tool — universally-readable unified-diff format; the first frame
- * writes a sentinel since there's no prior to diff. SIGINT sends a bare
- * `unsubscribe` (no id) which drops both subscriptions in one frame, then
- * exits.
+ * Connection / poll / sidecar / SIGINT semantics: capped-backoff
+ * connect+retry, post-disconnect reconnect, one `...`-fenced lifecycle note
+ * per transition, THREE combined sidecar files (state JSON + frame text +
+ * per-frame unified diff against the previous emit) overwritten each frame.
+ * The diff is `diff -u prev current` via the system tool — universally-
+ * readable unified-diff format; the first frame writes a sentinel since
+ * there's no prior to diff. SIGINT sends a bare `unsubscribe` (no id) which
+ * drops both subscriptions in one frame, then exits.
  *
  * Usage:
  *   bun scripts/board.ts [--sock <path>]
@@ -83,18 +80,19 @@ import {
 } from "../src/protocol";
 
 /**
- * Jobs page size — same as `scripts/jobs.ts`. Epics fetches the whole
- * default-scope set (`limit: 0`) because `epics.ts` does (and that scope
- * is already tiny — see the rationale in `scripts/epics.ts`).
+ * Page sizing. Jobs paginates at 10 — a tight enough window that a single
+ * frame stays readable while still covering the typical live-session set.
+ * Epics fetches the whole default-scope set (`limit: 0`) because that scope
+ * (open + not-yet-approved) is already tiny — well under any sensible page
+ * limit, and the user wants the whole board, not a window into it.
  */
 const JOBS_PAGE_LIMIT = 10;
 const EPICS_PAGE_LIMIT = 0;
 
 /**
- * Poll cadence (ms) — same as the sibling scripts. Refetches BOTH
- * collections each tick (coalesced per collection, so a tick that arrives
- * while a refetch is in flight just sets that collection's `refetchDirty`
- * and skips the second send).
+ * Poll cadence (ms). Refetches BOTH collections each tick (coalesced per
+ * collection, so a tick that arrives while a refetch is in flight just sets
+ * that collection's `refetchDirty` and skips the second send).
  */
 const POLL_MS = 500;
 
@@ -116,9 +114,18 @@ Usage: bun scripts/board.ts [--sock <path>]
 Renders both views as one frame per change, each frame led by '---':
 
   ---
-  {epics body}      (see scripts/epics.ts for the epic-block format)
+  {epics body}      (one block per epic, see epic-header format below)
   ~~~
-  {jobs body}       (see scripts/jobs.ts for the job-line format)
+  {jobs body}       (one row per job: {basename(cwd)} {title} [role] [state])
+
+Each epic block opens with a header line of the form:
+
+  ({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated]
+
+followed by indented task lines (one per embedded task) and a final
+"Quality audit and close" line for the epic itself. The [validated] /
+[unvalidated] pill reflects planctl's last_validated_at timestamp on the
+epic file — flipped by 'planctl validate --epic <id>'.
 
 The jobs body is itself split into two stacked sub-lists separated by a '~~~'
 line: jobs with NO plan_verb (ambient sessions) on top, jobs WITH a plan_verb
@@ -144,7 +151,7 @@ cleanly.
 
 This view uses the SERVER defaults for both collections (epics: open +
 not-yet-approved; jobs: live only). For explicit per-collection filters
-use the sibling scripts/epics.ts and scripts/jobs.ts.
+write a small custom subscribe client against src/protocol.ts.
 `;
 
 /** Approval enum vocabulary, mirrored from `src/plan-worker.ts:Approval`. */
@@ -170,8 +177,7 @@ function validatedPill(v: unknown): "validated" | "unvalidated" {
 }
 
 /**
- * Map a plan_verb to its noun-form role label for the `[{role}]` pill —
- * mirrors the sibling helpers in `scripts/epics.ts` and `scripts/jobs.ts`.
+ * Map a plan_verb to its noun-form role label for the `[{role}]` pill.
  * Returns `null` when the input is null (the caller drops the pill).
  */
 const PLAN_VERB_LABELS: Record<string, string> = {
@@ -268,8 +274,7 @@ async function main(): Promise<void> {
   const byCollection = new Map(states.map((s) => [s.collection, s]));
 
   // `lastBody` byte-compares the COMBINED body — internal row churn that
-  // doesn't surface in the render is invisible by design (same contract as
-  // the sibling scripts, just across two collections).
+  // doesn't surface in the render is invisible by design.
   let lastBody: string | null = null;
 
   type Sock = Awaited<ReturnType<typeof Bun.connect>>;
@@ -280,14 +285,13 @@ async function main(): Promise<void> {
 
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
-  // --- epic rendering (mirrors scripts/epics.ts:renderEpicBlock) ---
+  // --- epic rendering ---
 
   /**
-   * In the combined view we ALWAYS use the server's default epics scope (no
-   * CLI filter flag), so the fetched set IS the on-board set — `epicDepsFor`
-   * can drop any dep absent from the page (it's done-AND-approved and off
-   * the board). Same logic as `scripts/epics.ts:renderEpicBlock`'s
-   * default-mode branch; no `onBoardOnly` toggle is needed here.
+   * We ALWAYS use the server's default epics scope (no CLI filter flag), so
+   * the fetched set IS the on-board set — `epicDepsFor` can drop any dep
+   * absent from the page (it's done-AND-approved and off the board). No
+   * `onBoardOnly` toggle is needed here.
    */
   function renderJobLines(jobsArr: unknown): string[] {
     if (!Array.isArray(jobsArr) || jobsArr.length === 0) {
@@ -353,7 +357,7 @@ async function main(): Promise<void> {
       .join("\n+++\n");
   }
 
-  // --- job rendering (mirrors scripts/jobs.ts:projectRow) ---
+  // --- job rendering ---
 
   function projectJobRow(row: Record<string, unknown>): string {
     const title = seg(row.title);

@@ -127,7 +127,7 @@ export interface QueryFrame {
    * with NO row cap (LIMIT -1 internally; OFFSET still honored). The
    * realtime diff fan-out scales linearly with watched-set size, so callers
    * opt into `limit: 0` deliberately for views that need the whole
-   * collection (e.g. `scripts/epics.ts`).
+   * collection (e.g. `scripts/board.ts`).
    */
   limit?: number;
   offset?: number;

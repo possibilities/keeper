@@ -5,7 +5,7 @@
  * sends the matching approval RPC. Status defaults to `approved` so the
  * common case is a one-arg invocation.
  *
- * Unlike the example `scripts/epics.ts` / `scripts/jobs.ts` clients, this
+ * Unlike the example `scripts/board.ts` subscribe client, this
  * CLI is short-lived and read/write-mixed: each round-trip opens a fresh
  * `Bun.connect`, sends ONE frame, awaits the matching response by `id`,
  * and closes. No subscription, no poll, no reconnect — if the daemon is
@@ -152,7 +152,7 @@ function validateStatus(value: string): "approved" | "rejected" | "pending" {
  * a trailing `.<digits>` segment names a task (the epic_id is derived by
  * stripping the suffix); anything else is treated as an epic id.
  *
- * The task-id regex mirrors `taskNumFromId` in `scripts/epics.ts` and
+ * The task-id regex mirrors `taskNumFromId` in `scripts/board.ts` and
  * `epicNumberFromId` in the daemon — a planctl task id is the epic slug,
  * a dot, then an integer; no other structure carries the same suffix
  * shape in the wire vocabulary, so this is unambiguous.
@@ -289,7 +289,10 @@ async function roundTrip(
         },
       },
     }).catch((err: Error) => {
-      settle(new Error(`failed to connect to ${sockPath}: ${err.message}`), null);
+      settle(
+        new Error(`failed to connect to ${sockPath}: ${err.message}`),
+        null,
+      );
     });
   });
 }

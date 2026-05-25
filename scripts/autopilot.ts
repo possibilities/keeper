@@ -53,8 +53,8 @@ import {
 
 /**
  * Epics fetches the whole default-scope set (`limit: 0`) — same as
- * `scripts/board.ts` and `scripts/epics.ts`. The default scope is already
- * small (open + not-yet-approved), so unlimited is fine.
+ * `scripts/board.ts`. The default scope is already small (open +
+ * not-yet-approved), so unlimited is fine.
  */
 const EPICS_PAGE_LIMIT = 0;
 
@@ -234,9 +234,7 @@ async function main(): Promise<void> {
       return "";
     }
     return epics.order
-      .map((id) =>
-        renderEpicCommands(epics.byId.get(id) ?? { [epics.pk]: id }),
-      )
+      .map((id) => renderEpicCommands(epics.byId.get(id) ?? { [epics.pk]: id }))
       .join("\n\n");
   }
 

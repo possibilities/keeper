@@ -129,8 +129,7 @@ export const MAX_LIMIT = 500;
 // Every line is `[srv-ts] T=<epochMs> <event>` so a client log emitting the
 // same wall-clock can be diffed against it. Connection lifecycle is always
 // logged; per-call dispatch/tick timings are gated by a duration threshold
-// so the steady-state poll doesn't drown the log. Remove together with the
-// matching `[epics-ts]` instrumentation in `scripts/epics.ts` once the bug
+// so the steady-state poll doesn't drown the log. Remove once the bug
 // is understood.
 let __nextConnId = 0;
 function srvTs(msg: string): void {

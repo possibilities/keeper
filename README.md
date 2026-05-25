@@ -83,8 +83,8 @@ and the `events` log keep their canonical-owner writers and re-fold
 determinism extends to approval (rewind cursor + re-drain reproduces approval
 state byte-identically). RPC handlers MAY write `.planctl` files, never
 reducer projections directly (see [CLAUDE.md](./CLAUDE.md)'s DO NOT list).
-Three example clients ship in `scripts/` (`jobs.ts`, `epics.ts`, and
-`approve.ts`); see [Example clients](#example-clients) for usage.
+Two example clients ship in `scripts/` (`board.ts` and `approve.ts`); see
+[Example clients](#example-clients) for usage.
 
 ## What keeper is NOT
 
@@ -237,62 +237,54 @@ Keeper has no `install` verb. Wire it up manually:
    The subscribe server binds a Unix-domain socket at
    `~/.local/state/keeper/keeperd.sock` by default (a sibling of `keeper.db`).
    Override the path with the `KEEPER_SOCK` environment variable. Two example
-   clients ship in `scripts/` (see [Example clients](#example-clients)).
+   clients ship in `scripts/` — `board.ts` (subscribe) and `approve.ts` (RPC)
+   — see [Example clients](#example-clients).
 
 ## Example clients
 
-Three scripts under `scripts/` demonstrate the subscribe + RPC protocols.
-`jobs.ts` and `epics.ts` are read-only subscribe clients (clones of the same
-connection/coalescing/reconnect plumbing, differing only in their render
-layer); `approve.ts` is the first RPC client (single-shot `rpc` →
-`rpc_result`, no subscription). Run any with `bun scripts/<name>.ts --help`.
+Two scripts under `scripts/` demonstrate the subscribe + RPC protocols.
+`board.ts` is the read-only subscribe client (combined epics + jobs view on
+one connection); `approve.ts` is the RPC client (single-shot `rpc` →
+`rpc_result`, no subscription). Run either with `bun scripts/<name>.ts --help`.
 
-- `jobs.ts` — primitive list UI over the `jobs` collection: pages 10 live jobs
-  and renders a YAML frame per change, each row a single collapsed line
-  (`{basename(cwd)} · {title} · {state}`). Reconnects across keeperd restarts;
-  Ctrl-C unsubscribes cleanly.
-
-  ```sh
-  bun scripts/jobs.ts                # default scope: live jobs
-  bun scripts/jobs.ts --state ended  # see terminal jobs explicitly
-  ```
-
-- `epics.ts` — primitive list UI over the `epics` collection with per-epic
-  and per-task approval pills. Default scope is open, not-yet-approved
-  epics (server-side `{ status: "open", approval: { ne: "approved" } }`);
-  pass `--show-approved` to include approved epics and `--status` /
-  `--status-ne` to widen / narrow status. Each epic renders as a header
-  line — `{dir} {epic_number} {title} [#dep,#dep] [{status}] [{approval}]`
-  — followed by an indented slug line and one indented `{task_number}.
-  {title} [#dep,#dep] [{status}] [{approval}]` + slug line per embedded
-  task. Pills are `[approved]` / `[rejected]` / `[pending]`; a missing or
-  invalid `approval` renders as `[pending]` (the safe-value invariant).
-  The byte-compare emit gate means a pill flip reframes but a row change
-  that doesn't surface in the rendered text alone does not.
+- `board.ts` — combined "board" UI over the `epics` and `jobs` collections.
+  Subscribes to both on a single connection and emits one combined frame per
+  change, led by `---`, with a `~~~` divider between the epics body and the
+  jobs body (and a second `~~~` inside the jobs body splitting ambient
+  sessions from planner/worker/closer rows). Uses server-default scope for
+  both: epics `{ status: "open", approval: { ne: "approved" } }`, jobs live
+  only (`working + stopped`). Each epic renders as a header line —
+  `({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated]` —
+  followed by indented task lines (with `[{status}] [{approval}]` pills)
+  and a final "Quality audit and close" line for the epic itself. The
+  `[validated]` / `[unvalidated]` pill reflects planctl's
+  `last_validated_at` timestamp on the epic file (flipped by
+  `planctl validate --epic <id>`). The byte-compare emit gate keeps the
+  stream quiet when row churn doesn't surface in the render. Reconnects
+  across keeperd restarts; Ctrl-C unsubscribes cleanly. Every emitted
+  frame is mirrored to three per-pid `/tmp` sidecar files (combined JSON
+  state, frame text, unified diff vs. the previous emit); `--clear` enables
+  a live-panel mode that clears the terminal each frame and indexes the
+  sidecars so past frames remain inspectable.
 
   ```sh
-  bun scripts/epics.ts                  # default: open, not-yet-approved
-  bun scripts/epics.ts --show-approved  # include approved epics
-  bun scripts/epics.ts --status done    # see closed epics
+  bun scripts/board.ts            # combined board, default scope
+  bun scripts/board.ts --clear    # live-panel mode with indexed sidecars
   ```
 
 - `approve.ts` — the RPC client. Single-shot: opens a `Bun.connect`, sends
   one `rpc` frame for `set_task_approval` or `set_epic_approval`, awaits the
   `rpc_result` (or `error`), and exits. No subscription, no reconnect loop.
-  Approval is now a first-class planctl field, so the three valid values are
+  Approval is a first-class planctl field, so the three valid values are
   `approved`, `rejected`, and `pending` — there is no `clear` (set to
-  `pending` instead).
+  `pending` instead). The CLI infers epic vs. task from the id's shape
+  (trailing `.N` marks a task).
 
   ```sh
-  bun scripts/approve.ts epic <epic_id> approved
-  bun scripts/approve.ts epic <epic_id> pending            # reset to pending
-  bun scripts/approve.ts task <epic_id> <task_id> rejected
+  bun scripts/approve.ts <epic_id>                   # approved (default)
+  bun scripts/approve.ts <epic_id> pending           # reset to pending
+  bun scripts/approve.ts <epic_id>.<task_n> rejected # reject one task
   ```
-
-The two subscribe scripts mirror each emitted frame to per-pid `/tmp`
-sidecar files (full JSON state + rendered text) for out-of-band inspection.
-The shared subscribe-loop logic lives in each script verbatim — extract a
-shared module once the duplication starts costing more than the copy.
 
 ## Uninstall
 
@@ -352,7 +344,10 @@ changed file, and posts a `plan-epic`/`plan-task` snapshot message to main (and 
 events row and pumps a wake; the reducer folds an `EpicSnapshot` as an idempotent
 upsert into the single `epics` projection and a `TaskSnapshot` into its parent
 epic's embedded `tasks` JSON array (a task change `patch`es the parent epic;
-tombstones retract). As of schema v11 each epic also embeds its plan/close-verb
+tombstones retract). As of schema v14, the `epics` projection adds
+`last_validated_at` (TEXT, nullable) — the validation timestamp planctl writes
+via `planctl validate --epic <id>` and the board client renders as a
+`[validated|unvalidated]` pill. Each epic also embeds its plan/close-verb
 jobs as a `jobs` JSON array, and each task element embeds its own work-verb
 jobs as a nested `jobs` sub-array — fanned in from the reducer's jobs-side
 writes whenever a SessionStart spawn name parses as `{plan|work|close}::<ref>`
@@ -436,7 +431,7 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 
 # Plans projection — epics (each embedding its tasks AND its plan/close-verb jobs as JSON arrays) folded from the configured `.planctl` roots:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT epic_id, epic_number, title, status, json_array_length(jobs) AS epic_jobs_n FROM epics ORDER BY epic_number ASC LIMIT 10'
+  'SELECT epic_id, epic_number, title, status, last_validated_at, json_array_length(jobs) AS epic_jobs_n FROM epics ORDER BY epic_number ASC LIMIT 10'
 # Tasks live inside epics.tasks now — unnest with json_each to list them per epic:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(t.value, '\$.task_number') AS task_number, json_extract(t.value, '\$.title') AS title, json_extract(t.value, '\$.status') AS status FROM epics e, json_each(e.tasks) t ORDER BY e.epic_number ASC, task_number ASC LIMIT 10"
