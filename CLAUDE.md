@@ -9,6 +9,24 @@ event log, reducer, the five worker threads, and the wire protocol — see
 **AGENTS.md symlink** — `AGENTS.md` is a symlink to this file
 (`ln -s CLAUDE.md AGENTS.md`). Edit this file in place; never `rm`+recreate it.
 
+## Design stance
+
+**Design the server for the ideal architecture; do not nickle-and-dime against
+client churn.** The server (event log, reducer, projections, schema, RPC
+surface) is the durable artifact and the source of truth; clients (board.ts,
+the other `scripts/*.ts` UIs, autopilot, future consumers) are cheap to change.
+When a question is "should the projection carry richer state X?" the answer
+is decided by what makes the projection most honest and expressive — never
+by counting how many client call sites would need to update an enum check,
+rename a column reference, or absorb a new variant. Schema bumps, column
+renames, and enum widenings are routine; bending the server to preserve a
+lossy or misleading shape because consumers already read it is the cost we
+refuse. Concretely: if the event log already knows a fact, the projection
+surfaces it natively (full enum, raw timestamp, etc.) rather than collapsing
+it into a binary or a derived label for the renderer's convenience —
+collapsing is the renderer's job iff it ever needs to, and even then "show
+the native value" is the default.
+
 ## Event-sourcing invariants
 
 - **Cursor + projection advance in the SAME `BEGIN IMMEDIATE` transaction.** Every
