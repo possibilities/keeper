@@ -43,5 +43,5 @@ No behavior change risk if the move is verbatim. Only failure mode is a typo'd i
 - [ ] `grep -rn "scripts/readiness" --include="*.ts" .` (outside `.planctl/` and `node_modules/`) returns zero matches.
 
 ## Done summary
-
+Moved scripts/readiness.ts to src/readiness.ts (git mv preserving history); fixed the internal types import to ./types and retargeted three call-site imports (scripts/board.ts, test/readiness.test.ts, test/board.test.ts computeReadiness line only — projectRows import left untouched). bun test green: 713 pass, 1 skip, 0 fail.
 ## Evidence
