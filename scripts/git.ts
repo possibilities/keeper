@@ -95,21 +95,27 @@ function renderRows(rows: Record<string, unknown>[]): string {
       const dirty = Array.isArray(job.dirty)
         ? (job.dirty as Record<string, unknown>[])
         : [];
-      if (dirty.length === 0) continue;
+      const planctl = Array.isArray(job.planctl)
+        ? (job.planctl as Record<string, unknown>[])
+        : [];
+      if (dirty.length === 0 && planctl.length === 0) continue;
       const title = seg(job.title) || seg(job.job_id);
       const role = actor(job.plan_verb);
       const roleSeg = role == null ? "" : ` [${role}]`;
       lines.push(
-        `  ${title}${roleSeg} [${seg(job.state)}] dirty=${dirty.length}`,
+        `  ${title}${roleSeg} [${seg(job.state)}] dirty=${dirty.length} planctl=${planctl.length}`,
       );
       for (const file of dirty) {
         lines.push(`    ${statusLine(file)}`);
+      }
+      for (const file of planctl) {
+        lines.push(`    planctl ${statusLine(file)}`);
       }
     }
 
     blocks.push(lines.join("\n"));
   }
-  return blocks.join("\n\n");
+  return blocks.join("\n");
 }
 
 async function main(): Promise<void> {

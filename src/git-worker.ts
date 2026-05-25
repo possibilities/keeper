@@ -30,6 +30,7 @@ import { isAbsolute, join, normalize, relative } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
+import { parsePlanRef } from "./derivers";
 import { isDropError, RescanScheduler } from "./rescan";
 import type { ShutdownMessage } from "./wake-worker";
 
@@ -60,6 +61,7 @@ export interface GitJobView {
   plan_ref: string | null;
   touched: GitJobFileTouch[];
   dirty: GitFileStatus[];
+  planctl: GitFileStatus[];
 }
 
 export interface GitSnapshotPayload {
@@ -467,6 +469,37 @@ function touchesForJob(
   return mergeTouches(rows.flatMap((row) => extractFileTouches(row, root)));
 }
 
+/**
+ * Per-job set of `.planctl/{epics,tasks}/<id>.json` paths derived from the
+ * session's mutation-verb planctl invocations. Gated on
+ * `planctl_subject_present = 1` so read-only verbs (`cat`, `show`, `list`)
+ * never attribute a file. Targets are mapped through `parsePlanRef` so only
+ * canonical refs produce paths; malformed targets skip silently.
+ */
+function planctlPathsForJob(db: Database, jobId: string): Set<string> {
+  const rows = db
+    .query(
+      `SELECT DISTINCT planctl_target
+         FROM events
+        WHERE session_id = ?
+          AND planctl_op IS NOT NULL
+          AND planctl_subject_present = 1
+          AND planctl_target IS NOT NULL`,
+    )
+    .all(jobId) as { planctl_target: string }[];
+  const paths = new Set<string>();
+  for (const row of rows) {
+    const parsed = parsePlanRef(row.planctl_target);
+    if (parsed == null) continue;
+    if (parsed.kind === "epic") {
+      paths.add(`.planctl/epics/${parsed.epic_id}.json`);
+    } else {
+      paths.add(`.planctl/tasks/${parsed.task_id}.json`);
+    }
+  }
+  return paths;
+}
+
 export function buildGitSnapshot(
   db: Database,
   projectDir: string,
@@ -475,16 +508,21 @@ export function buildGitSnapshot(
   const jobs = liveJobsForRoot(db, projectDir).map((job) => {
     const touched = touchesForJob(db, projectDir, job.job_id);
     const touchedSet = new Set(touched.map((t) => t.path));
+    const planctlPaths = planctlPathsForJob(db, job.job_id);
     return {
       ...job,
       touched,
       dirty: status.files.filter((file) => isStatusTouchedBy(file, touchedSet)),
+      planctl: status.files.filter((file) =>
+        isStatusTouchedBy(file, planctlPaths),
+      ),
     };
   });
 
   const touchedByLiveJobs = new Set<string>();
   for (const job of jobs) {
     for (const touch of job.touched) touchedByLiveJobs.add(touch.path);
+    for (const file of job.planctl) touchedByLiveJobs.add(file.path);
   }
   const orphaned = status.files.filter(
     (file) => !isStatusTouchedBy(file, touchedByLiveJobs),
