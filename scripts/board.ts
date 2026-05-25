@@ -526,7 +526,7 @@ async function main(): Promise<void> {
       );
       lines.push(`   [${taskId}]`, ...renderJobLines(t.jobs));
     }
-    const closeRowBase = `${tasks.length + 1}. Quality audit and close [${seg(row.status)}] [${epicApproval}]`;
+    const closeRowBase = `X. Quality audit and close [${seg(row.status)}] [${epicApproval}]`;
     appendReadinessLines(
       lines,
       closeRowBase,
