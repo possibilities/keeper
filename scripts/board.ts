@@ -272,7 +272,7 @@ interface CollectionState {
    * (`own-progress-sub`) doesn't false-negative — read from `rows`
    * instead of `byId.values()`.
    */
-  rows: Record<string, unknown>[];
+  rows: unknown[];
   gotResult: boolean;
   queryInFlight: boolean;
   refetchDirty: boolean;
