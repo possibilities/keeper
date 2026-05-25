@@ -3,6 +3,7 @@
   "bundles": [
     "sketch/board-readiness-pill"
   ],
+  "closer_done_at": "2026-05-25T02:28:40Z",
   "created_at": "2026-05-24T23:33:37Z",
   "depends_on_epics": [
     "fn-598-creator-refiner-from-planctl-invocations",
@@ -15,10 +16,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "board readiness pill",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-24T23:34:08Z"
+  "updated_at": "2026-05-25T02:28:40Z"
 }

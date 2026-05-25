@@ -1,0 +1,20 @@
+{
+  "branch_name": "fn-604-fix-board-subagent-invocation-collapse",
+  "bundles": [],
+  "created_at": "2026-05-25T02:28:31Z",
+  "depends_on_epics": [
+    "fn-601-board-readiness-pill"
+  ],
+  "id": "fn-604-fix-board-subagent-invocation-collapse",
+  "last_validated_at": "2026-05-25T02:28:36Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "fix board subagent invocation collapse",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-25T02:28:36Z"
+}
