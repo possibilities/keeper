@@ -97,8 +97,8 @@ and the `events` log keep their canonical-owner writers and re-fold
 determinism extends to approval (rewind cursor + re-drain reproduces approval
 state byte-identically). RPC handlers MAY write `.planctl` files, never
 reducer projections directly (see [CLAUDE.md](./CLAUDE.md)'s DO NOT list).
-Two example clients ship in `scripts/` (`board.ts` and `approve.ts`); see
-[Example clients](#example-clients) for usage.
+Three example clients ship in `scripts/` (`board.ts`, `autopilot.ts`,
+and `approve.ts`); see [Example clients](#example-clients) for usage.
 
 ## What keeper is NOT
 
@@ -250,16 +250,23 @@ Keeper has no `install` verb. Wire it up manually:
 
    The subscribe server binds a Unix-domain socket at
    `~/.local/state/keeper/keeperd.sock` by default (a sibling of `keeper.db`).
-   Override the path with the `KEEPER_SOCK` environment variable. Two example
-   clients ship in `scripts/` — `board.ts` (subscribe) and `approve.ts` (RPC)
-   — see [Example clients](#example-clients).
+   Override the path with the `KEEPER_SOCK` environment variable. Three example
+   clients ship in `scripts/` — `board.ts` and `autopilot.ts` (subscribe;
+   both go through `src/readiness-client.ts`) and `approve.ts` (RPC) —
+   see [Example clients](#example-clients).
 
 ## Example clients
 
-Two scripts under `scripts/` demonstrate the subscribe + RPC protocols.
+Three scripts under `scripts/` demonstrate the subscribe + RPC protocols.
 `board.ts` is the read-only subscribe client (combined epics + jobs view on
-one connection); `approve.ts` is the RPC client (single-shot `rpc` →
-`rpc_result`, no subscription). Run either with `bun scripts/<name>.ts --help`.
+one connection); `autopilot.ts` is its dispatch-oriented sibling (flat
+command list plus a `===`-delimited "ready" block); `approve.ts` is the
+RPC client (single-shot `rpc` → `rpc_result`, no subscription). The two
+subscribe clients share a helper in `src/readiness-client.ts`
+(`subscribeReadiness`) that owns the three-collection subscribe lifecycle
+and the per-frame `computeReadiness` handoff (the pure verdict pipeline
+lives in `src/readiness.ts` as library code, not a runnable script). Run
+any of them with `bun scripts/<name>.ts --help`.
 
 - `board.ts` — combined "board" UI over the `epics`, `jobs`, and
   `subagent_invocations` collections. Subscribes to all three on a single
@@ -287,7 +294,7 @@ one connection); `approve.ts` is the RPC client (single-shot `rpc` →
   `last_validated_at` timestamp on the epic file (flipped by
   `planctl validate --epic <id>`). The `[ready] / [completed] /
   [blocked:<reason>]` pill is a pure-function readiness verdict computed
-  from the three-collection snapshot (see `scripts/readiness.ts`); a
+  from the three-collection snapshot (see `src/readiness.ts`); a
   blocked row is followed by a `   (reason: <reason>)` continuation
   line so the human reads the cause without scanning the upstream rows.
   The byte-compare emit gate keeps the stream quiet when row churn
@@ -301,6 +308,27 @@ one connection); `approve.ts` is the RPC client (single-shot `rpc` →
   ```sh
   bun scripts/board.ts            # combined board, default scope
   bun scripts/board.ts --clear    # live-panel mode with indexed sidecars
+  ```
+
+- `autopilot.ts` — dispatch-oriented sibling of `board.ts`. Subscribes
+  through the same `src/readiness-client.ts` helper and emits two
+  `===`-delimited blocks per frame, led by `---`. Block 1 is the flat
+  ordered command list — two lines per task (`cd <target_repo> && claude
+  '/plan:work <id>'` + `bun scripts/approve.ts <id>`) plus a virtual
+  close pair per epic (`/plan:close` + approve) — in the same traversal
+  order as `board.ts`. Block 2 lists only the pairs whose readiness
+  verdict is `{ tag: "ready" }` — the same set surfaced by board's
+  `[ready]` pills, prefixed by a one-line `#` header explaining that
+  this is "any one of these can be dispatched next," NOT a parallel
+  work queue (the single-root post-pass in `src/readiness.ts` keeps at
+  most one ready row per project root). Byte-compares the combined body
+  so a verdict transition with no task-set change still emits a new
+  frame. Same three sidecar files + `--clear` indexed-sidecar mode as
+  `board.ts`. SIGINT calls the helper's `dispose()` and exits 0.
+
+  ```sh
+  bun scripts/autopilot.ts            # two-block dispatch list, default scope
+  bun scripts/autopilot.ts --clear    # live-panel mode with indexed sidecars
   ```
 
 - `approve.ts` — the RPC client. Single-shot: opens a `Bun.connect`, sends
@@ -430,6 +458,18 @@ the whole process to a clean restart — with that single scoped exception, the
 recoverable drop signal on the transcript and plan watchers, which
 deliberately does NOT escalate (a re-scan throw is swallowed, never reaching
 the restart path).
+
+Readiness is a client-side library today, not a server-side collection.
+`src/readiness.ts` is the shared verdict pipeline consumed by
+`scripts/board.ts` and `scripts/autopilot.ts` via the
+`src/readiness-client.ts` helper, which subscribes to the three input
+collections (`epics`, `jobs`, `subagent_invocations`) and runs
+`computeReadiness` per emit. A server-side `readiness` projection
+(synthetic-event recompute, persisted verdict map, diffed over the wire
+like the other collections) is a natural future extension and
+intentionally out of scope here — the inputs are already on the wire,
+so the helper-in-`src/` design preserves the option without paying its
+cost today.
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).

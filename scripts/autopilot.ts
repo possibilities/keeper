@@ -1,8 +1,22 @@
 #!/usr/bin/env bun
 /**
  * keeper-autopilot — live command list over the keeper subscribe server.
- * Renders a flat ordered list of shell commands for each task and epic in
- * the same traversal order as `scripts/board.ts`'s epic rendering.
+ * Renders TWO `===`-delimited blocks per frame:
+ *
+ *   1. Flat ordered list of shell commands for each task and epic, in the
+ *      same traversal order as `scripts/board.ts`'s epic rendering. Every
+ *      task pair (work + approve) plus every epic close pair (close +
+ *      approve), unfiltered.
+ *   2. Only the rows whose readiness verdict is `{ tag: "ready" }` —
+ *      the same set surfaced by board's `[ready]` pills. The block opens
+ *      with a one-line `# header` reminding the reader that this list is
+ *      "any one of these can be dispatched next," NOT a parallel work
+ *      queue: the single-root post-pass in `src/readiness.ts` keeps at
+ *      most one ready row per project root.
+ *
+ * The two blocks are joined by `\n===\n` (mirrors board's `\n~~~\n`).
+ * When both are empty the body is `===` alone — same `---` lead, just a
+ * divider line.
  *
  * For each epic, in order:
  *
@@ -13,24 +27,24 @@
  *   bun ~/code/keeper/scripts/approve.ts <epic_id>
  *
  * Epics are separated by a blank line. Each frame is led by `---`.
- * A new frame prints only when the rendered output changes.
- *
- * Uses only the `epics` collection (tasks are embedded in each epic row),
- * so first-paint waits only for the first epics `result` to land — no
- * dual-collection readiness gate like `scripts/board.ts`.
+ * A new frame prints only when the rendered output changes (byte-compare
+ * on the COMBINED two-block body — a verdict transition with no task-set
+ * change still emits because block 2 changes).
  *
  * `task.target_repo` is used as the `cd` path for worker commands; falls
  * back to `epic.project_dir` when `target_repo` is null.
  *
- * Connection / poll / sidecar / SIGINT semantics mirror `scripts/board.ts`:
- * capped-backoff connect+retry, post-disconnect reconnect, one `...`-fenced
- * lifecycle note per transition, THREE sidecar files (state JSON + frame text
- * + per-frame unified diff against the previous emit) overwritten each frame.
- * In `--clear` mode each frame's sidecars are indexed so past frames persist,
- * and a session meta file at `/tmp/keeper-autopilot.<pid>.meta.txt`
- * accumulates the full index (tab-separated: frame# state frame diff).
- * SIGINT sends a bare `unsubscribe` (no id) which drops the subscription,
- * then exits.
+ * Connection / poll / sidecar / SIGINT semantics: the helper
+ * (`src/readiness-client.ts`) owns capped-backoff reconnect, the
+ * all-three-strict first-paint gate, per-collection coalesce, and the
+ * computeReadiness handoff. SIGINT calls `handle.dispose()` — which
+ * drops every subscription via a bare `unsubscribe` frame, releases
+ * timers, and exits cleanly. THREE sidecar files (state JSON + frame
+ * text + per-frame unified diff against the previous emit) are
+ * overwritten each frame. In `--clear` mode each frame's sidecars are
+ * indexed so past frames persist, and a session meta file at
+ * `/tmp/keeper-autopilot.<pid>.meta.txt` accumulates the full index
+ * (tab-separated: frame# state frame diff).
  *
  * Usage:
  *   bun scripts/autopilot.ts [--sock <path>] [--clear]
@@ -45,26 +59,10 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
 import {
-  encodeFrame,
-  LineBuffer,
-  type QueryFrame,
-  type ServerFrame,
-} from "../src/protocol";
-
-/**
- * Epics fetches the whole default-scope set (`limit: 0`) — same as
- * `scripts/board.ts`. The default scope is already small (open +
- * not-yet-approved), so unlimited is fine.
- */
-const EPICS_PAGE_LIMIT = 0;
-
-/**
- * Poll cadence (ms) — same as the sibling scripts.
- */
-const POLL_MS = 500;
-
-const INITIAL_BACKOFF_MS = 250;
-const MAX_BACKOFF_MS = 5000;
+  type ReadinessClientSnapshot,
+  subscribeReadiness,
+} from "../src/readiness-client";
+import type { Epic } from "../src/types";
 
 const HELP = `keeper-autopilot — live command list over the keeper subscribe server
 
@@ -78,9 +76,14 @@ Usage: bun scripts/autopilot.ts [--sock <path>] [--clear]
                    index (tab-separated: frame# state frame diff).
   --help           Show this help
 
-For each open epic, in the same order as scripts/board.ts, renders a flat
-command list — two lines per task (work + approve) then two lines for the
-virtual close row (close + approve):
+Emits two ===-delimited blocks per frame. Block 1 lists every task pair
+(work + approve) and every epic close pair (close + approve) in
+scripts/board.ts traversal order. Block 2 lists only those pairs whose
+readiness verdict is { tag: "ready" } — "any one of these can be
+dispatched next" (single-root post-pass keeps at most one ready row per
+project root), NOT a parallel work queue.
+
+Per-epic command shape:
 
   cd <target_repo> && claude '/plan:work <task_id>'
   bun ~/code/keeper/scripts/approve.ts <task_id>
@@ -88,60 +91,26 @@ virtual close row (close + approve):
   cd <project_dir> && claude '/plan:close <epic_id>'
   bun ~/code/keeper/scripts/approve.ts <epic_id>
 
-Epics are separated by a blank line. Each frame is led by '---'. A new
-frame prints only when the rendered output changes.
+Epics are separated by a blank line within each block. Blocks are joined
+by '\\n===\\n'. Each frame is led by '---'. A new frame prints only when
+the rendered output changes (byte-compare on the combined two-block body
+— a verdict transition with no task-set change still emits).
 
-task.target_repo is used as the cd path for worker commands; falls back to
-epic.project_dir when target_repo is null.
+task.target_repo is used as the cd path for worker commands; falls back
+to epic.project_dir when target_repo is null.
 
-The client waits for keeperd to come up and reconnects across restarts
-instead of exiting; each connection-lifecycle change prints a ...-fenced
-note. Every emitted frame is mirrored to three /tmp sidecar files (JSON
-state, frame text, unified diff vs. the previous emit). Ctrl-C exits cleanly.
+The helper waits for keeperd to come up and reconnects across restarts;
+each connection-lifecycle change prints a ...-fenced note. Every emitted
+frame is mirrored to three /tmp sidecar files (JSON state, frame text,
+unified diff vs. the previous emit). Ctrl-C calls dispose() and exits 0.
 `;
 
 const seg = (v: unknown) => (v == null ? "" : String(v));
 
-/**
- * Per-collection page + coalescing state — mirrors `CollectionState` in
- * `scripts/board.ts`. Only the `epics` collection is used here (tasks are
- * embedded in each epic row), so there is exactly one instance.
- */
-interface CollectionState {
-  readonly collection: string;
-  readonly subId: string;
-  readonly pk: string;
-  readonly query: QueryFrame;
-  order: string[];
-  byId: Map<string, Record<string, unknown>>;
-  gotResult: boolean;
-  queryInFlight: boolean;
-  refetchDirty: boolean;
-}
-
-function makeState(
-  collection: string,
-  subId: string,
-  pk: string,
-  limit: number,
-): CollectionState {
-  return {
-    collection,
-    subId,
-    pk,
-    query: { type: "query", collection, id: subId, limit },
-    order: [],
-    byId: new Map(),
-    gotResult: false,
-    queryInFlight: false,
-    refetchDirty: false,
-  };
-}
-
-function die(message: string): never {
-  process.stderr.write(`keeper-autopilot: ${message}\n`);
-  process.exit(2);
-}
+const READY_HEADER =
+  "# any one of these can be dispatched next — NOT a parallel work queue";
+const READY_HEADER_NOTE =
+  "# (single-root post-pass in src/readiness.ts keeps at most one ready row per project root)";
 
 async function main(): Promise<void> {
   const { values } = parseArgs({
@@ -164,24 +133,13 @@ async function main(): Promise<void> {
   const clearMode = values.clear;
   let frameCount = 0;
 
-  const epics = makeState(
-    "epics",
-    "autopilot-epics",
-    "epic_id",
-    EPICS_PAGE_LIMIT,
-  );
-  const states: CollectionState[] = [epics];
-  const byCollection = new Map(states.map((s) => [s.collection, s]));
-
-  // Byte-compare the combined body — internal row churn that doesn't surface
-  // in the render is invisible by design (same contract as the sibling scripts).
+  // Byte-compare the COMBINED two-block body — internal row churn that
+  // doesn't surface in either block's render is invisible by design.
+  // A verdict transition with no task-set change still changes block 2,
+  // so the byte compare correctly emits.
   let lastBody: string | null = null;
-
-  type Sock = Awaited<ReturnType<typeof Bun.connect>>;
-  let currentSock: Sock | null = null;
-  let attempt = 0;
-  let shuttingDown = false;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  // Snapshot of the most recent emitted state, for the JSON sidecar.
+  let lastEpicsSnapshot: Epic[] = [];
 
   // --- command rendering ---
 
@@ -193,19 +151,21 @@ async function main(): Promise<void> {
    * live in a different repo than its epic). Falls back to `epic.project_dir`
    * when `target_repo` is null or empty — same fallback used by the plan
    * worker when seeding tasks.
+   *
+   * Block 1 calls this directly. Block 2 calls
+   * `renderEpicCommandsFiltered` below with a verdict predicate.
    */
-  function renderEpicCommands(row: Record<string, unknown>): string {
-    const projectDir = seg(row.project_dir);
-    const epicId = seg(row[epics.pk]);
-    const tasks = Array.isArray(row.tasks) ? row.tasks : [];
+  function renderEpicCommands(epic: Epic): string {
+    const projectDir = seg(epic.project_dir);
+    const epicId = seg(epic.epic_id);
+    const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
     const lines: string[] = [];
 
     for (const task of tasks) {
-      const t = task as Record<string, unknown>;
-      const taskId = seg(t.task_id);
+      const taskId = seg(task.task_id);
       const dir =
-        t.target_repo != null && seg(t.target_repo) !== ""
-          ? seg(t.target_repo)
+        task.target_repo != null && seg(task.target_repo) !== ""
+          ? seg(task.target_repo)
           : projectDir;
       const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
       lines.push(
@@ -225,17 +185,95 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Full frame body: one epic command block per epic in server order, joined
-   * by a blank line. An empty epics set yields `""` — the frame is just the
-   * `---` lead.
+   * Render a filtered command block for a single epic: emits ONLY the
+   * task pairs and the close pair for which `isReady(kind, id)` returns
+   * true. Returns `null` when no row passes — caller drops the epic from
+   * block 2 entirely.
+   *
+   * Sibling of `renderEpicCommands` rather than a retrofitted filter
+   * parameter: keeps the unfiltered renderer pure and trivial, and the
+   * filtered renderer self-contained for the (currently single) block-2
+   * call site.
    */
-  function renderBody(): string {
-    if (epics.order.length === 0) {
-      return "";
+  function renderEpicCommandsFiltered(
+    epic: Epic,
+    isReady: (kind: "task" | "close", id: string) => boolean,
+  ): string | null {
+    const projectDir = seg(epic.project_dir);
+    const epicId = seg(epic.epic_id);
+    const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+    const lines: string[] = [];
+
+    for (const task of tasks) {
+      const taskId = seg(task.task_id);
+      if (!isReady("task", taskId)) {
+        continue;
+      }
+      const dir =
+        task.target_repo != null && seg(task.target_repo) !== ""
+          ? seg(task.target_repo)
+          : projectDir;
+      const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
+      lines.push(
+        `${cdPrefix}claude '/plan:work ${taskId}'`,
+        `bun ~/code/keeper/scripts/approve.ts ${taskId}`,
+      );
     }
-    return epics.order
-      .map((id) => renderEpicCommands(epics.byId.get(id) ?? { [epics.pk]: id }))
-      .join("\n\n");
+
+    if (isReady("close", epicId)) {
+      const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
+      lines.push(
+        `${cdPrefix}claude '/plan:close ${epicId}'`,
+        `bun ~/code/keeper/scripts/approve.ts ${epicId}`,
+      );
+    }
+
+    if (lines.length === 0) {
+      return null;
+    }
+    return lines.join(" &&\n");
+  }
+
+  /**
+   * Full frame body: two `===`-delimited blocks.
+   *
+   * Block 1 — every task pair + close pair per epic, server order.
+   * Block 2 — only rows whose readiness verdict tag is `"ready"`, with
+   *           a one-line `#`-prefixed header explaining the single-root
+   *           post-pass semantics.
+   *
+   * When both blocks are empty the body is `===` alone (preserves the
+   * divider — mirrors board's empty-section policy).
+   */
+  function renderBody(snap: ReadinessClientSnapshot): string {
+    const epicsArr = snap.epics;
+    const readiness = snap.readiness;
+    const isReady = (kind: "task" | "close", id: string): boolean => {
+      const verdict =
+        kind === "task"
+          ? readiness.perTask.get(id)
+          : readiness.perCloseRow.get(id);
+      return verdict !== undefined && verdict.tag === "ready";
+    };
+
+    const block1 =
+      epicsArr.length === 0
+        ? ""
+        : epicsArr.map((e) => renderEpicCommands(e)).join("\n\n");
+
+    const readyBlocks: string[] = [];
+    for (const epic of epicsArr) {
+      const rendered = renderEpicCommandsFiltered(epic, isReady);
+      if (rendered != null) {
+        readyBlocks.push(rendered);
+      }
+    }
+    const block2 =
+      readyBlocks.length === 0
+        ? ""
+        : `${READY_HEADER}\n${READY_HEADER_NOTE}\n${readyBlocks.join("\n\n")}`;
+
+    return `${block1}\n===\n${block2}`;
   }
 
   // --- sidecar paths ---
@@ -263,9 +301,7 @@ async function main(): Promise<void> {
       ? `/tmp/keeper-autopilot.${process.pid}.diff.${frameCount}.txt`
       : diffSidecar;
 
-    const stateJson = {
-      epics: epics.order.map((id) => epics.byId.get(id) ?? { [epics.pk]: id }),
-    };
+    const stateJson = { epics: lastEpicsSnapshot };
     try {
       writeFileSync(sState, `${JSON.stringify(stateJson, null, 2)}\n`);
       writeFileSync(sFrame, `${frameText}\n`);
@@ -318,19 +354,17 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Emit a frame iff (a) the epics collection has landed its first result
-   * and (b) the rendered body changed since the last emit. Single-collection
-   * variant of board.ts's `emitFrameIfChanged`.
+   * Emit a frame iff the rendered body changed since the last emit.
+   * The all-three-strict first-paint gate lives in the helper — by the
+   * time this fires, the snapshot is guaranteed complete.
    */
-  function emitFrameIfChanged(): void {
-    if (!epics.gotResult) {
-      return;
-    }
-    const body = renderBody();
+  function emitFrameIfChanged(snap: ReadinessClientSnapshot): void {
+    const body = renderBody(snap);
     if (body === lastBody) {
       return;
     }
     lastBody = body;
+    lastEpicsSnapshot = snap.epics;
     frameCount += 1;
     if (clearMode) {
       process.stdout.write("\x1b[2J\x1b[H");
@@ -338,29 +372,6 @@ async function main(): Promise<void> {
     const frameText = `---\n${body}`;
     log(frameText);
     writeSidecars(frameText);
-  }
-
-  /**
-   * Re-issue one collection's page query, coalesced. Mirrors
-   * `scheduleRefetchFor` in `scripts/board.ts`.
-   */
-  function scheduleRefetchFor(state: CollectionState): void {
-    if (!currentSock) {
-      return;
-    }
-    if (state.queryInFlight) {
-      state.refetchDirty = true;
-      return;
-    }
-    state.queryInFlight = true;
-    currentSock.write(encodeFrame(state.query));
-  }
-
-  /** Steady-poll backstop — all collections, every tick. */
-  function pollAll(): void {
-    for (const s of states) {
-      scheduleRefetchFor(s);
-    }
   }
 
   function emitLifecycle(
@@ -373,141 +384,26 @@ async function main(): Promise<void> {
       log(`${k}: ${String(v)}`);
     }
     log("...");
-  }
-
-  function handleFrame(frame: ServerFrame): void {
-    if (frame.type === "result") {
-      const state = byCollection.get(frame.collection);
-      if (!state) {
-        return;
-      }
-      state.queryInFlight = false;
-      state.order.length = 0;
-      state.byId.clear();
-      for (const row of frame.rows) {
-        const id = String(row[state.pk]);
-        state.order.push(id);
-        state.byId.set(id, row);
-      }
-      state.gotResult = true;
-      emitFrameIfChanged();
-      if (state.refetchDirty) {
-        state.refetchDirty = false;
-        scheduleRefetchFor(state);
-      }
-    } else if (frame.type === "patch" || frame.type === "meta") {
-      const state = byCollection.get(frame.collection);
-      if (state) {
-        scheduleRefetchFor(state);
-      }
-    } else if (frame.type === "error") {
-      log(`# error ${frame.code} (rev ${frame.rev}): ${frame.message}`);
-      // Terminal only if no result has ever landed; otherwise transient.
-      if (!epics.gotResult) {
-        shuttingDown = true;
-        currentSock?.end();
-        process.exit(1);
-      }
+    // On disconnect, clear `lastBody` so the next first-paint emits even
+    // if the post-reconnect snapshot happens to match the last pre-
+    // disconnect body byte-for-byte. (The helper resets its own collection
+    // state and re-gates first-paint behind all three `result`s.)
+    if (event === "disconnected") {
+      lastBody = null;
     }
   }
 
-  function teardownConnection(): void {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-    currentSock = null;
-    for (const s of states) {
-      s.order.length = 0;
-      s.byId.clear();
-      s.queryInFlight = false;
-      s.refetchDirty = false;
-    }
-    lastBody = null;
-  }
-
-  async function connectOnce(): Promise<void> {
-    const buffer = new LineBuffer();
-    await Bun.connect({
-      unix: sockPath,
-      socket: {
-        open(sock) {
-          attempt = 0;
-          currentSock = sock;
-          emitLifecycle("connected", { sock: sockPath });
-          for (const s of states) {
-            s.queryInFlight = true;
-            sock.write(encodeFrame(s.query));
-          }
-          pollTimer = setInterval(pollAll, POLL_MS);
-        },
-        data(_sock, chunk) {
-          let lines: string[];
-          try {
-            lines = buffer.push(chunk.toString("utf8"));
-          } catch (err) {
-            die(`protocol error: ${(err as Error).message}`);
-          }
-          for (const line of lines) {
-            if (line.trim().length === 0) {
-              continue;
-            }
-            handleFrame(JSON.parse(line) as ServerFrame);
-          }
-        },
-        close() {
-          if (shuttingDown) {
-            return;
-          }
-          teardownConnection();
-          emitLifecycle("disconnected", {});
-          void connectWithRetry();
-        },
-        error(_sock, err) {
-          emitLifecycle("error", { message: err.message });
-        },
-      },
-    });
-  }
-
-  async function connectWithRetry(): Promise<void> {
-    emitLifecycle("connecting", { sock: sockPath });
-    while (!shuttingDown) {
-      try {
-        await connectOnce();
-        return;
-      } catch (err) {
-        attempt += 1;
-        const delay = Math.min(
-          INITIAL_BACKOFF_MS * 2 ** (attempt - 1),
-          MAX_BACKOFF_MS,
-        );
-        emitLifecycle("waiting", {
-          attempt,
-          retry_in_ms: delay,
-          reason: (err as Error).message,
-        });
-        await Bun.sleep(delay);
-      }
-    }
-  }
-
-  process.on("SIGINT", () => {
-    shuttingDown = true;
-    if (pollTimer) {
-      clearInterval(pollTimer);
-    }
-    try {
-      // No `id` → drop every subscription on this connection in one frame.
-      currentSock?.write(encodeFrame({ type: "unsubscribe" }));
-      currentSock?.end();
-    } catch {
-      // socket already gone — nothing to release
-    }
-    process.exit(0);
+  const handle = subscribeReadiness({
+    sockPath,
+    idPrefix: "autopilot",
+    onSnapshot: emitFrameIfChanged,
+    onLifecycle: emitLifecycle,
   });
 
-  await connectWithRetry();
+  process.on("SIGINT", () => {
+    handle.dispose();
+    process.exit(0);
+  });
 }
 
 await main();
