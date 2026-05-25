@@ -12,12 +12,12 @@ event log, reducer, the five worker threads, and the wire protocol — see
 ## Event-sourcing invariants
 
 - **Cursor + projection advance in the SAME `BEGIN IMMEDIATE` transaction.** Every
-  fold writes the projection (`jobs`/`epics`, including the `syncJobIntoEpic`
-  fan-out from a `plan_ref`-bearing jobs write into the parent epic's embedded
-  `jobs` array or the target task element's nested `jobs` sub-array, AND the
-  `syncPlanctlLinks` fan-out from a `planctl_op != NULL` event re-deriving
-  the touched session's `jobs.epic_links` and every touched epic's
-  `epics.job_links`) and bumps `reducer_state.last_event_id` in one
+  fold writes the projection (`jobs`/`epics`/`subagent_invocations`, including the
+  `syncJobIntoEpic` fan-out from a `plan_ref`-bearing jobs write into the parent
+  epic's embedded `jobs` array or the target task element's nested `jobs`
+  sub-array, AND the `syncPlanctlLinks` fan-out from a `planctl_op != NULL`
+  event re-deriving the touched session's `jobs.epic_links` and every touched
+  epic's `epics.job_links`) and bumps `reducer_state.last_event_id` in one
   transaction. A crash mid-fold rolls back both; boot drain re-folds
   idempotently. This is the exactly-once-per-event guarantee — never split
   the two writes across transactions.

@@ -22,17 +22,21 @@ session's `(pid, start_time)` is gone from the OUTSIDE (SIGKILL'd,
 terminal-pane-closed, machine reboot, hook crash). Both terminal states are
 revivable — a fresh `claude --resume` re-opens either one to `stopped`.
 
-The event log also indexes seven sparse signals that surface across every
+The event log also indexes eight sparse signals that surface across every
 session — `events.slash_command` (the leading `/foo:bar` token of a
 `UserPromptSubmit` prompt), `events.skill_name` (the canonical name of a
-Skill-tool invocation, e.g. `plan:plan` or `arthack:check`), and a
-five-column planctl-invocation envelope (`planctl_op`, `planctl_target`,
-`planctl_epic_id`, `planctl_task_id`, `planctl_subject_present`) stamped on
-every `PreToolUse:Bash` row whose command parses as a `planctl <verb>
-[target]` invocation — so consumers can find `/plan:work` calls, `Skill`
-invocations, AND every planctl-CLI mutation cheaply without JSON-scanning
+Skill-tool invocation, e.g. `plan:plan` or `arthack:check`),
+`events.tool_use_id` (the Anthropic-assigned `toolu_*` id stamped on every
+`Pre/PostToolUse` row whose payload carries a non-empty `data.tool_use_id`
+— the bridge that lets the reducer pair a `PreToolUse:Agent` with its later
+`PostToolUse:Agent`), and a five-column planctl-invocation envelope
+(`planctl_op`, `planctl_target`, `planctl_epic_id`, `planctl_task_id`,
+`planctl_subject_present`) stamped on every `PreToolUse:Bash` row whose
+command parses as a `planctl <verb> [target]` invocation — so consumers
+can find `/plan:work` calls, `Skill` invocations, every Task-tool subagent
+lifecycle, AND every planctl-CLI mutation cheaply without JSON-scanning
 the event `data` blob. The `planctl_*` columns drive the creator/refiner
-classifier (see [Architecture](#architecture)). All seven are partial-indexed
+classifier (see [Architecture](#architecture)). All eight are partial-indexed
 on `WHERE col IS NOT NULL` (the planctl columns share a composite
 `(session_id, id) WHERE planctl_op IS NOT NULL` index for the per-session
 ordered scan).
@@ -55,13 +59,17 @@ and the boot drain re-converges idempotently after any downtime or crash.
 Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names
 a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
-page that doubles as a live subscription. Two collections register today —
-`jobs` (the first and default) and `epics` (the read-only plans surface — each
+page that doubles as a live subscription. Three collections register today —
+`jobs` (the first and default), `epics` (the read-only plans surface — each
 epic embeds its tasks as a JSON array, so there is no separate `tasks`
 collection; both the epic and each embedded task carry an `approval` field
 valued `"approved" | "rejected" | "pending"`, surfaced as a pill in the
-epics client). The surface is built so additional collections register
-without touching the wire protocol or the diff machinery. Page membership is frozen at query time,
+epics client), and `subagent_invocations` (the per-job timeline of Task-tool
+subagent calls — one row per `PreToolUse:Agent` paired with its later
+`PostToolUse:Agent` via `events.tool_use_id`, carrying lifecycle status
+`running | ok | error` and a populated `duration_ms` on completion). The
+surface is built so additional collections register without touching the
+wire protocol or the diff machinery. Page membership is frozen at query time,
 but each row's cells stream `patch` frames as the reducer folds new events.
 The `result` page also carries a `total` (the filtered-set size, ignoring
 limit/offset) and the server emits a third frame, `meta`, when that set
@@ -300,9 +308,12 @@ rm -rf ~/.local/state/keeper
 
 ## Architecture
 
-The `events` table is a durable append-only log; the reducer folds it into the
-`jobs` projection while advancing the `reducer_state` cursor in the same
-transaction (exactly-once-per-event). A Worker thread on its own read-only
+The `events` table is a durable append-only log (with eight sparse
+top-level signals partial-indexed for cheap cross-session lookup —
+`slash_command`, `skill_name`, `tool_use_id`, and the five-column
+`planctl_*` envelope; see [What keeper is](#what-keeper-is)); the reducer
+folds it into the `jobs` projection while advancing the `reducer_state`
+cursor in the same transaction (exactly-once-per-event). A Worker thread on its own read-only
 connection polls `PRAGMA data_version` at ~50ms and posts contentless wake
 messages; each wake triggers a drain to completion. On macOS, FSEvents/kqueue
 drop same-process writes and miss WAL writes entirely, so `data_version`
@@ -315,7 +326,8 @@ endpoint: a Unix-domain socket (guarded by a PID-liveness lock file) speaking
 NDJSON. The surface is namespaced by collection: each query names a collection,
 and everything collection-specific (which table to read, which columns to serve,
 which column the diff fires on) is described by a registry entry rather than
-hardcoded — `jobs` is the first such collection. On each `data_version` tick the
+hardcoded — `jobs` is the first such collection; `epics` and
+`subagent_invocations` register alongside it. On each `data_version` tick the
 server re-reads its watched rows, diffs the per-row version column, and pushes
 `patch` frames to subscribed clients. The same tick also runs a second pass: it
 groups subscriptions by filter signature, runs one `COUNT(*)` + membership-token
@@ -416,6 +428,14 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 # All planctl-CLI invocations across sessions — uses the composite partial idx_events_planctl_session index; the WHERE predicate must match the index predicate syntactically for SQLite to land the index:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT session_id, datetime(ts,'unixepoch','localtime'), planctl_op, planctl_target FROM events WHERE planctl_op IS NOT NULL ORDER BY id DESC LIMIT 20"
+
+# Recent per-job Task-tool subagent timeline — one row per PreToolUse:Agent paired with its PostToolUse:Agent (and lifecycle Start/Stop), status running|ok|error, duration_ms populated on SubagentStop:
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT job_id, turn_seq, subagent_type, status, duration_ms, prompt_chars, tool_use_id FROM subagent_invocations ORDER BY job_id ASC, turn_seq ASC LIMIT 20"
+
+# All Task-tool invocations across the event log — uses the partial idx_events_tool_use_id index:
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT COUNT(*) FROM events WHERE tool_use_id IS NOT NULL"
 
 # Jobs that created or refined an epic during a /plan:plan window (creator/refiner classifier output — jobs.epic_links is the per-session fan-out written by syncPlanctlLinks):
 sqlite3 ~/.local/state/keeper/keeper.db \
