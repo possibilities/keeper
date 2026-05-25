@@ -1,0 +1,20 @@
+{
+  "branch_name": "fn-608-shared-readiness-client-and-autopilot",
+  "bundles": [
+    "sketch/central-readiness-autopilot-ready-block"
+  ],
+  "created_at": "2026-05-25T20:13:23.590220Z",
+  "depends_on_epics": [],
+  "id": "fn-608-shared-readiness-client-and-autopilot",
+  "last_validated_at": "2026-05-25T20:13:23.625912Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Shared readiness client and autopilot ready block",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-25T20:13:23.590220Z"
+}

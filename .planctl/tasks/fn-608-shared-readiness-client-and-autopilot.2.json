@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-25T20:13:23.590220Z",
+  "depends_on": [
+    "fn-608-shared-readiness-client-and-autopilot.1"
+  ],
+  "epic": "fn-608-shared-readiness-client-and-autopilot",
+  "id": "fn-608-shared-readiness-client-and-autopilot.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Extract subscribeReadiness helper and refactor board",
+  "updated_at": "2026-05-25T20:13:23.590220Z"
+}

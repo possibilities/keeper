@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-25T20:13:23.590220Z",
+  "depends_on": [
+    "fn-608-shared-readiness-client-and-autopilot.2"
+  ],
+  "epic": "fn-608-shared-readiness-client-and-autopilot",
+  "id": "fn-608-shared-readiness-client-and-autopilot.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Wire autopilot ready block and refresh README",
+  "updated_at": "2026-05-25T20:13:23.590220Z"
+}
