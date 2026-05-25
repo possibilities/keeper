@@ -61,5 +61,5 @@ Critical parity work: `seedFromDb` at `plan-worker.ts:841-949` reconstructs `Pla
 - [ ] `CLAUDE.md` plan-worker invariant block has a one-sentence splice naming `.planctl/state/tasks/` as a watched subtree feeding TaskSnapshot
 
 ## Done summary
-
+Ingested planctl runtime status enum (todo|in_progress|done|blocked) from .planctl/state/tasks/ as runtime_status; renamed derived status→worker_phase; schema v19 rewind-and-redrain; seedFromDb parity invariant tests pin the #1 silent regression.
 ## Evidence

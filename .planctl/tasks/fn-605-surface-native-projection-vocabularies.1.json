@@ -11,8 +11,8 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "ingest runtime status, rename worker phase",
-  "updated_at": "2026-05-25T15:40:31.737351Z",
+  "updated_at": "2026-05-25T16:39:12.902912Z",
   "work_review_status": "unknown",
   "work_reviewed_at": null,
-  "worker_done_at": null
+  "worker_done_at": "2026-05-25T16:39:12.902912Z"
 }
