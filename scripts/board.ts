@@ -85,7 +85,12 @@ import {
   type QueryFrame,
   type ServerFrame,
 } from "../src/protocol";
-import type { Epic, Job, SubagentInvocation } from "../src/types";
+import type {
+  Epic,
+  Job,
+  JobLinkEntry,
+  SubagentInvocation,
+} from "../src/types";
 import {
   computeReadiness,
   formatPill,
@@ -136,8 +141,11 @@ Each epic block opens with a header line of the form:
 
   ({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated] [<readiness>]
 
-followed by indented task lines (one per embedded task) and a final
-"Quality audit and close" line for the epic itself. The [validated] /
+followed (when the epic carries job_links) by one indented creator/refiner
+line per linked session — '{title} [creator|refiner] [state]' for sessions
+present in the live jobs page, '[{job_id}] [creator|refiner]' for terminal
+or off-page sessions — then the task lines (one per embedded task), and a
+final "Quality audit and close" line for the epic itself. The [validated] /
 [unvalidated] pill reflects planctl's last_validated_at timestamp on the
 epic file — flipped by 'planctl validate --epic <id>'.
 
@@ -455,6 +463,34 @@ async function main(): Promise<void> {
       });
   }
 
+  /**
+   * Per-epic creator/refiner link lines, indented one level under the epic
+   * header. Each `JobLinkEntry` (`{kind, job_id}`) becomes one line. When
+   * the linked `job_id` is in the live `jobs` page we render its title +
+   * state pill (same grammar as `renderJobLines`); when absent — terminal
+   * sessions and off-page hits, the common case since `jobs` is live-only
+   * and capped — we render `[{job_id}]` so the missing state pill is the
+   * honest "not on the board" signal. Iteration order is the projection's
+   * own `(kind, job_id)` ASC sort.
+   */
+  function renderJobLinkLines(jobLinks: unknown): string[] {
+    if (!Array.isArray(jobLinks) || jobLinks.length === 0) {
+      return [];
+    }
+    const out: string[] = [];
+    for (const link of jobLinks as JobLinkEntry[]) {
+      const hit = jobs.byId.get(link.job_id);
+      if (hit === undefined) {
+        out.push(`   [${link.job_id}] [${link.kind}]`);
+        continue;
+      }
+      out.push(
+        `   ${seg(hit.title)} [${link.kind}] [${seg(hit.state)}]${rateLimitedPillSeg(hit.rate_limited_at)}`,
+      );
+    }
+    return out;
+  }
+
   function renderJobLines(jobsArr: unknown): string[] {
     if (!Array.isArray(jobsArr) || jobsArr.length === 0) {
       return [];
@@ -510,6 +546,7 @@ async function main(): Promise<void> {
     const epicVerdict = verdictFromMap(lastReadiness?.perEpic, epicId);
     lines.push(
       `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}] ${formatPill(epicVerdict)}`,
+      ...renderJobLinkLines(row.job_links),
     );
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {
