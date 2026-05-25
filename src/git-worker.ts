@@ -128,12 +128,7 @@ const DB_POLL_MS = 100;
 /** Silent-watcher backstop, same shape as `transcript-worker.ts`. */
 const HEARTBEAT_MS = 60_000;
 const GIT_TIMEOUT_MS = 2000;
-const FILE_TOOL_NAMES = new Set([
-  "Write",
-  "Edit",
-  "MultiEdit",
-  "NotebookEdit",
-]);
+const FILE_TOOL_NAMES = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 
 /**
  * Positive ignore globs for `@parcel/watcher`. Mirrors `plan-worker.ts`'s

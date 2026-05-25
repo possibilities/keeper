@@ -748,7 +748,12 @@ function insertPre(
   );
 }
 
-function bind(jobId: string, agentId: string, turnSeq: number, toolUseId: string): void {
+function bind(
+  jobId: string,
+  agentId: string,
+  turnSeq: number,
+  toolUseId: string,
+): void {
   db.run(
     `INSERT INTO subagent_invocations (
        job_id, agent_id, turn_seq, ts, tool_use_id, prompt_chars, status,
@@ -760,7 +765,9 @@ function bind(jobId: string, agentId: string, turnSeq: number, toolUseId: string
 
 describe("findPendingPreToolUseForStart", () => {
   test("returns null when no PreToolUse:Agent exists in session", () => {
-    expect(findPendingPreToolUseForStart(db, "sess-empty", "Explore")).toBeNull();
+    expect(
+      findPendingPreToolUseForStart(db, "sess-empty", "Explore"),
+    ).toBeNull();
   });
 
   test("returns null when agentType is null", () => {
@@ -888,9 +895,9 @@ describe("findPendingPreToolUseForStart", () => {
       { description: "good", prompt: "p", subagent_type: "Explore" },
       2.0,
     );
-    expect(findPendingPreToolUseForStart(db, "sess-x", "Explore")?.tool_use_id).toBe(
-      "toolu_good",
-    );
+    expect(
+      findPendingPreToolUseForStart(db, "sess-x", "Explore")?.tool_use_id,
+    ).toBe("toolu_good");
   });
 
   test("missing description in tool_input → result has description: null but tool_use_id set", () => {
@@ -916,7 +923,9 @@ describe("findPendingPreToolUseForStart", () => {
       { description: "d", subagent_type: "Explore" },
       1.0,
     );
-    expect(findPendingPreToolUseForStart(db, "sess-x", "Explore")?.prompt_chars).toBe(0);
+    expect(
+      findPendingPreToolUseForStart(db, "sess-x", "Explore")?.prompt_chars,
+    ).toBe(0);
   });
 
   test("description over 200 chars truncates to DESCRIPTION_MAX_CHARS", () => {
@@ -932,7 +941,8 @@ describe("findPendingPreToolUseForStart", () => {
       1.0,
     );
     expect(
-      findPendingPreToolUseForStart(db, "sess-x", "Explore")?.description?.length,
+      findPendingPreToolUseForStart(db, "sess-x", "Explore")?.description
+        ?.length,
     ).toBe(DESCRIPTION_MAX_CHARS);
   });
 });
