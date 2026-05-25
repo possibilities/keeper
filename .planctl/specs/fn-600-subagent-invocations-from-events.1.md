@@ -77,5 +77,5 @@ The intermediate post-task-.1 state is harmless: `subagent_invocations` exists b
 - [ ] `bun test test/derivers.test.ts test/db.test.ts test/events-writer.test.ts` passes.
 
 ## Done summary
-
+Added schema v17: sparse events.tool_use_id column with partial index, empty subagent_invocations peer table (composite PK), extractToolUseId deriver wired into the hook + migration backfill via json_extract (json_valid-gated), and rewind-and-redrain so the boot drain rebuilds the projection.
 ## Evidence
