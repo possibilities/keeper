@@ -79,5 +79,5 @@ Defaults follow `JOBS_DESCRIPTOR`'s shape (`src/collections.ts:80-134`).
 - [ ] `bun test test/reducer.test.ts` (and `test/collections.test.ts` if extant) passes.
 
 ## Done summary
-
+Wired the parser-port helpers into a sibling projectSubagentInvocationsRow reducer arm dispatched alongside projectJobsRow inside applyEvent's BEGIN IMMEDIATE, and registered SUBAGENT_INVOCATIONS_DESCRIPTOR (pk job_id, version last_event_id, default ts ASC) in collections REGISTRY. All 628 tests pass, including new fixtures for orphan stops, malformed data, PreToolUse-wins precedence, PostToolUse-before-SubagentStop ordering, re-fold determinism, and fn-598 coexistence.
 ## Evidence
