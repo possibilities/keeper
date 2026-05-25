@@ -92,10 +92,71 @@ export interface ReadinessClientSnapshot {
 }
 
 /**
+ * Fatal-error payload handed to `onFatal` when a terminal `error` frame
+ * arrives BEFORE any collection has produced its first `result` (i.e. the
+ * query itself is malformed — `bad_frame` / `unknown_collection`). `rev`
+ * is the wire-level world-rev when known (the protocol may omit it on
+ * pre-handshake errors). The shape is what `onLifecycle` already receives
+ * for the same frame; `onFatal` exists so callers can act on the
+ * terminal condition instead of just observing it.
+ */
+export interface FatalError {
+  readonly code: string;
+  readonly rev?: number;
+  readonly message: string;
+}
+
+/**
+ * Minimal socket shape the helper drives. Matches the surface area of
+ * `Bun.Socket` that `subscribeReadiness` touches — `write` to push frames,
+ * `end` to half-close. Surfaced as a named type so the test-injection
+ * `connect` factory can return a mock without depending on `bun:types`.
+ */
+export interface ReadinessSocket {
+  write(data: string): void;
+  end(): void;
+}
+
+/**
+ * Socket factory injected via `connect`. The helper hands the factory a
+ * `handlers` bag carrying `data` / `close` / `error` callbacks; the factory
+ * returns the live socket (or rejects, kicking the reconnect-backoff loop).
+ * In production this wraps `Bun.connect({ unix, socket })`; in tests, the
+ * mock implementation hands the helper a controllable socket that records
+ * writes and exposes the handlers for direct frame delivery.
+ */
+export interface SocketHandlers {
+  open(sock: ReadinessSocket): void;
+  data(sock: ReadinessSocket, chunk: Buffer): void;
+  close(): void;
+  error(sock: ReadinessSocket, err: Error): void;
+}
+
+export type ConnectFactory = (
+  sockPath: string,
+  handlers: SocketHandlers,
+) => Promise<ReadinessSocket>;
+
+/**
  * Subscribe options. `idPrefix` is appended with the collection name so
  * subscription IDs become `<prefix>-epics` / `<prefix>-jobs` /
  * `<prefix>-subagent-invocations`. The server doesn't enforce uniqueness
  * across connections; the prefix is purely a debug-log discriminator.
+ *
+ * `onFatal` is called when a terminal `error` frame arrives BEFORE any
+ * collection has produced a first `result` — the query itself is
+ * unrecoverable and a reconnect cannot fix it. When omitted, the helper
+ * defaults to `process.exit(1)` (matching the pre-extraction behavior at
+ * `scripts/board.ts:870`, commit `212be34^`). Callers that want
+ * non-process-exit semantics (e.g. tests, in-process consumers) pass a
+ * custom `onFatal`. The terminal error is also surfaced via `onLifecycle`
+ * with the same payload immediately before `onFatal` fires.
+ *
+ * `connect` is the socket factory used to open a connection — exposed
+ * only for test injection. Defaults to a thin wrapper around
+ * `Bun.connect({ unix, socket })`; production callers should never set
+ * this. Tests use it to substitute an in-memory mock that records
+ * outbound frames and delivers inbound frames synchronously.
  */
 export interface SubscribeOptions {
   readonly sockPath: string;
@@ -105,6 +166,8 @@ export interface SubscribeOptions {
     event: string,
     detail?: Record<string, unknown>,
   ) => void;
+  readonly onFatal?: (err: FatalError) => void;
+  readonly connect?: ConnectFactory;
 }
 
 /**
@@ -190,6 +253,40 @@ export function subscribeReadiness(
   opts: SubscribeOptions,
 ): ReadinessClientHandle {
   const { sockPath, idPrefix, onSnapshot, onLifecycle } = opts;
+  // Default `onFatal` restores the pre-extraction `process.exit(1)`
+  // behavior (`scripts/board.ts:870`, commit `212be34^`). Callers that
+  // want different semantics pass their own; tests always pass a custom
+  // one so the test process never exits.
+  const onFatal =
+    opts.onFatal ??
+    ((_err: FatalError): void => {
+      process.exit(1);
+    });
+  // Default `connect` factory wraps `Bun.connect`. Production callers
+  // never override this; tests inject an in-memory mock socket. The
+  // factory adapts `Bun.connect`'s socket-handler shape to the more
+  // minimal `SocketHandlers` interface so callers (tests) don't depend
+  // on `bun:types`.
+  const connect: ConnectFactory =
+    opts.connect ??
+    ((path, handlers) =>
+      Bun.connect({
+        unix: path,
+        socket: {
+          open(sock) {
+            handlers.open(sock as ReadinessSocket);
+          },
+          data(sock, chunk) {
+            handlers.data(sock as ReadinessSocket, chunk);
+          },
+          close() {
+            handlers.close();
+          },
+          error(sock, err) {
+            handlers.error(sock as ReadinessSocket, err);
+          },
+        },
+      }) as unknown as Promise<ReadinessSocket>);
 
   const epics = makeState(
     "epics",
@@ -216,8 +313,7 @@ export function subscribeReadiness(
   const states: CollectionState[] = [epics, jobs, subagentInvocations];
   const byCollection = new Map(states.map((s) => [s.collection, s]));
 
-  type Sock = Awaited<ReturnType<typeof Bun.connect>>;
-  let currentSock: Sock | null = null;
+  let currentSock: ReadinessSocket | null = null;
   let attempt = 0;
   let shuttingDown = false;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -308,11 +404,12 @@ export function subscribeReadiness(
         scheduleRefetchFor(state);
       }
     } else if (frame.type === "error") {
-      emit("error", {
+      const detail = {
         code: frame.code,
         rev: frame.rev,
         message: frame.message,
-      });
+      };
+      emit("error", detail);
       // A bad_frame / unknown_collection on our own query is terminal — a
       // reconnect can't fix a malformed query. Terminal iff NO collection
       // has produced a first result (with three collections, that means
@@ -329,6 +426,16 @@ export function subscribeReadiness(
         } catch {
           // already torn down
         }
+        // Hand the terminal error off to the caller (default:
+        // `process.exit(1)`) AFTER tearing the connection down, so a
+        // custom `onFatal` that throws or schedules work observes the
+        // helper in its fully-shut-down state. `onFatal` exceptions
+        // propagate — same no-self-heal contract as `onSnapshot`.
+        onFatal({
+          code: frame.code,
+          rev: frame.rev,
+          message: frame.message,
+        });
       }
     }
   }
@@ -351,56 +458,53 @@ export function subscribeReadiness(
 
   async function connectOnce(): Promise<void> {
     const buffer = new LineBuffer();
-    await Bun.connect({
-      unix: sockPath,
-      socket: {
-        open(sock) {
-          attempt = 0;
-          currentSock = sock;
-          emit("connected", { sock: sockPath });
-          // Send all three queries up front. Each collection's
-          // `queryInFlight` tracks its own send so the poll/refetch
-          // coalescer stays sane.
-          for (const s of states) {
-            s.queryInFlight = true;
-            sock.write(encodeFrame(s.query));
-          }
-          pollTimer = setInterval(pollAll, POLL_MS);
-        },
-        data(sock, chunk) {
-          let lines: string[];
+    await connect(sockPath, {
+      open(sock) {
+        attempt = 0;
+        currentSock = sock;
+        emit("connected", { sock: sockPath });
+        // Send all three queries up front. Each collection's
+        // `queryInFlight` tracks its own send so the poll/refetch
+        // coalescer stays sane.
+        for (const s of states) {
+          s.queryInFlight = true;
+          sock.write(encodeFrame(s.query));
+        }
+        pollTimer = setInterval(pollAll, POLL_MS);
+      },
+      data(sock, chunk) {
+        let lines: string[];
+        try {
+          lines = buffer.push(chunk.toString("utf8"));
+        } catch (err) {
+          // A protocol-frame parse failure is fatal for this connection
+          // but not for the caller's process — surface via lifecycle
+          // and tear down. The reconnect loop will try again.
+          emit("error", { message: (err as Error).message });
           try {
-            lines = buffer.push(chunk.toString("utf8"));
-          } catch (err) {
-            // A protocol-frame parse failure is fatal for this connection
-            // but not for the caller's process — surface via lifecycle
-            // and tear down. The reconnect loop will try again.
-            emit("error", { message: (err as Error).message });
-            try {
-              sock.end();
-            } catch {
-              // ignore
-            }
-            return;
+            sock.end();
+          } catch {
+            // ignore
           }
-          for (const line of lines) {
-            if (line.trim().length === 0) {
-              continue;
-            }
-            handleFrame(JSON.parse(line) as ServerFrame);
+          return;
+        }
+        for (const line of lines) {
+          if (line.trim().length === 0) {
+            continue;
           }
-        },
-        close() {
-          if (shuttingDown) {
-            return;
-          }
-          teardownConnection();
-          emit("disconnected");
-          void connectWithRetry();
-        },
-        error(_sock, err) {
-          emit("error", { message: err.message });
-        },
+          handleFrame(JSON.parse(line) as ServerFrame);
+        }
+      },
+      close() {
+        if (shuttingDown) {
+          return;
+        }
+        teardownConnection();
+        emit("disconnected");
+        void connectWithRetry();
+      },
+      error(_sock, err) {
+        emit("error", { message: err.message });
       },
     });
   }
