@@ -112,6 +112,99 @@ const READY_HEADER =
 const READY_HEADER_NOTE =
   "# (single-root post-pass in src/readiness.ts keeps at most one ready row per project root)";
 
+// --- command rendering (module-scope so test/autopilot.test.ts can import) ---
+
+/**
+ * Render the command block for a single epic: two lines per task (work +
+ * approve), then two lines for the virtual close row (close + approve).
+ *
+ * `task.target_repo` is the cd path for worker commands (the task may
+ * live in a different repo than its epic). Falls back to `epic.project_dir`
+ * when `target_repo` is null or empty — same fallback used by the plan
+ * worker when seeding tasks.
+ *
+ * Block 1 calls this directly. Block 2 calls
+ * `renderEpicCommandsFiltered` below with a verdict predicate.
+ */
+export function renderEpicCommands(epic: Epic): string {
+  const projectDir = seg(epic.project_dir);
+  const epicId = seg(epic.epic_id);
+  const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+  const lines: string[] = [];
+
+  for (const task of tasks) {
+    const taskId = seg(task.task_id);
+    const dir =
+      task.target_repo != null && seg(task.target_repo) !== ""
+        ? seg(task.target_repo)
+        : projectDir;
+    const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
+    lines.push(
+      `${cdPrefix}claude '/plan:work ${taskId}'`,
+      `bun ~/code/keeper/scripts/approve.ts ${taskId}`,
+    );
+  }
+
+  // Virtual close row — always appended, mirrors board.ts.
+  const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
+  lines.push(
+    `${cdPrefix}claude '/plan:close ${epicId}'`,
+    `bun ~/code/keeper/scripts/approve.ts ${epicId}`,
+  );
+
+  return lines.join(" &&\n");
+}
+
+/**
+ * Render a filtered command block for a single epic: emits ONLY the
+ * task pairs and the close pair for which `isReady(kind, id)` returns
+ * true. Returns `null` when no row passes — caller drops the epic from
+ * block 2 entirely.
+ *
+ * Sibling of `renderEpicCommands` rather than a retrofitted filter
+ * parameter: keeps the unfiltered renderer pure and trivial, and the
+ * filtered renderer self-contained for the (currently single) block-2
+ * call site.
+ */
+export function renderEpicCommandsFiltered(
+  epic: Epic,
+  isReady: (kind: "task" | "close", id: string) => boolean,
+): string | null {
+  const projectDir = seg(epic.project_dir);
+  const epicId = seg(epic.epic_id);
+  const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+  const lines: string[] = [];
+
+  for (const task of tasks) {
+    const taskId = seg(task.task_id);
+    if (!isReady("task", taskId)) {
+      continue;
+    }
+    const dir =
+      task.target_repo != null && seg(task.target_repo) !== ""
+        ? seg(task.target_repo)
+        : projectDir;
+    const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
+    lines.push(
+      `${cdPrefix}claude '/plan:work ${taskId}'`,
+      `bun ~/code/keeper/scripts/approve.ts ${taskId}`,
+    );
+  }
+
+  if (isReady("close", epicId)) {
+    const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
+    lines.push(
+      `${cdPrefix}claude '/plan:close ${epicId}'`,
+      `bun ~/code/keeper/scripts/approve.ts ${epicId}`,
+    );
+  }
+
+  if (lines.length === 0) {
+    return null;
+  }
+  return lines.join(" &&\n");
+}
+
 async function main(): Promise<void> {
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
@@ -142,97 +235,8 @@ async function main(): Promise<void> {
   let lastEpicsSnapshot: Epic[] = [];
 
   // --- command rendering ---
-
-  /**
-   * Render the command block for a single epic: two lines per task (work +
-   * approve), then two lines for the virtual close row (close + approve).
-   *
-   * `task.target_repo` is the cd path for worker commands (the task may
-   * live in a different repo than its epic). Falls back to `epic.project_dir`
-   * when `target_repo` is null or empty — same fallback used by the plan
-   * worker when seeding tasks.
-   *
-   * Block 1 calls this directly. Block 2 calls
-   * `renderEpicCommandsFiltered` below with a verdict predicate.
-   */
-  function renderEpicCommands(epic: Epic): string {
-    const projectDir = seg(epic.project_dir);
-    const epicId = seg(epic.epic_id);
-    const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
-    const lines: string[] = [];
-
-    for (const task of tasks) {
-      const taskId = seg(task.task_id);
-      const dir =
-        task.target_repo != null && seg(task.target_repo) !== ""
-          ? seg(task.target_repo)
-          : projectDir;
-      const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
-      lines.push(
-        `${cdPrefix}claude '/plan:work ${taskId}'`,
-        `bun ~/code/keeper/scripts/approve.ts ${taskId}`,
-      );
-    }
-
-    // Virtual close row — always appended, mirrors board.ts.
-    const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
-    lines.push(
-      `${cdPrefix}claude '/plan:close ${epicId}'`,
-      `bun ~/code/keeper/scripts/approve.ts ${epicId}`,
-    );
-
-    return lines.join(" &&\n");
-  }
-
-  /**
-   * Render a filtered command block for a single epic: emits ONLY the
-   * task pairs and the close pair for which `isReady(kind, id)` returns
-   * true. Returns `null` when no row passes — caller drops the epic from
-   * block 2 entirely.
-   *
-   * Sibling of `renderEpicCommands` rather than a retrofitted filter
-   * parameter: keeps the unfiltered renderer pure and trivial, and the
-   * filtered renderer self-contained for the (currently single) block-2
-   * call site.
-   */
-  function renderEpicCommandsFiltered(
-    epic: Epic,
-    isReady: (kind: "task" | "close", id: string) => boolean,
-  ): string | null {
-    const projectDir = seg(epic.project_dir);
-    const epicId = seg(epic.epic_id);
-    const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
-    const lines: string[] = [];
-
-    for (const task of tasks) {
-      const taskId = seg(task.task_id);
-      if (!isReady("task", taskId)) {
-        continue;
-      }
-      const dir =
-        task.target_repo != null && seg(task.target_repo) !== ""
-          ? seg(task.target_repo)
-          : projectDir;
-      const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
-      lines.push(
-        `${cdPrefix}claude '/plan:work ${taskId}'`,
-        `bun ~/code/keeper/scripts/approve.ts ${taskId}`,
-      );
-    }
-
-    if (isReady("close", epicId)) {
-      const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
-      lines.push(
-        `${cdPrefix}claude '/plan:close ${epicId}'`,
-        `bun ~/code/keeper/scripts/approve.ts ${epicId}`,
-      );
-    }
-
-    if (lines.length === 0) {
-      return null;
-    }
-    return lines.join(" &&\n");
-  }
+  // `renderEpicCommands` and `renderEpicCommandsFiltered` live at module
+  // scope above so test/autopilot.test.ts can import them directly.
 
   /**
    * Full frame body: two `===`-delimited blocks.
@@ -406,4 +410,6 @@ async function main(): Promise<void> {
   });
 }
 
-await main();
+if (import.meta.main) {
+  await main();
+}
