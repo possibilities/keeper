@@ -351,13 +351,13 @@ test("subscribeReadiness: terminal error frame (no prior result) invokes onFatal
   // loop open whenever a custom `onFatal` returned instead of exiting.
   const realSetInterval = globalThis.setInterval;
   const realClearInterval = globalThis.clearInterval;
-  const pending = new Set<ReturnType<typeof setInterval>>();
+  const pending = new Set<ReturnType<typeof realSetInterval>>();
   globalThis.setInterval = ((
-    handler: TimerHandler,
+    handler: Parameters<typeof realSetInterval>[0],
     timeout?: number,
     ...args: unknown[]
   ) => {
-    const id = realSetInterval(handler as () => void, timeout, ...args);
+    const id = realSetInterval(handler, timeout, ...args);
     pending.add(id);
     return id;
   }) as typeof setInterval;
@@ -443,7 +443,7 @@ test("subscribeReadiness: capped-backoff reconnect sequence — 250, 500, 1000, 
 
   const realSetTimeout = globalThis.setTimeout;
   globalThis.setTimeout = ((
-    handler: TimerHandler,
+    handler: Parameters<typeof realSetTimeout>[0],
     timeout?: number,
     ...args: unknown[]
   ) => {
