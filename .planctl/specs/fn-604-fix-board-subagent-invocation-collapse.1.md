@@ -46,5 +46,5 @@ Either approach lands the same outcome: every invocation row reaches
 - [ ] `bun run tsc --noEmit` is clean; `bun test` passes.
 
 ## Done summary
-
+Add CollectionState.rows + projectRows() helper to scripts/board.ts; route the readiness handoff for subagent_invocations through it so re-entrant sub-agents sharing one job_id all reach computeReadiness instead of collapsing last-write-wins through byId.values(). Regression test in test/board.test.ts pins the fix.
 ## Evidence

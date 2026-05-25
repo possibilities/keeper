@@ -1,12 +1,18 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-05-25T02:28:31Z",
   "depends_on": [],
   "epic": "fn-604-fix-board-subagent-invocation-collapse",
   "id": "fn-604-fix-board-subagent-invocation-collapse.1",
+  "preferred_backend": null,
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "fix subagent invocation collapse in board",
-  "updated_at": "2026-05-25T02:28:31Z"
+  "updated_at": "2026-05-25T04:19:53Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-25T04:19:53Z"
 }
