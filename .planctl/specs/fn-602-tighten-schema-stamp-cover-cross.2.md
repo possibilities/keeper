@@ -34,5 +34,5 @@ same-session only.
       is short-circuited to same-session only.
 
 ## Done summary
-
+Added test/reducer.test.ts case 'syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_links across every session that ever touched it' — seeds two sessions both refining the same epic, folds a backdated epic-create in session A that triggers per-window creator-suppression dropping A's refiner edge, and asserts the touched epic's job_links contains the new creator-A plus B's untouched refiner. Verified the test fails when the SELECT DISTINCT session_id sweep at reducer.ts:1418 is short-circuited to same-session only.
 ## Evidence
