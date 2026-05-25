@@ -20,11 +20,11 @@
  * reducer folds that persisted payload into `git_status`.
  */
 
-import type { AsyncSubscription } from "@parcel/watcher";
 import type { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { isAbsolute, join, normalize, relative } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
 import { isDropError, RescanScheduler } from "./rescan";
 import type { ShutdownMessage } from "./wake-worker";
@@ -676,9 +676,8 @@ function startWorker(): void {
       // the per-root JSON dedupe absorbs no-ops (including our own
       // GitSnapshot round-trips).
       const dataVersionQuery = db.query("PRAGMA data_version");
-      lastDataVersion = (
-        dataVersionQuery.get() as { data_version: number }
-      ).data_version;
+      lastDataVersion = (dataVersionQuery.get() as { data_version: number })
+        .data_version;
       dbPollTimer = setInterval(() => {
         if (shuttingDown) return;
         const cur = (dataVersionQuery.get() as { data_version: number })
