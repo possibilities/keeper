@@ -394,10 +394,12 @@ async function main(): Promise<void> {
    * only point where the complete group is available; the diff/patch path
    * only delivers changed rows so it can't compute this accurately).
    *
-   * Rule: within each `(job_id, subagent_type)` bucket sorted by `turn_seq`
-   * ascending, any `status='running'` entry whose index is not the last in
-   * the group is replaced. The last entry is always the "current" attempt
-   * regardless of status, so it is never flagged.
+   * Rule: within each `(job_id, subagent_type)` bucket, any
+   * `status='running'` entry whose `ts` is strictly less than the group's
+   * maximum `ts` is replaced. The entry at max `ts` is always the "current"
+   * attempt and is never flagged regardless of its status. `ts` is used
+   * rather than index position because `turn_seq` is per-(job_id,agent_id)
+   * and does not order correctly across different agent_ids sharing a job.
    *
    * `null`-typed entries (unknown subagent type) are skipped — we can't
    * group them meaningfully and they're not `plan:worker-*` spawns anyway.
