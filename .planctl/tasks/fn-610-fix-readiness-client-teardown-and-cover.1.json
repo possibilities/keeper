@@ -11,8 +11,8 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "clear pollTimer on terminal error and cover backoff",
-  "updated_at": "2026-05-25T23:53:36.842720Z",
+  "updated_at": "2026-05-25T23:57:13.931045Z",
   "work_review_status": "unknown",
   "work_reviewed_at": null,
-  "worker_done_at": null
+  "worker_done_at": "2026-05-25T23:57:13.931045Z"
 }

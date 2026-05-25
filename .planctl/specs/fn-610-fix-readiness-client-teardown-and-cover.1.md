@@ -39,5 +39,5 @@ sequence test cheap.
 - [ ] Both new assertions pass; no existing tests modified or weakened.
 
 ## Done summary
-
+Terminal-error branch now teardownConnection()s before onFatal so a non-exiting custom callback can't pin the event loop open; added F1 setInterval-leak spy assertion and a new test that drives the mock ConnectFactory to reject in sequence and asserts the 250/500/1000/2000/4000/5000/5000 ms capped-backoff delays.
 ## Evidence
