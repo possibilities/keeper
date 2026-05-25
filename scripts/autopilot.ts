@@ -221,7 +221,7 @@ async function main(): Promise<void> {
       `bun ~/code/keeper/scripts/approve.ts ${epicId}`,
     );
 
-    return lines.join("\n");
+    return lines.join(" &&\n");
   }
 
   /**
