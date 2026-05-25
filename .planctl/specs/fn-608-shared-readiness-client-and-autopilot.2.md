@@ -89,5 +89,5 @@ export function projectRows<T>(state: { rows: readonly unknown[] }): T[];
 - [ ] `bun test` passes.
 
 ## Done summary
-
+Extracted subscribeReadiness helper into src/readiness-client.ts (owns connection lifecycle, all-three-strict first-paint gate, computeReadiness handoff, capped-backoff reconnect, steady-poll backstop, idempotent dispose). scripts/board.ts is now a thin renderer (sidecars, per-frame subagent index, lastBody byte-compare). projectRows migrated to the helper; test/board.test.ts updated to import from src/readiness-client and the two-running-subagents-on-one-job_id regression still passes.
 ## Evidence
