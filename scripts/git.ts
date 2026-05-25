@@ -62,10 +62,17 @@ function renderRows(rows: Record<string, unknown>[]): string {
     const dir = seg(row.project_dir);
     const name = basename(dir) || dir;
     const branch = row.branch == null ? "detached" : seg(row.branch);
-    const ahead =
-      typeof row.ahead === "number" && row.ahead > 0 ? ` +${row.ahead}` : "";
+    const aheadCount =
+      typeof row.ahead === "number" && row.ahead > 0 ? row.ahead : 0;
+    const ahead = aheadCount > 0 ? ` +${aheadCount}` : "";
     const behind =
       typeof row.behind === "number" && row.behind > 0 ? ` -${row.behind}` : "";
+    const dirtyCount =
+      typeof row.dirty_count === "number" ? row.dirty_count : 0;
+    const orphanedCount =
+      typeof row.orphaned_count === "number" ? row.orphaned_count : 0;
+    if (aheadCount === 0 && dirtyCount === 0 && orphanedCount === 0) continue;
+
     const lines = [
       `${name} [${branch}${ahead}${behind}] dirty=${seg(row.dirty_count)} orphaned=${seg(row.orphaned_count)}`,
     ];
@@ -75,6 +82,10 @@ function renderRows(rows: Record<string, unknown>[]): string {
       : [];
     for (const file of orphaned) {
       lines.push(`  orphan ${statusLine(file)}`);
+    }
+
+    if (aheadCount > 0) {
+      lines.push(`  unpushed ${aheadCount}`);
     }
 
     const jobs = Array.isArray(row.jobs)
