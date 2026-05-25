@@ -107,5 +107,5 @@ Epic header rollup (after per-row + single-root):
 - [ ] Manual verification: `bun scripts/board.ts` against live keeperd shows the richer pills with reasons matching observed state.
 
 ## Done summary
-
+Added scripts/readiness.ts as a pure 10-predicate first-match-wins pipeline (computeReadiness + applySingleRootMutex + formatPill/formatReasonLine over a discriminated Verdict/BlockReason union); wired scripts/board.ts to a third subagent_invocations subscription with strict first-paint gate, post-status/approval [ready|completed|blocked:<reason>] pills on task/close/epic rows plus continuation reason lines, and updated README.md. test/readiness.test.ts (34 tests) covers the full predicate-ordering matrix, single-root post-pass, epic header rollup, missing-input defensives, dep-absent semantics, and subagent_invocations status filter.
 ## Evidence
