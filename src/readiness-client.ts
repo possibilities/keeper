@@ -426,6 +426,13 @@ export function subscribeReadiness(
         } catch {
           // already torn down
         }
+        // Release the steady-poll interval and reset per-collection state
+        // before handing the terminal error to the caller. The default
+        // `onFatal` is `process.exit(1)` so the leak is invisible there,
+        // but a custom `onFatal` that returns (tests, in-process
+        // consumers) would otherwise leave a live `setInterval` holding
+        // the event loop open indefinitely.
+        teardownConnection();
         // Hand the terminal error off to the caller (default:
         // `process.exit(1)`) AFTER tearing the connection down, so a
         // custom `onFatal` that throws or schedules work observes the

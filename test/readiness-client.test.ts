@@ -342,53 +342,190 @@ test("subscribeReadiness: dispose() is idempotent — second call is a no-op", (
 //     error payload (and onLifecycle sees the same error event).
 // ---------------------------------------------------------------------------
 
-test("subscribeReadiness: terminal error frame (no prior result) invokes onFatal with the error payload", () => {
-  const { factory, socketRef } = makeMockConnect();
-  const fatals: FatalError[] = [];
-  const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
-  const handle = subscribeReadiness({
-    sockPath: "/tmp/keeper-mock.sock",
-    idPrefix: "test-fatal",
-    onSnapshot: () => {
-      throw new Error("onSnapshot must not fire on a pre-handshake error");
-    },
-    onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
-    onFatal: (err) => fatals.push(err),
-    connect: factory,
-  });
-  const sock = socketRef.current;
-  if (!sock) {
-    throw new Error("mock socket never installed");
+test("subscribeReadiness: terminal error frame (no prior result) invokes onFatal with the error payload and leaves no pending setInterval", () => {
+  // Spy `setInterval` / `clearInterval` on the global so we can track
+  // every timer the helper schedules and assert NONE remain pending
+  // after `onFatal` fires. This pins the F1 leak: the terminal-error
+  // branch used to set `shuttingDown` and call `end()` but never
+  // clear `pollTimer`, leaving a live `setInterval` to hold the event
+  // loop open whenever a custom `onFatal` returned instead of exiting.
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  const pending = new Set<ReturnType<typeof setInterval>>();
+  globalThis.setInterval = ((
+    handler: TimerHandler,
+    timeout?: number,
+    ...args: unknown[]
+  ) => {
+    const id = realSetInterval(handler as () => void, timeout, ...args);
+    pending.add(id);
+    return id;
+  }) as typeof setInterval;
+  globalThis.clearInterval = ((id?: ReturnType<typeof setInterval>) => {
+    if (id !== undefined) {
+      pending.delete(id);
+    }
+    realClearInterval(id);
+  }) as typeof clearInterval;
+
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const fatals: FatalError[] = [];
+    const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-fatal",
+      onSnapshot: () => {
+        throw new Error("onSnapshot must not fire on a pre-handshake error");
+      },
+      onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+      onFatal: (err) => fatals.push(err),
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+
+    // Burn the three initial queries.
+    expect(sock.takeOutbound()).toHaveLength(3);
+    // The helper installed its steady-poll `setInterval` in `open`; the
+    // spy must have observed it.
+    expect(pending.size).toBe(1);
+
+    // Deliver a terminal `error` frame BEFORE any collection has a result.
+    sock.deliver([errorFrame("unknown_collection", "no such collection", 0)]);
+
+    // `onFatal` fired exactly once with the error payload.
+    expect(fatals).toHaveLength(1);
+    expect(fatals[0]).toEqual({
+      code: "unknown_collection",
+      rev: 0,
+      message: "no such collection",
+    });
+
+    // `onLifecycle` also saw an `error` event with the same fields (the
+    // contract is "lifecycle observes; fatal acts").
+    const errorEvents = lifecycle.filter((e) => e.event === "error");
+    expect(errorEvents).toHaveLength(1);
+    expect(errorEvents[0]?.detail).toEqual({
+      code: "unknown_collection",
+      rev: 0,
+      message: "no such collection",
+    });
+
+    // Socket was torn down via `end()` so the reconnect loop won't fire.
+    expect(sock.ended).toBe(true);
+
+    // The F1 invariant: the terminal-error branch cleared `pollTimer`
+    // before invoking `onFatal`, so no live `setInterval` survives.
+    expect(pending.size).toBe(0);
+
+    handle.dispose();
+  } finally {
+    globalThis.setInterval = realSetInterval;
+    globalThis.clearInterval = realClearInterval;
+    for (const id of pending) {
+      realClearInterval(id);
+    }
   }
+});
 
-  // Burn the three initial queries.
-  expect(sock.takeOutbound()).toHaveLength(3);
+test("subscribeReadiness: capped-backoff reconnect sequence — 250, 500, 1000, 2000, 4000, 5000 ms", async () => {
+  // F2 coverage: the reconnect loop computes
+  //   delay = min(INITIAL_BACKOFF_MS * 2 ** (attempt - 1), MAX_BACKOFF_MS)
+  // (`src/readiness-client.ts:524-525`). Drive the mock factory to reject
+  // back-to-back and intercept `setTimeout` to capture each `delay` the
+  // helper would sleep for. Firing the callback synchronously fast-forwards
+  // the backoff so the test stays deterministic and millisecond-fast.
+  const expected = [250, 500, 1000, 2000, 4000, 5000, 5000];
+  const observed: number[] = [];
 
-  // Deliver a terminal `error` frame BEFORE any collection has a result.
-  sock.deliver([errorFrame("unknown_collection", "no such collection", 0)]);
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((
+    handler: TimerHandler,
+    timeout?: number,
+    ...args: unknown[]
+  ) => {
+    // Capture only the reconnect-sleep timeouts: those are the ones the
+    // helper schedules from `connectWithRetry`. Other library timers
+    // (Bun internals, microtask shims) generally use `0` or `undefined`;
+    // the helper's sleeps are positive, finite millisecond delays
+    // matching the expected sequence. Recording every positive `timeout`
+    // is safe — the helper schedules no other positive-delay timeouts.
+    if (typeof timeout === "number" && timeout > 0) {
+      observed.push(timeout);
+      // Fire the callback on the next microtask so the awaiting
+      // `connectWithRetry` loop advances without a real delay.
+      queueMicrotask(() => {
+        (handler as () => void)();
+      });
+      // Return a fake id; helper only uses it for `clearTimeout` on
+      // dispose, which we won't reach for these timers.
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }
+    return realSetTimeout(handler as () => void, timeout, ...args);
+  }) as typeof setTimeout;
 
-  // `onFatal` fired exactly once with the error payload.
-  expect(fatals).toHaveLength(1);
-  expect(fatals[0]).toEqual({
-    code: "unknown_collection",
-    rev: 0,
-    message: "no such collection",
-  });
+  try {
+    let calls = 0;
+    let resolveDone: (() => void) | null = null;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
 
-  // `onLifecycle` also saw an `error` event with the same fields (the
-  // contract is "lifecycle observes; fatal acts").
-  const errorEvents = lifecycle.filter((e) => e.event === "error");
-  expect(errorEvents).toHaveLength(1);
-  expect(errorEvents[0]?.detail).toEqual({
-    code: "unknown_collection",
-    rev: 0,
-    message: "no such collection",
-  });
+    const factory: ConnectFactory = (_path, _handlers) => {
+      calls += 1;
+      if (calls <= expected.length) {
+        // Reject without calling `open` — no socket installed, no
+        // `setInterval` scheduled. Each rejection bumps `attempt` and
+        // schedules one backoff sleep.
+        return Promise.reject(new Error(`refused #${calls}`));
+      }
+      // Final attempt: signal the test we've observed the full capped
+      // sequence and hand back a never-resolving promise so the loop
+      // sits idle until `dispose()`.
+      resolveDone?.();
+      resolveDone = null;
+      return new Promise<ReadinessSocket>(() => {
+        /* never resolves — held until dispose() */
+      });
+    };
 
-  // Socket was torn down via `end()` so the reconnect loop won't fire.
-  expect(sock.ended).toBe(true);
+    const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-backoff",
+      onSnapshot: () => {
+        throw new Error("onSnapshot must not fire — no result ever delivered");
+      },
+      onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+      onFatal: () => {
+        throw new Error(
+          "onFatal must not fire — connect rejections are not terminal",
+        );
+      },
+      connect: factory,
+    });
 
-  handle.dispose();
+    // Wait for the full backoff sequence to play out.
+    await done;
+
+    // The helper observed expected.length rejections + scheduled
+    // expected.length backoff sleeps, capped at MAX_BACKOFF_MS for the
+    // tail entries.
+    expect(observed).toEqual(expected);
+
+    // Lifecycle should have emitted one `waiting` per backoff with a
+    // matching `retry_in_ms`.
+    const waits = lifecycle.filter((e) => e.event === "waiting");
+    expect(waits).toHaveLength(expected.length);
+    expect(waits.map((w) => w.detail?.retry_in_ms)).toEqual(expected);
+
+    handle.dispose();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
 });
 
 test("subscribeReadiness: non-terminal error (one collection already has a result) does NOT invoke onFatal", () => {
