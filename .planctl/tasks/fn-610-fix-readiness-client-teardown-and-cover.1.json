@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-25T23:52:14.066123Z",
+  "depends_on": [],
+  "epic": "fn-610-fix-readiness-client-teardown-and-cover",
+  "id": "fn-610-fix-readiness-client-teardown-and-cover.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "clear pollTimer on terminal error and cover backoff",
+  "updated_at": "2026-05-25T23:52:14.066123Z"
+}
