@@ -255,25 +255,33 @@ Two scripts under `scripts/` demonstrate the subscribe + RPC protocols.
 one connection); `approve.ts` is the RPC client (single-shot `rpc` →
 `rpc_result`, no subscription). Run either with `bun scripts/<name>.ts --help`.
 
-- `board.ts` — combined "board" UI over the `epics` and `jobs` collections.
-  Subscribes to both on a single connection and emits one combined frame per
-  change, led by `---`, with a `~~~` divider between the epics body and the
-  jobs body (and a second `~~~` inside the jobs body splitting ambient
-  sessions from planner/worker/closer rows). Uses server-default scope for
-  both: epics `{ status: "open", approval: { ne: "approved" } }`, jobs live
-  only (`working + stopped`). Each epic renders as a header line —
-  `({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated]` —
-  followed by indented task lines (with `[{status}] [{approval}]` pills)
-  and a final "Quality audit and close" line for the epic itself. The
-  `[validated]` / `[unvalidated]` pill reflects planctl's
+- `board.ts` — combined "board" UI over the `epics`, `jobs`, and
+  `subagent_invocations` collections. Subscribes to all three on a single
+  connection and emits one combined frame per change, led by `---`, with
+  a `~~~` divider between the epics body and the jobs body (and a second
+  `~~~` inside the jobs body splitting ambient sessions from
+  planner/worker/closer rows). Uses server-default scope for all three:
+  epics `{ status: "open", approval: { ne: "approved" } }`, jobs live
+  only (`working + stopped`), `subagent_invocations` full per-job
+  timeline. Each epic renders as a header line —
+  `({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated]
+  [ready|completed|blocked:<reason>]` — followed by indented task lines
+  (with `[{status}] [{approval}] [ready|completed|blocked:<reason>]`
+  pills) and a final "Quality audit and close" line for the epic itself.
+  The `[validated]` / `[unvalidated]` pill reflects planctl's
   `last_validated_at` timestamp on the epic file (flipped by
-  `planctl validate --epic <id>`). The byte-compare emit gate keeps the
-  stream quiet when row churn doesn't surface in the render. Reconnects
-  across keeperd restarts; Ctrl-C unsubscribes cleanly. Every emitted
-  frame is mirrored to three per-pid `/tmp` sidecar files (combined JSON
-  state, frame text, unified diff vs. the previous emit); `--clear` enables
-  a live-panel mode that clears the terminal each frame and indexes the
-  sidecars so past frames remain inspectable.
+  `planctl validate --epic <id>`). The `[ready] / [completed] /
+  [blocked:<reason>]` pill is a pure-function readiness verdict computed
+  from the three-collection snapshot (see `scripts/readiness.ts`); a
+  blocked row is followed by a `   (reason: <reason>)` continuation
+  line so the human reads the cause without scanning the upstream rows.
+  The byte-compare emit gate keeps the stream quiet when row churn
+  doesn't surface in the render. Reconnects across keeperd restarts;
+  Ctrl-C unsubscribes cleanly. Every emitted frame is mirrored to three
+  per-pid `/tmp` sidecar files (combined JSON state, frame text, unified
+  diff vs. the previous emit); `--clear` enables a live-panel mode that
+  clears the terminal each frame and indexes the sidecars so past frames
+  remain inspectable.
 
   ```sh
   bun scripts/board.ts            # combined board, default scope
