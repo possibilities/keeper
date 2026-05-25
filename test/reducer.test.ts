@@ -2866,6 +2866,114 @@ test("syncPlanctlLinks: two sessions touching the same epic both appear in job_l
   ]);
 });
 
+test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_links across every session that ever touched it", () => {
+  // Coverage for the cross-session expansion at `src/reducer.ts:1192` (the
+  // `SELECT DISTINCT session_id ... WHERE planctl_op IS NOT NULL AND
+  // (planctl_epic_id IN (...) OR planctl_target IN (...))` sweep). Without it
+  // a re-classification in session A would re-derive the touched epic's
+  // `job_links` against session A's invocations only — silently dropping
+  // every other session's edge on that epic. This test fails if the sweep is
+  // short-circuited to same-session only.
+  //
+  // The drop mechanism here is the classifier's per-window
+  // creator-suppression rule (see `deriveEpicLinks`): a creator-of-X
+  // encountered earlier in a window's ts-ASC order suppresses any later
+  // refiner-of-X in the same window. We exercise it by backdating the
+  // follow-up `epic-create` (ts 100) so on re-classification it lands BEFORE
+  // the existing `epic-set-title` (ts 110) inside window 1. Synthetic
+  // ordering — what matters here is the cross-session fan-out behaviour, not
+  // the realism of the wall-clock interleave.
+  //
+  // Scenario:
+  //   1. Session A opens a /plan:plan window (t=90) and refines epic X via
+  //      `epic-set-title` at t=110. A's epic_links = [refiner:X];
+  //      X's job_links = [refiner:A].
+  //   2. Session B opens a /plan:plan window (t=200) and refines epic X via
+  //      `epic-set-title` at t=210. The cross-session sweep from B's fold
+  //      adds B → X's job_links = [refiner:A, refiner:B].
+  //   3. Session A folds a backdated `epic-create` on X at t=100 — inside
+  //      A's window 1 but BEFORE the refiner. The classifier emits creator-X
+  //      first, which suppresses the now-later refiner-X. A's epic_links
+  //      collapse to [creator:X] — the refiner edge is dropped.
+  //   4. The fan-out's cross-session sweep MUST re-derive X's job_links over
+  //      both A and B — yielding [creator:A, refiner:B]. A short-circuited
+  //      (same-session-only) sweep would yield [creator:A] only, silently
+  //      losing B's refiner edge.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-A-xs",
+    ts: 80,
+  });
+  planPlanOpener("sess-A-xs", 90);
+  planctlEvent({
+    sessionId: "sess-A-xs",
+    op: "epic-set-title",
+    target: "fn-7-xs",
+    epicId: "fn-7-xs",
+    subjectPresent: true,
+    ts: 110,
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-B-xs",
+    ts: 190,
+  });
+  planPlanOpener("sess-B-xs", 200);
+  planctlEvent({
+    sessionId: "sess-B-xs",
+    op: "epic-set-title",
+    target: "fn-7-xs",
+    epicId: "fn-7-xs",
+    subjectPresent: true,
+    ts: 210,
+  });
+  drainAll();
+  // Pre-state: both sessions refine the epic.
+  expect(getEpicLinks("sess-A-xs")).toEqual([
+    { kind: "refiner", target: "fn-7-xs" },
+  ]);
+  expect(getEpicLinks("sess-B-xs")).toEqual([
+    { kind: "refiner", target: "fn-7-xs" },
+  ]);
+  expect(getJobLinks("fn-7-xs")).toEqual([
+    { kind: "refiner", job_id: "sess-A-xs" },
+    { kind: "refiner", job_id: "sess-B-xs" },
+  ]);
+
+  // Follow-up in session A — backdated `epic-create` at t=100 lands BEFORE
+  // the refiner at t=110, so re-classification emits creator-X first which
+  // suppresses the refiner via per-window-creator-of-X rule.
+  planctlEvent({
+    sessionId: "sess-A-xs",
+    op: "epic-create",
+    target: "fn-7-xs",
+    epicId: "fn-7-xs",
+    subjectPresent: true,
+    ts: 100,
+  });
+  drainAll();
+
+  // Session A's epic_links updated by the same-session re-derive (refiner
+  // dropped → creator emitted).
+  expect(getEpicLinks("sess-A-xs")).toEqual([
+    { kind: "creator", target: "fn-7-xs" },
+  ]);
+  // Session B's epic_links are not directly touched by the fan-out on A —
+  // they must still reach the correct post-state (B was never
+  // re-classified, so its refiner edge persists verbatim).
+  expect(getEpicLinks("sess-B-xs")).toEqual([
+    { kind: "refiner", target: "fn-7-xs" },
+  ]);
+  // The acceptance assertion: epic X's job_links no longer carries the
+  // stale session-A refiner edge, AND session B's refiner edge survives the
+  // cross-session re-derive. Sort is total-order (kind, job_id) ASC —
+  // creator < refiner lexicographically, so creator:A comes first.
+  expect(getJobLinks("fn-7-xs")).toEqual([
+    { kind: "creator", job_id: "sess-A-xs" },
+    { kind: "refiner", job_id: "sess-B-xs" },
+  ]);
+});
+
 test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out works)", () => {
   // Seed a creator edge via the fan-out → a shell epic with job_links.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-carveout" });
