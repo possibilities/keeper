@@ -35,5 +35,5 @@ This test mirrors the boot path exactly and would have caught the regression.
 - [ ] All existing plan-worker tests pass (no regressions).
 
 ## Done summary
-
+scanPlanctlDir now enumerates .planctl/state/tasks/*.state.json BEFORE the tasks/ loop and primes runtimeStatusCache via a new PlanScanner.primeRuntimeStatus(taskId, status) cache poke, using the same coerceRuntimeStatus guard as the live onChange arm (invalid values logged + skipped, no cache write). Added two integration tests in test/plan-worker.test.ts that mirror the boot path: pre-existing state file → first TaskSnapshot carries the correct runtime_status; invalid state value → task reads default todo. All 714 tests pass.
 ## Evidence

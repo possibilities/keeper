@@ -11,8 +11,8 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "prime runtimeStatusCache on boot scan and add integration test",
-  "updated_at": "2026-05-25T21:08:42.524401Z",
+  "updated_at": "2026-05-25T21:17:55.847951Z",
   "work_review_status": "unknown",
   "work_reviewed_at": null,
-  "worker_done_at": null
+  "worker_done_at": "2026-05-25T21:17:55.847951Z"
 }
