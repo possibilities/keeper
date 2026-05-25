@@ -24,5 +24,5 @@ No logic changes — this is a type-annotation and comment-only fix.
 - [ ] `bun run typecheck` passes
 
 ## Done summary
-
+Widened SubagentInvocation.status to 'running' | 'ok' | 'failed' | 'unknown' in src/types.ts and synced doc comments in types.ts, db.ts migration, and README. Updated one readiness test that used the old 'error' literal.
 ## Evidence
