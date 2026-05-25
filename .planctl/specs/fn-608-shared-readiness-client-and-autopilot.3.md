@@ -67,5 +67,5 @@ No new unit test required. Validation is visual: run `bun scripts/autopilot.ts` 
 - [ ] `bun test` passes.
 
 ## Done summary
-
+Rewired scripts/autopilot.ts to consume subscribeReadiness from src/readiness-client.ts (drop standalone three-collection setup + connect/poll/SIGINT plumbing; SIGINT now calls handle.dispose()). renderBody emits two ===-delimited blocks: full flat command list + ready-only block (filtered by verdict.tag === 'ready') headed by a comment about the single-root post-pass. README example-clients section adds autopilot.ts entry and retargets readiness reference to src/readiness.ts; README architecture section gains a one-paragraph deferral note on a future server-side readiness collection.
 ## Evidence
