@@ -77,5 +77,5 @@ Wipes every PreToolUse:Bash row's structurally-wrong stamps. Idempotent re-run s
 - [ ] Re-fold determinism preserved — test/reducer.test.ts:3159 stays green
 
 ## Done summary
-
+v19→v20 migration: NULL-outs PreToolUse:Bash planctl_* stamps (v14's input-command-regex output, structurally wrong on two-word verbs), re-stamps from PostToolUse:Bash envelope, and full-replace re-derives jobs.epic_links + epics.job_links via deriveEpicLinks/deriveJobLinks; ANALYZE epilogue refreshes the partial composite index stats. Also extends deriveJobLinks's creator predicate to recognize op='scaffold' symmetrically with deriveEpicLinks (task 1 missed the symmetric extension). New test seeds a scaffold envelope + a two-word epic-close + a subject-bearing epic-set-title and asserts the full Pass 0 → 1 → 2a → 2b chain.
 ## Evidence
