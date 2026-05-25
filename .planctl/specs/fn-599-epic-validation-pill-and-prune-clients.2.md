@@ -57,5 +57,5 @@ No new tests. The two test additions live in task .1. Smoke test: `bun scripts/b
 - [ ] `src/server-worker.ts:133` either repoints the `[epics-ts]` TODO at a live trace prefix or drops the line — decision and rationale captured in the commit message.
 
 ## Done summary
-
+Deleted scripts/epics.ts + scripts/jobs.ts, rewrote scripts/board.ts header + HELP (with new [validated|unvalidated] pill in epic-header format example), and repointed all cross-references (README.md intro counts + Example clients + Architecture v14 anchor + Inspect query, scripts/approve.ts, scripts/autopilot.ts, src/protocol.ts) at board.ts. Dropped the [epics-ts] TODO cross-ref from src/server-worker.ts since the prefix only emitted from the deleted script.
 ## Evidence
