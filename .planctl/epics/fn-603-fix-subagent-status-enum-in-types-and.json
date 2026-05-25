@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-603-fix-subagent-status-enum-in-types-and",
   "bundles": [],
+  "closer_done_at": "2026-05-25T03:04:16Z",
   "created_at": "2026-05-25T01:24:51Z",
   "depends_on_epics": [
     "fn-600-subagent-invocations-from-events"
@@ -11,10 +12,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "fix subagent status enum in types and docs",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-25T01:24:55Z"
+  "updated_at": "2026-05-25T03:04:16Z"
 }
