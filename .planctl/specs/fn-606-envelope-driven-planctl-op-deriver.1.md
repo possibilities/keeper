@@ -63,5 +63,5 @@ Update CLAUDE.md line 65 (Event-sourcing invariants — derivers paragraph): nam
 - [ ] CLAUDE.md line 65 and README.md lines 32-35 + 379 updated; `bun test` is green
 
 ## Done summary
-
+Flipped extractPlanctlInvocation to gate on PostToolUse:Bash and parse the authoritative planctl_invocation envelope from tool_response.stdout. Extended classifier creator predicate to accept op==='scaffold' alongside op==='create'. Test fixtures inverted accordingly. Comment + JSDoc updates across reducer/types/CLAUDE.md/README. Pre-existing schema-version-stamp test failures (12, unrelated) remain; new tests + scaffold-as-creator test pass.
 ## Evidence
