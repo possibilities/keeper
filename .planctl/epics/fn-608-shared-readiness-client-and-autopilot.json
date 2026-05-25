@@ -3,6 +3,7 @@
   "bundles": [
     "sketch/central-readiness-autopilot-ready-block"
   ],
+  "closer_done_at": "2026-05-25T23:29:26.876801Z",
   "created_at": "2026-05-25T20:13:23.590220Z",
   "depends_on_epics": [
     "fn-606-envelope-driven-planctl-op-deriver"
@@ -13,10 +14,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Shared readiness client and autopilot ready block",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-25T20:13:52.311130Z"
+  "updated_at": "2026-05-25T23:29:26.876801Z"
 }
