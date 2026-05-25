@@ -14,5 +14,5 @@ the autopilot work list.
 - [ ] If `renderEpicCommandsFiltered` (and any helpers needed for the test) are not currently exported from `scripts/autopilot.ts`, export them (or re-export through a thin internal module) so the test can import them directly without spawning a subprocess.
 
 ## Done summary
-
+Lifted renderEpicCommands/renderEpicCommandsFiltered to module scope + exported them; added test/autopilot.test.ts covering all-pass (byte-identical to unfiltered), some-pass (subset survives, order preserved), and none-pass (returns null) plus two empty-task edge cases. Gated main() behind import.meta.main.
 ## Evidence
