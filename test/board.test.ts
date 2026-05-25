@@ -1,7 +1,7 @@
 /**
- * Pure-function tests for `scripts/board.ts` — specifically the
- * `projectRows` helper that feeds the readiness handoff. Regression
- * coverage for the `byId`-collapse bug:
+ * Pure-function tests for `src/readiness-client.ts`'s `projectRows`
+ * helper that feeds the readiness handoff. Regression coverage for the
+ * `byId`-collapse bug:
  *
  * `SUBAGENT_INVOCATIONS_DESCRIPTOR` exposes `job_id` as the wire pk
  * even though the SQL composite identity is
@@ -18,11 +18,18 @@
  *   1. `projectRows` returns every row in `state.rows` (no collapse).
  *   2. Two `running` invocations sharing one `job_id` reach
  *      `computeReadiness` and produce `[blocked:sub-agent-running]`.
+ *
+ * `projectRows` now lives in `src/readiness-client.ts`; this file
+ * retains the `test/board.test.ts` name because the regression is
+ * board-traceable (the bug surfaced in board's readiness handoff and
+ * the assertion still mirrors that exact code path). The same
+ * helper is consumed by `scripts/autopilot.ts` post-extraction, so
+ * keeping the test name doesn't mislead.
  */
 
 import { expect, test } from "bun:test";
-import { projectRows } from "../scripts/board";
 import { computeReadiness } from "../src/readiness";
+import { projectRows } from "../src/readiness-client";
 import type {
   EmbeddedJob,
   Epic,

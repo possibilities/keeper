@@ -27,26 +27,16 @@
  * between epics and jobs, one inside the jobs section. The empty-side drop
  * rule (below) applies at both levels.
  *
- * One connection carries THREE `query` frames (one per collection — epics,
- * jobs, subagent_invocations — each with a distinct subscription `id`).
- * `patch` / `meta` frames carry only `collection` (no `id`), so we route
- * refetches by collection: an epics patch refetches only epics, a jobs
- * patch only jobs, a subagent_invocations patch only that. Each collection
- * keeps its own page state (`order` / `byId` / `gotResult`) and its own
- * coalescing flags (`queryInFlight` / `refetchDirty`), so a refetch in one
- * never blocks a refetch in the others; the rendered body + the readiness
- * pill are recomputed from ALL THREE whenever any lands a fresh `result`.
- * The combined body is byte-compared against the last printed frame, so
- * internal row churn that doesn't surface in the render is invisible.
- *
- * First-paint policy: NO frame is emitted until ALL THREE collections have
- * received their first `result` (strict — accept an indefinite dark board
- * over a wrong-state render). Otherwise the first paint would briefly show
- * a real section below an empty one (or vice versa), or compute the
- * readiness pill against a partial snapshot — both read as momentary
- * lies. After the first combined frame, every subsequent `result` may
- * emit — the lastBody compare keeps the stream quiet when nothing visible
- * changed.
+ * Connection / poll / coalesce / first-paint lifecycle is owned by
+ * `subscribeReadiness` in `src/readiness-client.ts`. The board is the
+ * RENDERER: it owns the sidecar writes, the per-frame `job_id →
+ * SubagentInvocation[]` index used to nest sub-agent lines under jobs,
+ * the `lastBody` byte-compare that suppresses no-op frames, and the
+ * stdout emit. The helper handles the all-three-strict first-paint
+ * gate, the per-collection refetch coalesce, the capped-backoff
+ * reconnect, the steady-poll backstop, and (load-bearing) reads
+ * subagent_invocations through `state.rows` so re-entrant sub-agents
+ * sharing one `job_id` all reach `computeReadiness`.
  *
  * Empty-section policy: an empty collection renders as NOTHING (no
  * placeholder text). The `~~~` divider is dropped when either side is
@@ -61,14 +51,13 @@
  * (`working + stopped`, terminal states hidden). That's the common-case
  * "board" view; for explicit filters drop down to a custom subscribe client.
  *
- * Connection / poll / sidecar / SIGINT semantics: capped-backoff
- * connect+retry, post-disconnect reconnect, one `...`-fenced lifecycle note
- * per transition, THREE combined sidecar files (state JSON + frame text +
- * per-frame unified diff against the previous emit) overwritten each frame.
- * The diff is `diff -u prev current` via the system tool — universally-
- * readable unified-diff format; the first frame writes a sentinel since
- * there's no prior to diff. SIGINT sends a bare `unsubscribe` (no id) which
- * drops both subscriptions in one frame, then exits.
+ * Sidecar / SIGINT semantics: THREE combined sidecar files (state JSON +
+ * frame text + per-frame unified diff against the previous emit) overwritten
+ * each frame. The diff is `diff -u prev current` via the system tool —
+ * universally-readable unified-diff format; the first frame writes a
+ * sentinel since there's no prior to diff. SIGINT calls the helper's
+ * `dispose()` (which drops every subscription on the connection via a
+ * bare `unsubscribe`) and exits.
  *
  * Usage:
  *   bun scripts/board.ts [--sock <path>]
@@ -82,39 +71,12 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
+import { formatPill, type Verdict } from "../src/readiness";
 import {
-  encodeFrame,
-  LineBuffer,
-  type QueryFrame,
-  type ServerFrame,
-} from "../src/protocol";
-import {
-  computeReadiness,
-  formatPill,
-  type ReadinessSnapshot,
-  type Verdict,
-} from "../src/readiness";
-import type { Epic, Job, JobLinkEntry, SubagentInvocation } from "../src/types";
-
-/**
- * Page sizing. Jobs paginates at 10 — a tight enough window that a single
- * frame stays readable while still covering the typical live-session set.
- * Epics fetches the whole default-scope set (`limit: 0`) because that scope
- * (open + not-yet-approved) is already tiny — well under any sensible page
- * limit, and the user wants the whole board, not a window into it.
- */
-const JOBS_PAGE_LIMIT = 10;
-const EPICS_PAGE_LIMIT = 0;
-
-/**
- * Poll cadence (ms). Refetches BOTH collections each tick (coalesced per
- * collection, so a tick that arrives while a refetch is in flight just sets
- * that collection's `refetchDirty` and skips the second send).
- */
-const POLL_MS = 500;
-
-const INITIAL_BACKOFF_MS = 250;
-const MAX_BACKOFF_MS = 5000;
+  type ReadinessClientSnapshot,
+  subscribeReadiness,
+} from "../src/readiness-client";
+import type { Job, JobLinkEntry, SubagentInvocation } from "../src/types";
 
 const HELP = `keeper-board — combined epics + jobs UI over the keeper subscribe server
 
@@ -195,6 +157,14 @@ timeline). For explicit per-collection filters write a small custom
 subscribe client against src/protocol.ts.
 `;
 
+/**
+ * Re-export `projectRows` from the helper so `test/board.test.ts` (and any
+ * external consumers) can keep importing `projectRows` from the board entry.
+ * The helper module is the canonical home; this re-export is a stability
+ * shim. New code should import from `src/readiness-client` directly.
+ */
+export { projectRows } from "../src/readiness-client";
+
 /** Approval enum vocabulary, mirrored from `src/plan-worker.ts:Approval`. */
 const APPROVAL_VALUES = new Set(["approved", "rejected", "pending"]);
 
@@ -260,84 +230,6 @@ function taskNumFromId(id: string): number | null {
   return m ? Number.parseInt(m[1], 10) : null;
 }
 
-function die(message: string): never {
-  process.stderr.write(`keeper-board: ${message}\n`);
-  process.exit(2);
-}
-
-/**
- * Per-collection page + coalescing state. One instance per subscription
- * (epics, jobs); both ride one connection. `order` + `byId` are rebuilt
- * wholesale on every `result`; `gotResult` flips true on the first one
- * and stays true. `queryInFlight` / `refetchDirty` are the coalescing
- * pair — see `scheduleRefetchFor`.
- */
-interface CollectionState {
-  readonly collection: string;
-  readonly subId: string;
-  readonly pk: string;
-  readonly query: QueryFrame;
-  order: string[];
-  byId: Map<string, Record<string, unknown>>;
-  /**
-   * Full row stream from the most recent `result` frame, in wire order.
-   * `byId` keys on `pk` and collapses duplicates — fine for `epics` /
-   * `jobs` (where `epic_id` / `job_id` is unique) but lossy for
-   * `subagent_invocations`, whose SQL composite identity is
-   * `(job_id, agent_id, turn_seq)` even though the descriptor exposes
-   * `job_id` alone as the wire pk (see
-   * `src/collections.ts:SUBAGENT_INVOCATIONS_DESCRIPTOR`). Callers that
-   * need every row — notably the readiness handoff for
-   * `subagent_invocations`, where two `running` invocations on one
-   * `job_id` must both reach `computeReadiness` so predicate 6
-   * (`own-progress-sub`) doesn't false-negative — read from `rows`
-   * instead of `byId.values()`.
-   */
-  rows: unknown[];
-  gotResult: boolean;
-  queryInFlight: boolean;
-  refetchDirty: boolean;
-}
-
-function makeState(
-  collection: string,
-  subId: string,
-  pk: string,
-  limit: number,
-): CollectionState {
-  return {
-    collection,
-    subId,
-    pk,
-    query: { type: "query", collection, id: subId, limit },
-    order: [],
-    byId: new Map(),
-    rows: [],
-    gotResult: false,
-    queryInFlight: false,
-    refetchDirty: false,
-  };
-}
-
-/**
- * Pure helper — project a collection state into the typed row stream the
- * readiness pipeline expects. Uses `state.rows` (not `byId.values()`) so
- * collections with a composite SQL identity but a single-column wire pk
- * (today: `subagent_invocations`, pk `job_id`, identity
- * `(job_id, agent_id, turn_seq)`) deliver every received row, not just
- * the last-write-wins one per pk value. Exported for the regression test
- * in `test/board.test.ts`.
- */
-export function projectRows<T>(state: { rows: readonly unknown[] }): T[] {
-  // The descriptors guarantee the row shape matches the typed projection
-  // (the server-side `decodeRow` materialises it); this cast is the same
-  // shape-trust the readiness handoff already makes. The input type is
-  // intentionally permissive (`readonly unknown[]`) so the regression
-  // test in `test/board.test.ts` can hand in a `{ rows: T[] }` literal
-  // without an upcast to `Record<string, unknown>[]`.
-  return state.rows as unknown as T[];
-}
-
 async function main(): Promise<void> {
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
@@ -359,74 +251,30 @@ async function main(): Promise<void> {
   const clearMode = values.clear;
   let frameCount = 0;
 
-  const epics = makeState("epics", "epics-frames", "epic_id", EPICS_PAGE_LIMIT);
-  const jobs = makeState("jobs", "jobs-frames", "job_id", JOBS_PAGE_LIMIT);
-  // The `subagent_invocations` descriptor exposes `job_id` as the wire pk
-  // even though the SQL identity is composite `(job_id, agent_id,
-  // turn_seq)` — see `src/collections.ts:SUBAGENT_INVOCATIONS_DESCRIPTOR`.
-  // `byId` collapses re-entrant sub-agents in one session (multiple rows
-  // sharing one `job_id`) to last-write-wins, so the readiness handoff in
-  // `emitFrameIfChanged` reads from `state.rows` instead — every received
-  // invocation reaches `computeReadiness` so predicate 6
-  // (`own-progress-sub`) sees every `running` sub. Page limit 0 streams
-  // the full default scope — same scope-is-board reasoning as epics.
-  const subagentInvocations = makeState(
-    "subagent_invocations",
-    "subagent-invocations-frames",
-    "job_id",
-    0,
-  );
-  const states: CollectionState[] = [epics, jobs, subagentInvocations];
-  const byCollection = new Map(states.map((s) => [s.collection, s]));
-
   // `lastBody` byte-compares the COMBINED body — internal row churn that
   // doesn't surface in the render is invisible by design.
   let lastBody: string | null = null;
-
-  // Latest readiness snapshot — computed once per frame inside
-  // `emitFrameIfChanged` BEFORE `renderBody` runs, and read by the row
-  // renderers (`renderEpicBlock` and friends) when stamping the pill.
-  // `null` between frames (cleared on disconnect; replaced on next emit).
-  let lastReadiness: ReadinessSnapshot | null = null;
-
-  // Per-frame `job_id → SubagentInvocation[]` index — built once in
-  // `emitFrameIfChanged` from `subagentInvocations.rows` and read by
-  // `subagentLinesFor` when nesting under a job row. Each bucket is
-  // sorted by `turn_seq asc` so the nested list reads in invocation
-  // order. `null` between frames (cleared on disconnect; replaced on
-  // next emit). The projection now promotes `superseded` natively
-  // (schema v? — task fn-605.2), so the renderer no longer derives an
-  // `is_replaced` flag client-side; it just stamps `[${status}]` verbatim.
-  let lastSubagentIndex: Map<string, SubagentInvocation[]> | null = null;
-
-  type Sock = Awaited<ReturnType<typeof Bun.connect>>;
-  let currentSock: Sock | null = null;
-  let attempt = 0;
-  let shuttingDown = false;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
 
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
   // --- epic rendering ---
 
   /**
-   * We ALWAYS use the server's default epics scope (no CLI filter flag), so
-   * the fetched set IS the on-board set — `epicDepsFor` can drop any dep
-   * absent from the page (it's done-AND-approved and off the board). No
-   * `onBoardOnly` toggle is needed here.
-   */
-  /**
-   * Per-job sub-agent lines. Reads from `lastSubagentIndex` (built once
-   * per frame in `emitFrameIfChanged` before `renderBody` runs). Each
-   * line carries `{subagent_type}: {description} [pill]` — `description`
-   * is dropped when null/empty so the pill stays anchored next to the
-   * type. `indent` is supplied per caller: embedded jobs (already three-
-   * space indented inside an epic block) get six spaces; bottom-section
-   * jobs (flush left) get three. Returns `[]` for jobs with no recorded
+   * Per-job sub-agent lines. Reads from the per-frame `subagentIndex` built
+   * by `emitFrame` and closed-over via the render context. Each line
+   * carries `{subagent_type}: {description} [pill]` — `description` is
+   * dropped when null/empty so the pill stays anchored next to the type.
+   * `indent` is supplied per caller: embedded jobs (already three-space
+   * indented inside an epic block) get six spaces; bottom-section jobs
+   * (flush left) get three. Returns `[]` for jobs with no recorded
    * invocations so callers can spread unconditionally.
    */
-  function subagentLinesFor(jobId: string, indent: string): string[] {
-    const hits = lastSubagentIndex?.get(jobId);
+  function subagentLinesFor(
+    subagentIndex: Map<string, SubagentInvocation[]>,
+    jobId: string,
+    indent: string,
+  ): string[] {
+    const hits = subagentIndex.get(jobId);
     if (hits === undefined || hits.length === 0) {
       return [];
     }
@@ -448,13 +296,16 @@ async function main(): Promise<void> {
    * honest "not on the board" signal. Iteration order is the projection's
    * own `(kind, job_id)` ASC sort.
    */
-  function renderJobLinkLines(jobLinks: unknown): string[] {
+  function renderJobLinkLines(
+    jobsById: Map<string, Job>,
+    jobLinks: unknown,
+  ): string[] {
     if (!Array.isArray(jobLinks) || jobLinks.length === 0) {
       return [];
     }
     const out: string[] = [];
     for (const link of jobLinks as JobLinkEntry[]) {
-      const hit = jobs.byId.get(link.job_id);
+      const hit = jobsById.get(link.job_id);
       if (hit === undefined) {
         out.push(`   [${link.job_id}] [${link.kind}]`);
         continue;
@@ -466,7 +317,10 @@ async function main(): Promise<void> {
     return out;
   }
 
-  function renderJobLines(jobsArr: unknown): string[] {
+  function renderJobLines(
+    subagentIndex: Map<string, SubagentInvocation[]>,
+    jobsArr: unknown,
+  ): string[] {
     if (!Array.isArray(jobsArr) || jobsArr.length === 0) {
       return [];
     }
@@ -476,19 +330,18 @@ async function main(): Promise<void> {
       out.push(
         `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${rateLimitedPillSeg(job.rate_limited_at)}`,
       );
-      out.push(...subagentLinesFor(String(job.job_id), "      "));
+      out.push(
+        ...subagentLinesFor(subagentIndex, String(job.job_id), "      "),
+      );
     }
     return out;
   }
 
   /**
-   * Look up a verdict by id from `lastReadiness`. A renderer-side lookup
+   * Look up a verdict by id from the readiness map. A renderer-side lookup
    * miss (verdict map doesn't have the id) yields the defensive
    * `[blocked:unknown]` pill — visible bug indicator, inert for autopilot
-   * dispatch. `lastReadiness === null` shouldn't happen once the first
-   * frame has emitted (the gate in `emitFrameIfChanged` runs
-   * `computeReadiness` before `renderBody`), but the safety net stays:
-   * the only way to get here without a readiness snapshot is a logic bug.
+   * dispatch.
    */
   function verdictFromMap(
     map: Map<string, Verdict> | undefined,
@@ -500,14 +353,19 @@ async function main(): Promise<void> {
     return map.get(id) ?? { tag: "blocked", reason: { kind: "unknown" } };
   }
 
-  function renderEpicBlock(row: Record<string, unknown>): string {
+  function renderEpicBlock(
+    snap: ReadinessClientSnapshot,
+    subagentIndex: Map<string, SubagentInvocation[]>,
+    epicIds: Set<string>,
+    row: Record<string, unknown>,
+  ): string {
     const dir =
       row.project_dir == null ? "" : basename(String(row.project_dir));
     const dirSeg = dir === "" ? "" : `(${dir}) `;
     const epicDeps = Array.isArray(row.depends_on_epics)
       ? row.depends_on_epics
       : [];
-    const epicDepsForRender = epicDeps.filter((d) => epics.byId.has(String(d)));
+    const epicDepsForRender = epicDeps.filter((d) => epicIds.has(String(d)));
     const epicDepNums = epicDepsForRender
       .map((d) => epicNumFromId(String(d)))
       .filter((n): n is number => n != null);
@@ -515,13 +373,13 @@ async function main(): Promise<void> {
       epicDepNums.length === 0
         ? ""
         : ` [${epicDepNums.map((n) => `#${n}`).join(",")}]`;
-    const epicId = seg(row[epics.pk]);
+    const epicId = seg(row.epic_id);
     const epicApproval = approvalPill(row.approval);
     const lines: string[] = [];
-    const epicVerdict = verdictFromMap(lastReadiness?.perEpic, epicId);
+    const epicVerdict = verdictFromMap(snap.readiness.perEpic, epicId);
     lines.push(
       `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}] ${formatPill(epicVerdict)}`,
-      ...renderJobLinkLines(row.job_links),
+      ...renderJobLinkLines(snap.jobs, row.job_links),
     );
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {
@@ -534,7 +392,7 @@ async function main(): Promise<void> {
         tnums.length === 0 ? "" : ` [${tnums.map((n) => `#${n}`).join(",")}]`;
       const taskApproval = approvalPill(t.approval);
       const taskId = seg(t.task_id);
-      const taskVerdict = verdictFromMap(lastReadiness?.perTask, taskId);
+      const taskVerdict = verdictFromMap(snap.readiness.perTask, taskId);
       lines.push(
         // Schema v19: task elements now carry both `runtime_status` (the
         // planctl-native enum `todo|in_progress|done|blocked`) and
@@ -543,24 +401,35 @@ async function main(): Promise<void> {
         // surfaces the full native vocabulary — no client-side collapse.
         `${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.runtime_status)}] [${seg(t.worker_phase)}] [${taskApproval}]`,
         `   [${taskId}] ${formatPill(taskVerdict)}`,
-        ...renderJobLines(t.jobs),
+        ...renderJobLines(subagentIndex, t.jobs),
       );
     }
-    const closeVerdict = verdictFromMap(lastReadiness?.perCloseRow, epicId);
+    const closeVerdict = verdictFromMap(snap.readiness.perCloseRow, epicId);
     lines.push(
       `X. Quality audit and close [${seg(row.status)}] [${epicApproval}]`,
       `   [${epicId}] ${formatPill(closeVerdict)}`,
-      ...renderJobLines(row.jobs),
+      ...renderJobLines(subagentIndex, row.jobs),
     );
     return lines.join("\n");
   }
 
-  function renderEpicsBody(): string {
-    if (epics.order.length === 0) {
+  function renderEpicsBody(
+    snap: ReadinessClientSnapshot,
+    subagentIndex: Map<string, SubagentInvocation[]>,
+  ): string {
+    if (snap.epics.length === 0) {
       return "";
     }
-    return epics.order
-      .map((id) => renderEpicBlock(epics.byId.get(id) ?? { [epics.pk]: id }))
+    const epicIds = new Set(snap.epics.map((e) => String(e.epic_id)));
+    return snap.epics
+      .map((e) =>
+        renderEpicBlock(
+          snap,
+          subagentIndex,
+          epicIds,
+          e as unknown as Record<string, unknown>,
+        ),
+      )
       .join("\n+++\n");
   }
 
@@ -584,19 +453,27 @@ async function main(): Promise<void> {
    * the flush-left job line). Same empty-side drop rule as the outer
    * `renderBody`: a partition with zero rows yields just the other one,
    * no divider; both empty yields `""`.
+   *
+   * The helper delivers `jobs` as a `Map<job_id, Job>` (no ordered slice),
+   * so we iterate via `jobs.values()` — the Map preserves insertion order
+   * and the helper's `result`-handler inserts in wire order, so server
+   * order is preserved.
    */
-  function renderJobsBody(): string {
-    if (jobs.order.length === 0) {
+  function renderJobsBody(
+    snap: ReadinessClientSnapshot,
+    subagentIndex: Map<string, SubagentInvocation[]>,
+  ): string {
+    if (snap.jobs.size === 0) {
       return "";
     }
     const noRole: string[] = [];
     const withRole: string[] = [];
-    for (const id of jobs.order) {
-      const row = jobs.byId.get(id) ?? { [jobs.pk]: id };
-      const block = [projectJobRow(row), ...subagentLinesFor(id, "   ")].join(
-        "\n",
-      );
-      if (row.plan_verb == null) {
+    for (const [id, row] of snap.jobs) {
+      const block = [
+        projectJobRow(row as unknown as Record<string, unknown>),
+        ...subagentLinesFor(subagentIndex, id, "   "),
+      ].join("\n");
+      if ((row as unknown as Record<string, unknown>).plan_verb == null) {
         noRole.push(block);
       } else {
         withRole.push(block);
@@ -621,9 +498,12 @@ async function main(): Promise<void> {
    * yields an empty body (the frame is just the `---` lead). Same `---`
    * lead as the sibling scripts — there's still one frame per change.
    */
-  function renderBody(): string {
-    const e = renderEpicsBody();
-    const j = renderJobsBody();
+  function renderBody(
+    snap: ReadinessClientSnapshot,
+    subagentIndex: Map<string, SubagentInvocation[]>,
+  ): string {
+    const e = renderEpicsBody(snap, subagentIndex);
+    const j = renderJobsBody(snap, subagentIndex);
     if (e === "") {
       return j;
     }
@@ -648,7 +528,10 @@ async function main(): Promise<void> {
   // frame lands (sentinel written instead).
   let lastFrameText: string | null = null;
 
-  function writeSidecars(frameText: string): void {
+  function writeSidecars(
+    snap: ReadinessClientSnapshot,
+    frameText: string,
+  ): void {
     // In --clear mode each frame's sidecars are indexed so past frames persist;
     // in default mode the three static paths are overwritten each frame.
     const sState = clearMode
@@ -661,8 +544,8 @@ async function main(): Promise<void> {
       ? `/tmp/keeper-board.${process.pid}.diff.${frameCount}.txt`
       : diffSidecar;
     const stateJson = {
-      epics: epics.order.map((id) => epics.byId.get(id) ?? { [epics.pk]: id }),
-      jobs: jobs.order.map((id) => jobs.byId.get(id) ?? { [jobs.pk]: id }),
+      epics: snap.epics,
+      jobs: Array.from(snap.jobs.values()),
     };
     try {
       writeFileSync(sState, `${JSON.stringify(stateJson, null, 2)}\n`);
@@ -719,55 +602,33 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Emit a frame iff (a) all three collections have landed their first
-   * result (no half-empty first paint — strict per spec: indefinite dark
-   * board over a wrong-state render) and (b) the combined body changed
-   * since the last emit. `computeReadiness` runs once per emit BEFORE
-   * `renderBody` so the row renderers can stamp the pill from
-   * `lastReadiness`.
+   * Helper-driven snapshot callback. Builds the per-frame `job_id →
+   * invocations` index, renders the combined body, byte-compares against
+   * the last emit, and writes sidecars + stdout when the render changes.
+   * The helper handles the all-three-strict first-paint gate AND the
+   * `computeReadiness` call — `snap.readiness` is fully populated when
+   * we get here.
    */
-  function emitFrameIfChanged(): void {
-    if (!epics.gotResult || !jobs.gotResult || !subagentInvocations.gotResult) {
-      return;
-    }
-    // Cast: the wire delivers each row as `Record<string, unknown>`; the
-    // descriptors guarantee the shape matches the typed projection (decoded
-    // by `decodeRow` on the server side). The readiness pipeline only
-    // touches typed fields it expects to exist.
-    const epicsTyped = epics.order.map(
-      (id) => (epics.byId.get(id) ?? { [epics.pk]: id }) as unknown as Epic,
-    );
-    const jobsTyped = new Map<string, Job>();
-    for (const [id, row] of jobs.byId) {
-      jobsTyped.set(id, row as unknown as Job);
-    }
-    // Read from `state.rows` (not `byId.values()`) so re-entrant sub-agents
-    // sharing one `job_id` all reach `computeReadiness` — `byId` keys on
-    // the wire pk (`job_id`) and collapses them last-write-wins, which
-    // would false-negative predicate 6 (`own-progress-sub`). See
-    // `projectRows` and the `CollectionState.rows` docstring.
-    const subsTyped = projectRows<SubagentInvocation>(subagentInvocations);
-    lastReadiness = computeReadiness(epicsTyped, jobsTyped, subsTyped);
-    // Per-frame `job_id → invocations` index for `subagentLinesFor` —
-    // re-entrant sub-agents within one session sit on the same `job_id`
-    // bucket, ordered by `turn_seq asc` so the nested list reads in
-    // invocation order. The projection now promotes `superseded` natively
-    // (task fn-605.2), so no client-side marking pass is required —
-    // `subagentLinesFor` stamps the raw `[${status}]` enum verbatim.
-    const subIndex = new Map<string, SubagentInvocation[]>();
-    for (const inv of subsTyped) {
-      const arr = subIndex.get(inv.job_id);
+  function emitFrame(snap: ReadinessClientSnapshot): void {
+    // Per-frame `job_id → invocations` index — re-entrant sub-agents within
+    // one session sit on the same `job_id` bucket, ordered by `turn_seq asc`
+    // so the nested list reads in invocation order. The projection now
+    // promotes `superseded` natively (task fn-605.2), so no client-side
+    // marking pass is required — `subagentLinesFor` stamps the raw
+    // `[${status}]` enum verbatim.
+    const subagentIndex = new Map<string, SubagentInvocation[]>();
+    for (const inv of snap.subagentInvocations) {
+      const arr = subagentIndex.get(inv.job_id);
       if (arr === undefined) {
-        subIndex.set(inv.job_id, [inv]);
+        subagentIndex.set(inv.job_id, [inv]);
       } else {
         arr.push(inv);
       }
     }
-    for (const arr of subIndex.values()) {
+    for (const arr of subagentIndex.values()) {
       arr.sort((a, b) => a.turn_seq - b.turn_seq);
     }
-    lastSubagentIndex = subIndex;
-    const body = renderBody();
+    const body = renderBody(snap, subagentIndex);
     if (body === lastBody) {
       return;
     }
@@ -778,32 +639,7 @@ async function main(): Promise<void> {
     }
     const frameText = `---\n${body}`;
     log(frameText);
-    writeSidecars(frameText);
-  }
-
-  /**
-   * Re-issue ONE collection's page query, coalesced. `state.queryInFlight`
-   * is per-collection so an in-flight epics refetch never blocks a jobs
-   * refetch (or vice versa). A change signal that arrives while a refetch
-   * is in flight queues exactly one more.
-   */
-  function scheduleRefetchFor(state: CollectionState): void {
-    if (!currentSock) {
-      return;
-    }
-    if (state.queryInFlight) {
-      state.refetchDirty = true;
-      return;
-    }
-    state.queryInFlight = true;
-    currentSock.write(encodeFrame(state.query));
-  }
-
-  /** Steady-poll backstop — both collections, every tick. */
-  function pollAll(): void {
-    for (const s of states) {
-      scheduleRefetchFor(s);
-    }
+    writeSidecars(snap, frameText);
   }
 
   function emitLifecycle(
@@ -816,169 +652,30 @@ async function main(): Promise<void> {
       log(`${k}: ${String(v)}`);
     }
     log("...");
-  }
-
-  function handleFrame(frame: ServerFrame): void {
-    if (frame.type === "result") {
-      const state = byCollection.get(frame.collection);
-      if (!state) {
-        // A `result` for a collection we don't track — defensive; should
-        // never happen on a connection we opened ourselves.
-        return;
-      }
-      state.queryInFlight = false;
-      state.order.length = 0;
-      state.byId.clear();
-      // Re-snapshot `rows` from this frame — the readiness handoff reads
-      // from here (not `byId.values()`) so that collections with a
-      // composite SQL identity but a single-column wire pk (today:
-      // `subagent_invocations`) deliver every row instead of collapsing
-      // duplicates last-write-wins. See `CollectionState.rows`.
-      state.rows = frame.rows.slice();
-      for (const row of frame.rows) {
-        const id = String(row[state.pk]);
-        state.order.push(id);
-        state.byId.set(id, row);
-      }
-      state.gotResult = true;
-      emitFrameIfChanged();
-      if (state.refetchDirty) {
-        state.refetchDirty = false;
-        scheduleRefetchFor(state);
-      }
-    } else if (frame.type === "patch" || frame.type === "meta") {
-      // Route by collection — patch/meta carry no `id`, only `collection`,
-      // so we refetch the collection that moved.
-      const state = byCollection.get(frame.collection);
-      if (state) {
-        scheduleRefetchFor(state);
-      }
-    } else if (frame.type === "error") {
-      log(`# error ${frame.code} (rev ${frame.rev}): ${frame.message}`);
-      // A bad_frame / unknown_collection on our own query is terminal — a
-      // reconnect can't fix a malformed query. Terminal iff NO collection
-      // has produced a first result (with three collections, that means
-      // all three failed); otherwise the error is likely transient and
-      // the next refetch will recover.
-      if (
-        !epics.gotResult &&
-        !jobs.gotResult &&
-        !subagentInvocations.gotResult
-      ) {
-        shuttingDown = true;
-        currentSock?.end();
-        process.exit(1);
-      }
+    // On disconnect, clear `lastBody` so the next first-paint emits even
+    // if the post-reconnect snapshot happens to match the last pre-
+    // disconnect body byte-for-byte. (The helper resets its own collection
+    // state and re-gates first-paint behind all three `result`s.)
+    if (event === "disconnected") {
+      lastBody = null;
     }
   }
 
-  function teardownConnection(): void {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-    currentSock = null;
-    for (const s of states) {
-      s.order.length = 0;
-      s.byId.clear();
-      s.rows.length = 0;
-      s.queryInFlight = false;
-      s.refetchDirty = false;
-      s.gotResult = false;
-    }
-    lastBody = null;
-    lastReadiness = null;
-    lastSubagentIndex = null;
-  }
-
-  async function connectOnce(): Promise<void> {
-    const buffer = new LineBuffer();
-    await Bun.connect({
-      unix: sockPath,
-      socket: {
-        open(sock) {
-          attempt = 0;
-          currentSock = sock;
-          emitLifecycle("connected", { sock: sockPath });
-          // Send BOTH queries up front. Each collection's `queryInFlight`
-          // tracks its own send so the poll/refetch coalescer stays sane.
-          for (const s of states) {
-            s.queryInFlight = true;
-            sock.write(encodeFrame(s.query));
-          }
-          pollTimer = setInterval(pollAll, POLL_MS);
-        },
-        data(_sock, chunk) {
-          let lines: string[];
-          try {
-            lines = buffer.push(chunk.toString("utf8"));
-          } catch (err) {
-            die(`protocol error: ${(err as Error).message}`);
-          }
-          for (const line of lines) {
-            if (line.trim().length === 0) {
-              continue;
-            }
-            handleFrame(JSON.parse(line) as ServerFrame);
-          }
-        },
-        close() {
-          if (shuttingDown) {
-            return;
-          }
-          teardownConnection();
-          emitLifecycle("disconnected", {});
-          void connectWithRetry();
-        },
-        error(_sock, err) {
-          emitLifecycle("error", { message: err.message });
-        },
-      },
-    });
-  }
-
-  async function connectWithRetry(): Promise<void> {
-    emitLifecycle("connecting", { sock: sockPath });
-    while (!shuttingDown) {
-      try {
-        await connectOnce();
-        return;
-      } catch (err) {
-        attempt += 1;
-        const delay = Math.min(
-          INITIAL_BACKOFF_MS * 2 ** (attempt - 1),
-          MAX_BACKOFF_MS,
-        );
-        emitLifecycle("waiting", {
-          attempt,
-          retry_in_ms: delay,
-          reason: (err as Error).message,
-        });
-        await Bun.sleep(delay);
-      }
-    }
-  }
-
-  process.on("SIGINT", () => {
-    shuttingDown = true;
-    if (pollTimer) {
-      clearInterval(pollTimer);
-    }
-    try {
-      // No `id` → drop every subscription on this connection in one frame.
-      currentSock?.write(encodeFrame({ type: "unsubscribe" }));
-      currentSock?.end();
-    } catch {
-      // socket already gone — nothing to release
-    }
-    process.exit(0);
+  const handle = subscribeReadiness({
+    sockPath,
+    idPrefix: "board",
+    onSnapshot: emitFrame,
+    onLifecycle: emitLifecycle,
   });
 
-  await connectWithRetry();
+  process.on("SIGINT", () => {
+    handle.dispose();
+    process.exit(0);
+  });
 }
 
 // Entry-point guard — only run when invoked as a script, not when imported
-// (the test suite imports `projectRows` from this module).
+// (the test suite re-imports `projectRows` from this module).
 if (import.meta.main) {
   await main();
 }
