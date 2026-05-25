@@ -30,5 +30,5 @@ onFatal contract and both findings touch the same module.
 - [ ] New `test/readiness-client.test.ts` covers (driven by an in-memory mock socket — parameterize the `Bun.connect` factory or accept a socket-factory option for test injection): (a) first-paint gate — `onSnapshot` does not fire until all three collections produce a `result`; (b) per-collection coalesce — a refetch fired while `queryInFlight` sets `refetchDirty` and a single follow-up query goes out; (c) idempotent `dispose()` — second call is a no-op, no callback fires; (d) terminal `error` frame with no `gotResult` invokes `onFatal` with the error payload.
 
 ## Done summary
-
+Added optional onFatal callback to subscribeReadiness (default restores pre-extraction process.exit(1)) and a connect-factory injection point. New test/readiness-client.test.ts covers first-paint gate, per-collection coalesce, idempotent dispose, terminal-error onFatal payload, plus a non-terminal-error gating companion.
 ## Evidence
