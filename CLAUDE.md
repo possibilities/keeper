@@ -62,9 +62,11 @@ the native value" is the default.
   per-session `jobs.epic_links` + per-epic `epics.job_links` link projections
   (sorted ASC on `(kind, target)` and `(kind, job_id)` respectively — total
   -order tiebreakers, never append). Hook-side derivers (`slashCommandFromPrompt`,
-  `extractSkillName`, `planVerbRefFromSpawnName`, `extractPlanctlInvocation`)
-  stamp the seven sparse `events` columns (`slash_command`, `skill_name`, and
-  the five-column planctl envelope `planctl_op` / `planctl_target` /
+  `extractSkillName`, `planVerbRefFromSpawnName`, `extractPlanctlInvocation`
+  — the last one gated on PostToolUse:Bash and parsing the authoritative
+  `planctl_invocation` envelope from `data.tool_response.stdout`) stamp the
+  seven sparse `events` columns (`slash_command`, `skill_name`, and the
+  five-column planctl envelope `planctl_op` / `planctl_target` /
   `planctl_epic_id` / `planctl_task_id` / `planctl_subject_present`) at hook
   write time — all pure functions of the hook payload, shared with the
   schema-migration backfill so a re-derive on stored events reproduces the

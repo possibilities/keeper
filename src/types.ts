@@ -98,20 +98,21 @@ export interface Event {
    */
   skill_name: string | null;
   /**
-   * Planctl-CLI verb extracted from a `PreToolUse:Bash` event's
-   * `data.tool_input.command` by
-   * {@link import("./derivers").extractPlanctlInvocation}. NULL on every row
-   * whose command does not parse as `planctl <verb> [target]` (the hook stamps
-   * NULL on misses so the partial-index `WHERE planctl_op IS NOT NULL`
-   * predicate stays selective). Examples: `epic-create`, `task-set-title`,
-   * `done`, `cat`.
+   * Planctl-CLI op pulled from a `PostToolUse:Bash` event's
+   * `data.tool_response.stdout` by
+   * {@link import("./derivers").extractPlanctlInvocation} — the authoritative
+   * `planctl_invocation` envelope planctl writes on every mutating call.
+   * NULL on every row whose stdout does not carry the envelope (the hook
+   * stamps NULL on misses so the partial-index `WHERE planctl_op IS NOT
+   * NULL` predicate stays selective). Examples: `epic-create`, `scaffold`,
+   * `task-set-title`, `done`, `epic-close`.
    */
   planctl_op: string | null;
   /**
-   * Raw planctl target argument as it appeared on the command line — typically
-   * an epic id (`fn-575-foo`) or task id (`fn-575-foo.3`), but NULL when the
-   * verb takes no argument (`planctl epics`, `planctl init`) or for unparseable
-   * shapes. Surrounding quotes are stripped; empty strings fold to NULL.
+   * Raw planctl target from the envelope — typically an epic id
+   * (`fn-575-foo`) or task id (`fn-575-foo.3`), but NULL when the verb takes
+   * no argument (`planctl init`) or when the envelope's `target` field is
+   * absent/non-string.
    */
   planctl_target: string | null;
   /**
@@ -128,12 +129,14 @@ export interface Event {
    */
   planctl_task_id: string | null;
   /**
-   * Read-only-verb gate: stored as INTEGER (0/1) at the SQLite layer to match
-   * the schema column, lifted to JS boolean via `=== 1` at the read boundary.
-   * `false` for verbs in the read-only allowlist (`epics`, `tasks`, `cat`,
-   * etc.); `true` for every other verb. NULL when `planctl_op` is NULL.
-   * Drives creator/refiner classification: `subject_present === false`
-   * mirrors jobctl's `subject is None` skip gate.
+   * Subject-present gate: stored as INTEGER (0/1) at the SQLite layer to
+   * match the schema column, lifted to JS boolean via `=== 1` at the read
+   * boundary. `true` when the envelope's `subject` field is non-null
+   * (mutation carrying human content — title / description / acceptance);
+   * `false` for verbs with no subject (read-only verbs, operational state
+   * writes). NULL when `planctl_op` is NULL. Drives creator/refiner
+   * classification: `subject_present === false` mirrors jobctl's
+   * `subject is None` skip gate.
    */
   planctl_subject_present: number | null;
   /**

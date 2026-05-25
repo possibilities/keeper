@@ -1935,7 +1935,16 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
   );
   expect(indexNames.has("idx_events_planctl_session")).toBe(true);
 
-  // Backfill: events.planctl_* on each PreToolUse:Bash row.
+  // Backfill: events.planctl_* on each PreToolUse:Bash row. As of
+  // fn-606.1 the `extractPlanctlInvocation` deriver gates on
+  // PostToolUse:Bash (parsing the authoritative `planctl_invocation`
+  // envelope from `tool_response.stdout`), so the v13→v14 backfill — which
+  // scans PreToolUse:Bash rows by hook-event gate — stamps zero columns
+  // against the new deriver. The v19→v20 migration (fn-606.2) re-stamps
+  // from PostToolUse:Bash rows and is the follow-up that restores live
+  // edges on historical data. This test asserts the shape (columns added,
+  // index present, backfill ran without throwing) — the per-event stamps
+  // are deliberately NULL until the v19→v20 step lands.
   const evRows = db
     .prepare(
       `SELECT id, ts, session_id, planctl_op, planctl_target,
@@ -1954,31 +1963,15 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
     planctl_task_id: string | null;
     planctl_subject_present: number | null;
   }[];
-  // Creator's epic-create row.
-  const create = evRows.find((r) => r.ts === 20);
-  expect(create?.planctl_op).toBe("epic-create");
-  expect(create?.planctl_target).toBe("fn-1-foo");
-  expect(create?.planctl_epic_id).toBe("fn-1-foo");
-  expect(create?.planctl_task_id).toBeNull();
-  expect(create?.planctl_subject_present).toBe(1);
-  // Read-only cat row — subject_present=0.
-  const cat = evRows.find((r) => r.ts === 30);
-  expect(cat?.planctl_op).toBe("cat");
-  expect(cat?.planctl_target).toBe("fn-1-foo");
-  expect(cat?.planctl_epic_id).toBe("fn-1-foo");
-  expect(cat?.planctl_subject_present).toBe(0);
-  // Refiner's epic-set-title row. The target has quotes stripped.
-  const refine = evRows.find((r) => r.ts === 50);
-  expect(refine?.planctl_op).toBe("epic-set-title");
-  expect(refine?.planctl_target).toBe("fn-1-foo");
-  expect(refine?.planctl_epic_id).toBe("fn-1-foo");
-  expect(refine?.planctl_subject_present).toBe(1);
-  // Non-planctl Bash row stays NULL across the board.
-  const ls = evRows.find((r) => r.ts === 60);
-  expect(ls?.planctl_op).toBeNull();
-  expect(ls?.planctl_target).toBeNull();
-  expect(ls?.planctl_epic_id).toBeNull();
-  expect(ls?.planctl_subject_present).toBeNull();
+  // Every PreToolUse:Bash row is left NULL — the deriver no longer
+  // recognizes the PreToolUse gate.
+  for (const r of evRows) {
+    expect(r.planctl_op).toBeNull();
+    expect(r.planctl_target).toBeNull();
+    expect(r.planctl_epic_id).toBeNull();
+    expect(r.planctl_task_id).toBeNull();
+    expect(r.planctl_subject_present).toBeNull();
+  }
 
   // jobs / epics projection rows do NOT survive the v16→v17
   // rewind-and-redrain: openDb runs both v14 (which would have populated

@@ -756,16 +756,25 @@ test("hook leaves skill_name NULL on PreToolUse + non-Skill tool", async () => {
 // Hook process integration (v14): planctl_* columns end-to-end
 // ---------------------------------------------------------------------------
 
-test("hook writes planctl_* columns on PreToolUse:Bash with a planctl mutation command", async () => {
+test("hook writes planctl_* columns on PostToolUse:Bash with a planctl envelope on stdout", async () => {
   // Mutation verb on an epic id: subject_present=1, epic_id stamped,
-  // task_id NULL (epic-form ref). Mirrors the canonical creator-side
-  // invocation shape (`planctl epic-create fn-N-foo "subject"`).
+  // task_id NULL (epic-form ref). The envelope (top-level
+  // `planctl_invocation` key in tool_response.stdout) is the authoritative
+  // source — what `planctl epic-create fn-N-foo "subject"` actually emits.
+  const stdout = JSON.stringify({
+    planctl_invocation: {
+      op: "epic-create",
+      target: "fn-42-foo",
+      subject: "the subject",
+    },
+  });
   const code = await fireViaLauncher("my-session", {
-    hook_event_name: "PreToolUse",
+    hook_event_name: "PostToolUse",
     session_id: "sess-planctl-create",
     cwd: "/tmp/work",
     tool_name: "Bash",
     tool_input: { command: 'planctl epic-create fn-42-foo "the subject"' },
+    tool_response: { stdout },
   });
   expect(code).toBe(0);
 
@@ -794,16 +803,24 @@ test("hook writes planctl_* columns on PreToolUse:Bash with a planctl mutation c
   }
 });
 
-test("hook writes planctl_* columns on PreToolUse:Bash with a planctl read-only verb on a task ref", async () => {
+test("hook writes planctl_* columns on PostToolUse:Bash with a planctl read-only verb on a task ref", async () => {
   // Read-only verb on a task-form ref: subject_present=0, epic_id + task_id
   // both stamped. Exercises the `parsePlanRef` task-form split and the
-  // PLANCTL_READONLY_VERBS membership check.
+  // envelope's null-subject → subject_present=0 path.
+  const stdout = JSON.stringify({
+    planctl_invocation: {
+      op: "cat",
+      target: "fn-42-foo.3",
+      subject: null,
+    },
+  });
   const code = await fireViaLauncher("my-session", {
-    hook_event_name: "PreToolUse",
+    hook_event_name: "PostToolUse",
     session_id: "sess-planctl-cat",
     cwd: "/tmp/work",
     tool_name: "Bash",
     tool_input: { command: "planctl cat fn-42-foo.3" },
+    tool_response: { stdout },
   });
   expect(code).toBe(0);
 
@@ -832,16 +849,17 @@ test("hook writes planctl_* columns on PreToolUse:Bash with a planctl read-only 
   }
 });
 
-test("hook leaves planctl_* columns NULL on PreToolUse:Bash with a non-planctl command", async () => {
-  // Bash command that is not a planctl invocation — all five planctl_*
-  // columns must stay NULL so the partial-index predicate keeps the
-  // index small.
+test("hook leaves planctl_* columns NULL on PostToolUse:Bash whose stdout carries no envelope", async () => {
+  // Bash command whose stdout is plain text (no planctl_invocation key) —
+  // all five planctl_* columns must stay NULL so the partial-index
+  // predicate keeps the index small.
   const code = await fireViaLauncher("my-session", {
-    hook_event_name: "PreToolUse",
+    hook_event_name: "PostToolUse",
     session_id: "sess-bash-ls",
     cwd: "/tmp/work",
     tool_name: "Bash",
     tool_input: { command: "ls -la /tmp" },
+    tool_response: { stdout: "drwxr-xr-x  ... /tmp\n" },
   });
   expect(code).toBe(0);
 
@@ -870,12 +888,13 @@ test("hook leaves planctl_* columns NULL on PreToolUse:Bash with a non-planctl c
   }
 });
 
-test("hook leaves planctl_* columns NULL on non-PreToolUse / non-Bash events", async () => {
-  // PostToolUse:Bash with a planctl command still leaves the columns NULL —
-  // the deriver is gated on `hookEvent === 'PreToolUse'`.
+test("hook leaves planctl_* columns NULL on PreToolUse:Bash even with a planctl command", async () => {
+  // PreToolUse:Bash with a planctl command must leave the columns NULL —
+  // the deriver is gated on `hookEvent === 'PostToolUse'`. This is the
+  // negative case for the new gate: only PostToolUse carries the envelope.
   const code = await fireViaLauncher("my-session", {
-    hook_event_name: "PostToolUse",
-    session_id: "sess-planctl-post",
+    hook_event_name: "PreToolUse",
+    session_id: "sess-planctl-pre",
     cwd: "/tmp/work",
     tool_name: "Bash",
     tool_input: { command: "planctl epic-create fn-1-bar" },
@@ -886,7 +905,7 @@ test("hook leaves planctl_* columns NULL on non-PreToolUse / non-Bash events", a
   try {
     const row = db
       .prepare(
-        "SELECT planctl_op FROM events WHERE session_id = 'sess-planctl-post'",
+        "SELECT planctl_op FROM events WHERE session_id = 'sess-planctl-pre'",
       )
       .get() as { planctl_op: string | null };
     expect(row.planctl_op).toBeNull();
@@ -895,16 +914,17 @@ test("hook leaves planctl_* columns NULL on non-PreToolUse / non-Bash events", a
   }
 });
 
-test("hook exits 0 on PreToolUse:Bash with a malformed tool_input.command (defensive)", async () => {
-  // Non-string `command` field: the deriver returns null defensively (the
+test("hook exits 0 on PostToolUse:Bash with a malformed tool_response.stdout (defensive)", async () => {
+  // Non-string `stdout` field: the deriver returns null defensively (the
   // hook never throws, exit-0 contract preserved). Asserts via exit code +
   // that the row landed with planctl_op NULL.
   const code = await fireViaLauncher("my-session", {
-    hook_event_name: "PreToolUse",
+    hook_event_name: "PostToolUse",
     session_id: "sess-planctl-malformed",
     cwd: "/tmp/work",
     tool_name: "Bash",
-    tool_input: { command: { not: "a string" } },
+    tool_input: { command: "planctl epic-create fn-1-bar" },
+    tool_response: { stdout: { not: "a string" } },
   });
   expect(code).toBe(0);
 

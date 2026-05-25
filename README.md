@@ -31,12 +31,16 @@ Skill-tool invocation, e.g. `plan:plan` or `arthack:check`),
 — the bridge that lets the reducer pair a `PreToolUse:Agent` with its later
 `PostToolUse:Agent`), and a five-column planctl-invocation envelope
 (`planctl_op`, `planctl_target`, `planctl_epic_id`, `planctl_task_id`,
-`planctl_subject_present`) stamped on every `PreToolUse:Bash` row whose
-command parses as a `planctl <verb> [target]` invocation — so consumers
-can find `/plan:work` calls, `Skill` invocations, every Task-tool subagent
-lifecycle, AND every planctl-CLI mutation cheaply without JSON-scanning
-the event `data` blob. The `planctl_*` columns drive the creator/refiner
-classifier (see [Architecture](#architecture)). All eight are partial-indexed
+`planctl_subject_present`) stamped on every `PostToolUse:Bash` row whose
+`data.tool_response.stdout` parses as JSON carrying a top-level
+`planctl_invocation` key — the authoritative envelope planctl writes on
+every mutating call. Consumers can find `/plan:work` calls, `Skill`
+invocations, every Task-tool subagent lifecycle, AND every planctl-CLI
+mutation cheaply without JSON-scanning the event `data` blob. The
+`planctl_*` columns drive the creator/refiner classifier (see
+[Architecture](#architecture)) — `op === "create"` and `op === "scaffold"`
+both classify as creators (scaffold is the canonical epic-create path on
+this codebase). All eight are partial-indexed
 on `WHERE col IS NOT NULL` (the planctl columns share a composite
 `(session_id, id) WHERE planctl_op IS NOT NULL` index for the per-session
 ordered scan).
@@ -387,9 +391,10 @@ writes whenever a SessionStart spawn name parses as `{plan|work|close}::<ref>`
 fan-out rides alongside: every `planctl_op != NULL` event triggers the
 `syncPlanctlLinks` helper, which re-derives per-session `jobs.epic_links` and
 per-epic `epics.job_links` from the session's planctl-CLI footprint
-classified against its `/plan:plan` windows (creator = `epic-create`
-mutation inside a window; refiner = any other epic-touching mutation inside
-a window). Both fan-outs run INSIDE the same `BEGIN IMMEDIATE` transaction
+classified against its `/plan:plan` windows (creator = `epic-create` OR
+`scaffold` mutation inside a window — scaffold is the canonical
+epic-create path on this codebase; refiner = any other epic-touching
+mutation inside a window). Both fan-outs run INSIDE the same `BEGIN IMMEDIATE` transaction
 as the triggering event's projection write + cursor advance, so the embedded
 arrays + link projections are pure functions of the event log and a
 from-scratch re-fold reproduces them byte-identically. File deletions are filesystem-synchronized: a live delete fires

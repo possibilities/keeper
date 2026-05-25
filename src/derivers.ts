@@ -302,85 +302,19 @@ export function parsePlanRef(ref: string | null): ParsedPlanRef | null {
 }
 
 /**
- * Anchored Bash-command → `{op, target}` match for the planctl-CLI invocation
- * deriver. The strict shape:
- *
- *   optional `cd <path> && ` prefix
- *   + bare `planctl` (no absolute path, no `bash -c`, no env-var prefix)
- *   + whitespace + op (`[a-zA-Z0-9_-]+`)
- *   + optional whitespace + target (`[^\s;&|]+`)
- *
- * Op character class is intentionally narrower than `\S+` — `[a-zA-Z0-9_-]+`
- * rejects shell metachars as the op (a malformed `planctl ;rm` cannot match
- * `;rm` as the op). Target group is `[^\s;&|]+` so a trailing `&&` / `;` / `|`
- * after the target doesn't get swallowed into the target capture; this also
- * means a target with embedded `&` (none exist in planctl's id grammar) would
- * be truncated, which is the correct conservative behavior.
- *
- * The `cd <path> &&` prefix is permitted because planctl invocations from
- * worker shells routinely run inside a `cd $PRIMARY_REPO && planctl …`
- * envelope (see jobctl `_derive_ids` precedent). Absolute paths like
- * `/usr/local/bin/planctl` do NOT match — we want only the bare CLI shape so
- * spurious matches against an unrelated binary named `planctl` deeper in the
- * filesystem stay out of the invocation log. `bash -c '…'` likewise does
- * NOT match — the prefix anchor rejects the leading `bash`.
- *
- * Module-scope literal so V8/JSC tier up once at process start, mirroring
- * every other parser in this file.
- */
-const PLANCTL_COMMAND_RE =
-  /^(?:cd\s+\S+\s+&&\s+)?planctl\s+([a-zA-Z0-9_-]+)(?:\s+([^\s;&|]+))?/;
-
-/**
- * Read-only planctl verb allowlist. Anything matching one of these verbs with
- * a parseable target produces `subject_present: false`; everything else
- * (mutation verbs — `epic-create`, `task-create`, `epic-set-title`, `done`,
- * `task-set-description`, etc.) produces `subject_present: true`.
- *
- * Source of truth for the planctl verb surface:
- * `apps/planctl/planctl/cli.py` — the `@cli.command(...)` and the
- * `@epic_group.command(...)` / `@task_group.command(...)` decorators
- * enumerate every verb. When planctl adds a new read-only verb, add it here
- * as a one-line edit; otherwise the new verb will be misclassified as a
- * mutation (false-positive creator/refiner link). The choice to fail-closed
- * (mutation by default) over fail-open is deliberate: a missed mutation
- * silently drops a creator/refiner edge, but a misclassified read-only
- * verb generates a spurious edge — and an explicit allowlist forces every
- * planctl verb addition through a code review of this set.
- *
- * Verbs included: `epics`, `tasks`, `cat`, `show`, `list`, `detect`,
- * `gist`, `init`, `claim`, `block`. `claim` and `block` are arguably
- * lifecycle mutations but produce no human "subject" (title / description /
- * acceptance text) — they're operational state writes from the worker side,
- * not planner edits, and so are treated as `subject_present: false` for
- * creator/refiner classification purposes.
- */
-const PLANCTL_READONLY_VERBS: ReadonlySet<string> = new Set([
-  "epics",
-  "tasks",
-  "cat",
-  "show",
-  "list",
-  "detect",
-  "gist",
-  "init",
-  "claim",
-  "block",
-]);
-
-/**
  * The shape returned by {@link extractPlanctlInvocation}. All four-id fields
  * (`op`, `target`, `epic_id`, `task_id`) are always present together; a `null`
  * return from the function signals "this is not a planctl invocation we care
- * about" (wrong hook event, wrong tool, malformed command, etc.). `target` /
- * `epic_id` / `task_id` may individually be `null` when the verb takes no
- * argument or when the argument is not a parseable planctl ref (`planctl
- * epics`, `planctl init`, `planctl scaffold foo.json`).
+ * about" (wrong hook event, wrong tool, missing/malformed envelope, etc.).
+ * `target` / `epic_id` / `task_id` may individually be `null` when the verb
+ * takes no argument or when the argument is not a parseable planctl ref
+ * (`planctl epics`, `planctl init`).
  *
- * `subject_present: false` for verbs in the read-only allowlist
- * ({@link PLANCTL_READONLY_VERBS}); `true` for every other verb with a
- * parseable target shape. The flag drives creator/refiner classification
- * downstream in `src/plan-classifier.ts`.
+ * `subject_present` mirrors the envelope's `subject != null` — `true` when
+ * the verb carries a human subject (title / description / acceptance text);
+ * `false` for read-only verbs and operational state writes (claim, block,
+ * etc.). The flag drives creator/refiner classification downstream in
+ * `src/plan-classifier.ts`.
  */
 export interface PlanctlInvocation {
   op: string;
@@ -391,68 +325,109 @@ export interface PlanctlInvocation {
 }
 
 /**
- * Extract a planctl-CLI invocation envelope from a `PreToolUse:Bash` event's
- * `data.tool_input.command` string. Returns `null` for every non-matching
+ * Defensive length cap on the stdout buffer we will attempt to `JSON.parse`.
+ * planctl envelopes are sub-kilobyte; any Bash stdout above this threshold
+ * is almost certainly not a planctl invocation and would needlessly burn
+ * cold-start budget on a large parse. Mirrors the cap-on-stdout posture
+ * elsewhere in the hook surface.
+ */
+const PLANCTL_STDOUT_CAP = 64_000;
+
+/**
+ * Extract a planctl-CLI invocation envelope from a `PostToolUse:Bash` event's
+ * `data.tool_response.stdout` string. Returns `null` for every non-matching
  * hook event / tool name / data shape — the column stays NULL on unrelated
  * rows so the partial-index `WHERE planctl_op IS NOT NULL` predicate stays
  * selective.
  *
- * Gated by `hookEvent === 'PreToolUse' && toolName === 'Bash'`. Every other
- * combination returns `null`. The command must be a bare `planctl <verb>
- * [target]` (optionally prefixed by `cd <path> && `) — absolute paths,
- * `bash -c '…'` wrappers, and env-var prefixes (`FOO=1 planctl …`) all
- * return `null`.
+ * Gated by `hookEvent === 'PostToolUse' && toolName === 'Bash'` (EXACT
+ * match — `PostToolUseFailure` has no `tool_response` and must not match
+ * via any `startsWith` shortcut). The stdout buffer must parse as JSON
+ * carrying a top-level `planctl_invocation` key; anything else returns
+ * `null`.
  *
- * Mirrors jobctl's `audit._derive_ids` 1:1 for the `target → (epic_id,
- * task_id)` split by reusing {@link parsePlanRef}: the spawn-name ref shape
- * (see {@link SPAWN_VERB_REF_RE}) and the planctl-target ref shape MUST
- * agree byte-for-byte so a re-fold from scratch reproduces the same epic
- * links.
+ * The envelope is the AUTHORITATIVE source: planctl writes it on every
+ * mutating call (and on no other call), so envelope-presence IS the
+ * mutation sentinel. This intentionally widens the surface from the old
+ * input-command-regex approach — `bash -c 'planctl …'`, `/abs/path/planctl
+ * …`, and env-prefixed (`FOO=1 planctl …`) invocations all stamp now,
+ * because the envelope rides on stdout regardless of how planctl was
+ * invoked. Envelope-less mutations from older planctl versions silently
+ * drop edges; acceptable since planctl is internally controlled.
  *
- * Mirrors {@link extractSkillName}'s shape exactly: a missing `tool_input`,
- * non-string `command`, or any other shape-mismatch path returns `null`.
- * Claude Code occasionally puts objects in fields documented as strings —
- * NEVER throw, the hook's exit-0 contract is non-negotiable.
+ * Mirrors {@link extractSubagentAgentId} (in `plugin/hooks/events-writer.ts`)
+ * 1:1 for the defensive-probe shape: type-check the `tool_response` object,
+ * type-check the `stdout` string, length-cap, fast `startsWith('{')` hint
+ * to skip the parse on the common non-JSON case, try/catch around
+ * `JSON.parse`. Mirrors jobctl's `audit._derive_ids` 1:1 for the
+ * `target → (epic_id, task_id)` split by reusing {@link parsePlanRef}: the
+ * spawn-name ref shape (see {@link SPAWN_VERB_REF_RE}) and the
+ * planctl-target ref shape MUST agree byte-for-byte so a re-fold from
+ * scratch reproduces the same epic links.
+ *
+ * NEVER throws — the hook's exit-0 contract is non-negotiable. Claude Code
+ * occasionally puts objects in fields documented as strings; every
+ * shape-mismatch path returns `null`.
  */
 export function extractPlanctlInvocation(
   hookEvent: string,
   toolName: string | null,
   data: Record<string, unknown>,
 ): PlanctlInvocation | null {
-  if (hookEvent !== "PreToolUse" || toolName !== "Bash") {
+  if (hookEvent !== "PostToolUse" || toolName !== "Bash") {
     return null;
   }
-  const toolInput = data.tool_input;
-  if (typeof toolInput !== "object" || toolInput === null) {
+  const toolResponse = data.tool_response;
+  if (typeof toolResponse !== "object" || toolResponse === null) {
     return null;
   }
-  const command = (toolInput as Record<string, unknown>).command;
-  if (typeof command !== "string" || command.length === 0) {
+  const stdout = (toolResponse as Record<string, unknown>).stdout;
+  if (typeof stdout !== "string" || stdout.length === 0) {
     return null;
   }
-  const m = command.match(PLANCTL_COMMAND_RE);
-  if (m == null) {
+  if (stdout.length > PLANCTL_STDOUT_CAP) {
     return null;
   }
-  // biome-ignore lint/style/noNonNullAssertion: regex match guarantees group 1
-  const op = m[1]!;
-  let target: string | null = m[2] ?? null;
-  if (target !== null) {
-    // Strip a single pair of surrounding quotes (either kind).
-    if (
-      target.length >= 2 &&
-      ((target.startsWith('"') && target.endsWith('"')) ||
-        (target.startsWith("'") && target.endsWith("'")))
-    ) {
-      target = target.slice(1, -1);
+  // Fast pre-parse hint: a planctl envelope is always a JSON object, so the
+  // first non-whitespace char is `{`. We trim only a single leading-WS pass
+  // (cheap) before the hint check; anything else short-circuits without a
+  // parse. Most PostToolUse:Bash rows are not JSON at all.
+  const head = stdout.charCodeAt(0);
+  // `{` is 0x7B. Allow a leading whitespace prefix (space=0x20, tab=0x09,
+  // newline=0x0A, carriage-return=0x0D) by re-checking the trimmed head.
+  if (head !== 0x7b) {
+    if (head !== 0x20 && head !== 0x09 && head !== 0x0a && head !== 0x0d) {
+      return null;
+    }
+    if (!stdout.trimStart().startsWith("{")) {
+      return null;
     }
   }
-  if (target === "") {
-    target = null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
   }
-  const parsed = target !== null ? parsePlanRef(target) : null;
-  const epic_id = parsed?.epic_id ?? null;
-  const task_id = parsed?.kind === "task" ? parsed.task_id : null;
-  const subject_present = !PLANCTL_READONLY_VERBS.has(op);
+  if (typeof parsed !== "object" || parsed === null) {
+    return null;
+  }
+  const envelope = (parsed as Record<string, unknown>).planctl_invocation;
+  if (typeof envelope !== "object" || envelope === null) {
+    return null;
+  }
+  const envObj = envelope as Record<string, unknown>;
+  const op = envObj.op;
+  if (typeof op !== "string" || op.length === 0) {
+    return null;
+  }
+  const rawTarget = envObj.target;
+  const target: string | null =
+    typeof rawTarget === "string" ? rawTarget : null;
+  const rawSubject = envObj.subject;
+  const subject_present = rawSubject != null;
+  const refParsed = target !== null ? parsePlanRef(target) : null;
+  const epic_id = refParsed?.epic_id ?? null;
+  const task_id = refParsed?.kind === "task" ? refParsed.task_id : null;
   return { op, target, epic_id, task_id, subject_present };
 }

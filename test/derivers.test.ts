@@ -152,104 +152,153 @@ test("isKilledTaskNotification rejects the empty string", () => {
 // extractPlanctlInvocation
 // ---------------------------------------------------------------------------
 
-const PLANCTL_READONLY_VERBS = [
-  "epics",
-  "tasks",
-  "cat",
-  "show",
-  "list",
-  "detect",
-  "gist",
-  "init",
-  "claim",
-  "block",
-] as const;
-
-function pre(command: unknown): Record<string, unknown> {
-  return { tool_input: { command } };
+interface Envelope {
+  op: string;
+  target?: string | null;
+  subject?: unknown;
 }
 
-test("extractPlanctlInvocation returns null on non-PreToolUse event", () => {
+/**
+ * Wrap a planctl_invocation envelope into the canonical PostToolUse:Bash
+ * tool_response.stdout shape — JSON whose top-level `planctl_invocation`
+ * key carries the envelope. Mirrors the planctl CLI's stdout-emit shape
+ * (`apps/planctl/planctl/cli.py` `emit()`).
+ */
+function post(envelope: Envelope | null): Record<string, unknown> {
+  const stdout =
+    envelope === null ? "" : JSON.stringify({ planctl_invocation: envelope });
+  return { tool_response: { stdout } };
+}
+
+/** Raw stdout body — for tests that need to bypass the JSON wrapper. */
+function postRaw(stdout: unknown): Record<string, unknown> {
+  return { tool_response: { stdout } };
+}
+
+test("extractPlanctlInvocation returns null on non-PostToolUse event", () => {
   expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", pre("planctl epics")),
+    extractPlanctlInvocation(
+      "PreToolUse",
+      "Bash",
+      post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
+    ),
   ).toBeNull();
   expect(
-    extractPlanctlInvocation("UserPromptSubmit", "Bash", pre("planctl epics")),
+    extractPlanctlInvocation(
+      "UserPromptSubmit",
+      "Bash",
+      post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
+    ),
+  ).toBeNull();
+});
+
+test("extractPlanctlInvocation returns null on PostToolUseFailure (prefix-startsWith would false-match)", () => {
+  // Defense against any future `startsWith('PostToolUse')` shortcut —
+  // PostToolUseFailure has no `tool_response` and must not match.
+  expect(
+    extractPlanctlInvocation(
+      "PostToolUseFailure",
+      "Bash",
+      post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
+    ),
   ).toBeNull();
 });
 
 test("extractPlanctlInvocation returns null on non-Bash tool", () => {
   expect(
-    extractPlanctlInvocation("PreToolUse", "Skill", pre("planctl epics")),
+    extractPlanctlInvocation(
+      "PostToolUse",
+      "Skill",
+      post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
+    ),
   ).toBeNull();
-  expect(
-    extractPlanctlInvocation("PreToolUse", null, pre("planctl epics")),
-  ).toBeNull();
-});
-
-test("extractPlanctlInvocation returns null on missing tool_input", () => {
-  expect(extractPlanctlInvocation("PreToolUse", "Bash", {})).toBeNull();
-  expect(
-    extractPlanctlInvocation("PreToolUse", "Bash", { tool_input: null }),
-  ).toBeNull();
-  expect(
-    extractPlanctlInvocation("PreToolUse", "Bash", { tool_input: "string" }),
-  ).toBeNull();
-});
-
-test("extractPlanctlInvocation returns null on non-string command", () => {
-  expect(extractPlanctlInvocation("PreToolUse", "Bash", pre(null))).toBeNull();
-  expect(extractPlanctlInvocation("PreToolUse", "Bash", pre(42))).toBeNull();
-  expect(
-    extractPlanctlInvocation("PreToolUse", "Bash", pre({ x: 1 })),
-  ).toBeNull();
-  expect(extractPlanctlInvocation("PreToolUse", "Bash", pre(""))).toBeNull();
-});
-
-test("extractPlanctlInvocation returns null on a command that isn't planctl", () => {
-  expect(
-    extractPlanctlInvocation("PreToolUse", "Bash", pre("ls -la")),
-  ).toBeNull();
-  expect(
-    extractPlanctlInvocation("PreToolUse", "Bash", pre("planning the day")),
-  ).toBeNull();
-});
-
-test("extractPlanctlInvocation rejects absolute-path planctl", () => {
   expect(
     extractPlanctlInvocation(
-      "PreToolUse",
-      "Bash",
-      pre("/usr/local/bin/planctl epics"),
+      "PostToolUse",
+      null,
+      post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
     ),
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation rejects bash -c wrapper", () => {
+test("extractPlanctlInvocation returns null on missing tool_response", () => {
+  expect(extractPlanctlInvocation("PostToolUse", "Bash", {})).toBeNull();
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", { tool_response: null }),
+  ).toBeNull();
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", {
+      tool_response: "string",
+    }),
+  ).toBeNull();
+});
+
+test("extractPlanctlInvocation returns null on non-string stdout", () => {
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", postRaw(null)),
+  ).toBeNull();
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", postRaw(42)),
+  ).toBeNull();
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", postRaw({ x: 1 })),
+  ).toBeNull();
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", postRaw("")),
+  ).toBeNull();
+});
+
+test("extractPlanctlInvocation returns null on stdout that isn't JSON", () => {
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", postRaw("hello world")),
+  ).toBeNull();
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", postRaw("ls -la\n")),
+  ).toBeNull();
+});
+
+test("extractPlanctlInvocation returns null on malformed JSON", () => {
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", postRaw('{"truncated')),
+  ).toBeNull();
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", postRaw("{ not json }")),
+  ).toBeNull();
+});
+
+test("extractPlanctlInvocation returns null on JSON without planctl_invocation key", () => {
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", postRaw('{"foo":"bar"}')),
+  ).toBeNull();
   expect(
     extractPlanctlInvocation(
-      "PreToolUse",
+      "PostToolUse",
       "Bash",
-      pre("bash -c 'planctl epics'"),
+      postRaw('{"planctl_invocation":null}'),
+    ),
+  ).toBeNull();
+  expect(
+    extractPlanctlInvocation(
+      "PostToolUse",
+      "Bash",
+      postRaw('{"planctl_invocation":"not-an-object"}'),
     ),
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation rejects env-prefix invocation", () => {
+test("extractPlanctlInvocation returns null when stdout exceeds the length cap", () => {
+  // 64_001 chars of valid JSON-looking text — over the 64_000 cap.
+  const oversize = `{${"x".repeat(64_000)}}`;
   expect(
-    extractPlanctlInvocation(
-      "PreToolUse",
-      "Bash",
-      pre("JOBCTL_FOO=1 planctl epics"),
-    ),
+    extractPlanctlInvocation("PostToolUse", "Bash", postRaw(oversize)),
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation parses bare planctl epic-create with epic ref", () => {
+test("extractPlanctlInvocation parses epic-create envelope with epic ref", () => {
   const got = extractPlanctlInvocation(
-    "PreToolUse",
+    "PostToolUse",
     "Bash",
-    pre("planctl epic-create fn-575-foo"),
+    post({ op: "epic-create", target: "fn-575-foo", subject: "the subject" }),
   );
   expect(got).toEqual({
     op: "epic-create",
@@ -260,29 +309,51 @@ test("extractPlanctlInvocation parses bare planctl epic-create with epic ref", (
   });
 });
 
-test("extractPlanctlInvocation parses cd <path> && planctl epic-create", () => {
+test("extractPlanctlInvocation parses scaffold envelope with epic ref", () => {
+  // scaffold is the canonical create-an-epic path on this codebase.
   const got = extractPlanctlInvocation(
-    "PreToolUse",
+    "PostToolUse",
     "Bash",
-    pre("cd /tmp && planctl epic-create fn-575-foo"),
+    post({
+      op: "scaffold",
+      target: "fn-606-envelope-driven-planctl-op-deriver",
+      subject: "title text",
+    }),
   );
   expect(got).toEqual({
-    op: "epic-create",
-    target: "fn-575-foo",
-    epic_id: "fn-575-foo",
+    op: "scaffold",
+    target: "fn-606-envelope-driven-planctl-op-deriver",
+    epic_id: "fn-606-envelope-driven-planctl-op-deriver",
     task_id: null,
     subject_present: true,
   });
 });
 
-test("extractPlanctlInvocation parses task-form target into epic_id + task_id", () => {
+test("extractPlanctlInvocation parses epic-close envelope with epic ref", () => {
+  // Two-word verb that the old input-command regex saw as `op=close,
+  // target=fn-...` — the envelope carries the real op name.
   const got = extractPlanctlInvocation(
-    "PreToolUse",
+    "PostToolUse",
     "Bash",
-    pre("planctl done fn-575-foo.3"),
+    post({ op: "epic-close", target: "fn-575-foo", subject: null }),
   );
   expect(got).toEqual({
-    op: "done",
+    op: "epic-close",
+    target: "fn-575-foo",
+    epic_id: "fn-575-foo",
+    task_id: null,
+    subject_present: false,
+  });
+});
+
+test("extractPlanctlInvocation parses task-set-tier envelope into epic_id + task_id", () => {
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({ op: "task-set-tier", target: "fn-575-foo.3", subject: "S" }),
+  );
+  expect(got).toEqual({
+    op: "task-set-tier",
     target: "fn-575-foo.3",
     epic_id: "fn-575-foo",
     task_id: "fn-575-foo.3",
@@ -290,56 +361,11 @@ test("extractPlanctlInvocation parses task-form target into epic_id + task_id", 
   });
 });
 
-test("extractPlanctlInvocation strips surrounding double quotes from target", () => {
+test("extractPlanctlInvocation parses envelope with null target (bare-verb mutation)", () => {
   const got = extractPlanctlInvocation(
-    "PreToolUse",
+    "PostToolUse",
     "Bash",
-    pre('planctl epic-set-title "fn-575-foo"'),
-  );
-  expect(got?.target).toBe("fn-575-foo");
-  expect(got?.epic_id).toBe("fn-575-foo");
-});
-
-test("extractPlanctlInvocation strips surrounding single quotes from target", () => {
-  const got = extractPlanctlInvocation(
-    "PreToolUse",
-    "Bash",
-    pre("planctl epic-set-title 'fn-575-foo'"),
-  );
-  expect(got?.target).toBe("fn-575-foo");
-  expect(got?.epic_id).toBe("fn-575-foo");
-});
-
-test("extractPlanctlInvocation does not swallow trailing && into target", () => {
-  const got = extractPlanctlInvocation(
-    "PreToolUse",
-    "Bash",
-    pre("planctl epics && echo done"),
-  );
-  expect(got).toEqual({
-    op: "epics",
-    target: null,
-    epic_id: null,
-    task_id: null,
-    subject_present: false,
-  });
-});
-
-test("extractPlanctlInvocation does not swallow trailing ; into target", () => {
-  const got = extractPlanctlInvocation(
-    "PreToolUse",
-    "Bash",
-    pre("planctl epics;ls"),
-  );
-  expect(got?.op).toBe("epics");
-  expect(got?.target).toBeNull();
-});
-
-test("extractPlanctlInvocation handles op without target (bare planctl init)", () => {
-  const got = extractPlanctlInvocation(
-    "PreToolUse",
-    "Bash",
-    pre("planctl init"),
+    post({ op: "init", target: null, subject: null }),
   );
   expect(got).toEqual({
     op: "init",
@@ -353,9 +379,9 @@ test("extractPlanctlInvocation handles op without target (bare planctl init)", (
 test("extractPlanctlInvocation treats non-ref target as parseable but unresolved", () => {
   // `planctl scaffold spec.json` — target is captured but parsePlanRef yields null.
   const got = extractPlanctlInvocation(
-    "PreToolUse",
+    "PostToolUse",
     "Bash",
-    pre("planctl scaffold spec.json"),
+    post({ op: "scaffold", target: "spec.json", subject: "x" }),
   );
   expect(got).toEqual({
     op: "scaffold",
@@ -366,106 +392,106 @@ test("extractPlanctlInvocation treats non-ref target as parseable but unresolved
   });
 });
 
-test("extractPlanctlInvocation marks every read-only verb subject_present:false", () => {
-  for (const verb of PLANCTL_READONLY_VERBS) {
-    const got = extractPlanctlInvocation(
-      "PreToolUse",
-      "Bash",
-      pre(`planctl ${verb} fn-1-foo`),
-    );
-    expect(got?.op).toBe(verb);
-    expect(got?.subject_present).toBe(false);
-  }
-});
-
-test("extractPlanctlInvocation marks epic-mutation verbs subject_present:true", () => {
-  const verbs = [
-    "epic-create",
-    "epic-set-title",
-    "epic-set-branch",
-    "epic-close",
-    "epic-add-dep",
-    "epic-invalidate",
-  ];
-  for (const verb of verbs) {
-    const got = extractPlanctlInvocation(
-      "PreToolUse",
-      "Bash",
-      pre(`planctl ${verb} fn-1-foo`),
-    );
-    expect(got?.op).toBe(verb);
-    expect(got?.subject_present).toBe(true);
-  }
-});
-
-test("extractPlanctlInvocation marks task-mutation verbs subject_present:true", () => {
-  const verbs = [
-    "task-set-description",
-    "task-set-acceptance",
-    "task-set-snippets",
-    "task-reset",
-  ];
-  for (const verb of verbs) {
-    const got = extractPlanctlInvocation(
-      "PreToolUse",
-      "Bash",
-      pre(`planctl ${verb} fn-1-foo.1`),
-    );
-    expect(got?.op).toBe(verb);
-    expect(got?.subject_present).toBe(true);
-  }
-});
-
-test("extractPlanctlInvocation marks lifecycle mutation verbs subject_present:true", () => {
-  // `done` is a worker-side lifecycle write — NOT in the read-only allowlist.
-  const got = extractPlanctlInvocation(
-    "PreToolUse",
+test("extractPlanctlInvocation marks subject_present:false when subject is missing or null", () => {
+  // Envelope where `subject` field is absent or explicitly null → false.
+  const a = extractPlanctlInvocation(
+    "PostToolUse",
     "Bash",
-    pre("planctl done fn-1-foo.1 --summary x"),
+    postRaw(
+      JSON.stringify({
+        planctl_invocation: { op: "show", target: "fn-1-foo" },
+      }),
+    ),
   );
-  expect(got?.op).toBe("done");
+  expect(a?.subject_present).toBe(false);
+  const b = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({ op: "cat", target: "fn-1-foo", subject: null }),
+  );
+  expect(b?.subject_present).toBe(false);
+});
+
+test("extractPlanctlInvocation marks subject_present:true when subject is any non-null value", () => {
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({ op: "epic-set-title", target: "fn-1-foo", subject: "new title" }),
+  );
   expect(got?.subject_present).toBe(true);
+});
+
+test("extractPlanctlInvocation widens to absolute-path and bash -c invocations (envelope is authoritative)", () => {
+  // The old regex rejected these; the envelope-based deriver accepts them
+  // because the envelope rides on stdout regardless of how planctl was
+  // invoked. The hook just sees a Bash command whose stdout is JSON.
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
+  );
+  expect(got?.op).toBe("epic-create");
+});
+
+test("extractPlanctlInvocation rejects an envelope missing op", () => {
+  expect(
+    extractPlanctlInvocation(
+      "PostToolUse",
+      "Bash",
+      postRaw(
+        JSON.stringify({
+          planctl_invocation: { target: "fn-1-foo", subject: "x" },
+        }),
+      ),
+    ),
+  ).toBeNull();
+});
+
+test("extractPlanctlInvocation rejects an envelope with empty-string op", () => {
+  expect(
+    extractPlanctlInvocation(
+      "PostToolUse",
+      "Bash",
+      postRaw(
+        JSON.stringify({ planctl_invocation: { op: "", target: "fn-1-foo" } }),
+      ),
+    ),
+  ).toBeNull();
+});
+
+test("extractPlanctlInvocation tolerates leading whitespace before the JSON body", () => {
+  // planctl envelopes are JSON; tolerate trailing newlines from upstream
+  // wrappers and leading whitespace from CLI prefix lines.
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    postRaw(
+      `\n  ${JSON.stringify({ planctl_invocation: { op: "init", target: null } })}\n`,
+    ),
+  );
+  expect(got?.op).toBe("init");
 });
 
 test("extractPlanctlInvocation never throws on arbitrary garbage", () => {
   const garbage: unknown[] = [
-    pre("\x00\x01\x02"),
-    pre("planctl"),
-    pre("planctl\t\t\tepics"),
-    pre("planctl !@#$%"),
-    pre("planctl ;;;"),
-    pre("p l a n c t l epics"),
-    { tool_input: { command: { nested: "object" } } },
-    { tool_input: { command: 1234 } },
-    { tool_input: 42 },
+    postRaw("\x00\x01\x02"),
+    postRaw("not json"),
+    postRaw('{"planctl_invocation":42}'),
+    postRaw('{"planctl_invocation":{"op":null}}'),
+    postRaw('{"planctl_invocation":{"op":"foo","target":42}}'),
+    { tool_response: { stdout: { nested: "object" } } },
+    { tool_response: 42 },
     {},
   ];
   for (const data of garbage) {
     expect(() =>
       extractPlanctlInvocation(
-        "PreToolUse",
+        "PostToolUse",
         "Bash",
         data as Record<string, unknown>,
       ),
     ).not.toThrow();
   }
-});
-
-test("extractPlanctlInvocation handles a 10KB command without backtracking", () => {
-  // No nested quantifiers in PLANCTL_COMMAND_RE — confirm a giant input
-  // resolves in linear time. We don't assert wall-time (flaky); we just
-  // assert the call completes and produces a sensible result.
-  const huge = `planctl epic-create fn-1-foo ${"x".repeat(10_000)}`;
-  const got = extractPlanctlInvocation("PreToolUse", "Bash", pre(huge));
-  expect(got?.op).toBe("epic-create");
-  expect(got?.target).toBe("fn-1-foo");
-});
-
-test("extractPlanctlInvocation rejects malformed leading token (planctld)", () => {
-  // The regex requires `planctl` followed by whitespace — `planctld` must not match.
-  expect(
-    extractPlanctlInvocation("PreToolUse", "Bash", pre("planctld epics")),
-  ).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

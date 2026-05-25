@@ -334,13 +334,15 @@ async function main(): Promise<void> {
       : null;
   const skillName = extractSkillName(hookEvent, toolName, data);
 
-  // v14: index the planctl-CLI invocation footprint on PreToolUse:Bash. The
-  // deriver is pure, gated on hook event + tool name, and defensive against
-  // any malformed `data.tool_input` shape — a null return collapses to all
-  // five params bound NULL on the prepared statement. Same module-scope
-  // regex / shared-source-of-truth pattern as `slashCommandFromPrompt` /
-  // `extractSkillName`; the v13→v14 migration backfill reuses this exact
-  // function so live + historical rows derive byte-identically.
+  // v14: index the planctl-CLI invocation footprint on PostToolUse:Bash by
+  // parsing the authoritative `planctl_invocation` envelope planctl writes
+  // on every mutating call's stdout (top-level `planctl_invocation` key
+  // inside `data.tool_response.stdout`). The deriver is pure, gated on
+  // hook event + tool name, and defensive against any malformed
+  // `data.tool_response` shape — a null return collapses to all five params
+  // bound NULL on the prepared statement. The v19→v20 migration backfill
+  // reuses this exact function so live + historical rows derive
+  // byte-identically.
   const planctlInvocation = extractPlanctlInvocation(hookEvent, toolName, data);
   const planctlOp = planctlInvocation?.op ?? null;
   const planctlTarget = planctlInvocation?.target ?? null;

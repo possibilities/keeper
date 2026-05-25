@@ -86,9 +86,19 @@ export const MAX_TS_SENTINEL = Number.MAX_SAFE_INTEGER;
  * migrated DB and break the "byte-identical re-fold" invariant.
  *
  * Pure function of the input. NEVER throws. Unknown / non-prefixed verbs
- * pass through unchanged — `cat` stays `cat`, `done` stays `done`, etc. —
- * so a future planctl CLI verb that doesn't follow the `<kind>-<op>` shape
- * rides through deterministically.
+ * pass through unchanged — `cat` stays `cat`, `done` stays `done`,
+ * `scaffold` stays `scaffold`, `close` stays `close`, etc. — so a future
+ * planctl CLI verb that doesn't follow the `<kind>-<op>` shape rides through
+ * deterministically.
+ *
+ * **Deliberate TS-only divergence from the Python reference.** Keeper's
+ * classifier ({@link deriveEpicLinks}) recognizes `op === "scaffold"` as a
+ * creator alongside `op === "create"`, because scaffold is the canonical
+ * epic-creation path on this codebase (zero `epic-create` events have ever
+ * fired). The Python `apps/cli_common/cli_common/planctl_invocations.py`
+ * does NOT recognize `scaffold` as a creator — its audit layer is unaffected
+ * by this change. Keeper's view is strictly richer; the parity-fixture tests
+ * remain green because none of the captured cases drive a scaffold edge.
  */
 export function normalizePlanctlOp(rawOp: string): string {
   if (rawOp.startsWith("epic-")) {
@@ -284,10 +294,15 @@ export function deriveEpicLinks(
     }
 
     // Classify: creator or refiner?
+    // `scaffold` is keeper's canonical epic-create path (the planctl CLI's
+    // `scaffold` verb writes a fresh `.planctl/epics/<id>.json`); it carries
+    // an epic-shaped target and is treated as a creator alongside `create`.
+    // See {@link normalizePlanctlOp} for the deliberate TS-only divergence
+    // from the Python audit layer.
     let kind: "creator" | "refiner";
     let linkTarget: string;
     if (
-      entry.op === "create" &&
+      (entry.op === "create" || entry.op === "scaffold") &&
       entry.target !== null &&
       parsePlanRef(entry.target)?.kind === "epic"
     ) {

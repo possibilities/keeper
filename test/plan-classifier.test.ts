@@ -196,3 +196,66 @@ test("deriveJobLinks returns empty on zero-session map", () => {
   const got = deriveJobLinks(new Map(), new Map(), "fn-1-foo");
   expect(got).toEqual([]);
 });
+
+// ---------------------------------------------------------------------------
+// Keeper-only divergence: scaffold-as-creator. The Python audit layer does
+// NOT recognize scaffold; keeper's classifier is strictly richer because
+// scaffold is the canonical epic-create path on this codebase.
+// ---------------------------------------------------------------------------
+
+test("deriveEpicLinks accepts op='scaffold' with an epic-shaped target as a creator", () => {
+  const windows: PlanWindow[] = [[100, MAX_TS_SENTINEL]];
+  const got = deriveEpicLinks(
+    [
+      {
+        ts: 150,
+        op: "scaffold",
+        target: "fn-606-envelope-driven-planctl-op-deriver",
+        epic_id: "fn-606-envelope-driven-planctl-op-deriver",
+        subject_present: true,
+      },
+    ],
+    windows,
+  );
+  expect(got).toEqual([
+    {
+      kind: "creator",
+      target: "fn-606-envelope-driven-planctl-op-deriver",
+    },
+  ]);
+});
+
+test("deriveEpicLinks: per-window suppression holds when both create and scaffold fire in the same window", () => {
+  // Within one window, a creator-of-X (whether `create` or `scaffold`)
+  // suppresses any same-window refiner-of-X. Both creator entries
+  // dedupe at the (kind, target) seen-set; only one edge survives.
+  const windows: PlanWindow[] = [[100, MAX_TS_SENTINEL]];
+  const got = deriveEpicLinks(
+    [
+      {
+        ts: 110,
+        op: "scaffold",
+        target: "fn-1-foo",
+        epic_id: "fn-1-foo",
+        subject_present: true,
+      },
+      {
+        ts: 120,
+        op: "epic-set-title",
+        target: "fn-1-foo",
+        epic_id: "fn-1-foo",
+        subject_present: true,
+      },
+      {
+        ts: 130,
+        op: "create",
+        target: "fn-1-foo",
+        epic_id: "fn-1-foo",
+        subject_present: true,
+      },
+    ],
+    windows,
+  );
+  // One creator edge — refiner-of-fn-1-foo is suppressed in the same window.
+  expect(got).toEqual([{ kind: "creator", target: "fn-1-foo" }]);
+});

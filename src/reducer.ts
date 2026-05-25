@@ -2079,18 +2079,25 @@ function projectJobsRow(db: Database, event: Event): void {
   // Planctl-CLI invocation fan-out. Re-derive the session's epic_links +
   // every touched epic's job_links from scratch via the pure classifier in
   // `src/plan-classifier.ts`. Gated on:
-  //   `planctl_op != NULL`     — this event is a planctl-CLI Bash invocation,
-  //                              one of the windowed mutations the classifier
-  //                              folds into edges;
+  //   `planctl_op != NULL`     — this event is a planctl-CLI Bash invocation
+  //                              (PostToolUse:Bash whose stdout carried the
+  //                              `planctl_invocation` envelope — see
+  //                              {@link extractPlanctlInvocation}), one of
+  //                              the windowed mutations the classifier folds
+  //                              into edges;
   //   OR `PreToolUse + skill_name='plan:plan'`
   //                            — this event is a `/plan:plan` window opener,
   //                              which can change the set of windows (and
   //                              thus which planctl events fall inside them)
   //                              even though it carries no `planctl_op` itself.
   //
+  // The trigger gate itself is hook-event-agnostic — `planctl_op != null`
+  // fires correctly regardless of whether the source event is a PreToolUse
+  // or PostToolUse row. Only the stamping deriver changed.
+  //
   // The two seams are disjoint from `syncJobIntoEpic` (jobs-write trigger):
   // a hook event like a SessionStart with `plan_ref` fires syncIfPlanRef but
-  // not syncPlanctlLinks; a PreToolUse:Bash with a planctl command fires
+  // not syncPlanctlLinks; a PostToolUse:Bash with a planctl envelope fires
   // syncPlanctlLinks but no jobs-side write happens (default switch arm).
   //
   // Post-switch placement matches the title-precedence precedent below: the

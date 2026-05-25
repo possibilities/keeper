@@ -2869,7 +2869,7 @@ function planctlEvent(args: {
   ts?: number;
 }): number {
   return insertEvent({
-    hook_event: "PreToolUse",
+    hook_event: "PostToolUse",
     session_id: args.sessionId,
     tool_name: "Bash",
     ts: args.ts,
