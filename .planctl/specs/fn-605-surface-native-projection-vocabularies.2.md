@@ -68,5 +68,5 @@ Otherwise a late SubagentStop or PostToolUse:Agent could flip `superseded` → `
 - [ ] `README.md` vocabulary updates at lines 67-70 and 440-442 list all 5 values
 
 ## Done summary
-
+Widened subagent_invocations.status to 5-value native vocabulary (running|ok|failed|unknown|superseded) with three new reducer write paths: PostToolUseFailure→failed (bridge-resolved), SessionEnd/Killed lifecycle sweep→unknown, and PostToolUse:Agent group-scan→superseded. Terminal-status guards extended; types + README + tests updated.
 ## Evidence
