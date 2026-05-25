@@ -187,7 +187,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("18");
+  expect(row.value).toBe("20");
   db.close();
 });
 
@@ -295,7 +295,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("18");
+  expect(ver.value).toBe("20");
 
   const eventNames = (
     db.prepare("PRAGMA table_info(events)").all() as {
@@ -345,7 +345,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("18");
+  expect(ver2.value).toBe("20");
   db2.close();
 });
 
@@ -398,7 +398,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("18");
+  expect(ver.value).toBe("20");
 
   const jobNames = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
@@ -424,7 +424,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("18");
+  expect(ver2.value).toBe("20");
   db2.close();
 });
 
@@ -459,7 +459,7 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("18");
+  expect(ver.value).toBe("20");
   const names = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
@@ -510,7 +510,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("18");
+  expect(ver.value).toBe("20");
 
   const tables = new Set(
     (
@@ -566,7 +566,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("18");
+  expect(ver2.value).toBe("20");
   db2.close();
 });
 
@@ -625,7 +625,7 @@ test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, tas
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("18");
+  expect(ver.value).toBe("20");
 
   // tasks table is gone (the v6→v7 backfill+DROP runs inside the same
   // transaction, before the v11 rewind clears `epics`).
@@ -745,7 +745,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("18");
+  expect(ver.value).toBe("20");
 
   // Both columns now appear.
   const eventNames = (
@@ -792,7 +792,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("18");
+  expect(ver2.value).toBe("20");
   const eventNames2 = (
     db2.prepare("PRAGMA table_info(events)").all() as { name: string }[]
   ).map((c) => c.name);
@@ -1051,7 +1051,7 @@ test("v9 DB migrates to v10: four columns added + three partial indexes + backfi
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("18");
+  expect(ver.value).toBe("20");
 
   // All four columns appear.
   const eventNames = (
@@ -1129,7 +1129,7 @@ test("v9 DB migrates to v10: four columns added + three partial indexes + backfi
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("18");
+  expect(ver2.value).toBe("20");
   // Re-verify the backfill landed identically on the second open — the
   // guard keeps the values stable.
   const jobsAfter = db2
@@ -1298,7 +1298,7 @@ test("v10 DB migrates to v11: epics.jobs added + rewind-and-redrain rebuilds emb
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("18");
+  expect(ver.value).toBe("20");
 
   // epics.jobs column present, with the NOT NULL DEFAULT '[]'.
   const epicCols = db.prepare("PRAGMA table_info(epics)").all() as {
@@ -1353,7 +1353,7 @@ test("v10 DB migrates to v11: epics.jobs added + rewind-and-redrain rebuilds emb
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("18");
+  expect(ver2.value).toBe("20");
   // No re-drain needed — the guard suppressed the rewind, so the rows
   // persist as-is.
   const epicsAfter = db2.query("SELECT * FROM epics ORDER BY epic_id").all();
@@ -1530,7 +1530,7 @@ test("v12 DB migrates to v13: epics.approval added, approvals table dropped, fil
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("18");
+  expect(ver.value).toBe("20");
 
   // approvals table is GONE — DROP TABLE IF EXISTS ran.
   const approvalsExists =
@@ -1608,7 +1608,7 @@ test("v12 DB migrates to v13: epics.approval added, approvals table dropped, fil
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("18");
+  expect(ver2.value).toBe("20");
   const epicsAfter = db2.query("SELECT * FROM epics ORDER BY epic_id").all();
   expect(epicsAfter).toEqual(epicsBefore);
   db2.close();
@@ -1901,7 +1901,7 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("18");
+  expect(ver.value).toBe("20");
 
   // All seven columns exist with correct shape.
   const eventNames = (
@@ -2003,7 +2003,7 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("18");
+  expect(ver2.value).toBe("20");
   const epicsAfter = db2.query("SELECT * FROM epics ORDER BY epic_id").all();
   const jobsAfter = db2.query("SELECT * FROM jobs ORDER BY job_id").all();
   const eventsAfter = db2.query("SELECT * FROM events ORDER BY id").all();
@@ -2237,7 +2237,7 @@ test("v16 DB migrates to v17: tool_use_id column + subagent_invocations + partia
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("18");
+  expect(ver.value).toBe("20");
 
   // events.tool_use_id exists.
   const eventNames = (
@@ -2300,11 +2300,467 @@ test("v16 DB migrates to v17: tool_use_id column + subagent_invocations + partia
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("18");
+  expect(ver2.value).toBe("20");
   const eventsAfter = db2
     .query("SELECT id, tool_use_id FROM events ORDER BY id")
     .all();
   expect(eventsAfter).toEqual(eventsBefore);
+  db2.close();
+});
+
+// ---------------------------------------------------------------------------
+// Schema v20 — re-stamp planctl_* from PostToolUse:Bash envelope + projection
+// re-derive (fn-606 task .2)
+// ---------------------------------------------------------------------------
+
+test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-stamped from envelope, projections re-derived with scaffold-as-creator", () => {
+  // Build a v19-shaped DB with hand-stamped PreToolUse:Bash rows carrying
+  // the structurally-wrong v14 shape (op='epic' target='close' on a
+  // two-word `planctl epic close fn-…` invocation, plus a correctly-shaped
+  // `epic-create` stamp from a hyphenated one-word verb). Pair each with a
+  // PostToolUse:Bash row whose `data.tool_response.stdout` carries a
+  // `planctl_invocation` envelope. After v20, the PreToolUse stamps must
+  // be NULL across the board and the PostToolUse stamps must reflect the
+  // envelope's authoritative shape, including a scaffold → creator edge.
+  //
+  // Sessions:
+  //   sess-creator-scaffold — opens a /plan:plan window, runs
+  //     `planctl scaffold fn-7-scaff` (the canonical create path on
+  //     keeper); envelope has op='scaffold' target='fn-7-scaff'
+  //     subject!=null. After v20 this should drive a creator edge in
+  //     jobs.epic_links and a creator entry in epics.job_links.
+  //   sess-refiner-twoword — opens a /plan:plan window, runs
+  //     `planctl epic close fn-7-scaff` (two-word verb form: this is the
+  //     exact shape that v14 mis-stamped op='epic' target='close'). The
+  //     PostToolUse envelope writes the authoritative op='epic-close'
+  //     target='fn-7-scaff'. Then runs `planctl epic set-title fn-7-scaff
+  //     "Renamed"` — a subject-bearing refiner verb that drives a refiner
+  //     edge through the classifier (which requires subject_present).
+  const v19 = new Database(dbPath, { create: true });
+  v19.run(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      session_id TEXT NOT NULL,
+      pid INTEGER,
+      hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      tool_name TEXT,
+      matcher TEXT,
+      cwd TEXT,
+      permission_mode TEXT,
+      agent_id TEXT,
+      agent_type TEXT,
+      stop_hook_active INTEGER,
+      data TEXT NOT NULL,
+      subagent_agent_id TEXT,
+      spawn_name TEXT,
+      start_time TEXT,
+      slash_command TEXT,
+      skill_name TEXT,
+      planctl_op TEXT,
+      planctl_target TEXT,
+      planctl_epic_id TEXT,
+      planctl_task_id TEXT,
+      planctl_subject_present INTEGER,
+      tool_use_id TEXT
+    )
+  `);
+  v19.run(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_source TEXT,
+      transcript_path TEXT,
+      start_time TEXT,
+      plan_verb TEXT,
+      plan_ref TEXT,
+      epic_links TEXT NOT NULL DEFAULT '[]',
+      rate_limited_at REAL
+    )
+  `);
+  v19.run(`
+    CREATE TABLE epics (
+      epic_id TEXT PRIMARY KEY,
+      epic_number INTEGER,
+      title TEXT,
+      project_dir TEXT,
+      status TEXT,
+      approval TEXT NOT NULL DEFAULT 'pending',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL DEFAULT 0,
+      tasks TEXT NOT NULL DEFAULT '[]',
+      depends_on_epics TEXT NOT NULL DEFAULT '[]',
+      jobs TEXT NOT NULL DEFAULT '[]',
+      job_links TEXT NOT NULL DEFAULT '[]',
+      last_validated_at TEXT
+    )
+  `);
+  v19.run(`
+    CREATE TABLE reducer_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_event_id INTEGER NOT NULL DEFAULT 0,
+      updated_at REAL NOT NULL
+    )
+  `);
+  v19.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v19.run("INSERT INTO meta (key, value) VALUES ('schema_version', '19')");
+  v19.run(
+    "INSERT INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 0, 1)",
+  );
+
+  // Seed events. PreToolUse:Bash rows carry the v14-stamped shape (we
+  // hand-set the columns to mimic what the old regex deriver would have
+  // produced); PostToolUse:Bash rows carry the envelope on stdout.
+  const insertEvent = v19.prepare(
+    `INSERT INTO events (
+       ts, session_id, hook_event, event_type, tool_name, data, skill_name,
+       planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+       planctl_subject_present
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+
+  // sess-creator-scaffold
+  insertEvent.run(
+    1,
+    "sess-creator-scaffold",
+    "SessionStart",
+    "session_start",
+    null,
+    "{}",
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+  );
+  insertEvent.run(
+    10,
+    "sess-creator-scaffold",
+    "PreToolUse",
+    "pre_tool_use",
+    "Skill",
+    JSON.stringify({ tool_input: { skill: "plan:plan" } }),
+    "plan:plan",
+    null,
+    null,
+    null,
+    null,
+    null,
+  );
+  // The PreToolUse:Bash for the scaffold — historically the regex deriver
+  // matched 'scaffold' as a write verb (it wasn't in the readonly
+  // allowlist) and stamped op='scaffold' target='fn-7-scaff'. Whatever
+  // shape it stamped, v20 Pass 0 must NULL it.
+  insertEvent.run(
+    20,
+    "sess-creator-scaffold",
+    "PreToolUse",
+    "pre_tool_use",
+    "Bash",
+    JSON.stringify({
+      tool_input: { command: "planctl scaffold fn-7-scaff 'Scaffolded title'" },
+    }),
+    null,
+    "scaffold",
+    "fn-7-scaff",
+    "fn-7-scaff",
+    null,
+    1,
+  );
+  // Matching PostToolUse:Bash with the authoritative envelope on stdout.
+  insertEvent.run(
+    21,
+    "sess-creator-scaffold",
+    "PostToolUse",
+    "post_tool_use",
+    "Bash",
+    JSON.stringify({
+      tool_input: { command: "planctl scaffold fn-7-scaff 'Scaffolded title'" },
+      tool_response: {
+        stdout: JSON.stringify({
+          planctl_invocation: {
+            op: "scaffold",
+            target: "fn-7-scaff",
+            subject: "Scaffolded title",
+          },
+        }),
+      },
+    }),
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+  );
+
+  // sess-refiner-twoword — the two-word verb regex bug.
+  insertEvent.run(
+    35,
+    "sess-refiner-twoword",
+    "SessionStart",
+    "session_start",
+    null,
+    "{}",
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+  );
+  insertEvent.run(
+    40,
+    "sess-refiner-twoword",
+    "PreToolUse",
+    "pre_tool_use",
+    "Skill",
+    JSON.stringify({ tool_input: { skill: "plan:plan" } }),
+    "plan:plan",
+    null,
+    null,
+    null,
+    null,
+    null,
+  );
+  // Wrong v14 shape on the PreToolUse row: the regex captured the first
+  // two tokens and stamped op='epic' target='close' instead of op='epic-close'
+  // target='fn-7-scaff'. We hand-seed exactly that broken shape.
+  insertEvent.run(
+    50,
+    "sess-refiner-twoword",
+    "PreToolUse",
+    "pre_tool_use",
+    "Bash",
+    JSON.stringify({
+      tool_input: { command: "planctl epic close fn-7-scaff" },
+    }),
+    null,
+    "epic",
+    "close",
+    null,
+    null,
+    0,
+  );
+  insertEvent.run(
+    51,
+    "sess-refiner-twoword",
+    "PostToolUse",
+    "post_tool_use",
+    "Bash",
+    JSON.stringify({
+      tool_input: { command: "planctl epic close fn-7-scaff" },
+      tool_response: {
+        stdout: JSON.stringify({
+          planctl_invocation: {
+            op: "epic-close",
+            target: "fn-7-scaff",
+          },
+        }),
+      },
+    }),
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+  );
+  // Subject-bearing refiner — the one that actually drives a refiner edge
+  // through the classifier's `subject_present` gate.
+  insertEvent.run(
+    60,
+    "sess-refiner-twoword",
+    "PreToolUse",
+    "pre_tool_use",
+    "Bash",
+    JSON.stringify({
+      tool_input: {
+        command: "planctl epic set-title fn-7-scaff 'Renamed'",
+      },
+    }),
+    null,
+    "epic",
+    "set-title",
+    null,
+    null,
+    1,
+  );
+  insertEvent.run(
+    61,
+    "sess-refiner-twoword",
+    "PostToolUse",
+    "post_tool_use",
+    "Bash",
+    JSON.stringify({
+      tool_input: {
+        command: "planctl epic set-title fn-7-scaff 'Renamed'",
+      },
+      tool_response: {
+        stdout: JSON.stringify({
+          planctl_invocation: {
+            op: "epic-set-title",
+            target: "fn-7-scaff",
+            subject: "Renamed",
+          },
+        }),
+      },
+    }),
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+  );
+
+  // Seed jobs rows for both sessions (SessionStart implies a jobs row).
+  const insertJob = v19.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES (?, ?, ?, ?)",
+  );
+  insertJob.run("sess-creator-scaffold", 1, 4, 1);
+  insertJob.run("sess-refiner-twoword", 35, 9, 35);
+  v19.close();
+
+  // Reopen via openDb — triggers the v19→v20 migration block.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("20");
+
+  // Pass 0 — every PreToolUse:Bash row's planctl_* columns are now NULL.
+  const preRows = db
+    .prepare(
+      `SELECT id, planctl_op, planctl_target, planctl_epic_id,
+              planctl_task_id, planctl_subject_present
+         FROM events
+        WHERE hook_event = 'PreToolUse' AND tool_name = 'Bash'
+        ORDER BY id ASC`,
+    )
+    .all() as {
+    id: number;
+    planctl_op: string | null;
+    planctl_target: string | null;
+    planctl_epic_id: string | null;
+    planctl_task_id: string | null;
+    planctl_subject_present: number | null;
+  }[];
+  for (const r of preRows) {
+    expect(r.planctl_op).toBeNull();
+    expect(r.planctl_target).toBeNull();
+    expect(r.planctl_epic_id).toBeNull();
+    expect(r.planctl_task_id).toBeNull();
+    expect(r.planctl_subject_present).toBeNull();
+  }
+
+  // Pass 1 — PostToolUse:Bash rows carry the envelope's authoritative shape.
+  const postRows = db
+    .prepare(
+      `SELECT session_id, planctl_op, planctl_target, planctl_epic_id,
+              planctl_task_id, planctl_subject_present
+         FROM events
+        WHERE hook_event = 'PostToolUse' AND tool_name = 'Bash'
+        ORDER BY id ASC`,
+    )
+    .all() as {
+    session_id: string;
+    planctl_op: string | null;
+    planctl_target: string | null;
+    planctl_epic_id: string | null;
+    planctl_task_id: string | null;
+    planctl_subject_present: number | null;
+  }[];
+  expect(postRows).toHaveLength(3);
+  // sess-creator-scaffold: op='scaffold', target='fn-7-scaff',
+  // epic_id='fn-7-scaff', task_id=null, subject_present=1.
+  expect(postRows[0]?.session_id).toBe("sess-creator-scaffold");
+  expect(postRows[0]?.planctl_op).toBe("scaffold");
+  expect(postRows[0]?.planctl_target).toBe("fn-7-scaff");
+  expect(postRows[0]?.planctl_epic_id).toBe("fn-7-scaff");
+  expect(postRows[0]?.planctl_task_id).toBeNull();
+  expect(postRows[0]?.planctl_subject_present).toBe(1);
+  // sess-refiner-twoword: op='epic-close', target='fn-7-scaff' — the
+  // two-word verb is now correctly stamped via the envelope, not the
+  // broken regex (which would have stamped op='epic' target='close').
+  expect(postRows[1]?.session_id).toBe("sess-refiner-twoword");
+  expect(postRows[1]?.planctl_op).toBe("epic-close");
+  expect(postRows[1]?.planctl_target).toBe("fn-7-scaff");
+  expect(postRows[1]?.planctl_epic_id).toBe("fn-7-scaff");
+  expect(postRows[1]?.planctl_task_id).toBeNull();
+  expect(postRows[1]?.planctl_subject_present).toBe(0);
+  // Second refiner action in the same session, with a subject — drives
+  // the actual refiner edge through the classifier.
+  expect(postRows[2]?.session_id).toBe("sess-refiner-twoword");
+  expect(postRows[2]?.planctl_op).toBe("epic-set-title");
+  expect(postRows[2]?.planctl_target).toBe("fn-7-scaff");
+  expect(postRows[2]?.planctl_epic_id).toBe("fn-7-scaff");
+  expect(postRows[2]?.planctl_task_id).toBeNull();
+  expect(postRows[2]?.planctl_subject_present).toBe(1);
+
+  // Pass 2a — jobs.epic_links populated from the new stamps.
+  const creatorJob = db
+    .prepare("SELECT epic_links FROM jobs WHERE job_id = ?")
+    .get("sess-creator-scaffold") as { epic_links: string };
+  const creatorLinks = JSON.parse(creatorJob.epic_links) as {
+    kind: string;
+    target: string;
+  }[];
+  expect(creatorLinks).toEqual([{ kind: "creator", target: "fn-7-scaff" }]);
+
+  const refinerJob = db
+    .prepare("SELECT epic_links FROM jobs WHERE job_id = ?")
+    .get("sess-refiner-twoword") as { epic_links: string };
+  const refinerLinks = JSON.parse(refinerJob.epic_links) as {
+    kind: string;
+    target: string;
+  }[];
+  expect(refinerLinks).toEqual([{ kind: "refiner", target: "fn-7-scaff" }]);
+
+  // Pass 2b — epics.job_links carries both edges keyed by epic. Shell-insert
+  // landed the epic row (no EpicSnapshot has folded for fn-7-scaff in the
+  // fixture).
+  const epicRow = db
+    .prepare("SELECT epic_id, job_links FROM epics WHERE epic_id = ?")
+    .get("fn-7-scaff") as { epic_id: string; job_links: string } | null;
+  expect(epicRow).not.toBeNull();
+  const jobLinks = JSON.parse(epicRow?.job_links ?? "[]") as {
+    kind: string;
+    job_id: string;
+  }[];
+  // Sort tiebreaker is `(kind, job_id)` ASC — creator first, then refiner.
+  expect(jobLinks).toEqual([
+    { kind: "creator", job_id: "sess-creator-scaffold" },
+    { kind: "refiner", job_id: "sess-refiner-twoword" },
+  ]);
+
+  // Idempotent re-open — version guard suppresses the backfill re-run.
+  const epicsBefore = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const jobsBefore = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  const eventsBefore = db.query("SELECT * FROM events ORDER BY id").all();
+  db.close();
+  const { db: db2 } = openDb(dbPath);
+  const ver2 = db2
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver2.value).toBe("20");
+  expect(db2.query("SELECT * FROM epics ORDER BY epic_id").all()).toEqual(
+    epicsBefore,
+  );
+  expect(db2.query("SELECT * FROM jobs ORDER BY job_id").all()).toEqual(
+    jobsBefore,
+  );
+  expect(db2.query("SELECT * FROM events ORDER BY id").all()).toEqual(
+    eventsBefore,
+  );
   db2.close();
 });
 

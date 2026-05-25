@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1022,6 +1022,16 @@ function migrate(db: Database): void {
       // The deriver returns `null` for any non-planctl Bash command —
       // we leave columns NULL on miss so the partial-index `WHERE
       // planctl_op IS NOT NULL` predicate stays selective.
+      //
+      // LEGACY (fn-606 task .1 + .2): as of the v19→v20 step below, the
+      // live `extractPlanctlInvocation` deriver gates on
+      // `PostToolUse:Bash` (parsing the authoritative `planctl_invocation`
+      // envelope from `data.tool_response.stdout`), not PreToolUse:Bash
+      // — so this Pass 1 now stamps zero rows on a fresh chain run (the
+      // gate mismatch is intentional: the v20 block re-stamps from
+      // PostToolUse:Bash and supersedes whatever this would have done
+      // anyway). Kept in place because removing it would break the
+      // version-guarded re-fold contract on already-migrated v14+ DBs.
       const bashRows = db
         .prepare(
           `SELECT id, hook_event, tool_name, data
@@ -1458,6 +1468,288 @@ function migrate(db: Database): void {
       db.run("DELETE FROM jobs");
       db.run("DELETE FROM epics");
       db.run("DELETE FROM subagent_invocations");
+    }
+
+    // v19→v20: re-stamp the five sparse `events.planctl_*` columns from the
+    // authoritative PostToolUse:Bash `planctl_invocation` envelope on
+    // `data.tool_response.stdout`, replacing the structurally-wrong v13→v14
+    // stamps that came from the now-replaced input-command regex on the
+    // PreToolUse:Bash side. Per fn-606 task .1 the live deriver
+    // `extractPlanctlInvocation` gates on `PostToolUse:Bash` and parses the
+    // envelope; the v13→v14 backfill block above (src/db.ts:1010-1253) calls
+    // the SAME deriver against PreToolUse:Bash rows and now returns null for
+    // every row — a harmless no-op on a fresh chain run. We leave the v14
+    // block untouched (it stays as legacy context; v20 supersedes its
+    // output) and re-do the per-event stamps + projection re-derive from the
+    // correct shape here.
+    //
+    // Same structural template as the v13→v14 backfill:
+    //
+    //   Pass 0 — NULL-out every PreToolUse:Bash row's planctl_* stamps.
+    //   Pass 1 — re-stamp PostToolUse:Bash rows via the new deriver.
+    //   Pass 2a — per-session `jobs.epic_links` re-derive via deriveEpicLinks.
+    //   Pass 2b — per-touched-epic `epics.job_links` re-derive via
+    //             deriveJobLinks (shell-insert missing epic rows).
+    //   ANALYZE epilogue — refresh `sqlite_stat1` so the first post-upgrade
+    //                       query lands the partial composite index.
+    //
+    // Version-guarded: a non-idempotent projection re-derive must run AT
+    // MOST once. The guard reads the meta row written by a PRIOR migrate() —
+    // on a fresh v20 DB (or one that crashed before stamping v20)
+    // `storedVersionV20 < 20` and the backfill runs; on a steady-state v20+
+    // DB it skips. Pass 0's IS NOT NULL filter and Pass 1's IS NULL filter
+    // also make the events-side stamps independently idempotent for a
+    // partial-run resume; Pass 2a/b is full-replace re-derive (idempotent
+    // by construction).
+    //
+    // Uses `db.run(sql, params)` (uncached path) per bun:sqlite #1332 (still
+    // open as of 2026-01) — the v13→v14 / v16→v17 backfills follow the same
+    // discipline.
+    const storedVersionV20 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV20 < 20) {
+      // Pass 0 — wipe every PreToolUse:Bash row's structurally-wrong stamps.
+      // The v14 backfill stamped these via the now-replaced input-command
+      // regex; leaving them populated would have the reducer's
+      // hook-event-agnostic `planctl_op != NULL` gate fan-out from
+      // wrong-shaped data (e.g. `planctl epic close fn-N-foo` was stamped
+      // op='epic' target='close', because the regex captured the first
+      // two tokens instead of the two-word verb form). Idempotent re-run
+      // safe: the IS NOT NULL predicate becomes a no-op after the first
+      // pass.
+      db.run(
+        `UPDATE events
+            SET planctl_op = NULL,
+                planctl_target = NULL,
+                planctl_epic_id = NULL,
+                planctl_task_id = NULL,
+                planctl_subject_present = NULL
+          WHERE hook_event = 'PreToolUse'
+            AND tool_name = 'Bash'
+            AND planctl_op IS NOT NULL`,
+      );
+
+      // Pass 1 — re-stamp from PostToolUse:Bash rows via the new deriver.
+      // The WHERE filter picks up only rows we haven't touched yet, so a
+      // partial-run resume on a crash mid-backfill is safe (a row that
+      // already has `planctl_op` set is skipped). The deriver returns
+      // `null` for any non-envelope-bearing PostToolUse:Bash — we leave
+      // columns NULL on miss so the partial-index `WHERE planctl_op IS
+      // NOT NULL` predicate stays selective.
+      const bashPostRows = db
+        .prepare(
+          `SELECT id, hook_event, tool_name, data
+             FROM events
+            WHERE hook_event = 'PostToolUse' AND tool_name = 'Bash'
+              AND planctl_op IS NULL`,
+        )
+        .all() as {
+        id: number;
+        hook_event: string;
+        tool_name: string | null;
+        data: string;
+      }[];
+      for (const row of bashPostRows) {
+        let parsed: Record<string, unknown> | null = null;
+        try {
+          parsed = JSON.parse(row.data) as Record<string, unknown>;
+        } catch {
+          // malformed blob — skip derivation, columns stay NULL.
+        }
+        if (parsed == null) {
+          continue;
+        }
+        const inv = extractPlanctlInvocation(
+          row.hook_event,
+          row.tool_name,
+          parsed,
+        );
+        if (inv == null) {
+          continue;
+        }
+        db.run(
+          `UPDATE events SET
+             planctl_op = ?,
+             planctl_target = ?,
+             planctl_epic_id = ?,
+             planctl_task_id = ?,
+             planctl_subject_present = ?
+           WHERE id = ?`,
+          [
+            inv.op,
+            inv.target,
+            inv.epic_id,
+            inv.task_id,
+            inv.subject_present ? 1 : 0,
+            row.id,
+          ],
+        );
+      }
+
+      // Pass 2 — per-session projection re-derive. Mirrors the v13→v14
+      // Pass 2 shape exactly (see lines 1075-1246): for every session_id
+      // with at least one stamped `planctl_op != NULL` event, compute its
+      // `/plan:plan` windows from `PreToolUse:Skill AND
+      // skill_name='plan:plan'` rows, run `deriveEpicLinks`, and UPDATE
+      // `jobs.epic_links`. Then for each touched epic id, gather all
+      // sessions+windows touching that epic and run `deriveJobLinks`,
+      // UPDATEing `epics.job_links` (shell-insert the epic row if it
+      // doesn't exist — mirrors the syncJobIntoEpic shell-insert pattern
+      // in `src/reducer.ts`).
+      //
+      // The output is byte-identical to what the live reducer fan-out
+      // (`syncPlanctlLinks`) produces on steady-state writes because both
+      // paths feed the SAME pure classifier functions in
+      // `src/plan-classifier.ts` — including the scaffold-as-creator
+      // predicate extension from fn-606 task .1.
+      const sessionRowsV20 = db
+        .prepare(
+          `SELECT DISTINCT session_id
+             FROM events
+            WHERE planctl_op IS NOT NULL`,
+        )
+        .all() as { session_id: string }[];
+
+      const invocationsBySessionV20 = new Map<string, ClassifierInvocation[]>();
+      const openerTimestampsBySessionV20 = new Map<string, number[]>();
+
+      for (const { session_id } of sessionRowsV20) {
+        const invRows = db
+          .prepare(
+            `SELECT id, ts, planctl_op, planctl_target, planctl_epic_id,
+                    planctl_task_id, planctl_subject_present
+               FROM events
+              WHERE session_id = ? AND planctl_op IS NOT NULL
+              ORDER BY id ASC`,
+          )
+          .all(session_id) as {
+          id: number;
+          ts: number;
+          planctl_op: string;
+          planctl_target: string | null;
+          planctl_epic_id: string | null;
+          planctl_task_id: string | null;
+          planctl_subject_present: number | null;
+        }[];
+        const invocations: ClassifierInvocation[] = invRows.map((r) => ({
+          ts: r.ts,
+          op: normalizePlanctlOp(r.planctl_op),
+          target: r.planctl_target,
+          epic_id: r.planctl_epic_id,
+          subject_present: r.planctl_subject_present === 1,
+        }));
+        invocationsBySessionV20.set(session_id, invocations);
+
+        // Locked gate: PreToolUse:Skill AND skill_name='plan:plan' only —
+        // slash_command='/plan:plan' UserPromptSubmit rows are NOT
+        // openers (they'd double-fire on slash-typed invocations).
+        const openerRows = db
+          .prepare(
+            `SELECT ts
+               FROM events
+              WHERE session_id = ?
+                AND hook_event = 'PreToolUse'
+                AND skill_name = 'plan:plan'
+              ORDER BY id ASC`,
+          )
+          .all(session_id) as { ts: number }[];
+        openerTimestampsBySessionV20.set(
+          session_id,
+          openerRows.map((r) => r.ts),
+        );
+      }
+
+      // Pass 2a — compute and write `jobs.epic_links` per session. Also
+      // collect every (epic_id) that appears in any session's epic_links
+      // so Pass 2b knows which epics need a job_links re-derive.
+      const windowsBySessionV20 = new Map<string, PlanWindow[]>();
+      const touchedEpicIdsV20 = new Set<string>();
+      for (const session_id of invocationsBySessionV20.keys()) {
+        const opens = openerTimestampsBySessionV20.get(session_id) ?? [];
+        const windows = computePlanWindows(opens);
+        windowsBySessionV20.set(session_id, windows);
+        const invocations = invocationsBySessionV20.get(session_id) ?? [];
+        const epicLinks = deriveEpicLinks(invocations, windows);
+        const epicLinksJson = JSON.stringify(epicLinks);
+        const latest = db
+          .prepare(
+            `SELECT id, ts
+               FROM events
+              WHERE session_id = ? AND planctl_op IS NOT NULL
+              ORDER BY id DESC
+              LIMIT 1`,
+          )
+          .get(session_id) as { id: number; ts: number } | null;
+        if (latest == null) {
+          continue;
+        }
+        // Orphan sessions (planctl events with no SessionStart, hence no
+        // backing jobs row) skip — no shell-insert into `jobs`. Mirrors
+        // the v13→v14 Pass 2a invariant: jobs rows are created only by
+        // SessionStart.
+        db.run(
+          `UPDATE jobs SET epic_links = ?, last_event_id = ?, updated_at = ?
+            WHERE job_id = ?`,
+          [epicLinksJson, latest.id, latest.ts, session_id],
+        );
+        for (const link of epicLinks) {
+          touchedEpicIdsV20.add(link.target);
+        }
+      }
+
+      // Pass 2b — compute and write `epics.job_links` per touched epic.
+      // Shell-insert the epic row if missing so a re-fold from scratch
+      // reproduces every projection row. Mirrors the v13→v14 Pass 2b
+      // shell-insert pattern (the ON CONFLICT carve-out at the
+      // EpicSnapshot fold preserves `job_links`).
+      for (const epicId of touchedEpicIdsV20) {
+        const jobLinks = deriveJobLinks(
+          invocationsBySessionV20,
+          windowsBySessionV20,
+          epicId,
+        );
+        const jobLinksJson = JSON.stringify(jobLinks);
+        const latest = db
+          .prepare(
+            `SELECT MAX(id) AS id, MAX(ts) AS ts
+               FROM events
+              WHERE planctl_op IS NOT NULL
+                AND (planctl_epic_id = ? OR planctl_target = ?)`,
+          )
+          .get(epicId, epicId) as { id: number | null; ts: number | null };
+        const stampId = latest.id ?? 0;
+        const stampTs = latest.ts ?? 0;
+        const existing = db
+          .prepare("SELECT epic_id FROM epics WHERE epic_id = ?")
+          .get(epicId) as { epic_id: string } | null;
+        if (existing != null) {
+          db.run(
+            `UPDATE epics SET job_links = ?, last_event_id = ?, updated_at = ?
+              WHERE epic_id = ?`,
+            [jobLinksJson, stampId, stampTs, epicId],
+          );
+        } else {
+          db.run(
+            `INSERT INTO epics (
+               epic_id, epic_number, title, project_dir, status,
+               last_event_id, updated_at, tasks, jobs, job_links
+             ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?)`,
+            [epicId, stampId, stampTs, jobLinksJson],
+          );
+        }
+      }
+
+      // Seed planner stats for the partial composite index so the first
+      // post-upgrade query lands the index instead of a scan
+      // (sqlite.org/lang_analyze.html — ANALYZE refreshes the
+      // `sqlite_stat1` table the planner reads). One-shot; subsequent
+      // boots don't re-ANALYZE here.
+      db.run("ANALYZE events");
     }
 
     db.prepare(

@@ -440,10 +440,14 @@ export function deriveJobLinks(
         continue;
       }
 
-      // Classify for this epic only.
+      // Classify for this epic only. `scaffold` is keeper's canonical
+      // epic-create path (zero `epic-create` events have ever fired on this
+      // codebase); treated as a creator alongside `create`, symmetric with
+      // the {@link deriveEpicLinks} predicate. Deliberate TS-only
+      // divergence from the Python audit layer.
       let kind: "creator" | "refiner";
       if (
-        entry.op === "create" &&
+        (entry.op === "create" || entry.op === "scaffold") &&
         entry.target !== null &&
         parsePlanRef(entry.target)?.kind === "epic" &&
         entry.target === epicId
