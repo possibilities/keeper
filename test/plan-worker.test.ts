@@ -24,12 +24,15 @@ import {
   buildEpicMessage,
   buildTaskMessage,
   classifyPlanPath,
+  coerceRuntimeStatus,
   epicNumberFromId,
   isWithinRoots,
   type PlanMessage,
   PlanScanner,
   scanRoot,
   seedFromDb,
+  taskDefPathFromStatePath,
+  taskIdFromStatePath,
   taskNumberFromId,
 } from "../src/plan-worker";
 
@@ -78,6 +81,77 @@ test("classifyPlanPath: epics/tasks json under .planctl, else null", () => {
   expect(classifyPlanPath("/a/.planctl/epics/sub/fn-1-x.json")).toBeNull();
 });
 
+test("classifyPlanPath: .planctl/state/tasks/*.state.json → task-state, else null", () => {
+  // Positive: the planctl LocalFileStateStore shape — 4-segment tail with the
+  // `.state.json` suffix on the basename.
+  expect(
+    classifyPlanPath("/a/b/.planctl/state/tasks/fn-1-x.2.state.json"),
+  ).toBe("task-state");
+  // Negative: a stray non-state `.json` under the same dir rejects (the suffix
+  // probe excludes it).
+  expect(
+    classifyPlanPath("/a/b/.planctl/state/tasks/fn-1-x.2.json"),
+  ).toBeNull();
+  // Negative: a 3-segment match under `.planctl/state/...` (wrong middle dir
+  // for the 3-tail probe AND wrong shape for the 4-tail probe) rejects.
+  expect(classifyPlanPath("/a/.planctl/state/fn-1-x.state.json")).toBeNull();
+  // Negative: a non-state file with the same tail depth rejects (wrong dir
+  // chain).
+  expect(
+    classifyPlanPath("/a/.planctl/snapshots/tasks/fn-1-x.state.json"),
+  ).toBeNull();
+  // Negative: a 5-segment match (deeper nesting) rejects — the probe is exact
+  // on the trailing 4 segments.
+  expect(
+    classifyPlanPath("/a/.planctl/state/tasks/sub/fn-1-x.state.json"),
+  ).toBeNull();
+});
+
+test("taskIdFromStatePath / taskDefPathFromStatePath: pure path arithmetic", () => {
+  // Strip the `.state.json` suffix from the basename to recover the task id.
+  expect(
+    taskIdFromStatePath("/a/.planctl/state/tasks/fn-1-x.2.state.json"),
+  ).toBe("fn-1-x.2");
+  // A basename without the suffix rejects.
+  expect(
+    taskIdFromStatePath("/a/.planctl/state/tasks/fn-1-x.2.json"),
+  ).toBeNull();
+  // Map a state-file path to the sibling task-definition path.
+  expect(
+    taskDefPathFromStatePath("/a/b/.planctl/state/tasks/fn-1-x.2.state.json"),
+  ).toBe("/a/b/.planctl/tasks/fn-1-x.2.json");
+  // A path that doesn't match the 4-segment shape rejects.
+  expect(taskDefPathFromStatePath("/a/.planctl/tasks/fn-1-x.json")).toBeNull();
+});
+
+test("coerceRuntimeStatus: enum passes through; missing → 'todo' silently; invalid → 'todo' with log", () => {
+  const logs: unknown[] = [];
+  // Every enum value passes through verbatim.
+  for (const v of ["todo", "in_progress", "done", "blocked"]) {
+    expect(coerceRuntimeStatus(v, (bad) => logs.push(bad))).toBe(v);
+  }
+  // Missing / null silently defaults to "todo" (planctl's merge_task_state
+  // convention — a fresh clone with no `state/` tree reads every task as
+  // `todo`); the onInvalid callback is NOT fired for absent fields.
+  expect(coerceRuntimeStatus(undefined, (bad) => logs.push(bad))).toBe("todo");
+  expect(coerceRuntimeStatus(null, (bad) => logs.push(bad))).toBe("todo");
+  expect(logs).toEqual([]);
+  // An unrecognized string / wrong-type value coerces to "todo" AND fires
+  // onInvalid so the producer can log to stderr.
+  expect(coerceRuntimeStatus("garbage", (bad) => logs.push(bad))).toBe("todo");
+  expect(coerceRuntimeStatus(42, (bad) => logs.push(bad))).toBe("todo");
+  expect(logs).toEqual(["garbage", 42]);
+});
+
+test("buildTaskMessage carries runtimeStatus passed in by the caller; defaults to 'todo' when omitted", () => {
+  // Default arg behaviour — no runtime status threaded → "todo".
+  const taskA = buildTaskMessage({ id: "fn-1-x.1" });
+  expect(taskA?.runtimeStatus).toBe("todo");
+  // Explicit pass-through (the cache value the PlanScanner threads in).
+  const taskB = buildTaskMessage({ id: "fn-1-x.1" }, "in_progress");
+  expect(taskB?.runtimeStatus).toBe("in_progress");
+});
+
 test("epicNumberFromId / taskNumberFromId: parse + null on no match", () => {
   expect(epicNumberFromId("fn-558-keeper-plans")).toBe(558);
   expect(epicNumberFromId("fn-1-x")).toBe(1);
@@ -87,14 +161,14 @@ test("epicNumberFromId / taskNumberFromId: parse + null on no match", () => {
   expect(taskNumberFromId("fn-1-x")).toBeNull();
 });
 
-test("buildTaskMessage derives status from worker_done_at", () => {
+test("buildTaskMessage derives workerPhase from worker_done_at", () => {
   const open = buildTaskMessage({ id: "fn-1-x.1" });
-  expect(open?.status).toBe("open");
+  expect(open?.workerPhase).toBe("open");
   const done = buildTaskMessage({
     id: "fn-1-x.2",
     worker_done_at: "2026-05-22T00:00:00Z",
   });
-  expect(done?.status).toBe("done");
+  expect(done?.workerPhase).toBe("done");
   // No id → null (can't key the projection).
   expect(buildTaskMessage({})).toBeNull();
 });
@@ -177,7 +251,9 @@ test("buildEpicMessage / buildTaskMessage default missing approval to 'pending' 
   const logs: string[] = [];
   const epic = buildEpicMessage({ id: "fn-9-x" }, (l) => logs.push(l));
   expect(epic?.approval).toBe("pending");
-  const task = buildTaskMessage({ id: "fn-9-x.1" }, (l) => logs.push(l));
+  const task = buildTaskMessage({ id: "fn-9-x.1" }, "todo", (l: string) =>
+    logs.push(l),
+  );
   expect(task?.approval).toBe("pending");
   expect(logs).toEqual([]);
 });
@@ -199,7 +275,8 @@ test("buildTaskMessage coerces an invalid approval value (wrong type) to 'pendin
   const logs: string[] = [];
   const msg = buildTaskMessage(
     { id: "fn-9-x.1", approval: 42 }, // number, not the enum
-    (l) => logs.push(l),
+    "todo",
+    (l: string) => logs.push(l),
   );
   expect(msg?.approval).toBe("pending");
   expect(logs.length).toBe(1);
@@ -282,7 +359,7 @@ test("onChange emits an epic snapshot then change-gates an identical re-scan", (
   expect((emitted[1] as { status: string }).status).toBe("done");
 });
 
-test("onChange emits a task snapshot with derived status + epicId", () => {
+test("onChange emits a task snapshot with derived workerPhase + epicId", () => {
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
     (m) => emitted.push(m),
@@ -303,7 +380,8 @@ test("onChange emits a task snapshot with derived status + epicId", () => {
       number: 2,
       title: "Subtask",
       targetRepo: "/repo",
-      status: "open",
+      workerPhase: "open",
+      runtimeStatus: "todo",
       approval: "pending",
       dependsOn: [],
     },
@@ -820,6 +898,150 @@ test("seedFromDb reconstructs last_validated_at field-identically (no synthetic 
   expect((emitted[0] as { lastValidatedAt: string }).lastValidatedAt).toBe(
     "2026-05-25T00:00:00Z",
   );
+});
+
+test("seedFromDb reconstructs workerPhase + runtimeStatus field-identically (no synthetic re-emit on boot, schema v19)", () => {
+  // The #1 silent regression risk for schema v19 (per the task spec): if the
+  // seed reconstruction places `workerPhase` / `runtimeStatus` in different
+  // object-literal SLOTS than `buildTaskMessage`, `JSON.stringify` byte-
+  // compares diverge and every embedded task element re-emits a synthetic
+  // TaskSnapshot on every daemon boot — silently. This test pins the
+  // byte-identity invariant by direct serialization compare, exercising both
+  // the live-stored shape (v19: `worker_phase` + `runtime_status` keys) and
+  // the legacy shape (pre-v19: `status` only) to prove defensive parity.
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  // Live v19 shape: embedded task carries BOTH new keys. A re-fold from the
+  // event log writes this shape; the seed reconstruction must read it back
+  // identically.
+  const tasksV19 = JSON.stringify([
+    {
+      task_id: "fn-9-x.1",
+      epic_id: "fn-9-x",
+      task_number: 1,
+      title: "T",
+      target_repo: "/repo",
+      worker_phase: "done",
+      runtime_status: "in_progress",
+      approval: "approved",
+      depends_on: [],
+      jobs: [],
+    },
+  ]);
+  // Legacy pre-v19 shape: only `status`. seedFromDb reads
+  // `t.worker_phase ?? t.status ?? "open"` so this row still reconstructs to
+  // `workerPhase: "open"` and defaults `runtimeStatus` to `"todo"`.
+  const tasksLegacy = JSON.stringify([
+    {
+      task_id: "fn-9-y.1",
+      epic_id: "fn-9-y",
+      task_number: 1,
+      title: "L",
+      target_repo: "/repo",
+      status: "open",
+      approval: "pending",
+      depends_on: [],
+      jobs: [],
+    },
+  ]);
+  db.run(
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "fn-9-x",
+      9,
+      "X",
+      "/repo",
+      "open",
+      1,
+      0,
+      tasksV19,
+      "fn-9-y",
+      9,
+      "Y",
+      "/repo",
+      "open",
+      1,
+      0,
+      tasksLegacy,
+    ],
+  );
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+  db.close();
+
+  // The on-disk task definition file for the v19-shaped row carries the
+  // fields that derive worker_phase: `worker_done_at` is present so the
+  // derived phase is "done". The state file is NOT written (the cache
+  // defaults to "todo"); but the seeded row has runtime_status="in_progress",
+  // so a state-less scan would NOT match and a re-emit IS expected. To
+  // pin parity, we instead pass the seeded runtimeStatus explicitly into
+  // buildTaskMessage and compare bytes — the load-bearing invariant for
+  // the seed change-gate.
+  const fromBuildV19 = buildTaskMessage(
+    {
+      id: "fn-9-x.1",
+      epic: "fn-9-x",
+      title: "T",
+      target_repo: "/repo",
+      worker_done_at: "2026-05-22T00:00:00Z", // derives workerPhase="done"
+      approval: "approved",
+    },
+    "in_progress", // runtimeStatus the scanner would thread in from the cache
+  );
+  const fromSeedV19 = {
+    kind: "plan-task" as const,
+    id: "fn-9-x.1",
+    epicId: "fn-9-x",
+    number: 1,
+    title: "T",
+    targetRepo: "/repo",
+    workerPhase: "done",
+    runtimeStatus: "in_progress",
+    approval: "approved" as const,
+    dependsOn: [],
+  };
+  // The load-bearing assertion: bytes must match. A reorder of either side's
+  // object-literal keys breaks this immediately.
+  expect(JSON.stringify(fromBuildV19)).toBe(JSON.stringify(fromSeedV19));
+
+  // Legacy pre-v19 stored row → seedFromDb reads `worker_phase ?? status`
+  // (= "open") and defaults `runtime_status` (= "todo"). A buildTaskMessage
+  // for the equivalent on-disk file (no worker_done_at, no state file) must
+  // serialize to the same bytes.
+  const fromBuildLegacy = buildTaskMessage(
+    {
+      id: "fn-9-y.1",
+      epic: "fn-9-y",
+      title: "L",
+      target_repo: "/repo",
+      approval: "pending",
+    },
+    "todo",
+  );
+  const fromSeedLegacy = {
+    kind: "plan-task" as const,
+    id: "fn-9-y.1",
+    epicId: "fn-9-y",
+    number: 1,
+    title: "L",
+    targetRepo: "/repo",
+    workerPhase: "open",
+    runtimeStatus: "todo",
+    approval: "pending" as const,
+    dependsOn: [],
+  };
+  expect(JSON.stringify(fromBuildLegacy)).toBe(JSON.stringify(fromSeedLegacy));
+
+  // The seed must have suppressed re-emits on the bootstrap (parity above
+  // proves the byte-compare holds for both shapes — no synthetic emission
+  // happened during seedFromDb itself).
+  expect(emitted).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------

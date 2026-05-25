@@ -449,7 +449,25 @@ export interface Task {
   task_number: number | null;
   title: string | null;
   target_repo: string | null;
-  status: string | null;
+  /**
+   * Derived worker-phase binary (schema v19): `worker_done_at` present →
+   * `"done"`, else `"open"`. Surfaces the same compressed signal the field
+   * used to carry under the legacy `status` name (renamed to free up
+   * `runtime_status` below for the planctl-native enum). Nullable on a shell
+   * task element inserted by `syncJobIntoEpic` before any plan-snapshot fold
+   * lands (matches the zero-event projection).
+   */
+  worker_phase: string | null;
+  /**
+   * Planctl-native runtime status (schema v19): the top-level `status` field
+   * of `.planctl/state/tasks/<task_id>.state.json` (`"todo" | "in_progress"
+   * | "done" | "blocked"`). Absent / missing state file / unrecognized value
+   * folds to `"todo"` per planctl's `merge_task_state` convention (a fresh
+   * clone with no `state/` tree reads every task as `todo`). Never null —
+   * the planctl default is always meaningful, so the type stays a plain
+   * string rather than `string | null`.
+   */
+  runtime_status: string;
   /**
    * Planctl-native approval state — top-level field on
    * `.planctl/tasks/<id>.<n>.json` (schema v13). Same enum + missing/invalid

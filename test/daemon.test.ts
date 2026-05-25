@@ -225,7 +225,8 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     task_number: number;
     title: string;
     target_repo: string;
-    status: string;
+    worker_phase: string;
+    runtime_status: string;
     approval: "approved" | "rejected" | "pending";
     depends_on: string[];
     jobs: unknown[];
@@ -237,7 +238,12 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     task_number: 2,
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
-    status: "open",
+    // Schema v19: the legacy `status` column was renamed to `worker_phase`
+    // (derived worker-phase binary) and a sibling `runtime_status` field
+    // surfaces the planctl-native enum. A TaskSnapshot blob without a state
+    // file folds `runtime_status` to the planctl `"todo"` default.
+    worker_phase: "open",
+    runtime_status: "todo",
     // Schema v13: a TaskSnapshot blob with no `approval` field folds to
     // "pending" on the embedded element (matches plan-worker coercion).
     approval: "pending",

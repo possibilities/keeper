@@ -333,6 +333,25 @@ interface PlanSnapshot {
   epic_id?: string | null;
   status?: string | null;
   /**
+   * Derived worker-phase binary on TaskSnapshot blobs (schema v19): the same
+   * compressed signal the field used to carry under the legacy `status`
+   * column on the embedded task element (`worker_done_at` present → `"done"`,
+   * else `"open"`). Renamed from `status` to free up `runtime_status` (below)
+   * for the planctl-native enum. A pre-v19 TaskSnapshot blob carries
+   * `status` instead; the reducer reads `worker_phase ?? status` for
+   * re-fold determinism across the version boundary.
+   */
+  worker_phase?: string | null;
+  /**
+   * Planctl-native runtime status on TaskSnapshot blobs (schema v19): the
+   * top-level `status` field of `.planctl/state/tasks/<task_id>.state.json`
+   * (`"todo" | "in_progress" | "done" | "blocked"`). Absent on pre-v19 blobs;
+   * the reducer reads defensively (`runtime_status ?? "todo"` — planctl's
+   * `merge_task_state` convention) so an older blob still folds
+   * deterministically.
+   */
+  runtime_status?: string | null;
+  /**
    * Planctl-native approval enum (schema v13). Pre-coerced by the plan-worker
    * to `"approved" | "rejected" | "pending"`; absent / NULL → folds to
    * `"pending"` so an old-shape blob still rides through deterministically.
@@ -473,13 +492,20 @@ function projectPlanRow(db: Database, event: Event): void {
     // embedded `jobs` sub-array is preserved from the OLD element below (a
     // plan-file snapshot carries no job data — see the RMW preservation step
     // before push), or defaults to `[]` for a first-sight task.
+    // The SLOT ORDER of the keys below is load-bearing: `seedFromDb` in
+    // `plan-worker.ts` reconstructs `PlanTaskMessage` from this persisted
+    // element shape, and the change-gate fingerprint is a `JSON.stringify`
+    // byte-compare. Any rename or reorder MUST be mirrored on
+    // `PlanTaskMessage` + `buildTaskMessage` + `seedFromDb`, or every task
+    // re-emits a synthetic snapshot on every daemon boot.
     const element: {
       task_id: string;
       epic_id: string;
       task_number: number | null;
       title: string | null;
       target_repo: string | null;
-      status: string | null;
+      worker_phase: string | null;
+      runtime_status: string;
       approval: "approved" | "rejected" | "pending";
       depends_on: string[];
       jobs: unknown[];
@@ -489,7 +515,18 @@ function projectPlanRow(db: Database, event: Event): void {
       task_number: snapshot.task_number ?? null,
       title: snapshot.title ?? null,
       target_repo: snapshot.target_repo ?? null,
-      status: snapshot.status ?? null,
+      // Renamed from the legacy `status` column on the embedded element
+      // (schema v19). A pre-v19 TaskSnapshot blob carries `status` instead of
+      // `worker_phase`; read whichever is present so a re-fold reproduces
+      // the same value across the version boundary.
+      worker_phase: snapshot.worker_phase ?? snapshot.status ?? null,
+      // Planctl-native runtime status (`todo|in_progress|done|blocked`),
+      // ingested from `.planctl/state/tasks/<task_id>.state.json` and pre-
+      // coerced by the plan-worker. Absent on pre-v19 blobs / never-observed
+      // state files → folds to `"todo"` per planctl's `merge_task_state`
+      // convention (a fresh clone with no `state/` tree reads every task as
+      // `todo`).
+      runtime_status: snapshot.runtime_status ?? "todo",
       // Pre-coerced by the plan-worker; a missing / NULL value in a legacy
       // synthetic event folds to "pending" so re-fold determinism survives the
       // v12→v13 boundary (same default as the schema column on the parent
@@ -1155,14 +1192,18 @@ function syncJobIntoEpic(
 
   // The full task element shape we read+write. The plan-fold's element
   // already carries all these fields; a shell task element initialises the
-  // scalar columns to NULL.
+  // scalar columns to NULL / the planctl `"todo"` default. The SLOT ORDER
+  // MUST match `projectPlanRow`'s embedded `element` shape AND
+  // `seedFromDb`'s reconstruction in `plan-worker.ts` (the change-gate
+  // `JSON.stringify` byte-compare is the parity check; see schema v19 note).
   interface TaskElement {
     task_id: string;
     epic_id: string | null;
     task_number: number | null;
     title: string | null;
     target_repo: string | null;
-    status: string | null;
+    worker_phase: string | null;
+    runtime_status: string;
     depends_on: unknown[];
     jobs: EmbeddedJobElement[];
   }
@@ -1189,6 +1230,12 @@ function syncJobIntoEpic(
   nextTaskJobs.push(element);
   sortEmbeddedJobs(nextTaskJobs);
 
+  // OLD-element carve-out: when an OLD task element exists, preserve ALL of
+  // its scalar fields (including the new `worker_phase` + `runtime_status`)
+  // by spreading and re-attaching only the freshly-merged `jobs` sub-array.
+  // The spread is the carve-out — a jobs-write fan-out MUST NOT clobber the
+  // plan-snapshot-derived fields, or every job tick would stomp the task-
+  // status pills with stale snapshot values (CLAUDE.md §Acceptance bullet).
   const newTaskElement: TaskElement =
     oldTask != null
       ? { ...oldTask, jobs: nextTaskJobs }
@@ -1198,7 +1245,11 @@ function syncJobIntoEpic(
           task_number: null,
           title: null,
           target_repo: null,
-          status: null,
+          worker_phase: null,
+          // A shell task element (no plan-snapshot folded yet) gets the
+          // planctl `"todo"` default, matching the zero-event projection
+          // and `merge_task_state` convention.
+          runtime_status: "todo",
           depends_on: [],
           jobs: nextTaskJobs,
         };

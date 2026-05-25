@@ -199,7 +199,7 @@ test("runQuery pages the epics collection with the served columns + total", () =
     "fn-2-beta",
   ]);
   // Served columns match the descriptor.
-  expect(Object.keys(res.rows[0]!).sort()).toEqual(
+  expect(Object.keys(res.rows[0] ?? {}).sort()).toEqual(
     [...EPICS_DESCRIPTOR.columns].sort(),
   );
   db.close();
@@ -233,7 +233,8 @@ test("runQuery decodes the embedded tasks JSON-array column into a real array", 
       filter: { epic_id: "fn-1-alpha" },
     }),
   );
-  const row = res.rows[0]!;
+  const row = res.rows[0];
+  if (row == null) throw new Error("expected row");
   expect(Array.isArray(row.tasks)).toBe(true);
   const arr = row.tasks as { task_id: string }[];
   expect(arr.map((t) => t.task_id)).toEqual(["fn-1-alpha.1", "fn-1-alpha.2"]);
@@ -254,7 +255,7 @@ test("runQuery decodes the depends_on_epics JSON-array column into a real array"
       filter: { epic_id: "fn-4-alpha" },
     }),
   );
-  expect(res.rows[0]!.depends_on_epics).toEqual(["fn-3-base"]);
+  expect(res.rows[0]?.depends_on_epics).toEqual(["fn-3-base"]);
   db.close();
 });
 
@@ -283,7 +284,8 @@ test("runQuery decodes the embedded jobs JSON-array column into a real array", (
       filter: { epic_id: "fn-9-jobs" },
     }),
   );
-  const row = res.rows[0]!;
+  const row = res.rows[0];
+  if (row == null) throw new Error("expected row");
   expect(Array.isArray(row.jobs)).toBe(true);
   const arr = row.jobs as { job_id: string; plan_verb: string }[];
   expect(arr.map((j) => j.job_id)).toEqual(["sess-plan-1"]);
@@ -310,7 +312,8 @@ test("runQuery decodes the jobs.epic_links JSON-array column into a real array (
       filter: { job_id: "sess-planner-1" },
     }),
   );
-  const row = res.rows[0]!;
+  const row = res.rows[0];
+  if (row == null) throw new Error("expected row");
   expect(Array.isArray(row.epic_links)).toBe(true);
   const arr = row.epic_links as { kind: string; target: string }[];
   expect(arr).toEqual([
@@ -342,7 +345,8 @@ test("runQuery decodes the epics.job_links JSON-array column into a real array (
       filter: { epic_id: "fn-9-links" },
     }),
   );
-  const row = res.rows[0]!;
+  const row = res.rows[0];
+  if (row == null) throw new Error("expected row");
   expect(Array.isArray(row.job_links)).toBe(true);
   const arr = row.job_links as { kind: string; job_id: string }[];
   expect(arr).toEqual([
@@ -392,7 +396,8 @@ test("runQuery nested-decodes task.jobs through the tasks JSON parse", () => {
       filter: { epic_id: "fn-1-foo" },
     }),
   );
-  const row = res.rows[0]!;
+  const row = res.rows[0];
+  if (row == null) throw new Error("expected row");
   expect(Array.isArray(row.tasks)).toBe(true);
   const taskArr = row.tasks as {
     task_id: string;
@@ -415,7 +420,7 @@ test("runQuery decodes a NULL/malformed tasks column to []", () => {
       filter: { epic_id: "fn-1-alpha" },
     }),
   );
-  expect(res.rows[0]!.tasks).toEqual([]);
+  expect(res.rows[0]?.tasks).toEqual([]);
   db.close();
 });
 
@@ -431,7 +436,7 @@ test("runQuery resolves the epics pk filter to a single row", () => {
     }),
   );
   expect(res.total).toBe(1);
-  expect(String(res.rows[0]!.epic_id)).toBe("fn-2-beta");
+  expect(String(res.rows[0]?.epic_id)).toBe("fn-2-beta");
   db.close();
 });
 
@@ -516,7 +521,7 @@ test("a pk lookup resolves a done epic despite the default open scope", () => {
     }),
   );
   expect(res.total).toBe(1);
-  expect(String(res.rows[0]!.epic_id)).toBe("fn-2-done");
+  expect(String(res.rows[0]?.epic_id)).toBe("fn-2-done");
   db.close();
 });
 
@@ -580,7 +585,7 @@ test("runQuery: explicit { approval: 'approved' } overrides the default ne", () 
     }),
   );
   expect(res.total).toBe(1);
-  expect(String(res.rows[0]!.epic_id)).toBe("fn-1");
+  expect(String(res.rows[0]?.epic_id)).toBe("fn-1");
   db.close();
 });
 
@@ -599,7 +604,7 @@ test("runQuery: { approval: { ne: 'rejected' } } excludes rejected rows", () => 
     }),
   );
   expect(res.total).toBe(1);
-  expect(String(res.rows[0]!.epic_id)).toBe("fn-1");
+  expect(String(res.rows[0]?.epic_id)).toBe("fn-1");
   db.close();
 });
 
@@ -642,7 +647,7 @@ test("epics result rows carry the `approval` column", () => {
       filter: { approval: "approved" },
     }),
   );
-  expect(res.rows[0]!.approval).toBe("approved");
+  expect(res.rows[0]?.approval).toBe("approved");
   db.close();
 });
 

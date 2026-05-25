@@ -85,12 +85,7 @@ import {
   type QueryFrame,
   type ServerFrame,
 } from "../src/protocol";
-import type {
-  Epic,
-  Job,
-  JobLinkEntry,
-  SubagentInvocation,
-} from "../src/types";
+import type { Epic, Job, JobLinkEntry, SubagentInvocation } from "../src/types";
 import {
   computeReadiness,
   formatPill,
@@ -561,7 +556,12 @@ async function main(): Promise<void> {
       const taskId = seg(t.task_id);
       const taskVerdict = verdictFromMap(lastReadiness?.perTask, taskId);
       lines.push(
-        `${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.status)}] [${taskApproval}]`,
+        // Schema v19: the embedded task element's legacy `status` was renamed
+        // to `worker_phase` (derived worker-phase binary, same compressed
+        // signal). The board reads the new key to keep the existing single-
+        // pill display unchanged; a later board-side task in this epic widens
+        // the line to render BOTH `[runtime_status] [worker_phase] [approval]`.
+        `${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.worker_phase)}] [${taskApproval}]`,
         `   [${taskId}] ${formatPill(taskVerdict)}`,
         ...renderJobLines(t.jobs),
       );

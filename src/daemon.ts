@@ -267,9 +267,7 @@ function runDaemon(): void {
   // `data.session_title` (the same field the reducer's title rule reads);
   // everything else is NULL (synthetic — never carries a process identity).
   transcriptWorker.onmessage = (
-    ev: MessageEvent<
-      TranscriptTitleMessage | RateLimitedMessage | undefined
-    >,
+    ev: MessageEvent<TranscriptTitleMessage | RateLimitedMessage | undefined>,
   ): void => {
     const msg = ev.data;
     if (!msg) {
@@ -411,7 +409,15 @@ function runDaemon(): void {
         task_number: msg.number,
         title: msg.title,
         target_repo: msg.targetRepo,
-        status: msg.status,
+        // Renamed from the legacy `status` field. The producer surfaces the
+        // derived worker-phase binary (`worker_done_at` present → "done", else
+        // "open") under its new name to free up `runtime_status` (sibling
+        // below) for planctl's native enum.
+        worker_phase: msg.workerPhase,
+        // Planctl-native runtime status (`todo|in_progress|done|blocked`)
+        // ingested from `.planctl/state/tasks/<task_id>.state.json`. Threads
+        // through the synthetic-event pipeline so a re-fold reproduces it.
+        runtime_status: msg.runtimeStatus,
         approval: msg.approval,
         depends_on: msg.dependsOn,
       });

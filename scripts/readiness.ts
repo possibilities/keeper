@@ -9,7 +9,7 @@
  * fixture pin a verdict for a given snapshot, and lets autopilot consume the
  * verdict's discriminated-union tag without parsing strings.
  *
- * Predicate pipeline — first-match-wins, ten ordered checks per row:
+ * Predicate pipeline — first-match-wins, eleven ordered checks per row:
  *   1. terminal-completed          — task: status==="done" && approval==="approved"
  *                                    close: epic.status==="done" && epic.approval==="approved"
  *   2. epic-not-validated          — parent epic.last_validated_at == null
@@ -22,13 +22,22 @@
  *   7. dep-on-task                 — any depends_on upstream NOT { tag:"completed" }
  *   8. dep-on-epic                 — any depends_on_epics upstream's close NOT completed
  *   9. dep-on-task-synthetic-close — for the synthetic close row: any non-completed task
- *  10. single-root                 — post-pass: only one row per project root may be `ready`
+ *  10. single-task-per-epic        — post-pass: one non-completed slot per epic
+ *  11. single-task-per-root        — post-pass: one non-completed slot per project root
  *
- * Single-root runs as a separate pass (`applySingleRootMutex`) over the
- * per-row verdicts in board traversal order — never folded into per-row
- * evaluation, so iteration order is the only determinism gate.
+ * The two post-passes (10, 11) run in that order — per-epic FIRST so its
+ * tighter scope wins the reason when both would apply. Both share one
+ * algorithmic shape: walk in board traversal order, the FIRST non-completed
+ * row claims the slot, every LATER row whose verdict is `ready` in that
+ * same slot gets mutated to the corresponding blocked reason. Rows already
+ * blocked by reasons 1–9 stay with their (more specific) reason; only
+ * `ready` rows are mutated. The "occupant" check counts ANY non-completed
+ * verdict (working, blocked-by-anything, ready) — so a sibling task that
+ * is actively `job-running` or `sub-agent-running` in the same epic/root
+ * still blocks later ready rows. Iteration order is the only determinism
+ * gate.
  *
- * Epic header rollup (after per-row + single-root):
+ * Epic header rollup (after per-row + both post-passes):
  *   - `[completed]` if close row verdict is `{ tag: "completed" }`.
  *   - `[ready]`     if any task or close row verdict is `{ tag: "ready" }`.
  *   - Otherwise `[blocked:<first non-completed row's reason in traversal order>]`.
@@ -191,8 +200,11 @@ function evaluateTask(
   // same "already-computed verdicts" handles.
   _perCloseRow: Map<string, Verdict>,
 ): Verdict {
-  // 1. terminal-completed.
-  if (task.status === "done" && task.approval === "approved") {
+  // 1. terminal-completed. Schema v19: read the derived worker-phase binary
+  // under its new key — the legacy `status` was renamed to `worker_phase`
+  // to free up `runtime_status` for the planctl-native enum. Semantics are
+  // unchanged: `worker_done_at` present → `worker_phase === "done"`.
+  if (task.worker_phase === "done" && task.approval === "approved") {
     return { tag: "completed" };
   }
 
@@ -210,7 +222,7 @@ function evaluateTask(
   if (task.approval === "rejected") {
     return { tag: "blocked", reason: { kind: "job-rejected" } };
   }
-  if (task.approval === "pending" && task.status === "done") {
+  if (task.approval === "pending" && task.worker_phase === "done") {
     return { tag: "blocked", reason: { kind: "job-pending" } };
   }
 
@@ -563,4 +575,3 @@ function formatReasonShort(reason: BlockReason): string {
       return "unknown";
   }
 }
-

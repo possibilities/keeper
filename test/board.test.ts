@@ -60,7 +60,12 @@ function makeTask(overrides: Partial<Task>): Task {
     task_number: 1,
     title: "task",
     target_repo: null,
-    status: "open",
+    // Schema v19: `status` renamed to `worker_phase` (derived binary —
+    // open|done) and `runtime_status` added (planctl-native enum, default
+    // "todo"). Both ride inside the embedded element on the parent epic's
+    // `tasks` array.
+    worker_phase: "open",
+    runtime_status: "todo",
     approval: "approved",
     depends_on: [],
     jobs: [],
@@ -142,7 +147,7 @@ test("two running invocations on one job_id both reach computeReadiness and bloc
   // are still running on that same job_id. Predicate 6
   // (own-progress-sub) must fire.
   const task = makeTask({
-    status: "open",
+    worker_phase: "open",
     approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
@@ -151,8 +156,18 @@ test("two running invocations on one job_id both reach computeReadiness and bloc
   // Two running invocations share one job_id, distinguished by (agent_id, turn_seq).
   // This is exactly the shape `byId.values()` collapsed — both must survive.
   const subRows = [
-    makeSub({ job_id: "worker-1", agent_id: "agent-A", turn_seq: 0, status: "running" }),
-    makeSub({ job_id: "worker-1", agent_id: "agent-B", turn_seq: 1, status: "running" }),
+    makeSub({
+      job_id: "worker-1",
+      agent_id: "agent-A",
+      turn_seq: 0,
+      status: "running",
+    }),
+    makeSub({
+      job_id: "worker-1",
+      agent_id: "agent-B",
+      turn_seq: 1,
+      status: "running",
+    }),
   ];
 
   // Simulate the board.ts hand-off: stash rows in a CollectionState-shaped
@@ -161,11 +176,7 @@ test("two running invocations on one job_id both reach computeReadiness and bloc
   const projected = projectRows<SubagentInvocation>({ rows: subRows });
   expect(projected).toHaveLength(2);
 
-  const snap = computeReadiness(
-    [epic],
-    new Map<string, Job>(),
-    projected,
-  );
+  const snap = computeReadiness([epic], new Map<string, Job>(), projected);
 
   expect(snap.perTask.get(task.task_id)).toEqual({
     tag: "blocked",

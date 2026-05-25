@@ -135,8 +135,22 @@ export interface PlanTaskMessage {
   title: string | null;
   /** The task's `target_repo` — stored opaque, never used to drive FS reads. */
   targetRepo: string | null;
-  /** Derived: `worker_done_at` present → "done", else "open". */
-  status: string;
+  /**
+   * Derived worker-phase binary: `worker_done_at` present → `"done"`, else
+   * `"open"`. Surfaces the same compressed signal the field used to carry
+   * under the legacy `status` name (renamed in schema v19 to make room for
+   * the planctl-native `runtime_status` enum below).
+   */
+  workerPhase: string;
+  /**
+   * Planctl-native runtime status ingested from
+   * `.planctl/state/tasks/<task_id>.state.json` (top-level `status` field):
+   * `"todo" | "in_progress" | "done" | "blocked"`. Absent / missing file /
+   * unrecognized value safe-defaults to `"todo"` per planctl's
+   * `merge_task_state` convention (a fresh clone with no `state/` tree reads
+   * every task as `todo`).
+   */
+  runtimeStatus: string;
   /**
    * Planctl-native approval enum, top-level on the task file. Same coercion
    * semantics as {@link PlanEpicMessage.approval}.
@@ -230,14 +244,25 @@ const PRUNE_DIRS = new Set([
 ]);
 
 /** Which `.planctl` collection a path belongs to (or none). */
-type PlanKind = "epic" | "task";
+type PlanKind = "epic" | "task" | "task-state";
 
 /**
- * Classify a watched path as an epic file, a task file, or neither, by matching
- * the `.planctl/epics/*.json` / `.planctl/tasks/*.json` shape. Uses the
- * platform path separator so it works under any root depth. A path NOT under a
- * `.planctl/{epics,tasks}` dir, or not ending in `.json`, returns `null` — the
- * callback then skips it (the in-callback filter the ignore globs can't express).
+ * Classify a watched path as an epic file, a task file, a task runtime-state
+ * file, or neither, by matching the planctl layout. Uses the platform path
+ * separator so it works under any root depth. A path NOT matching one of the
+ * shapes returns `null` — the callback then skips it (the in-callback filter
+ * the ignore globs can't express).
+ *
+ * Recognised shapes:
+ * - `.planctl/epics/<id>.json` (3-segment tail) → `"epic"`
+ * - `.planctl/tasks/<id>.json` (3-segment tail) → `"task"`
+ * - `.planctl/state/tasks/<id>.state.json` (4-segment tail) → `"task-state"`
+ *
+ * The 3-segment check is tried first so an `.json`-suffixed file under a
+ * 3-tail layout never falls through to the 4-tail probe. The 4-tail probe
+ * matches the planctl `LocalFileStateStore` shape (see
+ * `apps/planctl/planctl/store.py:151`); files there end in `.state.json` so a
+ * stray `*.json` (non-state) under `.planctl/state/tasks/` rejects.
  *
  * Pure — does no I/O. Exported for unit reach.
  */
@@ -245,23 +270,32 @@ export function classifyPlanPath(path: string): PlanKind | null {
   if (!path.endsWith(".json")) {
     return null;
   }
-  // Split into segments; the file must sit directly inside `.planctl/epics` or
-  // `.planctl/tasks` (the planctl layout). Match the trailing
-  // `.planctl / <epics|tasks> / <file>.json` triple.
   const segments = path.split(sep);
   const n = segments.length;
-  if (n < 3) {
+  // 3-segment tail: `.planctl/<epics|tasks>/<file>.json`.
+  if (n >= 3 && segments[n - 3] === ".planctl") {
+    const dir = segments[n - 2];
+    if (dir === "epics") {
+      return "epic";
+    }
+    if (dir === "tasks") {
+      return "task";
+    }
+    // Other `.planctl/<dir>/*.json` shapes (e.g. `specs/`) fall through and
+    // reject below — they are not our concern.
     return null;
   }
-  if (segments[n - 3] !== ".planctl") {
-    return null;
-  }
-  const dir = segments[n - 2];
-  if (dir === "epics") {
-    return "epic";
-  }
-  if (dir === "tasks") {
-    return "task";
+  // 4-segment tail: `.planctl/state/tasks/<id>.state.json`. The filename MUST
+  // end in `.state.json` (the planctl LocalFileStateStore convention); a
+  // stray `*.json` (non-state) under this subtree rejects.
+  if (
+    n >= 4 &&
+    segments[n - 4] === ".planctl" &&
+    segments[n - 3] === "state" &&
+    segments[n - 2] === "tasks" &&
+    segments[n - 1].endsWith(".state.json")
+  ) {
+    return "task-state";
   }
   return null;
 }
@@ -318,9 +352,66 @@ interface RawTask {
   depends_on?: unknown;
 }
 
+/**
+ * Raw planctl runtime-state JSON shape — only the field we project. The state
+ * file (`.planctl/state/tasks/<task_id>.state.json`) is written by planctl
+ * `LocalFileStateStore` (`apps/planctl/planctl/store.py:151`) and carries
+ * `assignee` / `claim_note` / `claimed_at` / `evidence` / `status` /
+ * `updated_at`; keeper only ingests `status`.
+ */
+interface RawTaskState {
+  status?: unknown;
+}
+
 /** Coerce a value to a non-empty string, else null. */
 function asString(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+/**
+ * Derive the planctl task id from a state-file path:
+ * `.../.planctl/state/tasks/<task_id>.state.json` → `<task_id>`. Returns null
+ * if the basename does not end in `.state.json` (caller has already
+ * classified — this stays a pure transform on the matched shape).
+ *
+ * Pure. Exported for unit reach.
+ */
+export function taskIdFromStatePath(path: string): string | null {
+  const segments = path.split(sep);
+  const base = segments[segments.length - 1];
+  const suffix = ".state.json";
+  if (!base.endsWith(suffix)) {
+    return null;
+  }
+  const id = base.slice(0, -suffix.length);
+  return id.length > 0 ? id : null;
+}
+
+/**
+ * Map a state-file path
+ * `.../.planctl/state/tasks/<task_id>.state.json` to the sibling task
+ * definition file path `.../.planctl/tasks/<task_id>.json`. Pure path
+ * arithmetic — does no I/O. Returns null on a shape mismatch (caller has
+ * already classified, so this is defensive only).
+ */
+export function taskDefPathFromStatePath(statePath: string): string | null {
+  const segments = statePath.split(sep);
+  const n = segments.length;
+  if (
+    n < 4 ||
+    segments[n - 4] !== ".planctl" ||
+    segments[n - 3] !== "state" ||
+    segments[n - 2] !== "tasks"
+  ) {
+    return null;
+  }
+  const taskId = taskIdFromStatePath(statePath);
+  if (taskId === null) {
+    return null;
+  }
+  // Replace the trailing `state/tasks/<id>.state.json` with `tasks/<id>.json`.
+  const planctlPrefix = segments.slice(0, n - 3);
+  return [...planctlPrefix, "tasks", `${taskId}.json`].join(sep);
 }
 
 /**
@@ -342,6 +433,46 @@ const APPROVAL_VALUES: ReadonlySet<string> = new Set([
   "rejected",
   "pending",
 ]);
+
+/**
+ * The fixed set of valid planctl runtime-status enum values
+ * (`.planctl/state/tasks/<id>.state.json`'s top-level `status` field). Mirrors
+ * the {@link APPROVAL_VALUES} pattern.
+ */
+const RUNTIME_STATUS_VALUES: ReadonlySet<string> = new Set([
+  "todo",
+  "in_progress",
+  "done",
+  "blocked",
+]);
+
+/**
+ * Coerce a value off a state file to the runtime-status enum. A valid enum
+ * string passes through; a missing field defaults silently to `"todo"`
+ * (mirrors planctl's `merge_task_state` convention — a task with no state file
+ * reads `todo` everywhere); any other value (wrong type, typo, garbage)
+ * coerces to `"todo"` with a stderr log via `onInvalid` — the CLAUDE.md "safe
+ * value" invariant. The fold stays a pure function of the persisted file
+ * (re-fold determinism preserved).
+ *
+ * Mirrors {@link coerceApproval} so a new enum field follows the same
+ * skip-and-log discipline.
+ */
+export function coerceRuntimeStatus(
+  v: unknown,
+  onInvalid?: (raw: unknown) => void,
+): string {
+  if (v === undefined || v === null) {
+    return "todo"; // missing field — quiet default, no log
+  }
+  if (typeof v === "string" && RUNTIME_STATUS_VALUES.has(v)) {
+    return v;
+  }
+  if (onInvalid) {
+    onInvalid(v);
+  }
+  return "todo";
+}
 
 /**
  * Coerce a value off a plan file to the {@link Approval} enum. A valid enum
@@ -411,6 +542,21 @@ export class PlanScanner {
   /** path → id, so a delete can drop the right change-gate entry. */
   private readonly pathToId = new Map<string, string>();
   /**
+   * Per-task cache of the latest runtime-status enum value observed in
+   * `.planctl/state/tasks/<task_id>.state.json` (top-level `status` field).
+   * Keyed by planctl task id. A task that has never been observed in the
+   * cache reads `"todo"` (planctl's `merge_task_state` default — a fresh
+   * clone with no `state/` tree shows every task as `todo`); the
+   * {@link buildTaskMessage} caller passes this default.
+   *
+   * Updated by an `onChange` over a `task-state` path AFTER the file
+   * coerce-parses cleanly, and re-derived to `"todo"` by `onDelete` over the
+   * same path (so a state-file vanish flips the task back to `todo`, matching
+   * planctl's "no state file → todo" convention). NEVER mutated from a `task`
+   * (definition) path — the cache is the state file's projection.
+   */
+  private readonly runtimeStatusCache = new Map<string, string>();
+  /**
    * The set of planctl ids whose backing `.json` file was actually enumerated
    * on disk by a boot scan ({@link markSeen}, called from `scanPlanctlDir` for
    * EVERY file regardless of parse outcome). The boot-reconciliation
@@ -419,6 +565,12 @@ export class PlanScanner {
    * `onDelete` ever fired). Keyed by the FILENAME-derived id (file basename
    * minus `.json`), NOT a parse result: a file mid-rewrite that fails to parse
    * still has its name on disk, so it is "seen" and never spuriously retracted.
+   *
+   * State files (`.planctl/state/tasks/<id>.state.json`) are NOT enrolled in
+   * this census — they are a SIDECAR projection layered onto task ids that
+   * already enrol via their definition file under `.planctl/tasks/`. The
+   * sweep retracts on missing definition files; a sidecar's absence is the
+   * cache's `"todo"` default, not a tombstone.
    */
   private readonly seenOnDisk = new Set<string>();
 
@@ -448,13 +600,44 @@ export class PlanScanner {
    * snapshot still held in the change-gate. The tombstone is the only
    * replay-deterministic way to fold a delete — it rides through the same
    * synthetic-event pipeline as the snapshot messages.
+   *
+   * `task-state` (sidecar) deletes do NOT emit a tombstone — they flip the
+   * runtime-status cache back to the planctl default `"todo"` and re-emit a
+   * TaskSnapshot from the still-present task-definition file. The definition
+   * file is the projection's identity; a sidecar vanishing reverts state, it
+   * does not retract the task.
    */
   onDelete(path: string): void {
+    const kind = classifyPlanPath(path);
+    if (kind === "task-state") {
+      // Sidecar delete: drop the cache entry (reverts the task to the planctl
+      // default "todo") and re-emit a TaskSnapshot from the still-present
+      // task-definition file. A state-file path is NOT tracked in
+      // `pathToId` (the cache key is the task id directly), so there is no
+      // entry to drop there.
+      const taskId = taskIdFromStatePath(path);
+      if (taskId === null) {
+        return;
+      }
+      const hadCache = this.runtimeStatusCache.has(taskId);
+      this.runtimeStatusCache.delete(taskId);
+      if (!hadCache) {
+        // The cache was already empty (reading "todo"); deleting a never-cached
+        // sidecar can't change the projection. Skip the re-emit.
+        return;
+      }
+      const defPath = taskDefPathFromStatePath(path);
+      if (defPath === null) {
+        return;
+      }
+      this.reemitTaskFromDef(defPath);
+      return;
+    }
+
     const id = this.pathToId.get(path);
     if (id === undefined) {
       return; // never folded this path — nothing to retract.
     }
-    const kind = classifyPlanPath(path);
     if (kind === "epic") {
       this.onSnapshot({ kind: "plan-epic-deleted", id });
     } else if (kind === "task") {
@@ -475,10 +658,78 @@ export class PlanScanner {
         }
       }
       this.onSnapshot({ kind: "plan-task-deleted", id, epicId });
+      // Definition file is gone: drop the runtime-status cache too, so a
+      // re-created task file starts from the planctl "todo" default rather
+      // than a stale cached value.
+      this.runtimeStatusCache.delete(id);
     }
     // Drop the change-gate so a re-created file re-emits its snapshot.
     this.pathToId.delete(path);
     this.lastEmitted.delete(id);
+  }
+
+  /**
+   * Read the task-definition file at `defPath` (if present) and re-emit a
+   * TaskSnapshot composed with the latest cached `runtimeStatus`. Used by
+   * the `task-state` change/delete arms — the sidecar carries only the
+   * runtime field, but the snapshot the reducer folds is full.
+   *
+   * A missing/unreadable/malformed definition file is skip-and-logged
+   * without emitting (mirrors {@link onChange}); the next true `task` event
+   * will replay through the same path.
+   */
+  private reemitTaskFromDef(defPath: string): void {
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(defPath);
+    } catch {
+      // Definition file absent (or read-vs-delete race) — the sidecar
+      // changed for a task whose definition hasn't appeared yet. The cache
+      // already updated; when the def lands, its `task` `onChange` reads
+      // the cache and emits correctly.
+      return;
+    }
+    if (!st.isFile() || st.size > MAX_PLAN_FILE_BYTES) {
+      return;
+    }
+    let text: string;
+    try {
+      text = readFileSync(defPath, "utf8");
+    } catch (err) {
+      this.log(
+        `[plan-worker] read failed for ${defPath}: ${stringifyErr(err)}`,
+      );
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (err) {
+      this.log(
+        `[plan-worker] malformed JSON in ${defPath}: ${stringifyErr(err)}`,
+      );
+      return;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      return;
+    }
+    const raw = parsed as RawTask;
+    const id = asString(raw.id);
+    if (id === null) {
+      return;
+    }
+    const runtimeStatus = this.runtimeStatusCache.get(id) ?? "todo";
+    const msg = buildTaskMessage(raw, runtimeStatus, this.log);
+    if (msg === null) {
+      return;
+    }
+    this.pathToId.set(defPath, msg.id);
+    const serialized = JSON.stringify(msg);
+    if (this.lastEmitted.get(msg.id) === serialized) {
+      return;
+    }
+    this.lastEmitted.set(msg.id, serialized);
+    this.onSnapshot(msg);
   }
 
   /**
@@ -530,14 +781,56 @@ export class PlanScanner {
       return;
     }
 
+    // `task-state` (sidecar) updates the per-task runtime-status cache and
+    // re-emits a TaskSnapshot composed against the sibling definition file.
+    // The sidecar carries only `status`; the projection event is wholesale,
+    // so the def file is read and merged in `reemitTaskFromDef`. A malformed
+    // `status` value safe-falls-through to `"todo"` via `coerceRuntimeStatus`
+    // (the fold never throws).
+    if (kind === "task-state") {
+      const taskId = taskIdFromStatePath(path);
+      if (taskId === null) {
+        return;
+      }
+      const raw = parsed as RawTaskState;
+      const runtimeStatus = coerceRuntimeStatus(raw.status, (bad) => {
+        this.log(
+          `[plan-worker] invalid runtime status in ${path}: ${JSON.stringify(bad)}; defaulting to "todo"`,
+        );
+      });
+      const prior = this.runtimeStatusCache.get(taskId) ?? "todo";
+      this.runtimeStatusCache.set(taskId, runtimeStatus);
+      if (prior === runtimeStatus) {
+        // Same value as already cached: the composed TaskSnapshot wouldn't
+        // change and the change-gate would suppress it anyway. Skip the
+        // re-emit work.
+        return;
+      }
+      const defPath = taskDefPathFromStatePath(path);
+      if (defPath === null) {
+        return;
+      }
+      this.reemitTaskFromDef(defPath);
+      return;
+    }
+
     // Pass the scanner's own `log` so a malformed `approval` field is logged
     // through the same sink as every other skip-and-log (stderr in production,
     // captured in tests). The build* functions stay pure otherwise — every
     // other coercion result is a return value, not a side effect.
-    const msg =
-      kind === "epic"
-        ? buildEpicMessage(parsed as RawEpic, this.log)
-        : buildTaskMessage(parsed as RawTask, this.log);
+    let msg: PlanEpicMessage | PlanTaskMessage | null;
+    if (kind === "epic") {
+      msg = buildEpicMessage(parsed as RawEpic, this.log);
+    } else {
+      // `kind === "task"`: thread the cached runtime status (default `"todo"`
+      // when never observed) so the composed TaskSnapshot carries the sidecar
+      // field even when the state file hasn't been read yet.
+      const raw = parsed as RawTask;
+      const id = asString(raw.id);
+      const runtimeStatus =
+        id !== null ? (this.runtimeStatusCache.get(id) ?? "todo") : "todo";
+      msg = buildTaskMessage(raw, runtimeStatus, this.log);
+    }
     if (msg === null) {
       // No usable id — can't key the projection. Skip-and-log.
       this.log(`[plan-worker] ${path} has no usable id; skipping`);
@@ -715,14 +1008,28 @@ export function buildEpicMessage(
 }
 
 /**
- * Build a `plan-task` message from a parsed task JSON, or null when the file has
- * no usable id. The number is derived from the id; status is DERIVED
- * (`worker_done_at` present → "done" else "open" — planctl tasks carry no
- * `status` field). Other fields are taken verbatim. `approval` matches
- * {@link buildEpicMessage}'s coercion semantics.
+ * Build a `plan-task` message from a parsed task JSON + the task's current
+ * runtime status (carried in the sibling `.planctl/state/tasks/<id>.state.json`
+ * file). Returns null when the task JSON has no usable id.
+ *
+ * Field derivation:
+ * - `workerPhase` is DERIVED from the task definition: `worker_done_at`
+ *   present → `"done"` else `"open"`. Surfaces the same compressed signal the
+ *   field used to carry under the legacy `status` name.
+ * - `runtimeStatus` is the planctl-native enum carried by the state file —
+ *   passed in by the caller (the {@link PlanScanner}, which caches the last
+ *   per-task value). When absent / never-observed, the caller passes `"todo"`
+ *   (planctl's `merge_task_state` default).
+ * - `approval` follows the {@link buildEpicMessage} coercion semantics.
+ *
+ * The OBJECT-LITERAL SLOT ORDER below is load-bearing — the change-gate
+ * compares `JSON.stringify` output byte-for-byte, and the seed reconstruction
+ * in {@link seedFromDb} must produce identical key order or every task
+ * re-emits a synthetic snapshot on every daemon boot.
  */
 export function buildTaskMessage(
   raw: RawTask,
+  runtimeStatus: string = "todo",
   log: (msg: string) => void = (m) => console.error(m),
 ): PlanTaskMessage | null {
   const id = asString(raw.id);
@@ -741,7 +1048,8 @@ export function buildTaskMessage(
     number: taskNumberFromId(id),
     title: asString(raw.title),
     targetRepo: asString(raw.target_repo),
-    status: asString(raw.worker_done_at) !== null ? "done" : "open",
+    workerPhase: asString(raw.worker_done_at) !== null ? "done" : "open",
+    runtimeStatus,
     approval,
     dependsOn: asStringArray(raw.depends_on),
   };
@@ -907,7 +1215,13 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       epic_id: string | null;
       title: string | null;
       target_repo: string | null;
-      status: string | null;
+      // Legacy column name in the embedded JSON — pre-schema-bump rows carry
+      // `status`; post-bump rows carry `worker_phase`. Both are read
+      // defensively (whichever is present feeds `workerPhase`) so the seed
+      // reconstruction works across the migration window.
+      status?: string | null;
+      worker_phase?: string | null;
+      runtime_status?: string | null;
       approval?: unknown;
       depends_on?: unknown;
     }[] = [];
@@ -931,9 +1245,16 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
         number: taskNumberFromId(t.task_id),
         title: t.title,
         targetRepo: t.target_repo,
-        // The projection stores the derived status verbatim; default to "open"
-        // for a (legacy) NULL so the reconstructed seed matches a fresh scan.
-        status: t.status ?? "open",
+        // The projection stores the derived worker-phase verbatim under
+        // `worker_phase` (post-bump) or the legacy `status` key (pre-bump);
+        // read whichever is present and default to "open" for a NULL so the
+        // reconstructed seed matches a fresh scan.
+        workerPhase: t.worker_phase ?? t.status ?? "open",
+        // The projection stores the planctl-native runtime status under
+        // `runtime_status`; default to "todo" for a (legacy / pre-bump) NULL
+        // so the reconstructed seed matches a fresh scan whose state file
+        // hasn't been read yet (planctl's `merge_task_state` convention).
+        runtimeStatus: t.runtime_status ?? "todo",
         // Same defensive coercion as buildTaskMessage so the seed is
         // byte-identical with what a fresh scan would emit; a legacy task
         // element without `approval` reconstructs to "pending" (matches the

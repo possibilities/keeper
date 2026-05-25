@@ -173,11 +173,16 @@ the native value" is the default.
 - **No prise/env-var integration, multi-session lineage, or harness_meta** — out
   of scope.
 - **Plans are READ-ONLY *except for the `approval` field***. The plan worker
-  watches the configured roots' `.planctl/{epics,tasks}` trees and folds
-  snapshots into the `epics` projection (each epic embeds its tasks as a JSON
-  array — both carrying `approval` — its plan/close-verb jobs as a JSON array,
-  and each task element embeds its own work-verb jobs as a nested JSON array
-  — no peer `tasks` or `epic_jobs` collection or table) served over the same
+  watches the configured roots' `.planctl/{epics,tasks}` trees AND the
+  `.planctl/state/tasks/` sidecar tree (planctl's `LocalFileStateStore`
+  writes `<task_id>.state.json` files there carrying the runtime status
+  `todo|in_progress|done|blocked`) and folds snapshots into the `epics`
+  projection — a task-state-file change re-emits the task's `TaskSnapshot`
+  with a fresh `runtime_status` field composed against the sibling task
+  definition. Each epic embeds its tasks as a JSON array — both carrying
+  `approval` — its plan/close-verb jobs as a JSON array, and each task
+  element embeds its own work-verb jobs as a nested JSON array — no peer
+  `tasks` or `epic_jobs` collection or table — served over the same
   socket. Jobs fan into the embedded arrays from the reducer's jobs-side writes
   via the `syncJobIntoEpic` helper, which runs INSIDE the same `BEGIN IMMEDIATE`
   transaction as the jobs write + cursor advance, so the embedded arrays are a

@@ -984,7 +984,11 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
       task_number: number | null;
       title: string | null;
       target_repo: string | null;
-      status: string | null;
+      // Schema v19: legacy `status` was renamed to `worker_phase` (derived
+      // worker-phase binary) to free up `runtime_status` (planctl-native
+      // enum) as a sibling field. Both ride inside the embedded element.
+      worker_phase: string | null;
+      runtime_status: string;
     }
     const task = await retryUntil(() => {
       const row = reader
@@ -1007,7 +1011,11 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
     expect(task.task_number).toBe(1);
     expect(task.title).toBe("First plans task");
     expect(task.target_repo).toBe("/tmp/keeper-e2e-repo");
-    expect(task.status).toBe("open");
+    // Schema v19: assert both task-status fields. `worker_phase` is the
+    // derived binary (was `status`); `runtime_status` defaults to "todo"
+    // when the task has no `.planctl/state/tasks/<id>.state.json` sidecar.
+    expect(task.worker_phase).toBe("open");
+    expect(task.runtime_status).toBe("todo");
 
     // --- UDS subscribe over the epics collection: query → result, then a live
     // patch when the epic file changes (state-on-disk → snapshot → fold). ---
@@ -1130,14 +1138,17 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
         );
       }
       // The embedded array (a decoded `Task[]` on the wire) carries the task
-      // with its flipped status.
+      // with its flipped worker-phase. Schema v19: the legacy `status` blob
+      // field is read defensively (`worker_phase ?? status`) by the reducer
+      // for re-fold determinism across the v18→v19 boundary, so a pre-v19
+      // shape with `status: "done"` lands as `worker_phase: "done"`.
       const embedded = taskPatch.row.tasks as {
         task_id: string;
-        status: string;
+        worker_phase: string;
       }[];
       expect(Array.isArray(embedded)).toBe(true);
       const folded = embedded.find((t) => t.task_id === taskId);
-      expect(folded?.status).toBe("done");
+      expect(folded?.worker_phase).toBe("done");
 
       // --- deletion retraction: a TaskDeleted tombstone splices the element
       // out of the parent epic's array; the epic patches with `tasks` empty.

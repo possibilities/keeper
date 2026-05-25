@@ -42,7 +42,12 @@ function makeTask(overrides: Partial<Task>): Task {
     task_number: 1,
     title: "task",
     target_repo: null,
-    status: "open",
+    // Schema v19: `status` renamed to `worker_phase` (derived binary —
+    // open|done) and `runtime_status` added (planctl-native enum, default
+    // "todo"). Both ride inside the embedded element on the parent epic's
+    // `tasks` array.
+    worker_phase: "open",
+    runtime_status: "todo",
     approval: "pending",
     depends_on: [],
     jobs: [],
@@ -141,7 +146,7 @@ function run(
 test("predicate 1 (terminal-completed) wins over 5 (own-progress-main)", () => {
   // A completed task whose embedded job hasn't transitioned to `stopped` yet.
   const task = makeTask({
-    status: "done",
+    worker_phase: "done",
     approval: "approved",
     jobs: [makeEmbeddedJob({ state: "working" })],
   });
@@ -151,7 +156,7 @@ test("predicate 1 (terminal-completed) wins over 5 (own-progress-main)", () => {
 });
 
 test("predicate 1 wins over 2 (epic-not-validated)", () => {
-  const task = makeTask({ status: "done", approval: "approved" });
+  const task = makeTask({ worker_phase: "done", approval: "approved" });
   const epic = makeEpic({ tasks: [task], last_validated_at: null });
   const snap = run([epic]);
   expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
@@ -176,7 +181,7 @@ test("predicate 2 (epic-not-validated) wins over 3 (planner-running)", () => {
 test("predicate 3 (planner-running) wins over 4 (own-approval)", () => {
   // Even an approved+done task blocks when a planner is working on the epic.
   // (Predicate 1 doesn't fire because approval is `pending`, not `approved`.)
-  const task = makeTask({ status: "open", approval: "approved" });
+  const task = makeTask({ worker_phase: "open", approval: "approved" });
   const epic = makeEpic({
     tasks: [task],
     job_links: [{ kind: "creator", job_id: "planner-job" }],
@@ -192,7 +197,7 @@ test("predicate 3 (planner-running) wins over 4 (own-approval)", () => {
 
 test("predicate 4 own-approval: job-rejected wins over job-pending", () => {
   // Rejected ABOVE pending — the spec invariant.
-  const task = makeTask({ status: "done", approval: "rejected" });
+  const task = makeTask({ worker_phase: "done", approval: "rejected" });
   const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
   expect(snap.perTask.get(task.task_id)).toEqual(
@@ -203,7 +208,7 @@ test("predicate 4 own-approval: job-rejected wins over job-pending", () => {
 test("predicate 4 wins over 5 (own-progress-main)", () => {
   // A rejected task whose worker is still running shows `job-rejected`.
   const task = makeTask({
-    status: "open",
+    worker_phase: "open",
     approval: "rejected",
     jobs: [makeEmbeddedJob({ state: "working" })],
   });
@@ -231,7 +236,7 @@ test("predicate 6 (own-progress-sub) wins over 7 (dep-on-task)", () => {
   // This row's sub-agent running. Upstream completed. Sub still blocks.
   const upstream = makeTask({
     task_id: "fn-1-foo.1",
-    status: "done",
+    worker_phase: "done",
     approval: "approved",
   });
   const dependent = makeTask({
@@ -262,7 +267,7 @@ test("predicate 7 (dep-on-task) wins over 8 (dep-on-epic)", () => {
   });
   const upstreamTask = makeTask({
     task_id: "fn-1-foo.1",
-    status: "open",
+    worker_phase: "open",
   });
   const dependent = makeTask({
     task_id: "fn-1-foo.2",
@@ -420,7 +425,7 @@ test("epic header rollup: all tasks done+approved + close blocked → header inh
   // is ready. To produce a blocked close, mark epic.approval=rejected.
   const t = makeTask({
     task_id: "fn-1-foo.1",
-    status: "done",
+    worker_phase: "done",
     approval: "approved",
   });
   const epic = makeEpic({ tasks: [t], approval: "rejected" });
@@ -436,7 +441,7 @@ test("epic header rollup: all tasks done+approved + close blocked → header inh
 test("epic header rollup: completed close → completed header", () => {
   const t = makeTask({
     task_id: "fn-1-foo.1",
-    status: "done",
+    worker_phase: "done",
     approval: "approved",
   });
   const epic = makeEpic({
@@ -451,19 +456,19 @@ test("epic header rollup: completed close → completed header", () => {
 test("epic header rollup: mixed states — reason from FIRST non-completed in traversal", () => {
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
-    status: "done",
+    worker_phase: "done",
     approval: "approved",
   });
   const t2 = makeTask({
     task_id: "fn-1-foo.2",
     task_number: 2,
-    status: "done",
+    worker_phase: "done",
     approval: "rejected", // first non-completed in traversal
   });
   const t3 = makeTask({
     task_id: "fn-1-foo.3",
     task_number: 3,
-    status: "done",
+    worker_phase: "done",
     approval: "pending", // would fire job-pending if reached first
   });
   const epic = makeEpic({ tasks: [t1, t2, t3] });
@@ -657,7 +662,7 @@ test("formatPill renders the three tags + every reason kind", () => {
 test("close row: every real task completed → close ready (then dep-on-task-synthetic-close passes)", () => {
   const t = makeTask({
     task_id: "fn-1-foo.1",
-    status: "done",
+    worker_phase: "done",
     approval: "approved",
   });
   const epic = makeEpic({ tasks: [t] });
@@ -668,18 +673,18 @@ test("close row: every real task completed → close ready (then dep-on-task-syn
 test("close row: any non-completed task → dep-on-task with FIRST non-completed id", () => {
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
-    status: "done",
+    worker_phase: "done",
     approval: "approved",
   });
   const t2 = makeTask({
     task_id: "fn-1-foo.2",
     task_number: 2,
-    status: "open",
+    worker_phase: "open",
   });
   const t3 = makeTask({
     task_id: "fn-1-foo.3",
     task_number: 3,
-    status: "open",
+    worker_phase: "open",
   });
   const epic = makeEpic({ tasks: [t1, t2, t3] });
   const snap = run([epic]);

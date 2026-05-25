@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1414,6 +1414,46 @@ function migrate(db: Database): void {
       )?.value ?? "0",
     );
     if (storedVersionV18 < 18) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM subagent_invocations");
+    }
+
+    // v18→v19: rename the legacy `status` key on every `epics.tasks` embedded
+    // element to `worker_phase`, and add the planctl-native `runtime_status`
+    // sibling (defaults to `"todo"`). Both fields ride the embedded JSON
+    // array — there is no schema column to ALTER. The reducer is the SINGLE
+    // source of truth for the embedded shape (`projectPlanRow` +
+    // `syncJobIntoEpic`'s OLD-element carve-out); a rewind-and-redrain
+    // replays the event log through the v19 reducer and re-emits every
+    // embedded element with the new key shape.
+    //
+    // Why rewind-and-redrain (not an in-place UPDATE that hand-rewrites the
+    // JSON): historical pre-v19 TaskSnapshot events still carry `status` in
+    // their `data` blob (immutable event log). Without a re-fold, an in-place
+    // JSON rewrite would converge once, but the NEXT `syncJobIntoEpic`
+    // fan-out triggered by a `jobs` write would spread the OLD pre-rewrite
+    // shape from the row it read back (the carve-out preserves OLD scalars),
+    // re-introducing `status` on the touched task element while neighbours
+    // kept `worker_phase`. The re-fold guarantees one shape across every
+    // embedded element by deriving them all from the same v19 reducer pass.
+    // The reducer reads `worker_phase ?? status` so a pre-v19 blob still
+    // folds deterministically (re-fold determinism preserved across the
+    // boundary).
+    //
+    // Non-idempotent — version-guarded by the `meta` row written by a PRIOR
+    // migrate() so a re-open of an already-migrated v19+ DB skips cleanly.
+    // The boot drain after migrate() rebuilds `jobs` / `epics` /
+    // `subagent_invocations` from the event log.
+    const storedVersionV19 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV19 < 19) {
       db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
       db.run("DELETE FROM jobs");
       db.run("DELETE FROM epics");

@@ -1594,14 +1594,20 @@ function getEpic(epicId: string) {
   } | null;
 }
 
-/** The element shape stored in `epics.tasks` as of schema v7. */
+/**
+ * The element shape stored in `epics.tasks` as of schema v19. Schema v7
+ * introduced the embedded array; v13 added `approval`; v19 renamed `status`
+ * to `worker_phase` and added the planctl-native `runtime_status` sibling
+ * (defaults to `"todo"`).
+ */
 interface EmbeddedTask {
   task_id: string;
   epic_id: string | null;
   task_number: number | null;
   title: string | null;
   target_repo: string | null;
-  status: string | null;
+  worker_phase?: string | null;
+  runtime_status?: string;
   approval?: "approved" | "rejected" | "pending";
   depends_on: string[];
   jobs?: unknown[];
@@ -1672,7 +1678,7 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
   expect(getCursor()).toBe(id);
 });
 
-test("TaskSnapshot folds into the parent epic's tasks array with all element fields + derived status", () => {
+test("TaskSnapshot folds into the parent epic's tasks array with all element fields + derived worker_phase + runtime_status", () => {
   // Seed the parent epic first so the task folds via the UPDATE path.
   epicSnapshotEvent("fn-1-add-oauth", {
     epic_number: 1,
@@ -1684,7 +1690,13 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     task_number: 3,
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
-    status: "done",
+    // Schema v19: the producer (plan-worker → daemon → synthetic event)
+    // ships BOTH `worker_phase` (renamed from `status`) and `runtime_status`
+    // (planctl-native enum). The legacy `status` is still read defensively
+    // (`worker_phase ?? status`) for re-fold determinism across the v18→v19
+    // boundary, but new events ship the new key shape.
+    worker_phase: "done",
+    runtime_status: "in_progress",
   });
   drainAll();
   const task = getTask("fn-1-add-oauth.3");
@@ -1694,7 +1706,8 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     task_number: 3,
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
-    status: "done",
+    worker_phase: "done",
+    runtime_status: "in_progress",
     // No `approval` in the blob → the embedded element defaults to "pending"
     // (matches the plan-worker's coercion + the epic-level schema default).
     approval: "pending",
@@ -2440,7 +2453,7 @@ test("Killed-mismatch path does NOT fan into the embedded entry", () => {
   // The jobs row stayed unchanged → no sync fired, embedded entry stayed put.
   const after = getEpicJobs("fn-7-x")[0];
   expect(after?.state).toBe("stopped");
-  expect(after?.last_event_id).toBe(beforeEventId!);
+  expect(after?.last_event_id).toBe(beforeEventId ?? 0);
 });
 
 test("Killed matching path DOES fan into the embedded entry (state -> killed)", () => {
@@ -2487,7 +2500,7 @@ test("Stop on a still-terminal job does NOT fan (no write happened)", () => {
   insertEvent({ hook_event: "Stop", session_id: "sess-stop-terminal" });
   drainAll();
   expect(getEpicJobs("fn-2-z")[0]?.state).toBe("ended");
-  expect(getEpicJobs("fn-2-z")[0]?.last_event_id).toBe(beforeId!);
+  expect(getEpicJobs("fn-2-z")[0]?.last_event_id).toBe(beforeId ?? 0);
 });
 
 test("multiple plan_ref jobs sort (created_at desc, job_id asc)", () => {
@@ -2568,15 +2581,99 @@ test("TaskSnapshot RMW preserves the task element's jobs sub-array", () => {
       task_number: 2,
       title: "Real Task",
       target_repo: "/repo",
-      status: "open",
+      // Schema v19: ship the new field names; the reducer also reads the
+      // legacy `status` defensively (`worker_phase ?? status`) for re-fold
+      // determinism across the boundary.
+      worker_phase: "open",
+      runtime_status: "todo",
     }),
   });
   drainAll();
   const task = getTask("fn-5-pre.2");
   expect(task?.title).toBe("Real Task");
-  expect(task?.status).toBe("open");
+  expect(task?.worker_phase).toBe("open");
+  expect(task?.runtime_status).toBe("todo");
   expect(getTaskJobs("fn-5-pre.2").length).toBe(1);
   expect(getTaskJobs("fn-5-pre.2")[0]?.job_id).toBe("sess-pre-task");
+});
+
+test("syncJobIntoEpic carve-out preserves worker_phase + runtime_status across a jobs-write fan-out (schema v19)", () => {
+  // The OLD-element carve-out at `reducer.ts:syncJobIntoEpic` spreads the
+  // prior task element's scalars when re-attaching the freshly-merged jobs
+  // sub-array (`{ ...oldTask, jobs: nextTaskJobs }`). Schema v19 added two
+  // new scalar fields (`worker_phase` + `runtime_status`); without the spread
+  // they'd be stomped to NULL/"todo" on every job tick. This test pins the
+  // invariant: fold a TaskSnapshot first (planting both fields), then drive
+  // a jobs-write that fans into the same task's embedded `jobs` sub-array,
+  // and assert both fields survive verbatim.
+
+  // 1. Plant a TaskSnapshot carrying both new fields. The reducer writes
+  // the embedded task element with `worker_phase: "done"` and
+  // `runtime_status: "in_progress"`.
+  insertEvent({
+    hook_event: "TaskSnapshot",
+    session_id: "fn-5-carve.3",
+    data: JSON.stringify({
+      epic_id: "fn-5-carve",
+      task_number: 3,
+      title: "Carve task",
+      target_repo: "/repo",
+      worker_phase: "done",
+      runtime_status: "in_progress",
+    }),
+  });
+  drainAll();
+  // Sanity: the snapshot landed.
+  const before = getTask("fn-5-carve.3");
+  expect(before?.worker_phase).toBe("done");
+  expect(before?.runtime_status).toBe("in_progress");
+
+  // 2. Drive a `work::` SessionStart whose `spawn_name` keys this task —
+  // the jobs row inserts with `plan_ref` set, `syncIfPlanRef` fires, and
+  // `syncJobIntoEpic` runs the OLD-element spread.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-carve-worker",
+    spawn_name: "work::fn-5-carve.3",
+  });
+  drainAll();
+
+  // 3. The carve-out invariant: BOTH new scalars must survive the fan-out
+  // verbatim. A regression here (e.g. an inline rebuild that omits the
+  // spread) would stomp them to NULL / "todo".
+  const after = getTask("fn-5-carve.3");
+  expect(after?.worker_phase).toBe("done");
+  expect(after?.runtime_status).toBe("in_progress");
+  // And the jobs sub-array picked up the new session.
+  expect(getTaskJobs("fn-5-carve.3").length).toBe(1);
+  expect(getTaskJobs("fn-5-carve.3")[0]?.job_id).toBe("sess-carve-worker");
+});
+
+test("TaskSnapshot reducer defensively folds a legacy `status` blob (no `worker_phase`/`runtime_status`) so pre-v19 events re-fold deterministically", () => {
+  // Re-fold determinism across the v18→v19 boundary: the immutable event
+  // log carries pre-v19 TaskSnapshot blobs that have `status: "open"` and
+  // NO `worker_phase` / `runtime_status` keys. The reducer reads
+  // `worker_phase ?? status` (= "open") and defaults `runtime_status` to
+  // "todo" per planctl's `merge_task_state` convention. Without those
+  // defensive reads, a from-scratch re-fold of an existing DB would either
+  // throw or land NULL on the embedded element, breaking the byte-identical
+  // re-fold invariant.
+  insertEvent({
+    hook_event: "TaskSnapshot",
+    session_id: "fn-5-legacy.1",
+    data: JSON.stringify({
+      epic_id: "fn-5-legacy",
+      task_number: 1,
+      title: "Legacy",
+      target_repo: "/repo",
+      // Note: legacy `status` key only, no v19 keys.
+      status: "open",
+    }),
+  });
+  drainAll();
+  const task = getTask("fn-5-legacy.1");
+  expect(task?.worker_phase).toBe("open");
+  expect(task?.runtime_status).toBe("todo");
 });
 
 test("dual-array fan-out: epic.jobs + task.jobs co-populated, survive EpicSnapshot ON CONFLICT", () => {
