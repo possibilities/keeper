@@ -268,8 +268,17 @@ one connection); `approve.ts` is the RPC client (single-shot `rpc` →
   timeline. Each epic renders as a header line —
   `({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated]
   [ready|completed|blocked:<reason>]` — followed by indented task lines
-  (with `[{status}] [{approval}] [ready|completed|blocked:<reason>]`
-  pills) and a final "Quality audit and close" line for the epic itself.
+  (with `[{runtime_status}] [{worker_phase}] [{approval}]
+  [ready|completed|blocked:<reason>]` pills — three native vocabularies
+  side-by-side: the planctl runtime enum `todo|in_progress|done|blocked`,
+  the derived worker-phase binary `open|done`, and approval
+  `approved|rejected|pending`) and a final "Quality audit and close"
+  line for the epic itself. Sub-agent invocations nest one indent
+  level under their owning job row as `{type}: {desc} [<status>]`,
+  stamping the raw 5-value projection enum
+  `running|ok|failed|unknown|superseded` verbatim (no renderer-side
+  collapse or hiding — `superseded` is promoted natively by the
+  projection so the full audit trail of re-entrant attempts is visible).
   The `[validated]` / `[unvalidated]` pill reflects planctl's
   `last_validated_at` timestamp on the epic file (flipped by
   `planctl validate --epic <id>`). The `[ready] / [completed] /

@@ -6,9 +6,12 @@
  * the epics body + a `~~~` divider line + the jobs body, both refreshed
  * under the same poll/connect lifecycle so they always show the same
  * wall-clock snapshot of the daemon. `subagent_invocations` rows feed the
- * readiness pill AND nest as indented `[running] / [stopped]` lines under
- * the matching job row (in both the embedded-in-epic context and the
- * bottom jobs list), keyed on `job_id` and ordered by `turn_seq asc`.
+ * readiness pill AND nest as indented `[<status>]` lines under the
+ * matching job row (in both the embedded-in-epic context and the bottom
+ * jobs list), stamping the raw 5-value projection enum
+ * `running|ok|failed|unknown|superseded` verbatim (no client-side collapse
+ * — `superseded` is promoted natively by the projection, see task fn-605.2),
+ * keyed on `job_id` and ordered by `turn_seq asc`.
  *
  * Frame shape (one `---` lead per frame):
  *
@@ -139,10 +142,20 @@ Each epic block opens with a header line of the form:
 followed (when the epic carries job_links) by one indented creator/refiner
 line per linked session — '{title} [creator|refiner] [state]' for sessions
 present in the live jobs page, '[{job_id}] [creator|refiner]' for terminal
-or off-page sessions — then the task lines (one per embedded task), and a
-final "Quality audit and close" line for the epic itself. The [validated] /
-[unvalidated] pill reflects planctl's last_validated_at timestamp on the
-epic file — flipped by 'planctl validate --epic <id>'.
+or off-page sessions — then the task lines (one per embedded task,
+'{n}. {title} [#dep,#dep] [runtime_status] [worker_phase] [approval]' —
+the three native pills side-by-side: planctl runtime status
+'todo|in_progress|done|blocked', derived worker-phase binary 'open|done',
+and approval 'approved|rejected|pending'), and a final "Quality audit and
+close" line for the epic itself. The [validated] / [unvalidated] pill
+reflects planctl's last_validated_at timestamp on the epic file — flipped
+by 'planctl validate --epic <id>'.
+
+Sub-agent invocations nest under their owning job row as one indented
+line each — '{subagent_type}: {description} [<status>]' — where <status>
+is the raw 5-value projection enum 'running|ok|failed|unknown|superseded'.
+'superseded' is rendered verbatim (no hiding) so the audit trail of
+re-entrant attempts stays visible.
 
 The [<readiness>] pill is one of [ready], [completed], or
 [blocked:<reason>] — a pure-function verdict computed by scripts/readiness.ts
@@ -235,18 +248,6 @@ function planVerbLabel(v: unknown): string | null {
  */
 function rateLimitedPillSeg(v: unknown): string {
   return v == null ? "" : " [limited]";
-}
-
-/**
- * Map a `subagent_invocations.status` value to the nested-line pill. The
- * projection enumerates `running | ok | failed | unknown`; anything past
- * `running` reads as terminal — collapsed to `[stopped]` so the nested
- * grammar stays a binary live/done indicator. Terminal-outcome detail
- * (`ok` vs `failed` vs `unknown`) lives on the row in SQLite for callers
- * that need it; this view just signals "still spinning or not".
- */
-function subagentPill(status: unknown): "[running]" | "[stopped]" {
-  return status === "running" ? "[running]" : "[stopped]";
 }
 
 function epicNumFromId(id: string): number | null {
@@ -388,34 +389,15 @@ async function main(): Promise<void> {
   // `null` between frames (cleared on disconnect; replaced on next emit).
   let lastReadiness: ReadinessSnapshot | null = null;
 
-  /**
-   * `SubagentInvocation` extended with a computed `is_replaced` flag.
-   * A row is `is_replaced` when it is `status='running'` AND a later entry
-   * exists in the same `(job_id, subagent_type)` group — meaning a newer
-   * attempt superseded it without a clean `SubagentStop`. Computed once per
-   * frame inside `emitFrameIfChanged` from the full per-job snapshot (the
-   * only point where the complete group is available; the diff/patch path
-   * only delivers changed rows so it can't compute this accurately).
-   *
-   * Rule: within each `(job_id, subagent_type)` bucket, any
-   * `status='running'` entry whose `ts` is strictly less than the group's
-   * maximum `ts` is replaced. The entry at max `ts` is always the "current"
-   * attempt and is never flagged regardless of its status. `ts` is used
-   * rather than index position because `turn_seq` is per-(job_id,agent_id)
-   * and does not order correctly across different agent_ids sharing a job.
-   *
-   * `null`-typed entries (unknown subagent type) are skipped — we can't
-   * group them meaningfully and they're not `plan:worker-*` spawns anyway.
-   */
-  type AnnotatedInvocation = SubagentInvocation & { is_replaced: boolean };
-
-  // Per-frame `job_id → AnnotatedInvocation[]` index — built once in
+  // Per-frame `job_id → SubagentInvocation[]` index — built once in
   // `emitFrameIfChanged` from `subagentInvocations.rows` and read by
   // `subagentLinesFor` when nesting under a job row. Each bucket is
   // sorted by `turn_seq asc` so the nested list reads in invocation
   // order. `null` between frames (cleared on disconnect; replaced on
-  // next emit).
-  let lastSubagentIndex: Map<string, AnnotatedInvocation[]> | null = null;
+  // next emit). The projection now promotes `superseded` natively
+  // (schema v? — task fn-605.2), so the renderer no longer derives an
+  // `is_replaced` flag client-side; it just stamps `[${status}]` verbatim.
+  let lastSubagentIndex: Map<string, SubagentInvocation[]> | null = null;
 
   type Sock = Awaited<ReturnType<typeof Bun.connect>>;
   let currentSock: Sock | null = null;
@@ -448,14 +430,12 @@ async function main(): Promise<void> {
     if (hits === undefined || hits.length === 0) {
       return [];
     }
-    return hits
-      .filter((inv) => !inv.is_replaced)
-      .map((inv) => {
-        const type = inv.subagent_type ?? "subagent";
-        const desc = inv.description ?? "";
-        const label = desc === "" ? type : `${type}: ${desc}`;
-        return `${indent}${label} ${subagentPill(inv.status)}`;
-      });
+    return hits.map((inv) => {
+      const type = inv.subagent_type ?? "subagent";
+      const desc = inv.description ?? "";
+      const label = desc === "" ? type : `${type}: ${desc}`;
+      return `${indent}${label} [${seg(inv.status)}]`;
+    });
   }
 
   /**
@@ -556,12 +536,12 @@ async function main(): Promise<void> {
       const taskId = seg(t.task_id);
       const taskVerdict = verdictFromMap(lastReadiness?.perTask, taskId);
       lines.push(
-        // Schema v19: the embedded task element's legacy `status` was renamed
-        // to `worker_phase` (derived worker-phase binary, same compressed
-        // signal). The board reads the new key to keep the existing single-
-        // pill display unchanged; a later board-side task in this epic widens
-        // the line to render BOTH `[runtime_status] [worker_phase] [approval]`.
-        `${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.worker_phase)}] [${taskApproval}]`,
+        // Schema v19: task elements now carry both `runtime_status` (the
+        // planctl-native enum `todo|in_progress|done|blocked`) and
+        // `worker_phase` (the derived worker-phase binary `open|done`).
+        // Render both pills side-by-side with `[approval]` so the row
+        // surfaces the full native vocabulary — no client-side collapse.
+        `${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.runtime_status)}] [${seg(t.worker_phase)}] [${taskApproval}]`,
         `   [${taskId}] ${formatPill(taskVerdict)}`,
         ...renderJobLines(t.jobs),
       );
@@ -771,49 +751,20 @@ async function main(): Promise<void> {
     // Per-frame `job_id → invocations` index for `subagentLinesFor` —
     // re-entrant sub-agents within one session sit on the same `job_id`
     // bucket, ordered by `turn_seq asc` so the nested list reads in
-    // invocation order. Each entry is spread into an `AnnotatedInvocation`
-    // with `is_replaced` defaulting to false; the marking pass below flips
-    // it for superseded running entries.
-    const subIndex = new Map<string, AnnotatedInvocation[]>();
+    // invocation order. The projection now promotes `superseded` natively
+    // (task fn-605.2), so no client-side marking pass is required —
+    // `subagentLinesFor` stamps the raw `[${status}]` enum verbatim.
+    const subIndex = new Map<string, SubagentInvocation[]>();
     for (const inv of subsTyped) {
-      const annotated: AnnotatedInvocation = { ...inv, is_replaced: false };
       const arr = subIndex.get(inv.job_id);
       if (arr === undefined) {
-        subIndex.set(inv.job_id, [annotated]);
+        subIndex.set(inv.job_id, [inv]);
       } else {
-        arr.push(annotated);
+        arr.push(inv);
       }
     }
     for (const arr of subIndex.values()) {
       arr.sort((a, b) => a.turn_seq - b.turn_seq);
-      // Mark replaced: within each (job_id, subagent_type) group, any
-      // status='running' entry that is not the last in the group is
-      // superseded by a later attempt and should be hidden by renderers.
-      // Group by subagent_type (skip null — untyped entries aren't grouped).
-      const byType = new Map<string, AnnotatedInvocation[]>();
-      for (const inv of arr) {
-        if (inv.subagent_type == null) continue;
-        let bucket = byType.get(inv.subagent_type);
-        if (bucket === undefined) {
-          bucket = [];
-          byType.set(inv.subagent_type, bucket);
-        }
-        bucket.push(inv);
-      }
-      for (const group of byType.values()) {
-        // A running entry is replaced iff there is ANY later entry in the
-        // group (by `ts`). Use ts-max rather than index position: turn_seq
-        // is per-(job_id,agent_id) and doesn't order correctly across
-        // different agent_ids when multiple sessions share a job. The entry
-        // with the maximum ts is always the "current" attempt and is never
-        // replaced regardless of its status.
-        const maxTs = Math.max(...group.map((inv) => inv.ts));
-        for (const inv of group) {
-          if (inv.status === "running" && inv.ts < maxTs) {
-            inv.is_replaced = true;
-          }
-        }
-      }
     }
     lastSubagentIndex = subIndex;
     const body = renderBody();
