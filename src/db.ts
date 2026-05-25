@@ -342,7 +342,8 @@ const CREATE_V17_INDEXES = [
  *
  * Defaults match the zero-event projection:
  * - `status='running'` is the SubagentStart-time value (a row is created
- *   when SubagentStart folds; flips to `'ok'` / `'error'` on SubagentStop).
+ *   when SubagentStart folds; flips to `'ok'` / `'failed'` / `'unknown'` on
+ *   SubagentStop).
  * - `prompt_chars=0` so a row created by SubagentStart before its matching
  *   PreToolUse:Agent row reads zero — task .3's reducer backfills it via the
  *   `tool_use_id` bridge.

@@ -289,7 +289,8 @@ export interface EmbeddedJob {
  *
  * `last_event_id` bumps on every UPDATE so the wire collection's diff
  * version semantics emit patch frames as the row transitions
- * `running → ok` / `running → error` and `duration_ms` populates.
+ * `running → ok` / `running → failed` / `running → unknown` and
+ * `duration_ms` populates.
  */
 export interface SubagentInvocation {
   job_id: string;
@@ -300,7 +301,7 @@ export interface SubagentInvocation {
   subagent_type: string | null;
   description: string | null;
   prompt_chars: number;
-  status: "running" | "ok" | "error";
+  status: "running" | "ok" | "failed" | "unknown";
   duration_ms: number | null;
   last_event_id: number;
   updated_at: number;

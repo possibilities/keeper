@@ -67,7 +67,7 @@ valued `"approved" | "rejected" | "pending"`, surfaced as a pill in the
 epics client), and `subagent_invocations` (the per-job timeline of Task-tool
 subagent calls — one row per `PreToolUse:Agent` paired with its later
 `PostToolUse:Agent` via `events.tool_use_id`, carrying lifecycle status
-`running | ok | error` and a populated `duration_ms` on completion). The
+`running | ok | failed | unknown` and a populated `duration_ms` on completion). The
 surface is built so additional collections register without touching the
 wire protocol or the diff machinery. Page membership is frozen at query time,
 but each row's cells stream `patch` frames as the reducer folds new events.
@@ -437,7 +437,7 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT session_id, datetime(ts,'unixepoch','localtime'), planctl_op, planctl_target FROM events WHERE planctl_op IS NOT NULL ORDER BY id DESC LIMIT 20"
 
-# Recent per-job Task-tool subagent timeline — one row per PreToolUse:Agent paired with its PostToolUse:Agent (and lifecycle Start/Stop), status running|ok|error, duration_ms populated on SubagentStop:
+# Recent per-job Task-tool subagent timeline — one row per PreToolUse:Agent paired with its PostToolUse:Agent (and lifecycle Start/Stop), status running|ok|failed|unknown, duration_ms populated on SubagentStop:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT job_id, turn_seq, subagent_type, status, duration_ms, prompt_chars, tool_use_id FROM subagent_invocations ORDER BY job_id ASC, turn_seq ASC LIMIT 20"
 

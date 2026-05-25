@@ -524,12 +524,12 @@ test("subagent_invocations: matching job_id but status !== 'running' → ignored
   expect(snap.perTask.get(t.task_id)).toEqual({ tag: "ready" });
 });
 
-test("subagent_invocations: error status → ignored", () => {
+test("subagent_invocations: failed status → ignored", () => {
   const t = makeTask({
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [t] });
-  const subs = [makeSub({ job_id: "worker-1", status: "error" })];
+  const subs = [makeSub({ job_id: "worker-1", status: "failed" })];
   const snap = run([epic], new Map(), subs);
   expect(snap.perTask.get(t.task_id)).toEqual({ tag: "ready" });
 });
