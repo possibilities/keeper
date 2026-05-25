@@ -76,5 +76,5 @@ Two focused additions:
 - [ ] Existing `test/rpc-handlers.test.ts:87` fixture continues to pass without modification.
 
 ## Done summary
-
+Plumbed last_validated_at through schema v16 + plan-worker + reducer + collections descriptor + Epic type; scripts/board.ts now renders [validated]/[unvalidated] pill on each epic header. seedFromDb reconstruction matches buildEpicMessage byte-identically to keep the restart change-gate quiet.
 ## Evidence
