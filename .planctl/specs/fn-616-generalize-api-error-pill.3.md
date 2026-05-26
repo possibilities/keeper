@@ -66,5 +66,5 @@ Specific steps:
 - [ ] End-to-end smoke: stop keeperd, delete db, restart, force a 401 in any tracked session, observe `[failed:authentication_failed]` colored red in `bun scripts/board.ts` (TTY).
 
 ## Done summary
-
+Renamed rateLimitedPillSeg → apiErrorPillSeg(at, kind) emitting [failed:<kind>] from the (last_api_error_at, last_api_error_kind) pair, dropped PILL_COLORS.limited, added a failed:* prefix fallback to colorizePillsInLine routing all six ApiErrorKind tokens to the error bucket (mirror of blocked:* → warn). Updated three call sites + HELP block + JSDocs; six new per-kind render tests + colorizer prefix-fallback tests + defensive null-kind fallback test.
 ## Evidence
