@@ -46,10 +46,28 @@
  * (tab-separated: frame# state frame diff).
  *
  * Usage:
- *   bun scripts/autopilot.ts [--sock <path>]
+ *   bun scripts/autopilot.ts [--sock <path>] [--launch]
  *
  *   --sock <path>    Socket path override (else $KEEPER_SOCK, else the
  *                    ~/.local/state/keeper/keeperd.sock default).
+ *   --launch         Auto-dispatch on verdict edges: spawn a Ghostty
+ *                    window running the worker command on the EDGE into
+ *                    `{ tag: "ready" }` for both task rows and close
+ *                    rows; fire `notifyctl` on the EDGE into
+ *                    `{ tag: "blocked", reason: { kind: "job-pending" } }`
+ *                    (worker_phase done + approval pending). The Ghostty
+ *                    window's command is the `cd … && claude '/plan:work …'`
+ *                    line ONLY — never the approval script; approvals
+ *                    remain the human's prerogative and are what the
+ *                    notifyctl alert is for. After spawn we try
+ *                    `yabai -m window --space 5` to shove the new window
+ *                    onto space 5; yabai's absence is tolerated.
+ *                    Per-row verdict signature is carried across snapshots
+ *                    in a `Map<string,string>`; the empty initial map
+ *                    means autopilot's first paint after process start
+ *                    fires for everything currently ready / pending. The
+ *                    map is NOT cleared on reconnect — a re-paint of the
+ *                    same verdicts does not refire.
  *   --help           Show this help.
  */
 
@@ -57,6 +75,7 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
+import type { Verdict } from "../src/readiness";
 import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
@@ -65,9 +84,16 @@ import type { Epic } from "../src/types";
 
 const HELP = `keeper-autopilot — live command list over the keeper subscribe server
 
-Usage: bun scripts/autopilot.ts [--sock <path>]
+Usage: bun scripts/autopilot.ts [--sock <path>] [--launch]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
+  --launch         Auto-dispatch ready rows: spawn a Ghostty window running
+                   the worker command for each task/close row whose verdict
+                   transitions into { tag: "ready" }, and notifyctl when a
+                   task/close row transitions into "approval pending"
+                   (worker_phase done + approval pending). Tries to move
+                   the new Ghostty window to yabai space 5 if yabai is
+                   installed.
   --help           Show this help
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
@@ -210,6 +236,7 @@ async function main(): Promise<void> {
     args: Bun.argv.slice(2),
     options: {
       sock: { type: "string" },
+      launch: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -221,6 +248,7 @@ async function main(): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
+  const launchEnabled = values.launch === true;
   const log = (s: string) => process.stdout.write(`${s}\n`);
   const liveShell = createLiveShell({ enabled: true });
   let frameCount = 0;
@@ -397,10 +425,203 @@ async function main(): Promise<void> {
     }
   }
 
+  // --- --launch dispatch ---
+  //
+  // Per-row verdict signature carried across snapshots. We fire side
+  // effects (Ghostty window for "→ ready", notifyctl for "→ approval
+  // pending") on the EDGE — `prev !== cur` with `cur` being one of those
+  // two signatures. The map is INTENTIONALLY not cleared on disconnect:
+  // a reconnect's first paint will see the same signatures as the last
+  // pre-disconnect frame and produce no spurious fires. The empty initial
+  // map means autopilot's first paint DOES fire for everything currently
+  // ready / pending — that is desired: "start autopilot, things you need
+  // to do open up."
+  const lastVerdictSig = new Map<string, string>();
+
+  function verdictSignature(v: Verdict | undefined): string {
+    if (v === undefined) {
+      return "unknown";
+    }
+    if (v.tag === "ready") {
+      return "ready";
+    }
+    if (v.tag === "completed") {
+      return "completed";
+    }
+    return `blocked:${v.reason.kind}`;
+  }
+
+  /**
+   * Spawn a Ghostty window running `<command>` (already wrapped in `cd …
+   * && claude …` shape by the caller). Fire-and-forget — stdout/stderr
+   * captured into the lifecycle sidecar on failure. After the AppleScript
+   * returns we attempt `yabai -m window --space 5` to shove the newly-
+   * focused window onto space 5; yabai not being installed is fine.
+   */
+  function launchInGhostty(workerShellCommand: string, rowId: string): void {
+    const zshInvocation = `/bin/zsh -l -c ${JSON.stringify(workerShellCommand)}`;
+    const appleScript = [
+      'tell application "Ghostty"',
+      "set cfg to new surface configuration",
+      `set command of cfg to ${JSON.stringify(zshInvocation)}`,
+      "new window with configuration cfg",
+      "end tell",
+    ];
+    const osascriptArgs = ["osascript"];
+    for (const line of appleScript) {
+      osascriptArgs.push("-e", line);
+    }
+    // Chain the yabai move into the same shell so we don't have to track
+    // the Ghostty PID — `yabai -m window --space 5` operates on the
+    // focused window, which is the brand-new Ghostty window.
+    const shellLine = `${osascriptArgs
+      .map((a) => `'${a.replace(/'/g, "'\\''")}'`)
+      .join(
+        " ",
+      )} && sleep 0.3 && yabai -m window --space 5 2>/dev/null || true`;
+    noteLine(`# launch: ${rowId} -- ${workerShellCommand}`);
+    try {
+      const proc = Bun.spawn(["sh", "-c", shellLine], {
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+      });
+      // Fire-and-forget; surface stderr to the lifecycle sidecar if any.
+      proc.exited
+        .then(async () => {
+          const errText = await new Response(proc.stderr).text();
+          if (errText.length > 0) {
+            noteLine(`# launch stderr (${rowId}): ${errText.trim()}`);
+          }
+        })
+        .catch((err) => {
+          noteLine(
+            `# warn: launch spawn for ${rowId} failed: ${(err as Error).message}`,
+          );
+        });
+    } catch (err) {
+      noteLine(
+        `# warn: launch spawn for ${rowId} failed: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  function notifyApprovalPending(rowId: string, kind: "task" | "close"): void {
+    const title = "keeper: approval needed";
+    const message =
+      kind === "task"
+        ? `task ${rowId} done — needs approval`
+        : `epic ${rowId} close done — needs approval`;
+    noteLine(`# notify: approval-pending ${kind} ${rowId}`);
+    try {
+      const proc = Bun.spawn(
+        [
+          "notifyctl",
+          "show-message",
+          "-t",
+          title,
+          "-m",
+          message,
+          "--sound",
+          "Ping",
+        ],
+        { stdout: "pipe", stderr: "pipe", stdin: "ignore" },
+      );
+      proc.exited
+        .then(async () => {
+          const errText = await new Response(proc.stderr).text();
+          if (errText.length > 0) {
+            noteLine(`# notify stderr (${rowId}): ${errText.trim()}`);
+          }
+        })
+        .catch((err) => {
+          noteLine(
+            `# warn: notify spawn for ${rowId} failed: ${(err as Error).message}`,
+          );
+        });
+    } catch (err) {
+      noteLine(
+        `# warn: notify spawn for ${rowId} failed: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * Walk every task + close row in the snapshot and fire side effects on
+   * EDGES into "ready" (Ghostty) or "blocked:job-pending" (notifyctl).
+   * `lastVerdictSig` is updated unconditionally so transitions out of
+   * those states (back to running, etc.) are recorded for the next edge.
+   *
+   * Worker commands MIRROR `renderEpicCommands` but DROP the approval
+   * line — the worker is what we want spawned; the approval step stays
+   * the human's prerogative (and is what notifyctl alerts about).
+   */
+  function processLaunchTransitions(snap: ReadinessClientSnapshot): void {
+    for (const epic of snap.epics) {
+      const projectDir = seg(epic.project_dir);
+      const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+
+      for (const task of tasks) {
+        const taskId = seg(task.task_id);
+        if (taskId === "") {
+          continue;
+        }
+        const key = `task:${taskId}`;
+        const cur = verdictSignature(snap.readiness.perTask.get(taskId));
+        const prev = lastVerdictSig.get(key);
+        if (prev === cur) {
+          continue;
+        }
+        lastVerdictSig.set(key, cur);
+        if (cur === "ready") {
+          const dir =
+            task.target_repo != null && seg(task.target_repo) !== ""
+              ? seg(task.target_repo)
+              : projectDir;
+          const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
+          launchInGhostty(
+            `${cdPrefix}claude '/plan:work ${taskId}'`,
+            `task ${taskId}`,
+          );
+        } else if (cur === "blocked:job-pending") {
+          notifyApprovalPending(taskId, "task");
+        }
+      }
+
+      const epicId = seg(epic.epic_id);
+      if (epicId === "") {
+        continue;
+      }
+      const closeKey = `close:${epicId}`;
+      const closeCur = verdictSignature(snap.readiness.perCloseRow.get(epicId));
+      const closePrev = lastVerdictSig.get(closeKey);
+      if (closePrev === closeCur) {
+        continue;
+      }
+      lastVerdictSig.set(closeKey, closeCur);
+      if (closeCur === "ready") {
+        const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
+        launchInGhostty(
+          `${cdPrefix}claude '/plan:close ${epicId}'`,
+          `close ${epicId}`,
+        );
+      } else if (closeCur === "blocked:job-pending") {
+        notifyApprovalPending(epicId, "close");
+      }
+    }
+  }
+
+  const onSnapshot = (snap: ReadinessClientSnapshot): void => {
+    if (launchEnabled) {
+      processLaunchTransitions(snap);
+    }
+    emitFrameIfChanged(snap);
+  };
+
   const handle = subscribeReadiness({
     sockPath,
     idPrefix: "autopilot",
-    onSnapshot: emitFrameIfChanged,
+    onSnapshot,
     onLifecycle: emitLifecycle,
   });
 
