@@ -57,5 +57,5 @@ Tests live under `test/` (NOT `tests/`). Run via `bun test`. Three test files to
 - [ ] README updates land (sparse-signals count, v22 clause, inspect query); CLAUDE.md "Name scraping" rule extension lands.
 
 ## Done summary
-
+Schema v22 captures CLAUDE_CONFIG_DIR on SessionStart: events.config_dir + jobs.config_dir added via addColumnIfMissing; hook's configDirFromEnv normalizes (undefined/'' -> null; strip trailing /); reducer's SessionStart fold uses COALESCE so a resume with NULL preserves the prior non-NULL. Re-fold determinism covered by new reducer tests; README + CLAUDE.md updated.
 ## Evidence
