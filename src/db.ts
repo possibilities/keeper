@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION = 22;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -256,7 +256,8 @@ CREATE TABLE IF NOT EXISTS events (
     planctl_epic_id TEXT,
     planctl_task_id TEXT,
     planctl_subject_present INTEGER,
-    tool_use_id TEXT
+    tool_use_id TEXT,
+    config_dir TEXT
 )
 `;
 
@@ -391,7 +392,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     plan_verb TEXT,
     plan_ref TEXT,
     epic_links TEXT NOT NULL DEFAULT '[]',
-    rate_limited_at REAL
+    rate_limited_at REAL,
+    config_dir TEXT
 )
 `;
 
@@ -1891,6 +1893,18 @@ function migrate(db: Database): void {
       }
     }
 
+    // v21→v22: add `events.config_dir` (the `CLAUDE_CONFIG_DIR` env value
+    // captured by the hook at SessionStart — the arthack-claude profile
+    // directory the session ran under) and `jobs.config_dir` (the projection
+    // of that capture, latest-non-NULL-wins via the SessionStart fold's
+    // `COALESCE(excluded.config_dir, jobs.config_dir)` ON CONFLICT SET).
+    // Both nullable, no backfill — pre-feature SessionStart events have no
+    // recoverable env, so ADD COLUMN leaves existing rows NULL, which is
+    // exactly the zero-event reading. Mirrors the v3→v4 spawn_name step:
+    // column defs match CREATE_EVENTS / CREATE_JOBS verbatim.
+    addColumnIfMissing(db, "events", "config_dir", "TEXT");
+    addColumnIfMissing(db, "jobs", "config_dir", "TEXT");
+
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(String(SCHEMA_VERSION));
@@ -1925,13 +1939,13 @@ function prepareStmts(db: Database): Stmts {
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
         planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-        planctl_subject_present, tool_use_id
+        planctl_subject_present, tool_use_id, config_dir
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
         $subagent_agent_id, $spawn_name, $start_time, $slash_command, $skill_name,
         $planctl_op, $planctl_target, $planctl_epic_id, $planctl_task_id,
-        $planctl_subject_present, $tool_use_id
+        $planctl_subject_present, $tool_use_id, $config_dir
       )
     `),
     selectWorldRev: db.prepare(

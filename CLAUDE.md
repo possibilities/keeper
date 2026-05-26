@@ -213,8 +213,14 @@ the native value" is the default.
 - **Name scraping is scoped, not general.** The hook MAY scrape the parent claude
   process's `--name`/`-n` via `ps` — but ONLY on `SessionStart`, ONLY single-level
   `process.ppid` (no PPID-walking), frozen into that one event's
-  `events.spawn_name`. FORBIDDEN: ongoing/periodic scraping, scraping on other
-  hook events, PPID-walking, and any multi-session lineage from process names.
+  `events.spawn_name`. The hook MAY ALSO read `process.env.CLAUDE_CONFIG_DIR`
+  on `SessionStart` only, normalize it (`undefined`/`""` → NULL; strip trailing
+  `/`), and freeze the result into that event's `events.config_dir` (projected
+  onto `jobs.config_dir` by the reducer's SessionStart fold with latest-non
+  -NULL-wins via `COALESCE`). FORBIDDEN: ongoing/periodic scraping, scraping on
+  other hook events, PPID-walking, any multi-session lineage from process names,
+  any env read beyond `CLAUDE_CONFIG_DIR`, and any env read inside the reducer
+  fold (env reads at fold time break re-fold determinism).
 
 ## Worker contract
 

@@ -22,6 +22,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  configDirFromEnv,
   nameFromArgs,
   parseLinuxStarttime,
   splitArgsLstart,
@@ -1053,6 +1054,208 @@ test("An event without tool_use_id leaves events.tool_use_id NULL", async () => 
       )
       .get() as { tool_use_id: string | null } | null;
     expect(row?.tool_use_id).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// configDirFromEnv unit (v22 — CLAUDE_CONFIG_DIR capture)
+// ---------------------------------------------------------------------------
+
+test("configDirFromEnv: a populated env value passes through", () => {
+  expect(configDirFromEnv({ CLAUDE_CONFIG_DIR: "/path/to/profile" })).toBe(
+    "/path/to/profile",
+  );
+});
+
+test("configDirFromEnv: undefined collapses to null", () => {
+  expect(configDirFromEnv({})).toBeNull();
+});
+
+test("configDirFromEnv: empty string collapses to null", () => {
+  expect(configDirFromEnv({ CLAUDE_CONFIG_DIR: "" })).toBeNull();
+});
+
+test("configDirFromEnv: a single trailing slash is stripped", () => {
+  expect(configDirFromEnv({ CLAUDE_CONFIG_DIR: "/path/to/profile/" })).toBe(
+    "/path/to/profile",
+  );
+});
+
+test("configDirFromEnv: a bare '/' value passes through unchanged", () => {
+  // Edge case: stripping a trailing slash from '/' would yield empty string,
+  // which collides with the absent shape. The helper guards on length > 1.
+  expect(configDirFromEnv({ CLAUDE_CONFIG_DIR: "/" })).toBe("/");
+});
+
+// ---------------------------------------------------------------------------
+// CLAUDE_CONFIG_DIR hook-process integration
+// ---------------------------------------------------------------------------
+
+/**
+ * Fire the launcher with an explicit env override (vs the shared
+ * `fireViaLauncher` which always inherits process.env wholesale). Lets us
+ * set / unset `CLAUDE_CONFIG_DIR` for the SessionStart capture test.
+ */
+async function fireViaLauncherWithEnv(
+  sessionName: string | null,
+  payload: Record<string, unknown>,
+  envOverlay: Record<string, string | undefined>,
+): Promise<number> {
+  const args = ["bun", "run", launcherPath];
+  if (sessionName !== null) {
+    args.push("--name", sessionName);
+  }
+  args.push("--payload", JSON.stringify(payload));
+  // Merge process.env + KEEPER_DB + overlay. An undefined value in the overlay
+  // explicitly clears the key (the launcher's `env: process.env` would
+  // otherwise re-inherit the test runner's own CLAUDE_CONFIG_DIR if set).
+  const env: Record<string, string> = {
+    ...(process.env as Record<string, string>),
+    KEEPER_DB: dbPath,
+  };
+  for (const [k, v] of Object.entries(envOverlay)) {
+    if (v === undefined) {
+      delete env[k];
+    } else {
+      env[k] = v;
+    }
+  }
+  const proc = Bun.spawn(args, {
+    cwd: ROOT,
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return await proc.exited;
+}
+
+test("SessionStart stamps events.config_dir from CLAUDE_CONFIG_DIR env", async () => {
+  const code = await fireViaLauncherWithEnv(
+    "my-session",
+    {
+      hook_event_name: "SessionStart",
+      session_id: "sess-cfg-set",
+      cwd: "/tmp/work",
+    },
+    { CLAUDE_CONFIG_DIR: "/Users/x/.claude-profiles/profile-a" },
+  );
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT config_dir FROM events WHERE session_id = 'sess-cfg-set' AND hook_event = 'SessionStart'",
+      )
+      .get() as { config_dir: string | null } | null;
+    expect(row?.config_dir).toBe("/Users/x/.claude-profiles/profile-a");
+  } finally {
+    db.close();
+  }
+});
+
+test("SessionStart strips a trailing '/' from CLAUDE_CONFIG_DIR before stamping", async () => {
+  const code = await fireViaLauncherWithEnv(
+    "my-session",
+    {
+      hook_event_name: "SessionStart",
+      session_id: "sess-cfg-trailing",
+      cwd: "/tmp/work",
+    },
+    { CLAUDE_CONFIG_DIR: "/Users/x/.claude-profiles/profile-b/" },
+  );
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT config_dir FROM events WHERE session_id = 'sess-cfg-trailing'",
+      )
+      .get() as { config_dir: string | null } | null;
+    expect(row?.config_dir).toBe("/Users/x/.claude-profiles/profile-b");
+  } finally {
+    db.close();
+  }
+});
+
+test("SessionStart with CLAUDE_CONFIG_DIR unset stamps NULL", async () => {
+  // Force-clear the env variable so the test inherits a known-unset state
+  // regardless of the test runner's environment.
+  const code = await fireViaLauncherWithEnv(
+    "my-session",
+    {
+      hook_event_name: "SessionStart",
+      session_id: "sess-cfg-unset",
+      cwd: "/tmp/work",
+    },
+    { CLAUDE_CONFIG_DIR: undefined },
+  );
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT config_dir FROM events WHERE session_id = 'sess-cfg-unset'",
+      )
+      .get() as { config_dir: string | null } | null;
+    expect(row?.config_dir).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
+test("SessionStart with CLAUDE_CONFIG_DIR='' stamps NULL", async () => {
+  const code = await fireViaLauncherWithEnv(
+    "my-session",
+    {
+      hook_event_name: "SessionStart",
+      session_id: "sess-cfg-empty",
+      cwd: "/tmp/work",
+    },
+    { CLAUDE_CONFIG_DIR: "" },
+  );
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT config_dir FROM events WHERE session_id = 'sess-cfg-empty'",
+      )
+      .get() as { config_dir: string | null } | null;
+    expect(row?.config_dir).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
+test("a non-SessionStart event leaves config_dir NULL even when CLAUDE_CONFIG_DIR is set", async () => {
+  // Locked design: env-capture is SessionStart-gated, same as spawn_name /
+  // start_time. A UserPromptSubmit row never carries the env value, even when
+  // it is set in the hook process.
+  const code = await fireViaLauncherWithEnv(
+    "my-session",
+    {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "sess-cfg-ups",
+      cwd: "/tmp/work",
+    },
+    { CLAUDE_CONFIG_DIR: "/Users/x/.claude-profiles/profile-c" },
+  );
+  expect(code).toBe(0);
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT config_dir FROM events WHERE session_id = 'sess-cfg-ups' AND hook_event = 'UserPromptSubmit'",
+      )
+      .get() as { config_dir: string | null } | null;
+    expect(row?.config_dir).toBeNull();
   } finally {
     db.close();
   }

@@ -198,6 +198,29 @@ export function parseLinuxStarttime(stat: string): string | null {
 }
 
 /**
+ * Normalize the `CLAUDE_CONFIG_DIR` env value as observed by the hook at
+ * `SessionStart`. Pure + exported so the normalization is unit-testable
+ * without spawning a real hook process.
+ *
+ * Rules (locked):
+ * - `undefined` / `""` → `null` (collapse the two "absent" shapes to one);
+ * - strip exactly one trailing `/` so `/path/foo/` and `/path/foo` project
+ *   to the same string (Claude Code's launcher and dotfiles disagree on the
+ *   trailing slash; the projection is the canonical form).
+ *
+ * Everything else passes through verbatim — we don't resolve symlinks,
+ * don't expand `~`, don't enforce absoluteness. The column is display /
+ * attribution only; it never drives a filesystem read.
+ */
+export function configDirFromEnv(env: NodeJS.ProcessEnv): string | null {
+  const raw = env.CLAUDE_CONFIG_DIR;
+  if (raw === undefined || raw === "") {
+    return null;
+  }
+  return raw.endsWith("/") && raw.length > 1 ? raw.slice(0, -1) : raw;
+}
+
+/**
  * Captured parent-process identity for a SessionStart event: the `--name`
  * token (when the launcher set one) and a platform-tagged `start_time` string
  * (`darwin:<lstart-text>` / `linux:<jiffies>`). Either field may be null
@@ -381,6 +404,18 @@ async function main(): Promise<void> {
       ? await scrapeSpawnInfo()
       : { name: null, startTime: null };
 
+  // SessionStart only: capture `CLAUDE_CONFIG_DIR` from the hook process's
+  // own env (Bun.spawn inherits env by default, so the parent claude
+  // process's env propagates into the hook subprocess — see the fn-614
+  // task .1 probe). Mirrors the `spawnInfo` SessionStart gate: every other
+  // hook event sends NULL, so a row's `events.config_dir` is set-once per
+  // SessionStart and the reducer's `COALESCE(excluded, jobs)` ON CONFLICT
+  // SET handles the latest-non-NULL-wins semantics for resume. The pure
+  // `configDirFromEnv` helper normalizes (undefined/'' → null; strip one
+  // trailing '/'); see its doc for the locked rules.
+  const configDir =
+    hookEvent === "SessionStart" ? configDirFromEnv(process.env) : null;
+
   const { db, stmts } = openDb(resolveDbPath());
   try {
     // BEGIN IMMEDIATE avoids the lock-upgrade SQLITE_BUSY path: a plain BEGIN
@@ -418,6 +453,7 @@ async function main(): Promise<void> {
         $planctl_task_id: planctlTaskId,
         $planctl_subject_present: planctlSubjectPresent,
         $tool_use_id: toolUseId,
+        $config_dir: configDir,
       });
     })();
   } finally {

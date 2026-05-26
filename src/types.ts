@@ -175,6 +175,18 @@ export interface Event {
    * `subagent_invocations` projection (schema v17).
    */
   tool_use_id: string | null;
+  /**
+   * `CLAUDE_CONFIG_DIR` env value as observed by the hook process at
+   * `SessionStart`. Normalized at capture: `undefined` / empty string → NULL;
+   * trailing `/` stripped. NULL on every non-SessionStart event row (the
+   * env-capture is `SessionStart`-gated to mirror the `spawn_name` /
+   * `start_time` pattern — see CLAUDE.md "Name scraping is scoped"). Folded
+   * into `jobs.config_dir` by the reducer's SessionStart arm with
+   * latest-non-NULL-wins via `COALESCE(excluded.config_dir, jobs.config_dir)`
+   * on the ON CONFLICT branch, so a resume SessionStart that captures NULL
+   * preserves the prior non-NULL projection.
+   */
+  config_dir: string | null;
 }
 
 /**
@@ -271,6 +283,16 @@ export interface Job {
    * on every job that has never been rate-limited.
    */
   rate_limited_at: number | null;
+  /**
+   * Projection of `Event.config_dir` — the `CLAUDE_CONFIG_DIR` env value
+   * the hook captured at SessionStart (schema v22). Latest-non-NULL-wins:
+   * the reducer's SessionStart arm writes `config_dir =
+   * COALESCE(excluded.config_dir, jobs.config_dir)` so a resume SessionStart
+   * with NULL preserves the prior non-NULL. NULL on every pre-v22 row and
+   * on jobs whose only SessionStart events ran without the env set.
+   * Attributes the session to the arthack-claude profile it ran under.
+   */
+  config_dir: string | null;
 }
 
 /**

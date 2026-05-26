@@ -22,28 +22,34 @@ session's `(pid, start_time)` is gone from the OUTSIDE (SIGKILL'd,
 terminal-pane-closed, machine reboot, hook crash). Both terminal states are
 revivable — a fresh `claude --resume` re-opens either one to `stopped`.
 
-The event log also indexes eight sparse signals that surface across every
+The event log also indexes nine sparse signals that surface across every
 session — `events.slash_command` (the leading `/foo:bar` token of a
 `UserPromptSubmit` prompt), `events.skill_name` (the canonical name of a
 Skill-tool invocation, e.g. `plan:plan` or `arthack:check`),
 `events.tool_use_id` (the Anthropic-assigned `toolu_*` id stamped on every
 `Pre/PostToolUse` row whose payload carries a non-empty `data.tool_use_id`
 — the bridge that lets the reducer pair a `PreToolUse:Agent` with its later
-`PostToolUse:Agent`), and a five-column planctl-invocation envelope
-(`planctl_op`, `planctl_target`, `planctl_epic_id`, `planctl_task_id`,
-`planctl_subject_present`) stamped on every `PostToolUse:Bash` row whose
-`data.tool_response.stdout` parses as JSON carrying a top-level
-`planctl_invocation` key — the authoritative envelope planctl writes on
-every mutating call. Consumers can find `/plan:work` calls, `Skill`
-invocations, every Task-tool subagent lifecycle, AND every planctl-CLI
+`PostToolUse:Agent`), `events.config_dir` (the `CLAUDE_CONFIG_DIR` env
+value captured by the hook on `SessionStart` — the arthack-claude profile
+directory the session ran under, projected onto `jobs.config_dir` with
+latest-non-NULL-wins via `COALESCE` on resume), and a five-column
+planctl-invocation envelope (`planctl_op`, `planctl_target`,
+`planctl_epic_id`, `planctl_task_id`, `planctl_subject_present`) stamped
+on every `PostToolUse:Bash` row whose `data.tool_response.stdout` parses
+as JSON carrying a top-level `planctl_invocation` key — the authoritative
+envelope planctl writes on every mutating call. Consumers can find
+`/plan:work` calls, `Skill` invocations, every Task-tool subagent
+lifecycle, every session's profile attribution, AND every planctl-CLI
 mutation cheaply without JSON-scanning the event `data` blob. The
 `planctl_*` columns drive the creator/refiner classifier (see
 [Architecture](#architecture)) — `op === "create"` and `op === "scaffold"`
 both classify as creators (scaffold is the canonical epic-create path on
-this codebase). All eight are partial-indexed
+this codebase). The non-`config_dir` signals are partial-indexed
 on `WHERE col IS NOT NULL` (the planctl columns share a composite
 `(session_id, id) WHERE planctl_op IS NOT NULL` index for the per-session
-ordered scan).
+ordered scan); `events.config_dir` rides without its own index — it is
+read off `jobs.config_dir` (a steady-state attribution column), not the
+event log.
 
 The architecture is deliberately small. Keeper is built on Bun + `bun:sqlite`
 with a single third-party runtime dependency: `@parcel/watcher` (a native
@@ -445,7 +451,12 @@ epic's embedded `tasks` JSON array (a task change `patch`es the parent epic;
 tombstones retract). As of schema v14, the `epics` projection adds
 `last_validated_at` (TEXT, nullable) — the validation timestamp planctl writes
 via `planctl validate --epic <id>` and the board client renders as a
-`[validated|unvalidated]` pill. As of schema v21, each `epics.job_links`
+`[validated|unvalidated]` pill. As of schema v22, `jobs.config_dir` captures `CLAUDE_CONFIG_DIR` from the
+SessionStart environment, projecting the arthack-claude profile a session
+ran under (latest-non-NULL-wins via `COALESCE(excluded.config_dir,
+jobs.config_dir)` on the SessionStart ON CONFLICT branch, so a resume
+SessionStart that captures NULL preserves the prior attribution).
+As of schema v21, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `rate_limited_at`
 denormalized off the live `jobs` row at the reducer's write boundary
 (via the shared `enrichJobLink` helper) — renderers (board) and
@@ -522,9 +533,9 @@ list, see [CLAUDE.md](./CLAUDE.md).
 ## Inspect
 
 ```sh
-# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a planctl-shaped spawn name at SessionStart, NULL otherwise):
+# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a planctl-shaped spawn name at SessionStart, NULL otherwise; config_dir captures CLAUDE_CONFIG_DIR at SessionStart with latest-non-NULL-wins via COALESCE on resume):
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT job_id, state, title, title_source, plan_verb, plan_ref, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
+  'SELECT job_id, state, title, title_source, plan_verb, plan_ref, config_dir, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
 
 # Planctl-spawned jobs only — indexed via the partial `idx_jobs_plan_ref WHERE plan_ref IS NOT NULL` so this lands the index, not a scan:
 sqlite3 ~/.local/state/keeper/keeper.db \

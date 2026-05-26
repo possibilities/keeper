@@ -76,6 +76,7 @@ function insertEvent(
     planctl_task_id: overrides.planctl_task_id ?? null,
     planctl_subject_present: overrides.planctl_subject_present ?? null,
     tool_use_id: overrides.tool_use_id ?? null,
+    config_dir: overrides.config_dir ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -83,8 +84,8 @@ function insertEvent(
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-       planctl_subject_present, tool_use_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       planctl_subject_present, tool_use_id, config_dir
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -110,6 +111,7 @@ function insertEvent(
       row.planctl_task_id,
       row.planctl_subject_present,
       row.tool_use_id,
+      row.config_dir,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -4738,4 +4740,106 @@ test("subagent_invocations coexists with planctl_links fan-out — both projecti
   expect(subagentAfter).toEqual(subagentBefore);
   expect(jobsAfter).toEqual(jobsBefore);
   expect(epicsAfter).toEqual(epicsBefore);
+});
+
+// ---------------------------------------------------------------------------
+// config_dir capture (schema v22) — SessionStart fold + COALESCE on resume
+// ---------------------------------------------------------------------------
+
+test("SessionStart seeds jobs.config_dir from events.config_dir", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    config_dir: "/Users/x/.claude-profiles/profile-a",
+  });
+  drainAll();
+  const row = db
+    .query("SELECT config_dir FROM jobs WHERE job_id = ?")
+    .get("sess-a") as { config_dir: string | null };
+  expect(row.config_dir).toBe("/Users/x/.claude-profiles/profile-a");
+});
+
+test("SessionStart with NULL config_dir leaves jobs.config_dir NULL (zero-event reading)", () => {
+  insertEvent({ hook_event: "SessionStart", config_dir: null });
+  drainAll();
+  const row = db
+    .query("SELECT config_dir FROM jobs WHERE job_id = ?")
+    .get("sess-a") as { config_dir: string | null };
+  expect(row.config_dir).toBeNull();
+});
+
+test("resume SessionStart with NULL config_dir preserves prior non-NULL via COALESCE", () => {
+  // The locked design: a second SessionStart on the same session_id that
+  // captures NULL (e.g. resume launched without the env var) must NOT
+  // clobber the prior non-NULL value. The reducer's ON CONFLICT SET clause
+  // wraps the column in `COALESCE(excluded.config_dir, jobs.config_dir)`
+  // exactly for this case.
+  insertEvent({
+    hook_event: "SessionStart",
+    config_dir: "/Users/x/.claude-profiles/profile-a",
+  });
+  drainAll();
+  expect(
+    (
+      db
+        .query("SELECT config_dir FROM jobs WHERE job_id = ?")
+        .get("sess-a") as {
+        config_dir: string | null;
+      }
+    ).config_dir,
+  ).toBe("/Users/x/.claude-profiles/profile-a");
+
+  // Resume — same session_id, NULL config_dir. COALESCE keeps the prior value.
+  insertEvent({ hook_event: "SessionStart", config_dir: null });
+  drainAll();
+  expect(
+    (
+      db
+        .query("SELECT config_dir FROM jobs WHERE job_id = ?")
+        .get("sess-a") as {
+        config_dir: string | null;
+      }
+    ).config_dir,
+  ).toBe("/Users/x/.claude-profiles/profile-a");
+});
+
+test("resume SessionStart with a fresh non-NULL config_dir overwrites the prior value", () => {
+  // Latest-non-NULL-wins: COALESCE on excluded means a populated incoming
+  // value DOES win (the column is not set-once like title — env attribution
+  // tracks the most-recent SessionStart's profile).
+  insertEvent({
+    hook_event: "SessionStart",
+    config_dir: "/Users/x/.claude-profiles/profile-a",
+  });
+  drainAll();
+  insertEvent({
+    hook_event: "SessionStart",
+    config_dir: "/Users/x/.claude-profiles/profile-b",
+  });
+  drainAll();
+  const row = db
+    .query("SELECT config_dir FROM jobs WHERE job_id = ?")
+    .get("sess-a") as { config_dir: string | null };
+  expect(row.config_dir).toBe("/Users/x/.claude-profiles/profile-b");
+});
+
+test("jobs.config_dir is byte-identical on rewind-and-redrain (re-fold determinism)", () => {
+  // CLAUDE.md byte-identical re-fold invariant: a from-scratch re-fold of
+  // the event log must reproduce jobs.config_dir exactly. Exercises the
+  // SessionStart INSERT-side write AND the ON CONFLICT COALESCE branch.
+  insertEvent({
+    hook_event: "SessionStart",
+    config_dir: "/Users/x/.claude-profiles/profile-a",
+  });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({ hook_event: "Stop" });
+  insertEvent({ hook_event: "SessionStart", config_dir: null }); // resume
+  drainAll();
+  const before = db.query("SELECT * FROM jobs WHERE job_id = ?").get("sess-a");
+  expect(before).not.toBeNull();
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = db.query("SELECT * FROM jobs WHERE job_id = ?").get("sess-a");
+  expect(after).toEqual(before);
 });

@@ -298,6 +298,7 @@ function runDaemon(): void {
         $planctl_epic_id: null,
         $planctl_task_id: null,
         $planctl_subject_present: null,
+        $config_dir: null,
       });
       // Our own INSERT bumps data_version, so the wake worker would re-drain
       // anyway — but pump directly so the title folds without a poll-cycle delay.
@@ -340,6 +341,7 @@ function runDaemon(): void {
         $planctl_epic_id: null,
         $planctl_task_id: null,
         $planctl_subject_present: null,
+        $config_dir: null,
       });
       wakePending = true;
       pumpWakes();
@@ -459,6 +461,7 @@ function runDaemon(): void {
       $planctl_epic_id: null,
       $planctl_task_id: null,
       $planctl_subject_present: null,
+      $config_dir: null,
     });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the snapshot folds without a poll-cycle delay.
@@ -568,6 +571,7 @@ function runDaemon(): void {
       $planctl_epic_id: null,
       $planctl_task_id: null,
       $planctl_subject_present: null,
+      $config_dir: null,
     });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the Killed fold lands without a poll-
@@ -644,6 +648,7 @@ function runDaemon(): void {
       $planctl_epic_id: null,
       $planctl_task_id: null,
       $planctl_subject_present: null,
+      $config_dir: null,
     });
     wakePending = true;
     pumpWakes();

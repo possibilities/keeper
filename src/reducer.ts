@@ -2060,11 +2060,12 @@ function projectJobsRow(db: Database, event: Event): void {
           event.spawn_name,
         );
         db.run(
-          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(job_id) DO UPDATE SET
              pid = COALESCE(excluded.pid, jobs.pid),
              start_time = COALESCE(excluded.start_time, jobs.start_time),
+             config_dir = COALESCE(excluded.config_dir, jobs.config_dir),
              state = CASE WHEN jobs.state IN ('${ENDED}','${KILLED}') THEN 'stopped' ELSE jobs.state END,
              last_event_id = excluded.last_event_id,
              updated_at = excluded.updated_at`,
@@ -2081,6 +2082,7 @@ function projectJobsRow(db: Database, event: Event): void {
             extractTranscriptPath(event),
             plan_verb,
             plan_ref,
+            event.config_dir,
           ],
         );
       }
@@ -2469,7 +2471,7 @@ export function drain(db: Database, batchSize = DEFAULT_BATCH_SIZE): number {
               stop_hook_active, data, subagent_agent_id, spawn_name,
               start_time, slash_command, skill_name,
               planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-              planctl_subject_present, tool_use_id
+              planctl_subject_present, tool_use_id, config_dir
          FROM events
         WHERE id > ?
         ORDER BY id ASC
