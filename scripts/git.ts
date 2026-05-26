@@ -5,23 +5,22 @@
  * The daemon-side git worker polls planctl-backed git worktrees and folds
  * synthetic `GitSnapshot` events into the `git` collection. This script is the
  * primitive frame UI for that surface, mirroring the sibling scripts' sidecars.
+ *
+ * Connection lifecycle is owned by `subscribeCollection` in
+ * `src/readiness-client.ts` — same capped-backoff reconnect, per-collection
+ * coalesce, steady-poll backstop, and `dispose()` contract as
+ * `subscribeReadiness` (used by board.ts and autopilot.ts). The script's
+ * job is rendering rows + writing sidecars; the helper handles everything
+ * below the rows.
  */
 
 import { appendFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
-import {
-  encodeFrame,
-  LineBuffer,
-  type QueryFrame,
-  type ServerFrame,
-} from "../src/protocol";
+import { subscribeCollection } from "../src/readiness-client";
 
 const COLLECTION = "git";
-const POLL_MS = 1000;
-const INITIAL_BACKOFF_MS = 250;
-const MAX_BACKOFF_MS = 5000;
 
 const HELP = `keeper-git — live git status frames over the keeper subscribe server
 
@@ -56,7 +55,16 @@ function actor(v: unknown): string | null {
   return s;
 }
 
-function renderRows(rows: Record<string, unknown>[]): string {
+/**
+ * Render the `git`-collection rows into the per-frame block list. Each row
+ * with non-zero ahead / dirty / orphaned counts produces one block; rows
+ * with all zeroes are dropped (the empty-row filter matches the
+ * pre-refactor `scripts/git.ts:74` behavior). Exported as `string[]`
+ * (one entry per kept block) so the live-shell wrapper in task 2 can
+ * consume lines, not a joined string; the script's emit seam still joins
+ * with `\n` for stdout / sidecar writes.
+ */
+export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
   const blocks: string[] = [];
   for (const row of rows) {
     const dir = seg(row.project_dir);
@@ -115,7 +123,17 @@ function renderRows(rows: Record<string, unknown>[]): string {
 
     blocks.push(lines.join("\n"));
   }
-  return blocks.join("\n");
+  return blocks;
+}
+
+/**
+ * Legacy `string`-shaped renderer kept as a thin wrapper so existing
+ * tests / callers that want a joined string don't have to handle the
+ * block array. The live-shell task (task 2) will consume
+ * `renderRowBlocks` directly.
+ */
+function renderRows(rows: Record<string, unknown>[]): string {
+  return renderRowBlocks(rows).join("\n");
 }
 
 async function main(): Promise<void> {
@@ -137,17 +155,9 @@ async function main(): Promise<void> {
 
   const sockPath = values.sock ?? resolveSockPath();
   const clearMode = values.clear;
-  const rows = new Map<string, Record<string, unknown>>();
-  let order: string[] = [];
   let lastFrame: string | null = null;
   let frameCount = 0;
-  let inFlight = false;
-  let dirty = false;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
-  let shuttingDown = false;
-  let attempt = 0;
-  type Sock = Awaited<ReturnType<typeof Bun.connect>>;
-  let currentSock: Sock | null = null;
+  let lastRows: Record<string, unknown>[] = [];
 
   const stateSidecar = `/tmp/keeper-git.${process.pid}.state.json`;
   const frameSidecar = `/tmp/keeper-git.${process.pid}.frame.txt`;
@@ -157,27 +167,6 @@ async function main(): Promise<void> {
 
   function log(s: string): void {
     process.stdout.write(`${s}\n`);
-  }
-
-  function query(sock: Sock): void {
-    if (inFlight) {
-      dirty = true;
-      return;
-    }
-    inFlight = true;
-    const filter =
-      values["project-dir"] == null
-        ? undefined
-        : { project_dir: values["project-dir"] };
-    const frame: QueryFrame = {
-      type: "query",
-      id: "frames",
-      collection: COLLECTION,
-      limit: 0,
-      sort: { column: "project_dir", dir: "asc" },
-      ...(filter ? { filter } : {}),
-    };
-    sock.write(encodeFrame(frame));
   }
 
   function writeSidecars(frameText: string): void {
@@ -190,8 +179,7 @@ async function main(): Promise<void> {
     const sDiff = clearMode
       ? `/tmp/keeper-git.${process.pid}.diff.${frameCount}.txt`
       : diffSidecar;
-    const state = order.map((id) => rows.get(id));
-    writeFileSync(sState, `${JSON.stringify(state, null, 2)}\n`);
+    writeFileSync(sState, `${JSON.stringify(lastRows, null, 2)}\n`);
     writeFileSync(sFrame, `${frameText}\n`);
     let diff = "# first frame - no previous to diff against\n";
     if (lastFrame != null) {
@@ -212,13 +200,16 @@ async function main(): Promise<void> {
     log(`...\nstate: ${sState}\nframe: ${sFrame}\ndiff: ${sDiff}\n...`);
   }
 
-  function emit(): void {
-    const rendered = renderRows(
-      order.flatMap((id) => {
-        const row = rows.get(id);
-        return row == null ? [] : [row];
-      }),
-    );
+  /**
+   * Helper-driven row callback. Renders the row list, byte-compares
+   * against the last emit, and writes sidecars + stdout when the render
+   * changes. The helper handles the first-paint gate, reconnect, and the
+   * `meta`/`patch` refetch coalescer — by the time this fires, `rows`
+   * carries the freshest `result` frame in wire order.
+   */
+  function emitFrame(rows: Record<string, unknown>[]): void {
+    lastRows = rows;
+    const rendered = renderRows(rows);
     const frameText = `---\n${rendered}`;
     if (frameText === lastFrame) return;
     frameCount += 1;
@@ -228,87 +219,43 @@ async function main(): Promise<void> {
     lastFrame = frameText;
   }
 
-  function handle(frame: ServerFrame): void {
-    if (frame.type === "result" && frame.collection === COLLECTION) {
-      inFlight = false;
-      rows.clear();
-      order = [];
-      for (const row of frame.rows) {
-        const id = seg(row.project_dir);
-        rows.set(id, row);
-        order.push(id);
-      }
-      emit();
-      if (dirty) {
-        dirty = false;
-        if (currentSock != null) query(currentSock);
-      }
-    } else if (
-      (frame.type === "patch" || frame.type === "meta") &&
-      frame.collection === COLLECTION
-    ) {
-      if (currentSock != null) query(currentSock);
-    } else if (frame.type === "error") {
-      log(`# error ${frame.code}: ${frame.message}`);
-      if (frame.collection === COLLECTION) process.exit(1);
+  function emitLifecycle(
+    event: string,
+    detail: Record<string, unknown> = {},
+  ): void {
+    log("...");
+    log(`event: ${event}`);
+    for (const [k, v] of Object.entries(detail)) {
+      log(`${k}: ${String(v)}`);
+    }
+    log("...");
+    // On disconnect, clear `lastFrame` so the next first-paint emits even
+    // if the post-reconnect snapshot happens to match the last pre-
+    // disconnect frame byte-for-byte. (The helper resets its own
+    // collection state and re-gates first-paint behind a fresh `result`.)
+    if (event === "disconnected") {
+      lastFrame = null;
     }
   }
 
-  function reconnectSoon(): void {
-    if (shuttingDown) return;
-    const delay =
-      attempt === 0
-        ? 0
-        : Math.min(INITIAL_BACKOFF_MS * 2 ** (attempt - 1), MAX_BACKOFF_MS);
-    attempt += 1;
-    setTimeout(() => void connect(), delay);
-  }
-
-  async function connect(): Promise<void> {
-    if (shuttingDown) return;
-    const buffer = new LineBuffer();
-    try {
-      currentSock = await Bun.connect({
-        unix: sockPath,
-        socket: {
-          open(sock) {
-            attempt = 0;
-            pollTimer = setInterval(() => query(sock), POLL_MS);
-            query(sock);
-          },
-          data(_sock, chunk) {
-            const text = new TextDecoder().decode(chunk);
-            for (const line of buffer.push(text)) {
-              handle(JSON.parse(line) as ServerFrame);
-            }
-          },
-          close() {
-            if (pollTimer != null) clearInterval(pollTimer);
-            currentSock = null;
-            reconnectSoon();
-          },
-          error(_sock, err) {
-            console.error(`# socket error: ${err instanceof Error ? err.message : String(err)}`);
-            if (pollTimer != null) clearInterval(pollTimer);
-            currentSock = null;
-            reconnectSoon();
-          },
-        },
-      });
-    } catch {
-      reconnectSoon();
-    }
-  }
-
-  process.on("SIGINT", () => {
-    shuttingDown = true;
-    if (pollTimer != null) clearInterval(pollTimer);
-    currentSock?.write(encodeFrame({ type: "unsubscribe", id: "frames" }));
-    currentSock?.end();
-    process.exit(0);
+  const projectDir = values["project-dir"];
+  const handle = subscribeCollection({
+    sockPath,
+    idPrefix: "git",
+    collection: COLLECTION,
+    limit: 0,
+    sort: { column: "project_dir", dir: "asc" },
+    ...(projectDir === undefined
+      ? {}
+      : { filter: { project_dir: projectDir } }),
+    onRows: emitFrame,
+    onLifecycle: emitLifecycle,
   });
 
-  await connect();
+  process.on("SIGINT", () => {
+    handle.dispose();
+    process.exit(0);
+  });
 }
 
 if (import.meta.main) {
