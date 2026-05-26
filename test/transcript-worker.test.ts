@@ -28,10 +28,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
 import {
+  matchApiError,
   scanJobsForTitles,
   seedFromDb,
   TranscriptLineStream,
 } from "../src/transcript-worker";
+import type { ApiErrorKind } from "../src/types";
 
 let tmpDir: string;
 
@@ -500,6 +502,298 @@ test("the callback's .jsonl filter ignores non-jsonl + directory paths (no read,
   appendFileSync(jsonl, `${titleLine("sess-ok", "RealTitle")}\n`);
   stream.onChange(jsonl);
   expect(emitted).toEqual(["RealTitle"]);
+});
+
+// ---------------------------------------------------------------------------
+// (a2) matchApiError — pure matcher coverage across the six-kind dispatch
+// + the two explicit negative gates (api_retry / SDKRateLimitEvent).
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a canonical `isApiErrorMessage:true` synthetic-assistant envelope,
+ * matching the wire shape of real captured transcript lines (the bare-string
+ * `error` form — confirmed against
+ * `~/.claude/projects/-Users-mike-code-agentuse/2164484b-*.jsonl` for
+ * `authentication_failed` and the 2026-05 `rate_limit` corpus). The matcher
+ * accepts both bare-string and structured `error.type` shapes; the bare
+ * form is the one Claude Code actually writes in 2026-05.
+ */
+function apiErrorLine(
+  sessionId: string,
+  error: unknown,
+  text: string,
+  overrides: Record<string, unknown> = {},
+): string {
+  return JSON.stringify({
+    type: "assistant",
+    error,
+    isApiErrorMessage: true,
+    sessionId,
+    message: { content: [{ type: "text", text }] },
+    ...overrides,
+  });
+}
+
+test("matchApiError: each canonical kind round-trips into ApiErrorLine.kind verbatim", () => {
+  // Positive coverage gate: every kind in the canonical six-value union
+  // must round-trip from a bare-string `error` field into the matched
+  // `ApiErrorLine.kind`. The five dispatched kinds map to themselves;
+  // the matcher's allow-list rejects anything else, so "unknown" can only
+  // come from the explicit fallback test below.
+  const cases: Array<{ wire: string; expected: ApiErrorKind }> = [
+    { wire: "rate_limit", expected: "rate_limit" },
+    { wire: "authentication_failed", expected: "authentication_failed" },
+    { wire: "billing_error", expected: "billing_error" },
+    { wire: "server_error", expected: "server_error" },
+    { wire: "invalid_request", expected: "invalid_request" },
+  ];
+  for (const { wire, expected } of cases) {
+    const line = apiErrorLine(`sess-${wire}`, wire, `text for ${wire}`);
+    const parsed = JSON.parse(line);
+    const match = matchApiError(parsed);
+    expect(match).not.toBeNull();
+    expect(match?.kind).toBe(expected);
+    expect(match?.sessionId).toBe(`sess-${wire}`);
+    expect(match?.text).toBe(`text for ${wire}`);
+  }
+});
+
+test("matchApiError: structured `error.type` wire shape (openclaude SDK declaration) is accepted", () => {
+  // Wire-shape variance gate: openclaude's `SDKAssistantMessageError`
+  // declares `error.type`, while the real captured 401 envelope writes a
+  // bare-string `error`. The matcher reads `error.type ?? error`, so
+  // both shapes accept. Coverage for the structured branch.
+  const line = apiErrorLine("sess-structured", { type: "server_error" }, "5xx");
+  const match = matchApiError(JSON.parse(line));
+  expect(match?.kind).toBe("server_error");
+});
+
+test("matchApiError: an unrecognized kind string falls through to 'unknown'", () => {
+  // Six-kind allow-list rejects anything else. A wire kind not in the
+  // canonical set (including the SDK's own `"unknown"` string AND garbage
+  // literals) folds to the literal `"unknown"` — the reducer's
+  // unknown-fallback bucket. Mirrors the reducer-side
+  // `validateApiErrorKind` invariant from the task .1 coverage.
+  const cases = [
+    "overloaded_error", // a plausible but non-canonical Anthropic shape
+    "completely-made-up",
+    "", // empty string is still a string
+  ];
+  for (const wire of cases) {
+    const line = apiErrorLine(`sess-fb-${wire || "empty"}`, wire, "msg");
+    const match = matchApiError(JSON.parse(line));
+    expect(match?.kind).toBe("unknown");
+  }
+});
+
+test("matchApiError: max_output_tokens folds to 'unknown' (boundary — never stamped as itself)", () => {
+  // openclaude's query loop treats `max_output_tokens` as recoverable via
+  // compact+retry, so stamping it as a terminal kind would mis-classify
+  // recovering sessions. The matcher's allow-list deliberately excludes
+  // `max_output_tokens` — if Claude Code ever DOES write an isApiErrorMessage
+  // envelope with this kind, it folds to `"unknown"` (the recoverable
+  // session would already be back to working by the time the reducer
+  // sees the event — `UserPromptSubmit` clears the paired columns). This
+  // test PINS the boundary so a future widening of the allow-list is a
+  // deliberate decision, not an accident.
+  const line = apiErrorLine("sess-mot", "max_output_tokens", "hit ceiling");
+  const match = matchApiError(JSON.parse(line));
+  expect(match?.kind).toBe("unknown");
+});
+
+test("matchApiError: SDK 'unknown' wire string also folds to 'unknown'", () => {
+  // openclaude's TS declares `"unknown"` as a valid `SDKAssistantMessageError`
+  // discriminant. The matcher's allow-list excludes it (the dispatched set
+  // is the five non-"unknown" kinds), so the wire string folds through the
+  // same fallback path. End state is identical to the unrecognized-kind
+  // case — useful as a sanity gate that we don't accidentally double-map.
+  const line = apiErrorLine("sess-sdk-unknown", "unknown", "shrug");
+  const match = matchApiError(JSON.parse(line));
+  expect(match?.kind).toBe("unknown");
+});
+
+test("matchApiError: a missing/non-string error field also folds to 'unknown'", () => {
+  // Defensive coverage: a malformed envelope (no `error` field, or one
+  // whose value is a non-string non-object) MUST NOT throw and MUST fold
+  // to "unknown" so the reducer's terminal-stamp behavior stays consistent.
+  // The four guard fields (type/isApiErrorMessage/sessionId/content) still
+  // gate match success — this test only widens to the `error` slot itself.
+  const cases: unknown[] = [
+    { error: undefined }, // missing
+    { error: 42 }, // non-string
+    { error: null }, // explicit null
+  ];
+  for (const [i, override] of cases.entries()) {
+    const env = {
+      type: "assistant",
+      isApiErrorMessage: true,
+      sessionId: `sess-err-${i}`,
+      message: { content: [{ type: "text", text: "msg" }] },
+      ...(override as object),
+    };
+    const match = matchApiError(env);
+    expect(match?.kind).toBe("unknown");
+    expect(match?.sessionId).toBe(`sess-err-${i}`);
+  }
+});
+
+test("matchApiError: real captured 401 envelope (bare-string 'authentication_failed') matches", () => {
+  // Wire-shape regression gate: a verbatim line from a real captured
+  // transcript at
+  // ~/.claude/projects/-Users-mike-code-agentuse/2164484b-*.jsonl
+  // (the practice-scout's authentication_failed fixture). If Claude Code's
+  // writer ever changes shape, this is the canary.
+  const line = `{"parentUuid":"dcc9930c-8714-4b3b-98e6-420ce59697bd","isSidechain":false,"type":"assistant","uuid":"d5367c20-bdc1-4bee-b4d9-90a404208ab5","timestamp":"2026-05-26T18:45:22.855Z","message":{"id":"f87b7fc5-d392-4db8-a7eb-c55cb0adccbb","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","content":[{"type":"text","text":"Please run /login · API Error: 401 Invalid authentication credentials"}],"context_management":null},"requestId":"req_011CbRgADwFUygFMyevtB7zP","error":"authentication_failed","isApiErrorMessage":true,"apiErrorStatus":401,"userType":"external","entrypoint":"cli","cwd":"/Users/mike/code/agentuse","sessionId":"2164484b-e74a-4f26-b716-b80b44c4de61","version":"2.1.150","gitBranch":"main"}`;
+  const match = matchApiError(JSON.parse(line));
+  expect(match).not.toBeNull();
+  expect(match?.kind).toBe("authentication_failed");
+  expect(match?.sessionId).toBe("2164484b-e74a-4f26-b716-b80b44c4de61");
+  expect(match?.text).toBe(
+    "Please run /login · API Error: 401 Invalid authentication credentials",
+  );
+});
+
+test("matchApiError negative gate: `{type:'system', subtype:'api_retry'}` (SDKAPIRetryMessage) MUST NOT match", () => {
+  // SDKAPIRetryMessage is a transient retry — session still live. Two
+  // gates reject it: `type !== "assistant"` AND the cheap pre-filter on
+  // `"isApiErrorMessage":true` (this envelope has no such field). This
+  // test exercises the in-matcher gate. A false-positive here would
+  // mid-life-stamp a session that's actively recovering.
+  const retry = {
+    type: "system",
+    subtype: "api_retry",
+    sessionId: "sess-retry",
+    retryInMs: 577.78,
+    retryAttempt: 1,
+    error: { type: null, cause: { code: "ConnectionRefused" } },
+    isApiErrorMessage: undefined, // explicitly absent
+  };
+  expect(matchApiError(retry)).toBeNull();
+});
+
+test("matchApiError negative gate: SDKRateLimitEvent (quota notification, no isApiErrorMessage) MUST NOT match", () => {
+  // SDKRateLimitEvent is the quota-notification envelope — a distinct
+  // shape with NO `isApiErrorMessage` field at all. The matcher's
+  // `isApiErrorMessage !== true` guard rejects it. A false-positive here
+  // would stamp a session as failed every time Anthropic sends a quota
+  // warning (a routine signal — the session keeps running).
+  const quotaNotification = {
+    type: "system",
+    subtype: "rate_limit_event",
+    sessionId: "sess-quota",
+    rate_limits: [{ limit: 50_000_000, used: 49_900_000, window: "5h" }],
+    // No isApiErrorMessage field whatsoever — distinct envelope.
+  };
+  expect(matchApiError(quotaNotification)).toBeNull();
+});
+
+test("matchApiError negative gate: a real assistant turn (no isApiErrorMessage) MUST NOT match", () => {
+  // A normal assistant message reaches the matcher only if its line
+  // happens to contain `"isApiErrorMessage":true` as a substring — which
+  // a real assistant turn doesn't. But if the pre-filter is ever loosened
+  // or someone calls the matcher directly, the four-guard gate must
+  // still reject. Test the in-matcher gate.
+  const realTurn = {
+    type: "assistant",
+    sessionId: "sess-real",
+    message: { content: [{ type: "text", text: "Hello!" }] },
+    // No isApiErrorMessage, no error — a vanilla assistant turn.
+  };
+  expect(matchApiError(realTurn)).toBeNull();
+});
+
+test("matchApiError: dispatchLine pre-filter widening — an authentication_failed line emits via onApiError", () => {
+  // End-to-end coverage on the TranscriptLineStream layer: the pre-filter
+  // widened from `'"rate_limit"'` to `'"isApiErrorMessage":true'`, so a
+  // 401 envelope (which doesn't contain "rate_limit") must still flow
+  // through. Without this gate, the matcher would never run on the very
+  // failure mode the task .2 generalization adds.
+  const path = join(tmpDir, "sess-auth.jsonl");
+  writeFileSync(path, "");
+  const errors: Array<{ sessionId: string; text: string; kind: ApiErrorKind }> =
+    [];
+  const stream = new TranscriptLineStream(
+    () => {},
+    () => {},
+    (sessionId, text, kind) => errors.push({ sessionId, text, kind }),
+  );
+  stream.register(path);
+
+  const line = apiErrorLine(
+    "sess-auth",
+    "authentication_failed",
+    "Please run /login",
+  );
+  appendFileSync(path, `${line}\n`);
+  stream.onChange(path);
+
+  expect(errors).toEqual([
+    {
+      sessionId: "sess-auth",
+      text: "Please run /login",
+      kind: "authentication_failed",
+    },
+  ]);
+});
+
+test("matchApiError: dispatchLine pre-filter — a rate_limit line still emits (regression gate for task .1 behavior)", () => {
+  // The widened pre-filter `"isApiErrorMessage":true` must catch the
+  // pre-existing rate-limit envelope just as the old `'"rate_limit"'`
+  // needle did. This pins the no-regression bar: tasks .2/.3 generalize
+  // WITHOUT dropping the original signal.
+  const path = join(tmpDir, "sess-rl.jsonl");
+  writeFileSync(path, "");
+  const errors: Array<{ kind: ApiErrorKind }> = [];
+  const stream = new TranscriptLineStream(
+    () => {},
+    () => {},
+    (_s, _t, kind) => errors.push({ kind }),
+  );
+  stream.register(path);
+
+  const line = apiErrorLine("sess-rl", "rate_limit", "out of usage");
+  appendFileSync(path, `${line}\n`);
+  stream.onChange(path);
+
+  expect(errors).toEqual([{ kind: "rate_limit" }]);
+});
+
+test("matchApiError: dispatchLine pre-filter rejects a non-isApiErrorMessage line (perf gate)", () => {
+  // The pre-filter exists for perf: a busy transcript writes thousands of
+  // assistant tool_use turns and tool_result attachments. None of them
+  // should reach JSON.parse, let alone the matcher. This test pins the
+  // contract by tracking emits across a populated session line — the
+  // emit list MUST stay empty.
+  const path = join(tmpDir, "sess-noise.jsonl");
+  writeFileSync(path, "");
+  const errors: ApiErrorKind[] = [];
+  const stream = new TranscriptLineStream(
+    () => {},
+    () => {},
+    (_s, _t, kind) => errors.push(kind),
+  );
+  stream.register(path);
+
+  // A normal assistant tool_use turn — large, busy, but no isApiErrorMessage.
+  const toolUse = JSON.stringify({
+    type: "assistant",
+    sessionId: "sess-noise",
+    message: {
+      content: [
+        { type: "text", text: "Looking up..." },
+        {
+          type: "tool_use",
+          id: "toolu_01",
+          name: "Bash",
+          input: { command: "ls" },
+        },
+      ],
+    },
+  });
+  appendFileSync(path, `${toolUse}\n`);
+  stream.onChange(path);
+
+  expect(errors).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------

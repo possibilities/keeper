@@ -81,7 +81,7 @@ import { DEFAULT_BATCH_SIZE, drain } from "./reducer";
 import { seedKilledSweep } from "./seed-sweep";
 import type { ServerWorkerData } from "./server-worker";
 import type {
-  RateLimitedMessage,
+  ApiErrorMessage,
   TranscriptTitleMessage,
   TranscriptWorkerData,
 } from "./transcript-worker";
@@ -269,7 +269,7 @@ function runDaemon(): void {
   // `data.session_title` (the same field the reducer's title rule reads);
   // everything else is NULL (synthetic — never carries a process identity).
   transcriptWorker.onmessage = (
-    ev: MessageEvent<TranscriptTitleMessage | RateLimitedMessage | undefined>,
+    ev: MessageEvent<TranscriptTitleMessage | ApiErrorMessage | undefined>,
   ): void => {
     const msg = ev.data;
     if (!msg) {
@@ -308,23 +308,31 @@ function runDaemon(): void {
       pumpWakes();
       return;
     }
-    if (msg.kind === "rate-limited") {
-      // Synthetic `RateLimited` event minted from the transcript-worker
-      // signal — Claude Code wrote its `isApiErrorMessage: true,
-      // error: "rate_limit"` synthetic assistant turn to the JSONL. The
-      // reducer's RateLimited arm folds this row by flipping `jobs.state`
-      // to `'stopped'` AND stamping `jobs.rate_limited_at` to the event
-      // ts in a single transaction (re-fold-deterministic). Everything
-      // other than `session_id` / `hook_event` / `event_type` / `data` is
-      // NULL — synthetics never carry a process identity. The display
-      // text rides in `data.rate_limit_text` for downstream consumers;
-      // the reducer reads only `event.ts` and `event.id`.
+    if (msg.kind === "api-error") {
+      // Synthetic `ApiError` event minted from the transcript-worker
+      // signal — Claude Code wrote its `isApiErrorMessage: true` synthetic
+      // assistant turn to the JSONL, naming the failure mode via a
+      // bare-string `error` field (`rate_limit` / `authentication_failed` /
+      // `billing_error` / `server_error` / `invalid_request`; anything
+      // else routed through the matcher's `"unknown"` fallback). The
+      // reducer's dual-case `RateLimited` / `ApiError` arm (schema v24)
+      // folds this row by flipping `jobs.state` to `'stopped'` AND
+      // stamping `(last_api_error_at, last_api_error_kind)` to the event
+      // ts + the matched kind in a single compound UPDATE
+      // (re-fold-deterministic). Everything other than `session_id` /
+      // `hook_event` / `event_type` / `data` is NULL — synthetics never
+      // carry a process identity. The matched kind rides in `data.kind`
+      // (read by the reducer's `extractApiErrorKind`); the display text
+      // rides alongside in `data.text` for downstream consumers. The
+      // pre-v24 `RateLimited` event_type is still folded by the same arm
+      // via the dual-case alias so the historical event log re-folds
+      // byte-deterministically — we never re-mint it.
       stmts.insertEvent.run({
         $ts: Date.now() / 1000,
         $session_id: msg.sessionId,
         $pid: null,
-        $hook_event: "RateLimited",
-        $event_type: "rate_limited",
+        $hook_event: "ApiError",
+        $event_type: "api_error",
         $tool_name: null,
         $matcher: null,
         $cwd: null,
@@ -332,7 +340,7 @@ function runDaemon(): void {
         $agent_id: null,
         $agent_type: null,
         $stop_hook_active: null,
-        $data: JSON.stringify({ rate_limit_text: msg.text }),
+        $data: JSON.stringify({ kind: msg.errorKind, text: msg.text }),
         $subagent_agent_id: null,
         $spawn_name: null,
         $start_time: null,

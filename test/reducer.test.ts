@@ -3777,13 +3777,18 @@ test("ApiError fold: data.kind values outside the canonical ApiErrorKind allow-l
   }
 });
 
-test("ApiError fold: each canonical ApiErrorKind round-trips into last_api_error_kind verbatim", () => {
+test("ApiError fold: each canonical ApiErrorKind round-trips + flips state to 'stopped' + stamps last_api_error_at", () => {
   // Sanity gate on the allow-list. The dual-case alias forces "rate_limit"
   // on RateLimited; the ApiError arm validates `data.kind` against the
-  // canonical six-value union. Each canonical value must round-trip
-  // verbatim into the projection (no normalization, no lower/upper-case
-  // mangling). Excludes "rate_limit" — covered by the legacy-alias test
-  // above; this gate is for the other five.
+  // canonical six-value union. Each canonical value must:
+  //   (a) round-trip verbatim into `last_api_error_kind`
+  //       (no normalization, no lower/upper-case mangling),
+  //   (b) flip `jobs.state` from "working" → "stopped" (same terminal
+  //       semantics as the legacy RateLimited arm), and
+  //   (c) stamp `last_api_error_at` to a non-NULL real (paired-NULL
+  //       invariant: both columns move together, both clear together).
+  // Excludes "rate_limit" — covered by the legacy-alias test above; this
+  // gate is the per-kind fold-arm coverage promised by task .2.
   const kinds = [
     "authentication_failed",
     "billing_error",
@@ -3804,11 +3809,17 @@ test("ApiError fold: each canonical ApiErrorKind round-trips into last_api_error
   drainAll();
   for (const kind of kinds) {
     const row = db
-      .query("SELECT last_api_error_kind FROM jobs WHERE job_id = ?")
+      .query(
+        "SELECT state, last_api_error_kind, last_api_error_at FROM jobs WHERE job_id = ?",
+      )
       .get(`sess-ae-canonical-${kind}`) as {
+      state: string;
       last_api_error_kind: string | null;
+      last_api_error_at: number | null;
     };
     expect(row.last_api_error_kind).toBe(kind);
+    expect(row.state).toBe("stopped");
+    expect(row.last_api_error_at).not.toBeNull();
   }
 });
 

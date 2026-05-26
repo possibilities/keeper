@@ -49,6 +49,7 @@ import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
 import { isDropError, RescanScheduler } from "./rescan";
+import type { ApiErrorKind } from "./types";
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only path
@@ -74,24 +75,34 @@ export interface TranscriptTitleMessage {
 }
 
 /**
- * Message posted to the parent on each fresh rate-limit synthetic assistant
- * turn observed in a session's transcript. Claude Code writes this entry
- * when the API request fails at the HTTP 429 boundary — no real model turn
- * fires, no hook event lands, but the JSONL gains a marker line carrying
- * `error: "rate_limit"`, `isApiErrorMessage: true`. Main mints a synthetic
- * `RateLimited` event from this message; the reducer flips `jobs.state` to
- * `'stopped'` AND stamps `jobs.rate_limited_at` to the event ts (see
- * `src/reducer.ts` RateLimited arm).
+ * Message posted to the parent on each fresh `isApiErrorMessage:true`
+ * synthetic-assistant turn observed in a session's transcript (schema v24).
+ * Claude Code writes this entry whenever the API request fails at a
+ * terminal HTTP boundary — no real model turn fires, no hook event lands,
+ * but the JSONL gains a marker line carrying `isApiErrorMessage: true` and
+ * a bare-string `error` field naming the failure mode (`rate_limit` /
+ * `authentication_failed` / `billing_error` / `server_error` /
+ * `invalid_request`; anything else folds to `"unknown"`). Main mints a
+ * synthetic `ApiError` event from this message; the reducer's dual-case
+ * `RateLimited` / `ApiError` arm flips `jobs.state` to `'stopped'` AND
+ * stamps `jobs.last_api_error_at` + `jobs.last_api_error_kind` to the
+ * event ts + the matched kind in a single compound UPDATE (see
+ * `src/reducer.ts`).
  *
- * `text` carries Claude Code's own user-facing wording — typically
- * `"You've hit your session limit · resets 3:20am (America/New_York)"` —
- * for downstream display. The worker doesn't parse the reset clock; the
- * full string rides as-is so a future renderer can surface it verbatim.
+ * `text` carries Claude Code's own user-facing wording — for `rate_limit`
+ * typically `"You've hit your session limit · resets 3:20am (America/New_York)"`,
+ * for `authentication_failed` typically
+ * `"Please run /login · API Error: 401 Invalid authentication credentials"`
+ * — preserved verbatim for downstream display. The worker doesn't parse
+ * the reset clock or the status code; the full string rides as-is so a
+ * future renderer can surface it.
  */
-export interface RateLimitedMessage {
-  kind: "rate-limited";
+export interface ApiErrorMessage {
+  kind: "api-error";
   sessionId: string;
   text: string;
+  /** Canonical {@link ApiErrorKind} value matched by `matchApiError`. */
+  errorKind: ApiErrorKind;
 }
 
 /** Message the parent sends to ask the worker to stop. */
@@ -147,29 +158,71 @@ function matchCustomTitle(parsed: unknown): CustomTitleLine | null {
   return { sessionId: obj.sessionId, title: obj.customTitle };
 }
 
-/** A parsed rate-limit synthetic assistant line: session + display text. */
-interface RateLimitLine {
+/**
+ * Canonical six-kind allow-list the transcript matcher dispatches against
+ * (mirrors `ApiErrorKind` minus `"unknown"`, which is reserved as the
+ * fall-through bucket). Kept as a `Set` for O(1) `.has` from inside
+ * `matchApiError`'s hot path. The five non-unknown entries are exactly the
+ * `error.type` values openclaude's `SDKAssistantMessageError` declares as
+ * terminal AND that we map straight through; `max_output_tokens` is
+ * deliberately ABSENT — openclaude's query loop treats it as recoverable
+ * via compact+retry, so stamping would mis-classify recovering sessions.
+ */
+const DISPATCHED_API_ERROR_KINDS: ReadonlySet<ApiErrorKind> = new Set([
+  "rate_limit",
+  "authentication_failed",
+  "billing_error",
+  "server_error",
+  "invalid_request",
+]);
+
+/**
+ * A parsed `isApiErrorMessage:true` synthetic-assistant line: session +
+ * display text + matched {@link ApiErrorKind}.
+ */
+interface ApiErrorLine {
   sessionId: string;
   text: string;
+  kind: ApiErrorKind;
 }
 
 /**
- * Match a parsed JSONL object against the rate-limit synthetic-assistant
- * shape that Claude Code emits when an API request fails at the HTTP 429
- * boundary. Required gate fields (verified against a real captured line):
+ * Match a parsed JSONL object against the `isApiErrorMessage` synthetic-
+ * assistant shape that Claude Code emits when an API request fails at a
+ * terminal HTTP boundary. Required gate fields (verified against real
+ * captured `rate_limit` and `authentication_failed` envelopes):
  *
  *   { type: "assistant",
- *     error: "rate_limit",
+ *     error: <bare-string-kind> | { type: <bare-string-kind> },
  *     isApiErrorMessage: true,
  *     sessionId: <string>,
- *     message: { content: [{type:"text", text:<reset wording>}] } }
+ *     message: { content: [{type:"text", text:<status wording>}] } }
  *
- * Strict gate — only the canonical rate-limit envelope matches; any other
- * assistant turn (real or synthetic) returns `null`. `text` falls back to
- * the empty string when the content shape is missing (still emits — the
- * synthetic event is the load-bearing signal, the text is display-only).
+ * Strict gate — only the canonical isApiErrorMessage envelope matches; any
+ * other assistant turn (real or synthetic) returns `null`. Two negative
+ * gates are explicit at the call-site filter (see `dispatchLine`) and
+ * implicit here:
+ *
+ *   - `SDKAPIRetryMessage` (`{type:"system", subtype:"api_retry"}`) — a
+ *     transient retry notification, session still live. Bounces here on
+ *     `type !== "assistant"`.
+ *   - `SDKRateLimitEvent` (the quota-notification envelope, a distinct
+ *     shape with no `isApiErrorMessage` field) — bounces here on
+ *     `isApiErrorMessage !== true`.
+ *
+ * Kind dispatch reads `error.type ?? error` so both wire shapes are
+ * accepted (real captured 401: `"error":"authentication_failed"` bare
+ * string; openclaude's TS declares `error.type` structured). The matched
+ * kind must appear in {@link DISPATCHED_API_ERROR_KINDS} — anything else
+ * (including the SDK's own `"unknown"` string, `"max_output_tokens"`, an
+ * unrecognized literal, a non-string `error`, or a missing field) falls
+ * through to {@link ApiErrorKind} `"unknown"`.
+ *
+ * `text` falls back to the empty string when the content shape is missing
+ * (still emits — the synthetic event is the load-bearing signal, the text
+ * is display-only).
  */
-function matchRateLimit(parsed: unknown): RateLimitLine | null {
+export function matchApiError(parsed: unknown): ApiErrorLine | null {
   if (!parsed || typeof parsed !== "object") {
     return null;
   }
@@ -183,15 +236,23 @@ function matchRateLimit(parsed: unknown): RateLimitLine | null {
   if (obj.type !== "assistant") {
     return null;
   }
-  if (obj.error !== "rate_limit") {
-    return null;
-  }
   if (obj.isApiErrorMessage !== true) {
     return null;
   }
   if (typeof obj.sessionId !== "string" || obj.sessionId.length === 0) {
     return null;
   }
+  // Accept both wire shapes: bare-string `error` (the real captured 401
+  // shape) and structured `error.type` (openclaude's TS declaration).
+  let rawKind: unknown = obj.error;
+  if (rawKind && typeof rawKind === "object") {
+    rawKind = (rawKind as { type?: unknown }).type;
+  }
+  const kind: ApiErrorKind =
+    typeof rawKind === "string" &&
+    DISPATCHED_API_ERROR_KINDS.has(rawKind as ApiErrorKind)
+      ? (rawKind as ApiErrorKind)
+      : "unknown";
   let text = "";
   const msg = obj.message;
   if (msg && typeof msg === "object") {
@@ -203,7 +264,7 @@ function matchRateLimit(parsed: unknown): RateLimitLine | null {
       }
     }
   }
-  return { sessionId: obj.sessionId, text };
+  return { sessionId: obj.sessionId, text, kind };
 }
 
 /**
@@ -248,23 +309,25 @@ export class TranscriptLineStream {
   /**
    * Live forward-tail driver. `onTitle` is called for each NEW (changed)
    * `custom-title` line — change-gated by `lastEmitted`. `log` is the
-   * stderr-logger seam tests override. `onRateLimited` is called for each
-   * fresh rate-limit synthetic-assistant line — NOT change-gated (the
-   * daemon-side reducer fold is idempotent, so a defensive same-line
-   * re-emit is harmless; the worker stays simple). In practice the
-   * forward-only tail anchors each path at EOF on first sight, so a line
-   * is read at most once per worker lifetime regardless.
+   * stderr-logger seam tests override. `onApiError` is called for each
+   * fresh `isApiErrorMessage:true` synthetic-assistant line carrying the
+   * matched {@link ApiErrorKind} — NOT change-gated (the daemon-side
+   * reducer fold is idempotent, so a defensive same-line re-emit is
+   * harmless; the worker stays simple). In practice the forward-only tail
+   * anchors each path at EOF on first sight, so a line is read at most
+   * once per worker lifetime regardless.
    *
-   * Param order is `(onTitle, log, onRateLimited)` — `log` stays in the
+   * Param order is `(onTitle, log, onApiError)` — `log` stays in the
    * historical second slot so existing 2-arg test calls keep working;
-   * `onRateLimited` is the new optional third slot.
+   * `onApiError` is the new optional third slot.
    */
   constructor(
     private readonly onTitle: (sessionId: string, title: string) => void,
     private readonly log: (msg: string) => void = (m) => console.error(m),
-    private readonly onRateLimited: (
+    private readonly onApiError: (
       sessionId: string,
       text: string,
+      kind: ApiErrorKind,
     ) => void = () => {},
   ) {}
 
@@ -554,13 +617,23 @@ export class TranscriptLineStream {
       return;
     }
     // Cheap pre-filter: skip the JSON.parse for lines that can't be either
-    // a title or a rate-limit synthetic. The two needle-substrings are
-    // disjoint, so a single `includes` per shape stays branch-cheap. Most
-    // transcript lines (assistant tool_use turns, tool_result attachments)
-    // miss both and bail before JSON.parse.
+    // a title or an isApiErrorMessage synthetic. The two needle-substrings
+    // are disjoint, so a single `includes` per shape stays branch-cheap.
+    // Most transcript lines (assistant tool_use turns, tool_result
+    // attachments) miss both and bail before JSON.parse.
+    //
+    // The api-error needle is `"isApiErrorMessage":true` rather than any
+    // per-kind error string — it's the one flag every terminal-failure
+    // envelope guarantees AND it skips both negative-gate frames (the
+    // `SDKAPIRetryMessage` system row has no such field; the
+    // `SDKRateLimitEvent` quota notification has a distinct envelope).
+    // Bun's `JSON.stringify` doesn't insert whitespace, and Claude Code's
+    // own writer doesn't either (verified against captured transcript
+    // lines from 2026-05; if that ever changes, widen to
+    // `"isApiErrorMessage"` and accept the slight per-line cost).
     const isTitle = line.includes("custom-title");
-    const isRateLimit = !isTitle && line.includes('"rate_limit"');
-    if (!isTitle && !isRateLimit) {
+    const isApiError = !isTitle && line.includes('"isApiErrorMessage":true');
+    if (!isTitle && !isApiError) {
       return;
     }
     let parsed: unknown;
@@ -585,16 +658,17 @@ export class TranscriptLineStream {
       this.onTitle(match.sessionId, match.title);
       return;
     }
-    // Rate-limit synthetic: no change-gate. The forward-only tail reads
-    // each line at most once per worker lifetime, and the reducer fold is
-    // idempotent (state + rate_limited_at stamped from the event payload),
-    // so a duplicate emit (boot scan + live tail double-fire would be the
-    // only way) folds to the same row state.
-    const match = matchRateLimit(parsed);
+    // isApiErrorMessage synthetic: no change-gate. The forward-only tail
+    // reads each line at most once per worker lifetime, and the reducer
+    // fold is idempotent (state + last_api_error_at + last_api_error_kind
+    // stamped from the event payload), so a duplicate emit (boot scan +
+    // live tail double-fire would be the only way) folds to the same row
+    // state.
+    const match = matchApiError(parsed);
     if (!match) {
       return;
     }
-    this.onRateLimited(match.sessionId, match.text);
+    this.onApiError(match.sessionId, match.text, match.kind);
   }
 }
 
@@ -696,12 +770,13 @@ function main(): void {
       } satisfies TranscriptTitleMessage);
     },
     undefined, // `log` defaults to stderr — the worker has no override here.
-    (sessionId, text) => {
+    (sessionId, text, errorKind) => {
       port.postMessage({
-        kind: "rate-limited",
+        kind: "api-error",
         sessionId,
         text,
-      } satisfies RateLimitedMessage);
+        errorKind,
+      } satisfies ApiErrorMessage);
     },
   );
 
