@@ -11,8 +11,8 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Runtime probe: confirm CLAUDE_CONFIG_DIR inherits",
-  "updated_at": "2026-05-26T15:23:32.545789Z",
+  "updated_at": "2026-05-26T15:27:15.299182Z",
   "work_review_status": "unknown",
   "work_reviewed_at": null,
-  "worker_done_at": null
+  "worker_done_at": "2026-05-26T15:27:15.299182Z"
 }

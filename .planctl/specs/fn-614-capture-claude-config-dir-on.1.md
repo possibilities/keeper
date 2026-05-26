@@ -38,5 +38,5 @@ Not unit-testable by design (probe is throwaway instrumentation, verified by man
 - [ ] Done summary records what value was observed (so the audit trail captures the verification).
 
 ## Done summary
-
+Probe confirmed CLAUDE_CONFIG_DIR=/Users/mike/.claude-profiles/multi-claude-3 inherits cleanly from arthack-claude.py launcher into the hook subprocess. Probe committed (36f8dd3) and reverted (73e405f); approach for schema bump in task 2 is green.
 ## Evidence
