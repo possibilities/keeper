@@ -107,5 +107,5 @@ Internal state and behavior:
 - [ ] `bun run lint && bun run typecheck` pass.
 
 ## Done summary
-
+Shipped src/live-shell.ts factory (alt-screen + raw-mode + per-line DEC 2026 ANSI diff + ring-buffered history + StdinBuffer-style escape parser + hjkl/arrow keymap + SIGWINCH debounce + sync idempotent dispose with exit/uncaught/unhandled safety nets + non-TTY fallback) plus 22-test suite in test/live-shell.test.ts driven by PassThrough-style fakes and a fake clock; lint, typecheck, and the live-shell suite all pass.
 ## Evidence
