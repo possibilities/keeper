@@ -145,5 +145,5 @@ Order of operations (single PR, logical sub-steps):
       migration parity.
 
 ## Done summary
-
+Landed schema v25: jobs.last_input_request_at + last_input_request_kind columns, InputRequest reducer arm (clone of RateLimited/ApiError shape with terminal guard), four clear arms (UserPromptSubmit + SessionStart unconditional; PreToolUse + PostToolUse gated on IS NOT NULL), daemon synthetic-event mint, and widened enrichJobLink/syncJobLinksOnJobWrite/buildEmbeddedJob/syncIfPlanRef/JOBS_DESCRIPTOR with locked key-order. New tests cover stamp + terminal guard, allow-list fallback, all four clear arms, gate keeps last_event_id steady, rewind-and-redrain re-fold determinism, link fan-out, and v24→v25 migration parity.
 ## Evidence
