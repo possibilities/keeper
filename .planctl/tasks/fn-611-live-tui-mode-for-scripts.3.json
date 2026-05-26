@@ -14,8 +14,8 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Wire live-shell into scripts, rename --clear to --live",
-  "updated_at": "2026-05-26T03:25:36.439320Z",
+  "updated_at": "2026-05-26T04:01:03.265720Z",
   "work_review_status": "unknown",
   "work_reviewed_at": null,
-  "worker_done_at": null
+  "worker_done_at": "2026-05-26T04:01:03.265720Z"
 }

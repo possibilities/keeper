@@ -101,5 +101,5 @@ README change (`README.md:258-347`, `## Example clients` section):
 - [ ] `bun run lint && bun run typecheck && bun test` pass.
 
 ## Done summary
-
+Wired createLiveShell into autopilot/board/git scripts: renamed --clear to --live, top-level renderers return string[], emit seam calls liveShell.pushFrame(lines), SIGINT order is liveShell.dispose() then handle.dispose(), README ## Example clients updated in place to cover --live for all three scripts.
 ## Evidence
