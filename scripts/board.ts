@@ -239,6 +239,83 @@ function epicNumFromId(id: string): number | null {
   return m ? Number.parseInt(m[1], 10) : null;
 }
 
+/**
+ * ANSI SGR sequences for the pill palette. Five semantic buckets keyed off
+ * exact pill strings (plus a `blocked:*` prefix fallback) so the colorizer
+ * stays purely string-driven — no structural knowledge of which column a
+ * pill came from. Standard 16-color ANSI for cross-terminal portability.
+ *
+ * Bucket rationale:
+ *   - active  (bright cyan): in motion right now, look here
+ *   - success (green):       positive resolution
+ *   - error   (red):         failure / needs intervention
+ *   - warn    (yellow):      blocked / something is in the way
+ *   - faded   (dim gray):    terminal + historical / recede
+ *
+ * Tokens NOT in this table render uncolored on purpose — once everything
+ * else is colored, the eye picks `pending` / `todo` / `unvalidated` /
+ * `unknown` / `open` and the role labels (`planner|worker|closer|creator|
+ * refiner`) out by ABSENCE of color. Coloring them too is noise.
+ *
+ * Only the inner token gets the SGR; the brackets stay default so the
+ * pill grid is still scannable.
+ */
+const SGR = {
+  active: "\x1b[96m",
+  success: "\x1b[32m",
+  error: "\x1b[31m",
+  warn: "\x1b[33m",
+  faded: "\x1b[2;37m",
+  reset: "\x1b[0m",
+} as const;
+
+type PillBucket = Exclude<keyof typeof SGR, "reset">;
+
+const PILL_COLORS: Record<string, PillBucket> = {
+  running: "active",
+  in_progress: "active",
+  working: "active",
+  ok: "success",
+  approved: "success",
+  validated: "success",
+  ready: "success",
+  done: "success",
+  failed: "error",
+  rejected: "error",
+  limited: "error",
+  killed: "error",
+  blocked: "warn",
+  completed: "faded",
+  superseded: "faded",
+  exited: "faded",
+  stopped: "faded",
+};
+
+/**
+ * Apply SGR coloring to bracketed pill tokens in a single rendered line.
+ * Pure string→string: matches `[<token>]`, looks the inner token up in
+ * `PILL_COLORS`, and falls back to the `warn` bucket for any `blocked:*`
+ * payload (so `[blocked:dep-on-task fn-614.2]` colors the same as
+ * `[blocked]`). Unknown tokens pass through verbatim.
+ *
+ * Module-level + exported so `test/board.test.ts` can assert the coloring
+ * contract without standing up the subscribe loop. Sidecars and the
+ * byte-compare body stay plain — only the lines shipped to `pushFrame`
+ * pass through this helper, gated on the TTY + NO_COLOR check in `main`.
+ */
+export function colorizePillsInLine(line: string): string {
+  return line.replace(/\[([^\]]+)\]/g, (match, inner: string) => {
+    let bucket = PILL_COLORS[inner];
+    if (bucket === undefined && inner.startsWith("blocked:")) {
+      bucket = "warn";
+    }
+    if (bucket === undefined) {
+      return match;
+    }
+    return `[${SGR[bucket]}${inner}${SGR.reset}]`;
+  });
+}
+
 function taskNumFromId(id: string): number | null {
   const m = /\.(\d+)$/.exec(id);
   return m ? Number.parseInt(m[1], 10) : null;
@@ -304,6 +381,13 @@ async function main(): Promise<void> {
   const liveMode = values.live;
   const liveShell = createLiveShell({ enabled: liveMode });
   let frameCount = 0;
+
+  // Color is for human eyes on a TTY. Pipes / redirects / NO_COLOR stay
+  // plain so consumers (grep, diff, `tee` to a file) see clean text.
+  // Sidecars are ALWAYS plain — only the lines passed to `pushFrame`
+  // pass through the colorizer.
+  const colorEnabled =
+    process.stdout.isTTY === true && process.env.NO_COLOR == null;
 
   // `lastBody` byte-compares the COMBINED body — internal row churn that
   // doesn't surface in the render is invisible by design.
@@ -691,7 +775,11 @@ async function main(): Promise<void> {
     frameCount += 1;
     const lines = ["---", ...bodyLines];
     const frameText = lines.join("\n");
-    liveShell.pushFrame(lines);
+    // Sidecars + byte-compare run on the plain `frameText`; only the lines
+    // shipped to the screen pick up SGR coloring. Gated on TTY + NO_COLOR
+    // so piped/redirected output stays clean.
+    const linesForShell = colorEnabled ? lines.map(colorizePillsInLine) : lines;
+    liveShell.pushFrame(linesForShell);
     writeSidecars(snap, frameText);
   }
 

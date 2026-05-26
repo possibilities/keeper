@@ -28,7 +28,7 @@
  */
 
 import { expect, test } from "bun:test";
-import { renderJobLinkLines } from "../scripts/board";
+import { colorizePillsInLine, renderJobLinkLines } from "../scripts/board";
 import { computeReadiness } from "../src/readiness";
 import { projectRows } from "../src/readiness-client";
 import type {
@@ -283,6 +283,83 @@ test("renderJobLinkLines: multiple entries iterate in provided order (projection
     "   First [creator] [working]",
     "   Second [refiner] [stopped]",
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// colorizePillsInLine — pure string→string SGR coloring of bracketed pills
+// ---------------------------------------------------------------------------
+
+// SGR bytes mirror the table in scripts/board.ts. Re-declared here (not
+// imported) so a regression that flips a bucket's color is caught — the
+// test fails until the change is intentional in both places.
+const ACTIVE = "\x1b[96m";
+const SUCCESS = "\x1b[32m";
+const ERROR = "\x1b[31m";
+const WARN = "\x1b[33m";
+const FADED = "\x1b[2;37m";
+const RESET = "\x1b[0m";
+
+test("colorizePillsInLine: unknown tokens pass through verbatim", () => {
+  expect(colorizePillsInLine("(dir) 12 Foo [planner] [pending]")).toBe(
+    "(dir) 12 Foo [planner] [pending]",
+  );
+});
+
+test("colorizePillsInLine: each bucket colors its representative tokens", () => {
+  expect(colorizePillsInLine("[running]")).toBe(`[${ACTIVE}running${RESET}]`);
+  expect(colorizePillsInLine("[in_progress]")).toBe(
+    `[${ACTIVE}in_progress${RESET}]`,
+  );
+  expect(colorizePillsInLine("[working]")).toBe(`[${ACTIVE}working${RESET}]`);
+  expect(colorizePillsInLine("[ok]")).toBe(`[${SUCCESS}ok${RESET}]`);
+  expect(colorizePillsInLine("[approved]")).toBe(
+    `[${SUCCESS}approved${RESET}]`,
+  );
+  expect(colorizePillsInLine("[validated]")).toBe(
+    `[${SUCCESS}validated${RESET}]`,
+  );
+  expect(colorizePillsInLine("[ready]")).toBe(`[${SUCCESS}ready${RESET}]`);
+  expect(colorizePillsInLine("[done]")).toBe(`[${SUCCESS}done${RESET}]`);
+  expect(colorizePillsInLine("[failed]")).toBe(`[${ERROR}failed${RESET}]`);
+  expect(colorizePillsInLine("[rejected]")).toBe(`[${ERROR}rejected${RESET}]`);
+  expect(colorizePillsInLine("[limited]")).toBe(`[${ERROR}limited${RESET}]`);
+  expect(colorizePillsInLine("[killed]")).toBe(`[${ERROR}killed${RESET}]`);
+  expect(colorizePillsInLine("[blocked]")).toBe(`[${WARN}blocked${RESET}]`);
+  expect(colorizePillsInLine("[completed]")).toBe(
+    `[${FADED}completed${RESET}]`,
+  );
+  expect(colorizePillsInLine("[superseded]")).toBe(
+    `[${FADED}superseded${RESET}]`,
+  );
+  expect(colorizePillsInLine("[exited]")).toBe(`[${FADED}exited${RESET}]`);
+  expect(colorizePillsInLine("[stopped]")).toBe(`[${FADED}stopped${RESET}]`);
+});
+
+test("colorizePillsInLine: blocked:<reason> takes the warn bucket via prefix fallback", () => {
+  expect(colorizePillsInLine("[blocked:dep-on-task fn-614.2]")).toBe(
+    `[${WARN}blocked:dep-on-task fn-614.2${RESET}]`,
+  );
+  expect(colorizePillsInLine("[blocked:unknown]")).toBe(
+    `[${WARN}blocked:unknown${RESET}]`,
+  );
+});
+
+test("colorizePillsInLine: multiple pills on one line each color independently", () => {
+  expect(
+    colorizePillsInLine("1. Foo [#2] [in_progress] [done] [pending]"),
+  ).toBe(
+    `1. Foo [#2] [${ACTIVE}in_progress${RESET}] [${SUCCESS}done${RESET}] [pending]`,
+  );
+});
+
+test("colorizePillsInLine: dependency pills like [#2] are not pill tokens, pass through", () => {
+  expect(colorizePillsInLine("(repo) 12 Foo [#2,#3] [validated] [ready]")).toBe(
+    `(repo) 12 Foo [#2,#3] [${SUCCESS}validated${RESET}] [${SUCCESS}ready${RESET}]`,
+  );
+});
+
+test("colorizePillsInLine: empty string yields empty string", () => {
+  expect(colorizePillsInLine("")).toBe("");
 });
 
 test("byId-style collapse (legacy bug) would only deliver one row", () => {
