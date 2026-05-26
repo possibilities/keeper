@@ -24,6 +24,7 @@
 import { appendFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
+import { createLiveShell } from "../src/live-shell";
 import { subscribeCollection } from "../src/readiness-client";
 
 const COLLECTION = "usage";
@@ -34,6 +35,12 @@ Usage: bun scripts/usage.ts [--sock <path>]
 
   --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)
   --help         Show this help
+
+Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
+  ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
+  q/Ctrl-C quit. Per-frame sidecars are indexed; lifecycle output is
+  appended to /tmp/keeper-usage.<pid>.lifecycle.txt. Session paths
+  print on exit.
 
 Rows show one agentuse profile: id, target + multiplier, session % +
 reset ISO, week % + reset ISO. Per-frame sidecars under
@@ -101,6 +108,7 @@ async function main(): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
+  const liveShell = createLiveShell({ enabled: true });
   let lastFrame: string | null = null;
   let frameCount = 0;
   let lastRows: Record<string, unknown>[] = [];
@@ -148,7 +156,7 @@ async function main(): Promise<void> {
     const frameText = ["---", ...bodyLines].join("\n");
     if (frameText === lastFrame) return;
     frameCount += 1;
-    log(frameText);
+    liveShell.pushFrame(bodyLines);
     writeSidecars(frameText);
     lastFrame = frameText;
   }
@@ -186,6 +194,8 @@ async function main(): Promise<void> {
   });
 
   process.on("SIGINT", () => {
+    // Terminal restoration before subscription teardown.
+    liveShell.dispose();
     handle.dispose();
     log("...");
     log(`meta: ${metaSidecar}`);
