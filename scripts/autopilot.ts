@@ -1,77 +1,45 @@
 #!/usr/bin/env bun
 /**
- * keeper-autopilot — live command list over the keeper subscribe server.
- * Renders TWO `===`-delimited blocks per frame:
+ * keeper-autopilot — dispatch log viewer over the keeper subscribe server.
  *
- *   1. Flat ordered list of shell commands for each task and epic, in the
- *      same traversal order as `scripts/board.ts`'s epic rendering. Every
- *      task pair (work + approve) plus every epic close pair (close +
- *      approve), unfiltered.
- *   2. Only the rows whose readiness verdict is `{ tag: "ready" }` —
- *      the same set surfaced by board's `[ready]` pills. The block opens
- *      with a one-line `# header` reminding the reader that this list is
- *      "any one of these can be dispatched next," NOT a parallel work
- *      queue: the single-root post-pass in `src/readiness.ts` keeps at
- *      most one ready row per project root.
+ * Subscribes to keeperd and (with --launch) auto-dispatches ready rows.
+ * Each frame lists every command dispatched so far, oldest first, with a
+ * relative "time ago" timestamp refreshed on each new dispatch:
  *
- * The two blocks are joined by `\n===\n` (mirrors board's `\n~~~\n`).
- * When both are empty the body is empty — no `===` divider, no chrome.
+ *   [2m ago] launch  cd <dir> && claude '/plan:work <task_id>'
+ *   [just now] notify  task <id> done — needs approval
  *
- * For each epic, in order:
+ * Dispatches are persisted to ~/.local/state/keeper/dispatch.log (JSONL)
+ * and loaded at startup so history survives restarts. A new frame is
+ * emitted immediately after each dispatch event.
  *
- *   cd <target_repo> && claude '/plan:work <task_id>'
- *   bun ~/code/keeper/scripts/approve.ts <task_id>
- *   ...                                               (one pair per task)
- *   cd <project_dir> && claude '/plan:close <epic_id>'
- *   bun ~/code/keeper/scripts/approve.ts <epic_id>
+ * With --launch, fires side effects on EDGES in the readiness verdicts:
+ *   → ready          spawn a Ghostty window running the worker command
+ *                    (`cd … && claude '/plan:work …'` or '/plan:close …')
+ *   → job-pending    fire `notifyctl` (worker done, approval needed)
+ * The approval step is always the human's prerogative. Per-row verdict
+ * signature is carried in a Map across snapshots; the map is NOT cleared
+ * on reconnect so reconnects don't refire already-seen edges.
  *
- * Epics are separated by a blank line. Each frame is led by `---`.
- * A new frame prints only when the rendered output changes (byte-compare
- * on the COMBINED two-block body — a verdict transition with no task-set
- * change still emits because block 2 changes).
- *
- * `task.target_repo` is used as the `cd` path for worker commands; falls
- * back to `epic.project_dir` when `target_repo` is null.
- *
- * Connection / poll / sidecar / SIGINT semantics: the helper
- * (`src/readiness-client.ts`) owns capped-backoff reconnect, the
- * all-three-strict first-paint gate, per-collection coalesce, and the
- * computeReadiness handoff. SIGINT calls the live-shell's `dispose()`
- * THEN `handle.dispose()` — the shell restores the terminal first, then
- * the helper drops every subscription via a bare `unsubscribe` frame,
- * releases timers, and exits cleanly. THREE indexed sidecar files per
- * frame (state JSON + frame text + per-frame unified diff against the
- * previous emit) plus a session meta file at
- * `/tmp/keeper-autopilot.<pid>.meta.txt` accumulate the full index
- * (tab-separated: frame# state frame diff).
+ * Connection / sidecar / SIGINT: the helper (`src/readiness-client.ts`)
+ * owns capped-backoff reconnect, the all-three-strict first-paint gate,
+ * per-collection coalesce, and the computeReadiness handoff. SIGINT calls
+ * the live-shell's `dispose()` THEN `handle.dispose()`. THREE indexed
+ * sidecar files per frame (state JSON + frame text + per-frame unified
+ * diff) plus a session meta file at
+ * `/tmp/keeper-autopilot.<pid>.meta.txt`.
  *
  * Usage:
  *   bun scripts/autopilot.ts [--sock <path>] [--launch]
  *
  *   --sock <path>    Socket path override (else $KEEPER_SOCK, else the
  *                    ~/.local/state/keeper/keeperd.sock default).
- *   --launch         Auto-dispatch on verdict edges: spawn a Ghostty
- *                    window running the worker command on the EDGE into
- *                    `{ tag: "ready" }` for both task rows and close
- *                    rows; fire `notifyctl` on the EDGE into
- *                    `{ tag: "blocked", reason: { kind: "job-pending" } }`
- *                    (worker_phase done + approval pending). The Ghostty
- *                    window's command is the `cd … && claude '/plan:work …'`
- *                    line ONLY — never the approval script; approvals
- *                    remain the human's prerogative and are what the
- *                    notifyctl alert is for. After spawn we try
- *                    `yabai -m window --space 5` to shove the new window
- *                    onto space 5; yabai's absence is tolerated.
- *                    Per-row verdict signature is carried across snapshots
- *                    in a `Map<string,string>`; the empty initial map
- *                    means autopilot's first paint after process start
- *                    fires for everything currently ready / pending. The
- *                    map is NOT cleared on reconnect — a re-paint of the
- *                    same verdicts does not refire.
+ *   --launch         Enable auto-dispatch (see above).
  *   --help           Show this help.
  */
 
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
@@ -82,7 +50,7 @@ import {
 } from "../src/readiness-client";
 import type { Epic } from "../src/types";
 
-const HELP = `keeper-autopilot — live command list over the keeper subscribe server
+const HELP = `keeper-autopilot — dispatch log viewer over the keeper subscribe server
 
 Usage: bun scripts/autopilot.ts [--sock <path>] [--launch]
 
@@ -102,41 +70,41 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   is appended to /tmp/keeper-autopilot.<pid>.lifecycle.txt. Session
   paths print on exit.
 
-Emits two ===-delimited blocks per frame. Block 1 lists every task pair
-(work + approve) and every epic close pair (close + approve) in
-scripts/board.ts traversal order. Block 2 lists only those pairs whose
-readiness verdict is { tag: "ready" } — "any one of these can be
-dispatched next" (single-root post-pass keeps at most one ready row per
-project root), NOT a parallel work queue.
+Each frame lists every command dispatched so far, oldest first, with a
+relative timestamp refreshed on each new dispatch:
 
-Per-epic command shape:
+  [2m ago] launch  cd <dir> && claude '/plan:work <task_id>'
+  [just now] notify  task <id> done — needs approval
 
-  cd <target_repo> && claude '/plan:work <task_id>'
-  bun ~/code/keeper/scripts/approve.ts <task_id>
-  ...
-  cd <project_dir> && claude '/plan:close <epic_id>'
-  bun ~/code/keeper/scripts/approve.ts <epic_id>
-
-Epics are separated by a blank line within each block. Blocks are joined
-by '\\n===\\n'. Each frame is led by '---'. A new frame prints only when
-the rendered output changes (byte-compare on the combined two-block body
-— a verdict transition with no task-set change still emits).
-
-task.target_repo is used as the cd path for worker commands; falls back
-to epic.project_dir when target_repo is null.
+History is loaded at startup from ~/.local/state/keeper/dispatch.log
+(JSONL) so prior sessions are visible across restarts. A new frame is
+emitted after each dispatch.
 
 The helper waits for keeperd to come up and reconnects across restarts;
-each connection-lifecycle change prints a ...-fenced note. Every emitted
-frame is mirrored to three /tmp sidecar files (JSON state, frame text,
-unified diff vs. the previous emit). Ctrl-C calls dispose() and exits 0.
+each connection-lifecycle change is appended to the lifecycle sidecar.
+Ctrl-C calls dispose() and exits 0.
 `;
 
 const seg = (v: unknown) => (v == null ? "" : String(v));
 
-const READY_HEADER =
-  "# any one of these can be dispatched next — NOT a parallel work queue";
-const READY_HEADER_NOTE =
-  "# (single-root post-pass in src/readiness.ts keeps at most one ready row per project root)";
+function timeAgo(ts: string): string {
+  const s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
+  if (s < 5) return "just now";
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+interface DispatchEntry {
+  ts: string;
+  kind: "launch" | "notify";
+  rowId: string;
+  command?: string;
+  message?: string;
+}
 
 // --- command rendering (module-scope so test/autopilot.test.ts can import) ---
 
@@ -248,75 +216,43 @@ async function main(): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
+  const dispatchLogPath = join(dirname(sockPath), "dispatch.log");
   const launchEnabled = values.launch === true;
-  const log = (s: string) => process.stdout.write(`${s}\n`);
   const liveShell = createLiveShell({ enabled: true });
   let frameCount = 0;
 
-  // Byte-compare the COMBINED two-block body — internal row churn that
-  // doesn't surface in either block's render is invisible by design.
-  // A verdict transition with no task-set change still changes block 2,
-  // so the byte compare correctly emits.
   let lastBody: string | null = null;
-  // Snapshot of the most recent emitted state, for the JSON sidecar.
-  let lastEpicsSnapshot: Epic[] = [];
 
-  // --- command rendering ---
-  // `renderEpicCommands` and `renderEpicCommandsFiltered` live at module
-  // scope above so test/autopilot.test.ts can import them directly.
+  // Load existing dispatch log entries at startup for cross-restart history.
+  const dispatchLog: DispatchEntry[] = (() => {
+    try {
+      return readFileSync(dispatchLogPath, "utf-8")
+        .split("\n")
+        .filter((l) => l.trim() !== "")
+        .flatMap((l) => {
+          try {
+            const e = JSON.parse(l) as DispatchEntry;
+            return e?.ts && e?.kind ? [e] : [];
+          } catch {
+            return [];
+          }
+        });
+    } catch {
+      return [];
+    }
+  })();
 
-  /**
-   * Full frame body: two `===`-delimited blocks, returned as one element
-   * per output line so the live-shell can consume lines (per-line ANSI
-   * diff). The caller joins with `\n` for stdout / sidecar / byte-compare.
-   *
-   * Block 1 — every task pair + close pair per epic, server order.
-   * Block 2 — only rows whose readiness verdict tag is `"ready"`, with
-   *           a one-line `#`-prefixed header explaining the single-root
-   *           post-pass semantics.
-   *
-   * When both blocks are empty the body is `===` alone (preserves the
-   * divider — mirrors board's empty-section policy).
-   */
-  function renderBody(snap: ReadinessClientSnapshot): string[] {
-    const epicsArr = snap.epics;
-    const readiness = snap.readiness;
-    const isReady = (kind: "task" | "close", id: string): boolean => {
-      const verdict =
-        kind === "task"
-          ? readiness.perTask.get(id)
-          : readiness.perCloseRow.get(id);
-      return verdict !== undefined && verdict.tag === "ready";
-    };
-
-    const block1 =
-      epicsArr.length === 0
-        ? ""
-        : epicsArr.map((e) => renderEpicCommands(e)).join("\n\n");
-
-    const readyBlocks: string[] = [];
-    for (const epic of epicsArr) {
-      const rendered = renderEpicCommandsFiltered(epic, isReady);
-      if (rendered != null) {
-        readyBlocks.push(rendered);
+  function renderDispatchFrame(): string[] {
+    if (dispatchLog.length === 0) {
+      return ["# no commands dispatched yet"];
+    }
+    return dispatchLog.map((e) => {
+      const age = timeAgo(e.ts);
+      if (e.kind === "launch") {
+        return `[${age}] launch  ${e.command ?? ""}`;
       }
-    }
-    const block2 =
-      readyBlocks.length === 0
-        ? ""
-        : `${READY_HEADER}\n${READY_HEADER_NOTE}\n${readyBlocks.join("\n\n")}`;
-
-    let body: string;
-    if (block1 === "" && block2 === "") {
-      body = "";
-    } else if (block1 === "") {
-      body = block2;
-    } else if (block2 === "") {
-      body = block1;
-    } else {
-      body = `${block1}\n===\n${block2}`;
-    }
-    return body === "" ? [] : body.split("\n");
+      return `[${age}] notify  ${e.message ?? ""}`;
+    });
   }
 
   // --- sidecar paths ---
@@ -342,7 +278,7 @@ async function main(): Promise<void> {
     const sFrame = `/tmp/keeper-autopilot.${process.pid}.frame.${frameCount}.txt`;
     const sDiff = `/tmp/keeper-autopilot.${process.pid}.diff.${frameCount}.txt`;
 
-    const stateJson = { epics: lastEpicsSnapshot };
+    const stateJson = { dispatches: dispatchLog };
     try {
       writeFileSync(sState, `${JSON.stringify(stateJson, null, 2)}\n`);
       writeFileSync(sFrame, `${frameText}\n`);
@@ -384,19 +320,13 @@ async function main(): Promise<void> {
     lastFrameText = frameText;
   }
 
-  /**
-   * Emit a frame iff the rendered body changed since the last emit.
-   * The all-three-strict first-paint gate lives in the helper — by the
-   * time this fires, the snapshot is guaranteed complete.
-   */
-  function emitFrameIfChanged(snap: ReadinessClientSnapshot): void {
-    const bodyLines = renderBody(snap);
+  function emitFrame(): void {
+    const bodyLines = renderDispatchFrame();
     const body = bodyLines.join("\n");
     if (body === lastBody) {
       return;
     }
     lastBody = body;
-    lastEpicsSnapshot = snap.epics;
     frameCount += 1;
     const frameText = ["---", ...bodyLines].join("\n");
     liveShell.pushFrame(bodyLines);
@@ -451,6 +381,16 @@ async function main(): Promise<void> {
     return `blocked:${v.reason.kind}`;
   }
 
+  function logDispatch(entry: DispatchEntry): void {
+    dispatchLog.push(entry);
+    try {
+      appendFileSync(dispatchLogPath, `${JSON.stringify(entry)}\n`);
+    } catch (err) {
+      noteLine(`# warn: dispatch log write failed: ${(err as Error).message}`);
+    }
+    emitFrame();
+  }
+
   /**
    * Spawn a Ghostty window running `<command>` (already wrapped in `cd …
    * && claude …` shape by the caller). Fire-and-forget — stdout/stderr
@@ -482,7 +422,12 @@ async function main(): Promise<void> {
       .join(
         " ",
       )} && sleep 0.3 && yabai -m window --space 5 2>/dev/null || true`;
-    noteLine(`# launch: ${rowId} -- ${workerShellCommand}`);
+    logDispatch({
+      ts: new Date().toISOString(),
+      kind: "launch",
+      rowId,
+      command: workerShellCommand,
+    });
     try {
       const proc = Bun.spawn(["sh", "-c", shellLine], {
         stdout: "pipe",
@@ -515,7 +460,12 @@ async function main(): Promise<void> {
       kind === "task"
         ? `task ${rowId} done — needs approval`
         : `epic ${rowId} close done — needs approval`;
-    noteLine(`# notify: approval-pending ${kind} ${rowId}`);
+    logDispatch({
+      ts: new Date().toISOString(),
+      kind: "notify",
+      rowId,
+      message,
+    });
     try {
       const proc = Bun.spawn(
         [
@@ -618,7 +568,7 @@ async function main(): Promise<void> {
     if (launchEnabled) {
       processLaunchTransitions(snap);
     }
-    emitFrameIfChanged(snap);
+    emitFrame();
   };
 
   const handle = subscribeReadiness({
@@ -631,10 +581,10 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => {
     liveShell.dispose();
     handle.dispose();
-    log("...");
-    log(`meta: ${metaSidecar}`);
-    log(`lifecycle: ${lifecycleSidecar}`);
-    log("...");
+    process.stdout.write("...\n");
+    process.stdout.write(`meta: ${metaSidecar}\n`);
+    process.stdout.write(`lifecycle: ${lifecycleSidecar}\n`);
+    process.stdout.write("...\n");
     process.exit(0);
   });
 }
