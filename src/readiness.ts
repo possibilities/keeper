@@ -196,7 +196,12 @@ export function computeReadiness(
 function evaluateTask(
   task: Task,
   epic: Epic,
-  jobs: Map<string, Job>,
+  // Schema v21 dropped the live-jobs join from `anyJobLinkRunning` — the
+  // embedded `JobLinkEntry.state` carries the linked session's last-known
+  // lifecycle off the projection. The arg stays in the signature so
+  // `computeReadiness`'s public surface is unchanged for external
+  // callers; the underscore signals it's intentionally unused here.
+  _jobs: Map<string, Job>,
   subRunningByJobId: Map<string, SubagentInvocation[]>,
   perTask: Map<string, Verdict>,
   // perCloseRow is unused for the task path but kept in the signature for
@@ -218,7 +223,7 @@ function evaluateTask(
   }
 
   // 3. planner-running.
-  if (anyJobLinkRunning(epic, jobs)) {
+  if (anyJobLinkRunning(epic)) {
     return { tag: "blocked", reason: { kind: "planner-running" } };
   }
 
@@ -288,7 +293,10 @@ function evaluateTask(
 
 function evaluateCloseRow(
   epic: Epic,
-  jobs: Map<string, Job>,
+  // See `evaluateTask` for why this is `_jobs` — schema v21's embedded
+  // `JobLinkEntry.state` removed the live-jobs join, and the public
+  // `computeReadiness` surface stays unchanged.
+  _jobs: Map<string, Job>,
   subRunningByJobId: Map<string, SubagentInvocation[]>,
   perTask: Map<string, Verdict>,
 ): Verdict {
@@ -303,7 +311,7 @@ function evaluateCloseRow(
   }
 
   // 3. planner-running.
-  if (anyJobLinkRunning(epic, jobs)) {
+  if (anyJobLinkRunning(epic)) {
     return { tag: "blocked", reason: { kind: "planner-running" } };
   }
 
@@ -545,10 +553,19 @@ function rollupEpicHeader(
 // Predicate helpers
 // ---------------------------------------------------------------------------
 
-function anyJobLinkRunning(epic: Epic, jobs: Map<string, Job>): boolean {
+/**
+ * Predicate 3 (`planner-running`). Reads each link's `state` directly off
+ * the embedded `JobLinkEntry` — schema v21 denormalized
+ * `(title, state, rate_limited_at)` off the linked `jobs` row at the
+ * reducer's write boundary so this predicate no longer needs to join
+ * against the live `jobs` page. Terminal sessions and off-page live
+ * sessions used to fall through the join and silently false-negative
+ * here (link.state was effectively unknown); now the embedded `state`
+ * IS the projection's last-known reading and `"working"` is dispositive.
+ */
+function anyJobLinkRunning(epic: Epic): boolean {
   for (const link of epic.job_links) {
-    const job = jobs.get(link.job_id);
-    if (job !== undefined && job.state === "working") {
+    if (link.state === "working") {
       return true;
     }
   }

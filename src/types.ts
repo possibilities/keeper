@@ -30,11 +30,35 @@ export interface Link {
  * session whose planctl footprint touched this epic inside one of its
  * `/plan:plan` windows.
  *
- * Mirrors `JobLink` in `src/plan-classifier.ts` field-for-field.
+ * **Embedded display payload** (schema v21): `title` / `state` /
+ * `rate_limited_at` are denormalized off the linked `jobs` row at the
+ * reducer's write boundary so renderers (board) and predicates (readiness)
+ * can read everything off the projection with no live-jobs join. Without
+ * this denormalization, terminal sessions and off-page live sessions
+ * fell through to a degraded `[{job_id}] [{kind}]` line on the board and
+ * the planner-running predicate quietly skipped link entries whose
+ * `job_id` wasn't in the current jobs page.
+ *
+ * The classifier's `JobLink` shape (`src/plan-classifier.ts`) stays thin
+ * (`{kind, job_id}`) — enrichment happens at the reducer's write boundary
+ * (`enrichJobLink` in `src/reducer.ts`) so the classifier stays a pure
+ * function of events. The reducer fans both ways: (a) every
+ * `syncPlanctlLinks` write reads the live `jobs` row and stamps these
+ * three fields; (b) every `syncJobLinksOnJobWrite` write — fired from
+ * any jobs-write that touches `(title, state, rate_limited_at)` on a
+ * session whose `epic_links !== '[]'` — re-stamps the same fields on
+ * every epic the session linked into.
+ *
+ * Defaults on a missing `jobs` row at enrichment time:
+ * `{title: null, state: "stopped", rate_limited_at: null}` — re-fold-safe
+ * "safe value" pattern per CLAUDE.md (never throw inside the fold tx).
  */
 export interface JobLinkEntry {
   kind: "creator" | "refiner";
   job_id: string;
+  title: string | null;
+  state: string;
+  rate_limited_at: number | null;
 }
 
 /**

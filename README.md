@@ -445,7 +445,17 @@ epic's embedded `tasks` JSON array (a task change `patch`es the parent epic;
 tombstones retract). As of schema v14, the `epics` projection adds
 `last_validated_at` (TEXT, nullable) — the validation timestamp planctl writes
 via `planctl validate --epic <id>` and the board client renders as a
-`[validated|unvalidated]` pill. Each epic also embeds its plan/close-verb
+`[validated|unvalidated]` pill. As of schema v21, each `epics.job_links`
+entry embeds the linked job's `title` / `state` / `rate_limited_at`
+denormalized off the live `jobs` row at the reducer's write boundary
+(via the shared `enrichJobLink` helper) — renderers (board) and
+predicates (readiness) read everything off `epics.job_links` with no
+live-jobs join, so terminal sessions and off-page live sessions no
+longer fall through to a degraded render line. A symmetric jobs-write
+fan-out (`syncJobLinksOnJobWrite`) re-stamps the enriched fields on
+every linked epic whenever a jobs row changes
+`(title, state, rate_limited_at)`, keeping the projection in lockstep
+with the session's last-known lifecycle. Each epic also embeds its plan/close-verb
 jobs as a `jobs` JSON array, and each task element embeds its own work-verb
 jobs as a nested `jobs` sub-array — fanned in from the reducer's jobs-side
 writes whenever a SessionStart spawn name parses as `{plan|work|close}::<ref>`
@@ -540,9 +550,12 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT job_id, plan_verb, plan_ref, epic_links FROM jobs WHERE json_array_length(epic_links) > 0 ORDER BY updated_at DESC LIMIT 10"
 
-# Epics by inbound-link density — every job whose planctl-CLI footprint created or refined the epic during a /plan:plan window (epics.job_links is the symmetric per-epic fan-out):
+# Epics by inbound-link density — every job whose planctl-CLI footprint created or refined the epic during a /plan:plan window (epics.job_links is the symmetric per-epic fan-out; as of schema v21 each entry embeds the linked job's title/state/rate_limited_at denormalized off the jobs row at the reducer's write boundary, so renderers + predicates no longer need a live-jobs join):
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT epic_id, epic_number, title, json_array_length(job_links) AS n FROM epics WHERE json_array_length(job_links) > 0 ORDER BY n DESC, epic_number ASC LIMIT 10"
+# Unnest job_links to see each link's embedded display payload (schema v21: kind, job_id, title, state, rate_limited_at):
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT e.epic_id, json_extract(l.value, '\$.kind') AS kind, json_extract(l.value, '\$.job_id') AS job_id, json_extract(l.value, '\$.title') AS title, json_extract(l.value, '\$.state') AS state, json_extract(l.value, '\$.rate_limited_at') AS rate_limited_at FROM epics e, json_each(e.job_links) l ORDER BY e.epic_number ASC, kind ASC, job_id ASC LIMIT 20"
 
 # Killed sessions specifically (proven-dead from outside the hook stream — SIGKILL, terminal-pane closure, reboot):
 sqlite3 ~/.local/state/keeper/keeper.db \

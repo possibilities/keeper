@@ -28,12 +28,14 @@
  */
 
 import { expect, test } from "bun:test";
+import { renderJobLinkLines } from "../scripts/board";
 import { computeReadiness } from "../src/readiness";
 import { projectRows } from "../src/readiness-client";
 import type {
   EmbeddedJob,
   Epic,
   Job,
+  JobLinkEntry,
   SubagentInvocation,
   Task,
 } from "../src/types";
@@ -189,6 +191,98 @@ test("two running invocations on one job_id both reach computeReadiness and bloc
     tag: "blocked",
     reason: { kind: "sub-agent-running" },
   });
+});
+
+// ---------------------------------------------------------------------------
+// renderJobLinkLines — schema v21 widened JobLinkEntry, single-branch render
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a schema-v21 `JobLinkEntry` with defaults matching
+ * `enrichJobLink`'s missing-row defaults (`title: null, state: "stopped",
+ * rate_limited_at: null`). Callers override per-test.
+ */
+function makeLink(overrides: Partial<JobLinkEntry>): JobLinkEntry {
+  return {
+    kind: "refiner",
+    job_id: "session-1",
+    title: null,
+    state: "stopped",
+    rate_limited_at: null,
+    ...overrides,
+  };
+}
+
+test("renderJobLinkLines: empty / non-array input → []", () => {
+  expect(renderJobLinkLines([])).toEqual([]);
+  expect(renderJobLinkLines(undefined)).toEqual([]);
+  expect(renderJobLinkLines(null)).toEqual([]);
+  expect(renderJobLinkLines("not an array")).toEqual([]);
+});
+
+test("renderJobLinkLines: one entry, all fields populated → one line, title + kind + state pills", () => {
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "creator",
+      job_id: "sess-A",
+      title: "Plan epic 7",
+      state: "working",
+    }),
+  ]);
+  expect(out).toEqual(["   Plan epic 7 [creator] [working]"]);
+});
+
+test("renderJobLinkLines: null title falls back to job_id (preserves line shape)", () => {
+  // Schema-v21 fallback: when the embedded title is null (e.g. a
+  // shell-inserted epic whose linked session has no captured title
+  // yet), the renderer subs in `job_id` so the readable label stays
+  // present and the bracket pill columns stay aligned.
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "refiner",
+      job_id: "sess-no-title",
+      title: null,
+      state: "stopped",
+    }),
+  ]);
+  expect(out).toEqual(["   sess-no-title [refiner] [stopped]"]);
+});
+
+test("renderJobLinkLines: rate_limited_at non-null appends [limited] pill (same line shape, live + terminal + off-page all)", () => {
+  // The [limited] pill is the only render variation; the spec says the
+  // entry shape is now uniform across live / terminal / off-page —
+  // there's no second branch to test, just the optional pill segment.
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "creator",
+      job_id: "sess-rl",
+      title: "Plan epic 8",
+      state: "stopped",
+      rate_limited_at: 1700000000,
+    }),
+  ]);
+  expect(out).toEqual(["   Plan epic 8 [creator] [stopped] [limited]"]);
+});
+
+test("renderJobLinkLines: multiple entries iterate in provided order (projection's own (kind, job_id) ASC sort)", () => {
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "creator",
+      job_id: "sess-A",
+      title: "First",
+      state: "working",
+    }),
+    makeLink({
+      kind: "refiner",
+      job_id: "sess-B",
+      title: "Second",
+      state: "stopped",
+    }),
+  ]);
+  expect(out).toEqual([
+    "   First [creator] [working]",
+    "   Second [refiner] [stopped]",
+  ]);
 });
 
 test("byId-style collapse (legacy bug) would only deliver one row", () => {

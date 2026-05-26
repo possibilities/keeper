@@ -35,10 +35,20 @@ the native value" is the default.
   epic's embedded `jobs` array or the target task element's nested `jobs`
   sub-array, AND the `syncPlanctlLinks` fan-out from a `planctl_op != NULL`
   event re-deriving the touched session's `jobs.epic_links` and every touched
-  epic's `epics.job_links`) and bumps `reducer_state.last_event_id` in one
-  transaction. A crash mid-fold rolls back both; boot drain re-folds
-  idempotently. This is the exactly-once-per-event guarantee — never split
-  the two writes across transactions.
+  epic's `epics.job_links` — each `epics.job_links` entry carries the widened
+  `JobLinkEntry` shape `{kind, job_id, title, state, rate_limited_at}` with
+  `(title, state, rate_limited_at)` enriched off the linked `jobs` row via the
+  shared `enrichJobLink` helper inside the open transaction, AND the
+  symmetric `syncJobLinksOnJobWrite` fan-out from a jobs-write whose
+  `jobs.epic_links !== '[]'` — re-stamping each linked epic's matching
+  `job_links` entry with fresh enrichment so a `state` flip on
+  UserPromptSubmit / Stop / SessionEnd / Killed / RateLimited, a title
+  update on TranscriptTitle, or a `rate_limited_at` set/clear propagates
+  to every epic that references the session) and bumps
+  `reducer_state.last_event_id` in one transaction. A crash mid-fold rolls
+  back both; boot drain re-folds idempotently. This is the
+  exactly-once-per-event guarantee — never split the two writes across
+  transactions.
 - **Schema defaults match the zero-event projection.** Keep schema defaults and
   the reducer's no-op / seed branches in sync, so a re-fold from an empty table
   reproduces the same rows.

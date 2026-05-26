@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 20;
+export const SCHEMA_VERSION = 21;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1750,6 +1750,145 @@ function migrate(db: Database): void {
       // `sqlite_stat1` table the planner reads). One-shot; subsequent
       // boots don't re-ANALYZE here.
       db.run("ANALYZE events");
+    }
+
+    // v20→v21: widen `epics.job_links` entries from the thin classifier
+    // shape `{kind, job_id}` to the enriched projection shape
+    // `{kind, job_id, title, state, rate_limited_at}` per fn-612 task .1.
+    // The denormalized payload lets renderers (board) and predicates
+    // (readiness) read everything off `epics.job_links` with no live-jobs
+    // join — terminal sessions and off-page live sessions stop falling
+    // through to the degraded `[{job_id}] [{kind}]` render line.
+    //
+    // The column TYPE is unchanged (TEXT, JSON-array) — only the entry
+    // shape widens — so no `ALTER TABLE` runs here. The migration is a
+    // version-guarded re-derive of every epic's `job_links` using the
+    // SAME `enrichJobLink` + `sortJobLinks` helpers as the live reducer
+    // (`src/reducer.ts`). Byte-identical re-fold is non-negotiable
+    // (CLAUDE.md "byte-identical re-fold" invariant): if the migration
+    // backfill and the live reducer produced different JSON, a from-
+    // scratch re-fold would diverge from the migrated state and the
+    // server-worker's per-row diff would emit spurious `patch` frames.
+    //
+    // Single code path enforced by inlining the SAME `(title, state,
+    // rate_limited_at)` enrichment shape here — see `enrichJobLink` in
+    // `src/reducer.ts` for the live-reducer twin. Defaults on a missing
+    // `jobs` row at enrichment time: `{title: null, state: "stopped",
+    // rate_limited_at: null}` — preserves orphan entries with safe
+    // values so re-fold determinism holds (a from-scratch re-fold sees
+    // the same missing row at the same enrichment point and writes the
+    // same defaults).
+    //
+    // Version-guarded: a non-idempotent re-derive must run AT MOST
+    // once. The guard reads the meta row written by a PRIOR migrate() —
+    // on a fresh v21 DB (or one that crashed before stamping v21)
+    // `storedVersionV21 < 21` and the backfill runs; on a steady-state
+    // v21+ DB it skips. The re-derive itself is full-replace
+    // (idempotent by construction — re-running it on the same input
+    // produces byte-identical output), so even a partial-run resume on
+    // crash is safe; the guard exists to avoid the per-boot UPDATE
+    // storm on a long-lived DB.
+    const storedVersionV21 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV21 < 21) {
+      // Re-derive every epic's `job_links` in place. We don't need to
+      // re-run the classifier — the existing `job_links` already carries
+      // the right `(kind, job_id)` edges; we only need to enrich each
+      // entry with the linked `jobs` row's display fields.
+      //
+      // Re-using the SAME enrichment shape as the live reducer:
+      //   row.{title, state, rate_limited_at} — same column SELECT;
+      //   missing row → defaults {title: null, state: "stopped",
+      //                            rate_limited_at: null}
+      //
+      // The (kind, job_id) sort tiebreaker is re-applied for safety —
+      // a hand-written or otherwise-mis-sorted blob would otherwise ride
+      // through.
+      const epicRowsV21 = db
+        .prepare("SELECT epic_id, job_links FROM epics")
+        .all() as { epic_id: string; job_links: string | null }[];
+      for (const row of epicRowsV21) {
+        // Safe parse — a malformed blob folds to []. NEVER throw inside
+        // migrate() (a throw rolls back the surrounding BEGIN IMMEDIATE
+        // and wedges the upgrade).
+        let entries: { kind: string; job_id: string }[] = [];
+        if (row.job_links != null && row.job_links.length > 0) {
+          try {
+            const parsed = JSON.parse(row.job_links);
+            if (Array.isArray(parsed)) {
+              entries = parsed as { kind: string; job_id: string }[];
+            }
+          } catch {
+            // malformed blob — fold to []; the UPDATE below writes '[]'
+            // and the entry is gone (matches the zero-event reading).
+          }
+        }
+        const enriched: {
+          kind: string;
+          job_id: string;
+          title: string | null;
+          state: string;
+          rate_limited_at: number | null;
+        }[] = [];
+        for (const e of entries) {
+          if (
+            e == null ||
+            typeof e !== "object" ||
+            typeof e.kind !== "string" ||
+            typeof e.job_id !== "string"
+          ) {
+            continue; // malformed entry — drop.
+          }
+          const jobRow = db
+            .prepare(
+              "SELECT title, state, rate_limited_at FROM jobs WHERE job_id = ?",
+            )
+            .get(e.job_id) as {
+            title: string | null;
+            state: string;
+            rate_limited_at: number | null;
+          } | null;
+          if (jobRow == null) {
+            // Orphan entry (job_id with no `jobs` row) — retain with
+            // safe defaults so re-fold determinism holds.
+            enriched.push({
+              kind: e.kind,
+              job_id: e.job_id,
+              title: null,
+              state: "stopped",
+              rate_limited_at: null,
+            });
+          } else {
+            enriched.push({
+              kind: e.kind,
+              job_id: e.job_id,
+              title: jobRow.title,
+              state: jobRow.state,
+              rate_limited_at: jobRow.rate_limited_at,
+            });
+          }
+        }
+        // Total-order ASC sort on (kind, job_id) — mirrors `sortJobLinks`
+        // in `src/reducer.ts`. Re-apply for safety: a hand-written or
+        // otherwise-mis-sorted blob would otherwise produce a different
+        // post-migration JSON than a from-scratch re-fold.
+        enriched.sort((a, b) => {
+          if (a.kind < b.kind) return -1;
+          if (a.kind > b.kind) return 1;
+          if (a.job_id < b.job_id) return -1;
+          if (a.job_id > b.job_id) return 1;
+          return 0;
+        });
+        db.run("UPDATE epics SET job_links = ? WHERE epic_id = ?", [
+          JSON.stringify(enriched),
+          row.epic_id,
+        ]);
+      }
     }
 
     db.prepare(

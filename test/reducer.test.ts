@@ -2892,8 +2892,19 @@ function getEpicLinks(sessionId: string): { kind: string; target: string }[] {
   return JSON.parse(row.epic_links);
 }
 
-/** Read the persisted `epics.job_links` as a real array. */
-function getJobLinks(epicId: string): { kind: string; job_id: string }[] {
+/**
+ * Read the persisted `epics.job_links` as a real array of the schema-v21
+ * widened JobLinkEntry shape `{kind, job_id, title, state, rate_limited_at}`.
+ * The reducer's `enrichJobLink` helper denormalizes the last three fields
+ * off the linked `jobs` row at write time.
+ */
+function getJobLinks(epicId: string): {
+  kind: string;
+  job_id: string;
+  title: string | null;
+  state: string;
+  rate_limited_at: number | null;
+}[] {
   const row = db
     .query("SELECT job_links FROM epics WHERE epic_id = ?")
     .get(epicId) as { job_links: string | null } | null;
@@ -2918,7 +2929,13 @@ test("syncPlanctlLinks: single-session single-window one creator emits creator e
     { kind: "creator", target: "fn-1-new" },
   ]);
   expect(getJobLinks("fn-1-new")).toEqual([
-    { kind: "creator", job_id: "sess-creator" },
+    {
+      kind: "creator",
+      job_id: "sess-creator",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
   ]);
 });
 
@@ -2949,8 +2966,20 @@ test("syncPlanctlLinks: single-session two windows creator-then-refiner-same-epi
     { kind: "refiner", target: "fn-2-foo" },
   ]);
   expect(getJobLinks("fn-2-foo")).toEqual([
-    { kind: "creator", job_id: "sess-cr" },
-    { kind: "refiner", job_id: "sess-cr" },
+    {
+      kind: "creator",
+      job_id: "sess-cr",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
+    {
+      kind: "refiner",
+      job_id: "sess-cr",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
   ]);
 });
 
@@ -3005,8 +3034,20 @@ test("syncPlanctlLinks: two sessions touching the same epic both appear in job_l
     { kind: "refiner", target: "fn-4-multi" },
   ]);
   expect(getJobLinks("fn-4-multi")).toEqual([
-    { kind: "creator", job_id: "sess-a-fan" },
-    { kind: "refiner", job_id: "sess-b-fan" },
+    {
+      kind: "creator",
+      job_id: "sess-a-fan",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
+    {
+      kind: "refiner",
+      job_id: "sess-b-fan",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
   ]);
 });
 
@@ -3080,8 +3121,20 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
     { kind: "refiner", target: "fn-7-xs" },
   ]);
   expect(getJobLinks("fn-7-xs")).toEqual([
-    { kind: "refiner", job_id: "sess-A-xs" },
-    { kind: "refiner", job_id: "sess-B-xs" },
+    {
+      kind: "refiner",
+      job_id: "sess-A-xs",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
+    {
+      kind: "refiner",
+      job_id: "sess-B-xs",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
   ]);
 
   // Follow-up in session A — backdated `epic-create` at t=100 lands BEFORE
@@ -3113,8 +3166,20 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
   // cross-session re-derive. Sort is total-order (kind, job_id) ASC —
   // creator < refiner lexicographically, so creator:A comes first.
   expect(getJobLinks("fn-7-xs")).toEqual([
-    { kind: "creator", job_id: "sess-A-xs" },
-    { kind: "refiner", job_id: "sess-B-xs" },
+    {
+      kind: "creator",
+      job_id: "sess-A-xs",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
+    {
+      kind: "refiner",
+      job_id: "sess-B-xs",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
   ]);
 });
 
@@ -3131,7 +3196,13 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
   });
   drainAll();
   expect(getJobLinks("fn-5-survive")).toEqual([
-    { kind: "creator", job_id: "sess-carveout" },
+    {
+      kind: "creator",
+      job_id: "sess-carveout",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
   ]);
   // Now fold an EpicSnapshot for the same epic — the ON CONFLICT clause
   // MUST omit job_links (alongside jobs / tasks) so the carve-out preserves
@@ -3152,7 +3223,13 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
   const epic = getEpic("fn-5-survive");
   expect(epic?.title).toBe("Survive Carve-out");
   expect(getJobLinks("fn-5-survive")).toEqual([
-    { kind: "creator", job_id: "sess-carveout" },
+    {
+      kind: "creator",
+      job_id: "sess-carveout",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
   ]);
 });
 
@@ -3201,6 +3278,288 @@ test("syncPlanctlLinks: re-fold determinism (rewind + DELETE + drain reproduces 
   const jobsAfter = db.query("SELECT * FROM jobs ORDER BY job_id").all();
   expect(epicsAfter).toEqual(epicsBefore);
   expect(jobsAfter).toEqual(jobsBefore);
+});
+
+// ---------------------------------------------------------------------------
+// syncJobLinksOnJobWrite — schema-v21 reverse fan-out from a jobs-write
+// into every linked epic's `job_links` enrichment payload.
+// ---------------------------------------------------------------------------
+
+test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded state on every linked epic", () => {
+  // Seed: a planctl creator edge → epic gets a job_links entry whose
+  // initial enriched state is "stopped" (the jobs row's default after
+  // SessionStart). A subsequent UserPromptSubmit flips state to
+  // "working" and the reverse fan-out must re-stamp the entry so the
+  // board's planner-running predicate fires.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-flip" });
+  planPlanOpener("sess-flip");
+  planctlEvent({
+    sessionId: "sess-flip",
+    op: "epic-create",
+    target: "fn-12-flip",
+    epicId: "fn-12-flip",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getJobLinks("fn-12-flip")).toEqual([
+    {
+      kind: "creator",
+      job_id: "sess-flip",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
+  ]);
+
+  // UserPromptSubmit flips state to "working" — the jobs-side branch
+  // writes the row, then `syncIfPlanRef` → `syncJobLinksOnJobWrite`
+  // re-stamps every linked epic's matching entry with fresh enrichment.
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-flip" });
+  drainAll();
+  expect(getJobLinks("fn-12-flip")).toEqual([
+    {
+      kind: "creator",
+      job_id: "sess-flip",
+      title: null,
+      state: "working",
+      rate_limited_at: null,
+    },
+  ]);
+
+  // Stop → state flips back to "stopped"; the reverse fan-out propagates.
+  insertEvent({ hook_event: "Stop", session_id: "sess-flip" });
+  drainAll();
+  expect(getJobLinks("fn-12-flip")[0]?.state).toBe("stopped");
+});
+
+test("syncJobLinksOnJobWrite: title update on TranscriptTitle re-stamps embedded title on every linked epic", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-title" });
+  planPlanOpener("sess-title");
+  planctlEvent({
+    sessionId: "sess-title",
+    op: "epic-create",
+    target: "fn-13-title",
+    epicId: "fn-13-title",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getJobLinks("fn-13-title")[0]?.title).toBeNull();
+
+  // TranscriptTitle event drives the priority-3 title rule, which writes
+  // jobs.{title, title_source}; the post-write `syncIfPlanRef` →
+  // `syncJobLinksOnJobWrite` reverse-fans the new title into every
+  // linked epic's job_links entry.
+  insertEvent({
+    hook_event: "TranscriptTitle",
+    session_id: "sess-title",
+    data: JSON.stringify({ session_title: "Live session title" }),
+  });
+  drainAll();
+  expect(getJobLinks("fn-13-title")[0]?.title).toBe("Live session title");
+});
+
+test("syncJobLinksOnJobWrite: RateLimited sets rate_limited_at, revival clears it", () => {
+  // Set up a working session linked to an epic.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-rl" });
+  planPlanOpener("sess-rl");
+  planctlEvent({
+    sessionId: "sess-rl",
+    op: "epic-create",
+    target: "fn-14-rl",
+    epicId: "fn-14-rl",
+    subjectPresent: true,
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rl" });
+  drainAll();
+  expect(getJobLinks("fn-14-rl")[0]?.rate_limited_at).toBeNull();
+
+  // RateLimited stamps `rate_limited_at` and flips state to "stopped";
+  // the reverse fan-out propagates BOTH to the embedded entry.
+  const rlId = insertEvent({
+    hook_event: "RateLimited",
+    session_id: "sess-rl",
+  });
+  drainAll();
+  const limited = getJobLinks("fn-14-rl")[0];
+  expect(limited?.state).toBe("stopped");
+  expect(limited?.rate_limited_at).not.toBeNull();
+
+  // A fresh UserPromptSubmit revives the session — clears
+  // `rate_limited_at` and flips state back to "working". The reverse
+  // fan-out propagates the clear to the embedded entry.
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rl" });
+  drainAll();
+  const revived = getJobLinks("fn-14-rl")[0];
+  expect(revived?.state).toBe("working");
+  expect(revived?.rate_limited_at).toBeNull();
+  // Smoke: the RateLimited event was the trigger that minted the prior
+  // stamp; the prior reference is preserved for clarity.
+  expect(rlId).toBeGreaterThan(0);
+});
+
+test("syncJobLinksOnJobWrite: short-circuits when jobs.epic_links is '[]' (no fan-out)", () => {
+  // A bare SessionStart with no planctl footprint — `jobs.epic_links`
+  // is `'[]'` and the reverse fan-out short-circuits on the
+  // pre-parse byte-compare. Sanity check: no epic row is created and
+  // no error is raised.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-no-links" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-no-links" });
+  insertEvent({ hook_event: "Stop", session_id: "sess-no-links" });
+  drainAll();
+  const epicCount = db.query("SELECT count(*) AS c FROM epics").get() as {
+    c: number;
+  };
+  expect(epicCount.c).toBe(0);
+});
+
+test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other entries verbatim", () => {
+  // Two sessions both refine the same epic. A jobs-write on session A
+  // must re-stamp ONLY A's entry on the epic — B's entry must survive
+  // verbatim. Regression: a missing carve-out (e.g. an inline rebuild
+  // that dropped every other entry instead of filtering by job_id)
+  // would silently lose B's edge on every A jobs-write.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-A-carve" });
+  planPlanOpener("sess-A-carve");
+  planctlEvent({
+    sessionId: "sess-A-carve",
+    op: "epic-create",
+    target: "fn-15-carve",
+    epicId: "fn-15-carve",
+    subjectPresent: true,
+  });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-B-carve" });
+  planPlanOpener("sess-B-carve");
+  planctlEvent({
+    sessionId: "sess-B-carve",
+    op: "epic-set-title",
+    target: "fn-15-carve",
+    epicId: "fn-15-carve",
+    subjectPresent: true,
+  });
+  drainAll();
+  const initial = getJobLinks("fn-15-carve");
+  expect(initial).toHaveLength(2);
+  expect(initial[0]?.kind).toBe("creator");
+  expect(initial[0]?.job_id).toBe("sess-A-carve");
+  expect(initial[1]?.kind).toBe("refiner");
+  expect(initial[1]?.job_id).toBe("sess-B-carve");
+
+  // Drive A to "working" via UserPromptSubmit. B's entry on the epic
+  // must survive byte-for-byte; only A's entry's `state` flips.
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-A-carve" });
+  drainAll();
+  const after = getJobLinks("fn-15-carve");
+  expect(after).toHaveLength(2);
+  // A: kind=creator preserved, state flipped to working.
+  expect(after[0]).toEqual({
+    kind: "creator",
+    job_id: "sess-A-carve",
+    title: null,
+    state: "working",
+    rate_limited_at: null,
+  });
+  // B: untouched (state still default "stopped").
+  expect(after[1]).toEqual({
+    kind: "refiner",
+    job_id: "sess-B-carve",
+    title: null,
+    state: "stopped",
+    rate_limited_at: null,
+  });
+});
+
+test("syncPlanctlLinks: missing jobs row at enrichment defaults to safe values (no throw inside fold)", () => {
+  // The classifier's deriveJobLinks runs OVER the events log directly
+  // and can emit edges for sessions that have NO backing jobs row
+  // (planctl invocation without a SessionStart — an orphan). The
+  // enrichment helper must fold the missing row to defaults rather
+  // than throw; rolling back the cursor would wedge the reducer.
+  //
+  // Drive an orphan planctl invocation: no SessionStart for the
+  // session, just a window opener + a planctl create event. The
+  // backing jobs row never gets inserted; the epic's job_links entry
+  // for this session must land with `enrichJobLink`'s defaults.
+  planPlanOpener("sess-orphan");
+  planctlEvent({
+    sessionId: "sess-orphan",
+    op: "epic-create",
+    target: "fn-16-orphan",
+    epicId: "fn-16-orphan",
+    subjectPresent: true,
+  });
+  drainAll();
+  // The orphan session has no backing jobs row, so enrichment hits
+  // the missing-row default branch.
+  const orphanJob = db
+    .query("SELECT job_id FROM jobs WHERE job_id = ?")
+    .get("sess-orphan");
+  expect(orphanJob).toBeNull();
+  // The epic's job_links carries the entry with defaults.
+  expect(getJobLinks("fn-16-orphan")).toEqual([
+    {
+      kind: "creator",
+      job_id: "sess-orphan",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
+  ]);
+});
+
+test("syncPlanctlLinks: widened-shape EpicSnapshot ON CONFLICT does not blank enriched fields", () => {
+  // Mirror the classic carve-out test but assert the WIDENED-shape
+  // payload survives. Without the carve-out, an approval RPC → file
+  // write → file-watcher → EpicSnapshot fold would wipe the entry's
+  // enriched fields back to defaults; this test pins the invariant
+  // for the v21 shape.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-wide" });
+  planPlanOpener("sess-wide");
+  planctlEvent({
+    sessionId: "sess-wide",
+    op: "epic-create",
+    target: "fn-17-wide",
+    epicId: "fn-17-wide",
+    subjectPresent: true,
+  });
+  // Drive an enriched payload: state=working + a real title via
+  // UserPromptSubmit carrying session_title.
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-wide",
+    data: JSON.stringify({ session_title: "Wide enrichment" }),
+  });
+  drainAll();
+  expect(getJobLinks("fn-17-wide")).toEqual([
+    {
+      kind: "creator",
+      job_id: "sess-wide",
+      title: "Wide enrichment",
+      state: "working",
+      rate_limited_at: null,
+    },
+  ]);
+
+  // Fold an EpicSnapshot — must preserve the WIDENED enrichment fields.
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-17-wide",
+    data: JSON.stringify({
+      epic_number: 17,
+      title: "Wide Survive Carve-out",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  drainAll();
+  expect(getJobLinks("fn-17-wide")).toEqual([
+    {
+      kind: "creator",
+      job_id: "sess-wide",
+      title: "Wide enrichment",
+      state: "working",
+      rate_limited_at: null,
+    },
+  ]);
 });
 
 // ---------------------------------------------------------------------------

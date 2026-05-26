@@ -77,7 +77,7 @@ import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
 } from "../src/readiness-client";
-import type { Job, JobLinkEntry, SubagentInvocation } from "../src/types";
+import type { JobLinkEntry, SubagentInvocation } from "../src/types";
 
 const HELP = `keeper-board — combined epics + jobs UI over the keeper subscribe server
 
@@ -106,9 +106,14 @@ Each epic block opens with a header line of the form:
   ({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated] [<readiness>]
 
 followed (when the epic carries job_links) by one indented creator/refiner
-line per linked session — '{title} [creator|refiner] [state]' for sessions
-present in the live jobs page, '[{job_id}] [creator|refiner]' for terminal
-or off-page sessions — then the task lines (one per embedded task,
+line per linked session — '{title} [creator|refiner] [state] [limited]?'
+(title falls back to {job_id} when the embedded title is null; the
+[limited] pill appears when the session was rate-limited and the human
+hasn't picked up since). Schema v21 denormalized title / state /
+rate_limited_at off the linked jobs row at the reducer's write boundary,
+so the same line shape renders for live, terminal, and off-page sessions
+— no live-jobs join, no off-page fallback branch — then the task lines
+(one per embedded task,
 '{n}. {title} [#dep,#dep] [runtime_status] [worker_phase] [approval]' —
 the three native pills side-by-side: planctl runtime status
 'todo|in_progress|done|blocked', derived worker-phase binary 'open|done',
@@ -234,6 +239,45 @@ function taskNumFromId(id: string): number | null {
   return m ? Number.parseInt(m[1], 10) : null;
 }
 
+/**
+ * Per-epic creator/refiner link lines, indented one level under the epic
+ * header. Each {@link JobLinkEntry} carries five embedded fields
+ * `{kind, job_id, title, state, rate_limited_at}` denormalized off the
+ * linked `jobs` row at the reducer's write boundary (schema v21), so
+ * the render reads every field straight off the projection — no
+ * live-jobs join, no off-page fallback branch.
+ *
+ * The line shape is the same regardless of whether the linked session
+ * is live, terminal, or off-page:
+ *
+ *     {title ?? job_id} [{kind}] [{state}]{rateLimitedPillSeg}
+ *
+ * Title falls back to `job_id` when the embedded `title` is null —
+ * preserves the line shape when title is genuinely unknown (e.g. a
+ * shell-inserted epic whose linked session has no captured title yet)
+ * without dropping the readable label entirely.
+ *
+ * Iteration order is the projection's own `(kind, job_id)` ASC sort
+ * (set by `sortJobLinks` in `src/reducer.ts`).
+ *
+ * Module-level + exported so `test/board.test.ts` can assert the line
+ * shape directly without standing up the full subscribe loop.
+ */
+export function renderJobLinkLines(jobLinks: unknown): string[] {
+  if (!Array.isArray(jobLinks) || jobLinks.length === 0) {
+    return [];
+  }
+  const out: string[] = [];
+  for (const link of jobLinks as JobLinkEntry[]) {
+    const label = link.title ?? link.job_id;
+    const state = link.state == null ? "" : String(link.state);
+    out.push(
+      `   ${label} [${link.kind}] [${state}]${rateLimitedPillSeg(link.rate_limited_at)}`,
+    );
+  }
+  return out;
+}
+
 async function main(): Promise<void> {
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
@@ -291,36 +335,9 @@ async function main(): Promise<void> {
     });
   }
 
-  /**
-   * Per-epic creator/refiner link lines, indented one level under the epic
-   * header. Each `JobLinkEntry` (`{kind, job_id}`) becomes one line. When
-   * the linked `job_id` is in the live `jobs` page we render its title +
-   * state pill (same grammar as `renderJobLines`); when absent — terminal
-   * sessions and off-page hits, the common case since `jobs` is live-only
-   * and capped — we render `[{job_id}]` so the missing state pill is the
-   * honest "not on the board" signal. Iteration order is the projection's
-   * own `(kind, job_id)` ASC sort.
-   */
-  function renderJobLinkLines(
-    jobsById: Map<string, Job>,
-    jobLinks: unknown,
-  ): string[] {
-    if (!Array.isArray(jobLinks) || jobLinks.length === 0) {
-      return [];
-    }
-    const out: string[] = [];
-    for (const link of jobLinks as JobLinkEntry[]) {
-      const hit = jobsById.get(link.job_id);
-      if (hit === undefined) {
-        out.push(`   [${link.job_id}] [${link.kind}]`);
-        continue;
-      }
-      out.push(
-        `   ${seg(hit.title)} [${link.kind}] [${seg(hit.state)}]${rateLimitedPillSeg(hit.rate_limited_at)}`,
-      );
-    }
-    return out;
-  }
+  // `renderJobLinkLines` lives at module scope (exported) — see above —
+  // so `test/board.test.ts` can assert the line shape without standing
+  // up the full subscribe loop.
 
   function renderJobLines(
     subagentIndex: Map<string, SubagentInvocation[]>,
@@ -384,7 +401,7 @@ async function main(): Promise<void> {
     const epicVerdict = verdictFromMap(snap.readiness.perEpic, epicId);
     lines.push(
       `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}] ${formatPill(epicVerdict)}`,
-      ...renderJobLinkLines(snap.jobs, row.job_links),
+      ...renderJobLinkLines(row.job_links),
     );
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {

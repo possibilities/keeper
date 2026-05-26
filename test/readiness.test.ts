@@ -78,26 +78,12 @@ function makeEpic(overrides: Partial<Epic>): Epic {
   };
 }
 
-function makeJob(overrides: Partial<Job>): Job {
-  return {
-    job_id: "session-1",
-    created_at: 0,
-    cwd: null,
-    pid: null,
-    state: "working",
-    last_event_id: 0,
-    updated_at: 0,
-    title: null,
-    title_source: null,
-    transcript_path: null,
-    start_time: null,
-    plan_verb: null,
-    plan_ref: null,
-    epic_links: [],
-    rate_limited_at: null,
-    ...overrides,
-  };
-}
+// `makeJob` (formerly built `Job` fixture rows for the planner-running
+// predicate's live-jobs Map join) is gone with schema v21 — the
+// `JobLinkEntry.state` field carries the linked session's last-known
+// lifecycle directly off the projection, so the predicate no longer
+// reads from a `jobs` Map. See `makeLink` below for the v21 fixture
+// shape.
 
 function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
   return {
@@ -127,6 +113,25 @@ function makeSub(overrides: Partial<SubagentInvocation>): SubagentInvocation {
     duration_ms: null,
     last_event_id: 0,
     updated_at: 0,
+    ...overrides,
+  };
+}
+
+/**
+ * Build a `JobLinkEntry` with the schema-v21 widened shape
+ * `{kind, job_id, title, state, rate_limited_at}` — defaults match the
+ * reducer's `enrichJobLink` orphan-row defaults
+ * (`title: null, state: "stopped", rate_limited_at: null`) so a
+ * caller that overrides only `kind` + `job_id` exercises the
+ * common "session not running" path.
+ */
+function makeLink(overrides: Partial<JobLinkEntry>): JobLinkEntry {
+  return {
+    kind: "refiner",
+    job_id: "session-1",
+    title: null,
+    state: "stopped",
+    rate_limited_at: null,
     ...overrides,
   };
 }
@@ -171,12 +176,13 @@ test("predicate 2 (epic-not-validated) wins over 3 (planner-running)", () => {
   const epic = makeEpic({
     tasks: [task],
     last_validated_at: null,
-    job_links: [{ kind: "refiner", job_id: "planner-job" }],
+    // Schema v21: state lives on the embedded JobLinkEntry — no
+    // separate `jobs` Map join. Set state=working to exercise the
+    // planner-running candidate, then assert the higher-priority
+    // epic-not-validated predicate still wins.
+    job_links: [makeLink({ job_id: "planner-job", state: "working" })],
   });
-  const jobs = new Map<string, Job>([
-    ["planner-job", makeJob({ job_id: "planner-job", state: "working" })],
-  ]);
-  const snap = run([epic], jobs);
+  const snap = run([epic]);
   expect(snap.perTask.get(task.task_id)).toEqual(
     blocked({ kind: "epic-not-validated" }),
   );
@@ -188,12 +194,11 @@ test("predicate 3 (planner-running) wins over 4 (own-approval)", () => {
   const task = makeTask({ worker_phase: "open", approval: "approved" });
   const epic = makeEpic({
     tasks: [task],
-    job_links: [{ kind: "creator", job_id: "planner-job" }],
+    job_links: [
+      makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
+    ],
   });
-  const jobs = new Map<string, Job>([
-    ["planner-job", makeJob({ job_id: "planner-job", state: "working" })],
-  ]);
-  const snap = run([epic], jobs);
+  const snap = run([epic]);
   expect(snap.perTask.get(task.task_id)).toEqual(
     blocked({ kind: "planner-running" }),
   );
@@ -703,27 +708,29 @@ test("subagent_invocations: running on different job_id → ignored", () => {
 // planner-running predicate — absent-from-jobs collection is NOT working
 // ---------------------------------------------------------------------------
 
-test("planner-running: job_links entry whose job_id is missing → not running", () => {
-  // job_links names a session_id that's not in the jobs map (the planner job
-  // is done + off the board, or hasn't loaded yet). Absent ≠ working, so the
-  // task is ready.
+test("planner-running: job_links entry whose embedded state defaults to 'stopped' → not running", () => {
+  // Schema v21: the link carries its own `state` field (denormalized off
+  // the linked jobs row at the reducer's write boundary). For an orphan
+  // entry (job_id with no `jobs` row at enrichment time), `enrichJobLink`
+  // defaults `state` to `"stopped"` — the same zero-event reading that
+  // used to surface as "absent from the jobs map" pre-v21. Either way:
+  // the task is ready because no link is `"working"`.
   const t = makeTask({ task_id: "fn-1-foo.1" });
-  const linkEntry: JobLinkEntry = { kind: "refiner", job_id: "missing-job" };
+  const linkEntry: JobLinkEntry = makeLink({ job_id: "missing-job" });
   const epic = makeEpic({ tasks: [t], job_links: [linkEntry] });
   const snap = run([epic]);
   expect(snap.perTask.get(t.task_id)).toEqual({ tag: "ready" });
 });
 
 test("planner-running: job_links entry on a stopped job → not running", () => {
+  // Schema v21 reads state straight off the embedded entry — no live
+  // `jobs` Map join, so this test no longer threads a jobs map at all.
   const t = makeTask({ task_id: "fn-1-foo.1" });
   const epic = makeEpic({
     tasks: [t],
-    job_links: [{ kind: "refiner", job_id: "planner-job" }],
+    job_links: [makeLink({ job_id: "planner-job", state: "stopped" })],
   });
-  const jobs = new Map<string, Job>([
-    ["planner-job", makeJob({ job_id: "planner-job", state: "stopped" })],
-  ]);
-  const snap = run([epic], jobs);
+  const snap = run([epic]);
   expect(snap.perTask.get(t.task_id)).toEqual({ tag: "ready" });
 });
 

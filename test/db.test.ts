@@ -187,7 +187,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("20");
+  expect(row.value).toBe("21");
   db.close();
 });
 
@@ -295,7 +295,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
 
   const eventNames = (
     db.prepare("PRAGMA table_info(events)").all() as {
@@ -345,7 +345,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("20");
+  expect(ver2.value).toBe("21");
   db2.close();
 });
 
@@ -398,7 +398,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
 
   const jobNames = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
@@ -424,7 +424,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("20");
+  expect(ver2.value).toBe("21");
   db2.close();
 });
 
@@ -459,7 +459,7 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
   const names = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
@@ -510,7 +510,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
 
   const tables = new Set(
     (
@@ -566,7 +566,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("20");
+  expect(ver2.value).toBe("21");
   db2.close();
 });
 
@@ -625,7 +625,7 @@ test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, tas
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
 
   // tasks table is gone (the v6→v7 backfill+DROP runs inside the same
   // transaction, before the v11 rewind clears `epics`).
@@ -745,7 +745,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
 
   // Both columns now appear.
   const eventNames = (
@@ -792,7 +792,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("20");
+  expect(ver2.value).toBe("21");
   const eventNames2 = (
     db2.prepare("PRAGMA table_info(events)").all() as { name: string }[]
   ).map((c) => c.name);
@@ -1051,7 +1051,7 @@ test("v9 DB migrates to v10: four columns added + three partial indexes + backfi
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
 
   // All four columns appear.
   const eventNames = (
@@ -1129,7 +1129,7 @@ test("v9 DB migrates to v10: four columns added + three partial indexes + backfi
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("20");
+  expect(ver2.value).toBe("21");
   // Re-verify the backfill landed identically on the second open — the
   // guard keeps the values stable.
   const jobsAfter = db2
@@ -1298,7 +1298,7 @@ test("v10 DB migrates to v11: epics.jobs added + rewind-and-redrain rebuilds emb
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
 
   // epics.jobs column present, with the NOT NULL DEFAULT '[]'.
   const epicCols = db.prepare("PRAGMA table_info(epics)").all() as {
@@ -1353,7 +1353,7 @@ test("v10 DB migrates to v11: epics.jobs added + rewind-and-redrain rebuilds emb
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("20");
+  expect(ver2.value).toBe("21");
   // No re-drain needed — the guard suppressed the rewind, so the rows
   // persist as-is.
   const epicsAfter = db2.query("SELECT * FROM epics ORDER BY epic_id").all();
@@ -1530,7 +1530,7 @@ test("v12 DB migrates to v13: epics.approval added, approvals table dropped, fil
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
 
   // approvals table is GONE — DROP TABLE IF EXISTS ran.
   const approvalsExists =
@@ -1608,7 +1608,7 @@ test("v12 DB migrates to v13: epics.approval added, approvals table dropped, fil
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("20");
+  expect(ver2.value).toBe("21");
   const epicsAfter = db2.query("SELECT * FROM epics ORDER BY epic_id").all();
   expect(epicsAfter).toEqual(epicsBefore);
   db2.close();
@@ -1901,7 +1901,7 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
 
   // All seven columns exist with correct shape.
   const eventNames = (
@@ -2003,7 +2003,7 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("20");
+  expect(ver2.value).toBe("21");
   const epicsAfter = db2.query("SELECT * FROM epics ORDER BY epic_id").all();
   const jobsAfter = db2.query("SELECT * FROM jobs ORDER BY job_id").all();
   const eventsAfter = db2.query("SELECT * FROM events ORDER BY id").all();
@@ -2237,7 +2237,7 @@ test("v16 DB migrates to v17: tool_use_id column + subagent_invocations + partia
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
 
   // events.tool_use_id exists.
   const eventNames = (
@@ -2300,7 +2300,7 @@ test("v16 DB migrates to v17: tool_use_id column + subagent_invocations + partia
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("20");
+  expect(ver2.value).toBe("21");
   const eventsAfter = db2
     .query("SELECT id, tool_use_id FROM events ORDER BY id")
     .all();
@@ -2630,12 +2630,14 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
   insertJob.run("sess-refiner-twoword", 35, 9, 35);
   v19.close();
 
-  // Reopen via openDb — triggers the v19→v20 migration block.
+  // Reopen via openDb — runs the v19→v20 migration block AND the
+  // v20→v21 enrichment widen-shape pass. After both, the meta row
+  // carries the current SCHEMA_VERSION.
   const { db } = openDb(dbPath);
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("20");
+  expect(ver.value).toBe("21");
 
   // Pass 0 — every PreToolUse:Bash row's planctl_* columns are now NULL.
   const preRows = db
@@ -2727,7 +2729,12 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
 
   // Pass 2b — epics.job_links carries both edges keyed by epic. Shell-insert
   // landed the epic row (no EpicSnapshot has folded for fn-7-scaff in the
-  // fixture).
+  // fixture). The v20→v21 enrichment pass widened each entry from the
+  // thin classifier shape `{kind, job_id}` to the enriched projection
+  // shape `{kind, job_id, title, state, rate_limited_at}`; both seeded
+  // jobs rows carry NULL title + default state `'stopped'` (the v19
+  // schema's NOT NULL DEFAULT 'stopped' on the jobs lifecycle column),
+  // so the enriched defaults flow through.
   const epicRow = db
     .prepare("SELECT epic_id, job_links FROM epics WHERE epic_id = ?")
     .get("fn-7-scaff") as { epic_id: string; job_links: string } | null;
@@ -2735,11 +2742,26 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
   const jobLinks = JSON.parse(epicRow?.job_links ?? "[]") as {
     kind: string;
     job_id: string;
+    title: string | null;
+    state: string;
+    rate_limited_at: number | null;
   }[];
   // Sort tiebreaker is `(kind, job_id)` ASC — creator first, then refiner.
   expect(jobLinks).toEqual([
-    { kind: "creator", job_id: "sess-creator-scaffold" },
-    { kind: "refiner", job_id: "sess-refiner-twoword" },
+    {
+      kind: "creator",
+      job_id: "sess-creator-scaffold",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
+    {
+      kind: "refiner",
+      job_id: "sess-refiner-twoword",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
   ]);
 
   // Idempotent re-open — version guard suppresses the backfill re-run.
@@ -2751,7 +2773,7 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("20");
+  expect(ver2.value).toBe("21");
   expect(db2.query("SELECT * FROM epics ORDER BY epic_id").all()).toEqual(
     epicsBefore,
   );
@@ -2760,6 +2782,214 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
   );
   expect(db2.query("SELECT * FROM events ORDER BY id").all()).toEqual(
     eventsBefore,
+  );
+  db2.close();
+});
+
+// ---------------------------------------------------------------------------
+// Schema v21 — widen `epics.job_links` entry shape from `{kind, job_id}` to
+// `{kind, job_id, title, state, rate_limited_at}` denormalized off the
+// linked `jobs` row at the reducer's write boundary (fn-612 task .1).
+// ---------------------------------------------------------------------------
+
+test("v20 DB migrates to v21: epics.job_links entries widen from thin {kind, job_id} to enriched {kind, job_id, title, state, rate_limited_at}; orphan entries retain with safe defaults", () => {
+  // Build a v20-shaped DB carrying the thin classifier-output shape on
+  // `epics.job_links`. After v21, every entry must carry the three
+  // denormalized fields read off the linked `jobs` row (or safe
+  // defaults when the row is missing — orphan retention).
+  //
+  // Coverage:
+  //   - Live entry (jobs row present, mid-lifecycle, non-default
+  //     title/state/rate_limited_at) — enrichment reads all three off
+  //     the jobs row.
+  //   - Default entry (jobs row present, schema defaults — null title,
+  //     state=stopped, null rate_limited_at) — enrichment reads
+  //     defaults off the row, NOT the orphan-row defaults branch.
+  //   - Orphan entry (no jobs row for the job_id) — enrichment folds
+  //     to safe defaults (title: null, state: "stopped",
+  //     rate_limited_at: null) and the entry is retained (NOT dropped),
+  //     so re-fold determinism holds.
+  const v20 = new Database(dbPath, { create: true });
+  v20.run(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      session_id TEXT NOT NULL,
+      pid INTEGER,
+      hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      tool_name TEXT,
+      matcher TEXT,
+      cwd TEXT,
+      permission_mode TEXT,
+      agent_id TEXT,
+      agent_type TEXT,
+      stop_hook_active INTEGER,
+      data TEXT NOT NULL,
+      subagent_agent_id TEXT,
+      spawn_name TEXT,
+      start_time TEXT,
+      slash_command TEXT,
+      skill_name TEXT,
+      planctl_op TEXT,
+      planctl_target TEXT,
+      planctl_epic_id TEXT,
+      planctl_task_id TEXT,
+      planctl_subject_present INTEGER,
+      tool_use_id TEXT
+    )
+  `);
+  v20.run(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_source TEXT,
+      transcript_path TEXT,
+      start_time TEXT,
+      plan_verb TEXT,
+      plan_ref TEXT,
+      epic_links TEXT NOT NULL DEFAULT '[]',
+      rate_limited_at REAL
+    )
+  `);
+  v20.run(`
+    CREATE TABLE epics (
+      epic_id TEXT PRIMARY KEY,
+      epic_number INTEGER,
+      title TEXT,
+      project_dir TEXT,
+      status TEXT,
+      approval TEXT NOT NULL DEFAULT 'pending',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL DEFAULT 0,
+      tasks TEXT NOT NULL DEFAULT '[]',
+      depends_on_epics TEXT NOT NULL DEFAULT '[]',
+      jobs TEXT NOT NULL DEFAULT '[]',
+      job_links TEXT NOT NULL DEFAULT '[]',
+      last_validated_at TEXT
+    )
+  `);
+  v20.run(`
+    CREATE TABLE reducer_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_event_id INTEGER NOT NULL DEFAULT 0,
+      updated_at REAL NOT NULL
+    )
+  `);
+  v20.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v20.run("INSERT INTO meta (key, value) VALUES ('schema_version', '20')");
+  v20.run(
+    "INSERT INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 0, 1)",
+  );
+
+  // Seed two jobs rows for enrichment + one orphan reference.
+  const insertJob = v20.prepare(
+    `INSERT INTO jobs (
+       job_id, created_at, state, last_event_id, updated_at,
+       title, rate_limited_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  );
+  // Live entry — mid-lifecycle, rich enrichment payload.
+  insertJob.run("sess-live", 100, "working", 5, 100, "Live session", 200);
+  // Default entry — fresh SessionStart-only row with all-default columns.
+  insertJob.run("sess-default", 50, "stopped", 1, 50, null, null);
+
+  // Seed one epic carrying the thin v20 shape on `job_links` — three
+  // entries: live, default, orphan (no matching jobs row).
+  v20
+    .prepare(
+      `INSERT INTO epics (
+       epic_id, epic_number, title, last_event_id, updated_at, job_links
+     ) VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      "fn-21-widen",
+      21,
+      "Widen Shape",
+      9,
+      100,
+      JSON.stringify([
+        { kind: "creator", job_id: "sess-live" },
+        { kind: "refiner", job_id: "sess-default" },
+        { kind: "refiner", job_id: "sess-orphan" },
+      ]),
+    );
+  v20.close();
+
+  // Reopen via openDb — triggers the v20→v21 migration block.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("21");
+
+  // Read the widened job_links payload.
+  const epicRow = db
+    .prepare("SELECT job_links FROM epics WHERE epic_id = ?")
+    .get("fn-21-widen") as { job_links: string };
+  const jobLinks = JSON.parse(epicRow.job_links) as {
+    kind: string;
+    job_id: string;
+    title: string | null;
+    state: string;
+    rate_limited_at: number | null;
+  }[];
+
+  // Total-order ASC sort on (kind, job_id) — creator first, then both
+  // refiners in job_id ASC order.
+  expect(jobLinks).toEqual([
+    {
+      kind: "creator",
+      job_id: "sess-live",
+      title: "Live session",
+      state: "working",
+      rate_limited_at: 200,
+    },
+    {
+      // Default entry: jobs row exists but every enrichment field is
+      // the schema default. The migration reads off the row, NOT the
+      // orphan-row defaults branch — same end-state shape, but the
+      // distinction matters for re-fold determinism.
+      kind: "refiner",
+      job_id: "sess-default",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
+    {
+      // Orphan entry: no jobs row for `sess-orphan`. The migration
+      // RETAINS the entry (NOT a silent drop — re-fold determinism
+      // requires the post-migrate state agree with the from-scratch
+      // re-fold, which also would emit an entry via the classifier
+      // and fold to the same orphan-row defaults via enrichJobLink).
+      kind: "refiner",
+      job_id: "sess-orphan",
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    },
+  ]);
+
+  // Idempotent re-open — version guard suppresses the backfill re-run.
+  const epicsBefore = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const jobsBefore = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  db.close();
+  const { db: db2 } = openDb(dbPath);
+  const ver2 = db2
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver2.value).toBe("21");
+  expect(db2.query("SELECT * FROM epics ORDER BY epic_id").all()).toEqual(
+    epicsBefore,
+  );
+  expect(db2.query("SELECT * FROM jobs ORDER BY job_id").all()).toEqual(
+    jobsBefore,
   );
   db2.close();
 });

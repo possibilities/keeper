@@ -103,7 +103,7 @@ import {
   findPendingPreToolUseForStart,
   resolveBridgeAgentId,
 } from "./subagent-invocations";
-import type { Event } from "./types";
+import type { Event, JobLinkEntry } from "./types";
 
 /**
  * Default batch size for {@link drain}. Keeps each writer transaction short so
@@ -1443,16 +1443,33 @@ function syncJobIntoEpic(
 }
 
 /**
- * Read the post-write `jobs` row and fan into the embedded epic/task arrays
- * iff `plan_ref` is non-null. The SELECT lives here (not at each call site)
- * so the fan-out reads the LATEST state-machine state — e.g. a SessionEnd
- * handler's UPDATE flips `state` to `ended` first, then this SELECT picks
- * up the new state and the embedded entry's `state` updates in lockstep.
+ * Read the post-write `jobs` row and fan into:
  *
- * Runs INSIDE the open transaction opened by {@link applyEvent}. The caller
- * MUST gate on "an UPDATE/INSERT actually wrote" before invoking — the
- * Killed-mismatch path (no write happened) must NOT fire sync. See the
- * per-call-site comments in {@link projectJobsRow}.
+ * (1) the embedded `epics.jobs` / task `jobs` sub-arrays via
+ *     {@link syncJobIntoEpic} — gated on `plan_ref != null` (the
+ *     `EmbeddedJob` slot is keyed off the session's spawn-name verb).
+ * (2) every linked epic's `epics.job_links` enriched entries via
+ *     {@link syncJobLinksOnJobWrite} — gated on `epic_links != '[]'`
+ *     (the link projection is keyed off the session's planctl-CLI
+ *     footprint, which is INDEPENDENT of `plan_ref`: an arthack-driven
+ *     manual session with `plan_ref = null` can still carry a creator
+ *     or refiner edge from `planctl epic-create` etc.).
+ *
+ * The SELECT lives here (not at each call site) so the fan-out reads
+ * the LATEST state-machine state — e.g. a SessionEnd handler's UPDATE
+ * flips `state` to `ended` first, then this SELECT picks up the new
+ * state and BOTH fan-outs see the updated `state` value in lockstep.
+ *
+ * Runs INSIDE the open transaction opened by {@link applyEvent}. The
+ * caller MUST gate on "an UPDATE/INSERT actually wrote" before invoking
+ * — the Killed-mismatch path (no write happened) must NOT fire either
+ * fan-out. See the per-call-site comments in {@link projectJobsRow}.
+ *
+ * The two fan-outs have DISJOINT gates (`plan_ref` vs `epic_links`) but
+ * SHARE the trigger condition ("a jobs row was just written that may
+ * have changed display fields"), so co-locating their wiring here keeps
+ * every call site one line and ensures neither fan-out is silently
+ * forgotten when a new jobs-write branch lands.
  */
 function syncIfPlanRef(
   db: Database,
@@ -1465,10 +1482,19 @@ function syncIfPlanRef(
       "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, rate_limited_at FROM jobs WHERE job_id = ?",
     )
     .get(jobId) as JobsRowForSync | null;
-  if (row == null || row.plan_ref == null) {
+  if (row == null) {
     return;
   }
-  syncJobIntoEpic(db, row, eventId, ts);
+  if (row.plan_ref != null) {
+    syncJobIntoEpic(db, row, eventId, ts);
+  }
+  // Independent gate: `syncJobLinksOnJobWrite` reads `jobs.epic_links`
+  // and short-circuits on `'[]'` itself, so it's cheap to always call —
+  // and gating it on `plan_ref != null` here would silently miss
+  // creator/refiner sessions whose spawn name didn't parse as
+  // `{plan|work|close}::<ref>` (e.g. arthack manual sessions running
+  // `planctl epic-create` outside the planctl spawn whitelist).
+  syncJobLinksOnJobWrite(db, jobId, eventId, ts);
 }
 
 /**
@@ -1519,8 +1545,16 @@ function sortEpicLinks(links: EpicLink[]): void {
  * Deterministic sort for an embedded `job_links` array (used on
  * `epics.job_links`). Total-order ASC on the full `(kind, job_id)` tuple —
  * mirrors the classifier's final sort. Parallel to {@link sortEpicLinks}.
+ *
+ * Accepts any object with `{kind, job_id}` so both the thin classifier
+ * shape ({@link JobLink}) and the enriched projection shape
+ * ({@link JobLinkEntry}) sort through the same code path — re-fold
+ * determinism is a function of the SORT order alone, not the carried
+ * fields, so a single sort with one widened parameter is correct.
  */
-function sortJobLinks(links: JobLink[]): void {
+function sortJobLinks(
+  links: { kind: "creator" | "refiner"; job_id: string }[],
+): void {
   links.sort((a, b) => {
     if (a.kind < b.kind) return -1;
     if (a.kind > b.kind) return 1;
@@ -1528,6 +1562,185 @@ function sortJobLinks(links: JobLink[]): void {
     if (a.job_id > b.job_id) return 1;
     return 0;
   });
+}
+
+/**
+ * Enrich a thin classifier-output `JobLink` (`{kind, job_id}`) into the
+ * widened `JobLinkEntry` projection shape carried on `epics.job_links`
+ * — adding `(title, state, rate_limited_at)` read directly off the
+ * post-write `jobs` row.
+ *
+ * Shared between the live reducer fan-out (`syncPlanctlLinks`), the
+ * jobs-write fan-out (`syncJobLinksOnJobWrite`), and the v20→v21
+ * migration backfill. SAME code path, SAME defaults — different code
+ * paths producing the same JSON is the classic silent re-fold-determinism
+ * break this helper exists to prevent.
+ *
+ * **Defaults on a missing `jobs` row.** Returns
+ * `{title: null, state: "stopped", rate_limited_at: null}` — the
+ * zero-event projection reading. This matches the scenario where the
+ * classifier emitted an edge for a session whose backing `jobs` row
+ * was never inserted (orphan planctl invocation: no SessionStart),
+ * and preserves re-fold determinism (a from-scratch re-fold sees the
+ * same missing row at the same enrichment point and writes the same
+ * defaults).
+ *
+ * NEVER throws inside the open BEGIN IMMEDIATE transaction.
+ */
+function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
+  const row = db
+    .query("SELECT title, state, rate_limited_at FROM jobs WHERE job_id = ?")
+    .get(classifierEntry.job_id) as {
+    title: string | null;
+    state: string;
+    rate_limited_at: number | null;
+  } | null;
+  if (row == null) {
+    return {
+      kind: classifierEntry.kind,
+      job_id: classifierEntry.job_id,
+      title: null,
+      state: "stopped",
+      rate_limited_at: null,
+    };
+  }
+  return {
+    kind: classifierEntry.kind,
+    job_id: classifierEntry.job_id,
+    title: row.title,
+    state: row.state,
+    rate_limited_at: row.rate_limited_at,
+  };
+}
+
+/**
+ * Reverse fan-out from a jobs-write that may have changed `title` /
+ * `state` / `rate_limited_at` on a session whose planctl-CLI footprint
+ * has already produced epic-link edges. For each epic that references
+ * this `jobId` via the symmetric `jobs.epic_links` array, re-stamp the
+ * matching entry on that epic's `job_links` with fresh enrichment
+ * (`enrichJobLink`), preserving every OTHER entry on that epic verbatim.
+ *
+ * Mirrors {@link syncJobIntoEpic}'s step-for-step structure. Runs INSIDE
+ * the open transaction opened by {@link applyEvent}; performs zero cursor
+ * work.
+ *
+ * **Gate (epic_links !== '[]').** The fan-out has its OWN gate — it is
+ * NOT piggybacking on `plan_ref`. A creator / refiner session may have
+ * `plan_ref = null` (an arthack-driven manual session running
+ * `planctl epic-create` outside a `work::` / `plan::` / `close::` spawn),
+ * so gating on `plan_ref` would silently miss its epic re-stamps. The
+ * gate reads `jobs.epic_links` directly and short-circuits when the cell
+ * is `'[]'` (no edges to fan into, so no epic to re-stamp).
+ *
+ * **Reverse lookup via the symmetric array (no `json_each` scan).**
+ * Single-row PK SELECT + small JSON parse of `jobs.epic_links` to know
+ * which epics to touch. We deliberately do NOT scan `epics.job_links`
+ * with `json_each`: that's an unindexed TVF (full table scan + virtual-
+ * row expansion), and the symmetric `jobs.epic_links` array already
+ * carries the reverse lookup at PK cost.
+ *
+ * **Shell-insert pattern.** When a targeted epic row does not yet exist
+ * (the classifier emitted an edge, but no EpicSnapshot has folded for
+ * that epic yet) the helper INSERTs a shell row carrying just this one
+ * enriched entry. Mirrors the same pattern in {@link syncPlanctlLinks}'s
+ * touched-epic loop and {@link syncJobIntoEpic}'s epic-shell branch.
+ *
+ * **OLD-element carve-out.** Entries for OTHER `job_id`s on the same
+ * epic are preserved verbatim (filter + push pattern); only the entry
+ * matching `jobId` is re-stamped with fresh enrichment. Without this
+ * carve-out a jobs-write would clobber every cross-session edge on every
+ * touched epic.
+ *
+ * NEVER throws inside the open transaction. A malformed stored
+ * `jobs.epic_links` blob folds to `[]` via {@link parseEmbeddedLinks};
+ * a malformed `epics.job_links` blob does the same.
+ */
+function syncJobLinksOnJobWrite(
+  db: Database,
+  jobId: string,
+  eventId: number,
+  ts: number,
+): void {
+  const jobRow = db
+    .query("SELECT epic_links FROM jobs WHERE job_id = ?")
+    .get(jobId) as { epic_links: string | null } | null;
+  if (jobRow == null) {
+    return; // no backing jobs row — orphan, nothing to fan from.
+  }
+  // Gate: `'[]'` short-circuit. The byte-compare is intentional — the
+  // schema default + the reducer's empty-array write both produce
+  // `'[]'` exactly, so this is a cheap pre-parse skip for the common
+  // case (a session with no planctl footprint).
+  if (jobRow.epic_links === null || jobRow.epic_links === "[]") {
+    return;
+  }
+  const epicLinks = parseEmbeddedLinks<EpicLink>(jobRow.epic_links);
+  if (epicLinks.length === 0) {
+    return; // malformed/empty after parse — nothing to fan into.
+  }
+
+  // Build the freshly-enriched entry once — every targeted epic re-stamps
+  // the SAME entry shape (the entry IS the post-write jobs row's
+  // projection through `enrichJobLink`).
+  const enriched = enrichJobLink(db, { kind: "creator", job_id: jobId });
+  // Note: `kind` above is a placeholder — the per-epic loop below knows
+  // the kind from the existing entry it's replacing, so we never use the
+  // placeholder kind. We construct the enriched payload here to amortize
+  // the SELECT across every touched epic.
+
+  for (const epicLink of epicLinks) {
+    const epicId = epicLink.target;
+    const epicRow = db
+      .query("SELECT job_links FROM epics WHERE epic_id = ?")
+      .get(epicId) as { job_links: string | null } | null;
+    const existing =
+      epicRow != null
+        ? parseEmbeddedLinks<JobLinkEntry>(epicRow.job_links)
+        : [];
+    // OLD-element carve-out: drop the entry for THIS job_id, preserve
+    // every other entry verbatim. Find the OLD entry's `kind` so the
+    // re-stamp lands with the same classifier-derived kind (the
+    // classifier — not the jobs-write — is the source of truth for
+    // creator vs. refiner; this helper only refreshes the display
+    // fields).
+    const oldEntry = existing.find((e) => e.job_id === jobId);
+    if (oldEntry == null) {
+      // The epic's `job_links` array doesn't carry this `job_id` yet.
+      // This can happen on a transient state where the session's
+      // `jobs.epic_links` was just (re-)derived to include this epic
+      // but the epic's reverse projection hasn't been re-derived to
+      // include this session. The authoritative re-stamp belongs to
+      // `syncPlanctlLinks`, not here — skip this epic, the planctl-
+      // event fan-out will catch up.
+      continue;
+    }
+    const next = existing.filter((e) => e.job_id !== jobId);
+    next.push({
+      ...enriched,
+      kind: oldEntry.kind,
+    });
+    sortJobLinks(next);
+    const jobLinksJson = JSON.stringify(next);
+    if (epicRow != null) {
+      db.run(
+        "UPDATE epics SET job_links = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+        [jobLinksJson, eventId, ts, epicId],
+      );
+    } else {
+      // No epic row yet — shell-insert. Mirrors the shell-insert in
+      // `syncPlanctlLinks`'s touched-epic loop; the EpicSnapshot ON
+      // CONFLICT carve-out preserves `job_links` so a later snapshot
+      // fold cannot wipe the enriched payload.
+      db.run(
+        `INSERT INTO epics (
+           epic_id, epic_number, title, project_dir, status,
+           last_event_id, updated_at, tasks, jobs, job_links
+         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?)`,
+        [epicId, eventId, ts, jobLinksJson],
+      );
+    }
+  }
 }
 
 /**
@@ -1747,8 +1960,18 @@ function syncPlanctlLinks(
       windowsBySession,
       epicId,
     );
-    sortJobLinks(newJobLinks);
-    const jobLinksJson = JSON.stringify(newJobLinks);
+    // Enrich each thin classifier entry into the widened JobLinkEntry
+    // shape (schema v21): SELECT the linked `jobs` row inside the open
+    // transaction and stamp `(title, state, rate_limited_at)`. The
+    // enrichment helper is the SAME one used by both the jobs-write
+    // fan-out (`syncJobLinksOnJobWrite`) and the v20→v21 migration
+    // backfill — re-fold determinism requires a single source of
+    // truth for "what's the projection shape on disk".
+    const enriched: JobLinkEntry[] = newJobLinks.map((e) =>
+      enrichJobLink(db, e),
+    );
+    sortJobLinks(enriched);
+    const jobLinksJson = JSON.stringify(enriched);
     const epicExists = db
       .query("SELECT epic_id FROM epics WHERE epic_id = ?")
       .get(epicId) as { epic_id: string } | null;
