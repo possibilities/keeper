@@ -1,0 +1,18 @@
+{
+  "branch_name": "fn-616-generalize-api-error-pill",
+  "bundles": [],
+  "created_at": "2026-05-26T21:36:43.421917Z",
+  "depends_on_epics": [],
+  "id": "fn-616-generalize-api-error-pill",
+  "last_validated_at": "2026-05-26T21:36:43.459044Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "generalize api-error pill",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-26T21:36:43.421917Z"
+}
