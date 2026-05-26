@@ -71,6 +71,7 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
+import { createLiveShell } from "../src/live-shell";
 import { formatPill, type Verdict } from "../src/readiness";
 import {
   type ReadinessClientSnapshot,
@@ -83,7 +84,10 @@ const HELP = `keeper-board — combined epics + jobs UI over the keeper subscrib
 Usage: bun scripts/board.ts [--sock <path>]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
-  --clear          Clear the terminal before each frame (live-panel mode).
+  --live           Real TUI mode (alt-screen + keyboard nav).
+                   When not a TTY, behaves as if --live was not set.
+                   Keys: ←/h/k prev frame, →/l/j next, g oldest,
+                         G/End/Esc return to live, q/Ctrl-C quit.
                    Each frame's sidecars are written to indexed paths
                    instead of overwriting, and a session meta file at
                    /tmp/keeper-board.<pid>.meta.txt accumulates the full
@@ -235,7 +239,7 @@ async function main(): Promise<void> {
     args: Bun.argv.slice(2),
     options: {
       sock: { type: "string" },
-      clear: { type: "boolean", default: false },
+      live: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -248,7 +252,8 @@ async function main(): Promise<void> {
 
   const sockPath = values.sock ?? resolveSockPath();
   const log = (s: string) => process.stdout.write(`${s}\n`);
-  const clearMode = values.clear;
+  const liveMode = values.live;
+  const liveShell = createLiveShell({ enabled: liveMode });
   let frameCount = 0;
 
   // `lastBody` byte-compares the COMBINED body — internal row churn that
@@ -497,20 +502,26 @@ async function main(): Promise<void> {
    * so a single populated section reads as a clean block; both empty
    * yields an empty body (the frame is just the `---` lead). Same `---`
    * lead as the sibling scripts — there's still one frame per change.
+   *
+   * Returns one element per output line so the live-shell can consume
+   * lines (per-line ANSI diff). The caller joins with `\n` for stdout /
+   * sidecar / byte-compare.
    */
   function renderBody(
     snap: ReadinessClientSnapshot,
     subagentIndex: Map<string, SubagentInvocation[]>,
-  ): string {
+  ): string[] {
     const e = renderEpicsBody(snap, subagentIndex);
     const j = renderJobsBody(snap, subagentIndex);
+    let body: string;
     if (e === "") {
-      return j;
+      body = j;
+    } else if (j === "") {
+      body = e;
+    } else {
+      body = `${e}\n~~~\n${j}`;
     }
-    if (j === "") {
-      return e;
-    }
-    return `${e}\n~~~\n${j}`;
+    return body === "" ? [] : body.split("\n");
   }
 
   const stateSidecar = `/tmp/keeper-board.${process.pid}.state.json`;
@@ -520,7 +531,7 @@ async function main(): Promise<void> {
   // its "before" file. Overwritten each tick; not surfaced in the meta note.
   const prevFrameTmp = `/tmp/keeper-board.${process.pid}.prev.frame.txt`;
   // Session-level meta file: one tab-separated line per frame (index +
-  // per-frame sidecar paths). Only written in `--clear` mode; accumulates
+  // per-frame sidecar paths). Only written in `--live` mode; accumulates
   // across the session so every past frame remains inspectable.
   const metaSidecar = `/tmp/keeper-board.${process.pid}.meta.txt`;
   // In-memory copy of the last emitted frame's body+lead, used as the
@@ -532,15 +543,15 @@ async function main(): Promise<void> {
     snap: ReadinessClientSnapshot,
     frameText: string,
   ): void {
-    // In --clear mode each frame's sidecars are indexed so past frames persist;
+    // In --live mode each frame's sidecars are indexed so past frames persist;
     // in default mode the three static paths are overwritten each frame.
-    const sState = clearMode
+    const sState = liveMode
       ? `/tmp/keeper-board.${process.pid}.state.${frameCount}.json`
       : stateSidecar;
-    const sFrame = clearMode
+    const sFrame = liveMode
       ? `/tmp/keeper-board.${process.pid}.frame.${frameCount}.txt`
       : frameSidecar;
-    const sDiff = clearMode
+    const sDiff = liveMode
       ? `/tmp/keeper-board.${process.pid}.diff.${frameCount}.txt`
       : diffSidecar;
     const stateJson = {
@@ -580,7 +591,7 @@ async function main(): Promise<void> {
     } catch (err) {
       log(`# warn: diff sidecar write failed: ${(err as Error).message}`);
     }
-    if (clearMode) {
+    if (liveMode) {
       try {
         appendFileSync(
           metaSidecar,
@@ -595,7 +606,7 @@ async function main(): Promise<void> {
     log(`state: ${sState}`);
     log(`frame: ${sFrame}`);
     log(`diff: ${sDiff}`);
-    if (clearMode) {
+    if (liveMode) {
       log(`meta: ${metaSidecar}`);
     }
     log("...");
@@ -628,17 +639,16 @@ async function main(): Promise<void> {
     for (const arr of subagentIndex.values()) {
       arr.sort((a, b) => a.turn_seq - b.turn_seq);
     }
-    const body = renderBody(snap, subagentIndex);
+    const bodyLines = renderBody(snap, subagentIndex);
+    const body = bodyLines.join("\n");
     if (body === lastBody) {
       return;
     }
     lastBody = body;
     frameCount += 1;
-    if (clearMode) {
-      process.stdout.write("\x1b[2J\x1b[H");
-    }
-    const frameText = `---\n${body}`;
-    log(frameText);
+    const lines = ["---", ...bodyLines];
+    const frameText = lines.join("\n");
+    liveShell.pushFrame(lines);
     writeSidecars(snap, frameText);
   }
 
@@ -669,6 +679,8 @@ async function main(): Promise<void> {
   });
 
   process.on("SIGINT", () => {
+    // Terminal restoration before subscription teardown.
+    liveShell.dispose();
     handle.dispose();
     process.exit(0);
   });

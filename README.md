@@ -257,16 +257,23 @@ Keeper has no `install` verb. Wire it up manually:
 
 ## Example clients
 
-Three scripts under `scripts/` demonstrate the subscribe + RPC protocols.
+Four scripts under `scripts/` demonstrate the subscribe + RPC protocols.
 `board.ts` is the read-only subscribe client (combined epics + jobs view on
 one connection); `autopilot.ts` is its dispatch-oriented sibling (flat
-command list plus a `===`-delimited "ready" block); `approve.ts` is the
-RPC client (single-shot `rpc` → `rpc_result`, no subscription). The two
-subscribe clients share a helper in `src/readiness-client.ts`
-(`subscribeReadiness`) that owns the three-collection subscribe lifecycle
-and the per-frame `computeReadiness` handoff (the pure verdict pipeline
-lives in `src/readiness.ts` as library code, not a runnable script). Run
-any of them with `bun scripts/<name>.ts --help`.
+command list plus a `===`-delimited "ready" block); `git.ts` watches the
+`git` worktree collection; `approve.ts` is the RPC client (single-shot
+`rpc` → `rpc_result`, no subscription). The three subscribe clients share
+helpers in `src/readiness-client.ts` — `subscribeReadiness` owns the
+three-collection lifecycle (board + autopilot) and `subscribeCollection`
+owns the single-collection lifecycle (git); both feed
+`computeReadiness` / row-list callbacks (the pure verdict pipeline lives
+in `src/readiness.ts` as library code, not a runnable script). All three
+subscribe clients accept a `--live` flag that enters alt-screen mode
+with per-line ANSI diff and keyboard navigation (←/h/k prev frame,
+→/l/j next, g oldest, G/End/Esc return to live, q/Ctrl-C quit) — when
+the script's stdout or stdin isn't a TTY (piped, redirected, or under
+CI) `--live` silently behaves as if it wasn't set. Run any of them with
+`bun scripts/<name>.ts --help`.
 
 - `board.ts` — combined "board" UI over the `epics`, `jobs`, and
   `subagent_invocations` collections. Subscribes to all three on a single
@@ -301,13 +308,17 @@ any of them with `bun scripts/<name>.ts --help`.
   doesn't surface in the render. Reconnects across keeperd restarts;
   Ctrl-C unsubscribes cleanly. Every emitted frame is mirrored to three
   per-pid `/tmp` sidecar files (combined JSON state, frame text, unified
-  diff vs. the previous emit); `--clear` enables a live-panel mode that
-  clears the terminal each frame and indexes the sidecars so past frames
-  remain inspectable.
+  diff vs. the previous emit); `--live` enters a real TUI (alt-screen +
+  per-line ANSI diff + ring-buffered frame history with keyboard
+  navigation) AND indexes the sidecars so past frames remain
+  inspectable. The keymap is `←/h/k` previous frame, `→/l/j` next, `g`
+  jump to oldest, `G`/`End`/`Esc` snap to live, `q`/`Ctrl-C` quit; when
+  stdout/stdin isn't a TTY (piped, redirected, CI) `--live` silently
+  behaves as if it wasn't set.
 
   ```sh
   bun scripts/board.ts            # combined board, default scope
-  bun scripts/board.ts --clear    # live-panel mode with indexed sidecars
+  bun scripts/board.ts --live     # alt-screen TUI with indexed sidecars
   ```
 
 - `autopilot.ts` — dispatch-oriented sibling of `board.ts`. Subscribes
@@ -323,12 +334,36 @@ any of them with `bun scripts/<name>.ts --help`.
   work queue (the single-root post-pass in `src/readiness.ts` keeps at
   most one ready row per project root). Byte-compares the combined body
   so a verdict transition with no task-set change still emits a new
-  frame. Same three sidecar files + `--clear` indexed-sidecar mode as
-  `board.ts`. SIGINT calls the helper's `dispose()` and exits 0.
+  frame. Same three sidecar files + `--live` alt-screen TUI as
+  `board.ts` (per-line ANSI diff, ring-buffered frame history, keymap
+  `←/h/k`/`→/l/j`/`g`/`G`/`Esc`/`q`; non-TTY behaves as if `--live`
+  wasn't set). SIGINT calls the live-shell's `dispose()` first
+  (terminal restoration) then the helper's `dispose()` and exits 0.
 
   ```sh
   bun scripts/autopilot.ts            # two-block dispatch list, default scope
-  bun scripts/autopilot.ts --clear    # live-panel mode with indexed sidecars
+  bun scripts/autopilot.ts --live     # alt-screen TUI with indexed sidecars
+  ```
+
+- `git.ts` — single-collection subscribe client over the `git`
+  collection (planctl-backed worktree status: branch, ahead/behind,
+  dirty + orphaned file lists, and per-live-job dirty/planctl file
+  groupings). Uses `subscribeCollection` from `src/readiness-client.ts`
+  (the same lifecycle primitive that powers the readiness clients,
+  scoped to one collection). Each frame is led by `---`; one block per
+  non-empty worktree row, all-zero rows dropped. Same three per-pid
+  `/tmp` sidecar files (JSON state, frame text, unified diff vs.
+  previous) + `--live` alt-screen TUI (per-line ANSI diff, ring-
+  buffered frame history, keymap `←/h/k`/`→/l/j`/`g`/`G`/`Esc`/`q`;
+  non-TTY behaves as if `--live` wasn't set). `--project-dir <path>`
+  filters to one worktree root. SIGINT calls the live-shell's
+  `dispose()` first (terminal restoration) then the helper's
+  `dispose()` and exits 0.
+
+  ```sh
+  bun scripts/git.ts                          # all worktrees
+  bun scripts/git.ts --project-dir /path/to   # one worktree only
+  bun scripts/git.ts --live                   # alt-screen TUI
   ```
 
 - `approve.ts` — the RPC client. Single-shot: opens a `Bun.connect`, sends

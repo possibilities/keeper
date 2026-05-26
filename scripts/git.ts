@@ -18,17 +18,23 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
+import { createLiveShell } from "../src/live-shell";
 import { subscribeCollection } from "../src/readiness-client";
 
 const COLLECTION = "git";
 
 const HELP = `keeper-git — live git status frames over the keeper subscribe server
 
-Usage: bun scripts/git.ts [--sock <path>] [--project-dir <path>] [--clear]
+Usage: bun scripts/git.ts [--sock <path>] [--project-dir <path>] [--live]
 
   --sock <path>         Socket path override ($KEEPER_SOCK / default otherwise)
   --project-dir <path>  Filter to one git worktree root
-  --clear               Clear before each frame and keep indexed sidecars
+  --live                Real TUI mode (alt-screen + keyboard nav).
+                        When not a TTY, behaves as if --live was not set.
+                        Keys: ←/h/k prev frame, →/l/j next, g oldest,
+                              G/End/Esc return to live, q/Ctrl-C quit.
+                        Indexes the sidecars so past frames remain
+                        inspectable.
   --help                Show this help
 
 Each frame is led by '---'. Rows show one planctl-backed git worktree, its
@@ -127,13 +133,16 @@ export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
 }
 
 /**
- * Legacy `string`-shaped renderer kept as a thin wrapper so existing
- * tests / callers that want a joined string don't have to handle the
- * block array. The live-shell task (task 2) will consume
- * `renderRowBlocks` directly.
+ * Top-level renderer — returns the frame body as one element per output
+ * line, suitable for `liveShell.pushFrame`. Internally fans out via
+ * `renderRowBlocks` (one multi-line block per non-empty worktree row),
+ * joins those blocks with `\n`, then splits on `\n` so each individual
+ * row becomes its own array element. The caller joins with `\n` for
+ * stdout / sidecar / byte-compare.
  */
-function renderRows(rows: Record<string, unknown>[]): string {
-  return renderRowBlocks(rows).join("\n");
+export function renderRowLines(rows: Record<string, unknown>[]): string[] {
+  const body = renderRowBlocks(rows).join("\n");
+  return body === "" ? [] : body.split("\n");
 }
 
 async function main(): Promise<void> {
@@ -142,7 +151,7 @@ async function main(): Promise<void> {
     options: {
       sock: { type: "string" },
       "project-dir": { type: "string" },
-      clear: { type: "boolean", default: false },
+      live: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -154,7 +163,8 @@ async function main(): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
-  const clearMode = values.clear;
+  const liveMode = values.live;
+  const liveShell = createLiveShell({ enabled: liveMode });
   let lastFrame: string | null = null;
   let frameCount = 0;
   let lastRows: Record<string, unknown>[] = [];
@@ -170,13 +180,13 @@ async function main(): Promise<void> {
   }
 
   function writeSidecars(frameText: string): void {
-    const sState = clearMode
+    const sState = liveMode
       ? `/tmp/keeper-git.${process.pid}.state.${frameCount}.json`
       : stateSidecar;
-    const sFrame = clearMode
+    const sFrame = liveMode
       ? `/tmp/keeper-git.${process.pid}.frame.${frameCount}.txt`
       : frameSidecar;
-    const sDiff = clearMode
+    const sDiff = liveMode
       ? `/tmp/keeper-git.${process.pid}.diff.${frameCount}.txt`
       : diffSidecar;
     writeFileSync(sState, `${JSON.stringify(lastRows, null, 2)}\n`);
@@ -191,7 +201,7 @@ async function main(): Promise<void> {
       diff = res.stdout.toString() || "# no rendered diff\n";
     }
     writeFileSync(sDiff, diff);
-    if (clearMode) {
+    if (liveMode) {
       appendFileSync(
         metaSidecar,
         `${frameCount}\t${sState}\t${sFrame}\t${sDiff}\n`,
@@ -209,12 +219,12 @@ async function main(): Promise<void> {
    */
   function emitFrame(rows: Record<string, unknown>[]): void {
     lastRows = rows;
-    const rendered = renderRows(rows);
-    const frameText = `---\n${rendered}`;
+    const bodyLines = renderRowLines(rows);
+    const lines = ["---", ...bodyLines];
+    const frameText = lines.join("\n");
     if (frameText === lastFrame) return;
     frameCount += 1;
-    if (clearMode) process.stdout.write("\x1b[2J\x1b[H");
-    log(frameText);
+    liveShell.pushFrame(lines);
     writeSidecars(frameText);
     lastFrame = frameText;
   }
@@ -253,6 +263,8 @@ async function main(): Promise<void> {
   });
 
   process.on("SIGINT", () => {
+    // Terminal restoration before subscription teardown.
+    liveShell.dispose();
     handle.dispose();
     process.exit(0);
   });

@@ -37,27 +37,32 @@
  * Connection / poll / sidecar / SIGINT semantics: the helper
  * (`src/readiness-client.ts`) owns capped-backoff reconnect, the
  * all-three-strict first-paint gate, per-collection coalesce, and the
- * computeReadiness handoff. SIGINT calls `handle.dispose()` — which
- * drops every subscription via a bare `unsubscribe` frame, releases
- * timers, and exits cleanly. THREE sidecar files (state JSON + frame
- * text + per-frame unified diff against the previous emit) are
- * overwritten each frame. In `--clear` mode each frame's sidecars are
+ * computeReadiness handoff. SIGINT calls the live-shell's `dispose()`
+ * THEN `handle.dispose()` — the shell restores the terminal first, then
+ * the helper drops every subscription via a bare `unsubscribe` frame,
+ * releases timers, and exits cleanly. THREE sidecar files (state JSON
+ * + frame text + per-frame unified diff against the previous emit) are
+ * overwritten each frame. In `--live` mode each frame's sidecars are
  * indexed so past frames persist, and a session meta file at
  * `/tmp/keeper-autopilot.<pid>.meta.txt` accumulates the full index
  * (tab-separated: frame# state frame diff).
  *
  * Usage:
- *   bun scripts/autopilot.ts [--sock <path>] [--clear]
+ *   bun scripts/autopilot.ts [--sock <path>] [--live]
  *
  *   --sock <path>    Socket path override (else $KEEPER_SOCK, else the
  *                    ~/.local/state/keeper/keeperd.sock default).
- *   --clear          Clear the terminal before each frame (live-panel mode).
+ *   --live           Real TUI mode (alt-screen + keyboard nav). When not a
+ *                    TTY, behaves as if --live was not set.
+ *                    Keys: ←/h/k prev frame, →/l/j next, g oldest,
+ *                          G/End/Esc return to live, q/Ctrl-C quit.
  *   --help           Show this help.
  */
 
 import { appendFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
+import { createLiveShell } from "../src/live-shell";
 import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
@@ -66,10 +71,13 @@ import type { Epic } from "../src/types";
 
 const HELP = `keeper-autopilot — live command list over the keeper subscribe server
 
-Usage: bun scripts/autopilot.ts [--sock <path>] [--clear]
+Usage: bun scripts/autopilot.ts [--sock <path>] [--live]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
-  --clear          Clear the terminal before each frame (live-panel mode).
+  --live           Real TUI mode (alt-screen + keyboard nav).
+                   When not a TTY, behaves as if --live was not set.
+                   Keys: ←/h/k prev frame, →/l/j next, g oldest,
+                         G/End/Esc return to live, q/Ctrl-C quit.
                    Each frame's sidecars are written to indexed paths
                    instead of overwriting, and a session meta file at
                    /tmp/keeper-autopilot.<pid>.meta.txt accumulates the full
@@ -210,7 +218,7 @@ async function main(): Promise<void> {
     args: Bun.argv.slice(2),
     options: {
       sock: { type: "string" },
-      clear: { type: "boolean", default: false },
+      live: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -223,7 +231,8 @@ async function main(): Promise<void> {
 
   const sockPath = values.sock ?? resolveSockPath();
   const log = (s: string) => process.stdout.write(`${s}\n`);
-  const clearMode = values.clear;
+  const liveMode = values.live;
+  const liveShell = createLiveShell({ enabled: liveMode });
   let frameCount = 0;
 
   // Byte-compare the COMBINED two-block body — internal row churn that
@@ -239,7 +248,9 @@ async function main(): Promise<void> {
   // scope above so test/autopilot.test.ts can import them directly.
 
   /**
-   * Full frame body: two `===`-delimited blocks.
+   * Full frame body: two `===`-delimited blocks, returned as one element
+   * per output line so the live-shell can consume lines (per-line ANSI
+   * diff). The caller joins with `\n` for stdout / sidecar / byte-compare.
    *
    * Block 1 — every task pair + close pair per epic, server order.
    * Block 2 — only rows whose readiness verdict tag is `"ready"`, with
@@ -249,7 +260,7 @@ async function main(): Promise<void> {
    * When both blocks are empty the body is `===` alone (preserves the
    * divider — mirrors board's empty-section policy).
    */
-  function renderBody(snap: ReadinessClientSnapshot): string {
+  function renderBody(snap: ReadinessClientSnapshot): string[] {
     const epicsArr = snap.epics;
     const readiness = snap.readiness;
     const isReady = (kind: "task" | "close", id: string): boolean => {
@@ -277,7 +288,7 @@ async function main(): Promise<void> {
         ? ""
         : `${READY_HEADER}\n${READY_HEADER_NOTE}\n${readyBlocks.join("\n\n")}`;
 
-    return `${block1}\n===\n${block2}`;
+    return `${block1}\n===\n${block2}`.split("\n");
   }
 
   // --- sidecar paths ---
@@ -288,20 +299,20 @@ async function main(): Promise<void> {
   // Internal scratch path for the previous frame text — fed to `diff -u`.
   const prevFrameTmp = `/tmp/keeper-autopilot.${process.pid}.prev.frame.txt`;
   // Session-level meta file: one tab-separated line per frame. Only written
-  // in `--clear` mode; accumulates across the session.
+  // in `--live` mode; accumulates across the session.
   const metaSidecar = `/tmp/keeper-autopilot.${process.pid}.meta.txt`;
   // In-memory copy of the last emitted frame text (for the diff).
   let lastFrameText: string | null = null;
 
   function writeSidecars(frameText: string): void {
-    // In --clear mode each frame's sidecars are indexed so past frames persist.
-    const sState = clearMode
+    // In --live mode each frame's sidecars are indexed so past frames persist.
+    const sState = liveMode
       ? `/tmp/keeper-autopilot.${process.pid}.state.${frameCount}.json`
       : stateSidecar;
-    const sFrame = clearMode
+    const sFrame = liveMode
       ? `/tmp/keeper-autopilot.${process.pid}.frame.${frameCount}.txt`
       : frameSidecar;
-    const sDiff = clearMode
+    const sDiff = liveMode
       ? `/tmp/keeper-autopilot.${process.pid}.diff.${frameCount}.txt`
       : diffSidecar;
 
@@ -336,7 +347,7 @@ async function main(): Promise<void> {
     } catch (err) {
       log(`# warn: diff sidecar write failed: ${(err as Error).message}`);
     }
-    if (clearMode) {
+    if (liveMode) {
       try {
         appendFileSync(
           metaSidecar,
@@ -351,7 +362,7 @@ async function main(): Promise<void> {
     log(`state: ${sState}`);
     log(`frame: ${sFrame}`);
     log(`diff: ${sDiff}`);
-    if (clearMode) {
+    if (liveMode) {
       log(`meta: ${metaSidecar}`);
     }
     log("...");
@@ -361,20 +372,24 @@ async function main(): Promise<void> {
    * Emit a frame iff the rendered body changed since the last emit.
    * The all-three-strict first-paint gate lives in the helper — by the
    * time this fires, the snapshot is guaranteed complete.
+   *
+   * `renderBody` returns one element per line; we prepend the `---` lead
+   * line and hand the array straight to `liveShell.pushFrame` so the
+   * per-line ANSI diff sees one row per element. The byte-compare gate
+   * still operates on the joined string (cheaper than `JSON.stringify`).
    */
   function emitFrameIfChanged(snap: ReadinessClientSnapshot): void {
-    const body = renderBody(snap);
+    const bodyLines = renderBody(snap);
+    const body = bodyLines.join("\n");
     if (body === lastBody) {
       return;
     }
     lastBody = body;
     lastEpicsSnapshot = snap.epics;
     frameCount += 1;
-    if (clearMode) {
-      process.stdout.write("\x1b[2J\x1b[H");
-    }
-    const frameText = `---\n${body}`;
-    log(frameText);
+    const lines = ["---", ...bodyLines];
+    const frameText = lines.join("\n");
+    liveShell.pushFrame(lines);
     writeSidecars(frameText);
   }
 
@@ -405,6 +420,10 @@ async function main(): Promise<void> {
   });
 
   process.on("SIGINT", () => {
+    // Terminal restoration before subscription teardown — the shell
+    // restores raw mode + leaves the alt-screen, then the helper drops
+    // every subscription via a bare `unsubscribe` frame.
+    liveShell.dispose();
     handle.dispose();
     process.exit(0);
   });
