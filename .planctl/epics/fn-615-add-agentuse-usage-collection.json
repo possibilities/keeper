@@ -1,0 +1,18 @@
+{
+  "branch_name": "fn-615-add-agentuse-usage-collection",
+  "bundles": [],
+  "created_at": "2026-05-26T19:45:27.804854Z",
+  "depends_on_epics": [],
+  "id": "fn-615-add-agentuse-usage-collection",
+  "last_validated_at": "2026-05-26T19:45:27.839819Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Add agentuse usage collection",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-26T19:45:27.804854Z"
+}
