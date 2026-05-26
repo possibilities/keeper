@@ -9,13 +9,15 @@
  * fixture pin a verdict for a given snapshot, and lets autopilot consume the
  * verdict's discriminated-union tag without parsing strings.
  *
- * Predicate pipeline — first-match-wins, eleven ordered checks per row:
+ * Predicate pipeline — first-match-wins, twelve ordered checks per row:
  *   1. terminal-completed          — task: status==="done" && approval==="approved"
  *                                    close: epic.status==="done" && epic.approval==="approved"
  *   2. epic-not-validated          — parent epic.last_validated_at == null
  *   3. planner-running             — any epic.job_links entry whose job is `working`
- *   4. own-approval                — task.approval==="rejected" → job-rejected
- *                                    task.approval==="pending" && status==="done" → job-pending
+ *   4. own-approval-rejected       — task.approval==="rejected" → job-rejected
+ *                                    (rejection is permanent regardless of session state, so it
+ *                                    ranks ABOVE the session-running checks; pending is split off
+ *                                    to predicate 7 so it cannot fire while a worker is still alive)
  *   5. own-progress-main           — task: any embedded jobs[] entry on this row state==="working"
  *                                    close: any embedded jobs[] entry on the epic OR on ANY of its
  *                                    tasks state==="working" (fan-out — see `evaluateCloseRow` for why)
@@ -23,18 +25,26 @@
  *                                    && status==="running"
  *                                    close: same predicate but joined against worker session ids from
  *                                    epic-level AND every task-level embedded jobs[]
- *   7. dep-on-task                 — any depends_on upstream NOT { tag:"completed" }
- *   8. dep-on-epic                 — any depends_on_epics upstream's close NOT completed
- *   9. dep-on-task-synthetic-close — for the synthetic close row: any non-completed task
- *  10. single-task-per-epic        — post-pass: one non-completed slot per epic
- *  11. single-task-per-root        — post-pass: one non-completed slot per project root
+ *   7. own-approval-pending        — task.approval==="pending" && status==="done" → job-pending
+ *                                    close: epic.approval==="pending" && epic.status==="done" → job-pending
+ *                                    Deliberately ranks BELOW 5/6: `worker_phase==="done"` is stamped
+ *                                    by `planctl done` and can race ahead of the Claude session's
+ *                                    Stop/SessionEnd, so `job-pending` must wait for the session
+ *                                    (and any sub-agent) to actually be idle. Otherwise consumers
+ *                                    (autopilot's approval-pending notify) fire prematurely while
+ *                                    the worker is still in-flight.
+ *   8. dep-on-task                 — any depends_on upstream NOT { tag:"completed" }
+ *   9. dep-on-epic                 — any depends_on_epics upstream's close NOT completed
+ *  10. dep-on-task-synthetic-close — for the synthetic close row: any non-completed task
+ *  11. single-task-per-epic        — post-pass: one non-completed slot per epic
+ *  12. single-task-per-root        — post-pass: one non-completed slot per project root
  *
- * The two post-passes (10, 11) run in that order — per-epic FIRST so its
+ * The two post-passes (11, 12) run in that order — per-epic FIRST so its
  * tighter scope wins the reason when both would apply. Both share one
  * algorithmic shape: walk in board traversal order, the FIRST non-completed
  * row claims the slot, every LATER row whose verdict is `ready` in that
  * same slot gets mutated to the corresponding blocked reason. Rows already
- * blocked by reasons 1–9 stay with their (more specific) reason; only
+ * blocked by reasons 1–10 stay with their (more specific) reason; only
  * `ready` rows are mutated. The "occupant" check counts ANY non-completed
  * verdict (working, blocked-by-anything, ready) — so a sibling task that
  * is actively `job-running` or `sub-agent-running` in the same epic/root
@@ -231,12 +241,12 @@ function evaluateTask(
     return { tag: "blocked", reason: { kind: "planner-running" } };
   }
 
-  // 4. own-approval — rejected ranks ABOVE pending.
+  // 4. own-approval-rejected — rejection is permanent regardless of session
+  // state, so it ranks ABOVE the session-running checks. The `pending` half
+  // of own-approval is split off to predicate 7 (below 5/6) so it cannot
+  // fire while a worker session is still alive — see predicate 7's comment.
   if (task.approval === "rejected") {
     return { tag: "blocked", reason: { kind: "job-rejected" } };
-  }
-  if (task.approval === "pending" && task.worker_phase === "done") {
-    return { tag: "blocked", reason: { kind: "job-pending" } };
   }
 
   // 5. own-progress-main — embedded jobs[] state vocabulary, no verb check
@@ -254,7 +264,20 @@ function evaluateTask(
     return { tag: "blocked", reason: { kind: "sub-agent-running" } };
   }
 
-  // 7. dep-on-task — any upstream NOT `{ tag: "completed" }`. The pre-sorted
+  // 7. own-approval-pending — deliberately ranks BELOW 5/6. `worker_phase`
+  // flips to "done" when planctl stamps `worker_done_at`, which can race
+  // ahead of the Claude session's Stop/SessionEnd (planctl `done` returns
+  // before the session exits). If `job-pending` fired here without 5/6
+  // clearing first, autopilot's approval-pending notify would page the
+  // human while the worker is still in-flight — exactly the bug this
+  // ordering exists to prevent. Once the session's embedded job state
+  // leaves `working` AND every sub-agent invocation finishes, this
+  // predicate fires and the notify lands at the right moment.
+  if (task.approval === "pending" && task.worker_phase === "done") {
+    return { tag: "blocked", reason: { kind: "job-pending" } };
+  }
+
+  // 8. dep-on-task — any upstream NOT `{ tag: "completed" }`. The pre-sorted
   // tasks order means typical intra-epic deps already have their upstream
   // verdict in `perTask`; an upstream absent from `perTask` (cross-epic dep
   // not yet folded, malformed id) counts as NOT completed → blocks.
@@ -268,7 +291,7 @@ function evaluateTask(
     }
   }
 
-  // 8. dep-on-epic — task-side rollup of the parent epic's dep list. An
+  // 9. dep-on-epic — task-side rollup of the parent epic's dep list. An
   // absent-from-input upstream counts as SATISFIED (mirrors board.ts:296-297
   // convention: done+approved off the board). We re-evaluate against
   // perCloseRow inside applySingleRootMutex? No — close-row verdicts are
@@ -287,10 +310,10 @@ function evaluateTask(
     }
   }
 
-  // 9. dep-on-task-synthetic-close — not applicable to a real task.
+  // 10. dep-on-task-synthetic-close — not applicable to a real task.
 
-  // 10. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
-  // 11. single-task-per-root — deferred to applySingleTaskPerRootMutex.
+  // 11. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
+  // 12. single-task-per-root — deferred to applySingleTaskPerRootMutex.
 
   return { tag: "ready" };
 }
@@ -319,12 +342,12 @@ function evaluateCloseRow(
     return { tag: "blocked", reason: { kind: "planner-running" } };
   }
 
-  // 4. own-approval — the close row's own approval lives on the EPIC.
+  // 4. own-approval-rejected — the close row's own approval lives on the
+  // EPIC. Rejection is permanent regardless of session state and stays at
+  // rank 4; the `pending` half is split off to predicate 7 below the
+  // session-running checks.
   if (epic.approval === "rejected") {
     return { tag: "blocked", reason: { kind: "job-rejected" } };
-  }
-  if (epic.approval === "pending" && epic.status === "done") {
-    return { tag: "blocked", reason: { kind: "job-pending" } };
   }
 
   // 5. own-progress-main — close-row blocks on a running worker session at
@@ -334,7 +357,7 @@ function evaluateCloseRow(
   // as soon as `worker_phase==="done" && approval==="approved"` — which
   // can race ahead of the worker session's Stop/SessionEnd (planctl can
   // record `worker_done_at` and the human can approve before the session
-  // exits). Without this fan-out, predicate 9 sees every task `completed`
+  // exits). Without this fan-out, predicate 10 sees every task `completed`
   // and the close row flips to `ready` while a worker is still alive.
   if (anyEmbeddedJobWorking(epic.jobs)) {
     return { tag: "blocked", reason: { kind: "job-running" } };
@@ -358,14 +381,24 @@ function evaluateCloseRow(
     }
   }
 
-  // 7. dep-on-task — not applicable to the close row (it has no direct
-  // task deps; predicate 9 below synthesizes those from the epic's tasks).
+  // 7. own-approval-pending — close-row variant, mirrors the task path's
+  // rationale: `epic.status` flips to "done" via the planctl close-verb
+  // synthesis, which can race ahead of the close session's Stop/SessionEnd.
+  // Placing this below 5/6 ensures `job-pending` only fires once every
+  // close-verb AND work-verb session (and any sub-agent) is actually idle,
+  // so autopilot's approval notify lands at the right moment.
+  if (epic.approval === "pending" && epic.status === "done") {
+    return { tag: "blocked", reason: { kind: "job-pending" } };
+  }
 
-  // 8. dep-on-epic — also not applicable to the close row (the spec
+  // 8. dep-on-task — not applicable to the close row (it has no direct
+  // task deps; predicate 10 below synthesizes those from the epic's tasks).
+
+  // 9. dep-on-epic — also not applicable to the close row (the spec
   // assigns cross-epic deps to the task rows; the close row's deps
   // cascade transitively through tasks).
 
-  // 9. dep-on-task-synthetic-close — every real task in the epic must be
+  // 10. dep-on-task-synthetic-close — every real task in the epic must be
   // completed. Reason carries the first non-completed task id in
   // traversal (pre-sorted tasks) order.
   for (const task of epic.tasks) {
@@ -378,8 +411,8 @@ function evaluateCloseRow(
     }
   }
 
-  // 10. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
-  // 11. single-task-per-root — deferred to applySingleTaskPerRootMutex.
+  // 11. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
+  // 12. single-task-per-root — deferred to applySingleTaskPerRootMutex.
 
   return { tag: "ready" };
 }
@@ -389,7 +422,7 @@ function evaluateCloseRow(
 // ---------------------------------------------------------------------------
 
 /**
- * Per-epic mutex (predicate 10). Walk each epic's tasks in pre-sorted order.
+ * Per-epic mutex (predicate 11). Walk each epic's tasks in pre-sorted order.
  * The FIRST task whose verdict is non-completed claims the epic's slot;
  * every LATER task in the same epic with verdict `{ tag: "ready" }` is
  * mutated to `{ kind: "single-task-per-epic" }`. Rows already blocked
@@ -399,7 +432,7 @@ function evaluateCloseRow(
  * blocked-by-anything) — so a sibling task that is actively `job-running`
  * or `sub-agent-running` blocks later ready siblings within the same epic.
  *
- * The close row is never considered here: predicate 9 already forces close
+ * The close row is never considered here: predicate 10 already forces close
  * to wait until every task is completed, so close can only be `ready` when
  * no real task in the epic is non-completed → no competitor.
  *
@@ -432,7 +465,7 @@ export function applySingleTaskPerEpicMutex(
 }
 
 /**
- * Per-root mutex (predicate 11). Walk every per-row verdict in board
+ * Per-root mutex (predicate 12). Walk every per-row verdict in board
  * traversal order (epics in input iteration order; per epic: pre-sorted
  * tasks then the synthetic close row). Key on the effective root:
  * `task.target_repo ?? epic.project_dir` (BOTH null AND empty-string fall

@@ -188,7 +188,7 @@ test("predicate 2 (epic-not-validated) wins over 3 (planner-running)", () => {
   );
 });
 
-test("predicate 3 (planner-running) wins over 4 (own-approval)", () => {
+test("predicate 3 (planner-running) wins over 4 (own-approval-rejected)", () => {
   // Even an approved+done task blocks when a planner is working on the epic.
   // (Predicate 1 doesn't fire because approval is `pending`, not `approved`.)
   const task = makeTask({ worker_phase: "open", approval: "approved" });
@@ -204,8 +204,10 @@ test("predicate 3 (planner-running) wins over 4 (own-approval)", () => {
   );
 });
 
-test("predicate 4 own-approval: job-rejected wins over job-pending", () => {
-  // Rejected ABOVE pending — the spec invariant.
+test("predicate 4 own-approval-rejected: job-rejected fires for a done+rejected task", () => {
+  // Rejection is permanent regardless of session state, so rejected ranks
+  // above 5/6/7. The `pending` half lives at predicate 7 and is exercised
+  // separately below.
   const task = makeTask({ worker_phase: "done", approval: "rejected" });
   const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
@@ -214,8 +216,10 @@ test("predicate 4 own-approval: job-rejected wins over job-pending", () => {
   );
 });
 
-test("predicate 4 wins over 5 (own-progress-main)", () => {
-  // A rejected task whose worker is still running shows `job-rejected`.
+test("predicate 4 (own-approval-rejected) wins over 5 (own-progress-main)", () => {
+  // A rejected task whose worker is still running shows `job-rejected` —
+  // rejection is the terminal verdict on this row regardless of session
+  // state.
   const task = makeTask({
     worker_phase: "open",
     approval: "rejected",
@@ -225,6 +229,73 @@ test("predicate 4 wins over 5 (own-progress-main)", () => {
   const snap = run([epic]);
   expect(snap.perTask.get(task.task_id)).toEqual(
     blocked({ kind: "job-rejected" }),
+  );
+});
+
+test("predicate 5 (own-progress-main) wins over 7 (own-approval-pending)", () => {
+  // The regression this guards: `worker_phase` flips to "done" when
+  // planctl stamps `worker_done_at`, which can race ahead of the Claude
+  // session's Stop/SessionEnd. If `job-pending` fired at the old rank-4
+  // position, autopilot's approval notify would page the human while the
+  // worker is still in-flight. The worker-still-running row reports
+  // `job-running`, NOT `job-pending`.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ state: "working" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "job-running" }),
+  );
+});
+
+test("predicate 6 (own-progress-sub) wins over 7 (own-approval-pending)", () => {
+  // Same race as predicate 5 above, but the live work is a sub-agent
+  // invocation rather than the worker session itself. Until every
+  // sub-agent finishes, `job-pending` is held back.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subs = [makeSub({ job_id: "worker-1", status: "running" })];
+  const snap = run([epic], new Map(), subs);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "sub-agent-running" }),
+  );
+});
+
+test("predicate 7 (own-approval-pending) fires once the worker session is idle", () => {
+  // Worker has stopped (embedded job state="stopped"), no sub-agents
+  // running, approval still pending — this is the moment autopilot is
+  // allowed to page the human.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "job-pending" }),
+  );
+});
+
+test("close row: predicate 5 (own-progress-main) wins over 7 (own-approval-pending)", () => {
+  // Close-row variant of the same race. Epic.status==="done" can be
+  // synthesized while the close-verb session is still alive; the close
+  // row must not flip to `job-pending` until that session is idle.
+  const epic = makeEpic({
+    status: "done",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ state: "working" })],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "job-running" }),
   );
 });
 
@@ -241,7 +312,7 @@ test("predicate 5 (own-progress-main) wins over 6 (own-progress-sub)", () => {
   );
 });
 
-test("predicate 6 (own-progress-sub) wins over 7 (dep-on-task)", () => {
+test("predicate 6 (own-progress-sub) wins over 8 (dep-on-task)", () => {
   // This row's sub-agent running. Upstream completed. Sub still blocks.
   const upstream = makeTask({
     task_id: "fn-1-foo.1",
@@ -262,7 +333,7 @@ test("predicate 6 (own-progress-sub) wins over 7 (dep-on-task)", () => {
   );
 });
 
-test("predicate 7 (dep-on-task) wins over 8 (dep-on-epic)", () => {
+test("predicate 8 (dep-on-task) wins over 9 (dep-on-epic)", () => {
   // Task depends on a non-completed sibling; the EPIC also has a non-completed
   // upstream epic. Task-dep should win.
   const upstreamEpic = makeEpic({
@@ -293,7 +364,7 @@ test("predicate 7 (dep-on-task) wins over 8 (dep-on-epic)", () => {
   );
 });
 
-test("predicate 8 (dep-on-epic) wins over 11 (single-task-per-root)", () => {
+test("predicate 9 (dep-on-epic) wins over 12 (single-task-per-root)", () => {
   // The dependent epic's task would otherwise compete for per-root with
   // the upstream epic's task; dep-on-epic should win.
   const upstreamEpic = makeEpic({
@@ -323,7 +394,7 @@ test("predicate 8 (dep-on-epic) wins over 11 (single-task-per-root)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Per-epic post-pass (predicate 10)
+// Per-epic post-pass (predicate 11)
 // ---------------------------------------------------------------------------
 
 test("per-epic: two ready tasks in same epic → first wins, second blocks single-task-per-epic", () => {
@@ -393,7 +464,7 @@ test("per-epic: doesn't fire when only one non-completed task exists", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Per-root post-pass (predicate 11)
+// Per-root post-pass (predicate 12)
 // ---------------------------------------------------------------------------
 
 test("per-root: same-root tasks in DIFFERENT epics → first wins, second blocks single-task-per-root", () => {
@@ -572,7 +643,7 @@ test("epic header rollup: zero-task epic — header = close-row verdict (ready)"
 });
 
 test("epic header rollup: all tasks done+approved + close blocked → header inherits close reason", () => {
-  // Close row is pending → predicate 4 fires job-pending, but only when
+  // Close row is pending → predicate 7 fires job-pending, but only when
   // epic.status === "done". With status=open the close row is just `ready`
   // (after dep-on-task-synthetic-close passes). To get a non-ready close
   // we set status=open + pending approval (no own-approval fire) — close
@@ -894,7 +965,7 @@ test("formatPill renders the three tags + every reason kind", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Close-row predicate 9 (dep-on-task-synthetic-close)
+// Close-row predicate 10 (dep-on-task-synthetic-close)
 // ---------------------------------------------------------------------------
 
 test("close row: every real task completed → close ready (then dep-on-task-synthetic-close passes)", () => {
