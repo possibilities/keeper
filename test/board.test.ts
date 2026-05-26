@@ -251,13 +251,13 @@ test("renderJobLinkLines: null title falls back to job_id (preserves line shape)
   expect(out).toEqual(["   sess-no-title [refiner] [stopped]"]);
 });
 
-test("renderJobLinkLines: last_api_error_at non-null appends [limited] pill (same line shape, live + terminal + off-page all)", () => {
-  // The [limited] pill is the only render variation today; task .3 of
-  // fn-616 widens it into `[failed:<kind>]`. Until then the pre-v24
-  // behavior is preserved: any non-null `last_api_error_at` value renders
-  // `[limited]`. The spec says the entry shape is uniform across live /
-  // terminal / off-page — there's no second branch to test, just the
-  // optional pill segment.
+test("renderJobLinkLines: last_api_error_at non-null appends [failed:<kind>] pill (same line shape, live + terminal + off-page all)", () => {
+  // The api-error pill is the only render variation today. The spec
+  // says the entry shape is uniform across live / terminal / off-page —
+  // there's no second branch to test, just the optional pill segment.
+  // The pill text is `[failed:<kind>]` where `<kind>` is taken straight
+  // off `last_api_error_kind`, stamped by the reducer's dual-case
+  // `RateLimited` / `ApiError` arm (schema v24).
   const out = renderJobLinkLines([
     makeLink({
       kind: "creator",
@@ -268,7 +268,58 @@ test("renderJobLinkLines: last_api_error_at non-null appends [limited] pill (sam
       last_api_error_kind: "rate_limit",
     }),
   ]);
-  expect(out).toEqual(["   Plan epic 8 [creator] [stopped] [limited]"]);
+  expect(out).toEqual([
+    "   Plan epic 8 [creator] [stopped] [failed:rate_limit]",
+  ]);
+});
+
+// One render test per ApiErrorKind. Six positive cases — every kind
+// the matcher emits (the openclaude SDK's six terminal kinds;
+// `max_output_tokens` is excluded by design as recoverable). Each
+// renders as `[failed:<kind>]` straight off `last_api_error_kind`.
+test.each([
+  "rate_limit",
+  "authentication_failed",
+  "billing_error",
+  "server_error",
+  "invalid_request",
+  "unknown",
+])(
+  "renderJobLinkLines: kind=%s renders [failed:<kind>] pill",
+  (kind: string) => {
+    const out = renderJobLinkLines([
+      makeLink({
+        kind: "refiner",
+        job_id: "sess-x",
+        title: "Plan epic 9",
+        state: "stopped",
+        last_api_error_at: 1700000000,
+        last_api_error_kind: kind,
+      }),
+    ]);
+    expect(out).toEqual([
+      `   Plan epic 9 [refiner] [stopped] [failed:${kind}]`,
+    ]);
+  },
+);
+
+// Defensive fallback: `at` non-null but `kind` happens to be null
+// (should be unreachable per the reducer's paired-NULL invariant). The
+// pill collapses to `[failed:unknown]` rather than the empty-inner
+// `[failed:]` — keeps the line readable if a future shape-skew bug
+// appears.
+test("renderJobLinkLines: at non-null, kind null defensively renders [failed:unknown]", () => {
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "creator",
+      job_id: "sess-defensive",
+      title: "Plan epic 10",
+      state: "stopped",
+      last_api_error_at: 1700000000,
+      last_api_error_kind: null,
+    }),
+  ]);
+  expect(out).toEqual(["   Plan epic 10 [creator] [stopped] [failed:unknown]"]);
 });
 
 test("renderJobLinkLines: multiple entries iterate in provided order (projection's own (kind, job_id) ASC sort)", () => {
@@ -329,7 +380,6 @@ test("colorizePillsInLine: each bucket colors its representative tokens", () => 
   expect(colorizePillsInLine("[done]")).toBe(`[${SUCCESS}done${RESET}]`);
   expect(colorizePillsInLine("[failed]")).toBe(`[${ERROR}failed${RESET}]`);
   expect(colorizePillsInLine("[rejected]")).toBe(`[${ERROR}rejected${RESET}]`);
-  expect(colorizePillsInLine("[limited]")).toBe(`[${ERROR}limited${RESET}]`);
   expect(colorizePillsInLine("[killed]")).toBe(`[${ERROR}killed${RESET}]`);
   expect(colorizePillsInLine("[blocked]")).toBe(`[${WARN}blocked${RESET}]`);
   expect(colorizePillsInLine("[completed]")).toBe(
@@ -350,6 +400,26 @@ test("colorizePillsInLine: blocked:<reason> takes the warn bucket via prefix fal
     `[${WARN}blocked:unknown${RESET}]`,
   );
 });
+
+// `failed:<kind>` prefix fallback — the six ApiErrorKind tokens minted
+// by `apiErrorPillSeg` all color the same as the bare `[failed]` exact
+// match (error bucket, red SGR). Mirrors the `blocked:*` → warn pattern
+// directly above.
+test.each([
+  "rate_limit",
+  "authentication_failed",
+  "billing_error",
+  "server_error",
+  "invalid_request",
+  "unknown",
+])(
+  "colorizePillsInLine: failed:%s takes the error bucket via prefix fallback",
+  (kind: string) => {
+    expect(colorizePillsInLine(`[failed:${kind}]`)).toBe(
+      `[${ERROR}failed:${kind}${RESET}]`,
+    );
+  },
+);
 
 test("colorizePillsInLine: multiple pills on one line each color independently", () => {
   expect(

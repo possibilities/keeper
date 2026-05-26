@@ -104,13 +104,18 @@ Each epic block opens with a header line of the form:
   ({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated] [<readiness>]
 
 followed (when the epic carries job_links) by one indented creator/refiner
-line per linked session — '{title} [creator|refiner] [state] [limited]?'
+line per linked session — '{title} [creator|refiner] [state] [failed:<kind>]?'
 (title falls back to {job_id} when the embedded title is null; the
-[limited] pill appears when the session was rate-limited and the human
-hasn't picked up since). Schema v21 denormalized title / state /
-rate_limited_at off the linked jobs row at the reducer's write boundary,
-so the same line shape renders for live, terminal, and off-page sessions
-— no live-jobs join, no off-page fallback branch — then the task lines
+[failed:<kind>] pill appears when the session's last Claude API request
+failed at a terminal HTTP boundary and the human hasn't picked up since —
+the six rendered kinds are rate_limit | authentication_failed |
+billing_error | server_error | invalid_request | unknown, and anything
+outside the allow-list folds to 'unknown'; the recoverable
+max_output_tokens kind is excluded by design). Schema v24 denormalized
+title / state / last_api_error_at / last_api_error_kind off the linked
+jobs row at the reducer's write boundary, so the same line shape renders
+for live, terminal, and off-page sessions — no live-jobs join, no
+off-page fallback branch — then the task lines
 (one per embedded task,
 '{n}. {title} [#dep,#dep] [runtime_status] [worker_phase] [approval]' —
 the three native pills side-by-side: planctl runtime status
@@ -210,22 +215,42 @@ function planVerbLabel(v: unknown): string | null {
 }
 
 /**
- * Render the optional `[limited]` pill segment from a
- * `jobs.last_api_error_at` cell (schema v24 — the column was widened from
- * the old single `rate_limited_at` slot into the two-field
- * `(last_api_error_at, last_api_error_kind)` signal; the kind-aware pill
- * lands in task .3 of fn-616). The reducer stamps the column on the
- * dual-case `RateLimited` / `ApiError` fold and clears it to NULL on the
- * next `UserPromptSubmit` revival (see `src/reducer.ts`), so any non-null
- * value means "this stoppage was api-error-caused, the human hasn't
- * picked up since". Returns the leading `' '` so the caller can append
- * unconditionally — empty string when the field is null, ` [limited]`
- * otherwise. The underlying lifecycle pill (`[stopped]`) is rendered
- * separately from `jobs.state` and always shows first; this annotation
- * stacks after it.
+ * Render the optional `[failed:<kind>]` pill segment from the
+ * `jobs.(last_api_error_at, last_api_error_kind)` pair (schema v24 — the
+ * two-field signal that replaced the v17 single `rate_limited_at` slot).
+ * The reducer stamps both columns together on the dual-case
+ * `RateLimited` / `ApiError` fold and clears them together to
+ * `(NULL, NULL)` on the next `UserPromptSubmit` revival (see
+ * `src/reducer.ts`), so a non-null `at` means "this stoppage was
+ * api-error-caused, the human hasn't picked up since".
+ *
+ * The kind is taken straight off `last_api_error_kind` — one of
+ * `rate_limit | authentication_failed | billing_error | server_error |
+ * invalid_request | unknown`. Anything outside that allow-list already
+ * folded to `"unknown"` at the matcher / reducer boundary (see
+ * `matchApiError` in `src/transcript-worker.ts`); the recoverable
+ * `max_output_tokens` kind is excluded at the matcher and never lands
+ * here.
+ *
+ * **Paired-NULL invariant.** The reducer guarantees `at` and `kind`
+ * move together — both NULL or both non-NULL. The fallback to
+ * `"unknown"` when `at` is non-null but `kind` happens to be null is
+ * defensive only (should be unreachable); keeps the pill from
+ * collapsing to `[failed:]` if a future shape-skew bug appears.
+ *
+ * Returns the leading `' '` so the caller can append unconditionally —
+ * empty string when `at` is null, ` [failed:<kind>]` otherwise. The
+ * underlying lifecycle pill (`[stopped]`) is rendered separately from
+ * `jobs.state` and always shows first; this annotation stacks after it
+ * and is colored red on a TTY via the colorizer's `failed:*` prefix
+ * fallback to the `error` bucket.
  */
-function rateLimitedPillSeg(v: unknown): string {
-  return v == null ? "" : " [limited]";
+function apiErrorPillSeg(at: unknown, kind: unknown): string {
+  if (at == null) {
+    return "";
+  }
+  const k = typeof kind === "string" && kind.length > 0 ? kind : "unknown";
+  return ` [failed:${k}]`;
 }
 
 function epicNumFromId(id: string): number | null {
@@ -235,9 +260,10 @@ function epicNumFromId(id: string): number | null {
 
 /**
  * ANSI SGR sequences for the pill palette. Five semantic buckets keyed off
- * exact pill strings (plus a `blocked:*` prefix fallback) so the colorizer
- * stays purely string-driven — no structural knowledge of which column a
- * pill came from. Standard 16-color ANSI for cross-terminal portability.
+ * exact pill strings (plus `blocked:*` and `failed:*` prefix fallbacks) so
+ * the colorizer stays purely string-driven — no structural knowledge of
+ * which column a pill came from. Standard 16-color ANSI for cross-terminal
+ * portability.
  *
  * Bucket rationale:
  *   - active  (bright cyan): in motion right now, look here
@@ -276,7 +302,6 @@ const PILL_COLORS: Record<string, PillBucket> = {
   done: "success",
   failed: "error",
   rejected: "error",
-  limited: "error",
   killed: "error",
   blocked: "warn",
   completed: "faded",
@@ -290,7 +315,10 @@ const PILL_COLORS: Record<string, PillBucket> = {
  * Pure string→string: matches `[<token>]`, looks the inner token up in
  * `PILL_COLORS`, and falls back to the `warn` bucket for any `blocked:*`
  * payload (so `[blocked:dep-on-task fn-614.2]` colors the same as
- * `[blocked]`). Unknown tokens pass through verbatim.
+ * `[blocked]`) AND to the `error` bucket for any `failed:*` payload (so
+ * the six `[failed:<kind>]` api-error pills minted by `apiErrorPillSeg`
+ * color the same as a bare `[failed]`). Unknown tokens pass through
+ * verbatim.
  *
  * Module-level + exported so `test/board.test.ts` can assert the coloring
  * contract without standing up the subscribe loop. Sidecars and the
@@ -302,6 +330,9 @@ export function colorizePillsInLine(line: string): string {
     let bucket = PILL_COLORS[inner];
     if (bucket === undefined && inner.startsWith("blocked:")) {
       bucket = "warn";
+    }
+    if (bucket === undefined && inner.startsWith("failed:")) {
+      bucket = "error";
     }
     if (bucket === undefined) {
       return match;
@@ -327,7 +358,7 @@ function taskNumFromId(id: string): number | null {
  * The line shape is the same regardless of whether the linked session
  * is live, terminal, or off-page:
  *
- *     {title ?? job_id} [{kind}] [{state}]{rateLimitedPillSeg}
+ *     {title ?? job_id} [{kind}] [{state}]{apiErrorPillSeg}
  *
  * Title falls back to `job_id` when the embedded `title` is null —
  * preserves the line shape when title is genuinely unknown (e.g. a
@@ -349,7 +380,7 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
     const label = link.title ?? link.job_id;
     const state = link.state == null ? "" : String(link.state);
     out.push(
-      `   ${label} [${link.kind}] [${state}]${rateLimitedPillSeg(link.last_api_error_at)}`,
+      `   ${label} [${link.kind}] [${state}]${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}`,
     );
   }
   return out;
@@ -432,7 +463,7 @@ async function main(): Promise<void> {
     for (const j of jobsArr) {
       const job = j as Record<string, unknown>;
       out.push(
-        `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${rateLimitedPillSeg(job.last_api_error_at)}`,
+        `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}`,
       );
       out.push(
         ...subagentLinesFor(subagentIndex, String(job.job_id), "      "),
@@ -545,7 +576,7 @@ async function main(): Promise<void> {
     const cwdSeg = cwd === "" ? "" : `(${cwd}) `;
     const role = planVerbLabel(row.plan_verb);
     const roleSeg = role == null ? "" : ` [${role}]`;
-    return `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${rateLimitedPillSeg(row.last_api_error_at)}`;
+    return `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
   }
 
   /**
