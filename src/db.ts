@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 23;
+export const SCHEMA_VERSION = 24;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -429,7 +429,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     plan_verb TEXT,
     plan_ref TEXT,
     epic_links TEXT NOT NULL DEFAULT '[]',
-    rate_limited_at REAL,
+    last_api_error_at REAL,
+    last_api_error_kind TEXT,
     config_dir TEXT
 )
 `;
@@ -1989,6 +1990,73 @@ function migrate(db: Database): void {
     // `src/usage-worker.ts` for the change-gate discipline that enforces the
     // same exclusion on the producer side; a freshness column added here
     // (or to the worker's change-gate hash) would churn every ~90s.
+
+    // v23→v24: generalize the rate-limit annotation column into a two-field
+    // signal. Replace `jobs.rate_limited_at REAL` with the pair
+    // `jobs.last_api_error_at REAL` + `jobs.last_api_error_kind TEXT`,
+    // matching the new {@link import("./types").ApiErrorKind} union. The
+    // reducer's pre-v24 `RateLimited` arm becomes a dual-case fold over
+    // `RateLimited | ApiError` (both labels route to one handler — the
+    // historical event log re-folds byte-deterministically; legacy events
+    // force `kind = "rate_limit"`, new events read `event.data.kind`).
+    //
+    // Pair-step: the same two columns are added to the embedded `jobs`
+    // array shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
+    // `EmbeddedJob` in `src/types.ts`) AND to the `JobLinkEntry` shape on
+    // `epics.job_links`. Historical serialized JSON arrays from v23 carry
+    // the OLD `rate_limited_at` field; without a rewind, incremental
+    // `syncJobIntoEpic` / `syncJobLinksOnJobWrite` writes from later events
+    // would re-serialize entries WITH the new field-pair while neighbour
+    // entries in the same array stayed WITH the old field, breaking the
+    // byte-identical re-fold invariant (CLAUDE.md). The rewind-and-redrain
+    // below harmonizes all three sides — `jobs` columns, `epics.jobs[]`,
+    // `epics.tasks[].jobs[]`, `epics.job_links[]` — to "new schema
+    // everywhere".
+    //
+    // Step 1: add the two new `jobs` columns. Both nullable, no DEFAULT —
+    // ADD COLUMN leaves prior rows reading NULL, which is exactly the
+    // zero-event / never-errored projection. Column defs match
+    // `CREATE_JOBS` so a fresh v24 DB and a migrated v23→v24 DB converge
+    // to identical schema (the addColumnIfMissing/literal lockstep
+    // convention).
+    addColumnIfMissing(db, "jobs", "last_api_error_at", "REAL");
+    addColumnIfMissing(db, "jobs", "last_api_error_kind", "TEXT");
+
+    // Step 2: drop the legacy `rate_limited_at` column. Idempotent
+    // (drops only if present), so this runs every boot and converges
+    // whether the DB is a fresh v24 (CREATE_JOBS already omits it) or
+    // an older v23 DB that still carries it. The historical fact is
+    // preserved in the immutable event log (every stored `RateLimited`
+    // event still mints the stamp on re-fold via the dual-case alias);
+    // the projection is rebuilt fresh by the rewind-and-redrain below,
+    // so we can safely drop the column without an explicit backfill.
+    dropColumnIfPresent(db, "jobs", "rate_limited_at");
+
+    // Step 3: rewind-and-redrain — same shape as the v17→v18 +
+    // v18→v19 steps. Version-guarded: re-open of an already-migrated
+    // v24+ DB skips it (the guard reads the meta row written by a
+    // PRIOR migrate(); on a fresh v24 DB or one that crashed before
+    // stamping v24, `storedVersionV24 < 24` and the rewind runs; on
+    // steady-state v24+ DB it skips). The boot drain after migrate()
+    // returns rebuilds `jobs` / `epics` / `subagent_invocations` from
+    // the event log, re-emitting embedded `jobs` arrays + `job_links`
+    // arrays with the new field-pair on every entry — legacy stored
+    // `RateLimited` events fold to `kind="rate_limit"` via the dual
+    // -case alias, so the post-rewind projection carries the new
+    // shape with the right semantic content.
+    const storedVersionV24 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV24 < 24) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM subagent_invocations");
+    }
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

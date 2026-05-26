@@ -110,7 +110,8 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     created_at: 0,
     updated_at: 0,
     last_event_id: 0,
-    rate_limited_at: null,
+    last_api_error_at: null,
+    last_api_error_kind: null,
     ...overrides,
   };
 }
@@ -198,9 +199,10 @@ test("two running invocations on one job_id both reach computeReadiness and bloc
 // ---------------------------------------------------------------------------
 
 /**
- * Build a schema-v21 `JobLinkEntry` with defaults matching
+ * Build a schema-v24 `JobLinkEntry` with defaults matching
  * `enrichJobLink`'s missing-row defaults (`title: null, state: "stopped",
- * rate_limited_at: null`). Callers override per-test.
+ * last_api_error_at: null, last_api_error_kind: null`). Callers override
+ * per-test.
  */
 function makeLink(overrides: Partial<JobLinkEntry>): JobLinkEntry {
   return {
@@ -208,7 +210,8 @@ function makeLink(overrides: Partial<JobLinkEntry>): JobLinkEntry {
     job_id: "session-1",
     title: null,
     state: "stopped",
-    rate_limited_at: null,
+    last_api_error_at: null,
+    last_api_error_kind: null,
     ...overrides,
   };
 }
@@ -248,17 +251,21 @@ test("renderJobLinkLines: null title falls back to job_id (preserves line shape)
   expect(out).toEqual(["   sess-no-title [refiner] [stopped]"]);
 });
 
-test("renderJobLinkLines: rate_limited_at non-null appends [limited] pill (same line shape, live + terminal + off-page all)", () => {
-  // The [limited] pill is the only render variation; the spec says the
-  // entry shape is now uniform across live / terminal / off-page —
-  // there's no second branch to test, just the optional pill segment.
+test("renderJobLinkLines: last_api_error_at non-null appends [limited] pill (same line shape, live + terminal + off-page all)", () => {
+  // The [limited] pill is the only render variation today; task .3 of
+  // fn-616 widens it into `[failed:<kind>]`. Until then the pre-v24
+  // behavior is preserved: any non-null `last_api_error_at` value renders
+  // `[limited]`. The spec says the entry shape is uniform across live /
+  // terminal / off-page — there's no second branch to test, just the
+  // optional pill segment.
   const out = renderJobLinkLines([
     makeLink({
       kind: "creator",
       job_id: "sess-rl",
       title: "Plan epic 8",
       state: "stopped",
-      rate_limited_at: 1700000000,
+      last_api_error_at: 1700000000,
+      last_api_error_kind: "rate_limit",
     }),
   ]);
   expect(out).toEqual(["   Plan epic 8 [creator] [stopped] [limited]"]);

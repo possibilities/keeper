@@ -21,10 +21,11 @@
  *                       |   'killed' -> 'stopped' + refresh pid + start_time;
  *                       |   a non-terminal row's state is left as-is.
  *   UserPromptSubmit    | state -> 'working'  (also re-opens 'ended' or 'killed')
- *                       |   AND clears rate_limited_at to NULL — a fresh
- *                       |   prompt means the human picked up after the quota
- *                       |   reset, so the "this stoppage was rate-limited"
- *                       |   annotation no longer applies.
+ *                       |   AND clears (last_api_error_at, last_api_error_kind)
+ *                       |   to (NULL, NULL) together — a fresh prompt means
+ *                       |   the human picked up after the quota reset /
+ *                       |   re-auth / retry, so the "this stoppage was
+ *                       |   api-error-caused" annotation no longer applies.
  *                       |   EXCEPT when the prompt is Claude Code's
  *                       |   `<task-notification>…<status>killed</status>`
  *                       |   shutdown-housekeeping envelope — those are no-ops
@@ -38,18 +39,27 @@
  *                       |   (pid, start_time) matches the event payload, OR
  *                       |   the persisted start_time is NULL — legacy loose
  *                       |   match. Race-recovered mismatches are no-ops.)
- *   RateLimited         | state -> 'stopped' AND rate_limited_at -> event.ts
- *                       |   (synthetic; skipped on 'ended' or 'killed' — same
- *                       |   terminal guard as Stop. Minted by main from a
- *                       |   transcript-worker `rate-limited` message when
- *                       |   Claude Code writes its isApiErrorMessage/rate_limit
- *                       |   synthetic assistant turn to the transcript. The
- *                       |   lifecycle column tracks "is the session running"
- *                       |   honestly — the API request failed at the boundary,
- *                       |   no work is happening — and rate_limited_at carries
- *                       |   the separate "*why* it's stopped" annotation that
- *                       |   survives Stop/SessionEnd/Killed and only clears on
- *                       |   the next UserPromptSubmit revival.)
+ *   RateLimited/ApiError| state -> 'stopped' AND (last_api_error_at,
+ *                       |   last_api_error_kind) -> (event.ts, kind) — both
+ *                       |   columns paired in a single UPDATE. (Synthetic;
+ *                       |   skipped on 'ended' or 'killed' — same terminal
+ *                       |   guard as Stop. Minted by main from a transcript
+ *                       |   -worker `api-error` message when Claude Code
+ *                       |   writes its `isApiErrorMessage: true` synthetic
+ *                       |   assistant turn to the transcript.) The legacy
+ *                       |   `RateLimited` event_type folds to
+ *                       |   `kind="rate_limit"` for byte-identical re-fold of
+ *                       |   the pre-v24 event log; the new `ApiError`
+ *                       |   event_type reads `data.kind` validated against
+ *                       |   the `ApiErrorKind` allow-list (unknown values
+ *                       |   fold to `"unknown"`). The lifecycle column
+ *                       |   tracks "is the session running" honestly — the
+ *                       |   API request failed at the boundary, no work is
+ *                       |   happening — and the (last_api_error_at,
+ *                       |   last_api_error_kind) pair carries the separate
+ *                       |   "*why* it's stopped" annotation that survives
+ *                       |   Stop/SessionEnd/Killed and only clears on the
+ *                       |   next UserPromptSubmit revival.
  *   <any with title>    | title -> data.session_title by precedence (the
  *                       |   source is 'transcript' for a TranscriptTitle event,
  *                       |   else 'payload'; write iff it outranks/ties+changes)
@@ -103,7 +113,7 @@ import {
   findPendingPreToolUseForStart,
   resolveBridgeAgentId,
 } from "./subagent-invocations";
-import type { Event, JobLinkEntry } from "./types";
+import type { ApiErrorKind, Event, JobLinkEntry } from "./types";
 
 /**
  * Default batch size for {@link drain}. Keeps each writer transaction short so
@@ -139,6 +149,58 @@ const ENDED = "ended";
  * guards below.
  */
 const KILLED = "killed";
+
+/**
+ * Canonical `ApiErrorKind` allow-list — string literals so the runtime
+ * validation `validateApiErrorKind` can `.has` against a Set. The values
+ * mirror {@link import("./types").ApiErrorKind} exactly; if the type
+ * widens or narrows the set MUST be updated in lockstep. Excludes
+ * `"unknown"` itself — that's the fallback every unrecognized value
+ * folds to.
+ */
+const API_ERROR_KINDS: ReadonlySet<ApiErrorKind> = new Set([
+  "rate_limit",
+  "authentication_failed",
+  "billing_error",
+  "server_error",
+  "invalid_request",
+]);
+
+/**
+ * Validate an event's `data.kind` against the {@link ApiErrorKind} union.
+ * Anything not in the canonical allow-list — including missing /
+ * non-string / unrecognized values like the SDK's own `"unknown"` —
+ * folds to `"unknown"`. Pure (no side effects, no throws); the fold
+ * arm calls it inside the open `BEGIN IMMEDIATE` transaction.
+ *
+ * Used by the dual-case `ApiError` arm: legacy `RateLimited` events
+ * skip this and force `kind = "rate_limit"` directly; new `ApiError`
+ * events route their `data.kind` through here.
+ */
+function validateApiErrorKind(raw: unknown): ApiErrorKind {
+  if (typeof raw !== "string") {
+    return "unknown";
+  }
+  return API_ERROR_KINDS.has(raw as ApiErrorKind)
+    ? (raw as ApiErrorKind)
+    : "unknown";
+}
+
+/**
+ * Parse the `kind` out of an event's `data` blob for the dual-case
+ * `RateLimited` / `ApiError` fold arm. Safe-parse: a malformed blob
+ * folds to `"unknown"` (never throws inside the fold transaction).
+ * The legacy `RateLimited` event_type forces `"rate_limit"` upstream
+ * — this helper is only called on the `ApiError` arm.
+ */
+function extractApiErrorKind(event: Event): ApiErrorKind {
+  try {
+    const parsed = JSON.parse(event.data) as { kind?: unknown };
+    return validateApiErrorKind(parsed?.kind);
+  } catch {
+    return "unknown";
+  }
+}
 
 /**
  * Title-source precedence. A higher number wins. NULL `title_source` (the
@@ -1312,7 +1374,8 @@ interface EmbeddedJobElement {
   created_at: number;
   updated_at: number;
   last_event_id: number;
-  rate_limited_at: number | null;
+  last_api_error_at: number | null;
+  last_api_error_kind: string | null;
 }
 
 /**
@@ -1328,7 +1391,8 @@ interface JobsRowForSync {
   created_at: number;
   updated_at: number;
   last_event_id: number;
-  rate_limited_at: number | null;
+  last_api_error_at: number | null;
+  last_api_error_kind: string | null;
 }
 
 /**
@@ -1386,7 +1450,8 @@ function buildEmbeddedJob(row: JobsRowForSync): EmbeddedJobElement {
     created_at: row.created_at,
     updated_at: row.updated_at,
     last_event_id: row.last_event_id,
-    rate_limited_at: row.rate_limited_at,
+    last_api_error_at: row.last_api_error_at,
+    last_api_error_kind: row.last_api_error_kind,
   };
 }
 
@@ -1605,7 +1670,7 @@ function syncIfPlanRef(
 ): void {
   const row = db
     .query(
-      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, rate_limited_at FROM jobs WHERE job_id = ?",
+      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = ?",
     )
     .get(jobId) as JobsRowForSync | null;
   if (row == null) {
@@ -1693,33 +1758,46 @@ function sortJobLinks(
 /**
  * Enrich a thin classifier-output `JobLink` (`{kind, job_id}`) into the
  * widened `JobLinkEntry` projection shape carried on `epics.job_links`
- * — adding `(title, state, rate_limited_at)` read directly off the
- * post-write `jobs` row.
+ * — adding `(title, state, last_api_error_at, last_api_error_kind)` read
+ * directly off the post-write `jobs` row.
  *
- * Shared between the live reducer fan-out (`syncPlanctlLinks`), the
- * jobs-write fan-out (`syncJobLinksOnJobWrite`), and the v20→v21
- * migration backfill. SAME code path, SAME defaults — different code
- * paths producing the same JSON is the classic silent re-fold-determinism
- * break this helper exists to prevent.
+ * Shared between the live reducer fan-out (`syncPlanctlLinks`) and the
+ * jobs-write fan-out (`syncJobLinksOnJobWrite`). SAME code path, SAME
+ * defaults — different code paths producing the same JSON is the
+ * classic silent re-fold-determinism break this helper exists to
+ * prevent.
  *
  * **Defaults on a missing `jobs` row.** Returns
- * `{title: null, state: "stopped", rate_limited_at: null}` — the
- * zero-event projection reading. This matches the scenario where the
- * classifier emitted an edge for a session whose backing `jobs` row
- * was never inserted (orphan planctl invocation: no SessionStart),
- * and preserves re-fold determinism (a from-scratch re-fold sees the
- * same missing row at the same enrichment point and writes the same
- * defaults).
+ * `{kind, job_id, title: null, state: "stopped", last_api_error_at: null,
+ * last_api_error_kind: null}` — the zero-event projection reading. The
+ * two api-error columns are emitted as explicit JSON nulls (NOT
+ * omitted): omitting keys vs. emitting nulls produces different
+ * `JSON.stringify` bytes and would break the byte-identical re-fold
+ * contract. This matches the scenario where the classifier emitted an
+ * edge for a session whose backing `jobs` row was never inserted (orphan
+ * planctl invocation: no SessionStart), and preserves re-fold
+ * determinism (a from-scratch re-fold sees the same missing row at the
+ * same enrichment point and writes the same defaults).
+ *
+ * **Key order is locked.** Both branches emit
+ * `{kind, job_id, title, state, last_api_error_at, last_api_error_kind}`
+ * in that exact order; the wire encoding is `JSON.stringify`, which
+ * preserves insertion order, so any drift between branches would
+ * produce different bytes for the same logical entry — a silent
+ * re-fold-determinism break.
  *
  * NEVER throws inside the open BEGIN IMMEDIATE transaction.
  */
 function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
   const row = db
-    .query("SELECT title, state, rate_limited_at FROM jobs WHERE job_id = ?")
+    .query(
+      "SELECT title, state, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = ?",
+    )
     .get(classifierEntry.job_id) as {
     title: string | null;
     state: string;
-    rate_limited_at: number | null;
+    last_api_error_at: number | null;
+    last_api_error_kind: string | null;
   } | null;
   if (row == null) {
     return {
@@ -1727,7 +1805,8 @@ function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
       job_id: classifierEntry.job_id,
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     };
   }
   return {
@@ -1735,17 +1814,19 @@ function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
     job_id: classifierEntry.job_id,
     title: row.title,
     state: row.state,
-    rate_limited_at: row.rate_limited_at,
+    last_api_error_at: row.last_api_error_at,
+    last_api_error_kind: row.last_api_error_kind,
   };
 }
 
 /**
  * Reverse fan-out from a jobs-write that may have changed `title` /
- * `state` / `rate_limited_at` on a session whose planctl-CLI footprint
- * has already produced epic-link edges. For each epic that references
- * this `jobId` via the symmetric `jobs.epic_links` array, re-stamp the
- * matching entry on that epic's `job_links` with fresh enrichment
- * (`enrichJobLink`), preserving every OTHER entry on that epic verbatim.
+ * `state` / `last_api_error_at` / `last_api_error_kind` on a session
+ * whose planctl-CLI footprint has already produced epic-link edges. For
+ * each epic that references this `jobId` via the symmetric
+ * `jobs.epic_links` array, re-stamp the matching entry on that epic's
+ * `job_links` with fresh enrichment (`enrichJobLink`), preserving every
+ * OTHER entry on that epic verbatim.
  *
  * Mirrors {@link syncJobIntoEpic}'s step-for-step structure. Runs INSIDE
  * the open transaction opened by {@link applyEvent}; performs zero cursor
@@ -2092,12 +2173,12 @@ function syncPlanctlLinks(
       epicId,
     );
     // Enrich each thin classifier entry into the widened JobLinkEntry
-    // shape (schema v21): SELECT the linked `jobs` row inside the open
-    // transaction and stamp `(title, state, rate_limited_at)`. The
-    // enrichment helper is the SAME one used by both the jobs-write
-    // fan-out (`syncJobLinksOnJobWrite`) and the v20→v21 migration
-    // backfill — re-fold determinism requires a single source of
-    // truth for "what's the projection shape on disk".
+    // shape (schema v24): SELECT the linked `jobs` row inside the open
+    // transaction and stamp `(title, state, last_api_error_at,
+    // last_api_error_kind)`. The enrichment helper is the SAME one used
+    // by the jobs-write fan-out (`syncJobLinksOnJobWrite`) — re-fold
+    // determinism requires a single source of truth for "what's the
+    // projection shape on disk".
     const enriched: JobLinkEntry[] = newJobLinks.map((e) =>
       enrichJobLink(db, e),
     );
@@ -2269,14 +2350,19 @@ function projectJobsRow(db: Database, event: Event): void {
       // (legacy hook) or pid matches, behavior is unchanged.
       //
       // The CASE is a pure function of (event.pid, row.pid) — re-fold safe.
-      // Also clears `rate_limited_at` to NULL on every revival: a fresh
-      // prompt means the human picked up after the quota reset, so the
-      // "this stoppage was rate-limited" annotation no longer applies. The
-      // clear is unconditional (cheap, no-op when already NULL) and pure —
-      // a from-scratch re-fold sees the same write.
+      // Also clears `last_api_error_at` AND `last_api_error_kind` to NULL
+      // together on every revival: a fresh prompt means the human picked
+      // up after the quota reset / re-auth / retry, so the "this stoppage
+      // was api-error-caused" annotation no longer applies. The clear is
+      // unconditional (cheap, no-op when already NULL), pure (a from-
+      // scratch re-fold sees the same write), and paired (both columns
+      // move together — no code path may clear one without the other,
+      // see {@link import("./types").JobLinkEntry}'s paired-NULL
+      // invariant).
       db.run(
         `UPDATE jobs SET state = 'working',
-                         rate_limited_at = NULL,
+                         last_api_error_at = NULL,
+                         last_api_error_kind = NULL,
                          pid = COALESCE(?, pid),
                          start_time = CASE
                            WHEN ? IS NOT NULL AND ? != pid THEN NULL
@@ -2385,29 +2471,46 @@ function projectJobsRow(db: Database, event: Event): void {
       }
       break;
 
-    case "RateLimited": {
-      // Synthetic event minted by main from a transcript-worker
-      // `rate-limited` message — fired when Claude Code writes its
-      // `isApiErrorMessage: true, error: "rate_limit"` synthetic assistant
-      // turn to the transcript. The API request failed at the boundary
-      // (HTTP 429) and no real model turn occurred, so the session is
-      // effectively stopped even though no `Stop` hook ever fired.
+    case "RateLimited":
+    case "ApiError": {
+      // Dual-case fold (schema v24). Both labels route through the same
+      // handler so the historical event log re-folds byte-deterministically:
       //
-      // Flips `state` to 'stopped' AND stamps `rate_limited_at` to the
-      // event ts in a single UPDATE — both columns must move together, so
-      // the board pill pair (`[stopped] [limited]`) is byte-identical
-      // under a from-scratch re-fold. Same terminal guard as Stop: a stray
-      // RateLimited on an already-terminal row must NOT resurrect it (and
-      // also must not stamp the annotation onto a row whose lifecycle is
-      // already `ended` / `killed` for unrelated reasons — the rate-limit
-      // signal is by definition mid-life).
+      //   - `RateLimited` is the legacy synthetic event_type (forever — the
+      //     event log is immutable per CLAUDE.md "hook/main is sole writer"
+      //     + "append-only"). Forces `kind = "rate_limit"` so the projection
+      //     reads identically to a fresh-mint `ApiError(kind="rate_limit")`.
+      //   - `ApiError` is the schema-v24 mint — main writes it from the
+      //     transcript-worker `api-error` message (task .2) carrying the
+      //     openclaude `SDKAssistantMessageError.type`. The event's
+      //     `data.kind` routes through `validateApiErrorKind` (anything not
+      //     in the canonical allow-list — including the SDK's own
+      //     `"unknown"` — folds to `"unknown"`).
+      //
+      // Both arms write `last_api_error_at` + `last_api_error_kind`
+      // together in a single compound UPDATE — paired-NULL invariant
+      // (CLAUDE.md "schema defaults match zero-event projection"); no code
+      // path may stamp one without the other. The board pill pair is
+      // byte-identical under a from-scratch re-fold.
+      //
+      // Same terminal guard as Stop: a stray ApiError on an already-
+      // terminal row must NOT resurrect it (and must not stamp the
+      // annotation onto a row whose lifecycle is already `ended` / `killed`
+      // for unrelated reasons — the api-error signal is by definition
+      // mid-life). The terminal guard is preserved verbatim from the
+      // pre-v24 `RateLimited` arm.
+      const kind: ApiErrorKind =
+        event.hook_event === "RateLimited"
+          ? "rate_limit"
+          : extractApiErrorKind(event);
       const res = db.run(
         `UPDATE jobs SET state = 'stopped',
-                         rate_limited_at = ?,
+                         last_api_error_at = ?,
+                         last_api_error_kind = ?,
                          last_event_id = ?,
                          updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
-        [ts, event.id, ts, jobId],
+        [ts, kind, event.id, ts, jobId],
       );
       // Sync only when the UPDATE actually wrote — a guarded no-op on a
       // still-terminal row must NOT re-fan the embedded entry (it would

@@ -611,13 +611,14 @@ function rollupEpicHeader(
 
 /**
  * Predicate 3 (`planner-running`). Reads each link's `state` directly off
- * the embedded `JobLinkEntry` — schema v21 denormalized
- * `(title, state, rate_limited_at)` off the linked `jobs` row at the
- * reducer's write boundary so this predicate no longer needs to join
- * against the live `jobs` page. Terminal sessions and off-page live
- * sessions used to fall through the join and silently false-negative
- * here (link.state was effectively unknown); now the embedded `state`
- * IS the projection's last-known reading and `"working"` is dispositive.
+ * the embedded `JobLinkEntry` — schema v24 denormalized
+ * `(title, state, last_api_error_at, last_api_error_kind)` off the linked
+ * `jobs` row at the reducer's write boundary so this predicate no longer
+ * needs to join against the live `jobs` page. Terminal sessions and
+ * off-page live sessions used to fall through the join and silently
+ * false-negative here (link.state was effectively unknown); now the
+ * embedded `state` IS the projection's last-known reading and
+ * `"working"` is dispositive.
  */
 function anyJobLinkRunning(epic: Epic): boolean {
   for (const link of epic.job_links) {

@@ -25,40 +25,66 @@ export interface Link {
 }
 
 /**
+ * Canonical vocabulary of `isApiErrorMessage` envelope kinds folded by the
+ * reducer's `ApiError` arm (schema v24). Mirrors openclaude's
+ * `SDKAssistantMessageError` union minus `max_output_tokens` (recoverable
+ * via compact+retry — never stamped). The transcript matcher dispatches on
+ * `error.type ∈ {rate_limit, authentication_failed, billing_error,
+ * server_error, invalid_request}`; anything else folds to `"unknown"`. The
+ * historical `RateLimited` event arm folds to `kind="rate_limit"` for
+ * byte-identical re-fold determinism — see `src/reducer.ts` for the
+ * dual-case alias.
+ */
+export type ApiErrorKind =
+  | "rate_limit"
+  | "authentication_failed"
+  | "billing_error"
+  | "server_error"
+  | "invalid_request"
+  | "unknown";
+
+/**
  * One entry in {@link Epic.job_links} — the symmetric per-epic view of
  * {@link Link}. `kind` carries the same vocabulary; `job_id` identifies the
  * session whose planctl footprint touched this epic inside one of its
  * `/plan:plan` windows.
  *
- * **Embedded display payload** (schema v21): `title` / `state` /
- * `rate_limited_at` are denormalized off the linked `jobs` row at the
- * reducer's write boundary so renderers (board) and predicates (readiness)
- * can read everything off the projection with no live-jobs join. Without
- * this denormalization, terminal sessions and off-page live sessions
- * fell through to a degraded `[{job_id}] [{kind}]` line on the board and
- * the planner-running predicate quietly skipped link entries whose
- * `job_id` wasn't in the current jobs page.
+ * **Embedded display payload** (schema v24): `title` / `state` /
+ * `last_api_error_at` / `last_api_error_kind` are denormalized off the
+ * linked `jobs` row at the reducer's write boundary so renderers (board)
+ * and predicates (readiness) can read everything off the projection with
+ * no live-jobs join. Without this denormalization, terminal sessions and
+ * off-page live sessions fell through to a degraded `[{job_id}] [{kind}]`
+ * line on the board and the planner-running predicate quietly skipped
+ * link entries whose `job_id` wasn't in the current jobs page.
  *
  * The classifier's `JobLink` shape (`src/plan-classifier.ts`) stays thin
  * (`{kind, job_id}`) — enrichment happens at the reducer's write boundary
  * (`enrichJobLink` in `src/reducer.ts`) so the classifier stays a pure
  * function of events. The reducer fans both ways: (a) every
  * `syncPlanctlLinks` write reads the live `jobs` row and stamps these
- * three fields; (b) every `syncJobLinksOnJobWrite` write — fired from
- * any jobs-write that touches `(title, state, rate_limited_at)` on a
- * session whose `epic_links !== '[]'` — re-stamps the same fields on
- * every epic the session linked into.
+ * four fields; (b) every `syncJobLinksOnJobWrite` write — fired from
+ * any jobs-write that touches `(title, state, last_api_error_at,
+ * last_api_error_kind)` on a session whose `epic_links !== '[]'` —
+ * re-stamps the same fields on every epic the session linked into.
  *
  * Defaults on a missing `jobs` row at enrichment time:
- * `{title: null, state: "stopped", rate_limited_at: null}` — re-fold-safe
- * "safe value" pattern per CLAUDE.md (never throw inside the fold tx).
+ * `{title: null, state: "stopped", last_api_error_at: null,
+ * last_api_error_kind: null}` — re-fold-safe "safe value" pattern per
+ * CLAUDE.md (never throw inside the fold tx).
+ *
+ * **Paired-NULL invariant.** `last_api_error_at` and `last_api_error_kind`
+ * move together: every reducer write that stamps one stamps the other,
+ * every clear (the `UserPromptSubmit` revival) clears both. No code path
+ * may write one without the other.
  */
 export interface JobLinkEntry {
   kind: "creator" | "refiner";
   job_id: string;
   title: string | null;
   state: string;
-  rate_limited_at: number | null;
+  last_api_error_at: number | null;
+  last_api_error_kind: string | null;
 }
 
 /**
@@ -269,20 +295,39 @@ export interface Job {
    */
   epic_links: Link[];
   /**
-   * Unix-seconds REAL stamped by the reducer's `RateLimited` arm — the
-   * synthetic event main mints from a transcript-worker `rate-limited`
-   * message when Claude Code writes its `isApiErrorMessage: true,
-   * error: "rate_limit"` synthetic assistant turn to the transcript. The
-   * lifecycle column (`state`) is concurrently flipped to `'stopped'`, so
-   * the underlying state-machine reads correctly; `rate_limited_at` is the
-   * separate annotation that explains *why* the session is stopped. Cleared
-   * on the next `UserPromptSubmit` revival (the human picked up after the
-   * quota reset) and only on that arm — Stop / SessionEnd / Killed leave
-   * it intact, so the "this stoppage was rate-limit-caused" attribution
-   * survives the natural lifecycle that follows the rate-limit event. NULL
-   * on every job that has never been rate-limited.
+   * Unix-seconds REAL stamped by the reducer's dual-case `RateLimited` /
+   * `ApiError` arm (schema v24) — the synthetic event main mints from a
+   * transcript-worker `api-error` message when Claude Code writes its
+   * `isApiErrorMessage: true` synthetic assistant turn to the transcript.
+   * The lifecycle column (`state`) is concurrently flipped to `'stopped'`,
+   * so the underlying state-machine reads correctly; `last_api_error_at`
+   * is the separate annotation that explains *why* the session is stopped.
+   * Cleared on the next `UserPromptSubmit` revival (the human picked up
+   * after the quota reset / re-authed / retried) and only on that arm —
+   * Stop / SessionEnd / Killed leave it intact, so the "this stoppage was
+   * API-error-caused" attribution survives the natural lifecycle that
+   * follows the api-error event. NULL on every job that has never hit a
+   * terminal api error.
+   *
+   * Pair: {@link last_api_error_kind} carries the openclaude
+   * `SDKAssistantMessageError` type that fired. Paired-NULL: both stamp
+   * together, both clear together — see the {@link ApiErrorKind} note.
    */
-  rate_limited_at: number | null;
+  last_api_error_at: number | null;
+  /**
+   * The {@link ApiErrorKind} value that fired the last api-error stamp:
+   * one of `"rate_limit"` / `"authentication_failed"` / `"billing_error"`
+   * / `"server_error"` / `"invalid_request"` / `"unknown"`. Paired with
+   * {@link last_api_error_at} — both stamp together in the fold, both
+   * clear together on `UserPromptSubmit` revival. NULL on every job that
+   * has never hit a terminal api error.
+   *
+   * Historical events stored as `events.event_type = 'RateLimited'` (the
+   * pre-v24 mint name) fold via the dual-case alias to
+   * `kind = "rate_limit"` so re-fold determinism holds across the v23 →
+   * v24 boundary.
+   */
+  last_api_error_kind: string | null;
   /**
    * Projection of `Event.config_dir` — the `CLAUDE_CONFIG_DIR` env value
    * the hook captured at SessionStart (schema v22). Latest-non-NULL-wins:
@@ -329,12 +374,21 @@ export interface EmbeddedJob {
   updated_at: number;
   last_event_id: number;
   /**
-   * Mirrors {@link Job.rate_limited_at} so a renderer reading the embedded
-   * array shows the same `[limited]` pill on the in-epic / in-task job
-   * lines that the top-level jobs collection shows on its bottom list.
-   * NULL on every entry that has never been rate-limited (the common case).
+   * Mirrors {@link Job.last_api_error_at} so a renderer reading the
+   * embedded array shows the same api-error annotation on the in-epic /
+   * in-task job lines that the top-level jobs collection shows on its
+   * bottom list. NULL on every entry that has never hit a terminal api
+   * error (the common case). Paired with {@link last_api_error_kind} —
+   * both fields move together; see {@link JobLinkEntry} for the
+   * paired-NULL invariant.
    */
-  rate_limited_at: number | null;
+  last_api_error_at: number | null;
+  /**
+   * Mirrors {@link Job.last_api_error_kind} — the {@link ApiErrorKind}
+   * that fired the last api-error stamp on this session. NULL whenever
+   * {@link last_api_error_at} is NULL.
+   */
+  last_api_error_kind: string | null;
 }
 
 /**

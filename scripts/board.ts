@@ -210,15 +210,19 @@ function planVerbLabel(v: unknown): string | null {
 }
 
 /**
- * Render the optional `[limited]` pill segment from a `jobs.rate_limited_at`
- * cell. The reducer stamps the column to a unix-seconds REAL on a synthetic
- * `RateLimited` fold and clears it to NULL on the next `UserPromptSubmit`
- * revival (see `src/reducer.ts`), so any non-null value means "this stoppage
- * was rate-limit-caused, the human hasn't picked up since the quota reset."
- * Returns the leading `' '` so the caller can append unconditionally — empty
- * string when the field is null, ` [limited]` otherwise. The underlying
- * lifecycle pill (`[stopped]`) is rendered separately from `jobs.state` and
- * always shows first; this annotation stacks after it.
+ * Render the optional `[limited]` pill segment from a
+ * `jobs.last_api_error_at` cell (schema v24 — the column was widened from
+ * the old single `rate_limited_at` slot into the two-field
+ * `(last_api_error_at, last_api_error_kind)` signal; the kind-aware pill
+ * lands in task .3 of fn-616). The reducer stamps the column on the
+ * dual-case `RateLimited` / `ApiError` fold and clears it to NULL on the
+ * next `UserPromptSubmit` revival (see `src/reducer.ts`), so any non-null
+ * value means "this stoppage was api-error-caused, the human hasn't
+ * picked up since". Returns the leading `' '` so the caller can append
+ * unconditionally — empty string when the field is null, ` [limited]`
+ * otherwise. The underlying lifecycle pill (`[stopped]`) is rendered
+ * separately from `jobs.state` and always shows first; this annotation
+ * stacks after it.
  */
 function rateLimitedPillSeg(v: unknown): string {
   return v == null ? "" : " [limited]";
@@ -313,10 +317,11 @@ function taskNumFromId(id: string): number | null {
 
 /**
  * Per-epic creator/refiner link lines, indented one level under the epic
- * header. Each {@link JobLinkEntry} carries five embedded fields
- * `{kind, job_id, title, state, rate_limited_at}` denormalized off the
- * linked `jobs` row at the reducer's write boundary (schema v21), so
- * the render reads every field straight off the projection — no
+ * header. Each {@link JobLinkEntry} carries six embedded fields
+ * `{kind, job_id, title, state, last_api_error_at, last_api_error_kind}`
+ * denormalized off the linked `jobs` row at the reducer's write boundary
+ * (schema v24), so the render reads every field straight off the
+ * projection — no
  * live-jobs join, no off-page fallback branch.
  *
  * The line shape is the same regardless of whether the linked session
@@ -344,7 +349,7 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
     const label = link.title ?? link.job_id;
     const state = link.state == null ? "" : String(link.state);
     out.push(
-      `   ${label} [${link.kind}] [${state}]${rateLimitedPillSeg(link.rate_limited_at)}`,
+      `   ${label} [${link.kind}] [${state}]${rateLimitedPillSeg(link.last_api_error_at)}`,
     );
   }
   return out;
@@ -427,7 +432,7 @@ async function main(): Promise<void> {
     for (const j of jobsArr) {
       const job = j as Record<string, unknown>;
       out.push(
-        `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${rateLimitedPillSeg(job.rate_limited_at)}`,
+        `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${rateLimitedPillSeg(job.last_api_error_at)}`,
       );
       out.push(
         ...subagentLinesFor(subagentIndex, String(job.job_id), "      "),
@@ -540,7 +545,7 @@ async function main(): Promise<void> {
     const cwdSeg = cwd === "" ? "" : `(${cwd}) `;
     const role = planVerbLabel(row.plan_verb);
     const roleSeg = role == null ? "" : ` [${role}]`;
-    return `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${rateLimitedPillSeg(row.rate_limited_at)}`;
+    return `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${rateLimitedPillSeg(row.last_api_error_at)}`;
   }
 
   /**

@@ -36,14 +36,16 @@ the native value" is the default.
   sub-array, AND the `syncPlanctlLinks` fan-out from a `planctl_op != NULL`
   event re-deriving the touched session's `jobs.epic_links` and every touched
   epic's `epics.job_links` — each `epics.job_links` entry carries the widened
-  `JobLinkEntry` shape `{kind, job_id, title, state, rate_limited_at}` with
-  `(title, state, rate_limited_at)` enriched off the linked `jobs` row via the
+  `JobLinkEntry` shape `{kind, job_id, title, state, last_api_error_at,
+  last_api_error_kind}` with `(title, state, last_api_error_at,
+  last_api_error_kind)` enriched off the linked `jobs` row via the
   shared `enrichJobLink` helper inside the open transaction, AND the
   symmetric `syncJobLinksOnJobWrite` fan-out from a jobs-write whose
   `jobs.epic_links !== '[]'` — re-stamping each linked epic's matching
   `job_links` entry with fresh enrichment so a `state` flip on
-  UserPromptSubmit / Stop / SessionEnd / Killed / RateLimited, a title
-  update on TranscriptTitle, or a `rate_limited_at` set/clear propagates
+  UserPromptSubmit / Stop / SessionEnd / Killed / RateLimited|ApiError, a
+  title update on TranscriptTitle, or a paired
+  `(last_api_error_at, last_api_error_kind)` set/clear propagates
   to every epic that references the session) and bumps
   `reducer_state.last_event_id` in one transaction. A crash mid-fold rolls
   back both; boot drain re-folds idempotently. This is the

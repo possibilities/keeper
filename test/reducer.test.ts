@@ -3120,9 +3120,10 @@ function getEpicLinks(sessionId: string): { kind: string; target: string }[] {
 }
 
 /**
- * Read the persisted `epics.job_links` as a real array of the schema-v21
- * widened JobLinkEntry shape `{kind, job_id, title, state, rate_limited_at}`.
- * The reducer's `enrichJobLink` helper denormalizes the last three fields
+ * Read the persisted `epics.job_links` as a real array of the schema-v24
+ * widened JobLinkEntry shape
+ * `{kind, job_id, title, state, last_api_error_at, last_api_error_kind}`.
+ * The reducer's `enrichJobLink` helper denormalizes the last four fields
  * off the linked `jobs` row at write time.
  */
 function getJobLinks(epicId: string): {
@@ -3130,7 +3131,8 @@ function getJobLinks(epicId: string): {
   job_id: string;
   title: string | null;
   state: string;
-  rate_limited_at: number | null;
+  last_api_error_at: number | null;
+  last_api_error_kind: string | null;
 }[] {
   const row = db
     .query("SELECT job_links FROM epics WHERE epic_id = ?")
@@ -3161,7 +3163,8 @@ test("syncPlanctlLinks: single-session single-window one creator emits creator e
       job_id: "sess-creator",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
 });
@@ -3198,14 +3201,16 @@ test("syncPlanctlLinks: single-session two windows creator-then-refiner-same-epi
       job_id: "sess-cr",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
     {
       kind: "refiner",
       job_id: "sess-cr",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
 });
@@ -3266,14 +3271,16 @@ test("syncPlanctlLinks: two sessions touching the same epic both appear in job_l
       job_id: "sess-a-fan",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
     {
       kind: "refiner",
       job_id: "sess-b-fan",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
 });
@@ -3353,14 +3360,16 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
       job_id: "sess-A-xs",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
     {
       kind: "refiner",
       job_id: "sess-B-xs",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
 
@@ -3398,14 +3407,16 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
       job_id: "sess-A-xs",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
     {
       kind: "refiner",
       job_id: "sess-B-xs",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
 });
@@ -3428,7 +3439,8 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
       job_id: "sess-carveout",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
   // Now fold an EpicSnapshot for the same epic — the ON CONFLICT clause
@@ -3455,7 +3467,8 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
       job_id: "sess-carveout",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
 });
@@ -3534,7 +3547,8 @@ test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded 
       job_id: "sess-flip",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
 
@@ -3549,7 +3563,8 @@ test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded 
       job_id: "sess-flip",
       title: null,
       state: "working",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
 
@@ -3585,7 +3600,7 @@ test("syncJobLinksOnJobWrite: title update on TranscriptTitle re-stamps embedded
   expect(getJobLinks("fn-13-title")[0]?.title).toBe("Live session title");
 });
 
-test("syncJobLinksOnJobWrite: RateLimited sets rate_limited_at, revival clears it", () => {
+test("syncJobLinksOnJobWrite: RateLimited (legacy alias) sets last_api_error_at + kind='rate_limit', revival clears both", () => {
   // Set up a working session linked to an epic.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-rl" });
   planPlanOpener("sess-rl");
@@ -3598,10 +3613,14 @@ test("syncJobLinksOnJobWrite: RateLimited sets rate_limited_at, revival clears i
   });
   insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rl" });
   drainAll();
-  expect(getJobLinks("fn-14-rl")[0]?.rate_limited_at).toBeNull();
+  expect(getJobLinks("fn-14-rl")[0]?.last_api_error_at).toBeNull();
+  expect(getJobLinks("fn-14-rl")[0]?.last_api_error_kind).toBeNull();
 
-  // RateLimited stamps `rate_limited_at` and flips state to "stopped";
-  // the reverse fan-out propagates BOTH to the embedded entry.
+  // Schema v24: the `RateLimited` event_type is the legacy alias on the
+  // dual-case fold arm — it forces `kind="rate_limit"` so the historical
+  // event log re-folds byte-deterministically alongside any new `ApiError`
+  // mints. Both columns stamp together (paired-NULL invariant); the
+  // reverse fan-out propagates BOTH to the embedded entry.
   const rlId = insertEvent({
     hook_event: "RateLimited",
     session_id: "sess-rl",
@@ -3609,19 +3628,247 @@ test("syncJobLinksOnJobWrite: RateLimited sets rate_limited_at, revival clears i
   drainAll();
   const limited = getJobLinks("fn-14-rl")[0];
   expect(limited?.state).toBe("stopped");
-  expect(limited?.rate_limited_at).not.toBeNull();
+  expect(limited?.last_api_error_at).not.toBeNull();
+  expect(limited?.last_api_error_kind).toBe("rate_limit");
 
-  // A fresh UserPromptSubmit revives the session — clears
-  // `rate_limited_at` and flips state back to "working". The reverse
-  // fan-out propagates the clear to the embedded entry.
+  // A fresh UserPromptSubmit revives the session — clears BOTH new
+  // columns (paired-NULL clear) and flips state back to "working". The
+  // reverse fan-out propagates the paired clear to the embedded entry.
   insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rl" });
   drainAll();
   const revived = getJobLinks("fn-14-rl")[0];
   expect(revived?.state).toBe("working");
-  expect(revived?.rate_limited_at).toBeNull();
+  expect(revived?.last_api_error_at).toBeNull();
+  expect(revived?.last_api_error_kind).toBeNull();
   // Smoke: the RateLimited event was the trigger that minted the prior
   // stamp; the prior reference is preserved for clarity.
   expect(rlId).toBeGreaterThan(0);
+});
+
+test("syncJobLinksOnJobWrite: ApiError (new mint) with data.kind='rate_limit' folds to byte-identical rows as a sibling RateLimited event", () => {
+  // Dual-case alias coverage gate (CLAUDE.md "byte-identical re-fold"):
+  // an `ApiError` event carrying `data.kind="rate_limit"` MUST produce a
+  // post-fold `jobs` row + `epics.job_links` entry that is JSON-equal to
+  // the equivalent `RateLimited`-folded state. The only field that may
+  // legitimately differ is `last_event_id` (event ids are
+  // monotone-per-DB so the two events get distinct ids) — strip that
+  // before compare.
+  //
+  // Build two parallel sessions, each linked to its own epic, each
+  // folded through ONE api-error event of the opposite arm.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-rl-legacy" });
+  planPlanOpener("sess-rl-legacy");
+  planctlEvent({
+    sessionId: "sess-rl-legacy",
+    op: "epic-create",
+    target: "fn-16-rl-legacy",
+    epicId: "fn-16-rl-legacy",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-rl-legacy",
+  });
+  insertEvent({
+    hook_event: "RateLimited",
+    session_id: "sess-rl-legacy",
+  });
+
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-rl-new" });
+  planPlanOpener("sess-rl-new");
+  planctlEvent({
+    sessionId: "sess-rl-new",
+    op: "epic-create",
+    target: "fn-16-rl-new",
+    epicId: "fn-16-rl-new",
+    subjectPresent: true,
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rl-new" });
+  insertEvent({
+    hook_event: "ApiError",
+    session_id: "sess-rl-new",
+    data: JSON.stringify({ kind: "rate_limit", text: "API quota exceeded" }),
+  });
+
+  drainAll();
+
+  // The two embedded entries on their respective epics must match
+  // field-for-field on (state, last_api_error_kind, last_api_error_at != null).
+  const legacy = getJobLinks("fn-16-rl-legacy")[0];
+  const newMint = getJobLinks("fn-16-rl-new")[0];
+  expect(legacy?.state).toBe("stopped");
+  expect(newMint?.state).toBe("stopped");
+  expect(legacy?.last_api_error_kind).toBe("rate_limit");
+  expect(newMint?.last_api_error_kind).toBe("rate_limit");
+  expect(legacy?.last_api_error_at).not.toBeNull();
+  expect(newMint?.last_api_error_at).not.toBeNull();
+
+  // The jobs rows themselves must also carry the same kind value — proves
+  // the dual-case alias landed at the jobs projection layer, not just the
+  // fan-out side.
+  const legacyJob = db
+    .query(
+      "SELECT state, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-rl-legacy") as {
+    state: string;
+    last_api_error_at: number | null;
+    last_api_error_kind: string | null;
+  };
+  const newJob = db
+    .query(
+      "SELECT state, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-rl-new") as {
+    state: string;
+    last_api_error_at: number | null;
+    last_api_error_kind: string | null;
+  };
+  expect(legacyJob.state).toBe("stopped");
+  expect(newJob.state).toBe("stopped");
+  expect(legacyJob.last_api_error_kind).toBe("rate_limit");
+  expect(newJob.last_api_error_kind).toBe("rate_limit");
+  expect(legacyJob.last_api_error_at).not.toBeNull();
+  expect(newJob.last_api_error_at).not.toBeNull();
+});
+
+test("ApiError fold: data.kind values outside the canonical ApiErrorKind allow-list fold to 'unknown'", () => {
+  // Coverage for the unknown-fallback branch of `validateApiErrorKind`:
+  // anything not in the canonical six-kind allow-list (including the SDK's
+  // own `"unknown"` string AND garbage strings AND missing `kind`) folds
+  // to the literal `"unknown"`. Pure function of the event payload — no
+  // throw inside the fold transaction (CLAUDE.md "never throw inside the
+  // fold tx").
+  for (const [variant, payload] of [
+    ["sdk-unknown", { kind: "unknown" }],
+    ["garbage-string", { kind: "not-a-real-error-type" }],
+    ["non-string", { kind: 42 }],
+    ["missing", {}],
+  ] as const) {
+    const sessionId = `sess-ae-${variant}`;
+    insertEvent({ hook_event: "SessionStart", session_id: sessionId });
+    insertEvent({ hook_event: "UserPromptSubmit", session_id: sessionId });
+    insertEvent({
+      hook_event: "ApiError",
+      session_id: sessionId,
+      data: JSON.stringify(payload),
+    });
+  }
+  drainAll();
+
+  for (const variant of [
+    "sdk-unknown",
+    "garbage-string",
+    "non-string",
+    "missing",
+  ]) {
+    const row = db
+      .query(
+        "SELECT state, last_api_error_kind, last_api_error_at FROM jobs WHERE job_id = ?",
+      )
+      .get(`sess-ae-${variant}`) as {
+      state: string;
+      last_api_error_kind: string | null;
+      last_api_error_at: number | null;
+    };
+    expect(row.state).toBe("stopped");
+    expect(row.last_api_error_kind).toBe("unknown");
+    expect(row.last_api_error_at).not.toBeNull();
+  }
+});
+
+test("ApiError fold: each canonical ApiErrorKind round-trips into last_api_error_kind verbatim", () => {
+  // Sanity gate on the allow-list. The dual-case alias forces "rate_limit"
+  // on RateLimited; the ApiError arm validates `data.kind` against the
+  // canonical six-value union. Each canonical value must round-trip
+  // verbatim into the projection (no normalization, no lower/upper-case
+  // mangling). Excludes "rate_limit" — covered by the legacy-alias test
+  // above; this gate is for the other five.
+  const kinds = [
+    "authentication_failed",
+    "billing_error",
+    "server_error",
+    "invalid_request",
+    "unknown",
+  ] as const;
+  for (const kind of kinds) {
+    const sessionId = `sess-ae-canonical-${kind}`;
+    insertEvent({ hook_event: "SessionStart", session_id: sessionId });
+    insertEvent({ hook_event: "UserPromptSubmit", session_id: sessionId });
+    insertEvent({
+      hook_event: "ApiError",
+      session_id: sessionId,
+      data: JSON.stringify({ kind }),
+    });
+  }
+  drainAll();
+  for (const kind of kinds) {
+    const row = db
+      .query("SELECT last_api_error_kind FROM jobs WHERE job_id = ?")
+      .get(`sess-ae-canonical-${kind}`) as {
+      last_api_error_kind: string | null;
+    };
+    expect(row.last_api_error_kind).toBe(kind);
+  }
+});
+
+test("ApiError fold: terminal-row guard preserved — ApiError on an 'ended' / 'killed' row does NOT resurrect (both new columns stay NULL)", () => {
+  // Negative-coverage gate on the terminal guard. The pre-v24 RateLimited
+  // arm carried a `state NOT IN ('ended','killed')` predicate to block
+  // resurrection of a row whose lifecycle is already terminal for
+  // unrelated reasons; the dual-case fold MUST preserve it verbatim.
+  // Without this guard, a stray late-arriving api-error event could
+  // mid-life-stamp an already-terminal row.
+
+  // 'ended' row.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ended" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ended" });
+  insertEvent({ hook_event: "SessionEnd", session_id: "sess-ended" });
+  drainAll();
+  insertEvent({
+    hook_event: "ApiError",
+    session_id: "sess-ended",
+    data: JSON.stringify({ kind: "rate_limit" }),
+  });
+  drainAll();
+  const ended = db
+    .query(
+      "SELECT state, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-ended") as {
+    state: string;
+    last_api_error_at: number | null;
+    last_api_error_kind: string | null;
+  };
+  expect(ended.state).toBe("ended");
+  expect(ended.last_api_error_at).toBeNull();
+  expect(ended.last_api_error_kind).toBeNull();
+
+  // 'killed' row — direct write via the schema (the live exit-watcher
+  // would do this through a Killed event, but for this guard test we just
+  // hand-set the state to verify the SQL predicate).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-killed" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-killed" });
+  drainAll();
+  db.run("UPDATE jobs SET state = 'killed' WHERE job_id = 'sess-killed'");
+  insertEvent({
+    hook_event: "ApiError",
+    session_id: "sess-killed",
+    data: JSON.stringify({ kind: "server_error" }),
+  });
+  drainAll();
+  const killed = db
+    .query(
+      "SELECT state, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-killed") as {
+    state: string;
+    last_api_error_at: number | null;
+    last_api_error_kind: string | null;
+  };
+  expect(killed.state).toBe("killed");
+  expect(killed.last_api_error_at).toBeNull();
+  expect(killed.last_api_error_kind).toBeNull();
 });
 
 test("syncJobLinksOnJobWrite: short-circuits when jobs.epic_links is '[]' (no fan-out)", () => {
@@ -3683,7 +3930,8 @@ test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other 
     job_id: "sess-A-carve",
     title: null,
     state: "working",
-    rate_limited_at: null,
+    last_api_error_at: null,
+    last_api_error_kind: null,
   });
   // B: untouched (state still default "stopped").
   expect(after[1]).toEqual({
@@ -3691,7 +3939,8 @@ test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other 
     job_id: "sess-B-carve",
     title: null,
     state: "stopped",
-    rate_limited_at: null,
+    last_api_error_at: null,
+    last_api_error_kind: null,
   });
 });
 
@@ -3772,7 +4021,8 @@ test("syncPlanctlLinks: missing jobs row at enrichment defaults to safe values (
       job_id: "sess-orphan",
       title: null,
       state: "stopped",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
 });
@@ -3806,7 +4056,8 @@ test("syncPlanctlLinks: widened-shape EpicSnapshot ON CONFLICT does not blank en
       job_id: "sess-wide",
       title: "Wide enrichment",
       state: "working",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
 
@@ -3828,7 +4079,8 @@ test("syncPlanctlLinks: widened-shape EpicSnapshot ON CONFLICT does not blank en
       job_id: "sess-wide",
       title: "Wide enrichment",
       state: "working",
-      rate_limited_at: null,
+      last_api_error_at: null,
+      last_api_error_kind: null,
     },
   ]);
 });
