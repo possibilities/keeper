@@ -15,8 +15,7 @@
  *      most one ready row per project root.
  *
  * The two blocks are joined by `\n===\n` (mirrors board's `\n~~~\n`).
- * When both are empty the body is `===` alone — same `---` lead, just a
- * divider line.
+ * When both are empty the body is empty — no `===` divider, no chrome.
  *
  * For each epic, in order:
  *
@@ -279,7 +278,17 @@ async function main(): Promise<void> {
         ? ""
         : `${READY_HEADER}\n${READY_HEADER_NOTE}\n${readyBlocks.join("\n\n")}`;
 
-    return `${block1}\n===\n${block2}`.split("\n");
+    let body: string;
+    if (block1 === "" && block2 === "") {
+      body = "";
+    } else if (block1 === "") {
+      body = block2;
+    } else if (block2 === "") {
+      body = block1;
+    } else {
+      body = `${block1}\n===\n${block2}`;
+    }
+    return body === "" ? [] : body.split("\n");
   }
 
   // --- sidecar paths ---
