@@ -930,3 +930,58 @@ test("close row: any non-completed task → dep-on-task with FIRST non-completed
     blocked({ kind: "dep-on-task", upstream: "fn-1-foo.2" }),
   );
 });
+
+// ---------------------------------------------------------------------------
+// Close-row predicate 5/6 fan-out across task-level embedded jobs
+// ---------------------------------------------------------------------------
+
+test("close row: task-level worker still working → job-running (even with task completed)", () => {
+  // Task verdict goes to `completed` via predicate 1 (worker_phase done +
+  // approval approved), but its embedded work-verb job is still `working`
+  // because Stop/SessionEnd hasn't fired yet. The close row must block on
+  // `job-running`, not flip to `ready`.
+  const t = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
+  });
+  const epic = makeEpic({ tasks: [t] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t.task_id)).toEqual({ tag: "completed" });
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "job-running" }),
+  );
+});
+
+test("close row: task-level worker has running sub-agent → sub-agent-running", () => {
+  // Task completed, worker job stopped, but a sub-agent invocation under
+  // that worker session id is still `running`. Close row must block.
+  const t = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [t] });
+  const sub = makeSub({ job_id: "worker-1", status: "running" });
+  const snap = run([epic], new Map(), [sub]);
+  expect(snap.perTask.get(t.task_id)).toEqual({ tag: "completed" });
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "sub-agent-running" }),
+  );
+});
+
+test("close row: all task workers stopped, no sub-agents running → ready", () => {
+  // Same shape as the regression cases but with a `stopped` worker and no
+  // running sub-agents. Close row should flip to `ready` as before.
+  const t = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [t] });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual({ tag: "ready" });
+});

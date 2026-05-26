@@ -16,9 +16,13 @@
  *   3. planner-running             — any epic.job_links entry whose job is `working`
  *   4. own-approval                — task.approval==="rejected" → job-rejected
  *                                    task.approval==="pending" && status==="done" → job-pending
- *   5. own-progress-main           — any embedded jobs[] entry on this row state==="working"
- *   6. own-progress-sub            — any subagentInvocations row job_id===<worker.session_id>
+ *   5. own-progress-main           — task: any embedded jobs[] entry on this row state==="working"
+ *                                    close: any embedded jobs[] entry on the epic OR on ANY of its
+ *                                    tasks state==="working" (fan-out — see `evaluateCloseRow` for why)
+ *   6. own-progress-sub            — task: any subagentInvocations row job_id===<this row's worker.session_id>
  *                                    && status==="running"
+ *                                    close: same predicate but joined against worker session ids from
+ *                                    epic-level AND every task-level embedded jobs[]
  *   7. dep-on-task                 — any depends_on upstream NOT { tag:"completed" }
  *   8. dep-on-epic                 — any depends_on_epics upstream's close NOT completed
  *   9. dep-on-task-synthetic-close — for the synthetic close row: any non-completed task
@@ -323,16 +327,35 @@ function evaluateCloseRow(
     return { tag: "blocked", reason: { kind: "job-pending" } };
   }
 
-  // 5. own-progress-main — close-row uses epic-level embedded jobs (close
-  // verb).
+  // 5. own-progress-main — close-row blocks on a running worker session at
+  // EITHER scope: epic-level (close-verb) embedded jobs, OR any task-level
+  // (work-verb) embedded job on a task in this epic. The task-level scan
+  // matters because predicate 1 (`evaluateTask`) marks a task `completed`
+  // as soon as `worker_phase==="done" && approval==="approved"` — which
+  // can race ahead of the worker session's Stop/SessionEnd (planctl can
+  // record `worker_done_at` and the human can approve before the session
+  // exits). Without this fan-out, predicate 9 sees every task `completed`
+  // and the close row flips to `ready` while a worker is still alive.
   if (anyEmbeddedJobWorking(epic.jobs)) {
     return { tag: "blocked", reason: { kind: "job-running" } };
   }
+  for (const task of epic.tasks) {
+    if (anyEmbeddedJobWorking(task.jobs)) {
+      return { tag: "blocked", reason: { kind: "job-running" } };
+    }
+  }
 
-  // 6. own-progress-sub — sub-agent invocation under the close worker's
-  // session id.
+  // 6. own-progress-sub — sub-agent invocation under ANY worker session
+  // bound to this epic (close-verb at epic level, work-verb at task level).
+  // Same race as predicate 5: a task's worker can still be running a
+  // sub-agent after planctl/human have driven the task to completed.
   if (anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId)) {
     return { tag: "blocked", reason: { kind: "sub-agent-running" } };
+  }
+  for (const task of epic.tasks) {
+    if (anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId)) {
+      return { tag: "blocked", reason: { kind: "sub-agent-running" } };
+    }
   }
 
   // 7. dep-on-task — not applicable to the close row (it has no direct
