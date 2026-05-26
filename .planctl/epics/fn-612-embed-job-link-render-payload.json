@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-612-embed-job-link-render-payload",
   "bundles": [],
+  "closer_done_at": "2026-05-26T10:52:55.586271Z",
   "created_at": "2026-05-26T02:48:51.182870Z",
   "depends_on_epics": [
     "fn-611-live-tui-mode-for-scripts"
@@ -11,10 +12,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Embed job-link render payload",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-26T02:49:00.239993Z"
+  "updated_at": "2026-05-26T10:52:55.586271Z"
 }
