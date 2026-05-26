@@ -3,6 +3,7 @@
   "bundles": [
     "sketch/capture-config-dir-on-session-start"
   ],
+  "closer_done_at": "2026-05-26T15:53:16.232182Z",
   "created_at": "2026-05-26T15:22:11.244142Z",
   "depends_on_epics": [],
   "id": "fn-614-capture-claude-config-dir-on",
@@ -11,10 +12,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Capture CLAUDE_CONFIG_DIR on SessionStart",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-26T15:22:11.244142Z"
+  "updated_at": "2026-05-26T15:53:16.232182Z"
 }
