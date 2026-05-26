@@ -738,7 +738,7 @@ async function main(): Promise<void> {
     const linesForShell = colorEnabled
       ? bodyLines.map(colorizePillsInLine)
       : bodyLines;
-    liveShell.pushFrame(linesForShell, snap.jobs.size);
+    liveShell.pushFrame(linesForShell);
     writeSidecars(snap, frameText);
   }
 

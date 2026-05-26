@@ -371,7 +371,7 @@ async function main(): Promise<void> {
     lastEpicsSnapshot = snap.epics;
     frameCount += 1;
     const frameText = ["---", ...bodyLines].join("\n");
-    liveShell.pushFrame(bodyLines, snap.epics.length);
+    liveShell.pushFrame(bodyLines);
     writeSidecars(frameText);
   }
 

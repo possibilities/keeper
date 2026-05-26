@@ -170,13 +170,11 @@ export interface SafetyNetTarget {
 
 /**
  * Caller-facing handle. `pushFrame` ships one frame's worth of rendered rows
- * (one element per row). `resultCount` is the caller's semantic item count
- * (e.g. jobs for board, rows for git, epics for autopilot) — shown in the
- * live-mode banner as "(N)". `dispose()` is synchronous and idempotent — a
- * second call writes nothing and detaches no listeners.
+ * (one element per row). `dispose()` is synchronous and idempotent — a second
+ * call writes nothing and detaches no listeners.
  */
 export interface LiveShell {
-  pushFrame(lines: string[], resultCount?: number): void;
+  pushFrame(lines: string[]): void;
   dispose(): void;
 }
 
@@ -261,7 +259,7 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   if (!enabled) {
     let disabledDisposed = false;
     return {
-      pushFrame(lines: string[], _resultCount?: number): void {
+      pushFrame(lines: string[]): void {
         if (disabledDisposed) {
           return;
         }
@@ -287,7 +285,6 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   // before the first paint so the first frame full-paints.
   let prevLines: string[] | null = null;
   let viewIdx: ViewIdx = "live";
-  let currentResultCount = 0;
   let disposed = false;
   const wasRaw = stdin.isRaw ?? false;
 
@@ -314,7 +311,9 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
    */
   function bannerFor(view: ViewIdx, total: number): string {
     if (view === "live" || total === 0) {
-      return `\x1b[2mShowing live results (${currentResultCount})\x1b[0m`;
+      return total === 0
+        ? "\x1b[2mShowing live results\x1b[0m"
+        : `\x1b[2mShowing live results (frame ${total})\x1b[0m`;
     }
     // `view` is 0-indexed within the held frames; humans count from 1.
     return `\x1b[2mframe ${view + 1} of ${total} — press G to return to live\x1b[0m`;
@@ -616,12 +615,9 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   // Public surface
   // ---------------------------------------------------------------------
 
-  function pushFrame(lines: string[], resultCount?: number): void {
+  function pushFrame(lines: string[]): void {
     if (disposed) {
       return;
-    }
-    if (resultCount !== undefined) {
-      currentResultCount = resultCount;
     }
     // Store a shallow copy so caller mutation can't corrupt history.
     const copy = lines.slice();
