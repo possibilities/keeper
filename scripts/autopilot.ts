@@ -459,7 +459,10 @@ async function main(): Promise<void> {
    * focused window onto space 5; yabai not being installed is fine.
    */
   function launchInGhostty(workerShellCommand: string, rowId: string): void {
-    const zshInvocation = `/bin/zsh -l -c ${JSON.stringify(workerShellCommand)}`;
+    // `-l -i` = login + interactive — login alone sources `.zprofile` only,
+    // so `claude` (and most user PATH additions) live in `.zshrc` which is
+    // interactive-only. Without `-i` the spawned shell can't find `claude`.
+    const zshInvocation = `/bin/zsh -l -i -c ${JSON.stringify(workerShellCommand)}`;
     const appleScript = [
       'tell application "Ghostty"',
       "set cfg to new surface configuration",
