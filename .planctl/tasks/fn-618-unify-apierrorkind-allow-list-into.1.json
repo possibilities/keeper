@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-26T23:06:57.765487Z",
+  "depends_on": [],
+  "epic": "fn-618-unify-apierrorkind-allow-list-into",
+  "id": "fn-618-unify-apierrorkind-allow-list-into.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "hoist shared ApiErrorKind allow-list to types.ts",
+  "updated_at": "2026-05-26T23:06:57.765487Z"
+}

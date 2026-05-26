@@ -1,0 +1,20 @@
+{
+  "branch_name": "fn-618-unify-apierrorkind-allow-list-into",
+  "bundles": [],
+  "created_at": "2026-05-26T23:06:57.765487Z",
+  "depends_on_epics": [
+    "fn-616-generalize-api-error-pill"
+  ],
+  "id": "fn-618-unify-apierrorkind-allow-list-into",
+  "last_validated_at": "2026-05-26T23:06:57.783265Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "unify ApiErrorKind allow-list into shared constant",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-26T23:06:57.765487Z"
+}
