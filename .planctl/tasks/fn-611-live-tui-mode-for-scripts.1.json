@@ -11,8 +11,8 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Migrate git.ts to shared subscribe helper",
-  "updated_at": "2026-05-26T02:40:33.440224Z",
+  "updated_at": "2026-05-26T02:51:14.576370Z",
   "work_review_status": "unknown",
   "work_reviewed_at": null,
-  "worker_done_at": null
+  "worker_done_at": "2026-05-26T02:51:14.576370Z"
 }

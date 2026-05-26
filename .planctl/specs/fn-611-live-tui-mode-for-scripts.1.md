@@ -94,5 +94,5 @@ the live-shell in task 2 has one integration shape to target.
 - [ ] `bun run lint && bun run typecheck && bun test` pass.
 
 ## Done summary
-
+Extracted subscribeCollection from subscribeReadiness behind a shared subscribeMulti driver; rewired scripts/git.ts to use it (deleting its hand-rolled Bun.connect/LineBuffer/reconnect loop and uniformizing SIGINT to handle.dispose()). Added test/git.test.ts covering query-frame shape, first-paint gate, coalesce, idempotent dispose, and renderRowBlocks empty-row drop.
 ## Evidence
