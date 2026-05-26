@@ -211,7 +211,7 @@ async function main(): Promise<void> {
     const frameText = ["---", ...bodyLines].join("\n");
     if (frameText === lastFrame) return;
     frameCount += 1;
-    liveShell.pushFrame(bodyLines);
+    liveShell.pushFrame(bodyLines, rows.length);
     writeSidecars(frameText);
     lastFrame = frameText;
   }
