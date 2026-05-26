@@ -50,5 +50,5 @@ widened-job-links work:
       change in reducer.ts; tests-only additions otherwise).
 
 ## Done summary
-
+Tightened syncJobLinksOnJobWrite oldEntry==null comment (unreachable in healthy projection; continue is defense-in-depth) and pinned two invariants with regression tests: Killed state flip propagates through syncJobLinksOnJobWrite to epics.job_links, and the v20→v21 migration's never-throw guard folds a malformed epics.job_links blob to '[]' without throwing.
 ## Evidence
