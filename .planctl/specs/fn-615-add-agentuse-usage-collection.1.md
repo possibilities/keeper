@@ -67,5 +67,5 @@ Clone the existing producer-worker archetype. Six sub-moves, all landing in one 
 - [ ] All tests pass: `bun test test/usage-worker.test.ts test/reducer.test.ts test/collections.test.ts test/db.test.ts`
 
 ## Done summary
-
+Shipped the agentuse usage producer-worker: schema v23 usage table + reducer arms (UsageSnapshot/UsageDeleted in same BEGIN IMMEDIATE as cursor advance + re-fold determinism), USAGE_DESCRIPTOR registered in REGISTRY, UsageScanner pure-core mirroring plan-worker + boot sweep + change-gate, daemon spawn/shutdown wiring for the seventh worker, and hermetic agentuse_root config key so integration tests can point the worker at a tmp dir. Freshness-exclusion discipline (fetched_at/next_fetch_at/last_successful_fetch_at/last_skipped_fetch_at) excluded from BOTH schema and change-gate hash with tripwire tests pairing producer + projection sides. 286/286 acceptance tests pass; full suite green (the 6 pre-existing live-shell failures are unaffected).
 ## Evidence
