@@ -381,20 +381,6 @@ async function main(): Promise<void> {
       ? await scrapeSpawnInfo()
       : { name: null, startTime: null };
 
-  // TODO-REVERT(fn-614.1): throwaway probe — verify CLAUDE_CONFIG_DIR inherits
-  // into the hook subprocess. Revert in the follow-up commit before task 2.
-  if (hookEvent === "SessionStart") {
-    try {
-      const probeValue = process.env.CLAUDE_CONFIG_DIR ?? "(unset)";
-      await Bun.write(
-        `/tmp/keeper-env-probe.${process.pid}.txt`,
-        `${probeValue}\n`,
-      );
-    } catch {
-      // probe is best-effort; never break the exit-0 contract
-    }
-  }
-
   const { db, stmts } = openDb(resolveDbPath());
   try {
     // BEGIN IMMEDIATE avoids the lock-upgrade SQLITE_BUSY path: a plain BEGIN
