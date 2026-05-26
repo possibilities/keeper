@@ -181,6 +181,11 @@ interface RawUsage {
   target?: unknown;
   multiplier?: unknown;
   usage?: unknown;
+  // Freshness fields — present in real agentuse envelopes, read and discarded.
+  fetched_at?: unknown;
+  next_fetch_at?: unknown;
+  last_successful_fetch_at?: unknown;
+  last_skipped_fetch_at?: unknown;
 }
 
 interface RawUsageWindow {
