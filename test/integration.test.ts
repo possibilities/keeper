@@ -62,16 +62,26 @@ beforeEach(() => {
   // touch the real `~/code`/`~/src` trees.
   planRoot = join(tmpDir, "plan-root");
   mkdirSync(planRoot, { recursive: true });
+  // Hermetic agentuse root for the usage-worker e2e — a tmp dir the daemon
+  // watches for `<id>.json` envelopes instead of the real
+  // `~/.local/state/agentuse`. The daemon resolves it via the same tmp
+  // `KEEPER_CONFIG` YAML so the usage worker never picks up the user's real
+  // per-profile envelopes (which would mint synthetic UsageSnapshot events
+  // and break the strict events-row-count assertions below).
+  const usageRoot = join(tmpDir, "agentuse");
+  mkdirSync(usageRoot, { recursive: true });
   configPath = join(tmpDir, "config.yaml");
   // Write a hermetic config pointing to planRoot (which has no .planctl/ dirs
-  // yet) AND to the hermetic transcript watch root via `claude_projects_root`.
-  // Passed to EVERY daemon spawn so the plan worker never boots-scans the real
-  // ~/code tree (which would flood the daemon with synthetic events and cause
-  // FSEvents congestion) and the transcript worker watches our tmp dir instead
-  // of the real ~/.claude/projects.
+  // yet) AND to the hermetic transcript watch root via `claude_projects_root`
+  // AND to the hermetic agentuse root via `agentuse_root`. Passed to EVERY
+  // daemon spawn so the plan worker never boots-scans the real ~/code tree
+  // (which would flood the daemon with synthetic events and cause FSEvents
+  // congestion), the transcript worker watches our tmp dir instead of the
+  // real ~/.claude/projects, and the usage worker watches an empty tmp dir
+  // instead of the real per-profile state dir.
   writeFileSync(
     configPath,
-    `roots:\n  - ${JSON.stringify(planRoot)}\nclaude_projects_root: ${JSON.stringify(watchRoot)}\n`,
+    `roots:\n  - ${JSON.stringify(planRoot)}\nclaude_projects_root: ${JSON.stringify(watchRoot)}\nagentuse_root: ${JSON.stringify(usageRoot)}\n`,
   );
   daemon = null;
 });

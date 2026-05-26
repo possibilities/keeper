@@ -257,6 +257,231 @@ test("GitRootDropped on an unknown project_dir is a safe no-op", () => {
   expect(getCursor()).toBe(id);
 });
 
+// ---------------------------------------------------------------------------
+// UsageSnapshot / UsageDeleted reducer arms — fn-615-add-agentuse-usage-collection
+// ---------------------------------------------------------------------------
+
+test("UsageSnapshot folds into the usage projection and advances the cursor", () => {
+  const id = insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 12.0,
+      session_resets_at: "2026-05-26T18:30:00-04:00",
+      week_percent: 8.0,
+      week_resets_at: "2026-06-01T20:00:00-04:00",
+    }),
+  });
+
+  expect(drainAll()).toBe(1);
+  const row = db
+    .query("SELECT * FROM usage WHERE id = ?")
+    .get("claude-default") as {
+    id: string;
+    target: string;
+    multiplier: number;
+    session_percent: number;
+    session_resets_at: string;
+    week_percent: number;
+    week_resets_at: string;
+    last_event_id: number;
+    updated_at: number;
+  } | null;
+
+  expect(row).not.toBeNull();
+  expect(row?.target).toBe("claude");
+  expect(row?.multiplier).toBe(5);
+  expect(row?.session_percent).toBe(12.0);
+  expect(row?.session_resets_at).toBe("2026-05-26T18:30:00-04:00");
+  expect(row?.week_percent).toBe(8.0);
+  expect(row?.week_resets_at).toBe("2026-06-01T20:00:00-04:00");
+  expect(row?.last_event_id).toBe(id);
+  expect(getCursor()).toBe(id);
+});
+
+test("UsageSnapshot upserts on conflict and bumps last_event_id every write", () => {
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 12.0,
+      session_resets_at: "T1",
+      week_percent: 8.0,
+      week_resets_at: "T2",
+    }),
+  });
+  const secondId = insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 30.0,
+      session_resets_at: "T1",
+      week_percent: 8.0,
+      week_resets_at: "T2",
+    }),
+  });
+  expect(drainAll()).toBe(2);
+  const row = db
+    .query("SELECT session_percent, last_event_id FROM usage WHERE id = ?")
+    .get("claude-default") as {
+    session_percent: number;
+    last_event_id: number;
+  };
+  expect(row.session_percent).toBe(30.0);
+  expect(row.last_event_id).toBe(secondId);
+});
+
+test("UsageSnapshot folds missing session/week to NULL (safe-value invariant)", () => {
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "x",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 1,
+      // session/week fields omitted → fold to NULL.
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT session_percent, session_resets_at, week_percent, week_resets_at FROM usage WHERE id = ?",
+    )
+    .get("x") as {
+    session_percent: number | null;
+    session_resets_at: string | null;
+    week_percent: number | null;
+    week_resets_at: string | null;
+  };
+  expect(row.session_percent).toBeNull();
+  expect(row.session_resets_at).toBeNull();
+  expect(row.week_percent).toBeNull();
+  expect(row.week_resets_at).toBeNull();
+});
+
+test("UsageSnapshot with empty pk (session_id) is a safe no-op", () => {
+  const id = insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "",
+    data: JSON.stringify({ target: "x" }),
+  });
+  expect(drainAll()).toBe(1);
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM usage").get() as { n: number }
+  ).n;
+  expect(count).toBe(0);
+  expect(getCursor()).toBe(id);
+});
+
+test("UsageSnapshot with malformed data blob is a safe no-op (cursor still advances)", () => {
+  const id = insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-default",
+    data: "{ not json",
+  });
+  expect(drainAll()).toBe(1);
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM usage").get() as { n: number }
+  ).n;
+  expect(count).toBe(0);
+  expect(getCursor()).toBe(id);
+});
+
+test("UsageDeleted DELETEs the usage row and advances the cursor", () => {
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 12.0,
+      session_resets_at: "T",
+      week_percent: 8.0,
+      week_resets_at: "T",
+    }),
+  });
+  const dropId = insertEvent({
+    hook_event: "UsageDeleted",
+    session_id: "claude-default",
+    data: "",
+  });
+  expect(drainAll()).toBe(2);
+  const row = db
+    .query("SELECT * FROM usage WHERE id = ?")
+    .get("claude-default");
+  expect(row).toBeNull();
+  expect(getCursor()).toBe(dropId);
+});
+
+test("UsageDeleted on an unknown id is a safe no-op (cursor still advances)", () => {
+  const id = insertEvent({
+    hook_event: "UsageDeleted",
+    session_id: "ghost",
+    data: "",
+  });
+  expect(drainAll()).toBe(1);
+  expect(getCursor()).toBe(id);
+});
+
+test("from-scratch re-fold reproduces the usage projection byte-identically", () => {
+  // Seed a sequence: snapshot, snapshot (upsert), delete, snapshot of another id.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 12.0,
+      session_resets_at: "T1",
+      week_percent: 8.0,
+      week_resets_at: "T2",
+    }),
+  });
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 30.0,
+      session_resets_at: "T1",
+      week_percent: 8.0,
+      week_resets_at: "T2",
+    }),
+  });
+  insertEvent({
+    hook_event: "UsageDeleted",
+    session_id: "claude-default",
+    data: "",
+  });
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "codex",
+    data: JSON.stringify({
+      target: "codex",
+      multiplier: 1,
+      session_percent: 1.0,
+      session_resets_at: "T3",
+      week_percent: 71.0,
+      week_resets_at: "T4",
+    }),
+  });
+  drainAll();
+  const before = db.query("SELECT * FROM usage ORDER BY id").all();
+  // Rewind + wipe + re-drain. Re-fold determinism: the post-rewind rows
+  // must equal byte-for-byte the pre-rewind rows.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM usage");
+  drainAll();
+  const after = db.query("SELECT * FROM usage ORDER BY id").all();
+  expect(after).toEqual(before);
+});
+
 function drainAll(): number {
   let total = 0;
   let n: number;

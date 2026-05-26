@@ -71,6 +71,7 @@ import {
   resolveClaudeProjectsRoot,
   resolveDbPath,
   resolvePlanRoots,
+  resolveUsageRoot,
   runPlanctlApprovalMigration,
 } from "./db";
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
@@ -84,6 +85,7 @@ import type {
   TranscriptTitleMessage,
   TranscriptWorkerData,
 } from "./transcript-worker";
+import type { UsageMessage, UsageWorkerData } from "./usage-worker";
 import type {
   ShutdownMessage,
   WakeMessage,
@@ -663,6 +665,99 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
+  // Spawn the usage worker in the SAME post-migration window. It watches the
+  // agentuse daemon's flat leaf state dir (`~/.local/state/agentuse/`) and
+  // posts `{kind: "usage-snapshot" | "usage-deleted", ...}` messages — the
+  // fifth file-watcher producer-worker instance. Main turns each into a
+  // synthetic `UsageSnapshot`/`UsageDeleted` events row on its writable
+  // connection. The watch root is resolved on main via `resolveUsageRoot()`
+  // and tolerates absence (agentuse may not have run yet).
+  const usageWorker = new Worker(
+    new URL("./usage-worker.ts", import.meta.url).href,
+    {
+      workerData: {
+        dbPath,
+        root: resolveUsageRoot(),
+      } satisfies UsageWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  // Main stays the SOLE writer: a `usage-snapshot`/`usage-deleted` message
+  // becomes a synthetic `UsageSnapshot`/`UsageDeleted` events row inserted on
+  // the existing WRITABLE connection, then a wake pump folds it. The agentuse
+  // profile id rides in `session_id` (the generic entity-key overload the
+  // reducer reads); the flattened snapshot rides in `data` for snapshots, an
+  // empty string for tombstones. Everything other than session_id / hook_event /
+  // event_type / data is NULL (synthetic — never carries a process identity).
+  usageWorker.onmessage = (
+    ev: MessageEvent<UsageMessage | undefined>,
+  ): void => {
+    const msg = ev.data;
+    if (!msg) return;
+    let hookEvent: string;
+    let data: string;
+    if (msg.kind === "usage-snapshot") {
+      hookEvent = "UsageSnapshot";
+      // Pre-flattened payload — the reducer never re-reads the on-disk file.
+      // Object-literal slot order is documentation only here (reducer is
+      // shape-tolerant); the load-bearing slot order lives in the worker's
+      // change-gate via `buildUsageMessage`.
+      data = JSON.stringify({
+        target: msg.target,
+        multiplier: msg.multiplier,
+        session_percent: msg.session_percent,
+        session_resets_at: msg.session_resets_at,
+        week_percent: msg.week_percent,
+        week_resets_at: msg.week_resets_at,
+      });
+    } else if (msg.kind === "usage-deleted") {
+      // Tombstone: the reducer DELETEs the `usage` row whose primary key is
+      // `id`. No payload beyond the pk in `session_id` — matches the
+      // GitRootDropped / EpicDeleted shape so re-fold reproduces the deletion.
+      hookEvent = "UsageDeleted";
+      data = "";
+    } else {
+      return;
+    }
+    stmts.insertEvent.run({
+      $ts: Date.now() / 1000,
+      $session_id: msg.id, // the entity pk: agentuse profile id
+      $pid: null,
+      $hook_event: hookEvent,
+      $event_type: "usage_snapshot",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: data,
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $planctl_op: null,
+      $planctl_target: null,
+      $planctl_epic_id: null,
+      $planctl_task_id: null,
+      $planctl_subject_present: null,
+      $config_dir: null,
+    });
+    wakePending = true;
+    pumpWakes();
+  };
+
+  usageWorker.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] usage worker error:", err.message ?? err);
+    fatalExit();
+  };
+
+  usageWorker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
+
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -701,14 +796,15 @@ function runDaemon(): void {
     planWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     exitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     gitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
+    usageWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
 
-    // Bun surfaces worker exit via the "close" event. Await ALL SIX workers'
-    // close (the server worker releases its socket + lock, the transcript +
-    // plan workers unsubscribe their watchers, and the exit-watcher releases
-    // its kqueue/pidfd fd in their own shutdown handlers — that teardown must
-    // land, or the socket / native watches / kernel fd leak into the next
-    // boot), raced against a single shared deadline so a wedged worker can't
-    // block our clean shutdown forever.
+    // Bun surfaces worker exit via the "close" event. Await ALL SEVEN
+    // workers' close (the server worker releases its socket + lock, the
+    // transcript + plan + usage workers unsubscribe their watchers, and the
+    // exit-watcher releases its kqueue/pidfd fd in their own shutdown
+    // handlers — that teardown must land, or the socket / native watches /
+    // kernel fd leak into the next boot), raced against a single shared
+    // deadline so a wedged worker can't block our clean shutdown forever.
     const exited = (w: Worker): Promise<void> =>
       new Promise<void>((resolve) => {
         w.addEventListener("close", () => resolve());
@@ -721,6 +817,7 @@ function runDaemon(): void {
         exited(planWorker),
         exited(exitWorker),
         exited(gitWorker),
+        exited(usageWorker),
       ]),
       Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS),
     ]);
@@ -752,6 +849,11 @@ function runDaemon(): void {
     }
     try {
       gitWorker.terminate();
+    } catch {
+      // best-effort if it already exited
+    }
+    try {
+      usageWorker.terminate();
     } catch {
       // best-effort if it already exited
     }

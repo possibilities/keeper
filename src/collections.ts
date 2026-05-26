@@ -270,6 +270,42 @@ export const GIT_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
+ * The `usage` descriptor — one row per agentuse profile observed by the
+ * usage worker. The row is a current-state snapshot of one
+ * `~/.local/state/agentuse/<id>.json` envelope (target, multiplier, and the
+ * two-window session+week percent/reset pair). It is produced by synthetic
+ * `UsageSnapshot` / `UsageDeleted` events, so the read surface rides the
+ * normal SQLite subscription machinery.
+ *
+ * **Freshness fields excluded by design.** The source envelope carries
+ * `fetched_at` / `next_fetch_at` / `last_successful_fetch_at` /
+ * `last_skipped_fetch_at` — these are read-and-discarded by the worker and
+ * absent from the projection schema. See `src/usage-worker.ts` for the
+ * change-gate discipline that enforces the exclusion.
+ */
+export const USAGE_DESCRIPTOR: CollectionDescriptor = {
+  name: "usage",
+  table: "usage",
+  columns: [
+    "id",
+    "target",
+    "multiplier",
+    "session_percent",
+    "session_resets_at",
+    "week_percent",
+    "week_resets_at",
+    "last_event_id",
+    "updated_at",
+  ],
+  pk: "id",
+  version: "last_event_id",
+  sortable: new Set(["id", "target", "last_event_id", "updated_at"]),
+  defaultSort: { column: "id", dir: "asc" },
+  filters: { id: "id", target: "target" },
+  jsonColumns: new Set(),
+};
+
+/**
  * The `subagent_invocations` descriptor — per-job timeline of `Agent` (Task)
  * tool invocations and their `SubagentStart` / `SubagentStop` lifecycle. The
  * peer-table projection lives in schema v17 (`src/db.ts`'s
@@ -331,6 +367,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [EPICS_DESCRIPTOR.name, EPICS_DESCRIPTOR],
   [GIT_DESCRIPTOR.name, GIT_DESCRIPTOR],
   [SUBAGENT_INVOCATIONS_DESCRIPTOR.name, SUBAGENT_INVOCATIONS_DESCRIPTOR],
+  [USAGE_DESCRIPTOR.name, USAGE_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 22;
+export const SCHEMA_VERSION = 23;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -94,15 +94,25 @@ const DEFAULT_PLAN_ROOTS = ["~/code"];
 const DEFAULT_CLAUDE_PROJECTS_ROOT = "~/.claude/projects";
 
 /**
+ * Default agentuse state-dir watch root when the config file is absent or
+ * carries no `agentuse_root`. The flat leaf dir agentuse writes per-profile
+ * `<id>.json` envelopes to. Tests override this via the YAML key so the
+ * usage worker never touches the user's real envelopes.
+ */
+const DEFAULT_AGENTUSE_ROOT = "~/.local/state/agentuse";
+
+/**
  * Parsed keeper daemon config. `roots` are the directories keeperd
  * scans/watches for `.planctl` plan trees; `claude_projects_root` is the single
- * directory the transcript worker watches for session JSONL. The two keys are
- * INDEPENDENT — a malformed/missing one never disturbs the other.
- * Forward-compatible: unknown keys are ignored.
+ * directory the transcript worker watches for session JSONL;
+ * `agentuse_root` is the single directory the usage worker watches for
+ * per-profile usage envelopes. The keys are INDEPENDENT — a malformed/missing
+ * one never disturbs the others. Forward-compatible: unknown keys are ignored.
  */
 export interface KeeperConfig {
   roots: string[];
   claudeProjectsRoot?: string;
+  agentuseRoot?: string;
 }
 
 /**
@@ -133,9 +143,10 @@ export function resolveConfig(): KeeperConfig {
   const path = resolveConfigPath();
   let roots: string[] = [...DEFAULT_PLAN_ROOTS];
   let claudeProjectsRoot: string = DEFAULT_CLAUDE_PROJECTS_ROOT;
+  let agentuseRoot: string = DEFAULT_AGENTUSE_ROOT;
   try {
     if (!existsSync(path)) {
-      return { roots, claudeProjectsRoot };
+      return { roots, claudeProjectsRoot, agentuseRoot };
     }
     const raw = Bun.YAML.parse(readFileSync(path, "utf8")) as unknown;
     if (raw && typeof raw === "object") {
@@ -152,6 +163,10 @@ export function resolveConfig(): KeeperConfig {
       if (typeof cpr === "string" && cpr.length > 0) {
         claudeProjectsRoot = cpr;
       }
+      const aur = (raw as { agentuse_root?: unknown }).agentuse_root;
+      if (typeof aur === "string" && aur.length > 0) {
+        agentuseRoot = aur;
+      }
     }
   } catch (err) {
     console.error(
@@ -161,9 +176,10 @@ export function resolveConfig(): KeeperConfig {
     return {
       roots: [...DEFAULT_PLAN_ROOTS],
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
+      agentuseRoot: DEFAULT_AGENTUSE_ROOT,
     };
   }
-  return { roots, claudeProjectsRoot };
+  return { roots, claudeProjectsRoot, agentuseRoot };
 }
 
 /**
@@ -211,6 +227,27 @@ export function resolveClaudeProjectsRoot(): string {
   const home = homedir();
   const entry =
     resolveConfig().claudeProjectsRoot ?? DEFAULT_CLAUDE_PROJECTS_ROOT;
+  if (entry === "~") {
+    return home;
+  }
+  if (entry.startsWith("~/")) {
+    return join(home, entry.slice(2));
+  }
+  return entry;
+}
+
+/**
+ * Resolve the agentuse watch root to a single clean absolute path. Mirrors
+ * {@link resolveClaudeProjectsRoot}'s shape — tilde expansion, NO
+ * existence-filter (the dir may not exist if agentuse has never run; the
+ * usage-worker tolerates absence). Defaults to `~/.local/state/agentuse`;
+ * overridable via the `agentuse_root` config key so hermetic integration
+ * tests can point the worker at a tmp dir instead of the real per-user
+ * envelopes.
+ */
+export function resolveUsageRoot(): string {
+  const home = homedir();
+  const entry = resolveConfig().agentuseRoot ?? DEFAULT_AGENTUSE_ROOT;
   if (entry === "~") {
     return home;
   }
@@ -433,6 +470,35 @@ CREATE TABLE IF NOT EXISTS git_status (
 )
 `;
 
+/**
+ * Schema-v23 `usage` projection table — one row per agentuse profile
+ * (`~/.local/state/agentuse/<id>.json`). The usage-worker watches that flat
+ * leaf dir, mints `UsageSnapshot` / `UsageDeleted` synthetic events, and the
+ * reducer folds them here via a single-row UPSERT.
+ *
+ * **Freshness fields are intentionally absent.** The source envelope carries
+ * `fetched_at` / `next_fetch_at` / `last_successful_fetch_at` /
+ * `last_skipped_fetch_at` which the producer fetches every ~90s even when the
+ * underlying quota numbers haven't moved. The change-gate hash on the worker
+ * side AND this projection both ignore those fields — so a fetch-only refresh
+ * cycle produces zero events and zero projection churn. Future contributors:
+ * do NOT add a freshness column here without re-reading the freshness-
+ * exclusion discipline notes in `src/usage-worker.ts` (load-bearing).
+ */
+const CREATE_USAGE = `
+CREATE TABLE IF NOT EXISTS usage (
+    id TEXT PRIMARY KEY,
+    target TEXT,
+    multiplier INTEGER,
+    session_percent REAL,
+    session_resets_at TEXT,
+    week_percent REAL,
+    week_resets_at TEXT,
+    last_event_id INTEGER,
+    updated_at REAL NOT NULL DEFAULT 0
+)
+`;
+
 const CREATE_REDUCER_STATE = `
 CREATE TABLE IF NOT EXISTS reducer_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -554,6 +620,7 @@ function migrate(db: Database): void {
     db.run(CREATE_JOBS);
     db.run(CREATE_EPICS);
     db.run(CREATE_GIT_STATUS);
+    db.run(CREATE_USAGE);
     db.run(CREATE_REDUCER_STATE);
     db.run(CREATE_META);
     db.run(CREATE_SUBAGENT_INVOCATIONS);
@@ -1904,6 +1971,24 @@ function migrate(db: Database): void {
     // column defs match CREATE_EVENTS / CREATE_JOBS verbatim.
     addColumnIfMissing(db, "events", "config_dir", "TEXT");
     addColumnIfMissing(db, "jobs", "config_dir", "TEXT");
+
+    // v22→v23: register the `usage` table (created above by the unconditional
+    // `CREATE_USAGE` bootstrap block). Per-profile agentuse quota snapshots
+    // — one row per `~/.local/state/agentuse/<id>.json`. The CREATE TABLE
+    // IF NOT EXISTS is idempotent and runs on every boot — no ALTER step is
+    // required here, so this block is a comment-only no-op that documents
+    // what the v23 stamp gates. Without this note the bare SCHEMA_VERSION =
+    // 23 bump would violate the CLAUDE.md invariant ("Bump SCHEMA_VERSION
+    // only when adding an ALTER block to migrate()"); a future real v22→v23
+    // ALTER would have to land alongside this comment's removal. Mirrors the
+    // v14→v15 git_status registration step exactly.
+    //
+    // NO freshness columns: every `fetched_at` / `next_fetch_at` /
+    // `last_successful_fetch_at` / `last_skipped_fetch_at` field on the
+    // source envelope is read-and-discarded by the worker. See
+    // `src/usage-worker.ts` for the change-gate discipline that enforces the
+    // same exclusion on the producer side; a freshness column added here
+    // (or to the worker's change-gate hash) would churn every ~90s.
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

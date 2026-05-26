@@ -20,6 +20,7 @@ import {
   EPICS_DESCRIPTOR,
   GIT_DESCRIPTOR,
   getCollection,
+  USAGE_DESCRIPTOR,
 } from "../src/collections";
 import { openDb } from "../src/db";
 import type { ErrorFrame, ResultFrame } from "../src/protocol";
@@ -129,6 +130,42 @@ test("getCollection resolves the git status collection", () => {
   expect(GIT_DESCRIPTOR.jsonColumns.has("dirty_files")).toBe(true);
   expect(GIT_DESCRIPTOR.jsonColumns.has("orphaned_files")).toBe(true);
   expect(GIT_DESCRIPTOR.jsonColumns.has("jobs")).toBe(true);
+});
+
+test("getCollection resolves the usage collection (fn-615)", () => {
+  expect(getCollection("usage")).toBe(USAGE_DESCRIPTOR);
+  expect(USAGE_DESCRIPTOR.table).toBe("usage");
+  expect(USAGE_DESCRIPTOR.pk).toBe("id");
+  expect(USAGE_DESCRIPTOR.version).toBe("last_event_id");
+  // Filters: pk + the natural per-target filter.
+  expect(USAGE_DESCRIPTOR.filters.id).toBe("id");
+  expect(USAGE_DESCRIPTOR.filters.target).toBe("target");
+  // Default sort is stable by pk.
+  expect(USAGE_DESCRIPTOR.defaultSort).toEqual({ column: "id", dir: "asc" });
+  // No JSON-decoded columns (all scalars).
+  expect(USAGE_DESCRIPTOR.jsonColumns.size).toBe(0);
+  // Columns include every persisted field.
+  for (const col of [
+    "id",
+    "target",
+    "multiplier",
+    "session_percent",
+    "session_resets_at",
+    "week_percent",
+    "week_resets_at",
+    "last_event_id",
+    "updated_at",
+  ]) {
+    expect(USAGE_DESCRIPTOR.columns).toContain(col);
+  }
+  // Sortable allowlist covers the human-relevant columns.
+  expect(USAGE_DESCRIPTOR.sortable.has("id")).toBe(true);
+  expect(USAGE_DESCRIPTOR.sortable.has("target")).toBe(true);
+  expect(USAGE_DESCRIPTOR.sortable.has("last_event_id")).toBe(true);
+  expect(USAGE_DESCRIPTOR.sortable.has("updated_at")).toBe(true);
+  // No defaultFilter / defaultClause — every row is interesting by default.
+  expect(USAGE_DESCRIPTOR.defaultFilter).toBeUndefined();
+  expect(USAGE_DESCRIPTOR.defaultClause).toBeUndefined();
 });
 
 test("epics descriptor: version is last_event_id; filters include pk + status; tasks is a jsonColumn out of sort/filter", () => {

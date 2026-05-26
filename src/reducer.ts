@@ -792,6 +792,132 @@ function retractGitStatus(db: Database, event: Event): void {
 }
 
 /**
+ * Pre-flattened agentuse usage snapshot. The usage-worker carries every
+ * projection-meaningful field in the synthetic `UsageSnapshot` event's
+ * `data` blob; the reducer never re-reads the on-disk file. **Freshness
+ * fields are explicitly absent** — `fetched_at` / `next_fetch_at` /
+ * `last_successful_fetch_at` / `last_skipped_fetch_at` are filtered at the
+ * producer (see `src/usage-worker.ts` `buildUsageMessage`); including any
+ * here would force a synthetic event on every ~90s fetch cycle.
+ */
+interface UsageSnapshotPayload {
+  target: string | null;
+  multiplier: number | null;
+  session_percent: number | null;
+  session_resets_at: string | null;
+  week_percent: number | null;
+  week_resets_at: string | null;
+}
+
+function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<UsageSnapshotPayload>;
+    return {
+      target: typeof parsed.target === "string" ? parsed.target : null,
+      multiplier:
+        typeof parsed.multiplier === "number" &&
+        Number.isInteger(parsed.multiplier)
+          ? parsed.multiplier
+          : null,
+      session_percent:
+        typeof parsed.session_percent === "number" &&
+        Number.isFinite(parsed.session_percent)
+          ? parsed.session_percent
+          : null,
+      session_resets_at:
+        typeof parsed.session_resets_at === "string"
+          ? parsed.session_resets_at
+          : null,
+      week_percent:
+        typeof parsed.week_percent === "number" &&
+        Number.isFinite(parsed.week_percent)
+          ? parsed.week_percent
+          : null,
+      week_resets_at:
+        typeof parsed.week_resets_at === "string"
+          ? parsed.week_resets_at
+          : null,
+    };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse usage snapshot blob for event id=${event.id} id=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `UsageSnapshot` event. Single-row UPSERT mirrors
+ * {@link projectGitStatus}'s flat-row pattern — no read-modify-write, no
+ * embedded arrays, no fan-out. The pk (`id`) rides in `event.session_id`
+ * (the generic entity-key overload the synthetic-event pipeline uses);
+ * payload fields ride in `event.data` (decoded by
+ * {@link extractUsageSnapshot}).
+ *
+ * Bumps `last_event_id` + `updated_at` on every write so the descriptor's
+ * diff-tick fires patches. Re-fold determinism: the reducer NEVER re-reads
+ * the on-disk file — the persisted event log is the sole source of truth.
+ */
+function projectUsageRow(db: Database, event: Event): void {
+  const id = event.session_id;
+  if (id == null || id.length === 0) {
+    return;
+  }
+  const snapshot = extractUsageSnapshot(event);
+  if (snapshot == null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO usage (
+       id, target, multiplier, session_percent, session_resets_at,
+       week_percent, week_resets_at, last_event_id, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       target = excluded.target,
+       multiplier = excluded.multiplier,
+       session_percent = excluded.session_percent,
+       session_resets_at = excluded.session_resets_at,
+       week_percent = excluded.week_percent,
+       week_resets_at = excluded.week_resets_at,
+       last_event_id = excluded.last_event_id,
+       updated_at = excluded.updated_at`,
+    [
+      id,
+      snapshot.target,
+      snapshot.multiplier,
+      snapshot.session_percent,
+      snapshot.session_resets_at,
+      snapshot.week_percent,
+      snapshot.week_resets_at,
+      event.id,
+      event.ts,
+    ],
+  );
+}
+
+/**
+ * Fold one synthetic `UsageDeleted` tombstone. The usage-worker posts this
+ * when an `<id>.json` file disappears (or the boot-reconciliation sweep
+ * retracts a projection ghost); without it, {@link projectUsageRow}'s
+ * UPSERT-only path would leak the final pre-delete snapshot row forever.
+ *
+ * The primary key (`id`) rides in `event.session_id`. An empty / missing pk
+ * is a safe no-op — the invariant says fold must never throw inside the
+ * cursor-advance transaction. DELETE is idempotent: re-folding over a row
+ * that's already gone matches zero rows, not an error.
+ */
+function retractUsageRow(db: Database, event: Event): void {
+  const id = event.session_id;
+  if (id == null || id.length === 0) {
+    return;
+  }
+  db.run("DELETE FROM usage WHERE id = ?", [id]);
+}
+
+/**
  * Sweep open `status='running'` subagent_invocations rows for a job to
  * `status='unknown'` in a single bulk UPDATE. Called from the SessionEnd and
  * Killed arms of {@link projectJobsRow} on the proven write path (after the
@@ -2418,6 +2544,10 @@ export function applyEvent(
       projectGitStatus(db, event);
     } else if (event.hook_event === "GitRootDropped") {
       retractGitStatus(db, event);
+    } else if (event.hook_event === "UsageSnapshot") {
+      projectUsageRow(db, event);
+    } else if (event.hook_event === "UsageDeleted") {
+      retractUsageRow(db, event);
     } else {
       projectJobsRow(db, event);
       // The `subagent_invocations` projection rides the same transaction +
