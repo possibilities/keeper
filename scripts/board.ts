@@ -13,9 +13,8 @@
  * — `superseded` is promoted natively by the projection, see task fn-605.2),
  * keyed on `job_id` and ordered by `turn_seq asc`.
  *
- * Frame shape (one `---` lead per frame):
+ * Frame shape:
  *
- *   ---
  *   {epics body}     ← one block per epic, see `renderEpicBlock` below
  *   ~~~
  *   {jobs body}      ← one row per job, see `projectJobRow` below
@@ -51,13 +50,15 @@
  * (`working + stopped`, terminal states hidden). That's the common-case
  * "board" view; for explicit filters drop down to a custom subscribe client.
  *
- * Sidecar / SIGINT semantics: THREE combined sidecar files (state JSON +
- * frame text + per-frame unified diff against the previous emit) overwritten
- * each frame. The diff is `diff -u prev current` via the system tool —
+ * Sidecar / SIGINT semantics: THREE indexed sidecar files per frame
+ * (state JSON + frame text + per-frame unified diff against the previous
+ * emit) plus a session meta file at /tmp/keeper-board.<pid>.meta.txt.
+ * The diff is `diff -u prev current` via the system tool —
  * universally-readable unified-diff format; the first frame writes a
- * sentinel since there's no prior to diff. SIGINT calls the helper's
- * `dispose()` (which drops every subscription on the connection via a
- * bare `unsubscribe`) and exits.
+ * sentinel since there's no prior to diff. SIGINT calls the shell's
+ * `dispose()` (restores the terminal), then the helper's `dispose()`
+ * (drops every subscription via a bare `unsubscribe`), logs the session
+ * sidecar paths, and exits.
  *
  * Usage:
  *   bun scripts/board.ts [--sock <path>]
@@ -84,24 +85,16 @@ const HELP = `keeper-board — combined epics + jobs UI over the keeper subscrib
 Usage: bun scripts/board.ts [--sock <path>]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
-  --live           Real TUI mode (alt-screen + keyboard nav).
-                   When not a TTY, behaves as if --live was not set.
-                   Keys: ←/h/k prev frame, →/l/j next, g oldest,
-                         G/End/Esc return to live, q/Ctrl-C quit.
-                   Each frame's sidecars are written to indexed paths
-                   instead of overwriting, and a session meta file at
-                   /tmp/keeper-board.<pid>.meta.txt accumulates the full
-                   index (tab-separated: frame# state frame diff).
-                   Per-frame paths and lifecycle events are NOT printed
-                   to stdout in --live mode (the alt-screen would scroll
-                   and corrupt the differ); lifecycle + warn output is
-                   appended to /tmp/keeper-board.<pid>.lifecycle.txt
-                   instead. The session paths are printed once on exit.
   --help           Show this help
 
-Renders both views as one frame per change, each frame led by '---':
+Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
+  ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
+  q/Ctrl-C quit. Per-frame sidecars are indexed; lifecycle + warn output
+  is appended to /tmp/keeper-board.<pid>.lifecycle.txt. Session paths
+  print on exit.
 
-  ---
+Renders both views as one frame per change:
+
   {epics body}      (one block per epic, see epic-header format below)
   ~~~
   {jobs body}       (one row per job: {basename(cwd)} {title} [role] [state])
@@ -156,14 +149,11 @@ empty (this applies to the inner jobs split too). The page is refetched on
 every change signal and on a steady poll; a new frame prints only when the
 combined rendered output changes. All three subscriptions ride one
 connection; an epics-only change refetches only epics (and vice versa).
-Every emitted frame is mirrored to three /tmp sidecar files (combined JSON
-state, combined frame text, unified diff vs. the previous emit), whose
-paths print in a ...-fenced note.
-
-The client waits for keeperd to come up and reconnects across restarts
-instead of exiting; each connection-lifecycle change prints a ...-fenced
-note (event: connecting|connected|waiting|disconnected). Ctrl-C exits
-cleanly.
+Every emitted frame is mirrored to three indexed /tmp sidecar files
+(state JSON + frame text + unified diff vs. the previous emit); a session
+meta file at /tmp/keeper-board.<pid>.meta.txt accumulates the index.
+Connection-lifecycle events are appended to the lifecycle sidecar.
+Session sidecar paths print on exit (Ctrl-C).
 
 This view uses the SERVER defaults for all three collections (epics: open +
 not-yet-approved; jobs: live only; subagent_invocations: full per-job
@@ -365,7 +355,6 @@ async function main(): Promise<void> {
     args: Bun.argv.slice(2),
     options: {
       sock: { type: "string" },
-      live: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -378,8 +367,7 @@ async function main(): Promise<void> {
 
   const sockPath = values.sock ?? resolveSockPath();
   const log = (s: string) => process.stdout.write(`${s}\n`);
-  const liveMode = values.live;
-  const liveShell = createLiveShell({ enabled: liveMode });
+  const liveShell = createLiveShell({ enabled: true });
   let frameCount = 0;
 
   // Color is for human eyes on a TTY. Pipes / redirects / NO_COLOR stay
@@ -630,32 +618,23 @@ async function main(): Promise<void> {
     return body === "" ? [] : body.split("\n");
   }
 
-  const stateSidecar = `/tmp/keeper-board.${process.pid}.state.json`;
-  const frameSidecar = `/tmp/keeper-board.${process.pid}.frame.txt`;
-  const diffSidecar = `/tmp/keeper-board.${process.pid}.diff.txt`;
   // Internal scratch path for the previous frame text — fed to `diff -u` as
   // its "before" file. Overwritten each tick; not surfaced in the meta note.
   const prevFrameTmp = `/tmp/keeper-board.${process.pid}.prev.frame.txt`;
   // Session-level meta file: one tab-separated line per frame (index +
-  // per-frame sidecar paths). Only written in `--live` mode; accumulates
-  // across the session so every past frame remains inspectable.
+  // per-frame sidecar paths). Accumulates across the session so every past
+  // frame remains inspectable.
   const metaSidecar = `/tmp/keeper-board.${process.pid}.meta.txt`;
-  // `--live` mode owns the alt-screen, so per-frame / per-event chatter
-  // can't go to stdout (raw newline writes scroll the alt-screen and
-  // desync the per-line differ — every row not updated next frame shows
-  // stale content). Lifecycle events and warn lines append here instead;
-  // tail -f from another pane to watch.
+  // The alt-screen owns stdout, so per-frame / per-event chatter goes here.
+  // Lifecycle events and warn lines append here instead; tail -f from another
+  // pane to watch.
   const lifecycleSidecar = `/tmp/keeper-board.${process.pid}.lifecycle.txt`;
-  // Route warn/lifecycle output: stdout in default mode, sidecar in --live.
+  // Route warn/lifecycle output to the sidecar.
   const noteLine = (s: string): void => {
-    if (liveMode) {
-      try {
-        appendFileSync(lifecycleSidecar, `${s}\n`);
-      } catch {
-        // best-effort — the sidecar is observational
-      }
-    } else {
-      log(s);
+    try {
+      appendFileSync(lifecycleSidecar, `${s}\n`);
+    } catch {
+      // best-effort — the sidecar is observational
     }
   };
   // In-memory copy of the last emitted frame's body+lead, used as the
@@ -667,17 +646,9 @@ async function main(): Promise<void> {
     snap: ReadinessClientSnapshot,
     frameText: string,
   ): void {
-    // In --live mode each frame's sidecars are indexed so past frames persist;
-    // in default mode the three static paths are overwritten each frame.
-    const sState = liveMode
-      ? `/tmp/keeper-board.${process.pid}.state.${frameCount}.json`
-      : stateSidecar;
-    const sFrame = liveMode
-      ? `/tmp/keeper-board.${process.pid}.frame.${frameCount}.txt`
-      : frameSidecar;
-    const sDiff = liveMode
-      ? `/tmp/keeper-board.${process.pid}.diff.${frameCount}.txt`
-      : diffSidecar;
+    const sState = `/tmp/keeper-board.${process.pid}.state.${frameCount}.json`;
+    const sFrame = `/tmp/keeper-board.${process.pid}.frame.${frameCount}.txt`;
+    const sDiff = `/tmp/keeper-board.${process.pid}.diff.${frameCount}.txt`;
     const stateJson = {
       epics: snap.epics,
       jobs: Array.from(snap.jobs.values()),
@@ -715,28 +686,15 @@ async function main(): Promise<void> {
     } catch (err) {
       noteLine(`# warn: diff sidecar write failed: ${(err as Error).message}`);
     }
-    if (liveMode) {
-      try {
-        appendFileSync(
-          metaSidecar,
-          `${frameCount}\t${sState}\t${sFrame}\t${sDiff}\n`,
-        );
-      } catch (err) {
-        noteLine(`# warn: meta write failed: ${(err as Error).message}`);
-      }
+    try {
+      appendFileSync(
+        metaSidecar,
+        `${frameCount}\t${sState}\t${sFrame}\t${sDiff}\n`,
+      );
+    } catch (err) {
+      noteLine(`# warn: meta write failed: ${(err as Error).message}`);
     }
     lastFrameText = frameText;
-    // In --live mode the alt-screen is the canvas — chatter to stdout would
-    // scroll it and desync the per-line differ. The meta sidecar already
-    // records every frame's indexed paths; the dispose summary surfaces
-    // them on exit.
-    if (!liveMode) {
-      log("...");
-      log(`state: ${sState}`);
-      log(`frame: ${sFrame}`);
-      log(`diff: ${sDiff}`);
-      log("...");
-    }
   }
 
   /**
@@ -773,12 +731,13 @@ async function main(): Promise<void> {
     }
     lastBody = body;
     frameCount += 1;
-    const lines = ["---", ...bodyLines];
-    const frameText = lines.join("\n");
-    // Sidecars + byte-compare run on the plain `frameText`; only the lines
-    // shipped to the screen pick up SGR coloring. Gated on TTY + NO_COLOR
-    // so piped/redirected output stays clean.
-    const linesForShell = colorEnabled ? lines.map(colorizePillsInLine) : lines;
+    const frameText = ["---", ...bodyLines].join("\n");
+    // Only lines shipped to the screen pick up SGR coloring. Gated on TTY +
+    // NO_COLOR so piped/redirected output stays clean. `---` is kept in
+    // frameText for sidecars/non-TTY output but not passed to the shell.
+    const linesForShell = colorEnabled
+      ? bodyLines.map(colorizePillsInLine)
+      : bodyLines;
     liveShell.pushFrame(linesForShell);
     writeSidecars(snap, frameText);
   }
@@ -787,24 +746,15 @@ async function main(): Promise<void> {
     event: string,
     detail: Record<string, unknown> = {},
   ): void {
-    // Single multi-line block — one write call, one append — so the
-    // alt-screen sees nothing in --live mode and the default-mode stdout
-    // emits in one shot like the sidecar block.
     const lines: string[] = ["...", `event: ${event}`];
     for (const [k, v] of Object.entries(detail)) {
       lines.push(`${k}: ${String(v)}`);
     }
     lines.push("...");
-    if (liveMode) {
-      try {
-        appendFileSync(lifecycleSidecar, `${lines.join("\n")}\n`);
-      } catch {
-        // best-effort
-      }
-    } else {
-      for (const line of lines) {
-        log(line);
-      }
+    try {
+      appendFileSync(lifecycleSidecar, `${lines.join("\n")}\n`);
+    } catch {
+      // best-effort
     }
     // On disconnect, clear `lastBody` so the next first-paint emits even
     // if the post-reconnect snapshot happens to match the last pre-
@@ -826,15 +776,10 @@ async function main(): Promise<void> {
     // Terminal restoration before subscription teardown.
     liveShell.dispose();
     handle.dispose();
-    // In --live mode chatter is suppressed during the session — surface
-    // the session sidecar paths to the user's restored terminal now so
-    // they can inspect the indexed history.
-    if (liveMode) {
-      log("...");
-      log(`meta: ${metaSidecar}`);
-      log(`lifecycle: ${lifecycleSidecar}`);
-      log("...");
-    }
+    log("...");
+    log(`meta: ${metaSidecar}`);
+    log(`lifecycle: ${lifecycleSidecar}`);
+    log("...");
     process.exit(0);
   });
 }

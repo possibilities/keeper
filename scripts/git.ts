@@ -25,25 +25,20 @@ const COLLECTION = "git";
 
 const HELP = `keeper-git — live git status frames over the keeper subscribe server
 
-Usage: bun scripts/git.ts [--sock <path>] [--project-dir <path>] [--live]
+Usage: bun scripts/git.ts [--sock <path>] [--project-dir <path>]
 
   --sock <path>         Socket path override ($KEEPER_SOCK / default otherwise)
   --project-dir <path>  Filter to one git worktree root
-  --live                Real TUI mode (alt-screen + keyboard nav).
-                        When not a TTY, behaves as if --live was not set.
-                        Keys: ←/h/k prev frame, →/l/j next, g oldest,
-                              G/End/Esc return to live, q/Ctrl-C quit.
-                        Indexes the sidecars so past frames remain
-                        inspectable. Per-frame paths and lifecycle events
-                        are NOT printed to stdout in --live mode (the
-                        alt-screen would scroll and corrupt the differ);
-                        lifecycle output is appended to
-                        /tmp/keeper-git.<pid>.lifecycle.txt. The session
-                        paths are printed once on exit.
   --help                Show this help
 
-Each frame is led by '---'. Rows show one planctl-backed git worktree, its
-dirty/orphan counts, orphaned files, and per-live-job dirty files.
+Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
+  ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
+  q/Ctrl-C quit. Per-frame sidecars are indexed; lifecycle output is
+  appended to /tmp/keeper-git.<pid>.lifecycle.txt. Session paths print
+  on exit.
+
+Rows show one planctl-backed git worktree, its dirty/orphan counts,
+orphaned files, and per-live-job dirty files.
 `;
 
 function seg(v: unknown): string {
@@ -156,7 +151,6 @@ async function main(): Promise<void> {
     options: {
       sock: { type: "string" },
       "project-dir": { type: "string" },
-      live: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -168,20 +162,14 @@ async function main(): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
-  const liveMode = values.live;
-  const liveShell = createLiveShell({ enabled: liveMode });
+  const liveShell = createLiveShell({ enabled: true });
   let lastFrame: string | null = null;
   let frameCount = 0;
   let lastRows: Record<string, unknown>[] = [];
 
-  const stateSidecar = `/tmp/keeper-git.${process.pid}.state.json`;
-  const frameSidecar = `/tmp/keeper-git.${process.pid}.frame.txt`;
-  const diffSidecar = `/tmp/keeper-git.${process.pid}.diff.txt`;
   const prevFrameTmp = `/tmp/keeper-git.${process.pid}.prev.frame.txt`;
   const metaSidecar = `/tmp/keeper-git.${process.pid}.meta.txt`;
-  // `--live` mode owns the alt-screen, so per-frame / per-event chatter
-  // can't go to stdout (raw newline writes scroll the alt-screen and
-  // desync the per-line differ). Lifecycle events append here instead.
+  // The alt-screen owns stdout; lifecycle events append here instead.
   const lifecycleSidecar = `/tmp/keeper-git.${process.pid}.lifecycle.txt`;
 
   function log(s: string): void {
@@ -189,15 +177,9 @@ async function main(): Promise<void> {
   }
 
   function writeSidecars(frameText: string): void {
-    const sState = liveMode
-      ? `/tmp/keeper-git.${process.pid}.state.${frameCount}.json`
-      : stateSidecar;
-    const sFrame = liveMode
-      ? `/tmp/keeper-git.${process.pid}.frame.${frameCount}.txt`
-      : frameSidecar;
-    const sDiff = liveMode
-      ? `/tmp/keeper-git.${process.pid}.diff.${frameCount}.txt`
-      : diffSidecar;
+    const sState = `/tmp/keeper-git.${process.pid}.state.${frameCount}.json`;
+    const sFrame = `/tmp/keeper-git.${process.pid}.frame.${frameCount}.txt`;
+    const sDiff = `/tmp/keeper-git.${process.pid}.diff.${frameCount}.txt`;
     writeFileSync(sState, `${JSON.stringify(lastRows, null, 2)}\n`);
     writeFileSync(sFrame, `${frameText}\n`);
     let diff = "# first frame - no previous to diff against\n";
@@ -210,19 +192,10 @@ async function main(): Promise<void> {
       diff = res.stdout.toString() || "# no rendered diff\n";
     }
     writeFileSync(sDiff, diff);
-    if (liveMode) {
-      appendFileSync(
-        metaSidecar,
-        `${frameCount}\t${sState}\t${sFrame}\t${sDiff}\n`,
-      );
-    }
-    // In --live mode the alt-screen is the canvas — chatter to stdout would
-    // scroll it and desync the per-line differ. The meta sidecar records
-    // every frame's indexed paths; the dispose summary surfaces them on
-    // exit.
-    if (!liveMode) {
-      log(`...\nstate: ${sState}\nframe: ${sFrame}\ndiff: ${sDiff}\n...`);
-    }
+    appendFileSync(
+      metaSidecar,
+      `${frameCount}\t${sState}\t${sFrame}\t${sDiff}\n`,
+    );
   }
 
   /**
@@ -235,11 +208,10 @@ async function main(): Promise<void> {
   function emitFrame(rows: Record<string, unknown>[]): void {
     lastRows = rows;
     const bodyLines = renderRowLines(rows);
-    const lines = ["---", ...bodyLines];
-    const frameText = lines.join("\n");
+    const frameText = ["---", ...bodyLines].join("\n");
     if (frameText === lastFrame) return;
     frameCount += 1;
-    liveShell.pushFrame(lines);
+    liveShell.pushFrame(bodyLines);
     writeSidecars(frameText);
     lastFrame = frameText;
   }
@@ -253,16 +225,10 @@ async function main(): Promise<void> {
       lines.push(`${k}: ${String(v)}`);
     }
     lines.push("...");
-    if (liveMode) {
-      try {
-        appendFileSync(lifecycleSidecar, `${lines.join("\n")}\n`);
-      } catch {
-        // best-effort
-      }
-    } else {
-      for (const line of lines) {
-        log(line);
-      }
+    try {
+      appendFileSync(lifecycleSidecar, `${lines.join("\n")}\n`);
+    } catch {
+      // best-effort
     }
     // On disconnect, clear `lastFrame` so the next first-paint emits even
     // if the post-reconnect snapshot happens to match the last pre-
@@ -291,12 +257,10 @@ async function main(): Promise<void> {
     // Terminal restoration before subscription teardown.
     liveShell.dispose();
     handle.dispose();
-    if (liveMode) {
-      log("...");
-      log(`meta: ${metaSidecar}`);
-      log(`lifecycle: ${lifecycleSidecar}`);
-      log("...");
-    }
+    log("...");
+    log(`meta: ${metaSidecar}`);
+    log(`lifecycle: ${lifecycleSidecar}`);
+    log("...");
     process.exit(0);
   });
 }

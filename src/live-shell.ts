@@ -304,16 +304,17 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   // ---------------------------------------------------------------------
 
   /**
-   * Compose the banner row (row 1, 1-indexed). Blank when live; "frame N
-   * of M — press G to return to live" when scrolled back. Rendered as part
-   * of the per-line diff so banner state can't desync from the frame.
+   * Compose the banner row (row 1, 1-indexed). "Showing live results" when
+   * live; "frame N of M — press G to return to live" when scrolled back.
+   * Rendered as part of the per-line diff so banner state can't desync from
+   * the frame.
    */
   function bannerFor(view: ViewIdx, total: number): string {
     if (view === "live" || total === 0) {
-      return "";
+      return "\x1b[2mShowing live results\x1b[0m";
     }
     // `view` is 0-indexed within the held frames; humans count from 1.
-    return `frame ${view + 1} of ${total} — press G to return to live`;
+    return `\x1b[2mframe ${view + 1} of ${total} — press G to return to live\x1b[0m`;
   }
 
   /**
