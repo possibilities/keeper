@@ -69,17 +69,21 @@ and the boot drain re-converges idempotently after any downtime or crash.
 Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names
 a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
-page that doubles as a live subscription. Three collections register today —
+page that doubles as a live subscription. Five collections register today —
 `jobs` (the first and default), `epics` (the read-only plans surface — each
 epic embeds its tasks as a JSON array, so there is no separate `tasks`
 collection; both the epic and each embedded task carry an `approval` field
 valued `"approved" | "rejected" | "pending"`, surfaced as a pill in the
-epics client), and `subagent_invocations` (the per-job timeline of Task-tool
+epics client), `subagent_invocations` (the per-job timeline of Task-tool
 subagent calls — one row per `PreToolUse:Agent` paired with its later
 `PostToolUse:Agent` via `events.tool_use_id`, carrying lifecycle status
 `running | ok | failed | unknown | superseded` and a populated `duration_ms`
 on close (NULL on rows that never observed a SubagentStop — `superseded`
-peers + lifecycle-swept `unknown` orphans)). The
+peers + lifecycle-swept `unknown` orphans)), `git` (per-worktree planctl-backed
+git status — branch, ahead/behind, dirty + orphaned file lists, per-live-job
+dirty/planctl groupings), and `usage` (one row per agentuse profile observed
+at `~/.local/state/agentuse/<id>.json` — target, multiplier, session+week
+percent and reset timestamps). The
 surface is built so additional collections register without touching the
 wire protocol or the diff machinery. Page membership is frozen at query time,
 but each row's cells stream `patch` frames as the reducer folds new events.
@@ -372,6 +376,24 @@ CI) `--live` silently behaves as if it wasn't set. Run any of them with
   bun scripts/git.ts --live                   # alt-screen TUI
   ```
 
+- `usage.ts` — single-collection subscribe client over the `usage`
+  collection (one row per agentuse profile observed at
+  `~/.local/state/agentuse/<id>.json`: target, multiplier, session+week
+  percent + reset timestamps). Uses `subscribeCollection` from
+  `src/readiness-client.ts` (same lifecycle primitive as `git.ts`).
+  Renders one `---`-delimited frame to stdout, one line per profile;
+  byte-compares the rendered frame so fetch-only refresh cycles produce
+  no visible re-render. Three per-pid `/tmp` sidecar files (JSON state,
+  frame text, unified diff vs. previous) indexed via a meta sidecar.
+  No `--live` / TUI yet (a later epic may promote this script when a
+  freshness signal lands). SIGINT calls the helper's `dispose()` and
+  prints sidecar paths on exit.
+
+  ```sh
+  bun scripts/usage.ts                # all profiles
+  bun scripts/usage.ts --sock /tmp/x  # socket override
+  ```
+
 - `approve.ts` — the RPC client. Single-shot: opens a `Bun.connect`, sends
   one `rpc` frame for `set_task_approval` or `set_epic_approval`, awaits the
   `rpc_result` (or `error`), and exits. No subscription, no reconnect loop.
@@ -492,7 +514,27 @@ re-scan of their existing change-gated boot-scan path (per affected root for the
 plan worker), recovering the missed change in-process without a daemon restart
 and without re-subscribing.
 
-A **fifth** Worker thread is the exit-watcher: it owns a kqueue (macOS) or
+A **fifth** Worker thread is the usage producer: it watches the agentuse
+daemon's flat leaf state directory (`~/.local/state/agentuse/`, one
+`<id>.json` per profile) with `@parcel/watcher`, safe-parses each changed
+file, and posts a `usage-snapshot` message to main (and a `usage-deleted`
+tombstone when a file vanishes). Main — again the sole writer — turns each
+into a synthetic `UsageSnapshot` (or `UsageDeleted`) events row and pumps a
+wake; the reducer folds it as an idempotent upsert into the flat `usage`
+projection (one row per profile; deletes via tombstone). As of schema v23
+the `usage` table lands alongside the existing collections, indexed via
+the same descriptor + REGISTRY entry pattern as `git`. Freshness fields
+(`fetched_at` / `next_fetch_at` / `last_successful_fetch_at` /
+`last_skipped_fetch_at`) are read-and-discarded at the worker boundary and
+excluded from both the change-gate and the projection schema, so the ~90s
+agentuse fetch loop produces zero events when no content moved. Like the
+transcript + plan producers, this is read-only / write-free, feeding the
+log only via main, and the watcher subscription is released in the
+worker's own shutdown handler. The producer also self-recovers from a
+*dropped-events* FSEvents overrun via a debounced single-flight re-scan
+of the existing change-gated boot-scan path.
+
+A **sixth** Worker thread is the exit-watcher: it owns a kqueue (macOS) or
 pidfd+epoll (Linux) fd via `bun:ffi`, polls `data_version` to keep its watch
 set in sync with the candidate `jobs` rows (`state IN ('working','stopped')
 AND pid IS NOT NULL`), and posts an `exit` message whenever a tracked pid
@@ -508,7 +550,7 @@ instance — read-only / write-free, feeding the log only via main — and its
 kqueue/pidfd fd is owned by the worker thread, released in its own shutdown
 handler.
 
-The five workers are fully independent; main supervises all five lifecycles
+The six workers are fully independent; main supervises all six lifecycles
 but routes none of their traffic, and any worker's `error` event escalates
 the whole process to a clean restart — with that single scoped exception, the
 recoverable drop signal on the transcript and plan watchers, which
@@ -581,6 +623,10 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 # Work-verb jobs per task — double-unnest epics.tasks then each task's embedded jobs sub-array:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.epic_number ASC, task_id ASC LIMIT 10"
+
+# Usage projection — one row per agentuse profile observed at ~/.local/state/agentuse/<id>.json (freshness fields are excluded by design — keeper has no freshness signal yet):
+sqlite3 ~/.local/state/keeper/keeper.db \
+  'SELECT * FROM usage ORDER BY target, id'
 
 # Raw event log tail (synthetic EpicSnapshot/TaskSnapshot/EpicDeleted/TaskDeleted rows appear here too):
 sqlite3 ~/.local/state/keeper/keeper.db \
