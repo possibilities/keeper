@@ -96,6 +96,8 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     last_event_id: 0,
     last_api_error_at: null,
     last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
     ...overrides,
   };
 }
@@ -119,12 +121,14 @@ function makeSub(overrides: Partial<SubagentInvocation>): SubagentInvocation {
 }
 
 /**
- * Build a `JobLinkEntry` with the schema-v24 widened shape
- * `{kind, job_id, title, state, last_api_error_at, last_api_error_kind}`
- * — defaults match the reducer's `enrichJobLink` orphan-row defaults
- * (`title: null, state: "stopped", last_api_error_at: null,
- * last_api_error_kind: null`) so a caller that overrides only `kind` +
- * `job_id` exercises the common "session not running" path.
+ * Build a `JobLinkEntry` with the schema-v25 widened shape
+ * `{kind, job_id, title, state, last_api_error_at, last_api_error_kind,
+ * last_input_request_at, last_input_request_kind}` — defaults match the
+ * reducer's `enrichJobLink` orphan-row defaults (`title: null,
+ * state: "stopped", last_api_error_at: null, last_api_error_kind: null,
+ * last_input_request_at: null, last_input_request_kind: null`) so a
+ * caller that overrides only `kind` + `job_id` exercises the common
+ * "session not running" path.
  */
 function makeLink(overrides: Partial<JobLinkEntry>): JobLinkEntry {
   return {
@@ -134,6 +138,8 @@ function makeLink(overrides: Partial<JobLinkEntry>): JobLinkEntry {
     state: "stopped",
     last_api_error_at: null,
     last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
     ...overrides,
   };
 }

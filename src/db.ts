@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 24;
+export const SCHEMA_VERSION = 25;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -431,6 +431,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     epic_links TEXT NOT NULL DEFAULT '[]',
     last_api_error_at REAL,
     last_api_error_kind TEXT,
+    last_input_request_at REAL,
+    last_input_request_kind TEXT,
     config_dir TEXT
 )
 `;
@@ -2052,6 +2054,68 @@ function migrate(db: Database): void {
       )?.value ?? "0",
     );
     if (storedVersionV24 < 24) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM subagent_invocations");
+    }
+
+    // v24→v25: surface "session blocked on AskUserQuestion" as a two-field
+    // signal mirroring the fn-616 (api-error) shape. Add the pair
+    // `jobs.last_input_request_at REAL` + `jobs.last_input_request_kind
+    // TEXT`, matching the new {@link import("./types").InputRequestKind}
+    // union. The reducer's `InputRequest` arm clones the v24 `ApiError`
+    // arm's shape: one terminal-guarded UPDATE that flips `state` to
+    // `'stopped'` AND stamps both columns together. Four clear arms zero
+    // both columns: `UserPromptSubmit` + `SessionStart` unconditionally,
+    // `PreToolUse` + `PostToolUse` gated on `last_input_request_at IS NOT
+    // NULL` (hot path — `AskUserQuestion` fires no hook of its own, so the
+    // closest "answered" signal is the next tool the agent uses).
+    //
+    // Pair-step: the same two columns are added to the embedded `jobs`
+    // array shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
+    // `EmbeddedJob` in `src/types.ts`) AND to the `JobLinkEntry` shape on
+    // `epics.job_links`. Historical serialized JSON arrays from v24 do
+    // NOT carry the new field-pair; without a rewind, incremental
+    // `syncJobIntoEpic` / `syncJobLinksOnJobWrite` writes from later
+    // events would re-serialize entries WITH the new pair while neighbour
+    // entries in the same array stayed WITHOUT it, breaking the
+    // byte-identical re-fold invariant (CLAUDE.md). The rewind-and-redrain
+    // below harmonizes all three sides — `jobs` columns, `epics.jobs[]`,
+    // `epics.tasks[].jobs[]`, `epics.job_links[]` — to "new schema
+    // everywhere".
+    //
+    // Step 1: add the two new `jobs` columns. Both nullable, no DEFAULT —
+    // ADD COLUMN leaves prior rows reading NULL, which is exactly the
+    // zero-event / never-blocked-on-input-request projection. Column defs
+    // match `CREATE_JOBS` so a fresh v25 DB and a migrated v24→v25 DB
+    // converge to identical schema (the addColumnIfMissing/literal
+    // lockstep convention).
+    addColumnIfMissing(db, "jobs", "last_input_request_at", "REAL");
+    addColumnIfMissing(db, "jobs", "last_input_request_kind", "TEXT");
+
+    // Step 2: rewind-and-redrain — same shape as the v17→v18, v18→v19,
+    // v23→v24 steps. Version-guarded: re-open of an already-migrated v25+
+    // DB skips it (the guard reads the meta row written by a PRIOR
+    // migrate(); on a fresh v25 DB or one that crashed before stamping
+    // v25, `storedVersionV25 < 25` and the rewind runs; on steady-state
+    // v25+ DB it skips). The boot drain after migrate() returns rebuilds
+    // `jobs` / `epics` / `subagent_invocations` from the event log,
+    // re-emitting embedded `jobs` arrays + `job_links` arrays with the
+    // new field-pair on every entry — the transcript matcher and the
+    // synthetic `InputRequest` mint arrive in the same task .1, so a
+    // re-fold of an event log that pre-dates fn-617 contains zero
+    // `InputRequest` events and the new columns simply read NULL
+    // everywhere (the zero-event projection — which is also the steady-
+    // state pre-fn-617 reading).
+    const storedVersionV25 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV25 < 25) {
       db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
       db.run("DELETE FROM jobs");
       db.run("DELETE FROM epics");

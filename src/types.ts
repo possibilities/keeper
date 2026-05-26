@@ -44,39 +44,63 @@ export type ApiErrorKind =
   | "unknown";
 
 /**
+ * Canonical vocabulary of `InputRequest` envelope kinds folded by the
+ * reducer's `InputRequest` arm (schema v25). Mints from a transcript-worker
+ * `input-request` message when Claude Code uses a built-in interactive
+ * tool that fires no hook of its own — initially `AskUserQuestion`. The
+ * union is currently single-member; future-extensible to `ExitPlanMode`
+ * and any other built-in interactive tool that surfaces a question with
+ * no Pre/PostToolUse hook of its own (mirrors {@link ApiErrorKind}'s
+ * "allow-list-extension is a planner decision" rationale).
+ *
+ * Unlike {@link ApiErrorKind}, no `"unknown"` fallback is reserved: the
+ * matcher in `src/transcript-worker.ts` only fires `input-request`
+ * messages for kinds it has explicitly mapped, so the union carries
+ * exactly the matched set — adding a future kind means widening this
+ * union AND the matcher in lockstep.
+ */
+export type InputRequestKind = "ask_user_question";
+
+/**
  * One entry in {@link Epic.job_links} — the symmetric per-epic view of
  * {@link Link}. `kind` carries the same vocabulary; `job_id` identifies the
  * session whose planctl footprint touched this epic inside one of its
  * `/plan:plan` windows.
  *
- * **Embedded display payload** (schema v24): `title` / `state` /
- * `last_api_error_at` / `last_api_error_kind` are denormalized off the
- * linked `jobs` row at the reducer's write boundary so renderers (board)
- * and predicates (readiness) can read everything off the projection with
- * no live-jobs join. Without this denormalization, terminal sessions and
- * off-page live sessions fell through to a degraded `[{job_id}] [{kind}]`
- * line on the board and the planner-running predicate quietly skipped
- * link entries whose `job_id` wasn't in the current jobs page.
+ * **Embedded display payload** (schema v25): `title` / `state` /
+ * `last_api_error_at` / `last_api_error_kind` / `last_input_request_at` /
+ * `last_input_request_kind` are denormalized off the linked `jobs` row
+ * at the reducer's write boundary so renderers (board) and predicates
+ * (readiness) can read everything off the projection with no live-jobs
+ * join. Without this denormalization, terminal sessions and off-page
+ * live sessions fell through to a degraded `[{job_id}] [{kind}]` line
+ * on the board and the planner-running predicate quietly skipped link
+ * entries whose `job_id` wasn't in the current jobs page.
  *
  * The classifier's `JobLink` shape (`src/plan-classifier.ts`) stays thin
  * (`{kind, job_id}`) — enrichment happens at the reducer's write boundary
  * (`enrichJobLink` in `src/reducer.ts`) so the classifier stays a pure
  * function of events. The reducer fans both ways: (a) every
  * `syncPlanctlLinks` write reads the live `jobs` row and stamps these
- * four fields; (b) every `syncJobLinksOnJobWrite` write — fired from
- * any jobs-write that touches `(title, state, last_api_error_at,
- * last_api_error_kind)` on a session whose `epic_links !== '[]'` —
- * re-stamps the same fields on every epic the session linked into.
+ * six fields; (b) every `syncJobLinksOnJobWrite` write — fired from any
+ * jobs-write that touches `(title, state, last_api_error_at,
+ * last_api_error_kind, last_input_request_at, last_input_request_kind)`
+ * on a session whose `epic_links !== '[]'` — re-stamps the same fields
+ * on every epic the session linked into.
  *
  * Defaults on a missing `jobs` row at enrichment time:
  * `{title: null, state: "stopped", last_api_error_at: null,
- * last_api_error_kind: null}` — re-fold-safe "safe value" pattern per
- * CLAUDE.md (never throw inside the fold tx).
+ * last_api_error_kind: null, last_input_request_at: null,
+ * last_input_request_kind: null}` — re-fold-safe "safe value" pattern
+ * per CLAUDE.md (never throw inside the fold tx).
  *
- * **Paired-NULL invariant.** `last_api_error_at` and `last_api_error_kind`
- * move together: every reducer write that stamps one stamps the other,
- * every clear (the `UserPromptSubmit` revival) clears both. No code path
- * may write one without the other.
+ * **Paired-NULL invariant.** `last_api_error_at` / `last_api_error_kind`
+ * AND `last_input_request_at` / `last_input_request_kind` each move
+ * together: every reducer write that stamps one column of a pair stamps
+ * the other, every clear (api-error: `UserPromptSubmit` revival;
+ * input-request: `UserPromptSubmit` / `SessionStart` / gated
+ * `PreToolUse` / `PostToolUse`) clears both columns of its pair. No
+ * code path may write one without the other.
  */
 export interface JobLinkEntry {
   kind: "creator" | "refiner";
@@ -85,6 +109,22 @@ export interface JobLinkEntry {
   state: string;
   last_api_error_at: number | null;
   last_api_error_kind: string | null;
+  /**
+   * Mirrors {@link Job.last_input_request_at} so a renderer reading the
+   * link entry shows the same input-request annotation on the symmetric
+   * per-epic projection that the top-level jobs collection shows on its
+   * own row. NULL on every entry that has never hit a terminal input-
+   * request (the common case). Paired with
+   * {@link last_input_request_kind} — both fields move together; see
+   * the paired-NULL invariant above.
+   */
+  last_input_request_at: number | null;
+  /**
+   * Mirrors {@link Job.last_input_request_kind} — the
+   * {@link InputRequestKind} that fired the last input-request stamp on
+   * this session. NULL whenever {@link last_input_request_at} is NULL.
+   */
+  last_input_request_kind: string | null;
 }
 
 /**
@@ -329,6 +369,36 @@ export interface Job {
    */
   last_api_error_kind: string | null;
   /**
+   * Unix-seconds REAL stamped by the reducer's `InputRequest` arm (schema
+   * v25) — the synthetic event main mints from a transcript-worker
+   * `input-request` message when Claude Code uses a built-in interactive
+   * tool that fires no hook of its own (initially `AskUserQuestion`).
+   * The lifecycle column (`state`) is concurrently flipped to `'stopped'`,
+   * so the underlying state-machine reads correctly; `last_input_request_at`
+   * is the separate annotation that explains *why* the session is
+   * stopped — the session is blocked on a human answer that has not
+   * arrived. Cleared on the next `UserPromptSubmit` (the human answered),
+   * `SessionStart` (resume) unconditionally, and on `PreToolUse` /
+   * `PostToolUse` gated on `last_input_request_at IS NOT NULL` (hot path
+   * — `AskUserQuestion` fires no hooks of its own; the closest "answered"
+   * signal is the next tool the agent uses). NULL on every job that has
+   * never hit a terminal input request.
+   *
+   * Pair: {@link last_input_request_kind} carries the
+   * {@link InputRequestKind} value that fired. Paired-NULL: both stamp
+   * together, both clear together — see the {@link JobLinkEntry} note.
+   */
+  last_input_request_at: number | null;
+  /**
+   * The {@link InputRequestKind} value that fired the last input-request
+   * stamp: currently always `"ask_user_question"` (single-member union).
+   * Paired with {@link last_input_request_at} — both stamp together in
+   * the fold, both clear together on `UserPromptSubmit` / `SessionStart`
+   * / gated `PreToolUse` / `PostToolUse`. NULL on every job that has
+   * never hit a terminal input request.
+   */
+  last_input_request_kind: string | null;
+  /**
    * Projection of `Event.config_dir` — the `CLAUDE_CONFIG_DIR` env value
    * the hook captured at SessionStart (schema v22). Latest-non-NULL-wins:
    * the reducer's SessionStart arm writes `config_dir =
@@ -389,6 +459,22 @@ export interface EmbeddedJob {
    * {@link last_api_error_at} is NULL.
    */
   last_api_error_kind: string | null;
+  /**
+   * Mirrors {@link Job.last_input_request_at} (schema v25) so a renderer
+   * reading the embedded array shows the same input-request annotation
+   * on the in-epic / in-task job lines that the top-level jobs
+   * collection shows on its own row. NULL on every entry that has never
+   * hit a terminal input request (the common case). Paired with
+   * {@link last_input_request_kind} — both fields move together; see
+   * {@link JobLinkEntry} for the paired-NULL invariant.
+   */
+  last_input_request_at: number | null;
+  /**
+   * Mirrors {@link Job.last_input_request_kind} — the
+   * {@link InputRequestKind} that fired the last input-request stamp on
+   * this session. NULL whenever {@link last_input_request_at} is NULL.
+   */
+  last_input_request_kind: string | null;
 }
 
 /**

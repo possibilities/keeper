@@ -103,6 +103,8 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "epic_links",
     "last_api_error_at",
     "last_api_error_kind",
+    "last_input_request_at",
+    "last_input_request_kind",
   ],
   pk: "job_id",
   version: "last_event_id",

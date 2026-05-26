@@ -49,7 +49,7 @@ import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
 import { isDropError, RescanScheduler } from "./rescan";
-import type { ApiErrorKind } from "./types";
+import type { ApiErrorKind, InputRequestKind } from "./types";
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only path
@@ -103,6 +103,33 @@ export interface ApiErrorMessage {
   text: string;
   /** Canonical {@link ApiErrorKind} value matched by `matchApiError`. */
   errorKind: ApiErrorKind;
+}
+
+/**
+ * Message posted to the parent on each fresh assistant turn whose
+ * `message.content[]` includes a built-in interactive tool that fires
+ * no Pre/PostToolUse hook of its own (schema v25). Initially scoped to
+ * `AskUserQuestion`; future-extensible to `ExitPlanMode` and any other
+ * interactive built-in. Main mints a synthetic `InputRequest` event
+ * from this message; the reducer's `InputRequest` arm flips
+ * `jobs.state` to `'stopped'` AND stamps
+ * `jobs.last_input_request_at` + `jobs.last_input_request_kind` to the
+ * event ts + the matched kind in a single compound UPDATE (see
+ * `src/reducer.ts`).
+ *
+ * The matcher (lands in task .2 of fn-617) walks the `message.content[]`
+ * array looking for `{type:"tool_use", name:"AskUserQuestion"}`. Once
+ * the human answers, the reducer clears the pair via `UserPromptSubmit`
+ * (typed reply) / `SessionStart` (resume) unconditionally, OR via
+ * `PreToolUse` / `PostToolUse` gated on `last_input_request_at IS NOT
+ * NULL` (the next tool the agent fires is the closest "answered"
+ * signal AskUserQuestion gives us).
+ */
+export interface InputRequestMessage {
+  kind: "input-request";
+  sessionId: string;
+  /** Canonical {@link InputRequestKind} value matched by the transcript matcher. */
+  requestKind: InputRequestKind;
 }
 
 /** Message the parent sends to ask the worker to stop. */

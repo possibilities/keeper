@@ -82,6 +82,7 @@ import { seedKilledSweep } from "./seed-sweep";
 import type { ServerWorkerData } from "./server-worker";
 import type {
   ApiErrorMessage,
+  InputRequestMessage,
   TranscriptTitleMessage,
   TranscriptWorkerData,
 } from "./transcript-worker";
@@ -269,7 +270,9 @@ function runDaemon(): void {
   // `data.session_title` (the same field the reducer's title rule reads);
   // everything else is NULL (synthetic — never carries a process identity).
   transcriptWorker.onmessage = (
-    ev: MessageEvent<TranscriptTitleMessage | ApiErrorMessage | undefined>,
+    ev: MessageEvent<
+      TranscriptTitleMessage | ApiErrorMessage | InputRequestMessage | undefined
+    >,
   ): void => {
     const msg = ev.data;
     if (!msg) {
@@ -341,6 +344,55 @@ function runDaemon(): void {
         $agent_type: null,
         $stop_hook_active: null,
         $data: JSON.stringify({ kind: msg.errorKind, text: msg.text }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $planctl_op: null,
+        $planctl_target: null,
+        $planctl_epic_id: null,
+        $planctl_task_id: null,
+        $planctl_subject_present: null,
+        $config_dir: null,
+      });
+      wakePending = true;
+      pumpWakes();
+      return;
+    }
+    if (msg.kind === "input-request") {
+      // Synthetic `InputRequest` event minted from the transcript-worker
+      // signal — Claude Code used a built-in interactive tool that fires
+      // no Pre/PostToolUse hook of its own (initially `AskUserQuestion`).
+      // The reducer's `InputRequest` arm (schema v25) folds this row by
+      // flipping `jobs.state` to `'stopped'` AND stamping
+      // `(last_input_request_at, last_input_request_kind)` to the event
+      // ts + the matched kind in a single compound UPDATE
+      // (re-fold-deterministic). Everything other than `session_id` /
+      // `hook_event` / `event_type` / `data` is NULL — synthetics never
+      // carry a process identity. The matched kind rides in `data.kind`
+      // (read by the reducer's `extractInputRequestKind`). Mirrors the
+      // `api-error` branch above structurally; the transcript matcher
+      // arrives in task .2 of fn-617 — until then no `InputRequest`
+      // event ever lands and this branch is unreachable in practice,
+      // but landing the mint + the reducer arm together preserves the
+      // re-fold determinism invariant (an event log emitted by a
+      // future task .2 must fold the same way under a re-fold from
+      // scratch on this code).
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: msg.sessionId,
+        $pid: null,
+        $hook_event: "InputRequest",
+        $event_type: "input_request",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ kind: msg.requestKind }),
         $subagent_agent_id: null,
         $spawn_name: null,
         $start_time: null,

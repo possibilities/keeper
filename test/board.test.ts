@@ -112,6 +112,8 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     last_event_id: 0,
     last_api_error_at: null,
     last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
     ...overrides,
   };
 }
@@ -199,10 +201,11 @@ test("two running invocations on one job_id both reach computeReadiness and bloc
 // ---------------------------------------------------------------------------
 
 /**
- * Build a schema-v24 `JobLinkEntry` with defaults matching
+ * Build a schema-v25 `JobLinkEntry` with defaults matching
  * `enrichJobLink`'s missing-row defaults (`title: null, state: "stopped",
- * last_api_error_at: null, last_api_error_kind: null`). Callers override
- * per-test.
+ * last_api_error_at: null, last_api_error_kind: null,
+ * last_input_request_at: null, last_input_request_kind: null`). Callers
+ * override per-test.
  */
 function makeLink(overrides: Partial<JobLinkEntry>): JobLinkEntry {
   return {
@@ -212,6 +215,8 @@ function makeLink(overrides: Partial<JobLinkEntry>): JobLinkEntry {
     state: "stopped",
     last_api_error_at: null,
     last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
     ...overrides,
   };
 }
