@@ -53,5 +53,5 @@ Specific steps:
 - [ ] End-to-end smoke: a live keeperd folding a real `authentication_failed` envelope from a tracked session lands `last_api_error_kind = "authentication_failed"` in the `jobs` row. Verify via `sqlite3 ~/.local/state/keeper/keeperd.db "SELECT job_id, last_api_error_at, last_api_error_kind FROM jobs WHERE last_api_error_at IS NOT NULL"`.
 
 ## Done summary
-
+Generalized transcript matcher from one-kind rate_limit to six-kind ApiError dispatch (matchRateLimit→matchApiError, RateLimitedMessage→ApiErrorMessage, daemon mints synthetic ApiError with data.kind). Pre-filter widened to '"isApiErrorMessage":true'; negative gates for api_retry + SDKRateLimitEvent. New transcript-worker matcher tests (positive per-kind, real captured 401 fixture, fallbacks, negative gates, dispatchLine integration) and widened reducer cross-test asserting state/at on each non-rate_limit kind.
 ## Evidence
