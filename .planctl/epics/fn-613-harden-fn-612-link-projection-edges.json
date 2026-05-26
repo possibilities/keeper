@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-613-harden-fn-612-link-projection-edges",
   "bundles": [],
+  "closer_done_at": "2026-05-26T11:43:40.465702Z",
   "created_at": "2026-05-26T10:52:49.048213Z",
   "depends_on_epics": [
     "fn-612-embed-job-link-render-payload"
@@ -11,10 +12,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "harden fn-612 link-projection edges",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-26T10:52:49.048213Z"
+  "updated_at": "2026-05-26T11:43:40.465702Z"
 }
