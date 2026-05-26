@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-614-capture-claude-config-dir-on",
   "bundles": [
     "sketch/capture-config-dir-on-session-start"
