@@ -92,6 +92,11 @@ Usage: bun scripts/board.ts [--sock <path>]
                    instead of overwriting, and a session meta file at
                    /tmp/keeper-board.<pid>.meta.txt accumulates the full
                    index (tab-separated: frame# state frame diff).
+                   Per-frame paths and lifecycle events are NOT printed
+                   to stdout in --live mode (the alt-screen would scroll
+                   and corrupt the differ); lifecycle + warn output is
+                   appended to /tmp/keeper-board.<pid>.lifecycle.txt
+                   instead. The session paths are printed once on exit.
   --help           Show this help
 
 Renders both views as one frame per change, each frame led by '---':
@@ -551,6 +556,24 @@ async function main(): Promise<void> {
   // per-frame sidecar paths). Only written in `--live` mode; accumulates
   // across the session so every past frame remains inspectable.
   const metaSidecar = `/tmp/keeper-board.${process.pid}.meta.txt`;
+  // `--live` mode owns the alt-screen, so per-frame / per-event chatter
+  // can't go to stdout (raw newline writes scroll the alt-screen and
+  // desync the per-line differ — every row not updated next frame shows
+  // stale content). Lifecycle events and warn lines append here instead;
+  // tail -f from another pane to watch.
+  const lifecycleSidecar = `/tmp/keeper-board.${process.pid}.lifecycle.txt`;
+  // Route warn/lifecycle output: stdout in default mode, sidecar in --live.
+  const noteLine = (s: string): void => {
+    if (liveMode) {
+      try {
+        appendFileSync(lifecycleSidecar, `${s}\n`);
+      } catch {
+        // best-effort — the sidecar is observational
+      }
+    } else {
+      log(s);
+    }
+  };
   // In-memory copy of the last emitted frame's body+lead, used as the
   // "before" side of the per-frame unified diff. `null` until the first
   // frame lands (sentinel written instead).
@@ -579,7 +602,7 @@ async function main(): Promise<void> {
       writeFileSync(sState, `${JSON.stringify(stateJson, null, 2)}\n`);
       writeFileSync(sFrame, `${frameText}\n`);
     } catch (err) {
-      log(`# warn: sidecar write failed: ${(err as Error).message}`);
+      noteLine(`# warn: sidecar write failed: ${(err as Error).message}`);
     }
     // Per-frame unified diff against the previous emit. Uses system `diff -u`
     // so the output is the universally-readable unified-diff format. `diff -u`
@@ -606,7 +629,7 @@ async function main(): Promise<void> {
     try {
       writeFileSync(sDiff, diffText);
     } catch (err) {
-      log(`# warn: diff sidecar write failed: ${(err as Error).message}`);
+      noteLine(`# warn: diff sidecar write failed: ${(err as Error).message}`);
     }
     if (liveMode) {
       try {
@@ -615,18 +638,21 @@ async function main(): Promise<void> {
           `${frameCount}\t${sState}\t${sFrame}\t${sDiff}\n`,
         );
       } catch (err) {
-        log(`# warn: meta write failed: ${(err as Error).message}`);
+        noteLine(`# warn: meta write failed: ${(err as Error).message}`);
       }
     }
     lastFrameText = frameText;
-    log("...");
-    log(`state: ${sState}`);
-    log(`frame: ${sFrame}`);
-    log(`diff: ${sDiff}`);
-    if (liveMode) {
-      log(`meta: ${metaSidecar}`);
+    // In --live mode the alt-screen is the canvas — chatter to stdout would
+    // scroll it and desync the per-line differ. The meta sidecar already
+    // records every frame's indexed paths; the dispose summary surfaces
+    // them on exit.
+    if (!liveMode) {
+      log("...");
+      log(`state: ${sState}`);
+      log(`frame: ${sFrame}`);
+      log(`diff: ${sDiff}`);
+      log("...");
     }
-    log("...");
   }
 
   /**
@@ -673,12 +699,25 @@ async function main(): Promise<void> {
     event: string,
     detail: Record<string, unknown> = {},
   ): void {
-    log("...");
-    log(`event: ${event}`);
+    // Single multi-line block — one write call, one append — so the
+    // alt-screen sees nothing in --live mode and the default-mode stdout
+    // emits in one shot like the sidecar block.
+    const lines: string[] = ["...", `event: ${event}`];
     for (const [k, v] of Object.entries(detail)) {
-      log(`${k}: ${String(v)}`);
+      lines.push(`${k}: ${String(v)}`);
     }
-    log("...");
+    lines.push("...");
+    if (liveMode) {
+      try {
+        appendFileSync(lifecycleSidecar, `${lines.join("\n")}\n`);
+      } catch {
+        // best-effort
+      }
+    } else {
+      for (const line of lines) {
+        log(line);
+      }
+    }
     // On disconnect, clear `lastBody` so the next first-paint emits even
     // if the post-reconnect snapshot happens to match the last pre-
     // disconnect body byte-for-byte. (The helper resets its own collection
@@ -699,6 +738,15 @@ async function main(): Promise<void> {
     // Terminal restoration before subscription teardown.
     liveShell.dispose();
     handle.dispose();
+    // In --live mode chatter is suppressed during the session — surface
+    // the session sidecar paths to the user's restored terminal now so
+    // they can inspect the indexed history.
+    if (liveMode) {
+      log("...");
+      log(`meta: ${metaSidecar}`);
+      log(`lifecycle: ${lifecycleSidecar}`);
+      log("...");
+    }
     process.exit(0);
   });
 }

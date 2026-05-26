@@ -324,6 +324,44 @@ test("resize: debounced, then full re-render of current frame", () => {
   shell.dispose();
 });
 
+test("resize: force-paint clears the alt-screen before walking rows", () => {
+  // The force branch (resize) must wipe the alt-screen first so any rogue
+  // content from outside the differ's model — past stdout writes, terminal
+  // -side reflow, etc. — cannot survive the repaint. The clear lives inside
+  // SYNC_BEGIN/SYNC_END so supporting terminals still paint atomically.
+  const { shell, stdout, clock } = bootShell();
+  stdout.take();
+  shell.pushFrame(["x", "y"]);
+  stdout.take();
+
+  stdout.fireResize();
+  clock.flush();
+  const out = stdout.take();
+  // The clear-screen + home sequence appears between SYNC_BEGIN and the
+  // first row write — i.e. before any `\x1b[r;1H` row position.
+  const syncIdx = out.indexOf("\x1b[?2026h");
+  const clearIdx = out.indexOf("\x1b[2J\x1b[H");
+  const firstRowIdx = out.indexOf("\x1b[1;1H");
+  expect(syncIdx).toBe(0);
+  expect(clearIdx).toBeGreaterThan(syncIdx);
+  expect(clearIdx).toBeLessThan(firstRowIdx);
+  shell.dispose();
+});
+
+test("steady-state diff does NOT clear the alt-screen (only force paths do)", () => {
+  // Defensive: the non-force diff must not emit the clear-screen sequence —
+  // doing so would defeat the per-row diff. Only the resize force-paint
+  // path clears.
+  const { shell, stdout } = bootShell();
+  stdout.take();
+  shell.pushFrame(["a"]);
+  stdout.take();
+  shell.pushFrame(["b"]);
+  const out = stdout.take();
+  expect(out).not.toContain("\x1b[2J\x1b[H");
+  shell.dispose();
+});
+
 test("scroll-back: left arrow decrements viewIdx and updates banner without auto-snap", () => {
   const { shell, stdout, stdin } = bootShell();
   stdout.take();

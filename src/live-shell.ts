@@ -188,6 +188,12 @@ const LEAVE_ALT = "\x1b[?25h\x1b[?1049l\x1b[0m";
 const SYNC_BEGIN = "\x1b[?2026h";
 const SYNC_END = "\x1b[?2026l";
 const CLEAR_LINE = "\x1b[2K";
+// Erase entire alt-screen + home cursor — prepended to the force-repaint
+// buffer on SIGWINCH so any rogue content (from external stdout writes
+// outside `pushFrame`, terminal-side reflow, etc.) cannot survive a
+// resize. The differ's `prevLines` model becomes authoritative again
+// on the very next paint.
+const CLEAR_SCREEN_HOME = "\x1b[2J\x1b[H";
 
 function moveTo(row: number, col: number): string {
   return `\x1b[${row};${col}H`;
@@ -342,7 +348,12 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
     const next = [banner, ...body];
     const prev = force ? null : prevLines;
 
-    let buf = SYNC_BEGIN;
+    // Force-paint (resize): wipe the alt-screen first so any rogue
+    // content from outside the differ's model — past stdout writes,
+    // terminal-side reflow on resize, etc. — gets cleared. Lives inside
+    // the SYNC_BEGIN/END wrapper so supporting terminals still paint
+    // atomically.
+    let buf = SYNC_BEGIN + (force ? CLEAR_SCREEN_HOME : "");
     const maxLen = Math.max(next.length, prev?.length ?? 0);
     for (let i = 0; i < maxLen; i++) {
       const nextLine = next[i];

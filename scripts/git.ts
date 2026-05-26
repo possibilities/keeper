@@ -34,7 +34,12 @@ Usage: bun scripts/git.ts [--sock <path>] [--project-dir <path>] [--live]
                         Keys: ←/h/k prev frame, →/l/j next, g oldest,
                               G/End/Esc return to live, q/Ctrl-C quit.
                         Indexes the sidecars so past frames remain
-                        inspectable.
+                        inspectable. Per-frame paths and lifecycle events
+                        are NOT printed to stdout in --live mode (the
+                        alt-screen would scroll and corrupt the differ);
+                        lifecycle output is appended to
+                        /tmp/keeper-git.<pid>.lifecycle.txt. The session
+                        paths are printed once on exit.
   --help                Show this help
 
 Each frame is led by '---'. Rows show one planctl-backed git worktree, its
@@ -174,6 +179,10 @@ async function main(): Promise<void> {
   const diffSidecar = `/tmp/keeper-git.${process.pid}.diff.txt`;
   const prevFrameTmp = `/tmp/keeper-git.${process.pid}.prev.frame.txt`;
   const metaSidecar = `/tmp/keeper-git.${process.pid}.meta.txt`;
+  // `--live` mode owns the alt-screen, so per-frame / per-event chatter
+  // can't go to stdout (raw newline writes scroll the alt-screen and
+  // desync the per-line differ). Lifecycle events append here instead.
+  const lifecycleSidecar = `/tmp/keeper-git.${process.pid}.lifecycle.txt`;
 
   function log(s: string): void {
     process.stdout.write(`${s}\n`);
@@ -207,7 +216,13 @@ async function main(): Promise<void> {
         `${frameCount}\t${sState}\t${sFrame}\t${sDiff}\n`,
       );
     }
-    log(`...\nstate: ${sState}\nframe: ${sFrame}\ndiff: ${sDiff}\n...`);
+    // In --live mode the alt-screen is the canvas — chatter to stdout would
+    // scroll it and desync the per-line differ. The meta sidecar records
+    // every frame's indexed paths; the dispose summary surfaces them on
+    // exit.
+    if (!liveMode) {
+      log(`...\nstate: ${sState}\nframe: ${sFrame}\ndiff: ${sDiff}\n...`);
+    }
   }
 
   /**
@@ -233,12 +248,22 @@ async function main(): Promise<void> {
     event: string,
     detail: Record<string, unknown> = {},
   ): void {
-    log("...");
-    log(`event: ${event}`);
+    const lines: string[] = ["...", `event: ${event}`];
     for (const [k, v] of Object.entries(detail)) {
-      log(`${k}: ${String(v)}`);
+      lines.push(`${k}: ${String(v)}`);
     }
-    log("...");
+    lines.push("...");
+    if (liveMode) {
+      try {
+        appendFileSync(lifecycleSidecar, `${lines.join("\n")}\n`);
+      } catch {
+        // best-effort
+      }
+    } else {
+      for (const line of lines) {
+        log(line);
+      }
+    }
     // On disconnect, clear `lastFrame` so the next first-paint emits even
     // if the post-reconnect snapshot happens to match the last pre-
     // disconnect frame byte-for-byte. (The helper resets its own
@@ -266,6 +291,12 @@ async function main(): Promise<void> {
     // Terminal restoration before subscription teardown.
     liveShell.dispose();
     handle.dispose();
+    if (liveMode) {
+      log("...");
+      log(`meta: ${metaSidecar}`);
+      log(`lifecycle: ${lifecycleSidecar}`);
+      log("...");
+    }
     process.exit(0);
   });
 }
