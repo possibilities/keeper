@@ -130,5 +130,5 @@ and the example query around line 510.
 - [ ] Re-fold determinism test passes (byte-identical `epics.job_links` after rewind + DELETE + drain)
 
 ## Done summary
-
+Widened JobLinkEntry to {kind, job_id, title, state, rate_limited_at} via shared enrichJobLink helper; threaded through syncPlanctlLinks + new syncJobLinksOnJobWrite reverse fan-out + v20→v21 migration backfill; renderers and predicates read straight off the projection with no live-jobs join.
 ## Evidence
