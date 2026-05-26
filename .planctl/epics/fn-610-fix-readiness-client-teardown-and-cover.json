@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-610-fix-readiness-client-teardown-and-cover",
   "bundles": [],
+  "closer_done_at": "2026-05-26T00:05:30.880996Z",
   "created_at": "2026-05-25T23:52:14.066123Z",
   "depends_on_epics": [
     "fn-609-cover-readiness-client-lifecycle-and"
@@ -11,10 +12,10 @@
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "fix readiness-client teardown and cover backoff",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-25T23:52:14.066123Z"
+  "updated_at": "2026-05-26T00:05:30.880996Z"
 }
