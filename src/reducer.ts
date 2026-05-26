@@ -32,7 +32,18 @@
  *                       |   for the lifecycle write (the title rule still
  *                       |   runs). See `isKilledTaskNotification` in
  *                       |   `src/derivers.ts` for the modest-scope rationale.
- *   Stop                | state -> 'stopped'  (skipped on 'ended' or 'killed')
+ *   Stop                | state -> 'stopped'  (skipped on 'ended' or 'killed',
+ *                       |   AND skipped while any subagent_invocations row for
+ *                       |   this job is status='running' — the parent's Stop
+ *                       |   hook fires when it yields to a Task tool's sub-
+ *                       |   agent, but the session is conceptually still
+ *                       |   working until the sub returns AND any post-sub
+ *                       |   follow-up finishes on a subsequent real Stop.
+ *                       |   Without this guard the embedded JobLinkEntry.state
+ *                       |   flashes to 'stopped' mid-sub-agent, which clears
+ *                       |   readiness predicate 5 prematurely and lets
+ *                       |   predicate 7 fire job-pending at every SubagentStop
+ *                       |   — autopilot's approval notify then dup-fires.)
  *   SessionEnd          | state -> 'ended'    (skipped on 'killed' — the kill
  *                       |   signal carries proven-dead evidence and outranks)
  *   Killed              | state -> 'killed'   (synthetic; folds iff persisted
@@ -41,7 +52,17 @@
  *                       |   match. Race-recovered mismatches are no-ops.)
  *   RateLimited/ApiError| state -> 'stopped' AND (last_api_error_at,
  *                       |   last_api_error_kind) -> (event.ts, kind) — both
- *                       |   columns paired in a single UPDATE. (Synthetic;
+ *                       |   columns paired in a single UPDATE. The state flip
+ *                       |   is suppressed (via a CASE) while any
+ *                       |   subagent_invocations row for this job is
+ *                       |   status='running' — same rationale as Stop; the
+ *                       |   parent isn't actively making API calls while it
+ *                       |   waits on a sub-agent, but if an error annotation
+ *                       |   lands during that window the projection should
+ *                       |   record it WITHOUT misreporting the session as
+ *                       |   stopped. The (last_api_error_at, last_api_error_kind)
+ *                       |   pair stamps unconditionally so the annotation
+ *                       |   reading stays honest. (Synthetic;
  *                       |   skipped on 'ended' or 'killed' — same terminal
  *                       |   guard as Stop. Minted by main from a transcript
  *                       |   -worker `api-error` message when Claude Code
@@ -113,7 +134,12 @@ import {
   findPendingPreToolUseForStart,
   resolveBridgeAgentId,
 } from "./subagent-invocations";
-import type { ApiErrorKind, Event, JobLinkEntry } from "./types";
+import type {
+  ApiErrorKind,
+  Event,
+  InputRequestKind,
+  JobLinkEntry,
+} from "./types";
 
 /**
  * Default batch size for {@link drain}. Keeps each writer transaction short so
@@ -199,6 +225,54 @@ function extractApiErrorKind(event: Event): ApiErrorKind {
     return validateApiErrorKind(parsed?.kind);
   } catch {
     return "unknown";
+  }
+}
+
+/**
+ * Canonical `InputRequestKind` allow-list — string literals so the
+ * runtime validation `validateInputRequestKind` can `.has` against a
+ * Set. The values mirror {@link import("./types").InputRequestKind}
+ * exactly; if the type widens or narrows the set MUST be updated in
+ * lockstep. The fallback for an unrecognized value is the only union
+ * member (`"ask_user_question"`) — unlike `ApiErrorKind` there is no
+ * reserved `"unknown"` bucket, because the transcript matcher only
+ * fires `input-request` messages for kinds it has explicitly mapped
+ * (no upstream allow-list to bypass).
+ */
+const INPUT_REQUEST_KINDS: ReadonlySet<InputRequestKind> = new Set([
+  "ask_user_question",
+]);
+
+/**
+ * Validate an event's `data.kind` against the {@link InputRequestKind}
+ * union. Anything not in the canonical allow-list — including missing /
+ * non-string / unrecognized values — folds to `"ask_user_question"`,
+ * the single-member union's only value. Pure (no side effects, no
+ * throws); the fold arm calls it inside the open `BEGIN IMMEDIATE`
+ * transaction. Mirrors {@link validateApiErrorKind}'s shape minus the
+ * reserved `"unknown"` fallback.
+ */
+function validateInputRequestKind(raw: unknown): InputRequestKind {
+  if (typeof raw !== "string") {
+    return "ask_user_question";
+  }
+  return INPUT_REQUEST_KINDS.has(raw as InputRequestKind)
+    ? (raw as InputRequestKind)
+    : "ask_user_question";
+}
+
+/**
+ * Parse the `kind` out of an event's `data` blob for the `InputRequest`
+ * fold arm. Safe-parse: a malformed blob folds to `"ask_user_question"`
+ * (never throws inside the fold transaction). Mirrors
+ * {@link extractApiErrorKind} step-for-step.
+ */
+function extractInputRequestKind(event: Event): InputRequestKind {
+  try {
+    const parsed = JSON.parse(event.data) as { kind?: unknown };
+    return validateInputRequestKind(parsed?.kind);
+  } catch {
+    return "ask_user_question";
   }
 }
 
@@ -1376,6 +1450,8 @@ interface EmbeddedJobElement {
   last_event_id: number;
   last_api_error_at: number | null;
   last_api_error_kind: string | null;
+  last_input_request_at: number | null;
+  last_input_request_kind: string | null;
 }
 
 /**
@@ -1393,6 +1469,8 @@ interface JobsRowForSync {
   last_event_id: number;
   last_api_error_at: number | null;
   last_api_error_kind: string | null;
+  last_input_request_at: number | null;
+  last_input_request_kind: string | null;
 }
 
 /**
@@ -1452,6 +1530,8 @@ function buildEmbeddedJob(row: JobsRowForSync): EmbeddedJobElement {
     last_event_id: row.last_event_id,
     last_api_error_at: row.last_api_error_at,
     last_api_error_kind: row.last_api_error_kind,
+    last_input_request_at: row.last_input_request_at,
+    last_input_request_kind: row.last_input_request_kind,
   };
 }
 
@@ -1670,7 +1750,7 @@ function syncIfPlanRef(
 ): void {
   const row = db
     .query(
-      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = ?",
+      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind FROM jobs WHERE job_id = ?",
     )
     .get(jobId) as JobsRowForSync | null;
   if (row == null) {
@@ -1791,13 +1871,15 @@ function sortJobLinks(
 function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
   const row = db
     .query(
-      "SELECT title, state, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = ?",
+      "SELECT title, state, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind FROM jobs WHERE job_id = ?",
     )
     .get(classifierEntry.job_id) as {
     title: string | null;
     state: string;
     last_api_error_at: number | null;
     last_api_error_kind: string | null;
+    last_input_request_at: number | null;
+    last_input_request_kind: string | null;
   } | null;
   if (row == null) {
     return {
@@ -1807,6 +1889,8 @@ function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     };
   }
   return {
@@ -1816,6 +1900,8 @@ function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
     state: row.state,
     last_api_error_at: row.last_api_error_at,
     last_api_error_kind: row.last_api_error_kind,
+    last_input_request_at: row.last_input_request_at,
+    last_input_request_kind: row.last_input_request_kind,
   };
 }
 
@@ -2274,6 +2360,20 @@ function projectJobsRow(db: Database, event: Event): void {
              start_time = COALESCE(excluded.start_time, jobs.start_time),
              config_dir = COALESCE(excluded.config_dir, jobs.config_dir),
              state = CASE WHEN jobs.state IN ('${ENDED}','${KILLED}') THEN 'stopped' ELSE jobs.state END,
+             -- Schema v25: unconditional paired clear on every SessionStart
+             -- (including resume). A SessionStart means a live process is
+             -- attached, so any pending input-request annotation is stale:
+             -- if the question still matters, the next user prompt will
+             -- come fresh (and re-trigger via the matcher); if the human
+             -- moved on (most resume cases), the stale annotation must not
+             -- linger. Cheap when already NULL — no-op write. Paired:
+             -- both columns clear together — see
+             -- {@link import("./types").JobLinkEntry}'s paired-NULL
+             -- invariant. SessionStart is rare (once per session boot/
+             -- resume), so the unconditional write — versus a gated one —
+             -- is the trivially-cheap shape.
+             last_input_request_at = NULL,
+             last_input_request_kind = NULL,
              last_event_id = excluded.last_event_id,
              updated_at = excluded.updated_at`,
           [
@@ -2359,10 +2459,20 @@ function projectJobsRow(db: Database, event: Event): void {
       // move together — no code path may clear one without the other,
       // see {@link import("./types").JobLinkEntry}'s paired-NULL
       // invariant).
+      //
+      // Schema v25 extends the same paired-clear to
+      // `last_input_request_at` + `last_input_request_kind`: a fresh
+      // prompt means the human answered the pending `AskUserQuestion`
+      // (or whatever interactive built-in tool was blocking), so the
+      // "this stoppage was input-request-caused" annotation no longer
+      // applies either. Unconditional (cheap, no-op when already NULL)
+      // and paired with its sibling column.
       db.run(
         `UPDATE jobs SET state = 'working',
                          last_api_error_at = NULL,
                          last_api_error_kind = NULL,
+                         last_input_request_at = NULL,
+                         last_input_request_kind = NULL,
                          pid = COALESCE(?, pid),
                          start_time = CASE
                            WHEN ? IS NOT NULL AND ? != pid THEN NULL
@@ -2383,6 +2493,31 @@ function projectJobsRow(db: Database, event: Event): void {
       // synthetic Killed event). After a real re-open (SessionStart or
       // UserPromptSubmit) the row is no longer terminal, so a normal post-resume
       // Stop applies here as usual.
+      //
+      // Sub-agent guard: when Claude Code's parent agent dispatches a Task
+      // tool, it emits Stop and yields to the sub-agent (sub-agent events
+      // share the parent session_id; the parent's hook stream genuinely sees
+      // a Stop). Conceptually the session is still working until the sub-
+      // agent returns AND any post-sub follow-up emits a subsequent real Stop.
+      // Honoring the mid-yield Stop drops state to 'stopped' while a sub is
+      // running, which clears readiness predicate 5 prematurely — predicate 7
+      // then fires `job-pending` the moment SubagentStop lands (if approval is
+      // already pending), and autopilot's approval-notify dup-fires when the
+      // parent resumes and Stops a second time. Skip the state flip while any
+      // subagent_invocations row for this job is still status='running'.
+      //
+      // Re-fold determinism: subagent_invocations reflects every SubagentStart
+      // / SubagentStop folded with id < event.id (sequential fold), so the
+      // running-check is a pure function of the event log up to this point.
+      const subRunning = db
+        .query(
+          `SELECT 1 FROM subagent_invocations
+            WHERE job_id = ? AND status = 'running' LIMIT 1`,
+        )
+        .get(jobId);
+      if (subRunning != null) {
+        break;
+      }
       const res = db.run(
         `UPDATE jobs SET state = 'stopped', last_event_id = ?, updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
@@ -2503,8 +2638,24 @@ function projectJobsRow(db: Database, event: Event): void {
         event.hook_event === "RateLimited"
           ? "rate_limit"
           : extractApiErrorKind(event);
+      // Sub-agent guard (mirrors Stop): suppress the state flip while any
+      // subagent_invocations row for this job is status='running'. The
+      // parent isn't actively making API calls while it waits on a sub-
+      // agent, but an api-error annotation may still land in that window
+      // (synthetic minting from the transcript-worker is independent of
+      // sub-agent lifecycle). Stamp the (last_api_error_at, last_api_error_kind)
+      // pair unconditionally — that's the honest annotation reading — while
+      // keeping state at its pre-event value via CASE. Pure function of the
+      // event log up to event.id (sequential fold of SubagentStart/Stop).
       const res = db.run(
-        `UPDATE jobs SET state = 'stopped',
+        `UPDATE jobs SET state = CASE
+                           WHEN EXISTS (
+                             SELECT 1 FROM subagent_invocations
+                              WHERE job_id = jobs.job_id
+                                AND status = 'running'
+                           ) THEN state
+                           ELSE 'stopped'
+                         END,
                          last_api_error_at = ?,
                          last_api_error_kind = ?,
                          last_event_id = ?,
@@ -2521,17 +2672,120 @@ function projectJobsRow(db: Database, event: Event): void {
       break;
     }
 
+    case "InputRequest": {
+      // Synthetic event (schema v25) minted by main from a transcript-worker
+      // `input-request` message — Claude Code used a built-in interactive
+      // tool that fires no hook of its own (initially `AskUserQuestion`).
+      // The session is blocked on a human answer that has not yet arrived,
+      // so the lifecycle column flips to `'stopped'` AND the pair
+      // `(last_input_request_at, last_input_request_kind)` stamps to the
+      // event ts + the matched {@link import("./types").InputRequestKind}.
+      //
+      // Clone of the v24 `RateLimited`/`ApiError` arm in structural shape:
+      // one compound UPDATE that writes the lifecycle column + the
+      // annotation pair together (paired-NULL invariant — CLAUDE.md
+      // "schema defaults match zero-event projection"; no code path may
+      // stamp one column of the pair without the other). Same terminal
+      // guard as Stop / ApiError: a stray InputRequest on an already-
+      // terminal row must NOT resurrect it (and must not stamp the
+      // annotation onto a row whose lifecycle is already `ended` /
+      // `killed` for unrelated reasons — the input-request signal is by
+      // definition mid-life).
+      //
+      // `extractInputRequestKind` reads `data.kind` and routes through
+      // {@link validateInputRequestKind} (anything not in the canonical
+      // allow-list folds to `"ask_user_question"` — the single-member
+      // union's only value, mirroring fn-616's `ApiError` "unknown"
+      // fallback shape but without a reserved `"unknown"` member, since
+      // the transcript matcher only mints messages for kinds it has
+      // explicitly mapped).
+      //
+      // **Why a synthetic event, not a hook event?** `AskUserQuestion`
+      // fires no Pre/PostToolUse hook of its own (verified empirically
+      // against two real AskUserQuestion sessions). The transcript-worker
+      // matcher (lands in task .2) is the only place we can detect the
+      // tool use; main mints the `InputRequest` synthetic carrying the
+      // session id + matched kind, and this arm folds it identically to
+      // the api-error arm shape. The clear paths (`UserPromptSubmit` /
+      // `SessionStart` unconditional; `PreToolUse` / `PostToolUse` gated)
+      // run from the regular hook events — see those arms for the
+      // "closest answered signal" rationale.
+      const kind = extractInputRequestKind(event);
+      const res = db.run(
+        `UPDATE jobs SET state = 'stopped',
+                         last_input_request_at = ?,
+                         last_input_request_kind = ?,
+                         last_event_id = ?,
+                         updated_at = ?
+           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
+        [ts, kind, event.id, ts, jobId],
+      );
+      // Sync only when the UPDATE actually wrote — a guarded no-op on a
+      // still-terminal row must NOT re-fan the embedded entry (it would
+      // re-write a stale-but-unchanged element with the new event_id).
+      if (res.changes > 0) {
+        syncIfPlanRef(db, jobId, event.id, ts);
+      }
+      break;
+    }
+
+    case "PreToolUse":
+    case "PostToolUse": {
+      // Hot-path clear (~50+ fires per turn). `AskUserQuestion` fires no
+      // Pre/PostToolUse hook of its own, so the closest "answered" signal
+      // is the next tool the agent uses — once any other tool fires, the
+      // human has answered the question and the session is no longer
+      // blocked, so we zero the input-request pair.
+      //
+      // Gated on `last_input_request_at IS NOT NULL` so the unconditional
+      // `UPDATE jobs SET ... WHERE job_id = ?` only fires when there is
+      // actually something to clear — without the gate, every tool call
+      // in every session would no-op-write the pair to NULL (already
+      // NULL), churning `last_event_id` / `updated_at` and re-fanning
+      // every embedded array. The gate keeps the cost at zero for the
+      // overwhelming majority of tool calls (no prior input-request) and
+      // pays only when the pair actually needs clearing.
+      //
+      // Paired clear (CLAUDE.md "schema defaults match zero-event
+      // projection"): both columns NULL together — no code path may
+      // clear one without the other.
+      //
+      // Sync gated on the UPDATE actually firing (changes > 0): a no-op
+      // clear must NOT re-fan the embedded entry. The gate is a SELECT-
+      // free predicate that re-runs at WHERE time, so the UPDATE's
+      // `changes > 0` is the authoritative signal.
+      const res = db.run(
+        `UPDATE jobs SET last_input_request_at = NULL,
+                         last_input_request_kind = NULL,
+                         last_event_id = ?,
+                         updated_at = ?
+           WHERE job_id = ? AND last_input_request_at IS NOT NULL`,
+        [event.id, ts, jobId],
+      );
+      if (res.changes > 0) {
+        syncIfPlanRef(db, jobId, event.id, ts);
+      }
+      break;
+    }
+
     default:
-      // PreToolUse, PostToolUse, PostToolUseFailure, Notification, and any
-      // unknown forward-compat event: no lifecycle write. Cursor still advances
-      // upstream. (No terminal guard needed — these branches never write the
-      // state column.) The `Pre/PostToolUse[Failure]` rows ALSO feed
+      // PostToolUseFailure, Notification, and any unknown forward-compat
+      // event: no lifecycle write. Cursor still advances upstream. (No
+      // terminal guard needed — these branches never write the state
+      // column.) The `Pre/PostToolUse[Failure]` rows ALSO feed
       // `projectSubagentInvocationsRow` (via the per-event dispatch in
-      // `applyEvent`); the no-op here is specifically the *jobs* projection.
-      // SubagentStart / SubagentStop, formerly listed here as no-ops, are
-      // dispatched out of `applyEvent` to `projectSubagentInvocationsRow` —
-      // they still never touch `jobs` (no lifecycle column writes), so the
-      // `jobs` arm stays a no-op for them.
+      // `applyEvent`); the no-op here is specifically the *jobs*
+      // projection. SubagentStart / SubagentStop, formerly listed here
+      // as no-ops, are dispatched out of `applyEvent` to
+      // `projectSubagentInvocationsRow` — they still never touch `jobs`
+      // (no lifecycle column writes), so the `jobs` arm stays a no-op
+      // for them.
+      //
+      // Schema v25 lifts `PreToolUse` and `PostToolUse` out of this
+      // default arm into their own gated-clear case (above) — but only
+      // for the `last_input_request_*` paired clear. The post-switch
+      // planctl fan-out + title precedence rule still fire for those
+      // events because they live OUTSIDE the switch.
       break;
   }
 

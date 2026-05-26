@@ -521,6 +521,138 @@ test("Stop moves state to stopped", () => {
   expect(getJob()?.state).toBe("stopped");
 });
 
+test("Stop is a no-op on state while a sub-agent is running (parent yielded to Task)", () => {
+  // When the parent agent dispatches a Task tool, Claude Code emits Stop and
+  // yields control to the sub-agent — but conceptually the session is still
+  // working until the sub returns AND any post-sub follow-up Stops. Honoring
+  // the mid-yield Stop would clear readiness predicate 5 prematurely and let
+  // predicate 7 dup-fire (see autopilot's approval-pending notify).
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-1",
+    agent_type: "Explore",
+  });
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  // State stays 'working' — Stop landed during the sub-agent's run.
+  expect(getJob()?.state).toBe("working");
+});
+
+test("Stop after SubagentStop flips state to stopped (final post-sub Stop)", () => {
+  // The honest read of the user's mental model: Stop is a real lifecycle
+  // signal only when no sub-agent is still in flight. The exact bug repro
+  // sequence: parent yields to sub via Stop, sub finishes, parent resumes
+  // via UserPromptSubmit, parent finishes with a real Stop — and ONLY this
+  // final Stop drops state to 'stopped'.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-2",
+    agent_type: "plan:worker-high",
+  });
+  // Mid-yield Stop while sub-2 is running — should be a state no-op.
+  insertEvent({ hook_event: "Stop" });
+  // Sub finishes.
+  insertEvent({ hook_event: "SubagentStop", agent_id: "sub-2" });
+  // Parent resumes (Claude Code feeds sub results back via UserPromptSubmit).
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  // Parent's real final Stop — no sub running now, this one applies.
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+});
+
+test("Stop guard handles multiple concurrent sub-agents (releases only when ALL done)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-a",
+    agent_type: "Explore",
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-b",
+    agent_type: "Explore",
+  });
+  // Stop while BOTH subs are running — no-op.
+  insertEvent({ hook_event: "Stop" });
+  insertEvent({ hook_event: "SubagentStop", agent_id: "sub-a" });
+  // Stop while sub-b is still running — still a no-op.
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  // Sub-b finishes, then parent emits its real Stop.
+  insertEvent({ hook_event: "SubagentStop", agent_id: "sub-b" });
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+});
+
+test("ApiError during a sub-agent run stamps annotation without flipping state", () => {
+  // Mirror of the Stop guard for the synthetic api-error fold: the (last_
+  // api_error_at, last_api_error_kind) pair must stamp honestly even while
+  // a sub-agent runs, but the state flip is suppressed so the session keeps
+  // reading as 'working' for readiness predicate 5.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-api",
+    agent_type: "Explore",
+  });
+  insertEvent({
+    hook_event: "ApiError",
+    data: JSON.stringify({ kind: "rate_limit" }),
+  });
+  drainAll();
+  const job = db
+    .query(
+      "SELECT state, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-a") as {
+    state: string;
+    last_api_error_at: number | null;
+    last_api_error_kind: string | null;
+  };
+  expect(job.state).toBe("working");
+  expect(job.last_api_error_at).not.toBeNull();
+  expect(job.last_api_error_kind).toBe("rate_limit");
+});
+
+test("from-scratch re-fold of a sub-agent yield sequence is byte-deterministic", () => {
+  // The sub-agent-aware Stop guard reads subagent_invocations, but every
+  // SubagentStart/Stop was folded with a strictly-lower event id, so the
+  // running-check is a pure function of the event log up to the Stop. Re-
+  // fold from scratch must reproduce the same final state.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-rf",
+    agent_type: "Explore",
+  });
+  insertEvent({ hook_event: "Stop" });
+  insertEvent({ hook_event: "SubagentStop", agent_id: "sub-rf" });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  const firstJob = getJob();
+  expect(firstJob?.state).toBe("stopped");
+
+  // Rewind cursor + wipe projections, then re-drain the same event log.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM subagent_invocations");
+  drainAll();
+  const reJob = getJob();
+  expect(reJob?.state).toBe("stopped");
+  expect(reJob?.last_event_id).toBe(firstJob?.last_event_id);
+});
+
 test("SessionEnd moves state to ended", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "SessionEnd" });
@@ -3120,11 +3252,12 @@ function getEpicLinks(sessionId: string): { kind: string; target: string }[] {
 }
 
 /**
- * Read the persisted `epics.job_links` as a real array of the schema-v24
+ * Read the persisted `epics.job_links` as a real array of the schema-v25
  * widened JobLinkEntry shape
- * `{kind, job_id, title, state, last_api_error_at, last_api_error_kind}`.
- * The reducer's `enrichJobLink` helper denormalizes the last four fields
- * off the linked `jobs` row at write time.
+ * `{kind, job_id, title, state, last_api_error_at, last_api_error_kind,
+ * last_input_request_at, last_input_request_kind}`. The reducer's
+ * `enrichJobLink` helper denormalizes the last six fields off the linked
+ * `jobs` row at write time.
  */
 function getJobLinks(epicId: string): {
   kind: string;
@@ -3133,6 +3266,8 @@ function getJobLinks(epicId: string): {
   state: string;
   last_api_error_at: number | null;
   last_api_error_kind: string | null;
+  last_input_request_at: number | null;
+  last_input_request_kind: string | null;
 }[] {
   const row = db
     .query("SELECT job_links FROM epics WHERE epic_id = ?")
@@ -3165,6 +3300,8 @@ test("syncPlanctlLinks: single-session single-window one creator emits creator e
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
 });
@@ -3203,6 +3340,8 @@ test("syncPlanctlLinks: single-session two windows creator-then-refiner-same-epi
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
     {
       kind: "refiner",
@@ -3211,6 +3350,8 @@ test("syncPlanctlLinks: single-session two windows creator-then-refiner-same-epi
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
 });
@@ -3273,6 +3414,8 @@ test("syncPlanctlLinks: two sessions touching the same epic both appear in job_l
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
     {
       kind: "refiner",
@@ -3281,6 +3424,8 @@ test("syncPlanctlLinks: two sessions touching the same epic both appear in job_l
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
 });
@@ -3362,6 +3507,8 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
     {
       kind: "refiner",
@@ -3370,6 +3517,8 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
 
@@ -3409,6 +3558,8 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
     {
       kind: "refiner",
@@ -3417,6 +3568,8 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
 });
@@ -3441,6 +3594,8 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
   // Now fold an EpicSnapshot for the same epic — the ON CONFLICT clause
@@ -3469,6 +3624,8 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
 });
@@ -3549,6 +3706,8 @@ test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded 
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
 
@@ -3565,6 +3724,8 @@ test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded 
       state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
 
@@ -3943,6 +4104,8 @@ test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other 
     state: "working",
     last_api_error_at: null,
     last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
   });
   // B: untouched (state still default "stopped").
   expect(after[1]).toEqual({
@@ -3952,6 +4115,8 @@ test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other 
     state: "stopped",
     last_api_error_at: null,
     last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
   });
 });
 
@@ -4034,6 +4199,8 @@ test("syncPlanctlLinks: missing jobs row at enrichment defaults to safe values (
       state: "stopped",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
 });
@@ -4069,6 +4236,8 @@ test("syncPlanctlLinks: widened-shape EpicSnapshot ON CONFLICT does not blank en
       state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
 
@@ -4092,6 +4261,8 @@ test("syncPlanctlLinks: widened-shape EpicSnapshot ON CONFLICT does not blank en
       state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
     },
   ]);
 });
@@ -5330,4 +5501,342 @@ test("jobs.config_dir is byte-identical on rewind-and-redrain (re-fold determini
   drainAll();
   const after = db.query("SELECT * FROM jobs WHERE job_id = ?").get("sess-a");
   expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
+// InputRequest fold (schema v25, fn-617 task .1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read just `state` + the input-request pair off a jobs row by id. Used by
+ * the fn-617 task .1 tests to assert the paired-NULL invariant + the
+ * terminal guard.
+ */
+function getInputRequestState(jobId: string): {
+  state: string;
+  last_input_request_at: number | null;
+  last_input_request_kind: string | null;
+} | null {
+  return db
+    .query(
+      "SELECT state, last_input_request_at, last_input_request_kind FROM jobs WHERE job_id = ?",
+    )
+    .get(jobId) as {
+    state: string;
+    last_input_request_at: number | null;
+    last_input_request_kind: string | null;
+  } | null;
+}
+
+test("InputRequest fold: stamps both columns + flips state to 'stopped'", () => {
+  // The keystone bullet of fn-617 task .1: a synthetic `InputRequest`
+  // event minted from a transcript-worker `input-request` message flips
+  // jobs.state to 'stopped' AND stamps `(last_input_request_at,
+  // last_input_request_kind)` to the event ts + the matched kind in a
+  // single compound UPDATE.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir" });
+  drainAll();
+  const before = getInputRequestState("sess-ir");
+  expect(before?.state).toBe("working");
+  expect(before?.last_input_request_at).toBeNull();
+  expect(before?.last_input_request_kind).toBeNull();
+
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-ir",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  drainAll();
+  const after = getInputRequestState("sess-ir");
+  expect(after?.state).toBe("stopped");
+  expect(after?.last_input_request_at).not.toBeNull();
+  expect(after?.last_input_request_kind).toBe("ask_user_question");
+});
+
+test("InputRequest fold: terminal-row guard preserved — InputRequest on 'ended' / 'killed' row does NOT resurrect (both columns stay NULL)", () => {
+  // Negative-coverage gate on the terminal guard cloned from the v24
+  // RateLimited/ApiError arm. A stray late-arriving InputRequest on an
+  // already-terminal row must NOT mid-life-stamp it.
+
+  // 'ended' row.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-ended" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-ended" });
+  insertEvent({ hook_event: "SessionEnd", session_id: "sess-ir-ended" });
+  drainAll();
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-ir-ended",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  drainAll();
+  const ended = getInputRequestState("sess-ir-ended");
+  expect(ended?.state).toBe("ended");
+  expect(ended?.last_input_request_at).toBeNull();
+  expect(ended?.last_input_request_kind).toBeNull();
+
+  // 'killed' row — hand-set lifecycle to test the SQL predicate directly
+  // (mirrors the v24 ApiError terminal-guard test shape).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-killed" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-killed" });
+  drainAll();
+  db.run("UPDATE jobs SET state = 'killed' WHERE job_id = 'sess-ir-killed'");
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-ir-killed",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  drainAll();
+  const killed = getInputRequestState("sess-ir-killed");
+  expect(killed?.state).toBe("killed");
+  expect(killed?.last_input_request_at).toBeNull();
+  expect(killed?.last_input_request_kind).toBeNull();
+});
+
+test("InputRequest fold: data.kind outside the canonical allow-list folds to 'ask_user_question'", () => {
+  // Single-member union sanity gate. Unlike `ApiErrorKind`, there is no
+  // reserved `"unknown"` fallback — every unrecognized value folds to
+  // the only member, `"ask_user_question"`. The matcher is expected to
+  // only emit `input-request` messages for kinds it has explicitly
+  // mapped, but the reducer must still be defensive (malformed blob /
+  // unknown-string / missing-kind) to satisfy the never-throw-inside-
+  // fold invariant.
+  for (const [variant, payload] of [
+    ["garbage-string", { kind: "not-a-real-kind" }],
+    ["non-string", { kind: 42 }],
+    ["missing", {}],
+  ] as const) {
+    const sessionId = `sess-ir-${variant}`;
+    insertEvent({ hook_event: "SessionStart", session_id: sessionId });
+    insertEvent({ hook_event: "UserPromptSubmit", session_id: sessionId });
+    insertEvent({
+      hook_event: "InputRequest",
+      session_id: sessionId,
+      data: JSON.stringify(payload),
+    });
+  }
+  drainAll();
+  for (const variant of ["garbage-string", "non-string", "missing"]) {
+    const row = getInputRequestState(`sess-ir-${variant}`);
+    expect(row?.state).toBe("stopped");
+    expect(row?.last_input_request_kind).toBe("ask_user_question");
+    expect(row?.last_input_request_at).not.toBeNull();
+  }
+});
+
+test("InputRequest clear arms: UserPromptSubmit clears the pair (paired-NULL clear) and flips state to 'working'", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-ups" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-ups" });
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-ir-ups",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  drainAll();
+  const blocked = getInputRequestState("sess-ir-ups");
+  expect(blocked?.state).toBe("stopped");
+  expect(blocked?.last_input_request_at).not.toBeNull();
+  expect(blocked?.last_input_request_kind).toBe("ask_user_question");
+
+  // The human answers — UserPromptSubmit unconditionally clears BOTH
+  // columns of the pair (paired-NULL invariant) and flips state to
+  // 'working'.
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-ups" });
+  drainAll();
+  const revived = getInputRequestState("sess-ir-ups");
+  expect(revived?.state).toBe("working");
+  expect(revived?.last_input_request_at).toBeNull();
+  expect(revived?.last_input_request_kind).toBeNull();
+});
+
+test("InputRequest clear arms: SessionStart resume clears the pair (paired-NULL clear)", () => {
+  // Set up a blocked row, then drive a resume via a duplicate SessionStart.
+  // The ON CONFLICT branch is what fires on resume; that's the v25-extended
+  // clear path.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-ss" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-ss" });
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-ir-ss",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  drainAll();
+  const blocked = getInputRequestState("sess-ir-ss");
+  expect(blocked?.last_input_request_at).not.toBeNull();
+  expect(blocked?.last_input_request_kind).toBe("ask_user_question");
+
+  // Duplicate SessionStart — resume. The ON CONFLICT branch unconditionally
+  // clears the input-request pair (paired-NULL invariant); the rest of the
+  // ON CONFLICT semantics (terminal→stopped, pid/start_time COALESCE) are
+  // unaffected.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-ss" });
+  drainAll();
+  const resumed = getInputRequestState("sess-ir-ss");
+  expect(resumed?.last_input_request_at).toBeNull();
+  expect(resumed?.last_input_request_kind).toBeNull();
+});
+
+test("InputRequest clear arms: PreToolUse + PostToolUse clear the pair (gated on IS NOT NULL)", () => {
+  // The hot-path clear arms: AskUserQuestion fires no hook of its own, so
+  // the closest "answered" signal is the next tool the agent uses. The
+  // gate on `last_input_request_at IS NOT NULL` keeps the cost at zero
+  // for the overwhelming majority of tool calls — without the gate, every
+  // tool call in every session would no-op-write the pair to NULL.
+
+  // PreToolUse arm: blocked → PreToolUse clears.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-pre" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-pre" });
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-ir-pre",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  drainAll();
+  expect(
+    getInputRequestState("sess-ir-pre")?.last_input_request_at,
+  ).not.toBeNull();
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-ir-pre",
+  });
+  drainAll();
+  expect(getInputRequestState("sess-ir-pre")?.last_input_request_at).toBeNull();
+  expect(
+    getInputRequestState("sess-ir-pre")?.last_input_request_kind,
+  ).toBeNull();
+
+  // PostToolUse arm: blocked → PostToolUse clears.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-post" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-post" });
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-ir-post",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  drainAll();
+  expect(
+    getInputRequestState("sess-ir-post")?.last_input_request_at,
+  ).not.toBeNull();
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-ir-post",
+  });
+  drainAll();
+  expect(
+    getInputRequestState("sess-ir-post")?.last_input_request_at,
+  ).toBeNull();
+  expect(
+    getInputRequestState("sess-ir-post")?.last_input_request_kind,
+  ).toBeNull();
+});
+
+test("InputRequest clear gate: PreToolUse/PostToolUse on a session with last_input_request_at IS NULL does NOT touch jobs (no last_event_id bump)", () => {
+  // Hot-path no-op gate: without the `IS NOT NULL` predicate, every tool
+  // call in every session would no-op-write the pair (already NULL),
+  // bumping last_event_id + updated_at and re-fanning embedded arrays.
+  // Pin the gate by asserting `last_event_id` does NOT advance past the
+  // pre-tool-call snapshot when there's no annotation to clear.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-gate" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-gate" });
+  drainAll();
+  const before = db
+    .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
+    .get("sess-ir-gate") as { last_event_id: number };
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-ir-gate",
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-ir-gate",
+  });
+  drainAll();
+  const after = db
+    .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
+    .get("sess-ir-gate") as { last_event_id: number };
+  // No clear-arm UPDATE fired, so jobs.last_event_id stayed at the
+  // UserPromptSubmit event id. (PreToolUse / PostToolUse have no other
+  // jobs-write path on this session — no plan_ref, no planctl_op.)
+  expect(after.last_event_id).toBe(before.last_event_id);
+});
+
+test("InputRequest re-fold determinism: rewind-and-redrain reproduces byte-identical jobs row", () => {
+  // CLAUDE.md byte-identical re-fold invariant: a from-scratch re-fold of
+  // the event log must reproduce jobs row byte-for-byte. Exercises the
+  // InputRequest stamp + a clear arm (UserPromptSubmit).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-redrain" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-ir-redrain",
+  });
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-ir-redrain",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  // Then a fresh prompt clears the pair — exercises both the stamp arm
+  // and the unconditional UPS clear arm on re-fold.
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-ir-redrain",
+  });
+  drainAll();
+  const before = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-ir-redrain");
+  expect(before).not.toBeNull();
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-ir-redrain");
+  expect(after).toEqual(before);
+});
+
+test("syncJobLinksOnJobWrite: InputRequest stamp propagates to epics.job_links; UPS revival clears it", () => {
+  // Mirrors the v24 RateLimited link-fan-out test shape: a session linked
+  // to an epic gets blocked → the reverse fan-out propagates the
+  // input-request pair into the linked epic's `epics.job_links[]` entry;
+  // a fresh UserPromptSubmit revives → the reverse fan-out propagates
+  // the paired clear back into the link entry.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-link" });
+  planPlanOpener("sess-ir-link");
+  planctlEvent({
+    sessionId: "sess-ir-link",
+    op: "epic-create",
+    target: "fn-15-ir",
+    epicId: "fn-15-ir",
+    subjectPresent: true,
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-link" });
+  drainAll();
+  // Initial: both fields NULL on the link entry.
+  expect(getJobLinks("fn-15-ir")[0]?.last_input_request_at).toBeNull();
+  expect(getJobLinks("fn-15-ir")[0]?.last_input_request_kind).toBeNull();
+
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-ir-link",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  drainAll();
+  const blocked = getJobLinks("fn-15-ir")[0];
+  expect(blocked?.state).toBe("stopped");
+  expect(blocked?.last_input_request_at).not.toBeNull();
+  expect(blocked?.last_input_request_kind).toBe("ask_user_question");
+
+  // Revival via UserPromptSubmit — reverse fan-out propagates the paired
+  // clear to the embedded entry.
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-link" });
+  drainAll();
+  const revived = getJobLinks("fn-15-ir")[0];
+  expect(revived?.state).toBe("working");
+  expect(revived?.last_input_request_at).toBeNull();
+  expect(revived?.last_input_request_kind).toBeNull();
 });
