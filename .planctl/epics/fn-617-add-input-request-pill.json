@@ -2,9 +2,11 @@
   "branch_name": "fn-617-add-input-request-pill",
   "bundles": [],
   "created_at": "2026-05-26T22:04:02.585742Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-616-generalize-api-error-pill"
+  ],
   "id": "fn-617-add-input-request-pill",
-  "last_validated_at": "2026-05-26T22:04:02.655895Z",
+  "last_validated_at": "2026-05-26T22:04:13.100029Z",
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -14,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-26T22:04:02.585742Z"
+  "updated_at": "2026-05-26T22:04:13.015233Z"
 }
