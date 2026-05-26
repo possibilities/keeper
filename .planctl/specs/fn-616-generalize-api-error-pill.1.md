@@ -71,5 +71,5 @@ Order of operations inside the task (single PR, but logical sub-steps for review
 - [ ] `bun test` passes; existing rate-limit tests pass under the renamed columns (this is the keystone — the historical event log re-folds deterministically).
 
 ## Done summary
-
+Widened jobs.rate_limited_at into the two-field (last_api_error_at, last_api_error_kind) pair across types/reducer/collections, landed v23→v24 rewind-and-redrain migration, and converted the RateLimited fold into a dual-case alias over RateLimited|ApiError so the historical event log re-folds byte-deterministically with kind='rate_limit'. Added dual-case alias coverage + canonical kind round-trip + unknown-fallback + terminal-row guard reducer tests; added a v23→v24 migration test that pins the rewind-then-redrain rebuilds projections via the dual-case alias. board.ts call sites read the new field name (preserves the [limited] pill text until task .3 widens it into [failed:<kind>]).
 ## Evidence
