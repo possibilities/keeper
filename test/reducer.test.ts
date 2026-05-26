@@ -3468,6 +3468,50 @@ test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other 
   });
 });
 
+test("syncJobLinksOnJobWrite: Killed state flip propagates to epics.job_links", () => {
+  // CLAUDE.md invariant: "a `state` flip on UserPromptSubmit / Stop /
+  // SessionEnd / Killed / RateLimited … propagates to every epic that
+  // references the session." The Stop / UserPromptSubmit / RateLimited
+  // arms are covered above; pin the Killed arm here.
+  //
+  // Seed: SessionStart with explicit (pid, start_time) so the Killed
+  // event's strict-match path fires (the loose pid-only branch is the
+  // legacy-row exception, not what we want to exercise). Then drive a
+  // planctl creator edge so `jobs.epic_links` is non-empty and the
+  // reverse fan-out has a target.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-kill",
+    pid: 7777,
+    start_time: "macos:Wed May 26 12:00:00 2026",
+  });
+  planPlanOpener("sess-kill");
+  planctlEvent({
+    sessionId: "sess-kill",
+    op: "epic-create",
+    target: "fn-17-kill",
+    epicId: "fn-17-kill",
+    subjectPresent: true,
+  });
+  // UserPromptSubmit must carry the same pid as SessionStart — a
+  // pid-change clears start_time to NULL (the legacy-loose path) and
+  // would defeat the strict-match Killed exercise.
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-kill",
+    pid: 7777,
+  });
+  drainAll();
+  expect(getJobLinks("fn-17-kill")[0]?.state).toBe("working");
+
+  // Killed with matching (pid, start_time) → jobs.state flips to
+  // "killed"; syncIfPlanRef → syncJobLinksOnJobWrite re-stamps the
+  // linked epic's entry.
+  killedEvent(7777, "macos:Wed May 26 12:00:00 2026", "sess-kill");
+  drainAll();
+  expect(getJobLinks("fn-17-kill")[0]?.state).toBe("killed");
+});
+
 test("syncPlanctlLinks: missing jobs row at enrichment defaults to safe values (no throw inside fold)", () => {
   // The classifier's deriveJobLinks runs OVER the events log directly
   // and can emit edges for sessions that have NO backing jobs row

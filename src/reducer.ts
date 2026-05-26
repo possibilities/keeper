@@ -1706,13 +1706,18 @@ function syncJobLinksOnJobWrite(
     // fields).
     const oldEntry = existing.find((e) => e.job_id === jobId);
     if (oldEntry == null) {
-      // The epic's `job_links` array doesn't carry this `job_id` yet.
-      // This can happen on a transient state where the session's
-      // `jobs.epic_links` was just (re-)derived to include this epic
-      // but the epic's reverse projection hasn't been re-derived to
-      // include this session. The authoritative re-stamp belongs to
-      // `syncPlanctlLinks`, not here — skip this epic, the planctl-
-      // event fan-out will catch up.
+      // Unreachable in a healthy projection. Invariant: `jobs.epic_links`
+      // and `epics.job_links` are atomically co-written by
+      // `syncPlanctlLinks` in the same `BEGIN IMMEDIATE` transaction as
+      // the event fold, so every `(session, epic)` edge present in
+      // `jobs.epic_links` has a matching reverse entry in
+      // `epics.job_links`. No other helper de-syncs them — the OLD-element
+      // carve-out in `syncPlanctlLinks` preserves other entries verbatim,
+      // the EpicSnapshot ON CONFLICT carve-out preserves `job_links`, and
+      // EpicDeleted drops the epic row entirely (the shell-insert branch
+      // below rebuilds it). There is NO async catch-up loop; we keep this
+      // `continue` purely as defense-in-depth so a corrupt-blob projection
+      // can't wedge the reverse fan-out mid-transaction.
       continue;
     }
     const next = existing.filter((e) => e.job_id !== jobId);

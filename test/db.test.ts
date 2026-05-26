@@ -2994,6 +2994,122 @@ test("v20 DB migrates to v21: epics.job_links entries widen from thin {kind, job
   db2.close();
 });
 
+test("v20 DB migrates to v21: malformed (non-JSON) epics.job_links blob folds to '[]' without throwing (never-throw-inside-migrate invariant)", () => {
+  // CLAUDE.md invariant: "NEVER throw inside the open BEGIN IMMEDIATE
+  // transaction — a throw rolls back the cursor and wedges the reducer."
+  // The v20→v21 enrichment pass at src/db.ts wraps the per-row JSON.parse
+  // in try/catch so a corrupt blob folds to []. Pin that guard against a
+  // future refactor that might drop the try/catch.
+  //
+  // Build a minimal v20 DB carrying a non-JSON string in `epics.job_links`
+  // for one epic. After openDb runs the migration block, the column must
+  // be `'[]'` and the schema_version must have advanced to 21 — proving
+  // the migration neither threw nor rolled back.
+  const v20 = new Database(dbPath, { create: true });
+  v20.run(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      session_id TEXT NOT NULL,
+      pid INTEGER,
+      hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      tool_name TEXT,
+      matcher TEXT,
+      cwd TEXT,
+      permission_mode TEXT,
+      agent_id TEXT,
+      agent_type TEXT,
+      stop_hook_active INTEGER,
+      data TEXT NOT NULL,
+      subagent_agent_id TEXT,
+      spawn_name TEXT,
+      start_time TEXT,
+      slash_command TEXT,
+      skill_name TEXT,
+      planctl_op TEXT,
+      planctl_target TEXT,
+      planctl_epic_id TEXT,
+      planctl_task_id TEXT,
+      planctl_subject_present INTEGER,
+      tool_use_id TEXT
+    )
+  `);
+  v20.run(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_source TEXT,
+      transcript_path TEXT,
+      start_time TEXT,
+      plan_verb TEXT,
+      plan_ref TEXT,
+      epic_links TEXT NOT NULL DEFAULT '[]',
+      rate_limited_at REAL
+    )
+  `);
+  v20.run(`
+    CREATE TABLE epics (
+      epic_id TEXT PRIMARY KEY,
+      epic_number INTEGER,
+      title TEXT,
+      project_dir TEXT,
+      status TEXT,
+      approval TEXT NOT NULL DEFAULT 'pending',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL DEFAULT 0,
+      tasks TEXT NOT NULL DEFAULT '[]',
+      depends_on_epics TEXT NOT NULL DEFAULT '[]',
+      jobs TEXT NOT NULL DEFAULT '[]',
+      job_links TEXT NOT NULL DEFAULT '[]',
+      last_validated_at TEXT
+    )
+  `);
+  v20.run(`
+    CREATE TABLE reducer_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_event_id INTEGER NOT NULL DEFAULT 0,
+      updated_at REAL NOT NULL
+    )
+  `);
+  v20.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v20.run("INSERT INTO meta (key, value) VALUES ('schema_version', '20')");
+  v20.run(
+    "INSERT INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 0, 1)",
+  );
+
+  // Hand-write a non-JSON string into `epics.job_links` for one epic.
+  // The migration's safe-parse must fold this to [] and emit '[]' in
+  // the UPDATE, NOT throw.
+  v20
+    .prepare(
+      `INSERT INTO epics (
+       epic_id, epic_number, title, last_event_id, updated_at, job_links
+     ) VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run("fn-21-corrupt", 21, "Corrupt Blob", 1, 100, "not-json{[");
+  v20.close();
+
+  // Reopen via openDb — the v20→v21 block must complete cleanly.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("21");
+
+  const epicRow = db
+    .prepare("SELECT job_links FROM epics WHERE epic_id = ?")
+    .get("fn-21-corrupt") as { job_links: string };
+  expect(epicRow.job_links).toBe("[]");
+  db.close();
+});
+
 test("v12 DB migrates to v13: FS overlay applies sidecar rows BEFORE the DROP TABLE", () => {
   // Variant of the prior test that exercises the FS migration's OVERLAY pass
   // by running it against a v12-shaped DB whose `approvals` table is still
