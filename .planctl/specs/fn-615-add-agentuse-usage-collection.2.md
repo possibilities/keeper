@@ -57,5 +57,5 @@ Single-collection subscriber + docs update. Clones `scripts/git.ts` shape closel
 - [ ] CLAUDE.md count-phrasing updated if applicable
 
 ## Done summary
-
+Add scripts/usage.ts subscriber (single-collection subscribe via subscribeCollection, scripts/git.ts-shaped sidecars, SIGINT teardown) and update README for the usage collection (count phrasing, usage producer-worker arch paragraph, schema v23 callout, Example clients bullet, Inspect query, worker tally).
 ## Evidence
