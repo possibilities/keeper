@@ -1,12 +1,18 @@
 {
+  "approval": "pending",
   "bundles": [],
   "created_at": "2026-05-26T02:06:40.310604Z",
   "depends_on": [],
   "epic": "fn-611-live-tui-mode-for-scripts",
   "id": "fn-611-live-tui-mode-for-scripts.2",
+  "preferred_backend": null,
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
   "title": "Build src/live-shell.ts TUI primitive",
-  "updated_at": "2026-05-26T02:06:40.310604Z"
+  "updated_at": "2026-05-26T02:53:26.028565Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": null
 }
