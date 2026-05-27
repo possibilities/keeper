@@ -104,18 +104,25 @@ Each epic block opens with a header line of the form:
   ({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated] [<readiness>]
 
 followed (when the epic carries job_links) by one indented creator/refiner
-line per linked session — '{title} [creator|refiner] [state] [failed:<kind>]?'
+line per linked session —
+'{title} [creator|refiner] [state] [failed:<kind>]? [awaiting:<kind>]?'
 (title falls back to {job_id} when the embedded title is null; the
 [failed:<kind>] pill appears when the session's last Claude API request
 failed at a terminal HTTP boundary and the human hasn't picked up since —
 the six rendered kinds are rate_limit | authentication_failed |
 billing_error | server_error | invalid_request | unknown, and anything
 outside the allow-list folds to 'unknown'; the recoverable
-max_output_tokens kind is excluded by design). Schema v24 denormalized
-title / state / last_api_error_at / last_api_error_kind off the linked
-jobs row at the reducer's write boundary, so the same line shape renders
-for live, terminal, and off-page sessions — no live-jobs join, no
-off-page fallback branch — then the task lines
+max_output_tokens kind is excluded by design; the [awaiting:<kind>] pill
+appears when the session is stopped on an interactive built-in tool that
+fires no hook of its own — currently just AskUserQuestion, rendered as
+[awaiting:ask_user_question] in warn/yellow via the awaiting:* prefix
+fallback, future-extensible to any other built-in interactive tool that
+surfaces a question without a hook; pills stack in lifecycle order
+state → failed → awaiting). Schema v25 denormalized title / state /
+last_api_error_at / last_api_error_kind / last_input_request_at /
+last_input_request_kind off the linked jobs row at the reducer's write
+boundary, so the same line shape renders for live, terminal, and
+off-page sessions — no live-jobs join, no off-page fallback branch — then the task lines
 (one per embedded task,
 '{n}. {title} [#dep,#dep] [runtime_status] [worker_phase] [approval]' —
 the three native pills side-by-side: planctl runtime status
@@ -253,6 +260,50 @@ function apiErrorPillSeg(at: unknown, kind: unknown): string {
   return ` [failed:${k}]`;
 }
 
+/**
+ * Render the optional `[awaiting:<kind>]` pill segment from the
+ * `jobs.(last_input_request_at, last_input_request_kind)` pair (schema
+ * v25 — the two-field signal cloned one-for-one off fn-616's
+ * `apiErrorPillSeg` shape). The reducer stamps both columns together on
+ * the `InputRequest` fold (a synthetic event minted by
+ * `matchAskUserQuestion` in `src/transcript-worker.ts` when a real
+ * assistant turn carries an `AskUserQuestion` tool_use) and clears them
+ * together on the next `UserPromptSubmit` / `SessionStart` revival or
+ * any `PreToolUse` / `PostToolUse` (the hot-path arms are gated on
+ * `last_input_request_at IS NOT NULL`), so a non-null `at` means
+ * "this stoppage is awaiting a human answer to an interactive
+ * tool-use that fires no hook of its own."
+ *
+ * The kind is taken straight off `last_input_request_kind` — currently
+ * the single-member union `ask_user_question`, future-extensible to
+ * any built-in interactive tool that surfaces a question without a
+ * hook (e.g. `ExitPlanMode`). No allow-list narrowing here; the kind
+ * comes off the matcher / reducer boundary already and renders
+ * verbatim.
+ *
+ * **Paired-NULL invariant.** The reducer guarantees `at` and `kind`
+ * move together — both NULL or both non-NULL. The fallback to
+ * `"unknown"` when `at` is non-null but `kind` happens to be null is
+ * defensive only (should be unreachable); keeps the pill from
+ * collapsing to `[awaiting:]` if a future shape-skew bug appears.
+ *
+ * Returns the leading `' '` so the caller can append unconditionally —
+ * empty string when `at` is null, ` [awaiting:<kind>]` otherwise. The
+ * underlying lifecycle pill (`[stopped]`) is rendered separately from
+ * `jobs.state` and always shows first; this annotation stacks LAST
+ * (after `[limited]?` and `[failed:<kind>]?`) so a single row carrying
+ * all three annotations reads in lifecycle order (state →
+ * rate-limited → api-error → awaiting). Colored yellow on a TTY via
+ * the colorizer's `awaiting:*` prefix fallback to the `warn` bucket.
+ */
+function inputRequestPillSeg(at: unknown, kind: unknown): string {
+  if (at == null) {
+    return "";
+  }
+  const k = typeof kind === "string" && kind.length > 0 ? kind : "unknown";
+  return ` [awaiting:${k}]`;
+}
+
 function epicNumFromId(id: string): number | null {
   const m = /^[a-z]+-(\d+)-/.exec(id);
   return m ? Number.parseInt(m[1], 10) : null;
@@ -260,10 +311,10 @@ function epicNumFromId(id: string): number | null {
 
 /**
  * ANSI SGR sequences for the pill palette. Five semantic buckets keyed off
- * exact pill strings (plus `blocked:*` and `failed:*` prefix fallbacks) so
- * the colorizer stays purely string-driven — no structural knowledge of
- * which column a pill came from. Standard 16-color ANSI for cross-terminal
- * portability.
+ * exact pill strings (plus `blocked:*`, `failed:*`, and `awaiting:*`
+ * prefix fallbacks) so the colorizer stays purely string-driven — no
+ * structural knowledge of which column a pill came from. Standard
+ * 16-color ANSI for cross-terminal portability.
  *
  * Bucket rationale:
  *   - active  (bright cyan): in motion right now, look here
@@ -317,8 +368,12 @@ const PILL_COLORS: Record<string, PillBucket> = {
  * payload (so `[blocked:dep-on-task fn-614.2]` colors the same as
  * `[blocked]`) AND to the `error` bucket for any `failed:*` payload (so
  * the six `[failed:<kind>]` api-error pills minted by `apiErrorPillSeg`
- * color the same as a bare `[failed]`). Unknown tokens pass through
- * verbatim.
+ * color the same as a bare `[failed]`) AND to the `warn` bucket for any
+ * `awaiting:*` payload (so the `[awaiting:<kind>]` input-request pills
+ * minted by `inputRequestPillSeg` — currently just
+ * `[awaiting:ask_user_question]`, future-extensible to any built-in
+ * interactive tool — color the same as a bare `[blocked]`). Unknown
+ * tokens pass through verbatim.
  *
  * Module-level + exported so `test/board.test.ts` can assert the coloring
  * contract without standing up the subscribe loop. Sidecars and the
@@ -334,6 +389,9 @@ export function colorizePillsInLine(line: string): string {
     if (bucket === undefined && inner.startsWith("failed:")) {
       bucket = "error";
     }
+    if (bucket === undefined && inner.startsWith("awaiting:")) {
+      bucket = "warn";
+    }
     if (bucket === undefined) {
       return match;
     }
@@ -348,22 +406,26 @@ function taskNumFromId(id: string): number | null {
 
 /**
  * Per-epic creator/refiner link lines, indented one level under the epic
- * header. Each {@link JobLinkEntry} carries six embedded fields
- * `{kind, job_id, title, state, last_api_error_at, last_api_error_kind}`
- * denormalized off the linked `jobs` row at the reducer's write boundary
- * (schema v24), so the render reads every field straight off the
- * projection — no
+ * header. Each {@link JobLinkEntry} carries eight embedded fields
+ * `{kind, job_id, title, state, last_api_error_at, last_api_error_kind,
+ * last_input_request_at, last_input_request_kind}` denormalized off the
+ * linked `jobs` row at the reducer's write boundary (schema v25), so
+ * the render reads every field straight off the projection — no
  * live-jobs join, no off-page fallback branch.
  *
  * The line shape is the same regardless of whether the linked session
  * is live, terminal, or off-page:
  *
- *     {title ?? job_id} [{kind}] [{state}]{apiErrorPillSeg}
+ *     {title ?? job_id} [{kind}] [{state}]{apiErrorPillSeg}{inputRequestPillSeg}
  *
  * Title falls back to `job_id` when the embedded `title` is null —
  * preserves the line shape when title is genuinely unknown (e.g. a
  * shell-inserted epic whose linked session has no captured title yet)
  * without dropping the readable label entirely.
+ *
+ * Pill stacking order is `[state] [failed:<kind>]? [awaiting:<kind>]?`
+ * — the awaiting pill stacks LAST so a row carrying both annotations
+ * reads in lifecycle order (state → api-error → awaiting).
  *
  * Iteration order is the projection's own `(kind, job_id)` ASC sort
  * (set by `sortJobLinks` in `src/reducer.ts`).
@@ -380,7 +442,7 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
     const label = link.title ?? link.job_id;
     const state = link.state == null ? "" : String(link.state);
     out.push(
-      `   ${label} [${link.kind}] [${state}]${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}`,
+      `   ${label} [${link.kind}] [${state}]${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}${inputRequestPillSeg(link.last_input_request_at, link.last_input_request_kind)}`,
     );
   }
   return out;
@@ -463,7 +525,7 @@ async function main(): Promise<void> {
     for (const j of jobsArr) {
       const job = j as Record<string, unknown>;
       out.push(
-        `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}`,
+        `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}${inputRequestPillSeg(job.last_input_request_at, job.last_input_request_kind)}`,
       );
       out.push(
         ...subagentLinesFor(subagentIndex, String(job.job_id), "      "),
@@ -576,7 +638,7 @@ async function main(): Promise<void> {
     const cwdSeg = cwd === "" ? "" : `(${cwd}) `;
     const role = planVerbLabel(row.plan_verb);
     const roleSeg = role == null ? "" : ` [${role}]`;
-    return `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
+    return `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}${inputRequestPillSeg(row.last_input_request_at, row.last_input_request_kind)}`;
   }
 
   /**

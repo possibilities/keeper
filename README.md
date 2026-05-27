@@ -15,7 +15,17 @@ sessions spawned by planctl — a `(plan_verb, plan_ref)` pair derived at
 SessionStart from the spawn name. The verb is the strict whitelist `{plan,
 work, close}` and the ref is the targeted planctl entity (epic id like
 `fn-575-foo`, or task id like `fn-575-foo.3`); both stay NULL for sessions not
-spawned through planctl. The `killed` state is the sibling terminal state to
+spawned through planctl. Two paired stoppage annotations ride alongside
+the `stopped` state: `(last_api_error_at, last_api_error_kind)` (schema
+v24) marks a stoppage caused by a terminal Claude-API HTTP failure the
+human hasn't picked up since, and `(last_input_request_at,
+last_input_request_kind)` (schema v25) marks a stoppage awaiting a human
+answer to a built-in interactive tool that fires no hook of its own
+(currently `ask_user_question`, future-extensible). Both pairs paired-NULL
+together: stamped on the matching reducer fold, cleared on the next
+`UserPromptSubmit` / `SessionStart` revival (with `PreToolUse` /
+`PostToolUse` gated on the column-is-not-NULL hot-path predicate for
+`last_input_request_at`). The `killed` state is the sibling terminal state to
 `ended`: reached not from a SessionEnd hook but from synthetic `Killed` events
 emitted by the boot seed sweep and the live exit-watcher worker, which prove a
 session's `(pid, start_time)` is gone from the OUTSIDE (SIGKILL'd,
@@ -314,6 +324,17 @@ CI) `--live` silently behaves as if it wasn't set. Run any of them with
   from the three-collection snapshot (see `src/readiness.ts`); a
   blocked row is followed by a `   (reason: <reason>)` continuation
   line so the human reads the cause without scanning the upstream rows.
+  Job/link rows also carry two optional stoppage-annotation pills that
+  stack after `[state]` in lifecycle order: `[failed:<kind>]` (red /
+  error bucket) when the session's last Claude-API request hit a
+  terminal HTTP failure — the six rendered kinds are `rate_limit |
+  authentication_failed | billing_error | server_error |
+  invalid_request | unknown` — and `[awaiting:<kind>]` (yellow / warn
+  bucket) when the session is stopped on a built-in interactive tool
+  that fires no hook of its own (currently `[awaiting:ask_user_question]`,
+  future-extensible). Both pills color through prefix fallbacks
+  (`failed:*` → `error`, `awaiting:*` → `warn`), so future kinds need
+  no code change.
   The byte-compare emit gate keeps the stream quiet when row churn
   doesn't surface in the render. Reconnects across keeperd restarts;
   Ctrl-C unsubscribes cleanly. Every emitted frame is mirrored to three
@@ -454,11 +475,19 @@ exactly as the patch pass shares one re-read per collection.
 A **third** Worker thread is the transcript-title producer: it watches the
 external transcript tree (the `claude_projects_root` from
 `~/.config/keeper/config.yaml`, default `~/.claude/projects`) with
-`@parcel/watcher`, forward-tails each changed JSONL from a stored byte-offset, and on a
-`custom-title` line posts a `transcript-title` message to main. Main — the sole
-writer — turns that into a synthetic `TranscriptTitle` events row on its writable
-connection and pumps a wake; the reducer folds it as the priority-3 `transcript`
-title.
+`@parcel/watcher`, forward-tails each changed JSONL from a stored byte-offset,
+and minted three classes of synthetic event from matched lines: a
+`custom-title` line becomes a `TranscriptTitle` (folded as the priority-3
+`transcript` title), a Claude-API HTTP error line becomes an `ApiError`
+(folded to stamp `(last_api_error_at, last_api_error_kind)` and flip
+`state → 'stopped'`), and an assistant turn whose `content[]` carries a
+`{type:"tool_use", name:"AskUserQuestion"}` becomes an `InputRequest`
+(folded to stamp `(last_input_request_at, last_input_request_kind)` and
+flip `state → 'stopped'` — this is the only signal for built-in
+interactive tools that fire no hook of their own). Main — the sole
+writer — turns each producer message into the matching events row on
+its writable connection and pumps a wake; the reducer's terminal-guarded
+arms do the projection work.
 
 A **fourth** Worker thread is the plan producer: it watches each configured
 project root (from `~/.config/keeper/config.yaml`, default `~/code`) for
@@ -478,9 +507,10 @@ SessionStart environment, projecting the arthack-claude profile a session
 ran under (latest-non-NULL-wins via `COALESCE(excluded.config_dir,
 jobs.config_dir)` on the SessionStart ON CONFLICT branch, so a resume
 SessionStart that captures NULL preserves the prior attribution).
-As of schema v24, each `epics.job_links`
+As of schema v25, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `last_api_error_at` /
-`last_api_error_kind` denormalized off the live `jobs` row at the
+`last_api_error_kind` / `last_input_request_at` /
+`last_input_request_kind` denormalized off the live `jobs` row at the
 reducer's write boundary (via the shared `enrichJobLink` helper) —
 renderers (board) and predicates (readiness) read everything off
 `epics.job_links` with no live-jobs join, so terminal sessions and
@@ -488,8 +518,15 @@ off-page live sessions no longer fall through to a degraded render
 line. A symmetric jobs-write fan-out (`syncJobLinksOnJobWrite`)
 re-stamps the enriched fields on every linked epic whenever a jobs
 row changes
-`(title, state, last_api_error_at, last_api_error_kind)`, keeping the projection in lockstep
-with the session's last-known lifecycle. Each epic also embeds its plan/close-verb
+`(title, state, last_api_error_at, last_api_error_kind,
+last_input_request_at, last_input_request_kind)`, keeping the
+projection in lockstep with the session's last-known lifecycle. The
+two pairs are stamped together on `ApiError` / `InputRequest` folds
+and cleared on the next `UserPromptSubmit` / `SessionStart` revival
+(`PreToolUse` / `PostToolUse` also clear `last_input_request_*`,
+gated on the column-is-not-NULL hot-path predicate — these arms fire
+50+ times per turn so the gate keeps the UPDATE cold when nothing is
+awaiting). Each epic also embeds its plan/close-verb
 jobs as a `jobs` JSON array, and each task element embeds its own work-verb
 jobs as a nested `jobs` sub-array — fanned in from the reducer's jobs-side
 writes whenever a SessionStart spawn name parses as `{plan|work|close}::<ref>`
@@ -576,9 +613,9 @@ list, see [CLAUDE.md](./CLAUDE.md).
 ## Inspect
 
 ```sh
-# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a planctl-shaped spawn name at SessionStart, NULL otherwise; config_dir captures CLAUDE_CONFIG_DIR at SessionStart with latest-non-NULL-wins via COALESCE on resume):
+# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a planctl-shaped spawn name at SessionStart, NULL otherwise; config_dir captures CLAUDE_CONFIG_DIR at SessionStart with latest-non-NULL-wins via COALESCE on resume; last_api_error_(at,kind) and last_input_request_(at,kind) are paired stoppage annotations stamped together on ApiError / InputRequest folds and cleared on the next UPS/SessionStart revival — last_input_request_* also clear on PreToolUse/PostToolUse, gated):
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT job_id, state, title, title_source, plan_verb, plan_ref, config_dir, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
+  'SELECT job_id, state, title, title_source, plan_verb, plan_ref, config_dir, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
 
 # Planctl-spawned jobs only — indexed via the partial `idx_jobs_plan_ref WHERE plan_ref IS NOT NULL` so this lands the index, not a scan:
 sqlite3 ~/.local/state/keeper/keeper.db \
@@ -604,12 +641,12 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT job_id, plan_verb, plan_ref, epic_links FROM jobs WHERE json_array_length(epic_links) > 0 ORDER BY updated_at DESC LIMIT 10"
 
-# Epics by inbound-link density — every job whose planctl-CLI footprint created or refined the epic during a /plan:plan window (epics.job_links is the symmetric per-epic fan-out; as of schema v24 each entry embeds the linked job's title/state/last_api_error_at/last_api_error_kind denormalized off the jobs row at the reducer's write boundary, so renderers + predicates no longer need a live-jobs join):
+# Epics by inbound-link density — every job whose planctl-CLI footprint created or refined the epic during a /plan:plan window (epics.job_links is the symmetric per-epic fan-out; as of schema v25 each entry embeds the linked job's title/state/last_api_error_(at,kind)/last_input_request_(at,kind) denormalized off the jobs row at the reducer's write boundary, so renderers + predicates no longer need a live-jobs join):
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT epic_id, epic_number, title, json_array_length(job_links) AS n FROM epics WHERE json_array_length(job_links) > 0 ORDER BY n DESC, epic_number ASC LIMIT 10"
-# Unnest job_links to see each link's embedded display payload (schema v24: kind, job_id, title, state, last_api_error_at, last_api_error_kind):
+# Unnest job_links to see each link's embedded display payload (schema v25: kind, job_id, title, state, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind):
 sqlite3 ~/.local/state/keeper/keeper.db \
-  "SELECT e.epic_id, json_extract(l.value, '\$.kind') AS kind, json_extract(l.value, '\$.job_id') AS job_id, json_extract(l.value, '\$.title') AS title, json_extract(l.value, '\$.state') AS state, json_extract(l.value, '\$.last_api_error_at') AS last_api_error_at, json_extract(l.value, '\$.last_api_error_kind') AS last_api_error_kind FROM epics e, json_each(e.job_links) l ORDER BY e.epic_number ASC, kind ASC, job_id ASC LIMIT 20"
+  "SELECT e.epic_id, json_extract(l.value, '\$.kind') AS kind, json_extract(l.value, '\$.job_id') AS job_id, json_extract(l.value, '\$.title') AS title, json_extract(l.value, '\$.state') AS state, json_extract(l.value, '\$.last_api_error_at') AS last_api_error_at, json_extract(l.value, '\$.last_api_error_kind') AS last_api_error_kind, json_extract(l.value, '\$.last_input_request_at') AS last_input_request_at, json_extract(l.value, '\$.last_input_request_kind') AS last_input_request_kind FROM epics e, json_each(e.job_links) l ORDER BY e.epic_number ASC, kind ASC, job_id ASC LIMIT 20"
 
 # Killed sessions specifically (proven-dead from outside the hook stream — SIGKILL, terminal-pane closure, reboot):
 sqlite3 ~/.local/state/keeper/keeper.db \

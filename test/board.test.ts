@@ -327,6 +327,74 @@ test("renderJobLinkLines: at non-null, kind null defensively renders [failed:unk
   expect(out).toEqual(["   Plan epic 10 [creator] [stopped] [failed:unknown]"]);
 });
 
+// `last_input_request_at` non-null appends the `[awaiting:<kind>]` pill
+// (warn/yellow via the colorizer's `awaiting:*` prefix fallback). Stacks
+// AFTER `[failed:<kind>]` so a row carrying both annotations reads in
+// lifecycle order (state → api-error → awaiting). Schema v25 introduced
+// the `(last_input_request_at, last_input_request_kind)` pair on
+// `JobLinkEntry` (cloned one-for-one off fn-616's api-error pair); the
+// reducer's `InputRequest` fold stamps both columns together and four
+// clear arms (UPS, SessionStart unconditional; PreToolUse, PostToolUse
+// gated on `last_input_request_at IS NOT NULL`) zero them.
+test("renderJobLinkLines: last_input_request_at non-null appends [awaiting:<kind>] pill", () => {
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "creator",
+      job_id: "sess-iq",
+      title: "Plan epic 11",
+      state: "stopped",
+      last_input_request_at: 1700000000,
+      last_input_request_kind: "ask_user_question",
+    }),
+  ]);
+  expect(out).toEqual([
+    "   Plan epic 11 [creator] [stopped] [awaiting:ask_user_question]",
+  ]);
+});
+
+// Defensive fallback: `at` non-null but `kind` happens to be null
+// (should be unreachable per the reducer's paired-NULL invariant). The
+// pill collapses to `[awaiting:unknown]` rather than the empty-inner
+// `[awaiting:]` — keeps the line readable if a future shape-skew bug
+// appears. Mirrors the api-error defensive case.
+test("renderJobLinkLines: input_request_at non-null, kind null defensively renders [awaiting:unknown]", () => {
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "refiner",
+      job_id: "sess-iq-defensive",
+      title: "Plan epic 12",
+      state: "stopped",
+      last_input_request_at: 1700000000,
+      last_input_request_kind: null,
+    }),
+  ]);
+  expect(out).toEqual([
+    "   Plan epic 12 [refiner] [stopped] [awaiting:unknown]",
+  ]);
+});
+
+// Stacking-order snapshot — a row carrying BOTH api-error AND
+// input-request annotations renders `[state] [failed:<kind>] [awaiting:<kind>]`
+// in that order. Pins lifecycle order so a future change reordering pills
+// is caught.
+test("renderJobLinkLines: failed + awaiting stack in lifecycle order (state → failed → awaiting)", () => {
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "creator",
+      job_id: "sess-both",
+      title: "Plan epic 13",
+      state: "stopped",
+      last_api_error_at: 1700000000,
+      last_api_error_kind: "rate_limit",
+      last_input_request_at: 1700000001,
+      last_input_request_kind: "ask_user_question",
+    }),
+  ]);
+  expect(out).toEqual([
+    "   Plan epic 13 [creator] [stopped] [failed:rate_limit] [awaiting:ask_user_question]",
+  ]);
+});
+
 test("renderJobLinkLines: multiple entries iterate in provided order (projection's own (kind, job_id) ASC sort)", () => {
   const out = renderJobLinkLines([
     makeLink({
@@ -425,6 +493,31 @@ test.each([
     );
   },
 );
+
+// `awaiting:<kind>` prefix fallback — the input-request pills minted by
+// `inputRequestPillSeg` all color the same as the bare `[blocked]` exact
+// match (warn bucket, yellow SGR). Mirrors the `failed:*` → error and
+// `blocked:*` → warn patterns directly above. The single member rendered
+// today is `ask_user_question`; the fallback is open-ended (any future
+// `InputRequestKind` lands in warn without a code change).
+test("colorizePillsInLine: awaiting:ask_user_question takes the warn bucket via prefix fallback", () => {
+  expect(colorizePillsInLine("[awaiting:ask_user_question]")).toBe(
+    `[${WARN}awaiting:ask_user_question${RESET}]`,
+  );
+});
+
+// Stacking-order snapshot rendered through the colorizer — a row
+// carrying all three annotations (state + api-error + input-request)
+// must color each pill independently in lifecycle order.
+test("colorizePillsInLine: stopped + failed + awaiting stack colors independently in lifecycle order", () => {
+  expect(
+    colorizePillsInLine(
+      "Plan epic 13 [creator] [stopped] [failed:rate_limit] [awaiting:ask_user_question]",
+    ),
+  ).toBe(
+    `Plan epic 13 [creator] [${FADED}stopped${RESET}] [${ERROR}failed:rate_limit${RESET}] [${WARN}awaiting:ask_user_question${RESET}]`,
+  );
+});
 
 test("colorizePillsInLine: multiple pills on one line each color independently", () => {
   expect(
