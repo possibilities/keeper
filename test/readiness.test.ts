@@ -154,8 +154,12 @@ function run(
   epics: Epic[],
   jobs: Map<string, Job> = new Map(),
   subs: SubagentInvocation[] = [],
+  gitStatusByProjectDir: Map<
+    string,
+    { dirty_count: number; orphan_count: number }
+  > = new Map(),
 ) {
-  return computeReadiness(epics, jobs, subs);
+  return computeReadiness(epics, jobs, subs, gitStatusByProjectDir);
 }
 
 // ---------------------------------------------------------------------------
@@ -303,23 +307,18 @@ test("predicate 7 (own-approval-pending) fires once the worker session is idle",
 // ---------------------------------------------------------------------------
 
 test("predicate 6.5 git-uncommitted wins over 7 (own-approval-pending)", () => {
-  // Worker idle, approval pending, but the embedded worker job's
-  // git_dirty_count > 0 — the mechanical gate fires and blocks autopilot's
-  // approve dispatch before predicate 7 ever gets a look.
+  // Worker idle, approval pending, and the live `git_status` map for the
+  // epic's project_dir reports dirty_count > 0 — the mechanical gate
+  // fires and blocks autopilot's approve dispatch before predicate 7 ever
+  // gets a look. fn-626: predicate 6.5 now reads off the live project-wide
+  // `git_status` row, not the embedded per-job count columns.
   const task = makeTask({
     worker_phase: "done",
     approval: "pending",
-    jobs: [
-      makeEmbeddedJob({
-        plan_verb: "work",
-        state: "stopped",
-        git_dirty_count: 3,
-        git_orphan_count: 0,
-      }),
-    ],
   });
   const epic = makeEpic({ tasks: [task] });
-  const snap = run([epic]);
+  const gitMap = new Map([["/repo", { dirty_count: 3, orphan_count: 0 }]]);
+  const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
     blocked({ kind: "git-uncommitted" }),
   );
@@ -331,40 +330,27 @@ test("predicate 6.5 git-orphans fires when dirty count is zero but orphan count 
   const task = makeTask({
     worker_phase: "done",
     approval: "pending",
-    jobs: [
-      makeEmbeddedJob({
-        plan_verb: "work",
-        state: "stopped",
-        git_dirty_count: 0,
-        git_orphan_count: 2,
-      }),
-    ],
   });
   const epic = makeEpic({ tasks: [task] });
-  const snap = run([epic]);
+  const gitMap = new Map([["/repo", { dirty_count: 0, orphan_count: 2 }]]);
+  const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
     blocked({ kind: "git-orphans" }),
   );
 });
 
 test("predicate 5 (own-progress-main) wins over 6.5 git-uncommitted", () => {
-  // The worker is still running AND the tree is dirty. Predicate 5 fires
-  // first — git state is captured opportunistically and might be stale
-  // mid-yield; the gate must wait for session idle.
+  // The worker is still running AND the live tree is dirty. Predicate 5
+  // fires first — git state is captured opportunistically and might be
+  // stale mid-yield; the gate must wait for session idle.
   const task = makeTask({
     worker_phase: "done",
     approval: "pending",
-    jobs: [
-      makeEmbeddedJob({
-        plan_verb: "work",
-        state: "working",
-        git_dirty_count: 5,
-        git_orphan_count: 0,
-      }),
-    ],
+    jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
   });
   const epic = makeEpic({ tasks: [task] });
-  const snap = run([epic]);
+  const gitMap = new Map([["/repo", { dirty_count: 5, orphan_count: 0 }]]);
+  const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
     blocked({ kind: "job-running" }),
   );
@@ -382,14 +368,13 @@ test("predicate 6 (own-progress-sub) wins over 6.5 git-uncommitted", () => {
         job_id: "worker-1",
         plan_verb: "work",
         state: "stopped",
-        git_dirty_count: 3,
-        git_orphan_count: 0,
       }),
     ],
   });
   const epic = makeEpic({ tasks: [task] });
   const subs = [makeSub({ job_id: "worker-1", status: "running" })];
-  const snap = run([epic], new Map(), subs);
+  const gitMap = new Map([["/repo", { dirty_count: 3, orphan_count: 0 }]]);
+  const snap = run([epic], new Map(), subs, gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
     blocked({ kind: "sub-agent-running" }),
   );
@@ -405,73 +390,55 @@ test("predicate 6.5 skipped when worker_phase !== 'done' (task path)", () => {
   const task = makeTask({
     worker_phase: "open",
     approval: "pending",
-    jobs: [
-      makeEmbeddedJob({
-        plan_verb: "work",
-        state: "stopped",
-        git_dirty_count: 5,
-        git_orphan_count: 0,
-      }),
-    ],
   });
   const epic = makeEpic({ tasks: [task] });
-  const snap = run([epic]);
+  const gitMap = new Map([["/repo", { dirty_count: 5, orphan_count: 0 }]]);
+  const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual({ tag: "ready" });
 });
 
-test("predicate 6.5 skipped when embedded jobs[] has no work-verb entry (task path)", () => {
-  // The task has no worker job — only the close-verb / plan-verb jobs would
-  // live on the epic-level array. With no work-verb match, the predicate
-  // falls through to 7, which fires.
+test("predicate 6.5 skipped when no git_status entry for the project root (task path)", () => {
+  // fn-626: the predicate looks up `task.target_repo ?? epic.project_dir`
+  // in the `gitStatusByProjectDir` map. A missing entry (no live snapshot
+  // for the root yet, or the autopilot simulator's deliberately-empty map)
+  // → skip and fall through to 7, which fires.
   const task = makeTask({
     worker_phase: "done",
     approval: "pending",
-    jobs: [],
   });
   const epic = makeEpic({ tasks: [task] });
-  const snap = run([epic]);
+  const snap = run([epic]); // empty git map by default
   expect(snap.perTask.get(task.task_id)).toEqual(
     blocked({ kind: "job-pending" }),
   );
 });
 
-test("predicate 6.5 picks the FRESHEST work-verb job when multiple exist", () => {
-  // The embedded array is sorted (created_at desc, job_id asc) by the
-  // reducer, so "freshest" is the first work-verb match in iteration order.
-  // Here the fresher worker has a clean tree and the stale one is dirty —
-  // the predicate reads the fresher one and falls through to predicate 7.
-  const fresh = makeEmbeddedJob({
-    job_id: "worker-fresh",
-    plan_verb: "work",
-    state: "stopped",
-    created_at: 200,
-    git_dirty_count: 0,
-    git_orphan_count: 0,
-  });
-  const stale = makeEmbeddedJob({
-    job_id: "worker-stale",
-    plan_verb: "work",
-    state: "stopped",
-    created_at: 100,
-    git_dirty_count: 5,
-    git_orphan_count: 0,
-  });
+test("predicate 6.5 uses task.target_repo when set, falling back to epic.project_dir otherwise", () => {
+  // Cross-repo task: target_repo points to a different worktree than the
+  // epic. The predicate must look up the live `git_status` for the task's
+  // target_repo, NOT the epic's project_dir. Same root-resolution shape
+  // `effectiveRoot` uses for the per-root mutex.
   const task = makeTask({
     worker_phase: "done",
     approval: "pending",
-    jobs: [fresh, stale], // already sorted (created_at desc) like the reducer
+    target_repo: "/other-repo",
   });
-  const epic = makeEpic({ tasks: [task] });
-  const snap = run([epic]);
+  const epic = makeEpic({ tasks: [task], project_dir: "/repo" });
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 0, orphan_count: 0 }],
+    ["/other-repo", { dirty_count: 0, orphan_count: 7 }],
+  ]);
+  const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "job-pending" }),
+    blocked({ kind: "git-orphans" }),
   );
 });
 
-test("predicate 6.5 fires for evaluateCloseRow with plan_verb='close' filter", () => {
-  // Close-row variant — the gate reads the epic-level embedded jobs[]
-  // filtered to close-verb. Epic.status === "done" gates the predicate;
-  // the close-verb job's git_dirty_count > 0 fires the block.
+test("predicate 6.5 fires for evaluateCloseRow keyed by epic.project_dir", () => {
+  // Close-row variant — the gate reads the live `git_status` row for
+  // `epic.project_dir` (no per-row override on the synthetic close row).
+  // Epic.status === "done" gates the predicate; the live row's
+  // dirty_count > 0 fires the block.
   const task = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -481,17 +448,9 @@ test("predicate 6.5 fires for evaluateCloseRow with plan_verb='close' filter", (
     tasks: [task],
     status: "done",
     approval: "pending",
-    jobs: [
-      makeEmbeddedJob({
-        job_id: "closer-1",
-        plan_verb: "close",
-        state: "stopped",
-        git_dirty_count: 4,
-        git_orphan_count: 0,
-      }),
-    ],
   });
-  const snap = run([epic]);
+  const gitMap = new Map([["/repo", { dirty_count: 4, orphan_count: 0 }]]);
+  const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
     blocked({ kind: "git-uncommitted" }),
   );
@@ -507,24 +466,16 @@ test("predicate 6.5 skipped when epic.status !== 'done' (close-row path)", () =>
     tasks: [task],
     status: "open",
     approval: "pending",
-    jobs: [
-      makeEmbeddedJob({
-        job_id: "closer-1",
-        plan_verb: "close",
-        state: "stopped",
-        git_dirty_count: 5,
-        git_orphan_count: 0,
-      }),
-    ],
   });
-  const snap = run([epic]);
+  const gitMap = new Map([["/repo", { dirty_count: 5, orphan_count: 0 }]]);
+  const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
     blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
   );
 });
 
-test("predicate 6.5 skipped when close-verb job missing from epic.jobs (close-row path)", () => {
-  // Close row with epic.status==="done" but no close-verb embedded job —
+test("predicate 6.5 skipped when no git_status entry for epic.project_dir (close-row path)", () => {
+  // Close row with epic.status==="done" but no live git_status entry —
   // the predicate falls through to 7 which fires.
   const task = makeTask({
     task_id: "fn-1-foo.1",
@@ -535,12 +486,89 @@ test("predicate 6.5 skipped when close-verb job missing from epic.jobs (close-ro
     tasks: [task],
     status: "done",
     approval: "pending",
-    jobs: [], // no close-verb job
   });
-  const snap = run([epic]);
+  const snap = run([epic]); // empty git map
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
     blocked({ kind: "job-pending" }),
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-626 regression: terminal worker carries a stale per-job count, but the
+// live `git_status` row says zero. The fix moved predicate 6.5 off the
+// embedded per-job columns (which freeze on terminal worker transition)
+// and onto the live project-wide `git_status` map. A re-running predicate
+// MUST read the live count and verdict `ready`, not block on `git-orphans`.
+// ---------------------------------------------------------------------------
+
+test("fn-626 task arm: terminal worker with stale git_orphan_count > 0 but fresh git_status orphan_count == 0 → does not block on git-orphans", () => {
+  // The witnessed bug: epic 623 task 1's worker (state=ended) carried
+  // git_orphan_count=2 frozen on terminal transition, but the live
+  // git_status row for /Users/mike/code/keeper correctly says 0. Predicate
+  // 6.5 must read the live row (the map), not the stale per-job column,
+  // so the task verdict no longer reports `git-orphans`.
+  //
+  // Approval is pending here so the row reaches predicate 6.5 (predicate 1
+  // would short-circuit a done+approved task to `completed`); the
+  // load-bearing assertion is that the stale per-job count cannot resurrect
+  // a `git-orphans` block when the live count is 0 — instead the row falls
+  // through to predicate 7 (`job-pending`).
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-1",
+        plan_verb: "work",
+        state: "ended", // terminal — per-job counts are now frozen
+        git_dirty_count: 0,
+        git_orphan_count: 2, // stale snapshot from when the worker was live
+      }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  // Live `git_status` row for /repo reports clean — the project-wide
+  // state has moved on since the worker froze its per-job counts.
+  const gitMap = new Map([["/repo", { dirty_count: 0, orphan_count: 0 }]]);
+  const snap = run([epic], new Map(), [], gitMap);
+  const verdict = snap.perTask.get(task.task_id);
+  expect(verdict).toEqual(blocked({ kind: "job-pending" }));
+  expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
+});
+
+test("fn-626 close-row arm: stale embedded close-verb git_orphan_count > 0 but fresh git_status orphan_count == 0 → does not block on git-orphans", () => {
+  // Mirror of the task-arm regression for the close row. Epic.status="done"
+  // with a terminal close-verb embedded job carrying frozen
+  // git_orphan_count=2, but the live `git_status` for the epic's
+  // project_dir reports 0 — the close row must not block on `git-orphans`.
+  const task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+  });
+  const epic = makeEpic({
+    tasks: [task],
+    status: "done",
+    approval: "pending",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "ended", // terminal — counts frozen
+        git_dirty_count: 0,
+        git_orphan_count: 2, // stale frozen snapshot
+      }),
+    ],
+  });
+  const gitMap = new Map([["/repo", { dirty_count: 0, orphan_count: 0 }]]);
+  const snap = run([epic], new Map(), [], gitMap);
+  const verdict = snap.perCloseRow.get(epic.epic_id);
+  // Live count is 0 → predicate 6.5 doesn't fire. Falls through to 7
+  // (epic.approval="pending", epic.status="done") → job-pending. The
+  // load-bearing assertion is that `git-orphans` does NOT fire on the
+  // stale per-job count.
+  expect(verdict).toEqual(blocked({ kind: "job-pending" }));
+  expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
 });
 
 test("close row: predicate 5 (own-progress-main) wins over 7 (own-approval-pending)", () => {

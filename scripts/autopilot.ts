@@ -624,7 +624,20 @@ export function predictNextDispatches(
     return { approvals: [], informational, workers: [], closers: [] };
   }
 
-  const futureReadiness = computeReadiness(simulatedEpics, snap.jobs, []);
+  // Empty git-status map is deliberate: the autopilot simulator builds a
+  // synthetic `Epic[]` and doesn't model real git state. Passing an empty
+  // map keeps the simulator's "predicate 6.5 doesn't fire" semantics — the
+  // real `subscribeReadiness` pipeline does the live `git_status` lookup
+  // before approve/dispatch lands. Don't "fix" this to forward
+  // `snap.gitStatus` without first re-checking what the simulator should
+  // do with it (today: nothing, the worker hasn't run yet so the live row
+  // is the wrong sample).
+  const futureReadiness = computeReadiness(
+    simulatedEpics,
+    snap.jobs,
+    [],
+    new Map(),
+  );
 
   const approvals: PreviewRow[] = [];
   const workers: PreviewRow[] = [];

@@ -81,7 +81,7 @@ import {
   type ServerFrame,
 } from "./protocol";
 import { computeReadiness, type ReadinessSnapshot } from "./readiness";
-import type { Epic, Job, SubagentInvocation } from "./types";
+import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
 
 // ---------------------------------------------------------------------------
 // Tuning constants — same values the prior board.ts standalone code used.
@@ -90,6 +90,10 @@ import type { Epic, Job, SubagentInvocation } from "./types";
 const JOBS_PAGE_LIMIT = 10;
 const EPICS_PAGE_LIMIT = 0;
 const SUBAGENT_INVOCATIONS_PAGE_LIMIT = 0;
+// Full set — one row per planctl-backed git worktree; the watched set is
+// scoped to project roots that have produced events, which is bounded by the
+// human's actual repo collection.
+const GIT_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
@@ -125,6 +129,7 @@ export interface ReadinessClientSnapshot {
   readonly epics: Epic[];
   readonly jobs: Map<string, Job>;
   readonly subagentInvocations: SubagentInvocation[];
+  readonly gitStatus: GitStatus[];
   readonly readiness: ReadinessSnapshot;
 }
 
@@ -944,6 +949,7 @@ export function subscribeReadiness(
   const epicsSubId = `${idPrefix}-epics`;
   const jobsSubId = `${idPrefix}-jobs`;
   const subsSubId = `${idPrefix}-subagent-invocations`;
+  const gitSubId = `${idPrefix}-git`;
   const epics = makeState("epics", epicsSubId, "epic_id", {
     type: "query",
     collection: "epics",
@@ -976,10 +982,36 @@ export function subscribeReadiness(
       limit: SUBAGENT_INVOCATIONS_PAGE_LIMIT,
     },
   );
-  const states: CollectionState[] = [epics, jobs, subagentInvocations];
+  // The `git` collection feeds predicate 6.5 (git-uncommitted / git-orphans)
+  // — one row per planctl-backed git worktree, keyed by `project_dir`.
+  // Schema-v21 froze per-job `git_dirty_count`/`git_orphan_count` columns
+  // on terminal worker transition, so reading those at evaluate time
+  // produced false `git-orphans` blocks against a since-clean tree. The
+  // live `git_status` row is the honest source of truth; we project it
+  // into a `Map<project_dir, {dirty_count, orphan_count}>` and pass it
+  // into `computeReadiness` below. First-paint gate widened to include
+  // this collection so a partial snapshot can't flip the pill on the
+  // pre-paint blank state.
+  const gitStatus = makeState("git", gitSubId, "project_dir", {
+    type: "query",
+    collection: "git",
+    id: gitSubId,
+    limit: GIT_PAGE_LIMIT,
+  });
+  const states: CollectionState[] = [
+    epics,
+    jobs,
+    subagentInvocations,
+    gitStatus,
+  ];
 
   function emitSnapshotIfReady(): void {
-    if (!epics.gotResult || !jobs.gotResult || !subagentInvocations.gotResult) {
+    if (
+      !epics.gotResult ||
+      !jobs.gotResult ||
+      !subagentInvocations.gotResult ||
+      !gitStatus.gotResult
+    ) {
       return;
     }
     // Cast: the wire delivers each row as `Record<string, unknown>`; the
@@ -1004,7 +1036,27 @@ export function subscribeReadiness(
     const subsForReadiness = collapseSubagentsByName(subsTyped).map(
       (g) => g.row,
     );
-    const readiness = computeReadiness(epicsTyped, jobsTyped, subsForReadiness);
+    // Project the `git_status` rows into the `{dirty_count, orphan_count}`
+    // shape `computeReadiness` consumes. The collection's column is
+    // `orphaned_count`; the readiness map uses the shorter `orphan_count`
+    // alias to match the `BlockReason` kind name (`git-orphans`).
+    const gitTyped = projectRows<GitStatus>(gitStatus);
+    const gitStatusByProjectDir = new Map<
+      string,
+      { dirty_count: number; orphan_count: number }
+    >();
+    for (const row of gitTyped) {
+      gitStatusByProjectDir.set(row.project_dir, {
+        dirty_count: row.dirty_count,
+        orphan_count: row.orphaned_count,
+      });
+    }
+    const readiness = computeReadiness(
+      epicsTyped,
+      jobsTyped,
+      subsForReadiness,
+      gitStatusByProjectDir,
+    );
     // Exceptions from `onSnapshot` propagate. This matches keeper's
     // "no in-process self-heal" stance and the prior board.ts code path,
     // which had no try/catch around its emit either.
@@ -1012,6 +1064,7 @@ export function subscribeReadiness(
       epics: epicsTyped,
       jobs: jobsTyped,
       subagentInvocations: subsTyped,
+      gitStatus: gitTyped,
       readiness,
     });
   }

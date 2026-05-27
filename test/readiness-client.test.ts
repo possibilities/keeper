@@ -206,29 +206,35 @@ test("subscribeReadiness: first-paint gate withholds onSnapshot until all three 
     throw new Error("mock socket never installed");
   }
 
-  // Three initial queries fired on open — one per collection.
+  // Four initial queries fired on open — one per collection (fn-626
+  // widened the readiness composition with `git_status` for predicate 6.5).
   const initial = sock.takeOutbound();
-  expect(initial).toHaveLength(3);
+  expect(initial).toHaveLength(4);
   expect(
     initial.map((f) => (f as { collection: string }).collection).sort(),
-  ).toEqual(["epics", "jobs", "subagent_invocations"]);
+  ).toEqual(["epics", "git", "jobs", "subagent_invocations"]);
 
   // Deliver only `epics` first: gate must hold.
   sock.deliver([emptyResult("epics", "test-paintgate-epics")]);
   expect(snapshots).toHaveLength(0);
 
-  // Add `jobs`: gate still holds (need all three).
+  // Add `jobs`: gate still holds (need all four).
   sock.deliver([emptyResult("jobs", "test-paintgate-jobs")]);
   expect(snapshots).toHaveLength(0);
 
-  // Add `subagent_invocations`: gate clears, snapshot fires exactly once.
+  // Add `subagent_invocations`: still missing `git`.
   sock.deliver([
     emptyResult("subagent_invocations", "test-paintgate-subagent-invocations"),
   ]);
+  expect(snapshots).toHaveLength(0);
+
+  // Add `git`: gate clears, snapshot fires exactly once.
+  sock.deliver([emptyResult("git", "test-paintgate-git")]);
   expect(snapshots).toHaveLength(1);
   expect(snapshots[0]?.epics).toEqual([]);
   expect(snapshots[0]?.jobs.size).toBe(0);
   expect(snapshots[0]?.subagentInvocations).toEqual([]);
+  expect(snapshots[0]?.gitStatus).toEqual([]);
 
   handle.dispose();
 });
@@ -254,8 +260,8 @@ test("subscribeReadiness: refetch fired while queryInFlight is coalesced into on
     throw new Error("mock socket never installed");
   }
 
-  // Discard the three initial queries.
-  expect(sock.takeOutbound()).toHaveLength(3);
+  // Discard the four initial queries (fn-626 added `git`).
+  expect(sock.takeOutbound()).toHaveLength(4);
 
   // BEFORE the `epics` result resolves the in-flight query, deliver TWO
   // `meta` nudges for `epics` — both should fold into one pending
@@ -313,6 +319,7 @@ test("subscribeReadiness: dispose() is idempotent — second call is a no-op", (
     emptyResult("epics", "test-dispose-epics"),
     emptyResult("jobs", "test-dispose-jobs"),
     emptyResult("subagent_invocations", "test-dispose-subagent-invocations"),
+    emptyResult("git", "test-dispose-git"),
   ]);
   expect(snapshots).toHaveLength(1);
 
@@ -387,8 +394,8 @@ test("subscribeReadiness: terminal error frame (no prior result) invokes onFatal
       throw new Error("mock socket never installed");
     }
 
-    // Burn the three initial queries.
-    expect(sock.takeOutbound()).toHaveLength(3);
+    // Burn the four initial queries (fn-626 added `git`).
+    expect(sock.takeOutbound()).toHaveLength(4);
     // The helper installed its steady-poll `setInterval` in `open`; the
     // spy must have observed it.
     expect(pending.size).toBe(1);
@@ -690,10 +697,12 @@ test("subscribeReadiness: Path B (1–5 s) — slow-flight latches once, timeout
     harness.pollHandler()();
 
     const slowAt1s = lifecycle.filter((e) => e.event === "query_slow_flight");
-    // Three collections all in flight, all crossed 1 s — three emits.
-    expect(slowAt1s).toHaveLength(3);
+    // Four collections all in flight, all crossed 1 s — four emits (fn-626
+    // added `git` to the readiness composition).
+    expect(slowAt1s).toHaveLength(4);
     expect(slowAt1s.map((e) => e.detail?.collection).sort()).toEqual([
       "epics",
+      "git",
       "jobs",
       "subagent_invocations",
     ]);
@@ -703,7 +712,7 @@ test("subscribeReadiness: Path B (1–5 s) — slow-flight latches once, timeout
     harness.pollHandler()();
     expect(
       lifecycle.filter((e) => e.event === "query_slow_flight"),
-    ).toHaveLength(3);
+    ).toHaveLength(4);
 
     // t=5001 ms: timeout fires. Single-flight `reconnecting` guard means
     // exactly one `query_timeout` event for the FIRST stuck state.
@@ -827,8 +836,9 @@ test("subscribeReadiness: Path C — reconnect clears slow-flight state, fresh w
     const slowCountAfter = lifecycle.filter(
       (e) => e.event === "query_slow_flight",
     ).length;
-    // Three collections in the new window, three fresh emits.
-    expect(slowCountAfter - slowCountBefore).toBe(3);
+    // Four collections in the new window, four fresh emits (fn-626 added
+    // `git`).
+    expect(slowCountAfter - slowCountBefore).toBe(4);
 
     handle.dispose();
   } finally {
@@ -859,14 +869,14 @@ test("subscribeReadiness: single-flight — two stuck collections produce ONE re
     }
     sock.takeOutbound();
 
-    // All three collections are still in flight (no `result` delivered).
-    // At t=5001 ms all three cross the deadline on the same poll tick.
+    // All four collections are still in flight (no `result` delivered).
+    // At t=5001 ms all four cross the deadline on the same poll tick.
     harness.advance(5001);
     harness.pollHandler()();
 
     // Exactly ONE `query_timeout` event, named after the FIRST state
     // (`epics` — the order in `states[]` matches the makeState calls in
-    // `subscribeReadiness`: epics, jobs, subagent_invocations).
+    // `subscribeReadiness`: epics, jobs, subagent_invocations, git).
     const timeouts = lifecycle.filter((e) => e.event === "query_timeout");
     expect(timeouts).toHaveLength(1);
     expect(timeouts[0]?.detail?.collection).toBe("epics");

@@ -26,19 +26,24 @@
  *                                    close: same predicate but joined against worker session ids from
  *                                    epic-level AND every task-level embedded jobs[]
  *   6.5. git-uncommitted / git-orphans
- *                                  — task (gated worker_phase==="done"): pick the freshest worker-verb
- *                                    embedded jobs[] entry; if its git_dirty_count > 0 → git-uncommitted,
- *                                    else if git_orphan_count > 0 → git-orphans. Skipped when no
- *                                    work-verb entry exists or worker_phase !== "done".
- *                                    close (gated epic.status==="done"): same idea against close-verb
- *                                    embedded jobs[] on the epic. Mechanical gate that lifts the
- *                                    inferred git cleanliness check out of /plan:approve's LLM cascade
- *                                    into keeper's deterministic readiness pipeline. Placed AFTER
+ *                                  — task (gated worker_phase==="done"): look up the live `git_status`
+ *                                    row for `task.target_repo ?? epic.project_dir` via
+ *                                    `gitStatusByProjectDir`; if its dirty_count > 0 → git-uncommitted,
+ *                                    else if orphan_count > 0 → git-orphans. Skipped when no entry
+ *                                    exists for the root (no snapshot yet, or simulator's empty map)
+ *                                    or worker_phase !== "done".
+ *                                    close (gated epic.status==="done"): same idea keyed by
+ *                                    `epic.project_dir`. Mechanical gate that lifts the inferred git
+ *                                    cleanliness check out of /plan:approve's LLM cascade into
+ *                                    keeper's deterministic readiness pipeline. Placed AFTER
  *                                    session-running (5/6) and BEFORE approval-pending (7) for the
  *                                    same race rationale as predicate 7: the gate must wait until
  *                                    every worker session and sub-agent is actually idle before
  *                                    sampling git state, otherwise mid-yield Stops produce stale
- *                                    dirty-tree readings that flap the pill.
+ *                                    dirty-tree readings that flap the pill. Reads off the live
+ *                                    project-wide `git_status` row (not the embedded per-job count
+ *                                    columns) — those columns freeze on terminal worker transition
+ *                                    while the project's git state may have moved on.
  *   7. own-approval-pending        — task.approval==="pending" && status==="done" → job-pending
  *                                    close: epic.approval==="pending" && epic.status==="done" → job-pending
  *                                    Deliberately ranks BELOW 5/6: `worker_phase==="done"` is stamped
@@ -86,13 +91,15 @@ import type { Epic, Job, SubagentInvocation, Task } from "./types";
  * - `planner-running`                  — a creator/refiner job for this epic is `working`.
  * - `job-running`                      — an embedded `jobs[]` entry on this row is `working`.
  * - `sub-agent-running`                — a sub-agent invocation for this row's worker is `running`.
- * - `git-uncommitted`                  — the freshest worker/close-verb embedded job's `git_dirty_count > 0`
- *                                        (mechanical gate inserted at rank 6.5; payload-less by design — see
- *                                        the predicate-pipeline docstring for the rationale on placement).
- * - `git-orphans`                      — the freshest worker/close-verb embedded job's `git_orphan_count > 0`
- *                                        (mechanical gate inserted at rank 6.5; payload-less by design —
- *                                        complements `git-uncommitted` and fires when dirty count is zero
- *                                        but the project has orphan files).
+ * - `git-uncommitted`                  — the live `git_status` row for this row's project root has
+ *                                        `dirty_count > 0` (mechanical gate inserted at rank 6.5;
+ *                                        payload-less by design — see the predicate-pipeline docstring
+ *                                        for the rationale on placement).
+ * - `git-orphans`                      — the live `git_status` row for this row's project root has
+ *                                        `orphan_count > 0` (mechanical gate inserted at rank 6.5;
+ *                                        payload-less by design — complements `git-uncommitted` and
+ *                                        fires when dirty count is zero but the project has orphan
+ *                                        files).
  * - `dep-on-task`                      — an upstream task is not completed (carries the upstream id).
  * - `dep-on-epic`                      — an upstream epic's close is not completed.
  * - `single-task-per-epic`             — lost the per-epic mutex (a sibling row in the same epic is non-completed).
@@ -152,6 +159,21 @@ export function computeReadiness(
   epics: Iterable<Epic>,
   jobs: Map<string, Job>,
   subagentInvocations: Iterable<SubagentInvocation>,
+  // Project-wide git status keyed by `project_dir`. The task arm of
+  // predicate 6.5 looks up `task.target_repo ?? epic.project_dir` (same
+  // root-resolution shape `effectiveRoot` uses for the per-root mutex);
+  // the close-row arm looks up `epic.project_dir` directly. Defaults to an
+  // empty map so callers that don't subscribe to `git_status` (today: the
+  // autopilot simulator, hand-rolled test fixtures) preserve the pre-fix
+  // "predicate 6.5 doesn't fire" semantics. Replaces the schema-v21
+  // per-job `git_dirty_count`/`git_orphan_count` read off the freshest
+  // embedded worker job — those columns only refresh while the job is in
+  // `state IN ('working','stopped')` and freeze on terminal transition,
+  // so the live `git_status` row is the honest source of truth.
+  gitStatusByProjectDir: Map<
+    string,
+    { dirty_count: number; orphan_count: number }
+  > = new Map(),
 ): ReadinessSnapshot {
   // Build a job_id → SubagentInvocation[] index so predicate 6 is O(1) per row.
   // Filtered to `status === "running"` at index time — the only status that
@@ -198,6 +220,7 @@ export function computeReadiness(
         subRunningByJobId,
         perTask,
         perCloseRow,
+        gitStatusByProjectDir,
       );
       perTask.set(task.task_id, verdict);
     }
@@ -208,6 +231,7 @@ export function computeReadiness(
       jobs,
       subRunningByJobId,
       perTask,
+      gitStatusByProjectDir,
     );
     perCloseRow.set(epic.epic_id, closeVerdict);
   }
@@ -245,6 +269,10 @@ function evaluateTask(
   // symmetry with `evaluateCloseRow`'s shape — both predicates take the
   // same "already-computed verdicts" handles.
   _perCloseRow: Map<string, Verdict>,
+  gitStatusByProjectDir: Map<
+    string,
+    { dirty_count: number; orphan_count: number }
+  >,
 ): Verdict {
   // 1. terminal-completed. Schema v19: read the derived worker-phase binary
   // under its new key — the legacy `status` was renamed to `worker_phase`
@@ -297,18 +325,25 @@ function evaluateTask(
   // can't matter yet. Placed between 6 and 7 for the same race rationale as
   // predicate 7: until every worker session AND every sub-agent is actually
   // idle, the git read could capture a mid-yield Stop's stale dirty-tree
-  // reading and flap the pill. The freshest worker job is the first
-  // `plan_verb === 'work'` entry in `task.jobs` (already sorted
-  // `(created_at desc, job_id asc)` by `sortEmbeddedJobs` — first match in
-  // iteration order). An empty filtered selection → skip this predicate and
-  // fall through to 7.
+  // reading and flap the pill.
+  //
+  // Source of counts: the live, project-wide `git_status` row keyed by
+  // `task.target_repo ?? epic.project_dir` (mirrors `effectiveRoot`'s
+  // task-row resolution). The per-job `git_dirty_count`/`git_orphan_count`
+  // columns are a historical record of what each job's last live tick saw
+  // and freeze on terminal transition — reading them here would produce
+  // false `git-orphans` blocks against a since-clean tree. A missing map
+  // entry (no `git_status` snapshot for this root yet, or the autopilot
+  // simulator's deliberately-empty map) → skip the predicate and fall
+  // through to 7.
   if (task.worker_phase === "done") {
-    const worker = pickFreshestEmbeddedJobByVerb(task.jobs, "work");
-    if (worker !== undefined) {
-      if (worker.git_dirty_count > 0) {
+    const root = task.target_repo ?? epic.project_dir;
+    const gs = root === null ? undefined : gitStatusByProjectDir.get(root);
+    if (gs !== undefined) {
+      if (gs.dirty_count > 0) {
         return { tag: "blocked", reason: { kind: "git-uncommitted" } };
       }
-      if (worker.git_orphan_count > 0) {
+      if (gs.orphan_count > 0) {
         return { tag: "blocked", reason: { kind: "git-orphans" } };
       }
     }
@@ -380,6 +415,10 @@ function evaluateCloseRow(
   _jobs: Map<string, Job>,
   subRunningByJobId: Map<string, SubagentInvocation[]>,
   perTask: Map<string, Verdict>,
+  gitStatusByProjectDir: Map<
+    string,
+    { dirty_count: number; orphan_count: number }
+  >,
 ): Verdict {
   // 1. terminal-completed (close-row variant).
   if (epic.status === "done" && epic.approval === "approved") {
@@ -440,17 +479,22 @@ function evaluateCloseRow(
   // the close row hasn't reached the approval window before that, so the
   // git state can't matter yet. Same placement rationale as the task path
   // (between 6 and 7 to avoid mid-yield Stop's stale dirty-tree readings).
-  // The freshest close-verb job is the first `plan_verb === 'close'` entry
-  // in `epic.jobs` (already sorted `(created_at desc, job_id asc)` —
-  // first match in iteration order). An empty filtered selection → skip
-  // and fall through to 7.
+  //
+  // Source of counts: the live, project-wide `git_status` row keyed by
+  // `epic.project_dir` (no per-row override on the synthetic close row).
+  // Same rationale as the task path — the per-job `git_dirty_count`
+  // /`git_orphan_count` columns freeze on terminal transition; the live
+  // `git_status` row is the honest source of truth.
   if (epic.status === "done") {
-    const closer = pickFreshestEmbeddedJobByVerb(epic.jobs, "close");
-    if (closer !== undefined) {
-      if (closer.git_dirty_count > 0) {
+    const gs =
+      epic.project_dir === null
+        ? undefined
+        : gitStatusByProjectDir.get(epic.project_dir);
+    if (gs !== undefined) {
+      if (gs.dirty_count > 0) {
         return { tag: "blocked", reason: { kind: "git-uncommitted" } };
       }
-      if (closer.git_orphan_count > 0) {
+      if (gs.orphan_count > 0) {
         return { tag: "blocked", reason: { kind: "git-orphans" } };
       }
     }
@@ -732,38 +776,6 @@ function anyEmbeddedJobHasRunningSubagent(
     }
   }
   return false;
-}
-
-/**
- * Predicate 6.5 (`git-uncommitted` / `git-orphans`). Pick the freshest
- * embedded job whose `plan_verb` matches the supplied verb filter (typically
- * `"work"` for the task path, `"close"` for the close-row path). The
- * embedded array is already sorted `(created_at desc, job_id asc)` by
- * `sortEmbeddedJobs` in the reducer, so "freshest" == first match in
- * iteration order. Returns `undefined` when no entry matches the verb —
- * callers fall through to the next predicate.
- */
-function pickFreshestEmbeddedJobByVerb(
-  embedded:
-    | {
-        plan_verb: string;
-        git_dirty_count: number;
-        git_orphan_count: number;
-      }[]
-    | undefined,
-  verb: string,
-):
-  | { plan_verb: string; git_dirty_count: number; git_orphan_count: number }
-  | undefined {
-  if (embedded === undefined) {
-    return undefined;
-  }
-  for (const job of embedded) {
-    if (job.plan_verb === verb) {
-      return job;
-    }
-  }
-  return undefined;
 }
 
 // ---------------------------------------------------------------------------
