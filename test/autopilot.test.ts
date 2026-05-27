@@ -434,15 +434,15 @@ test("predictNextDispatches — empty preview when nothing is running and nothin
   expect(closers).toEqual([]);
 });
 
-test("predictNextDispatches — in-flight worker with git_dirty_count > 0 does NOT yet emit informational", () => {
-  // Regression for the "show too early" symptom: a worker that is
-  // actively editing has dirty files most of the time, but the row
-  // shouldn't render `git-dirty::<id>` until the worker has actually
-  // stopped — the dirtiness might resolve when the worker commits
-  // before going idle. Current verdict is `blocked:job-running`
+test("predictNextDispatches — in-flight worker with git_dirty_count > 0 still predicts approve::<task>", () => {
+  // The sim zeros git counts on the working→ended flip — it models a
+  // worker that finishes AND commits before going idle, so predicate 6.5
+  // (git-uncommitted) does NOT fire in futureReadiness and mask the
+  // approve prediction. Current readiness is still blocked:job-running
   // (predicate 5), so the informational pre-pass (which reads `cur`,
-  // not the simulated `fut`) skips the row. Approvals still fires for
-  // the predicted post-completion edge.
+  // not the simulated `fut`) skips the `git-dirty::<id>` row — that
+  // gate is reserved for "worker actually stopped dirty", caught off
+  // current state once `worker_phase` flips to done for real.
   const epic = makeEpic({
     tasks: [
       makeTask({
@@ -464,18 +464,19 @@ test("predictNextDispatches — in-flight worker with git_dirty_count > 0 does N
   const { approvals, informational, workers, closers } = predictNextDispatches(
     buildSnap([epic]),
   );
-  // The worker's future verdict in the sim is blocked:git-uncommitted
-  // (predicate 6.5), so approvals stays empty too — the row is past
-  // the approve-prediction edge but not yet at the informational gate.
-  expect(approvals).toEqual([]);
+  expect(approvals.map((r) => `${r.verb}::${r.id}`)).toEqual([
+    "approve::fn-1-foo.1",
+  ]);
   expect(informational).toEqual([]);
   expect(workers).toEqual([]);
   expect(closers).toEqual([]);
 });
 
-test("predictNextDispatches — in-flight worker with git_orphan_count > 0 does NOT yet emit informational", () => {
-  // Sibling regression: same suppression for the `git-orphans` future
-  // verdict while the worker is still running.
+test("predictNextDispatches — in-flight worker with git_orphan_count > 0 still predicts approve::<task>", () => {
+  // Sibling case: same sim-zeroing applies to git_orphan_count, so a
+  // running worker with orphans queued in its worktree still predicts
+  // approve. The informational gate stays cur-driven and only fires
+  // once the worker actually stops with orphans still present.
   const epic = makeEpic({
     tasks: [
       makeTask({
@@ -498,7 +499,9 @@ test("predictNextDispatches — in-flight worker with git_orphan_count > 0 does 
   const { approvals, informational, workers, closers } = predictNextDispatches(
     buildSnap([epic]),
   );
-  expect(approvals).toEqual([]);
+  expect(approvals.map((r) => `${r.verb}::${r.id}`)).toEqual([
+    "approve::fn-1-foo.1",
+  ]);
   expect(informational).toEqual([]);
   expect(workers).toEqual([]);
   expect(closers).toEqual([]);

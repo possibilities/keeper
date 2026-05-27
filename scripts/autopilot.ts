@@ -350,7 +350,15 @@ export function renderEpicCommandsFiltered(
 //   - `plan_verb === "work"`    → owning task's `worker_phase = "done"`
 //   - `plan_verb === "close"`   → owning epic's `status        = "done"`
 //   - `plan_verb === "approve"` → owning row's `approval       = "approved"`
-//   In every case the job's own `state` is stamped `"ended"`.
+//   In every case the job's own `state` is stamped `"ended"` AND its
+//   `git_dirty_count` / `git_orphan_count` are zeroed — the sim models a
+//   worker that finishes AND commits before going idle, so predicate 6.5
+//   (git-uncommitted / git-orphans) does not fire in `futureReadiness`
+//   and mask the post-completion approve prediction. If the worker
+//   actually stops WITHOUT committing, the informational pre-pass off
+//   CURRENT readiness catches it as `git-dirty::<id>` once `worker_phase`
+//   flips to `"done"` for real; the prediction's job is "next dispatch on
+//   the normal path".
 //
 // Additionally: a row whose CURRENT verdict is `ready` has its own next
 // dispatch advanced too (a ready task/close-row is about to fire its
@@ -551,7 +559,9 @@ export function predictNextDispatches(
     }
     const simEpicJobs = epicTouched
       ? epicJobs.map((j) =>
-          j.state === "working" ? { ...j, state: "ended" } : j,
+          j.state === "working"
+            ? { ...j, state: "ended", git_dirty_count: 0, git_orphan_count: 0 }
+            : j,
         )
       : epicJobs;
 
@@ -590,7 +600,9 @@ export function predictNextDispatches(
         worker_phase: simWorkerPhase,
         approval: simApproval,
         jobs: taskJobs.map((j) =>
-          j.state === "working" ? { ...j, state: "ended" } : j,
+          j.state === "working"
+            ? { ...j, state: "ended", git_dirty_count: 0, git_orphan_count: 0 }
+            : j,
         ),
       };
     });
