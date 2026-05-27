@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-27T06:14:16.540845Z",
+  "depends_on": [],
+  "epic": "fn-621-slot-after-closer-epic-ordering",
+  "id": "fn-621-slot-after-closer-epic-ordering.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": null,
+  "title": "Add slot-after-closer columns and board pill",
+  "updated_at": "2026-05-27T06:14:16.540845Z"
+}

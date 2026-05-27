@@ -1,0 +1,18 @@
+{
+  "branch_name": "fn-621-slot-after-closer-epic-ordering",
+  "bundles": [],
+  "created_at": "2026-05-27T06:14:16.540845Z",
+  "depends_on_epics": [],
+  "id": "fn-621-slot-after-closer-epic-ordering",
+  "last_validated_at": "2026-05-27T06:14:16.560375Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Slot-after-closer epic ordering",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-27T06:14:16.540845Z"
+}
