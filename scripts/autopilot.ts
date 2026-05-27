@@ -58,17 +58,19 @@
  * after which the row drops off and re-appears as `approve::<id>`),
  * then workers, then closers (rows that flip blocked→ready in a
  * simulation that forces every currently-active row to completed).
- * Preview rows are single-line `(<dir>) <verb>::<id>` — no `[dry]`
- * tag, no shell-command footer. The preview recomputes from the live
+ * Preview rows are single-line `(<dir>) <verb>::<id> [<pill>]` where
+ * the pill is `[claude]` for dispatch-backed rows (approve / work /
+ * close) and `[info]` for the informational `git-dirty` row — no
+ * `[dry]` tag, no shell-command footer. The preview recomputes from the live
  * readiness snapshot on every emit; section 1 above the `---` is the
  * per-run current+queued view described above:
  *
  *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
  *   ---
- *   (keeper) approve::fn-619-pin-inputrequest-mid-subagent-state.1
- *   (keeper) git-dirty::fn-619-pin-inputrequest-mid-subagent-state.2
- *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.3
- *   (keeper) close::fn-619-pin-inputrequest-mid-subagent-state
+ *   (keeper) approve::fn-619-pin-inputrequest-mid-subagent-state.1 [claude]
+ *   (keeper) git-dirty::fn-619-pin-inputrequest-mid-subagent-state.2 [info]
+ *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.3 [claude]
+ *   (keeper) close::fn-619-pin-inputrequest-mid-subagent-state [claude]
  *
  * Fires side effects on EDGES in the readiness verdicts:
  *   → ready          spawn a Ghostty window running the worker command
@@ -177,7 +179,9 @@ or blocked:git-orphans emit an informational 'git-dirty::<id>' row
 the human resolves it by cleaning the worktree, after which the row
 drops off and re-emerges as 'approve::<id>'); rows that flip to ready
 emit 'work::<task>' / 'close::<epic>'. Preview rows are single-line
-'(<dir>) <verb>::<id>' — no [dry] tag, no shell-command footer.
+'(<dir>) <verb>::<id> [<pill>]' where the pill is '[claude]' for
+dispatch-backed rows (approve / work / close) and '[info]' for the
+informational 'git-dirty' row — no [dry] tag, no shell-command footer.
 
 The helper waits for keeperd to come up and reconnects across restarts;
 each connection-lifecycle change is appended to the lifecycle sidecar.
@@ -834,7 +838,11 @@ async function main(): Promise<void> {
     const section2: string[] = [];
     for (const r of [...approvals, ...informational, ...workers, ...closers]) {
       const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
-      section2.push(`${dirSeg}${r.verb}::${r.id}`);
+      // Category pill: `[claude]` for rows backed by a `/plan:<verb>`
+      // dispatch (approve / work / close); `[info]` for `git-dirty`
+      // informational rows that have no dispatch behind them.
+      const pill = r.verb === "git-dirty" ? " [info]" : " [claude]";
+      section2.push(`${dirSeg}${r.verb}::${r.id}${pill}`);
     }
     // The `---` separator is only emitted between two non-empty sections.
     // When section 1 is empty (no dispatches this run yet) but section 2
