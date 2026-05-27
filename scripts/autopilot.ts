@@ -620,7 +620,7 @@ async function main(): Promise<void> {
   const sockPath = values.sock ?? resolveSockPath();
   const dispatchLogPath = join(dirname(sockPath), "dispatch.log");
   const dryRun = values["dry-run"] === true;
-  const liveShell = createLiveShell({ enabled: true });
+  const liveShell = createLiveShell({ enabled: true, title: "autopilot" });
   let frameCount = 0;
 
   let lastBody: string | null = null;
@@ -680,14 +680,8 @@ async function main(): Promise<void> {
     }
     section1.push(...queued);
 
-    // Title line — same shape across all live keeper scripts (board, git,
-    // autopilot, usage). Sits at the very top of every frame so the
-    // report is self-identifying in the alt-screen view AND in the
-    // sidecar files. Built once here and prepended to whatever section
-    // shape the rest of this function returns.
-    const title = "autopilot";
     if (lastSnap === null) {
-      return section1.length === 0 ? [] : [title, ...section1];
+      return section1;
     }
     const { approvals, workers, closers } = predictNextDispatches(lastSnap);
     if (
@@ -695,7 +689,7 @@ async function main(): Promise<void> {
       workers.length === 0 &&
       closers.length === 0
     ) {
-      return section1.length === 0 ? [] : [title, ...section1];
+      return section1;
     }
     const section2: string[] = [];
     for (const r of [...approvals, ...workers, ...closers]) {
@@ -704,12 +698,11 @@ async function main(): Promise<void> {
     }
     // The `---` separator is only emitted between two non-empty sections.
     // When section 1 is empty (no dispatches this run yet) but section 2
-    // has predicted rows, the preview lines render alone — still under
-    // the title.
+    // has predicted rows, the preview lines render alone.
     if (section1.length === 0) {
-      return [title, ...section2];
+      return section2;
     }
-    return [title, ...section1, "---", ...section2];
+    return [...section1, "---", ...section2];
   }
 
   // --- sidecar paths ---

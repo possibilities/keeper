@@ -187,10 +187,7 @@ export function renderRowLines(
   const wSwPct = widest(sonnetCells.map((c) => c.swPct ?? ""));
   const wSwReset = widest(sonnetCells.map((c) => c.swReset));
 
-  // Title line — same shape across all live keeper scripts (board, git,
-  // autopilot, usage). Sits at the very top of every frame so the report
-  // is self-identifying in the alt-screen view AND in the sidecar files.
-  const lines: string[] = ["usage"];
+  const lines: string[] = [];
   for (const c of cells) {
     const id = c.id.padStart(wId, " ");
     const targetChip =
@@ -224,7 +221,7 @@ async function main(): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
-  const liveShell = createLiveShell({ enabled: true });
+  const liveShell = createLiveShell({ enabled: true, title: "usage" });
   let lastFrame: string | null = null;
   let frameCount = 0;
   let lastRows: Record<string, unknown>[] = [];

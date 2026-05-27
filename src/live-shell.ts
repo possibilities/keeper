@@ -162,6 +162,15 @@ export interface LiveShellOptions {
    * actually terminating the test runner.
    */
   readonly onExit?: () => void;
+  /**
+   * Optional report name rendered at the head of the banner row (e.g.
+   * `"board"` → `[[board]] Showing live results (frame 13)`). Lets each
+   * live keeper script identify itself in the alt-screen without
+   * burning a body-line of vertical space. Omit / pass `""` for no
+   * prefix — back-compat for tests and any caller that doesn't need
+   * the chrome.
+   */
+  readonly title?: string;
 }
 
 /**
@@ -301,6 +310,11 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   const resizeDebounceMs = opts.resizeDebounceMs ?? DEFAULT_RESIZE_DEBOUNCE_MS;
   const safetyNetTarget = opts.safetyNetTarget ?? (process as SafetyNetTarget);
   const onExit = opts.onExit ?? (() => process.exit(0));
+  // Pre-computed `[[<title>]] ` prefix folded into the banner row. Empty
+  // when no title was supplied so the banner reads exactly as it did
+  // pre-title.
+  const titlePrefix =
+    opts.title != null && opts.title !== "" ? `[[${opts.title}]] ` : "";
 
   const history: string[][] = [];
   // The currently-painted rows (offset by 1; index 0 is row 2, etc.). `null`
@@ -342,11 +356,11 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   function bannerFor(view: ViewIdx, total: number): string {
     if (view === "live" || total === 0) {
       return total === 0
-        ? "\x1b[2mShowing live results\x1b[0m"
-        : `\x1b[2mShowing live results (frame ${total})\x1b[0m`;
+        ? `\x1b[2m${titlePrefix}Showing live results\x1b[0m`
+        : `\x1b[2m${titlePrefix}Showing live results (frame ${total})\x1b[0m`;
     }
     // `view` is 0-indexed within the held frames; humans count from 1.
-    return `\x1b[2mframe ${view + 1} of ${total} — press G to return to live\x1b[0m`;
+    return `\x1b[2m${titlePrefix}frame ${view + 1} of ${total} — press G to return to live\x1b[0m`;
   }
 
   /**

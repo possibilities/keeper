@@ -9,9 +9,9 @@
  * snapshots — the live script passes `Date.now()` from both the
  * data-change emit and the 30s tick.
  *
- * `lines[0]` is the fixed `"usage"` title row shared with the sibling
- * live scripts (board / git / autopilot). Data rows start at `lines[1]`;
- * assertions index accordingly.
+ * The renderer returns data rows only — the script title (`"usage"`) is
+ * rendered by the live-shell banner, not the row body, so `lines[0]` is
+ * the first profile row.
  */
 
 import { expect, test } from "bun:test";
@@ -39,12 +39,11 @@ test("renders future reset times with space-separated units", () => {
     ],
     NOW_MS,
   );
-  expect(lines).toHaveLength(2);
-  expect(lines[0]).toBe("usage");
-  expect(lines[1]).toContain("(resets in 5m)");
-  expect(lines[1]).toContain("(resets in 3h 5m)");
-  expect(lines[1]).toContain("session 42%");
-  expect(lines[1]).toContain("week 17%");
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toContain("(resets in 5m)");
+  expect(lines[0]).toContain("(resets in 3h 5m)");
+  expect(lines[0]).toContain("session 42%");
+  expect(lines[0]).toContain("week 17%");
 });
 
 test("renders the round boundary as 'now'", () => {
@@ -62,7 +61,7 @@ test("renders the round boundary as 'now'", () => {
     ],
     NOW_MS,
   );
-  expect(lines[1]).toContain("(resets now)");
+  expect(lines[0]).toContain("(resets now)");
 });
 
 test("renders past reset times with the 'ago' suffix and spaced units", () => {
@@ -83,8 +82,8 @@ test("renders past reset times with the 'ago' suffix and spaced units", () => {
     ],
     NOW_MS,
   );
-  expect(lines[1]).toContain("(resets 2m ago)");
-  expect(lines[1]).toContain("(resets 2h 5m ago)");
+  expect(lines[0]).toContain("(resets 2m ago)");
+  expect(lines[0]).toContain("(resets 2h 5m ago)");
 });
 
 test("collapses to days at the day boundary; drops residual minutes", () => {
@@ -105,8 +104,8 @@ test("collapses to days at the day boundary; drops residual minutes", () => {
     ],
     NOW_MS,
   );
-  expect(lines[1]).toContain("(resets in 1d)");
-  expect(lines[1]).toContain("(resets in 5d 21h)");
+  expect(lines[0]).toContain("(resets in 1d)");
+  expect(lines[0]).toContain("(resets in 5d 21h)");
 });
 
 test("collapses to weeks at the week boundary; drops residual hours", () => {
@@ -127,8 +126,8 @@ test("collapses to weeks at the week boundary; drops residual hours", () => {
     ],
     NOW_MS,
   );
-  expect(lines[1]).toContain("(resets in 1w)");
-  expect(lines[1]).toContain("(resets in 1w 1d)");
+  expect(lines[0]).toContain("(resets in 1w)");
+  expect(lines[0]).toContain("(resets in 1w 1d)");
 });
 
 test("malformed ISO falls through unchanged (no throw)", () => {
@@ -151,8 +150,8 @@ test("malformed ISO falls through unchanged (no throw)", () => {
   );
   // Bad ISO → raw value; empty → empty (no "(resets )" punctuation
   // hiccup beyond the standing format).
-  expect(lines[1]).toContain("(resets not-an-iso)");
-  expect(lines[1]).toContain("(resets )");
+  expect(lines[0]).toContain("(resets not-an-iso)");
+  expect(lines[0]).toContain("(resets )");
 });
 
 test("rounds to the nearest minute (30s window)", () => {
@@ -175,8 +174,8 @@ test("rounds to the nearest minute (30s window)", () => {
     ],
     NOW_MS,
   );
-  expect(lines[1]).toContain("(resets in 1m)");
-  expect(lines[1]).toContain("(resets now)");
+  expect(lines[0]).toContain("(resets in 1m)");
+  expect(lines[0]).toContain("(resets now)");
 });
 
 test("empty row set returns an empty array", () => {
@@ -207,13 +206,12 @@ test("widest-id padding right-aligns the parenthesized id segment", () => {
     ],
     NOW_MS,
   );
-  // Title row at index 0, two data rows after. Each id is wrapped in
-  // `(...)` and padStart-aligned to the widest `(id)` length so the
-  // closing `)` stamps at a fixed column. The short row gets leading
-  // spaces; the long row consumes the full width.
-  expect(lines[0]).toBe("usage");
-  expect(lines[1].startsWith("        (a) ")).toBe(true);
-  expect(lines[2].startsWith("(longer-id) ")).toBe(true);
+  // Each id is wrapped in `(...)` and padStart-aligned to the widest
+  // `(id)` length so the closing `)` stamps at a fixed column. The
+  // short row gets leading spaces; the long row consumes the full
+  // width.
+  expect(lines[0].startsWith("        (a) ")).toBe(true);
+  expect(lines[1].startsWith("(longer-id) ")).toBe(true);
 });
 
 test("sonnet_week_percent adds a third pipe-delimited column to that row", () => {
@@ -249,7 +247,6 @@ test("sonnet_week_percent adds a third pipe-delimited column to that row", () =>
     ],
     NOW_MS,
   );
-  expect(lines[0]).toBe("usage");
   // codex row has no sonnet data — does not render the third column.
   const codexRow = lines.find((l) => l.includes("(codex)")) ?? "";
   expect(codexRow).not.toContain("sonnet");

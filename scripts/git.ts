@@ -142,11 +142,7 @@ export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
  */
 export function renderRowLines(rows: Record<string, unknown>[]): string[] {
   const body = renderRowBlocks(rows).join("\n");
-  if (body === "") return [];
-  // Title line — same shape across all live keeper scripts (board, git,
-  // autopilot, usage). Sits at the very top of every frame so the report
-  // is self-identifying in the alt-screen view AND in the sidecar files.
-  return ["git", ...body.split("\n")];
+  return body === "" ? [] : body.split("\n");
 }
 
 async function main(): Promise<void> {
@@ -166,7 +162,7 @@ async function main(): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
-  const liveShell = createLiveShell({ enabled: true });
+  const liveShell = createLiveShell({ enabled: true, title: "git" });
   let lastFrame: string | null = null;
   let frameCount = 0;
   let lastRows: Record<string, unknown>[] = [];

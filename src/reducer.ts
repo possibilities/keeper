@@ -850,6 +850,26 @@ function extractGitSnapshot(event: Event): GitSnapshotPayload | null {
  * Fold one synthetic git snapshot. The reducer never re-runs git; it only
  * persists the observed payload from the event log, keeping re-fold deterministic
  * even though the original producer observed mutable filesystem state.
+ *
+ * Schema-v28 fan-out: in addition to writing the `git_status` row, this arm
+ * stamps `(git_dirty_count, git_orphan_count)` onto every job enumerated in
+ * `snapshot.jobs[]`. `git_dirty_count` is per-job (the GitJobView's own
+ * `dirty.length`); `git_orphan_count` is the project-wide
+ * `snapshot.orphaned_files.length` broadcast onto every enumerated job
+ * (per-project, not per-job). Each updated jobs row is then re-fanned via
+ * `syncJobIntoEpic` so the embedded `jobs[]` arrays on the parent epic /
+ * task element pick up the new counts. All of this runs inside the same
+ * `BEGIN IMMEDIATE` transaction opened by `applyEvent` — exactly-once-per
+ * -event holds across both projections (the `git_status` write + the
+ * jobs/epics fan-out).
+ *
+ * The from-scratch re-fold sees every historical `GitSnapshot` event in
+ * order and re-derives the same counts byte-identically; the `INSERT OR
+ * IGNORE` -then-`UPDATE` pattern (UPDATE only — no shell-row creation) is
+ * intentional: a snapshot enumerating a job whose `SessionStart` hasn't
+ * folded yet leaves the row absent and the UPDATE matches zero rows. The
+ * next snapshot after SessionStart lands the counts; the gap between is
+ * the same false-clean window as the migration window.
  */
 function projectGitStatus(db: Database, event: Event): void {
   const snapshot = extractGitSnapshot(event);
@@ -891,6 +911,33 @@ function projectGitStatus(db: Database, event: Event): void {
       event.ts,
     ],
   );
+
+  // Schema-v28 fan-out into `jobs`: stamp per-job dirty counts + project
+  // -wide orphan count onto every enumerated job, then re-emit each job's
+  // embedded-array sync so the counts propagate into `epics.jobs[]` /
+  // `epics.tasks[].jobs[]`. Same `BEGIN IMMEDIATE` as the `git_status`
+  // write above + the surrounding cursor advance.
+  const projectOrphans = snapshot.orphaned_files.length;
+  for (const job of snapshot.jobs) {
+    const jobId = job.job_id;
+    if (typeof jobId !== "string" || jobId.length === 0) {
+      continue;
+    }
+    const jobDirty = Array.isArray(job.dirty) ? job.dirty.length : 0;
+    // UPDATE-only (no shell-row insert): a `GitSnapshot` enumerating a job
+    // whose `SessionStart` event hasn't folded yet leaves the row absent
+    // and the UPDATE matches zero rows. The next snapshot after
+    // SessionStart lands the counts.
+    db.run(
+      "UPDATE jobs SET git_dirty_count = ?, git_orphan_count = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
+      [jobDirty, projectOrphans, event.id, event.ts, jobId],
+    );
+    // Re-fan into the embedded `jobs[]` arrays — `syncIfPlanRef` reads the
+    // post-write jobs row and routes via `plan_ref`. A job whose UPDATE
+    // matched zero rows (no SessionStart yet) returns null from the SELECT
+    // and the helper exits without a write.
+    syncIfPlanRef(db, jobId, event.id, event.ts);
+  }
 }
 
 /**
@@ -903,11 +950,50 @@ function projectGitStatus(db: Database, event: Event): void {
  * missing pk is a safe no-op — the invariant says fold must never throw
  * inside the cursor-advance transaction. DELETE is idempotent: re-folding
  * over a row that's already gone matches zero rows, not an error.
+ *
+ * Schema-v28 symmetric clear: before the DELETE, read the soon-to-be-dropped
+ * row's persisted `git_status.jobs` JSON to enumerate the job_ids the last
+ * fan-out stamped, then zero each one's `git_dirty_count` /
+ * `git_orphan_count` and re-emit the `syncJobIntoEpic` fan-out so the
+ * embedded arrays clear in lockstep. Canonical attribution: the SAME
+ * `jobs[]` enumeration that the write side fanned over is the enumeration
+ * the clear walks — symmetric write/clear keeps an unrelated project's
+ * jobs (running in another worktree) untouched. All inside the open
+ * transaction.
  */
 function retractGitStatus(db: Database, event: Event): void {
   const projectDir = event.session_id;
   if (projectDir == null || projectDir.length === 0) {
     return;
+  }
+  // Pre-DELETE: read the row's stored `jobs` JSON to enumerate the job_ids
+  // the last fan-out stamped (canonical attribution). A missing row / empty
+  // / malformed JSON folds to `[]` — no-op, matches the "fold must never
+  // throw" invariant.
+  const row = db
+    .query("SELECT jobs FROM git_status WHERE project_dir = ?")
+    .get(projectDir) as { jobs: string | null } | null;
+  if (row != null && row.jobs != null && row.jobs.length > 0) {
+    let attributedJobs: Array<{ job_id?: unknown }> = [];
+    try {
+      const parsed = JSON.parse(row.jobs);
+      if (Array.isArray(parsed)) {
+        attributedJobs = parsed as Array<{ job_id?: unknown }>;
+      }
+    } catch {
+      // malformed stored array → treat as empty, fall through to DELETE.
+    }
+    for (const job of attributedJobs) {
+      const jobId = job.job_id;
+      if (typeof jobId !== "string" || jobId.length === 0) {
+        continue;
+      }
+      db.run(
+        "UPDATE jobs SET git_dirty_count = 0, git_orphan_count = 0, last_event_id = ?, updated_at = ? WHERE job_id = ?",
+        [event.id, event.ts, jobId],
+      );
+      syncIfPlanRef(db, jobId, event.id, event.ts);
+    }
   }
   db.run("DELETE FROM git_status WHERE project_dir = ?", [projectDir]);
 }
@@ -1453,11 +1539,25 @@ interface EmbeddedJobElement {
   last_api_error_kind: string | null;
   last_input_request_at: number | null;
   last_input_request_kind: string | null;
+  // Schema v28: per-job dirty-file count + project-wide orphan-file count
+  // (broadcast onto every job in the snapshot). Both INTEGER NOT NULL
+  // DEFAULT 0 on the underlying `jobs` row, so the read-side mirror is plain
+  // `number` (never null). Drives the readiness pipeline's `git-uncommitted`
+  // / `git-orphans` predicates via the embedded array on the parent
+  // task / epic element.
+  git_dirty_count: number;
+  git_orphan_count: number;
 }
 
 /**
  * The shape of the post-write `jobs` row {@link syncJobIntoEpic} reads back to
  * build the embedded element. Mirrors the relevant subset of {@link import("./types").Job}.
+ *
+ * Schema-v28: `git_dirty_count` + `git_orphan_count` are required on this
+ * input shape so TypeScript surfaces any caller of `syncJobIntoEpic` (via
+ * the `syncIfPlanRef` SELECT path) that forgets to project them out of
+ * `jobs`. The defaults are `0` on a never-snapshotted row, but the type is
+ * `number` (not `number | null`) because the column is `NOT NULL DEFAULT 0`.
  */
 interface JobsRowForSync {
   job_id: string;
@@ -1472,6 +1572,8 @@ interface JobsRowForSync {
   last_api_error_kind: string | null;
   last_input_request_at: number | null;
   last_input_request_kind: string | null;
+  git_dirty_count: number;
+  git_orphan_count: number;
 }
 
 /**
@@ -1533,6 +1635,8 @@ function buildEmbeddedJob(row: JobsRowForSync): EmbeddedJobElement {
     last_api_error_kind: row.last_api_error_kind,
     last_input_request_at: row.last_input_request_at,
     last_input_request_kind: row.last_input_request_kind,
+    git_dirty_count: row.git_dirty_count,
+    git_orphan_count: row.git_orphan_count,
   };
 }
 
@@ -1751,7 +1855,7 @@ function syncIfPlanRef(
 ): void {
   const row = db
     .query(
-      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind FROM jobs WHERE job_id = ?",
+      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, git_dirty_count, git_orphan_count FROM jobs WHERE job_id = ?",
     )
     .get(jobId) as JobsRowForSync | null;
   if (row == null) {

@@ -465,7 +465,7 @@ async function main(): Promise<void> {
 
   const sockPath = values.sock ?? resolveSockPath();
   const log = (s: string) => process.stdout.write(`${s}\n`);
-  const liveShell = createLiveShell({ enabled: true });
+  const liveShell = createLiveShell({ enabled: true, title: "board" });
   let frameCount = 0;
 
   // Color is for human eyes on a TTY. Pipes / redirects / NO_COLOR stay
@@ -713,11 +713,7 @@ async function main(): Promise<void> {
     } else {
       body = `${e}\n~~~\n${j}`;
     }
-    if (body === "") return [];
-    // Title line — same shape across all live keeper scripts (board, git,
-    // autopilot, usage). Sits at the very top of every frame so the report
-    // is self-identifying in the alt-screen view AND in the sidecar files.
-    return ["board", ...body.split("\n")];
+    return body === "" ? [] : body.split("\n");
   }
 
   // Internal scratch path for the previous frame text — fed to `diff -u` as
