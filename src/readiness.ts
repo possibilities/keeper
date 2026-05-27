@@ -71,8 +71,10 @@
  * gate.
  *
  * Epic header rollup (after per-row + both post-passes):
- *   - `[completed]` if close row verdict is `{ tag: "completed" }`.
- *   - `[ready]`     if any task or close row verdict is `{ tag: "ready" }`.
+ *   - `[completed]`         if close row verdict is `{ tag: "completed" }`.
+ *   - `[ready]`             if any task or close row verdict is `{ tag: "ready" }`.
+ *   - `[running:<kind>]`    if any task or close row verdict is `{ tag: "running" }`
+ *                           (priority slots between `ready` and `blocked`).
  *   - Otherwise `[blocked:<first non-completed row's reason in traversal order>]`.
  */
 
@@ -88,9 +90,6 @@ import type { Epic, Job, SubagentInvocation, Task } from "./types";
  *
  * - `job-rejected` / `job-pending`     — this row's own approval state.
  * - `epic-not-validated`               — parent epic has no `last_validated_at`.
- * - `planner-running`                  — a creator/refiner job for this epic is `working`.
- * - `job-running`                      — an embedded `jobs[]` entry on this row is `working`.
- * - `sub-agent-running`                — a sub-agent invocation for this row's worker is `running`.
  * - `git-uncommitted`                  — the live `git_status` row for this row's project root has
  *                                        `dirty_count > 0` (mechanical gate inserted at rank 6.5;
  *                                        payload-less by design — see the predicate-pipeline docstring
@@ -110,9 +109,6 @@ export type BlockReason =
   | { kind: "job-rejected" }
   | { kind: "job-pending" }
   | { kind: "epic-not-validated" }
-  | { kind: "planner-running" }
-  | { kind: "job-running" }
-  | { kind: "sub-agent-running" }
   | { kind: "git-uncommitted" }
   | { kind: "git-orphans" }
   | { kind: "dep-on-task"; upstream: string }
@@ -121,10 +117,23 @@ export type BlockReason =
   | { kind: "single-task-per-root" }
   | { kind: "unknown" };
 
+/**
+ * The three "in-motion" reasons split out of `BlockReason` into the
+ * sibling `running` Verdict tag. A `running` verdict means the row has a
+ * live worker / sub-agent / planner session actively in motion — distinct
+ * from a `blocked` verdict, which means the row is stuck waiting on a
+ * dependency, approval, repo state, or mutex.
+ */
+export type RunningReason =
+  | { kind: "job-running" }
+  | { kind: "sub-agent-running" }
+  | { kind: "planner-running" };
+
 export type Verdict =
   | { tag: "ready" }
   | { tag: "completed" }
-  | { tag: "blocked"; reason: BlockReason };
+  | { tag: "blocked"; reason: BlockReason }
+  | { tag: "running"; reason: RunningReason };
 
 /**
  * The full readiness snapshot — per-task, per-close-row (keyed by epic_id),
@@ -289,7 +298,7 @@ function evaluateTask(
 
   // 3. planner-running.
   if (anyJobLinkRunning(epic)) {
-    return { tag: "blocked", reason: { kind: "planner-running" } };
+    return { tag: "running", reason: { kind: "planner-running" } };
   }
 
   // 4. own-approval-rejected — rejection is permanent regardless of session
@@ -304,7 +313,7 @@ function evaluateTask(
   // (the embedded array's verb is implied by where it lives — task-level
   // here means verb `work`).
   if (anyEmbeddedJobWorking(task.jobs)) {
-    return { tag: "blocked", reason: { kind: "job-running" } };
+    return { tag: "running", reason: { kind: "job-running" } };
   }
 
   // 6. own-progress-sub — sub-agent invocation under THIS row's worker
@@ -312,7 +321,7 @@ function evaluateTask(
   // may have zero or more workers. A single `running` invocation on any
   // worker blocks.
   if (anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId)) {
-    return { tag: "blocked", reason: { kind: "sub-agent-running" } };
+    return { tag: "running", reason: { kind: "sub-agent-running" } };
   }
 
   // 6.5. git-uncommitted / git-orphans — mechanical gate that blocks autopilot's
@@ -432,7 +441,7 @@ function evaluateCloseRow(
 
   // 3. planner-running.
   if (anyJobLinkRunning(epic)) {
-    return { tag: "blocked", reason: { kind: "planner-running" } };
+    return { tag: "running", reason: { kind: "planner-running" } };
   }
 
   // 4. own-approval-rejected — the close row's own approval lives on the
@@ -453,11 +462,11 @@ function evaluateCloseRow(
   // exits). Without this fan-out, predicate 10 sees every task `completed`
   // and the close row flips to `ready` while a worker is still alive.
   if (anyEmbeddedJobWorking(epic.jobs)) {
-    return { tag: "blocked", reason: { kind: "job-running" } };
+    return { tag: "running", reason: { kind: "job-running" } };
   }
   for (const task of epic.tasks) {
     if (anyEmbeddedJobWorking(task.jobs)) {
-      return { tag: "blocked", reason: { kind: "job-running" } };
+      return { tag: "running", reason: { kind: "job-running" } };
     }
   }
 
@@ -466,11 +475,11 @@ function evaluateCloseRow(
   // Same race as predicate 5: a task's worker can still be running a
   // sub-agent after planctl/human have driven the task to completed.
   if (anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId)) {
-    return { tag: "blocked", reason: { kind: "sub-agent-running" } };
+    return { tag: "running", reason: { kind: "sub-agent-running" } };
   }
   for (const task of epic.tasks) {
     if (anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId)) {
-      return { tag: "blocked", reason: { kind: "sub-agent-running" } };
+      return { tag: "running", reason: { kind: "sub-agent-running" } };
     }
   }
 
@@ -579,15 +588,9 @@ function evaluateCloseRow(
  * worker that would conflict with a freshly-dispatched sibling.
  */
 function isLiveWorkOccupant(verdict: Verdict): boolean {
-  if (verdict.tag !== "blocked") {
-    return false;
-  }
-  const kind = verdict.reason.kind;
   return (
-    kind === "job-running" ||
-    kind === "sub-agent-running" ||
-    kind === "planner-running" ||
-    kind === "job-pending"
+    verdict.tag === "running" ||
+    (verdict.tag === "blocked" && verdict.reason.kind === "job-pending")
   );
 }
 
@@ -779,6 +782,19 @@ function rollupEpicHeader(
     return { tag: "ready" };
   }
 
+  // `[running]` iff any task or close-row is running — priority slots
+  // between `ready` and `blocked`. Reason is the first running row's
+  // reason in traversal order (pre-sorted tasks then close row).
+  for (const task of epic.tasks) {
+    const v = perTask.get(task.task_id);
+    if (v !== undefined && v.tag === "running") {
+      return { tag: "running", reason: v.reason };
+    }
+  }
+  if (closeVerdict !== undefined && closeVerdict.tag === "running") {
+    return { tag: "running", reason: closeVerdict.reason };
+  }
+
   // Otherwise blocked — reason is the first non-completed row in traversal
   // order (pre-sorted tasks then close row).
   for (const task of epic.tasks) {
@@ -792,8 +808,8 @@ function rollupEpicHeader(
     if (v.tag === "blocked") {
       return { tag: "blocked", reason: v.reason };
     }
-    // Defensive: ready slipped past the early-return — re-emit.
-    return { tag: "ready" };
+    // Defensive: ready / running slipped past the early-returns — re-emit.
+    return v;
   }
 
   if (closeVerdict === undefined) {
@@ -802,8 +818,8 @@ function rollupEpicHeader(
   if (closeVerdict.tag === "blocked") {
     return { tag: "blocked", reason: closeVerdict.reason };
   }
-  // Close-row is "ready" — already caught above; or "completed" — already
-  // caught above. Defensive fall-through.
+  // Close-row is "ready" / "running" / "completed" — all caught above.
+  // Defensive fall-through.
   return closeVerdict;
 }
 
@@ -866,9 +882,9 @@ function anyEmbeddedJobHasRunningSubagent(
 // ---------------------------------------------------------------------------
 
 /**
- * Render the bracket pill for a verdict — `[ready]`, `[completed]`, or
- * `[blocked:<reason>]`. String concerns isolated here so the predicate
- * pipeline never touches strings.
+ * Render the bracket pill for a verdict — `[ready]`, `[completed]`,
+ * `[running:<kind>]`, or `[blocked:<reason>]`. String concerns isolated
+ * here so the predicate pipeline never touches strings.
  */
 export function formatPill(verdict: Verdict): string {
   if (verdict.tag === "ready") {
@@ -876,6 +892,9 @@ export function formatPill(verdict: Verdict): string {
   }
   if (verdict.tag === "completed") {
     return "[completed]";
+  }
+  if (verdict.tag === "running") {
+    return `[running:${verdict.reason.kind}]`;
   }
   return `[blocked:${formatReasonShort(verdict.reason)}]`;
 }
@@ -889,12 +908,6 @@ function formatReasonShort(reason: BlockReason): string {
       return "job-pending";
     case "epic-not-validated":
       return "epic-not-validated";
-    case "planner-running":
-      return "planner-running";
-    case "job-running":
-      return "job-running";
-    case "sub-agent-running":
-      return "sub-agent-running";
     case "git-uncommitted":
       return "git-uncommitted";
     case "git-orphans":

@@ -449,7 +449,11 @@ const PILL_COLORS: Record<string, PillBucket> = {
  * interactive tool — color the same as a bare `[blocked]`) AND to the
  * `warn` bucket for any `task-repo:*` payload (so the
  * `[task-repo:<basename>]` divergence pill minted by `taskRepoPillSeg`
- * colors the same as `[blocked]`). Unknown tokens pass through verbatim.
+ * colors the same as `[blocked]`) AND to the `active` (cyan) bucket for
+ * any `running:*` payload (so the `[running:<kind>]` motion pills minted
+ * by `formatPill` for the three reasons split out of `BlockReason` —
+ * `job-running`, `sub-agent-running`, `planner-running` — color the same
+ * as a bare `[running]`). Unknown tokens pass through verbatim.
  *
  * Module-level + exported so `test/board.test.ts` can assert the coloring
  * contract without standing up the subscribe loop. Sidecars and the
@@ -470,6 +474,9 @@ export function colorizePillsInLine(line: string): string {
     }
     if (bucket === undefined && inner.startsWith("task-repo:")) {
       bucket = "warn";
+    }
+    if (bucket === undefined && inner.startsWith("running:")) {
+      bucket = "active";
     }
     if (bucket === undefined) {
       return match;

@@ -17,7 +17,7 @@
  * These tests assert:
  *   1. `projectRows` returns every row in `state.rows` (no collapse).
  *   2. Two `running` invocations sharing one `job_id` reach
- *      `computeReadiness` and produce `[blocked:sub-agent-running]`.
+ *      `computeReadiness` and produce `[running:sub-agent-running]`.
  *
  * `projectRows` now lives in `src/readiness-client.ts`; this file
  * retains the `test/board.test.ts` name because the regression is
@@ -377,7 +377,7 @@ test("collapseSubagentsByName: fn-593.3 collapse → predicate 6 stops blocking"
   // The integration assertion: with the fn-593.3 row shape, the collapsed
   // slice handed to computeReadiness has the surviving row at status='ok'.
   // Predicate 6 (own-progress-sub) no longer fires, so the readiness
-  // verdict for the row's owning task isn't `blocked:sub-agent-running`.
+  // verdict for the row's owning task isn't `running:sub-agent-running`.
   // This is the autopilot-unsticking effect of the client-side collapse.
   const task = makeTask({
     worker_phase: "open",
@@ -415,7 +415,11 @@ test("collapseSubagentsByName: fn-593.3 collapse → predicate 6 stops blocking"
   const snap = computeReadiness([epic], new Map<string, Job>(), collapsed);
   const verdict = snap.perTask.get(task.task_id);
   // Whatever the verdict, it MUST NOT be sub-agent-running — the orphan
-  // turn_seq=1 has been masked by the same-name collapse.
+  // turn_seq=1 has been masked by the same-name collapse. Post-split,
+  // sub-agent-running lives under the `running` tag, not `blocked`.
+  if (verdict?.tag === "running") {
+    expect(verdict.reason.kind).not.toBe("sub-agent-running");
+  }
   if (verdict?.tag === "blocked") {
     expect(verdict.reason.kind).not.toBe("sub-agent-running");
   }
@@ -464,7 +468,7 @@ test("two running invocations on one job_id both reach computeReadiness and bloc
   const snap = computeReadiness([epic], new Map<string, Job>(), projected);
 
   expect(snap.perTask.get(task.task_id)).toEqual({
-    tag: "blocked",
+    tag: "running",
     reason: { kind: "sub-agent-running" },
   });
 });

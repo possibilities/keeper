@@ -24,6 +24,7 @@ import {
   type BlockReason,
   computeReadiness,
   formatPill,
+  type RunningReason,
   type Verdict,
 } from "../src/readiness";
 import type {
@@ -153,6 +154,10 @@ function blocked(reason: BlockReason): Verdict {
   return { tag: "blocked", reason };
 }
 
+function running(reason: RunningReason): Verdict {
+  return { tag: "running", reason };
+}
+
 function run(
   epics: Epic[],
   jobs: Map<string, Job> = new Map(),
@@ -217,7 +222,7 @@ test("predicate 3 (planner-running) wins over 4 (own-approval-rejected)", () => 
   });
   const snap = run([epic]);
   expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "planner-running" }),
+    running({ kind: "planner-running" }),
   );
 });
 
@@ -264,7 +269,7 @@ test("predicate 5 (own-progress-main) wins over 7 (own-approval-pending)", () =>
   const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
   expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "job-running" }),
+    running({ kind: "job-running" }),
   );
 });
 
@@ -281,7 +286,7 @@ test("predicate 6 (own-progress-sub) wins over 7 (own-approval-pending)", () => 
   const subs = [makeSub({ job_id: "worker-1", status: "running" })];
   const snap = run([epic], new Map(), subs);
   expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "sub-agent-running" }),
+    running({ kind: "sub-agent-running" }),
   );
 });
 
@@ -355,7 +360,7 @@ test("predicate 5 (own-progress-main) wins over 6.5 git-uncommitted", () => {
   const gitMap = new Map([["/repo", { dirty_count: 5, orphan_count: 0 }]]);
   const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "job-running" }),
+    running({ kind: "job-running" }),
   );
 });
 
@@ -379,7 +384,7 @@ test("predicate 6 (own-progress-sub) wins over 6.5 git-uncommitted", () => {
   const gitMap = new Map([["/repo", { dirty_count: 3, orphan_count: 0 }]]);
   const snap = run([epic], new Map(), subs, gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "sub-agent-running" }),
+    running({ kind: "sub-agent-running" }),
   );
 });
 
@@ -585,7 +590,7 @@ test("close row: predicate 5 (own-progress-main) wins over 7 (own-approval-pendi
   });
   const snap = run([epic]);
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
-    blocked({ kind: "job-running" }),
+    running({ kind: "job-running" }),
   );
 });
 
@@ -598,7 +603,7 @@ test("predicate 5 (own-progress-main) wins over 6 (own-progress-sub)", () => {
   const subs = [makeSub({ job_id: "worker-1", status: "running" })];
   const snap = run([epic], new Map(), subs);
   expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "job-running" }),
+    running({ kind: "job-running" }),
   );
 });
 
@@ -619,7 +624,7 @@ test("predicate 6 (own-progress-sub) wins over 8 (dep-on-task)", () => {
   const subs = [makeSub({ job_id: "worker-2", status: "running" })];
   const snap = run([epic], new Map(), subs);
   expect(snap.perTask.get(dependent.task_id)).toEqual(
-    blocked({ kind: "sub-agent-running" }),
+    running({ kind: "sub-agent-running" }),
   );
 });
 
@@ -733,7 +738,7 @@ test("per-epic: working task in epic occupies the slot → sibling ready task bl
   const epic = makeEpic({ tasks: [working, ready] });
   const snap = run([epic]);
   expect(snap.perTask.get("fn-1-foo.1")).toEqual(
-    blocked({ kind: "job-running" }),
+    running({ kind: "job-running" }),
   );
   expect(snap.perTask.get("fn-1-foo.2")).toEqual(
     blocked({ kind: "single-task-per-epic" }),
@@ -890,7 +895,7 @@ test("per-root: working task in epic A occupies root → ready task in epic B bl
   });
   const snap = run([e1, e2]);
   expect(snap.perTask.get("fn-1-foo.1")).toEqual(
-    blocked({ kind: "job-running" }),
+    running({ kind: "job-running" }),
   );
   expect(snap.perTask.get("fn-2-bar.1")).toEqual(
     blocked({ kind: "single-task-per-root" }),
@@ -1167,13 +1172,13 @@ test("applySingleTaskPerEpicMutex: ready row before job-running row in same epic
   const epic = makeEpic({ tasks: [t1, t2] });
   const perTask = new Map<string, Verdict>([
     ["fn-1-foo.1", { tag: "ready" }],
-    ["fn-1-foo.2", blocked({ kind: "job-running" })],
+    ["fn-1-foo.2", running({ kind: "job-running" })],
   ]);
   applySingleTaskPerEpicMutex([epic], perTask);
   expect(perTask.get("fn-1-foo.1")).toEqual(
     blocked({ kind: "single-task-per-epic" }),
   );
-  expect(perTask.get("fn-1-foo.2")).toEqual(blocked({ kind: "job-running" }));
+  expect(perTask.get("fn-1-foo.2")).toEqual(running({ kind: "job-running" }));
 });
 
 test("applySingleTaskPerEpicMutex: only ready rows are mutated (already-blocked sibling keeps its reason)", () => {
@@ -1252,11 +1257,11 @@ test("applySingleTaskPerRootMutex: live-work blocked row claims the root", () =>
     tasks: [e2t1],
   });
   const perTask = new Map<string, Verdict>([
-    ["fn-1-foo.1", blocked({ kind: "job-running" })],
+    ["fn-1-foo.1", running({ kind: "job-running" })],
     ["fn-2-bar.1", { tag: "ready" }],
   ]);
   applySingleTaskPerRootMutex([e1, e2], perTask, new Map());
-  expect(perTask.get("fn-1-foo.1")).toEqual(blocked({ kind: "job-running" }));
+  expect(perTask.get("fn-1-foo.1")).toEqual(running({ kind: "job-running" }));
   expect(perTask.get("fn-2-bar.1")).toEqual(
     blocked({ kind: "single-task-per-root" }),
   );
@@ -1323,13 +1328,13 @@ test("applySingleTaskPerRootMutex: ready row in earlier-iterating epic blocked b
   });
   const perTask = new Map<string, Verdict>([
     ["fn-1-foo.1", { tag: "ready" }],
-    ["fn-2-bar.1", blocked({ kind: "job-running" })],
+    ["fn-2-bar.1", running({ kind: "job-running" })],
   ]);
   applySingleTaskPerRootMutex([e1, e2], perTask, new Map());
   expect(perTask.get("fn-1-foo.1")).toEqual(
     blocked({ kind: "single-task-per-root" }),
   );
-  expect(perTask.get("fn-2-bar.1")).toEqual(blocked({ kind: "job-running" }));
+  expect(perTask.get("fn-2-bar.1")).toEqual(running({ kind: "job-running" }));
 });
 
 test("applySingleTaskPerRootMutex: ready close row in earlier epic blocked by job-running task in later epic (same root)", () => {
@@ -1353,7 +1358,7 @@ test("applySingleTaskPerRootMutex: ready close row in earlier epic blocked by jo
     tasks: [e2t1],
   });
   const perTask = new Map<string, Verdict>([
-    ["fn-2-bar.1", blocked({ kind: "job-running" })],
+    ["fn-2-bar.1", running({ kind: "job-running" })],
   ]);
   const perCloseRow = new Map<string, Verdict>([
     ["fn-1-foo", { tag: "ready" }],
@@ -1362,7 +1367,7 @@ test("applySingleTaskPerRootMutex: ready close row in earlier epic blocked by jo
   expect(perCloseRow.get("fn-1-foo")).toEqual(
     blocked({ kind: "single-task-per-root" }),
   );
-  expect(perTask.get("fn-2-bar.1")).toEqual(blocked({ kind: "job-running" }));
+  expect(perTask.get("fn-2-bar.1")).toEqual(running({ kind: "job-running" }));
 });
 
 // ---------------------------------------------------------------------------
@@ -1381,14 +1386,14 @@ test("formatPill renders the three tags + every reason kind", () => {
   expect(formatPill(blocked({ kind: "epic-not-validated" }))).toBe(
     "[blocked:epic-not-validated]",
   );
-  expect(formatPill(blocked({ kind: "planner-running" }))).toBe(
-    "[blocked:planner-running]",
+  expect(formatPill(running({ kind: "planner-running" }))).toBe(
+    "[running:planner-running]",
   );
-  expect(formatPill(blocked({ kind: "job-running" }))).toBe(
-    "[blocked:job-running]",
+  expect(formatPill(running({ kind: "job-running" }))).toBe(
+    "[running:job-running]",
   );
-  expect(formatPill(blocked({ kind: "sub-agent-running" }))).toBe(
-    "[blocked:sub-agent-running]",
+  expect(formatPill(running({ kind: "sub-agent-running" }))).toBe(
+    "[running:sub-agent-running]",
   );
   expect(formatPill(blocked({ kind: "git-uncommitted" }))).toBe(
     "[blocked:git-uncommitted]",
@@ -1468,7 +1473,7 @@ test("close row: task-level worker still working → job-running (even with task
   const snap = run([epic]);
   expect(snap.perTask.get(t.task_id)).toEqual({ tag: "completed" });
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
-    blocked({ kind: "job-running" }),
+    running({ kind: "job-running" }),
   );
 });
 
@@ -1486,7 +1491,7 @@ test("close row: task-level worker has running sub-agent → sub-agent-running",
   const snap = run([epic], new Map(), [sub]);
   expect(snap.perTask.get(t.task_id)).toEqual({ tag: "completed" });
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
-    blocked({ kind: "sub-agent-running" }),
+    running({ kind: "sub-agent-running" }),
   );
 });
 

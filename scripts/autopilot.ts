@@ -697,7 +697,10 @@ export function predictNextDispatches(
       const fut = futureReadiness.perTask.get(taskId);
       if (fut?.tag === "blocked" && fut.reason.kind === "job-pending") {
         approvals.push(previewRowFromTask(task, projectDir, "approve"));
-      } else if (cur.tag === "blocked" && fut?.tag === "ready") {
+      } else if (
+        (cur.tag === "blocked" || cur.tag === "running") &&
+        fut?.tag === "ready"
+      ) {
         workers.push(previewRowFromTask(task, projectDir, "work"));
       }
     }
@@ -712,7 +715,10 @@ export function predictNextDispatches(
     const fut = futureReadiness.perCloseRow.get(epicId);
     if (fut?.tag === "blocked" && fut.reason.kind === "job-pending") {
       approvals.push(previewRowFromEpic(epic, "approve"));
-    } else if (cur.tag === "blocked" && fut?.tag === "ready") {
+    } else if (
+      (cur.tag === "blocked" || cur.tag === "running") &&
+      fut?.tag === "ready"
+    ) {
       closers.push(previewRowFromEpic(epic, "close"));
     }
   }
@@ -1417,6 +1423,9 @@ async function main(): Promise<void> {
     }
     if (v.tag === "completed") {
       return "completed";
+    }
+    if (v.tag === "running") {
+      return `running:${v.reason.kind}`;
     }
     return `blocked:${v.reason.kind}`;
   }
