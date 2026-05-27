@@ -34,5 +34,5 @@ kinds explicitly.
 - [ ] All existing readiness tests still pass
 
 ## Done summary
-
+Rewrote applySingleTaskPerEpicMutex/applySingleTaskPerRootMutex JSDoc to describe pass-1 (isLiveWorkOccupant whitelist) vs pass-2 (ready tiebreak) semantics; renamed two tests away from 'any non-completed verdict' phrasing and added per-mutex dep-on-task negative-control tests that lock in the narrowed whitelist.
 ## Evidence
