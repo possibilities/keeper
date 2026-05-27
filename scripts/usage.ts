@@ -15,8 +15,9 @@
  * `scripts/git.ts`. The script's job is rendering rows + writing sidecars;
  * the helper handles everything below the rows.
  *
- * Reset cells render as minute-rounded relative time (`in 3h5m`, `5m`,
- * `now`, `2m ago`) against the current wall clock. For the live frame in
+ * Reset cells render as minute-rounded humanized relative time
+ * (`in 5d 21h`, `in 3h 5m`, `in 5m`, `now`, `2h 5m ago`) against the
+ * current wall clock. For the live frame in
  * TUI mode a 30s tick re-renders via `liveShell.refreshLive` so the visible
  * countdown ticks forward without growing history or writing sidecars;
  * historical scroll-back keeps each frame's at-capture rendering, so the
@@ -46,9 +47,10 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   print on exit.
 
 Rows show one agentuse profile: id, target + multiplier, session % +
-reset (minute-rounded relative time, e.g. \`in 3h5m\`), week % +
-reset. The live frame re-renders every 30s so countdowns tick;
-historical scroll-back stays frozen at each frame's capture time.
+reset (minute-rounded humanized relative time, e.g. \`in 5d 21h\` /
+\`in 1h 16m\` / \`in 5m\` / \`now\`), week % + reset. The live frame
+re-renders every 30s so countdowns tick; historical scroll-back
+stays frozen at each frame's capture time.
 Per-frame sidecars under /tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*
 with an indexed meta sidecar; session paths print on SIGINT.
 `;
@@ -68,7 +70,18 @@ function pct(v: unknown): string {
  * Returns `""` for an empty input (no reset known), the raw input string
  * if the ISO is unparseable (degrade gracefully — better than throwing
  * inside a render hot path), `"now"` at the round boundary, and
- * `in 3h5m` / `5m` / `2m ago` / `3h5m ago` otherwise.
+ * a two-unit-max largest-first form otherwise:
+ *
+ *   - `≥ 1 week`: `Nw Md` (residual hours dropped — at week scale,
+ *     minute precision is noise; the residual hours under a day
+ *     wouldn't be worth showing either).
+ *   - `≥ 1 day`:  `Nd Mh` (residual minutes dropped).
+ *   - `≥ 1 hour`: `Nh Mm`.
+ *   - otherwise: `Mm`.
+ *
+ * Zero residuals collapse: `1w` not `1w 0d`, `1d` not `1d 0h`, `1h`
+ * not `1h 0m`. Suffix is `in <body>` for the future, `<body> ago` for
+ * the past.
  *
  * `nowMs` is a parameter (not `Date.now()` baked in) so tests can drive
  * deterministic snapshots AND so the 30s tick can pass a fresh clock
@@ -82,9 +95,24 @@ function relTime(iso: string, nowMs: number): string {
   if (diffMin === 0) return "now";
   const past = diffMin < 0;
   const total = Math.abs(diffMin);
-  const h = Math.floor(total / 60);
-  const m = total % 60;
-  const body = h > 0 ? `${h}h${m}m` : `${m}m`;
+  const days = Math.floor(total / 1440);
+  const weeks = Math.floor(days / 7);
+  let body: string;
+  if (weeks >= 1) {
+    const d = days % 7;
+    body = d > 0 ? `${weeks}w ${d}d` : `${weeks}w`;
+  } else if (days >= 1) {
+    const h = Math.floor((total - days * 1440) / 60);
+    body = h > 0 ? `${days}d ${h}h` : `${days}d`;
+  } else {
+    const h = Math.floor(total / 60);
+    const m = total % 60;
+    if (h > 0) {
+      body = m > 0 ? `${h}h ${m}m` : `${h}h`;
+    } else {
+      body = `${m}m`;
+    }
+  }
   return past ? `${body} ago` : `in ${body}`;
 }
 

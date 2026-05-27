@@ -20,7 +20,7 @@ function isoOffset(minutes: number): string {
   return new Date(NOW_MS + minutes * 60_000).toISOString();
 }
 
-test("renders future reset times as 'in Xh{Y}m' / 'in Ym'", () => {
+test("renders future reset times with space-separated units", () => {
   const lines = renderRowLines(
     [
       {
@@ -30,14 +30,14 @@ test("renders future reset times as 'in Xh{Y}m' / 'in Ym'", () => {
         session_percent: 42,
         session_resets_at: isoOffset(5), // 5 minutes ahead
         week_percent: 17,
-        week_resets_at: isoOffset(185), // 3h05m ahead
+        week_resets_at: isoOffset(185), // 3h 5m ahead
       },
     ],
     NOW_MS,
   );
   expect(lines).toHaveLength(1);
   expect(lines[0]).toContain("(resets in 5m)");
-  expect(lines[0]).toContain("(resets in 3h5m)");
+  expect(lines[0]).toContain("(resets in 3h 5m)");
   expect(lines[0]).toContain("session 42%");
   expect(lines[0]).toContain("week 17%");
 });
@@ -60,7 +60,7 @@ test("renders the round boundary as 'now'", () => {
   expect(lines[0]).toContain("(resets now)");
 });
 
-test("renders past reset times as 'Xh{Y}m ago' / 'Ym ago'", () => {
+test("renders past reset times with the 'ago' suffix and spaced units", () => {
   // Defensive: reset times should be in the future, but a stale
   // projection or clock skew could surface a past timestamp. Render
   // it honestly rather than swallowing.
@@ -79,7 +79,51 @@ test("renders past reset times as 'Xh{Y}m ago' / 'Ym ago'", () => {
     NOW_MS,
   );
   expect(lines[0]).toContain("(resets 2m ago)");
-  expect(lines[0]).toContain("(resets 2h5m ago)");
+  expect(lines[0]).toContain("(resets 2h 5m ago)");
+});
+
+test("collapses to days at the day boundary; drops residual minutes", () => {
+  // ≥ 1d branch: format is `Nd Mh` (residual minutes dropped — at the
+  // day scale, minute precision is noise). At exactly 24h the hour
+  // residual is zero so the output collapses to `1d`.
+  const lines = renderRowLines(
+    [
+      {
+        id: "a",
+        target: "opus",
+        multiplier: 1,
+        session_percent: 0,
+        session_resets_at: isoOffset(24 * 60), // exactly 1 day
+        week_percent: 0,
+        week_resets_at: isoOffset(141 * 60 + 16), // 141h 16m → 5d 21h
+      },
+    ],
+    NOW_MS,
+  );
+  expect(lines[0]).toContain("(resets in 1d)");
+  expect(lines[0]).toContain("(resets in 5d 21h)");
+});
+
+test("collapses to weeks at the week boundary; drops residual hours", () => {
+  // ≥ 1w branch: format is `Nw Md`. At exactly 7d the day residual is
+  // zero so the output collapses to `1w`; 8d8h rounds to `1w 1d` (the
+  // 8 hours drop because at week scale they're noise).
+  const lines = renderRowLines(
+    [
+      {
+        id: "a",
+        target: "opus",
+        multiplier: 1,
+        session_percent: 0,
+        session_resets_at: isoOffset(7 * 24 * 60), // exactly 1 week
+        week_percent: 0,
+        week_resets_at: isoOffset(8 * 24 * 60 + 8 * 60), // 8d 8h → 1w 1d
+      },
+    ],
+    NOW_MS,
+  );
+  expect(lines[0]).toContain("(resets in 1w)");
+  expect(lines[0]).toContain("(resets in 1w 1d)");
 });
 
 test("malformed ISO falls through unchanged (no throw)", () => {
