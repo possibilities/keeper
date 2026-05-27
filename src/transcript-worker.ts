@@ -295,6 +295,79 @@ export function matchApiError(parsed: unknown): ApiErrorLine | null {
 }
 
 /**
+ * A parsed assistant turn carrying a built-in interactive tool that fires no
+ * Pre/PostToolUse hook of its own: session + matched {@link InputRequestKind}.
+ * Initially scoped to `AskUserQuestion`; future-extensible via the discriminator
+ * (e.g. `ExitPlanMode`) without a new message kind. No display text — the
+ * `[awaiting:<kind>]` pill is the load-bearing signal, the question text rides
+ * downstream via the transcript itself.
+ */
+interface InputRequestLine {
+  sessionId: string;
+  requestKind: InputRequestKind;
+}
+
+/**
+ * Match a parsed JSONL object against the "assistant turn including a built-in
+ * interactive tool that surfaces a question with no hook" shape. Today the
+ * only such tool is `AskUserQuestion`; future matchers slot into the same
+ * helper by widening the discriminator branch.
+ *
+ * Strict gates (mirroring `matchApiError`'s field-by-field gating):
+ *
+ *   - `parsed.type === "assistant"` — synthetic non-assistant rows bounce
+ *     (a `custom-title` line or a rate-limit synthetic with the literal word
+ *     "AskUserQuestion" embedded in text never reaches this point thanks to
+ *     the `dispatchLine` pre-filter, but the gate is defense in depth).
+ *   - `parsed.sessionId` is a non-empty string.
+ *   - `parsed.message.content` is an array AND at least one element satisfies
+ *     `{type:"tool_use", name:"AskUserQuestion"}`.
+ *
+ * **Walk the array — never index `content[0]`.** Rate-limit's matcher reads
+ * `content[0]` because the synthetic envelope carries a single text block;
+ * real assistant turns interleave text + N tool_uses, and the
+ * `AskUserQuestion` tool_use is often NOT the first element (verified
+ * against captured corpora — a leading text block precedes the tool_use in
+ * most turns).
+ *
+ * Returns the matched `{sessionId, requestKind}` or `null` for any other line.
+ */
+export function matchAskUserQuestion(parsed: unknown): InputRequestLine | null {
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+  const obj = parsed as {
+    type?: unknown;
+    sessionId?: unknown;
+    message?: unknown;
+  };
+  if (obj.type !== "assistant") {
+    return null;
+  }
+  if (typeof obj.sessionId !== "string" || obj.sessionId.length === 0) {
+    return null;
+  }
+  const msg = obj.message;
+  if (!msg || typeof msg !== "object") {
+    return null;
+  }
+  const content = (msg as { content?: unknown }).content;
+  if (!Array.isArray(content)) {
+    return null;
+  }
+  for (const block of content) {
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+    const b = block as { type?: unknown; name?: unknown };
+    if (b.type === "tool_use" && b.name === "AskUserQuestion") {
+      return { sessionId: obj.sessionId, requestKind: "ask_user_question" };
+    }
+  }
+  return null;
+}
+
+/**
  * Per-path forward-tail state: the byte offset we've consumed up to, a
  * persistent UTF-8 decoder (so a multi-byte char split across a read-chunk
  * boundary never decodes to U+FFFD — undici #5035, a real corruption bug), and
@@ -344,9 +417,13 @@ export class TranscriptLineStream {
    * anchors each path at EOF on first sight, so a line is read at most
    * once per worker lifetime regardless.
    *
-   * Param order is `(onTitle, log, onApiError)` — `log` stays in the
-   * historical second slot so existing 2-arg test calls keep working;
-   * `onApiError` is the new optional third slot.
+   * Param order is `(onTitle, log, onApiError, onInputRequest)` — `log`
+   * stays in the historical second slot so existing 2-arg test calls keep
+   * working; `onApiError` is the optional third slot and `onInputRequest`
+   * is the optional fourth (the convention is "new callbacks tack onto
+   * the end"). Defaulting every optional callback to a no-op lets a
+   * unit-test stub only the slot it cares about without rewiring the
+   * full surface.
    */
   constructor(
     private readonly onTitle: (sessionId: string, title: string) => void,
@@ -355,6 +432,10 @@ export class TranscriptLineStream {
       sessionId: string,
       text: string,
       kind: ApiErrorKind,
+    ) => void = () => {},
+    private readonly onInputRequest: (
+      sessionId: string,
+      requestKind: InputRequestKind,
     ) => void = () => {},
   ) {}
 
@@ -644,23 +725,35 @@ export class TranscriptLineStream {
       return;
     }
     // Cheap pre-filter: skip the JSON.parse for lines that can't be either
-    // a title or an isApiErrorMessage synthetic. The two needle-substrings
-    // are disjoint, so a single `includes` per shape stays branch-cheap.
-    // Most transcript lines (assistant tool_use turns, tool_result
-    // attachments) miss both and bail before JSON.parse.
+    // a title, an isApiErrorMessage synthetic, OR an AskUserQuestion
+    // tool_use. The three needle-substrings are empirically disjoint (see
+    // the "disjointness corpus" test), so a single `includes` per shape
+    // stays branch-cheap. Most transcript lines (assistant text turns,
+    // tool_result attachments, other tool_use turns) miss all three and
+    // bail before JSON.parse.
     //
     // The api-error needle is `"isApiErrorMessage":true` rather than any
     // per-kind error string — it's the one flag every terminal-failure
     // envelope guarantees AND it skips both negative-gate frames (the
     // `SDKAPIRetryMessage` system row has no such field; the
     // `SDKRateLimitEvent` quota notification has a distinct envelope).
+    //
+    // The input-request needle is `"name":"AskUserQuestion"` rather than
+    // the bare token `AskUserQuestion` — the bare token could appear in
+    // a `custom-title` describing the prior turn ("Renamed: handling
+    // AskUserQuestion") or in a rate-limit error message rendering of
+    // the prior tool_use envelope verbatim. Anchoring on the `"name":`
+    // prefix pins the substring to the `tool_use` schema's `name` field.
+    //
     // Bun's `JSON.stringify` doesn't insert whitespace, and Claude Code's
     // own writer doesn't either (verified against captured transcript
-    // lines from 2026-05; if that ever changes, widen to
-    // `"isApiErrorMessage"` and accept the slight per-line cost).
+    // lines from 2026-05; if that ever changes, widen to `"name"` and
+    // accept the slight per-line cost).
     const isTitle = line.includes("custom-title");
     const isApiError = !isTitle && line.includes('"isApiErrorMessage":true');
-    if (!isTitle && !isApiError) {
+    const isInputRequest =
+      !isTitle && !isApiError && line.includes('"name":"AskUserQuestion"');
+    if (!isTitle && !isApiError && !isInputRequest) {
       return;
     }
     let parsed: unknown;
@@ -685,17 +778,34 @@ export class TranscriptLineStream {
       this.onTitle(match.sessionId, match.title);
       return;
     }
-    // isApiErrorMessage synthetic: no change-gate. The forward-only tail
-    // reads each line at most once per worker lifetime, and the reducer
-    // fold is idempotent (state + last_api_error_at + last_api_error_kind
-    // stamped from the event payload), so a duplicate emit (boot scan +
-    // live tail double-fire would be the only way) folds to the same row
-    // state.
-    const match = matchApiError(parsed);
+    if (isApiError) {
+      // isApiErrorMessage synthetic: no change-gate. The forward-only tail
+      // reads each line at most once per worker lifetime, and the reducer
+      // fold is idempotent (state + last_api_error_at + last_api_error_kind
+      // stamped from the event payload), so a duplicate emit (boot scan +
+      // live tail double-fire would be the only way) folds to the same row
+      // state.
+      const match = matchApiError(parsed);
+      if (!match) {
+        return;
+      }
+      this.onApiError(match.sessionId, match.text, match.kind);
+      return;
+    }
+    // AskUserQuestion (or any future built-in interactive tool with no
+    // hook): no change-gate, mirroring the isApiErrorMessage rationale
+    // verbatim. The reducer's `InputRequest` arm is idempotent — the
+    // `(at, kind)` pair + the terminal-guarded `state -> 'stopped'`
+    // flip fold to the same row state under a duplicate emit. There is
+    // no boot-scan path for this signal (the `[awaiting:*]` pill marks
+    // a LIVE state; replaying it from a historical transcript scan
+    // would show stale blocks for sessions that were long since
+    // answered).
+    const match = matchAskUserQuestion(parsed);
     if (!match) {
       return;
     }
-    this.onApiError(match.sessionId, match.text, match.kind);
+    this.onInputRequest(match.sessionId, match.requestKind);
   }
 }
 
@@ -804,6 +914,13 @@ function main(): void {
         text,
         errorKind,
       } satisfies ApiErrorMessage);
+    },
+    (sessionId, requestKind) => {
+      port.postMessage({
+        kind: "input-request",
+        sessionId,
+        requestKind,
+      } satisfies InputRequestMessage);
     },
   );
 

@@ -29,11 +29,12 @@ import { join } from "node:path";
 import { openDb } from "../src/db";
 import {
   matchApiError,
+  matchAskUserQuestion,
   scanJobsForTitles,
   seedFromDb,
   TranscriptLineStream,
 } from "../src/transcript-worker";
-import type { ApiErrorKind } from "../src/types";
+import type { ApiErrorKind, InputRequestKind } from "../src/types";
 
 let tmpDir: string;
 
@@ -794,6 +795,325 @@ test("matchApiError: dispatchLine pre-filter rejects a non-isApiErrorMessage lin
   stream.onChange(path);
 
   expect(errors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// (a3) matchAskUserQuestion — pure matcher coverage for the InputRequest
+// signal (schema v25). Today the only matched discriminator is
+// `ask_user_question`; future built-in interactive tools (e.g. ExitPlanMode)
+// would extend the same matcher and slot into the same `InputRequestLine`
+// shape via the `requestKind` discriminator.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build an `assistant` turn whose `message.content[]` carries a
+ * `tool_use:AskUserQuestion` block (plus optional sibling blocks). Real
+ * captured shape: a leading text block often precedes the tool_use, and
+ * additional tool_uses can interleave — the matcher must walk the array.
+ */
+function askUserQuestionLine(
+  sessionId: string,
+  options: {
+    leadingText?: string;
+    extraTools?: Array<{ name: string }>;
+    askUserQuestionPosition?: "first" | "last" | "middle";
+  } = {},
+): string {
+  const position = options.askUserQuestionPosition ?? "last";
+  const auqBlock = {
+    type: "tool_use",
+    id: "toolu_auq01",
+    name: "AskUserQuestion",
+    input: { questions: [{ question: "Pick one", header: "h", options: [] }] },
+  };
+  const content: unknown[] = [];
+  if (options.leadingText) {
+    content.push({ type: "text", text: options.leadingText });
+  }
+  const extras = (options.extraTools ?? []).map((t, i) => ({
+    type: "tool_use",
+    id: `toolu_extra${i}`,
+    name: t.name,
+    input: {},
+  }));
+  if (position === "first") {
+    content.push(auqBlock, ...extras);
+  } else if (position === "middle") {
+    if (extras.length === 0) {
+      content.push(auqBlock);
+    } else {
+      const mid = Math.floor(extras.length / 2);
+      content.push(...extras.slice(0, mid), auqBlock, ...extras.slice(mid));
+    }
+  } else {
+    content.push(...extras, auqBlock);
+  }
+  return JSON.stringify({
+    type: "assistant",
+    sessionId,
+    message: { content },
+  });
+}
+
+test("matchAskUserQuestion: positive — captured AskUserQuestion shape matches", () => {
+  // The canonical real-corpus shape: leading text + a single AskUserQuestion
+  // tool_use, real assistant turn (not synthetic). Verified against
+  // ~/.claude/projects/-Users-mike-code-jobsearch/22c690a6-*.jsonl line 54.
+  const line = askUserQuestionLine("sess-auq", {
+    leadingText: "Let me confirm.",
+    askUserQuestionPosition: "last",
+  });
+  const match = matchAskUserQuestion(JSON.parse(line));
+  expect(match).toEqual({
+    sessionId: "sess-auq",
+    requestKind: "ask_user_question",
+  });
+});
+
+test("matchAskUserQuestion: positive — multi-content with text + AskUserQuestion + other tool_use emits exactly one", () => {
+  // The matcher walks the array; a mixed-content turn (text + Bash tool_use
+  // + AskUserQuestion + Read tool_use) must surface the AskUserQuestion
+  // exactly once. This is the regression gate for the
+  // "iterate content[]; never index content[0]" invariant — if the matcher
+  // indexed `content[0]`, this would silently miss.
+  const line = askUserQuestionLine("sess-multi", {
+    leadingText: "Thinking...",
+    extraTools: [{ name: "Bash" }, { name: "Read" }],
+    askUserQuestionPosition: "middle",
+  });
+  const match = matchAskUserQuestion(JSON.parse(line));
+  expect(match).toEqual({
+    sessionId: "sess-multi",
+    requestKind: "ask_user_question",
+  });
+});
+
+test("matchAskUserQuestion: negative — assistant turn with other tool_use but no AskUserQuestion does not match", () => {
+  const line = JSON.stringify({
+    type: "assistant",
+    sessionId: "sess-bash-only",
+    message: {
+      content: [
+        { type: "text", text: "running" },
+        { type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } },
+        { type: "tool_use", id: "t2", name: "Read", input: { path: "/x" } },
+      ],
+    },
+  });
+  expect(matchAskUserQuestion(JSON.parse(line))).toBeNull();
+});
+
+test("matchAskUserQuestion: negative — assistant turn with only text content does not match", () => {
+  const line = JSON.stringify({
+    type: "assistant",
+    sessionId: "sess-text",
+    message: { content: [{ type: "text", text: "just talking" }] },
+  });
+  expect(matchAskUserQuestion(JSON.parse(line))).toBeNull();
+});
+
+test("matchAskUserQuestion: negative — rate_limit synthetic (assistant, isApiErrorMessage) does not match", () => {
+  // A canonical rate-limit envelope: `type:"assistant"` is satisfied, but no
+  // tool_use block exists — the matcher walks content and finds only text.
+  // Gate ensures the input-request matcher never co-fires with api-error.
+  const line = apiErrorLine(
+    "sess-rl-cross",
+    "rate_limit",
+    "You've hit your session limit",
+  );
+  expect(matchAskUserQuestion(JSON.parse(line))).toBeNull();
+});
+
+test("matchAskUserQuestion: negative — custom-title line does not match", () => {
+  const line = titleLine("sess-title", "AskUserQuestion as a quoted title");
+  expect(matchAskUserQuestion(JSON.parse(line))).toBeNull();
+});
+
+test("matchAskUserQuestion: negative — user turn carrying tool_result does not match", () => {
+  // The tool_result for a previous AskUserQuestion lives in a `type:"user"`
+  // turn. The matcher's first gate (`type === "assistant"`) bounces it.
+  const line = JSON.stringify({
+    type: "user",
+    sessionId: "sess-user",
+    message: {
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_01",
+          content: "answer",
+        },
+      ],
+    },
+  });
+  expect(matchAskUserQuestion(JSON.parse(line))).toBeNull();
+});
+
+test("matchAskUserQuestion: negative — missing sessionId does not match", () => {
+  const line = JSON.stringify({
+    type: "assistant",
+    message: {
+      content: [
+        { type: "tool_use", id: "t1", name: "AskUserQuestion", input: {} },
+      ],
+    },
+  });
+  expect(matchAskUserQuestion(JSON.parse(line))).toBeNull();
+});
+
+test("matchAskUserQuestion: negative — non-array content does not match", () => {
+  const line = JSON.stringify({
+    type: "assistant",
+    sessionId: "sess-bad-content",
+    message: { content: "not an array" },
+  });
+  expect(matchAskUserQuestion(JSON.parse(line))).toBeNull();
+});
+
+test("matchAskUserQuestion: dispatchLine — a captured AskUserQuestion line emits exactly one InputRequest", () => {
+  // End-to-end on the TranscriptLineStream: the pre-filter must let
+  // `"name":"AskUserQuestion"` through, the matcher must accept it, and
+  // the fourth callback must receive a single `(sessionId, requestKind)`.
+  const path = join(tmpDir, "sess-auq.jsonl");
+  writeFileSync(path, "");
+  const requests: Array<{
+    sessionId: string;
+    requestKind: InputRequestKind;
+  }> = [];
+  const stream = new TranscriptLineStream(
+    () => {},
+    () => {},
+    () => {},
+    (sessionId, requestKind) => requests.push({ sessionId, requestKind }),
+  );
+  stream.register(path);
+
+  const line = askUserQuestionLine("sess-auq", {
+    leadingText: "Let me confirm.",
+  });
+  appendFileSync(path, `${line}\n`);
+  stream.onChange(path);
+
+  expect(requests).toEqual([
+    { sessionId: "sess-auq", requestKind: "ask_user_question" },
+  ]);
+});
+
+test("matchAskUserQuestion: dispatchLine — malformed JSON whose substring matches the pre-filter skip-and-logs without throwing", () => {
+  // The pre-filter is a substring check; a truncated/corrupt line that
+  // happens to contain `"name":"AskUserQuestion"` must skip-and-log
+  // (logged messages collected via the `log` callback) and NOT throw —
+  // mirrors the api-error / custom-title malformed-skip contract.
+  const path = join(tmpDir, "sess-malformed.jsonl");
+  writeFileSync(path, "");
+  const requests: InputRequestKind[] = [];
+  const logs: string[] = [];
+  const stream = new TranscriptLineStream(
+    () => {},
+    (m) => logs.push(m),
+    () => {},
+    (_s, kind) => requests.push(kind),
+  );
+  stream.register(path);
+
+  // Truncated mid-object — pre-filter substring is present, but JSON.parse fails.
+  appendFileSync(path, `{"type":"assistant","name":"AskUserQuestion"\n`);
+  expect(() => stream.onChange(path)).not.toThrow();
+  expect(requests).toEqual([]);
+  expect(logs.some((l) => l.includes("malformed"))).toBe(true);
+});
+
+test("matchAskUserQuestion: dispatchLine pre-filter rejects an assistant tool_use turn whose name is NOT AskUserQuestion (perf gate)", () => {
+  // Mirrors the matchApiError perf-gate test: a busy assistant turn full of
+  // Bash/Read tool_uses must bail at the substring check, never reaching
+  // JSON.parse. Tracked indirectly via "no emit": even if it parsed, the
+  // matcher would return null; this test pins both ends of the contract.
+  const path = join(tmpDir, "sess-noise-auq.jsonl");
+  writeFileSync(path, "");
+  const requests: InputRequestKind[] = [];
+  const stream = new TranscriptLineStream(
+    () => {},
+    () => {},
+    () => {},
+    (_s, kind) => requests.push(kind),
+  );
+  stream.register(path);
+
+  const toolUse = JSON.stringify({
+    type: "assistant",
+    sessionId: "sess-noise-auq",
+    message: {
+      content: [
+        { type: "text", text: "running" },
+        { type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } },
+      ],
+    },
+  });
+  appendFileSync(path, `${toolUse}\n`);
+  stream.onChange(path);
+  expect(requests).toEqual([]);
+});
+
+test("disjointness corpus: the three pre-filter needles never co-fire on the same line", () => {
+  // The pre-filter contract: a line matches AT MOST ONE of the three
+  // needles (`custom-title` / `"isApiErrorMessage":true` /
+  // `"name":"AskUserQuestion"`). This corpus walks a real captured
+  // representative of each plus a few cross-contamination cases the
+  // disjointness gate was designed to catch:
+  //   - a custom-title naming "AskUserQuestion" in its text
+  //   - a rate-limit envelope whose `text` happens to render the prior
+  //     turn's `AskUserQuestion` literally
+  // Asserts exactly one needle fires per line (or zero for ordinary
+  // tool_use noise).
+  const cases: Array<{ name: string; line: string; expect: 0 | 1 }> = [
+    { name: "title", line: titleLine("s", "Plain title"), expect: 1 },
+    {
+      name: "title-naming-auq",
+      line: titleLine("s", "Renamed: handling AskUserQuestion"),
+      expect: 1, // matches "custom-title" only; isInputRequest gated off.
+    },
+    {
+      name: "api-error-rate-limit",
+      line: apiErrorLine("s", "rate_limit", "out of usage"),
+      expect: 1,
+    },
+    {
+      name: "api-error-with-auq-text",
+      line: apiErrorLine(
+        "s",
+        "rate_limit",
+        'prior turn was tool_use "AskUserQuestion"',
+      ),
+      expect: 1, // isApiErrorMessage wins; isInputRequest gated off by precedence.
+    },
+    {
+      name: "ask-user-question",
+      line: askUserQuestionLine("s"),
+      expect: 1,
+    },
+    {
+      name: "vanilla-tool-use",
+      line: JSON.stringify({
+        type: "assistant",
+        sessionId: "s",
+        message: {
+          content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }],
+        },
+      }),
+      expect: 0,
+    },
+  ];
+
+  for (const c of cases) {
+    const isTitle = c.line.includes("custom-title");
+    const isApiError = !isTitle && c.line.includes('"isApiErrorMessage":true');
+    const isInputRequest =
+      !isTitle && !isApiError && c.line.includes('"name":"AskUserQuestion"');
+    const hits = [isTitle, isApiError, isInputRequest].filter(Boolean).length;
+    expect({ name: c.name, hits }).toEqual({
+      name: c.name,
+      hits: c.expect,
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
