@@ -106,5 +106,5 @@ Wire shape:
       shape).
 
 ## Done summary
-
+Added matchAskUserQuestion() parser, fourth onInputRequest callback on TranscriptLineStream, third dispatchLine pre-filter needle ('"name":"AskUserQuestion"' — empirically disjoint from the existing two), and worker main() wiring that posts InputRequestMessage. No boot-scan path — forward-tail-only, mirroring RateLimited/ApiError. Tests cover positive (real captured shape), multi-content (text + AUQ + other tool_use, regression gate for iterate-not-index), negatives (other tool_use only, text only, rate-limit cross-fire, custom-title cross-fire, user turn with tool_result, missing sessionId, non-array content), malformed-skip, perf-gate, and a disjointness corpus.
 ## Evidence
