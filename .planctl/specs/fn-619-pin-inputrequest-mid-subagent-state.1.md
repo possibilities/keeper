@@ -8,5 +8,5 @@ Finding F6 from the fn-617-add-input-request-pill audit. The Stop arm at test/re
 - [ ] bun test test/reducer.test.ts passes
 
 ## Done summary
-
+Added reducer test pinning InputRequest's intentional behavioral asymmetry vs Stop/ApiError: an InputRequest event on a session with a running subagent_invocations row must still flip state to 'stopped' and stamp the (last_input_request_at, last_input_request_kind) pair.
 ## Evidence
