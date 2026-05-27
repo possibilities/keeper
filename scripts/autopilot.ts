@@ -22,23 +22,35 @@
  *    dry?, pid?}` — written by `logDispatch` the moment autopilot
  *    fires (or would-have-fired in dry mode).
  *   `{"kind":"fulfilled", ts, verb, id, pid?}` — written by
- *    `detectFulfillments` the first time an embedded job for the
+ *    `detectJobTransitions` the first time an embedded job for the
  *    dispatched `(verb, id)` appears in the readiness snapshot. Marks
  *    the dispatch as claimed for life — section 1's "queued → current"
  *    move pivots on this, and the durable re-dispatch guard rides on
  *    the matching `dispatchedKeys` set so a session-ended → verdict-
  *    flips-back-to-ready cycle cannot open a second Ghostty window.
+ *   `{"kind":"completed", ts, verb, id, pid?}` — written by
+ *    `detectJobTransitions` the first time the embedded job for the
+ *    dispatched `(verb, id)` is observed in a terminal state
+ *    (`state === "ended" | "killed"`). Migrates the row from
+ *    `--- current ---` to `--- completed ---`.
  *
- * The frame has three named-header sections, each emitted only when
- * non-empty: `--- current ---`, `--- queued ---`, `--- predicted ---`.
+ * The frame has four named-header sections, each emitted only when
+ * non-empty, rendered in this order: `--- current ---`, `--- queued ---`,
+ * `--- predicted ---`, `--- completed ---`. The ordering is attention-
+ * first (live agents at the top, then about-to-be-active, then future,
+ * then growing history at the bottom so completed entries don't push
+ * live state around).
  *
- * The first two are scoped to THIS RUN — they never show dispatches
- * that landed before the UI started. On startup `hydrateDispatchLog`
- * folds the on-disk log back into the durable `dispatchedKeys` /
- * `fulfilledKeys` sets (so the re-dispatch guard survives restarts),
- * but the in-memory `dispatchLog` array that drives them starts empty.
- * This-run dispatches partition on fulfillment: rows whose key has
- * been observed registered render under `--- current ---`; rows still
+ * The first three (current / queued / completed) are scoped to THIS
+ * RUN — they never show dispatches that landed before the UI started.
+ * On startup `hydrateDispatchLog` folds the on-disk log back into the
+ * durable `dispatchedKeys` / `fulfilledKeys` / `completedKeys` sets
+ * (so the re-dispatch guard survives restarts), but the in-memory
+ * `dispatchLog` array that drives them starts empty. This-run
+ * dispatches partition three ways: rows whose key has been observed
+ * terminal (`state in {ended, killed}`) render under
+ * `--- completed ---`; rows whose key has been observed registered
+ * but not yet terminal render under `--- current ---`; rows still
  * waiting on the agent to boot render under `--- queued ---`. In wet
  * mode queued is transient (~1-3 frames between dispatch and
  * SessionStart fold); in dry mode it persists for the lifetime of the
@@ -49,7 +61,8 @@
  * won't re-appear in the frame on restart.
  *
  * A new frame is emitted immediately after each dispatch AND whenever
- * `detectFulfillments` observes a key flip from queued → current.
+ * `detectJobTransitions` observes a key flip from queued → current or
+ * current → completed.
  *
  * The `--- predicted ---` section previews the next dispatches
  * autopilot will fire as current sessions finish — approvals first,
@@ -155,23 +168,26 @@ summary form is '(<dir>) <verb>::<id>'; dry runs append the would-have
     cd /Users/mike/code/keeper && \\
       claude '/plan:approve fn-619-pin-inputrequest-mid-subagent-state.1'
 
-The frame has three named-header sections, each emitted only when
-non-empty: '--- current ---', '--- queued ---', '--- predicted ---'.
+The frame has four named-header sections, each emitted only when
+non-empty, rendered in this order: '--- current ---',
+'--- queued ---', '--- predicted ---', '--- completed ---'.
 
-The current/queued sections are scoped to this run — they never show
-dispatches that landed before the UI started. Within the run,
-dispatches partition on fulfillment: rows whose dispatched (verb, id)
-has been observed registered in keeper render under
+The current/queued/completed sections are scoped to this run — they
+never show dispatches that landed before the UI started. Within the
+run, dispatches partition three ways: rows observed terminal
+(state in {ended, killed}) render under '--- completed ---'; rows
+observed registered but not yet terminal render under
 '--- current ---'; rows still waiting on the agent to boot render
 under '--- queued ---'. In wet mode queued is transient (~1-3 frames
 before SessionStart folds); in dry mode it persists for the lifetime
 of the run. The JSONL log at ~/.local/state/keeper/dispatch.log
-carries two kinds — 'launch' (every dispatch) and 'fulfilled' (first
-observation of the registered session) — and is folded into the
-durable re-dispatch guard on startup so cross-run double-fires are
-suppressed, but the in-memory display array starts empty each run. A
-new frame is emitted after each dispatch AND whenever a queued row
-moves to current.
+carries three kinds — 'launch' (every dispatch), 'fulfilled' (first
+observation of the registered session), and 'completed' (first
+observation of the session in a terminal state) — and is folded
+into the durable re-dispatch guard on startup so cross-run double-
+fires are suppressed, but the in-memory display array starts empty
+each run. A new frame is emitted after each dispatch AND whenever a
+row moves between sections.
 
 The '--- predicted ---' section previews the next dispatches autopilot
 will fire as a direct consequence of the embedded jobs currently in
@@ -659,20 +675,25 @@ export function predictNextDispatches(
 //     dry?, pid?}` — written by `logDispatch` the moment autopilot fires
 //     (or would-have-fired in dry mode).
 //   - `{"kind":"fulfilled", ts, verb, id, pid?}` — written by
-//     `onSnapshot` the first time an embedded job appears in the
-//     readiness snapshot for the dispatched `(verb, id)` pair. Marks the
-//     dispatch as "claimed forever"; once fulfilled, no other autopilot
-//     automation re-fires for it (in this run or any future run).
+//     `detectJobTransitions` the first time an embedded job appears in
+//     the readiness snapshot for the dispatched `(verb, id)` pair. Marks
+//     the dispatch as "claimed forever"; once fulfilled, no other
+//     autopilot automation re-fires for it (in this run or any future
+//     run).
+//   - `{"kind":"completed", ts, verb, id, pid?}` — written by
+//     `detectJobTransitions` the first time the matching embedded job
+//     is observed in a terminal state (`"ended"` / `"killed"`).
+//     Migrates the row from `--- current ---` to `--- completed ---`.
 //
-// On startup, `hydrateDispatchLog` folds both kinds into the durable
-// `dispatchedKeys` + `fulfilledKeys` sets so the cross-run re-dispatch
-// guard survives restarts. The section-1 display array (`dispatchLog`)
-// is NOT hydrated — it starts empty each run, so prior-run dispatches
-// (including dry-run dispatches that can never reach fulfillment) don't
-// leak into the UI.
+// On startup, `hydrateDispatchLog` folds all three kinds into the
+// durable `dispatchedKeys` + `fulfilledKeys` + `completedKeys` sets so
+// the cross-run re-dispatch guard survives restarts. The display array
+// (`dispatchLog`) is NOT hydrated — it starts empty each run, so prior-
+// run dispatches (including dry-run dispatches that can never reach
+// fulfillment) don't leak into the UI.
 
 /**
- * Re-fold `dispatch.log` from disk into the two durable sets that
+ * Re-fold `dispatch.log` from disk into the three durable sets that
  * survive across runs:
  *
  *   - `dispatchedKeys` — every `${verb}::${id}` autopilot has ever
@@ -682,13 +703,16 @@ export function predictNextDispatches(
  *     row, and the guard survives restarts.
  *   - `fulfilledKeys` — every `${verb}::${id}` autopilot has observed
  *     register (an embedded job for that row+verb appeared in the
- *     readiness snapshot). Marks the dispatch as claimed for life;
- *     section 1's "queued → current" partition pivots on this for
- *     this-run dispatches.
+ *     readiness snapshot). Marks the dispatch as claimed for life; the
+ *     "queued → current" partition pivots on this for this-run
+ *     dispatches.
+ *   - `completedKeys` — every `${verb}::${id}` autopilot has observed
+ *     reach a terminal job state (`"ended"` / `"killed"`). Drives the
+ *     "current → completed" partition for this-run dispatches.
  *
- * The section-1 display array is intentionally NOT seeded from the log
- * — prior-run dispatches never appear in this run's UI. The two sets
- * above are enough to make the durable re-dispatch guard work.
+ * The display array is intentionally NOT seeded from the log — prior-
+ * run dispatches never appear in this run's UI. The three sets above
+ * are enough to make the durable re-dispatch guard work.
  *
  * Malformed JSONL lines skip silently — `dispatch.log` is a forensic
  * audit log, not the event store, so re-fold determinism isn't a goal
@@ -697,14 +721,16 @@ export function predictNextDispatches(
 export function hydrateDispatchLog(path: string): {
   dispatchedKeys: Set<string>;
   fulfilledKeys: Set<string>;
+  completedKeys: Set<string>;
 } {
   const dispatchedKeys = new Set<string>();
   const fulfilledKeys = new Set<string>();
+  const completedKeys = new Set<string>();
   let content: string;
   try {
     content = readFileSync(path, "utf8");
   } catch {
-    return { dispatchedKeys, fulfilledKeys };
+    return { dispatchedKeys, fulfilledKeys, completedKeys };
   }
   for (const line of content.split("\n")) {
     if (line.trim() === "") {
@@ -726,19 +752,27 @@ export function hydrateDispatchLog(path: string): {
       dispatchedKeys.add(key);
     } else if (row.kind === "fulfilled") {
       fulfilledKeys.add(key);
+    } else if (row.kind === "completed") {
+      completedKeys.add(key);
     }
   }
-  return { dispatchedKeys, fulfilledKeys };
+  return { dispatchedKeys, fulfilledKeys, completedKeys };
 }
 
 /**
- * Returns `true` iff the readiness snapshot carries an embedded job for
- * this `(verb, id)` pair. Used as the fulfillment predicate: once an
- * autopilot dispatch's agent has booted (or any matching session exists
- * in keeper's projection), an `EmbeddedJob` with `plan_verb === verb`
- * lands in the parent row's `jobs[]` array via the reducer's
- * `syncJobIntoEpic` fan-out (schema v26 widened the verb whitelist to
- * accept `approve` alongside `work` / `close`).
+ * Returns the embedded job that matches this dispatched `(verb, id)`
+ * pair, or `undefined` if no such job is in the snapshot yet. Drives
+ * both transitions:
+ *
+ *   - **fulfillment**: any return value (defined job) means an embedded
+ *     job for the dispatched row+verb has landed in keeper's
+ *     projection — the agent has booted (or any matching session
+ *     exists) via the reducer's `syncJobIntoEpic` fan-out (schema v26
+ *     widened the verb whitelist to accept `approve` alongside
+ *     `work` / `close`).
+ *   - **completion**: the matched job's `state` field carries the
+ *     observed lifecycle state; the caller treats `"ended"` /
+ *     `"killed"` as terminal.
  *
  * Dispatches by `id` shape: a dotted `id` (`fn-619-foo.1`) targets a
  * task — scan that task's `jobs[]`. An undotted `id` (`fn-619-foo`)
@@ -746,11 +780,11 @@ export function hydrateDispatchLog(path: string): {
  * epic's `jobs[]`. The matching entry's `plan_verb` must equal the
  * dispatched verb.
  */
-export function findSessionMatch(
+export function findSessionJob(
   snap: ReadinessClientSnapshot,
   verb: string,
   id: string,
-): boolean {
+): { state: string } | undefined {
   const isTaskForm = id.includes(".");
   if (isTaskForm) {
     for (const epic of snap.epics) {
@@ -760,19 +794,19 @@ export function findSessionMatch(
           continue;
         }
         const jobs = Array.isArray(task.jobs) ? task.jobs : [];
-        return jobs.some((j) => j.plan_verb === verb);
+        return jobs.find((j) => j.plan_verb === verb);
       }
     }
-    return false;
+    return undefined;
   }
   for (const epic of snap.epics) {
     if (epic.epic_id !== id) {
       continue;
     }
     const jobs = Array.isArray(epic.jobs) ? epic.jobs : [];
-    return jobs.some((j) => j.plan_verb === verb);
+    return jobs.find((j) => j.plan_verb === verb);
   }
-  return false;
+  return undefined;
 }
 
 async function main(): Promise<void> {
@@ -816,28 +850,43 @@ async function main(): Promise<void> {
   // Hydrate the durable cross-run guard from disk. `dispatchedKeys`
   // carries every key from every prior run (durable guard against
   // double-fire); `fulfilledKeys` carries every `(verb, id)` autopilot
-  // has observed register. The section-1 display array (`dispatchLog`)
-  // starts empty each run — prior-run dispatches never appear in this
-  // run's UI. This run's launches push onto `dispatchLog` as they fire
-  // and write a `kind:"launch"` line; the matching `kind:"fulfilled"`
-  // line is written the first time the snapshot shows an embedded job
-  // for the dispatched row+verb.
-  const { dispatchedKeys, fulfilledKeys } = hydrateDispatchLog(dispatchLogPath);
+  // has observed register; `completedKeys` carries every key autopilot
+  // has observed reach a terminal job state. The display array
+  // (`dispatchLog`) starts empty each run — prior-run dispatches never
+  // appear in this run's UI. This run's launches push onto `dispatchLog`
+  // as they fire and write a `kind:"launch"` line; the matching
+  // `kind:"fulfilled"` and `kind:"completed"` lines are written the
+  // first time the snapshot shows an embedded job for the dispatched
+  // row+verb and the first time that job's `state` is observed terminal.
+  const { dispatchedKeys, fulfilledKeys, completedKeys } =
+    hydrateDispatchLog(dispatchLogPath);
   const dispatchLog: DispatchEntry[] = [];
 
   function renderDispatchFrame(): string[] {
-    // Three named-header sections, each only emitted when non-empty:
-    // `--- current ---` (this-run dispatches whose `(verb, id)` has been
-    // observed registered in keeper), `--- queued ---` (this-run
-    // dispatches still waiting on the agent to boot), and
+    // Four named-header sections, each only emitted when non-empty,
+    // rendered in this order: `--- current ---` (this-run dispatches
+    // observed registered but not yet terminal), `--- queued ---`
+    // (this-run dispatches still waiting on the agent to boot),
     // `--- predicted ---` (`predictNextDispatches` output for the next
-    // edges as in-flight jobs finish). In wet mode queued is typically
-    // transient (1-3 frames between dispatch and SessionStart fold); in
-    // dry mode it persists until the human runs the command manually.
+    // edges as in-flight jobs finish), and `--- completed ---` (this-
+    // run dispatches whose matching embedded job has been observed in
+    // a terminal state `"ended"` / `"killed"`). The ordering is
+    // attention-first — live agents at the top, growing history at the
+    // bottom so completed rows don't push live state around. In wet
+    // mode queued is typically transient (1-3 frames between dispatch
+    // and SessionStart fold); in dry mode it persists until the human
+    // runs the command manually (no real session ever boots, so neither
+    // `current` nor `completed` ever populates for a dry dispatch).
     const current: string[] = [];
     const queued: string[] = [];
+    const completed: string[] = [];
     for (const e of dispatchLog) {
-      const target = fulfilledKeys.has(`${e.verb}::${e.id}`) ? current : queued;
+      const key = `${e.verb}::${e.id}`;
+      const target = completedKeys.has(key)
+        ? completed
+        : fulfilledKeys.has(key)
+          ? current
+          : queued;
       const dirSeg = e.dir === "" ? "" : `(${e.dir}) `;
       const dryTag = e.dry ? "[dry] " : "";
       target.push(`${dirSeg}${dryTag}${e.verb}::${e.id}`);
@@ -866,19 +915,35 @@ async function main(): Promise<void> {
       out.push(...queued);
     }
 
-    if (lastSnap === null) {
-      return out;
+    if (lastSnap !== null) {
+      const { approvals, informational, workers, closers } =
+        predictNextDispatches(lastSnap);
+      if (
+        approvals.length !== 0 ||
+        informational.length !== 0 ||
+        workers.length !== 0 ||
+        closers.length !== 0
+      ) {
+        out.push(
+          ...renderPredictedSection(approvals, informational, workers, closers),
+        );
+      }
     }
-    const { approvals, informational, workers, closers } =
-      predictNextDispatches(lastSnap);
-    if (
-      approvals.length === 0 &&
-      informational.length === 0 &&
-      workers.length === 0 &&
-      closers.length === 0
-    ) {
-      return out;
+
+    if (completed.length > 0) {
+      out.push("--- completed ---");
+      out.push(...completed);
     }
+    return out;
+  }
+
+  function renderPredictedSection(
+    approvals: PreviewRow[],
+    informational: PreviewRow[],
+    workers: PreviewRow[],
+    closers: PreviewRow[],
+  ): string[] {
+    const out: string[] = [];
     out.push("--- predicted ---");
     const predictedRows = [
       ...approvals,
@@ -1294,36 +1359,65 @@ async function main(): Promise<void> {
     }
   }
 
-  function detectFulfillments(snap: ReadinessClientSnapshot): void {
-    // Walk every still-unfulfilled dispatch and check whether the
-    // snapshot now carries an embedded job for that (verb, id). First
-    // observation wins: mark the key, append a `kind:"fulfilled"` line
-    // to `dispatch.log`, and move the row from queued → current in the
-    // next frame render. No-op when nothing changes.
+  function detectJobTransitions(snap: ReadinessClientSnapshot): void {
+    // Walk every dispatch and check whether the snapshot has advanced
+    // its matching embedded job:
+    //
+    //   queued → current      first time a job for (verb, id) is
+    //                         observed in the snapshot at all
+    //                         (kind:"fulfilled" log line).
+    //   current → completed   first time that job's `state` is observed
+    //                         in a terminal value (`"ended"` /
+    //                         `"killed"`) (kind:"completed" log line).
+    //
+    // First observation wins for each transition. No-op when nothing
+    // changes.
     for (const entry of dispatchLog) {
       const key = `${entry.verb}::${entry.id}`;
-      if (fulfilledKeys.has(key)) {
+      if (completedKeys.has(key)) {
         continue;
       }
-      if (!findSessionMatch(snap, entry.verb, entry.id)) {
+      const job = findSessionJob(snap, entry.verb, entry.id);
+      if (job === undefined) {
         continue;
       }
-      fulfilledKeys.add(key);
-      try {
-        appendFileSync(
-          dispatchLogPath,
-          `${JSON.stringify({
-            kind: "fulfilled",
-            ts: new Date().toISOString(),
-            verb: entry.verb,
-            id: entry.id,
-            pid: process.pid,
-          })}\n`,
-        );
-      } catch (err) {
-        noteLine(
-          `# warn: fulfilled log write failed: ${(err as Error).message}`,
-        );
+      if (!fulfilledKeys.has(key)) {
+        fulfilledKeys.add(key);
+        try {
+          appendFileSync(
+            dispatchLogPath,
+            `${JSON.stringify({
+              kind: "fulfilled",
+              ts: new Date().toISOString(),
+              verb: entry.verb,
+              id: entry.id,
+              pid: process.pid,
+            })}\n`,
+          );
+        } catch (err) {
+          noteLine(
+            `# warn: fulfilled log write failed: ${(err as Error).message}`,
+          );
+        }
+      }
+      if (job.state === "ended" || job.state === "killed") {
+        completedKeys.add(key);
+        try {
+          appendFileSync(
+            dispatchLogPath,
+            `${JSON.stringify({
+              kind: "completed",
+              ts: new Date().toISOString(),
+              verb: entry.verb,
+              id: entry.id,
+              pid: process.pid,
+            })}\n`,
+          );
+        } catch (err) {
+          noteLine(
+            `# warn: completed log write failed: ${(err as Error).message}`,
+          );
+        }
       }
     }
   }
@@ -1331,7 +1425,7 @@ async function main(): Promise<void> {
   let firstPaintLogged = false;
   const onSnapshot = (snap: ReadinessClientSnapshot): void => {
     lastSnap = snap;
-    detectFulfillments(snap);
+    detectJobTransitions(snap);
     if (!firstPaintLogged) {
       firstPaintLogged = true;
       const ready: string[] = [];
