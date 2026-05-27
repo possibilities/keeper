@@ -11,5 +11,5 @@ Fix: force a deterministic threshold crossing so lines.length > 0 can be asserte
 - [ ] The fast-tick companion test (line 1835) is unaffected
 
 ## Done summary
-
+Replaced spin-wait + 500-row volume approach with a mocked performance.now() that advances +20ms per call, guaranteeing the threshold gate fires deterministically; lines.length > 0 now asserted unconditionally.
 ## Evidence

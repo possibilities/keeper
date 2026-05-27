@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "make diffTick slow-tick test deterministic",
-  "updated_at": "2026-05-27T18:55:43.886220Z"
+  "updated_at": "2026-05-27T20:10:50.878048Z",
+  "worker_done_at": "2026-05-27T20:10:50.878048Z"
 }
