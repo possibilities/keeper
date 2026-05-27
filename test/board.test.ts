@@ -508,6 +508,20 @@ test("colorizePillsInLine: awaiting:ask_user_question takes the warn bucket via 
   );
 });
 
+// `task-repo:<basename>` prefix fallback — the divergence pill minted
+// by `taskRepoPillSeg` colors the same as `[blocked]` (warn bucket,
+// yellow SGR). The basename can carry any path-safe character; the
+// fallback is purely string-prefix-driven, so the payload renders
+// verbatim inside the brackets.
+test("colorizePillsInLine: task-repo:<basename> takes the warn bucket via prefix fallback", () => {
+  expect(colorizePillsInLine("[task-repo:arthack]")).toBe(
+    `[${WARN}task-repo:arthack${RESET}]`,
+  );
+  expect(colorizePillsInLine("[task-repo:my-side-repo]")).toBe(
+    `[${WARN}task-repo:my-side-repo${RESET}]`,
+  );
+});
+
 // Stacking-order snapshot rendered through the colorizer — a row
 // carrying all three annotations (state + api-error + input-request)
 // must color each pill independently in lifecycle order.

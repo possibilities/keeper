@@ -147,6 +147,15 @@ end of the header itself. The bracket payload carries the full reason
 (including any "dep-on-task <upstream>" id) so blocked rows need no
 separate continuation.
 
+When a task's target_repo diverges from its epic's project_dir, the id
+line carries one extra trailing pill '[task-repo:<basename>]' (yellow /
+warn bucket via the colorizer's 'task-repo:*' prefix fallback) so the
+unusual cross-repo routing surfaces visibly next to the verdict that
+references it (the same divergence drives which root the per-root mutex
+locks; see effectiveRoot in src/readiness.ts). The close row uses the
+epic's project_dir directly (no per-row override), so the pill never
+appears on the "Quality audit and close" line.
+
 The jobs body is itself split into two stacked sub-lists separated by a '~~~'
 line: jobs with NO plan_verb (ambient sessions) on top, jobs WITH a plan_verb
 (planner/worker/closer — epic-bound work) on the bottom. A fully-populated
@@ -304,6 +313,40 @@ function inputRequestPillSeg(at: unknown, kind: unknown): string {
   return ` [awaiting:${k}]`;
 }
 
+/**
+ * Render the optional `[task-repo:<basename>]` pill segment when a task's
+ * `target_repo` diverges from its epic's `project_dir`. Divergence is
+ * unusual — a task whose worker runs in a sibling repo from where the
+ * epic was authored. Visible as a yellow/warn pill via the
+ * colorizer's `task-repo:*` prefix fallback so the eye picks the
+ * divergent row out at a glance (this is the same predicate the
+ * per-root mutex uses to decide which root claims a task — see
+ * `effectiveRoot` in `src/readiness.ts`).
+ *
+ * The close row uses `epic.project_dir` directly with no per-row
+ * `target_repo`, so divergence isn't representable there — the helper
+ * is only called from the task arm of `renderEpicBlock`.
+ *
+ * Empty / null `target_repo` is the "no override" case (the task runs
+ * in the epic's project_dir); we return `""` so the caller can append
+ * unconditionally. Same null+empty fallthrough as `effectiveRoot`
+ * so the pill never lies about which root the row actually occupies.
+ */
+function taskRepoPillSeg(taskRepo: unknown, epicProjectDir: unknown): string {
+  if (taskRepo == null) {
+    return "";
+  }
+  const tr = String(taskRepo);
+  if (tr === "") {
+    return "";
+  }
+  const epicDir = epicProjectDir == null ? "" : String(epicProjectDir);
+  if (tr === epicDir) {
+    return "";
+  }
+  return ` [task-repo:${basename(tr)}]`;
+}
+
 function epicNumFromId(id: string): number | null {
   const m = /^[a-z]+-(\d+)-/.exec(id);
   return m ? Number.parseInt(m[1], 10) : null;
@@ -372,8 +415,10 @@ const PILL_COLORS: Record<string, PillBucket> = {
  * `awaiting:*` payload (so the `[awaiting:<kind>]` input-request pills
  * minted by `inputRequestPillSeg` — currently just
  * `[awaiting:ask_user_question]`, future-extensible to any built-in
- * interactive tool — color the same as a bare `[blocked]`). Unknown
- * tokens pass through verbatim.
+ * interactive tool — color the same as a bare `[blocked]`) AND to the
+ * `warn` bucket for any `task-repo:*` payload (so the
+ * `[task-repo:<basename>]` divergence pill minted by `taskRepoPillSeg`
+ * colors the same as `[blocked]`). Unknown tokens pass through verbatim.
  *
  * Module-level + exported so `test/board.test.ts` can assert the coloring
  * contract without standing up the subscribe loop. Sidecars and the
@@ -390,6 +435,9 @@ export function colorizePillsInLine(line: string): string {
       bucket = "error";
     }
     if (bucket === undefined && inner.startsWith("awaiting:")) {
+      bucket = "warn";
+    }
+    if (bucket === undefined && inner.startsWith("task-repo:")) {
       bucket = "warn";
     }
     if (bucket === undefined) {
@@ -597,7 +645,7 @@ async function main(): Promise<void> {
         // Render both pills side-by-side with `[approval]` so the row
         // surfaces the full native vocabulary — no client-side collapse.
         `${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.runtime_status)}] [${seg(t.worker_phase)}] [${taskApproval}]`,
-        `   [${taskId}] ${formatPill(taskVerdict)}`,
+        `   [${taskId}] ${formatPill(taskVerdict)}${taskRepoPillSeg(t.target_repo, row.project_dir)}`,
         ...renderJobLines(subagentIndex, t.jobs),
       );
     }
