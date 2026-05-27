@@ -76,5 +76,5 @@ Existing test patterns in `test/readiness-client.test.ts` use the `ConnectFactor
 - [ ] `bun test` green
 
 ## Done summary
-
+Added query_slow_flight (1s) + query_timeout (5s) lifecycle events to readiness-client.ts with single-flight reconnect guard; CollectionState gained queryInFlightSince + lastSlowFlightAt fields, pollAll walks states for stuck-window detection, triggerReconnect tears the socket down and lets connectWithRetry kick in.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Add per-collection slow-flight and timeout-reconnect to readiness client",
-  "updated_at": "2026-05-27T16:46:54.678676Z"
+  "updated_at": "2026-05-27T18:03:18.787647Z",
+  "worker_done_at": "2026-05-27T18:03:18.787647Z"
 }
