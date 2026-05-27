@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Version-probe diffTick to decode only changed rows",
-  "updated_at": "2026-05-27T22:17:49.317006Z"
+  "updated_at": "2026-05-27T23:40:27.038108Z",
+  "worker_done_at": "2026-05-27T23:40:27.038108Z"
 }

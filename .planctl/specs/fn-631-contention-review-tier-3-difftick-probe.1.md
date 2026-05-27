@@ -199,5 +199,6 @@ Add an inline comment in the diffTick body noting the read-snapshot drift betwee
 - [ ] `bun test` green
 
 ## Done summary
-
+Rewrote diffTick to version-probe-first: new selectVersionsByIds projects (pk, version) only over the watched union, changedIds is built across all conns, full-row selectByIds runs only when changedIds is non-empty. New probeVersions stage in TRACE output. Synthetic bench (N=700, 4 JSON cols/row): idle p95 1.85ms->0.50ms (3.7x), K=1 p95 1.90ms->0.96ms (2.0x). 121/121 tests pass.
 ## Evidence
+- Tests: server_worker, collections, total_pass
