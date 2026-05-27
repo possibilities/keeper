@@ -25,10 +25,12 @@
 
 import { expect, test } from "bun:test";
 import {
+  predictNextDispatches,
   renderEpicCommands,
   renderEpicCommandsFiltered,
 } from "../scripts/autopilot";
-import type { Epic, Task } from "../src/types";
+import { computeReadiness } from "../src/readiness";
+import type { EmbeddedJob, Epic, Job, Task } from "../src/types";
 
 function makeTask(overrides: Partial<Task>): Task {
   return {
@@ -167,4 +169,265 @@ test("renderEpicCommandsFiltered — empty-task epic with ready close emits clos
   expect(filtered).not.toBeNull();
   expect(filtered).toContain("claude '/plan:close fn-1-foo'");
   expect(filtered).not.toContain("plan:work");
+});
+
+// ---------------------------------------------------------------------------
+// predictNextDispatches — verb-aware simulation pass over `computeReadiness`.
+//
+// The function is a pure transform of the readiness snapshot, so each test
+// builds an `Epic[]` fixture, runs `computeReadiness` to get the current
+// verdicts, packages them into a `ReadinessClientSnapshot`, and asserts
+// against the three preview buckets (approvals / workers / closers).
+//
+// Pause-invariance is enforced by the function's signature — it takes only
+// the snapshot and never reads autopilot's `paused` state — so the test
+// matrix focuses on the verb-aware semantics rather than asserting an
+// invariant the type system already pins.
+// ---------------------------------------------------------------------------
+
+function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
+  return {
+    job_id: "session-1",
+    plan_verb: "work",
+    state: "working",
+    title: null,
+    created_at: 0,
+    updated_at: 0,
+    last_event_id: 0,
+    last_api_error_at: null,
+    last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
+    git_dirty_count: 0,
+    git_orphan_count: 0,
+    ...overrides,
+  };
+}
+
+function buildSnap(epics: Epic[]) {
+  const jobs = new Map<string, Job>();
+  const readiness = computeReadiness(epics, jobs, []);
+  return { epics, jobs, subagentInvocations: [], readiness };
+}
+
+test("predictNextDispatches — in-flight worker on a task predicts approve::<task>", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.4",
+        task_number: 4,
+        worker_phase: "open",
+        approval: "pending",
+        jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
+      }),
+    ],
+    approval: "pending",
+  });
+  const { approvals, workers, closers } = predictNextDispatches(
+    buildSnap([epic]),
+  );
+  expect(approvals.map((r) => `${r.verb}::${r.id}`)).toEqual([
+    "approve::fn-1-foo.4",
+  ]);
+  expect(workers).toEqual([]);
+  expect(closers).toEqual([]);
+});
+
+test("predictNextDispatches — in-flight worker on a task does NOT predict approve::<epic> via close-row fan-up", () => {
+  // The regression case from the user's autopilot frame: task .4's worker
+  // is running, which fans the close-row up to blocked:job-running. Under
+  // the old "active + not approved" rule, this spuriously emitted
+  // approve::<epic> even though no closer had ever started. Under the
+  // verb-aware simulation, the close-row stays at blocked:dep-on-task in
+  // the future readiness pass (because .4 is sim'd to blocked:job-pending,
+  // not completed), so approve::<epic> drops out.
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.4",
+        task_number: 4,
+        worker_phase: "open",
+        approval: "pending",
+        jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
+      }),
+      makeTask({
+        task_id: "fn-1-foo.5",
+        task_number: 5,
+        worker_phase: "open",
+        approval: "pending",
+      }),
+    ],
+    approval: "pending",
+  });
+  const { approvals, workers, closers } = predictNextDispatches(
+    buildSnap([epic]),
+  );
+  const ids = approvals.map((r) => `${r.verb}::${r.id}`);
+  expect(ids).toContain("approve::fn-1-foo.4");
+  expect(ids).not.toContain("approve::fn-1-foo");
+  expect(workers).toEqual([]);
+  expect(closers).toEqual([]);
+});
+
+test("predictNextDispatches — in-flight approver on .3 plus worker on .4 yields approve::.4 only", () => {
+  // The full frame from the bug report: approver on .3 + worker on .4 +
+  // sibling .5 + epic close-row. Verb-aware sim collapses .3 to completed
+  // (approve session ending → approval=approved), .4 to blocked:job-pending
+  // (worker ending → worker_phase=done with approval still pending), and
+  // leaves .5 + close-row untouched. Only approve::.4 emits; the spurious
+  // approve::<epic> from the old code disappears.
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.3",
+        task_number: 3,
+        worker_phase: "done",
+        approval: "pending",
+        jobs: [
+          makeEmbeddedJob({
+            job_id: "session-3a",
+            plan_verb: "approve",
+            state: "working",
+          }),
+        ],
+      }),
+      makeTask({
+        task_id: "fn-1-foo.4",
+        task_number: 4,
+        worker_phase: "open",
+        approval: "pending",
+        jobs: [
+          makeEmbeddedJob({
+            job_id: "session-4",
+            plan_verb: "work",
+            state: "working",
+          }),
+        ],
+      }),
+      makeTask({
+        task_id: "fn-1-foo.5",
+        task_number: 5,
+        worker_phase: "open",
+        approval: "pending",
+      }),
+    ],
+    approval: "pending",
+  });
+  const { approvals, workers, closers } = predictNextDispatches(
+    buildSnap([epic]),
+  );
+  expect(approvals.map((r) => `${r.verb}::${r.id}`)).toEqual([
+    "approve::fn-1-foo.4",
+  ]);
+  expect(workers).toEqual([]);
+  expect(closers).toEqual([]);
+});
+
+test("predictNextDispatches — in-flight closer on the epic predicts approve::<epic>", () => {
+  // Closer is the close-row's own in-flight job, so its completion flips
+  // epic.status="done" and (with approval still pending) the close-row's
+  // future verdict is blocked:job-pending → approve::<epic>.
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "done",
+        approval: "approved",
+      }),
+    ],
+    status: "open",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ plan_verb: "close", state: "working" })],
+  });
+  const { approvals, workers, closers } = predictNextDispatches(
+    buildSnap([epic]),
+  );
+  expect(approvals.map((r) => `${r.verb}::${r.id}`)).toEqual([
+    "approve::fn-1-foo",
+  ]);
+  expect(workers).toEqual([]);
+  expect(closers).toEqual([]);
+});
+
+test("predictNextDispatches — a ready task predicts approve::<task> as the next step after section-1 dispatch", () => {
+  // A task at cur=ready has its worker dispatched into section 1 right
+  // now. Section 2's job is to preview the step AFTER that — which is
+  // approve::<task> once the worker ends with approval still pending.
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "pending",
+      }),
+    ],
+    approval: "pending",
+  });
+  const snap = buildSnap([epic]);
+  // Sanity: confirm the fixture really produces a ready task verdict —
+  // the assertion that follows depends on this precondition.
+  expect(snap.readiness.perTask.get("fn-1-foo.1")?.tag).toBe("ready");
+  const { approvals, workers, closers } = predictNextDispatches(snap);
+  expect(approvals.map((r) => `${r.verb}::${r.id}`)).toEqual([
+    "approve::fn-1-foo.1",
+  ]);
+  expect(workers).toEqual([]);
+  expect(closers).toEqual([]);
+});
+
+test("predictNextDispatches — no in-flight jobs and no ready rows yields empty preview", () => {
+  // Every task is already completed and the close-row is ready (status
+  // still open, approval=pending). One row is ready, so the simulation
+  // touches the tree, but the diff produces only the approve::<epic>
+  // prediction for the close-row — no workers, no closers from
+  // downstream tasks.
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "done",
+        approval: "approved",
+      }),
+    ],
+    status: "open",
+    approval: "pending",
+  });
+  const snap = buildSnap([epic]);
+  expect(snap.readiness.perCloseRow.get("fn-1-foo")?.tag).toBe("ready");
+  const { approvals, workers, closers } = predictNextDispatches(snap);
+  expect(approvals.map((r) => `${r.verb}::${r.id}`)).toEqual([
+    "approve::fn-1-foo",
+  ]);
+  expect(workers).toEqual([]);
+  expect(closers).toEqual([]);
+});
+
+test("predictNextDispatches — empty preview when nothing is running and nothing is ready", () => {
+  // Every row is either completed or blocked behind a human action that
+  // isn't currently in flight — the preview should be empty.
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "done",
+        approval: "pending",
+      }),
+    ],
+    status: "open",
+    approval: "pending",
+  });
+  const snap = buildSnap([epic]);
+  // Task is blocked:job-pending (worker done, awaiting approval).
+  expect(snap.readiness.perTask.get("fn-1-foo.1")).toEqual({
+    tag: "blocked",
+    reason: { kind: "job-pending" },
+  });
+  const { approvals, workers, closers } = predictNextDispatches(snap);
+  expect(approvals).toEqual([]);
+  expect(workers).toEqual([]);
+  expect(closers).toEqual([]);
 });

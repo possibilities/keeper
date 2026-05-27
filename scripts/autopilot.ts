@@ -157,12 +157,16 @@ frame is emitted after each dispatch AND whenever a queued row moves
 to current.
 
 Below a '---' separator (only when non-empty), the frame previews the next
-dispatches autopilot will fire as current sessions finish — approvals
-first (one per currently-active row whose approval isn't "approved"),
-then workers, then closers (rows that flip blocked→ready when every
-currently-active row is forced to completed). Preview rows are
-single-line '(<dir>) <verb>::<id>' — no [dry] tag, no shell-command
-footer.
+dispatches autopilot will fire as a direct consequence of the embedded
+jobs currently in flight. All three buckets fall out of one simulation
+pass: every working embedded job has its post-completion effect mirrored
+onto the owning row (work→worker_phase=done, close→epic.status=done,
+approve→approval=approved; jobs[i].state=ended) and approval is NEVER
+auto-flipped for rows whose only in-flight job is a worker. Rows whose
+verdict flips to blocked:job-pending in the simulated re-run emit
+'approve::<id>'; rows that flip to ready emit 'work::<task>' /
+'close::<epic>'. Preview rows are single-line '(<dir>) <verb>::<id>' —
+no [dry] tag, no shell-command footer.
 
 The helper waits for keeperd to come up and reconnects across restarts;
 each connection-lifecycle change is appended to the lifecycle sidecar.
@@ -291,32 +295,55 @@ export function renderEpicCommandsFiltered(
 // --- next-dispatch prediction (module-scope so tests can import) ---------
 //
 // Section 2 of the autopilot frame previews the next dispatches that will
-// fire as currently-active sessions finish. The "active set" is every row
-// whose current verdict is `ready`, `blocked:job-running`, or
-// `blocked:sub-agent-running`. `planner-running` is NOT included — a
-// planner finishing produces tasks, not approvals/workers/closers, so
-// modeling its completion is outside this preview's scope.
+// fire as a direct consequence of the embedded jobs currently in flight.
+// All three buckets (approvals, workers, closers) fall out of ONE
+// `computeReadiness` pass over a verb-aware simulated tree.
 //
-// Two layers:
-//   - approvals — for every active row whose own `approval` isn't already
-//     "approved", autopilot will fire `approve::<id>` on its job-pending
-//     edge once the worker session ends. Pre-approved rows skip the
-//     approve dispatch (they go straight to completed) so they're
-//     excluded from this layer.
-//   - workers + closers — rows whose verdict flips `blocked → ready` in
-//     a simulation that forces every active row to the completed shape
-//     (`worker_phase`/`status`="done", `approval`="approved", embedded
-//     jobs[].state="ended"). Subagent invocations are dropped from the
-//     simulation: every running sub-agent is on an active-set row (the
-//     row would otherwise not be `sub-agent-running`), and the active
-//     set is being forced completed — so `[]` is equivalent to ending
-//     every sub.
+// Simulation rules (per embedded `EmbeddedJob` whose `state === "working"`):
+//   - `plan_verb === "work"`    → owning task's `worker_phase = "done"`
+//   - `plan_verb === "close"`   → owning epic's `status        = "done"`
+//   - `plan_verb === "approve"` → owning row's `approval       = "approved"`
+//   In every case the job's own `state` is stamped `"ended"`.
+//
+// Additionally: a row whose CURRENT verdict is `ready` has its own next
+// dispatch advanced too (a ready task/close-row is about to fire its
+// worker/closer in this frame's section-1 block; previewing the NEXT step
+// means modeling that dispatch's completion). For a ready task,
+// `worker_phase = "done"`; for a ready close-row, `epic.status = "done"`.
+//
+// Approval is NEVER auto-flipped for rows whose only in-flight job is a
+// worker — approval is a human action, not an in-flight one. This is the
+// key fix vs. the prior "force every active row to done+approved" sim,
+// which over-eagerly flipped a close-row to `completed` whenever a TASK's
+// worker was running and then re-derived approvals from a bespoke
+// "active + not approved" rule that emitted spurious `approve::<epic>`
+// lines (the close-row's "active" status had fanned up from the task
+// worker, not from an in-flight closer).
+//
+// Bucketing — for each row, compare `snap.readiness` against
+// `futureReadiness`:
+//   - `cur=blocked → fut=blocked:job-pending` → push `approve::<id>`.
+//   - `cur=blocked → fut=ready`               → push `work::<task>` /
+//                                                `close::<epic>`.
+// Other transitions (incl. `cur=blocked → fut=completed`, which happens
+// for rows whose own worker AND approver are both in flight) emit
+// nothing — those rows are already past the next-dispatch edge.
+//
+// Subagent invocations are dropped from the simulation: every running sub
+// belongs to an in-flight job whose `state` we just stamped `"ended"`,
+// so passing `[]` is equivalent to ending every sub.
 //
 // `computeReadiness` is pure, so we just hand it the simulated `Epic[]`
-// and diff its output against `snap.readiness`. The post-pass mutexes
-// (single-task-per-epic / per-root) self-correct in the re-run: if two
-// dependents would both be eligible, the first-in-traversal-order wins
-// the slot and the others stay blocked under the simulated mutex.
+// and diff its output. The post-pass mutexes (single-task-per-epic /
+// per-root) self-correct in the re-run: if two dependents would both be
+// eligible, the first-in-traversal-order wins the slot and the others
+// stay blocked under the simulated mutex.
+//
+// Pause-invariance: `predictNextDispatches` is a PURE function of `snap`
+// — no read of `paused`, `lastVerdictSig`, `dispatchedKeys`, or any other
+// module-level state. The pause gate lives on the side-effecting
+// `processLaunchTransitions` path; the preview keeps rendering
+// identically whether autopilot is `[paused]` or `[playing]`.
 
 export interface PreviewRow {
   verb: "work" | "close" | "approve";
@@ -334,21 +361,6 @@ export interface PreviewSections {
   approvals: PreviewRow[];
   workers: PreviewRow[];
   closers: PreviewRow[];
-}
-
-function isActiveVerdict(v: Verdict | undefined): boolean {
-  if (v === undefined) {
-    return false;
-  }
-  if (v.tag === "ready") {
-    return true;
-  }
-  if (v.tag === "blocked") {
-    return (
-      v.reason.kind === "job-running" || v.reason.kind === "sub-agent-running"
-    );
-  }
-  return false;
 }
 
 function taskCdDir(task: Task, projectDir: string): string {
@@ -385,75 +397,110 @@ function previewRowFromEpic(epic: Epic, verb: "close" | "approve"): PreviewRow {
 export function predictNextDispatches(
   snap: ReadinessClientSnapshot,
 ): PreviewSections {
-  const approvals: PreviewRow[] = [];
-  const activeTaskIds = new Set<string>();
-  const activeCloseEpicIds = new Set<string>();
-
-  for (const epic of snap.epics) {
-    const projectDir = seg(epic.project_dir);
-    const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
-    for (const task of tasks) {
-      const taskId = seg(task.task_id);
-      if (taskId === "") {
-        continue;
-      }
-      if (!isActiveVerdict(snap.readiness.perTask.get(taskId))) {
-        continue;
-      }
-      activeTaskIds.add(taskId);
-      if (task.approval !== "approved") {
-        approvals.push(previewRowFromTask(task, projectDir, "approve"));
-      }
-    }
-    const epicId = seg(epic.epic_id);
-    if (epicId === "") {
-      continue;
-    }
-    if (!isActiveVerdict(snap.readiness.perCloseRow.get(epicId))) {
-      continue;
-    }
-    activeCloseEpicIds.add(epicId);
-    if (epic.approval !== "approved") {
-      approvals.push(previewRowFromEpic(epic, "approve"));
-    }
-  }
-
-  if (activeTaskIds.size === 0 && activeCloseEpicIds.size === 0) {
-    return { approvals, workers: [], closers: [] };
-  }
-
+  // Build a verb-aware simulated tree. For each embedded job whose
+  // `state === "working"`, mirror its post-completion effect onto the
+  // owning row keyed off `plan_verb`. For each row whose CURRENT verdict
+  // is `ready`, advance its own dispatch-completion flag too (a ready
+  // row is about to fire its own worker/closer in section 1; this
+  // preview models the step AFTER that). Approval is NEVER auto-flipped
+  // for rows whose only in-flight job is a worker — that's the
+  // semantics that makes downstream approve::<row> emit correctly while
+  // refusing to predict an approve beat for a row whose own scope has
+  // no running job (e.g. a close-row whose blocked:job-running verdict
+  // fans up from a task worker, not from a closer).
+  let dirty = false;
   const simulatedEpics: Epic[] = snap.epics.map((epic) => {
-    const epicActive = activeCloseEpicIds.has(epic.epic_id);
+    const epicJobs = Array.isArray(epic.jobs) ? epic.jobs : [];
     const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+    const epicId = seg(epic.epic_id);
+
+    let simEpicStatus = epic.status;
+    let simEpicApproval = epic.approval;
+    let epicTouched = false;
+    for (const job of epicJobs) {
+      if (job.state !== "working") {
+        continue;
+      }
+      if (job.plan_verb === "close") {
+        simEpicStatus = "done";
+        epicTouched = true;
+      } else if (job.plan_verb === "approve") {
+        simEpicApproval = "approved";
+        epicTouched = true;
+      }
+    }
+    const curClose =
+      epicId === "" ? undefined : snap.readiness.perCloseRow.get(epicId);
+    if (curClose?.tag === "ready") {
+      simEpicStatus = "done";
+      epicTouched = true;
+    }
+    const simEpicJobs = epicTouched
+      ? epicJobs.map((j) =>
+          j.state === "working" ? { ...j, state: "ended" } : j,
+        )
+      : epicJobs;
+
+    let anyTaskTouched = false;
+    const simTasks = tasks.map((task) => {
+      const taskJobs = Array.isArray(task.jobs) ? task.jobs : [];
+      const taskId = seg(task.task_id);
+
+      let simWorkerPhase = task.worker_phase;
+      let simApproval = task.approval;
+      let taskTouched = false;
+      for (const job of taskJobs) {
+        if (job.state !== "working") {
+          continue;
+        }
+        if (job.plan_verb === "work") {
+          simWorkerPhase = "done";
+          taskTouched = true;
+        } else if (job.plan_verb === "approve") {
+          simApproval = "approved";
+          taskTouched = true;
+        }
+      }
+      const curTask =
+        taskId === "" ? undefined : snap.readiness.perTask.get(taskId);
+      if (curTask?.tag === "ready") {
+        simWorkerPhase = "done";
+        taskTouched = true;
+      }
+      if (!taskTouched) {
+        return task;
+      }
+      anyTaskTouched = true;
+      return {
+        ...task,
+        worker_phase: simWorkerPhase,
+        approval: simApproval,
+        jobs: taskJobs.map((j) =>
+          j.state === "working" ? { ...j, state: "ended" } : j,
+        ),
+      };
+    });
+
+    if (!epicTouched && !anyTaskTouched) {
+      return epic;
+    }
+    dirty = true;
     return {
       ...epic,
-      ...(epicActive
-        ? {
-            status: "done",
-            approval: "approved" as const,
-            jobs: (Array.isArray(epic.jobs) ? epic.jobs : []).map((j) => ({
-              ...j,
-              state: "ended",
-            })),
-          }
-        : {}),
-      tasks: tasks.map((task) => {
-        if (!activeTaskIds.has(task.task_id)) {
-          return task;
-        }
-        const taskJobs = Array.isArray(task.jobs) ? task.jobs : [];
-        return {
-          ...task,
-          worker_phase: "done",
-          approval: "approved" as const,
-          jobs: taskJobs.map((j) => ({ ...j, state: "ended" })),
-        };
-      }),
+      status: simEpicStatus,
+      approval: simEpicApproval,
+      jobs: simEpicJobs,
+      tasks: simTasks,
     };
   });
 
+  if (!dirty) {
+    return { approvals: [], workers: [], closers: [] };
+  }
+
   const futureReadiness = computeReadiness(simulatedEpics, snap.jobs, []);
 
+  const approvals: PreviewRow[] = [];
   const workers: PreviewRow[] = [];
   const closers: PreviewRow[] = [];
   for (const epic of snap.epics) {
@@ -465,8 +512,20 @@ export function predictNextDispatches(
         continue;
       }
       const cur = snap.readiness.perTask.get(taskId);
+      // `cur === completed` rows are already past the next-dispatch edge;
+      // `cur === undefined` is a defensive miss (no prediction). Approve
+      // predictions flow from EITHER `blocked → job-pending` (in-flight
+      // worker / approver chain) OR `ready → job-pending` (section 1's
+      // about-to-dispatch worker, modelled as completed). Worker
+      // predictions flow only from `blocked → ready` — a row already at
+      // `ready` is firing its worker in section 1, not section 2.
+      if (cur === undefined || cur.tag === "completed") {
+        continue;
+      }
       const fut = futureReadiness.perTask.get(taskId);
-      if (cur?.tag === "blocked" && fut?.tag === "ready") {
+      if (fut?.tag === "blocked" && fut.reason.kind === "job-pending") {
+        approvals.push(previewRowFromTask(task, projectDir, "approve"));
+      } else if (cur.tag === "blocked" && fut?.tag === "ready") {
         workers.push(previewRowFromTask(task, projectDir, "work"));
       }
     }
@@ -475,8 +534,13 @@ export function predictNextDispatches(
       continue;
     }
     const cur = snap.readiness.perCloseRow.get(epicId);
+    if (cur === undefined || cur.tag === "completed") {
+      continue;
+    }
     const fut = futureReadiness.perCloseRow.get(epicId);
-    if (cur?.tag === "blocked" && fut?.tag === "ready") {
+    if (fut?.tag === "blocked" && fut.reason.kind === "job-pending") {
+      approvals.push(previewRowFromEpic(epic, "approve"));
+    } else if (cur.tag === "blocked" && fut?.tag === "ready") {
       closers.push(previewRowFromEpic(epic, "close"));
     }
   }
@@ -1184,7 +1248,8 @@ async function main(): Promise<void> {
   // chrome that repaints just row 0 and never grows the frame history.
   // Constructed AFTER the functions it closes over are defined so the
   // closure captures live references.
-  const pauseStatus = (): string => (dryRun ? "" : paused ? "[paused]" : "[playing]");
+  const pauseStatus = (): string =>
+    dryRun ? "" : paused ? "[paused]" : "[playing]";
   const liveShell = createLiveShell({
     enabled: true,
     title: "autopilot",
