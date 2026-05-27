@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-27T21:06:48.600596Z",
+  "depends_on": [],
+  "epic": "fn-629-tighten-readiness-mutex-docs-and-test",
+  "id": "fn-629-tighten-readiness-mutex-docs-and-test.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "fix mutex JSDoc, test names, and negative-control tests",
+  "updated_at": "2026-05-27T21:06:48.600596Z"
+}

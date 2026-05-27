@@ -1,0 +1,21 @@
+{
+  "branch_name": "fn-629-tighten-readiness-mutex-docs-and-test",
+  "bundles": [],
+  "created_at": "2026-05-27T21:06:48.600596Z",
+  "depends_on_epics": [
+    "fn-627-fix-readiness-mutex-iteration-order"
+  ],
+  "id": "fn-629-tighten-readiness-mutex-docs-and-test",
+  "last_validated_at": "2026-05-27T21:06:48.749879Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "tighten readiness mutex docs and test coverage",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-27T21:06:48.600596Z"
+}
