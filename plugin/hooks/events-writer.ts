@@ -423,7 +423,13 @@ async function main(): Promise<void> {
   const configDir =
     hookEvent === "SessionStart" ? configDirFromEnv(process.env) : null;
 
-  const { db, stmts } = openDb(resolveDbPath());
+  // `migrate: false` — the daemon is the sole migrator (see CLAUDE.md
+  // "Migrations are forward-only"). A fresh install must boot the daemon
+  // at least once before the hook can write; the LaunchAgent handles this
+  // on login. A hook arriving against a missing/stale schema fails its
+  // INSERT, which the outer try/catch swallows to stderr and exits 0 per
+  // the "never block Claude" contract.
+  const { db, stmts } = openDb(resolveDbPath(), { migrate: false });
   try {
     // BEGIN IMMEDIATE avoids the lock-upgrade SQLITE_BUSY path: a plain BEGIN
     // would start read-only and need to upgrade to write on INSERT, which

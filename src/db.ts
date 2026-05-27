@@ -545,6 +545,17 @@ export interface Stmts {
 
 export interface OpenDbOptions {
   readonly?: boolean;
+  /**
+   * Run schema convergence (`migrate(db)`) after opening. Defaults to `true`
+   * for writer connections; readers skip migration unconditionally regardless
+   * of this flag. The hook (`plugin/hooks/events-writer.ts`) passes `false`
+   * so the daemon remains the sole migrator — a fresh-install ordering
+   * constraint that the README spells out (the LaunchAgent boots the daemon
+   * before any Claude Code session starts; hook events arriving against a
+   * missing/stale schema fail INSERT and exit 0 per the hook's "never block
+   * Claude" contract).
+   */
+  migrate?: boolean;
 }
 
 export interface KeeperDb {
@@ -2437,7 +2448,7 @@ export function openDb(path: string, options: OpenDbOptions = {}): KeeperDb {
   );
   applyPragmas(db);
 
-  if (!readonly) {
+  if ((options.migrate ?? true) && !readonly) {
     migrate(db);
   }
 

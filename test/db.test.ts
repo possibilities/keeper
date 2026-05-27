@@ -136,6 +136,78 @@ test("readonly: true opens a read-only connection", () => {
   reader.db.close();
 });
 
+test("migrate: false skips schema convergence but still applies PRAGMAs + prepareStmts", () => {
+  // Phase 1 — daemon-style open performs migration + seeds the schema.
+  const writer = openDb(dbPath);
+  writer.db.close();
+
+  // Phase 2 — hook-style reopen against the now-migrated DB with migrate
+  // skipped. PRAGMAs are connection-local so they MUST still run; the
+  // prepared `insertEvent` statement MUST still build against the live
+  // schema. This is the contract `plugin/hooks/events-writer.ts` relies on.
+  const hookOpen = openDb(dbPath, { migrate: false });
+
+  const busy = hookOpen.db.prepare("PRAGMA busy_timeout").get() as {
+    timeout: number;
+  };
+  expect(busy.timeout).toBe(5000);
+
+  // The prepared insertEvent stmt must succeed against the live schema.
+  hookOpen.stmts.insertEvent.run({
+    $ts: 1,
+    $session_id: "sess-migrate-false",
+    $pid: null,
+    $hook_event: "SessionStart",
+    $event_type: "session_start",
+    $tool_name: null,
+    $matcher: null,
+    $cwd: null,
+    $permission_mode: null,
+    $agent_id: null,
+    $agent_type: null,
+    $stop_hook_active: null,
+    $data: "{}",
+    $subagent_agent_id: null,
+    $spawn_name: null,
+    $start_time: null,
+    $slash_command: null,
+    $skill_name: null,
+    $planctl_op: null,
+    $planctl_target: null,
+    $planctl_epic_id: null,
+    $planctl_task_id: null,
+    $planctl_subject_present: null,
+    $tool_use_id: null,
+    $config_dir: null,
+    $planctl_queue_jump: null,
+  });
+
+  const count = (
+    hookOpen.db.prepare("SELECT COUNT(*) AS n FROM events").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(1);
+
+  hookOpen.db.close();
+});
+
+test("migrate: false against an empty DB fails to prepare (hook outer-guard tolerates)", () => {
+  // The hook's contract: if the daemon has never booted, the schema does
+  // not exist, `prepareStmts` throws on the missing `events` table, and the
+  // outer try/catch in `events-writer.ts` swallows + exits 0. This negative
+  // test pins that failure mode so a future refactor cannot silently make
+  // the hook self-migrate.
+  const freshDbPath = join(tmpDir, "fresh-empty.db");
+  let threw = false;
+  try {
+    openDb(freshDbPath, { migrate: false });
+  } catch {
+    threw = true;
+  }
+  expect(threw).toBe(true);
+});
+
 test("reducer_state row (1, 0, ts) is seeded on first open", () => {
   const { db } = openDb(dbPath);
   const row = db

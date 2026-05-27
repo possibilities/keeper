@@ -44,6 +44,13 @@ let launcherPath: string;
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-events-writer-test-"));
   dbPath = join(tmpDir, "keeper.db");
+  // The hook opens with `{ migrate: false }` — the daemon is the sole
+  // migrator (see CLAUDE.md "Migrations are forward-only"). These tests
+  // simulate "daemon has already booted at least once" by pre-migrating
+  // the schema here. Without this, the hook's `prepareStmts` would throw
+  // on the missing `events` table — the intentional fresh-install failure
+  // mode that the outer try/catch swallows to stderr.
+  openDb(dbPath).db.close();
   launcherPath = join(tmpDir, "spawn-launcher.ts");
   // The launcher pipes a payload (its first non-flag arg after the marker) into
   // the hook on stdin and exits with the hook's code. Its OWN argv carries the

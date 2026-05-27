@@ -123,7 +123,11 @@ the native value" is the default.
   slot in `migrate()`. Idempotent steps may run unguarded; a non-idempotent step
   (data backfill, destructive DROP) MUST be version-guarded so a re-run can't
   corrupt an already-migrated schema. Bump `SCHEMA_VERSION` only when adding an
-  ALTER; never reduce it, never branch.
+  ALTER; never reduce it, never branch. The daemon is the SOLE migrator; the
+  hook (`plugin/hooks/events-writer.ts`) opens with `{ migrate: false }` and
+  never runs schema convergence. A hook arriving against a missing/stale schema
+  fails its INSERT and exits 0 per the "never block Claude" contract — silent
+  event loss is the accepted failure mode.
 
 ## DO NOT
 

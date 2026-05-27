@@ -257,6 +257,18 @@ Keeper has no `install` verb. Wire it up manually:
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.plist
    ```
 
+   **The daemon must boot at least once before the hook can write events.**
+   The hook opens its sqlite connection with `{ migrate: false }` — the
+   daemon is the sole migrator (see CLAUDE.md "Migrations are forward-only").
+   On a fresh install the LaunchAgent runs the daemon at login, which creates
+   the DB and runs `migrate()` to converge the schema; only after that does
+   the hook have tables to INSERT into. If the hook fires against a missing
+   schema (e.g. you started a Claude Code session before the LaunchAgent
+   booted the daemon for the first time) the INSERT fails, the hook's outer
+   try/catch logs to stderr, and the process exits 0 — the event is lost but
+   the session is not blocked. The manual recovery is `launchctl bootstrap`
+   above; subsequent sessions write normally.
+
    **Upgrade-from-pre-trace-gate note:** if you are re-bootstrapping over an
    existing install whose `server.stderr` predates the `KEEPER_TRACE_SERVER`
    gate (the file may be hundreds of megabytes of `[srv-ts]` lines), run this
