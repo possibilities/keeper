@@ -117,17 +117,18 @@ Usage: bun scripts/autopilot.ts [--sock <path>] [--dry-run]
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
-  p pause/resume dispatches, q/Ctrl-C quit. Per-frame sidecars are
-  indexed; lifecycle + warn output is appended to
+  space pause/resume dispatches, q/Ctrl-C quit. Per-frame sidecars
+  are indexed; lifecycle + warn output is appended to
   /tmp/keeper-autopilot.<pid>.lifecycle.txt. Session paths print on
   exit.
 
-Always starts paused — the title shows '[PAUSED]' until you press
-'p', at which point any currently ready/pending rows fire
-immediately (using the last snapshot, no wait for the next push) and
-new edges fire as they arrive. Pause has no effect in --dry-run mode
-(dispatches are already side-effect-free there), so the [PAUSED] tag
-is suppressed and the 'p' key is a silent no-op.
+Always starts paused — the banner row carries a '[paused]' /
+'[playing]' indicator (live-only chrome; toggling it doesn't push a
+frame to history). Pressing space flips the state; on unpause any
+currently ready/pending rows fire immediately against the last
+snapshot, no wait for keeperd's next push. Pause has no effect in
+--dry-run mode (dispatches are already side-effect-free there), so
+the indicator is suppressed and the space key is a silent no-op.
 
 Each frame lists every command dispatched so far, oldest first. Each
 line is prefixed with the basename of the cd target so the project is
@@ -698,42 +699,29 @@ async function main(): Promise<void> {
     }
     section1.push(...queued);
 
-    const body = composeBody();
-    // Wet-mode pause indicator: the live-shell's banner title is fixed at
-    // construction (`[[autopilot]] Showing live results …`), so the pause
-    // state lives in the body. Prepended unconditionally when paused so
-    // it's visible even on a fully-empty frame; suppressed in --dry-run
-    // since pause has no observable effect there.
-    if (paused && !dryRun) {
-      return body.length === 0 ? ["[PAUSED]"] : ["[PAUSED]", "", ...body];
+    if (lastSnap === null) {
+      return section1;
     }
-    return body;
-
-    function composeBody(): string[] {
-      if (lastSnap === null) {
-        return section1;
-      }
-      const { approvals, workers, closers } = predictNextDispatches(lastSnap);
-      if (
-        approvals.length === 0 &&
-        workers.length === 0 &&
-        closers.length === 0
-      ) {
-        return section1;
-      }
-      const section2: string[] = [];
-      for (const r of [...approvals, ...workers, ...closers]) {
-        const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
-        section2.push(`${dirSeg}${r.verb}::${r.id}`);
-      }
-      // The `---` separator is only emitted between two non-empty
-      // sections. When section 1 is empty (no dispatches this run yet)
-      // but section 2 has predicted rows, the preview lines render alone.
-      if (section1.length === 0) {
-        return section2;
-      }
-      return [...section1, "---", ...section2];
+    const { approvals, workers, closers } = predictNextDispatches(lastSnap);
+    if (
+      approvals.length === 0 &&
+      workers.length === 0 &&
+      closers.length === 0
+    ) {
+      return section1;
     }
+    const section2: string[] = [];
+    for (const r of [...approvals, ...workers, ...closers]) {
+      const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
+      section2.push(`${dirSeg}${r.verb}::${r.id}`);
+    }
+    // The `---` separator is only emitted between two non-empty sections.
+    // When section 1 is empty (no dispatches this run yet) but section 2
+    // has predicted rows, the preview lines render alone.
+    if (section1.length === 0) {
+      return section2;
+    }
+    return [...section1, "---", ...section2];
   }
 
   // --- sidecar paths ---
@@ -1187,34 +1175,35 @@ async function main(): Promise<void> {
     emitFrame();
   };
 
-  // `p` toggles `paused`. On the unpause edge in wet mode we eagerly re-run
-  // `processLaunchTransitions` against the cached snapshot so the human
-  // doesn't have to wait for keeperd's next push to see things fire. In
-  // dry-run the flag toggles but nothing else moves (the title doesn't
-  // carry [PAUSED] either, so the keypress is invisible). The frame is
-  // refreshed via `liveShell.refreshLive` so the title flip lands
-  // immediately without growing history. Constructed AFTER the functions
-  // it closes over are defined so the closure captures live references.
+  // Space toggles `paused`. On the unpause edge in wet mode we eagerly
+  // re-run `processLaunchTransitions` against the cached snapshot so the
+  // human doesn't have to wait for keeperd's next push to see things
+  // fire. In dry-run the flag toggles but nothing else moves and the
+  // banner indicator stays hidden, so the keypress is invisible. The
+  // banner indicator is updated via `liveShell.setStatus` — live-only
+  // chrome that repaints just row 0 and never grows the frame history.
+  // Constructed AFTER the functions it closes over are defined so the
+  // closure captures live references.
+  const pauseStatus = (): string => (dryRun ? "" : paused ? "[paused]" : "[playing]");
   const liveShell = createLiveShell({
     enabled: true,
     title: "autopilot",
     onUnhandledKey: (key) => {
-      if (key !== "p" || dryRun) {
+      if (key !== " " || dryRun) {
         return;
       }
       paused = !paused;
+      liveShell.setStatus(pauseStatus());
       if (!paused && lastSnap !== null) {
         processLaunchTransitions(lastSnap);
       }
-      liveShell.refreshLive(renderDispatchFrame());
     },
   });
-  // Initial paint so the [PAUSED] indicator shows up before keeperd's
-  // first snapshot lands (otherwise the user sees an empty alt-screen for
-  // the connection's first few ms). Goes through `emitFrame` so
-  // `lastBody` is kept in sync and the post-connect onSnapshot emit
-  // doesn't double-push an identical frame.
-  emitFrame();
+  // Seed the banner indicator so the user sees `[paused]` from the very
+  // first paint, before keeperd's first snapshot lands. setStatus does a
+  // banner-only repaint with no body content, which is exactly what we
+  // want here.
+  liveShell.setStatus(pauseStatus());
 
   const handle = subscribeReadiness({
     sockPath,

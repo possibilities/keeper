@@ -210,6 +210,16 @@ export interface LiveShell {
    * the same frame to a pipe would dupe lines) or after `dispose()`.
    */
   refreshLive(lines: string[]): void;
+  /**
+   * Update a short status segment folded into the banner row (appended
+   * after the existing `Showing live results …` / `frame N of M …` text).
+   * The status is live-only chrome: it's not part of any frame and does
+   * not push history, so toggling it never grows the ring buffer. Empty
+   * string hides the segment. The repaint is per-line-diffed against
+   * `prevLines`, so an unchanged status writes only the SYNC wrapper
+   * bytes; a changed status repaints the banner row alone.
+   */
+  setStatus(status: string): void;
   dispose(): void;
 }
 
@@ -305,6 +315,10 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
         // duplicate frame bodies when the script is piped to a file or
         // running under CI.
       },
+      setStatus(_status: string): void {
+        // Silent no-op in pass-through: there's no banner to update when
+        // we never wrote one in the first place.
+      },
       dispose(): void {
         // No-op; flag exists only so a post-dispose `pushFrame` is silent.
         disabledDisposed = true;
@@ -341,6 +355,11 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   // supersedes the overlay). Historical scroll-back is unaffected: held
   // frames keep their frozen at-capture rendering.
   let liveOverlay: string[] | null = null;
+  // Short caller-controlled status segment folded into the banner row
+  // (after the existing `Showing live results …` / `frame N of M …`
+  // text). Live-only chrome — never part of any frame's history. Empty
+  // string hides the segment.
+  let bannerStatus = "";
 
   // ---- Escape-parser state.
   // `escBuf` accumulates bytes that begin with `\x1b`. When a complete CSI
@@ -364,13 +383,14 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
    * the frame.
    */
   function bannerFor(view: ViewIdx, total: number): string {
+    const statusSuffix = bannerStatus === "" ? "" : ` ${bannerStatus}`;
     if (view === "live" || total === 0) {
       return total === 0
-        ? `\x1b[2m${titlePrefix}Showing live results\x1b[0m`
-        : `\x1b[2m${titlePrefix}Showing live results (frame ${total})\x1b[0m`;
+        ? `\x1b[2m${titlePrefix}Showing live results${statusSuffix}\x1b[0m`
+        : `\x1b[2m${titlePrefix}Showing live results (frame ${total})${statusSuffix}\x1b[0m`;
     }
     // `view` is 0-indexed within the held frames; humans count from 1.
-    return `\x1b[2m${titlePrefix}frame ${view + 1} of ${total} — press G to return to live\x1b[0m`;
+    return `\x1b[2m${titlePrefix}frame ${view + 1} of ${total} — press G to return to live${statusSuffix}\x1b[0m`;
   }
 
   /**
@@ -720,6 +740,20 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
     // `visibleRows`.
   }
 
+  function setStatus(status: string): void {
+    if (disposed) {
+      return;
+    }
+    if (bannerStatus === status) {
+      return;
+    }
+    bannerStatus = status;
+    // Banner-only repaint: the per-line diff sees an unchanged body and
+    // a changed row 0, so only the banner row's bytes ship. No frame is
+    // appended to history — toggling status is pure chrome.
+    renderDiff(false);
+  }
+
   function dispose(): void {
     if (disposed) {
       return;
@@ -789,5 +823,5 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   safetyNetTarget.on("uncaughtException", onUncaught);
   safetyNetTarget.on("unhandledRejection", onUnhandledRejection);
 
-  return { pushFrame, refreshLive, dispose };
+  return { pushFrame, refreshLive, setStatus, dispose };
 }
