@@ -163,6 +163,15 @@ export interface LiveShellOptions {
    */
   readonly onExit?: () => void;
   /**
+   * Called for any key the shell's built-in keymap doesn't handle (anything
+   * other than nav keys, `g`, `G`/End/Esc, `q`/Ctrl-C). Lets the caller bind
+   * its own keys (e.g. `p` for pause/resume) without forking the shell. The
+   * `key` argument is the same raw string the internal dispatcher receives —
+   * a single character for printable keys, or the full CSI/SS3 sequence for
+   * escape-prefixed keys.
+   */
+  readonly onUnhandledKey?: (key: string) => void;
+  /**
    * Optional report name rendered at the head of the banner row (e.g.
    * `"board"` → `[[board]] Showing live results (frame 13)`). Lets each
    * live keeper script identify itself in the alt-screen without
@@ -310,6 +319,7 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   const resizeDebounceMs = opts.resizeDebounceMs ?? DEFAULT_RESIZE_DEBOUNCE_MS;
   const safetyNetTarget = opts.safetyNetTarget ?? (process as SafetyNetTarget);
   const onExit = opts.onExit ?? (() => process.exit(0));
+  const onUnhandledKey = opts.onUnhandledKey;
   // Pre-computed `[[<title>]] ` prefix folded into the banner row. Empty
   // when no title was supplied so the banner reads exactly as it did
   // pre-title.
@@ -509,7 +519,11 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
         onExit();
         return;
       default:
-        // ignore everything else (printable letters, unmapped CSI, etc.)
+        // Hand unmapped keys (printable letters, unmapped CSI, etc.) to the
+        // caller's `onUnhandledKey` if one was supplied; otherwise ignore.
+        if (onUnhandledKey !== undefined) {
+          onUnhandledKey(key);
+        }
         return;
     }
   }

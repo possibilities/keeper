@@ -117,9 +117,17 @@ Usage: bun scripts/autopilot.ts [--sock <path>] [--dry-run]
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
-  q/Ctrl-C quit. Per-frame sidecars are indexed; lifecycle + warn output
-  is appended to /tmp/keeper-autopilot.<pid>.lifecycle.txt. Session
-  paths print on exit.
+  p pause/resume dispatches, q/Ctrl-C quit. Per-frame sidecars are
+  indexed; lifecycle + warn output is appended to
+  /tmp/keeper-autopilot.<pid>.lifecycle.txt. Session paths print on
+  exit.
+
+Always starts paused — the title shows '[PAUSED]' until you press
+'p', at which point any currently ready/pending rows fire
+immediately (using the last snapshot, no wait for the next push) and
+new edges fire as they arrive. Pause has no effect in --dry-run mode
+(dispatches are already side-effect-free there), so the [PAUSED] tag
+is suppressed and the 'p' key is a silent no-op.
 
 Each frame lists every command dispatched so far, oldest first. Each
 line is prefixed with the basename of the cd target so the project is
@@ -620,8 +628,18 @@ async function main(): Promise<void> {
   const sockPath = values.sock ?? resolveSockPath();
   const dispatchLogPath = join(dirname(sockPath), "dispatch.log");
   const dryRun = values["dry-run"] === true;
-  const liveShell = createLiveShell({ enabled: true, title: "autopilot" });
   let frameCount = 0;
+
+  // Always starts paused. While `paused && !dryRun`,
+  // `processLaunchTransitions` returns early — no Ghostty windows open and
+  // `lastVerdictSig` stays frozen, so any currently ready/pending row will
+  // fire on the next snapshot once unpaused. On the unpause edge we ALSO
+  // immediately re-run `processLaunchTransitions(lastSnap)` so the human
+  // doesn't have to wait for keeperd to push the next snapshot. In
+  // --dry-run mode the flag is tracked but ignored: dispatches are
+  // already side-effect-free, so the 'p' key is a silent no-op and the
+  // title never carries the [PAUSED] tag.
+  let paused = true;
 
   let lastBody: string | null = null;
   // Latest readiness snapshot, captured at the top of `onSnapshot`. The
@@ -680,29 +698,42 @@ async function main(): Promise<void> {
     }
     section1.push(...queued);
 
-    if (lastSnap === null) {
-      return section1;
+    const body = composeBody();
+    // Wet-mode pause indicator: the live-shell's banner title is fixed at
+    // construction (`[[autopilot]] Showing live results …`), so the pause
+    // state lives in the body. Prepended unconditionally when paused so
+    // it's visible even on a fully-empty frame; suppressed in --dry-run
+    // since pause has no observable effect there.
+    if (paused && !dryRun) {
+      return body.length === 0 ? ["[PAUSED]"] : ["[PAUSED]", "", ...body];
     }
-    const { approvals, workers, closers } = predictNextDispatches(lastSnap);
-    if (
-      approvals.length === 0 &&
-      workers.length === 0 &&
-      closers.length === 0
-    ) {
-      return section1;
+    return body;
+
+    function composeBody(): string[] {
+      if (lastSnap === null) {
+        return section1;
+      }
+      const { approvals, workers, closers } = predictNextDispatches(lastSnap);
+      if (
+        approvals.length === 0 &&
+        workers.length === 0 &&
+        closers.length === 0
+      ) {
+        return section1;
+      }
+      const section2: string[] = [];
+      for (const r of [...approvals, ...workers, ...closers]) {
+        const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
+        section2.push(`${dirSeg}${r.verb}::${r.id}`);
+      }
+      // The `---` separator is only emitted between two non-empty
+      // sections. When section 1 is empty (no dispatches this run yet)
+      // but section 2 has predicted rows, the preview lines render alone.
+      if (section1.length === 0) {
+        return section2;
+      }
+      return [...section1, "---", ...section2];
     }
-    const section2: string[] = [];
-    for (const r of [...approvals, ...workers, ...closers]) {
-      const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
-      section2.push(`${dirSeg}${r.verb}::${r.id}`);
-    }
-    // The `---` separator is only emitted between two non-empty sections.
-    // When section 1 is empty (no dispatches this run yet) but section 2
-    // has predicted rows, the preview lines render alone.
-    if (section1.length === 0) {
-      return section2;
-    }
-    return [...section1, "---", ...section2];
   }
 
   // --- sidecar paths ---
@@ -1000,6 +1031,16 @@ async function main(): Promise<void> {
   }
 
   function processLaunchTransitions(snap: ReadinessClientSnapshot): void {
+    // While paused (wet mode only), skip the entire transition walk —
+    // including the `lastVerdictSig` update. The map stays frozen at its
+    // pre-pause shape, so on the unpause edge the next snapshot (or the
+    // eager call from the 'p' key handler) sees the same prev → cur edge
+    // and fires anything currently ready/pending. Already-dispatched rows
+    // are still protected by the durable `dispatchedKeys` re-dispatch
+    // guard. Dry-run bypasses the gate so pause has no observable effect.
+    if (paused && !dryRun) {
+      return;
+    }
     for (const epic of snap.epics) {
       const projectDir = seg(epic.project_dir);
       const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
@@ -1145,6 +1186,35 @@ async function main(): Promise<void> {
     processLaunchTransitions(snap);
     emitFrame();
   };
+
+  // `p` toggles `paused`. On the unpause edge in wet mode we eagerly re-run
+  // `processLaunchTransitions` against the cached snapshot so the human
+  // doesn't have to wait for keeperd's next push to see things fire. In
+  // dry-run the flag toggles but nothing else moves (the title doesn't
+  // carry [PAUSED] either, so the keypress is invisible). The frame is
+  // refreshed via `liveShell.refreshLive` so the title flip lands
+  // immediately without growing history. Constructed AFTER the functions
+  // it closes over are defined so the closure captures live references.
+  const liveShell = createLiveShell({
+    enabled: true,
+    title: "autopilot",
+    onUnhandledKey: (key) => {
+      if (key !== "p" || dryRun) {
+        return;
+      }
+      paused = !paused;
+      if (!paused && lastSnap !== null) {
+        processLaunchTransitions(lastSnap);
+      }
+      liveShell.refreshLive(renderDispatchFrame());
+    },
+  });
+  // Initial paint so the [PAUSED] indicator shows up before keeperd's
+  // first snapshot lands (otherwise the user sees an empty alt-screen for
+  // the connection's first few ms). Goes through `emitFrame` so
+  // `lastBody` is kept in sync and the post-connect onSnapshot emit
+  // doesn't double-push an identical frame.
+  emitFrame();
 
   const handle = subscribeReadiness({
     sockPath,
