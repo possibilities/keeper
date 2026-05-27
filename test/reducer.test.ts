@@ -2362,6 +2362,7 @@ function getEpic(epicId: string) {
     last_validated_at: string | null;
     created_by_closer_of: string | null;
     sort_path: string;
+    queue_jump: number;
   } | null;
 }
 
