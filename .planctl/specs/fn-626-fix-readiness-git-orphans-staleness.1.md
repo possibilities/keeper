@@ -71,5 +71,5 @@ Mirror for the close-row arm.
 - [ ] `bun test` and `bun run typecheck` pass
 
 ## Done summary
-
+Pivot predicate 6.5 onto live git_status row keyed by task.target_repo ?? epic.project_dir (task arm) / epic.project_dir (close-row arm); delete pickFreshestEmbeddedJobByVerb. readiness-client subscribes to a 4th 'git' collection and widens first-paint gate to 4-strict; autopilot simulator passes explicit new Map() with rationale comment. Regression tests assert stale per-job orphan counts no longer block when live git_status reports 0.
 ## Evidence

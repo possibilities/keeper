@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "fix readiness git-orphans staleness",
-  "updated_at": "2026-05-27T19:45:38.557529Z"
+  "updated_at": "2026-05-27T20:14:22.859921Z",
+  "worker_done_at": "2026-05-27T20:14:22.859921Z"
 }
