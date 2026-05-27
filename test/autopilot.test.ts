@@ -67,6 +67,9 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     tasks: [],
     jobs: [],
     job_links: [],
+    created_by_closer_of: null,
+    sort_path: "000001",
+    queue_jump: 0,
     last_validated_at: "2026-05-24T00:00:00Z",
     ...overrides,
   };
