@@ -208,6 +208,64 @@ test("migrate: false against an empty DB fails to prepare (hook outer-guard tole
   expect(threw).toBe(true);
 });
 
+test("migrate: false against a stale schema fails on a column-binding error (hook outer-guard tolerates)", () => {
+  // The companion negative case to the empty-DB test above. CLAUDE.md's
+  // migration invariant: "A hook arriving against a missing OR STALE schema
+  // fails its INSERT and exits 0." Empty-DB hits a "no such table: events"
+  // path in prepareStmts. The stale-schema case — events table present but
+  // newer columns absent — hits a DIFFERENT path: prepareStmts succeeds for
+  // statements that don't touch the missing columns, but the insertEvent
+  // prepare itself fails because the INSERT names columns the live schema
+  // doesn't have. The hook's outer try/catch swallows either failure and
+  // exits 0; this test pins the column-binding flavor so a future schema
+  // bump can't silently make the hook self-migrate or mask the failure.
+  const staleDbPath = join(tmpDir, "stale-schema.db");
+  // Hand-roll an older events table that omits at least one column
+  // insertEvent's INSERT statement names — here, planctl_queue_jump,
+  // tool_use_id, config_dir, plus the planctl_* envelope columns. This is
+  // the shape a keeper DB last migrated several schema versions ago would
+  // present to a freshly-built hook binary.
+  const seed = new Database(staleDbPath, { create: true });
+  seed.run(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      session_id TEXT NOT NULL,
+      pid INTEGER,
+      hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      tool_name TEXT,
+      matcher TEXT,
+      cwd TEXT,
+      permission_mode TEXT,
+      agent_id TEXT,
+      agent_type TEXT,
+      stop_hook_active INTEGER,
+      data TEXT,
+      subagent_agent_id TEXT,
+      spawn_name TEXT,
+      start_time INTEGER,
+      slash_command TEXT,
+      skill_name TEXT
+    )
+  `);
+  seed.close();
+
+  let error: unknown = null;
+  try {
+    openDb(staleDbPath, { migrate: false });
+  } catch (err) {
+    error = err;
+  }
+  expect(error).not.toBeNull();
+  const message = String((error as Error).message ?? error);
+  // The failure mode must be DISTINCT from the missing-table error in the
+  // test above ("no such table: events"). A stale-schema open trips on a
+  // missing column reference during prepareStmts' INSERT prepare.
+  expect(message).not.toMatch(/no such table/i);
+  expect(message).toMatch(/no such column|has no column/i);
+});
+
 test("reducer_state row (1, 0, ts) is seeded on first open", () => {
   const { db } = openDb(dbPath);
   const row = db
