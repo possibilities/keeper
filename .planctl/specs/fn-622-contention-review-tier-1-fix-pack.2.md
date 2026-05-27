@@ -68,5 +68,5 @@ if (TRACE) srvTs(`op=runQuery col=${col} ... countAndToken=${(t1-t0).toFixed(2)}
 - [ ] Microbenchmark in `## Evidence` showing < 1% overhead with `TRACE=0`
 
 ## Done summary
-
+Added staged timing instrumentation to runQuery/diffTick/writeFrames under the existing KEEPER_TRACE_SERVER gate. runQuery emits per call; diffTick gated to >5ms-any-stage or >10ms-total; writeFrames gated to KEEPER_TRACE_FRAME_BYTES (default 4096). Funneled through one formatStages helper for awk-parseable output. Zero-overhead-when-off verified via 10k-iter microbenchmark (TRACE=0 within noise of baseline).
 ## Evidence
