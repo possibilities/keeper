@@ -2,9 +2,9 @@
 /**
  * keeper-autopilot — dispatch log viewer over the keeper subscribe server.
  *
- * Subscribes to keeperd and (with --launch) auto-dispatches ready rows.
- * Each frame lists every command dispatched so far, oldest first, with a
- * relative "time ago" timestamp refreshed on each new dispatch:
+ * Subscribes to keeperd and auto-dispatches ready rows. Each frame lists
+ * every command dispatched so far, oldest first, with a relative "time
+ * ago" timestamp refreshed on each new dispatch:
  *
  *   [2m ago] launch  cd <dir> && claude '/plan:work <task_id>'
  *   [just now] notify  task <id> done — needs approval
@@ -13,7 +13,7 @@
  * and loaded at startup so history survives restarts. A new frame is
  * emitted immediately after each dispatch event.
  *
- * With --launch, fires side effects on EDGES in the readiness verdicts:
+ * Fires side effects on EDGES in the readiness verdicts:
  *   → ready          spawn a Ghostty window running the worker command
  *                    (`cd … && claude '/plan:work …'` or '/plan:close …')
  *   → job-pending    fire `notifyctl` (worker done, approval needed)
@@ -30,11 +30,10 @@
  * `/tmp/keeper-autopilot.<pid>.meta.txt`.
  *
  * Usage:
- *   bun scripts/autopilot.ts [--sock <path>] [--launch]
+ *   bun scripts/autopilot.ts [--sock <path>] [--dry-run]
  *
  *   --sock <path>    Socket path override (else $KEEPER_SOCK, else the
  *                    ~/.local/state/keeper/keeperd.sock default).
- *   --launch         Enable auto-dispatch (see above).
  *   --dry-run        Log edges without spawning Ghostty or notifyctl.
  *   --help           Show this help.
  */
@@ -53,20 +52,12 @@ import type { Epic } from "../src/types";
 
 const HELP = `keeper-autopilot — dispatch log viewer over the keeper subscribe server
 
-Usage: bun scripts/autopilot.ts [--sock <path>] [--launch]
+Usage: bun scripts/autopilot.ts [--sock <path>] [--dry-run]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
-  --launch         Auto-dispatch ready rows: spawn a Ghostty window running
-                   the worker command for each task/close row whose verdict
-                   transitions into { tag: "ready" }, and notifyctl when a
-                   task/close row transitions into "approval pending"
-                   (worker_phase done + approval pending). Tries to move
-                   the new Ghostty window to yabai space 5 if yabai is
-                   installed.
   --dry-run        Log dispatches to the frame and disk but skip the
-                   actual Ghostty spawn and notifyctl call. Implies
-                   --launch for edge detection. Entries appear as
-                   "[Xm ago] launch (dry)  <command>" in the frame.
+                   actual Ghostty spawn and notifyctl call. Entries
+                   appear as "[Xm ago] launch (dry)  <command>".
   --help           Show this help
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
@@ -210,7 +201,6 @@ async function main(): Promise<void> {
     args: Bun.argv.slice(2),
     options: {
       sock: { type: "string" },
-      launch: { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
@@ -224,7 +214,6 @@ async function main(): Promise<void> {
 
   const sockPath = values.sock ?? resolveSockPath();
   const dispatchLogPath = join(dirname(sockPath), "dispatch.log");
-  const launchEnabled = values.launch === true;
   const dryRun = values["dry-run"] === true;
   const liveShell = createLiveShell({ enabled: true });
   let frameCount = 0;
@@ -578,9 +567,7 @@ async function main(): Promise<void> {
   }
 
   const onSnapshot = (snap: ReadinessClientSnapshot): void => {
-    if (launchEnabled) {
-      processLaunchTransitions(snap);
-    }
+    processLaunchTransitions(snap);
     emitFrame();
   };
 
