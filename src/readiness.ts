@@ -272,7 +272,11 @@ function evaluateTask(
   // human while the worker is still in-flight — exactly the bug this
   // ordering exists to prevent. Once the session's embedded job state
   // leaves `working` AND every sub-agent invocation finishes, this
-  // predicate fires and the notify lands at the right moment.
+  // predicate fires and the notify lands at the right moment. The reducer's
+  // Stop arm carries a sub-running guard that keeps `state='working'` across
+  // a parent's mid-yield Stop while a sub-agent runs — without it the
+  // sequence (Stop while sub running → SubagentStop → UPS-resume → Stop)
+  // would dup-clear this predicate twice (see `src/reducer.ts` Stop arm).
   if (task.approval === "pending" && task.worker_phase === "done") {
     return { tag: "blocked", reason: { kind: "job-pending" } };
   }
