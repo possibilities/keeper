@@ -305,7 +305,12 @@ CI) `--live` silently behaves as if it wasn't set. Run any of them with
   only (`working + stopped`), `subagent_invocations` full per-job
   timeline. Each epic renders as a header line —
   `({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated]
-  [ready|completed|blocked:<reason>]` — followed by indented task lines
+  [slotted-after-closer]? [ready|completed|blocked:<reason>]` — followed by indented task lines
+  (the optional `[slotted-after-closer]` pill — schema v29, active/cyan
+  bucket — appears only when the epic was minted by another epic's
+  closer session, i.e. `epics.created_by_closer_of != null`; its
+  presence is also what slots the row directly below its parent under
+  the default `sort_path ASC` ordering)
   (with `[{runtime_status}] [{worker_phase}] [{approval}]
   [ready|completed|blocked:<reason>]` pills — three native vocabularies
   side-by-side: the planctl runtime enum `todo|in_progress|done|blocked`,
@@ -507,7 +512,19 @@ SessionStart environment, projecting the arthack-claude profile a session
 ran under (latest-non-NULL-wins via `COALESCE(excluded.config_dir,
 jobs.config_dir)` on the SessionStart ON CONFLICT branch, so a resume
 SessionStart that captures NULL preserves the prior attribution).
-As of schema v25, each `epics.job_links`
+As of schema v29, the `epics` projection gains `created_by_closer_of` (TEXT,
+nullable — the closer→child link's `plan_ref`, i.e. the closed-epic id whose
+`/plan:plan` closer session minted this child epic via `epic-create`) and
+`sort_path` (TEXT NOT NULL DEFAULT '' — a zero-padded-6 dotted materialized-
+path key like `"000003.000007"`). Both are reducer-derived inside
+`syncPlanctlLinks` from the existing `job_links` + `jobs.plan_verb` /
+`plan_ref` substrate; an `EpicSnapshot` carve-out preserves them across an
+approval-RPC round-trip (alongside `tasks` / `jobs` / `job_links`). The
+`EPICS_DESCRIPTOR.defaultSort` flips from `epic_number asc` to
+`sort_path asc`, so a closer-created child epic slots directly below its
+parent in the default page; `sort_path` overflows to `''` at the documented
+ceiling `epic_number >= 1_000_000` (safe-fold; the reducer never throws
+inside `BEGIN IMMEDIATE`). As of schema v25, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `last_api_error_at` /
 `last_api_error_kind` / `last_input_request_at` /
 `last_input_request_kind` denormalized off the live `jobs` row at the
@@ -644,24 +661,24 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 
 # Epics by inbound-link density — every job whose planctl-CLI footprint created or refined the epic during a /plan:plan window (epics.job_links is the symmetric per-epic fan-out; as of schema v25 each entry embeds the linked job's title/state/last_api_error_(at,kind)/last_input_request_(at,kind) denormalized off the jobs row at the reducer's write boundary, so renderers + predicates no longer need a live-jobs join):
 sqlite3 ~/.local/state/keeper/keeper.db \
-  "SELECT epic_id, epic_number, title, json_array_length(job_links) AS n FROM epics WHERE json_array_length(job_links) > 0 ORDER BY n DESC, epic_number ASC LIMIT 10"
+  "SELECT epic_id, epic_number, title, json_array_length(job_links) AS n FROM epics WHERE json_array_length(job_links) > 0 ORDER BY n DESC, sort_path ASC LIMIT 10"
 # Unnest job_links to see each link's embedded display payload (schema v25: kind, job_id, title, state, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind):
 sqlite3 ~/.local/state/keeper/keeper.db \
-  "SELECT e.epic_id, json_extract(l.value, '\$.kind') AS kind, json_extract(l.value, '\$.job_id') AS job_id, json_extract(l.value, '\$.title') AS title, json_extract(l.value, '\$.state') AS state, json_extract(l.value, '\$.last_api_error_at') AS last_api_error_at, json_extract(l.value, '\$.last_api_error_kind') AS last_api_error_kind, json_extract(l.value, '\$.last_input_request_at') AS last_input_request_at, json_extract(l.value, '\$.last_input_request_kind') AS last_input_request_kind FROM epics e, json_each(e.job_links) l ORDER BY e.epic_number ASC, kind ASC, job_id ASC LIMIT 20"
+  "SELECT e.epic_id, json_extract(l.value, '\$.kind') AS kind, json_extract(l.value, '\$.job_id') AS job_id, json_extract(l.value, '\$.title') AS title, json_extract(l.value, '\$.state') AS state, json_extract(l.value, '\$.last_api_error_at') AS last_api_error_at, json_extract(l.value, '\$.last_api_error_kind') AS last_api_error_kind, json_extract(l.value, '\$.last_input_request_at') AS last_input_request_at, json_extract(l.value, '\$.last_input_request_kind') AS last_input_request_kind FROM epics e, json_each(e.job_links) l ORDER BY e.sort_path ASC, kind ASC, job_id ASC LIMIT 20"
 
 # Killed sessions specifically (proven-dead from outside the hook stream — SIGKILL, terminal-pane closure, reboot):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, pid, start_time FROM jobs WHERE state = "killed" ORDER BY updated_at DESC LIMIT 10'
 
-# Plans projection — epics (each embedding its tasks AND its plan/close-verb jobs as JSON arrays) folded from the configured `.planctl` roots:
+# Plans projection — epics (each embedding its tasks AND its plan/close-verb jobs as JSON arrays) folded from the configured `.planctl` roots. As of schema v29 the natural sort is `sort_path ASC` (matches the `EPICS_DESCRIPTOR` default), which slots closer-created children directly below their parent:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT epic_id, epic_number, title, status, last_validated_at, json_array_length(jobs) AS epic_jobs_n FROM epics ORDER BY epic_number ASC LIMIT 10'
+  'SELECT epic_id, epic_number, sort_path, created_by_closer_of, title, status, last_validated_at, json_array_length(jobs) AS epic_jobs_n FROM epics ORDER BY sort_path ASC, epic_id ASC LIMIT 10'
 # Tasks live inside epics.tasks now — unnest with json_each to list them per epic. Schema v19 surfaces BOTH the planctl-native runtime status (`runtime_status`: todo|in_progress|done|blocked, ingested from `.planctl/state/tasks/<task_id>.state.json`) AND the derived worker-phase binary (`worker_phase`: open|done, derived from `worker_done_at`) — same task, two complementary axes:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(t.value, '\$.task_number') AS task_number, json_extract(t.value, '\$.title') AS title, json_extract(t.value, '\$.runtime_status') AS runtime_status, json_extract(t.value, '\$.worker_phase') AS worker_phase FROM epics e, json_each(e.tasks) t ORDER BY e.epic_number ASC, task_number ASC LIMIT 10"
+  "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(t.value, '\$.task_number') AS task_number, json_extract(t.value, '\$.title') AS title, json_extract(t.value, '\$.runtime_status') AS runtime_status, json_extract(t.value, '\$.worker_phase') AS worker_phase FROM epics e, json_each(e.tasks) t ORDER BY e.sort_path ASC, task_number ASC LIMIT 10"
 # Work-verb jobs per task — double-unnest epics.tasks then each task's embedded jobs sub-array:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.epic_number ASC, task_id ASC LIMIT 10"
+  "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.sort_path ASC, task_id ASC LIMIT 10"
 
 # Usage projection — one row per agentuse profile observed at ~/.local/state/agentuse/<id>.json (freshness fields are excluded by design — keeper has no freshness signal yet):
 sqlite3 ~/.local/state/keeper/keeper.db \

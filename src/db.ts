@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 28;
+export const SCHEMA_VERSION = 29;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -453,7 +453,9 @@ CREATE TABLE IF NOT EXISTS epics (
     depends_on_epics TEXT NOT NULL DEFAULT '[]',
     jobs TEXT NOT NULL DEFAULT '[]',
     job_links TEXT NOT NULL DEFAULT '[]',
-    last_validated_at TEXT
+    last_validated_at TEXT,
+    created_by_closer_of TEXT,
+    sort_path TEXT NOT NULL DEFAULT ''
 )
 `;
 
@@ -2215,6 +2217,66 @@ function migrate(db: Database): void {
     // the counts byte-identically via the new fan-out, and an event log
     // with zero GitSnapshot events leaves the columns at 0 (which IS the
     // steady-state zero-event reading).
+
+    // v28→v29: surface the "this epic was created by another epic's closer
+    // session" relationship as first-class projection fields on `epics`.
+    // Two columns:
+    //   - `created_by_closer_of TEXT` — the raw closer→child link (the
+    //     closer's `plan_ref`, i.e. the id of the closed epic that spawned
+    //     this one). NULL for plain epics.
+    //   - `sort_path TEXT NOT NULL DEFAULT ''` — a zero-padded-6 dotted
+    //     lexicographic key like `"000003.000007"` driving the descriptor's
+    //     default sort. The dot (ASCII 46) is strictly less than the digits
+    //     (ASCII 48-57) so the prefix-sort invariant
+    //     `"000003" < "000003.000007" < "000004"` holds under SQLite BINARY
+    //     collation.
+    //
+    // The reducer's `syncPlanctlLinks` fan-out derives both columns inside
+    // the same `BEGIN IMMEDIATE` transaction as the existing `job_links`
+    // write, and cascades a `sort_path` change to every transitive
+    // descendant (cycle guard caps depth at 50 — defense-in-depth, since
+    // `created_by_closer_of` is immutable by construction). The
+    // `EPICS_DESCRIPTOR` in `src/collections.ts` flips its `defaultSort`
+    // from `epic_number` to `sort_path` so the existing generic ORDER BY
+    // template at `src/server-worker.ts` produces the slotted order with
+    // zero code change.
+    //
+    // Step 1: add the two new `epics` columns. `created_by_closer_of` is
+    // nullable TEXT with no DEFAULT (matches the reducer's NULL-for-plain-
+    // epic semantics). `sort_path` is `TEXT NOT NULL DEFAULT ''` — the
+    // empty-string default matches the schema's zero-event reading and the
+    // shell-INSERT branches in `syncPlanctlLinks` / `projectPlanRow` (the
+    // next `syncPlanctlLinks` call computes the real value). Both column
+    // defs match `CREATE_EPICS` so a fresh v29 DB and a migrated v28→v29
+    // DB converge to identical schema (the addColumnIfMissing/literal
+    // lockstep convention; mirrors the v27→v28 `git_dirty_count` /
+    // `git_orphan_count` pair-step shape).
+    addColumnIfMissing(db, "epics", "created_by_closer_of", "TEXT");
+    addColumnIfMissing(db, "epics", "sort_path", "TEXT NOT NULL DEFAULT ''");
+
+    // Step 2: rewind-and-redrain — same shape as the v25→v26 spawn-name
+    // widening. Both new columns are derived from the existing event log
+    // (closer-creator link via `jobs.plan_verb` / `plan_ref` of the
+    // creator session, surfaced through the v14 `job_links` projection;
+    // sort path composed transitively from `epic_number`s along the
+    // closer chain). A re-fold from cursor=0 under the new
+    // `syncPlanctlLinks` derivation rebuilds both columns byte-deterministic-
+    // ally from the same events the daemon already has. Version-guarded
+    // mirrors prior rewinds: re-open of an already-migrated v29+ DB skips
+    // the block.
+    const storedVersionV29 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV29 < 29) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM subagent_invocations");
+    }
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

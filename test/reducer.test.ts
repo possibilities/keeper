@@ -2353,6 +2353,8 @@ function getEpic(epicId: string) {
     jobs: string;
     job_links: string;
     last_validated_at: string | null;
+    created_by_closer_of: string | null;
+    sort_path: string;
   } | null;
 }
 
@@ -2435,6 +2437,12 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     // No `last_validated_at` in the blob → folds to NULL (the schema column is
     // a plain nullable TEXT, no DEFAULT).
     last_validated_at: null,
+    // Schema v29: created_by_closer_of stays NULL (no planctl links yet);
+    // sort_path is derived immediately when epic_number is known (the
+    // EpicSnapshot fold now computes it on first sight so parent chains
+    // resolve without requiring a planctl event on the parent epic).
+    created_by_closer_of: null,
+    sort_path: "000001",
   });
   expect(epic?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);
@@ -4033,6 +4041,611 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
   ]);
 });
 
+// ---------------------------------------------------------------------------
+// Schema v29: syncPlanctlLinks computes `created_by_closer_of` + `sort_path`
+// + transitive cascade on the epics projection
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the two new schema-v29 columns. Returns `null` when the epic row is
+ * missing.
+ */
+function getEpicSortFields(
+  epicId: string,
+): { created_by_closer_of: string | null; sort_path: string } | null {
+  return db
+    .query(
+      "SELECT created_by_closer_of, sort_path FROM epics WHERE epic_id = ?",
+    )
+    .get(epicId) as {
+    created_by_closer_of: string | null;
+    sort_path: string;
+  } | null;
+}
+
+test("syncPlanctlLinks v29: plain epic with no closer ancestry → created_by_closer_of=NULL, sort_path=zeroPad6(epic_number)", () => {
+  // Seed: a plain creator session (not a closer) creates fn-1-plain. The
+  // creator's plan_verb is null (no spawn_name parsing), so
+  // `created_by_closer_of` resolves to NULL and sort_path falls to the
+  // zero-padded epic_number.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-plain-v29" });
+  planPlanOpener("sess-plain-v29");
+  planctlEvent({
+    sessionId: "sess-plain-v29",
+    op: "epic-create",
+    target: "fn-1-plain",
+    epicId: "fn-1-plain",
+    subjectPresent: true,
+  });
+  // Land an EpicSnapshot so `epic_number` is populated; without it the
+  // own-row read folds to 0 ("000000").
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-1-plain",
+    data: JSON.stringify({
+      epic_number: 1,
+      title: "Plain",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  // Trigger one more planctl event so syncPlanctlLinks re-runs with the
+  // epic_number now visible.
+  planctlEvent({
+    sessionId: "sess-plain-v29",
+    op: "epic-set-title",
+    target: "fn-1-plain",
+    epicId: "fn-1-plain",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getEpicSortFields("fn-1-plain")).toEqual({
+    created_by_closer_of: null,
+    sort_path: "000001",
+  });
+});
+
+test("syncPlanctlLinks v29: closer-created epic single level → created_by_closer_of=parent, sort_path=parent.zeroPad6(epic_number)", () => {
+  // Closer session for fn-3-foo (plan_verb='close', plan_ref='fn-3-foo')
+  // creates fn-7-bar via /plan:plan + epic-create. The derivation
+  // resolves `created_by_closer_of` to the closer's plan_ref ('fn-3-foo')
+  // and composes sort_path as `<parent.sort_path>.000007`.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-closer-fn3",
+    spawn_name: "close::fn-3-foo",
+  });
+  // Seed parent fn-3-foo so its sort_path resolves first. Use a non-closer
+  // session to create the parent so its own `created_by_closer_of` is NULL.
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-3-foo",
+    data: JSON.stringify({
+      epic_number: 3,
+      title: "Parent",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  // The closer session now opens a plan window and creates fn-7-bar.
+  planPlanOpener("sess-closer-fn3");
+  planctlEvent({
+    sessionId: "sess-closer-fn3",
+    op: "epic-create",
+    target: "fn-7-bar",
+    epicId: "fn-7-bar",
+    subjectPresent: true,
+  });
+  // EpicSnapshot for fn-7-bar so its epic_number is visible to the
+  // syncPlanctlLinks derivation.
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-7-bar",
+    data: JSON.stringify({
+      epic_number: 7,
+      title: "Child",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  // One more planctl event in the closer session to re-trigger
+  // syncPlanctlLinks with the epic_number now known.
+  planctlEvent({
+    sessionId: "sess-closer-fn3",
+    op: "epic-set-title",
+    target: "fn-7-bar",
+    epicId: "fn-7-bar",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getEpicSortFields("fn-7-bar")).toEqual({
+    created_by_closer_of: "fn-3-foo",
+    sort_path: "000003.000007",
+  });
+});
+
+test("syncPlanctlLinks v29: chain depth 2 → fn-3 → fn-7 → fn-11 composes 000003.000007.000011", () => {
+  // Parent fn-3-foo: a plain planning session creates it. A planctl event
+  // targeting an epic is what wakes the derivation — an EpicSnapshot alone
+  // does not.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-plan-fn3" });
+  planPlanOpener("sess-plan-fn3");
+  planctlEvent({
+    sessionId: "sess-plan-fn3",
+    op: "epic-create",
+    target: "fn-3-foo",
+    epicId: "fn-3-foo",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-3-foo",
+    data: JSON.stringify({
+      epic_number: 3,
+      title: "P",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-plan-fn3",
+    op: "epic-set-title",
+    target: "fn-3-foo",
+    epicId: "fn-3-foo",
+    subjectPresent: true,
+  });
+  // Child fn-7-bar: closer-created from fn-3-foo.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-c3",
+    spawn_name: "close::fn-3-foo",
+  });
+  planPlanOpener("sess-c3");
+  planctlEvent({
+    sessionId: "sess-c3",
+    op: "epic-create",
+    target: "fn-7-bar",
+    epicId: "fn-7-bar",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-7-bar",
+    data: JSON.stringify({
+      epic_number: 7,
+      title: "C",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-c3",
+    op: "epic-set-title",
+    target: "fn-7-bar",
+    epicId: "fn-7-bar",
+    subjectPresent: true,
+  });
+  // Grandchild fn-11-baz: closer-created from fn-7-bar.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-c7",
+    spawn_name: "close::fn-7-bar",
+  });
+  planPlanOpener("sess-c7");
+  planctlEvent({
+    sessionId: "sess-c7",
+    op: "epic-create",
+    target: "fn-11-baz",
+    epicId: "fn-11-baz",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-11-baz",
+    data: JSON.stringify({
+      epic_number: 11,
+      title: "GC",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-c7",
+    op: "epic-set-title",
+    target: "fn-11-baz",
+    epicId: "fn-11-baz",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getEpicSortFields("fn-3-foo")?.sort_path).toBe("000003");
+  expect(getEpicSortFields("fn-7-bar")).toEqual({
+    created_by_closer_of: "fn-3-foo",
+    sort_path: "000003.000007",
+  });
+  expect(getEpicSortFields("fn-11-baz")).toEqual({
+    created_by_closer_of: "fn-7-bar",
+    sort_path: "000003.000007.000011",
+  });
+});
+
+test("syncPlanctlLinks v29: chain depth 3 has no truncation", () => {
+  // fn-2 → fn-4 → fn-8 → fn-16, each level via a closer session.
+  const levels: [string, number, string | null][] = [
+    ["fn-2-l0", 2, null],
+    ["fn-4-l1", 4, "fn-2-l0"],
+    ["fn-8-l2", 8, "fn-4-l1"],
+    ["fn-16-l3", 16, "fn-8-l2"],
+  ];
+  for (const [id, num, parent] of levels) {
+    if (parent != null) {
+      const sess = `sess-${id}`;
+      insertEvent({
+        hook_event: "SessionStart",
+        session_id: sess,
+        spawn_name: `close::${parent}`,
+      });
+      planPlanOpener(sess);
+      planctlEvent({
+        sessionId: sess,
+        op: "epic-create",
+        target: id,
+        epicId: id,
+        subjectPresent: true,
+      });
+    }
+    insertEvent({
+      hook_event: "EpicSnapshot",
+      session_id: id,
+      data: JSON.stringify({
+        epic_number: num,
+        title: id,
+        project_dir: "/repo",
+        status: "open",
+      }),
+    });
+    if (parent != null) {
+      planctlEvent({
+        sessionId: `sess-${id}`,
+        op: "epic-set-title",
+        target: id,
+        epicId: id,
+        subjectPresent: true,
+      });
+    }
+  }
+  drainAll();
+  expect(getEpicSortFields("fn-16-l3")).toEqual({
+    created_by_closer_of: "fn-8-l2",
+    sort_path: "000002.000004.000008.000016",
+  });
+});
+
+test("syncPlanctlLinks v29: parent-missing event ordering → child gets placeholder, parent EpicSnapshot triggers cascade re-stamp", () => {
+  // Child folds first: its parent fn-3-foo has no EpicSnapshot yet. The
+  // derivation falls back to `zeroPad6(child.epic_number)` (placeholder).
+  // Then the parent's EpicSnapshot lands AND a follow-up planctl event in
+  // the parent's session triggers the cascade re-stamp to the canonical
+  // value.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-closer-missing",
+    spawn_name: "close::fn-3-missing",
+  });
+  planPlanOpener("sess-closer-missing");
+  planctlEvent({
+    sessionId: "sess-closer-missing",
+    op: "epic-create",
+    target: "fn-7-orphan",
+    epicId: "fn-7-orphan",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-7-orphan",
+    data: JSON.stringify({
+      epic_number: 7,
+      title: "Orphan",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  // One more planctl event to re-trigger syncPlanctlLinks now that
+  // epic_number is visible.
+  planctlEvent({
+    sessionId: "sess-closer-missing",
+    op: "epic-set-title",
+    target: "fn-7-orphan",
+    epicId: "fn-7-orphan",
+    subjectPresent: true,
+  });
+  drainAll();
+  // Intermediate state: created_by_closer_of resolved (we have the closer-
+  // creator job's plan_ref), but parent's sort_path is '' (no parent row),
+  // so child falls back to zeroPad6(epic_number).
+  expect(getEpicSortFields("fn-7-orphan")).toEqual({
+    created_by_closer_of: "fn-3-missing",
+    sort_path: "000007",
+  });
+
+  // Parent EpicSnapshot lands.
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-3-missing",
+    data: JSON.stringify({
+      epic_number: 3,
+      title: "Parent",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  drainAll();
+  // The parent itself is plain (no closer creator); just inserting the
+  // EpicSnapshot doesn't trigger a syncPlanctlLinks pass on the parent
+  // (only a planctl event does). Fire a planctl event in some session
+  // touching the parent to wake the fan-out — a refiner edit suffices.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-edit-parent" });
+  planPlanOpener("sess-edit-parent");
+  planctlEvent({
+    sessionId: "sess-edit-parent",
+    op: "epic-set-title",
+    target: "fn-3-missing",
+    epicId: "fn-3-missing",
+    subjectPresent: true,
+  });
+  drainAll();
+
+  // Final state: parent's sort_path = '000003'; cascade re-stamped child.
+  expect(getEpicSortFields("fn-3-missing")?.sort_path).toBe("000003");
+  expect(getEpicSortFields("fn-7-orphan")).toEqual({
+    created_by_closer_of: "fn-3-missing",
+    sort_path: "000003.000007",
+  });
+});
+
+test("syncPlanctlLinks v29: creator tie-break picks lowest job_id ASC among multiple closers", () => {
+  // Two closer sessions BOTH create the same child epic. (Pathological
+  // but possible: two arthack-spawned closers running in parallel against
+  // the same `close::fn-2-tie` window before one wins.) The tie-break
+  // resolves to the lowest job_id ASC — here `sess-A-tie` < `sess-B-tie`.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-A-tie",
+    spawn_name: "close::fn-2-tie",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-B-tie",
+    spawn_name: "close::fn-9-other",
+  });
+  // Parent for sess-A-tie's closer.
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-2-tie",
+    data: JSON.stringify({
+      epic_number: 2,
+      title: "P-A",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  // Parent for sess-B-tie's closer.
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-9-other",
+    data: JSON.stringify({
+      epic_number: 9,
+      title: "P-B",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  // Both sessions create the same child.
+  planPlanOpener("sess-A-tie");
+  planctlEvent({
+    sessionId: "sess-A-tie",
+    op: "epic-create",
+    target: "fn-5-tied-child",
+    epicId: "fn-5-tied-child",
+    subjectPresent: true,
+  });
+  planPlanOpener("sess-B-tie");
+  planctlEvent({
+    sessionId: "sess-B-tie",
+    op: "epic-create",
+    target: "fn-5-tied-child",
+    epicId: "fn-5-tied-child",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-5-tied-child",
+    data: JSON.stringify({
+      epic_number: 5,
+      title: "Child",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  // Wake a fresh syncPlanctlLinks pass with the child's epic_number known.
+  planctlEvent({
+    sessionId: "sess-A-tie",
+    op: "epic-set-title",
+    target: "fn-5-tied-child",
+    epicId: "fn-5-tied-child",
+    subjectPresent: true,
+  });
+  drainAll();
+  // Tie-break: sess-A-tie has the lower job_id ASC, so its plan_ref wins.
+  expect(getEpicSortFields("fn-5-tied-child")?.created_by_closer_of).toBe(
+    "fn-2-tie",
+  );
+});
+
+test("syncPlanctlLinks v29: EpicSnapshot ON CONFLICT preserves created_by_closer_of + sort_path (carve-out v29)", () => {
+  // Closer creates child, sort_path resolves. Then an EpicSnapshot for the
+  // child re-folds (e.g. an approval RPC round-trip). Both new columns
+  // MUST survive the ON CONFLICT — without the carve-out the
+  // approval-flip pipeline would wipe them on every approval change.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-carve29",
+    spawn_name: "close::fn-3-c29",
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-3-c29",
+    data: JSON.stringify({
+      epic_number: 3,
+      title: "P",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planPlanOpener("sess-carve29");
+  planctlEvent({
+    sessionId: "sess-carve29",
+    op: "epic-create",
+    target: "fn-7-c29",
+    epicId: "fn-7-c29",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-7-c29",
+    data: JSON.stringify({
+      epic_number: 7,
+      title: "C",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-carve29",
+    op: "epic-set-title",
+    target: "fn-7-c29",
+    epicId: "fn-7-c29",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getEpicSortFields("fn-7-c29")).toEqual({
+    created_by_closer_of: "fn-3-c29",
+    sort_path: "000003.000007",
+  });
+
+  // Re-fold an EpicSnapshot (mirrors an approval RPC round-trip).
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-7-c29",
+    data: JSON.stringify({
+      epic_number: 7,
+      title: "C (renamed)",
+      project_dir: "/repo",
+      status: "open",
+      approval: "approved",
+    }),
+  });
+  drainAll();
+
+  // The scalar flipped to "approved" / new title; the v29 columns survive.
+  const epic = getEpic("fn-7-c29");
+  expect(epic?.title).toBe("C (renamed)");
+  expect(epic?.approval).toBe("approved");
+  expect(getEpicSortFields("fn-7-c29")).toEqual({
+    created_by_closer_of: "fn-3-c29",
+    sort_path: "000003.000007",
+  });
+});
+
+test("syncPlanctlLinks v29: epic_number >= 1_000_000 safe-folds to sort_path='' (no throw, cursor advances)", () => {
+  // Synthetic event with an absurd epic_number — the documented ceiling
+  // is 999,999. Reducer must never throw inside BEGIN IMMEDIATE; the
+  // safe-fold writes sort_path=''.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-overflow" });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-x-overflow",
+    data: JSON.stringify({
+      epic_number: 1_000_000,
+      title: "Overflow",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planPlanOpener("sess-overflow");
+  planctlEvent({
+    sessionId: "sess-overflow",
+    op: "epic-set-title",
+    target: "fn-x-overflow",
+    epicId: "fn-x-overflow",
+    subjectPresent: true,
+  });
+  // The drain MUST NOT throw.
+  expect(() => drainAll()).not.toThrow();
+  expect(getEpicSortFields("fn-x-overflow")).toEqual({
+    created_by_closer_of: null,
+    sort_path: "",
+  });
+});
+
+test("syncPlanctlLinks v29: re-fold determinism preserves byte-identical (created_by_closer_of, sort_path) on every epic", () => {
+  // Build a non-trivial state via a closer-driven chain, capture every
+  // epic row, rewind + DELETE + drain, capture again, byte-compare.
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-3-r29",
+    data: JSON.stringify({
+      epic_number: 3,
+      title: "P",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-r29",
+    spawn_name: "close::fn-3-r29",
+  });
+  planPlanOpener("sess-r29");
+  planctlEvent({
+    sessionId: "sess-r29",
+    op: "epic-create",
+    target: "fn-7-r29",
+    epicId: "fn-7-r29",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-7-r29",
+    data: JSON.stringify({
+      epic_number: 7,
+      title: "C",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-r29",
+    op: "epic-set-title",
+    target: "fn-7-r29",
+    epicId: "fn-7-r29",
+    subjectPresent: true,
+  });
+  drainAll();
+  const epicsBefore = JSON.stringify(
+    db.query("SELECT * FROM epics ORDER BY epic_id").all(),
+  );
+
+  // Rewind + clear + redrain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  drainAll();
+  const epicsAfter = JSON.stringify(
+    db.query("SELECT * FROM epics ORDER BY epic_id").all(),
+  );
+  // Byte-identical including the two new schema-v29 columns.
+  expect(epicsAfter).toBe(epicsBefore);
+});
 test("syncPlanctlLinks: re-fold determinism (rewind + DELETE + drain reproduces byte-identical projection)", () => {
   // Drive a full session: two windows, a creator, a refiner, plus a
   // cross-session refiner so both projections accumulate.

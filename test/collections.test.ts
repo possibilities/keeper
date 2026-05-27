@@ -61,11 +61,23 @@ function seedEpic(
     depends_on_epics: string;
     jobs: string;
     job_links: string;
+    sort_path: string;
+    created_by_closer_of: string;
   }> = {},
 ): void {
+  // Schema v29: default the sort_path to zero-padded-6 of epic_number when
+  // a number is given so the default `sort_path ASC` order matches what the
+  // reducer would derive; callers that need explicit control pass
+  // `sort_path` directly. `created_by_closer_of` defaults to null.
+  const computedSortPath =
+    opts.sort_path != null
+      ? opts.sort_path
+      : opts.epic_number != null
+        ? String(opts.epic_number).padStart(6, "0")
+        : "";
   db.query(
-    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs, job_links)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs, job_links, sort_path, created_by_closer_of)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     epic_id,
     opts.epic_number ?? null,
@@ -78,6 +90,8 @@ function seedEpic(
     opts.depends_on_epics ?? "[]",
     opts.jobs ?? "[]",
     opts.job_links ?? "[]",
+    computedSortPath,
+    opts.created_by_closer_of ?? null,
   );
 }
 
@@ -181,11 +195,35 @@ test("epics descriptor: version is last_event_id; filters include pk + status; t
   expect(EPICS_DESCRIPTOR.filters.tasks).toBeUndefined();
 });
 
-test("epics default sort is epic_number asc", () => {
+test("epics default sort is sort_path asc (schema v29)", () => {
+  // Schema v29: flipped from `epic_number asc` to `sort_path asc` — the
+  // materialized-path key the reducer's `syncPlanctlLinks` derives. Slots
+  // closer-created children directly below their parent in the default
+  // page; the prefix-sort invariant `"000003" < "000003.000007" < "000004"`
+  // holds under SQLite BINARY collation.
   expect(EPICS_DESCRIPTOR.defaultSort).toEqual({
-    column: "epic_number",
+    column: "sort_path",
     dir: "asc",
   });
+});
+
+test("epics descriptor: sort_path is in sortable (schema v29 trust boundary)", () => {
+  // The generic ORDER BY interpolation in `src/server-worker.ts` reads from
+  // the descriptor's `sortable` allowlist. Without `sort_path` here the
+  // flipped `defaultSort` would be rejected at the trust boundary.
+  expect(EPICS_DESCRIPTOR.sortable.has("sort_path")).toBe(true);
+});
+
+test("epics descriptor: created_by_closer_of + sort_path columns are served (schema v29)", () => {
+  // Both new schema-v29 columns ride on every `result` / `patch` frame —
+  // the board reads `created_by_closer_of` for its `[slotted-after-closer]`
+  // pill, and a future client could expose `sort_path` directly.
+  expect(EPICS_DESCRIPTOR.columns).toContain("created_by_closer_of");
+  expect(EPICS_DESCRIPTOR.columns).toContain("sort_path");
+  // `created_by_closer_of` is out of `sortable` / `filters` —
+  // downstream branches on its null-ness, not its value.
+  expect(EPICS_DESCRIPTOR.sortable.has("created_by_closer_of")).toBe(false);
+  expect(EPICS_DESCRIPTOR.filters.created_by_closer_of).toBeUndefined();
 });
 
 test("runQuery decodes the git status JSON columns", () => {

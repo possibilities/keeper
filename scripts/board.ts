@@ -111,7 +111,12 @@ Renders both views as one frame per change:
 
 Each epic block opens with a header line of the form:
 
-  ({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated] [<readiness>]
+  ({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated] [slotted-after-closer]? [<readiness>]
+
+The optional [slotted-after-closer] pill (schema v29) appears only on epics
+whose projection carries a non-null created_by_closer_of — i.e. epics minted
+by another epic's closer session. Its presence is also what slots the epic
+directly below its parent in the default sort (sort_path ASC).
 
 followed (when the epic carries job_links) by one indented creator/refiner
 line per linked session —
@@ -410,6 +415,11 @@ const PILL_COLORS: Record<string, PillBucket> = {
   running: "active",
   in_progress: "active",
   working: "active",
+  // Schema v29: the `[slotted-after-closer]` epic-header pill (rendered
+  // when `epics.created_by_closer_of != null`). Active/cyan bucket — this
+  // is "live, structural relationship visible to the human" rather than
+  // a success/error/warn state. See `renderEpicBlock` for the placement.
+  "slotted-after-closer": "active",
   ok: "success",
   approved: "success",
   validated: "success",
@@ -673,8 +683,16 @@ async function main(): Promise<void> {
     const epicApproval = approvalPill(row.approval);
     const lines: string[] = [];
     const epicVerdict = verdictFromMap(snap.readiness.perEpic, epicId);
+    // Schema v29: `[slotted-after-closer]` pill — appears only when the
+    // epic was minted by another epic's closer session (the projection's
+    // `created_by_closer_of` is non-null). Placed after `[validated|
+    // unvalidated]` and before the readiness pill (mirrors the
+    // `epicDepsSeg` shape: empty string when absent, leading space when
+    // present so the join reads cleanly).
+    const slottedSeg =
+      row.created_by_closer_of == null ? "" : " [slotted-after-closer]";
     lines.push(
-      `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}] ${formatPill(epicVerdict)}`,
+      `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}]${slottedSeg} ${formatPill(epicVerdict)}`,
       ...renderJobLinkLines(row.job_links),
     );
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];

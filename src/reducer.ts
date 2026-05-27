@@ -538,6 +538,9 @@ function extractPlanSnapshot(event: Event): PlanSnapshot | null {
  * A missing/malformed blob is a no-op (extract returned null); the cursor still
  * advances upstream.
  */
+/** Zero-pad an integer to width 6 for schema-v29 `sort_path` keys. */
+const zeroPad6 = (n: number): string => String(n).padStart(6, "0");
+
 function projectPlanRow(db: Database, event: Event): void {
   const snapshot = extractPlanSnapshot(event);
   if (snapshot == null) {
@@ -548,19 +551,24 @@ function projectPlanRow(db: Database, event: Event): void {
 
   if (event.hook_event === "EpicSnapshot") {
     // The ON CONFLICT update lists ONLY scalar columns and NEVER `tasks` /
-    // `jobs` / `job_links`: an epic snapshot carries no task, job, or
-    // job-link data, and a shell row inserted by a task-before-epic
-    // TaskSnapshot, a job-before-epic `syncJobIntoEpic`, or a planctl-event
-    // -before-epic `syncPlanctlLinks` already holds those arrays. INSERT
-    // defaults all three to `'[]'` (the schema default), so the first-sight
-    // epic reads empty arrays and a later epic snapshot can never clobber
-    // arrays a shell holds. The `job_links` carve-out is mandatory: without
-    // it, an approval RPC → atomic file write → file-watcher → EpicSnapshot
-    // fold would wipe the creator/refiner provenance projection on every
-    // approval flip.
+    // `jobs` / `job_links` / `created_by_closer_of` / `sort_path`: an epic
+    // snapshot carries no task, job, job-link, OR closer-derivation data,
+    // and a shell row inserted by a task-before-epic TaskSnapshot, a
+    // job-before-epic `syncJobIntoEpic`, or a planctl-event-before-epic
+    // `syncPlanctlLinks` already holds those columns (the planctl-event
+    // shell stamps `job_links` real and leaves the two new schema-v29
+    // closer columns at NULL / '' for the next `syncPlanctlLinks` call to
+    // compute). INSERT defaults all five to schema defaults (`'[]'`,
+    // `NULL`, `''`), so the first-sight epic reads empties and a later
+    // epic snapshot can never clobber them. The `job_links` /
+    // `created_by_closer_of` / `sort_path` carve-out is mandatory: without
+    // it, an approval RPC → atomic file write → file-watcher →
+    // EpicSnapshot fold would wipe the creator/refiner provenance
+    // projection (schema v14) AND the closer-creator link + materialized-
+    // path sort key (schema v29) on every approval flip.
     db.run(
-      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_validated_at, last_event_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_validated_at, last_event_id, updated_at, created_by_closer_of, sort_path)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '')
        ON CONFLICT(epic_id) DO UPDATE SET
          epic_number = excluded.epic_number,
          title = excluded.title,
@@ -595,6 +603,47 @@ function projectPlanRow(db: Database, event: Event): void {
         ts,
       ],
     );
+    // Schema v29: if `sort_path` is still '' (no `syncPlanctlLinks` has run
+    // yet) but `epic_number` is now known, derive the sort_path so that child
+    // epics can inherit a non-empty parent path. This is the "parent's
+    // EpicSnapshot triggers cascade re-stamp" behaviour — an EpicSnapshot for
+    // a root epic unblocks the chain without requiring a planctl event.
+    const spRow = db
+      .query(
+        "SELECT epic_number, created_by_closer_of, sort_path FROM epics WHERE epic_id = ?",
+      )
+      .get(entityId) as {
+      epic_number: number | null;
+      created_by_closer_of: string | null;
+      sort_path: string;
+    } | null;
+    if (spRow != null && spRow.sort_path === "" && spRow.epic_number != null) {
+      const ownNumber = spRow.epic_number;
+      let derivedPath: string;
+      if (ownNumber >= 1_000_000) {
+        derivedPath = "";
+      } else if (spRow.created_by_closer_of == null) {
+        derivedPath = zeroPad6(ownNumber);
+      } else {
+        const parentRow = db
+          .query("SELECT sort_path FROM epics WHERE epic_id = ?")
+          .get(spRow.created_by_closer_of) as {
+          sort_path: string | null;
+        } | null;
+        const parentPath = parentRow?.sort_path ?? "";
+        derivedPath =
+          parentPath === ""
+            ? zeroPad6(ownNumber)
+            : `${parentPath}.${zeroPad6(ownNumber)}`;
+      }
+      if (derivedPath !== "") {
+        db.run(
+          "UPDATE epics SET sort_path = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+          [derivedPath, event.id, ts, entityId],
+        );
+        cascadeSortPath(db, entityId, event.id, ts);
+      }
+    }
   } else {
     // TaskSnapshot: a read-modify-write on the PARENT epic's embedded `tasks`
     // array. The parent key is `snapshot.epic_id` (NOT event.session_id, which
@@ -2133,13 +2182,18 @@ function syncJobLinksOnJobWrite(
     } else {
       // No epic row yet — shell-insert. Mirrors the shell-insert in
       // `syncPlanctlLinks`'s touched-epic loop; the EpicSnapshot ON
-      // CONFLICT carve-out preserves `job_links` so a later snapshot
-      // fold cannot wipe the enriched payload.
+      // CONFLICT carve-out preserves `job_links` /
+      // `created_by_closer_of` / `sort_path` so a later snapshot fold
+      // cannot wipe the enriched payload OR the schema-v29 closer
+      // columns. Both new columns default to `NULL` / `''` (the schema
+      // zero-event reading); the next `syncPlanctlLinks` call computes
+      // the real values.
       db.run(
         `INSERT INTO epics (
            epic_id, epic_number, title, project_dir, status,
-           last_event_id, updated_at, tasks, jobs, job_links
-         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?)`,
+           last_event_id, updated_at, tasks, jobs, job_links,
+           created_by_closer_of, sort_path
+         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?, NULL, '')`,
         [epicId, eventId, ts, jobLinksJson],
       );
     }
@@ -2357,6 +2411,13 @@ function syncPlanctlLinks(
   // Shell-insert a missing epic row — mirrors syncJobIntoEpic's pattern. A
   // later EpicSnapshot fills the scalars without clobbering job_links (the
   // EpicSnapshot ON CONFLICT omits the column — see projectPlanRow).
+  //
+  // Schema v29: per-epic, also derive `created_by_closer_of` (the raw closer
+  // → child link) and `sort_path` (the materialized-path sort key). After
+  // each touched epic's UPDATE, transitively re-stamp every descendant's
+  // `sort_path` whose closer-chain leads back to this epic. The cascade
+  // runs inside the same BEGIN IMMEDIATE so a from-scratch re-fold
+  // reproduces byte-identical projection.
   for (const epicId of touchedEpics) {
     const newJobLinks = deriveJobLinks(
       invocationsBySession,
@@ -2375,26 +2436,221 @@ function syncPlanctlLinks(
     );
     sortJobLinks(enriched);
     const jobLinksJson = JSON.stringify(enriched);
+
+    // Schema v29: derive `created_by_closer_of` from the just-computed
+    // creator entries. Filter the creator job_ids down to those whose
+    // backing `jobs` row carries `plan_verb='close' AND plan_ref IS NOT
+    // NULL`; tie-break on lowest `job_id` ASC (deterministic, identical
+    // across re-folds). If none match → NULL.
+    let createdByCloserOf: string | null = null;
+    const creatorJobIds = enriched
+      .filter((e) => e.kind === "creator")
+      .map((e) => e.job_id);
+    if (creatorJobIds.length > 0) {
+      const placeholders = creatorJobIds.map(() => "?").join(",");
+      const closerRows = db
+        .query(
+          `SELECT job_id, plan_ref
+             FROM jobs
+            WHERE job_id IN (${placeholders})
+              AND plan_verb = 'close'
+              AND plan_ref IS NOT NULL
+            ORDER BY job_id ASC`,
+        )
+        .all(...creatorJobIds) as {
+        job_id: string;
+        plan_ref: string;
+      }[];
+      if (closerRows.length > 0) {
+        createdByCloserOf = closerRows[0].plan_ref;
+      }
+    }
+
+    // Derive `sort_path` from the resolved `created_by_closer_of` and this
+    // epic's own `epic_number`. Three branches:
+    //   - `created_by_closer_of == null` → `zeroPad6(epic_number)`.
+    //   - Parent's `sort_path` resolves to a non-empty value →
+    //     `<parent.sort_path>.<zeroPad6(epic_number)>`.
+    //   - Parent row missing OR parent's `sort_path === ''` (transient
+    //     shell, or recursive overflow earlier in chain) → fall back to
+    //     `zeroPad6(epic_number)` (placeholder; later parent re-projection
+    //     triggers cascade re-stamp).
+    //   - Overflow guard: `epic_number >= 1_000_000` → `sort_path = ''` +
+    //     console.error note. Never throws (the safe-fold honors the
+    //     "reducer never throws inside BEGIN IMMEDIATE" invariant).
+    //
+    // `epic_number` is read off the touched epic row, NOT from the in-
+    // flight snapshot — `syncPlanctlLinks` may run on an EpicSnapshot,
+    // a planctl-event, or a /plan:plan opener, only the first of which
+    // even carries an `epic_number`. A shell row (planctl event before
+    // the EpicSnapshot lands) has `epic_number = NULL`; the derivation
+    // safely-folds to `zeroPad6(0)` = `"000000"` in that case so the
+    // re-fold determinism holds. The very next EpicSnapshot triggers a
+    // fresh `syncPlanctlLinks` round (via the planctl-event fold), which
+    // will recompute with the now-known `epic_number` and cascade if it
+    // changed.
+    const ownRow = db
+      .query("SELECT epic_number FROM epics WHERE epic_id = ?")
+      .get(epicId) as { epic_number: number | null } | null;
+    const ownNumber = ownRow?.epic_number ?? 0;
+    let sortPath: string;
+    if (ownNumber >= 1_000_000) {
+      // Overflow guard — width=6 can't represent this monotonic id; the
+      // documented ceiling is 999,999. Fold to `''` and note; never throw.
+      console.error(
+        `keeper reducer: epic ${epicId} has epic_number=${ownNumber} ` +
+          `>= 1_000_000; sort_path overflow ceiling — folding to ''`,
+      );
+      sortPath = "";
+    } else if (createdByCloserOf == null) {
+      sortPath = zeroPad6(ownNumber);
+    } else {
+      const parentRow = db
+        .query("SELECT sort_path FROM epics WHERE epic_id = ?")
+        .get(createdByCloserOf) as { sort_path: string | null } | null;
+      const parentPath = parentRow?.sort_path ?? "";
+      if (parentPath === "") {
+        // Parent missing / placeholder — fall back to root-level position.
+        // The cascade re-stamps when the parent later resolves.
+        sortPath = zeroPad6(ownNumber);
+      } else {
+        sortPath = `${parentPath}.${zeroPad6(ownNumber)}`;
+      }
+    }
+
     const epicExists = db
       .query("SELECT epic_id FROM epics WHERE epic_id = ?")
       .get(epicId) as { epic_id: string } | null;
     if (epicExists != null) {
+      // Extend the existing UPDATE to also set the two new schema-v29
+      // columns in the same statement.
       db.run(
-        "UPDATE epics SET job_links = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
-        [jobLinksJson, eventId, ts, epicId],
+        "UPDATE epics SET job_links = ?, created_by_closer_of = ?, sort_path = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+        [jobLinksJson, createdByCloserOf, sortPath, eventId, ts, epicId],
       );
     } else {
-      // Shell-insert: no epic row yet. Scalars default to NULL / "[]" matching
-      // the schema's zero-event reading. A later EpicSnapshot fills the
-      // scalars; the ON CONFLICT carve-out preserves job_links / jobs / tasks.
+      // Shell-insert: no epic row yet. Scalars default to NULL / "[]"
+      // matching the schema's zero-event reading. A later EpicSnapshot
+      // fills the scalars; the ON CONFLICT carve-out preserves
+      // job_links / jobs / tasks / created_by_closer_of / sort_path. The
+      // two schema-v29 columns are stamped with the JUST-DERIVED values
+      // (typically `created_by_closer_of` is real but `sort_path` is the
+      // placeholder `zeroPad6(0) = "000000"` since no `epic_number` is
+      // known yet — the next `syncPlanctlLinks` call, post-EpicSnapshot,
+      // recomputes against the now-visible `epic_number`).
       db.run(
         `INSERT INTO epics (
            epic_id, epic_number, title, project_dir, status,
-           last_event_id, updated_at, tasks, jobs, job_links
-         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?)`,
-        [epicId, eventId, ts, jobLinksJson],
+           last_event_id, updated_at, tasks, jobs, job_links,
+           created_by_closer_of, sort_path
+         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?, ?, ?)`,
+        [epicId, eventId, ts, jobLinksJson, createdByCloserOf, sortPath],
       );
     }
+
+    // Transitive cascade: every epic whose `created_by_closer_of` equals
+    // this just-updated epic's id must have its `sort_path` recomputed
+    // against the new parent value. Recurse to fixed point inside the
+    // open transaction. Cycle guard: a `visited` set + depth cap of 50.
+    // By construction `created_by_closer_of` is immutable once set (one
+    // closer-creator per epic, set on creation), so cycles can't form;
+    // the guard is defense-in-depth — a malformed historical state, an
+    // unexpected pathological event sequence, or a future invariant
+    // violation cannot wedge the reducer.
+    cascadeSortPath(db, epicId, eventId, ts);
+  }
+}
+
+/**
+ * Schema v29: re-stamp `sort_path` on every transitive descendant of
+ * `rootEpicId` (every epic with `created_by_closer_of = rootEpicId`, and
+ * recursively their descendants). Runs INSIDE the open BEGIN IMMEDIATE
+ * transaction opened by {@link applyEvent}; performs zero cursor work.
+ *
+ * The cascade is BFS over an in-memory queue with a `visited: Set<string>`
+ * cycle guard and a depth cap at 50. By construction cycles can't form —
+ * `created_by_closer_of` is immutable once set, one closer-creator per
+ * epic — so the guard is defense-in-depth: a malformed historical state
+ * or unexpected pathological event sequence cannot wedge the reducer.
+ * Both bails (cycle hit / depth overrun) `console.error` a note and
+ * return; never throws.
+ *
+ * Each descendant's `sort_path` is recomputed as `<parent.sort_path>.<
+ * zeroPad6(descendant.epic_number)>` (or `zeroPad6(descendant.epic_number)`
+ * if parent's `sort_path === ''` — the placeholder case). Same overflow
+ * guard as in {@link syncPlanctlLinks}: `epic_number >= 1_000_000` folds
+ * to `sort_path = ''` and notes.
+ */
+function cascadeSortPath(
+  db: Database,
+  rootEpicId: string,
+  eventId: number,
+  ts: number,
+): void {
+  const MAX_DEPTH = 50;
+  const visited = new Set<string>();
+  visited.add(rootEpicId);
+  // BFS frontier: each entry is `(parentId, depth)`. We re-stamp every
+  // child of `parentId` and enqueue the children for their own children.
+  let frontier: { id: string; depth: number }[] = [
+    { id: rootEpicId, depth: 0 },
+  ];
+  while (frontier.length > 0) {
+    const next: { id: string; depth: number }[] = [];
+    for (const { id: parentId, depth } of frontier) {
+      if (depth >= MAX_DEPTH) {
+        console.error(
+          `keeper reducer: sort_path cascade depth >= ${MAX_DEPTH} ` +
+            `at parent=${parentId}; bailing (cycle guard / defense-in-depth)`,
+        );
+        return;
+      }
+      const parentRow = db
+        .query("SELECT sort_path FROM epics WHERE epic_id = ?")
+        .get(parentId) as { sort_path: string | null } | null;
+      const parentPath = parentRow?.sort_path ?? "";
+      const children = db
+        .query(
+          `SELECT epic_id, epic_number
+             FROM epics
+            WHERE created_by_closer_of = ?
+            ORDER BY epic_id ASC`,
+        )
+        .all(parentId) as {
+        epic_id: string;
+        epic_number: number | null;
+      }[];
+      for (const child of children) {
+        if (visited.has(child.epic_id)) {
+          console.error(
+            `keeper reducer: sort_path cascade cycle detected ` +
+              `at epic=${child.epic_id}; bailing (defense-in-depth)`,
+          );
+          return;
+        }
+        visited.add(child.epic_id);
+        const childNumber = child.epic_number ?? 0;
+        let childPath: string;
+        if (childNumber >= 1_000_000) {
+          console.error(
+            `keeper reducer: epic ${child.epic_id} has epic_number=` +
+              `${childNumber} >= 1_000_000; sort_path overflow ceiling ` +
+              `— folding to '' (cascade)`,
+          );
+          childPath = "";
+        } else if (parentPath === "") {
+          childPath = zeroPad6(childNumber);
+        } else {
+          childPath = `${parentPath}.${zeroPad6(childNumber)}`;
+        }
+        db.run(
+          "UPDATE epics SET sort_path = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+          [childPath, eventId, ts, child.epic_id],
+        );
+        next.push({ id: child.epic_id, depth: depth + 1 });
+      }
+    }
+    frontier = next;
   }
 }
 

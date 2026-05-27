@@ -663,6 +663,52 @@ export interface Epic {
    * layer; drives the board UI's `[validated]` / `[unvalidated]` pill.
    */
   last_validated_at: string | null;
+  /**
+   * Schema v29: the raw closer→child link — the `plan_ref` (i.e. closed-epic
+   * id) of the closer session whose `/plan:plan` window minted THIS epic via
+   * `epic-create`. `null` for plain epics (no closer ancestry). Reducer-
+   * derived inside `syncPlanctlLinks` from `job_links` creator entries +
+   * `jobs.plan_verb` / `jobs.plan_ref`: filtered to `plan_verb='close'`,
+   * tie-broken on lowest `job_id` ASC. Immutable by construction once set
+   * (one closer-creator per epic), which is what makes the transitive
+   * `sort_path` cascade converge without a cycle.
+   *
+   * Survives an `EpicSnapshot` round-trip — the `projectPlanRow` ON CONFLICT
+   * carve-out omits this column alongside `tasks` / `jobs` / `job_links`
+   * (and now {@link sort_path}). Without the carve-out, an approval RPC →
+   * atomic file write → file-watcher → snapshot fold would wipe the link
+   * projection on every approval flip.
+   */
+  created_by_closer_of: string | null;
+  /**
+   * Schema v29: the materialized-path sort key — a zero-padded-6 dotted
+   * lexicographic string like `"000003.000007"` driving the
+   * `EPICS_DESCRIPTOR.defaultSort` ORDER BY. The dot (ASCII 46) sits below
+   * the digits (ASCII 48-57), so the prefix-sort invariant
+   * `"000003" < "000003.000007" < "000004"` holds under SQLite BINARY
+   * collation — a closer-created child slots directly after its parent and
+   * before the next peer.
+   *
+   * Reducer-derived inside `syncPlanctlLinks`:
+   * - {@link created_by_closer_of} `== null` → `zeroPad6(epic_number)`.
+   * - Else → `<parent.sort_path>.<zeroPad6(epic_number)>` (parent looked
+   *   up by `epic_id = created_by_closer_of`). Parent-missing folds to
+   *   `zeroPad6(epic_number)` (placeholder); a later parent EpicSnapshot
+   *   re-runs `syncPlanctlLinks` whose transitive cascade re-stamps the
+   *   chain.
+   * - Overflow guard: `epic_number >= 1_000_000` → `''` + stderr note
+   *   (boundary won't realistically be hit in this control-plane use case;
+   *   the safe-fold prevents the reducer from throwing inside the open
+   *   transaction).
+   *
+   * Survives an `EpicSnapshot` round-trip — `projectPlanRow` ON CONFLICT
+   * carve-out preserves this column alongside `tasks` / `jobs` /
+   * `job_links` / `created_by_closer_of`. Empty string is also the schema
+   * zero-event default and the shell-INSERT placeholder during the
+   * transient window between shell-insert and the next `syncPlanctlLinks`
+   * call.
+   */
+  sort_path: string;
 }
 
 /**

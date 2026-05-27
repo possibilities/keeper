@@ -143,26 +143,42 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
 
 /**
  * The `epics` descriptor — the plans read surface's first collection. Columns
- * mirror the v6 `epics` table 1:1 (`src/db.ts` `CREATE_EPICS`). `version` is
- * `last_event_id` (the monotonic per-row column the diff fires on, bumped by the
- * snapshot fold). Sort defaults to creation order, newest first, like `jobs`
- * (`epic_number asc` — epics have no `created_at` column, and `epic_number` is
- * the monotonic creation-order signal, so ascending puts the oldest-created
- * epic on top). `filters`
- * carries the pk (`epic_id` — detail-page single-item subscribe) plus the
- * natural filter columns `status` + `project_dir`. `title`/`epic_number` are
- * read-only display — served but out of `sortable`/`filters`. `project_dir`
- * holds opaque foreign-process JSON; it's a bound filter VALUE here, never an
- * interpolated identifier or a filesystem-read driver.
+ * mirror the `epics` table 1:1 (`src/db.ts` `CREATE_EPICS`). `version` is
+ * `last_event_id` (the monotonic per-row column the diff fires on, bumped by
+ * the snapshot fold). `filters` carries the pk (`epic_id` — detail-page
+ * single-item subscribe) plus the natural filter columns `status` +
+ * `project_dir` + `approval`. `title`/`epic_number` are read-only display —
+ * served but out of `sortable`/`filters`. `project_dir` holds opaque foreign-
+ * process JSON; it's a bound filter VALUE here, never an interpolated
+ * identifier or a filesystem-read driver.
  *
  * As of schema v7 each epic embeds its tasks as the `tasks` JSON-array column —
  * the standalone `tasks` collection was dropped. `tasks` is served (in
  * `columns`) AND registered in `jsonColumns` so {@link decodeRow} parses the
  * stored TEXT into a real `Task[]` at the read boundary; it is OUT of
- * `sortable`/`filters` (a nested display array, never a sort/filter key). The
- * default sort is `epic_number asc` — oldest-created epic on top, a stable
- * creation order, so a task edit (which bumps the epic's `last_event_id`) never
- * reorders the default view.
+ * `sortable`/`filters` (a nested display array, never a sort/filter key).
+ *
+ * Default sort: schema v29 flips this from `epic_number asc` to `sort_path
+ * asc`. `sort_path` is the materialized-path key the reducer derives in
+ * `syncPlanctlLinks` (zero-padded-6 dotted lexicographic, like
+ * `"000003.000007"`). The dot (ASCII 46) sits strictly below the digits
+ * (ASCII 48-57), so under SQLite BINARY collation the prefix-sort invariant
+ * `"000003" < "000003.000007" < "000004"` slots a closer-created child
+ * directly after its parent and before the next peer epic. This is a
+ * MEANINGFUL change from the v6-through-v28 stance: closer-completion DOES
+ * reorder the page, by design — the moment a child epic is created from a
+ * closer session, it appears one row below the closed parent. The previous
+ * rationale ("`epic_number` never reorders, so a task edit can't churn the
+ * page") still holds for ordinary edits (task-snapshot folds don't touch
+ * `created_by_closer_of` or `sort_path`); only the closer-creation event
+ * itself triggers a reorder, which is the explicitly desired behavior.
+ *
+ * `sort_path` is added to `sortable` (the trust-boundary allowlist for
+ * ORDER BY interpolation in `src/server-worker.ts`). `created_by_closer_of`
+ * is served as a column but stays OUT of `sortable` / `filters` —
+ * downstream consumers (board's `[slotted-after-closer]` pill, future
+ * filters) branch on its null-ness, not its value, so a wire filter slot
+ * would be cosmetic.
  */
 export const EPICS_DESCRIPTOR: CollectionDescriptor = {
   name: "epics",
@@ -186,6 +202,16 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // scalar string, NOT JSON — decoding it would fall back to `[]` and
     // corrupt the wire value).
     "last_validated_at",
+    // Schema v29: closer-creator link + materialized-path sort key. Both
+    // reducer-derived inside `syncPlanctlLinks` (see `src/reducer.ts`).
+    // `created_by_closer_of` is plain nullable TEXT; `sort_path` is TEXT
+    // NOT NULL DEFAULT ''. Both served verbatim on `result`/`patch` and
+    // out of `jsonColumns` (scalar strings). `sort_path` lands in
+    // `sortable` below (driving the new default ORDER BY);
+    // `created_by_closer_of` stays out (downstream branches on its
+    // null-ness, not its value).
+    "created_by_closer_of",
+    "sort_path",
   ],
   pk: "epic_id",
   version: "last_event_id",
@@ -195,8 +221,12 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "epic_id",
     "epic_number",
     "status",
+    // Schema v29: the materialized-path sort key. Added to the
+    // trust-boundary allowlist so the generic ORDER BY interpolation in
+    // `src/server-worker.ts` accepts it as the default sort column.
+    "sort_path",
   ]),
-  defaultSort: { column: "epic_number", dir: "asc" },
+  defaultSort: { column: "sort_path", dir: "asc" },
   filters: {
     epic_id: "epic_id",
     status: "status",
