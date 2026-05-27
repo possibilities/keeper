@@ -1,5 +1,5 @@
 {
-  "approval": "rejected",
+  "approval": "approved",
   "branch_name": "fn-618-unify-apierrorkind-allow-list-into",
   "bundles": [],
   "closer_done_at": "2026-05-27T01:59:32.785088Z",
@@ -18,5 +18,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-27T02:00:39.726115Z"
+  "updated_at": "2026-05-27T02:02:08.902675Z"
 }
