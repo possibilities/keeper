@@ -48,5 +48,5 @@ blocked-later, for both `applySingleTaskPerEpicMutex` and
 - [ ] `bun test test/readiness.test.ts` passes with all existing tests green.
 
 ## Done summary
-
+Made applySingleTaskPerEpicMutex and applySingleTaskPerRootMutex order-independent via a two-pass walk: pass-1 lets any live-work verdict (job-running / sub-agent-running / planner-running / job-pending) claim the mutex slot regardless of iteration order; pass-2 demotes ready rows whose slot is already claimed. Close-row branch of the per-root mutex gets symmetric pass-1 treatment. Added regression tests for ready-first-then-live-work ordering on both mutexes plus the close-row variant.
 ## Evidence

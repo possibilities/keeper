@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "fix readiness mutex iteration order",
-  "updated_at": "2026-05-27T20:12:08.183486Z"
+  "updated_at": "2026-05-27T20:59:22.429873Z",
+  "worker_done_at": "2026-05-27T20:59:22.429873Z"
 }
