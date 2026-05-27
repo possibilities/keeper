@@ -70,5 +70,5 @@ In render-context.test.ts: delete the `renderFileList` describe block (around li
 - [ ] `bun test apps/planctl/skills/approve/scripts/render-context.test.ts` passes; no regressions in other arthack test files
 
 ## Done summary
-
+Trimmed /plan:approve cascade from four rules to two: kept Rule 0 (keeperd unavailable) + renamed former Rule 3 to Rule 1 (needs-human signal). Deleted SKILL.md Rule 1/Rule 2 blocks, the third keeperd round-trip (git collection), renderFileList helper, GitFile/GitJob interfaces, and matching tests. Minimized renderKeeperdUnavailable to heading + detail line. 22/22 tests pass; acceptance grep clean.
 ## Evidence
