@@ -3,10 +3,12 @@
  * keeper-autopilot — dispatch log viewer over the keeper subscribe server.
  *
  * Subscribes to keeperd and auto-dispatches ready rows. Each frame lists
- * every command dispatched so far, oldest first:
+ * every command dispatched so far, oldest first. Each line is prefixed
+ * with the basename of the cd target so the project is scannable at a
+ * glance (matches the `(dir)` shape used by `board.ts`):
  *
- *   launch  cd <dir> && claude '/plan:work <task_id>'
- *   notify  task <id> done — needs approval
+ *   (dir) launch  cd <dir> && claude '/plan:work <task_id>'
+ *   (dir) launch  cd <dir> && claude '/plan:approve <id>'
  *
  * Dispatches are persisted to ~/.local/state/keeper/dispatch.log (JSONL)
  * for forensic tailing across restarts, but each run's frame only shows
@@ -16,10 +18,12 @@
  * Fires side effects on EDGES in the readiness verdicts:
  *   → ready          spawn a Ghostty window running the worker command
  *                    (`cd … && claude '/plan:work …'` or '/plan:close …')
- *   → job-pending    fire `notifyctl` (worker done, approval needed)
- * The approval step is always the human's prerogative. Per-row verdict
- * signature is carried in a Map across snapshots; the map is NOT cleared
- * on reconnect so reconnects don't refire already-seen edges.
+ *   → job-pending    spawn a Ghostty window running the approve command
+ *                    (`cd … && claude '/plan:approve …'`) so the human
+ *                    lands directly in the review session.
+ * Per-row verdict signature is carried in a Map across snapshots; the
+ * map is NOT cleared on reconnect so reconnects don't refire already
+ * -seen edges.
  *
  * Connection / sidecar / SIGINT: the helper (`src/readiness-client.ts`)
  * owns capped-backoff reconnect, the all-three-strict first-paint gate,
@@ -39,7 +43,7 @@
  */
 
 import { appendFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
@@ -56,8 +60,8 @@ Usage: bun scripts/autopilot.ts [--sock <path>] [--dry-run]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
   --dry-run        Log dispatches to the frame and disk but skip the
-                   actual Ghostty spawn and notifyctl call. Entries
-                   appear as "launch (dry)  <command>".
+                   actual Ghostty spawn. Entries appear as
+                   "(dir) launch (dry)  <command>".
   --help           Show this help
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
@@ -66,10 +70,12 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   is appended to /tmp/keeper-autopilot.<pid>.lifecycle.txt. Session
   paths print on exit.
 
-Each frame lists every command dispatched so far, oldest first:
+Each frame lists every command dispatched so far, oldest first. Each
+line is prefixed with the basename of the cd target so the project is
+scannable at a glance (matches the (dir) shape used by board.ts):
 
-  launch  cd <dir> && claude '/plan:work <task_id>'
-  notify  task <id> done — needs approval
+  (dir) launch  cd <dir> && claude '/plan:work <task_id>'
+  (dir) launch  cd <dir> && claude '/plan:approve <id>'
 
 Each run's frame shows only dispatches from this run; the JSONL log at
 ~/.local/state/keeper/dispatch.log is still appended for forensic tailing
@@ -84,10 +90,12 @@ const seg = (v: unknown) => (v == null ? "" : String(v));
 
 interface DispatchEntry {
   ts: string;
-  kind: "launch" | "notify";
+  kind: "launch";
   rowId: string;
-  command?: string;
-  message?: string;
+  // Basename of the cd target — empty string when none. Rendered as the
+  // leading `(<dir>) ` segment of the frame line.
+  dir: string;
+  command: string;
   dry?: boolean;
   // Stamped at logDispatch time; lets future post-mortems correlate a
   // dispatch.log row to a specific autopilot process without grepping
@@ -222,10 +230,8 @@ async function main(): Promise<void> {
     }
     return dispatchLog.map((e) => {
       const dry = e.dry ? " (dry)" : "";
-      if (e.kind === "launch") {
-        return `launch${dry}  ${e.command ?? ""}`;
-      }
-      return `notify${dry}  ${e.message ?? ""}`;
+      const dirSeg = e.dir === "" ? "" : `(${e.dir}) `;
+      return `${dirSeg}launch${dry}  ${e.command}`;
     });
   }
 
@@ -332,14 +338,15 @@ async function main(): Promise<void> {
   // --- --launch dispatch ---
   //
   // Per-row verdict signature carried across snapshots. We fire side
-  // effects (Ghostty window for "→ ready", notifyctl for "→ approval
-  // pending") on the EDGE — `prev !== cur` with `cur` being one of those
-  // two signatures. The map is INTENTIONALLY not cleared on disconnect:
-  // a reconnect's first paint will see the same signatures as the last
-  // pre-disconnect frame and produce no spurious fires. The empty initial
-  // map means autopilot's first paint DOES fire for everything currently
-  // ready / pending — that is desired: "start autopilot, things you need
-  // to do open up."
+  // effects (Ghostty window for "→ ready" running the worker/closer verb,
+  // Ghostty window for "→ approval pending" running the approve verb) on
+  // the EDGE — `prev !== cur` with `cur` being one of those two
+  // signatures. The map is INTENTIONALLY not cleared on disconnect: a
+  // reconnect's first paint will see the same signatures as the last
+  // pre-disconnect frame and produce no spurious fires. The empty
+  // initial map means autopilot's first paint DOES fire for everything
+  // currently ready / pending — that is desired: "start autopilot,
+  // things you need to do open up."
   const lastVerdictSig = new Map<string, string>();
 
   function verdictSignature(v: Verdict | undefined): string {
@@ -373,7 +380,11 @@ async function main(): Promise<void> {
    * returns we attempt `yabai -m window --space 5` to shove the newly-
    * focused window onto space 5; yabai not being installed is fine.
    */
-  function launchInGhostty(workerShellCommand: string, rowId: string): void {
+  function launchInGhostty(
+    workerShellCommand: string,
+    rowId: string,
+    dir: string,
+  ): void {
     // `-l -i` = login + interactive — login alone sources `.zprofile` only,
     // so `claude` (and most user PATH additions) live in `.zshrc` which is
     // interactive-only. Without `-i` the spawned shell can't find `claude`.
@@ -401,6 +412,7 @@ async function main(): Promise<void> {
       ts: new Date().toISOString(),
       kind: "launch",
       rowId,
+      dir,
       command: workerShellCommand,
       dry: dryRun || undefined,
     });
@@ -431,62 +443,16 @@ async function main(): Promise<void> {
     }
   }
 
-  function notifyApprovalPending(rowId: string, kind: "task" | "close"): void {
-    const title = "keeper: approval needed";
-    const message =
-      kind === "task"
-        ? `task ${rowId} done — needs approval`
-        : `epic ${rowId} close done — needs approval`;
-    logDispatch({
-      ts: new Date().toISOString(),
-      kind: "notify",
-      rowId,
-      message,
-      dry: dryRun || undefined,
-    });
-    if (dryRun) return;
-    try {
-      const proc = Bun.spawn(
-        [
-          "notifyctl",
-          "show-message",
-          "-t",
-          title,
-          "-m",
-          message,
-          "--sound",
-          "Ping",
-        ],
-        { stdout: "pipe", stderr: "pipe", stdin: "ignore" },
-      );
-      proc.exited
-        .then(async () => {
-          const errText = await new Response(proc.stderr).text();
-          if (errText.length > 0) {
-            noteLine(`# notify stderr (${rowId}): ${errText.trim()}`);
-          }
-        })
-        .catch((err) => {
-          noteLine(
-            `# warn: notify spawn for ${rowId} failed: ${(err as Error).message}`,
-          );
-        });
-    } catch (err) {
-      noteLine(
-        `# warn: notify spawn for ${rowId} failed: ${(err as Error).message}`,
-      );
-    }
-  }
-
   /**
    * Walk every task + close row in the snapshot and fire side effects on
-   * EDGES into "ready" (Ghostty) or "blocked:job-pending" (notifyctl).
-   * `lastVerdictSig` is updated unconditionally so transitions out of
-   * those states (back to running, etc.) are recorded for the next edge.
+   * EDGES into "ready" (Ghostty: worker/closer verb) or
+   * "blocked:job-pending" (Ghostty: approve verb). `lastVerdictSig` is
+   * updated unconditionally so transitions out of those states (back to
+   * running, etc.) are recorded for the next edge.
    *
    * Worker commands MIRROR `renderEpicCommands` but DROP the approval
-   * line — the worker is what we want spawned; the approval step stays
-   * the human's prerogative (and is what notifyctl alerts about).
+   * line — the approve verb is now its own dispatch path on the
+   * job-pending edge.
    */
   // Silent instrumentation: every verdict-signature edge is appended to the
   // lifecycle sidecar so future post-mortems can reconstruct the prev → cur
@@ -559,18 +525,24 @@ async function main(): Promise<void> {
         }
         logTransition(key, prev, cur, taskDetail(task, snap));
         lastVerdictSig.set(key, cur);
+        const dir =
+          task.target_repo != null && seg(task.target_repo) !== ""
+            ? seg(task.target_repo)
+            : projectDir;
+        const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
+        const dirBase = dir === "" ? "" : basename(dir);
         if (cur === "ready") {
-          const dir =
-            task.target_repo != null && seg(task.target_repo) !== ""
-              ? seg(task.target_repo)
-              : projectDir;
-          const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
           launchInGhostty(
             `${cdPrefix}claude '/plan:work ${taskId}'`,
             `task ${taskId}`,
+            dirBase,
           );
         } else if (cur === "blocked:job-pending") {
-          notifyApprovalPending(taskId, "task");
+          launchInGhostty(
+            `${cdPrefix}claude '/plan:approve ${taskId}'`,
+            `approve task ${taskId}`,
+            dirBase,
+          );
         }
       }
 
@@ -586,14 +558,20 @@ async function main(): Promise<void> {
       }
       logTransition(closeKey, closePrev, closeCur, closeDetail(epic, snap));
       lastVerdictSig.set(closeKey, closeCur);
+      const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
+      const dirBase = projectDir === "" ? "" : basename(projectDir);
       if (closeCur === "ready") {
-        const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
         launchInGhostty(
           `${cdPrefix}claude '/plan:close ${epicId}'`,
           `close ${epicId}`,
+          dirBase,
         );
       } else if (closeCur === "blocked:job-pending") {
-        notifyApprovalPending(epicId, "close");
+        launchInGhostty(
+          `${cdPrefix}claude '/plan:approve ${epicId}'`,
+          `approve close ${epicId}`,
+          dirBase,
+        );
       }
     }
   }
