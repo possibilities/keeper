@@ -563,7 +563,12 @@ As of schema v29, the `epics` projection gains `created_by_closer_of` (TEXT,
 nullable — the closer→child link's `plan_ref`, i.e. the closed-epic id whose
 `/plan:plan` closer session minted this child epic via `epic-create`) and
 `sort_path` (TEXT NOT NULL DEFAULT '' — a zero-padded-6 dotted materialized-
-path key like `"000003.000007"`). Both are reducer-derived inside
+path key like `"000003.000007"`). As of schema v30 (fn-595), `epics` adds
+`queue_jump` (INTEGER NOT NULL DEFAULT 0) projected from the
+`planctl_queue_jump` envelope column on `/plan:queue` scaffold events;
+when set on a root epic, `cascadeSortPath` stamps a `!`-prefixed
+`sort_path` so queue-jumped epics sort above all other root epics in the
+default `sort_path ASC` page. Both are reducer-derived inside
 `syncPlanctlLinks` from the existing `job_links` + `jobs.plan_verb` /
 `plan_ref` substrate; an `EpicSnapshot` carve-out preserves them across an
 approval-RPC round-trip (alongside `tasks` / `jobs` / `job_links`). The

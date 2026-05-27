@@ -86,9 +86,11 @@ the native value" is the default.
   `extractSkillName`, `planVerbRefFromSpawnName`, `extractPlanctlInvocation`
   — the last one gated on PostToolUse:Bash and parsing the authoritative
   `planctl_invocation` envelope from `data.tool_response.stdout`) stamp the
-  seven sparse `events` columns (`slash_command`, `skill_name`, and the
-  five-column planctl envelope `planctl_op` / `planctl_target` /
-  `planctl_epic_id` / `planctl_task_id` / `planctl_subject_present`) at hook
+  eight sparse `events` columns (`slash_command`, `skill_name`, and the
+  six-column planctl envelope `planctl_op` / `planctl_target` /
+  `planctl_epic_id` / `planctl_task_id` / `planctl_subject_present` /
+  `planctl_queue_jump` — the last lifted from the optional `queue_jump`
+  field on the envelope, set by `/plan:queue` and absent elsewhere) at hook
   write time — all pure functions of the hook payload, shared with the
   schema-migration backfill so a re-derive on stored events reproduces the
   same column values. The reducer's `syncJobIntoEpic` fan-out maintains the
@@ -96,7 +98,21 @@ the native value" is the default.
   parallel `syncPlanctlLinks` fan-out maintains `jobs.epic_links` +
   `epics.job_links` from each `planctl_op != NULL` event by re-deriving
   from scratch against the touched session's full planctl footprint (never
-  delta-merging, so re-fold idempotence holds). The producer workers feed
+  delta-merging, so re-fold idempotence holds). As of schema v30 (fn-595),
+  `syncPlanctlLinks` also projects `epics.queue_jump` (INTEGER 0/1,
+  default 0) from the `planctl_queue_jump` envelope column — lifted with
+  `?? false` so envelopes predating the field fold to `0` deterministically.
+  When `queue_jump = 1` AND the epic has no `created_by_closer_of` (root
+  epic), `cascadeSortPath` takes the `!`-prefix branch and stamps a
+  `!<padded-epic-number>` `sort_path`, floating queue-jumped roots above
+  all other roots in the dashctl board's default `sort_path ASC` page.
+  Non-root queue-jumped epics still project `queue_jump = 1` for symmetry
+  but inherit the parent's prefix via the cascade — no double-prefix.
+  The schema v30 ALTER adds `queue_jump INTEGER NOT NULL DEFAULT 0` to
+  `epics`; the `EpicSnapshot` ON CONFLICT carve-out adds `queue_jump`
+  to the file-content-snapshot UPDATE-omit list alongside `tasks` /
+  `jobs` / `job_links` / `created_by_closer_of` / `sort_path`, so
+  envelope-derived state is never stomped by a re-observed snapshot. The producer workers feed
   the log only via main's writable connection; they never write the DB.
   Synthetic events covered by this rule: `TranscriptTitle` (transcript
   worker), `EpicSnapshot` / `TaskSnapshot` / `EpicDeleted` / `TaskDeleted`
