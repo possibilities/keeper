@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-05-27T16:46:54.678676Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Split hook DB open from daemon migrate via OpenDbOptions.migrate flag",
-  "updated_at": "2026-05-27T18:22:16.460459Z",
+  "updated_at": "2026-05-27T18:47:49.080910Z",
   "worker_done_at": "2026-05-27T18:22:16.460459Z"
 }
