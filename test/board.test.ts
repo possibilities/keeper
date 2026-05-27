@@ -510,7 +510,7 @@ test("renderJobLinkLines: one entry, all fields populated → one line, title + 
       state: "working",
     }),
   ]);
-  expect(out).toEqual(["   Plan epic 7 [creator] [working]"]);
+  expect(out).toEqual(["  Plan epic 7 [creator] [working]"]);
 });
 
 test("renderJobLinkLines: null title falls back to job_id (preserves line shape)", () => {
@@ -526,7 +526,7 @@ test("renderJobLinkLines: null title falls back to job_id (preserves line shape)
       state: "stopped",
     }),
   ]);
-  expect(out).toEqual(["   sess-no-title [refiner] [stopped]"]);
+  expect(out).toEqual(["  sess-no-title [refiner] [stopped]"]);
 });
 
 test("renderJobLinkLines: last_api_error_at non-null appends [failed:<kind>] pill (same line shape, live + terminal + off-page all)", () => {
@@ -547,7 +547,7 @@ test("renderJobLinkLines: last_api_error_at non-null appends [failed:<kind>] pil
     }),
   ]);
   expect(out).toEqual([
-    "   Plan epic 8 [creator] [stopped] [failed:rate_limit]",
+    "  Plan epic 8 [creator] [stopped] [failed:rate_limit]",
   ]);
 });
 
@@ -575,9 +575,7 @@ test.each([
         last_api_error_kind: kind,
       }),
     ]);
-    expect(out).toEqual([
-      `   Plan epic 9 [refiner] [stopped] [failed:${kind}]`,
-    ]);
+    expect(out).toEqual([`  Plan epic 9 [refiner] [stopped] [failed:${kind}]`]);
   },
 );
 
@@ -597,7 +595,7 @@ test("renderJobLinkLines: at non-null, kind null defensively renders [failed:unk
       last_api_error_kind: null,
     }),
   ]);
-  expect(out).toEqual(["   Plan epic 10 [creator] [stopped] [failed:unknown]"]);
+  expect(out).toEqual(["  Plan epic 10 [creator] [stopped] [failed:unknown]"]);
 });
 
 // `last_input_request_at` non-null appends the `[awaiting:<kind>]` pill
@@ -621,7 +619,7 @@ test("renderJobLinkLines: last_input_request_at non-null appends [awaiting:<kind
     }),
   ]);
   expect(out).toEqual([
-    "   Plan epic 11 [creator] [stopped] [awaiting:ask_user_question]",
+    "  Plan epic 11 [creator] [stopped] [awaiting:ask_user_question]",
   ]);
 });
 
@@ -642,7 +640,7 @@ test("renderJobLinkLines: input_request_at non-null, kind null defensively rende
     }),
   ]);
   expect(out).toEqual([
-    "   Plan epic 12 [refiner] [stopped] [awaiting:unknown]",
+    "  Plan epic 12 [refiner] [stopped] [awaiting:unknown]",
   ]);
 });
 
@@ -664,7 +662,7 @@ test("renderJobLinkLines: failed + awaiting stack in lifecycle order (state → 
     }),
   ]);
   expect(out).toEqual([
-    "   Plan epic 13 [creator] [stopped] [failed:rate_limit] [awaiting:ask_user_question]",
+    "  Plan epic 13 [creator] [stopped] [failed:rate_limit] [awaiting:ask_user_question]",
   ]);
 });
 
@@ -684,8 +682,8 @@ test("renderJobLinkLines: multiple entries iterate in provided order (projection
     }),
   ]);
   expect(out).toEqual([
-    "   First [creator] [working]",
-    "   Second [refiner] [stopped]",
+    "  First [creator] [working]",
+    "  Second [refiner] [stopped]",
   ]);
 });
 

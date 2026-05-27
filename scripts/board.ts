@@ -521,7 +521,7 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
     const label = link.title ?? link.job_id;
     const state = link.state == null ? "" : String(link.state);
     out.push(
-      `   ${label} [${link.kind}] [${state}]${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}${inputRequestPillSeg(link.last_input_request_at, link.last_input_request_kind)}`,
+      `  ${label} [${link.kind}] [${state}]${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}${inputRequestPillSeg(link.last_input_request_at, link.last_input_request_kind)}`,
     );
   }
   return out;
@@ -634,7 +634,7 @@ async function main(): Promise<void> {
     for (const j of jobsArr) {
       const job = j as Record<string, unknown>;
       out.push(
-        `   ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}${inputRequestPillSeg(job.last_input_request_at, job.last_input_request_kind)}`,
+        `    ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}${inputRequestPillSeg(job.last_input_request_at, job.last_input_request_kind)}`,
       );
       out.push(
         ...subagentLinesFor(subagentIndex, String(job.job_id), "      "),
@@ -713,15 +713,15 @@ async function main(): Promise<void> {
         // `worker_phase` (the derived worker-phase binary `open|done`).
         // Render both pills side-by-side with `[approval]` so the row
         // surfaces the full native vocabulary — no client-side collapse.
-        `${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.runtime_status)}] [${seg(t.worker_phase)}] [${taskApproval}]`,
-        `   [${taskId}] ${formatPill(taskVerdict)}${taskRepoPillSeg(t.target_repo, row.project_dir)}`,
+        `  ${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.runtime_status)}] [${seg(t.worker_phase)}] [${taskApproval}]`,
+        `    [${taskId}] ${formatPill(taskVerdict)}${taskRepoPillSeg(t.target_repo, row.project_dir)}`,
         ...renderJobLines(subagentIndex, t.jobs),
       );
     }
     const closeVerdict = verdictFromMap(snap.readiness.perCloseRow, epicId);
     lines.push(
-      `X. Quality audit and close [${seg(row.status)}] [${epicApproval}]`,
-      `   [${epicId}] ${formatPill(closeVerdict)}`,
+      `  X. Quality audit and close [${seg(row.status)}] [${epicApproval}]`,
+      `    [${epicId}] ${formatPill(closeVerdict)}`,
       ...renderJobLines(subagentIndex, row.jobs),
     );
     return lines.join("\n");
@@ -744,7 +744,7 @@ async function main(): Promise<void> {
           e as unknown as Record<string, unknown>,
         ),
       )
-      .join("\n+++\n");
+      .join("\n");
   }
 
   // --- job rendering ---
@@ -785,7 +785,7 @@ async function main(): Promise<void> {
     for (const [id, row] of snap.jobs) {
       const block = [
         projectJobRow(row as unknown as Record<string, unknown>),
-        ...subagentLinesFor(subagentIndex, id, "   "),
+        ...subagentLinesFor(subagentIndex, id, "  "),
       ].join("\n");
       if ((row as unknown as Record<string, unknown>).plan_verb == null) {
         noRole.push(block);
