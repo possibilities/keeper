@@ -1,0 +1,19 @@
+{
+  "branch_name": "fn-626-fix-readiness-git-orphans-staleness",
+  "bundles": [],
+  "created_at": "2026-05-27T19:45:38.557529Z",
+  "depends_on_epics": [],
+  "id": "fn-626-fix-readiness-git-orphans-staleness",
+  "last_validated_at": "2026-05-27T19:45:38.621077Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": true,
+  "snippets": [],
+  "status": "open",
+  "title": "fix readiness git-orphans staleness",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-27T19:45:38.557529Z"
+}

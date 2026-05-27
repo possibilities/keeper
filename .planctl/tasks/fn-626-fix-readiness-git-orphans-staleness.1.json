@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-27T19:45:38.557529Z",
+  "depends_on": [],
+  "epic": "fn-626-fix-readiness-git-orphans-staleness",
+  "id": "fn-626-fix-readiness-git-orphans-staleness.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "fix readiness git-orphans staleness",
+  "updated_at": "2026-05-27T19:45:38.557529Z"
+}
