@@ -414,6 +414,37 @@ const CREATE_SUBAGENT_INVOCATIONS_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_subagent_invocations_job ON subagent_invocations(job_id)",
 ];
 
+/**
+ * Tier 2 (fn-628) always-run table-scoped index on `epics`. Eliminates the
+ * `USE TEMP B-TREE FOR ORDER BY` on the default epics query
+ * (`(status='open' OR approval!='approved') ORDER BY sort_path ASC, epic_id ASC`).
+ * The WHERE columns aren't in the index — the OR-predicate applies as a filter
+ * during the in-order index scan, so EQP shows `SCAN epics USING INDEX
+ * idx_epics_sort_path` (not COVERING). Acceptable at current row counts (~700);
+ * if future growth makes the filter dominant, a follow-up can materialize a
+ * derived `default_visible` integer column. `CREATE INDEX IF NOT EXISTS` is
+ * idempotent and forward-only — no SCHEMA_VERSION bump.
+ */
+const CREATE_EPICS_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_epics_sort_path ON epics(sort_path, epic_id)",
+];
+
+/**
+ * Tier 2 (fn-628) always-run table-scoped index on `jobs`. Serves the default
+ * jobs query (`WHERE state NOT IN ('ended','killed') ORDER BY created_at DESC,
+ * job_id`). The index shape is `(created_at DESC, job_id, state)` — NOT
+ * `(state, created_at DESC, job_id)`: SQLite cannot translate a `NOT IN`
+ * predicate into a usable index-entry range on the leading column (negation
+ * can't be mapped to a contiguous range), so a `state`-leading index would
+ * land but never be picked by the planner. Putting `created_at DESC` as the
+ * leader serves the ORDER BY directly; trailing `state` makes the index
+ * covering for the post-seek filter. EQP shows `SCAN jobs USING COVERING
+ * INDEX idx_jobs_created_state` — sort eliminated, no row-lookup heap fetch.
+ */
+const CREATE_JOBS_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_jobs_created_state ON jobs(created_at DESC, job_id, state)",
+];
+
 const CREATE_JOBS = `
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
@@ -2354,6 +2385,24 @@ function migrate(db: Database): void {
       db.run("DELETE FROM epics");
       db.run("DELETE FROM subagent_invocations");
     }
+
+    // Tier 2 (fn-628) always-run table-scoped indexes on epics + jobs. Placed
+    // AFTER the v28→v29 ADD COLUMN block stamps `epics.sort_path` so a
+    // migrating-from-v28 DB has the indexed column by the time the index runs.
+    // The remaining indexed columns (`epic_id`, `created_at`, `job_id`,
+    // `state`) all exist from schema v1. `CREATE INDEX IF NOT EXISTS` is
+    // idempotent — no SCHEMA_VERSION bump. `ANALYZE epics; ANALYZE jobs;`
+    // runs unconditionally on every boot so the planner picks the new
+    // indexes on first post-upgrade query — cost is negligible on tables
+    // under ~1.1k rows.
+    for (const sql of CREATE_EPICS_INDEXES) {
+      db.run(sql);
+    }
+    for (const sql of CREATE_JOBS_INDEXES) {
+      db.run(sql);
+    }
+    db.run("ANALYZE epics");
+    db.run("ANALYZE jobs");
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

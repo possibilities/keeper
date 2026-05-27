@@ -87,6 +87,8 @@ test("all expected indexes are present", () => {
     "idx_events_ts",
     "idx_events_pid_hook_tool",
     "idx_events_subagent_agent_id",
+    "idx_epics_sort_path",
+    "idx_jobs_created_state",
   ];
   for (const name of required) {
     expect(names.has(name)).toBe(true);
@@ -1021,6 +1023,88 @@ test("v10 idx_jobs_plan_ref serves a WHERE plan_verb='close' query (EXPLAIN QUER
     .all() as { detail: string }[];
   const detail = plan.map((r) => r.detail).join(" | ");
   expect(detail).toMatch(/idx_jobs_plan_ref/);
+  db.close();
+});
+
+test("Tier 2 (fn-628) idx_epics_sort_path + idx_jobs_created_state are present on fresh openDb", () => {
+  const { db } = openDb(dbPath);
+  const indexes = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+    .all() as { name: string }[];
+  const names = new Set(indexes.map((i) => i.name));
+  expect(names.has("idx_epics_sort_path")).toBe(true);
+  expect(names.has("idx_jobs_created_state")).toBe(true);
+  db.close();
+});
+
+test("Tier 2 (fn-628) idx_epics_sort_path serves the default epics query (EXPLAIN QUERY PLAN)", () => {
+  // Seed ~50 rows + ANALYZE so the planner picks the index. The default epics
+  // query (EPICS_DESCRIPTOR.defaultSort = sort_path asc; defaultClause =
+  // status='open' OR approval!='approved') should serve the ORDER BY via the
+  // index without a temp B-tree. The WHERE columns aren't in the index — the
+  // OR-predicate applies as a filter during the in-order scan, so EQP shows
+  // `SCAN epics USING INDEX idx_epics_sort_path` (NOT covering).
+  const { db } = openDb(dbPath);
+  const insert = db.prepare(
+    "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at, sort_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  for (let i = 0; i < 50; i++) {
+    const status = i % 3 === 0 ? "closed" : "open";
+    const approval = i % 4 === 0 ? "approved" : "pending";
+    const padded = String(i).padStart(6, "0");
+    insert.run(`fn-${i}-foo`, i, `Epic ${i}`, status, approval, i, 1, padded);
+  }
+  db.run("ANALYZE");
+
+  const plan = db
+    .prepare(
+      "EXPLAIN QUERY PLAN SELECT epic_id FROM epics WHERE (status = 'open' OR approval != 'approved') ORDER BY sort_path ASC, epic_id ASC",
+    )
+    .all() as { detail: string }[];
+  const detail = plan.map((r) => r.detail).join(" | ");
+  expect(detail).toMatch(
+    /SCAN epics USING (COVERING )?INDEX idx_epics_sort_path/,
+  );
+  expect(detail).not.toMatch(/USE TEMP B-TREE/);
+  db.close();
+});
+
+test("Tier 2 (fn-628) idx_jobs_created_state serves the default jobs query as COVERING (EXPLAIN QUERY PLAN)", () => {
+  // Seed ~50 rows + ANALYZE so the planner picks the index. The default jobs
+  // query (JOBS_DESCRIPTOR.defaultFilter = state NOT IN ('ended','killed');
+  // defaultSort = created_at desc) is served by the corrected index shape
+  // `(created_at DESC, job_id, state)` — `created_at DESC` leads so the
+  // ORDER BY is satisfied in order, and trailing `state` makes the index
+  // covering for the NOT IN filter (no heap row-lookup). The state-leading
+  // shape was rejected during planning because SQLite cannot translate a
+  // `NOT IN` predicate into a usable index-entry range on the leading
+  // column.
+  const { db } = openDb(dbPath);
+  const states = ["running", "stopped", "ended", "killed", "spawned"];
+  const insert = db.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, state) VALUES (?, ?, ?, ?, ?)",
+  );
+  for (let i = 0; i < 60; i++) {
+    insert.run(
+      `job-${i}`,
+      1_700_000_000 + i,
+      i,
+      1_700_000_000 + i,
+      states[i % states.length],
+    );
+  }
+  db.run("ANALYZE");
+
+  const plan = db
+    .prepare(
+      "EXPLAIN QUERY PLAN SELECT job_id, state FROM jobs WHERE state NOT IN ('ended', 'killed') ORDER BY created_at DESC, job_id ASC",
+    )
+    .all() as { detail: string }[];
+  const detail = plan.map((r) => r.detail).join(" | ");
+  expect(detail).toMatch(
+    /SCAN jobs USING COVERING INDEX idx_jobs_created_state/,
+  );
+  expect(detail).not.toMatch(/USE TEMP B-TREE/);
   db.close();
 });
 
