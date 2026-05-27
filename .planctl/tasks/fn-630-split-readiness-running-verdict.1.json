@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-27T21:16:54.092683Z",
+  "depends_on": [],
+  "epic": "fn-630-split-readiness-running-verdict",
+  "id": "fn-630-split-readiness-running-verdict.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "split readiness running verdict",
+  "updated_at": "2026-05-27T21:16:54.092683Z"
+}
