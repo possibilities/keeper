@@ -3,11 +3,10 @@
  * keeper-autopilot — dispatch log viewer over the keeper subscribe server.
  *
  * Subscribes to keeperd and auto-dispatches ready rows. Each frame lists
- * every command dispatched so far, oldest first, with a relative "time
- * ago" timestamp refreshed on each new dispatch:
+ * every command dispatched so far, oldest first:
  *
- *   [2m ago] launch  cd <dir> && claude '/plan:work <task_id>'
- *   [just now] notify  task <id> done — needs approval
+ *   launch  cd <dir> && claude '/plan:work <task_id>'
+ *   notify  task <id> done — needs approval
  *
  * Dispatches are persisted to ~/.local/state/keeper/dispatch.log (JSONL)
  * for forensic tailing across restarts, but each run's frame only shows
@@ -58,7 +57,7 @@ Usage: bun scripts/autopilot.ts [--sock <path>] [--dry-run]
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
   --dry-run        Log dispatches to the frame and disk but skip the
                    actual Ghostty spawn and notifyctl call. Entries
-                   appear as "[Xm ago] launch (dry)  <command>".
+                   appear as "launch (dry)  <command>".
   --help           Show this help
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
@@ -67,11 +66,10 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   is appended to /tmp/keeper-autopilot.<pid>.lifecycle.txt. Session
   paths print on exit.
 
-Each frame lists every command dispatched so far, oldest first, with a
-relative timestamp refreshed on each new dispatch:
+Each frame lists every command dispatched so far, oldest first:
 
-  [2m ago] launch  cd <dir> && claude '/plan:work <task_id>'
-  [just now] notify  task <id> done — needs approval
+  launch  cd <dir> && claude '/plan:work <task_id>'
+  notify  task <id> done — needs approval
 
 Each run's frame shows only dispatches from this run; the JSONL log at
 ~/.local/state/keeper/dispatch.log is still appended for forensic tailing
@@ -83,17 +81,6 @@ Ctrl-C calls dispose() and exits 0.
 `;
 
 const seg = (v: unknown) => (v == null ? "" : String(v));
-
-function timeAgo(ts: string): string {
-  const s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
-  if (s < 5) return "just now";
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
-}
 
 interface DispatchEntry {
   ts: string;
@@ -234,12 +221,11 @@ async function main(): Promise<void> {
       return ["# no commands dispatched yet"];
     }
     return dispatchLog.map((e) => {
-      const age = timeAgo(e.ts);
       const dry = e.dry ? " (dry)" : "";
       if (e.kind === "launch") {
-        return `[${age}] launch${dry}  ${e.command ?? ""}`;
+        return `launch${dry}  ${e.command ?? ""}`;
       }
-      return `[${age}] notify${dry}  ${e.message ?? ""}`;
+      return `notify${dry}  ${e.message ?? ""}`;
     });
   }
 
