@@ -1,12 +1,18 @@
 {
+  "approval": "pending",
   "bundles": [],
   "created_at": "2026-05-27T01:48:01.680912Z",
   "depends_on": [],
   "epic": "fn-619-pin-inputrequest-mid-subagent-state",
   "id": "fn-619-pin-inputrequest-mid-subagent-state.1",
+  "preferred_backend": null,
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
   "title": "add InputRequest mid-subagent test",
-  "updated_at": "2026-05-27T01:48:01.680912Z"
+  "updated_at": "2026-05-27T02:05:34.471885Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": null
 }
