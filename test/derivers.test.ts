@@ -156,6 +156,11 @@ interface Envelope {
   op: string;
   target?: string | null;
   subject?: unknown;
+  // Schema v30: the `/plan:queue` priority-jump signal. Optional + arbitrary
+  // type (`unknown`) so tests can drive the deriver's `=== true` defensive
+  // check with non-boolean values too (the string `"true"`, `1`, an object,
+  // etc., all of which MUST fold to `false`).
+  queue_jump?: unknown;
 }
 
 /**
@@ -306,6 +311,7 @@ test("extractPlanctlInvocation parses epic-create envelope with epic ref", () =>
     epic_id: "fn-575-foo",
     task_id: null,
     subject_present: true,
+    queue_jump: false,
   });
 });
 
@@ -326,6 +332,7 @@ test("extractPlanctlInvocation parses scaffold envelope with epic ref", () => {
     epic_id: "fn-606-envelope-driven-planctl-op-deriver",
     task_id: null,
     subject_present: true,
+    queue_jump: false,
   });
 });
 
@@ -343,6 +350,7 @@ test("extractPlanctlInvocation parses epic-close envelope with epic ref", () => 
     epic_id: "fn-575-foo",
     task_id: null,
     subject_present: false,
+    queue_jump: false,
   });
 });
 
@@ -358,6 +366,7 @@ test("extractPlanctlInvocation parses task-set-tier envelope into epic_id + task
     epic_id: "fn-575-foo",
     task_id: "fn-575-foo.3",
     subject_present: true,
+    queue_jump: false,
   });
 });
 
@@ -373,6 +382,7 @@ test("extractPlanctlInvocation parses envelope with null target (bare-verb mutat
     epic_id: null,
     task_id: null,
     subject_present: false,
+    queue_jump: false,
   });
 });
 
@@ -389,6 +399,7 @@ test("extractPlanctlInvocation treats non-ref target as parseable but unresolved
     epic_id: null,
     task_id: null,
     subject_present: true,
+    queue_jump: false,
   });
 });
 
@@ -419,6 +430,85 @@ test("extractPlanctlInvocation marks subject_present:true when subject is any no
     post({ op: "epic-set-title", target: "fn-1-foo", subject: "new title" }),
   );
   expect(got?.subject_present).toBe(true);
+});
+
+test("extractPlanctlInvocation lifts queue_jump:true from the envelope (schema v30)", () => {
+  // The canonical `/plan:queue` scaffold path — planctl emits the literal
+  // boolean `true` on the envelope, the deriver lifts to `queue_jump: true`.
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({
+      op: "scaffold",
+      target: "fn-700-queued-thing",
+      subject: "title",
+      queue_jump: true,
+    }),
+  );
+  expect(got).toEqual({
+    op: "scaffold",
+    target: "fn-700-queued-thing",
+    epic_id: "fn-700-queued-thing",
+    task_id: null,
+    subject_present: true,
+    queue_jump: true,
+  });
+});
+
+test("extractPlanctlInvocation folds queue_jump:false from the envelope (defer / non-queue paths)", () => {
+  // `/plan:defer` and every non-queue scaffold path emit the literal
+  // boolean `false` (or omit the key entirely). The deriver folds both to
+  // `queue_jump: false`.
+  const explicit = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({
+      op: "scaffold",
+      target: "fn-700-deferred-thing",
+      subject: "title",
+      queue_jump: false,
+    }),
+  );
+  expect(explicit?.queue_jump).toBe(false);
+
+  // Absent key (legacy planctl envelope predating v30) — `=== true` is
+  // false, so queue_jump folds to `false`. This is the re-fold determinism
+  // gate: every historical event lacking the field reproduces `false`.
+  const absent = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({
+      op: "scaffold",
+      target: "fn-700-legacy-thing",
+      subject: "title",
+    }),
+  );
+  expect(absent?.queue_jump).toBe(false);
+});
+
+test("extractPlanctlInvocation defensive: non-boolean queue_jump values fold to false", () => {
+  // The `=== true` check is intentionally strict — any non-boolean value
+  // (string "true", `1`, an object, `null`) folds to `false`. Protects
+  // against a buggy planctl emitting the wrong shape.
+  const cases: { label: string; value: unknown }[] = [
+    { label: "string 'true'", value: "true" },
+    { label: "number 1", value: 1 },
+    { label: "object {x:1}", value: { x: 1 } },
+    { label: "null", value: null },
+  ];
+  for (const { value } of cases) {
+    const got = extractPlanctlInvocation(
+      "PostToolUse",
+      "Bash",
+      post({
+        op: "scaffold",
+        target: "fn-700-malformed",
+        subject: "title",
+        queue_jump: value,
+      }),
+    );
+    expect(got?.queue_jump).toBe(false);
+  }
 });
 
 test("extractPlanctlInvocation widens to absolute-path and bash -c invocations (envelope is authoritative)", () => {

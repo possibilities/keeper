@@ -379,6 +379,13 @@ async function main(): Promise<void> {
       : planctlInvocation.subject_present
         ? 1
         : 0;
+  // v30: `queue_jump` mirrors the `subject_present` 0/1/null convention —
+  // INTEGER on disk, NULL when the event isn't a planctl invocation at all.
+  // Lifted from the envelope's `queue_jump` boolean by the deriver's
+  // `=== true` defensive check (legacy / non-boolean / absent → `false`),
+  // so a re-fold from cursor=0 reproduces the column byte-identically.
+  const planctlQueueJump =
+    planctlInvocation === null ? null : planctlInvocation.queue_jump ? 1 : 0;
 
   // v17: index the Anthropic tool_use_id correlator on every event payload
   // carrying it. Unlike `slashCommandFromPrompt` / `extractSkillName` /
@@ -454,6 +461,7 @@ async function main(): Promise<void> {
         $planctl_subject_present: planctlSubjectPresent,
         $tool_use_id: toolUseId,
         $config_dir: configDir,
+        $planctl_queue_jump: planctlQueueJump,
       });
     })();
   } finally {

@@ -77,6 +77,12 @@ function insertEvent(
     planctl_subject_present: overrides.planctl_subject_present ?? null,
     tool_use_id: overrides.tool_use_id ?? null,
     config_dir: overrides.config_dir ?? null,
+    // Schema v30: queue-jump sparse column; NULL unless this is a planctl
+    // event whose envelope carried `queue_jump: true` (stamped 1) or any
+    // other planctl event (stamped 0). The test helper defaults to NULL so
+    // every non-planctl event lands NULL — matches the live hook's stamping
+    // contract (see `plugin/hooks/events-writer.ts`).
+    planctl_queue_jump: overrides.planctl_queue_jump ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -84,8 +90,8 @@ function insertEvent(
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-       planctl_subject_present, tool_use_id, config_dir
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -112,6 +118,7 @@ function insertEvent(
       row.planctl_subject_present,
       row.tool_use_id,
       row.config_dir,
+      row.planctl_queue_jump,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -2443,6 +2450,9 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     // resolve without requiring a planctl event on the parent epic).
     created_by_closer_of: null,
     sort_path: "000001",
+    // Schema v30: queue_jump defaults to 0 — no planctl_invocation envelope
+    // with `queue_jump: true` has been observed for this epic.
+    queue_jump: 0,
   });
   expect(epic?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);
@@ -3636,6 +3646,10 @@ function planctlEvent(args: {
   epicId: string | null;
   taskId?: string | null;
   subjectPresent: boolean;
+  // Schema v30: optional queue-jump flag. Defaults `false` so existing tests
+  // (every one written before v30) keep their old shape; new tests opt in by
+  // passing `queueJump: true` to drive the `/plan:queue` projection path.
+  queueJump?: boolean;
   ts?: number;
 }): number {
   return insertEvent({
@@ -3648,6 +3662,7 @@ function planctlEvent(args: {
     planctl_epic_id: args.epicId,
     planctl_task_id: args.taskId ?? null,
     planctl_subject_present: args.subjectPresent ? 1 : 0,
+    planctl_queue_jump: args.queueJump ? 1 : 0,
   });
 }
 
@@ -4646,6 +4661,491 @@ test("syncPlanctlLinks v29: re-fold determinism preserves byte-identical (create
   // Byte-identical including the two new schema-v29 columns.
   expect(epicsAfter).toBe(epicsBefore);
 });
+
+// ---------------------------------------------------------------------------
+// Schema v30: queue_jump projection + `!`-prefix sort_path branch
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the schema-v30 columns for one epic. Returns NULL when the epic row
+ * is missing. Mirrors `getEpicSortFields` (v29) — separate helper so the v30
+ * tests stay self-contained.
+ */
+function getEpicQueueState(
+  epicId: string,
+): { queue_jump: number; sort_path: string } | null {
+  return db
+    .query("SELECT queue_jump, sort_path FROM epics WHERE epic_id = ?")
+    .get(epicId) as { queue_jump: number; sort_path: string } | null;
+}
+
+test("syncPlanctlLinks v30: root epic with queue_jump=true → epics.queue_jump=1, sort_path='!<padded>'", () => {
+  // The canonical `/plan:queue` flow: scaffold envelope carries
+  // `queue_jump: true`; hook stamps `planctl_queue_jump = 1` on the event;
+  // reducer projects `epics.queue_jump = 1` AND prepends `!` to the
+  // sort_path (root → `created_by_closer_of IS NULL`).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-queued-root" });
+  planPlanOpener("sess-queued-root");
+  planctlEvent({
+    sessionId: "sess-queued-root",
+    op: "scaffold",
+    target: "fn-700-queued",
+    epicId: "fn-700-queued",
+    subjectPresent: true,
+    queueJump: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-700-queued",
+    data: JSON.stringify({
+      epic_number: 700,
+      title: "Queued",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  // Re-trigger syncPlanctlLinks with the epic_number now visible.
+  planctlEvent({
+    sessionId: "sess-queued-root",
+    op: "epic-set-title",
+    target: "fn-700-queued",
+    epicId: "fn-700-queued",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getEpicQueueState("fn-700-queued")).toEqual({
+    queue_jump: 1,
+    sort_path: "!000700",
+  });
+});
+
+test("syncPlanctlLinks v30: root epic with queue_jump=false → queue_jump=0, plain padded sort_path", () => {
+  // The `/plan:defer` and every other non-queue scaffold path: envelope
+  // either omits queue_jump or sets it to `false`. Reducer projects
+  // queue_jump=0 and stamps a plain (no `!` prefix) sort_path.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-defer-root" });
+  planPlanOpener("sess-defer-root");
+  planctlEvent({
+    sessionId: "sess-defer-root",
+    op: "scaffold",
+    target: "fn-701-deferred",
+    epicId: "fn-701-deferred",
+    subjectPresent: true,
+    // queueJump intentionally absent → defaults to false in the helper.
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-701-deferred",
+    data: JSON.stringify({
+      epic_number: 701,
+      title: "Deferred",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-defer-root",
+    op: "epic-set-title",
+    target: "fn-701-deferred",
+    epicId: "fn-701-deferred",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getEpicQueueState("fn-701-deferred")).toEqual({
+    queue_jump: 0,
+    sort_path: "000701",
+  });
+});
+
+test("syncPlanctlLinks v30: cascade propagates `!`-prefix to closer-of children via parentPath string concat", () => {
+  // A queue-jumped parent's `!`-prefix MUST propagate to every transitive
+  // closer-of descendant. The cascade has no separate queue-jump awareness
+  // — the prefix is already baked into the parent's sort_path string and
+  // gets read into `parentPath` then concat'd as `<parentPath>.<child>`.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-queued-parent",
+  });
+  planPlanOpener("sess-queued-parent");
+  planctlEvent({
+    sessionId: "sess-queued-parent",
+    op: "scaffold",
+    target: "fn-720-queued-parent",
+    epicId: "fn-720-queued-parent",
+    subjectPresent: true,
+    queueJump: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-720-queued-parent",
+    data: JSON.stringify({
+      epic_number: 720,
+      title: "Queued Parent",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-queued-parent",
+    op: "epic-set-title",
+    target: "fn-720-queued-parent",
+    epicId: "fn-720-queued-parent",
+    subjectPresent: true,
+  });
+  // Closer-of child of the queue-jumped parent.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-child-of-queued",
+    spawn_name: "close::fn-720-queued-parent",
+  });
+  planPlanOpener("sess-child-of-queued");
+  planctlEvent({
+    sessionId: "sess-child-of-queued",
+    op: "epic-create",
+    target: "fn-721-child",
+    epicId: "fn-721-child",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-721-child",
+    data: JSON.stringify({
+      epic_number: 721,
+      title: "Child",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-child-of-queued",
+    op: "epic-set-title",
+    target: "fn-721-child",
+    epicId: "fn-721-child",
+    subjectPresent: true,
+  });
+  drainAll();
+  // Parent: queue_jump=1 + `!`-prefix.
+  expect(getEpicQueueState("fn-720-queued-parent")).toEqual({
+    queue_jump: 1,
+    sort_path: "!000720",
+  });
+  // Child: queue_jump=0 (its own session never flipped the flag) BUT
+  // inherits the `!`-prefix via `<parentPath>.<zeroPad6(child)>`.
+  expect(getEpicQueueState("fn-721-child")).toEqual({
+    queue_jump: 0,
+    sort_path: "!000720.000721",
+  });
+});
+
+test("syncPlanctlLinks v30: non-root queue-jumped epic inherits parent's path verbatim (no double-prefix)", () => {
+  // A queue-jumped epic with `created_by_closer_of` set (non-root) still
+  // projects queue_jump=1 for symmetry, but its sort_path follows the
+  // standard `<parent.sort_path>.<padded>` derivation — NO extra `!`
+  // prefix. The parent (non-queued in this test) supplies a plain path,
+  // so the child's path is `<plain>.<padded>`.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-plain-parent-v30",
+  });
+  planPlanOpener("sess-plain-parent-v30");
+  planctlEvent({
+    sessionId: "sess-plain-parent-v30",
+    op: "epic-create",
+    target: "fn-730-plain-parent",
+    epicId: "fn-730-plain-parent",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-730-plain-parent",
+    data: JSON.stringify({
+      epic_number: 730,
+      title: "Plain Parent",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-plain-parent-v30",
+    op: "epic-set-title",
+    target: "fn-730-plain-parent",
+    epicId: "fn-730-plain-parent",
+    subjectPresent: true,
+  });
+  // Closer of the plain parent runs `/plan:queue` to mint a new child.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-queued-nonroot-child",
+    spawn_name: "close::fn-730-plain-parent",
+  });
+  planPlanOpener("sess-queued-nonroot-child");
+  planctlEvent({
+    sessionId: "sess-queued-nonroot-child",
+    op: "scaffold",
+    target: "fn-731-queued-nonroot",
+    epicId: "fn-731-queued-nonroot",
+    subjectPresent: true,
+    queueJump: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-731-queued-nonroot",
+    data: JSON.stringify({
+      epic_number: 731,
+      title: "Queued Non-Root",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-queued-nonroot-child",
+    op: "epic-set-title",
+    target: "fn-731-queued-nonroot",
+    epicId: "fn-731-queued-nonroot",
+    subjectPresent: true,
+  });
+  drainAll();
+  // Plain root parent.
+  expect(getEpicQueueState("fn-730-plain-parent")).toEqual({
+    queue_jump: 0,
+    sort_path: "000730",
+  });
+  // Non-root queue-jumped child: queue_jump=1 BUT sort_path inherits
+  // parent's plain path. NO `!` prefix (the child is non-root).
+  expect(getEpicQueueState("fn-731-queued-nonroot")).toEqual({
+    queue_jump: 1,
+    sort_path: "000730.000731",
+  });
+});
+
+test("syncPlanctlLinks v30: EpicSnapshot re-fold preserves queue_jump (ON CONFLICT carve-out)", () => {
+  // The mandatory snapshot carve-out: a re-folded EpicSnapshot (e.g. an
+  // approval RPC round-trip) MUST NOT wipe `queue_jump` back to 0. Set up
+  // a queued root, then re-fold its snapshot with a different status /
+  // approval and confirm queue_jump survives.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-carve30",
+  });
+  planPlanOpener("sess-carve30");
+  planctlEvent({
+    sessionId: "sess-carve30",
+    op: "scaffold",
+    target: "fn-740-carve30",
+    epicId: "fn-740-carve30",
+    subjectPresent: true,
+    queueJump: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-740-carve30",
+    data: JSON.stringify({
+      epic_number: 740,
+      title: "Carve30",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-carve30",
+    op: "epic-set-title",
+    target: "fn-740-carve30",
+    epicId: "fn-740-carve30",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getEpicQueueState("fn-740-carve30")).toEqual({
+    queue_jump: 1,
+    sort_path: "!000740",
+  });
+
+  // Re-fold an EpicSnapshot (mirrors an approval RPC round-trip — a fresh
+  // atomic file write fires a snapshot event into the reducer).
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-740-carve30",
+    data: JSON.stringify({
+      epic_number: 740,
+      title: "Carve30 (approved)",
+      project_dir: "/repo",
+      status: "open",
+      approval: "approved",
+    }),
+  });
+  drainAll();
+
+  // Scalars flipped; queue_jump + sort_path survive the carve-out.
+  const epic = getEpic("fn-740-carve30");
+  expect(epic?.title).toBe("Carve30 (approved)");
+  expect(epic?.approval).toBe("approved");
+  expect(getEpicQueueState("fn-740-carve30")).toEqual({
+    queue_jump: 1,
+    sort_path: "!000740",
+  });
+});
+
+test("syncPlanctlLinks v30: re-fold determinism preserves byte-identical queue_jump + sort_path", () => {
+  // Drive a queue-jumped state, capture every epic row, rewind + DELETE
+  // + drain, capture again, byte-compare. Mirrors the v29 re-fold test.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-queued-r30",
+  });
+  planPlanOpener("sess-queued-r30");
+  planctlEvent({
+    sessionId: "sess-queued-r30",
+    op: "scaffold",
+    target: "fn-750-r30",
+    epicId: "fn-750-r30",
+    subjectPresent: true,
+    queueJump: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-750-r30",
+    data: JSON.stringify({
+      epic_number: 750,
+      title: "R30",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-queued-r30",
+    op: "epic-set-title",
+    target: "fn-750-r30",
+    epicId: "fn-750-r30",
+    subjectPresent: true,
+  });
+  // A closer-of child to exercise cascade re-fold too.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-r30-child",
+    spawn_name: "close::fn-750-r30",
+  });
+  planPlanOpener("sess-r30-child");
+  planctlEvent({
+    sessionId: "sess-r30-child",
+    op: "epic-create",
+    target: "fn-751-r30-child",
+    epicId: "fn-751-r30-child",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-751-r30-child",
+    data: JSON.stringify({
+      epic_number: 751,
+      title: "R30 Child",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-r30-child",
+    op: "epic-set-title",
+    target: "fn-751-r30-child",
+    epicId: "fn-751-r30-child",
+    subjectPresent: true,
+  });
+  drainAll();
+  const epicsBefore = JSON.stringify(
+    db.query("SELECT * FROM epics ORDER BY epic_id").all(),
+  );
+
+  // Rewind + clear + redrain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  drainAll();
+  const epicsAfter = JSON.stringify(
+    db.query("SELECT * FROM epics ORDER BY epic_id").all(),
+  );
+  // Byte-identical including queue_jump + the inherited `!`-prefix.
+  expect(epicsAfter).toBe(epicsBefore);
+});
+
+test("syncPlanctlLinks v30: multiple queue-jumped roots sort FIFO by epic_number under shared `!` prefix", () => {
+  // FIFO semantics (chosen design — see epic spec §"Alternatives"): three
+  // queue-jumped roots stamped at different epic_numbers should sort in
+  // ascending epic_number order. The shared `!` prefix lifts them above
+  // every non-queued root; the zero-padded epic_number tail orders them
+  // among themselves. No tiebreaker math needed.
+  for (const num of [770, 771, 772]) {
+    const sess = `sess-fifo-${num}`;
+    insertEvent({ hook_event: "SessionStart", session_id: sess });
+    planPlanOpener(sess);
+    planctlEvent({
+      sessionId: sess,
+      op: "scaffold",
+      target: `fn-${num}-fifo`,
+      epicId: `fn-${num}-fifo`,
+      subjectPresent: true,
+      queueJump: true,
+    });
+    insertEvent({
+      hook_event: "EpicSnapshot",
+      session_id: `fn-${num}-fifo`,
+      data: JSON.stringify({
+        epic_number: num,
+        title: `FIFO ${num}`,
+        project_dir: "/repo",
+        status: "open",
+      }),
+    });
+    planctlEvent({
+      sessionId: sess,
+      op: "epic-set-title",
+      target: `fn-${num}-fifo`,
+      epicId: `fn-${num}-fifo`,
+      subjectPresent: true,
+    });
+  }
+  // Plus a plain (non-queued) root to confirm it sorts AFTER all
+  // queued roots — `!` (0x21) < `0` (0x30) under BINARY collation.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-fifo-plain" });
+  planPlanOpener("sess-fifo-plain");
+  planctlEvent({
+    sessionId: "sess-fifo-plain",
+    op: "epic-create",
+    target: "fn-769-plain-after",
+    epicId: "fn-769-plain-after",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-769-plain-after",
+    data: JSON.stringify({
+      epic_number: 769,
+      title: "Plain Outsider",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  planctlEvent({
+    sessionId: "sess-fifo-plain",
+    op: "epic-set-title",
+    target: "fn-769-plain-after",
+    epicId: "fn-769-plain-after",
+    subjectPresent: true,
+  });
+  drainAll();
+
+  // Read sort_path for all four; expect FIFO order under shared `!`,
+  // then the plain root after.
+  const rows = db
+    .query(
+      "SELECT epic_id, sort_path FROM epics WHERE epic_id LIKE 'fn-7%-fifo' OR epic_id = 'fn-769-plain-after' ORDER BY sort_path ASC",
+    )
+    .all() as { epic_id: string; sort_path: string }[];
+  expect(rows).toEqual([
+    { epic_id: "fn-770-fifo", sort_path: "!000770" },
+    { epic_id: "fn-771-fifo", sort_path: "!000771" },
+    { epic_id: "fn-772-fifo", sort_path: "!000772" },
+    { epic_id: "fn-769-plain-after", sort_path: "000769" },
+  ]);
+});
+
 test("syncPlanctlLinks: re-fold determinism (rewind + DELETE + drain reproduces byte-identical projection)", () => {
   // Drive a full session: two windows, a creator, a refiner, plus a
   // cross-session refiner so both projections accumulate.

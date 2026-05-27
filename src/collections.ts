@@ -212,6 +212,17 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // null-ness, not its value).
     "created_by_closer_of",
     "sort_path",
+    // Schema v30: `queue_jump` — priority-jump flag projected from the
+    // `planctl_invocation` envelope's `queue_jump` boolean by
+    // `syncPlanctlLinks`. INTEGER NOT NULL DEFAULT 0 at the SQLite layer;
+    // dashctl consumers lift to JS boolean (`queue_jump === 1`) at the
+    // read boundary. Served verbatim on `result`/`patch`; kept OUT of
+    // `sortable` (the `!`-prefix on `sort_path` carries the ordering
+    // signal — sorting by `queue_jump` directly would be a redundant
+    // wire knob) AND OUT of `filters` (downstream consumers branch on
+    // the value cosmetically — e.g. a `[queued]` pill — rather than
+    // wire-filter on it). Out of `jsonColumns` (a scalar integer).
+    "queue_jump",
   ],
   pk: "epic_id",
   version: "last_event_id",

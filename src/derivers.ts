@@ -318,6 +318,15 @@ export function parsePlanRef(ref: string | null): ParsedPlanRef | null {
  * `false` for read-only verbs and operational state writes (claim, block,
  * etc.). The flag drives creator/refiner classification downstream in
  * `src/plan-classifier.ts`.
+ *
+ * `queue_jump` (schema v30) mirrors the envelope's `queue_jump` field —
+ * server-derived from a `/plan:queue` scaffold event, ALWAYS present, defaults
+ * `false` whenever the envelope omits the key, has a non-boolean value, or is
+ * produced by an older planctl that predates the field. The `=== true`
+ * defensive check guarantees byte-identical re-fold determinism across the
+ * v29→v30 boundary: every legacy event folds to `queue_jump=false`. Projected
+ * to `epics.queue_jump` by `syncPlanctlLinks`; drives the `!`-prefix `sort_path`
+ * branch for root epics so queued work sorts atop the dashctl board.
  */
 export interface PlanctlInvocation {
   op: string;
@@ -325,6 +334,7 @@ export interface PlanctlInvocation {
   epic_id: string | null;
   task_id: string | null;
   subject_present: boolean;
+  queue_jump: boolean;
 }
 
 /**
@@ -429,8 +439,17 @@ export function extractPlanctlInvocation(
     typeof rawTarget === "string" ? rawTarget : null;
   const rawSubject = envObj.subject;
   const subject_present = rawSubject != null;
+  // Schema v30: lift the `/plan:queue` priority-jump signal from the envelope.
+  // Defensive `=== true` check (NOT `?? false` or truthiness) — anything else
+  // (absent, non-boolean, an object, the string "true", `1`, etc.) folds to
+  // `false`. This is what makes the v29→v30 re-fold byte-identical: every
+  // legacy event predating the field has no `queue_jump` key, so `envObj
+  // .queue_jump === true` evaluates `false` for ALL historical events. The
+  // ONLY way to land `queue_jump: true` is for the planctl CLI to have
+  // emitted the literal boolean `true` on the scaffold envelope.
+  const queue_jump = envObj.queue_jump === true;
   const refParsed = target !== null ? parsePlanRef(target) : null;
   const epic_id = refParsed?.epic_id ?? null;
   const task_id = refParsed?.kind === "task" ? refParsed.task_id : null;
-  return { op, target, epic_id, task_id, subject_present };
+  return { op, target, epic_id, task_id, subject_present, queue_jump };
 }

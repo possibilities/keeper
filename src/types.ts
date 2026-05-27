@@ -253,6 +253,23 @@ export interface Event {
    */
   planctl_subject_present: number | null;
   /**
+   * Schema v30: queue-jump signal lifted from the envelope's `queue_jump`
+   * boolean by {@link import("./derivers").extractPlanctlInvocation}. Stored
+   * as INTEGER (0/1) at the SQLite layer to match the schema column (SQLite
+   * has no native BOOLEAN — same convention as
+   * {@link planctl_subject_present}); lifted to JS boolean via `=== 1` at the
+   * read boundary. `1` ONLY when the envelope carried the literal boolean
+   * `true` on the `/plan:queue` scaffold path; `0` for every other planctl
+   * event (the deriver's `=== true` check folds absent / non-boolean / older
+   * envelope shapes to `0`). NULL when `planctl_op` is NULL.
+   *
+   * Projected to `epics.queue_jump` by `syncPlanctlLinks` in the same
+   * `BEGIN IMMEDIATE` transaction; root epics with `queue_jump = 1` get a
+   * `!`-prefix on their `sort_path` so they sort above all other root epics
+   * in the dashctl board's default ORDER BY.
+   */
+  planctl_queue_jump: number | null;
+  /**
    * Anthropic tool_use correlator string (`toolu_...`) pulled out of every
    * event payload's `data.tool_use_id` by
    * {@link import("./derivers").extractToolUseId}. Populated on every
@@ -703,12 +720,39 @@ export interface Epic {
    *
    * Survives an `EpicSnapshot` round-trip — `projectPlanRow` ON CONFLICT
    * carve-out preserves this column alongside `tasks` / `jobs` /
-   * `job_links` / `created_by_closer_of`. Empty string is also the schema
-   * zero-event default and the shell-INSERT placeholder during the
+   * `job_links` / `created_by_closer_of` / `queue_jump`. Empty string is also
+   * the schema zero-event default and the shell-INSERT placeholder during the
    * transient window between shell-insert and the next `syncPlanctlLinks`
    * call.
    */
   sort_path: string;
+  /**
+   * Schema v30: priority-jump flag projected from
+   * {@link Event.planctl_queue_jump} by `syncPlanctlLinks`. Stored as INTEGER
+   * (0/1) at the SQLite layer to match the schema column (SQLite has no
+   * native BOOLEAN — same convention as `planctl_subject_present` on the
+   * events side). `1` ONLY when the epic's session emitted at least one
+   * `planctl_invocation` envelope with `queue_jump: true` (today: the
+   * `/plan:queue` scaffold path); `0` for every other epic. Defaults `0` on
+   * the schema (`INTEGER NOT NULL DEFAULT 0`) so a fresh DB and every
+   * pre-v30 row read identical zero-event projection.
+   *
+   * Drives the `!`-prefix `sort_path` branch in `syncPlanctlLinks` and
+   * `cascadeSortPath`: a root epic (`created_by_closer_of IS NULL`) with
+   * `queue_jump = 1` projects `sort_path = "!" + zeroPad6(epic_number)`,
+   * so the `!` (ASCII 33) sorts strictly below the digits (ASCII 48-57)
+   * and lifts the epic above every non-queued root in the dashctl board's
+   * default ORDER BY. The prefix is propagated through `parentPath` string
+   * concat to all transitive closer-of descendants — no separate child-flag
+   * plumbing.
+   *
+   * Survives an `EpicSnapshot` round-trip — `projectPlanRow` ON CONFLICT
+   * carve-out preserves this column alongside `tasks` / `jobs` /
+   * `job_links` / `created_by_closer_of` / `sort_path`. Without the carve-out,
+   * an approval RPC → atomic file write → file-watcher → snapshot fold would
+   * wipe the envelope-derived flag back to `0` on every approval flip.
+   */
+  queue_jump: number;
 }
 
 /**

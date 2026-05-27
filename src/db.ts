@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 29;
+export const SCHEMA_VERSION = 30;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -294,7 +294,8 @@ CREATE TABLE IF NOT EXISTS events (
     planctl_task_id TEXT,
     planctl_subject_present INTEGER,
     tool_use_id TEXT,
-    config_dir TEXT
+    config_dir TEXT,
+    planctl_queue_jump INTEGER
 )
 `;
 
@@ -455,7 +456,8 @@ CREATE TABLE IF NOT EXISTS epics (
     job_links TEXT NOT NULL DEFAULT '[]',
     last_validated_at TEXT,
     created_by_closer_of TEXT,
-    sort_path TEXT NOT NULL DEFAULT ''
+    sort_path TEXT NOT NULL DEFAULT '',
+    queue_jump INTEGER NOT NULL DEFAULT 0
 )
 `;
 
@@ -2278,6 +2280,70 @@ function migrate(db: Database): void {
       db.run("DELETE FROM subagent_invocations");
     }
 
+    // v29→v30: thread the `/plan:queue` priority-jump signal through the
+    // existing planctl envelope → events sparse column → epics projection
+    // pipeline so root epics scaffolded via `/plan:queue` sort above all
+    // other root epics in the dashctl board.
+    //
+    // Two new columns:
+    //   - `events.planctl_queue_jump INTEGER` — sparse; mirrors the existing
+    //     `planctl_op` / `planctl_target` / `planctl_epic_id` / `planctl_task_id`
+    //     / `planctl_subject_present` five-column pattern. Lifted from
+    //     `data.tool_response.stdout`'s `planctl_invocation.queue_jump` boolean
+    //     by `extractPlanctlInvocation`. Stays NULL on every row whose
+    //     `planctl_op IS NULL`; stamped `0` / `1` whenever the envelope is
+    //     present. The deriver's `=== true` defensive check folds absent /
+    //     non-boolean / older-envelope shapes to `0`, which is what makes the
+    //     v29→v30 re-fold byte-identical: legacy events have no `queue_jump`
+    //     key, so they all fold to `0`.
+    //   - `epics.queue_jump INTEGER NOT NULL DEFAULT 0` — projected by
+    //     `syncPlanctlLinks` from the touched epic's events. Drives the
+    //     `!`-prefix `sort_path` branch for root epics (`created_by_closer_of
+    //     IS NULL`) so `sort_path = "!" + zeroPad6(epic_number)` lifts the
+    //     epic above every non-queued root under SQLite BINARY collation (`!`
+    //     is ASCII 33, strictly below the digits at 48-57). The prefix is
+    //     propagated through `parentPath` string concat to all transitive
+    //     closer-of descendants in `cascadeSortPath` — no separate child-flag
+    //     plumbing.
+    //
+    // Both column defs match `CREATE_EVENTS` / `CREATE_EPICS` so a fresh v30
+    // DB and a migrated v29→v30 DB converge to identical schema (the
+    // addColumnIfMissing/literal lockstep convention; mirrors the v28→v29
+    // pair-step shape one block up). SQLite has no native BOOLEAN; the column
+    // is INTEGER (0/1), matching the `planctl_subject_present` convention.
+    // No new index — the queue_jump signal is read off the planctl-event
+    // partial composite index (`(session_id, id) WHERE planctl_op IS NOT NULL`)
+    // already created by v14, since the column is only ever read inside the
+    // same per-session scan `syncPlanctlLinks` already runs.
+    addColumnIfMissing(db, "events", "planctl_queue_jump", "INTEGER");
+    addColumnIfMissing(db, "epics", "queue_jump", "INTEGER NOT NULL DEFAULT 0");
+
+    // Rewind-and-redrain — same shape as v28→v29 one block up. The
+    // `events.planctl_queue_jump` column is derived from the immutable event
+    // log (the envelope's `queue_jump` boolean lifted by `extractPlanctlInvocation`)
+    // and `epics.queue_jump` is projected from it via `syncPlanctlLinks`. A
+    // re-fold from cursor=0 under the new deriver + new projection rebuilds
+    // both byte-deterministically. Version-guarded mirrors prior rewinds:
+    // re-open of an already-migrated v30+ DB skips the block. The boot drain
+    // after migrate() returns rebuilds `jobs` / `epics` / `subagent_invocations`
+    // from the event log with the new field everywhere; legacy events fold to
+    // `0` via the deriver's `=== true` check (their envelope has no
+    // `queue_jump` key) so the post-rewind projection carries the new shape
+    // with the right semantic content.
+    const storedVersionV30 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV30 < 30) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM subagent_invocations");
+    }
+
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(String(SCHEMA_VERSION));
@@ -2312,13 +2378,13 @@ function prepareStmts(db: Database): Stmts {
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
         planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-        planctl_subject_present, tool_use_id, config_dir
+        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
         $subagent_agent_id, $spawn_name, $start_time, $slash_command, $skill_name,
         $planctl_op, $planctl_target, $planctl_epic_id, $planctl_task_id,
-        $planctl_subject_present, $tool_use_id, $config_dir
+        $planctl_subject_present, $tool_use_id, $config_dir, $planctl_queue_jump
       )
     `),
     selectWorldRev: db.prepare(

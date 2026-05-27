@@ -551,24 +551,26 @@ function projectPlanRow(db: Database, event: Event): void {
 
   if (event.hook_event === "EpicSnapshot") {
     // The ON CONFLICT update lists ONLY scalar columns and NEVER `tasks` /
-    // `jobs` / `job_links` / `created_by_closer_of` / `sort_path`: an epic
-    // snapshot carries no task, job, job-link, OR closer-derivation data,
-    // and a shell row inserted by a task-before-epic TaskSnapshot, a
-    // job-before-epic `syncJobIntoEpic`, or a planctl-event-before-epic
+    // `jobs` / `job_links` / `created_by_closer_of` / `sort_path` /
+    // `queue_jump`: an epic snapshot carries no task, job, job-link,
+    // closer-derivation, OR queue-jump data, and a shell row inserted by
+    // a task-before-epic TaskSnapshot, a job-before-epic
+    // `syncJobIntoEpic`, or a planctl-event-before-epic
     // `syncPlanctlLinks` already holds those columns (the planctl-event
-    // shell stamps `job_links` real and leaves the two new schema-v29
-    // closer columns at NULL / '' for the next `syncPlanctlLinks` call to
-    // compute). INSERT defaults all five to schema defaults (`'[]'`,
-    // `NULL`, `''`), so the first-sight epic reads empties and a later
-    // epic snapshot can never clobber them. The `job_links` /
-    // `created_by_closer_of` / `sort_path` carve-out is mandatory: without
-    // it, an approval RPC → atomic file write → file-watcher →
-    // EpicSnapshot fold would wipe the creator/refiner provenance
-    // projection (schema v14) AND the closer-creator link + materialized-
-    // path sort key (schema v29) on every approval flip.
+    // shell stamps `job_links` real and leaves the schema-v29 closer
+    // columns + the schema-v30 queue-jump column at NULL / '' / 0 for
+    // the next `syncPlanctlLinks` call to compute). INSERT defaults all
+    // six to schema defaults (`'[]'`, `NULL`, `''`, `0`), so the
+    // first-sight epic reads empties and a later epic snapshot can never
+    // clobber them. The `job_links` / `created_by_closer_of` /
+    // `sort_path` / `queue_jump` carve-out is mandatory: without it, an
+    // approval RPC → atomic file write → file-watcher → EpicSnapshot fold
+    // would wipe the creator/refiner provenance projection (schema v14)
+    // AND the closer-creator link + materialized-path sort key (schema
+    // v29) AND the priority-jump flag (schema v30) on every approval flip.
     db.run(
-      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_validated_at, last_event_id, updated_at, created_by_closer_of, sort_path)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '')
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_validated_at, last_event_id, updated_at, created_by_closer_of, sort_path, queue_jump)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 0)
        ON CONFLICT(epic_id) DO UPDATE SET
          epic_number = excluded.epic_number,
          title = excluded.title,
@@ -608,14 +610,25 @@ function projectPlanRow(db: Database, event: Event): void {
     // epics can inherit a non-empty parent path. This is the "parent's
     // EpicSnapshot triggers cascade re-stamp" behaviour — an EpicSnapshot for
     // a root epic unblocks the chain without requiring a planctl event.
+    //
+    // Schema v30: also read `queue_jump` off the existing row (the ON
+    // CONFLICT carve-out above preserves it across snapshot folds) and
+    // prepend `!` to the path for ROOT epics whose `queue_jump = 1`. A
+    // non-root queue-jumped epic inherits its parent's path verbatim — the
+    // root parent's `!`-prefix propagates through the `parentPath` string
+    // concat for free (no double-prefix risk). The `!` (ASCII 33) sorts
+    // strictly below the digits (ASCII 48-57) under SQLite BINARY collation,
+    // so a queue-jumped root lifts above every non-queued root in the
+    // dashctl board's default ORDER BY.
     const spRow = db
       .query(
-        "SELECT epic_number, created_by_closer_of, sort_path FROM epics WHERE epic_id = ?",
+        "SELECT epic_number, created_by_closer_of, sort_path, queue_jump FROM epics WHERE epic_id = ?",
       )
       .get(entityId) as {
       epic_number: number | null;
       created_by_closer_of: string | null;
       sort_path: string;
+      queue_jump: number;
     } | null;
     if (spRow != null && spRow.sort_path === "" && spRow.epic_number != null) {
       const ownNumber = spRow.epic_number;
@@ -623,7 +636,12 @@ function projectPlanRow(db: Database, event: Event): void {
       if (ownNumber >= 1_000_000) {
         derivedPath = "";
       } else if (spRow.created_by_closer_of == null) {
-        derivedPath = zeroPad6(ownNumber);
+        // Root: stamp `!`-prefix when queue_jump=1; plain zero-padded
+        // epic_number otherwise.
+        derivedPath =
+          spRow.queue_jump === 1
+            ? `!${zeroPad6(ownNumber)}`
+            : zeroPad6(ownNumber);
       } else {
         const parentRow = db
           .query("SELECT sort_path FROM epics WHERE epic_id = ?")
@@ -2183,11 +2201,13 @@ function syncJobLinksOnJobWrite(
       // No epic row yet — shell-insert. Mirrors the shell-insert in
       // `syncPlanctlLinks`'s touched-epic loop; the EpicSnapshot ON
       // CONFLICT carve-out preserves `job_links` /
-      // `created_by_closer_of` / `sort_path` so a later snapshot fold
-      // cannot wipe the enriched payload OR the schema-v29 closer
-      // columns. Both new columns default to `NULL` / `''` (the schema
-      // zero-event reading); the next `syncPlanctlLinks` call computes
-      // the real values.
+      // `created_by_closer_of` / `sort_path` / `queue_jump` so a later
+      // snapshot fold cannot wipe the enriched payload OR the
+      // schema-v29 closer columns OR the schema-v30 queue-jump flag.
+      // All three new columns default to `NULL` / `''` / `0` (the
+      // schema zero-event reading); the next `syncPlanctlLinks` call
+      // computes the real values. `queue_jump` is omitted from the
+      // column list so SQLite fills `INTEGER NOT NULL DEFAULT 0`.
       db.run(
         `INSERT INTO epics (
            epic_id, epic_number, title, project_dir, status,
@@ -2391,6 +2411,11 @@ function syncPlanctlLinks(
         subject_present: r.planctl_subject_present === 1,
       })),
     );
+    // Schema v30: queue_jump is NOT part of the ClassifierInvocation shape
+    // (the classifier doesn't need it — it's a per-epic flag, not a per-
+    // invocation classification signal). We read it below per-touched-epic
+    // off the events sparse column directly, gated by the same
+    // `planctl_op IS NOT NULL` partial index.
     const sidOpenerRows = db
       .query(
         `SELECT ts
@@ -2493,6 +2518,35 @@ function syncPlanctlLinks(
       .query("SELECT epic_number FROM epics WHERE epic_id = ?")
       .get(epicId) as { epic_number: number | null } | null;
     const ownNumber = ownRow?.epic_number ?? 0;
+
+    // Schema v30: derive `queue_jump` for this epic. Scan THIS epic's
+    // session events for any planctl_invocation envelope that carried
+    // `queue_jump: true` (today: the `/plan:queue` scaffold path). The
+    // signal is sticky-true: any single envelope flipping it to `1`
+    // locks the epic into queued state for the lifetime of the
+    // projection. There is no `/plan:unqueue` path — removing a queued
+    // epic requires deleting the epic outright. A re-fold replays the
+    // same envelopes in the same order, so the EXISTS branch is
+    // byte-deterministic.
+    //
+    // The scan keys off `planctl_epic_id = <this epicId>` (the parsed-
+    // out epic side of `planctl_target`). The `(session_id, id) WHERE
+    // planctl_op IS NOT NULL` partial composite index from schema v14
+    // serves this filter cheaply since `planctl_epic_id` is itself
+    // guaranteed non-NULL whenever `planctl_op` is non-NULL AND the
+    // target parsed as a planctl ref.
+    const queueJumpRow = db
+      .query(
+        `SELECT EXISTS(
+           SELECT 1 FROM events
+            WHERE planctl_op IS NOT NULL
+              AND planctl_epic_id = ?
+              AND planctl_queue_jump = 1
+         ) AS hit`,
+      )
+      .get(epicId) as { hit: number };
+    const queueJump = queueJumpRow.hit === 1 ? 1 : 0;
+
     let sortPath: string;
     if (ownNumber >= 1_000_000) {
       // Overflow guard — width=6 can't represent this monotonic id; the
@@ -2503,7 +2557,13 @@ function syncPlanctlLinks(
       );
       sortPath = "";
     } else if (createdByCloserOf == null) {
-      sortPath = zeroPad6(ownNumber);
+      // Root epic. Schema v30: prepend `!` when queue_jump=1 so this
+      // epic sorts strictly above every non-queued root under SQLite
+      // BINARY collation (`!` = ASCII 33 < digits 48-57). Multiple
+      // queue-jumped roots sort FIFO by epic_number under the shared
+      // `!` prefix — no tiebreaker math.
+      sortPath =
+        queueJump === 1 ? `!${zeroPad6(ownNumber)}` : zeroPad6(ownNumber);
     } else {
       const parentRow = db
         .query("SELECT sort_path FROM epics WHERE epic_id = ?")
@@ -2512,8 +2572,17 @@ function syncPlanctlLinks(
       if (parentPath === "") {
         // Parent missing / placeholder — fall back to root-level position.
         // The cascade re-stamps when the parent later resolves.
+        // Schema v30: a non-root queue-jumped epic in placeholder state
+        // does NOT get the `!`-prefix; once the parent resolves the
+        // cascade re-stamps with the inherited prefix from `parentPath`.
         sortPath = zeroPad6(ownNumber);
       } else {
+        // Non-root: inherit parent's path verbatim. If the parent (root
+        // or transitive ancestor) carries the `!`-prefix, it propagates
+        // through this string concat for free — no separate child-flag
+        // plumbing. A non-root queue-jumped epic still projects
+        // `queue_jump = 1` for symmetry (the row knows its own state)
+        // but does NOT prepend a second `!`.
         sortPath = `${parentPath}.${zeroPad6(ownNumber)}`;
       }
     }
@@ -2522,29 +2591,48 @@ function syncPlanctlLinks(
       .query("SELECT epic_id FROM epics WHERE epic_id = ?")
       .get(epicId) as { epic_id: string } | null;
     if (epicExists != null) {
-      // Extend the existing UPDATE to also set the two new schema-v29
-      // columns in the same statement.
+      // Extend the existing UPDATE to also set the schema-v29 columns
+      // AND the schema-v30 `queue_jump` column in the same statement.
       db.run(
-        "UPDATE epics SET job_links = ?, created_by_closer_of = ?, sort_path = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
-        [jobLinksJson, createdByCloserOf, sortPath, eventId, ts, epicId],
+        "UPDATE epics SET job_links = ?, created_by_closer_of = ?, sort_path = ?, queue_jump = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+        [
+          jobLinksJson,
+          createdByCloserOf,
+          sortPath,
+          queueJump,
+          eventId,
+          ts,
+          epicId,
+        ],
       );
     } else {
       // Shell-insert: no epic row yet. Scalars default to NULL / "[]"
       // matching the schema's zero-event reading. A later EpicSnapshot
       // fills the scalars; the ON CONFLICT carve-out preserves
-      // job_links / jobs / tasks / created_by_closer_of / sort_path. The
-      // two schema-v29 columns are stamped with the JUST-DERIVED values
-      // (typically `created_by_closer_of` is real but `sort_path` is the
-      // placeholder `zeroPad6(0) = "000000"` since no `epic_number` is
-      // known yet — the next `syncPlanctlLinks` call, post-EpicSnapshot,
-      // recomputes against the now-visible `epic_number`).
+      // job_links / jobs / tasks / created_by_closer_of / sort_path /
+      // queue_jump. The schema-v29 + v30 columns are stamped with the
+      // JUST-DERIVED values (typically `created_by_closer_of` is real
+      // but `sort_path` is the placeholder `zeroPad6(0) = "000000"` since
+      // no `epic_number` is known yet — the next `syncPlanctlLinks`
+      // call, post-EpicSnapshot, recomputes against the now-visible
+      // `epic_number`; the `queue_jump` value is locked-in true on
+      // first observation since the scan reads it from the immutable
+      // event log).
       db.run(
         `INSERT INTO epics (
            epic_id, epic_number, title, project_dir, status,
            last_event_id, updated_at, tasks, jobs, job_links,
-           created_by_closer_of, sort_path
-         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?, ?, ?)`,
-        [epicId, eventId, ts, jobLinksJson, createdByCloserOf, sortPath],
+           created_by_closer_of, sort_path, queue_jump
+         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?, ?, ?, ?)`,
+        [
+          epicId,
+          eventId,
+          ts,
+          jobLinksJson,
+          createdByCloserOf,
+          sortPath,
+          queueJump,
+        ],
       );
     }
 
@@ -2580,6 +2668,16 @@ function syncPlanctlLinks(
  * if parent's `sort_path === ''` — the placeholder case). Same overflow
  * guard as in {@link syncPlanctlLinks}: `epic_number >= 1_000_000` folds
  * to `sort_path = ''` and notes.
+ *
+ * Schema v30: the `!`-prefix queue-jump signal propagates through the
+ * `parentPath` string concat for free. If the root epic carries
+ * `sort_path = "!000003"`, the BFS reads that string off the `epics` row
+ * and composes `"!000003.000007"` for each child — the cascade has NO
+ * separate queue_jump awareness because the prefix is already baked into
+ * the parent path string. `queue_jump` itself (the projection column) is
+ * NOT re-stamped here: children carry their OWN queue-jump state set by
+ * `syncPlanctlLinks` on their own session's events, independent of the
+ * root's state. Cascading only touches `sort_path`, never `queue_jump`.
  */
 function cascadeSortPath(
   db: Database,
