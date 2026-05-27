@@ -102,6 +102,10 @@ interface DispatchEntry {
   command?: string;
   message?: string;
   dry?: boolean;
+  // Stamped at logDispatch time; lets future post-mortems correlate a
+  // dispatch.log row to a specific autopilot process without grepping
+  // sidecar mtimes. Frames don't render this field.
+  pid?: number;
 }
 
 // --- command rendering (module-scope so test/autopilot.test.ts can import) ---
@@ -366,9 +370,10 @@ async function main(): Promise<void> {
   }
 
   function logDispatch(entry: DispatchEntry): void {
-    dispatchLog.push(entry);
+    const stamped: DispatchEntry = { ...entry, pid: process.pid };
+    dispatchLog.push(stamped);
     try {
-      appendFileSync(dispatchLogPath, `${JSON.stringify(entry)}\n`);
+      appendFileSync(dispatchLogPath, `${JSON.stringify(stamped)}\n`);
     } catch (err) {
       noteLine(`# warn: dispatch log write failed: ${(err as Error).message}`);
     }
@@ -497,6 +502,59 @@ async function main(): Promise<void> {
    * line — the worker is what we want spawned; the approval step stays
    * the human's prerogative (and is what notifyctl alerts about).
    */
+  // Silent instrumentation: every verdict-signature edge is appended to the
+  // lifecycle sidecar so future post-mortems can reconstruct the prev → cur
+  // sequence. Compact one-liner shape (sortable, greppable):
+  //   <iso-ts> transition pid=<pid> <key> <prev> → <cur> | <detail>
+  // <detail> carries the row-state fields that drive predicates 5/6/7:
+  // approval, worker_phase (task) / status (close), jobs.length, and the
+  // count of running sub-agents for the row's worker jobs.
+  function logTransition(
+    key: string,
+    prev: string | undefined,
+    cur: string,
+    detail: string,
+  ): void {
+    noteLine(
+      `${new Date().toISOString()} transition pid=${process.pid} ${key} ${prev ?? "∅"} → ${cur} | ${detail}`,
+    );
+  }
+
+  function taskDetail(
+    task: ReadinessClientSnapshot["epics"][number]["tasks"][number],
+    snap: ReadinessClientSnapshot,
+  ): string {
+    const subRunByJob = new Map<string, number>();
+    for (const inv of snap.subagentInvocations) {
+      if (inv.status === "running") {
+        subRunByJob.set(inv.job_id, (subRunByJob.get(inv.job_id) ?? 0) + 1);
+      }
+    }
+    const jobs = Array.isArray(task.jobs) ? task.jobs : [];
+    let subRun = 0;
+    for (const j of jobs) {
+      subRun += subRunByJob.get(seg(j.job_id)) ?? 0;
+    }
+    const jobStates = jobs.map((j) => seg(j.state)).join(",");
+    return `approval=${seg(task.approval)} worker_phase=${seg(task.worker_phase)} jobs=${jobs.length}[${jobStates}] sub_running=${subRun}`;
+  }
+
+  function closeDetail(epic: Epic, snap: ReadinessClientSnapshot): string {
+    const subRunByJob = new Map<string, number>();
+    for (const inv of snap.subagentInvocations) {
+      if (inv.status === "running") {
+        subRunByJob.set(inv.job_id, (subRunByJob.get(inv.job_id) ?? 0) + 1);
+      }
+    }
+    const jobs = Array.isArray(epic.jobs) ? epic.jobs : [];
+    let subRun = 0;
+    for (const j of jobs) {
+      subRun += subRunByJob.get(seg(j.job_id)) ?? 0;
+    }
+    const jobStates = jobs.map((j) => seg(j.state)).join(",");
+    return `approval=${seg(epic.approval)} status=${seg(epic.status)} jobs=${jobs.length}[${jobStates}] sub_running=${subRun}`;
+  }
+
   function processLaunchTransitions(snap: ReadinessClientSnapshot): void {
     for (const epic of snap.epics) {
       const projectDir = seg(epic.project_dir);
@@ -513,6 +571,7 @@ async function main(): Promise<void> {
         if (prev === cur) {
           continue;
         }
+        logTransition(key, prev, cur, taskDetail(task, snap));
         lastVerdictSig.set(key, cur);
         if (cur === "ready") {
           const dir =
@@ -539,6 +598,7 @@ async function main(): Promise<void> {
       if (closePrev === closeCur) {
         continue;
       }
+      logTransition(closeKey, closePrev, closeCur, closeDetail(epic, snap));
       lastVerdictSig.set(closeKey, closeCur);
       if (closeCur === "ready") {
         const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
@@ -552,7 +612,32 @@ async function main(): Promise<void> {
     }
   }
 
+  let firstPaintLogged = false;
   const onSnapshot = (snap: ReadinessClientSnapshot): void => {
+    if (!firstPaintLogged) {
+      firstPaintLogged = true;
+      const ready: string[] = [];
+      const pending: string[] = [];
+      for (const epic of snap.epics) {
+        for (const task of Array.isArray(epic.tasks) ? epic.tasks : []) {
+          const sig = verdictSignature(
+            snap.readiness.perTask.get(seg(task.task_id)),
+          );
+          if (sig === "ready") ready.push(`task:${seg(task.task_id)}`);
+          else if (sig === "blocked:job-pending")
+            pending.push(`task:${seg(task.task_id)}`);
+        }
+        const cSig = verdictSignature(
+          snap.readiness.perCloseRow.get(seg(epic.epic_id)),
+        );
+        if (cSig === "ready") ready.push(`close:${seg(epic.epic_id)}`);
+        else if (cSig === "blocked:job-pending")
+          pending.push(`close:${seg(epic.epic_id)}`);
+      }
+      noteLine(
+        `${new Date().toISOString()} first-paint pid=${process.pid} epics=${snap.epics.length} ready=[${ready.join(",")}] pending=[${pending.join(",")}]`,
+      );
+    }
     processLaunchTransitions(snap);
     emitFrame();
   };
