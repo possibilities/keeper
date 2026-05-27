@@ -257,7 +257,36 @@ Keeper has no `install` verb. Wire it up manually:
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.plist
    ```
 
-7. **Verify** the agent is loaded and the projection is live:
+   **Upgrade-from-pre-trace-gate note:** if you are re-bootstrapping over an
+   existing install whose `server.stderr` predates the `KEEPER_TRACE_SERVER`
+   gate (the file may be hundreds of megabytes of `[srv-ts]` lines), run this
+   one-time truncate FIRST to reclaim the disk space:
+
+   ```sh
+   truncate -s 0 ~/.local/state/keeper/server.stderr
+   ```
+
+   This is the only manual operator action required by the trace-gate upgrade;
+   normal runtime growth is now bounded by the rare `[server-worker]` error
+   class plus the weekly rotation sidecar (next step).
+
+7. **Install the rotation sidecar** so `server.stderr` doesn't grow unbounded
+   over weeks even with `KEEPER_TRACE_SERVER=0`:
+
+   ```sh
+   cp plist/arthack.keeperd.logrotate.plist ~/Library/LaunchAgents/
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
+   ```
+
+   The sidecar is a user-LaunchAgent that runs Sunday 04:00 weekly,
+   `truncate`s `server.stderr`, and `launchctl kickstart`s the daemon so the
+   new process opens a fresh fd at offset 0. macOS `newsyslog` is not used
+   (it needs SIGHUP-reopen or daemon termination per rotation — neither is
+   wired up). Weekly daemon restart is the cost; expect a one-time
+   reconnect across your subscribe clients each Sunday at 04:00. Inspect with
+   `launchctl print gui/$(id -u)/arthack.keeperd.logrotate`.
+
+8. **Verify** the agent is loaded and the projection is live:
 
    ```sh
    launchctl print gui/$(id -u)/arthack.keeperd | head
@@ -270,7 +299,13 @@ Keeper has no `install` verb. Wire it up manually:
 
    The subscribe server binds a Unix-domain socket at
    `~/.local/state/keeper/keeperd.sock` by default (a sibling of `keeper.db`).
-   Override the path with the `KEEPER_SOCK` environment variable. Three example
+   Override the path with the `KEEPER_SOCK` environment variable. Set
+   `KEEPER_TRACE_SERVER=1` to enable verbose server-worker diagnostic logging
+   — `[srv-ts]` stage timings, frame byte counts, connection lifecycle — on
+   `server.stderr`; off by default (the rare `[server-worker]` error class is
+   always logged). The plist's `EnvironmentVariables` block carries
+   `KEEPER_TRACE_SERVER=0`; flip to `1` then
+   `launchctl kickstart -k gui/$UID/arthack.keeperd` to enable. Three example
    clients ship in `scripts/` — `board.ts` and `autopilot.ts` (subscribe;
    both go through `src/readiness-client.ts`) and `approve.ts` (RPC) —
    see [Example clients](#example-clients).

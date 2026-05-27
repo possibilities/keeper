@@ -35,6 +35,15 @@
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
 		<!--
+		  Verbose server-worker diagnostic logging. Default `0` (off) writes
+		  only the rare `[server-worker]` error class to server.stderr. Flip
+		  to `1` and `launchctl kickstart -k gui/$UID/arthack.keeperd` to
+		  enable `[srv-ts]` stage timings, frame byte counts, and connection
+		  lifecycle on stderr. Read once at worker module load.
+		-->
+		<key>KEEPER_TRACE_SERVER</key>
+		<string>0</string>
+		<!--
 		  The subscribe server's UDS defaults to keeperd.sock in the state dir
 		  below (sibling of StandardOutPath / keeper.db). Uncomment to override:
 		  <key>KEEPER_SOCK</key>

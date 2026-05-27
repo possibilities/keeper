@@ -1615,3 +1615,75 @@ test("diffTick backpressure: a pending conn gets no meta and does NOT advance; n
   expect(sock.data.lastTotal).toBe(2);
   db.close();
 });
+
+// ---------------------------------------------------------------------------
+// KEEPER_TRACE_SERVER gate (subprocess: module-level `const TRACE` reads
+// `process.env` exactly once at import, so each test spawns a fresh Bun
+// subprocess that boots a server-worker with the env var set/unset, opens a
+// UDS connection (which exercises the `open` srvTs call site), then exits.
+// stderr is captured and asserted on.)
+// ---------------------------------------------------------------------------
+
+async function runTraceGateChild(env: Record<string, string>): Promise<string> {
+  const childDb = join(tmpDir, "trace.db");
+  const childSock = join(tmpDir, "trace.sock");
+  const childLock = join(tmpDir, "trace.lock");
+  openDb(childDb).db.close();
+  const script = `
+    import { openDb } from ${JSON.stringify(join(import.meta.dir, "../src/db"))};
+    import { startServer } from ${JSON.stringify(join(import.meta.dir, "../src/server-worker"))};
+    const { db } = openDb(${JSON.stringify(childDb)}, { readonly: true });
+    const server = startServer(db, ${JSON.stringify(childSock)}, ${JSON.stringify(childLock)});
+    const sock = await Bun.connect({ unix: ${JSON.stringify(childSock)}, socket: { data() {}, error() {} } });
+    // Give the server's open() handler a tick to run.
+    await Bun.sleep(50);
+    sock.end();
+    await Bun.sleep(50);
+    server.stop();
+    db.close();
+  `;
+  const proc = Bun.spawn({
+    cmd: ["bun", "--eval", script],
+    env: { ...process.env, ...env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stderr] = await Promise.all([
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return stderr;
+}
+
+test("KEEPER_TRACE_SERVER unset: no [srv-ts] lines on stderr", async () => {
+  const stderr = await runTraceGateChild({ KEEPER_TRACE_SERVER: "" });
+  expect(stderr.includes("[srv-ts]")).toBe(false);
+}, 10_000);
+
+test("KEEPER_TRACE_SERVER=1: [srv-ts] conn open line appears on stderr", async () => {
+  const stderr = await runTraceGateChild({ KEEPER_TRACE_SERVER: "1" });
+  expect(stderr.includes("[srv-ts]")).toBe(true);
+  expect(/\[srv-ts\] T=\d+ conn \d+ open/.test(stderr)).toBe(true);
+}, 10_000);
+
+test("all srvTs( call sites are gated by if (TRACE) (source-level lint)", () => {
+  const src = readFileSync(
+    join(import.meta.dir, "../src/server-worker.ts"),
+    "utf8",
+  );
+  const lines = src.split("\n");
+  // Find every srvTs( occurrence outside the function definition itself and
+  // verify it's reached only via `if (TRACE)` — either same-line prefix or
+  // the immediately preceding line. The grep over the file is documented in
+  // the task spec as the regression check; this test bakes it in.
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.includes("srvTs(")) continue;
+    // Skip the function definition line itself.
+    if (line.includes("function srvTs(")) continue;
+    const sameLine = line.includes("if (TRACE)");
+    const prev = i > 0 ? lines[i - 1] : "";
+    const prevLine = prev.trimEnd().endsWith("if (TRACE)");
+    expect(sameLine || prevLine).toBe(true);
+  }
+});

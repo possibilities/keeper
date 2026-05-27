@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent SIDECAR for the keeper reducer daemon (keeperd).
+
+  macOS log rotation is `newsyslog`, not logrotate, and newsyslog requires
+  either a daemon SIGHUP-reopen (keeperd has none) or termination on each
+  rotation. Rather than build SIGHUP plumbing, this sidecar truncates
+  `server.stderr` in-place and `launchctl kickstart`s the daemon weekly.
+  After kickstart, the new daemon process opens a fresh fd at offset 0 —
+  so the truncate-then-kickstart order matters and is chained with `&&`
+  in one shell invocation: a failed truncate aborts the kickstart, which
+  is the safer failure mode.
+
+  Cadence: Sunday 04:00 weekly. The weekly restart cost is acceptable;
+  the operator-visible restart is announced in README.md's install section.
+
+  Install:
+    cp plist/arthack.keeperd.logrotate.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
+
+  Failures are observable via:
+    launchctl print gui/$UID/arthack.keeperd.logrotate
+
+  (No StandardOutPath / StandardErrorPath here — output goes to the user's
+  default launchd log, which is the right place for a rare scheduled job.)
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>arthack.keeperd.logrotate</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>truncate -s 0 "$HOME/.local/state/keeper/server.stderr" &amp;&amp; launchctl kickstart -k gui/$UID/arthack.keeperd</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Weekday</key>
+		<integer>0</integer>
+		<key>Hour</key>
+		<integer>4</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>RunAtLoad</key>
+	<false/>
+</dict>
+</plist>

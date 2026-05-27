@@ -127,10 +127,14 @@ export const MAX_LIMIT = 500;
 //
 // Diagnostic-only logs for chasing the "epics frame takes 5s sometimes" bug.
 // Every line is `[srv-ts] T=<epochMs> <event>` so a client log emitting the
-// same wall-clock can be diffed against it. Connection lifecycle is always
-// logged; per-call dispatch/tick timings are gated by a duration threshold
-// so the steady-state poll doesn't drown the log. Remove once the bug
-// is understood.
+// same wall-clock can be diffed against it. Connection lifecycle and
+// per-call dispatch/tick timings are gated by `KEEPER_TRACE_SERVER=1` AT
+// THE CALL SITE — not inside `srvTs` — because the caller's template-literal
+// `msg` argument allocates before any in-function gate would fire. Read the
+// env var exactly once at module load into a `const`; V8/JSC elides the
+// `if (TRACE)` branch in steady-state when off. The rare `[server-worker]`
+// error class stays UN-gated.
+const TRACE = process.env.KEEPER_TRACE_SERVER === "1";
 let __nextConnId = 0;
 function srvTs(msg: string): void {
   console.error(`[srv-ts] T=${Date.now()} ${msg}`);
@@ -1118,9 +1122,10 @@ export async function pollLoop(
     if (_sleepActual > interval + 100) {
       // The event loop didn't wake us on time — something held it. Likely the
       // smoking gun for the "epics frame takes 5s" bug.
-      srvTs(
-        `poll-loop sleep overrun: requested=${interval}ms actual=${_sleepActual}ms`,
-      );
+      if (TRACE)
+        srvTs(
+          `poll-loop sleep overrun: requested=${interval}ms actual=${_sleepActual}ms`,
+        );
     }
     if (isShutdown()) {
       break;
@@ -1132,7 +1137,7 @@ export async function pollLoop(
       diffTick(db, getConns());
       const _tickDur = Date.now() - _tickStart;
       if (_tickDur >= 20) {
-        srvTs(`poll-loop diffTick duration=${_tickDur}ms`);
+        if (TRACE) srvTs(`poll-loop diffTick duration=${_tickDur}ms`);
       }
     }
   }
@@ -1199,23 +1204,23 @@ export function startServer(
         socket.data = newConnState();
         socket.data.id = ++__nextConnId;
         conns.add(socket as unknown as Writable);
-        srvTs(`conn ${socket.data.id} open`);
+        if (TRACE) srvTs(`conn ${socket.data.id} open`);
       },
       data(socket, chunk) {
         const id = socket.data.id ?? -1;
-        srvTs(`conn ${id} data chunk=${chunk.length}`);
+        if (TRACE) srvTs(`conn ${id} data chunk=${chunk.length}`);
         const t0 = Date.now();
         handleData(db, socket, chunk, writerDb);
         const dur = Date.now() - t0;
         if (dur >= 5) {
-          srvTs(`conn ${id} handleData duration=${dur}ms`);
+          if (TRACE) srvTs(`conn ${id} handleData duration=${dur}ms`);
         }
       },
       drain(socket) {
         resumePending(socket as unknown as Writable);
       },
       close(socket) {
-        srvTs(`conn ${socket.data.id ?? -1} close`);
+        if (TRACE) srvTs(`conn ${socket.data.id ?? -1} close`);
         // Drop the connection from the fan-out set, then release per-connection
         // state; nothing process-global to release here.
         conns.delete(socket as unknown as Writable);
@@ -1325,16 +1330,17 @@ function handleData(
     const _id = socket.data.id ?? -1;
     const _collTag = _collection ? ` coll=${_collection}` : "";
     if (_frameType === "query" || _dispatchDur >= 5) {
-      srvTs(
-        `conn ${_id} dispatch type=${_frameType}${_collTag} duration=${_dispatchDur}ms frames=${frames.length}`,
-      );
+      if (TRACE)
+        srvTs(
+          `conn ${_id} dispatch type=${_frameType}${_collTag} duration=${_dispatchDur}ms frames=${frames.length}`,
+        );
     }
     if (frames.length > 0) {
       const _writeStart = Date.now();
       writeFrames(w, frames);
       const _writeDur = Date.now() - _writeStart;
       if (_writeDur >= 5) {
-        srvTs(`conn ${_id} writeFrames duration=${_writeDur}ms`);
+        if (TRACE) srvTs(`conn ${_id} writeFrames duration=${_writeDur}ms`);
       }
     }
   }
