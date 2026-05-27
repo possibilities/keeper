@@ -724,7 +724,7 @@ test("subscribeReadiness: Path B (1–5 s) — slow-flight latches once, timeout
   }
 });
 
-test("subscribeReadiness: Path C — reconnect clears slow-flight state, fresh window emits cleanly", () => {
+test("subscribeReadiness: Path C — reconnect clears slow-flight state, fresh window emits cleanly", async () => {
   const harness = installTimerHarness();
   try {
     let connectCount = 0;
@@ -807,43 +807,32 @@ test("subscribeReadiness: Path C — reconnect clears slow-flight state, fresh w
     sock1.closeFromServer();
     // Yield so the awaited connect() resolves and the next `connectOnce`
     // can run.
-    return new Promise<void>((resolve) => {
-      queueMicrotask(() => {
-        try {
-          expect(connectCount).toBe(2);
-          const sock2 = socketRefs[1]?.current;
-          if (!sock2) {
-            throw new Error("mock socket #2 never installed");
-          }
-          sock2.takeOutbound();
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
 
-          // Fresh window: advance another 1001 ms and poll — slow-flight
-          // latch must have been cleared by `teardownConnection`, so we
-          // get a brand-new emit per state.
-          const slowCountBefore = lifecycle.filter(
-            (e) => e.event === "query_slow_flight",
-          ).length;
-          harness.advance(1001);
-          harness.pollHandler()();
-          const slowCountAfter = lifecycle.filter(
-            (e) => e.event === "query_slow_flight",
-          ).length;
-          // Three collections in the new window, three fresh emits.
-          expect(slowCountAfter - slowCountBefore).toBe(3);
+    expect(connectCount).toBe(2);
+    const sock2 = socketRefs[1]?.current;
+    if (!sock2) {
+      throw new Error("mock socket #2 never installed");
+    }
+    sock2.takeOutbound();
 
-          handle.dispose();
-          resolve();
-        } catch (err) {
-          handle.dispose();
-          throw err;
-        }
-      });
-    }).finally(() => {
-      harness.restore();
-    });
-  } catch (err) {
+    // Fresh window: advance another 1001 ms and poll — slow-flight
+    // latch must have been cleared by `teardownConnection`, so we
+    // get a brand-new emit per state.
+    const slowCountBefore = lifecycle.filter(
+      (e) => e.event === "query_slow_flight",
+    ).length;
+    harness.advance(1001);
+    harness.pollHandler()();
+    const slowCountAfter = lifecycle.filter(
+      (e) => e.event === "query_slow_flight",
+    ).length;
+    // Three collections in the new window, three fresh emits.
+    expect(slowCountAfter - slowCountBefore).toBe(3);
+
+    handle.dispose();
+  } finally {
     harness.restore();
-    throw err;
   }
 });
 
