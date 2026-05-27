@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-622-contention-review-tier-1-fix-pack",
   "bundles": [],
   "closer_done_at": "2026-05-27T18:55:50.645928Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-27T18:55:50.645928Z"
+  "updated_at": "2026-05-27T18:56:28.122094Z"
 }
