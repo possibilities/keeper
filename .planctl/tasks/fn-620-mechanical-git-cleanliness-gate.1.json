@@ -1,0 +1,12 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-27T05:17:36.827446Z",
+  "depends_on": [],
+  "epic": "fn-620-mechanical-git-cleanliness-gate",
+  "id": "fn-620-mechanical-git-cleanliness-gate.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "title": "Keeper mechanical gate",
+  "updated_at": "2026-05-27T05:17:36.827446Z"
+}
