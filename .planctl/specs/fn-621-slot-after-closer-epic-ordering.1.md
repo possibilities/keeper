@@ -124,5 +124,5 @@ Land the whole server-side flip plus the board pill as one coherent change. The 
 - [ ] Existing `bun test` suite continues to pass.
 
 ## Done summary
-
+Added created_by_closer_of and sort_path to epics projection (schema v29). syncPlanctlLinks derives both columns with full transitive cascade + depth-50 cycle guard inside BEGIN IMMEDIATE. EpicSnapshot fold eagerly derives sort_path when epic_number first becomes known. EPICS_DESCRIPTOR.defaultSort flips to sort_path ASC. Board renders [slotted-after-closer] pill. Fixed worker-introduced duplicate test section and pre-existing sort_path derivation gap.
 ## Evidence
