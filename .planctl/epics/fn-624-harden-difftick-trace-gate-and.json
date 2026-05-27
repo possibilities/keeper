@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-624-harden-difftick-trace-gate-and",
   "bundles": [],
   "closer_done_at": "2026-05-27T20:28:59.611795Z",
@@ -18,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-27T20:28:59.611795Z"
+  "updated_at": "2026-05-27T20:31:15.963333Z"
 }
