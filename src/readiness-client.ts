@@ -287,6 +287,83 @@ export function projectRows<T>(state: { rows: readonly unknown[] }): T[] {
 }
 
 /**
+ * Client-side collapse of `subagent_invocations` by `(job_id,
+ * subagent_type)`. For each group, the row with the highest
+ * `turn_seq` wins; the count of folded rows AND the count of stuck
+ * orphans ride alongside so renderers can stamp a `(×N)` multiplier
+ * and an `N stuck` indicator (board), and readiness can pretend
+ * each named sub-agent is one logical agent (predicate 6 stops
+ * false-blocking on orphaned `running` rows whose matching
+ * `SubagentStop` never landed).
+ *
+ * "Stuck" definition: a row inside a group is stuck iff it is NOT
+ * the surviving (max-`turn_seq`) row AND its `status === 'running'`.
+ * A single-row group is never stuck; a running surviving row is
+ * "currently running," not stuck. Counted inline so we never need
+ * to retain the non-surviving rows themselves.
+ *
+ * Operating assumption: Claude Code does NOT spawn parallel sub-
+ * agents of the same `subagent_type` within one parent session.
+ * Under that assumption, "same name in one job" means "serial re-
+ * invocation," and collapsing to the most-recent is the correct
+ * logical view. If that ever ceases to hold we'd see parallel
+ * `running` rows of the same type collapse to a single status —
+ * worth revisiting the assumption then, but at the cost of one
+ * masked-orphan recurrence, not a wedged projection.
+ *
+ * Returns groups in first-seen order (by the first row of each
+ * `(job_id, subagent_type)` group as it appears in the input
+ * stream), so a renderer that wants to preserve event-stream order
+ * gets it for free. Within each group the SURVIVING row is the
+ * highest-`turn_seq` row (not necessarily the first-seen).
+ *
+ * Pure function of its input; exported so the board renderer
+ * (`scripts/board.ts:subagentLinesFor`) and the test suite can call
+ * it directly without standing up the subscribe loop.
+ */
+export interface SubagentGroup {
+  readonly row: SubagentInvocation;
+  readonly count: number;
+  readonly stuck: number;
+}
+
+export function collapseSubagentsByName(
+  rows: readonly SubagentInvocation[],
+): SubagentGroup[] {
+  const groups = new Map<
+    string,
+    { row: SubagentInvocation; count: number; stuck: number }
+  >();
+  const order: string[] = [];
+  for (const row of rows) {
+    const key = `${row.job_id}\x00${row.subagent_type ?? ""}`;
+    const existing = groups.get(key);
+    if (existing === undefined) {
+      groups.set(key, { row, count: 1, stuck: 0 });
+      order.push(key);
+      continue;
+    }
+    existing.count += 1;
+    if (row.turn_seq > existing.row.turn_seq) {
+      // New row supersedes the old surviving. The demoted surviving
+      // becomes a stuck orphan iff it was still `running`.
+      if (existing.row.status === "running") {
+        existing.stuck += 1;
+      }
+      existing.row = row;
+    } else if (row.status === "running") {
+      // Older-than-surviving row that's still `running` — stuck.
+      existing.stuck += 1;
+    }
+  }
+  return order.map((k) => {
+    // biome-ignore lint/style/noNonNullAssertion: keys mirror the `order` array
+    const g = groups.get(k)!;
+    return { row: g.row, count: g.count, stuck: g.stuck };
+  });
+}
+
+/**
  * Internal options passed to `subscribeMulti`. The two public helpers shape
  * their differing semantics through this surface:
  *
@@ -776,7 +853,17 @@ export function subscribeReadiness(
     }
     // Read from `state.rows` (not `byId.values()`) — see module docstring.
     const subsTyped = projectRows<SubagentInvocation>(subagentInvocations);
-    const readiness = computeReadiness(epicsTyped, jobsTyped, subsTyped);
+    // Collapse same-name sub-agents to most-recent before readiness sees
+    // them — same operating assumption + rationale as `collapseSubagentsByName`'s
+    // docstring (no parallel like-named sub-agents in practice, so
+    // orphaned `running` rows whose matching `SubagentStop` never
+    // landed shouldn't false-block predicate 6). The full uncollapsed
+    // slice still rides on the snapshot for the audit trail; only the
+    // readiness handoff sees the collapsed view.
+    const subsForReadiness = collapseSubagentsByName(subsTyped).map(
+      (g) => g.row,
+    );
+    const readiness = computeReadiness(epicsTyped, jobsTyped, subsForReadiness);
     // Exceptions from `onSnapshot` propagate. This matches keeper's
     // "no in-process self-heal" stance and the prior board.ts code path,
     // which had no try/catch around its emit either.

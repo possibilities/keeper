@@ -9,9 +9,16 @@
  * readiness pill AND nest as indented `[<status>]` lines under the
  * matching job row (in both the embedded-in-epic context and the bottom
  * jobs list), stamping the raw 5-value projection enum
- * `running|ok|failed|unknown|superseded` verbatim (no client-side collapse
- * — `superseded` is promoted natively by the projection, see task fn-605.2),
- * keyed on `job_id` and ordered by `turn_seq asc`.
+ * `running|ok|failed|unknown|superseded` verbatim — `superseded` is
+ * promoted natively by the projection (task fn-605.2). Same-name
+ * invocations within one job ADDITIONALLY collapse on the client to a
+ * single line representing the most-recent (max turn_seq) row via
+ * `collapseSubagentsByName` in `src/readiness-client.ts` — a `(×N)`
+ * multiplier and an optional `N stuck` orphan indicator surface the
+ * collapsed count and any non-surviving `running` rows. The same
+ * collapse feeds readiness, so an orphan `running` row whose matching
+ * `SubagentStop` never landed no longer false-blocks predicate 6. Full
+ * uncollapsed audit trail stays in sqlite.
  *
  * Frame shape:
  *
@@ -75,6 +82,7 @@ import { resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
 import { formatPill, type Verdict } from "../src/readiness";
 import {
+  collapseSubagentsByName,
   type ReadinessClientSnapshot,
   subscribeReadiness,
 } from "../src/readiness-client";
@@ -133,10 +141,21 @@ reflects planctl's last_validated_at timestamp on the epic file — flipped
 by 'planctl validate --epic <id>'.
 
 Sub-agent invocations nest under their owning job row as one indented
-line each — '{subagent_type}: {description} [<status>]' — where <status>
-is the raw 5-value projection enum 'running|ok|failed|unknown|superseded'.
-'superseded' is rendered verbatim (no hiding) so the audit trail of
-re-entrant attempts stays visible.
+line each — '{subagent_type}{annotations}: {description} [<status>]' —
+where <status> is the raw 5-value projection enum
+'running|ok|failed|unknown|superseded'. 'superseded' is rendered verbatim
+(no hiding) so the audit trail of re-entrant attempts stays visible.
+
+Same-name invocations within one job COLLAPSE on the client to a single
+line representing the most recent (max turn_seq) row; the {annotations}
+block is a parenthesized comma-joined annotation that appears only when
+there's something to say: '(×N)' when the group folded N rows, and/or
+'(N stuck)' when one or more non-surviving rows are still status='running'
+(orphans whose matching SubagentStop never landed). The same collapse
+applies to the readiness handoff (predicate 6 sees one logical agent
+per (job_id, subagent_type) pair) so an orphaned 'running' row no longer
+false-blocks downstream rows. The full uncollapsed audit trail is still
+in sqlite — only the client view collapses.
 
 The [<readiness>] pill is one of [ready], [completed], or
 [blocked:<reason>] — a pure-function verdict computed by src/readiness.ts
@@ -532,14 +551,24 @@ async function main(): Promise<void> {
   // --- epic rendering ---
 
   /**
-   * Per-job sub-agent lines. Reads from the per-frame `subagentIndex` built
-   * by `emitFrame` and closed-over via the render context. Each line
-   * carries `{subagent_type}: {description} [pill]` — `description` is
-   * dropped when null/empty so the pill stays anchored next to the type.
-   * `indent` is supplied per caller: embedded jobs (already three-space
-   * indented inside an epic block) get six spaces; bottom-section jobs
-   * (flush left) get three. Returns `[]` for jobs with no recorded
-   * invocations so callers can spread unconditionally.
+   * Per-job sub-agent lines. Reads from the per-frame `subagentIndex`
+   * built by `emitFrame` and closed-over via the render context. Same-
+   * name invocations within one job collapse to a single line via
+   * `collapseSubagentsByName` — see that helper's docstring for the
+   * operating assumption (no parallel like-named sub-agents in
+   * practice). Each line carries
+   * `{subagent_type}{annotations}: {description} [pill]` — `description`
+   * is dropped when null/empty so the pill stays anchored next to the
+   * type. `annotations` is a parenthesized comma-joined block that
+   * appears only when there's something to say:
+   *   - `×N` when the group folded more than one row
+   *   - `N stuck` when one or more non-surviving rows are still
+   *     `status='running'` (orphans whose `SubagentStop` never landed)
+   * A clean group of one row renders with no parenthesized block.
+   * `indent` is supplied per caller: embedded jobs (already three-
+   * space indented inside an epic block) get six spaces; bottom-
+   * section jobs (flush left) get three. Returns `[]` for jobs with
+   * no recorded invocations so callers can spread unconditionally.
    */
   function subagentLinesFor(
     subagentIndex: Map<string, SubagentInvocation[]>,
@@ -550,11 +579,22 @@ async function main(): Promise<void> {
     if (hits === undefined || hits.length === 0) {
       return [];
     }
-    return hits.map((inv) => {
-      const type = inv.subagent_type ?? "subagent";
-      const desc = inv.description ?? "";
-      const label = desc === "" ? type : `${type}: ${desc}`;
-      return `${indent}${label} [${seg(inv.status)}]`;
+    const groups = collapseSubagentsByName(hits);
+    return groups.map((g) => {
+      const type = g.row.subagent_type ?? "subagent";
+      const desc = g.row.description ?? "";
+      const annotations: string[] = [];
+      if (g.count > 1) {
+        annotations.push(`×${g.count}`);
+      }
+      if (g.stuck > 0) {
+        annotations.push(`${g.stuck} stuck`);
+      }
+      const annSeg =
+        annotations.length === 0 ? "" : ` (${annotations.join(", ")})`;
+      const head = `${type}${annSeg}`;
+      const label = desc === "" ? head : `${head}: ${desc}`;
+      return `${indent}${label} [${seg(g.row.status)}]`;
     });
   }
 

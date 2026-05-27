@@ -30,7 +30,7 @@
 import { expect, test } from "bun:test";
 import { colorizePillsInLine, renderJobLinkLines } from "../scripts/board";
 import { computeReadiness } from "../src/readiness";
-import { projectRows } from "../src/readiness-client";
+import { collapseSubagentsByName, projectRows } from "../src/readiness-client";
 import type {
   EmbeddedJob,
   Epic,
@@ -148,6 +148,274 @@ test("projectRows preserves wire order", () => {
 
 test("projectRows on empty rows yields empty array", () => {
   expect(projectRows({ rows: [] })).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// collapseSubagentsByName — client-side same-name collapse + stuck-orphan count
+// ---------------------------------------------------------------------------
+
+test("collapseSubagentsByName: empty input → []", () => {
+  expect(collapseSubagentsByName([])).toEqual([]);
+});
+
+test("collapseSubagentsByName: single row → one group, count=1, stuck=0", () => {
+  const row = makeSub({
+    job_id: "j",
+    subagent_type: "plan:worker-high",
+    turn_seq: 0,
+    status: "running",
+  });
+  const out = collapseSubagentsByName([row]);
+  expect(out).toHaveLength(1);
+  expect(out[0]?.row).toBe(row);
+  expect(out[0]?.count).toBe(1);
+  expect(out[0]?.stuck).toBe(0);
+});
+
+test("collapseSubagentsByName: same name keeps max turn_seq, counts all rows", () => {
+  // Four rows, none stuck — `running:0 → ok:1 → ok:2 → ok:3` collapses to ok:3.
+  // count = 4, stuck = 0 because the only `running` row is non-surviving but
+  // there's NO later `running` survivor either, so the "stuck" definition
+  // ("non-surviving + status='running'") fires for turn_seq=0 only when a
+  // LATER row supersedes it AND that row's status isn't running. Trace:
+  // first row sets {row:0, count:1, stuck:0}. Next row (turn 1, ok)
+  // supersedes; turn_seq=0 was running → stuck += 1 → {row:1, count:2, stuck:1}.
+  // Then turn 2 ok → {row:2, count:3, stuck:1}. Then turn 3 ok → {row:3, count:4, stuck:1}.
+  const rows = [
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 0,
+      status: "running",
+    }),
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 1,
+      status: "ok",
+    }),
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 2,
+      status: "ok",
+    }),
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 3,
+      status: "ok",
+    }),
+  ];
+  const out = collapseSubagentsByName(rows);
+  expect(out).toHaveLength(1);
+  expect(out[0]?.row.turn_seq).toBe(3);
+  expect(out[0]?.row.status).toBe("ok");
+  expect(out[0]?.count).toBe(4);
+  expect(out[0]?.stuck).toBe(1);
+});
+
+test("collapseSubagentsByName: fn-593.3 shape — running orphan masked, stuck=1", () => {
+  // Exact shape from the wedged fn-593.3 session — ok:0, running:1 (orphan),
+  // ok:2, ok:3. The surviving row is ok:3; turn_seq=1's `running` is a
+  // non-surviving stuck orphan that gets counted but doesn't reach
+  // computeReadiness via the subscribe loop.
+  const rows = [
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 0,
+      status: "ok",
+    }),
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 1,
+      status: "running",
+    }),
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 2,
+      status: "ok",
+    }),
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 3,
+      status: "ok",
+    }),
+  ];
+  const [group] = collapseSubagentsByName(rows);
+  expect(group?.row.turn_seq).toBe(3);
+  expect(group?.row.status).toBe("ok");
+  expect(group?.count).toBe(4);
+  expect(group?.stuck).toBe(1);
+});
+
+test("collapseSubagentsByName: surviving row running → not stuck (currently running)", () => {
+  // Two rows, `ok:0 → running:1`. The surviving row (turn 1) IS running,
+  // which is the normal "currently running" case — NOT stuck.
+  const rows = [
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 0,
+      status: "ok",
+    }),
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 1,
+      status: "running",
+    }),
+  ];
+  const [g] = collapseSubagentsByName(rows);
+  expect(g?.row.status).toBe("running");
+  expect(g?.count).toBe(2);
+  expect(g?.stuck).toBe(0);
+});
+
+test("collapseSubagentsByName: different subagent_types don't collapse", () => {
+  const rows = [
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 0,
+      status: "ok",
+    }),
+    makeSub({
+      job_id: "j",
+      subagent_type: "plan:repo-scout",
+      turn_seq: 1,
+      status: "running",
+    }),
+  ];
+  const out = collapseSubagentsByName(rows);
+  expect(out).toHaveLength(2);
+  expect(out.map((g) => g.row.subagent_type)).toEqual([
+    "plan:worker-high",
+    "plan:repo-scout",
+  ]);
+});
+
+test("collapseSubagentsByName: different job_ids don't collapse even with same name", () => {
+  const rows = [
+    makeSub({
+      job_id: "j1",
+      subagent_type: "plan:worker-high",
+      turn_seq: 0,
+      status: "ok",
+    }),
+    makeSub({
+      job_id: "j2",
+      subagent_type: "plan:worker-high",
+      turn_seq: 0,
+      status: "ok",
+    }),
+  ];
+  const out = collapseSubagentsByName(rows);
+  expect(out).toHaveLength(2);
+  expect(out.map((g) => g.row.job_id)).toEqual(["j1", "j2"]);
+});
+
+test("collapseSubagentsByName: first-seen order preserved across groups", () => {
+  // Rows arrive: A, B, A — output groups should be in [A, B] order (A's
+  // FIRST appearance wins, not its last).
+  const rows = [
+    makeSub({ job_id: "j", subagent_type: "A", turn_seq: 0, status: "ok" }),
+    makeSub({ job_id: "j", subagent_type: "B", turn_seq: 1, status: "ok" }),
+    makeSub({ job_id: "j", subagent_type: "A", turn_seq: 2, status: "ok" }),
+  ];
+  const out = collapseSubagentsByName(rows);
+  expect(out.map((g) => g.row.subagent_type)).toEqual(["A", "B"]);
+});
+
+test("collapseSubagentsByName: out-of-order input still keeps max turn_seq", () => {
+  // Rows arrive in non-monotone turn_seq order (the wire stream is sorted
+  // ascending today but the helper must not depend on that). Surviving
+  // row is still the max turn_seq.
+  const rows = [
+    makeSub({ job_id: "j", subagent_type: "A", turn_seq: 5, status: "ok" }),
+    makeSub({
+      job_id: "j",
+      subagent_type: "A",
+      turn_seq: 3,
+      status: "running",
+    }),
+    makeSub({ job_id: "j", subagent_type: "A", turn_seq: 7, status: "ok" }),
+  ];
+  const [g] = collapseSubagentsByName(rows);
+  expect(g?.row.turn_seq).toBe(7);
+  expect(g?.row.status).toBe("ok");
+  expect(g?.stuck).toBe(1);
+});
+
+test("collapseSubagentsByName: null subagent_type groups together within a job", () => {
+  // Two null-subagent_type rows on the same job collapse to one group —
+  // null is treated as its own key value, not as "always distinct."
+  const rows = [
+    makeSub({
+      job_id: "j",
+      subagent_type: null,
+      turn_seq: 0,
+      status: "running",
+    }),
+    makeSub({ job_id: "j", subagent_type: null, turn_seq: 1, status: "ok" }),
+  ];
+  const out = collapseSubagentsByName(rows);
+  expect(out).toHaveLength(1);
+  expect(out[0]?.row.turn_seq).toBe(1);
+  expect(out[0]?.count).toBe(2);
+  expect(out[0]?.stuck).toBe(1);
+});
+
+test("collapseSubagentsByName: fn-593.3 collapse → predicate 6 stops blocking", () => {
+  // The integration assertion: with the fn-593.3 row shape, the collapsed
+  // slice handed to computeReadiness has the surviving row at status='ok'.
+  // Predicate 6 (own-progress-sub) no longer fires, so the readiness
+  // verdict for the row's owning task isn't `blocked:sub-agent-running`.
+  // This is the autopilot-unsticking effect of the client-side collapse.
+  const task = makeTask({
+    worker_phase: "open",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subRows = [
+    makeSub({
+      job_id: "worker-1",
+      subagent_type: "plan:worker-high",
+      turn_seq: 0,
+      status: "ok",
+    }),
+    makeSub({
+      job_id: "worker-1",
+      subagent_type: "plan:worker-high",
+      turn_seq: 1,
+      status: "running",
+    }),
+    makeSub({
+      job_id: "worker-1",
+      subagent_type: "plan:worker-high",
+      turn_seq: 2,
+      status: "ok",
+    }),
+    makeSub({
+      job_id: "worker-1",
+      subagent_type: "plan:worker-high",
+      turn_seq: 3,
+      status: "ok",
+    }),
+  ];
+  const collapsed = collapseSubagentsByName(subRows).map((g) => g.row);
+  const snap = computeReadiness([epic], new Map<string, Job>(), collapsed);
+  const verdict = snap.perTask.get(task.task_id);
+  // Whatever the verdict, it MUST NOT be sub-agent-running — the orphan
+  // turn_seq=1 has been masked by the same-name collapse.
+  if (verdict?.tag === "blocked") {
+    expect(verdict.reason.kind).not.toBe("sub-agent-running");
+  }
 });
 
 // ---------------------------------------------------------------------------
