@@ -2,9 +2,11 @@
   "branch_name": "fn-621-slot-after-closer-epic-ordering",
   "bundles": [],
   "created_at": "2026-05-27T06:14:16.540845Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-620-mechanical-git-cleanliness-gate"
+  ],
   "id": "fn-621-slot-after-closer-epic-ordering",
-  "last_validated_at": "2026-05-27T06:14:16.560375Z",
+  "last_validated_at": "2026-05-27T06:21:08.161793Z",
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -14,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-27T06:14:16.540845Z"
+  "updated_at": "2026-05-27T06:21:08.142860Z"
 }
