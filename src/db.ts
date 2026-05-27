@@ -430,6 +430,34 @@ const CREATE_EPICS_INDEXES = [
 ];
 
 /**
+ * Tier 2 (fn-628) always-run partial composite indexes on `events` for the
+ * reducer's `syncPlanctlLinks` cross-session sweep. Two indexes paired with a
+ * UNION query rewrite at `src/reducer.ts` (~2371): the planner picks ONE
+ * index per cross-column OR, so the original `(planctl_epic_id IN ... OR
+ * planctl_target IN ...)` SCANned `idx_events_planctl_session` and only one
+ * of the two new indexes was reachable. The UNION form decomposes into a
+ * `COMPOUND QUERY` whose left branch SEARCHes `idx_events_planctl_epic` and
+ * right branch SEARCHes `idx_events_planctl_target` — both new indexes hit,
+ * dedup via temp B-tree, identical session_id set vs the prior
+ * `SELECT DISTINCT ... OR ...` form.
+ *
+ * The `WHERE planctl_op IS NOT NULL` predicate mirrors `idx_events_planctl_session`
+ * and satisfies SQLite's partial-index Rule 2 (sqlite.org/partialindex.html
+ * §3): any comparison on a column declared `IS NOT NULL` in the index
+ * satisfies the predicate, so consumer queries don't need to repeat the
+ * predicate verbatim. Trailing `(session_id, id)` keeps the indexes covering
+ * for the `SELECT session_id` projection without a heap row-lookup.
+ *
+ * Practice-scout measured ~12.6% insert overhead on the planctl-bearing
+ * subset (~10% of all events) — bounded and acceptable. `CREATE INDEX IF
+ * NOT EXISTS` is idempotent; no SCHEMA_VERSION bump.
+ */
+const CREATE_EVENTS_PLANCTL_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_events_planctl_epic ON events(planctl_epic_id, session_id, id) WHERE planctl_op IS NOT NULL",
+  "CREATE INDEX IF NOT EXISTS idx_events_planctl_target ON events(planctl_target, session_id, id) WHERE planctl_op IS NOT NULL",
+];
+
+/**
  * Tier 2 (fn-628) always-run table-scoped index on `jobs`. Serves the default
  * jobs query (`WHERE state NOT IN ('ended','killed') ORDER BY created_at DESC,
  * job_id`). The index shape is `(created_at DESC, job_id, state)` — NOT
@@ -2386,23 +2414,32 @@ function migrate(db: Database): void {
       db.run("DELETE FROM subagent_invocations");
     }
 
-    // Tier 2 (fn-628) always-run table-scoped indexes on epics + jobs. Placed
-    // AFTER the v28→v29 ADD COLUMN block stamps `epics.sort_path` so a
-    // migrating-from-v28 DB has the indexed column by the time the index runs.
-    // The remaining indexed columns (`epic_id`, `created_at`, `job_id`,
-    // `state`) all exist from schema v1. `CREATE INDEX IF NOT EXISTS` is
-    // idempotent — no SCHEMA_VERSION bump. `ANALYZE epics; ANALYZE jobs;`
-    // runs unconditionally on every boot so the planner picks the new
-    // indexes on first post-upgrade query — cost is negligible on tables
-    // under ~1.1k rows.
+    // Tier 2 (fn-628) always-run table-scoped indexes on epics + jobs +
+    // events. Placed AFTER the v28→v29 ADD COLUMN block stamps
+    // `epics.sort_path` so a migrating-from-v28 DB has the indexed column by
+    // the time the index runs. The remaining indexed columns (`epic_id`,
+    // `created_at`, `job_id`, `state`) all exist from schema v1; the
+    // planctl_* columns indexed here exist from schema v14. `CREATE INDEX IF
+    // NOT EXISTS` is idempotent — no SCHEMA_VERSION bump.
+    // `ANALYZE epics; ANALYZE jobs; ANALYZE events;` runs unconditionally on
+    // every boot so the planner picks the new indexes on first post-upgrade
+    // query — cost is negligible on tables under ~1.1k rows for epics/jobs;
+    // events sits at ~110k rows on the daemon's hot DB and ANALYZE costs
+    // ~10ms there. The fn-628.2 `CREATE_EVENTS_PLANCTL_INDEXES` block
+    // pairs with the OR→UNION rewrite at src/reducer.ts:~2371 so both new
+    // partial indexes are SEARCHed (not just one) at the hot-path sweep.
     for (const sql of CREATE_EPICS_INDEXES) {
       db.run(sql);
     }
     for (const sql of CREATE_JOBS_INDEXES) {
       db.run(sql);
     }
+    for (const sql of CREATE_EVENTS_PLANCTL_INDEXES) {
+      db.run(sql);
+    }
     db.run("ANALYZE epics");
     db.run("ANALYZE jobs");
+    db.run("ANALYZE events");
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

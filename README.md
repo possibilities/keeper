@@ -55,11 +55,16 @@ mutation cheaply without JSON-scanning the event `data` blob. The
 [Architecture](#architecture)) — `op === "create"` and `op === "scaffold"`
 both classify as creators (scaffold is the canonical epic-create path on
 this codebase). The non-`config_dir` signals are partial-indexed
-on `WHERE col IS NOT NULL` (the planctl columns share a composite
-`(session_id, id) WHERE planctl_op IS NOT NULL` index for the per-session
-ordered scan); `events.config_dir` rides without its own index — it is
-read off `jobs.config_dir` (a steady-state attribution column), not the
-event log.
+on `WHERE col IS NOT NULL`. The planctl columns ride three partial indexes
+sharing the `WHERE planctl_op IS NOT NULL` predicate: `idx_events_planctl_session`
+on `(session_id, id)` for the per-session ordered scan, plus the Tier 2
+`idx_events_planctl_epic` on `(planctl_epic_id, session_id, id)` and
+`idx_events_planctl_target` on `(planctl_target, session_id, id)` for the
+reducer's `syncPlanctlLinks` cross-session sweep — the sweep is a UNION
+of `planctl_epic_id IN (...)` and `planctl_target IN (...)` so the planner
+SEARCHes both indexes (a cross-column `OR` would have to scan one).
+`events.config_dir` rides without its own index — it is read off
+`jobs.config_dir` (a steady-state attribution column), not the event log.
 
 The architecture is deliberately small. Keeper is built on Bun + `bun:sqlite`
 with a single third-party runtime dependency: `@parcel/watcher` (a native
@@ -698,6 +703,10 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 # All planctl-CLI invocations across sessions — uses the composite partial idx_events_planctl_session index; the WHERE predicate must match the index predicate syntactically for SQLite to land the index:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT session_id, datetime(ts,'unixepoch','localtime'), planctl_op, planctl_target FROM events WHERE planctl_op IS NOT NULL ORDER BY id DESC LIMIT 20"
+
+# Every session that has touched a given epic — UNION mirrors the reducer's syncPlanctlLinks cross-session sweep; the left branch uses the partial idx_events_planctl_epic index, the right branch uses the partial idx_events_planctl_target index (SQLite picks ONE index per cross-column OR, so the OR form was rewritten to UNION to reach both):
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT session_id FROM events WHERE planctl_op IS NOT NULL AND planctl_epic_id = 'fn-628-contention-review-tier-2-index-pack' UNION SELECT session_id FROM events WHERE planctl_op IS NOT NULL AND planctl_target = 'fn-628-contention-review-tier-2-index-pack'"
 
 # Recent per-job Task-tool subagent timeline — one row per PreToolUse:Agent paired with its PostToolUse:Agent (and lifecycle Start/Stop), status running|ok|failed|unknown|superseded, duration_ms populated on SubagentStop (NULL on rows never closed — superseded peers + lifecycle-swept unknown orphans):
 sqlite3 ~/.local/state/keeper/keeper.db \

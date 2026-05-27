@@ -89,6 +89,8 @@ test("all expected indexes are present", () => {
     "idx_events_subagent_agent_id",
     "idx_epics_sort_path",
     "idx_jobs_created_state",
+    "idx_events_planctl_epic",
+    "idx_events_planctl_target",
   ];
   for (const name of required) {
     expect(names.has(name)).toBe(true);
@@ -1105,6 +1107,223 @@ test("Tier 2 (fn-628) idx_jobs_created_state serves the default jobs query as CO
     /SCAN jobs USING COVERING INDEX idx_jobs_created_state/,
   );
   expect(detail).not.toMatch(/USE TEMP B-TREE/);
+  db.close();
+});
+
+// Tier 2 (fn-628.2) — paired `CREATE_EVENTS_PLANCTL_INDEXES` + UNION rewrite.
+// Helper seeds a varied event mix that exercises both the planctl_epic_id and
+// planctl_target sides plus rows that match neither. Shared by the three EQP
+// tests + the semantic-equivalence test below.
+function seedPlanctlEventMix(db: Database): void {
+  const insert = db.prepare(
+    `INSERT INTO events (
+       ts, session_id, hook_event, event_type, data,
+       planctl_op, planctl_target, planctl_epic_id
+     ) VALUES (?, ?, ?, ?, '{}', ?, ?, ?)`,
+  );
+  // Sessions whose footprint matches via planctl_epic_id only — the work-verb
+  // shape (planctl_target = task id, planctl_epic_id = parent epic).
+  for (let i = 0; i < 20; i++) {
+    insert.run(
+      1_700_000_000 + i,
+      `sess-epic-${i}`,
+      "PostToolUse",
+      "post_tool_use",
+      "done",
+      `fn-100-foo.${i}`,
+      "fn-100-foo",
+    );
+  }
+  // Sessions whose footprint matches via planctl_target only — the
+  // epic-targeting shape (planctl_target = epic id directly, planctl_epic_id
+  // null because the envelope didn't carry it for this op).
+  for (let i = 0; i < 20; i++) {
+    insert.run(
+      1_700_000_500 + i,
+      `sess-target-${i}`,
+      "PostToolUse",
+      "post_tool_use",
+      "approve",
+      "fn-100-foo",
+      null,
+    );
+  }
+  // Sessions whose footprint matches BOTH (the normal scaffold/work shape:
+  // planctl_target = task id, planctl_epic_id = parent epic).
+  for (let i = 0; i < 10; i++) {
+    insert.run(
+      1_700_001_000 + i,
+      `sess-both-${i}`,
+      "PostToolUse",
+      "post_tool_use",
+      "scaffold",
+      `fn-100-foo.x${i}`,
+      "fn-100-foo",
+    );
+  }
+  // Noise: planctl rows pointing at a different epic, plus non-planctl rows.
+  for (let i = 0; i < 20; i++) {
+    insert.run(
+      1_700_001_500 + i,
+      `sess-noise-${i}`,
+      "PostToolUse",
+      "post_tool_use",
+      "done",
+      `fn-999-bar.${i}`,
+      "fn-999-bar",
+    );
+  }
+  // Production-proportion non-planctl noise: ~99% of events carry NULL
+  // planctl_op, so the partial-index footprint is ~1% of the full table.
+  // Without this mass, ANALYZE can't tell the partial composite apart from
+  // `idx_events_session` and the planner picks the simpler one (the planner
+  // makes the right pick on the live ~110k-row DB; this scales the fixture
+  // proportionally). Diverse session_id keeps `idx_events_session`'s
+  // selectivity at production-like (~3k distinct sessions in prod).
+  for (let i = 0; i < 5000; i++) {
+    insert.run(
+      1_700_010_000 + i,
+      `sess-non-planctl-${i % 500}`,
+      "PostToolUse",
+      "post_tool_use",
+      null,
+      null,
+      null,
+    );
+  }
+  db.run("ANALYZE");
+}
+
+test("Tier 2 (fn-628.2) idx_events_planctl_epic + idx_events_planctl_target are present on fresh openDb", () => {
+  const { db } = openDb(dbPath);
+  const indexes = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+    .all() as { name: string }[];
+  const names = new Set(indexes.map((i) => i.name));
+  expect(names.has("idx_events_planctl_epic")).toBe(true);
+  expect(names.has("idx_events_planctl_target")).toBe(true);
+  db.close();
+});
+
+test("Tier 2 (fn-628.2) cross-session UNION sweep uses BOTH planctl partial indexes (EXPLAIN QUERY PLAN)", () => {
+  // Mirrors the syncPlanctlLinks cross-session sweep at src/reducer.ts:~2371
+  // after the OR→UNION rewrite. EQP must show a COMPOUND QUERY whose two
+  // branches each SEARCH a different new partial index — proving the
+  // optimizer can reach both indexes (the prior OR form could only reach one).
+  const { db } = openDb(dbPath);
+  seedPlanctlEventMix(db);
+
+  const plan = db
+    .prepare(
+      `EXPLAIN QUERY PLAN
+       SELECT session_id
+         FROM events
+        WHERE planctl_op IS NOT NULL
+          AND planctl_epic_id IN ('fn-100-foo')
+        UNION
+       SELECT session_id
+         FROM events
+        WHERE planctl_op IS NOT NULL
+          AND planctl_target IN ('fn-100-foo')`,
+    )
+    .all() as { detail: string }[];
+  const detail = plan.map((r) => r.detail).join(" | ");
+  expect(detail).toMatch(/COMPOUND QUERY/);
+  expect(detail).toMatch(/SEARCH events USING INDEX idx_events_planctl_epic/);
+  expect(detail).toMatch(/SEARCH events USING INDEX idx_events_planctl_target/);
+  db.close();
+});
+
+test("Tier 2 (fn-628.2) per-epic queue_jump scan uses idx_events_planctl_epic (EXPLAIN QUERY PLAN)", () => {
+  // The per-epic queue_jump EXISTS scan at src/reducer.ts:~2543 keys off
+  // `planctl_epic_id = ?` — must hit the new index (the schema-v14
+  // session-leading index cannot serve a planctl_epic_id equality).
+  const { db } = openDb(dbPath);
+  seedPlanctlEventMix(db);
+
+  const plan = db
+    .prepare(
+      `EXPLAIN QUERY PLAN
+       SELECT EXISTS(
+         SELECT 1 FROM events
+          WHERE planctl_op IS NOT NULL
+            AND planctl_epic_id = ?
+            AND planctl_queue_jump = 1
+       ) AS hit`,
+    )
+    .all("fn-100-foo") as { detail: string }[];
+  const detail = plan.map((r) => r.detail).join(" | ");
+  expect(detail).toMatch(
+    /SEARCH events USING INDEX idx_events_planctl_epic \(planctl_epic_id=\?\)/,
+  );
+  db.close();
+});
+
+test("Tier 2 (fn-628.2) per-session ordered planctl load still uses idx_events_planctl_session (regression guard)", () => {
+  // The per-session ordered load at src/reducer.ts:~2389-2395 must NOT be
+  // displaced by the new indexes — confirms the v14 session-leading index
+  // remains the planner's pick for `WHERE session_id = ? AND planctl_op IS
+  // NOT NULL ORDER BY id ASC`.
+  const { db } = openDb(dbPath);
+  seedPlanctlEventMix(db);
+
+  const plan = db
+    .prepare(
+      `EXPLAIN QUERY PLAN
+       SELECT ts, planctl_op, planctl_target, planctl_epic_id,
+              planctl_subject_present
+         FROM events
+        WHERE session_id = ? AND planctl_op IS NOT NULL
+        ORDER BY id ASC`,
+    )
+    .all("sess-both-0") as { detail: string }[];
+  const detail = plan.map((r) => r.detail).join(" | ");
+  expect(detail).toMatch(
+    /SEARCH events USING INDEX idx_events_planctl_session/,
+  );
+  db.close();
+});
+
+test("Tier 2 (fn-628.2) UNION rewrite is semantically equivalent to the prior OR form (re-fold determinism guard)", () => {
+  // The reducer's `syncPlanctlLinks` cross-session sweep must produce
+  // byte-identical session_id sets after the rewrite. Both forms run against
+  // the same fixture; sorted+deduped session_id sets must deep-equal.
+  const { db } = openDb(dbPath);
+  seedPlanctlEventMix(db);
+
+  const orForm = db
+    .prepare(
+      `SELECT DISTINCT session_id
+         FROM events
+        WHERE planctl_op IS NOT NULL
+          AND (planctl_epic_id IN ('fn-100-foo') OR planctl_target IN ('fn-100-foo'))`,
+    )
+    .all() as { session_id: string }[];
+  const unionForm = db
+    .prepare(
+      `SELECT session_id
+         FROM events
+        WHERE planctl_op IS NOT NULL
+          AND planctl_epic_id IN ('fn-100-foo')
+        UNION
+       SELECT session_id
+         FROM events
+        WHERE planctl_op IS NOT NULL
+          AND planctl_target IN ('fn-100-foo')`,
+    )
+    .all() as { session_id: string }[];
+
+  const orSet = orForm.map((r) => r.session_id).sort();
+  const unionSet = unionForm.map((r) => r.session_id).sort();
+  // UNION dedups intrinsically; SELECT DISTINCT does too — both must
+  // produce the same set (and contain it without duplicates).
+  expect(new Set(orSet).size).toBe(orSet.length);
+  expect(new Set(unionSet).size).toBe(unionSet.length);
+  expect(unionSet).toEqual(orSet);
+  // Spot-check: the fixture has 20 epic-only + 20 target-only + 10 both =
+  // 50 distinct sessions that should match (the noise + non-planctl rows
+  // point at a different epic / carry NULL planctl columns).
+  expect(unionSet.length).toBe(50);
   db.close();
 });
 

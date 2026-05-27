@@ -2368,12 +2368,26 @@ function syncPlanctlLinks(
   // needs the full per-session ordering for its window advance.
   const targetList = [...touchedEpics];
   const placeholders = targetList.map(() => "?").join(",");
+  // UNION (not OR) so the planner uses BOTH partial indexes — SQLite picks
+  // ONE index per cross-column OR, but a UNION decomposes into a COMPOUND
+  // QUERY whose left branch SEARCHes `idx_events_planctl_epic` and right
+  // branch SEARCHes `idx_events_planctl_target` (Tier 2 fn-628; see
+  // `CREATE_EVENTS_PLANCTL_INDEXES` in src/db.ts). UNION dedups via temp
+  // B-tree — identical session_id set to the prior `SELECT DISTINCT ...
+  // OR ...` form, so re-fold determinism is preserved (the downstream
+  // `syncPlanctlLinks` derivation consumes the session_id set the same
+  // way regardless of which form produced it).
   const sessionRows = db
     .query(
-      `SELECT DISTINCT session_id
+      `SELECT session_id
          FROM events
         WHERE planctl_op IS NOT NULL
-          AND (planctl_epic_id IN (${placeholders}) OR planctl_target IN (${placeholders}))`,
+          AND planctl_epic_id IN (${placeholders})
+        UNION
+       SELECT session_id
+         FROM events
+        WHERE planctl_op IS NOT NULL
+          AND planctl_target IN (${placeholders})`,
     )
     .all(...targetList, ...targetList) as { session_id: string }[];
   // The current session might have touched an epic in pre-state that NO
@@ -2530,11 +2544,14 @@ function syncPlanctlLinks(
     // byte-deterministic.
     //
     // The scan keys off `planctl_epic_id = <this epicId>` (the parsed-
-    // out epic side of `planctl_target`). The `(session_id, id) WHERE
-    // planctl_op IS NOT NULL` partial composite index from schema v14
-    // serves this filter cheaply since `planctl_epic_id` is itself
-    // guaranteed non-NULL whenever `planctl_op` is non-NULL AND the
-    // target parsed as a planctl ref.
+    // out epic side of `planctl_target`). The Tier 2 (fn-628.2)
+    // `idx_events_planctl_epic ON events(planctl_epic_id, session_id, id)
+    // WHERE planctl_op IS NOT NULL` partial composite index serves this
+    // equality cheaply — EQP shows `SEARCH events USING INDEX
+    // idx_events_planctl_epic (planctl_epic_id=?)`. The schema-v14
+    // `(session_id, id) WHERE planctl_op IS NOT NULL` index is
+    // session-leading and cannot serve a `planctl_epic_id = ?` lookup
+    // on its own.
     const queueJumpRow = db
       .query(
         `SELECT EXISTS(
