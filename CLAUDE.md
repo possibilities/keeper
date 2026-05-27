@@ -46,7 +46,16 @@ the native value" is the default.
   UserPromptSubmit / Stop / SessionEnd / Killed / RateLimited|ApiError, a
   title update on TranscriptTitle, or a paired
   `(last_api_error_at, last_api_error_kind)` set/clear propagates
-  to every epic that references the session) and bumps
+  to every epic that references the session, AND the schema-v28
+  `projectGitStatus`/`retractGitStatus` fan-out from a `GitSnapshot` /
+  `GitRootDropped` event — per-job `jobs.git_dirty_count` (from
+  `snapshot.jobs[*].dirty.length`) and project-broadcast
+  `jobs.git_orphan_count` (from `snapshot.orphaned_files.length`) stamped
+  onto every enumerated job, then re-fanned via `syncJobIntoEpic` so the
+  embedded `jobs[]` arrays carry the counts; the `GitRootDropped` clear
+  walks the SAME canonical `git_status.jobs` enumeration the last write
+  fanned over and zeroes both columns symmetrically — so an unrelated
+  project's jobs running in another worktree stay untouched) and bumps
   `reducer_state.last_event_id` in one transaction. A crash mid-fold rolls
   back both; boot drain re-folds idempotently. This is the
   exactly-once-per-event guarantee — never split the two writes across

@@ -105,6 +105,8 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "last_api_error_kind",
     "last_input_request_at",
     "last_input_request_kind",
+    "git_dirty_count",
+    "git_orphan_count",
   ],
   pk: "job_id",
   version: "last_event_id",

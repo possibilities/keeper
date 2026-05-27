@@ -432,6 +432,24 @@ export interface Job {
    * Attributes the session to the arthack-claude profile it ran under.
    */
   config_dir: string | null;
+  /**
+   * Per-job dirty-file count (schema v28) — `snapshot.jobs[*].dirty.length`
+   * from the latest `GitSnapshot` whose `jobs[]` enumerated this session.
+   * 0 on every job a snapshot has never enumerated (steady-state zero
+   * -event reading), 0 after a `GitRootDropped` retraction zeroes the
+   * canonical-attribution enumeration. Drives the readiness pipeline's
+   * `git-uncommitted` predicate.
+   */
+  git_dirty_count: number;
+  /**
+   * Project-wide orphan-file count (schema v28) —
+   * `snapshot.orphaned_files.length` from the latest `GitSnapshot`,
+   * broadcast onto every job enumerated in that snapshot's `jobs[]`. 0 on
+   * every job a snapshot has never enumerated, 0 after a `GitRootDropped`
+   * retraction zeroes the canonical-attribution enumeration. Drives the
+   * readiness pipeline's `git-orphans` predicate.
+   */
+  git_orphan_count: number;
 }
 
 /**
@@ -503,6 +521,24 @@ export interface EmbeddedJob {
    * this session. NULL whenever {@link last_input_request_at} is NULL.
    */
   last_input_request_kind: string | null;
+  /**
+   * Mirrors {@link Job.git_dirty_count} (schema v28) so a renderer reading
+   * the embedded array shows the same per-job dirty-file count on the
+   * in-epic / in-task job lines that the top-level jobs collection shows
+   * on its bottom list. 0 on every entry a `GitSnapshot` has never
+   * enumerated (the common case for non-worker sessions). Drives the
+   * readiness pipeline's `git-uncommitted` predicate via the embedded
+   * array on the parent task element.
+   */
+  git_dirty_count: number;
+  /**
+   * Mirrors {@link Job.git_orphan_count} (schema v28) — project-wide
+   * orphan-file count broadcast onto every job enumerated in the snapshot.
+   * 0 on every entry a `GitSnapshot` has never enumerated. Drives the
+   * readiness pipeline's `git-orphans` predicate via the embedded array on
+   * the parent task element.
+   */
+  git_orphan_count: number;
 }
 
 /**

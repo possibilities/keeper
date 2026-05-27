@@ -98,6 +98,8 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     last_api_error_kind: null,
     last_input_request_at: null,
     last_input_request_kind: null,
+    git_dirty_count: 0,
+    git_orphan_count: 0,
     ...overrides,
   };
 }
@@ -288,6 +290,255 @@ test("predicate 7 (own-approval-pending) fires once the worker session is idle",
   const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
   expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "job-pending" }),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Predicate 6.5 (git-uncommitted / git-orphans) — fn-620 mechanical
+// git-cleanliness gate. Insertion-point race rationale mirrors predicate 7:
+// the gate must wait until every worker session and sub-agent is actually
+// idle before sampling git state, otherwise mid-yield Stops produce stale
+// dirty-tree readings.
+// ---------------------------------------------------------------------------
+
+test("predicate 6.5 git-uncommitted wins over 7 (own-approval-pending)", () => {
+  // Worker idle, approval pending, but the embedded worker job's
+  // git_dirty_count > 0 — the mechanical gate fires and blocks autopilot's
+  // approve dispatch before predicate 7 ever gets a look.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [
+      makeEmbeddedJob({
+        plan_verb: "work",
+        state: "stopped",
+        git_dirty_count: 3,
+        git_orphan_count: 0,
+      }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "git-uncommitted" }),
+  );
+});
+
+test("predicate 6.5 git-orphans fires when dirty count is zero but orphan count > 0", () => {
+  // git-uncommitted takes priority over git-orphans; with dirty=0 and
+  // orphans>0, the predicate reports git-orphans.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [
+      makeEmbeddedJob({
+        plan_verb: "work",
+        state: "stopped",
+        git_dirty_count: 0,
+        git_orphan_count: 2,
+      }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "git-orphans" }),
+  );
+});
+
+test("predicate 5 (own-progress-main) wins over 6.5 git-uncommitted", () => {
+  // The worker is still running AND the tree is dirty. Predicate 5 fires
+  // first — git state is captured opportunistically and might be stale
+  // mid-yield; the gate must wait for session idle.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [
+      makeEmbeddedJob({
+        plan_verb: "work",
+        state: "working",
+        git_dirty_count: 5,
+        git_orphan_count: 0,
+      }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "job-running" }),
+  );
+});
+
+test("predicate 6 (own-progress-sub) wins over 6.5 git-uncommitted", () => {
+  // Worker stopped but a sub-agent is still running. Same race as 5/6.5:
+  // git state could be stale while the sub-agent is mid-edit; the gate
+  // must wait for sub-agent idle.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-1",
+        plan_verb: "work",
+        state: "stopped",
+        git_dirty_count: 3,
+        git_orphan_count: 0,
+      }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subs = [makeSub({ job_id: "worker-1", status: "running" })];
+  const snap = run([epic], new Map(), subs);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "sub-agent-running" }),
+  );
+});
+
+test("predicate 6.5 skipped when worker_phase !== 'done' (task path)", () => {
+  // Gate is gated on worker_phase==="done". A worker still mid-flight with
+  // worker_phase="open" never reaches the approval window, so git state
+  // doesn't matter yet — the gate is skipped and the row falls through.
+  // Here predicate 7 also fails (worker_phase != "done") so the row is
+  // ready (then per-epic/per-root mutexes apply, but with a single task,
+  // ready stands).
+  const task = makeTask({
+    worker_phase: "open",
+    approval: "pending",
+    jobs: [
+      makeEmbeddedJob({
+        plan_verb: "work",
+        state: "stopped",
+        git_dirty_count: 5,
+        git_orphan_count: 0,
+      }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "ready" });
+});
+
+test("predicate 6.5 skipped when embedded jobs[] has no work-verb entry (task path)", () => {
+  // The task has no worker job — only the close-verb / plan-verb jobs would
+  // live on the epic-level array. With no work-verb match, the predicate
+  // falls through to 7, which fires.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "job-pending" }),
+  );
+});
+
+test("predicate 6.5 picks the FRESHEST work-verb job when multiple exist", () => {
+  // The embedded array is sorted (created_at desc, job_id asc) by the
+  // reducer, so "freshest" is the first work-verb match in iteration order.
+  // Here the fresher worker has a clean tree and the stale one is dirty —
+  // the predicate reads the fresher one and falls through to predicate 7.
+  const fresh = makeEmbeddedJob({
+    job_id: "worker-fresh",
+    plan_verb: "work",
+    state: "stopped",
+    created_at: 200,
+    git_dirty_count: 0,
+    git_orphan_count: 0,
+  });
+  const stale = makeEmbeddedJob({
+    job_id: "worker-stale",
+    plan_verb: "work",
+    state: "stopped",
+    created_at: 100,
+    git_dirty_count: 5,
+    git_orphan_count: 0,
+  });
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [fresh, stale], // already sorted (created_at desc) like the reducer
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "job-pending" }),
+  );
+});
+
+test("predicate 6.5 fires for evaluateCloseRow with plan_verb='close' filter", () => {
+  // Close-row variant — the gate reads the epic-level embedded jobs[]
+  // filtered to close-verb. Epic.status === "done" gates the predicate;
+  // the close-verb job's git_dirty_count > 0 fires the block.
+  const task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+  });
+  const epic = makeEpic({
+    tasks: [task],
+    status: "done",
+    approval: "pending",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "stopped",
+        git_dirty_count: 4,
+        git_orphan_count: 0,
+      }),
+    ],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "git-uncommitted" }),
+  );
+});
+
+test("predicate 6.5 skipped when epic.status !== 'done' (close-row path)", () => {
+  // Gate is gated on epic.status==="done". An epic still mid-flight never
+  // reaches the close-approval window, so git state doesn't matter yet —
+  // the gate is skipped. Predicate 10 (dep-on-task-synthetic-close) then
+  // blocks the close row because the only task is not completed.
+  const task = makeTask({ task_id: "fn-1-foo.1", worker_phase: "open" });
+  const epic = makeEpic({
+    tasks: [task],
+    status: "open",
+    approval: "pending",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "stopped",
+        git_dirty_count: 5,
+        git_orphan_count: 0,
+      }),
+    ],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
+  );
+});
+
+test("predicate 6.5 skipped when close-verb job missing from epic.jobs (close-row path)", () => {
+  // Close row with epic.status==="done" but no close-verb embedded job —
+  // the predicate falls through to 7 which fires.
+  const task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+  });
+  const epic = makeEpic({
+    tasks: [task],
+    status: "done",
+    approval: "pending",
+    jobs: [], // no close-verb job
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
     blocked({ kind: "job-pending" }),
   );
 });
@@ -956,6 +1207,12 @@ test("formatPill renders the three tags + every reason kind", () => {
   );
   expect(formatPill(blocked({ kind: "sub-agent-running" }))).toBe(
     "[blocked:sub-agent-running]",
+  );
+  expect(formatPill(blocked({ kind: "git-uncommitted" }))).toBe(
+    "[blocked:git-uncommitted]",
+  );
+  expect(formatPill(blocked({ kind: "git-orphans" }))).toBe(
+    "[blocked:git-orphans]",
   );
   expect(
     formatPill(blocked({ kind: "dep-on-task", upstream: "fn-1-foo.2" })),

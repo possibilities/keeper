@@ -258,6 +258,313 @@ test("GitRootDropped on an unknown project_dir is a safe no-op", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Schema-v28 GitSnapshot → jobs fan-out — fn-620 mechanical git-cleanliness gate
+// ---------------------------------------------------------------------------
+
+test("GitSnapshot fans out git counts into jobs and the embedded jobs[] array", () => {
+  // Seed a worker session with a plan_ref so syncJobIntoEpic fires.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-worker",
+    spawn_name: "work::fn-1-foo.1",
+  });
+  // Seed a task snapshot so the parent epic / task element exists when the
+  // fan-out lands. Without it, syncJobIntoEpic would still shell-insert,
+  // but the explicit fold makes the test assertion easier to read.
+  insertEvent({
+    hook_event: "TaskSnapshot",
+    session_id: "fn-1-foo.1",
+    data: JSON.stringify({
+      task_id: "fn-1-foo.1",
+      epic_id: "fn-1-foo",
+      task_number: 1,
+      title: "task",
+      target_repo: null,
+      worker_phase: "open",
+      runtime_status: "todo",
+      approval: "pending",
+      depends_on: [],
+    }),
+  });
+
+  const snapshotId = insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: "abc",
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        { path: "src/a.ts", xy: " M" },
+        { path: "src/b.ts", xy: " M" },
+      ],
+      orphaned_files: [{ path: "orph.txt", xy: " M" }],
+      jobs: [
+        {
+          job_id: "sess-worker",
+          dirty: [
+            { path: "src/a.ts", xy: " M" },
+            { path: "src/b.ts", xy: " M" },
+          ],
+        },
+      ],
+    }),
+  });
+
+  expect(drainAll()).toBe(3);
+
+  // jobs row carries per-job dirty count + project-broadcast orphan count.
+  const row = db
+    .query(
+      "SELECT git_dirty_count, git_orphan_count FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-worker") as {
+    git_dirty_count: number;
+    git_orphan_count: number;
+  } | null;
+  expect(row).not.toBeNull();
+  expect(row?.git_dirty_count).toBe(2);
+  expect(row?.git_orphan_count).toBe(1);
+
+  // Embedded task element's jobs[] carries the same counts.
+  const epicRow = db
+    .query("SELECT tasks FROM epics WHERE epic_id = ?")
+    .get("fn-1-foo") as { tasks: string } | null;
+  expect(epicRow).not.toBeNull();
+  const tasksArr = JSON.parse(epicRow?.tasks ?? "[]") as Array<{
+    task_id: string;
+    jobs: Array<{
+      job_id: string;
+      git_dirty_count: number;
+      git_orphan_count: number;
+    }>;
+  }>;
+  const task = tasksArr.find((t) => t.task_id === "fn-1-foo.1");
+  expect(task).not.toBeUndefined();
+  const embeddedJob = task?.jobs.find((j) => j.job_id === "sess-worker");
+  expect(embeddedJob).not.toBeUndefined();
+  expect(embeddedJob?.git_dirty_count).toBe(2);
+  expect(embeddedJob?.git_orphan_count).toBe(1);
+
+  expect(getCursor()).toBe(snapshotId);
+});
+
+test("GitSnapshot UPDATE matches zero rows for a job with no SessionStart yet (safe no-op)", () => {
+  // The fan-out enumerates a job that hasn't folded yet — UPDATE matches
+  // zero rows, syncIfPlanRef SELECT returns null, no embedded write.
+  const snapshotId = insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M" }],
+      orphaned_files: [],
+      jobs: [
+        {
+          job_id: "sess-never-started",
+          dirty: [{ path: "src/a.ts", xy: " M" }],
+        },
+      ],
+    }),
+  });
+
+  expect(drainAll()).toBe(1);
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }
+  ).n;
+  expect(count).toBe(0);
+  expect(getCursor()).toBe(snapshotId);
+});
+
+test("GitRootDropped zeroes git counts via the canonical attribution; unrelated jobs untouched", () => {
+  // Seed two worker sessions in two different projects. A GitSnapshot in
+  // project A stamps worker A; a GitSnapshot in project B stamps worker B.
+  // GitRootDropped on project A clears worker A only; worker B stays put.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-a",
+    spawn_name: "work::fn-1-foo.1",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-b",
+    spawn_name: "work::fn-2-bar.1",
+  });
+
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo-a",
+    cwd: "/repo-a",
+    data: JSON.stringify({
+      project_dir: "/repo-a",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "x.ts", xy: " M" }],
+      orphaned_files: [{ path: "y.ts", xy: " M" }],
+      jobs: [{ job_id: "sess-a", dirty: [{ path: "x.ts", xy: " M" }] }],
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo-b",
+    cwd: "/repo-b",
+    data: JSON.stringify({
+      project_dir: "/repo-b",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        { path: "p.ts", xy: " M" },
+        { path: "q.ts", xy: " M" },
+      ],
+      orphaned_files: [],
+      jobs: [
+        {
+          job_id: "sess-b",
+          dirty: [
+            { path: "p.ts", xy: " M" },
+            { path: "q.ts", xy: " M" },
+          ],
+        },
+      ],
+    }),
+  });
+  const dropId = insertEvent({
+    hook_event: "GitRootDropped",
+    session_id: "/repo-a",
+    cwd: "/repo-a",
+    data: "",
+  });
+
+  expect(drainAll()).toBe(5);
+
+  // sess-a counts cleared by the symmetric clear.
+  const rowA = db
+    .query(
+      "SELECT git_dirty_count, git_orphan_count FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-a") as {
+    git_dirty_count: number;
+    git_orphan_count: number;
+  } | null;
+  expect(rowA?.git_dirty_count).toBe(0);
+  expect(rowA?.git_orphan_count).toBe(0);
+
+  // sess-b in the other project stays untouched.
+  const rowB = db
+    .query(
+      "SELECT git_dirty_count, git_orphan_count FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-b") as {
+    git_dirty_count: number;
+    git_orphan_count: number;
+  } | null;
+  expect(rowB?.git_dirty_count).toBe(2);
+  expect(rowB?.git_orphan_count).toBe(0);
+
+  expect(getCursor()).toBe(dropId);
+});
+
+test("from-scratch re-fold reproduces the GitSnapshot fan-out byte-identically", () => {
+  // Seed a sequence: SessionStart, TaskSnapshot, GitSnapshot (stamps counts),
+  // GitSnapshot (refresh — different dirty count), GitRootDropped (clears).
+  // After every fold the jobs row + embedded array carry the predictable
+  // counts. Rewind cursor + DELETE FROM jobs + DELETE FROM epics + redrain;
+  // the post-rewind rows must equal byte-for-byte the pre-rewind rows.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-w",
+    spawn_name: "work::fn-1-foo.1",
+  });
+  insertEvent({
+    hook_event: "TaskSnapshot",
+    session_id: "fn-1-foo.1",
+    data: JSON.stringify({
+      task_id: "fn-1-foo.1",
+      epic_id: "fn-1-foo",
+      task_number: 1,
+      title: "task",
+      target_repo: null,
+      worker_phase: "open",
+      runtime_status: "todo",
+      approval: "pending",
+      depends_on: [],
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M" }],
+      orphaned_files: [{ path: "orph.txt", xy: " M" }],
+      jobs: [{ job_id: "sess-w", dirty: [{ path: "src/a.ts", xy: " M" }] }],
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [],
+      orphaned_files: [],
+      jobs: [{ job_id: "sess-w", dirty: [] }],
+    }),
+  });
+  drainAll();
+
+  const beforeJobs = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  const beforeEpics = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const beforeGit = db
+    .query("SELECT * FROM git_status ORDER BY project_dir")
+    .all();
+
+  // Rewind + wipe + re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM git_status");
+  drainAll();
+
+  const afterJobs = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  const afterEpics = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const afterGit = db
+    .query("SELECT * FROM git_status ORDER BY project_dir")
+    .all();
+
+  expect(afterJobs).toEqual(beforeJobs);
+  expect(afterEpics).toEqual(beforeEpics);
+  expect(afterGit).toEqual(beforeGit);
+});
+
+// ---------------------------------------------------------------------------
 // UsageSnapshot / UsageDeleted reducer arms — fn-615-add-agentuse-usage-collection
 // ---------------------------------------------------------------------------
 

@@ -9,7 +9,7 @@
  * fixture pin a verdict for a given snapshot, and lets autopilot consume the
  * verdict's discriminated-union tag without parsing strings.
  *
- * Predicate pipeline — first-match-wins, twelve ordered checks per row:
+ * Predicate pipeline — first-match-wins, fourteen ordered checks per row:
  *   1. terminal-completed          — task: status==="done" && approval==="approved"
  *                                    close: epic.status==="done" && epic.approval==="approved"
  *   2. epic-not-validated          — parent epic.last_validated_at == null
@@ -25,6 +25,20 @@
  *                                    && status==="running"
  *                                    close: same predicate but joined against worker session ids from
  *                                    epic-level AND every task-level embedded jobs[]
+ *   6.5. git-uncommitted / git-orphans
+ *                                  — task (gated worker_phase==="done"): pick the freshest worker-verb
+ *                                    embedded jobs[] entry; if its git_dirty_count > 0 → git-uncommitted,
+ *                                    else if git_orphan_count > 0 → git-orphans. Skipped when no
+ *                                    work-verb entry exists or worker_phase !== "done".
+ *                                    close (gated epic.status==="done"): same idea against close-verb
+ *                                    embedded jobs[] on the epic. Mechanical gate that lifts the
+ *                                    inferred git cleanliness check out of /plan:approve's LLM cascade
+ *                                    into keeper's deterministic readiness pipeline. Placed AFTER
+ *                                    session-running (5/6) and BEFORE approval-pending (7) for the
+ *                                    same race rationale as predicate 7: the gate must wait until
+ *                                    every worker session and sub-agent is actually idle before
+ *                                    sampling git state, otherwise mid-yield Stops produce stale
+ *                                    dirty-tree readings that flap the pill.
  *   7. own-approval-pending        — task.approval==="pending" && status==="done" → job-pending
  *                                    close: epic.approval==="pending" && epic.status==="done" → job-pending
  *                                    Deliberately ranks BELOW 5/6: `worker_phase==="done"` is stamped
@@ -72,6 +86,13 @@ import type { Epic, Job, SubagentInvocation, Task } from "./types";
  * - `planner-running`                  — a creator/refiner job for this epic is `working`.
  * - `job-running`                      — an embedded `jobs[]` entry on this row is `working`.
  * - `sub-agent-running`                — a sub-agent invocation for this row's worker is `running`.
+ * - `git-uncommitted`                  — the freshest worker/close-verb embedded job's `git_dirty_count > 0`
+ *                                        (mechanical gate inserted at rank 6.5; payload-less by design — see
+ *                                        the predicate-pipeline docstring for the rationale on placement).
+ * - `git-orphans`                      — the freshest worker/close-verb embedded job's `git_orphan_count > 0`
+ *                                        (mechanical gate inserted at rank 6.5; payload-less by design —
+ *                                        complements `git-uncommitted` and fires when dirty count is zero
+ *                                        but the project has orphan files).
  * - `dep-on-task`                      — an upstream task is not completed (carries the upstream id).
  * - `dep-on-epic`                      — an upstream epic's close is not completed.
  * - `single-task-per-epic`             — lost the per-epic mutex (a sibling row in the same epic is non-completed).
@@ -85,6 +106,8 @@ export type BlockReason =
   | { kind: "planner-running" }
   | { kind: "job-running" }
   | { kind: "sub-agent-running" }
+  | { kind: "git-uncommitted" }
+  | { kind: "git-orphans" }
   | { kind: "dep-on-task"; upstream: string }
   | { kind: "dep-on-epic"; upstream: string }
   | { kind: "single-task-per-epic" }
@@ -264,6 +287,33 @@ function evaluateTask(
     return { tag: "blocked", reason: { kind: "sub-agent-running" } };
   }
 
+  // 6.5. git-uncommitted / git-orphans — mechanical gate that blocks autopilot's
+  // /plan:approve dispatch when the worker's worktree has uncommitted dirty
+  // files or the project has orphan files. Lifted from the /plan:approve
+  // skill's inferred LLM-as-judge cascade into this deterministic predicate.
+  //
+  // Gated on `worker_phase==="done"` (planctl stamped `worker_done_at`): the
+  // task hasn't reached the approval window before that, so the git state
+  // can't matter yet. Placed between 6 and 7 for the same race rationale as
+  // predicate 7: until every worker session AND every sub-agent is actually
+  // idle, the git read could capture a mid-yield Stop's stale dirty-tree
+  // reading and flap the pill. The freshest worker job is the first
+  // `plan_verb === 'work'` entry in `task.jobs` (already sorted
+  // `(created_at desc, job_id asc)` by `sortEmbeddedJobs` — first match in
+  // iteration order). An empty filtered selection → skip this predicate and
+  // fall through to 7.
+  if (task.worker_phase === "done") {
+    const worker = pickFreshestEmbeddedJobByVerb(task.jobs, "work");
+    if (worker !== undefined) {
+      if (worker.git_dirty_count > 0) {
+        return { tag: "blocked", reason: { kind: "git-uncommitted" } };
+      }
+      if (worker.git_orphan_count > 0) {
+        return { tag: "blocked", reason: { kind: "git-orphans" } };
+      }
+    }
+  }
+
   // 7. own-approval-pending — deliberately ranks BELOW 5/6. `worker_phase`
   // flips to "done" when planctl stamps `worker_done_at`, which can race
   // ahead of the Claude session's Stop/SessionEnd (planctl `done` returns
@@ -382,6 +432,27 @@ function evaluateCloseRow(
   for (const task of epic.tasks) {
     if (anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId)) {
       return { tag: "blocked", reason: { kind: "sub-agent-running" } };
+    }
+  }
+
+  // 6.5. git-uncommitted / git-orphans — close-row variant. Gated on
+  // `epic.status === "done"` (planctl stamped the epic-level done status):
+  // the close row hasn't reached the approval window before that, so the
+  // git state can't matter yet. Same placement rationale as the task path
+  // (between 6 and 7 to avoid mid-yield Stop's stale dirty-tree readings).
+  // The freshest close-verb job is the first `plan_verb === 'close'` entry
+  // in `epic.jobs` (already sorted `(created_at desc, job_id asc)` —
+  // first match in iteration order). An empty filtered selection → skip
+  // and fall through to 7.
+  if (epic.status === "done") {
+    const closer = pickFreshestEmbeddedJobByVerb(epic.jobs, "close");
+    if (closer !== undefined) {
+      if (closer.git_dirty_count > 0) {
+        return { tag: "blocked", reason: { kind: "git-uncommitted" } };
+      }
+      if (closer.git_orphan_count > 0) {
+        return { tag: "blocked", reason: { kind: "git-orphans" } };
+      }
     }
   }
 
@@ -663,6 +734,38 @@ function anyEmbeddedJobHasRunningSubagent(
   return false;
 }
 
+/**
+ * Predicate 6.5 (`git-uncommitted` / `git-orphans`). Pick the freshest
+ * embedded job whose `plan_verb` matches the supplied verb filter (typically
+ * `"work"` for the task path, `"close"` for the close-row path). The
+ * embedded array is already sorted `(created_at desc, job_id asc)` by
+ * `sortEmbeddedJobs` in the reducer, so "freshest" == first match in
+ * iteration order. Returns `undefined` when no entry matches the verb —
+ * callers fall through to the next predicate.
+ */
+function pickFreshestEmbeddedJobByVerb(
+  embedded:
+    | {
+        plan_verb: string;
+        git_dirty_count: number;
+        git_orphan_count: number;
+      }[]
+    | undefined,
+  verb: string,
+):
+  | { plan_verb: string; git_dirty_count: number; git_orphan_count: number }
+  | undefined {
+  if (embedded === undefined) {
+    return undefined;
+  }
+  for (const job of embedded) {
+    if (job.plan_verb === verb) {
+      return job;
+    }
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Format helper
 // ---------------------------------------------------------------------------
@@ -697,6 +800,10 @@ function formatReasonShort(reason: BlockReason): string {
       return "job-running";
     case "sub-agent-running":
       return "sub-agent-running";
+    case "git-uncommitted":
+      return "git-uncommitted";
+    case "git-orphans":
+      return "git-orphans";
     case "dep-on-task":
       return `dep-on-task ${reason.upstream}`;
     case "dep-on-epic":
