@@ -41,24 +41,38 @@
  * then growing history at the bottom so completed entries don't push
  * live state around).
  *
- * The first three (current / queued / completed) are scoped to THIS
- * RUN — they never show dispatches that landed before the UI started.
- * On startup `hydrateDispatchLog` folds the on-disk log back into the
- * durable `dispatchedKeys` / `fulfilledKeys` / `completedKeys` sets
- * (so the re-dispatch guard survives restarts), but the in-memory
- * `dispatchLog` array that drives them starts empty. This-run
- * dispatches partition three ways: rows whose key has been observed
- * terminal (`state in {ended, killed}`) render under
- * `--- completed ---`; rows whose key has been observed registered
- * but not yet terminal render under `--- current ---`; rows still
- * waiting on the agent to boot render under `--- queued ---`. In wet
- * mode queued is transient (~1-3 frames between dispatch and
- * SessionStart fold); in dry mode it persists for the lifetime of the
- * run since no claude session is actually spawned. A real mid-flight
- * crash loses display state for in-flight dispatches — the dispatches
- * themselves still happened (Ghostty windows exist; dispatch.log
- * records them), and the re-dispatch guard still fires, but they
- * won't re-appear in the frame on restart.
+ * `--- current ---` survives a restart; `--- queued ---` and
+ * `--- completed ---` are scoped to THIS RUN. On startup
+ * `hydrateDispatchLog` folds the on-disk log back into the durable
+ * `dispatchedKeys` / `fulfilledKeys` / `completedKeys` sets (so the
+ * re-dispatch guard survives restarts) AND walks the parsed launch
+ * rows a second time, returning `restoredEntries`: every
+ * `kind:"launch"` row where `fulfilledKeys.has(key) &&
+ * !completedKeys.has(key) && !dry`, deduped latest-per-key (later
+ * `ts` wins), sorted by `ts` ascending. `main()` seeds the in-memory
+ * `dispatchLog` array from `restoredEntries`, so a prior-run
+ * still-running dispatch renders under `--- current ---` on the very
+ * first frame. If the matching embedded job has since fallen off the
+ * projection (parent epic became done+approved or was
+ * `planctl epic-delete`d), `detectJobTransitions`'s disappearance
+ * branch migrates the key to `completedKeys` on the first
+ * post-startup snapshot and the row moves to `--- completed ---`.
+ * Dispatches partition three ways: rows whose key has been observed
+ * terminal (`state in {ended, killed}`) or whose fulfilled job has
+ * disappeared from the snapshot render under `--- completed ---`;
+ * rows whose key has been observed registered but not yet terminal
+ * render under `--- current ---`; rows still waiting on the agent to
+ * boot render under `--- queued ---`. In wet mode queued is transient
+ * (~1-3 frames between dispatch and SessionStart fold); in dry mode
+ * it persists for the lifetime of the run since no claude session is
+ * actually spawned (and dry launches are deliberately NOT restored
+ * across runs — they can never reach fulfillment). A real mid-flight
+ * crash now PRESERVES `--- current ---` (the next run rehydrates it
+ * from disk via the filter above); `--- queued ---` is still lost
+ * across the crash because a queued dispatch has no `fulfilled` line
+ * yet, and `--- completed ---` is still scoped to this run because
+ * completed entries are forensic history the human can tail in
+ * `dispatch.log`.
  *
  * A new frame is emitted immediately after each dispatch AND whenever
  * `detectJobTransitions` observes a key flip from queued → current or
@@ -172,22 +186,38 @@ The frame has four named-header sections, each emitted only when
 non-empty, rendered in this order: '--- current ---',
 '--- queued ---', '--- predicted ---', '--- completed ---'.
 
-The current/queued/completed sections are scoped to this run — they
-never show dispatches that landed before the UI started. Within the
-run, dispatches partition three ways: rows observed terminal
-(state in {ended, killed}) render under '--- completed ---'; rows
-observed registered but not yet terminal render under
+'--- current ---' survives a restart; '--- queued ---' and
+'--- completed ---' are scoped to this run. On startup
+hydrateDispatchLog folds the on-disk log back into the durable
+dispatchedKeys / fulfilledKeys / completedKeys sets AND restores any
+launch row where fulfilled && !completed && !dry (latest-per-key
+wins, sorted by ts ascending) into the in-memory display array, so
+prior-run still-running dispatches re-appear under '--- current ---'
+on the first frame. If a restored entry's matching embedded job has
+since disappeared from the projection (parent epic became
+done+approved or was planctl epic-deleted), the disappearance rule
+in detectJobTransitions migrates it to '--- completed ---' on the
+first post-startup snapshot.
+
+Within a run, dispatches partition three ways: rows observed
+terminal (state in {ended, killed}) — OR (post-fulfillment)
+disappeared from the snapshot — render under '--- completed ---';
+rows observed registered but not yet terminal render under
 '--- current ---'; rows still waiting on the agent to boot render
 under '--- queued ---'. In wet mode queued is transient (~1-3 frames
 before SessionStart folds); in dry mode it persists for the lifetime
-of the run. The JSONL log at ~/.local/state/keeper/dispatch.log
-carries three kinds — 'launch' (every dispatch), 'fulfilled' (first
-observation of the registered session), and 'completed' (first
-observation of the session in a terminal state) — and is folded
-into the durable re-dispatch guard on startup so cross-run double-
-fires are suppressed, but the in-memory display array starts empty
-each run. A new frame is emitted after each dispatch AND whenever a
-row moves between sections.
+of the run, and dry launches are deliberately NOT restored across
+runs since they can never reach fulfillment. The JSONL log at
+~/.local/state/keeper/dispatch.log carries three kinds — 'launch'
+(every dispatch), 'fulfilled' (first observation of the registered
+session), and 'completed' (first observation of the session in a
+terminal state OR first post-fulfillment disappearance) — and
+drives both the durable re-dispatch guard and the cross-run
+current-section restore. A real mid-flight crash now preserves
+'--- current ---' (next run rehydrates it from disk); '--- queued ---'
+is still lost across the crash because a queued dispatch has no
+fulfilled line yet. A new frame is emitted after each dispatch AND
+whenever a row moves between sections.
 
 The '--- predicted ---' section previews the next dispatches autopilot
 will fire as a direct consequence of the embedded jobs currently in
@@ -760,15 +790,37 @@ export function hydrateDispatchLog(path: string): {
   dispatchedKeys: Set<string>;
   fulfilledKeys: Set<string>;
   completedKeys: Set<string>;
+  // Launch rows that were fulfilled but NOT completed and NOT dry,
+  // parsed back into the in-memory `DispatchEntry` shape so the
+  // `--- current ---` section can survive a restart. Latest-per-key
+  // wins (a later `ts` overwrites an earlier launch for the same
+  // `(verb, id)`), then the array is sorted by `ts` ascending so the
+  // oldest-first frame ordering is preserved. The partition logic at
+  // the render seam already keys off `completedKeys` /
+  // `fulfilledKeys`, so the restored entries automatically land under
+  // `--- current ---` without further main()-side intervention.
+  restoredEntries: DispatchEntry[];
 } {
   const dispatchedKeys = new Set<string>();
   const fulfilledKeys = new Set<string>();
   const completedKeys = new Set<string>();
+  // Buffer every parsed `kind:"launch"` row keyed by `(verb, id)` so
+  // we can apply the latest-per-key rule in a second pass — at parse
+  // time we don't yet know whether the key will end up in
+  // `completedKeys`, so the filter (`fulfilledKeys.has(key) &&
+  // !completedKeys.has(key) && !dry`) has to wait for the first pass
+  // to finish populating the three sets.
+  const launchRows = new Map<string, DispatchEntry>();
   let content: string;
   try {
     content = readFileSync(path, "utf8");
   } catch {
-    return { dispatchedKeys, fulfilledKeys, completedKeys };
+    return {
+      dispatchedKeys,
+      fulfilledKeys,
+      completedKeys,
+      restoredEntries: [],
+    };
   }
   for (const line of content.split("\n")) {
     if (line.trim() === "") {
@@ -788,13 +840,73 @@ export function hydrateDispatchLog(path: string): {
     const key = `${verb}::${id}`;
     if (row.kind === "launch") {
       dispatchedKeys.add(key);
+      // Parse the launch row into a `DispatchEntry` shape. Every
+      // field needed by the renderer already lives on the line (see
+      // `logDispatch`); type-guard each one and skip silently on a
+      // shape mismatch (forensic log, not the event store).
+      if (verb !== "work" && verb !== "close" && verb !== "approve") {
+        continue;
+      }
+      const ts = row.ts;
+      const rowId = row.rowId;
+      const dir = row.dir;
+      const dirFull = row.dirFull;
+      const command = row.command;
+      if (
+        typeof ts !== "string" ||
+        typeof rowId !== "string" ||
+        typeof dir !== "string" ||
+        typeof dirFull !== "string" ||
+        typeof command !== "string"
+      ) {
+        continue;
+      }
+      const dry = row.dry === true;
+      const pid = typeof row.pid === "number" ? row.pid : undefined;
+      const entry: DispatchEntry = {
+        ts,
+        kind: "launch",
+        rowId,
+        dir,
+        dirFull,
+        verb,
+        id,
+        command,
+        ...(dry ? { dry: true } : {}),
+        ...(pid !== undefined ? { pid } : {}),
+      };
+      // Latest-per-key wins. A historical re-dispatch for the same
+      // `(verb, id)` (rare — the durable guard suppresses it — but
+      // possible if `dispatch.log` is older than `dispatchedKeys`)
+      // collapses to the most recent row.
+      const prev = launchRows.get(key);
+      if (prev === undefined || prev.ts <= ts) {
+        launchRows.set(key, entry);
+      }
     } else if (row.kind === "fulfilled") {
       fulfilledKeys.add(key);
     } else if (row.kind === "completed") {
       completedKeys.add(key);
     }
   }
-  return { dispatchedKeys, fulfilledKeys, completedKeys };
+  // Second pass: apply the restore filter (`fulfilled && !completed
+  // && !dry`) against the now-complete three sets, then sort by `ts`
+  // ascending to preserve the oldest-first frame ordering.
+  const restoredEntries: DispatchEntry[] = [];
+  for (const [key, entry] of launchRows) {
+    if (!fulfilledKeys.has(key)) {
+      continue;
+    }
+    if (completedKeys.has(key)) {
+      continue;
+    }
+    if (entry.dry === true) {
+      continue;
+    }
+    restoredEntries.push(entry);
+  }
+  restoredEntries.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  return { dispatchedKeys, fulfilledKeys, completedKeys, restoredEntries };
 }
 
 /**
@@ -1049,9 +1161,20 @@ async function main(): Promise<void> {
   // `kind:"fulfilled"` and `kind:"completed"` lines are written the
   // first time the snapshot shows an embedded job for the dispatched
   // row+verb and the first time that job's `state` is observed terminal.
-  const { dispatchedKeys, fulfilledKeys, completedKeys } =
+  const { dispatchedKeys, fulfilledKeys, completedKeys, restoredEntries } =
     hydrateDispatchLog(dispatchLogPath);
-  const dispatchLog: DispatchEntry[] = [];
+  // Seed the in-memory display array from any prior-run launches that
+  // were fulfilled but not completed (and not dry) — so a still-running
+  // cross-run dispatch renders under `--- current ---` immediately on
+  // startup instead of waiting for the next snapshot transition. The
+  // partition logic in `renderDispatchFrame` already keys off
+  // `completedKeys` / `fulfilledKeys`, so the restored entries land
+  // under `--- current ---` automatically; if the matching job has
+  // since fallen off the projection (epic became done+approved or was
+  // epic-deleted), `detectJobTransitions`'s disappearance branch
+  // migrates the key to `completedKeys` on the first post-startup
+  // snapshot and the row moves to `--- completed ---`.
+  const dispatchLog: DispatchEntry[] = restoredEntries;
 
   function renderDispatchFrame(): string[] {
     // Four named-header sections, each only emitted when non-empty,

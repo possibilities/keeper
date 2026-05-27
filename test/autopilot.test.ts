@@ -24,12 +24,16 @@
  */
 
 import { expect, test } from "bun:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type {
   DetectJobTransitionsDeps,
   DispatchEntry,
 } from "../scripts/autopilot";
 import {
   detectJobTransitions,
+  hydrateDispatchLog,
   predictNextDispatches,
   renderEpicCommands,
   renderEpicCommandsFiltered,
@@ -738,4 +742,267 @@ test("detectJobTransitions — fulfilled key disappears from snapshot reaches co
   expect(captured.length).toBe(2);
   expect(completedKeys.has("approve::fn-2-bar")).toBe(false);
   expect(fulfilledKeys.has("approve::fn-2-bar")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// hydrateDispatchLog — restoredEntries cross-run survival of `--- current ---`.
+//
+// `hydrateDispatchLog` already folded the three durable sets
+// (`dispatchedKeys` / `fulfilledKeys` / `completedKeys`) before
+// fn-625; this batch widens its return shape with `restoredEntries:
+// DispatchEntry[]` so prior-run launches that are
+// `fulfilled && !completed && !dry` can re-populate the in-memory
+// `dispatchLog` array on startup. The filter is the contract the
+// section partition logic in `renderDispatchFrame` consumes
+// downstream — restored entries automatically land under
+// `--- current ---` because their key is in `fulfilledKeys` but not
+// `completedKeys`. The seven cases below pin every load-bearing
+// property the task spec calls out.
+// ---------------------------------------------------------------------------
+
+function writeDispatchLog(rows: Array<Record<string, unknown>>): string {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-autopilot-hydrate-"));
+  const path = join(dir, "dispatch.log");
+  writeFileSync(path, `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`);
+  return path;
+}
+
+test("hydrateDispatchLog — launch + fulfilled + !completed + !dry → restored", () => {
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-1",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+      pid: 42,
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:02.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries, fulfilledKeys, completedKeys } =
+    hydrateDispatchLog(path);
+  expect(fulfilledKeys.has("work::fn-1-foo.1")).toBe(true);
+  expect(completedKeys.has("work::fn-1-foo.1")).toBe(false);
+  expect(restoredEntries.length).toBe(1);
+  const entry = restoredEntries[0] as DispatchEntry;
+  expect(entry.verb).toBe("work");
+  expect(entry.id).toBe("fn-1-foo.1");
+  expect(entry.dir).toBe("repo");
+  expect(entry.dirFull).toBe("/repo");
+  expect(entry.command).toBe("cd /repo && claude '/plan:work fn-1-foo.1'");
+  expect(entry.ts).toBe("2026-05-27T00:00:01.000Z");
+  expect(entry.dry).toBeUndefined();
+  expect(entry.pid).toBe(42);
+});
+
+test("hydrateDispatchLog — launch + fulfilled + completed → NOT restored", () => {
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-1",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+      pid: 42,
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:02.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+    {
+      kind: "completed",
+      ts: "2026-05-27T00:00:03.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries, completedKeys } = hydrateDispatchLog(path);
+  expect(completedKeys.has("work::fn-1-foo.1")).toBe(true);
+  expect(restoredEntries.length).toBe(0);
+});
+
+test("hydrateDispatchLog — launch only (no fulfilled) → NOT restored", () => {
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-1",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries, dispatchedKeys, fulfilledKeys } =
+    hydrateDispatchLog(path);
+  expect(dispatchedKeys.has("work::fn-1-foo.1")).toBe(true);
+  expect(fulfilledKeys.has("work::fn-1-foo.1")).toBe(false);
+  expect(restoredEntries.length).toBe(0);
+});
+
+test("hydrateDispatchLog — dry launch + fulfilled → NOT restored", () => {
+  // Dry launches can never reach fulfillment in production (no real
+  // session boots), but pinning the dry filter independently of that
+  // invariant prevents a future log-format quirk from leaking a dry
+  // entry into the live UI.
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-1",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+      dry: true,
+      pid: 42,
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:02.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries } = hydrateDispatchLog(path);
+  expect(restoredEntries.length).toBe(0);
+});
+
+test("hydrateDispatchLog — two launches same (verb,id) different ts → latest wins", () => {
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-old",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1' OLD",
+      pid: 41,
+    },
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:05.000Z",
+      rowId: "row-new",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1' NEW",
+      pid: 42,
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:06.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries } = hydrateDispatchLog(path);
+  expect(restoredEntries.length).toBe(1);
+  const entry = restoredEntries[0] as DispatchEntry;
+  expect(entry.rowId).toBe("row-new");
+  expect(entry.command).toBe("cd /repo && claude '/plan:work fn-1-foo.1' NEW");
+  expect(entry.ts).toBe("2026-05-27T00:00:05.000Z");
+  expect(entry.pid).toBe(42);
+});
+
+test("hydrateDispatchLog — multiple keys → restoredEntries sorted by ts ascending", () => {
+  const path = writeDispatchLog([
+    // Intentionally write launches out of `ts` order to prove the
+    // sort step (not just insertion order) is the source of the
+    // ascending arrangement.
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:05.000Z",
+      rowId: "row-c",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-3-baz.1",
+      command: "c",
+    },
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-a",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "a",
+    },
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:03.000Z",
+      rowId: "row-b",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-2-bar.1",
+      command: "b",
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:10.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:11.000Z",
+      verb: "work",
+      id: "fn-2-bar.1",
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:12.000Z",
+      verb: "work",
+      id: "fn-3-baz.1",
+    },
+  ]);
+  const { restoredEntries } = hydrateDispatchLog(path);
+  expect(restoredEntries.length).toBe(3);
+  expect(restoredEntries.map((e) => e.id)).toEqual([
+    "fn-1-foo.1",
+    "fn-2-bar.1",
+    "fn-3-baz.1",
+  ]);
+  expect(restoredEntries.map((e) => e.ts)).toEqual([
+    "2026-05-27T00:00:01.000Z",
+    "2026-05-27T00:00:03.000Z",
+    "2026-05-27T00:00:05.000Z",
+  ]);
+});
+
+test("hydrateDispatchLog — missing file → empty restoredEntries (no throw)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-autopilot-hydrate-"));
+  const path = join(dir, "does-not-exist.log");
+  const result = hydrateDispatchLog(path);
+  expect(result.restoredEntries).toEqual([]);
+  expect(result.dispatchedKeys.size).toBe(0);
+  expect(result.fulfilledKeys.size).toBe(0);
+  expect(result.completedKeys.size).toBe(0);
 });
