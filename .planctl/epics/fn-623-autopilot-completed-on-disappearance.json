@@ -1,5 +1,5 @@
 {
-  "approval": "rejected",
+  "approval": "approved",
   "branch_name": "fn-623-autopilot-completed-on-disappearance",
   "bundles": [
     "sketch/autopilot-completed-on-disappearance"
@@ -19,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-27T19:59:38.441391Z"
+  "updated_at": "2026-05-27T20:00:10.173911Z"
 }
