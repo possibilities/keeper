@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "add migrate:false stale-schema test",
-  "updated_at": "2026-05-27T18:55:43.886220Z"
+  "updated_at": "2026-05-27T20:22:39.399232Z",
+  "worker_done_at": "2026-05-27T20:22:39.399232Z"
 }

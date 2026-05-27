@@ -15,5 +15,5 @@ Add a test that: (1) creates the events table with a minimal older column set (m
 - [ ] Hook outer-guard contract (exits 0 on throw) is documented or confirmed covered
 
 ## Done summary
-
+Added stale-schema test for migrate:false: hand-rolls events table missing newer columns (planctl_*, tool_use_id, config_dir, planctl_queue_jump), asserts openDb throws a column-binding error (no such column / has no column) distinct from the 'no such table' empty-DB error path. Pins the CLAUDE.md hook outer-guard contract for stale-schema arrivals.
 ## Evidence
