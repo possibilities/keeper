@@ -29,44 +29,49 @@
  *    the matching `dispatchedKeys` set so a session-ended → verdict-
  *    flips-back-to-ready cycle cannot open a second Ghostty window.
  *
- * Section 1 is scoped to THIS RUN — it never shows dispatches that
- * landed before the UI started. On startup `hydrateDispatchLog` folds
- * the on-disk log back into the durable `dispatchedKeys` /
+ * The frame has three named-header sections, each emitted only when
+ * non-empty: `--- current ---`, `--- queued ---`, `--- predicted ---`.
+ *
+ * The first two are scoped to THIS RUN — they never show dispatches
+ * that landed before the UI started. On startup `hydrateDispatchLog`
+ * folds the on-disk log back into the durable `dispatchedKeys` /
  * `fulfilledKeys` sets (so the re-dispatch guard survives restarts),
- * but the in-memory `dispatchLog` array that drives section 1 starts
- * empty. Section 1 partitions this-run's dispatches on fulfillment:
- * rows whose key has been observed registered ("current") render above,
- * then a blank-line gutter, then rows still waiting on the agent to
- * boot ("queued") below. In wet mode queued is transient (~1-3 frames
- * between dispatch and SessionStart fold); in dry mode it persists
- * for the lifetime of the run since no claude session is actually
- * spawned. A real mid-flight crash loses section-1 display state for
- * in-flight dispatches — the dispatches themselves still happened
- * (Ghostty windows exist; dispatch.log records them), and the
- * re-dispatch guard still fires, but they won't re-appear in the
- * frame on restart.
+ * but the in-memory `dispatchLog` array that drives them starts empty.
+ * This-run dispatches partition on fulfillment: rows whose key has
+ * been observed registered render under `--- current ---`; rows still
+ * waiting on the agent to boot render under `--- queued ---`. In wet
+ * mode queued is transient (~1-3 frames between dispatch and
+ * SessionStart fold); in dry mode it persists for the lifetime of the
+ * run since no claude session is actually spawned. A real mid-flight
+ * crash loses display state for in-flight dispatches — the dispatches
+ * themselves still happened (Ghostty windows exist; dispatch.log
+ * records them), and the re-dispatch guard still fires, but they
+ * won't re-appear in the frame on restart.
  *
  * A new frame is emitted immediately after each dispatch AND whenever
  * `detectFulfillments` observes a key flip from queued → current.
  *
- * Below a `---` separator (only present when non-empty), the frame
- * previews the next dispatches autopilot will fire as current sessions
- * finish — approvals first, then informational `git-dirty::<id>` rows
- * (worker's future verdict is `git-uncommitted` / `git-orphans`,
- * collapsed to one signal; renders alongside the others but has NO
- * dispatch behind it — the human resolves it by cleaning the worktree,
- * after which the row drops off and re-appears as `approve::<id>`),
- * then workers, then closers (rows that flip blocked→ready in a
- * simulation that forces every currently-active row to completed).
- * Preview rows are single-line `(<dir>) <verb>::<id> [<pill>]` where
- * the pill is `[claude]` for dispatch-backed rows (approve / work /
- * close) and `[info]` for the informational `git-dirty` row — no
- * `[dry]` tag, no shell-command footer. The preview recomputes from the live
- * readiness snapshot on every emit; section 1 above the `---` is the
- * per-run current+queued view described above:
+ * The `--- predicted ---` section previews the next dispatches
+ * autopilot will fire as current sessions finish — approvals first,
+ * then informational `git-dirty::<id>` rows (worker's future verdict
+ * is `git-uncommitted` / `git-orphans`, collapsed to one signal;
+ * renders alongside the others but has NO dispatch behind it — the
+ * human resolves it by cleaning the worktree, after which the row
+ * drops off and re-appears as `approve::<id>`), then workers, then
+ * closers (rows that flip blocked→ready in a simulation that forces
+ * every currently-active row to completed). Preview rows are
+ * single-line `(<dir>) [<pill>] <verb>::<id>` where the pill sits
+ * immediately after the dir column and is `[claude]` for dispatch-
+ * backed rows (approve / work / close) or `[info  ]` for the
+ * informational `git-dirty` row (label right-padded to "claude"'s
+ * width so all pills are 8 chars). The dir column itself is padded to
+ * the widest `(<dir>) ` across the predicted rows so pills align
+ * across projects. No `[dry]` tag, no shell-command footer. The
+ * preview recomputes from the live readiness snapshot on every emit:
  *
+ *   --- current ---
  *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
- *   ---
+ *   --- predicted ---
  *   (keeper) approve::fn-619-pin-inputrequest-mid-subagent-state.1 [claude]
  *   (keeper) git-dirty::fn-619-pin-inputrequest-mid-subagent-state.2 [info]
  *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.3 [claude]
@@ -150,26 +155,29 @@ summary form is '(<dir>) <verb>::<id>'; dry runs append the would-have
     cd /Users/mike/code/keeper && \\
       claude '/plan:approve fn-619-pin-inputrequest-mid-subagent-state.1'
 
-Section 1 is scoped to this run — it never shows dispatches that
-landed before the UI started. Within the run, it partitions on
-fulfillment: rows whose dispatched (verb, id) has been observed
-registered in keeper land in "current" (above); rows still waiting on
-the agent to boot land in "queued" (below), separated by a blank-line
-gutter. In wet mode queued is transient (~1-3 frames before
-SessionStart folds); in dry mode it persists for the lifetime of the
-run. The JSONL log at ~/.local/state/keeper/dispatch.log carries two
-kinds — 'launch' (every dispatch) and 'fulfilled' (first observation
-of the registered session) — and is folded into the durable
-re-dispatch guard on startup so cross-run double-fires are
-suppressed, but the section-1 array starts empty each run. A new
-frame is emitted after each dispatch AND whenever a queued row moves
-to current.
+The frame has three named-header sections, each emitted only when
+non-empty: '--- current ---', '--- queued ---', '--- predicted ---'.
 
-Below a '---' separator (only when non-empty), the frame previews the next
-dispatches autopilot will fire as a direct consequence of the embedded
-jobs currently in flight. All four buckets fall out of one simulation
-pass: every working embedded job has its post-completion effect mirrored
-onto the owning row (work→worker_phase=done, close→epic.status=done,
+The current/queued sections are scoped to this run — they never show
+dispatches that landed before the UI started. Within the run,
+dispatches partition on fulfillment: rows whose dispatched (verb, id)
+has been observed registered in keeper render under
+'--- current ---'; rows still waiting on the agent to boot render
+under '--- queued ---'. In wet mode queued is transient (~1-3 frames
+before SessionStart folds); in dry mode it persists for the lifetime
+of the run. The JSONL log at ~/.local/state/keeper/dispatch.log
+carries two kinds — 'launch' (every dispatch) and 'fulfilled' (first
+observation of the registered session) — and is folded into the
+durable re-dispatch guard on startup so cross-run double-fires are
+suppressed, but the in-memory display array starts empty each run. A
+new frame is emitted after each dispatch AND whenever a queued row
+moves to current.
+
+The '--- predicted ---' section previews the next dispatches autopilot
+will fire as a direct consequence of the embedded jobs currently in
+flight. All four buckets fall out of one simulation pass: every
+working embedded job has its post-completion effect mirrored onto the
+owning row (work→worker_phase=done, close→epic.status=done,
 approve→approval=approved; jobs[i].state=ended) and approval is NEVER
 auto-flipped for rows whose only in-flight job is a worker. Rows whose
 verdict flips to blocked:job-pending in the simulated re-run emit
@@ -784,12 +792,14 @@ async function main(): Promise<void> {
   const dispatchLog: DispatchEntry[] = [];
 
   function renderDispatchFrame(): string[] {
-    // Partition section 1 by fulfillment: rows whose `(verb, id)` has
-    // been observed registered in keeper land in `current`; rows that
-    // haven't yet land in `queued`. In wet mode, queued is typically
-    // transient (1-3 frames between dispatch and SessionStart fold);
-    // in dry mode it persists until the human runs the command
-    // manually, since no actual claude session is spawned.
+    // Three named-header sections, each only emitted when non-empty:
+    // `--- current ---` (this-run dispatches whose `(verb, id)` has been
+    // observed registered in keeper), `--- queued ---` (this-run
+    // dispatches still waiting on the agent to boot), and
+    // `--- predicted ---` (`predictNextDispatches` output for the next
+    // edges as in-flight jobs finish). In wet mode queued is typically
+    // transient (1-3 frames between dispatch and SessionStart fold); in
+    // dry mode it persists until the human runs the command manually.
     const current: string[] = [];
     const queued: string[] = [];
     for (const e of dispatchLog) {
@@ -811,19 +821,19 @@ async function main(): Promise<void> {
         }
       }
     }
-    const section1: string[] = [];
-    section1.push(...current);
-    if (current.length > 0 && queued.length > 0) {
-      // Blank-line gutter between current (fulfilled, above) and
-      // queued (unfulfilled, below). No `---` separator here — that's
-      // reserved for between section 1 (combined) and section 2
-      // (predicted next).
-      section1.push("");
+
+    const out: string[] = [];
+    if (current.length > 0) {
+      out.push("--- current ---");
+      out.push(...current);
     }
-    section1.push(...queued);
+    if (queued.length > 0) {
+      out.push("--- queued ---");
+      out.push(...queued);
+    }
 
     if (lastSnap === null) {
-      return section1;
+      return out;
     }
     const { approvals, informational, workers, closers } =
       predictNextDispatches(lastSnap);
@@ -833,24 +843,36 @@ async function main(): Promise<void> {
       workers.length === 0 &&
       closers.length === 0
     ) {
-      return section1;
+      return out;
     }
-    const section2: string[] = [];
-    for (const r of [...approvals, ...informational, ...workers, ...closers]) {
-      const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
-      // Category pill: `[claude]` for rows backed by a `/plan:<verb>`
-      // dispatch (approve / work / close); `[info]` for `git-dirty`
-      // informational rows that have no dispatch behind them.
-      const pill = r.verb === "git-dirty" ? " [info]" : " [claude]";
-      section2.push(`${dirSeg}${r.verb}::${r.id}${pill}`);
+    out.push("--- predicted ---");
+    const predictedRows = [
+      ...approvals,
+      ...informational,
+      ...workers,
+      ...closers,
+    ];
+    // Column widths so dir + pill align across all predicted rows:
+    //   - dir column: `(<dir>) ` is `dir.length + 3` chars; widen to the
+    //     max so e.g. `(keeper) ` gets a trailing space to match
+    //     `(arthack) `. Zero when no row has a dir.
+    //   - pill: right-pad the label inside the brackets to the longest
+    //     label ("claude") so `[claude]` and `[info  ]` are both 8 chars.
+    // Pill sits immediately after the dir column, before the verb::id.
+    const maxDirLen = predictedRows.reduce(
+      (m, r) => Math.max(m, r.dir.length),
+      0,
+    );
+    const dirColWidth = maxDirLen === 0 ? 0 : maxDirLen + 3;
+    const PILL_LABEL_WIDTH = 6;
+    for (const r of predictedRows) {
+      const dirSegRaw = r.dir === "" ? "" : `(${r.dir}) `;
+      const dirSeg = dirSegRaw.padEnd(dirColWidth);
+      const label = r.verb === "git-dirty" ? "info" : "claude";
+      const pill = `[${label.padEnd(PILL_LABEL_WIDTH)}]`;
+      out.push(`${dirSeg}${pill} ${r.verb}::${r.id}`);
     }
-    // The `---` separator is only emitted between two non-empty sections.
-    // When section 1 is empty (no dispatches this run yet) but section 2
-    // has predicted rows, the preview lines render alone.
-    if (section1.length === 0) {
-      return section2;
-    }
-    return [...section1, "---", ...section2];
+    return out;
   }
 
   // --- sidecar paths ---
