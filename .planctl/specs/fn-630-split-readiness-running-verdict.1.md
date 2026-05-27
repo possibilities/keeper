@@ -105,5 +105,5 @@ Verify all three test suites green before committing.
   three motion reasons use the new `running()` helper.
 
 ## Done summary
-
+Split the running Verdict tag out of blocked: BlockReason loses job-running/sub-agent-running/planner-running, new RunningReason union holds them, evaluator/rollup/formatPill/colorizer/autopilot updated; 136 tests across readiness/board/autopilot suites green.
 ## Evidence
