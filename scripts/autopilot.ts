@@ -72,10 +72,10 @@
  *   --- current ---
  *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
  *   --- predicted ---
- *   (keeper) approve::fn-619-pin-inputrequest-mid-subagent-state.1 [claude]
- *   (keeper) git-dirty::fn-619-pin-inputrequest-mid-subagent-state.2 [info]
- *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.3 [claude]
- *   (keeper) close::fn-619-pin-inputrequest-mid-subagent-state [claude]
+ *   (arthack) [claude] approve::fn-594-fix-silent-failure-paths-in-templates.1
+ *   (arthack) [info  ] git-dirty::fn-594-fix-silent-failure-paths-in-templates.1
+ *   (keeper)  [claude] work::fn-619-pin-inputrequest-mid-subagent-state.3
+ *   (keeper)  [claude] close::fn-619-pin-inputrequest-mid-subagent-state
  *
  * Fires side effects on EDGES in the readiness verdicts:
  *   → ready          spawn a Ghostty window running the worker command
@@ -187,9 +187,12 @@ or blocked:git-orphans emit an informational 'git-dirty::<id>' row
 the human resolves it by cleaning the worktree, after which the row
 drops off and re-emerges as 'approve::<id>'); rows that flip to ready
 emit 'work::<task>' / 'close::<epic>'. Preview rows are single-line
-'(<dir>) <verb>::<id> [<pill>]' where the pill is '[claude]' for
-dispatch-backed rows (approve / work / close) and '[info]' for the
-informational 'git-dirty' row — no [dry] tag, no shell-command footer.
+'(<dir>) [<pill>] <verb>::<id>' where the pill sits immediately after
+the dir column and is '[claude]' for dispatch-backed rows (approve /
+work / close) or '[info  ]' for the informational 'git-dirty' row
+(label right-padded to 'claude's width so all pills are 8 chars; the
+dir column itself is padded to the widest '(<dir>) ' so pills align
+across projects). No [dry] tag, no shell-command footer.
 
 The helper waits for keeperd to come up and reconnects across restarts;
 each connection-lifecycle change is appended to the lifecycle sidecar.
