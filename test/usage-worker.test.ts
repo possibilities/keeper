@@ -133,7 +133,33 @@ test("buildUsageMessage maps id/target/multiplier and the two-window usage sub-b
     session_resets_at: "2026-05-26T18:30:00-04:00",
     week_percent: 8.0,
     week_resets_at: "2026-06-01T20:00:00-04:00",
+    // `usage.sonnet_week` absent → both fields fold to null per the
+    // safe-value invariant. (codex envelopes never carry this sub-object.)
+    sonnet_week_percent: null,
+    sonnet_week_resets_at: null,
   });
+});
+
+test("buildUsageMessage projects the optional sonnet_week sub-block when present", () => {
+  // Claude target's envelope carries a third per-model `sonnet_week`
+  // window. The worker parses it into `sonnet_week_percent` +
+  // `sonnet_week_resets_at` so the projection's third column lights up
+  // for claude profiles without affecting the codex shape.
+  const msg = buildUsageMessage({
+    id: "claude-default",
+    target: "claude",
+    multiplier: 5,
+    usage: {
+      session: { percent_used: 12.0, resets_at: "2026-05-26T18:30:00-04:00" },
+      week: { percent_used: 8.0, resets_at: "2026-06-01T20:00:00-04:00" },
+      sonnet_week: {
+        percent_used: 2.0,
+        resets_at: "2026-06-01T20:00:00-04:00",
+      },
+    },
+  });
+  expect(msg?.sonnet_week_percent).toBe(2.0);
+  expect(msg?.sonnet_week_resets_at).toBe("2026-06-01T20:00:00-04:00");
 });
 
 test("buildUsageMessage returns null when id is missing or non-string", () => {
@@ -251,6 +277,8 @@ test("onChange emits a usage-snapshot for a real envelope, then change-gates an 
     session_resets_at: "2026-05-26T18:30:00-04:00",
     week_percent: 8.0,
     week_resets_at: "2026-06-01T20:00:00-04:00",
+    sonnet_week_percent: null,
+    sonnet_week_resets_at: null,
   });
 
   // Identical re-scan suppressed.

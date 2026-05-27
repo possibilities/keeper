@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 26;
+export const SCHEMA_VERSION = 28;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -433,7 +433,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_api_error_kind TEXT,
     last_input_request_at REAL,
     last_input_request_kind TEXT,
-    config_dir TEXT
+    config_dir TEXT,
+    git_dirty_count INTEGER NOT NULL DEFAULT 0,
+    git_orphan_count INTEGER NOT NULL DEFAULT 0
 )
 `;
 
@@ -497,6 +499,8 @@ CREATE TABLE IF NOT EXISTS usage (
     session_resets_at TEXT,
     week_percent REAL,
     week_resets_at TEXT,
+    sonnet_week_percent REAL,
+    sonnet_week_resets_at TEXT,
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0
 )
@@ -2146,6 +2150,71 @@ function migrate(db: Database): void {
       db.run("DELETE FROM epics");
       db.run("DELETE FROM subagent_invocations");
     }
+
+    // v26→v27: surface the agentuse `sonnet_week` quota window as a paired
+    // `(sonnet_week_percent, sonnet_week_resets_at)` field on the `usage`
+    // projection — third column alongside `session` and `week`. Only some
+    // profiles (currently the claude target) carry it, so both columns are
+    // nullable with no backfill. Idempotent ADD COLUMN matches the v3→v4
+    // shape — no rewind needed: existing `UsageSnapshot` events predate the
+    // worker's sonnet_week parse, so a re-fold would leave the columns NULL
+    // (which IS the steady-state zero-event reading). The next scrape from
+    // the producer surfaces the data via a fresh synthetic event.
+    addColumnIfMissing(db, "usage", "sonnet_week_percent", "REAL");
+    addColumnIfMissing(db, "usage", "sonnet_week_resets_at", "TEXT");
+
+    // v27→v28: denormalize the per-job dirty-file count and the project-wide
+    // orphan-file count onto the `jobs` projection so readiness predicates
+    // can branch on git cleanliness without joining `git_status`. Pair-step:
+    // add `jobs.git_dirty_count INTEGER NOT NULL DEFAULT 0` (per-job — from
+    // the producer's `snapshot.jobs[*].dirty.length`) and
+    // `jobs.git_orphan_count INTEGER NOT NULL DEFAULT 0` (project-broadcast
+    // — `snapshot.orphaned_files.length` stamped onto every job enumerated
+    // in the same snapshot). The reducer's `projectGitStatus` arm fans these
+    // out inside the same `BEGIN IMMEDIATE` transaction that writes
+    // `git_status`, then re-runs `syncJobIntoEpic` on each touched job so
+    // the embedded `jobs[]` arrays on epics + task elements carry the new
+    // counts as well (mirrors the schema v24/v25 fan-out shape:
+    // `last_api_error_*` / `last_input_request_*` rode the same RMW path).
+    //
+    // Pair-step: the same two fields are added to `EmbeddedJob` (typed in
+    // `src/types.ts`) and to `EmbeddedJobElement` (the reducer-internal
+    // mirror in `src/reducer.ts`). `buildEmbeddedJob` reads the new columns
+    // off the post-write `jobs` row so every `syncJobIntoEpic` caller (Stop,
+    // SessionEnd, UserPromptSubmit, RateLimited, ApiError, InputRequest
+    // arms, plus the new GitSnapshot fan-out) automatically lands the new
+    // counts in the embedded arrays — no caller audit-and-pass needed
+    // because the canonical input shape changes underneath.
+    //
+    // Step 1: add the two new `jobs` columns. Both `INTEGER NOT NULL
+    // DEFAULT 0` — a never-snapshotted job reads "0 dirty, 0 orphan", which
+    // is exactly the zero-event projection (no GitSnapshot has fanned in
+    // for this session). Column defs match `CREATE_JOBS` so a fresh v28 DB
+    // and a migrated v27→v28 DB converge to identical schema (the
+    // addColumnIfMissing/literal lockstep convention).
+    addColumnIfMissing(
+      db,
+      "jobs",
+      "git_dirty_count",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
+    addColumnIfMissing(
+      db,
+      "jobs",
+      "git_orphan_count",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
+
+    // Step 2: NO rewind. The migration window is "false-clean" — every
+    // pre-v28 jobs row reads 0/0 until the next `GitSnapshot` tick from the
+    // git-worker re-snapshots its watched roots (typically sub-second via
+    // `data_version` polling). A rewind would be expensive (touches every
+    // event) and the steady-state convergence is fast enough that the
+    // minimal-scope choice wins. The from-scratch re-fold path is
+    // unaffected: replaying every historical GitSnapshot event re-derives
+    // the counts byte-identically via the new fan-out, and an event log
+    // with zero GitSnapshot events leaves the columns at 0 (which IS the
+    // steady-state zero-event reading).
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

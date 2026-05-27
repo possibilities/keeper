@@ -111,6 +111,14 @@ export interface UsageSnapshotMessage {
   week_percent: number | null;
   /** Weekly reset instant — ISO-8601 string when present, else null. */
   week_resets_at: string | null;
+  /**
+   * Sonnet-specific weekly quota percent used (0-100). Only the claude
+   * target's envelope carries `usage.sonnet_week`; codex omits it. Null
+   * when the source envelope is missing the sub-object.
+   */
+  sonnet_week_percent: number | null;
+  /** Sonnet-specific weekly reset instant — ISO-8601 string when present, else null. */
+  sonnet_week_resets_at: string | null;
 }
 
 /**
@@ -241,9 +249,15 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
   let sessionResetsAt: string | null = null;
   let weekPercent: number | null = null;
   let weekResetsAt: string | null = null;
+  let sonnetWeekPercent: number | null = null;
+  let sonnetWeekResetsAt: string | null = null;
   const usageBlock = raw.usage;
   if (usageBlock != null && typeof usageBlock === "object") {
-    const u = usageBlock as { session?: unknown; week?: unknown };
+    const u = usageBlock as {
+      session?: unknown;
+      week?: unknown;
+      sonnet_week?: unknown;
+    };
     if (u.session != null && typeof u.session === "object") {
       const s = u.session as RawUsageWindow;
       sessionPercent = asNumber(s.percent_used);
@@ -253,6 +267,11 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
       const w = u.week as RawUsageWindow;
       weekPercent = asNumber(w.percent_used);
       weekResetsAt = asString(w.resets_at);
+    }
+    if (u.sonnet_week != null && typeof u.sonnet_week === "object") {
+      const sw = u.sonnet_week as RawUsageWindow;
+      sonnetWeekPercent = asNumber(sw.percent_used);
+      sonnetWeekResetsAt = asString(sw.resets_at);
     }
   }
   return {
@@ -264,6 +283,8 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
     session_resets_at: sessionResetsAt,
     week_percent: weekPercent,
     week_resets_at: weekResetsAt,
+    sonnet_week_percent: sonnetWeekPercent,
+    sonnet_week_resets_at: sonnetWeekResetsAt,
   };
 }
 
@@ -496,7 +517,8 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
   const rows = db
     .query(
       `SELECT id, target, multiplier, session_percent, session_resets_at,
-              week_percent, week_resets_at
+              week_percent, week_resets_at, sonnet_week_percent,
+              sonnet_week_resets_at
          FROM usage`,
     )
     .all() as {
@@ -507,6 +529,8 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
     session_resets_at: string | null;
     week_percent: number | null;
     week_resets_at: string | null;
+    sonnet_week_percent: number | null;
+    sonnet_week_resets_at: string | null;
   }[];
   for (const r of rows) {
     const msg: UsageSnapshotMessage = {
@@ -518,6 +542,8 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
       session_resets_at: r.session_resets_at,
       week_percent: r.week_percent,
       week_resets_at: r.week_resets_at,
+      sonnet_week_percent: r.sonnet_week_percent,
+      sonnet_week_resets_at: r.sonnet_week_resets_at,
     };
     scanner.seed(r.id, JSON.stringify(msg));
   }

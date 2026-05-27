@@ -769,6 +769,8 @@ function runDaemon(): void {
         session_resets_at: msg.session_resets_at,
         week_percent: msg.week_percent,
         week_resets_at: msg.week_resets_at,
+        sonnet_week_percent: msg.sonnet_week_percent,
+        sonnet_week_resets_at: msg.sonnet_week_resets_at,
       });
     } else if (msg.kind === "usage-deleted") {
       // Tombstone: the reducer DELETEs the `usage` row whose primary key is

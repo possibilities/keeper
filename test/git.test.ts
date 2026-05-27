@@ -223,7 +223,7 @@ test("subscribeCollection: result frame fires onRows with the expected string[] 
   if (!rows) throw new Error("missing rows snapshot");
   const blocks = renderRowBlocks(rows);
   expect(blocks).toHaveLength(1);
-  expect(blocks[0]).toMatch(/^a \[main \+2\]/);
+  expect(blocks[0]).toMatch(/^\(a\) \[main \+2\]/);
 
   handle.dispose();
 });
@@ -377,7 +377,7 @@ test("renderRowBlocks: drops all-zero rows and emits one block per non-empty row
   const block = blocks[0];
   if (!block) throw new Error("missing block");
   // First line: `dirty [feat -1] dirty=2 orphaned=0`
-  expect(block).toMatch(/^dirty \[feat -1\] dirty=2 orphaned=0\n/);
+  expect(block).toMatch(/^\(dirty\) \[feat -1\] dirty=2 orphaned=0\n/);
   // Job line with the `worker` actor label.
   expect(block).toContain("  do thing [worker] [running] dirty=1 planctl=0");
   // Dirty-file line indented under the job.
@@ -400,6 +400,6 @@ test("renderRowBlocks: ahead-only row produces an unpushed line", () => {
   expect(blocks).toHaveLength(1);
   const block = blocks[0];
   if (!block) throw new Error("missing block");
-  expect(block).toMatch(/^ahead \[main \+3\]/);
+  expect(block).toMatch(/^\(ahead\) \[main \+3\]/);
   expect(block).toContain("  unpushed 3");
 });

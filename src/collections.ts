@@ -297,6 +297,8 @@ export const USAGE_DESCRIPTOR: CollectionDescriptor = {
     "session_resets_at",
     "week_percent",
     "week_resets_at",
+    "sonnet_week_percent",
+    "sonnet_week_resets_at",
     "last_event_id",
     "updated_at",
   ],

@@ -713,7 +713,11 @@ async function main(): Promise<void> {
     } else {
       body = `${e}\n~~~\n${j}`;
     }
-    return body === "" ? [] : body.split("\n");
+    if (body === "") return [];
+    // Title line — same shape across all live keeper scripts (board, git,
+    // autopilot, usage). Sits at the very top of every frame so the report
+    // is self-identifying in the alt-screen view AND in the sidecar files.
+    return ["board", ...body.split("\n")];
   }
 
   // Internal scratch path for the previous frame text — fed to `diff -u` as

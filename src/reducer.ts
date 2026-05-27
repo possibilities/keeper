@@ -928,6 +928,8 @@ interface UsageSnapshotPayload {
   session_resets_at: string | null;
   week_percent: number | null;
   week_resets_at: string | null;
+  sonnet_week_percent: number | null;
+  sonnet_week_resets_at: string | null;
 }
 
 function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
@@ -960,6 +962,15 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
       week_resets_at:
         typeof parsed.week_resets_at === "string"
           ? parsed.week_resets_at
+          : null,
+      sonnet_week_percent:
+        typeof parsed.sonnet_week_percent === "number" &&
+        Number.isFinite(parsed.sonnet_week_percent)
+          ? parsed.sonnet_week_percent
+          : null,
+      sonnet_week_resets_at:
+        typeof parsed.sonnet_week_resets_at === "string"
+          ? parsed.sonnet_week_resets_at
           : null,
     };
   } catch (err) {
@@ -994,8 +1005,9 @@ function projectUsageRow(db: Database, event: Event): void {
   db.run(
     `INSERT INTO usage (
        id, target, multiplier, session_percent, session_resets_at,
-       week_percent, week_resets_at, last_event_id, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       week_percent, week_resets_at, sonnet_week_percent,
+       sonnet_week_resets_at, last_event_id, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        target = excluded.target,
        multiplier = excluded.multiplier,
@@ -1003,6 +1015,8 @@ function projectUsageRow(db: Database, event: Event): void {
        session_resets_at = excluded.session_resets_at,
        week_percent = excluded.week_percent,
        week_resets_at = excluded.week_resets_at,
+       sonnet_week_percent = excluded.sonnet_week_percent,
+       sonnet_week_resets_at = excluded.sonnet_week_resets_at,
        last_event_id = excluded.last_event_id,
        updated_at = excluded.updated_at`,
     [
@@ -1013,6 +1027,8 @@ function projectUsageRow(db: Database, event: Event): void {
       snapshot.session_resets_at,
       snapshot.week_percent,
       snapshot.week_resets_at,
+      snapshot.sonnet_week_percent,
+      snapshot.sonnet_week_resets_at,
       event.id,
       event.ts,
     ],

@@ -119,36 +119,91 @@ function relTime(iso: string, nowMs: number): string {
 /**
  * Render the `usage`-collection rows into one line per profile.
  *
- *   {id} [{target} {multiplier}x] session {pct}% (resets {rel}) | week {pct}% (resets {rel})
+ *   {(id)} [{target} {mult}x] session {pct} (resets {rel}) | week {pct} (resets {rel})
+ *                                                          | sonnet {pct} (resets {rel})
  *
- * The `{id}` segment is right-padded to the widest observed id length so
- * a multi-profile view stays column-aligned. Reset cells are rendered
- * against the supplied `nowMs` — the caller passes `Date.now()` from the
- * data-change emit AND from the 30s tick, and tests pass a fixed clock.
+ * Every column is pre-measured across the row set so the grid stays
+ * aligned: id wraps in `(...)` and right-aligns (padStart) so the closing
+ * `)` stamps at a fixed column; target padEnds + multiplier padStarts
+ * inside the `[target  Nx]` chip so the chip's right edge is fixed;
+ * session / week pct values padStart, reset strings padEnd. The third
+ * `| sonnet ...` column appears ONLY on rows whose envelope carried
+ * `usage.sonnet_week` — currently the claude target's envelope, not
+ * codex — and its widths are computed over that subset. Rows without
+ * sonnet data simply end after the week column; they do NOT render an
+ * empty placeholder.
+ *
+ * Reset cells are rendered against the supplied `nowMs` — the caller
+ * passes `Date.now()` from the data-change emit AND from the 30s tick,
+ * and tests pass a fixed clock.
  */
 export function renderRowLines(
   rows: Record<string, unknown>[],
   nowMs: number,
 ): string[] {
   if (rows.length === 0) return [];
-  const widestId = rows.reduce(
-    (acc, row) => Math.max(acc, seg(row.id).length),
-    0,
-  );
-  const lines: string[] = [];
-  for (const row of rows) {
-    const id = seg(row.id).padEnd(widestId, " ");
-    const target = seg(row.target);
-    const mult = seg(row.multiplier);
-    const targetSeg =
-      target === "" && mult === "" ? "" : `[${target} ${mult}x]`;
-    const sPct = pct(row.session_percent);
-    const sReset = relTime(seg(row.session_resets_at), nowMs);
-    const wPct = pct(row.week_percent);
-    const wReset = relTime(seg(row.week_resets_at), nowMs);
-    lines.push(
-      `${id} ${targetSeg} session ${sPct} (resets ${sReset}) | week ${wPct} (resets ${wReset})`,
-    );
+
+  interface RowCells {
+    id: string;
+    target: string;
+    mult: string;
+    sPct: string;
+    sReset: string;
+    wPct: string;
+    wReset: string;
+    // null when this row's envelope carried no sonnet_week sub-object.
+    swPct: string | null;
+    // Empty string when no sonnet data; otherwise the rendered relative
+    // time (or "" inside the rendered cell if sonnet_resets_at was null).
+    swReset: string;
+  }
+
+  const cells: RowCells[] = rows.map((row) => {
+    const hasSonnet = row.sonnet_week_percent != null;
+    return {
+      id: `(${seg(row.id)})`,
+      target: seg(row.target),
+      mult: seg(row.multiplier),
+      sPct: pct(row.session_percent),
+      sReset: relTime(seg(row.session_resets_at), nowMs),
+      wPct: pct(row.week_percent),
+      wReset: relTime(seg(row.week_resets_at), nowMs),
+      swPct: hasSonnet ? pct(row.sonnet_week_percent) : null,
+      swReset: hasSonnet ? relTime(seg(row.sonnet_week_resets_at), nowMs) : "",
+    };
+  });
+
+  const widest = (xs: string[]): number =>
+    xs.reduce((acc, x) => Math.max(acc, x.length), 0);
+
+  const wId = widest(cells.map((c) => c.id));
+  const wTarget = widest(cells.map((c) => c.target));
+  const wMult = widest(cells.map((c) => c.mult));
+  const wSPct = widest(cells.map((c) => c.sPct));
+  const wSReset = widest(cells.map((c) => c.sReset));
+  const wWPct = widest(cells.map((c) => c.wPct));
+  const wWReset = widest(cells.map((c) => c.wReset));
+  const sonnetCells = cells.filter((c) => c.swPct != null);
+  const wSwPct = widest(sonnetCells.map((c) => c.swPct ?? ""));
+  const wSwReset = widest(sonnetCells.map((c) => c.swReset));
+
+  // Title line — same shape across all live keeper scripts (board, git,
+  // autopilot, usage). Sits at the very top of every frame so the report
+  // is self-identifying in the alt-screen view AND in the sidecar files.
+  const lines: string[] = ["usage"];
+  for (const c of cells) {
+    const id = c.id.padStart(wId, " ");
+    const targetChip =
+      c.target === "" && c.mult === ""
+        ? ""
+        : `[${c.target.padEnd(wTarget, " ")} ${c.mult.padStart(wMult, " ")}x]`;
+    const sSeg = `session ${c.sPct.padStart(wSPct, " ")} (resets ${c.sReset.padEnd(wSReset, " ")})`;
+    const wSeg = `week ${c.wPct.padStart(wWPct, " ")} (resets ${c.wReset.padEnd(wWReset, " ")})`;
+    const swSeg =
+      c.swPct == null
+        ? ""
+        : ` | sonnet ${c.swPct.padStart(wSwPct, " ")} (resets ${c.swReset.padEnd(wSwReset, " ")})`;
+    lines.push(`${id} ${targetChip} ${sSeg} | ${wSeg}${swSeg}`);
   }
   return lines;
 }

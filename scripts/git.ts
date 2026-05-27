@@ -88,7 +88,7 @@ export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
     if (aheadCount === 0 && dirtyCount === 0 && orphanedCount === 0) continue;
 
     const lines = [
-      `${name} [${branch}${ahead}${behind}] dirty=${seg(row.dirty_count)} orphaned=${seg(row.orphaned_count)}`,
+      `(${name}) [${branch}${ahead}${behind}] dirty=${seg(row.dirty_count)} orphaned=${seg(row.orphaned_count)}`,
     ];
 
     const orphaned = Array.isArray(row.orphaned_files)
@@ -142,7 +142,11 @@ export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
  */
 export function renderRowLines(rows: Record<string, unknown>[]): string[] {
   const body = renderRowBlocks(rows).join("\n");
-  return body === "" ? [] : body.split("\n");
+  if (body === "") return [];
+  // Title line — same shape across all live keeper scripts (board, git,
+  // autopilot, usage). Sits at the very top of every frame so the report
+  // is self-identifying in the alt-screen view AND in the sidecar files.
+  return ["git", ...body.split("\n")];
 }
 
 async function main(): Promise<void> {
