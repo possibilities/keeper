@@ -10,8 +10,9 @@
  *   [just now] notify  task <id> done — needs approval
  *
  * Dispatches are persisted to ~/.local/state/keeper/dispatch.log (JSONL)
- * and loaded at startup so history survives restarts. A new frame is
- * emitted immediately after each dispatch event.
+ * for forensic tailing across restarts, but each run's frame only shows
+ * dispatches from this run — the file is write-only from autopilot's
+ * perspective. A new frame is emitted immediately after each dispatch.
  *
  * Fires side effects on EDGES in the readiness verdicts:
  *   → ready          spawn a Ghostty window running the worker command
@@ -38,7 +39,7 @@
  *   --help           Show this help.
  */
 
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
@@ -72,9 +73,9 @@ relative timestamp refreshed on each new dispatch:
   [2m ago] launch  cd <dir> && claude '/plan:work <task_id>'
   [just now] notify  task <id> done — needs approval
 
-History is loaded at startup from ~/.local/state/keeper/dispatch.log
-(JSONL) so prior sessions are visible across restarts. A new frame is
-emitted after each dispatch.
+Each run's frame shows only dispatches from this run; the JSONL log at
+~/.local/state/keeper/dispatch.log is still appended for forensic tailing
+across restarts. A new frame is emitted after each dispatch.
 
 The helper waits for keeperd to come up and reconnects across restarts;
 each connection-lifecycle change is appended to the lifecycle sidecar.
@@ -220,24 +221,9 @@ async function main(): Promise<void> {
 
   let lastBody: string | null = null;
 
-  // Load existing dispatch log entries at startup for cross-restart history.
-  const dispatchLog: DispatchEntry[] = (() => {
-    try {
-      return readFileSync(dispatchLogPath, "utf-8")
-        .split("\n")
-        .filter((l) => l.trim() !== "")
-        .flatMap((l) => {
-          try {
-            const e = JSON.parse(l) as DispatchEntry;
-            return e?.ts && e?.kind ? [e] : [];
-          } catch {
-            return [];
-          }
-        });
-    } catch {
-      return [];
-    }
-  })();
+  // Frames show only dispatches from this run; logDispatch still appends
+  // to `dispatchLogPath` for forensic tailing across restarts.
+  const dispatchLog: DispatchEntry[] = [];
 
   function renderDispatchFrame(): string[] {
     if (dispatchLog.length === 0) {
