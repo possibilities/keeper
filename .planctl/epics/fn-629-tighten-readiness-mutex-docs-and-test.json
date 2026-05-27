@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-629-tighten-readiness-mutex-docs-and-test",
   "bundles": [],
   "closer_done_at": "2026-05-27T22:14:16.505528Z",
@@ -18,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-27T22:14:16.505528Z"
+  "updated_at": "2026-05-27T22:15:14.356323Z"
 }
