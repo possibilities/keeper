@@ -528,6 +528,369 @@ test("subscribeReadiness: capped-backoff reconnect sequence — 250, 500, 1000, 
   }
 });
 
+// ---------------------------------------------------------------------------
+// Slow-flight + hard-deadline reconnect coverage (fn-622.3)
+//
+// The helper's `pollAll` walks every state on each `POLL_MS` tick and
+// compares `Date.now() - queryInFlightSince` against `SLOW_FLIGHT_MS`
+// (1 s) and `QUERY_TIMEOUT_MS` (5 s). To stay deterministic and
+// millisecond-fast we mock `Date.now()` plus capture the `setInterval`
+// handler the helper installs in `open` so the test can fire `pollAll`
+// manually at chosen wall-clock points. No real time elapses.
+// ---------------------------------------------------------------------------
+//
+// Shared scaffolding: install `Date.now` + `setInterval` spies, return
+// a `tick(ms)` advancer that bumps the mocked clock and runs the
+// captured poll handler. `restore()` unwinds both.
+// ---------------------------------------------------------------------------
+
+interface TimerHarness {
+  setNow(ms: number): void;
+  advance(ms: number): void;
+  pollHandler(): () => void;
+  pollIntervalMs(): number;
+  restore(): void;
+}
+
+function installTimerHarness(startMs = 1_000_000): TimerHarness {
+  const realNow = Date.now;
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  let now = startMs;
+  let captured: (() => void) | null = null;
+  let capturedInterval = 0;
+  let realId: ReturnType<typeof realSetInterval> | null = null;
+  Date.now = () => now;
+  globalThis.setInterval = ((
+    handler: Parameters<typeof realSetInterval>[0],
+    timeout?: number,
+    ...args: unknown[]
+  ) => {
+    // Capture the first positive-interval handler — that's the helper's
+    // poll loop. Any other timers (Bun internals) fall through to the
+    // real implementation untouched. The captured handler is invoked
+    // manually by `pollHandler()`; we still register a real interval
+    // with a huge delay so the spy's return id is a valid timer the
+    // helper can `clearInterval` without complaint.
+    if (captured === null && typeof timeout === "number" && timeout > 0) {
+      captured = handler as () => void;
+      capturedInterval = timeout;
+      realId = realSetInterval(() => {
+        /* never fires in test horizon */
+      }, 86_400_000);
+      return realId;
+    }
+    return realSetInterval(handler, timeout, ...args);
+  }) as typeof setInterval;
+  globalThis.clearInterval = ((id?: ReturnType<typeof setInterval>) => {
+    if (id !== undefined && id === realId) {
+      realClearInterval(realId);
+      realId = null;
+      captured = null;
+      return;
+    }
+    realClearInterval(id);
+  }) as typeof clearInterval;
+  return {
+    setNow(ms: number): void {
+      now = ms;
+    },
+    advance(ms: number): void {
+      now += ms;
+    },
+    pollHandler(): () => void {
+      if (captured === null) {
+        throw new Error("poll handler never captured");
+      }
+      return captured;
+    },
+    pollIntervalMs(): number {
+      return capturedInterval;
+    },
+    restore(): void {
+      Date.now = realNow;
+      globalThis.setInterval = realSetInterval;
+      globalThis.clearInterval = realClearInterval;
+      if (realId !== null) {
+        realClearInterval(realId);
+      }
+    },
+  };
+}
+
+test("subscribeReadiness: Path A (<1 s) — result arrives before slow-flight threshold, no events", () => {
+  const harness = installTimerHarness();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-patha",
+      onSnapshot: () => {
+        /* ignore */
+      },
+      onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+      onFatal: () => {
+        throw new Error("onFatal must not fire on the happy path");
+      },
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+    sock.takeOutbound();
+
+    // Advance to t=500 ms and deliver a result for one collection.
+    harness.advance(500);
+    sock.deliver([emptyResult("epics", "test-patha-epics")]);
+
+    // Run the poll — no state should be stuck (epics resolved at 500 ms,
+    // jobs + subagent still in flight but only at 500 ms in-flight age).
+    harness.pollHandler()();
+
+    expect(
+      lifecycle.filter((e) => e.event === "query_slow_flight"),
+    ).toHaveLength(0);
+    expect(lifecycle.filter((e) => e.event === "query_timeout")).toHaveLength(
+      0,
+    );
+
+    handle.dispose();
+  } finally {
+    harness.restore();
+  }
+});
+
+test("subscribeReadiness: Path B (1–5 s) — slow-flight latches once, timeout fires reconnect at 5 s", () => {
+  const harness = installTimerHarness();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-pathb",
+      onSnapshot: () => {
+        /* ignore */
+      },
+      onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+      onFatal: () => {
+        throw new Error("onFatal must not fire — timeout is not a fatal");
+      },
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+    sock.takeOutbound();
+
+    // t=1000 ms + epsilon: slow-flight should fire exactly once per state.
+    harness.advance(1001);
+    harness.pollHandler()();
+
+    const slowAt1s = lifecycle.filter((e) => e.event === "query_slow_flight");
+    // Three collections all in flight, all crossed 1 s — three emits.
+    expect(slowAt1s).toHaveLength(3);
+    expect(slowAt1s.map((e) => e.detail?.collection).sort()).toEqual([
+      "epics",
+      "jobs",
+      "subagent_invocations",
+    ]);
+
+    // t=2500 ms: another poll, latch must hold — no NEW slow-flight events.
+    harness.advance(1499);
+    harness.pollHandler()();
+    expect(
+      lifecycle.filter((e) => e.event === "query_slow_flight"),
+    ).toHaveLength(3);
+
+    // t=5001 ms: timeout fires. Single-flight `reconnecting` guard means
+    // exactly one `query_timeout` event for the FIRST stuck state.
+    harness.advance(2501);
+    harness.pollHandler()();
+    const timeouts = lifecycle.filter((e) => e.event === "query_timeout");
+    expect(timeouts).toHaveLength(1);
+    expect(timeouts[0]?.detail?.collection).toBe("epics");
+    expect(typeof timeouts[0]?.detail?.age_ms).toBe("number");
+    expect((timeouts[0]?.detail?.age_ms as number) >= 5000).toBe(true);
+
+    // Socket was end()'d to kick the reconnect loop.
+    expect(sock.ended).toBe(true);
+
+    handle.dispose();
+  } finally {
+    harness.restore();
+  }
+});
+
+test("subscribeReadiness: Path C — reconnect clears slow-flight state, fresh window emits cleanly", () => {
+  const harness = installTimerHarness();
+  try {
+    let connectCount = 0;
+    const socketRefs: { current: MockSocket | null }[] = [];
+    const factory: ConnectFactory = async (_path, handlers) => {
+      connectCount += 1;
+      let resolveDone: (() => void) | null = null;
+      const done = new Promise<void>((resolve) => {
+        resolveDone = resolve;
+      });
+      const sock: MockSocket = {
+        outbound: [],
+        ended: false,
+        handlers,
+        write(data: string): void {
+          sock.outbound.push(data);
+        },
+        end(): void {
+          sock.ended = true;
+          resolveDone?.();
+          resolveDone = null;
+        },
+        deliver(frames: ServerFrame[]): void {
+          const payload = frames.map(encodeFrame).join("");
+          sock.handlers.data(sock, Buffer.from(payload, "utf8"));
+        },
+        closeFromServer(): void {
+          sock.handlers.close();
+          resolveDone?.();
+          resolveDone = null;
+        },
+        takeOutbound(): unknown[] {
+          const parsed = sock.outbound.map((line) => {
+            const trimmed = line.endsWith("\n") ? line.slice(0, -1) : line;
+            return JSON.parse(trimmed);
+          });
+          sock.outbound.length = 0;
+          return parsed;
+        },
+      };
+      const ref: { current: MockSocket | null } = { current: sock };
+      socketRefs.push(ref);
+      handlers.open(sock);
+      await done;
+      return sock;
+    };
+
+    const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-pathc",
+      onSnapshot: () => {
+        /* ignore */
+      },
+      onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+      onFatal: () => {
+        throw new Error("onFatal must not fire");
+      },
+      connect: factory,
+    });
+
+    // First connection: trigger a timeout to force reconnect.
+    const sock1 = socketRefs[0]?.current;
+    if (!sock1) {
+      throw new Error("mock socket #1 never installed");
+    }
+    sock1.takeOutbound();
+    harness.advance(5001);
+    harness.pollHandler()();
+    expect(lifecycle.filter((e) => e.event === "query_timeout")).toHaveLength(
+      1,
+    );
+    expect(sock1.ended).toBe(true);
+
+    // Simulate the close-from-network that follows our `end()` call. The
+    // helper's `close` handler runs `teardownConnection()` + kicks
+    // `connectWithRetry`, which synchronously re-invokes the factory
+    // (the rejection branch is skipped because we return a real
+    // resolved promise).
+    sock1.closeFromServer();
+    // Yield so the awaited connect() resolves and the next `connectOnce`
+    // can run.
+    return new Promise<void>((resolve) => {
+      queueMicrotask(() => {
+        try {
+          expect(connectCount).toBe(2);
+          const sock2 = socketRefs[1]?.current;
+          if (!sock2) {
+            throw new Error("mock socket #2 never installed");
+          }
+          sock2.takeOutbound();
+
+          // Fresh window: advance another 1001 ms and poll — slow-flight
+          // latch must have been cleared by `teardownConnection`, so we
+          // get a brand-new emit per state.
+          const slowCountBefore = lifecycle.filter(
+            (e) => e.event === "query_slow_flight",
+          ).length;
+          harness.advance(1001);
+          harness.pollHandler()();
+          const slowCountAfter = lifecycle.filter(
+            (e) => e.event === "query_slow_flight",
+          ).length;
+          // Three collections in the new window, three fresh emits.
+          expect(slowCountAfter - slowCountBefore).toBe(3);
+
+          handle.dispose();
+          resolve();
+        } catch (err) {
+          handle.dispose();
+          throw err;
+        }
+      });
+    }).finally(() => {
+      harness.restore();
+    });
+  } catch (err) {
+    harness.restore();
+    throw err;
+  }
+});
+
+test("subscribeReadiness: single-flight — two stuck collections produce ONE reconnect at the 5 s deadline", () => {
+  const harness = installTimerHarness();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-singleflight",
+      onSnapshot: () => {
+        /* ignore */
+      },
+      onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+      onFatal: () => {
+        throw new Error("onFatal must not fire");
+      },
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+    sock.takeOutbound();
+
+    // All three collections are still in flight (no `result` delivered).
+    // At t=5001 ms all three cross the deadline on the same poll tick.
+    harness.advance(5001);
+    harness.pollHandler()();
+
+    // Exactly ONE `query_timeout` event, named after the FIRST state
+    // (`epics` — the order in `states[]` matches the makeState calls in
+    // `subscribeReadiness`: epics, jobs, subagent_invocations).
+    const timeouts = lifecycle.filter((e) => e.event === "query_timeout");
+    expect(timeouts).toHaveLength(1);
+    expect(timeouts[0]?.detail?.collection).toBe("epics");
+
+    // ONE socket end() call (also implies one reconnect kick).
+    expect(sock.ended).toBe(true);
+
+    handle.dispose();
+  } finally {
+    harness.restore();
+  }
+});
+
 test("subscribeReadiness: non-terminal error (one collection already has a result) does NOT invoke onFatal", () => {
   // Companion-of-(d): pin the gating contract. A `result` from any one
   // collection means the query shape is valid; a subsequent error is

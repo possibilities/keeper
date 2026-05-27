@@ -93,6 +93,21 @@ const SUBAGENT_INVOCATIONS_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
+/**
+ * Slow-flight + hard-deadline thresholds for an in-flight `query`. The
+ * steady-poll loop (`pollAll`, fires every `POLL_MS`) walks every state
+ * and compares `Date.now() - queryInFlightSince` against these. At
+ * `SLOW_FLIGHT_MS` the helper emits a single `query_slow_flight`
+ * lifecycle event (latched by `lastSlowFlightAt` so it fires once per
+ * stuck window, not every poll). At `QUERY_TIMEOUT_MS` the helper
+ * concludes the connection is wedged, emits `query_timeout`, tears the
+ * socket down, and lets the existing `connectWithRetry` machinery
+ * reconnect from scratch. `Date.now()` here is correct: thresholds are
+ * wall-clock, sub-ms precision is irrelevant, and in-process state has
+ * no need to survive a restart (`teardownConnection` clears it).
+ */
+const SLOW_FLIGHT_MS = 1000;
+const QUERY_TIMEOUT_MS = 5000;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -170,8 +185,14 @@ export interface ReadinessClientHandle {
 /**
  * Lifecycle-event callback shape — same for both public helpers. The
  * driver emits `connecting` / `connected` / `disconnected` / `waiting` /
- * `error` events with a small detail payload (`sock`, `attempt`,
- * `retry_in_ms`, `reason`, `code`, `rev`, `message` — fields per event).
+ * `error` / `query_slow_flight` / `query_timeout` events with a small
+ * detail payload (`sock`, `attempt`, `retry_in_ms`, `reason`, `code`,
+ * `rev`, `message`, `collection`, `query_id`, `age_ms` — fields per
+ * event). `query_slow_flight` fires once at `SLOW_FLIGHT_MS` per stuck
+ * in-flight window (latched by `lastSlowFlightAt` so it doesn't repeat
+ * every poll); `query_timeout` fires at `QUERY_TIMEOUT_MS` immediately
+ * before the helper tears the socket down and the reconnect loop kicks
+ * back in. Both carry `{collection, query_id, sock, age_ms}`.
  */
 export type LifecycleCallback = (
   event: string,
@@ -245,6 +266,25 @@ interface CollectionState {
   gotResult: boolean;
   queryInFlight: boolean;
   refetchDirty: boolean;
+  /**
+   * `Date.now()` wall-clock stamp when `queryInFlight` last transitioned
+   * to `true` (initial open-handler send + every `scheduleRefetchFor`
+   * send). `null` whenever no query is in flight — `handleFrame`'s
+   * `result` branch clears it back to `null` alongside `queryInFlight`,
+   * and `teardownConnection` clears it on every disconnect so a
+   * post-reconnect re-stamp is honest. Read by `pollAll` to compute the
+   * stuck-window age against `SLOW_FLIGHT_MS` / `QUERY_TIMEOUT_MS`.
+   */
+  queryInFlightSince: number | null;
+  /**
+   * Single-fire latch for `query_slow_flight`. `null` means "no
+   * slow-flight emitted yet for the current stuck window"; a non-null
+   * `Date.now()` stamp means "already emitted once, suppress further
+   * emissions until the state clears." Cleared whenever
+   * `queryInFlightSince` is cleared (`result`, teardown), so a
+   * subsequent stuck window gets exactly one emit again.
+   */
+  lastSlowFlightAt: number | null;
 }
 
 function makeState(
@@ -264,6 +304,8 @@ function makeState(
     gotResult: false,
     queryInFlight: false,
     refetchDirty: false,
+    queryInFlightSince: null,
+    lastSlowFlightAt: null,
   };
 }
 
@@ -408,6 +450,15 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   let currentSock: ReadinessSocket | null = null;
   let attempt = 0;
   let shuttingDown = false;
+  /**
+   * Single-flight guard for `triggerReconnect`. Two simultaneously-stuck
+   * collections crossing `QUERY_TIMEOUT_MS` on the same poll tick must
+   * produce ONE reconnect, not two — otherwise the second tear-down
+   * would race the first reconnect attempt. Cleared in the `connectOnce`
+   * open handler (alongside `attempt = 0`) and in the `close` handler so
+   * a graceful close from the server also clears the latch.
+   */
+  let reconnecting = false;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   // Resolves on the pending `await Bun.sleep(...)` so `dispose()` during
@@ -428,10 +479,78 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       return;
     }
     state.queryInFlight = true;
+    // Stamp the in-flight-since clock on every fresh send and reset the
+    // slow-flight latch so the next stuck window gets exactly one emit
+    // again. Cleared symmetrically in `handleFrame`'s `result` branch.
+    state.queryInFlightSince = Date.now();
+    state.lastSlowFlightAt = null;
     currentSock.write(encodeFrame(state.query));
   }
 
+  /**
+   * Tear down the live connection in response to a hard query timeout.
+   * Emits `query_timeout` for the first state that crossed the deadline,
+   * calls `teardownConnection()` to release the steady-poll interval and
+   * reset every per-state field, then half-closes the socket. The
+   * existing `close` handler in `connectOnce` invokes `connectWithRetry`
+   * on the resulting close event, so reconnect is automatic — no new
+   * plumbing. Guarded by `reconnecting` so two stuck collections
+   * crossing the threshold on the same poll produce one reconnect.
+   */
+  function triggerReconnect(state: CollectionState): void {
+    if (reconnecting || shuttingDown) {
+      return;
+    }
+    reconnecting = true;
+    const ageMs =
+      state.queryInFlightSince === null
+        ? 0
+        : Date.now() - state.queryInFlightSince;
+    emit("query_timeout", {
+      collection: state.collection,
+      query_id: state.subId,
+      sock: sockPath,
+      age_ms: ageMs,
+    });
+    // Grab the socket reference BEFORE `teardownConnection()` nulls
+    // `currentSock` — otherwise the `end()` below is silently a no-op
+    // and the underlying socket never closes, no `close` callback ever
+    // fires, and `connectWithRetry` never re-runs.
+    const sock = currentSock;
+    teardownConnection();
+    try {
+      sock?.end();
+    } catch {
+      // already torn down
+    }
+  }
+
   function pollAll(): void {
+    // First pass: check every state's in-flight age against the
+    // slow-flight + timeout thresholds. A timeout aborts the poll and
+    // triggers a reconnect (single-flight via the `reconnecting` latch);
+    // a slow-flight emits a one-shot lifecycle event and continues.
+    const now = Date.now();
+    for (const s of states) {
+      if (!s.queryInFlight || s.queryInFlightSince === null) {
+        continue;
+      }
+      const age = now - s.queryInFlightSince;
+      if (age >= QUERY_TIMEOUT_MS) {
+        triggerReconnect(s);
+        return;
+      }
+      if (age >= SLOW_FLIGHT_MS && s.lastSlowFlightAt === null) {
+        emit("query_slow_flight", {
+          collection: s.collection,
+          query_id: s.subId,
+          sock: sockPath,
+          age_ms: age,
+        });
+        s.lastSlowFlightAt = now;
+      }
+    }
+    // Second pass: the steady-poll refetch backstop, unchanged.
     for (const s of states) {
       scheduleRefetchFor(s);
     }
@@ -446,6 +565,10 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         return;
       }
       state.queryInFlight = false;
+      // Clear the slow-flight + timeout machinery now that we have a
+      // result. The next `scheduleRefetchFor` re-stamps both.
+      state.queryInFlightSince = null;
+      state.lastSlowFlightAt = null;
       state.order.length = 0;
       state.byId.clear();
       // Re-snapshot `rows` from this frame — see module docstring on why
@@ -522,6 +645,12 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       s.queryInFlight = false;
       s.refetchDirty = false;
       s.gotResult = false;
+      // Reset the slow-flight + timeout machinery so the
+      // post-reconnect re-stamp is honest and a survived
+      // `lastSlowFlightAt` from the old window can't suppress the
+      // first emit of the new window.
+      s.queryInFlightSince = null;
+      s.lastSlowFlightAt = null;
     }
   }
 
@@ -530,13 +659,19 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     await connect(sockPath, {
       open(sock) {
         attempt = 0;
+        reconnecting = false;
         currentSock = sock;
         emit("connected", { sock: sockPath });
         // Send every subscribed query up front. Each collection's
         // `queryInFlight` tracks its own send so the poll/refetch
-        // coalescer stays sane.
+        // coalescer stays sane. Stamp `queryInFlightSince` on each
+        // send and reset `lastSlowFlightAt` so the post-reconnect
+        // window starts clean.
+        const now = Date.now();
         for (const s of states) {
           s.queryInFlight = true;
+          s.queryInFlightSince = now;
+          s.lastSlowFlightAt = null;
           sock.write(encodeFrame(s.query));
         }
         pollTimer = setInterval(pollAll, POLL_MS);
@@ -568,6 +703,12 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         if (shuttingDown) {
           return;
         }
+        // Clear the single-flight latch so a fresh `connectWithRetry`
+        // cycle (whether it follows a graceful close or our own
+        // `triggerReconnect` tear-down) can advance to `open` and reset
+        // the latch on its own — and so a future timeout-triggered
+        // reconnect after this cycle isn't permanently suppressed.
+        reconnecting = false;
         teardownConnection();
         emit("disconnected");
         void connectWithRetry();
