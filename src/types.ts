@@ -44,6 +44,29 @@ export type ApiErrorKind =
   | "unknown";
 
 /**
+ * Canonical `ApiErrorKind` allow-list — the five dispatch-terminal kinds
+ * the transcript matcher recognizes and the reducer folds straight through.
+ * Excludes `"unknown"` itself: that's the fall-through bucket every
+ * unrecognized value collapses to (the matcher only emits a kind in this
+ * set; the reducer's `validateApiErrorKind` returns `"unknown"` for
+ * anything missing / non-string / not in this set).
+ *
+ * Single shared source of truth: imported by `src/reducer.ts`'s
+ * `validateApiErrorKind` (runtime `.has` against unknown event payload
+ * `data.kind`) and by `src/transcript-worker.ts`'s `matchApiError`
+ * (runtime `.has` against unknown transcript-line `error.type`). Adding a
+ * future kind means widening this set AND the {@link ApiErrorKind} union
+ * in lockstep — both consumers pick up the change for free.
+ */
+export const API_ERROR_KINDS: ReadonlySet<ApiErrorKind> = new Set([
+  "rate_limit",
+  "authentication_failed",
+  "billing_error",
+  "server_error",
+  "invalid_request",
+]);
+
+/**
  * Canonical vocabulary of `InputRequest` envelope kinds folded by the
  * reducer's `InputRequest` arm (schema v25). Mints from a transcript-worker
  * `input-request` message when Claude Code uses a built-in interactive

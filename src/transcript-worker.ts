@@ -50,6 +50,7 @@ import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
 import { isDropError, RescanScheduler } from "./rescan";
 import type { ApiErrorKind, InputRequestKind } from "./types";
+import { API_ERROR_KINDS } from "./types";
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only path
@@ -186,24 +187,6 @@ function matchCustomTitle(parsed: unknown): CustomTitleLine | null {
 }
 
 /**
- * Canonical six-kind allow-list the transcript matcher dispatches against
- * (mirrors `ApiErrorKind` minus `"unknown"`, which is reserved as the
- * fall-through bucket). Kept as a `Set` for O(1) `.has` from inside
- * `matchApiError`'s hot path. The five non-unknown entries are exactly the
- * `error.type` values openclaude's `SDKAssistantMessageError` declares as
- * terminal AND that we map straight through; `max_output_tokens` is
- * deliberately ABSENT — openclaude's query loop treats it as recoverable
- * via compact+retry, so stamping would mis-classify recovering sessions.
- */
-const DISPATCHED_API_ERROR_KINDS: ReadonlySet<ApiErrorKind> = new Set([
-  "rate_limit",
-  "authentication_failed",
-  "billing_error",
-  "server_error",
-  "invalid_request",
-]);
-
-/**
  * A parsed `isApiErrorMessage:true` synthetic-assistant line: session +
  * display text + matched {@link ApiErrorKind}.
  */
@@ -240,7 +223,7 @@ interface ApiErrorLine {
  * Kind dispatch reads `error.type ?? error` so both wire shapes are
  * accepted (real captured 401: `"error":"authentication_failed"` bare
  * string; openclaude's TS declares `error.type` structured). The matched
- * kind must appear in {@link DISPATCHED_API_ERROR_KINDS} — anything else
+ * kind must appear in {@link API_ERROR_KINDS} — anything else
  * (including the SDK's own `"unknown"` string, `"max_output_tokens"`, an
  * unrecognized literal, a non-string `error`, or a missing field) falls
  * through to {@link ApiErrorKind} `"unknown"`.
@@ -276,8 +259,7 @@ export function matchApiError(parsed: unknown): ApiErrorLine | null {
     rawKind = (rawKind as { type?: unknown }).type;
   }
   const kind: ApiErrorKind =
-    typeof rawKind === "string" &&
-    DISPATCHED_API_ERROR_KINDS.has(rawKind as ApiErrorKind)
+    typeof rawKind === "string" && API_ERROR_KINDS.has(rawKind as ApiErrorKind)
       ? (rawKind as ApiErrorKind)
       : "unknown";
   let text = "";

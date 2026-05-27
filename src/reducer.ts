@@ -140,6 +140,7 @@ import type {
   InputRequestKind,
   JobLinkEntry,
 } from "./types";
+import { API_ERROR_KINDS } from "./types";
 
 /**
  * Default batch size for {@link drain}. Keeps each writer transaction short so
@@ -175,22 +176,6 @@ const ENDED = "ended";
  * guards below.
  */
 const KILLED = "killed";
-
-/**
- * Canonical `ApiErrorKind` allow-list — string literals so the runtime
- * validation `validateApiErrorKind` can `.has` against a Set. The values
- * mirror {@link import("./types").ApiErrorKind} exactly; if the type
- * widens or narrows the set MUST be updated in lockstep. Excludes
- * `"unknown"` itself — that's the fallback every unrecognized value
- * folds to.
- */
-const API_ERROR_KINDS: ReadonlySet<ApiErrorKind> = new Set([
-  "rate_limit",
-  "authentication_failed",
-  "billing_error",
-  "server_error",
-  "invalid_request",
-]);
 
 /**
  * Validate an event's `data.kind` against the {@link ApiErrorKind} union.
