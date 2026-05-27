@@ -5,10 +5,14 @@
  * Subscribes to keeperd and auto-dispatches ready rows. Each frame lists
  * every command dispatched so far, oldest first. Each line is prefixed
  * with the basename of the cd target so the project is scannable at a
- * glance (matches the `(dir)` shape used by `board.ts`):
+ * glance (matches the `(dir)` shape used by `board.ts`). The summary
+ * form is `(<dir>) <verb>::<id>`; dry runs append the would-have-run
+ * shell command on two indented lines beneath:
  *
- *   (dir) launch  cd <dir> && claude '/plan:work <task_id>'
- *   (dir) launch  cd <dir> && claude '/plan:approve <id>'
+ *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
+ *   (keeper) [dry] approve::fn-619-pin-inputrequest-mid-subagent-state.1
+ *     cd /Users/mike/code/keeper && \
+ *       claude '/plan:approve fn-619-pin-inputrequest-mid-subagent-state.1'
  *
  * Dispatches are persisted to ~/.local/state/keeper/dispatch.log (JSONL)
  * for forensic tailing across restarts, but each run's frame only shows
@@ -60,8 +64,9 @@ Usage: bun scripts/autopilot.ts [--sock <path>] [--dry-run]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
   --dry-run        Log dispatches to the frame and disk but skip the
-                   actual Ghostty spawn. Entries appear as
-                   "(dir) launch (dry)  <command>".
+                   actual Ghostty spawn. The summary line carries a
+                   [dry] tag and is followed by the would-have-run
+                   shell command on two indented lines.
   --help           Show this help
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
@@ -72,10 +77,14 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
 
 Each frame lists every command dispatched so far, oldest first. Each
 line is prefixed with the basename of the cd target so the project is
-scannable at a glance (matches the (dir) shape used by board.ts):
+scannable at a glance (matches the (dir) shape used by board.ts). The
+summary form is '(<dir>) <verb>::<id>'; dry runs append the would-have
+-run shell command on two indented lines:
 
-  (dir) launch  cd <dir> && claude '/plan:work <task_id>'
-  (dir) launch  cd <dir> && claude '/plan:approve <id>'
+  (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
+  (keeper) [dry] approve::fn-619-pin-inputrequest-mid-subagent-state.1
+    cd /Users/mike/code/keeper && \\
+      claude '/plan:approve fn-619-pin-inputrequest-mid-subagent-state.1'
 
 Each run's frame shows only dispatches from this run; the JSONL log at
 ~/.local/state/keeper/dispatch.log is still appended for forensic tailing
@@ -95,6 +104,15 @@ interface DispatchEntry {
   // Basename of the cd target — empty string when none. Rendered as the
   // leading `(<dir>) ` segment of the frame line.
   dir: string;
+  // Full cd target path — used to reconstruct the indented `cd … && \`
+  // line in the dry-run multi-line frame form. Empty string when none.
+  dirFull: string;
+  verb: "work" | "close" | "approve";
+  id: string;
+  // The fused `cd … && claude …` shell string used by the actual `sh -c`
+  // spawn AND persisted to the JSONL dispatch log for forensic tailing
+  // across restarts. Frames render `verb`/`id`/`dirFull` instead; this
+  // field exists so a re-fold of dispatch.log doesn't lose what ran.
   command: string;
   dry?: boolean;
   // Stamped at logDispatch time; lets future post-mortems correlate a
@@ -228,11 +246,26 @@ async function main(): Promise<void> {
     if (dispatchLog.length === 0) {
       return ["# no commands dispatched yet"];
     }
-    return dispatchLog.map((e) => {
-      const dry = e.dry ? " (dry)" : "";
+    const out: string[] = [];
+    for (const e of dispatchLog) {
       const dirSeg = e.dir === "" ? "" : `(${e.dir}) `;
-      return `${dirSeg}launch${dry}  ${e.command}`;
-    });
+      const dryTag = e.dry ? "[dry] " : "";
+      out.push(`${dirSeg}${dryTag}${e.verb}::${e.id}`);
+      if (e.dry) {
+        // Dry runs append the would-have-run shell command, split across
+        // two indented lines for readability: `  cd <full> && \` then
+        // `    claude '/plan:<verb> <id>'`. The `cd` line is dropped when
+        // there's no dir, so a no-dir dry dispatch shows just the claude
+        // line under the summary.
+        if (e.dirFull !== "") {
+          out.push(`  cd ${e.dirFull} && \\`);
+          out.push(`    claude '/plan:${e.verb} ${e.id}'`);
+        } else {
+          out.push(`  claude '/plan:${e.verb} ${e.id}'`);
+        }
+      }
+    }
+    return out;
   }
 
   // --- sidecar paths ---
@@ -384,6 +417,9 @@ async function main(): Promise<void> {
     workerShellCommand: string,
     rowId: string,
     dir: string,
+    dirFull: string,
+    verb: "work" | "close" | "approve",
+    id: string,
   ): void {
     // `-l -i` = login + interactive — login alone sources `.zprofile` only,
     // so `claude` (and most user PATH additions) live in `.zshrc` which is
@@ -413,6 +449,9 @@ async function main(): Promise<void> {
       kind: "launch",
       rowId,
       dir,
+      dirFull,
+      verb,
+      id,
       command: workerShellCommand,
       dry: dryRun || undefined,
     });
@@ -536,12 +575,18 @@ async function main(): Promise<void> {
             `${cdPrefix}claude '/plan:work ${taskId}'`,
             `task ${taskId}`,
             dirBase,
+            dir,
+            "work",
+            taskId,
           );
         } else if (cur === "blocked:job-pending") {
           launchInGhostty(
             `${cdPrefix}claude '/plan:approve ${taskId}'`,
             `approve task ${taskId}`,
             dirBase,
+            dir,
+            "approve",
+            taskId,
           );
         }
       }
@@ -565,12 +610,18 @@ async function main(): Promise<void> {
           `${cdPrefix}claude '/plan:close ${epicId}'`,
           `close ${epicId}`,
           dirBase,
+          projectDir,
+          "close",
+          epicId,
         );
       } else if (closeCur === "blocked:job-pending") {
         launchInGhostty(
           `${cdPrefix}claude '/plan:approve ${epicId}'`,
           `approve close ${epicId}`,
           dirBase,
+          projectDir,
+          "approve",
+          epicId,
         );
       }
     }
