@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-627-fix-readiness-mutex-iteration-order",
   "bundles": [],
   "closer_done_at": "2026-05-27T21:07:01.064211Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-27T21:07:01.064211Z"
+  "updated_at": "2026-05-27T21:07:31.363872Z"
 }
