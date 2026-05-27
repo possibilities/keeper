@@ -68,6 +68,7 @@ import {
   getCollection,
   type Row,
   selectByIds,
+  selectVersionsByIds,
 } from "./collections";
 import { openDb, resolveSockPath } from "./db";
 import {
@@ -1006,9 +1007,11 @@ function readWorldRevOnce(db: Database): number {
 
 /**
  * Compute the union of watched ids across a set of connections (all of which
- * share one collection). The poll loop does ONE shared `selectByIds(union)`
- * re-read per collection group per tick, then fans the rows out — so N
- * connections watching overlapping pages cost one query, not N.
+ * share one collection). The poll loop does ONE shared `selectVersionsByIds`
+ * version-probe per collection group per tick — cheap (`pk, version` only,
+ * no JSON decode) — and only on a non-empty `changedIds` set does it follow
+ * with ONE shared `selectByIds` to fetch full rows. N connections watching
+ * overlapping pages cost one probe + at most one full-row read, not N.
  */
 function unionWatched(conns: Iterable<Writable>): string[] {
   const union = new Set<string>();
@@ -1027,13 +1030,19 @@ function unionWatched(conns: Iterable<Writable>): string[] {
  *    emitted this tick. Distinct from the per-row `version` column the diff
  *    fires on (for jobs both happen to be `last_event_id`; do not conflate).
  * 2. Group connections by active collection (skip `null`-collection conns).
- * 3. Per group: read the union of watched ids once via `selectByIds` and index
- *    by the descriptor's pk.
- * 4. For each connection, for each watched id: push a `patch {collection, rev,
- *    row}` ONLY when `row[descriptor.version] > lastSent[id]`, then bump
- *    `lastSent`. No patch when equal — the diff is state-based, so multiple
- *    folds between ticks collapse to one push (coalescing, no event queue).
- * 5. SECOND pass — membership staleness. Group the live (non-null collection,
+ * 3. Per group: read the union of watched ids once, then VERSION-PROBE the
+ *    full set via `selectVersionsByIds` — cheap (`pk, version` only, no JSON
+ *    decode). Compare each conn's `lastSent[id]` against the probed version
+ *    across ALL conns (no pending skip in this loop) to build `changedIds`.
+ * 4. If `changedIds` is non-empty, fetch the FULL rows for just those ids via
+ *    `selectByIds([...changedIds])` and index by the descriptor's pk. If
+ *    `changedIds` is empty, skip the second SELECT entirely (idle tick).
+ * 5. For each non-pending connection, for each watched id: push a `patch
+ *    {collection, rev, row}` ONLY when `row[descriptor.version] >
+ *    lastSent[id]`, then bump `lastSent`. No patch when equal — the diff is
+ *    state-based, so multiple folds between ticks collapse to one push
+ *    (coalescing, no event queue).
+ * 6. SECOND pass — membership staleness. Group the live (non-null collection,
  *    non-null `where`) connections by filter signature `[collection, clause,
  *    params]`, run ONE `countAndToken` per distinct signature (mirroring the
  *    one-`selectByIds`-per-collection sharing above), and fan `{total, token}`
@@ -1090,6 +1099,7 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
   const rev = readWorldRevOnce(db);
   const _tAfterRev = TRACE ? performance.now() : 0;
   let _accUnion = 0;
+  let _accProbe = 0;
   let _accSelect = 0;
   let _accPatch = 0;
 
@@ -1107,42 +1117,90 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
     if (ids.length === 0) {
       continue;
     }
-    const rows = selectByIds(db, descriptor, ids);
+    // Stage 2 — version probe. Read only `(pk, version)` for every watched id
+    // (no row body, no JSON-decode). This is the dominant-cost fix vs the old
+    // shape: ~682 epics × 4 JSON-array columns × every tick of `JSON.parse`
+    // collapses to one cheap projection. Per-conn comparison below builds
+    // `changedIds` and only on a non-empty set do we fetch full rows.
+    const versions = selectVersionsByIds(db, descriptor, ids);
     const _g2 = TRACE ? performance.now() : 0;
-    if (TRACE) _accSelect += _g2 - _g1;
-    // Index by the descriptor's pk for per-connection fan-out.
-    const byId = new Map<string, Row>();
-    for (const row of rows) {
-      byId.set(String(row[descriptor.pk]), row);
+    if (TRACE) _accProbe += _g2 - _g1;
+
+    // Stage 3 — compute the set of ids that advanced for ANY conn in the
+    // group. Iterates ALL conns (no `pending` skip in this loop): the skip
+    // belongs only in the fanout below where `lastSent` actually advances.
+    // Skipping pending conns here would deprive a sole backpressured watcher
+    // of the eventual fetch — still eventually-consistent (next tick re-probes
+    // since `lastSent` didn't advance), but adds a tick of drain latency.
+    // Matching today's union-fetch behavior keeps the algorithm shape minimal
+    // and the latency profile identical.
+    const changedIds = new Set<string>();
+    for (const sock of group) {
+      for (const id of sock.data.watched) {
+        const v = versions.get(id);
+        const last = sock.data.lastSent.get(id) ?? -1;
+        // `v === undefined` mirrors today's `!row` guard: a row vanished
+        // (never happens in v1, but defensive). `v === null` mirrors the
+        // existing `version !== null` guard.
+        if (v !== undefined && v !== null && v > last) {
+          changedIds.add(id);
+        }
+      }
     }
 
-    for (const sock of group) {
-      // Slow consumer: a still-pending write means this socket is
-      // backpressured. Skip it (don't advance lastSent); the next tick re-diffs.
-      if (sock.data.pending) {
-        continue;
+    // Stage 4 — conditional full-row fetch + per-conn fanout. If nothing
+    // changed, skip the second SELECT entirely. The meta second-pass runs
+    // unconditionally below (it's structurally independent).
+    //
+    // Read-snapshot drift: the probe and this fetch are TWO autocommit
+    // queries — a writer commit can land between them, in which case the
+    // second query returns the post-commit shape. Same race class as today's
+    // `readWorldRev` + `selectByIds` sequence; the patch frame carries the
+    // latest row and the world-rev may be one behind. Self-correcting on the
+    // next tick.
+    if (changedIds.size > 0) {
+      const rows = selectByIds(db, descriptor, [...changedIds]);
+      const _g3 = TRACE ? performance.now() : 0;
+      if (TRACE) _accSelect += _g3 - _g2;
+      // Index by the descriptor's pk for per-connection fan-out.
+      const byId = new Map<string, Row>();
+      for (const row of rows) {
+        byId.set(String(row[descriptor.pk]), row);
       }
-      const patches: PatchFrame[] = [];
-      for (const id of sock.data.watched) {
-        const row = byId.get(id);
-        if (!row) {
-          // The row vanished (rows are never deleted in v1, but stay
-          // defensive): nothing to diff, leave lastSent untouched.
+
+      for (const sock of group) {
+        // Slow consumer: a still-pending write means this socket is
+        // backpressured. Skip it (don't advance lastSent); the next tick
+        // re-diffs. The skip lives ONLY here — building `changedIds` above
+        // iterates all conns so the fetch shape mirrors today's behavior.
+        if (sock.data.pending) {
           continue;
         }
-        const version = row[descriptor.version] as number | null;
-        const last = sock.data.lastSent.get(id) ?? -1;
-        if (version !== null && version > last) {
-          patches.push({ type: "patch", collection: name, rev, row });
-          sock.data.lastSent.set(id, version);
+        const patches: PatchFrame[] = [];
+        for (const id of sock.data.watched) {
+          const row = byId.get(id);
+          if (!row) {
+            // This conn's id wasn't in `changedIds` (or the row vanished —
+            // defensive, rows are never deleted in v1): nothing to diff,
+            // leave lastSent untouched.
+            continue;
+          }
+          const version = row[descriptor.version] as number | null;
+          const last = sock.data.lastSent.get(id) ?? -1;
+          if (version !== null && version > last) {
+            patches.push({ type: "patch", collection: name, rev, row });
+            sock.data.lastSent.set(id, version);
+          }
+        }
+        if (patches.length > 0) {
+          writeFrames(sock, patches);
         }
       }
-      if (patches.length > 0) {
-        writeFrames(sock, patches);
-      }
+      const _g4 = TRACE ? performance.now() : 0;
+      if (TRACE) _accPatch += _g4 - _g3;
     }
-    const _g3 = TRACE ? performance.now() : 0;
-    if (TRACE) _accPatch += _g3 - _g2;
+    // else: idle tick — no changes since last tick. Second SELECT skipped
+    // entirely; the meta `countAndToken` pass below still runs.
   }
   const _tAfterPatch = TRACE ? performance.now() : 0;
 
@@ -1220,6 +1278,7 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
     TRACE &&
     (_readWorldRevMs > 5 ||
       _accUnion > 5 ||
+      _accProbe > 5 ||
       _accSelect > 5 ||
       _accPatch > 5 ||
       _metaCountMs > 5 ||
@@ -1232,6 +1291,7 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
         stages: [
           ["readWorldRev", _readWorldRevMs.toFixed(2)],
           ["unionWatched", _accUnion.toFixed(2)],
+          ["probeVersions", _accProbe.toFixed(2)],
           ["selectByIds", _accSelect.toFixed(2)],
           ["patchFanout", _accPatch.toFixed(2)],
           ["metaCount", _metaCountMs.toFixed(2)],

@@ -20,9 +20,11 @@ import {
   EPICS_DESCRIPTOR,
   GIT_DESCRIPTOR,
   getCollection,
+  JOBS_DESCRIPTOR,
+  selectVersionsByIds,
   USAGE_DESCRIPTOR,
 } from "../src/collections";
-import { openDb } from "../src/db";
+import { MAX_IN_PARAMS, openDb } from "../src/db";
 import type { ErrorFrame, ResultFrame } from "../src/protocol";
 import { runQuery } from "../src/server-worker";
 
@@ -732,4 +734,102 @@ test("epics result rows carry the `approval` column", () => {
 
 test("getCollection returns undefined for `approvals` (retired in schema v13)", () => {
   expect(getCollection("approvals")).toBeUndefined();
+});
+
+// ---------------------------------------------------------------------------
+// selectVersionsByIds — the version-probe-first helper that drives diffTick's
+// two-pass shape. The helper projects only `(pk, version)` (no JSON columns,
+// no decodeRow) so the cheap probe pass per tick scales to N watched rows
+// without paying the per-row JSON.parse cost the old shape paid.
+// ---------------------------------------------------------------------------
+
+test("selectVersionsByIds: empty ids → empty Map (no SQL run)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  // Seed a row so an erroneous "fetch all" implementation would return non-empty.
+  seedEpic(db, "fn-1", { epic_number: 1, last_event_id: 7 });
+  const map = selectVersionsByIds(db, EPICS_DESCRIPTOR, []);
+  expect(map.size).toBe(0);
+  db.close();
+});
+
+test("selectVersionsByIds: known seed → Map carries (pk, version) pairs, only requested ids", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1", { epic_number: 1, last_event_id: 11 });
+  seedEpic(db, "fn-2", { epic_number: 2, last_event_id: 22 });
+  seedEpic(db, "fn-3", { epic_number: 3, last_event_id: 33 });
+  // Request a strict subset; verify the other row is absent from the result.
+  const map = selectVersionsByIds(db, EPICS_DESCRIPTOR, ["fn-1", "fn-3"]);
+  expect(map.size).toBe(2);
+  expect(map.get("fn-1")).toBe(11);
+  expect(map.get("fn-3")).toBe(33);
+  expect(map.has("fn-2")).toBe(false);
+  db.close();
+});
+
+test("selectVersionsByIds: works for the jobs descriptor too (descriptor-agnostic)", () => {
+  // The helper is generic over CollectionDescriptor — verify it routes the
+  // table/pk/version identifiers correctly for a non-epics descriptor.
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  seedJob(db, "b", { last_event_id: 9 });
+  const map = selectVersionsByIds(db, JOBS_DESCRIPTOR, ["a", "b"]);
+  expect(map.size).toBe(2);
+  expect(map.get("a")).toBe(5);
+  expect(map.get("b")).toBe(9);
+  db.close();
+});
+
+test("selectVersionsByIds: typeof is number for known-non-null versions", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1", { epic_number: 1, last_event_id: 42 });
+  const map = selectVersionsByIds(db, EPICS_DESCRIPTOR, ["fn-1"]);
+  const v = map.get("fn-1");
+  expect(typeof v).toBe("number");
+  expect(v).toBe(42);
+  db.close();
+});
+
+test("selectVersionsByIds: id absent from the table is not in the result Map", () => {
+  // The schema-never-deletes assumption matches today's `!row` guard in
+  // diffTick: a missing id surfaces as `Map.get(id) === undefined`, which the
+  // caller treats as "skip silently".
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1", { epic_number: 1, last_event_id: 7 });
+  const map = selectVersionsByIds(db, EPICS_DESCRIPTOR, ["fn-1", "ghost"]);
+  expect(map.size).toBe(1);
+  expect(map.get("fn-1")).toBe(7);
+  expect(map.get("ghost")).toBeUndefined();
+  db.close();
+});
+
+test("selectVersionsByIds: ids.length > MAX_IN_PARAMS throws (mirrors selectByIds)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const ids: string[] = [];
+  for (let i = 0; i < MAX_IN_PARAMS + 1; i++) ids.push(`fn-${i}`);
+  expect(() => selectVersionsByIds(db, EPICS_DESCRIPTOR, ids)).toThrow(
+    /exceeds SQLITE_MAX_VARIABLE_NUMBER/,
+  );
+  db.close();
+});
+
+test("selectVersionsByIds: never selects JSON columns (no decodeRow path; cheap projection)", () => {
+  // The whole point of the probe is to skip JSON-column reads. Even though
+  // `tasks` is a populated JSON-TEXT column on epics, the returned Map
+  // shape (`pk` + `version` only) has no key for it — and since the helper
+  // never invokes `decodeRow`, populated JSON data can't sneak into the
+  // value. This test catches a regression where someone widens the SELECT
+  // projection to include arbitrary columns.
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1", {
+    epic_number: 1,
+    last_event_id: 99,
+    tasks: JSON.stringify([{ id: "fn-1.1", title: "stub" }]),
+  });
+  const map = selectVersionsByIds(db, EPICS_DESCRIPTOR, ["fn-1"]);
+  // Value is the bare version number; no row-shape with `tasks` field.
+  expect(map.get("fn-1")).toBe(99);
+  // typeof guard — the Map<string, number | null> shape is preserved even
+  // when adjacent columns carry JSON-TEXT content.
+  expect(typeof map.get("fn-1")).toBe("number");
+  db.close();
 });

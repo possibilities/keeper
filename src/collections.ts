@@ -462,6 +462,63 @@ export function selectByIds(
 }
 
 /**
+ * Read JUST the `(pk, version)` pair for a set of rows by primary key. The
+ * version-probe-first pass in `diffTick`: cheap to project (no row body, no
+ * JSON columns), cheap to decode (no `decodeRow`), and the result feeds a
+ * per-conn `version > lastSent` comparison that drives the conditional
+ * `selectByIds` for full rows ONLY when something changed. The two reads can
+ * race a writer commit between them — same read-snapshot drift class as the
+ * existing `readWorldRev` + `selectByIds` sequence; self-correcting next tick.
+ *
+ * Mirrors `selectByIds`'s prelude one-for-one: empty `ids` short-circuits to
+ * an empty Map (`IN ()` is a SQL syntax error), `ids.length > MAX_IN_PARAMS`
+ * throws (the cap-throw failure semantics match `selectByIds` — propagates to
+ * `pollLoop` → daemon `fatalExit` → LaunchAgent restart), and the prepare is
+ * per-call (the IN-list arity varies per tick; caching by SQL string via
+ * `db.query()` would leak prepared-statement entries). `AS pk`/`AS version`
+ * aliases normalize the returned shape regardless of which descriptor was
+ * passed. `descriptor.pk` and `descriptor.version` are trusted constants
+ * (interpolation-safe); the ids are bound (`?`).
+ *
+ * NEVER calls `decodeRow` — by descriptor design, neither `pk` nor `version`
+ * is in `jsonColumns` (they're SQL scalar identifiers). The `Map<string,
+ * number | null>` value shape preserves today's `selectByIds` row-cast
+ * (`row[descriptor.version] as number | null`) at the call site so the
+ * existing `version !== null && version > last` guard in `diffTick` keeps
+ * unchanged — and future-proofs against a descriptor making `version`
+ * nullable.
+ */
+export function selectVersionsByIds(
+  db: Database,
+  descriptor: CollectionDescriptor,
+  ids: readonly string[],
+): Map<string, number | null> {
+  if (ids.length === 0) {
+    return new Map();
+  }
+  if (ids.length > MAX_IN_PARAMS) {
+    throw new Error(
+      `selectVersionsByIds: id-set of ${ids.length} exceeds SQLITE_MAX_VARIABLE_NUMBER (${MAX_IN_PARAMS}); chunk the caller`,
+    );
+  }
+  const placeholders = ids.map(() => "?").join(",");
+  const sql = `
+    SELECT ${descriptor.pk} AS pk, ${descriptor.version} AS version
+      FROM ${descriptor.table}
+     WHERE ${descriptor.pk} IN (${placeholders})
+  `;
+  // Per-call prepare: matches the `selectByIds` rationale — arity-varying
+  // IN-list, cache-leak risk via `db.query()`.
+  const stmt = db.prepare(sql);
+  const rows = stmt.all(...ids) as { pk: unknown; version: number | null }[];
+  const map = new Map<string, number | null>();
+  for (const r of rows) {
+    map.set(String(r.pk), r.version);
+  }
+  return map;
+}
+
+/**
  * Decode a row's JSON-TEXT columns into real values at the read boundary. For
  * each name in `descriptor.jsonColumns`, replaces the row's stored TEXT with
  * `JSON.parse`'d output so the wire frame serves an array/object — not a JSON

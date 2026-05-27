@@ -1284,6 +1284,159 @@ test("diffTick groups connections by collection (one selectByIds per group)", ()
   db.close();
 });
 
+test("diffTick property: K changes ⇒ K patches; only changed rows are fetched/decoded; unchanged rows skip selectByIds", async () => {
+  // PROPERTY: after the two-pass rewrite, the second SELECT (`selectByIds`,
+  // which is the only path that invokes `decodeRow`) is called with EXACTLY
+  // the set of ids whose `version` advanced past `lastSent` — not with the
+  // full union. So for N watched rows and K advances, `selectByIds` is
+  // either called once with `[K-ids]` (K > 0) or not called at all (K = 0).
+  //
+  // Implementation: spy on the `selectByIds` import via `mock.module` so we
+  // can count its invocations + assert the exact ids it was passed. The spy
+  // is scoped to a child-spawn so it can't leak into other test cases.
+  const childDb = join(tmpDir, "property.db");
+  openDb(childDb).db.close();
+  const script = `
+    import { mock } from "bun:test";
+    import { openDb } from ${JSON.stringify(join(import.meta.dir, "../src/db"))};
+    import * as collections from ${JSON.stringify(join(import.meta.dir, "../src/collections"))};
+    // Pre-import the real selectByIds so the spy can delegate to it.
+    const _realSelectByIds = collections.selectByIds;
+    let _selectByIdsCalls = [];
+    await mock.module(${JSON.stringify(join(import.meta.dir, "../src/collections"))}, () => ({
+      ...collections,
+      selectByIds: (db, descriptor, ids) => {
+        _selectByIdsCalls.push({ collection: descriptor.name, ids: [...ids] });
+        return _realSelectByIds(db, descriptor, ids);
+      },
+    }));
+    // Import server-worker AFTER the mock is installed so its top-level
+    // \`import { selectByIds } from "./collections"\` resolves to the spy.
+    const { diffTick } = await import(${JSON.stringify(join(import.meta.dir, "../src/server-worker"))});
+    const { db } = openDb(${JSON.stringify(childDb)}, { readonly: false });
+
+    // Seed N = 10 epics with non-trivial JSON-column content (so a decoded
+    // row is visibly distinct from an undecoded one — \`tasks\` is an array,
+    // not a string).
+    const N = 10;
+    for (let i = 0; i < N; i++) {
+      const tasks = JSON.stringify([{ id: \`fn-\${i}.1\`, title: \`t\${i}\` }]);
+      db.query(\`
+        INSERT INTO epics (
+          epic_id, epic_number, title, project_dir, status, last_event_id,
+          updated_at, tasks, depends_on_epics, jobs, job_links, sort_path,
+          created_by_closer_of
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '[]', ?, NULL)
+      \`).run(\`fn-\${i}\`, i, \`title-\${i}\`, "/repo", "open", i * 10, 1, tasks, String(i).padStart(6, "0"));
+    }
+    db.query("UPDATE reducer_state SET last_event_id = 999 WHERE id = 1").run();
+
+    // Build a fake socket with watched + lastSent seeded from the live row
+    // versions — so a fresh diffTick is a no-op until rows actually advance.
+    const ids = [];
+    const lastSent = new Map();
+    for (let i = 0; i < N; i++) {
+      const id = \`fn-\${i}\`;
+      ids.push(id);
+      lastSent.set(id, i * 10);
+    }
+    const sock = {
+      data: {
+        buffer: { push: () => [], pendingLength: () => 0 },
+        collection: "epics",
+        watched: new Set(ids),
+        lastSent,
+        where: null, lastTotal: null, lastToken: null, pending: null,
+        frames: [],
+      },
+      write(buf, off, len) {
+        const text = Buffer.from(buf.subarray(off ?? 0, (off ?? 0) + (len ?? buf.length - (off ?? 0)))).toString("utf8");
+        for (const line of text.split("\\n")) {
+          if (line.length > 0) this.data.frames.push(JSON.parse(line));
+        }
+        return len ?? buf.length - (off ?? 0);
+      },
+    };
+
+    // Tick 1: no advances since baseline → no patch, no selectByIds call.
+    _selectByIdsCalls = [];
+    diffTick(db, [sock]);
+    const tick1 = {
+      patches: sock.data.frames.filter(f => f.type === "patch").length,
+      calls: _selectByIdsCalls.map(c => ({ collection: c.collection, idCount: c.ids.length, ids: [...c.ids].sort() })),
+    };
+
+    // Tick 2: advance K = 3 rows; assert (a) K patches, (b) selectByIds called
+    // ONCE with EXACTLY K ids, (c) patched rows have decoded JSON columns
+    // (tasks is an array).
+    const K = 3;
+    const advancedIds = ["fn-2", "fn-5", "fn-8"];
+    for (const id of advancedIds) {
+      db.query("UPDATE epics SET last_event_id = last_event_id + 100 WHERE epic_id = ?").run(id);
+    }
+    sock.data.frames = [];
+    _selectByIdsCalls = [];
+    diffTick(db, [sock]);
+    const tick2Patches = sock.data.frames.filter(f => f.type === "patch");
+    const tick2 = {
+      patchCount: tick2Patches.length,
+      patchIds: tick2Patches.map(p => String(p.row.epic_id)).sort(),
+      tasksAreArrays: tick2Patches.every(p => Array.isArray(p.row.tasks)),
+      tasksFirstHasTitle: tick2Patches.every(p => p.row.tasks[0] && typeof p.row.tasks[0].title === "string"),
+      calls: _selectByIdsCalls.map(c => ({ collection: c.collection, idCount: c.ids.length, ids: [...c.ids].sort() })),
+    };
+
+    console.log(JSON.stringify({ tick1, tick2, advancedIds: [...advancedIds].sort(), N, K }));
+    db.close();
+  `;
+  const proc = Bun.spawn({
+    cmd: ["bun", "--eval", script],
+    env: process.env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (proc.exitCode !== 0) {
+    throw new Error(
+      `child failed (exit=${proc.exitCode})\nstdout: ${stdout}\nstderr: ${stderr}`,
+    );
+  }
+  const result = JSON.parse(stdout.trim()) as {
+    tick1: { patches: number; calls: { idCount: number }[] };
+    tick2: {
+      patchCount: number;
+      patchIds: string[];
+      tasksAreArrays: boolean;
+      tasksFirstHasTitle: boolean;
+      calls: { collection: string; idCount: number; ids: string[] }[];
+    };
+    advancedIds: string[];
+    N: number;
+    K: number;
+  };
+
+  // Tick 1: nothing changed since the seeded baseline → zero patches AND
+  // `selectByIds` was NEVER called (the two-pass rewrite's whole point:
+  // unchanged rows are not decoded).
+  expect(result.tick1.patches).toBe(0);
+  expect(result.tick1.calls.length).toBe(0);
+
+  // Tick 2: exactly K = 3 patches; exactly K decoded rows; one selectByIds
+  // call carrying ONLY the K changed ids (not N).
+  expect(result.tick2.patchCount).toBe(result.K);
+  expect(result.tick2.patchIds).toEqual(result.advancedIds);
+  expect(result.tick2.tasksAreArrays).toBe(true);
+  expect(result.tick2.tasksFirstHasTitle).toBe(true);
+  expect(result.tick2.calls.length).toBe(1);
+  expect(result.tick2.calls[0]?.collection).toBe("epics");
+  expect(result.tick2.calls[0]?.idCount).toBe(result.K);
+  expect(result.tick2.calls[0]?.ids).toEqual(result.advancedIds);
+}, 15_000);
+
 test("pollLoop drives a patch to a subscriber after a separate writer commits", async () => {
   // Reader connection runs the poll loop (autocommit, observes other conns'
   // commits). A separate writer connection commits a jobs change.
@@ -1777,11 +1930,12 @@ test("diffTick: TRACE=1 emits op=diffTick line for a slow tick (>10ms total)", a
       // Deterministic threshold crossing via a mocked performance.now() that
       // returns a monotonically increasing virtual clock advanced by +20ms on
       // every call. diffTick's staged-timing instrumentation pulls the clock
-      // 5+ times per tick (start, afterRev, g0/g1/g2/g3 per group, afterPatch,
-      // end), so each stage delta lands at +20ms — well above the per-stage
-      // 5ms gate and the total 10ms gate. No wall-clock spin, no CI-speed
-      // hope: the slow-tick line is guaranteed to emit when (and only when)
-      // the threshold gate is wired correctly.
+      // 7+ times per tick (start, afterRev, g0/g1/g2/g3/g4 per group,
+      // afterPatch, end — the probeVersions stage adds one timestamp on top
+      // of the pre-rewrite count), so each stage delta lands at +20ms — well
+      // above the per-stage 5ms gate and the total 10ms gate. No wall-clock
+      // spin, no CI-speed hope: the slow-tick line is guaranteed to emit when
+      // (and only when) the threshold gate is wired correctly.
       const _realNow = performance.now.bind(performance);
       let _virtualMs = _realNow();
       performance.now = () => {
@@ -1815,7 +1969,7 @@ test("diffTick: TRACE=1 emits op=diffTick line for a slow tick (>10ms total)", a
   expect(lines.length).toBeGreaterThan(0);
   for (const line of lines) {
     expect(line).toMatch(
-      /\[srv-ts\] T=\d+ op=diffTick col=\* readWorldRev=\d+\.\d{2} unionWatched=\d+\.\d{2} selectByIds=\d+\.\d{2} patchFanout=\d+\.\d{2} metaCount=\d+\.\d{2} total=\d+\.\d{2}/,
+      /\[srv-ts\] T=\d+ op=diffTick col=\* readWorldRev=\d+\.\d{2} unionWatched=\d+\.\d{2} probeVersions=\d+\.\d{2} selectByIds=\d+\.\d{2} patchFanout=\d+\.\d{2} metaCount=\d+\.\d{2} total=\d+\.\d{2}/,
     );
   }
 }, 15_000);

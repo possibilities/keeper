@@ -520,8 +520,11 @@ and everything collection-specific (which table to read, which columns to serve,
 which column the diff fires on) is described by a registry entry rather than
 hardcoded — `jobs` is the first such collection; `epics` and
 `subagent_invocations` register alongside it. On each `data_version` tick the
-server re-reads its watched rows, diffs the per-row version column, and pushes
-`patch` frames to subscribed clients. The same tick also runs a second pass: it
+server runs a two-pass diff: first a cheap `(pk, version)` probe over the union
+of watched ids — no row body, no JSON decode — to find which rows advanced past
+each connection's `lastSent`, then (only when something changed) a second SELECT
+that fetches and JSON-decodes just the changed rows and pushes `patch` frames to
+subscribed clients. The same tick also runs a second pass: it
 groups subscriptions by filter signature, runs one `COUNT(*)` + membership-token
 query per distinct filter (the token is a `group_concat` over the matching pk
 identities, ordered by pk so it's stable and fingerprints membership, not cell
