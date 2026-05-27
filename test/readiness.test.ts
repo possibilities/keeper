@@ -1114,10 +1114,13 @@ test("applySingleTaskPerEpicMutex: standalone invocation mutates verdict map in 
   );
 });
 
-test("applySingleTaskPerEpicMutex: non-completed non-ready row STILL claims the epic slot", () => {
-  // The new semantics: any non-completed verdict (not just `ready`) claims
-  // the slot. A blocked-but-non-completed row occupies the epic, so the
-  // later ready row gets mutated.
+test("applySingleTaskPerEpicMutex: live-work blocked row claims the epic slot", () => {
+  // Pass-1 semantics: a verdict from the `isLiveWorkOccupant` whitelist —
+  // one of `job-running`, `sub-agent-running`, `planner-running`,
+  // `job-pending` — claims the epic slot regardless of iteration order, so
+  // the later ready row gets demoted. Dependency / admin / repo-state /
+  // mutex-synthesized blocks do NOT claim in pass-1 (see the negative-
+  // control test below for `dep-on-task`).
   const t1 = makeTask({ task_id: "fn-1-foo.1" });
   const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
   const epic = makeEpic({ tasks: [t1, t2] });
@@ -1130,6 +1133,28 @@ test("applySingleTaskPerEpicMutex: non-completed non-ready row STILL claims the 
   expect(perTask.get("fn-1-foo.2")).toEqual(
     blocked({ kind: "single-task-per-epic" }),
   );
+});
+
+test("applySingleTaskPerEpicMutex: dep-on-task row does NOT claim the epic slot (negative control)", () => {
+  // Negative control for the pass-1 whitelist. A `dep-on-task` block is
+  // NOT one of the four `isLiveWorkOccupant` kinds (`job-running`,
+  // `sub-agent-running`, `planner-running`, `job-pending`) — it represents
+  // waiting, not concurrent worker activity. So a later ready sibling must
+  // win the slot rather than be demoted to single-task-per-epic. Locks in
+  // the narrowed whitelist against future regression that would silently
+  // re-broaden to "any non-completed verdict".
+  const t1 = makeTask({ task_id: "fn-1-foo.1" });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", blocked({ kind: "dep-on-task", upstream: "fn-0-x.1" })],
+    ["fn-1-foo.2", { tag: "ready" }],
+  ]);
+  applySingleTaskPerEpicMutex([epic], perTask);
+  expect(perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-0-x.1" }),
+  );
+  expect(perTask.get("fn-1-foo.2")).toEqual({ tag: "ready" });
 });
 
 test("applySingleTaskPerEpicMutex: ready row before job-running row in same epic still gets demoted to single-task-per-epic", () => {
@@ -1202,9 +1227,13 @@ test("applySingleTaskPerRootMutex: standalone invocation mutates verdict maps in
   );
 });
 
-test("applySingleTaskPerRootMutex: non-completed non-ready row STILL claims the root", () => {
-  // Cross-epic version of the same broader rule: an actively blocked row in
-  // epic A occupies root /r so a later ready row in epic B gets mutated.
+test("applySingleTaskPerRootMutex: live-work blocked row claims the root", () => {
+  // Cross-epic pass-1 semantics: a verdict from the `isLiveWorkOccupant`
+  // whitelist — one of `job-running`, `sub-agent-running`, `planner-running`,
+  // `job-pending` — in epic A occupies root /r so a later ready row in
+  // epic B gets demoted. Dependency / admin / repo-state / mutex-
+  // synthesized blocks do NOT claim in pass-1 (see the negative-control
+  // test below for `dep-on-task`).
   const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
   const e1 = makeEpic({
     epic_id: "fn-1-foo",
@@ -1231,6 +1260,41 @@ test("applySingleTaskPerRootMutex: non-completed non-ready row STILL claims the 
   expect(perTask.get("fn-2-bar.1")).toEqual(
     blocked({ kind: "single-task-per-root" }),
   );
+});
+
+test("applySingleTaskPerRootMutex: dep-on-task row does NOT claim the root (negative control)", () => {
+  // Cross-epic negative control for the pass-1 whitelist. A `dep-on-task`
+  // block in epic A is NOT one of the four `isLiveWorkOccupant` kinds, so
+  // it must NOT claim root /r. The ready row in epic B on the same root
+  // must remain ready rather than be demoted to single-task-per-root.
+  // Locks in the narrowed whitelist against a future regression that would
+  // silently re-broaden to "any non-completed verdict".
+  const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/r",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", blocked({ kind: "dep-on-task", upstream: "fn-0-x.1" })],
+    ["fn-2-bar.1", { tag: "ready" }],
+  ]);
+  applySingleTaskPerRootMutex([e1, e2], perTask, new Map());
+  expect(perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-0-x.1" }),
+  );
+  expect(perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
 });
 
 test("applySingleTaskPerRootMutex: ready row in earlier-iterating epic blocked by job-running row in later-iterating epic (same root)", () => {

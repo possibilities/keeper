@@ -541,15 +541,22 @@ function evaluateCloseRow(
 // ---------------------------------------------------------------------------
 
 /**
- * Per-epic mutex (predicate 11). Walk each epic's tasks in pre-sorted order.
- * The FIRST task whose verdict is non-completed claims the epic's slot;
- * every LATER task in the same epic with verdict `{ tag: "ready" }` is
- * mutated to `{ kind: "single-task-per-epic" }`. Rows already blocked
- * (dep-on-task, job-running, etc.) keep their more-specific reason.
+ * Per-epic mutex (predicate 11). Two-pass walk over each epic's tasks in
+ * pre-sorted order.
  *
- * The "occupant" check counts ANY non-completed verdict (ready, working,
- * blocked-by-anything) — so a sibling task that is actively `job-running`
- * or `sub-agent-running` blocks later ready siblings within the same epic.
+ * Pass 1 — live-work claim: scan every task; if any task's verdict satisfies
+ * `isLiveWorkOccupant` (i.e. one of `job-running`, `sub-agent-running`,
+ * `planner-running`, `job-pending`), that task claims the epic's slot
+ * regardless of iteration order. Dependency-style blocks (`dep-on-task`,
+ * `dep-on-epic`), admin blocks, repo-state blocks, mutex-synthesized blocks,
+ * and `unknown` do NOT claim in pass-1 — they represent waiting, not
+ * concurrent worker activity.
+ *
+ * Pass 2 — ready tiebreak: walk the same tasks again. If pass-1 already
+ * claimed the slot, every `{ tag: "ready" }` row is mutated to
+ * `{ kind: "single-task-per-epic" }`. Otherwise the FIRST ready row wins the
+ * slot and every LATER ready row is demoted. Rows already blocked keep their
+ * more-specific reason (only `{ tag: "ready" }` is mutated).
  *
  * The close row is never considered here: predicate 10 already forces close
  * to wait until every task is completed, so close can only be `ready` when
@@ -626,17 +633,26 @@ export function applySingleTaskPerEpicMutex(
 }
 
 /**
- * Per-root mutex (predicate 12). Walk every per-row verdict in board
- * traversal order (epics in input iteration order; per epic: pre-sorted
+ * Per-root mutex (predicate 12). Two-pass walk over every per-row verdict in
+ * board traversal order (epics in input iteration order; per epic: pre-sorted
  * tasks then the synthetic close row). Key on the effective root:
  * `task.target_repo ?? epic.project_dir` (BOTH null AND empty-string fall
  * through to the next fallback — mirroring `scripts/autopilot.ts:206-210`
- * exactly). The FIRST non-completed row per root claims the slot; every
- * LATER row in the same root with verdict `{ tag: "ready" }` is mutated to
- * `{ kind: "single-task-per-root" }`. Same "any non-completed occupant"
- * rule as the per-epic pass — a sibling task in the same root that is
- * actively `job-running` (or any non-completed state) still blocks later
- * ready rows.
+ * exactly).
+ *
+ * Pass 1 — live-work claim: scan every task and close row; any verdict
+ * satisfying `isLiveWorkOccupant` (one of `job-running`, `sub-agent-running`,
+ * `planner-running`, `job-pending`) claims its effective root regardless of
+ * iteration order relative to ready siblings in other epics on the same
+ * root. Dependency / admin / repo-state / mutex-synthesized blocks and
+ * `unknown` do NOT claim in pass-1 — they don't represent a live worker
+ * that would conflict with a freshly-dispatched sibling.
+ *
+ * Pass 2 — ready tiebreak: walk tasks and close rows in iteration order. If
+ * the root is already claimed by pass-1, every `{ tag: "ready" }` row on
+ * that root is mutated to `{ kind: "single-task-per-root" }`. Otherwise the
+ * FIRST ready row per root wins the slot and every LATER ready row on the
+ * same root is demoted.
  *
  * Exported separately so the test suite can drive it with a hand-rolled
  * verdict map.
