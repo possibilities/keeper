@@ -320,8 +320,9 @@ export interface Job {
    */
   start_time: string | null;
   /**
-   * Spawn-derived planctl verb on the strict whitelist `{plan, work, close}`,
-   * extracted from `Event.spawn_name` at SessionStart by
+   * Spawn-derived planctl verb on the strict whitelist
+   * `{plan, work, close, approve}`, extracted from `Event.spawn_name` at
+   * SessionStart by
    * {@link import("./derivers").planVerbRefFromSpawnName}. NULL on jobs whose
    * spawn name didn't match the canonical `{verb}::<ref>` shape (no spawn name,
    * `audit::`/`develop::` prefix, malformed body, extra `::` segments). Paired
@@ -446,12 +447,16 @@ export interface ReducerState {
 
 /**
  * The display projection of a `jobs` row embedded inside an `epics` row's
- * `jobs` array (epic-level: verbs `plan` / `close`) or inside a task element's
- * `jobs` sub-array (task-level: verb `work`). The reducer's `syncJobIntoEpic`
- * helper builds these from the post-write `jobs` row whenever a `plan_ref` is
- * non-null. Sorted `(created_at desc, job_id asc)` — total-order tiebreaker on
- * `job_id` is non-negotiable for byte-identical re-fold (see CLAUDE.md
- * "byte-identical re-fold" invariant).
+ * `jobs` array (epic-form ref: verbs `plan` / `close` / `approve`) or inside
+ * a task element's `jobs` sub-array (task-form ref: verbs `work` /
+ * `approve`). The reducer's `syncJobIntoEpic` helper builds these from the
+ * post-write `jobs` row whenever a `plan_ref` is non-null; the destination
+ * array is decided by `parsePlanRef`'s kind (ordinal-suffix presence), so
+ * the `approve` verb lands alongside `plan`/`close` for an epic-form ref
+ * and alongside `work` for a task-form ref. Sorted
+ * `(created_at desc, job_id asc)` — total-order tiebreaker on `job_id` is
+ * non-negotiable for byte-identical re-fold (see CLAUDE.md "byte-identical
+ * re-fold" invariant).
  *
  * Field set is the minimal display projection: identity + verb + lifecycle
  * state + title + the monotonic per-row version (`last_event_id`) that fires
@@ -556,12 +561,16 @@ export interface SubagentInvocation {
  * (`decodeRow`); a task edit folds into this array and bumps the epic's
  * `last_event_id`, so it surfaces as a `patch` on the parent epic row.
  *
- * As of schema v11 each epic also embeds its plan/close-verb jobs in the
- * `jobs` array (`EmbeddedJob[]`); work-verb jobs live inside their target
- * task element's nested `jobs` sub-array (see {@link Task.jobs}). The reducer
- * fans a `jobs` write into the correct embedded array via `syncJobIntoEpic`
- * whenever the row carries a `plan_ref`. Stored as JSON TEXT, decoded to a
- * real array at the read boundary; sorted `(created_at desc, job_id asc)`.
+ * As of schema v11 each epic also embeds its epic-form-ref jobs in the
+ * `jobs` array (`EmbeddedJob[]`) — verbs `plan` and `close`, plus `approve`
+ * since v26's whitelist widening; task-form-ref jobs live inside their
+ * target task element's nested `jobs` sub-array (see {@link Task.jobs}) —
+ * verb `work`, plus `approve` since v26. The reducer fans a `jobs` write
+ * into the correct embedded array via `syncJobIntoEpic` whenever the row
+ * carries a `plan_ref` (the kind — epic vs task — is decided by
+ * `parsePlanRef` from the ref's ordinal-suffix presence, not the verb).
+ * Stored as JSON TEXT, decoded to a real array at the read boundary;
+ * sorted `(created_at desc, job_id asc)`.
  */
 export interface Epic {
   epic_id: string;
@@ -591,9 +600,10 @@ export interface Epic {
   tasks: Task[];
   /**
    * Epic-level embedded jobs: `jobs` rows whose `plan_ref` equals this
-   * `epic_id` (verbs `plan` / `close`). Work-verb jobs live in each task
-   * element's `jobs` sub-array, never here. Sorted
-   * `(created_at desc, job_id asc)`.
+   * `epic_id` — verbs `plan` / `close`, plus `approve` since v26's whitelist
+   * widening (an `approve::fn-N-foo` session embeds here). Task-form-ref jobs
+   * (verbs `work` / `approve` against a task) live in each task element's
+   * `jobs` sub-array, never here. Sorted `(created_at desc, job_id asc)`.
    */
   jobs: EmbeddedJob[];
   /**
@@ -695,8 +705,10 @@ export interface Task {
   depends_on: string[];
   /**
    * Task-level embedded jobs: `jobs` rows whose `plan_ref` equals this
-   * `task_id` (verb `work`). Lives nested inside the parent epic's embedded
-   * `tasks` array — decoded at the read boundary via the same JSON parse as
+   * `task_id` — verb `work`, plus `approve` since v26's whitelist widening
+   * (an `approve::fn-N-foo.M` session embeds here alongside its work
+   * counterpart). Lives nested inside the parent epic's embedded `tasks`
+   * array — decoded at the read boundary via the same JSON parse as
    * `tasks` itself (no separate `jsonColumns` entry; nested decode rides for
    * free). Sorted `(created_at desc, job_id asc)`.
    */

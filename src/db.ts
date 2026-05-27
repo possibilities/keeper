@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 25;
+export const SCHEMA_VERSION = 26;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -2116,6 +2116,31 @@ function migrate(db: Database): void {
       )?.value ?? "0",
     );
     if (storedVersionV25 < 25) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM subagent_invocations");
+    }
+
+    // v26: widen `SPAWN_VERB_REF_RE` to accept the `approve` verb so
+    // sessions launched as `claude --name approve::<ref> '/plan:approve
+    // <ref>'` populate `jobs.plan_verb` / `jobs.plan_ref` and embed into
+    // the parent epic's / task's `jobs[]` array — uniform with `plan` /
+    // `work` / `close`. The regex change is data-incompatible: existing
+    // events with `spawn_name="approve::..."` folded under the old regex
+    // left `plan_verb` NULL on their jobs row and skipped the
+    // `syncJobIntoEpic` embed. Rewind the cursor + clear projections so
+    // boot drain re-folds every event under the widened regex and the
+    // existing approve sessions land in the right embedded arrays. Same
+    // shape as every prior version-guarded rewind in this file.
+    const storedVersionV26 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV26 < 26) {
       db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
       db.run("DELETE FROM jobs");
       db.run("DELETE FROM epics");

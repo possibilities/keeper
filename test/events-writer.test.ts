@@ -570,6 +570,20 @@ test("planVerbRefFromSpawnName: plan::<ref> → {plan, ref}", () => {
   });
 });
 
+test("planVerbRefFromSpawnName: approve::<epic-task> → {approve, ref}", () => {
+  expect(planVerbRefFromSpawnName("approve::fn-619-pin-foo.1")).toEqual({
+    plan_verb: "approve",
+    plan_ref: "fn-619-pin-foo.1",
+  });
+});
+
+test("planVerbRefFromSpawnName: approve::<epic> → {approve, epic-id}", () => {
+  expect(planVerbRefFromSpawnName("approve::fn-619-pin-foo")).toEqual({
+    plan_verb: "approve",
+    plan_ref: "fn-619-pin-foo",
+  });
+});
+
 test("planVerbRefFromSpawnName: audit::<ref> → {null, null} (whitelist)", () => {
   // audit is NOT in the locked whitelist — adding it requires editing the
   // regex deliberately, never silent fall-through.

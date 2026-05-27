@@ -157,7 +157,7 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   JSON array (a fourth, read-only producer worker watches the configured
   roots' `.planctl/{epics,tasks}` trees; jobs fan in from the reducer's own
   jobs-side writes whenever a SessionStart spawn name parses as
-  `{plan|work|close}::<ref>`). The socket carries plan mutations *scoped to
+  `{plan|work|close|approve}::<ref>`). The socket carries plan mutations *scoped to
   the `approval` field only* — the `set_task_approval` / `set_epic_approval`
   RPCs write `approval` on the target `.planctl` file via atomic temp+rename,
   and the plan worker round-trips the change back as a snapshot event. Every
@@ -526,10 +526,11 @@ and cleared on the next `UserPromptSubmit` / `SessionStart` revival
 (`PreToolUse` / `PostToolUse` also clear `last_input_request_*`,
 gated on the column-is-not-NULL hot-path predicate — these arms fire
 50+ times per turn so the gate keeps the UPDATE cold when nothing is
-awaiting). Each epic also embeds its plan/close-verb
-jobs as a `jobs` JSON array, and each task element embeds its own work-verb
-jobs as a nested `jobs` sub-array — fanned in from the reducer's jobs-side
-writes whenever a SessionStart spawn name parses as `{plan|work|close}::<ref>`
+awaiting). Each epic also embeds its plan/close/approve-verb (epic-form)
+jobs as a `jobs` JSON array, and each task element embeds its own
+work/approve-verb (task-form) jobs as a nested `jobs` sub-array — fanned in
+from the reducer's jobs-side writes whenever a SessionStart spawn name
+parses as `{plan|work|close|approve}::<ref>`
 (the `syncJobIntoEpic` helper), so the single `epics` collection serves epic
 + tasks + associated sessions in one subscribe. As of schema v14 a second
 fan-out rides alongside: every `planctl_op != NULL` event triggers the

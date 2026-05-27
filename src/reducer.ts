@@ -1748,7 +1748,7 @@ function syncIfPlanRef(
   // and short-circuits on `'[]'` itself, so it's cheap to always call —
   // and gating it on `plan_ref != null` here would silently miss
   // creator/refiner sessions whose spawn name didn't parse as
-  // `{plan|work|close}::<ref>` (e.g. arthack manual sessions running
+  // `{plan|work|close|approve}::<ref>` (e.g. arthack manual sessions running
   // `planctl epic-create` outside the planctl spawn whitelist).
   syncJobLinksOnJobWrite(db, jobId, eventId, ts);
 }
@@ -2326,14 +2326,15 @@ function projectJobsRow(db: Database, event: Event): void {
         // Derive `plan_verb`/`plan_ref` from the SessionStart spawn name via
         // the same pure parser the v9→v10 migration backfill uses (single
         // source of truth). NULL on every spawn name that doesn't match the
-        // strict `{plan|work|close}::<ref>` whitelist — re-fold deterministic.
+        // strict `{plan|work|close|approve}::<ref>` whitelist — re-fold
+        // deterministic.
         //
         // Set-once identity on RESUME: the ON CONFLICT branch leaves both
         // columns untouched. A duplicate SessionStart on a non-`{plan,work,
-        // close}::` spawn (or a switch from one verb to another mid-session)
-        // never overwrites the seeded pair — mirrors the title/title_source
-        // precedence rule, where a resume never re-seeds the priority-1
-        // 'spawn' name over a higher source.
+        // close,approve}::` spawn (or a switch from one verb to another
+        // mid-session) never overwrites the seeded pair — mirrors the
+        // title/title_source precedence rule, where a resume never re-seeds
+        // the priority-1 'spawn' name over a higher source.
         const { plan_verb, plan_ref } = planVerbRefFromSpawnName(
           event.spawn_name,
         );
