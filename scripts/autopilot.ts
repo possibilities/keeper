@@ -19,6 +19,22 @@
  * dispatches from this run — the file is write-only from autopilot's
  * perspective. A new frame is emitted immediately after each dispatch.
  *
+ * Below a `---` separator (only present when non-empty), the frame
+ * previews the next dispatches autopilot will fire as current sessions
+ * finish — approvals first (one per currently-active row whose approval
+ * isn't already "approved"), then workers, then closers (rows that flip
+ * blocked→ready in a simulation that forces every currently-active row
+ * to completed). Preview rows are single-line `(<dir>) <verb>::<id>` —
+ * no `[dry]` tag, no shell-command footer. The preview recomputes from
+ * the live readiness snapshot on every emit; section 1 above the `---`
+ * is the persisted dispatch log for this run:
+ *
+ *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
+ *   ---
+ *   (keeper) approve::fn-619-pin-inputrequest-mid-subagent-state.1
+ *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.2
+ *   (keeper) close::fn-619-pin-inputrequest-mid-subagent-state
+ *
  * Fires side effects on EDGES in the readiness verdicts:
  *   → ready          spawn a Ghostty window running the worker command
  *                    (`cd … && claude '/plan:work …'` or '/plan:close …')
@@ -51,12 +67,12 @@ import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
-import type { Verdict } from "../src/readiness";
+import { computeReadiness, type Verdict } from "../src/readiness";
 import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
 } from "../src/readiness-client";
-import type { Epic } from "../src/types";
+import type { Epic, Task } from "../src/types";
 
 const HELP = `keeper-autopilot — dispatch log viewer over the keeper subscribe server
 
@@ -89,6 +105,14 @@ summary form is '(<dir>) <verb>::<id>'; dry runs append the would-have
 Each run's frame shows only dispatches from this run; the JSONL log at
 ~/.local/state/keeper/dispatch.log is still appended for forensic tailing
 across restarts. A new frame is emitted after each dispatch.
+
+Below a '---' separator (only when non-empty), the frame previews the next
+dispatches autopilot will fire as current sessions finish — approvals
+first (one per currently-active row whose approval isn't "approved"),
+then workers, then closers (rows that flip blocked→ready when every
+currently-active row is forced to completed). Preview rows are
+single-line '(<dir>) <verb>::<id>' — no [dry] tag, no shell-command
+footer.
 
 The helper waits for keeperd to come up and reconnects across restarts;
 each connection-lifecycle change is appended to the lifecycle sidecar.
@@ -214,6 +238,202 @@ export function renderEpicCommandsFiltered(
   return lines.join(" &&\n");
 }
 
+// --- next-dispatch prediction (module-scope so tests can import) ---------
+//
+// Section 2 of the autopilot frame previews the next dispatches that will
+// fire as currently-active sessions finish. The "active set" is every row
+// whose current verdict is `ready`, `blocked:job-running`, or
+// `blocked:sub-agent-running`. `planner-running` is NOT included — a
+// planner finishing produces tasks, not approvals/workers/closers, so
+// modeling its completion is outside this preview's scope.
+//
+// Two layers:
+//   - approvals — for every active row whose own `approval` isn't already
+//     "approved", autopilot will fire `approve::<id>` on its job-pending
+//     edge once the worker session ends. Pre-approved rows skip the
+//     approve dispatch (they go straight to completed) so they're
+//     excluded from this layer.
+//   - workers + closers — rows whose verdict flips `blocked → ready` in
+//     a simulation that forces every active row to the completed shape
+//     (`worker_phase`/`status`="done", `approval`="approved", embedded
+//     jobs[].state="ended"). Subagent invocations are dropped from the
+//     simulation: every running sub-agent is on an active-set row (the
+//     row would otherwise not be `sub-agent-running`), and the active
+//     set is being forced completed — so `[]` is equivalent to ending
+//     every sub.
+//
+// `computeReadiness` is pure, so we just hand it the simulated `Epic[]`
+// and diff its output against `snap.readiness`. The post-pass mutexes
+// (single-task-per-epic / per-root) self-correct in the re-run: if two
+// dependents would both be eligible, the first-in-traversal-order wins
+// the slot and the others stay blocked under the simulated mutex.
+
+export interface PreviewRow {
+  verb: "work" | "close" | "approve";
+  id: string;
+  // Basename of the cd target — empty string when none. Rendered as the
+  // leading `(<dir>) ` segment of the preview line.
+  dir: string;
+  // Full cd target path — retained on the descriptor so future renderers
+  // (e.g. a multi-line preview shape) can reconstruct the shell command.
+  // Today's renderer only consumes `dir` for the `(<dir>)` prefix.
+  dirFull: string;
+}
+
+export interface PreviewSections {
+  approvals: PreviewRow[];
+  workers: PreviewRow[];
+  closers: PreviewRow[];
+}
+
+function isActiveVerdict(v: Verdict | undefined): boolean {
+  if (v === undefined) {
+    return false;
+  }
+  if (v.tag === "ready") {
+    return true;
+  }
+  if (v.tag === "blocked") {
+    return (
+      v.reason.kind === "job-running" || v.reason.kind === "sub-agent-running"
+    );
+  }
+  return false;
+}
+
+function taskCdDir(task: Task, projectDir: string): string {
+  if (task.target_repo != null && seg(task.target_repo) !== "") {
+    return seg(task.target_repo);
+  }
+  return projectDir;
+}
+
+function previewRowFromTask(
+  task: Task,
+  projectDir: string,
+  verb: "work" | "approve",
+): PreviewRow {
+  const dirFull = taskCdDir(task, projectDir);
+  return {
+    verb,
+    id: seg(task.task_id),
+    dir: dirFull === "" ? "" : basename(dirFull),
+    dirFull,
+  };
+}
+
+function previewRowFromEpic(epic: Epic, verb: "close" | "approve"): PreviewRow {
+  const projectDir = seg(epic.project_dir);
+  return {
+    verb,
+    id: seg(epic.epic_id),
+    dir: projectDir === "" ? "" : basename(projectDir),
+    dirFull: projectDir,
+  };
+}
+
+export function predictNextDispatches(
+  snap: ReadinessClientSnapshot,
+): PreviewSections {
+  const approvals: PreviewRow[] = [];
+  const activeTaskIds = new Set<string>();
+  const activeCloseEpicIds = new Set<string>();
+
+  for (const epic of snap.epics) {
+    const projectDir = seg(epic.project_dir);
+    const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+    for (const task of tasks) {
+      const taskId = seg(task.task_id);
+      if (taskId === "") {
+        continue;
+      }
+      if (!isActiveVerdict(snap.readiness.perTask.get(taskId))) {
+        continue;
+      }
+      activeTaskIds.add(taskId);
+      if (task.approval !== "approved") {
+        approvals.push(previewRowFromTask(task, projectDir, "approve"));
+      }
+    }
+    const epicId = seg(epic.epic_id);
+    if (epicId === "") {
+      continue;
+    }
+    if (!isActiveVerdict(snap.readiness.perCloseRow.get(epicId))) {
+      continue;
+    }
+    activeCloseEpicIds.add(epicId);
+    if (epic.approval !== "approved") {
+      approvals.push(previewRowFromEpic(epic, "approve"));
+    }
+  }
+
+  if (activeTaskIds.size === 0 && activeCloseEpicIds.size === 0) {
+    return { approvals, workers: [], closers: [] };
+  }
+
+  const simulatedEpics: Epic[] = snap.epics.map((epic) => {
+    const epicActive = activeCloseEpicIds.has(epic.epic_id);
+    const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+    return {
+      ...epic,
+      ...(epicActive
+        ? {
+            status: "done",
+            approval: "approved" as const,
+            jobs: (Array.isArray(epic.jobs) ? epic.jobs : []).map((j) => ({
+              ...j,
+              state: "ended",
+            })),
+          }
+        : {}),
+      tasks: tasks.map((task) => {
+        if (!activeTaskIds.has(task.task_id)) {
+          return task;
+        }
+        const taskJobs = Array.isArray(task.jobs) ? task.jobs : [];
+        return {
+          ...task,
+          worker_phase: "done",
+          approval: "approved" as const,
+          jobs: taskJobs.map((j) => ({ ...j, state: "ended" })),
+        };
+      }),
+    };
+  });
+
+  const futureReadiness = computeReadiness(simulatedEpics, snap.jobs, []);
+
+  const workers: PreviewRow[] = [];
+  const closers: PreviewRow[] = [];
+  for (const epic of snap.epics) {
+    const projectDir = seg(epic.project_dir);
+    const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+    for (const task of tasks) {
+      const taskId = seg(task.task_id);
+      if (taskId === "") {
+        continue;
+      }
+      const cur = snap.readiness.perTask.get(taskId);
+      const fut = futureReadiness.perTask.get(taskId);
+      if (cur?.tag === "blocked" && fut?.tag === "ready") {
+        workers.push(previewRowFromTask(task, projectDir, "work"));
+      }
+    }
+    const epicId = seg(epic.epic_id);
+    if (epicId === "") {
+      continue;
+    }
+    const cur = snap.readiness.perCloseRow.get(epicId);
+    const fut = futureReadiness.perCloseRow.get(epicId);
+    if (cur?.tag === "blocked" && fut?.tag === "ready") {
+      closers.push(previewRowFromEpic(epic, "close"));
+    }
+  }
+
+  return { approvals, workers, closers };
+}
+
 async function main(): Promise<void> {
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
@@ -237,35 +457,59 @@ async function main(): Promise<void> {
   let frameCount = 0;
 
   let lastBody: string | null = null;
+  // Latest readiness snapshot, captured at the top of `onSnapshot`. The
+  // section-2 preview (`predictNextDispatches`) recomputes from this on
+  // every frame emit. `null` until the first paint lands.
+  let lastSnap: ReadinessClientSnapshot | null = null;
 
   // Frames show only dispatches from this run; logDispatch still appends
   // to `dispatchLogPath` for forensic tailing across restarts.
   const dispatchLog: DispatchEntry[] = [];
 
   function renderDispatchFrame(): string[] {
-    if (dispatchLog.length === 0) {
-      return ["# no commands dispatched yet"];
-    }
-    const out: string[] = [];
+    const section1: string[] = [];
     for (const e of dispatchLog) {
       const dirSeg = e.dir === "" ? "" : `(${e.dir}) `;
       const dryTag = e.dry ? "[dry] " : "";
-      out.push(`${dirSeg}${dryTag}${e.verb}::${e.id}`);
+      section1.push(`${dirSeg}${dryTag}${e.verb}::${e.id}`);
       if (e.dry) {
-        // Dry runs append the would-have-run shell command, split across
-        // two indented lines for readability: `  cd <full> && \` then
-        // `    claude '/plan:<verb> <id>'`. The `cd` line is dropped when
-        // there's no dir, so a no-dir dry dispatch shows just the claude
-        // line under the summary.
+        // Dry runs append the would-have-run shell command, split
+        // across two indented lines for readability: `  cd <full> &&
+        // \` then `    claude '/plan:<verb> <id>'`. The `cd` line is
+        // dropped when there's no dir, so a no-dir dry dispatch shows
+        // just the claude line under the summary.
         if (e.dirFull !== "") {
-          out.push(`  cd ${e.dirFull} && \\`);
-          out.push(`    claude '/plan:${e.verb} ${e.id}'`);
+          section1.push(`  cd ${e.dirFull} && \\`);
+          section1.push(`    claude '/plan:${e.verb} ${e.id}'`);
         } else {
-          out.push(`  claude '/plan:${e.verb} ${e.id}'`);
+          section1.push(`  claude '/plan:${e.verb} ${e.id}'`);
         }
       }
     }
-    return out;
+
+    if (lastSnap === null) {
+      return section1;
+    }
+    const { approvals, workers, closers } = predictNextDispatches(lastSnap);
+    if (
+      approvals.length === 0 &&
+      workers.length === 0 &&
+      closers.length === 0
+    ) {
+      return section1;
+    }
+    const section2: string[] = [];
+    for (const r of [...approvals, ...workers, ...closers]) {
+      const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
+      section2.push(`${dirSeg}${r.verb}::${r.id}`);
+    }
+    // The `---` separator is only emitted between two non-empty sections.
+    // When section 1 is empty (no dispatches this run yet) but section 2
+    // has predicted rows, the preview lines render alone.
+    if (section1.length === 0) {
+      return section2;
+    }
+    return [...section1, "---", ...section2];
   }
 
   // --- sidecar paths ---
@@ -629,6 +873,7 @@ async function main(): Promise<void> {
 
   let firstPaintLogged = false;
   const onSnapshot = (snap: ReadinessClientSnapshot): void => {
+    lastSnap = snap;
     if (!firstPaintLogged) {
       firstPaintLogged = true;
       const ready: string[] = [];
