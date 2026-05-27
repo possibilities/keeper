@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-27T16:46:54.678676Z",
+  "depends_on": [],
+  "epic": "fn-622-contention-review-tier-1-fix-pack",
+  "id": "fn-622-contention-review-tier-1-fix-pack.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Gate srvTs behind KEEPER_TRACE_SERVER, document env var, ship rotation sidecar",
+  "updated_at": "2026-05-27T16:46:54.678676Z"
+}
