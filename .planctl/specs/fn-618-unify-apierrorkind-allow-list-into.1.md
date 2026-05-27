@@ -12,5 +12,5 @@ Fix: export a single `API_ERROR_KINDS: ReadonlySet<ApiErrorKind>` const from `sr
 - [ ] All existing tests pass (bun test).
 
 ## Done summary
-
+Exported API_ERROR_KINDS from types.ts; removed local literals in reducer.ts and transcript-worker.ts; updated JSDoc refs.
 ## Evidence

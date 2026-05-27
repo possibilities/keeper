@@ -11,8 +11,8 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "hoist shared ApiErrorKind allow-list to types.ts",
-  "updated_at": "2026-05-27T01:49:05.163704Z",
+  "updated_at": "2026-05-27T01:54:51.643772Z",
   "work_review_status": "unknown",
   "work_reviewed_at": null,
-  "worker_done_at": null
+  "worker_done_at": "2026-05-27T01:54:51.643772Z"
 }
