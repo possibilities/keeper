@@ -17,6 +17,7 @@
 import { appendFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
+import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
 import { subscribeCollection } from "../src/readiness-client";
@@ -33,7 +34,8 @@ Usage: bun scripts/git.ts [--sock <path>] [--project-dir <path>]
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
-  q/Ctrl-C quit. Per-frame sidecars are indexed; lifecycle output is
+  c copy current frame + sidecar paths to clipboard, q/Ctrl-C quit.
+  Per-frame sidecars are indexed; lifecycle output is
   appended to /tmp/keeper-git.<pid>.lifecycle.txt. Session paths print
   on exit.
 
@@ -162,7 +164,14 @@ async function main(): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
-  const liveShell = createLiveShell({ enabled: true, title: "git" });
+  // Forward-reference slot for the `c`-key copy handler — wired further
+  // down once sidecar paths and the last frame text are in scope.
+  let onKey: ((key: string) => void) | undefined;
+  const liveShell = createLiveShell({
+    enabled: true,
+    title: "git",
+    onUnhandledKey: (key) => onKey?.(key),
+  });
   let lastFrame: string | null = null;
   let frameCount = 0;
   let lastRows: Record<string, unknown>[] = [];
@@ -171,6 +180,43 @@ async function main(): Promise<void> {
   const metaSidecar = `/tmp/keeper-git.${process.pid}.meta.txt`;
   // The alt-screen owns stdout; lifecycle events append here instead.
   const lifecycleSidecar = `/tmp/keeper-git.${process.pid}.lifecycle.txt`;
+
+  // `c` copies a debug snapshot to the clipboard. See board.ts for the
+  // shared shape — same payload, swap script name and sidecar paths.
+  let copyStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  onKey = (key: string): void => {
+    if (key !== "c") return;
+    if (lastFrame == null) return;
+    const payload = buildDebugSnapshot({
+      script: "git",
+      pid: process.pid,
+      frame: lastFrame,
+      frameNumber: frameCount,
+      metaSidecar,
+      lifecycleSidecar,
+      nowIso: new Date().toISOString(),
+    });
+    const flashed = frameCount;
+    void copyToClipboard(payload).then((res) => {
+      if (res.ok) {
+        liveShell.setStatus(`[copied frame ${flashed}]`);
+      } else {
+        try {
+          appendFileSync(
+            lifecycleSidecar,
+            `# warn: clipboard copy failed: ${res.error}\n`,
+          );
+        } catch {
+          // best-effort
+        }
+        liveShell.setStatus("[copy failed]");
+      }
+      if (copyStatusTimer !== undefined) {
+        clearTimeout(copyStatusTimer);
+      }
+      copyStatusTimer = setTimeout(() => liveShell.setStatus(""), 1500);
+    });
+  };
 
   function log(s: string): void {
     process.stdout.write(`${s}\n`);

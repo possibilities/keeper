@@ -95,6 +95,7 @@
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
+import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
 import { computeReadiness, type Verdict } from "../src/readiness";
@@ -117,8 +118,9 @@ Usage: bun scripts/autopilot.ts [--sock <path>] [--dry-run]
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
-  space pause/resume dispatches, q/Ctrl-C quit. Per-frame sidecars
-  are indexed; lifecycle + warn output is appended to
+  space pause/resume dispatches,
+  c copy current frame + sidecar paths to clipboard, q/Ctrl-C quit.
+  Per-frame sidecars are indexed; lifecycle + warn output is appended to
   /tmp/keeper-autopilot.<pid>.lifecycle.txt. Session paths print on
   exit.
 
@@ -1250,17 +1252,54 @@ async function main(): Promise<void> {
   // closure captures live references.
   const pauseStatus = (): string =>
     dryRun ? "" : paused ? "[paused]" : "[playing]";
+  // `c` flashes a debug snapshot to the clipboard. Status is briefly
+  // overridden with `[copied frame N]` / `[copy failed]`, then restored
+  // to the pause indicator (NOT cleared to "") so the human doesn't
+  // lose track of `[paused]` / `[playing]` after pressing c.
+  let copyStatusTimer: ReturnType<typeof setTimeout> | undefined;
   const liveShell = createLiveShell({
     enabled: true,
     title: "autopilot",
     onUnhandledKey: (key) => {
-      if (key !== " " || dryRun) {
+      if (key === " " && !dryRun) {
+        paused = !paused;
+        liveShell.setStatus(pauseStatus());
+        if (!paused && lastSnap !== null) {
+          processLaunchTransitions(lastSnap);
+        }
         return;
       }
-      paused = !paused;
-      liveShell.setStatus(pauseStatus());
-      if (!paused && lastSnap !== null) {
-        processLaunchTransitions(lastSnap);
+      if (key === "c") {
+        if (lastFrameText == null) {
+          return;
+        }
+        const payload = buildDebugSnapshot({
+          script: "autopilot",
+          pid: process.pid,
+          frame: lastFrameText,
+          frameNumber: frameCount,
+          metaSidecar,
+          lifecycleSidecar,
+          nowIso: new Date().toISOString(),
+        });
+        const flashed = frameCount;
+        void copyToClipboard(payload).then((res) => {
+          if (res.ok) {
+            liveShell.setStatus(`[copied frame ${flashed}]`);
+          } else {
+            noteLine(`# warn: clipboard copy failed: ${res.error}`);
+            liveShell.setStatus("[copy failed]");
+          }
+          if (copyStatusTimer !== undefined) {
+            clearTimeout(copyStatusTimer);
+          }
+          // Restore the pause indicator (not "") so toggling [paused] /
+          // [playing] state survives the copy flash.
+          copyStatusTimer = setTimeout(
+            () => liveShell.setStatus(pauseStatus()),
+            1500,
+          );
+        });
       }
     },
   });

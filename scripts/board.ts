@@ -78,6 +78,7 @@
 import { appendFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
+import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
 import { formatPill, type Verdict } from "../src/readiness";
@@ -97,7 +98,8 @@ Usage: bun scripts/board.ts [--sock <path>]
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
-  q/Ctrl-C quit. Per-frame sidecars are indexed; lifecycle + warn output
+  c copy current frame + sidecar paths to clipboard, q/Ctrl-C quit.
+  Per-frame sidecars are indexed; lifecycle + warn output
   is appended to /tmp/keeper-board.<pid>.lifecycle.txt. Session paths
   print on exit.
 
@@ -532,7 +534,16 @@ async function main(): Promise<void> {
 
   const sockPath = values.sock ?? resolveSockPath();
   const log = (s: string) => process.stdout.write(`${s}\n`);
-  const liveShell = createLiveShell({ enabled: true, title: "board" });
+  // Forward-reference slot for the `c`-key copy handler — wired to a real
+  // closure further down once `lastFrameText`, sidecar paths, and
+  // `noteLine` are in scope. The wrapper passed to createLiveShell stays
+  // stable across the swap.
+  let onKey: ((key: string) => void) | undefined;
+  const liveShell = createLiveShell({
+    enabled: true,
+    title: "board",
+    onUnhandledKey: (key) => onKey?.(key),
+  });
   let frameCount = 0;
 
   // Color is for human eyes on a TTY. Pipes / redirects / NO_COLOR stay
@@ -950,6 +961,42 @@ async function main(): Promise<void> {
       lastBody = null;
     }
   }
+
+  // `c` copies a debug snapshot (current frame + sidecar paths) to
+  // the clipboard via `pbcopy`. Flashes `[copied frame N]` / `[copy
+  // failed]` in the banner via setStatus, then clears after ~1.5s.
+  // Skipped silently before the first frame lands.
+  let copyStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  onKey = (key: string): void => {
+    if (key !== "c") {
+      return;
+    }
+    if (lastFrameText == null) {
+      return;
+    }
+    const payload = buildDebugSnapshot({
+      script: "board",
+      pid: process.pid,
+      frame: lastFrameText,
+      frameNumber: frameCount,
+      metaSidecar,
+      lifecycleSidecar,
+      nowIso: new Date().toISOString(),
+    });
+    const flashed = frameCount;
+    void copyToClipboard(payload).then((res) => {
+      if (res.ok) {
+        liveShell.setStatus(`[copied frame ${flashed}]`);
+      } else {
+        noteLine(`# warn: clipboard copy failed: ${res.error}`);
+        liveShell.setStatus("[copy failed]");
+      }
+      if (copyStatusTimer !== undefined) {
+        clearTimeout(copyStatusTimer);
+      }
+      copyStatusTimer = setTimeout(() => liveShell.setStatus(""), 1500);
+    });
+  };
 
   const handle = subscribeReadiness({
     sockPath,
