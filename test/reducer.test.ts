@@ -5554,6 +5554,47 @@ test("InputRequest fold: stamps both columns + flips state to 'stopped'", () => 
   expect(after?.last_input_request_kind).toBe("ask_user_question");
 });
 
+test("InputRequest on a session with a running subagent_invocations row still flips state to 'stopped' and stamps the (at, kind) pair", () => {
+  // Mirror of test/reducer.test.ts:524 ("Stop is a no-op on state while a
+  // sub-agent is running"), but for InputRequest — and with the OPPOSITE
+  // assertion. Stop and ApiError both skip the state flip when a
+  // subagent_invocations row is running (parent yielded to a Task, the
+  // session is conceptually still working). InputRequest intentionally
+  // omits that guard: a question to a human really blocks forward progress
+  // regardless of who's asking — parent OR sub-agent — so the state must
+  // flip to 'stopped' and the (last_input_request_at,
+  // last_input_request_kind) pair must stamp. This test pins that
+  // behavioral asymmetry so a future "consistency" edit that adds the
+  // sub-agent guard to InputRequest gets caught.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-sub" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-sub" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    session_id: "sess-ir-sub",
+    agent_id: "sub-ir",
+    agent_type: "Explore",
+  });
+  drainAll();
+  // Pre-state: session is 'working', sub-agent is running, pair is NULL.
+  const before = getInputRequestState("sess-ir-sub");
+  expect(before?.state).toBe("working");
+  expect(before?.last_input_request_at).toBeNull();
+  expect(before?.last_input_request_kind).toBeNull();
+
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-ir-sub",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  drainAll();
+  // Post-state: state flipped to 'stopped' (opposite of Stop's no-op), pair
+  // stamped — InputRequest does NOT consult the sub-agent guard.
+  const after = getInputRequestState("sess-ir-sub");
+  expect(after?.state).toBe("stopped");
+  expect(after?.last_input_request_at).not.toBeNull();
+  expect(after?.last_input_request_kind).toBe("ask_user_question");
+});
+
 test("InputRequest fold: terminal-row guard preserved — InputRequest on 'ended' / 'killed' row does NOT resurrect (both columns stay NULL)", () => {
   // Negative-coverage gate on the terminal guard cloned from the v24
   // RateLimited/ApiError arm. A stray late-arriving InputRequest on an
