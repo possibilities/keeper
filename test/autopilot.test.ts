@@ -177,7 +177,9 @@ test("renderEpicCommandsFiltered — empty-task epic with ready close emits clos
 // The function is a pure transform of the readiness snapshot, so each test
 // builds an `Epic[]` fixture, runs `computeReadiness` to get the current
 // verdicts, packages them into a `ReadinessClientSnapshot`, and asserts
-// against the three preview buckets (approvals / workers / closers).
+// against the four preview buckets (approvals / informational / workers
+// / closers — `informational` carries `git-dirty::<id>` rows that have
+// no dispatch behind them).
 //
 // Pause-invariance is enforced by the function's signature — it takes only
 // the snapshot and never reads autopilot's `paused` state — so the test
@@ -428,6 +430,75 @@ test("predictNextDispatches — empty preview when nothing is running and nothin
   });
   const { approvals, workers, closers } = predictNextDispatches(snap);
   expect(approvals).toEqual([]);
+  expect(workers).toEqual([]);
+  expect(closers).toEqual([]);
+});
+
+test("predictNextDispatches — in-flight worker with git_dirty_count > 0 predicts informational git-dirty::<task>", () => {
+  // Regression: an in-flight worker that has edited files (the common case
+  // — the worker IS editing) makes the simulated future verdict land at
+  // `blocked:git-uncommitted` via readiness predicate 6.5, NOT at
+  // `blocked:job-pending`. Without the informational carve-out the row
+  // would silently drop from section 2 (the symptom the user hit).
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "pending",
+        jobs: [
+          makeEmbeddedJob({
+            plan_verb: "work",
+            state: "working",
+            git_dirty_count: 3,
+          }),
+        ],
+      }),
+    ],
+    approval: "pending",
+  });
+  const { approvals, informational, workers, closers } = predictNextDispatches(
+    buildSnap([epic]),
+  );
+  expect(approvals).toEqual([]);
+  expect(informational.map((r) => `${r.verb}::${r.id}`)).toEqual([
+    "git-dirty::fn-1-foo.1",
+  ]);
+  expect(workers).toEqual([]);
+  expect(closers).toEqual([]);
+});
+
+test("predictNextDispatches — in-flight worker with git_orphan_count > 0 collapses to the same git-dirty signal", () => {
+  // Same shape as the uncommitted case: predicate 6.5's second branch
+  // (`git-orphans`) is the future verdict, and the bucketing collapses
+  // both `git-uncommitted` and `git-orphans` to one informational signal.
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "pending",
+        jobs: [
+          makeEmbeddedJob({
+            plan_verb: "work",
+            state: "working",
+            git_dirty_count: 0,
+            git_orphan_count: 2,
+          }),
+        ],
+      }),
+    ],
+    approval: "pending",
+  });
+  const { approvals, informational, workers, closers } = predictNextDispatches(
+    buildSnap([epic]),
+  );
+  expect(approvals).toEqual([]);
+  expect(informational.map((r) => `${r.verb}::${r.id}`)).toEqual([
+    "git-dirty::fn-1-foo.1",
+  ]);
   expect(workers).toEqual([]);
   expect(closers).toEqual([]);
 });

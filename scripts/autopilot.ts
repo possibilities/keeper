@@ -51,18 +51,23 @@
  *
  * Below a `---` separator (only present when non-empty), the frame
  * previews the next dispatches autopilot will fire as current sessions
- * finish — approvals first (one per currently-active row whose approval
- * isn't already "approved"), then workers, then closers (rows that flip
- * blocked→ready in a simulation that forces every currently-active row
- * to completed). Preview rows are single-line `(<dir>) <verb>::<id>` —
- * no `[dry]` tag, no shell-command footer. The preview recomputes from
- * the live readiness snapshot on every emit; section 1 above the `---`
- * is the per-run current+queued view described above:
+ * finish — approvals first, then informational `git-dirty::<id>` rows
+ * (worker's future verdict is `git-uncommitted` / `git-orphans`,
+ * collapsed to one signal; renders alongside the others but has NO
+ * dispatch behind it — the human resolves it by cleaning the worktree,
+ * after which the row drops off and re-appears as `approve::<id>`),
+ * then workers, then closers (rows that flip blocked→ready in a
+ * simulation that forces every currently-active row to completed).
+ * Preview rows are single-line `(<dir>) <verb>::<id>` — no `[dry]`
+ * tag, no shell-command footer. The preview recomputes from the live
+ * readiness snapshot on every emit; section 1 above the `---` is the
+ * per-run current+queued view described above:
  *
  *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
  *   ---
  *   (keeper) approve::fn-619-pin-inputrequest-mid-subagent-state.1
- *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.2
+ *   (keeper) git-dirty::fn-619-pin-inputrequest-mid-subagent-state.2
+ *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.3
  *   (keeper) close::fn-619-pin-inputrequest-mid-subagent-state
  *
  * Fires side effects on EDGES in the readiness verdicts:
@@ -160,15 +165,19 @@ to current.
 
 Below a '---' separator (only when non-empty), the frame previews the next
 dispatches autopilot will fire as a direct consequence of the embedded
-jobs currently in flight. All three buckets fall out of one simulation
+jobs currently in flight. All four buckets fall out of one simulation
 pass: every working embedded job has its post-completion effect mirrored
 onto the owning row (work→worker_phase=done, close→epic.status=done,
 approve→approval=approved; jobs[i].state=ended) and approval is NEVER
 auto-flipped for rows whose only in-flight job is a worker. Rows whose
 verdict flips to blocked:job-pending in the simulated re-run emit
-'approve::<id>'; rows that flip to ready emit 'work::<task>' /
-'close::<epic>'. Preview rows are single-line '(<dir>) <verb>::<id>' —
-no [dry] tag, no shell-command footer.
+'approve::<id>'; rows whose verdict flips to blocked:git-uncommitted
+or blocked:git-orphans emit an informational 'git-dirty::<id>' row
+(same edge shape as approve but autopilot has no dispatch behind it —
+the human resolves it by cleaning the worktree, after which the row
+drops off and re-emerges as 'approve::<id>'); rows that flip to ready
+emit 'work::<task>' / 'close::<epic>'. Preview rows are single-line
+'(<dir>) <verb>::<id>' — no [dry] tag, no shell-command footer.
 
 The helper waits for keeperd to come up and reconnects across restarts;
 each connection-lifecycle change is appended to the lifecycle sidecar.
@@ -298,8 +307,13 @@ export function renderEpicCommandsFiltered(
 //
 // Section 2 of the autopilot frame previews the next dispatches that will
 // fire as a direct consequence of the embedded jobs currently in flight.
-// All three buckets (approvals, workers, closers) fall out of ONE
-// `computeReadiness` pass over a verb-aware simulated tree.
+// All four buckets (approvals, informational, workers, closers) fall out
+// of ONE `computeReadiness` pass over a verb-aware simulated tree. The
+// `informational` bucket is the carve-out for rows whose future verdict
+// is `blocked:git-uncommitted` / `blocked:git-orphans` — same edge shape
+// as approve (worker_phase flipped to done) but no `/plan:<verb>`
+// command resolves it, so autopilot renders it as `git-dirty::<id>`
+// purely as a signal to the human and never dispatches against it.
 //
 // Simulation rules (per embedded `EmbeddedJob` whose `state === "working"`):
 //   - `plan_verb === "work"`    → owning task's `worker_phase = "done"`
@@ -325,6 +339,12 @@ export function renderEpicCommandsFiltered(
 // Bucketing — for each row, compare `snap.readiness` against
 // `futureReadiness`:
 //   - `cur=blocked → fut=blocked:job-pending` → push `approve::<id>`.
+//   - `cur=blocked → fut=blocked:git-uncommitted` /
+//     `cur=blocked → fut=blocked:git-orphans`  → push informational
+//                                                `git-dirty::<id>`
+//                                                (collapses both reasons
+//                                                into one preview signal;
+//                                                no dispatch behind it).
 //   - `cur=blocked → fut=ready`               → push `work::<task>` /
 //                                                `close::<epic>`.
 // Other transitions (incl. `cur=blocked → fut=completed`, which happens
@@ -348,7 +368,12 @@ export function renderEpicCommandsFiltered(
 // identically whether autopilot is `[paused]` or `[playing]`.
 
 export interface PreviewRow {
-  verb: "work" | "close" | "approve";
+  // `git-dirty` is informational — section 2 renders it as
+  // `git-dirty::<id>` to signal "the worker has uncommitted/orphan
+  // files that block the approve dispatch", but autopilot itself
+  // never dispatches on this verb. Collapses readiness's
+  // `git-uncommitted` + `git-orphans` reasons into one preview signal.
+  verb: "work" | "close" | "approve" | "git-dirty";
   id: string;
   // Basename of the cd target — empty string when none. Rendered as the
   // leading `(<dir>) ` segment of the preview line.
@@ -361,6 +386,13 @@ export interface PreviewRow {
 
 export interface PreviewSections {
   approvals: PreviewRow[];
+  // Informational rows whose future verdict is `git-uncommitted` or
+  // `git-orphans` — the worker has filesystem state to clean up before
+  // its approve dispatch can fire. Rendered between approvals and
+  // workers; never produces a dispatch. Falls off the frame as soon
+  // as the worker commits / clears orphans (predicate 6.5 stops firing
+  // and the row migrates to `approvals` on the next emit).
+  informational: PreviewRow[];
   workers: PreviewRow[];
   closers: PreviewRow[];
 }
@@ -375,7 +407,7 @@ function taskCdDir(task: Task, projectDir: string): string {
 function previewRowFromTask(
   task: Task,
   projectDir: string,
-  verb: "work" | "approve",
+  verb: "work" | "approve" | "git-dirty",
 ): PreviewRow {
   const dirFull = taskCdDir(task, projectDir);
   return {
@@ -386,7 +418,10 @@ function previewRowFromTask(
   };
 }
 
-function previewRowFromEpic(epic: Epic, verb: "close" | "approve"): PreviewRow {
+function previewRowFromEpic(
+  epic: Epic,
+  verb: "close" | "approve" | "git-dirty",
+): PreviewRow {
   const projectDir = seg(epic.project_dir);
   return {
     verb,
@@ -497,12 +532,13 @@ export function predictNextDispatches(
   });
 
   if (!dirty) {
-    return { approvals: [], workers: [], closers: [] };
+    return { approvals: [], informational: [], workers: [], closers: [] };
   }
 
   const futureReadiness = computeReadiness(simulatedEpics, snap.jobs, []);
 
   const approvals: PreviewRow[] = [];
+  const informational: PreviewRow[] = [];
   const workers: PreviewRow[] = [];
   const closers: PreviewRow[] = [];
   for (const epic of snap.epics) {
@@ -518,15 +554,26 @@ export function predictNextDispatches(
       // `cur === undefined` is a defensive miss (no prediction). Approve
       // predictions flow from EITHER `blocked → job-pending` (in-flight
       // worker / approver chain) OR `ready → job-pending` (section 1's
-      // about-to-dispatch worker, modelled as completed). Worker
-      // predictions flow only from `blocked → ready` — a row already at
-      // `ready` is firing its worker in section 1, not section 2.
+      // about-to-dispatch worker, modelled as completed). The
+      // `git-uncommitted` / `git-orphans` cases collapse into a single
+      // `git-dirty` informational row — same edge shape (worker_phase
+      // flipped to done) but no dispatch behind it; the human resolves
+      // it by cleaning the worktree, after which predicate 6.5 stops
+      // firing and the row migrates to `approvals`. Worker predictions
+      // flow only from `blocked → ready` — a row already at `ready` is
+      // firing its worker in section 1, not section 2.
       if (cur === undefined || cur.tag === "completed") {
         continue;
       }
       const fut = futureReadiness.perTask.get(taskId);
       if (fut?.tag === "blocked" && fut.reason.kind === "job-pending") {
         approvals.push(previewRowFromTask(task, projectDir, "approve"));
+      } else if (
+        fut?.tag === "blocked" &&
+        (fut.reason.kind === "git-uncommitted" ||
+          fut.reason.kind === "git-orphans")
+      ) {
+        informational.push(previewRowFromTask(task, projectDir, "git-dirty"));
       } else if (cur.tag === "blocked" && fut?.tag === "ready") {
         workers.push(previewRowFromTask(task, projectDir, "work"));
       }
@@ -542,12 +589,18 @@ export function predictNextDispatches(
     const fut = futureReadiness.perCloseRow.get(epicId);
     if (fut?.tag === "blocked" && fut.reason.kind === "job-pending") {
       approvals.push(previewRowFromEpic(epic, "approve"));
+    } else if (
+      fut?.tag === "blocked" &&
+      (fut.reason.kind === "git-uncommitted" ||
+        fut.reason.kind === "git-orphans")
+    ) {
+      informational.push(previewRowFromEpic(epic, "git-dirty"));
     } else if (cur.tag === "blocked" && fut?.tag === "ready") {
       closers.push(previewRowFromEpic(epic, "close"));
     }
   }
 
-  return { approvals, workers, closers };
+  return { approvals, informational, workers, closers };
 }
 
 // --- dispatch.log hydration + fulfillment detection ---------------------
@@ -768,16 +821,18 @@ async function main(): Promise<void> {
     if (lastSnap === null) {
       return section1;
     }
-    const { approvals, workers, closers } = predictNextDispatches(lastSnap);
+    const { approvals, informational, workers, closers } =
+      predictNextDispatches(lastSnap);
     if (
       approvals.length === 0 &&
+      informational.length === 0 &&
       workers.length === 0 &&
       closers.length === 0
     ) {
       return section1;
     }
     const section2: string[] = [];
-    for (const r of [...approvals, ...workers, ...closers]) {
+    for (const r of [...approvals, ...informational, ...workers, ...closers]) {
       const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
       section2.push(`${dirSeg}${r.verb}::${r.id}`);
     }
