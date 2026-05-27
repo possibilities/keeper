@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-625-hydrate-autopilot-current-across",
   "bundles": [],
   "closer_done_at": "2026-05-27T20:44:57.641814Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-27T20:44:57.641814Z"
+  "updated_at": "2026-05-27T20:45:31.705690Z"
 }
