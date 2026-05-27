@@ -872,6 +872,102 @@ test("Stop after SubagentStop flips state to stopped (final post-sub Stop)", () 
   expect(getJob()?.state).toBe("stopped");
 });
 
+test("Stop guard ignores `running` orphan when a later same-name row exists (fn-593.3 shape)", () => {
+  // Wedged-projection repro. The existing supersession path (`findOpenRunning
+  // InGroup` at PostToolUse:Agent) can miss an orphan in real traces — e.g.
+  // when the later same-name spawn reuses agent_id, or the failure-path
+  // didn't run supersession. The Stop guard MUST still let the parent
+  // close: same-name collapse on (job_id, subagent_type) — any `running`
+  // row with a higher-turn_seq sibling under the same name is ignored
+  // for the guard. Mirrors the client-side `collapseSubagentsByName` rule.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  // Hand-write the wedged subagent_invocations shape: turn_seq=1 stuck at
+  // `running`, turn_seq=2 finished `ok` — both share the same
+  // subagent_type. Bypasses the SubagentStart/PostToolUse:Agent path so we
+  // can pin the exact state the wedged production trace landed in. The
+  // earlier `ok:turn_seq=0` from fn-593.3's trace is irrelevant to the
+  // guard (status='ok' never blocks anything); omitted for brevity.
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "sess-a",
+      "agent-orphan",
+      1,
+      1_000,
+      null,
+      "plan:worker-high",
+      null,
+      0,
+      "running",
+      null,
+      0,
+      1_000,
+    ],
+  );
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "sess-a",
+      "agent-newer",
+      2,
+      2_000,
+      null,
+      "plan:worker-high",
+      null,
+      0,
+      "ok",
+      null,
+      0,
+      2_000,
+    ],
+  );
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  // Before the collapse-aware guard this stayed 'working' forever; now the
+  // orphan is filtered out and Stop's UPDATE writes 'stopped'.
+  expect(getJob()?.state).toBe("stopped");
+});
+
+test("Stop guard still blocks when the only `running` row is NOT collapse-eligible", () => {
+  // Counter-test: an orphan `running` with NO later same-name sibling
+  // still blocks Stop — the collapse rule only fires when a higher
+  // turn_seq exists for the same (job_id, subagent_type). This is the
+  // normal mid-yield case (single in-flight sub-agent of its type),
+  // preserved as a guard-rail against an overzealous filter.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "sess-a",
+      "solo-agent",
+      0,
+      1_000,
+      null,
+      "plan:worker-high",
+      null,
+      0,
+      "running",
+      null,
+      0,
+      1_000,
+    ],
+  );
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+});
+
 test("Stop guard handles multiple concurrent sub-agents (releases only when ALL done)", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "UserPromptSubmit" });

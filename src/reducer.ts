@@ -2612,13 +2612,32 @@ function projectJobsRow(db: Database, event: Event): void {
       // parent resumes and Stops a second time. Skip the state flip while any
       // subagent_invocations row for this job is still status='running'.
       //
+      // Same-name collapse: a `running` row is ignored by the guard if a
+      // LATER same-`(job_id, subagent_type)` row exists in the projection.
+      // Operating assumption: Claude Code does not spawn parallel same-name
+      // sub-agents in one parent session, so "same name with a higher
+      // turn_seq" means "the older row is an orphan whose `SubagentStop`
+      // never landed" — exactly the fn-593.3 case. The guard then matches
+      // the client-side `collapseSubagentsByName` rule, so server `jobs.state`
+      // and client predicate 6 unwedge together. `subagent_type IS …` is
+      // null-safe equality (matches null-to-null but not null-to-non-null),
+      // mirroring the client key derivation that treats `subagent_type ??
+      // ""` as the group key.
+      //
       // Re-fold determinism: subagent_invocations reflects every SubagentStart
       // / SubagentStop folded with id < event.id (sequential fold), so the
       // running-check is a pure function of the event log up to this point.
       const subRunning = db
         .query(
-          `SELECT 1 FROM subagent_invocations
-            WHERE job_id = ? AND status = 'running' LIMIT 1`,
+          `SELECT 1 FROM subagent_invocations s1
+            WHERE s1.job_id = ?
+              AND s1.status = 'running'
+              AND NOT EXISTS (
+                SELECT 1 FROM subagent_invocations s2
+                 WHERE s2.job_id = s1.job_id
+                   AND s2.subagent_type IS s1.subagent_type
+                   AND s2.turn_seq > s1.turn_seq
+              ) LIMIT 1`,
         )
         .get(jobId);
       if (subRunning != null) {
