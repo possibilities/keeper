@@ -109,5 +109,5 @@ Three new EQP regression tests + one semantic-equivalence test:
 - [ ] `bun test` green; re-fold determinism preserved
 
 ## Done summary
-
+Add idx_events_planctl_epic + idx_events_planctl_target partial composite indexes (both WHERE planctl_op IS NOT NULL); rewrite syncPlanctlLinks cross-session sweep from cross-column OR to UNION so the planner SEARCHes both indexes via COMPOUND QUERY (was SCANning idx_events_planctl_session); per-epic queue_jump scan now SEARCHes idx_events_planctl_epic; per-session ordered load unchanged on idx_events_planctl_session (regression-guarded); 5 new EQP + semantic-equivalence tests pass. EQP before/after evidence in transcript.
 ## Evidence

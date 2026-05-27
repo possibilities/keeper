@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Add planctl partial indexes plus OR\u2192UNION rewrite (F7 reducer-side)",
-  "updated_at": "2026-05-27T21:06:05.469672Z"
+  "updated_at": "2026-05-27T21:37:44.166662Z",
+  "worker_done_at": "2026-05-27T21:37:44.166662Z"
 }
