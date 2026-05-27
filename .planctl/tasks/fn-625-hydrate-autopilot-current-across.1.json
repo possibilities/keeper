@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Hydrate autopilot current across restarts",
-  "updated_at": "2026-05-27T19:14:45.741255Z"
+  "updated_at": "2026-05-27T20:40:49.503576Z",
+  "worker_done_at": "2026-05-27T20:40:49.503576Z"
 }

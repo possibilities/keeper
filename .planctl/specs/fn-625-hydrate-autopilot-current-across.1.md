@@ -39,5 +39,5 @@ Three coupled edits in `scripts/autopilot.ts`, then mirrored doc + test updates.
 - [ ] `bun test test/autopilot.test.ts` passes; new cases cover at minimum: launch+fulfilled,no-completed → restored; launch+fulfilled+completed → NOT restored; launch only → NOT restored; dry+fulfilled → NOT restored; two launches same `(verb,id)` different `ts` → latest-wins; multiple keys → sorted by `ts` ascending; disappearance rule fires for `fulfilled && job === undefined` and writes the `kind:"completed"` line
 
 ## Done summary
-
+Extended hydrateDispatchLog with restoredEntries (fulfilled && !completed && !dry, latest-per-key, ts-ascending); main() seeds dispatchLog from it so --- current --- survives restart. Disappearance branch in detectJobTransitions already migrates restored entries whose epic has since dropped off the projection. Updated header docstring + HELP, added 7 hydration tests.
 ## Evidence
