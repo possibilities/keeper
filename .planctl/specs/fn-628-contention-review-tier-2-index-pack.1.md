@@ -92,5 +92,5 @@ For `idx_epics_sort_path`, seed epics with a mix of `(status, approval, sort_pat
 - [ ] `bun test` green
 
 ## Done summary
-
+Added idx_epics_sort_path on epics(sort_path, epic_id) and idx_jobs_created_state on jobs(created_at DESC, job_id, state) with ANALYZE epics; ANALYZE jobs; in migrate(). EQP confirms USE TEMP B-TREE eliminated and the jobs index is COVERING. SCHEMA_VERSION unchanged at 30; bun test test/db.test.ts green (69/69).
 ## Evidence

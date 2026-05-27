@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Add idx_epics_sort_path and idx_jobs_created_state (F6 read-side indexes)",
-  "updated_at": "2026-05-27T21:06:05.469672Z"
+  "updated_at": "2026-05-27T21:19:41.879136Z",
+  "worker_done_at": "2026-05-27T21:19:41.879136Z"
 }
