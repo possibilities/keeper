@@ -354,17 +354,21 @@ export function renderEpicCommandsFiltered(
 // Bucketing — for each row, compare `snap.readiness` against
 // `futureReadiness`:
 //   - `cur=blocked → fut=blocked:job-pending` → push `approve::<id>`.
-//   - `cur=blocked → fut=blocked:git-uncommitted` /
-//     `cur=blocked → fut=blocked:git-orphans`  → push informational
-//                                                `git-dirty::<id>`
-//                                                (collapses both reasons
-//                                                into one preview signal;
-//                                                no dispatch behind it).
 //   - `cur=blocked → fut=ready`               → push `work::<task>` /
 //                                                `close::<epic>`.
 // Other transitions (incl. `cur=blocked → fut=completed`, which happens
 // for rows whose own worker AND approver are both in flight) emit
 // nothing — those rows are already past the next-dispatch edge.
+//
+// The `informational` bucket is sourced separately, off CURRENT readiness
+// (NOT the simulated future): a row pushes `git-dirty::<id>` only when
+// `cur.tag === "blocked"` and `cur.reason.kind` is `"git-uncommitted"` or
+// `"git-orphans"`. Real readiness predicate 6.5 only fires once the
+// worker has actually stopped (predicates 5 / 6 must clear first), so
+// this gate keeps the informational row from surfacing while a worker
+// is still actively editing — the dirtiness might resolve when the
+// worker commits before going idle, and previewing it too early would
+// be misleading.
 //
 // Subagent invocations are dropped from the simulation: every running sub
 // belongs to an in-flight job whose `state` we just stamped `"ended"`,
@@ -449,6 +453,48 @@ function previewRowFromEpic(
 export function predictNextDispatches(
   snap: ReadinessClientSnapshot,
 ): PreviewSections {
+  // Informational pre-pass. Source `git-dirty::<id>` rows from CURRENT
+  // readiness, NOT from the simulated future. Predicate 6.5 in real
+  // readiness (`git-uncommitted` / `git-orphans`) only fires once the
+  // worker has actually stopped — predicates 5 and 6 must clear first,
+  // which requires every embedded job to leave `working` AND every
+  // sub-agent to finish. So sourcing off `cur` is the gate the human
+  // wants: a row only renders `git-dirty::<id>` once the worker is done
+  // and the worktree's dirtiness is genuinely the next blocker; an
+  // actively-editing worker's transient dirty state never surfaces
+  // here. The fut-driven sim below intentionally omits this bucket.
+  const informational: PreviewRow[] = [];
+  for (const epic of snap.epics) {
+    const projectDir = seg(epic.project_dir);
+    const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+    for (const task of tasks) {
+      const taskId = seg(task.task_id);
+      if (taskId === "") {
+        continue;
+      }
+      const cur = snap.readiness.perTask.get(taskId);
+      if (
+        cur?.tag === "blocked" &&
+        (cur.reason.kind === "git-uncommitted" ||
+          cur.reason.kind === "git-orphans")
+      ) {
+        informational.push(previewRowFromTask(task, projectDir, "git-dirty"));
+      }
+    }
+    const epicId = seg(epic.epic_id);
+    if (epicId === "") {
+      continue;
+    }
+    const curClose = snap.readiness.perCloseRow.get(epicId);
+    if (
+      curClose?.tag === "blocked" &&
+      (curClose.reason.kind === "git-uncommitted" ||
+        curClose.reason.kind === "git-orphans")
+    ) {
+      informational.push(previewRowFromEpic(epic, "git-dirty"));
+    }
+  }
+
   // Build a verb-aware simulated tree. For each embedded job whose
   // `state === "working"`, mirror its post-completion effect onto the
   // owning row keyed off `plan_verb`. For each row whose CURRENT verdict
@@ -547,13 +593,12 @@ export function predictNextDispatches(
   });
 
   if (!dirty) {
-    return { approvals: [], informational: [], workers: [], closers: [] };
+    return { approvals: [], informational, workers: [], closers: [] };
   }
 
   const futureReadiness = computeReadiness(simulatedEpics, snap.jobs, []);
 
   const approvals: PreviewRow[] = [];
-  const informational: PreviewRow[] = [];
   const workers: PreviewRow[] = [];
   const closers: PreviewRow[] = [];
   for (const epic of snap.epics) {
@@ -569,26 +614,18 @@ export function predictNextDispatches(
       // `cur === undefined` is a defensive miss (no prediction). Approve
       // predictions flow from EITHER `blocked → job-pending` (in-flight
       // worker / approver chain) OR `ready → job-pending` (section 1's
-      // about-to-dispatch worker, modelled as completed). The
-      // `git-uncommitted` / `git-orphans` cases collapse into a single
-      // `git-dirty` informational row — same edge shape (worker_phase
-      // flipped to done) but no dispatch behind it; the human resolves
-      // it by cleaning the worktree, after which predicate 6.5 stops
-      // firing and the row migrates to `approvals`. Worker predictions
-      // flow only from `blocked → ready` — a row already at `ready` is
-      // firing its worker in section 1, not section 2.
+      // about-to-dispatch worker, modelled as completed). Worker
+      // predictions flow only from `blocked → ready` — a row already at
+      // `ready` is firing its worker in section 1, not section 2. The
+      // `git-dirty` informational bucket is NOT sourced here — see the
+      // pre-pass at the top of this function for why it reads `cur`
+      // instead of the simulated `fut`.
       if (cur === undefined || cur.tag === "completed") {
         continue;
       }
       const fut = futureReadiness.perTask.get(taskId);
       if (fut?.tag === "blocked" && fut.reason.kind === "job-pending") {
         approvals.push(previewRowFromTask(task, projectDir, "approve"));
-      } else if (
-        fut?.tag === "blocked" &&
-        (fut.reason.kind === "git-uncommitted" ||
-          fut.reason.kind === "git-orphans")
-      ) {
-        informational.push(previewRowFromTask(task, projectDir, "git-dirty"));
       } else if (cur.tag === "blocked" && fut?.tag === "ready") {
         workers.push(previewRowFromTask(task, projectDir, "work"));
       }
@@ -604,12 +641,6 @@ export function predictNextDispatches(
     const fut = futureReadiness.perCloseRow.get(epicId);
     if (fut?.tag === "blocked" && fut.reason.kind === "job-pending") {
       approvals.push(previewRowFromEpic(epic, "approve"));
-    } else if (
-      fut?.tag === "blocked" &&
-      (fut.reason.kind === "git-uncommitted" ||
-        fut.reason.kind === "git-orphans")
-    ) {
-      informational.push(previewRowFromEpic(epic, "git-dirty"));
     } else if (cur.tag === "blocked" && fut?.tag === "ready") {
       closers.push(previewRowFromEpic(epic, "close"));
     }
