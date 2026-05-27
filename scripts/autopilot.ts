@@ -15,9 +15,31 @@
  *       claude '/plan:approve fn-619-pin-inputrequest-mid-subagent-state.1'
  *
  * Dispatches are persisted to ~/.local/state/keeper/dispatch.log (JSONL)
- * for forensic tailing across restarts, but each run's frame only shows
- * dispatches from this run — the file is write-only from autopilot's
- * perspective. A new frame is emitted immediately after each dispatch.
+ * for forensic tailing AND for restart durability. Two line kinds:
+ *
+ *   `{"kind":"launch", ts, rowId, dir, dirFull, verb, id, command,
+ *    dry?, pid?}` — written by `logDispatch` the moment autopilot
+ *    fires (or would-have-fired in dry mode).
+ *   `{"kind":"fulfilled", ts, verb, id, pid?}` — written by
+ *    `detectFulfillments` the first time an embedded job for the
+ *    dispatched `(verb, id)` appears in the readiness snapshot. Marks
+ *    the dispatch as claimed for life — section 1's "queued → current"
+ *    move pivots on this, and the durable re-dispatch guard rides on
+ *    the matching `dispatchedKeys` set so a session-ended → verdict-
+ *    flips-back-to-ready cycle cannot open a second Ghostty window.
+ *
+ * Section 1 partitions on fulfillment: rows whose key has been observed
+ * registered ("current") render above, then a blank-line gutter, then
+ * rows still waiting on the agent to boot ("queued") below. In wet mode
+ * queued is transient (~1-3 frames between dispatch and SessionStart
+ * fold); in dry mode it persists until the human runs the command
+ * manually since no claude session is actually spawned. On startup the
+ * log is folded back into the in-memory state — fulfilled prior-run
+ * dispatches drop out (history is on disk), unfulfilled ones rehydrate
+ * into the queued view so a mid-flight crash doesn't lose them.
+ *
+ * A new frame is emitted immediately after each dispatch AND whenever
+ * `detectFulfillments` observes a key flip from queued → current.
  *
  * Below a `---` separator (only present when non-empty), the frame
  * previews the next dispatches autopilot will fire as current sessions
@@ -27,7 +49,7 @@
  * to completed). Preview rows are single-line `(<dir>) <verb>::<id>` —
  * no `[dry]` tag, no shell-command footer. The preview recomputes from
  * the live readiness snapshot on every emit; section 1 above the `---`
- * is the persisted dispatch log for this run:
+ * is the per-run current+queued view described above:
  *
  *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
  *   ---
@@ -62,7 +84,7 @@
  *   --help           Show this help.
  */
 
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
@@ -102,9 +124,19 @@ summary form is '(<dir>) <verb>::<id>'; dry runs append the would-have
     cd /Users/mike/code/keeper && \\
       claude '/plan:approve fn-619-pin-inputrequest-mid-subagent-state.1'
 
-Each run's frame shows only dispatches from this run; the JSONL log at
-~/.local/state/keeper/dispatch.log is still appended for forensic tailing
-across restarts. A new frame is emitted after each dispatch.
+Section 1 partitions on fulfillment: rows whose dispatched (verb, id)
+has been observed registered in keeper land in "current" (above);
+rows still waiting on the agent to boot land in "queued" (below),
+separated by a blank-line gutter. In wet mode queued is transient
+(~1-3 frames before SessionStart folds); in dry mode it persists until
+the human runs the command manually. The JSONL log at
+~/.local/state/keeper/dispatch.log carries two kinds — 'launch' (every
+dispatch) and 'fulfilled' (first observation of the registered
+session) — so restart durability rides on the log: prior-run launches
+that never reached fulfillment rehydrate into this run's queued view,
+fulfilled prior-run dispatches drop out as history. A new frame is
+emitted after each dispatch AND whenever a queued row moves to
+current.
 
 Below a '---' separator (only when non-empty), the frame previews the next
 dispatches autopilot will fire as current sessions finish — approvals
@@ -434,6 +466,137 @@ export function predictNextDispatches(
   return { approvals, workers, closers };
 }
 
+// --- dispatch.log hydration + fulfillment detection ---------------------
+//
+// `dispatch.log` is a forensic JSONL append-only log under
+// `~/.local/state/keeper/dispatch.log`. Each line is a JSON object with a
+// `kind` discriminator:
+//
+//   - `{"kind":"launch", ts, rowId, dir, dirFull, verb, id, command,
+//     dry?, pid?}` — written by `logDispatch` the moment autopilot fires
+//     (or would-have-fired in dry mode).
+//   - `{"kind":"fulfilled", ts, verb, id, pid?}` — written by
+//     `onSnapshot` the first time an embedded job appears in the
+//     readiness snapshot for the dispatched `(verb, id)` pair. Marks the
+//     dispatch as "claimed forever"; once fulfilled, the row never goes
+//     back into the queued display even if its session later ends, and
+//     no other autopilot automation re-fires for it.
+//
+// Restart durability rides on the log: on startup, `hydrateDispatchLog`
+// folds both kinds back into in-memory `dispatchLog` + `dispatchedKeys`
+// + `fulfilledKeys`. Fulfilled prior-run dispatches don't reappear in
+// this run's section 1 (history is on disk); unfulfilled ones do, so a
+// crash mid-flight doesn't lose track of what was queued.
+
+/**
+ * Re-fold `dispatch.log` from disk into the three pieces of state
+ * autopilot needs at startup:
+ *
+ *   - `dispatchedKeys` — every `${verb}::${id}` autopilot has ever
+ *     dispatched (this run + every prior run). Drives the re-dispatch
+ *     guard in `launchInGhostty` so a session-ended → verdict-flips-back-
+ *     to-ready cycle cannot open a second Ghostty window for the same
+ *     row, and the guard survives restarts.
+ *   - `fulfilledKeys` — every `${verb}::${id}` autopilot has observed
+ *     register (an embedded job for that row+verb appeared in the
+ *     readiness snapshot). Marks the dispatch as claimed for life;
+ *     section 1 partitions on this.
+ *   - `entries` — the `dispatchLog` array seed: prior-run launches whose
+ *     key is NOT in `fulfilledKeys` (the still-queued tail). Fulfilled
+ *     prior-run dispatches are history and don't carry into this run's
+ *     display.
+ *
+ * Malformed JSONL lines skip silently — `dispatch.log` is a forensic
+ * audit log, not the event store, so re-fold determinism isn't a goal
+ * here. A truncated/corrupt line cannot wedge startup.
+ */
+export function hydrateDispatchLog(path: string): {
+  entries: DispatchEntry[];
+  dispatchedKeys: Set<string>;
+  fulfilledKeys: Set<string>;
+} {
+  const dispatchedKeys = new Set<string>();
+  const fulfilledKeys = new Set<string>();
+  const launches: DispatchEntry[] = [];
+  let content: string;
+  try {
+    content = readFileSync(path, "utf8");
+  } catch {
+    return { entries: [], dispatchedKeys, fulfilledKeys };
+  }
+  for (const line of content.split("\n")) {
+    if (line.trim() === "") {
+      continue;
+    }
+    let row: Record<string, unknown>;
+    try {
+      row = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const verb = row.verb;
+    const id = row.id;
+    if (typeof verb !== "string" || typeof id !== "string") {
+      continue;
+    }
+    const key = `${verb}::${id}`;
+    if (row.kind === "launch") {
+      dispatchedKeys.add(key);
+      launches.push(row as unknown as DispatchEntry);
+    } else if (row.kind === "fulfilled") {
+      fulfilledKeys.add(key);
+    }
+  }
+  const entries = launches.filter(
+    (e) => !fulfilledKeys.has(`${e.verb}::${e.id}`),
+  );
+  return { entries, dispatchedKeys, fulfilledKeys };
+}
+
+/**
+ * Returns `true` iff the readiness snapshot carries an embedded job for
+ * this `(verb, id)` pair. Used as the fulfillment predicate: once an
+ * autopilot dispatch's agent has booted (or any matching session exists
+ * in keeper's projection), an `EmbeddedJob` with `plan_verb === verb`
+ * lands in the parent row's `jobs[]` array via the reducer's
+ * `syncJobIntoEpic` fan-out (schema v26 widened the verb whitelist to
+ * accept `approve` alongside `work` / `close`).
+ *
+ * Dispatches by `id` shape: a dotted `id` (`fn-619-foo.1`) targets a
+ * task — scan that task's `jobs[]`. An undotted `id` (`fn-619-foo`)
+ * targets an epic-level row (close or approve on the epic) — scan the
+ * epic's `jobs[]`. The matching entry's `plan_verb` must equal the
+ * dispatched verb.
+ */
+export function findSessionMatch(
+  snap: ReadinessClientSnapshot,
+  verb: string,
+  id: string,
+): boolean {
+  const isTaskForm = id.includes(".");
+  if (isTaskForm) {
+    for (const epic of snap.epics) {
+      const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+      for (const task of tasks) {
+        if (task.task_id !== id) {
+          continue;
+        }
+        const jobs = Array.isArray(task.jobs) ? task.jobs : [];
+        return jobs.some((j) => j.plan_verb === verb);
+      }
+    }
+    return false;
+  }
+  for (const epic of snap.epics) {
+    if (epic.epic_id !== id) {
+      continue;
+    }
+    const jobs = Array.isArray(epic.jobs) ? epic.jobs : [];
+    return jobs.some((j) => j.plan_verb === verb);
+  }
+  return false;
+}
+
 async function main(): Promise<void> {
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
@@ -462,16 +625,36 @@ async function main(): Promise<void> {
   // every frame emit. `null` until the first paint lands.
   let lastSnap: ReadinessClientSnapshot | null = null;
 
-  // Frames show only dispatches from this run; logDispatch still appends
-  // to `dispatchLogPath` for forensic tailing across restarts.
-  const dispatchLog: DispatchEntry[] = [];
+  // Hydrate from disk so re-dispatch guards and the queued display
+  // survive a crash mid-flight. `dispatchedKeys` carries every key from
+  // every prior run (durable guard against double-fire); `fulfilledKeys`
+  // carries every `(verb, id)` autopilot has observed register;
+  // `dispatchLog` is seeded with prior-run launches that never reached
+  // fulfillment (the still-queued tail). This run's launches push onto
+  // `dispatchLog` as they fire and write a `kind:"launch"` line; the
+  // matching `kind:"fulfilled"` line is written the first time the
+  // snapshot shows an embedded job for the dispatched row+verb.
+  const {
+    entries: hydratedEntries,
+    dispatchedKeys,
+    fulfilledKeys,
+  } = hydrateDispatchLog(dispatchLogPath);
+  const dispatchLog: DispatchEntry[] = hydratedEntries;
 
   function renderDispatchFrame(): string[] {
-    const section1: string[] = [];
+    // Partition section 1 by fulfillment: rows whose `(verb, id)` has
+    // been observed registered in keeper land in `current`; rows that
+    // haven't yet land in `queued`. In wet mode, queued is typically
+    // transient (1-3 frames between dispatch and SessionStart fold);
+    // in dry mode it persists until the human runs the command
+    // manually, since no actual claude session is spawned.
+    const current: string[] = [];
+    const queued: string[] = [];
     for (const e of dispatchLog) {
+      const target = fulfilledKeys.has(`${e.verb}::${e.id}`) ? current : queued;
       const dirSeg = e.dir === "" ? "" : `(${e.dir}) `;
       const dryTag = e.dry ? "[dry] " : "";
-      section1.push(`${dirSeg}${dryTag}${e.verb}::${e.id}`);
+      target.push(`${dirSeg}${dryTag}${e.verb}::${e.id}`);
       if (e.dry) {
         // Dry runs append the would-have-run shell command, split
         // across two indented lines for readability: `  cd <full> &&
@@ -479,13 +662,23 @@ async function main(): Promise<void> {
         // dropped when there's no dir, so a no-dir dry dispatch shows
         // just the claude line under the summary.
         if (e.dirFull !== "") {
-          section1.push(`  cd ${e.dirFull} && \\`);
-          section1.push(`    claude '/plan:${e.verb} ${e.id}'`);
+          target.push(`  cd ${e.dirFull} && \\`);
+          target.push(`    claude '/plan:${e.verb} ${e.id}'`);
         } else {
-          section1.push(`  claude '/plan:${e.verb} ${e.id}'`);
+          target.push(`  claude '/plan:${e.verb} ${e.id}'`);
         }
       }
     }
+    const section1: string[] = [];
+    section1.push(...current);
+    if (current.length > 0 && queued.length > 0) {
+      // Blank-line gutter between current (fulfilled, above) and
+      // queued (unfulfilled, below). No `---` separator here — that's
+      // reserved for between section 1 (combined) and section 2
+      // (predicted next).
+      section1.push("");
+    }
+    section1.push(...queued);
 
     if (lastSnap === null) {
       return section1;
@@ -642,6 +835,7 @@ async function main(): Promise<void> {
   function logDispatch(entry: DispatchEntry): void {
     const stamped: DispatchEntry = { ...entry, pid: process.pid };
     dispatchLog.push(stamped);
+    dispatchedKeys.add(`${stamped.verb}::${stamped.id}`);
     try {
       appendFileSync(dispatchLogPath, `${JSON.stringify(stamped)}\n`);
     } catch (err) {
@@ -665,6 +859,21 @@ async function main(): Promise<void> {
     verb: "work" | "close" | "approve",
     id: string,
   ): void {
+    // Durable re-dispatch guard. `dispatchedKeys` is seeded from
+    // `dispatch.log` on startup and grows on every `logDispatch` call,
+    // so a verdict cycle (e.g. ready → job-running → session killed →
+    // ready) cannot open a second Ghostty window for the same row in
+    // this run OR across a restart. The `lastVerdictSig` map handles
+    // same-signature edges in-memory; this set is the persistent
+    // backstop. Once-dispatched is once-dispatched for life — if a
+    // re-dispatch is genuinely wanted the human edits `dispatch.log`.
+    const key = `${verb}::${id}`;
+    if (dispatchedKeys.has(key)) {
+      noteLine(
+        `${new Date().toISOString()} re-dispatch suppressed pid=${process.pid} ${key} (rowId=${rowId})`,
+      );
+      return;
+    }
     // `-l -i` = login + interactive — login alone sources `.zprofile` only,
     // so `claude` (and most user PATH additions) live in `.zshrc` which is
     // interactive-only. Without `-i` the spawned shell can't find `claude`.
@@ -871,9 +1080,44 @@ async function main(): Promise<void> {
     }
   }
 
+  function detectFulfillments(snap: ReadinessClientSnapshot): void {
+    // Walk every still-unfulfilled dispatch and check whether the
+    // snapshot now carries an embedded job for that (verb, id). First
+    // observation wins: mark the key, append a `kind:"fulfilled"` line
+    // to `dispatch.log`, and move the row from queued → current in the
+    // next frame render. No-op when nothing changes.
+    for (const entry of dispatchLog) {
+      const key = `${entry.verb}::${entry.id}`;
+      if (fulfilledKeys.has(key)) {
+        continue;
+      }
+      if (!findSessionMatch(snap, entry.verb, entry.id)) {
+        continue;
+      }
+      fulfilledKeys.add(key);
+      try {
+        appendFileSync(
+          dispatchLogPath,
+          `${JSON.stringify({
+            kind: "fulfilled",
+            ts: new Date().toISOString(),
+            verb: entry.verb,
+            id: entry.id,
+            pid: process.pid,
+          })}\n`,
+        );
+      } catch (err) {
+        noteLine(
+          `# warn: fulfilled log write failed: ${(err as Error).message}`,
+        );
+      }
+    }
+  }
+
   let firstPaintLogged = false;
   const onSnapshot = (snap: ReadinessClientSnapshot): void => {
     lastSnap = snap;
+    detectFulfillments(snap);
     if (!firstPaintLogged) {
       firstPaintLogged = true;
       const ready: string[] = [];
