@@ -21,7 +21,15 @@
  * - `createLiveShell(opts)` — returns a `LiveShell` handle.
  * - `pushFrame(lines)` — called once per script emit. `lines` is one element
  *   per row; the live-shell never splits on `\n` and the caller's contract is
- *   "one row per element."
+ *   "one row per element." Appends to history; the frozen render becomes the
+ *   historical scroll-back for that frame.
+ * - `refreshLive(lines)` — re-render the live view's body without appending
+ *   to history. Sets a single-slot overlay applied only when the user is
+ *   viewing live; historical frames keep their frozen at-capture rendering.
+ *   Cleared by the next `pushFrame`. Use for time-driven re-renders (e.g.
+ *   recomputing relative-time strings against the current clock) so the live
+ *   view ticks forward while scroll-back stays consistent with what was on
+ *   screen when each frame was captured.
  * - `dispose()` — synchronous, idempotent. Restores raw mode, leaves the
  *   alt-screen, shows the cursor, detaches all listeners.
  *
@@ -175,6 +183,15 @@ export interface SafetyNetTarget {
  */
 export interface LiveShell {
   pushFrame(lines: string[]): void;
+  /**
+   * Re-render the live view's body without appending a new frame to history.
+   * Sets a single-slot overlay applied only when `viewIdx === "live"`. The
+   * overlay is cleared by the next `pushFrame` (a fresh tip supersedes it).
+   * Historical frames keep their at-capture rendering — scroll-back is
+   * unaffected. No-op when the shell is the non-TTY pass-through (repainting
+   * the same frame to a pipe would dupe lines) or after `dispose()`.
+   */
+  refreshLive(lines: string[]): void;
   dispose(): void;
 }
 
@@ -265,6 +282,11 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
         }
         stdout.write(`${lines.join("\n")}\n`);
       },
+      refreshLive(_lines: string[]): void {
+        // Silent no-op in pass-through: time-driven re-renders would print
+        // duplicate frame bodies when the script is piped to a file or
+        // running under CI.
+      },
       dispose(): void {
         // No-op; flag exists only so a post-dispose `pushFrame` is silent.
         disabledDisposed = true;
@@ -287,6 +309,14 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   let viewIdx: ViewIdx = "live";
   let disposed = false;
   const wasRaw = stdin.isRaw ?? false;
+  // Optional re-render of the live view's body. When set AND
+  // viewIdx === "live", `visibleRows` returns this overlay instead of the
+  // history tip — so a time-driven tick repaint (e.g. relative-time
+  // strings ticking against the wall clock) can update the live view
+  // without growing history. Cleared by `pushFrame` (a fresh tip
+  // supersedes the overlay). Historical scroll-back is unaffected: held
+  // frames keep their frozen at-capture rendering.
+  let liveOverlay: string[] | null = null;
 
   // ---- Escape-parser state.
   // `escBuf` accumulates bytes that begin with `\x1b`. When a complete CSI
@@ -330,7 +360,7 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
       return [];
     }
     if (view === "live") {
-      return history[history.length - 1] ?? [];
+      return liveOverlay ?? history[history.length - 1] ?? [];
     }
     return history[view] ?? [];
   }
@@ -619,6 +649,9 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
     if (disposed) {
       return;
     }
+    // A fresh tip supersedes any time-driven overlay — clear it so the
+    // newly-pushed render becomes both the history tip and the live view.
+    liveOverlay = null;
     // Store a shallow copy so caller mutation can't corrupt history.
     const copy = lines.slice();
     history.push(copy);
@@ -640,6 +673,23 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
       // right thing: only the banner row's bytes will have changed.
       renderDiff(false);
     }
+  }
+
+  function refreshLive(lines: string[]): void {
+    if (disposed) {
+      return;
+    }
+    // Store a shallow copy so caller mutation can't corrupt the overlay.
+    liveOverlay = lines.slice();
+    if (viewIdx === "live") {
+      // Re-render against the new overlay. The per-line diff naturally
+      // skips unchanged rows, so a tick that produces identical text
+      // costs only the SYNC_BEGIN/SYNC_END wrapper bytes.
+      renderDiff(false);
+    }
+    // When scrolled back, the overlay sits dormant until the user snaps
+    // back to live — `snapLive()` → `renderDiff(false)` picks it up via
+    // `visibleRows`.
   }
 
   function dispose(): void {
@@ -711,5 +761,5 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   safetyNetTarget.on("uncaughtException", onUncaught);
   safetyNetTarget.on("unhandledRejection", onUnhandledRejection);
 
-  return { pushFrame, dispose };
+  return { pushFrame, refreshLive, dispose };
 }

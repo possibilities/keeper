@@ -680,3 +680,102 @@ test("vim-style h/j/k/l navigate history; printable letters are otherwise ignore
 
   shell.dispose();
 });
+
+test("refreshLive updates the live view body without growing history", () => {
+  // The 30s tick in `scripts/usage.ts` calls `refreshLive` to recompute
+  // relative-time strings without minting a new frame. The contract:
+  // (a) live view re-renders with the new body, (b) history length
+  // does not change, (c) stepping back still shows the original
+  // at-capture render.
+  const { shell, stdout, stdin } = bootShell();
+  stdout.take();
+  shell.pushFrame(["captured at 3m"]);
+  stdout.take();
+
+  // Tick: same row, fresher text.
+  shell.refreshLive(["captured at 2m"]);
+  const tickOut = stdout.take();
+  expect(tickOut).toContain("\x1b[2;1H\x1b[2Kcaptured at 2m");
+  // No new frame: banner still reads "frame 1" / "live results", never
+  // bumps the M count.
+  expect(tickOut).not.toContain("frame 2");
+
+  // Step back via left-arrow: with only one frame, viewIdx clamps to 0
+  // and the *frozen* capture-time text is shown — not the overlay.
+  stdin.feed("\x1b[D");
+  const backOut = stdout.take();
+  expect(backOut).toContain("\x1b[2;1H\x1b[2Kcaptured at 3m");
+  expect(backOut).not.toContain("captured at 2m");
+
+  shell.dispose();
+});
+
+test("refreshLive overlay is cleared by the next pushFrame", () => {
+  // A fresh tip supersedes the overlay — re-rendering after a data
+  // change must not show stale overlay text.
+  const { shell, stdout } = bootShell();
+  stdout.take();
+  shell.pushFrame(["original"]);
+  stdout.take();
+  shell.refreshLive(["ticked"]);
+  stdout.take();
+
+  // Data change: new pushFrame's body is what renders, NOT the overlay.
+  shell.pushFrame(["fresh-data"]);
+  const out = stdout.take();
+  expect(out).toContain("\x1b[2;1H\x1b[2Kfresh-data");
+  expect(out).not.toContain("ticked");
+
+  shell.dispose();
+});
+
+test("refreshLive while scrolled back does not redraw but applies on snap-to-live", () => {
+  // Per the contract: when viewIdx !== "live", refreshLive caches the
+  // overlay silently. Returning to live (`G`) then paints with the
+  // overlay applied. This is how a tick that fires while the user is
+  // browsing history still has its effect once they snap back.
+  const { shell, stdout, stdin } = bootShell();
+  stdout.take();
+  shell.pushFrame(["A"]);
+  shell.pushFrame(["B"]);
+  stdout.take();
+
+  // Step back so viewIdx becomes 0 (frame "A").
+  stdin.feed("\x1b[D");
+  stdout.take();
+
+  // Tick fires while scrolled back — must produce no body re-render
+  // (still showing "A"); only the banner row might repaint, but the
+  // body row 2 must NOT change.
+  shell.refreshLive(["B-ticked"]);
+  const idleOut = stdout.take();
+  expect(idleOut).not.toContain("B-ticked");
+  // Body row stays on the historical "A" — i.e. either unchanged or
+  // explicitly repainted as "A", never as "B-ticked".
+  if (idleOut.includes("\x1b[2;1H\x1b[2K")) {
+    expect(idleOut).toContain("\x1b[2;1H\x1b[2KA");
+  }
+
+  // Snap back to live with `G`: the overlay applies, rendering the
+  // ticked body in place of the original tip "B".
+  stdin.feed("G");
+  const liveOut = stdout.take();
+  expect(liveOut).toContain("\x1b[2;1H\x1b[2KB-ticked");
+
+  shell.dispose();
+});
+
+test("refreshLive is a silent no-op in the non-TTY pass-through", () => {
+  // Piping the script to a file or running under CI: `refreshLive` must
+  // not print duplicated frame bodies. Only `pushFrame` produces output.
+  const stdout = makeFakeStdout({ tty: false });
+  const stdin = makeFakeStdin({ tty: false });
+  const shell = createLiveShell({ enabled: true, stdout, stdin });
+  shell.pushFrame(["row"]);
+  expect(stdout.take()).toBe("row\n");
+
+  shell.refreshLive(["row-ticked"]);
+  expect(stdout.take()).toBe("");
+
+  shell.dispose();
+});

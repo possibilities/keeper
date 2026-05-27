@@ -15,10 +15,13 @@
  * `scripts/git.ts`. The script's job is rendering rows + writing sidecars;
  * the helper handles everything below the rows.
  *
- * First cut is non-TUI: rows are emitted to stdout one frame at a time,
- * `---`-delimited. The reset timestamps render as their raw ISO strings
- * — keeper has no freshness signal yet by design (a later epic may add a
- * client-side countdown).
+ * Reset cells render as minute-rounded relative time (`in 3h5m`, `5m`,
+ * `now`, `2m ago`) against the current wall clock. For the live frame in
+ * TUI mode a 30s tick re-renders via `liveShell.refreshLive` so the visible
+ * countdown ticks forward without growing history or writing sidecars;
+ * historical scroll-back keeps each frame's at-capture rendering, so the
+ * relative times you see when stepping back are the ones that were on
+ * screen when that frame was first emitted.
  */
 
 import { appendFileSync, writeFileSync } from "node:fs";
@@ -43,9 +46,11 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   print on exit.
 
 Rows show one agentuse profile: id, target + multiplier, session % +
-reset ISO, week % + reset ISO. Per-frame sidecars under
-/tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.* with an indexed
-meta sidecar; session paths print on SIGINT.
+reset (minute-rounded relative time, e.g. \`in 3h5m\`), week % +
+reset. The live frame re-renders every 30s so countdowns tick;
+historical scroll-back stays frozen at each frame's capture time.
+Per-frame sidecars under /tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*
+with an indexed meta sidecar; session paths print on SIGINT.
 `;
 
 function seg(v: unknown): string {
@@ -59,16 +64,44 @@ function pct(v: unknown): string {
 }
 
 /**
+ * Minute-rounded humanized relative time between `iso` and `nowMs`.
+ * Returns `""` for an empty input (no reset known), the raw input string
+ * if the ISO is unparseable (degrade gracefully — better than throwing
+ * inside a render hot path), `"now"` at the round boundary, and
+ * `in 3h5m` / `5m` / `2m ago` / `3h5m ago` otherwise.
+ *
+ * `nowMs` is a parameter (not `Date.now()` baked in) so tests can drive
+ * deterministic snapshots AND so the 30s tick can pass a fresh clock
+ * read without `renderRowLines` doing any wall-clock IO of its own.
+ */
+function relTime(iso: string, nowMs: number): string {
+  if (iso === "") return "";
+  const target = Date.parse(iso);
+  if (Number.isNaN(target)) return iso;
+  const diffMin = Math.round((target - nowMs) / 60000);
+  if (diffMin === 0) return "now";
+  const past = diffMin < 0;
+  const total = Math.abs(diffMin);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  const body = h > 0 ? `${h}h${m}m` : `${m}m`;
+  return past ? `${body} ago` : `in ${body}`;
+}
+
+/**
  * Render the `usage`-collection rows into one line per profile.
  *
- *   {id} [{target} {multiplier}x] session {pct}% (resets {iso}) | week {pct}% (resets {iso})
+ *   {id} [{target} {multiplier}x] session {pct}% (resets {rel}) | week {pct}% (resets {rel})
  *
  * The `{id}` segment is right-padded to the widest observed id length so
- * a multi-profile view stays column-aligned. Reset timestamps are raw
- * ISO strings (no client-side countdown — keeper has no freshness signal
- * yet by design; a later epic may add one).
+ * a multi-profile view stays column-aligned. Reset cells are rendered
+ * against the supplied `nowMs` — the caller passes `Date.now()` from the
+ * data-change emit AND from the 30s tick, and tests pass a fixed clock.
  */
-export function renderRowLines(rows: Record<string, unknown>[]): string[] {
+export function renderRowLines(
+  rows: Record<string, unknown>[],
+  nowMs: number,
+): string[] {
   if (rows.length === 0) return [];
   const widestId = rows.reduce(
     (acc, row) => Math.max(acc, seg(row.id).length),
@@ -82,9 +115,9 @@ export function renderRowLines(rows: Record<string, unknown>[]): string[] {
     const targetSeg =
       target === "" && mult === "" ? "" : `[${target} ${mult}x]`;
     const sPct = pct(row.session_percent);
-    const sReset = seg(row.session_resets_at);
+    const sReset = relTime(seg(row.session_resets_at), nowMs);
     const wPct = pct(row.week_percent);
-    const wReset = seg(row.week_resets_at);
+    const wReset = relTime(seg(row.week_resets_at), nowMs);
     lines.push(
       `${id} ${targetSeg} session ${sPct} (resets ${sReset}) | week ${wPct} (resets ${wReset})`,
     );
@@ -112,6 +145,11 @@ async function main(): Promise<void> {
   let lastFrame: string | null = null;
   let frameCount = 0;
   let lastRows: Record<string, unknown>[] = [];
+  // Last lines we pushed/refreshed to the live shell. Lets the 30s tick
+  // skip the `refreshLive` call when minute-rounding produced identical
+  // text — avoids even the cost of constructing the overlay (renderDiff
+  // would short-circuit too, but skipping here is cheaper and clearer).
+  let lastLiveLines: string[] = [];
 
   const prevFrameTmp = `/tmp/keeper-usage.${process.pid}.prev.frame.txt`;
   const metaSidecar = `/tmp/keeper-usage.${process.pid}.meta.txt`;
@@ -148,18 +186,45 @@ async function main(): Promise<void> {
    * the last emit and only writes (sidecars + stdout) when the render
    * changes — so a fetch-only refresh that bumps the `usage` row's
    * `last_event_id` without moving any projection-meaningful field
-   * produces no visible re-render.
+   * produces no visible re-render. Rendering is against `Date.now()` so
+   * the frozen at-capture text in history reflects what was on screen
+   * the moment the data landed; the 30s tick below keeps the live view
+   * ticking forward via `refreshLive`.
    */
   function emitFrame(rows: Record<string, unknown>[]): void {
     lastRows = rows;
-    const bodyLines = renderRowLines(rows);
+    const bodyLines = renderRowLines(rows, Date.now());
     const frameText = ["---", ...bodyLines].join("\n");
     if (frameText === lastFrame) return;
     frameCount += 1;
     liveShell.pushFrame(bodyLines);
+    lastLiveLines = bodyLines;
     writeSidecars(frameText);
     lastFrame = frameText;
   }
+
+  function linesEqual(a: string[], b: string[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+
+  // 30s tick: re-render the live view's relative-time cells against the
+  // current wall clock and overlay via `refreshLive`. No history growth,
+  // no sidecar writes — historical scroll-back still shows each frame's
+  // at-capture text. Skipped when there's no data yet OR when the render
+  // hasn't changed (minute-rounding holds for most ticks). 30s gives the
+  // worst-case half-minute lag on a minute boundary, which is plenty for
+  // minute-precision display.
+  const tickHandle = setInterval(() => {
+    if (lastRows.length === 0) return;
+    const bodyLines = renderRowLines(lastRows, Date.now());
+    if (linesEqual(bodyLines, lastLiveLines)) return;
+    lastLiveLines = bodyLines;
+    liveShell.refreshLive(bodyLines);
+  }, 30_000);
 
   function emitLifecycle(
     event: string,
@@ -194,6 +259,10 @@ async function main(): Promise<void> {
   });
 
   process.on("SIGINT", () => {
+    // Stop the relative-time tick FIRST so it can't fire against a
+    // disposed shell (refreshLive is no-op post-dispose, but skipping
+    // the rendered-rows + lines-equal work is cleaner).
+    clearInterval(tickHandle);
     // Terminal restoration before subscription teardown.
     liveShell.dispose();
     handle.dispose();
