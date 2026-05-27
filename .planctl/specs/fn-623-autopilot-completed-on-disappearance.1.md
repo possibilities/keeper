@@ -58,5 +58,5 @@ Four coordinated changes in `scripts/autopilot.ts`, then a new test in `test/aut
 - [ ] Manual smoke: run `bun scripts/autopilot.ts`, dispatch an `approve::<epic>` against a done-epic, observe the row migrates from `--- current ---` to `--- completed ---` after the epic falls off the page.
 
 ## Done summary
-
+Extracted detectJobTransitions to module scope behind a Deps record and added the fulfilled-then-disappeared branch (gated on fulfilledKeys.has(key)) so epic-level dispatches migrate from --- current --- to --- completed --- once their parent epic falls off the default subscription scope. Widened docstrings and added a unit test covering the three load-bearing properties (fires on fulfilled+disappeared, queued-but-never-fulfilled stays put, idempotent across repeat empty snapshots).
 ## Evidence
