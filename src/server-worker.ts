@@ -135,9 +135,51 @@ export const MAX_LIMIT = 500;
 // `if (TRACE)` branch in steady-state when off. The rare `[server-worker]`
 // error class stays UN-gated.
 const TRACE = process.env.KEEPER_TRACE_SERVER === "1";
+// Per-frame byte threshold for `writeFrames` instrumentation: only emit a
+// stage line when the encoded buffer is at least this large. Read once at
+// module load; a non-numeric env value (`NaN`) falls back to the default.
+const TRACE_FRAME_BYTES_DEFAULT = 4096;
+const TRACE_FRAME_BYTES = (() => {
+  const raw = process.env.KEEPER_TRACE_FRAME_BYTES;
+  if (raw === undefined || raw === "") return TRACE_FRAME_BYTES_DEFAULT;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : TRACE_FRAME_BYTES_DEFAULT;
+})();
 let __nextConnId = 0;
 function srvTs(msg: string): void {
   console.error(`[srv-ts] T=${Date.now()} ${msg}`);
+}
+
+/**
+ * Format a stage-timing line for the `[srv-ts]` log. Funnels both `runQuery`
+ * and `diffTick` outputs through ONE call so the awk-parseable shape stays
+ * locked across call sites:
+ *
+ *   op=<name> col=<col> [rows=<N>] [bytes=<B>] <stage1>=<ms> ... total=<ms>
+ *
+ * Stage values are pre-computed `.toFixed(2)` ms deltas; the caller passes the
+ * already-formatted strings so this helper does no math (and so a `TRACE=0`
+ * caller never reaches it — the guard is at the call site). The `total` is
+ * appended last, always, as the spec locks.
+ */
+function formatStages(args: {
+  op: string;
+  col: string;
+  rows?: number;
+  bytes?: number;
+  stages: Array<[string, string]>;
+  total: string;
+}): string {
+  let line = `op=${args.op} col=${args.col}`;
+  if (args.rows !== undefined) line += ` rows=${args.rows}`;
+  if (args.bytes !== undefined) line += ` bytes=${args.bytes}`;
+  for (const [name, ms] of args.stages) {
+    line += ` ${name}=${ms}`;
+  }
+  line += ` total=${args.total}`;
+  return line;
 }
 
 /**
@@ -469,6 +511,13 @@ export function runQuery(
   // to BOTH the page SELECT and the membership count below — they can't drift.
   const where = resolveFilter(descriptor, frame.filter);
 
+  // Staged timing instrumentation — gated by the same module-level `TRACE`
+  // const so a `KEEPER_TRACE_SERVER=0` daemon does zero stage work. Ternary
+  // -guarded `performance.now()` keeps the const at `0` and elides the
+  // syscall when off. Sub-ms resolution; the wall-clock prefix is stamped
+  // by `srvTs` from `Date.now()`.
+  const _t0 = TRACE ? performance.now() : 0;
+
   // Filtered-set size + membership token, over the WHERE only (no limit/offset).
   const { total, token } = countAndToken(
     db,
@@ -476,6 +525,7 @@ export function runQuery(
     where.clause,
     where.params,
   );
+  const _t1 = TRACE ? performance.now() : 0;
 
   // table/columns/pk/sortCol/dir are descriptor constants, never wire text —
   // safe to interpolate. filter values + limit/offset are bound. A wire
@@ -493,9 +543,11 @@ export function runQuery(
   const rawRows = db
     .prepare(sql)
     .all(...where.params, sqlLimit, offset) as Row[];
+  const _t2 = TRACE ? performance.now() : 0;
   // Decode any JSON-TEXT columns so `result` rows carry the same shape as the
   // diff/patch path (`selectByIds`); a no-op while `jsonColumns` is empty.
   const rows = rawRows.map((row) => decodeRow(descriptor, row));
+  const _t3 = TRACE ? performance.now() : 0;
 
   if (out) {
     out.where = where;
@@ -503,7 +555,7 @@ export function runQuery(
     out.token = token;
   }
 
-  return {
+  const result: ResultFrame = {
     type: "result",
     ...(frame.id !== undefined ? { id: frame.id } : {}),
     collection: descriptor.name,
@@ -511,6 +563,29 @@ export function runQuery(
     total,
     rows,
   };
+  const _t4 = TRACE ? performance.now() : 0;
+
+  // `runQuery` is called once per client query (rare relative to tick rate);
+  // emit unconditionally when TRACE=1 — no threshold gate needed here. The
+  // frame encode stage covers the synchronous Result-frame object build;
+  // `writeFrames` byte counts are emitted by its own instrumentation.
+  if (TRACE)
+    srvTs(
+      formatStages({
+        op: "runQuery",
+        col: descriptor.name,
+        rows: rows.length,
+        stages: [
+          ["countAndToken", (_t1 - _t0).toFixed(2)],
+          ["pageSelect", (_t2 - _t1).toFixed(2)],
+          ["decodeRow", (_t3 - _t2).toFixed(2)],
+          ["frameEncode", (_t4 - _t3).toFixed(2)],
+        ],
+        total: (_t4 - _t0).toFixed(2),
+      }),
+    );
+
+  return result;
 }
 
 /**
@@ -865,6 +940,21 @@ export function writeFrames(sock: Writable, frames: ServerFrame[]): void {
     offset = 0;
   }
 
+  // Stage-trace large frame batches BEFORE flush so the bytes/frames recorded
+  // match the encoded buffer exactly (flush may stash a tail on backpressure
+  // but the byte count we're profiling is the encoded payload, not what hit
+  // the wire). Threshold-gated on `KEEPER_TRACE_FRAME_BYTES` (default 4096)
+  // to avoid logging every small patch frame; the collection name comes from
+  // `sock.data.collection`, which may be null pre-subscribe — fall back to
+  // "?". The TRACE env gate short-circuits FIRST so a TRACE=0 daemon never
+  // reaches the buf.length comparison; the source-level lint accepts this
+  // compound `if (TRACE && ...)` shape alongside the existing bare
+  // `if (TRACE)` form.
+  if (TRACE && buf.length >= TRACE_FRAME_BYTES)
+    srvTs(
+      `op=writeFrames col=${sock.data.collection ?? "?"} bytes=${buf.length} frames=${frames.length}`,
+    );
+
   flush(sock, buf, offset);
 }
 
@@ -989,7 +1079,19 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
     return;
   }
 
+  // Staged timing — same ternary-gated `performance.now()` discipline as
+  // `runQuery`. Per-collection-group sub-stages accumulate into the running
+  // totals (`_acc*`) so the emitted line is one tick's total cost, not one
+  // collection's. Stages map verbatim to the source-code call sites; decode
+  // is bundled inside `selectByIds` per src/collections.ts and is not broken
+  // out separately. Stage names are also used in the threshold gate below.
+  const _tStart = TRACE ? performance.now() : 0;
+
   const rev = readWorldRevOnce(db);
+  const _tAfterRev = TRACE ? performance.now() : 0;
+  let _accUnion = 0;
+  let _accSelect = 0;
+  let _accPatch = 0;
 
   for (const [name, group] of byCollection) {
     const descriptor = getCollection(name);
@@ -998,11 +1100,16 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       // happen — the registry is static): nothing to diff.
       continue;
     }
+    const _g0 = TRACE ? performance.now() : 0;
     const ids = unionWatched(group);
+    const _g1 = TRACE ? performance.now() : 0;
+    if (TRACE) _accUnion += _g1 - _g0;
     if (ids.length === 0) {
       continue;
     }
     const rows = selectByIds(db, descriptor, ids);
+    const _g2 = TRACE ? performance.now() : 0;
+    if (TRACE) _accSelect += _g2 - _g1;
     // Index by the descriptor's pk for per-connection fan-out.
     const byId = new Map<string, Row>();
     for (const row of rows) {
@@ -1034,7 +1141,10 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
         writeFrames(sock, patches);
       }
     }
+    const _g3 = TRACE ? performance.now() : 0;
+    if (TRACE) _accPatch += _g3 - _g2;
   }
+  const _tAfterPatch = TRACE ? performance.now() : 0;
 
   // Second pass: membership-staleness `meta`. Group the live connections (a
   // non-null collection AND a resolved `where`) by filter signature so two
@@ -1090,6 +1200,45 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       }
     }
   }
+  const _tEnd = TRACE ? performance.now() : 0;
+
+  // Per-tick gating: only emit when any stage > 5ms OR total > 10ms, mirroring
+  // the existing `pollLoop` sleep-overrun pattern. Without this gate, a 50 ms
+  // poll at rest produces ~1200 lines/minute with tracing on, drowning the
+  // signal we're trying to study. Threshold knob (`KEEPER_TRACE_TICK_MS`) is
+  // a future tuning point if even this gate floods under contention. The col
+  // value is "*" because diffTick spans every collection-group this tick;
+  // per-group breakdown would require N lines per tick — out of scope.
+  //
+  // The TRACE env gate is the outer short-circuit (`if (TRACE && ...)`) so a
+  // TRACE=0 daemon does ZERO stage-delta arithmetic — every `t*` constant is
+  // `0` from the ternaries above and we never enter this branch.
+  const _readWorldRevMs = TRACE ? _tAfterRev - _tStart : 0;
+  const _metaCountMs = TRACE ? _tEnd - _tAfterPatch : 0;
+  const _totalMs = TRACE ? _tEnd - _tStart : 0;
+  const _slowTick =
+    TRACE &&
+    (_readWorldRevMs > 5 ||
+      _accUnion > 5 ||
+      _accSelect > 5 ||
+      _accPatch > 5 ||
+      _metaCountMs > 5 ||
+      _totalMs > 10);
+  if (TRACE && _slowTick)
+    srvTs(
+      formatStages({
+        op: "diffTick",
+        col: "*",
+        stages: [
+          ["readWorldRev", _readWorldRevMs.toFixed(2)],
+          ["unionWatched", _accUnion.toFixed(2)],
+          ["selectByIds", _accSelect.toFixed(2)],
+          ["patchFanout", _accPatch.toFixed(2)],
+          ["metaCount", _metaCountMs.toFixed(2)],
+        ],
+        total: _totalMs.toFixed(2),
+      }),
+    );
 }
 
 /**
