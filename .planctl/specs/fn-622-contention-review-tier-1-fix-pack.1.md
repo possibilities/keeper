@@ -58,5 +58,5 @@ Rotation sidecar:
 - [ ] `bun test` green
 
 ## Done summary
-
+Gated all 8 srvTs() call sites in src/server-worker.ts behind module-level const TRACE = process.env.KEEPER_TRACE_SERVER === '1' (read once at import). Added KEEPER_TRACE_SERVER=0 to the daemon plist's EnvironmentVariables, created plist/arthack.keeperd.logrotate.plist as a weekly Sunday 04:00 sidecar LaunchAgent (truncate server.stderr && launchctl kickstart), documented the env var + one-time truncate upgrade step + sidecar install in README.md, and added bun:test subprocess tests asserting the gate (unset → no [srv-ts]; =1 → conn open line) plus a source-level lint that every srvTs( call is preceded by if (TRACE).
 ## Evidence

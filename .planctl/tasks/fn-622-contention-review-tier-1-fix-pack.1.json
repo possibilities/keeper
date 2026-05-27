@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Gate srvTs behind KEEPER_TRACE_SERVER, document env var, ship rotation sidecar",
-  "updated_at": "2026-05-27T16:46:54.678676Z"
+  "updated_at": "2026-05-27T17:03:41.789770Z",
+  "worker_done_at": "2026-05-27T17:03:41.789770Z"
 }
