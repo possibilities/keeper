@@ -95,5 +95,5 @@ Three structural moves in `scripts/board.ts`, one set of README revisions.
       three call sites, and stacking-order snapshot.
 
 ## Done summary
-
+Wired inputRequestPillSeg into renderJobLinkLines / renderJobLines / projectJobRow; extended colorizePillsInLine with the awaiting:* → warn prefix fallback; added tests for the segment + colorizer + stacking-order snapshot (state → failed → awaiting); revised the five README touchpoints in-place per docs-gap-scout.
 ## Evidence
