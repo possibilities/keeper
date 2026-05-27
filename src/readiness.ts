@@ -558,27 +558,69 @@ function evaluateCloseRow(
  * Exported separately so the test suite can drive it with a hand-rolled
  * verdict map.
  */
+/**
+ * "Live work" predicate. A row whose verdict claims a mutex slot in pass-1
+ * regardless of iteration order. The set is the running/queued states that
+ * represent ACTUAL ongoing or imminent worker activity on a target — the
+ * states where dispatching another job to the same scope would land us with
+ * two live workers on the same target.
+ *
+ * Excluded: dependency blocks (`dep-on-task`, `dep-on-epic`), admin blocks
+ * (`epic-not-validated`, `job-rejected`), repo-state blocks (`git-uncommitted`,
+ * `git-orphans`), mutex-synthesized blocks (`single-task-per-epic`,
+ * `single-task-per-root`), and `unknown` — none of those represent a live
+ * worker that would conflict with a freshly-dispatched sibling.
+ */
+function isLiveWorkOccupant(verdict: Verdict): boolean {
+  if (verdict.tag !== "blocked") {
+    return false;
+  }
+  const kind = verdict.reason.kind;
+  return (
+    kind === "job-running" ||
+    kind === "sub-agent-running" ||
+    kind === "planner-running" ||
+    kind === "job-pending"
+  );
+}
+
 export function applySingleTaskPerEpicMutex(
   epicsArr: Epic[],
   perTask: Map<string, Verdict>,
 ): void {
   for (const epic of epicsArr) {
+    // Pass 1: any "live work" verdict (running/queued worker activity)
+    // claims the epic slot regardless of iteration order relative to
+    // ready siblings. Dependency-style blocks (dep-on-task, etc.) do
+    // NOT claim — they represent waiting, not concurrent work.
     let occupied = false;
     for (const task of epic.tasks) {
       const verdict = perTask.get(task.task_id);
-      if (verdict === undefined || verdict.tag === "completed") {
+      if (verdict === undefined) {
+        continue;
+      }
+      if (isLiveWorkOccupant(verdict)) {
+        occupied = true;
+        break;
+      }
+    }
+
+    // Pass 2: walk ready rows. If the slot is already claimed by Pass 1,
+    // every ready row is demoted. Otherwise, the first ready row wins
+    // and later ready rows are demoted (preserving prior behavior).
+    for (const task of epic.tasks) {
+      const verdict = perTask.get(task.task_id);
+      if (verdict === undefined || verdict.tag !== "ready") {
         continue;
       }
       if (!occupied) {
         occupied = true;
         continue;
       }
-      if (verdict.tag === "ready") {
-        perTask.set(task.task_id, {
-          tag: "blocked",
-          reason: { kind: "single-task-per-epic" },
-        });
-      }
+      perTask.set(task.task_id, {
+        tag: "blocked",
+        reason: { kind: "single-task-per-epic" },
+      });
     }
   }
 }
@@ -606,12 +648,39 @@ export function applySingleTaskPerRootMutex(
 ): void {
   const occupiedRoots = new Set<string>();
 
+  // Pass 1: every "live work" verdict (task OR close row) claims its
+  // root regardless of iteration order relative to ready siblings in
+  // other epics on the same root. See `isLiveWorkOccupant` — only
+  // running/queued worker activity counts; dependency / mutex-synthesized
+  // blocks do not, since they don't represent a live worker that would
+  // conflict with a freshly-dispatched sibling.
   for (const epic of epicsArr) {
     const projectDir = stringOrNull(epic.project_dir);
 
     for (const task of epic.tasks) {
       const verdict = perTask.get(task.task_id);
-      if (verdict === undefined || verdict.tag === "completed") {
+      if (verdict === undefined || !isLiveWorkOccupant(verdict)) {
+        continue;
+      }
+      const root = effectiveRoot(stringOrNull(task.target_repo), projectDir);
+      occupiedRoots.add(root);
+    }
+
+    const closeVerdict = perCloseRow.get(epic.epic_id);
+    if (closeVerdict !== undefined && isLiveWorkOccupant(closeVerdict)) {
+      const root = effectiveRoot(null, projectDir);
+      occupiedRoots.add(root);
+    }
+  }
+
+  // Pass 2: walk ready rows in iteration order. First ready row per root
+  // wins the (still-unclaimed) slot; subsequent ready rows are demoted.
+  for (const epic of epicsArr) {
+    const projectDir = stringOrNull(epic.project_dir);
+
+    for (const task of epic.tasks) {
+      const verdict = perTask.get(task.task_id);
+      if (verdict === undefined || verdict.tag !== "ready") {
         continue;
       }
       const root = effectiveRoot(stringOrNull(task.target_repo), projectDir);
@@ -619,22 +688,20 @@ export function applySingleTaskPerRootMutex(
         occupiedRoots.add(root);
         continue;
       }
-      if (verdict.tag === "ready") {
-        perTask.set(task.task_id, {
-          tag: "blocked",
-          reason: { kind: "single-task-per-root" },
-        });
-      }
+      perTask.set(task.task_id, {
+        tag: "blocked",
+        reason: { kind: "single-task-per-root" },
+      });
     }
 
     // Close row uses the epic's project_dir directly (no per-row
     // `target_repo` on a synthetic close).
     const closeVerdict = perCloseRow.get(epic.epic_id);
-    if (closeVerdict !== undefined && closeVerdict.tag !== "completed") {
+    if (closeVerdict !== undefined && closeVerdict.tag === "ready") {
       const root = effectiveRoot(null, projectDir);
       if (!occupiedRoots.has(root)) {
         occupiedRoots.add(root);
-      } else if (closeVerdict.tag === "ready") {
+      } else {
         perCloseRow.set(epic.epic_id, {
           tag: "blocked",
           reason: { kind: "single-task-per-root" },

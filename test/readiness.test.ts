@@ -1132,6 +1132,25 @@ test("applySingleTaskPerEpicMutex: non-completed non-ready row STILL claims the 
   );
 });
 
+test("applySingleTaskPerEpicMutex: ready row before job-running row in same epic still gets demoted to single-task-per-epic", () => {
+  // Iteration-order regression: a `ready` task in position N is demoted
+  // when a `job-running` task occupies position N+1 in the SAME epic.
+  // The one-pass algorithm let the ready row win the slot first; the
+  // two-pass fix claims the slot for the actively-running row in pass 1.
+  const t1 = makeTask({ task_id: "fn-1-foo.1" });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", { tag: "ready" }],
+    ["fn-1-foo.2", blocked({ kind: "job-running" })],
+  ]);
+  applySingleTaskPerEpicMutex([epic], perTask);
+  expect(perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+  expect(perTask.get("fn-1-foo.2")).toEqual(blocked({ kind: "job-running" }));
+});
+
 test("applySingleTaskPerEpicMutex: only ready rows are mutated (already-blocked sibling keeps its reason)", () => {
   // First row ready → claims slot. Second row already dep-on-task blocked →
   // stays put. Third row ready → mutated to single-task-per-epic.
@@ -1212,6 +1231,74 @@ test("applySingleTaskPerRootMutex: non-completed non-ready row STILL claims the 
   expect(perTask.get("fn-2-bar.1")).toEqual(
     blocked({ kind: "single-task-per-root" }),
   );
+});
+
+test("applySingleTaskPerRootMutex: ready row in earlier-iterating epic blocked by job-running row in later-iterating epic (same root)", () => {
+  // Iteration-order regression (the bug witnessed in production):
+  // fn-624.1 was `ready` in epic A, fn-626.1 was `job-running` in epic B,
+  // both on root /r. With the one-pass algorithm the ready row won the
+  // root slot first and autopilot dispatched it concurrently with the
+  // already-working sibling. The two-pass fix lets pass-1 claim the
+  // root for the job-running row so the ready row is demoted.
+  const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/r",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", { tag: "ready" }],
+    ["fn-2-bar.1", blocked({ kind: "job-running" })],
+  ]);
+  applySingleTaskPerRootMutex([e1, e2], perTask, new Map());
+  expect(perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+  expect(perTask.get("fn-2-bar.1")).toEqual(blocked({ kind: "job-running" }));
+});
+
+test("applySingleTaskPerRootMutex: ready close row in earlier epic blocked by job-running task in later epic (same root)", () => {
+  // Mirror coverage for the close-row branch: a ready close in epic A
+  // must yield the root to a job-running task in epic B regardless of
+  // iteration order.
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/r",
+    tasks: [],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([
+    ["fn-2-bar.1", blocked({ kind: "job-running" })],
+  ]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", { tag: "ready" }],
+  ]);
+  applySingleTaskPerRootMutex([e1, e2], perTask, perCloseRow);
+  expect(perCloseRow.get("fn-1-foo")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+  expect(perTask.get("fn-2-bar.1")).toEqual(blocked({ kind: "job-running" }));
 });
 
 // ---------------------------------------------------------------------------
