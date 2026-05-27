@@ -1,0 +1,21 @@
+{
+  "branch_name": "fn-623-autopilot-completed-on-disappearance",
+  "bundles": [
+    "sketch/autopilot-completed-on-disappearance"
+  ],
+  "created_at": "2026-05-27T17:16:05.277503Z",
+  "depends_on_epics": [],
+  "id": "fn-623-autopilot-completed-on-disappearance",
+  "last_validated_at": "2026-05-27T17:16:05.400983Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Autopilot completed on disappearance",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-27T17:16:05.277503Z"
+}
