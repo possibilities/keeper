@@ -77,5 +77,5 @@ Documentation:
 - [ ] `bun test` green
 
 ## Done summary
-
+Added OpenDbOptions.migrate (default true); hook now opens with { migrate: false } so daemon is sole migrator. applyPragmas + prepareStmts remain unconditional. CLAUDE.md + README updated with daemon-must-boot-first contract.
 ## Evidence
