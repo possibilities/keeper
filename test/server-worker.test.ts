@@ -1721,8 +1721,8 @@ async function runStageChild(
   openDb(childDb).db.close();
   const script = `
     import { openDb } from ${JSON.stringify(join(import.meta.dir, "../src/db"))};
-    import { runQuery, diffTick, writeFrames } from ${JSON.stringify(join(import.meta.dir, "../src/server-worker"))};
-    import { JOBS_DESCRIPTOR, countAndToken, resolveFilter } from ${JSON.stringify(join(import.meta.dir, "../src/collections"))};
+    import { runQuery, diffTick, writeFrames, resolveFilter } from ${JSON.stringify(join(import.meta.dir, "../src/server-worker"))};
+    import { JOBS_DESCRIPTOR, countAndToken } from ${JSON.stringify(join(import.meta.dir, "../src/collections"))};
     const { db } = openDb(${JSON.stringify(childDb)}, { readonly: false });
     ${body}
     db.close();
@@ -1774,17 +1774,24 @@ test("diffTick: TRACE=1 emits op=diffTick line for a slow tick (>10ms total)", a
   const stderr = await runStageChild(
     { KEEPER_TRACE_SERVER: "1" },
     `
-      // Seed enough rows + a slow synthetic stall (busy loop) to push the tick
-      // over the 10ms total threshold. We can't easily mock selectByIds in a
-      // subprocess, so we drive the slow path via row volume + a tight loop
-      // patched onto countAndToken's WHERE — simpler: just seed many rows
-      // and one connection that watches them all, then trigger diffTick.
-      const N = 500;
-      for (let i = 0; i < N; i++) {
-        db.query("INSERT INTO jobs (job_id, created_at, state, last_event_id, updated_at) VALUES (?, ?, 'working', ?, ?)").run("j" + i, i, i, i);
-      }
-      const watched = new Set();
-      for (let i = 0; i < N; i++) watched.add("j" + i);
+      // Deterministic threshold crossing via a mocked performance.now() that
+      // returns a monotonically increasing virtual clock advanced by +20ms on
+      // every call. diffTick's staged-timing instrumentation pulls the clock
+      // 5+ times per tick (start, afterRev, g0/g1/g2/g3 per group, afterPatch,
+      // end), so each stage delta lands at +20ms — well above the per-stage
+      // 5ms gate and the total 10ms gate. No wall-clock spin, no CI-speed
+      // hope: the slow-tick line is guaranteed to emit when (and only when)
+      // the threshold gate is wired correctly.
+      const _realNow = performance.now.bind(performance);
+      let _virtualMs = _realNow();
+      performance.now = () => {
+        _virtualMs += 20;
+        return _virtualMs;
+      };
+      // Seed one row + one connection that watches it. Volume doesn't matter
+      // anymore — the mocked clock supplies the slowness.
+      db.query("INSERT INTO jobs (job_id, created_at, state, last_event_id, updated_at) VALUES ('j0', 0, 'working', 0, 0)").run();
+      const watched = new Set(["j0"]);
       const where = resolveFilter(JOBS_DESCRIPTOR, {});
       const { total, token } = countAndToken(db, JOBS_DESCRIPTOR, where.clause, where.params);
       const sock = {
@@ -1797,34 +1804,15 @@ test("diffTick: TRACE=1 emits op=diffTick line for a slow tick (>10ms total)", a
         },
         write(buf, off, len) { return (len ?? buf.length - (off ?? 0)); },
       };
-      // Force the tick total over 10ms by burning CPU between calls. We can't
-      // patch the internals, so we just run diffTick enough times that the
-      // probability of one slow tick is high. Also, the row-fanout work in
-      // diffTick itself with N=500 rows on a fresh DB tends to land >10ms on
-      // CI. If both fail, fall back to a synthetic spin-wait around it.
-      let emitted = false;
-      const deadline = Date.now() + 2000;
-      while (!emitted && Date.now() < deadline) {
-        // Spin a few ms before diffTick so cumulative event-loop work nudges
-        // the stages over their threshold. This is a self-checking test: we
-        // poll until at least one line appears or the deadline trips.
-        const spinUntil = Date.now() + 8;
-        while (Date.now() < spinUntil) { /* burn */ }
-        // Reset lastSent so each iteration produces patch work.
-        sock.data.lastSent = new Map();
-        diffTick(db, [sock]);
-        // Look at stderr-buffer via process.stderr? Simpler: re-run is fine,
-        // bun:test captures stderr from the whole subprocess at exit.
-        emitted = true; // break — we'll assert from the parent on captured stderr
-      }
+      diffTick(db, [sock]);
+      performance.now = _realNow;
     `,
   );
-  // The test is "TRACE=1 + a fanout that should land over the threshold emits
-  // at least one diffTick line OR none if the machine is fast enough that
-  // every stage was sub-5ms and total under 10ms". The threshold gate is the
-  // point of the test, so we accept either >=1 line OR explicit zero plus a
-  // sanity check that the gate is wired (lines must match the locked shape).
+  // With the mocked clock supplying +20ms per performance.now() call, the
+  // threshold gate MUST fire. Assert lines.length > 0 unconditionally, and
+  // assert the locked shape on every emitted line.
   const lines = stderr.split("\n").filter((l) => l.includes("op=diffTick"));
+  expect(lines.length).toBeGreaterThan(0);
   for (const line of lines) {
     expect(line).toMatch(
       /\[srv-ts\] T=\d+ op=diffTick col=\* readWorldRev=\d+\.\d{2} unionWatched=\d+\.\d{2} selectByIds=\d+\.\d{2} patchFanout=\d+\.\d{2} metaCount=\d+\.\d{2} total=\d+\.\d{2}/,
