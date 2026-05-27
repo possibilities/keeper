@@ -35,6 +35,7 @@
  *   --sock <path>    Socket path override (else $KEEPER_SOCK, else the
  *                    ~/.local/state/keeper/keeperd.sock default).
  *   --launch         Enable auto-dispatch (see above).
+ *   --dry-run        Log edges without spawning Ghostty or notifyctl.
  *   --help           Show this help.
  */
 
@@ -62,6 +63,10 @@ Usage: bun scripts/autopilot.ts [--sock <path>] [--launch]
                    (worker_phase done + approval pending). Tries to move
                    the new Ghostty window to yabai space 5 if yabai is
                    installed.
+  --dry-run        Log dispatches to the frame and disk but skip the
+                   actual Ghostty spawn and notifyctl call. Implies
+                   --launch for edge detection. Entries appear as
+                   "[Xm ago] launch (dry)  <command>" in the frame.
   --help           Show this help
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
@@ -104,6 +109,7 @@ interface DispatchEntry {
   rowId: string;
   command?: string;
   message?: string;
+  dry?: boolean;
 }
 
 // --- command rendering (module-scope so test/autopilot.test.ts can import) ---
@@ -205,6 +211,7 @@ async function main(): Promise<void> {
     options: {
       sock: { type: "string" },
       launch: { type: "boolean", default: false },
+      "dry-run": { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -218,6 +225,7 @@ async function main(): Promise<void> {
   const sockPath = values.sock ?? resolveSockPath();
   const dispatchLogPath = join(dirname(sockPath), "dispatch.log");
   const launchEnabled = values.launch === true;
+  const dryRun = values["dry-run"] === true;
   const liveShell = createLiveShell({ enabled: true });
   let frameCount = 0;
 
@@ -248,10 +256,11 @@ async function main(): Promise<void> {
     }
     return dispatchLog.map((e) => {
       const age = timeAgo(e.ts);
+      const dry = e.dry ? " (dry)" : "";
       if (e.kind === "launch") {
-        return `[${age}] launch  ${e.command ?? ""}`;
+        return `[${age}] launch${dry}  ${e.command ?? ""}`;
       }
-      return `[${age}] notify  ${e.message ?? ""}`;
+      return `[${age}] notify${dry}  ${e.message ?? ""}`;
     });
   }
 
@@ -427,7 +436,9 @@ async function main(): Promise<void> {
       kind: "launch",
       rowId,
       command: workerShellCommand,
+      dry: dryRun || undefined,
     });
+    if (dryRun) return;
     try {
       const proc = Bun.spawn(["sh", "-c", shellLine], {
         stdout: "pipe",
@@ -465,7 +476,9 @@ async function main(): Promise<void> {
       kind: "notify",
       rowId,
       message,
+      dry: dryRun || undefined,
     });
+    if (dryRun) return;
     try {
       const proc = Bun.spawn(
         [
