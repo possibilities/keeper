@@ -217,7 +217,7 @@ Ctrl-C calls dispose() and exits 0.
 
 const seg = (v: unknown) => (v == null ? "" : String(v));
 
-interface DispatchEntry {
+export interface DispatchEntry {
   ts: string;
   kind: "launch";
   rowId: string;
@@ -693,9 +693,22 @@ export function predictNextDispatches(
 //     autopilot automation re-fires for it (in this run or any future
 //     run).
 //   - `{"kind":"completed", ts, verb, id, pid?}` — written by
-//     `detectJobTransitions` the first time the matching embedded job
-//     is observed in a terminal state (`"ended"` / `"killed"`).
-//     Migrates the row from `--- current ---` to `--- completed ---`.
+//     `detectJobTransitions` from EITHER of two triggers:
+//       (a) the matching embedded job is observed in a terminal state
+//           (`"ended"` / `"killed"`); OR
+//       (b) the dispatch was already fulfilled in a prior snapshot and
+//           `findSessionJob` now returns `undefined` — the parent epic
+//           has fallen off the default subscription scope (typically
+//           because it's done+approved per `src/collections.ts:251-254`,
+//           or was explicitly `planctl epic-delete`d). Both forms migrate
+//           the row from `--- current ---` to `--- completed ---`.
+//
+//     The disappearance trigger relies on the all-three-collections
+//     gate in `subscribeReadiness.emitSnapshotIfReady`
+//     (`src/readiness-client.ts:840-841`): the client only emits a
+//     snapshot once every collection's `result` frame has landed
+//     post-reconnect, so a partial mid-reconnect frame cannot
+//     spuriously fire the rule.
 //
 // On startup, `hydrateDispatchLog` folds all three kinds into the
 // durable `dispatchedKeys` + `fulfilledKeys` + `completedKeys` sets so
@@ -821,6 +834,159 @@ export function findSessionJob(
   return undefined;
 }
 
+/**
+ * Closure-dependency record for `detectJobTransitions`. The function
+ * was extracted from `main()` so the new fulfilled-then-disappeared
+ * branch could be unit-tested in isolation; the production call site
+ * inside `main()` wires `appendLine` to `appendFileSync(dispatchLogPath, …)`
+ * and the test wires it to an in-memory recorder.
+ */
+export interface DetectJobTransitionsDeps {
+  // Mutable display array. `detectJobTransitions` does not push to it
+  // (only `logDispatch` does), but it walks the array each call to
+  // partition keys into the three durable sets.
+  dispatchLog: DispatchEntry[];
+  // Durable cross-snapshot set: a key lands here the first time
+  // `findSessionJob` returns a defined job for `(verb, id)`. Survives
+  // restarts via `hydrateDispatchLog`.
+  fulfilledKeys: Set<string>;
+  // Durable cross-snapshot set: a key lands here when the matching job
+  // is observed terminal OR (post-fulfillment) when the key disappears
+  // from the snapshot. Survives restarts.
+  completedKeys: Set<string>;
+  // Production wires to the on-disk JSONL path; tests reuse it for
+  // warn-line context only.
+  dispatchLogPath: string;
+  // Lifecycle-warn sink — wraps `appendFileSync(lifecycleSidecar, …)`
+  // in production; tests can hand a no-op.
+  noteLine: (s: string) => void;
+  // The autopilot process pid stamped into every emitted log line.
+  pid: number;
+  // The disk-append callback. Production wires
+  // `(line) => appendFileSync(dispatchLogPath, line)`; tests inject an
+  // in-memory recorder to assert the exact JSON shape without touching
+  // the filesystem.
+  appendLine: (line: string) => void;
+}
+
+/**
+ * Walk every dispatch and check whether the snapshot has advanced
+ * its matching embedded job:
+ *
+ *   queued → current      first time a job for (verb, id) is observed
+ *                         in the snapshot at all (kind:"fulfilled"
+ *                         log line).
+ *   current → completed   EITHER first time that job's `state` is
+ *                         observed in a terminal value (`"ended"` /
+ *                         `"killed"`), OR (post-fulfillment) the
+ *                         first time the matching job disappears
+ *                         from the snapshot entirely — the parent
+ *                         epic has fallen off the default subscription
+ *                         scope (typically done+approved per
+ *                         `src/collections.ts:251-254`) or was
+ *                         `planctl epic-delete`d. Both emit a
+ *                         `kind:"completed"` log line with the same
+ *                         `{kind, ts, verb, id, pid}` JSON shape.
+ *
+ * First observation wins for each transition. No-op when nothing
+ * changes.
+ *
+ * The disappearance branch is gated on `fulfilledKeys.has(key)`:
+ * without that gate a queued dispatch whose agent hasn't booted yet
+ * (also `findSessionJob === undefined`) would migrate to completed
+ * instantly. The gate is load-bearing — do not remove it. The branch
+ * also relies on `subscribeReadiness.emitSnapshotIfReady`'s
+ * all-three-collections gate (`src/readiness-client.ts:840-841`) to
+ * avoid firing on a partial post-reconnect frame.
+ */
+export function detectJobTransitions(
+  deps: DetectJobTransitionsDeps,
+  snap: ReadinessClientSnapshot,
+): void {
+  const {
+    dispatchLog,
+    fulfilledKeys,
+    completedKeys,
+    noteLine,
+    pid,
+    appendLine,
+  } = deps;
+  for (const entry of dispatchLog) {
+    const key = `${entry.verb}::${entry.id}`;
+    if (completedKeys.has(key)) {
+      continue;
+    }
+    const job = findSessionJob(snap, entry.verb, entry.id);
+    // Disappearance branch — MUST precede the `job === undefined`
+    // early-return below; a future drive-by reorder would silently
+    // break the rule. The `fulfilledKeys.has(key)` gate is what
+    // distinguishes "epic dropped off the page after fulfillment"
+    // (terminal, migrate to completed) from "agent hasn't booted yet"
+    // (queued, stay put).
+    if (job === undefined && fulfilledKeys.has(key)) {
+      completedKeys.add(key);
+      try {
+        appendLine(
+          `${JSON.stringify({
+            kind: "completed",
+            ts: new Date().toISOString(),
+            verb: entry.verb,
+            id: entry.id,
+            pid,
+          })}\n`,
+        );
+      } catch (err) {
+        noteLine(
+          `# warn: completed log write failed: ${(err as Error).message}`,
+        );
+      }
+      continue;
+    }
+    // Constraint: the disappearance branch above MUST stay above this
+    // early-return — otherwise the `fulfilled && undefined` case is
+    // preempted and never reaches `completed`.
+    if (job === undefined) {
+      continue;
+    }
+    if (!fulfilledKeys.has(key)) {
+      fulfilledKeys.add(key);
+      try {
+        appendLine(
+          `${JSON.stringify({
+            kind: "fulfilled",
+            ts: new Date().toISOString(),
+            verb: entry.verb,
+            id: entry.id,
+            pid,
+          })}\n`,
+        );
+      } catch (err) {
+        noteLine(
+          `# warn: fulfilled log write failed: ${(err as Error).message}`,
+        );
+      }
+    }
+    if (job.state === "ended" || job.state === "killed") {
+      completedKeys.add(key);
+      try {
+        appendLine(
+          `${JSON.stringify({
+            kind: "completed",
+            ts: new Date().toISOString(),
+            verb: entry.verb,
+            id: entry.id,
+            pid,
+          })}\n`,
+        );
+      } catch (err) {
+        noteLine(
+          `# warn: completed log write failed: ${(err as Error).message}`,
+        );
+      }
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
@@ -881,14 +1047,20 @@ async function main(): Promise<void> {
     // (this-run dispatches still waiting on the agent to boot),
     // `--- predicted ---` (`predictNextDispatches` output for the next
     // edges as in-flight jobs finish), and `--- completed ---` (this-
-    // run dispatches whose matching embedded job has been observed in
-    // a terminal state `"ended"` / `"killed"`). The ordering is
-    // attention-first — live agents at the top, growing history at the
-    // bottom so completed rows don't push live state around. In wet
-    // mode queued is typically transient (1-3 frames between dispatch
-    // and SessionStart fold); in dry mode it persists until the human
-    // runs the command manually (no real session ever boots, so neither
-    // `current` nor `completed` ever populates for a dry dispatch).
+    // run dispatches whose matching embedded job has either reached a
+    // terminal state `"ended"` / `"killed"` OR — after the dispatch was
+    // already fulfilled in a prior snapshot — has disappeared from the
+    // subscription page entirely, typically because the parent epic
+    // became done+approved and fell out of the default epics scope
+    // per `src/collections.ts:251-254`, or because the human ran an
+    // explicit `planctl epic-delete` against the fulfilled target).
+    // The ordering is attention-first — live agents at the top, growing
+    // history at the bottom so completed rows don't push live state
+    // around. In wet mode queued is typically transient (1-3 frames
+    // between dispatch and SessionStart fold); in dry mode it persists
+    // until the human runs the command manually (no real session ever
+    // boots, so neither `current` nor `completed` ever populates for a
+    // dry dispatch).
     const current: string[] = [];
     const queued: string[] = [];
     const completed: string[] = [];
@@ -1371,73 +1543,22 @@ async function main(): Promise<void> {
     }
   }
 
-  function detectJobTransitions(snap: ReadinessClientSnapshot): void {
-    // Walk every dispatch and check whether the snapshot has advanced
-    // its matching embedded job:
-    //
-    //   queued → current      first time a job for (verb, id) is
-    //                         observed in the snapshot at all
-    //                         (kind:"fulfilled" log line).
-    //   current → completed   first time that job's `state` is observed
-    //                         in a terminal value (`"ended"` /
-    //                         `"killed"`) (kind:"completed" log line).
-    //
-    // First observation wins for each transition. No-op when nothing
-    // changes.
-    for (const entry of dispatchLog) {
-      const key = `${entry.verb}::${entry.id}`;
-      if (completedKeys.has(key)) {
-        continue;
-      }
-      const job = findSessionJob(snap, entry.verb, entry.id);
-      if (job === undefined) {
-        continue;
-      }
-      if (!fulfilledKeys.has(key)) {
-        fulfilledKeys.add(key);
-        try {
-          appendFileSync(
-            dispatchLogPath,
-            `${JSON.stringify({
-              kind: "fulfilled",
-              ts: new Date().toISOString(),
-              verb: entry.verb,
-              id: entry.id,
-              pid: process.pid,
-            })}\n`,
-          );
-        } catch (err) {
-          noteLine(
-            `# warn: fulfilled log write failed: ${(err as Error).message}`,
-          );
-        }
-      }
-      if (job.state === "ended" || job.state === "killed") {
-        completedKeys.add(key);
-        try {
-          appendFileSync(
-            dispatchLogPath,
-            `${JSON.stringify({
-              kind: "completed",
-              ts: new Date().toISOString(),
-              verb: entry.verb,
-              id: entry.id,
-              pid: process.pid,
-            })}\n`,
-          );
-        } catch (err) {
-          noteLine(
-            `# warn: completed log write failed: ${(err as Error).message}`,
-          );
-        }
-      }
-    }
-  }
+  const detectJobTransitionsDeps: DetectJobTransitionsDeps = {
+    dispatchLog,
+    fulfilledKeys,
+    completedKeys,
+    dispatchLogPath,
+    noteLine,
+    pid: process.pid,
+    appendLine: (line: string): void => {
+      appendFileSync(dispatchLogPath, line);
+    },
+  };
 
   let firstPaintLogged = false;
   const onSnapshot = (snap: ReadinessClientSnapshot): void => {
     lastSnap = snap;
-    detectJobTransitions(snap);
+    detectJobTransitions(detectJobTransitionsDeps, snap);
     if (!firstPaintLogged) {
       firstPaintLogged = true;
       const ready: string[] = [];

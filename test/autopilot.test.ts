@@ -24,7 +24,12 @@
  */
 
 import { expect, test } from "bun:test";
+import type {
+  DetectJobTransitionsDeps,
+  DispatchEntry,
+} from "../scripts/autopilot";
 import {
+  detectJobTransitions,
   predictNextDispatches,
   renderEpicCommands,
   renderEpicCommandsFiltered,
@@ -582,4 +587,139 @@ test("predictNextDispatches — stopped worker + worker_phase=done + git_orphan_
   ]);
   expect(workers).toEqual([]);
   expect(closers).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// detectJobTransitions — fulfilled-then-disappeared rule.
+//
+// `detectJobTransitions` migrates a dispatched row across three states
+// (queued → current → completed) by folding successive readiness
+// snapshots. The terminal-state branch (`state in ("ended", "killed")`)
+// has shipped since the original autopilot frame; the new branch
+// added by fn-623.1 fires `current → completed` when a *previously
+// fulfilled* dispatch's matching job has *disappeared* from the
+// snapshot entirely — the parent epic has fallen off the default
+// subscription scope after becoming done+approved, or a human ran
+// `planctl epic-delete` against the target.
+//
+// The branch is gated on `fulfilledKeys.has(key)` so a queued
+// dispatch whose agent has not yet booted (also a `findSessionJob
+// === undefined` shape) cannot migrate to completed instantly. This
+// test pins all three load-bearing properties in one case:
+//   (a) frame 1: fulfilled epic+embedded-job → `fulfilledKeys` gains
+//       the key and a `kind:"fulfilled"` line is recorded.
+//   (b) frame 2: same key, epic gone from the snap → `completedKeys`
+//       gains the key and a `kind:"completed"` line is recorded.
+//   (c) frame 3: same empty snap → no second `completed` line
+//       (idempotence via the `completedKeys.has(key)` guard at the
+//       top of the loop).
+// Bonus: a never-fulfilled queued dispatch in the same frames stays
+// absent from both sets — proves the `fulfilledKeys` gate.
+// ---------------------------------------------------------------------------
+
+function makeDispatchEntry(overrides: Partial<DispatchEntry>): DispatchEntry {
+  return {
+    ts: "2026-05-27T00:00:00.000Z",
+    kind: "launch",
+    rowId: "row-1",
+    dir: "repo",
+    dirFull: "/repo",
+    verb: "approve",
+    id: "fn-1-foo",
+    command: "cd /repo && claude '/plan:approve fn-1-foo'",
+    pid: 42,
+    ...overrides,
+  };
+}
+
+test("detectJobTransitions — fulfilled key disappears from snapshot reaches completed", () => {
+  // Two dispatches in the log: one will be fulfilled then disappear,
+  // one is queued and never appears (proves the `fulfilledKeys`
+  // gate).
+  const fulfilledEntry = makeDispatchEntry({
+    verb: "approve",
+    id: "fn-1-foo",
+  });
+  const neverFulfilledEntry = makeDispatchEntry({
+    verb: "approve",
+    id: "fn-2-bar",
+  });
+  const dispatchLog: DispatchEntry[] = [fulfilledEntry, neverFulfilledEntry];
+  const fulfilledKeys = new Set<string>();
+  const completedKeys = new Set<string>();
+  const captured: string[] = [];
+  const noteLines: string[] = [];
+  const deps: DetectJobTransitionsDeps = {
+    dispatchLog,
+    fulfilledKeys,
+    completedKeys,
+    dispatchLogPath: "/tmp/keeper-autopilot.test.dispatch.log",
+    noteLine: (s) => noteLines.push(s),
+    pid: 4242,
+    appendLine: (line) => captured.push(line),
+  };
+
+  // Frame (a): the dispatched epic is on the page with a matching
+  // embedded job → `fulfilledKeys` gains the key and a
+  // `kind:"fulfilled"` line is recorded. The never-fulfilled entry
+  // has no epic in the snap, so it must stay absent from both sets.
+  const frame1Epic = makeEpic({
+    epic_id: "fn-1-foo",
+    jobs: [makeEmbeddedJob({ plan_verb: "approve", state: "working" })],
+  });
+  const snap1 = buildSnap([frame1Epic]);
+  detectJobTransitions(deps, snap1);
+
+  expect(fulfilledKeys.has("approve::fn-1-foo")).toBe(true);
+  expect(completedKeys.has("approve::fn-1-foo")).toBe(false);
+  expect(fulfilledKeys.has("approve::fn-2-bar")).toBe(false);
+  expect(completedKeys.has("approve::fn-2-bar")).toBe(false);
+  expect(captured.length).toBe(1);
+  const fulfilledLine = JSON.parse(captured[0] ?? "{}") as Record<
+    string,
+    unknown
+  >;
+  expect(fulfilledLine.kind).toBe("fulfilled");
+  expect(fulfilledLine.verb).toBe("approve");
+  expect(fulfilledLine.id).toBe("fn-1-foo");
+  expect(typeof fulfilledLine.ts).toBe("string");
+  expect(typeof fulfilledLine.pid).toBe("number");
+  expect(fulfilledLine.pid).toBe(4242);
+  // The completed shape is intentionally lean — no `reason` field.
+  expect("reason" in fulfilledLine).toBe(false);
+
+  // Frame (b): the epic has fallen off the page (e.g. became
+  // done+approved and exited the default scope). The fulfilled
+  // dispatch's matching job is now undefined; combined with
+  // `fulfilledKeys.has(key)`, the disappearance branch fires →
+  // `completedKeys` gains the key and a `kind:"completed"` line
+  // lands. The never-fulfilled entry STILL has no matching job and
+  // STILL is not in `fulfilledKeys`, so the gate keeps it queued.
+  const snap2 = buildSnap([]);
+  detectJobTransitions(deps, snap2);
+
+  expect(completedKeys.has("approve::fn-1-foo")).toBe(true);
+  expect(completedKeys.has("approve::fn-2-bar")).toBe(false);
+  expect(fulfilledKeys.has("approve::fn-2-bar")).toBe(false);
+  expect(captured.length).toBe(2);
+  const completedLine = JSON.parse(captured[1] ?? "{}") as Record<
+    string,
+    unknown
+  >;
+  expect(completedLine.kind).toBe("completed");
+  expect(completedLine.verb).toBe("approve");
+  expect(completedLine.id).toBe("fn-1-foo");
+  expect(typeof completedLine.ts).toBe("string");
+  expect(typeof completedLine.pid).toBe("number");
+  expect(completedLine.pid).toBe(4242);
+  expect("reason" in completedLine).toBe(false);
+
+  // Frame (c): a third call with the same empty snap → no second
+  // `completed` line. The `completedKeys.has(key)` guard at the top
+  // of the loop short-circuits before the disappearance branch is
+  // reached. The never-fulfilled entry remains queued.
+  detectJobTransitions(deps, snap2);
+  expect(captured.length).toBe(2);
+  expect(completedKeys.has("approve::fn-2-bar")).toBe(false);
+  expect(fulfilledKeys.has("approve::fn-2-bar")).toBe(false);
 });
