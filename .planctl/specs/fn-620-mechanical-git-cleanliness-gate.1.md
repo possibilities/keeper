@@ -91,5 +91,5 @@ Update CLAUDE.md's "Event-sourcing invariants" first bullet: weave the new GitSn
 - [ ] `bun test` passes; no regressions in existing readiness or reducer tests
 
 ## Done summary
-
+Schema v28 adds jobs.git_dirty_count + git_orphan_count with GitSnapshot fan-out + GitRootDropped symmetric clear; new predicate 6.5 (git-uncommitted / git-orphans) wired into evaluateTask + evaluateCloseRow between session-running (5/6) and approval-pending (7).
 ## Evidence
