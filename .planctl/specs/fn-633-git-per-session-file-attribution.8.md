@@ -55,5 +55,5 @@ Add a small test for `renderRowBlocks` (if not already present) using a syntheti
 - [ ] At least one new test for renderRowBlocks covering multi-attribution shape
 
 ## Done summary
-
+Rewrote scripts/git.ts renderRowBlocks to a file-centric layout with source-badged multi-attribution (tool/bash/inferred@<session>); <orphan> renders for files with no attribution; header carries dirty/orphan/unattributed counts; rename pairs get a continuation line; attribution list truncates to ~100 chars with +N more suffix. board.ts had no git column references; autopilot.ts three-column zero-on-flip already landed in task 7.
 ## Evidence
