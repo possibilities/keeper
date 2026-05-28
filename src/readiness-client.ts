@@ -451,6 +451,18 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     connect,
   } = opts;
   const byCollection = new Map(states.map((s) => [s.collection, s]));
+  // Parallel id-keyed index for multi-sub-aware routing. The server (post
+  // fn-632.1) echoes each query's `id` on its `result`/`patch`/`meta`
+  // frames, so a connection carrying N concurrent subs can route each
+  // server frame back to the originating state without disambiguating by
+  // collection alone (two subs on the same collection with different
+  // filters are now possible). `subId` is a stable constant per state for
+  // the helper's lifetime (`${idPrefix}-<collection>` in
+  // `subscribeReadiness`, immutable across reconnect), so the map is
+  // built once and never rebuilt — matches the immutability contract on
+  // `states` itself. Legacy servers that don't echo `id` on patch/meta
+  // fall through to `byCollection` — strictly additive on the wire.
+  const bySubId = new Map(states.map((s) => [s.subId, s]));
 
   let currentSock: ReadinessSocket | null = null;
   let attempt = 0;
@@ -531,10 +543,18 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   }
 
   function pollAll(): void {
-    // First pass: check every state's in-flight age against the
-    // slow-flight + timeout thresholds. A timeout aborts the poll and
-    // triggers a reconnect (single-flight via the `reconnecting` latch);
-    // a slow-flight emits a one-shot lifecycle event and continues.
+    // The poll loop is now SLOW-FLIGHT DETECTION ONLY (fn-622's Tier 1
+    // diagnostic). It walks every state, compares
+    // `Date.now() - queryInFlightSince` against `SLOW_FLIGHT_MS` /
+    // `QUERY_TIMEOUT_MS`, and either emits a one-shot
+    // `query_slow_flight` lifecycle event or triggers a reconnect via
+    // the single-flight `reconnecting` latch. NO REFETCH IS SCHEDULED
+    // HERE — the prior steady-poll second pass (which fired a refetch
+    // on every state every `POLL_MS`) was a workaround for the F3
+    // single-sub server bug that the multi-sub refactor (fn-632.1)
+    // closes. Post-Task-A, real-time `patch`/`meta` frames drive
+    // freshness via `scheduleRefetchFor` in `handleFrame`; pollAll is
+    // pure diagnosis.
     const now = Date.now();
     for (const s of states) {
       if (!s.queryInFlight || s.queryInFlightSince === null) {
@@ -555,17 +575,25 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         s.lastSlowFlightAt = now;
       }
     }
-    // Second pass: the steady-poll refetch backstop, unchanged.
-    for (const s of states) {
-      scheduleRefetchFor(s);
-    }
   }
 
   function handleFrame(frame: ServerFrame): void {
     if (frame.type === "result") {
-      const state = byCollection.get(frame.collection);
+      // Id-first routing: prefer the echoed sub `id` (multi-sub-aware
+      // server, fn-632.1+), fall back to `collection` (legacy server
+      // that doesn't echo `id`). The result frame has always carried
+      // `id?: string` in the wire protocol, but legacy single-sub
+      // servers omitted it on `patch`/`meta`; doing the lookup uniformly
+      // here keeps result/patch/meta consistent. A bare `collection`
+      // lookup would still work for the helper (one sub per collection
+      // by construction), but the consistency is load-bearing for any
+      // future consumer that registers multiple subs on the same
+      // collection.
+      const state =
+        (frame.id !== undefined ? bySubId.get(frame.id) : undefined) ??
+        byCollection.get(frame.collection);
       if (!state) {
-        // A `result` for a collection we don't track — defensive; should
+        // A `result` for a sub we don't track — defensive; should
         // never happen on a connection we opened ourselves.
         return;
       }
@@ -591,7 +619,16 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         scheduleRefetchFor(state);
       }
     } else if (frame.type === "patch" || frame.type === "meta") {
-      const state = byCollection.get(frame.collection);
+      // Id-first routing, same fallback chain as `result`. A new server
+      // (fn-632.1+) emits `id` on every patch/meta on behalf of a sub
+      // with a non-null id; a legacy server emits neither, and the
+      // collection lookup is the only routable signal. Either way, the
+      // helper schedules a refetch for the matching state — patches +
+      // metas are pure "data changed, fetch fresh" nudges in this
+      // pipeline.
+      const state =
+        (frame.id !== undefined ? bySubId.get(frame.id) : undefined) ??
+        byCollection.get(frame.collection);
       if (state) {
         scheduleRefetchFor(state);
       }

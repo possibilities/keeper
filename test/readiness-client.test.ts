@@ -930,3 +930,273 @@ test("subscribeReadiness: non-terminal error (one collection already has a resul
 
   handle.dispose();
 });
+
+// ---------------------------------------------------------------------------
+// Multi-sub routing + 500ms-refetch-removal coverage (fn-632.2)
+//
+// The server-side multi-sub refactor (fn-632.1) added `id?: string` to
+// `patch`/`meta` frames so a connection carrying N concurrent subs can
+// route each frame back to the originating sub. The client-side change
+// here is two-part: (1) id-first routing on result/patch/meta with a
+// fall-through to collection lookup (legacy server compat), (2) drop
+// the 500ms steady-poll refetch backstop — patch/meta drive freshness
+// now, the poll loop is slow-flight detection only.
+// ---------------------------------------------------------------------------
+
+function patchFrame(
+  collection: string,
+  id: string | undefined,
+  rev = 2,
+): ServerFrame {
+  return {
+    type: "patch",
+    ...(id === undefined ? {} : { id }),
+    collection,
+    rev,
+    row: { epic_id: "irrelevant" },
+  };
+}
+
+function metaFrameWithId(
+  collection: string,
+  id: string | undefined,
+  rev = 2,
+): ServerFrame {
+  return {
+    type: "meta",
+    ...(id === undefined ? {} : { id }),
+    collection,
+    rev,
+    total: 0,
+  };
+}
+
+test("subscribeReadiness: id-first routing — patch{id} triggers a refetch on the matching sub", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-idroute",
+    onSnapshot: () => {
+      /* ignore */
+    },
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  // Resolve the four initial queries so subsequent in-flight tracking
+  // is clean — refetch coalesce is exercised here, not first-paint.
+  expect(sock.takeOutbound()).toHaveLength(4);
+  sock.deliver([
+    emptyResult("epics", "test-idroute-epics"),
+    emptyResult("jobs", "test-idroute-jobs"),
+    emptyResult("subagent_invocations", "test-idroute-subagent-invocations"),
+    emptyResult("git", "test-idroute-git"),
+  ]);
+  sock.takeOutbound();
+
+  // A `patch` carrying ONLY the sub id (no collection match needed) is
+  // routed via bySubId to the epics state. Verify by asserting exactly
+  // ONE follow-up query is emitted, and it targets the `epics`
+  // collection.
+  sock.deliver([patchFrame("epics", "test-idroute-epics", 3)]);
+  const follow = sock.takeOutbound();
+  expect(follow).toHaveLength(1);
+  expect((follow[0] as { collection: string }).collection).toBe("epics");
+  expect((follow[0] as { id: string }).id).toBe("test-idroute-epics");
+
+  handle.dispose();
+});
+
+test("subscribeReadiness: legacy server compat — patch with no id falls back to byCollection routing", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-legacy",
+    onSnapshot: () => {
+      /* ignore */
+    },
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  expect(sock.takeOutbound()).toHaveLength(4);
+  sock.deliver([
+    emptyResult("epics", "test-legacy-epics"),
+    emptyResult("jobs", "test-legacy-jobs"),
+    emptyResult("subagent_invocations", "test-legacy-subagent-invocations"),
+    emptyResult("git", "test-legacy-git"),
+  ]);
+  sock.takeOutbound();
+
+  // A `patch` WITHOUT `id` (legacy single-sub server) is routed by
+  // collection — `frame.id === undefined` short-circuits the bySubId
+  // lookup, then byCollection.get("jobs") resolves the jobs state.
+  sock.deliver([patchFrame("jobs", undefined, 4)]);
+  const follow = sock.takeOutbound();
+  expect(follow).toHaveLength(1);
+  expect((follow[0] as { collection: string }).collection).toBe("jobs");
+
+  // Same for `meta` — legacy servers emit neither id, and the
+  // collection lookup is the only routable signal.
+  sock.deliver([metaFrameWithId("git", undefined, 5)]);
+  const follow2 = sock.takeOutbound();
+  expect(follow2).toHaveLength(1);
+  expect((follow2[0] as { collection: string }).collection).toBe("git");
+
+  handle.dispose();
+});
+
+test("subscribeReadiness: reconnect re-issues queries with the same stable subIds", async () => {
+  // Build a multi-connect factory so the helper's reconnect loop can
+  // hand a second mock socket on the second `connectOnce()` pass.
+  let connectCount = 0;
+  const socketRefs: { current: MockSocket | null }[] = [];
+  const factory: ConnectFactory = async (_path, handlers) => {
+    connectCount += 1;
+    let resolveDone: (() => void) | null = null;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const sock: MockSocket = {
+      outbound: [],
+      ended: false,
+      handlers,
+      write(data: string): void {
+        sock.outbound.push(data);
+      },
+      end(): void {
+        sock.ended = true;
+        resolveDone?.();
+        resolveDone = null;
+      },
+      deliver(frames: ServerFrame[]): void {
+        const payload = frames.map(encodeFrame).join("");
+        sock.handlers.data(sock, Buffer.from(payload, "utf8"));
+      },
+      closeFromServer(): void {
+        sock.handlers.close();
+        resolveDone?.();
+        resolveDone = null;
+      },
+      takeOutbound(): unknown[] {
+        const parsed = sock.outbound.map((line) => {
+          const trimmed = line.endsWith("\n") ? line.slice(0, -1) : line;
+          return JSON.parse(trimmed);
+        });
+        sock.outbound.length = 0;
+        return parsed;
+      },
+    };
+    const ref: { current: MockSocket | null } = { current: sock };
+    socketRefs.push(ref);
+    handlers.open(sock);
+    await done;
+    return sock;
+  };
+
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-reconnect",
+    onSnapshot: () => {
+      /* ignore — first-paint isn't reached, no results delivered */
+    },
+    connect: factory,
+  });
+
+  const sock1 = socketRefs[0]?.current;
+  if (!sock1) {
+    throw new Error("mock socket #1 never installed");
+  }
+  const initial1 = sock1.takeOutbound();
+  expect(initial1).toHaveLength(4);
+  const initialIds1 = initial1.map((f) => (f as { id: string }).id).sort();
+  expect(initialIds1).toEqual([
+    "test-reconnect-epics",
+    "test-reconnect-git",
+    "test-reconnect-jobs",
+    "test-reconnect-subagent-invocations",
+  ]);
+
+  // Force a close so `connectWithRetry` re-runs `connectOnce` and
+  // re-fires the open handler against a fresh socket.
+  sock1.closeFromServer();
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+  expect(connectCount).toBe(2);
+  const sock2 = socketRefs[1]?.current;
+  if (!sock2) {
+    throw new Error("mock socket #2 never installed");
+  }
+  const initial2 = sock2.takeOutbound();
+  expect(initial2).toHaveLength(4);
+  const initialIds2 = initial2.map((f) => (f as { id: string }).id).sort();
+  // EXACT same subIds — they're constants in subscribeReadiness, and the
+  // states[] list is built once at the top of the helper and reused
+  // verbatim across reconnects. This is the invariant that lets the
+  // server rebuild the same subs by id post-reconnect.
+  expect(initialIds2).toEqual(initialIds1);
+
+  handle.dispose();
+});
+
+test("subscribeReadiness: pollAll no longer schedules per-state refetches — freshness is patch-driven only", () => {
+  const harness = installTimerHarness();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-no-poll-refetch",
+      onSnapshot: () => {
+        /* ignore */
+      },
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+    sock.takeOutbound();
+
+    // Resolve all four initial queries so every state has gotResult and
+    // queryInFlight cleared. With the second-pass refetch removed,
+    // pollAll over a fully-resolved state list should fire ZERO new
+    // outbound writes.
+    sock.deliver([
+      emptyResult("epics", "test-no-poll-refetch-epics"),
+      emptyResult("jobs", "test-no-poll-refetch-jobs"),
+      emptyResult(
+        "subagent_invocations",
+        "test-no-poll-refetch-subagent-invocations",
+      ),
+      emptyResult("git", "test-no-poll-refetch-git"),
+    ]);
+    sock.takeOutbound();
+
+    // Advance well past POLL_MS (500) and fire the poll handler several
+    // times. If the legacy second pass still existed it would write 4
+    // refetch queries per tick — assert zero writes across multiple
+    // poll ticks.
+    harness.advance(600);
+    harness.pollHandler()();
+    harness.advance(600);
+    harness.pollHandler()();
+    harness.advance(600);
+    harness.pollHandler()();
+    expect(sock.outbound).toHaveLength(0);
+
+    // …but a patch arrival STILL drives a refetch (the legitimate
+    // freshness path the poll-loop refetch used to backstop).
+    sock.deliver([patchFrame("epics", "test-no-poll-refetch-epics", 2)]);
+    expect(sock.takeOutbound()).toHaveLength(1);
+
+    handle.dispose();
+  } finally {
+    harness.restore();
+  }
+});

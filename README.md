@@ -678,12 +678,18 @@ Readiness is a client-side library today, not a server-side collection.
 `scripts/board.ts` and `scripts/autopilot.ts` via the
 `src/readiness-client.ts` helper, which subscribes to the three input
 collections (`epics`, `jobs`, `subagent_invocations`) and runs
-`computeReadiness` per emit. A server-side `readiness` projection
-(synthetic-event recompute, persisted verdict map, diffed over the wire
-like the other collections) is a natural future extension and
-intentionally out of scope here — the inputs are already on the wire,
-so the helper-in-`src/` design preserves the option without paying its
-cost today.
+`computeReadiness` per emit. Each per-collection state carries a stable
+constant `subId` (`${idPrefix}-<collection>`) that the helper sends on
+every `query` frame and uses to route inbound `patch`/`meta` frames
+back to the originating state via a `bySubId` map — collection lookup
+is the legacy-server fallback. Freshness is patch-driven: the poll
+loop is slow-flight detection only (1 s lifecycle warning, 5 s
+reconnect), no steady-poll refetch backstop. A server-side `readiness`
+projection (synthetic-event recompute, persisted verdict map, diffed
+over the wire like the other collections) is a natural future
+extension and intentionally out of scope here — the inputs are already
+on the wire, so the helper-in-`src/` design preserves the option
+without paying its cost today.
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).
