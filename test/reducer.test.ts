@@ -326,14 +326,14 @@ test("GitSnapshot fans out git counts into jobs and the embedded jobs[] array", 
     tool_name: "Write",
     session_id: "sess-worker",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "PostToolUse",
     tool_name: "Edit",
     session_id: "sess-worker",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "src/b.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/b.ts" } }),
   });
 
   const snapshotId = insertEvent({
@@ -416,7 +416,7 @@ test("GitSnapshot UPDATE matches zero rows for a job with no SessionStart yet (s
     tool_name: "Write",
     session_id: "sess-never-started",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   const snapshotId = insertEvent({
     hook_event: "GitSnapshot",
@@ -470,21 +470,21 @@ test("GitRootDropped zeroes git counts via the canonical attribution; unrelated 
     tool_name: "Write",
     session_id: "sess-a",
     cwd: "/repo-a",
-    data: JSON.stringify({ tool_input: { file_path: "x.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo-a/x.ts" } }),
   });
   insertEvent({
     hook_event: "PostToolUse",
     tool_name: "Write",
     session_id: "sess-b",
     cwd: "/repo-b",
-    data: JSON.stringify({ tool_input: { file_path: "p.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo-b/p.ts" } }),
   });
   insertEvent({
     hook_event: "PostToolUse",
     tool_name: "Write",
     session_id: "sess-b",
     cwd: "/repo-b",
-    data: JSON.stringify({ tool_input: { file_path: "q.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo-b/q.ts" } }),
   });
 
   insertEvent({
@@ -594,7 +594,7 @@ test("GitSnapshot attribution pass 1: tool Write mints a file_attributions row",
     session_id: "sess-a",
     cwd: "/repo",
     ts: 100,
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -626,21 +626,21 @@ test("GitSnapshot attribution pass 1: Edit, MultiEdit, NotebookEdit all mint att
     tool_name: "Edit",
     session_id: "sess-a",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "edit.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/edit.ts" } }),
   });
   insertEvent({
     hook_event: "PostToolUse",
     tool_name: "MultiEdit",
     session_id: "sess-a",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "multi.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/multi.ts" } }),
   });
   insertEvent({
     hook_event: "PostToolUse",
     tool_name: "NotebookEdit",
     session_id: "sess-a",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "nb.ipynb" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/nb.ipynb" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -703,7 +703,7 @@ test("GitSnapshot attribution pass 1: bash mutation lands a 'bash'-source row", 
       upstream: null,
       ahead: null,
       behind: null,
-      dirty_files: [{ path: "/repo/del.ts", xy: " D", mtime_ms: null }],
+      dirty_files: [{ path: "del.ts", xy: " D", mtime_ms: null }],
     }),
   });
   drainAll();
@@ -711,7 +711,7 @@ test("GitSnapshot attribution pass 1: bash mutation lands a 'bash'-source row", 
     .query(
       "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
     )
-    .get("/repo", "sess-a", "/repo/del.ts") as {
+    .get("/repo", "sess-a", "del.ts") as {
     op: string;
     source: string;
   } | null;
@@ -732,14 +732,14 @@ test("GitSnapshot multi-attribution: two sessions touch the same file → both r
     tool_name: "Write",
     session_id: "sess-a",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "PostToolUse",
     tool_name: "Write",
     session_id: "sess-b",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -813,7 +813,7 @@ test("GitSnapshot multi-attribution: tool + bash on the same file → bash-sourc
       upstream: null,
       ahead: null,
       behind: null,
-      dirty_files: [{ path: "/repo/x.ts", xy: " D", mtime_ms: null }],
+      dirty_files: [{ path: "x.ts", xy: " D", mtime_ms: null }],
     }),
   });
   drainAll();
@@ -821,7 +821,7 @@ test("GitSnapshot multi-attribution: tool + bash on the same file → bash-sourc
     .query(
       "SELECT op, source, last_mutation_at FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
     )
-    .get("/repo", "sess-a", "/repo/x.ts") as {
+    .get("/repo", "sess-a", "x.ts") as {
     op: string;
     source: string;
     last_mutation_at: number;
@@ -843,7 +843,7 @@ test("GitSnapshot discharge rule: a session that committed AFTER its mutation dr
     session_id: TEST_UUID,
     cwd: "/repo",
     ts: 100,
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   // GitSnapshot first to create the file_attributions row.
   insertEvent({
@@ -921,7 +921,7 @@ test("GitSnapshot re-discharge: mutate → commit → re-mutate → file back in
     session_id: TEST_UUID,
     cwd: "/repo",
     ts: 100,
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -959,7 +959,7 @@ test("GitSnapshot re-discharge: mutate → commit → re-mutate → file back in
     session_id: TEST_UUID,
     cwd: "/repo",
     ts: 300,
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -1000,7 +1000,7 @@ test("GitSnapshot global discharge: NULL committer clears every session's attrib
     session_id: TEST_UUID,
     cwd: "/repo",
     ts: 100,
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "PostToolUse",
@@ -1008,7 +1008,7 @@ test("GitSnapshot global discharge: NULL committer clears every session's attrib
     session_id: TEST_UUID_2,
     cwd: "/repo",
     ts: 110,
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -1137,7 +1137,7 @@ test("GitSnapshot inferred attribution: skipped when explicit attribution exists
     session_id: "sess-a",
     cwd: "/repo",
     ts: 80,
-    data: JSON.stringify({ tool_input: { file_path: "build/out.o" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/build/out.o" } }),
   });
   insertEvent({
     hook_event: "PreToolUse",
@@ -1326,7 +1326,7 @@ test("GitSnapshot unattributed-to-live: file attributed only to ENDED session �
     tool_name: "Write",
     session_id: "sess-a",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({ hook_event: "SessionEnd", session_id: "sess-a" });
   insertEvent({
@@ -1369,7 +1369,7 @@ test("GitSnapshot rename: orig_path matches the historical mutation event", () =
     tool_name: "Write",
     session_id: "sess-a",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "old.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/old.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -1412,7 +1412,7 @@ test("GitSnapshot dirty_files[].attributions[] carries title + state from jobs r
     tool_name: "Write",
     session_id: "sess-a",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -1459,7 +1459,7 @@ test("GitSnapshot newest-wins: two mutations on same file by same session → la
     session_id: "sess-a",
     cwd: "/repo",
     ts: 100,
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "PostToolUse",
@@ -1467,7 +1467,7 @@ test("GitSnapshot newest-wins: two mutations on same file by same session → la
     session_id: "sess-a",
     cwd: "/repo",
     ts: 200,
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -1503,7 +1503,7 @@ test("GitSnapshot project isolation: file in /repo-a does not affect /repo-b's a
     tool_name: "Write",
     session_id: "sess-a",
     cwd: "/repo-a",
-    data: JSON.stringify({ tool_input: { file_path: "shared.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo-a/shared.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -1520,15 +1520,14 @@ test("GitSnapshot project isolation: file in /repo-a does not affect /repo-b's a
     }),
   });
   drainAll();
-  // The tool mutation matches by path regardless of cwd (the deriver
-  // pass walks ALL mutation events with that file_path) — so the
-  // attribution row DOES land in /repo-b. This is a known cross-
-  // worktree leakage (the spec acknowledges it; the planner can fix
-  // it in a follow-up by gating on cwd in pass 1).
+  // Repo-anchored matching (fn-633 path-canonicalization fix): pass 1
+  // builds the candidate as `<project_dir>/<file.path>`, so a /repo-b
+  // snapshot probes for `/repo-b/shared.ts` and never matches sess-a's
+  // `/repo-a/shared.ts` mutation. The cross-worktree leak the original
+  // fn-633 shipped (where the bare relative path matched across repos) is
+  // closed — no attribution row lands in /repo-b.
   const row = getAttribution("/repo-b", "sess-a", "shared.ts");
-  expect(row).not.toBeUndefined();
-  // The corollary: a project-A retract does NOT touch project-B. The
-  // composite PK includes project_dir.
+  expect(row).toBeNull();
 });
 
 test("GitSnapshot re-fold determinism over a full attribution lifecycle", () => {
@@ -1542,7 +1541,7 @@ test("GitSnapshot re-fold determinism over a full attribution lifecycle", () => 
     session_id: TEST_UUID,
     cwd: "/repo",
     ts: 100,
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -1579,7 +1578,7 @@ test("GitSnapshot re-fold determinism over a full attribution lifecycle", () => 
     session_id: TEST_UUID,
     cwd: "/repo",
     ts: 300,
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -1640,7 +1639,7 @@ test("GitSnapshot retract DELETEs file_attributions rows AND zeroes per-job coun
     tool_name: "Write",
     session_id: "sess-a",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/a.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",
@@ -1720,7 +1719,7 @@ test("from-scratch re-fold reproduces the GitSnapshot fan-out byte-identically",
     tool_name: "Write",
     session_id: "sess-w",
     cwd: "/repo",
-    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
   });
   insertEvent({
     hook_event: "GitSnapshot",

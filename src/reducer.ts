@@ -1030,13 +1030,27 @@ interface SessionMutation {
 
 function findExplicitAttributions(
   db: Database,
+  projectDir: string,
   file: ReducerDirtyFile,
 ): SessionMutation[] {
-  // Build the candidate path list: `path` plus optional `orig_path` (for
-  // renames, the historical mutation events targeted the OLD name).
-  const paths: string[] = [file.path];
+  // Build the candidate path list as ABSOLUTE paths anchored on
+  // `projectDir`. The derivers store mutation targets absolutely
+  // (`tool_input.file_path` is absolute; bash targets are absolutized
+  // against cwd via `resolveAgainstCwd`), whereas `file.path` from the git
+  // snapshot is repo-relative — so we must lexically join them here before
+  // the equality probe. This is exactly the canonicalization the deriver
+  // docstring defers to "the reducer's attribution pass". Lexical join only
+  // (no `path.resolve`, no symlink walk) to preserve re-fold determinism.
+  // Repo-anchoring keeps the match precise: a bare relative basename could
+  // collide with a same-named file in another repo, so we never probe the
+  // bare relative form. (`orig_path` covers the rename case — the historical
+  // mutation events targeted the OLD name.)
+  const trimmedRoot = projectDir.endsWith("/")
+    ? projectDir.slice(0, -1)
+    : projectDir;
+  const paths: string[] = [`${trimmedRoot}/${file.path}`];
   if (file.orig_path != null && file.orig_path !== file.path) {
-    paths.push(file.orig_path);
+    paths.push(`${trimmedRoot}/${file.orig_path}`);
   }
 
   const perSession = new Map<string, SessionMutation>();
@@ -1314,7 +1328,7 @@ function projectGitStatus(db: Database, event: Event): void {
        WHERE excluded.last_mutation_at > file_attributions.last_mutation_at`,
   );
   for (const file of snapshot.dirty_files) {
-    const explicit = findExplicitAttributions(db, file);
+    const explicit = findExplicitAttributions(db, projectDir, file);
     for (const m of explicit) {
       upsertStmt.run(
         projectDir,
