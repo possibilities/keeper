@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-28T15:05:45.647176Z",
+  "depends_on": [
+    "fn-633-git-per-session-file-attribution.2"
+  ],
+  "epic": "fn-633-git-per-session-file-attribution",
+  "id": "fn-633-git-per-session-file-attribution.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Bash mutation hook deriver and backfill",
+  "updated_at": "2026-05-28T15:05:45.647176Z"
+}
