@@ -919,16 +919,23 @@ function extractGitSnapshot(event: Event): GitSnapshotPayload | null {
  * even though the original producer observed mutable filesystem state.
  *
  * Schema-v28 fan-out: in addition to writing the `git_status` row, this arm
- * stamps `(git_dirty_count, git_orphan_count)` onto every job enumerated in
- * `snapshot.jobs[]`. `git_dirty_count` is per-job (the GitJobView's own
- * `dirty.length`); `git_orphan_count` is the project-wide
- * `snapshot.orphaned_files.length` broadcast onto every enumerated job
- * (per-project, not per-job). Each updated jobs row is then re-fanned via
- * `syncJobIntoEpic` so the embedded `jobs[]` arrays on the parent epic /
- * task element pick up the new counts. All of this runs inside the same
- * `BEGIN IMMEDIATE` transaction opened by `applyEvent` — exactly-once-per
- * -event holds across both projections (the `git_status` write + the
+ * stamps `(git_dirty_count, git_unattributed_to_live_count)` onto every job
+ * enumerated in `snapshot.jobs[]`. `git_dirty_count` is per-job (the
+ * GitJobView's own `dirty.length`); `git_unattributed_to_live_count` is the
+ * project-wide `snapshot.orphaned_files.length` broadcast onto every
+ * enumerated job (per-project, not per-job). Each updated jobs row is then
+ * re-fanned via `syncJobIntoEpic` so the embedded `jobs[]` arrays on the
+ * parent epic / task element pick up the new counts. All of this runs inside
+ * the same `BEGIN IMMEDIATE` transaction opened by `applyEvent` — exactly-
+ * once-per-event holds across both projections (the `git_status` write + the
  * jobs/epics fan-out).
+ *
+ * Schema-v31 note: the column written here was renamed from the legacy
+ * `jobs.git_orphan_count` to `jobs.git_unattributed_to_live_count`; the
+ * numeric value, the producer source, and the semantic are unchanged. The
+ * NEW `jobs.git_orphan_count` (strict-mystery: files with no attribution
+ * from any session) lands its fold in fn-633.6 and stays at the schema
+ * default of `0` until that task ships.
  *
  * The from-scratch re-fold sees every historical `GitSnapshot` event in
  * order and re-derives the same counts byte-identically; the `INSERT OR
@@ -996,7 +1003,7 @@ function projectGitStatus(db: Database, event: Event): void {
     // and the UPDATE matches zero rows. The next snapshot after
     // SessionStart lands the counts.
     db.run(
-      "UPDATE jobs SET git_dirty_count = ?, git_orphan_count = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
+      "UPDATE jobs SET git_dirty_count = ?, git_unattributed_to_live_count = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
       [jobDirty, projectOrphans, event.id, event.ts, jobId],
     );
     // Re-fan into the embedded `jobs[]` arrays — `syncIfPlanRef` reads the
@@ -1021,12 +1028,18 @@ function projectGitStatus(db: Database, event: Event): void {
  * Schema-v28 symmetric clear: before the DELETE, read the soon-to-be-dropped
  * row's persisted `git_status.jobs` JSON to enumerate the job_ids the last
  * fan-out stamped, then zero each one's `git_dirty_count` /
- * `git_orphan_count` and re-emit the `syncJobIntoEpic` fan-out so the
- * embedded arrays clear in lockstep. Canonical attribution: the SAME
+ * `git_unattributed_to_live_count` and re-emit the `syncJobIntoEpic` fan-out
+ * so the embedded arrays clear in lockstep. Canonical attribution: the SAME
  * `jobs[]` enumeration that the write side fanned over is the enumeration
  * the clear walks — symmetric write/clear keeps an unrelated project's
  * jobs (running in another worktree) untouched. All inside the open
  * transaction.
+ *
+ * Schema-v31 note: the column cleared here was renamed from the legacy
+ * `jobs.git_orphan_count` to `jobs.git_unattributed_to_live_count`; the
+ * NEW `jobs.git_orphan_count` (strict-mystery) is unaffected by this retract
+ * until its fold lands in fn-633.6, at which point this clear will be
+ * widened to zero both columns symmetrically.
  */
 function retractGitStatus(db: Database, event: Event): void {
   const projectDir = event.session_id;
@@ -1056,7 +1069,7 @@ function retractGitStatus(db: Database, event: Event): void {
         continue;
       }
       db.run(
-        "UPDATE jobs SET git_dirty_count = 0, git_orphan_count = 0, last_event_id = ?, updated_at = ? WHERE job_id = ?",
+        "UPDATE jobs SET git_dirty_count = 0, git_unattributed_to_live_count = 0, last_event_id = ?, updated_at = ? WHERE job_id = ?",
         [event.id, event.ts, jobId],
       );
       syncIfPlanRef(db, jobId, event.id, event.ts);
@@ -1606,13 +1619,20 @@ interface EmbeddedJobElement {
   last_api_error_kind: string | null;
   last_input_request_at: number | null;
   last_input_request_kind: string | null;
-  // Schema v28: per-job dirty-file count + project-wide orphan-file count
-  // (broadcast onto every job in the snapshot). Both INTEGER NOT NULL
-  // DEFAULT 0 on the underlying `jobs` row, so the read-side mirror is plain
-  // `number` (never null). Drives the readiness pipeline's `git-uncommitted`
-  // / `git-orphans` predicates via the embedded array on the parent
-  // task / epic element.
+  // Schema v28: per-job dirty-file count. INTEGER NOT NULL DEFAULT 0 on the
+  // underlying `jobs` row, so the read-side mirror is plain `number` (never
+  // null). Drives the readiness pipeline's `git-uncommitted` predicate via
+  // the embedded array on the parent task / epic element.
   git_dirty_count: number;
+  // Schema v31: renamed from the legacy v28 `git_orphan_count`. Same
+  // numeric value, same fold, same zero-event reading; the rename carries
+  // through every embedded array via `buildEmbeddedJob`. Drives the
+  // readiness pipeline's `git-orphans` predicate after fn-633.6 flips the
+  // consumer.
+  git_unattributed_to_live_count: number;
+  // Schema v31: NEW column for the strict-mystery semantic (files with no
+  // attribution from any session). Reads 0 on every entry until the
+  // reducer fold rewrite in fn-633.6 lands. INTEGER NOT NULL DEFAULT 0.
   git_orphan_count: number;
 }
 
@@ -1640,6 +1660,11 @@ interface JobsRowForSync {
   last_input_request_at: number | null;
   last_input_request_kind: string | null;
   git_dirty_count: number;
+  // Schema v31: renamed from `git_orphan_count` — carries the legacy v28
+  // semantic ("files-not-attributed-to-a-live-session") under the new
+  // vocabulary.
+  git_unattributed_to_live_count: number;
+  // Schema v31: new strict-mystery column.
   git_orphan_count: number;
 }
 
@@ -1703,6 +1728,7 @@ function buildEmbeddedJob(row: JobsRowForSync): EmbeddedJobElement {
     last_input_request_at: row.last_input_request_at,
     last_input_request_kind: row.last_input_request_kind,
     git_dirty_count: row.git_dirty_count,
+    git_unattributed_to_live_count: row.git_unattributed_to_live_count,
     git_orphan_count: row.git_orphan_count,
   };
 }
@@ -1922,7 +1948,7 @@ function syncIfPlanRef(
 ): void {
   const row = db
     .query(
-      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, git_dirty_count, git_orphan_count FROM jobs WHERE job_id = ?",
+      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
     )
     .get(jobId) as JobsRowForSync | null;
   if (row == null) {

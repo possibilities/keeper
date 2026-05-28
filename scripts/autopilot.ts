@@ -381,7 +381,11 @@ export function renderEpicCommandsFiltered(
 //   - `plan_verb === "close"`   → owning epic's `status        = "done"`
 //   - `plan_verb === "approve"` → owning row's `approval       = "approved"`
 //   In every case the job's own `state` is stamped `"ended"` AND its
-//   `git_dirty_count` / `git_orphan_count` are zeroed — the sim models a
+//   `git_dirty_count` / `git_unattributed_to_live_count` / `git_orphan_count`
+//   are zeroed (schema v31 split the legacy `git_orphan_count` into the
+//   renamed-and-preserved `git_unattributed_to_live_count` and the new
+//   strict-mystery `git_orphan_count`; the sim zeroes BOTH so a future
+//   predicate-6.5 source flip is covered symmetrically) — the sim models a
 //   worker that finishes AND commits before going idle, so predicate 6.5
 //   (git-uncommitted / git-orphans) does not fire in `futureReadiness`
 //   and mask the post-completion approve prediction. If the worker
@@ -590,7 +594,13 @@ export function predictNextDispatches(
     const simEpicJobs = epicTouched
       ? epicJobs.map((j) =>
           j.state === "working"
-            ? { ...j, state: "ended", git_dirty_count: 0, git_orphan_count: 0 }
+            ? {
+                ...j,
+                state: "ended",
+                git_dirty_count: 0,
+                git_unattributed_to_live_count: 0,
+                git_orphan_count: 0,
+              }
             : j,
         )
       : epicJobs;
@@ -631,7 +641,13 @@ export function predictNextDispatches(
         approval: simApproval,
         jobs: taskJobs.map((j) =>
           j.state === "working"
-            ? { ...j, state: "ended", git_dirty_count: 0, git_orphan_count: 0 }
+            ? {
+                ...j,
+                state: "ended",
+                git_dirty_count: 0,
+                git_unattributed_to_live_count: 0,
+                git_orphan_count: 0,
+              }
             : j,
         ),
       };

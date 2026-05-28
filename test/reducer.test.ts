@@ -324,18 +324,24 @@ test("GitSnapshot fans out git counts into jobs and the embedded jobs[] array", 
 
   expect(drainAll()).toBe(3);
 
-  // jobs row carries per-job dirty count + project-broadcast orphan count.
+  // jobs row carries per-job dirty count + project-broadcast unattributed
+  // -to-live count (schema v31 renamed the legacy `git_orphan_count` to
+  // `git_unattributed_to_live_count`; the new `git_orphan_count` carries the
+  // strict-mystery semantic populated by the task-6 reducer fold, so it
+  // stays at the default `0` here).
   const row = db
     .query(
-      "SELECT git_dirty_count, git_orphan_count FROM jobs WHERE job_id = ?",
+      "SELECT git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
     )
     .get("sess-worker") as {
     git_dirty_count: number;
+    git_unattributed_to_live_count: number;
     git_orphan_count: number;
   } | null;
   expect(row).not.toBeNull();
   expect(row?.git_dirty_count).toBe(2);
-  expect(row?.git_orphan_count).toBe(1);
+  expect(row?.git_unattributed_to_live_count).toBe(1);
+  expect(row?.git_orphan_count).toBe(0);
 
   // Embedded task element's jobs[] carries the same counts.
   const epicRow = db
@@ -347,6 +353,7 @@ test("GitSnapshot fans out git counts into jobs and the embedded jobs[] array", 
     jobs: Array<{
       job_id: string;
       git_dirty_count: number;
+      git_unattributed_to_live_count: number;
       git_orphan_count: number;
     }>;
   }>;
@@ -355,7 +362,8 @@ test("GitSnapshot fans out git counts into jobs and the embedded jobs[] array", 
   const embeddedJob = task?.jobs.find((j) => j.job_id === "sess-worker");
   expect(embeddedJob).not.toBeUndefined();
   expect(embeddedJob?.git_dirty_count).toBe(2);
-  expect(embeddedJob?.git_orphan_count).toBe(1);
+  expect(embeddedJob?.git_unattributed_to_live_count).toBe(1);
+  expect(embeddedJob?.git_orphan_count).toBe(0);
 
   expect(getCursor()).toBe(snapshotId);
 });
@@ -460,28 +468,35 @@ test("GitRootDropped zeroes git counts via the canonical attribution; unrelated 
 
   expect(drainAll()).toBe(5);
 
-  // sess-a counts cleared by the symmetric clear.
+  // sess-a counts cleared by the symmetric clear. Schema v31 renamed the
+  // legacy `git_orphan_count` to `git_unattributed_to_live_count`; the
+  // retract zeroes the renamed column (the strict-mystery `git_orphan_count`
+  // stays at 0 by schema default in this build — its fold lands in fn-633.6).
   const rowA = db
     .query(
-      "SELECT git_dirty_count, git_orphan_count FROM jobs WHERE job_id = ?",
+      "SELECT git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
     )
     .get("sess-a") as {
     git_dirty_count: number;
+    git_unattributed_to_live_count: number;
     git_orphan_count: number;
   } | null;
   expect(rowA?.git_dirty_count).toBe(0);
+  expect(rowA?.git_unattributed_to_live_count).toBe(0);
   expect(rowA?.git_orphan_count).toBe(0);
 
   // sess-b in the other project stays untouched.
   const rowB = db
     .query(
-      "SELECT git_dirty_count, git_orphan_count FROM jobs WHERE job_id = ?",
+      "SELECT git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
     )
     .get("sess-b") as {
     git_dirty_count: number;
+    git_unattributed_to_live_count: number;
     git_orphan_count: number;
   } | null;
   expect(rowB?.git_dirty_count).toBe(2);
+  expect(rowB?.git_unattributed_to_live_count).toBe(0);
   expect(rowB?.git_orphan_count).toBe(0);
 
   expect(getCursor()).toBe(dropId);

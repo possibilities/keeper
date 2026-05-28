@@ -459,12 +459,33 @@ export interface Job {
    */
   git_dirty_count: number;
   /**
-   * Project-wide orphan-file count (schema v28) —
-   * `snapshot.orphaned_files.length` from the latest `GitSnapshot`,
-   * broadcast onto every job enumerated in that snapshot's `jobs[]`. 0 on
-   * every job a snapshot has never enumerated, 0 after a `GitRootDropped`
-   * retraction zeroes the canonical-attribution enumeration. Drives the
-   * readiness pipeline's `git-orphans` predicate.
+   * Project-wide files-not-attributed-to-a-live-session count (schema v31
+   * rename of the legacy v28 `git_orphan_count` column — see the v30→v31
+   * ALTER block in `src/db.ts` for the full rename rationale). Holds the
+   * SAME semantic the v28 column carried: files dirty in the worktree that
+   * no LIVE session was the canonical attribution for at snapshot time.
+   * Under the new vocabulary this is the live-attribution gap; under the
+   * old vocabulary it was called "orphan". The numeric value, the
+   * populating fold (the existing `projectGitStatus` arm; rewritten in
+   * fn-633.6 to maintain the new file-centric attribution), and the
+   * zero-event reading (0 on every never-snapshotted job, 0 after a
+   * `GitRootDropped` retraction) all carry through the rename unchanged.
+   * Drives the readiness pipeline's `git-orphans` predicate after task .6
+   * flips the consumer to the renamed column.
+   */
+  git_unattributed_to_live_count: number;
+  /**
+   * Project-wide strict-mystery file count (schema v31 — new column under
+   * the file-attribution rewrite). Files dirty in the worktree that have
+   * NO attribution from ANY session (past or present — no mutation events
+   * recorded against the file from any tracked session). Populated by the
+   * reducer's `projectGitStatus` rewrite in fn-633.6; until that task
+   * lands, the column reads `0` on every row (the DEFAULT). 0 on every
+   * job a snapshot has never enumerated, 0 after a `GitRootDropped`
+   * retraction zeroes the canonical-attribution enumeration. The
+   * historical "orphan" name is preserved here under its new strict-
+   * mystery meaning so future consumers reading "git_orphan_count" land
+   * on the more honest semantic without code churn.
    */
   git_orphan_count: number;
 }
@@ -549,11 +570,20 @@ export interface EmbeddedJob {
    */
   git_dirty_count: number;
   /**
-   * Mirrors {@link Job.git_orphan_count} (schema v28) — project-wide
-   * orphan-file count broadcast onto every job enumerated in the snapshot.
-   * 0 on every entry a `GitSnapshot` has never enumerated. Drives the
-   * readiness pipeline's `git-orphans` predicate via the embedded array on
-   * the parent task element.
+   * Mirrors {@link Job.git_unattributed_to_live_count} (schema v31 — renamed
+   * from the legacy v28 `git_orphan_count` column). Same numeric value,
+   * same fold, same zero-event reading; the rename carries through to
+   * every embedded array via the `buildEmbeddedJob` helper in
+   * `src/reducer.ts`. Drives the readiness pipeline's `git-orphans`
+   * predicate via the embedded array on the parent task element after
+   * fn-633.6 flips the consumer.
+   */
+  git_unattributed_to_live_count: number;
+  /**
+   * Mirrors {@link Job.git_orphan_count} (schema v31 — new column under
+   * the file-attribution rewrite). Strict-mystery file count for the
+   * project; reads 0 on every entry until the reducer fold rewrite in
+   * fn-633.6 lands.
    */
   git_orphan_count: number;
 }

@@ -103,6 +103,7 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     last_input_request_at: null,
     last_input_request_kind: null,
     git_dirty_count: 0,
+    git_unattributed_to_live_count: 0,
     git_orphan_count: 0,
     ...overrides,
   };

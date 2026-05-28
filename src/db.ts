@@ -53,7 +53,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 30;
+export const SCHEMA_VERSION = 31;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -295,7 +295,9 @@ CREATE TABLE IF NOT EXISTS events (
     planctl_subject_present INTEGER,
     tool_use_id TEXT,
     config_dir TEXT,
-    planctl_queue_jump INTEGER
+    planctl_queue_jump INTEGER,
+    bash_mutation_kind TEXT,
+    bash_mutation_targets TEXT
 )
 `;
 
@@ -495,6 +497,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_input_request_kind TEXT,
     config_dir TEXT,
     git_dirty_count INTEGER NOT NULL DEFAULT 0,
+    git_unattributed_to_live_count INTEGER NOT NULL DEFAULT 0,
     git_orphan_count INTEGER NOT NULL DEFAULT 0
 )
 `;
@@ -568,6 +571,114 @@ CREATE TABLE IF NOT EXISTS usage (
     updated_at REAL NOT NULL DEFAULT 0
 )
 `;
+
+/**
+ * Schema-v31 `file_attributions` projection table — one row per
+ * `(project_dir, session_id, file_path)` triple. Records the attribution claim
+ * that this session has at least one mutation (tool or bash) on this file in
+ * this project that has NOT been discharged by a later commit.
+ *
+ * Maintained by the reducer's `projectGitStatus` arm (task 6) inside the same
+ * `BEGIN IMMEDIATE` transaction as the `git_status` write + cursor advance, so
+ * a from-scratch re-fold rebuilds the table byte-deterministically from the
+ * immutable event log. The discharge rule lives in this column shape: a row
+ * exists for as long as the session is on-the-hook for a still-dirty file;
+ * `last_commit_at` advances past `last_mutation_at` to clear the attribution
+ * (the row stays for the historical record; the readiness pass filters by the
+ * inequality), and a fresh mutation flips the same row back into the
+ * on-the-hook state by bumping `last_mutation_at` past `last_commit_at`.
+ *
+ * The composite primary key `(project_dir, session_id, file_path)` carries
+ * three orthogonal axes: the same file path under two different worktrees
+ * lands two distinct rows (different `project_dir`), and two sessions touching
+ * the same file under the same worktree land two distinct rows (different
+ * `session_id`). Both are the desired semantics — multi-attribution per file
+ * is the whole point of this epic.
+ *
+ * Field semantics:
+ * - `project_dir` (TEXT, part of PK): the git project root for this
+ *   attribution, from the `GitSnapshot` event's `project_dir` field.
+ * - `session_id` (TEXT, part of PK): the keeper job/session id whose
+ *   mutation/Bash event minted the attribution.
+ * - `file_path` (TEXT, part of PK): the path of the dirty file, normalized
+ *   relative to `project_dir` to match the git status canonical form.
+ * - `last_mutation_at` (REAL, NOT NULL): unix-seconds of the latest
+ *   mutation event from this session on this file. Bumped on every fresh
+ *   mutation (re-edits put the session back on the hook).
+ * - `last_commit_at` (REAL, nullable): unix-seconds of the most recent
+ *   `Commit` event from this session whose `files` list contains this
+ *   `file_path`. NULL while the session has never committed this file.
+ *   The readiness rule fires "attributed iff `last_commit_at IS NULL OR
+ *   last_commit_at < last_mutation_at`".
+ * - `op` (TEXT, NOT NULL): the latest mutation kind — display-only at this
+ *   layer (the reducer doesn't gate on the literal value); free-form so
+ *   future ops (Edit/Write/MultiEdit/Bash kinds) extend without a schema bump.
+ * - `source` (TEXT, NOT NULL, CHECK): provenance — `'tool'` for Edit/Write/
+ *   MultiEdit, `'bash'` for the new `bash_mutation_kind` deriver column,
+ *   `'inferred'` for time-bracket attribution against Bash event intervals.
+ *   The CHECK constraint keeps the enum honest at the storage layer.
+ * - `last_event_id` (INTEGER, nullable): the `events.id` of the latest
+ *   contributing event. Display/debug.
+ * - `updated_at` (REAL, NOT NULL, DEFAULT 0): unix-seconds of the latest
+ *   reducer write — mirrors the convention on every other projection table.
+ *
+ * Defaults match the zero-event projection: every required field has either
+ * a `NOT NULL` constraint requiring an explicit insert value, or a `DEFAULT`
+ * matching the empty state. A fresh DB with zero events has zero rows here.
+ */
+const CREATE_FILE_ATTRIBUTIONS = `
+CREATE TABLE IF NOT EXISTS file_attributions (
+    project_dir TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    last_mutation_at REAL NOT NULL,
+    last_commit_at REAL,
+    op TEXT NOT NULL,
+    source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred')),
+    last_event_id INTEGER,
+    updated_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (project_dir, session_id, file_path)
+)
+`;
+
+/**
+ * Schema-v31 indexes on `file_attributions`. Both are full (non-partial)
+ * indexes — every row is a valid attribution claim, so a partial predicate
+ * would only narrow by row-count parity (zero benefit, extra cost on inserts).
+ *
+ * - `idx_file_attributions_file (project_dir, file_path)`: serves the
+ *   per-file multi-attribution read — "all sessions on the hook for this
+ *   file in this project". Leading `project_dir` so a worktree-scoped scan
+ *   is index-served end-to-end.
+ * - `idx_file_attributions_session (session_id)`: serves the per-session
+ *   "what files am I on the hook for" read — used by the reducer's
+ *   per-job fan-out when a `GitRootDropped` retraction needs to walk every
+ *   attribution belonging to a session that was just retracted.
+ */
+const CREATE_FILE_ATTRIBUTIONS_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_file_attributions_file ON file_attributions(project_dir, file_path)",
+  "CREATE INDEX IF NOT EXISTS idx_file_attributions_session ON file_attributions(session_id)",
+];
+
+/**
+ * Schema-v31 partial index on `events.bash_mutation_kind`. Pairs with the new
+ * sparse column added in the v30→v31 ALTER block. Mirrors {@link
+ * CREATE_V10_INDEXES} structure: KEPT OUT of {@link CREATE_EVENTS_INDEXES} so
+ * the unconditional CREATE block doesn't reference a column that doesn't
+ * exist yet on a migrating v30 DB. `migrate()` runs this AFTER the matching
+ * ADD COLUMN in the v30→v31 block; a fresh v31 DB picks it up via the same
+ * block (the `addColumnIfMissing` no-ops on the freshly CREATE'd table).
+ *
+ * `WHERE bash_mutation_kind IS NOT NULL` is the canonical SQLite partial-
+ * index pattern (sqlite.org/partialindex.html §2 Rule 2): the planner
+ * auto-matches any equality/LIKE comparison on the indexed column when the
+ * predicate is `IS NOT NULL`, so a `WHERE bash_mutation_kind = 'mutates'`
+ * scan from the reducer's bash-attribution fold (task 6) lands the index
+ * instead of a full events scan.
+ */
+const CREATE_V31_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_events_bash_mutation_kind ON events(bash_mutation_kind) WHERE bash_mutation_kind IS NOT NULL",
+];
 
 const CREATE_REDUCER_STATE = `
 CREATE TABLE IF NOT EXISTS reducer_state (
@@ -688,6 +799,55 @@ function dropColumnIfPresent(
 }
 
 /**
+ * Rename a column only if the OLD name is still present AND the NEW name is
+ * not. Quad-state idempotence covers every re-run case:
+ *   - Old present, new absent → run the ALTER (the migration path).
+ *   - Old absent, new present → already renamed; no-op (re-running migrate()
+ *     against an already-migrated DB).
+ *   - Old absent, new absent → table doesn't have either yet; no-op (caller
+ *     mis-ordered the migration step, or a future contributor dropped the
+ *     column entirely).
+ *   - Old present, new present → both columns coexist. This is the
+ *     **fresh-DB** path under the addColumnIfMissing/literal lockstep
+ *     convention: when a v30→v31 ALTER pair renames `git_orphan_count` to
+ *     `git_unattributed_to_live_count` and adds a fresh `git_orphan_count`,
+ *     the CREATE_JOBS literal MUST carry both names from scratch (otherwise
+ *     a fresh-DB schema would differ from a migrated one). On a fresh boot
+ *     CREATE_JOBS lands both columns BEFORE the migrate block reaches
+ *     `renameColumnIfPresent`, so the helper sees both present. The
+ *     correct fresh-DB action is "no-op" — the target schema is already
+ *     there. (A genuine drift scenario — two columns with overlapping data
+ *     — is indistinguishable from the fresh-DB case at this layer; the
+ *     lockstep convention makes the fresh-DB case the common one, and the
+ *     column-shape parity tests in `test/db.test.ts` catch a contributor's
+ *     accidental drift between literal and migrated paths.)
+ *
+ * Requires SQLite 3.25+ for `ALTER TABLE ... RENAME COLUMN`; Bun ships
+ * SQLite 3.46+, so the floor is well below the runtime. The caller emits a
+ * defensive version check upstream of the migration block for extra
+ * forward-compat insurance.
+ */
+function renameColumnIfPresent(
+  db: Database,
+  table: string,
+  oldName: string,
+  newName: string,
+): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as {
+    name: string;
+  }[];
+  const hasOld = cols.some((c) => c.name === oldName);
+  const hasNew = cols.some((c) => c.name === newName);
+  if (!hasOld) {
+    return; // already renamed OR neither present
+  }
+  if (hasNew) {
+    return; // fresh-DB lockstep: CREATE_TABLE literal already carries both
+  }
+  db.run(`ALTER TABLE ${table} RENAME COLUMN ${oldName} TO ${newName}`);
+}
+
+/**
  * Run schema bootstrap + forward-only ALTER block. Writer-only. Wrapped in a
  * single transaction so a half-applied schema can never persist across a
  * crashed boot.
@@ -706,6 +866,10 @@ function migrate(db: Database): void {
     db.run(CREATE_META);
     db.run(CREATE_SUBAGENT_INVOCATIONS);
     for (const sql of CREATE_SUBAGENT_INVOCATIONS_INDEXES) {
+      db.run(sql);
+    }
+    db.run(CREATE_FILE_ATTRIBUTIONS);
+    for (const sql of CREATE_FILE_ATTRIBUTIONS_INDEXES) {
       db.run(sql);
     }
 
@@ -2411,6 +2575,144 @@ function migrate(db: Database): void {
       db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
       db.run("DELETE FROM jobs");
       db.run("DELETE FROM epics");
+      db.run("DELETE FROM subagent_invocations");
+    }
+
+    // v30→v31: rewrite the git-attribution surface from "files attributed to
+    // a live session, everything else is orphan" to honest per-(session, file)
+    // attribution with a commit-based discharge rule. This task lands the
+    // schema slot only — the reducer fold that fills `file_attributions` from
+    // events + the bash mutation deriver land in tasks .3 / .6.
+    //
+    // Three schema-level changes:
+    //   1. `events.bash_mutation_kind TEXT` + `events.bash_mutation_targets TEXT`
+    //      — two sparse columns, NULL on every row whose PostToolUse:Bash payload
+    //      didn't parse as a mutation. The deriver (task .3) populates them at
+    //      hook write time; this block adds the slot. Partial index on
+    //      `bash_mutation_kind` follows the schema-v10 / v14 / v17 pattern —
+    //      kept OUT of `CREATE_EVENTS_INDEXES` so a migrating v30 DB doesn't
+    //      try to index a column it hasn't gained yet, run AFTER the matching
+    //      addColumnIfMissing here.
+    //   2. `jobs.git_orphan_count` RENAME → `jobs.git_unattributed_to_live_count`
+    //      + fresh `jobs.git_orphan_count INTEGER NOT NULL DEFAULT 0` with the
+    //      new strict-mystery semantic. The legacy v28 `git_orphan_count`
+    //      column held "files-not-attributed-to-a-live-session" (which IS the
+    //      definition of `git_unattributed_to_live_count` under the new
+    //      vocabulary), so we rename the storage slot in place — that
+    //      preserves the column's pre-existing DEFAULT 0 zero-event reading
+    //      AND keeps the SQLite RENAME COLUMN cheap (just a catalog patch,
+    //      no row rewrite). The fresh `git_orphan_count` column carries the
+    //      new strict-mystery semantic (files with no attribution from any
+    //      session — past or present), populated by the new reducer fold
+    //      in task .6. Both columns land in `CREATE_JOBS` so a fresh v31 DB
+    //      and a migrated v30→v31 DB converge to the same schema. Readiness
+    //      predicate 6.5 flips to read `git_unattributed_to_live_count`
+    //      (the same numeric value it read before under the old name) in
+    //      task .6's client work; this task touches only the storage layer.
+    //   3. `file_attributions` table — one row per `(project_dir, session_id,
+    //      file_path)` triple, the discharge-aware attribution record the
+    //      new fold maintains. PK is the three-column composite (so multi-
+    //      attribution per file across sessions and worktrees lives as
+    //      distinct rows). Two non-partial indexes serve the per-file
+    //      multi-attribution read and the per-session retract sweep.
+    //
+    // Defensive SQLite version check: RENAME COLUMN requires 3.25+ and Bun
+    // ships 3.46+, so this is extremely unlikely to trip — but the
+    // sub-system invariant (forward-only migration, never-throw-inside-
+    // migrate) makes a cheap pre-check the right choice when the
+    // alternative is a half-applied schema. The check runs unconditionally
+    // (no version guard) so a future SQLite downgrade is caught even on a
+    // re-opened v31 DB.
+    const sqliteVer = (
+      db.prepare("SELECT sqlite_version() AS v").get() as { v: string }
+    ).v;
+    {
+      const parts = sqliteVer.split(".").map((n) => Number(n));
+      const major = parts[0] ?? 0;
+      const minor = parts[1] ?? 0;
+      if (major < 3 || (major === 3 && minor < 25)) {
+        throw new Error(
+          `schema v31 requires SQLite 3.25+ for RENAME COLUMN; found ${sqliteVer}`,
+        );
+      }
+    }
+
+    // Step 1: events sparse columns.
+    addColumnIfMissing(db, "events", "bash_mutation_kind", "TEXT");
+    addColumnIfMissing(db, "events", "bash_mutation_targets", "TEXT");
+
+    // Step 2: jobs column rename + new column.
+    //
+    // The rename runs BEFORE the addColumnIfMissing for the new
+    // `git_orphan_count`. Order matters: if we ran `addColumnIfMissing` first
+    // against a v30 DB whose `git_orphan_count` was the LEGACY column, the
+    // add would no-op (column already present) and the rename below would
+    // fail (`hasOld && hasNew` → drift error). By renaming first, the
+    // legacy `git_orphan_count` becomes `git_unattributed_to_live_count`,
+    // freeing the name for the fresh DEFAULT 0 column the next call adds.
+    //
+    // On a fresh v31 DB, CREATE_JOBS already carries both column names
+    // — the rename is a no-op (`!hasOld && hasNew`) and the
+    // addColumnIfMissing is a no-op (`git_orphan_count` is present).
+    // On a re-opened already-migrated v31 DB the same two no-ops hold:
+    // the migrate-once invariant is maintained without a version guard
+    // (the helpers' triple-state idempotence does the work).
+    renameColumnIfPresent(
+      db,
+      "jobs",
+      "git_orphan_count",
+      "git_unattributed_to_live_count",
+    );
+    addColumnIfMissing(
+      db,
+      "jobs",
+      "git_orphan_count",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
+
+    // Step 3: partial index on the new bash_mutation_kind column. Pairs with
+    // the addColumnIfMissing above — runs AFTER the column exists, mirrors
+    // the v10/v14/v17 partial-index pattern.
+    for (const sql of CREATE_V31_INDEXES) {
+      db.run(sql);
+    }
+
+    // Step 4: version-guarded rewind-and-redrain. Required because the new
+    // `git_orphan_count` carries a fundamentally different semantic (strict
+    // mystery — populated by the new reducer fold in task .6), AND
+    // `file_attributions` rows are computed by the same fold from the event
+    // log. A pre-v31 jobs row carries the old legacy `git_orphan_count`
+    // value under the renamed column (`git_unattributed_to_live_count`),
+    // which is correct under the new vocabulary, but the new `git_orphan_count`
+    // column would read DEFAULT 0 — which means "no mystery files" — until
+    // the next `GitSnapshot` re-fans counts. The honest path is to wipe and
+    // re-fold: cursor=0, DELETE jobs/epics/git_status/file_attributions,
+    // boot drain re-derives every column byte-deterministically under the
+    // new schema. (`subagent_invocations` is unaffected by this migration
+    // but the prior rewind blocks all wipe it for symmetry with the
+    // "rebuild every projection table" pattern; v31 follows suit.)
+    //
+    // Version-guarded mirrors prior rewinds: a re-open of an already-
+    // migrated v31+ DB skips this block. The boot drain after migrate()
+    // returns rebuilds all four projections from the immutable event log
+    // under the new reducer fold (task .6 lands the fold; until that
+    // task ships, the post-rewind projection reads zero for the new
+    // strict-mystery column and `git_unattributed_to_live_count` reads
+    // whatever the existing reducer fold produces — which IS the legacy
+    // semantic the rename preserved).
+    const storedVersionV31 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV31 < 31) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM git_status");
+      db.run("DELETE FROM file_attributions");
       db.run("DELETE FROM subagent_invocations");
     }
 

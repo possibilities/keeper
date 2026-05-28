@@ -106,6 +106,15 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "last_input_request_at",
     "last_input_request_kind",
     "git_dirty_count",
+    // Schema v31: the legacy `git_orphan_count` (schema v28 — "files-not-
+    // attributed-to-a-live-session") is renamed to
+    // `git_unattributed_to_live_count` under the new vocabulary. The fresh
+    // `git_orphan_count` carries the new strict-mystery semantic (files
+    // with no attribution from any session — past or present), populated
+    // by the new reducer fold in fn-633.6. Both columns ride here as
+    // INTEGER NOT NULL DEFAULT 0; neither is in `sortable` / `filters`
+    // (display + readiness-predicate inputs only).
+    "git_unattributed_to_live_count",
     "git_orphan_count",
   ],
   pk: "job_id",
