@@ -26,6 +26,7 @@ import { join } from "node:path";
 import {
   countAndToken,
   EPICS_DESCRIPTOR,
+  getCollection,
   JOBS_DESCRIPTOR,
   type Row,
 } from "../src/collections";
@@ -53,6 +54,7 @@ import {
   resolveFilter,
   resumePending,
   runQuery,
+  type SubState,
   startServer,
   unregisterRpc,
   type Writable,
@@ -94,6 +96,21 @@ function newConn(): ConnState {
   return dispatchInit();
 }
 
+/**
+ * Read the anonymous (legacy single-sub) subscription off a conn — `null` is
+ * the sentinel sub-id for queries without an explicit `id`. Returns
+ * `undefined` when there is no anonymous sub (e.g. after `unsubscribe` with
+ * no id, or before any query).
+ */
+function anonSub(conn: ConnState): SubState | undefined {
+  return conn.subs.get(null);
+}
+
+/** Read a named sub off a conn, or `undefined` if absent. */
+function subFor(conn: ConnState, id: string): SubState | undefined {
+  return conn.subs.get(id);
+}
+
 function dispatchInit(): ConnState {
   // The module's newConnState is private; build the equivalent here.
   return {
@@ -103,12 +120,7 @@ function dispatchInit(): ConnState {
       push: () => [],
       pendingLength: () => 0,
     } as unknown as ConnState["buffer"],
-    collection: null,
-    watched: new Set<string>(),
-    lastSent: new Map<string, number>(),
-    where: null,
-    lastTotal: null,
-    lastToken: null,
+    subs: new Map(),
     pending: null,
   };
 }
@@ -555,10 +567,11 @@ test("dispatchLine query seeds the collection + watched-set + lastSent", () => {
   );
   expect(frames).toHaveLength(1);
   expect((frames[0] as ResultFrame).type).toBe("result");
-  expect(conn.collection).toBe("jobs");
-  expect([...conn.watched].sort()).toEqual(["a", "b"]);
-  expect(conn.lastSent.get("a")).toBe(5);
-  expect(conn.lastSent.get("b")).toBe(9);
+  const sub = anonSub(conn);
+  expect(sub?.collection).toBe("jobs");
+  expect([...(sub?.watched ?? [])].sort()).toEqual(["a", "b"]);
+  expect(sub?.lastSent.get("a")).toBe(5);
+  expect(sub?.lastSent.get("b")).toBe(9);
   db.close();
 });
 
@@ -567,17 +580,17 @@ test("dispatchLine unsubscribe clears collection + watched-set", () => {
   seedJob(db, "a");
   const conn = newConn();
   dispatchLine(db, conn, JSON.stringify({ type: "query", collection: "jobs" }));
-  expect(conn.watched.size).toBe(1);
-  expect(conn.collection).toBe("jobs");
+  expect(anonSub(conn)?.watched.size).toBe(1);
+  expect(anonSub(conn)?.collection).toBe("jobs");
   const frames = dispatchLine(
     db,
     conn,
     JSON.stringify({ type: "unsubscribe" }),
   );
   expect(frames).toHaveLength(0);
-  expect(conn.collection).toBeNull();
-  expect(conn.watched.size).toBe(0);
-  expect(conn.lastSent.size).toBe(0);
+  // Anonymous-bodied unsubscribe clears every sub on the conn.
+  expect(conn.subs.size).toBe(0);
+  expect(anonSub(conn)).toBeUndefined();
   db.close();
 });
 
@@ -595,7 +608,7 @@ test("dispatchLine query with absent/empty/non-string collection → bad_frame",
     expect(frames[0].type).toBe("error");
     expect((frames[0] as ErrorFrame).code).toBe("bad_frame");
     // No subscription was ever established.
-    expect(conn.collection).toBeNull();
+    expect(conn.subs.size).toBe(0);
   }
   db.close();
 });
@@ -606,11 +619,13 @@ test("dispatchLine unknown collection → unknown_collection AND prior subscript
   const conn = newConn();
   // Establish a live subscription first.
   dispatchLine(db, conn, JSON.stringify({ type: "query", collection: "jobs" }));
-  expect(conn.collection).toBe("jobs");
-  expect([...conn.watched]).toEqual(["a"]);
+  expect(anonSub(conn)?.collection).toBe("jobs");
+  expect([...(anonSub(conn)?.watched ?? [])]).toEqual(["a"]);
 
   // A well-formed query naming an unregistered collection errors WITHOUT
-  // touching the existing subscription.
+  // touching the existing subscription. (Note: the new query carries `id:
+  // "q2"`, which would be a SECOND sub if successful — it must not even
+  // allocate that slot on the unknown_collection path.)
   const frames = dispatchLine(
     db,
     conn,
@@ -620,10 +635,11 @@ test("dispatchLine unknown collection → unknown_collection AND prior subscript
   expect(frames[0].type).toBe("error");
   expect((frames[0] as ErrorFrame).code).toBe("unknown_collection");
   expect((frames[0] as ErrorFrame).collection).toBe("plans");
-  // Prior subscription intact.
-  expect(conn.collection).toBe("jobs");
-  expect([...conn.watched]).toEqual(["a"]);
-  expect(conn.lastSent.get("a")).toBe(5);
+  // Prior subscription intact; no "q2" slot leaked.
+  expect(anonSub(conn)?.collection).toBe("jobs");
+  expect([...(anonSub(conn)?.watched ?? [])]).toEqual(["a"]);
+  expect(anonSub(conn)?.lastSent.get("a")).toBe(5);
+  expect(subFor(conn, "q2")).toBeUndefined();
   db.close();
 });
 
@@ -895,8 +911,8 @@ test("dispatchLine rpc preserves an existing subscription (rpc does not touch Co
       conn,
       JSON.stringify({ type: "query", collection: "jobs" }),
     );
-    expect(conn.collection).toBe("jobs");
-    expect(conn.watched.has("a")).toBe(true);
+    expect(anonSub(conn)?.collection).toBe("jobs");
+    expect(anonSub(conn)?.watched.has("a")).toBe(true);
 
     // An RPC in the middle of a live subscription must NOT touch ConnState.
     dispatchLine(
@@ -905,9 +921,9 @@ test("dispatchLine rpc preserves an existing subscription (rpc does not touch Co
       JSON.stringify({ type: "rpc", id: "r1", method: "noop" }),
       db,
     );
-    expect(conn.collection).toBe("jobs");
-    expect(conn.watched.has("a")).toBe(true);
-    expect(conn.lastSent.get("a")).toBe(5);
+    expect(anonSub(conn)?.collection).toBe("jobs");
+    expect(anonSub(conn)?.watched.has("a")).toBe(true);
+    expect(anonSub(conn)?.lastSent.get("a")).toBe(5);
   } finally {
     teardown();
     db.close();
@@ -1065,16 +1081,19 @@ function fakeSock(): Writable & {
 }
 
 /**
- * Seed a connection's active collection + watched-set + lastSent from the rows
- * it would page, PLUS the membership baseline (`where` + `lastTotal` +
- * `lastToken`) the meta pass diffs against. `diffTick` groups by `collection`
- * and skips null-collection conns, so the active collection must be set for the
- * diff to visit the conn. The baseline is computed from the live DB so a pure
- * cell update (membership unchanged) is a meta-pass no-op for these tests.
+ * Seed a subscription on a connection: its collection + watched-set + lastSent
+ * (from the rows the originating query would have paged) PLUS the membership
+ * baseline (`where` + `lastTotal` + `lastToken`) the meta pass diffs against.
+ * `diffTick` iterates `(sock, subId, sub)` triples and groups by
+ * `sub.collection`, so each call here installs ONE sub on the socket.
  *
  * `filter` is the wire filter the subscription was built from (`{}` =
  * unfiltered, the jobs default). The membership baseline is seeded from the SAME
  * resolved filter / countAndToken the server would have used.
+ *
+ * `subId` keys the sub in `sock.data.subs`. The default `null` preserves the
+ * legacy anonymous-sub shape so the 35+ existing call sites work unchanged;
+ * multi-sub tests pass explicit string ids to install named subs.
  */
 function watch(
   db: Database,
@@ -1082,20 +1101,27 @@ function watch(
   seed: Record<string, number>,
   filter: Record<string, FilterValue> = {},
   collection = "jobs",
+  subId: string | null = null,
 ): void {
-  sock.data.collection = collection;
-  sock.data.watched = new Set(Object.keys(seed));
-  sock.data.lastSent = new Map(Object.entries(seed));
-  const where = resolveFilter(JOBS_DESCRIPTOR, filter);
+  const descriptor = getCollection(collection);
+  if (!descriptor) {
+    throw new Error(`watch: no such collection: ${collection}`);
+  }
+  const where = resolveFilter(descriptor, filter);
   const { total, token } = countAndToken(
     db,
-    JOBS_DESCRIPTOR,
+    descriptor,
     where.clause,
     where.params,
   );
-  sock.data.where = where;
-  sock.data.lastTotal = total;
-  sock.data.lastToken = token;
+  sock.data.subs.set(subId, {
+    collection,
+    watched: new Set(Object.keys(seed)),
+    lastSent: new Map(Object.entries(seed)),
+    where,
+    lastTotal: total,
+    lastToken: token,
+  });
 }
 
 /** Bump a job's last_event_id (and updated_at) — simulates a reducer fold. */
@@ -1146,7 +1172,7 @@ test("diffTick pushes one patch when a watched row advances; rev is stamped", ()
   expect(patch.row.last_event_id).toBe(6);
   expect(patch.rev).toBe(42);
   // lastSent advanced to the pushed value.
-  expect(sock.data.lastSent.get("a")).toBe(6);
+  expect(sock.data.subs.get(null)?.lastSent.get("a")).toBe(6);
   db.close();
 });
 
@@ -1236,21 +1262,17 @@ test("diffTick skips a backpressured socket without stalling others; lastSent no
   // Slow connection was skipped: no NEW patch frame appended by the diff, and
   // lastSent stayed at 1 so the next tick re-reflects current state.
   expect(slow.frames).toHaveLength(0);
-  expect(slow.data.lastSent.get("a")).toBe(1);
+  expect(slow.data.subs.get(null)?.lastSent.get("a")).toBe(1);
   db.close();
 });
 
-test("diffTick never visits a null-collection connection", () => {
+test("diffTick skips a connection with no active subscriptions", () => {
   const { db } = openDb(dbPath, { readonly: false });
   seedJob(db, "a", { last_event_id: 1 });
 
-  // A conn with NO active subscription: watched is populated but collection is
-  // null (e.g. after unsubscribe but a stale watched-set lingered). It must be
-  // skipped — no patch, watched untouched.
+  // A conn with NO active subscription (empty subs map — e.g. never queried,
+  // or after unsubscribe). diffTick builds zero triples from it and never emits.
   const idle = fakeSock();
-  idle.data.collection = null;
-  idle.data.watched = new Set(["a"]);
-  idle.data.lastSent = new Map([["a", 1]]);
 
   const active = fakeSock();
   watch(db, active, { a: 1 });
@@ -1258,10 +1280,10 @@ test("diffTick never visits a null-collection connection", () => {
   advanceJob(db, "a", 2);
   diffTick(db, [idle, active]);
 
-  // Active conn got its patch; idle (null-collection) conn was never visited.
+  // Active conn got its patch; idle (no subs) conn was never visited.
   expect(active.frames).toHaveLength(1);
   expect(idle.frames).toHaveLength(0);
-  expect(idle.data.lastSent.get("a")).toBe(1);
+  expect(idle.data.subs.size).toBe(0);
   db.close();
 });
 
@@ -1342,11 +1364,17 @@ test("diffTick property: K changes ⇒ K patches; only changed rows are fetched/
     }
     const sock = {
       data: {
-        buffer: { push: () => [], pendingLength: () => 0 },
-        collection: "epics",
-        watched: new Set(ids),
-        lastSent,
-        where: null, lastTotal: null, lastToken: null, pending: null,
+        subs: new Map([[null, {
+          collection: "epics",
+          watched: new Set(ids),
+          lastSent,
+          where: { clause: "", params: [] },
+          lastTotal: 0,
+          lastToken: "",
+        }]]),
+        pending: null,
+        buffer: "",
+        id: 0,
         frames: [],
       },
       write(buf, off, len) {
@@ -1659,7 +1687,7 @@ test("diffTick emits a meta when total grows (a row enters the set)", () => {
   expect(meta?.total).toBe(2);
   expect(meta?.rev).toBe(5);
   // Baseline advanced — a second no-change tick is silent.
-  expect(sock.data.lastTotal).toBe(2);
+  expect(sock.data.subs.get(null)?.lastTotal).toBe(2);
   diffTick(db, [sock]);
   expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(1);
   db.close();
@@ -1726,8 +1754,8 @@ test("diffTick shares one count across two conns on the same filter; both advanc
 
   expect(firstMeta(w1)?.total).toBe(2);
   expect(firstMeta(w2)?.total).toBe(2);
-  expect(w1.data.lastTotal).toBe(2);
-  expect(w2.data.lastTotal).toBe(2);
+  expect(w1.data.subs.get(null)?.lastTotal).toBe(2);
+  expect(w2.data.subs.get(null)?.lastTotal).toBe(2);
   db.close();
 });
 
@@ -1759,13 +1787,13 @@ test("diffTick backpressure: a pending conn gets no meta and does NOT advance; n
 
   // Skipped: no meta, baseline NOT advanced.
   expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(0);
-  expect(sock.data.lastTotal).toBe(1);
+  expect(sock.data.subs.get(null)?.lastTotal).toBe(1);
 
   // Unblock and re-tick: the signal is re-derived from current state.
   sock.data.pending = null;
   diffTick(db, [sock]);
   expect(firstMeta(sock)?.total).toBe(2);
-  expect(sock.data.lastTotal).toBe(2);
+  expect(sock.data.subs.get(null)?.lastTotal).toBe(2);
   db.close();
 });
 
@@ -1950,11 +1978,17 @@ test("diffTick: TRACE=1 emits op=diffTick line for a slow tick (>10ms total)", a
       const { total, token } = countAndToken(db, JOBS_DESCRIPTOR, where.clause, where.params);
       const sock = {
         data: {
-          buffer: { push: () => [], pendingLength: () => 0 },
-          collection: "jobs",
-          watched,
-          lastSent: new Map(),
-          where, lastTotal: total, lastToken: token, pending: null,
+          subs: new Map([[null, {
+            collection: "jobs",
+            watched,
+            lastSent: new Map(),
+            where,
+            lastTotal: total,
+            lastToken: token,
+          }]]),
+          pending: null,
+          buffer: "",
+          id: 0,
         },
         write(buf, off, len) { return (len ?? buf.length - (off ?? 0)); },
       };

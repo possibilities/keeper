@@ -34,13 +34,16 @@
  * - `patch`  — a single row in the page has advanced (its per-row `version`
  *              column moved forward). The full updated `row` is included so the
  *              client never needs to re-query to render the change. Echoes the
- *              `collection`.
+ *              `collection`, and echoes the originating query's `id` (when
+ *              present) so a multi-sub client can route the frame to the
+ *              correct subscription.
  * - `meta`   — a membership-staleness signal for the active subscription: the
  *              filtered-set `total` and/or the set's membership changed since
  *              the last frame sent on this connection. Carries the new `total`
  *              but NOT the changed rows — it's a "set changed, refresh" nudge,
  *              not a live membership stream (frozen membership is unchanged).
- *              Echoes the `collection`.
+ *              Echoes the `collection`, and echoes the originating query's
+ *              `id` (when present) for multi-sub routing.
  * - `rpc_result` — response to a successful `rpc` call. Echoes the request's
  *                  `id` for correlation; `value` is the handler's return,
  *                  shaped by the handler (opaque to the framing layer).
@@ -163,10 +166,14 @@ export interface ResultFrame<R extends Row = Row> {
 /**
  * Server → client: one row in the active page has advanced. `row` is the
  * full updated row (not a delta) so the client renders without re-querying.
- * `collection` echoes the collection the row belongs to.
+ * `collection` echoes the collection the row belongs to. `id`, when present,
+ * echoes the originating query's `id`, routing the frame to the correct
+ * subscription on a multi-sub connection. Absent when the originating query
+ * had no `id` (legacy single-sub client).
  */
 export interface PatchFrame<R extends Row = Row> {
   type: "patch";
+  id?: string;
   collection: string;
   rev: number;
   row: R;
@@ -183,10 +190,14 @@ export interface PatchFrame<R extends Row = Row> {
  * the live page does not reflow under the client. A `meta` frame is a "the set
  * changed, re-query if you care" nudge, not a live membership stream. `rev` is
  * the same world-rev stamped on the tick's patches; `collection` echoes the
- * subscription's collection. Mirrors `patch` in carrying no `id`.
+ * subscription's collection. `id`, when present, echoes the originating
+ * query's `id`, routing the frame to the correct subscription on a multi-sub
+ * connection. Absent when the originating query had no `id` (legacy single-sub
+ * client).
  */
 export interface MetaFrame {
   type: "meta";
+  id?: string;
   collection: string;
   rev: number;
   total: number;

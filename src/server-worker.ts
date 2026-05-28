@@ -184,41 +184,65 @@ function formatStages(args: {
 }
 
 /**
+ * Per-subscription state on a connection. One `SubState` carries everything
+ * that used to live as a top-level slot on `ConnState`:
+ *
+ * - `collection` is the subscription's collection name.
+ * - `watched` is the frozen page membership (keyed by the collection's pk),
+ *   seeded by the originating `query` and re-diffed on every `data_version`
+ *   tick.
+ * - `lastSent` maps pk → the collection's version column as last pushed to
+ *   this subscription, so the diff emits a `patch` exactly once per advance.
+ * - `where` is the resolved filter (clause + bound params) the originating
+ *   query was built from; reused on every tick for the membership COUNT+token
+ *   so the count cannot drift from the page that produced it.
+ * - `lastTotal` / `lastToken` are the filtered-set size + membership
+ *   fingerprint last reflected to this subscription (seeded from the same read
+ *   that produced the `result`'s `total`); the diff emits a `meta` frame only
+ *   when either moves.
+ */
+export interface SubState {
+  collection: string;
+  watched: Set<string>;
+  lastSent: Map<string, number>;
+  where: ResolvedFilter;
+  lastTotal: number;
+  lastToken: string;
+}
+
+/**
  * Per-connection state, carried on `socket.data` (typed via the
  * `Bun.listen<ConnState>` generic).
  *
  * - `buffer` line-buffers inbound chunks until a `\n` lands (NDJSON framing).
- * - `collection` is the active subscription's collection name (`null` until the
- *   first successful `query`; reset to `null` on `unsubscribe`). `diffTick`
- *   groups connections by it and skips `null`-collection conns.
- * - `watched` is the frozen page membership (keyed by the collection's pk)
- *   seeded by the latest `query` — the set re-read + diffed on every
- *   `data_version` tick.
- * - `lastSent` maps pk → the collection's version column as last pushed to this
- *   client, so the diff emits a `patch` exactly once per advance.
- * - `where` is the resolved filter (clause + bound params) the active query was
- *   built from — `null` until the first successful `query`, reset on
- *   `unsubscribe`. `diffTick` reuses it for the membership COUNT+token so the
- *   count can never drift from the page that produced it.
- * - `lastTotal` / `lastToken` are the filtered-set size + membership
- *   fingerprint last reflected to this client (seeded from the same read that
- *   produced the `result`'s `total`); the diff emits a `meta` frame only when
- *   either moves. `null` until the first `query`, reset on `unsubscribe`.
+ * - `subs` maps the query's `id` (or `null` for the anonymous-sub sentinel
+ *   used by legacy single-sub clients) to its `SubState`. A connection may
+ *   carry any number of concurrent subscriptions, each with its own
+ *   collection / watched-set / lastSent / where / lastTotal / lastToken; the
+ *   anonymous slot replaces itself on each anonymous re-query (matching the
+ *   "one active subscription" semantic for legacy clients), while id-keyed
+ *   subs replace per-id and otherwise coexist. `diffTick` iterates the union
+ *   `(sock, subId, sub)` across all connections, groups by `sub.collection`,
+ *   and fans `patch`/`meta` frames per-sub (carrying `id` when `subId !==
+ *   null`).
  * - `pending` holds a backpressured tail: the UTF-8 bytes not yet accepted by
- *   the socket, resumed in `drain`.
+ *   the socket, resumed in `drain`. Backpressure is SOCKET-LEVEL — when set
+ *   it skips ALL subs on this connection together (no coordination overhead;
+ *   the outbound buffer is the shared resource being protected).
+ * - `id` is the debug per-connection sequence id used by `[srv-ts]` logs.
  *
- * One active subscription per connection: a re-query fully REPLACES
- * `collection` + `watched` + `lastSent` + `where` + `lastTotal` + `lastToken`
- * (list → detail navigation).
+ * Subscription mutation:
+ *   - A `query` frame keyed by `frame.id ?? null` atomically replaces (or
+ *     creates) one slot in `subs` — list→detail navigation on a legacy client
+ *     re-queries the anonymous slot; a multi-sub client adds/replaces by id.
+ *   - An `unsubscribe{id}` deletes just that slot (silent no-op when absent
+ *     — idempotent, matches HTTP DELETE 404-as-success).
+ *   - An `unsubscribe{}` clears the whole map.
+ *   - `close` clears the whole map + drops `pending`.
  */
 export interface ConnState {
   buffer: LineBuffer;
-  collection: string | null;
-  watched: Set<string>;
-  lastSent: Map<string, number>;
-  where: ResolvedFilter | null;
-  lastTotal: number | null;
-  lastToken: string | null;
+  subs: Map<string | null, SubState>;
   pending: { bytes: Uint8Array; offset: number } | null;
   /** DEBUG: per-connection sequence id for `[srv-ts]` log correlation. */
   id?: number;
@@ -227,12 +251,7 @@ export interface ConnState {
 function newConnState(): ConnState {
   return {
     buffer: new LineBuffer(),
-    collection: null,
-    watched: new Set(),
-    lastSent: new Map(),
-    where: null,
-    lastTotal: null,
-    lastToken: null,
+    subs: new Map(),
     pending: null,
   };
 }
@@ -749,29 +768,41 @@ export function dispatchLine(
         return [out];
       }
       const descriptor = getCollection(out.collection) as CollectionDescriptor;
-      // Replace the subscription atomically (one synchronous block, no await):
-      // collection + watched + lastSent + the membership baseline, keyed by the
-      // descriptor's pk/version, so no diffTick interleaves stale rows.
-      conn.collection = out.collection;
-      conn.watched = new Set(out.rows.map((r) => String(r[descriptor.pk])));
-      conn.lastSent = new Map(
-        out.rows.map((r) => [
-          String(r[descriptor.pk]),
-          r[descriptor.version] as number,
-        ]),
-      );
-      conn.where = seed.where;
-      conn.lastTotal = seed.total;
-      conn.lastToken = seed.token;
+      // Allocate / replace the subscription atomically (one synchronous block,
+      // no await): collection + watched + lastSent + the membership baseline,
+      // keyed by the descriptor's pk/version, so no diffTick interleaves stale
+      // rows. The slot's key is `frame.id ?? null` — `null` is the anonymous-
+      // sub sentinel used by legacy single-sub clients, where subsequent
+      // anonymous queries replace this same slot (matching today's "one active
+      // subscription" semantic). Id-keyed subs replace per-id and otherwise
+      // coexist with every other sub on this connection.
+      const subId = frame.id ?? null;
+      const subState: SubState = {
+        collection: out.collection,
+        watched: new Set(out.rows.map((r) => String(r[descriptor.pk]))),
+        lastSent: new Map(
+          out.rows.map((r) => [
+            String(r[descriptor.pk]),
+            r[descriptor.version] as number,
+          ]),
+        ),
+        where: seed.where,
+        lastTotal: seed.total,
+        lastToken: seed.token,
+      };
+      conn.subs.set(subId, subState);
       return [out];
     }
     case "unsubscribe": {
-      conn.collection = null;
-      conn.watched = new Set();
-      conn.lastSent = new Map();
-      conn.where = null;
-      conn.lastTotal = null;
-      conn.lastToken = null;
+      // With `id` → delete just that sub (silent no-op if not found —
+      // idempotent, matches HTTP DELETE 404-as-success). Without `id` → clear
+      // every sub on this conn (preserves today's "drop the active
+      // subscription" semantic for legacy clients).
+      if (frame.id !== undefined) {
+        conn.subs.delete(frame.id);
+      } else {
+        conn.subs.clear();
+      }
       return [];
     }
     case "rpc": {
@@ -910,6 +941,20 @@ export interface Writable {
 const encoder = new TextEncoder();
 
 /**
+ * Best-effort collection label for the `op=writeFrames` trace line. Most
+ * server-emit batches carry one collection across all frames (a `runQuery`
+ * result, a per-collection patch fanout, a meta emit); for frames that don't
+ * carry one (e.g. an `error` frame minted without a known collection, or an
+ * `rpc_result`) the label degrades to `"?"`. Pure read of the encoded
+ * frames — no socket access, so it stays safe regardless of which sub the
+ * batch belongs to.
+ */
+function firstFrameCollection(frames: ServerFrame[]): string {
+  const first = frames[0] as { collection?: unknown } | undefined;
+  return first && typeof first.collection === "string" ? first.collection : "?";
+}
+
+/**
  * Write a batch of server frames to the socket with backpressure handling.
  * Encodes to one UTF-8 buffer, then writes from `pending.offset`. Bun's
  * `socket.write()` returns BYTES ACCEPTED — may be `< length` (buffer full) or
@@ -945,15 +990,16 @@ export function writeFrames(sock: Writable, frames: ServerFrame[]): void {
   // match the encoded buffer exactly (flush may stash a tail on backpressure
   // but the byte count we're profiling is the encoded payload, not what hit
   // the wire). Threshold-gated on `KEEPER_TRACE_FRAME_BYTES` (default 4096)
-  // to avoid logging every small patch frame; the collection name comes from
-  // `sock.data.collection`, which may be null pre-subscribe — fall back to
-  // "?". The TRACE env gate short-circuits FIRST so a TRACE=0 daemon never
-  // reaches the buf.length comparison; the source-level lint accepts this
-  // compound `if (TRACE && ...)` shape alongside the existing bare
-  // `if (TRACE)` form.
+  // to avoid logging every small patch frame. The collection label is derived
+  // from the first frame's `collection` (most server-emit batches share a
+  // collection across frames); falls back to "?" for frames that don't carry
+  // one (e.g. some error frames). The TRACE env gate short-circuits FIRST so
+  // a TRACE=0 daemon never reaches the buf.length comparison; the source-
+  // level lint accepts this compound `if (TRACE && ...)` shape alongside the
+  // existing bare `if (TRACE)` form.
   if (TRACE && buf.length >= TRACE_FRAME_BYTES)
     srvTs(
-      `op=writeFrames col=${sock.data.collection ?? "?"} bytes=${buf.length} frames=${frames.length}`,
+      `op=writeFrames col=${firstFrameCollection(frames)} bytes=${buf.length} frames=${frames.length}`,
     );
 
   flush(sock, buf, offset);
@@ -1006,17 +1052,21 @@ function readWorldRevOnce(db: Database): number {
 }
 
 /**
- * Compute the union of watched ids across a set of connections (all of which
+ * Compute the union of watched ids across a set of subscriptions (all of which
  * share one collection). The poll loop does ONE shared `selectVersionsByIds`
  * version-probe per collection group per tick — cheap (`pk, version` only,
  * no JSON decode) — and only on a non-empty `changedIds` set does it follow
- * with ONE shared `selectByIds` to fetch full rows. N connections watching
+ * with ONE shared `selectByIds` to fetch full rows. N subscriptions watching
  * overlapping pages cost one probe + at most one full-row read, not N.
+ *
+ * Multi-sub: takes `SubState`s directly (one sub per element, multiple subs
+ * may live on a single socket), since the (collection, sub) binding is made
+ * by the caller's grouping before this is called.
  */
-function unionWatched(conns: Iterable<Writable>): string[] {
+function unionWatched(subs: Iterable<SubState>): string[] {
   const union = new Set<string>();
-  for (const sock of conns) {
-    for (const id of sock.data.watched) {
+  for (const sub of subs) {
+    for (const id of sub.watched) {
       union.add(id);
     }
   }
@@ -1029,32 +1079,38 @@ function unionWatched(conns: Iterable<Writable>): string[] {
  * 1. Read world rev once → the GLOBAL reducer cursor stamped on every `patch`
  *    emitted this tick. Distinct from the per-row `version` column the diff
  *    fires on (for jobs both happen to be `last_event_id`; do not conflate).
- * 2. Group connections by active collection (skip `null`-collection conns).
- * 3. Per group: read the union of watched ids once, then VERSION-PROBE the
- *    full set via `selectVersionsByIds` — cheap (`pk, version` only, no JSON
- *    decode). Compare each conn's `lastSent[id]` against the probed version
- *    across ALL conns (no pending skip in this loop) to build `changedIds`.
+ * 2. Iterate the union `(sock, subId, sub)` across every connection's `subs`
+ *    map (a conn with no subs contributes nothing). Group by `sub.collection`.
+ * 3. Per group: read the union of watched ids across all SUBS in the group,
+ *    then VERSION-PROBE the full set via `selectVersionsByIds` — cheap
+ *    (`pk, version` only, no JSON decode). Compare each sub's `lastSent[id]`
+ *    against the probed version across ALL subs (no pending skip in this
+ *    loop) to build `changedIds`.
  * 4. If `changedIds` is non-empty, fetch the FULL rows for just those ids via
  *    `selectByIds([...changedIds])` and index by the descriptor's pk. If
  *    `changedIds` is empty, skip the second SELECT entirely (idle tick).
- * 5. For each non-pending connection, for each watched id: push a `patch
- *    {collection, rev, row}` ONLY when `row[descriptor.version] >
- *    lastSent[id]`, then bump `lastSent`. No patch when equal — the diff is
- *    state-based, so multiple folds between ticks collapse to one push
- *    (coalescing, no event queue).
- * 6. SECOND pass — membership staleness. Group the live (non-null collection,
- *    non-null `where`) connections by filter signature `[collection, clause,
- *    params]`, run ONE `countAndToken` per distinct signature (mirroring the
- *    one-`selectByIds`-per-collection sharing above), and fan `{total, token}`
- *    out: emit a `meta` frame to each conn whose `total` or `token` moved since
- *    its last, then advance `lastTotal`/`lastToken`. This is the count signal —
- *    NOT a membership stream; the changed rows are never sent (frozen page).
+ * 5. For each non-pending sock-sub pair, for each watched id: push a
+ *    `patch{collection, rev, row, [id]}` ONLY when `row[descriptor.version] >
+ *    sub.lastSent[id]`, then bump `sub.lastSent`. The patch carries `id` when
+ *    `subId !== null` (multi-sub routing); legacy anonymous subs (subId
+ *    null) emit without `id`, transparent to old clients. No patch when
+ *    equal — the diff is state-based, so multiple folds between ticks
+ *    collapse to one push (coalescing, no event queue).
+ * 6. SECOND pass — membership staleness. Group the live `(sock, sub)` pairs
+ *    by filter signature `[collection, clause, params]`, run ONE
+ *    `countAndToken` per distinct signature (mirroring the one-`selectByIds`
+ *    -per-collection sharing above), and fan `{total, token}` out: emit a
+ *    `meta` frame to each sub whose `total` or `token` moved since its last
+ *    (carrying `id` when `subId !== null`), then advance the sub's
+ *    `lastTotal`/`lastToken`. This is the count signal — NOT a membership
+ *    stream; the changed rows are never sent (frozen page).
  *
- * Backpressure: a connection with a pending (backpressured) write is SKIPPED
- * for the tick — never blocking fan-out to other connections, and crucially
- * `lastSent` (patch pass) and `lastTotal`/`lastToken` (meta pass) are NOT
- * advanced for a skipped conn, so the next tick re-reflects current state and
- * nothing is lost.
+ * Backpressure (socket-level): a connection with a pending (backpressured)
+ * write is SKIPPED for the tick — ALL subs on that socket together, since the
+ * outbound buffer is the shared resource being protected. Neither
+ * `sub.lastSent` (patch pass) nor `sub.lastTotal`/`sub.lastToken` (meta pass)
+ * advance for any sub on a skipped socket, so the next tick re-reflects
+ * current state and nothing is lost.
  *
  * Reads the collection table only (never `events`). The self-correcting race —
  * a poll landing after a hook `events` INSERT but before the reducer folds —
@@ -1069,19 +1125,20 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
     return;
   }
 
-  // Group connections by their active collection; null-collection conns (no
-  // live subscription) are never visited.
-  const byCollection = new Map<string, Writable[]>();
+  // Build the flat list of (sock, subId, sub) triples across all conns and
+  // group by `sub.collection`. A conn with an empty `subs` map (no live
+  // subscription) contributes nothing.
+  type Triple = { sock: Writable; subId: string | null; sub: SubState };
+  const byCollection = new Map<string, Triple[]>();
   for (const sock of list) {
-    const name = sock.data.collection;
-    if (name === null) {
-      continue;
-    }
-    const group = byCollection.get(name);
-    if (group) {
-      group.push(sock);
-    } else {
-      byCollection.set(name, [sock]);
+    for (const [subId, sub] of sock.data.subs) {
+      const group = byCollection.get(sub.collection);
+      const triple: Triple = { sock, subId, sub };
+      if (group) {
+        group.push(triple);
+      } else {
+        byCollection.set(sub.collection, [triple]);
+      }
     }
   }
   if (byCollection.size === 0) {
@@ -1111,7 +1168,9 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       continue;
     }
     const _g0 = TRACE ? performance.now() : 0;
-    const ids = unionWatched(group);
+    // unionWatched takes SubStates directly (not Writables) — the (collection,
+    // sub) binding is already made by the grouping above.
+    const ids = unionWatched(group.map((t) => t.sub));
     const _g1 = TRACE ? performance.now() : 0;
     if (TRACE) _accUnion += _g1 - _g0;
     if (ids.length === 0) {
@@ -1120,25 +1179,25 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
     // Stage 2 — version probe. Read only `(pk, version)` for every watched id
     // (no row body, no JSON-decode). This is the dominant-cost fix vs the old
     // shape: ~682 epics × 4 JSON-array columns × every tick of `JSON.parse`
-    // collapses to one cheap projection. Per-conn comparison below builds
+    // collapses to one cheap projection. Per-sub comparison below builds
     // `changedIds` and only on a non-empty set do we fetch full rows.
     const versions = selectVersionsByIds(db, descriptor, ids);
     const _g2 = TRACE ? performance.now() : 0;
     if (TRACE) _accProbe += _g2 - _g1;
 
-    // Stage 3 — compute the set of ids that advanced for ANY conn in the
-    // group. Iterates ALL conns (no `pending` skip in this loop): the skip
+    // Stage 3 — compute the set of ids that advanced for ANY sub in the
+    // group. Iterates ALL subs (no `pending` skip in this loop): the skip
     // belongs only in the fanout below where `lastSent` actually advances.
-    // Skipping pending conns here would deprive a sole backpressured watcher
+    // Skipping pending socks here would deprive a sole backpressured watcher
     // of the eventual fetch — still eventually-consistent (next tick re-probes
     // since `lastSent` didn't advance), but adds a tick of drain latency.
     // Matching today's union-fetch behavior keeps the algorithm shape minimal
     // and the latency profile identical.
     const changedIds = new Set<string>();
-    for (const sock of group) {
-      for (const id of sock.data.watched) {
+    for (const { sub } of group) {
+      for (const id of sub.watched) {
         const v = versions.get(id);
-        const last = sock.data.lastSent.get(id) ?? -1;
+        const last = sub.lastSent.get(id) ?? -1;
         // `v === undefined` mirrors today's `!row` guard: a row vanished
         // (never happens in v1, but defensive). `v === null` mirrors the
         // existing `version !== null` guard.
@@ -1148,7 +1207,7 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       }
     }
 
-    // Stage 4 — conditional full-row fetch + per-conn fanout. If nothing
+    // Stage 4 — conditional full-row fetch + per-sub fanout. If nothing
     // changed, skip the second SELECT entirely. The meta second-pass runs
     // unconditionally below (it's structurally independent).
     //
@@ -1162,34 +1221,43 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       const rows = selectByIds(db, descriptor, [...changedIds]);
       const _g3 = TRACE ? performance.now() : 0;
       if (TRACE) _accSelect += _g3 - _g2;
-      // Index by the descriptor's pk for per-connection fan-out.
+      // Index by the descriptor's pk for per-sub fan-out.
       const byId = new Map<string, Row>();
       for (const row of rows) {
         byId.set(String(row[descriptor.pk]), row);
       }
 
-      for (const sock of group) {
+      for (const { sock, subId, sub } of group) {
         // Slow consumer: a still-pending write means this socket is
-        // backpressured. Skip it (don't advance lastSent); the next tick
-        // re-diffs. The skip lives ONLY here — building `changedIds` above
-        // iterates all conns so the fetch shape mirrors today's behavior.
+        // backpressured. Skip it (don't advance any sub's lastSent on this
+        // sock); the next tick re-diffs. The skip is SOCKET-LEVEL —
+        // backpressure protects the conn's outbound buffer, which all subs
+        // on the conn share. The skip lives ONLY here — building
+        // `changedIds` above iterates all subs so the fetch shape mirrors
+        // today's behavior.
         if (sock.data.pending) {
           continue;
         }
         const patches: PatchFrame[] = [];
-        for (const id of sock.data.watched) {
+        for (const id of sub.watched) {
           const row = byId.get(id);
           if (!row) {
-            // This conn's id wasn't in `changedIds` (or the row vanished —
+            // This sub's id wasn't in `changedIds` (or the row vanished —
             // defensive, rows are never deleted in v1): nothing to diff,
             // leave lastSent untouched.
             continue;
           }
           const version = row[descriptor.version] as number | null;
-          const last = sock.data.lastSent.get(id) ?? -1;
+          const last = sub.lastSent.get(id) ?? -1;
           if (version !== null && version > last) {
-            patches.push({ type: "patch", collection: name, rev, row });
-            sock.data.lastSent.set(id, version);
+            patches.push({
+              type: "patch",
+              ...(subId !== null ? { id: subId } : {}),
+              collection: name,
+              rev,
+              row,
+            });
+            sub.lastSent.set(id, version);
           }
         }
         if (patches.length > 0) {
@@ -1204,57 +1272,68 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
   }
   const _tAfterPatch = TRACE ? performance.now() : 0;
 
-  // Second pass: membership-staleness `meta`. Group the live connections (a
-  // non-null collection AND a resolved `where`) by filter signature so two
-  // conns paging/sorting the same filter share ONE countAndToken; signature
-  // folds in the bound params (so state=working vs state=stopped don't share)
-  // and excludes sort/limit/offset (so different pages of one filter do share).
+  // Second pass: membership-staleness `meta`. Group every live `(sock, sub)`
+  // pair by filter signature so two pairs paging/sorting the same filter
+  // share ONE countAndToken; signature folds in the bound params (so
+  // state=working vs state=stopped don't share) and excludes sort/limit/
+  // offset (so different pages of one filter do share). Pairs from different
+  // socks AND from different subs on the same sock both share when their
+  // filters match.
   const byFilter = new Map<
     string,
     {
       descriptor: CollectionDescriptor;
       where: ResolvedFilter;
-      conns: Writable[];
+      pairs: { sock: Writable; subId: string | null; sub: SubState }[];
     }
   >();
   for (const sock of list) {
-    const name = sock.data.collection;
-    const where = sock.data.where;
-    if (name === null || where === null) {
-      continue;
-    }
-    const descriptor = getCollection(name);
-    if (!descriptor) {
-      continue;
-    }
-    const sig = JSON.stringify([name, where.clause, where.params]);
-    const group = byFilter.get(sig);
-    if (group) {
-      group.conns.push(sock);
-    } else {
-      byFilter.set(sig, { descriptor, where, conns: [sock] });
+    for (const [subId, sub] of sock.data.subs) {
+      const descriptor = getCollection(sub.collection);
+      if (!descriptor) {
+        continue;
+      }
+      const sig = JSON.stringify([
+        sub.collection,
+        sub.where.clause,
+        sub.where.params,
+      ]);
+      const group = byFilter.get(sig);
+      const pair = { sock, subId, sub };
+      if (group) {
+        group.pairs.push(pair);
+      } else {
+        byFilter.set(sig, { descriptor, where: sub.where, pairs: [pair] });
+      }
     }
   }
 
-  for (const { descriptor, where, conns } of byFilter.values()) {
+  for (const { descriptor, where, pairs } of byFilter.values()) {
     const { total, token } = countAndToken(
       db,
       descriptor,
       where.clause,
       where.params,
     );
-    for (const sock of conns) {
-      // Backpressure: skip a pending conn WITHOUT advancing its baseline, so
-      // the signal re-fires next tick (mirrors the patch pass).
+    for (const { sock, subId, sub } of pairs) {
+      // Backpressure: skip a pending sock WITHOUT advancing this sub's
+      // baseline, so the signal re-fires next tick (mirrors the patch pass).
+      // Socket-level skip: all subs on this conn are affected together.
       if (sock.data.pending) {
         continue;
       }
-      if (total !== sock.data.lastTotal || token !== sock.data.lastToken) {
+      if (total !== sub.lastTotal || token !== sub.lastToken) {
         writeFrames(sock, [
-          { type: "meta", collection: descriptor.name, rev, total },
+          {
+            type: "meta",
+            ...(subId !== null ? { id: subId } : {}),
+            collection: descriptor.name,
+            rev,
+            total,
+          },
         ]);
-        sock.data.lastTotal = total;
-        sock.data.lastToken = token;
+        sub.lastTotal = total;
+        sub.lastToken = token;
       }
     }
   }
@@ -1433,13 +1512,8 @@ export function startServer(
         // Drop the connection from the fan-out set, then release per-connection
         // state; nothing process-global to release here.
         conns.delete(socket as unknown as Writable);
+        socket.data.subs.clear();
         socket.data.pending = null;
-        socket.data.collection = null;
-        socket.data.watched.clear();
-        socket.data.lastSent.clear();
-        socket.data.where = null;
-        socket.data.lastTotal = null;
-        socket.data.lastToken = null;
       },
       error(_socket, err) {
         console.error("[server-worker] socket error:", err);
