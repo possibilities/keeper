@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Implement cross-project dep gating",
-  "updated_at": "2026-05-28T18:58:14.204055Z"
+  "updated_at": "2026-05-28T23:25:08.054643Z",
+  "worker_done_at": "2026-05-28T23:25:08.054643Z"
 }

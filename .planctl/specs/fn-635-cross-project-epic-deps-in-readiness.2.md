@@ -132,5 +132,5 @@ visible) and confirm a diagnostic lands in
 - [ ] No changes to `scripts/autopilot.ts` dispatch logic (only the diagnostics drain + log line); verdict-edge logic remains untouched — verified by re-reading the per-frame loop end-to-end after the diagnostic-drain hook lands
 
 ## Done summary
-
+Add dep-on-epic-dangling BlockReason, cwd-then-global resolver in predicate 9, cross-project provenance pills, diagnostics channel, and README updates
 ## Evidence
