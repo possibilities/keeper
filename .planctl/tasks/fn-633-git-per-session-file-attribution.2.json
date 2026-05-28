@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Schema v31 migration and rewind",
-  "updated_at": "2026-05-28T15:05:45.647176Z"
+  "updated_at": "2026-05-28T15:46:41.924139Z",
+  "worker_done_at": "2026-05-28T15:46:41.924139Z"
 }

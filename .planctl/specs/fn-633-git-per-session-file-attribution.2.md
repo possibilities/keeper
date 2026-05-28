@@ -57,5 +57,5 @@ Tests in test/db.test.ts (new or extend existing): fresh DB at v31 has expected 
 - [ ] test/db.test.ts (or equivalent) covers fresh-DB shape, v30→v31 migration shape, rewind idempotence, and re-fold reproducibility
 
 ## Done summary
-
+Schema v31 lands: events.bash_mutation_kind + bash_mutation_targets sparse columns, jobs.git_orphan_count renamed to git_unattributed_to_live_count + fresh git_orphan_count (strict-mystery), file_attributions table with composite PK + two indexes, partial index on bash_mutation_kind, version-guarded rewind, and full type/descriptor/reducer alignment so tasks .3 / .6 can land bash deriver + projectGitStatus rewrite without further schema motion.
 ## Evidence
