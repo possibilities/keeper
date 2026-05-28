@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-633-git-per-session-file-attribution",
   "bundles": [
     "sketch/git-surface-rewrite-per-session-attribution"
@@ -18,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-28T19:57:53.114053Z"
+  "updated_at": "2026-05-28T19:58:09.185296Z"
 }
