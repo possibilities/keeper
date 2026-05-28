@@ -232,5 +232,5 @@ All 35+ existing call sites work unchanged.
 - [ ] `bun test` green.
 
 ## Done summary
-
+Refactored ConnState to subs: Map<string|null,SubState>. Added SubState type, rewrote ConnState docstring, updated dispatchLine query/unsubscribe handlers, refactored diffTick to iterate (sock,subId,sub) triples grouped by collection. PatchFrame/MetaFrame gain id?: string. watch() helper gains subId=null param. Six new multi-sub tests + integration test. All 85 server-worker tests pass.
 ## Evidence
