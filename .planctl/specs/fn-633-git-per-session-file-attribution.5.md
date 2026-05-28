@@ -64,5 +64,5 @@ test/git-worker.test.ts: pure-function test for `buildGitSnapshot` against a tmp
 - [ ] test/git-worker.test.ts covers the new payload shape with ≥5 cases (clean, mixed-dirty, all-untracked, stat-race, symlink)
 
 ## Done summary
-
+Narrow producer to file-centric GitSnapshot: drop liveJobsForRoot/touchesForJob/planctlPathsForJob; buildGitSnapshot now composes porcelain-v2 parse + per-file lstat for mtime_ms (lstat to preserve symlink semantics; null on stat race). Reducer keeps writing orphaned_files/jobs[] columns via a local StoredGitSnapshot widening type during the .5→.6 transitional window.
 ## Evidence
