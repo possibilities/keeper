@@ -1627,6 +1627,17 @@ async function main(): Promise<void> {
     for (const epic of snap.epics) {
       const projectDir = seg(epic.project_dir);
       const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+      // Within a single epic, defer the side-effecting `launchInGhostty`
+      // calls into two buckets so approves fire ahead of any work/close
+      // dispatches. Edge detection (prev→cur diff, logTransition,
+      // lastVerdictSig.set) stays in the existing one-pass walk so every
+      // transition is still recorded exactly once. Matches the
+      // predicted-section ordering in `predictNextDispatches`
+      // (approvals → informational → workers → closers); an approve still
+      // requires `cur === "blocked:job-pending"` for that row, no trigger
+      // conditions are relaxed.
+      const approveDispatches: Array<() => void> = [];
+      const workCloseDispatches: Array<() => void> = [];
 
       for (const task of tasks) {
         const taskId = seg(task.task_id);
@@ -1648,58 +1659,73 @@ async function main(): Promise<void> {
         const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
         const dirBase = dir === "" ? "" : basename(dir);
         if (cur === "ready") {
-          launchInGhostty(
-            `${cdPrefix}claude '/plan:work ${taskId}'`,
-            `task ${taskId}`,
-            dirBase,
-            dir,
-            "work",
-            taskId,
+          workCloseDispatches.push(() =>
+            launchInGhostty(
+              `${cdPrefix}claude '/plan:work ${taskId}'`,
+              `task ${taskId}`,
+              dirBase,
+              dir,
+              "work",
+              taskId,
+            ),
           );
         } else if (cur === "blocked:job-pending") {
-          launchInGhostty(
-            `${cdPrefix}claude '/plan:approve ${taskId}'`,
-            `approve task ${taskId}`,
-            dirBase,
-            dir,
-            "approve",
-            taskId,
+          approveDispatches.push(() =>
+            launchInGhostty(
+              `${cdPrefix}claude '/plan:approve ${taskId}'`,
+              `approve task ${taskId}`,
+              dirBase,
+              dir,
+              "approve",
+              taskId,
+            ),
           );
         }
       }
 
       const epicId = seg(epic.epic_id);
-      if (epicId === "") {
-        continue;
-      }
-      const closeKey = `close:${epicId}`;
-      const closeCur = verdictSignature(snap.readiness.perCloseRow.get(epicId));
-      const closePrev = lastVerdictSig.get(closeKey);
-      if (closePrev === closeCur) {
-        continue;
-      }
-      logTransition(closeKey, closePrev, closeCur, closeDetail(epic, snap));
-      lastVerdictSig.set(closeKey, closeCur);
-      const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
-      const dirBase = projectDir === "" ? "" : basename(projectDir);
-      if (closeCur === "ready") {
-        launchInGhostty(
-          `${cdPrefix}claude '/plan:close ${epicId}'`,
-          `close ${epicId}`,
-          dirBase,
-          projectDir,
-          "close",
-          epicId,
+      if (epicId !== "") {
+        const closeKey = `close:${epicId}`;
+        const closeCur = verdictSignature(
+          snap.readiness.perCloseRow.get(epicId),
         );
-      } else if (closeCur === "blocked:job-pending") {
-        launchInGhostty(
-          `${cdPrefix}claude '/plan:approve ${epicId}'`,
-          `approve close ${epicId}`,
-          dirBase,
-          projectDir,
-          "approve",
-          epicId,
-        );
+        const closePrev = lastVerdictSig.get(closeKey);
+        if (closePrev !== closeCur) {
+          logTransition(closeKey, closePrev, closeCur, closeDetail(epic, snap));
+          lastVerdictSig.set(closeKey, closeCur);
+          const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
+          const dirBase = projectDir === "" ? "" : basename(projectDir);
+          if (closeCur === "ready") {
+            workCloseDispatches.push(() =>
+              launchInGhostty(
+                `${cdPrefix}claude '/plan:close ${epicId}'`,
+                `close ${epicId}`,
+                dirBase,
+                projectDir,
+                "close",
+                epicId,
+              ),
+            );
+          } else if (closeCur === "blocked:job-pending") {
+            approveDispatches.push(() =>
+              launchInGhostty(
+                `${cdPrefix}claude '/plan:approve ${epicId}'`,
+                `approve close ${epicId}`,
+                dirBase,
+                projectDir,
+                "approve",
+                epicId,
+              ),
+            );
+          }
+        }
+      }
+
+      for (const fire of approveDispatches) {
+        fire();
+      }
+      for (const fire of workCloseDispatches) {
+        fire();
       }
     }
   }
