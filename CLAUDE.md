@@ -46,16 +46,30 @@ the native value" is the default.
   UserPromptSubmit / Stop / SessionEnd / Killed / RateLimited|ApiError, a
   title update on TranscriptTitle, or a paired
   `(last_api_error_at, last_api_error_kind)` set/clear propagates
-  to every epic that references the session, AND the schema-v28
-  `projectGitStatus`/`retractGitStatus` fan-out from a `GitSnapshot` /
-  `GitRootDropped` event — per-job `jobs.git_dirty_count` (from
-  `snapshot.jobs[*].dirty.length`) and project-broadcast
-  `jobs.git_orphan_count` (from `snapshot.orphaned_files.length`) stamped
-  onto every enumerated job, then re-fanned via `syncJobIntoEpic` so the
-  embedded `jobs[]` arrays carry the counts; the `GitRootDropped` clear
-  walks the SAME canonical `git_status.jobs` enumeration the last write
-  fanned over and zeroes both columns symmetrically — so an unrelated
-  project's jobs running in another worktree stay untouched) and bumps
+  to every epic that references the session, AND the schema-v31
+  `projectGitStatus`/`retractGitStatus`/`projectCommit` fan-out from a
+  `GitSnapshot` / `GitRootDropped` / `Commit` event — `git_status` rows
+  carry the file-centric `dirty_files` JSON array with per-(session, file)
+  `attributions[]` computed by joining the event log against the
+  producer-frozen `mtime_ms` on each dirty-file entry, the renamed
+  per-job `jobs.git_unattributed_to_live_count` (formerly
+  `jobs.git_orphan_count` — dirty files no live session is on the hook
+  for) and the redefined strict-mystery `jobs.git_orphan_count` (dirty
+  files with zero attribution after the inference pass) are stamped onto
+  every enumerated job and re-fanned via `syncJobIntoEpic` so the
+  embedded `jobs[]` arrays carry the counts, and the new
+  `file_attributions` projection table (one row per
+  `(project_dir, file_path, session_id)` carrying `last_mutation_at` +
+  `last_commit_at`) is maintained inside the SAME `BEGIN IMMEDIATE` —
+  `Commit` folds update `last_commit_at` (never delete rows; a re-edit
+  re-arms attribution by re-stamping `last_mutation_at`), and the
+  `GitRootDropped` clear walks the SAME canonical `git_status.jobs`
+  enumeration the last write fanned over and zeroes the per-job columns
+  symmetrically — so an unrelated project's jobs running in another
+  worktree stay untouched. Producer-side `stat()` is forbidden inside
+  the reducer's transaction; mtimes are computed at snapshot build time
+  in the git worker, embedded in the payload, and consumed pure-SQL by
+  the attribution pass so re-fold determinism holds.) and bumps
   `reducer_state.last_event_id` in one transaction. A crash mid-fold rolls
   back both; boot drain re-folds idempotently. This is the
   exactly-once-per-event guarantee — never split the two writes across
@@ -83,14 +97,20 @@ the native value" is the default.
   per-session `jobs.epic_links` + per-epic `epics.job_links` link projections
   (sorted ASC on `(kind, target)` and `(kind, job_id)` respectively — total
   -order tiebreakers, never append). Hook-side derivers (`slashCommandFromPrompt`,
-  `extractSkillName`, `planVerbRefFromSpawnName`, `extractPlanctlInvocation`
-  — the last one gated on PostToolUse:Bash and parsing the authoritative
-  `planctl_invocation` envelope from `data.tool_response.stdout`) stamp the
-  eight sparse `events` columns (`slash_command`, `skill_name`, and the
+  `extractSkillName`, `planVerbRefFromSpawnName`, `extractPlanctlInvocation`,
+  `extractBashMutation`
+  — the planctl deriver gated on PostToolUse:Bash and parsing the
+  authoritative `planctl_invocation` envelope from
+  `data.tool_response.stdout`; the bash-mutation deriver gated on
+  PostToolUse:Bash and parsing the command shape) stamp the
+  ten sparse `events` columns (`slash_command`, `skill_name`, the
   six-column planctl envelope `planctl_op` / `planctl_target` /
   `planctl_epic_id` / `planctl_task_id` / `planctl_subject_present` /
   `planctl_queue_jump` — the last lifted from the optional `queue_jump`
-  field on the envelope, set by `/plan:queue` and absent elsewhere) at hook
+  field on the envelope, set by `/plan:queue` and absent elsewhere — and
+  the schema-v31 pair `bash_mutation_kind` + `bash_mutation_targets`
+  naming the filesystem-mutation shape and the affected paths for the
+  reducer's git-attribution pass) at hook
   write time — all pure functions of the hook payload, shared with the
   schema-migration backfill so a re-derive on stored events reproduces the
   same column values. The reducer's `syncJobIntoEpic` fan-out maintains the
@@ -121,7 +141,14 @@ the native value" is the default.
   the existing `tasks` / `jobs` carve-outs so an approval-RPC round-trip
   cannot wipe the link projection), `Killed` (boot seed sweep + live
   exit-watcher worker, gated by main's `(pid, start_time)` verifier before
-  insert). The RPC handlers' `.planctl` writes are not projection writes;
+  insert), `GitSnapshot` / `GitRootDropped` / `Commit` (git worker — the
+  schema-v31 file-centric `GitSnapshot` payload carries per-file
+  `{path, xy, mtime_ms}` with the producer-stamped mtime frozen in for
+  the reducer's attribution pass, and `Commit` fires on every HEAD-oid
+  change carrying `{project_dir, commit_oid, parent_oid, files,
+  committer_session_id}` for the discharge fold), `UsageSnapshot` /
+  `UsageDeleted` (usage worker), `ApiError` / `InputRequest` (transcript
+  worker). The RPC handlers' `.planctl` writes are not projection writes;
   the watcher round-trips them back as `EpicSnapshot`/`TaskSnapshot` events
   that the reducer folds — so re-fold determinism extends to `approval`.
 - **Producer-only liveness probing.** The seed sweep and the exit-watcher

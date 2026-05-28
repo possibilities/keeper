@@ -95,8 +95,14 @@ subagent calls — one row per `PreToolUse:Agent` paired with its later
 `running | ok | failed | unknown | superseded` and a populated `duration_ms`
 on close (NULL on rows that never observed a SubagentStop — `superseded`
 peers + lifecycle-swept `unknown` orphans)), `git` (per-worktree planctl-backed
-git status — branch, ahead/behind, dirty + orphaned file lists, per-live-job
-dirty/planctl groupings), and `usage` (one row per agentuse profile observed
+git status — branch, ahead/behind, and a file-centric `dirty_files` list where
+each entry carries a per-file `attributions[]` array with `source` badges
+(`tool` / `bash` / `inferred`) naming every session that mutated the file
+since its last commit; a session is attributed iff it has mutated the file
+AND has not committed it more recently than its last mutation, so commit
+discharges attribution and a re-edit reinstates it; the strict
+`orphan_files` bucket holds dirty files with zero attribution after the
+inference pass), and `usage` (one row per agentuse profile observed
 at `~/.local/state/agentuse/<id>.json` — target, multiplier, session+week
 percent and reset timestamps). The
 surface is built so additional collections register without touching the
@@ -435,8 +441,14 @@ CI) `--live` silently behaves as if it wasn't set. Run any of them with
 
 - `git.ts` — single-collection subscribe client over the `git`
   collection (planctl-backed worktree status: branch, ahead/behind,
-  dirty + orphaned file lists, and per-live-job dirty/planctl file
-  groupings). Uses `subscribeCollection` from `src/readiness-client.ts`
+  and a file-centric layout — one line per dirty file followed by its
+  per-session `attributions[]`, each rendered with a colored source
+  badge (`tool` = direct Edit/Write/MultiEdit, `bash` = derived from a
+  Bash mutation event, `inferred` = time-bracketed against the
+  session's Bash intervals); a single file can carry multiple
+  attribution rows when several live sessions edited it without an
+  intervening commit, and the strict `orphan_files` bucket is rendered
+  as a separate trailing block for dirty files with zero attribution). Uses `subscribeCollection` from `src/readiness-client.ts`
   (the same lifecycle primitive that powers the readiness clients,
   scoped to one collection). Each frame is led by `---`; one block per
   non-empty worktree row, all-zero rows dropped. Same three per-pid
@@ -500,10 +512,12 @@ rm -rf ~/.local/state/keeper
 
 ## Architecture
 
-The `events` table is a durable append-only log (with eight sparse
+The `events` table is a durable append-only log (with ten sparse
 top-level signals partial-indexed for cheap cross-session lookup —
-`slash_command`, `skill_name`, `tool_use_id`, and the five-column
-`planctl_*` envelope; see [What keeper is](#what-keeper-is)); the reducer
+`slash_command`, `skill_name`, `tool_use_id`, the five-column
+`planctl_*` envelope, and the schema-v31 pair `bash_mutation_kind` +
+`bash_mutation_targets` stamped on `PostToolUse:Bash` rows whose
+command parses as a filesystem-mutating shape; see [What keeper is](#what-keeper-is)); the reducer
 folds it into the `jobs` projection while advancing the `reducer_state`
 cursor in the same transaction (exactly-once-per-event). A Worker thread on its own read-only
 connection polls `PRAGMA data_version` at ~50ms and posts contentless wake
@@ -584,7 +598,30 @@ approval-RPC round-trip (alongside `tasks` / `jobs` / `job_links`). The
 `sort_path asc`, so a closer-created child epic slots directly below its
 parent in the default page; `sort_path` overflows to `''` at the documented
 ceiling `epic_number >= 1_000_000` (safe-fold; the reducer never throws
-inside `BEGIN IMMEDIATE`). As of schema v25, each `epics.job_links`
+inside `BEGIN IMMEDIATE`). As of schema v31, the `git` collection is
+rebuilt around per-(session, file) attribution: `events` gains
+`bash_mutation_kind` + `bash_mutation_targets` (hook-side derived columns
+that name the mutation shape and the affected paths on every
+`PostToolUse:Bash` row whose command parses as a filesystem mutation),
+`jobs` gains `git_unattributed_to_live_count` (the renamed former
+`git_orphan_count` — dirty files no live session is on the hook for) and
+redefines `git_orphan_count` to the strict mystery sense (dirty files
+with zero attribution after the inference pass), and a new
+`file_attributions` table carries one row per `(project_dir, file_path,
+session_id)` with `last_mutation_at` + `last_commit_at` so the discharge
+rule is indexable. The producer worker `stat`s every dirty file at
+snapshot build time and embeds `mtime_ms` in the `GitSnapshot` payload;
+the reducer's attribution pass joins the event log against those
+frozen-in-payload mtimes inside `BEGIN IMMEDIATE` (never `stat`s inside
+the transaction). The git-worker also emits a new `Commit` synthetic
+event on every HEAD-oid change (carrying `{project_dir, commit_oid,
+parent_oid, files, committer_session_id}` — the committer is resolved
+deterministically from a `Session-Id:` commit trailer stamped by the
+`plugin/bin/git` PATH wrapper when `CLAUDE_CODE_SESSION_ID` is set, or
+falls back to a global discharge when the trailer is absent), and the
+reducer's `Commit` fold updates `file_attributions.last_commit_at`
+(never deletes rows) so a re-edit re-arms attribution by re-stamping
+`last_mutation_at`. `GitRootDropped` retracts symmetrically. As of schema v25, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `last_api_error_at` /
 `last_api_error_kind` / `last_input_request_at` /
 `last_input_request_kind` denormalized off the live `jobs` row at the
@@ -749,6 +786,14 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 # Work-verb jobs per task — double-unnest epics.tasks then each task's embedded jobs sub-array:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.sort_path ASC, task_id ASC LIMIT 10"
+
+# Git projection — one row per planctl-backed worktree. dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred and commit-discharge timestamps):
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT project_dir, branch, ahead, behind, json_extract(dirty_files, '\$[0]') AS first_dirty FROM git_status LIMIT 5"
+
+# file_attributions — one row per (project_dir, file_path, session_id) carrying the discharge-rule facts (last_mutation_at vs last_commit_at; a row is live-attributed iff last_commit_at IS NULL OR last_commit_at < last_mutation_at). Indexed for both per-file and per-session scans:
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT project_dir, file_path, session_id, last_mutation_at, last_commit_at FROM file_attributions ORDER BY last_mutation_at DESC LIMIT 20"
 
 # Usage projection — one row per agentuse profile observed at ~/.local/state/agentuse/<id>.json (freshness fields are excluded by design — keeper has no freshness signal yet):
 sqlite3 ~/.local/state/keeper/keeper.db \
