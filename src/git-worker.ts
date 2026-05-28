@@ -8,12 +8,12 @@
  * checkout, branch-switch, fetch — operations that mutate refs/HEAD/index
  * without touching any worktree file, which the worktree subscription
  * intentionally never sees because it ignores `**\/.git/**`), (3) a
- * `PRAGMA data_version` bump on keeper's own DB (new tool event landed →
- * per-job touched-set may have changed → reattribution required), or (4) a
- * 60s heartbeat safety-net. Each signal feeds a per-root `RescanScheduler`
- * (trailing-debounce + single-flight) so a flurry collapses into one
- * `git status` shell-out. The per-root `lastByRoot` JSON dedupe absorbs
- * no-op snapshots.
+ * `PRAGMA data_version` bump on keeper's own DB (new jobs row → root-membership
+ * may have changed → re-reconcile worktree subscriptions; the attribution
+ * join itself runs in the reducer, not here), or (4) a 60s heartbeat
+ * safety-net. Each signal feeds a per-root `RescanScheduler` (trailing-
+ * debounce + single-flight) so a flurry collapses into one `git status`
+ * shell-out. The per-root `lastByRoot` JSON dedupe absorbs no-op snapshots.
  *
  * `PRAGMA data_version` polling is the only sanctioned DB change primitive
  * per the CLAUDE.md DO-NOT — it's a sub-ms autocommit counter read, not a
@@ -29,12 +29,12 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
-import { isAbsolute, join, normalize, relative, resolve } from "node:path";
+import { existsSync, lstatSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
-import { parsePlanRef, parseSessionIdTrailer } from "./derivers";
+import { parseSessionIdTrailer } from "./derivers";
 import { isDropError, RescanScheduler } from "./rescan";
 import type { ShutdownMessage } from "./wake-worker";
 
@@ -51,23 +51,49 @@ export interface GitFileStatus {
   orig_path?: string;
 }
 
-export interface GitJobFileTouch {
+/**
+ * One dirty-file entry on the file-centric {@link GitSnapshotPayload} (schema
+ * v31 / task fn-633.5). Field-for-field a {@link GitFileStatus} plus a
+ * frozen-in-payload `mtime_ms` (filesystem modification time in unix-epoch
+ * milliseconds, lifted via `fs.lstatSync(path).mtimeMs` so symlinks report
+ * the link's own mtime — not the target's). `mtime_ms` is `null` when the
+ * `lstat` failed (the file moved between `git status` enumeration and the
+ * per-file `lstat`, the producer-side stat race documented in the task
+ * spec's "Risks" section); the reducer reads `null` as "no inferred-
+ * attribution possible for this file" and rolls forward without it.
+ *
+ * The producer no longer joins against the event log to compute per-job
+ * touched-set / per-job dirty filter / project-wide orphan set — those
+ * derivations move to the reducer (task fn-633.6) where they run inside
+ * `BEGIN IMMEDIATE` against the persisted event log + `file_attributions`
+ * table. The producer's contract narrows to "enumerate dirty files,
+ * `lstat` each, embed mtime, post the payload".
+ */
+export interface GitDirtyFile {
   path: string;
-  ops: string[];
+  xy: string;
+  kind: "ordinary" | "renamed" | "unmerged" | "untracked";
+  orig_path?: string;
+  mtime_ms: number | null;
 }
 
-export interface GitJobView {
-  job_id: string;
-  title: string | null;
-  state: string;
-  cwd: string | null;
-  plan_verb: string | null;
-  plan_ref: string | null;
-  touched: GitJobFileTouch[];
-  dirty: GitFileStatus[];
-  planctl: GitFileStatus[];
-}
-
+/**
+ * The file-centric `GitSnapshot` payload (schema v31 / task fn-633.5). Carries
+ * the producer-observed `git status --porcelain=v2` parse — branch metadata,
+ * HEAD oid, ahead/behind, and the dirty-file list with embedded `mtime_ms`
+ * per file — and NOTHING else. Per-job rollup (`jobs[]`), per-file
+ * attributions (`attributions[]`), and the project-wide orphan set
+ * (`orphaned_files`) are derived by the reducer in `projectGitStatus`
+ * (task fn-633.6) joining this payload against the persisted event log
+ * and `file_attributions` table.
+ *
+ * Why the producer doesn't compute attribution: a touched-set join over
+ * the event log would have to happen at producer time, and the producer
+ * runs without the writer lock — so two concurrent producers (real + a
+ * future replay) would see different mid-fold projections. Moving the
+ * join to the reducer's `BEGIN IMMEDIATE` makes attribution a pure
+ * function of the persisted event log, restoring re-fold determinism.
+ */
 export interface GitSnapshotPayload {
   project_dir: string;
   branch: string | null;
@@ -75,9 +101,7 @@ export interface GitSnapshotPayload {
   upstream: string | null;
   ahead: number | null;
   behind: number | null;
-  dirty_files: GitFileStatus[];
-  orphaned_files: GitFileStatus[];
-  jobs: GitJobView[];
+  dirty_files: GitDirtyFile[];
 }
 
 export interface GitSnapshotMessage extends GitSnapshotPayload {
@@ -149,27 +173,11 @@ interface ParsedGitStatus {
   files: GitFileStatus[];
 }
 
-interface JobRow {
-  job_id: string;
-  title: string | null;
-  state: string;
-  cwd: string | null;
-  plan_verb: string | null;
-  plan_ref: string | null;
-}
-
-interface EventRow {
-  tool_name: string | null;
-  cwd: string | null;
-  data: string;
-}
-
 /** `PRAGMA data_version` cadence — same shape as `wake-worker.ts`. */
 const DB_POLL_MS = 100;
 /** Silent-watcher backstop, same shape as `transcript-worker.ts`. */
 const HEARTBEAT_MS = 60_000;
 const GIT_TIMEOUT_MS = 2000;
-const FILE_TOOL_NAMES = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 
 /**
  * Positive ignore globs for `@parcel/watcher`. Mirrors `plan-worker.ts`'s
@@ -221,97 +229,6 @@ function stringifyErr(err: unknown): string {
   } catch {
     return String(err);
   }
-}
-
-function isInside(root: string, path: string): boolean {
-  const rel = relative(root, path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
-function normalizeRel(path: string): string {
-  return path.split("\\").join("/");
-}
-
-function resolveEventPath(
-  rawPath: string,
-  root: string,
-  cwd: string | null,
-): string | null {
-  if (rawPath.length === 0) {
-    return null;
-  }
-  const abs = normalize(
-    isAbsolute(rawPath) ? rawPath : join(cwd ?? root, rawPath),
-  );
-  if (!isInside(root, abs)) {
-    return null;
-  }
-  return normalizeRel(relative(root, abs));
-}
-
-function touchOpForTool(toolName: string | null): string | null {
-  switch (toolName) {
-    case "Write":
-      return "write";
-    case "Edit":
-    case "MultiEdit":
-    case "NotebookEdit":
-      return "update";
-    default:
-      return null;
-  }
-}
-
-export function extractFileTouches(
-  row: EventRow,
-  root: string,
-): GitJobFileTouch[] {
-  if (!FILE_TOOL_NAMES.has(row.tool_name ?? "")) {
-    return [];
-  }
-  let parsed: { tool_input?: unknown };
-  try {
-    parsed = JSON.parse(row.data) as { tool_input?: unknown };
-  } catch {
-    return [];
-  }
-  const input = parsed.tool_input;
-  if (typeof input !== "object" || input === null) {
-    return [];
-  }
-  const key = row.tool_name === "NotebookEdit" ? "notebook_path" : "file_path";
-  const candidate = (input as Record<string, unknown>)[key];
-  if (typeof candidate !== "string") {
-    return [];
-  }
-  const path = resolveEventPath(candidate, root, row.cwd);
-  const op = touchOpForTool(row.tool_name);
-  return path != null && op != null ? [{ path, ops: [op] }] : [];
-}
-
-function mergeTouches(touches: GitJobFileTouch[]): GitJobFileTouch[] {
-  const byPath = new Map<string, Set<string>>();
-  for (const touch of touches) {
-    let ops = byPath.get(touch.path);
-    if (ops == null) {
-      ops = new Set();
-      byPath.set(touch.path, ops);
-    }
-    for (const op of touch.ops) ops.add(op);
-  }
-  return [...byPath.entries()]
-    .map(([path, ops]) => ({ path, ops: [...ops].sort() }))
-    .sort((a, b) => a.path.localeCompare(b.path));
-}
-
-function isStatusTouchedBy(
-  status: GitFileStatus,
-  touched: Set<string>,
-): boolean {
-  return (
-    touched.has(status.path) ||
-    (status.orig_path != null && touched.has(status.orig_path))
-  );
 }
 
 function parseBranchAheadBehind(value: string): {
@@ -674,95 +591,63 @@ function discoverProjectRoots(
   return [...roots].sort();
 }
 
-function liveJobsForRoot(db: Database, root: string): JobRow[] {
-  const rows = db
-    .query(
-      `SELECT job_id, title, state, cwd, plan_verb, plan_ref
-         FROM jobs
-        WHERE cwd IS NOT NULL
-          AND state IN ('working', 'stopped')
-        ORDER BY created_at DESC, job_id ASC`,
-    )
-    .all() as JobRow[];
-  return rows.filter((row) => row.cwd != null && isInside(root, row.cwd));
-}
-
-function touchesForJob(
-  db: Database,
-  root: string,
-  jobId: string,
-): GitJobFileTouch[] {
-  const rows = db
-    .query(
-      `SELECT tool_name, cwd, data
-         FROM events
-        WHERE session_id = ?
-          AND hook_event = 'PostToolUse'
-          AND tool_name IN ('Write', 'Edit', 'MultiEdit', 'NotebookEdit')
-        ORDER BY id ASC`,
-    )
-    .all(jobId) as EventRow[];
-  return mergeTouches(rows.flatMap((row) => extractFileTouches(row, root)));
+/**
+ * Best-effort `lstat` of one worktree-relative dirty-file path, anchored on
+ * `projectDir`. Returns the file's mtime in unix-epoch milliseconds, or
+ * `null` if `lstat` failed (the file was enumerated by `git status` but
+ * gone by the time we stat it — the documented producer-side stat race).
+ *
+ * **`lstat`, not `stat`** — for a worktree-managed symlink we want the
+ * symlink's own mtime, not the target's (the target may live outside the
+ * worktree entirely, and `git status` already reported the symlink itself
+ * as the dirty entry). Without `lstat`, a symlink to a frequently-touched
+ * external file would get a misleading mtime that re-attributes its
+ * inferred-claim every time the target moved.
+ *
+ * Producer-only contract: a throw here cannot wedge the worker, so we
+ * collapse every failure mode to `null` and let the reducer roll forward.
+ */
+function lstatMtimeMs(projectDir: string, relPath: string): number | null {
+  try {
+    const abs = isAbsolute(relPath) ? relPath : join(projectDir, relPath);
+    const st = lstatSync(abs);
+    return st.mtimeMs;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Per-job set of `.planctl/{epics,tasks}/<id>.json` paths derived from the
- * session's mutation-verb planctl invocations. Gated on
- * `planctl_subject_present = 1` so read-only verbs (`cat`, `show`, `list`)
- * never attribute a file. Targets are mapped through `parsePlanRef` so only
- * canonical refs produce paths; malformed targets skip silently.
+ * Build the file-centric `GitSnapshot` payload. Pure composition of the
+ * `git status --porcelain=v2` parse with a per-file `lstat` for `mtime_ms` —
+ * no event-log join, no `jobs` join, no per-(session, file) derivation.
+ * Per-job rollup, per-file attribution, and the project-wide orphan set are
+ * computed by the reducer in `projectGitStatus` (task fn-633.6) inside
+ * `BEGIN IMMEDIATE` against the persisted event log + `file_attributions`
+ * table — moving the join there restores re-fold determinism (a producer
+ * runs without the writer lock, so an event-log join here would see a
+ * different mid-fold projection on every re-fold).
+ *
+ * The renamed-path case keeps the renamed entry's `path` (the NEW path —
+ * what's currently in the worktree); `orig_path` rides along when set so
+ * the reducer can dereference both halves of the rename pair against the
+ * event log. `lstat` always targets `path` (the new name); `orig_path`
+ * doesn't exist on disk anymore.
  */
-function planctlPathsForJob(db: Database, jobId: string): Set<string> {
-  const rows = db
-    .query(
-      `SELECT DISTINCT planctl_target
-         FROM events
-        WHERE session_id = ?
-          AND planctl_op IS NOT NULL
-          AND planctl_subject_present = 1
-          AND planctl_target IS NOT NULL`,
-    )
-    .all(jobId) as { planctl_target: string }[];
-  const paths = new Set<string>();
-  for (const row of rows) {
-    const parsed = parsePlanRef(row.planctl_target);
-    if (parsed == null) continue;
-    if (parsed.kind === "epic") {
-      paths.add(`.planctl/epics/${parsed.epic_id}.json`);
-    } else {
-      paths.add(`.planctl/tasks/${parsed.task_id}.json`);
-    }
-  }
-  return paths;
-}
-
 export function buildGitSnapshot(
-  db: Database,
   projectDir: string,
   status: ParsedGitStatus,
 ): GitSnapshotPayload {
-  const jobs = liveJobsForRoot(db, projectDir).map((job) => {
-    const touched = touchesForJob(db, projectDir, job.job_id);
-    const touchedSet = new Set(touched.map((t) => t.path));
-    const planctlPaths = planctlPathsForJob(db, job.job_id);
-    return {
-      ...job,
-      touched,
-      dirty: status.files.filter((file) => isStatusTouchedBy(file, touchedSet)),
-      planctl: status.files.filter((file) =>
-        isStatusTouchedBy(file, planctlPaths),
-      ),
+  const dirty: GitDirtyFile[] = status.files.map((file) => {
+    const entry: GitDirtyFile = {
+      path: file.path,
+      xy: file.xy,
+      kind: file.kind,
+      mtime_ms: lstatMtimeMs(projectDir, file.path),
     };
+    if (file.orig_path != null) entry.orig_path = file.orig_path;
+    return entry;
   });
-
-  const touchedByLiveJobs = new Set<string>();
-  for (const job of jobs) {
-    for (const touch of job.touched) touchedByLiveJobs.add(touch.path);
-    for (const file of job.planctl) touchedByLiveJobs.add(file.path);
-  }
-  const orphaned = status.files.filter(
-    (file) => !isStatusTouchedBy(file, touchedByLiveJobs),
-  );
 
   return {
     project_dir: projectDir,
@@ -771,9 +656,7 @@ export function buildGitSnapshot(
     upstream: status.upstream,
     ahead: status.ahead,
     behind: status.behind,
-    dirty_files: status.files,
-    orphaned_files: orphaned,
-    jobs,
+    dirty_files: dirty,
   };
 }
 
@@ -895,7 +778,7 @@ function startWorker(): void {
 
     let snapshot: GitSnapshotPayload;
     try {
-      snapshot = buildGitSnapshot(db, root, status);
+      snapshot = buildGitSnapshot(root, status);
     } catch (err) {
       console.error(
         `[git-worker] buildGitSnapshot failed for ${root}: ${stringifyErr(err)}`,

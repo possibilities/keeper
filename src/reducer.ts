@@ -881,12 +881,44 @@ function retractPlanRow(db: Database, event: Event): void {
   );
 }
 
-function extractGitSnapshot(event: Event): GitSnapshotPayload | null {
+/**
+ * Reducer-local widened `GitSnapshot` shape (transitional — fn-633.5 → .6).
+ *
+ * The producer payload ({@link GitSnapshotPayload}) narrowed in fn-633.5 to
+ * the file-centric shape `{project_dir, branch, head_oid, upstream, ahead,
+ * behind, dirty_files: GitDirtyFile[]}` — `orphaned_files` and `jobs[]`
+ * dropped because their derivations move into the reducer's transactional
+ * fold in fn-633.6. Until that task rewrites `projectGitStatus` to derive
+ * `orphaned_files` / per-job rollup from `dirty_files` + `file_attributions`
+ * + the event log, the reducer still WRITES those columns on the
+ * `git_status` projection and fans the per-job counts into `jobs` — so it
+ * needs to read both halves of the transitional shape:
+ *
+ * - Real producer events post-fn-633.5 carry only the narrow shape. The
+ *   reducer reads `orphaned_files` / `jobs[]` as `[]` from this type's
+ *   defaults, so `git_unattributed_to_live_count` stays at the steady-
+ *   state zero between fn-633.5 and fn-633.6 (the same false-clean window
+ *   documented on `projectGitStatus` for unenumerated jobs).
+ * - Test fixtures (and any historical events stored before fn-633.5) still
+ *   carry the wide shape. The defensive `Array.isArray` checks accept
+ *   their `orphaned_files` / `jobs[]` and keep the legacy fan-out behavior
+ *   verbatim, preserving re-fold determinism across the schema-v31 cut.
+ *
+ * fn-633.6 deletes this local type and replaces it with the narrow producer
+ * payload — by then `orphaned_files` / `jobs[]` are computed inside the
+ * fold, not lifted from the event blob.
+ */
+interface StoredGitSnapshot extends GitSnapshotPayload {
+  orphaned_files: unknown[];
+  jobs: { job_id?: unknown; dirty?: unknown }[];
+}
+
+function extractGitSnapshot(event: Event): StoredGitSnapshot | null {
   if (event.data == null || event.data.length === 0) {
     return null;
   }
   try {
-    const parsed = JSON.parse(event.data) as Partial<GitSnapshotPayload>;
+    const parsed = JSON.parse(event.data) as Partial<StoredGitSnapshot>;
     if (
       typeof parsed.project_dir !== "string" ||
       parsed.project_dir.length === 0
