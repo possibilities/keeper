@@ -40,5 +40,5 @@ test/readiness.test.ts: existing predicate 6.5 cases get column-name updates. Ad
 - [ ] Comment block in readiness.ts documents the reason-kind-vs-column divergence
 
 ## Done summary
-
+Renamed readiness map field from orphan_count to unattributed_to_live_count (schema-v31 column rename). Predicate 6.5 task + close arms now read the renamed value; block-reason kind stays git-orphans for autopilot backward compatibility. Client-side projection computes unattributed_to_live_count from git_status.dirty_files[].attributions[] (counting files with no live working/stopped attribution); the wire column orphaned_count carrying strict-mystery is informational only at v31. Added two acceptance tests proving strict-mystery > 0 with unattributed_to_live == 0 does NOT block; updated existing fn-620/fn-626 predicate 6.5 tests + autopilot.test.ts for the field rename. Column-name-vs-reason-kind divergence documented in readiness.ts BlockReason doc, map-type doc, and both predicate arms.
 ## Evidence
