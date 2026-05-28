@@ -1,0 +1,85 @@
+#!/bin/bash
+# keeper git wrapper — stamps a `Session-Id:` trailer on every `git commit`
+# invocation when $CLAUDE_CODE_SESSION_ID is set.
+#
+# Walks past leading git global options to find the real subcommand. When the
+# subcommand is `commit` AND $CLAUDE_CODE_SESSION_ID is set, injects
+# `--trailer "Session-Id: $CLAUDE_CODE_SESSION_ID"` immediately after the
+# `commit` token before exec'ing /usr/bin/git. Every other path-through is
+# byte-identical argv.
+#
+# Conservative default: any input we can't classify falls through to real git
+# unmodified — the only failure mode is "couldn't determine subcmd → don't
+# inject" so the wrapper never breaks a non-commit invocation.
+#
+# Git's `--trailer` flag uses `addIfDifferentNeighbor` by default, so an
+# `amend` with the same Session-Id is a no-op (verified empirically).
+
+set -u
+
+REAL_GIT=/usr/bin/git
+
+# If the session id isn't set, there's nothing to inject — exec real git with
+# the original argv unchanged.
+if [ -z "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  exec "$REAL_GIT" "$@"
+fi
+
+# Walk past git global options to find the subcommand index. Returns the
+# index of the subcommand in $@ via the global SUBCMD_IDX, or empty on
+# unknown / no subcommand.
+SUBCMD_IDX=""
+SUBCMD=""
+
+i=1
+while [ $i -le $# ]; do
+  arg="${!i}"
+  case "$arg" in
+    # Global options that consume the NEXT argument.
+    -c|-C|--git-dir|--work-tree|--namespace|--super-prefix|--config-env|--list-cmds|--attr-source)
+      i=$((i + 2))
+      continue
+      ;;
+    # Global options bundled with `=VALUE`, no second arg consumed.
+    --git-dir=*|--work-tree=*|--namespace=*|--super-prefix=*|--config-env=*|--list-cmds=*|--attr-source=*|--exec-path=*)
+      i=$((i + 1))
+      continue
+      ;;
+    # Global flags with no argument.
+    -p|--paginate|-P|--no-pager|--bare|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--exec-path|--html-path|--man-path|--info-path|-h|--help|--version)
+      i=$((i + 1))
+      continue
+      ;;
+    # Anything else starting with `-` is unknown — bail to fall-through.
+    -*)
+      SUBCMD_IDX=""
+      break
+      ;;
+    # First non-option token is the subcommand.
+    *)
+      SUBCMD_IDX=$i
+      SUBCMD="$arg"
+      break
+      ;;
+  esac
+done
+
+# Not a `commit` subcommand → exec unchanged.
+if [ "$SUBCMD" != "commit" ]; then
+  exec "$REAL_GIT" "$@"
+fi
+
+# Rebuild argv with `--trailer "Session-Id: $CLAUDE_CODE_SESSION_ID"` injected
+# right after the `commit` token.
+TRAILER="Session-Id: $CLAUDE_CODE_SESSION_ID"
+NEW_ARGS=()
+j=1
+while [ $j -le $# ]; do
+  NEW_ARGS+=("${!j}")
+  if [ $j -eq $SUBCMD_IDX ]; then
+    NEW_ARGS+=("--trailer" "$TRAILER")
+  fi
+  j=$((j + 1))
+done
+
+exec "$REAL_GIT" "${NEW_ARGS[@]}"
