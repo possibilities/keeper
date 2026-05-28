@@ -359,9 +359,12 @@ CI) `--live` silently behaves as if it wasn't set. Run any of them with
   a `~~~` divider between the epics body and the jobs body (and a second
   `~~~` inside the jobs body splitting ambient sessions from
   planner/worker/closer rows). Uses server-default scope for all three:
-  epics `{ status: "open", approval: { ne: "approved" } }`, jobs live
-  only (`working + stopped`), `subagent_invocations` full per-job
-  timeline. Each epic renders as a header line —
+  epics are scoped via the descriptor's `defaultClause` — schema v32
+  (fn-634) materializes the predicate "open OR not-yet-approved" as the
+  VIRTUAL generated column `default_visible` and serves it from the
+  partial index `idx_epics_default_visible WHERE default_visible = 1`
+  as a covering SEARCH — jobs live only (`working + stopped`),
+  `subagent_invocations` full per-job timeline. Each epic renders as a header line —
   `({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated]
   [slotted-after-closer]? [ready|completed|blocked:<reason>]` — followed by indented task lines
   (the optional `[slotted-after-closer]` pill — schema v29, active/cyan
@@ -621,7 +624,17 @@ deterministically from a `Session-Id:` commit trailer stamped by the
 falls back to a global discharge when the trailer is absent), and the
 reducer's `Commit` fold updates `file_attributions.last_commit_at`
 (never deletes rows) so a re-edit re-arms attribution by re-stamping
-`last_mutation_at`. `GitRootDropped` retracts symmetrically. As of schema v25, each `epics.job_links`
+`last_mutation_at`. `GitRootDropped` retracts symmetrically. As of
+schema v32 (fn-634), `epics` adds `default_visible` as a VIRTUAL
+generated column SQLite computes from
+`CASE WHEN status='open' OR approval!='approved' THEN 1 ELSE 0 END`,
+materializing the descriptor's cross-column default scope as a single
+0/1 derived value; a partial composite index
+`idx_epics_default_visible ON epics(default_visible, sort_path, epic_id)
+WHERE default_visible = 1` serves the default no-wire-filter query as
+a covering SEARCH (no SCAN, no temp B-tree for the
+`sort_path ASC, epic_id ASC` ORDER BY) — collapsing the Tier 4
+diffTick/metaCount p95 tail. As of schema v25, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `last_api_error_at` /
 `last_api_error_kind` / `last_input_request_at` /
 `last_input_request_kind` denormalized off the live `jobs` row at the
@@ -777,9 +790,12 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, pid, start_time FROM jobs WHERE state = "killed" ORDER BY updated_at DESC LIMIT 10'
 
-# Plans projection — epics (each embedding its tasks AND its plan/close-verb jobs as JSON arrays) folded from the configured `.planctl` roots. As of schema v29 the natural sort is `sort_path ASC` (matches the `EPICS_DESCRIPTOR` default), which slots closer-created children directly below their parent — uses the idx_epics_sort_path index:
+# Plans projection — epics (each embedding its tasks AND its plan/close-verb jobs as JSON arrays) folded from the configured `.planctl` roots. As of schema v29 the natural sort is `sort_path ASC` (matches the `EPICS_DESCRIPTOR` default), which slots closer-created children directly below their parent — an unfiltered query uses idx_epics_sort_path; the default-scope query (`WHERE default_visible = 1`, schema v32) uses the partial composite idx_epics_default_visible:
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT epic_id, epic_number, sort_path, created_by_closer_of, title, status, last_validated_at, json_array_length(jobs) AS epic_jobs_n FROM epics ORDER BY sort_path ASC, epic_id ASC LIMIT 10'
+# Default-scope epics — what the board sees by default: every open OR not-yet-approved epic. Schema v32 (fn-634) materializes the predicate as the VIRTUAL generated column `default_visible` and a partial composite index `idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1` serves it as a covering SEARCH (no SCAN, no temp B-tree). The literal `= 1` is load-bearing for the partial-index match:
+sqlite3 ~/.local/state/keeper/keeper.db \
+  'SELECT epic_id, epic_number, sort_path, title, status, approval FROM epics WHERE default_visible = 1 ORDER BY sort_path ASC, epic_id ASC LIMIT 10'
 # Tasks live inside epics.tasks now — unnest with json_each to list them per epic. Schema v19 surfaces BOTH the planctl-native runtime status (`runtime_status`: todo|in_progress|done|blocked, ingested from `.planctl/state/tasks/<task_id>.state.json`) AND the derived worker-phase binary (`worker_phase`: open|done, derived from `worker_done_at`) — outer ORDER BY uses the idx_epics_sort_path index:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(t.value, '\$.task_number') AS task_number, json_extract(t.value, '\$.title') AS title, json_extract(t.value, '\$.runtime_status') AS runtime_status, json_extract(t.value, '\$.worker_phase') AS worker_phase FROM epics e, json_each(e.tasks) t ORDER BY e.sort_path ASC, task_number ASC LIMIT 10"

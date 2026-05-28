@@ -395,13 +395,16 @@ test("runQuery applies the default live scope, hiding both terminal states, unle
   db.close();
 });
 
-test("resolveFilter: epics default OR-scope applies bare, is dropped by ANY wire filter, exempts pk lookups", () => {
-  // No filter → the descriptor's `defaultClause` (raw SQL with bound params)
-  // is appended. Predicate is "open OR not-yet-approved" — the cross-column
-  // OR that the per-key `defaultFilter` map can't express.
+test("resolveFilter: epics default visible-scope applies bare, is dropped by ANY wire filter, exempts pk lookups", () => {
+  // No filter → the descriptor's `defaultClause` is appended. Predicate is
+  // "open OR not-yet-approved", materialized as the schema-v32 VIRTUAL
+  // generated column `default_visible` and queried via the literal
+  // single-column equality `default_visible = 1` (NOT parameterized — the
+  // literal is required for the partial-index matcher to land
+  // `idx_epics_default_visible`).
   const def = resolveFilter(EPICS_DESCRIPTOR, undefined);
-  expect(def.clause).toBe("WHERE (status = ? OR approval != ?)");
-  expect(def.params).toEqual(["open", "approved"]);
+  expect(def.clause).toBe("WHERE default_visible = 1");
+  expect(def.params).toEqual([]);
 
   // An explicit status drops the defaultClause entirely (wire-not-empty is
   // the user's "I know what I want" override). Page now shows ONLY done

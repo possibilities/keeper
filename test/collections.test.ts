@@ -535,16 +535,19 @@ test("runQuery narrows the epics set by status filter", () => {
 });
 
 test("epics descriptor defaults the view scope to status open OR approval ne approved", () => {
-  // Cross-column OR default — the predicate can't be expressed as per-key
-  // ANDs, so it lives in `defaultClause` (raw SQL with bound params), not the
-  // `defaultFilter` map. ANY wire filter drops it (the wire is the user's "I
-  // know what I want" override); a pk subscribe is exempt.
+  // Schema v32 (fn-634): the predicate "open OR not-yet-approved" is
+  // materialized via the VIRTUAL generated column `default_visible` and
+  // queried as a literal single-column equality `default_visible = 1` —
+  // literal-1 (not `params: [1]`) so the partial-index matcher lands
+  // `idx_epics_default_visible WHERE default_visible = 1` reliably across
+  // SQLite versions. ANY wire filter drops the clause (the wire is the
+  // user's "I know what I want" override); a pk subscribe is exempt.
   expect(EPICS_DESCRIPTOR.defaultClause).toEqual({
-    sql: "(status = ? OR approval != ?)",
-    params: ["open", "approved"],
+    sql: "default_visible = 1",
+    params: [],
   });
-  // The per-key `defaultFilter` map is unused on epics — only the raw OR
-  // clause applies.
+  // The per-key `defaultFilter` map is unused on epics — only the
+  // generated-column clause applies.
   expect(EPICS_DESCRIPTOR.defaultFilter).toBeUndefined();
 });
 

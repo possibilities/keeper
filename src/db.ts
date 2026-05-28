@@ -54,7 +54,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 31;
+export const SCHEMA_VERSION = 32;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -418,18 +418,35 @@ const CREATE_SUBAGENT_INVOCATIONS_INDEXES = [
 ];
 
 /**
- * Tier 2 (fn-628) always-run table-scoped index on `epics`. Eliminates the
- * `USE TEMP B-TREE FOR ORDER BY` on the default epics query
- * (`(status='open' OR approval!='approved') ORDER BY sort_path ASC, epic_id ASC`).
- * The WHERE columns aren't in the index — the OR-predicate applies as a filter
- * during the in-order index scan, so EQP shows `SCAN epics USING INDEX
- * idx_epics_sort_path` (not COVERING). Acceptable at current row counts (~700);
- * if future growth makes the filter dominant, a follow-up can materialize a
- * derived `default_visible` integer column. `CREATE INDEX IF NOT EXISTS` is
- * idempotent and forward-only — no SCHEMA_VERSION bump.
+ * Tier 2 (fn-628) + Tier 4.1 (fn-634) always-run table-scoped indexes on
+ * `epics`. Two complementary shapes:
+ *
+ * 1. `idx_epics_sort_path ON epics(sort_path, epic_id)` — Tier 2 (fn-628).
+ *    Serves explicit-status / explicit-filter queries whose WHERE drops the
+ *    descriptor's `defaultClause`. EQP shows `SCAN epics USING INDEX
+ *    idx_epics_sort_path` (in-order index scan; WHERE applies as a filter
+ *    against the indexed rows).
+ *
+ * 2. `idx_epics_default_visible ON epics(default_visible, sort_path, epic_id)
+ *    WHERE default_visible = 1` — Tier 4.1 (fn-634). Serves the default
+ *    no-wire-filter epics query. The schema-v32 `default_visible` VIRTUAL
+ *    generated column collapses the cross-column `(status='open' OR
+ *    approval!='approved')` predicate into a single-column equality
+ *    SQLite can serve from a partial index: EQP shows `SEARCH epics USING
+ *    (COVERING )?INDEX idx_epics_default_visible` — no SCAN, no temp B-tree
+ *    for the ORDER BY. Realizes the forecast in fn-628's original comment
+ *    (the OR-predicate filter was dominating the diffTick metaCount tail at
+ *    ~3.1 s p95 by Tier 4 measurement); see
+ *    `fn-634-contention-review-tier-4-default-visible`.
+ *
+ * `CREATE INDEX IF NOT EXISTS` is idempotent and forward-only; the
+ * `default_visible` partial index is keyed on a column added by the v31→v32
+ * migration block in `migrate()`, so the index command runs only after the
+ * generated column lands.
  */
 const CREATE_EPICS_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_epics_sort_path ON epics(sort_path, epic_id)",
+  "CREATE INDEX IF NOT EXISTS idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1",
 ];
 
 /**
@@ -520,7 +537,8 @@ CREATE TABLE IF NOT EXISTS epics (
     last_validated_at TEXT,
     created_by_closer_of TEXT,
     sort_path TEXT NOT NULL DEFAULT '',
-    queue_jump INTEGER NOT NULL DEFAULT 0
+    queue_jump INTEGER NOT NULL DEFAULT 0,
+    default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status='open' OR approval!='approved' THEN 1 ELSE 0 END) VIRTUAL
 )
 `;
 
@@ -769,6 +787,42 @@ function addColumnIfMissing(
   columnDef: string,
 ): void {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as {
+    name: string;
+  }[];
+  if (cols.some((c) => c.name === column)) {
+    return;
+  }
+  db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${columnDef}`);
+}
+
+/**
+ * Add a GENERATED ALWAYS column to a table only if it isn't already present.
+ * Mirror of {@link addColumnIfMissing} with one critical difference: the
+ * presence check reads `PRAGMA table_xinfo` (NOT `PRAGMA table_info`).
+ * Generated columns — STORED or VIRTUAL — are excluded from `table_info` per
+ * SQLite's behavior; only `table_xinfo` enumerates them. Using `table_info`
+ * here would re-attempt the ALTER on every boot after the first migration
+ * and throw "duplicate column" at the next reopen, wedging the daemon at
+ * launch.
+ *
+ * SQLite forbids `ALTER TABLE ADD COLUMN ... STORED` — only `VIRTUAL` is
+ * allowed via ALTER. Callers must include the `GENERATED ALWAYS AS (...)
+ * VIRTUAL` clause in `columnDef`. (Fresh DBs land the column via the
+ * `CREATE_*` literal which DOES support STORED, but the lockstep convention
+ * across this file is that the literal and the ALTER produce the same
+ * schema shape — VIRTUAL in both places.)
+ *
+ * Idempotence + forward-only: a second call on an already-migrated DB
+ * no-ops via the xinfo presence check; the helper never drops or rewrites.
+ * Same contract as `addColumnIfMissing`.
+ */
+function addGeneratedColumnIfMissing(
+  db: Database,
+  table: string,
+  column: string,
+  columnDef: string,
+): void {
+  const cols = db.prepare(`PRAGMA table_xinfo(${table})`).all() as {
     name: string;
   }[];
   if (cols.some((c) => c.name === column)) {
@@ -2812,6 +2866,36 @@ function migrate(db: Database): void {
       db.run("DELETE FROM file_attributions");
       db.run("DELETE FROM subagent_invocations");
     }
+
+    // v31→v32: Tier 4.1 (fn-634) — `epics.default_visible` VIRTUAL generated
+    // column. Materializes the cross-column predicate
+    // `(status='open' OR approval!='approved')` as a single-column 0/1 derived
+    // value SQLite computes on every read. Paired with the partial index
+    // `idx_epics_default_visible WHERE default_visible = 1` in the always-run
+    // `CREATE_EPICS_INDEXES` block below, this collapses the OR-predicate
+    // SCAN (which Tier 4 measurement clocked at p95=3.1s on diffTick/metaCount)
+    // into a single-column SEARCH against an index that already covers the
+    // ORDER BY. No data backfill — VIRTUAL means SQLite recomputes on read,
+    // so existing rows automatically expose the correct value without an
+    // UPDATE pass.
+    //
+    // CASE-wrap is load-bearing: `status` is TEXT-nullable (no NOT NULL
+    // constraint on the column), and the bare `(status='open' OR
+    // approval!='approved')` returns NULL when status IS NULL AND
+    // approval='approved' — which would violate the column's NOT NULL
+    // constraint at scan time. CASE always returns 0 or 1, never NULL.
+    //
+    // Uses `addGeneratedColumnIfMissing` (NOT `addColumnIfMissing`): the
+    // helper reads `PRAGMA table_xinfo` so generated columns are visible to
+    // the idempotence check; `PRAGMA table_info` excludes generated columns
+    // entirely and would re-attempt the ALTER on every reopen, throwing
+    // "duplicate column" at the next boot.
+    addGeneratedColumnIfMissing(
+      db,
+      "epics",
+      "default_visible",
+      "INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status='open' OR approval!='approved' THEN 1 ELSE 0 END) VIRTUAL",
+    );
 
     // Tier 2 (fn-628) always-run table-scoped indexes on epics + jobs +
     // events. Placed AFTER the v28→v29 ADD COLUMN block stamps

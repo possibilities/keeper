@@ -232,6 +232,19 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // the value cosmetically — e.g. a `[queued]` pill — rather than
     // wire-filter on it). Out of `jsonColumns` (a scalar integer).
     "queue_jump",
+    // Schema v32: `default_visible` — VIRTUAL generated column SQLite
+    // computes from `(status, approval)` on every read, materializing
+    // the cross-column `(status='open' OR approval!='approved')`
+    // predicate as a single-column 0/1 value. Served on the wire as
+    // display-only — clients can SEE it (a debug aid for "would this
+    // epic render on the default page?") but MUST NOT filter/sort by
+    // it. Out of `sortable` / `filters` / `jsonColumns`: the column is
+    // an implementation detail of the descriptor's `defaultClause`, not
+    // a domain attribute. The descriptor's defaultClause queries it
+    // (`default_visible = 1`); a partial index keyed on the same shape
+    // (`idx_epics_default_visible WHERE default_visible = 1`) serves
+    // the SEARCH path. See `fn-634-contention-review-tier-4-default-visible`.
+    "default_visible",
   ],
   pk: "epic_id",
   version: "last_event_id",
@@ -262,15 +275,25 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
   // Default scope: an epics query with no wire filter shows every epic that
   // is OPEN OR NOT-YET-APPROVED — the union, not the intersection. Open work
   // (live) and unreviewed work (needs a human) are both interesting; only
-  // done-AND-approved epics fall off the page by default. The predicate
-  // crosses two columns, so it lives in `defaultClause` (raw SQL with bound
-  // params) rather than the per-key `defaultFilter` map. ANY explicit wire
+  // done-AND-approved epics fall off the page by default. ANY explicit wire
   // filter — `--status done`, `--show-approved`, a pk subscribe — drops
   // this clause entirely (the wire is the user's "I know what I want"
   // override).
+  //
+  // Schema v32 (fn-634): the cross-column OR is materialized as a single
+  // VIRTUAL generated column `default_visible` computed by SQLite from
+  // `(status, approval)` on every read, and a partial index
+  // `idx_epics_default_visible WHERE default_visible = 1` makes the SEARCH
+  // covering — no SCAN, no temp B-tree for the `sort_path ASC, epic_id ASC`
+  // ORDER BY. The clause is the literal `default_visible = 1` (NOT a
+  // parameterized `default_visible = ?` with `params=[1]`): SQLite's
+  // partial-index matcher requires the query's WHERE term to syntactically
+  // imply the partial index's WHERE clause, and literal-1 matches literal-1
+  // exactly; relying on bound-parameter constant folding to hit the partial
+  // index isn't guaranteed across SQLite versions.
   defaultClause: {
-    sql: "(status = ? OR approval != ?)",
-    params: ["open", "approved"],
+    sql: "default_visible = 1",
+    params: [],
   },
   // `tasks`, `depends_on_epics`, `jobs`, and `job_links` are JSON-TEXT array
   // columns — decoded to real arrays at the read boundary. `jobs` carries the

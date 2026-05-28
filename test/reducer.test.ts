@@ -4069,6 +4069,10 @@ function getEpic(epicId: string) {
     created_by_closer_of: string | null;
     sort_path: string;
     queue_jump: number;
+    // Schema v32 (fn-634): VIRTUAL generated column SQLite computes from
+    // `(status, approval)` via `CASE WHEN status='open' OR approval!='approved'
+    // THEN 1 ELSE 0 END`. `SELECT *` enumerates it like any other column.
+    default_visible: number;
   } | null;
 }
 
@@ -4160,6 +4164,10 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     // Schema v30: queue_jump defaults to 0 — no planctl_invocation envelope
     // with `queue_jump: true` has been observed for this epic.
     queue_jump: 0,
+    // Schema v32 (fn-634): default_visible is the VIRTUAL generated column
+    // computed from (status, approval). status='open' + approval='pending'
+    // → both branches of the OR hit → 1.
+    default_visible: 1,
   });
   expect(epic?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);
