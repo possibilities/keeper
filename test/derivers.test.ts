@@ -7,11 +7,22 @@
 
 import { expect, test } from "bun:test";
 import {
+  extractBashMutation,
   extractPlanctlInvocation,
   extractToolUseId,
   isKilledTaskNotification,
   parsePlanRef,
 } from "../src/derivers";
+
+// Minimal helper to build a PostToolUse:Bash deriver call shape.
+function bashMutation(command: string, cwd: string | null = "/repo") {
+  return extractBashMutation(
+    "PostToolUse",
+    "Bash",
+    { tool_input: { command } },
+    cwd,
+  );
+}
 
 // ---------------------------------------------------------------------------
 // parsePlanRef
@@ -643,4 +654,348 @@ test("extractToolUseId fires regardless of hook event / tool name (broad gate)",
   // A SessionStart payload, a Notification payload, or any other event — if
   // they carry `tool_use_id`, the column populates. (In practice they don't;
   // the partial index stays selective.)
+});
+
+// ---------------------------------------------------------------------------
+// extractBashMutation (v31 sparse-column deriver)
+// ---------------------------------------------------------------------------
+
+test("extractBashMutation returns null on non-PostToolUse event", () => {
+  expect(
+    extractBashMutation(
+      "PreToolUse",
+      "Bash",
+      { tool_input: { command: "rm foo" } },
+      "/repo",
+    ),
+  ).toBeNull();
+  expect(
+    extractBashMutation(
+      "PostToolUseFailure",
+      "Bash",
+      { tool_input: { command: "rm foo" } },
+      "/repo",
+    ),
+  ).toBeNull();
+});
+
+test("extractBashMutation returns null on non-Bash tool", () => {
+  expect(
+    extractBashMutation(
+      "PostToolUse",
+      "Edit",
+      { tool_input: { command: "rm foo" } },
+      "/repo",
+    ),
+  ).toBeNull();
+});
+
+test("extractBashMutation returns null on missing/empty tool_input", () => {
+  expect(extractBashMutation("PostToolUse", "Bash", {}, "/repo")).toBeNull();
+  expect(
+    extractBashMutation("PostToolUse", "Bash", { tool_input: null }, "/repo"),
+  ).toBeNull();
+  expect(
+    extractBashMutation("PostToolUse", "Bash", { tool_input: {} }, "/repo"),
+  ).toBeNull();
+  expect(
+    extractBashMutation(
+      "PostToolUse",
+      "Bash",
+      { tool_input: { command: "" } },
+      "/repo",
+    ),
+  ).toBeNull();
+  expect(
+    extractBashMutation(
+      "PostToolUse",
+      "Bash",
+      { tool_input: { command: 42 } },
+      "/repo",
+    ),
+  ).toBeNull();
+});
+
+test("extractBashMutation returns null on length-capped command", () => {
+  // Cap is 32_000; a 40k-char command never even tokenizes.
+  const big = "a".repeat(40_000);
+  expect(bashMutation(`rm ${big}`)).toBeNull();
+});
+
+// --- Package managers ---
+
+test("extractBashMutation: pnpm install variants → pkg-install", () => {
+  for (const verb of ["install", "i", "add"]) {
+    const m = bashMutation(`pnpm ${verb} foo`);
+    expect(m?.kind).toBe("pkg-install");
+    expect(m?.targets).toEqual(["/repo/package.json", "pnpm-lock.yaml"]);
+  }
+});
+
+test("extractBashMutation: pnpm uninstall variants → pkg-uninstall", () => {
+  for (const verb of ["remove", "rm", "uninstall", "un"]) {
+    const m = bashMutation(`pnpm ${verb} foo`);
+    expect(m?.kind).toBe("pkg-uninstall");
+    expect(m?.targets).toEqual(["/repo/package.json", "pnpm-lock.yaml"]);
+  }
+});
+
+test("extractBashMutation: npm install/uninstall → pkg-{install,uninstall}", () => {
+  expect(bashMutation("npm install lodash")?.kind).toBe("pkg-install");
+  expect(bashMutation("npm i lodash")?.kind).toBe("pkg-install");
+  expect(bashMutation("npm uninstall lodash")?.kind).toBe("pkg-uninstall");
+  const m = bashMutation("npm install lodash");
+  expect(m?.targets).toEqual(["/repo/package.json", "package-lock.json"]);
+});
+
+test("extractBashMutation: yarn add/remove → pkg-{install,uninstall}", () => {
+  expect(bashMutation("yarn add react")?.kind).toBe("pkg-install");
+  expect(bashMutation("yarn remove react")?.kind).toBe("pkg-uninstall");
+  const m = bashMutation("yarn add react");
+  expect(m?.targets).toEqual(["/repo/package.json", "yarn.lock"]);
+});
+
+test("extractBashMutation: bun add/remove → pkg-{install,uninstall}", () => {
+  expect(bashMutation("bun add zod")?.kind).toBe("pkg-install");
+  expect(bashMutation("bun remove zod")?.kind).toBe("pkg-uninstall");
+  const m = bashMutation("bun add zod");
+  expect(m?.targets).toEqual(["/repo/package.json", "bun.lockb"]);
+});
+
+test("extractBashMutation: uv add/remove/sync/lock → pkg-{install,uninstall}", () => {
+  expect(bashMutation("uv add httpx")?.kind).toBe("pkg-install");
+  expect(bashMutation("uv sync")?.kind).toBe("pkg-install");
+  expect(bashMutation("uv lock")?.kind).toBe("pkg-install");
+  expect(bashMutation("uv remove httpx")?.kind).toBe("pkg-uninstall");
+  const m = bashMutation("uv add httpx");
+  expect(m?.targets).toEqual(["/repo/pyproject.toml", "uv.lock"]);
+});
+
+test("extractBashMutation: pip install/uninstall → pkg-{install,uninstall}", () => {
+  expect(bashMutation("pip install requests")?.kind).toBe("pkg-install");
+  expect(bashMutation("pip uninstall requests")?.kind).toBe("pkg-uninstall");
+});
+
+test("extractBashMutation: cargo add/remove → pkg-{install,uninstall}", () => {
+  expect(bashMutation("cargo add serde")?.kind).toBe("pkg-install");
+  expect(bashMutation("cargo remove serde")?.kind).toBe("pkg-uninstall");
+  const m = bashMutation("cargo add serde");
+  expect(m?.targets).toEqual(["/repo/Cargo.toml", "Cargo.lock"]);
+});
+
+test("extractBashMutation: poetry add/remove → pkg-{install,uninstall}", () => {
+  expect(bashMutation("poetry add fastapi")?.kind).toBe("pkg-install");
+  expect(bashMutation("poetry remove fastapi")?.kind).toBe("pkg-uninstall");
+});
+
+test("extractBashMutation: pnpm test (non-mutating subcommand) → null", () => {
+  expect(bashMutation("pnpm test")).toBeNull();
+  expect(bashMutation("npm run build")).toBeNull();
+  expect(bashMutation("cargo build")).toBeNull();
+  expect(bashMutation("pnpm")).toBeNull(); // no subcommand
+});
+
+test("extractBashMutation: env-prefix tokens are stripped (KEY=VAL pnpm i)", () => {
+  const m = bashMutation("FOO=1 BAR=baz pnpm i lodash");
+  expect(m?.kind).toBe("pkg-install");
+  expect(m?.targets).toEqual(["/repo/package.json", "pnpm-lock.yaml"]);
+});
+
+// --- Explicit fs ---
+
+test("extractBashMutation: rm -rf path → fs-remove with resolved path", () => {
+  const m = bashMutation("rm -rf src/foo.ts");
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["/repo/src/foo.ts"]);
+});
+
+test("extractBashMutation: rm with absolute path passes through", () => {
+  const m = bashMutation("rm /tmp/x");
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["/tmp/x"]);
+});
+
+test("extractBashMutation: rm with multiple paths → all resolved", () => {
+  const m = bashMutation("rm a.txt b.txt c.txt");
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["/repo/a.txt", "/repo/b.txt", "/repo/c.txt"]);
+});
+
+test("extractBashMutation: mv a b → fs-move with both operands", () => {
+  const m = bashMutation("mv old.ts new.ts");
+  expect(m?.kind).toBe("fs-move");
+  expect(m?.targets).toEqual(["/repo/old.ts", "/repo/new.ts"]);
+});
+
+test("extractBashMutation: cp -r src dst → fs-copy with both operands", () => {
+  const m = bashMutation("cp -r src dst");
+  expect(m?.kind).toBe("fs-copy");
+  expect(m?.targets).toEqual(["/repo/src", "/repo/dst"]);
+});
+
+test("extractBashMutation: mkdir -p deep/nested → fs-mkdir", () => {
+  const m = bashMutation("mkdir -p deep/nested");
+  expect(m?.kind).toBe("fs-mkdir");
+  expect(m?.targets).toEqual(["/repo/deep/nested"]);
+});
+
+test("extractBashMutation: rm with only flags (no positional) → null", () => {
+  expect(bashMutation("rm -rf")).toBeNull();
+});
+
+test("extractBashMutation: rm -- -looks-like-flag → fs-remove with post-dashdash", () => {
+  // The `--` terminator means everything after is positional.
+  const m = bashMutation("rm -- -weirdname");
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["/repo/-weirdname"]);
+});
+
+test("extractBashMutation: rm with quoted path containing spaces", () => {
+  const m = bashMutation('rm "my file.txt"');
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["/repo/my file.txt"]);
+});
+
+test("extractBashMutation: rm with single-quoted path", () => {
+  const m = bashMutation("rm 'a b c.txt'");
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["/repo/a b c.txt"]);
+});
+
+test("extractBashMutation: rm with backslash-escaped space", () => {
+  const m = bashMutation("rm a\\ b.txt");
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["/repo/a b.txt"]);
+});
+
+// --- Git tree-mutators ---
+
+test("extractBashMutation: git checkout (no pathspec) → tree sentinel", () => {
+  const m = bashMutation("git checkout feature-branch");
+  expect(m?.kind).toBe("git-tree-mutate");
+  expect(m?.targets).toEqual(["__TREE__"]);
+});
+
+test("extractBashMutation: git restore (no pathspec) → tree sentinel", () => {
+  const m = bashMutation("git restore .");
+  expect(m?.kind).toBe("git-tree-mutate");
+  expect(m?.targets).toEqual(["__TREE__"]);
+});
+
+test("extractBashMutation: git stash → tree sentinel", () => {
+  const m = bashMutation("git stash");
+  expect(m?.kind).toBe("git-tree-mutate");
+  expect(m?.targets).toEqual(["__TREE__"]);
+});
+
+test("extractBashMutation: git reset → tree sentinel", () => {
+  const m = bashMutation("git reset --hard HEAD~1");
+  expect(m?.kind).toBe("git-tree-mutate");
+  expect(m?.targets).toEqual(["__TREE__"]);
+});
+
+test("extractBashMutation: git checkout -- path1 path2 → pathspec targets", () => {
+  const m = bashMutation("git checkout -- src/a.ts src/b.ts");
+  expect(m?.kind).toBe("git-tree-mutate");
+  expect(m?.targets).toEqual(["/repo/src/a.ts", "/repo/src/b.ts"]);
+});
+
+test("extractBashMutation: git restore -- single-path → pathspec target", () => {
+  const m = bashMutation("git restore -- src/a.ts");
+  expect(m?.targets).toEqual(["/repo/src/a.ts"]);
+});
+
+test("extractBashMutation: git status (non-mutator) → null", () => {
+  expect(bashMutation("git status")).toBeNull();
+  expect(bashMutation("git diff")).toBeNull();
+  expect(bashMutation("git log")).toBeNull();
+  expect(bashMutation("git")).toBeNull(); // no subcommand
+});
+
+// --- Negative & malformed ---
+
+test("extractBashMutation: cat file (read-only) → null", () => {
+  expect(bashMutation("cat file.txt")).toBeNull();
+  expect(bashMutation("ls -la")).toBeNull();
+  expect(bashMutation("echo hello")).toBeNull();
+});
+
+test("extractBashMutation: empty command after env-prefix → null", () => {
+  expect(bashMutation("FOO=1 BAR=2")).toBeNull();
+});
+
+test("extractBashMutation: never throws on arbitrary garbage shapes", () => {
+  const garbage: unknown[] = [
+    null,
+    undefined,
+    {},
+    { tool_input: 42 },
+    { tool_input: { command: 42 } },
+    { tool_input: { command: { obj: "x" } } },
+    { tool_input: [] },
+    { tool_input: "string" },
+  ];
+  for (const data of garbage) {
+    expect(() =>
+      extractBashMutation(
+        "PostToolUse",
+        "Bash",
+        (data ?? {}) as Record<string, unknown>,
+        "/repo",
+      ),
+    ).not.toThrow();
+  }
+});
+
+test("extractBashMutation: handles unclosed quote without throwing", () => {
+  // Unclosed quote eats to end of string per the tokenizer's contract.
+  // This shouldn't throw — it should produce *something*, and not match
+  // any pattern (since the token contains the rest of the command).
+  expect(() => bashMutation('rm "unclosed')).not.toThrow();
+});
+
+test("extractBashMutation: compound command tokenizes only the first simple command", () => {
+  // `cd foo && rm bar` — we only see `cd foo`, which is not a mutation.
+  // Acceptable lossiness per the task spec ("compound commands degrade
+  // gracefully to inferred").
+  const m = bashMutation("cd foo && rm bar");
+  expect(m).toBeNull();
+});
+
+test("extractBashMutation: piped commands stop at the pipe boundary", () => {
+  // `cat foo | rm bar` — first simple command is `cat foo` (not a mutation).
+  expect(bashMutation("cat foo | rm bar")).toBeNull();
+});
+
+test("extractBashMutation: relative paths resolve to absolute via cwd", () => {
+  const m = bashMutation("rm foo/bar.ts", "/Users/mike/code/keeper");
+  expect(m?.targets).toEqual(["/Users/mike/code/keeper/foo/bar.ts"]);
+});
+
+test("extractBashMutation: null cwd leaves relative paths unresolved", () => {
+  const m = bashMutation("rm foo.ts", null);
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["foo.ts"]);
+});
+
+test("extractBashMutation: trailing-slash cwd is normalized", () => {
+  const m = bashMutation("rm foo.ts", "/repo/");
+  expect(m?.targets).toEqual(["/repo/foo.ts"]);
+});
+
+test("extractBashMutation: tilde NOT expanded (lexical-only contract)", () => {
+  const m = bashMutation("rm ~/foo.ts");
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["/repo/~/foo.ts"]);
+});
+
+test("extractBashMutation: round-trip determinism — same input → same output", () => {
+  // The migration backfill and the hook call the same deriver — assert
+  // the function is deterministic by calling twice and comparing.
+  const a = bashMutation("pnpm add foo");
+  const b = bashMutation("pnpm add foo");
+  expect(a).toEqual(b);
+  const c = bashMutation("rm -rf src/old");
+  const d = bashMutation("rm -rf src/old");
+  expect(c).toEqual(d);
 });

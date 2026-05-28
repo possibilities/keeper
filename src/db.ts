@@ -35,6 +35,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  extractBashMutation,
   extractPlanctlInvocation,
   extractSkillName,
   planVerbRefFromSpawnName,
@@ -2677,6 +2678,102 @@ function migrate(db: Database): void {
       db.run(sql);
     }
 
+    // Step 3.5: same-transaction backfill of `bash_mutation_kind` /
+    // `bash_mutation_targets` on every stored `PostToolUse:Bash` event row.
+    // Mirrors the v9→v10 (slash_command/skill_name) + v13→v14 (planctl_*)
+    // + v16→v17 (tool_use_id) + v29→v30 (planctl_queue_jump) backfill
+    // precedents: the migration walks every candidate row, re-derives the
+    // new sparse columns via the SAME pure deriver the hook will call at
+    // steady-state, and UPDATEs them in place. Two invariants drive this
+    // shape:
+    //
+    //   1. Re-fold determinism (CLAUDE.md "byte-identical re-fold"):
+    //      historical rows and future hook writes must converge on the
+    //      same column values for the same payload. Sharing the deriver
+    //      function makes that mechanical — there is no second
+    //      implementation to drift against the first.
+    //   2. Reducer fold dependency: task .6's bash-attribution fold reads
+    //      `bash_mutation_kind IS NOT NULL` to know which events
+    //      contributed a mutation edge. Without the backfill, every
+    //      pre-v31 Bash event would read NULL on the new columns even
+    //      though the deriver, applied to its stored payload, would
+    //      stamp a kind. The post-rewind boot drain re-folds every event
+    //      from scratch — but the projection fold reads the BACKFILLED
+    //      `events` rows, not the live deriver, so the events table MUST
+    //      already carry the new columns before the boot drain starts.
+    //
+    // Version-guarded by the same `storedVersionV31 < 31` check that
+    // gates the rewind below: a re-open of an already-migrated v31+ DB
+    // skips the backfill (idempotence). The check is duplicated rather
+    // than hoisted because the rewind block reads the same `meta` row
+    // and we keep the two steps decoupled — task .6 may later move the
+    // rewind, and the backfill should ride with the migration shape
+    // regardless. (`SELECT value FROM meta WHERE key = 'schema_version'`
+    // costs ~microseconds per call; the duplication is free.)
+    //
+    // Performance: re-running the deriver per row is O(rows × command-
+    // length). Bash events on a hot keeper DB sit at ~10k-20k; the
+    // tokenizer is single-pass over a length-capped string. Wall-clock
+    // budget on a realistic event log is sub-second. If a future log
+    // grows past the 5s informal target, the row-walk would need
+    // chunking — the spec's "Risks" section flags this as future work.
+    const storedVersionV31Backfill = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV31Backfill < 31) {
+      const rows = db
+        .prepare(
+          `SELECT id, hook_event, tool_name, cwd, data FROM events
+             WHERE tool_name = 'Bash' AND hook_event = 'PostToolUse'`,
+        )
+        .all() as {
+        id: number;
+        hook_event: string;
+        tool_name: string | null;
+        cwd: string | null;
+        data: string;
+      }[];
+      const updateStmt = db.prepare(
+        `UPDATE events
+            SET bash_mutation_kind = ?, bash_mutation_targets = ?
+          WHERE id = ?`,
+      );
+      for (const row of rows) {
+        // Defensive parse — a malformed historical `data` blob folds to
+        // safe NULL (matching the CLAUDE.md "safe value on malformed
+        // payload" invariant); the deriver itself never throws on any
+        // parsed shape because every branch is a typeof guard. The
+        // try/catch around JSON.parse keeps a corrupt row from wedging
+        // the migration.
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(row.data) as Record<string, unknown>;
+          if (typeof parsed !== "object" || parsed === null) {
+            updateStmt.run(null, null, row.id);
+            continue;
+          }
+        } catch {
+          updateStmt.run(null, null, row.id);
+          continue;
+        }
+        const mutation = extractBashMutation(
+          row.hook_event,
+          row.tool_name,
+          parsed,
+          row.cwd,
+        );
+        if (mutation === null) {
+          updateStmt.run(null, null, row.id);
+          continue;
+        }
+        updateStmt.run(mutation.kind, JSON.stringify(mutation.targets), row.id);
+      }
+    }
+
     // Step 4: version-guarded rewind-and-redrain. Required because the new
     // `git_orphan_count` carries a fundamentally different semantic (strict
     // mystery — populated by the new reducer fold in task .6), AND
@@ -2777,13 +2874,15 @@ function prepareStmts(db: Database): Stmts {
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
         planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump
+        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+        bash_mutation_kind, bash_mutation_targets
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
         $subagent_agent_id, $spawn_name, $start_time, $slash_command, $skill_name,
         $planctl_op, $planctl_target, $planctl_epic_id, $planctl_task_id,
-        $planctl_subject_present, $tool_use_id, $config_dir, $planctl_queue_jump
+        $planctl_subject_present, $tool_use_id, $config_dir, $planctl_queue_jump,
+        $bash_mutation_kind, $bash_mutation_targets
       )
     `),
     selectWorldRev: db.prepare(

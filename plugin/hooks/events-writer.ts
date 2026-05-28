@@ -26,6 +26,7 @@
 
 import { openDb, resolveDbPath } from "../../src/db";
 import {
+  extractBashMutation,
   extractPlanctlInvocation,
   extractSkillName,
   extractToolUseId,
@@ -399,6 +400,24 @@ async function main(): Promise<void> {
   // wiring; no reducer cases yet).
   const toolUseId = extractToolUseId(data);
 
+  // v31: index the bash mutation footprint on PostToolUse:Bash by tokenizing
+  // the authoritative `tool_input.command` string and matching against a
+  // hardcoded pattern table (package managers, explicit fs verbs, git tree-
+  // mutators). The deriver is pure, gated on hook event + tool name, and
+  // defensive against any malformed `tool_input` shape — a null return
+  // collapses to both params bound NULL on the prepared statement. The
+  // v30→v31 migration backfill reuses this exact function so live +
+  // historical rows derive byte-identically. Pure-function purity is the
+  // re-fold-determinism contract: a future bugfix to `extractBashMutation`
+  // would require a schema-bump-with-rewind to re-backfill stored rows.
+  const bashMutation = extractBashMutation(hookEvent, toolName, data, cwd);
+  const bashMutationKind = bashMutation?.kind ?? null;
+  // Serialize the targets array as JSON. NULL when no mutation matched, so
+  // the partial index (`WHERE bash_mutation_kind IS NOT NULL`) stays
+  // selective and the column shape stays the standard sparse-text pattern.
+  const bashMutationTargets =
+    bashMutation === null ? null : JSON.stringify(bashMutation.targets);
+
   // SessionStart only: scrape the parent claude argv `--name`/`-n` AND the
   // process start_time in a single platform-specific probe, so the reducer can
   // seed `jobs.title` from the very first event AND store the recycle-safe
@@ -468,6 +487,8 @@ async function main(): Promise<void> {
         $tool_use_id: toolUseId,
         $config_dir: configDir,
         $planctl_queue_jump: planctlQueueJump,
+        $bash_mutation_kind: bashMutationKind,
+        $bash_mutation_targets: bashMutationTargets,
       });
     })();
   } finally {

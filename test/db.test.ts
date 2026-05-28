@@ -184,6 +184,8 @@ test("migrate: false skips schema convergence but still applies PRAGMAs + prepar
     $tool_use_id: null,
     $config_dir: null,
     $planctl_queue_jump: null,
+    $bash_mutation_kind: null,
+    $bash_mutation_targets: null,
   });
 
   const count = (

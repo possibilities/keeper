@@ -453,3 +453,490 @@ export function extractPlanctlInvocation(
   const task_id = refParsed?.kind === "task" ? refParsed.task_id : null;
   return { op, target, epic_id, task_id, subject_present, queue_jump };
 }
+
+/**
+ * Defensive cap on the Bash `tool_input.command` string we will tokenize.
+ * Real shell commands stamped on Bash hooks are kilobyte-class at most; an
+ * outsized blob is almost certainly machine-generated piped output that
+ * couldn't have been a meaningful mutation. Skipping the parse on the rare
+ * giant input keeps the hook cold-start budget intact (CLAUDE.md "1.5s
+ * SessionEnd timeout"). The cap is generous enough to never bite real
+ * shell invocations.
+ */
+const BASH_COMMAND_CAP = 32_000;
+
+/**
+ * Whitespace-trimmed sentinel matching env-prefix tokens (`KEY=VAL pnpm i`).
+ * Anchored at the start of the token; uppercase + digits + `_` for the key,
+ * any non-whitespace body for the value. We strip these from the leading
+ * argv until the first non-env-prefix token, so a `FOO=1 BAR=baz pnpm i`
+ * invocation resolves to a `pnpm i` head. Tokenization stays lexical —
+ * we never expand the value or substitute it into later tokens.
+ */
+const ENV_PREFIX_RE = /^[A-Z_][A-Z0-9_]*=/;
+
+/**
+ * The hardcoded "every package manager we recognize" table. Keys are the argv
+ * head tokens; values carry the install / uninstall verbs (so the deriver
+ * can tag the mutation kind precisely) and the canonical lockfile path
+ * suffix (joined to `<git-root>` at fold time — except we don't know the
+ * git root from a hook payload, so the targets list carries the bare
+ * lockfile name AND the cwd-anchored `package.json`-style manifest path).
+ *
+ * Manifests live in `cwd`; lockfiles live at the git root. Per the task
+ * spec's "hardcoded canonical paths, not arg parsing" rule, we do NOT walk
+ * up from `cwd` to find the git root — the reducer's attribution pass
+ * (task .6) is responsible for resolving the lockfile path against the
+ * project_dir the GitSnapshot is anchored on. The deriver stamps the
+ * bare lockfile basename and the cwd-anchored manifest path; downstream
+ * consumers map them to absolute paths in their own coordinate space.
+ *
+ * Each entry's `install` / `uninstall` arrays list the subcommands that
+ * actually mutate the lockfile / manifest. `pnpm test` / `npm run x` /
+ * `cargo build` are NOT in the lists — they don't mutate the dep graph
+ * and don't deserve an attribution edge.
+ */
+interface PkgManagerSpec {
+  install: ReadonlySet<string>;
+  uninstall: ReadonlySet<string>;
+  /**
+   * Relative lockfile path under the git root. Stamped verbatim in the
+   * `targets` array; downstream consumers prepend project_dir.
+   */
+  lockfile: string;
+  /**
+   * Relative manifest path under cwd. Stamped verbatim under cwd-anchored
+   * resolution; downstream consumers may absolutize.
+   */
+  manifest: string;
+}
+
+const PKG_MANAGERS: Record<string, PkgManagerSpec> = {
+  pnpm: {
+    install: new Set(["install", "i", "add"]),
+    uninstall: new Set(["remove", "rm", "uninstall", "un"]),
+    lockfile: "pnpm-lock.yaml",
+    manifest: "package.json",
+  },
+  npm: {
+    install: new Set(["install", "i", "add"]),
+    uninstall: new Set(["uninstall", "remove", "rm", "un"]),
+    lockfile: "package-lock.json",
+    manifest: "package.json",
+  },
+  yarn: {
+    install: new Set(["install", "add"]),
+    uninstall: new Set(["remove"]),
+    lockfile: "yarn.lock",
+    manifest: "package.json",
+  },
+  bun: {
+    install: new Set(["install", "i", "add"]),
+    uninstall: new Set(["remove", "rm"]),
+    lockfile: "bun.lockb",
+    manifest: "package.json",
+  },
+  uv: {
+    install: new Set(["add", "sync", "lock"]),
+    uninstall: new Set(["remove"]),
+    lockfile: "uv.lock",
+    manifest: "pyproject.toml",
+  },
+  pip: {
+    install: new Set(["install"]),
+    uninstall: new Set(["uninstall"]),
+    lockfile: "requirements.txt",
+    manifest: "requirements.txt",
+  },
+  cargo: {
+    install: new Set(["add", "install"]),
+    uninstall: new Set(["remove", "uninstall"]),
+    lockfile: "Cargo.lock",
+    manifest: "Cargo.toml",
+  },
+  poetry: {
+    install: new Set(["add", "install", "lock", "update"]),
+    uninstall: new Set(["remove"]),
+    lockfile: "poetry.lock",
+    manifest: "pyproject.toml",
+  },
+};
+
+/**
+ * Whitelist of explicit filesystem-mutating commands. The argv head must be
+ * EXACT (no `/usr/bin/rm` — the hook's `cwd` doesn't resolve aliases or
+ * absolute paths; that's task 6's inferred-attribution job).
+ *
+ * Each entry maps the verb to the deriver's mutation `kind`. Argv tail
+ * parsing is identical for all three: skip leading `-flag` tokens, every
+ * remaining token is a path. We do NOT distinguish source vs destination
+ * for `mv` / `cp` — the deriver reports every operand as a target. This
+ * over-attributes the source, but the reducer's attribution pass is the
+ * final arbiter against the actual dirty file set.
+ */
+const FS_COMMANDS: Record<
+  string,
+  "fs-remove" | "fs-move" | "fs-copy" | "fs-mkdir"
+> = {
+  rm: "fs-remove",
+  mv: "fs-move",
+  cp: "fs-copy",
+  mkdir: "fs-mkdir",
+};
+
+/**
+ * Whitelist of git subcommands that rewrite the working tree out from under
+ * us. The deriver stamps a `__TREE__` sentinel target when no pathspec is
+ * present (the whole tree may flip — every dirty file could change
+ * attribution). With a pathspec, only the literal pathspec arg is stamped
+ * (we don't expand globs — the inferred-attribution pass handles that).
+ */
+const GIT_TREE_MUTATORS: ReadonlySet<string> = new Set([
+  "checkout",
+  "restore",
+  "stash",
+  "reset",
+]);
+
+/**
+ * Tree-wide sentinel target for git mutations with no pathspec. Downstream
+ * the reducer reads this as "any dirty file in the project could have
+ * flipped attribution". We use a bracketed token so it can never collide
+ * with a real path (POSIX paths can't contain unescaped `__` boundaries
+ * at the start, and the surrounding `__` doubles the no-collision guard).
+ */
+const TREE_SENTINEL = "__TREE__";
+
+/**
+ * The shape returned by {@link extractBashMutation}. `kind` tags the
+ * mutation family — drives the bash-side attribution edge the reducer's
+ * fold (task .6) will create. `targets` is the lexical list of resolved
+ * paths (relative→absolute against `cwd`), bare lockfile/manifest names
+ * for package-manager kinds, or the `__TREE__` sentinel for git
+ * tree-mutators with no pathspec.
+ *
+ * A null return from {@link extractBashMutation} signals "not a mutation
+ * we recognize" — the column stays NULL on disk and the partial index
+ * (`WHERE bash_mutation_kind IS NOT NULL`) stays selective.
+ */
+export interface BashMutation {
+  kind:
+    | "pkg-install"
+    | "pkg-uninstall"
+    | "fs-remove"
+    | "fs-move"
+    | "fs-copy"
+    | "fs-mkdir"
+    | "git-tree-mutate";
+  targets: string[];
+}
+
+/**
+ * Tokenize a POSIX-shell-ish command line into argv tokens. Quote-aware
+ * (single + double), backslash-escape-aware. NO AST, NO subshells, NO
+ * heredocs, NO brace expansion — every uncovered pattern degrades to
+ * "won't match a mutation" and falls through to the inferred-attribution
+ * pass (task .6). Returns the argv array; never throws.
+ *
+ * Quoting rules (the subset we recognize):
+ * - `'...'` (single quotes): everything between is literal, including
+ *   spaces and backslashes. A missing close-quote eats to end-of-string.
+ * - `"..."` (double quotes): everything between is literal except `\\`,
+ *   `\"`, `\$`, `\`` — these strip the backslash and pass the next char
+ *   through (POSIX double-quote escape rules). Other backslash sequences
+ *   keep the backslash literally (so `"\n"` is the two-char `\n`, not a
+ *   newline). A missing close-quote eats to end-of-string.
+ * - `\X` (bare backslash escape): outside quotes, drops the backslash and
+ *   includes the next char literally. A bare trailing `\` at end-of-input
+ *   is dropped.
+ *
+ * Compound-command separators (`;`, `&&`, `||`, `|`) terminate the current
+ * token list — we only ever tokenize the FIRST simple command in a
+ * compound. The spec accepts this: "compound commands degrade gracefully
+ * to inferred". Subshells (`$(...)`, backticks) are not tokenized — they
+ * pass through as opaque chars inside their own token.
+ */
+function tokenizeShell(command: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let inSingle = false;
+  let inDouble = false;
+  let hasContent = false; // distinguish "empty unquoted token" from "no token"
+  const flush = (): void => {
+    if (hasContent) {
+      tokens.push(current);
+    }
+    current = "";
+    hasContent = false;
+  };
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i] as string;
+    if (inSingle) {
+      if (c === "'") {
+        inSingle = false;
+        hasContent = true;
+        continue;
+      }
+      current += c;
+      hasContent = true;
+      continue;
+    }
+    if (inDouble) {
+      if (c === '"') {
+        inDouble = false;
+        hasContent = true;
+        continue;
+      }
+      if (c === "\\" && i + 1 < command.length) {
+        const next = command[i + 1] as string;
+        if (next === "\\" || next === '"' || next === "$" || next === "`") {
+          current += next;
+          hasContent = true;
+          i++;
+          continue;
+        }
+      }
+      current += c;
+      hasContent = true;
+      continue;
+    }
+    if (c === "'") {
+      inSingle = true;
+      hasContent = true;
+      continue;
+    }
+    if (c === '"') {
+      inDouble = true;
+      hasContent = true;
+      continue;
+    }
+    if (c === "\\" && i + 1 < command.length) {
+      current += command[i + 1];
+      hasContent = true;
+      i++;
+      continue;
+    }
+    // Compound-command separator: stop after the first simple command.
+    if (c === ";" || c === "|" || c === "&") {
+      flush();
+      return tokens;
+    }
+    if (c === " " || c === "\t" || c === "\n" || c === "\r") {
+      flush();
+      continue;
+    }
+    current += c;
+    hasContent = true;
+  }
+  flush();
+  return tokens;
+}
+
+/**
+ * Resolve `path` against `cwd` lexically. Absolute paths pass through;
+ * relative paths get `<cwd>/<path>` joined. We do NOT call `path.resolve`
+ * (no `..` collapsing, no symlink walk) and we do NOT expand `~` — the
+ * hook's payload-only invariant forbids any filesystem hit. Lexical
+ * resolution is the contract: the reducer's attribution pass (task .6)
+ * is the right place to canonicalize against actual git status output.
+ *
+ * `cwd` may be null on synthetic events; in that case relative paths are
+ * stamped verbatim (the reducer has nothing better to do with them than
+ * tag the row "unresolved" and fall through to inferred).
+ */
+function resolveAgainstCwd(p: string, cwd: string | null): string {
+  if (p.length === 0) {
+    return p;
+  }
+  if (p.startsWith("/")) {
+    return p;
+  }
+  if (cwd === null || cwd.length === 0) {
+    return p;
+  }
+  const trimmed = cwd.endsWith("/") ? cwd.slice(0, -1) : cwd;
+  return `${trimmed}/${p}`;
+}
+
+/**
+ * Skip leading env-prefix tokens (`KEY=VAL ... cmd`) and leading flag
+ * tokens (`--`, `-x`) on a fs-command argv tail. Returns the index of the
+ * first positional argument. The fs-commands all share the GNU/BSD flag
+ * convention: `-` or `--` prefix means flag. A bare `--` terminator means
+ * "rest are positional" — we honor that by returning the index PAST it.
+ */
+function firstPositional(tokens: string[], startIdx: number): number {
+  let i = startIdx;
+  while (i < tokens.length) {
+    const t = tokens[i] as string;
+    if (t === "--") {
+      return i + 1;
+    }
+    if (t.startsWith("-") && t.length > 1) {
+      i++;
+      continue;
+    }
+    return i;
+  }
+  return i;
+}
+
+/**
+ * Extract the mutation kind + lexical target list from a `PostToolUse:Bash`
+ * event's `data.tool_input.command` string. Returns `null` on every
+ * non-matching hook event / tool name / data shape, every unrecognized
+ * command head, every empty argv after env-prefix stripping, and every
+ * exception path — the hook's exit-0 contract is non-negotiable.
+ *
+ * Gated by `hookEvent === 'PostToolUse' && toolName === 'Bash'` (EXACT —
+ * `PostToolUseFailure` has no settled `tool_input` and must not match).
+ * The `cwd` argument is taken from `events.cwd` (the cwd at hook fire,
+ * which IS the cwd of the bash subprocess that ran the command — modulo
+ * compound commands where the inner cwd may differ; accepted lossiness,
+ * see the spec's "Risks" section).
+ *
+ * Pattern table (hardcoded canonical paths per the spec's "no arg parsing"
+ * rule):
+ * - **Package managers** (`pnpm`, `npm`, `yarn`, `bun`, `uv`, `pip`,
+ *   `cargo`, `poetry`): match argv[0] + argv[1] against
+ *   {@link PKG_MANAGERS}'s install/uninstall sets; targets are the
+ *   `<cwd>/manifest` + bare `lockfile` strings.
+ * - **Explicit fs** (`rm`, `mv`, `cp`, `mkdir`): match argv[0] against
+ *   {@link FS_COMMANDS}; targets are every non-flag argv tail token,
+ *   resolved lexically against `cwd`.
+ * - **Git tree-mutators** (`checkout`, `restore`, `stash`, `reset`):
+ *   match `argv[0] === 'git'` AND `argv[1] in `{@link GIT_TREE_MUTATORS}`;
+ *   targets are either every pathspec arg (post-`--`) or the
+ *   `__TREE__` sentinel when no pathspec is present.
+ *
+ * Mirrors {@link extractPlanctlInvocation}'s defensive-probe shape: type-
+ * check the `tool_input` object, type-check the `command` string, length
+ * cap, try/catch around the tokenizer. NEVER throws past the caller —
+ * every error path returns `null`.
+ *
+ * Pure function of its arguments: re-fold determinism (CLAUDE.md "byte-
+ * identical re-fold" invariant) requires that the migration's same-
+ * transaction backfill, the live hook write, and a future from-scratch
+ * re-fold all produce the same output for the same input. A future
+ * bugfix to this deriver requires a schema-bump-with-rewind to re-backfill
+ * stored rows — same precedent as the v25→v26 spawn-name widening.
+ */
+export function extractBashMutation(
+  hookEvent: string,
+  toolName: string | null,
+  data: Record<string, unknown>,
+  cwd: string | null,
+): BashMutation | null {
+  if (hookEvent !== "PostToolUse" || toolName !== "Bash") {
+    return null;
+  }
+  const toolInput = data.tool_input;
+  if (typeof toolInput !== "object" || toolInput === null) {
+    return null;
+  }
+  const command = (toolInput as Record<string, unknown>).command;
+  if (typeof command !== "string" || command.length === 0) {
+    return null;
+  }
+  if (command.length > BASH_COMMAND_CAP) {
+    return null;
+  }
+  let tokens: string[];
+  try {
+    tokens = tokenizeShell(command);
+  } catch {
+    return null;
+  }
+  // Strip env-prefix tokens (`KEY=VAL`). They are NOT part of the simple
+  // command's argv per POSIX shell grammar; stripping is the canonical
+  // pre-resolution step.
+  let i = 0;
+  while (i < tokens.length && ENV_PREFIX_RE.test(tokens[i] as string)) {
+    i++;
+  }
+  if (i >= tokens.length) {
+    return null;
+  }
+  const head = tokens[i] as string;
+  // Package-manager dispatch — argv[0] is the pm, argv[1] is the
+  // subcommand (`install` / `add` / `remove` / `rm` / etc.).
+  const pkg = PKG_MANAGERS[head];
+  if (pkg !== undefined) {
+    const sub = tokens[i + 1];
+    if (typeof sub !== "string") {
+      return null;
+    }
+    if (pkg.install.has(sub)) {
+      return {
+        kind: "pkg-install",
+        targets: [resolveAgainstCwd(pkg.manifest, cwd), pkg.lockfile],
+      };
+    }
+    if (pkg.uninstall.has(sub)) {
+      return {
+        kind: "pkg-uninstall",
+        targets: [resolveAgainstCwd(pkg.manifest, cwd), pkg.lockfile],
+      };
+    }
+    return null;
+  }
+  // Explicit fs dispatch — argv[0] is the verb; every non-flag argv tail
+  // token is a target path.
+  const fsKind = FS_COMMANDS[head];
+  if (fsKind !== undefined) {
+    const firstArg = firstPositional(tokens, i + 1);
+    const targets: string[] = [];
+    for (let j = firstArg; j < tokens.length; j++) {
+      const t = tokens[j] as string;
+      if (t.length === 0) {
+        continue;
+      }
+      targets.push(resolveAgainstCwd(t, cwd));
+    }
+    if (targets.length === 0) {
+      return null;
+    }
+    return { kind: fsKind, targets };
+  }
+  // Git tree-mutator dispatch — `git <subcommand> [args...]` where
+  // subcommand is a tree-mutator. No pathspec → `__TREE__` sentinel.
+  if (head === "git") {
+    const sub = tokens[i + 1];
+    if (typeof sub !== "string" || !GIT_TREE_MUTATORS.has(sub)) {
+      return null;
+    }
+    // After the subcommand, find the first positional past flags.
+    const firstArg = firstPositional(tokens, i + 2);
+    const pathspecs: string[] = [];
+    // For `git checkout <branch>`, the first positional is the branch
+    // name (not a path) — but we can't tell that apart from a pathspec
+    // without doing real git arg parsing. The conservative choice is to
+    // treat ALL non-`--`-separated positionals as tree-wide (since a
+    // bare branch checkout flips the entire tree anyway) and only honor
+    // pathspecs after an explicit `--` terminator. That matches the
+    // POSIX convention: `git checkout -- path1 path2` is the unambiguous
+    // pathspec form.
+    let sawSeparator = false;
+    for (let j = i + 2; j < tokens.length; j++) {
+      const t = tokens[j] as string;
+      if (t === "--") {
+        sawSeparator = true;
+        continue;
+      }
+      if (!sawSeparator) {
+        continue;
+      }
+      if (t.length === 0) {
+        continue;
+      }
+      pathspecs.push(resolveAgainstCwd(t, cwd));
+    }
+    if (sawSeparator && pathspecs.length > 0) {
+      return { kind: "git-tree-mutate", targets: pathspecs };
+    }
+    // No `--` separator OR no pathspecs after it → tree-wide sentinel.
+    void firstArg;
+    return { kind: "git-tree-mutate", targets: [TREE_SENTINEL] };
+  }
+  return null;
+}
