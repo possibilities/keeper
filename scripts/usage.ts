@@ -16,9 +16,11 @@
  * the helper handles everything below the rows.
  *
  * Reset cells render as minute-rounded humanized relative time
- * (`in 5d 21h`, `in 3h 5m`, `in 5m`, `now`, `2h 5m ago`) against the
- * current wall clock. For the live frame in
- * TUI mode a 30s tick re-renders via `liveShell.refreshLive` so the visible
+ * (`5d 21h`, `3h 5m`, `5m`, `now`, `2h 5m ago`) against the current
+ * wall clock — future times drop the `in ` prefix since the column
+ * context (a reset countdown) makes the direction unambiguous; past
+ * times keep `ago` to flag the inversion. For the live frame in TUI
+ * mode a 30s tick re-renders via `liveShell.refreshLive` so the visible
  * countdown ticks forward without growing history or writing sidecars;
  * historical scroll-back keeps each frame's at-capture rendering, so the
  * relative times you see when stepping back are the ones that were on
@@ -50,10 +52,11 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
 
 Each profile renders as a stacked block — a header line with the id
 chip + target/multiplier chip, then one indented body line per quota
-window (session, week, and sonnet where present). Reset times render
-as minute-rounded humanized relative time (\`in 5d 21h\` / \`in 1h 16m\`
-/ \`in 5m\` / \`now\`). The live frame re-renders every 30s so countdowns
-tick; historical scroll-back stays frozen at each frame's capture time.
+window (session, week, and sonnet where present). Each body line
+carries a 30-wide ASCII bar (\`█\` filled / \`░\` empty) followed by
+the numeric pct and a bare relative reset time (\`5d 21h\` / \`1h 16m\`
+/ \`5m\` / \`now\` / \`2m ago\`). The live frame re-renders every 30s so
+countdowns tick; historical scroll-back stays frozen at each frame's capture time.
 Per-frame sidecars under /tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*
 with an indexed meta sidecar; session paths print on SIGINT.
 `;
@@ -83,8 +86,9 @@ function pct(v: unknown): string {
  *   - otherwise: `Mm`.
  *
  * Zero residuals collapse: `1w` not `1w 0d`, `1d` not `1d 0h`, `1h`
- * not `1h 0m`. Suffix is `in <body>` for the future, `<body> ago` for
- * the past.
+ * not `1h 0m`. Future times render bare (`<body>`) — the column
+ * context (reset countdown) makes direction unambiguous; past times
+ * keep the `<body> ago` suffix to flag the inversion.
  *
  * `nowMs` is a parameter (not `Date.now()` baked in) so tests can drive
  * deterministic snapshots AND so the 30s tick can pass a fresh clock
@@ -116,7 +120,25 @@ function relTime(iso: string, nowMs: number): string {
       body = `${m}m`;
     }
   }
-  return past ? `${body} ago` : `in ${body}`;
+  return past ? `${body} ago` : body;
+}
+
+const BAR_WIDTH = 30;
+
+/**
+ * Fixed-width ASCII progress bar — bracket + `BAR_WIDTH` cells + bracket,
+ * identical width across every row so the pct column to its right stays
+ * aligned without per-row width math. `█` is filled, `░` is empty; the
+ * fill count rounds half-up against `BAR_WIDTH`, so at 30-wide 5% → 2
+ * cells, 4% → 1 cell, 1% → 0 cells. Clamped to `[0, 100]` and folds
+ * unknown / non-numeric input to an all-empty bar — matches `pct`'s
+ * `?` fallback so a row missing data still renders a uniform cell.
+ */
+function bar(v: unknown): string {
+  const n = typeof v === "number" ? v : Number(v);
+  const safe = Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0;
+  const filled = Math.round((safe / 100) * BAR_WIDTH);
+  return `[${"█".repeat(filled)}${"░".repeat(BAR_WIDTH - filled)}]`;
 }
 
 /**
@@ -125,21 +147,24 @@ function relTime(iso: string, nowMs: number): string {
  * then one indented body line per quota window:
  *
  *   (claude-multi-3) [claude 20x]
- *                    session 16% (resets in 29m)
- *                    week    36% (resets in 4d 5h)
- *                    sonnet   8% (resets in 4d 5h)
+ *                    session [█████░░░░░░░░░░░░░░░░░░░░░░░░░]  16% 29m
+ *                    week    [███████████░░░░░░░░░░░░░░░░░░░]  36% 4d 5h
+ *                    sonnet  [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   8% 4d 5h
  *
  * Body indent equals `wId + 1` so labels line up under the `[` of the
  * chip. Labels (`session` / `week` / `sonnet`) padEnd to the widest of
  * the labels ACTUALLY rendered across the row set — `sonnet` only joins
  * that pool when at least one row has `sonnet_week_percent` data, so a
- * sonnet-less screen still aligns pct values cleanly. Pct cells padStart
- * to the widest pct across every body line that will render (session,
- * week, and sonnet wherever present), so a `100%` in any row pushes a
- * matching column of right-aligned digits everywhere.
+ * sonnet-less screen still aligns pct values cleanly. The bar is fixed
+ * `BAR_WIDTH + 2`-col width (bracket + BAR_WIDTH cells + bracket) so no
+ * per-row width math is needed; pct cells padStart to the widest pct
+ * across every body line that will render (session, week, and sonnet
+ * wherever present), so a `100%` in any row pushes a matching column
+ * of right-aligned digits everywhere.
  *
- * The `(resets <rel>)` tail is unpadded — the closing `)` lands wherever
- * the rel-time text ends. The line above is the alignment grid.
+ * The bare relative-time tail is unpadded — it lands wherever the
+ * pct column ends, with a single separating space. Rows whose reset
+ * ISO was empty render no tail at all (no trailing whitespace).
  *
  * Rows without sonnet data simply omit the sonnet body line; they do NOT
  * render an empty placeholder.
@@ -158,11 +183,14 @@ export function renderRowLines(
     id: string;
     target: string;
     mult: string;
+    sBar: string;
     sPct: string;
     sReset: string;
+    wBar: string;
     wPct: string;
     wReset: string;
     // null when this row's envelope carried no sonnet_week sub-object.
+    swBar: string | null;
     swPct: string | null;
     // Empty string when no sonnet data; otherwise the rendered relative
     // time (or "" inside the rendered cell if sonnet_resets_at was null).
@@ -175,10 +203,13 @@ export function renderRowLines(
       id: `(${seg(row.id)})`,
       target: seg(row.target),
       mult: seg(row.multiplier),
+      sBar: bar(row.session_percent),
       sPct: pct(row.session_percent),
       sReset: relTime(seg(row.session_resets_at), nowMs),
+      wBar: bar(row.week_percent),
       wPct: pct(row.week_percent),
       wReset: relTime(seg(row.week_resets_at), nowMs),
+      swBar: hasSonnet ? bar(row.sonnet_week_percent) : null,
       swPct: hasSonnet ? pct(row.sonnet_week_percent) : null,
       swReset: hasSonnet ? relTime(seg(row.sonnet_week_resets_at), nowMs) : "",
     };
@@ -207,8 +238,17 @@ export function renderRowLines(
   const wLabel = widest(labels);
 
   const indent = " ".repeat(wId + 1);
-  const renderBody = (label: string, pctStr: string, rel: string): string =>
-    `${indent}${label.padEnd(wLabel, " ")} ${pctStr.padStart(wPct, " ")} (resets ${rel})`;
+  const renderBody = (
+    label: string,
+    barStr: string,
+    pctStr: string,
+    rel: string,
+  ): string => {
+    const head = `${indent}${label.padEnd(wLabel, " ")} ${barStr} ${pctStr.padStart(wPct, " ")}`;
+    // Skip the trailing space when there's no rel-time to follow — an
+    // empty-ISO row shouldn't leave whitespace at end-of-line.
+    return rel === "" ? head : `${head} ${rel}`;
+  };
 
   const lines: string[] = [];
   for (const c of cells) {
@@ -218,10 +258,10 @@ export function renderRowLines(
         ? ""
         : `[${c.target.padEnd(wTarget, " ")} ${c.mult.padStart(wMult, " ")}x]`;
     lines.push(targetChip === "" ? id : `${id} ${targetChip}`);
-    lines.push(renderBody("session", c.sPct, c.sReset));
-    lines.push(renderBody("week", c.wPct, c.wReset));
-    if (c.swPct != null) {
-      lines.push(renderBody("sonnet", c.swPct, c.swReset));
+    lines.push(renderBody("session", c.sBar, c.sPct, c.sReset));
+    lines.push(renderBody("week", c.wBar, c.wPct, c.wReset));
+    if (c.swPct != null && c.swBar != null) {
+      lines.push(renderBody("sonnet", c.swBar, c.swPct, c.swReset));
     }
   }
   return lines;

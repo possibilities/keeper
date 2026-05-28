@@ -4,9 +4,11 @@
  * `renderRowLines` consumes the daemon-side `usage` collection rows and
  * renders a stacked block per agentuse profile: a header line carrying
  * the id chip + target/multiplier chip, then one indented body line per
- * quota window (session / week / sonnet-where-present). Reset ISO
- * strings fold into a minute-rounded humanized relative-time form
- * (`in 3h 5m` / `5m` / `now` / `2m ago`).
+ * quota window (session / week / sonnet-where-present). Each body line
+ * is `label [bar] pct rel` — a 30-wide ASCII bar (`█`/`░`) followed by
+ * the numeric pct and a bare relative reset time. Future times render
+ * without an `in ` prefix (`3h 5m` / `5m` / `now`) since the column
+ * context makes the direction unambiguous; past times keep `2m ago`.
  *
  * `nowMs` is an explicit parameter so tests can drive deterministic
  * snapshots — the live script passes `Date.now()` from both the
@@ -50,10 +52,17 @@ test("renders future reset times with space-separated units", () => {
   );
   // header + session + week
   expect(lines).toHaveLength(3);
-  expect(bodyLine(lines, "session")).toContain("(resets in 5m)");
-  expect(bodyLine(lines, "week")).toContain("(resets in 3h 5m)");
-  expect(bodyLine(lines, "session")).toContain("session 42%");
-  expect(bodyLine(lines, "week")).toContain("week    17%");
+  expect(bodyLine(lines, "session")).toMatch(/ 5m$/);
+  expect(bodyLine(lines, "week")).toMatch(/ 3h 5m$/);
+  // 42% → round(12.6) = 13 of 30 filled; 17% → round(5.1) = 5 of 30
+  // filled. Bar is fixed 32-col `[<30 cells>]`; pct cell padStarts to
+  // wPct (here 3).
+  expect(bodyLine(lines, "session")).toContain(
+    "session [█████████████░░░░░░░░░░░░░░░░░] 42%",
+  );
+  expect(bodyLine(lines, "week")).toContain(
+    "week    [█████░░░░░░░░░░░░░░░░░░░░░░░░░] 17%",
+  );
 });
 
 test("renders the round boundary as 'now'", () => {
@@ -71,8 +80,8 @@ test("renders the round boundary as 'now'", () => {
     ],
     NOW_MS,
   );
-  expect(bodyLine(lines, "session")).toContain("(resets now)");
-  expect(bodyLine(lines, "week")).toContain("(resets now)");
+  expect(bodyLine(lines, "session")).toMatch(/ now$/);
+  expect(bodyLine(lines, "week")).toMatch(/ now$/);
 });
 
 test("renders past reset times with the 'ago' suffix and spaced units", () => {
@@ -93,8 +102,8 @@ test("renders past reset times with the 'ago' suffix and spaced units", () => {
     ],
     NOW_MS,
   );
-  expect(bodyLine(lines, "session")).toContain("(resets 2m ago)");
-  expect(bodyLine(lines, "week")).toContain("(resets 2h 5m ago)");
+  expect(bodyLine(lines, "session")).toMatch(/ 2m ago$/);
+  expect(bodyLine(lines, "week")).toMatch(/ 2h 5m ago$/);
 });
 
 test("collapses to days at the day boundary; drops residual minutes", () => {
@@ -115,8 +124,8 @@ test("collapses to days at the day boundary; drops residual minutes", () => {
     ],
     NOW_MS,
   );
-  expect(bodyLine(lines, "session")).toContain("(resets in 1d)");
-  expect(bodyLine(lines, "week")).toContain("(resets in 5d 21h)");
+  expect(bodyLine(lines, "session")).toMatch(/ 1d$/);
+  expect(bodyLine(lines, "week")).toMatch(/ 5d 21h$/);
 });
 
 test("collapses to weeks at the week boundary; drops residual hours", () => {
@@ -137,8 +146,8 @@ test("collapses to weeks at the week boundary; drops residual hours", () => {
     ],
     NOW_MS,
   );
-  expect(bodyLine(lines, "session")).toContain("(resets in 1w)");
-  expect(bodyLine(lines, "week")).toContain("(resets in 1w 1d)");
+  expect(bodyLine(lines, "session")).toMatch(/ 1w$/);
+  expect(bodyLine(lines, "week")).toMatch(/ 1w 1d$/);
 });
 
 test("malformed ISO falls through unchanged (no throw)", () => {
@@ -159,10 +168,11 @@ test("malformed ISO falls through unchanged (no throw)", () => {
     ],
     NOW_MS,
   );
-  // Bad ISO → raw value; empty → empty (no "(resets )" punctuation
-  // hiccup beyond the standing format).
-  expect(bodyLine(lines, "session")).toContain("(resets not-an-iso)");
-  expect(bodyLine(lines, "week")).toContain("(resets )");
+  // Bad ISO → raw value as the trailing rel-cell; empty ISO → no
+  // trailing rel at all (renderBody drops the trailing space when
+  // rel is empty, so the line ends at the pct cell).
+  expect(bodyLine(lines, "session")).toMatch(/ not-an-iso$/);
+  expect(bodyLine(lines, "week")).toMatch(/ 10%$/);
 });
 
 test("rounds to the nearest minute (30s window)", () => {
@@ -185,8 +195,8 @@ test("rounds to the nearest minute (30s window)", () => {
     ],
     NOW_MS,
   );
-  expect(bodyLine(lines, "session")).toContain("(resets in 1m)");
-  expect(bodyLine(lines, "week")).toContain("(resets now)");
+  expect(bodyLine(lines, "session")).toMatch(/ 1m$/);
+  expect(bodyLine(lines, "week")).toMatch(/ now$/);
 });
 
 test("empty row set returns an empty array", () => {
@@ -292,7 +302,7 @@ test("sonnet body line appears only on rows with sonnet_week data", () => {
   const claudeBlock = lines.slice(3).join("\n");
   expect(claudeBlock).toContain("sonnet");
   const sonnetRow = lines.find((l) => l.trimStart().startsWith("sonnet "));
-  expect(sonnetRow ?? "").toContain("(resets in 5d)");
+  expect(sonnetRow ?? "").toMatch(/ 5d$/);
 });
 
 test("label padding widens to 'sonnet' only when sonnet rows exist", () => {
@@ -312,9 +322,14 @@ test("label padding widens to 'sonnet' only when sonnet rows exist", () => {
     ],
     NOW_MS,
   );
-  // `week` padEnd(7) + " " + `5%` padStart(2 — the wPct in this single
-  // -digit row set) → `week    5%`.
-  expect(bodyLine(sansSonnet, "week")).toContain("week    5%");
+  // `week` padEnd(7) + " " + bar + " " + `5%` padStart(2 — the wPct in
+  // this single-digit row set) → `week    [<bar>] 5%`. Four spaces
+  // between `week` and the bar's `[` (3 from padEnd + 1 separator);
+  // one space between bar's `]` and the pct cell. 5% → round(1.5) =
+  // 2 of 30 cells filled.
+  expect(bodyLine(sansSonnet, "week")).toContain(
+    "week    [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 5%",
+  );
 
   // With sonnet → labels pool gains "sonnet"; widest still 7
   // ("session" beats "sonnet" by 1). wPct is still 2 here.
@@ -334,8 +349,14 @@ test("label padding widens to 'sonnet' only when sonnet rows exist", () => {
     ],
     NOW_MS,
   );
-  expect(bodyLine(withSonnet, "week")).toContain("week    5%");
-  expect(bodyLine(withSonnet, "sonnet")).toContain("sonnet  5%");
+  expect(bodyLine(withSonnet, "week")).toContain(
+    "week    [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 5%",
+  );
+  // `sonnet` padEnd(7) leaves 1 trailing space; +1 separator → 2 spaces
+  // between `sonnet` and the bar's `[`.
+  expect(bodyLine(withSonnet, "sonnet")).toContain(
+    "sonnet  [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 5%",
+  );
 });
 
 test("pct cells right-align to the widest pct across all body lines", () => {
@@ -365,13 +386,15 @@ test("pct cells right-align to the widest pct across all body lines", () => {
     ],
     NOW_MS,
   );
-  // `100%` sets the column width; smaller pcts padStart to match.
-  // Two-space indent before pct (label is "session" or "week   ", then
-  // space, then padStart 4: "100%", "  3%", "  9%", "  8%").
+  // `100%` sets the column width; smaller pcts padStart to match. The
+  // bar is fixed 12-col so the pct column starts at a uniform offset;
+  // padStart(4) gives "100%" / "  3%" / "  9%" / "  8%", which in the
+  // body line lands as `] 100%` / `]   3%` etc. — `]` from the bar's
+  // closing bracket + 1 separator + the padStart-padded pct.
   const sessionRows = lines.filter((l) => l.trimStart().startsWith("session "));
   const weekRows = lines.filter((l) => l.trimStart().startsWith("week "));
-  expect(sessionRows[0]).toContain("session 100%");
-  expect(sessionRows[1]).toContain("session   3%");
-  expect(weekRows[0]).toContain("week      9%");
-  expect(weekRows[1]).toContain("week      8%");
+  expect(sessionRows[0]).toContain("] 100%");
+  expect(sessionRows[1]).toContain("]   3%");
+  expect(weekRows[0]).toContain("]   9%");
+  expect(weekRows[1]).toContain("]   8%");
 });
