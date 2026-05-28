@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-631-contention-review-tier-3-difftick-probe",
   "bundles": [],
   "closer_done_at": "2026-05-28T12:37:40.657595Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-28T12:37:40.657595Z"
+  "updated_at": "2026-05-28T12:41:53.976261Z"
 }
