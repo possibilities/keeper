@@ -111,7 +111,11 @@ Renders both views as one frame per change:
 
 Each epic block opens with a header line of the form:
 
-  ({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated] [slotted-after-closer]? [<readiness>]
+  ({dir}) {epic_number} {title} [name#dep,name#dep] [validated|unvalidated] [slotted-after-closer]? [<readiness>]
+
+The cross-epic dependency pills carry the dep's project-name prefix
+(e.g. [arthack#633]) so deps that cross topics/projects read unambiguously;
+the bare task-dep pills below stay [#n] (same-epic, no prefix needed).
 
 The optional [slotted-after-closer] pill (schema v29) appears only on epics
 whose projection carries a non-null created_by_closer_of — i.e. epics minted
@@ -373,9 +377,17 @@ function taskRepoPillSeg(taskRepo: unknown, epicProjectDir: unknown): string {
   return ` [task-repo:${basename(tr)}]`;
 }
 
-function epicNumFromId(id: string): number | null {
-  const m = /^[a-z]+-(\d+)-/.exec(id);
-  return m ? Number.parseInt(m[1], 10) : null;
+/**
+ * Cross-epic dependency reference label — `<name>#<number>` (e.g.
+ * `arthack#633`) extracted from a dep epic id like
+ * `arthack-633-git-per-session-file-attribution`. The project-name prefix
+ * disambiguates deps that cross topics/projects, so the header pill reads
+ * `[arthack#633]` rather than the bare `[#633]`. Returns `null` when the id
+ * doesn't match the `<name>-<number>-<slug>` shape (caller drops it).
+ */
+function epicDepRefFromId(id: string): string | null {
+  const m = /^([a-z]+)-(\d+)-/.exec(id);
+  return m ? `${m[1]}#${m[2]}` : null;
 }
 
 /**
@@ -679,13 +691,11 @@ async function main(): Promise<void> {
       ? row.depends_on_epics
       : [];
     const epicDepsForRender = epicDeps.filter((d) => epicIds.has(String(d)));
-    const epicDepNums = epicDepsForRender
-      .map((d) => epicNumFromId(String(d)))
-      .filter((n): n is number => n != null);
+    const epicDepRefs = epicDepsForRender
+      .map((d) => epicDepRefFromId(String(d)))
+      .filter((r): r is string => r != null);
     const epicDepsSeg =
-      epicDepNums.length === 0
-        ? ""
-        : ` [${epicDepNums.map((n) => `#${n}`).join(",")}]`;
+      epicDepRefs.length === 0 ? "" : ` [${epicDepRefs.join(",")}]`;
     const epicId = seg(row.epic_id);
     const epicApproval = approvalPill(row.approval);
     const lines: string[] = [];
