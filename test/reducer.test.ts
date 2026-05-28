@@ -587,6 +587,492 @@ test("from-scratch re-fold reproduces the GitSnapshot fan-out byte-identically",
 });
 
 // ---------------------------------------------------------------------------
+// Commit reducer arm — fn-633.4 commit-driven file_attributions discharge
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert a single file_attributions row matching the task .2 schema. The
+ * fold path that creates rows lives in fn-633.6; this helper lets the
+ * fn-633.4 tests stage rows directly so the discharge fold's UPDATE
+ * matches.
+ */
+function insertAttribution(opts: {
+  project_dir: string;
+  session_id: string;
+  file_path: string;
+  last_mutation_at: number;
+  last_commit_at?: number | null;
+  op?: string;
+  source?: "tool" | "bash" | "inferred";
+}): void {
+  db.run(
+    `INSERT INTO file_attributions
+       (project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      opts.project_dir,
+      opts.session_id,
+      opts.file_path,
+      opts.last_mutation_at,
+      opts.last_commit_at ?? null,
+      opts.op ?? "write",
+      opts.source ?? "tool",
+      0,
+      opts.last_mutation_at,
+    ],
+  );
+}
+
+function getAttribution(
+  project_dir: string,
+  session_id: string,
+  file_path: string,
+):
+  | {
+      last_mutation_at: number;
+      last_commit_at: number | null;
+      last_event_id: number | null;
+      updated_at: number;
+    }
+  | undefined {
+  return db
+    .query(
+      `SELECT last_mutation_at, last_commit_at, last_event_id, updated_at
+         FROM file_attributions
+        WHERE project_dir = ? AND session_id = ? AND file_path = ?`,
+    )
+    .get(project_dir, session_id, file_path) as
+    | {
+        last_mutation_at: number;
+        last_commit_at: number | null;
+        last_event_id: number | null;
+        updated_at: number;
+      }
+    | undefined;
+}
+
+const TEST_OID = "0123456789abcdef0123456789abcdef01234567";
+const TEST_OID_2 = "fedcba9876543210fedcba9876543210fedcba98";
+const TEST_UUID = "01234567-89ab-cdef-0123-456789abcdef";
+const TEST_UUID_2 = "fedcba98-7654-3210-fedc-ba9876543210";
+
+test("Commit with a valid trailer discharges ONE session's attribution for the named files", () => {
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID_2,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: TEST_OID_2,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 200_000,
+    }),
+  });
+
+  expect(drainAll()).toBe(1);
+  // Committing session's attribution discharged.
+  const committed = getAttribution("/repo", TEST_UUID, "src/a.ts");
+  expect(committed?.last_commit_at).toBe(200);
+  expect(committed?.last_event_id).toBe(id);
+  // Other session's attribution untouched (per-session discharge).
+  const other = getAttribution("/repo", TEST_UUID_2, "src/a.ts");
+  expect(other?.last_commit_at).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("Commit with NULL committer_session_id globally discharges every session's attribution", () => {
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID_2,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: null,
+      committed_at_ms: 300_000,
+    }),
+  });
+
+  expect(drainAll()).toBe(1);
+  // Both sessions' attributions cleared.
+  expect(getAttribution("/repo", TEST_UUID, "src/a.ts")?.last_commit_at).toBe(
+    300,
+  );
+  expect(getAttribution("/repo", TEST_UUID_2, "src/a.ts")?.last_commit_at).toBe(
+    300,
+  );
+  expect(getCursor()).toBe(id);
+});
+
+test("Commit on a file with no attribution row is a safe no-op", () => {
+  // No row in file_attributions. The fold's UPDATE matches zero rows;
+  // never throws, cursor still advances.
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/unknown.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 100_000,
+    }),
+  });
+
+  expect(drainAll()).toBe(1);
+  // No row was created (discharge cannot resurrect a non-existent
+  // attribution; row creation lives in task .6's mutation-fold path).
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM file_attributions").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+  expect(getCursor()).toBe(id);
+});
+
+test("Commit with empty files array is a safe no-op", () => {
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: [],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 100_000,
+    }),
+  });
+
+  expect(drainAll()).toBe(1);
+  expect(
+    getAttribution("/repo", TEST_UUID, "src/a.ts")?.last_commit_at,
+  ).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("Commit with malformed data blob is a safe no-op (cursor still advances)", () => {
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: "{not-json",
+  });
+
+  expect(drainAll()).toBe(1);
+  expect(
+    getAttribution("/repo", TEST_UUID, "src/a.ts")?.last_commit_at,
+  ).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("Commit with invalid commit_oid is a safe no-op", () => {
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: "bad-oid",
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 100_000,
+    }),
+  });
+
+  expect(drainAll()).toBe(1);
+  expect(
+    getAttribution("/repo", TEST_UUID, "src/a.ts")?.last_commit_at,
+  ).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("Commit with a malformed committer_session_id folds to global discharge", () => {
+  // The extractCommit deriver normalizes a non-UUID committer_session_id
+  // to null, which the fold treats as global discharge — matching the
+  // spec's "absent or malformed → committer_session_id = null → global
+  // discharge" rule.
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID_2,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: "not-a-uuid",
+      committed_at_ms: 400_000,
+    }),
+  });
+  expect(drainAll()).toBe(1);
+  // Both rows discharged (global discharge — malformed trailer ⇒ null).
+  expect(getAttribution("/repo", TEST_UUID, "src/a.ts")?.last_commit_at).toBe(
+    400,
+  );
+  expect(getAttribution("/repo", TEST_UUID_2, "src/a.ts")?.last_commit_at).toBe(
+    400,
+  );
+  expect(getCursor()).toBe(id);
+});
+
+test("Commit per-session discharge does NOT touch rows in a different project_dir", () => {
+  // Same session_id + file_path under two different worktrees lands two
+  // distinct file_attributions rows (the composite PK carries project_dir
+  // as the first key). A commit on `/repo-a` must not discharge the
+  // attribution on `/repo-b`.
+  insertAttribution({
+    project_dir: "/repo-a",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  insertAttribution({
+    project_dir: "/repo-b",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo-a",
+    cwd: "/repo-a",
+    data: JSON.stringify({
+      project_dir: "/repo-a",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 500_000,
+    }),
+  });
+
+  expect(drainAll()).toBe(1);
+  // /repo-a discharged; /repo-b untouched.
+  expect(getAttribution("/repo-a", TEST_UUID, "src/a.ts")?.last_commit_at).toBe(
+    500,
+  );
+  expect(
+    getAttribution("/repo-b", TEST_UUID, "src/a.ts")?.last_commit_at,
+  ).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("Commit discharges multiple files in one event", () => {
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/b.ts",
+    last_mutation_at: 100,
+  });
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/c.ts",
+    last_mutation_at: 100,
+  });
+
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts", "src/c.ts"], // not src/b.ts
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 600_000,
+    }),
+  });
+
+  expect(drainAll()).toBe(1);
+  expect(getAttribution("/repo", TEST_UUID, "src/a.ts")?.last_commit_at).toBe(
+    600,
+  );
+  // b.ts is not in the file list → still on-the-hook.
+  expect(
+    getAttribution("/repo", TEST_UUID, "src/b.ts")?.last_commit_at,
+  ).toBeNull();
+  expect(getAttribution("/repo", TEST_UUID, "src/c.ts")?.last_commit_at).toBe(
+    600,
+  );
+  expect(getCursor()).toBe(id);
+});
+
+test("from-scratch re-fold reproduces the Commit attribution byte-identically", () => {
+  // Seed: a mutation row (pre-staged the way task .6 will mint them), a
+  // Commit that discharges it, then rewind + re-drain. The committed_at
+  // must come back identical from the persisted event log alone — no
+  // git re-shell, no FS read.
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 700_000,
+    }),
+  });
+  drainAll();
+  const before = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+
+  // Rewind cursor; but file_attributions rows persist (the per-session
+  // discharge is a deterministic function of the event log + the staged
+  // attribution row, so re-fold from cursor=0 over a row whose
+  // last_commit_at is already stamped should reproduce the same stamp).
+  // Mirrors the existing v31 re-fold determinism check (in
+  // `src/db.ts:2807`) for `file_attributions`.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run(
+    "UPDATE file_attributions SET last_commit_at = NULL, last_event_id = NULL WHERE 1",
+  );
+  // Bump updated_at back to the original mutation timestamp so the
+  // post-rewind read matches the pre-rewind read after the deterministic
+  // re-fold restamps it.
+  db.run("UPDATE file_attributions SET updated_at = 100 WHERE 1");
+  drainAll();
+
+  const after = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+  expect(after).toEqual(before);
+});
+
+test("Commit fold runs in the SAME transaction as cursor advance (atomicity)", () => {
+  // Synthetic crash mid-fold via the applyEvent test seam — both the
+  // file_attributions UPDATE and the cursor advance must roll back
+  // together. Re-folding from the rolled-back state restores both.
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 800_000,
+    }),
+  });
+  // Read the event from the events table for applyEvent.
+  const event = db.query("SELECT * FROM events WHERE id = ?").get(id) as Event;
+  expect(() => {
+    applyEvent(db, event, {
+      onBeforeCursorAdvance: () => {
+        throw new Error("simulated crash");
+      },
+    });
+  }).toThrow("simulated crash");
+  // Cursor did NOT advance; file_attributions row did NOT update.
+  expect(getCursor()).toBe(0);
+  expect(
+    getAttribution("/repo", TEST_UUID, "src/a.ts")?.last_commit_at,
+  ).toBeNull();
+  // Re-fold without the crash seam — both writes land.
+  applyEvent(db, event);
+  expect(getCursor()).toBe(id);
+  expect(getAttribution("/repo", TEST_UUID, "src/a.ts")?.last_commit_at).toBe(
+    800,
+  );
+});
+
+// ---------------------------------------------------------------------------
 // UsageSnapshot / UsageDeleted reducer arms — fn-615-add-agentuse-usage-collection
 // ---------------------------------------------------------------------------
 

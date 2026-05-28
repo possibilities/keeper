@@ -111,6 +111,7 @@
 
 import type { Database } from "bun:sqlite";
 import {
+  extractCommit,
   isKilledTaskNotification,
   parsePlanRef,
   planVerbRefFromSpawnName,
@@ -1076,6 +1077,110 @@ function retractGitStatus(db: Database, event: Event): void {
     }
   }
   db.run("DELETE FROM git_status WHERE project_dir = ?", [projectDir]);
+}
+
+/**
+ * Fold one synthetic `Commit` event. The git-worker emits one of these per
+ * commit in a HEAD-oid delta (see {@link
+ * import("./git-worker").enumerateCommitsInDelta}); main lifts the message
+ * into the synthetic event row this arm reads.
+ *
+ * Discharge semantic: for each `(project_dir, file_path)` pair in the
+ * commit's `files` list,
+ *   - `committer_session_id` non-null → UPDATE the matching
+ *     `file_attributions` row for `(project_dir, committer_session_id,
+ *     file_path)`, setting `last_commit_at = committed_at_ms / 1000`. Per
+ *     -session discharge: only the committing session clears its claim.
+ *   - `committer_session_id` null → UPDATE every `file_attributions` row
+ *     for `(project_dir, file_path)` regardless of session — a human / CI
+ *     commit (no `Session-Id:` trailer, or malformed value) globally
+ *     discharges every session's attribution claim for the named files.
+ *
+ * The UPDATE matches zero rows when no session has yet recorded a mutation
+ * on the file (file_attributions rows are created by the mutation-event
+ * fold in task .6, not here). That's intentional — a discharge can't
+ * resurrect a non-existent attribution. The cursor still advances per the
+ * fold-tx invariant.
+ *
+ * Producer-only liveness: this arm reads ONLY the payload fields. No
+ * `git log` re-shell, no FS probe, no env read — every fact it touches
+ * lives in the event log, so a from-scratch re-fold reproduces the same
+ * `file_attributions.last_commit_at` byte-deterministically.
+ *
+ * Runs inside the same `BEGIN IMMEDIATE` transaction as the cursor
+ * advance (via {@link applyEvent}); a throw anywhere here rolls back
+ * both writes. The defensive {@link import("./derivers").extractCommit}
+ * parser returns `null` on every shape-mismatch path so a malformed
+ * payload folds to a safe no-op; the cursor still advances.
+ */
+function foldCommit(db: Database, event: Event): void {
+  const commit = extractCommit(event);
+  if (commit == null) {
+    return;
+  }
+  if (commit.files.length === 0) {
+    // A commit with no files (empty commit via `--allow-empty`, or a
+    // commit whose file-list shell-out returned empty) has nothing to
+    // discharge. Safe no-op.
+    return;
+  }
+  // Convert producer-side milliseconds to projection-table seconds. The
+  // file_attributions schema (see `src/db.ts:631`) stores REAL unix-
+  // seconds for `last_mutation_at` / `last_commit_at`, mirroring every
+  // other projection table; the producer carries milliseconds for
+  // JS-side ergonomics. Single multiplication, safe-fold on zero (the
+  // extractCommit defensive parser folds a bad ts to 0 → discharge
+  // timestamp would be 0, indistinguishable from "never committed" in
+  // the readiness inequality; accepted lossiness on a malformed
+  // payload that should never occur in steady state).
+  const lastCommitAtSeconds = commit.committed_at_ms / 1000;
+  const eventTs = event.ts;
+  const eventId = event.id;
+  if (commit.committer_session_id !== null) {
+    // Per-session discharge: only the committing session clears its claim
+    // on each named file. Other sessions that also touched these files
+    // (multi-attribution) stay on-the-hook until they commit too.
+    const stmt = db.prepare(
+      `UPDATE file_attributions
+          SET last_commit_at = ?, last_event_id = ?, updated_at = ?
+        WHERE project_dir = ?
+          AND session_id = ?
+          AND file_path = ?`,
+    );
+    for (const filePath of commit.files) {
+      if (typeof filePath !== "string" || filePath.length === 0) continue;
+      stmt.run(
+        lastCommitAtSeconds,
+        eventId,
+        eventTs,
+        commit.project_dir,
+        commit.committer_session_id,
+        filePath,
+      );
+    }
+    return;
+  }
+  // Global discharge: no trailer or malformed trailer → no honest way to
+  // pin the discharge to a specific session, so we clear EVERY session's
+  // attribution row for the named files. Matches the spec's "global
+  // discharge (null committer_session_id) updates every session's
+  // attribution row for the named files" rule.
+  const globalStmt = db.prepare(
+    `UPDATE file_attributions
+        SET last_commit_at = ?, last_event_id = ?, updated_at = ?
+      WHERE project_dir = ?
+        AND file_path = ?`,
+  );
+  for (const filePath of commit.files) {
+    if (typeof filePath !== "string" || filePath.length === 0) continue;
+    globalStmt.run(
+      lastCommitAtSeconds,
+      eventId,
+      eventTs,
+      commit.project_dir,
+      filePath,
+    );
+  }
 }
 
 /**
@@ -3423,6 +3528,8 @@ export function applyEvent(
       projectGitStatus(db, event);
     } else if (event.hook_event === "GitRootDropped") {
       retractGitStatus(db, event);
+    } else if (event.hook_event === "Commit") {
+      foldCommit(db, event);
     } else if (event.hook_event === "UsageSnapshot") {
       projectUsageRow(db, event);
     } else if (event.hook_event === "UsageDeleted") {

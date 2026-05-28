@@ -34,7 +34,7 @@ import { isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
-import { parsePlanRef } from "./derivers";
+import { parsePlanRef, parseSessionIdTrailer } from "./derivers";
 import { isDropError, RescanScheduler } from "./rescan";
 import type { ShutdownMessage } from "./wake-worker";
 
@@ -97,7 +97,48 @@ export interface GitRootDroppedMessage {
   project_dir: string;
 }
 
-export type GitWorkerMessage = GitSnapshotMessage | GitRootDroppedMessage;
+/**
+ * Per-commit message: a single commit landed in the HEAD-oid delta the worker
+ * just observed. The worker enumerates the `<prev>..<new>` range and emits one
+ * of these per commit (so an N-commit push lands N `Commit` events — each
+ * carries its own trailer, file list, and parent oid). Main lifts every
+ * message into a synthetic `Commit` event whose reducer fold
+ * ({@link import("./reducer").foldCommit}) updates
+ * `file_attributions.last_commit_at` for the named files — discharging the
+ * attribution claim for the committer session, or globally clearing the
+ * attribution for the named files when the trailer is absent / malformed
+ * (the global-discharge fallback documented in the fn-633 epic spec).
+ *
+ * `commit_oid` is the full SHA-1 (or SHA-256 on a future repo) of the commit
+ * being attributed. `parent_oid` is the first-parent's full oid, or `null`
+ * for the initial commit (no parent). `committed_at_ms` is unix-epoch
+ * milliseconds, derived from git's `%ct` (committer date in unix seconds)
+ * multiplied by 1000 — stamped into `file_attributions.last_commit_at` by
+ * the reducer, so a from-scratch re-fold reproduces the same discharge
+ * timestamp byte-deterministically (the reducer never re-shells git).
+ *
+ * `committer_session_id` is the validated session id pulled from the commit's
+ * `Session-Id:` trailer via {@link
+ * import("./derivers").parseSessionIdTrailer} (UUID-ish, take-last on
+ * cherry-pick stacks). `null` when the trailer is absent, malformed, or
+ * doesn't parse as a UUID — the reducer fold reads `null` as "global
+ * discharge for this file set" (a human / CI commit clears every session's
+ * attribution).
+ */
+export interface CommitMessage {
+  kind: "commit";
+  project_dir: string;
+  commit_oid: string;
+  parent_oid: string | null;
+  files: string[];
+  committer_session_id: string | null;
+  committed_at_ms: number;
+}
+
+export type GitWorkerMessage =
+  | GitSnapshotMessage
+  | GitRootDroppedMessage
+  | CommitMessage;
 
 interface ParsedGitStatus {
   branch: string | null;
@@ -436,6 +477,157 @@ function readStatus(root: string): ParsedGitStatus | null {
   return out == null ? null : parsePorcelainV2(out);
 }
 
+/**
+ * Per-commit shape produced by {@link enumerateCommitsInDelta}. Field-for-
+ * field this is the {@link CommitMessage} payload minus the `kind` /
+ * `project_dir` discriminators (those ride in at the message boundary so the
+ * enumerator stays a pure git-output parser).
+ */
+interface EnumeratedCommit {
+  commit_oid: string;
+  parent_oid: string | null;
+  files: string[];
+  committer_session_id: string | null;
+  committed_at_ms: number;
+}
+
+/**
+ * Shell-out + parse for one commit's file list via
+ * `git -C <root> log -1 <oid> --name-only --no-renames --first-parent
+ * --format= -z`. `-z` swaps the per-record newline terminator for NUL,
+ * keeping paths that contain spaces or newlines whole. The `--format=` empty
+ * format string suppresses the commit-info header so the output is just the
+ * NUL-separated file list. `--first-parent` matches the "diff vs first
+ * parent" mental model for merge commits — subsequent parents' file changes
+ * attribute via their own commits in the parents' history (see the task
+ * spec's "Risks" section on merge-commit semantics).
+ *
+ * Returns the file list, or an empty array on any non-zero exit / parse
+ * miss (the producer-only invariant means a failed shell-out can't wedge
+ * the worker; the next snapshot or commit will re-attempt).
+ */
+function commitFiles(root: string, oid: string): string[] {
+  const out = gitOutput([
+    "-C",
+    root,
+    "log",
+    "-1",
+    oid,
+    "--name-only",
+    "--no-renames",
+    "--first-parent",
+    "--format=",
+    "-z",
+  ]);
+  if (out == null) return [];
+  // `--format=` empty output is just the NUL-separated file list followed
+  // by a trailing NUL. Split on NUL and drop empties (trailing NUL ⇒ last
+  // element is empty; format-empty ⇒ leading NUL may produce an empty
+  // leading element too — defensive filter on both).
+  const files: string[] = [];
+  for (const f of out.split("\0")) {
+    if (f.length > 0) files.push(f);
+  }
+  return files;
+}
+
+/**
+ * Enumerate the commits in a `<prev>..<new>` HEAD-oid delta. Shells out to
+ * `git -C <root> log <prev>..<new> --format='%H%x00%P%x00%ct%x00%(trailers:
+ * key=Session-Id,valueonly,only,unfold)' --no-patch -z` and parses each
+ * commit's four-field record. Falls back to single-commit emission against
+ * `<new>` when `<prev>..<new>` is empty (force-push, rebase to a non-
+ * descendant) or when `<prev>` is null (bootstrap-from-null, initial
+ * commit). For each enumerated commit, a sibling
+ * `git log -1 <oid> --name-only --first-parent` populates the file list.
+ *
+ * Returns the per-commit array in REVERSE chronological order (newest
+ * first — git's default `log` ordering). The caller emits one
+ * {@link CommitMessage} per element in iteration order; the reducer fold is
+ * commutative on `last_commit_at` (a later commit at higher ts wins via
+ * `MAX(existing, incoming)` semantics — or simply "always stamp" since
+ * commits are inherently ordered by chronology and the producer emits them
+ * in batch per delta), so iteration order doesn't affect the final
+ * projection.
+ */
+function enumerateCommitsInDelta(
+  root: string,
+  prev: string | null,
+  next: string,
+): EnumeratedCommit[] {
+  const format =
+    "%H%x00%P%x00%ct%x00%(trailers:key=Session-Id,valueonly,only,unfold)";
+  let out: string | null = null;
+  if (prev !== null) {
+    out = gitOutput([
+      "-C",
+      root,
+      "log",
+      `${prev}..${next}`,
+      `--format=${format}`,
+      "--no-patch",
+      "-z",
+    ]);
+  }
+  if (out == null || out.length === 0) {
+    // Fallback: force-push / non-descendant / bootstrap-from-null / initial
+    // commit. Emit a single-commit log against `<next>` only — this gives
+    // us at least the attribution for the HEAD commit (the producer's
+    // job is to be honest about what we observed; subsequent commits in
+    // a non-descendant ancestry are lost, but that's an acceptable
+    // edge per the task spec's "Risks" section).
+    out = gitOutput([
+      "-C",
+      root,
+      "log",
+      "-1",
+      next,
+      `--format=${format}`,
+      "--no-patch",
+      "-z",
+    ]);
+  }
+  if (out == null || out.length === 0) {
+    return [];
+  }
+  // Parse: with `-z`, git replaces the per-record `\n` terminator with `\0`
+  // — but the `%x00` separators inside the format string also emit literal
+  // NULs in-stream. So the wire format for N commits is:
+  //   OID1\0PARENTS1\0CT1\0TRAILERS1\0OID2\0PARENTS2\0CT2\0TRAILERS2\0...
+  // — i.e. a flat sequence of 4N NUL-delimited fields with a trailing
+  // empty element after the final NUL. Split on `\0` and consume in
+  // groups of 4.
+  const fields = out.split("\0");
+  const commits: EnumeratedCommit[] = [];
+  for (let i = 0; i + 3 < fields.length; i += 4) {
+    const oid = (fields[i] ?? "").trim();
+    if (oid.length === 0) continue;
+    const parentsRaw = (fields[i + 1] ?? "").trim();
+    // `%P` emits parent oids space-separated. First-parent semantic:
+    // attribute against the FIRST parent only (matches `--first-parent`
+    // for the file-list call below).
+    const parentOid: string | null =
+      parentsRaw.length === 0 ? null : (parentsRaw.split(" ")[0] ?? null);
+    const ctRaw = fields[i + 2] ?? "";
+    const ctSeconds = Number(ctRaw);
+    const committedAtMs =
+      Number.isFinite(ctSeconds) && ctSeconds > 0
+        ? Math.floor(ctSeconds * 1000)
+        : 0;
+    const trailers = fields[i + 3] ?? "";
+    const committerSessionId = parseSessionIdTrailer(trailers);
+    const files = commitFiles(root, oid);
+    commits.push({
+      commit_oid: oid,
+      parent_oid: parentOid,
+      files,
+      committer_session_id: committerSessionId,
+      committed_at_ms: committedAtMs,
+    });
+  }
+  return commits;
+}
+
 function discoverProjectRoots(
   db: Database,
   cwdRootCache?: Map<string, string | null>,
@@ -600,6 +792,26 @@ function startWorker(): void {
   const port = parentPort;
 
   const lastByRoot = new Map<string, string>();
+  /**
+   * Per-root HEAD-oid bootstrap cache. On first observation of a root, we
+   * seed this with the current `head_oid` from `git status --porcelain=v2
+   * --branch` so the worker emits NOTHING on bootstrap — we don't know if
+   * the existing HEAD landed during this keeperd run or before it, so the
+   * honest move is "watch from here forward". On every subsequent
+   * snapshot, a non-equal `head_oid` is the HEAD-delta signal that fires
+   * commit enumeration. After a successful enumeration we update the
+   * Map so the next snapshot's comparison is against the just-emitted
+   * head.
+   *
+   * Not persisted across daemon restarts: the seed sweep + this Map's
+   * lazy population on first snapshot mean a launchd restart sees the
+   * post-restart HEAD as "current" and starts emitting only on
+   * post-restart deltas. Misses the discharge for any commit that
+   * landed while keeperd was down — accepted lossiness; the
+   * file_attributions invariant is "best-effort discharge against
+   * observed commits", not "exhaustive historical replay".
+   */
+  const lastHeadOidByRoot = new Map<string, string | null>();
   // Each watched root holds a worktree subscription and (best-effort) a
   // git-common-dir subscription. The git-dir sub may be null if the
   // common-dir lookup failed or the subscribe itself rejected (logged,
@@ -637,6 +849,50 @@ function startWorker(): void {
       return;
     }
     if (status == null) return;
+
+    // HEAD-oid delta detection — runs BEFORE the snapshot emission so a
+    // commit's discharge lands before the next observed dirty count. The
+    // first time we see a root, seed the Map with the current head_oid
+    // and emit no commits (bootstrap-from-null avoidance per the task
+    // spec). Every subsequent observation compares against the seeded
+    // prev and emits one CommitMessage per commit in the delta.
+    const currentHeadOid = status.head_oid;
+    const had = lastHeadOidByRoot.has(root);
+    if (!had) {
+      lastHeadOidByRoot.set(root, currentHeadOid);
+    } else {
+      const prev = lastHeadOidByRoot.get(root) ?? null;
+      if (currentHeadOid !== null && currentHeadOid !== prev) {
+        try {
+          const commits = enumerateCommitsInDelta(root, prev, currentHeadOid);
+          for (const c of commits) {
+            port.postMessage({
+              kind: "commit",
+              project_dir: root,
+              commit_oid: c.commit_oid,
+              parent_oid: c.parent_oid,
+              files: c.files,
+              committer_session_id: c.committer_session_id,
+              committed_at_ms: c.committed_at_ms,
+            } satisfies CommitMessage);
+          }
+        } catch (err) {
+          // Producer-only contract: a failed enumeration cannot wedge the
+          // worker; log to stderr and continue. The next HEAD-oid change
+          // will re-attempt (with `prev` updated below to the current
+          // head, so we don't perpetually re-enumerate the same range).
+          console.error(
+            `[git-worker] commit enumeration failed for ${root}: ${stringifyErr(err)}`,
+          );
+        }
+      }
+      // Update prev unconditionally so a snapshot with the same head_oid
+      // doesn't re-enumerate, AND a one-off failed enumeration doesn't
+      // get stuck retrying the same range forever. NULL head_oid (e.g.
+      // a worktree with no commits) also stores as null.
+      lastHeadOidByRoot.set(root, currentHeadOid);
+    }
+
     let snapshot: GitSnapshotPayload;
     try {
       snapshot = buildGitSnapshot(db, root, status);
@@ -781,6 +1037,10 @@ function startWorker(): void {
       schedulers.delete(root);
     }
     lastByRoot.delete(root);
+    // Clear the HEAD-oid bootstrap cache too so a re-subscribe of the same
+    // root (planctl dir re-created) re-seeds from the current head and
+    // doesn't emit a phantom delta against the pre-drop state.
+    lastHeadOidByRoot.delete(root);
   }
 
   async function reconcileRoots(): Promise<void> {

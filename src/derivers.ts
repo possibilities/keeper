@@ -13,6 +13,13 @@
  * - `planVerbRefFromSpawnName(spawnName)` — split a
  *   `{plan,work,close,approve}::<ref>` spawn name into its verb + ref
  *   components for the jobs projection.
+ * - `parseSessionIdTrailer(raw)` / `extractCommit(event)` — take-last
+ *   parser for the `Session-Id:` trailer block git emits via
+ *   `%(trailers:key=Session-Id,valueonly,only,unfold)`, and the
+ *   defensive synthetic-`Commit`-event payload parser the reducer's
+ *   `foldCommit` arm reads. Pure functions of their inputs so the
+ *   git-worker producer write and a future from-scratch re-fold
+ *   derive byte-identical results.
  *
  * Why a separate module rather than colocating with the hook or reducer:
  *
@@ -939,4 +946,180 @@ export function extractBashMutation(
     return { kind: "git-tree-mutate", targets: [TREE_SENTINEL] };
   }
   return null;
+}
+
+/**
+ * Canonical UUID-ish session-id pattern. Claude Code's
+ * `CLAUDE_CODE_SESSION_ID` is a lowercase-hyphenated v4 UUID
+ * (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`); the git wrapper
+ * (`plugin/bin/git`) stamps that value verbatim into the
+ * `Session-Id:` trailer. A trailer carrying anything else
+ * (truncated, missing hyphens, uppercase, garbage) is treated as
+ * malformed and the deriver returns `null` → global discharge.
+ *
+ * Anchored at start AND end (the regex test below uses `^…$`
+ * implicitly via `RegExp.test` on a trimmed string with no anchors —
+ * see {@link parseSessionIdTrailer}). Module-scope literal so V8/JSC
+ * tier up once at process start, mirroring every other parser in
+ * this file.
+ */
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Take-last policy on a multi-line `Session-Id:` trailer block as
+ * produced by `git log --format='%(trailers:key=Session-Id,valueonly,
+ * only,unfold)'`. Git emits ONE line per Session-Id trailer found on
+ * the commit (newline-separated, with a trailing newline on the
+ * format-expansion result), so a cherry-picked commit that picked up
+ * a second `Session-Id:` trailer from the source commit emits two
+ * lines — and the canonical attribution is the LAST line (the
+ * cherry-picker's session, not the original author's).
+ *
+ * Returns the last non-empty trimmed line that matches
+ * {@link UUID_RE}, or `null` for an empty / whitespace-only / all-
+ * malformed input. A mixed block (one malformed line + one valid
+ * UUID line) returns the valid one iff it is the last non-empty
+ * line — mirroring the spec's "take-last policy" without a salvage
+ * pass.
+ *
+ * Pure function of its argument so re-fold determinism holds: the
+ * migration's same-transaction backfill (if added later), the live
+ * worker emission, and a future from-scratch re-fold all produce
+ * the same output for the same input.
+ */
+export function parseSessionIdTrailer(raw: unknown): string | null {
+  if (typeof raw !== "string" || raw.length === 0) {
+    return null;
+  }
+  // Split on `\n` (the unfold output is plain newlines); trim each
+  // line because git appends a trailing `\n` after the last trailer
+  // value, which produces a trailing empty element on split.
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = (lines[i] ?? "").trim();
+    if (line.length === 0) continue;
+    return UUID_RE.test(line) ? line : null;
+  }
+  return null;
+}
+
+/**
+ * The shape returned by {@link extractCommit}. Mirrors the
+ * git-worker's `CommitMessage` field-for-field minus the `kind`
+ * discriminator. A `null` return signals "not a parseable Commit
+ * payload" — the reducer's fold arm short-circuits without a write,
+ * the cursor still advances (never throw inside the fold tx).
+ *
+ * `committer_session_id` is `null` either because the trailer was
+ * absent (commit minted outside a Claude Code session — human
+ * commit, CI commit, etc.) OR malformed (wrapper bug, hand-edited
+ * trailer with a bad value). Both fold to the same "global
+ * discharge" semantic: every session's attribution row for the
+ * named files clears, because we have no honest way to single out a
+ * specific session.
+ *
+ * `committed_at_ms` is unix-epoch milliseconds — the producer
+ * derives it from git's `%ct` (committer date in unix seconds) by
+ * multiplying by 1000. Stored in the payload so the reducer can
+ * stamp `file_attributions.last_commit_at` without re-reading the
+ * commit (producer-only liveness invariant).
+ */
+export interface CommitPayload {
+  project_dir: string;
+  commit_oid: string;
+  parent_oid: string | null;
+  files: string[];
+  committer_session_id: string | null;
+  committed_at_ms: number;
+}
+
+/**
+ * Anchored full-OID match — git short-OIDs vary in length but the
+ * `%H` format always emits the full 40-char SHA-1 (or 64-char
+ * SHA-256 on future repos). We accept either width so a SHA-256
+ * repo doesn't fail attribution; anything else (empty, partial,
+ * non-hex, embedded whitespace) rejects. Module-scope literal so
+ * V8/JSC tier up once at process start.
+ */
+const GIT_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+/**
+ * Defensive parse of a synthetic `Commit` event's `data` blob into
+ * a {@link CommitPayload}. Returns `null` on every shape-mismatch
+ * path — the reducer's fold arm reads the return value and skips
+ * the write on null, advancing the cursor without a throw.
+ *
+ * Pure function of the event-row shape so re-fold determinism
+ * holds: a from-scratch re-fold against the persisted event log
+ * derives the same payload as the live producer wrote.
+ *
+ * `parent_oid` may be the empty string when git's `%P` expansion
+ * returned no parents (the initial commit). We normalize that to
+ * `null` so downstream consumers don't accidentally compare
+ * against `""`.
+ */
+export function extractCommit(event: { data: string }): CommitPayload | null {
+  if (typeof event.data !== "string" || event.data.length === 0) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(event.data);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return null;
+  }
+  const obj = parsed as Record<string, unknown>;
+  const projectDir = obj.project_dir;
+  if (typeof projectDir !== "string" || projectDir.length === 0) {
+    return null;
+  }
+  const commitOid = obj.commit_oid;
+  if (typeof commitOid !== "string" || !GIT_OID_RE.test(commitOid)) {
+    return null;
+  }
+  const rawParent = obj.parent_oid;
+  let parentOid: string | null;
+  if (rawParent === null || rawParent === undefined) {
+    parentOid = null;
+  } else if (typeof rawParent === "string") {
+    parentOid =
+      rawParent.length === 0
+        ? null
+        : GIT_OID_RE.test(rawParent)
+          ? rawParent
+          : null;
+  } else {
+    parentOid = null;
+  }
+  const rawFiles = obj.files;
+  const files: string[] = [];
+  if (Array.isArray(rawFiles)) {
+    for (const f of rawFiles) {
+      if (typeof f === "string" && f.length > 0) {
+        files.push(f);
+      }
+    }
+  }
+  const rawSession = obj.committer_session_id;
+  const committerSessionId: string | null =
+    typeof rawSession === "string" && UUID_RE.test(rawSession)
+      ? rawSession
+      : null;
+  const rawTs = obj.committed_at_ms;
+  const committedAtMs =
+    typeof rawTs === "number" && Number.isFinite(rawTs) && rawTs > 0
+      ? rawTs
+      : 0;
+  return {
+    project_dir: projectDir,
+    commit_oid: commitOid,
+    parent_oid: parentOid,
+    files,
+    committer_session_id: committerSessionId,
+    committed_at_ms: committedAtMs,
+  };
 }

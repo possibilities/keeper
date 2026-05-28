@@ -698,6 +698,15 @@ function runDaemon(): void {
       // the EpicDeleted / TaskDeleted shape so re-fold reproduces the deletion.
       hookEvent = "GitRootDropped";
       data = "";
+    } else if (msg.kind === "commit") {
+      // Per-commit attribution event. The reducer's `foldCommit` arm reads
+      // the payload's `files` + `committer_session_id` and updates
+      // `file_attributions.last_commit_at` — discharging the committing
+      // session's claim on each file, or globally clearing every session's
+      // claim when the trailer was absent / malformed.
+      hookEvent = "Commit";
+      const { kind: _kind, ...commit } = msg;
+      data = JSON.stringify(commit);
     } else {
       return;
     }
