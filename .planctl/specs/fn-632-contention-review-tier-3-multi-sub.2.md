@@ -110,5 +110,5 @@ Drop reference to the 500ms full-refetch backstop. Note that patch/meta routing 
 - [ ] `bun test` green.
 
 ## Done summary
-
+Client-side id-first routing in handleFrame (bySubId map alongside byCollection, collection fallback for legacy servers) + removed pollAll's 500ms refetch backstop. Patch-driven freshness via scheduleRefetchFor from handleFrame; pollAll is slow-flight diagnosis only. Four new tests cover id routing, legacy compat, reconnect subId stability, and the no-poll-refetch invariant. All 14 readiness-client tests + 85 server-worker tests pass. README readiness paragraph revised.
 ## Evidence

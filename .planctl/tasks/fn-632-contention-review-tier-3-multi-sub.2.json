@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Client id-based routing + drop 500ms refetch",
-  "updated_at": "2026-05-28T13:49:28.594440Z"
+  "updated_at": "2026-05-28T14:33:02.609566Z",
+  "worker_done_at": "2026-05-28T14:33:02.609566Z"
 }
