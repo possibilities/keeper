@@ -48,11 +48,12 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   appended to /tmp/keeper-usage.<pid>.lifecycle.txt. Session paths
   print on exit.
 
-Rows show one agentuse profile: id, target + multiplier, session % +
-reset (minute-rounded humanized relative time, e.g. \`in 5d 21h\` /
-\`in 1h 16m\` / \`in 5m\` / \`now\`), week % + reset. The live frame
-re-renders every 30s so countdowns tick; historical scroll-back
-stays frozen at each frame's capture time.
+Each profile renders as a stacked block — a header line with the id
+chip + target/multiplier chip, then one indented body line per quota
+window (session, week, and sonnet where present). Reset times render
+as minute-rounded humanized relative time (\`in 5d 21h\` / \`in 1h 16m\`
+/ \`in 5m\` / \`now\`). The live frame re-renders every 30s so countdowns
+tick; historical scroll-back stays frozen at each frame's capture time.
 Per-frame sidecars under /tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*
 with an indexed meta sidecar; session paths print on SIGINT.
 `;
@@ -119,21 +120,29 @@ function relTime(iso: string, nowMs: number): string {
 }
 
 /**
- * Render the `usage`-collection rows into one line per profile.
+ * Render the `usage`-collection rows into a stacked, indented block per
+ * profile — a header line carrying the id chip + target/multiplier chip,
+ * then one indented body line per quota window:
  *
- *   {(id)} [{target} {mult}x] session {pct} (resets {rel}) | week {pct} (resets {rel})
- *                                                          | sonnet {pct} (resets {rel})
+ *   (claude-multi-3) [claude 20x]
+ *                    session 16% (resets in 29m)
+ *                    week    36% (resets in 4d 5h)
+ *                    sonnet   8% (resets in 4d 5h)
  *
- * Every column is pre-measured across the row set so the grid stays
- * aligned: id wraps in `(...)` and right-aligns (padStart) so the closing
- * `)` stamps at a fixed column; target padEnds + multiplier padStarts
- * inside the `[target  Nx]` chip so the chip's right edge is fixed;
- * session / week pct values padStart, reset strings padEnd. The third
- * `| sonnet ...` column appears ONLY on rows whose envelope carried
- * `usage.sonnet_week` — currently the claude target's envelope, not
- * codex — and its widths are computed over that subset. Rows without
- * sonnet data simply end after the week column; they do NOT render an
- * empty placeholder.
+ * Body indent equals `wId + 1` so labels line up under the `[` of the
+ * chip. Labels (`session` / `week` / `sonnet`) padEnd to the widest of
+ * the labels ACTUALLY rendered across the row set — `sonnet` only joins
+ * that pool when at least one row has `sonnet_week_percent` data, so a
+ * sonnet-less screen still aligns pct values cleanly. Pct cells padStart
+ * to the widest pct across every body line that will render (session,
+ * week, and sonnet wherever present), so a `100%` in any row pushes a
+ * matching column of right-aligned digits everywhere.
+ *
+ * The `(resets <rel>)` tail is unpadded — the closing `)` lands wherever
+ * the rel-time text ends. The line above is the alignment grid.
+ *
+ * Rows without sonnet data simply omit the sonnet body line; they do NOT
+ * render an empty placeholder.
  *
  * Reset cells are rendered against the supplied `nowMs` — the caller
  * passes `Date.now()` from the data-change emit AND from the 30s tick,
@@ -181,13 +190,25 @@ export function renderRowLines(
   const wId = widest(cells.map((c) => c.id));
   const wTarget = widest(cells.map((c) => c.target));
   const wMult = widest(cells.map((c) => c.mult));
-  const wSPct = widest(cells.map((c) => c.sPct));
-  const wSReset = widest(cells.map((c) => c.sReset));
-  const wWPct = widest(cells.map((c) => c.wPct));
-  const wWReset = widest(cells.map((c) => c.wReset));
-  const sonnetCells = cells.filter((c) => c.swPct != null);
-  const wSwPct = widest(sonnetCells.map((c) => c.swPct ?? ""));
-  const wSwReset = widest(sonnetCells.map((c) => c.swReset));
+
+  // Pct width across every body line that will render.
+  const allPcts: string[] = [];
+  for (const c of cells) {
+    allPcts.push(c.sPct, c.wPct);
+    if (c.swPct != null) allPcts.push(c.swPct);
+  }
+  const wPct = widest(allPcts);
+
+  // Label width across the labels actually rendered. `sonnet` joins the
+  // pool only when at least one row has sonnet data — keeps a sonnet-
+  // less screen from padding `week` against an absent label.
+  const labels = ["session", "week"];
+  if (cells.some((c) => c.swPct != null)) labels.push("sonnet");
+  const wLabel = widest(labels);
+
+  const indent = " ".repeat(wId + 1);
+  const renderBody = (label: string, pctStr: string, rel: string): string =>
+    `${indent}${label.padEnd(wLabel, " ")} ${pctStr.padStart(wPct, " ")} (resets ${rel})`;
 
   const lines: string[] = [];
   for (const c of cells) {
@@ -196,13 +217,12 @@ export function renderRowLines(
       c.target === "" && c.mult === ""
         ? ""
         : `[${c.target.padEnd(wTarget, " ")} ${c.mult.padStart(wMult, " ")}x]`;
-    const sSeg = `session ${c.sPct.padStart(wSPct, " ")} (resets ${c.sReset.padEnd(wSReset, " ")})`;
-    const wSeg = `week ${c.wPct.padStart(wWPct, " ")} (resets ${c.wReset.padEnd(wWReset, " ")})`;
-    const swSeg =
-      c.swPct == null
-        ? ""
-        : ` | sonnet ${c.swPct.padStart(wSwPct, " ")} (resets ${c.swReset.padEnd(wSwReset, " ")})`;
-    lines.push(`${id} ${targetChip} ${sSeg} | ${wSeg}${swSeg}`);
+    lines.push(targetChip === "" ? id : `${id} ${targetChip}`);
+    lines.push(renderBody("session", c.sPct, c.sReset));
+    lines.push(renderBody("week", c.wPct, c.wReset));
+    if (c.swPct != null) {
+      lines.push(renderBody("sonnet", c.swPct, c.swReset));
+    }
   }
   return lines;
 }
@@ -234,6 +254,12 @@ async function main(): Promise<void> {
   let lastFrame: string | null = null;
   let frameCount = 0;
   let lastRows: Record<string, unknown>[] = [];
+  // Projection-meaningful subset of the last emit. Gating `emitFrame` on
+  // this — not on the rendered text — keeps a fetch-only refresh that
+  // bumps `last_event_id` / `updated_at` from flapping a new frame, AND
+  // keeps minute-tick relative-time bleed from forging one either. Cleared
+  // on `disconnected` so a post-reconnect first emit always paints.
+  let lastRowsKey: string | null = null;
   // Last lines we pushed/refreshed to the live shell. Lets the 30s tick
   // skip the `refreshLive` call when minute-rounding produced identical
   // text — avoids even the cost of constructing the overlay (renderDiff
@@ -308,20 +334,46 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Helper-driven row callback. Byte-compares the rendered frame against
-   * the last emit and only writes (sidecars + stdout) when the render
-   * changes — so a fetch-only refresh that bumps the `usage` row's
-   * `last_event_id` without moving any projection-meaningful field
-   * produces no visible re-render. Rendering is against `Date.now()` so
-   * the frozen at-capture text in history reflects what was on screen
-   * the moment the data landed; the 30s tick below keeps the live view
-   * ticking forward via `refreshLive`.
+   * Stringify the projection-meaningful subset of the row set into a stable
+   * hash key. `last_event_id` / `updated_at` are excluded on purpose — they
+   * bump on every fetch-only refresh even when no rendered field changed —
+   * and so is anything else the renderer doesn't read. Keeps the gate
+   * insensitive to wall-clock-driven relative-time bleed too: the inputs
+   * are raw ISO timestamps + percents, not the minute-rounded prose.
+   */
+  function rowsHashKey(rows: Record<string, unknown>[]): string {
+    return JSON.stringify(
+      rows.map((r) => [
+        r.id,
+        r.target,
+        r.multiplier,
+        r.session_percent,
+        r.session_resets_at,
+        r.week_percent,
+        r.week_resets_at,
+        r.sonnet_week_percent,
+        r.sonnet_week_resets_at,
+      ]),
+    );
+  }
+
+  /**
+   * Helper-driven row callback. Gates on the raw projection subset (see
+   * {@link rowsHashKey}) — NOT on rendered text — so a fetch-only refresh
+   * that bumps `last_event_id` / `updated_at` produces no new frame, and a
+   * minute-boundary crossing between two same-data emits can't forge one
+   * either. Rendering is still against `Date.now()` so the frozen
+   * at-capture text in history reflects what was on screen the moment the
+   * data landed; the 30s tick below keeps the live view ticking forward
+   * via `refreshLive` without growing history.
    */
   function emitFrame(rows: Record<string, unknown>[]): void {
+    const rowsKey = rowsHashKey(rows);
+    if (rowsKey === lastRowsKey) return;
+    lastRowsKey = rowsKey;
     lastRows = rows;
     const bodyLines = renderRowLines(rows, Date.now());
     const frameText = ["---", ...bodyLines].join("\n");
-    if (frameText === lastFrame) return;
     frameCount += 1;
     liveShell.pushFrame(bodyLines);
     lastLiveLines = bodyLines;
@@ -366,11 +418,12 @@ async function main(): Promise<void> {
     } catch {
       // best-effort
     }
-    // On disconnect, clear `lastFrame` so the next first-paint emits even
-    // if the post-reconnect snapshot happens to match the last pre-
-    // disconnect frame byte-for-byte.
+    // On disconnect, clear both gates so the next first-paint always emits
+    // — even if the post-reconnect snapshot matches the last pre-disconnect
+    // row set (raw or rendered) byte-for-byte.
     if (event === "disconnected") {
       lastFrame = null;
+      lastRowsKey = null;
     }
   }
 
