@@ -89,5 +89,5 @@ test/reducer.test.ts: this task adds the biggest test surface — target ≥20 f
 - [ ] Re-fold determinism: rewind + drain reproduces byte-identical projection rows
 
 ## Done summary
-
+Rewrote projectGitStatus as a five-pass attribution fold inside BEGIN IMMEDIATE: explicit tool/bash mutation upsert, inferred attribution via mtime-bracketed Bash windows, materialized attributions[] under the last_mutation_at > COALESCE(last_commit_at, 0) discharge filter, per-job + project-broadcast count fan-out, and symmetric file_attributions DELETE on GitRootDropped. 20 new fold tests cover happy/discharge/re-discharge/global-discharge/multi-attribution/inferred/truly-orphan/unattributed-to-live/re-fold-determinism/retract.
 ## Evidence
