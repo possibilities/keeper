@@ -53,5 +53,5 @@ Manual proofread post-edit. No automated test surface for prose. Run `bun test` 
 - [ ] Manual proofread + `bun test` passes
 
 ## Done summary
-
+Updated README + CLAUDE.md prose for schema v31: file-centric git surface, per-(session, file) attribution with commit-discharge semantics, sparse-columns count bumped 8→10, Commit synthetic event added to DO-NOT enumeration, Inspect section gains git_status + file_attributions queries.
 ## Evidence
