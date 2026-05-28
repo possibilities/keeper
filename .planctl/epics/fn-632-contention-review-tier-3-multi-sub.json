@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-632-contention-review-tier-3-multi-sub",
   "bundles": [],
   "closer_done_at": "2026-05-28T14:37:47.416023Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-28T14:37:47.416023Z"
+  "updated_at": "2026-05-28T14:38:02.646244Z"
 }
