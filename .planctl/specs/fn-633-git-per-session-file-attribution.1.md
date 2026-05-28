@@ -37,5 +37,5 @@ Drop a `git` shell-script wrapper into `plugin/bin/git` (already first in keeper
 - [ ] Manual verification: `jobctl commit-work --preview-files` and `jobctl commit-work "test"` invocations route through the wrapper (jobctl uses bare `["git", ...]` per investigation)
 
 ## Done summary
-
+Added plugin/bin/git wrapper (bash, +x) that walks past git global options to detect  subcommand and injects --trailer "Session-Id: $CLAUDE_CODE_SESSION_ID" before exec'ing /usr/bin/git. 13-case bun:test suite covers commit/amend/global-option/pass-through paths.
 ## Evidence
