@@ -1,0 +1,154 @@
+"""Stdlib-only tests for keeper.api.get_session_dirty_files.
+
+Runs with ``python -m unittest`` from ``keeper-py/`` — no pytest, no deps,
+matching the package's stdlib-only contract.  Builds a temp DB with the
+v31-shaped ``meta`` / ``file_attributions`` / ``git_status`` tables and
+exercises the attribution + dirty-intersection rules.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+from keeper.api import (
+    KeeperDBMissing,
+    KeeperSchemaError,
+    get_session_dirty_files,
+)
+
+
+def _build_db(path: Path, *, schema_version: int = 31) -> None:
+    conn = sqlite3.connect(path)
+    # Real keeper shape: meta is a key/value table, version stored as TEXT.
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
+        (str(schema_version),),
+    )
+    conn.execute(
+        """CREATE TABLE file_attributions (
+            project_dir TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            last_mutation_at REAL NOT NULL,
+            last_commit_at REAL,
+            op TEXT NOT NULL,
+            source TEXT NOT NULL,
+            last_event_id INTEGER,
+            updated_at REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (project_dir, session_id, file_path)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE git_status (
+            project_dir TEXT PRIMARY KEY,
+            dirty_files TEXT NOT NULL DEFAULT '[]'
+        )"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def _add_attrib(path, project_dir, session_id, file_path, mut, commit, src="tool"):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO file_attributions "
+        "(project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (project_dir, session_id, file_path, mut, commit, src, src),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _set_dirty(path, project_dir, rel_paths):
+    cell = json.dumps([{"path": p, "xy": " M", "mtime_ms": None} for p in rel_paths])
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO git_status (project_dir, dirty_files) VALUES (?, ?) "
+        "ON CONFLICT(project_dir) DO UPDATE SET dirty_files = excluded.dirty_files",
+        (project_dir, cell),
+    )
+    conn.commit()
+    conn.close()
+
+
+class GetSessionDirtyFilesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self._tmp.name) / "keeper.db"
+        _build_db(self.db)
+        self._prev = os.environ.get("KEEPER_DB")
+        os.environ["KEEPER_DB"] = str(self.db)
+
+    def tearDown(self) -> None:
+        if self._prev is None:
+            os.environ.pop("KEEPER_DB", None)
+        else:
+            os.environ["KEEPER_DB"] = self._prev
+        self._tmp.cleanup()
+
+    def test_on_hook_and_dirty_is_returned(self):
+        _add_attrib(self.db, "/repo", "sess", "src/a.ts", mut=100, commit=None)
+        _set_dirty(self.db, "/repo", ["src/a.ts"])
+        result = get_session_dirty_files("sess", "/repo")
+        self.assertEqual(result["files_by_repo"], {"/repo": ["src/a.ts"]})
+        self.assertEqual(result["cwd_repo"], "/repo")
+
+    def test_discharged_file_excluded(self):
+        # last_commit_at > last_mutation_at → committed since the edit → off hook.
+        _add_attrib(self.db, "/repo", "sess", "src/a.ts", mut=100, commit=200)
+        _set_dirty(self.db, "/repo", ["src/a.ts"])
+        result = get_session_dirty_files("sess", "/repo")
+        self.assertEqual(result["files_by_repo"], {})
+
+    def test_re_mutated_after_commit_back_on_hook(self):
+        _add_attrib(self.db, "/repo", "sess", "src/a.ts", mut=300, commit=200)
+        _set_dirty(self.db, "/repo", ["src/a.ts"])
+        result = get_session_dirty_files("sess", "/repo")
+        self.assertEqual(result["files_by_repo"], {"/repo": ["src/a.ts"]})
+
+    def test_on_hook_but_not_dirty_excluded(self):
+        # Undischarged but reverted → not in git_status.dirty_files → skip.
+        _add_attrib(self.db, "/repo", "sess", "src/a.ts", mut=100, commit=None)
+        _set_dirty(self.db, "/repo", [])
+        result = get_session_dirty_files("sess", "/repo")
+        self.assertEqual(result["files_by_repo"], {})
+
+    def test_other_session_not_returned(self):
+        _add_attrib(self.db, "/repo", "other", "src/a.ts", mut=100, commit=None)
+        _set_dirty(self.db, "/repo", ["src/a.ts"])
+        result = get_session_dirty_files("sess", "/repo")
+        self.assertEqual(result["files_by_repo"], {})
+
+    def test_cwd_repo_longest_prefix_wins(self):
+        _set_dirty(self.db, "/repo", [])
+        _set_dirty(self.db, "/repo/inner", [])
+        result = get_session_dirty_files("sess", "/repo/inner/sub")
+        self.assertEqual(result["cwd_repo"], "/repo/inner")
+
+    def test_cwd_outside_any_repo_is_none(self):
+        _set_dirty(self.db, "/repo", [])
+        result = get_session_dirty_files("sess", "/elsewhere")
+        self.assertIsNone(result["cwd_repo"])
+
+    def test_unsupported_schema_raises(self):
+        bad = Path(self._tmp.name) / "bad.db"
+        _build_db(bad, schema_version=30)
+        os.environ["KEEPER_DB"] = str(bad)
+        with self.assertRaises(KeeperSchemaError):
+            get_session_dirty_files("sess", "/repo")
+
+    def test_missing_db_raises(self):
+        os.environ["KEEPER_DB"] = str(Path(self._tmp.name) / "nope.db")
+        with self.assertRaises(KeeperDBMissing):
+            get_session_dirty_files("sess", "/repo")
+
+
+if __name__ == "__main__":
+    unittest.main()
