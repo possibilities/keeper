@@ -142,6 +142,7 @@ import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
 } from "../src/readiness-client";
+import { appendDiagnostic } from "../src/readiness-diagnostics";
 import type { Epic, Task } from "../src/types";
 
 const HELP = `keeper-autopilot — dispatch log viewer over the keeper subscribe server
@@ -1152,6 +1153,14 @@ async function main(): Promise<void> {
 
   const sockPath = values.sock ?? resolveSockPath();
   const dispatchLogPath = join(dirname(sockPath), "dispatch.log");
+  // fn-635: readiness diagnostics JSONL log. Same path keeper-wide
+  // (shared with `scripts/board.ts`'s drain) so two processes appending
+  // concurrently land in one file. POSIX O_APPEND under PIPE_BUF gives
+  // atomicity without flock.
+  const diagnosticsLogPath = join(
+    dirname(sockPath),
+    "readiness-diagnostics.jsonl",
+  );
   const dryRun = values["dry-run"] === true;
   let frameCount = 0;
 
@@ -1745,6 +1754,15 @@ async function main(): Promise<void> {
   let firstPaintLogged = false;
   const onSnapshot = (snap: ReadinessClientSnapshot): void => {
     lastSnap = snap;
+    // fn-635: drain readiness diagnostics first. Verdict-edge handling
+    // (`processLaunchTransitions`, `detectJobTransitions`) is unchanged;
+    // the drain is a pure observation step that records the resolver's
+    // ambiguity findings to a shared JSONL log siblings the dispatch
+    // log. Same single-O_APPEND-line-under-PIPE_BUF atomicity contract
+    // as the dispatch log.
+    for (const d of snap.readiness.diagnostics) {
+      appendDiagnostic(d, diagnosticsLogPath);
+    }
     detectJobTransitions(detectJobTransitionsDeps, snap);
     if (!firstPaintLogged) {
       firstPaintLogged = true;

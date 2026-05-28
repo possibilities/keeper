@@ -76,18 +76,19 @@
  */
 
 import { appendFileSync, writeFileSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
-import { formatPill, type Verdict } from "../src/readiness";
+import { formatPill, resolveEpicDep, type Verdict } from "../src/readiness";
 import {
   collapseSubagentsByName,
   type ReadinessClientSnapshot,
   subscribeReadiness,
 } from "../src/readiness-client";
-import type { JobLinkEntry, SubagentInvocation } from "../src/types";
+import { appendDiagnostic } from "../src/readiness-diagnostics";
+import type { Epic, JobLinkEntry, SubagentInvocation } from "../src/types";
 
 const HELP = `keeper-board — combined epics + jobs UI over the keeper subscribe server
 
@@ -391,6 +392,29 @@ function epicDepRefFromId(id: string): string | null {
 }
 
 /**
+ * Parallel to {@link epicDepRefFromId} for the bare-id form (`fn-N`, no
+ * trailing slug). Returns the bare epic number when the id matches; else
+ * `null`. The board's `[#N,#M]` summary pill on the epic header uses
+ * this alongside `epicDepRefFromId` so both id shapes render correctly
+ * — full ids carry the `<project>#<N>` cross-project prefix when present,
+ * bare ids render as a bare `#N` (intra-project by definition of the
+ * resolver's fn-N-then-cwd-then-global match path).
+ */
+export function epicNumFromIdOrBare(id: string): number | null {
+  // Full id: `<name>-<num>-<slug>` — first numeric segment after the
+  // project prefix. Bare id: `fn-<num>` exact.
+  const full = /^[a-z]+-(\d+)-/.exec(id);
+  if (full !== null) {
+    return Number.parseInt(full[1] ?? "", 10);
+  }
+  const bare = /^fn-(\d+)$/.exec(id);
+  if (bare !== null) {
+    return Number.parseInt(bare[1] ?? "", 10);
+  }
+  return null;
+}
+
+/**
  * ANSI SGR sequences for the pill palette. Five semantic buckets keyed off
  * exact pill strings (plus `blocked:*`, `failed:*`, and `awaiting:*`
  * prefix fallbacks) so the colorizer stays purely string-driven — no
@@ -440,6 +464,13 @@ const PILL_COLORS: Record<string, PillBucket> = {
   failed: "error",
   rejected: "error",
   killed: "error",
+  // fn-635: a structurally-broken cross-project epic dep (full-id miss,
+  // bare-id miss, or ambiguous bare-id with no same-project disambiguator)
+  // renders red — distinct from the amber `[blocked]` family. The
+  // colorizer's prefix branch below routes `blocked:dep-on-epic-dangling
+  // <id>` to this bucket; the bare `[dep-on-epic-dangling]` token (e.g.
+  // a future direct-pill render path) also lands here via exact match.
+  "dep-on-epic-dangling": "error",
   blocked: "warn",
   completed: "faded",
   superseded: "faded",
@@ -475,6 +506,19 @@ const PILL_COLORS: Record<string, PillBucket> = {
 export function colorizePillsInLine(line: string): string {
   return line.replace(/\[([^\]]+)\]/g, (match, inner: string) => {
     let bucket = PILL_COLORS[inner];
+    // fn-635: route `blocked:dep-on-epic-dangling <id>` to the `error`
+    // bucket (red) — distinct from the amber `blocked:*` family. This
+    // check MUST precede the generic `blocked:` → `warn` fallback below,
+    // otherwise a dangling dep would render amber. The exact-match
+    // `PILL_COLORS["dep-on-epic-dangling"] = "error"` entry above
+    // handles the bare-token path; this prefix branch handles the
+    // wrapped `blocked:dep-on-epic-dangling <upstream>` payload.
+    if (
+      bucket === undefined &&
+      inner.startsWith("blocked:dep-on-epic-dangling")
+    ) {
+      bucket = "error";
+    }
     if (bucket === undefined && inner.startsWith("blocked:")) {
       bucket = "warn";
     }
@@ -562,6 +606,14 @@ async function main(): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
+  // fn-635: readiness diagnostics JSONL log. Siblings the sock + dispatch
+  // log in the same state directory (`~/.local/state/keeper/`). Two
+  // processes (board.ts + autopilot.ts) can append concurrently; POSIX
+  // O_APPEND under PIPE_BUF gives the atomicity guarantee, no flock.
+  const diagnosticsLogPath = join(
+    dirname(sockPath),
+    "readiness-diagnostics.jsonl",
+  );
   const log = (s: string) => process.stdout.write(`${s}\n`);
   // Forward-reference slot for the `c`-key copy handler — wired to a real
   // closure further down once `lastFrameText`, sidecar paths, and
@@ -682,6 +734,9 @@ async function main(): Promise<void> {
     snap: ReadinessClientSnapshot,
     subagentIndex: Map<string, SubagentInvocation[]>,
     epicIds: Set<string>,
+    epicsList: Epic[],
+    epicById: Map<string, Epic>,
+    epicsByNumber: Map<number, Epic[]>,
     row: Record<string, unknown>,
   ): string {
     const dir =
@@ -690,12 +745,66 @@ async function main(): Promise<void> {
     const epicDeps = Array.isArray(row.depends_on_epics)
       ? row.depends_on_epics
       : [];
-    const epicDepsForRender = epicDeps.filter((d) => epicIds.has(String(d)));
-    const epicDepRefs = epicDepsForRender
-      .map((d) => epicDepRefFromId(String(d)))
-      .filter((r): r is string => r != null);
+    // fn-635: summary pill uses the shared `resolveEpicDep` so the
+    // summary and the row pill agree on every dep's resolution. Three
+    // render shapes:
+    //   - intra-project resolved → `[#N]`
+    //   - cross-project resolved → `[<project>::#N]`
+    //   - dangling (full-id miss, bare-id miss, ambiguous-no-disambig)
+    //     → `[?#N]` when the id is well-formed enough to extract N,
+    //     dropped when it isn't.
+    // Predicates 9's resolver may emit diagnostics; we pass a throwaway
+    // diagnostic sink here because the canonical diagnostics drain is
+    // driven by `snap.readiness.diagnostics` (already populated by
+    // `computeReadiness` in the helper). Keeping a separate sink avoids
+    // double-emitting on every render tick.
+    const consumerEpic = epicsList.find(
+      (e) => e.epic_id === String(row.epic_id),
+    );
+    const epicDepRefs: string[] = [];
+    for (const d of epicDeps) {
+      const depStr = String(d);
+      const num = epicNumFromIdOrBare(depStr);
+      if (consumerEpic === undefined) {
+        // Defensive: if the consumer epic shape isn't recoverable, fall
+        // through to the legacy `<name>#<number>` render so the line
+        // stays informative even on a malformed input.
+        const legacy = epicDepRefFromId(depStr);
+        if (legacy !== null) {
+          epicDepRefs.push(legacy);
+        }
+        continue;
+      }
+      const resolved = resolveEpicDep(
+        depStr,
+        consumerEpic,
+        epicById,
+        epicsByNumber,
+        [],
+      );
+      if (resolved.kind === "dangling") {
+        if (num !== null) {
+          epicDepRefs.push(`?#${num}`);
+        }
+        continue;
+      }
+      const resolvedNum = resolved.epic.epic_number;
+      if (typeof resolvedNum !== "number") {
+        continue;
+      }
+      if (resolved.cross_project === null) {
+        epicDepRefs.push(`#${resolvedNum}`);
+      } else {
+        epicDepRefs.push(`${resolved.cross_project}::#${resolvedNum}`);
+      }
+    }
     const epicDepsSeg =
       epicDepRefs.length === 0 ? "" : ` [${epicDepRefs.join(",")}]`;
+    // `epicIds` is no longer used for filtering (resolver path handles
+    // every dep shape including ambiguous bare-ids); kept in the
+    // signature for API stability while the helper is in flux. Silence
+    // the lint by reading once.
+    void epicIds;
     const epicId = seg(row.epic_id);
     const epicApproval = approvalPill(row.approval);
     const lines: string[] = [];
@@ -752,12 +861,35 @@ async function main(): Promise<void> {
       return "";
     }
     const epicIds = new Set(snap.epics.map((e) => String(e.epic_id)));
-    return snap.epics
+    // fn-635: build the same `epicById` + `epicsByNumber` indexes the
+    // shared `resolveEpicDep` needs, once per frame. Mirrors the index
+    // shape `computeReadiness` builds — kept structurally parallel so a
+    // future planctl-side change to the cwd-then-global semantic flows
+    // through both the readiness pipeline and the board renderer
+    // identically.
+    const epicsList = snap.epics as Epic[];
+    const epicById = new Map<string, Epic>();
+    const epicsByNumber = new Map<number, Epic[]>();
+    for (const epic of epicsList) {
+      epicById.set(epic.epic_id, epic);
+      if (typeof epic.epic_number === "number") {
+        const arr = epicsByNumber.get(epic.epic_number);
+        if (arr === undefined) {
+          epicsByNumber.set(epic.epic_number, [epic]);
+        } else {
+          arr.push(epic);
+        }
+      }
+    }
+    return epicsList
       .map((e) =>
         renderEpicBlock(
           snap,
           subagentIndex,
           epicIds,
+          epicsList,
+          epicById,
+          epicsByNumber,
           e as unknown as Record<string, unknown>,
         ),
       )
@@ -938,6 +1070,15 @@ async function main(): Promise<void> {
    * we get here.
    */
   function emitFrame(snap: ReadinessClientSnapshot): void {
+    // fn-635: drain `snap.readiness.diagnostics` to the JSONL log before
+    // building the render. The drain is per-snapshot, not per-emit (we
+    // want every observed ambiguity recorded even if the render is
+    // byte-stable and `lastBody` short-circuits). Best-effort append —
+    // `appendDiagnostic` swallows I/O errors so a transient FS hiccup
+    // doesn't wedge the frame loop.
+    for (const d of snap.readiness.diagnostics) {
+      appendDiagnostic(d, diagnosticsLogPath);
+    }
     // Per-frame `job_id → invocations` index — re-entrant sub-agents within
     // one session sit on the same `job_id` bucket, ordered by `turn_seq asc`
     // so the nested list reads in invocation order. The projection now

@@ -91,6 +91,7 @@
  *   - Otherwise `[blocked:<first non-completed row's reason in traversal order>]`.
  */
 
+import type { ResolutionDiagnostic } from "./readiness-diagnostics";
 import type { Epic, Job, SubagentInvocation, Task } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -121,7 +122,23 @@ import type { Epic, Job, SubagentInvocation, Task } from "./types";
  *                                        `git_orphan_count` (zero-attribution from any session)
  *                                        is informational only at v31 and does not feed this kind.
  * - `dep-on-task`                      — an upstream task is not completed (carries the upstream id).
- * - `dep-on-epic`                      — an upstream epic's close is not completed.
+ * - `dep-on-epic`                      — an upstream epic's close is not completed. Carries the
+ *                                        resolved full epic id as `upstream`. When the upstream's
+ *                                        `project_dir` basename differs from the consumer's, the
+ *                                        optional `cross_project` field carries the upstream's
+ *                                        project basename so the renderer can prefix the pill
+ *                                        `dep-on-epic <project>::<id>`; `null` for intra-project
+ *                                        deps. The `upstream` field stays a literal id so
+ *                                        consumers can use it for lookup without re-parsing.
+ * - `dep-on-epic-dangling`             — a `depends_on_epics` entry could not be resolved against
+ *                                        the input snapshot. Three sources: a full-id miss
+ *                                        (`fn-100-foo` not in `epicById`), a bare-id miss
+ *                                        (`fn-100` matched no epic in `epicsByNumber`), or a
+ *                                        bare-id ambiguity (2+ matches, no same-project match
+ *                                        disambiguates) — the ambiguity case ALSO emits a
+ *                                        {@link ResolutionDiagnostic} so the human sees which
+ *                                        candidates collided. Red pill (autopilot's structural
+ *                                        problem signal), distinct from the amber `dep-on-epic`.
  * - `single-task-per-epic`             — lost the per-epic mutex (a sibling row in the same epic is non-completed).
  * - `single-task-per-root`             — lost the per-root mutex (a row in another epic in the same project root is non-completed).
  * - `unknown`                          — defensive default for verdict/renderer mismatch.
@@ -133,7 +150,8 @@ export type BlockReason =
   | { kind: "git-uncommitted" }
   | { kind: "git-orphans" }
   | { kind: "dep-on-task"; upstream: string }
-  | { kind: "dep-on-epic"; upstream: string }
+  | { kind: "dep-on-epic"; upstream: string; cross_project: string | null }
+  | { kind: "dep-on-epic-dangling"; upstream: string }
   | { kind: "single-task-per-epic" }
   | { kind: "single-task-per-root" }
   | { kind: "unknown" };
@@ -161,11 +179,21 @@ export type Verdict =
  * and per-epic-header (also keyed by epic_id). Renderer-side lookups that
  * miss should render `[blocked:unknown]` — visible (bug indicator) and inert
  * (autopilot won't dispatch on `unknown`).
+ *
+ * `diagnostics` carries structured side-band output from the resolver — today
+ * just `ambiguous-dep-resolution` rows for bare `fn-N` epic deps that matched
+ * 2+ epics with no same-project disambiguator. Side-effecting consumers
+ * (`scripts/board.ts`, `scripts/autopilot.ts`) drain this array per snapshot
+ * and append each entry to `~/.local/state/keeper/readiness-diagnostics.jsonl`
+ * via {@link appendDiagnostic}. Pure-function consumers (tests, the autopilot
+ * simulator) read it for assertions or ignore it. `computeReadiness` itself
+ * never performs I/O.
  */
 export interface ReadinessSnapshot {
   perTask: Map<string, Verdict>;
   perCloseRow: Map<string, Verdict>;
   perEpic: Map<string, Verdict>;
+  diagnostics: ResolutionDiagnostic[];
 }
 
 // ---------------------------------------------------------------------------
@@ -237,10 +265,29 @@ export function computeReadiness(
 
   // Build a tasks-by-id index spanning every epic, so cross-epic
   // `depends_on` lookups (rare but possible per spec) hit O(1).
+  //
+  // Parallel `epicById` + `epicsByNumber` indexes feed predicate 9's
+  // cwd-then-global resolver (see {@link resolveEpicDep}). `epicById`
+  // resolves full ids (`fn-100-foo`); `epicsByNumber` resolves bare
+  // `fn-N` ids that may match multiple epics across configured project
+  // roots — the resolver's same-project preference picks the consumer's
+  // root when multiple candidates exist, falls through to a dangling
+  // verdict + diagnostic when no candidate disambiguates.
   const taskById = new Map<string, Task>();
+  const epicById = new Map<string, Epic>();
+  const epicsByNumber = new Map<number, Epic[]>();
   const epicsArr: Epic[] = [];
   for (const epic of epics) {
     epicsArr.push(epic);
+    epicById.set(epic.epic_id, epic);
+    if (typeof epic.epic_number === "number") {
+      const arr = epicsByNumber.get(epic.epic_number);
+      if (arr === undefined) {
+        epicsByNumber.set(epic.epic_number, [epic]);
+      } else {
+        arr.push(epic);
+      }
+    }
     for (const task of epic.tasks) {
       taskById.set(task.task_id, task);
     }
@@ -249,6 +296,7 @@ export function computeReadiness(
   const perTask = new Map<string, Verdict>();
   const perCloseRow = new Map<string, Verdict>();
   const perEpic = new Map<string, Verdict>();
+  const diagnostics: ResolutionDiagnostic[] = [];
 
   for (const epic of epicsArr) {
     // Per-task pass — depends_on is intra-epic, and the pre-sorted tasks
@@ -265,6 +313,9 @@ export function computeReadiness(
         perTask,
         perCloseRow,
         gitStatusByProjectDir,
+        epicById,
+        epicsByNumber,
+        diagnostics,
       );
       perTask.set(task.task_id, verdict);
     }
@@ -291,7 +342,7 @@ export function computeReadiness(
     perEpic.set(epic.epic_id, rollupEpicHeader(epic, perTask, perCloseRow));
   }
 
-  return { perTask, perCloseRow, perEpic };
+  return { perTask, perCloseRow, perEpic, diagnostics };
 }
 
 // ---------------------------------------------------------------------------
@@ -309,14 +360,16 @@ function evaluateTask(
   _jobs: Map<string, Job>,
   subRunningByJobId: Map<string, SubagentInvocation[]>,
   perTask: Map<string, Verdict>,
-  // perCloseRow is unused for the task path but kept in the signature for
-  // symmetry with `evaluateCloseRow`'s shape — both predicates take the
-  // same "already-computed verdicts" handles.
-  _perCloseRow: Map<string, Verdict>,
+  // perCloseRow IS used by predicate 9's tolerant forward-ref evaluator —
+  // see the predicate's body for the rationale.
+  perCloseRow: Map<string, Verdict>,
   gitStatusByProjectDir: Map<
     string,
     { dirty_count: number; unattributed_to_live_count: number }
   >,
+  epicById: Map<string, Epic>,
+  epicsByNumber: Map<number, Epic[]>,
+  diagnostics: ResolutionDiagnostic[],
 ): Verdict {
   // 1. terminal-completed. Schema v19: read the derived worker-phase binary
   // under its new key — the legacy `status` was renamed to `worker_phase`
@@ -435,21 +488,68 @@ function evaluateTask(
     }
   }
 
-  // 9. dep-on-epic — task-side rollup of the parent epic's dep list. An
-  // absent-from-input upstream counts as SATISFIED (mirrors board.ts:296-297
-  // convention: done+approved off the board). We re-evaluate against
-  // perCloseRow inside applySingleRootMutex? No — close-row verdicts are
-  // already computed for prior epics in iteration order, and a forward
-  // dep (epic depends on a later epic) is rare; treat absent as satisfied.
+  // 9. dep-on-epic — task-side rollup of the parent epic's dep list.
+  // fn-635: cwd-then-global resolver via {@link resolveEpicDep}. Each
+  // `depends_on_epics` entry is classified as a full id (`fn-100-foo`)
+  // or a bare id (`fn-100`); full ids look up `epicById`, bare ids look
+  // up `epicsByNumber` and prefer the consumer's own `project_dir` on
+  // multi-match. Three resolver outcomes:
+  //
+  //   - `dangling` — the upstream id has no entry in `epicById` AND no
+  //     bare match in `epicsByNumber` (full-id miss or bare-id miss),
+  //     OR 2+ matches with no same-project disambiguator. Emit
+  //     `dep-on-epic-dangling` (red pill). The ambiguity case also
+  //     pushes a `ResolutionDiagnostic` onto the snapshot's diagnostics
+  //     array; the dangling-via-miss cases do NOT — they're the normal
+  //     "upstream genuinely unknown" signal and a JSONL log line per
+  //     frame per dangling dep would flood the channel.
+  //   - `found` — the resolver returned the upstream epic + a
+  //     cross-project flag (basenames of consumer + upstream
+  //     `project_dir` differ). Evaluate the upstream's close verdict:
+  //       - `perCloseRow` has the verdict AND it's `completed` →
+  //         satisfied, skip.
+  //       - `perCloseRow` has the verdict AND it's non-completed →
+  //         `dep-on-epic` (amber), carrying the resolved full id and
+  //         the cross-project provenance for the renderer.
+  //       - `perCloseRow` is missing (forward-ref in iteration order,
+  //         rare) → tolerant: treat as satisfied. The upstream IS in
+  //         `epicById` so it's not dangling; the close-row verdict will
+  //         catch up on a subsequent snapshot fold.
+  //
+  // The discriminated `cross_project` payload field is null for
+  // intra-project deps; the literal upstream id stays on `upstream` so
+  // downstream consumers (autopilot, board) can re-look-up without
+  // re-parsing the prefix.
   for (const upstreamEpic of epic.depends_on_epics) {
-    const upstreamClose = _perCloseRow.get(upstreamEpic);
+    const resolved = resolveEpicDep(
+      upstreamEpic,
+      epic,
+      epicById,
+      epicsByNumber,
+      diagnostics,
+    );
+    if (resolved.kind === "dangling") {
+      return {
+        tag: "blocked",
+        reason: { kind: "dep-on-epic-dangling", upstream: upstreamEpic },
+      };
+    }
+    const upstreamClose = perCloseRow.get(resolved.epic.epic_id);
     if (upstreamClose === undefined) {
-      continue; // satisfied — off the board
+      // Tolerant forward-ref: upstream IS known (resolved), just hasn't
+      // had its close-row verdict computed yet in this iteration. Treat
+      // as satisfied; preserves the legacy "rare in-snapshot forward
+      // case still flows" handwave.
+      continue;
     }
     if (upstreamClose.tag !== "completed") {
       return {
         tag: "blocked",
-        reason: { kind: "dep-on-epic", upstream: upstreamEpic },
+        reason: {
+          kind: "dep-on-epic",
+          upstream: resolved.epic.epic_id,
+          cross_project: resolved.cross_project,
+        },
       };
     }
   }
@@ -809,6 +909,148 @@ function stringOrNull(v: unknown): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Predicate 9 helper: cwd-then-global epic-dep resolver
+// ---------------------------------------------------------------------------
+
+/**
+ * Bare `fn-N` id pattern — `fn-` followed by digits, with no trailing
+ * `-slug`. Matches `fn-100`; does NOT match `fn-100-foo`. Anchored on
+ * both ends so a malformed entry doesn't slip through.
+ */
+const BARE_FN_PATTERN = /^fn-(\d+)$/;
+
+/**
+ * Project-basename comparator for the resolver. Empty strings on either
+ * side fall through to `false` — a missing `project_dir` cannot match
+ * for cross-project disambiguation, so empties never "tie".
+ *
+ * Mirrors the board renderer's `basename(project_dir)` rendering shape —
+ * an `arthack`-prefixed pill matches an `arthack/...` project dir but
+ * not `arthack-fork/...`. Path-only basename comparison via Node's
+ * `basename` would require importing node:path here; we lift the
+ * tail-segment ourselves to keep `readiness.ts` import-graph-clean.
+ */
+function projectBasename(dir: string | null): string {
+  if (dir == null || dir === "") {
+    return "";
+  }
+  // Strip trailing slashes, take the segment after the last `/`.
+  // Equivalent to `node:path` basename for POSIX paths; this module
+  // never sees Windows paths (planctl is POSIX-only by design).
+  const trimmed = dir.replace(/\/+$/, "");
+  const idx = trimmed.lastIndexOf("/");
+  return idx === -1 ? trimmed : trimmed.slice(idx + 1);
+}
+
+/** Resolver outcome — discriminated union so callers can branch on `kind`. */
+export type EpicDepResolution =
+  | {
+      kind: "found";
+      epic: Epic;
+      /**
+       * Upstream's project basename when it differs from the consumer's —
+       * for the renderer's `[arthack::#N]` cross-project prefix. `null`
+       * when the basenames match (intra-project).
+       */
+      cross_project: string | null;
+    }
+  | { kind: "dangling" };
+
+/**
+ * Resolve one `depends_on_epics` entry against the in-snapshot index, mirroring
+ * planctl's fn-600 cwd-then-global semantics. Two id shapes are accepted:
+ *
+ *   - Full id (`fn-100-foo`) — direct `epicById` lookup. Miss → dangling.
+ *   - Bare id (`fn-100`) — `epicsByNumber` lookup. Zero matches → dangling;
+ *     exactly one match → use it; 2+ matches → prefer the consumer epic's
+ *     `project_dir` basename. If exactly one candidate shares it, use that
+ *     candidate. Otherwise emit a `ResolutionDiagnostic` and yield dangling
+ *     so the human sees the ambiguity rather than autopilot silently picking
+ *     a wrong upstream.
+ *
+ * Anything not matching either shape (typo, malformed id) → dangling without
+ * a diagnostic; the dangling pill itself is the signal.
+ *
+ * Exported so `scripts/board.ts` summary pill can share the same resolution
+ * path as predicate 9 — they MUST agree, otherwise the summary pill and the
+ * row pill could disagree on whether an upstream is dangling.
+ */
+export function resolveEpicDep(
+  rawDep: string,
+  consumer: Epic,
+  epicById: Map<string, Epic>,
+  epicsByNumber: Map<number, Epic[]>,
+  diagnostics: ResolutionDiagnostic[],
+): EpicDepResolution {
+  const consumerBase = projectBasename(consumer.project_dir);
+
+  // Bare-id form takes priority over the full-id branch so a string like
+  // `fn-100` (no slug) doesn't accidentally hit the full-id lookup with a
+  // partial match. The BARE_FN_PATTERN excludes the dotted task form.
+  const bareMatch = BARE_FN_PATTERN.exec(rawDep);
+  if (bareMatch !== null) {
+    const num = Number.parseInt(bareMatch[1] ?? "", 10);
+    if (Number.isNaN(num)) {
+      return { kind: "dangling" };
+    }
+    const candidates = epicsByNumber.get(num) ?? [];
+    if (candidates.length === 0) {
+      return { kind: "dangling" };
+    }
+    if (candidates.length === 1) {
+      const upstream = candidates[0];
+      if (upstream === undefined) {
+        return { kind: "dangling" };
+      }
+      const upstreamBase = projectBasename(upstream.project_dir);
+      const crossProject =
+        consumerBase !== "" &&
+        upstreamBase !== "" &&
+        consumerBase !== upstreamBase
+          ? upstreamBase
+          : null;
+      return { kind: "found", epic: upstream, cross_project: crossProject };
+    }
+    // 2+ candidates. Prefer the consumer's own project_dir basename.
+    const sameProject = candidates.filter(
+      (e) =>
+        projectBasename(e.project_dir) === consumerBase && consumerBase !== "",
+    );
+    if (sameProject.length === 1) {
+      const upstream = sameProject[0];
+      if (upstream === undefined) {
+        return { kind: "dangling" };
+      }
+      // Same-project hit can't be cross-project by definition.
+      return { kind: "found", epic: upstream, cross_project: null };
+    }
+    // Ambiguous: 2+ candidates AND no unique same-project disambiguator.
+    // Emit a diagnostic with every match's full id (sorted for re-fold
+    // determinism) and fall through to dangling.
+    diagnostics.push({
+      ts: new Date().toISOString(),
+      kind: "ambiguous-dep-resolution",
+      consumer_epic: consumer.epic_id,
+      upstream: rawDep,
+      matches: candidates.map((e) => e.epic_id).sort(),
+    });
+    return { kind: "dangling" };
+  }
+
+  // Full-id form. Direct lookup. Miss → dangling.
+  const upstream = epicById.get(rawDep);
+  if (upstream === undefined) {
+    return { kind: "dangling" };
+  }
+  const upstreamBase = projectBasename(upstream.project_dir);
+  const crossProject =
+    consumerBase !== "" && upstreamBase !== "" && consumerBase !== upstreamBase
+      ? upstreamBase
+      : null;
+  return { kind: "found", epic: upstream, cross_project: crossProject };
+}
+
+// ---------------------------------------------------------------------------
 // Epic header rollup
 // ---------------------------------------------------------------------------
 
@@ -952,7 +1194,12 @@ export function formatPill(verdict: Verdict): string {
   return `[blocked:${formatReasonShort(verdict.reason)}]`;
 }
 
-/** The short form rendered inside the bracket pill. */
+/**
+ * The short form rendered inside the bracket pill. The `default` arm
+ * narrows `reason` to `never` via the assertNever pattern — a future
+ * `BlockReason` variant addition that forgets to add a case here is a
+ * compile-time error, not a silent `unknown` fallback.
+ */
 function formatReasonShort(reason: BlockReason): string {
   switch (reason.kind) {
     case "job-rejected":
@@ -968,12 +1215,30 @@ function formatReasonShort(reason: BlockReason): string {
     case "dep-on-task":
       return `dep-on-task ${reason.upstream}`;
     case "dep-on-epic":
-      return `dep-on-epic ${reason.upstream}`;
+      // Cross-project provenance lives at the render layer — the
+      // `cross_project` payload field carries the upstream's project
+      // basename when it differs from the consumer's; renderer prefixes
+      // the id with `<project>::`. Intra-project deps (`cross_project ==
+      // null`) keep the bare-id render.
+      return reason.cross_project === null
+        ? `dep-on-epic ${reason.upstream}`
+        : `dep-on-epic ${reason.cross_project}::${reason.upstream}`;
+    case "dep-on-epic-dangling":
+      return `dep-on-epic-dangling ${reason.upstream}`;
     case "single-task-per-epic":
       return "single-task-per-epic";
     case "single-task-per-root":
       return "single-task-per-root";
     case "unknown":
       return "unknown";
+    default: {
+      // Exhaustiveness guard. If a new BlockReason variant lands without
+      // a case above, TypeScript will surface `reason` as the new variant
+      // here (not narrowed to `never`), failing the type-check at build
+      // time. Keeps a future fn-N addition from silently rendering
+      // `unknown`.
+      const _exhaustive: never = reason;
+      return _exhaustive;
+    }
   }
 }

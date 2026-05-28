@@ -763,7 +763,11 @@ test("predicate 9 (dep-on-epic) wins over 12 (single-task-per-root)", () => {
   // Upstream task is ready; dependent task should be dep-on-epic blocked.
   expect(snap.perTask.get("fn-0-bar.1")).toEqual({ tag: "ready" });
   expect(snap.perTask.get(dependent.task_id)).toEqual(
-    blocked({ kind: "dep-on-epic", upstream: "fn-0-bar" }),
+    blocked({
+      kind: "dep-on-epic",
+      upstream: "fn-0-bar",
+      cross_project: null,
+    }),
   );
 });
 
@@ -1103,12 +1107,197 @@ test("missing-input: a task with depends_on referencing a non-existent task → 
   );
 });
 
-test("dep-on-epic absent-from-collection counts as SATISFIED", () => {
-  // Upstream epic not in the input — treat as off-the-board (done+approved).
+test("dep-on-epic tolerant forward-ref: upstream IS in epicById but its close verdict isn't in perCloseRow yet → satisfied", () => {
+  // fn-635 split A. The consumer epic depends_on a sibling epic that
+  // appears LATER in iteration order, so its close-row verdict isn't in
+  // `perCloseRow` when predicate 9 evaluates this task. The upstream IS
+  // resolvable via the epicById index built up-front, so it's not
+  // dangling — the rare forward-ref case stays tolerantly satisfied
+  // (consumer flips when the next snapshot lands).
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2-bar"], // forward-ref to the LATER epic
+  });
+  const upstream = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    tasks: [],
+  });
+  const snap = run([consumer, upstream]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+});
+
+test("dep-on-epic full-id miss → dep-on-epic-dangling (truly unknown upstream)", () => {
+  // fn-635 split B. The upstream id is well-formed but has no entry in
+  // the input snapshot — neither `epicById` (full-id miss) nor
+  // `epicsByNumber` (bare-id miss). Pre-fn-635 this silently passed; the
+  // new contract is a structural-problem signal (red pill).
   const t = makeTask({ task_id: "fn-1-foo.1" });
   const epic = makeEpic({ tasks: [t], depends_on_epics: ["fn-99-ghost"] });
   const snap = run([epic]);
-  expect(snap.perTask.get(t.task_id)).toEqual({ tag: "ready" });
+  expect(snap.perTask.get(t.task_id)).toEqual(
+    blocked({ kind: "dep-on-epic-dangling", upstream: "fn-99-ghost" }),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// fn-635 predicate-9 resolver matrix — intra-project, cross-project,
+// bare-id forms, ambiguity, full-id misses.
+// ---------------------------------------------------------------------------
+
+test("resolver: intra-project bare-id resolves to same-project epic, satisfied", () => {
+  // Upstream done+approved in the same project_dir, bare-id form. The
+  // resolver lifts the bare id, finds exactly one match, marks it
+  // intra-project (no cross-project prefix).
+  const upstream = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/repo",
+    status: "done",
+    approval: "approved",
+    tasks: [],
+  });
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2"], // bare form
+  });
+  const snap = run([upstream, consumer]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+});
+
+test("resolver: cross-project full-id resolves, NOT completed → dep-on-epic with cross_project prefix", () => {
+  // Cross-project upstream — different project_dir basenames. Resolver
+  // marks the resolution cross-project; renderer prefixes the pill
+  // `dep-on-epic arthack::fn-2-bar`. The upstream is open + pending.
+  const upstream = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/Users/mike/code/arthack",
+    status: "open",
+    approval: "pending",
+    tasks: [],
+  });
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/Users/mike/code/keeper",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2-bar"], // full form
+  });
+  const snap = run([upstream, consumer]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({
+      kind: "dep-on-epic",
+      upstream: "fn-2-bar",
+      cross_project: "arthack",
+    }),
+  );
+});
+
+test("resolver: cross-project bare-id (cwd-then-global) resolves when only one match exists", () => {
+  // Bare `fn-2` matches exactly one epic in the input, which happens to
+  // live in another project. The single-match branch picks it; cross-
+  // project flag is set because basenames differ.
+  const upstream = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/Users/mike/code/arthack",
+    status: "done",
+    approval: "approved",
+    tasks: [],
+  });
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/Users/mike/code/keeper",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2"], // bare form
+  });
+  const snap = run([upstream, consumer]);
+  // Upstream completed → consumer satisfied.
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+});
+
+test("resolver: bare-id miss → dep-on-epic-dangling", () => {
+  // `fn-99` matches no epic in the input. Dangling without diagnostic
+  // (the dangling pill is the signal).
+  const t = makeTask({ task_id: "fn-1-foo.1" });
+  const epic = makeEpic({ tasks: [t], depends_on_epics: ["fn-99"] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t.task_id)).toEqual(
+    blocked({ kind: "dep-on-epic-dangling", upstream: "fn-99" }),
+  );
+});
+
+test("resolver: 2+ matches with NO same-project disambiguator → dangling + diagnostic", () => {
+  // Two epics with `epic_number === 2` both live in projects OTHER than
+  // the consumer's `/Users/mike/code/keeper`. The resolver yields
+  // dangling AND pushes an `ambiguous-dep-resolution` row onto the
+  // snapshot's diagnostics array. `matches` is sorted for re-fold
+  // determinism.
+  const a = makeEpic({
+    epic_id: "fn-2-aaa",
+    epic_number: 2,
+    project_dir: "/Users/mike/code/arthack",
+    tasks: [],
+  });
+  const b = makeEpic({
+    epic_id: "fn-2-zzz",
+    epic_number: 2,
+    project_dir: "/Users/mike/code/otherproj",
+    tasks: [],
+  });
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/Users/mike/code/keeper",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2"], // ambiguous bare form
+  });
+  const snap = run([a, b, consumer]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dep-on-epic-dangling", upstream: "fn-2" }),
+  );
+  expect(snap.diagnostics).toHaveLength(1);
+  expect(snap.diagnostics[0]?.kind).toBe("ambiguous-dep-resolution");
+  expect(snap.diagnostics[0]?.consumer_epic).toBe("fn-1-foo");
+  expect(snap.diagnostics[0]?.upstream).toBe("fn-2");
+  expect(snap.diagnostics[0]?.matches).toEqual(["fn-2-aaa", "fn-2-zzz"]);
+});
+
+test("resolver: 2+ matches WITH unique same-project disambiguator → cwd-first wins, satisfied (no diagnostic)", () => {
+  // Two epics with `epic_number === 2`; one shares the consumer's
+  // `project_dir` basename. The resolver picks the same-project
+  // candidate, no diagnostic emitted.
+  const sameProj = makeEpic({
+    epic_id: "fn-2-here",
+    epic_number: 2,
+    project_dir: "/Users/mike/code/keeper",
+    status: "done",
+    approval: "approved",
+    tasks: [],
+  });
+  const otherProj = makeEpic({
+    epic_id: "fn-2-there",
+    epic_number: 2,
+    project_dir: "/Users/mike/code/arthack",
+    tasks: [],
+  });
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/Users/mike/code/keeper",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2"],
+  });
+  const snap = run([sameProj, otherProj, consumer]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.diagnostics).toEqual([]);
 });
 
 test("formatPill defaults to [blocked:unknown] for the unknown reason", () => {
@@ -1484,8 +1673,28 @@ test("formatPill renders the three tags + every reason kind", () => {
     formatPill(blocked({ kind: "dep-on-task", upstream: "fn-1-foo.2" })),
   ).toBe("[blocked:dep-on-task fn-1-foo.2]");
   expect(
-    formatPill(blocked({ kind: "dep-on-epic", upstream: "fn-0-bar" })),
+    formatPill(
+      blocked({
+        kind: "dep-on-epic",
+        upstream: "fn-0-bar",
+        cross_project: null,
+      }),
+    ),
   ).toBe("[blocked:dep-on-epic fn-0-bar]");
+  expect(
+    formatPill(
+      blocked({
+        kind: "dep-on-epic",
+        upstream: "fn-0-bar",
+        cross_project: "arthack",
+      }),
+    ),
+  ).toBe("[blocked:dep-on-epic arthack::fn-0-bar]");
+  expect(
+    formatPill(
+      blocked({ kind: "dep-on-epic-dangling", upstream: "fn-99-ghost" }),
+    ),
+  ).toBe("[blocked:dep-on-epic-dangling fn-99-ghost]");
   expect(formatPill(blocked({ kind: "single-task-per-epic" }))).toBe(
     "[blocked:single-task-per-epic]",
   );

@@ -28,8 +28,12 @@
  */
 
 import { expect, test } from "bun:test";
-import { colorizePillsInLine, renderJobLinkLines } from "../scripts/board";
-import { computeReadiness } from "../src/readiness";
+import {
+  colorizePillsInLine,
+  epicNumFromIdOrBare,
+  renderJobLinkLines,
+} from "../scripts/board";
+import { computeReadiness, formatPill } from "../src/readiness";
 import { collapseSubagentsByName, projectRows } from "../src/readiness-client";
 import type {
   EmbeddedJob,
@@ -825,6 +829,119 @@ test("colorizePillsInLine: dependency pills like [#2] are not pill tokens, pass 
 
 test("colorizePillsInLine: empty string yields empty string", () => {
   expect(colorizePillsInLine("")).toBe("");
+});
+
+// ---------------------------------------------------------------------------
+// fn-635: epicNumFromIdOrBare — handles BOTH full `name-N-slug` form and the
+// bare `fn-N` form planctl emits for cross-project epic deps.
+// ---------------------------------------------------------------------------
+
+test("epicNumFromIdOrBare: full-id form (`name-N-slug`) returns N", () => {
+  expect(epicNumFromIdOrBare("fn-100-foo")).toBe(100);
+  expect(epicNumFromIdOrBare("arthack-633-git-attribution")).toBe(633);
+});
+
+test("epicNumFromIdOrBare: bare `fn-N` form returns N (no trailing slug)", () => {
+  expect(epicNumFromIdOrBare("fn-100")).toBe(100);
+  expect(epicNumFromIdOrBare("fn-7")).toBe(7);
+});
+
+test("epicNumFromIdOrBare: malformed ids return null", () => {
+  expect(epicNumFromIdOrBare("notvalid")).toBeNull();
+  expect(epicNumFromIdOrBare("fn-")).toBeNull();
+  expect(epicNumFromIdOrBare("fn-abc")).toBeNull();
+  expect(epicNumFromIdOrBare("123-foo")).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// fn-635: colorizePillsInLine — `blocked:dep-on-epic-dangling <id>` lands in
+// the error bucket (red), distinct from the amber `blocked:*` family. The
+// prefix-branch ordering check is load-bearing: without `dep-on-epic-dangling`
+// coming BEFORE the generic `blocked:` fallback in `colorizePillsInLine`, the
+// dangling pill would render amber and the structural-problem signal would
+// be lost.
+// ---------------------------------------------------------------------------
+
+test("colorizePillsInLine: blocked:dep-on-epic-dangling lands in error (red) bucket via per-payload branch", () => {
+  expect(
+    colorizePillsInLine("[blocked:dep-on-epic-dangling fn-99-ghost]"),
+  ).toBe(`[${ERROR}blocked:dep-on-epic-dangling fn-99-ghost${RESET}]`);
+});
+
+test("colorizePillsInLine: bare [dep-on-epic-dangling] (exact-match) lands in error bucket too", () => {
+  // The exact-match entry in PILL_COLORS handles a future direct-pill
+  // render path; the prefix branch above handles the wrapped
+  // `blocked:dep-on-epic-dangling <id>` payload.
+  expect(colorizePillsInLine("[dep-on-epic-dangling]")).toBe(
+    `[${ERROR}dep-on-epic-dangling${RESET}]`,
+  );
+});
+
+test("colorizePillsInLine: ordering — dep-on-epic-dangling wins over the generic blocked:* fallback", () => {
+  // Negative control. If a future drive-by reorder moves the
+  // `blocked:dep-on-epic-dangling` branch BELOW the generic `blocked:`
+  // branch in `colorizePillsInLine`, the dangling payload would fall
+  // through to the warn bucket. This test fails until the ordering is
+  // restored.
+  const out = colorizePillsInLine("[blocked:dep-on-epic-dangling fn-100]");
+  expect(out).toContain(ERROR);
+  expect(out).not.toContain(WARN);
+});
+
+test("colorizePillsInLine: regular blocked:dep-on-epic (amber/warn) stays warn", () => {
+  // Mirror control for the non-dangling dep-on-epic payload — it must
+  // continue to color amber via the generic `blocked:*` fallback.
+  expect(colorizePillsInLine("[blocked:dep-on-epic fn-100-foo]")).toBe(
+    `[${WARN}blocked:dep-on-epic fn-100-foo${RESET}]`,
+  );
+  expect(colorizePillsInLine("[blocked:dep-on-epic arthack::fn-100]")).toBe(
+    `[${WARN}blocked:dep-on-epic arthack::fn-100${RESET}]`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// fn-635: formatPill renders cross-project + dangling variants
+// ---------------------------------------------------------------------------
+
+test("formatPill: dep-on-epic intra-project renders bare id (no provenance prefix)", () => {
+  expect(
+    formatPill({
+      tag: "blocked",
+      reason: {
+        kind: "dep-on-epic",
+        upstream: "fn-100-foo",
+        cross_project: null,
+      },
+    }),
+  ).toBe("[blocked:dep-on-epic fn-100-foo]");
+});
+
+test("formatPill: dep-on-epic cross-project renders <project>::<id> prefix", () => {
+  expect(
+    formatPill({
+      tag: "blocked",
+      reason: {
+        kind: "dep-on-epic",
+        upstream: "fn-100-foo",
+        cross_project: "arthack",
+      },
+    }),
+  ).toBe("[blocked:dep-on-epic arthack::fn-100-foo]");
+});
+
+test("formatPill: dep-on-epic-dangling renders the upstream id verbatim", () => {
+  expect(
+    formatPill({
+      tag: "blocked",
+      reason: { kind: "dep-on-epic-dangling", upstream: "fn-99-ghost" },
+    }),
+  ).toBe("[blocked:dep-on-epic-dangling fn-99-ghost]");
+  expect(
+    formatPill({
+      tag: "blocked",
+      reason: { kind: "dep-on-epic-dangling", upstream: "fn-7" },
+    }),
+  ).toBe("[blocked:dep-on-epic-dangling fn-7]");
 });
 
 test("byId-style collapse (legacy bug) would only deliver one row", () => {

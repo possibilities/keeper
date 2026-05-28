@@ -390,17 +390,55 @@ CI) `--live` silently behaves as if it wasn't set. Run any of them with
   from the three-collection snapshot (see `src/readiness.ts`); a
   blocked row is followed by a `   (reason: <reason>)` continuation
   line so the human reads the cause without scanning the upstream rows.
-  Job/link rows also carry two optional stoppage-annotation pills that
-  stack after `[state]` in lifecycle order: `[failed:<kind>]` (red /
+  The `BlockReason` vocabulary splits epic-dep failures into two cousins:
+  `dep-on-epic <id>` (amber / warn — the upstream IS in the snapshot
+  but its close verdict isn't `completed`) and `dep-on-epic-dangling
+  <id>` (red / error — the upstream id failed to resolve at all,
+  meaning either a full-id miss, a bare `fn-N` miss, or an ambiguous
+  bare-id with no same-project disambiguator). The dangling case
+  surfaces planctl's fn-600 cross-project bare-id dep contract: a
+  stored `fn-100` on `epic.depends_on_epics` resolves cwd-then-global
+  against the in-snapshot epics index built inside `computeReadiness`,
+  and an unresolvable id is a structural problem (typo, deleted
+  upstream, missed project root) — distinct from "upstream is still
+  cooking". When the resolver lands a cross-project match the renderer
+  prefixes the pill `dep-on-epic <project>::<id>` (e.g.
+  `[blocked:dep-on-epic arthack::fn-633-git-attribution]`) so the
+  cross-project provenance reads at a glance; intra-project deps keep
+  the bare-id render. The board's epic-header summary pill uses the
+  same shared `resolveEpicDep` so the summary and the row pill agree:
+  `[#N]` intra-project, `[arthack::#N]` cross-project,
+  `[?#N]` dangling. Ambiguous-bare-id resolutions (2+ matches with no
+  same-project disambiguator) emit one
+  `{ts, kind:"ambiguous-dep-resolution", consumer_epic, upstream,
+  matches: string[]}` line per occurrence to
+  `~/.local/state/keeper/readiness-diagnostics.jsonl` so the human
+  sees which candidates collided; the line is appended atomically
+  (POSIX O_APPEND under PIPE_BUF) so board.ts and autopilot.ts can
+  write concurrently without flock. Job/link rows also carry two
+  optional stoppage-annotation pills that stack after `[state]` in
+  lifecycle order: `[failed:<kind>]` (red /
   error bucket) when the session's last Claude-API request hit a
   terminal HTTP failure — the six rendered kinds are `rate_limit |
   authentication_failed | billing_error | server_error |
   invalid_request | unknown` — and `[awaiting:<kind>]` (yellow / warn
   bucket) when the session is stopped on a built-in interactive tool
   that fires no hook of its own (currently `[awaiting:ask_user_question]`,
-  future-extensible). Both pills color through prefix fallbacks
-  (`failed:*` → `error`, `awaiting:*` → `warn`), so future kinds need
-  no code change.
+  future-extensible). The colorizer (`PILL_COLORS` in
+  `scripts/board.ts`) routes tokens through five buckets — `active`
+  (cyan) for in-motion, `success` (green) for terminal-positive,
+  `error` (red) for structural failure (including
+  `dep-on-epic-dangling` via both an exact-match entry and a
+  `blocked:dep-on-epic-dangling` prefix branch that wins over the
+  generic `blocked:*` → `warn` fallback), `warn` (yellow) for
+  blocked/waiting, `faded` (dim) for historical — and prefix fallbacks
+  (`failed:*` → `error`, `awaiting:*` → `warn`,
+  `blocked:*` → `warn`, `running:*` → `active`, `task-repo:*` →
+  `warn`) so future kinds need no code change. Pills NOT in
+  `PILL_COLORS` render uncolored on purpose — the eye picks
+  `pending` / `todo` / `unvalidated` / `unknown` / `open` and the role
+  labels (`planner|worker|closer|creator|refiner`) out by absence of
+  color.
   The byte-compare emit gate keeps the stream quiet when row churn
   doesn't surface in the render. Reconnects across keeperd restarts;
   Ctrl-C unsubscribes cleanly. Every emitted frame is mirrored to three
