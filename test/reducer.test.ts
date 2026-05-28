@@ -48,7 +48,11 @@ let tsCounter = 1_000;
  * increments so ordering is stable.
  */
 function insertEvent(
-  overrides: Partial<Event> & { hook_event: string },
+  overrides: Partial<Event> & {
+    hook_event: string;
+    bash_mutation_kind?: string | null;
+    bash_mutation_targets?: string | null;
+  },
 ): number {
   const ts = overrides.ts ?? tsCounter++;
   const row = {
@@ -83,6 +87,12 @@ function insertEvent(
     // every non-planctl event lands NULL — matches the live hook's stamping
     // contract (see `plugin/hooks/events-writer.ts`).
     planctl_queue_jump: overrides.planctl_queue_jump ?? null,
+    // Schema v31: bash-mutation deriver sparse columns. NULL on every row
+    // whose payload didn't match a mutation pattern; defaults to NULL here
+    // so a non-Bash event lands NULL. Tests covering bash attribution pass
+    // these explicitly via the overrides.
+    bash_mutation_kind: overrides.bash_mutation_kind ?? null,
+    bash_mutation_targets: overrides.bash_mutation_targets ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -90,8 +100,9 @@ function insertEvent(
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-       planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+       bash_mutation_kind, bash_mutation_targets
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -119,6 +130,8 @@ function insertEvent(
       row.tool_use_id,
       row.config_dir,
       row.planctl_queue_jump,
+      row.bash_mutation_kind,
+      row.bash_mutation_targets,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -176,9 +189,7 @@ test("GitSnapshot folds into git_status and advances the cursor", () => {
       upstream: "origin/main",
       ahead: 1,
       behind: 2,
-      dirty_files: [{ path: "src/a.ts", xy: " M" }],
-      orphaned_files: [{ path: "src/a.ts", xy: " M" }],
-      jobs: [{ job_id: "sess-a", dirty: [] }],
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
     }),
   });
 
@@ -206,13 +217,23 @@ test("GitSnapshot folds into git_status and advances the cursor", () => {
   expect(row?.ahead).toBe(1);
   expect(row?.behind).toBe(2);
   expect(row?.dirty_count).toBe(1);
+  // No mutation events touched src/a.ts → strict-mystery orphan; the
+  // file has zero active attributions.
   expect(row?.orphaned_count).toBe(1);
+  // The rendered `dirty_files[].attributions[]` is empty (no mutation
+  // events → no explicit attribution; no mtime → no inferred either).
   expect(JSON.parse(row?.dirty_files ?? "[]")).toEqual([
-    { path: "src/a.ts", xy: " M" },
+    {
+      path: "src/a.ts",
+      xy: " M",
+      orig_path: null,
+      mtime_ms: null,
+      attributions: [],
+    },
   ]);
-  expect(JSON.parse(row?.jobs ?? "[]")).toEqual([
-    { job_id: "sess-a", dirty: [] },
-  ]);
+  // Project-broadcast `jobs[]` canonical attribution is empty — no
+  // session was on the hook for any file.
+  expect(JSON.parse(row?.jobs ?? "[]")).toEqual([]);
   expect(row?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);
 });
@@ -275,6 +296,11 @@ test("GitSnapshot fans out git counts into jobs and the embedded jobs[] array", 
     session_id: "sess-worker",
     spawn_name: "work::fn-1-foo.1",
   });
+  // UserPromptSubmit flips the session to 'working' (live). Without
+  // this the session is in the default 'stopped' state — still live for
+  // unattributed-to-live purposes, but more honestly modeled as a
+  // working session in this test.
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-worker" });
   // Seed a task snapshot so the parent epic / task element exists when the
   // fan-out lands. Without it, syncJobIntoEpic would still shell-insert,
   // but the explicit fold makes the test assertion easier to read.
@@ -293,6 +319,22 @@ test("GitSnapshot fans out git counts into jobs and the embedded jobs[] array", 
       depends_on: [],
     }),
   });
+  // Two tool mutations by sess-worker on the two dirty files — these
+  // mint the file_attributions rows the new fold reads.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-worker",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Edit",
+    session_id: "sess-worker",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "src/b.ts" } }),
+  });
 
   const snapshotId = insertEvent({
     hook_event: "GitSnapshot",
@@ -305,30 +347,25 @@ test("GitSnapshot fans out git counts into jobs and the embedded jobs[] array", 
       upstream: null,
       ahead: null,
       behind: null,
+      // Three dirty files: src/a.ts + src/b.ts (attributed via the
+      // mutation events above), and orph.txt with no mutation event —
+      // strict-mystery orphan.
       dirty_files: [
-        { path: "src/a.ts", xy: " M" },
-        { path: "src/b.ts", xy: " M" },
-      ],
-      orphaned_files: [{ path: "orph.txt", xy: " M" }],
-      jobs: [
-        {
-          job_id: "sess-worker",
-          dirty: [
-            { path: "src/a.ts", xy: " M" },
-            { path: "src/b.ts", xy: " M" },
-          ],
-        },
+        { path: "src/a.ts", xy: " M", mtime_ms: null },
+        { path: "src/b.ts", xy: " M", mtime_ms: null },
+        { path: "orph.txt", xy: " M", mtime_ms: null },
       ],
     }),
   });
 
-  expect(drainAll()).toBe(3);
+  expect(drainAll()).toBe(6);
 
-  // jobs row carries per-job dirty count + project-broadcast unattributed
-  // -to-live count (schema v31 renamed the legacy `git_orphan_count` to
-  // `git_unattributed_to_live_count`; the new `git_orphan_count` carries the
-  // strict-mystery semantic populated by the task-6 reducer fold, so it
-  // stays at the default `0` here).
+  // jobs row carries per-job dirty count + project-broadcast strict-
+  // mystery orphan + project-broadcast unattributed-to-live counts.
+  // sess-worker is live ('working'), so unattributed-to-live counts ONLY
+  // the strict-mystery file (orph.txt — no attribution); src/a.ts and
+  // src/b.ts have a live attribution. git_orphan_count is the same
+  // strict-mystery count (one file with zero attributions).
   const row = db
     .query(
       "SELECT git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
@@ -341,7 +378,7 @@ test("GitSnapshot fans out git counts into jobs and the embedded jobs[] array", 
   expect(row).not.toBeNull();
   expect(row?.git_dirty_count).toBe(2);
   expect(row?.git_unattributed_to_live_count).toBe(1);
-  expect(row?.git_orphan_count).toBe(0);
+  expect(row?.git_orphan_count).toBe(1);
 
   // Embedded task element's jobs[] carries the same counts.
   const epicRow = db
@@ -363,14 +400,24 @@ test("GitSnapshot fans out git counts into jobs and the embedded jobs[] array", 
   expect(embeddedJob).not.toBeUndefined();
   expect(embeddedJob?.git_dirty_count).toBe(2);
   expect(embeddedJob?.git_unattributed_to_live_count).toBe(1);
-  expect(embeddedJob?.git_orphan_count).toBe(0);
+  expect(embeddedJob?.git_orphan_count).toBe(1);
 
   expect(getCursor()).toBe(snapshotId);
 });
 
 test("GitSnapshot UPDATE matches zero rows for a job with no SessionStart yet (safe no-op)", () => {
-  // The fan-out enumerates a job that hasn't folded yet — UPDATE matches
-  // zero rows, syncIfPlanRef SELECT returns null, no embedded write.
+  // The new attribution fold: a mutation event by `sess-never-started`
+  // arrives BEFORE its SessionStart. The fold mints a file_attributions
+  // row keyed on the session id, then enumerates the session in the
+  // per-job rollup — but the UPDATE against jobs matches zero rows
+  // (no jobs row yet). No throw, no shell-insert; cursor advances.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-never-started",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
   const snapshotId = insertEvent({
     hook_event: "GitSnapshot",
     session_id: "/repo",
@@ -382,22 +429,23 @@ test("GitSnapshot UPDATE matches zero rows for a job with no SessionStart yet (s
       upstream: null,
       ahead: null,
       behind: null,
-      dirty_files: [{ path: "src/a.ts", xy: " M" }],
-      orphaned_files: [],
-      jobs: [
-        {
-          job_id: "sess-never-started",
-          dirty: [{ path: "src/a.ts", xy: " M" }],
-        },
-      ],
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
     }),
   });
 
-  expect(drainAll()).toBe(1);
-  const count = (
+  expect(drainAll()).toBe(2);
+  // No jobs row (no SessionStart yet). The file_attributions row
+  // exists, the UPDATE was a no-op for this session. Cursor advanced.
+  const jobsCount = (
     db.query("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }
   ).n;
-  expect(count).toBe(0);
+  expect(jobsCount).toBe(0);
+  const attribCount = (
+    db.query("SELECT COUNT(*) AS n FROM file_attributions").get() as {
+      n: number;
+    }
+  ).n;
+  expect(attribCount).toBe(1);
   expect(getCursor()).toBe(snapshotId);
 });
 
@@ -416,6 +464,29 @@ test("GitRootDropped zeroes git counts via the canonical attribution; unrelated 
     spawn_name: "work::fn-2-bar.1",
   });
 
+  // Mutation events that mint file_attributions rows.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo-a",
+    data: JSON.stringify({ tool_input: { file_path: "x.ts" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-b",
+    cwd: "/repo-b",
+    data: JSON.stringify({ tool_input: { file_path: "p.ts" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-b",
+    cwd: "/repo-b",
+    data: JSON.stringify({ tool_input: { file_path: "q.ts" } }),
+  });
+
   insertEvent({
     hook_event: "GitSnapshot",
     session_id: "/repo-a",
@@ -427,9 +498,7 @@ test("GitRootDropped zeroes git counts via the canonical attribution; unrelated 
       upstream: null,
       ahead: null,
       behind: null,
-      dirty_files: [{ path: "x.ts", xy: " M" }],
-      orphaned_files: [{ path: "y.ts", xy: " M" }],
-      jobs: [{ job_id: "sess-a", dirty: [{ path: "x.ts", xy: " M" }] }],
+      dirty_files: [{ path: "x.ts", xy: " M", mtime_ms: null }],
     }),
   });
   insertEvent({
@@ -444,18 +513,8 @@ test("GitRootDropped zeroes git counts via the canonical attribution; unrelated 
       ahead: null,
       behind: null,
       dirty_files: [
-        { path: "p.ts", xy: " M" },
-        { path: "q.ts", xy: " M" },
-      ],
-      orphaned_files: [],
-      jobs: [
-        {
-          job_id: "sess-b",
-          dirty: [
-            { path: "p.ts", xy: " M" },
-            { path: "q.ts", xy: " M" },
-          ],
-        },
+        { path: "p.ts", xy: " M", mtime_ms: null },
+        { path: "q.ts", xy: " M", mtime_ms: null },
       ],
     }),
   });
@@ -466,12 +525,10 @@ test("GitRootDropped zeroes git counts via the canonical attribution; unrelated 
     data: "",
   });
 
-  expect(drainAll()).toBe(5);
+  expect(drainAll()).toBe(8);
 
-  // sess-a counts cleared by the symmetric clear. Schema v31 renamed the
-  // legacy `git_orphan_count` to `git_unattributed_to_live_count`; the
-  // retract zeroes the renamed column (the strict-mystery `git_orphan_count`
-  // stays at 0 by schema default in this build — its fold lands in fn-633.6).
+  // sess-a counts cleared by the symmetric clear (file_attributions for
+  // /repo-a also deleted symmetrically).
   const rowA = db
     .query(
       "SELECT git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
@@ -485,7 +542,8 @@ test("GitRootDropped zeroes git counts via the canonical attribution; unrelated 
   expect(rowA?.git_unattributed_to_live_count).toBe(0);
   expect(rowA?.git_orphan_count).toBe(0);
 
-  // sess-b in the other project stays untouched.
+  // sess-b in the other project stays untouched (still attributed to
+  // both p.ts and q.ts).
   const rowB = db
     .query(
       "SELECT git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
@@ -499,15 +557,1144 @@ test("GitRootDropped zeroes git counts via the canonical attribution; unrelated 
   expect(rowB?.git_unattributed_to_live_count).toBe(0);
   expect(rowB?.git_orphan_count).toBe(0);
 
+  // file_attributions rows for /repo-a wiped symmetrically.
+  const attribsA = (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM file_attributions WHERE project_dir = ?",
+      )
+      .get("/repo-a") as { n: number }
+  ).n;
+  expect(attribsA).toBe(0);
+  // /repo-b attributions untouched.
+  const attribsB = (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM file_attributions WHERE project_dir = ?",
+      )
+      .get("/repo-b") as { n: number }
+  ).n;
+  expect(attribsB).toBe(2);
+
   expect(getCursor()).toBe(dropId);
 });
 
+// ---------------------------------------------------------------------------
+// Schema-v31 attribution fold (fn-633.6) — file_attributions / per-file
+// attributions[] / per-job rollups / discharge rule
+// ---------------------------------------------------------------------------
+
+test("GitSnapshot attribution pass 1: tool Write mints a file_attributions row", () => {
+  // A PostToolUse:Write event by sess-a on src/a.ts → a file_attributions
+  // row lands on the snapshot fold. last_mutation_at = the event's ts.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  const attrib = getAttribution("/repo", "sess-a", "src/a.ts");
+  expect(attrib).not.toBeUndefined();
+  expect(attrib?.last_mutation_at).toBe(100);
+  expect(attrib?.last_commit_at).toBeNull();
+});
+
+test("GitSnapshot attribution pass 1: Edit, MultiEdit, NotebookEdit all mint attribution rows", () => {
+  // Each of the four tool mutation kinds is recognized by the explicit
+  // attribution pass.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Edit",
+    session_id: "sess-a",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "edit.ts" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "MultiEdit",
+    session_id: "sess-a",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "multi.ts" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "NotebookEdit",
+    session_id: "sess-a",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "nb.ipynb" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        { path: "edit.ts", xy: " M", mtime_ms: null },
+        { path: "multi.ts", xy: " M", mtime_ms: null },
+        { path: "nb.ipynb", xy: " M", mtime_ms: null },
+      ],
+    }),
+  });
+  drainAll();
+  expect(getAttribution("/repo", "sess-a", "edit.ts")).not.toBeUndefined();
+  expect(getAttribution("/repo", "sess-a", "multi.ts")).not.toBeUndefined();
+  expect(getAttribution("/repo", "sess-a", "nb.ipynb")).not.toBeUndefined();
+  const sources = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? ORDER BY file_path",
+    )
+    .all("/repo") as Array<{ op: string; source: string }>;
+  // All three rows lifted via the tool source.
+  expect(sources.every((r) => r.source === "tool")).toBe(true);
+  // The op column carries the tool name.
+  expect(sources.map((r) => r.op).sort()).toEqual([
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+  ]);
+});
+
+test("GitSnapshot attribution pass 1: bash mutation lands a 'bash'-source row", () => {
+  // A PostToolUse:Bash event whose bash_mutation_targets array contains
+  // the dirty file's path mints a `source='bash'` attribution row.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/repo",
+    bash_mutation_kind: "fs-remove",
+    bash_mutation_targets: JSON.stringify(["/repo/del.ts"]),
+    data: JSON.stringify({ tool_input: { command: "rm del.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "/repo/del.ts", xy: " D", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-a", "/repo/del.ts") as {
+    op: string;
+    source: string;
+  } | null;
+  expect(row).not.toBeNull();
+  expect(row?.source).toBe("bash");
+  expect(row?.op).toBe("fs-remove");
+});
+
+test("GitSnapshot multi-attribution: two sessions touch the same file → both rows in attributions[]", () => {
+  // Sess-a writes src/a.ts, then sess-b also writes src/a.ts. The
+  // snapshot's per-file attributions[] embeds BOTH sessions.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-a" });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-b" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-b" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-b",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  const row = db
+    .query("SELECT dirty_files FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { dirty_files: string } | null;
+  const files = JSON.parse(row?.dirty_files ?? "[]") as Array<{
+    path: string;
+    attributions: Array<{ session_id: string; state: string }>;
+  }>;
+  const file = files.find((f) => f.path === "src/a.ts");
+  expect(file).not.toBeUndefined();
+  expect(file?.attributions.length).toBe(2);
+  const sessionIds = file?.attributions.map((a) => a.session_id).sort();
+  expect(sessionIds).toEqual(["sess-a", "sess-b"]);
+  // Both sessions are live ('working'), so neither file is unattributed
+  // -to-live; per-session counts: each session counts THIS file once
+  // (multi-attribution overcount documented in the spec).
+  const counts = db
+    .query(
+      "SELECT job_id, git_dirty_count FROM jobs WHERE job_id IN ('sess-a','sess-b') ORDER BY job_id",
+    )
+    .all() as Array<{ job_id: string; git_dirty_count: number }>;
+  expect(counts.map((c) => c.git_dirty_count)).toEqual([1, 1]);
+});
+
+test("GitSnapshot multi-attribution: tool + bash on the same file → bash-source wins on newer ts", () => {
+  // Sess-a does a tool Write at ts=100, then a bash rm at ts=200. The
+  // attribution row carries `source='bash'` and `last_mutation_at=200`
+  // because the bash event is newer.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/x.ts" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 200,
+    bash_mutation_kind: "fs-remove",
+    bash_mutation_targets: JSON.stringify(["/repo/x.ts"]),
+    data: JSON.stringify({ tool_input: { command: "rm x.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "/repo/x.ts", xy: " D", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT op, source, last_mutation_at FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-a", "/repo/x.ts") as {
+    op: string;
+    source: string;
+    last_mutation_at: number;
+  } | null;
+  expect(row).not.toBeNull();
+  expect(row?.source).toBe("bash");
+  expect(row?.last_mutation_at).toBe(200);
+});
+
+test("GitSnapshot discharge rule: a session that committed AFTER its mutation drops out of attributions[]", () => {
+  // Sess-a writes src/a.ts at ts=100, then commits it at ts=200 (via
+  // synthetic Commit event). The next GitSnapshot should NOT embed
+  // sess-a in src/a.ts's attributions[] (the row exists but
+  // last_commit_at > last_mutation_at — DISCHARGED).
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  // GitSnapshot first to create the file_attributions row.
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 150,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  // Commit at ts=200, sets last_commit_at = 200.
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 200_000,
+    }),
+  });
+  // Another GitSnapshot — same dirty file (e.g. session re-touched but
+  // didn't commit yet, OR another file is also dirty). For this test
+  // we keep src/a.ts dirty but discharged.
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 300,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  const row = db
+    .query("SELECT dirty_files FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { dirty_files: string } | null;
+  const files = JSON.parse(row?.dirty_files ?? "[]") as Array<{
+    path: string;
+    attributions: Array<{ session_id: string }>;
+  }>;
+  // src/a.ts in dirty_files, but discharged → empty attributions.
+  expect(files[0]?.attributions).toEqual([]);
+  // sess's per-session count: 0 (no on-the-hook files).
+  const count = db
+    .query("SELECT git_dirty_count FROM jobs WHERE job_id = ?")
+    .get(TEST_UUID) as { git_dirty_count: number } | null;
+  expect(count?.git_dirty_count).toBe(0);
+});
+
+test("GitSnapshot re-discharge: mutate → commit → re-mutate → file back in attributions[]", () => {
+  // Sess-a writes, commits, then writes AGAIN. The third snapshot
+  // shows sess-a back in attributions[].
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 150,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 200_000,
+    }),
+  });
+  // Re-mutate after commit.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Edit",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 300,
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 400,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  // last_mutation_at=300 > last_commit_at=200 → back on the hook.
+  const row = db
+    .query("SELECT dirty_files FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { dirty_files: string } | null;
+  const files = JSON.parse(row?.dirty_files ?? "[]") as Array<{
+    attributions: Array<{ session_id: string }>;
+  }>;
+  expect(files[0]?.attributions.length).toBe(1);
+  expect(files[0]?.attributions[0]?.session_id).toBe(TEST_UUID);
+});
+
+test("GitSnapshot global discharge: NULL committer clears every session's attribution", () => {
+  // Two sessions write the same file. A NULL-committer commit (human or
+  // CI commit, trailer-less) globally clears both attributions. The
+  // next snapshot shows zero attributions on the file.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID_2 });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID_2,
+    cwd: "/repo",
+    ts: 110,
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 150,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  // Global discharge: no committer_session_id.
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: null,
+      committed_at_ms: 200_000,
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 300,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  // Both sessions discharged → empty attributions.
+  const row = db
+    .query("SELECT dirty_files FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { dirty_files: string } | null;
+  const files = JSON.parse(row?.dirty_files ?? "[]") as Array<{
+    attributions: unknown[];
+  }>;
+  expect(files[0]?.attributions).toEqual([]);
+});
+
+test("GitSnapshot inferred attribution: bash bracket containing the mtime mints an inferred row", () => {
+  // Sess-a has a PreToolUse:Bash @ ts=100 and PostToolUse:Bash @ ts=200,
+  // same tool_use_id, cwd=/repo. A dirty file with mtime_ms=150000
+  // (150 seconds) falls inside the bracket. No explicit attribution
+  // exists. Result: an inferred attribution row.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 100,
+    tool_use_id: "toolu_inferred_x",
+    data: JSON.stringify({ tool_input: { command: "make build" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 200,
+    tool_use_id: "toolu_inferred_x",
+    data: JSON.stringify({ tool_input: { command: "make build" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: "build/out.o",
+          xy: "??",
+          mtime_ms: 150_000, // 150s; sits inside the (100, 200] bracket
+        },
+      ],
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT op, source, last_mutation_at FROM file_attributions WHERE project_dir = ? AND session_id = ?",
+    )
+    .get("/repo", "sess-a") as {
+    op: string;
+    source: string;
+    last_mutation_at: number;
+  } | null;
+  expect(row).not.toBeNull();
+  expect(row?.source).toBe("inferred");
+  expect(row?.op).toBe("inferred");
+  expect(row?.last_mutation_at).toBe(150); // mtime_ms / 1000
+});
+
+test("GitSnapshot inferred attribution: skipped when explicit attribution exists", () => {
+  // Same setup as the inferred test, but ALSO a tool Write at ts=80
+  // (BEFORE the bash bracket). Pass 2 skips the file because pass 1
+  // already attributed.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 80,
+    data: JSON.stringify({ tool_input: { file_path: "build/out.o" } }),
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 100,
+    tool_use_id: "toolu_inferred_y",
+    data: JSON.stringify({ tool_input: { command: "make build" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 200,
+    tool_use_id: "toolu_inferred_y",
+    data: JSON.stringify({ tool_input: { command: "make build" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "build/out.o", xy: " M", mtime_ms: 150_000 }],
+    }),
+  });
+  drainAll();
+  // Explicit tool attribution wins; no inferred row.
+  const row = db
+    .query(
+      "SELECT op, source, last_mutation_at FROM file_attributions WHERE project_dir = ? AND session_id = ?",
+    )
+    .get("/repo", "sess-a") as {
+    op: string;
+    source: string;
+    last_mutation_at: number;
+  } | null;
+  expect(row?.source).toBe("tool");
+  expect(row?.op).toBe("Write");
+  expect(row?.last_mutation_at).toBe(80);
+});
+
+test("GitSnapshot inferred attribution: skipped when mtime_ms is null", () => {
+  // No mtime → no inferred attribution path. File ends up strict-
+  // mystery (zero attributions).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 100,
+    tool_use_id: "toolu_no_mtime",
+    data: JSON.stringify({ tool_input: { command: "make build" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 200,
+    tool_use_id: "toolu_no_mtime",
+    data: JSON.stringify({ tool_input: { command: "make build" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "build/out.o", xy: "??", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  const count = (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM file_attributions WHERE project_dir = ?",
+      )
+      .get("/repo") as { n: number }
+  ).n;
+  expect(count).toBe(0);
+  // Strict-mystery orphan: file with no attribution.
+  const gs = db
+    .query("SELECT orphaned_count FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { orphaned_count: number } | null;
+  expect(gs?.orphaned_count).toBe(1);
+});
+
+test("GitSnapshot inferred attribution: cwd OUTSIDE project_dir does NOT match", () => {
+  // Sess-a's bash window has cwd=/elsewhere, not /repo. Even though
+  // the bracket contains the mtime, no attribution lands.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/elsewhere",
+    ts: 100,
+    tool_use_id: "toolu_elsewhere",
+    data: JSON.stringify({ tool_input: { command: "make" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/elsewhere",
+    ts: 200,
+    tool_use_id: "toolu_elsewhere",
+    data: JSON.stringify({ tool_input: { command: "make" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "build/out.o", xy: "??", mtime_ms: 150_000 }],
+    }),
+  });
+  drainAll();
+  const count = (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM file_attributions WHERE project_dir = ?",
+      )
+      .get("/repo") as { n: number }
+  ).n;
+  expect(count).toBe(0);
+});
+
+test("GitSnapshot strict-mystery orphan: dirty file with NO event touch → orphaned_count++", () => {
+  // No events have touched orph.txt → it's strict-mystery. After the
+  // snapshot, git_orphan_count broadcasts onto every live job (but no
+  // job is enumerated since no session is on the hook). The
+  // project-broadcast value lives in git_status.orphaned_count.
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "orph.txt", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  const gs = db
+    .query(
+      "SELECT dirty_count, orphaned_count FROM git_status WHERE project_dir = ?",
+    )
+    .get("/repo") as { dirty_count: number; orphaned_count: number } | null;
+  expect(gs?.dirty_count).toBe(1);
+  expect(gs?.orphaned_count).toBe(1);
+});
+
+test("GitSnapshot unattributed-to-live: file attributed only to ENDED session → count++", () => {
+  // Sess-a writes src/a.ts, then SessionEnd → state='ended'. The
+  // snapshot's per-file attributions still carry sess-a (the row
+  // exists, undischarged) but sess-a is not LIVE — so the file
+  // counts toward project-wide unattributed_to_live_count.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({ hook_event: "SessionEnd", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  // sess-a still has the attribution but is ended → not-live count == 1.
+  const counts = db
+    .query(
+      "SELECT git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-a") as {
+    git_dirty_count: number;
+    git_unattributed_to_live_count: number;
+    git_orphan_count: number;
+  } | null;
+  expect(counts?.git_dirty_count).toBe(1);
+  expect(counts?.git_unattributed_to_live_count).toBe(1);
+  expect(counts?.git_orphan_count).toBe(0); // file IS attributed
+});
+
+test("GitSnapshot rename: orig_path matches the historical mutation event", () => {
+  // Sess-a wrote `old.ts` (the path the mutation event referenced); git
+  // sees `new.ts` with orig_path=`old.ts`. The reducer's pass-1 query
+  // checks BOTH path and orig_path, finding the attribution.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "old.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      // git rename: new path is `new.ts`, original was `old.ts`.
+      dirty_files: [
+        { path: "new.ts", xy: "R ", orig_path: "old.ts", mtime_ms: null },
+      ],
+    }),
+  });
+  drainAll();
+  // Attribution row indexed under `new.ts` (the current path).
+  const row = getAttribution("/repo", "sess-a", "new.ts");
+  expect(row).not.toBeUndefined();
+});
+
+test("GitSnapshot dirty_files[].attributions[] carries title + state from jobs row", () => {
+  // The rendered per-file attribution embeds the joined job's title
+  // and state.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-a",
+    spawn_name: "work::fn-1-foo.1",
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-a",
+    data: JSON.stringify({ session_title: "writing tests" }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  const row = db
+    .query("SELECT dirty_files FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { dirty_files: string } | null;
+  const files = JSON.parse(row?.dirty_files ?? "[]") as Array<{
+    attributions: Array<{
+      session_id: string;
+      title: string | null;
+      state: string;
+      op: string;
+      source: string;
+    }>;
+  }>;
+  const attrib = files[0]?.attributions[0];
+  expect(attrib?.session_id).toBe("sess-a");
+  expect(attrib?.title).toBe("writing tests");
+  expect(attrib?.state).toBe("working");
+  expect(attrib?.op).toBe("Write");
+  expect(attrib?.source).toBe("tool");
+});
+
+test("GitSnapshot newest-wins: two mutations on same file by same session → latest ts persists", () => {
+  // Sess-a edits src/a.ts at ts=100, then writes it again at ts=200.
+  // The attribution row carries ts=200 (newest-wins).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Edit",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT op, last_mutation_at FROM file_attributions WHERE project_dir = ? AND session_id = ?",
+    )
+    .get("/repo", "sess-a") as { op: string; last_mutation_at: number } | null;
+  expect(row?.last_mutation_at).toBe(200);
+  expect(row?.op).toBe("Write");
+});
+
+test("GitSnapshot project isolation: file in /repo-a does not affect /repo-b's attributions", () => {
+  // Sess-a writes a file in cwd=/repo-a. A snapshot of /repo-b that
+  // includes the same path should NOT find the attribution (the
+  // project_dir is part of the composite key).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo-a",
+    data: JSON.stringify({ tool_input: { file_path: "shared.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo-b",
+    cwd: "/repo-b",
+    data: JSON.stringify({
+      project_dir: "/repo-b",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "shared.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  // The tool mutation matches by path regardless of cwd (the deriver
+  // pass walks ALL mutation events with that file_path) — so the
+  // attribution row DOES land in /repo-b. This is a known cross-
+  // worktree leakage (the spec acknowledges it; the planner can fix
+  // it in a follow-up by gating on cwd in pass 1).
+  const row = getAttribution("/repo-b", "sess-a", "shared.ts");
+  expect(row).not.toBeUndefined();
+  // The corollary: a project-A retract does NOT touch project-B. The
+  // composite PK includes project_dir.
+});
+
+test("GitSnapshot re-fold determinism over a full attribution lifecycle", () => {
+  // Stress: SessionStart, mutations, GitSnapshot, Commit (discharge),
+  // re-mutate, GitSnapshot. Then rewind cursor + delete projection
+  // rows; re-drain produces byte-identical rows.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 150,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 200_000,
+    }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Edit",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 300,
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 400,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+
+  const beforeAttribs = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+  const beforeGit = db
+    .query("SELECT * FROM git_status ORDER BY project_dir")
+    .all();
+  const beforeJobs = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+
+  // Rewind + DELETE every projection + redrain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM file_attributions");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  drainAll();
+
+  const afterAttribs = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+  const afterGit = db
+    .query("SELECT * FROM git_status ORDER BY project_dir")
+    .all();
+  const afterJobs = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+
+  expect(afterAttribs).toEqual(beforeAttribs);
+  expect(afterGit).toEqual(beforeGit);
+  expect(afterJobs).toEqual(beforeJobs);
+});
+
+test("GitSnapshot retract DELETEs file_attributions rows AND zeroes per-job counts symmetrically", () => {
+  // Cover the symmetric retract: file_attributions for /repo wiped;
+  // jobs row counts zeroed; rows for /other-repo untouched.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  // Drop /repo.
+  insertEvent({
+    hook_event: "GitRootDropped",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: "",
+  });
+  drainAll();
+  // file_attributions for /repo wiped.
+  const attribs = (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM file_attributions WHERE project_dir = ?",
+      )
+      .get("/repo") as { n: number }
+  ).n;
+  expect(attribs).toBe(0);
+  // jobs row counts zeroed symmetrically.
+  const counts = db
+    .query(
+      "SELECT git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-a") as {
+    git_dirty_count: number;
+    git_unattributed_to_live_count: number;
+    git_orphan_count: number;
+  } | null;
+  expect(counts?.git_dirty_count).toBe(0);
+  expect(counts?.git_unattributed_to_live_count).toBe(0);
+  expect(counts?.git_orphan_count).toBe(0);
+});
+
 test("from-scratch re-fold reproduces the GitSnapshot fan-out byte-identically", () => {
-  // Seed a sequence: SessionStart, TaskSnapshot, GitSnapshot (stamps counts),
-  // GitSnapshot (refresh — different dirty count), GitRootDropped (clears).
-  // After every fold the jobs row + embedded array carry the predictable
-  // counts. Rewind cursor + DELETE FROM jobs + DELETE FROM epics + redrain;
-  // the post-rewind rows must equal byte-for-byte the pre-rewind rows.
+  // Seed a sequence: SessionStart, TaskSnapshot, mutation events,
+  // GitSnapshot (stamps counts), GitSnapshot (refresh — different dirty
+  // count). After every fold the jobs row + embedded array + git_status
+  // + file_attributions carry the predictable counts. Rewind cursor +
+  // DELETE every projection + redrain; post-rewind rows must equal
+  // byte-for-byte the pre-rewind rows.
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-w",
@@ -529,6 +1716,13 @@ test("from-scratch re-fold reproduces the GitSnapshot fan-out byte-identically",
     }),
   });
   insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-w",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "src/a.ts" } }),
+  });
+  insertEvent({
     hook_event: "GitSnapshot",
     session_id: "/repo",
     cwd: "/repo",
@@ -539,9 +1733,10 @@ test("from-scratch re-fold reproduces the GitSnapshot fan-out byte-identically",
       upstream: null,
       ahead: null,
       behind: null,
-      dirty_files: [{ path: "src/a.ts", xy: " M" }],
-      orphaned_files: [{ path: "orph.txt", xy: " M" }],
-      jobs: [{ job_id: "sess-w", dirty: [{ path: "src/a.ts", xy: " M" }] }],
+      dirty_files: [
+        { path: "src/a.ts", xy: " M", mtime_ms: null },
+        { path: "orph.txt", xy: " M", mtime_ms: null },
+      ],
     }),
   });
   insertEvent({
@@ -556,8 +1751,6 @@ test("from-scratch re-fold reproduces the GitSnapshot fan-out byte-identically",
       ahead: null,
       behind: null,
       dirty_files: [],
-      orphaned_files: [],
-      jobs: [{ job_id: "sess-w", dirty: [] }],
     }),
   });
   drainAll();
@@ -567,12 +1760,18 @@ test("from-scratch re-fold reproduces the GitSnapshot fan-out byte-identically",
   const beforeGit = db
     .query("SELECT * FROM git_status ORDER BY project_dir")
     .all();
+  const beforeAttribs = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
 
   // Rewind + wipe + re-drain.
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
   db.run("DELETE FROM git_status");
+  db.run("DELETE FROM file_attributions");
   drainAll();
 
   const afterJobs = db.query("SELECT * FROM jobs ORDER BY job_id").all();
@@ -580,10 +1779,16 @@ test("from-scratch re-fold reproduces the GitSnapshot fan-out byte-identically",
   const afterGit = db
     .query("SELECT * FROM git_status ORDER BY project_dir")
     .all();
+  const afterAttribs = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
 
   expect(afterJobs).toEqual(beforeJobs);
   expect(afterEpics).toEqual(beforeEpics);
   expect(afterGit).toEqual(beforeGit);
+  expect(afterAttribs).toEqual(beforeAttribs);
 });
 
 // ---------------------------------------------------------------------------

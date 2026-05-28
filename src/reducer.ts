@@ -116,7 +116,6 @@ import {
   parsePlanRef,
   planVerbRefFromSpawnName,
 } from "./derivers";
-import type { GitSnapshotPayload } from "./git-worker";
 import {
   type ClassifierInvocation,
   computePlanWindows,
@@ -882,61 +881,53 @@ function retractPlanRow(db: Database, event: Event): void {
 }
 
 /**
- * Reducer-local widened `GitSnapshot` shape (transitional — fn-633.5 → .6).
- *
- * The producer payload ({@link GitSnapshotPayload}) narrowed in fn-633.5 to
- * the file-centric shape `{project_dir, branch, head_oid, upstream, ahead,
- * behind, dirty_files: GitDirtyFile[]}` — `orphaned_files` and `jobs[]`
- * dropped because their derivations move into the reducer's transactional
- * fold in fn-633.6. Until that task rewrites `projectGitStatus` to derive
- * `orphaned_files` / per-job rollup from `dirty_files` + `file_attributions`
- * + the event log, the reducer still WRITES those columns on the
- * `git_status` projection and fans the per-job counts into `jobs` — so it
- * needs to read both halves of the transitional shape:
- *
- * - Real producer events post-fn-633.5 carry only the narrow shape. The
- *   reducer reads `orphaned_files` / `jobs[]` as `[]` from this type's
- *   defaults, so `git_unattributed_to_live_count` stays at the steady-
- *   state zero between fn-633.5 and fn-633.6 (the same false-clean window
- *   documented on `projectGitStatus` for unenumerated jobs).
- * - Test fixtures (and any historical events stored before fn-633.5) still
- *   carry the wide shape. The defensive `Array.isArray` checks accept
- *   their `orphaned_files` / `jobs[]` and keep the legacy fan-out behavior
- *   verbatim, preserving re-fold determinism across the schema-v31 cut.
- *
- * fn-633.6 deletes this local type and replaces it with the narrow producer
- * payload — by then `orphaned_files` / `jobs[]` are computed inside the
- * fold, not lifted from the event blob.
+ * Reducer-local view of one entry in the producer's `dirty_files[]` array.
+ * Field-for-field a {@link import("./git-worker").GitDirtyFile} with every
+ * field defensively re-typed as the safe-fold fallback (the producer is a
+ * separate process, so the reducer cannot trust shape — every parse path
+ * has to fold to a safe value rather than throw inside the BEGIN IMMEDIATE
+ * transaction).
  */
-interface StoredGitSnapshot extends GitSnapshotPayload {
-  orphaned_files: unknown[];
-  jobs: { job_id?: unknown; dirty?: unknown }[];
+interface ReducerDirtyFile {
+  path: string;
+  xy: string;
+  orig_path: string | null;
+  mtime_ms: number | null;
 }
 
-function extractGitSnapshot(event: Event): StoredGitSnapshot | null {
+/**
+ * Reducer-local view of the v31 file-centric `GitSnapshot` payload. The
+ * producer narrowed to `{project_dir, branch, head_oid, upstream, ahead,
+ * behind, dirty_files[]}` in fn-633.5; this task (.6) derives every other
+ * facet — per-(session, file) attribution rows, per-job dirty rollup,
+ * project-broadcast orphan/unattributed counts, and the rendered
+ * `dirty_files[].attributions[]` JSON — inside `BEGIN IMMEDIATE` against
+ * the persisted event log + `file_attributions` table. No more
+ * `orphaned_files` or `jobs[]` lifted from the event blob (the
+ * transitional shape was removed at this task; historical events stored
+ * against the wide shape still parse — extra keys are ignored — but their
+ * `orphaned_files` / `jobs[]` are never read).
+ */
+interface ParsedGitSnapshot {
+  project_dir: string;
+  branch: string | null;
+  head_oid: string | null;
+  upstream: string | null;
+  ahead: number | null;
+  behind: number | null;
+  dirty_files: ReducerDirtyFile[];
+}
+
+function extractGitSnapshot(event: Event): ParsedGitSnapshot | null {
   if (event.data == null || event.data.length === 0) {
     return null;
   }
+  let parsed: Partial<ParsedGitSnapshot> & {
+    dirty_files?: unknown;
+  };
   try {
-    const parsed = JSON.parse(event.data) as Partial<StoredGitSnapshot>;
-    if (
-      typeof parsed.project_dir !== "string" ||
-      parsed.project_dir.length === 0
-    ) {
-      return null;
-    }
-    return {
-      project_dir: parsed.project_dir,
-      branch: typeof parsed.branch === "string" ? parsed.branch : null,
-      head_oid: typeof parsed.head_oid === "string" ? parsed.head_oid : null,
-      upstream: typeof parsed.upstream === "string" ? parsed.upstream : null,
-      ahead: typeof parsed.ahead === "number" ? parsed.ahead : null,
-      behind: typeof parsed.behind === "number" ? parsed.behind : null,
-      dirty_files: Array.isArray(parsed.dirty_files) ? parsed.dirty_files : [],
-      orphaned_files: Array.isArray(parsed.orphaned_files)
-        ? parsed.orphaned_files
-        : [],
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
+    parsed = JSON.parse(event.data) as Partial<ParsedGitSnapshot> & {
+      dirty_files?: unknown;
     };
   } catch (err) {
     console.error(
@@ -944,45 +935,653 @@ function extractGitSnapshot(event: Event): StoredGitSnapshot | null {
     );
     return null;
   }
+  if (
+    typeof parsed.project_dir !== "string" ||
+    parsed.project_dir.length === 0
+  ) {
+    return null;
+  }
+  // Per-file defensive parse: every field guarded against shape mismatch.
+  // A bad file folds to `null` (skipped); a bad mtime folds to `null` (the
+  // file simply gets no inferred-attribution chance in pass 2). Never
+  // throws — the fold tx is sacred.
+  const dirtyFiles: ReducerDirtyFile[] = [];
+  if (Array.isArray(parsed.dirty_files)) {
+    for (const rawFile of parsed.dirty_files as unknown[]) {
+      if (typeof rawFile !== "object" || rawFile === null) continue;
+      const f = rawFile as Record<string, unknown>;
+      if (typeof f.path !== "string" || f.path.length === 0) continue;
+      const xy = typeof f.xy === "string" ? f.xy : "";
+      const origPath =
+        typeof f.orig_path === "string" && f.orig_path.length > 0
+          ? f.orig_path
+          : null;
+      const mtimeMs =
+        typeof f.mtime_ms === "number" && Number.isFinite(f.mtime_ms)
+          ? f.mtime_ms
+          : null;
+      dirtyFiles.push({
+        path: f.path,
+        xy,
+        orig_path: origPath,
+        mtime_ms: mtimeMs,
+      });
+    }
+  }
+  return {
+    project_dir: parsed.project_dir,
+    branch: typeof parsed.branch === "string" ? parsed.branch : null,
+    head_oid: typeof parsed.head_oid === "string" ? parsed.head_oid : null,
+    upstream: typeof parsed.upstream === "string" ? parsed.upstream : null,
+    ahead: typeof parsed.ahead === "number" ? parsed.ahead : null,
+    behind: typeof parsed.behind === "number" ? parsed.behind : null,
+    dirty_files: dirtyFiles,
+  };
+}
+
+/**
+ * One row in the per-file attribution materialized view embedded into
+ * `git_status.dirty_files[].attributions[]`. The reducer composes this from
+ * the join `file_attributions LEFT JOIN jobs USING (session_id)` after
+ * the discharge filter (`last_mutation_at > COALESCE(last_commit_at, 0)`),
+ * so a session that has discharged its claim on a file is omitted from the
+ * file's attribution list — which IS the readiness signal a client renders.
+ *
+ * `title` / `state` are nullable because the `jobs` row may not yet exist
+ * for an attribution (a Write tool fold ran before SessionStart, possible
+ * during a re-fold-from-cursor=0 if event ordering differs from the boot-
+ * drain — defensive shape, defaults `state="stopped"` if the join misses).
+ */
+interface RenderedAttribution {
+  session_id: string;
+  title: string | null;
+  state: string;
+  last_touch_at: number;
+  op: string;
+  source: "tool" | "bash" | "inferred";
+}
+
+/**
+ * Project the latest `(session_id, file_path)` mutation evidence the
+ * persisted event log carries for a given dirty file. One pass over the
+ * union of:
+ *   - tool mutations: PostToolUse on `tool_name ∈ {Write, Edit, MultiEdit,
+ *     NotebookEdit}` whose `tool_input.file_path` matches the dirty file's
+ *     `path` or its `orig_path` (rename case);
+ *   - bash mutations: PostToolUse:Bash events whose `bash_mutation_targets`
+ *     JSON array contains the dirty file's `path` or `orig_path`.
+ *
+ * The function returns one row per session, carrying the LATEST `ts` it
+ * saw and the source/op identifying that row. The reducer's pass-1 upsert
+ * folds these into `file_attributions` using the "newest wins" rule (the
+ * UPSERT's WHERE clause gates the UPDATE on `excluded.last_mutation_at >
+ * file_attributions.last_mutation_at`).
+ *
+ * Pure SQL — no liveness probe, no FS read. Every fact lives in the
+ * `events` table so a from-scratch re-fold reproduces the same row set.
+ */
+interface SessionMutation {
+  session_id: string;
+  last_mutation_at: number;
+  last_event_id: number;
+  op: string;
+  source: "tool" | "bash";
+}
+
+function findExplicitAttributions(
+  db: Database,
+  file: ReducerDirtyFile,
+): SessionMutation[] {
+  // Build the candidate path list: `path` plus optional `orig_path` (for
+  // renames, the historical mutation events targeted the OLD name).
+  const paths: string[] = [file.path];
+  if (file.orig_path != null && file.orig_path !== file.path) {
+    paths.push(file.orig_path);
+  }
+
+  const perSession = new Map<string, SessionMutation>();
+
+  // Tool-mutation scan: PostToolUse rows on the four mutation tool names
+  // whose `data.tool_input.file_path` equals one of the candidate paths.
+  // `json_extract` walks the stored JSON in place — no full parse from
+  // SQL's perspective, and the `tool_name` filter narrows the index-seek
+  // before the JSON probe. The reducer's BEGIN IMMEDIATE bounds this scan
+  // to the writer lock window — kept narrow by the per-file iteration.
+  for (const candidatePath of paths) {
+    const toolRows = db
+      .prepare(
+        `SELECT id, ts, session_id, tool_name
+           FROM events
+          WHERE hook_event = 'PostToolUse'
+            AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
+            AND json_extract(data, '$.tool_input.file_path') = ?`,
+      )
+      .all(candidatePath) as Array<{
+      id: number;
+      ts: number;
+      session_id: string;
+      tool_name: string;
+    }>;
+    for (const row of toolRows) {
+      if (row.session_id == null || row.session_id.length === 0) continue;
+      const existing = perSession.get(row.session_id);
+      if (existing == null || row.ts > existing.last_mutation_at) {
+        perSession.set(row.session_id, {
+          session_id: row.session_id,
+          last_mutation_at: row.ts,
+          last_event_id: row.id,
+          op: row.tool_name,
+          source: "tool",
+        });
+      }
+    }
+  }
+
+  // Bash-mutation scan: PostToolUse:Bash events whose stored
+  // `bash_mutation_targets` JSON array contains the candidate path.
+  // The partial index `WHERE bash_mutation_kind IS NOT NULL` narrows the
+  // scan to the sparse mutation subset before the JSON probe. Use
+  // `json_each` to expand the array — SQLite's JSON1 module evaluates
+  // this lazily, so a non-matching row exits the join after one probe.
+  for (const candidatePath of paths) {
+    const bashRows = db
+      .prepare(
+        `SELECT e.id, e.ts, e.session_id, e.bash_mutation_kind AS kind
+           FROM events e
+          WHERE e.bash_mutation_kind IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM json_each(e.bash_mutation_targets) j
+               WHERE j.value = ?
+            )`,
+      )
+      .all(candidatePath) as Array<{
+      id: number;
+      ts: number;
+      session_id: string;
+      kind: string;
+    }>;
+    for (const row of bashRows) {
+      if (row.session_id == null || row.session_id.length === 0) continue;
+      const existing = perSession.get(row.session_id);
+      // Bash wins ties via "last write wins on the same ts" — keep
+      // deterministic ordering by also breaking ties on event id (a
+      // later row in the same ts has a higher id under the events
+      // INTEGER PRIMARY KEY AUTOINCREMENT).
+      if (
+        existing == null ||
+        row.ts > existing.last_mutation_at ||
+        (row.ts === existing.last_mutation_at &&
+          row.id > existing.last_event_id)
+      ) {
+        perSession.set(row.session_id, {
+          session_id: row.session_id,
+          last_mutation_at: row.ts,
+          last_event_id: row.id,
+          op: row.kind,
+          source: "bash",
+        });
+      }
+    }
+  }
+
+  return Array.from(perSession.values());
+}
+
+/**
+ * Project inferred attributions for a dirty file by time-bracketing its
+ * `mtime_ms` against `(PreToolUse:Bash, PostToolUse:Bash)` intervals in
+ * sessions whose `cwd` is inside `project_dir`. Used when pass 1 finds NO
+ * explicit attributions (tool or bash) for the file — a last-resort honest
+ * inference: "some bash invocation in this project's window may have
+ * touched this file".
+ *
+ * The window is `(pre.ts, post.ts]` — `pre` is the PreToolUse:Bash, `post`
+ * is the matched PostToolUse:Bash with the same `tool_use_id`. The match
+ * uses the `(session_id, tool_use_id)` pair (every Bash invocation gets a
+ * fresh `tool_use_id`, schema v17), so concurrent bash invocations don't
+ * cross-bracket.
+ *
+ * `cwd` containment: we accept a session whose `cwd` is either equal to
+ * `project_dir` or a subdirectory of it. `project_dir + '/'` prefix-match
+ * with a guard against `project_dir` being root (`/`) or having a trailing
+ * slash already. This is conservative: a session running in a sub-tree of
+ * the worktree's parent (e.g. a monorepo) won't be bracketed against the
+ * sub-tree's snapshot — that's the desired "stay honest" failure mode.
+ *
+ * Returns one entry per session whose bracket enclosed the mtime; if
+ * multiple brackets in the same session enclose, we keep the LATEST
+ * matching post.ts (the most recent plausible bash window). The pass-2
+ * upsert uses `last_mutation_at = file.mtime_ms / 1000` (NOT the
+ * bracket's post.ts) — re-fold determinism rides on the frozen-in-payload
+ * mtime, not the floating event timestamps.
+ */
+interface InferredAttribution {
+  session_id: string;
+  last_event_id: number;
+}
+
+function findInferredAttributions(
+  db: Database,
+  projectDir: string,
+  file: ReducerDirtyFile,
+): InferredAttribution[] {
+  if (file.mtime_ms == null) {
+    return [];
+  }
+  const mtimeSec = file.mtime_ms / 1000;
+  // SQL: find any PostToolUse:Bash whose paired PreToolUse:Bash (same
+  // session, same tool_use_id) brackets the mtime, AND whose session
+  // cwd is inside project_dir. The `cwd` containment is expressed as
+  // a literal-equality OR LIKE-prefix join — the LIKE form uses the
+  // project_dir + '/' prefix so a session running in a sibling
+  // directory doesn't match.
+  //
+  // The `(session_id, tool_use_id)` self-join is index-served by the
+  // partial index `idx_events_tool_use_id WHERE tool_use_id IS NOT
+  // NULL` (schema v17). The compound predicate keeps each pre/post
+  // row paired to its sibling.
+  //
+  // Take-latest per session: ORDER BY post.ts DESC LIMIT — but we
+  // want one row per session, so do the aggregation in JS after the
+  // SQL pulls candidates (the candidate set is bounded by the
+  // session count × concurrent-bracket count, both small in
+  // practice).
+  const projectDirPrefix = projectDir.endsWith("/")
+    ? projectDir
+    : `${projectDir}/`;
+  const rows = db
+    .prepare(
+      `SELECT post.session_id AS session_id, post.id AS last_event_id, post.ts AS post_ts
+         FROM events pre
+         JOIN events post
+           ON post.session_id = pre.session_id
+          AND post.tool_use_id = pre.tool_use_id
+          AND post.hook_event = 'PostToolUse'
+          AND post.tool_name = 'Bash'
+        WHERE pre.hook_event = 'PreToolUse'
+          AND pre.tool_name = 'Bash'
+          AND pre.tool_use_id IS NOT NULL
+          AND pre.ts < ?
+          AND post.ts >= ?
+          AND (post.cwd = ? OR post.cwd LIKE ?)`,
+    )
+    .all(mtimeSec, mtimeSec, projectDir, `${projectDirPrefix}%`) as Array<{
+    session_id: string;
+    last_event_id: number;
+    post_ts: number;
+  }>;
+  const perSession = new Map<string, InferredAttribution>();
+  for (const row of rows) {
+    if (row.session_id == null || row.session_id.length === 0) continue;
+    const existing = perSession.get(row.session_id);
+    if (existing == null || row.last_event_id > existing.last_event_id) {
+      perSession.set(row.session_id, {
+        session_id: row.session_id,
+        last_event_id: row.last_event_id,
+      });
+    }
+  }
+  return Array.from(perSession.values());
 }
 
 /**
  * Fold one synthetic git snapshot. The reducer never re-runs git; it only
- * persists the observed payload from the event log, keeping re-fold deterministic
- * even though the original producer observed mutable filesystem state.
+ * persists the observed payload from the event log, keeping re-fold
+ * deterministic even though the original producer observed mutable
+ * filesystem state.
  *
- * Schema-v28 fan-out: in addition to writing the `git_status` row, this arm
- * stamps `(git_dirty_count, git_unattributed_to_live_count)` onto every job
- * enumerated in `snapshot.jobs[]`. `git_dirty_count` is per-job (the
- * GitJobView's own `dirty.length`); `git_unattributed_to_live_count` is the
- * project-wide `snapshot.orphaned_files.length` broadcast onto every
- * enumerated job (per-project, not per-job). Each updated jobs row is then
- * re-fanned via `syncJobIntoEpic` so the embedded `jobs[]` arrays on the
- * parent epic / task element pick up the new counts. All of this runs inside
- * the same `BEGIN IMMEDIATE` transaction opened by `applyEvent` — exactly-
- * once-per-event holds across both projections (the `git_status` write + the
- * jobs/epics fan-out).
+ * Schema-v31 attribution rewrite (fn-633.6): five integrated passes inside
+ * the same `BEGIN IMMEDIATE` transaction opened by `applyEvent`:
  *
- * Schema-v31 note: the column written here was renamed from the legacy
- * `jobs.git_orphan_count` to `jobs.git_unattributed_to_live_count`; the
- * numeric value, the producer source, and the semantic are unchanged. The
- * NEW `jobs.git_orphan_count` (strict-mystery: files with no attribution
- * from any session) lands its fold in fn-633.6 and stays at the schema
- * default of `0` until that task ships.
+ *   1. Explicit attribution upsert. For each dirty file, scan the event
+ *      log for tool mutations (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`
+ *      against the file's `path` or `orig_path`) and bash mutations
+ *      (`bash_mutation_targets` array contains the path). Per session,
+ *      take the latest event ts and upsert into `file_attributions` with
+ *      `source ∈ {'tool', 'bash'}`. Newest-wins per session, deterministic
+ *      tie-break on event id.
+ *
+ *   2. Inferred attribution. For each dirty file with `mtime_ms != null`
+ *      AND NO explicit attribution from pass 1, find `(PreToolUse:Bash,
+ *      PostToolUse:Bash)` brackets in any session whose cwd is inside
+ *      `project_dir` and whose interval contains the file's mtime. Upsert
+ *      with `source='inferred'`, `op='inferred'`, `last_mutation_at =
+ *      mtime_ms / 1000`. Re-fold deterministic because mtimes are
+ *      frozen in the payload.
+ *
+ *   3. Render `attributions[]` per file. Join `file_attributions` LEFT
+ *      JOIN `jobs` under the discharge filter `last_mutation_at >
+ *      COALESCE(last_commit_at, 0)`, materialize `{session_id, title,
+ *      state, last_touch_at, op, source}` per active attribution into the
+ *      `git_status.dirty_files[].attributions[]` JSON.
+ *
+ *   4. Per-job rollups. For every session referenced by an active
+ *      attribution under this project_dir:
+ *      - `git_dirty_count` = count of files in this snapshot's dirty set
+ *        the session is still on the hook for;
+ *      - `git_unattributed_to_live_count` = project-wide count of dirty
+ *        files whose attribution set contains no LIVE session (state ∈
+ *        {'working', 'stopped'}); legacy "orphan" semantic, drives
+ *        readiness predicate 6.5;
+ *      - `git_orphan_count` = project-wide count of dirty files with
+ *        ZERO active attributions (strict-mystery semantic).
+ *      Fan into `epics.jobs[]` + `epics.tasks[].jobs[]` via the existing
+ *      `syncIfPlanRef` helper.
+ *
+ *   5. Symmetric retract (in `retractGitStatus`): on `GitRootDropped`,
+ *      DELETE `file_attributions` for `project_dir` and zero
+ *      `git_dirty_count` / `git_unattributed_to_live_count` /
+ *      `git_orphan_count` on every session that was on-the-hook.
+ *
+ * Multi-attribution overcount: a file attributed to sessions A and B
+ * counts toward BOTH A's and B's `git_dirty_count`. That's intentional —
+ * co-authorship is the honest semantic. Aggregate consumers (board.ts)
+ * must NOT sum these as if they were disjoint.
  *
  * The from-scratch re-fold sees every historical `GitSnapshot` event in
- * order and re-derives the same counts byte-identically; the `INSERT OR
- * IGNORE` -then-`UPDATE` pattern (UPDATE only — no shell-row creation) is
- * intentional: a snapshot enumerating a job whose `SessionStart` hasn't
- * folded yet leaves the row absent and the UPDATE matches zero rows. The
- * next snapshot after SessionStart lands the counts; the gap between is
- * the same false-clean window as the migration window.
+ * order and re-derives the same counts byte-identically; every fact lives
+ * in the persisted event log (the frozen-in-payload mtimes preserve
+ * inferred-attribution determinism). The `INSERT OR IGNORE`-then-`UPDATE`
+ * pattern for the per-job rollup is intentional: a snapshot referencing
+ * a job whose `SessionStart` hasn't folded yet leaves the row absent and
+ * the UPDATE matches zero rows. The next snapshot after SessionStart
+ * lands the counts.
  */
 function projectGitStatus(db: Database, event: Event): void {
   const snapshot = extractGitSnapshot(event);
   if (snapshot == null) {
     return;
   }
+  const eventTs = event.ts;
+  const eventId = event.id;
+  const projectDir = snapshot.project_dir;
+
+  // PASS 1 — Explicit attribution upsert. For each dirty file, scan the
+  // event log for tool/bash mutations whose payload references the file
+  // path (or its rename's orig_path). Per session, take the LATEST
+  // matching event (newest-wins via the UPSERT's WHERE clause).
+  const explicitBySession = new Map<string, Set<string>>(); // session_id → set of file_paths it explicitly touched
+  const upsertStmt = db.prepare(
+    `INSERT INTO file_attributions
+       (project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at)
+       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+       ON CONFLICT(project_dir, session_id, file_path) DO UPDATE SET
+         last_mutation_at = excluded.last_mutation_at,
+         op = excluded.op,
+         source = excluded.source,
+         last_event_id = excluded.last_event_id,
+         updated_at = excluded.updated_at
+       WHERE excluded.last_mutation_at > file_attributions.last_mutation_at`,
+  );
+  for (const file of snapshot.dirty_files) {
+    const explicit = findExplicitAttributions(db, file);
+    for (const m of explicit) {
+      upsertStmt.run(
+        projectDir,
+        m.session_id,
+        file.path,
+        m.last_mutation_at,
+        m.op,
+        m.source,
+        m.last_event_id,
+        eventTs,
+      );
+      let set = explicitBySession.get(m.session_id);
+      if (set == null) {
+        set = new Set();
+        explicitBySession.set(m.session_id, set);
+      }
+      set.add(file.path);
+    }
+  }
+
+  // PASS 2 — Inferred attribution. Files with no explicit attribution
+  // from any session (and a non-null mtime) get bracketed against
+  // PreToolUse/PostToolUse Bash intervals. The matching session(s) get
+  // an `inferred`-source upsert with `last_mutation_at = file.mtime_ms /
+  // 1000`. The mtime is frozen in the payload, so re-fold deterministic.
+  for (const file of snapshot.dirty_files) {
+    // Skip if this file already has explicit attribution from ANY
+    // session — pass 2 is a last-resort inference, not an augment.
+    let hasExplicit = false;
+    for (const [, paths] of explicitBySession) {
+      if (paths.has(file.path)) {
+        hasExplicit = true;
+        break;
+      }
+    }
+    if (hasExplicit) continue;
+    if (file.mtime_ms == null) continue;
+    const inferred = findInferredAttributions(db, projectDir, file);
+    const mtimeSec = file.mtime_ms / 1000;
+    for (const m of inferred) {
+      upsertStmt.run(
+        projectDir,
+        m.session_id,
+        file.path,
+        mtimeSec,
+        "inferred",
+        "inferred",
+        m.last_event_id,
+        eventTs,
+      );
+    }
+  }
+
+  // PASS 3 — Render per-file `attributions[]`. Join `file_attributions`
+  // against `jobs` (LEFT JOIN — a missing jobs row reads defaults), apply
+  // the discharge filter, and embed the materialized view inside each
+  // dirty file's `attributions[]`. The WHERE clause `last_mutation_at >
+  // COALESCE(last_commit_at, 0)` is THE discharge rule: a session that
+  // has committed past its last mutation drops out of the file's
+  // attribution list.
+  //
+  // Sorted ASC on `(session_id)` — total-order tiebreaker is non-
+  // negotiable for byte-identical re-fold. Without the deterministic
+  // sort, two re-folds could produce different JSON orderings under
+  // the same input.
+  const attribStmt = db.prepare(
+    `SELECT fa.session_id AS session_id,
+            fa.last_mutation_at AS last_touch_at,
+            fa.op AS op,
+            fa.source AS source,
+            j.title AS title,
+            j.state AS state
+       FROM file_attributions fa
+       LEFT JOIN jobs j ON j.job_id = fa.session_id
+      WHERE fa.project_dir = ?
+        AND fa.file_path = ?
+        AND fa.last_mutation_at > COALESCE(fa.last_commit_at, 0)
+      ORDER BY fa.session_id ASC`,
+  );
+  const renderedFiles: Array<
+    ReducerDirtyFile & { attributions: RenderedAttribution[] }
+  > = [];
+  const fileToAttributions = new Map<string, RenderedAttribution[]>();
+  for (const file of snapshot.dirty_files) {
+    const rows = attribStmt.all(projectDir, file.path) as Array<{
+      session_id: string;
+      last_touch_at: number;
+      op: string;
+      source: string;
+      title: string | null;
+      state: string | null;
+    }>;
+    const attributions: RenderedAttribution[] = rows.map((r) => ({
+      session_id: r.session_id,
+      title: r.title,
+      // Default `state="stopped"` matches the schema default + the zero
+      // -event projection (jobs row absent ↔ session never observed).
+      state: r.state ?? "stopped",
+      last_touch_at: r.last_touch_at,
+      op: r.op,
+      source:
+        r.source === "tool" || r.source === "bash" || r.source === "inferred"
+          ? r.source
+          : "inferred",
+    }));
+    renderedFiles.push({ ...file, attributions });
+    fileToAttributions.set(file.path, attributions);
+  }
+
+  // PASS 4 — Per-job rollups.
+  //
+  // (a) `git_orphan_count`: project-wide count of dirty files with ZERO
+  //     active attributions — the strict-mystery semantic.
+  // (b) `git_unattributed_to_live_count`: project-wide count of dirty
+  //     files whose attribution set contains NO live session
+  //     (state ∈ {'working', 'stopped'}). The legacy v28 "orphan" name
+  //     under the new vocabulary; drives readiness predicate 6.5.
+  // (c) `git_dirty_count`: per-session count of files in the current
+  //     snapshot the session is on the hook for (active attribution,
+  //     undischarged).
+  //
+  // The two project-wide counts are broadcast onto every enumerated
+  // session — every session with at least one active attribution under
+  // this project_dir. The per-session count is, well, per-session.
+  let orphanCount = 0;
+  let unattributedToLiveCount = 0;
+  const sessionsWithAttribution = new Set<string>();
+  const sessionDirtyCount = new Map<string, number>(); // session_id → git_dirty_count
+  const LIVE_STATES = new Set(["working", "stopped"]);
+  for (const file of snapshot.dirty_files) {
+    const attributions = fileToAttributions.get(file.path) ?? [];
+    if (attributions.length === 0) {
+      orphanCount++;
+      unattributedToLiveCount++;
+      continue;
+    }
+    let hasLive = false;
+    for (const a of attributions) {
+      sessionsWithAttribution.add(a.session_id);
+      sessionDirtyCount.set(
+        a.session_id,
+        (sessionDirtyCount.get(a.session_id) ?? 0) + 1,
+      );
+      if (LIVE_STATES.has(a.state)) hasLive = true;
+    }
+    if (!hasLive) unattributedToLiveCount++;
+  }
+
+  // Also enumerate every session that has any active attribution for
+  // this project — even if NONE of its attributed files are in the
+  // current snapshot's dirty_files set. (A file that was attributed in
+  // an earlier snapshot but discharged in the current commit set would
+  // not appear in `dirty_files` — but if undischarged, the session's
+  // count should still reflect the project-wide rollup.) In practice
+  // the previous `attributions[]` build only considered current
+  // dirty_files, so we need a separate enumeration. This walks every
+  // active row under `project_dir` and includes its session in the
+  // fan-out set; the per-session `git_dirty_count` already counted only
+  // current dirty files (sessionDirtyCount entries default to 0 for
+  // sessions present here but absent from sessionDirtyCount — they're
+  // attributed to this project but to no file in the current snapshot).
+  const allActiveSessions = db
+    .prepare(
+      `SELECT DISTINCT session_id
+         FROM file_attributions
+        WHERE project_dir = ?
+          AND last_mutation_at > COALESCE(last_commit_at, 0)`,
+    )
+    .all(projectDir) as Array<{ session_id: string }>;
+  for (const row of allActiveSessions) {
+    sessionsWithAttribution.add(row.session_id);
+  }
+
+  // Enumerate every session that previously had a count stamped for
+  // this project, even if it has no active attribution now. Their
+  // counts must zero out symmetrically — otherwise a session that
+  // committed all its files would keep a stale git_dirty_count.
+  // The canonical pre-write enumeration: the persisted `git_status.jobs`
+  // JSON from the prior snapshot (the projection's own canonical
+  // attribution). A first-ever snapshot reads `[]`; thereafter every
+  // prior fan-out session shows up here.
+  const priorRow = db
+    .prepare("SELECT jobs FROM git_status WHERE project_dir = ?")
+    .get(projectDir) as { jobs: string | null } | null;
+  const priorSessions = new Set<string>();
+  if (priorRow != null && priorRow.jobs != null && priorRow.jobs.length > 0) {
+    try {
+      const parsed = JSON.parse(priorRow.jobs) as unknown;
+      if (Array.isArray(parsed)) {
+        for (const entry of parsed) {
+          if (typeof entry === "object" && entry !== null) {
+            const jobId = (entry as { job_id?: unknown }).job_id;
+            if (typeof jobId === "string" && jobId.length > 0) {
+              priorSessions.add(jobId);
+            }
+          }
+        }
+      }
+    } catch {
+      // malformed prior JSON folds to empty set; safe-fold per "never
+      // throw" invariant.
+    }
+  }
+  // Union of "sessions with at least one active attribution" and
+  // "sessions that had a count stamped in the prior snapshot" — every
+  // session in either set needs a fan-out write.
+  const sessionsToFanOut = new Set<string>();
+  for (const s of sessionsWithAttribution) sessionsToFanOut.add(s);
+  for (const s of priorSessions) sessionsToFanOut.add(s);
+
+  // Stamp counts. UPDATE-only (no shell-row insert): a session whose
+  // `SessionStart` hasn't folded yet — the UPDATE matches zero rows
+  // safely, the next snapshot after SessionStart lands the counts.
+  const jobUpdateStmt = db.prepare(
+    `UPDATE jobs
+        SET git_dirty_count = ?,
+            git_unattributed_to_live_count = ?,
+            git_orphan_count = ?,
+            last_event_id = ?,
+            updated_at = ?
+      WHERE job_id = ?`,
+  );
+  // Deterministic iteration order — Set iteration in V8/JSC is
+  // insertion-order, but we sort explicitly to keep re-fold byte-
+  // identical irrespective of insertion-order vagaries across
+  // different drains.
+  const sortedSessions = Array.from(sessionsToFanOut).sort();
+  // Build the canonical attribution JSON for the post-PASS-5
+  // git_status.jobs slot. Format mirrors the legacy v28 shape
+  // `{job_id, dirty: <count>}` so a downstream retract walks the
+  // same structure (retractGitStatus reads `job_id` only).
+  const projectionJobs: Array<{ job_id: string; dirty: number }> = [];
+  for (const sessionId of sortedSessions) {
+    const dirtyForSession = sessionDirtyCount.get(sessionId) ?? 0;
+    jobUpdateStmt.run(
+      dirtyForSession,
+      unattributedToLiveCount,
+      orphanCount,
+      eventId,
+      eventTs,
+      sessionId,
+    );
+    // Re-fan into embedded jobs[] — `syncIfPlanRef` reads back the
+    // post-write row + routes via `plan_ref`. A session whose UPDATE
+    // matched zero rows (no SessionStart yet) returns null from the
+    // SELECT and the helper exits without a write.
+    syncIfPlanRef(db, sessionId, eventId, eventTs);
+    projectionJobs.push({ job_id: sessionId, dirty: dirtyForSession });
+  }
+
+  // git_status write — after pass 1-4 have populated file_attributions
+  // and per-job rollups. The rendered `dirty_files[].attributions[]`
+  // JSON is the materialized view the client reads. `orphaned_files` /
+  // `jobs` carry the project-broadcast counts in the same on-disk shape
+  // the legacy v28 producer used (`orphaned_files.length` == orphan
+  // count for backward-compatible reads); the new strict-mystery
+  // semantic flows through the dedicated `dirty_count` /
+  // `orphaned_count` columns. The `jobs` JSON enumerates the
+  // canonical attribution set the retract walks — same shape the v28
+  // producer wrote.
+  //
+  // `orphaned_files` shape: we don't ship a per-file orphan list (the
+  // new strict-mystery semantic is "files with no attribution at all",
+  // which IS just `dirty_files where attributions.length == 0`).
+  // Storing the per-file list would duplicate that. Instead we store
+  // an empty array and let the `orphaned_count` column carry the
+  // scalar — the same approach the producer took post-fn-633.5.
   db.run(
     `INSERT INTO git_status (
        project_dir, branch, head_oid, upstream, ahead, behind,
@@ -1003,48 +1602,21 @@ function projectGitStatus(db: Database, event: Event): void {
        last_event_id = excluded.last_event_id,
        updated_at = excluded.updated_at`,
     [
-      snapshot.project_dir,
+      projectDir,
       snapshot.branch,
       snapshot.head_oid,
       snapshot.upstream,
       snapshot.ahead,
       snapshot.behind,
       snapshot.dirty_files.length,
-      snapshot.orphaned_files.length,
-      JSON.stringify(snapshot.dirty_files),
-      JSON.stringify(snapshot.orphaned_files),
-      JSON.stringify(snapshot.jobs),
-      event.id,
-      event.ts,
+      orphanCount,
+      JSON.stringify(renderedFiles),
+      JSON.stringify([]),
+      JSON.stringify(projectionJobs),
+      eventId,
+      eventTs,
     ],
   );
-
-  // Schema-v28 fan-out into `jobs`: stamp per-job dirty counts + project
-  // -wide orphan count onto every enumerated job, then re-emit each job's
-  // embedded-array sync so the counts propagate into `epics.jobs[]` /
-  // `epics.tasks[].jobs[]`. Same `BEGIN IMMEDIATE` as the `git_status`
-  // write above + the surrounding cursor advance.
-  const projectOrphans = snapshot.orphaned_files.length;
-  for (const job of snapshot.jobs) {
-    const jobId = job.job_id;
-    if (typeof jobId !== "string" || jobId.length === 0) {
-      continue;
-    }
-    const jobDirty = Array.isArray(job.dirty) ? job.dirty.length : 0;
-    // UPDATE-only (no shell-row insert): a `GitSnapshot` enumerating a job
-    // whose `SessionStart` event hasn't folded yet leaves the row absent
-    // and the UPDATE matches zero rows. The next snapshot after
-    // SessionStart lands the counts.
-    db.run(
-      "UPDATE jobs SET git_dirty_count = ?, git_unattributed_to_live_count = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
-      [jobDirty, projectOrphans, event.id, event.ts, jobId],
-    );
-    // Re-fan into the embedded `jobs[]` arrays — `syncIfPlanRef` reads the
-    // post-write jobs row and routes via `plan_ref`. A job whose UPDATE
-    // matched zero rows (no SessionStart yet) returns null from the SELECT
-    // and the helper exits without a write.
-    syncIfPlanRef(db, jobId, event.id, event.ts);
-  }
 }
 
 /**
@@ -1058,21 +1630,23 @@ function projectGitStatus(db: Database, event: Event): void {
  * inside the cursor-advance transaction. DELETE is idempotent: re-folding
  * over a row that's already gone matches zero rows, not an error.
  *
- * Schema-v28 symmetric clear: before the DELETE, read the soon-to-be-dropped
- * row's persisted `git_status.jobs` JSON to enumerate the job_ids the last
- * fan-out stamped, then zero each one's `git_dirty_count` /
- * `git_unattributed_to_live_count` and re-emit the `syncJobIntoEpic` fan-out
- * so the embedded arrays clear in lockstep. Canonical attribution: the SAME
- * `jobs[]` enumeration that the write side fanned over is the enumeration
- * the clear walks — symmetric write/clear keeps an unrelated project's
- * jobs (running in another worktree) untouched. All inside the open
- * transaction.
+ * Schema-v28 symmetric clear (widened in v31): before the DELETE, read the
+ * soon-to-be-dropped row's persisted `git_status.jobs` JSON to enumerate the
+ * job_ids the last fan-out stamped, then zero each one's `git_dirty_count`
+ * / `git_unattributed_to_live_count` / `git_orphan_count` and re-emit the
+ * `syncJobIntoEpic` fan-out so the embedded arrays clear in lockstep.
+ * Canonical attribution: the SAME `jobs[]` enumeration that the write side
+ * fanned over is the enumeration the clear walks — symmetric write/clear
+ * keeps an unrelated project's jobs (running in another worktree)
+ * untouched. All inside the open transaction.
  *
- * Schema-v31 note: the column cleared here was renamed from the legacy
- * `jobs.git_orphan_count` to `jobs.git_unattributed_to_live_count`; the
- * NEW `jobs.git_orphan_count` (strict-mystery) is unaffected by this retract
- * until its fold lands in fn-633.6, at which point this clear will be
- * widened to zero both columns symmetrically.
+ * Schema-v31 widening (fn-633.6): the retract also DELETEs every
+ * `file_attributions` row for this `project_dir`. The attribution table is
+ * a pure projection of the event log under the new attribution rewrite, so
+ * dropping the worktree drops the per-(session, file) rows it owned. A
+ * re-fold over the persisted events re-creates the same rows — and the
+ * subsequent retract (re-folded too) re-deletes them — preserving the
+ * "byte-identical re-fold" invariant across the snapshot + retract pair.
  */
 function retractGitStatus(db: Database, event: Event): void {
   const projectDir = event.session_id;
@@ -1102,12 +1676,17 @@ function retractGitStatus(db: Database, event: Event): void {
         continue;
       }
       db.run(
-        "UPDATE jobs SET git_dirty_count = 0, git_unattributed_to_live_count = 0, last_event_id = ?, updated_at = ? WHERE job_id = ?",
+        "UPDATE jobs SET git_dirty_count = 0, git_unattributed_to_live_count = 0, git_orphan_count = 0, last_event_id = ?, updated_at = ? WHERE job_id = ?",
         [event.id, event.ts, jobId],
       );
       syncIfPlanRef(db, jobId, event.id, event.ts);
     }
   }
+  // Schema-v31: also drop every file_attributions row for this project_dir
+  // — symmetric with the projectGitStatus pass-1/2 upserts. The
+  // attribution table is a pure projection of the event log, so a retract
+  // walks it the same way.
+  db.run("DELETE FROM file_attributions WHERE project_dir = ?", [projectDir]);
   db.run("DELETE FROM git_status WHERE project_dir = ?", [projectDir]);
 }
 
