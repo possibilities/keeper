@@ -68,5 +68,5 @@ test/reducer.test.ts: ≥10 fold cases for the new `Commit` arm — happy-path (
 - [ ] ≥10 reducer fold tests + worker-level integration tests pass
 
 ## Done summary
-
+Added Commit synthetic event: git-worker enumerates commits in HEAD-oid deltas (with parseSessionIdTrailer take-last UUID validation and extractCommit defensive parser); reducer's foldCommit arm updates file_attributions.last_commit_at inside the open BEGIN IMMEDIATE — per-session discharge on a valid trailer, global discharge on null/malformed. 28 new tests.
 ## Evidence
