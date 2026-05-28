@@ -125,5 +125,5 @@ Expected outcomes (informational, not strict acceptance):
 - [ ] `bun test` green
 
 ## Done summary
-
+Schema v32: epics.default_visible VIRTUAL generated column + partial composite index idx_epics_default_visible serve the descriptor's default scope as a covering SEARCH, killing the OR-predicate SCAN that drove the Tier 4 diffTick/metaCount p95 tail. New addGeneratedColumnIfMissing helper (PRAGMA table_xinfo) keeps the migration boot-twice idempotent.
 ## Evidence

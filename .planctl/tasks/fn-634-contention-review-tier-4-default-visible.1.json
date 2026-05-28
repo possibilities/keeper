@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Materialize default_visible VIRTUAL column on epics with partial index",
-  "updated_at": "2026-05-28T15:52:54.855590Z"
+  "updated_at": "2026-05-28T20:23:06.665785Z",
+  "worker_done_at": "2026-05-28T20:23:06.665785Z"
 }
