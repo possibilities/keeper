@@ -51,5 +51,5 @@ test/derivers.test.ts: ~30-40 new cases covering pkg managers (each kind × inst
 - [ ] Hook still exits 0 on a malformed Bash command (defensive guard at events-writer.ts:486-493 catches deriver-side throws — but the deriver itself must not throw on any input)
 
 ## Done summary
-
+Added extractBashMutation deriver covering pnpm/npm/yarn/bun/uv/pip/cargo/poetry, rm/mv/cp/mkdir, and git tree-mutators (checkout/restore/stash/reset) with POSIX-shell-ish tokenization (quote-aware, env-prefix-stripping, compound-command-stopping). Wired into the hook write-path (stamps bash_mutation_kind + bash_mutation_targets on PostToolUse:Bash), the v30→v31 same-transaction migration backfill (re-derives the same values on every stored Bash event row via the shared deriver), and all seven synthetic-event lift sites in daemon.ts (null for both new columns). 44 new test cases in test/derivers.test.ts cover happy paths per pm/fs/git kind, negative cases (read-only commands, missing args, non-mutating subcommands), tokenization edge cases (quoting, escaping, env-prefix, compound separators, absolute/relative cwd resolution), and round-trip determinism. All 96 derivers tests pass; 489 tests pass across derivers/db/daemon/reducer/events-writer suites.
 ## Evidence
