@@ -349,25 +349,29 @@ test("renderRowBlocks: drops all-zero rows and emits one block per non-empty row
       behind: 0,
       dirty_count: 0,
       orphaned_count: 0,
-      orphaned_files: [],
-      jobs: [],
+      dirty_files: [],
     },
     {
       project_dir: "/repo/dirty",
       branch: "feat",
       ahead: 0,
       behind: 1,
-      dirty_count: 2,
+      dirty_count: 1,
       orphaned_count: 0,
-      orphaned_files: [],
-      jobs: [
+      dirty_files: [
         {
-          job_id: "j1",
-          title: "do thing",
-          plan_verb: "work",
-          state: "running",
-          dirty: [{ xy: " M", path: "src/foo.ts" }],
-          planctl: [],
+          xy: " M",
+          path: "src/foo.ts",
+          attributions: [
+            {
+              session_id: "sess-a",
+              title: "do thing",
+              state: "working",
+              last_touch_at: 1000,
+              op: "Write",
+              source: "tool",
+            },
+          ],
         },
       ],
     },
@@ -376,12 +380,12 @@ test("renderRowBlocks: drops all-zero rows and emits one block per non-empty row
   expect(blocks).toHaveLength(1);
   const block = blocks[0];
   if (!block) throw new Error("missing block");
-  // First line: `dirty [feat -1] dirty=2 orphaned=0`
-  expect(block).toMatch(/^\(dirty\) \[feat -1\] dirty=2 orphaned=0\n/);
-  // Job line with the `worker` actor label.
-  expect(block).toContain("  do thing [worker] [running] dirty=1 planctl=0");
-  // Dirty-file line indented under the job.
-  expect(block).toContain("     M src/foo.ts");
+  // First line: header with file-centric counts (dirty/orphan/unattributed).
+  expect(block).toMatch(
+    /^\(dirty\) \[feat -1\] dirty=1 orphan=0 unattributed=0\n/,
+  );
+  // File line: path + xy + source-badged attribution (`tool@<title>`).
+  expect(block).toContain("  src/foo.ts [ M] tool@do thing");
 });
 
 test("renderRowBlocks: ahead-only row produces an unpushed line", () => {
@@ -393,8 +397,7 @@ test("renderRowBlocks: ahead-only row produces an unpushed line", () => {
       behind: 0,
       dirty_count: 0,
       orphaned_count: 0,
-      orphaned_files: [],
-      jobs: [],
+      dirty_files: [],
     },
   ]);
   expect(blocks).toHaveLength(1);
@@ -402,4 +405,162 @@ test("renderRowBlocks: ahead-only row produces an unpushed line", () => {
   if (!block) throw new Error("missing block");
   expect(block).toMatch(/^\(ahead\) \[main \+3\]/);
   expect(block).toContain("  unpushed 3");
+});
+
+// ---------------------------------------------------------------------------
+// renderRowBlocks: file-centric layout — multi-attribution, truly-orphan,
+// rename continuation line, and the source-badged sort order
+// (last_touch_at desc, most-recent first).
+// ---------------------------------------------------------------------------
+
+test("renderRowBlocks: file-centric layout — multi-attribution, orphan, rename, sort order", () => {
+  const blocks = renderRowBlocks([
+    {
+      project_dir: "/repo/multi",
+      branch: "main",
+      ahead: 0,
+      behind: 0,
+      // 4 dirty files: one multi-attribution, one truly-orphan, one
+      // single-attribution stopped (counts as unattributed-to-live),
+      // one rename-with-attribution.
+      dirty_count: 4,
+      orphaned_count: 1,
+      dirty_files: [
+        // multi-attribution: tool + bash + inferred, three sessions, with
+        // mixed last_touch_at to verify desc sort (bash@new should appear
+        // first, then tool@mid, then inferred@old).
+        {
+          xy: " M",
+          path: "src/foo.ts",
+          attributions: [
+            {
+              session_id: "sess-mid",
+              title: "mid",
+              state: "working",
+              last_touch_at: 2000,
+              op: "Edit",
+              source: "tool",
+            },
+            {
+              session_id: "sess-new",
+              title: "new",
+              state: "working",
+              last_touch_at: 3000,
+              op: "rm",
+              source: "bash",
+            },
+            {
+              session_id: "sess-old",
+              title: "old",
+              state: "stopped",
+              last_touch_at: 1000,
+              op: "inferred",
+              source: "inferred",
+            },
+          ],
+        },
+        // truly-orphan: no attributions at all → renders as `<orphan>`.
+        {
+          xy: "??",
+          path: "tmp/mystery.bin",
+          attributions: [],
+        },
+        // single attribution but session is ended → counts toward
+        // unattributed-to-live (no live state in {working, stopped}).
+        {
+          xy: " M",
+          path: "src/legacy.ts",
+          attributions: [
+            {
+              session_id: "sess-dead",
+              title: "ended thing",
+              state: "ended",
+              last_touch_at: 500,
+              op: "Write",
+              source: "tool",
+            },
+          ],
+        },
+        // rename: orig_path present and different → continuation line.
+        {
+          xy: "R ",
+          path: "src/new-name.ts",
+          orig_path: "src/old-name.ts",
+          attributions: [
+            {
+              session_id: "sess-renamer",
+              title: "renamer",
+              state: "working",
+              last_touch_at: 4000,
+              op: "mv",
+              source: "bash",
+            },
+          ],
+        },
+      ],
+    },
+  ]);
+
+  expect(blocks).toHaveLength(1);
+  const block = blocks[0];
+  if (!block) throw new Error("missing block");
+
+  // Header: file-centric counts. Two files are unattributed-to-live —
+  // the truly-orphan tmp/mystery.bin and the ended-session legacy.ts.
+  expect(block).toMatch(
+    /^\(multi\) \[main\] dirty=4 orphan=1 unattributed=2\n/,
+  );
+
+  // Multi-attribution sorted last_touch_at desc.
+  expect(block).toContain("  src/foo.ts [ M] bash@new, tool@mid, inferred@old");
+
+  // Truly-orphan file renders as `<orphan>`.
+  expect(block).toContain("  tmp/mystery.bin [??] <orphan>");
+
+  // Single-attribution ended session.
+  expect(block).toContain("  src/legacy.ts [ M] tool@ended thing");
+
+  // Rename: primary line + continuation.
+  expect(block).toContain("  src/new-name.ts [R ] bash@renamer");
+  expect(block).toContain("    ↳ renamed from src/old-name.ts");
+});
+
+test("renderRowBlocks: attribution truncation appends `+N more` for dense lines", () => {
+  // 10 attributions on one file — at least one must drop into `+N more`
+  // under the 100-char line cap.
+  const manyAttributions = Array.from({ length: 10 }, (_, i) => ({
+    session_id: `sess-${i}`,
+    title: `verbose-session-title-${i}`,
+    state: "working",
+    last_touch_at: 10 * (10 - i), // descending, so source order is preserved
+    op: "Edit",
+    source: "tool" as const,
+  }));
+  const blocks = renderRowBlocks([
+    {
+      project_dir: "/repo/dense",
+      branch: "main",
+      ahead: 0,
+      behind: 0,
+      dirty_count: 1,
+      orphaned_count: 0,
+      dirty_files: [
+        {
+          xy: " M",
+          path: "src/hot.ts",
+          attributions: manyAttributions,
+        },
+      ],
+    },
+  ]);
+
+  expect(blocks).toHaveLength(1);
+  const block = blocks[0];
+  if (!block) throw new Error("missing block");
+  // Find the file line and assert it carries a `+N more` suffix.
+  const fileLine = block
+    .split("\n")
+    .find((l) => l.startsWith("  src/hot.ts ["));
+  if (fileLine == null) throw new Error("missing file line");
+  expect(fileLine).toMatch(/\+\d+ more$/);
 });

@@ -39,38 +39,145 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   appended to /tmp/keeper-git.<pid>.lifecycle.txt. Session paths print
   on exit.
 
-Rows show one planctl-backed git worktree, its dirty/orphan counts,
-orphaned files, and per-live-job dirty files.
+Rows show one planctl-backed git worktree, its dirty / orphan /
+unattributed counts, and per-file source-badged attribution
+(\`tool@<session>, bash@<session>, inferred@<session>\`). Files with
+no attribution at all render as \`<orphan>\` in the attribution slot.
 `;
 
 function seg(v: unknown): string {
   return v == null ? "" : String(v);
 }
 
-function statusLine(file: Record<string, unknown>): string {
-  const xy = seg(file.xy).padEnd(2, " ");
-  const path = seg(file.path);
-  const orig = file.orig_path == null ? "" : ` <- ${seg(file.orig_path)}`;
-  return `${xy} ${path}${orig}`;
+/**
+ * Approximate render width budget per file line — when the source-badged
+ * attribution list would overflow this, the renderer truncates the trailing
+ * entries into a `+N more` suffix. Empirical guideline from the task spec
+ * (~100 chars per file line); tuned down a hair so the standard prefix
+ * (`  path/to/file.ts [xy] `) plus 2-3 short labels fits in 100 cols.
+ */
+const MAX_ATTRIBUTION_LINE = 100;
+
+/**
+ * One entry in the per-file `attributions[]` array the reducer writes into
+ * `git_status.dirty_files[].attributions`. See `RenderedAttribution` in
+ * `src/reducer.ts`; this is the wire-side mirror with permissive types so
+ * a malformed row from the read boundary degrades gracefully.
+ */
+interface AttributionEntry {
+  session_id?: unknown;
+  title?: unknown;
+  state?: unknown;
+  last_touch_at?: unknown;
+  op?: unknown;
+  source?: unknown;
 }
 
-function actor(v: unknown): string | null {
-  if (v == null) return null;
-  const s = String(v);
-  if (s === "plan") return "planner";
-  if (s === "work") return "worker";
-  if (s === "close") return "closer";
-  return s;
+/**
+ * Short label for a session — the embedded job title (set by the
+ * `TranscriptTitle` synthetic event or the SessionStart fallback) when
+ * present, otherwise the session/job UUID. Mirrors the `title ?? job_id`
+ * fallback that board.ts uses for `job_links` rendering.
+ */
+function attributionLabel(a: AttributionEntry): string {
+  const title = seg(a.title);
+  if (title.length > 0) return title;
+  return seg(a.session_id);
+}
+
+/**
+ * Compose one attribution badge: `<source>@<label>`. The source verb
+ * (`tool` / `bash` / `inferred`) is the per-entry provenance — `tool`
+ * from a Write/Edit/MultiEdit/NotebookEdit mutation event, `bash` from
+ * the hook-stamped bash mutation deriver, `inferred` from the reducer's
+ * mtime-bracket fallback pass.
+ */
+function attributionBadge(a: AttributionEntry): string {
+  const source = seg(a.source);
+  // Defensive fallback — the reducer constrains source to a closed enum,
+  // but a malformed row from the read boundary should still render
+  // something the human can interpret rather than the empty string.
+  const verb = source.length > 0 ? source : "?";
+  return `${verb}@${attributionLabel(a)}`;
+}
+
+/**
+ * Render the attribution badges for one dirty file. Sort `last_touch_at`
+ * descending so the most-recent mutation appears first. Cap the total
+ * line width at `MAX_ATTRIBUTION_LINE` — when the joined badge list
+ * exceeds that, truncate trailing entries and append `+N more`. Returns
+ * the literal `<orphan>` token when no attributions exist (strict-mystery
+ * semantic from the reducer's pass-4 orphan count).
+ */
+function renderAttributions(
+  attributions: AttributionEntry[],
+  prefixLen: number,
+): string {
+  if (attributions.length === 0) return "<orphan>";
+
+  // Sort by `last_touch_at` desc. Defensive `Number(...) || 0` because
+  // a malformed JSON entry from the read boundary could land as a string.
+  const sorted = [...attributions].sort((a, b) => {
+    const at = Number(a.last_touch_at) || 0;
+    const bt = Number(b.last_touch_at) || 0;
+    return bt - at;
+  });
+
+  const badges = sorted.map(attributionBadge);
+  const budget = MAX_ATTRIBUTION_LINE - prefixLen;
+  // Fast path: full list fits, no truncation needed.
+  const fullJoin = badges.join(", ");
+  if (fullJoin.length <= budget) return fullJoin;
+
+  // Truncated path: keep adding badges while the running join + the
+  // worst-case `+N more` suffix still fits the budget. `more` always
+  // refers to the REMAINING badges; recompute the suffix per step.
+  const kept: string[] = [];
+  for (let i = 0; i < badges.length; i++) {
+    const badge = badges[i];
+    if (badge == null) continue;
+    const tentative =
+      kept.length === 0 ? badge : `${kept.join(", ")}, ${badge}`;
+    const remaining = badges.length - (i + 1);
+    const suffix = remaining > 0 ? `, +${remaining} more` : "";
+    if (tentative.length + suffix.length > budget && kept.length > 0) {
+      // Stop here — emit what we've already accepted plus a suffix for
+      // every badge we DIDN'T include (badges.length - kept.length).
+      const dropped = badges.length - kept.length;
+      return `${kept.join(", ")}, +${dropped} more`;
+    }
+    kept.push(badge);
+  }
+  // Loop completed without truncating — shouldn't happen given the
+  // fast-path check above, but the fallback is the full join.
+  return kept.join(", ");
 }
 
 /**
  * Render the `git`-collection rows into the per-frame block list. Each row
- * with non-zero ahead / dirty / orphaned counts produces one block; rows
+ * with non-zero ahead / dirty / orphan counts produces one block; rows
  * with all zeroes are dropped (the empty-row filter matches the
- * pre-refactor `scripts/git.ts:74` behavior). Exported as `string[]`
- * (one entry per kept block) so the live-shell wrapper in task 2 can
- * consume lines, not a joined string; the script's emit seam still joins
- * with `\n` for stdout / sidecar writes.
+ * pre-refactor behavior). Exported as `string[]` (one entry per kept
+ * block) so the live-shell wrapper consumes lines, not a joined string;
+ * the script's emit seam still joins with `\n` for stdout / sidecar
+ * writes.
+ *
+ * Layout (file-centric, one line per dirty file with source-badged
+ * multi-attribution):
+ *
+ *   (project) [branch +ahead -behind] dirty=N orphan=M unattributed=K
+ *     path/to/file.ts [M ] tool@sess-a, bash@sess-b, inferred@sess-c
+ *       ↳ renamed from path/to/orig.ts
+ *     path/to/other.ts [??] <orphan>
+ *     unpushed N
+ *
+ * `dirty=` carries the project-wide dirty file count (`dirty_count`);
+ * `orphan=` is the strict-mystery `orphaned_count` (files with zero
+ * attributions); `unattributed=` is computed locally as the count of
+ * dirty files whose attribution set contains no live session. Per-file
+ * attributions ride on the `dirty_files[].attributions[]` JSON the
+ * reducer writes — sorted `last_touch_at` desc, capped at
+ * MAX_ATTRIBUTION_LINE with `+N more` truncation for dense lines.
  */
 export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
   const blocks: string[] = [];
@@ -89,44 +196,64 @@ export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
       typeof row.orphaned_count === "number" ? row.orphaned_count : 0;
     if (aheadCount === 0 && dirtyCount === 0 && orphanedCount === 0) continue;
 
+    const dirtyFiles = Array.isArray(row.dirty_files)
+      ? (row.dirty_files as Record<string, unknown>[])
+      : [];
+
+    // Local unattributed count — dirty files whose attribution set
+    // contains no live session (state ∈ {working, stopped}). The reducer
+    // stamps this onto `jobs.git_unattributed_to_live_count`, but the
+    // git_status row doesn't carry the scalar directly. We re-derive
+    // from the per-file attributions so the header line stays a pure
+    // function of the wire payload.
+    const LIVE_STATES = new Set(["working", "stopped"]);
+    let unattributedCount = 0;
+    for (const file of dirtyFiles) {
+      const atts = Array.isArray(file.attributions)
+        ? (file.attributions as AttributionEntry[])
+        : [];
+      if (atts.length === 0) {
+        unattributedCount++;
+        continue;
+      }
+      let hasLive = false;
+      for (const a of atts) {
+        if (LIVE_STATES.has(seg(a.state))) {
+          hasLive = true;
+          break;
+        }
+      }
+      if (!hasLive) unattributedCount++;
+    }
+
     const lines = [
-      `(${name}) [${branch}${ahead}${behind}] dirty=${seg(row.dirty_count)} orphaned=${seg(row.orphaned_count)}`,
+      `(${name}) [${branch}${ahead}${behind}] dirty=${dirtyCount} orphan=${orphanedCount} unattributed=${unattributedCount}`,
     ];
 
-    const orphaned = Array.isArray(row.orphaned_files)
-      ? (row.orphaned_files as Record<string, unknown>[])
-      : [];
-    for (const file of orphaned) {
-      lines.push(`  orphan ${statusLine(file)}`);
+    // One line per dirty file: indented path + xy code + badge list.
+    // Renames carry an extra `↳ renamed from <orig_path>` continuation
+    // line so the rename-pair stays legible without bloating the
+    // primary line. Attribution truncation budgets the primary line
+    // only — continuations are short by construction.
+    for (const file of dirtyFiles) {
+      const xy = seg(file.xy).padEnd(2, " ");
+      const path = seg(file.path);
+      const atts = Array.isArray(file.attributions)
+        ? (file.attributions as AttributionEntry[])
+        : [];
+      // Prefix is `  <path> [xy] ` — width drives the attribution
+      // truncation budget below.
+      const prefix = `  ${path} [${xy}] `;
+      const attrText = renderAttributions(atts, prefix.length);
+      lines.push(`${prefix}${attrText}`);
+      const orig = seg(file.orig_path);
+      if (orig.length > 0 && orig !== path) {
+        lines.push(`    ↳ renamed from ${orig}`);
+      }
     }
 
     if (aheadCount > 0) {
       lines.push(`  unpushed ${aheadCount}`);
-    }
-
-    const jobs = Array.isArray(row.jobs)
-      ? (row.jobs as Record<string, unknown>[])
-      : [];
-    for (const job of jobs) {
-      const dirty = Array.isArray(job.dirty)
-        ? (job.dirty as Record<string, unknown>[])
-        : [];
-      const planctl = Array.isArray(job.planctl)
-        ? (job.planctl as Record<string, unknown>[])
-        : [];
-      if (dirty.length === 0 && planctl.length === 0) continue;
-      const title = seg(job.title) || seg(job.job_id);
-      const role = actor(job.plan_verb);
-      const roleSeg = role == null ? "" : ` [${role}]`;
-      lines.push(
-        `  ${title}${roleSeg} [${seg(job.state)}] dirty=${dirty.length} planctl=${planctl.length}`,
-      );
-      for (const file of dirty) {
-        lines.push(`    ${statusLine(file)}`);
-      }
-      for (const file of planctl) {
-        lines.push(`    planctl ${statusLine(file)}`);
-      }
     }
 
     blocks.push(lines.join("\n"));
