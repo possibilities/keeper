@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-28T18:58:14.204055Z",
+  "depends_on": [
+    "fn-635-cross-project-epic-deps-in-readiness.1"
+  ],
+  "epic": "fn-635-cross-project-epic-deps-in-readiness",
+  "id": "fn-635-cross-project-epic-deps-in-readiness.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Implement cross-project dep gating",
+  "updated_at": "2026-05-28T18:58:14.204055Z"
+}

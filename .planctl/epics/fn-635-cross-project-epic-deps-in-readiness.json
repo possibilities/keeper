@@ -1,0 +1,19 @@
+{
+  "branch_name": "fn-635-cross-project-epic-deps-in-readiness",
+  "bundles": [],
+  "created_at": "2026-05-28T18:58:14.204055Z",
+  "depends_on_epics": [],
+  "id": "fn-635-cross-project-epic-deps-in-readiness",
+  "last_validated_at": "2026-05-28T18:58:14.328201Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Cross-project epic deps in readiness",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-28T18:58:14.204055Z"
+}
