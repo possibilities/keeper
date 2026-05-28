@@ -223,7 +223,7 @@ function buildSnap(
   epics: Epic[],
   gitStatusByProjectDir: Map<
     string,
-    { dirty_count: number; orphan_count: number }
+    { dirty_count: number; unattributed_to_live_count: number }
   > = new Map(),
 ) {
   const jobs = new Map<string, Job>();
@@ -553,7 +553,9 @@ test("predictNextDispatches — stopped worker + worker_phase=done + git_dirty_c
   // fn-626: predicate 6.5 now reads off the live project-wide `git_status`
   // map, not the embedded per-job columns. Feed a map entry whose
   // dirty_count > 0 to drive the predicate.
-  const gitMap = new Map([["/repo", { dirty_count: 3, orphan_count: 0 }]]);
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 3, unattributed_to_live_count: 0 }],
+  ]);
   const snap = buildSnap([epic], gitMap);
   // Sanity check that the readiness predicate actually fires.
   expect(snap.readiness.perTask.get("fn-1-foo.1")).toEqual({
@@ -594,7 +596,9 @@ test("predictNextDispatches — stopped worker + worker_phase=done + git_orphan_
   });
   // fn-626: feed the live `git_status` map — predicate 6.5 reads from
   // there now, not the embedded per-job columns.
-  const gitMap = new Map([["/repo", { dirty_count: 0, orphan_count: 2 }]]);
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 0, unattributed_to_live_count: 2 }],
+  ]);
   const snap = buildSnap([epic], gitMap);
   expect(snap.readiness.perTask.get("fn-1-foo.1")).toEqual({
     tag: "blocked",

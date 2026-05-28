@@ -165,7 +165,7 @@ function run(
   subs: SubagentInvocation[] = [],
   gitStatusByProjectDir: Map<
     string,
-    { dirty_count: number; orphan_count: number }
+    { dirty_count: number; unattributed_to_live_count: number }
   > = new Map(),
 ) {
   return computeReadiness(epics, jobs, subs, gitStatusByProjectDir);
@@ -326,7 +326,9 @@ test("predicate 6.5 git-uncommitted wins over 7 (own-approval-pending)", () => {
     approval: "pending",
   });
   const epic = makeEpic({ tasks: [task] });
-  const gitMap = new Map([["/repo", { dirty_count: 3, orphan_count: 0 }]]);
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 3, unattributed_to_live_count: 0 }],
+  ]);
   const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
     blocked({ kind: "git-uncommitted" }),
@@ -341,7 +343,9 @@ test("predicate 6.5 git-orphans fires when dirty count is zero but orphan count 
     approval: "pending",
   });
   const epic = makeEpic({ tasks: [task] });
-  const gitMap = new Map([["/repo", { dirty_count: 0, orphan_count: 2 }]]);
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 0, unattributed_to_live_count: 2 }],
+  ]);
   const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
     blocked({ kind: "git-orphans" }),
@@ -358,7 +362,9 @@ test("predicate 5 (own-progress-main) wins over 6.5 git-uncommitted", () => {
     jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
   });
   const epic = makeEpic({ tasks: [task] });
-  const gitMap = new Map([["/repo", { dirty_count: 5, orphan_count: 0 }]]);
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 5, unattributed_to_live_count: 0 }],
+  ]);
   const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
     running({ kind: "job-running" }),
@@ -382,7 +388,9 @@ test("predicate 6 (own-progress-sub) wins over 6.5 git-uncommitted", () => {
   });
   const epic = makeEpic({ tasks: [task] });
   const subs = [makeSub({ job_id: "worker-1", status: "running" })];
-  const gitMap = new Map([["/repo", { dirty_count: 3, orphan_count: 0 }]]);
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 3, unattributed_to_live_count: 0 }],
+  ]);
   const snap = run([epic], new Map(), subs, gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
     running({ kind: "sub-agent-running" }),
@@ -401,7 +409,9 @@ test("predicate 6.5 skipped when worker_phase !== 'done' (task path)", () => {
     approval: "pending",
   });
   const epic = makeEpic({ tasks: [task] });
-  const gitMap = new Map([["/repo", { dirty_count: 5, orphan_count: 0 }]]);
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 5, unattributed_to_live_count: 0 }],
+  ]);
   const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual({ tag: "ready" });
 });
@@ -434,8 +444,8 @@ test("predicate 6.5 uses task.target_repo when set, falling back to epic.project
   });
   const epic = makeEpic({ tasks: [task], project_dir: "/repo" });
   const gitMap = new Map([
-    ["/repo", { dirty_count: 0, orphan_count: 0 }],
-    ["/other-repo", { dirty_count: 0, orphan_count: 7 }],
+    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
+    ["/other-repo", { dirty_count: 0, unattributed_to_live_count: 7 }],
   ]);
   const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perTask.get(task.task_id)).toEqual(
@@ -458,7 +468,9 @@ test("predicate 6.5 fires for evaluateCloseRow keyed by epic.project_dir", () =>
     status: "done",
     approval: "pending",
   });
-  const gitMap = new Map([["/repo", { dirty_count: 4, orphan_count: 0 }]]);
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 4, unattributed_to_live_count: 0 }],
+  ]);
   const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
     blocked({ kind: "git-uncommitted" }),
@@ -476,7 +488,9 @@ test("predicate 6.5 skipped when epic.status !== 'done' (close-row path)", () =>
     status: "open",
     approval: "pending",
   });
-  const gitMap = new Map([["/repo", { dirty_count: 5, orphan_count: 0 }]]);
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 5, unattributed_to_live_count: 0 }],
+  ]);
   const snap = run([epic], new Map(), [], gitMap);
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
     blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
@@ -510,7 +524,7 @@ test("predicate 6.5 skipped when no git_status entry for epic.project_dir (close
 // MUST read the live count and verdict `ready`, not block on `git-orphans`.
 // ---------------------------------------------------------------------------
 
-test("fn-626 task arm: terminal worker with stale git_orphan_count > 0 but fresh git_status orphan_count == 0 → does not block on git-orphans", () => {
+test("fn-626 task arm: terminal worker with stale git_orphan_count > 0 but fresh git_status unattributed_to_live_count == 0 → does not block on git-orphans", () => {
   // The witnessed bug: epic 623 task 1's worker (state=ended) carried
   // git_orphan_count=2 frozen on terminal transition, but the live
   // git_status row for /Users/mike/code/keeper correctly says 0. Predicate
@@ -538,14 +552,16 @@ test("fn-626 task arm: terminal worker with stale git_orphan_count > 0 but fresh
   const epic = makeEpic({ tasks: [task] });
   // Live `git_status` row for /repo reports clean — the project-wide
   // state has moved on since the worker froze its per-job counts.
-  const gitMap = new Map([["/repo", { dirty_count: 0, orphan_count: 0 }]]);
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
+  ]);
   const snap = run([epic], new Map(), [], gitMap);
   const verdict = snap.perTask.get(task.task_id);
   expect(verdict).toEqual(blocked({ kind: "job-pending" }));
   expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
 });
 
-test("fn-626 close-row arm: stale embedded close-verb git_orphan_count > 0 but fresh git_status orphan_count == 0 → does not block on git-orphans", () => {
+test("fn-626 close-row arm: stale embedded close-verb git_orphan_count > 0 but fresh git_status unattributed_to_live_count == 0 → does not block on git-orphans", () => {
   // Mirror of the task-arm regression for the close row. Epic.status="done"
   // with a terminal close-verb embedded job carrying frozen
   // git_orphan_count=2, but the live `git_status` for the epic's
@@ -569,13 +585,75 @@ test("fn-626 close-row arm: stale embedded close-verb git_orphan_count > 0 but f
       }),
     ],
   });
-  const gitMap = new Map([["/repo", { dirty_count: 0, orphan_count: 0 }]]);
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
+  ]);
   const snap = run([epic], new Map(), [], gitMap);
   const verdict = snap.perCloseRow.get(epic.epic_id);
   // Live count is 0 → predicate 6.5 doesn't fire. Falls through to 7
   // (epic.approval="pending", epic.status="done") → job-pending. The
   // load-bearing assertion is that `git-orphans` does NOT fire on the
   // stale per-job count.
+  expect(verdict).toEqual(blocked({ kind: "job-pending" }));
+  expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
+});
+
+// ---------------------------------------------------------------------------
+// fn-633.7 acceptance: predicate 6.5 sources from `unattributed_to_live_count`
+// (the renamed legacy v28 "orphan" column under its honest new name), not
+// from the new strict-mystery `git_orphan_count`. The strict-mystery column
+// is informational only at v31 — it captures truly orphan files (no
+// attribution from ANY session past or present) and surfaces in
+// `scripts/git.ts` for human inspection, but does NOT block readiness.
+// ---------------------------------------------------------------------------
+
+test("fn-633.7 task arm: strict-mystery orphan_count > 0 with unattributed_to_live_count == 0 does NOT block predicate 6.5", () => {
+  // The readiness map only carries `unattributed_to_live_count` (the
+  // legacy v28 "orphan" semantic). The new schema-v31 strict-mystery
+  // `git_orphan_count` on the wire is not projected into the map by
+  // design — it's informational only. So a project with strict-mystery
+  // orphans but zero unattributed-to-live files must NOT trigger
+  // predicate 6.5; the row falls through to predicate 7.
+  //
+  // Concretely: the readiness map is the only signal predicate 6.5
+  // reads, and it carries `unattributed_to_live_count: 0`. The test
+  // asserts the predicate does not block — that's the v31 contract:
+  // strict-mystery is informational, only unattributed-to-live blocks.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
+  ]);
+  const snap = run([epic], new Map(), [], gitMap);
+  const verdict = snap.perTask.get(task.task_id);
+  // Predicate 6.5 does not fire; falls through to 7 (`job-pending`)
+  // because `worker_phase==="done"` and `approval==="pending"`.
+  expect(verdict).toEqual(blocked({ kind: "job-pending" }));
+  expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
+});
+
+test("fn-633.7 close-row arm: strict-mystery orphan_count > 0 with unattributed_to_live_count == 0 does NOT block predicate 6.5", () => {
+  // Close-row mirror of the task-arm test. Same v31 contract: only
+  // `unattributed_to_live_count > 0` triggers `git-orphans`; the
+  // strict-mystery column on the wire is informational only.
+  const task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+  });
+  const epic = makeEpic({
+    tasks: [task],
+    status: "done",
+    approval: "pending",
+  });
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
+  ]);
+  const snap = run([epic], new Map(), [], gitMap);
+  const verdict = snap.perCloseRow.get(epic.epic_id);
   expect(verdict).toEqual(blocked({ kind: "job-pending" }));
   expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
 });

@@ -29,9 +29,9 @@
  *                                  — task (gated worker_phase==="done"): look up the live `git_status`
  *                                    row for `task.target_repo ?? epic.project_dir` via
  *                                    `gitStatusByProjectDir`; if its dirty_count > 0 → git-uncommitted,
- *                                    else if orphan_count > 0 → git-orphans. Skipped when no entry
- *                                    exists for the root (no snapshot yet, or simulator's empty map)
- *                                    or worker_phase !== "done".
+ *                                    else if unattributed_to_live_count > 0 → git-orphans. Skipped
+ *                                    when no entry exists for the root (no snapshot yet, or
+ *                                    simulator's empty map) or worker_phase !== "done".
  *                                    close (gated epic.status==="done"): same idea keyed by
  *                                    `epic.project_dir`. Mechanical gate that lifts the inferred git
  *                                    cleanliness check out of /plan:approve's LLM cascade into
@@ -44,6 +44,19 @@
  *                                    project-wide `git_status` row (not the embedded per-job count
  *                                    columns) — those columns freeze on terminal worker transition
  *                                    while the project's git state may have moved on.
+ *                                    The block-reason `kind` is `git-orphans` (preserved for
+ *                                    backward compatibility with autopilot's reason enumeration —
+ *                                    `scripts/autopilot.ts:230,238,449` consume the literal
+ *                                    string), but the underlying signal is the schema-v31
+ *                                    `git_unattributed_to_live_count` column (the legacy v28
+ *                                    "orphan" semantic preserved under its new name — dirty files
+ *                                    no live session is on the hook for). The new strict-mystery
+ *                                    `git_orphan_count` column (files with ZERO active
+ *                                    attribution from any tracked session) is INFORMATIONAL ONLY
+ *                                    at v31 — not a block reason, not a predicate; it surfaces in
+ *                                    `scripts/git.ts` for human inspection. See the
+ *                                    `gitStatusByProjectDir` doc on `computeReadiness` below for
+ *                                    the column-name-vs-reason-kind divergence rationale.
  *   7. own-approval-pending        — task.approval==="pending" && status==="done" → job-pending
  *                                    close: epic.approval==="pending" && epic.status==="done" → job-pending
  *                                    Deliberately ranks BELOW 5/6: `worker_phase==="done"` is stamped
@@ -95,10 +108,18 @@ import type { Epic, Job, SubagentInvocation, Task } from "./types";
  *                                        payload-less by design — see the predicate-pipeline docstring
  *                                        for the rationale on placement).
  * - `git-orphans`                      — the live `git_status` row for this row's project root has
- *                                        `orphan_count > 0` (mechanical gate inserted at rank 6.5;
- *                                        payload-less by design — complements `git-uncommitted` and
- *                                        fires when dirty count is zero but the project has orphan
- *                                        files).
+ *                                        `unattributed_to_live_count > 0` (mechanical gate inserted
+ *                                        at rank 6.5; payload-less by design — complements
+ *                                        `git-uncommitted` and fires when dirty count is zero but
+ *                                        the project has dirty files no LIVE session is on the hook
+ *                                        for). The reason kind string stays `git-orphans` for
+ *                                        backward compatibility with autopilot's literal
+ *                                        comparisons (`scripts/autopilot.ts:230,238,449`); the
+ *                                        underlying column is the schema-v31 rename
+ *                                        `git_unattributed_to_live_count` (legacy v28 "orphan"
+ *                                        semantic preserved). The new strict-mystery
+ *                                        `git_orphan_count` (zero-attribution from any session)
+ *                                        is informational only at v31 and does not feed this kind.
  * - `dep-on-task`                      — an upstream task is not completed (carries the upstream id).
  * - `dep-on-epic`                      — an upstream epic's close is not completed.
  * - `single-task-per-epic`             — lost the per-epic mutex (a sibling row in the same epic is non-completed).
@@ -179,9 +200,23 @@ export function computeReadiness(
   // embedded worker job — those columns only refresh while the job is in
   // `state IN ('working','stopped')` and freeze on terminal transition,
   // so the live `git_status` row is the honest source of truth.
+  //
+  // Schema-v31 column-name-vs-reason-kind divergence: the field
+  // `unattributed_to_live_count` on this map sources the schema-v31
+  // `jobs.git_unattributed_to_live_count` column (renamed from the
+  // legacy v28 `git_orphan_count`; same value, more honest name — "dirty
+  // files no LIVE session is on the hook for"). The block-reason kind is
+  // STILL `git-orphans` because autopilot's reason enumeration
+  // (`scripts/autopilot.ts:230,238,449`) consumes the literal string
+  // `"git-orphans"`; flipping the kind would ripple through every
+  // consumer without semantic benefit. The new strict-mystery
+  // `git_orphan_count` column (files with ZERO active attribution from
+  // any session past or present) is informational only at v31 — not
+  // projected into this map, not consulted by any predicate. If
+  // strict-mystery ever needs to block, that's a separate refinement.
   gitStatusByProjectDir: Map<
     string,
-    { dirty_count: number; orphan_count: number }
+    { dirty_count: number; unattributed_to_live_count: number }
   > = new Map(),
 ): ReadinessSnapshot {
   // Build a job_id → SubagentInvocation[] index so predicate 6 is O(1) per row.
@@ -280,7 +315,7 @@ function evaluateTask(
   _perCloseRow: Map<string, Verdict>,
   gitStatusByProjectDir: Map<
     string,
-    { dirty_count: number; orphan_count: number }
+    { dirty_count: number; unattributed_to_live_count: number }
   >,
 ): Verdict {
   // 1. terminal-completed. Schema v19: read the derived worker-phase binary
@@ -326,8 +361,9 @@ function evaluateTask(
 
   // 6.5. git-uncommitted / git-orphans — mechanical gate that blocks autopilot's
   // /plan:approve dispatch when the worker's worktree has uncommitted dirty
-  // files or the project has orphan files. Lifted from the /plan:approve
-  // skill's inferred LLM-as-judge cascade into this deterministic predicate.
+  // files or the project has dirty files no live session is on the hook for.
+  // Lifted from the /plan:approve skill's inferred LLM-as-judge cascade into
+  // this deterministic predicate.
   //
   // Gated on `worker_phase==="done"` (planctl stamped `worker_done_at`): the
   // task hasn't reached the approval window before that, so the git state
@@ -338,13 +374,23 @@ function evaluateTask(
   //
   // Source of counts: the live, project-wide `git_status` row keyed by
   // `task.target_repo ?? epic.project_dir` (mirrors `effectiveRoot`'s
-  // task-row resolution). The per-job `git_dirty_count`/`git_orphan_count`
-  // columns are a historical record of what each job's last live tick saw
-  // and freeze on terminal transition — reading them here would produce
-  // false `git-orphans` blocks against a since-clean tree. A missing map
-  // entry (no `git_status` snapshot for this root yet, or the autopilot
+  // task-row resolution). The per-job `git_dirty_count` /
+  // `git_unattributed_to_live_count` columns on the embedded jobs[] are a
+  // historical record of what each job's last live tick saw and freeze on
+  // terminal transition — reading them here would produce false
+  // `git-orphans` blocks against a since-clean tree. A missing map entry
+  // (no `git_status` snapshot for this root yet, or the autopilot
   // simulator's deliberately-empty map) → skip the predicate and fall
   // through to 7.
+  //
+  // Schema-v31 rename: the `unattributed_to_live_count` field on the
+  // readiness map sources the renamed `git_unattributed_to_live_count`
+  // column (legacy v28 "orphan" semantic, preserved under the new
+  // vocabulary — dirty files no LIVE session is on the hook for). The
+  // block-reason kind is `git-orphans` (NOT renamed) for backward
+  // compatibility with autopilot consumers — see `gitStatusByProjectDir`'s
+  // doc on `computeReadiness` for the column-name-vs-reason-kind
+  // divergence rationale.
   if (task.worker_phase === "done") {
     const root = task.target_repo ?? epic.project_dir;
     const gs = root === null ? undefined : gitStatusByProjectDir.get(root);
@@ -352,7 +398,7 @@ function evaluateTask(
       if (gs.dirty_count > 0) {
         return { tag: "blocked", reason: { kind: "git-uncommitted" } };
       }
-      if (gs.orphan_count > 0) {
+      if (gs.unattributed_to_live_count > 0) {
         return { tag: "blocked", reason: { kind: "git-orphans" } };
       }
     }
@@ -426,7 +472,7 @@ function evaluateCloseRow(
   perTask: Map<string, Verdict>,
   gitStatusByProjectDir: Map<
     string,
-    { dirty_count: number; orphan_count: number }
+    { dirty_count: number; unattributed_to_live_count: number }
   >,
 ): Verdict {
   // 1. terminal-completed (close-row variant).
@@ -491,9 +537,16 @@ function evaluateCloseRow(
   //
   // Source of counts: the live, project-wide `git_status` row keyed by
   // `epic.project_dir` (no per-row override on the synthetic close row).
-  // Same rationale as the task path — the per-job `git_dirty_count`
-  // /`git_orphan_count` columns freeze on terminal transition; the live
-  // `git_status` row is the honest source of truth.
+  // Same rationale as the task path — the per-job `git_dirty_count` /
+  // `git_unattributed_to_live_count` columns freeze on terminal transition;
+  // the live `git_status` row is the honest source of truth.
+  //
+  // Schema-v31 rename: same column-name-vs-reason-kind divergence as the
+  // task path — read `unattributed_to_live_count` (the renamed legacy v28
+  // "orphan" column under its honest new name) but emit the unchanged
+  // `git-orphans` reason kind for autopilot backward compatibility. See
+  // the task path's predicate 6.5 comment and the `gitStatusByProjectDir`
+  // doc on `computeReadiness` for the full rationale.
   if (epic.status === "done") {
     const gs =
       epic.project_dir === null
@@ -503,7 +556,7 @@ function evaluateCloseRow(
       if (gs.dirty_count > 0) {
         return { tag: "blocked", reason: { kind: "git-uncommitted" } };
       }
-      if (gs.orphan_count > 0) {
+      if (gs.unattributed_to_live_count > 0) {
         return { tag: "blocked", reason: { kind: "git-orphans" } };
       }
     }

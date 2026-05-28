@@ -1025,10 +1025,14 @@ export function subscribeReadiness(
   // on terminal worker transition, so reading those at evaluate time
   // produced false `git-orphans` blocks against a since-clean tree. The
   // live `git_status` row is the honest source of truth; we project it
-  // into a `Map<project_dir, {dirty_count, orphan_count}>` and pass it
-  // into `computeReadiness` below. First-paint gate widened to include
-  // this collection so a partial snapshot can't flip the pill on the
-  // pre-paint blank state.
+  // into a `Map<project_dir, {dirty_count, unattributed_to_live_count}>`
+  // and pass it into `computeReadiness` below. The
+  // `unattributed_to_live_count` field carries the schema-v31 legacy
+  // "orphan" semantic (renamed for honesty under `git_unattributed_to_live_count`);
+  // see the projection block below for the column-name-vs-reason-kind
+  // divergence rationale. First-paint gate widened to include this
+  // collection so a partial snapshot can't flip the pill on the pre-paint
+  // blank state.
   const gitStatus = makeState("git", gitSubId, "project_dir", {
     type: "query",
     collection: "git",
@@ -1073,19 +1077,71 @@ export function subscribeReadiness(
     const subsForReadiness = collapseSubagentsByName(subsTyped).map(
       (g) => g.row,
     );
-    // Project the `git_status` rows into the `{dirty_count, orphan_count}`
-    // shape `computeReadiness` consumes. The collection's column is
-    // `orphaned_count`; the readiness map uses the shorter `orphan_count`
-    // alias to match the `BlockReason` kind name (`git-orphans`).
+    // Project the `git_status` rows into the
+    // `{dirty_count, unattributed_to_live_count}` shape `computeReadiness`
+    // consumes. The `dirty_count` is the direct column read; the
+    // `unattributed_to_live_count` is the schema-v31 legacy v28 "orphan"
+    // semantic (renamed for honesty — "dirty files no LIVE session is on
+    // the hook for") and feeds readiness predicate 6.5's `git-orphans`
+    // block reason. Note the deliberate column-name-vs-reason-kind
+    // divergence: the readiness reason kind is STILL `git-orphans`
+    // (preserved for backward compatibility with autopilot's literal
+    // string comparisons in `scripts/autopilot.ts:230,238,449`); only the
+    // underlying column the count is sourced from gets the more honest
+    // name. See `gitStatusByProjectDir`'s doc on `computeReadiness` for
+    // the rationale.
+    //
+    // The `git_status.orphaned_count` column on the wire carries the NEW
+    // schema-v31 strict-mystery semantic (files with ZERO active
+    // attribution from any tracked session — same value as
+    // `jobs.git_orphan_count`); it is INFORMATIONAL ONLY at v31 and is
+    // NOT projected into the readiness map. To recover the legacy
+    // unattributed-to-live count for readiness, we compute it
+    // client-side from the per-file `attributions[]` materialized view
+    // on `git_status.dirty_files`: a dirty file counts toward
+    // `unattributed_to_live_count` when its `attributions[]` contains no
+    // entry with `state IN ('working', 'stopped')`. The mirror of the
+    // reducer's PASS-4 fan-out computation (`src/reducer.ts:1442-1463`),
+    // redone here from the same materialized JSON the reducer wrote so
+    // both numbers reconcile.
     const gitTyped = projectRows<GitStatus>(gitStatus);
     const gitStatusByProjectDir = new Map<
       string,
-      { dirty_count: number; orphan_count: number }
+      { dirty_count: number; unattributed_to_live_count: number }
     >();
+    const LIVE_ATTRIBUTION_STATES = new Set(["working", "stopped"]);
     for (const row of gitTyped) {
+      // Walk `dirty_files[].attributions[]` and count files with no live
+      // attribution. Defensive parsing: every nested field is `unknown`
+      // at the wire boundary, so guard each access (no-attribution rows
+      // count, malformed rows fall through to no-attribution by design —
+      // mirrors the reducer's "fold must never throw" safe-value
+      // discipline).
+      let unattributedToLive = 0;
+      for (const file of row.dirty_files) {
+        if (typeof file !== "object" || file === null) {
+          unattributedToLive++;
+          continue;
+        }
+        const attrs = (file as { attributions?: unknown }).attributions;
+        if (!Array.isArray(attrs) || attrs.length === 0) {
+          unattributedToLive++;
+          continue;
+        }
+        let hasLive = false;
+        for (const a of attrs) {
+          if (typeof a !== "object" || a === null) continue;
+          const state = (a as { state?: unknown }).state;
+          if (typeof state === "string" && LIVE_ATTRIBUTION_STATES.has(state)) {
+            hasLive = true;
+            break;
+          }
+        }
+        if (!hasLive) unattributedToLive++;
+      }
       gitStatusByProjectDir.set(row.project_dir, {
         dirty_count: row.dirty_count,
-        orphan_count: row.orphaned_count,
+        unattributed_to_live_count: unattributedToLive,
       });
     }
     const readiness = computeReadiness(
