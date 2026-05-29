@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { extractCommit, parseSessionIdTrailer } from "../src/derivers";
 import {
   buildGitSnapshot,
+  decideHeadDivergence,
   type GitDirtyFile,
   parsePorcelainV2,
   resolveHeadOidViaFs,
@@ -606,4 +607,63 @@ test("resolveHeadOidViaFs returns null on a non-repo path (fail-safe)", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// decideHeadDivergence — pure decision for the emitSnapshot wedge guard. Suppress
+// (and eventually trip) ONLY when git-derived HEAD and fs-derived HEAD disagree;
+// fail OPEN on uncertainty (null fs head) so real data is never withheld.
+// ---------------------------------------------------------------------------
+
+const A = "a".repeat(40);
+const B = "b".repeat(40);
+const GRACE = 90_000;
+
+test("decideHeadDivergence: agreement is not divergent and clears the timer", () => {
+  expect(decideHeadDivergence(A, A, 1000, 5000, GRACE)).toEqual({
+    suppress: false,
+    sinceMs: null,
+    trip: false,
+  });
+});
+
+test("decideHeadDivergence: null git or null fs head fails open (trust git, reset)", () => {
+  expect(decideHeadDivergence(null, A, 1000, 5000, GRACE).suppress).toBe(false);
+  // fsHead null = can't verify → never suppress real data, never escalate.
+  expect(decideHeadDivergence(A, null, 1000, 5000, GRACE)).toEqual({
+    suppress: false,
+    sinceMs: null,
+    trip: false,
+  });
+});
+
+test("decideHeadDivergence: first divergence suppresses and stamps sinceMs=now, no trip", () => {
+  const d = decideHeadDivergence(A, B, null, 5000, GRACE);
+  expect(d.suppress).toBe(true);
+  expect(d.sinceMs).toBe(5000);
+  expect(d.trip).toBe(false);
+});
+
+test("decideHeadDivergence: ongoing divergence carries sinceMs forward until the grace window elapses", () => {
+  // 30s in — still within grace.
+  expect(decideHeadDivergence(A, B, 5000, 35_000, GRACE)).toEqual({
+    suppress: true,
+    sinceMs: 5000,
+    trip: false,
+  });
+  // exactly grace later — trips.
+  expect(decideHeadDivergence(A, B, 5000, 5000 + GRACE, GRACE)).toEqual({
+    suppress: true,
+    sinceMs: 5000,
+    trip: true,
+  });
+});
+
+test("decideHeadDivergence: a transient blip (commit race) that re-agrees never trips", () => {
+  // Divergent at t=5000 (commit just landed, worker not yet caught up)...
+  const blip = decideHeadDivergence(A, B, null, 5000, GRACE);
+  expect(blip.suppress).toBe(true);
+  // ...then the next read agrees → reset, so the grace timer never accumulates.
+  const recovered = decideHeadDivergence(B, B, blip.sinceMs, 5500, GRACE);
+  expect(recovered).toEqual({ suppress: false, sinceMs: null, trip: false });
 });

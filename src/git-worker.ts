@@ -179,15 +179,16 @@ const DB_POLL_MS = 100;
 const HEARTBEAT_MS = 60_000;
 const GIT_TIMEOUT_MS = 2000;
 /**
- * Consecutive heartbeats the worker's `git`-derived HEAD may disagree with the
- * fs-derived HEAD before the divergence watchdog escalates. At one check per
- * `HEARTBEAT_MS`, `2` means ~1–2 min of CONFIRMED staleness — long enough to
- * ride out the sub-second window where a commit lands between the heartbeat's
- * `readStatus` and the watchdog's ref read, short enough that a genuine wedge
- * is recovered before agents lose trust in the surface. See
- * {@link resolveHeadOidViaFs}.
+ * How long the worker's `git`-derived HEAD may CONTINUOUSLY disagree with the
+ * fs-derived HEAD before the divergence watchdog escalates (`process.exit(1)`
+ * → LaunchAgent restart). During the window every divergent snapshot is
+ * SUPPRESSED — see {@link decideHeadDivergence} and the gate in `emitSnapshot`.
+ * 90s rides out the sub-second window where a commit lands between `readStatus`
+ * and the fs ref read (a healthy commit reconciles within one debounce), while
+ * recovering a genuine wedge before agents lose trust in the surface. Measured
+ * on the monotonic clock (`performance.now()`), never wall-time.
  */
-const HEAD_DIVERGENCE_LIMIT = 2;
+const HEAD_DIVERGENCE_GRACE_MS = 90_000;
 
 /**
  * Positive ignore globs for `@parcel/watcher`. Mirrors `plan-worker.ts`'s
@@ -392,8 +393,8 @@ function gitCommonDirFor(root: string): string | null {
 
 /**
  * Resolve a worktree's current HEAD oid by reading the git ref files DIRECTLY
- * via `fs` — never shelling out to `git`. This is the {@link checkHeadDivergence}
- * watchdog's independent ground truth.
+ * via `fs` — never shelling out to `git`. This is the {@link decideHeadDivergence}
+ * wedge guard's independent ground truth (see `snapshotSuppressedByDivergence`).
  *
  * *Why fs and not `git rev-parse`:* the failure mode this guards against is a
  * long-running worker whose `git` subprocess invocations silently return a
@@ -463,6 +464,47 @@ export function resolveHeadOidViaFs(root: string): string | null {
     // Any fs/parse failure → "unknown", never escalate. Pure best-effort.
     return null;
   }
+}
+
+/**
+ * Pure decision for the `emitSnapshot` HEAD-divergence gate (the wedge guard).
+ * Split out from the worker closure so it is unit-testable and deterministic.
+ *
+ * The wedge: keeper's long-lived git-worker thread can start returning a STALE
+ * `git status` view (frozen HEAD + dirty set) for many minutes while the same
+ * process's `fs` reads stay fresh — a `Bun.spawnSync`/long-Worker boundary
+ * defect we could not minimally reproduce, so we DETECT-AND-PREVENT rather than
+ * cure. `gitHead` is what `readStatus` just reported; `fsHead` is
+ * {@link resolveHeadOidViaFs} (the trusted ground truth).
+ *
+ * - Agreement, or `fsHead == null` (can't verify — fail OPEN, trust git), or a
+ *   null `gitHead`: not divergent. `suppress=false`, `sinceMs=null` (reset the
+ *   timer), `trip=false`.
+ * - Divergence: `suppress=true` — the caller must NOT emit this snapshot,
+ *   enumerate its commits, or advance any head cache (the payload is untrusted,
+ *   a data-INTEGRITY failure, not just staleness). `sinceMs` is the monotonic
+ *   start of the current divergence run (carried in from prior state, or
+ *   `nowMs` on first divergence). `trip=true` once it has persisted ≥ `graceMs`
+ *   — the caller then exits for a LaunchAgent restart, the only honest recovery.
+ */
+export interface HeadDivergenceDecision {
+  suppress: boolean;
+  sinceMs: number | null;
+  trip: boolean;
+}
+
+export function decideHeadDivergence(
+  gitHead: string | null,
+  fsHead: string | null,
+  priorSinceMs: number | null,
+  nowMs: number,
+  graceMs: number,
+): HeadDivergenceDecision {
+  if (gitHead == null || fsHead == null || gitHead === fsHead) {
+    return { suppress: false, sinceMs: null, trip: false };
+  }
+  const sinceMs = priorSinceMs ?? nowMs;
+  return { suppress: true, sinceMs, trip: nowMs - sinceMs >= graceMs };
 }
 
 function readStatus(root: string): ParsedGitStatus | null {
@@ -794,14 +836,14 @@ function startWorker(): void {
   const schedulers = new Map<string, RescanScheduler>();
   const cwdRootCache = new Map<string, string | null>();
   /**
-   * Per-root run of consecutive heartbeats on which the worker's `git`-derived
-   * HEAD ({@link lastHeadOidByRoot}) disagreed with the fs-derived HEAD. Reset
-   * to 0 the moment they agree (or the fs read can't determine truth). Escalates
-   * via {@link checkHeadDivergence} once a root reaches {@link
-   * HEAD_DIVERGENCE_LIMIT}. See the divergence-watchdog rationale on
-   * {@link resolveHeadOidViaFs}.
+   * Per-root monotonic timestamp (`performance.now()` ms) at which the worker's
+   * `git`-derived HEAD first diverged from the fs-derived HEAD and has stayed
+   * divergent since. `undefined`/absent means "in agreement". Cleared the moment
+   * git and fs agree (or fs can't be resolved). The `emitSnapshot` gate reads
+   * this to suppress divergent snapshots and to escalate after
+   * {@link HEAD_DIVERGENCE_GRACE_MS}. See {@link decideHeadDivergence}.
    */
-  const headDivergenceByRoot = new Map<string, number>();
+  const headDivergentSinceByRoot = new Map<string, number>();
 
   let watcherModule: typeof import("@parcel/watcher") | null = null;
   let dbPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -826,6 +868,19 @@ function startWorker(): void {
       return;
     }
     if (status == null) return;
+
+    // Wedge guard (data-integrity gate). The long-lived git subprocess can
+    // start returning a STALE view (frozen head + dirty set) while fs reads in
+    // this same process stay fresh; emitting it surfaces committed-clean files
+    // as phantom dirty <orphan> across every repo. Cross-check the just-read
+    // git HEAD against the fs-derived truth BEFORE trusting the payload, and on
+    // divergence suppress everything below (no emit, no commit enumeration, no
+    // head-cache advance) — see snapshotSuppressedByDivergence. Runs here on the
+    // live emit path because the 60s heartbeat proved unreliable during a real
+    // wedge (it never fired).
+    if (snapshotSuppressedByDivergence(root, status.head_oid)) {
+      return;
+    }
 
     // HEAD-oid delta detection — runs BEFORE the snapshot emission so a
     // commit's discharge lands before the next observed dirty count. The
@@ -897,49 +952,59 @@ function startWorker(): void {
   }
 
   /**
-   * Divergence watchdog. Runs once per heartbeat, AFTER that heartbeat's
-   * `emitSnapshot` pass has refreshed {@link lastHeadOidByRoot} from a live
-   * `git status`. For each subscribed root it compares the worker's
-   * `git`-derived HEAD against {@link resolveHeadOidViaFs} (an fs-only read,
-   * immune to the stale-`git`-subprocess wedge this guards against). A root that
-   * stays divergent for {@link HEAD_DIVERGENCE_LIMIT} consecutive heartbeats is
-   * proof the worker's `git` view is wedged — there is no honest in-process
-   * recovery (the same wedged `git` produced the bad snapshot), so we escalate
-   * the worker-contract way: log + `process.exit(1)`, which surfaces as the
-   * worker's `close` event in main → `fatalExit` → LaunchAgent restart. A fresh
-   * process re-seeds HEAD correctly (verified: a bounce clears the wedge in
-   * ~30s). NEVER respawn in-process — that violates the no-self-heal invariant.
+   * Wedge guard, called by `emitSnapshot` on the LIVE emit path (the proven path
+   * — it's the one producing snapshots; the 60s heartbeat alone proved
+   * unreliable, it never fired during a real wedge). Returns `true` when this
+   * snapshot must be SUPPRESSED: the just-read `gitHead` disagrees with the
+   * fs-derived ground truth ({@link resolveHeadOidViaFs}), so the whole
+   * `git status` payload is untrusted — a data-INTEGRITY failure, not mere
+   * staleness. The caller must then NOT emit, NOT enumerate commits, and NOT
+   * advance any head cache.
    *
-   * `resolveHeadOidViaFs` returning `null` (unresolvable ref shape) or a missing
-   * `lastHeadOidByRoot` entry (root never snapshotted) resets the run to 0 —
-   * the watchdog only counts CONFIRMED divergence, never uncertainty.
+   * Persistence is tracked on the monotonic clock in {@link
+   * headDivergentSinceByRoot}. Once divergence has held ≥ {@link
+   * HEAD_DIVERGENCE_GRACE_MS} the worker `process.exit(1)`s → `close` event in
+   * main → `fatalExit` → LaunchAgent restart (a fresh process re-seeds HEAD
+   * correctly; verified a bounce clears the wedge in ~30s). NEVER respawn
+   * in-process — the no-self-heal invariant. Logs once at onset and once at trip
+   * (rate-limited — not every suppressed emit). Agreement / unresolvable fs head
+   * clears the timer; we never escalate on uncertainty.
    */
-  function checkHeadDivergence(): void {
-    if (shuttingDown) return;
-    for (const root of subscriptions.keys()) {
-      const workerHead = lastHeadOidByRoot.get(root);
-      const fsHead = resolveHeadOidViaFs(root);
-      if (workerHead == null || fsHead == null || workerHead === fsHead) {
-        headDivergenceByRoot.set(root, 0);
-        continue;
-      }
-      const run = (headDivergenceByRoot.get(root) ?? 0) + 1;
-      headDivergenceByRoot.set(root, run);
-      console.error(
-        `[git-worker] HEAD divergence for ${root}: git=${workerHead.slice(0, 12)} fs=${fsHead.slice(0, 12)} (run ${run}/${HEAD_DIVERGENCE_LIMIT})`,
-      );
-      if (run >= HEAD_DIVERGENCE_LIMIT) {
-        console.error(
-          `[git-worker] HEAD divergence watchdog tripped for ${root} — git subprocess view is wedged; exiting for LaunchAgent restart`,
-        );
-        try {
-          db.close();
-        } catch {
-          // best-effort — process is exiting anyway
-        }
-        process.exit(1);
-      }
+  function snapshotSuppressedByDivergence(
+    root: string,
+    gitHead: string | null,
+  ): boolean {
+    const fsHead = resolveHeadOidViaFs(root);
+    const prior = headDivergentSinceByRoot.get(root) ?? null;
+    const decision = decideHeadDivergence(
+      gitHead,
+      fsHead,
+      prior,
+      performance.now(),
+      HEAD_DIVERGENCE_GRACE_MS,
+    );
+    if (!decision.suppress) {
+      headDivergentSinceByRoot.delete(root);
+      return false;
     }
+    headDivergentSinceByRoot.set(root, decision.sinceMs as number);
+    if (prior == null) {
+      console.error(
+        `[git-worker] HEAD divergence for ${root}: git=${(gitHead ?? "null").slice(0, 12)} fs=${(fsHead ?? "null").slice(0, 12)} — suppressing snapshots (grace ${HEAD_DIVERGENCE_GRACE_MS}ms)`,
+      );
+    }
+    if (decision.trip) {
+      console.error(
+        `[git-worker] HEAD divergence watchdog tripped for ${root} after ${Math.round((performance.now() - (decision.sinceMs as number)) / 1000)}s — git subprocess view is wedged; exiting for LaunchAgent restart`,
+      );
+      try {
+        db.close();
+      } catch {
+        // best-effort — process is exiting anyway
+      }
+      process.exit(1);
+    }
+    return true;
   }
 
   async function subscribeRoot(root: string): Promise<void> {
@@ -1160,11 +1225,12 @@ function startWorker(): void {
       heartbeatTimer = setInterval(() => {
         if (shuttingDown) return;
         void reconcileRoots();
+        // emitSnapshot self-gates via snapshotSuppressedByDivergence, so the
+        // heartbeat doubles as the quiet-repo backstop for the wedge guard —
+        // even with no file/commit activity it re-checks divergence and drives
+        // the eventual restart. (The primary trigger is the live watcher/
+        // db-poll emit path, since this 60s timer proved unreliable mid-wedge.)
         for (const root of subscriptions.keys()) emitSnapshot(root);
-        // Watchdog runs LAST — after this cycle's snapshots refreshed the
-        // worker's git-derived HEAD — so a healthy heartbeat that self-corrects
-        // resets the divergence run before it can be counted.
-        checkHeadDivergence();
       }, HEARTBEAT_MS);
     })
     .catch((err) => {
