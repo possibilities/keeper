@@ -30,8 +30,9 @@ from pathlib import Path
 # — NOT ``PRAGMA user_version`` (which keeper leaves at 0).  The
 # ``file_attributions`` / ``git_status`` shape this reader depends on landed in
 # v31 (fn-633); v32 (fn-634 ``default_visible``) is additive and doesn't touch
-# it.  Bump this set when a keeper schema change alters those tables.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32})
+# it; v33 (fn-639 ``profiles``) is additive and doesn't touch it.  Bump this
+# set when a keeper schema change alters those tables.
+SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33})
 
 
 class KeeperError(Exception):
