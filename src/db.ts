@@ -262,6 +262,30 @@ export function resolveUsageRoot(): string {
 }
 
 /**
+ * Resolve the keeper dead-letter directory (fn-643). `KEEPER_DEAD_LETTER_DIR`
+ * env wins (hermetic tests point it at a tmp dir, mirroring the hook's
+ * matching override); otherwise default to `~/.local/state/keeper/dead-letters`,
+ * a sibling of the DB file. The directory may not exist at daemon boot on a
+ * fresh machine (the hook only creates it on a dropped INSERT); the
+ * dead-letter worker tolerates absence — see the worker's existsSync guard.
+ *
+ * MUST match `resolveDeadLetterDir` in `plugin/hooks/events-writer.ts`
+ * byte-for-byte — the hook is the sole writer of the NDJSON files and the
+ * daemon is the sole reader, so a divergence would silently lose dead-letter
+ * visibility. The hook keeps its own local copy because the hook is
+ * forbidden from importing `bun:sqlite` (CLAUDE.md "No third-party deps in
+ * the hook"); `src/db.ts` carries this duplicate for the daemon-side
+ * import surface.
+ */
+export function resolveDeadLetterDir(): string {
+  const override = process.env.KEEPER_DEAD_LETTER_DIR;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "dead-letters");
+}
+
+/**
  * SQLite default `SQLITE_MAX_VARIABLE_NUMBER` is 999 — `IN (?,?,...)` binds
  * one variable per id. Callers of `selectByIds` (`src/collections.ts`) must
  * chunk past this cap or cap their input. The server-worker page sizes
