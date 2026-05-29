@@ -39,14 +39,21 @@
  *    the matching `dispatchedKeys` set so a session-ended → verdict-
  *    flips-back-to-ready cycle cannot open a second Ghostty window.
  *   `{"kind":"completed", ts, verb, id, pid?}` — written by
- *    `detectJobTransitions` the first time the embedded job for the
- *    dispatched `(verb, id)` is observed in a terminal state
- *    (`state === "ended" | "killed"`). Migrates the row from
- *    `--- current ---` to `--- completed ---`. ALSO triggers the
- *    `closeWindow(entry.windowId)` auto-close at this edge (both the
- *    terminal-state branch and the disappearance branch), reaping the
- *    Ghostty window in lockstep with the dispatch's terminal state so
- *    the human's screen doesn't accumulate parked surfaces.
+ *    `detectJobTransitions` the first time the dispatched `(verb, id)`
+ *    is observed completed on EITHER axis: (a) the embedded job reaches
+ *    a terminal session state (`state === "ended" | "killed"`), or (b)
+ *    the job is parked at `state === "stopped"` AND the row's board
+ *    readiness verdict is already `{ tag: "completed" }` — the same
+ *    signal `board.ts` stamps `[completed]` on (worker done + approved,
+ *    or epic done + approved). Migrates the row from `--- current ---`
+ *    to `--- completed ---`. ALSO triggers the
+ *    `closeWindow(entry.windowId)` auto-close at this edge (terminal-
+ *    state branch, stopped-and-board-complete branch, AND the
+ *    disappearance branch), reaping the Ghostty window in lockstep with
+ *    the work actually being done so the human's screen doesn't
+ *    accumulate parked surfaces. Branch (b) is what reaps a finished-
+ *    and-approved worker that would otherwise linger at `stopped` (and
+ *    keep its window open) until the human closed it by hand.
  *
  * The frame has four named-header sections, each emitted only when
  * non-empty, rendered in this order: `--- current ---`, `--- queued ---`,
@@ -236,11 +243,14 @@ in detectJobTransitions migrates it to '--- completed ---' on the
 first post-startup snapshot.
 
 Within a run, dispatches partition three ways: rows observed
-terminal (state in {ended, killed}) — OR (post-fulfillment)
-disappeared from the snapshot — render under '--- completed ---';
-rows observed registered but not yet terminal render under
-'--- current ---'; rows still waiting on the agent to boot render
-under '--- queued ---'. In wet mode queued is transient (~1-3 frames
+completed render under '--- completed ---' — completed means the
+session went terminal (state in {ended, killed}), OR it is parked at
+'stopped' while the row's board readiness verdict is already
+[completed] (same semantics as board.ts: worker done + approved, or
+epic done + approved), OR (post-fulfillment) its job disappeared from
+the snapshot; rows observed registered but not yet completed render
+under '--- current ---'; rows still waiting on the agent to boot
+render under '--- queued ---'. In wet mode queued is transient (~1-3 frames
 before SessionStart folds); in dry mode it persists for the lifetime
 of the run, and dry launches are deliberately NOT restored across
 runs since they can never reach fulfillment. The JSONL log at
@@ -248,12 +258,15 @@ runs since they can never reach fulfillment. The JSONL log at
 (every dispatch), 'window' (the freshly-spawned Ghostty window's
 stable id, emitted right after the osascript spawn returns),
 'fulfilled' (first observation of the registered session), and
-'completed' (first observation of the session in a terminal state OR
-first post-fulfillment disappearance) — and drives both the durable
+'completed' (first observation of completion on any of three axes:
+terminal session state, stopped-while-board-verdict-completed, or
+post-fulfillment disappearance) — and drives both the durable
 re-dispatch guard and the cross-run current-section restore. The
 'completed' edge ALSO fires the Ghostty window auto-close
 (closeWindow on the persisted windowId) so the dispatched window
-exits in lockstep with the underlying agent. A real mid-flight crash
+exits in lockstep with the work actually being done — including the
+stopped-and-approved case, which previously kept its window open
+until the human closed it by hand. A real mid-flight crash
 now preserves '--- current ---' (next run rehydrates it from disk);
 '--- queued ---' is still lost across the crash because a queued
 dispatch has no fulfilled line yet. A new frame is emitted after each
@@ -1136,15 +1149,21 @@ export function predictNextDispatches(
 //     autopilot automation re-fires for it (in this run or any future
 //     run).
 //   - `{"kind":"completed", ts, verb, id, pid?}` — written by
-//     `detectJobTransitions` from EITHER of two triggers:
+//     `detectJobTransitions` from ANY of three triggers:
 //       (a) the matching embedded job is observed in a terminal state
 //           (`"ended"` / `"killed"`); OR
-//       (b) the dispatch was already fulfilled in a prior snapshot and
+//       (b) the matching embedded job is parked at `"stopped"` AND the
+//           row's board readiness verdict is already `{ tag: "completed" }`
+//           (`isDispatchVerdictCompleted` — same `[completed]` semantics
+//           board.ts uses: worker done + approved, or epic done +
+//           approved); OR
+//       (c) the dispatch was already fulfilled in a prior snapshot and
 //           `findSessionJob` now returns `undefined` — the parent epic
 //           has fallen off the default subscription scope (typically
 //           because it's done+approved per `src/collections.ts:251-254`,
-//           or was explicitly `planctl epic-delete`d). Both forms migrate
-//           the row from `--- current ---` to `--- completed ---`.
+//           or was explicitly `planctl epic-delete`d). All three forms
+//           migrate the row from `--- current ---` to `--- completed ---`
+//           and fire `closeWindow`.
 //
 //     The disappearance trigger relies on the all-three-collections
 //     gate in `subscribeReadiness.emitSnapshotIfReady`
@@ -1389,6 +1408,34 @@ export function findSessionJob(
 }
 
 /**
+ * True when the dispatched row's board readiness verdict is
+ * `{ tag: "completed" }` — the SAME signal `board.ts` uses to stamp a
+ * task / close-row `[completed]` pill (task: `worker_phase === "done" &&
+ * approval === "approved"`; close: `epic.status === "done" &&
+ * epic.approval === "approved"`). This is the planctl + approval axis,
+ * independent of the session's lifecycle `state`.
+ *
+ * Id-shape split mirrors `findSessionJob`: a dotted id (`fn-…-foo.1`)
+ * is a task row → read `perTask`; an undotted id (`fn-…-foo`) is the
+ * epic's close row → read `perCloseRow`. So `work` / task-level
+ * `approve` consult the task verdict, and `close` / epic-level
+ * `approve` consult the close-row verdict. A renderer-side lookup miss
+ * (verdict map has no entry) is treated as "not completed".
+ *
+ * Exported so `test/autopilot.test.ts` can pin the id-shape routing
+ * without standing up the subscribe loop.
+ */
+export function isDispatchVerdictCompleted(
+  snap: ReadinessClientSnapshot,
+  id: string,
+): boolean {
+  const verdict = id.includes(".")
+    ? snap.readiness.perTask.get(id)
+    : snap.readiness.perCloseRow.get(id);
+  return verdict?.tag === "completed";
+}
+
+/**
  * Closure-dependency record for `detectJobTransitions`. The function
  * was extracted from `main()` so the new fulfilled-then-disappeared
  * branch could be unit-tested in isolation; the production call site
@@ -1440,17 +1487,23 @@ export interface DetectJobTransitionsDeps {
  *   queued → current      first time a job for (verb, id) is observed
  *                         in the snapshot at all (kind:"fulfilled"
  *                         log line).
- *   current → completed   EITHER first time that job's `state` is
- *                         observed in a terminal value (`"ended"` /
- *                         `"killed"`), OR (post-fulfillment) the
- *                         first time the matching job disappears
- *                         from the snapshot entirely — the parent
- *                         epic has fallen off the default subscription
- *                         scope (typically done+approved per
- *                         `src/collections.ts:251-254`) or was
- *                         `planctl epic-delete`d. Both emit a
- *                         `kind:"completed"` log line with the same
- *                         `{kind, ts, verb, id, pid}` JSON shape.
+ *   current → completed   ANY of three first-observations:
+ *                         (1) the job's `state` reaches a terminal value
+ *                             (`"ended"` / `"killed"`); OR
+ *                         (2) the job is parked at `"stopped"` AND the
+ *                             row's board readiness verdict is already
+ *                             `{ tag: "completed" }` (`board.ts`'s
+ *                             `[completed]` semantics —
+ *                             `isDispatchVerdictCompleted`); OR
+ *                         (3) (post-fulfillment) the matching job
+ *                             disappears from the snapshot entirely —
+ *                             the parent epic fell off the default
+ *                             subscription scope (typically done+approved
+ *                             per `src/collections.ts:251-254`) or was
+ *                             `planctl epic-delete`d.
+ *                         All three emit a `kind:"completed"` log line
+ *                         with the same `{kind, ts, verb, id, pid}` JSON
+ *                         shape and fire `closeWindow(entry.windowId)`.
  *
  * First observation wins for each transition. No-op when nothing
  * changes.
@@ -1537,7 +1590,26 @@ export function detectJobTransitions(
         );
       }
     }
-    if (job.state === "ended" || job.state === "killed") {
+    // Migrate to completed on EITHER axis:
+    //   - terminal: the session lifecycle reached `"ended"` / `"killed"`
+    //     (e.g. the window was closed or the agent crashed). Always
+    //     completes regardless of board verdict — a killed/ended session
+    //     is gone either way.
+    //   - board-verdict: the session is parked at `"stopped"` AND its
+    //     board readiness verdict is already `{ tag: "completed" }` (the
+    //     same signal `board.ts` stamps `[completed]` on — worker done +
+    //     approved, or epic done + approved). This is the fix for
+    //     finished-and-approved workers that linger in `--- current ---`
+    //     until the human closes their window: completing here ALSO
+    //     fires `closeWindow`, so a parked surface is reaped in lockstep
+    //     with the work actually being done. Gated on `state ===
+    //     "stopped"` so an actively-`working` session is never reaped
+    //     mid-flight on a verdict race (board predicate 1
+    //     terminal-completed outranks the running predicates).
+    const terminal = job.state === "ended" || job.state === "killed";
+    const stoppedAndComplete =
+      job.state === "stopped" && isDispatchVerdictCompleted(snap, entry.id);
+    if (terminal || stoppedAndComplete) {
       completedKeys.add(key);
       try {
         appendLine(
@@ -1554,9 +1626,10 @@ export function detectJobTransitions(
           `# warn: completed log write failed: ${(err as Error).message}`,
         );
       }
-      // Auto-close trigger (terminal-state branch). Mirrors the
-      // disappearance branch above — same once-per-key guarantee via
-      // the `completedKeys.has(key)` top-of-loop guard.
+      // Auto-close trigger. Mirrors the disappearance branch above —
+      // same once-per-key guarantee via the `completedKeys.has(key)`
+      // top-of-loop guard. Fires for both the terminal and the
+      // stopped-and-board-complete paths.
       closeWindow(entry.windowId);
     }
   }

@@ -1080,6 +1080,125 @@ test("detectJobTransitions — closeWindow fires with entry.windowId at disappea
 });
 
 // ---------------------------------------------------------------------------
+// detectJobTransitions — stopped-while-board-verdict-completed trigger.
+//
+// A worker that finished its task and got approved parks at
+// `state === "stopped"` (its Ghostty window is still open) — it never
+// reaches `ended`/`killed` until the human closes the window. board.ts
+// already shows the task `[completed]`. This trigger migrates such a
+// row to `--- completed ---` AND fires `closeWindow` so the parked
+// surface is reaped in lockstep with the work being done — the same
+// edge that was previously dead for stopped sessions.
+//
+// Two properties pinned:
+//   (a) stopped job + board verdict completed (worker_phase done +
+//       approved) → completed + closeWindow.
+//   (b) stopped job whose verdict is NOT completed (worker done but
+//       approval pending) stays under `--- current ---` — no migration,
+//       no close.
+// ---------------------------------------------------------------------------
+
+test("detectJobTransitions — stopped job whose board verdict is completed migrates and closes window", () => {
+  const entry = makeDispatchEntry({
+    verb: "work",
+    id: "fn-1-foo.1",
+    dir: "repo",
+    dirFull: "/repo",
+    windowId: "tab-group-F00DCAFE",
+  });
+  const dispatchLog: DispatchEntry[] = [entry];
+  const fulfilledKeys = new Set<string>();
+  const completedKeys = new Set<string>();
+  const captured: string[] = [];
+  const closedIds: Array<string | undefined> = [];
+  const deps: DetectJobTransitionsDeps = {
+    dispatchLog,
+    fulfilledKeys,
+    completedKeys,
+    dispatchLogPath: "/tmp/keeper-autopilot.test.dispatch.log",
+    noteLine: () => {},
+    pid: 4242,
+    appendLine: (line) => captured.push(line),
+    closeWindow: (id) => closedIds.push(id),
+  };
+
+  // Frame 1: worker still running → fulfilled, no completion yet.
+  const taskWorking = makeTask({
+    task_id: "fn-1-foo.1",
+    task_number: 1,
+    worker_phase: "open",
+    jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
+  });
+  detectJobTransitions(deps, buildSnap([makeEpic({ tasks: [taskWorking] })]));
+  expect(fulfilledKeys.has("work::fn-1-foo.1")).toBe(true);
+  expect(completedKeys.has("work::fn-1-foo.1")).toBe(false);
+  expect(closedIds).toEqual([]);
+
+  // Frame 2: worker finished + approved (board verdict `completed`) but
+  // the session is parked at `stopped` (window still open, NOT ended).
+  // The stopped-and-board-complete branch fires.
+  const taskDone = makeTask({
+    task_id: "fn-1-foo.1",
+    task_number: 1,
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ plan_verb: "work", state: "stopped" })],
+  });
+  const snapDone = buildSnap([makeEpic({ tasks: [taskDone] })]);
+  // Guard: the board verdict really is `completed` (mirrors board.ts).
+  expect(snapDone.readiness.perTask.get("fn-1-foo.1")?.tag).toBe("completed");
+  detectJobTransitions(deps, snapDone);
+  expect(completedKeys.has("work::fn-1-foo.1")).toBe(true);
+  expect(closedIds).toEqual(["tab-group-F00DCAFE"]);
+  const line = JSON.parse(captured.at(-1) ?? "{}") as Record<string, unknown>;
+  expect(line.kind).toBe("completed");
+  expect(line.verb).toBe("work");
+  expect(line.id).toBe("fn-1-foo.1");
+});
+
+test("detectJobTransitions — stopped job that is NOT board-completed stays current", () => {
+  const entry = makeDispatchEntry({
+    verb: "work",
+    id: "fn-1-foo.1",
+    dir: "repo",
+    dirFull: "/repo",
+    windowId: "tab-group-BADBADBAD",
+  });
+  const dispatchLog: DispatchEntry[] = [entry];
+  const fulfilledKeys = new Set<string>();
+  const completedKeys = new Set<string>();
+  const closedIds: Array<string | undefined> = [];
+  const deps: DetectJobTransitionsDeps = {
+    dispatchLog,
+    fulfilledKeys,
+    completedKeys,
+    dispatchLogPath: "/tmp/keeper-autopilot.test.dispatch.log",
+    noteLine: () => {},
+    pid: 4242,
+    appendLine: () => {},
+    closeWindow: (id) => closedIds.push(id),
+  };
+
+  // Worker finished (worker_phase done) but approval is still pending —
+  // board verdict is `blocked:job-pending`, NOT `completed`. A stopped
+  // session here must NOT migrate or close: it's awaiting human approval.
+  const taskPending = makeTask({
+    task_id: "fn-1-foo.1",
+    task_number: 1,
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ plan_verb: "work", state: "stopped" })],
+  });
+  const snap = buildSnap([makeEpic({ tasks: [taskPending] })]);
+  expect(snap.readiness.perTask.get("fn-1-foo.1")?.tag).not.toBe("completed");
+  detectJobTransitions(deps, snap);
+  detectJobTransitions(deps, snap);
+  expect(fulfilledKeys.has("work::fn-1-foo.1")).toBe(true);
+  expect(completedKeys.has("work::fn-1-foo.1")).toBe(false);
+  expect(closedIds).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
 // hydrateDispatchLog — fn-640.1 window-row fold.
 //
 // A new `kind:"window"` row carries the spawned Ghostty window's id;
