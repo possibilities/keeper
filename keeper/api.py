@@ -33,9 +33,12 @@ from pathlib import Path
 # it; v33 (fn-639 ``profiles``) is additive and doesn't touch it; v34
 # (fn-637 ``resolved_epic_deps`` on epics) is additive and doesn't touch it;
 # v35 (fn-642 ``usage``+``profiles`` rate-limit colocation) is additive and
-# touches only ``usage`` / ``profiles`` (keeper-py reads neither).
+# touches only ``usage`` / ``profiles`` (keeper-py reads neither); v36 (fn-642
+# ``jobs.profile_name``) is an additive nullable column on ``jobs`` and doesn't
+# touch the file-attribution shape; v37 (fn-643 ``dead_letters`` operational
+# sidecar table + index) is additive and touches neither.
 # Bump this set when a keeper schema change alters those tables.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37})
 
 
 class KeeperError(Exception):
