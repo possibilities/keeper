@@ -9,7 +9,7 @@
  *   2. Boot drain: `while (drain(db, BATCH) > 0) {}` — fold every unfolded event
  *      using the SAME code path as steady-state. After downtime this catches the
  *      projection up before the daemon goes live.
- *   3. Spawn SIX worker threads (all AFTER migrate + boot drain + seed sweep,
+ *   3. Spawn SEVEN worker threads (all AFTER migrate + boot drain + seed sweep,
  *      so their read-only `openDb` connections never race a missing/un-migrated
  *      DB and the exit-watcher's data_version diff sees a settled projection):
  *      - the wake worker — opens its own read-only connection, polls
@@ -49,7 +49,7 @@
  *      no event is missed (drain always re-reads from the cursor) and drain is
  *      never invoked re-entrantly. A `transcript-title` / `exit` message
  *      inserts the synthetic event then pumps a wake to fold it.
- *   5. SIGTERM: post `{ type: "shutdown" }` to ALL SIX workers, await their
+ *   5. SIGTERM: post `{ type: "shutdown" }` to ALL SEVEN workers, await their
  *      `close` events against a short deadline, terminate them, close the db,
  *      exit 0. This is the ONLY clean exit. The server worker releases its
  *      socket + lock, the transcript + plan workers unsubscribe their watchers,
@@ -66,14 +66,22 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import {
   openDb,
   resolveClaudeProjectsRoot,
   resolveDbPath,
+  resolveDeadLetterDir,
   resolvePlanRoots,
   resolveUsageRoot,
   runPlanctlApprovalMigration,
 } from "./db";
+import { parseDeadLetterLine } from "./dead-letter";
+import type {
+  DeadLetterChangedMessage,
+  DeadLetterWorkerData,
+} from "./dead-letter-worker";
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
 import type { GitWorkerData, GitWorkerMessage } from "./git-worker";
 import type { PlanMessage, PlanWorkerData } from "./plan-worker";
@@ -109,6 +117,151 @@ export function drainToCompletion(
 ): void {
   while (drain(db, batchSize) > 0) {
     // keep folding until caught up
+  }
+}
+
+/**
+ * Hard cap on the per-pid dead-letter NDJSON file size before we read it. The
+ * hook writes one record per dropped INSERT and never truncates / rotates, so
+ * a single file could in principle grow unbounded under sustained drop storms.
+ * 16 MiB is far above any realistic dead-letter accumulation between daemon
+ * restarts (a thousand drops at ~1 KiB each fits in 1 MiB) and prevents a
+ * pathological file from OOM'ing the import scan. An oversized file is
+ * skip-and-logged — never throws — so one bad file doesn't wedge the rest of
+ * the dir scan.
+ */
+const MAX_DEAD_LETTER_FILE_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Scan the dead-letter dir and import each NDJSON file's records into the
+ * `dead_letters` operational table via `INSERT OR IGNORE` (keyed on `dl_id`).
+ * This is a DIRECT operational-table write — NOT an event fold — called both
+ * once at boot (in `runDaemon`'s boot sequence, after `seedKilledSweep`) and
+ * live on every `{kind:"dead-letter-changed"}` message from the dead-letter
+ * worker.
+ *
+ * Idempotency: `INSERT OR IGNORE` on the `dl_id` PRIMARY KEY means a re-scan
+ * of an unchanged file inserts nothing new — the same NDJSON file can be
+ * scanned a hundred times and the table converges on the same row set. This
+ * makes the "watcher event = re-read everything" pattern safe.
+ *
+ * Per-file isolation: every recoverable error (missing dir, missing file
+ * mid-scan, read error, oversized file, malformed line, INSERT throw) is
+ * swallowed to stderr — the import path MUST NOT throw out of the scan, or a
+ * single bad file would wedge boot AND the live message loop (both call this
+ * function). Exported so the test surface can drive it directly without
+ * spawning the worker.
+ */
+export function scanDeadLetterDir(db: Database, dir: string): void {
+  // Missing-dir tolerance: a fresh machine has no dead-letters/ tree until
+  // the hook hits its first drop. Returning early is the documented
+  // graceful-degradation path; the worker's existsSync guard mirrors this.
+  if (!existsSync(dir)) {
+    return;
+  }
+
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    console.error(
+      `[keeperd] dead-letter scan failed to readdir ${dir}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+
+  // Prepare the insert statement once outside the loop (bun:sqlite's
+  // prepared-statement cache makes a fresh `db.run` near-equivalent, but
+  // hoisting it is the documented zero-cost form for hot-ish paths).
+  // `INSERT OR IGNORE` collapses a duplicate `dl_id` to a no-op; the
+  // primary-key conflict path is the idempotency guarantee.
+  const insertStmt = db.prepare(
+    `INSERT OR IGNORE INTO dead_letters
+       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+        status, recovered_at, replayed_event_id, source_file)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', NULL, NULL, ?)`,
+  );
+
+  for (const name of names) {
+    if (!name.endsWith(".ndjson")) {
+      // The hook writes per-pid `<pid>.ndjson` files; ignore anything else
+      // that might land in the dir (editor backup files, a future tool
+      // dropping logs alongside).
+      continue;
+    }
+    const full = join(dir, name);
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(full);
+    } catch (err) {
+      // Read-vs-delete race (the file vanished between readdir and stat):
+      // skip-and-log without throwing. The next watcher event will pick it
+      // up if it reappears.
+      console.error(
+        `[keeperd] dead-letter scan stat failed for ${full}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      continue;
+    }
+    if (!st.isFile()) {
+      continue;
+    }
+    if (st.size > MAX_DEAD_LETTER_FILE_BYTES) {
+      console.error(
+        `[keeperd] dead-letter file ${full} exceeds ${MAX_DEAD_LETTER_FILE_BYTES} bytes (${st.size}); skipping`,
+      );
+      continue;
+    }
+
+    let text: string;
+    try {
+      text = readFileSync(full, "utf8");
+    } catch (err) {
+      console.error(
+        `[keeperd] dead-letter scan read failed for ${full}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      continue;
+    }
+
+    // NDJSON: one record per `\n`-delimited line. `parseDeadLetterLine`
+    // returns null for an empty / truncated / malformed line — skip those
+    // silently, the next valid line (or a later append) still imports. A
+    // crash-killed hook may leave a partial trailing line; that is the
+    // documented crash-safety contract on the producer side.
+    const lines = text.split("\n");
+    for (const line of lines) {
+      const record = parseDeadLetterLine(line);
+      if (record === null) {
+        continue;
+      }
+      try {
+        insertStmt.run(
+          record.dl_id,
+          record.session_id,
+          record.hook_event,
+          record.ts,
+          record.dl_written_at,
+          record.pid,
+          JSON.stringify(record.bindings),
+          full,
+        );
+      } catch (err) {
+        // A bad row (e.g. a forward-compat column we don't store on this
+        // schema, a constraint violation that's NOT the PK duplicate
+        // INSERT OR IGNORE swallows) must not wedge the rest of the scan
+        // OR the boot/live loop. Log and continue.
+        console.error(
+          `[keeperd] dead-letter INSERT failed for ${record.dl_id} (${full}): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
   }
 }
 
@@ -152,6 +305,18 @@ function runDaemon(): void {
   // emitted.
   seedKilledSweep(db);
   drainToCompletion(db);
+
+  // Step 2b — dead-letter boot import (fn-643 task .3). Read every NDJSON
+  // file the hook wrote during downtime / since the last daemon run and
+  // INSERT OR IGNORE each parsed record into `dead_letters` as `waiting`.
+  // MUST run before the dead-letter worker spawns (and before the server
+  // worker starts serving): a board client subscribing the moment the
+  // socket comes up must see the full `waiting` backlog, not a partially
+  // imported one. The scan is idempotent (`INSERT OR IGNORE` on `dl_id`),
+  // so a re-scan is harmless. Missing dir is tolerated (fresh machine).
+  // This is a DIRECT operational-table write — NOT an event fold.
+  const deadLetterDir = resolveDeadLetterDir();
+  scanDeadLetterDir(db, deadLetterDir);
 
   // Coalescing flag: every wake sets it; the run loop resets it before each
   // drain pass. A wake arriving mid-drain leaves the flag set, so the loop runs
@@ -856,6 +1021,71 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
+  // Spawn the dead-letter worker (fn-643 task .3) in the SAME post-migration
+  // window — the seventh worker thread (and sixth file-watcher producer
+  // instance). It watches the dead-letters dir for changes and posts a
+  // contentless `{kind:"dead-letter-changed"}` message. The worker holds NO
+  // DB handle — main is the sole DB writer here, just as it is for the
+  // event log; on each worker message main re-runs `scanDeadLetterDir`
+  // (same primitive as the boot scan above), which INSERT OR IGNOREs each
+  // parsed record into the `dead_letters` operational table.
+  //
+  // The boot scan above already imported every pre-existing file; this
+  // live path covers files the hook writes AFTER the daemon comes up. The
+  // worker spawns AFTER the boot import so the table state is settled
+  // before any live notification arrives — there is no race where a
+  // live message could fire against a half-imported boot state.
+  const deadLetterWorker = new Worker(
+    new URL("./dead-letter-worker.ts", import.meta.url).href,
+    {
+      workerData: { dir: deadLetterDir } satisfies DeadLetterWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  // Main owns the actual `dead_letters` write: a worker `dead-letter-changed`
+  // message triggers a fresh `scanDeadLetterDir` against the on-disk dir
+  // (treating the watcher event as "go look", never as the data — the
+  // CLAUDE.md "safe value" pattern). The scan is idempotent (`INSERT OR
+  // IGNORE` on `dl_id`), so a burst of watcher events collapses harmlessly
+  // into the same converged row set. NO wake is pumped here — the write
+  // goes to the `dead_letters` table, NOT `events`, so there is no
+  // projection to fold; the server worker's data_version polling picks
+  // up the row change directly and the board re-renders.
+  deadLetterWorker.onmessage = (
+    ev: MessageEvent<DeadLetterChangedMessage | undefined>,
+  ): void => {
+    const msg = ev.data;
+    if (!msg || msg.kind !== "dead-letter-changed") {
+      return;
+    }
+    try {
+      scanDeadLetterDir(db, deadLetterDir);
+    } catch (err) {
+      // Defense-in-depth: scanDeadLetterDir's design contract is "never
+      // throw out of the scan", but an unexpected internal throw must
+      // NOT crash the daemon. Log and continue — the next watcher event
+      // will retry the import.
+      console.error(
+        `[keeperd] dead-letter live import threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  };
+
+  // Same crash policy as the other workers: any thread failure → fatalExit.
+  deadLetterWorker.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] dead-letter worker error:", err.message ?? err);
+    fatalExit();
+  };
+
+  // Same crash-via-`close` gap: a dead-letter-worker `process.exit(1)`
+  // fires `close`, not `onerror`. `!shuttingDown` makes it inert on clean
+  // shutdown.
+  deadLetterWorker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
+
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -895,14 +1125,18 @@ function runDaemon(): void {
     exitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     gitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     usageWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
+    deadLetterWorker.postMessage({
+      type: "shutdown",
+    } satisfies ShutdownMessage);
 
-    // Bun surfaces worker exit via the "close" event. Await ALL SEVEN
+    // Bun surfaces worker exit via the "close" event. Await ALL EIGHT
     // workers' close (the server worker releases its socket + lock, the
-    // transcript + plan + usage workers unsubscribe their watchers, and the
-    // exit-watcher releases its kqueue/pidfd fd in their own shutdown
-    // handlers — that teardown must land, or the socket / native watches /
-    // kernel fd leak into the next boot), raced against a single shared
-    // deadline so a wedged worker can't block our clean shutdown forever.
+    // transcript + plan + usage + dead-letter workers unsubscribe their
+    // watchers, and the exit-watcher releases its kqueue/pidfd fd in their
+    // own shutdown handlers — that teardown must land, or the socket /
+    // native watches / kernel fd leak into the next boot), raced against a
+    // single shared deadline so a wedged worker can't block our clean
+    // shutdown forever.
     const exited = (w: Worker): Promise<void> =>
       new Promise<void>((resolve) => {
         w.addEventListener("close", () => resolve());
@@ -916,6 +1150,7 @@ function runDaemon(): void {
         exited(exitWorker),
         exited(gitWorker),
         exited(usageWorker),
+        exited(deadLetterWorker),
       ]),
       Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS),
     ]);
@@ -952,6 +1187,11 @@ function runDaemon(): void {
     }
     try {
       usageWorker.terminate();
+    } catch {
+      // best-effort if it already exited
+    }
+    try {
+      deadLetterWorker.terminate();
     } catch {
       // best-effort if it already exited
     }
