@@ -225,6 +225,7 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     task_number: number;
     title: string;
     target_repo: string;
+    tier: string | null;
     worker_phase: string;
     runtime_status: string;
     approval: "approved" | "rejected" | "pending";
@@ -238,6 +239,11 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     task_number: 2,
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
+    // fn-602: `tier` rides FREE in the embedded JSON. This synthetic event
+    // omits the field — the reducer reads `snapshot.tier ?? null` so the
+    // embedded element folds to `null` deterministically (graceful-
+    // degradation precedent shared with `worker_phase`/`runtime_status`).
+    tier: null,
     // Schema v19: the legacy `status` column was renamed to `worker_phase`
     // (derived worker-phase binary) and a sibling `runtime_status` field
     // surfaces the planctl-native enum. A TaskSnapshot blob without a state
