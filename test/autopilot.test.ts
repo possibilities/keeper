@@ -32,7 +32,8 @@ import type {
   DispatchEntry,
 } from "../scripts/autopilot";
 import {
-  buildClaudeDispatchCommand,
+  ARTHACK_ROOT,
+  buildWorkerCommand,
   detectJobTransitions,
   hydrateDispatchLog,
   isLiveSessionInRoot,
@@ -51,6 +52,7 @@ function makeTask(overrides: Partial<Task>): Task {
     task_number: 1,
     title: "task",
     target_repo: null,
+    tier: null,
     worker_phase: "open",
     runtime_status: "todo",
     approval: "approved",
@@ -104,15 +106,26 @@ test("renderEpicCommandsFiltered — all-pass matches renderEpicCommands byte-fo
   expect(filtered).not.toBeNull();
   expect(filtered).toBe(unfiltered);
 
-  // Sanity-check the rendered shape: includes all three work commands,
-  // the per-task target_repo override, and the close pair.
-  expect(filtered).toContain("cd /repo && claude '/plan:work fn-1-foo.1'");
+  // Sanity-check the rendered shape: every claude line now routes through
+  // `buildWorkerCommand` (fn-602.2), so each work/close command carries
+  // `--model sonnet --effort max --name <verb>::<id>` and the per-task
+  // `target_repo` override still wins for `.2`. None of these tasks
+  // carries a `tier`, so the work-tier `--plugin-dir` is omitted.
   expect(filtered).toContain(
-    "cd /other-repo && claude '/plan:work fn-1-foo.2'",
+    "cd /repo && claude --model sonnet --effort max --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
   );
-  expect(filtered).toContain("cd /repo && claude '/plan:work fn-1-foo.3'");
-  expect(filtered).toContain("cd /repo && claude '/plan:close fn-1-foo'");
+  expect(filtered).toContain(
+    "cd /other-repo && claude --model sonnet --effort max --name work::fn-1-foo.2 '/plan:work fn-1-foo.2'",
+  );
+  expect(filtered).toContain(
+    "cd /repo && claude --model sonnet --effort max --name work::fn-1-foo.3 '/plan:work fn-1-foo.3'",
+  );
+  expect(filtered).toContain(
+    "cd /repo && claude --model sonnet --effort max --name close::fn-1-foo '/plan:close fn-1-foo'",
+  );
   expect(filtered).toContain("bun ~/code/keeper/scripts/approve.ts fn-1-foo");
+  // Tier-null work omits `--plugin-dir` entirely.
+  expect(filtered).not.toContain("--plugin-dir");
 });
 
 test("renderEpicCommandsFiltered — some-pass keeps only ready rows, preserves order", () => {
@@ -131,14 +144,17 @@ test("renderEpicCommandsFiltered — some-pass keeps only ready rows, preserves 
   const filtered = renderEpicCommandsFiltered(epic, isReady);
   expect(filtered).not.toBeNull();
 
-  // .2 work + approve pair present.
-  expect(filtered).toContain("cd /repo && claude '/plan:work fn-1-foo.2'");
+  // .2 work + approve pair present (work command carries the
+  // fn-602.2 flags via `buildWorkerCommand`).
+  expect(filtered).toContain(
+    "cd /repo && claude --model sonnet --effort max --name work::fn-1-foo.2 '/plan:work fn-1-foo.2'",
+  );
   expect(filtered).toContain("bun ~/code/keeper/scripts/approve.ts fn-1-foo.2");
 
   // .1, .3, and the close pair are gone.
   expect(filtered).not.toContain("fn-1-foo.1");
   expect(filtered).not.toContain("fn-1-foo.3");
-  expect(filtered).not.toContain("claude '/plan:close fn-1-foo'");
+  expect(filtered).not.toContain("/plan:close fn-1-foo");
 });
 
 test("renderEpicCommandsFiltered — some-pass with surviving close row", () => {
@@ -155,7 +171,9 @@ test("renderEpicCommandsFiltered — some-pass with surviving close row", () => 
 
   const filtered = renderEpicCommandsFiltered(epic, isReady);
   expect(filtered).not.toBeNull();
-  expect(filtered).toContain("cd /repo && claude '/plan:close fn-1-foo'");
+  expect(filtered).toContain(
+    "cd /repo && claude --model sonnet --effort max --name close::fn-1-foo '/plan:close fn-1-foo'",
+  );
   expect(filtered).toContain("bun ~/code/keeper/scripts/approve.ts fn-1-foo");
   expect(filtered).not.toContain("plan:work");
 });
@@ -182,22 +200,33 @@ test("renderEpicCommandsFiltered — empty-task epic with ready close emits clos
   const epic = makeEpic({ tasks: [] });
   const filtered = renderEpicCommandsFiltered(epic, ALWAYS_READY);
   expect(filtered).not.toBeNull();
-  expect(filtered).toContain("claude '/plan:close fn-1-foo'");
+  expect(filtered).toContain("'/plan:close fn-1-foo'");
   expect(filtered).not.toContain("plan:work");
 });
 
 // ---------------------------------------------------------------------------
-// buildClaudeDispatchCommand — the LIVE dispatch channel (separate from the
-// display builders). The four real `processLaunchTransitions` sites all
-// route through this helper, so it is the single chokepoint where keeper's
-// `--name <verb>::<id>` linkage contract is enforced. The emitted token
-// MUST match the deriver regex in `src/derivers.ts` (`SPAWN_VERB_REF_RE`):
+// buildWorkerCommand — the ONLY source of the `claude '/plan:<verb> <id>'`
+// shell command for every autopilot consumer: the live
+// `launchInGhostty` dispatch sites AND the display/dry-run renderers
+// (`renderEpicCommands` / `renderEpicCommandsFiltered` / the predicted
+// section's `v` toggle). fn-602.2 moves model/effort/work-tier-plugin
+// selection upstream from `arthack-claude.py` into autopilot so the
+// launcher knows nothing about planctl, tiers, or plan-role prompts.
+//
+// The emitted `--name` token MUST match the deriver regex in
+// `src/derivers.ts` (`SPAWN_VERB_REF_RE`):
 //   ^(plan|work|close|approve)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$
 // Failure mode if the name is wrong (or absent): SessionStart's `ps`
 // scrape yields null, `plan_ref` derives null, `syncJobIntoEpic` no-ops,
 // and the spawned session never enters `task.jobs[]` — the readiness
-// predicates and the per-root dispatch mutex go blind to it (the P1
-// failure this task closes).
+// predicates and the per-root dispatch mutex go blind to it.
+//
+// Flag-mapping contract (per fn-602 epic spec):
+//   - work, close → `--model sonnet --effort max`
+//   - approve     → `--model sonnet --effort low`
+//   - work        → additionally `--plugin-dir
+//                   <ARTHACK_ROOT>/claude/work-plugins/<tier>`,
+//                   SKIPPED when tier is null (degrade to launcher default)
 // ---------------------------------------------------------------------------
 
 // Mirror of the deriver regex at src/derivers.ts:88 — duplicated here so
@@ -217,58 +246,93 @@ function extractNameToken(command: string): string | null {
   return m?.[1] ?? null;
 }
 
-test("buildClaudeDispatchCommand — work uses task id, name matches deriver regex", () => {
-  const cmd = buildClaudeDispatchCommand("work", "fn-1-foo.3", "/repo");
-  expect(cmd).toContain("--name work::fn-1-foo.3");
-  expect(cmd).toContain("'/plan:work fn-1-foo.3'");
+test("buildWorkerCommand — work carries sonnet+max, name, tier plugin-dir", () => {
+  const cmd = buildWorkerCommand("work", "fn-1-foo.3", "/repo", "xhigh");
   expect(cmd.startsWith("cd /repo && ")).toBe(true);
+  expect(cmd).toContain("--model sonnet");
+  expect(cmd).toContain("--effort max");
+  expect(cmd).toContain("--name work::fn-1-foo.3");
+  expect(cmd).toContain(
+    `--plugin-dir ${ARTHACK_ROOT}/claude/work-plugins/xhigh`,
+  );
+  expect(cmd).toContain("'/plan:work fn-1-foo.3'");
 
-  const token = extractNameToken(cmd);
+  const token = extractNameToken(cmd) ?? "";
   expect(token).toBe("work::fn-1-foo.3");
-  expect(SPAWN_VERB_REF_RE.test(token!)).toBe(true);
+  expect(SPAWN_VERB_REF_RE.test(token)).toBe(true);
 });
 
-test("buildClaudeDispatchCommand — close uses epic id (no dot suffix), name matches deriver regex", () => {
-  const cmd = buildClaudeDispatchCommand("close", "fn-1-foo", "/repo");
+test("buildWorkerCommand — tier-null work omits --plugin-dir (degrades to launcher default)", () => {
+  const cmd = buildWorkerCommand("work", "fn-1-foo.3", "/repo", null);
+  expect(cmd).toContain("--model sonnet");
+  expect(cmd).toContain("--effort max");
+  expect(cmd).toContain("--name work::fn-1-foo.3");
+  // No --plugin-dir flag at all; the launcher picks its own default.
+  expect(cmd).not.toContain("--plugin-dir");
+  expect(cmd).toContain("'/plan:work fn-1-foo.3'");
+});
+
+test("buildWorkerCommand — work with tier omitted (undefined) behaves like tier=null", () => {
+  // Call sites at the close/approve-close path pass no `tier` argument
+  // at all; the work path may also pass `task.tier` which is `undefined`
+  // on partial fixtures. Both must degrade identically.
+  const cmd = buildWorkerCommand("work", "fn-1-foo.3", "/repo");
+  expect(cmd).not.toContain("--plugin-dir");
+});
+
+test("buildWorkerCommand — close carries sonnet+max + name; no plugin-dir even when tier passed", () => {
+  // Defensive: close is epic-level and has no tier, but call sites may
+  // still pass `null`/`undefined` through the same helper signature.
+  // The helper must IGNORE `tier` on non-`work` verbs.
+  const cmd = buildWorkerCommand("close", "fn-1-foo", "/repo", "xhigh");
+  expect(cmd).toContain("--model sonnet");
+  expect(cmd).toContain("--effort max");
   expect(cmd).toContain("--name close::fn-1-foo");
+  expect(cmd).not.toContain("--plugin-dir");
   expect(cmd).toContain("'/plan:close fn-1-foo'");
 
-  const token = extractNameToken(cmd);
+  const token = extractNameToken(cmd) ?? "";
   expect(token).toBe("close::fn-1-foo");
-  expect(SPAWN_VERB_REF_RE.test(token!)).toBe(true);
+  expect(SPAWN_VERB_REF_RE.test(token)).toBe(true);
 });
 
-test("buildClaudeDispatchCommand — approve (task scope) carries task id", () => {
-  const cmd = buildClaudeDispatchCommand("approve", "fn-1-foo.3", "/repo");
+test("buildWorkerCommand — approve (task scope) carries sonnet+low + name; no plugin-dir", () => {
+  const cmd = buildWorkerCommand("approve", "fn-1-foo.3", "/repo", "xhigh");
+  expect(cmd).toContain("--model sonnet");
+  expect(cmd).toContain("--effort low");
   expect(cmd).toContain("--name approve::fn-1-foo.3");
+  expect(cmd).not.toContain("--plugin-dir");
   expect(cmd).toContain("'/plan:approve fn-1-foo.3'");
 
-  const token = extractNameToken(cmd);
+  const token = extractNameToken(cmd) ?? "";
   expect(token).toBe("approve::fn-1-foo.3");
-  expect(SPAWN_VERB_REF_RE.test(token!)).toBe(true);
+  expect(SPAWN_VERB_REF_RE.test(token)).toBe(true);
 });
 
-test("buildClaudeDispatchCommand — approve (close scope) carries epic id", () => {
-  const cmd = buildClaudeDispatchCommand("approve", "fn-1-foo", "/repo");
+test("buildWorkerCommand — approve (close scope) carries epic id", () => {
+  const cmd = buildWorkerCommand("approve", "fn-1-foo", "/repo");
+  expect(cmd).toContain("--effort low");
   expect(cmd).toContain("--name approve::fn-1-foo");
   expect(cmd).toContain("'/plan:approve fn-1-foo'");
 
-  const token = extractNameToken(cmd);
+  const token = extractNameToken(cmd) ?? "";
   expect(token).toBe("approve::fn-1-foo");
-  expect(SPAWN_VERB_REF_RE.test(token!)).toBe(true);
+  expect(SPAWN_VERB_REF_RE.test(token)).toBe(true);
 });
 
-test("buildClaudeDispatchCommand — empty projectDir omits the cd prefix", () => {
+test("buildWorkerCommand — empty projectDir omits the cd prefix", () => {
   // `dir === ""` is the no-cd path taken when neither task.target_repo
   // nor epic.project_dir produced a non-empty `seg`. The bare command
-  // must still carry the --name flag so the linkage contract holds even
-  // when autopilot can't cd anywhere.
-  const cmd = buildClaudeDispatchCommand("work", "fn-1-foo.3", "");
+  // must still carry the flags so the linkage + flag contracts hold
+  // even when autopilot can't cd anywhere.
+  const cmd = buildWorkerCommand("work", "fn-1-foo.3", "", null);
   expect(cmd.startsWith("cd ")).toBe(false);
-  expect(cmd).toBe("claude --name work::fn-1-foo.3 '/plan:work fn-1-foo.3'");
+  expect(cmd).toBe(
+    "claude --model sonnet --effort max --name work::fn-1-foo.3 '/plan:work fn-1-foo.3'",
+  );
 });
 
-test("buildClaudeDispatchCommand — name token is single-token (no spaces, no shell metachars)", () => {
+test("buildWorkerCommand — name token is single-token (no spaces, no shell metachars)", () => {
   // macOS `ps -o args=` scrape only reads up to the first whitespace
   // after `--name `. A space in the token would silently truncate the
   // scrape. Also pins the no-shell-metachar property: the launchInGhostty
@@ -276,14 +340,44 @@ test("buildClaudeDispatchCommand — name token is single-token (no spaces, no s
   // long as the verb::id token uses only `[a-z0-9:.-]`.
   for (const verb of ["work", "close", "approve"] as const) {
     for (const id of ["fn-1-foo", "fn-1-foo.3", "fn-638-harden-autopilot.12"]) {
-      const cmd = buildClaudeDispatchCommand(verb, id, "/repo");
-      const token = extractNameToken(cmd);
-      expect(token).not.toBeNull();
-      expect(token!).not.toContain(" ");
-      expect(token!).toMatch(/^[a-z0-9:.-]+$/);
-      expect(SPAWN_VERB_REF_RE.test(token!)).toBe(true);
+      const cmd = buildWorkerCommand(verb, id, "/repo");
+      const token = extractNameToken(cmd) ?? "";
+      expect(token).not.toBe("");
+      expect(token).not.toContain(" ");
+      expect(token).toMatch(/^[a-z0-9:.-]+$/);
+      expect(SPAWN_VERB_REF_RE.test(token)).toBe(true);
     }
   }
+});
+
+test("buildWorkerCommand — ARTHACK_ROOT is the absolute base for work plugin-dir", () => {
+  // The constant is expanded once at module load (`~` → `homedir()`)
+  // and routed through `buildWorkerCommand` for every work dispatch.
+  // An accidentally-unexpanded `~` would surface as a literal `~/code/...`
+  // path that the launcher's cwd would silently break.
+  expect(ARTHACK_ROOT.startsWith("/")).toBe(true);
+  expect(ARTHACK_ROOT.includes("~")).toBe(false);
+
+  const cmd = buildWorkerCommand("work", "fn-1-foo.3", "/repo", "xhigh");
+  expect(cmd).toContain(
+    `--plugin-dir ${ARTHACK_ROOT}/claude/work-plugins/xhigh`,
+  );
+});
+
+test("renderEpicCommands — work command carries tier --plugin-dir when task.tier is set", () => {
+  // The display/dry-run renderer is the same helper used by the live
+  // dispatch path — fn-602.2 routes both through `buildWorkerCommand`
+  // so a tier on the task surfaces identically in copy-paste output.
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", task_number: 1, tier: "max" })],
+  });
+  const rendered = renderEpicCommands(epic);
+  expect(rendered).toContain(
+    `--plugin-dir ${ARTHACK_ROOT}/claude/work-plugins/max`,
+  );
+  expect(rendered).toContain("--name work::fn-1-foo.1");
+  expect(rendered).toContain("--model sonnet");
+  expect(rendered).toContain("--effort max");
 });
 
 // ---------------------------------------------------------------------------

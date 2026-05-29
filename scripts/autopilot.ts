@@ -137,6 +137,7 @@
  */
 
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
@@ -260,6 +261,28 @@ Ctrl-C calls dispose() and exits 0.
 
 const seg = (v: unknown) => (v == null ? "" : String(v));
 
+/**
+ * Filesystem root of the arthack monorepo, hosting the per-tier
+ * `claude/work-plugins/<tier>/` directories autopilot points the
+ * `work` verb at via `--plugin-dir`. fn-602 moves this selection
+ * upstream from `arthack-claude.py` into autopilot, so the launcher
+ * no longer needs to know about planctl, tiers, or plan-role prompts.
+ *
+ * Env-overridable via `ARTHACK_ROOT` (mostly for tests / a future
+ * non-default workspace layout); the default `~/code/arthack` is the
+ * correct path on the dispatch desktop autopilot runs on. `~` is
+ * expanded eagerly at module load so downstream `--plugin-dir <root>/…`
+ * strings carry an absolute path the launcher's cwd doesn't break.
+ */
+export const ARTHACK_ROOT: string = ((): string => {
+  const raw = process.env.ARTHACK_ROOT;
+  const v = raw != null && raw !== "" ? raw : "~/code/arthack";
+  if (v === "~" || v.startsWith("~/")) {
+    return v === "~" ? homedir() : join(homedir(), v.slice(2));
+  }
+  return v;
+})();
+
 export interface DispatchEntry {
   ts: string;
   kind: "launch";
@@ -287,11 +310,17 @@ export interface DispatchEntry {
 // --- command rendering (module-scope so test/autopilot.test.ts can import) ---
 
 /**
- * Build the shell command autopilot hands to `launchInGhostty` at a real
- * dispatch site. Encodes the load-bearing linkage contract: every spawned
- * `claude` carries `--name <verb>::<id>` so the SessionStart hook freezes
- * `events.spawn_name`, the deriver yields `plan_ref={verb,id}`, and the
- * reducer's `syncJobIntoEpic` fan-out routes the session into the
+ * Single source of the `claude '/plan:<verb> <id>'` shell command for
+ * every autopilot consumer: the live `launchInGhostty` dispatch sites
+ * AND the display/dry-run renderers (`renderEpicCommands`,
+ * `renderEpicCommandsFiltered`, the predicted-section `v` toggle).
+ * Routing both through one helper is the whole point of fn-602.2 — a
+ * dry-run vs live drift would be invisible until a real dispatch.
+ *
+ * Encodes the load-bearing linkage contract: every spawned `claude`
+ * carries `--name <verb>::<id>` so the SessionStart hook freezes
+ * `events.spawn_name`, the deriver yields `plan_ref={verb,id}`, and
+ * the reducer's `syncJobIntoEpic` fan-out routes the session into the
  * embedded `task.jobs[]` array (or epic `jobs[]` for close/approve-close).
  *
  * The emitted name MUST match the deriver regex in `src/derivers.ts`
@@ -300,18 +329,36 @@ export interface DispatchEntry {
  * `approve` use the appropriate id form chosen by the caller (task id for
  * a task-level approve, epic id for close + approve-close).
  *
- * NOTE: This helper is the dispatch channel ONLY. The display builders
- * (`renderEpicCommands` / `renderEpicCommandsFiltered`) intentionally emit
- * the bare human-readable form without `--name`; their byte-exact tests at
- * test/autopilot.test.ts:106-138 pin that shape.
+ * Flag mapping (fn-602.2 — moves model/effort/work-tier-plugin selection
+ * upstream from `arthack-claude.py` into autopilot):
+ *   - work, close → `--model sonnet --effort max`
+ *   - approve     → `--model sonnet --effort low`
+ *   - work        → additionally `--plugin-dir <ARTHACK_ROOT>/claude/work-plugins/<tier>`,
+ *                   SKIPPED when `tier == null` (degrade to launcher default)
+ *
+ * The optional `tier` is consumed only by `work`; passing it for
+ * close/approve is a no-op so call sites at the epic level don't need
+ * a branch.
  */
-export function buildClaudeDispatchCommand(
+export function buildWorkerCommand(
   verb: "work" | "close" | "approve",
   id: string,
   projectDir: string,
+  tier?: string | null,
 ): string {
   const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
-  return `${cdPrefix}claude --name ${verb}::${id} '/plan:${verb} ${id}'`;
+  const flags: string[] = [];
+  if (verb === "approve") {
+    flags.push("--model", "sonnet", "--effort", "low");
+  } else {
+    // work, close
+    flags.push("--model", "sonnet", "--effort", "max");
+  }
+  flags.push("--name", `${verb}::${id}`);
+  if (verb === "work" && tier != null && tier !== "") {
+    flags.push("--plugin-dir", `${ARTHACK_ROOT}/claude/work-plugins/${tier}`);
+  }
+  return `${cdPrefix}claude ${flags.join(" ")} '/plan:${verb} ${id}'`;
 }
 
 /**
@@ -338,17 +385,15 @@ export function renderEpicCommands(epic: Epic): string {
       task.target_repo != null && seg(task.target_repo) !== ""
         ? seg(task.target_repo)
         : projectDir;
-    const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
     lines.push(
-      `${cdPrefix}claude '/plan:work ${taskId}'`,
+      buildWorkerCommand("work", taskId, dir, task.tier),
       `bun ~/code/keeper/scripts/approve.ts ${taskId}`,
     );
   }
 
   // Virtual close row — always appended, mirrors board.ts.
-  const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
   lines.push(
-    `${cdPrefix}claude '/plan:close ${epicId}'`,
+    buildWorkerCommand("close", epicId, projectDir),
     `bun ~/code/keeper/scripts/approve.ts ${epicId}`,
   );
 
@@ -384,17 +429,15 @@ export function renderEpicCommandsFiltered(
       task.target_repo != null && seg(task.target_repo) !== ""
         ? seg(task.target_repo)
         : projectDir;
-    const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
     lines.push(
-      `${cdPrefix}claude '/plan:work ${taskId}'`,
+      buildWorkerCommand("work", taskId, dir, task.tier),
       `bun ~/code/keeper/scripts/approve.ts ${taskId}`,
     );
   }
 
   if (isReady("close", epicId)) {
-    const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
     lines.push(
-      `${cdPrefix}claude '/plan:close ${epicId}'`,
+      buildWorkerCommand("close", epicId, projectDir),
       `bun ~/code/keeper/scripts/approve.ts ${epicId}`,
     );
   }
@@ -500,6 +543,13 @@ export interface PreviewRow {
   // (e.g. a multi-line preview shape) can reconstruct the shell command.
   // Today's renderer only consumes `dir` for the `(<dir>)` prefix.
   dirFull: string;
+  // Owning task's `tier` — present only for `work` rows sourced from a
+  // task, threaded into `buildWorkerCommand` by the `v` toggle so the
+  // copy-paste command carries `--plugin-dir <work-plugins/<tier>>`.
+  // `null` on close/approve/git-dirty rows (no work-tier selection),
+  // and `null` on work rows whose task spec carries no tier (legacy
+  // pre-fn-602.1 / fn-N.1 tasks; degrades to launcher default).
+  tier: string | null;
 }
 
 export interface PreviewSections {
@@ -731,6 +781,9 @@ function previewRowFromTask(
     id: seg(task.task_id),
     dir: dirFull === "" ? "" : basename(dirFull),
     dirFull,
+    // Only `work` consumes `tier` in `buildWorkerCommand`; approve /
+    // git-dirty rows zero it so the field shape stays uniform.
+    tier: verb === "work" ? task.tier : null,
   };
 }
 
@@ -744,6 +797,9 @@ function previewRowFromEpic(
     id: seg(epic.epic_id),
     dir: projectDir === "" ? "" : basename(projectDir),
     dirFull: projectDir,
+    // Epic-scoped rows (close / approve-close / git-dirty fan-up) have
+    // no tier; the work-tier-plugin selection only applies to work.
+    tier: null,
   };
 }
 
@@ -1572,7 +1628,7 @@ async function main(): Promise<void> {
       // The informational `git-dirty` row has no dispatch behind it, so
       // it's never annotated.
       if (showCommands && r.verb !== "git-dirty") {
-        out.push(`  ${buildClaudeDispatchCommand(r.verb, r.id, r.dirFull)}`);
+        out.push(`  ${buildWorkerCommand(r.verb, r.id, r.dirFull, r.tier)}`);
       }
     }
     return out;
@@ -1946,7 +2002,7 @@ async function main(): Promise<void> {
         if (cur === "ready") {
           workCloseDispatches.push(() =>
             launchInGhostty(
-              buildClaudeDispatchCommand("work", taskId, dir),
+              buildWorkerCommand("work", taskId, dir, task.tier),
               `task ${taskId}`,
               dirBase,
               dir,
@@ -1958,7 +2014,7 @@ async function main(): Promise<void> {
         } else if (cur === "blocked:job-pending") {
           approveDispatches.push(() =>
             launchInGhostty(
-              buildClaudeDispatchCommand("approve", taskId, dir),
+              buildWorkerCommand("approve", taskId, dir),
               `approve task ${taskId}`,
               dirBase,
               dir,
@@ -1984,7 +2040,7 @@ async function main(): Promise<void> {
           if (closeCur === "ready") {
             workCloseDispatches.push(() =>
               launchInGhostty(
-                buildClaudeDispatchCommand("close", epicId, projectDir),
+                buildWorkerCommand("close", epicId, projectDir),
                 `close ${epicId}`,
                 dirBase,
                 projectDir,
@@ -1996,7 +2052,7 @@ async function main(): Promise<void> {
           } else if (closeCur === "blocked:job-pending") {
             approveDispatches.push(() =>
               launchInGhostty(
-                buildClaudeDispatchCommand("approve", epicId, projectDir),
+                buildWorkerCommand("approve", epicId, projectDir),
                 `approve close ${epicId}`,
                 dirBase,
                 projectDir,
