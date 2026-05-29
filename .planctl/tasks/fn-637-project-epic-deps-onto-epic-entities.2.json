@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Add resolved-deps column and reverse-index table",
-  "updated_at": "2026-05-29T01:22:02.387083Z"
+  "updated_at": "2026-05-29T04:56:48.226199Z",
+  "worker_done_at": "2026-05-29T04:56:48.226199Z"
 }

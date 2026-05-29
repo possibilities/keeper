@@ -50,5 +50,5 @@ type exist and migrate cleanly.
 - [ ] Migration is idempotent and forward-only; re-fold from an empty table reproduces the zero-event defaults.
 
 ## Done summary
-
+Bumped SCHEMA_VERSION 33→34; added resolved_epic_deps TEXT (nullable) to epics + epic_dep_edges reverse-index table with dep_token index; wired into EPICS_DESCRIPTOR + jsonColumns; added Epic.resolved_epic_deps + ResolvedEpicDep type; migration + decode tests pass. Fixed makeEpic fixtures in 4 test files + reducer.test getEpic cast in follow-up commit.
 ## Evidence
