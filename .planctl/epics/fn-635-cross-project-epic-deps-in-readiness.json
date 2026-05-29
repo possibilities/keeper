@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-635-cross-project-epic-deps-in-readiness",
   "bundles": [],
   "closer_done_at": "2026-05-29T00:08:15.885211Z",
@@ -18,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-29T00:08:15.885211Z"
+  "updated_at": "2026-05-29T00:08:30.562392Z"
 }
