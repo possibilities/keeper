@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "replay bridge, RPC, main append-and-flip",
-  "updated_at": "2026-05-29T15:00:36.105354Z"
+  "updated_at": "2026-05-29T20:19:29.217445Z",
+  "worker_done_at": "2026-05-29T20:19:29.217445Z"
 }

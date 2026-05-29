@@ -65,5 +65,5 @@ log and main stays the sole writer of the replayed event.
 - [ ] Re-fold is byte-identical and never touches dead_letters.
 
 ## Done summary
-
+replay_dead_letter RPC implemented: server-worker→main async bridge with correlation-id + timeout, recoverOneDeadLetter BEGIN IMMEDIATE transaction (insert event + flip row), pumpWakes to fold recovered session into jobs. Oldest-first; zero-waiting returns clean ack. Full test coverage including integration round-trip.
 ## Evidence
