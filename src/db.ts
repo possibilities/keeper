@@ -3468,9 +3468,9 @@ function migrate(db: Database): void {
       // The `''` sentinel's basename is `""` — left in place as a valid
       // (but non-joining) `profile_name`; the `profile_name != ''` guard on
       // both sides of the join keeps it out of any usage join.
-      const rows = db
-        .prepare("SELECT config_dir FROM profiles")
-        .all() as { config_dir: string }[];
+      const rows = db.prepare("SELECT config_dir FROM profiles").all() as {
+        config_dir: string;
+      }[];
       const updateStmt = db.prepare(
         "UPDATE profiles SET profile_name = ? WHERE config_dir = ?",
       );
