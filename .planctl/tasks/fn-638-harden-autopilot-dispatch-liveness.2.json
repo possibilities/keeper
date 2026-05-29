@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "autopilot name flag links worker to task",
-  "updated_at": "2026-05-29T01:25:32.806518Z"
+  "updated_at": "2026-05-29T01:52:59.649794Z",
+  "worker_done_at": "2026-05-29T01:52:59.649794Z"
 }

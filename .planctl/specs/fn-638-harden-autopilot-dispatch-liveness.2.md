@@ -63,5 +63,5 @@ the root mutex — the guard must exist before linking is enabled.
 - [ ] Name survives the launchInGhostty quoting chain (verified)
 
 ## Done summary
-
+Closed the autopilot→keeper linkage gap (P1 root cause). All four real dispatch sites in processLaunchTransitions now route through a new exported buildClaudeDispatchCommand helper that emits --name <verb>::<id> matching SPAWN_VERB_REF_RE; work uses task id, close/approve-close use epic id, approve-task uses task id. Display builders untouched (byte-exact tests stay green). Six new unit tests pin the deriver-regex contract, per-verb id form, empty-projectDir no-cd path, and the single-token/no-shell-metachar invariants the ps -o args= scrape and launchInGhostty quoting chain depend on.
 ## Evidence
