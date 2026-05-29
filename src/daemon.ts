@@ -87,7 +87,11 @@ import type { GitWorkerData, GitWorkerMessage } from "./git-worker";
 import type { PlanMessage, PlanWorkerData } from "./plan-worker";
 import { DEFAULT_BATCH_SIZE, drain } from "./reducer";
 import { seedKilledSweep } from "./seed-sweep";
-import type { ServerWorkerData } from "./server-worker";
+import type {
+  ReplayRequestMessage,
+  ReplayResultMessage,
+  ServerWorkerData,
+} from "./server-worker";
 import type {
   ApiErrorMessage,
   InputRequestMessage,
@@ -266,6 +270,205 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
 }
 
 /**
+ * The full `events` table column list, in CREATE_EVENTS order. Used by
+ * {@link recoverOneDeadLetter} to drive a dynamic INSERT against the
+ * row's stored `bindings` blob: only the columns the dead-letter record
+ * actually carries are bound, so a re-fold reproduces byte-identical to
+ * what the hook would have written had its INSERT not failed. Held as a
+ * module constant so adding a column means touching THIS list AND the
+ * CREATE_EVENTS literal AND the prepared `insertEvent` statement
+ * (a shared boundary that's been tight in this repo since fn-456).
+ *
+ * `id` is omitted — it's `INTEGER PRIMARY KEY AUTOINCREMENT`, SQLite
+ * picks a fresh higher value than every existing row so the replayed
+ * event lands at the tail of the log and folds at the end of the next
+ * drain pass.
+ */
+const EVENTS_COLUMNS = [
+  "ts",
+  "session_id",
+  "pid",
+  "hook_event",
+  "event_type",
+  "tool_name",
+  "matcher",
+  "cwd",
+  "permission_mode",
+  "agent_id",
+  "agent_type",
+  "stop_hook_active",
+  "data",
+  "subagent_agent_id",
+  "spawn_name",
+  "start_time",
+  "slash_command",
+  "skill_name",
+  "planctl_op",
+  "planctl_target",
+  "planctl_epic_id",
+  "planctl_task_id",
+  "planctl_subject_present",
+  "tool_use_id",
+  "config_dir",
+  "planctl_queue_jump",
+  "bash_mutation_kind",
+  "bash_mutation_targets",
+] as const;
+
+/**
+ * Recover ONE oldest `waiting` dead-letter row (fn-643 task .4). Picks the
+ * row with the smallest `(dl_written_at, dl_id)` tuple, rebuilds an
+ * `events` INSERT from its stored `bindings`, and flips the row to
+ * `recovered` (stamping `recovered_at` + `replayed_event_id`) — all in
+ * ONE `BEGIN IMMEDIATE` transaction. Returns the recovered row's `dl_id`
+ * on success, or `null` when the table had zero `waiting` rows.
+ *
+ * MUST run on main (the daemon's writer connection); the server-worker's
+ * `replay_dead_letter` RPC routes through the worker→main bridge so this
+ * write lands here, preserving the CLAUDE.md invariant "main is the sole
+ * writer of the events log". The replayed event is a PLAIN REAL event
+ * (carrying the original `pid`, `start_time`, `config_dir`, `data`,
+ * etc.), NOT a synthetic mint — a from-scratch re-fold against the post-
+ * recovery event log reproduces the projection byte-identically (the
+ * reducer treats the replayed row exactly as it would have treated the
+ * hook's original INSERT had it not failed). `dead_letters` itself is
+ * never touched by a re-fold per the schema-v37 invariant.
+ *
+ * Transactional shape (`BEGIN IMMEDIATE`):
+ * 1. SELECT the oldest waiting row (`ORDER BY dl_written_at, dl_id LIMIT 1`).
+ * 2. If none, COMMIT and return null.
+ * 3. Build the INSERT column list from `EVENTS_COLUMNS ∩ keys(bindings)`
+ *    — forward-compat: a future-schema binding for an unknown column is
+ *    dropped on replay (per the dead-letter docstring's contract).
+ * 4. Run the INSERT, capture `lastInsertRowid` as `replayed_event_id`.
+ * 5. UPDATE the `dead_letters` row: status='recovered', recovered_at=now,
+ *    replayed_event_id=<captured>.
+ * 6. COMMIT.
+ *
+ * A throw inside the transaction rolls back BOTH the INSERT and the
+ * UPDATE — the row stays `waiting`, the events log stays untouched, and
+ * the dispatcher surfaces `rpc_failed`. The next replay invocation re-
+ * tries the same row.
+ *
+ * Idempotency under re-invocation: a successful recovery flips the row
+ * to `recovered`; the same row will never be picked again (the
+ * `WHERE status='waiting'` predicate filters it out). Two back-to-back
+ * replays drain two rows oldest-first; a third on an empty backlog
+ * returns null cleanly.
+ *
+ * Exported for direct test reach.
+ */
+export function recoverOneDeadLetter(db: Database): string | null {
+  // bun:sqlite exposes `db.transaction(fn)` for an explicit BEGIN/COMMIT
+  // wrapper, BUT the inline `db.exec("BEGIN IMMEDIATE"); ... COMMIT/
+  // ROLLBACK` form is what the reducer uses (`src/reducer.ts:drain`) and
+  // it composes cleanly with the inline SQL here. Symmetry > API
+  // shape.
+  db.run("BEGIN IMMEDIATE");
+  let recoveredDlId: string | null = null;
+  try {
+    const row = db
+      .prepare(
+        `SELECT dl_id, bindings, ts, session_id, hook_event, pid
+           FROM dead_letters
+          WHERE status = 'waiting'
+          ORDER BY dl_written_at ASC, dl_id ASC
+          LIMIT 1`,
+      )
+      .get() as {
+      dl_id: string;
+      bindings: string;
+      ts: number;
+      session_id: string;
+      hook_event: string;
+      pid: number | null;
+    } | null;
+    if (row === null) {
+      db.run("COMMIT");
+      return null;
+    }
+    // Parse the stored bindings. A malformed JSON blob is a real bug
+    // (the import path validated structure on the way in), but a stored
+    // record from a future schema may carry keys we don't know how to
+    // bind — we drop those silently per the forward-compat contract.
+    // Throwing here would leak `rpc_failed` to the client AND leave the
+    // row in `waiting` for the next replay to retry. A schema-bug
+    // diagnostic above (logged) would be nice; for now we rely on the
+    // import path's parser to reject malformed blobs.
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.bindings);
+    } catch (err) {
+      // The bindings blob is unparseable. We can't replay the row; throw
+      // so the transaction rolls back and the row stays `waiting` for an
+      // operator to inspect. The error message names the dl_id so logs
+      // pinpoint the offending row.
+      throw new Error(
+        `replay: bindings JSON parse failed for dl_id ${row.dl_id}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed)
+    ) {
+      throw new Error(
+        `replay: bindings is not a JSON object for dl_id ${row.dl_id}`,
+      );
+    }
+    const bindings = parsed as Record<string, unknown>;
+
+    // Build the INSERT column list from the intersection of the events
+    // column set and the bindings keys. Unknown keys are dropped; missing
+    // known keys bind NULL via the `?? null` in the values mapper below.
+    // The column list is interpolated directly because EVENTS_COLUMNS is
+    // a module constant (no wire text); values are bound positionally.
+    const presentCols = EVENTS_COLUMNS.filter((c) =>
+      Object.prototype.hasOwnProperty.call(bindings, c),
+    );
+    if (presentCols.length === 0) {
+      throw new Error(
+        `replay: bindings carry no recognized events columns for dl_id ${row.dl_id}`,
+      );
+    }
+    const placeholders = presentCols.map(() => "?").join(", ");
+    const values = presentCols.map((c) => {
+      const v = bindings[c];
+      // SQLite storage classes are TEXT / INTEGER / REAL / NULL /
+      // BLOB. The dead-letter `bindings` map is constrained to
+      // string / number / boolean / null (see
+      // `DeadLetterBindings`); booleans serialize as 0/1 here.
+      if (typeof v === "boolean") return v ? 1 : 0;
+      return v as string | number | null;
+    });
+    const insertSql = `INSERT INTO events (${presentCols.join(", ")}) VALUES (${placeholders})`;
+    const info = db.prepare(insertSql).run(...values);
+    const replayedEventId = Number(info.lastInsertRowid);
+
+    db.prepare(
+      `UPDATE dead_letters
+          SET status = 'recovered',
+              recovered_at = ?,
+              replayed_event_id = ?
+        WHERE dl_id = ?`,
+    ).run(Date.now() / 1000, replayedEventId, row.dl_id);
+
+    db.run("COMMIT");
+    recoveredDlId = row.dl_id;
+  } catch (err) {
+    try {
+      db.run("ROLLBACK");
+    } catch {
+      // best-effort; the throw propagates
+    }
+    throw err;
+  }
+  return recoveredDlId;
+}
+
+/**
  * Run the daemon. Returns once the process is wired up and the steady-state
  * wake loop is running; the loop itself keeps the event loop alive until SIGTERM
  * or a crash. Exported (rather than executed at import) so a test can drive boot
@@ -388,6 +591,52 @@ function runDaemon(): void {
       workerData: { dbPath } satisfies ServerWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );
+
+  // Server-worker → main bridge (fn-643 task .4). The server-worker posts
+  // {kind:"replay-request", id} when a board client invokes the
+  // `replay_dead_letter` RPC; main runs `recoverOneDeadLetter` and posts
+  // back {type:"replay-result", id, ok, recovered_dl_id?, error?}. This
+  // is the SOLE worker→main request/reply path; the existing
+  // {kind:"ready"} signal is one-way (worker→main only) and a stale
+  // message that's neither matches no branch and is silently dropped.
+  serverWorker.onmessage = (
+    ev: MessageEvent<ReplayRequestMessage | { kind: "ready" } | undefined>,
+  ): void => {
+    const msg = ev.data;
+    if (!msg || msg.kind !== "replay-request") {
+      return;
+    }
+    const id = msg.id;
+    let reply: ReplayResultMessage;
+    try {
+      const recoveredDlId = recoverOneDeadLetter(db);
+      reply = {
+        type: "replay-result",
+        id,
+        ok: true,
+        recovered_dl_id: recoveredDlId,
+      };
+      if (recoveredDlId !== null) {
+        // We appended a real `events` row. Pump a wake so the reducer
+        // folds it (jobs / epics / etc.) without waiting for the wake
+        // worker's `data_version` poll — symmetry with the other
+        // synthetic-event mint sites in this file.
+        wakePending = true;
+        pumpWakes();
+      }
+    } catch (err) {
+      // The recovery transaction crashed (programming bug or a DB-level
+      // failure). Surface as a typed `ok:false` reply; the worker's
+      // dispatcher frames `rpc_failed` on the wire.
+      reply = {
+        type: "replay-result",
+        id,
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+    serverWorker.postMessage(reply);
+  };
 
   // Same crash policy as the wake worker: any thread failure → fatalExit → exit
   // 1 → launchd restart. No in-process respawn.

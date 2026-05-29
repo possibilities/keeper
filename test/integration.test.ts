@@ -657,6 +657,218 @@ test("end-to-end: set_task_approval RPC → atomic plan-file rewrite, set_epic_a
   expect(existsSync(sockPath)).toBe(false);
 }, 15000);
 
+test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends real event, flips waiting→recovered, session reappears", async () => {
+  // Hermetic dead-letters dir under the per-test tmp tree so the boot scan
+  // imports rows we control instead of the user's real dropped-events file.
+  // `KEEPER_DEAD_LETTER_DIR` is the env override (see `resolveDeadLetterDir`).
+  const { mkdirSync } =
+    require("node:fs") as typeof import("node:fs");
+  const deadLetterDir = join(tmpDir, "dead-letters");
+  mkdirSync(deadLetterDir, { recursive: true });
+
+  // Seed two `waiting` rows by hand: the daemon's boot scan only imports
+  // from per-pid NDJSON files via `parseDeadLetterLine`, so we open the DB,
+  // INSERT the rows, close, and let the spawned daemon pick them up via the
+  // SAME schema.
+  //
+  // Note: the boot scan above is bypassed; we INSERT directly into
+  // `dead_letters` (mirroring what the scan would have produced) so the
+  // test is hermetic against the dead-letter parser and the NDJSON file
+  // format. The post-replay assertions still drive the full
+  // worker→main→reducer round-trip.
+  {
+    const { openDb } = require("../src/db") as typeof import("../src/db");
+    const { db } = openDb(dbPath);
+    try {
+      const insertStmt = db.prepare(
+        `INSERT INTO dead_letters
+           (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+            status, recovered_at, replayed_event_id, source_file)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', NULL, NULL, NULL)`,
+      );
+      // First (oldest) waiting row: a dropped SessionStart for sess-replay-1.
+      insertStmt.run(
+        "dl-first",
+        "sess-replay-1",
+        "SessionStart",
+        1_700_000_000,
+        100,
+        4321,
+        JSON.stringify({
+          ts: 1_700_000_000,
+          session_id: "sess-replay-1",
+          pid: 4321,
+          hook_event: "SessionStart",
+          event_type: "lifecycle",
+          data: "{}",
+          cwd: "/tmp/replay",
+        }),
+      );
+      // Second waiting row — newer dl_written_at; should NOT be picked first.
+      insertStmt.run(
+        "dl-second",
+        "sess-replay-2",
+        "SessionStart",
+        1_700_000_005,
+        200,
+        4322,
+        JSON.stringify({
+          ts: 1_700_000_005,
+          session_id: "sess-replay-2",
+          pid: 4322,
+          hook_event: "SessionStart",
+          event_type: "lifecycle",
+          data: "{}",
+          cwd: "/tmp/replay-2",
+        }),
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_SOCK: sockPath,
+      KEEPER_CONFIG: configPath,
+      KEEPER_DEAD_LETTER_DIR: deadLetterDir,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const bound = await retryUntil(
+    () => (existsSync(sockPath) ? true : null),
+    3000,
+  );
+  if (!bound) {
+    const out = await readStream(daemon.stdout);
+    const err = await readStream(daemon.stderr);
+    throw new Error(`socket never bound.\nstdout:\n${out}\nstderr:\n${err}`);
+  }
+
+  async function rpc(
+    method: string,
+    params: Record<string, unknown> | undefined,
+  ): Promise<unknown> {
+    const buffer = new LineBuffer();
+    const id = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      Bun.connect({
+        unix: sockPath,
+        socket: {
+          open(s) {
+            s.write(
+              encodeFrame(
+                params === undefined
+                  ? { type: "rpc", id, method }
+                  : { type: "rpc", id, method, params },
+              ),
+            );
+          },
+          data(s, chunk) {
+            for (const line of buffer.push(chunk.toString("utf8"))) {
+              if (line.trim().length === 0) continue;
+              const frame = JSON.parse(line) as ServerFrame;
+              if ((frame as { id?: string }).id !== id) continue;
+              if (frame.type === "rpc_result") {
+                resolve(frame.value);
+              } else if (frame.type === "error") {
+                reject(
+                  new Error(
+                    `${(frame as { code: string }).code}: ${(frame as { message: string }).message}`,
+                  ),
+                );
+              }
+              s.end();
+              return;
+            }
+          },
+          close() {},
+          error(_s, err) {
+            reject(err);
+          },
+        },
+      }).catch(reject);
+    });
+  }
+
+  // First replay: oldest waiting row (dl-first, sess-replay-1) flips to
+  // recovered; the events log gains a real SessionStart row; the reducer
+  // folds it into a fresh `jobs` row.
+  const first = (await rpc("replay_dead_letter", {})) as {
+    ok: boolean;
+    recovered_dl_id: string | null;
+  };
+  expect(first).toEqual({ ok: true, recovered_dl_id: "dl-first" });
+
+  // Poll the jobs projection for the recovered session.
+  const verify = await retryUntil(() => {
+    const { openDb } =
+      require("../src/db") as typeof import("../src/db");
+    const { db } = openDb(dbPath, { readonly: true });
+    try {
+      const job = db
+        .query(
+          "SELECT job_id, state, cwd FROM jobs WHERE job_id = 'sess-replay-1'",
+        )
+        .get() as { job_id: string; state: string; cwd: string } | null;
+      const dl = db
+        .query(
+          "SELECT status, replayed_event_id FROM dead_letters WHERE dl_id = 'dl-first'",
+        )
+        .get() as {
+        status: string;
+        replayed_event_id: number | null;
+      } | null;
+      if (
+        job &&
+        dl &&
+        dl.status === "recovered" &&
+        dl.replayed_event_id !== null
+      ) {
+        return { job, dl };
+      }
+      return null;
+    } finally {
+      db.close();
+    }
+  }, 3000);
+  expect(verify).not.toBeNull();
+  expect(verify?.job.job_id).toBe("sess-replay-1");
+  expect(verify?.job.cwd).toBe("/tmp/replay");
+
+  // Second replay: drains the next oldest (dl-second).
+  const second = (await rpc("replay_dead_letter", {})) as {
+    ok: boolean;
+    recovered_dl_id: string | null;
+  };
+  expect(second).toEqual({ ok: true, recovered_dl_id: "dl-second" });
+
+  // Third replay: backlog empty → clean ack, NOT an error.
+  const third = (await rpc("replay_dead_letter", undefined)) as {
+    ok: boolean;
+    recovered_dl_id: string | null;
+  };
+  expect(third).toEqual({ ok: true, recovered_dl_id: null });
+
+  // A bad params payload is rejected as `bad_params` and the connection
+  // survives — the dispatcher contract for typed validation throws.
+  try {
+    await rpc("replay_dead_letter", { dl_id: "nope" });
+    throw new Error("expected bad_params rejection");
+  } catch (e) {
+    expect(String(e)).toMatch(/bad_params/);
+  }
+
+  daemon.kill("SIGTERM");
+  expect(await daemon.exited).toBe(0);
+  expect(existsSync(sockPath)).toBe(false);
+}, 15000);
+
 test("end-to-end: transcript worker → custom-title write flips jobs.title to 'transcript'", async () => {
   const sessionId = "sess-transcript-e2e";
 

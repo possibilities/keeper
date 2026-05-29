@@ -10,7 +10,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { drainToCompletion } from "../src/daemon";
+import { drainToCompletion, recoverOneDeadLetter } from "../src/daemon";
 import { openDb } from "../src/db";
 import { drain } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
@@ -561,5 +561,380 @@ test("seed sweep ignores rows already in terminal states (ended, killed) and row
   expect(stateOf("sess-already-killed")).toBe("killed");
   expect(stateOf("sess-no-pid")).toBe("stopped");
 
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// recoverOneDeadLetter (fn-643 task .4 — the replay transaction)
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert one dead-letter row in the `waiting` state. Mirrors what
+ * `scanDeadLetterDir` would have written from a parsed NDJSON record. Each
+ * test that needs more rows calls this multiple times — write-time keys
+ * `(dl_written_at, dl_id)` drive the oldest-first replay pick.
+ */
+function seedDeadLetter(
+  db: ReturnType<typeof openDb>["db"],
+  opts: {
+    dl_id: string;
+    session_id: string;
+    hook_event: string;
+    ts: number;
+    dl_written_at: number;
+    pid?: number | null;
+    bindings: Record<string, unknown>;
+    source_file?: string | null;
+  },
+): void {
+  db.prepare(
+    `INSERT INTO dead_letters
+       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+        status, recovered_at, replayed_event_id, source_file)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', NULL, NULL, ?)`,
+  ).run(
+    opts.dl_id,
+    opts.session_id,
+    opts.hook_event,
+    opts.ts,
+    opts.dl_written_at,
+    opts.pid ?? null,
+    JSON.stringify(opts.bindings),
+    opts.source_file ?? null,
+  );
+}
+
+test("recoverOneDeadLetter appends a real events row + flips dead_letters to recovered, in one transaction", () => {
+  const { db } = openDb(dbPath);
+  // Seed one SessionStart dead-letter — the dropped-incident scenario.
+  seedDeadLetter(db, {
+    dl_id: "dl-aaa",
+    session_id: "sess-recovered",
+    hook_event: "SessionStart",
+    ts: 1_700_000_000,
+    dl_written_at: 1_700_000_001,
+    pid: 4242,
+    bindings: {
+      ts: 1_700_000_000,
+      session_id: "sess-recovered",
+      pid: 4242,
+      hook_event: "SessionStart",
+      event_type: "lifecycle",
+      data: JSON.stringify({}),
+      cwd: "/tmp/foo",
+      spawn_name: "agent-x",
+      start_time: "darwin:Mon Jan  1 00:00:00 2026",
+      config_dir: null,
+    },
+  });
+
+  const eventsBefore = (
+    db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
+  ).n;
+
+  const dlId = recoverOneDeadLetter(db);
+  expect(dlId).toBe("dl-aaa");
+
+  // A real events row landed, carrying the stored bindings verbatim.
+  const eventsAfter = (
+    db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
+  ).n;
+  expect(eventsAfter).toBe(eventsBefore + 1);
+  const replayed = db
+    .query(
+      `SELECT id, session_id, hook_event, pid, cwd, spawn_name, start_time, ts
+         FROM events WHERE session_id = 'sess-recovered'`,
+    )
+    .get() as {
+    id: number;
+    session_id: string;
+    hook_event: string;
+    pid: number | null;
+    cwd: string | null;
+    spawn_name: string | null;
+    start_time: string | null;
+    ts: number;
+  };
+  expect(replayed.hook_event).toBe("SessionStart");
+  expect(replayed.pid).toBe(4242);
+  expect(replayed.cwd).toBe("/tmp/foo");
+  expect(replayed.spawn_name).toBe("agent-x");
+  expect(replayed.start_time).toBe("darwin:Mon Jan  1 00:00:00 2026");
+  // ts preserved verbatim (NOT stamped to Date.now()/1000 — this is a real
+  // event with the original wall-clock time).
+  expect(replayed.ts).toBe(1_700_000_000);
+
+  // Dead-letter row flipped to recovered with the captured event id.
+  const dlRow = db
+    .query(
+      `SELECT status, recovered_at, replayed_event_id FROM dead_letters WHERE dl_id = 'dl-aaa'`,
+    )
+    .get() as {
+    status: string;
+    recovered_at: number;
+    replayed_event_id: number;
+  };
+  expect(dlRow.status).toBe("recovered");
+  expect(dlRow.replayed_event_id).toBe(replayed.id);
+  expect(typeof dlRow.recovered_at).toBe("number");
+  expect(dlRow.recovered_at).toBeGreaterThan(0);
+
+  db.close();
+});
+
+test("recoverOneDeadLetter folded by the reducer → jobs row appears for the recovered session", () => {
+  const { db } = openDb(dbPath);
+  seedDeadLetter(db, {
+    dl_id: "dl-bbb",
+    session_id: "sess-folded",
+    hook_event: "SessionStart",
+    ts: 1_700_000_010,
+    dl_written_at: 1_700_000_011,
+    pid: 9999,
+    bindings: {
+      ts: 1_700_000_010,
+      session_id: "sess-folded",
+      pid: 9999,
+      hook_event: "SessionStart",
+      event_type: "lifecycle",
+      data: JSON.stringify({}),
+      cwd: "/work",
+    },
+  });
+
+  // No jobs row yet — the SessionStart was dropped before this test ran.
+  const before = db
+    .query("SELECT COUNT(*) AS n FROM jobs WHERE job_id = 'sess-folded'")
+    .get() as { n: number };
+  expect(before.n).toBe(0);
+
+  expect(recoverOneDeadLetter(db)).toBe("dl-bbb");
+
+  // Drain folds the appended event into the projection.
+  drainToCompletion(db);
+
+  const after = db
+    .query("SELECT job_id, state, cwd FROM jobs WHERE job_id = 'sess-folded'")
+    .get() as { job_id: string; state: string; cwd: string };
+  expect(after.job_id).toBe("sess-folded");
+  // The reducer's SessionStart fold seeds a row in 'stopped' state — the
+  // session would flip to 'working' on the next UserPromptSubmit. Replaying
+  // just the dropped SessionStart resurrects the row, which is the whole
+  // point of the recovery (the row appears on the board where it was
+  // invisible before).
+  expect(after.state).toBe("stopped");
+  expect(after.cwd).toBe("/work");
+
+  db.close();
+});
+
+test("recoverOneDeadLetter picks the OLDEST waiting row, ordered by (dl_written_at ASC, dl_id ASC)", () => {
+  const { db } = openDb(dbPath);
+  // Three rows; the middle write_at is the oldest by dl_written_at, and the
+  // dl_id tiebreaker resolves the dl_written_at tie deterministically.
+  seedDeadLetter(db, {
+    dl_id: "dl-2",
+    session_id: "sess-2",
+    hook_event: "SessionStart",
+    ts: 1,
+    dl_written_at: 200,
+    bindings: {
+      ts: 1,
+      session_id: "sess-2",
+      hook_event: "SessionStart",
+      event_type: "lifecycle",
+      data: "{}",
+    },
+  });
+  seedDeadLetter(db, {
+    dl_id: "dl-1a",
+    session_id: "sess-1a",
+    hook_event: "SessionStart",
+    ts: 1,
+    dl_written_at: 100,
+    bindings: {
+      ts: 1,
+      session_id: "sess-1a",
+      hook_event: "SessionStart",
+      event_type: "lifecycle",
+      data: "{}",
+    },
+  });
+  seedDeadLetter(db, {
+    dl_id: "dl-1b",
+    session_id: "sess-1b",
+    hook_event: "SessionStart",
+    ts: 1,
+    dl_written_at: 100,
+    bindings: {
+      ts: 1,
+      session_id: "sess-1b",
+      hook_event: "SessionStart",
+      event_type: "lifecycle",
+      data: "{}",
+    },
+  });
+
+  // Oldest by dl_written_at (100) with the smallest dl_id ('dl-1a') wins.
+  expect(recoverOneDeadLetter(db)).toBe("dl-1a");
+  // Next oldest at dl_written_at=100 with dl_id 'dl-1b'.
+  expect(recoverOneDeadLetter(db)).toBe("dl-1b");
+  // Then the dl_written_at=200 row.
+  expect(recoverOneDeadLetter(db)).toBe("dl-2");
+  // No more waiting rows.
+  expect(recoverOneDeadLetter(db)).toBeNull();
+
+  db.close();
+});
+
+test("recoverOneDeadLetter on empty backlog returns null and writes nothing", () => {
+  const { db } = openDb(dbPath);
+  const eventsBefore = (
+    db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
+  ).n;
+  expect(recoverOneDeadLetter(db)).toBeNull();
+  const eventsAfter = (
+    db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
+  ).n;
+  expect(eventsAfter).toBe(eventsBefore);
+  db.close();
+});
+
+test("recoverOneDeadLetter rolls back the events INSERT on malformed bindings; row stays waiting", () => {
+  const { db } = openDb(dbPath);
+  // Hand-write a row with garbage `bindings` JSON (bypassing
+  // parseDeadLetterLine which would have rejected it on the import path).
+  db.prepare(
+    `INSERT INTO dead_letters
+       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+        status, recovered_at, replayed_event_id, source_file)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', NULL, NULL, NULL)`,
+  ).run(
+    "dl-bad",
+    "sess-bad",
+    "SessionStart",
+    1,
+    1,
+    null,
+    "this is not json",
+  );
+
+  const eventsBefore = (
+    db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
+  ).n;
+  expect(() => recoverOneDeadLetter(db)).toThrow(/bindings JSON parse failed/);
+  // Transaction rolled back: no events row, dead-letter row still waiting.
+  const eventsAfter = (
+    db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
+  ).n;
+  expect(eventsAfter).toBe(eventsBefore);
+  const dlRow = db
+    .query("SELECT status FROM dead_letters WHERE dl_id = 'dl-bad'")
+    .get() as { status: string };
+  expect(dlRow.status).toBe("waiting");
+  db.close();
+});
+
+test("recoverOneDeadLetter forward-compat: unknown columns in bindings are dropped, known ones bind", () => {
+  const { db } = openDb(dbPath);
+  seedDeadLetter(db, {
+    dl_id: "dl-fwd",
+    session_id: "sess-fwd",
+    hook_event: "SessionStart",
+    ts: 5,
+    dl_written_at: 5,
+    bindings: {
+      ts: 5,
+      session_id: "sess-fwd",
+      hook_event: "SessionStart",
+      event_type: "lifecycle",
+      data: "{}",
+      // A column from a hypothetical future schema — dropped on replay.
+      future_column_v99: "should-be-ignored",
+    },
+  });
+  expect(recoverOneDeadLetter(db)).toBe("dl-fwd");
+  const row = db
+    .query(
+      "SELECT session_id, hook_event FROM events WHERE session_id = 'sess-fwd'",
+    )
+    .get() as { session_id: string; hook_event: string };
+  expect(row.session_id).toBe("sess-fwd");
+  expect(row.hook_event).toBe("SessionStart");
+  db.close();
+});
+
+test("recoverOneDeadLetter skips rows already in `recovered` status (idempotency under re-invocation)", () => {
+  const { db } = openDb(dbPath);
+  seedDeadLetter(db, {
+    dl_id: "dl-once",
+    session_id: "sess-once",
+    hook_event: "SessionStart",
+    ts: 1,
+    dl_written_at: 1,
+    bindings: {
+      ts: 1,
+      session_id: "sess-once",
+      hook_event: "SessionStart",
+      event_type: "lifecycle",
+      data: "{}",
+    },
+  });
+  expect(recoverOneDeadLetter(db)).toBe("dl-once");
+  // A second invocation sees zero waiting rows — the same dl_id never
+  // recovers twice.
+  expect(recoverOneDeadLetter(db)).toBeNull();
+  db.close();
+});
+
+test("recoverOneDeadLetter does NOT touch dead_letters on a re-fold (the row survives DELETE FROM jobs+epics)", () => {
+  // Re-fold determinism invariant (CLAUDE.md "DO NOT" — dead_letters is an
+  // operational sidecar, NEVER a fold target). Recover, then simulate a
+  // from-scratch re-fold: zero the cursor + delete projections + re-drain.
+  // dead_letters row must survive byte-identically.
+  const { db } = openDb(dbPath);
+  seedDeadLetter(db, {
+    dl_id: "dl-refold",
+    session_id: "sess-refold",
+    hook_event: "SessionStart",
+    ts: 7,
+    dl_written_at: 7,
+    bindings: {
+      ts: 7,
+      session_id: "sess-refold",
+      hook_event: "SessionStart",
+      event_type: "lifecycle",
+      data: "{}",
+    },
+  });
+  expect(recoverOneDeadLetter(db)).toBe("dl-refold");
+  drainToCompletion(db);
+
+  const dlBefore = db
+    .query("SELECT * FROM dead_letters WHERE dl_id = 'dl-refold'")
+    .get() as Record<string, unknown>;
+
+  // Simulate a from-scratch re-fold.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  drainToCompletion(db);
+
+  const dlAfter = db
+    .query("SELECT * FROM dead_letters WHERE dl_id = 'dl-refold'")
+    .get() as Record<string, unknown>;
+  expect(dlAfter).toEqual(dlBefore);
+  // The re-fold reproduced the jobs row from the events log.
+  const job = db
+    .query("SELECT state FROM jobs WHERE job_id = 'sess-refold'")
+    .get() as { state: string };
+  // The reducer's SessionStart fold seeds a row in 'stopped' state (the
+  // initial state — the row flips to 'working' only on the next
+  // UserPromptSubmit). Replaying just the SessionStart resurrects the row;
+  // the rest of the session lifecycle would arrive via subsequent events
+  // if any were dead-lettered alongside (out of scope for v1 — replay is
+  // one record at a time, and a partial recovery is still strictly better
+  // than the row never appearing on the board).
+  expect(job.state).toBe("stopped");
   db.close();
 });

@@ -24,11 +24,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb, serializePlanctlJson } from "../src/db";
 import {
+  replayDeadLetterHandler,
   resolvePlanFile,
   setEpicApprovalHandler,
   setTaskApprovalHandler,
 } from "../src/rpc-handlers";
-import { BadParamsError } from "../src/server-worker";
+import {
+  BadParamsError,
+  type ReplayBridge,
+} from "../src/server-worker";
 
 let tmpDir: string;
 let dbPath: string;
@@ -477,4 +481,84 @@ test("resolvePlanFile walks one level deep to find <root>/<project>/.planctl/...
 test("resolvePlanFile returns null when no root carries the file", () => {
   expect(resolvePlanFile([planRoot], "tasks", "fn-nx.1")).toBeNull();
   expect(resolvePlanFile([], "epics", "fn-nx")).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// replay_dead_letter (async — routes through the worker→main bridge)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a stub bridge whose `replay()` resolves with a fixed result. Lets
+ * the unit layer drive `replayDeadLetterHandler` directly without a real
+ * worker / parent port — the handler's job is "validate params, call
+ * bridge.replay, normalize the response", and a stub captures every call
+ * for shape assertions.
+ */
+function stubBridge(
+  result:
+    | { ok: true; recovered_dl_id?: string | null }
+    | { ok: false; error?: string },
+): { bridge: ReplayBridge; state: { calls: number } } {
+  const state = { calls: 0 };
+  const bridge: ReplayBridge = {
+    async replay() {
+      state.calls += 1;
+      return result;
+    },
+  };
+  return { bridge, state };
+}
+
+test("replay_dead_letter calls bridge.replay and normalizes recovered_dl_id", async () => {
+  const { bridge } = stubBridge({ ok: true, recovered_dl_id: "dl-1" });
+  const result = await replayDeadLetterHandler(undefined, bridge);
+  expect(result).toEqual({ ok: true, recovered_dl_id: "dl-1" });
+});
+
+test("replay_dead_letter normalizes a missing recovered_dl_id to null (empty backlog ack)", async () => {
+  const { bridge } = stubBridge({ ok: true });
+  const result = await replayDeadLetterHandler(undefined, bridge);
+  expect(result).toEqual({ ok: true, recovered_dl_id: null });
+});
+
+test("replay_dead_letter normalizes explicit null recovered_dl_id", async () => {
+  const { bridge } = stubBridge({ ok: true, recovered_dl_id: null });
+  const result = await replayDeadLetterHandler(null, bridge);
+  expect(result).toEqual({ ok: true, recovered_dl_id: null });
+});
+
+test("replay_dead_letter accepts an empty object as params", async () => {
+  const { bridge } = stubBridge({ ok: true, recovered_dl_id: "dl-2" });
+  const result = await replayDeadLetterHandler({}, bridge);
+  expect(result).toEqual({ ok: true, recovered_dl_id: "dl-2" });
+});
+
+test("replay_dead_letter throws BadParamsError on non-object params", async () => {
+  const { bridge } = stubBridge({ ok: true });
+  for (const bad of ["nope", 42, true, [1, 2]]) {
+    expect(replayDeadLetterHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
+test("replay_dead_letter throws BadParamsError on params with extra keys", async () => {
+  const { bridge } = stubBridge({ ok: true });
+  expect(
+    replayDeadLetterHandler({ dl_id: "dl-1" }, bridge),
+  ).rejects.toBeInstanceOf(BadParamsError);
+});
+
+test("replay_dead_letter throws (rpc_failed framing) when bridge reports ok:false", async () => {
+  const { bridge } = stubBridge({ ok: false, error: "main crashed" });
+  expect(
+    replayDeadLetterHandler(undefined, bridge),
+  ).rejects.toThrow(/main crashed/);
+});
+
+test("replay_dead_letter throws a generic message when ok:false carries no error string", async () => {
+  const { bridge } = stubBridge({ ok: false });
+  expect(
+    replayDeadLetterHandler(undefined, bridge),
+  ).rejects.toThrow(/main reported failure/);
 });

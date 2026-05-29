@@ -42,14 +42,18 @@ import type {
 } from "../src/protocol";
 import {
   acquireLock,
+  ASYNC_RPC_REGISTRY,
   BadParamsError,
   type ConnState,
   diffTick,
+  type DispatchAsyncCtx,
   dispatchLine,
   isPidAlive,
   LockHeldError,
   pollLoop,
   RPC_REGISTRY,
+  type ReplayBridge,
+  registerAsyncRpc,
   registerRpc,
   resolveFilter,
   resumePending,
@@ -937,6 +941,193 @@ test("registerRpc throws on duplicate method", () => {
   const teardown = withRpc("dup", () => null);
   try {
     expect(() => registerRpc("dup", () => null)).toThrow(/already registered/);
+  } finally {
+    teardown();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Async RPC dispatch (fn-643 task .4 — `replay_dead_letter` substrate)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a stub `DispatchAsyncCtx` with a synchronous-resolving bridge and a
+ * collector for frames delivered via `onAsyncResult`. The handler returns
+ * the value the bridge resolves with.
+ */
+function asyncCtxStub(opts: {
+  replay: () => Promise<{
+    ok: boolean;
+    recovered_dl_id?: string | null;
+    error?: string;
+  }>;
+}): {
+  ctx: DispatchAsyncCtx;
+  bridgeCalls: { count: number };
+  delivered: ServerFrame[][];
+} {
+  const bridgeCalls = { count: 0 };
+  const delivered: ServerFrame[][] = [];
+  const bridge: ReplayBridge = {
+    async replay() {
+      bridgeCalls.count += 1;
+      return opts.replay();
+    },
+  };
+  const ctx: DispatchAsyncCtx = {
+    bridge,
+    onAsyncResult: (frames) => {
+      delivered.push(frames);
+    },
+  };
+  return { ctx, bridgeCalls, delivered };
+}
+
+function withAsyncRpc(
+  method: string,
+  handler: (params: unknown, bridge: ReplayBridge) => Promise<unknown>,
+): () => void {
+  registerAsyncRpc(method, handler);
+  return () => unregisterRpc(method);
+}
+
+test("ASYNC_RPC_REGISTRY is empty by default", () => {
+  expect(ASYNC_RPC_REGISTRY.size).toBe(0);
+});
+
+test("dispatchLine async rpc → returns [] inline; ctx.onAsyncResult delivers rpc_result on resolution", async () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const teardown = withAsyncRpc("async_noop", async (_params, bridge) => {
+    const r = await bridge.replay();
+    return { ok: true, dl: r.recovered_dl_id };
+  });
+  try {
+    const conn = newConn();
+    const { ctx, bridgeCalls, delivered } = asyncCtxStub({
+      replay: async () => ({ ok: true, recovered_dl_id: "dl-7" }),
+    });
+    const inline = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "async_noop" }),
+      db,
+      ctx,
+    );
+    expect(inline).toEqual([]);
+    // Let the microtask queue flush so the resolved promise lands.
+    await Bun.sleep(10);
+    expect(bridgeCalls.count).toBe(1);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toHaveLength(1);
+    const frame = delivered[0][0] as RpcResultFrame;
+    expect(frame.type).toBe("rpc_result");
+    expect(frame.id).toBe("r1");
+    expect(frame.value).toEqual({ ok: true, dl: "dl-7" });
+  } finally {
+    teardown();
+    db.close();
+  }
+});
+
+test("dispatchLine async rpc → handler throw flows to rpc_failed via onAsyncResult", async () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const teardown = withAsyncRpc("async_boom", async () => {
+    throw new Error("kaboom-async");
+  });
+  try {
+    const conn = newConn();
+    const { ctx, delivered } = asyncCtxStub({
+      replay: async () => ({ ok: true, recovered_dl_id: null }),
+    });
+    const inline = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "async_boom" }),
+      db,
+      ctx,
+    );
+    expect(inline).toEqual([]);
+    await Bun.sleep(10);
+    expect(delivered).toHaveLength(1);
+    const frame = delivered[0][0] as ErrorFrame;
+    expect(frame.type).toBe("error");
+    expect(frame.code).toBe("rpc_failed");
+    expect(frame.id).toBe("r1");
+    expect(frame.message).toContain("kaboom-async");
+  } finally {
+    teardown();
+    db.close();
+  }
+});
+
+test("dispatchLine async rpc → BadParamsError throw flows to bad_params via onAsyncResult", async () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const teardown = withAsyncRpc("async_strict", async () => {
+    throw new BadParamsError("nope shape mismatch");
+  });
+  try {
+    const conn = newConn();
+    const { ctx, delivered } = asyncCtxStub({
+      replay: async () => ({ ok: true }),
+    });
+    dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "async_strict" }),
+      db,
+      ctx,
+    );
+    await Bun.sleep(10);
+    expect(delivered).toHaveLength(1);
+    const frame = delivered[0][0] as ErrorFrame;
+    expect(frame.code).toBe("bad_params");
+    expect(frame.id).toBe("r1");
+    expect(frame.message).toContain("nope shape mismatch");
+  } finally {
+    teardown();
+    db.close();
+  }
+});
+
+test("dispatchLine async rpc without asyncCtx → unknown_method (legacy sync caller is unchanged)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const teardown = withAsyncRpc("async_no_ctx", async () => ({ ok: true }));
+  try {
+    const conn = newConn();
+    const frames = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "async_no_ctx" }),
+      db,
+      // no asyncCtx — caller hasn't opted in
+    );
+    expect(frames).toHaveLength(1);
+    expect(frames[0].type).toBe("error");
+    expect((frames[0] as ErrorFrame).code).toBe("unknown_method");
+    expect((frames[0] as ErrorFrame).id).toBe("r1");
+  } finally {
+    teardown();
+    db.close();
+  }
+});
+
+test("registerAsyncRpc collides with a same-name sync registration", () => {
+  const teardown = withRpc("collide", () => null);
+  try {
+    expect(() =>
+      registerAsyncRpc("collide", async () => null),
+    ).toThrow(/already registered/);
+  } finally {
+    teardown();
+  }
+});
+
+test("registerRpc collides with a same-name async registration", () => {
+  const teardown = withAsyncRpc("collide_async", async () => null);
+  try {
+    expect(() => registerRpc("collide_async", () => null)).toThrow(
+      /already registered/,
+    );
   } finally {
     teardown();
   }

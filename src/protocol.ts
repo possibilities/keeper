@@ -248,8 +248,11 @@ export interface RpcResultFrame {
  *   registered handler. Carries the request `id`.
  * - `"bad_params"` — an `rpc` handler rejected its `params` shape. Carries the
  *   request `id`. (Emitted from inside a handler, not the dispatch shell.)
- * - `"rpc_failed"` — an `rpc` handler threw. The thrown message is carried in
- *   `message`; the connection stays open. Carries the request `id`.
+ * - `"rpc_failed"` — an `rpc` handler threw, an async-RPC bridge to main
+ *   timed out, or main posted back `{ok: false, error}` on its replay path
+ *   (e.g. the recovery transaction itself crashed). The thrown / posted-back
+ *   message is carried in `message`; the connection stays open. Carries the
+ *   request `id`.
  *
  * `id` is set when the error is attributable to a specific client frame;
  * `collection` is set when attributable to a named collection.

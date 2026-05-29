@@ -110,12 +110,77 @@ export interface ShutdownMessage {
 }
 
 /**
+ * Worker→main request bridge for the {@link replayDeadLetterHandler} RPC
+ * (fn-643 task .4). The async-RPC dispatch path posts this message with a
+ * correlation `id` and awaits the matching {@link ReplayResultMessage} reply
+ * from main. The kind is intentionally specific (not a generic "rpc-request")
+ * — adding a second async RPC later means adding a second message kind, not
+ * widening this one, so each main-thread handler stays narrowly typed.
+ *
+ * Why route through main rather than have the worker write the events log
+ * directly: the CLAUDE.md invariant "main is the sole writer of the events
+ * log" is the determinism boundary — every projection-driving fact lives in
+ * the immutable event log via main's writable connection. The replay path
+ * appends a real (not synthetic) event built from the dead-letter row's
+ * stored bindings; that write MUST land on main so the from-scratch re-fold
+ * sees a single linear append history with no holes.
+ *
+ * No payload beyond `id` — the actual work (pick row, build event, INSERT,
+ * flip status) is a closed transaction main runs from scratch on receipt.
+ * Each request handles exactly ONE oldest-first record; a no-waiting-rows
+ * outcome flows back via {@link ReplayResultMessage}'s `recovered_dl_id:
+ * null` shape (an ok ack, not an error).
+ */
+export interface ReplayRequestMessage {
+  kind: "replay-request";
+  id: string;
+}
+
+/**
+ * Main→worker reply paired with a {@link ReplayRequestMessage}. The async-RPC
+ * dispatcher resolves the awaiting promise on receipt; the `id` correlates it
+ * back to the original request.
+ *
+ * Shape rationale (mirroring `ok` / `value` on `RpcResultFrame` vs `error` /
+ * `message` on `ErrorFrame`):
+ * - `ok: true, recovered_dl_id: string` — main flipped one waiting row to
+ *   recovered and appended the corresponding `events` row. The dl_id of
+ *   the recovered row is included so the worker can frame it as the RPC's
+ *   return value (visible at the board / CLI client).
+ * - `ok: true, recovered_dl_id: null` — there were zero `waiting` rows;
+ *   main did nothing. The board's keypress gracefully no-ops on an empty
+ *   backlog rather than surfacing an error.
+ * - `ok: false, error: string` — main's recovery transaction itself
+ *   crashed (a programming bug or a DB-level failure). The worker frames
+ *   this as an `rpc_failed` ErrorFrame carrying `error`.
+ */
+export interface ReplayResultMessage {
+  type: "replay-result";
+  id: string;
+  ok: boolean;
+  recovered_dl_id?: string | null;
+  error?: string;
+}
+
+/**
  * Poll cadence (ms) for the realtime `data_version` loop. Mirrors the wake
  * worker's defaults — 50 ms is the sweet spot, floored at 25 ms to avoid
  * burning a core.
  */
 export const DEFAULT_POLL_MS = 50;
 const MIN_POLL_MS = 25;
+
+/**
+ * Hard upper bound on how long the async-RPC bridge waits for a
+ * `replay-result` reply from main before rejecting (fn-643 task .4). A
+ * healthy main answers in well under a millisecond on local UDS — even a
+ * mid-drain main releases the writer lock between batches, so a single
+ * replay round-trip slots in cleanly. 5s is generous enough to absorb a
+ * brief drain stall under contention but tight enough that a wedged main
+ * surfaces as a typed `rpc_failed` error frame on the board rather than
+ * hanging the keypress.
+ */
+const REPLAY_DEADLINE_MS = 5000;
 
 /** Default page size when a `query` omits `limit`; the hard cap is the same. */
 export const DEFAULT_LIMIT = 100;
@@ -647,6 +712,63 @@ function clampLimit(limit: number | undefined): number {
 export type RpcHandler = (db: Database, params: unknown) => unknown;
 
 /**
+ * Bridge a worker-side async RPC handler uses to round-trip work through
+ * main. Today the only async RPC is `replay_dead_letter` (fn-643 task .4)
+ * and the only bridge call is {@link ReplayBridge.replay}; future async RPCs
+ * would add their own method to this interface (or a sibling one). The
+ * shape is intentionally narrow — the bridge is the SOLE seam between the
+ * worker thread and main's writer connection, and the type names every
+ * supported operation.
+ *
+ * Per the CLAUDE.md invariant "main is the sole writer of the events log",
+ * every async-RPC handler that needs to append events MUST route through a
+ * bridge call rather than its own DB write. The bridge implementation lives
+ * in `main()`: it posts a {@link ReplayRequestMessage} (or sibling) to the
+ * parent port and awaits the matching {@link ReplayResultMessage} reply,
+ * honoring a deadline so a wedged main never hangs the keypress on the
+ * board.
+ */
+export interface ReplayBridge {
+  /**
+   * Ask main to recover one oldest waiting dead-letter row. Resolves with
+   * `{ok:true, recovered_dl_id}` on success (`recovered_dl_id: null` is a
+   * clean no-op ack when the table has zero waiting rows) and `{ok:false,
+   * error}` if main's recovery transaction crashed. Rejects with a thrown
+   * Error only on timeout or a transport-level failure — the typed
+   * `{ok:false,error}` shape covers the "main responded with a failure"
+   * case so handlers can frame `rpc_failed` without distinguishing
+   * timeout vs error.
+   */
+  replay(): Promise<{
+    ok: boolean;
+    recovered_dl_id?: string | null;
+    error?: string;
+  }>;
+}
+
+/**
+ * Handler signature for an async RPC. Invoked with the request frame's
+ * `params` (opaque; validate shape and throw `BadParamsError` on mismatch)
+ * AND the {@link ReplayBridge} — the worker→main round-trip surface. The
+ * resolved value is framed as `rpc_result.value`. A throw (rejection)
+ * frames `rpc_failed` (or `bad_params` for `BadParamsError`). The handler
+ * MUST NOT touch any DB connection — every write goes through the bridge.
+ *
+ * Why a distinct type from {@link RpcHandler}: the existing SYNC handler
+ * contract is load-bearing for `set_task_approval` / `set_epic_approval`
+ * (single-threaded JS gives them per-file single-flight for free). The
+ * async path is opt-in and isolated; tagging the handler type makes the
+ * dispatch shell route the two paths separately and prevents accidental
+ * cross-pollination (a sync handler that suddenly returns a Promise would
+ * silently break the rev-stamping contract, since `readWorldRev(db)` runs
+ * inline after the sync handler today).
+ */
+export type AsyncRpcHandler = (
+  params: unknown,
+  bridge: ReplayBridge,
+) => Promise<unknown>;
+
+/**
  * A typed error a handler may throw when its `params` are malformed; the
  * dispatcher catches it and frames an `error` with code `bad_params`,
  * preserving the message. Distinct from a plain throw so the wire `code`
@@ -676,10 +798,12 @@ export const RPC_REGISTRY: Map<string, RpcHandler> = new Map();
 /**
  * Register an RPC handler. Throws if `method` is already registered — a
  * collision is a programming error, not a runtime condition the dispatcher
- * should silently paper over.
+ * should silently paper over. Also throws if `method` is already registered
+ * as an ASYNC handler ({@link registerAsyncRpc}) — sync vs async is a
+ * dispatch-shell decision and a method must pick one.
  */
 export function registerRpc(method: string, handler: RpcHandler): void {
-  if (RPC_REGISTRY.has(method)) {
+  if (RPC_REGISTRY.has(method) || ASYNC_RPC_REGISTRY.has(method)) {
     throw new Error(`RPC method already registered: ${method}`);
   }
   RPC_REGISTRY.set(method, handler);
@@ -687,15 +811,63 @@ export function registerRpc(method: string, handler: RpcHandler): void {
 
 /**
  * Remove a handler. Intended for tests that register a temporary handler and
- * tear it down after; production registrations are install-once.
+ * tear it down after; production registrations are install-once. Removes
+ * from BOTH the sync and async registries — a test that flipped a method's
+ * sync/async kind across runs would otherwise leak across isolates.
  */
 export function unregisterRpc(method: string): void {
   RPC_REGISTRY.delete(method);
+  ASYNC_RPC_REGISTRY.delete(method);
+}
+
+/**
+ * The async-RPC dispatch registry: method name → handler. Mirrors
+ * {@link RPC_REGISTRY} but for handlers that round-trip through main via
+ * {@link ReplayBridge}. EMPTY by default at module load; concrete async
+ * handlers install themselves via `installRpcHandlers()` in
+ * `src/rpc-handlers.ts`. Process-global, matching the sync registry's
+ * ownership model.
+ */
+export const ASYNC_RPC_REGISTRY: Map<string, AsyncRpcHandler> = new Map();
+
+/**
+ * Register an async RPC handler. Same collision contract as
+ * {@link registerRpc} — a method can be sync OR async, never both.
+ */
+export function registerAsyncRpc(
+  method: string,
+  handler: AsyncRpcHandler,
+): void {
+  if (ASYNC_RPC_REGISTRY.has(method) || RPC_REGISTRY.has(method)) {
+    throw new Error(`RPC method already registered: ${method}`);
+  }
+  ASYNC_RPC_REGISTRY.set(method, handler);
 }
 
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
+
+/**
+ * Optional plumbing the dispatch shell forwards to an async RPC handler.
+ * `bridge` is the worker→main round-trip surface the handler may call;
+ * `onAsyncResult` is the callback the dispatcher fires when the handler's
+ * promise resolves (or rejects) — the caller (`handleData`) wires this to
+ * `writeFrames` so the eventual frame lands on the connection. Both are
+ * required together: providing one without the other is a misconfigured
+ * caller (an async-RPC frame would either resolve with no place to write
+ * its frame, or have nowhere to route the bridge call).
+ *
+ * Sync-RPC paths and non-RPC frames ignore both fields, so a test calling
+ * `dispatchLine` without `asyncCtx` keeps the same drive-it-synchronously
+ * contract as before — `asyncCtx === undefined` simply makes async-RPC
+ * frames return `unknown_method` (since the async registry is unreachable
+ * from a caller that didn't opt in).
+ */
+export interface DispatchAsyncCtx {
+  bridge: ReplayBridge;
+  onAsyncResult: (frames: ServerFrame[]) => void;
+}
 
 /**
  * Parse and dispatch ONE NDJSON line against the connection state. Returns the
@@ -705,18 +877,28 @@ export function unregisterRpc(method: string): void {
  * caller too, but we keep the contract here so the unit layer can call this
  * directly.
  *
- * RPC dispatch: an `rpc` frame routes through `RPC_REGISTRY`. The dispatcher
- * runs the handler under the WRITER `db` connection (passed via `writerDb`
- * when present; falls back to the reader `db` only for read-only test wiring).
- * Every RPC failure path returns an `error` frame, never throws —
- * `unknown_method` on missing handler, `bad_params` on a typed
- * `BadParamsError` throw, `rpc_failed` on any other throw.
+ * RPC dispatch: an `rpc` frame routes through `RPC_REGISTRY` (sync) OR
+ * `ASYNC_RPC_REGISTRY` (async). The dispatcher runs the SYNC handler under
+ * the WRITER `db` connection (passed via `writerDb` when present; falls back
+ * to the reader `db` only for read-only test wiring) and frames the result
+ * inline. The ASYNC handler runs via the {@link DispatchAsyncCtx} bridge —
+ * the dispatcher returns `[]` immediately, then the handler's resolved
+ * frame lands via `asyncCtx.onAsyncResult` when the worker→main round-trip
+ * completes. Every RPC failure path returns / fires an `error` frame, never
+ * throws — `unknown_method` on missing handler, `bad_params` on a typed
+ * `BadParamsError` throw, `rpc_failed` on any other throw or async
+ * rejection.
+ *
+ * An async-RPC frame arriving without `asyncCtx` returns `unknown_method`
+ * (the dispatcher cannot route it to the async registry without the
+ * bridge); this keeps the legacy sync-only test surface unchanged.
  */
 export function dispatchLine(
   db: Database,
   conn: ConnState,
   line: string,
   writerDb?: Database,
+  asyncCtx?: DispatchAsyncCtx,
 ): ServerFrame[] {
   if (line.trim().length === 0) {
     return []; // blank keep-alive line — ignore
@@ -806,7 +988,7 @@ export function dispatchLine(
       return [];
     }
     case "rpc": {
-      return dispatchRpc(db, frame as RpcFrame, writerDb);
+      return dispatchRpc(db, frame as RpcFrame, writerDb, asyncCtx);
     }
     default: {
       const t = (frame as { type?: unknown }).type;
@@ -840,6 +1022,7 @@ function dispatchRpc(
   db: Database,
   frame: RpcFrame,
   writerDb: Database | undefined,
+  asyncCtx: DispatchAsyncCtx | undefined,
 ): ServerFrame[] {
   // `id` must be a non-empty string — without it the client can't correlate
   // the response, and we won't echo `undefined` to paper over the omission.
@@ -863,42 +1046,105 @@ function dispatchRpc(
     ];
   }
 
+  // Try the sync registry first; if there's no sync hit AND the caller
+  // wired an async bridge, fall through to the async registry. This order
+  // preserves the sync-only contract for existing callers (`asyncCtx ===
+  // undefined` collapses async lookups to `unknown_method`, so tests that
+  // never wired the bridge keep their pre-fn-643 behavior verbatim).
   const handler = RPC_REGISTRY.get(frame.method);
-  if (!handler) {
-    return [
-      errorFrame(
-        db,
-        "unknown_method",
-        `no such rpc method: ${frame.method}`,
-        id,
-      ),
-    ];
-  }
+  if (handler) {
+    // Run the handler against the WRITER connection — the server's reader is
+    // read-only and will reject INSERTs. Tests may pass `writerDb === undefined`
+    // for read-only handlers (in which case we hand the handler the reader,
+    // which is enough for a no-op).
+    const handlerDb = writerDb ?? db;
 
-  // Run the handler against the WRITER connection — the server's reader is
-  // read-only and will reject INSERTs. Tests may pass `writerDb === undefined`
-  // for read-only handlers (in which case we hand the handler the reader,
-  // which is enough for a no-op).
-  const handlerDb = writerDb ?? db;
-
-  let value: unknown;
-  try {
-    value = handler(handlerDb, frame.params);
-  } catch (err) {
-    if (err instanceof BadParamsError) {
-      return [errorFrame(db, "bad_params", err.message, id)];
+    let value: unknown;
+    try {
+      value = handler(handlerDb, frame.params);
+    } catch (err) {
+      if (err instanceof BadParamsError) {
+        return [errorFrame(db, "bad_params", err.message, id)];
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      return [errorFrame(db, "rpc_failed", message, id)];
     }
-    const message = err instanceof Error ? err.message : String(err);
-    return [errorFrame(db, "rpc_failed", message, id)];
+
+    const result: RpcResultFrame = {
+      type: "rpc_result",
+      id,
+      rev: readWorldRev(db),
+      value,
+    };
+    return [result];
   }
 
-  const result: RpcResultFrame = {
-    type: "rpc_result",
-    id,
-    rev: readWorldRev(db),
-    value,
-  };
-  return [result];
+  const asyncHandler = ASYNC_RPC_REGISTRY.get(frame.method);
+  if (asyncHandler && asyncCtx) {
+    // Async path. Fire the handler; on resolution / rejection, frame the
+    // result and ship it via `onAsyncResult`. The dispatcher returns []
+    // immediately so the sync caller doesn't block — handleData has
+    // already returned to the socket-data event loop by the time
+    // onAsyncResult fires. The `rev` is read at result-construction time
+    // (not at dispatch time) so a recovery write's data_version bump is
+    // reflected on the response. Any throw inside the handler synchronous
+    // body (a `BadParamsError` raised before the await) AND any promise
+    // rejection both flow through the catch.
+    void runAsyncRpc(db, id, asyncHandler, frame.params, asyncCtx);
+    return [];
+  }
+
+  return [
+    errorFrame(db, "unknown_method", `no such rpc method: ${frame.method}`, id),
+  ];
+}
+
+/**
+ * Drive an async RPC handler to completion and ship the result frame.
+ * Pulled out of `dispatchRpc` for readability — the sync path is the
+ * 99% case (the only async RPC today is `replay_dead_letter`), and
+ * inlining a Promise chain in the middle of the synchronous switch
+ * obscured the sync-path control flow.
+ *
+ * Failure modes that map to `rpc_failed` here:
+ * - the handler threw / rejected with a non-`BadParamsError` Error;
+ * - the bridge's underlying main-thread post resolved with
+ *   `{ok:false, error}` — the handler propagates that as a thrown
+ *   Error so this catch frames it uniformly;
+ * - the bridge timed out (handler throws an Error with a "no response
+ *   from main" message).
+ *
+ * `BadParamsError` survives as `bad_params` for parity with the sync
+ * dispatch.
+ */
+function runAsyncRpc(
+  db: Database,
+  id: string,
+  handler: AsyncRpcHandler,
+  params: unknown,
+  asyncCtx: DispatchAsyncCtx,
+): void {
+  void (async () => {
+    let value: unknown;
+    try {
+      value = await handler(params, asyncCtx.bridge);
+    } catch (err) {
+      if (err instanceof BadParamsError) {
+        asyncCtx.onAsyncResult([errorFrame(db, "bad_params", err.message, id)]);
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      asyncCtx.onAsyncResult([errorFrame(db, "rpc_failed", message, id)]);
+      return;
+    }
+    const result: RpcResultFrame = {
+      type: "rpc_result",
+      id,
+      rev: readWorldRev(db),
+      value,
+    };
+    asyncCtx.onAsyncResult([result]);
+  })();
 }
 
 function errorFrame(
@@ -1465,6 +1711,13 @@ export interface RunningServer {
  * connections belongs to the caller (`main()` opens and closes them); this
  * function only forwards `writerDb` into the dispatch path.
  *
+ * `bridge` is the worker→main round-trip surface (fn-643 task .4). When
+ * present, an `rpc` frame for a method registered in `ASYNC_RPC_REGISTRY`
+ * routes through the async dispatch path: the handler awaits a main-thread
+ * action via the bridge, and the resulting frame is written back to the
+ * connection when the round-trip completes. When absent, async-RPC methods
+ * surface as `unknown_method` — the sync test surface stays self-contained.
+ *
  * Throws `LockHeldError` if a live instance owns the lock — the caller exits
  * non-zero.
  */
@@ -1473,6 +1726,7 @@ export function startServer(
   sockPath: string,
   lockPath: string,
   writerDb?: Database,
+  bridge?: ReplayBridge,
 ): RunningServer {
   acquireLock(lockPath, sockPath);
 
@@ -1498,7 +1752,7 @@ export function startServer(
         const id = socket.data.id ?? -1;
         if (TRACE) srvTs(`conn ${id} data chunk=${chunk.length}`);
         const t0 = Date.now();
-        handleData(db, socket, chunk, writerDb);
+        handleData(db, socket, chunk, writerDb, bridge);
         const dur = Date.now() - t0;
         if (dur >= 5) {
           if (TRACE) srvTs(`conn ${id} handleData duration=${dur}ms`);
@@ -1557,6 +1811,7 @@ function handleData(
   socket: import("bun").Socket<ConnState>,
   chunk: Buffer,
   writerDb?: Database,
+  bridge?: ReplayBridge,
 ): void {
   const w = socket as unknown as Writable;
   let lines: string[];
@@ -1578,6 +1833,20 @@ function handleData(
     throw err;
   }
 
+  // Build the asyncCtx ONCE per data chunk, not per line. The bridge is
+  // process-global state; `onAsyncResult` closes over the per-connection
+  // socket so a deferred async-RPC result lands on the originating conn.
+  // Only constructed when both halves are wired — otherwise async-RPC
+  // frames surface as `unknown_method` (see `dispatchRpc`).
+  const asyncCtx: DispatchAsyncCtx | undefined = bridge
+    ? {
+        bridge,
+        onAsyncResult: (frames: ServerFrame[]): void => {
+          if (frames.length > 0) writeFrames(w, frames);
+        },
+      }
+    : undefined;
+
   for (const line of lines) {
     let frames: ServerFrame[];
     // DEBUG: time each dispatchLine so we can spot a slow query / RPC.
@@ -1596,7 +1865,7 @@ function handleData(
       // dispatchLine itself will surface the bad_frame; just log unknown.
     }
     try {
-      frames = dispatchLine(db, socket.data, line, writerDb);
+      frames = dispatchLine(db, socket.data, line, writerDb, asyncCtx);
     } catch (err) {
       // Defensive: dispatchLine is contracted not to throw, but a DB hiccup
       // mid-query shouldn't kill the connection.
@@ -1663,16 +1932,60 @@ function main(): void {
   const { db } = openDb(data.dbPath, { readonly: true });
   const { db: writerDb } = openDb(data.dbPath);
 
-  // Install every concrete RPC handler into `RPC_REGISTRY`. Side-effect import:
-  // a plain `import` of `src/server-worker.ts` from main/test code is inert
-  // (the `isMainThread` guard skips `main()`), so the registry only fills
-  // inside a real worker spawn. Concrete handlers live in
-  // `src/rpc-handlers.ts`; this is the single install point.
+  // Install every concrete RPC handler into `RPC_REGISTRY` /
+  // `ASYNC_RPC_REGISTRY`. Side-effect import: a plain `import` of
+  // `src/server-worker.ts` from main/test code is inert (the `isMainThread`
+  // guard skips `main()`), so the registries only fill inside a real worker
+  // spawn. Concrete handlers live in `src/rpc-handlers.ts`; this is the
+  // single install point.
   installRpcHandlers();
+
+  // Worker→main async-RPC bridge state (fn-643 task .4). Outgoing
+  // {@link ReplayRequestMessage} posts await their matching `replay-result`
+  // reply by correlation id. Resolves the awaiting promise with the
+  // typed `{ok, recovered_dl_id?, error?}` shape; a timeout rejects with
+  // a thrown Error. The bridge implementation is the SOLE place this
+  // worker thread exchanges messages with main outside the shutdown /
+  // ready protocol.
+  type ReplayResolution = {
+    ok: boolean;
+    recovered_dl_id?: string | null;
+    error?: string;
+  };
+  const pendingReplays = new Map<
+    string,
+    {
+      resolve: (r: ReplayResolution) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  const bridge: ReplayBridge = {
+    replay(): Promise<ReplayResolution> {
+      return new Promise<ReplayResolution>((resolve, reject) => {
+        const reqId = crypto.randomUUID();
+        const timer = setTimeout(() => {
+          if (pendingReplays.delete(reqId)) {
+            reject(
+              new Error(
+                `no response from main within ${REPLAY_DEADLINE_MS}ms (id ${reqId})`,
+              ),
+            );
+          }
+        }, REPLAY_DEADLINE_MS);
+        timer.unref?.();
+        pendingReplays.set(reqId, { resolve, reject, timer });
+        parentPort!.postMessage({
+          kind: "replay-request",
+          id: reqId,
+        } satisfies ReplayRequestMessage);
+      });
+    },
+  };
 
   let server: RunningServer;
   try {
-    server = startServer(db, sockPath, lockPath, writerDb);
+    server = startServer(db, sockPath, lockPath, writerDb, bridge);
   } catch (err) {
     // Lock held by a live instance, or bind failed. No self-heal — exit
     // non-zero; launchd backs off and the live owner keeps serving.
@@ -1708,11 +2021,34 @@ function main(): void {
     process.exit(0);
   };
 
-  parentPort.on("message", (msg: ShutdownMessage | undefined) => {
-    if (msg && msg.type === "shutdown") {
-      shutdown();
-    }
-  });
+  parentPort.on(
+    "message",
+    (msg: ShutdownMessage | ReplayResultMessage | undefined) => {
+      if (!msg) return;
+      if ((msg as ShutdownMessage).type === "shutdown") {
+        shutdown();
+        return;
+      }
+      if ((msg as ReplayResultMessage).type === "replay-result") {
+        const r = msg as ReplayResultMessage;
+        const entry = pendingReplays.get(r.id);
+        if (!entry) {
+          // Stale reply (correlation id we already timed out / never sent
+          // — should never happen; main only posts in response to our
+          // posts). Silent drop is the right call: there's no awaiting
+          // promise to surface the discrepancy to anyway.
+          return;
+        }
+        pendingReplays.delete(r.id);
+        clearTimeout(entry.timer);
+        entry.resolve({
+          ok: r.ok,
+          recovered_dl_id: r.recovered_dl_id,
+          error: r.error,
+        });
+      }
+    },
+  );
 
   // Realtime layer: poll data_version and fan committed jobs changes out as
   // per-entity patches. Runs on the worker's own read-only connection (the same

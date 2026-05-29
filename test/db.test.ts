@@ -323,7 +323,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("36");
+  expect(row.value).toBe("37");
   db.close();
 });
 

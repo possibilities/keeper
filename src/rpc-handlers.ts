@@ -8,15 +8,21 @@
  * spawn, and tests that import the worker module piecemeal opt out by not
  * importing this file.
  *
- * Currently registers TWO handlers (the planctl-native approval pair, schema
- * v13 — see the fn-592-approval-as-planctl-field epic):
+ * Currently registers THREE handlers:
  *
  * - `set_task_approval { epic_id, task_id, status }` — mutate the `approval`
- *   field on `<root>/.planctl/tasks/<task_id>.json` to `status`.
+ *   field on `<root>/.planctl/tasks/<task_id>.json` to `status`. (Schema v13
+ *   — see the fn-592-approval-as-planctl-field epic.)
  * - `set_epic_approval { epic_id, status }` — mutate the `approval` field on
- *   `<root>/.planctl/epics/<epic_id>.json` to `status`.
+ *   `<root>/.planctl/epics/<epic_id>.json` to `status`. (Same.)
+ * - `replay_dead_letter` (no params) — ASYNC RPC. Asks main to recover ONE
+ *   oldest `waiting` dead-letter row by appending the stored bindings back
+ *   into the `events` log and flipping the row to `recovered`, all in one
+ *   `BEGIN IMMEDIATE` transaction. (Schema v37 — see fn-643 task .4.) The
+ *   actual work runs on main (the sole writer of the events log); this
+ *   handler routes through the worker→main bridge.
  *
- * Both handlers write the canonical planctl JSON form (see
+ * The two approval handlers write the canonical planctl JSON form (see
  * `serializePlanctlJson` in `src/db.ts`) atomically (temp file in same dir,
  * `<final>.tmp.<pid>.<crypto.randomUUID()>` suffix, `renameSync`). The
  * round-trip back into the projection happens via the existing
@@ -56,7 +62,12 @@ import type { Database } from "bun:sqlite";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteFile, resolvePlanRoots, serializePlanctlJson } from "./db";
-import { BadParamsError, registerRpc } from "./server-worker";
+import {
+  BadParamsError,
+  type ReplayBridge,
+  registerAsyncRpc,
+  registerRpc,
+} from "./server-worker";
 
 /**
  * The planctl-native approval enum. Wire-validated by each handler (a wire
@@ -300,17 +311,93 @@ export function setEpicApprovalHandler(
   return { ok: true, epic_id, approval: status };
 }
 
+// ---------------------------------------------------------------------------
+// `replay_dead_letter` (async — routes through the worker→main bridge)
+// ---------------------------------------------------------------------------
+
 /**
- * Install every handler in this module into the process-global
- * `RPC_REGISTRY`. Called for its side effect by the server-worker module
- * body — a single import is enough to register every concrete RPC.
+ * Successful return shape for `replay_dead_letter`. Mirrors the bridge's
+ * resolved `{ok, recovered_dl_id}` directly so the wire `value` is a
+ * one-line JSON object a client (board / CLI) can render verbatim.
  *
- * Idempotency: `registerRpc` throws on duplicate methods (a programming
- * error, not a runtime condition); never call this twice from the same
- * process. Tests that want to drive a handler directly should import the
- * handler and call it, NOT re-register it.
+ * - `ok: true, recovered_dl_id: string` — one row flipped `waiting →
+ *   recovered`; the appended events row is in flight to the reducer.
+ * - `ok: true, recovered_dl_id: null` — no `waiting` rows remained at
+ *   the moment main processed the request. Clean no-op ack; the board
+ *   re-renders with the same (zero) waiting count.
+ */
+export interface ReplayDeadLetterResult {
+  ok: true;
+  recovered_dl_id: string | null;
+}
+
+/**
+ * `replay_dead_letter` handler. Bridges the worker→main request/reply
+ * round-trip (fn-643 task .4); main does the actual recovery in one
+ * `BEGIN IMMEDIATE` transaction.
+ *
+ * Wire `params` MUST be either absent / `null` / an empty object — there is
+ * NO way to target a specific row from the client. The server picks the
+ * oldest `waiting` row (by `(dl_written_at ASC, dl_id ASC)`) on every
+ * invocation; the human's keypress recovers ONE at a time and the board's
+ * count drops by one. A future "replay all" or "replay this specific
+ * dl_id" verb is out of scope and would land as a sibling RPC.
+ *
+ * Failure modes routed through the dispatcher:
+ * - main's recovery transaction throws → bridge resolves `{ok:false,
+ *   error}` → handler throws an Error → dispatcher frames `rpc_failed`.
+ * - bridge times out (default 5s) → bridge rejects → dispatcher frames
+ *   `rpc_failed` with a "no response from main" message.
+ *
+ * No bridge timeout is forced shorter inside the handler — the bridge's
+ * own deadline IS the timeout contract for this RPC.
+ */
+export async function replayDeadLetterHandler(
+  params: unknown,
+  bridge: ReplayBridge,
+): Promise<ReplayDeadLetterResult> {
+  // Wire validation: accept null / absent / an empty object. A non-empty
+  // object surfaces as `BadParamsError` so a caller passing a stray field
+  // by mistake gets a typed wire error rather than a silent ignore.
+  if (params !== undefined && params !== null) {
+    if (typeof params !== "object" || Array.isArray(params)) {
+      throw new BadParamsError(
+        "replay_dead_letter: params must be absent, null, or an empty object",
+      );
+    }
+    if (Object.keys(params as Record<string, unknown>).length > 0) {
+      throw new BadParamsError(
+        "replay_dead_letter: params must have no keys (no client-side row targeting; server picks oldest waiting)",
+      );
+    }
+  }
+  const result = await bridge.replay();
+  if (!result.ok) {
+    // Main posted back a typed failure. Throw with main's error message
+    // so the dispatcher frames `rpc_failed` carrying the same text.
+    throw new Error(result.error ?? "replay_dead_letter: main reported failure");
+  }
+  return {
+    ok: true,
+    // Normalize undefined → null so the wire value carries an explicit
+    // sentinel for "nothing to replay" rather than dropping the field.
+    recovered_dl_id: result.recovered_dl_id ?? null,
+  };
+}
+
+/**
+ * Install every handler in this module into the process-global registries
+ * (`RPC_REGISTRY` for sync handlers, `ASYNC_RPC_REGISTRY` for async ones).
+ * Called for its side effect by the server-worker module body — a single
+ * import is enough to register every concrete RPC.
+ *
+ * Idempotency: `registerRpc` / `registerAsyncRpc` throw on duplicate methods
+ * (a programming error, not a runtime condition); never call this twice from
+ * the same process. Tests that want to drive a handler directly should
+ * import the handler and call it, NOT re-register it.
  */
 export function installRpcHandlers(): void {
   registerRpc("set_task_approval", setTaskApprovalHandler);
   registerRpc("set_epic_approval", setEpicApprovalHandler);
+  registerAsyncRpc("replay_dead_letter", replayDeadLetterHandler);
 }
