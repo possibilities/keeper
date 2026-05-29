@@ -4297,6 +4297,8 @@ function getEpic(epicId: string) {
     created_by_closer_of: string | null;
     sort_path: string;
     queue_jump: number;
+    // Schema v34 (fn-637): NULL = not-yet-computed; '[]' = computed, no deps.
+    resolved_epic_deps: string | null;
     // Schema v32 (fn-634): VIRTUAL generated column SQLite computes from
     // `(status, approval)` via `CASE WHEN status='open' OR approval!='approved'
     // THEN 1 ELSE 0 END`. `SELECT *` enumerates it like any other column.

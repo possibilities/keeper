@@ -77,6 +77,7 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     created_by_closer_of: null,
     sort_path: "000001",
     queue_jump: 0,
+    resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
     ...overrides,
   };
