@@ -31,9 +31,14 @@ import { expect, test } from "bun:test";
 import {
   colorizePillsInLine,
   epicNumFromIdOrBare,
+  renderEpicDepPills,
   renderJobLinkLines,
 } from "../scripts/board";
-import { computeReadiness, formatPill } from "../src/readiness";
+import {
+  computeReadiness,
+  type EpicDepResolution,
+  formatPill,
+} from "../src/readiness";
 import { collapseSubagentsByName, projectRows } from "../src/readiness-client";
 import type {
   EmbeddedJob,
@@ -942,6 +947,52 @@ test("formatPill: dep-on-epic-dangling renders the upstream id verbatim", () => 
       reason: { kind: "dep-on-epic-dangling", upstream: "fn-7" },
     }),
   ).toBe("[blocked:dep-on-epic-dangling fn-7]");
+});
+
+// ---------------------------------------------------------------------------
+// fn-636: renderEpicDepPills — the three render shapes produced by the
+// board's `[#N,#M]` summary pill assembly. `renderEpicDepPills` is the
+// extracted helper lifted out of `renderEpicBlock` so the dangling /
+// intra-project / cross-project branches are directly assertable without
+// driving a full subscribe-server frame.
+// ---------------------------------------------------------------------------
+
+test("renderEpicDepPills: dangling resolution with parseable number → `?#N`", () => {
+  const dangling: EpicDepResolution = { kind: "dangling" };
+  const out = renderEpicDepPills(["fn-99-ghost"], () => dangling);
+  expect(out).toEqual(["?#99"]);
+});
+
+test("renderEpicDepPills: intra-project resolution (cross_project === null) → `#N`", () => {
+  const upstream = makeEpic({
+    epic_id: "fn-100-foo",
+    epic_number: 100,
+    project_dir: "/repo",
+  });
+  const found: EpicDepResolution = {
+    kind: "found",
+    epic: upstream,
+    cross_project: null,
+    completed: false,
+  };
+  const out = renderEpicDepPills(["fn-100-foo"], () => found);
+  expect(out).toEqual(["#100"]);
+});
+
+test("renderEpicDepPills: cross-project resolution (non-null cross_project basename) → `<prefix>::#N`", () => {
+  const upstream = makeEpic({
+    epic_id: "fn-633-git-attribution",
+    epic_number: 633,
+    project_dir: "/Users/mike/code/arthack",
+  });
+  const found: EpicDepResolution = {
+    kind: "found",
+    epic: upstream,
+    cross_project: "arthack",
+    completed: false,
+  };
+  const out = renderEpicDepPills(["fn-633"], () => found);
+  expect(out).toEqual(["arthack::#633"]);
 });
 
 test("byId-style collapse (legacy bug) would only deliver one row", () => {
