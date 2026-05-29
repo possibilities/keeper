@@ -23,7 +23,9 @@ import {
   getCollection,
   JOBS_DESCRIPTOR,
   PROFILES_DESCRIPTOR,
+  selectByIdsChunked,
   selectVersionsByIds,
+  selectVersionsByIdsChunked,
   USAGE_DESCRIPTOR,
 } from "../src/collections";
 import { MAX_IN_PARAMS, openDb } from "../src/db";
@@ -952,6 +954,53 @@ test("selectVersionsByIds: ids.length > MAX_IN_PARAMS throws (mirrors selectById
   expect(() => selectVersionsByIds(db, EPICS_DESCRIPTOR, ids)).toThrow(
     /exceeds SQLITE_MAX_VARIABLE_NUMBER/,
   );
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// selectByIdsChunked / selectVersionsByIdsChunked — caller-side chunking that
+// keeps diffTick alive when a watched collection exceeds MAX_IN_PARAMS (999).
+// The `dead_letters` collection crossing 999 rows crashed the poll loop in a
+// restart loop; these wrappers split the id-set into batches and merge.
+// ---------------------------------------------------------------------------
+
+test("selectVersionsByIdsChunked: > MAX_IN_PARAMS ids return ALL versions (no throw)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const n = MAX_IN_PARAMS * 2 + 17; // spans 3 batches
+  const ids: string[] = [];
+  for (let i = 0; i < n; i++) {
+    seedEpic(db, `fn-${i}`, { epic_number: i, last_event_id: i });
+    ids.push(`fn-${i}`);
+  }
+  // The unchunked helper would throw on this id-set.
+  expect(() => selectVersionsByIds(db, EPICS_DESCRIPTOR, ids)).toThrow();
+  const map = selectVersionsByIdsChunked(db, EPICS_DESCRIPTOR, ids);
+  expect(map.size).toBe(n);
+  expect(map.get("fn-0")).toBe(0);
+  expect(map.get(`fn-${n - 1}`)).toBe(n - 1);
+  db.close();
+});
+
+test("selectByIdsChunked: > MAX_IN_PARAMS ids return ALL rows (no throw)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const n = MAX_IN_PARAMS + 5; // spans 2 batches
+  const ids: string[] = [];
+  for (let i = 0; i < n; i++) {
+    seedJob(db, `j-${i}`, { last_event_id: i });
+    ids.push(`j-${i}`);
+  }
+  const rows = selectByIdsChunked(db, JOBS_DESCRIPTOR, ids);
+  expect(rows.length).toBe(n);
+  db.close();
+});
+
+test("chunked wrappers pass sub-cap id-sets straight through", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1", { epic_number: 1, last_event_id: 11 });
+  expect(
+    selectVersionsByIdsChunked(db, EPICS_DESCRIPTOR, ["fn-1"]).get("fn-1"),
+  ).toBe(11);
+  expect(selectVersionsByIdsChunked(db, EPICS_DESCRIPTOR, []).size).toBe(0);
   db.close();
 });
 

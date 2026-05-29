@@ -67,8 +67,8 @@ import {
   decodeRow,
   getCollection,
   type Row,
-  selectByIds,
-  selectVersionsByIds,
+  selectByIdsChunked,
+  selectVersionsByIdsChunked,
 } from "./collections";
 import { openDb, resolveSockPath } from "./db";
 import {
@@ -1427,7 +1427,7 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
     // shape: ~682 epics × 4 JSON-array columns × every tick of `JSON.parse`
     // collapses to one cheap projection. Per-sub comparison below builds
     // `changedIds` and only on a non-empty set do we fetch full rows.
-    const versions = selectVersionsByIds(db, descriptor, ids);
+    const versions = selectVersionsByIdsChunked(db, descriptor, ids);
     const _g2 = TRACE ? performance.now() : 0;
     if (TRACE) _accProbe += _g2 - _g1;
 
@@ -1464,7 +1464,7 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
     // latest row and the world-rev may be one behind. Self-correcting on the
     // next tick.
     if (changedIds.size > 0) {
-      const rows = selectByIds(db, descriptor, [...changedIds]);
+      const rows = selectByIdsChunked(db, descriptor, [...changedIds]);
       const _g3 = TRACE ? performance.now() : 0;
       if (TRACE) _accSelect += _g3 - _g2;
       // Index by the descriptor's pk for per-sub fan-out.

@@ -702,6 +702,55 @@ export function selectVersionsByIds(
 }
 
 /**
+ * Caller-side chunking wrappers for {@link selectByIds} /
+ * {@link selectVersionsByIds}. Those deliberately throw past `MAX_IN_PARAMS`
+ * ("chunk the caller") — a tested contract. `diffTick` watches WHOLE
+ * collections, so once a collection exceeds 999 rows the watched-id union (and
+ * the changed-id fetch on a from-scratch first tick) blows SQLite's bound-
+ * variable cap and crashes the poll loop → daemon crash-loop. (The
+ * `dead_letters` collection crossing 999 is what triggered this in the wild.)
+ * These split the id-set into `MAX_IN_PARAMS`-sized batches and merge: the
+ * array form preserves batch order; the map form is a plain union (collection
+ * pks are unique, so batches are disjoint — no real conflict). Sub-cap calls
+ * pass straight through with zero extra allocation.
+ */
+export function selectByIdsChunked(
+  db: Database,
+  descriptor: CollectionDescriptor,
+  ids: readonly string[],
+): Row[] {
+  if (ids.length <= MAX_IN_PARAMS) {
+    return selectByIds(db, descriptor, ids);
+  }
+  const out: Row[] = [];
+  for (let i = 0; i < ids.length; i += MAX_IN_PARAMS) {
+    const batch = selectByIds(db, descriptor, ids.slice(i, i + MAX_IN_PARAMS));
+    for (const row of batch) out.push(row);
+  }
+  return out;
+}
+
+export function selectVersionsByIdsChunked(
+  db: Database,
+  descriptor: CollectionDescriptor,
+  ids: readonly string[],
+): Map<string, number | null> {
+  if (ids.length <= MAX_IN_PARAMS) {
+    return selectVersionsByIds(db, descriptor, ids);
+  }
+  const merged = new Map<string, number | null>();
+  for (let i = 0; i < ids.length; i += MAX_IN_PARAMS) {
+    const batch = selectVersionsByIds(
+      db,
+      descriptor,
+      ids.slice(i, i + MAX_IN_PARAMS),
+    );
+    for (const [pk, version] of batch) merged.set(pk, version);
+  }
+  return merged;
+}
+
+/**
  * Decode a row's JSON-TEXT columns into real values at the read boundary. For
  * each name in `descriptor.jsonColumns`, replaces the row's stored TEXT with
  * `JSON.parse`'d output so the wire frame serves an array/object — not a JSON
