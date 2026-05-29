@@ -1,0 +1,19 @@
+{
+  "branch_name": "fn-644-autopilot-startup-stagger-gate",
+  "bundles": [],
+  "created_at": "2026-05-29T15:11:52.344136Z",
+  "depends_on_epics": [],
+  "id": "fn-644-autopilot-startup-stagger-gate",
+  "last_validated_at": "2026-05-29T15:11:52.461885Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Autopilot startup-stagger gate",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-29T15:11:52.344136Z"
+}
