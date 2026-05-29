@@ -19,7 +19,7 @@
  */
 
 import { expect, test } from "bun:test";
-import { renderProfileLines, renderRowLines } from "../scripts/usage";
+import { renderRowLines } from "../scripts/usage";
 
 // Fixed reference clock: 2025-01-15T12:00:00.000Z.
 const NOW_MS = Date.parse("2025-01-15T12:00:00.000Z");
@@ -400,118 +400,217 @@ test("pct cells right-align to the widest pct across all body lines", () => {
 });
 
 // ---------------------------------------------------------------------------
-// renderProfileLines — the "Rate limits by profile" block. Driven by the
-// `profiles` collection (one row per Claude profile keyed by `config_dir`,
-// with `last_rate_limit_at` as REAL unix-SECONDS).
+// Colocated rate-limit line (schema v35 / fn-642). `usage` rows now carry
+// `last_rate_limit_at` (REAL unix-SECONDS) inline; `renderRowLines` emits a
+// `rate-limited <rel>` line under the quota lines for tracked stacks that
+// have been rate-limited, omits the line for never-limited rows and for the
+// codex stack (which has no rate-limit concept), and untracked profiles do
+// not render at all (they have no `usage` row).
 // ---------------------------------------------------------------------------
 
 const NOW_SEC = Math.floor(NOW_MS / 1000);
 
-test("renders one row per profile with relative time or em-dash", () => {
-  // Three rows: one default-sentinel with a recent rate limit (5m ago),
-  // one explicit config_dir with an older rate limit (3h 12m ago), and one
-  // that has NEVER hit a rate limit (NULL last_rate_limit_at → `—`).
-  const lines = renderProfileLines(
+/** Find the body line whose label starts with `label` (after the indent),
+ *  matching the literal label exactly (handles dashed labels like
+ *  `rate-limited`; the bodyLine helper above appends a trailing space). */
+function bodyLineExact(lines: string[], label: string): string | undefined {
+  return lines.find((l) => l.trimStart().startsWith(`${label} `));
+}
+
+test("emits 'rate-limited <rel>' when last_rate_limit_at is set", () => {
+  // A tracked stack with last_rate_limit_at 3h 12m in the past should
+  // render a `rate-limited` body line carrying that relative time.
+  const lines = renderRowLines(
     [
       {
-        config_dir: "",
-        last_rate_limit_at: NOW_SEC - 5 * 60,
-        last_rate_limit_session_id: "s1",
-      },
-      {
-        config_dir: "~/.claude-profiles/multi-claude-3",
+        id: "claude-multi-3",
+        target: "claude",
+        multiplier: 20,
+        session_percent: 16,
+        session_resets_at: isoOffset(29),
+        week_percent: 36,
+        week_resets_at: isoOffset(4 * 24 * 60 + 5 * 60),
         last_rate_limit_at: NOW_SEC - (3 * 3600 + 12 * 60),
         last_rate_limit_session_id: "s2",
       },
+    ],
+    NOW_MS,
+  );
+  // header + session + week + rate-limited = 4 lines.
+  expect(lines).toHaveLength(4);
+  const row = bodyLineExact(lines, "rate-limited");
+  expect(row, "expected a rate-limited line").toBeDefined();
+  expect(row as string).toMatch(/ 3h 12m ago$/);
+});
+
+test("omits the rate-limited line when last_rate_limit_at is NULL", () => {
+  // A tracked stack with no rate-limit annotation renders no
+  // `rate-limited` line at all — no `—` placeholder.
+  const lines = renderRowLines(
+    [
       {
-        config_dir: "~/.claude-profiles/quiet-one",
+        id: "claude-default",
+        target: "claude",
+        multiplier: 5,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 17,
+        week_resets_at: isoOffset(5 * 24 * 60),
         last_rate_limit_at: null,
         last_rate_limit_session_id: null,
       },
     ],
     NOW_MS,
   );
-  // Header line + 3 profile rows.
-  expect(lines).toHaveLength(4);
-  expect(lines[0]).toBe("Rate limits by profile");
-  // `''` sentinel renders as the `(default)` literal — NOT empty parens
-  // (which would read as "missing data"). The default profile is a
-  // known-correct value here, not absence.
-  const defaultRow = lines.find((l) => l.startsWith("(default)"));
-  expect(defaultRow, "expected a (default) row").toBeDefined();
-  expect(defaultRow as string).toMatch(/ 5m ago$/);
-  // Explicit config_dir wraps in parens like the usage block's id chip.
-  const multi = lines.find((l) =>
-    l.startsWith("(~/.claude-profiles/multi-claude-3)"),
+  // header + session + week only.
+  expect(lines).toHaveLength(3);
+  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
+  // And no leaked em-dash or `rate-limited` literal anywhere.
+  expect(lines.join("\n")).not.toContain("rate-limited");
+  expect(lines.join("\n")).not.toContain("—");
+});
+
+test("omits the rate-limited line for the codex stack", () => {
+  // The codex stack has no rate-limit concept; even if a non-null
+  // `last_rate_limit_at` were on the wire (it shouldn't be), the
+  // renderer must suppress the line.
+  const lines = renderRowLines(
+    [
+      {
+        id: "codex",
+        target: "codex",
+        multiplier: 1,
+        session_percent: 27,
+        session_resets_at: isoOffset(60),
+        week_percent: 77,
+        week_resets_at: isoOffset(3 * 24 * 60),
+        // Defensive: a wire bug delivering a non-null limit should still
+        // not render for codex.
+        last_rate_limit_at: NOW_SEC - 60,
+      },
+    ],
+    NOW_MS,
   );
-  expect(multi, "expected an explicit-config_dir row").toBeDefined();
-  expect(multi as string).toMatch(/ 3h 12m ago$/);
-  // NULL last_rate_limit_at renders the em-dash — no raw-float leakage,
-  // no whitespace at end-of-line.
-  const quiet = lines.find((l) =>
-    l.startsWith("(~/.claude-profiles/quiet-one)"),
+  expect(lines).toHaveLength(3);
+  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("rate-limited");
+});
+
+test("rate-limited line indent + label-padding align under the chip", () => {
+  // The rate-limited body line shares the same indent (`wId + 1` spaces,
+  // landing under the chip's `[`) as the quota lines, and pads its label
+  // to the widest of the labels actually rendered. With `rate-limited`
+  // in the pool (12 chars), `session` (7) padEnds to 12, so the quota
+  // labels gain trailing whitespace to keep their bars aligned under
+  // the rate-limited row's rel-time column position.
+  const lines = renderRowLines(
+    [
+      {
+        id: "claude-multi-3",
+        target: "claude",
+        multiplier: 20,
+        session_percent: 5,
+        session_resets_at: isoOffset(5),
+        week_percent: 5,
+        week_resets_at: isoOffset(5),
+        last_rate_limit_at: NOW_SEC - 5 * 60,
+      },
+    ],
+    NOW_MS,
   );
-  expect(quiet, "expected a quiet (null) row").toBeDefined();
-  expect(quiet as string).toMatch(/ —$/);
+  const header = lines[0];
+  const bracket = header.indexOf("[");
+  expect(bracket).toBe("(claude-multi-3)".length + 1);
+  const rl = bodyLineExact(lines, "rate-limited") as string;
+  // The rate-limited literal lands at the chip's `[` column.
+  expect(rl.indexOf("rate-limited")).toBe(bracket);
+  // `rate-limited` is 12 chars (the widest label here), padEnd(12) leaves
+  // zero trailing spaces; one separator space precedes the relative time.
+  expect(rl).toBe(`${" ".repeat(bracket)}rate-limited 5m ago`);
+  // Quota labels are padded to width 12 too so they share the column
+  // landing; session is 7 → 5 trailing spaces, week is 4 → 8 trailing.
+  const session = bodyLineExact(lines, "session") as string;
+  expect(
+    session.startsWith(`${" ".repeat(bracket)}session${" ".repeat(5)} [`),
+  ).toBe(true);
+  const week = bodyLineExact(lines, "week") as string;
+  expect(week.startsWith(`${" ".repeat(bracket)}week${" ".repeat(8)} [`)).toBe(
+    true,
+  );
+});
+
+test("label padding ignores 'rate-limited' when no row renders one", () => {
+  // Mirror of the existing label-padding test: `rate-limited` must only
+  // join the label-width pool when at least one row will render that
+  // line, so a limit-less screen keeps its quota labels at width 7
+  // (`session`) rather than 12 (`rate-limited`).
+  const lines = renderRowLines(
+    [
+      {
+        id: "a",
+        target: "opus",
+        multiplier: 1,
+        session_percent: 5,
+        session_resets_at: isoOffset(5),
+        week_percent: 5,
+        week_resets_at: isoOffset(5),
+        last_rate_limit_at: null,
+      },
+    ],
+    NOW_MS,
+  );
+  expect(bodyLine(lines, "week")).toContain(
+    "week    [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 5%",
+  );
 });
 
 test("unix-seconds input renders as relative time (no raw-float leakage)", () => {
-  // The `profiles.last_rate_limit_at` column is REAL unix-SECONDS to match
-  // `jobs.last_api_error_at` (the source-of-truth for the projection).
-  // Feeding it straight into `relTime` would do `Date.parse` and yield NaN,
-  // leaking the raw float into the rendered text. The numeric variant
-  // routes through `relTimeFromUnixSec` so the rendered cell is the same
-  // minute-rounded prose as the usage block's reset times.
-  const lines = renderProfileLines(
+  // The colocated `usage.last_rate_limit_at` column is REAL unix-SECONDS
+  // to match `profiles.last_rate_limit_at` / `jobs.last_api_error_at`.
+  // Feeding it straight into `relTime` would do `Date.parse` and yield
+  // NaN, leaking the raw float into the rendered text. The numeric
+  // variant routes through `relTimeFromUnixSec` so the rendered cell is
+  // the same minute-rounded prose as the quota reset times.
+  const lines = renderRowLines(
     [
       {
-        config_dir: "p1",
+        id: "p1",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(10),
+        week_percent: 10,
+        week_resets_at: isoOffset(10),
         last_rate_limit_at: NOW_SEC - 120, // 2 minutes ago
       },
     ],
     NOW_MS,
   );
-  const row = lines[1];
+  const row = bodyLineExact(lines, "rate-limited") as string;
   expect(row).toMatch(/ 2m ago$/);
   // Defensive: no raw float anywhere in the rendered text.
   expect(row).not.toMatch(/\d+\.\d+/);
 });
 
-test("chip column padEnds to the widest profile so relative times align", () => {
-  // `(default)` (9 chars) and `(longer-config-dir)` (19 chars) should
-  // padEnd to the widest, leaving the relative-time column flush across
-  // all rows.
-  const lines = renderProfileLines(
-    [
-      { config_dir: "", last_rate_limit_at: NOW_SEC - 60 },
-      { config_dir: "longer-config-dir", last_rate_limit_at: NOW_SEC - 60 },
-    ],
-    NOW_MS,
-  );
-  // chips: "(default)" (9), "(longer-config-dir)" (19) — widest = 19. Then
-  // a single separator space, then the rel-time.
-  const defaultRow = lines.find((l) => l.startsWith("(default)"));
-  expect(defaultRow, "expected a (default) row").toBeDefined();
-  // padEnd(19) on "(default)" (length 9) = 10 trailing spaces, then " 1m ago".
-  expect(defaultRow as string).toBe(`(default)${" ".repeat(10)} 1m ago`);
-});
-
-test("empty row set returns an empty array", () => {
-  expect(renderProfileLines([], NOW_MS)).toEqual([]);
-});
-
-test("renders 'now' at the round boundary for unix-seconds input", () => {
+test("renders 'now' at the round boundary for the rate-limit cell", () => {
   // A unix-seconds input within 30s of `nowMs` rounds to the same minute
-  // and renders as "now" — the same contract as `relTime`'s ISO callers,
-  // shared via `relTimeFromMs`.
-  const lines = renderProfileLines(
+  // and renders as "now" — same contract as the quota cells, shared via
+  // `relTimeFromMs`.
+  const lines = renderRowLines(
     [
       {
-        config_dir: "p1",
+        id: "p1",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(10),
+        week_percent: 10,
+        week_resets_at: isoOffset(10),
         last_rate_limit_at: NOW_SEC, // exact now
       },
     ],
     NOW_MS,
   );
-  expect(lines[1]).toMatch(/ now$/);
+  const row = bodyLineExact(lines, "rate-limited") as string;
+  expect(row).toMatch(/ now$/);
 });
