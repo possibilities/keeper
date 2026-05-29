@@ -54,7 +54,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 33;
+export const SCHEMA_VERSION = 34;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -538,6 +538,7 @@ CREATE TABLE IF NOT EXISTS epics (
     created_by_closer_of TEXT,
     sort_path TEXT NOT NULL DEFAULT '',
     queue_jump INTEGER NOT NULL DEFAULT 0,
+    resolved_epic_deps TEXT,
     default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status='open' OR approval!='approved' THEN 1 ELSE 0 END) VIRTUAL
 )
 `;
@@ -651,6 +652,58 @@ CREATE TABLE IF NOT EXISTS profiles (
     updated_at REAL NOT NULL DEFAULT 0
 )
 `;
+
+/**
+ * Schema-v34 `epic_dep_edges` reverse-dependency index (fn-637). One row per
+ * `(consumer_epic, raw_dep_token)` edge — the reverse adjacency list of
+ * `epics.depends_on_epics`. Keyed on `(consumer_id, dep_token)` so a forward
+ * rebuild (task .3) can wipe-and-reinsert a consumer's edges atomically inside
+ * the open `BEGIN IMMEDIATE` transaction, and a paired index on `dep_token`
+ * serves the reverse fan-out lookup ("every consumer that depends on token X")
+ * the task-.3 `EpicSnapshot` / `EpicDeleted` arms need to re-stamp downstream
+ * consumers when an upstream epic changes state.
+ *
+ * Field semantics:
+ * - `consumer_id` (TEXT, part of PK): the `epics.epic_id` of the consumer
+ *   epic whose `depends_on_epics` array contains this `dep_token`.
+ * - `dep_token` (TEXT, part of PK): the raw token from the consumer's
+ *   `depends_on_epics` JSON array — verbatim, NOT the resolved id. Raw-token
+ *   keying is resolution-independent: a dangling/ambiguous dep has no resolved
+ *   id to key on, and the codebase explicitly rejected resolved-id keying
+ *   (the consumer would fall out of the index when its dep is dangling, and
+ *   never get re-stamped when disambiguation becomes possible). Keying on the
+ *   raw token handles ambiguity flips natively — the upstream `EpicSnapshot`
+ *   carries the new epic_number; the reverse lookup against the raw token
+ *   (e.g. a bare number `"7"`, a slug like `"fn-7"`, or a full id) finds every
+ *   consumer whose dep could match the new candidate, and the per-consumer
+ *   re-resolve in task .3 promotes/demotes the state from there.
+ *
+ * Defaults match the zero-event projection: a fresh DB with zero events has
+ * zero rows here (no epics → no edges). The table populates organically from
+ * task .3's reducer fan-out (a forward stamp on every `EpicSnapshot` rebuilds
+ * the consumer's edges; a `EpicDeleted` for a consumer wipes them). A from-
+ * scratch re-fold rebuilds the table byte-deterministically from the event
+ * log; the reverse-dep fan-out is the only producer.
+ */
+const CREATE_EPIC_DEP_EDGES = `
+CREATE TABLE IF NOT EXISTS epic_dep_edges (
+    consumer_id TEXT NOT NULL,
+    dep_token TEXT NOT NULL,
+    PRIMARY KEY (consumer_id, dep_token)
+)
+`;
+
+/**
+ * Schema-v34 reverse-lookup index on `epic_dep_edges.dep_token`. Pairs with
+ * the table above. The composite PK `(consumer_id, dep_token)` is the leading-
+ * `consumer_id` index SQLite implicitly builds; the task-.3 reverse fan-out
+ * keys off `dep_token` ALONE ("every consumer whose `depends_on_epics`
+ * contains token X"), which needs a dedicated index with `dep_token` first.
+ * Without it, the fan-out would SCAN the table on every upstream snapshot.
+ */
+const CREATE_EPIC_DEP_EDGES_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_epic_dep_edges_dep_token ON epic_dep_edges(dep_token)",
+];
 
 /**
  * Schema-v31 `file_attributions` projection table — one row per
@@ -989,6 +1042,10 @@ function migrate(db: Database): void {
       db.run(sql);
     }
     db.run(CREATE_PROFILES);
+    db.run(CREATE_EPIC_DEP_EDGES);
+    for (const sql of CREATE_EPIC_DEP_EDGES_INDEXES) {
+      db.run(sql);
+    }
 
     // Seed singleton cursor on first boot. Subsequent boots are no-ops.
     db.run(
@@ -3002,6 +3059,40 @@ function migrate(db: Database): void {
     // log, so an existing v32 DB transitioning to v33 will see `profiles`
     // populate organically on the next SessionStart / rate_limit fold without
     // disturbing the other projections.
+
+    // v33→v34: fn-637 — schema foundation for projecting cross-epic dependency
+    // resolution into the `epics` row. Two structural additions:
+    //   - `epics.resolved_epic_deps TEXT` (nullable JSON array) — carries the
+    //     resolved + enriched state of the epic's `depends_on_epics`. NULL is
+    //     load-bearing: it means "not-yet-computed" and is DISTINCT from
+    //     `'[]'` ("computed, no deps"). The zero-event projection (a freshly
+    //     created epics row) reads NULL until the reducer's task-.3 forward-
+    //     stamp computes the array. `decodeRow` returns `null` (not `[]`) for
+    //     a NULL column — clients branch on null-ness to distinguish "still
+    //     converging" from "empty by design".
+    //   - `epic_dep_edges (consumer_id, dep_token)` reverse-index table +
+    //     `idx_epic_dep_edges_dep_token` — the reverse adjacency list keying
+    //     off the raw token from each consumer's `depends_on_epics`. See the
+    //     `CREATE_EPIC_DEP_EDGES` literal for the raw-token-vs-resolved-id
+    //     rationale (ambiguity flips, dangling deps).
+    //
+    // Both column + table defs match the `CREATE_EPICS` / `CREATE_EPIC_DEP_EDGES`
+    // literals above so a fresh v34 DB and a migrated v33→v34 DB converge to
+    // identical schema (the addColumnIfMissing/literal lockstep convention).
+    // `addColumnIfMissing` is idempotent — a fresh v34 DB enters this block
+    // too and the helper no-ops because the column is already present from
+    // `CREATE_EPICS`. The `epic_dep_edges` table + index are picked up by the
+    // unconditional bootstrap CREATE block above; this slot exists for the
+    // version-bump stamp ordering and the column ALTER.
+    //
+    // No rewind: a from-scratch re-fold (rewind cursor + `DELETE FROM epics;
+    // DELETE FROM epic_dep_edges`) is the task-.3 determinism guarantee, but
+    // for the v33→v34 step itself we just leave `resolved_epic_deps` at NULL
+    // on existing rows (the "not-yet-computed" sentinel) — the next
+    // `EpicSnapshot` fold under the new reducer logic (task .3) will populate
+    // it. Forward-only: NULL on a pre-fold row is the correct zero-event
+    // shape. No backfill needed at this layer.
+    addColumnIfMissing(db, "epics", "resolved_epic_deps", "TEXT");
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

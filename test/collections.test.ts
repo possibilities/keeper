@@ -373,6 +373,93 @@ test("runQuery decodes the depends_on_epics JSON-array column into a real array"
   db.close();
 });
 
+test("epics descriptor: resolved_epic_deps is served + a jsonColumn (schema v34, fn-637)", () => {
+  // Schema-v34 column carrying the resolved + enriched state of
+  // `depends_on_epics`. Served on every `result` / `patch` frame and
+  // decoded as JSON at the read boundary (`decodeRow`); NULL is preserved
+  // (the "not-yet-computed" sentinel) — DISTINCT from `'[]'` (the
+  // "computed, no deps" stored value). Out of `sortable` / `filters`
+  // (clients branch on element shape, not column value).
+  expect(EPICS_DESCRIPTOR.columns).toContain("resolved_epic_deps");
+  expect(EPICS_DESCRIPTOR.jsonColumns.has("resolved_epic_deps")).toBe(true);
+  expect(EPICS_DESCRIPTOR.sortable.has("resolved_epic_deps")).toBe(false);
+  expect(EPICS_DESCRIPTOR.filters.resolved_epic_deps).toBeUndefined();
+});
+
+test("runQuery decodes resolved_epic_deps JSON into a real array (schema v34, fn-637)", () => {
+  // Stored as JSON-TEXT — `decodeRow` parses to a real array on the wire.
+  // Mirror of the `depends_on_epics` decode test above; the per-entry
+  // shape is the task-.3 `ResolvedEpicDep` type but the decode pass is
+  // value-agnostic — we round-trip whatever JSON the column carries.
+  const { db } = openDb(dbPath, { readonly: false });
+  const resolved = JSON.stringify([
+    {
+      dep_token: "fn-3",
+      resolved_epic_id: "fn-3-base",
+      epic_number: 3,
+      project_basename: "keeper",
+      cross_project: false,
+      state: "satisfied",
+    },
+    {
+      dep_token: "missing",
+      resolved_epic_id: null,
+      epic_number: null,
+      project_basename: null,
+      cross_project: false,
+      state: "dangling",
+    },
+  ]);
+  // seedEpic doesn't carry resolved_epic_deps in its options, so we stamp
+  // it directly via UPDATE — the row's other defaults stay intact.
+  seedEpic(db, "fn-9-resolved", { epic_number: 9, status: "open" });
+  db.prepare(
+    "UPDATE epics SET resolved_epic_deps = ? WHERE epic_id = 'fn-9-resolved'",
+  ).run(resolved);
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "epics",
+      filter: { epic_id: "fn-9-resolved" },
+    }),
+  );
+  const row = res.rows[0];
+  expect(row).toBeDefined();
+  expect(Array.isArray(row?.resolved_epic_deps)).toBe(true);
+  const arr = row?.resolved_epic_deps as {
+    dep_token: string;
+    state: string;
+  }[];
+  expect(arr).toHaveLength(2);
+  expect(arr[0]?.dep_token).toBe("fn-3");
+  expect(arr[0]?.state).toBe("satisfied");
+  expect(arr[1]?.state).toBe("dangling");
+  db.close();
+});
+
+test("runQuery preserves NULL on resolved_epic_deps (NOT collapsed to []) — the 'not-yet-computed' sentinel is load-bearing (schema v34, fn-637)", () => {
+  // The zero-event projection for `resolved_epic_deps` is NULL, which
+  // means "the reducer hasn't computed this yet". That state is DISTINCT
+  // from `[]` ("computed, no deps") at the readiness layer — without
+  // preserving NULL, downstream consumers couldn't tell convergence apart
+  // from a structurally empty dep list. seedEpic stamps the row but never
+  // touches `resolved_epic_deps`, so the column reads NULL from the DB;
+  // `decodeRow` must preserve that NULL on the wire.
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-7-pending", { epic_number: 7, status: "open" });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "epics",
+      filter: { epic_id: "fn-7-pending" },
+    }),
+  );
+  const row = res.rows[0];
+  expect(row).toBeDefined();
+  expect(row?.resolved_epic_deps).toBeNull();
+  db.close();
+});
+
 test("runQuery decodes the embedded jobs JSON-array column into a real array", () => {
   const { db } = openDb(dbPath, { readonly: false });
   const epicJobs = JSON.stringify([

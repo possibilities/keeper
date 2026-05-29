@@ -783,6 +783,78 @@ export interface Epic {
    * wipe the envelope-derived flag back to `0` on every approval flip.
    */
   queue_jump: number;
+  /**
+   * Schema v34 (fn-637): the resolved + enriched state of this epic's
+   * `depends_on_epics`, computed at fold time by the reducer's task-.3 forward-
+   * stamp using the shared `resolveEpicDep` helper. Drives readiness predicate
+   * 9 (`dep-on-epic`, `dep-on-epic-dangling`) and the board summary pill, so
+   * downstream consumers read the projection instead of re-resolving live.
+   *
+   * Three-state shape:
+   * - `null` — NOT-YET-COMPUTED. Load-bearing: a fresh epics row (no fold has
+   *   landed) reads `null`, DISTINCT from `[]` ("computed, no deps"). The
+   *   `decodeRow` boundary preserves `null` on the wire (special-cased in
+   *   {@link EPICS_DESCRIPTOR.jsonColumns}).
+   * - `[]` — COMPUTED, NO DEPS. The epic's `depends_on_epics` is empty.
+   * - `ResolvedEpicDep[]` — one entry per token in the consumer's
+   *   `depends_on_epics`, in source order. Per-entry shape (task .3 lands the
+   *   concrete type): `{dep_token, resolved_epic_id, epic_number,
+   *   project_basename, cross_project, state}` where `state` is one of
+   *   `'satisfied' | 'blocked-incomplete' | 'dangling'`.
+   *
+   * Stored as a JSON-TEXT column (`TEXT`, nullable) at the SQLite layer.
+   * Maintained by the reducer's task-.3 forward-stamp + reverse fan-out
+   * (sibling of `syncJobLinksOnJobWrite`) keyed through the `epic_dep_edges`
+   * reverse-index table. Survives an `EpicSnapshot` round-trip via the
+   * `projectPlanRow` ON CONFLICT carve-out (task .3 lands the carve-out
+   * alongside the existing `tasks` / `jobs` / `job_links` /
+   * `created_by_closer_of` / `sort_path` / `queue_jump` set).
+   */
+  resolved_epic_deps: ResolvedEpicDep[] | null;
+}
+
+/**
+ * Schema v34 (fn-637): one entry in {@link Epic.resolved_epic_deps} — the
+ * resolved + enriched state of a single token from the consumer epic's
+ * `depends_on_epics` array. Computed at fold time by the reducer's task-.3
+ * forward-stamp using the shared `resolveEpicDep` helper.
+ *
+ * Tri-state `state` field carries the readiness verdict the autopilot's
+ * BlockReason surface (`dep-on-epic`, `dep-on-epic-dangling`) and the board
+ * summary pill consume:
+ * - `'satisfied'` — upstream epic resolved + done + approved.
+ * - `'blocked-incomplete'` — upstream resolved, but not done-and-approved.
+ * - `'dangling'` — no upstream resolves (the token doesn't match any epic
+ *   in the lookup index), or the match is ambiguous and the disambiguator
+ *   can't pick one.
+ */
+export interface ResolvedEpicDep {
+  /** The raw token from the consumer's `depends_on_epics` array — verbatim. */
+  dep_token: string;
+  /**
+   * The resolved upstream `epics.epic_id`, or `null` when the token is
+   * dangling / ambiguous (no resolution possible at fold time).
+   */
+  resolved_epic_id: string | null;
+  /**
+   * The upstream's `epic_number`, or `null` when dangling — display-only at
+   * this layer (the resolver carries the number for the board's `[fn-N]` chip).
+   */
+  epic_number: number | null;
+  /**
+   * The basename of the upstream's `project_dir` (the worktree leaf — e.g.
+   * `keeper` for `/Users/mike/code/keeper`), or `null` when dangling.
+   * Display-only — drives the `<basename> · fn-N` board chip.
+   */
+  project_basename: string | null;
+  /**
+   * `true` when the resolved upstream lives in a different project (its
+   * `project_dir` differs from the consumer's). `false` for same-project deps
+   * and for dangling deps (no resolution to compare).
+   */
+  cross_project: boolean;
+  /** Readiness verdict — see the type-level comment. */
+  state: "satisfied" | "blocked-incomplete" | "dangling";
 }
 
 /**

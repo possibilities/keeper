@@ -4401,6 +4401,12 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     // Schema v30: queue_jump defaults to 0 — no planctl_invocation envelope
     // with `queue_jump: true` has been observed for this epic.
     queue_jump: 0,
+    // Schema v34 (fn-637): resolved_epic_deps is NULL on a freshly-folded
+    // epics row — "not-yet-computed", distinct from `'[]'` ("computed,
+    // no deps"). The task-.3 reducer forward-stamp populates this column
+    // from the shared `resolveEpicDep` helper; this task .2 lays only
+    // the schema foundation, so the column reads NULL here.
+    resolved_epic_deps: null,
     // Schema v32 (fn-634): default_visible is the VIRTUAL generated column
     // computed from (status, approval). status='open' + approval='pending'
     // → both branches of the OR hit → 1.

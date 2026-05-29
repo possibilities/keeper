@@ -232,6 +232,17 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // the value cosmetically — e.g. a `[queued]` pill — rather than
     // wire-filter on it). Out of `jsonColumns` (a scalar integer).
     "queue_jump",
+    // Schema v34 (fn-637): `resolved_epic_deps` — nullable JSON-TEXT array
+    // carrying the resolved + enriched state of `depends_on_epics`. NULL is
+    // load-bearing — it means "not-yet-computed" and is DISTINCT from `'[]'`
+    // ("computed, no deps"). The reducer's task-.3 forward-stamp populates
+    // the column from the shared `resolveEpicDep` helper, projecting the
+    // tri-state (`satisfied | blocked-incomplete | dangling`) the autopilot's
+    // BlockReason surface and the board summary pill read. Decoded as a
+    // jsonColumn at the read boundary — `decodeRow` parses the JSON to a real
+    // array when present, returns null when NULL. Out of `sortable` /
+    // `filters` (clients branch on element shape, not column value).
+    "resolved_epic_deps",
     // Schema v32: `default_visible` — VIRTUAL generated column SQLite
     // computes from `(status, approval)` on every read, materializing
     // the cross-column `(status='open' OR approval!='approved')`
@@ -305,7 +316,18 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
   // parsed arrays whose nested objects' nested arrays are already arrays, so
   // no separate `jsonColumns` entry is needed for the nested sub-array. All
   // four are served + decoded but OUT of `sortable`/`filters`.
-  jsonColumns: new Set(["tasks", "depends_on_epics", "jobs", "job_links"]),
+  jsonColumns: new Set([
+    "tasks",
+    "depends_on_epics",
+    "jobs",
+    "job_links",
+    // Schema v34 (fn-637): `resolved_epic_deps` is nullable — `decodeRow`
+    // returns `null` for a NULL column (the "not-yet-computed" sentinel)
+    // and the parsed array when the column carries JSON. Null-vs-empty-array
+    // is load-bearing for clients distinguishing "still converging" from
+    // "no deps".
+    "resolved_epic_deps",
+  ]),
 };
 
 /**
@@ -624,7 +646,15 @@ export function decodeRow(descriptor: CollectionDescriptor, row: Row): Row {
         // fall through to the [] fallback
       }
     }
-    out[col] = [];
+    // NULL preservation (schema v34, fn-637): a NULL column reads `null`
+    // from bun:sqlite. For nullable JSON columns like `resolved_epic_deps`,
+    // NULL is load-bearing — it signals "not-yet-computed", DISTINCT from a
+    // stored `'[]'` ("computed, no deps"). Preserve `null` on the wire so
+    // clients can branch on null-ness; an unparseable or empty string still
+    // falls back to `[]` (the schema-default empty shape for non-nullable
+    // JSON columns like `tasks` / `jobs` / `job_links`, which have a
+    // `NOT NULL DEFAULT '[]'` and so will never reach this branch with `null`).
+    out[col] = raw === null || raw === undefined ? null : [];
   }
   return out;
 }
