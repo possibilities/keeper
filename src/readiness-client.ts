@@ -1185,6 +1185,15 @@ export function subscribeReadiness(
       subsForReadiness,
       gitStatusByProjectDir,
       completedEpicsTyped,
+      // fn-638.4: caller-injected reference timestamp (unix seconds) for
+      // the `sub-agent-stale` `RunningReason` variant. The pure readiness
+      // pass never reads `Date.now()`; the live client supplies it here,
+      // per snapshot, so a still-`running` sub-agent past
+      // `SUBAGENT_STALENESS_SEC` renders as `sub-agent-stale` instead of
+      // `sub-agent-running`. See `computeReadiness`'s `now` parameter doc
+      // for the full rationale (mirrors fn-637.1's injected-`now`
+      // resolver pattern in `epic-deps.ts`).
+      Math.floor(Date.now() / 1000),
     );
     // Exceptions from `onSnapshot` propagate. This matches keeper's
     // "no in-process self-heal" stance and the prior board.ts code path,

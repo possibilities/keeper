@@ -171,6 +171,20 @@ function run(
   return computeReadiness(epics, jobs, subs, gitStatusByProjectDir);
 }
 
+// fn-638.4: variant that threads an explicit `now` (unix seconds) into
+// `computeReadiness` for the staleness-sensitive sub-agent predicate.
+// Skips the `completedEpics` slot with the same default the production
+// signature carries (empty iterable) so a test only needs to care about
+// `now` if it's exercising sub-agent staleness.
+function runWithNow(
+  epics: Epic[],
+  subs: SubagentInvocation[],
+  now: number,
+  jobs: Map<string, Job> = new Map(),
+) {
+  return computeReadiness(epics, jobs, subs, new Map(), [], now);
+}
+
 // ---------------------------------------------------------------------------
 // Predicate-ordering matrix
 // ---------------------------------------------------------------------------
@@ -285,6 +299,117 @@ test("predicate 6 (own-progress-sub) wins over 7 (own-approval-pending)", () => 
   });
   const epic = makeEpic({ tasks: [task] });
   const subs = [makeSub({ job_id: "worker-1", status: "running" })];
+  const snap = run([epic], new Map(), subs);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "sub-agent-running" }),
+  );
+});
+
+// fn-638.4: predicate 6 splits its running-sub-agent verdict on age.
+// A still-`running` sub-agent whose `ts` is older than the caller-
+// injected `now` by strictly more than `SUBAGENT_STALENESS_SEC` (120s,
+// mirroring the reducer's bounded Stop guard window) surfaces as
+// `sub-agent-stale` instead of `sub-agent-running`. Both directions
+// driven with an explicit `now` so the test is deterministic — no
+// `Date.now()` in either the test or the pure pass.
+test("predicate 6: running sub-agent within freshness window → sub-agent-running", () => {
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  // Started 60s before `now` — well within the 120s window. Verdict
+  // stays `sub-agent-running` (fresh work in flight).
+  const subs = [makeSub({ job_id: "worker-1", status: "running", ts: 1000 })];
+  const snap = runWithNow([epic], subs, 1060);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "sub-agent-running" }),
+  );
+});
+
+test("predicate 6: running sub-agent past staleness window → sub-agent-stale", () => {
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  // Started 200s before `now` — strictly past the 120s window. Verdict
+  // flips to `sub-agent-stale` (possibly-stuck orphan, visibility
+  // affordance so a human can see WHAT is holding the gate).
+  const subs = [makeSub({ job_id: "worker-1", status: "running", ts: 1000 })];
+  const snap = runWithNow([epic], subs, 1200);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "sub-agent-stale" }),
+  );
+});
+
+test("predicate 6: a mix of stale + fresh running sub-agents stays at sub-agent-running", () => {
+  // The point of `sub-agent-stale` is "the only live work is suspect".
+  // If even one sub-agent on the row is fresh, the row genuinely is
+  // making progress somewhere and shouldn't render as stale.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subs = [
+    makeSub({
+      job_id: "worker-1",
+      agent_id: "agent-old",
+      status: "running",
+      ts: 1000,
+    }),
+    makeSub({
+      job_id: "worker-1",
+      agent_id: "agent-fresh",
+      status: "running",
+      ts: 1150,
+    }),
+  ];
+  // `now=1200`: agent-old is 200s back (stale), agent-fresh is 50s back
+  // (fresh). The "all stale" predicate is false, so the verdict stays
+  // at `sub-agent-running`.
+  const snap = runWithNow([epic], subs, 1200);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "sub-agent-running" }),
+  );
+});
+
+test("predicate 6: exact boundary tick (now - ts === threshold) is not yet stale", () => {
+  // Strict `>` boundary mirrors the reducer's bounded Stop guard
+  // (`age > MAX_STOP_YIELD_GAP_SEC`). At the boundary tick, the row
+  // stays at `sub-agent-running`; the next-tick comparison would flip.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subs = [makeSub({ job_id: "worker-1", status: "running", ts: 1000 })];
+  const snap = runWithNow([epic], subs, 1120);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "sub-agent-running" }),
+  );
+});
+
+test("predicate 6: default `now` (NEGATIVE_INFINITY) never flips to sub-agent-stale", () => {
+  // Callers that omit `now` (autopilot simulator, hand-rolled fixtures)
+  // get `Number.NEGATIVE_INFINITY` as the default — `-Infinity - ts >
+  // threshold` is always false, so the staleness branch can never fire.
+  // Pre-fn-638.4 callers preserve their old `sub-agent-running` verdict
+  // bit-for-bit.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  // ts far in the past relative to a wall-clock `now`, but `run` omits
+  // the param — default kicks in and the verdict stays fresh.
+  const subs = [makeSub({ job_id: "worker-1", status: "running", ts: 0 })];
   const snap = run([epic], new Map(), subs);
   expect(snap.perTask.get(task.task_id)).toEqual(
     running({ kind: "sub-agent-running" }),
@@ -1713,6 +1838,9 @@ test("formatPill renders the three tags + every reason kind", () => {
   expect(formatPill(running({ kind: "sub-agent-running" }))).toBe(
     "[running:sub-agent-running]",
   );
+  expect(formatPill(running({ kind: "sub-agent-stale" }))).toBe(
+    "[running:sub-agent-stale]",
+  );
   expect(formatPill(blocked({ kind: "git-uncommitted" }))).toBe(
     "[blocked:git-uncommitted]",
   );
@@ -1828,6 +1956,56 @@ test("close row: task-level worker has running sub-agent → sub-agent-running",
   const sub = makeSub({ job_id: "worker-1", status: "running" });
   const snap = run([epic], new Map(), [sub]);
   expect(snap.perTask.get(t.task_id)).toEqual({ tag: "completed" });
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    running({ kind: "sub-agent-running" }),
+  );
+});
+
+// fn-638.4: close-row variant of the per-task staleness split. The
+// close row pools every contributing scope (epic-level close jobs + each
+// task's work jobs) — only when EVERY surviving running sub-agent
+// across every scope is past the threshold does the close row flip to
+// `sub-agent-stale`.
+test("close row: task-level running sub-agent past staleness window → sub-agent-stale", () => {
+  const t = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [t] });
+  const sub = makeSub({ job_id: "worker-1", status: "running", ts: 1000 });
+  // `now=1200`: age=200, threshold=120 → stale.
+  const snap = runWithNow([epic], [sub], 1200);
+  expect(snap.perTask.get(t.task_id)).toEqual({ tag: "completed" });
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    running({ kind: "sub-agent-stale" }),
+  );
+});
+
+test("close row: a single fresh sub-agent anywhere keeps the verdict at sub-agent-running", () => {
+  // Two tasks; task-1's worker has a stale sub-agent, task-2's has a
+  // fresh one. The close row pools both scopes — one fresh sub-agent
+  // anywhere keeps the verdict at `sub-agent-running` (the close row
+  // genuinely is blocked on live work somewhere).
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-2", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const subs = [
+    makeSub({ job_id: "worker-1", status: "running", ts: 1000 }), // stale
+    makeSub({ job_id: "worker-2", status: "running", ts: 1150 }), // fresh
+  ];
+  const snap = runWithNow([epic], subs, 1200);
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
     running({ kind: "sub-agent-running" }),
   );

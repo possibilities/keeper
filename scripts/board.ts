@@ -540,9 +540,14 @@ const PILL_COLORS: Record<string, PillBucket> = {
  * `[task-repo:<basename>]` divergence pill minted by `taskRepoPillSeg`
  * colors the same as `[blocked]`) AND to the `active` (cyan) bucket for
  * any `running:*` payload (so the `[running:<kind>]` motion pills minted
- * by `formatPill` for the three reasons split out of `BlockReason` —
- * `job-running`, `sub-agent-running`, `planner-running` — color the same
- * as a bare `[running]`). Unknown tokens pass through verbatim.
+ * by `formatPill` for the four reasons split out of `BlockReason` —
+ * `job-running`, `sub-agent-running`, `planner-running`, and (fn-638.4)
+ * `sub-agent-stale` — color the same as a bare `[running]`, EXCEPT the
+ * `running:sub-agent-stale` payload, which is routed to the `warn`
+ * (yellow) bucket by a more-specific branch above the generic
+ * `running:*` fallback so a possibly-stuck orphan sub-agent renders
+ * distinctly from fresh in-flight work). Unknown tokens pass through
+ * verbatim.
  *
  * Module-level + exported so `test/board.test.ts` can assert the coloring
  * contract without standing up the subscribe loop. Sidecars and the
@@ -575,6 +580,16 @@ export function colorizePillsInLine(line: string): string {
       bucket = "warn";
     }
     if (bucket === undefined && inner.startsWith("task-repo:")) {
+      bucket = "warn";
+    }
+    // fn-638.4: route `running:sub-agent-stale` to the `warn` bucket
+    // (yellow) so a possibly-stuck orphan sub-agent renders distinctly
+    // from a fresh `running:*` (cyan). Placed BEFORE the generic
+    // `running:*` → `active` fallback so the more-specific staleness
+    // signal wins. The other three `RunningReason` kinds
+    // (`job-running`, `sub-agent-running`, `planner-running`) fall
+    // through to `active` as before.
+    if (bucket === undefined && inner === "running:sub-agent-stale") {
       bucket = "warn";
     }
     if (bucket === undefined && inner.startsWith("running:")) {

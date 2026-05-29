@@ -193,16 +193,69 @@ export type BlockReason =
   | { kind: "unknown" };
 
 /**
- * The three "in-motion" reasons split out of `BlockReason` into the
+ * The four "in-motion" reasons split out of `BlockReason` into the
  * sibling `running` Verdict tag. A `running` verdict means the row has a
  * live worker / sub-agent / planner session actively in motion — distinct
  * from a `blocked` verdict, which means the row is stuck waiting on a
  * dependency, approval, repo state, or mutex.
+ *
+ * `sub-agent-stale` (fn-638.4) is the visibility affordance for a
+ * still-`running` sub-agent invocation whose start age exceeds
+ * `SUBAGENT_STALENESS_SEC` relative to the caller-injected `now`. It is a
+ * SUPPLEMENT to the reducer's bounded Stop guard (fn-638.1), not a
+ * replacement: the reducer releases the worker's `working` state once the
+ * Stop event's `ts` is past the same window, which clears predicate 5; a
+ * sub-agent that survives that release because Stop never fired
+ * (autopilot-spawned `claude` exited without a Stop hook, or the
+ * sub-agent's parent session is orphaned) keeps predicate 6 firing
+ * `sub-agent-running` indefinitely. This variant makes the
+ * possibly-stuck condition visible on the board so a human can see WHAT
+ * is holding a gate instead of seeing a wedged autopilot. The threshold
+ * mirrors `MAX_STOP_YIELD_GAP_SEC` (120s) so the two definitions stay
+ * aligned — once the bounded Stop guard would have considered the
+ * sub-agent old enough to bypass, this predicate surfaces the same row
+ * as stale. Aligns with `collapseSubagentsByName`'s client-side
+ * "stuck-orphan" notion in convergent intent: the client labels the
+ * structurally-stuck rows (older turn_seq superseded but still running),
+ * this predicate labels them temporally (older than the freshness
+ * window) — both flag the same orphaned-running rows in practice.
  */
 export type RunningReason =
   | { kind: "job-running" }
   | { kind: "sub-agent-running" }
+  | { kind: "sub-agent-stale" }
   | { kind: "planner-running" };
+
+/**
+ * Staleness threshold for the `sub-agent-stale` `RunningReason` variant
+ * (fn-638.4). A still-`running` sub-agent whose `ts` is older than the
+ * caller-injected `now` by strictly more than this many seconds renders
+ * as `sub-agent-stale` instead of `sub-agent-running`. Value mirrors
+ * `MAX_STOP_YIELD_GAP_SEC` in `src/reducer.ts` (the bounded Stop guard
+ * window): once the reducer would have considered the sub-agent old
+ * enough to bypass on a Stop event, this predicate surfaces the same row
+ * as stale so the board pill and the autopilot release-window agree on
+ * the same row population. Held as a local constant (not imported from
+ * `reducer.ts`) so the readiness module stays leaf-ish — both
+ * definitions live as bare numeric constants with cross-refs in their
+ * docstrings, drifting one without the other surfaces in
+ * `test/reducer.test.ts` + `test/readiness.test.ts` together.
+ *
+ * Determinism: the comparison `now - inv.ts > SUBAGENT_STALENESS_SEC` is
+ * a pure function of the injected `now` and the projection's `ts` field
+ * — no `Date.now()` here, just like the reducer's bounded Stop guard.
+ * Callers in the live path (`subscribeReadiness` → `computeReadiness`)
+ * supply `Math.floor(Date.now()/1000)` per snapshot; the autopilot
+ * simulator and tests that don't care pass `Number.NEGATIVE_INFINITY`
+ * (the parameter's default) so the staleness branch never fires for
+ * them. Re-fold determinism does not apply here — this is a CLIENT
+ * computation over the live projection, not a reducer fold. The two
+ * worlds are deliberately separate: the reducer's bounded Stop guard
+ * (fold-time, event-`ts`-driven) does the WORK of releasing the worker;
+ * this predicate does the VISIBILITY work of telling a human why a
+ * surviving sub-agent is suspect.
+ */
+export const SUBAGENT_STALENESS_SEC = 120;
 
 export type Verdict =
   | { tag: "ready" }
@@ -291,6 +344,25 @@ export function computeReadiness(
   // `dep-on-epic-dangling`. Defaults to empty so existing callers/tests that
   // don't subscribe to the completed set keep the pre-fix behavior.
   completedEpics: Iterable<Epic> = [],
+  // fn-638.4: caller-injected reference timestamp (unix seconds) for the
+  // `sub-agent-stale` `RunningReason` variant — a still-`running` sub-agent
+  // invocation whose `ts` is older than `now - SUBAGENT_STALENESS_SEC`
+  // surfaces as `sub-agent-stale` instead of `sub-agent-running`. Mirrors
+  // the injected-timestamp pattern fn-637.1 established in `epic-deps.ts`
+  // for `resolveEpicDep`: the pure readiness pass never reads `Date.now()`;
+  // the live client (`subscribeReadiness`) supplies
+  // `Math.floor(Date.now()/1000)` per snapshot. The autopilot simulator and
+  // hand-rolled tests that don't model running sub-agents pass the default
+  // `Number.NEGATIVE_INFINITY` so the staleness branch can never fire for
+  // them (`-Infinity - inv.ts > threshold` is always false). Held as a
+  // separate parameter from `completedEpics`' wall-clock so the two pure
+  // surfaces stay independently overridable — a test exercising staleness
+  // doesn't need to also supply completed epics, and vice versa. This is a
+  // CLIENT computation distinct from the reducer fold (the bounded Stop
+  // guard at `src/reducer.ts:MAX_STOP_YIELD_GAP_SEC` does the WORK of
+  // releasing the worker; this predicate does the VISIBILITY work of
+  // surfacing a sub-agent that survives that release).
+  now: number = Number.NEGATIVE_INFINITY,
 ): ReadinessSnapshot {
   // Build a job_id → SubagentInvocation[] index so predicate 6 is O(1) per row.
   // Filtered to `status === "running"` at index time — the only status that
@@ -385,6 +457,7 @@ export function computeReadiness(
         epicById,
         epicsByNumber,
         diagnostics,
+        now,
       );
       perTask.set(task.task_id, verdict);
     }
@@ -396,6 +469,7 @@ export function computeReadiness(
       subRunningByJobId,
       perTask,
       gitStatusByProjectDir,
+      now,
     );
     perCloseRow.set(epic.epic_id, closeVerdict);
   }
@@ -439,6 +513,10 @@ function evaluateTask(
   epicById: Map<string, Epic>,
   epicsByNumber: Map<number, Epic[]>,
   diagnostics: ResolutionDiagnostic[],
+  // fn-638.4: caller-injected reference timestamp (unix seconds) for the
+  // sub-agent staleness check at predicate 6. See `computeReadiness`'s
+  // `now` doc for the determinism rationale.
+  now: number,
 ): Verdict {
   // 1. terminal-completed. Schema v19: read the derived worker-phase binary
   // under its new key — the legacy `status` was renamed to `worker_phase`
@@ -477,7 +555,31 @@ function evaluateTask(
   // session. The worker session id is the embedded job's `job_id`; a task
   // may have zero or more workers. A single `running` invocation on any
   // worker blocks.
+  //
+  // fn-638.4: split the verdict on `now - inv.ts > SUBAGENT_STALENESS_SEC`:
+  // if EVERY surviving running sub-agent under this row is stale, render
+  // `sub-agent-stale` (visibility affordance for a possibly-stuck
+  // orphan); otherwise render `sub-agent-running` (fresh work in
+  // flight). The reducer's bounded Stop guard (fn-638.1) releases the
+  // worker's `working` state under the same window; this predicate runs
+  // AFTER that release surfaces — predicate 5 has already cleared by
+  // then, so this branch sees only the sub-agents that survived. Reads
+  // the same threshold the reducer uses so the two definitions stay
+  // aligned with `collapseSubagentsByName`'s structural stuck-orphan
+  // notion (the client labels turn_seq-superseded rows; this predicate
+  // labels temporally-old rows — both converge on the same orphaned
+  // running rows).
   if (anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId)) {
+    if (
+      allRunningSubagentsAreStale(
+        task.jobs,
+        subRunningByJobId,
+        now,
+        SUBAGENT_STALENESS_SEC,
+      )
+    ) {
+      return { tag: "running", reason: { kind: "sub-agent-stale" } };
+    }
     return { tag: "running", reason: { kind: "sub-agent-running" } };
   }
 
@@ -652,6 +754,10 @@ function evaluateCloseRow(
     string,
     { dirty_count: number; unattributed_to_live_count: number }
   >,
+  // fn-638.4: caller-injected reference timestamp (unix seconds) for the
+  // sub-agent staleness check at predicate 6. See `computeReadiness`'s
+  // `now` doc for the determinism rationale.
+  now: number,
 ): Verdict {
   // 1. terminal-completed (close-row variant).
   if (epic.status === "done" && epic.approval === "approved") {
@@ -698,13 +804,21 @@ function evaluateCloseRow(
   // bound to this epic (close-verb at epic level, work-verb at task level).
   // Same race as predicate 5: a task's worker can still be running a
   // sub-agent after planctl/human have driven the task to completed.
-  if (anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId)) {
-    return { tag: "running", reason: { kind: "sub-agent-running" } };
-  }
-  for (const task of epic.tasks) {
-    if (anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId)) {
-      return { tag: "running", reason: { kind: "sub-agent-running" } };
+  //
+  // fn-638.4: same stale split as the task path's predicate 6 — render
+  // `sub-agent-stale` iff every surviving running sub-agent across the
+  // checked scopes (epic-level close jobs + every task-level work job)
+  // is past `SUBAGENT_STALENESS_SEC` relative to `now`; otherwise
+  // `sub-agent-running`. The check pools every scope so a single fresh
+  // sub-agent on any task keeps the close row at `sub-agent-running`
+  // (the close row is genuinely blocked on live work somewhere); the
+  // close row only flips to `sub-agent-stale` once every surviving
+  // sub-agent across every contributing scope is suspect.
+  if (closeRowHasRunningSubagent(epic, subRunningByJobId)) {
+    if (allCloseRowRunningSubagentsAreStale(epic, subRunningByJobId, now)) {
+      return { tag: "running", reason: { kind: "sub-agent-stale" } };
     }
+    return { tag: "running", reason: { kind: "sub-agent-running" } };
   }
 
   // 6.5. git-uncommitted / git-orphans — close-row variant. Gated on
@@ -1119,6 +1233,110 @@ function anyEmbeddedJobHasRunningSubagent(
     }
   }
   return false;
+}
+
+/**
+ * fn-638.4: predicate 6 staleness companion to
+ * {@link anyEmbeddedJobHasRunningSubagent}. Returns `true` iff every
+ * surviving `running` `subagent_invocation` under the given embedded
+ * jobs has `now - inv.ts > threshold`. Vacuous-truth on no running
+ * sub-agents (the predicate-6 entry already excluded that case via
+ * {@link anyEmbeddedJobHasRunningSubagent}; callers MUST gate on it
+ * first). Threshold semantics match the reducer's bounded Stop guard:
+ * strict `>` so the boundary tick (`now - inv.ts === threshold`)
+ * doesn't yet flip the pill.
+ *
+ * "Every" (not "any") so a single fresh sub-agent on the same row keeps
+ * the verdict at `sub-agent-running`. The point of `sub-agent-stale` is
+ * "the only live work is suspect" — if even one sub-agent is fresh, the
+ * row genuinely is making progress somewhere and the human shouldn't
+ * see a stuck-orphan pill.
+ */
+function allRunningSubagentsAreStale(
+  embedded: { job_id: string }[] | undefined,
+  subRunningByJobId: Map<string, SubagentInvocation[]>,
+  now: number,
+  threshold: number,
+): boolean {
+  if (embedded === undefined) {
+    return false;
+  }
+  for (const job of embedded) {
+    const hits = subRunningByJobId.get(job.job_id);
+    if (hits === undefined) {
+      continue;
+    }
+    for (const inv of hits) {
+      if (now - inv.ts <= threshold) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * fn-638.4: close-row variant of
+ * {@link anyEmbeddedJobHasRunningSubagent}, pooling the
+ * epic-level jobs AND every task-level jobs sub-array. Used by
+ * `evaluateCloseRow`'s predicate 6 so the close row stalls on any
+ * surviving running sub-agent across either scope (mirroring the
+ * existing close-row scan that was inlined as two separate calls before
+ * the fn-638.4 stale-split). Returns `true` iff at least one running
+ * sub-agent is present in any scope.
+ */
+function closeRowHasRunningSubagent(
+  epic: Epic,
+  subRunningByJobId: Map<string, SubagentInvocation[]>,
+): boolean {
+  if (anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId)) {
+    return true;
+  }
+  for (const task of epic.tasks) {
+    if (anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * fn-638.4: close-row variant of {@link allRunningSubagentsAreStale},
+ * pooling every contributing scope (epic-level close jobs + every
+ * task-level work jobs). Returns `true` iff EVERY surviving running
+ * sub-agent across every scope is past `SUBAGENT_STALENESS_SEC` — one
+ * fresh sub-agent anywhere keeps the verdict at `sub-agent-running`.
+ * Callers MUST gate on `closeRowHasRunningSubagent` first; vacuous-
+ * truth otherwise.
+ */
+function allCloseRowRunningSubagentsAreStale(
+  epic: Epic,
+  subRunningByJobId: Map<string, SubagentInvocation[]>,
+  now: number,
+): boolean {
+  if (
+    !allRunningSubagentsAreStale(
+      epic.jobs,
+      subRunningByJobId,
+      now,
+      SUBAGENT_STALENESS_SEC,
+    )
+  ) {
+    return false;
+  }
+  for (const task of epic.tasks) {
+    if (
+      !allRunningSubagentsAreStale(
+        task.jobs,
+        subRunningByJobId,
+        now,
+        SUBAGENT_STALENESS_SEC,
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

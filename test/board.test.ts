@@ -818,6 +818,33 @@ test("colorizePillsInLine: stopped + failed + awaiting stack colors independentl
   );
 });
 
+// fn-638.4: the `running:*` prefix fallback colors the three "fresh
+// in-flight" RunningReason kinds (`job-running`, `sub-agent-running`,
+// `planner-running`) as `active` (cyan) — same bucket as the bare
+// `[running]` exact match — while the more-specific
+// `running:sub-agent-stale` branch above the fallback routes the
+// possibly-stuck orphan variant to `warn` (yellow). Asserts the
+// distinct color so a regression that drops the more-specific branch
+// would surface here instead of silently re-collapsing stale into
+// cyan.
+test("colorizePillsInLine: running:<kind> fresh variants take the active bucket via prefix fallback", () => {
+  expect(colorizePillsInLine("[running:job-running]")).toBe(
+    `[${ACTIVE}running:job-running${RESET}]`,
+  );
+  expect(colorizePillsInLine("[running:sub-agent-running]")).toBe(
+    `[${ACTIVE}running:sub-agent-running${RESET}]`,
+  );
+  expect(colorizePillsInLine("[running:planner-running]")).toBe(
+    `[${ACTIVE}running:planner-running${RESET}]`,
+  );
+});
+
+test("colorizePillsInLine: running:sub-agent-stale takes the warn bucket (more-specific branch)", () => {
+  expect(colorizePillsInLine("[running:sub-agent-stale]")).toBe(
+    `[${WARN}running:sub-agent-stale${RESET}]`,
+  );
+});
+
 test("colorizePillsInLine: multiple pills on one line each color independently", () => {
   expect(
     colorizePillsInLine("1. Foo [#2] [in_progress] [done] [pending]"),
