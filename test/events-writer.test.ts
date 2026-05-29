@@ -18,7 +18,15 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,6 +36,7 @@ import {
   splitArgsLstart,
 } from "../plugin/hooks/events-writer";
 import { openDb } from "../src/db";
+import { parseDeadLetterLine } from "../src/dead-letter";
 import {
   extractSkillName,
   planVerbRefFromSpawnName,
@@ -1277,6 +1286,184 @@ test("a non-SessionStart event leaves config_dir NULL even when CLAUDE_CONFIG_DI
       )
       .get() as { config_dir: string | null } | null;
     expect(row?.config_dir).toBeNull();
+  } finally {
+    db.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Dead-letter path (fn-643 task .2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fire the launcher with an explicit `KEEPER_DEAD_LETTER_DIR` override so
+ * the test can inspect the per-pid NDJSON file without touching the user's
+ * real `~/.local/state/keeper/dead-letters/` directory. Also accepts an
+ * `extraEnv` overlay so a single test can clear `KEEPER_DB` (forcing the
+ * hook into a fresh-DB no-schema scenario) without mutating the shared
+ * `fireViaLauncher` helper.
+ *
+ * Returns both the launcher exit code AND the resolved dead-letter dir so
+ * callers can scan the directory for the pid-keyed NDJSON file. The
+ * launcher's PID is the writer pid — the spawned bun-hook process's parent.
+ */
+async function fireViaLauncherWithDeadLetter(
+  sessionName: string | null,
+  payload: Record<string, unknown>,
+  deadLetterDir: string,
+  extraEnv: Record<string, string | undefined> = {},
+): Promise<{ code: number; deadLetterDir: string; launcherPid: number }> {
+  const args = ["bun", "run", launcherPath];
+  if (sessionName !== null) {
+    args.push("--name", sessionName);
+  }
+  args.push("--payload", JSON.stringify(payload));
+  const env: Record<string, string> = {
+    ...(process.env as Record<string, string>),
+    KEEPER_DB: dbPath,
+    KEEPER_DEAD_LETTER_DIR: deadLetterDir,
+  };
+  for (const [k, v] of Object.entries(extraEnv)) {
+    if (v === undefined) {
+      delete env[k];
+    } else {
+      env[k] = v;
+    }
+  }
+  const proc = Bun.spawn(args, {
+    cwd: ROOT,
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const code = await proc.exited;
+  return { code, deadLetterDir, launcherPid: proc.pid ?? -1 };
+}
+
+test("a forced INSERT failure writes a per-pid NDJSON dead-letter and exits 0", async () => {
+  // Point KEEPER_DB at a brand-new, unmigrated DB file. The hook opens with
+  // `migrate: false`, so `prepareStmts` throws on the missing `events` table
+  // — the canonical "schema-transition window during a deploy" failure mode
+  // from the epic. Per fn-643 task .2, the dead-letter helper captures the
+  // resolved bindings to disk and the hook still exits 0.
+  const freshDb = join(tmpDir, "no-schema.db");
+  // Don't pre-migrate this DB — the parent dir exists (tmpDir) but the file
+  // doesn't, so `openDb({migrate:false})` opens it `create:true` and then
+  // `prepareStmts` throws on the missing `events` table.
+  const dlDir = join(tmpDir, "dead-letters");
+
+  const { code } = await fireViaLauncherWithDeadLetter(
+    "my-session",
+    {
+      hook_event_name: "SessionStart",
+      session_id: "sess-deadletter-ss",
+      cwd: "/tmp/work",
+    },
+    dlDir,
+    { KEEPER_DB: freshDb },
+  );
+  // Exit-0 contract holds even when the INSERT side fails — the hook must
+  // never wedge Claude's session.
+  expect(code).toBe(0);
+
+  // The per-pid NDJSON file lands in the override dir. We don't know the
+  // hook subprocess's pid, but it's the only file in the dir.
+  expect(existsSync(dlDir)).toBe(true);
+  const files = readdirSync(dlDir).filter((f) => f.endsWith(".ndjson"));
+  expect(files.length).toBe(1);
+  // Filename is <pid>.ndjson.
+  expect(/^\d+\.ndjson$/.test(files[0]!)).toBe(true);
+
+  const lines = readFileSync(join(dlDir, files[0]!), "utf-8")
+    .split("\n")
+    .filter((s) => s.length > 0);
+  expect(lines.length).toBe(1);
+  const record = parseDeadLetterLine(lines[0]!);
+  expect(record).not.toBeNull();
+  expect(record!.dl_id).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+  );
+  expect(record!.session_id).toBe("sess-deadletter-ss");
+  expect(record!.hook_event).toBe("SessionStart");
+  expect(typeof record!.ts).toBe("number");
+  expect(typeof record!.dl_written_at).toBe("number");
+  expect(typeof record!.pid).toBe("number");
+
+  // SessionStart-scraped fields MUST round-trip into the dead-letter
+  // record — they're not in stdin and are unrecoverable later. The launcher
+  // passes `--name my-session`, so the ps probe captures it on macOS/linux.
+  // On darwin the ps probe captures both spawn_name AND start_time
+  // simultaneously; on linux they're independent /proc reads. Assert
+  // structurally regardless of platform.
+  expect(record!.bindings.session_id).toBe("sess-deadletter-ss");
+  expect(record!.bindings.hook_event).toBe("SessionStart");
+  expect(record!.bindings.event_type).toBe("session_start");
+  expect("spawn_name" in record!.bindings).toBe(true);
+  expect("start_time" in record!.bindings).toBe(true);
+  expect("config_dir" in record!.bindings).toBe(true);
+  if (process.platform === "darwin" || process.platform === "linux") {
+    // The launcher (the hook's parent) DOES carry `--name my-session` on its
+    // argv, so the spawn_name capture lands.
+    expect(record!.bindings.spawn_name).toBe("my-session");
+  }
+});
+
+test("dead-letter file is mode 0o600 (private — bindings can carry secrets)", async () => {
+  const freshDb = join(tmpDir, "no-schema-mode.db");
+  const dlDir = join(tmpDir, "dead-letters-mode");
+
+  const { code } = await fireViaLauncherWithDeadLetter(
+    "any",
+    {
+      hook_event_name: "SessionStart",
+      session_id: "sess-mode",
+      cwd: "/tmp/work",
+    },
+    dlDir,
+    { KEEPER_DB: freshDb },
+  );
+  expect(code).toBe(0);
+
+  const files = readdirSync(dlDir).filter((f) => f.endsWith(".ndjson"));
+  expect(files.length).toBe(1);
+  const path = join(dlDir, files[0]!);
+  // Stat: file mode masked to permission bits = 0o600 on platforms that
+  // honor chmod (everywhere bun runs except Windows, which we don't ship).
+  const { statSync } = await import("node:fs");
+  const mode = statSync(path).mode & 0o777;
+  expect(mode).toBe(0o600);
+});
+
+test("steady-state success writes NO dead-letter file", async () => {
+  // Normal happy path: the schema is pre-migrated (by `beforeEach`), so the
+  // INSERT succeeds on the first attempt and the dead-letter helper is
+  // never invoked. The override dir stays empty / absent.
+  const dlDir = join(tmpDir, "dead-letters-happy");
+  const { code } = await fireViaLauncherWithDeadLetter(
+    "my-session",
+    {
+      hook_event_name: "SessionStart",
+      session_id: "sess-happy",
+      cwd: "/tmp/work",
+    },
+    dlDir,
+  );
+  expect(code).toBe(0);
+
+  // Either the dir doesn't exist at all (writeDeadLetter never ran, so
+  // mkdir never ran), or it's empty. Both shapes are valid.
+  if (existsSync(dlDir)) {
+    const files = readdirSync(dlDir);
+    expect(files.length).toBe(0);
+  }
+
+  // And the event row landed in the DB as expected.
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare("SELECT spawn_name FROM events WHERE session_id = 'sess-happy'")
+      .get() as { spawn_name: string | null } | null;
+    expect(row).not.toBeNull();
   } finally {
     db.close();
   }

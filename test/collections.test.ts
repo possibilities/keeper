@@ -1019,11 +1019,27 @@ test("dead_letters defaultFilter: recovered rows excluded from default runQuery 
   db.query(
     `INSERT INTO dead_letters (dl_id, session_id, hook_event, ts, dl_written_at, bindings, status)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run("dl-wait-1", "sess-aaa", "SessionStart", 1000.0, 1001.0, "{}", "waiting");
+  ).run(
+    "dl-wait-1",
+    "sess-aaa",
+    "SessionStart",
+    1000.0,
+    1001.0,
+    "{}",
+    "waiting",
+  );
   db.query(
     `INSERT INTO dead_letters (dl_id, session_id, hook_event, ts, dl_written_at, bindings, status)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run("dl-recv-1", "sess-bbb", "SessionStart", 1002.0, 1003.0, "{}", "recovered");
+  ).run(
+    "dl-recv-1",
+    "sess-bbb",
+    "SessionStart",
+    1002.0,
+    1003.0,
+    "{}",
+    "recovered",
+  );
   // Default query — no explicit filter — should see only the waiting row.
   const res = asResult(
     runQuery(db, 0, { type: "query", collection: "dead_letters" }),
