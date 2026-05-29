@@ -56,5 +56,5 @@ Import does NOT replay (no events written here).
 - [ ] The worker follows the worker contract (guard, typed protocol, supervisor lifecycle, watcher released in shutdown).
 
 ## Done summary
-
+Added the dead-letter watcher worker (src/dead-letter-worker.ts) + main-side scanDeadLetterDir importer wired into the daemon boot sequence (after seedKilledSweep) and the live worker-message path; INSERT OR IGNORE on dl_id keeps the table idempotent across re-scans. Missing dir is tolerated, partial-line / malformed JSON / oversized files skip-and-log without throwing. The worker follows the keeper contract (isMainThread guard, typed protocol, supervisor lifecycle, @parcel/watcher subscription released in shutdown).
 ## Evidence

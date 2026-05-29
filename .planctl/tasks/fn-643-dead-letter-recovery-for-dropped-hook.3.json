@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "daemon import via watcher worker",
-  "updated_at": "2026-05-29T15:00:36.105354Z"
+  "updated_at": "2026-05-29T18:38:16.696361Z",
+  "worker_done_at": "2026-05-29T18:38:16.696361Z"
 }
