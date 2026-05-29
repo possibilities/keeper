@@ -388,7 +388,7 @@ test("renderRowBlocks: drops all-zero rows and emits one block per non-empty row
   expect(block).toContain("  src/foo.ts [ M] tool@do thing");
 });
 
-test("renderRowBlocks: ahead-only row produces an unpushed line", () => {
+test("renderRowBlocks: ahead-only row shows +N on the project line, no unpushed line", () => {
   const blocks = renderRowBlocks([
     {
       project_dir: "/repo/ahead",
@@ -404,7 +404,7 @@ test("renderRowBlocks: ahead-only row produces an unpushed line", () => {
   const block = blocks[0];
   if (!block) throw new Error("missing block");
   expect(block).toMatch(/^\(ahead\) \[main \+3\]/);
-  expect(block).toContain("  unpushed 3");
+  expect(block).not.toContain("unpushed");
 });
 
 // ---------------------------------------------------------------------------

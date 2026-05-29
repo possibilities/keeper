@@ -169,7 +169,6 @@ function renderAttributions(
  *     path/to/file.ts [M ] tool@sess-a, bash@sess-b, inferred@sess-c
  *       ↳ renamed from path/to/orig.ts
  *     path/to/other.ts [??] <orphan>
- *     unpushed N
  *
  * `dirty=` carries the project-wide dirty file count (`dirty_count`);
  * `orphan=` is the strict-mystery `orphaned_count` (files with zero
@@ -250,10 +249,6 @@ export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
       if (orig.length > 0 && orig !== path) {
         lines.push(`    ↳ renamed from ${orig}`);
       }
-    }
-
-    if (aheadCount > 0) {
-      lines.push(`  unpushed ${aheadCount}`);
     }
 
     blocks.push(lines.join("\n"));
