@@ -1,0 +1,21 @@
+{
+  "branch_name": "fn-640-autopilot-ghostty-window-autoclose",
+  "bundles": [
+    "sketch/autopilot-ghostty-window-autoclose"
+  ],
+  "created_at": "2026-05-29T04:05:31.533313Z",
+  "depends_on_epics": [],
+  "id": "fn-640-autopilot-ghostty-window-autoclose",
+  "last_validated_at": "2026-05-29T04:05:31.756246Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "autopilot ghostty window autoclose",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-29T04:05:31.533313Z"
+}
