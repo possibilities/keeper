@@ -116,6 +116,7 @@ import {
   parsePlanRef,
   planVerbRefFromSpawnName,
 } from "./derivers";
+import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
 import {
   type ClassifierInvocation,
   computePlanWindows,
@@ -126,6 +127,7 @@ import {
   normalizePlanctlOp,
   type PlanWindow,
 } from "./plan-classifier";
+import type { ResolutionDiagnostic } from "./readiness-diagnostics";
 import {
   extractTurnSeq,
   findBridgePreToolUse,
@@ -136,9 +138,11 @@ import {
 } from "./subagent-invocations";
 import type {
   ApiErrorKind,
+  Epic,
   Event,
   InputRequestKind,
   JobLinkEntry,
+  ResolvedEpicDep,
 } from "./types";
 import { API_ERROR_KINDS } from "./types";
 
@@ -604,22 +608,24 @@ function projectPlanRow(db: Database, event: Event): void {
   if (event.hook_event === "EpicSnapshot") {
     // The ON CONFLICT update lists ONLY scalar columns and NEVER `tasks` /
     // `jobs` / `job_links` / `created_by_closer_of` / `sort_path` /
-    // `queue_jump`: an epic snapshot carries no task, job, job-link,
-    // closer-derivation, OR queue-jump data, and a shell row inserted by
-    // a task-before-epic TaskSnapshot, a job-before-epic
-    // `syncJobIntoEpic`, or a planctl-event-before-epic
-    // `syncPlanctlLinks` already holds those columns (the planctl-event
-    // shell stamps `job_links` real and leaves the schema-v29 closer
-    // columns + the schema-v30 queue-jump column at NULL / '' / 0 for
-    // the next `syncPlanctlLinks` call to compute). INSERT defaults all
-    // six to schema defaults (`'[]'`, `NULL`, `''`, `0`), so the
-    // first-sight epic reads empties and a later epic snapshot can never
-    // clobber them. The `job_links` / `created_by_closer_of` /
-    // `sort_path` / `queue_jump` carve-out is mandatory: without it, an
+    // `queue_jump` / `resolved_epic_deps`: an epic snapshot carries no
+    // task, job, job-link, closer-derivation, queue-jump, OR dep-
+    // resolution data, and a shell row inserted by a task-before-epic
+    // TaskSnapshot, a job-before-epic `syncJobIntoEpic`, or a
+    // planctl-event-before-epic `syncPlanctlLinks` already holds those
+    // columns (the planctl-event shell stamps `job_links` real and leaves
+    // the schema-v29 closer columns + the schema-v30 queue-jump column at
+    // NULL / '' / 0 for the next `syncPlanctlLinks` call to compute). The
+    // schema-v34 (fn-637) `resolved_epic_deps` column is computed AFTER
+    // this INSERT/UPDATE by `syncEpicDepsForward` against the post-write
+    // row; INSERT defaults it to NULL (the schema column default) and the
+    // ON CONFLICT carve-out preserves the just-computed projection
+    // across the next snapshot fold. Without the carve-out, an
     // approval RPC → atomic file write → file-watcher → EpicSnapshot fold
     // would wipe the creator/refiner provenance projection (schema v14)
     // AND the closer-creator link + materialized-path sort key (schema
-    // v29) AND the priority-jump flag (schema v30) on every approval flip.
+    // v29) AND the priority-jump flag (schema v30) AND the resolved-
+    // deps projection (schema v34) on every approval flip.
     db.run(
       `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_validated_at, last_event_id, updated_at, created_by_closer_of, sort_path, queue_jump)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 0)
@@ -713,6 +719,54 @@ function projectPlanRow(db: Database, event: Event): void {
         );
         cascadeSortPath(db, entityId, event.id, ts);
       }
+    }
+
+    // Schema v34 (fn-637): forward stamp + reverse fan-out for
+    // `resolved_epic_deps` + `epic_dep_edges`. Built ONCE per EpicSnapshot
+    // — the all-epics index assembled here is shared across the forward
+    // pass (the consumer is THIS epic; its edges + projection rebuild
+    // from scratch) and the reverse pass (every consumer whose
+    // `depends_on_epics` token IN (this.epic_id, 'fn-' || this.epic_number)
+    // — they re-resolve against the same index so a state flip on the
+    // upstream propagates in lockstep).
+    //
+    // Read-in-fold is allowed (the autocommit ban is on DB watchers,
+    // not query reads). The all-epics scan is ~1k rows on the steady-
+    // state DB; the per-event cost is dominated by the per-consumer
+    // re-stamps in the reverse pass.
+    //
+    // Order: forward FIRST, reverse SECOND. The reverse pass reads the
+    // consumer's `epics` row and re-resolves against the upstream's
+    // post-write state; running it AFTER the forward pass keeps the
+    // upstream's own row settled before downstream consumers re-stamp
+    // against it.
+    {
+      const index = buildEpicIndex(db);
+      syncEpicDepsForward(
+        db,
+        entityId,
+        event.id,
+        ts,
+        index.epicById,
+        index.epicsByNumber,
+      );
+      // Read the upstream's epic_number off the just-settled row (the
+      // forward pass may have stamped sort_path / resolved_epic_deps but
+      // didn't touch epic_number itself — the EpicSnapshot's INSERT/UPDATE
+      // did). A NULL epic_number means the reverse lookup skips the
+      // bare-id (`fn-N`) branch but still considers the full id.
+      const upstreamRow = db
+        .query("SELECT epic_number FROM epics WHERE epic_id = ?")
+        .get(entityId) as { epic_number: number | null } | null;
+      syncEpicDepsReverse(
+        db,
+        entityId,
+        upstreamRow?.epic_number ?? null,
+        event.id,
+        ts,
+        index.epicById,
+        index.epicsByNumber,
+      );
     }
   } else {
     // TaskSnapshot: a read-modify-write on the PARENT epic's embedded `tasks`
@@ -882,8 +936,41 @@ function retractPlanRow(db: Database, event: Event): void {
   const entityId = event.session_id;
 
   if (event.hook_event === "EpicDeleted") {
-    // Idempotent: a missing epic matches zero rows — a correct no-op.
+    // Schema v34 (fn-637): capture the upstream's epic_number BEFORE the
+    // DELETE so the reverse fan-out can re-stamp downstream consumers
+    // that depended on the bare-id form (`fn-N`) — the row is about to
+    // vanish, taking `epic_number` with it. Idempotent: a missing epic
+    // reads `null`, falls through, and the DELETE is a no-op match.
+    const pre = db
+      .query("SELECT epic_number FROM epics WHERE epic_id = ?")
+      .get(entityId) as { epic_number: number | null } | null;
     db.run("DELETE FROM epics WHERE epic_id = ?", [entityId]);
+    // Also drop the upstream's OWN edges row — the consumer→token
+    // index for THIS epic as a consumer is gone with the row, so its
+    // back-references should not linger. Forward-only: re-fold from
+    // scratch replays the create→delete sequence and reproduces the
+    // same retracted state. Idempotent: zero matches on a never-existed
+    // / already-retracted edge.
+    db.run("DELETE FROM epic_dep_edges WHERE consumer_id = ?", [entityId]);
+    // Reverse fan-out — re-stamp every downstream consumer whose
+    // `depends_on_epics` carried this epic's full id or bare id. The
+    // resolver re-runs against the post-DELETE `epics` table: a
+    // matching upstream now misses and the consumer's matching entry
+    // flips to `dangling`. Order matters: DELETE FIRST so the resolver
+    // observes the missing row; reverse fan-out SECOND. Built ONCE per
+    // EpicDeleted — same shape as the EpicSnapshot path.
+    if (pre != null) {
+      const index = buildEpicIndex(db);
+      syncEpicDepsReverse(
+        db,
+        entityId,
+        pre.epic_number,
+        event.id,
+        event.ts,
+        index.epicById,
+        index.epicsByNumber,
+      );
+    }
     return;
   }
 
@@ -3599,6 +3686,498 @@ function cascadeSortPath(
       }
     }
     frontier = next;
+  }
+}
+
+/**
+ * Schema v34 (fn-637): row shape lifted from `epics` for the fold-time
+ * resolver's all-epics index. Carries the minimal subset
+ * `resolveEpicDep` reads off an {@link Epic}: `epic_id`, `epic_number`,
+ * `project_dir`, `status`, `approval`. Everything else (`tasks`,
+ * `jobs`, `job_links`, `depends_on_epics`, etc.) is irrelevant to
+ * resolution and excluded from the SELECT to keep the in-fold scan
+ * narrow.
+ */
+interface EpicLite {
+  epic_id: string;
+  epic_number: number | null;
+  project_dir: string | null;
+  status: string | null;
+  approval: "approved" | "rejected" | "pending";
+}
+
+/**
+ * Reducer-local minimal {@link Epic}-shaped record assembled from an
+ * {@link EpicLite} row, satisfying the {@link Epic} surface the shared
+ * {@link resolveEpicDep} resolver reads. The fields the resolver does
+ * NOT touch (`tasks`, `jobs`, `job_links`, etc.) are stamped with
+ * zero-event defaults so a type-narrow consumer that walks them yields
+ * the same shape as a real {@link Epic} (defense-in-depth — the
+ * resolver only reads the five fields above, but the helper builds the
+ * full surface so future widening of the resolver doesn't silently miss
+ * fields).
+ */
+function epicLiteToEpic(row: EpicLite): Epic {
+  return {
+    epic_id: row.epic_id,
+    epic_number: row.epic_number,
+    title: null,
+    project_dir: row.project_dir,
+    status: row.status,
+    approval: row.approval,
+    last_event_id: null,
+    updated_at: 0,
+    depends_on_epics: [],
+    tasks: [],
+    jobs: [],
+    job_links: [],
+    last_validated_at: null,
+    created_by_closer_of: null,
+    sort_path: "",
+    queue_jump: 0,
+    resolved_epic_deps: null,
+  };
+}
+
+/**
+ * Schema v34 (fn-637): build the in-fold all-epics index the shared
+ * {@link resolveEpicDep} resolver reads against. Returns `(epicById,
+ * epicsByNumber)` keyed off the live `epics` table. Runs INSIDE the
+ * open transaction opened by {@link applyEvent}; performs zero cursor
+ * work.
+ *
+ * Read-in-fold is allowed (the autocommit ban in CLAUDE.md is on DB
+ * watchers, not query reads). The SELECT is narrow — five columns —
+ * and the table sits at ~1k rows in the steady state, so the scan is
+ * cheap. Per-call cost dominates the fold; if it becomes hot a future
+ * optimization could cache the index inside `applyEvent` and reuse it
+ * across the forward + reverse passes, but the current shape keeps
+ * each helper composable.
+ *
+ * Determinism: every column read is persisted from the immutable event
+ * log; nothing here reads wall-clock, env, or OS state. A from-scratch
+ * re-fold rebuilds the same index at the same event, so the per-event
+ * derivation of `resolved_epic_deps` is byte-identical across re-folds.
+ */
+function buildEpicIndex(db: Database): {
+  epicById: Map<string, Epic>;
+  epicsByNumber: Map<number, Epic[]>;
+} {
+  const rows = db
+    .query(
+      `SELECT epic_id, epic_number, project_dir, status, approval
+         FROM epics`,
+    )
+    .all() as EpicLite[];
+  const epicById = new Map<string, Epic>();
+  const epicsByNumber = new Map<number, Epic[]>();
+  for (const row of rows) {
+    const epic = epicLiteToEpic(row);
+    epicById.set(row.epic_id, epic);
+    if (row.epic_number != null) {
+      const bucket = epicsByNumber.get(row.epic_number);
+      if (bucket == null) {
+        epicsByNumber.set(row.epic_number, [epic]);
+      } else {
+        bucket.push(epic);
+      }
+    }
+  }
+  // Stable order inside each `epicsByNumber` bucket so the resolver's
+  // ambiguity tie-break (and downstream re-fold byte-identity) does not
+  // depend on SQLite's result ordering. ORDER BY at the SELECT layer
+  // would lift the cost into the planner; sorting the small bucket in
+  // memory is cheaper and identical in semantics.
+  for (const bucket of epicsByNumber.values()) {
+    bucket.sort((a, b) =>
+      a.epic_id < b.epic_id ? -1 : a.epic_id > b.epic_id ? 1 : 0,
+    );
+  }
+  return { epicById, epicsByNumber };
+}
+
+/**
+ * Schema v34 (fn-637): the shared enrich helper — mirror of
+ * {@link enrichJobLink}. Given a raw `depTok` from the consumer's
+ * `depends_on_epics` and the in-fold all-epics index, runs the shared
+ * fold-safe {@link resolveEpicDep} resolver and projects the minimal-
+ * subset tri-state entry onto the wire shape carried in
+ * `epics.resolved_epic_deps`. Shared by the forward stamp, the
+ * reverse fan-out, and the EpicDeleted path: SAME code path, SAME
+ * defaults — re-fold determinism requires a single source of truth
+ * for "what's the projection shape on disk".
+ *
+ * **Tri-state mapping** (locked):
+ * - `dangling` — resolver returned `{kind: "dangling"}`.
+ * - `satisfied` — resolver returned `{kind: "found"}` AND
+ *   `epicIsCompleted(upstream)` (status='done' AND approval='approved'
+ *   — the same terminal predicate `evaluateCloseRow` reads).
+ * - `blocked-incomplete` — resolver returned `{kind: "found"}` but the
+ *   upstream is not completed (any other `status`/`approval` combo).
+ *
+ * **Locked key order.** The minimal-subset shape emits keys in the
+ * exact order `{dep_token, resolved_epic_id, epic_number,
+ * project_basename, cross_project, state}`; the wire encoding is
+ * `JSON.stringify`, which preserves insertion order, so any drift
+ * between this helper's branches would produce different bytes for the
+ * same logical entry — a silent re-fold-determinism break. Both
+ * branches (dangling vs. found) emit the same six keys with explicit
+ * `null` for the four "no resolution" fields in the dangling branch
+ * (NOT omitted) so the byte shape stays uniform.
+ *
+ * **Cross-project flag.** Computed off the consumer's `project_dir`
+ * basename vs. the upstream's. The same `projectBasename` helper the
+ * readiness side uses (`./epic-deps`) keeps the boundary semantics
+ * (POSIX-only, strip-trailing-slash) consistent across re-folds.
+ * `cross_project` is `true` IFF the resolved upstream's basename is a
+ * non-empty string AND differs from the consumer's non-empty basename;
+ * dangling and "no project_dir on either side" both fold to `false`.
+ *
+ * **No wall-clock, no diagnostics surface.** The resolver injects `now`
+ * for the `ambiguous-dep-resolution` diagnostic timestamp. The fold-
+ * time call passes the event's own `ts` (an ISO-8601 string derived
+ * deterministically — see `eventTsToIso`) so a re-fold reproduces the
+ * same diagnostic. The diagnostics sink itself is a fresh empty array
+ * the helper drops on the floor — the fold writes only the projection
+ * row, never the side-band JSONL log (that's a `scripts/board.ts` /
+ * `scripts/autopilot.ts` concern reading the readiness snapshot's
+ * `diagnostics` field at frame-emit time).
+ *
+ * NEVER throws inside the open BEGIN IMMEDIATE transaction.
+ */
+function enrichEpicDep(
+  depTok: string,
+  consumer: Epic,
+  epicById: Map<string, Epic>,
+  epicsByNumber: Map<number, Epic[]>,
+  nowIso: string,
+): ResolvedEpicDep {
+  // No-op diagnostics sink: a fresh empty array the helper drops on
+  // the floor. Diagnostics are observational (side-band JSONL log read
+  // at frame emit), not projection state; emitting them at fold time
+  // would require an I/O path inside the transaction. The readiness
+  // side surfaces the same diagnostic on its live resolve pass.
+  const diagnostics: ResolutionDiagnostic[] = [];
+  const resolved = resolveEpicDep(
+    depTok,
+    consumer,
+    epicById,
+    epicsByNumber,
+    diagnostics,
+    nowIso,
+  );
+  if (resolved.kind === "dangling") {
+    return {
+      dep_token: depTok,
+      resolved_epic_id: null,
+      epic_number: null,
+      project_basename: null,
+      cross_project: false,
+      state: "dangling",
+    };
+  }
+  const upstream = resolved.epic;
+  // Cross-project is a boolean on the wire (NOT the readiness-side
+  // string-or-null shape) — the projection carries the basename
+  // separately so a consumer that wants to render the prefix has
+  // both fields. `resolved.cross_project` is `string | null` from the
+  // resolver; reduce to boolean here.
+  const crossProject = resolved.cross_project !== null;
+  return {
+    dep_token: depTok,
+    resolved_epic_id: upstream.epic_id,
+    epic_number: upstream.epic_number,
+    project_basename: projectBasename(upstream.project_dir),
+    cross_project: crossProject,
+    state: epicIsCompleted(upstream) ? "satisfied" : "blocked-incomplete",
+  };
+}
+
+/**
+ * Schema v34 (fn-637): unix-seconds → ISO-8601 string for the resolver's
+ * `now` parameter. Deterministic — `Date(unix*1000).toISOString()` is a
+ * pure function of the unix-second integer carried on the event row, so
+ * a from-scratch re-fold reproduces the same diagnostic ts byte-for-
+ * byte (and `enrichEpicDep` drops the diagnostic on the floor anyway,
+ * but the determinism contract holds end-to-end).
+ *
+ * Why we don't just pass the unix-seconds number through: the resolver's
+ * `now` slot is typed as a string for the readiness side's
+ * `new Date().toISOString()` precedent. Keeping the signature shape
+ * stable across the readiness wrapper + the fold-time caller avoids
+ * a `now: string | number` widening and the discriminated-union noise
+ * that would ride with it.
+ */
+function eventTsToIso(ts: number): string {
+  return new Date(ts * 1000).toISOString();
+}
+
+/**
+ * Schema v34 (fn-637): deterministic sort for an embedded
+ * `resolved_epic_deps` array. **Source order** — entries are written
+ * in the same order they appear in the consumer's `depends_on_epics`
+ * array (NOT sorted by `dep_token`). This matches the readiness side's
+ * iteration order, so a renderer reading `resolved_epic_deps` sees the
+ * deps in the same order it'd see them off `depends_on_epics`.
+ *
+ * The sort itself is a no-op — included as a named function for symmetry
+ * with {@link sortEpicLinks} / {@link sortJobLinks} and a single hook
+ * point if a future ORDER BY rule lands. Re-fold determinism holds
+ * because `depends_on_epics` is the source array (persisted in the
+ * event blob, byte-stable across re-folds), and the helper just walks
+ * it in order.
+ */
+function preserveSourceOrder(_arr: ResolvedEpicDep[]): void {
+  // Intentional no-op — see docstring.
+}
+
+/**
+ * Schema v34 (fn-637): the forward fold. Rebuild `epic_dep_edges` rows
+ * for consumer `epicId` from scratch, then stamp the enriched
+ * `resolved_epic_deps` array on the consumer's `epics` row.
+ *
+ * Runs INSIDE the open transaction opened by {@link applyEvent}; performs
+ * zero cursor work. Called from the {@link projectPlanRow} EpicSnapshot
+ * arm AFTER the INSERT/UPDATE of the consumer's row, AFTER the
+ * sort_path derivation, but BEFORE the reverse fan-out (the reverse
+ * pass reads `epics` for upstream rows that may have moved into / out
+ * of the dep-resolution scope on this fold, and the forward pass has
+ * already settled the consumer's row).
+ *
+ * **Full-recompute, never delta-merge.** Mirrors {@link syncPlanctlLinks}.
+ * A delta-merge would double-add edges on re-fold. The forward pass
+ * deletes every existing `epic_dep_edges` row for this consumer and
+ * inserts one per `dep_token` in the consumer's `depends_on_epics`.
+ *
+ * **Raw-token edges.** Each `epic_dep_edges` row carries the raw token
+ * from `depends_on_epics` verbatim — NOT the resolved id. Raw-token
+ * keying makes ambiguity flips (a new same-number epic appears) and
+ * dangling deps (no upstream resolves) re-stamp natively on a later
+ * upstream snapshot: the reverse fan-out looks up consumers via
+ * `dep_token IN (A.epic_id, 'fn-' || A.epic_number)`, and the raw
+ * token is what the consumer originally typed.
+ *
+ * **De-duplicates within the consumer.** Two identical `depends_on_epics`
+ * tokens collapse to ONE `epic_dep_edges` row (the table's `PRIMARY
+ * KEY (consumer_id, dep_token)`) but BOTH render in `resolved_epic_deps`
+ * — the projection mirrors the source array exactly. The de-dup at
+ * the edges level is the schema constraint speaking, not a semantic
+ * rule; the `INSERT OR IGNORE` shape preserves it without throwing
+ * inside the transaction.
+ *
+ * NEVER throws inside the open transaction. A malformed
+ * `depends_on_epics` blob is already filtered out by `projectPlanRow`'s
+ * guarded parse (it lands on the row as `'[]'`); we re-parse defensively
+ * here as `[]` if SQLite returns a NULL/malformed cell.
+ */
+function syncEpicDepsForward(
+  db: Database,
+  epicId: string,
+  eventId: number,
+  ts: number,
+  epicById: Map<string, Epic>,
+  epicsByNumber: Map<number, Epic[]>,
+): void {
+  // Read the consumer's row, including the just-written
+  // `depends_on_epics`. This is the post-write read — the consumer's
+  // INSERT/UPDATE has already landed in this transaction.
+  const consumerRow = db
+    .query(
+      `SELECT epic_id, epic_number, project_dir, status, approval,
+              depends_on_epics
+         FROM epics
+        WHERE epic_id = ?`,
+    )
+    .get(epicId) as (EpicLite & { depends_on_epics: string | null }) | null;
+  if (consumerRow == null) {
+    // Consumer row vanished mid-fold — shouldn't happen (we're called
+    // post-INSERT/UPDATE of this very row), but defense-in-depth.
+    return;
+  }
+  let depTokens: string[] = [];
+  if (
+    consumerRow.depends_on_epics != null &&
+    consumerRow.depends_on_epics.length > 0
+  ) {
+    try {
+      const parsed = JSON.parse(consumerRow.depends_on_epics);
+      if (Array.isArray(parsed)) {
+        depTokens = parsed.filter((t): t is string => typeof t === "string");
+      }
+    } catch {
+      // malformed stored array → treat as empty, fall through.
+    }
+  }
+
+  // Full-recompute: wipe the consumer's existing edges, then insert
+  // fresh ones from `depTokens`. `INSERT OR IGNORE` collapses
+  // duplicate tokens onto a single edge row (the table's composite PK
+  // enforces it), without throwing.
+  db.run("DELETE FROM epic_dep_edges WHERE consumer_id = ?", [epicId]);
+  for (const tok of depTokens) {
+    db.run(
+      "INSERT OR IGNORE INTO epic_dep_edges (consumer_id, dep_token) VALUES (?, ?)",
+      [epicId, tok],
+    );
+  }
+
+  // Build the enriched array. Source order — see
+  // `preserveSourceOrder`'s docstring.
+  const consumerEpic = epicLiteToEpic(consumerRow);
+  // Make sure the consumer's own row is visible to the resolver — it
+  // may have been freshly INSERTed into `epics` this fold and the index
+  // was assembled BEFORE that INSERT landed on disk (we read the index
+  // mid-projectPlanRow, after the upstream INSERT but the caller assembles
+  // it before). Defense-in-depth: stamp the consumer back into the index
+  // so a self-referential dep resolves the same way it would on a re-fold.
+  if (!epicById.has(epicId)) {
+    epicById.set(epicId, consumerEpic);
+    if (consumerEpic.epic_number != null) {
+      const bucket = epicsByNumber.get(consumerEpic.epic_number);
+      if (bucket == null) {
+        epicsByNumber.set(consumerEpic.epic_number, [consumerEpic]);
+      } else {
+        bucket.push(consumerEpic);
+        bucket.sort((a, b) =>
+          a.epic_id < b.epic_id ? -1 : a.epic_id > b.epic_id ? 1 : 0,
+        );
+      }
+    }
+  }
+  const nowIso = eventTsToIso(ts);
+  const enriched: ResolvedEpicDep[] = depTokens.map((tok) =>
+    enrichEpicDep(tok, consumerEpic, epicById, epicsByNumber, nowIso),
+  );
+  preserveSourceOrder(enriched);
+
+  db.run(
+    "UPDATE epics SET resolved_epic_deps = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+    [JSON.stringify(enriched), eventId, ts, epicId],
+  );
+}
+
+/**
+ * Schema v34 (fn-637): the reverse fan-out. After upstream `epicId`'s
+ * row was written (EpicSnapshot) or deleted (EpicDeleted), find every
+ * downstream consumer whose `depends_on_epics` carries a token that
+ * could match this upstream and re-stamp their `resolved_epic_deps`.
+ *
+ * Runs INSIDE the open transaction opened by {@link applyEvent}; performs
+ * zero cursor work. Depth-1 only — the fan-out never recurses, even if
+ * a re-stamped consumer's projection changes downstream. The acyclic
+ * `depends_on_epics` invariant + depth-1 fan-out together bound the
+ * write fan-out per event to "the consumers of this one epic".
+ *
+ * **Matching tokens** (raw-token, NOT resolved-id). Looks up consumers
+ * via `dep_token IN (<full_id>, 'fn-' || <epic_number>)`. Both forms
+ * are considered: a consumer typed the full id `fn-100-foo` or the
+ * bare id `fn-100`. The bare-id branch catches ambiguity flips —
+ * before, `fn-100` resolved to nothing (no candidate); now, with a
+ * new `fn-100-bar` epic in play, it resolves to one (or two, which
+ * the resolver then re-disambiguates).
+ *
+ * **Skip the upstream itself.** A consumer that depends on itself (a
+ * pathological state) is filtered out via `consumer_id != ?`. Without
+ * this, the reverse pass would re-stamp the upstream's OWN
+ * `resolved_epic_deps` based on its post-write state — already done
+ * by the forward pass on this same fold. Avoiding the double-stamp
+ * keeps the fold-time write count tight.
+ *
+ * **Deterministic ORDER BY consumer_id ASC.** Re-fold determinism
+ * requires the per-consumer re-stamps to land in a stable order,
+ * since each re-stamp UPDATEs the consumer row and bumps its
+ * `last_event_id` / `updated_at`; SQLite's result order is otherwise
+ * implementation-defined.
+ *
+ * **`isDelete=true` branch** (EpicDeleted). Same query, same loop, same
+ * re-stamp. The upstream's row was already DELETEd by `retractPlanRow`,
+ * so when the resolver looks it up by full id it misses; bare-id lookups
+ * also miss because the deleted row has fallen out of `epicsByNumber`.
+ * Both flip the consumer's matching entry to `dangling`. The branch is
+ * unified with the snapshot path because the resolver consults the LIVE
+ * `epics` table via `buildEpicIndex` — once the upstream row is gone,
+ * the resolution outcome flips naturally.
+ *
+ * NEVER throws inside the open transaction.
+ */
+function syncEpicDepsReverse(
+  db: Database,
+  epicId: string,
+  epicNumber: number | null,
+  eventId: number,
+  ts: number,
+  epicById: Map<string, Epic>,
+  epicsByNumber: Map<number, Epic[]>,
+): void {
+  // Reverse adjacency lookup keyed off the raw token. Both the full id
+  // (`fn-100-foo`) and the bare id (`fn-100`) are considered — a
+  // consumer typed one or the other. Bare-id is materialized only when
+  // `epicNumber != null`; an epic with no `epic_number` (a transient
+  // shell, theoretically) projects no bare-id back-edge.
+  let consumerRows: { consumer_id: string }[];
+  if (epicNumber != null) {
+    consumerRows = db
+      .query(
+        `SELECT DISTINCT consumer_id
+           FROM epic_dep_edges
+          WHERE consumer_id != ?
+            AND dep_token IN (?, ?)
+          ORDER BY consumer_id ASC`,
+      )
+      .all(epicId, epicId, `fn-${epicNumber}`) as { consumer_id: string }[];
+  } else {
+    consumerRows = db
+      .query(
+        `SELECT DISTINCT consumer_id
+           FROM epic_dep_edges
+          WHERE consumer_id != ?
+            AND dep_token = ?
+          ORDER BY consumer_id ASC`,
+      )
+      .all(epicId, epicId) as { consumer_id: string }[];
+  }
+  if (consumerRows.length === 0) {
+    return;
+  }
+  const nowIso = eventTsToIso(ts);
+  for (const { consumer_id: consumerId } of consumerRows) {
+    const consumerRow = db
+      .query(
+        `SELECT epic_id, epic_number, project_dir, status, approval,
+                depends_on_epics
+           FROM epics
+          WHERE epic_id = ?`,
+      )
+      .get(consumerId) as
+      | (EpicLite & { depends_on_epics: string | null })
+      | null;
+    if (consumerRow == null) {
+      // Edges table out of sync with epics — defense-in-depth.
+      continue;
+    }
+    let depTokens: string[] = [];
+    if (
+      consumerRow.depends_on_epics != null &&
+      consumerRow.depends_on_epics.length > 0
+    ) {
+      try {
+        const parsed = JSON.parse(consumerRow.depends_on_epics);
+        if (Array.isArray(parsed)) {
+          depTokens = parsed.filter((t): t is string => typeof t === "string");
+        }
+      } catch {
+        // malformed stored array → treat as empty, fall through.
+      }
+    }
+    const consumerEpic = epicLiteToEpic(consumerRow);
+    const enriched: ResolvedEpicDep[] = depTokens.map((tok) =>
+      enrichEpicDep(tok, consumerEpic, epicById, epicsByNumber, nowIso),
+    );
+    preserveSourceOrder(enriched);
+    db.run(
+      "UPDATE epics SET resolved_epic_deps = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+      [JSON.stringify(enriched), eventId, ts, consumerId],
+    );
   }
 }
 

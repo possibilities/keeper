@@ -41,6 +41,7 @@ import {
   planVerbRefFromSpawnName,
   slashCommandFromPrompt,
 } from "./derivers";
+import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
 import {
   type ClassifierInvocation,
   computePlanWindows,
@@ -49,6 +50,8 @@ import {
   normalizePlanctlOp,
   type PlanWindow,
 } from "./plan-classifier";
+import type { ResolutionDiagnostic } from "./readiness-diagnostics";
+import type { Epic, ResolvedEpicDep } from "./types";
 
 /**
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
@@ -1017,11 +1020,310 @@ function renameColumnIfPresent(
 }
 
 /**
+ * Schema v34 (fn-637): chunked backfill for `resolved_epic_deps` +
+ * `epic_dep_edges` on existing `epics` rows. Runs OUTSIDE the main
+ * migrate transaction so the WAL writer lock is NOT held across the
+ * whole table scan — each chunk writes inside its own short BEGIN
+ * IMMEDIATE, releasing the lock between chunks so concurrent hook
+ * inserts (the keeper hook's per-event INSERT) are never starved.
+ *
+ * **Backfill semantics.** Re-derives `epic_dep_edges` + `resolved_epic_deps`
+ * for EVERY existing `epics` row. An epic with no `depends_on_epics`
+ * gets `resolved_epic_deps = '[]'` (computed, no deps) — distinct from
+ * NULL (not-yet-computed). An epic with deps gets the enriched array
+ * (resolver outcome per dep — `satisfied | blocked-incomplete |
+ * dangling`). Idempotent on re-run: a row whose backfill already
+ * landed re-derives to the same shape because the resolver is a pure
+ * function of the live `epics` table. The version guard means the
+ * post-migrate call only fires on the v33→v34 upgrade boot; a steady-
+ * state re-open of an already-migrated DB skips the work entirely.
+ *
+ * **Chunking.** Walks `epics` rows in slices of {@link BACKFILL_CHUNK_SIZE}
+ * via `ORDER BY epic_id LIMIT ? OFFSET ?`. Each chunk runs inside its
+ * own BEGIN IMMEDIATE so the writer lock is held for the duration of
+ * one chunk only (under a thousand epic rows fit in one chunk by
+ * design, so the lock window is sub-millisecond). The full-table scan
+ * is bounded by the row count of `epics` — small in the daemon's
+ * steady state (under 1k rows in practice).
+ *
+ * **Cost profile.** Per-row, the backfill assembles the all-epics
+ * index ONCE per chunk and reuses it across all rows in the chunk
+ * (the index is a pure function of the current `epics` table, which
+ * doesn't change inside this routine — chunked writes against
+ * different rows don't affect the resolution-relevant `(epic_id,
+ * epic_number, project_dir, status, approval)` columns). The per-chunk
+ * write cost is O(chunk_size * deps_per_row) ALTER INSERTs +
+ * O(chunk_size) UPDATE writes.
+ *
+ * **Determinism.** The backfill produces the SAME projection a from-
+ * scratch re-fold would produce. The resolver injects `now` from each
+ * epic's persisted `updated_at` (or `'1970-01-01T00:00:00.000Z'` when
+ * NULL/zero — a defensive fallback for the pre-event-stream slot;
+ * `enrichEpicDep` drops the diagnostic on the floor anyway, so the
+ * `now` value only matters to the diagnostic ts, which is not written
+ * to the projection at all). No `Date.now()`, no env reads.
+ */
+const BACKFILL_CHUNK_SIZE = 200;
+
+function backfillResolvedEpicDeps(db: Database): void {
+  // Step 1: enumerate the epics rows that need backfill. Read the row
+  // count once OUTSIDE the chunk loop — the loop's LIMIT/OFFSET pagination
+  // is stable because the backfill writes `resolved_epic_deps` (a column
+  // outside the ORDER BY) and does NOT delete/insert epics rows, so
+  // walking by `(ORDER BY epic_id ASC, LIMIT, OFFSET)` is reproducible.
+  const epicIdsRow = db
+    .prepare("SELECT epic_id FROM epics ORDER BY epic_id ASC")
+    .all() as { epic_id: string }[];
+  if (epicIdsRow.length === 0) {
+    return; // fresh DB; nothing to backfill.
+  }
+  const allEpicIds = epicIdsRow.map((r) => r.epic_id);
+
+  // Step 2: build the all-epics index ONCE for the full backfill pass.
+  // The resolver-relevant columns (`epic_id`, `epic_number`, `project_dir`,
+  // `status`, `approval`) are stable across the backfill: the chunked
+  // UPDATEs only touch `resolved_epic_deps` + `last_event_id` +
+  // `updated_at`, none of which the resolver reads. So a single index
+  // assembly suffices for the whole pass.
+  //
+  // Defensive shape: the same `EpicLite` / `epicLiteToEpic` helpers from
+  // the reducer module would be ideal here, but db.ts is the migrator
+  // and lives below reducer.ts in the import graph. We re-implement the
+  // narrow helper inline (15 LOC) so db.ts stays cycle-free, and the
+  // shape matches the reducer's `buildEpicIndex` field-for-field — a
+  // re-fold against the same `epics` rows produces the same enriched
+  // entries because both sides feed the resolver via the same `EpicLite`
+  // → `Epic` projection.
+  type BackfillEpicRow = {
+    epic_id: string;
+    epic_number: number | null;
+    project_dir: string | null;
+    status: string | null;
+    approval: "approved" | "rejected" | "pending";
+    depends_on_epics: string | null;
+    updated_at: number;
+  };
+  const indexRows = db
+    .prepare(
+      `SELECT epic_id, epic_number, project_dir, status, approval
+         FROM epics`,
+    )
+    .all() as Omit<BackfillEpicRow, "depends_on_epics" | "updated_at">[];
+  const epicById = new Map<string, Epic>();
+  const epicsByNumber = new Map<number, Epic[]>();
+  for (const row of indexRows) {
+    const epic: Epic = {
+      epic_id: row.epic_id,
+      epic_number: row.epic_number,
+      title: null,
+      project_dir: row.project_dir,
+      status: row.status,
+      approval: row.approval,
+      last_event_id: null,
+      updated_at: 0,
+      depends_on_epics: [],
+      tasks: [],
+      jobs: [],
+      job_links: [],
+      last_validated_at: null,
+      created_by_closer_of: null,
+      sort_path: "",
+      queue_jump: 0,
+      resolved_epic_deps: null,
+    };
+    epicById.set(row.epic_id, epic);
+    if (row.epic_number != null) {
+      const bucket = epicsByNumber.get(row.epic_number);
+      if (bucket == null) {
+        epicsByNumber.set(row.epic_number, [epic]);
+      } else {
+        bucket.push(epic);
+      }
+    }
+  }
+  for (const bucket of epicsByNumber.values()) {
+    bucket.sort((a, b) =>
+      a.epic_id < b.epic_id ? -1 : a.epic_id > b.epic_id ? 1 : 0,
+    );
+  }
+
+  // Step 3: chunked write loop. Each chunk: BEGIN IMMEDIATE → read
+  // chunk → for each row recompute the projection → UPDATE +
+  // edges-table writes → COMMIT. The chunk size bounds the writer-lock
+  // window so concurrent hook inserts get a fair shot between chunks.
+  let offset = 0;
+  while (offset < allEpicIds.length) {
+    const slice = allEpicIds.slice(offset, offset + BACKFILL_CHUNK_SIZE);
+    db.transaction(() => {
+      // Single SELECT per chunk over a stable id list (driven by the
+      // pre-enumerated `allEpicIds`). Avoids LIMIT/OFFSET reads that
+      // would re-scan the table on each chunk; the bound id list lets
+      // us bind parameters directly.
+      const placeholders = slice.map(() => "?").join(",");
+      const chunkRows = db
+        .prepare(
+          `SELECT epic_id, epic_number, project_dir, status, approval,
+                  depends_on_epics, updated_at
+             FROM epics
+            WHERE epic_id IN (${placeholders})`,
+        )
+        .all(...slice) as BackfillEpicRow[];
+      for (const row of chunkRows) {
+        const consumerEpic: Epic = {
+          epic_id: row.epic_id,
+          epic_number: row.epic_number,
+          title: null,
+          project_dir: row.project_dir,
+          status: row.status,
+          approval: row.approval,
+          last_event_id: null,
+          updated_at: 0,
+          depends_on_epics: [],
+          tasks: [],
+          jobs: [],
+          job_links: [],
+          last_validated_at: null,
+          created_by_closer_of: null,
+          sort_path: "",
+          queue_jump: 0,
+          resolved_epic_deps: null,
+        };
+        let depTokens: string[] = [];
+        if (row.depends_on_epics != null && row.depends_on_epics.length > 0) {
+          try {
+            const parsed = JSON.parse(row.depends_on_epics);
+            if (Array.isArray(parsed)) {
+              depTokens = parsed.filter(
+                (t): t is string => typeof t === "string",
+              );
+            }
+          } catch {
+            // malformed → empty deps; row gets `resolved_epic_deps = '[]'`.
+          }
+        }
+
+        // Wipe + insert this consumer's `epic_dep_edges` rows. Idempotent:
+        // a re-run reproduces the same shape because depTokens is a pure
+        // function of `depends_on_epics`. The DELETE on a never-seeded row
+        // matches zero rows and is a no-op.
+        db.prepare("DELETE FROM epic_dep_edges WHERE consumer_id = ?").run(
+          row.epic_id,
+        );
+        const insertEdge = db.prepare(
+          "INSERT OR IGNORE INTO epic_dep_edges (consumer_id, dep_token) VALUES (?, ?)",
+        );
+        for (const tok of depTokens) {
+          insertEdge.run(row.epic_id, tok);
+        }
+
+        // Compute the enriched array via the shared resolver. The
+        // `now` injection is the epic row's persisted `updated_at`
+        // converted to ISO-8601 (zero/null fallback to the unix
+        // epoch); the diagnostic path is dropped on the floor so the
+        // value only matters to the would-be `ResolutionDiagnostic` ts.
+        const nowIso =
+          row.updated_at > 0
+            ? new Date(row.updated_at * 1000).toISOString()
+            : new Date(0).toISOString();
+        const diagnosticsSink: ResolutionDiagnostic[] = [];
+        const enriched: ResolvedEpicDep[] = depTokens.map((tok) => {
+          const resolved = resolveEpicDep(
+            tok,
+            consumerEpic,
+            epicById,
+            epicsByNumber,
+            diagnosticsSink,
+            nowIso,
+          );
+          if (resolved.kind === "dangling") {
+            return {
+              dep_token: tok,
+              resolved_epic_id: null,
+              epic_number: null,
+              project_basename: null,
+              cross_project: false,
+              state: "dangling",
+            };
+          }
+          const upstream = resolved.epic;
+          return {
+            dep_token: tok,
+            resolved_epic_id: upstream.epic_id,
+            epic_number: upstream.epic_number,
+            project_basename: projectBasename(upstream.project_dir),
+            cross_project: resolved.cross_project !== null,
+            state: epicIsCompleted(upstream)
+              ? "satisfied"
+              : "blocked-incomplete",
+          };
+        });
+
+        // Bump `last_event_id` to the row's existing value (read off the
+        // current epics row); the backfill is NOT a fold and should not
+        // re-stamp the column with a fresh id. We re-stamp `updated_at`
+        // to the original row's `updated_at` for the same reason — the
+        // backfill is structurally invisible to the wire diff. SQLite
+        // can't read+write a row's old column value in one statement
+        // cheaply, so we pass the original row's `last_event_id` through
+        // a tiny SELECT inside the same chunk transaction.
+        const cur = db
+          .prepare("SELECT last_event_id FROM epics WHERE epic_id = ?")
+          .get(row.epic_id) as { last_event_id: number | null } | null;
+        db.prepare(
+          "UPDATE epics SET resolved_epic_deps = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+        ).run(
+          JSON.stringify(enriched),
+          cur?.last_event_id ?? null,
+          row.updated_at,
+          row.epic_id,
+        );
+      }
+    }).immediate();
+    offset += BACKFILL_CHUNK_SIZE;
+  }
+}
+
+/**
  * Run schema bootstrap + forward-only ALTER block. Writer-only. Wrapped in a
  * single transaction so a half-applied schema can never persist across a
  * crashed boot.
+ *
+ * Schema v34 (fn-637): after the main migrate transaction commits, run the
+ * chunked backfill for `resolved_epic_deps` + `epic_dep_edges` on existing
+ * `epics` rows. The backfill is OUTSIDE the main transaction to avoid a
+ * mega-transaction WAL lock — see {@link backfillResolvedEpicDeps} for the
+ * chunking + version-guard contract. Reading `storedVersion` from
+ * `meta` BEFORE entering the transaction lets us detect the v33→v34
+ * upgrade reliably (the version stamp inside the transaction is what we
+ * see if we read after migrate commits, but we want the PRE-migrate value).
  */
 function migrate(db: Database): void {
+  // Pre-read storedVersion BEFORE entering the migrate transaction so the
+  // post-commit backfill (`resolved_epic_deps`) can branch on whether this
+  // boot is the v33→v34 upgrade or a steady-state re-open of an already-
+  // migrated v34+ DB. A bare read against `meta` doesn't write, so it
+  // never contends with the upcoming BEGIN IMMEDIATE.
+  //
+  // Fresh DB carve-out: a never-bootstrapped DB has no `meta` table, so
+  // the SELECT would throw. Check existence first via `sqlite_master`; a
+  // missing table reads as the zero version (which, for a fresh DB, is
+  // correct — no backfill needed because the migrate transaction will
+  // CREATE TABLE every projection empty).
+  const metaTableExists =
+    db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
+      )
+      .get() != null;
+  const preMigrateStoredVersion = metaTableExists
+    ? Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      )
+    : 0;
   db.transaction(() => {
     db.run(CREATE_EVENTS);
     for (const sql of CREATE_EVENTS_INDEXES) {
@@ -3103,6 +3405,19 @@ function migrate(db: Database): void {
     // Failure (lock unavailable past `busy_timeout`) is now clean and total at
     // BEGIN, never half-applied. Pairs with the same fix in `applyEvent`.
   }).immediate();
+
+  // Schema v34 (fn-637): chunked backfill for `resolved_epic_deps` +
+  // `epic_dep_edges`. Runs OUTSIDE the main migrate transaction so the
+  // WAL writer lock is NOT held across the whole table scan — instead,
+  // the backfill writes one short BEGIN IMMEDIATE per chunk, releasing
+  // the lock between chunks so concurrent hook inserts are never
+  // starved. Version-guarded on the pre-migrate stored version (read
+  // BEFORE the transaction stamped v34) so the work runs exactly once
+  // per upgrade; a fresh v34 DB and a steady-state re-open both skip it
+  // by construction.
+  if (preMigrateStoredVersion < 34) {
+    backfillResolvedEpicDeps(db);
+  }
 }
 
 /**
