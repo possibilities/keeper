@@ -35,9 +35,11 @@ import {
   buildClaudeDispatchCommand,
   detectJobTransitions,
   hydrateDispatchLog,
+  isLiveSessionInRoot,
   predictNextDispatches,
   renderEpicCommands,
   renderEpicCommandsFiltered,
+  shouldSuppressDispatch,
 } from "../scripts/autopilot";
 import { computeReadiness } from "../src/readiness";
 import type { EmbeddedJob, Epic, Job, Task } from "../src/types";
@@ -1118,4 +1120,404 @@ test("hydrateDispatchLog — missing file → empty restoredEntries (no throw)",
   expect(result.dispatchedKeys.size).toBe(0);
   expect(result.fulfilledKeys.size).toBe(0);
   expect(result.completedKeys.size).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// fn-638.3: shouldSuppressDispatch + isLiveSessionInRoot
+//
+// The two pure helpers behind `launchInGhostty`'s pre-spawn gate.
+//
+// shouldSuppressDispatch reconciles three suppression mechanisms:
+//   (1) `work`/`close` once-for-life launch suppression via
+//       `dispatchedKeys` — double-spawning a worker risks git corruption.
+//   (2) `approve` fulfillment suppression via `fulfilledKeys` — a
+//       dismissed approve window must re-dispatch on the next
+//       `job-pending` edge to self-heal.
+//   (3) Pre-spawn live-session-in-root gate — refuse a second dispatch
+//       to a root that already hosts a live session (running-tag verdict
+//       OR launched-but-unfulfilled dispatch), self excluded, fail-closed
+//       on a partial snapshot.
+//
+// The test matrix below pins every load-bearing edge the spec calls out:
+//   (a) dismissed approve (launch, no fulfilled) → re-dispatch ALLOWED
+//   (b) fulfilled approve → re-dispatch SUPPRESSED via fulfilled
+//   (c) work / close → re-dispatch SUPPRESSED via dispatchedKeys for life
+//   (d) live `running`-tag sibling in root → SUPPRESSED via live-in-root
+//   (e) launched-but-unfulfilled dispatch in same root → SUPPRESSED
+//   (f) self is excluded (a row never blocks its own dispatch)
+//   (g) empty/null snapshot → fail-closed (SUPPRESSED via live-in-root)
+//   (h) different root → not suppressed
+// ---------------------------------------------------------------------------
+
+test("shouldSuppressDispatch — dismissed approve re-dispatches on next job-pending edge", () => {
+  // Approve was launched once (dispatchedKeys has the key, dispatch
+  // log carries the launch row) but never fulfilled (no embedded job
+  // ever appeared — the human dismissed the window). The next
+  // `job-pending` edge MUST be allowed through; otherwise everything
+  // queued behind this approve deadlocks for life.
+  const dispatchedKeys = new Set<string>(["approve::fn-1-foo.1"]);
+  const fulfilledKeys = new Set<string>();
+  const launchEntry = makeDispatchEntry({
+    verb: "approve",
+    id: "fn-1-foo.1",
+    dir: "repo",
+    dirFull: "/repo",
+  });
+  const dispatchLog: DispatchEntry[] = [launchEntry];
+  // Snap carries the task at blocked:job-pending (any non-empty snap
+  // where the row has no live sibling will do — the
+  // `isLiveSessionInRoot` branch must NOT fire for self).
+  const epic = makeEpic({
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "done",
+        approval: "pending",
+      }),
+    ],
+  });
+  const snap = buildSnap([epic]);
+  const reason = shouldSuppressDispatch(
+    "approve",
+    "fn-1-foo.1",
+    "/repo",
+    snap,
+    dispatchedKeys,
+    fulfilledKeys,
+    dispatchLog,
+  );
+  expect(reason).toBeNull();
+});
+
+test("shouldSuppressDispatch — fulfilled approve is suppressed for life", () => {
+  // Approve was launched AND fulfilled (an embedded job appeared,
+  // marking the key in fulfilledKeys). A re-edge MUST be suppressed —
+  // a second window for an already-running approve is the original
+  // double-fire bug the durable guard prevents.
+  const dispatchedKeys = new Set<string>(["approve::fn-1-foo.1"]);
+  const fulfilledKeys = new Set<string>(["approve::fn-1-foo.1"]);
+  const epic = makeEpic({ project_dir: "/repo" });
+  const snap = buildSnap([epic]);
+  const reason = shouldSuppressDispatch(
+    "approve",
+    "fn-1-foo.1",
+    "/repo",
+    snap,
+    dispatchedKeys,
+    fulfilledKeys,
+    [],
+  );
+  expect(reason).toBe("fulfilled-suppressed");
+});
+
+test("shouldSuppressDispatch — work is launch-suppressed for life (NOT fulfillment-keyed)", () => {
+  // Work has been launched (dispatchedKeys carries the key) but never
+  // fulfilled — e.g. the agent crashed before SessionStart. This MUST
+  // stay suppressed; re-dispatching a worker risks two live workers
+  // on the same task and git corruption. The fulfillment-keying carve-
+  // out is approve-only.
+  const dispatchedKeys = new Set<string>(["work::fn-1-foo.1"]);
+  const fulfilledKeys = new Set<string>();
+  const epic = makeEpic({ project_dir: "/repo" });
+  const snap = buildSnap([epic]);
+  const reason = shouldSuppressDispatch(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    snap,
+    dispatchedKeys,
+    fulfilledKeys,
+    [],
+  );
+  expect(reason).toBe("launch-suppressed");
+});
+
+test("shouldSuppressDispatch — close is launch-suppressed for life (NOT fulfillment-keyed)", () => {
+  // Symmetric to work: close keeps once-for-life launch suppression.
+  const dispatchedKeys = new Set<string>(["close::fn-1-foo"]);
+  const fulfilledKeys = new Set<string>();
+  const epic = makeEpic({ project_dir: "/repo" });
+  const snap = buildSnap([epic]);
+  const reason = shouldSuppressDispatch(
+    "close",
+    "fn-1-foo",
+    "/repo",
+    snap,
+    dispatchedKeys,
+    fulfilledKeys,
+    [],
+  );
+  expect(reason).toBe("launch-suppressed");
+});
+
+test("shouldSuppressDispatch — live running sibling in same root suppresses second dispatch", () => {
+  // Two tasks share the same effective root (epic.project_dir).
+  // task .1 has a working embedded job → running-tag verdict. A
+  // dispatch for task .2 in the same root MUST be suppressed — two
+  // live workers in one repo is the git-corruption scenario the gate
+  // exists to prevent.
+  const epic = makeEpic({
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "approved",
+        jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        worker_phase: "open",
+        approval: "approved",
+        depends_on: [],
+      }),
+    ],
+  });
+  const snap = buildSnap([epic]);
+  // Sanity: .1 must be at a running-tag verdict for this test to
+  // exercise the live-in-root branch (vs. a dispatch-log gap).
+  expect(snap.readiness.perTask.get("fn-1-foo.1")?.tag).toBe("running");
+  const reason = shouldSuppressDispatch(
+    "work",
+    "fn-1-foo.2",
+    "/repo",
+    snap,
+    new Set(),
+    new Set(),
+    [],
+  );
+  expect(reason).toBe("live-in-root");
+});
+
+test("shouldSuppressDispatch — launched-but-unfulfilled dispatch in same root suppresses second dispatch", () => {
+  // Pure dispatch-log branch: no snapshot signal yet, but a sibling
+  // dispatch fired moments ago and the SessionStart fold has not
+  // round-tripped. The propagation gap is closed by `dispatchLog` +
+  // `!fulfilledKeys` for the OTHER key in the same root.
+  const dispatchLog: DispatchEntry[] = [
+    makeDispatchEntry({
+      verb: "work",
+      id: "fn-1-foo.1",
+      dir: "repo",
+      dirFull: "/repo",
+    }),
+  ];
+  // Snap carries the epic so we pass the fail-closed gate, but no
+  // running-tag verdict yet (the freshly-launched session is still in
+  // the propagation gap before SessionStart folds).
+  const epic = makeEpic({
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+      }),
+    ],
+  });
+  const snap = buildSnap([epic]);
+  const reason = shouldSuppressDispatch(
+    "work",
+    "fn-1-foo.2",
+    "/repo",
+    snap,
+    new Set(),
+    new Set(),
+    dispatchLog,
+  );
+  expect(reason).toBe("live-in-root");
+});
+
+test("shouldSuppressDispatch — self is excluded from live-in-root gate (does not block own dispatch)", () => {
+  // The row being dispatched has a launch log line (just fired) but
+  // is the row we're checking. Self-exclusion via `(verb, id)` is
+  // load-bearing: without it the gate would refuse every re-dispatch
+  // edge after a launch line lands. The previous test already proved
+  // the gate fires for OTHER rows in the same root.
+  const dispatchLog: DispatchEntry[] = [
+    makeDispatchEntry({
+      verb: "approve",
+      id: "fn-1-foo.1",
+      dir: "repo",
+      dirFull: "/repo",
+    }),
+  ];
+  const epic = makeEpic({
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "done",
+        approval: "pending",
+      }),
+    ],
+  });
+  const snap = buildSnap([epic]);
+  // Same `(verb, id)` as the dispatch log entry → must be excluded
+  // from BOTH branches of the gate.
+  const reason = shouldSuppressDispatch(
+    "approve",
+    "fn-1-foo.1",
+    "/repo",
+    snap,
+    new Set(),
+    new Set(),
+    dispatchLog,
+  );
+  expect(reason).toBeNull();
+});
+
+test("isLiveSessionInRoot — null snapshot fails closed (suppresses)", () => {
+  // The "snapshot staleness post-reconnect" risk: bias false-negative-
+  // safe (suppress) when we cannot verify.
+  const result = isLiveSessionInRoot(
+    null,
+    "/repo",
+    "work",
+    "fn-1-foo.1",
+    [],
+    new Set(),
+  );
+  expect(result).toBe(true);
+});
+
+test("isLiveSessionInRoot — empty-epics snapshot fails closed (suppresses)", () => {
+  // A snapshot with zero epics is indistinguishable from "haven't
+  // synced yet" — suppress. Same fail-closed bias as null.
+  const snap = buildSnap([]);
+  const result = isLiveSessionInRoot(
+    snap,
+    "/repo",
+    "work",
+    "fn-1-foo.1",
+    [],
+    new Set(),
+  );
+  expect(result).toBe(true);
+});
+
+test("isLiveSessionInRoot — live session in DIFFERENT root does not suppress", () => {
+  // Two epics in different repos. A running-tag verdict in /other-repo
+  // must NOT block a dispatch into /repo — the gate is per-root, not
+  // global. This is the multi-project-concurrency baseline.
+  const liveEpic = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/other-repo",
+    sort_path: "000002",
+    tasks: [
+      makeTask({
+        epic_id: "fn-2-bar",
+        task_id: "fn-2-bar.1",
+        task_number: 1,
+        jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
+      }),
+    ],
+  });
+  const targetEpic = makeEpic({
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", task_number: 1 })],
+  });
+  const snap = buildSnap([liveEpic, targetEpic]);
+  const result = isLiveSessionInRoot(
+    snap,
+    "/repo",
+    "work",
+    "fn-1-foo.1",
+    [],
+    new Set(),
+  );
+  expect(result).toBe(false);
+});
+
+test("isLiveSessionInRoot — task.target_repo overrides epic.project_dir for effective root", () => {
+  // A task with `target_repo: "/other-repo"` lives in /other-repo, NOT
+  // the epic's /repo. A live session on that task must block dispatches
+  // into /other-repo (not /repo). Mirrors the `taskCdDir` derivation
+  // the dispatch sites use to compute `dirFull`.
+  const epic = makeEpic({
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/other-repo",
+        jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/other-repo",
+      }),
+    ],
+  });
+  const snap = buildSnap([epic]);
+  // .2 dispatching into /other-repo MUST be blocked by .1's live job.
+  expect(
+    isLiveSessionInRoot(
+      snap,
+      "/other-repo",
+      "work",
+      "fn-1-foo.2",
+      [],
+      new Set(),
+    ),
+  ).toBe(true);
+  // .2 dispatching into /repo (the epic's project_dir) would be a
+  // mis-derived caller; the gate should NOT fire because no row's
+  // effective root === /repo (.1 lives in /other-repo by target_repo).
+  // This pins the "effective root" semantics — gate is not global.
+  expect(
+    isLiveSessionInRoot(snap, "/repo", "work", "fn-1-foo.2", [], new Set()),
+  ).toBe(false);
+});
+
+test("isLiveSessionInRoot — fulfilled launch log entry does NOT count as live", () => {
+  // A launch line whose key IS in `fulfilledKeys` is no longer "in
+  // the propagation gap" — the embedded job has landed, so the
+  // snapshot-driven branch is the source of truth. If the matching
+  // row has since transitioned out of running (e.g. completed,
+  // killed, idle) the row should not be blocked anymore. Without
+  // this filter, every prior-run launch in `dispatch.log` would
+  // pin its root forever.
+  const dispatchLog: DispatchEntry[] = [
+    makeDispatchEntry({
+      verb: "work",
+      id: "fn-1-foo.1",
+      dir: "repo",
+      dirFull: "/repo",
+    }),
+  ];
+  const fulfilledKeys = new Set<string>(["work::fn-1-foo.1"]);
+  const epic = makeEpic({
+    project_dir: "/repo",
+    tasks: [
+      // .1's worker has finished (worker_phase=done, no live job).
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "done",
+      }),
+      makeTask({ task_id: "fn-1-foo.2", task_number: 2 }),
+    ],
+  });
+  const snap = buildSnap([epic]);
+  // .2 dispatching into /repo should NOT be blocked.
+  const result = isLiveSessionInRoot(
+    snap,
+    "/repo",
+    "work",
+    "fn-1-foo.2",
+    dispatchLog,
+    fulfilledKeys,
+  );
+  expect(result).toBe(false);
 });

@@ -510,6 +510,204 @@ function taskCdDir(task: Task, projectDir: string): string {
   return projectDir;
 }
 
+/**
+ * Suppression-reason union for `shouldSuppressDispatch` (fn-638.3). A
+ * `null` return means "fire the dispatch"; any other value names the
+ * specific suppression rule that fired. Exported so tests can pin the
+ * exact reason per case.
+ */
+export type SuppressionReason =
+  // Once-for-life launch suppression on `work`/`close`. Set on every
+  // launch and persists across restarts via `dispatch.log` →
+  // `hydrateDispatchLog`. Double-spawning a worker/closer risks git
+  // corruption, so this is intentionally irreversible.
+  | "launch-suppressed"
+  // Approve-only fulfillment suppression. An approve verb's only side
+  // effect happens when the human runs `/plan:approve` (the resulting
+  // SessionStart fold lands an embedded job for the row and fulfills
+  // the key). A dismissed approve window (launched, never fulfilled)
+  // must re-dispatch on the next `job-pending` edge to self-heal.
+  | "fulfilled-suppressed"
+  // Pre-spawn live-session-in-root gate. Suppress when a sibling row in
+  // the same effective root already has a `running`-tag verdict OR
+  // when a launched-but-unfulfilled dispatch on the same root is still
+  // in the propagation gap. Fail-closed on a partial snapshot.
+  | "live-in-root";
+
+/**
+ * Decide whether `launchInGhostty` must suppress this dispatch and, if
+ * so, name the rule that fired. Pure function over the four pieces of
+ * state the call site holds — exported so the test suite can drive it
+ * with hand-rolled snapshots and dispatch logs.
+ *
+ * Three suppression rules, in priority order (matching the `launchInGhostty`
+ * branching):
+ *
+ *   1. `verb === "approve"` AND `fulfilledKeys.has(key)` →
+ *      `"fulfilled-suppressed"`. Approve is fulfillment-keyed (not
+ *      launch-keyed) so a dismissed approve window re-dispatches on
+ *      the next `job-pending` edge.
+ *   2. `verb in ("work","close")` AND `dispatchedKeys.has(key)` →
+ *      `"launch-suppressed"`. Once-for-life launch suppression.
+ *   3. `isLiveSessionInRoot(...)` → `"live-in-root"`. The target root
+ *      already has a live session (running-tag verdict OR
+ *      launched-but-unfulfilled dispatch); self is excluded.
+ *
+ * Returns `null` to fire the dispatch.
+ */
+export function shouldSuppressDispatch(
+  verb: "work" | "close" | "approve",
+  id: string,
+  dir: string,
+  snap: ReadinessClientSnapshot | null,
+  dispatchedKeys: Set<string>,
+  fulfilledKeys: Set<string>,
+  dispatchLog: DispatchEntry[],
+): SuppressionReason | null {
+  const key = `${verb}::${id}`;
+  if (verb === "approve") {
+    if (fulfilledKeys.has(key)) {
+      return "fulfilled-suppressed";
+    }
+  } else if (dispatchedKeys.has(key)) {
+    return "launch-suppressed";
+  }
+  if (isLiveSessionInRoot(snap, dir, verb, id, dispatchLog, fulfilledKeys)) {
+    return "live-in-root";
+  }
+  return null;
+}
+
+/**
+ * Pre-spawn live-session-in-root gate (fn-638.3).
+ *
+ * Returns `true` when the target `dir` already hosts a live session that
+ * autopilot is NOT about to dispatch itself, so the caller must suppress.
+ * "Live" means EITHER:
+ *
+ *   - the snapshot carries a `running`-tag verdict on a row whose effective
+ *     root (task `target_repo` || epic `project_dir`) equals `dir`. The
+ *     `running` tag (`{job-running, sub-agent-running, planner-running}`)
+ *     is the readiness signal for "a real worker is in motion on this
+ *     row"; a second dispatch to the same root would land two live
+ *     workers on one target and risk git corruption — the
+ *     false-negative-safe failure mode the epic's "best practices"
+ *     section calls out.
+ *   - the in-memory `dispatchLog` carries a launch line for the same root
+ *     whose key is NOT yet in `fulfilledKeys` (autopilot fired the
+ *     window but the SessionStart fold has not yet round-tripped into
+ *     an embedded job). Skipping this branch would let a second dispatch
+ *     race the first inside the dispatch→projection propagation gap.
+ *
+ * Self is excluded by `(excludeVerb, excludeId)` so a row never blocks
+ * its own dispatch. A row that disappeared from the snapshot post-
+ * fulfillment (terminal job, epic-delete) does NOT contribute — only
+ * `running`-tag verdicts on rows still on the page count.
+ *
+ * Fail-closed on a partial/empty snapshot: when `snap === null` OR
+ * `snap.epics.length === 0`, return `true` (suppress) — duplicate
+ * workers on one task corrupt git history; suppressing a dispatch is
+ * recoverable on the next snapshot edge.
+ *
+ * Exported separately so the test suite can drive it with hand-rolled
+ * snapshots and dispatch logs.
+ */
+export function isLiveSessionInRoot(
+  snap: ReadinessClientSnapshot | null,
+  dir: string,
+  excludeVerb: "work" | "close" | "approve",
+  excludeId: string,
+  dispatchLog: DispatchEntry[],
+  fulfilledKeys: Set<string>,
+): boolean {
+  // Fail-closed on a partial/empty snapshot — see jsdoc above.
+  if (snap === null || snap.epics.length === 0) {
+    return true;
+  }
+  // `dir === ""` is the no-cd case; a target with no root cannot collide
+  // with another root, but we still scan the dispatch log + snapshot so
+  // the helper is symmetric. An empty-root collision is degenerate (only
+  // happens if the caller passes through an empty `project_dir`); treat
+  // it as "no collision possible" by short-circuiting empty `dir`.
+  if (dir === "") {
+    return false;
+  }
+  const excludeKey = `${excludeVerb}::${excludeId}`;
+  // Branch 1: snapshot-driven check. Walk every epic + task in the
+  // snapshot. For each row whose effective root === `dir`, look up its
+  // verdict; a `running` tag means live work. Self is excluded by id.
+  //
+  // The close-row verdict deliberately is NOT consulted here: the close
+  // row's `running` tag fans up from a task worker's verdict via
+  // predicate 5 in `evaluateCloseRow`, so a close row at
+  // `epic.project_dir` will report `running` even when the actual worker
+  // is editing a task's `target_repo` (a different root entirely). To
+  // detect "a real session is about to write to `dir`", check ONLY
+  // task-level verdicts whose effective root === `dir`, plus the epic's
+  // OWN embedded jobs (close-verb / plan-verb) when
+  // `epic.project_dir === dir`. That keeps the gate scoped to "actual
+  // worker overlap in this root" instead of being tripped by sibling-
+  // root activity that rolls up.
+  for (const epic of snap.epics) {
+    const projectDir = seg(epic.project_dir);
+    const epicId = seg(epic.epic_id);
+    const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
+    for (const task of tasks) {
+      const taskId = seg(task.task_id);
+      if (taskId === "") {
+        continue;
+      }
+      const taskRoot = taskCdDir(task as Task, projectDir);
+      if (taskRoot !== dir) {
+        continue;
+      }
+      // Skip self. A task-scope row dispatches as
+      // `(work|approve, task_id)`; the close-row dispatches as
+      // `(close|approve, epic_id)`. Either id form may be the self
+      // exclusion.
+      if (taskId === excludeId) {
+        continue;
+      }
+      const verdict = snap.readiness.perTask.get(taskId);
+      if (verdict !== undefined && verdict.tag === "running") {
+        return true;
+      }
+    }
+    // Epic-level: check the epic's OWN jobs (close-verb / plan-verb /
+    // approve-close) when `epic.project_dir === dir`. The epic's close-
+    // row verdict is intentionally NOT consulted (it fans up from task
+    // workers — see the block-doc above). A close-verb or plan-verb job
+    // in `state === "working"` IS a session about to write to
+    // `epic.project_dir`, so it counts.
+    if (projectDir === dir && epicId !== "" && epicId !== excludeId) {
+      const epicJobs = Array.isArray(epic.jobs) ? epic.jobs : [];
+      for (const job of epicJobs) {
+        if (job.state === "working") {
+          return true;
+        }
+      }
+    }
+  }
+  // Branch 2: launched-but-unfulfilled check. A dispatch that has fired
+  // (a `kind:"launch"` line in `dispatchLog`) but whose matching
+  // embedded job has not yet appeared in the snapshot (the key is NOT
+  // in `fulfilledKeys`) is a live session in the propagation gap.
+  // Self is excluded by `(verb, id)`.
+  for (const entry of dispatchLog) {
+    if (entry.dirFull !== dir) {
+      continue;
+    }
+    const key = `${entry.verb}::${entry.id}`;
+    if (key === excludeKey) {
+      continue;
+    }
+    if (!fulfilledKeys.has(key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function previewRowFromTask(
   task: Task,
   projectDir: string,
@@ -1509,19 +1707,43 @@ async function main(): Promise<void> {
     dirFull: string,
     verb: "work" | "close" | "approve",
     id: string,
+    snap: ReadinessClientSnapshot | null,
   ): void {
-    // Durable re-dispatch guard. `dispatchedKeys` is seeded from
-    // `dispatch.log` on startup and grows on every `logDispatch` call,
-    // so a verdict cycle (e.g. ready → job-running → session killed →
-    // ready) cannot open a second Ghostty window for the same row in
-    // this run OR across a restart. The `lastVerdictSig` map handles
-    // same-signature edges in-memory; this set is the persistent
-    // backstop. Once-dispatched is once-dispatched for life — if a
-    // re-dispatch is genuinely wanted the human edits `dispatch.log`.
+    // Re-dispatch guard (fn-638.3). Three suppression rules, evaluated
+    // in `shouldSuppressDispatch` (pure, exported for testing):
+    //
+    //   - `launch-suppressed`: once-for-life launch guard for `work` /
+    //     `close`. Double-spawning a worker or closer can corrupt git
+    //     history, so once-dispatched stays once-dispatched across
+    //     this run AND across restarts (seeded from `dispatch.log` on
+    //     startup via `hydrateDispatchLog`).
+    //   - `fulfilled-suppressed`: approve-only fulfillment guard. An
+    //     approve verb has no side effect until the human runs
+    //     `/plan:approve` — so a dismissed approve window (launch line
+    //     written, never fulfilled) must re-dispatch on the next
+    //     `job-pending` edge to self-heal. Keying on launch would
+    //     deadlock everything queued behind the dismissed approve.
+    //   - `live-in-root`: pre-spawn live-session-in-root gate. Refuse
+    //     when a sibling row in the same effective root already has a
+    //     `running`-tag verdict OR a launched-but-unfulfilled dispatch
+    //     on the same root. Self is excluded. Fail-closed on a
+    //     partial/empty snapshot.
+    //
+    // `lastVerdictSig` still handles same-signature edges in-memory at
+    // the call site; these guards are the persistent backstop.
     const key = `${verb}::${id}`;
-    if (dispatchedKeys.has(key)) {
+    const suppression = shouldSuppressDispatch(
+      verb,
+      id,
+      dirFull,
+      snap,
+      dispatchedKeys,
+      fulfilledKeys,
+      dispatchLog,
+    );
+    if (suppression !== null) {
       noteLine(
-        `${new Date().toISOString()} re-dispatch suppressed pid=${process.pid} ${key} (rowId=${rowId})`,
+        `${new Date().toISOString()} re-dispatch suppressed (${suppression}) pid=${process.pid} ${key} dir=${dirFull} (rowId=${rowId})`,
       );
       return;
     }
@@ -1703,6 +1925,7 @@ async function main(): Promise<void> {
               dir,
               "work",
               taskId,
+              snap,
             ),
           );
         } else if (cur === "blocked:job-pending") {
@@ -1714,6 +1937,7 @@ async function main(): Promise<void> {
               dir,
               "approve",
               taskId,
+              snap,
             ),
           );
         }
@@ -1739,6 +1963,7 @@ async function main(): Promise<void> {
                 projectDir,
                 "close",
                 epicId,
+                snap,
               ),
             );
           } else if (closeCur === "blocked:job-pending") {
@@ -1750,6 +1975,7 @@ async function main(): Promise<void> {
                 projectDir,
                 "approve",
                 epicId,
+                snap,
               ),
             );
           }
