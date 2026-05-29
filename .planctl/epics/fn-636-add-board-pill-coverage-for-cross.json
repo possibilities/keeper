@@ -1,0 +1,21 @@
+{
+  "branch_name": "fn-636-add-board-pill-coverage-for-cross",
+  "bundles": [],
+  "created_at": "2026-05-29T00:08:10.337392Z",
+  "depends_on_epics": [
+    "fn-635-cross-project-epic-deps-in-readiness"
+  ],
+  "id": "fn-636-add-board-pill-coverage-for-cross",
+  "last_validated_at": "2026-05-29T00:08:10.487601Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "add board pill coverage for cross-project dep shapes",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-29T00:08:10.337392Z"
+}
