@@ -82,5 +82,5 @@ deterministic.
 - [ ] Rebased onto fn-637 (post-stopgap `computeReadiness` signature, projection-backed predicate 9 + board summary pill); landed after fn-636 and fn-637.4 (no render-block collision)
 
 ## Done summary
-
+Added sub-agent-stale RunningReason variant (predicate 6, both task and close-row paths) firing when every surviving running sub-agent is past SUBAGENT_STALENESS_SEC (120s, mirroring the reducer's bounded Stop window). computeReadiness gained an injected  parameter following fn-637.1's pattern; pure pass never reads Date.now(). board.ts colorizes the new pill as warn (yellow) distinct from cyan running:*.
 ## Evidence
