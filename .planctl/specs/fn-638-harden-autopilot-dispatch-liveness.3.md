@@ -69,5 +69,5 @@ fail-closed on a partial snapshot.
 - [ ] No re-dispatch storm and no deadlock across the three suppression mechanisms
 
 ## Done summary
-
+Approve dispatches now suppress on fulfillment (not launch) so a dismissed approve re-dispatches on the next job-pending edge; work/close keep once-for-life launch suppression. Added pre-spawn live-session-in-root gate (running-tag sibling OR launched-but-unfulfilled in same root, self excluded, fail-closed on null/empty snapshot). Reconciled in pure shouldSuppressDispatch helper with 12 new tests.
 ## Evidence
