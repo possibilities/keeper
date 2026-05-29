@@ -21,6 +21,7 @@ import {
   GIT_DESCRIPTOR,
   getCollection,
   JOBS_DESCRIPTOR,
+  PROFILES_DESCRIPTOR,
   selectVersionsByIds,
   USAGE_DESCRIPTOR,
 } from "../src/collections";
@@ -182,6 +183,42 @@ test("getCollection resolves the usage collection (fn-615)", () => {
   // No defaultFilter / defaultClause — every row is interesting by default.
   expect(USAGE_DESCRIPTOR.defaultFilter).toBeUndefined();
   expect(USAGE_DESCRIPTOR.defaultClause).toBeUndefined();
+});
+
+test("getCollection resolves the profiles collection (fn-639)", () => {
+  expect(getCollection("profiles")).toBe(PROFILES_DESCRIPTOR);
+  expect(PROFILES_DESCRIPTOR.table).toBe("profiles");
+  expect(PROFILES_DESCRIPTOR.pk).toBe("config_dir");
+  expect(PROFILES_DESCRIPTOR.version).toBe("last_event_id");
+  // Filter: pk only — the per-profile read narrows on the profile dir.
+  expect(PROFILES_DESCRIPTOR.filters.config_dir).toBe("config_dir");
+  // Default sort is stable by pk.
+  expect(PROFILES_DESCRIPTOR.defaultSort).toEqual({
+    column: "config_dir",
+    dir: "asc",
+  });
+  // No JSON-decoded columns — every persisted field is a scalar.
+  expect(PROFILES_DESCRIPTOR.jsonColumns.size).toBe(0);
+  // Columns include every persisted field.
+  for (const col of [
+    "config_dir",
+    "last_rate_limit_at",
+    "last_rate_limit_session_id",
+    "last_event_id",
+    "updated_at",
+  ]) {
+    expect(PROFILES_DESCRIPTOR.columns).toContain(col);
+  }
+  // Sortable allowlist covers config_dir, last_rate_limit_at (time-ordered
+  // browse for "most-recently-rate-limited first"), last_event_id, updated_at.
+  expect(PROFILES_DESCRIPTOR.sortable.has("config_dir")).toBe(true);
+  expect(PROFILES_DESCRIPTOR.sortable.has("last_rate_limit_at")).toBe(true);
+  expect(PROFILES_DESCRIPTOR.sortable.has("last_event_id")).toBe(true);
+  expect(PROFILES_DESCRIPTOR.sortable.has("updated_at")).toBe(true);
+  // No defaultFilter / defaultClause — every row is interesting by default
+  // (a quiet seed-only profile is still surface-worthy).
+  expect(PROFILES_DESCRIPTOR.defaultFilter).toBeUndefined();
+  expect(PROFILES_DESCRIPTOR.defaultClause).toBeUndefined();
 });
 
 test("epics descriptor: version is last_event_id; filters include pk + status; tasks is a jsonColumn out of sort/filter", () => {

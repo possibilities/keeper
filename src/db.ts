@@ -54,7 +54,7 @@ import {
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 32;
+export const SCHEMA_VERSION = 33;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -592,6 +592,67 @@ CREATE TABLE IF NOT EXISTS usage (
 `;
 
 /**
+ * Schema-v33 `profiles` projection table (fn-639) — one row per Claude profile
+ * directory, keyed by `config_dir` (the `CLAUDE_CONFIG_DIR` env value the hook
+ * captures on `SessionStart`, normalized at the hook boundary; the empty-string
+ * sentinel `''` collapses NULL → default `~/.claude`). Correlates the last
+ * `rate_limit` ApiError with each profile so renderers (`scripts/usage.ts`'s
+ * "Rate limits by profile" block) can surface profile-level reset state below
+ * the existing per-profile usage stacks.
+ *
+ * Maintained by two reducer fan-outs inside the existing `BEGIN IMMEDIATE`
+ * transaction (cursor + projection advance together — never split across
+ * transactions): the SessionStart arm `INSERT OR IGNORE`s a visible row for
+ * every unique `config_dir` (quiet or not, `last_rate_limit_*` stay NULL), and
+ * the dual-case `RateLimited`/`ApiError` arm gated on `kind === "rate_limit"`
+ * UPSERTs `last_rate_limit_at` + `last_rate_limit_session_id` against the
+ * session's `jobs.config_dir` (read in-transaction via the
+ * `syncIfPlanRef` read-then-write precedent — null-guarded so a missing
+ * jobs row skips quietly without throwing inside the open transaction).
+ *
+ * Both fan-outs use the SAME `COALESCE(config_dir,'')` expression so a NULL-
+ * config session's rate limit lands on the exact `''` row it seeded — orphaned
+ * or duplicate buckets are impossible by construction. Last-write-wins on
+ * `last_rate_limit_at` follows the event log's append-only id ordering (no
+ * `max()` guard needed; events fold in id order).
+ *
+ * Field semantics:
+ * - `config_dir` (TEXT, PRIMARY KEY, NOT NULL): the Claude profile directory.
+ *   `NOT NULL` is load-bearing — SQLite treats multiple NULL PK rows as
+ *   distinct, so a nullable PK + `INSERT OR IGNORE` would NOT dedupe. The
+ *   `''` sentinel collapses default `~/.claude` (sessions where
+ *   `CLAUDE_CONFIG_DIR` was unset → `events.config_dir = NULL`).
+ * - `last_rate_limit_at` (REAL, nullable): unix-seconds of the latest
+ *   `RateLimited` / `ApiError(kind="rate_limit")` fold for any session under
+ *   this profile. NULL until the first rate_limit lands — a seed-only row
+ *   (every quiet profile) reads NULL here.
+ * - `last_rate_limit_session_id` (TEXT, nullable): the `jobs.job_id` of the
+ *   session whose rate_limit minted `last_rate_limit_at`. Paired with the
+ *   timestamp; both are NULL together (seed-only row) or both populated.
+ * - `last_event_id` (INTEGER, nullable): the `events.id` of the latest
+ *   contributing event — display/debug; also the descriptor's `version`
+ *   column so the wire diff fires on every fan-out write.
+ * - `updated_at` (REAL, NOT NULL, DEFAULT 0): unix-seconds of the latest
+ *   reducer write — mirrors every other projection table.
+ *
+ * Defaults match the zero-event projection: a fresh DB with zero events has
+ * zero rows; the SessionStart fan-out is the only seed path, so the table
+ * stays empty until the first session arrives. Re-fold determinism: both
+ * fan-outs read only the event payload (`event.config_dir`, `event.ts`,
+ * `event.id`, `event.session_id`) and the in-transaction `jobs.config_dir`,
+ * never `Date.now()`/env/OS state.
+ */
+const CREATE_PROFILES = `
+CREATE TABLE IF NOT EXISTS profiles (
+    config_dir TEXT NOT NULL PRIMARY KEY,
+    last_rate_limit_at REAL,
+    last_rate_limit_session_id TEXT,
+    last_event_id INTEGER,
+    updated_at REAL NOT NULL DEFAULT 0
+)
+`;
+
+/**
  * Schema-v31 `file_attributions` projection table — one row per
  * `(project_dir, session_id, file_path)` triple. Records the attribution claim
  * that this session has at least one mutation (tool or bash) on this file in
@@ -927,6 +988,7 @@ function migrate(db: Database): void {
     for (const sql of CREATE_FILE_ATTRIBUTIONS_INDEXES) {
       db.run(sql);
     }
+    db.run(CREATE_PROFILES);
 
     // Seed singleton cursor on first boot. Subsequent boots are no-ops.
     db.run(
@@ -2923,6 +2985,23 @@ function migrate(db: Database): void {
     db.run("ANALYZE epics");
     db.run("ANALYZE jobs");
     db.run("ANALYZE events");
+
+    // v32→v33: fn-639 — `profiles` projection table keyed by `config_dir`.
+    // Maintained entirely by reducer fan-outs (SessionStart `INSERT OR IGNORE`
+    // seed + `RateLimited`/`ApiError(rate_limit)` UPSERT) inside the existing
+    // `BEGIN IMMEDIATE` transaction. No data backfill — the table populates
+    // from the event log on the next drain. A re-open of an already-migrated
+    // v33+ DB picks up the table via the unconditional `CREATE TABLE IF NOT
+    // EXISTS CREATE_PROFILES` in the bootstrap block above; this slot exists
+    // only to stamp the version bump deterministically alongside the existing
+    // ordering of migrate slots (the CREATE itself is idempotent and runs on
+    // every boot, so a fresh v33 DB picks it up via the bootstrap path).
+    //
+    // No rewind: a from-scratch re-fold (rewind cursor + `DELETE FROM
+    // profiles`) reproduces the table byte-deterministically from the event
+    // log, so an existing v32 DB transitioning to v33 will see `profiles`
+    // populate organically on the next SessionStart / rate_limit fold without
+    // disturbing the other projections.
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

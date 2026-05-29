@@ -386,6 +386,48 @@ export const USAGE_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
+ * The `profiles` descriptor (schema v33, fn-639) — one row per Claude profile
+ * directory keyed by `config_dir`. Correlates the last `rate_limit` ApiError
+ * with each profile so renderers (`scripts/usage.ts`'s "Rate limits by
+ * profile" block) can surface profile-level reset state alongside the
+ * per-profile usage stacks.
+ *
+ * Schema lives in `src/db.ts`'s `CREATE_PROFILES`; the population path is
+ * the reducer's SessionStart `INSERT OR IGNORE` seed + the dual-case
+ * `RateLimited`/`ApiError` arm UPSERT, both inside the existing
+ * `BEGIN IMMEDIATE` transaction. `''`-sentinel collapses the default
+ * `~/.claude` profile so a single PK groups every NULL-`config_dir` session.
+ *
+ * `pk: 'config_dir'` matches the table's NOT NULL PRIMARY KEY;
+ * `version: 'last_event_id'` so the wire diff fires on every seed-or-upsert
+ * write. `defaultSort` stable by pk (mirrors `USAGE_DESCRIPTOR`'s shape).
+ * `filters: { config_dir }` lets a renderer page on a specific profile. No
+ * `jsonColumns` — every persisted field is a scalar.
+ */
+export const PROFILES_DESCRIPTOR: CollectionDescriptor = {
+  name: "profiles",
+  table: "profiles",
+  columns: [
+    "config_dir",
+    "last_rate_limit_at",
+    "last_rate_limit_session_id",
+    "last_event_id",
+    "updated_at",
+  ],
+  pk: "config_dir",
+  version: "last_event_id",
+  sortable: new Set([
+    "config_dir",
+    "last_rate_limit_at",
+    "last_event_id",
+    "updated_at",
+  ]),
+  defaultSort: { column: "config_dir", dir: "asc" },
+  filters: { config_dir: "config_dir" },
+  jsonColumns: new Set(),
+};
+
+/**
  * The `subagent_invocations` descriptor — per-job timeline of `Agent` (Task)
  * tool invocations and their `SubagentStart` / `SubagentStop` lifecycle. The
  * peer-table projection lives in schema v17 (`src/db.ts`'s
@@ -448,6 +490,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [GIT_DESCRIPTOR.name, GIT_DESCRIPTOR],
   [SUBAGENT_INVOCATIONS_DESCRIPTOR.name, SUBAGENT_INVOCATIONS_DESCRIPTOR],
   [USAGE_DESCRIPTOR.name, USAGE_DESCRIPTOR],
+  [PROFILES_DESCRIPTOR.name, PROFILES_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

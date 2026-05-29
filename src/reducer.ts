@@ -3666,6 +3666,21 @@ function projectJobsRow(db: Database, event: Event): void {
             event.config_dir,
           ],
         );
+        // Schema v33 (fn-639): seed a visible `profiles` row for this
+        // session's `config_dir` bucket. `INSERT OR IGNORE` so a resume into
+        // a profile that already has a row is a no-op, and a duplicate
+        // SessionStart on the same profile never re-stamps `last_event_id`
+        // (the first seed wins). `COALESCE(?,'')` collapses a NULL
+        // `events.config_dir` (default `~/.claude` — no `CLAUDE_CONFIG_DIR`
+        // env) into the empty-string sentinel, matching the rate-limit
+        // fan-out's identical expression so a NULL-config session's later
+        // rate limit lands on the exact `''` row it seeded here.
+        // `last_rate_limit_*` stay NULL — populated only by the rate-limit
+        // arm below. Pure function of the event (no `Date.now`/env/OS state).
+        db.run(
+          `INSERT OR IGNORE INTO profiles (config_dir, last_event_id, updated_at) VALUES (COALESCE(?, ''), ?, ?)`,
+          [event.config_dir, event.id, ts],
+        );
       }
       syncIfPlanRef(db, jobId, event.id, ts);
       break;
@@ -3994,6 +4009,45 @@ function projectJobsRow(db: Database, event: Event): void {
       // re-write a stale-but-unchanged element with the new event_id).
       if (res.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
+      }
+      // Schema v33 (fn-639): profile-level rate-limit fan-out. Gated on
+      // the already-resolved `kind === "rate_limit"` local above — covers
+      // both the legacy `RateLimited` event_type (forced to "rate_limit")
+      // and the v24 `ApiError` mint whose `extractApiErrorKind` returned
+      // "rate_limit". Other `ApiErrorKind` values (`authentication_failed`,
+      // `server_error`, etc.) are out of scope per fn-639 — only `rate_limit`
+      // stamps the profile row.
+      //
+      // Read the session's `config_dir` from `jobs` in-transaction (the
+      // `syncIfPlanRef` read-then-write precedent at ~:2714-2738). Null-
+      // guarded: if the jobs row is absent (a rate_limit landing before
+      // SessionStart on a brand-new session — unusual but legal), skip the
+      // fan-out; the cursor still advances. The UPSERT runs INDEPENDENTLY
+      // of the jobs UPDATE guard above — a rate_limit on a terminal jobs
+      // row still attributes to the profile (the profile-level signal is
+      // honest regardless of the per-session terminal guard).
+      //
+      // UPSERT shape: last-write-wins on `last_rate_limit_at`. Events fold
+      // in id order, so a later event always carries a strictly-greater
+      // (ts, id) pair — no `max()` guard needed. `COALESCE(?,'')` matches
+      // the SessionStart seed's identical expression so a NULL-config
+      // session's rate limit lands on the exact `''` row it seeded.
+      if (kind === "rate_limit") {
+        const profileRow = db
+          .query("SELECT config_dir FROM jobs WHERE job_id = ?")
+          .get(jobId) as { config_dir: string | null } | null;
+        if (profileRow != null) {
+          db.run(
+            `INSERT INTO profiles (config_dir, last_rate_limit_at, last_rate_limit_session_id, last_event_id, updated_at)
+                  VALUES (COALESCE(?, ''), ?, ?, ?, ?)
+             ON CONFLICT(config_dir) DO UPDATE SET
+               last_rate_limit_at = excluded.last_rate_limit_at,
+               last_rate_limit_session_id = excluded.last_rate_limit_session_id,
+               last_event_id = excluded.last_event_id,
+               updated_at = excluded.updated_at`,
+            [profileRow.config_dir, ts, jobId, event.id, ts],
+          );
+        }
       }
       break;
     }
