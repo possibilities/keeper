@@ -61,5 +61,5 @@ a name whose `.claude.json` lacks the tier — each must not crash.
 - [ ] `pyyaml` added to pyproject + uv.lock; daemon starts clean under the LaunchAgent after a bounce
 
 ## Done summary
-
+agentuse daemon ACCOUNTS now built at runtime from XDG ~/.config/agentuse/config.yaml (profile name list); each multiplier derived from ~/.claude-profiles/<name>/.claude.json organizationRateLimitTier via {default_claude_ai:1, default_claude_max_5x:5, default_claude_max_20x:20}; codex appended in code. Missing/malformed config, missing .claude.json, and unknown tiers all degrade to safe defaults with stderr logs. pyyaml added to pyproject + uv.lock. Verified live: default=5, multi-claude-1=1, multi-claude-2=1, multi-claude-3=20.
 ## Evidence
