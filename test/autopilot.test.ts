@@ -228,7 +228,14 @@ function buildSnap(
 ) {
   const jobs = new Map<string, Job>();
   const readiness = computeReadiness(epics, jobs, [], gitStatusByProjectDir);
-  return { epics, jobs, subagentInvocations: [], gitStatus: [], readiness };
+  return {
+    epics,
+    completedEpics: [],
+    jobs,
+    subagentInvocations: [],
+    gitStatus: [],
+    readiness,
+  };
 }
 
 test("predictNextDispatches — in-flight worker on a task predicts approve::<task>", () => {

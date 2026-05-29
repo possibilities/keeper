@@ -881,6 +881,27 @@ async function main(): Promise<void> {
         }
       }
     }
+    // fn-637: merge the completed (done+approved) upstreams into the resolver
+    // indexes ONLY — never into `epicsList`. These epics are pruned from the
+    // default-visible page, so without them the summary pill would resolve a
+    // satisfied cross-epic dep to the false `[?#N]` dangling form. The merge +
+    // `epicById.has` guard mirror `computeReadiness`'s completed-epics merge
+    // exactly so the summary pill and predicate 9 never disagree. The rendered
+    // epic list stays the default-visible set (`epicsList`).
+    for (const epic of snap.completedEpics as Epic[]) {
+      if (epicById.has(epic.epic_id)) {
+        continue;
+      }
+      epicById.set(epic.epic_id, epic);
+      if (typeof epic.epic_number === "number") {
+        const arr = epicsByNumber.get(epic.epic_number);
+        if (arr === undefined) {
+          epicsByNumber.set(epic.epic_number, [epic]);
+        } else {
+          arr.push(epic);
+        }
+      }
+    }
     return epicsList
       .map((e) =>
         renderEpicBlock(

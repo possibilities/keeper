@@ -246,6 +246,15 @@ export function computeReadiness(
     string,
     { dirty_count: number; unattributed_to_live_count: number }
   > = new Map(),
+  // fn-637: completed upstream epics (`status==="done" && approval==="approved"`)
+  // that have been pruned from the default-visible page and so are absent from
+  // `epics`. Supplied via a scoped resolver-only read (see `subscribeReadiness`).
+  // Merged into the `epicById`/`epicsByNumber` resolver indexes ONLY — never
+  // into the verdict/mutex iteration — so predicate 9 resolves a satisfied
+  // cross-epic dependency to `found` (completed) instead of falsely reporting
+  // `dep-on-epic-dangling`. Defaults to empty so existing callers/tests that
+  // don't subscribe to the completed set keep the pre-fix behavior.
+  completedEpics: Iterable<Epic> = [],
 ): ReadinessSnapshot {
   // Build a job_id → SubagentInvocation[] index so predicate 6 is O(1) per row.
   // Filtered to `status === "running"` at index time — the only status that
@@ -290,6 +299,30 @@ export function computeReadiness(
     }
     for (const task of epic.tasks) {
       taskById.set(task.task_id, task);
+    }
+  }
+
+  // fn-637: merge the completed-epics resolver index. These are done+approved
+  // upstreams pruned from the default-visible page; they reach us via a scoped
+  // read and are added to `epicById`/`epicsByNumber` ONLY — never to `epicsArr`
+  // or `taskById` — so the per-task / close-row / mutex passes stay scoped to
+  // the default-visible set exactly as before. The `epicById.has` guard makes
+  // the merge a no-op for any epic already in the live set (the two sets are
+  // disjoint by construction — `default_visible=1` vs the done+approved
+  // supplemental filter — but the guard also prevents a transient
+  // double-delivery from creating a phantom same-number bare-id ambiguity).
+  for (const epic of completedEpics) {
+    if (epicById.has(epic.epic_id)) {
+      continue;
+    }
+    epicById.set(epic.epic_id, epic);
+    if (typeof epic.epic_number === "number") {
+      const arr = epicsByNumber.get(epic.epic_number);
+      if (arr === undefined) {
+        epicsByNumber.set(epic.epic_number, [epic]);
+      } else {
+        arr.push(epic);
+      }
     }
   }
 
@@ -533,6 +566,15 @@ function evaluateTask(
         tag: "blocked",
         reason: { kind: "dep-on-epic-dangling", upstream: upstreamEpic },
       };
+    }
+    if (resolved.completed) {
+      // fn-637: the upstream is done+approved. It has fallen out of the
+      // default-visible page (`default_visible=0`) and reached the resolver
+      // only via the completed-epics index, so it has no `perCloseRow`
+      // verdict — skip without consulting it. Without this branch the
+      // upstream's absence from the live index produced a false
+      // `dep-on-epic-dangling` block the instant it completed.
+      continue;
     }
     const upstreamClose = perCloseRow.get(resolved.epic.epic_id);
     if (upstreamClose === undefined) {
@@ -942,6 +984,18 @@ function projectBasename(dir: string | null): string {
   return idx === -1 ? trimmed : trimmed.slice(idx + 1);
 }
 
+/**
+ * fn-637: dep-satisfaction predicate, identical to `evaluateCloseRow`'s
+ * terminal-completed check. A resolved upstream that is completed satisfies
+ * the dependency even when it has been pruned from the default-visible page
+ * (`default_visible=0`) and supplied to the resolver only via the
+ * completed-epics index. Kept as a single helper so the resolver and the
+ * close-row never drift on what "done" means.
+ */
+function epicIsCompleted(epic: Epic): boolean {
+  return epic.status === "done" && epic.approval === "approved";
+}
+
 /** Resolver outcome — discriminated union so callers can branch on `kind`. */
 export type EpicDepResolution =
   | {
@@ -953,6 +1007,16 @@ export type EpicDepResolution =
        * when the basenames match (intra-project).
        */
       cross_project: string | null;
+      /**
+       * fn-637: `true` when the resolved upstream is itself completed
+       * (`status==="done" && approval==="approved"` — the same terminal
+       * predicate `evaluateCloseRow` uses). A completed upstream satisfies
+       * the dependency outright; predicate 9 skips it without consulting
+       * `perCloseRow` (the completed upstream is pruned from the
+       * default-visible page and reaches the resolver only via the
+       * completed-epics index, so it has no per-close-row verdict).
+       */
+      completed: boolean;
     }
   | { kind: "dangling" };
 
@@ -1009,7 +1073,12 @@ export function resolveEpicDep(
         consumerBase !== upstreamBase
           ? upstreamBase
           : null;
-      return { kind: "found", epic: upstream, cross_project: crossProject };
+      return {
+        kind: "found",
+        epic: upstream,
+        cross_project: crossProject,
+        completed: epicIsCompleted(upstream),
+      };
     }
     // 2+ candidates. Prefer the consumer's own project_dir basename.
     const sameProject = candidates.filter(
@@ -1022,7 +1091,12 @@ export function resolveEpicDep(
         return { kind: "dangling" };
       }
       // Same-project hit can't be cross-project by definition.
-      return { kind: "found", epic: upstream, cross_project: null };
+      return {
+        kind: "found",
+        epic: upstream,
+        cross_project: null,
+        completed: epicIsCompleted(upstream),
+      };
     }
     // Ambiguous: 2+ candidates AND no unique same-project disambiguator.
     // Emit a diagnostic with every match's full id (sorted for re-fold
@@ -1047,7 +1121,12 @@ export function resolveEpicDep(
     consumerBase !== "" && upstreamBase !== "" && consumerBase !== upstreamBase
       ? upstreamBase
       : null;
-  return { kind: "found", epic: upstream, cross_project: crossProject };
+  return {
+    kind: "found",
+    epic: upstream,
+    cross_project: crossProject,
+    completed: epicIsCompleted(upstream),
+  };
 }
 
 // ---------------------------------------------------------------------------

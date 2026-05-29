@@ -1234,6 +1234,56 @@ test("resolver: bare-id miss → dep-on-epic-dangling", () => {
   );
 });
 
+test("fn-637: a completed upstream supplied via completedEpics resolves satisfied, not dangling", () => {
+  // The upstream is done+approved, hence pruned from the default-visible
+  // page — it is NOT in the main `epics` list. Before fn-637 the consumer's
+  // full-id dep missed `epicById` and false-blocked as dep-on-epic-dangling
+  // the instant the upstream completed. Supplying the completed upstream via
+  // the resolver-only `completedEpics` arg lets predicate 9 resolve it as
+  // completed → the dependency is satisfied.
+  const completedUpstream = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/Users/mike/code/keeper",
+    status: "done",
+    approval: "approved",
+    tasks: [],
+  });
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/Users/mike/code/keeper",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2-bar"], // full form
+  });
+
+  // Control: WITHOUT the completed upstream in scope, the dep dangles —
+  // proving the `completedEpics` arg is what flips the verdict.
+  const dangling = computeReadiness(
+    [consumer],
+    new Map<string, Job>(),
+    [],
+    new Map(),
+  );
+  expect(dangling.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dep-on-epic-dangling", upstream: "fn-2-bar" }),
+  );
+
+  // With the completed upstream supplied via the resolver-only arg, the
+  // consumer task is satisfied (ready).
+  const satisfied = computeReadiness(
+    [consumer],
+    new Map<string, Job>(),
+    [],
+    new Map(),
+    [completedUpstream],
+  );
+  expect(satisfied.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  // Resolver-only: the completed upstream never entered the verdict-driving
+  // iteration, so it has no close-row verdict of its own.
+  expect(satisfied.perCloseRow.get("fn-2-bar")).toBeUndefined();
+});
+
 test("resolver: 2+ matches with NO same-project disambiguator → dangling + diagnostic", () => {
   // Two epics with `epic_number === 2` both live in projects OTHER than
   // the consumer's `/Users/mike/code/keeper`. The resolver yields
