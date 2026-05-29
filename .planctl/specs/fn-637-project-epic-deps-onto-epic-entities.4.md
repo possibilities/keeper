@@ -68,5 +68,5 @@ surface as part of this cutover (no sequencing dep needed).
 - [ ] Full affected-suite green; behavior matches the pre-cutover board/autopilot output.
 
 ## Done summary
-
+Predicate 9 + board pill cut over to read epic.resolved_epic_deps off the schema-v34 projection; fn-637 stopgap (completedEpics subscription + merges) deleted, readiness-client back to 4 collections. BlockReason payloads (dep-on-epic with cross_project, dep-on-epic-dangling) byte-preserved for autopilot. Docs (CLAUDE.md + README) document the syncResolvedEpicDeps forward/reverse fan-out and prune fn-637 references.
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Cutover readers and delete fn-637 stopgap",
-  "updated_at": "2026-05-29T01:22:02.387083Z"
+  "updated_at": "2026-05-29T12:56:39.830715Z",
+  "worker_done_at": "2026-05-29T12:56:39.830715Z"
 }
