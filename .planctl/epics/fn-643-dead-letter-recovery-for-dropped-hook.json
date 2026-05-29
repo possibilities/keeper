@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-643-dead-letter-recovery-for-dropped-hook",
   "bundles": [],
   "closer_done_at": "2026-05-29T23:48:22.741744Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-29T23:48:22.741744Z"
+  "updated_at": "2026-05-29T23:53:04.844786Z"
 }
