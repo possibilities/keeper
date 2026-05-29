@@ -87,22 +87,27 @@
  * drops off and re-appears as `approve::<id>`), then workers, then
  * closers (rows that flip blocked→ready in a simulation that forces
  * every currently-active row to completed). Preview rows are
- * single-line `(<dir>) [<pill>] <verb>::<id>` where the pill sits
- * immediately after the dir column and is `[claude]` for dispatch-
- * backed rows (approve / work / close) or `[info  ]` for the
- * informational `git-dirty` row (label right-padded to "claude"'s
- * width so all pills are 8 chars). The dir column itself is padded to
- * the widest `(<dir>) ` across the predicted rows so pills align
+ * single-line `(<dir>) <verb>::<id>`; the dir column is padded to the
+ * widest `(<dir>) ` across the predicted rows so `<verb>::<id>` aligns
  * across projects. No `[dry]` tag, no shell-command footer. The
  * preview recomputes from the live readiness snapshot on every emit:
  *
  *   --- current ---
  *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
  *   --- predicted ---
- *   (arthack) [claude] approve::fn-594-fix-silent-failure-paths-in-templates.1
- *   (arthack) [info  ] git-dirty::fn-594-fix-silent-failure-paths-in-templates.1
- *   (keeper)  [claude] work::fn-619-pin-inputrequest-mid-subagent-state.3
- *   (keeper)  [claude] close::fn-619-pin-inputrequest-mid-subagent-state
+ *   (arthack) approve::fn-594-fix-silent-failure-paths-in-templates.1
+ *   (arthack) git-dirty::fn-594-fix-silent-failure-paths-in-templates.1
+ *   (keeper)  work::fn-619-pin-inputrequest-mid-subagent-state.3
+ *   (keeper)  close::fn-619-pin-inputrequest-mid-subagent-state
+ *
+ * The `v` key toggles a per-row command display: every command-bearing
+ * row (dispatched current/queued/completed rows and dispatch-backed
+ * predicted work/close/approve rows) grows one indented line carrying
+ * the full `cd … && claude --name … '/plan:…'` shell command for
+ * copy-paste when the human wants to run it manually. The
+ * informational `git-dirty` preview row has no dispatch behind it and
+ * is never annotated. The toggle repaints the live body without
+ * growing frame history and lights a `[cmd]` marker in the banner.
  *
  * Fires side effects on EDGES in the readiness verdicts:
  *   → ready          spawn a Ghostty window running the worker command
@@ -159,6 +164,7 @@ Usage: bun scripts/autopilot.ts [--sock <path>] [--dry-run]
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
   space pause/resume dispatches,
+  v toggle per-row command display (for copy-paste / manual run),
   c copy current frame + sidecar paths to clipboard, q/Ctrl-C quit.
   Per-frame sidecars are indexed; lifecycle + warn output is appended to
   /tmp/keeper-autopilot.<pid>.lifecycle.txt. Session paths print on
@@ -234,12 +240,18 @@ or blocked:git-orphans emit an informational 'git-dirty::<id>' row
 the human resolves it by cleaning the worktree, after which the row
 drops off and re-emerges as 'approve::<id>'); rows that flip to ready
 emit 'work::<task>' / 'close::<epic>'. Preview rows are single-line
-'(<dir>) [<pill>] <verb>::<id>' where the pill sits immediately after
-the dir column and is '[claude]' for dispatch-backed rows (approve /
-work / close) or '[info  ]' for the informational 'git-dirty' row
-(label right-padded to 'claude's width so all pills are 8 chars; the
-dir column itself is padded to the widest '(<dir>) ' so pills align
-across projects). No [dry] tag, no shell-command footer.
+'(<dir>) <verb>::<id>'; the dir column is padded to the widest
+'(<dir>) ' so '<verb>::<id>' aligns across projects. No [dry] tag, no
+shell-command footer.
+
+The 'v' key toggles a per-row command display: every command-bearing
+row (dispatched current/queued/completed rows and dispatch-backed
+predicted work/close/approve rows) grows one indented line carrying
+the full 'cd … && claude --name … /plan:…' shell command for copy-
+paste when you want to run it manually. The informational 'git-dirty'
+preview row has no dispatch behind it and is never annotated. Toggling
+repaints the live body without growing frame history and lights a
+'[cmd]' marker in the banner.
 
 The helper waits for keeperd to come up and reconnects across restarts;
 each connection-lifecycle change is appended to the lifecycle sidecar.
@@ -1401,6 +1413,15 @@ async function main(): Promise<void> {
   // title never carries the [PAUSED] tag.
   let paused = true;
 
+  // `v` toggles command display. When on, every command-bearing row
+  // (dispatched current/queued/completed + predicted work/close/approve)
+  // gets one extra indented line carrying the full shell command, so the
+  // human can mouse-select it and run it manually. Informational
+  // `git-dirty` predicted rows have no command behind them and are never
+  // annotated. The toggle repaints the live body via `refreshLive` (no
+  // history growth) and adds a `[cmd]` marker to the banner.
+  let showCommands = false;
+
   let lastBody: string | null = null;
   // Latest readiness snapshot, captured at the top of `onSnapshot`. The
   // section-2 preview (`predictNextDispatches`) recomputes from this on
@@ -1479,6 +1500,11 @@ async function main(): Promise<void> {
         } else {
           target.push(`  claude '/plan:${e.verb} ${e.id}'`);
         }
+      } else if (showCommands) {
+        // `v` toggle: surface the real fused command (`cd … && claude
+        // --name … '/plan:…'`) on one indented line for copy-paste.
+        // Dry rows already carry their footer above, so they're skipped.
+        target.push(`  ${e.command}`);
       }
     }
 
@@ -1528,25 +1554,26 @@ async function main(): Promise<void> {
       ...workers,
       ...closers,
     ];
-    // Column widths so dir + pill align across all predicted rows:
-    //   - dir column: `(<dir>) ` is `dir.length + 3` chars; widen to the
-    //     max so e.g. `(keeper) ` gets a trailing space to match
-    //     `(arthack) `. Zero when no row has a dir.
-    //   - pill: right-pad the label inside the brackets to the longest
-    //     label ("claude") so `[claude]` and `[info  ]` are both 8 chars.
-    // Pill sits immediately after the dir column, before the verb::id.
+    // Dir column width so `verb::id` aligns across all predicted rows:
+    // `(<dir>) ` is `dir.length + 3` chars; widen to the max so e.g.
+    // `(keeper) ` gets a trailing space to match `(arthack) `. Zero when
+    // no row has a dir.
     const maxDirLen = predictedRows.reduce(
       (m, r) => Math.max(m, r.dir.length),
       0,
     );
     const dirColWidth = maxDirLen === 0 ? 0 : maxDirLen + 3;
-    const PILL_LABEL_WIDTH = 6;
     for (const r of predictedRows) {
       const dirSegRaw = r.dir === "" ? "" : `(${r.dir}) `;
       const dirSeg = dirSegRaw.padEnd(dirColWidth);
-      const label = r.verb === "git-dirty" ? "info" : "claude";
-      const pill = `[${label.padEnd(PILL_LABEL_WIDTH)}]`;
-      out.push(`${dirSeg}${pill} ${r.verb}::${r.id}`);
+      out.push(`${dirSeg}${r.verb}::${r.id}`);
+      // `v` toggle: every dispatch-backed preview row (work/close/approve)
+      // gets its would-run command on one indented line for copy-paste.
+      // The informational `git-dirty` row has no dispatch behind it, so
+      // it's never annotated.
+      if (showCommands && r.verb !== "git-dirty") {
+        out.push(`  ${buildClaudeDispatchCommand(r.verb, r.id, r.dirFull)}`);
+      }
     }
     return out;
   }
@@ -2053,8 +2080,16 @@ async function main(): Promise<void> {
   // chrome that repaints just row 0 and never grows the frame history.
   // Constructed AFTER the functions it closes over are defined so the
   // closure captures live references.
-  const pauseStatus = (): string =>
-    dryRun ? "" : paused ? "[paused]" : "[playing]";
+  const statusLine = (): string => {
+    const parts: string[] = [];
+    if (!dryRun) {
+      parts.push(paused ? "[paused]" : "[playing]");
+    }
+    if (showCommands) {
+      parts.push("[cmd]");
+    }
+    return parts.join(" ");
+  };
   // `c` flashes a debug snapshot to the clipboard. Status is briefly
   // overridden with `[copied frame N]` / `[copy failed]`, then restored
   // to the pause indicator (NOT cleared to "") so the human doesn't
@@ -2066,10 +2101,20 @@ async function main(): Promise<void> {
     onUnhandledKey: (key) => {
       if (key === " " && !dryRun) {
         paused = !paused;
-        liveShell.setStatus(pauseStatus());
+        liveShell.setStatus(statusLine());
         if (!paused && lastSnap !== null) {
           processLaunchTransitions(lastSnap);
         }
+        return;
+      }
+      if (key === "v") {
+        // Toggle command display. Repaint the live body via `refreshLive`
+        // so the per-row command lines appear/disappear without pushing a
+        // frame to history (a pure view toggle, like the pause indicator),
+        // and reflect the state in the banner with a `[cmd]` marker.
+        showCommands = !showCommands;
+        liveShell.setStatus(statusLine());
+        liveShell.refreshLive(renderDispatchFrame());
         return;
       }
       if (key === "c") {
@@ -2096,10 +2141,10 @@ async function main(): Promise<void> {
           if (copyStatusTimer !== undefined) {
             clearTimeout(copyStatusTimer);
           }
-          // Restore the pause indicator (not "") so toggling [paused] /
-          // [playing] state survives the copy flash.
+          // Restore the status indicator (not "") so the [paused] /
+          // [playing] / [cmd] state survives the copy flash.
           copyStatusTimer = setTimeout(
-            () => liveShell.setStatus(pauseStatus()),
+            () => liveShell.setStatus(statusLine()),
             1500,
           );
         });
@@ -2110,7 +2155,7 @@ async function main(): Promise<void> {
   // first paint, before keeperd's first snapshot lands. setStatus does a
   // banner-only repaint with no body content, which is exactly what we
   // want here.
-  liveShell.setStatus(pauseStatus());
+  liveShell.setStatus(statusLine());
 
   const handle = subscribeReadiness({
     sockPath,
