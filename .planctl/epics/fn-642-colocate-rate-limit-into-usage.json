@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-642-colocate-rate-limit-into-usage",
   "bundles": [],
+  "closer_done_at": "2026-05-29T17:32:57.674062Z",
   "created_at": "2026-05-29T14:45:21.690852Z",
   "depends_on_epics": [],
   "id": "fn-642-colocate-rate-limit-into-usage",
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Colocate rate-limit into usage",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-29T14:45:21.690852Z"
+  "updated_at": "2026-05-29T17:32:57.674062Z"
 }
