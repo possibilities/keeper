@@ -41,18 +41,18 @@ import type {
   ServerFrame,
 } from "../src/protocol";
 import {
-  acquireLock,
   ASYNC_RPC_REGISTRY,
+  acquireLock,
   BadParamsError,
   type ConnState,
-  diffTick,
   type DispatchAsyncCtx,
+  diffTick,
   dispatchLine,
   isPidAlive,
   LockHeldError,
   pollLoop,
-  RPC_REGISTRY,
   type ReplayBridge,
+  RPC_REGISTRY,
   registerAsyncRpc,
   registerRpc,
   resolveFilter,
@@ -1114,9 +1114,9 @@ test("dispatchLine async rpc without asyncCtx → unknown_method (legacy sync ca
 test("registerAsyncRpc collides with a same-name sync registration", () => {
   const teardown = withRpc("collide", () => null);
   try {
-    expect(() =>
-      registerAsyncRpc("collide", async () => null),
-    ).toThrow(/already registered/);
+    expect(() => registerAsyncRpc("collide", async () => null)).toThrow(
+      /already registered/,
+    );
   } finally {
     teardown();
   }

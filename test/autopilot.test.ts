@@ -433,6 +433,12 @@ function buildSnap(
     jobs,
     subagentInvocations: [],
     gitStatus: [],
+    // fn-643.5: `deadLetters` rides on every readiness snapshot. The
+    // autopilot doesn't read it (the predict / detect / dispatch pipeline
+    // is dead-letter-agnostic), so the helper stamps an empty array on
+    // every fixture — same shape as the steady-state empty page from the
+    // descriptor's `defaultFilter: { status: "waiting" }` scope.
+    deadLetters: [],
     readiness,
   };
 }

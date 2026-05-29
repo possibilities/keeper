@@ -426,7 +426,7 @@ export function recoverOneDeadLetter(db: Database): string | null {
     // The column list is interpolated directly because EVENTS_COLUMNS is
     // a module constant (no wire text); values are bound positionally.
     const presentCols = EVENTS_COLUMNS.filter((c) =>
-      Object.prototype.hasOwnProperty.call(bindings, c),
+      Object.hasOwn(bindings, c),
     );
     if (presentCols.length === 0) {
       throw new Error(

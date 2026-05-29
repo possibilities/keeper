@@ -191,7 +191,7 @@ Usage: bun scripts/autopilot.ts [--sock <path>] [--dry-run]
                    The summary line carries a [dry] tag and is followed
                    by the would-have-run shell command on two indented
                    lines. Live mode launches each worker through
-                   \$SHELL (validated absolute path, /bin/zsh fallback)
+                   $SHELL (validated absolute path, /bin/zsh fallback)
                    with -l -i and chains an interactive shell after
                    claude exits, so a dropped session leaves a
                    keyboard-usable shell in the window.

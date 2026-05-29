@@ -809,15 +809,7 @@ test("recoverOneDeadLetter rolls back the events INSERT on malformed bindings; r
        (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
         status, recovered_at, replayed_event_id, source_file)
      VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', NULL, NULL, NULL)`,
-  ).run(
-    "dl-bad",
-    "sess-bad",
-    "SessionStart",
-    1,
-    1,
-    null,
-    "this is not json",
-  );
+  ).run("dl-bad", "sess-bad", "SessionStart", 1, 1, null, "this is not json");
 
   const eventsBefore = (
     db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }

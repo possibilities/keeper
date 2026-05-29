@@ -661,8 +661,7 @@ test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends r
   // Hermetic dead-letters dir under the per-test tmp tree so the boot scan
   // imports rows we control instead of the user's real dropped-events file.
   // `KEEPER_DEAD_LETTER_DIR` is the env override (see `resolveDeadLetterDir`).
-  const { mkdirSync } =
-    require("node:fs") as typeof import("node:fs");
+  const { mkdirSync } = require("node:fs") as typeof import("node:fs");
   const deadLetterDir = join(tmpDir, "dead-letters");
   mkdirSync(deadLetterDir, { recursive: true });
 
@@ -807,8 +806,7 @@ test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends r
 
   // Poll the jobs projection for the recovered session.
   const verify = await retryUntil(() => {
-    const { openDb } =
-      require("../src/db") as typeof import("../src/db");
+    const { openDb } = require("../src/db") as typeof import("../src/db");
     const { db } = openDb(dbPath, { readonly: true });
     try {
       const job = db

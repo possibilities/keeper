@@ -375,7 +375,9 @@ export async function replayDeadLetterHandler(
   if (!result.ok) {
     // Main posted back a typed failure. Throw with main's error message
     // so the dispatcher frames `rpc_failed` carrying the same text.
-    throw new Error(result.error ?? "replay_dead_letter: main reported failure");
+    throw new Error(
+      result.error ?? "replay_dead_letter: main reported failure",
+    );
   }
   return {
     ok: true,

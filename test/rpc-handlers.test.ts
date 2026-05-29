@@ -29,10 +29,7 @@ import {
   setEpicApprovalHandler,
   setTaskApprovalHandler,
 } from "../src/rpc-handlers";
-import {
-  BadParamsError,
-  type ReplayBridge,
-} from "../src/server-worker";
+import { BadParamsError, type ReplayBridge } from "../src/server-worker";
 
 let tmpDir: string;
 let dbPath: string;
@@ -551,14 +548,14 @@ test("replay_dead_letter throws BadParamsError on params with extra keys", async
 
 test("replay_dead_letter throws (rpc_failed framing) when bridge reports ok:false", async () => {
   const { bridge } = stubBridge({ ok: false, error: "main crashed" });
-  expect(
-    replayDeadLetterHandler(undefined, bridge),
-  ).rejects.toThrow(/main crashed/);
+  expect(replayDeadLetterHandler(undefined, bridge)).rejects.toThrow(
+    /main crashed/,
+  );
 });
 
 test("replay_dead_letter throws a generic message when ok:false carries no error string", async () => {
   const { bridge } = stubBridge({ ok: false });
-  expect(
-    replayDeadLetterHandler(undefined, bridge),
-  ).rejects.toThrow(/main reported failure/);
+  expect(replayDeadLetterHandler(undefined, bridge)).rejects.toThrow(
+    /main reported failure/,
+  );
 });

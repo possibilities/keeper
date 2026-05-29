@@ -31,6 +31,7 @@ import { expect, test } from "bun:test";
 import {
   colorizePillsInLine,
   epicNumFromIdOrBare,
+  renderDeadLetterPill,
   renderEpicDepPills,
   renderJobLinkLines,
 } from "../scripts/board";
@@ -78,6 +79,11 @@ function makeTask(overrides: Partial<Task>): Task {
     task_number: 1,
     title: "task",
     target_repo: null,
+    // `tier` is a required nullable column on the `Task` shape (the
+    // projection writes either a real tier string or NULL). Stamp NULL
+    // here so the fixture compiles under `exactOptionalPropertyTypes`;
+    // tests that care about a real tier override via `...overrides`.
+    tier: null,
     // Schema v19: `status` renamed to `worker_phase` (derived binary —
     // open|done) and `runtime_status` added (planctl-native enum, default
     // "todo"). Both ride inside the embedded element on the parent epic's
@@ -1043,4 +1049,37 @@ test("byId-style collapse (legacy bug) would only deliver one row", () => {
   expect(Array.from(byId.values())).toHaveLength(1);
   // The fix path delivers both:
   expect(projectRows<SubagentInvocation>({ rows })).toHaveLength(2);
+});
+
+// ---------------------------------------------------------------------------
+// renderDeadLetterPill — board's persistent warn banner for waiting
+// dead-letter rows (fn-643.5). Native count surfaces verbatim; the pill
+// drops cleanly at zero so the banner reads empty in the happy steady
+// state. Defensive against malformed inputs (NaN / negative).
+// ---------------------------------------------------------------------------
+
+test("renderDeadLetterPill: positive N renders `[dead-letter:N]` verbatim (native count)", () => {
+  expect(renderDeadLetterPill(1)).toBe("[dead-letter:1]");
+  expect(renderDeadLetterPill(3)).toBe("[dead-letter:3]");
+  expect(renderDeadLetterPill(42)).toBe("[dead-letter:42]");
+});
+
+test("renderDeadLetterPill: zero / negative / NaN collapse to empty (banner drops the pill cleanly)", () => {
+  expect(renderDeadLetterPill(0)).toBe("");
+  expect(renderDeadLetterPill(-1)).toBe("");
+  expect(renderDeadLetterPill(Number.NaN)).toBe("");
+  // `Infinity` is not finite — also collapses (defensive).
+  expect(renderDeadLetterPill(Number.POSITIVE_INFINITY)).toBe("");
+});
+
+test("colorizePillsInLine: dead-letter:<N> takes the warn bucket via prefix fallback", () => {
+  // fn-643.5: the `[dead-letter:N]` banner pill colors yellow alongside
+  // the other warn-bucket prefixes (`blocked:*` / `awaiting:*` /
+  // `task-repo:*`). The count payload is opaque to the colorizer.
+  expect(colorizePillsInLine("[dead-letter:1]")).toBe(
+    `[${WARN}dead-letter:1${RESET}]`,
+  );
+  expect(colorizePillsInLine("[dead-letter:42]")).toBe(
+    `[${WARN}dead-letter:42${RESET}]`,
+  );
 });
