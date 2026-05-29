@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-637-project-epic-deps-onto-epic-entities",
   "bundles": [],
   "closer_done_at": "2026-05-29T13:02:24.306874Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-29T13:02:24.306874Z"
+  "updated_at": "2026-05-29T13:02:37.397189Z"
 }
