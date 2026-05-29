@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  DEAD_LETTERS_DESCRIPTOR,
   EPICS_DESCRIPTOR,
   GIT_DESCRIPTOR,
   getCollection,
@@ -973,5 +974,71 @@ test("selectVersionsByIds: never selects JSON columns (no decodeRow path; cheap 
   // typeof guard — the Map<string, number | null> shape is preserved even
   // when adjacent columns carry JSON-TEXT content.
   expect(typeof map.get("fn-1")).toBe("number");
+  db.close();
+});
+
+test("DEAD_LETTERS_DESCRIPTOR: descriptor shape and registry registration (fn-643)", () => {
+  expect(getCollection("dead_letters")).toBe(DEAD_LETTERS_DESCRIPTOR);
+  expect(DEAD_LETTERS_DESCRIPTOR.table).toBe("dead_letters");
+  expect(DEAD_LETTERS_DESCRIPTOR.pk).toBe("dl_id");
+  expect(DEAD_LETTERS_DESCRIPTOR.version).toBe("dl_written_at");
+  expect(DEAD_LETTERS_DESCRIPTOR.defaultSort).toEqual({
+    column: "dl_written_at",
+    dir: "asc",
+  });
+  // defaultFilter scopes to `waiting` so the board warn-count tracks backlog.
+  expect(DEAD_LETTERS_DESCRIPTOR.defaultFilter).toEqual({ status: "waiting" });
+  // bindings is the only JSON column.
+  expect(DEAD_LETTERS_DESCRIPTOR.jsonColumns.has("bindings")).toBe(true);
+  expect(DEAD_LETTERS_DESCRIPTOR.jsonColumns.size).toBe(1);
+  // All table columns are enumerated in the descriptor.
+  for (const col of [
+    "dl_id",
+    "session_id",
+    "hook_event",
+    "ts",
+    "dl_written_at",
+    "pid",
+    "bindings",
+    "status",
+    "recovered_at",
+    "replayed_event_id",
+    "source_file",
+  ]) {
+    expect(DEAD_LETTERS_DESCRIPTOR.columns).toContain(col);
+  }
+  // Filters include the key access paths.
+  expect(DEAD_LETTERS_DESCRIPTOR.filters.dl_id).toBe("dl_id");
+  expect(DEAD_LETTERS_DESCRIPTOR.filters.status).toBe("status");
+  expect(DEAD_LETTERS_DESCRIPTOR.filters.session_id).toBe("session_id");
+});
+
+test("dead_letters defaultFilter: recovered rows excluded from default runQuery page (fn-643)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  // Insert one waiting and one recovered row directly — no reducer path.
+  db.query(
+    `INSERT INTO dead_letters (dl_id, session_id, hook_event, ts, dl_written_at, bindings, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run("dl-wait-1", "sess-aaa", "SessionStart", 1000.0, 1001.0, "{}", "waiting");
+  db.query(
+    `INSERT INTO dead_letters (dl_id, session_id, hook_event, ts, dl_written_at, bindings, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run("dl-recv-1", "sess-bbb", "SessionStart", 1002.0, 1003.0, "{}", "recovered");
+  // Default query — no explicit filter — should see only the waiting row.
+  const res = asResult(
+    runQuery(db, 0, { type: "query", collection: "dead_letters" }),
+  );
+  expect(res.total).toBe(1);
+  expect(String(res.rows[0]?.dl_id)).toBe("dl-wait-1");
+  // An explicit status=recovered override surfaces the recovered row.
+  const res2 = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "dead_letters",
+      filter: { status: "recovered" },
+    }),
+  );
+  expect(res2.total).toBe(1);
+  expect(String(res2.rows[0]?.dl_id)).toBe("dl-recv-1");
   db.close();
 });

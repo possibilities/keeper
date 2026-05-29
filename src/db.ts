@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 36;
+export const SCHEMA_VERSION = 37;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -742,6 +742,102 @@ const CREATE_EPIC_DEP_EDGES_INDEXES = [
 ];
 
 /**
+ * Schema-v37 `dead_letters` OPERATIONAL sidecar table (fn-643) — one row per
+ * recovered hook-INSERT failure. NOT a reducer projection: this table is
+ * populated by the daemon's import path (task .3, scanning the per-pid NDJSON
+ * dead-letter files the hook writes when its `events` INSERT exhausts the
+ * bounded retry) and never folded from events. The whole point of the table
+ * is visibility into events that NEVER MADE IT into the event log — so a
+ * from-scratch re-fold (rewind cursor, `DELETE FROM jobs; DELETE FROM epics`)
+ * MUST NOT delete or touch `dead_letters`: the rows are the daemon's
+ * operational record of dropped hook events, orthogonal to the projection
+ * graph. The replay verb (task .4) is the only way a row transitions from
+ * `waiting` → `recovered`: it appends a plain real event built from the
+ * row's saved `bindings` and flips `status` + stamps `recovered_at` +
+ * `replayed_event_id` in ONE transaction, so the recovered event folds into
+ * the projection through the normal id-ordered drain.
+ *
+ * Field semantics:
+ * - `dl_id` (TEXT, PRIMARY KEY): the hook-generated UUID stamped on the
+ *   NDJSON record. The import path's idempotency key — a re-scan of a
+ *   `.ndjson` file that's already imported finds matching `dl_id`s and
+ *   short-circuits (`INSERT OR IGNORE`), so re-imports never duplicate a
+ *   row.
+ * - `session_id` (TEXT, NOT NULL): the Claude Code session id from the
+ *   dropped insert binding. Display + correlation against the board's
+ *   `jobs` rows.
+ * - `hook_event` (TEXT, NOT NULL): the dropped event's hook event name
+ *   (`SessionStart`, `UserPromptSubmit`, etc.) — useful at a glance for
+ *   the board's warn-count tooltip ("waiting: 1 SessionStart").
+ * - `ts` (REAL, NOT NULL): the dropped event's own unix-seconds timestamp,
+ *   preserved verbatim through the NDJSON record. The replay path
+ *   re-uses this `ts` on the appended real event so a re-fold lands the
+ *   recovered row at the correct historical position in the reducer's
+ *   `last_event_id`-ordered drain.
+ * - `dl_written_at` (REAL, NOT NULL): unix-seconds when the hook wrote
+ *   the NDJSON record. Distinct from `ts` — `ts` is the EVENT's wall
+ *   time; `dl_written_at` is the dead-letter file's write time, and the
+ *   "oldest waiting first" replay pick orders on it.
+ * - `pid` (INTEGER): the hook process pid (for debugging — the per-pid
+ *   NDJSON file naming aligns with this column).
+ * - `bindings` (TEXT, NOT NULL): the FULL insert-binding set the hook
+ *   would have run against `events` (all derived columns + the
+ *   SessionStart-scraped `spawn_name` / `start_time` / `config_dir`),
+ *   serialized as JSON. The replay path deserializes this back to bound
+ *   parameters and runs the same insert it would have run originally —
+ *   so the recovered event row is byte-identical to what the hook would
+ *   have produced (modulo the `id` SQLite assigns, which the replay path
+ *   captures into `replayed_event_id`).
+ * - `status` (TEXT, NOT NULL, DEFAULT 'waiting'): `waiting | recovered`.
+ *   The board reads `status='waiting'` for the warn count via the
+ *   collection descriptor's `defaultFilter` below. The replay flips
+ *   `waiting → recovered` inside the same `BEGIN IMMEDIATE` that appends
+ *   the real event; no other transitions.
+ * - `recovered_at` (REAL, nullable): unix-seconds when the replay flipped
+ *   the row. NULL while `status='waiting'`; both populate together on
+ *   replay.
+ * - `replayed_event_id` (INTEGER, nullable): the `events.id` of the
+ *   appended real event. NULL while `status='waiting'`; populates on
+ *   replay so the audit trail joins the dead-letter row back to the
+ *   recovered event.
+ * - `source_file` (TEXT, nullable): the per-pid NDJSON file path the row
+ *   was imported from (display + debugging — "this dead letter came from
+ *   this pid file"). Nullable so a future direct-RPC injection path
+ *   (out of scope here) doesn't need to fabricate a file name.
+ *
+ * Defaults match the zero-event-log projection: a fresh DB has zero
+ * `dead_letters` rows, and the table populates only from the daemon's
+ * import scan (task .3) — never from event-log folds.
+ */
+const CREATE_DEAD_LETTERS = `
+CREATE TABLE IF NOT EXISTS dead_letters (
+    dl_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    hook_event TEXT NOT NULL,
+    ts REAL NOT NULL,
+    dl_written_at REAL NOT NULL,
+    pid INTEGER,
+    bindings TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'waiting',
+    recovered_at REAL,
+    replayed_event_id INTEGER,
+    source_file TEXT
+)
+`;
+
+/**
+ * Schema-v37 index on `dead_letters` (fn-643). Serves the two access paths:
+ * (a) the board's warn-count "how many waiting dead letters" — a partial-index
+ * scan keyed by `status='waiting'`, and (b) the replay verb's "oldest waiting
+ * first" pick — sorted by `dl_written_at ASC`. The composite (status,
+ * dl_written_at) covers both, and SQLite's planner uses the leading
+ * `status` column for the equality narrowing.
+ */
+const CREATE_DEAD_LETTERS_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_dead_letters_status_written_at ON dead_letters(status, dl_written_at)",
+];
+
+/**
  * Schema-v31 `file_attributions` projection table — one row per
  * `(project_dir, session_id, file_path)` triple. Records the attribution claim
  * that this session has at least one mutation (tool or bash) on this file in
@@ -1379,6 +1475,10 @@ function migrate(db: Database): void {
     db.run(CREATE_PROFILES);
     db.run(CREATE_EPIC_DEP_EDGES);
     for (const sql of CREATE_EPIC_DEP_EDGES_INDEXES) {
+      db.run(sql);
+    }
+    db.run(CREATE_DEAD_LETTERS);
+    for (const sql of CREATE_DEAD_LETTERS_INDEXES) {
       db.run(sql);
     }
 
@@ -3517,6 +3617,34 @@ function migrate(db: Database): void {
         );
       }
     }
+
+    // v36→v37: fn-643 — `dead_letters` OPERATIONAL sidecar table for
+    // recovering hook events the daemon-side INSERT dropped (transient
+    // SQLITE_BUSY, schema-transition window during a deploy). Picked up
+    // unconditionally by the `CREATE TABLE IF NOT EXISTS CREATE_DEAD_LETTERS`
+    // in the bootstrap block above; this slot exists only for the version-
+    // bump stamp ordering. No data backfill — the table populates exclusively
+    // from the daemon's import scan against the per-pid NDJSON dead-letter
+    // files (task .3), and stays empty on a fresh DB / a steady-state v37
+    // re-open with no dropped events on disk.
+    //
+    // The table is NOT a reducer projection — it is the daemon's operational
+    // record of events that NEVER MADE IT into the event log. The from-
+    // scratch re-fold reset path (`UPDATE reducer_state SET last_event_id =
+    // 0; DELETE FROM jobs; DELETE FROM epics`, see the v10→v11 slot above
+    // and any future rewind-and-redrain step) MUST NOT delete or touch
+    // `dead_letters`: re-folding the event log reproduces the projections
+    // byte-deterministically, but it cannot reproduce rows for events that
+    // were never appended in the first place. The replay verb (task .4) is
+    // the only way a `waiting` row transitions to `recovered`: it appends a
+    // plain real event (using the row's preserved `bindings` + `ts`) and
+    // flips `status`/stamps `recovered_at`/stamps `replayed_event_id` in
+    // ONE `BEGIN IMMEDIATE` — the recovered event then folds through the
+    // normal id-ordered drain. Re-fold determinism is preserved on the
+    // event-log side; the dead-letter sidecar is the daemon's separate
+    // audit log of what was never folded until the human recovered it.
+    //
+    // See `CREATE_DEAD_LETTERS` above for the column docstring.
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

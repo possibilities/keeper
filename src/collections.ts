@@ -510,11 +510,86 @@ export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
+ * The `dead_letters` descriptor (schema v37, fn-643) — one row per dropped
+ * hook-INSERT recovered by the daemon's import path. NOT a reducer
+ * projection: rows arrive via the daemon scanning per-pid NDJSON files the
+ * hook wrote when its `events` INSERT exhausted the bounded retry (see
+ * `CREATE_DEAD_LETTERS` in `src/db.ts`). The collection's purpose is the
+ * board's persistent yellow warn-count + the replay verb's "oldest waiting
+ * first" pick.
+ *
+ * `defaultFilter: { status: 'waiting' }` scopes the default page to the
+ * unrecovered backlog — a board with no wire filter shows the live count
+ * and the replay action targets the same set. Recovered rows still exist
+ * (the row is the audit trail joining the dead-letter UUID back to the
+ * `replayed_event_id`), but they fall off the default page; a client can
+ * still subscribe to recovered rows by asking explicitly
+ * (`filter:{ status: "recovered" }`) or to the union via `not_in: []`.
+ *
+ * `pk: 'dl_id'` (the hook-generated UUID, the import-path idempotency key);
+ * `version: 'dl_written_at'` so the wire diff fires when a new dead-letter
+ * lands (the column is monotonic at the per-pid file level). The replay
+ * transition (`waiting → recovered`) does NOT bump `dl_written_at` — it
+ * stamps `recovered_at` instead. Both states are read-visible; the
+ * `defaultFilter` is what hides recovered rows on the default page, NOT a
+ * version-column trick.
+ *
+ * `defaultSort: { dl_written_at, asc }` matches the replay's "oldest
+ * waiting first" pick. `filters` carries the pk + `status` so the board
+ * narrows to one row on detail subscribe and a client can page recovered
+ * rows explicitly. `bindings` is JSON-TEXT — decoded at the read boundary
+ * so the wire serves a real object, not a stringified one (parity with
+ * `epics.tasks`, `git.dirty_files`).
+ */
+export const DEAD_LETTERS_DESCRIPTOR: CollectionDescriptor = {
+  name: "dead_letters",
+  table: "dead_letters",
+  columns: [
+    "dl_id",
+    "session_id",
+    "hook_event",
+    "ts",
+    "dl_written_at",
+    "pid",
+    "bindings",
+    "status",
+    "recovered_at",
+    "replayed_event_id",
+    "source_file",
+  ],
+  pk: "dl_id",
+  version: "dl_written_at",
+  sortable: new Set([
+    "dl_written_at",
+    "ts",
+    "recovered_at",
+    "hook_event",
+    "session_id",
+  ]),
+  defaultSort: { column: "dl_written_at", dir: "asc" },
+  filters: {
+    dl_id: "dl_id",
+    status: "status",
+    session_id: "session_id",
+    hook_event: "hook_event",
+  },
+  // Default scope: hide already-recovered rows so the board's warn-count
+  // tracks the live backlog. An explicit wire filter on `status` overrides
+  // (e.g. `--status recovered` pages the audit trail; the union via
+  // `{not_in: []}` shows both). A pk subscribe (detail page on one
+  // `dl_id`) is exempt from defaults — the row resolves regardless of
+  // status.
+  defaultFilter: { status: "waiting" },
+  jsonColumns: new Set(["bindings"]),
+};
+
+/**
  * The registry, keyed by wire-facing collection name. `jobs` + the `epics`
  * plan collection (which embeds its tasks + plan/close-verb jobs as JSON-array
  * columns — the standalone `tasks` collection was dropped in schema v7 — and
  * carries `approval` as a real column as of schema v13) + `git` + the
- * `subagent_invocations` per-job Agent-timeline projection (schema v17).
+ * `subagent_invocations` per-job Agent-timeline projection (schema v17) +
+ * the `dead_letters` operational sidecar (schema v37, fn-643).
  */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
@@ -523,6 +598,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [SUBAGENT_INVOCATIONS_DESCRIPTOR.name, SUBAGENT_INVOCATIONS_DESCRIPTOR],
   [USAGE_DESCRIPTOR.name, USAGE_DESCRIPTOR],
   [PROFILES_DESCRIPTOR.name, PROFILES_DESCRIPTOR],
+  [DEAD_LETTERS_DESCRIPTOR.name, DEAD_LETTERS_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

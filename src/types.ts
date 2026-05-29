@@ -502,6 +502,103 @@ export interface ReducerState {
 }
 
 /**
+ * One row of the `dead_letters` OPERATIONAL sidecar (schema v37, fn-643).
+ * Mirrors the `CREATE_DEAD_LETTERS` shape in `src/db.ts` column-for-column;
+ * the `bindings` field is JSON-TEXT on the SQLite layer but decoded to a
+ * real {@link DeadLetterBindings} object at the read boundary by the
+ * collection's `jsonColumns: new Set(["bindings"])` entry in
+ * `src/collections.ts` (`DEAD_LETTERS_DESCRIPTOR`).
+ *
+ * NOT a reducer projection: rows arrive via the daemon's import scan over
+ * the per-pid NDJSON dead-letter files the hook writes when its `events`
+ * INSERT exhausts the bounded retry. The whole point of the table is
+ * visibility into events that NEVER MADE IT into the event log, so a
+ * from-scratch re-fold (rewind cursor + DELETE projections) MUST NOT
+ * touch `dead_letters` — the rows are the daemon's operational record of
+ * dropped hook events, orthogonal to the projection graph.
+ *
+ * The {@link status} transition `waiting → recovered` happens only inside
+ * the replay verb (task .4), which appends a real `events` row built from
+ * the saved {@link bindings} and flips this row to `recovered` while
+ * stamping {@link recovered_at} + {@link replayed_event_id} in ONE
+ * `BEGIN IMMEDIATE`. No other transitions.
+ */
+export interface DeadLetter {
+  /**
+   * Hook-generated UUID stamped on the NDJSON record — the import path's
+   * idempotency key (`INSERT OR IGNORE` on this column), so a re-scan of an
+   * already-imported `.ndjson` file never duplicates a row.
+   */
+  dl_id: string;
+  /**
+   * Claude Code session id from the dropped insert binding — for display +
+   * correlation against the board's `jobs` rows.
+   */
+  session_id: string;
+  /**
+   * The dropped event's hook event name (`SessionStart`, `UserPromptSubmit`,
+   * etc.). Useful for the board's warn-count tooltip ("waiting: 1
+   * SessionStart").
+   */
+  hook_event: string;
+  /**
+   * The dropped event's own unix-seconds timestamp, preserved verbatim
+   * through the NDJSON record. The replay path re-uses this `ts` on the
+   * appended real event so a re-fold lands the recovered row at the
+   * correct historical position.
+   */
+  ts: number;
+  /**
+   * Unix-seconds when the hook wrote the NDJSON record. Distinct from
+   * {@link ts} — the latter is the EVENT's wall time, this is the dead-
+   * letter file's write time. The "oldest waiting first" replay pick
+   * orders on this column.
+   */
+  dl_written_at: number;
+  /**
+   * Hook process pid (debugging — aligns with the per-pid NDJSON file
+   * naming). Nullable: the hook may not have learned its own pid in
+   * exotic cases.
+   */
+  pid: number | null;
+  /**
+   * Full insert-binding set the hook would have run against `events`,
+   * including the SessionStart-only scraped `spawn_name` / `start_time` /
+   * `config_dir`. Stored as JSON-TEXT in SQLite and decoded to the real
+   * object at the read boundary; the replay path deserializes this back
+   * to bound parameters and runs the same insert.
+   */
+  bindings: Record<string, string | number | boolean | null>;
+  /**
+   * `'waiting'` until the replay verb flips the row to `'recovered'` (the
+   * only transition). The collection descriptor's `defaultFilter:
+   * { status: 'waiting' }` scopes the default page to the unrecovered
+   * backlog so the board's warn-count tracks the live "things to fix"
+   * count, while recovered rows remain queryable via an explicit
+   * `filter: { status: 'recovered' }`.
+   */
+  status: "waiting" | "recovered";
+  /**
+   * Unix-seconds when the replay flipped this row. NULL while
+   * {@link status} is `'waiting'`; both fields populate together on
+   * replay.
+   */
+  recovered_at: number | null;
+  /**
+   * `events.id` of the appended real event on replay — the audit trail
+   * joining this dead-letter row back to the recovered event. NULL while
+   * {@link status} is `'waiting'`.
+   */
+  replayed_event_id: number | null;
+  /**
+   * Per-pid NDJSON file path the row was imported from (debugging — "this
+   * dead letter came from this pid file"). Nullable so a future direct-
+   * RPC injection path doesn't need to fabricate a file name.
+   */
+  source_file: string | null;
+}
+
+/**
  * The display projection of a `jobs` row embedded inside an `epics` row's
  * `jobs` array (epic-form ref: verbs `plan` / `close` / `approve`) or inside
  * a task element's `jobs` sub-array (task-form ref: verbs `work` /
