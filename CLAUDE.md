@@ -158,6 +158,14 @@ the native value" is the default.
   the event payload's `(pid, start_time)` against the persisted row only.
   A liveness re-probe inside a fold would break re-fold determinism (a
   from-scratch re-fold would see different OS state than the original run).
+  The same rule scopes the Stop fold's bounded sub-agent guard
+  (`MAX_STOP_YIELD_GAP_SEC`, fn-638.1): the staleness check compares the
+  Stop event's own `ts` against the surviving running sub-agent row's `ts`
+  (both unix-SECONDS, from the immutable event log via
+  `subagent_invocations`) against a compile-time constant — NEVER
+  `Date.now()`, NEVER a config / `meta`-row source. A fold-time comparison
+  rooted in the event's own `ts` is the determinism boundary; any OS-clock
+  read inside a fold would re-fold differently.
 - **PRAGMAs are connection-local** — `applyPragmas` runs on every `openDb`,
   including each worker's read-only connection and the hook's fresh per-invocation
   connection. Without `busy_timeout` a connection defaults to 0 and contention

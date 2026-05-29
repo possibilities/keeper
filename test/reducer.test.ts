@@ -2653,8 +2653,13 @@ test("Stop guard still blocks when the only `running` row is NOT collapse-eligib
   // turn_seq exists for the same (job_id, subagent_type). This is the
   // normal mid-yield case (single in-flight sub-agent of its type),
   // preserved as a guard-rail against an overzealous filter.
-  insertEvent({ hook_event: "SessionStart" });
-  insertEvent({ hook_event: "UserPromptSubmit" });
+  //
+  // fn-638.1: ts values pinned explicitly so the surviving running row
+  // sits well within `MAX_STOP_YIELD_GAP_SEC` of the Stop event's ts —
+  // this test pins the "mid-yield with a single in-flight sub" branch,
+  // not the bounded-recency release (covered separately below).
+  insertEvent({ hook_event: "SessionStart", ts: 50_000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 50_001 });
   db.run(
     `INSERT INTO subagent_invocations
        (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
@@ -2664,7 +2669,7 @@ test("Stop guard still blocks when the only `running` row is NOT collapse-eligib
       "sess-a",
       "solo-agent",
       0,
-      1_000,
+      50_002,
       null,
       "plan:worker-high",
       null,
@@ -2672,10 +2677,10 @@ test("Stop guard still blocks when the only `running` row is NOT collapse-eligib
       "running",
       null,
       0,
-      1_000,
+      50_002,
     ],
   );
-  insertEvent({ hook_event: "Stop" });
+  insertEvent({ hook_event: "Stop", ts: 50_003 });
   drainAll();
   expect(getJob()?.state).toBe("working");
 });
@@ -2754,6 +2759,230 @@ test("from-scratch re-fold of a sub-agent yield sequence is byte-deterministic",
   insertEvent({ hook_event: "SubagentStop", agent_id: "sub-rf" });
   insertEvent({ hook_event: "UserPromptSubmit" });
   insertEvent({ hook_event: "Stop" });
+  drainAll();
+  const firstJob = getJob();
+  expect(firstJob?.state).toBe("stopped");
+
+  // Rewind cursor + wipe projections, then re-drain the same event log.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM subagent_invocations");
+  drainAll();
+  const reJob = getJob();
+  expect(reJob?.state).toBe("stopped");
+  expect(reJob?.last_event_id).toBe(firstJob?.last_event_id);
+});
+
+// ---------------------------------------------------------------------------
+// fn-638.1: bounded-recency release of a stuck sub-agent Stop guard.
+//
+// Closes problem-3: an orphan SubagentStart that never emits SubagentStop
+// would pin its parent at `state='working'` until the window closed, because
+// the sub-agent guard's `subRunning` query swallowed every Stop indefinitely.
+// The bound: when the newest surviving running sub-agent's `ts` is older than
+// `MAX_STOP_YIELD_GAP_SEC` (120s) relative to the Stop event's `ts`, the
+// guard releases — Stop writes `state='stopped'` and fan-out runs normally.
+// All timestamps are unix-SECONDS (same unit as events / subagent_invocations).
+// ---------------------------------------------------------------------------
+
+test("bounded Stop guard: stale orphan sub-agent (age > bound) releases to stopped", () => {
+  // A SubagentStart that never got its SubagentStop, much older than the
+  // Stop event's ts. Before fn-638.1 this stayed 'working' forever; now the
+  // bound trips and the Stop writes 'stopped'.
+  insertEvent({ hook_event: "SessionStart", ts: 10_000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 10_001 });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-orphan",
+    agent_type: "Explore",
+    ts: 10_002,
+  });
+  // Stop lands well past the 120s bound — the orphan is treated as a
+  // dropped SubagentStop and the gate releases.
+  insertEvent({ hook_event: "Stop", ts: 10_500 });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+});
+
+test("bounded Stop guard: fresh sub-agent (age <= bound) still swallows Stop", () => {
+  // A legitimately in-flight sub-agent — the parent yielded recently, the
+  // sub is still working. The Stop within the bound MUST still be a no-op
+  // on state, otherwise readiness predicate 5 clears prematurely and
+  // predicate 7 dup-fires `job-pending`.
+  insertEvent({ hook_event: "SessionStart", ts: 10_000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 10_001 });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-live",
+    agent_type: "Explore",
+    ts: 10_002,
+  });
+  // Stop 60s after sub start — within the 120s bound, guard holds.
+  insertEvent({ hook_event: "Stop", ts: 10_062 });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+});
+
+test("bounded Stop guard: boundary exactly at MAX_STOP_YIELD_GAP_SEC keeps swallowing", () => {
+  // The release branch is `age > MAX_STOP_YIELD_GAP_SEC` (strict). At the
+  // boundary the guard still swallows — gives clock-skew and same-second
+  // wiggle room on the "still in-flight" side. Belt-and-suspenders against
+  // the "negative/zero age" risk listed in the task spec.
+  insertEvent({ hook_event: "SessionStart", ts: 10_000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 10_001 });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-edge",
+    agent_type: "Explore",
+    ts: 10_002,
+  });
+  // Stop exactly 120s after sub start.
+  insertEvent({ hook_event: "Stop", ts: 10_122 });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+});
+
+test("bounded Stop guard: NULL ts on a running row keeps swallowing (safe branch)", () => {
+  // Legacy/malformed `subagent_invocations` row with NULL ts — the bound
+  // cannot honestly compute an age, so the guard conservatively keeps
+  // swallowing (treat as not-stuck, never throw). Spec edge case.
+  // bun:sqlite rejects a literal NULL on a `NOT NULL REAL` column, so we
+  // instead simulate the "we can't trust this ts" branch with a 0 sentinel
+  // — the reducer's `rowTs == null || rowTs <= 0` guard treats both the
+  // same way.
+  insertEvent({ hook_event: "SessionStart", ts: 10_000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 10_001 });
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "sess-a",
+      "agent-zero-ts",
+      0,
+      0, // sentinel: cannot honestly age this row
+      null,
+      "plan:worker-high",
+      null,
+      0,
+      "running",
+      null,
+      0,
+      1_000,
+    ],
+  );
+  // Stop arrives at a normal far-future ts — without the safe-branch
+  // guard, `age = 10_500 - 0 = 10_500 > 120` would release prematurely.
+  insertEvent({ hook_event: "Stop", ts: 10_500 });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+});
+
+test("bounded Stop guard: negative age (event ts < row ts) keeps swallowing", () => {
+  // Clock skew / out-of-order ts ordering — `age = event.ts - row.ts` goes
+  // negative. The strict `age > bound` check naturally rejects this, but
+  // we pin the behavior with an explicit test so a future refactor that
+  // takes `Math.abs(age)` would fail loudly.
+  insertEvent({ hook_event: "SessionStart", ts: 10_000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 10_001 });
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "sess-a",
+      "agent-future-ts",
+      0,
+      50_000, // future ts vs. the Stop below
+      null,
+      "plan:worker-high",
+      null,
+      0,
+      "running",
+      null,
+      0,
+      50_000,
+    ],
+  );
+  insertEvent({ hook_event: "Stop", ts: 10_500 });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+});
+
+test("bounded Stop guard: anchors on newest surviving running row, not the demoted orphan", () => {
+  // Two same-name running rows: an OLD turn_seq=0 (the would-be orphan, but
+  // collapsed away by the higher-turn_seq sibling) and a FRESH turn_seq=1
+  // (the surviving max). The existing same-name `turn_seq` collapse filters
+  // the old row out of the candidate set; the recency check must measure
+  // against the SURVIVING row's ts — so the Stop within the bound is still
+  // swallowed. Anchoring on the demoted orphan would release prematurely.
+  insertEvent({ hook_event: "SessionStart", ts: 10_000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 10_001 });
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "sess-a",
+      "agent-old",
+      0,
+      9_000, // ancient — well beyond the bound on its own
+      null,
+      "plan:worker-high",
+      null,
+      0,
+      "running",
+      null,
+      0,
+      9_000,
+    ],
+  );
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "sess-a",
+      "agent-new",
+      1,
+      10_050, // fresh — within the bound vs. the Stop at 10_060
+      null,
+      "plan:worker-high",
+      null,
+      0,
+      "running",
+      null,
+      0,
+      10_050,
+    ],
+  );
+  insertEvent({ hook_event: "Stop", ts: 10_060 });
+  drainAll();
+  // If the recency check measured against agent-old (ts=9_000), age=1_060
+  // would release. The collapse filter must drop agent-old first and the
+  // check must read agent-new's ts (10_050), so age=10 < bound → swallow.
+  expect(getJob()?.state).toBe("working");
+});
+
+test("bounded Stop guard: from-scratch re-fold of a bounded release is byte-deterministic", () => {
+  // The recency comparison is `event.ts - row.ts` against a compile-time
+  // constant — pure function of the event log. A from-scratch re-fold
+  // (rewind cursor, wipe projections, re-drain) must reproduce the same
+  // final state AND the same `last_event_id` stamp. Closes the "no
+  // Date.now() in the fold" acceptance bullet operationally.
+  insertEvent({ hook_event: "SessionStart", ts: 10_000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 10_001 });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-rf-stale",
+    agent_type: "Explore",
+    ts: 10_002,
+  });
+  insertEvent({ hook_event: "Stop", ts: 10_500 }); // far past 120s bound
   drainAll();
   const firstJob = getJob();
   expect(firstJob?.state).toBe("stopped");

@@ -178,6 +178,47 @@ const ENDED = "ended";
 const KILLED = "killed";
 
 /**
+ * Recency bound (unix-SECONDS) for the Stop fold's sub-agent guard. A one-shot
+ * orphan sub-agent that never emits `SubagentStop` (sub crashed, hook timed
+ * out, hook write lost to the "hook always exits 0" contract) would otherwise
+ * pin its parent job at `state='working'` forever — the Stop guard's
+ * `subRunning` query would keep finding the surviving running row, swallow
+ * every subsequent Stop, and hold the per-root/per-epic autopilot mutex open
+ * until a human closes the window. Until now `sweepRunningSubagentsToUnknown`
+ * was the sole orphan resolver and ran ONLY on SessionEnd/Killed.
+ *
+ * The bound: if the newest surviving `running` sub-agent's `ts` (the same row
+ * the existing max-`turn_seq` collapse query already returns) is older than
+ * this many seconds relative to the Stop event's `ts`, the guard releases —
+ * the Stop fold writes `state='stopped'` and re-fans the embedded plan
+ * entries normally (`syncIfPlanRef` / `syncJobLinksOnJobWrite`).
+ *
+ * Both `events.ts` and `subagent_invocations.ts` are REAL unix-SECONDS
+ * (`db.ts:399-413`, and the `(event.ts - row.ts) * 1000` ms convention at
+ * `applySubagentInvocations`). The age comparison is in seconds — multiplying
+ * by 1000 would be a 1000x bug.
+ *
+ * Pure function of the event log: the comparison is `event.ts - row.ts`
+ * against a compile-time constant — no `Date.now()`, no config, no
+ * `meta`-row source. Re-fold determinism holds (CLAUDE.md "Producer-only
+ * liveness probing": fold-time comparisons against an event's own `ts` are
+ * safe; OS-clock reads inside the fold are banned).
+ *
+ * Tradeoffs of the chosen value:
+ *
+ * - Too large → a real stuck sub-agent holds the mutex longer than necessary
+ *   before autopilot can redispatch.
+ * - Too small → a legitimately slow in-flight sub-agent flashes `stopped`
+ *   prematurely; readiness predicate 5 clears for a tick and predicate 7
+ *   spuriously fires `job-pending` (autopilot's approval-notify can dup).
+ *
+ * 120s sits well above the p99 sub-agent latency observed in keeper's own
+ * traces while keeping the wedge window short enough that an orphaned worker
+ * doesn't sit "working" for a full Claude Code session window.
+ */
+const MAX_STOP_YIELD_GAP_SEC = 120;
+
+/**
  * Validate an event's `data.kind` against the {@link ApiErrorKind} union.
  * Anything not in the canonical allow-list — including missing /
  * non-string / unrecognized values like the SDK's own `"unknown"` —
@@ -3754,9 +3795,18 @@ function projectJobsRow(db: Database, event: Event): void {
       // Re-fold determinism: subagent_invocations reflects every SubagentStart
       // / SubagentStop folded with id < event.id (sequential fold), so the
       // running-check is a pure function of the event log up to this point.
+      //
+      // Recency bound (fn-638.1): anchor the staleness check on the SURVIVING
+      // running row (max `turn_seq` per same-name group) — measured against
+      // the newest running `ts`, never a demoted orphan. Return that `ts` from
+      // the same query so the JS-side comparison reads the exact row the
+      // collapse rule already chose to honor. ORDER BY ts DESC ensures
+      // multiple concurrent in-flight sub-agents pick the newest start (a
+      // single slow-but-real sub keeps the guard armed; we only release once
+      // even the freshest survivor crosses the bound).
       const subRunning = db
         .query(
-          `SELECT 1 FROM subagent_invocations s1
+          `SELECT s1.ts AS ts FROM subagent_invocations s1
             WHERE s1.job_id = ?
               AND s1.status = 'running'
               AND NOT EXISTS (
@@ -3764,11 +3814,35 @@ function projectJobsRow(db: Database, event: Event): void {
                  WHERE s2.job_id = s1.job_id
                    AND s2.subagent_type IS s1.subagent_type
                    AND s2.turn_seq > s1.turn_seq
-              ) LIMIT 1`,
+              )
+            ORDER BY s1.ts DESC
+            LIMIT 1`,
         )
-        .get(jobId);
+        .get(jobId) as { ts: number | null } | null;
       if (subRunning != null) {
-        break;
+        // Edge cases (CLAUDE.md "never throw inside the fold"):
+        // - NULL `ts` on a legacy/malformed running row → conservatively
+        //   treat as not-stuck (keep swallowing) to avoid a premature
+        //   release on a row whose age we cannot honestly compute.
+        // - Negative / zero `age` (clock skew, same-second events,
+        //   re-fold replays) → keep swallowing; the bound only releases
+        //   once `age` STRICTLY exceeds `MAX_STOP_YIELD_GAP_SEC`.
+        const rowTs = subRunning.ts;
+        if (rowTs == null || rowTs <= 0) {
+          break;
+        }
+        const age = event.ts - rowTs;
+        if (age <= MAX_STOP_YIELD_GAP_SEC) {
+          break;
+        }
+        // Fall through: the newest surviving running sub-agent is older
+        // than the bound — treat as an orphan whose `SubagentStop` never
+        // landed, release the Stop gate. The UPDATE below writes
+        // `state='stopped'` and the standard `syncIfPlanRef` fan-out runs
+        // (which in turn re-stamps every linked epic via
+        // `syncJobLinksOnJobWrite`, so the state flip propagates to the
+        // `epics.job_links` projection symmetrically with the normal
+        // mid-sub-completed Stop path).
       }
       const res = db.run(
         `UPDATE jobs SET state = 'stopped', last_event_id = ?, updated_at = ?
