@@ -50,5 +50,5 @@ end to end.
 - [ ] `bun test` green; end-to-end replay manually verified.
 
 ## Done summary
-
+Cross-cutting docs land: README adds dead_letters as 7th collection, replay_dead_letter RPC, schema-v37 narrative, seventh-worker block, board pill + replay keypress, and sqlite inspect queries. CLAUDE.md adds dead-letter import/replay arms to the event-sourcing invariants, the hook NDJSON sidecar + main-sole-writer-of-dead_letters clauses, migrations bumped to v37, replay_dead_letter added to the DO-NOT RPC enumeration, and the 'approval is RPC-writable' bullet revised to cover the delayed-real-event surface with the dead_letters re-fold exclusion. AGENTS.md symlink intact. bun test green (6 pre-existing live-shell.test.ts failures unrelated to this task — confirmed identical on clean main).
 ## Evidence
