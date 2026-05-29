@@ -399,6 +399,39 @@ function writeDeadLetter(record: DeadLetterRecord): void {
   }
 }
 
+/**
+ * Hook-local `busy_timeout` (ms). Lower than the shared 5s `applyPragmas`
+ * value because the hook lives inside Claude's SessionEnd 1.5s budget. Named
+ * so the diagnostic drop-log can report the value the hook actually waited on.
+ */
+const HOOK_BUSY_TIMEOUT_MS = 1200;
+
+/**
+ * Diagnostic drop-log path. One NDJSON line per dead-lettered INSERT —
+ * SEPARATE from the dead-letter recovery records (those drive replay; this is
+ * pure instrumentation to attribute drop bursts: error code, attempts, wait).
+ * Append-only, never consumed. `KEEPER_DROP_LOG` overrides for tests.
+ */
+function dropLogPath(): string {
+  const env = process.env.KEEPER_DROP_LOG;
+  if (env != null && env.length > 0) return env;
+  return join(homedir(), ".local", "state", "keeper", "hook-drops.ndjson");
+}
+
+/**
+ * Best-effort append of one diagnostic line to the drop-log. Mirrors
+ * {@link writeDeadLetter}'s swallow-everything contract: instrumentation must
+ * NEVER affect the hook's exit-0 outcome. A single small (<512 B) append is
+ * atomic per `write(2)`, so concurrent same/cross-pid hooks don't tear lines.
+ */
+function writeDropLog(line: string): void {
+  try {
+    appendFileSync(dropLogPath(), line, { mode: 0o600 });
+  } catch (err) {
+    process.stderr.write(`keeper events-writer: drop-log failed: ${err}\n`);
+  }
+}
+
 async function main(): Promise<void> {
   const raw = await readStdin();
   const data = JSON.parse(raw) as Record<string, unknown>;
@@ -586,7 +619,10 @@ async function main(): Promise<void> {
   // INSERT. Inline (not an outer helper) so it closes over the resolved
   // bindings and the SessionStart-scraped fields without re-plumbing them
   // through a long argument list.
-  const deadLetter = (lastError: unknown): void => {
+  const deadLetter = (
+    lastError: unknown,
+    diag?: { attempts: number; wait_ms: number },
+  ): void => {
     // Bare-column bindings (strip the `$` prefix the prepared-statement
     // uses) so the daemon-side import (task .3) can map it 1:1 to the
     // `events` columns on a future replay.
@@ -605,6 +641,33 @@ async function main(): Promise<void> {
       bindings,
     };
     writeDeadLetter(record);
+    // Diagnostic drop-log (instrumentation, SEPARATE from the recovery record
+    // above): capture WHY the INSERT failed and how long the hook waited, so
+    // drop bursts can be attributed to a cause (SQLITE_BUSY contention vs
+    // schema-mismatch vs other) and time-correlated with the daemon's
+    // `[fold-slow]` trace. Best-effort — never affects the hook outcome.
+    try {
+      const e = lastError as { code?: unknown; message?: unknown } | null;
+      writeDropLog(
+        `${JSON.stringify({
+          ts: Date.now() / 1000,
+          hook_event: hookEvent,
+          session_id: sessionId,
+          pid,
+          phase: diag != null ? "insert" : "open",
+          error_code: typeof e?.code === "string" ? e.code : null,
+          error_message: (typeof e?.message === "string"
+            ? e.message
+            : String(lastError)
+          ).slice(0, 300),
+          attempts: diag?.attempts ?? 0,
+          wait_ms: diag?.wait_ms ?? 0,
+          busy_timeout_ms: HOOK_BUSY_TIMEOUT_MS,
+        })}\n`,
+      );
+    } catch {
+      // instrumentation is best-effort; never affect the hook outcome
+    }
     // Surface the underlying cause to stderr too — useful in
     // `claude --debug` output for diagnosing recurring drops.
     process.stderr.write(
@@ -635,7 +698,7 @@ async function main(): Promise<void> {
     // routinely blow it. ~1200ms gives the writer one full
     // checkpoint/commit window to clear, after which retry+dead-letter
     // takes over. Connection-local — does NOT affect the daemon/workers.
-    db.run("PRAGMA busy_timeout = 1200");
+    db.run(`PRAGMA busy_timeout = ${HOOK_BUSY_TIMEOUT_MS}`);
 
     // BEGIN IMMEDIATE avoids the lock-upgrade SQLITE_BUSY path: a plain BEGIN
     // would start read-only and need to upgrade to write on INSERT, which
@@ -658,9 +721,12 @@ async function main(): Promise<void> {
       stmts.insertEvent.run(insertBindings);
     });
 
+    const insertStartedAt = Date.now();
     let lastError: unknown = null;
     let succeeded = false;
+    let attemptsMade = 0;
     for (let attempt = 0; attempt < 2; attempt++) {
+      attemptsMade = attempt + 1;
       try {
         insert();
         succeeded = true;
@@ -676,7 +742,10 @@ async function main(): Promise<void> {
     }
 
     if (!succeeded) {
-      deadLetter(lastError);
+      deadLetter(lastError, {
+        attempts: attemptsMade,
+        wait_ms: Date.now() - insertStartedAt,
+      });
     }
   } finally {
     db.close();

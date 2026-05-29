@@ -5064,6 +5064,15 @@ export function applyEvent(
  * is guarded inside {@link extractPermissionMode} (skip-and-log), so one
  * malformed row never halts the reducer.
  */
+/**
+ * A single-event fold over this many ms logs a `[fold-slow]` diagnostic line.
+ * A slow fold holds the `BEGIN IMMEDIATE` write lock that long, starving
+ * concurrent hook INSERTs and producing dead-letter bursts — the threshold is
+ * the gate (only outliers log, so steady-state is silent). Instrumentation
+ * only; not part of any projection.
+ */
+const SLOW_FOLD_LOG_MS = 200;
+
 export function drain(db: Database, batchSize = DEFAULT_BATCH_SIZE): number {
   const cursorRow = db
     .query("SELECT last_event_id FROM reducer_state WHERE id = 1")
@@ -5086,7 +5095,20 @@ export function drain(db: Database, batchSize = DEFAULT_BATCH_SIZE): number {
     .all(cursor, batchSize) as Event[];
 
   for (const row of rows) {
+    const foldStart = performance.now();
     applyEvent(db, row);
+    const foldMs = performance.now() - foldStart;
+    if (foldMs >= SLOW_FOLD_LOG_MS) {
+      // Instrumentation: this fold held the `BEGIN IMMEDIATE` write lock for
+      // `foldMs`, starving any concurrent hook INSERT (→ dead-letter bursts).
+      // Logs the event identity so the cause is attributable and time-
+      // correlatable with the hook drop-log. Pure side-effect: the projection
+      // write inside `applyEvent` is unchanged, so re-fold determinism holds
+      // (the wall-clock read is not an input to any projection).
+      console.error(
+        `[fold-slow] id=${row.id} event=${row.hook_event ?? "?"} type=${row.event_type ?? "?"} dur=${Math.round(foldMs)}ms`,
+      );
+    }
   }
 
   return rows.length;
