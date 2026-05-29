@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 34;
+export const SCHEMA_VERSION = 35;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -578,6 +578,25 @@ CREATE TABLE IF NOT EXISTS git_status (
  * cycle produces zero events and zero projection churn. Future contributors:
  * do NOT add a freshness column here without re-reading the freshness-
  * exclusion discipline notes in `src/usage-worker.ts` (load-bearing).
+ *
+ * **Schema v35 (fn-642): colocated rate-limit columns.** `last_rate_limit_at`
+ * + `last_rate_limit_session_id` mirror the matching `profiles` row so a
+ * single `usage` subscribe carries the rate-limit annotation — `scripts/usage.ts`
+ * collapses to a one-collection client. The join key is the derived
+ * `profile_name = projectBasename(jobs.config_dir)` (the on-disk profile
+ * directory's basename — agentuse and keeper agreed on this in agentuse
+ * fd283d1), maintained on the `profiles` side and joined in via the
+ * bidirectional reducer fan-out. The UsageSnapshot payload does NOT carry
+ * these fields; they are populated server-side from `profiles`.
+ *
+ * Both columns are nullable: a usage row whose matching profile has not yet
+ * hit a rate-limit (the steady state) reads NULL on both, and a `''`-sentinel
+ * profile (default `~/.claude`, basename `""`) never joins by design. They
+ * are carved out of the `projectUsageRow` `ON CONFLICT(id) DO UPDATE SET`
+ * clause — a `UsageSnapshot` re-fold must NOT clobber the rate-limit
+ * annotation a prior `RateLimited` fan-out wrote (mirrors the
+ * `EpicSnapshot` carve-out for `tasks` / `jobs` / `job_links` /
+ * `resolved_epic_deps`).
  */
 const CREATE_USAGE = `
 CREATE TABLE IF NOT EXISTS usage (
@@ -590,6 +609,8 @@ CREATE TABLE IF NOT EXISTS usage (
     week_resets_at TEXT,
     sonnet_week_percent REAL,
     sonnet_week_resets_at TEXT,
+    last_rate_limit_at REAL,
+    last_rate_limit_session_id TEXT,
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0
 )
@@ -626,6 +647,16 @@ CREATE TABLE IF NOT EXISTS usage (
  *   distinct, so a nullable PK + `INSERT OR IGNORE` would NOT dedupe. The
  *   `''` sentinel collapses default `~/.claude` (sessions where
  *   `CLAUDE_CONFIG_DIR` was unset → `events.config_dir = NULL`).
+ * - `profile_name` (TEXT, nullable): schema v35 (fn-642) — the derived
+ *   `projectBasename(config_dir)` (the last path segment of the profile
+ *   directory). Serves as the join key against `usage.id` so the
+ *   bidirectional rate-limit fan-out lands on the matching usage row.
+ *   Derivation is byte-identical at the SessionStart seed and the v35
+ *   one-time backfill (same `projectBasename` helper). NULL only on rows
+ *   minted before v35 that did not transit the backfill (defensive — the
+ *   backfill runs once per upgrade boot and covers every row); the `''`
+ *   sentinel's basename is `""` and the `profile_name != ''` guard on
+ *   both sides of the join keeps `''`-sentinel rows out of the join.
  * - `last_rate_limit_at` (REAL, nullable): unix-seconds of the latest
  *   `RateLimited` / `ApiError(kind="rate_limit")` fold for any session under
  *   this profile. NULL until the first rate_limit lands — a seed-only row
@@ -649,6 +680,7 @@ CREATE TABLE IF NOT EXISTS usage (
 const CREATE_PROFILES = `
 CREATE TABLE IF NOT EXISTS profiles (
     config_dir TEXT NOT NULL PRIMARY KEY,
+    profile_name TEXT,
     last_rate_limit_at REAL,
     last_rate_limit_session_id TEXT,
     last_event_id INTEGER,
@@ -3395,6 +3427,57 @@ function migrate(db: Database): void {
     // it. Forward-only: NULL on a pre-fold row is the correct zero-event
     // shape. No backfill needed at this layer.
     addColumnIfMissing(db, "epics", "resolved_epic_deps", "TEXT");
+
+    // v34→v35: fn-642 — colocate Claude rate-limit state into the `usage`
+    // projection. Three structural additions, all matching the CREATE_USAGE /
+    // CREATE_PROFILES literals above so a fresh v35 DB and a migrated v34→v35
+    // DB converge to identical schema (the addColumnIfMissing/literal lockstep
+    // convention):
+    //   - `usage.last_rate_limit_at REAL` (nullable) — colocated mirror of the
+    //     matching `profiles` row, populated by the schema-v35 forward
+    //     (RateLimited → usage) and reverse (UsageSnapshot ← profiles) fan-out
+    //     inside the existing `BEGIN IMMEDIATE`.
+    //   - `usage.last_rate_limit_session_id TEXT` (nullable) — paired with
+    //     `last_rate_limit_at`. Both NULL together (no rate-limit yet for the
+    //     matching profile) or both populated; the `RateLimited` arm stamps
+    //     them as a pair.
+    //   - `profiles.profile_name TEXT` (nullable) — the derived
+    //     `projectBasename(config_dir)` (last path segment), maintained by the
+    //     SessionStart seed arm in the reducer. Serves as the join key against
+    //     `usage.id` so the bidirectional fan-out lands on the matching row.
+    //
+    // The version-guarded one-time backfill below stamps `profile_name` on
+    // every existing `profiles` row, deriving the value via the same
+    // `projectBasename` helper the SessionStart seed uses (byte-identical
+    // derivation so a from-scratch re-fold and the backfilled row converge).
+    // The backfill is non-idempotent (an UPDATE that ran twice is a no-op,
+    // but the spec asks for it gated explicitly so a future re-run of this
+    // slot can't corrupt). The two `usage` columns need no backfill — they
+    // are NULL on every pre-v35 row and re-populated by the next fan-out fold
+    // (either a `RateLimited` arrival or a fresh `UsageSnapshot` joining
+    // against the matching profile row).
+    addColumnIfMissing(db, "usage", "last_rate_limit_at", "REAL");
+    addColumnIfMissing(db, "usage", "last_rate_limit_session_id", "TEXT");
+    addColumnIfMissing(db, "profiles", "profile_name", "TEXT");
+    if (preMigrateStoredVersion < 35) {
+      // Non-idempotent (version-guarded): read every `profiles` row, derive
+      // `profile_name` from `config_dir` via the SAME `projectBasename` helper
+      // the SessionStart seed uses, and UPDATE in-place. Re-fold determinism:
+      // a from-scratch re-fold drops the table and re-seeds via SessionStart,
+      // which also calls `projectBasename` — the converged shape matches.
+      // The `''` sentinel's basename is `""` — left in place as a valid
+      // (but non-joining) `profile_name`; the `profile_name != ''` guard on
+      // both sides of the join keeps it out of any usage join.
+      const rows = db
+        .prepare("SELECT config_dir FROM profiles")
+        .all() as { config_dir: string }[];
+      const updateStmt = db.prepare(
+        "UPDATE profiles SET profile_name = ? WHERE config_dir = ?",
+      );
+      for (const row of rows) {
+        updateStmt.run(projectBasename(row.config_dir), row.config_dir);
+      }
+    }
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

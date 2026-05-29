@@ -77,7 +77,8 @@ the native value" is the default.
   PK + `INSERT OR IGNORE` would NOT dedupe) is maintained by two reducer
   fan-outs inside the SAME `BEGIN IMMEDIATE`: the SessionStart arm
   `INSERT OR IGNORE`s a visible row for every unique `config_dir` (quiet
-  or not — `last_rate_limit_*` stay NULL on seed-only profiles), and the
+  or not — `last_rate_limit_*` populated only after the first rate-limit
+  fan-out lands, not on the seed), and the
   dual-case `RateLimited`/`ApiError` arm gated on `kind === "rate_limit"`
   reads the session's `jobs.config_dir` in-transaction (null-guarded via
   the `syncIfPlanRef` read-then-write precedent — a missing jobs row
@@ -86,7 +87,36 @@ the native value" is the default.
   `COALESCE(config_dir,'')` expression as the seed so a NULL-config
   session's rate limit lands on the exact `''` row it seeded. Last-
   write-wins on `last_rate_limit_at` follows the event log's append-
-  only id ordering (no `max()` guard — events fold in id order).) and bumps
+  only id ordering (no `max()` guard — events fold in id order).
+  Schema v35 (fn-642) also stamps a derived `profile_name` column
+  (`projectBasename(config_dir)`) on every `profiles` row via the same
+  helper at SessionStart seed time AND on the dual-case UPSERT, with a
+  one-time version-guarded backfill of pre-v35 rows on migrate — so
+  byte-identical derivation is preserved across seed, UPSERT, backfill,
+  and re-fold. The `profile_name` column is the join key against
+  `usage.id` for the schema-v35 bidirectional usage↔profiles rate-limit
+  fan-out.) AND the schema-v35 (fn-642) bidirectional `usage`↔`profiles`
+  rate-limit fan-out: the `RateLimited`/`ApiError(kind='rate_limit')`
+  arm, after the existing `profiles` UPSERT, runs a pure
+  `UPDATE usage SET last_rate_limit_at=?, last_rate_limit_session_id=?,
+  last_event_id=<event.id>, updated_at=? WHERE id =
+  projectBasename(config_dir)` — pure UPDATE, never UPSERT (a rate-limit
+  must NOT mint a phantom usage row for a profile agentuse isn't
+  tracking; `usage` is canonical for "tracked profiles"). The reverse
+  direction lives in `projectUsageRow`: the existing UPSERT carves
+  `last_rate_limit_at` + `last_rate_limit_session_id` OUT of the
+  `ON CONFLICT(id) DO UPDATE SET` clause (mirroring the `EpicSnapshot`
+  carve-out so a re-snapshot can't clobber the rate-limit annotation),
+  then a post-UPSERT
+  `SELECT last_rate_limit_at, last_rate_limit_session_id FROM profiles
+  WHERE profile_name = <usage.id> AND profile_name != ''` re-stamps the
+  pair from the matching profiles row — NULL-safe when no row matches
+  (a later RateLimited fans them in via the forward path). Both
+  directions guard `profile_name != ''` so the `''` sentinel (default
+  `~/.claude`, basename `""`) never cross-contaminates the join. The
+  `last_event_id` bump on the forward UPDATE is load-bearing — it is
+  the descriptor's `version` column; without the bump the wire diff
+  would not fire and the UI wouldn't refresh.) and bumps
   `reducer_state.last_event_id` in one transaction. A crash mid-fold rolls
   back both; boot drain re-folds idempotently. This is the
   exactly-once-per-event guarantee — never split the two writes across

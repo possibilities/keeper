@@ -170,6 +170,9 @@ test("getCollection resolves the usage collection (fn-615)", () => {
     "session_resets_at",
     "week_percent",
     "week_resets_at",
+    // Schema v35 (fn-642): colocated rate-limit columns.
+    "last_rate_limit_at",
+    "last_rate_limit_session_id",
     "last_event_id",
     "updated_at",
   ]) {
@@ -202,6 +205,8 @@ test("getCollection resolves the profiles collection (fn-639)", () => {
   // Columns include every persisted field.
   for (const col of [
     "config_dir",
+    // Schema v35 (fn-642): derived basename, the join key against usage.id.
+    "profile_name",
     "last_rate_limit_at",
     "last_rate_limit_session_id",
     "last_event_id",

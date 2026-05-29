@@ -104,10 +104,15 @@ discharges attribution and a re-edit reinstates it; the strict
 `orphan_files` bucket holds dirty files with zero attribution after the
 inference pass), `usage` (one row per agentuse profile observed
 at `~/.local/state/agentuse/<id>.json` — target, multiplier, session+week
-percent and reset timestamps), and `profiles` (schema v33, fn-639 — one
+percent and reset timestamps; schema v35 (fn-642) adds the colocated
+`last_rate_limit_at` + `last_rate_limit_session_id` columns, populated
+server-side by a bidirectional fan-out against the matching `profiles`
+row so a single-collection client sees both quota and rate-limit state
+together), and `profiles` (schema v33, fn-639 — one
 row per Claude profile directory, keyed by `config_dir`, correlating the
-last `rate_limit` ApiError with each profile so renderers can surface
-profile-level reset state alongside the per-profile usage stacks; the
+last `rate_limit` ApiError with each profile; schema v35 adds the
+derived `profile_name = basename(config_dir)` join key against
+`usage.id`; the
 `''` sentinel collapses default `~/.claude` so a single PK groups every
 NULL-`CLAUDE_CONFIG_DIR` session). The
 surface is built so additional collections register without touching the
@@ -515,23 +520,20 @@ CI) `--live` silently behaves as if it wasn't set. Run any of them with
   bun scripts/git.ts --live                   # alt-screen TUI
   ```
 
-- `usage.ts` — dual-collection subscribe client riding two
-  `subscribeCollection` calls (same lifecycle primitive as `git.ts`):
-  one over the `usage` collection (one row per agentuse profile observed
-  at `~/.local/state/agentuse/<id>.json`: target, multiplier, session+week
-  percent + reset timestamps) and one over the `profiles` collection (one
-  row per Claude profile directory keyed by `config_dir`, carrying
-  `last_rate_limit_at` + `last_rate_limit_session_id` for the most recent
-  rate-limit ApiError). Renders one `---`-delimited frame composing the
-  usage stacks on top and a "Rate limits by profile" block (one row per
-  profile, `(default)` for the `''` sentinel, `—` for never-rate-limited
-  profiles) below. Each stream owns its own change-gate so a fetch-only
-  refresh on one collection can't shake a re-emit on the other; either
-  `onRows` triggers a combined re-render against the latest-of-each.
-  Per-frame sidecars (`/tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*`,
-  indexed via a meta sidecar) carry BOTH row sets so the JSON sidecar
-  captures the full input to the composed frame. SIGINT disposes BOTH
-  subscription handles and prints sidecar paths on exit.
+- `usage.ts` — single-collection subscribe client (schema v35 / fn-642
+  colocated the rate-limit annotation onto the `usage` row, dropping the
+  prior dual-collection `usage` + `profiles` split). One
+  `subscribeCollection` call over the `usage` collection (one row per
+  agentuse profile observed at `~/.local/state/agentuse/<id>.json`:
+  target, multiplier, session+week percent + reset timestamps, plus the
+  schema-v35 colocated `last_rate_limit_at` +
+  `last_rate_limit_session_id`). Each row's stack carries the colocated
+  rate-limit line when set; untracked profiles (rate-limited but with no
+  agentuse usage row) do not render. Per-frame sidecars
+  (`/tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*`, indexed via a meta
+  sidecar) carry the row set so the JSON sidecar captures the full input
+  to the rendered frame. SIGINT disposes the subscription handle and
+  prints sidecar paths on exit.
 
   ```sh
   bun scripts/usage.ts                # all profiles
@@ -735,6 +737,28 @@ shape). The `EpicSnapshot` ON CONFLICT carve-out widens to include
 `created_by_closer_of` / `sort_path` / `queue_jump` so a file-content
 re-observation (e.g. an approval-RPC round-trip) can't wipe the
 projection-derived dep resolution.
+As of schema v35 (fn-642), the `usage` projection colocates the
+Claude rate-limit annotation: `last_rate_limit_at` +
+`last_rate_limit_session_id` are populated server-side by a
+bidirectional fan-out against the matching `profiles` row, joined on
+the derived `profile_name = projectBasename(config_dir)` column
+(`profiles.profile_name = usage.id`). The forward direction lives in the
+`RateLimited` / `ApiError(kind='rate_limit')` arm — a pure UPDATE
+against `usage WHERE id = <profile_name>` (never UPSERT, so a
+rate-limit on a profile agentuse isn't tracking does NOT mint a
+phantom usage row). The reverse direction lives in `projectUsageRow`:
+the existing UPSERT carves the two rate-limit columns OUT of the
+`ON CONFLICT(id) DO UPDATE SET` clause (so a re-snapshot can't clobber
+the annotation), then a post-UPSERT SELECT against `profiles` pulls
+the current state forward. Both directions guard `profile_name != ''`
+so the `''` sentinel (default `~/.claude`, basename `""`) never
+cross-contaminates the join. The `profile_name` derivation is
+byte-identical at the SessionStart seed, the dual-case UPSERT, and the
+v34→v35 one-time migrate backfill — re-fold determinism converges.
+The colocation drops `scripts/usage.ts`'s "Rate limits by profile"
+block: each tracked profile's usage stack now carries a `rate-limited
+<rel>` line off the same row; untracked profiles render no rate-limit
+annotation.
 As of schema v25, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `last_api_error_at` /
 `last_api_error_kind` / `last_input_request_at` /

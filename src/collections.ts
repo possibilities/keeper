@@ -396,6 +396,8 @@ export const USAGE_DESCRIPTOR: CollectionDescriptor = {
     "week_resets_at",
     "sonnet_week_percent",
     "sonnet_week_resets_at",
+    "last_rate_limit_at",
+    "last_rate_limit_session_id",
     "last_event_id",
     "updated_at",
   ],
@@ -431,6 +433,7 @@ export const PROFILES_DESCRIPTOR: CollectionDescriptor = {
   table: "profiles",
   columns: [
     "config_dir",
+    "profile_name",
     "last_rate_limit_at",
     "last_rate_limit_session_id",
     "last_event_id",

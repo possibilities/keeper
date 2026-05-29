@@ -31,9 +31,11 @@ from pathlib import Path
 # ``file_attributions`` / ``git_status`` shape this reader depends on landed in
 # v31 (fn-633); v32 (fn-634 ``default_visible``) is additive and doesn't touch
 # it; v33 (fn-639 ``profiles``) is additive and doesn't touch it; v34
-# (fn-637 ``resolved_epic_deps`` on epics) is additive and doesn't touch it.
+# (fn-637 ``resolved_epic_deps`` on epics) is additive and doesn't touch it;
+# v35 (fn-642 ``usage``+``profiles`` rate-limit colocation) is additive and
+# touches only ``usage`` / ``profiles`` (keeper-py reads neither).
 # Bump this set when a keeper schema change alters those tables.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35})
 
 
 class KeeperError(Exception):

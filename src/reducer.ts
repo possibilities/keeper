@@ -2038,6 +2038,19 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
  * Bumps `last_event_id` + `updated_at` on every write so the descriptor's
  * diff-tick fires patches. Re-fold determinism: the reducer NEVER re-reads
  * the on-disk file — the persisted event log is the sole source of truth.
+ *
+ * **Schema v35 (fn-642): reverse fan-out (UsageSnapshot ← profiles).** The
+ * colocated `last_rate_limit_at` + `last_rate_limit_session_id` columns are
+ * carved OUT of the `ON CONFLICT(id) DO UPDATE SET` clause (mirroring the
+ * `EpicSnapshot` carve-out for `tasks` / `jobs` / `job_links` / etc.) — a
+ * `UsageSnapshot` re-fold must NOT clobber the rate-limit annotation a
+ * prior `RateLimited` fan-out wrote. After the UPSERT, a SELECT against
+ * the matching `profiles` row (joined on `profile_name = usage.id`) pulls
+ * the current rate-limit state and stamps it onto the row. NULL-safe: if
+ * no matching `profiles` row exists (e.g. a usage id with no SessionStart-
+ * seeded profile yet), the columns stay NULL — a later `RateLimited` will
+ * fan them in via the forward path. The `profile_name != ''` guard keeps
+ * the `''` sentinel (default `~/.claude`) out of the join.
  */
 function projectUsageRow(db: Database, event: Event): void {
   const id = event.session_id;
@@ -2077,6 +2090,43 @@ function projectUsageRow(db: Database, event: Event): void {
       snapshot.sonnet_week_resets_at,
       event.id,
       event.ts,
+    ],
+  );
+  // Schema v35 (fn-642): reverse fan-out. Pull the current rate-limit
+  // annotation from the matching `profiles` row and stamp it onto the just-
+  // UPSERTed usage row. The join key is `profiles.profile_name = usage.id`,
+  // guarded `profile_name != ''` so the `''` sentinel never joins. NULL-safe:
+  // a missing/quiet profile row leaves the columns NULL (`SELECT ... LIMIT 1`
+  // returns null → both bindings are NULL → the UPDATE writes NULLs, which
+  // is the correct zero-event shape). A later `RateLimited` will populate
+  // them via the forward fan-out.
+  //
+  // Pure function of the fold inputs + the in-transaction `profiles` row —
+  // no `Date.now`/env/OS reads. Re-fold determinism: events fold in id
+  // order, so a re-fold sees the same `profiles` state at the same point in
+  // the stream and stamps the same values. The `last_event_id` bump is
+  // already covered by the UPSERT above; the reverse fan-out's UPDATE does
+  // not need to re-bump because the row's `last_event_id` already advanced
+  // for this same event.
+  const profileRow = db
+    .query(
+      `SELECT last_rate_limit_at, last_rate_limit_session_id
+         FROM profiles
+        WHERE profile_name = ? AND profile_name != ''`,
+    )
+    .get(id) as {
+    last_rate_limit_at: number | null;
+    last_rate_limit_session_id: string | null;
+  } | null;
+  db.run(
+    `UPDATE usage
+        SET last_rate_limit_at = ?,
+            last_rate_limit_session_id = ?
+      WHERE id = ?`,
+    [
+      profileRow?.last_rate_limit_at ?? null,
+      profileRow?.last_rate_limit_session_id ?? null,
+      id,
     ],
   );
 }
@@ -4292,9 +4342,25 @@ function projectJobsRow(db: Database, event: Event): void {
         // rate limit lands on the exact `''` row it seeded here.
         // `last_rate_limit_*` stay NULL — populated only by the rate-limit
         // arm below. Pure function of the event (no `Date.now`/env/OS state).
+        //
+        // Schema v35 (fn-642): also seed `profile_name` from the SAME
+        // `projectBasename` derivation the v34→v35 migrate backfill uses
+        // (byte-identical so a re-fold post-migrate converges). The `''`
+        // sentinel's basename is `""`; the `profile_name != ''` guard on
+        // both sides of the usage<->profiles join keeps it from cross-
+        // contaminating a `''`-id usage row. `INSERT OR IGNORE` means a
+        // pre-existing row keeps the first seed's `profile_name`, but the
+        // helper is a pure function of `config_dir` so a duplicate
+        // SessionStart on the same `config_dir` would derive the same value
+        // anyway — re-fold determinism holds.
         db.run(
-          `INSERT OR IGNORE INTO profiles (config_dir, last_event_id, updated_at) VALUES (COALESCE(?, ''), ?, ?)`,
-          [event.config_dir, event.id, ts],
+          `INSERT OR IGNORE INTO profiles (config_dir, profile_name, last_event_id, updated_at) VALUES (COALESCE(?, ''), ?, ?, ?)`,
+          [
+            event.config_dir,
+            projectBasename(event.config_dir),
+            event.id,
+            ts,
+          ],
         );
       }
       syncIfPlanRef(db, jobId, event.id, ts);
@@ -4653,15 +4719,59 @@ function projectJobsRow(db: Database, event: Event): void {
           .get(jobId) as { config_dir: string | null } | null;
         if (profileRow != null) {
           db.run(
-            `INSERT INTO profiles (config_dir, last_rate_limit_at, last_rate_limit_session_id, last_event_id, updated_at)
-                  VALUES (COALESCE(?, ''), ?, ?, ?, ?)
+            `INSERT INTO profiles (config_dir, profile_name, last_rate_limit_at, last_rate_limit_session_id, last_event_id, updated_at)
+                  VALUES (COALESCE(?, ''), ?, ?, ?, ?, ?)
              ON CONFLICT(config_dir) DO UPDATE SET
                last_rate_limit_at = excluded.last_rate_limit_at,
                last_rate_limit_session_id = excluded.last_rate_limit_session_id,
                last_event_id = excluded.last_event_id,
                updated_at = excluded.updated_at`,
-            [profileRow.config_dir, ts, jobId, event.id, ts],
+            [
+              profileRow.config_dir,
+              projectBasename(profileRow.config_dir),
+              ts,
+              jobId,
+              event.id,
+              ts,
+            ],
           );
+          // Schema v35 (fn-642): forward fan-out — colocate the rate-limit
+          // annotation on the matching `usage` row so a single `usage`
+          // subscribe carries both quota numbers and rate-limit state. The
+          // join key is `usage.id = profiles.profile_name` (the on-disk
+          // profile-directory basename agentuse and keeper agreed on).
+          //
+          // Pure UPDATE — never UPSERT: a rate_limit must not mint a
+          // phantom `usage` row for a profile agentuse isn't tracking
+          // (the `usage` set is the canonical "tracked profiles" surface
+          // and is the responsibility of the usage-worker alone). If no
+          // matching `usage` row exists, the UPDATE matches zero rows
+          // and we move on; a later `UsageSnapshot` for the same id will
+          // pull the rate-limit annotation back via the reverse fan-out
+          // (the `projectUsageRow` post-UPSERT SELECT).
+          //
+          // `WHERE id = <profile_name> AND profile_name != ''` keeps the
+          // `''` sentinel (default `~/.claude`, basename `""`) from
+          // ever joining a usage row whose id happens to be `""`. The
+          // `last_event_id` bump is load-bearing — the descriptor's
+          // version column drives the wire diff; without the bump the
+          // subscribe wouldn't fire and the UI would stay stale.
+          //
+          // Pure function of the fold inputs (`event.ts`, `event.id`,
+          // `jobId`, in-transaction `jobs.config_dir`) — no
+          // `Date.now`/env/OS reads.
+          const profileName = projectBasename(profileRow.config_dir);
+          if (profileName !== "") {
+            db.run(
+              `UPDATE usage
+                  SET last_rate_limit_at = ?,
+                      last_rate_limit_session_id = ?,
+                      last_event_id = ?,
+                      updated_at = ?
+                WHERE id = ?`,
+              [ts, jobId, event.id, ts, profileName],
+            );
+          }
         }
       }
       break;

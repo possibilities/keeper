@@ -2501,6 +2501,333 @@ test("from-scratch re-fold reproduces the usage projection byte-identically", ()
   expect(after).toEqual(before);
 });
 
+// ---------------------------------------------------------------------------
+// Schema v35 (fn-642) — bidirectional rate-limit fan-out between `usage` and
+// `profiles`. `usage.id` joins against `profiles.profile_name` (the derived
+// `projectBasename(config_dir)`); the `''` sentinel never participates.
+// ---------------------------------------------------------------------------
+
+test("forward fan-out: RateLimited stamps the matching usage row's last_rate_limit_* and bumps last_event_id (fn-642)", () => {
+  // Profile dir `/Users/x/.claude-profiles/multi-claude-3` → basename
+  // `multi-claude-3` → matching usage row id `multi-claude-3`.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "multi-claude-3",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 20,
+      session_percent: 5.0,
+      session_resets_at: "T1",
+      week_percent: 10.0,
+      week_resets_at: "T2",
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rl",
+    config_dir: "/Users/x/.claude-profiles/multi-claude-3",
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rl" });
+  const rlId = insertEvent({
+    hook_event: "RateLimited",
+    session_id: "sess-rl",
+  });
+  drainAll();
+  const usageRow = db
+    .query(
+      "SELECT last_rate_limit_at, last_rate_limit_session_id, last_event_id FROM usage WHERE id = 'multi-claude-3'",
+    )
+    .get() as {
+    last_rate_limit_at: number | null;
+    last_rate_limit_session_id: string | null;
+    last_event_id: number;
+  };
+  expect(usageRow.last_rate_limit_at).not.toBeNull();
+  expect(usageRow.last_rate_limit_session_id).toBe("sess-rl");
+  // last_event_id bumped to the rate-limit event id so the wire diff fires.
+  expect(usageRow.last_event_id).toBe(rlId);
+});
+
+test("forward fan-out: a rate_limit on an untracked profile is a no-op — no phantom usage row minted (fn-642)", () => {
+  // SessionStart on profile-A but agentuse never observed profile-A in
+  // ~/.local/state/agentuse — there's no `usage` row to fan into. The
+  // forward UPDATE must match zero rows and we must NOT mint a phantom.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-untracked",
+    config_dir: "/Users/x/.claude-profiles/untracked-profile",
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-untracked",
+  });
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-untracked" });
+  drainAll();
+  // The profiles row was seeded + rate-limit stamped (existing fn-639
+  // behavior); but `usage` was never touched.
+  const usageCount = (
+    db.query("SELECT COUNT(*) AS n FROM usage").get() as { n: number }
+  ).n;
+  expect(usageCount).toBe(0);
+});
+
+test("reverse fan-out: UsageSnapshot pulls the current rate-limit from the matching profiles row (fn-642)", () => {
+  // Rate limit lands FIRST (with no usage row yet), then the UsageSnapshot
+  // arrives. The reverse fan-out's post-UPSERT SELECT must pull the
+  // profile's rate-limit annotation onto the new usage row.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-A",
+    config_dir: "/Users/x/.claude-profiles/multi-claude-1",
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-A" });
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-A" });
+  // Now the UsageSnapshot arrives.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "multi-claude-1",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 1,
+      session_percent: 20.0,
+      session_resets_at: "T1",
+      week_percent: 5.0,
+      week_resets_at: "T2",
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT last_rate_limit_at, last_rate_limit_session_id FROM usage WHERE id = 'multi-claude-1'",
+    )
+    .get() as {
+    last_rate_limit_at: number | null;
+    last_rate_limit_session_id: string | null;
+  };
+  expect(row.last_rate_limit_at).not.toBeNull();
+  expect(row.last_rate_limit_session_id).toBe("sess-A");
+});
+
+test("reverse fan-out is NULL-safe: a UsageSnapshot with no matching profiles row leaves rate-limit columns NULL (fn-642)", () => {
+  // No SessionStart for the profile this usage corresponds to. The
+  // UsageSnapshot UPSERTs the row; the reverse fan-out's SELECT returns
+  // null; both columns stay NULL.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "lone-profile",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 1.0,
+      session_resets_at: "T1",
+      week_percent: 1.0,
+      week_resets_at: "T2",
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT last_rate_limit_at, last_rate_limit_session_id FROM usage WHERE id = 'lone-profile'",
+    )
+    .get() as {
+    last_rate_limit_at: number | null;
+    last_rate_limit_session_id: string | null;
+  };
+  expect(row.last_rate_limit_at).toBeNull();
+  expect(row.last_rate_limit_session_id).toBeNull();
+});
+
+test("ON CONFLICT carve-out: a re-UsageSnapshot does NOT clobber a prior rate-limit fan-out (fn-642)", () => {
+  // A rate-limit lands BEFORE the second UsageSnapshot. The UPSERT must
+  // NOT include last_rate_limit_* in its ON CONFLICT DO UPDATE SET clause —
+  // otherwise the snapshot's NULL bindings would clobber the stamped value.
+  // The reverse fan-out's post-UPSERT SELECT re-reads the profile row and
+  // re-applies it (which keeps the value), so net effect is preservation.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "multi-claude-2",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 1,
+      session_percent: 5.0,
+      session_resets_at: "T1",
+      week_percent: 5.0,
+      week_resets_at: "T2",
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-B",
+    config_dir: "/Users/x/.claude-profiles/multi-claude-2",
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-B" });
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-B" });
+  // The usage row now carries the rate-limit. A second UsageSnapshot lands —
+  // the carve-out must preserve last_rate_limit_*.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "multi-claude-2",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 1,
+      session_percent: 30.0,
+      session_resets_at: "T1",
+      week_percent: 5.0,
+      week_resets_at: "T2",
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT session_percent, last_rate_limit_session_id FROM usage WHERE id = 'multi-claude-2'",
+    )
+    .get() as {
+    session_percent: number;
+    last_rate_limit_session_id: string | null;
+  };
+  // Quota numbers DO update on a re-snapshot.
+  expect(row.session_percent).toBe(30.0);
+  // Rate-limit annotation is preserved through the snapshot churn.
+  expect(row.last_rate_limit_session_id).toBe("sess-B");
+});
+
+test("'' sentinel never joins a usage row (fn-642)", () => {
+  // A default-`~/.claude` session (NULL config_dir → '' sentinel) seeds the
+  // '' profile row with profile_name=''. An agentuse profile whose id is
+  // literally "" cannot exist (`<id>.json` with empty basename is impossible
+  // on disk), and the join is guarded `profile_name != ''` so even if a
+  // pathological usage row with id='' existed, it would NOT participate.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-default",
+    config_dir: null,
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-default" });
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-default" });
+  // A pathological usage row with id='' is constructed to assert the guard
+  // (a defensive sanity check — in real usage agentuse cannot mint this).
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 1.0,
+      session_resets_at: "T1",
+      week_percent: 1.0,
+      week_resets_at: "T2",
+    }),
+  });
+  drainAll();
+  // The empty-string event.session_id is rejected by projectUsageRow's
+  // early null/empty-id guard (existing behavior, not v35) — so no row
+  // is minted in the first place. Sanity: no usage row exists.
+  const usageCount = (
+    db.query("SELECT COUNT(*) AS n FROM usage").get() as { n: number }
+  ).n;
+  expect(usageCount).toBe(0);
+  // The '' profile row was stamped with the rate-limit, but it did NOT
+  // cross-contaminate any usage row (because none exist).
+  const profileRow = db
+    .query(
+      "SELECT profile_name, last_rate_limit_session_id FROM profiles WHERE config_dir = ''",
+    )
+    .get() as {
+    profile_name: string;
+    last_rate_limit_session_id: string | null;
+  };
+  expect(profileRow.profile_name).toBe("");
+  expect(profileRow.last_rate_limit_session_id).toBe("sess-default");
+});
+
+test("from-scratch re-fold reproduces usage + profiles projections byte-identically (fn-642)", () => {
+  // Cover both fan-out directions and event ordering:
+  // (a) UsageSnapshot BEFORE SessionStart BEFORE RateLimited (forward path);
+  // (b) RateLimited BEFORE UsageSnapshot (reverse path);
+  // (c) untracked rate-limit (no usage row) mints nothing on usage;
+  // (d) '' sentinel never cross-contaminates.
+  // (a) forward: usage row exists, then SessionStart, then rate-limit fans in.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "multi-claude-3",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 20,
+      session_percent: 15.0,
+      session_resets_at: "T1",
+      week_percent: 5.0,
+      week_resets_at: "T2",
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-fwd",
+    config_dir: "/Users/x/.claude-profiles/multi-claude-3",
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-fwd" });
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-fwd" });
+  // (b) reverse: rate-limit first under a profile whose usage row has not
+  // yet been snapshotted; then the UsageSnapshot lands and pulls it in.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rev",
+    config_dir: "/Users/x/.claude-profiles/multi-claude-1",
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rev" });
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-rev" });
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "multi-claude-1",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 1,
+      session_percent: 25.0,
+      session_resets_at: "T1",
+      week_percent: 5.0,
+      week_resets_at: "T2",
+    }),
+  });
+  // (c) untracked: rate-limit on a profile agentuse doesn't track.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-untracked",
+    config_dir: "/Users/x/.claude-profiles/untracked",
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-untracked",
+  });
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-untracked" });
+  // (d) '' sentinel rate-limit (default ~/.claude).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-default",
+    config_dir: null,
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-default" });
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-default" });
+  drainAll();
+  const beforeUsage = db
+    .query("SELECT * FROM usage ORDER BY id ASC")
+    .all();
+  const beforeProfiles = db
+    .query("SELECT * FROM profiles ORDER BY config_dir ASC")
+    .all();
+  // Rewind + wipe + re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM usage");
+  db.run("DELETE FROM profiles");
+  drainAll();
+  const afterUsage = db
+    .query("SELECT * FROM usage ORDER BY id ASC")
+    .all();
+  const afterProfiles = db
+    .query("SELECT * FROM profiles ORDER BY config_dir ASC")
+    .all();
+  expect(afterUsage).toEqual(beforeUsage);
+  expect(afterProfiles).toEqual(beforeProfiles);
+});
+
 function drainAll(): number {
   let total = 0;
   let n: number;
