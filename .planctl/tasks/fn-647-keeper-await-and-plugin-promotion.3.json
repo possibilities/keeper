@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-29T21:14:46.672093Z",
+  "depends_on": [],
+  "epic": "fn-647-keeper-await-and-plugin-promotion",
+  "id": "fn-647-keeper-await-and-plugin-promotion.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "promote repo root to plugin",
+  "updated_at": "2026-05-29T21:14:46.672093Z"
+}

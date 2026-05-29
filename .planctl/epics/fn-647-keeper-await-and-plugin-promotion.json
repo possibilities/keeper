@@ -1,0 +1,21 @@
+{
+  "branch_name": "fn-647-keeper-await-and-plugin-promotion",
+  "bundles": [],
+  "created_at": "2026-05-29T21:14:46.672093Z",
+  "depends_on_epics": [
+    "fn-646-keeper-cli-opentui-port"
+  ],
+  "id": "fn-647-keeper-await-and-plugin-promotion",
+  "last_validated_at": "2026-05-29T21:14:46.795933Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "keeper await and plugin promotion",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-29T21:14:46.672093Z"
+}
