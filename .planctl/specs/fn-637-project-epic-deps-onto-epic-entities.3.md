@@ -79,5 +79,5 @@ never recurse inside the fold.
 - [ ] Re-fold determinism test passes byte-identical; no wall-clock/env in the fold.
 
 ## Done summary
-
+Project resolved_epic_deps + epic_dep_edges from the event log via a shared enrichEpicDep helper (mirror of enrichJobLink): forward stamp + reverse fan-out + EpicDeleted re-stamp, all inside the same BEGIN IMMEDIATE; ON CONFLICT carve-out extended to preserve the projection across approval RPC round-trips; version-guarded chunked backfill outside the migrate transaction. Re-fold determinism test passes byte-identically.
 ## Evidence

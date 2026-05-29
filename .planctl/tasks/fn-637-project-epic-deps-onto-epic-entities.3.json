@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "Reducer forward stamp, reverse fan-out, backfill",
-  "updated_at": "2026-05-29T01:22:02.387083Z"
+  "updated_at": "2026-05-29T12:21:02.669893Z",
+  "worker_done_at": "2026-05-29T12:21:02.669893Z"
 }
