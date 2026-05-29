@@ -2663,6 +2663,81 @@ test("forward fan-out: RateLimited stamps the matching usage row's last_rate_lim
   expect(usageRow.last_event_id).toBe(rlId);
 });
 
+test("SessionStart stamps jobs.profile_name from config_dir; a NULL-config resume preserves it (v36)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-pn",
+    config_dir: "/Users/x/.claude-profiles/multi-claude-3",
+  });
+  drainAll();
+  const seeded = db
+    .query("SELECT profile_name, config_dir FROM jobs WHERE job_id = 'sess-pn'")
+    .get() as { profile_name: string | null; config_dir: string | null };
+  // Derived basename of config_dir — same helper the profiles seed uses.
+  expect(seeded.profile_name).toBe("multi-claude-3");
+
+  // A resume (duplicate SessionStart) carrying NO config_dir must not clobber
+  // the seeded name: config_dir COALESCE keeps the dir, and the mirrored
+  // profile_name COALESCE keeps the name (excluded.profile_name is NULL).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-pn",
+    config_dir: null,
+  });
+  drainAll();
+  const resumed = db
+    .query("SELECT profile_name, config_dir FROM jobs WHERE job_id = 'sess-pn'")
+    .get() as { profile_name: string | null; config_dir: string | null };
+  expect(resumed.profile_name).toBe("multi-claude-3");
+  expect(resumed.config_dir).toBe("/Users/x/.claude-profiles/multi-claude-3");
+});
+
+test("SessionStart with NULL config_dir leaves jobs.profile_name NULL (default profile, v36)", () => {
+  // Tracks config_dir's own nullability — a NULL config_dir (default
+  // ~/.claude, no CLAUDE_CONFIG_DIR) derives a NULL profile_name, NOT the
+  // ''-collapse the profiles seed applies. The renderer maps NULL → (default).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-default-pn",
+    config_dir: null,
+  });
+  drainAll();
+  const row = db
+    .query("SELECT profile_name FROM jobs WHERE job_id = 'sess-default-pn'")
+    .get() as { profile_name: string | null };
+  expect(row.profile_name).toBeNull();
+});
+
+test("from-scratch re-fold reproduces jobs.profile_name byte-identically (v36)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rf-a",
+    config_dir: "/Users/x/.claude-profiles/multi-claude-3",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rf-b",
+    config_dir: null,
+  });
+  // A NULL-config resume on A — exercises the COALESCE-preserve path on re-fold.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rf-a",
+    config_dir: null,
+  });
+  drainAll();
+  const before = db
+    .query("SELECT job_id, profile_name, config_dir FROM jobs ORDER BY job_id")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = db
+    .query("SELECT job_id, profile_name, config_dir FROM jobs ORDER BY job_id")
+    .all();
+  expect(after).toEqual(before);
+});
+
 test("forward fan-out: a rate_limit on an untracked profile is a no-op — no phantom usage row minted (fn-642)", () => {
   // SessionStart on profile-A but agentuse never observed profile-A in
   // ~/.local/state/agentuse — there's no `usage` row to fan into. The

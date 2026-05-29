@@ -188,6 +188,16 @@ test("getCollection resolves the usage collection (fn-615)", () => {
   expect(USAGE_DESCRIPTOR.defaultClause).toBeUndefined();
 });
 
+test("JOBS_DESCRIPTOR serves profile_name for the recent-sessions log (v36)", () => {
+  // Schema v36: the derived `profile_name` rides the jobs row natively so the
+  // usage surface's "recent sessions" log labels each job by profile without a
+  // client-side join. Display-only — out of sortable / filters / jsonColumns.
+  expect(JOBS_DESCRIPTOR.columns).toContain("profile_name");
+  expect(JOBS_DESCRIPTOR.sortable.has("profile_name")).toBe(false);
+  expect(JOBS_DESCRIPTOR.filters.profile_name).toBeUndefined();
+  expect(JOBS_DESCRIPTOR.jsonColumns.has("profile_name")).toBe(false);
+});
+
 test("getCollection resolves the profiles collection (fn-639)", () => {
   expect(getCollection("profiles")).toBe(PROFILES_DESCRIPTOR);
   expect(PROFILES_DESCRIPTOR.table).toBe("profiles");
