@@ -5998,9 +5998,9 @@ test("fresh v34 DB has epics.resolved_epic_deps (nullable TEXT) and epic_dep_edg
   // (c) idx_epic_dep_edges_dep_token — the reverse fan-out index. Must
   // exist and key on `dep_token` ALONE (NOT a leading-consumer composite —
   // that's what the implicit PK index covers).
-  const idxList = db
-    .prepare("PRAGMA index_list(epic_dep_edges)")
-    .all() as { name: string }[];
+  const idxList = db.prepare("PRAGMA index_list(epic_dep_edges)").all() as {
+    name: string;
+  }[];
   const idxNames = idxList.map((r) => r.name);
   expect(idxNames).toContain("idx_epic_dep_edges_dep_token");
   const idxCols = db
@@ -6010,9 +6010,11 @@ test("fresh v34 DB has epics.resolved_epic_deps (nullable TEXT) and epic_dep_edg
 
   // (d) Zero-event projection: both surfaces start empty.
   expect(
-    (db.prepare("SELECT COUNT(*) AS n FROM epic_dep_edges").get() as {
-      n: number;
-    }).n,
+    (
+      db.prepare("SELECT COUNT(*) AS n FROM epic_dep_edges").get() as {
+        n: number;
+      }
+    ).n,
   ).toBe(0);
   expect(
     (db.prepare("SELECT COUNT(*) AS n FROM epics").get() as { n: number }).n,
@@ -6021,13 +6023,16 @@ test("fresh v34 DB has epics.resolved_epic_deps (nullable TEXT) and epic_dep_edg
   db.close();
 });
 
-test("v33 DB migrates to v34: resolved_epic_deps column + epic_dep_edges table added; pre-existing rows survive with NULL resolved_epic_deps (fn-637)", () => {
+test("v33 DB migrates to v34: resolved_epic_deps column + epic_dep_edges table added; pre-existing rows re-derive via chunked post-migrate backfill (fn-637)", () => {
   // Build a v33-shape DB by hand (epics with the v33 column set; no
   // resolved_epic_deps; no epic_dep_edges table), then reopen via
   // openDb() → migrate() to verify: (a) version stamp bumps to "34",
-  // (b) the new column is added with NULL on the pre-existing row,
-  // (c) the epic_dep_edges table + dep_token index exist with the
-  // expected shape, (d) the pre-existing epics row survives.
+  // (b) the new column is added AND the chunked post-migrate backfill
+  // populates it (task .3 — re-derives `resolved_epic_deps` for every
+  // pre-existing row; a row with empty `depends_on_epics` reads `'[]'`
+  // — "computed, no deps", distinct from the NULL "not-yet-computed"
+  // sentinel), (c) the epic_dep_edges table + dep_token index exist
+  // with the expected shape, (d) the pre-existing epics row survives.
   const otherTmp = mkdtempSync(join(tmpdir(), "keeper-db-v33-shape-"));
   const otherPath = join(otherTmp, "k.db");
   const v33 = new Database(otherPath, { create: true });
@@ -6106,8 +6111,14 @@ test("v33 DB migrates to v34: resolved_epic_deps column + epic_dep_edges table a
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
   expect(ver.value).toBe("34");
-  // (b) resolved_epic_deps added; the pre-existing row reads NULL there
-  // (the schema-default "not-yet-computed" sentinel — distinct from `[]`).
+  // (b) resolved_epic_deps added AND the post-migrate chunked backfill
+  // re-derived the column for the pre-existing row. The row had no
+  // `depends_on_epics`, so the resolver yields the empty enriched array,
+  // which the backfill stamps as the wire string `'[]'` — distinct from
+  // the NULL "not-yet-computed" sentinel. Task .3 contract: the backfill
+  // runs version-guarded on the v33→v34 transition, computes
+  // `resolved_epic_deps` once per existing row, and releases the writer
+  // lock between chunks (no mega-transaction).
   const cols = reopened.prepare("PRAGMA table_info(epics)").all() as {
     name: string;
   }[];
@@ -6122,7 +6133,7 @@ test("v33 DB migrates to v34: resolved_epic_deps column + epic_dep_edges table a
     resolved_epic_deps: string | null;
   };
   expect(row.title).toBe("preserved-across-migrate");
-  expect(row.resolved_epic_deps).toBeNull();
+  expect(row.resolved_epic_deps).toBe("[]");
   // (c) epic_dep_edges table + dep_token index exist.
   const tables = (
     reopened
@@ -6143,6 +6154,127 @@ test("v33 DB migrates to v34: resolved_epic_deps column + epic_dep_edges table a
     .get() as { value: string };
   expect(ver2.value).toBe("34");
   reopened2.close();
+  rmSync(otherTmp, { recursive: true, force: true });
+});
+
+test("v33 DB with non-trivial deps backfills `resolved_epic_deps` + `epic_dep_edges` via the chunked post-migrate pass (fn-637)", () => {
+  // Build a v33-shape DB carrying TWO epics: an upstream `fn-1-up`
+  // (status=done, approval=approved) and a downstream `fn-2-down`
+  // depending on the full upstream id. Reopen via openDb() → migrate()
+  // → backfill, then verify: (a) the downstream's `resolved_epic_deps`
+  // resolves the upstream as `satisfied`, (b) the `epic_dep_edges` row
+  // landed for the downstream consumer.
+  const otherTmp = mkdtempSync(join(tmpdir(), "keeper-db-v33-deps-"));
+  const otherPath = join(otherTmp, "k.db");
+  const v33 = new Database(otherPath, { create: true });
+  v33.run(`
+    CREATE TABLE epics (
+      epic_id TEXT PRIMARY KEY,
+      epic_number INTEGER,
+      title TEXT,
+      project_dir TEXT,
+      status TEXT,
+      approval TEXT NOT NULL DEFAULT 'pending',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL DEFAULT 0,
+      tasks TEXT NOT NULL DEFAULT '[]',
+      depends_on_epics TEXT NOT NULL DEFAULT '[]',
+      jobs TEXT NOT NULL DEFAULT '[]',
+      job_links TEXT NOT NULL DEFAULT '[]',
+      last_validated_at TEXT,
+      created_by_closer_of TEXT,
+      sort_path TEXT NOT NULL DEFAULT '',
+      queue_jump INTEGER NOT NULL DEFAULT 0,
+      default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status='open' OR approval!='approved' THEN 1 ELSE 0 END) VIRTUAL
+    )
+  `);
+  v33
+    .prepare(
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_event_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run("fn-1-up", 1, "Up", "/repo", "done", "approved", "[]", 1, 1);
+  v33
+    .prepare(
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_event_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      "fn-2-down",
+      2,
+      "Down",
+      "/repo",
+      "open",
+      "pending",
+      JSON.stringify(["fn-1-up"]),
+      2,
+      2,
+    );
+  v33.run(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_source TEXT,
+      transcript_path TEXT,
+      start_time TEXT,
+      plan_verb TEXT,
+      plan_ref TEXT,
+      epic_links TEXT NOT NULL DEFAULT '[]',
+      last_api_error_at REAL,
+      last_api_error_kind TEXT,
+      last_input_request_at REAL,
+      last_input_request_kind TEXT,
+      config_dir TEXT,
+      git_dirty_count INTEGER NOT NULL DEFAULT 0,
+      git_unattributed_to_live_count INTEGER NOT NULL DEFAULT 0,
+      git_orphan_count INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  v33.run(
+    `CREATE TABLE reducer_state (
+       id INTEGER PRIMARY KEY CHECK (id = 1),
+       last_event_id INTEGER NOT NULL DEFAULT 0,
+       updated_at REAL NOT NULL
+     )`,
+  );
+  v33.run(
+    "INSERT INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 0, 0)",
+  );
+  v33.run(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)`);
+  v33.run(`INSERT INTO meta (key, value) VALUES ('schema_version', '33')`);
+  v33.close();
+
+  const { db: reopened } = openDb(otherPath);
+  // (a) downstream's `resolved_epic_deps` is the resolved enriched entry —
+  // the backfill ran the shared resolver and stamped `satisfied`.
+  const row = reopened
+    .prepare("SELECT resolved_epic_deps FROM epics WHERE epic_id = 'fn-2-down'")
+    .get() as { resolved_epic_deps: string };
+  const parsed = JSON.parse(row.resolved_epic_deps);
+  expect(parsed).toEqual([
+    {
+      dep_token: "fn-1-up",
+      resolved_epic_id: "fn-1-up",
+      epic_number: 1,
+      project_basename: "repo",
+      cross_project: false,
+      state: "satisfied",
+    },
+  ]);
+  // (b) the consumer's `epic_dep_edges` row landed.
+  const edges = reopened
+    .prepare(
+      "SELECT consumer_id, dep_token FROM epic_dep_edges ORDER BY consumer_id, dep_token",
+    )
+    .all() as { consumer_id: string; dep_token: string }[];
+  expect(edges).toEqual([{ consumer_id: "fn-2-down", dep_token: "fn-1-up" }]);
+  reopened.close();
   rmSync(otherTmp, { recursive: true, force: true });
 });
 

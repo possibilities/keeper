@@ -4403,12 +4403,14 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     // Schema v30: queue_jump defaults to 0 — no planctl_invocation envelope
     // with `queue_jump: true` has been observed for this epic.
     queue_jump: 0,
-    // Schema v34 (fn-637): resolved_epic_deps is NULL on a freshly-folded
-    // epics row — "not-yet-computed", distinct from `'[]'` ("computed,
-    // no deps"). The task-.3 reducer forward-stamp populates this column
-    // from the shared `resolveEpicDep` helper; this task .2 lays only
-    // the schema foundation, so the column reads NULL here.
-    resolved_epic_deps: null,
+    // Schema v34 (fn-637): the task-.3 forward stamp populates this
+    // column from the shared `resolveEpicDep` helper inside the same
+    // BEGIN IMMEDIATE transaction as the EpicSnapshot fold. A first-
+    // sight epic with no `depends_on_epics` in the blob folds to '[]'
+    // ("computed, no deps") — DISTINCT from `null` ("not-yet-computed")
+    // which is the schema-v33→v34 transitional reading on a pre-fold
+    // row.
+    resolved_epic_deps: "[]",
     // Schema v32 (fn-634): default_visible is the VIRTUAL generated column
     // computed from (status, approval). status='open' + approval='pending'
     // → both branches of the OR hit → 1.
@@ -4681,6 +4683,451 @@ test("plan folds do not touch the jobs projection", () => {
   expect(getJob()?.state).toBe("working");
   expect(getEpic("fn-1")?.title).toBe("E");
   expect(getTask("fn-1.1")?.title).toBe("T");
+});
+
+// ---------------------------------------------------------------------------
+// Schema v34 (fn-637): cross-epic dep projection — `resolved_epic_deps` +
+// `epic_dep_edges`. The forward stamp + reverse fan-out maintain the
+// projection inside the same BEGIN IMMEDIATE as the EpicSnapshot fold,
+// and the EpicDeleted retract re-stamps downstream consumers to dangling.
+// ---------------------------------------------------------------------------
+
+/** Decode an epic's `resolved_epic_deps` JSON-TEXT column. NULL → null. */
+function getResolvedEpicDeps(epicId: string): Array<{
+  dep_token: string;
+  resolved_epic_id: string | null;
+  epic_number: number | null;
+  project_basename: string | null;
+  cross_project: boolean;
+  state: "satisfied" | "blocked-incomplete" | "dangling";
+}> | null {
+  const row = db
+    .query("SELECT resolved_epic_deps FROM epics WHERE epic_id = ?")
+    .get(epicId) as { resolved_epic_deps: string | null } | null;
+  if (row == null || row.resolved_epic_deps == null) {
+    return null;
+  }
+  return JSON.parse(row.resolved_epic_deps);
+}
+
+test("fn-637: forward stamp on EpicSnapshot computes `resolved_epic_deps` for an empty deps list as '[]' (computed, no deps — distinct from NULL not-yet-computed)", () => {
+  // A first-sight EpicSnapshot with no `depends_on_epics` in the blob lands
+  // `resolved_epic_deps = '[]'` after the forward stamp runs, NOT NULL —
+  // the column transitions from the "not-yet-computed" sentinel to the
+  // "computed, no deps" terminal value inside the fold transaction.
+  epicSnapshotEvent("fn-empty", {
+    epic_number: 1,
+    title: "Empty deps",
+    project_dir: "/repo",
+    status: "open",
+  });
+  drainAll();
+  expect(getResolvedEpicDeps("fn-empty")).toEqual([]);
+});
+
+test("fn-637: forward stamp resolves a satisfied upstream (done + approved) to `state: satisfied`", () => {
+  // Seed the upstream as done+approved FIRST (epicIsCompleted → true).
+  epicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Upstream",
+    project_dir: "/repo",
+    status: "done",
+    approval: "approved",
+  });
+  // Then the consumer depending on the full upstream id.
+  epicSnapshotEvent("fn-2-down", {
+    epic_number: 2,
+    title: "Downstream",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-1-up"],
+  });
+  drainAll();
+  const resolved = getResolvedEpicDeps("fn-2-down");
+  expect(resolved).toEqual([
+    {
+      dep_token: "fn-1-up",
+      resolved_epic_id: "fn-1-up",
+      epic_number: 1,
+      project_basename: "repo",
+      cross_project: false,
+      state: "satisfied",
+    },
+  ]);
+});
+
+test("fn-637: forward stamp resolves a non-done upstream to `state: blocked-incomplete`", () => {
+  epicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Upstream",
+    project_dir: "/repo",
+    status: "open",
+  });
+  epicSnapshotEvent("fn-2-down", {
+    epic_number: 2,
+    title: "Downstream",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-1-up"],
+  });
+  drainAll();
+  const resolved = getResolvedEpicDeps("fn-2-down");
+  expect(resolved?.[0]?.state).toBe("blocked-incomplete");
+});
+
+test("fn-637: forward stamp resolves an unknown token to `state: dangling`", () => {
+  epicSnapshotEvent("fn-1-down", {
+    epic_number: 1,
+    title: "Downstream",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-99-nonexistent"],
+  });
+  drainAll();
+  const resolved = getResolvedEpicDeps("fn-1-down");
+  expect(resolved).toEqual([
+    {
+      dep_token: "fn-99-nonexistent",
+      resolved_epic_id: null,
+      epic_number: null,
+      project_basename: null,
+      cross_project: false,
+      state: "dangling",
+    },
+  ]);
+});
+
+test("fn-637: forward stamp rebuilds `epic_dep_edges` rows for the consumer", () => {
+  epicSnapshotEvent("fn-1-down", {
+    epic_number: 1,
+    title: "Downstream",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-99-x", "fn-7"],
+  });
+  drainAll();
+  const edges = db
+    .query(
+      "SELECT consumer_id, dep_token FROM epic_dep_edges WHERE consumer_id = ? ORDER BY dep_token",
+    )
+    .all("fn-1-down") as { consumer_id: string; dep_token: string }[];
+  expect(edges).toEqual([
+    { consumer_id: "fn-1-down", dep_token: "fn-7" },
+    { consumer_id: "fn-1-down", dep_token: "fn-99-x" },
+  ]);
+});
+
+test("fn-637: forward stamp full-recomputes `epic_dep_edges` on a re-snapshot (deletes old deps not in the new list)", () => {
+  epicSnapshotEvent("fn-1-down", {
+    epic_number: 1,
+    title: "Downstream",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-7", "fn-8"],
+  });
+  drainAll();
+  // Re-snapshot with a different deps list — the old fn-8 edge must drop.
+  epicSnapshotEvent("fn-1-down", {
+    epic_number: 1,
+    title: "Downstream",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-7", "fn-9"],
+  });
+  drainAll();
+  const tokens = (
+    db
+      .query(
+        "SELECT dep_token FROM epic_dep_edges WHERE consumer_id = ? ORDER BY dep_token",
+      )
+      .all("fn-1-down") as { dep_token: string }[]
+  ).map((r) => r.dep_token);
+  expect(tokens).toEqual(["fn-7", "fn-9"]);
+});
+
+test("fn-637: reverse fan-out re-stamps a downstream consumer when the upstream completes (the core bug)", () => {
+  // Consumer first — it sees a non-existent upstream and stamps `dangling`.
+  epicSnapshotEvent("fn-2-down", {
+    epic_number: 2,
+    title: "Downstream",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-1-up"],
+  });
+  drainAll();
+  expect(getResolvedEpicDeps("fn-2-down")?.[0]?.state).toBe("dangling");
+
+  // Upstream appears in `open` state — re-resolves to `blocked-incomplete`.
+  epicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Upstream",
+    project_dir: "/repo",
+    status: "open",
+  });
+  drainAll();
+  expect(getResolvedEpicDeps("fn-2-down")?.[0]?.state).toBe(
+    "blocked-incomplete",
+  );
+
+  // Upstream flips to done+approved — re-stamp to satisfied in the SAME fold.
+  // The reverse fan-out keyed on `dep_token IN (id, fn-number)` catches the
+  // downstream consumer and re-resolves it through `enrichEpicDep`.
+  epicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Upstream",
+    project_dir: "/repo",
+    status: "done",
+    approval: "approved",
+  });
+  drainAll();
+  expect(getResolvedEpicDeps("fn-2-down")?.[0]?.state).toBe("satisfied");
+});
+
+test("fn-637: reverse fan-out catches bare-id (`fn-N`) consumers when the upstream's snapshot lands", () => {
+  // Consumer depends on bare `fn-1` (no slug). Initially dangling.
+  epicSnapshotEvent("fn-2-down", {
+    epic_number: 2,
+    title: "Downstream",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-1"],
+  });
+  drainAll();
+  expect(getResolvedEpicDeps("fn-2-down")?.[0]?.state).toBe("dangling");
+
+  // Upstream appears with epic_number=1. The reverse fan-out's
+  // `dep_token IN (epic_id, 'fn-' || epic_number)` lookup matches the
+  // bare-id consumer and re-stamps it.
+  epicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Upstream",
+    project_dir: "/repo",
+    status: "done",
+    approval: "approved",
+  });
+  drainAll();
+  const resolved = getResolvedEpicDeps("fn-2-down");
+  expect(resolved?.[0]?.dep_token).toBe("fn-1");
+  expect(resolved?.[0]?.resolved_epic_id).toBe("fn-1-up");
+  expect(resolved?.[0]?.state).toBe("satisfied");
+});
+
+test("fn-637: a new same-number epic flips a bare-id consumer to `dangling` (ambiguity)", () => {
+  // First upstream — bare-id consumer resolves to it.
+  epicSnapshotEvent("fn-1-foo", {
+    epic_number: 1,
+    title: "Foo",
+    project_dir: "/repo-a",
+    status: "open",
+  });
+  epicSnapshotEvent("fn-2-down", {
+    epic_number: 2,
+    title: "Downstream",
+    project_dir: "/repo-a",
+    status: "open",
+    depends_on_epics: ["fn-1"],
+  });
+  drainAll();
+  expect(getResolvedEpicDeps("fn-2-down")?.[0]?.resolved_epic_id).toBe(
+    "fn-1-foo",
+  );
+
+  // Second upstream with the SAME epic_number lands in a different project.
+  // Now `fn-1` is ambiguous; the consumer's own project_dir basename
+  // disambiguates (so it stays on fn-1-foo). To force the ambiguity branch
+  // we use a different project on the consumer that matches NEITHER
+  // candidate.
+  epicSnapshotEvent("fn-1-bar", {
+    epic_number: 1,
+    title: "Bar",
+    project_dir: "/repo-b",
+    status: "open",
+  });
+  epicSnapshotEvent("fn-2-down", {
+    epic_number: 2,
+    title: "Downstream",
+    project_dir: "/repo-c",
+    status: "open",
+    depends_on_epics: ["fn-1"],
+  });
+  drainAll();
+  // 2+ candidates, no same-project disambiguator → ambiguous → dangling.
+  expect(getResolvedEpicDeps("fn-2-down")?.[0]?.state).toBe("dangling");
+});
+
+test("fn-637: EpicDeleted re-stamps downstream consumers to `dangling`", () => {
+  epicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Upstream",
+    project_dir: "/repo",
+    status: "done",
+    approval: "approved",
+  });
+  epicSnapshotEvent("fn-2-down", {
+    epic_number: 2,
+    title: "Downstream",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-1-up"],
+  });
+  drainAll();
+  expect(getResolvedEpicDeps("fn-2-down")?.[0]?.state).toBe("satisfied");
+
+  // Tombstone the upstream — the downstream consumer's matching entry
+  // flips to dangling in the same fold via the reverse fan-out.
+  insertEvent({
+    hook_event: "EpicDeleted",
+    session_id: "fn-1-up",
+    data: JSON.stringify({}),
+  });
+  drainAll();
+  expect(getResolvedEpicDeps("fn-2-down")?.[0]?.state).toBe("dangling");
+});
+
+test("fn-637: ON CONFLICT carve-out preserves `resolved_epic_deps` across a re-snapshot of the consumer (approval RPC round-trip)", () => {
+  // Seed the upstream + downstream with a real dep, so the consumer's
+  // resolved_epic_deps holds a non-trivial enriched entry.
+  epicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Upstream",
+    project_dir: "/repo",
+    status: "done",
+    approval: "approved",
+  });
+  epicSnapshotEvent("fn-2-down", {
+    epic_number: 2,
+    title: "Downstream",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-1-up"],
+  });
+  drainAll();
+  const before = getResolvedEpicDeps("fn-2-down");
+
+  // Re-snapshot the consumer with the SAME depends_on_epics list. The forward
+  // stamp re-runs and produces the same projection — the byte-identical
+  // re-emit confirms the carve-out + the forward stamp are end-to-end stable.
+  epicSnapshotEvent("fn-2-down", {
+    epic_number: 2,
+    title: "Downstream",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-1-up"],
+  });
+  drainAll();
+  const after = getResolvedEpicDeps("fn-2-down");
+  expect(after).toEqual(before);
+});
+
+test("fn-637: re-fold determinism — rewind + DELETE epics + DELETE epic_dep_edges + re-drain reproduces both projections byte-identically", () => {
+  // Seed a mixed sequence: a satisfied upstream, a blocked-incomplete
+  // upstream, a dangling consumer, plus a bare-id reverse fan-out, plus
+  // an EpicDeleted.
+  epicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Up",
+    project_dir: "/repo",
+    status: "open",
+  });
+  epicSnapshotEvent("fn-2-up", {
+    epic_number: 2,
+    title: "Up2",
+    project_dir: "/repo",
+    status: "done",
+    approval: "approved",
+  });
+  epicSnapshotEvent("fn-3-down", {
+    epic_number: 3,
+    title: "Down",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-1-up", "fn-2-up", "fn-99-missing"],
+  });
+  // Upstream flips to done+approved — downstream re-stamp.
+  epicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Up",
+    project_dir: "/repo",
+    status: "done",
+    approval: "approved",
+  });
+  // Bare-id consumer + EpicDeleted on another upstream.
+  epicSnapshotEvent("fn-4-bare", {
+    epic_number: 4,
+    title: "Bare",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-2"],
+  });
+  insertEvent({
+    hook_event: "EpicDeleted",
+    session_id: "fn-2-up",
+    data: JSON.stringify({}),
+  });
+  drainAll();
+
+  const beforeEpics = db
+    .query(
+      "SELECT epic_id, depends_on_epics, resolved_epic_deps FROM epics ORDER BY epic_id",
+    )
+    .all();
+  const beforeEdges = db
+    .query(
+      "SELECT consumer_id, dep_token FROM epic_dep_edges ORDER BY consumer_id, dep_token",
+    )
+    .all();
+
+  // Rewind + wipe + re-drain. Re-fold determinism: the post-rewind rows
+  // must equal byte-for-byte the pre-rewind rows.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM epic_dep_edges");
+  drainAll();
+
+  const afterEpics = db
+    .query(
+      "SELECT epic_id, depends_on_epics, resolved_epic_deps FROM epics ORDER BY epic_id",
+    )
+    .all();
+  const afterEdges = db
+    .query(
+      "SELECT consumer_id, dep_token FROM epic_dep_edges ORDER BY consumer_id, dep_token",
+    )
+    .all();
+
+  expect(afterEpics).toEqual(beforeEpics);
+  expect(afterEdges).toEqual(beforeEdges);
+});
+
+test("fn-637: multiple deps preserve source order in `resolved_epic_deps` (mirrors `depends_on_epics`)", () => {
+  // Source order is locked: the enriched entries appear in the same order
+  // the consumer's `depends_on_epics` array lists them. A stable iteration
+  // order is what readiness predicate 9 + the board pill consume.
+  epicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Up1",
+    project_dir: "/repo",
+    status: "open",
+  });
+  epicSnapshotEvent("fn-2-up", {
+    epic_number: 2,
+    title: "Up2",
+    project_dir: "/repo",
+    status: "done",
+    approval: "approved",
+  });
+  epicSnapshotEvent("fn-3-down", {
+    epic_number: 3,
+    title: "Down",
+    project_dir: "/repo",
+    status: "open",
+    depends_on_epics: ["fn-2-up", "fn-1-up", "fn-99-x"],
+  });
+  drainAll();
+  const tokens = (getResolvedEpicDeps("fn-3-down") ?? []).map(
+    (e) => e.dep_token,
+  );
+  expect(tokens).toEqual(["fn-2-up", "fn-1-up", "fn-99-x"]);
 });
 
 // ---------------------------------------------------------------------------
