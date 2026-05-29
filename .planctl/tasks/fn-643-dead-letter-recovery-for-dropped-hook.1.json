@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-29T15:00:36.105354Z",
+  "depends_on": [],
+  "epic": "fn-643-dead-letter-recovery-for-dropped-hook",
+  "id": "fn-643-dead-letter-recovery-for-dropped-hook.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "dead_letters table, record schema, collection",
+  "updated_at": "2026-05-29T15:00:36.105354Z"
+}

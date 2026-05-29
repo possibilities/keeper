@@ -1,0 +1,19 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-29T15:00:36.105354Z",
+  "depends_on": [
+    "fn-643-dead-letter-recovery-for-dropped-hook.1",
+    "fn-643-dead-letter-recovery-for-dropped-hook.2",
+    "fn-643-dead-letter-recovery-for-dropped-hook.3",
+    "fn-643-dead-letter-recovery-for-dropped-hook.4",
+    "fn-643-dead-letter-recovery-for-dropped-hook.5"
+  ],
+  "epic": "fn-643-dead-letter-recovery-for-dropped-hook",
+  "id": "fn-643-dead-letter-recovery-for-dropped-hook.6",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "docs, invariants, final sweep",
+  "updated_at": "2026-05-29T15:00:36.105354Z"
+}
