@@ -53,5 +53,5 @@ per keypress.
 - [ ] readiness-client first-paint gate widened to 5 collections; stale "three/all-three" comments fixed.
 
 ## Done summary
-
+Board surfaces persistent warn pill [dead-letter:N] from the new 5th readiness collection (dead_letters with status=waiting filter); 'r' keypress opens a fresh RPC connection to send replay_dead_letter and flashes status. First-paint gate widened to 5 collections; empty steady state still clears.
 ## Evidence
