@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-29T01:22:02.387083Z",
+  "depends_on": [],
+  "epic": "fn-637-project-epic-deps-onto-epic-entities",
+  "id": "fn-637-project-epic-deps-onto-epic-entities.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Add resolved-deps column and reverse-index table",
+  "updated_at": "2026-05-29T01:22:02.387083Z"
+}
