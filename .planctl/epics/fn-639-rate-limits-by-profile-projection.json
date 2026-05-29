@@ -2,9 +2,11 @@
   "branch_name": "fn-639-rate-limits-by-profile-projection",
   "bundles": [],
   "created_at": "2026-05-29T02:23:57.076919Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-637-project-epic-deps-onto-epic-entities"
+  ],
   "id": "fn-639-rate-limits-by-profile-projection",
-  "last_validated_at": "2026-05-29T02:23:57.243180Z",
+  "last_validated_at": "2026-05-29T02:24:34.849016Z",
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -15,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-29T02:23:57.076919Z"
+  "updated_at": "2026-05-29T02:24:34.805021Z"
 }
