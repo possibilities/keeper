@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-29T14:45:21.690852Z",
+  "depends_on": [],
+  "epic": "fn-642-colocate-rate-limit-into-usage",
+  "id": "fn-642-colocate-rate-limit-into-usage.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "keeper server-side projection join",
+  "updated_at": "2026-05-29T14:45:21.690852Z"
+}

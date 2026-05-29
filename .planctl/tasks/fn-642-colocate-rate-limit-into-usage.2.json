@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-29T14:45:21.690852Z",
+  "depends_on": [
+    "fn-642-colocate-rate-limit-into-usage.1"
+  ],
+  "epic": "fn-642-colocate-rate-limit-into-usage",
+  "id": "fn-642-colocate-rate-limit-into-usage.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "keeper usage.ts colocation + drop block",
+  "updated_at": "2026-05-29T14:45:21.690852Z"
+}
