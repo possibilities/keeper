@@ -275,6 +275,34 @@ export interface DispatchEntry {
 // --- command rendering (module-scope so test/autopilot.test.ts can import) ---
 
 /**
+ * Build the shell command autopilot hands to `launchInGhostty` at a real
+ * dispatch site. Encodes the load-bearing linkage contract: every spawned
+ * `claude` carries `--name <verb>::<id>` so the SessionStart hook freezes
+ * `events.spawn_name`, the deriver yields `plan_ref={verb,id}`, and the
+ * reducer's `syncJobIntoEpic` fan-out routes the session into the
+ * embedded `task.jobs[]` array (or epic `jobs[]` for close/approve-close).
+ *
+ * The emitted name MUST match the deriver regex in `src/derivers.ts`
+ * (`SPAWN_VERB_REF_RE`): `^(plan|work|close|approve)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$`.
+ * Per the epic spec: `work` uses the task id (`fn-N-slug.M`), `close` and
+ * `approve` use the appropriate id form chosen by the caller (task id for
+ * a task-level approve, epic id for close + approve-close).
+ *
+ * NOTE: This helper is the dispatch channel ONLY. The display builders
+ * (`renderEpicCommands` / `renderEpicCommandsFiltered`) intentionally emit
+ * the bare human-readable form without `--name`; their byte-exact tests at
+ * test/autopilot.test.ts:106-138 pin that shape.
+ */
+export function buildClaudeDispatchCommand(
+  verb: "work" | "close" | "approve",
+  id: string,
+  projectDir: string,
+): string {
+  const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
+  return `${cdPrefix}claude --name ${verb}::${id} '/plan:${verb} ${id}'`;
+}
+
+/**
  * Render the command block for a single epic: two lines per task (work +
  * approve), then two lines for the virtual close row (close + approve).
  *
@@ -1665,12 +1693,11 @@ async function main(): Promise<void> {
           task.target_repo != null && seg(task.target_repo) !== ""
             ? seg(task.target_repo)
             : projectDir;
-        const cdPrefix = dir === "" ? "" : `cd ${dir} && `;
         const dirBase = dir === "" ? "" : basename(dir);
         if (cur === "ready") {
           workCloseDispatches.push(() =>
             launchInGhostty(
-              `${cdPrefix}claude '/plan:work ${taskId}'`,
+              buildClaudeDispatchCommand("work", taskId, dir),
               `task ${taskId}`,
               dirBase,
               dir,
@@ -1681,7 +1708,7 @@ async function main(): Promise<void> {
         } else if (cur === "blocked:job-pending") {
           approveDispatches.push(() =>
             launchInGhostty(
-              `${cdPrefix}claude '/plan:approve ${taskId}'`,
+              buildClaudeDispatchCommand("approve", taskId, dir),
               `approve task ${taskId}`,
               dirBase,
               dir,
@@ -1702,12 +1729,11 @@ async function main(): Promise<void> {
         if (closePrev !== closeCur) {
           logTransition(closeKey, closePrev, closeCur, closeDetail(epic, snap));
           lastVerdictSig.set(closeKey, closeCur);
-          const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
           const dirBase = projectDir === "" ? "" : basename(projectDir);
           if (closeCur === "ready") {
             workCloseDispatches.push(() =>
               launchInGhostty(
-                `${cdPrefix}claude '/plan:close ${epicId}'`,
+                buildClaudeDispatchCommand("close", epicId, projectDir),
                 `close ${epicId}`,
                 dirBase,
                 projectDir,
@@ -1718,7 +1744,7 @@ async function main(): Promise<void> {
           } else if (closeCur === "blocked:job-pending") {
             approveDispatches.push(() =>
               launchInGhostty(
-                `${cdPrefix}claude '/plan:approve ${epicId}'`,
+                buildClaudeDispatchCommand("approve", epicId, projectDir),
                 `approve close ${epicId}`,
                 dirBase,
                 projectDir,

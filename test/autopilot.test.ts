@@ -32,6 +32,7 @@ import type {
   DispatchEntry,
 } from "../scripts/autopilot";
 import {
+  buildClaudeDispatchCommand,
   detectJobTransitions,
   hydrateDispatchLog,
   predictNextDispatches,
@@ -181,6 +182,106 @@ test("renderEpicCommandsFiltered — empty-task epic with ready close emits clos
   expect(filtered).not.toBeNull();
   expect(filtered).toContain("claude '/plan:close fn-1-foo'");
   expect(filtered).not.toContain("plan:work");
+});
+
+// ---------------------------------------------------------------------------
+// buildClaudeDispatchCommand — the LIVE dispatch channel (separate from the
+// display builders). The four real `processLaunchTransitions` sites all
+// route through this helper, so it is the single chokepoint where keeper's
+// `--name <verb>::<id>` linkage contract is enforced. The emitted token
+// MUST match the deriver regex in `src/derivers.ts` (`SPAWN_VERB_REF_RE`):
+//   ^(plan|work|close|approve)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$
+// Failure mode if the name is wrong (or absent): SessionStart's `ps`
+// scrape yields null, `plan_ref` derives null, `syncJobIntoEpic` no-ops,
+// and the spawned session never enters `task.jobs[]` — the readiness
+// predicates and the per-root dispatch mutex go blind to it (the P1
+// failure this task closes).
+// ---------------------------------------------------------------------------
+
+// Mirror of the deriver regex at src/derivers.ts:88 — duplicated here so
+// the test pins the on-the-wire contract independently of derivers.ts
+// drift. If derivers.ts changes the regex, BOTH places must update.
+const SPAWN_VERB_REF_RE =
+  /^(plan|work|close|approve)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$/;
+
+function extractNameToken(command: string): string | null {
+  // Mirror of `nameFromArgs` at plugin/hooks/events-writer.ts:125. The
+  // single-token rule matters: macOS `ps -o args=` space-joins argv, so
+  // the scrape can only see the first whitespace-delimited token after
+  // `--name `. The verb::id alphabet (`a-z`, `0-9`, `:`, `-`, `.`) has
+  // no whitespace, so this is faithful as long as the dispatch helper
+  // emits the form `--name <token> ` with a trailing space.
+  const m = command.match(/(?:^|\s)(?:--name[= ]|-n )(\S+)/);
+  return m?.[1] ?? null;
+}
+
+test("buildClaudeDispatchCommand — work uses task id, name matches deriver regex", () => {
+  const cmd = buildClaudeDispatchCommand("work", "fn-1-foo.3", "/repo");
+  expect(cmd).toContain("--name work::fn-1-foo.3");
+  expect(cmd).toContain("'/plan:work fn-1-foo.3'");
+  expect(cmd.startsWith("cd /repo && ")).toBe(true);
+
+  const token = extractNameToken(cmd);
+  expect(token).toBe("work::fn-1-foo.3");
+  expect(SPAWN_VERB_REF_RE.test(token!)).toBe(true);
+});
+
+test("buildClaudeDispatchCommand — close uses epic id (no dot suffix), name matches deriver regex", () => {
+  const cmd = buildClaudeDispatchCommand("close", "fn-1-foo", "/repo");
+  expect(cmd).toContain("--name close::fn-1-foo");
+  expect(cmd).toContain("'/plan:close fn-1-foo'");
+
+  const token = extractNameToken(cmd);
+  expect(token).toBe("close::fn-1-foo");
+  expect(SPAWN_VERB_REF_RE.test(token!)).toBe(true);
+});
+
+test("buildClaudeDispatchCommand — approve (task scope) carries task id", () => {
+  const cmd = buildClaudeDispatchCommand("approve", "fn-1-foo.3", "/repo");
+  expect(cmd).toContain("--name approve::fn-1-foo.3");
+  expect(cmd).toContain("'/plan:approve fn-1-foo.3'");
+
+  const token = extractNameToken(cmd);
+  expect(token).toBe("approve::fn-1-foo.3");
+  expect(SPAWN_VERB_REF_RE.test(token!)).toBe(true);
+});
+
+test("buildClaudeDispatchCommand — approve (close scope) carries epic id", () => {
+  const cmd = buildClaudeDispatchCommand("approve", "fn-1-foo", "/repo");
+  expect(cmd).toContain("--name approve::fn-1-foo");
+  expect(cmd).toContain("'/plan:approve fn-1-foo'");
+
+  const token = extractNameToken(cmd);
+  expect(token).toBe("approve::fn-1-foo");
+  expect(SPAWN_VERB_REF_RE.test(token!)).toBe(true);
+});
+
+test("buildClaudeDispatchCommand — empty projectDir omits the cd prefix", () => {
+  // `dir === ""` is the no-cd path taken when neither task.target_repo
+  // nor epic.project_dir produced a non-empty `seg`. The bare command
+  // must still carry the --name flag so the linkage contract holds even
+  // when autopilot can't cd anywhere.
+  const cmd = buildClaudeDispatchCommand("work", "fn-1-foo.3", "");
+  expect(cmd.startsWith("cd ")).toBe(false);
+  expect(cmd).toBe("claude --name work::fn-1-foo.3 '/plan:work fn-1-foo.3'");
+});
+
+test("buildClaudeDispatchCommand — name token is single-token (no spaces, no shell metachars)", () => {
+  // macOS `ps -o args=` scrape only reads up to the first whitespace
+  // after `--name `. A space in the token would silently truncate the
+  // scrape. Also pins the no-shell-metachar property: the launchInGhostty
+  // quoting chain (sh -c → /bin/zsh -l -i -c → AppleScript) is safe as
+  // long as the verb::id token uses only `[a-z0-9:.-]`.
+  for (const verb of ["work", "close", "approve"] as const) {
+    for (const id of ["fn-1-foo", "fn-1-foo.3", "fn-638-harden-autopilot.12"]) {
+      const cmd = buildClaudeDispatchCommand(verb, id, "/repo");
+      const token = extractNameToken(cmd);
+      expect(token).not.toBeNull();
+      expect(token!).not.toContain(" ");
+      expect(token!).toMatch(/^[a-z0-9:.-]+$/);
+      expect(SPAWN_VERB_REF_RE.test(token!)).toBe(true);
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------
