@@ -129,7 +129,30 @@ the native value" is the default.
   resume never clobbers a seeded name. The v35→v36 migrate adds the
   nullable column and runs a one-time version-guarded backfill deriving
   `profile_name` from each existing row's `config_dir` via the same
-  helper (byte-identical so a from-scratch re-fold converges).) and bumps
+  helper (byte-identical so a from-scratch re-fold converges).) AND the
+  schema-v37 (fn-643) `dead_letters` OPERATIONAL sidecar fan-outs — a
+  pair of arms that live OUTSIDE the reducer's projection writes because
+  the table is NOT a reducer projection. The import arm runs in main
+  (NOT inside `BEGIN IMMEDIATE` against the event cursor): on every
+  dead-letter-watcher message AND once at boot, main scans
+  `~/.local/state/keeper/dead-letters/`, reads each per-pid NDJSON file,
+  parses each line via `parseDeadLetterLine`, and `INSERT OR IGNORE INTO
+  dead_letters` keyed by `dl_id` — `OR IGNORE` makes the import
+  idempotent under re-scan (drop-overrun re-scans, boot re-scans, live
+  re-scans all converge on the same set). The replay arm runs in main
+  when the server-worker bridges a `replay_dead_letter` RPC: in ONE
+  `BEGIN IMMEDIATE` main picks the oldest `waiting` row, appends a plain
+  REAL `events` row with the row's preserved `bindings` + `ts` + real
+  pid, captures the new `events.id`, and flips the dead-letter row's
+  `status` to `recovered` while stamping `recovered_at` + `replayed_event_id`.
+  The appended event then folds through the normal id-ordered drain on
+  the next wake — re-fold determinism is preserved because the event log
+  carries the recovered event with a fresh, higher id (re-fold from
+  `last_event_id = 0` replays it in order), and the `dead_letters`
+  sidecar is excluded from the re-fold reset (`DELETE FROM jobs;
+  DELETE FROM epics` MUST NOT touch `dead_letters` — dead letters are
+  the audit log of events that NEVER MADE IT into the event log to be
+  folded, so a re-fold cannot reproduce them).) and bumps
   `reducer_state.last_event_id` in one transaction. A crash mid-fold rolls
   back both; boot drain re-folds idempotently. This is the
   exactly-once-per-event guarantee — never split the two writes across
@@ -144,9 +167,14 @@ the native value" is the default.
 - **A malformed `data` blob (or stored JSON array) skips/folds to a safe value and
   the cursor still advances** — never throw inside the fold transaction; a throw
   rolls back the cursor and wedges the reducer.
-- **The hook is the sole writer of *hook* events; main is the sole writer of
-  *synthetic* events; the server-worker writes the `approval` field on
-  external `.planctl` JSON files (via atomic temp+rename) and nothing else.**
+- **The hook is the sole writer of *hook* events AND of per-pid NDJSON
+  dead-letter files; main is the sole writer of *synthetic* events AND of
+  the `dead_letters` operational sidecar AND of the delayed-real-event
+  replay path; the server-worker writes the `approval` field on external
+  `.planctl` JSON files (via atomic temp+rename) AND bridges
+  `replay_dead_letter` calls to main (it does not write the event log
+  itself — it routes the call to main, which owns every event-log write)
+  and nothing else.**
   Every projection-driving fact lives in the immutable event log — never
   written straight to `jobs`/`epics` — so a re-fold from scratch (rewind
   cursor, `DELETE FROM jobs`/`epics`, re-drain) reproduces byte-identical
@@ -257,11 +285,18 @@ the native value" is the default.
   slot in `migrate()`. Idempotent steps may run unguarded; a non-idempotent step
   (data backfill, destructive DROP) MUST be version-guarded so a re-run can't
   corrupt an already-migrated schema. Bump `SCHEMA_VERSION` only when adding an
-  ALTER; never reduce it, never branch. The daemon is the SOLE migrator; the
+  ALTER; never reduce it, never branch. Current version: **v37** (fn-643 —
+  `dead_letters` operational sidecar table for hook-INSERT failure recovery;
+  the slot stamps the version-bump but adds no data backfill — the table
+  populates exclusively from the daemon's import scan against the per-pid
+  NDJSON dead-letter files). The daemon is the SOLE migrator; the
   hook (`plugin/hooks/events-writer.ts`) opens with `{ migrate: false }` and
   never runs schema convergence. A hook arriving against a missing/stale schema
-  fails its INSERT and exits 0 per the "never block Claude" contract — silent
-  event loss is the accepted failure mode.
+  fails its INSERT and — as of v37 — writes a per-pid NDJSON dead-letter file
+  to `~/.local/state/keeper/dead-letters/` so the dropped event becomes
+  recoverable via the `replay_dead_letter` RPC instead of silently lost; the
+  hook still exits 0 per the "never block Claude" contract. Silent event
+  loss is no longer the default failure mode — visible-but-recoverable is.
 
 ## DO NOT
 
@@ -276,25 +311,45 @@ the native value" is the default.
   per-file single-flight lock owned by the server-worker; the reply is an
   `rpc_result` (or an `error` with code `unknown_method` / `bad_params` /
   `rpc_failed`). RPC handlers MUST NOT write reducer projections (`jobs` /
-  `epics`), sidecar tables, or the `events` log directly: projection changes
-  round-trip through the plan-worker file watcher and the synthetic-event
-  path, so a from-scratch re-fold sees every approval change exactly as it
-  was observed. The concrete RPCs are `set_task_approval` and
-  `set_epic_approval`; the protocol shape, the dispatch registry, and the
-  writer lifecycle are built as a generic foundation, not welded to those
-  two handlers.
-- **The `approval` field is RPC-writable on `.planctl` files; everything else
-  is not.** `set_task_approval` and `set_epic_approval` write the top-level
-  `approval` field (`"approved" | "rejected" | "pending"`) on the target
-  task or epic JSON via atomic temp+rename in the same directory as the
-  target. The change is observed by `@parcel/watcher`, lifted into an
-  `EpicSnapshot` / `TaskSnapshot` event by the plan worker, and folded into
-  the `epics` projection — re-fold determinism is preserved because the
-  event log carries every approval transition. A missing or invalid
-  `approval` value folds to `"pending"` per the "safe value" invariant.
-  *Why this is the only RPC-writable field:* approval is the one piece of
-  human state that has no Claude Code hook to attach it to; every other
-  planctl field is the planner's or worker's job.
+  `epics`) directly: projection changes round-trip through the plan-worker
+  file watcher and the synthetic-event path, so a from-scratch re-fold
+  sees every approval change exactly as it was observed. The concrete RPCs
+  are `set_task_approval`, `set_epic_approval`, and `replay_dead_letter`
+  (schema v37 / fn-643 — the server-worker bridges the call to main,
+  which appends a plain real event with the dead-letter row's preserved
+  bindings/ts and flips the audit row to `recovered` in ONE
+  `BEGIN IMMEDIATE`; the server-worker itself does NOT write the event
+  log, and the `dead_letters` write IS a sidecar-table write but it is
+  EXPLICITLY scoped — only `replay_dead_letter` may touch it, only via
+  main's bridge, and the same transaction appends the real event so the
+  flip and the recovery are atomic on the log side). The protocol shape,
+  the dispatch registry, and the writer lifecycle are built as a generic
+  foundation, not welded to these three handlers.
+- **RPC writes are scoped to two surfaces — the `approval` field on
+  `.planctl` files, and the delayed-real-event replay path (`dead_letters`
+  + the `events` log via main).** `set_task_approval` and `set_epic_approval`
+  write the top-level `approval` field (`"approved" | "rejected" | "pending"`)
+  on the target task or epic JSON via atomic temp+rename in the same
+  directory as the target. The change is observed by `@parcel/watcher`,
+  lifted into an `EpicSnapshot` / `TaskSnapshot` event by the plan worker,
+  and folded into the `epics` projection — re-fold determinism is preserved
+  because the event log carries every approval transition. A missing or
+  invalid `approval` value folds to `"pending"` per the "safe value"
+  invariant. `replay_dead_letter` (schema v37 / fn-643) is the delayed-
+  real-event surface: the server-worker bridges to main, which picks the
+  oldest `waiting` `dead_letters` row, appends a plain real `events` row
+  with the row's preserved `bindings` + `ts` + real pid, and flips the
+  audit row to `recovered` in ONE `BEGIN IMMEDIATE`. The appended event
+  is INDISTINGUISHABLE from a fresh hook insert — it folds through the
+  normal id-ordered drain on the next wake — so re-fold determinism
+  holds even though the write was triggered by an RPC: the event log is
+  still the authoritative source of every projection-driving fact, and
+  the `dead_letters` sidecar is excluded from the re-fold reset.
+  *Why these are the only RPC-writable surfaces:* approval is the one
+  piece of human state that has no Claude Code hook to attach it to;
+  replay is the recovery path for events the hook tried to write and
+  failed to insert. Every other planctl field is the planner's or
+  worker's job, and every other event-log write belongs to the hook.
 - **No kernel file watchers ON KEEPER'S OWN SQLite DB** (`fs.watch`, FSEvents,
   kqueue, chokidar). *Why:* they drop same-process writes and miss WAL writes on
   macOS. Use `PRAGMA data_version` polling on a read-only connection as the only

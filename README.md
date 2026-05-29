@@ -84,7 +84,7 @@ and the boot drain re-converges idempotently after any downtime or crash.
 Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names
 a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
-page that doubles as a live subscription. Six collections register today —
+page that doubles as a live subscription. Seven collections register today —
 `jobs` (the first and default), `epics` (the read-only plans surface — each
 epic embeds its tasks as a JSON array, so there is no separate `tasks`
 collection; both the epic and each embedded task carry an `approval` field
@@ -114,7 +114,15 @@ last `rate_limit` ApiError with each profile; schema v35 adds the
 derived `profile_name = basename(config_dir)` join key against
 `usage.id`; the
 `''` sentinel collapses default `~/.claude` so a single PK groups every
-NULL-`CLAUDE_CONFIG_DIR` session). The
+NULL-`CLAUDE_CONFIG_DIR` session), and `dead_letters` (schema v37, fn-643 —
+the OPERATIONAL sidecar table, one row per unrecoverable hook INSERT failure
+imported from the per-pid NDJSON files the hook writes to
+`~/.local/state/keeper/dead-letters/` when its bounded retry exhausts;
+keyed by `dl_id` and idempotent under re-scan; status flips
+`waiting → recovered` only when the human triggers the `replay_dead_letter`
+RPC. It is NOT a reducer projection — re-folding the event log never touches
+it, because dead letters are the audit log of events that NEVER made it into
+the event log to be folded). The
 surface is built so additional collections register without touching the
 wire protocol or the diff machinery. Page membership is frozen at query time,
 but each row's cells stream `patch` frames as the reducer folds new events.
@@ -128,18 +136,27 @@ The QUERY surface is read-only: the server is just another reader on its own
 read-only connection, polling `data_version` like the reducer-wake worker.
 **Mutation is a separate, scoped path:** the same socket carries `rpc` request
 frames that dispatch to registered server-side handlers, which write *external
-resources* through a dedicated writer owned by the server-worker. The two
-concrete RPCs are `set_task_approval` and `set_epic_approval`; each writes
+resources* through a dedicated writer owned by the server-worker. The three
+concrete RPCs are `set_task_approval` and `set_epic_approval` (each writes
 the top-level `approval` field on the target `.planctl/{epics,tasks}/<id>.json`
-file via atomic temp+rename under a per-file single-flight lock. The change
+file via atomic temp+rename under a per-file single-flight lock — the change
 is observed by `@parcel/watcher` and round-trips through the plan worker as
 an `EpicSnapshot` / `TaskSnapshot` event, so the reducer's `epics` projection
 and the `events` log keep their canonical-owner writers and re-fold
-determinism extends to approval (rewind cursor + re-drain reproduces approval
-state byte-identically). RPC handlers MAY write `.planctl` files, never
-reducer projections directly (see [CLAUDE.md](./CLAUDE.md)'s DO NOT list).
-Three example clients ship in `scripts/` (`board.ts`, `autopilot.ts`,
-and `approve.ts`); see [Example clients](#example-clients) for usage.
+determinism extends to approval) and `replay_dead_letter` (the scoped
+synthetic-event-write recovery verb added by schema v37 / fn-643: the
+server-worker bridges the call to main via the in-process message bus,
+and main picks the oldest `waiting` row from `dead_letters`, appends a
+plain real event with the row's preserved `bindings` + `ts`, and flips
+`status` to `recovered` in ONE `BEGIN IMMEDIATE` — the recovered event
+then folds through the normal id-ordered drain, and the audit row keeps
+its `replayed_event_id` for posterity). RPC handlers MAY write
+`.planctl` files and — via the scoped main-bridge — append real events
+to the log AND flip the `dead_letters` audit row in one transaction;
+never reducer projections directly (see [CLAUDE.md](./CLAUDE.md)'s DO
+NOT list). Three example clients ship in `scripts/` (`board.ts`,
+`autopilot.ts`, and `approve.ts`); see [Example clients](#example-clients)
+for usage.
 
 ## What keeper is NOT
 
@@ -449,6 +466,16 @@ CI) `--live` silently behaves as if it wasn't set. Run any of them with
   `pending` / `todo` / `unvalidated` / `unknown` / `open` and the role
   labels (`planner|worker|closer|creator|refiner`) out by absence of
   color.
+  The banner status line carries a persistent `[dead-letter:N]` warn pill
+  (schema v37, fn-643) when the `dead_letters` collection has waiting rows;
+  the `r` keypress fires the `replay_dead_letter` RPC (single-shot
+  `rpc` → `rpc_result`), recovering the OLDEST waiting row — the daemon
+  appends a plain real event and flips the audit row to `recovered` in one
+  transaction. The board flashes `[replaying…]` immediately, then
+  `[recovered <dl_id>]` / `[nothing to replay]` / `[replay failed: …]`
+  for ~1.5 s before the persistent `[dead-letter:N]` pill resumes; on
+  success the dropped session reappears in the next frame and `N` drops
+  by one.
   The byte-compare emit gate keeps the stream quiet when row churn
   doesn't surface in the render. Reconnects across keeperd restarts;
   Ctrl-C unsubscribes cleanly. Every emitted frame is mirrored to three
@@ -759,6 +786,31 @@ The colocation drops `scripts/usage.ts`'s "Rate limits by profile"
 block: each tracked profile's usage stack now carries a `rate-limited
 <rel>` line off the same row; untracked profiles render no rate-limit
 annotation.
+As of schema v37 (fn-643), keeper recovers dropped hook events instead
+of silently losing them. The hook's `events` INSERT gains a bounded retry
+on `SQLITE_BUSY` / `SQLITE_LOCKED`; on final failure it writes a per-pid
+NDJSON dead-letter file to `~/.local/state/keeper/dead-letters/` carrying
+a self-describing record (`dl_id`, all derived insert bindings, and the
+SessionStart-scraped `spawn_name` / `start_time` / `config_dir`) and
+still exits 0 (the "never block Claude" contract). The daemon imports
+those files into the new `dead_letters` operational sidecar table at
+boot AND live via a seventh worker (the dead-letter watcher), keyed by
+`dl_id` so re-scans never duplicate. Import is OPERATIONAL, not a fold:
+the table is NOT a reducer projection and the from-scratch re-fold reset
+(`UPDATE reducer_state SET last_event_id = 0; DELETE FROM jobs;
+DELETE FROM epics`) MUST NOT touch it — dead letters are the audit log
+of events that never made it into the event log to be folded.
+Recovery is a deliberate one-at-a-time human action: the board renders
+the count as a persistent `[dead-letter:N]` warn pill in its banner;
+the `r` keypress fires the `replay_dead_letter` RPC, which routes
+board → socket → server-worker → main and lets main append a plain
+real event (full bindings, real pid, preserved `ts`) AND flip the row
+to `recovered` in ONE `BEGIN IMMEDIATE`. The recovered event then folds
+through the normal id-ordered drain; the dropped session reappears in
+the board (with its full lifecycle, since the original event log carried
+nothing for it) and `N` drops by one. The schema bump is v36→v37; fn-642
+(`profile_name` jobs column) occupies the v35→v36 slot ahead of this
+work.
 As of schema v25, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `last_api_error_at` /
 `last_api_error_kind` / `last_input_request_at` /
@@ -841,12 +893,28 @@ instance — read-only / write-free, feeding the log only via main — and its
 kqueue/pidfd fd is owned by the worker thread, released in its own shutdown
 handler.
 
-The six workers are fully independent; main supervises all six lifecycles
+A **seventh** Worker thread is the dead-letter watcher (schema v37, fn-643):
+it watches `~/.local/state/keeper/dead-letters/` with `@parcel/watcher` and
+posts a contentless `{kind: "dead-letter-changed"}` message to main on every
+change. Main owns the actual `dead_letters` write — scans the dir, reads
+each NDJSON file, parses each line, and `INSERT OR IGNORE`s into
+`dead_letters` keyed by `dl_id` (idempotent under re-scan). The worker
+holds no DB connection (main is the sole writer of operational rows too),
+just the watcher subscription, released in its own shutdown handler.
+Missing-dir tolerance: a fresh machine has no `dead-letters/` tree until
+the hook hits its first drop; the worker tolerates absence at spawn and
+the watch installs lazily once main first imports. Like the other
+external-tree watchers it self-recovers from FSEvents drop-overruns via
+the shared debounced re-scan scheduler. Distinct from the other six
+producers it does NOT mint synthetic `events` rows — the import is a
+direct operational-table write — and it is NOT a fold.
+
+The seven workers are fully independent; main supervises all seven lifecycles
 but routes none of their traffic, and any worker's `error` event escalates
 the whole process to a clean restart — with that single scoped exception, the
-recoverable drop signal on the transcript and plan watchers, which
-deliberately does NOT escalate (a re-scan throw is swallowed, never reaching
-the restart path).
+recoverable drop signal on the transcript, plan, usage, and dead-letter
+watchers, which deliberately does NOT escalate (a re-scan throw is swallowed,
+never reaching the restart path).
 
 Readiness is a client-side library today, not a server-side collection.
 `src/readiness.ts` is the shared verdict pipeline consumed by
@@ -943,6 +1011,14 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 # Profiles projection — schema v33 (fn-639). One row per Claude profile directory keyed by config_dir (the CLAUDE_CONFIG_DIR env value captured at SessionStart; the '' sentinel collapses default ~/.claude). Quiet profiles render with NULL last_rate_limit_at; a rate_limit stamps (last_rate_limit_at, last_rate_limit_session_id) keyed on the same COALESCE(config_dir,'') expression as the SessionStart seed so a NULL-config session's rate limit lands on the exact '' row it seeded:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT config_dir, datetime(last_rate_limit_at,'unixepoch','localtime') AS last_rl_at, last_rate_limit_session_id FROM profiles ORDER BY config_dir ASC"
+
+# dead_letters operational sidecar — schema v37 (fn-643). One row per unrecoverable hook INSERT failure imported from ~/.local/state/keeper/dead-letters/<pid>.ndjson. status flips waiting → recovered when the human triggers the replay_dead_letter RPC; recovered rows keep replayed_event_id pointing at the appended real event. NOT a reducer projection — re-folding the event log never touches this table:
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT dl_id, status, datetime(dl_written_at,'unixepoch','localtime') AS written, datetime(recovered_at,'unixepoch','localtime') AS recovered, replayed_event_id FROM dead_letters ORDER BY dl_written_at ASC LIMIT 20"
+
+# Waiting dead-letter count (what board.ts's [dead-letter:N] pill renders):
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT count(*) FROM dead_letters WHERE status = 'waiting'"
 
 # Raw event log tail (synthetic EpicSnapshot/TaskSnapshot/EpicDeleted/TaskDeleted rows appear here too):
 sqlite3 ~/.local/state/keeper/keeper.db \
