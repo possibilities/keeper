@@ -80,13 +80,9 @@ import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveSockPath } from "../src/db";
+import { type EpicDepResolution, resolveEpicDep } from "../src/epic-deps";
 import { createLiveShell } from "../src/live-shell";
-import {
-  type EpicDepResolution,
-  formatPill,
-  resolveEpicDep,
-  type Verdict,
-} from "../src/readiness";
+import { formatPill, type Verdict } from "../src/readiness";
 import {
   collapseSubagentsByName,
   type ReadinessClientSnapshot,
@@ -827,7 +823,22 @@ async function main(): Promise<void> {
       epicDepRefs = renderEpicDepPills(
         epicDeps.map((d) => String(d)),
         (depStr) =>
-          resolveEpicDep(depStr, consumerEpic, epicById, epicsByNumber, []),
+          resolveEpicDep(
+            depStr,
+            consumerEpic,
+            epicById,
+            epicsByNumber,
+            [],
+            // Wall-clock injection. The diagnostics sink here is a
+            // throwaway (`[]`) — the canonical drain runs through
+            // `snap.readiness.diagnostics` populated by
+            // `computeReadiness` — so the timestamp would never
+            // surface, but the leaf signature requires it. Keep the
+            // `new Date()` here so the board renderer never grows a
+            // fold-determinism constraint; only the reducer caller
+            // (fn-637.3) passes an event-derived ts.
+            new Date().toISOString(),
+          ),
       );
     }
     const epicDepsSeg =

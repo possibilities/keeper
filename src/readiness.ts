@@ -91,8 +91,44 @@
  *   - Otherwise `[blocked:<first non-completed row's reason in traversal order>]`.
  */
 
+import {
+  type EpicDepResolution,
+  resolveEpicDep as resolveEpicDepLeaf,
+} from "./epic-deps";
 import type { ResolutionDiagnostic } from "./readiness-diagnostics";
 import type { Epic, Job, SubagentInvocation, Task } from "./types";
+
+// Re-export so existing import sites (`scripts/board.ts` and any other
+// consumer that pulled `EpicDepResolution` / `resolveEpicDep` from
+// `readiness.ts`) keep working without a rename rippling outside this
+// extraction. The canonical home is `./epic-deps`; this is a thin
+// compat surface.
+export type { EpicDepResolution };
+
+/**
+ * Wall-clock-bound wrapper around the fold-safe `resolveEpicDep` in
+ * `./epic-deps`. Existing readiness/board callers expected the resolver
+ * to stamp diagnostics with the current wall-clock time; preserve that
+ * exact behavior by passing `new Date().toISOString()` here. The reducer
+ * caller (fn-637.3) goes straight to `./epic-deps#resolveEpicDep` with
+ * an event-derived timestamp so its fold stays deterministic.
+ */
+export function resolveEpicDep(
+  rawDep: string,
+  consumer: Epic,
+  epicById: Map<string, Epic>,
+  epicsByNumber: Map<number, Epic[]>,
+  diagnostics: ResolutionDiagnostic[],
+): EpicDepResolution {
+  return resolveEpicDepLeaf(
+    rawDep,
+    consumer,
+    epicById,
+    epicsByNumber,
+    diagnostics,
+    new Date().toISOString(),
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -953,181 +989,15 @@ function stringOrNull(v: unknown): string | null {
 // ---------------------------------------------------------------------------
 // Predicate 9 helper: cwd-then-global epic-dep resolver
 // ---------------------------------------------------------------------------
-
-/**
- * Bare `fn-N` id pattern — `fn-` followed by digits, with no trailing
- * `-slug`. Matches `fn-100`; does NOT match `fn-100-foo`. Anchored on
- * both ends so a malformed entry doesn't slip through.
- */
-const BARE_FN_PATTERN = /^fn-(\d+)$/;
-
-/**
- * Project-basename comparator for the resolver. Empty strings on either
- * side fall through to `false` — a missing `project_dir` cannot match
- * for cross-project disambiguation, so empties never "tie".
- *
- * Mirrors the board renderer's `basename(project_dir)` rendering shape —
- * an `arthack`-prefixed pill matches an `arthack/...` project dir but
- * not `arthack-fork/...`. Path-only basename comparison via Node's
- * `basename` would require importing node:path here; we lift the
- * tail-segment ourselves to keep `readiness.ts` import-graph-clean.
- */
-function projectBasename(dir: string | null): string {
-  if (dir == null || dir === "") {
-    return "";
-  }
-  // Strip trailing slashes, take the segment after the last `/`.
-  // Equivalent to `node:path` basename for POSIX paths; this module
-  // never sees Windows paths (planctl is POSIX-only by design).
-  const trimmed = dir.replace(/\/+$/, "");
-  const idx = trimmed.lastIndexOf("/");
-  return idx === -1 ? trimmed : trimmed.slice(idx + 1);
-}
-
-/**
- * fn-637: dep-satisfaction predicate, identical to `evaluateCloseRow`'s
- * terminal-completed check. A resolved upstream that is completed satisfies
- * the dependency even when it has been pruned from the default-visible page
- * (`default_visible=0`) and supplied to the resolver only via the
- * completed-epics index. Kept as a single helper so the resolver and the
- * close-row never drift on what "done" means.
- */
-function epicIsCompleted(epic: Epic): boolean {
-  return epic.status === "done" && epic.approval === "approved";
-}
-
-/** Resolver outcome — discriminated union so callers can branch on `kind`. */
-export type EpicDepResolution =
-  | {
-      kind: "found";
-      epic: Epic;
-      /**
-       * Upstream's project basename when it differs from the consumer's —
-       * for the renderer's `[arthack::#N]` cross-project prefix. `null`
-       * when the basenames match (intra-project).
-       */
-      cross_project: string | null;
-      /**
-       * fn-637: `true` when the resolved upstream is itself completed
-       * (`status==="done" && approval==="approved"` — the same terminal
-       * predicate `evaluateCloseRow` uses). A completed upstream satisfies
-       * the dependency outright; predicate 9 skips it without consulting
-       * `perCloseRow` (the completed upstream is pruned from the
-       * default-visible page and reaches the resolver only via the
-       * completed-epics index, so it has no per-close-row verdict).
-       */
-      completed: boolean;
-    }
-  | { kind: "dangling" };
-
-/**
- * Resolve one `depends_on_epics` entry against the in-snapshot index, mirroring
- * planctl's fn-600 cwd-then-global semantics. Two id shapes are accepted:
- *
- *   - Full id (`fn-100-foo`) — direct `epicById` lookup. Miss → dangling.
- *   - Bare id (`fn-100`) — `epicsByNumber` lookup. Zero matches → dangling;
- *     exactly one match → use it; 2+ matches → prefer the consumer epic's
- *     `project_dir` basename. If exactly one candidate shares it, use that
- *     candidate. Otherwise emit a `ResolutionDiagnostic` and yield dangling
- *     so the human sees the ambiguity rather than autopilot silently picking
- *     a wrong upstream.
- *
- * Anything not matching either shape (typo, malformed id) → dangling without
- * a diagnostic; the dangling pill itself is the signal.
- *
- * Exported so `scripts/board.ts` summary pill can share the same resolution
- * path as predicate 9 — they MUST agree, otherwise the summary pill and the
- * row pill could disagree on whether an upstream is dangling.
- */
-export function resolveEpicDep(
-  rawDep: string,
-  consumer: Epic,
-  epicById: Map<string, Epic>,
-  epicsByNumber: Map<number, Epic[]>,
-  diagnostics: ResolutionDiagnostic[],
-): EpicDepResolution {
-  const consumerBase = projectBasename(consumer.project_dir);
-
-  // Bare-id form takes priority over the full-id branch so a string like
-  // `fn-100` (no slug) doesn't accidentally hit the full-id lookup with a
-  // partial match. The BARE_FN_PATTERN excludes the dotted task form.
-  const bareMatch = BARE_FN_PATTERN.exec(rawDep);
-  if (bareMatch !== null) {
-    const num = Number.parseInt(bareMatch[1] ?? "", 10);
-    if (Number.isNaN(num)) {
-      return { kind: "dangling" };
-    }
-    const candidates = epicsByNumber.get(num) ?? [];
-    if (candidates.length === 0) {
-      return { kind: "dangling" };
-    }
-    if (candidates.length === 1) {
-      const upstream = candidates[0];
-      if (upstream === undefined) {
-        return { kind: "dangling" };
-      }
-      const upstreamBase = projectBasename(upstream.project_dir);
-      const crossProject =
-        consumerBase !== "" &&
-        upstreamBase !== "" &&
-        consumerBase !== upstreamBase
-          ? upstreamBase
-          : null;
-      return {
-        kind: "found",
-        epic: upstream,
-        cross_project: crossProject,
-        completed: epicIsCompleted(upstream),
-      };
-    }
-    // 2+ candidates. Prefer the consumer's own project_dir basename.
-    const sameProject = candidates.filter(
-      (e) =>
-        projectBasename(e.project_dir) === consumerBase && consumerBase !== "",
-    );
-    if (sameProject.length === 1) {
-      const upstream = sameProject[0];
-      if (upstream === undefined) {
-        return { kind: "dangling" };
-      }
-      // Same-project hit can't be cross-project by definition.
-      return {
-        kind: "found",
-        epic: upstream,
-        cross_project: null,
-        completed: epicIsCompleted(upstream),
-      };
-    }
-    // Ambiguous: 2+ candidates AND no unique same-project disambiguator.
-    // Emit a diagnostic with every match's full id (sorted for re-fold
-    // determinism) and fall through to dangling.
-    diagnostics.push({
-      ts: new Date().toISOString(),
-      kind: "ambiguous-dep-resolution",
-      consumer_epic: consumer.epic_id,
-      upstream: rawDep,
-      matches: candidates.map((e) => e.epic_id).sort(),
-    });
-    return { kind: "dangling" };
-  }
-
-  // Full-id form. Direct lookup. Miss → dangling.
-  const upstream = epicById.get(rawDep);
-  if (upstream === undefined) {
-    return { kind: "dangling" };
-  }
-  const upstreamBase = projectBasename(upstream.project_dir);
-  const crossProject =
-    consumerBase !== "" && upstreamBase !== "" && consumerBase !== upstreamBase
-      ? upstreamBase
-      : null;
-  return {
-    kind: "found",
-    epic: upstream,
-    cross_project: crossProject,
-    completed: epicIsCompleted(upstream),
-  };
-}
+//
+// As of fn-637.1 the resolver, its supporting helpers (`projectBasename`,
+// `epicIsCompleted`, `BARE_FN_PATTERN`), and the `EpicDepResolution` type
+// live in `./epic-deps` so the SAME code path is shared with the reducer
+// fold (fn-637.3) without an import cycle. The `resolveEpicDep` wall-clock
+// wrapper near the top of this file preserves the legacy
+// `new Date().toISOString()` behavior for readiness/board callers; the
+// reducer goes straight to the leaf module with an event-derived
+// timestamp.
 
 // ---------------------------------------------------------------------------
 // Epic header rollup
