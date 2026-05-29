@@ -81,7 +81,12 @@ import { parseArgs } from "node:util";
 import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
-import { formatPill, resolveEpicDep, type Verdict } from "../src/readiness";
+import {
+  type EpicDepResolution,
+  formatPill,
+  resolveEpicDep,
+  type Verdict,
+} from "../src/readiness";
 import {
   collapseSubagentsByName,
   type ReadinessClientSnapshot,
@@ -412,6 +417,51 @@ export function epicNumFromIdOrBare(id: string): number | null {
     return Number.parseInt(bare[1] ?? "", 10);
   }
   return null;
+}
+
+/**
+ * fn-636: pill assembly for one epic's `depends_on_epics` list. Lifted out
+ * of the `renderEpicBlock` closure so the three render shapes are directly
+ * assertable from tests:
+ *
+ *   - dangling (resolver said `dangling`, id well-formed enough to extract
+ *     a number) → `?#N`
+ *   - intra-project (resolver returned `cross_project === null`) → `#N`
+ *   - cross-project (resolver returned a non-null `cross_project`) →
+ *     `<prefix>::#N`
+ *
+ * Malformed dangling ids (no extractable number) and found-but-numberless
+ * upstreams are dropped, matching the closure's behavior verbatim. The
+ * caller still drives `resolveEpicDep` directly so the diagnostics sink
+ * stays under its control; this helper only assembles the rendered refs
+ * from the dep string + its resolution.
+ */
+export function renderEpicDepPills(
+  deps: ReadonlyArray<string>,
+  resolve: (dep: string) => EpicDepResolution,
+): string[] {
+  const refs: string[] = [];
+  for (const d of deps) {
+    const depStr = String(d);
+    const num = epicNumFromIdOrBare(depStr);
+    const resolved = resolve(depStr);
+    if (resolved.kind === "dangling") {
+      if (num !== null) {
+        refs.push(`?#${num}`);
+      }
+      continue;
+    }
+    const resolvedNum = resolved.epic.epic_number;
+    if (typeof resolvedNum !== "number") {
+      continue;
+    }
+    if (resolved.cross_project === null) {
+      refs.push(`#${resolvedNum}`);
+    } else {
+      refs.push(`${resolved.cross_project}::#${resolvedNum}`);
+    }
+  }
+  return refs;
 }
 
 /**
@@ -761,42 +811,24 @@ async function main(): Promise<void> {
     const consumerEpic = epicsList.find(
       (e) => e.epic_id === String(row.epic_id),
     );
-    const epicDepRefs: string[] = [];
-    for (const d of epicDeps) {
-      const depStr = String(d);
-      const num = epicNumFromIdOrBare(depStr);
-      if (consumerEpic === undefined) {
-        // Defensive: if the consumer epic shape isn't recoverable, fall
-        // through to the legacy `<name>#<number>` render so the line
-        // stays informative even on a malformed input.
-        const legacy = epicDepRefFromId(depStr);
+    let epicDepRefs: string[];
+    if (consumerEpic === undefined) {
+      // Defensive: if the consumer epic shape isn't recoverable, fall
+      // through to the legacy `<name>#<number>` render so the line
+      // stays informative even on a malformed input.
+      epicDepRefs = [];
+      for (const d of epicDeps) {
+        const legacy = epicDepRefFromId(String(d));
         if (legacy !== null) {
           epicDepRefs.push(legacy);
         }
-        continue;
       }
-      const resolved = resolveEpicDep(
-        depStr,
-        consumerEpic,
-        epicById,
-        epicsByNumber,
-        [],
+    } else {
+      epicDepRefs = renderEpicDepPills(
+        epicDeps.map((d) => String(d)),
+        (depStr) =>
+          resolveEpicDep(depStr, consumerEpic, epicById, epicsByNumber, []),
       );
-      if (resolved.kind === "dangling") {
-        if (num !== null) {
-          epicDepRefs.push(`?#${num}`);
-        }
-        continue;
-      }
-      const resolvedNum = resolved.epic.epic_number;
-      if (typeof resolvedNum !== "number") {
-        continue;
-      }
-      if (resolved.cross_project === null) {
-        epicDepRefs.push(`#${resolvedNum}`);
-      } else {
-        epicDepRefs.push(`${resolved.cross_project}::#${resolvedNum}`);
-      }
     }
     const epicDepsSeg =
       epicDepRefs.length === 0 ? "" : ` [${epicDepRefs.join(",")}]`;
