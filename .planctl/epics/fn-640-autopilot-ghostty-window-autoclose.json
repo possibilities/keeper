@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-640-autopilot-ghostty-window-autoclose",
   "bundles": [
     "sketch/autopilot-ghostty-window-autoclose"
@@ -18,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-29T13:44:01.201738Z"
+  "updated_at": "2026-05-29T13:44:21.976097Z"
 }
