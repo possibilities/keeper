@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-638-harden-autopilot-dispatch-liveness",
   "bundles": [],
+  "closer_done_at": "2026-05-29T02:34:29.080678Z",
   "created_at": "2026-05-29T01:25:32.806518Z",
   "depends_on_epics": [],
   "id": "fn-638-harden-autopilot-dispatch-liveness",
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "harden autopilot dispatch liveness fidelity",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-29T01:29:22.799047Z"
+  "updated_at": "2026-05-29T02:34:29.080678Z"
 }
