@@ -84,7 +84,7 @@ and the boot drain re-converges idempotently after any downtime or crash.
 Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names
 a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
-page that doubles as a live subscription. Five collections register today —
+page that doubles as a live subscription. Six collections register today —
 `jobs` (the first and default), `epics` (the read-only plans surface — each
 epic embeds its tasks as a JSON array, so there is no separate `tasks`
 collection; both the epic and each embedded task carry an `approval` field
@@ -102,9 +102,14 @@ since its last commit; a session is attributed iff it has mutated the file
 AND has not committed it more recently than its last mutation, so commit
 discharges attribution and a re-edit reinstates it; the strict
 `orphan_files` bucket holds dirty files with zero attribution after the
-inference pass), and `usage` (one row per agentuse profile observed
+inference pass), `usage` (one row per agentuse profile observed
 at `~/.local/state/agentuse/<id>.json` — target, multiplier, session+week
-percent and reset timestamps). The
+percent and reset timestamps), and `profiles` (schema v33, fn-639 — one
+row per Claude profile directory, keyed by `config_dir`, correlating the
+last `rate_limit` ApiError with each profile so renderers can surface
+profile-level reset state alongside the per-profile usage stacks; the
+`''` sentinel collapses default `~/.claude` so a single PK groups every
+NULL-`CLAUDE_CONFIG_DIR` session). The
 surface is built so additional collections register without touching the
 wire protocol or the diff machinery. Page membership is frozen at query time,
 but each row's cells stream `patch` frames as the reducer folds new events.
@@ -672,7 +677,19 @@ materializing the descriptor's cross-column default scope as a single
 WHERE default_visible = 1` serves the default no-wire-filter query as
 a covering SEARCH (no SCAN, no temp B-tree for the
 `sort_path ASC, epic_id ASC` ORDER BY) — collapsing the Tier 4
-diffTick/metaCount p95 tail. As of schema v25, each `epics.job_links`
+diffTick/metaCount p95 tail. As of schema v33 (fn-639), a new
+`profiles` projection table (one row per Claude profile directory keyed
+by `config_dir TEXT NOT NULL PRIMARY KEY`; the `''` sentinel collapses
+default `~/.claude`) is maintained by two reducer fan-outs inside the
+existing `BEGIN IMMEDIATE`: the SessionStart arm `INSERT OR IGNORE`s a
+visible row for every unique `config_dir` (quiet or not — `last_rate_limit_*`
+stay NULL until the first rate_limit lands), and the dual-case
+`RateLimited`/`ApiError(kind='rate_limit')` arm UPSERTs
+`last_rate_limit_at` + `last_rate_limit_session_id` against the same
+`COALESCE(config_dir,'')` expression as the seed so a NULL-config session's
+rate limit lands on the exact `''` row it seeded (worker count unchanged
+— no new producer thread; the fan-outs ride the existing reducer arms).
+As of schema v25, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `last_api_error_at` /
 `last_api_error_kind` / `last_input_request_at` /
 `last_input_request_kind` denormalized off the live `jobs` row at the
@@ -852,6 +869,10 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 # Usage projection — one row per agentuse profile observed at ~/.local/state/agentuse/<id>.json (freshness fields are excluded by design — keeper has no freshness signal yet):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT * FROM usage ORDER BY target, id'
+
+# Profiles projection — schema v33 (fn-639). One row per Claude profile directory keyed by config_dir (the CLAUDE_CONFIG_DIR env value captured at SessionStart; the '' sentinel collapses default ~/.claude). Quiet profiles render with NULL last_rate_limit_at; a rate_limit stamps (last_rate_limit_at, last_rate_limit_session_id) keyed on the same COALESCE(config_dir,'') expression as the SessionStart seed so a NULL-config session's rate limit lands on the exact '' row it seeded:
+sqlite3 ~/.local/state/keeper/keeper.db \
+  "SELECT config_dir, datetime(last_rate_limit_at,'unixepoch','localtime') AS last_rl_at, last_rate_limit_session_id FROM profiles ORDER BY config_dir ASC"
 
 # Raw event log tail (synthetic EpicSnapshot/TaskSnapshot/EpicDeleted/TaskDeleted rows appear here too):
 sqlite3 ~/.local/state/keeper/keeper.db \

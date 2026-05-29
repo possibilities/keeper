@@ -69,7 +69,24 @@ the native value" is the default.
   worktree stay untouched. Producer-side `stat()` is forbidden inside
   the reducer's transaction; mtimes are computed at snapshot build time
   in the git worker, embedded in the payload, and consumed pure-SQL by
-  the attribution pass so re-fold determinism holds.) and bumps
+  the attribution pass so re-fold determinism holds. AND the schema-v33
+  (fn-639) `profiles` projection table   (one row per Claude profile
+  directory, keyed by `config_dir TEXT NOT NULL PRIMARY KEY` with the
+  `''` sentinel collapsing default `~/.claude` — NOT NULL is load-
+  bearing, SQLite treats multiple NULL PK rows as distinct so a nullable
+  PK + `INSERT OR IGNORE` would NOT dedupe) is maintained by two reducer
+  fan-outs inside the SAME `BEGIN IMMEDIATE`: the SessionStart arm
+  `INSERT OR IGNORE`s a visible row for every unique `config_dir` (quiet
+  or not — `last_rate_limit_*` stay NULL on seed-only profiles), and the
+  dual-case `RateLimited`/`ApiError` arm gated on `kind === "rate_limit"`
+  reads the session's `jobs.config_dir` in-transaction (null-guarded via
+  the `syncIfPlanRef` read-then-write precedent — a missing jobs row
+  skips quietly; cursor still advances) then UPSERTs `last_rate_limit_at`
+  + `last_rate_limit_session_id` against the same
+  `COALESCE(config_dir,'')` expression as the seed so a NULL-config
+  session's rate limit lands on the exact `''` row it seeded. Last-
+  write-wins on `last_rate_limit_at` follows the event log's append-
+  only id ordering (no `max()` guard — events fold in id order).) and bumps
   `reducer_state.last_event_id` in one transaction. A crash mid-fold rolls
   back both; boot drain re-folds idempotently. This is the
   exactly-once-per-event guarantee — never split the two writes across
