@@ -72,5 +72,5 @@ dual-stream composition, not a drop-in second subscribe.
 - [ ] README.md `usage.ts` example client entry updated to note the two subscriptions
 
 ## Done summary
-
+Added a second subscribeCollection over 'profiles' to scripts/usage.ts; the script now composes one frame from two independent streams — usage stacks on top, a 'Rate limits by profile' block below (one row per profile, '(default)' for the '' sentinel, '—' for NULL last_rate_limit_at). Added a numeric-seconds relTime variant (relTimeFromUnixSec → shared relTimeFromMs body) so REAL unix-seconds inputs render as relative time with no raw-float leakage; existing ISO callers untouched. Both blocks re-render on the 30s tick against the same Date.now(); both subscription handles disposed on SIGINT; independent per-stream change-gates. README + HELP + module docstring + new tests cover the dual-stream surface (5 new tests; 18 total in test/usage.test.ts, all pass).
 ## Evidence
