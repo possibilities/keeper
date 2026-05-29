@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [
     "sketch/autopilot-ghostty-window-autoclose"
   ],
@@ -11,6 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "ghostty window capture and autoclose",
-  "updated_at": "2026-05-29T13:26:31.343910Z",
+  "updated_at": "2026-05-29T13:39:47.275959Z",
   "worker_done_at": "2026-05-29T13:26:31.343910Z"
 }
