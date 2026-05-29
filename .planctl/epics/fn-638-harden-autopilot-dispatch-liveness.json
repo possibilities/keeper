@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-638-harden-autopilot-dispatch-liveness",
   "bundles": [],
   "closer_done_at": "2026-05-29T02:34:29.080678Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-29T02:34:29.080678Z"
+  "updated_at": "2026-05-29T02:42:31.588978Z"
 }
