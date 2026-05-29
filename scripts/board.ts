@@ -120,6 +120,9 @@ Each epic block opens with a header line of the form:
 
   ({dir}) {epic_number} {title} [name#dep,name#dep] [validated|unvalidated] [slotted-after-closer]? [<readiness>]
 
+(a [blocked:<reason>] readiness pill drops to its own indented line beneath
+the header instead of stamping at the end; ready/completed/running stay inline)
+
 The cross-epic dependency pills carry the dep's project-name prefix
 (e.g. [arthack#633]) so deps that cross topics/projects read unambiguously;
 the bare task-dep pills below stay [#n] (same-epic, no prefix needed).
@@ -185,8 +188,9 @@ close row a [ready] / [completed] / [running:<kind>] pill stamps inline on
 the indented "[<id>]" reference line beneath the header; a [blocked:<reason>]
 pill instead drops to its OWN line directly beneath the id line (so the
 full reason — including any "dep-on-task <upstream>" id — reads without
-wrapping). For the epic header (which has no id line) the pill always
-stamps at the end of the header itself.
+wrapping). The epic header (which has no id line) follows the same split:
+ready/completed/running stamp at the end of the header itself, while a
+[blocked:<reason>] pill drops to its own indented line beneath it.
 
 When a task's target_repo diverges from its epic's project_dir, the id
 line carries one extra trailing pill '[task-repo:<basename>]' (yellow /
@@ -940,10 +944,15 @@ async function main(): Promise<void> {
     // present so the join reads cleanly).
     const slottedSeg =
       row.created_by_closer_of == null ? "" : " [slotted-after-closer]";
-    lines.push(
-      `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}]${slottedSeg} ${formatPill(epicVerdict)}`,
-      ...renderJobLinkLines(row.job_links),
-    );
+    // Same rule as the task/close rows: a [blocked:<reason>] verdict drops
+    // to its own line (two-space indent) beneath the header; ready/
+    // completed/running stay inline at the end of the header itself.
+    const epicHeader = `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}]${slottedSeg}`;
+    const epicHeaderLines =
+      epicVerdict.tag === "blocked"
+        ? [epicHeader, `  ${formatPill(epicVerdict)}`]
+        : [`${epicHeader} ${formatPill(epicVerdict)}`];
+    lines.push(...epicHeaderLines, ...renderJobLinkLines(row.job_links));
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {
       const t = task as Record<string, unknown>;
