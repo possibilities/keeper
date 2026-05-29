@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "hook retry + per-pid dead-letter write",
-  "updated_at": "2026-05-29T15:00:36.105354Z"
+  "updated_at": "2026-05-29T17:57:10.915932Z",
+  "worker_done_at": "2026-05-29T17:57:10.915932Z"
 }

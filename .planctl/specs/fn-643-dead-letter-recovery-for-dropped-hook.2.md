@@ -64,5 +64,5 @@ dead-letter file — without ever breaking the exit-0 contract or adding deps.
 - [ ] Dead-letter dir is created 0o700-ish best-effort and the file is 0o600.
 
 ## Done summary
-
+Hook gains a bounded one-attempt retry on SQLITE_BUSY/SQLITE_LOCKED (~30ms Atomics.wait sleep) and a per-pid NDJSON dead-letter under ~/.local/state/keeper/dead-letters/<pid>.ndjson on final failure — preserving the exit-0 contract while making dropped INSERTs recoverable. Hook-local PRAGMA busy_timeout=1200 keeps the retry budget inside the SessionEnd 1.5s window; the shared 5s applyPragmas the daemon/workers depend on is unchanged.
 ## Evidence
