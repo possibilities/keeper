@@ -41,6 +41,7 @@ import {
   renderEpicCommands,
   renderEpicCommandsFiltered,
   shouldSuppressDispatch,
+  validateShell,
 } from "../scripts/autopilot";
 import { computeReadiness } from "../src/readiness";
 import type { EmbeddedJob, Epic, Job, Task } from "../src/types";
@@ -879,6 +880,7 @@ test("detectJobTransitions — fulfilled key disappears from snapshot reaches co
   const completedKeys = new Set<string>();
   const captured: string[] = [];
   const noteLines: string[] = [];
+  const closedIds: Array<string | undefined> = [];
   const deps: DetectJobTransitionsDeps = {
     dispatchLog,
     fulfilledKeys,
@@ -887,6 +889,7 @@ test("detectJobTransitions — fulfilled key disappears from snapshot reaches co
     noteLine: (s) => noteLines.push(s),
     pid: 4242,
     appendLine: (line) => captured.push(line),
+    closeWindow: (id) => closedIds.push(id),
   };
 
   // Frame (a): the dispatched epic is on the page with a matching
@@ -952,6 +955,277 @@ test("detectJobTransitions — fulfilled key disappears from snapshot reaches co
   expect(captured.length).toBe(2);
   expect(completedKeys.has("approve::fn-2-bar")).toBe(false);
   expect(fulfilledKeys.has("approve::fn-2-bar")).toBe(false);
+  // closeWindow MUST have been invoked exactly once — when frame (b)
+  // migrated the row to `completedKeys` via the disappearance branch.
+  // The entry carried no windowId (test fixture omitted it), so the
+  // recorded id is `undefined` — the production closeWindow no-ops on
+  // that shape, but the call site must still fire so a future
+  // entry-with-windowId is auto-closed at the same edge.
+  expect(closedIds).toEqual([undefined]);
+});
+
+// ---------------------------------------------------------------------------
+// detectJobTransitions — fn-640.1 auto-close trigger.
+//
+// Two new properties pin the auto-close wiring at both
+// `completedKeys`-entry sites:
+//   - The terminal-state branch (`state in {"ended","killed"}`) fires
+//     `closeWindow(entry.windowId)` AND the disappearance branch does
+//     the same. The recording stub captures the exact id passed
+//     through so a windowId-stamped entry is reaped.
+//   - The `completedKeys.has(key)` top-of-loop guard suppresses any
+//     second close on a repeat tick.
+// ---------------------------------------------------------------------------
+
+test("detectJobTransitions — closeWindow fires with entry.windowId at terminal-state edge AND on repeat tick stays silent", () => {
+  // Entry carries a stamped windowId from the live-spawn capture. A
+  // matching embedded job in `working` state on frame 1 → fulfilled;
+  // on frame 2 the job is `ended` → completed branch fires, AND
+  // closeWindow(windowId) lands.
+  const entry = makeDispatchEntry({
+    verb: "work",
+    id: "fn-1-foo.1",
+    dir: "repo",
+    dirFull: "/repo",
+    windowId: "tab-group-DEADBEEF",
+  });
+  const dispatchLog: DispatchEntry[] = [entry];
+  const fulfilledKeys = new Set<string>();
+  const completedKeys = new Set<string>();
+  const captured: string[] = [];
+  const closedIds: Array<string | undefined> = [];
+  const deps: DetectJobTransitionsDeps = {
+    dispatchLog,
+    fulfilledKeys,
+    completedKeys,
+    dispatchLogPath: "/tmp/keeper-autopilot.test.dispatch.log",
+    noteLine: () => {},
+    pid: 4242,
+    appendLine: (line) => captured.push(line),
+    closeWindow: (id) => closedIds.push(id),
+  };
+
+  // Frame 1: working job → fulfilled. No close yet.
+  const taskWorking = makeTask({
+    task_id: "fn-1-foo.1",
+    task_number: 1,
+    jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
+  });
+  const snap1 = buildSnap([makeEpic({ tasks: [taskWorking] })]);
+  detectJobTransitions(deps, snap1);
+  expect(fulfilledKeys.has("work::fn-1-foo.1")).toBe(true);
+  expect(completedKeys.has("work::fn-1-foo.1")).toBe(false);
+  expect(closedIds).toEqual([]);
+
+  // Frame 2: job ended → terminal-state branch fires. completedKeys
+  // gains the key, completed line lands, closeWindow(windowId) fires.
+  const taskEnded = makeTask({
+    task_id: "fn-1-foo.1",
+    task_number: 1,
+    jobs: [makeEmbeddedJob({ plan_verb: "work", state: "ended" })],
+  });
+  const snap2 = buildSnap([makeEpic({ tasks: [taskEnded] })]);
+  detectJobTransitions(deps, snap2);
+  expect(completedKeys.has("work::fn-1-foo.1")).toBe(true);
+  expect(closedIds).toEqual(["tab-group-DEADBEEF"]);
+
+  // Frame 3: same ended snap → `completedKeys.has(key)` short-circuits
+  // at the top of the loop, no second close fires.
+  detectJobTransitions(deps, snap2);
+  expect(closedIds).toEqual(["tab-group-DEADBEEF"]);
+});
+
+test("detectJobTransitions — closeWindow fires with entry.windowId at disappearance edge", () => {
+  // Sibling case: post-fulfillment, the matching job disappears from
+  // the snapshot (parent epic became done+approved). Same auto-close
+  // path as the terminal-state branch.
+  const entry = makeDispatchEntry({
+    verb: "approve",
+    id: "fn-1-foo",
+    dir: "repo",
+    dirFull: "/repo",
+    windowId: "tab-group-CAFEBABE",
+  });
+  const dispatchLog: DispatchEntry[] = [entry];
+  const fulfilledKeys = new Set<string>();
+  const completedKeys = new Set<string>();
+  const closedIds: Array<string | undefined> = [];
+  const deps: DetectJobTransitionsDeps = {
+    dispatchLog,
+    fulfilledKeys,
+    completedKeys,
+    dispatchLogPath: "/tmp/keeper-autopilot.test.dispatch.log",
+    noteLine: () => {},
+    pid: 4242,
+    appendLine: () => {},
+    closeWindow: (id) => closedIds.push(id),
+  };
+
+  // Frame 1: epic + matching approve job → fulfilled.
+  const snap1 = buildSnap([
+    makeEpic({
+      epic_id: "fn-1-foo",
+      jobs: [makeEmbeddedJob({ plan_verb: "approve", state: "working" })],
+    }),
+  ]);
+  detectJobTransitions(deps, snap1);
+  expect(fulfilledKeys.has("approve::fn-1-foo")).toBe(true);
+  expect(closedIds).toEqual([]);
+
+  // Frame 2: epic gone → disappearance branch fires (gated on
+  // fulfilledKeys). closeWindow lands with the stamped id.
+  detectJobTransitions(deps, buildSnap([]));
+  expect(completedKeys.has("approve::fn-1-foo")).toBe(true);
+  expect(closedIds).toEqual(["tab-group-CAFEBABE"]);
+});
+
+// ---------------------------------------------------------------------------
+// hydrateDispatchLog — fn-640.1 window-row fold.
+//
+// A new `kind:"window"` row carries the spawned Ghostty window's id;
+// pass 2 stamps that id onto the matching surviving restored launch
+// entry so cross-run auto-close still works. Three properties to pin:
+//   (a) window row folds windowId onto the matching restored entry.
+//   (b) latest-ts-wins on duplicate window rows for the same (verb, id).
+//   (c) an old log with no window row leaves windowId undefined.
+// ---------------------------------------------------------------------------
+
+test("hydrateDispatchLog — window row folds windowId onto matching restored entry", () => {
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-1",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+      pid: 42,
+    },
+    {
+      kind: "window",
+      ts: "2026-05-27T00:00:01.500Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      windowId: "tab-group-AAA",
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:02.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries } = hydrateDispatchLog(path);
+  expect(restoredEntries.length).toBe(1);
+  const entry = restoredEntries[0] as DispatchEntry;
+  expect(entry.windowId).toBe("tab-group-AAA");
+});
+
+test("hydrateDispatchLog — duplicate window rows for same (verb, id) → latest-ts wins", () => {
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-1",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+      pid: 42,
+    },
+    // Out-of-order on purpose so the test asserts the ts comparison,
+    // not the insertion order.
+    {
+      kind: "window",
+      ts: "2026-05-27T00:00:05.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      windowId: "tab-group-NEW",
+    },
+    {
+      kind: "window",
+      ts: "2026-05-27T00:00:02.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      windowId: "tab-group-OLD",
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:06.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries } = hydrateDispatchLog(path);
+  expect(restoredEntries.length).toBe(1);
+  expect(restoredEntries[0]?.windowId).toBe("tab-group-NEW");
+});
+
+test("hydrateDispatchLog — log with no window row leaves windowId undefined on restored entry", () => {
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-1",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+      pid: 42,
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:02.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries } = hydrateDispatchLog(path);
+  expect(restoredEntries.length).toBe(1);
+  expect(restoredEntries[0]?.windowId).toBeUndefined();
+});
+
+test("hydrateDispatchLog — malformed window row (non-string windowId) skips silently", () => {
+  // Forensic-log contract: a shape mismatch on a window row skips
+  // without throwing; the rest of the log still hydrates. Pinned so
+  // a future log-format quirk doesn't wedge startup.
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-1",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+      pid: 42,
+    },
+    {
+      kind: "window",
+      ts: "2026-05-27T00:00:01.500Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      windowId: 12345, // wrong type
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:02.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries } = hydrateDispatchLog(path);
+  expect(restoredEntries.length).toBe(1);
+  expect(restoredEntries[0]?.windowId).toBeUndefined();
 });
 
 // ---------------------------------------------------------------------------
@@ -1615,4 +1889,29 @@ test("isLiveSessionInRoot — fulfilled launch log entry does NOT count as live"
     fulfilledKeys,
   );
   expect(result).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// validateShell — fn-640.1 $SHELL guard rules.
+//
+// Three independent rejection rules: undefined/empty, non-absolute,
+// embedded `"`, and non-existent path. A passing absolute path that
+// `existsSync` confirms is returned verbatim. The fallback at the
+// call site is `/bin/zsh` — pinned via the `process.env.SHELL =
+// undefined` case (returns null).
+// ---------------------------------------------------------------------------
+
+test("validateShell — undefined / empty / non-absolute / quote-injected / non-existent → null", () => {
+  expect(validateShell(undefined)).toBe(null);
+  expect(validateShell("")).toBe(null);
+  expect(validateShell("zsh")).toBe(null); // not absolute
+  expect(validateShell('/bin/zsh"')).toBe(null); // quote-injection guard
+  expect(validateShell("/nonexistent/shell/path/xyzzy")).toBe(null);
+});
+
+test("validateShell — existing absolute path with no quote → returned verbatim", () => {
+  // `/bin/sh` exists on every macOS / Linux box this repo runs on;
+  // pinning it is the minimal positive case that exercises the
+  // existsSync branch end-to-end.
+  expect(validateShell("/bin/sh")).toBe("/bin/sh");
 });

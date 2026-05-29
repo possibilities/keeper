@@ -15,12 +15,22 @@
  *       claude '/plan:approve fn-619-pin-inputrequest-mid-subagent-state.1'
  *
  * Dispatches are persisted to ~/.local/state/keeper/dispatch.log (JSONL)
- * for forensic tailing AND for the cross-run re-dispatch guard. Two
+ * for forensic tailing AND for the cross-run re-dispatch guard. Four
  * line kinds:
  *
  *   `{"kind":"launch", ts, rowId, dir, dirFull, verb, id, command,
  *    dry?, pid?}` — written by `logDispatch` the moment autopilot
  *    fires (or would-have-fired in dry mode).
+ *   `{"kind":"window", ts, verb, id, windowId}` — written by
+ *    `launchInGhostty` right after osascript's `new window with
+ *    configuration cfg` call returns the freshly-spawned Ghostty
+ *    window's stable id (a `tab-group-…` token). Stamps `windowId`
+ *    onto the in-memory `DispatchEntry` by reference so the same-run
+ *    auto-close can fire, and survives a restart via
+ *    `hydrateDispatchLog`'s second `Map<string,string>` keyed by
+ *    `${verb}::${id}` (latest-ts-wins). Raw `appendFileSync` — NOT
+ *    `logDispatch` — to avoid re-pushing a display entry. Fire-and-
+ *    forget on failure (window simply won't auto-close).
  *   `{"kind":"fulfilled", ts, verb, id, pid?}` — written by
  *    `detectJobTransitions` the first time an embedded job for the
  *    dispatched `(verb, id)` appears in the readiness snapshot. Marks
@@ -32,7 +42,11 @@
  *    `detectJobTransitions` the first time the embedded job for the
  *    dispatched `(verb, id)` is observed in a terminal state
  *    (`state === "ended" | "killed"`). Migrates the row from
- *    `--- current ---` to `--- completed ---`.
+ *    `--- current ---` to `--- completed ---`. ALSO triggers the
+ *    `closeWindow(entry.windowId)` auto-close at this edge (both the
+ *    terminal-state branch and the disappearance branch), reaping the
+ *    Ghostty window in lockstep with the dispatch's terminal state so
+ *    the human's screen doesn't accumulate parked surfaces.
  *
  * The frame has four named-header sections, each emitted only when
  * non-empty, rendered in this order: `--- current ---`, `--- queued ---`,
@@ -49,14 +63,18 @@
  * rows a second time, returning `restoredEntries`: every
  * `kind:"launch"` row where `fulfilledKeys.has(key) &&
  * !completedKeys.has(key) && !dry`, deduped latest-per-key (later
- * `ts` wins), sorted by `ts` ascending. `main()` seeds the in-memory
- * `dispatchLog` array from `restoredEntries`, so a prior-run
- * still-running dispatch renders under `--- current ---` on the very
- * first frame. If the matching embedded job has since fallen off the
- * projection (parent epic became done+approved or was
+ * `ts` wins), sorted by `ts` ascending. The matching `kind:"window"`
+ * row (if any) is folded onto the restored entry's `windowId`
+ * (latest-ts-wins) so cross-run auto-close still works. `main()`
+ * seeds the in-memory `dispatchLog` array from `restoredEntries`, so
+ * a prior-run still-running dispatch renders under `--- current ---`
+ * on the very first frame. If the matching embedded job has since
+ * fallen off the projection (parent epic became done+approved or was
  * `planctl epic-delete`d), `detectJobTransitions`'s disappearance
  * branch migrates the key to `completedKeys` on the first
- * post-startup snapshot and the row moves to `--- completed ---`.
+ * post-startup snapshot, the row moves to `--- completed ---`, AND
+ * `closeWindow(entry.windowId)` fires to reap the parked Ghostty
+ * window — same auto-close path the terminal-state branch takes.
  * Dispatches partition three ways: rows whose key has been observed
  * terminal (`state in {ended, killed}`) or whose fulfilled job has
  * disappeared from the snapshot render under `--- completed ---`;
@@ -136,7 +154,12 @@
  *   --help           Show this help.
  */
 
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
@@ -157,9 +180,14 @@ Usage: bun scripts/autopilot.ts [--sock <path>] [--dry-run]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
   --dry-run        Log dispatches to the frame and disk but skip the
-                   actual Ghostty spawn. The summary line carries a
-                   [dry] tag and is followed by the would-have-run
-                   shell command on two indented lines.
+                   actual Ghostty spawn (and the matching auto-close).
+                   The summary line carries a [dry] tag and is followed
+                   by the would-have-run shell command on two indented
+                   lines. Live mode launches each worker through
+                   \$SHELL (validated absolute path, /bin/zsh fallback)
+                   with -l -i and chains an interactive shell after
+                   claude exits, so a dropped session leaves a
+                   keyboard-usable shell in the window.
   --help           Show this help
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
@@ -216,16 +244,20 @@ under '--- queued ---'. In wet mode queued is transient (~1-3 frames
 before SessionStart folds); in dry mode it persists for the lifetime
 of the run, and dry launches are deliberately NOT restored across
 runs since they can never reach fulfillment. The JSONL log at
-~/.local/state/keeper/dispatch.log carries three kinds — 'launch'
-(every dispatch), 'fulfilled' (first observation of the registered
-session), and 'completed' (first observation of the session in a
-terminal state OR first post-fulfillment disappearance) — and
-drives both the durable re-dispatch guard and the cross-run
-current-section restore. A real mid-flight crash now preserves
-'--- current ---' (next run rehydrates it from disk); '--- queued ---'
-is still lost across the crash because a queued dispatch has no
-fulfilled line yet. A new frame is emitted after each dispatch AND
-whenever a row moves between sections.
+~/.local/state/keeper/dispatch.log carries four kinds — 'launch'
+(every dispatch), 'window' (the freshly-spawned Ghostty window's
+stable id, emitted right after the osascript spawn returns),
+'fulfilled' (first observation of the registered session), and
+'completed' (first observation of the session in a terminal state OR
+first post-fulfillment disappearance) — and drives both the durable
+re-dispatch guard and the cross-run current-section restore. The
+'completed' edge ALSO fires the Ghostty window auto-close
+(closeWindow on the persisted windowId) so the dispatched window
+exits in lockstep with the underlying agent. A real mid-flight crash
+now preserves '--- current ---' (next run rehydrates it from disk);
+'--- queued ---' is still lost across the crash because a queued
+dispatch has no fulfilled line yet. A new frame is emitted after each
+dispatch AND whenever a row moves between sections.
 
 The '--- predicted ---' section previews the next dispatches autopilot
 will fire as a direct consequence of the embedded jobs currently in
@@ -283,6 +315,46 @@ export const ARTHACK_ROOT: string = ((): string => {
   return v;
 })();
 
+/**
+ * Sanity-check a `$SHELL` candidate before threading it into the
+ * AppleScript `command` field. Returns the path on success, `null` on
+ * any rejection — callers then fall back to `/bin/zsh`.
+ *
+ * Three rules — minimal but load-bearing:
+ *   1. Must be a non-empty string.
+ *   2. Must be an absolute path (`/`-rooted) that `fs.existsSync` says
+ *      exists. Drops malformed env values and stale paths to deleted
+ *      shells. (No `X_OK` mode check — Bun's `existsSync` lacks the
+ *      mode flag, and `osascript` will surface an unexec error if the
+ *      file is non-executable; falling back on `existsSync` alone is
+ *      the right minimum.)
+ *   3. Must contain no `"` (AppleScript string-literal injection
+ *      guard). The shell path is interpolated into the `set command of
+ *      cfg to ...` literal via `JSON.stringify`, but a `"` in the path
+ *      itself would still break out of the outer literal once the
+ *      JSON-encoded string is re-encoded by AppleScript's parser. A
+ *      shell binary with `"` in its name is pathological; reject
+ *      defensively.
+ *
+ * Exported so test/autopilot.test.ts can exercise the validation
+ * boundaries without spinning up a real `$SHELL`.
+ */
+export function validateShell(candidate: string | undefined): string | null {
+  if (typeof candidate !== "string" || candidate === "") {
+    return null;
+  }
+  if (!candidate.startsWith("/")) {
+    return null;
+  }
+  if (candidate.includes('"')) {
+    return null;
+  }
+  if (!existsSync(candidate)) {
+    return null;
+  }
+  return candidate;
+}
+
 export interface DispatchEntry {
   ts: string;
   kind: "launch";
@@ -305,6 +377,17 @@ export interface DispatchEntry {
   // dispatch.log row to a specific autopilot process without grepping
   // sidecar mtimes. Frames don't render this field.
   pid?: number;
+  // Ghostty window id (`tab-group-…`) captured from osascript stdout
+  // right after the `new window with configuration cfg` call returns —
+  // stamped on the LIVE in-memory entry by reference so the same-run
+  // auto-close in `detectJobTransitions` can fire `closeWindow(entry.windowId)`
+  // when the dispatched row reaches `completedKeys`. Also persisted to
+  // disk via a `{"kind":"window", ts, verb, id, windowId}` row that
+  // `hydrateDispatchLog` folds back onto the restored entry across runs.
+  // `undefined` when the osascript capture failed or hasn't landed yet;
+  // `closeWindow` no-ops on that shape (the shell-fallback covers the
+  // window — it just won't auto-close).
+  windowId?: string;
 }
 
 // --- command rendering (module-scope so test/autopilot.test.ts can import) ---
@@ -1128,6 +1211,13 @@ export function hydrateDispatchLog(path: string): {
   // !completedKeys.has(key) && !dry`) has to wait for the first pass
   // to finish populating the three sets.
   const launchRows = new Map<string, DispatchEntry>();
+  // Buffer every parsed `kind:"window"` row keyed by `(verb, id)` so
+  // we can stamp `windowId` onto the matching surviving restored
+  // launch entry in pass 2. Latest-ts-wins (an old log can carry a
+  // stale id if the window was already reaped; the freshest row is
+  // the closest live signal). Track the `ts` alongside the id so the
+  // comparison doesn't pin to insertion order.
+  const windowRows = new Map<string, { windowId: string; ts: string }>();
   let content: string;
   try {
     content = readFileSync(path, "utf8");
@@ -1204,11 +1294,29 @@ export function hydrateDispatchLog(path: string): {
       fulfilledKeys.add(key);
     } else if (row.kind === "completed") {
       completedKeys.add(key);
+    } else if (row.kind === "window") {
+      const ts = row.ts;
+      const windowId = row.windowId;
+      // Type-guard every field; a shape mismatch (e.g. `windowId`
+      // recorded as a number by a future log-format quirk) skips
+      // silently per the "malformed lines skip" forensic-log
+      // contract. The latest-ts-wins comparison string-compares ISO
+      // timestamps (their lex order matches chronological order).
+      if (typeof ts !== "string" || typeof windowId !== "string") {
+        continue;
+      }
+      const prev = windowRows.get(key);
+      if (prev === undefined || prev.ts <= ts) {
+        windowRows.set(key, { windowId, ts });
+      }
     }
   }
   // Second pass: apply the restore filter (`fulfilled && !completed
   // && !dry`) against the now-complete three sets, then sort by `ts`
-  // ascending to preserve the oldest-first frame ordering.
+  // ascending to preserve the oldest-first frame ordering. Stamp the
+  // matching `windowRows` entry's `windowId` (if any) onto the
+  // restored entry so cross-run auto-close still works on a launch
+  // that had a window-id capture before the crash/restart.
   const restoredEntries: DispatchEntry[] = [];
   for (const [key, entry] of launchRows) {
     if (!fulfilledKeys.has(key)) {
@@ -1219,6 +1327,10 @@ export function hydrateDispatchLog(path: string): {
     }
     if (entry.dry === true) {
       continue;
+    }
+    const window = windowRows.get(key);
+    if (window !== undefined) {
+      entry.windowId = window.windowId;
     }
     restoredEntries.push(entry);
   }
@@ -1309,6 +1421,16 @@ export interface DetectJobTransitionsDeps {
   // in-memory recorder to assert the exact JSON shape without touching
   // the filesystem.
   appendLine: (line: string) => void;
+  // Auto-close trigger. Fired at BOTH `completedKeys`-entry sites
+  // (terminal-state branch AND disappearance branch) so the dispatched
+  // Ghostty window exits in lockstep with the underlying agent's
+  // terminal state. Production wires a fire-and-forget osascript spawn
+  // using the verified repeat-loop close pattern; tests inject a
+  // recording closure to assert the windowId reached the callback. The
+  // `entry.windowId` (which may be `undefined`) is passed through
+  // unconditionally — the production implementation no-ops on
+  // `undefined` so the call site can stay branch-free.
+  closeWindow: (windowId: string | undefined) => void;
 }
 
 /**
@@ -1352,6 +1474,7 @@ export function detectJobTransitions(
     noteLine,
     pid,
     appendLine,
+    closeWindow,
   } = deps;
   for (const entry of dispatchLog) {
     const key = `${entry.verb}::${entry.id}`;
@@ -1382,6 +1505,12 @@ export function detectJobTransitions(
           `# warn: completed log write failed: ${(err as Error).message}`,
         );
       }
+      // Auto-close trigger (disappearance branch). `entry.windowId`
+      // may be `undefined`; the production implementation no-ops on
+      // that shape so the call here stays branch-free. The
+      // `completedKeys.has(key)` guard at the top of the loop ensures
+      // a subsequent snapshot doesn't fire `closeWindow` twice.
+      closeWindow(entry.windowId);
       continue;
     }
     // Constraint: the disappearance branch above MUST stay above this
@@ -1425,6 +1554,10 @@ export function detectJobTransitions(
           `# warn: completed log write failed: ${(err as Error).message}`,
         );
       }
+      // Auto-close trigger (terminal-state branch). Mirrors the
+      // disappearance branch above — same once-per-key guarantee via
+      // the `completedKeys.has(key)` top-of-loop guard.
+      closeWindow(entry.windowId);
     }
   }
 }
@@ -1831,28 +1964,39 @@ async function main(): Promise<void> {
       return;
     }
     // `-l -i` = login + interactive — login alone sources `.zprofile` only,
-    // so `claude` (and most user PATH additions) live in `.zshrc` which is
-    // interactive-only. Without `-i` the spawned shell can't find `claude`.
-    const zshInvocation = `/bin/zsh -l -i -c ${JSON.stringify(workerShellCommand)}`;
+    // so `claude` (and most user PATH additions) live in the interactive
+    // rc file (`.zshrc` / `.bashrc`) which is interactive-only. Without
+    // `-i` the spawned shell can't find `claude`. zsh's `exec_opt` is OFF
+    // under `-i` (verified live), so `exec <shell>` re-spawns rather than
+    // replacing — claude stays a CHILD of a live login+interactive shell,
+    // and on claude's exit the shell drops into an interactive prompt the
+    // human can use (vim fallback for the rare case auto-close fails to
+    // fire). Applies to any POSIX-ish login+interactive shell, not just
+    // zsh.
+    const shell = validateShell(process.env.SHELL) ?? "/bin/zsh";
+    // Wrap the worker command so claude is a child of $SHELL and a fresh
+    // interactive shell takes over on claude's exit. The outer `-l -i -c`
+    // runs the body string; the trailing `exec ${shell} -l -i` keeps a
+    // usable shell in the Ghostty window so a dropped session is not a
+    // dead window.
+    const shellInvocation = `${shell} -l -i -c ${JSON.stringify(`${workerShellCommand} ; exec ${shell} -l -i`)}`;
     const appleScript = [
       'tell application "Ghostty"',
       "set cfg to new surface configuration",
-      `set command of cfg to ${JSON.stringify(zshInvocation)}`,
-      "new window with configuration cfg",
+      `set command of cfg to ${JSON.stringify(shellInvocation)}`,
+      // `set w to new window …` captures the spawned window so we can
+      // `return id of w`; the AppleScript stdout is then piped to
+      // osascript's exit-0 stdout (`tab-group-…`) which we parse for the
+      // `windowId` stamp. Isolating the osascript spawn from the yabai
+      // tail keeps that capture clean.
+      "set w to new window with configuration cfg",
+      "return id of w",
       "end tell",
     ];
-    const osascriptArgs = ["osascript"];
+    const osascriptArgs: string[] = [];
     for (const line of appleScript) {
       osascriptArgs.push("-e", line);
     }
-    // Chain the yabai move into the same shell so we don't have to track
-    // the Ghostty PID — `yabai -m window --space 5` operates on the
-    // focused window, which is the brand-new Ghostty window.
-    const shellLine = `${osascriptArgs
-      .map((a) => `'${a.replace(/'/g, "'\\''")}'`)
-      .join(
-        " ",
-      )} && sleep 0.3 && yabai -m window --space 5 2>/dev/null || true`;
     logDispatch({
       ts: new Date().toISOString(),
       kind: "launch",
@@ -1866,17 +2010,63 @@ async function main(): Promise<void> {
     });
     if (dryRun) return;
     try {
-      const proc = Bun.spawn(["sh", "-c", shellLine], {
+      // Spawn osascript as its OWN process so its stdout carries ONLY
+      // the bare window id (`tab-group-…`). The yabai move below is a
+      // separate fire-and-forget step so its output never pollutes the
+      // capture.
+      const proc = Bun.spawn(["osascript", ...osascriptArgs], {
         stdout: "pipe",
         stderr: "pipe",
         stdin: "ignore",
       });
-      // Fire-and-forget; surface stderr to the lifecycle sidecar if any.
-      proc.exited
-        .then(async () => {
-          const errText = await new Response(proc.stderr).text();
-          if (errText.length > 0) {
-            noteLine(`# launch stderr (${rowId}): ${errText.trim()}`);
+      Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ])
+        .then(([exitCode, stdoutText, stderrText]) => {
+          if (stderrText.length > 0) {
+            noteLine(`# launch stderr (${rowId}): ${stderrText.trim()}`);
+          }
+          const windowId = stdoutText.trim();
+          if (exitCode === 0 && windowId.length > 0) {
+            // Mutate the LIVE in-memory entry by reference (find by
+            // `${verb}::${id}`). The just-pushed entry is the last
+            // matching `(verb, id)` in `dispatchLog`; scan backward to
+            // grab it without iterating the full array.
+            const liveKey = `${verb}::${id}`;
+            for (let i = dispatchLog.length - 1; i >= 0; i--) {
+              const e = dispatchLog[i];
+              if (e !== undefined && `${e.verb}::${e.id}` === liveKey) {
+                e.windowId = windowId;
+                break;
+              }
+            }
+            // Persist the windowId to disk as a `window` kind row via
+            // a raw `appendFileSync` — NOT `logDispatch` (which would
+            // re-push a display entry and re-add to `dispatchedKeys`).
+            // Try/catch → noteLine on failure; the in-memory stamp
+            // still carries the same-run auto-close path forward.
+            try {
+              appendFileSync(
+                dispatchLogPath,
+                `${JSON.stringify({
+                  kind: "window",
+                  ts: new Date().toISOString(),
+                  verb,
+                  id,
+                  windowId,
+                })}\n`,
+              );
+            } catch (err) {
+              noteLine(
+                `# warn: window log write failed: ${(err as Error).message}`,
+              );
+            }
+          } else if (exitCode !== 0) {
+            noteLine(
+              `# warn: osascript spawn for ${rowId} exited non-zero (${exitCode}); window will not auto-close`,
+            );
           }
         })
         .catch((err) => {
@@ -1884,6 +2074,22 @@ async function main(): Promise<void> {
             `# warn: launch spawn for ${rowId} failed: ${(err as Error).message}`,
           );
         });
+      // Separate fire-and-forget yabai move — `yabai -m window --space 5`
+      // operates on the focused window, which is the brand-new Ghostty
+      // window. The 0.3s sleep gives Ghostty time to claim focus. yabai
+      // not being installed is fine (`|| true`).
+      try {
+        Bun.spawn(
+          [
+            "sh",
+            "-c",
+            "sleep 0.3 && yabai -m window --space 5 2>/dev/null || true",
+          ],
+          { stdout: "ignore", stderr: "ignore", stdin: "ignore" },
+        );
+      } catch {
+        // best-effort; the dispatch already shipped via osascript.
+      }
     } catch (err) {
       noteLine(
         `# warn: launch spawn for ${rowId} failed: ${(err as Error).message}`,
@@ -2083,6 +2289,73 @@ async function main(): Promise<void> {
     pid: process.pid,
     appendLine: (line: string): void => {
       appendFileSync(dispatchLogPath, line);
+    },
+    closeWindow: (windowId: string | undefined): void => {
+      // No-op on undefined (no id was captured at launch — the
+      // shell-fallback covers the window; it just won't auto-close)
+      // and under `--dry-run` (the spawn itself was suppressed, so
+      // there's no window to close). Under dry-run we still
+      // `noteLine` the intended close so the lifecycle sidecar
+      // shows the would-have-fired path.
+      if (windowId === undefined || windowId === "") {
+        return;
+      }
+      if (dryRun) {
+        noteLine(
+          `# closeWindow (dry) windowId=${windowId} — would close Ghostty window`,
+        );
+        return;
+      }
+      // Verified repeat-loop close pattern (tip Ghostty
+      // `cb36966a7`, 2026-05-29): `close window id "..."` errors
+      // -2741 (text vs integer specifier), `close <w>` errors -1708
+      // (verb belongs to the `terminal` class not `window`). The
+      // repeat-loop walks the window list, matches by id, and fires
+      // `close window <w>` against the AppleScript object reference
+      // — the only form that actually reaps the surface.
+      const appleScript = [
+        `set wid to ${JSON.stringify(windowId)}`,
+        'tell application "Ghostty"',
+        "repeat with w in every window",
+        "if id of w is wid then",
+        "close window w",
+        "return",
+        "end if",
+        "end repeat",
+        'return "not-found"',
+        "end tell",
+      ];
+      const args: string[] = [];
+      for (const line of appleScript) {
+        args.push("-e", line);
+      }
+      try {
+        const proc = Bun.spawn(["osascript", ...args], {
+          stdout: "ignore",
+          stderr: "pipe",
+          stdin: "ignore",
+        });
+        // Fire-and-forget; surface stderr (osascript error or
+        // "not-found") to the lifecycle sidecar but never throw
+        // back into the transitions loop.
+        Promise.all([proc.exited, new Response(proc.stderr).text()])
+          .then(([_exitCode, stderrText]) => {
+            if (stderrText.length > 0) {
+              noteLine(
+                `# closeWindow stderr (${windowId}): ${stderrText.trim()}`,
+              );
+            }
+          })
+          .catch((err) => {
+            noteLine(
+              `# warn: closeWindow spawn (${windowId}) failed: ${(err as Error).message}`,
+            );
+          });
+      } catch (err) {
+        noteLine(
+          `# warn: closeWindow spawn (${windowId}) failed: ${(err as Error).message}`,
+        );
+      }
     },
   };
 

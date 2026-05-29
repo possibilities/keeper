@@ -462,27 +462,30 @@ CI) `--live` silently behaves as if it wasn't set. Run any of them with
   ```
 
 - `autopilot.ts` — dispatch-oriented sibling of `board.ts`. Subscribes
-  through the same `src/readiness-client.ts` helper and emits two
-  `===`-delimited blocks per frame, led by `---`. Block 1 is the flat
-  ordered command list — two lines per task (`cd <target_repo> && claude
-  '/plan:work <id>'` + `bun scripts/approve.ts <id>`) plus a virtual
-  close pair per epic (`/plan:close` + approve) — in the same traversal
-  order as `board.ts`. Block 2 lists only the pairs whose readiness
-  verdict is `{ tag: "ready" }` — the same set surfaced by board's
-  `[ready]` pills, prefixed by a one-line `#` header explaining that
-  this is "any one of these can be dispatched next," NOT a parallel
-  work queue (the single-root post-pass in `src/readiness.ts` keeps at
-  most one ready row per project root). Byte-compares the combined body
-  so a verdict transition with no task-set change still emits a new
-  frame. Same three sidecar files + `--live` alt-screen TUI as
-  `board.ts` (per-line ANSI diff, ring-buffered frame history, keymap
-  `←/h/k`/`→/l/j`/`g`/`G`/`Esc`/`q`; non-TTY behaves as if `--live`
-  wasn't set). SIGINT calls the live-shell's `dispose()` first
-  (terminal restoration) then the helper's `dispose()` and exits 0.
+  through the same `src/readiness-client.ts` helper and renders a
+  four-section frame (`--- current ---`, `--- queued ---`,
+  `--- predicted ---`, `--- completed ---`) of every dispatch fired so
+  far this run (plus prior-run rehydrated `--- current ---` rows via
+  `hydrateDispatchLog`). Fires on verdict edges: a row flipping to
+  `ready` spawns a Ghostty window running `cd <target_repo> && claude
+  '/plan:work|close <id>'`; a row flipping to `blocked:job-pending`
+  spawns the matching `/plan:approve`. The launch goes through
+  validated `$SHELL` (`-l -i`, `/bin/zsh` fallback) with `exec $SHELL
+  -l -i` chained after claude exits so a dropped session leaves a
+  usable shell. Each launch records its Ghostty window id in
+  `~/.local/state/keeper/dispatch.log` (a `kind:"window"` row) and
+  auto-closes the window via osascript the moment the dispatch reaches
+  `--- completed ---` (terminal job state or post-fulfillment
+  disappearance), so parked "process exited" surfaces don't accumulate.
+  Re-dispatch is gated by durable `dispatchedKeys` / `fulfilledKeys`
+  sets seeded from `dispatch.log`. Alt-screen TUI when stdout is a TTY;
+  keymap `←/h/k` / `→/l/j` / `g` / `G/Esc` / `space` pause / `v` toggle
+  commands / `c` copy / `q` quit. SIGINT restores the terminal then
+  disposes the helper.
 
   ```sh
-  bun scripts/autopilot.ts            # two-block dispatch list, default scope
-  bun scripts/autopilot.ts --live     # alt-screen TUI with indexed sidecars
+  bun scripts/autopilot.ts            # four-section dispatch frame, default scope
+  bun scripts/autopilot.ts --dry-run  # log dispatches without spawning Ghostty
   ```
 
 - `git.ts` — single-collection subscribe client over the `git`
