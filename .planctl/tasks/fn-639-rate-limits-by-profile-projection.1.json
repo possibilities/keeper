@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-29T02:23:57.076919Z",
+  "depends_on": [],
+  "epic": "fn-639-rate-limits-by-profile-projection",
+  "id": "fn-639-rate-limits-by-profile-projection.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Profiles projection and reducer fan-outs",
+  "updated_at": "2026-05-29T02:23:57.076919Z"
+}
