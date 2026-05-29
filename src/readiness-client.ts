@@ -1,11 +1,12 @@
 /**
- * Shared subscribe client + readiness handoff for the three keeper collections
- * (`epics`, `jobs`, `subagent_invocations`) PLUS a generic single-collection
- * subscribe helper. One imperative API: callers pass a snapshot/rows callback
- * and get back a `dispose()` handle. The helpers own the connection lifecycle
- * (capped-backoff reconnect, post-disconnect re-handshake, per-collection
- * coalesce, steady-poll backstop) plus the relevant first-paint gate and the
- * per-frame projection; callers do rendering and side effects on top.
+ * Shared subscribe client + readiness handoff for the five keeper collections
+ * (`epics`, `jobs`, `subagent_invocations`, `git`, `dead_letters`) PLUS a
+ * generic single-collection subscribe helper. One imperative API: callers
+ * pass a snapshot/rows callback and get back a `dispose()` handle. The
+ * helpers own the connection lifecycle (capped-backoff reconnect,
+ * post-disconnect re-handshake, per-collection coalesce, steady-poll
+ * backstop) plus the relevant first-paint gate and the per-frame projection;
+ * callers do rendering and side effects on top.
  *
  * Two public entry points
  * -----------------------
@@ -16,12 +17,17 @@
  *   semantics: an `error` frame BEFORE the first `result` is unrecoverable
  *   (the query is malformed); after at least one `result`, errors are
  *   transient and the next refetch can recover.
- * - `subscribeReadiness({ ... })` — three-collection composition used by the
+ * - `subscribeReadiness({ ... })` — five-collection composition used by the
  *   full-readiness consumers (`scripts/board.ts`, `scripts/autopilot.ts`).
- *   All three (`epics` + `jobs` + `subagent_invocations`) ride a single
- *   connection; the all-three-strict first-paint gate withholds `onSnapshot`
- *   until each has produced a `result`, then `computeReadiness` runs and the
- *   composed snapshot fires.
+ *   All five (`epics` + `jobs` + `subagent_invocations` + `git` +
+ *   `dead_letters`) ride a single connection; the all-five-strict
+ *   first-paint gate withholds `onSnapshot` until each has produced a
+ *   `result`, then `computeReadiness` runs and the composed snapshot fires.
+ *   The `dead_letters` collection rides the descriptor's default
+ *   `filter: { status: "waiting" }` scope so the wire stream tracks only the
+ *   unrecovered backlog — the board's persistent warn-count and
+ *   readiness consumers see "things to fix right now," not the audit trail
+ *   of already-recovered rows.
  *
  * Both helpers share one internal driver (`subscribeMulti`) that owns the
  * socket, the reconnect-with-backoff loop, the line buffer, the per-collection
@@ -46,10 +52,15 @@
  *
  * Lifecycle contract:
  *   - First-paint gate. `subscribeReadiness` withholds `onSnapshot` until
- *     epics + jobs + subagent_invocations have EACH produced their first
- *     `result`; `subscribeCollection` withholds `onRows` until its single
- *     collection has produced its first `result`. A partial snapshot would
- *     compute readiness against a wrong-state input.
+ *     epics + jobs + subagent_invocations + git + dead_letters have EACH
+ *     produced their first `result`; `subscribeCollection` withholds
+ *     `onRows` until its single collection has produced its first `result`.
+ *     A partial snapshot would compute readiness against a wrong-state
+ *     input. The empty steady state of `dead_letters` (zero waiting rows,
+ *     the happy case) still produces a `result` frame with `rows: []` so
+ *     the gate clears — the descriptor's `defaultFilter: { status:
+ *     "waiting" }` scope means "no dropped events to recover," not "no
+ *     subscription."
  *   - Capped-backoff reconnect: 250 ms → 5000 ms doubling per attempt;
  *     resets on a successful connection.
  *   - Steady-poll backstop (500 ms) refetches each subscribed collection
@@ -81,7 +92,13 @@ import {
   type ServerFrame,
 } from "./protocol";
 import { computeReadiness, type ReadinessSnapshot } from "./readiness";
-import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
+import type {
+  DeadLetter,
+  Epic,
+  GitStatus,
+  Job,
+  SubagentInvocation,
+} from "./types";
 
 // ---------------------------------------------------------------------------
 // Tuning constants — same values the prior board.ts standalone code used.
@@ -94,6 +111,13 @@ const SUBAGENT_INVOCATIONS_PAGE_LIMIT = 0;
 // scoped to project roots that have produced events, which is bounded by the
 // human's actual repo collection.
 const GIT_PAGE_LIMIT = 0;
+// Full set — `dead_letters` rides the descriptor's
+// `defaultFilter: { status: "waiting" }` so the wire stream is just the
+// unrecovered backlog (typically zero rows; bursts are bounded by how many
+// hook-INSERT failures the daemon has imported but not yet replayed). Page
+// limit 0 streams them all — there is no scroll affordance and the
+// renderer needs the full native count to surface as a warn pill.
+const DEAD_LETTERS_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
@@ -123,13 +147,17 @@ const QUERY_TIMEOUT_MS = 5000;
  * `byId.values()` — see module docstring for the predicate-6 reasoning.
  * `jobs` is a `Map<job_id, Job>` because board's renderer indexes by id for
  * the per-epic `job_links` lookup; autopilot can ignore the map and read
- * only `epics` if it wants to.
+ * only `epics` if it wants to. `deadLetters` is the unrecovered backlog
+ * (descriptor `defaultFilter: { status: "waiting" }` scope); a renderer
+ * surfaces `deadLetters.length` as the warn-count pill and a `0`-length
+ * array drops the pill cleanly.
  */
 export interface ReadinessClientSnapshot {
   readonly epics: Epic[];
   readonly jobs: Map<string, Job>;
   readonly subagentInvocations: SubagentInvocation[];
   readonly gitStatus: GitStatus[];
+  readonly deadLetters: DeadLetter[];
   readonly readiness: ReadinessSnapshot;
 }
 
@@ -419,8 +447,9 @@ export function collapseSubagentsByName(
  *     helper has already updated `state.rows` / `state.byId` / `state.order`
  *     by then.
  *   - `isTerminal(states)` returns true iff a pre-paint `error` should be
- *     treated as a fatal query-shape error (multi: all three lack
- *     `gotResult`; single: the one collection lacks `gotResult`).
+ *     treated as a fatal query-shape error (multi: ALL collections lack
+ *     `gotResult` — five for `subscribeReadiness`; single: the one
+ *     collection lacks `gotResult`).
  */
 interface MultiOptions {
   readonly sockPath: string;
@@ -936,14 +965,15 @@ export function subscribeCollection(
 }
 
 // ---------------------------------------------------------------------------
-// Public helper #2: three-collection readiness subscribe
+// Public helper #2: five-collection readiness subscribe
 // ---------------------------------------------------------------------------
 
 /**
  * Subscribe options. `idPrefix` is appended with the collection name so
  * subscription IDs become `<prefix>-epics` / `<prefix>-jobs` /
- * `<prefix>-subagent-invocations`. The server doesn't enforce uniqueness
- * across connections; the prefix is purely a debug-log discriminator.
+ * `<prefix>-subagent-invocations` / `<prefix>-git` /
+ * `<prefix>-dead-letters`. The server doesn't enforce uniqueness across
+ * connections; the prefix is purely a debug-log discriminator.
  *
  * `onFatal` is called when a terminal `error` frame arrives BEFORE any
  * collection has produced a first `result` — the query itself is
@@ -970,8 +1000,8 @@ export interface SubscribeOptions {
 }
 
 /**
- * Open a subscription to all three readiness collections on a single
- * connection and invoke `onSnapshot` once per emit (after the all-three
+ * Open a subscription to all five readiness collections on a single
+ * connection and invoke `onSnapshot` once per emit (after the all-five
  * gate clears). Returns a handle whose `dispose()` tears down the
  * connection, cancels any pending reconnect timer, and releases the
  * steady-poll interval.
@@ -987,6 +1017,7 @@ export function subscribeReadiness(
   const jobsSubId = `${idPrefix}-jobs`;
   const subsSubId = `${idPrefix}-subagent-invocations`;
   const gitSubId = `${idPrefix}-git`;
+  const deadLettersSubId = `${idPrefix}-dead-letters`;
   const epics = makeState("epics", epicsSubId, "epic_id", {
     type: "query",
     collection: "epics",
@@ -1039,11 +1070,28 @@ export function subscribeReadiness(
     id: gitSubId,
     limit: GIT_PAGE_LIMIT,
   });
+  // The `dead_letters` collection feeds the board's persistent warn-count
+  // pill (waiting rows the daemon imported from per-pid NDJSON files when
+  // the hook's `events` INSERT exhausted retry — see fn-643). Default
+  // page rides the descriptor's `defaultFilter: { status: "waiting" }`
+  // server-side scope so the wire stream is just the unrecovered backlog;
+  // recovered rows still exist (the row is the audit trail joining
+  // `dl_id` to the appended `replayed_event_id`) but fall off the default
+  // page. First-paint gate widened to this collection — an empty steady
+  // state (zero waiting, the happy case) still produces a `result` frame
+  // with `rows: []` so the gate clears.
+  const deadLetters = makeState("dead_letters", deadLettersSubId, "dl_id", {
+    type: "query",
+    collection: "dead_letters",
+    id: deadLettersSubId,
+    limit: DEAD_LETTERS_PAGE_LIMIT,
+  });
   const states: CollectionState[] = [
     epics,
     jobs,
     subagentInvocations,
     gitStatus,
+    deadLetters,
   ];
 
   function emitSnapshotIfReady(): void {
@@ -1051,7 +1099,8 @@ export function subscribeReadiness(
       !epics.gotResult ||
       !jobs.gotResult ||
       !subagentInvocations.gotResult ||
-      !gitStatus.gotResult
+      !gitStatus.gotResult ||
+      !deadLetters.gotResult
     ) {
       return;
     }
@@ -1159,6 +1208,13 @@ export function subscribeReadiness(
       // resolver pattern in `epic-deps.ts`).
       Math.floor(Date.now() / 1000),
     );
+    // `dead_letters` is a flat row stream — typed projection from
+    // `state.rows` so the wire diff (each `result` re-snapshots `rows`)
+    // is the source of truth. Renderers consume `deadLetters.length` for
+    // the warn-count pill; the `dl_id` + `hook_event` + `session_id`
+    // fields ride along so a future detail view (or a tooltip) can
+    // surface "what dropped" without a separate sub.
+    const deadLettersTyped = projectRows<DeadLetter>(deadLetters);
     // Exceptions from `onSnapshot` propagate. This matches keeper's
     // "no in-process self-heal" stance and the prior board.ts code path,
     // which had no try/catch around its emit either.
@@ -1167,6 +1223,7 @@ export function subscribeReadiness(
       jobs: jobsTyped,
       subagentInvocations: subsTyped,
       gitStatus: gitTyped,
+      deadLetters: deadLettersTyped,
       readiness,
     });
   }

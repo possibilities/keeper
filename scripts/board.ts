@@ -82,6 +82,12 @@ import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveSockPath } from "../src/db";
 import type { EpicDepResolution } from "../src/epic-deps";
 import { createLiveShell } from "../src/live-shell";
+import {
+  type ClientFrame,
+  encodeFrame,
+  LineBuffer,
+  type ServerFrame,
+} from "../src/protocol";
 import { formatPill, type Verdict } from "../src/readiness";
 import {
   collapseSubagentsByName,
@@ -105,7 +111,9 @@ Usage: bun scripts/board.ts [--sock <path>]
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
-  c copy current frame + sidecar paths to clipboard, q/Ctrl-C quit.
+  c copy current frame + sidecar paths to clipboard,
+  r replay one oldest waiting dead-letter (recovers a dropped hook event),
+  q/Ctrl-C quit.
   Per-frame sidecars are indexed; lifecycle + warn output
   is appended to /tmp/keeper-board.<pid>.lifecycle.txt. Session paths
   print on exit.
@@ -650,6 +658,15 @@ export function colorizePillsInLine(line: string): string {
     if (bucket === undefined && inner.startsWith("task-repo:")) {
       bucket = "warn";
     }
+    // fn-643.5: `[dead-letter:N]` is the persistent banner pill the board
+    // stamps when the daemon's `dead_letters` collection has waiting rows.
+    // Warn/yellow bucket — "things to fix right now," same family as
+    // `[blocked]` / `[awaiting:*]` / `[task-repo:*]`. The pill is dropped
+    // entirely at count 0 (renderDeadLetterPill returns ""), so the
+    // colorizer only sees this branch when there is actually a backlog.
+    if (bucket === undefined && inner.startsWith("dead-letter:")) {
+      bucket = "warn";
+    }
     // fn-638.4: route `running:sub-agent-stale` to the `warn` bucket
     // (yellow) so a possibly-stuck orphan sub-agent renders distinctly
     // from a fresh `running:*` (cyan). Placed BEFORE the generic
@@ -667,6 +684,193 @@ export function colorizePillsInLine(line: string): string {
       return match;
     }
     return `[${SGR[bucket]}${inner}${SGR.reset}]`;
+  });
+}
+
+/**
+ * Render the persistent `[dead-letter:N]` warn pill for the banner status
+ * line. `N` is the native waiting-row count from the `dead_letters`
+ * collection (descriptor `defaultFilter: { status: "waiting" }`); zero
+ * returns an empty string so the banner drops the pill cleanly when there
+ * is no backlog. A `null` / negative input also collapses to empty —
+ * defensive against a malformed snapshot. The returned string is plain
+ * text; the banner colorizer applies `warn` (yellow) via the
+ * `dead-letter:*` prefix branch in {@link colorizePillsInLine}.
+ *
+ * Module-level + exported so `test/board.test.ts` can assert the pill
+ * shape without standing up the subscribe loop.
+ */
+export function renderDeadLetterPill(waitingCount: number): string {
+  if (!Number.isFinite(waitingCount) || waitingCount <= 0) {
+    return "";
+  }
+  return `[dead-letter:${waitingCount}]`;
+}
+
+/**
+ * Hard upper bound on how long the `r` replay keypress waits for the
+ * `replay_dead_letter` RPC to reply. The handler's bridge already
+ * deadlines on the worker→main round-trip (`src/server-worker.ts`); 5s
+ * mirrors approve.ts's RESPONSE_TIMEOUT_MS so the board never wedges
+ * on a stuck daemon.
+ */
+const REPLAY_DEAD_LETTER_TIMEOUT_MS = 5000;
+
+/**
+ * Shape of a successful `replay_dead_letter` RPC reply.
+ * `recovered_dl_id: null` is the "nothing to replay" no-op ack; a string
+ * value is the freshly-recovered row's `dl_id` (the row that flipped
+ * `waiting → recovered`). Mirrors `ReplayDeadLetterResult` in
+ * `src/rpc-handlers.ts` — kept structural here so the board doesn't
+ * pull a server-side import.
+ */
+export interface ReplayDeadLetterRpcResult {
+  recovered_dl_id: string | null;
+}
+
+/**
+ * One-shot RPC client for `replay_dead_letter`. Opens a fresh UDS
+ * connection (the board's subscribe socket is read-only — RPCs ride
+ * SEPARATE connections per the approve.ts pattern), sends a single
+ * `rpc` frame, awaits the matching `rpc_result` / `error` frame by id,
+ * closes. Rejects with an Error carrying the human-readable reason on
+ * connect-fail, transport error, malformed frame, server-side close
+ * before reply, server `error` frame, or
+ * REPLAY_DEAD_LETTER_TIMEOUT_MS elapsing post-connect.
+ *
+ * Module-level + exported so `test/board.test.ts` can stand up a mock
+ * server and exercise the wire shape without the live-shell loop.
+ *
+ * The `connect` parameter is optional for test injection only —
+ * production callers pass nothing and get the real `Bun.connect`.
+ */
+export async function sendReplayDeadLetterRpc(
+  sockPath: string,
+  connect?: (path: string) => Promise<{
+    write(data: string): void;
+    end(): void;
+  }>,
+): Promise<ReplayDeadLetterRpcResult> {
+  const rpcId = crypto.randomUUID();
+  const send: ClientFrame = {
+    type: "rpc",
+    id: rpcId,
+    method: "replay_dead_letter",
+    params: {},
+  };
+  return new Promise<ReplayDeadLetterRpcResult>((resolve, reject) => {
+    const buffer = new LineBuffer();
+    let settled = false;
+    let sock: { end(): void } | null = null;
+    const settle = (
+      err: Error | null,
+      value: ReplayDeadLetterRpcResult | null,
+    ) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        sock?.end();
+      } catch {
+        // already torn down
+      }
+      if (err) {
+        reject(err);
+      } else if (value) {
+        resolve(value);
+      } else {
+        reject(new Error("internal: settle called with neither err nor value"));
+      }
+    };
+    const timeout = setTimeout(() => {
+      settle(
+        new Error(
+          `no response from daemon within ${REPLAY_DEAD_LETTER_TIMEOUT_MS}ms`,
+        ),
+        null,
+      );
+    }, REPLAY_DEAD_LETTER_TIMEOUT_MS);
+    timeout.unref?.();
+
+    const handleFrame = (frame: ServerFrame): void => {
+      if ((frame as { id?: string }).id !== rpcId) {
+        // Unrelated frame — discard. The dispatcher today never leaks
+        // unrelated frames into an RPC reply path, but the discipline
+        // matches approve.ts's defensive id-match.
+        return;
+      }
+      if (frame.type === "rpc_result") {
+        const value = frame.value as { recovered_dl_id?: string | null };
+        const recovered =
+          typeof value?.recovered_dl_id === "string"
+            ? value.recovered_dl_id
+            : null;
+        settle(null, { recovered_dl_id: recovered });
+        return;
+      }
+      if (frame.type === "error") {
+        settle(new Error(`server error ${frame.code}: ${frame.message}`), null);
+        return;
+      }
+      settle(new Error(`unexpected frame type: ${frame.type}`), null);
+    };
+
+    const factory =
+      connect ??
+      ((path: string) =>
+        Bun.connect({
+          unix: path,
+          socket: {
+            open(s) {
+              sock = s as unknown as { end(): void };
+              s.write(encodeFrame(send));
+            },
+            data(_s, chunk) {
+              let lines: string[];
+              try {
+                lines = buffer.push(chunk.toString("utf8"));
+              } catch (err) {
+                settle(
+                  new Error(`protocol error: ${(err as Error).message}`),
+                  null,
+                );
+                return;
+              }
+              for (const line of lines) {
+                if (line.trim().length === 0) continue;
+                let frame: ServerFrame;
+                try {
+                  frame = JSON.parse(line) as ServerFrame;
+                } catch (err) {
+                  settle(
+                    new Error(
+                      `malformed server frame: ${(err as Error).message}`,
+                    ),
+                    null,
+                  );
+                  return;
+                }
+                handleFrame(frame);
+              }
+            },
+            close() {
+              settle(
+                new Error("daemon closed connection before responding"),
+                null,
+              );
+            },
+            error(_s, err) {
+              settle(new Error(`socket error: ${err.message}`), null);
+            },
+          },
+        }) as unknown as Promise<{ write(data: string): void; end(): void }>);
+
+    factory(sockPath).catch((err: Error) => {
+      settle(
+        new Error(`failed to connect to ${sockPath}: ${err.message}`),
+        null,
+      );
+    });
   });
 }
 
@@ -777,6 +981,25 @@ async function main(): Promise<void> {
   // `lastBody` byte-compares the COMBINED body — internal row churn that
   // doesn't surface in the render is invisible by design.
   let lastBody: string | null = null;
+
+  // fn-643.5: latest waiting dead-letter count from the readiness
+  // snapshot. Persistent banner pill `[dead-letter:N]` reflects this on
+  // every frame; the replay-key flash temporarily overrides the banner
+  // via setStatus(), and the per-flash timer restores
+  // `setStatus(persistentBannerPill())` so the pill never disappears
+  // unintentionally. `0` (or null) collapses the pill to empty —
+  // dropped cleanly.
+  let waitingDeadLetterCount = 0;
+  // Pre-colorized banner status string for the persistent dead-letter
+  // pill. Recomputed every frame and after every flash timer. Empty
+  // string when there's no backlog (banner shows nothing).
+  function persistentBannerPill(): string {
+    const raw = renderDeadLetterPill(waitingDeadLetterCount);
+    if (raw === "") {
+      return "";
+    }
+    return colorEnabled ? colorizePillsInLine(raw) : raw;
+  }
 
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
@@ -1216,6 +1439,15 @@ async function main(): Promise<void> {
     for (const d of snap.readiness.diagnostics) {
       appendDiagnostic(d, diagnosticsLogPath);
     }
+    // fn-643.5: refresh the persistent banner pill BEFORE the
+    // body-stability short-circuit below — the dead-letter count can
+    // change independently of the body (a new waiting row landing while
+    // the epics/jobs render stays byte-stable). Always re-stamp the
+    // banner so the pill reflects every snapshot, even snapshots where
+    // the body byte-compare drops the frame. `setStatus` is itself a
+    // no-op when the string is unchanged.
+    waitingDeadLetterCount = snap.deadLetters.length;
+    liveShell.setStatus(persistentBannerPill());
     // Per-frame `job_id → invocations` index — re-entrant sub-agents within
     // one session sit on the same `job_id` bucket, ordered by `turn_seq asc`
     // so the nested list reads in invocation order. The projection now
@@ -1275,15 +1507,30 @@ async function main(): Promise<void> {
     }
   }
 
+  // Shared banner-flash timer. `c` (copy) and `r` (replay-dead-letter)
+  // both push a transient `[...]` status pill into the banner via
+  // `setStatus`; this single timer restores the persistent
+  // `[dead-letter:N]` (or empty) pill after the flash window. One timer
+  // (vs. per-key) means a fresh flash from EITHER key cancels a
+  // still-pending restore from the OTHER — last-flash-wins, no leaked
+  // banner state.
+  let flashTimer: ReturnType<typeof setTimeout> | undefined;
+  function scheduleFlashRestore(): void {
+    if (flashTimer !== undefined) {
+      clearTimeout(flashTimer);
+    }
+    flashTimer = setTimeout(() => {
+      flashTimer = undefined;
+      liveShell.setStatus(persistentBannerPill());
+    }, 1500);
+  }
+
   // `c` copies a debug snapshot (current frame + sidecar paths) to
   // the clipboard via `pbcopy`. Flashes `[copied frame N]` / `[copy
-  // failed]` in the banner via setStatus, then clears after ~1.5s.
+  // failed]` in the banner via setStatus; the shared flash-restore
+  // timer puts the persistent dead-letter pill back after ~1.5 s.
   // Skipped silently before the first frame lands.
-  let copyStatusTimer: ReturnType<typeof setTimeout> | undefined;
-  onKey = (key: string): void => {
-    if (key !== "c") {
-      return;
-    }
+  function handleCopyKey(): void {
     if (lastFrameText == null) {
       return;
     }
@@ -1304,11 +1551,66 @@ async function main(): Promise<void> {
         noteLine(`# warn: clipboard copy failed: ${res.error}`);
         liveShell.setStatus("[copy failed]");
       }
-      if (copyStatusTimer !== undefined) {
-        clearTimeout(copyStatusTimer);
-      }
-      copyStatusTimer = setTimeout(() => liveShell.setStatus(""), 1500);
+      scheduleFlashRestore();
     });
+  }
+
+  // `r` recovers ONE oldest waiting dead-letter via the `replay_dead_letter`
+  // RPC over a fresh short-lived UDS connection (board's subscribe socket
+  // is read-only; the RPC dispatch rides a SEPARATE connection per the
+  // approve.ts pattern). Flashes `[replaying…]` immediately, then
+  // `[recovered <dl_id>]` / `[nothing to replay]` / `[replay failed:
+  // <reason>]` on the RPC reply. A single-flight guard suppresses
+  // double-fires while a replay is in flight — the keypress would
+  // otherwise stack pending RPCs. The persistent `[dead-letter:N]` pill
+  // drops on the next frame (the recovered row leaves the waiting page);
+  // the recovered session appears via its `events`-side fold.
+  let replayInFlight = false;
+  function handleReplayKey(): void {
+    if (replayInFlight) {
+      // Already a replay in flight — refuse silently rather than queue
+      // another. The flash timer will restore the banner soon enough.
+      return;
+    }
+    replayInFlight = true;
+    liveShell.setStatus("[replaying…]");
+    // Do NOT schedule the flash restore yet — the `[replaying…]` pill
+    // must persist until the RPC resolves. The reply path schedules
+    // the restore AFTER stamping the final flash text.
+    void sendReplayDeadLetterRpc(sockPath)
+      .then(
+        (result) => {
+          if (result.recovered_dl_id === null) {
+            liveShell.setStatus("[nothing to replay]");
+          } else {
+            liveShell.setStatus(`[recovered ${result.recovered_dl_id}]`);
+          }
+          scheduleFlashRestore();
+        },
+        (err: Error) => {
+          noteLine(`# warn: dead-letter replay failed: ${err.message}`);
+          // Trim a possibly-multiline error message into a single
+          // banner-safe segment. The full message lives in the
+          // lifecycle sidecar via the noteLine above.
+          const oneLine = err.message.split("\n", 1)[0] ?? err.message;
+          liveShell.setStatus(`[replay failed: ${oneLine}]`);
+          scheduleFlashRestore();
+        },
+      )
+      .finally(() => {
+        replayInFlight = false;
+      });
+  }
+
+  onKey = (key: string): void => {
+    if (key === "c") {
+      handleCopyKey();
+      return;
+    }
+    if (key === "r") {
+      handleReplayKey();
+      return;
+    }
   };
 
   const handle = subscribeReadiness({
