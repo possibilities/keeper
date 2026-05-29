@@ -50,6 +50,7 @@ so re-fold determinism holds (CLAUDE.md "Producer-only liveness probing").
 - Negative or zero computed age (clock skew / same-second events) must NOT trip the release branch prematurely.
 - A `running` row with NULL/0 `ts` (legacy/malformed) — fold to a safe, defined branch (conservatively treat as not-stuck → keep swallowing, to avoid a premature release); never throw inside the fold.
 - Anchor the age on the surviving (max `turn_seq`) running row the existing query returns — measure against the newest running `ts`, not a demoted orphan.
+- **Lands after fn-637** (`project-epic-deps-onto-epic-entities`): fn-637.3 reworks the EpicSnapshot fold and adds new helpers in this same file, so line numbers above will drift — the Stop fold is an independent region; rebase, don't merge-fight. This task adds NO schema column (pure fold logic over the existing `ts`), so there is NO collision with fn-637.2's v32->v33 bump — do not add a migration here.
 
 ### Test notes
 
@@ -66,6 +67,7 @@ assert byte-identical `jobs`/`subagent_invocations` rows.
 - [ ] Same-name `turn_seq` collapse preserved; fan-out (`syncIfPlanRef`, `syncJobLinksOnJobWrite`) runs on the bounded release
 - [ ] No `Date.now()` in the fold; re-fold determinism test passes
 - [ ] Edge cases (negative age, NULL `ts`) fold to a defined, non-throwing branch
+- [ ] Adds no schema column / no migration (no collision with fn-637's v33 bump)
 
 ## Done summary
 
