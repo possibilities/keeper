@@ -131,7 +131,9 @@ directly below its parent in the default sort (sort_path ASC).
 
 followed (when the epic carries job_links) by one indented creator/refiner
 line per linked session —
-'{title} [creator|refiner] [state] [failed:<kind>]? [awaiting:<kind>]?'
+'{title} [creator|refiner] [state] [failed:<kind>]?' with an optional
+[awaiting:<kind>] pill dropped onto its own indented continuation line
+beneath the row
 (title falls back to {job_id} when the embedded title is null; the
 [failed:<kind>] pill appears when the session's last Claude API request
 failed at a terminal HTTP boundary and the human hasn't picked up since —
@@ -143,8 +145,9 @@ appears when the session is stopped on an interactive built-in tool that
 fires no hook of its own — currently just AskUserQuestion, rendered as
 [awaiting:ask_user_question] in warn/yellow via the awaiting:* prefix
 fallback, future-extensible to any other built-in interactive tool that
-surfaces a question without a hook; pills stack in lifecycle order
-state → failed → awaiting). Schema v25 denormalized title / state /
+surfaces a question without a hook; the [state]/[failed:<kind>] pills
+stay inline while [awaiting:<kind>] drops to its own continuation line
+below the row). Schema v25 denormalized title / state /
 last_api_error_at / last_api_error_kind / last_input_request_at /
 last_input_request_kind off the linked jobs row at the reducer's write
 boundary, so the same line shape renders for live, terminal, and
@@ -178,11 +181,12 @@ in sqlite — only the client view collapses.
 The [<readiness>] pill is one of [ready], [completed], or
 [blocked:<reason>] — a pure-function verdict computed by src/readiness.ts
 from the (epics, jobs, subagent_invocations) snapshot. For tasks and the
-close row the pill stamps onto the indented "[<id>]" reference line beneath
-the header; for the epic header (which has no id line) it stamps at the
-end of the header itself. The bracket payload carries the full reason
-(including any "dep-on-task <upstream>" id) so blocked rows need no
-separate continuation.
+close row a [ready] / [completed] / [running:<kind>] pill stamps inline on
+the indented "[<id>]" reference line beneath the header; a [blocked:<reason>]
+pill instead drops to its OWN line directly beneath the id line (so the
+full reason — including any "dep-on-task <upstream>" id — reads without
+wrapping). For the epic header (which has no id line) the pill always
+stamps at the end of the header itself.
 
 When a task's target_repo diverges from its epic's project_dir, the id
 line carries one extra trailing pill '[task-repo:<basename>]' (yellow /
@@ -333,14 +337,14 @@ function apiErrorPillSeg(at: unknown, kind: unknown): string {
  * defensive only (should be unreachable); keeps the pill from
  * collapsing to `[awaiting:]` if a future shape-skew bug appears.
  *
- * Returns the leading `' '` so the caller can append unconditionally —
- * empty string when `at` is null, ` [awaiting:<kind>]` otherwise. The
- * underlying lifecycle pill (`[stopped]`) is rendered separately from
- * `jobs.state` and always shows first; this annotation stacks LAST
- * (after `[limited]?` and `[failed:<kind>]?`) so a single row carrying
- * all three annotations reads in lifecycle order (state →
- * rate-limited → api-error → awaiting). Colored yellow on a TTY via
- * the colorizer's `awaiting:*` prefix fallback to the `warn` bucket.
+ * Returns the leading `' '` so the segment is self-delimiting —
+ * empty string when `at` is null, ` [awaiting:<kind>]` otherwise. Unlike
+ * `[state]` / `[failed:<kind>]` (which stay inline on the row), every
+ * caller drops THIS segment onto its own indented continuation line
+ * beneath the row (`.trimStart()`-ed of the leading space) so a
+ * long-running interactive stop reads without wrapping. Colored yellow
+ * on a TTY via the colorizer's `awaiting:*` prefix fallback to the
+ * `warn` bucket.
  */
 function inputRequestPillSeg(at: unknown, kind: unknown): string {
   if (at == null) {
@@ -679,16 +683,17 @@ function taskNumFromId(id: string): number | null {
  * The line shape is the same regardless of whether the linked session
  * is live, terminal, or off-page:
  *
- *     {title ?? job_id} [{kind}] [{state}]{apiErrorPillSeg}{inputRequestPillSeg}
+ *     {title ?? job_id} [{kind}] [{state}]{apiErrorPillSeg}
+ *       [awaiting:<kind>]   ← only when present, own continuation line
  *
  * Title falls back to `job_id` when the embedded `title` is null —
  * preserves the line shape when title is genuinely unknown (e.g. a
  * shell-inserted epic whose linked session has no captured title yet)
  * without dropping the readable label entirely.
  *
- * Pill stacking order is `[state] [failed:<kind>]? [awaiting:<kind>]?`
- * — the awaiting pill stacks LAST so a row carrying both annotations
- * reads in lifecycle order (state → api-error → awaiting).
+ * `[state]` and `[failed:<kind>]?` stay inline on the row; the optional
+ * `[awaiting:<kind>]` pill drops to its own indented continuation line
+ * beneath the row so a long interactive stop reads without wrapping.
  *
  * Iteration order is the projection's own `(kind, job_id)` ASC sort
  * (set by `sortJobLinks` in `src/reducer.ts`).
@@ -704,9 +709,19 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
   for (const link of jobLinks as JobLinkEntry[]) {
     const label = link.title ?? link.job_id;
     const state = link.state == null ? "" : String(link.state);
-    out.push(
-      `  ${label} [${link.kind}] [${state}]${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}${inputRequestPillSeg(link.last_input_request_at, link.last_input_request_kind)}`,
+    const awaiting = inputRequestPillSeg(
+      link.last_input_request_at,
+      link.last_input_request_kind,
     );
+    out.push(
+      `  ${label} [${link.kind}] [${state}]${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}`,
+    );
+    // The [awaiting:<kind>] pill drops to its own continuation line (one
+    // indent level deeper) so a long-running interactive stop reads
+    // without wrapping; [state]/[failed:<kind>] stay inline above.
+    if (awaiting !== "") {
+      out.push(`    ${awaiting.trimStart()}`);
+    }
   }
   return out;
 }
@@ -825,9 +840,18 @@ async function main(): Promise<void> {
     const out: string[] = [];
     for (const j of jobsArr) {
       const job = j as Record<string, unknown>;
-      out.push(
-        `    ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}${inputRequestPillSeg(job.last_input_request_at, job.last_input_request_kind)}`,
+      const awaiting = inputRequestPillSeg(
+        job.last_input_request_at,
+        job.last_input_request_kind,
       );
+      out.push(
+        `    ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}`,
+      );
+      // [awaiting:<kind>] on its own continuation line (six-space indent —
+      // same depth as this row's sub-agent lines below).
+      if (awaiting !== "") {
+        out.push(`      ${awaiting.trimStart()}`);
+      }
       out.push(
         ...subagentLinesFor(subagentIndex, String(job.job_id), "      "),
       );
@@ -932,6 +956,16 @@ async function main(): Promise<void> {
       const taskApproval = approvalPill(t.approval);
       const taskId = seg(t.task_id);
       const taskVerdict = verdictFromMap(snap.readiness.perTask, taskId);
+      // A [blocked:<reason>] verdict drops to its own line beneath the
+      // [id] reference; ready/completed/running pills stay inline on the id
+      // line. The `[task-repo:<basename>]` divergence pill follows the
+      // verdict wherever it lands (it "surfaces next to the verdict that
+      // references it" — see `taskRepoPillSeg`).
+      const taskPillSeg = `${formatPill(taskVerdict)}${taskRepoPillSeg(t.target_repo, row.project_dir)}`;
+      const taskIdLines =
+        taskVerdict.tag === "blocked"
+          ? [`    [${taskId}]`, `    ${taskPillSeg}`]
+          : [`    [${taskId}] ${taskPillSeg}`];
       lines.push(
         // Schema v19: task elements now carry both `runtime_status` (the
         // planctl-native enum `todo|in_progress|done|blocked`) and
@@ -939,14 +973,20 @@ async function main(): Promise<void> {
         // Render both pills side-by-side with `[approval]` so the row
         // surfaces the full native vocabulary — no client-side collapse.
         `  ${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.runtime_status)}] [${seg(t.worker_phase)}] [${taskApproval}]`,
-        `    [${taskId}] ${formatPill(taskVerdict)}${taskRepoPillSeg(t.target_repo, row.project_dir)}`,
+        ...taskIdLines,
         ...renderJobLines(subagentIndex, t.jobs),
       );
     }
     const closeVerdict = verdictFromMap(snap.readiness.perCloseRow, epicId);
+    // Same rule as the task arm: a [blocked:<reason>] verdict drops to its
+    // own line beneath the [id]; ready/completed/running stay inline.
+    const closeIdLines =
+      closeVerdict.tag === "blocked"
+        ? [`    [${epicId}]`, `    ${formatPill(closeVerdict)}`]
+        : [`    [${epicId}] ${formatPill(closeVerdict)}`];
     lines.push(
       `  X. Quality audit and close [${seg(row.status)}] [${epicApproval}]`,
-      `    [${epicId}] ${formatPill(closeVerdict)}`,
+      ...closeIdLines,
       ...renderJobLines(subagentIndex, row.jobs),
     );
     return lines.join("\n");
@@ -985,7 +1025,14 @@ async function main(): Promise<void> {
     const cwdSeg = cwd === "" ? "" : `(${cwd}) `;
     const role = planVerbLabel(row.plan_verb);
     const roleSeg = role == null ? "" : ` [${role}]`;
-    return `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}${inputRequestPillSeg(row.last_input_request_at, row.last_input_request_kind)}`;
+    const awaiting = inputRequestPillSeg(
+      row.last_input_request_at,
+      row.last_input_request_kind,
+    );
+    const head = `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
+    // [awaiting:<kind>] drops to its own continuation line (two-space indent —
+    // same depth as this row's sub-agent lines, appended by the caller).
+    return awaiting === "" ? head : `${head}\n  ${awaiting.trimStart()}`;
   }
 
   /**

@@ -613,10 +613,11 @@ test("renderJobLinkLines: at non-null, kind null defensively renders [failed:unk
   expect(out).toEqual(["  Plan epic 10 [creator] [stopped] [failed:unknown]"]);
 });
 
-// `last_input_request_at` non-null appends the `[awaiting:<kind>]` pill
-// (warn/yellow via the colorizer's `awaiting:*` prefix fallback). Stacks
-// AFTER `[failed:<kind>]` so a row carrying both annotations reads in
-// lifecycle order (state → api-error → awaiting). Schema v25 introduced
+// `last_input_request_at` non-null emits the `[awaiting:<kind>]` pill
+// (warn/yellow via the colorizer's `awaiting:*` prefix fallback) on its
+// OWN continuation line beneath the row (four-space indent), so a long
+// interactive stop reads without wrapping; `[state]`/`[failed:<kind>]`
+// stay inline above it. Schema v25 introduced
 // the `(last_input_request_at, last_input_request_kind)` pair on
 // `JobLinkEntry` (cloned one-for-one off fn-616's api-error pair); the
 // reducer's `InputRequest` fold stamps both columns together and four
@@ -634,7 +635,8 @@ test("renderJobLinkLines: last_input_request_at non-null appends [awaiting:<kind
     }),
   ]);
   expect(out).toEqual([
-    "  Plan epic 11 [creator] [stopped] [awaiting:ask_user_question]",
+    "  Plan epic 11 [creator] [stopped]",
+    "    [awaiting:ask_user_question]",
   ]);
 });
 
@@ -655,15 +657,16 @@ test("renderJobLinkLines: input_request_at non-null, kind null defensively rende
     }),
   ]);
   expect(out).toEqual([
-    "  Plan epic 12 [refiner] [stopped] [awaiting:unknown]",
+    "  Plan epic 12 [refiner] [stopped]",
+    "    [awaiting:unknown]",
   ]);
 });
 
-// Stacking-order snapshot — a row carrying BOTH api-error AND
-// input-request annotations renders `[state] [failed:<kind>] [awaiting:<kind>]`
-// in that order. Pins lifecycle order so a future change reordering pills
-// is caught.
-test("renderJobLinkLines: failed + awaiting stack in lifecycle order (state → failed → awaiting)", () => {
+// Stacking snapshot — a row carrying BOTH api-error AND input-request
+// annotations renders `[state] [failed:<kind>]` inline, then drops
+// `[awaiting:<kind>]` onto its own indented continuation line beneath the
+// row. Pins the inline-vs-continuation split so a future change is caught.
+test("renderJobLinkLines: failed stays inline, awaiting drops to its own line", () => {
   const out = renderJobLinkLines([
     makeLink({
       kind: "creator",
@@ -677,7 +680,8 @@ test("renderJobLinkLines: failed + awaiting stack in lifecycle order (state → 
     }),
   ]);
   expect(out).toEqual([
-    "  Plan epic 13 [creator] [stopped] [failed:rate_limit] [awaiting:ask_user_question]",
+    "  Plan epic 13 [creator] [stopped] [failed:rate_limit]",
+    "    [awaiting:ask_user_question]",
   ]);
 });
 
