@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-643-dead-letter-recovery-for-dropped-hook",
   "bundles": [],
+  "closer_done_at": "2026-05-29T23:48:22.741744Z",
   "created_at": "2026-05-29T15:00:36.105354Z",
   "depends_on_epics": [],
   "id": "fn-643-dead-letter-recovery-for-dropped-hook",
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "dead-letter recovery for dropped hook events",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-29T15:00:36.105354Z"
+  "updated_at": "2026-05-29T23:48:22.741744Z"
 }
