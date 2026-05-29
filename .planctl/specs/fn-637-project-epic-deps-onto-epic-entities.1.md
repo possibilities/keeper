@@ -52,5 +52,5 @@ board.ts — collapse both onto the new module's single copy.
 - [ ] All existing readiness + board tests pass with no assertion changes.
 
 ## Done summary
-
+Extracted resolveEpicDep + supporting helpers (EpicDepResolution, epicIsCompleted, projectBasename, BARE_FN_PATTERN) into new leaf module src/epic-deps.ts; resolver now takes injected 'now: string' timestamp instead of reading new Date() internally so the reducer fold in .3 can reuse it deterministically. readiness.ts and board.ts pass new Date().toISOString() to preserve legacy behavior bit-for-bit; readiness-side back-compat wrapper keeps existing 5-arg call sites unchanged.
 ## Evidence
