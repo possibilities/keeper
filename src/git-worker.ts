@@ -29,7 +29,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { existsSync, lstatSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
@@ -178,6 +178,16 @@ const DB_POLL_MS = 100;
 /** Silent-watcher backstop, same shape as `transcript-worker.ts`. */
 const HEARTBEAT_MS = 60_000;
 const GIT_TIMEOUT_MS = 2000;
+/**
+ * Consecutive heartbeats the worker's `git`-derived HEAD may disagree with the
+ * fs-derived HEAD before the divergence watchdog escalates. At one check per
+ * `HEARTBEAT_MS`, `2` means ~1–2 min of CONFIRMED staleness — long enough to
+ * ride out the sub-second window where a commit lands between the heartbeat's
+ * `readStatus` and the watchdog's ref read, short enough that a genuine wedge
+ * is recovered before agents lose trust in the surface. See
+ * {@link resolveHeadOidViaFs}.
+ */
+const HEAD_DIVERGENCE_LIMIT = 2;
 
 /**
  * Positive ignore globs for `@parcel/watcher`. Mirrors `plan-worker.ts`'s
@@ -378,6 +388,81 @@ function gitCommonDirFor(root: string): string | null {
   if (!value) return null;
   const abs = isAbsolute(value) ? value : resolve(root, value);
   return existsSync(abs) ? abs : null;
+}
+
+/**
+ * Resolve a worktree's current HEAD oid by reading the git ref files DIRECTLY
+ * via `fs` — never shelling out to `git`. This is the {@link checkHeadDivergence}
+ * watchdog's independent ground truth.
+ *
+ * *Why fs and not `git rev-parse`:* the failure mode this guards against is a
+ * long-running worker whose `git` subprocess invocations silently return a
+ * STALE view (observed in the wild — `readStatus` froze on an old HEAD for ~50
+ * min while the repo advanced three commits, surfacing committed files as
+ * phantom `<orphan>` dirty entries across every watched repo). A divergence
+ * check that also shells `git` would read the same stale value and never fire.
+ * `fs` reads stay correct in that wedged state — the same worker was still
+ * `lstat`ing live mtimes throughout — so a direct ref read is the one source we
+ * can trust to catch the wedge.
+ *
+ * Handles the common cases: a regular repo (`<root>/.git/`), a linked worktree
+ * (`<root>/.git` is a `gitdir:`-pointer file → per-worktree dir with a sibling
+ * `commondir`), a symbolic `ref:` HEAD resolved against the loose ref then
+ * `packed-refs`, and a detached HEAD (oid inline). Returns the 40/64-hex oid, or
+ * `null` on any shape it can't resolve cheaply — the watchdog treats `null` as
+ * "can't determine truth this cycle" and never escalates on it (fail-safe).
+ */
+export function resolveHeadOidViaFs(root: string): string | null {
+  const isOid = (s: string): boolean => /^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(s);
+  try {
+    let gitDir = join(root, ".git");
+    const dotGit = lstatSync(gitDir);
+    if (dotGit.isFile()) {
+      // Linked worktree: `.git` is a `gitdir: <abs-or-rel-path>` pointer file.
+      const m = readFileSync(gitDir, "utf8")
+        .trim()
+        .match(/^gitdir:\s*(.+)$/);
+      if (m == null) return null;
+      gitDir = isAbsolute(m[1]) ? m[1] : resolve(root, m[1]);
+    }
+    const head = readFileSync(join(gitDir, "HEAD"), "utf8").trim();
+    if (!head.startsWith("ref:")) {
+      // Detached HEAD — the oid is inline.
+      return isOid(head) ? head : null;
+    }
+    const refName = head.slice("ref:".length).trim();
+    // Shared refs live in the common-dir for a linked worktree; a regular repo
+    // has no `commondir` file and refs sit under `gitDir` itself.
+    let commonDir = gitDir;
+    const commonDirFile = join(gitDir, "commondir");
+    if (existsSync(commonDirFile)) {
+      const c = readFileSync(commonDirFile, "utf8").trim();
+      commonDir = isAbsolute(c) ? c : resolve(gitDir, c);
+    }
+    const loosePath = join(commonDir, refName);
+    if (existsSync(loosePath)) {
+      const oid = readFileSync(loosePath, "utf8").trim();
+      return isOid(oid) ? oid : null;
+    }
+    // Loose ref absent → consult packed-refs.
+    const packedPath = join(commonDir, "packed-refs");
+    if (existsSync(packedPath)) {
+      for (const line of readFileSync(packedPath, "utf8").split("\n")) {
+        if (line.length === 0 || line.startsWith("#") || line.startsWith("^")) {
+          continue;
+        }
+        const sp = line.indexOf(" ");
+        if (sp < 0) continue;
+        const oid = line.slice(0, sp);
+        const name = line.slice(sp + 1).trim();
+        if (name === refName && isOid(oid)) return oid;
+      }
+    }
+    return null;
+  } catch {
+    // Any fs/parse failure → "unknown", never escalate. Pure best-effort.
+    return null;
+  }
 }
 
 function readStatus(root: string): ParsedGitStatus | null {
@@ -708,6 +793,15 @@ function startWorker(): void {
   const subscriptions = new Map<string, RootSubscriptions>();
   const schedulers = new Map<string, RescanScheduler>();
   const cwdRootCache = new Map<string, string | null>();
+  /**
+   * Per-root run of consecutive heartbeats on which the worker's `git`-derived
+   * HEAD ({@link lastHeadOidByRoot}) disagreed with the fs-derived HEAD. Reset
+   * to 0 the moment they agree (or the fs read can't determine truth). Escalates
+   * via {@link checkHeadDivergence} once a root reaches {@link
+   * HEAD_DIVERGENCE_LIMIT}. See the divergence-watchdog rationale on
+   * {@link resolveHeadOidViaFs}.
+   */
+  const headDivergenceByRoot = new Map<string, number>();
 
   let watcherModule: typeof import("@parcel/watcher") | null = null;
   let dbPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -800,6 +894,52 @@ function startWorker(): void {
     s = new RescanScheduler(() => emitSnapshot(root));
     schedulers.set(root, s);
     return s;
+  }
+
+  /**
+   * Divergence watchdog. Runs once per heartbeat, AFTER that heartbeat's
+   * `emitSnapshot` pass has refreshed {@link lastHeadOidByRoot} from a live
+   * `git status`. For each subscribed root it compares the worker's
+   * `git`-derived HEAD against {@link resolveHeadOidViaFs} (an fs-only read,
+   * immune to the stale-`git`-subprocess wedge this guards against). A root that
+   * stays divergent for {@link HEAD_DIVERGENCE_LIMIT} consecutive heartbeats is
+   * proof the worker's `git` view is wedged — there is no honest in-process
+   * recovery (the same wedged `git` produced the bad snapshot), so we escalate
+   * the worker-contract way: log + `process.exit(1)`, which surfaces as the
+   * worker's `close` event in main → `fatalExit` → LaunchAgent restart. A fresh
+   * process re-seeds HEAD correctly (verified: a bounce clears the wedge in
+   * ~30s). NEVER respawn in-process — that violates the no-self-heal invariant.
+   *
+   * `resolveHeadOidViaFs` returning `null` (unresolvable ref shape) or a missing
+   * `lastHeadOidByRoot` entry (root never snapshotted) resets the run to 0 —
+   * the watchdog only counts CONFIRMED divergence, never uncertainty.
+   */
+  function checkHeadDivergence(): void {
+    if (shuttingDown) return;
+    for (const root of subscriptions.keys()) {
+      const workerHead = lastHeadOidByRoot.get(root);
+      const fsHead = resolveHeadOidViaFs(root);
+      if (workerHead == null || fsHead == null || workerHead === fsHead) {
+        headDivergenceByRoot.set(root, 0);
+        continue;
+      }
+      const run = (headDivergenceByRoot.get(root) ?? 0) + 1;
+      headDivergenceByRoot.set(root, run);
+      console.error(
+        `[git-worker] HEAD divergence for ${root}: git=${workerHead.slice(0, 12)} fs=${fsHead.slice(0, 12)} (run ${run}/${HEAD_DIVERGENCE_LIMIT})`,
+      );
+      if (run >= HEAD_DIVERGENCE_LIMIT) {
+        console.error(
+          `[git-worker] HEAD divergence watchdog tripped for ${root} — git subprocess view is wedged; exiting for LaunchAgent restart`,
+        );
+        try {
+          db.close();
+        } catch {
+          // best-effort — process is exiting anyway
+        }
+        process.exit(1);
+      }
+    }
   }
 
   async function subscribeRoot(root: string): Promise<void> {
@@ -1021,6 +1161,10 @@ function startWorker(): void {
         if (shuttingDown) return;
         void reconcileRoots();
         for (const root of subscriptions.keys()) emitSnapshot(root);
+        // Watchdog runs LAST — after this cycle's snapshots refreshed the
+        // worker's git-derived HEAD — so a healthy heartbeat that self-corrects
+        // resets the divergence run before it can be counted.
+        checkHeadDivergence();
       }, HEARTBEAT_MS);
     })
     .catch((err) => {
