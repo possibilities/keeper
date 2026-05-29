@@ -1187,6 +1187,121 @@ test("GitSnapshot inferred attribution: skipped when explicit attribution exists
   expect(row?.last_mutation_at).toBe(80);
 });
 
+test("GitSnapshot inferred attribution: runs when the only explicit attribution is DISCHARGED", () => {
+  // Regression (fn-orphan-discharge): sess-a writes the file (ts=80),
+  // commits it (ts=200 → discharges the explicit row), then a bash step
+  // re-dirties it (a formatter / codegen run that leaves no Write/Edit
+  // and no recognized bash_mutation) inside a (300, 400] Bash bracket.
+  // The file's mtime (350) sits in that bracket. The explicit row still
+  // EXISTS but is discharged (last_mutation_at=80 <= last_commit_at=200),
+  // so pass 2 MUST run and mint an inferred row — otherwise the file
+  // falls to <orphan> despite an available bracketing window. The old
+  // guard skipped pass 2 on the mere presence of any explicit row.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 80,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/build/out.o" } }),
+  });
+  // A snapshot while the file is dirty mints the explicit row (ts=80),
+  // so the later Commit has a row to stamp last_commit_at onto — the
+  // real-world ordering the bug depends on.
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 120,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "build/out.o", xy: " M", mtime_ms: null }],
+    }),
+  });
+  // Commit discharges sess-a's explicit attribution (last_commit_at=200).
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["build/out.o"],
+      committer_session_id: "sess-a",
+      committed_at_ms: 200_000,
+    }),
+  });
+  // Post-commit bash bracket — no Write/Edit, no bash_mutation_kind.
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 300,
+    tool_use_id: "toolu_discharged_infer",
+    data: JSON.stringify({ tool_input: { command: "bun run lint" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-a",
+    cwd: "/repo",
+    ts: 400,
+    tool_use_id: "toolu_discharged_infer",
+    data: JSON.stringify({ tool_input: { command: "bun run lint" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 500,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "build/out.o", xy: " M", mtime_ms: 350_000 }],
+    }),
+  });
+  drainAll();
+  // The discharged explicit row is re-stamped as an inferred attribution
+  // (mtime 350 > last_commit_at 200 → active again).
+  const row = db
+    .query(
+      "SELECT op, source, last_mutation_at FROM file_attributions WHERE project_dir = ? AND session_id = ?",
+    )
+    .get("/repo", "sess-a") as {
+    op: string;
+    source: string;
+    last_mutation_at: number;
+  } | null;
+  expect(row?.source).toBe("inferred");
+  expect(row?.op).toBe("inferred");
+  expect(row?.last_mutation_at).toBe(350);
+  // Not a strict-mystery orphan — the inferred attribution claims it.
+  const gs = db
+    .query(
+      "SELECT orphaned_count, dirty_files FROM git_status WHERE project_dir = ?",
+    )
+    .get("/repo") as { orphaned_count: number; dirty_files: string } | null;
+  expect(gs?.orphaned_count).toBe(0);
+  const files = JSON.parse(gs?.dirty_files ?? "[]") as Array<{
+    attributions: Array<{ session_id: string; source: string }>;
+  }>;
+  expect(files[0]?.attributions.length).toBe(1);
+  expect(files[0]?.attributions[0]?.session_id).toBe("sess-a");
+});
+
 test("GitSnapshot inferred attribution: skipped when mtime_ms is null", () => {
   // No mtime → no inferred attribution path. File ends up strict-
   // mystery (zero attributions).
@@ -2807,9 +2922,7 @@ test("from-scratch re-fold reproduces usage + profiles projections byte-identica
   insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-default" });
   insertEvent({ hook_event: "RateLimited", session_id: "sess-default" });
   drainAll();
-  const beforeUsage = db
-    .query("SELECT * FROM usage ORDER BY id ASC")
-    .all();
+  const beforeUsage = db.query("SELECT * FROM usage ORDER BY id ASC").all();
   const beforeProfiles = db
     .query("SELECT * FROM profiles ORDER BY config_dir ASC")
     .all();
@@ -2818,9 +2931,7 @@ test("from-scratch re-fold reproduces usage + profiles projections byte-identica
   db.run("DELETE FROM usage");
   db.run("DELETE FROM profiles");
   drainAll();
-  const afterUsage = db
-    .query("SELECT * FROM usage ORDER BY id ASC")
-    .all();
+  const afterUsage = db.query("SELECT * FROM usage ORDER BY id ASC").all();
   const afterProfiles = db
     .query("SELECT * FROM profiles ORDER BY config_dir ASC")
     .all();

@@ -1464,7 +1464,6 @@ function projectGitStatus(db: Database, event: Event): void {
   // event log for tool/bash mutations whose payload references the file
   // path (or its rename's orig_path). Per session, take the LATEST
   // matching event (newest-wins via the UPSERT's WHERE clause).
-  const explicitBySession = new Map<string, Set<string>>(); // session_id → set of file_paths it explicitly touched
   const upsertStmt = db.prepare(
     `INSERT INTO file_attributions
        (project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at)
@@ -1490,31 +1489,40 @@ function projectGitStatus(db: Database, event: Event): void {
         m.last_event_id,
         eventTs,
       );
-      let set = explicitBySession.get(m.session_id);
-      if (set == null) {
-        set = new Set();
-        explicitBySession.set(m.session_id, set);
-      }
-      set.add(file.path);
     }
   }
 
-  // PASS 2 — Inferred attribution. Files with no explicit attribution
-  // from any session (and a non-null mtime) get bracketed against
-  // PreToolUse/PostToolUse Bash intervals. The matching session(s) get
-  // an `inferred`-source upsert with `last_mutation_at = file.mtime_ms /
-  // 1000`. The mtime is frozen in the payload, so re-fold deterministic.
+  // PASS 2 — Inferred attribution. Files with no UNDISCHARGED explicit
+  // attribution from any session (and a non-null mtime) get bracketed
+  // against PreToolUse/PostToolUse Bash intervals. The matching
+  // session(s) get an `inferred`-source upsert with `last_mutation_at =
+  // file.mtime_ms / 1000`. The mtime is frozen in the payload, so re-fold
+  // deterministic.
+  //
+  // The skip guard probes for an explicit (`tool`/`bash`) row that is
+  // still ACTIVE under the discharge rule (`last_mutation_at >
+  // COALESCE(last_commit_at, 0)`) — NOT merely the presence of any
+  // explicit row. A file whose every explicit attribution has been
+  // discharged by a commit, then re-dirtied by a bash step (formatter,
+  // codegen) that left no `Write`/`Edit` and no recognized
+  // `bash_mutation`, has zero active explicit attributions — so inference
+  // MUST run, or the file falls to `<orphan>` even though a bracketing
+  // Bash window in the producing session is available. Probing the table
+  // (just written in pass 1) rather than an in-memory "any explicit ever"
+  // set is what makes the discharge interaction correct; it stays a pure
+  // function of the event log within this `BEGIN IMMEDIATE`.
+  const activeExplicitStmt = db.prepare(
+    `SELECT 1 FROM file_attributions
+      WHERE project_dir = ?
+        AND file_path = ?
+        AND source IN ('tool', 'bash')
+        AND last_mutation_at > COALESCE(last_commit_at, 0)
+      LIMIT 1`,
+  );
   for (const file of snapshot.dirty_files) {
-    // Skip if this file already has explicit attribution from ANY
-    // session — pass 2 is a last-resort inference, not an augment.
-    let hasExplicit = false;
-    for (const [, paths] of explicitBySession) {
-      if (paths.has(file.path)) {
-        hasExplicit = true;
-        break;
-      }
-    }
-    if (hasExplicit) continue;
+    const hasActiveExplicit =
+      activeExplicitStmt.get(projectDir, file.path) != null;
+    if (hasActiveExplicit) continue;
     if (file.mtime_ms == null) continue;
     const inferred = findInferredAttributions(db, projectDir, file);
     const mtimeSec = file.mtime_ms / 1000;
@@ -4355,12 +4363,7 @@ function projectJobsRow(db: Database, event: Event): void {
         // anyway — re-fold determinism holds.
         db.run(
           `INSERT OR IGNORE INTO profiles (config_dir, profile_name, last_event_id, updated_at) VALUES (COALESCE(?, ''), ?, ?, ?)`,
-          [
-            event.config_dir,
-            projectBasename(event.config_dir),
-            event.id,
-            ts,
-          ],
+          [event.config_dir, projectBasename(event.config_dir), event.id, ts],
         );
       }
       syncIfPlanRef(db, jobId, event.id, ts);
