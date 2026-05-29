@@ -512,18 +512,23 @@ CI) `--live` silently behaves as if it wasn't set. Run any of them with
   bun scripts/git.ts --live                   # alt-screen TUI
   ```
 
-- `usage.ts` — single-collection subscribe client over the `usage`
-  collection (one row per agentuse profile observed at
-  `~/.local/state/agentuse/<id>.json`: target, multiplier, session+week
-  percent + reset timestamps). Uses `subscribeCollection` from
-  `src/readiness-client.ts` (same lifecycle primitive as `git.ts`).
-  Renders one `---`-delimited frame to stdout, one line per profile;
-  byte-compares the rendered frame so fetch-only refresh cycles produce
-  no visible re-render. Three per-pid `/tmp` sidecar files (JSON state,
-  frame text, unified diff vs. previous) indexed via a meta sidecar.
-  No `--live` / TUI yet (a later epic may promote this script when a
-  freshness signal lands). SIGINT calls the helper's `dispose()` and
-  prints sidecar paths on exit.
+- `usage.ts` — dual-collection subscribe client riding two
+  `subscribeCollection` calls (same lifecycle primitive as `git.ts`):
+  one over the `usage` collection (one row per agentuse profile observed
+  at `~/.local/state/agentuse/<id>.json`: target, multiplier, session+week
+  percent + reset timestamps) and one over the `profiles` collection (one
+  row per Claude profile directory keyed by `config_dir`, carrying
+  `last_rate_limit_at` + `last_rate_limit_session_id` for the most recent
+  rate-limit ApiError). Renders one `---`-delimited frame composing the
+  usage stacks on top and a "Rate limits by profile" block (one row per
+  profile, `(default)` for the `''` sentinel, `—` for never-rate-limited
+  profiles) below. Each stream owns its own change-gate so a fetch-only
+  refresh on one collection can't shake a re-emit on the other; either
+  `onRows` triggers a combined re-render against the latest-of-each.
+  Per-frame sidecars (`/tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*`,
+  indexed via a meta sidecar) carry BOTH row sets so the JSON sidecar
+  captures the full input to the composed frame. SIGINT disposes BOTH
+  subscription handles and prints sidecar paths on exit.
 
   ```sh
   bun scripts/usage.ts                # all profiles

@@ -1,19 +1,35 @@
 #!/usr/bin/env bun
 /**
- * keeper-usage — watch the keeperd `usage` collection as frames.
+ * keeper-usage — watch the keeperd `usage` AND `profiles` collections as
+ * one composed frame.
+ *
+ * Two independent `subscribeCollection` calls share one frame: the
+ * `usage` stacks (per-profile session/week quota bars with reset
+ * countdowns) render on top, and a "Rate limits by profile" block
+ * (keyed by `config_dir`, showing each Claude profile's last rate-limit
+ * relative time) renders below. The two streams have disjoint key spaces
+ * (usage `id` is the agentuse profile id; profiles key is `config_dir`),
+ * so the blocks are presented stacked-but-disjoint — not as a row-to-row
+ * correlation. Each stream owns its own change-gate and module-locals;
+ * either `onRows` triggers a combined re-render against the latest-of-each.
  *
  * The daemon-side usage worker watches `~/.local/state/agentuse/<id>.json`
  * and folds synthetic `UsageSnapshot` / `UsageDeleted` events into the
- * `usage` collection. This script is the primitive frame UI for that
- * surface, mirroring `scripts/git.ts`'s sidecar discipline (per-frame
- * state JSON + frame text + unified diff under `/tmp/keeper-usage.<pid>.*`,
- * indexed meta sidecar, SIGINT teardown that prints sidecar paths).
+ * `usage` collection. The reducer maintains the `profiles` projection
+ * inline on SessionStart (seed by `COALESCE(config_dir,'')`) and on
+ * `rate_limit` ApiError (upsert `last_rate_limit_at` +
+ * `last_rate_limit_session_id`). This script is the primitive frame UI
+ * for both surfaces, mirroring `scripts/git.ts`'s sidecar discipline
+ * (per-frame state JSON carrying BOTH row sets + frame text + unified
+ * diff under `/tmp/keeper-usage.<pid>.*`, indexed meta sidecar, SIGINT
+ * teardown that prints sidecar paths).
  *
  * Connection lifecycle is owned by `subscribeCollection` in
  * `src/readiness-client.ts` — same capped-backoff reconnect, per-collection
  * coalesce, steady-poll backstop, and `dispose()` contract as
  * `scripts/git.ts`. The script's job is rendering rows + writing sidecars;
- * the helper handles everything below the rows.
+ * the helper handles everything below the rows. Each subscribe opens its
+ * own connection; SIGINT must dispose both handles.
  *
  * Reset cells render as minute-rounded humanized relative time
  * (`5d 21h`, `3h 5m`, `5m`, `now`, `2h 5m ago`) against the current
@@ -35,6 +51,7 @@ import { createLiveShell } from "../src/live-shell";
 import { subscribeCollection } from "../src/readiness-client";
 
 const COLLECTION = "usage";
+const PROFILES_COLLECTION = "profiles";
 
 const HELP = `keeper-usage — live usage frames over the keeper subscribe server
 
@@ -55,10 +72,14 @@ chip + target/multiplier chip, then one indented body line per quota
 window (session, week, and sonnet where present). Each body line
 carries a 30-wide ASCII bar (\`█\` filled / \`░\` empty) followed by
 the numeric pct and a bare relative reset time (\`5d 21h\` / \`1h 16m\`
-/ \`5m\` / \`now\` / \`2m ago\`). The live frame re-renders every 30s so
-countdowns tick; historical scroll-back stays frozen at each frame's capture time.
-Per-frame sidecars under /tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*
-with an indexed meta sidecar; session paths print on SIGINT.
+/ \`5m\` / \`now\` / \`2m ago\`). Below the usage stacks, a "Rate limits
+by profile" block lists each Claude profile (keyed by config_dir; the
+default \`~/.claude\` renders as \`(default)\`) with the relative time
+of the last rate-limit error, or \`—\` for profiles that have never hit
+one. The live frame re-renders every 30s so countdowns tick; historical
+scroll-back stays frozen at each frame's capture time. Per-frame sidecars
+under /tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.* with an indexed
+meta sidecar; session paths print on SIGINT.
 `;
 
 function seg(v: unknown): string {
@@ -97,8 +118,41 @@ function pct(v: unknown): string {
 function relTime(iso: string, nowMs: number): string {
   if (iso === "") return "";
   const target = Date.parse(iso);
-  if (Number.isNaN(target)) return iso;
-  const diffMin = Math.round((target - nowMs) / 60000);
+  return relTimeFromMs(target, nowMs, iso);
+}
+
+/**
+ * Numeric (unix-seconds) variant of {@link relTime}. The `usage` collection
+ * carries reset timestamps as ISO strings; the `profiles` collection carries
+ * `last_rate_limit_at` as REAL unix-SECONDS (matching `jobs.last_api_error_at`).
+ * Feeding raw seconds into `relTime` would do `Date.parse` and yield NaN, so
+ * we route numeric inputs through this thin shim — converting once to ms and
+ * sharing the same minute-rounding body. Returns `""` for `null`/`undefined`
+ * (no rate limit known); otherwise the same `"now"` / `"Nh Mm"` / `"Mm ago"`
+ * shape as `relTime`.
+ */
+function relTimeFromUnixSec(
+  sec: number | null | undefined,
+  nowMs: number,
+): string {
+  if (sec == null) return "";
+  return relTimeFromMs(sec * 1000, nowMs, "");
+}
+
+/**
+ * Shared body for {@link relTime} (ISO callers) and {@link relTimeFromUnixSec}
+ * (unix-seconds callers). `targetMs` is the parsed absolute time in ms;
+ * `fallback` is what to return on NaN (the raw ISO for ISO callers, `""`
+ * for numeric callers since "we have a number" is already a parse). Pure
+ * function — no wall-clock IO of its own.
+ */
+function relTimeFromMs(
+  targetMs: number,
+  nowMs: number,
+  fallback: string,
+): string {
+  if (Number.isNaN(targetMs)) return fallback;
+  const diffMin = Math.round((targetMs - nowMs) / 60000);
   if (diffMin === 0) return "now";
   const past = diffMin < 0;
   const total = Math.abs(diffMin);
@@ -267,6 +321,86 @@ export function renderRowLines(
   return lines;
 }
 
+const DEFAULT_PROFILE_LABEL = "(default)";
+
+/**
+ * Render the `profiles`-collection rows as a "Rate limits by profile" block —
+ * one row per Claude profile (keyed by `config_dir`) showing the relative
+ * time of the last `rate_limit` ApiError, or `—` when none has been observed.
+ *
+ *   (default)              5m ago
+ *   (multi-claude-3)       3h 12m ago
+ *   (multi-claude-7)       —
+ *
+ * The `''` sentinel `config_dir` (the default `~/.claude` profile, which
+ * collapses every NULL-`CLAUDE_CONFIG_DIR` session onto a single PK) renders
+ * as `(default)` rather than an empty chip — empty parens read as "missing
+ * data," and the default profile is a known-correct value here, not absence.
+ *
+ * The two blocks (`usage` stacks + this "Rate limits by profile" table) are
+ * INDEPENDENT in key space: usage `id` is the agentuse profile id (e.g.
+ * `claude-multi-3`) while the profile key is the config_dir (e.g.
+ * `~/.claude-profiles/multi-claude-3`). They are not joinable today — see
+ * the epic notes — so this block is presented stacked-but-disjoint, not as
+ * a per-row correlation.
+ *
+ * `last_rate_limit_at` arrives over the wire as REAL unix-SECONDS (matching
+ * `jobs.last_api_error_at`); we route through {@link relTimeFromUnixSec} so
+ * a raw float doesn't leak into the rendered text. `nowMs` is an explicit
+ * parameter (same contract as `renderRowLines`) so tests can drive a fixed
+ * clock and the 30s tick can pass `Date.now()` afresh.
+ */
+export function renderProfileLines(
+  rows: Record<string, unknown>[],
+  nowMs: number,
+): string[] {
+  if (rows.length === 0) return [];
+
+  interface ProfileCells {
+    chip: string;
+    rel: string;
+  }
+
+  const cells: ProfileCells[] = rows.map((row) => {
+    const cfg = row.config_dir;
+    const cfgStr = cfg == null ? "" : String(cfg);
+    // Wrap in parens to mirror the usage block's id-chip shape; the `''`
+    // sentinel renders as the `(default)` literal rather than `()`.
+    const chip = cfgStr === "" ? DEFAULT_PROFILE_LABEL : `(${cfgStr})`;
+    const raw = row.last_rate_limit_at;
+    let rel: string;
+    if (raw == null) {
+      // NULL last_rate_limit_at — no rate limit ever observed on this
+      // profile (seed-only row from the SessionStart `INSERT OR IGNORE`,
+      // or a quiet profile since the last cursor rewind).
+      rel = "—";
+    } else if (typeof raw === "number") {
+      rel = relTimeFromUnixSec(raw, nowMs);
+      // An empty string from the helper would only happen here if `raw`
+      // were null/undefined — guarded above — but fold to `—` defensively
+      // so a future helper change can't leak whitespace.
+      if (rel === "") rel = "—";
+    } else {
+      // Defensive: a non-numeric `last_rate_limit_at` would be a wire-shape
+      // bug. Render the raw value rather than throwing inside the render
+      // hot path (matches `relTime`'s degrade-to-raw stance).
+      rel = String(raw);
+    }
+    return { chip, rel };
+  });
+
+  const widest = (xs: string[]): number =>
+    xs.reduce((acc, x) => Math.max(acc, x.length), 0);
+
+  const wChip = widest(cells.map((c) => c.chip));
+
+  const lines: string[] = ["Rate limits by profile"];
+  for (const c of cells) {
+    lines.push(`${c.chip.padEnd(wChip, " ")} ${c.rel}`);
+  }
+  return lines;
+}
+
 async function main(): Promise<void> {
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
@@ -293,13 +427,20 @@ async function main(): Promise<void> {
   });
   let lastFrame: string | null = null;
   let frameCount = 0;
-  let lastRows: Record<string, unknown>[] = [];
-  // Projection-meaningful subset of the last emit. Gating `emitFrame` on
-  // this — not on the rendered text — keeps a fetch-only refresh that
-  // bumps `last_event_id` / `updated_at` from flapping a new frame, AND
-  // keeps minute-tick relative-time bleed from forging one either. Cleared
-  // on `disconnected` so a post-reconnect first emit always paints.
-  let lastRowsKey: string | null = null;
+  // Two parallel sets of module-locals — one per subscribed collection.
+  // `emitFrame` composes ONE frame from the latest-of-each, so either
+  // stream's `onRows` can trigger a combined re-render against whatever
+  // the other stream most recently delivered.
+  let lastUsageRows: Record<string, unknown>[] = [];
+  let lastProfileRows: Record<string, unknown>[] = [];
+  // Projection-meaningful subsets of the last emit per stream. Gating
+  // `emitFrame` on these — not on the rendered text — keeps a fetch-only
+  // refresh that bumps `last_event_id` / `updated_at` from flapping a new
+  // frame, AND keeps minute-tick relative-time bleed from forging one
+  // either. Cleared on `disconnected` so a post-reconnect first emit on
+  // either stream always paints.
+  let lastUsageRowsKey: string | null = null;
+  let lastProfileRowsKey: string | null = null;
   // Last lines we pushed/refreshed to the live shell. Lets the 30s tick
   // skip the `refreshLive` call when minute-rounding produced identical
   // text — avoids even the cost of constructing the overlay (renderDiff
@@ -355,7 +496,12 @@ async function main(): Promise<void> {
     const sState = `/tmp/keeper-usage.${process.pid}.state.${frameCount}.json`;
     const sFrame = `/tmp/keeper-usage.${process.pid}.frame.${frameCount}.txt`;
     const sDiff = `/tmp/keeper-usage.${process.pid}.diff.${frameCount}.txt`;
-    writeFileSync(sState, `${JSON.stringify(lastRows, null, 2)}\n`);
+    // Dual-stream state JSON — both collections' row sets so a sidecar
+    // captures the full input to the composed frame, not just one half.
+    writeFileSync(
+      sState,
+      `${JSON.stringify({ usage: lastUsageRows, profiles: lastProfileRows }, null, 2)}\n`,
+    );
     writeFileSync(sFrame, `${frameText}\n`);
     let diff = "# first frame - no previous to diff against\n";
     if (lastFrame != null) {
@@ -374,14 +520,15 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Stringify the projection-meaningful subset of the row set into a stable
-   * hash key. `last_event_id` / `updated_at` are excluded on purpose — they
-   * bump on every fetch-only refresh even when no rendered field changed —
-   * and so is anything else the renderer doesn't read. Keeps the gate
-   * insensitive to wall-clock-driven relative-time bleed too: the inputs
-   * are raw ISO timestamps + percents, not the minute-rounded prose.
+   * Stringify the projection-meaningful subset of the `usage` row set into
+   * a stable hash key. `last_event_id` / `updated_at` are excluded on
+   * purpose — they bump on every fetch-only refresh even when no rendered
+   * field changed — and so is anything else the renderer doesn't read.
+   * Keeps the gate insensitive to wall-clock-driven relative-time bleed
+   * too: the inputs are raw ISO timestamps + percents, not the
+   * minute-rounded prose.
    */
-  function rowsHashKey(rows: Record<string, unknown>[]): string {
+  function usageRowsHashKey(rows: Record<string, unknown>[]): string {
     return JSON.stringify(
       rows.map((r) => [
         r.id,
@@ -398,27 +545,79 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Helper-driven row callback. Gates on the raw projection subset (see
-   * {@link rowsHashKey}) — NOT on rendered text — so a fetch-only refresh
-   * that bumps `last_event_id` / `updated_at` produces no new frame, and a
-   * minute-boundary crossing between two same-data emits can't forge one
-   * either. Rendering is still against `Date.now()` so the frozen
-   * at-capture text in history reflects what was on screen the moment the
-   * data landed; the 30s tick below keeps the live view ticking forward
-   * via `refreshLive` without growing history.
+   * Sibling gate for the `profiles` stream. Same exclusion rationale as
+   * {@link usageRowsHashKey}: `last_event_id` / `updated_at` flap on
+   * fetch-only refresh; rendering reads only `config_dir` and
+   * `last_rate_limit_at`. Each stream owns its own change-gate so a noisy
+   * fetch on one collection can't shake a re-emit on the other.
    */
-  function emitFrame(rows: Record<string, unknown>[]): void {
-    const rowsKey = rowsHashKey(rows);
-    if (rowsKey === lastRowsKey) return;
-    lastRowsKey = rowsKey;
-    lastRows = rows;
-    const bodyLines = renderRowLines(rows, Date.now());
+  function profileRowsHashKey(rows: Record<string, unknown>[]): string {
+    return JSON.stringify(
+      rows.map((r) => [r.config_dir, r.last_rate_limit_at]),
+    );
+  }
+
+  /**
+   * Combined-render emitter. Composes ONE frame from the latest-of-each
+   * stream — usage block on top, then the "Rate limits by profile" block
+   * (with a blank-line separator when both blocks have content). Either
+   * subscription's `onRows` triggers a combined re-render via {@link emitUsage}
+   * or {@link emitProfiles}; each updates its own slice of state, advances
+   * its own change-gate, and calls back into here. Rendering is against
+   * `Date.now()` so the frozen at-capture text in history reflects what
+   * was on screen the moment the data landed; the 30s tick keeps the live
+   * view ticking forward via `refreshLive` without growing history.
+   */
+  function emitFrame(): void {
+    const now = Date.now();
+    const usageLines = renderRowLines(lastUsageRows, now);
+    const profileLines = renderProfileLines(lastProfileRows, now);
+    // Stitch the two blocks. A blank-line separator between them is only
+    // useful when both have content; either-side-empty drops the gap so
+    // the surviving block stays flush with the frame header.
+    let bodyLines: string[];
+    if (usageLines.length > 0 && profileLines.length > 0) {
+      bodyLines = [...usageLines, "", ...profileLines];
+    } else if (usageLines.length > 0) {
+      bodyLines = usageLines;
+    } else {
+      bodyLines = profileLines;
+    }
     const frameText = ["---", ...bodyLines].join("\n");
     frameCount += 1;
     liveShell.pushFrame(bodyLines);
     lastLiveLines = bodyLines;
     writeSidecars(frameText);
     lastFrame = frameText;
+  }
+
+  /**
+   * `usage`-stream row callback. Gates on the raw projection subset (see
+   * {@link usageRowsHashKey}) — NOT on rendered text — so a fetch-only
+   * refresh that bumps `last_event_id` / `updated_at` produces no new
+   * frame, and a minute-boundary crossing between two same-data emits
+   * can't forge one either. Triggers a combined re-render against the
+   * current `lastProfileRows` so both blocks stay in sync.
+   */
+  function emitUsage(rows: Record<string, unknown>[]): void {
+    const rowsKey = usageRowsHashKey(rows);
+    if (rowsKey === lastUsageRowsKey) return;
+    lastUsageRowsKey = rowsKey;
+    lastUsageRows = rows;
+    emitFrame();
+  }
+
+  /**
+   * `profiles`-stream row callback. Same change-gate discipline as
+   * {@link emitUsage} but against the profile-specific hash key. Triggers
+   * a combined re-render against the current `lastUsageRows`.
+   */
+  function emitProfiles(rows: Record<string, unknown>[]): void {
+    const rowsKey = profileRowsHashKey(rows);
+    if (rowsKey === lastProfileRowsKey) return;
+    lastProfileRowsKey = rowsKey;
+    lastProfileRows = rows;
+    emitFrame();
   }
 
   function linesEqual(a: string[], b: string[]): boolean {
@@ -432,13 +631,25 @@ async function main(): Promise<void> {
   // 30s tick: re-render the live view's relative-time cells against the
   // current wall clock and overlay via `refreshLive`. No history growth,
   // no sidecar writes — historical scroll-back still shows each frame's
-  // at-capture text. Skipped when there's no data yet OR when the render
-  // hasn't changed (minute-rounding holds for most ticks). 30s gives the
-  // worst-case half-minute lag on a minute boundary, which is plenty for
-  // minute-precision display.
+  // at-capture text. Skipped when there's no data on either stream yet OR
+  // when the composed render hasn't changed (minute-rounding holds for
+  // most ticks). 30s gives the worst-case half-minute lag on a minute
+  // boundary, which is plenty for minute-precision display. BOTH blocks
+  // re-render against the same `Date.now()` so relative times in either
+  // block stay fresh on the same tick.
   const tickHandle = setInterval(() => {
-    if (lastRows.length === 0) return;
-    const bodyLines = renderRowLines(lastRows, Date.now());
+    if (lastUsageRows.length === 0 && lastProfileRows.length === 0) return;
+    const now = Date.now();
+    const usageLines = renderRowLines(lastUsageRows, now);
+    const profileLines = renderProfileLines(lastProfileRows, now);
+    let bodyLines: string[];
+    if (usageLines.length > 0 && profileLines.length > 0) {
+      bodyLines = [...usageLines, "", ...profileLines];
+    } else if (usageLines.length > 0) {
+      bodyLines = usageLines;
+    } else {
+      bodyLines = profileLines;
+    }
     if (linesEqual(bodyLines, lastLiveLines)) return;
     lastLiveLines = bodyLines;
     liveShell.refreshLive(bodyLines);
@@ -458,22 +669,46 @@ async function main(): Promise<void> {
     } catch {
       // best-effort
     }
-    // On disconnect, clear both gates so the next first-paint always emits
-    // — even if the post-reconnect snapshot matches the last pre-disconnect
-    // row set (raw or rendered) byte-for-byte.
+    // On disconnect, clear every gate so the next first-paint always
+    // emits — even if the post-reconnect snapshot matches the last
+    // pre-disconnect row set (raw or rendered) byte-for-byte. The helper
+    // emits one `disconnected` per torn-down connection regardless of
+    // which subscription was carried on it, so we clear both streams'
+    // gates uniformly — the next `result` on either side will repaint
+    // the composed frame. The lifecycle source itself isn't part of the
+    // detail bag, so we can't (and don't need to) discriminate per
+    // collection here.
     if (event === "disconnected") {
       lastFrame = null;
-      lastRowsKey = null;
+      lastUsageRowsKey = null;
+      lastProfileRowsKey = null;
     }
   }
 
-  const handle = subscribeCollection({
+  // Two independent single-collection subscriptions ride two connections
+  // (one per `subscribeCollection` call). The dual-stream composition lives
+  // in `emitFrame` — each `onRows` updates its own slice of state and the
+  // composer renders against the latest-of-each. The two streams have
+  // disjoint key spaces (usage `id` is the agentuse profile id; profiles
+  // key is `config_dir`) so there is no row-to-row correlation to enforce
+  // here.
+  const usageHandle = subscribeCollection({
     sockPath,
     idPrefix: "usage",
     collection: COLLECTION,
     limit: 0,
     sort: { column: "id", dir: "asc" },
-    onRows: emitFrame,
+    onRows: emitUsage,
+    onLifecycle: emitLifecycle,
+  });
+
+  const profilesHandle = subscribeCollection({
+    sockPath,
+    idPrefix: "usage",
+    collection: PROFILES_COLLECTION,
+    limit: 0,
+    sort: { column: "config_dir", dir: "asc" },
+    onRows: emitProfiles,
     onLifecycle: emitLifecycle,
   });
 
@@ -484,7 +719,11 @@ async function main(): Promise<void> {
     clearInterval(tickHandle);
     // Terminal restoration before subscription teardown.
     liveShell.dispose();
-    handle.dispose();
+    // Dispose BOTH subscription handles — leaking the second one would
+    // leave a live `subscribeMulti` reconnect loop holding the event loop
+    // open after exit.
+    usageHandle.dispose();
+    profilesHandle.dispose();
     log("...");
     log(`meta: ${metaSidecar}`);
     log(`lifecycle: ${lifecycleSidecar}`);

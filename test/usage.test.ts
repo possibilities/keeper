@@ -19,7 +19,7 @@
  */
 
 import { expect, test } from "bun:test";
-import { renderRowLines } from "../scripts/usage";
+import { renderProfileLines, renderRowLines } from "../scripts/usage";
 
 // Fixed reference clock: 2025-01-15T12:00:00.000Z.
 const NOW_MS = Date.parse("2025-01-15T12:00:00.000Z");
@@ -397,4 +397,121 @@ test("pct cells right-align to the widest pct across all body lines", () => {
   expect(sessionRows[1]).toContain("]   3%");
   expect(weekRows[0]).toContain("]   9%");
   expect(weekRows[1]).toContain("]   8%");
+});
+
+// ---------------------------------------------------------------------------
+// renderProfileLines — the "Rate limits by profile" block. Driven by the
+// `profiles` collection (one row per Claude profile keyed by `config_dir`,
+// with `last_rate_limit_at` as REAL unix-SECONDS).
+// ---------------------------------------------------------------------------
+
+const NOW_SEC = Math.floor(NOW_MS / 1000);
+
+test("renders one row per profile with relative time or em-dash", () => {
+  // Three rows: one default-sentinel with a recent rate limit (5m ago),
+  // one explicit config_dir with an older rate limit (3h 12m ago), and one
+  // that has NEVER hit a rate limit (NULL last_rate_limit_at → `—`).
+  const lines = renderProfileLines(
+    [
+      {
+        config_dir: "",
+        last_rate_limit_at: NOW_SEC - 5 * 60,
+        last_rate_limit_session_id: "s1",
+      },
+      {
+        config_dir: "~/.claude-profiles/multi-claude-3",
+        last_rate_limit_at: NOW_SEC - (3 * 3600 + 12 * 60),
+        last_rate_limit_session_id: "s2",
+      },
+      {
+        config_dir: "~/.claude-profiles/quiet-one",
+        last_rate_limit_at: null,
+        last_rate_limit_session_id: null,
+      },
+    ],
+    NOW_MS,
+  );
+  // Header line + 3 profile rows.
+  expect(lines).toHaveLength(4);
+  expect(lines[0]).toBe("Rate limits by profile");
+  // `''` sentinel renders as the `(default)` literal — NOT empty parens
+  // (which would read as "missing data"). The default profile is a
+  // known-correct value here, not absence.
+  const defaultRow = lines.find((l) => l.startsWith("(default)"));
+  expect(defaultRow, "expected a (default) row").toBeDefined();
+  expect(defaultRow as string).toMatch(/ 5m ago$/);
+  // Explicit config_dir wraps in parens like the usage block's id chip.
+  const multi = lines.find((l) =>
+    l.startsWith("(~/.claude-profiles/multi-claude-3)"),
+  );
+  expect(multi, "expected an explicit-config_dir row").toBeDefined();
+  expect(multi as string).toMatch(/ 3h 12m ago$/);
+  // NULL last_rate_limit_at renders the em-dash — no raw-float leakage,
+  // no whitespace at end-of-line.
+  const quiet = lines.find((l) =>
+    l.startsWith("(~/.claude-profiles/quiet-one)"),
+  );
+  expect(quiet, "expected a quiet (null) row").toBeDefined();
+  expect(quiet as string).toMatch(/ —$/);
+});
+
+test("unix-seconds input renders as relative time (no raw-float leakage)", () => {
+  // The `profiles.last_rate_limit_at` column is REAL unix-SECONDS to match
+  // `jobs.last_api_error_at` (the source-of-truth for the projection).
+  // Feeding it straight into `relTime` would do `Date.parse` and yield NaN,
+  // leaking the raw float into the rendered text. The numeric variant
+  // routes through `relTimeFromUnixSec` so the rendered cell is the same
+  // minute-rounded prose as the usage block's reset times.
+  const lines = renderProfileLines(
+    [
+      {
+        config_dir: "p1",
+        last_rate_limit_at: NOW_SEC - 120, // 2 minutes ago
+      },
+    ],
+    NOW_MS,
+  );
+  const row = lines[1];
+  expect(row).toMatch(/ 2m ago$/);
+  // Defensive: no raw float anywhere in the rendered text.
+  expect(row).not.toMatch(/\d+\.\d+/);
+});
+
+test("chip column padEnds to the widest profile so relative times align", () => {
+  // `(default)` (9 chars) and `(longer-config-dir)` (19 chars) should
+  // padEnd to the widest, leaving the relative-time column flush across
+  // all rows.
+  const lines = renderProfileLines(
+    [
+      { config_dir: "", last_rate_limit_at: NOW_SEC - 60 },
+      { config_dir: "longer-config-dir", last_rate_limit_at: NOW_SEC - 60 },
+    ],
+    NOW_MS,
+  );
+  // chips: "(default)" (9), "(longer-config-dir)" (19) — widest = 19. Then
+  // a single separator space, then the rel-time.
+  const defaultRow = lines.find((l) => l.startsWith("(default)"));
+  expect(defaultRow, "expected a (default) row").toBeDefined();
+  // padEnd(19) on "(default)" (length 9) = 10 trailing spaces, then " 1m ago".
+  expect(defaultRow as string).toBe(`(default)${" ".repeat(10)} 1m ago`);
+});
+
+test("empty row set returns an empty array", () => {
+  expect(renderProfileLines([], NOW_MS)).toEqual([]);
+});
+
+test("renders 'now' at the round boundary for unix-seconds input", () => {
+  // A unix-seconds input within 30s of `nowMs` rounds to the same minute
+  // and renders as "now" — the same contract as `relTime`'s ISO callers,
+  // shared via `relTimeFromMs`.
+  const lines = renderProfileLines(
+    [
+      {
+        config_dir: "p1",
+        last_rate_limit_at: NOW_SEC, // exact now
+      },
+    ],
+    NOW_MS,
+  );
+  expect(lines[1]).toMatch(/ now$/);
 });
