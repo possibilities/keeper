@@ -122,5 +122,5 @@ Five coordinated changes in `scripts/autopilot.ts` (client-side, NOT the reducer
 - [ ] `bun test --isolate` passes (new closeWindow + hydrate-fold assertions); `bun run lint` + `bun run typecheck` clean
 
 ## Done summary
-
+Generalized autopilot's Ghostty launch to validated $SHELL (with /bin/zsh fallback) and a chained interactive-shell fallback, captured the spawned window id into a new dispatch.log `window` row (folded back via hydrateDispatchLog), and wired closeWindow into detectJobTransitions at both completedKeys-entry sites so parked Ghostty surfaces auto-close in lockstep with the agent's terminal state.
 ## Evidence
