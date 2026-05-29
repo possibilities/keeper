@@ -98,5 +98,5 @@ entirely by reducer fan-outs inside the existing `BEGIN IMMEDIATE` transaction
 - [ ] CLAUDE.md invariant enumeration + README collections/schema/inspect docs updated
 
 ## Done summary
-
+Added schema-v33 `profiles` projection table keyed by `config_dir` (NOT NULL PK, '' sentinel collapses default ~/.claude); maintained by two reducer fan-outs inside the existing BEGIN IMMEDIATE — SessionStart INSERT OR IGNORE seed + RateLimited/ApiError(rate_limit) UPSERT. Registered PROFILES_DESCRIPTOR. Added 9 tests including a from-scratch re-fold determinism test.
 ## Evidence
