@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-05-29T01:22:02.387083Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Add resolved-deps column and reverse-index table",
-  "updated_at": "2026-05-29T04:56:48.226199Z",
+  "updated_at": "2026-05-29T11:00:17.959302Z",
   "worker_done_at": "2026-05-29T04:56:48.226199Z"
 }
