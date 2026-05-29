@@ -9,5 +9,5 @@ Originating finding F4. The three-branch pill assembly at `scripts/board.ts:785-
 - [ ] Cross-project dep: `<prefix>::#<num>` appears when resolved with a non-null `cross_project` basename
 
 ## Done summary
-
+Extracted the three-branch pill assembly from renderEpicBlock into an exported renderEpicDepPills helper and added direct assertions for the dangling (?#N), intra-project (#N), and cross-project (<prefix>::#N) shapes.
 ## Evidence
