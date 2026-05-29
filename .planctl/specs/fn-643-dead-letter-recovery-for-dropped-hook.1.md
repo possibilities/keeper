@@ -66,5 +66,5 @@ surface.
 - [ ] The table is documented as operational/never-folded and excluded from the re-fold reset path.
 
 ## Done summary
-
+Schema v37: CREATE_DEAD_LETTERS operational table, src/dead-letter.ts pure NDJSON serialize/parse (no bun:sqlite), DEAD_LETTERS_DESCRIPTOR with defaultFilter status=waiting, DeadLetter type in types.ts. Tests: dead-letter round-trip + null-on-partial, collections descriptor + defaultFilter scope.
 ## Evidence
