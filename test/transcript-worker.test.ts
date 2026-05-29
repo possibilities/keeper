@@ -232,10 +232,13 @@ test("scanFile: a missing/empty file is a non-fatal no-op", () => {
     (m) => logs.push(m),
   );
 
-  // Missing file → stat fails → skip-and-log, never throws.
+  // Missing file → stat fails with ENOENT → SILENT skip, never throws. A
+  // vanished transcript is the expected case (scanJobsForTitles walks every
+  // historical jobs.transcript_path, most long gone); logging each one buried
+  // the real signal under ~200k lines / 75MB per boot, so ENOENT is swallowed.
   stream.scanFile(join(tmpDir, "does-not-exist.jsonl"));
   expect(emitted).toEqual([]);
-  expect(logs.some((l) => l.includes("boot scan stat failed"))).toBe(true);
+  expect(logs).toEqual([]);
 
   // Empty file (size 0) → no emit, no log noise.
   const emptyPath = join(tmpDir, "empty.jsonl");

@@ -487,9 +487,18 @@ export class TranscriptLineStream {
       }
       size = st.size;
     } catch (err) {
-      this.log(
-        `[transcript-worker] boot scan stat failed for ${path}: ${stringifyErr(err)}`,
-      );
+      // ENOENT is the EXPECTED case, not an error: `scanJobsForTitles` walks
+      // every `jobs.transcript_path` row — thousands of historical sessions
+      // across every profile — and most of those transcript files are long
+      // gone. Logging each one buried the real signal under ~200k lines and
+      // grew `server.stderr` to 75MB+ per boot. A vanished transcript simply
+      // has no title to fold; skip it silently. Other stat failures (EACCES,
+      // EIO, …) are genuinely unexpected and still surface.
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        this.log(
+          `[transcript-worker] boot scan stat failed for ${path}: ${stringifyErr(err)}`,
+        );
+      }
       return;
     }
     if (size <= 0) {

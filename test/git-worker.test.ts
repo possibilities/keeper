@@ -15,6 +15,7 @@ import {
   buildGitSnapshot,
   type GitDirtyFile,
   parsePorcelainV2,
+  resolveHeadOidViaFs,
 } from "../src/git-worker";
 
 // ---------------------------------------------------------------------------
@@ -508,5 +509,101 @@ test("extractCommit clamps non-positive / non-numeric committed_at_ms to 0", () 
       }),
     });
     expect(res?.committed_at_ms).toBe(0);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// resolveHeadOidViaFs — the divergence watchdog's fs-only HEAD ground truth.
+// Must match `git rev-parse HEAD` across regular repos, packed-refs, detached
+// HEAD, and linked worktrees, WITHOUT shelling git — that independence is the
+// whole point (it stays correct when the worker's git subprocess view wedges).
+// ---------------------------------------------------------------------------
+
+function git(cwd: string, ...args: string[]): string {
+  const r = Bun.spawnSync(["git", "-C", cwd, ...args], {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "t",
+      GIT_AUTHOR_EMAIL: "t@t.t",
+      GIT_COMMITTER_NAME: "t",
+      GIT_COMMITTER_EMAIL: "t@t.t",
+    },
+  });
+  if (!r.success) {
+    throw new Error(`git ${args.join(" ")} failed: ${r.stderr.toString()}`);
+  }
+  return r.stdout.toString().trim();
+}
+
+function initRepo(): string {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-headfs-"));
+  git(dir, "init", "-q", "-b", "main");
+  writeFileSync(join(dir, "a.txt"), "hello\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-qm", "init");
+  return dir;
+}
+
+test("resolveHeadOidViaFs matches git rev-parse on a regular repo (loose ref)", () => {
+  const dir = initRepo();
+  try {
+    expect(resolveHeadOidViaFs(dir)).toBe(git(dir, "rev-parse", "HEAD"));
+    // A second commit advances HEAD; the fs read must track it.
+    writeFileSync(join(dir, "b.txt"), "world\n");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "second");
+    expect(resolveHeadOidViaFs(dir)).toBe(git(dir, "rev-parse", "HEAD"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveHeadOidViaFs resolves a packed ref (no loose ref file)", () => {
+  const dir = initRepo();
+  try {
+    const head = git(dir, "rev-parse", "HEAD");
+    git(dir, "pack-refs", "--all");
+    // refs/heads/main is now only in packed-refs; the loose file is gone.
+    expect(resolveHeadOidViaFs(dir)).toBe(head);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveHeadOidViaFs returns the oid for a detached HEAD", () => {
+  const dir = initRepo();
+  try {
+    const head = git(dir, "rev-parse", "HEAD");
+    git(dir, "checkout", "-q", "--detach", head);
+    expect(resolveHeadOidViaFs(dir)).toBe(head);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveHeadOidViaFs resolves a linked worktree's own HEAD", () => {
+  const dir = initRepo();
+  const wt = mkdtempSync(join(tmpdir(), "keeper-headfs-wt-"));
+  rmSync(wt, { recursive: true, force: true }); // git worktree add wants a fresh path
+  try {
+    git(dir, "branch", "feature");
+    git(dir, "worktree", "add", "-q", wt, "feature");
+    // The linked worktree's `.git` is a `gitdir:` pointer file, refs live in
+    // the main repo's common-dir — the resolver must follow both hops.
+    expect(resolveHeadOidViaFs(wt)).toBe(git(wt, "rev-parse", "HEAD"));
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveHeadOidViaFs returns null on a non-repo path (fail-safe)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-headfs-bare-"));
+  try {
+    expect(resolveHeadOidViaFs(dir)).toBeNull();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
