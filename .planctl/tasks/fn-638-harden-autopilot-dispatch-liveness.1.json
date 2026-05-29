@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "bounded stop guard for stuck subagents",
-  "updated_at": "2026-05-29T01:29:22.799047Z"
+  "updated_at": "2026-05-29T01:44:43.855642Z",
+  "worker_done_at": "2026-05-29T01:44:43.855642Z"
 }

@@ -70,5 +70,5 @@ assert byte-identical `jobs`/`subagent_invocations` rows.
 - [ ] Adds no schema column / no migration (no collision with fn-637's v33 bump)
 
 ## Done summary
-
+Add MAX_STOP_YIELD_GAP_SEC=120 recency bound to the Stop fold's sub-agent guard — a one-shot orphan that never emits SubagentStop no longer pins its job at 'working' indefinitely. The bounded comparison is a pure function of the event log (event.ts vs surviving row.ts) so re-fold determinism holds, NULL/zero/negative ts deltas conservatively keep swallowing, and standard fan-out runs on the bounded release.
 ## Evidence
