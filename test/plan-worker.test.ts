@@ -380,6 +380,9 @@ test("onChange emits a task snapshot with derived workerPhase + epicId", () => {
       number: 2,
       title: "Subtask",
       targetRepo: "/repo",
+      // fn-602: `tier` rides FREE in the embedded JSON; pre-fn-602 task files
+      // lack the field and `buildTaskMessage` coerces to `null`.
+      tier: null,
       workerPhase: "open",
       runtimeStatus: "todo",
       approval: "pending",
@@ -1001,6 +1004,11 @@ test("seedFromDb reconstructs workerPhase + runtimeStatus field-identically (no 
     number: 1,
     title: "T",
     targetRepo: "/repo",
+    // fn-602: legacy stored element lacks `tier`; seedFromDb reconstructs
+    // `tier: null` via `?? null`, and `buildTaskMessage` on the equivalent
+    // tier-less raw task file coerces to `null` via `asString(undefined)`.
+    // Bytes match because the slot order is identical across both sites.
+    tier: null,
     workerPhase: "done",
     runtimeStatus: "in_progress",
     approval: "approved" as const,
@@ -1031,6 +1039,10 @@ test("seedFromDb reconstructs workerPhase + runtimeStatus field-identically (no 
     number: 1,
     title: "L",
     targetRepo: "/repo",
+    // fn-602: same byte-parity invariant — tier defaults to `null` on both
+    // the seed side (`t.tier ?? null`) and the build side (`asString(raw.tier)`
+    // → `null` when `raw.tier` is undefined on a tier-less task file).
+    tier: null,
     workerPhase: "open",
     runtimeStatus: "todo",
     approval: "pending" as const,

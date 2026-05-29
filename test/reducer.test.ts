@@ -4316,6 +4316,15 @@ interface EmbeddedTask {
   task_number: number | null;
   title: string | null;
   target_repo: string | null;
+  /**
+   * Planctl-native effort tier (fn-602): rides FREE in the embedded JSON
+   * (no schema column, no SCHEMA_VERSION bump). Optional on the test
+   * interface because pre-fn-602 events / serialised arrays lack the key;
+   * the reducer reads `snapshot.tier ?? null` so a missing field folds to
+   * `null` deterministically (graceful-degradation precedent shared with
+   * `worker_phase`/`runtime_status`).
+   */
+  tier?: string | null;
   worker_phase?: string | null;
   runtime_status?: string;
   approval?: "approved" | "rejected" | "pending";
@@ -4413,6 +4422,10 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     task_number: 3,
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
+    // fn-602: the producer ships `tier` (planctl `medium|high|xhigh|max`)
+    // verbatim from the task-def file's top-level `tier` field. Stored
+    // opaque — the reducer never branches on the value.
+    tier: "high",
     // Schema v19: the producer (plan-worker → daemon → synthetic event)
     // ships BOTH `worker_phase` (renamed from `status`) and `runtime_status`
     // (planctl-native enum). The legacy `status` is still read defensively
@@ -4429,6 +4442,7 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     task_number: 3,
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
+    tier: "high",
     worker_phase: "done",
     runtime_status: "in_progress",
     // No `approval` in the blob → the embedded element defaults to "pending"
@@ -4443,6 +4457,39 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
   // The fold bumps the parent epic's last_event_id (so it patches).
   expect(getEpic("fn-1-add-oauth")?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);
+});
+
+test("fn-602: a pre-tier TaskSnapshot blob (no `tier` key) folds to `tier: null` on the embedded element (deterministic graceful degradation)", () => {
+  // Re-fold determinism guard for fn-602: tier rides FREE in the
+  // embedded-tasks JSON with no schema column and no SCHEMA_VERSION bump,
+  // so historical TaskSnapshot events predate the field. The reducer reads
+  // `snapshot.tier ?? null` and the embedded element initialises to `null`
+  // — same graceful-degradation precedent as `worker_phase`/`runtime_status`
+  // on the v18→v19 boundary, so a re-fold of the immutable event log
+  // through the new reducer produces a byte-deterministic projection.
+  epicSnapshotEvent("fn-602-decouple", {
+    epic_number: 602,
+    title: "Decouple",
+    status: "open",
+  });
+  // Deliberately omit `tier` from the snapshot blob — this is the shape
+  // every TaskSnapshot event in the log carries before fn-602.
+  taskSnapshotEvent("fn-602-decouple.1", {
+    epic_id: "fn-602-decouple",
+    task_number: 1,
+    title: "Project tier",
+    target_repo: "/Users/mike/code/keeper",
+    worker_phase: "open",
+    runtime_status: "todo",
+  });
+  drainAll();
+  const task = getTask("fn-602-decouple.1");
+  expect(task?.tier).toBeNull();
+  // Sanity-check that the other fields all populated normally — tier's null
+  // default is the only graceful-degradation slot in play here.
+  expect(task?.title).toBe("Project tier");
+  expect(task?.worker_phase).toBe("open");
+  expect(task?.runtime_status).toBe("todo");
 });
 
 test("TaskSnapshot before its epic inserts a shell row carrying the task", () => {

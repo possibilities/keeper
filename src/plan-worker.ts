@@ -136,6 +136,16 @@ export interface PlanTaskMessage {
   /** The task's `target_repo` — stored opaque, never used to drive FS reads. */
   targetRepo: string | null;
   /**
+   * Planctl-native effort tier (fn-602): the top-level `tier` field on the
+   * task-def file (planctl's `medium | high | xhigh | max` vocabulary).
+   * Stored opaque — keeper never branches on the value, so a future tier
+   * widening rides through with no code change. Null on absent/legacy files;
+   * a pre-fn-602 `TaskSnapshot` event blob lacks this field and folds to
+   * `null` deterministically (same graceful-degradation precedent as
+   * `worker_phase`/`runtime_status`).
+   */
+  tier: string | null;
+  /**
    * Derived worker-phase binary: `worker_done_at` present → `"done"`, else
    * `"open"`. Surfaces the same compressed signal the field used to carry
    * under the legacy `status` name (renamed in schema v19 to make room for
@@ -347,6 +357,15 @@ interface RawTask {
   epic?: unknown;
   title?: unknown;
   target_repo?: unknown;
+  /**
+   * Planctl-native effort tier (fn-602): top-level field on the task-def file,
+   * read by `planctl resolve-task` from `task_def.get("tier")`. Planctl's own
+   * vocabulary is `medium | high | xhigh | max` (planctl `TASK_TIERS`), but
+   * keeper stores the field opaque — never branches on the value — so any
+   * future tier widening rides through with no code change. Absent on legacy
+   * task files / unset on newer ones; coerced to `null` by `asString`.
+   */
+  tier?: unknown;
   worker_done_at?: unknown;
   approval?: unknown;
   depends_on?: unknown;
@@ -1066,6 +1085,7 @@ export function buildTaskMessage(
     number: taskNumberFromId(id),
     title: asString(raw.title),
     targetRepo: asString(raw.target_repo),
+    tier: asString(raw.tier),
     workerPhase: asString(raw.worker_done_at) !== null ? "done" : "open",
     runtimeStatus,
     approval,
@@ -1325,6 +1345,14 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       epic_id: string | null;
       title: string | null;
       target_repo: string | null;
+      /**
+       * Planctl-native effort tier (fn-602). Absent on pre-fn-602 stored
+       * task elements; read defensively (`?? null`) so the reconstructed
+       * `PlanTaskMessage.tier` matches `buildTaskMessage`'s output on a
+       * fresh re-scan and the change-gate suppresses correctly across the
+       * upgrade window.
+       */
+      tier?: string | null;
       // Legacy column name in the embedded JSON — pre-schema-bump rows carry
       // `status`; post-bump rows carry `worker_phase`. Both are read
       // defensively (whichever is present feeds `workerPhase`) so the seed
@@ -1355,6 +1383,11 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
         number: taskNumberFromId(t.task_id),
         title: t.title,
         targetRepo: t.target_repo,
+        // Planctl-native effort tier (fn-602). Pre-fn-602 stored elements
+        // lack the key — `?? null` matches `buildTaskMessage`'s
+        // `asString(raw.tier)` on a tier-less task file so the change-gate
+        // byte-compare suppresses on restart.
+        tier: t.tier ?? null,
         // The projection stores the derived worker-phase verbatim under
         // `worker_phase` (post-bump) or the legacy `status` key (pre-bump);
         // read whichever is present and default to "open" for a NULL so the

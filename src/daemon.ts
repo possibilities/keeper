@@ -482,6 +482,12 @@ function runDaemon(): void {
         task_number: msg.number,
         title: msg.title,
         target_repo: msg.targetRepo,
+        // Planctl-native effort tier (fn-602): rides FREE in the embedded-
+        // tasks JSON — no schema column, no migration. A pre-fn-602
+        // TaskSnapshot blob lacks this key and the reducer reads
+        // `snapshot.tier ?? null` (graceful-degradation precedent shared with
+        // `worker_phase`/`runtime_status`).
+        tier: msg.tier,
         // Renamed from the legacy `status` field. The producer surfaces the
         // derived worker-phase binary (`worker_done_at` present → "done", else
         // "open") under its new name to free up `runtime_status` (sibling

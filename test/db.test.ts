@@ -1988,6 +1988,84 @@ test("v10 DB migrates to v11: epics.jobs added + rewind-and-redrain rebuilds emb
   db2.close();
 });
 
+test("fn-602: `tier` survives a re-fold from the immutable event log (rides FREE in embedded JSON, no schema column / migration)", () => {
+  // Re-fold determinism guard for fn-602: the producer ships the
+  // planctl-native `tier` field on every TaskSnapshot blob; the reducer
+  // folds it into the embedded element under the same `tier` key with no
+  // schema column (rides FREE in the JSON-TEXT `epics.tasks` array).
+  // This test seeds the event log with a tier-bearing TaskSnapshot, drains
+  // once to confirm the projection carries the tier, then rewinds the
+  // cursor and re-drains to confirm a from-scratch re-fold reproduces the
+  // same byte-deterministic value — the CLAUDE.md re-fold invariant.
+  const { db } = openDb(dbPath);
+
+  // Seed: EpicSnapshot then TaskSnapshot, both as synthetic plan events.
+  const insertEvent = db.prepare(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (?, ?, ?, ?, ?)",
+  );
+  insertEvent.run(
+    1,
+    "fn-602-decouple",
+    "EpicSnapshot",
+    "plan_snapshot",
+    JSON.stringify({
+      epic_number: 602,
+      title: "Decouple",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  );
+  insertEvent.run(
+    2,
+    "fn-602-decouple.1",
+    "TaskSnapshot",
+    "plan_snapshot",
+    JSON.stringify({
+      epic_id: "fn-602-decouple",
+      task_number: 1,
+      title: "Project tier",
+      target_repo: "/repo",
+      tier: "xhigh",
+      worker_phase: "open",
+      runtime_status: "todo",
+    }),
+  );
+
+  drainAll(db);
+
+  // First drain: the embedded tasks array carries tier verbatim from the
+  // blob.
+  const before = JSON.parse(
+    (
+      db
+        .prepare("SELECT tasks FROM epics WHERE epic_id = 'fn-602-decouple'")
+        .get() as { tasks: string }
+    ).tasks,
+  ) as { task_id: string; tier?: string | null }[];
+  expect(before.length).toBe(1);
+  expect(before[0]?.task_id).toBe("fn-602-decouple.1");
+  expect(before[0]?.tier).toBe("xhigh");
+
+  // Rewind + re-drain: same shape every version-guarded rewind in db.ts
+  // does. The event log is immutable; only the projection is rebuilt.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM epics");
+  drainAll(db);
+
+  // After re-fold: byte-identical tier value, no NULLing, no shape drift.
+  const after = JSON.parse(
+    (
+      db
+        .prepare("SELECT tasks FROM epics WHERE epic_id = 'fn-602-decouple'")
+        .get() as { tasks: string }
+    ).tasks,
+  ) as { task_id: string; tier?: string | null }[];
+  expect(after.length).toBe(1);
+  expect(after[0]?.tier).toBe("xhigh");
+
+  db.close();
+});
+
 test("v12 DB migrates to v13: epics.approval added, approvals table dropped, file backfill + overlay applied, idempotent re-run", () => {
   // Build a v12-shaped DB by hand: events + jobs + epics + approvals at the
   // v12 shape, version '12'. The v12→v13 step ADDs `epics.approval`, DROPs

@@ -493,6 +493,17 @@ interface PlanSnapshot {
   title?: string | null;
   project_dir?: string | null;
   target_repo?: string | null;
+  /**
+   * Planctl-native effort tier on TaskSnapshot blobs (fn-602): the top-level
+   * `tier` field on the task-def file (planctl's `medium | high | xhigh | max`
+   * vocabulary). Stored opaque — the reducer never branches on the value, so
+   * a future tier widening rides through with no code change. Absent on pre-
+   * fn-602 blobs; the reducer reads defensively (`snapshot.tier ?? null`) so
+   * an older blob folds to a null tier deterministically — same graceful-
+   * degradation precedent as `worker_phase`/`runtime_status`. Rides FREE in
+   * the embedded-tasks JSON; no schema column, no SCHEMA_VERSION bump.
+   */
+  tier?: string | null;
   epic_id?: string | null;
   status?: string | null;
   /**
@@ -734,6 +745,7 @@ function projectPlanRow(db: Database, event: Event): void {
       task_number: number | null;
       title: string | null;
       target_repo: string | null;
+      tier: string | null;
       worker_phase: string | null;
       runtime_status: string;
       approval: "approved" | "rejected" | "pending";
@@ -745,6 +757,16 @@ function projectPlanRow(db: Database, event: Event): void {
       task_number: snapshot.task_number ?? null,
       title: snapshot.title ?? null,
       target_repo: snapshot.target_repo ?? null,
+      // Planctl-native effort tier (fn-602): rides FREE in the embedded JSON
+      // — no schema column, no SCHEMA_VERSION bump. Pre-fn-602 TaskSnapshot
+      // blobs lack the field and fold to `null` (graceful-degradation
+      // precedent shared with `worker_phase` / `runtime_status`); a later
+      // planctl re-emit of the task fills it. The slot lives after
+      // `target_repo` to match `PlanTaskMessage` / `seedFromDb` / the
+      // `TaskElement` shell in `syncJobIntoEpic` — the change-gate
+      // `JSON.stringify` byte-compare relies on consistent slot order
+      // across all four sites (see CLAUDE.md "SLOT ORDER is load-bearing").
+      tier: snapshot.tier ?? null,
       // Renamed from the legacy `status` column on the embedded element
       // (schema v19). A pre-v19 TaskSnapshot blob carries `status` instead of
       // `worker_phase`; read whichever is present so a re-fold reproduces
@@ -2593,6 +2615,15 @@ function syncJobIntoEpic(
     task_number: number | null;
     title: string | null;
     target_repo: string | null;
+    /**
+     * Planctl-native effort tier (fn-602). Optional on the type because pre-
+     * fn-602 stored elements lack the key; the OLD-element carve-out spread
+     * below preserves whatever value (or absence) was already there. A shell
+     * element from this fan-out initialises `tier: null` (matches the zero-
+     * event projection) — a later plan-snapshot fold fills it without
+     * clobbering jobs via the same spread-carve-out as the other scalars.
+     */
+    tier?: string | null;
     worker_phase: string | null;
     runtime_status: string;
     depends_on: unknown[];
@@ -2636,6 +2667,11 @@ function syncJobIntoEpic(
           task_number: null,
           title: null,
           target_repo: null,
+          // Planctl-native effort tier (fn-602): shell elements know
+          // nothing about it — a later plan-snapshot fold fills it via the
+          // OLD-element carve-out spread above (`{...oldTask, jobs: ...}`)
+          // without clobbering the new `jobs` sub-array.
+          tier: null,
           worker_phase: null,
           // A shell task element (no plan-snapshot folded yet) gets the
           // planctl `"todo"` default, matching the zero-event projection

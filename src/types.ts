@@ -828,6 +828,18 @@ export interface Task {
   title: string | null;
   target_repo: string | null;
   /**
+   * Planctl-native effort tier (fn-602): the top-level `tier` field on
+   * `.planctl/tasks/<id>.json` (planctl's `medium | high | xhigh | max`
+   * vocabulary). Stored opaque — keeper never branches on the value, so a
+   * future tier widening rides through with no code change. Null on legacy
+   * task files / shell elements / a pre-fn-602 `TaskSnapshot` event blob
+   * that lacks the field (graceful-degradation precedent shared with
+   * `worker_phase`/`runtime_status`). Rides FREE inside the parent epic's
+   * embedded `tasks` JSON array — no schema column of its own; no
+   * SCHEMA_VERSION bump.
+   */
+  tier: string | null;
+  /**
    * Derived worker-phase binary (schema v19): `worker_done_at` present →
    * `"done"`, else `"open"`. Surfaces the same compressed signal the field
    * used to carry under the legacy `status` name (renamed to free up
