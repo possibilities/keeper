@@ -32,6 +32,7 @@ import type {
   Epic,
   Job,
   JobLinkEntry,
+  ResolvedEpicDep,
   SubagentInvocation,
   Task,
 } from "../src/types";
@@ -47,6 +48,7 @@ function makeTask(overrides: Partial<Task>): Task {
     task_number: 1,
     title: "task",
     target_repo: null,
+    tier: null,
     // Schema v19: `status` renamed to `worker_phase` (derived binary —
     // open|done) and `runtime_status` added (planctl-native enum, default
     // "todo"). Both ride inside the embedded element on the parent epic's
@@ -79,6 +81,27 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     queue_jump: 0,
     resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
+    ...overrides,
+  };
+}
+
+/**
+ * fn-637.4: build a `ResolvedEpicDep` projection entry — the shape the
+ * reducer's `enrichEpicDep` would emit for a single token in a consumer
+ * epic's `depends_on_epics` array. Predicate 9 now reads off this projection
+ * instead of calling the resolver live, so test fixtures construct epics
+ * with a populated `resolved_epic_deps` and assert on the same surface the
+ * reducer produces.
+ */
+function makeResolvedDep(
+  overrides: Partial<ResolvedEpicDep> & { dep_token: string },
+): ResolvedEpicDep {
+  return {
+    resolved_epic_id: null,
+    epic_number: null,
+    project_basename: null,
+    cross_project: false,
+    state: "dangling",
     ...overrides,
   };
 }
@@ -174,16 +197,16 @@ function run(
 
 // fn-638.4: variant that threads an explicit `now` (unix seconds) into
 // `computeReadiness` for the staleness-sensitive sub-agent predicate.
-// Skips the `completedEpics` slot with the same default the production
-// signature carries (empty iterable) so a test only needs to care about
-// `now` if it's exercising sub-agent staleness.
+// fn-637.4: the `completedEpics` slot is gone — predicate 9 now reads the
+// projected `epic.resolved_epic_deps` tri-state, no resolver-only sub
+// remains.
 function runWithNow(
   epics: Epic[],
   subs: SubagentInvocation[],
   now: number,
   jobs: Map<string, Job> = new Map(),
 ) {
-  return computeReadiness(epics, jobs, subs, new Map(), [], now);
+  return computeReadiness(epics, jobs, subs, new Map(), now);
 }
 
 // ---------------------------------------------------------------------------
@@ -835,7 +858,7 @@ test("predicate 6 (own-progress-sub) wins over 8 (dep-on-task)", () => {
 
 test("predicate 8 (dep-on-task) wins over 9 (dep-on-epic)", () => {
   // Task depends on a non-completed sibling; the EPIC also has a non-completed
-  // upstream epic. Task-dep should win.
+  // upstream epic (projected as `blocked-incomplete`). Task-dep should win.
   const upstreamEpic = makeEpic({
     epic_id: "fn-0-bar",
     epic_number: 0,
@@ -857,6 +880,16 @@ test("predicate 8 (dep-on-task) wins over 9 (dep-on-epic)", () => {
   const epic = makeEpic({
     tasks: [upstreamTask, dependent],
     depends_on_epics: ["fn-0-bar"],
+    resolved_epic_deps: [
+      makeResolvedDep({
+        dep_token: "fn-0-bar",
+        resolved_epic_id: "fn-0-bar",
+        epic_number: 0,
+        project_basename: "other",
+        cross_project: true,
+        state: "blocked-incomplete",
+      }),
+    ],
   });
   const snap = run([upstreamEpic, epic]);
   expect(snap.perTask.get(dependent.task_id)).toEqual(
@@ -866,7 +899,9 @@ test("predicate 8 (dep-on-task) wins over 9 (dep-on-epic)", () => {
 
 test("predicate 9 (dep-on-epic) wins over 12 (single-task-per-root)", () => {
   // The dependent epic's task would otherwise compete for per-root with
-  // the upstream epic's task; dep-on-epic should win.
+  // the upstream epic's task; dep-on-epic should win. Same-project upstream
+  // → projection entry has `cross_project: false`, predicate 9 reconstructs
+  // the BlockReason's `cross_project: null` from the boolean + basename pair.
   const upstreamEpic = makeEpic({
     epic_id: "fn-0-bar",
     epic_number: 0,
@@ -884,6 +919,16 @@ test("predicate 9 (dep-on-epic) wins over 12 (single-task-per-root)", () => {
     tasks: [dependent],
     depends_on_epics: ["fn-0-bar"],
     project_dir: "/repo",
+    resolved_epic_deps: [
+      makeResolvedDep({
+        dep_token: "fn-0-bar",
+        resolved_epic_id: "fn-0-bar",
+        epic_number: 0,
+        project_basename: "repo",
+        cross_project: false,
+        state: "blocked-incomplete",
+      }),
+    ],
   });
   const snap = run([upstreamEpic, epic]);
   // Upstream task is ready; dependent task should be dep-on-epic blocked.
@@ -1233,35 +1278,33 @@ test("missing-input: a task with depends_on referencing a non-existent task → 
   );
 });
 
-test("dep-on-epic tolerant forward-ref: upstream IS in epicById but its close verdict isn't in perCloseRow yet → satisfied", () => {
-  // fn-635 split A. The consumer epic depends_on a sibling epic that
-  // appears LATER in iteration order, so its close-row verdict isn't in
-  // `perCloseRow` when predicate 9 evaluates this task. The upstream IS
-  // resolvable via the epicById index built up-front, so it's not
-  // dangling — the rare forward-ref case stays tolerantly satisfied
-  // (consumer flips when the next snapshot lands).
+test("dep-on-epic null resolved_epic_deps: predicate 9 short-circuits, no-block (defensive)", () => {
+  // fn-637.4: `resolved_epic_deps === null` is the "not-yet-computed" sentinel
+  // (a fresh epics row that the reducer hasn't stamped yet). Predicate 9 skips
+  // the dep evaluation entirely so a row never false-blocks during the
+  // migration window before the reducer's first fold lands. Production reads
+  // see `[]` or a populated array; this guard is the safe-default fallback.
   const consumer = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
     tasks: [makeTask({ task_id: "fn-1-foo.1" })],
-    depends_on_epics: ["fn-2-bar"], // forward-ref to the LATER epic
+    depends_on_epics: ["fn-2-bar"],
+    resolved_epic_deps: null,
   });
-  const upstream = makeEpic({
-    epic_id: "fn-2-bar",
-    epic_number: 2,
-    tasks: [],
-  });
-  const snap = run([consumer, upstream]);
+  const snap = run([consumer]);
   expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
 });
 
-test("dep-on-epic full-id miss → dep-on-epic-dangling (truly unknown upstream)", () => {
-  // fn-635 split B. The upstream id is well-formed but has no entry in
-  // the input snapshot — neither `epicById` (full-id miss) nor
-  // `epicsByNumber` (bare-id miss). Pre-fn-635 this silently passed; the
-  // new contract is a structural-problem signal (red pill).
+test("dep-on-epic full-id projection dangling → dep-on-epic-dangling", () => {
+  // The reducer projected the dep as `state === "dangling"` — no upstream
+  // resolved (full-id miss). Predicate 9 emits `dep-on-epic-dangling`
+  // carrying the raw `dep_token`.
   const t = makeTask({ task_id: "fn-1-foo.1" });
-  const epic = makeEpic({ tasks: [t], depends_on_epics: ["fn-99-ghost"] });
+  const epic = makeEpic({
+    tasks: [t],
+    depends_on_epics: ["fn-99-ghost"],
+    resolved_epic_deps: [makeResolvedDep({ dep_token: "fn-99-ghost" })],
+  });
   const snap = run([epic]);
   expect(snap.perTask.get(t.task_id)).toEqual(
     blocked({ kind: "dep-on-epic-dangling", upstream: "fn-99-ghost" }),
@@ -1269,53 +1312,63 @@ test("dep-on-epic full-id miss → dep-on-epic-dangling (truly unknown upstream)
 });
 
 // ---------------------------------------------------------------------------
-// fn-635 predicate-9 resolver matrix — intra-project, cross-project,
-// bare-id forms, ambiguity, full-id misses.
+// fn-637.4 predicate-9 projection matrix — the four tri-state outcomes
+// (`satisfied`, `blocked-incomplete` intra/cross, `dangling`) read off
+// `epic.resolved_epic_deps`. The resolver itself is tested in
+// `test/epic-deps.test.ts`; the reducer's forward stamp + reverse fan-out
+// in `test/reducer.test.ts:1690`. Here we exercise predicate 9's pure
+// projection-consuming branches.
 // ---------------------------------------------------------------------------
 
-test("resolver: intra-project bare-id resolves to same-project epic, satisfied", () => {
-  // Upstream done+approved in the same project_dir, bare-id form. The
-  // resolver lifts the bare id, finds exactly one match, marks it
-  // intra-project (no cross-project prefix).
-  const upstream = makeEpic({
-    epic_id: "fn-2-bar",
-    epic_number: 2,
-    project_dir: "/repo",
-    status: "done",
-    approval: "approved",
-    tasks: [],
-  });
-  const consumer = makeEpic({
-    epic_id: "fn-1-foo",
-    epic_number: 1,
-    project_dir: "/repo",
-    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
-    depends_on_epics: ["fn-2"], // bare form
-  });
-  const snap = run([upstream, consumer]);
-  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
-});
-
-test("resolver: cross-project full-id resolves, NOT completed → dep-on-epic with cross_project prefix", () => {
-  // Cross-project upstream — different project_dir basenames. Resolver
-  // marks the resolution cross-project; renderer prefixes the pill
-  // `dep-on-epic arthack::fn-2-bar`. The upstream is open + pending.
-  const upstream = makeEpic({
-    epic_id: "fn-2-bar",
-    epic_number: 2,
-    project_dir: "/Users/mike/code/arthack",
-    status: "open",
-    approval: "pending",
-    tasks: [],
-  });
+test("predicate 9: projection state=satisfied → consumer ready", () => {
+  // The reducer projected the upstream as `satisfied` (done+approved). The
+  // consumer's task path skips the entry and falls through to `ready`. The
+  // upstream itself need not be in the live `epics` list — it could be
+  // off-page completed; the projection already settled the verdict.
   const consumer = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
     project_dir: "/Users/mike/code/keeper",
     tasks: [makeTask({ task_id: "fn-1-foo.1" })],
-    depends_on_epics: ["fn-2-bar"], // full form
+    depends_on_epics: ["fn-2-bar"],
+    resolved_epic_deps: [
+      makeResolvedDep({
+        dep_token: "fn-2-bar",
+        resolved_epic_id: "fn-2-bar",
+        epic_number: 2,
+        project_basename: "keeper",
+        cross_project: false,
+        state: "satisfied",
+      }),
+    ],
   });
-  const snap = run([upstream, consumer]);
+  const snap = run([consumer]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+});
+
+test("predicate 9: projection state=blocked-incomplete + cross_project=true → dep-on-epic with basename prefix", () => {
+  // Cross-project upstream is open+pending. The projection carries
+  // `cross_project: true` + `project_basename: "arthack"`; predicate 9
+  // reconstructs the readiness-side `cross_project: string | null`
+  // BlockReason payload from the boolean + basename pair.
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/Users/mike/code/keeper",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2-bar"],
+    resolved_epic_deps: [
+      makeResolvedDep({
+        dep_token: "fn-2-bar",
+        resolved_epic_id: "fn-2-bar",
+        epic_number: 2,
+        project_basename: "arthack",
+        cross_project: true,
+        state: "blocked-incomplete",
+      }),
+    ],
+  });
+  const snap = run([consumer]);
   expect(snap.perTask.get("fn-1-foo.1")).toEqual(
     blocked({
       kind: "dep-on-epic",
@@ -1325,155 +1378,101 @@ test("resolver: cross-project full-id resolves, NOT completed → dep-on-epic wi
   );
 });
 
-test("resolver: cross-project bare-id (cwd-then-global) resolves when only one match exists", () => {
-  // Bare `fn-2` matches exactly one epic in the input, which happens to
-  // live in another project. The single-match branch picks it; cross-
-  // project flag is set because basenames differ.
-  const upstream = makeEpic({
-    epic_id: "fn-2-bar",
-    epic_number: 2,
-    project_dir: "/Users/mike/code/arthack",
-    status: "done",
-    approval: "approved",
-    tasks: [],
-  });
+test("predicate 9: projection state=satisfied via bare-id resolution → ready", () => {
+  // The dep_token is the bare form `fn-2`; the reducer resolved it to
+  // `fn-2-bar` via the cwd-then-global lookup and projected `satisfied`.
+  // Predicate 9 doesn't care about the resolution mechanism — it just
+  // consumes the tri-state.
   const consumer = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    project_dir: "/Users/mike/code/keeper",
+    project_dir: "/repo",
     tasks: [makeTask({ task_id: "fn-1-foo.1" })],
-    depends_on_epics: ["fn-2"], // bare form
+    depends_on_epics: ["fn-2"],
+    resolved_epic_deps: [
+      makeResolvedDep({
+        dep_token: "fn-2",
+        resolved_epic_id: "fn-2-bar",
+        epic_number: 2,
+        project_basename: "repo",
+        cross_project: false,
+        state: "satisfied",
+      }),
+    ],
   });
-  const snap = run([upstream, consumer]);
-  // Upstream completed → consumer satisfied.
+  const snap = run([consumer]);
   expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
 });
 
-test("resolver: bare-id miss → dep-on-epic-dangling", () => {
-  // `fn-99` matches no epic in the input. Dangling without diagnostic
-  // (the dangling pill is the signal).
+test("predicate 9: projection state=dangling → dep-on-epic-dangling carries raw dep_token", () => {
+  // Bare-id miss / full-id miss / ambiguity all surface as
+  // `state === "dangling"` on the projection. Predicate 9 emits the
+  // `dep-on-epic-dangling` BlockReason carrying the raw `dep_token`
+  // verbatim (so the renderer's `[?#N]` extraction works on the same
+  // string the planctl file carries).
   const t = makeTask({ task_id: "fn-1-foo.1" });
-  const epic = makeEpic({ tasks: [t], depends_on_epics: ["fn-99"] });
+  const epic = makeEpic({
+    tasks: [t],
+    depends_on_epics: ["fn-99"],
+    resolved_epic_deps: [makeResolvedDep({ dep_token: "fn-99" })],
+  });
   const snap = run([epic]);
   expect(snap.perTask.get(t.task_id)).toEqual(
     blocked({ kind: "dep-on-epic-dangling", upstream: "fn-99" }),
   );
 });
 
-test("fn-637: a completed upstream supplied via completedEpics resolves satisfied, not dangling", () => {
-  // The upstream is done+approved, hence pruned from the default-visible
-  // page — it is NOT in the main `epics` list. Before fn-637 the consumer's
-  // full-id dep missed `epicById` and false-blocked as dep-on-epic-dangling
-  // the instant the upstream completed. Supplying the completed upstream via
-  // the resolver-only `completedEpics` arg lets predicate 9 resolve it as
-  // completed → the dependency is satisfied.
-  const completedUpstream = makeEpic({
-    epic_id: "fn-2-bar",
-    epic_number: 2,
-    project_dir: "/Users/mike/code/keeper",
-    status: "done",
-    approval: "approved",
-    tasks: [],
-  });
+test("predicate 9: empty resolved_epic_deps array → ready (no deps)", () => {
+  // `[]` is the computed-no-deps state. Predicate 9 walks zero entries
+  // and falls through to `ready`.
   const consumer = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    project_dir: "/Users/mike/code/keeper",
     tasks: [makeTask({ task_id: "fn-1-foo.1" })],
-    depends_on_epics: ["fn-2-bar"], // full form
+    depends_on_epics: [],
+    resolved_epic_deps: [],
   });
-
-  // Control: WITHOUT the completed upstream in scope, the dep dangles —
-  // proving the `completedEpics` arg is what flips the verdict.
-  const dangling = computeReadiness(
-    [consumer],
-    new Map<string, Job>(),
-    [],
-    new Map(),
-  );
-  expect(dangling.perTask.get("fn-1-foo.1")).toEqual(
-    blocked({ kind: "dep-on-epic-dangling", upstream: "fn-2-bar" }),
-  );
-
-  // With the completed upstream supplied via the resolver-only arg, the
-  // consumer task is satisfied (ready).
-  const satisfied = computeReadiness(
-    [consumer],
-    new Map<string, Job>(),
-    [],
-    new Map(),
-    [completedUpstream],
-  );
-  expect(satisfied.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
-  // Resolver-only: the completed upstream never entered the verdict-driving
-  // iteration, so it has no close-row verdict of its own.
-  expect(satisfied.perCloseRow.get("fn-2-bar")).toBeUndefined();
-});
-
-test("resolver: 2+ matches with NO same-project disambiguator → dangling + diagnostic", () => {
-  // Two epics with `epic_number === 2` both live in projects OTHER than
-  // the consumer's `/Users/mike/code/keeper`. The resolver yields
-  // dangling AND pushes an `ambiguous-dep-resolution` row onto the
-  // snapshot's diagnostics array. `matches` is sorted for re-fold
-  // determinism.
-  const a = makeEpic({
-    epic_id: "fn-2-aaa",
-    epic_number: 2,
-    project_dir: "/Users/mike/code/arthack",
-    tasks: [],
-  });
-  const b = makeEpic({
-    epic_id: "fn-2-zzz",
-    epic_number: 2,
-    project_dir: "/Users/mike/code/otherproj",
-    tasks: [],
-  });
-  const consumer = makeEpic({
-    epic_id: "fn-1-foo",
-    epic_number: 1,
-    project_dir: "/Users/mike/code/keeper",
-    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
-    depends_on_epics: ["fn-2"], // ambiguous bare form
-  });
-  const snap = run([a, b, consumer]);
-  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
-    blocked({ kind: "dep-on-epic-dangling", upstream: "fn-2" }),
-  );
-  expect(snap.diagnostics).toHaveLength(1);
-  expect(snap.diagnostics[0]?.kind).toBe("ambiguous-dep-resolution");
-  expect(snap.diagnostics[0]?.consumer_epic).toBe("fn-1-foo");
-  expect(snap.diagnostics[0]?.upstream).toBe("fn-2");
-  expect(snap.diagnostics[0]?.matches).toEqual(["fn-2-aaa", "fn-2-zzz"]);
-});
-
-test("resolver: 2+ matches WITH unique same-project disambiguator → cwd-first wins, satisfied (no diagnostic)", () => {
-  // Two epics with `epic_number === 2`; one shares the consumer's
-  // `project_dir` basename. The resolver picks the same-project
-  // candidate, no diagnostic emitted.
-  const sameProj = makeEpic({
-    epic_id: "fn-2-here",
-    epic_number: 2,
-    project_dir: "/Users/mike/code/keeper",
-    status: "done",
-    approval: "approved",
-    tasks: [],
-  });
-  const otherProj = makeEpic({
-    epic_id: "fn-2-there",
-    epic_number: 2,
-    project_dir: "/Users/mike/code/arthack",
-    tasks: [],
-  });
-  const consumer = makeEpic({
-    epic_id: "fn-1-foo",
-    epic_number: 1,
-    project_dir: "/Users/mike/code/keeper",
-    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
-    depends_on_epics: ["fn-2"],
-  });
-  const snap = run([sameProj, otherProj, consumer]);
+  const snap = run([consumer]);
   expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
-  expect(snap.diagnostics).toEqual([]);
+});
+
+test("predicate 9: first non-satisfied entry wins (source-order traversal)", () => {
+  // Two deps: the first `satisfied`, the second `blocked-incomplete`.
+  // Predicate 9 walks in projection source order and reports the FIRST
+  // non-satisfied entry — second one wins.
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2-bar", "fn-3-baz"],
+    resolved_epic_deps: [
+      makeResolvedDep({
+        dep_token: "fn-2-bar",
+        resolved_epic_id: "fn-2-bar",
+        epic_number: 2,
+        project_basename: "repo",
+        cross_project: false,
+        state: "satisfied",
+      }),
+      makeResolvedDep({
+        dep_token: "fn-3-baz",
+        resolved_epic_id: "fn-3-baz",
+        epic_number: 3,
+        project_basename: "repo",
+        cross_project: false,
+        state: "blocked-incomplete",
+      }),
+    ],
+  });
+  const snap = run([consumer]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({
+      kind: "dep-on-epic",
+      upstream: "fn-3-baz",
+      cross_project: null,
+    }),
+  );
 });
 
 test("formatPill defaults to [blocked:unknown] for the unknown reason", () => {

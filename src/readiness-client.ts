@@ -127,16 +127,6 @@ const QUERY_TIMEOUT_MS = 5000;
  */
 export interface ReadinessClientSnapshot {
   readonly epics: Epic[];
-  /**
-   * fn-637: completed upstream epics (`status==="done" && approval==="approved"`)
-   * read on a scoped, resolver-only subscription. These are pruned from the
-   * default-visible `epics` page, so a downstream epic that depends on one
-   * would otherwise resolve it as `dep-on-epic-dangling`. Consumers merge this
-   * set into their dep-resolver indexes ONLY (never the rendered/iterated epic
-   * list) — see `renderEpicsBody` in `scripts/board.ts` and the `completedEpics`
-   * param of `computeReadiness`.
-   */
-  readonly completedEpics: Epic[];
   readonly jobs: Map<string, Job>;
   readonly subagentInvocations: SubagentInvocation[];
   readonly gitStatus: GitStatus[];
@@ -994,7 +984,6 @@ export function subscribeReadiness(
   const connect = opts.connect ?? defaultConnect;
 
   const epicsSubId = `${idPrefix}-epics`;
-  const completedEpicsSubId = `${idPrefix}-completed-epics`;
   const jobsSubId = `${idPrefix}-jobs`;
   const subsSubId = `${idPrefix}-subagent-invocations`;
   const gitSubId = `${idPrefix}-git`;
@@ -1003,21 +992,6 @@ export function subscribeReadiness(
     collection: "epics",
     id: epicsSubId,
     limit: EPICS_PAGE_LIMIT,
-  });
-  // fn-637: scoped resolver-only read of the completed (done+approved) epics
-  // pruned from the default-visible `epics` page. The non-empty `filter`
-  // suppresses the server's `default_visible=1` defaultClause, so this returns
-  // exactly the completed set. `limit: 0` is the "no limit" sentinel — these
-  // rows are thin and change rarely, and the resolver needs whichever one a
-  // downstream dep happens to reference. Fed ONLY into the dep-resolver indexes
-  // (never rendered or verdict-evaluated) so a satisfied dependency on a
-  // completed upstream resolves green instead of false `dep-on-epic-dangling`.
-  const completedEpics = makeState("epics", completedEpicsSubId, "epic_id", {
-    type: "query",
-    collection: "epics",
-    id: completedEpicsSubId,
-    limit: 0,
-    filter: { status: "done", approval: "approved" },
   });
   const jobs = makeState("jobs", jobsSubId, "job_id", {
     type: "query",
@@ -1067,7 +1041,6 @@ export function subscribeReadiness(
   });
   const states: CollectionState[] = [
     epics,
-    completedEpics,
     jobs,
     subagentInvocations,
     gitStatus,
@@ -1076,7 +1049,6 @@ export function subscribeReadiness(
   function emitSnapshotIfReady(): void {
     if (
       !epics.gotResult ||
-      !completedEpics.gotResult ||
       !jobs.gotResult ||
       !subagentInvocations.gotResult ||
       !gitStatus.gotResult
@@ -1088,13 +1060,6 @@ export function subscribeReadiness(
     // (decoded by `decodeRow` on the server side).
     const epicsTyped = epics.order.map(
       (id) => (epics.byId.get(id) ?? { [epics.pk]: id }) as unknown as Epic,
-    );
-    // fn-637: completed (done+approved) upstreams for the dep resolver only.
-    const completedEpicsTyped = completedEpics.order.map(
-      (id) =>
-        (completedEpics.byId.get(id) ?? {
-          [completedEpics.pk]: id,
-        }) as unknown as Epic,
     );
     const jobsTyped = new Map<string, Job>();
     for (const [id, row] of jobs.byId) {
@@ -1184,7 +1149,6 @@ export function subscribeReadiness(
       jobsTyped,
       subsForReadiness,
       gitStatusByProjectDir,
-      completedEpicsTyped,
       // fn-638.4: caller-injected reference timestamp (unix seconds) for
       // the `sub-agent-stale` `RunningReason` variant. The pure readiness
       // pass never reads `Date.now()`; the live client supplies it here,
@@ -1200,7 +1164,6 @@ export function subscribeReadiness(
     // which had no try/catch around its emit either.
     onSnapshot({
       epics: epicsTyped,
-      completedEpics: completedEpicsTyped,
       jobs: jobsTyped,
       subagentInvocations: subsTyped,
       gitStatus: gitTyped,

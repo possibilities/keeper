@@ -335,15 +335,6 @@ export function computeReadiness(
     string,
     { dirty_count: number; unattributed_to_live_count: number }
   > = new Map(),
-  // fn-637: completed upstream epics (`status==="done" && approval==="approved"`)
-  // that have been pruned from the default-visible page and so are absent from
-  // `epics`. Supplied via a scoped resolver-only read (see `subscribeReadiness`).
-  // Merged into the `epicById`/`epicsByNumber` resolver indexes ONLY — never
-  // into the verdict/mutex iteration — so predicate 9 resolves a satisfied
-  // cross-epic dependency to `found` (completed) instead of falsely reporting
-  // `dep-on-epic-dangling`. Defaults to empty so existing callers/tests that
-  // don't subscribe to the completed set keep the pre-fix behavior.
-  completedEpics: Iterable<Epic> = [],
   // fn-638.4: caller-injected reference timestamp (unix seconds) for the
   // `sub-agent-stale` `RunningReason` variant — a still-`running` sub-agent
   // invocation whose `ts` is older than `now - SUBAGENT_STALENESS_SEC`
@@ -354,10 +345,7 @@ export function computeReadiness(
   // `Math.floor(Date.now()/1000)` per snapshot. The autopilot simulator and
   // hand-rolled tests that don't model running sub-agents pass the default
   // `Number.NEGATIVE_INFINITY` so the staleness branch can never fire for
-  // them (`-Infinity - inv.ts > threshold` is always false). Held as a
-  // separate parameter from `completedEpics`' wall-clock so the two pure
-  // surfaces stay independently overridable — a test exercising staleness
-  // doesn't need to also supply completed epics, and vice versa. This is a
+  // them (`-Infinity - inv.ts > threshold` is always false). This is a
   // CLIENT computation distinct from the reducer fold (the bounded Stop
   // guard at `src/reducer.ts:MAX_STOP_YIELD_GAP_SEC` does the WORK of
   // releasing the worker; this predicate does the VISIBILITY work of
@@ -383,60 +371,29 @@ export function computeReadiness(
   // Build a tasks-by-id index spanning every epic, so cross-epic
   // `depends_on` lookups (rare but possible per spec) hit O(1).
   //
-  // Parallel `epicById` + `epicsByNumber` indexes feed predicate 9's
-  // cwd-then-global resolver (see {@link resolveEpicDep}). `epicById`
-  // resolves full ids (`fn-100-foo`); `epicsByNumber` resolves bare
-  // `fn-N` ids that may match multiple epics across configured project
-  // roots — the resolver's same-project preference picks the consumer's
-  // root when multiple candidates exist, falls through to a dangling
-  // verdict + diagnostic when no candidate disambiguates.
+  // fn-637.4: the parallel `epicById` + `epicsByNumber` indexes are gone.
+  // Predicate 9 now reads `epic.resolved_epic_deps` (schema-v34 projection,
+  // maintained by the reducer's forward-stamp + reverse fan-out), so the
+  // readiness pass no longer resolves cross-epic deps live.
   const taskById = new Map<string, Task>();
-  const epicById = new Map<string, Epic>();
-  const epicsByNumber = new Map<number, Epic[]>();
   const epicsArr: Epic[] = [];
   for (const epic of epics) {
     epicsArr.push(epic);
-    epicById.set(epic.epic_id, epic);
-    if (typeof epic.epic_number === "number") {
-      const arr = epicsByNumber.get(epic.epic_number);
-      if (arr === undefined) {
-        epicsByNumber.set(epic.epic_number, [epic]);
-      } else {
-        arr.push(epic);
-      }
-    }
     for (const task of epic.tasks) {
       taskById.set(task.task_id, task);
-    }
-  }
-
-  // fn-637: merge the completed-epics resolver index. These are done+approved
-  // upstreams pruned from the default-visible page; they reach us via a scoped
-  // read and are added to `epicById`/`epicsByNumber` ONLY — never to `epicsArr`
-  // or `taskById` — so the per-task / close-row / mutex passes stay scoped to
-  // the default-visible set exactly as before. The `epicById.has` guard makes
-  // the merge a no-op for any epic already in the live set (the two sets are
-  // disjoint by construction — `default_visible=1` vs the done+approved
-  // supplemental filter — but the guard also prevents a transient
-  // double-delivery from creating a phantom same-number bare-id ambiguity).
-  for (const epic of completedEpics) {
-    if (epicById.has(epic.epic_id)) {
-      continue;
-    }
-    epicById.set(epic.epic_id, epic);
-    if (typeof epic.epic_number === "number") {
-      const arr = epicsByNumber.get(epic.epic_number);
-      if (arr === undefined) {
-        epicsByNumber.set(epic.epic_number, [epic]);
-      } else {
-        arr.push(epic);
-      }
     }
   }
 
   const perTask = new Map<string, Verdict>();
   const perCloseRow = new Map<string, Verdict>();
   const perEpic = new Map<string, Verdict>();
+  // fn-637.4: the readiness pass no longer resolves cross-epic deps live, so
+  // there's no ambiguity-diagnostic surface here anymore. The reducer's
+  // fold-time `enrichEpicDep` invocation owns ambiguity emission; this slot
+  // remains in the snapshot for the public `ReadinessSnapshot` contract
+  // (`scripts/board.ts` / `scripts/autopilot.ts` drain `diagnostics` per
+  // snapshot via `appendDiagnostic`) and stays empty under the projection
+  // cutover.
   const diagnostics: ResolutionDiagnostic[] = [];
 
   for (const epic of epicsArr) {
@@ -454,9 +411,6 @@ export function computeReadiness(
         perTask,
         perCloseRow,
         gitStatusByProjectDir,
-        epicById,
-        epicsByNumber,
-        diagnostics,
         now,
       );
       perTask.set(task.task_id, verdict);
@@ -503,16 +457,17 @@ function evaluateTask(
   _jobs: Map<string, Job>,
   subRunningByJobId: Map<string, SubagentInvocation[]>,
   perTask: Map<string, Verdict>,
-  // perCloseRow IS used by predicate 9's tolerant forward-ref evaluator —
-  // see the predicate's body for the rationale.
-  perCloseRow: Map<string, Verdict>,
+  // perCloseRow used to be consulted by predicate 9's tolerant
+  // forward-ref evaluator. fn-637.4 replaced the live resolve with a
+  // read off `epic.resolved_epic_deps`, so predicate 9 no longer
+  // touches `perCloseRow` — the param remains in the signature for
+  // call-site symmetry with `evaluateCloseRow` and the
+  // post-pass mutex helpers.
+  _perCloseRow: Map<string, Verdict>,
   gitStatusByProjectDir: Map<
     string,
     { dirty_count: number; unattributed_to_live_count: number }
   >,
-  epicById: Map<string, Epic>,
-  epicsByNumber: Map<number, Epic[]>,
-  diagnostics: ResolutionDiagnostic[],
   // fn-638.4: caller-injected reference timestamp (unix seconds) for the
   // sub-agent staleness check at predicate 6. See `computeReadiness`'s
   // `now` doc for the determinism rationale.
@@ -660,75 +615,55 @@ function evaluateTask(
   }
 
   // 9. dep-on-epic — task-side rollup of the parent epic's dep list.
-  // fn-635: cwd-then-global resolver via {@link resolveEpicDep}. Each
-  // `depends_on_epics` entry is classified as a full id (`fn-100-foo`)
-  // or a bare id (`fn-100`); full ids look up `epicById`, bare ids look
-  // up `epicsByNumber` and prefer the consumer's own `project_dir` on
-  // multi-match. Three resolver outcomes:
+  // Reads `epic.resolved_epic_deps` (the schema-v34 projection
+  // maintained by the reducer's fn-637.3 forward stamp + reverse
+  // fan-out). Each entry is a {@link ResolvedEpicDep} carrying the
+  // resolved upstream + a tri-state `state` field:
   //
-  //   - `dangling` — the upstream id has no entry in `epicById` AND no
-  //     bare match in `epicsByNumber` (full-id miss or bare-id miss),
-  //     OR 2+ matches with no same-project disambiguator. Emit
-  //     `dep-on-epic-dangling` (red pill). The ambiguity case also
-  //     pushes a `ResolutionDiagnostic` onto the snapshot's diagnostics
-  //     array; the dangling-via-miss cases do NOT — they're the normal
-  //     "upstream genuinely unknown" signal and a JSONL log line per
-  //     frame per dangling dep would flood the channel.
-  //   - `found` — the resolver returned the upstream epic + a
-  //     cross-project flag (basenames of consumer + upstream
-  //     `project_dir` differ). Evaluate the upstream's close verdict:
-  //       - `perCloseRow` has the verdict AND it's `completed` →
-  //         satisfied, skip.
-  //       - `perCloseRow` has the verdict AND it's non-completed →
-  //         `dep-on-epic` (amber), carrying the resolved full id and
-  //         the cross-project provenance for the renderer.
-  //       - `perCloseRow` is missing (forward-ref in iteration order,
-  //         rare) → tolerant: treat as satisfied. The upstream IS in
-  //         `epicById` so it's not dangling; the close-row verdict will
-  //         catch up on a subsequent snapshot fold.
+  //   - `satisfied` — upstream is `status==="done" && approval==="approved"`;
+  //     dependency met. Skip.
+  //   - `blocked-incomplete` — upstream resolved but NOT done-and-approved.
+  //     Emit `dep-on-epic` (amber), carrying the resolved upstream id and the
+  //     cross-project basename when `cross_project === true`. Same payload
+  //     shape autopilot's BlockReason consumer reads byte-for-byte.
+  //   - `dangling` — no resolution possible (full-id miss, bare-id miss, or
+  //     2+ matches with no same-project disambiguator). Emit
+  //     `dep-on-epic-dangling` (red pill) carrying the raw `dep_token`.
   //
-  // The discriminated `cross_project` payload field is null for
-  // intra-project deps; the literal upstream id stays on `upstream` so
-  // downstream consumers (autopilot, board) can re-look-up without
-  // re-parsing the prefix.
-  for (const upstreamEpic of epic.depends_on_epics) {
-    const resolved = resolveEpicDep(
-      upstreamEpic,
-      epic,
-      epicById,
-      epicsByNumber,
-      diagnostics,
-    );
-    if (resolved.kind === "dangling") {
-      return {
-        tag: "blocked",
-        reason: { kind: "dep-on-epic-dangling", upstream: upstreamEpic },
-      };
-    }
-    if (resolved.completed) {
-      // fn-637: the upstream is done+approved. It has fallen out of the
-      // default-visible page (`default_visible=0`) and reached the resolver
-      // only via the completed-epics index, so it has no `perCloseRow`
-      // verdict — skip without consulting it. Without this branch the
-      // upstream's absence from the live index produced a false
-      // `dep-on-epic-dangling` block the instant it completed.
-      continue;
-    }
-    const upstreamClose = perCloseRow.get(resolved.epic.epic_id);
-    if (upstreamClose === undefined) {
-      // Tolerant forward-ref: upstream IS known (resolved), just hasn't
-      // had its close-row verdict computed yet in this iteration. Treat
-      // as satisfied; preserves the legacy "rare in-snapshot forward
-      // case still flows" handwave.
-      continue;
-    }
-    if (upstreamClose.tag !== "completed") {
+  // `null` short-circuits the loop — a fresh-row "not yet computed" state
+  // (see {@link Epic.resolved_epic_deps}). The reducer stamps the column
+  // synchronously inside the same fold as the EpicSnapshot write, so the
+  // null window only spans a single in-flight migration; production reads
+  // always see `[]` or a populated array.
+  //
+  // The fn-637 cutover deleted the prior live-resolve loop (and its
+  // `epicById`/`epicsByNumber` indexes, ambiguity diagnostics, tolerant
+  // forward-ref handling). Diagnostics still flow off the reducer's
+  // fold-time resolver invocation, surfaced via the side-band JSONL log
+  // (`~/.local/state/keeper/readiness-diagnostics.jsonl`).
+  if (epic.resolved_epic_deps !== null) {
+    for (const dep of epic.resolved_epic_deps) {
+      if (dep.state === "satisfied") {
+        continue;
+      }
+      if (dep.state === "dangling") {
+        return {
+          tag: "blocked",
+          reason: { kind: "dep-on-epic-dangling", upstream: dep.dep_token },
+        };
+      }
+      // blocked-incomplete: emit `dep-on-epic`. Carry the resolved
+      // upstream id (non-null when state is `blocked-incomplete`) and
+      // reconstruct the readiness-side `cross_project: string | null`
+      // shape from the projection's boolean + basename pair: when
+      // cross-project, the basename is non-null and is carried as the
+      // prefix; same-project deps carry `null`.
       return {
         tag: "blocked",
         reason: {
           kind: "dep-on-epic",
-          upstream: resolved.epic.epic_id,
-          cross_project: resolved.cross_project,
+          upstream: dep.resolved_epic_id ?? dep.dep_token,
+          cross_project: dep.cross_project ? dep.project_basename : null,
         },
       };
     }

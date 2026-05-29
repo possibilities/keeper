@@ -80,7 +80,7 @@ import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveSockPath } from "../src/db";
-import { type EpicDepResolution, resolveEpicDep } from "../src/epic-deps";
+import type { EpicDepResolution } from "../src/epic-deps";
 import { createLiveShell } from "../src/live-shell";
 import { formatPill, type Verdict } from "../src/readiness";
 import {
@@ -89,7 +89,12 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import { appendDiagnostic } from "../src/readiness-diagnostics";
-import type { Epic, JobLinkEntry, SubagentInvocation } from "../src/types";
+import type {
+  Epic,
+  JobLinkEntry,
+  ResolvedEpicDep,
+  SubagentInvocation,
+} from "../src/types";
 
 const HELP = `keeper-board — combined epics + jobs UI over the keeper subscribe server
 
@@ -461,6 +466,61 @@ export function renderEpicDepPills(
 }
 
 /**
+ * fn-637.4: projection-driven counterpart to {@link renderEpicDepPills}.
+ * Reads the schema-v34 `resolved_epic_deps` array (the reducer's forward-
+ * stamp output) and assembles the same three render shapes — `#N`,
+ * `<project>::#N`, `?#N` — without invoking the resolver live. The board
+ * pill and predicate 9 in `src/readiness.ts` consume the same projection,
+ * so they cannot drift on what an entry resolves to.
+ *
+ * Per-entry render rules (identical surface to {@link renderEpicDepPills}):
+ *   - `state === "dangling"` → `?#N` when `dep_token` parses to a number,
+ *     dropped otherwise (the well-formed-but-numberless case maps to no
+ *     pill, mirroring the legacy renderer).
+ *   - `state === "satisfied" | "blocked-incomplete"` + `cross_project === false`
+ *     → `#N` (intra-project; `epic_number` is non-null for resolved entries).
+ *   - `state === "satisfied" | "blocked-incomplete"` + `cross_project === true`
+ *     → `<project_basename>::#N` (cross-project prefix; basename is non-null
+ *     for resolved entries).
+ *
+ * A resolved entry whose `epic_number` is somehow null (defensive: should
+ * not happen given the reducer's invariants) is dropped, matching the
+ * legacy behavior bit-for-bit.
+ */
+export function renderEpicDepPillsFromProjection(
+  deps: ReadonlyArray<ResolvedEpicDep>,
+): string[] {
+  const refs: string[] = [];
+  for (const dep of deps) {
+    if (dep.state === "dangling") {
+      const num = epicNumFromIdOrBare(dep.dep_token);
+      if (num !== null) {
+        refs.push(`?#${num}`);
+      }
+      continue;
+    }
+    const resolvedNum = dep.epic_number;
+    if (typeof resolvedNum !== "number") {
+      continue;
+    }
+    if (!dep.cross_project) {
+      refs.push(`#${resolvedNum}`);
+    } else {
+      // `cross_project === true` implies a non-null `project_basename` (the
+      // reducer's `enrichEpicDep` only sets the boolean when basenames
+      // differ — both non-empty by construction). Guard once and drop the
+      // pill on the impossible-null fallback to keep the renderer total.
+      const basename = dep.project_basename;
+      if (basename === null) {
+        continue;
+      }
+      refs.push(`${basename}::#${resolvedNum}`);
+    }
+  }
+  return refs;
+}
+
+/**
  * ANSI SGR sequences for the pill palette. Five semantic buckets keyed off
  * exact pill strings (plus `blocked:*`, `failed:*`, and `awaiting:*`
  * prefix fallbacks) so the colorizer stays purely string-driven — no
@@ -795,9 +855,6 @@ async function main(): Promise<void> {
     snap: ReadinessClientSnapshot,
     subagentIndex: Map<string, SubagentInvocation[]>,
     epicIds: Set<string>,
-    epicsList: Epic[],
-    epicById: Map<string, Epic>,
-    epicsByNumber: Map<number, Epic[]>,
     row: Record<string, unknown>,
   ): string {
     const dir =
@@ -806,27 +863,32 @@ async function main(): Promise<void> {
     const epicDeps = Array.isArray(row.depends_on_epics)
       ? row.depends_on_epics
       : [];
-    // fn-635: summary pill uses the shared `resolveEpicDep` so the
-    // summary and the row pill agree on every dep's resolution. Three
-    // render shapes:
-    //   - intra-project resolved → `[#N]`
-    //   - cross-project resolved → `[<project>::#N]`
-    //   - dangling (full-id miss, bare-id miss, ambiguous-no-disambig)
-    //     → `[?#N]` when the id is well-formed enough to extract N,
-    //     dropped when it isn't.
-    // Predicates 9's resolver may emit diagnostics; we pass a throwaway
-    // diagnostic sink here because the canonical diagnostics drain is
-    // driven by `snap.readiness.diagnostics` (already populated by
-    // `computeReadiness` in the helper). Keeping a separate sink avoids
-    // double-emitting on every render tick.
-    const consumerEpic = epicsList.find(
-      (e) => e.epic_id === String(row.epic_id),
-    );
+    // fn-637.4: summary pill reads `row.resolved_epic_deps` — the schema-v34
+    // projection maintained by the reducer's forward-stamp + reverse fan-out.
+    // The board pill and predicate 9 share the same source of truth, so they
+    // cannot drift. Three render shapes (identical to the pre-cutover live
+    // resolver branches):
+    //   - `satisfied` / `blocked-incomplete` + `cross_project === false` →
+    //     `[#N]` intra-project
+    //   - `satisfied` / `blocked-incomplete` + `cross_project === true` →
+    //     `[<project_basename>::#N]` cross-project
+    //   - `dangling` → `[?#N]` when the raw `dep_token` parses to a
+    //     number, dropped when it doesn't.
+    // The fn-637 `completedEpics` merge / resolver-only subscription is gone
+    // — completed upstreams already resolved into `state === "satisfied"`
+    // entries at fold time when the consumer's row was last stamped.
+    const resolvedDeps = Array.isArray(row.resolved_epic_deps)
+      ? (row.resolved_epic_deps as ResolvedEpicDep[])
+      : [];
     let epicDepRefs: string[];
-    if (consumerEpic === undefined) {
-      // Defensive: if the consumer epic shape isn't recoverable, fall
-      // through to the legacy `<name>#<number>` render so the line
-      // stays informative even on a malformed input.
+    if (resolvedDeps.length > 0) {
+      epicDepRefs = renderEpicDepPillsFromProjection(resolvedDeps);
+    } else {
+      // No projection entries (either `depends_on_epics` is empty, or the
+      // row landed before the schema-v34 reducer stamped it — `null`
+      // sentinel). Fall back to the legacy `<name>#<number>` render off
+      // the raw `depends_on_epics` array so the line stays informative
+      // during the migration window.
       epicDepRefs = [];
       for (const d of epicDeps) {
         const legacy = epicDepRefFromId(String(d));
@@ -834,27 +896,6 @@ async function main(): Promise<void> {
           epicDepRefs.push(legacy);
         }
       }
-    } else {
-      epicDepRefs = renderEpicDepPills(
-        epicDeps.map((d) => String(d)),
-        (depStr) =>
-          resolveEpicDep(
-            depStr,
-            consumerEpic,
-            epicById,
-            epicsByNumber,
-            [],
-            // Wall-clock injection. The diagnostics sink here is a
-            // throwaway (`[]`) — the canonical drain runs through
-            // `snap.readiness.diagnostics` populated by
-            // `computeReadiness` — so the timestamp would never
-            // surface, but the leaf signature requires it. Keep the
-            // `new Date()` here so the board renderer never grows a
-            // fold-determinism constraint; only the reducer caller
-            // (fn-637.3) passes an event-derived ts.
-            new Date().toISOString(),
-          ),
-      );
     }
     const epicDepsSeg =
       epicDepRefs.length === 0 ? "" : ` [${epicDepRefs.join(",")}]`;
@@ -919,56 +960,17 @@ async function main(): Promise<void> {
       return "";
     }
     const epicIds = new Set(snap.epics.map((e) => String(e.epic_id)));
-    // fn-635: build the same `epicById` + `epicsByNumber` indexes the
-    // shared `resolveEpicDep` needs, once per frame. Mirrors the index
-    // shape `computeReadiness` builds — kept structurally parallel so a
-    // future planctl-side change to the cwd-then-global semantic flows
-    // through both the readiness pipeline and the board renderer
-    // identically.
+    // fn-637.4: the `epicById` + `epicsByNumber` resolver indexes and the
+    // completed-epics merge are gone. The summary pill reads each row's
+    // `resolved_epic_deps` projection directly (see `renderEpicBlock`), so
+    // the renderer doesn't need a cross-epic lookup index anymore.
     const epicsList = snap.epics as Epic[];
-    const epicById = new Map<string, Epic>();
-    const epicsByNumber = new Map<number, Epic[]>();
-    for (const epic of epicsList) {
-      epicById.set(epic.epic_id, epic);
-      if (typeof epic.epic_number === "number") {
-        const arr = epicsByNumber.get(epic.epic_number);
-        if (arr === undefined) {
-          epicsByNumber.set(epic.epic_number, [epic]);
-        } else {
-          arr.push(epic);
-        }
-      }
-    }
-    // fn-637: merge the completed (done+approved) upstreams into the resolver
-    // indexes ONLY — never into `epicsList`. These epics are pruned from the
-    // default-visible page, so without them the summary pill would resolve a
-    // satisfied cross-epic dep to the false `[?#N]` dangling form. The merge +
-    // `epicById.has` guard mirror `computeReadiness`'s completed-epics merge
-    // exactly so the summary pill and predicate 9 never disagree. The rendered
-    // epic list stays the default-visible set (`epicsList`).
-    for (const epic of snap.completedEpics as Epic[]) {
-      if (epicById.has(epic.epic_id)) {
-        continue;
-      }
-      epicById.set(epic.epic_id, epic);
-      if (typeof epic.epic_number === "number") {
-        const arr = epicsByNumber.get(epic.epic_number);
-        if (arr === undefined) {
-          epicsByNumber.set(epic.epic_number, [epic]);
-        } else {
-          arr.push(epic);
-        }
-      }
-    }
     return epicsList
       .map((e) =>
         renderEpicBlock(
           snap,
           subagentIndex,
           epicIds,
-          epicsList,
-          epicById,
-          epicsByNumber,
           e as unknown as Record<string, unknown>,
         ),
       )

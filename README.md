@@ -694,6 +694,44 @@ stay NULL until the first rate_limit lands), and the dual-case
 `COALESCE(config_dir,'')` expression as the seed so a NULL-config session's
 rate limit lands on the exact `''` row it seeded (worker count unchanged
 — no new producer thread; the fan-outs ride the existing reducer arms).
+As of schema v34 (fn-637), the `epics` projection adds
+`resolved_epic_deps` (a nullable JSON-TEXT array — `null` for
+not-yet-computed, `[]` for computed-no-deps, populated for resolved
+entries) carrying the enriched, resolved state of each token in the
+consumer epic's `depends_on_epics`: per-entry
+`{dep_token, resolved_epic_id, epic_number, project_basename,
+cross_project, state}` where `state` is the tri-state
+`satisfied | blocked-incomplete | dangling`. A companion
+`epic_dep_edges (consumer_id, dep_token)` reverse-index table keys every
+raw token off the consumer's source array. Both are maintained by the
+reducer's schema-v34 `syncResolvedEpicDeps` forward-stamp + reverse
+fan-out inside the same `BEGIN IMMEDIATE` as the triggering
+`EpicSnapshot` / `EpicDeleted` fold: the forward pass rebuilds the
+consumer's `epic_dep_edges` rows from scratch and stamps
+`resolved_epic_deps` using the shared `epic-deps#resolveEpicDep` (no
+fold-time wall clock — the event's own `ts` is injected for the
+diagnostic timestamp), and the reverse pass picks every downstream
+consumer whose raw tokens could match the just-written upstream (via
+`SELECT consumer_id FROM epic_dep_edges WHERE dep_token IN (B.epic_id,
+"fn-" || B.epic_number)` — the indexed reverse lookup, never a
+`json_each` scan) and re-stamps each one's `resolved_epic_deps` from
+scratch. End-to-end: completing (done+approved) an upstream re-stamps
+every downstream consumer's entries to `satisfied` in the SAME fold,
+and a bare-id ambiguity disambiguates as soon as a new same-number
+epic lands. The readiness/board READ surface is fully projection-driven
+— predicate 9 in `src/readiness.ts` and the board summary pill in
+`scripts/board.ts` consume `epic.resolved_epic_deps` directly (the
+prior fn-637 stopgap that streamed completed (done+approved) epics over
+a resolver-only subscription so the live readiness pass could see them
+is gone — `subscribeReadiness` is back to four collections, predicate 9
+no longer calls `resolveEpicDep`, and the `BlockReason` surface
+autopilot consumes — `dep-on-epic` with `cross_project`,
+`dep-on-epic-dangling` — is byte-for-byte preserved off the projection
+shape). The `EpicSnapshot` ON CONFLICT carve-out widens to include
+`resolved_epic_deps` alongside `tasks` / `jobs` / `job_links` /
+`created_by_closer_of` / `sort_path` / `queue_jump` so a file-content
+re-observation (e.g. an approval-RPC round-trip) can't wipe the
+projection-derived dep resolution.
 As of schema v25, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `last_api_error_at` /
 `last_api_error_kind` / `last_input_request_at` /

@@ -148,15 +148,38 @@ the native value" is the default.
   The schema v30 ALTER adds `queue_jump INTEGER NOT NULL DEFAULT 0` to
   `epics`; the `EpicSnapshot` ON CONFLICT carve-out adds `queue_jump`
   to the file-content-snapshot UPDATE-omit list alongside `tasks` /
-  `jobs` / `job_links` / `created_by_closer_of` / `sort_path`, so
-  envelope-derived state is never stomped by a re-observed snapshot. The producer workers feed
+  `jobs` / `job_links` / `created_by_closer_of` / `sort_path` /
+  `resolved_epic_deps` (schema v34 / fn-637.3 — see the
+  `syncResolvedEpicDeps` fan-out below), so envelope-derived state is
+  never stomped by a re-observed snapshot. AND the schema-v34 (fn-637.3)
+  `syncResolvedEpicDeps` forward stamp + reverse fan-out: each
+  `EpicSnapshot` rebuilds the consumer's `epic_dep_edges` rows (the
+  raw-token reverse index keyed on `(consumer_id, dep_token)`) and
+  stamps the enriched `resolved_epic_deps` JSON array on the consumer's
+  `epics` row, then runs the reverse pass — `SELECT consumer_id FROM
+  epic_dep_edges WHERE dep_token IN (B.epic_id, "fn-" || B.epic_number)`
+  picks every downstream consumer whose raw-token entries could match
+  upstream `B`, and re-stamps each one's `resolved_epic_deps` from
+  scratch against the post-write `epics` index — so a completing
+  upstream's downstream consumers flip from `blocked-incomplete` to
+  `satisfied` in the SAME fold, and a bare-id ambiguity disambiguates
+  as soon as a new same-number epic lands. `EpicDeleted` fires the same
+  reverse pass against the deleted upstream's raw tokens so a deleted
+  epic re-stamps downstream consumers as `dangling`. The resolver is the
+  same `epic-deps#resolveEpicDep` the readiness side runs (no fold-time
+  wall-clock — the event's own `ts` is injected for the diagnostic
+  timestamp), and the readiness/board read side is fully projection-
+  driven (predicate 9 in `src/readiness.ts` and the board summary pill
+  in `scripts/board.ts` read `epic.resolved_epic_deps` directly; no live
+  resolver call on the read path). The producer workers feed
   the log only via main's writable connection; they never write the DB.
   Synthetic events covered by this rule: `TranscriptTitle` (transcript
   worker), `EpicSnapshot` / `TaskSnapshot` / `EpicDeleted` / `TaskDeleted`
   (plan worker — these now carry `approval` round-tripped from the file;
-  the `EpicSnapshot` ON CONFLICT clause carves out `job_links` alongside
-  the existing `tasks` / `jobs` carve-outs so an approval-RPC round-trip
-  cannot wipe the link projection), `Killed` (boot seed sweep + live
+  the `EpicSnapshot` ON CONFLICT clause carves out `job_links` +
+  `resolved_epic_deps` alongside the existing `tasks` / `jobs` carve-outs
+  so an approval-RPC round-trip cannot wipe the link projection or the
+  schema-v34 cross-epic dep resolution), `Killed` (boot seed sweep + live
   exit-watcher worker, gated by main's `(pid, start_time)` verifier before
   insert), `GitSnapshot` / `GitRootDropped` / `Commit` (git worker — the
   schema-v31 file-centric `GitSnapshot` payload carries per-file
