@@ -19,7 +19,7 @@
  */
 
 import { expect, test } from "bun:test";
-import { renderRowLines } from "../scripts/usage";
+import { renderRowLines, renderSessionLines } from "../scripts/usage";
 
 // Fixed reference clock: 2025-01-15T12:00:00.000Z.
 const NOW_MS = Date.parse("2025-01-15T12:00:00.000Z");
@@ -613,4 +613,105 @@ test("renders 'now' at the round boundary for the rate-limit cell", () => {
   );
   const row = bodyLineExact(lines, "rate-limited") as string;
   expect(row).toMatch(/ now$/);
+});
+
+// ---------------------------------------------------------------------------
+// renderSessionLines — the "recent sessions" log (schema v36, jobs.profile_name)
+// ---------------------------------------------------------------------------
+//
+// Consumes the `jobs` collection rows newest-first and renders one line per
+// job: `profile  id  title  state  <rel> ago`. `profile_name` rides the row
+// natively; a NULL/empty name renders as `(default)`. `created_at` is REAL
+// unix-SECONDS routed through `relTimeFromUnixSec`.
+
+/** A jobs row with the fields renderSessionLines reads. */
+function job(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    job_id: "abcdef0123",
+    profile_name: "multi-claude-3",
+    title: "some work",
+    state: "ended",
+    created_at: NOW_SEC - 120, // 2m ago
+    ...over,
+  };
+}
+
+test("empty job set renders no lines", () => {
+  expect(renderSessionLines([], NOW_MS)).toEqual([]);
+});
+
+test("labels each session with its profile and a 7-char short id", () => {
+  const lines = renderSessionLines(
+    [job({ job_id: "8449b0912ff", profile_name: "multi-claude-3" })],
+    NOW_MS,
+  );
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toContain("multi-claude-3");
+  expect(lines[0]).toContain("8449b09"); // sliced to 7
+  expect(lines[0]).not.toContain("8449b0912ff"); // full id not shown
+  expect(lines[0]).toMatch(/ 2m ago$/);
+});
+
+test("NULL or empty profile_name renders as (default)", () => {
+  const fromNull = renderSessionLines([job({ profile_name: null })], NOW_MS);
+  const fromEmpty = renderSessionLines([job({ profile_name: "" })], NOW_MS);
+  expect(fromNull[0]).toContain("(default)");
+  expect(fromEmpty[0]).toContain("(default)");
+});
+
+test("missing/empty title falls back to <untitled>", () => {
+  const fromNull = renderSessionLines([job({ title: null })], NOW_MS);
+  const fromEmpty = renderSessionLines([job({ title: "" })], NOW_MS);
+  expect(fromNull[0]).toContain("<untitled>");
+  expect(fromEmpty[0]).toContain("<untitled>");
+});
+
+test("long titles truncate with an ellipsis", () => {
+  const long = "x".repeat(80);
+  const lines = renderSessionLines([job({ title: long })], NOW_MS);
+  expect(lines[0]).toContain("…");
+  // Full 80-char title is not present verbatim.
+  expect(lines[0]).not.toContain(long);
+});
+
+test("includes terminal-state sessions (killed / ended) in the log", () => {
+  const lines = renderSessionLines(
+    [
+      job({ job_id: "a1", state: "killed" }),
+      job({ job_id: "b2", state: "ended" }),
+      job({ job_id: "c3", state: "working" }),
+    ],
+    NOW_MS,
+  );
+  expect(lines).toHaveLength(3);
+  expect(lines[0]).toContain("killed");
+  expect(lines[1]).toContain("ended");
+  expect(lines[2]).toContain("working");
+});
+
+test("columns align — profile/id/title/state padEnd to widest present", () => {
+  const lines = renderSessionLines(
+    [
+      job({ profile_name: "short", job_id: "aaa1", title: "t1" }),
+      job({ profile_name: "much-longer-profile", job_id: "bb2", title: "t2" }),
+    ],
+    NOW_MS,
+  );
+  // The short profile is right-padded to the wider profile's width, so the
+  // next column ("id") starts at the same offset on both lines (ids here are
+  // ≤7 chars so the short-id slice leaves them intact).
+  const idCol0 = lines[0].indexOf("aaa1");
+  const idCol1 = lines[1].indexOf("bb2");
+  expect(idCol0).toBe(idCol1);
+});
+
+test("change-gate insensitivity: rendered tail moves with the clock", () => {
+  // Same raw row, two different clocks → different rendered tails. This is the
+  // exact case the script's `jobsRowsHashKey` guards against forging a frame:
+  // the hash keys off raw `created_at`, not this rendered text.
+  const row = [job({ created_at: NOW_SEC - 120 })];
+  const at2m = renderSessionLines(row, NOW_MS);
+  const at1h = renderSessionLines(row, NOW_MS + 58 * 60_000);
+  expect(at2m[0]).toMatch(/ 2m ago$/);
+  expect(at1h[0]).toMatch(/ 1h ago$/);
 });

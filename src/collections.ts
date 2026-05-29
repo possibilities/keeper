@@ -116,6 +116,13 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // (display + readiness-predicate inputs only).
     "git_unattributed_to_live_count",
     "git_orphan_count",
+    // Schema v36: `profile_name` — the derived `projectBasename(config_dir)`
+    // stamped onto the row by the reducer's SessionStart fold (NULL when the
+    // session ran under the default `~/.claude` profile). Served for display
+    // (the usage surface's "recent sessions" log labels each job by profile);
+    // OUT of `sortable` / `filters` / `jsonColumns` (a scalar the renderer
+    // reads, never a sort/filter key).
+    "profile_name",
   ],
   pk: "job_id",
   version: "last_event_id",

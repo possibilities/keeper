@@ -1,12 +1,17 @@
 #!/usr/bin/env bun
 /**
- * keeper-usage — watch the keeperd `usage` collection as a single composed
- * frame.
+ * keeper-usage — watch the keeperd `usage` + `jobs` collections as a single
+ * composed frame.
  *
- * One `subscribeCollection` call drives one frame: each row renders as a
- * stacked block — a header line with the id chip + target/multiplier
- * chip, then one indented body line per quota window (session, week,
- * and sonnet where present). As of schema v35 (fn-642) the rate-limit
+ * Two `subscribeCollection` calls drive one composed frame. The `usage`
+ * stream renders the per-profile quota stacks (top); the `jobs` stream
+ * renders the `recent sessions` log (bottom — the last 20 jobs newest-first,
+ * each labeled with its `profile_name`). Either stream changing re-emits the
+ * whole frame; each is change-gated on its own raw-field hash, so a
+ * relative-time tick or a fetch-only refresh never forges a frame. Each
+ * usage row renders as a stacked block — a header line with the id chip +
+ * target/multiplier chip, then one indented body line per quota window
+ * (session, week, and sonnet where present). As of schema v35 (fn-642) the rate-limit
  * annotation is colocated onto the same `usage` row via
  * `last_rate_limit_at` + `last_rate_limit_session_id`, so a tracked
  * stack carries a `rate-limited <rel>` line under its quota lines when
@@ -78,7 +83,10 @@ the numeric pct and a bare relative reset time (\`5d 21h\` / \`1h 16m\`
 annotation (schema v35 / fn-642) gets a colocated \`rate-limited <rel>\`
 line under its quota lines; codex and never-limited stacks omit it.
 Untracked profiles (a rate-limit with no agentuse usage row) do not
-render. The live frame re-renders every 30s so countdowns tick;
+render. Below the profile stacks, a \`recent sessions\` block logs the
+last 20 jobs (any state) newest-first, each labeled with the profile
+it ran under (\`profile_name\`, schema v36) plus a short id, title,
+state, and age. The live frame re-renders every 30s so countdowns tick;
 historical scroll-back stays frozen at each frame's capture time.
 Per-frame sidecars under /tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*
 with an indexed meta sidecar; session paths print on SIGINT.
@@ -359,6 +367,88 @@ export function renderRowLines(
   return lines;
 }
 
+/** How many most-recent jobs the "recent sessions" log renders. */
+const SESSION_LOG_LIMIT = 20;
+/** Title truncation width for the session log (ellipsis included). */
+const SESSION_TITLE_MAX = 44;
+/** Label for a job that ran under the default `~/.claude` profile. */
+const DEFAULT_PROFILE_LABEL = "(default)";
+
+/**
+ * Render the `jobs`-collection rows into a "recent sessions" log — one line
+ * per job, newest first, labeling each with the profile it ran under:
+ *
+ *   multi-claude-3  8449dda  infer attribution for discharged dirty files  ended    1h 5m ago
+ *   multi-claude-3  23983ee  biome reflow of profiles backfill query        ended    2h ago
+ *   (default)       9z8y7x1  <untitled>                                     killed   3h 12m ago
+ *
+ * `profile_name` rides the row natively (schema v36) — the reducer's
+ * SessionStart fold stamps `projectBasename(config_dir)`, NULL when the
+ * session ran under the default profile, so the renderer needs no join. A
+ * NULL/empty name renders as {@link DEFAULT_PROFILE_LABEL}. Columns padEnd to
+ * the widest value ACTUALLY present across the row set (profile / short id /
+ * title / state), and the relative-time tail floats after the state column
+ * with a two-space gap.
+ *
+ * `job_id` is sliced to 7 chars (a git-style short id); `title` falls back to
+ * `<untitled>` and truncates to {@link SESSION_TITLE_MAX}. `created_at` is
+ * REAL unix-SECONDS (matching `relTimeFromUnixSec`), so every session — being
+ * in the past — renders an `<rel> ago` tail. `nowMs` is a parameter (not
+ * `Date.now()` baked in) so the 30s tick and tests can drive a deterministic
+ * clock without the renderer doing any wall-clock IO of its own — and so the
+ * change-gate (which hashes the RAW `created_at`, never this rendered tail)
+ * stays insensitive to minute-boundary bleed.
+ */
+export function renderSessionLines(
+  jobs: Record<string, unknown>[],
+  nowMs: number,
+): string[] {
+  if (jobs.length === 0) return [];
+
+  interface SessionCell {
+    profile: string;
+    id: string;
+    title: string;
+    state: string;
+    rel: string;
+  }
+
+  const cells: SessionCell[] = jobs.map((job) => {
+    const pn = job.profile_name;
+    const profile =
+      pn == null || pn === "" ? DEFAULT_PROFILE_LABEL : String(pn);
+    const idRaw = seg(job.job_id);
+    const id = idRaw.length > 7 ? idRaw.slice(0, 7) : idRaw;
+    const titleRaw = seg(job.title);
+    const titleFull = titleRaw === "" ? "<untitled>" : titleRaw;
+    const title =
+      titleFull.length > SESSION_TITLE_MAX
+        ? `${titleFull.slice(0, SESSION_TITLE_MAX - 1)}…`
+        : titleFull;
+    const createdAt = job.created_at;
+    const rel =
+      typeof createdAt === "number" ? relTimeFromUnixSec(createdAt, nowMs) : "";
+    return { profile, id, title, state: seg(job.state), rel };
+  });
+
+  const widest = (xs: string[]): number =>
+    xs.reduce((acc, x) => Math.max(acc, x.length), 0);
+  const wProfile = widest(cells.map((c) => c.profile));
+  const wId = widest(cells.map((c) => c.id));
+  const wTitle = widest(cells.map((c) => c.title));
+  const wState = widest(cells.map((c) => c.state));
+
+  const lines: string[] = [];
+  for (const c of cells) {
+    const head = `${c.profile.padEnd(wProfile, " ")}  ${c.id.padEnd(wId, " ")}  ${c.title.padEnd(wTitle, " ")}  ${c.state.padEnd(wState, " ")}`;
+    // Trim trailing pad when there's no rel-time tail (defensive — a NOT NULL
+    // `created_at` always yields one, but a malformed row shouldn't leave
+    // end-of-line whitespace).
+    lines.push(c.rel === "" ? head.trimEnd() : `${head}  ${c.rel}`);
+  }
+  return lines;
+}
+
 async function main(): Promise<void> {
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
@@ -389,12 +479,20 @@ async function main(): Promise<void> {
   // on `disconnected` (via `lastUsageRowsKey`) so the next first-paint
   // always emits.
   let lastUsageRows: Record<string, unknown>[] = [];
+  // Module-local row cache for the single `jobs` subscription (the "recent
+  // sessions" log). Same change-gate discipline as the usage cache.
+  let lastJobsRows: Record<string, unknown>[] = [];
   // Projection-meaningful subset of the last emit. Gating `emitFrame` on
   // this — not on the rendered text — keeps a fetch-only refresh that
   // bumps `last_event_id` / `updated_at` from flapping a new frame, AND
   // keeps minute-tick relative-time bleed from forging one either.
   // Cleared on `disconnected` so a post-reconnect first emit always paints.
   let lastUsageRowsKey: string | null = null;
+  // The same gate for the `jobs` stream — hashes RAW unrendered fields
+  // (`created_at` as unix-seconds, never the minute-rounded `<rel> ago`
+  // tail) so a relative-time tick or a fetch-only `last_event_id` bump
+  // never forges a concrete frame; only real data movement does.
+  let lastJobsRowsKey: string | null = null;
   // Last lines we pushed/refreshed to the live shell. Lets the 30s tick
   // skip the `refreshLive` call when minute-rounding produced identical
   // text — avoids even the cost of constructing the overlay (renderDiff
@@ -450,12 +548,13 @@ async function main(): Promise<void> {
     const sState = `/tmp/keeper-usage.${process.pid}.state.${frameCount}.json`;
     const sFrame = `/tmp/keeper-usage.${process.pid}.frame.${frameCount}.txt`;
     const sDiff = `/tmp/keeper-usage.${process.pid}.diff.${frameCount}.txt`;
-    // Single-stream state JSON — the `usage` row set is the full input
-    // to the rendered frame (rate-limit annotations ride the same row
-    // via schema v35 / fn-642).
+    // State JSON — the `usage` row set plus the `jobs` row set are the full
+    // input to the rendered frame (rate-limit annotations ride the usage row
+    // via schema v35 / fn-642; per-job `profile_name` rides the jobs row via
+    // schema v36).
     writeFileSync(
       sState,
-      `${JSON.stringify({ usage: lastUsageRows }, null, 2)}\n`,
+      `${JSON.stringify({ usage: lastUsageRows, jobs: lastJobsRows }, null, 2)}\n`,
     );
     writeFileSync(sFrame, `${frameText}\n`);
     let diff = "# first frame - no previous to diff against\n";
@@ -501,14 +600,53 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Single-stream emitter. Renders the `usage` rows against `Date.now()`
-   * so the frozen at-capture text in history reflects what was on screen
-   * the moment the data landed; the 30s tick keeps the live view ticking
-   * forward via `refreshLive` without growing history.
+   * Stringify the projection-meaningful subset of the `jobs` row set into a
+   * stable hash key. Hashes ONLY the RAW unrendered fields the session log
+   * reads — `job_id` (identity + short id), `profile_name` (the label),
+   * `created_at` (raw unix-seconds, NOT the minute-rounded tail), `state`,
+   * and `title`. Deliberately excludes `last_event_id` / `updated_at` (they
+   * bump on every fetch-only refresh) so the gate fires only on real data
+   * movement, and keys off raw `created_at` so a minute-boundary crossing
+   * between two same-data emits can't forge a frame.
+   */
+  function jobsRowsHashKey(rows: Record<string, unknown>[]): string {
+    return JSON.stringify(
+      rows.map((r) => [
+        r.job_id,
+        r.profile_name,
+        r.created_at,
+        r.state,
+        r.title,
+      ]),
+    );
+  }
+
+  /**
+   * Compose the full frame body against `nowMs`: the per-profile usage stacks
+   * on top, then — when at least one job is present — a blank-line-separated
+   * `recent sessions` block. Both streams render against the SAME clock so a
+   * single 30s tick keeps every relative-time cell (quota resets, rate-limit
+   * annotations, AND session ages) fresh together.
+   */
+  function composeBody(nowMs: number): string[] {
+    const usageLines = renderRowLines(lastUsageRows, nowMs);
+    const sessionLines = renderSessionLines(lastJobsRows, nowMs);
+    if (sessionLines.length === 0) return usageLines;
+    if (usageLines.length === 0) {
+      return ["recent sessions", ...sessionLines];
+    }
+    return [...usageLines, "", "recent sessions", ...sessionLines];
+  }
+
+  /**
+   * Composed emitter. Renders both streams against `Date.now()` so the frozen
+   * at-capture text in history reflects what was on screen the moment the data
+   * landed; the 30s tick keeps the live view ticking forward via `refreshLive`
+   * without growing history.
    */
   function emitFrame(): void {
     const now = Date.now();
-    const bodyLines = renderRowLines(lastUsageRows, now);
+    const bodyLines = composeBody(now);
     const frameText = ["---", ...bodyLines].join("\n");
     frameCount += 1;
     liveShell.pushFrame(bodyLines);
@@ -532,6 +670,20 @@ async function main(): Promise<void> {
     emitFrame();
   }
 
+  /**
+   * `jobs`-stream row callback for the "recent sessions" log. Same change-gate
+   * contract as {@link emitUsage} — gates on {@link jobsRowsHashKey} (raw
+   * fields, not rendered text), so a fetch-only refresh or a minute-boundary
+   * crossing produces no new frame.
+   */
+  function emitJobs(rows: Record<string, unknown>[]): void {
+    const rowsKey = jobsRowsHashKey(rows);
+    if (rowsKey === lastJobsRowsKey) return;
+    lastJobsRowsKey = rowsKey;
+    lastJobsRows = rows;
+    emitFrame();
+  }
+
   function linesEqual(a: string[], b: string[]): boolean {
     if (a.length !== b.length) return false;
     for (let i = 0; i < a.length; i++) {
@@ -550,8 +702,8 @@ async function main(): Promise<void> {
   // and the colocated `rate-limited` cells re-render against the same
   // `Date.now()` so the full stack stays fresh on the same tick.
   const tickHandle = setInterval(() => {
-    if (lastUsageRows.length === 0) return;
-    const bodyLines = renderRowLines(lastUsageRows, Date.now());
+    if (lastUsageRows.length === 0 && lastJobsRows.length === 0) return;
+    const bodyLines = composeBody(Date.now());
     if (linesEqual(bodyLines, lastLiveLines)) return;
     lastLiveLines = bodyLines;
     liveShell.refreshLive(bodyLines);
@@ -577,6 +729,7 @@ async function main(): Promise<void> {
     if (event === "disconnected") {
       lastFrame = null;
       lastUsageRowsKey = null;
+      lastJobsRowsKey = null;
     }
   }
 
@@ -594,6 +747,24 @@ async function main(): Promise<void> {
     onLifecycle: emitLifecycle,
   });
 
+  // Second subscription: the `jobs` collection drives the "recent sessions"
+  // log. `sort created_at desc` + `limit 20` is the last-N-sessions page, and
+  // `filter { state: { not_in: [] } }` overrides the descriptor's default
+  // terminal-hide scope (the empty `not_in` contributes no clause — see
+  // `resolveFilter`) so the log includes `ended` / `killed` jobs — a true
+  // "last 20 sessions", not "last 20 live sessions". `profile_name` rides each
+  // row natively (schema v36), so no `profiles` join is needed here.
+  const jobsHandle = subscribeCollection({
+    sockPath,
+    idPrefix: "usage",
+    collection: "jobs",
+    limit: SESSION_LOG_LIMIT,
+    sort: { column: "created_at", dir: "desc" },
+    filter: { state: { not_in: [] } },
+    onRows: emitJobs,
+    onLifecycle: emitLifecycle,
+  });
+
   process.on("SIGINT", () => {
     // Stop the relative-time tick FIRST so it can't fire against a
     // disposed shell (refreshLive is no-op post-dispose, but skipping
@@ -602,6 +773,7 @@ async function main(): Promise<void> {
     // Terminal restoration before subscription teardown.
     liveShell.dispose();
     usageHandle.dispose();
+    jobsHandle.dispose();
     log("...");
     log(`meta: ${metaSidecar}`);
     log(`lifecycle: ${lifecycleSidecar}`);

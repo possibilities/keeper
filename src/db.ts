@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 35;
+export const SCHEMA_VERSION = 36;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -519,7 +519,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     config_dir TEXT,
     git_dirty_count INTEGER NOT NULL DEFAULT 0,
     git_unattributed_to_live_count INTEGER NOT NULL DEFAULT 0,
-    git_orphan_count INTEGER NOT NULL DEFAULT 0
+    git_orphan_count INTEGER NOT NULL DEFAULT 0,
+    profile_name TEXT
 )
 `;
 
@@ -3476,6 +3477,44 @@ function migrate(db: Database): void {
       );
       for (const row of rows) {
         updateStmt.run(projectBasename(row.config_dir), row.config_dir);
+      }
+    }
+
+    // v35→v36: stamp the derived profile name onto every `jobs` row so the
+    // usage surface's "recent sessions" log labels each job with its profile
+    // without a client-side join. `jobs.profile_name` mirrors the existing
+    // `profiles.profile_name` derivation (`projectBasename(config_dir)`),
+    // maintained by the reducer's SessionStart fold — the only arm that writes
+    // `jobs.config_dir`. Nullable and tracks `config_dir`'s OWN nullability: a
+    // NULL `config_dir` (default `~/.claude`, no `CLAUDE_CONFIG_DIR`) derives a
+    // NULL `profile_name` rather than the `''`-collapse the `profiles` seed
+    // uses — `jobs.config_dir` stays genuinely NULL (COALESCE-on-resume), so a
+    // matching-nullability `profile_name` keeps the resume precedence honest.
+    // The literal addition above (CREATE_JOBS) keeps a fresh v36 DB and a
+    // migrated v35→v36 DB converged on identical schema.
+    addColumnIfMissing(db, "jobs", "profile_name", "TEXT");
+    if (preMigrateStoredVersion < 36) {
+      // Version-guarded one-time backfill. Derive via the SAME `projectBasename`
+      // helper the SessionStart fold uses (byte-identical so a from-scratch
+      // re-fold — which drops `jobs` and re-seeds via SessionStart — converges
+      // on the same value). A NULL `config_dir` yields a NULL `profile_name`,
+      // matching the fold's `config_dir == null ? null : projectBasename(...)`
+      // derivation exactly. Non-idempotent, hence the explicit version guard so
+      // a future re-run of this slot can't re-stamp a since-cleared value.
+      const jobRows = db
+        .prepare("SELECT job_id, config_dir FROM jobs")
+        .all() as {
+        job_id: string;
+        config_dir: string | null;
+      }[];
+      const jobUpdateStmt = db.prepare(
+        "UPDATE jobs SET profile_name = ? WHERE job_id = ?",
+      );
+      for (const row of jobRows) {
+        jobUpdateStmt.run(
+          row.config_dir == null ? null : projectBasename(row.config_dir),
+          row.job_id,
+        );
       }
     }
 

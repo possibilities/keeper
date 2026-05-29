@@ -116,7 +116,20 @@ the native value" is the default.
   `~/.claude`, basename `""`) never cross-contaminates the join. The
   `last_event_id` bump on the forward UPDATE is load-bearing — it is
   the descriptor's `version` column; without the bump the wire diff
-  would not fire and the UI wouldn't refresh.) and bumps
+  would not fire and the UI wouldn't refresh.) AND the schema-v36
+  `jobs.profile_name` stamp: the SessionStart jobs UPSERT — the only arm
+  that writes `jobs.config_dir` — also stamps the derived
+  `projectBasename(config_dir)` onto `jobs.profile_name` so the usage
+  surface's "recent sessions" log (`scripts/usage.ts`) labels each job by
+  profile natively, no client-side join. Unlike the `profiles` seed's
+  `''`-collapse, the value tracks `config_dir`'s OWN nullability — a NULL
+  `config_dir` (default `~/.claude`) derives a NULL `profile_name` —
+  and the `ON CONFLICT DO UPDATE` mirrors `config_dir`'s
+  `COALESCE(excluded.profile_name, jobs.profile_name)` so a NULL-config
+  resume never clobbers a seeded name. The v35→v36 migrate adds the
+  nullable column and runs a one-time version-guarded backfill deriving
+  `profile_name` from each existing row's `config_dir` via the same
+  helper (byte-identical so a from-scratch re-fold converges).) and bumps
   `reducer_state.last_event_id` in one transaction. A crash mid-fold rolls
   back both; boot drain re-folds idempotently. This is the
   exactly-once-per-event guarantee — never split the two writes across
