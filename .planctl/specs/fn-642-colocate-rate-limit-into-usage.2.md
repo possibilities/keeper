@@ -57,5 +57,5 @@ is set, absent when NULL, and absent for the codex row. Remove the
 - [ ] `bun test test/usage.test.ts` is green; README usage.ts description updated
 
 ## Done summary
-
+scripts/usage.ts subscribes only to usage; tracked stacks render a colocated rate-limited <rel> body line when last_rate_limit_at is set; codex and never-limited stacks omit it; untracked profiles do not render; sidecar narrows to { usage }.
 ## Evidence

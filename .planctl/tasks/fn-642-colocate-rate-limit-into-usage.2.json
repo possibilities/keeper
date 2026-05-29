@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "keeper usage.ts colocation + drop block",
-  "updated_at": "2026-05-29T14:45:21.690852Z"
+  "updated_at": "2026-05-29T15:32:32.897320Z",
+  "worker_done_at": "2026-05-29T15:32:32.897320Z"
 }
