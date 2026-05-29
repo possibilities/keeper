@@ -24,7 +24,15 @@
  * the same shape regardless of which writer landed the row.
  */
 
+import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { openDb, resolveDbPath } from "../../src/db";
+import type {
+  DeadLetterBindings,
+  DeadLetterRecord,
+} from "../../src/dead-letter";
+import { serializeDeadLetterRecord } from "../../src/dead-letter";
 import {
   extractBashMutation,
   extractPlanctlInvocation,
@@ -303,6 +311,94 @@ async function scrapeSpawnInfo(): Promise<SpawnInfo> {
   }
 }
 
+/**
+ * Resolve the keeper dead-letter directory. `KEEPER_DEAD_LETTER_DIR` env wins
+ * (hermetic tests point it at a tmpdir); otherwise default to
+ * `~/.local/state/keeper/dead-letters/`, a sibling of the DB. The directory is
+ * created best-effort 0o700-ish by {@link writeDeadLetter} on demand — the
+ * helper is pure + does no I/O.
+ */
+function resolveDeadLetterDir(): string {
+  const override = process.env.KEEPER_DEAD_LETTER_DIR;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "dead-letters");
+}
+
+/**
+ * `SQLITE_BUSY` / `SQLITE_LOCKED` predicate. The bun:sqlite error carries
+ * BOTH `.code` (e.g. `"SQLITE_BUSY"`) and a libsqlite-style `.message`
+ * containing `"database is locked"`. Check both — the message text is the
+ * stable cross-binding shape and `.code` may shift across bun versions.
+ * `SQLITE_BUSY_SNAPSHOT` and every other error are NOT retriable: the
+ * `BEGIN IMMEDIATE` already avoids the lock-upgrade snapshot path and the
+ * caller goes straight to dead-letter on anything else.
+ */
+function isRetriableLockError(err: unknown): boolean {
+  if (err === null || typeof err !== "object") {
+    return false;
+  }
+  const e = err as { code?: unknown; message?: unknown };
+  const code = typeof e.code === "string" ? e.code : "";
+  const message = typeof e.message === "string" ? e.message : "";
+  // `SQLITE_BUSY_SNAPSHOT` is NOT retriable (the BEGIN IMMEDIATE path avoids
+  // it; if it surfaces anyway, dead-letter immediately).
+  if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") {
+    return true;
+  }
+  return message.includes("database is locked");
+}
+
+/**
+ * Synchronous sleep for `ms` milliseconds. The hook runs without an event
+ * loop after `main()` returns control, so `setTimeout` is unavailable inside
+ * the retry path. `Atomics.wait` on a fresh, zero-initialized SharedArrayBuffer
+ * blocks the current thread for up to the timeout — no event loop required.
+ * The wait always returns `"timed-out"` since nothing else holds a handle to
+ * the buffer to notify.
+ */
+function sleepSync(ms: number): void {
+  const buf = new SharedArrayBuffer(4);
+  const view = new Int32Array(buf);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+/**
+ * Best-effort append-one-line write of a dead-letter record to the per-pid
+ * NDJSON file. The hook MUST never throw past this helper — every failure
+ * mode (mkdir fail, append fail, chmod fail) is swallowed to stderr so the
+ * exit-0 contract holds. The chmod is best-effort 0o600 because the
+ * serialized bindings can carry prompt text and file paths the user
+ * reasonably considers private.
+ *
+ * The per-pid filename (`<pid>.ndjson`) keeps concurrent same-process hook
+ * writes (e.g. a late PostToolUse overlapping SessionEnd) from interleaving
+ * with each other: different pids never share a file, so an >PIPE_BUF (512 B
+ * on macOS) line can't tear across two hooks' appends.
+ */
+function writeDeadLetter(record: DeadLetterRecord): void {
+  try {
+    const dir = resolveDeadLetterDir();
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+    } catch {
+      // Directory may already exist with different mode; recursive mkdir is
+      // idempotent on absence, so a failure here is informational only.
+    }
+    const file = join(dir, `${process.pid}.ndjson`);
+    appendFileSync(file, serializeDeadLetterRecord(record));
+    try {
+      chmodSync(file, 0o600);
+    } catch {
+      // chmod best-effort — the file may have been written by a prior hook
+      // whose process can't chmod it now; the data is still on disk.
+    }
+  } catch (err) {
+    process.stderr.write(`keeper events-writer: dead-letter failed: ${err}\n`);
+  }
+}
+
 async function main(): Promise<void> {
   const raw = await readStdin();
   const data = JSON.parse(raw) as Record<string, unknown>;
@@ -442,55 +538,146 @@ async function main(): Promise<void> {
   const configDir =
     hookEvent === "SessionStart" ? configDirFromEnv(process.env) : null;
 
+  // Resolve the full named-bindings map ONCE up front, outside the open/
+  // retry block. The same object is reused for every retry attempt and is
+  // the canonical source the dead-letter record reads from on final failure —
+  // so the on-disk record carries every column the hook would have
+  // produced, including SessionStart-scraped fields (`spawn_name`,
+  // `start_time`, `config_dir`) that are NOT in stdin and unrecoverable
+  // later. Each `$`-prefixed key strips its prefix when projected into the
+  // dead-letter `bindings` map (the schema-shared form is bare column
+  // names — see `DeadLetterBindings` in `src/dead-letter.ts`).
+  const insertBindings = {
+    $ts: ts,
+    $session_id: sessionId,
+    $pid: pid,
+    $hook_event: hookEvent,
+    $event_type: eventType,
+    $tool_name: toolName,
+    $matcher: matcher,
+    $cwd: cwd,
+    $permission_mode: permissionMode,
+    $agent_id: agentId,
+    $agent_type: agentType,
+    $stop_hook_active: stopHookActive,
+    $data: raw,
+    $subagent_agent_id: subagentAgentId,
+    $spawn_name: spawnInfo.name,
+    $start_time: spawnInfo.startTime,
+    $slash_command: slashCommand,
+    $skill_name: skillName,
+    $planctl_op: planctlOp,
+    $planctl_target: planctlTarget,
+    $planctl_epic_id: planctlEpicId,
+    $planctl_task_id: planctlTaskId,
+    $planctl_subject_present: planctlSubjectPresent,
+    $tool_use_id: toolUseId,
+    $config_dir: configDir,
+    $planctl_queue_jump: planctlQueueJump,
+    $bash_mutation_kind: bashMutationKind,
+    $bash_mutation_targets: bashMutationTargets,
+  };
+
+  // Dead-letter on FINAL INSERT failure (fn-643 task .2). The closure
+  // captures the resolved `insertBindings` + envelope fields once; the call
+  // site fires it after `openDb` failure OR after the bounded retry has
+  // exhausted. The hook ALWAYS reaches one of those two call sites
+  // post-bindings, never both, so the on-disk dl_id is unique per dropped
+  // INSERT. Inline (not an outer helper) so it closes over the resolved
+  // bindings and the SessionStart-scraped fields without re-plumbing them
+  // through a long argument list.
+  const deadLetter = (lastError: unknown): void => {
+    // Bare-column bindings (strip the `$` prefix the prepared-statement
+    // uses) so the daemon-side import (task .3) can map it 1:1 to the
+    // `events` columns on a future replay.
+    const bindings: DeadLetterBindings = {};
+    for (const [key, value] of Object.entries(insertBindings)) {
+      const column = key.startsWith("$") ? key.slice(1) : key;
+      bindings[column] = value;
+    }
+    const record: DeadLetterRecord = {
+      dl_id: crypto.randomUUID(),
+      session_id: sessionId,
+      hook_event: hookEvent,
+      ts,
+      dl_written_at: Date.now() / 1000,
+      pid,
+      bindings,
+    };
+    writeDeadLetter(record);
+    // Surface the underlying cause to stderr too — useful in
+    // `claude --debug` output for diagnosing recurring drops.
+    process.stderr.write(
+      `keeper events-writer: INSERT failed (dead-lettered): ${lastError}\n`,
+    );
+  };
+
   // `migrate: false` — the daemon is the sole migrator (see CLAUDE.md
   // "Migrations are forward-only"). A fresh install must boot the daemon
   // at least once before the hook can write; the LaunchAgent handles this
-  // on login. A hook arriving against a missing/stale schema fails its
-  // INSERT, which the outer try/catch swallows to stderr and exits 0 per
-  // the "never block Claude" contract.
-  const { db, stmts } = openDb(resolveDbPath(), { migrate: false });
+  // on login. A hook arriving against a missing/stale schema fails inside
+  // `openDb` at `prepareStmts` time (the prepared INSERT names a column
+  // that doesn't yet exist) — that throw is a post-binding failure too, so
+  // the dead-letter path captures it. The exit-0 contract still holds.
+  let opened: ReturnType<typeof openDb>;
   try {
+    opened = openDb(resolveDbPath(), { migrate: false });
+  } catch (err) {
+    deadLetter(err);
+    return;
+  }
+  const { db, stmts } = opened;
+  try {
+    // Hook-local busy_timeout override (fn-643 task .2). The shared
+    // `applyPragmas` 5s is calibrated for the daemon/workers, which can
+    // wait an arbitrarily long time on a writer; the hook lives inside
+    // Claude's SessionEnd 1.5s budget and a full 5s busy-wait would
+    // routinely blow it. ~1200ms gives the writer one full
+    // checkpoint/commit window to clear, after which retry+dead-letter
+    // takes over. Connection-local — does NOT affect the daemon/workers.
+    db.run("PRAGMA busy_timeout = 1200");
+
     // BEGIN IMMEDIATE avoids the lock-upgrade SQLITE_BUSY path: a plain BEGIN
     // would start read-only and need to upgrade to write on INSERT, which
     // bypasses busy_timeout and errors immediately on contention. IMMEDIATE
-    // grabs the reserved lock up front and waits per busy_timeout (5s) for
-    // any in-flight writer.
-    db.transaction(() => {
+    // grabs the reserved lock up front and waits per busy_timeout for any
+    // in-flight writer.
+    //
+    // Bounded retry (fn-643 task .2): on `SQLITE_BUSY`/`SQLITE_LOCKED`
+    // (either `.code` match or `"database is locked"` in `.message`), sleep
+    // ~30ms synchronously and retry exactly ONCE. Every other error
+    // (`SQLITE_BUSY_SNAPSHOT`, schema mismatch, constraint violation, etc.)
+    // is non-retriable → straight to dead-letter. The retry budget is
+    // bounded (1 attempt + 1 short sleep + 1 retry) so the hook stays
+    // safely inside the SessionEnd 1.5s budget even on contention.
+    const insert = db.transaction(() => {
       // Named bindings: a missed column on a future ALTER no longer silently
       // shifts data into the next slot. `start_time` is captured on
       // SessionStart only as a platform-tagged opaque string — null on every
       // other event by design.
-      stmts.insertEvent.run({
-        $ts: ts,
-        $session_id: sessionId,
-        $pid: pid,
-        $hook_event: hookEvent,
-        $event_type: eventType,
-        $tool_name: toolName,
-        $matcher: matcher,
-        $cwd: cwd,
-        $permission_mode: permissionMode,
-        $agent_id: agentId,
-        $agent_type: agentType,
-        $stop_hook_active: stopHookActive,
-        $data: raw,
-        $subagent_agent_id: subagentAgentId,
-        $spawn_name: spawnInfo.name,
-        $start_time: spawnInfo.startTime,
-        $slash_command: slashCommand,
-        $skill_name: skillName,
-        $planctl_op: planctlOp,
-        $planctl_target: planctlTarget,
-        $planctl_epic_id: planctlEpicId,
-        $planctl_task_id: planctlTaskId,
-        $planctl_subject_present: planctlSubjectPresent,
-        $tool_use_id: toolUseId,
-        $config_dir: configDir,
-        $planctl_queue_jump: planctlQueueJump,
-        $bash_mutation_kind: bashMutationKind,
-        $bash_mutation_targets: bashMutationTargets,
-      });
-    })();
+      stmts.insertEvent.run(insertBindings);
+    });
+
+    let lastError: unknown = null;
+    let succeeded = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        insert();
+        succeeded = true;
+        break;
+      } catch (err) {
+        lastError = err;
+        if (attempt === 0 && isRetriableLockError(err)) {
+          sleepSync(30);
+          continue;
+        }
+        break;
+      }
+    }
+
+    if (!succeeded) {
+      deadLetter(lastError);
+    }
   } finally {
     db.close();
   }
