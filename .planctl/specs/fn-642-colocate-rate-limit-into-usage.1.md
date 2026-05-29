@@ -82,5 +82,5 @@ columns to the collections descriptor test (test/collections.test.ts:152-188).
 - [ ] CLAUDE.md + README architecture docs updated
 
 ## Done summary
-
+Schema v35: added bidirectional usage<->profiles rate-limit fan-out (last_rate_limit_at + last_rate_limit_session_id on usage, profile_name on profiles); ON CONFLICT carve-out preserves the annotation through re-snapshots; pure UPDATE on forward path so untracked profiles do not mint phantom usage rows; '' sentinel guarded on both sides; from-scratch re-fold determinism preserved.
 ## Evidence
