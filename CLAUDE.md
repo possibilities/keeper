@@ -455,3 +455,35 @@ Every keeper Worker thread follows the same durable contract:
   registered pidfds; all must be closed in the worker's shutdown handler.
 - **No in-process self-heal** — a worker's `error` event escalates to `fatalExit`;
   workers never respawn themselves or each other.
+
+## Known issue: autopilot Ghostty surface-init OOM ("Oh, no." windows)
+
+Autopilot's `launchInGhostty` spawns Ghostty windows rapidly via AppleScript.
+On Ghostty `tip` (macOS), a dispatch that loses a font-metrics race at window
+creation dies with an **"Oh, no. The terminal failed to initialize"** window
+(~100ms into init, *before* the PTY/`claude` command ever runs). The dispatch
+is silently dropped — the verb never executes — so a `work`/`approve`/`close`
+may need a manual re-run (pull its command from
+`~/.local/state/keeper/dispatch.log`).
+
+- **Root cause** (Ghostty bug, not keeper): `ghostty_surface_new()` →
+  `error.OutOfMemory`. `renderer/size.zig` `GridSize.update` computes
+  `columns = screen_px / cell_px` with only a min clamp; when `cellSize()` is
+  ~0 during a fast spawn the dimensions saturate (`u16`) and
+  `renderer/cell.zig:91` `alloc(CellBg=4B, cols*rows)` requests up to ~17GB.
+  NOT memory exhaustion (fires at ~236MB RSS, RAM free). NOT a crash (no
+  `.ghosttycrash`). Full trace folded into the `fn-640` epic spec.
+- **`fn-640` (window autoclose) is window hygiene, NOT this fix** — and is
+  reportedly still not closing windows even after shipping.
+- **TODO (deferred):** instrumented Ghostty build to capture the exact
+  `cols × rows` at failure, then file upstream (grid alloc needs an upper
+  clamp). Build from `~/src/ghostty-org--ghostty` (zig 0.15.2): add a log at
+  `renderer/cell.zig:89` + `GridSize.update`, `zig build`, run it (quits the
+  single-instance GUI), burst windows to repro. Passive unified-log capture
+  cannot get the size — init emits no size line (verified).
+- **Ops:** kill the dead windows (titled `👻`, nothing else is) —
+  `osascript -e 'tell application "Ghostty"' -e 'repeat with w in windows' -e 'if (name of w) contains "👻" then close window w' -e 'end repeat' -e 'end tell'`
+  (loop it; closing mutates the list). Use `close window w`, not `close`
+  (`-1708`). Count crashes:
+  `/usr/bin/log show --last 24h --predicate 'subsystem == "com.mitchellh.ghostty"' | grep "error initializing surface"`
+  (use `/usr/bin/log` — `log` is shell-shadowed).
