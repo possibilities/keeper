@@ -3,10 +3,11 @@
   "bundles": [],
   "created_at": "2026-05-29T22:17:19.000272Z",
   "depends_on_epics": [
-    "fn-645-usage-envelope-status-and-error"
+    "fn-645-usage-envelope-status-and-error",
+    "fn-649-git-attribution-fold-perf"
   ],
   "id": "fn-648-git-rm-mv-deletion-attribution",
-  "last_validated_at": "2026-05-29T22:17:35.510805Z",
+  "last_validated_at": "2026-05-30T00:02:29.496775Z",
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -17,5 +18,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-29T22:17:35.460887Z"
+  "updated_at": "2026-05-30T00:02:29.450736Z"
 }
