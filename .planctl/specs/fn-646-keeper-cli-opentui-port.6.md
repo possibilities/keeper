@@ -49,5 +49,5 @@ client-facing prose.
 - [ ] CLAUDE.md identifier mentions point at the `keeper` subcommands; AGENTS.md symlink intact; server-side sections untouched.
 
 ## Done summary
-
+Flipped README's Example clients section and CLAUDE.md client identifier mentions from bun scripts/<name>.ts to keeper <subcommand>; reconciled stale --live flag and live-shell module-name leaks in client-facing prose. Server-side sections untouched; AGENTS.md symlink intact.
 ## Evidence
