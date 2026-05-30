@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-644-autopilot-startup-stagger-gate",
   "bundles": [],
   "closer_done_at": "2026-05-30T01:12:40.997567Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-30T01:12:40.997567Z"
+  "updated_at": "2026-05-30T01:12:55.597364Z"
 }
