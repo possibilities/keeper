@@ -91,10 +91,48 @@ test("all expected indexes are present", () => {
     "idx_jobs_created_state",
     "idx_events_planctl_epic",
     "idx_events_planctl_target",
+    // fn-649: attribution-fold perf indexes.
+    "idx_events_hook_tool",
+    "idx_events_tool_file_path",
   ];
   for (const name of required) {
     expect(names.has(name)).toBe(true);
   }
+  db.close();
+});
+
+test("idx_events_tool_file_path turns the explicit-attribution scan into a SEEK", () => {
+  // fn-649: findExplicitAttributions matches this exact json_extract expression
+  // per dirty file. Without the expression index it scans all PostToolUse rows
+  // (measured 3.5s/file → multi-second GitSnapshot folds); with it, a seek.
+  const { db } = openDb(dbPath);
+  const plan = db
+    .prepare(
+      `EXPLAIN QUERY PLAN
+         SELECT id FROM events
+          WHERE hook_event = 'PostToolUse'
+            AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
+            AND json_extract(data, '$.tool_input.file_path') = ?`,
+    )
+    .all("/x") as { detail: string }[];
+  const detail = plan.map((r) => r.detail).join(" | ");
+  expect(detail).toContain("idx_events_tool_file_path");
+  expect(detail).toContain("SEARCH"); // a seek, not SCAN
+  expect(detail).not.toContain("SCAN events");
+  db.close();
+});
+
+test("busyTimeoutMs option overrides the default and is set before WAL", () => {
+  // fn-649: the hook passes 1200 so the journal_mode=WAL switch waits within
+  // its budget instead of failing instantly under contention.
+  const { db } = openDb(dbPath, { busyTimeoutMs: 1200 });
+  const busy = db.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+  expect(busy.timeout).toBe(1200);
+  // WAL still took effect (the reordered pragma sequence is intact).
+  const journal = db.prepare("PRAGMA journal_mode").get() as {
+    journal_mode: string;
+  };
+  expect(journal.journal_mode).toBe("wal");
   db.close();
 });
 
