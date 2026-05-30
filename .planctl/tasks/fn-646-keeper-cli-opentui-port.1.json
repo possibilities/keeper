@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-05-29T20:20:58.479393Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "cli foundation and dispatcher",
-  "updated_at": "2026-05-30T12:39:09.222577Z",
+  "updated_at": "2026-05-30T12:41:20.546277Z",
   "worker_done_at": "2026-05-30T12:39:09.222577Z"
 }
