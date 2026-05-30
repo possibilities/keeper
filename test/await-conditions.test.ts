@@ -37,7 +37,6 @@ import type {
   EmbeddedJob,
   Epic,
   Job,
-  JobLinkEntry,
   ResolvedEpicDep,
   SubagentInvocation,
   Task,
@@ -118,20 +117,6 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     git_dirty_count: 0,
     git_unattributed_to_live_count: 0,
     git_orphan_count: 0,
-    ...overrides,
-  };
-}
-
-function _makeLink(overrides: Partial<JobLinkEntry>): JobLinkEntry {
-  return {
-    kind: "refiner",
-    job_id: "session-1",
-    title: null,
-    state: "stopped",
-    last_api_error_at: null,
-    last_api_error_kind: null,
-    last_input_request_at: null,
-    last_input_request_kind: null,
     ...overrides,
   };
 }
