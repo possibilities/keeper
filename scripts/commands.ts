@@ -55,7 +55,7 @@ import {
   type ServerFrame,
 } from "../src/protocol";
 import type { Epic, Task } from "../src/types";
-import { buildWorkerCommand } from "./autopilot";
+import { buildWorkerCommand } from "../cli/autopilot";
 
 /**
  * Hard upper bound on how long the CLI waits for the `result` frame after a
