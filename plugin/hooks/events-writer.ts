@@ -684,21 +684,24 @@ async function main(): Promise<void> {
   // the dead-letter path captures it. The exit-0 contract still holds.
   let opened: ReturnType<typeof openDb>;
   try {
-    opened = openDb(resolveDbPath(), { migrate: false });
+    opened = openDb(resolveDbPath(), {
+      migrate: false,
+      // Pass the hook's tight budget so `applyPragmas` sets busy_timeout BEFORE
+      // the `journal_mode = WAL` switch — otherwise that switch fails instantly
+      // under contention (the `open:SQLITE_BUSY` drops). No later override
+      // needed: this value rides every statement on the connection.
+      busyTimeoutMs: HOOK_BUSY_TIMEOUT_MS,
+    });
   } catch (err) {
     deadLetter(err);
     return;
   }
   const { db, stmts } = opened;
   try {
-    // Hook-local busy_timeout override (fn-643 task .2). The shared
-    // `applyPragmas` 5s is calibrated for the daemon/workers, which can
-    // wait an arbitrarily long time on a writer; the hook lives inside
-    // Claude's SessionEnd 1.5s budget and a full 5s busy-wait would
-    // routinely blow it. ~1200ms gives the writer one full
-    // checkpoint/commit window to clear, after which retry+dead-letter
-    // takes over. Connection-local — does NOT affect the daemon/workers.
-    db.run(`PRAGMA busy_timeout = ${HOOK_BUSY_TIMEOUT_MS}`);
+    // busy_timeout is already HOOK_BUSY_TIMEOUT_MS — `openDb` set it FIRST in
+    // applyPragmas (before the journal_mode=WAL switch), so the hook stays
+    // inside Claude's SessionEnd 1.5s budget AND the WAL switch no longer fails
+    // instantly under contention. No re-set needed here.
 
     // BEGIN IMMEDIATE avoids the lock-upgrade SQLITE_BUSY path: a plain BEGIN
     // would start read-only and need to upgrade to write on INSERT, which

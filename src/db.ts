@@ -336,6 +336,22 @@ const CREATE_EVENTS_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_events_tool_name ON events(tool_name)",
   "CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)",
   "CREATE INDEX IF NOT EXISTS idx_events_pid_hook_tool ON events(pid, hook_event, tool_name)",
+  // (hook_event, tool_name) composite — the inferred-attribution self-join
+  // (`findInferredAttributions`) scans all PreToolUse rows via the single-column
+  // `idx_events_hook_event`; this lets the `pre` side seek straight to
+  // PreToolUse:Bash. (`idx_events_pid_hook_tool` leads with `pid`, so it can't
+  // serve a hook_event-first query.)
+  "CREATE INDEX IF NOT EXISTS idx_events_hook_tool ON events(hook_event, tool_name)",
+  // Expression index on the Write/Edit tool's target path — THE hot path. The
+  // explicit-attribution scan (`findExplicitAttributions`) matches
+  // `json_extract(data,'$.tool_input.file_path') = ?` per dirty file; without
+  // this it lands on `idx_events_hook_event` and runs `json_extract` over all
+  // ~50k PostToolUse rows (measured 3.5s/file → multi-second GitSnapshot folds
+  // that starve hook INSERTs). The partial WHERE + the expression match the
+  // query EXACTLY so SQLite turns the scan into a sub-ms SEEK (verified). Pure
+  // performance: index choice never changes fold results, so re-fold
+  // determinism is untouched and no SCHEMA_VERSION bump is needed (idempotent).
+  "CREATE INDEX IF NOT EXISTS idx_events_tool_file_path ON events(json_extract(data, '$.tool_input.file_path')) WHERE hook_event = 'PostToolUse' AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')",
   // Partial index on the sparse subagent bridge column. Only PostToolUse:Agent
   // rows populate it; the WHERE predicate must match consumer queries
   // exactly for SQLite to use the index instead of a scan.
@@ -1015,6 +1031,13 @@ export interface OpenDbOptions {
    * Claude" contract).
    */
   migrate?: boolean;
+  /**
+   * Connection-local `busy_timeout` in ms (default 5000). Set FIRST in
+   * {@link applyPragmas} so the `journal_mode = WAL` switch waits instead of
+   * failing instantly under contention. The hook passes `1200` to stay inside
+   * Claude's SessionEnd budget.
+   */
+  busyTimeoutMs?: number;
 }
 
 export interface KeeperDb {
@@ -1035,10 +1058,16 @@ export interface KeeperDb {
  * - `foreign_keys = ON`: bun:sqlite does not auto-enable.
  * - `temp_store = MEMORY`: keeps spill files off disk.
  */
-function applyPragmas(db: Database): void {
+function applyPragmas(db: Database, busyTimeoutMs = 5000): void {
+  // busy_timeout FIRST. The `journal_mode = WAL` switch below needs a brief
+  // write lock; with SQLite's default busy_timeout of 0 it fails INSTANTLY with
+  // SQLITE_BUSY under any concurrent writer — the `open:SQLITE_BUSY` hook drops
+  // (wait=0ms) the drop-log surfaced. Setting the timeout first makes that
+  // switch (and every later statement) wait. Connection-local; the hook passes
+  // its tighter `busyTimeoutMs` so the WAL switch can't blow its 1.5s budget.
+  db.run(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
   db.run("PRAGMA journal_mode = WAL");
   db.run("PRAGMA synchronous = NORMAL");
-  db.run("PRAGMA busy_timeout = 5000");
   db.run("PRAGMA foreign_keys = ON");
   db.run("PRAGMA temp_store = MEMORY");
 }
@@ -3776,7 +3805,7 @@ export function openDb(path: string, options: OpenDbOptions = {}): KeeperDb {
     path,
     readonly ? { readonly: true } : { create: true },
   );
-  applyPragmas(db);
+  applyPragmas(db, options.busyTimeoutMs ?? 5000);
 
   if ((options.migrate ?? true) && !readonly) {
     migrate(db);
