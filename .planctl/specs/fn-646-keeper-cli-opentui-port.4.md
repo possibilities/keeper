@@ -63,5 +63,5 @@ passes through. Manually diff `keeper board` colors against
 - [ ] `cli/board.ts` wired into the dispatcher; SIGINT order + sidecars preserved; `test/board.test.ts` + shim tests green.
 
 ## Done summary
-
+Moved scripts/board.ts to cli/board.ts under the dispatcher's main(argv) signature; added src/ansi-to-styled.ts to parse the six SGR escape sequences board emits into OpenTUI StyledText chunks at paint time; wired the shim through src/live-shell.ts's paint layer via linesToContent (plain-rows fast path, StyledText only when any line carries \x1b).
 ## Evidence
