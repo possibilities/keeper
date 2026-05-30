@@ -1,5 +1,5 @@
 /**
- * Pure-function tests for `scripts/usage.ts`'s `renderRowLines` helper.
+ * Pure-function tests for `cli/usage.ts`'s `renderRowLines` helper.
  *
  * `renderRowLines` consumes the daemon-side `usage` collection rows and
  * renders a stacked block per agentuse profile: a header line carrying
@@ -19,7 +19,7 @@
  */
 
 import { expect, test } from "bun:test";
-import { renderRowLines, renderSessionLines } from "../scripts/usage";
+import { renderRowLines, renderSessionLines } from "../cli/usage";
 
 // Fixed reference clock: 2025-01-15T12:00:00.000Z.
 const NOW_MS = Date.parse("2025-01-15T12:00:00.000Z");
