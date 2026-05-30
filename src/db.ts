@@ -348,6 +348,18 @@ const CREATE_EVENTS_INDEXES = [
   // cold cache (measured ~1.8s → ~274ms), so an orphan-heavy GitSnapshot fold
   // never starves a concurrent hook INSERT.
   "CREATE INDEX IF NOT EXISTS idx_events_hook_tool_ts ON events(hook_event, tool_name, ts)",
+  // COVERING indexes for the hoisted inferred-attribution window self-join
+  // (`computeRepoBashWindows`). Without them the join reads 64k bash-event full
+  // ROWS — ~400MB of `data` blobs — so a cold/evicted fold paid seconds of I/O
+  // and starved hook INSERTs even with a 256MB cache. These carry every column
+  // the query touches (filter + join + SELECT), so the planner uses COVERING
+  // INDEX and never visits a data page: measured 40ms cold with only an 8MB
+  // cache (cache-INDEPENDENT, doesn't grow with the log). `idx_events_bashwin_pre`
+  // serves the PreToolUse:Bash driver; `idx_events_bashwin_post` the
+  // tool_use_id-joined PostToolUse:Bash side (partial — only rows with a
+  // tool_use_id participate).
+  "CREATE INDEX IF NOT EXISTS idx_events_bashwin_pre ON events(hook_event, tool_name, ts, tool_use_id, session_id)",
+  "CREATE INDEX IF NOT EXISTS idx_events_bashwin_post ON events(tool_use_id, hook_event, tool_name, ts, cwd, session_id) WHERE tool_use_id IS NOT NULL",
   // Expression index on the Write/Edit tool's target path — THE hot path. The
   // explicit-attribution scan (`findExplicitAttributions`) matches
   // `json_extract(data,'$.tool_input.file_path') = ?` per dirty file; without

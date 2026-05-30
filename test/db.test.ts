@@ -95,6 +95,8 @@ test("all expected indexes are present", () => {
     "idx_events_hook_tool",
     "idx_events_hook_tool_ts",
     "idx_events_tool_file_path",
+    "idx_events_bashwin_pre",
+    "idx_events_bashwin_post",
   ];
   for (const name of required) {
     expect(names.has(name)).toBe(true);
