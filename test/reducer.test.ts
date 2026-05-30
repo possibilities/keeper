@@ -720,6 +720,364 @@ test("GitSnapshot attribution pass 1: bash mutation lands a 'bash'-source row", 
   expect(row?.op).toBe("fs-remove");
 });
 
+// ---------------------------------------------------------------------------
+// fn-648 deletion-attribution: git-rm / git-mv events match dirty files via
+// exact + directory-prefix + fnmatch against bash_mutation_targets. The .1
+// deriver task stamps `bash_mutation_kind ∈ {git-rm, git-mv}` for these; this
+// task wires the reducer's pass-1 to match the snapshot-known deleted/renamed
+// paths against them so the file doesn't fall to `<orphan>`.
+// ---------------------------------------------------------------------------
+
+test("GitSnapshot deletion-attribution: git-rm exact token attributes the deleted file", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-rm" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rm" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-rm",
+    cwd: "/repo",
+    bash_mutation_kind: "git-rm",
+    bash_mutation_targets: JSON.stringify(["/repo/apps/jobctl/src/main.ts"]),
+    data: JSON.stringify({
+      tool_input: { command: "git rm apps/jobctl/src/main.ts" },
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      // Deleted file → xy=" D", mtime_ms=null (file is gone) — pass-2
+      // inferred cannot fire; pass-1 exact must.
+      dirty_files: [
+        { path: "apps/jobctl/src/main.ts", xy: " D", mtime_ms: null },
+      ],
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-rm", "apps/jobctl/src/main.ts") as {
+    op: string;
+    source: string;
+  } | null;
+  expect(row).not.toBeNull();
+  expect(row?.source).toBe("bash");
+  expect(row?.op).toBe("git-rm");
+  // Project-wide rollups: file has an attribution → not orphaned,
+  // and sess-rm is live ('working') → not unattributed-to-live.
+  const jobRow = db
+    .query(
+      "SELECT git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-rm") as {
+    git_dirty_count: number;
+    git_unattributed_to_live_count: number;
+    git_orphan_count: number;
+  } | null;
+  expect(jobRow?.git_dirty_count).toBe(1);
+  expect(jobRow?.git_unattributed_to_live_count).toBe(0);
+  expect(jobRow?.git_orphan_count).toBe(0);
+});
+
+test("GitSnapshot deletion-attribution: git-rm -r directory-prefix attributes every file under the dir", () => {
+  // `git rm -r dir/` (post-resolveAgainstCwd) stamps `/repo/dir` as the
+  // sole target token. The reducer's directory-prefix mode then
+  // attributes every file whose path starts with `/repo/dir/`.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-rmdir" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rmdir" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-rmdir",
+    cwd: "/repo",
+    bash_mutation_kind: "git-rm",
+    bash_mutation_targets: JSON.stringify(["/repo/apps/legacy"]),
+    data: JSON.stringify({ tool_input: { command: "git rm -r apps/legacy" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        { path: "apps/legacy/a.ts", xy: " D", mtime_ms: null },
+        { path: "apps/legacy/sub/b.ts", xy: " D", mtime_ms: null },
+        // Negative control: a file outside the dir-prefix MUST NOT match.
+        { path: "apps/other/c.ts", xy: " D", mtime_ms: null },
+      ],
+    }),
+  });
+  drainAll();
+  const inside1 = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-rmdir", "apps/legacy/a.ts");
+  const inside2 = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-rmdir", "apps/legacy/sub/b.ts");
+  const outside = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-rmdir", "apps/other/c.ts");
+  expect(inside1).not.toBeNull();
+  expect(inside2).not.toBeNull();
+  expect(outside).toBeNull();
+  // Project-wide: 1 orphan (apps/other/c.ts), 2 attributed.
+  const jobRow = db
+    .query(
+      "SELECT git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-rmdir") as {
+    git_dirty_count: number;
+    git_unattributed_to_live_count: number;
+    git_orphan_count: number;
+  } | null;
+  expect(jobRow?.git_dirty_count).toBe(2);
+  expect(jobRow?.git_unattributed_to_live_count).toBe(1);
+  expect(jobRow?.git_orphan_count).toBe(1);
+});
+
+test("GitSnapshot deletion-attribution: git-rm fnmatch glob token matches *.ts", () => {
+  // `git rm '*.ts'` (post-resolveAgainstCwd) → `/repo/*.ts`. The
+  // fnmatch path attributes files matching `[^/]*\.ts` (a single
+  // segment only — `*` does NOT cross `/`).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-glob" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-glob" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-glob",
+    cwd: "/repo",
+    bash_mutation_kind: "git-rm",
+    bash_mutation_targets: JSON.stringify(["/repo/*.ts"]),
+    data: JSON.stringify({ tool_input: { command: "git rm '*.ts'" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        // Top-level .ts files match.
+        { path: "a.ts", xy: " D", mtime_ms: null },
+        { path: "b.ts", xy: " D", mtime_ms: null },
+        // Nested files MUST NOT match (`*` doesn't cross `/`).
+        { path: "src/c.ts", xy: " D", mtime_ms: null },
+        // Wrong extension MUST NOT match.
+        { path: "d.js", xy: " D", mtime_ms: null },
+      ],
+    }),
+  });
+  drainAll();
+  const a = db
+    .query(
+      "SELECT 1 FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-glob", "a.ts");
+  const b = db
+    .query(
+      "SELECT 1 FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-glob", "b.ts");
+  const c = db
+    .query(
+      "SELECT 1 FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-glob", "src/c.ts");
+  const d = db
+    .query(
+      "SELECT 1 FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-glob", "d.js");
+  expect(a).not.toBeNull();
+  expect(b).not.toBeNull();
+  expect(c).toBeNull();
+  expect(d).toBeNull();
+});
+
+test("GitSnapshot deletion-attribution: git-mv attributes both source and destination", () => {
+  // `git mv old.ts new.ts` → `bash_mutation_targets = ["/repo/old.ts",
+  // "/repo/new.ts"]`. The snapshot reports the rename as a single dirty
+  // file with `path=new.ts, orig_path=old.ts` (the git porcelain `R `
+  // status). The reducer probes BOTH candidate paths (path + orig_path)
+  // so the renamed file attributes on both ends.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-mv" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-mv" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-mv",
+    cwd: "/repo",
+    bash_mutation_kind: "git-mv",
+    bash_mutation_targets: JSON.stringify(["/repo/old.ts", "/repo/new.ts"]),
+    data: JSON.stringify({ tool_input: { command: "git mv old.ts new.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        { path: "new.ts", orig_path: "old.ts", xy: "R ", mtime_ms: null },
+      ],
+    }),
+  });
+  drainAll();
+  // The attribution row is keyed on the SNAPSHOT path (`new.ts`) — the
+  // file_path the upsert uses is `file.path`, not the matched token.
+  const row = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-mv", "new.ts") as {
+    op: string;
+    source: string;
+  } | null;
+  expect(row).not.toBeNull();
+  expect(row?.source).toBe("bash");
+  expect(row?.op).toBe("git-mv");
+  // No orphan — the rename is fully attributed.
+  const jobRow = db
+    .query("SELECT git_orphan_count FROM jobs WHERE job_id = ?")
+    .get("sess-mv") as { git_orphan_count: number } | null;
+  expect(jobRow?.git_orphan_count).toBe(0);
+});
+
+test("GitSnapshot deletion-attribution: __TREE__ sentinel never matches a real file", () => {
+  // A `git checkout` event (tree-mutator, no pathspec) stamps the
+  // `__TREE__` sentinel as its sole target. The deletion-attribution
+  // pass MUST NOT prefix-match or glob-match `__TREE__` against any
+  // real path — the sentinel signals "no pathspec, attribute nothing
+  // via this token" and the reducer enforces that by skipping the
+  // literal token before the prefix/glob probes.
+  //
+  // We use a `git-rm` event (the kind the deletion path scans) carrying
+  // ONLY the sentinel to prove the skip — even if a future change
+  // routed sentinel-bearing rows through the kind filter, the file
+  // still wouldn't attribute.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-sentinel" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-sentinel" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-sentinel",
+    cwd: "/repo",
+    bash_mutation_kind: "git-rm",
+    bash_mutation_targets: JSON.stringify(["__TREE__"]),
+    data: JSON.stringify({
+      tool_input: { command: "git rm --pathspec-from-file=list" },
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "real.ts", xy: " D", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  // The sentinel must NOT attribute the file — zero file_attributions
+  // rows for this (project, session, file) tuple.
+  const row = db
+    .query(
+      "SELECT 1 FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-sentinel", "real.ts");
+  expect(row).toBeNull();
+  // Project-wide rollup confirms the file is a strict-mystery orphan.
+  const statusRow = db
+    .query("SELECT orphaned_count FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { orphaned_count: number } | null;
+  expect(statusRow?.orphaned_count).toBe(1);
+});
+
+test("GitSnapshot deletion-attribution: plain modification still attributes via exact match (negative control)", () => {
+  // Regression guard: the new prefix/glob path must not regress the
+  // existing exact-match behavior on a non-deletion event. A plain
+  // `git checkout file.ts` deriver-stamped as `git-tree-mutate` with a
+  // single exact target still attributes the modification via the SQL
+  // exact path (NOT the new git-rm/git-mv JS scan, which is gated on
+  // kind ∈ {git-rm, git-mv}).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-mod" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-mod" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-mod",
+    cwd: "/repo",
+    bash_mutation_kind: "git-tree-mutate",
+    bash_mutation_targets: JSON.stringify(["/repo/file.ts"]),
+    data: JSON.stringify({
+      tool_input: { command: "git checkout -- file.ts" },
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      // Plain modification (not a delete).
+      dirty_files: [{ path: "file.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-mod", "file.ts") as {
+    op: string;
+    source: string;
+  } | null;
+  expect(row).not.toBeNull();
+  expect(row?.source).toBe("bash");
+  expect(row?.op).toBe("git-tree-mutate");
+});
+
 test("GitSnapshot multi-attribution: two sessions touch the same file → both rows in attributions[]", () => {
   // Sess-a writes src/a.ts, then sess-b also writes src/a.ts. The
   // snapshot's per-file attributions[] embeds BOTH sessions.
