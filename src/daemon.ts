@@ -478,7 +478,13 @@ function runDaemon(): void {
   process.title = "keeperd";
 
   const dbPath = resolveDbPath();
-  const { db, stmts } = openDb(dbPath);
+  // 256MB page cache on the writer connection: folds run here under the
+  // BEGIN IMMEDIATE write lock, and the default ~8MB cache evicted hot
+  // attribution-index pages between folds — a fold revisiting cold pages on the
+  // ~850MB log paid seconds of I/O and starved concurrent hook INSERTs into
+  // dead-letters. Retaining the working set keeps folds fast (and the lock
+  // short). The short-lived hook deliberately keeps the small default.
+  const { db, stmts } = openDb(dbPath, { cacheSizeKb: 262144 });
 
   // Step 1b — schema-v13 planctl approval migration (filesystem half). The
   // SQL half (ADD COLUMN `epics.approval` + DROP TABLE `approvals`) ran

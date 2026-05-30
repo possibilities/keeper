@@ -1044,6 +1044,13 @@ export interface OpenDbOptions {
    * Claude's SessionEnd budget.
    */
   busyTimeoutMs?: number;
+  /**
+   * Per-connection page-cache cap in KB (negative `PRAGMA cache_size`). Omit on
+   * the short-lived hook (keeps the small default per spawn); the long-running
+   * daemon passes a large value so it retains hot pages across folds instead of
+   * re-reading cold pages from the ~850MB log.
+   */
+  cacheSizeKb?: number;
 }
 
 export interface KeeperDb {
@@ -1072,7 +1079,11 @@ export interface KeeperDb {
  *   shared OS page cache — negligible per-connection cost, so the short-lived
  *   hook benefits too without committing heap.
  */
-function applyPragmas(db: Database, busyTimeoutMs = 5000): void {
+function applyPragmas(
+  db: Database,
+  busyTimeoutMs = 5000,
+  cacheSizeKb?: number,
+): void {
   // busy_timeout FIRST. The `journal_mode = WAL` switch below needs a brief
   // write lock; with SQLite's default busy_timeout of 0 it fails INSTANTLY with
   // SQLITE_BUSY under any concurrent writer — the `open:SQLITE_BUSY` hook drops
@@ -1084,9 +1095,19 @@ function applyPragmas(db: Database, busyTimeoutMs = 5000): void {
   db.run("PRAGMA synchronous = NORMAL");
   db.run("PRAGMA foreign_keys = ON");
   db.run("PRAGMA temp_store = MEMORY");
-  // 4 GiB cap (SQLite clamps to its compile-time max). Covers the current
-  // ~850MB log with growth room; revisit if the DB approaches the cap.
+  // 4 GiB cap (SQLite clamps to its compile-time max). mmap serves pages from
+  // the shared OS page cache once resident — it removes read() syscall overhead
+  // but NOT the first cold disk read, so it pairs with cache_size below.
   db.run("PRAGMA mmap_size = 4294967296");
+  // Large per-connection page cache (negative = KB cap). The long-running
+  // daemon RETAINS hot index/data pages across folds instead of re-reading cold
+  // pages from the ~850MB log — the default ~8MB cache evicts constantly, so a
+  // fold that revisits the attribution indexes paid seconds of cold I/O and
+  // starved hook INSERTs. Only the daemon passes this; the short-lived hook
+  // keeps the small default so each per-invocation spawn stays cheap.
+  if (cacheSizeKb != null && cacheSizeKb > 0) {
+    db.run(`PRAGMA cache_size = -${cacheSizeKb}`);
+  }
 }
 
 /**
@@ -3822,7 +3843,7 @@ export function openDb(path: string, options: OpenDbOptions = {}): KeeperDb {
     path,
     readonly ? { readonly: true } : { create: true },
   );
-  applyPragmas(db, options.busyTimeoutMs ?? 5000);
+  applyPragmas(db, options.busyTimeoutMs ?? 5000, options.cacheSizeKb);
 
   if ((options.migrate ?? true) && !readonly) {
     migrate(db);
