@@ -13,8 +13,10 @@ event log, reducer, the five worker threads, and the wire protocol — see
 
 **Design the server for the ideal architecture; do not nickle-and-dime against
 client churn.** The server (event log, reducer, projections, schema, RPC
-surface) is the durable artifact and the source of truth; clients (board.ts,
-the other `scripts/*.ts` UIs, autopilot, future consumers) are cheap to change.
+surface) is the durable artifact and the source of truth; clients (the
+`keeper` CLI subcommands wired through `cli/keeper.ts` — `keeper board`,
+`keeper autopilot`, `keeper git`, `keeper usage`, `keeper approve` —
+plus future consumers) are cheap to change.
 When a question is "should the projection carry richer state X?" the answer
 is decided by what makes the projection most honest and expressive — never
 by counting how many client call sites would need to update an enum check,
@@ -120,7 +122,7 @@ the native value" is the default.
   `jobs.profile_name` stamp: the SessionStart jobs UPSERT — the only arm
   that writes `jobs.config_dir` — also stamps the derived
   `projectBasename(config_dir)` onto `jobs.profile_name` so the usage
-  surface's "recent sessions" log (`scripts/usage.ts`) labels each job by
+  surface's "recent sessions" log (`keeper usage`) labels each job by
   profile natively, no client-side join. Unlike the `profiles` seed's
   `''`-collapse, the value tracks `config_dir`'s OWN nullability — a NULL
   `config_dir` (default `~/.claude`) derives a NULL `profile_name` —
