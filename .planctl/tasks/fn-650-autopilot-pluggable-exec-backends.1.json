@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-30T12:58:31.903792Z",
+  "depends_on": [],
+  "epic": "fn-650-autopilot-pluggable-exec-backends",
+  "id": "fn-650-autopilot-pluggable-exec-backends.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "exec-backend module config and rewire",
+  "updated_at": "2026-05-30T12:58:31.903792Z"
+}
