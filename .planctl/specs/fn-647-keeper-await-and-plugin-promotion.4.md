@@ -62,5 +62,5 @@ handling, persistent default).
 - [ ] The emitted command string matches task .2's grammar and exit-code contract; skill resolves as `/keeper:keeper-await`.
 
 ## Done summary
-
+Authored skills/keeper-await/SKILL.md at plugin root: frontmatter with auto-trigger description (849 chars) covering wait-then-act phrasings without requiring 'keeper'/'epic'/'task', allowed-tools Monitor+Bash, body parses target/condition/follow-up, pre-checks on-board via planctl show (refusing off-board), wires Monitor(keeper await <cond> <id>) with persistent:true default, and acts on the terminal [keeper-await] met line. Emitted command + exit-code contract matches task .2 exactly.
 ## Evidence
