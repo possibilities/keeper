@@ -56,5 +56,5 @@ exec claude. Restore.
 - [ ] With the plugin present, a launched session exposes `/keeper:keeper-await` and the hook fires exactly once.
 
 ## Done summary
-
+arthack-claude.py loads ~/code/keeper as a root --plugin-dir for every profile with a fail-loud preflight against the root manifest; added autouse fixture so HOME-sandboxed tests seed a stub keeper plugin and the preflight passes.
 ## Evidence
