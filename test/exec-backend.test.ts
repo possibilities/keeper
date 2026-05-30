@@ -24,14 +24,21 @@ import {
   buildGhosttyLaunchArgs,
   buildZellijAttachBgArgs,
   buildZellijCloseTabArgs,
+  buildZellijListPanesArgs,
   buildZellijListSessionsArgs,
+  buildZellijListTabsArgs,
   buildZellijNewTabArgs,
+  buildZellijQueryTabNamesArgs,
+  buildZellijRenamePaneArgs,
   createGhosttyBackend,
   createZellijBackend,
   DEFAULT_EXEC_BACKEND,
   DEFAULT_ZELLIJ_SESSION,
+  firstTabIdFromListTabs,
+  newestTerminalPaneId,
   resolveExecBackend,
   type SpawnFn,
+  tabNameListed,
 } from "../src/exec-backend";
 
 /**
@@ -138,6 +145,29 @@ test("buildZellijNewTabArgs: emits --cwd <abs> -- <argv> after session+action se
   ]);
 });
 
+test("buildZellijNewTabArgs: inserts --name <name> before -- when provided", () => {
+  const got = buildZellijNewTabArgs(
+    "autopilot",
+    "/abs",
+    ["/bin/zsh", "-c", "echo hi"],
+    "work::fn-1-x.1",
+  );
+  // --name lands between --cwd <dir> and the -- argv boundary.
+  const nameIdx = got.indexOf("--name");
+  const dashIdx = got.indexOf("--");
+  expect(nameIdx).toBeGreaterThan(got.indexOf("/abs"));
+  expect(got[nameIdx + 1]).toBe("work::fn-1-x.1");
+  expect(nameIdx).toBeLessThan(dashIdx);
+  expect(got.slice(dashIdx + 1)).toEqual(["/bin/zsh", "-c", "echo hi"]);
+});
+
+test("buildZellijNewTabArgs: omits --name entirely for empty/absent name", () => {
+  expect(buildZellijNewTabArgs("s", "/abs", ["sh"], "")).not.toContain(
+    "--name",
+  );
+  expect(buildZellijNewTabArgs("s", "/abs", ["sh"])).not.toContain("--name");
+});
+
 test("buildZellijCloseTabArgs: routes through close-tab-by-id <id>", () => {
   expect(buildZellijCloseTabArgs("autopilot", "7")).toEqual([
     "zellij",
@@ -149,6 +179,58 @@ test("buildZellijCloseTabArgs: routes through close-tab-by-id <id>", () => {
   ]);
 });
 
+test("buildZellijListTabsArgs / buildZellijListPanesArgs / buildZellijRenamePaneArgs: well-formed", () => {
+  expect(buildZellijListTabsArgs("autopilot")).toEqual([
+    "zellij",
+    "--session",
+    "autopilot",
+    "action",
+    "list-tabs",
+  ]);
+  expect(buildZellijListPanesArgs("autopilot")).toEqual([
+    "zellij",
+    "--session",
+    "autopilot",
+    "action",
+    "list-panes",
+  ]);
+  expect(
+    buildZellijRenamePaneArgs("autopilot", "terminal_3", "Worker"),
+  ).toEqual([
+    "zellij",
+    "--session",
+    "autopilot",
+    "action",
+    "rename-pane",
+    "-p",
+    "terminal_3",
+    "Worker",
+  ]);
+});
+
+test("firstTabIdFromListTabs: skips header, returns first numeric tab id", () => {
+  expect(
+    firstTabIdFromListTabs(
+      "TAB_ID  POSITION  NAME\n0  0  Tab #1\n1  1  agent\n",
+    ),
+  ).toBe("0");
+  // Unparsable / empty → null (degrade to keeping the default tab).
+  expect(firstTabIdFromListTabs("")).toBeNull();
+  expect(firstTabIdFromListTabs("TAB_ID  POSITION  NAME\n")).toBeNull();
+});
+
+test("newestTerminalPaneId: picks highest terminal_<n>, ignores plugin/header", () => {
+  const text =
+    "PANE_ID  TYPE  TITLE\n" +
+    "plugin_0  plugin  (.) - zellij:link\n" +
+    "terminal_0  terminal  Pane #1\n" +
+    "terminal_5  terminal  /bin/zsh -l -i -c ...\n";
+  expect(newestTerminalPaneId(text)).toBe("terminal_5");
+  expect(
+    newestTerminalPaneId("PANE_ID  TYPE  TITLE\nplugin_0  plugin  x\n"),
+  ).toBeNull();
+});
+
 test("buildZellijListSessionsArgs / buildZellijAttachBgArgs: well-formed", () => {
   expect(buildZellijListSessionsArgs()).toEqual(["zellij", "list-sessions"]);
   expect(buildZellijAttachBgArgs("autopilot")).toEqual([
@@ -157,6 +239,31 @@ test("buildZellijListSessionsArgs / buildZellijAttachBgArgs: well-formed", () =>
     "-b",
     "autopilot",
   ]);
+});
+
+test("buildZellijQueryTabNamesArgs: well-formed", () => {
+  expect(buildZellijQueryTabNamesArgs("autopilot")).toEqual([
+    "zellij",
+    "--session",
+    "autopilot",
+    "action",
+    "query-tab-names",
+  ]);
+});
+
+test("tabNameListed: exact-matches a tab name, never a substring", () => {
+  const text = "work::fn-60-other.1\nclose::fn-12-x\napprove::fn-3-y.2\n";
+  // Exact hit.
+  expect(tabNameListed(text, "close::fn-12-x")).toBe(true);
+  // Substring of a listed name must NOT match (the `work::fn-6` vs
+  // `work::fn-60` hazard the gate exists to avoid).
+  expect(tabNameListed(text, "work::fn-6")).toBe(false);
+  // Absent name.
+  expect(tabNameListed(text, "work::fn-99-z.1")).toBe(false);
+  // Empty input.
+  expect(tabNameListed("", "work::fn-1-x.1")).toBe(false);
+  // ANSI-coded line still matches after strip.
+  expect(tabNameListed("[1mwork::fn-1-x.1[0m\n", "work::fn-1-x.1")).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
@@ -379,6 +486,118 @@ test("createZellijBackend.launch: session-ensure is memoized — second launch s
   expect(listCount).toBe(1);
 });
 
+test("createZellijBackend.launch: fresh mint reaps the orphan default tab after the agent tab lands", async () => {
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  let listCalls = 0;
+  // Disambiguate action subcommands by cmd[4]; sessions missing first,
+  // then listed so the mint branch fires.
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "list-sessions") {
+      listCalls++;
+      return reply(listCalls === 1 ? "" : "autopilot\n");
+    }
+    if (cmd[1] === "attach") return reply("");
+    if (cmd[1] === "--session" && cmd[4] === "list-tabs") {
+      return reply("TAB_ID  POSITION  NAME\n0  0  Tab #1\n");
+    }
+    if (cmd[1] === "--session" && cmd[4] === "new-tab") return reply("9\n");
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    session: "autopilot",
+    spawn,
+  });
+  const tabId = await backend.launch(["sh"], "row-1", "/abs");
+  expect(tabId).toBe("9");
+  // The orphaned default tab (id 0, captured from list-tabs at mint) is
+  // closed AFTER the agent tab exists.
+  const closeCall = calls.find(
+    (c) => c[4] === "close-tab-by-id" && c[5] === "0",
+  );
+  expect(closeCall).toBeDefined();
+  const newTabIdx = calls.findIndex((c) => c[4] === "new-tab");
+  const closeIdx = calls.findIndex((c) => c[4] === "close-tab-by-id");
+  expect(closeIdx).toBeGreaterThan(newTabIdx);
+  // One-shot: a second launch (session now memoized) does NOT re-close.
+  calls.length = 0;
+  await backend.launch(["sh"], "row-2", "/abs");
+  expect(calls.some((c) => c[4] === "close-tab-by-id")).toBe(false);
+});
+
+test("createZellijBackend.launch: paneName pins the agent pane via rename-pane on the newest terminal", async () => {
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "list-sessions") return reply("autopilot\n");
+    if (cmd[1] === "--session" && cmd[4] === "new-tab") return reply("3\n");
+    if (cmd[1] === "--session" && cmd[4] === "list-panes") {
+      return reply(
+        "PANE_ID  TYPE  TITLE\nterminal_0  terminal  Pane #1\nterminal_4  terminal  /bin/zsh ...\n",
+      );
+    }
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    session: "autopilot",
+    spawn,
+  });
+  const tabId = await backend.launch(["sh"], "row-1", "/abs", {
+    tabName: "work::fn-1-x.1",
+    paneName: "Worker",
+  });
+  expect(tabId).toBe("3");
+  // new-tab carried the tab name.
+  const newTab = calls.find((c) => c[4] === "new-tab");
+  expect(newTab).toContain("--name");
+  expect(newTab).toContain("work::fn-1-x.1");
+  // rename-pane targeted the newest terminal pane with the role label.
+  const rename = calls.find((c) => c[4] === "rename-pane");
+  expect(rename).toEqual([
+    "zellij",
+    "--session",
+    "autopilot",
+    "action",
+    "rename-pane",
+    "-p",
+    "terminal_4",
+    "Worker",
+  ]);
+});
+
+test("createZellijBackend.launch: no paneName → no rename-pane call", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "zellij:list-sessions": { stdout: "autopilot\n", exitCode: 0 },
+      "zellij:--session": { stdout: "1\n", exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  await backend.launch(["sh"], "row-1", "/abs", { tabName: "work::x" });
+  expect(calls.some((c) => c[4] === "rename-pane")).toBe(false);
+  expect(calls.some((c) => c[4] === "list-panes")).toBe(false);
+});
+
 test("createZellijBackend.close: emits close-tab-by-id <id>", () => {
   const calls: string[][] = [];
   const notes: string[] = [];
@@ -401,6 +620,84 @@ test("createZellijBackend.close: emits close-tab-by-id <id>", () => {
     "close-tab-by-id",
     "7",
   ]);
+});
+
+test("createZellijBackend.isSurfaceLive: true when an exact tab name is listed", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "zellij:list-sessions": { stdout: "autopilot\n", exitCode: 0 },
+      "zellij:--session": {
+        stdout: "work::fn-60-x.1\nclose::fn-12-y\n",
+        exitCode: 0,
+      },
+    },
+    calls,
+  );
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  expect(await backend.isSurfaceLive("close::fn-12-y")).toBe(true);
+  // The query-tab-names action was the probe.
+  expect(calls.some((c) => c[4] === "query-tab-names")).toBe(true);
+});
+
+test("createZellijBackend.isSurfaceLive: false when the name is absent (substring near-miss does not match)", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "zellij:list-sessions": { stdout: "autopilot\n", exitCode: 0 },
+      "zellij:--session": { stdout: "work::fn-60-x.1\n", exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  // `work::fn-6` is a substring of the listed `work::fn-60-x.1` but must
+  // NOT be treated as live.
+  expect(await backend.isSurfaceLive("work::fn-6")).toBe(false);
+});
+
+test("createZellijBackend.isSurfaceLive: fail-closed (true) on non-zero query exit", async () => {
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  // list-sessions clean (ensureSession passes) but query-tab-names exits
+  // non-zero → fail-closed `true` so a probe error suppresses a dispatch
+  // rather than risking a double-spawn.
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string, exitCode = 0) => ({
+      exited: Promise.resolve(exitCode),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "list-sessions") return reply("autopilot\n");
+    if (cmd[4] === "query-tab-names") return reply("", 1);
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    session: "autopilot",
+    spawn,
+  });
+  expect(await backend.isSurfaceLive("work::fn-1-x.1")).toBe(true);
+  expect(notes.some((s) => s.includes("query-tab-names exited non-zero"))).toBe(
+    true,
+  );
+});
+
+test("createGhosttyBackend.isSurfaceLive: always false (no addressable registry)", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub({}, calls);
+  const backend = createGhosttyBackend({ noteLine: () => {}, spawn });
+  expect(await backend.isSurfaceLive("work::fn-1-x.1")).toBe(false);
+  // No process spawned — the Ghostty gate is a pure no-op.
+  expect(calls.length).toBe(0);
 });
 
 // ---------------------------------------------------------------------------

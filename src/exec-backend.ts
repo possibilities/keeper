@@ -19,8 +19,15 @@
  * - `createGhosttyBackend({ noteLine, spawn? })` — osascript launch +
  *   yabai move; osascript repeat-loop close.
  * - `createZellijBackend({ noteLine, session, spawn? })` — lazy session-
- *   ensure (memoized once) + `action new-tab --cwd <abs> -- <argv>` + tab-
- *   id capture; `action close-tab-by-id <id>` close.
+ *   ensure (memoized once) + `action new-tab --cwd <abs> [--name <tab>]
+ *   -- <argv>` + tab-id capture; `action close-tab-by-id <id>` close.
+ *   When the ensure step MINTS the session (vs. attaching to a listed
+ *   one), it captures the empty default `Tab #1` id and the first launch
+ *   reaps it after the agent tab lands — net a single named agent tab.
+ *   When `opts.paneName` is set, the launch resolves the just-created
+ *   pane (newest `terminal_<n>` from `action list-panes`) and pins its
+ *   title via `action rename-pane -p` — authoritative over the command-
+ *   derived default and over later program OSC-2 titles.
  * - `resolveExecBackend(name, deps)` — factory by name; defaults to and
  *   falls back to `"zellij"` on an unknown name (the config layer
  *   validates upstream, this is belt-and-suspenders).
@@ -69,13 +76,44 @@ export type SpawnFn = (
  * (e.g. ghostty's `tab-group-…` handed to zellij after a config flip)
  * is treated like an unknown id — best-effort attempt, no throw.
  */
+/**
+ * Optional surface labels for a launch. `tabName` names the zellij tab
+ * (`new-tab --name`); `paneName` pins the pane title via `rename-pane`
+ * (authoritative — it survives later program OSC-2 titles from claude /
+ * the fallback shell, verified on zellij 0.44). Both are ignored by the
+ * Ghostty backend, which has no equivalent surface.
+ */
+export interface LaunchOptions {
+  readonly tabName?: string;
+  readonly paneName?: string;
+}
+
 export interface ExecBackend {
   /** Spawn a terminal surface running argv at `dir`. Resolves to a
-   *  stable id, or `null` when no id was captured. */
-  launch(argv: string[], rowId: string, dir: string): Promise<string | null>;
+   *  stable id, or `null` when no id was captured. `opts` carries
+   *  optional surface labels (zellij tab/pane names); the Ghostty
+   *  backend ignores them. */
+  launch(
+    argv: string[],
+    rowId: string,
+    dir: string,
+    opts?: LaunchOptions,
+  ): Promise<string | null>;
   /** Reap a previously-launched surface by id. Fire-and-forget;
    *  never throws back. No-op on empty/undefined id. */
   close(windowId: string): void;
+  /** True when a terminal surface labeled `name` is already live in the
+   *  backend (zellij: a tab whose name === `name`). Drives autopilot's
+   *  name-exact re-dispatch gate — UNLIKE the root-scoped, self-EXCLUDING
+   *  `isLiveSessionInRoot`, this matches the exact `verb::id` INCLUDING
+   *  the row's own surface, so an already-running identical row blocks its
+   *  own re-dispatch even when `dispatch.log` did not survive a restart.
+   *  FAIL-CLOSED: resolves `true` when liveness cannot be determined
+   *  (query failed / binary missing / non-zero exit) so a probe error
+   *  never opens the double-spawn hole — a suppressed dispatch self-heals
+   *  on the next snapshot edge. The Ghostty backend has no addressable
+   *  tab registry and resolves `false` (no gate). */
+  isSurfaceLive(name: string): Promise<boolean>;
 }
 
 /**
@@ -223,11 +261,17 @@ export function buildGhosttyCloseArgs(windowId: string): string[] {
  * execs it directly with no shell layer — the OS argv boundary is the
  * safe quoting seam (no injection surface). `dir` MUST be absolute —
  * zellij's `--cwd` does not expand `~`/`$HOME` (issue #2288).
+ *
+ * `name`, when non-empty, labels the new tab via `--name` (autopilot
+ * passes the worker's `verb::id` spawn name so the tab bar mirrors the
+ * `claude --name`). Omitted entirely when absent so zellij assigns its
+ * default `Tab #N`.
  */
 export function buildZellijNewTabArgs(
   session: string,
   dir: string,
   argv: string[],
+  name?: string,
 ): string[] {
   return [
     "zellij",
@@ -237,6 +281,7 @@ export function buildZellijNewTabArgs(
     "new-tab",
     "--cwd",
     dir,
+    ...(name != null && name !== "" ? ["--name", name] : []),
     "--",
     ...argv,
   ];
@@ -265,6 +310,128 @@ export function buildZellijCloseTabArgs(
  */
 export function buildZellijListSessionsArgs(): string[] {
   return ["zellij", "list-sessions"];
+}
+
+/**
+ * Build the zellij `action query-tab-names` argv. Pure — exported for
+ * tests. Drives the name-exact live-surface gate: tabs are named with the
+ * dispatch's `verb::id` (autopilot's `launchWindow` passes it as
+ * `tabName`), so "is `work::fn-…` already live?" is an exact match over
+ * this command's one-name-per-line output.
+ */
+export function buildZellijQueryTabNamesArgs(session: string): string[] {
+  return ["zellij", "--session", session, "action", "query-tab-names"];
+}
+
+/**
+ * Parse `action query-tab-names` output and decide whether a tab named
+ * exactly `name` is live. zellij prints one tab name per line; we
+ * ANSI-strip + trim each line (same colorblindness as
+ * `zellijSessionListed`) and EXACT-match — not a substring match, so
+ * `work::fn-6` never spuriously matches `work::fn-60`. Exported for tests.
+ */
+export function tabNameListed(text: string, name: string): boolean {
+  for (const raw of text.split("\n")) {
+    const trimmed = raw.replace(ANSI_CSI_RE, "").trim();
+    if (trimmed.length === 0) {
+      continue;
+    }
+    if (trimmed === name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Build the zellij `action list-tabs` argv. Pure — exported for tests.
+ * Used once per freshly-minted session to capture the default tab's id
+ * (the empty `Tab #1` zellij creates) so the first agent launch can
+ * reap it — leaving a single named agent tab instead of an orphaned
+ * default beside it.
+ */
+export function buildZellijListTabsArgs(session: string): string[] {
+  return ["zellij", "--session", session, "action", "list-tabs"];
+}
+
+/**
+ * Parse `action list-tabs` output and return the first tab's stable id.
+ * The output is a header row (`TAB_ID  POSITION  NAME`) followed by one
+ * whitespace-delimited data row per tab; we skip the header and peel the
+ * first column off the first data row. Returns `null` on empty/unparsable
+ * output so the caller degrades to "leave the default tab" rather than
+ * closing the wrong id. ANSI-stripped for the same colorblindness as
+ * `zellijSessionListed`.
+ */
+export function firstTabIdFromListTabs(text: string): string | null {
+  for (const raw of text.split("\n")) {
+    const trimmed = raw.replace(ANSI_CSI_RE, "").trim();
+    if (trimmed.length === 0 || trimmed.startsWith("TAB_ID")) {
+      continue;
+    }
+    const id = trimmed.split(/\s+/)[0];
+    if (id != null && /^\d+$/.test(id)) {
+      return id;
+    }
+  }
+  return null;
+}
+
+/**
+ * Build the zellij `action list-panes` argv. Pure — exported for tests.
+ * Run right after `new-tab` to find the just-created agent pane id (the
+ * newest `terminal_<n>`) so `rename-pane -p` can pin its title.
+ */
+export function buildZellijListPanesArgs(session: string): string[] {
+  return ["zellij", "--session", session, "action", "list-panes"];
+}
+
+/**
+ * Build the zellij `action rename-pane -p <paneId> <name>` argv. Pure —
+ * exported for tests. `-p` targets a specific pane id (vs. the focused
+ * pane, which is unreliable when no client is attached) and the assigned
+ * name is authoritative — it overrides the command-derived default AND
+ * pins against later program OSC-2 titles.
+ */
+export function buildZellijRenamePaneArgs(
+  session: string,
+  paneId: string,
+  name: string,
+): string[] {
+  return [
+    "zellij",
+    "--session",
+    session,
+    "action",
+    "rename-pane",
+    "-p",
+    paneId,
+    name,
+  ];
+}
+
+/**
+ * Parse `action list-panes` output and return the newest terminal pane
+ * id (`terminal_<n>` with the highest `n`). zellij's pane ids are a
+ * global monotonic counter, so the highest-numbered terminal pane is the
+ * one the immediately-preceding `new-tab` created — robust as long as
+ * launches are serialized (autopilot's single settling slot guarantees
+ * it). Skips `plugin_*` rows and the header. Returns `null` when no
+ * terminal pane is found.
+ */
+export function newestTerminalPaneId(text: string): string | null {
+  let best = -1;
+  for (const raw of text.split("\n")) {
+    const trimmed = raw.replace(ANSI_CSI_RE, "").trim();
+    const m = /^terminal_(\d+)\b/.exec(trimmed);
+    if (m?.[1] != null) {
+      const n = Number.parseInt(m[1], 10);
+      if (n > best) {
+        best = n;
+      }
+    }
+  }
+  return best >= 0 ? `terminal_${best}` : null;
 }
 
 /**
@@ -310,6 +477,7 @@ export function createGhosttyBackend(deps: GhosttyBackendDeps): ExecBackend {
       argv: string[],
       rowId: string,
       _dir: string,
+      _opts?: LaunchOptions,
     ): Promise<string | null> {
       const osascriptArgs = buildGhosttyLaunchArgs(argv);
       try {
@@ -389,6 +557,14 @@ export function createGhosttyBackend(deps: GhosttyBackendDeps): ExecBackend {
         );
       }
     },
+    // Ghostty has no addressable tab/surface registry the launcher can
+    // query by name, so the name-exact gate is a no-op here — resolve
+    // `false` (never suppress). The duplicate-spawn protection the gate
+    // provides is zellij-only; the Ghostty backend is being retired, so
+    // this is the documented degradation, not a gap.
+    async isSurfaceLive(_name: string): Promise<boolean> {
+      return false;
+    },
   };
 }
 
@@ -445,6 +621,13 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
   const spawn = deps.spawn ?? defaultSpawn;
   const session = deps.session;
   let sessionReady: Promise<void> | null = null;
+  // When `ensureSession` MINTS the session (vs. attaching to a listed
+  // one), zellij leaves an empty default `Tab #1`. We stash its id here
+  // and the FIRST successful `launch` reaps it after creating the agent
+  // tab — net result is a single named agent tab, not an orphan beside
+  // it. Cleared after the one-shot close so later launches never touch
+  // it; stays null when the session pre-existed (nothing to reap).
+  let pendingOrphanTabId: string | null = null;
 
   async function runCapture(
     args: string[],
@@ -490,6 +673,14 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       while (Date.now() < deadline) {
         const probe = await runCapture(buildZellijListSessionsArgs());
         if (probe != null && zellijSessionListed(probe.stdout, session)) {
+          // Freshly minted: capture the default `Tab #1` id so the first
+          // launch can reap it once the agent tab exists. Best-effort —
+          // a missing/unparsable list leaves `pendingOrphanTabId` null
+          // and we simply keep the default tab.
+          const tabs = await runCapture(buildZellijListTabsArgs(session));
+          if (tabs != null) {
+            pendingOrphanTabId = firstTabIdFromListTabs(tabs.stdout);
+          }
           return;
         }
         await delay(50);
@@ -506,9 +697,10 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       argv: string[],
       rowId: string,
       dir: string,
+      opts?: LaunchOptions,
     ): Promise<string | null> {
       await ensureSession();
-      const args = buildZellijNewTabArgs(session, dir, argv);
+      const args = buildZellijNewTabArgs(session, dir, argv, opts?.tabName);
       const res = await runCapture(args);
       if (res == null) {
         deps.noteLine(
@@ -521,6 +713,31 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       }
       const tabId = res.stdout.trim();
       if (res.exitCode === 0 && tabId.length > 0) {
+        // Pin the pane title to the role label (Worker/Closer/Approver).
+        // Best-effort: resolve the just-created pane (newest terminal)
+        // and `rename-pane -p`. A missing/unparsable list or a failed
+        // rename leaves zellij's command-derived default — never blocks
+        // the launch.
+        if (opts?.paneName != null && opts.paneName !== "") {
+          const panes = await runCapture(buildZellijListPanesArgs(session));
+          const paneId =
+            panes != null ? newestTerminalPaneId(panes.stdout) : null;
+          if (paneId != null) {
+            await runCapture(
+              buildZellijRenamePaneArgs(session, paneId, opts.paneName),
+            );
+          }
+        }
+        // First launch after a fresh mint: reap the orphaned default
+        // `Tab #1` now that the agent tab exists, leaving a single named
+        // agent tab. Done AFTER the agent tab is confirmed so the session
+        // never drops to zero tabs (which would exit it). One-shot.
+        if (pendingOrphanTabId != null) {
+          await runCapture(
+            buildZellijCloseTabArgs(session, pendingOrphanTabId),
+          );
+          pendingOrphanTabId = null;
+        }
         return tabId;
       }
       if (res.exitCode !== 0) {
@@ -556,6 +773,30 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
           `# warn: closeWindow spawn (${windowId}) failed: ${(err as Error).message}`,
         );
       }
+    },
+    async isSurfaceLive(name: string): Promise<boolean> {
+      // Name-exact live-surface gate. Ensure the session exists
+      // (memoized; a freshly-minted session has only the empty default
+      // tab, which can never match a `verb::id`), then ask zellij for
+      // every tab name and exact-match `name`. FAIL-CLOSED: binary
+      // missing (null) OR non-zero exit resolves `true` so a probe
+      // failure suppresses rather than risking a double-spawn (the
+      // caller re-fires on the next verdict edge).
+      await ensureSession();
+      const res = await runCapture(buildZellijQueryTabNamesArgs(session));
+      if (res == null) {
+        deps.noteLine(
+          `# warn: zellij query-tab-names failed (binary missing?); treating surface "${name}" as live (fail-closed)`,
+        );
+        return true;
+      }
+      if (res.exitCode !== 0) {
+        deps.noteLine(
+          `# warn: zellij query-tab-names exited non-zero (${res.exitCode}); treating surface "${name}" as live (fail-closed)`,
+        );
+        return true;
+      }
+      return tabNameListed(res.stdout, name);
     },
   };
 }

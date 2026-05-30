@@ -2381,47 +2381,92 @@ export async function main(argv: string[]): Promise<void> {
     // AppleScript `command of cfg` body.
     const body = `${workerShellCommand} ; exec ${shell} -l -i`;
     const argv = [shell, "-l", "-i", "-c", body];
-    logDispatch({
-      ts: new Date().toISOString(),
-      kind: "launch",
-      rowId,
-      dir,
-      dirFull,
-      verb,
-      id,
-      command: workerShellCommand,
-      dry: dryRun || undefined,
-    });
-    if (dryRun) return;
-    // Startup-stagger gate (fn-644). A real-launch path always holds
-    // the single settling slot from here until the row is observed
+    // Dry-run: log the would-have-dispatched row and stop — no surface
+    // probe, no settling slot, no real spawn.
+    if (dryRun) {
+      logDispatch({
+        ts: new Date().toISOString(),
+        kind: "launch",
+        rowId,
+        dir,
+        dirFull,
+        verb,
+        id,
+        command: workerShellCommand,
+        dry: true,
+      });
+      return;
+    }
+    // Startup-stagger gate (fn-644). A real-launch path always holds the
+    // single settling slot from here until the row is observed
     // `running`-tag in `releaseSettledKeys` (or swept by
-    // `sweepSettleTimeouts` as a fail-open). The slot is wet-only;
-    // dry-run never reaches this line.
-    settling.set(`${verb}::${id}`, Date.now());
-    backend
-      .launch(argv, rowId, dirFull)
-      .then((windowId) => {
+    // `sweepSettleTimeouts` as a fail-open). Take it SYNCHRONOUSLY,
+    // before the async surface probe below, so a concurrent same-tick
+    // edge can't double-fill it; rolled back via `settling.delete(key)`
+    // if the surface-live gate suppresses.
+    settling.set(key, Date.now());
+    void (async () => {
+      // Name-exact live-surface gate (fn-652 hotfix). UNLIKE the
+      // root-scoped, self-excluding `isLiveSessionInRoot`, this asks the
+      // backend whether a surface named EXACTLY `verb::id` is already live
+      // — INCLUDING this row's own surface — so a worker that survived an
+      // autopilot restart (re-parented onto the long-lived zellij server)
+      // blocks its own re-dispatch even when `dispatch.log` was born fresh
+      // and `dispatchedKeys` is empty (the exact fn-652 double-spawn). The
+      // backend fail-closes (an indeterminate probe reports live), so a
+      // query error suppresses rather than risking a duplicate worker; the
+      // caller re-fires on the next verdict edge.
+      if (await backend.isSurfaceLive(key)) {
+        settling.delete(key);
+        noteLine(
+          `${new Date().toISOString()} re-dispatch suppressed (surface-live) pid=${process.pid} ${key} dir=${dirFull} (rowId=${rowId})`,
+        );
+        return;
+      }
+      // No live surface — commit the dispatch (log row + frame emit + the
+      // `dispatchedKeys` add) only now, so a surface-suppressed dispatch
+      // never writes a misleading launch line.
+      logDispatch({
+        ts: new Date().toISOString(),
+        kind: "launch",
+        rowId,
+        dir,
+        dirFull,
+        verb,
+        id,
+        command: workerShellCommand,
+      });
+      // Surface labels (zellij only; Ghostty ignores both): the tab
+      // carries the full `verb::id` (mirrors the `claude --name`) so the
+      // tab bar identifies the task; the pane carries the short role word
+      // so the pane frame reads clean instead of the wrapped shell
+      // command.
+      const paneRole =
+        verb === "work" ? "Worker" : verb === "close" ? "Closer" : "Approver";
+      try {
+        const windowId = await backend.launch(argv, rowId, dirFull, {
+          tabName: key,
+          paneName: paneRole,
+        });
         if (windowId == null) {
           return; // backend already surfaced the failure via noteLine
         }
         // Mutate the LIVE in-memory entry by reference (find by
-        // `${verb}::${id}`). The just-pushed entry is the last
-        // matching `(verb, id)` in `dispatchLog`; scan backward to
-        // grab it without iterating the full array.
-        const liveKey = `${verb}::${id}`;
+        // `${verb}::${id}`). The just-pushed entry is the last matching
+        // `(verb, id)` in `dispatchLog`; scan backward to grab it without
+        // iterating the full array.
         for (let i = dispatchLog.length - 1; i >= 0; i--) {
           const e = dispatchLog[i];
-          if (e !== undefined && `${e.verb}::${e.id}` === liveKey) {
+          if (e !== undefined && `${e.verb}::${e.id}` === key) {
             e.windowId = windowId;
             break;
           }
         }
-        // Persist the windowId to disk as a `window` kind row via a
-        // raw `appendFileSync` — NOT `logDispatch` (which would
-        // re-push a display entry and re-add to `dispatchedKeys`).
-        // Try/catch → noteLine on failure; the in-memory stamp still
-        // carries the same-run auto-close path forward.
+        // Persist the windowId to disk as a `window` kind row via a raw
+        // `appendFileSync` — NOT `logDispatch` (which would re-push a
+        // display entry and re-add to `dispatchedKeys`). Try/catch →
+        // noteLine on failure; the in-memory stamp still carries the
+        // same-run auto-close path forward.
         try {
           appendFileSync(
             dispatchLogPath,
@@ -2438,12 +2483,12 @@ export async function main(argv: string[]): Promise<void> {
             `# warn: window log write failed: ${(err as Error).message}`,
           );
         }
-      })
-      .catch((err) => {
+      } catch (err) {
         noteLine(
           `# warn: launch spawn for ${rowId} failed: ${(err as Error).message}`,
         );
-      });
+      }
+    })();
   }
 
   /**
