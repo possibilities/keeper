@@ -98,5 +98,5 @@ not fire deleted.
 - [ ] Tests via the mock-socket ConnectFactory pass; `biome check` + `tsc --noEmit` clean.
 
 ## Done summary
-
+Register `keeper await <complete|unblocked> <id>` on the cli/keeper.ts dispatcher; subscribeReadiness drives board-scope authority, subscribeCollection(epic_id) one-shots disambiguate epic-complete from deleted with reconnect-blip gating; Monitor-shaped stdout protocol with terminating-latched terminals (met/failed reason={not-found,timeout,deleted,stuck,connect}); 24 new mock-socket ConnectFactory tests cover armed-then-met, SIGTERM/--timeout, stuck default/--fail-on-stuck, drop+re-query, reconnect blip, onFatal routing.
 ## Evidence
