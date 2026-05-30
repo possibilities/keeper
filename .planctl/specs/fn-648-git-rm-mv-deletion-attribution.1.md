@@ -60,5 +60,5 @@ Cover: `git rm a b c`, `git rm -r dir/`, `git rm --cached f`, `git rm '*.ts'`
 - [ ] New + existing derivers.test.ts pass.
 
 ## Done summary
-
+extractBashMutation now recognizes git rm/mv as new BashMutation kinds (git-rm, git-mv) with cwd-resolved pathspec targets, flag/-- handling, and TREE_SENTINEL bail on --pathspec-from-file= or :-magic. Shared redirect-token filter (isRedirectToken) terminates target collection on the fs-commands arm AND the new git arm, fixing the long-standing 2>&1 / > log / 2> err / &> file / N>&M leak. 22 new tests; full suite 1544/0.
 ## Evidence
