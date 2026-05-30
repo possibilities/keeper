@@ -140,7 +140,20 @@ export interface KeeperConfig {
   agentuseRoot?: string;
   execBackend?: "ghostty" | "zellij";
   zellijSession?: string;
+  // Whether autopilot reaps a dispatched terminal surface once its work
+  // reaches a terminal state (the `closeWindow` auto-close). Defaults to
+  // `true` (reap). Set `autoclose_windows: false` to keep finished
+  // windows open — useful while troubleshooting a worker whose surface
+  // would otherwise vanish the moment it goes idle/done.
+  autocloseWindows?: boolean;
 }
+
+/**
+ * Default for `autoclose_windows`: autopilot reaps a finished dispatch's
+ * terminal surface unless the config turns it off. Exported so the
+ * resolver and tests share one literal.
+ */
+export const DEFAULT_AUTOCLOSE_WINDOWS = true;
 
 /**
  * Resolve the keeper config path. `KEEPER_CONFIG` env var wins (hermetic tests
@@ -162,8 +175,10 @@ export function resolveConfigPath(): string {
  * goes for `claude_projects_root` (default `~/.claude/projects`),
  * `agentuse_root` (default `~/.local/state/agentuse`), `exec_backend`
  * (default `"zellij"`, validated against `{ghostty,zellij}` — anything
- * else falls back to the default), and `zellij_session` (default
- * `"autopilot"`, non-empty string required). The config is best-effort and
+ * else falls back to the default), `zellij_session` (default
+ * `"autopilot"`, non-empty string required), and `autoclose_windows`
+ * (default `true`, explicit boolean required — anything else keeps the
+ * default). The config is best-effort and
  * must never throw past this resolver. ALL keys resolve INDEPENDENTLY from
  * the same parsed document — a bad `roots` never disturbs `exec_backend`
  * and vice-versa. Only string entries of `roots` survive; non-string junk
@@ -176,6 +191,7 @@ export function resolveConfig(): KeeperConfig {
   let agentuseRoot: string = DEFAULT_AGENTUSE_ROOT;
   let execBackend: "ghostty" | "zellij" = DEFAULT_EXEC_BACKEND;
   let zellijSession: string = DEFAULT_ZELLIJ_SESSION;
+  let autocloseWindows: boolean = DEFAULT_AUTOCLOSE_WINDOWS;
   try {
     if (!existsSync(path)) {
       return {
@@ -184,6 +200,7 @@ export function resolveConfig(): KeeperConfig {
         agentuseRoot,
         execBackend,
         zellijSession,
+        autocloseWindows,
       };
     }
     const raw = Bun.YAML.parse(readFileSync(path, "utf8")) as unknown;
@@ -213,6 +230,12 @@ export function resolveConfig(): KeeperConfig {
       if (typeof zs === "string" && zs.length > 0) {
         zellijSession = zs;
       }
+      // Only an explicit boolean overrides the default; any other shape
+      // (missing, string, null) leaves autoclose at its `true` default.
+      const acw = (raw as { autoclose_windows?: unknown }).autoclose_windows;
+      if (typeof acw === "boolean") {
+        autocloseWindows = acw;
+      }
     }
   } catch (err) {
     console.error(
@@ -225,6 +248,7 @@ export function resolveConfig(): KeeperConfig {
       agentuseRoot: DEFAULT_AGENTUSE_ROOT,
       execBackend: DEFAULT_EXEC_BACKEND,
       zellijSession: DEFAULT_ZELLIJ_SESSION,
+      autocloseWindows: DEFAULT_AUTOCLOSE_WINDOWS,
     };
   }
   return {
@@ -233,6 +257,7 @@ export function resolveConfig(): KeeperConfig {
     agentuseRoot,
     execBackend,
     zellijSession,
+    autocloseWindows,
   };
 }
 

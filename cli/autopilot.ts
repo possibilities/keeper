@@ -2725,6 +2725,19 @@ export async function main(argv: string[]): Promise<void> {
       if (windowId === undefined || windowId === "") {
         return;
       }
+      // Auto-close kill switch (config `autoclose_windows: false`). When
+      // disabled the finished dispatch's terminal surface is LEFT OPEN —
+      // the human is troubleshooting and doesn't want windows vanishing
+      // the moment a worker goes idle/done. The completed-edge bookkeeping
+      // in `detectJobTransitions` still fires (the row migrates to
+      // `--- completed ---`); only the reap is suppressed. Note the
+      // would-have-closed id so the lifecycle sidecar shows the skip.
+      if (!cfg.autocloseWindows) {
+        noteLine(
+          `# closeWindow (autoclose disabled) windowId=${windowId} — leaving surface open`,
+        );
+        return;
+      }
       if (dryRun) {
         noteLine(
           `# closeWindow (dry) windowId=${windowId} — would close terminal surface`,

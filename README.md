@@ -258,6 +258,13 @@ Keeper has no `install` verb. Wire it up manually:
    - `zellij_session` — the zellij session name autopilot's zellij backend
      lazily ensures (and reuses) for every tab it spawns. Default:
      `autopilot`. Ignored when `exec_backend: ghostty`.
+   - `autoclose_windows` — whether autopilot reaps a dispatched terminal
+     surface once its work reaches a terminal state (the auto-close).
+     Default: `true`. Set `false` to keep finished windows open — useful
+     while troubleshooting a worker whose surface would otherwise vanish the
+     moment it goes idle/done. Only an explicit boolean overrides the default
+     (a string like `"false"` is ignored). The completed-row bookkeeping
+     still fires; only the window reap is suppressed.
 
    ```sh
    mkdir -p ~/.config/keeper
@@ -268,6 +275,7 @@ Keeper has no `install` verb. Wire it up manually:
    claude_projects_root: ~/.claude/projects
    exec_backend: zellij
    zellij_session: autopilot
+   autoclose_windows: true
    YAML
    ```
 
@@ -277,8 +285,9 @@ Keeper has no `install` verb. Wire it up manually:
    All keys fall back independently — a missing/malformed one never disturbs
    the others; a missing or malformed config falls back to every default
    (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
-   `exec_backend: zellij`, `zellij_session: autopilot`). An unknown
-   `exec_backend` value also falls back to `zellij`.
+   `exec_backend: zellij`, `zellij_session: autopilot`,
+   `autoclose_windows: true`). An unknown `exec_backend` value also falls
+   back to `zellij`.
 
    (The legacy `KEEPER_WATCH_ROOT` env var is retired; if still set, the daemon
    logs a one-line deprecation warning and ignores it.)
