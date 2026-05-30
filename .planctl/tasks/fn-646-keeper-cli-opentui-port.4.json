@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-05-29T20:20:58.479393Z",
   "depends_on": [
@@ -11,6 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "board cutover ansi shim",
-  "updated_at": "2026-05-30T16:53:12.830518Z",
+  "updated_at": "2026-05-30T17:52:52.796511Z",
   "worker_done_at": "2026-05-30T16:53:12.830518Z"
 }
