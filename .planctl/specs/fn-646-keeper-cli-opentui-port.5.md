@@ -56,5 +56,5 @@ correctly after a copy flash.
 - [ ] `cli/autopilot.ts` wired into the dispatcher; SIGINT teardown preserved; `test/autopilot.test.ts` green.
 
 ## Done summary
-
+Moved scripts/autopilot.ts → cli/autopilot.ts; main(argv) replaces Bun.argv.slice(2); import.meta.main guard neutralized; HELP usage line + docblock flipped to 'keeper autopilot'; stateful onUnhandledKey (space pause-gated on !dryRun, v toggle via refreshLive, c copy) and setStatus → statusLine() restore preserved verbatim; SIGINT teardown + dispatch-log/Ghostty side effects intact; test/autopilot.test.ts imports flipped to ../cli/autopilot (71/71 green).
 ## Evidence
