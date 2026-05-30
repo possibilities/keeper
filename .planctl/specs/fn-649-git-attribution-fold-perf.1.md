@@ -72,5 +72,5 @@ journal_mode (order assertion or a contention smoke test).
   green.
 
 ## Done summary
-
+Eliminated multi-second GitSnapshot folds that starved hook INSERTs into dead-letter bursts. (1) idx_events_tool_file_path expression index: explicit-attribution scan 3556ms->0.4ms seek. (2) Hoisted the inferred-attribution bash-window self-join out of the per-file loop (computeRepoBashWindows + inferFromWindows): N orphan files x 2.5s -> 1 bounded scan; 297 reducer tests confirm byte-identical attributions. (3) idx_events_hook_tool + idx_events_hook_tool_ts: cold window scan 1836ms->526ms. (4) applyPragmas sets busy_timeout before journal_mode=WAL (openDb busyTimeoutMs param) - fixes open:SQLITE_BUSY drops. Verified live: worst-case fold 41s->under 600ms (under the hook's 1.2s budget); 0 new drops. Commits 8070728, 76cd0d2, 5efb1ba, 032e5ed.
 ## Evidence
