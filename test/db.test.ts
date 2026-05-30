@@ -369,7 +369,7 @@ test("schema_version is stamped in meta", () => {
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(row.value).toBe("38");
+  expect(row.value).toBe("39");
   db.close();
 });
 
@@ -477,7 +477,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   const eventNames = (
     db.prepare("PRAGMA table_info(events)").all() as {
@@ -527,7 +527,7 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   db2.close();
 });
 
@@ -580,7 +580,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   const jobNames = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
@@ -606,7 +606,7 @@ test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", ()
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   db2.close();
 });
 
@@ -641,7 +641,7 @@ test("v2 DB migrates: mode + title_history dropped, title preserved", () => {
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   const names = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
@@ -692,7 +692,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   const tables = new Set(
     (
@@ -769,7 +769,7 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   db2.close();
 });
 
@@ -828,7 +828,7 @@ test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, tas
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // tasks table is gone (the v6→v7 backfill+DROP runs inside the same
   // transaction, before the v11 rewind clears `epics`).
@@ -948,7 +948,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // Both columns now appear.
   const eventNames = (
@@ -995,7 +995,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   const eventNames2 = (
     db2.prepare("PRAGMA table_info(events)").all() as { name: string }[]
   ).map((c) => c.name);
@@ -1300,7 +1300,7 @@ test("Tier 4.1 (fn-634) migrate() is boot-twice idempotent (addGeneratedColumnIf
   const ver = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   // The column must still be present (sanity).
   const cols = db2.prepare("PRAGMA table_xinfo(epics)").all() as {
     name: string;
@@ -1728,7 +1728,7 @@ test("v9 DB migrates to v10: four columns added + three partial indexes + backfi
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // All four columns appear.
   const eventNames = (
@@ -1806,7 +1806,7 @@ test("v9 DB migrates to v10: four columns added + three partial indexes + backfi
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   // Re-verify the backfill landed identically on the second open — the
   // guard keeps the values stable.
   const jobsAfter = db2
@@ -1975,7 +1975,7 @@ test("v10 DB migrates to v11: epics.jobs added + rewind-and-redrain rebuilds emb
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // epics.jobs column present, with the NOT NULL DEFAULT '[]'.
   const epicCols = db.prepare("PRAGMA table_info(epics)").all() as {
@@ -2030,7 +2030,7 @@ test("v10 DB migrates to v11: epics.jobs added + rewind-and-redrain rebuilds emb
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   // No re-drain needed — the guard suppressed the rewind, so the rows
   // persist as-is.
   const epicsAfter = db2.query("SELECT * FROM epics ORDER BY epic_id").all();
@@ -2285,7 +2285,7 @@ test("v12 DB migrates to v13: epics.approval added, approvals table dropped, fil
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // approvals table is GONE — DROP TABLE IF EXISTS ran.
   const approvalsExists =
@@ -2363,7 +2363,7 @@ test("v12 DB migrates to v13: epics.approval added, approvals table dropped, fil
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   const epicsAfter = db2.query("SELECT * FROM epics ORDER BY epic_id").all();
   expect(epicsAfter).toEqual(epicsBefore);
   db2.close();
@@ -2485,7 +2485,7 @@ test("fresh openDb has the schema-v23 usage table for the agentuse read surface 
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   db.close();
 });
 
@@ -2561,7 +2561,7 @@ test("v22 DB migrates to v23: usage table created via migrate() path, byte-ident
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   const migrated = db.prepare("PRAGMA table_info(usage)").all() as {
     name: string;
     type: string;
@@ -2611,7 +2611,7 @@ test("v22→v23 migration is idempotent on re-open", () => {
   const ver = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   const cols = db2.prepare("PRAGMA table_info(usage)").all() as {
     name: string;
   }[];
@@ -2756,7 +2756,7 @@ test("v23 DB migrates to v24: jobs.rate_limited_at dropped; last_api_error_at + 
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // Step 2: jobs column shape has the new two-field pair and NO legacy
   // rate_limited_at column.
@@ -2797,7 +2797,7 @@ test("v23 DB migrates to v24: jobs.rate_limited_at dropped; last_api_error_at + 
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   expect(db2.query("SELECT * FROM events ORDER BY id").all()).toEqual(
     eventsBefore,
   );
@@ -3017,7 +3017,7 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // All seven columns exist with correct shape.
   const eventNames = (
@@ -3119,7 +3119,7 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   const epicsAfter = db2.query("SELECT * FROM epics ORDER BY epic_id").all();
   const jobsAfter = db2.query("SELECT * FROM jobs ORDER BY job_id").all();
   const eventsAfter = db2.query("SELECT * FROM events ORDER BY id").all();
@@ -3353,7 +3353,7 @@ test("v16 DB migrates to v17: tool_use_id column + subagent_invocations + partia
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // events.tool_use_id exists.
   const eventNames = (
@@ -3416,7 +3416,7 @@ test("v16 DB migrates to v17: tool_use_id column + subagent_invocations + partia
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   const eventsAfter = db2
     .query("SELECT id, tool_use_id FROM events ORDER BY id")
     .all();
@@ -3757,7 +3757,7 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // Pass 0 — every PreToolUse:Bash row's planctl_* columns are now NULL.
   const preRows = db
@@ -3904,7 +3904,7 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   expect(db2.query("SELECT * FROM epics ORDER BY epic_id").all()).toEqual(
     epicsBefore,
   );
@@ -4072,7 +4072,7 @@ test("v20 DB migrates to v21: epics.job_links entries widen from thin {kind, job
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // Post-migration: the v23→v24 rewind wiped epics + jobs; the boot
   // drain has nothing to rebuild from (no events seeded), so the
@@ -4094,7 +4094,7 @@ test("v20 DB migrates to v21: epics.job_links entries widen from thin {kind, job
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   expect(db2.query("SELECT * FROM epics ORDER BY epic_id").all()).toEqual(
     epicsBefore,
   );
@@ -4217,7 +4217,7 @@ test("v20 DB migrates to v21: malformed (non-JSON) epics.job_links blob folds to
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // Post-rewind: the corrupt epic row is wiped along with the rest of the
   // projection (no events seeded → empty rebuild).
@@ -4309,7 +4309,7 @@ test("v21 DB migrates to v22: events.config_dir + jobs.config_dir added, rows pr
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   const eventCols = (
     db.prepare("PRAGMA table_info(events)").all() as { name: string }[]
@@ -4346,7 +4346,7 @@ test("v21 DB migrates to v22: events.config_dir + jobs.config_dir added, rows pr
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   db2.close();
 });
 
@@ -4904,7 +4904,7 @@ test("v24 DB migrates to v25: jobs.last_input_request_at + last_input_request_ki
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // Step 2: jobs column shape has the new two-field pair alongside the
   // v24 api-error pair.
@@ -4954,7 +4954,7 @@ test("v24 DB migrates to v25: jobs.last_input_request_at + last_input_request_ki
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   expect(db2.query("SELECT * FROM events ORDER BY id").all()).toEqual(
     eventsBefore,
   );
@@ -5053,7 +5053,7 @@ test("addColumnIfMissing is idempotent for the v29 columns", () => {
   const ver = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   db2.close();
 });
 
@@ -5170,7 +5170,7 @@ test("v29 DB migrates to v30: events.planctl_queue_jump + epics.queue_jump added
   const ver = reopened
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // epics.queue_jump column present + the existing row reads it as 0
   // (the INTEGER NOT NULL DEFAULT 0 fills the pre-existing row safely;
@@ -5212,7 +5212,7 @@ test("v29 DB migrates to v30: events.planctl_queue_jump + epics.queue_jump added
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   db2.close();
   rmSync(otherTmp, { recursive: true, force: true });
 });
@@ -5237,7 +5237,7 @@ test("addColumnIfMissing is idempotent for the v30 columns", () => {
   const ver = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   db2.close();
 });
 
@@ -5369,7 +5369,7 @@ test("fresh DB schema_version is stamped at current SCHEMA_VERSION", () => {
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   db.close();
 });
 
@@ -5547,7 +5547,7 @@ test("v30 DB migrates to v31: events sparse columns added, jobs column rename + 
   const ver = reopened
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // Version-guarded rewind ran: cursor=0, jobs/epics/git_status/file_attributions
   // wiped.
@@ -5602,7 +5602,7 @@ test("v30→v31 rewind is version-guarded: re-open of an already-migrated v31 DB
   const ver = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   db2.close();
 });
 
@@ -5682,14 +5682,18 @@ test("fresh v31 DB schema (CREATE_JOBS) matches v30→v31 migrated schema (colum
   expect(migratedCols).toEqual(freshCols);
 });
 
-test("v31 DB migrates to v32: epics.default_visible added as VIRTUAL generated column; pre-existing rows compute correct values per (status, approval)", () => {
+test("v31 DB migrates to v32: epics.default_visible added as VIRTUAL generated column; post-migrate rows compute correct values per (status, approval) (fn-634, fn-648)", () => {
   // Build a v31-shape epics table by hand (16 columns including queue_jump
-  // but NO default_visible), seed cross-product rows, then reopen via
-  // openDb() → migrate() to verify: (a) version stamp = "32", (b)
-  // default_visible column exists per PRAGMA table_xinfo, (c) the
-  // pre-existing rows now report correct default_visible values per the
-  // CASE-wrapped expression (open OR !approved → 1; else 0; NULL-status
-  // collapses via CASE to 0 on the approved corner).
+  // but NO default_visible). Reopen via openDb() → migrate() to verify:
+  // (a) version stamp = current SCHEMA_VERSION, (b) default_visible
+  // column exists per PRAGMA table_xinfo, (c) post-migrate inserts on the
+  // 6 corners of the (status, approval) cross product compute the correct
+  // default_visible per the CASE-wrapped expression (open OR !approved → 1;
+  // else 0; NULL-status collapses via CASE to 0 on the approved corner).
+  // The fn-648 v38→v39 rewind wipes the epics table during migrate, so
+  // pre-migrate rows would not survive — VIRTUAL means SQLite recomputes
+  // on read regardless of which rows exist, so we insert AFTER migrate to
+  // pin the same correctness property.
   const otherTmp = mkdtempSync(join(tmpdir(), "keeper-db-v31-shape-"));
   const otherPath = join(otherTmp, "k.db");
   const v31 = new Database(otherPath, { create: true });
@@ -5715,20 +5719,10 @@ test("v31 DB migrates to v32: epics.default_visible added as VIRTUAL generated c
       queue_jump INTEGER NOT NULL DEFAULT 0
     )
   `);
-  // Seed the 6 corners of the (status, approval) cross product.
-  const insert = v31.prepare(
-    "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-  );
-  insert.run("e1", 1, "open+approved", "open", "approved", 1, 1);
-  insert.run("e2", 2, "open+pending", "open", "pending", 2, 1);
-  insert.run("e3", 3, "done+approved", "done", "approved", 3, 1);
-  insert.run("e4", 4, "done+pending", "done", "pending", 4, 1);
-  insert.run("e5", 5, "null+approved", null, "approved", 5, 1);
-  insert.run("e6", 6, "null+pending", null, "pending", 6, 1);
   // v31's other tables — minimal shape so migrate()'s schema-converge
-  // doesn't trip on missing tables. The rewind blocks are version-guarded
-  // (storedVersion < N) so a v31 → v32 reopen does NOT re-trigger the
-  // v30→v31 rewind; the seeded epics rows must survive.
+  // doesn't trip on missing tables. We seed the 6 corners AFTER migrate
+  // (post-rewind) to assert VIRTUAL-computation correctness — see the
+  // test-level docstring for the fn-648 rewind context.
   v31.run(`
     CREATE TABLE jobs (
       job_id TEXT PRIMARY KEY,
@@ -5777,7 +5771,7 @@ test("v31 DB migrates to v32: epics.default_visible added as VIRTUAL generated c
   const ver = reopened
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
 
   // (b) default_visible column present per PRAGMA table_xinfo (the
   // generated-column-aware helper).
@@ -5786,9 +5780,19 @@ test("v31 DB migrates to v32: epics.default_visible added as VIRTUAL generated c
   ).map((c) => c.name);
   expect(cols).toContain("default_visible");
 
-  // (c) Pre-existing rows now compute the correct default_visible values
-  // per the CASE-wrapped expression — VIRTUAL means SQLite recomputes on
-  // every read, so no backfill UPDATE was needed.
+  // (c) Seed the 6 corners of the (status, approval) cross product
+  // post-migrate (the fn-648 v38→v39 rewind would have wiped any
+  // pre-migrate rows). VIRTUAL means SQLite recomputes on every read,
+  // so insert-then-read pins the CASE-wrapped expression's correctness.
+  const insertPost = reopened.prepare(
+    "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  );
+  insertPost.run("e1", 1, "open+approved", "open", "approved", 1, 1);
+  insertPost.run("e2", 2, "open+pending", "open", "pending", 2, 1);
+  insertPost.run("e3", 3, "done+approved", "done", "approved", 3, 1);
+  insertPost.run("e4", 4, "done+pending", "done", "pending", 4, 1);
+  insertPost.run("e5", 5, "null+approved", null, "approved", 5, 1);
+  insertPost.run("e6", 6, "null+pending", null, "pending", 6, 1);
   const rows = reopened
     .prepare("SELECT epic_id, default_visible FROM epics ORDER BY epic_id ASC")
     .all() as { epic_id: string; default_visible: number }[];
@@ -5816,7 +5820,7 @@ test("v31 DB migrates to v32: epics.default_visible added as VIRTUAL generated c
   const ver2 = reopened2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   const rowCount = (
     reopened2.prepare("SELECT COUNT(*) AS n FROM epics").get() as {
       n: number;
@@ -5887,13 +5891,15 @@ test("fresh v33 DB has profiles table with config_dir NOT NULL PRIMARY KEY + pai
   db.close();
 });
 
-test("v32 DB migrates to v33: profiles table added; pre-existing projections preserved (fn-639)", () => {
+test("v32 DB migrates to v33: profiles table added; pre-existing projections wiped by v38→v39 rewind (fn-639, fn-648)", () => {
   // Build a v32-shape DB by hand (epics + jobs + reducer_state + meta only —
   // no profiles), then reopen via openDb() → migrate() to verify: (a) the
-  // version stamp bumps to "33", (b) the profiles table exists with the
-  // correct shape, (c) the pre-existing epics rows survive the migration
-  // (no rewind on v32→v33 — the new table populates organically on the
-  // next SessionStart fold).
+  // version stamp bumps through v33 to the current SCHEMA_VERSION, (b) the
+  // profiles table exists with the correct shape, (c) the pre-existing
+  // epics row is WIPED by the fn-648 v38→v39 rewind in the same migrate
+  // transaction. The v32→v33 step itself has no rewind — the new profiles
+  // table populates organically on the next SessionStart fold — but the
+  // later v38→v39 step in the same transaction clears epics/jobs/etc.
   const otherTmp = mkdtempSync(join(tmpdir(), "keeper-db-v32-shape-"));
   const otherPath = join(otherTmp, "k.db");
   const v32 = new Database(otherPath, { create: true });
@@ -5971,7 +5977,7 @@ test("v32 DB migrates to v33: profiles table added; pre-existing projections pre
   const ver = reopened
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   // (b) profiles table exists with the right column shape.
   const cols = reopened.prepare("PRAGMA table_info(profiles)").all() as {
     name: string;
@@ -5986,18 +5992,22 @@ test("v32 DB migrates to v33: profiles table added; pre-existing projections pre
     "last_event_id",
     "updated_at",
   ]);
-  // (c) Pre-existing epics row survives — v32→v33 has no rewind.
+  // (c) Pre-existing epics row is wiped by the fn-648 v38→v39 rewind in
+  // the same migrate transaction. v32→v33 itself has no rewind, but the
+  // later v38→v39 step inside the same `migrate()` call clears the
+  // projection tables. The boot drain (not run here) would re-fold from
+  // the event log under the new reducer match logic.
   const epicRow = reopened
     .prepare("SELECT epic_id, title FROM epics WHERE epic_id = 'e1'")
-    .get() as { epic_id: string; title: string };
-  expect(epicRow.title).toBe("preserved-across-migrate");
+    .get() as { epic_id: string; title: string } | null;
+  expect(epicRow).toBeNull();
   reopened.close();
   // Re-open is idempotent.
   const { db: reopened2 } = openDb(otherPath);
   const ver2 = reopened2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   reopened2.close();
   rmSync(otherTmp, { recursive: true, force: true });
 });
@@ -6076,16 +6086,19 @@ test("fresh v34 DB has epics.resolved_epic_deps (nullable TEXT) and epic_dep_edg
   db.close();
 });
 
-test("v33 DB migrates to v34: resolved_epic_deps column + epic_dep_edges table added; pre-existing rows re-derive via chunked post-migrate backfill (fn-637)", () => {
+test("v33 DB migrates to v34: resolved_epic_deps column + epic_dep_edges table added; pre-existing rows wiped by v38→v39 rewind (fn-637, fn-648)", () => {
   // Build a v33-shape DB by hand (epics with the v33 column set; no
   // resolved_epic_deps; no epic_dep_edges table), then reopen via
-  // openDb() → migrate() to verify: (a) version stamp bumps to "34",
-  // (b) the new column is added AND the chunked post-migrate backfill
-  // populates it (task .3 — re-derives `resolved_epic_deps` for every
-  // pre-existing row; a row with empty `depends_on_epics` reads `'[]'`
-  // — "computed, no deps", distinct from the NULL "not-yet-computed"
-  // sentinel), (c) the epic_dep_edges table + dep_token index exist
-  // with the expected shape, (d) the pre-existing epics row survives.
+  // openDb() → migrate() to verify: (a) version stamp bumps through v34
+  // to the current SCHEMA_VERSION, (b) the new column is added,
+  // (c) the epic_dep_edges table + dep_token index exist with the
+  // expected shape, (d) the pre-existing epics row is WIPED by the
+  // fn-648 v38→v39 rewind (the rewind runs after the v33→v34 chunked
+  // backfill but inside the same openDb() call — the original v33→v34
+  // backfill's projection output does not survive). The boot drain
+  // (not run here) would re-fold from the event log under the new
+  // reducer match logic; for this fixture there are no events, so the
+  // epics table simply reads empty after migrate.
   const otherTmp = mkdtempSync(join(tmpdir(), "keeper-db-v33-shape-"));
   const otherPath = join(otherTmp, "k.db");
   const v33 = new Database(otherPath, { create: true });
@@ -6159,19 +6172,17 @@ test("v33 DB migrates to v34: resolved_epic_deps column + epic_dep_edges table a
   v33.close();
 
   const { db: reopened } = openDb(otherPath);
-  // (a) Version stamp bumped to 34.
+  // (a) Version stamp bumped through v34 to the current SCHEMA_VERSION.
   const ver = reopened
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
-  // (b) resolved_epic_deps added AND the post-migrate chunked backfill
-  // re-derived the column for the pre-existing row. The row had no
-  // `depends_on_epics`, so the resolver yields the empty enriched array,
-  // which the backfill stamps as the wire string `'[]'` — distinct from
-  // the NULL "not-yet-computed" sentinel. Task .3 contract: the backfill
-  // runs version-guarded on the v33→v34 transition, computes
-  // `resolved_epic_deps` once per existing row, and releases the writer
-  // lock between chunks (no mega-transaction).
+  expect(ver.value).toBe("39");
+  // (b) resolved_epic_deps column added. Under the fn-648 v38→v39 rewind,
+  // the pre-existing `e1` row is wiped before the chunked v34 backfill
+  // runs, so the backfill walks an empty epics table and has nothing to
+  // UPDATE. The boot drain (not run here) would re-fold from the event
+  // log, re-creating epics rows under the new reducer match logic; this
+  // fixture has no events, so the table reads empty.
   const cols = reopened.prepare("PRAGMA table_info(epics)").all() as {
     name: string;
   }[];
@@ -6184,9 +6195,12 @@ test("v33 DB migrates to v34: resolved_epic_deps column + epic_dep_edges table a
     epic_id: string;
     title: string;
     resolved_epic_deps: string | null;
-  };
-  expect(row.title).toBe("preserved-across-migrate");
-  expect(row.resolved_epic_deps).toBe("[]");
+  } | null;
+  expect(row).toBeNull();
+  const epicCount = (
+    reopened.prepare("SELECT COUNT(*) AS n FROM epics").get() as { n: number }
+  ).n;
+  expect(epicCount).toBe(0);
   // (c) epic_dep_edges table + dep_token index exist.
   const tables = (
     reopened
@@ -6205,18 +6219,23 @@ test("v33 DB migrates to v34: resolved_epic_deps column + epic_dep_edges table a
   const ver2 = reopened2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   reopened2.close();
   rmSync(otherTmp, { recursive: true, force: true });
 });
 
-test("v33 DB with non-trivial deps backfills `resolved_epic_deps` + `epic_dep_edges` via the chunked post-migrate pass (fn-637)", () => {
+test("v33 DB with non-trivial deps: pre-existing rows wiped by v38→v39 rewind; chunked v34 backfill walks empty epics (fn-637, fn-648)", () => {
   // Build a v33-shape DB carrying TWO epics: an upstream `fn-1-up`
   // (status=done, approval=approved) and a downstream `fn-2-down`
   // depending on the full upstream id. Reopen via openDb() → migrate()
-  // → backfill, then verify: (a) the downstream's `resolved_epic_deps`
-  // resolves the upstream as `satisfied`, (b) the `epic_dep_edges` row
-  // landed for the downstream consumer.
+  // → backfill. Under the fn-648 v38→v39 rewind, both seeded epics are
+  // wiped inside the main migrate transaction BEFORE the post-migrate
+  // chunked v34 backfill runs — so the backfill walks an empty epics
+  // table, no `resolved_epic_deps` is stamped, and `epic_dep_edges`
+  // stays empty. The boot drain (not run here) would re-create both
+  // epics from the event log and the reducer's `syncResolvedEpicDeps`
+  // forward-stamp would populate the projection live; this fixture
+  // has no events, so the tables read empty after migrate.
   const otherTmp = mkdtempSync(join(tmpdir(), "keeper-db-v33-deps-"));
   const otherPath = join(otherTmp, "k.db");
   const v33 = new Database(otherPath, { create: true });
@@ -6304,29 +6323,22 @@ test("v33 DB with non-trivial deps backfills `resolved_epic_deps` + `epic_dep_ed
   v33.close();
 
   const { db: reopened } = openDb(otherPath);
-  // (a) downstream's `resolved_epic_deps` is the resolved enriched entry —
-  // the backfill ran the shared resolver and stamped `satisfied`.
-  const row = reopened
-    .prepare("SELECT resolved_epic_deps FROM epics WHERE epic_id = 'fn-2-down'")
-    .get() as { resolved_epic_deps: string };
-  const parsed = JSON.parse(row.resolved_epic_deps);
-  expect(parsed).toEqual([
-    {
-      dep_token: "fn-1-up",
-      resolved_epic_id: "fn-1-up",
-      epic_number: 1,
-      project_basename: "repo",
-      cross_project: false,
-      state: "satisfied",
-    },
-  ]);
-  // (b) the consumer's `epic_dep_edges` row landed.
+  // (a) `epics` table is empty after the fn-648 v38→v39 rewind. Both
+  // seeded epics are wiped before the chunked v34 backfill runs, so the
+  // backfill has nothing to UPDATE and `resolved_epic_deps` stays
+  // unpopulated by construction.
+  const epicCount = (
+    reopened.prepare("SELECT COUNT(*) AS n FROM epics").get() as { n: number }
+  ).n;
+  expect(epicCount).toBe(0);
+  // (b) `epic_dep_edges` table exists (bootstrap CREATE IF NOT EXISTS) but
+  // carries no rows — there are no epics for the backfill to derive from.
   const edges = reopened
     .prepare(
       "SELECT consumer_id, dep_token FROM epic_dep_edges ORDER BY consumer_id, dep_token",
     )
     .all() as { consumer_id: string; dep_token: string }[];
-  expect(edges).toEqual([{ consumer_id: "fn-2-down", dep_token: "fn-1-up" }]);
+  expect(edges).toEqual([]);
   reopened.close();
   rmSync(otherTmp, { recursive: true, force: true });
 });
@@ -6342,7 +6354,7 @@ test("v33→v34 migration is boot-twice idempotent: addColumnIfMissing + CREATE 
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   db.close();
   const { db: db2 } = openDb(dbPath);
   // Schema convergence ran clean on the second boot — the version stamp
@@ -6350,7 +6362,7 @@ test("v33→v34 migration is boot-twice idempotent: addColumnIfMissing + CREATE 
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   const cols = db2.prepare("PRAGMA table_info(epics)").all() as {
     name: string;
   }[];
@@ -6364,13 +6376,16 @@ test("v33→v34 migration is boot-twice idempotent: addColumnIfMissing + CREATE 
   db2.close();
 });
 
-test("v35 DB migrates to v36: jobs.profile_name added + backfilled from config_dir (NULL config → NULL name), idempotent re-open", () => {
+test("v35 DB migrates to v36: jobs.profile_name added; pre-existing rows wiped by v38→v39 rewind; idempotent re-open (fn-642, fn-648)", () => {
   // Build a v35-shaped DB by hand: a jobs table WITHOUT profile_name, two
-  // pre-existing rows (one under a named profile dir, one default/NULL), and
-  // schema_version '35' so the projection survives (no rewind block runs at
-  // ≥ v35). The v35→v36 step must ADD jobs.profile_name and backfill it from
-  // config_dir via the same projectBasename derivation the SessionStart fold
-  // uses — NULL config_dir → NULL profile_name (default ~/.claude profile).
+  // pre-existing rows (one under a named profile dir, one default/NULL),
+  // schema_version '35'. The v35→v36 step ADDs jobs.profile_name and
+  // backfills it from config_dir via projectBasename — but then the
+  // fn-648 v38→v39 rewind that follows in the same migrate transaction
+  // wipes the jobs table, so the backfill's effect is invisible to the
+  // post-migrate state. The boot drain (not run here) would re-seed jobs
+  // from SessionStart events under the new reducer match logic; this
+  // fixture has no events, so the jobs table reads empty after migrate.
   const v35 = new Database(dbPath, { create: true });
   v35.run(`
     CREATE TABLE jobs (
@@ -6412,20 +6427,18 @@ test("v35 DB migrates to v36: jobs.profile_name added + backfilled from config_d
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver.value).toBe("38");
+  expect(ver.value).toBe("39");
   const jobCols = (
     db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[]
   ).map((c) => c.name);
   expect(jobCols).toContain("profile_name");
-  // Backfill: named profile → basename; NULL config → NULL name.
-  const named = db
-    .prepare("SELECT profile_name FROM jobs WHERE job_id = 'j-named'")
-    .get() as { profile_name: string | null };
-  expect(named.profile_name).toBe("multi-claude-3");
-  const def = db
-    .prepare("SELECT profile_name FROM jobs WHERE job_id = 'j-default'")
-    .get() as { profile_name: string | null };
-  expect(def.profile_name).toBeNull();
+  // The v35→v36 backfill stamped profile_name on both seeded jobs rows,
+  // but the fn-648 v38→v39 rewind in the same migrate transaction wiped
+  // the jobs table afterwards — the post-migrate state is empty.
+  const jobCount = (
+    db.prepare("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }
+  ).n;
+  expect(jobCount).toBe(0);
   db.close();
 
   // Idempotent re-open: second openDb is a no-op (addColumnIfMissing guards on
@@ -6434,6 +6447,195 @@ test("v35 DB migrates to v36: jobs.profile_name added + backfilled from config_d
   const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver2.value).toBe("38");
+  expect(ver2.value).toBe("39");
   db2.close();
+});
+
+test("v38→v39: bash_mutation_* backfilled over historical PostToolUse:Bash rows via shared deriver; rewind wipes projections; idempotent re-run", () => {
+  // Boot once at v39 so the events / jobs / epics / git_status /
+  // file_attributions / subagent_invocations / reducer_state / meta tables
+  // exist at the current shape. Then "downgrade" the stamped schema_version
+  // to '38' and clear the two sparse bash_mutation columns on a seeded
+  // PostToolUse:Bash row that — under the new deriver — should derive
+  // `git-rm` with a single-target pathspec. A second openDb runs the
+  // version-guarded backfill + rewind:
+  //   - backfill: the seeded row's NULL columns must populate via the SAME
+  //     `extractBashMutation` the hook calls steady-state, with the new
+  //     `git-rm` kind landing.
+  //   - rewind: cursor=0, jobs/epics/git_status/file_attributions/
+  //     subagent_invocations rows wiped so the boot drain re-folds under the
+  //     new reducer match logic.
+  // A third openDb verifies idempotence: the stored version is now ≥ 39, so
+  // neither the backfill nor the rewind re-runs (hand-seeded row survives).
+  const { db: v39 } = openDb(dbPath);
+  // Seed a `PostToolUse:Bash` event whose payload describes `git rm foo.txt`
+  // — under the new deriver this yields kind=`git-rm` and a single resolved
+  // pathspec target. Also seed a malformed-data row to pin the safe-NULL
+  // branch (try/catch around JSON.parse, then the typeof guard).
+  v39.run(
+    `INSERT INTO events (
+       ts, session_id, hook_event, event_type, tool_name, data
+     ) VALUES (?, ?, ?, ?, ?, ?)`,
+    [
+      1,
+      "sess-v39-backfill",
+      "PostToolUse",
+      "post_tool_use",
+      "Bash",
+      JSON.stringify({
+        tool_input: { command: "git rm foo.txt" },
+        tool_response: { stdout: "", stderr: "", interrupted: false },
+      }),
+    ],
+  );
+  v39.run(
+    `INSERT INTO events (
+       ts, session_id, hook_event, event_type, tool_name, data
+     ) VALUES (?, ?, ?, ?, ?, ?)`,
+    [
+      2,
+      "sess-v39-backfill",
+      "PostToolUse",
+      "post_tool_use",
+      "Bash",
+      "{ not valid json",
+    ],
+  );
+  // Seed a non-Bash PostToolUse event to prove the WHERE clause scoping —
+  // it must NOT be touched by the backfill.
+  v39.run(
+    `INSERT INTO events (
+       ts, session_id, hook_event, event_type, tool_name, data
+     ) VALUES (?, ?, ?, ?, ?, ?)`,
+    [3, "sess-v39-backfill", "PostToolUse", "post_tool_use", "Read", "{}"],
+  );
+  // Seed projection rows so the rewind can be observed wiping them.
+  v39.run(
+    "INSERT INTO jobs (job_id, created_at, updated_at) VALUES ('legacy-pre-v39', 0, 0)",
+  );
+  v39.run(
+    "INSERT INTO epics (epic_id, epic_number, title, last_event_id, updated_at) VALUES ('e-pre-v39', 99, 't', 0, 0)",
+  );
+  v39.run("UPDATE reducer_state SET last_event_id = 4242 WHERE id = 1");
+  // Clear the bash_mutation columns and downgrade the stamped version so
+  // the v38→v39 slot's guard fires on next open.
+  v39.run(
+    "UPDATE events SET bash_mutation_kind = NULL, bash_mutation_targets = NULL",
+  );
+  v39.run("UPDATE meta SET value = '38' WHERE key = 'schema_version'");
+  v39.close();
+
+  // Second open: backfill walks PostToolUse:Bash rows; rewind wipes projections.
+  const { db: migrated } = openDb(dbPath);
+
+  // Version stamped forward to 39.
+  const ver = migrated
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe("39");
+
+  // Backfill: the `git rm foo.txt` row now carries kind=`git-rm` and a
+  // JSON-array of one target. The deriver resolves the bare pathspec
+  // against the row's `cwd` (NULL here) so the path stays as-given.
+  const gitRm = migrated
+    .prepare(
+      "SELECT bash_mutation_kind, bash_mutation_targets FROM events WHERE ts = 1",
+    )
+    .get() as {
+    bash_mutation_kind: string | null;
+    bash_mutation_targets: string | null;
+  };
+  expect(gitRm.bash_mutation_kind).toBe("git-rm");
+  expect(gitRm.bash_mutation_targets).not.toBeNull();
+  const gitRmTargets = JSON.parse(
+    gitRm.bash_mutation_targets as string,
+  ) as string[];
+  expect(Array.isArray(gitRmTargets)).toBe(true);
+  expect(gitRmTargets.length).toBe(1);
+  expect(gitRmTargets[0]).toContain("foo.txt");
+
+  // Malformed-payload row: defensive try/catch around JSON.parse folds to
+  // (NULL, NULL) — the migration does not throw and the row is still
+  // touched (the UPDATE writes NULL, the BEGIN IMMEDIATE proceeds).
+  const malformed = migrated
+    .prepare(
+      "SELECT bash_mutation_kind, bash_mutation_targets FROM events WHERE ts = 2",
+    )
+    .get() as {
+    bash_mutation_kind: string | null;
+    bash_mutation_targets: string | null;
+  };
+  expect(malformed.bash_mutation_kind).toBeNull();
+  expect(malformed.bash_mutation_targets).toBeNull();
+
+  // Non-Bash PostToolUse row: untouched by the WHERE-scoped backfill —
+  // NULL on both columns (its starting state).
+  const nonBash = migrated
+    .prepare(
+      "SELECT bash_mutation_kind, bash_mutation_targets FROM events WHERE ts = 3",
+    )
+    .get() as {
+    bash_mutation_kind: string | null;
+    bash_mutation_targets: string | null;
+  };
+  expect(nonBash.bash_mutation_kind).toBeNull();
+  expect(nonBash.bash_mutation_targets).toBeNull();
+
+  // Rewind: cursor=0, projection tables wiped — boot drain (not run here)
+  // re-folds under the new reducer logic when the daemon starts.
+  const cursor = (
+    migrated
+      .prepare("SELECT last_event_id FROM reducer_state WHERE id = 1")
+      .get() as { last_event_id: number }
+  ).last_event_id;
+  expect(cursor).toBe(0);
+  expect(
+    (migrated.prepare("SELECT COUNT(*) AS n FROM jobs").get() as { n: number })
+      .n,
+  ).toBe(0);
+  expect(
+    (migrated.prepare("SELECT COUNT(*) AS n FROM epics").get() as { n: number })
+      .n,
+  ).toBe(0);
+  expect(
+    (
+      migrated.prepare("SELECT COUNT(*) AS n FROM git_status").get() as {
+        n: number;
+      }
+    ).n,
+  ).toBe(0);
+  expect(
+    (
+      migrated.prepare("SELECT COUNT(*) AS n FROM file_attributions").get() as {
+        n: number;
+      }
+    ).n,
+  ).toBe(0);
+  expect(
+    (
+      migrated
+        .prepare("SELECT COUNT(*) AS n FROM subagent_invocations")
+        .get() as { n: number }
+    ).n,
+  ).toBe(0);
+  migrated.close();
+
+  // Third open: idempotence. Stored version is now ≥ 39 — neither the
+  // backfill nor the rewind re-runs. Hand-seed a row that the rewind WOULD
+  // wipe; if the guard works the row survives.
+  const { db: third } = openDb(dbPath);
+  third.run(
+    "INSERT INTO jobs (job_id, created_at, updated_at) VALUES ('post-v39-survivor', 0, 0)",
+  );
+  third.close();
+  const { db: fourth } = openDb(dbPath);
+  const survivor = fourth
+    .prepare("SELECT job_id FROM jobs WHERE job_id = 'post-v39-survivor'")
+    .get() as { job_id: string } | null;
+  expect(survivor?.job_id).toBe("post-v39-survivor");
+  const ver4 = fourth
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver4.value).toBe("39");
+  fourth.close();
 });

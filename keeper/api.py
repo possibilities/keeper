@@ -38,9 +38,13 @@ from pathlib import Path
 # touch the file-attribution shape; v37 (fn-643 ``dead_letters`` operational
 # sidecar table + index) is additive and touches neither; v38 (fn-645 usage
 # envelope status / subscription / error axes) adds nullable columns to
-# ``usage`` only (keeper-py reads neither ``usage`` nor ``profiles``).
+# ``usage`` only (keeper-py reads neither ``usage`` nor ``profiles``); v39
+# (fn-648 git-rm/git-mv deletion attribution) bumps for the backfill +
+# cursor-rewind that re-derives ``events.bash_mutation_kind`` /
+# ``bash_mutation_targets`` over historical rows and re-folds the projections
+# — no shape change to the file-attribution-relevant tables keeper-py reads.
 # Bump this set when a keeper schema change alters those tables.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37, 38})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37, 38, 39})
 
 
 class KeeperError(Exception):

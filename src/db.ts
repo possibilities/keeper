@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 38;
+export const SCHEMA_VERSION = 39;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -3793,6 +3793,127 @@ function migrate(db: Database): void {
     addColumnIfMissing(db, "usage", "error_message", "TEXT");
     addColumnIfMissing(db, "usage", "error_at", "TEXT");
 
+    // v38→v39: fn-648 — backfill `bash_mutation_kind` / `bash_mutation_targets`
+    // over every historical `PostToolUse:Bash` row via the SHARED
+    // `extractBashMutation` deriver, then rewind the reducer cursor and wipe
+    // the projection tables so a from-scratch re-fold reproduces healed
+    // attributions byte-deterministically.
+    //
+    // No schema-shape change: the two sparse columns already exist (added in
+    // the v30→v31 slot above). The bump exists to gate the backfill + rewind
+    // version-guards so a re-open of an already-migrated v39+ DB skips both
+    // (the idempotence invariant). A future SCHEMA_VERSION bump that doesn't
+    // change column shape is unusual but legitimate: the deriver's *output*
+    // changed (it now recognizes `git-rm` / `git-mv` and ignores redirect
+    // tokens), and stored historical column values are stale until re-derived.
+    //
+    // Two version-guarded steps mirror v30→v31's shape (src/db.ts:3445-3539):
+    //
+    //   1. Backfill: walk every `PostToolUse:Bash` event, JSON.parse the
+    //      payload (defensive: malformed → (null, null), matching the
+    //      CLAUDE.md "safe value on malformed payload" invariant), re-derive
+    //      via the SHARED deriver, and UPDATE the two sparse columns in
+    //      place. Re-fold determinism (CLAUDE.md "byte-identical re-fold"):
+    //      historical rows and future hook writes must converge on the same
+    //      column values for the same payload via the same deriver function.
+    //      The new `git-rm` / `git-mv` kinds and the redirect-token fix from
+    //      `.1` apply to every stored row, not just future writes.
+    //
+    //   2. Cursor-rewind + DELETE projections: the new reducer match logic
+    //      from `.2` (exact + directory-prefix + fnmatch against the
+    //      snapshot-known deleted/renamed paths) changes historical
+    //      attributions — files that were `<orphan>` under the old logic
+    //      become attributed under the new logic. Without rewinding, the
+    //      stored `jobs.git_unattributed_to_live_count` / `jobs.git_orphan_count`
+    //      / `git_status.dirty_files[].attributions` / `file_attributions`
+    //      values would diverge from a fresh re-fold, violating
+    //      determinism. The honest path is to wipe and re-fold: cursor=0,
+    //      DELETE the four projection tables (jobs/epics/git_status/
+    //      file_attributions/subagent_invocations — the last for symmetry
+    //      with v31's "rebuild every projection table" pattern), boot drain
+    //      re-derives every column under the new reducer logic.
+    //
+    // Performance: the backfill re-runs the deriver per row. The redirect
+    // fix widened the affected set beyond git — every `fs-remove` /
+    // `fs-move` / `fs-copy` / `git-*` row re-derives. v31's backfill was
+    // sub-second at ~10-20k rows on the hot DB; this one is the same shape
+    // (single-pass tokenizer over length-capped command strings).
+    const storedVersionV39Backfill = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV39Backfill < 39) {
+      const rows = db
+        .prepare(
+          `SELECT id, hook_event, tool_name, cwd, data FROM events
+             WHERE tool_name = 'Bash' AND hook_event = 'PostToolUse'`,
+        )
+        .all() as {
+        id: number;
+        hook_event: string;
+        tool_name: string | null;
+        cwd: string | null;
+        data: string;
+      }[];
+      const updateStmt = db.prepare(
+        `UPDATE events
+            SET bash_mutation_kind = ?, bash_mutation_targets = ?
+          WHERE id = ?`,
+      );
+      for (const row of rows) {
+        // Defensive parse — mirrors the v30→v31 backfill: a malformed
+        // historical `data` blob folds to safe NULL (CLAUDE.md "safe value
+        // on malformed payload" invariant); the deriver itself never
+        // throws because every branch is a typeof guard. The try/catch
+        // around JSON.parse keeps a corrupt row from wedging migrate().
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(row.data) as Record<string, unknown>;
+          if (typeof parsed !== "object" || parsed === null) {
+            updateStmt.run(null, null, row.id);
+            continue;
+          }
+        } catch {
+          updateStmt.run(null, null, row.id);
+          continue;
+        }
+        const mutation = extractBashMutation(
+          row.hook_event,
+          row.tool_name,
+          parsed,
+          row.cwd,
+        );
+        if (mutation === null) {
+          updateStmt.run(null, null, row.id);
+          continue;
+        }
+        updateStmt.run(mutation.kind, JSON.stringify(mutation.targets), row.id);
+      }
+    }
+
+    // Version-guarded rewind: mirrors v30→v31's rewind block. A re-open of
+    // an already-migrated v39+ DB skips this. The boot drain after migrate()
+    // returns rebuilds all five projections from the immutable event log
+    // under the new reducer fold logic (`.2`).
+    const storedVersionV39Rewind = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV39Rewind < 39) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM git_status");
+      db.run("DELETE FROM file_attributions");
+      db.run("DELETE FROM subagent_invocations");
+    }
+
     // fn-649: COVERING indexes for the hoisted inferred-attribution window
     // self-join (`computeRepoBashWindows`). Created HERE — after every column-
     // adding version slot above — because they reference `tool_use_id` (added in
@@ -3800,7 +3921,7 @@ function migrate(db: Database): void {
     // `CREATE_EVENTS_INDEXES` block would fail "no such column" while migrating a
     // pre-v17 DB. Idempotent `CREATE INDEX IF NOT EXISTS`, so no SCHEMA_VERSION
     // bump is needed (and none claimed — v38 is taken by fn-645's `usage`
-    // envelope columns above).
+    // envelope columns above, v39 by fn-648's backfill+rewind).
     //
     // Without them the window join reads 64k bash-event full ROWS (~400MB of
     // `data` blobs), which evicts even a 256MB cache and leaves a cold fold
