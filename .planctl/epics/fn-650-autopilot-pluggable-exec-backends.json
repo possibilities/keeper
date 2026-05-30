@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-650-autopilot-pluggable-exec-backends",
   "bundles": [],
   "closer_done_at": "2026-05-30T21:42:12.738326Z",
@@ -18,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-30T21:42:12.738326Z"
+  "updated_at": "2026-05-30T23:54:13.295140Z"
 }
