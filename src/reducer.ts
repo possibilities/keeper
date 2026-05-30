@@ -1324,38 +1324,49 @@ interface InferredAttribution {
   last_event_id: number;
 }
 
-function findInferredAttributions(
+/**
+ * One `(PreToolUse:Bash, PostToolUse:Bash)` invocation window in a project's
+ * sessions — `pre_ts`/`post_ts` are the bracket `(pre.ts, post.ts]` a dirty
+ * file's mtime is tested against in {@link inferFromWindows}.
+ */
+interface BashWindow {
+  session_id: string;
+  last_event_id: number;
+  pre_ts: number;
+  post_ts: number;
+}
+
+/**
+ * Compute every bash window in `projectDir`'s sessions that could bracket SOME
+ * dirty-file mtime in `[minMtimeSec, maxMtimeSec]`. HOISTED out of the per-file
+ * loop: the old `findInferredAttributions` ran this `(session_id,
+ * tool_use_id)` self-join — a ~2.5s grind over 32k `PreToolUse:Bash` rows — once
+ * PER orphan file, so an orphan-heavy `GitSnapshot` took tens of seconds and
+ * held the `BEGIN IMMEDIATE` write lock long enough to starve hook INSERTs into
+ * dead-letters. Now it runs ONCE per fold, bounded to the dirty mtime span
+ * (`post.ts >= minMtimeSec AND pre.ts < maxMtimeSec`): a window outside that
+ * span cannot bracket any of this snapshot's files, and dirty files are recently
+ * modified, so the bound shrinks the scan to a tiny recent slice.
+ *
+ * The cwd containment (`post.cwd = projectDir OR post.cwd LIKE projectDir/%`)
+ * and the partial-index-served `(session_id, tool_use_id)` join are unchanged
+ * from the old per-file query. Pure read of the immutable event log; the exact
+ * per-file bracket is applied in {@link inferFromWindows}, so re-fold
+ * determinism is byte-identical to the pre-hoist behavior.
+ */
+function computeRepoBashWindows(
   db: Database,
   projectDir: string,
-  file: ReducerDirtyFile,
-): InferredAttribution[] {
-  if (file.mtime_ms == null) {
-    return [];
-  }
-  const mtimeSec = file.mtime_ms / 1000;
-  // SQL: find any PostToolUse:Bash whose paired PreToolUse:Bash (same
-  // session, same tool_use_id) brackets the mtime, AND whose session
-  // cwd is inside project_dir. The `cwd` containment is expressed as
-  // a literal-equality OR LIKE-prefix join — the LIKE form uses the
-  // project_dir + '/' prefix so a session running in a sibling
-  // directory doesn't match.
-  //
-  // The `(session_id, tool_use_id)` self-join is index-served by the
-  // partial index `idx_events_tool_use_id WHERE tool_use_id IS NOT
-  // NULL` (schema v17). The compound predicate keeps each pre/post
-  // row paired to its sibling.
-  //
-  // Take-latest per session: ORDER BY post.ts DESC LIMIT — but we
-  // want one row per session, so do the aggregation in JS after the
-  // SQL pulls candidates (the candidate set is bounded by the
-  // session count × concurrent-bracket count, both small in
-  // practice).
+  minMtimeSec: number,
+  maxMtimeSec: number,
+): BashWindow[] {
   const projectDirPrefix = projectDir.endsWith("/")
     ? projectDir
     : `${projectDir}/`;
   const rows = db
     .prepare(
-      `SELECT post.session_id AS session_id, post.id AS last_event_id, post.ts AS post_ts
+      `SELECT post.session_id AS session_id, post.id AS last_event_id,
+              pre.ts AS pre_ts, post.ts AS post_ts
          FROM events pre
          JOIN events post
            ON post.session_id = pre.session_id
@@ -1369,19 +1380,43 @@ function findInferredAttributions(
           AND post.ts >= ?
           AND (post.cwd = ? OR post.cwd LIKE ?)`,
     )
-    .all(mtimeSec, mtimeSec, projectDir, `${projectDirPrefix}%`) as Array<{
+    .all(
+      maxMtimeSec,
+      minMtimeSec,
+      projectDir,
+      `${projectDirPrefix}%`,
+    ) as Array<{
     session_id: string;
     last_event_id: number;
+    pre_ts: number;
     post_ts: number;
   }>;
-  const perSession = new Map<string, InferredAttribution>();
+  const windows: BashWindow[] = [];
   for (const row of rows) {
     if (row.session_id == null || row.session_id.length === 0) continue;
-    const existing = perSession.get(row.session_id);
-    if (existing == null || row.last_event_id > existing.last_event_id) {
-      perSession.set(row.session_id, {
-        session_id: row.session_id,
-        last_event_id: row.last_event_id,
+    windows.push(row);
+  }
+  return windows;
+}
+
+/**
+ * Apply the exact per-file bracket `(pre.ts, post.ts]` to the precomputed
+ * {@link computeRepoBashWindows} set: a window matches iff `pre_ts < mtimeSec
+ * <= post_ts`. Take-latest per session by `last_event_id` — byte-identical to
+ * the old per-file query's in-JS aggregation, so re-fold determinism holds.
+ */
+function inferFromWindows(
+  windows: readonly BashWindow[],
+  mtimeSec: number,
+): InferredAttribution[] {
+  const perSession = new Map<string, InferredAttribution>();
+  for (const w of windows) {
+    if (!(w.pre_ts < mtimeSec && w.post_ts >= mtimeSec)) continue;
+    const existing = perSession.get(w.session_id);
+    if (existing == null || w.last_event_id > existing.last_event_id) {
+      perSession.set(w.session_id, {
+        session_id: w.session_id,
+        last_event_id: w.last_event_id,
       });
     }
   }
@@ -1519,24 +1554,42 @@ function projectGitStatus(db: Database, event: Event): void {
         AND last_mutation_at > COALESCE(last_commit_at, 0)
       LIMIT 1`,
   );
+  // Gather the files that actually need inference (no active explicit
+  // attribution, non-null mtime) and the mtime span across them, so the bash-
+  // window scan runs ONCE for the whole snapshot instead of once per file.
+  const inferNeeded: ReducerDirtyFile[] = [];
+  let minMtimeSec = Number.POSITIVE_INFINITY;
+  let maxMtimeSec = Number.NEGATIVE_INFINITY;
   for (const file of snapshot.dirty_files) {
-    const hasActiveExplicit =
-      activeExplicitStmt.get(projectDir, file.path) != null;
-    if (hasActiveExplicit) continue;
+    if (activeExplicitStmt.get(projectDir, file.path) != null) continue;
     if (file.mtime_ms == null) continue;
-    const inferred = findInferredAttributions(db, projectDir, file);
+    inferNeeded.push(file);
     const mtimeSec = file.mtime_ms / 1000;
-    for (const m of inferred) {
-      upsertStmt.run(
-        projectDir,
-        m.session_id,
-        file.path,
-        mtimeSec,
-        "inferred",
-        "inferred",
-        m.last_event_id,
-        eventTs,
-      );
+    if (mtimeSec < minMtimeSec) minMtimeSec = mtimeSec;
+    if (mtimeSec > maxMtimeSec) maxMtimeSec = mtimeSec;
+  }
+  if (inferNeeded.length > 0) {
+    const bashWindows = computeRepoBashWindows(
+      db,
+      projectDir,
+      minMtimeSec,
+      maxMtimeSec,
+    );
+    for (const file of inferNeeded) {
+      const mtimeSec = (file.mtime_ms as number) / 1000;
+      const inferred = inferFromWindows(bashWindows, mtimeSec);
+      for (const m of inferred) {
+        upsertStmt.run(
+          projectDir,
+          m.session_id,
+          file.path,
+          mtimeSec,
+          "inferred",
+          "inferred",
+          m.last_event_id,
+          eventTs,
+        );
+      }
     }
   }
 
