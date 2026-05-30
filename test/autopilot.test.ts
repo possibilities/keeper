@@ -1,5 +1,5 @@
 /**
- * Tests for `scripts/autopilot.ts`'s block-2 filtered renderer.
+ * Tests for `cli/autopilot.ts`'s block-2 filtered renderer.
  *
  * Block 2 in autopilot's frame body lists only the task pairs + close
  * pair whose readiness verdict is `{ tag: "ready" }`. The filtering is
@@ -18,7 +18,7 @@
  *   (c) none-pass — every kind returns false → renderer returns `null`
  *       and the epic is dropped from block 2.
  *
- * Importing the renderers directly from `scripts/autopilot.ts` avoids
+ * Importing the renderers directly from `cli/autopilot.ts` avoids
  * spawning a subprocess (matches the keeper convention used by the
  * other `test/*.test.ts` pure-function suites).
  */
@@ -31,7 +31,7 @@ import type {
   DetectJobTransitionsDeps,
   DispatchEntry,
   PendingLaunch,
-} from "../scripts/autopilot";
+} from "../cli/autopilot";
 import {
   ARTHACK_ROOT,
   buildWorkerCommand,
@@ -49,7 +49,7 @@ import {
   sweepSettleTimeouts,
   tryLaunch,
   validateShell,
-} from "../scripts/autopilot";
+} from "../cli/autopilot";
 import { computeReadiness } from "../src/readiness";
 import type { EmbeddedJob, Epic, Job, Task } from "../src/types";
 

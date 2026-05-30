@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
 /**
  * `keeper` CLI dispatcher. Routes the first positional argv token to one of
- * the four TUI subcommands; surfaces top-level help and version. This is
- * task .1 of the OpenTUI port epic — the renderer cutover lands in .2+,
- * the individual `main`s relocate from `scripts/*.ts` to `cli/*.ts` in
- * `.3`-`.5`. For now each subcommand module re-shells out to its
- * `scripts/*.ts` counterpart so this task is independently verifiable.
+ * the four TUI subcommands; surfaces top-level help and version. Landed in
+ * task .1 of the OpenTUI port epic with the renderer cutover and the four
+ * subcommand mains relocating from `scripts/*.ts` to `cli/*.ts` over
+ * `.2`-`.5`. After `.5` (autopilot) every subcommand resolves to a
+ * `cli/<sub>.ts` module exporting its own `main(argv)` — no
+ * `scripts/*.ts` shim path remains.
  *
  * Contract (per the spec's gap analysis):
  *   - Bare `keeper` → usage block on stderr, exit 1.
