@@ -98,5 +98,5 @@ gated fields move).
 - [ ] turbo lint + typecheck + bun test green
 
 ## Done summary
-
+Schema v38 projects status/subscription_active/error_type/error_message/error_at onto the usage row; usage-worker carries the new fields via a new usageGateKey helper that excludes error_at from the change-gate (first projected-but-gate-excluded field); reducer extractUsageSnapshot+projectUsageRow fold the five columns leaving the v35 rate-limit reverse fan-out carve-out untouched; scripts/usage.ts hides subscription_active=false rows, shows the status token on the header, and renders a stale error line with error_at ticking via relTime in the reset column; usageRowsHashKey includes the new fields; tests cover all behaviors (28 renderer + 26 worker, all green).
 ## Evidence
