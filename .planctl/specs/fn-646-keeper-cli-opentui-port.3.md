@@ -50,5 +50,5 @@ relative-time tick advances live and does not bleed into a held frame.
 - [ ] `cli/usage.ts` wired into the dispatcher; `test/usage.test.ts` green.
 
 ## Done summary
-
+Ported scripts/usage.ts to cli/usage.ts and wired into keeper dispatcher; preserved dual subscribeCollection composition, 30s refreshLive tick with linesEqual no-op, and three-handle SIGINT teardown.
 ## Evidence
