@@ -77,14 +77,15 @@ test("parseAnsiSegments: plain line passes through as one plain segment", () => 
 
 test("parseAnsiSegments: each of the six SGR codes maps to the right bucket", () => {
   // Six independent runs — each opens its bucket, writes text, resets.
-  const cases: Array<["active" | "success" | "error" | "warn" | "faded", string]> =
-    [
-      ["active", SGR.active],
-      ["success", SGR.success],
-      ["error", SGR.error],
-      ["warn", SGR.warn],
-      ["faded", SGR.faded],
-    ];
+  const cases: Array<
+    ["active" | "success" | "error" | "warn" | "faded", string]
+  > = [
+    ["active", SGR.active],
+    ["success", SGR.success],
+    ["error", SGR.error],
+    ["warn", SGR.warn],
+    ["faded", SGR.faded],
+  ];
   for (const [kind, open] of cases) {
     const line = `${open}token${SGR.reset}`;
     expect(parseAnsiSegments(line)).toEqual([{ kind, text: "token" }]);

@@ -82,10 +82,7 @@ import type {
   StyledText,
   TextRenderable,
 } from "@opentui/core";
-import {
-  type AnsiToStyledRuntime,
-  linesToContent,
-} from "./ansi-to-styled";
+import { type AnsiToStyledRuntime, linesToContent } from "./ansi-to-styled";
 import {
   createLiveShellCore,
   type LiveShellCore,
@@ -441,7 +438,9 @@ export interface LiveShellPaintRuntime {
   // convert board's embedded SGR escapes into OpenTUI styling at paint
   // time. The body of the scene is the ONLY caller — banner stays
   // plain text + `attributes: DIM` per the docstring above.
-  readonly StyledText: new (chunks: ConstructorParameters<typeof StyledText>[0]) => StyledText;
+  readonly StyledText: new (
+    chunks: ConstructorParameters<typeof StyledText>[0],
+  ) => StyledText;
   readonly RGBA: { fromHex(hex: string): RGBA };
 }
 
