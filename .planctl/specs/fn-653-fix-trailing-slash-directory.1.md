@@ -19,5 +19,5 @@ is sufficient; reducer-side normalization is preferred for locality.
 - [ ] Existing no-slash reducer test still passes
 
 ## Done summary
-
+Stripped trailing slash from token at the top of bashTargetMatches so git rm -r dir/ (slash-preserved by resolveAgainstCwd) hits the directory-prefix branch. Added reducer test covering the slash-terminated case; existing no-slash test still passes.
 ## Evidence
