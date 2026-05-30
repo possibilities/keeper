@@ -127,5 +127,5 @@ single call site `fireLaunch` (line ~2538). Rewire
 - [ ] `bun test` green; lint clean
 
 ## Done summary
-
+Extract autopilot's Ghostty osascript spawn/close mechanics behind a narrow ExecBackend interface in src/exec-backend.ts; add a zellij backend (lazy session-ensure + new-tab id capture + close-tab-by-id) sharing the same shape; make the backend config-selectable via exec_backend + zellij_session in resolveConfig (default zellij); autopilot resolves the backend once in main() and routes launchWindow/closeWindow through it without changing orchestration.
 ## Evidence
