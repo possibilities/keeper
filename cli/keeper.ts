@@ -23,7 +23,13 @@
 
 import packageJson from "../package.json" with { type: "json" };
 
-export const SUBCOMMANDS = ["board", "git", "usage", "autopilot"] as const;
+export const SUBCOMMANDS = [
+  "board",
+  "git",
+  "usage",
+  "autopilot",
+  "await",
+] as const;
 export type Subcommand = (typeof SUBCOMMANDS)[number];
 
 export const USAGE = `keeper — unified CLI for the keeper TUIs
@@ -36,6 +42,7 @@ Subcommands:
   git         Live git status frames
   usage       Live usage frames
   autopilot   Dispatch log viewer
+  await       Block until a planctl board condition holds
 
 Flags:
   --help, -h     Show this help
@@ -113,6 +120,7 @@ export async function main(): Promise<void> {
     git: async (argv) => (await import("./git")).main(argv),
     usage: async (argv) => (await import("./usage")).main(argv),
     autopilot: async (argv) => (await import("./autopilot")).main(argv),
+    await: async (argv) => (await import("./await")).main(argv),
   };
 
   await dispatch(Bun.argv.slice(2), {

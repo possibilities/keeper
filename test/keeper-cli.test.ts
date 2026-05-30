@@ -50,6 +50,7 @@ function makeHarness(): Harness {
       git: mkHandler("git"),
       usage: mkHandler("usage"),
       autopilot: mkHandler("autopilot"),
+      await: mkHandler("await"),
     },
     stdout: (s) => stdout.push(s),
     stderr: (s) => stderr.push(s),
@@ -164,6 +165,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("git")).toBe(true);
     expect(isSubcommand("usage")).toBe(true);
     expect(isSubcommand("autopilot")).toBe(true);
+    expect(isSubcommand("await")).toBe(true);
     expect(isSubcommand("bogus")).toBe(false);
     expect(isSubcommand("")).toBe(false);
   });
