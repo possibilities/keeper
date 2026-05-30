@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-648-git-rm-mv-deletion-attribution",
   "bundles": [],
   "closer_done_at": "2026-05-30T21:12:02.941798Z",
@@ -19,5 +20,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-30T21:12:02.941798Z"
+  "updated_at": "2026-05-30T21:14:01.046633Z"
 }
