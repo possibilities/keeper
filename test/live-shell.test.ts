@@ -29,7 +29,9 @@
 
 import { afterEach, beforeAll, expect, test } from "bun:test";
 import {
+  RGBA,
   ScrollBoxRenderable,
+  StyledText,
   TextAttributes,
   TextRenderable,
 } from "@opentui/core";
@@ -41,11 +43,15 @@ import { createLiveShellCore } from "../src/live-shell-core";
 // production loads these dynamically (see the `attachLiveShellPaint`
 // docstring). Tests import them eagerly since the OpenTUI test
 // runner already pulls the same native binary in via
-// `createTestRenderer`.
+// `createTestRenderer`. `StyledText` / `RGBA` were added in fn-646.4
+// for the ANSI→StyledText shim that converts board's embedded SGR
+// escapes into OpenTUI styling at paint time.
 const PAINT_RUNTIME = {
   TextRenderable,
   ScrollBoxRenderable,
   TextAttributes,
+  StyledText,
+  RGBA,
 } as const;
 
 /**

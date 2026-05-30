@@ -77,9 +77,15 @@
 import type {
   CliRenderer,
   KeyEvent,
+  RGBA,
   ScrollBoxRenderable,
+  StyledText,
   TextRenderable,
 } from "@opentui/core";
+import {
+  type AnsiToStyledRuntime,
+  linesToContent,
+} from "./ansi-to-styled";
 import {
   createLiveShellCore,
   type LiveShellCore,
@@ -346,6 +352,12 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
           TextRenderable: otui.TextRenderable,
           ScrollBoxRenderable: otui.ScrollBoxRenderable,
           TextAttributes: otui.TextAttributes,
+          // fn-646.4: shim runtime — board emits SGR escapes that the
+          // paint layer parses into StyledText chunks. Other TUIs emit
+          // plain text and short-circuit on the no-`\x1b` fast path
+          // inside `linesToContent`.
+          StyledText: otui.StyledText,
+          RGBA: otui.RGBA,
         },
         { onUnhandledKey: opts.onUnhandledKey },
       );
@@ -425,6 +437,12 @@ export interface LiveShellPaintRuntime {
   readonly TextRenderable: typeof TextRenderable;
   readonly ScrollBoxRenderable: typeof ScrollBoxRenderable;
   readonly TextAttributes: { readonly DIM: number };
+  // fn-646.4: the ANSI→StyledText shim's chunk-builder needs these to
+  // convert board's embedded SGR escapes into OpenTUI styling at paint
+  // time. The body of the scene is the ONLY caller — banner stays
+  // plain text + `attributes: DIM` per the docstring above.
+  readonly StyledText: new (chunks: ConstructorParameters<typeof StyledText>[0]) => StyledText;
+  readonly RGBA: { fromHex(hex: string): RGBA };
 }
 
 /**
@@ -490,9 +508,18 @@ export function attachLiveShellPaint(
     height: Math.max(0, renderer.height - 1),
     viewportCulling: true,
   });
+  // fn-646.4: derive the shim runtime bag once — pulled out of the
+  // `LiveShellPaintRuntime` (which carries the rest of the scene's
+  // ctors) so the body assignment in `repaint()` reads symmetrically
+  // for the pass-through and the StyledText paths.
+  const shimRuntime: AnsiToStyledRuntime = {
+    StyledText: runtime.StyledText,
+    RGBA: runtime.RGBA,
+    TextAttributes: runtime.TextAttributes,
+  };
   const bodyNode = new runtime.TextRenderable(renderer, {
     id: "live-shell-body",
-    content: core.visibleRows().join("\n"),
+    content: linesToContent(core.visibleRows(), shimRuntime),
   });
   sb.add(bodyNode);
   renderer.root.add(bannerNode);
@@ -567,9 +594,14 @@ export function attachLiveShellPaint(
       lastBannerText = bannerNext;
     }
     const rows = core.visibleRows();
+    // Cache key is still the plain `\n`-joined text — it's a faithful
+    // change-detector regardless of whether the actual `bodyNode.content`
+    // gets a string (no-ANSI fast path) or a StyledText (board's ANSI-
+    // bearing lines). Avoids re-running the parser when rows are
+    // byte-identical to the last paint.
     const joined = rows.join("\n");
     if (joined !== lastBodyText || rows.length !== lastBodyLineCount) {
-      bodyNode.content = joined;
+      bodyNode.content = linesToContent(rows, shimRuntime);
       lastBodyText = joined;
       lastBodyLineCount = rows.length;
     }

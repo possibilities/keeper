@@ -34,7 +34,7 @@ import {
   renderDeadLetterPill,
   renderEpicDepPills,
   renderJobLinkLines,
-} from "../scripts/board";
+} from "../cli/board";
 import {
   computeReadiness,
   type EpicDepResolution,

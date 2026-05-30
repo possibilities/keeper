@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-30T16:47:43.394598Z",
+  "depends_on": [
+    "fn-651-usage-lift-time-and-freshness.4"
+  ],
+  "epic": "fn-651-usage-lift-time-and-freshness",
+  "id": "fn-651-usage-lift-time-and-freshness.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "keeper render lift countdown and staleness",
+  "updated_at": "2026-05-30T16:47:43.394598Z"
+}

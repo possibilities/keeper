@@ -1,0 +1,19 @@
+{
+  "branch_name": "fn-651-usage-lift-time-and-freshness",
+  "bundles": [],
+  "created_at": "2026-05-30T16:47:43.394598Z",
+  "depends_on_epics": [],
+  "id": "fn-651-usage-lift-time-and-freshness",
+  "last_validated_at": "2026-05-30T16:47:43.505981Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "usage lift-time and freshness",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-30T16:47:43.394598Z"
+}
