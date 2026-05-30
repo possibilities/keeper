@@ -8,7 +8,7 @@
     "fn-650-autopilot-pluggable-exec-backends"
   ],
   "id": "fn-651-usage-lift-time-and-freshness",
-  "last_validated_at": "2026-05-30T19:06:37.752770Z",
+  "last_validated_at": "2026-05-30T19:06:37.969076Z",
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -20,5 +20,5 @@
     "/Users/mike/code/agentuse",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-30T19:06:37.641414Z"
+  "updated_at": "2026-05-30T19:06:37.927465Z"
 }
