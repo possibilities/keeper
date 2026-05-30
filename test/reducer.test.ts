@@ -11029,3 +11029,181 @@ test("from-scratch re-fold reproduces the profiles projection byte-identically (
     .all();
   expect(after).toEqual(before);
 });
+
+// ---------------------------------------------------------------------------
+// Schema v40 (fn-652): jobs.name_history append on title-advance
+// ---------------------------------------------------------------------------
+
+/** Read the persisted `name_history` for `jobId` as a parsed string array. */
+function getNameHistory(jobId = "sess-a"): string[] | null {
+  const row = db
+    .query("SELECT name_history FROM jobs WHERE job_id = ?")
+    .get(jobId) as { name_history: string } | null;
+  if (row == null) return null;
+  return JSON.parse(row.name_history) as string[];
+}
+
+test("SessionStart with spawn_name seeds name_history = [spawn_name]", () => {
+  insertEvent({ hook_event: "SessionStart", spawn_name: "work::foo" });
+  drainAll();
+  expect(getNameHistory()).toEqual(["work::foo"]);
+});
+
+test("SessionStart without spawn_name seeds name_history = []", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  drainAll();
+  expect(getNameHistory()).toEqual([]);
+});
+
+test("title precedence-write appends the new distinct title to name_history", () => {
+  insertEvent({ hook_event: "SessionStart", spawn_name: "work::foo" });
+  // A payload-source title advances over the priority-1 spawn source.
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ session_title: "real-title" }),
+  });
+  drainAll();
+  expect(getNameHistory()).toEqual(["work::foo", "real-title"]);
+});
+
+test("repeating the same title is a no-op (tail-dedupe)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  // Two payload-source title events with the SAME title — the second is a
+  // pure no-op (precedence-write rule skips the UPDATE when persisted ===
+  // incoming), so name_history must NOT carry a duplicate tail.
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ session_title: "foo" }),
+  });
+  insertEvent({
+    hook_event: "Notification",
+    data: JSON.stringify({ session_title: "foo" }),
+  });
+  drainAll();
+  expect(getNameHistory()).toEqual(["foo"]);
+});
+
+test("revert to earlier title appends again (history records the bounce)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  // foo → bar → foo: each transition advances `title` and appends a new
+  // entry to name_history. Dedupe is tail-only — repeating an EARLIER value
+  // still records the bounce.
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ session_title: "foo" }),
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ session_title: "bar" }),
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ session_title: "foo" }),
+  });
+  drainAll();
+  expect(getNameHistory()).toEqual(["foo", "bar", "foo"]);
+});
+
+test("name_history caps at the most-recent 20 entries", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  // 25 distinct titles → only the last 20 should remain.
+  for (let i = 0; i < 25; i++) {
+    insertEvent({
+      hook_event: "UserPromptSubmit",
+      data: JSON.stringify({ session_title: `t-${i}` }),
+    });
+  }
+  drainAll();
+  const history = getNameHistory();
+  expect(history?.length).toBe(20);
+  // Tail is the latest title; head is t-5 (first 5 sliced off).
+  expect(history?.[history.length - 1]).toBe("t-24");
+  expect(history?.[0]).toBe("t-5");
+});
+
+test("RESUME (duplicate SessionStart) does NOT touch name_history", () => {
+  insertEvent({ hook_event: "SessionStart", spawn_name: "work::foo" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ session_title: "real-title" }),
+  });
+  drainAll();
+  expect(getNameHistory()).toEqual(["work::foo", "real-title"]);
+  // Now end the session and resume with a different spawn name — the
+  // RESUME path's ON CONFLICT branch MUST leave name_history alone
+  // (precedence-owned, mirrors title/title_source).
+  insertEvent({
+    hook_event: "SessionEnd",
+    data: JSON.stringify({ reason: "stop" }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "work::different-spawn-name",
+  });
+  drainAll();
+  // The resume's spawn name was NOT prepended/appended; history stays put.
+  expect(getNameHistory()).toEqual(["work::foo", "real-title"]);
+});
+
+test("higher-priority title source (transcript over payload) appends a new entry", () => {
+  insertEvent({ hook_event: "SessionStart", spawn_name: "spawn-x" });
+  // Tier 2 payload-source seeds title='foo'.
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ session_title: "foo" }),
+  });
+  // Tier 3 transcript-source promotes title='bar' over the payload source.
+  // Even though 'bar' was never in history, it gets appended via the
+  // distinct-advance rule.
+  insertEvent({
+    hook_event: "TranscriptTitle",
+    data: JSON.stringify({ session_title: "bar" }),
+  });
+  drainAll();
+  expect(getNameHistory()).toEqual(["spawn-x", "foo", "bar"]);
+});
+
+test("name_history is re-fold deterministic: rewind + re-drain reproduces it byte-for-byte", () => {
+  insertEvent({ hook_event: "SessionStart", spawn_name: "spawn-z" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ session_title: "alpha" }),
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ session_title: "beta" }),
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ session_title: "alpha" }),
+  });
+  drainAll();
+  const before = getNameHistory();
+  expect(before).toEqual(["spawn-z", "alpha", "beta", "alpha"]);
+
+  // Rewind + wipe + re-drain. The persisted `name_history` after re-fold
+  // must equal the pre-rewind value byte-for-byte (pure function of the
+  // event log + reducer logic; no Date.now/env reads).
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  expect(getNameHistory()).toEqual(before);
+});
+
+test("title fold with a malformed persisted name_history blob folds to [] then appends safely", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  drainAll();
+  // Corrupt the persisted cell to a non-array string (should never happen
+  // in steady-state — the column is NOT NULL DEFAULT '[]' and every writer
+  // JSON.stringify's a real array — but the defensive parse must fold
+  // safely). The next title-advance must produce a healthy ['x'] history.
+  db.run("UPDATE jobs SET name_history = ? WHERE job_id = 'sess-a'", [
+    "{ not a json array",
+  ]);
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ session_title: "x" }),
+  });
+  drainAll();
+  expect(getNameHistory()).toEqual(["x"]);
+});

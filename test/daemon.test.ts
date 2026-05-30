@@ -115,7 +115,9 @@ test("withBootDrainCheckpointTuning disables autocheckpoint inside the body and 
 
   // Steady-state default before the wrapper runs.
   const initial = (
-    db.query("PRAGMA wal_autocheckpoint").get() as { wal_autocheckpoint: number }
+    db.query("PRAGMA wal_autocheckpoint").get() as {
+      wal_autocheckpoint: number;
+    }
   ).wal_autocheckpoint;
   expect(initial).toBe(WAL_AUTOCHECKPOINT_PAGES);
 
@@ -133,7 +135,9 @@ test("withBootDrainCheckpointTuning disables autocheckpoint inside the body and 
   expect(insideValue).toBe(0);
   // …and the steady-state threshold is restored once the drain completes.
   const after = (
-    db.query("PRAGMA wal_autocheckpoint").get() as { wal_autocheckpoint: number }
+    db.query("PRAGMA wal_autocheckpoint").get() as {
+      wal_autocheckpoint: number;
+    }
   ).wal_autocheckpoint;
   expect(after).toBe(WAL_AUTOCHECKPOINT_PAGES);
 
@@ -152,7 +156,9 @@ test("withBootDrainCheckpointTuning restores autocheckpoint even if the body thr
   // The `finally` must re-arm steady-state checkpointing — leaving the
   // long-running writer with autocheckpoint=0 would let the WAL grow unbounded.
   const after = (
-    db.query("PRAGMA wal_autocheckpoint").get() as { wal_autocheckpoint: number }
+    db.query("PRAGMA wal_autocheckpoint").get() as {
+      wal_autocheckpoint: number;
+    }
   ).wal_autocheckpoint;
   expect(after).toBe(WAL_AUTOCHECKPOINT_PAGES);
 

@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 39;
+export const SCHEMA_VERSION = 40;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -616,7 +616,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     git_dirty_count INTEGER NOT NULL DEFAULT 0,
     git_unattributed_to_live_count INTEGER NOT NULL DEFAULT 0,
     git_orphan_count INTEGER NOT NULL DEFAULT 0,
-    profile_name TEXT
+    profile_name TEXT,
+    name_history TEXT NOT NULL DEFAULT '[]'
 )
 `;
 
@@ -3964,6 +3965,59 @@ function migrate(db: Database): void {
       db.run("DELETE FROM subagent_invocations");
     }
 
+    // v39→v40: fn-652 — `jobs.name_history` ordered JSON array of the distinct
+    // titles a job has carried (oldest→newest, current title last, deduped,
+    // capped at the most-recent 20). Maintained by the reducer's title
+    // precedence-write block — when the persisted `(title, title_source)`
+    // is promoted to a new distinct value, the new title is appended to the
+    // persisted array iff it is not already the last element. The cap is
+    // applied by slicing to the last 20 entries. Pure function of the
+    // persisted cell + the incoming title (no `Date.now`, no event-arrival
+    // ordering) so a from-scratch re-fold reproduces byte-identical
+    // `name_history` values. Seeded on the SessionStart spawn insert with
+    // `["<spawn name>"]` when `spawn_name != null`, else `'[]'` (the schema
+    // default).
+    //
+    // Mirrors `epic_links` (TEXT NOT NULL DEFAULT '[]') — same JSON-array
+    // convention. The literal addition above in CREATE_JOBS keeps a fresh
+    // v40 DB and a migrated v39→v40 DB converged on identical schema (the
+    // addColumnIfMissing/literal lockstep convention).
+    //
+    // The version-guarded one-time backfill below seeds `name_history` for
+    // every existing `jobs` row: `["<title>"]` when `title` is non-NULL,
+    // `'[]'` otherwise. A re-open of an already-migrated v40+ DB skips the
+    // backfill via the `preMigrateStoredVersion < 40` guard. Re-fold
+    // determinism: a from-scratch re-fold drops the `jobs` table and re-
+    // seeds via SessionStart's spawn-title insert and subsequent title-
+    // precedence writes — the backfilled `["<title>"]` matches what the
+    // fold would have produced (the current `title` was either seeded at
+    // SessionStart or promoted through the title rule, both of which the
+    // new append logic would record as the sole entry on a fresh fold).
+    addColumnIfMissing(
+      db,
+      "jobs",
+      "name_history",
+      "TEXT NOT NULL DEFAULT '[]'",
+    );
+    if (preMigrateStoredVersion < 40) {
+      // Non-idempotent (version-guarded): read every `jobs` row, derive the
+      // seed array from `title`, and UPDATE in-place. A NULL `title` keeps
+      // the schema-default `'[]'` (the column was added NOT NULL DEFAULT
+      // '[]' above, so the freshly-added cell is already `'[]'`; the UPDATE
+      // is a no-op write in that case but is explicit for symmetry).
+      const rows = db.prepare("SELECT job_id, title FROM jobs").all() as {
+        job_id: string;
+        title: string | null;
+      }[];
+      const updateStmt = db.prepare(
+        "UPDATE jobs SET name_history = ? WHERE job_id = ?",
+      );
+      for (const row of rows) {
+        const seed = row.title != null ? JSON.stringify([row.title]) : "[]";
+        updateStmt.run(seed, row.job_id);
+      }
+    }
+
     // fn-649: COVERING indexes for the hoisted inferred-attribution window
     // self-join (`computeRepoBashWindows`). Created HERE — after every column-
     // adding version slot above — because they reference `tool_use_id` (added in
@@ -3971,7 +4025,8 @@ function migrate(db: Database): void {
     // `CREATE_EVENTS_INDEXES` block would fail "no such column" while migrating a
     // pre-v17 DB. Idempotent `CREATE INDEX IF NOT EXISTS`, so no SCHEMA_VERSION
     // bump is needed (and none claimed — v38 is taken by fn-645's `usage`
-    // envelope columns above, v39 by fn-648's backfill+rewind).
+    // envelope columns above, v39 by fn-648's backfill+rewind, v40 by
+    // fn-652's `jobs.name_history`).
     //
     // Without them the window join reads 64k bash-event full ROWS (~400MB of
     // `data` blobs), which evicts even a 256MB cache and leaves a cold fold

@@ -319,16 +319,28 @@ the native value" is the default.
   NOT a floor/ceiling, so an additive bump keeper-py never reads (e.g. a
   `usage`-only column) still must be listed. The `test/schema-version.test.ts`
   assertion enforces this: it reads `SCHEMA_VERSION` and fails the build unless
-  the frozenset's max covers it. Current version: **v39** (fn-648 — the
-  `git-rm` / `git-mv` deriver fix ships with a version-guarded one-time
-  backfill that re-derives `bash_mutation_kind` + `bash_mutation_targets`
-  over every persisted `PostToolUse:Bash` row using the new deriver
-  (capturing previously-missed `git rm`/`git mv` events AND scrubbing
-  redirect-token pollution from existing `fs-*` rows), then rewinds
-  `reducer_state.last_event_id = 0` and clears `jobs` / `epics` so the
-  next boot drain re-folds the healed event log into byte-identical
-  projections — version-guarded so a re-run can't corrupt the
-  already-migrated schema. v38, fn-645: additive nullable `usage`
+  the frozenset's max covers it. Current version: **v40** (fn-652 —
+  `jobs.name_history TEXT NOT NULL DEFAULT '[]'` ordered JSON array of
+  the distinct titles a session has carried, oldest→newest, deduped
+  against the tail, capped at the most-recent 20; appended in the
+  reducer's title precedence-write block whenever `title` advances to a
+  new distinct value, seeded on the SessionStart spawn insert,
+  precedence-owned (resume never re-seeds). Re-fold deterministic:
+  append is a pure function of the persisted cell + the incoming title,
+  with no `Date.now`/env reads. Backfill is `preMigrateStoredVersion <
+  40` guarded and seeds each existing titled row's array to `[title]`.
+  keeper-py does not read `name_history` — the consumer is claudectl
+  via a forthcoming `get_session_name_history()` — so the keeper-py
+  bump is whitelist-only with no reader logic change.). v39, fn-648:
+  the `git-rm` / `git-mv` deriver fix ships with a version-guarded
+  one-time backfill that re-derives `bash_mutation_kind` +
+  `bash_mutation_targets` over every persisted `PostToolUse:Bash` row
+  using the new deriver (capturing previously-missed `git rm`/`git mv`
+  events AND scrubbing redirect-token pollution from existing `fs-*`
+  rows), then rewinds `reducer_state.last_event_id = 0` and clears
+  `jobs` / `epics` so the next boot drain re-folds the healed event log
+  into byte-identical projections — version-guarded so a re-run can't
+  corrupt the already-migrated schema. v38, fn-645: additive nullable `usage`
   columns for the agentuse envelope's status / subscription / error
   axes; keeper-py reads neither `usage` nor `profiles`, so the bump is
   whitelist-only with no reader logic change. v37, fn-643: `dead_letters`

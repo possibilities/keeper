@@ -42,9 +42,14 @@ from pathlib import Path
 # (fn-648 git-rm/git-mv deletion attribution) bumps for the backfill +
 # cursor-rewind that re-derives ``events.bash_mutation_kind`` /
 # ``bash_mutation_targets`` over historical rows and re-folds the projections
-# — no shape change to the file-attribution-relevant tables keeper-py reads.
+# — no shape change to the file-attribution-relevant tables keeper-py reads;
+# v40 (fn-652 jobs.name_history) adds a NOT NULL DEFAULT '[]' JSON-array
+# column on ``jobs`` carrying the ordered distinct titles a session has
+# carried — keeper-py does not read ``jobs.name_history`` (the consumer is
+# claudectl via a forthcoming ``get_session_name_history()``), so the bump
+# is whitelist-only with no reader logic change.
 # Bump this set when a keeper schema change alters those tables.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37, 38, 39})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37, 38, 39, 40})
 
 
 class KeeperError(Exception):

@@ -4593,9 +4593,20 @@ function projectJobsRow(db: Database, event: Event): void {
         const { plan_verb, plan_ref } = planVerbRefFromSpawnName(
           event.spawn_name,
         );
+        // Schema v40 (fn-652): seed `name_history` with `["<spawn_name>"]`
+        // on the spawn INSERT when `spawn_name != null`, else `'[]'` (the
+        // schema default, also written explicitly for symmetry). RESUME is
+        // a no-touch: the ON CONFLICT branch must leave `name_history`
+        // alone — mirrors `title` / `title_source` (precedence-owned, a
+        // resume never re-seeds the priority-1 spawn name over a higher
+        // source). The title precedence-write block below the switch is
+        // the only path that appends a new entry; the spawn seed is set-
+        // once identity per session, so re-fold determinism holds.
+        const spawnNameHistory =
+          event.spawn_name != null ? JSON.stringify([event.spawn_name]) : "[]";
         db.run(
-          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name, name_history)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(job_id) DO UPDATE SET
              pid = COALESCE(excluded.pid, jobs.pid),
              start_time = COALESCE(excluded.start_time, jobs.start_time),
@@ -4640,6 +4651,10 @@ function projectJobsRow(db: Database, event: Event): void {
             // (NOT the `''`-collapse profiles applies) so the column tracks
             // `jobs.config_dir`'s own nullability under the resume COALESCE.
             event.config_dir == null ? null : projectBasename(event.config_dir),
+            // Schema v40 (fn-652): see comment above. ON CONFLICT leaves
+            // jobs.name_history untouched (no `name_history = ...` clause
+            // in the UPDATE SET), so RESUME never re-seeds.
+            spawnNameHistory,
           ],
         );
         // Schema v33 (fn-639): seed a visible `profiles` row for this
@@ -5254,17 +5269,31 @@ function projectJobsRow(db: Database, event: Event): void {
     const source = titleSourceForEvent(event);
     const p = sourcePriority(source);
     const row = db
-      .query("SELECT title, title_source FROM jobs WHERE job_id = ?")
+      .query(
+        "SELECT title, title_source, name_history FROM jobs WHERE job_id = ?",
+      )
       .get(jobId) as {
       title: string | null;
       title_source: string | null;
+      name_history: string;
     } | null;
     if (row != null) {
       const pp = sourcePriority(row.title_source);
       if (p > pp || (p === pp && row.title !== title)) {
+        // Schema v40 (fn-652): append the promoted title to the persisted
+        // `name_history` JSON array iff it isn't already the last element
+        // (dedupe-against-tail). Cap at the most-recent 20 by slicing the
+        // tail. Pure function of the persisted cell + the incoming title —
+        // no `Date.now`/env reads, no event-arrival ordering — so a from-
+        // scratch re-fold reproduces byte-identical history. Defensive
+        // parse: a malformed array folds to `[]` per the CLAUDE.md "safe
+        // value on malformed payload" invariant (the column is NOT NULL
+        // DEFAULT '[]' so a healthy reducer never writes anything else,
+        // but the JSON.parse boundary is the right place to harden).
+        const nextHistory = appendNameHistory(row.name_history, title);
         db.run(
-          "UPDATE jobs SET title = ?, title_source = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
-          [title, source, event.id, ts, jobId],
+          "UPDATE jobs SET title = ?, title_source = ?, name_history = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
+          [title, source, nextHistory, event.id, ts, jobId],
         );
         // Title flipped → re-fan into the embedded entry so the displayed
         // title tracks. A TranscriptTitle event's title rule is the only
@@ -5276,6 +5305,52 @@ function projectJobsRow(db: Database, event: Event): void {
       }
     }
   }
+}
+
+/**
+ * Schema v40 (fn-652): append `title` to the persisted JSON array iff it
+ * is not already the last element. Caps the result at the most-recent 20
+ * entries by slicing the tail. Pure function of `(persistedJson, title)`:
+ * no `Date.now`/env reads, no fold-time wall-clock — so a from-scratch
+ * re-fold reproduces byte-identical history. Returns a `JSON.stringify`
+ * of the resulting array, ready to bind into the `UPDATE jobs SET
+ * name_history = ?` slot.
+ *
+ * Defensive parse: a malformed persisted JSON blob (which should never
+ * happen — the column is NOT NULL DEFAULT '[]' and every writer
+ * `JSON.stringify`s a real array) folds to `[]` per the CLAUDE.md "safe
+ * value on malformed payload" invariant, then proceeds with the append.
+ * A non-array JSON value (e.g. an object) is treated the same way.
+ * Entries that are not strings (defensive — a malformed historical row)
+ * are filtered out before append.
+ */
+function appendNameHistory(persisted: string, title: string): string {
+  const NAME_HISTORY_CAP = 20;
+  let history: string[];
+  try {
+    const parsed = JSON.parse(persisted) as unknown;
+    if (Array.isArray(parsed)) {
+      history = parsed.filter((x): x is string => typeof x === "string");
+    } else {
+      history = [];
+    }
+  } catch {
+    history = [];
+  }
+  // Dedupe against the tail only: the array represents oldest→newest, so a
+  // distinct-advance that happens to repeat an earlier title (e.g. foo→bar→foo)
+  // still records the second `foo` entry, preserving the "title history" shape
+  // a session-name resolver wants. Skipping only the case where the incoming
+  // title equals the current tail keeps the precedence-write rule (which
+  // already gates on `row.title !== title`) symmetric with the history.
+  if (history.length > 0 && history[history.length - 1] === title) {
+    return JSON.stringify(history);
+  }
+  history.push(title);
+  if (history.length > NAME_HISTORY_CAP) {
+    history = history.slice(history.length - NAME_HISTORY_CAP);
+  }
+  return JSON.stringify(history);
 }
 
 /**
