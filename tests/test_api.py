@@ -19,6 +19,7 @@ from keeper.api import (
     KeeperDBMissing,
     KeeperSchemaError,
     get_session_dirty_files,
+    get_session_titles,
 )
 
 
@@ -148,6 +149,72 @@ class GetSessionDirtyFilesTest(unittest.TestCase):
         os.environ["KEEPER_DB"] = str(Path(self._tmp.name) / "nope.db")
         with self.assertRaises(KeeperDBMissing):
             get_session_dirty_files("sess", "/repo")
+
+
+def _build_jobs_db(path: Path, *, schema_version: int = 31) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
+        (str(schema_version),),
+    )
+    # Minimal jobs shape — only the columns get_session_titles reads.
+    conn.execute(
+        "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, title TEXT, title_source TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _add_job(path, job_id, title):
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO jobs (job_id, title) VALUES (?, ?)", (job_id, title))
+    conn.commit()
+    conn.close()
+
+
+class GetSessionTitlesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self._tmp.name) / "keeper.db"
+        _build_jobs_db(self.db)
+        self._prev = os.environ.get("KEEPER_DB")
+        os.environ["KEEPER_DB"] = str(self.db)
+
+    def tearDown(self) -> None:
+        if self._prev is None:
+            os.environ.pop("KEEPER_DB", None)
+        else:
+            os.environ["KEEPER_DB"] = self._prev
+        self._tmp.cleanup()
+
+    def test_titled_jobs_returned(self):
+        _add_job(self.db, "sess-1", "first-session")
+        _add_job(self.db, "sess-2", "second-session")
+        self.assertEqual(
+            get_session_titles(),
+            {"sess-1": "first-session", "sess-2": "second-session"},
+        )
+
+    def test_null_title_omitted(self):
+        _add_job(self.db, "sess-1", "named")
+        _add_job(self.db, "sess-2", None)
+        self.assertEqual(get_session_titles(), {"sess-1": "named"})
+
+    def test_empty_when_no_jobs(self):
+        self.assertEqual(get_session_titles(), {})
+
+    def test_unsupported_schema_raises(self):
+        bad = Path(self._tmp.name) / "bad.db"
+        _build_jobs_db(bad, schema_version=30)
+        os.environ["KEEPER_DB"] = str(bad)
+        with self.assertRaises(KeeperSchemaError):
+            get_session_titles()
+
+    def test_missing_db_raises(self):
+        os.environ["KEEPER_DB"] = str(Path(self._tmp.name) / "nope.db")
+        with self.assertRaises(KeeperDBMissing):
+            get_session_titles()
 
 
 if __name__ == "__main__":

@@ -213,3 +213,29 @@ def get_session_dirty_files(session_id: str, cwd: str) -> dict:
         return {"files_by_repo": files_by_repo, "cwd_repo": cwd_repo}
     finally:
         conn.close()
+
+
+def get_session_titles() -> dict[str, str]:
+    """Return ``{session_id: title}`` for every job that has a title.
+
+    Reads keeper's ``jobs`` projection (``job_id`` is the session id in v1;
+    ``title`` is the human-readable session name, seeded at SessionStart and
+    refined by prompt/transcript per the reducer's ``title_source``
+    precedence).  Jobs with a NULL ``title`` are omitted, mirroring the old
+    hooks-tracker ``WHERE name IS NOT NULL`` filter.
+
+    Raises ``KeeperDBMissing`` / ``KeeperSchemaError`` like the other readers
+    here — no silent fallback.
+    """
+    path = _resolve_db_path()
+    conn = _open_readonly(path)
+    try:
+        _check_schema(conn)
+        return {
+            job_id: title
+            for job_id, title in conn.execute(
+                "SELECT job_id, title FROM jobs WHERE title IS NOT NULL"
+            )
+        }
+    finally:
+        conn.close()
