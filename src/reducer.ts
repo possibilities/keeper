@@ -1153,13 +1153,29 @@ interface RenderedAttribution {
 
 /**
  * Project the latest `(session_id, file_path)` mutation evidence the
- * persisted event log carries for a given dirty file. One pass over the
- * union of:
- *   - tool mutations: PostToolUse on `tool_name ∈ {Write, Edit, MultiEdit,
- *     NotebookEdit}` whose `tool_input.file_path` matches the dirty file's
- *     `path` or its `orig_path` (rename case);
- *   - bash mutations: PostToolUse:Bash events whose `bash_mutation_targets`
- *     JSON array contains the dirty file's `path` or `orig_path`.
+ * persisted event log carries for a given dirty file. Three match modes
+ * are layered, all feeding the same `file_attributions` UPSERT in
+ * pass 1:
+ *
+ *   - tool mutations (exact): PostToolUse on `tool_name ∈ {Write, Edit,
+ *     MultiEdit, NotebookEdit}` whose `tool_input.file_path` matches the
+ *     dirty file's `path` or its `orig_path` (rename case);
+ *   - bash mutations (exact): PostToolUse:Bash events whose
+ *     `bash_mutation_targets` JSON array contains the dirty file's `path`
+ *     or `orig_path` — SQL-side via `json_each WHERE j.value = ?`. Covers
+ *     plain modifications by `git-tree-mutate` / `fs-*` deriver kinds
+ *     stamping concrete file paths.
+ *   - bash mutations (prefix + fnmatch) for `git-rm` / `git-mv` events:
+ *     these targets MAY name directories (recursive `git rm -r dir/`) or
+ *     globs (`'*.ts'`) — modes SQL can't probe — AND the dirty files
+ *     they touch carry `mtime_ms=null` (deleted-tree), so the inferred
+ *     pass-2 path is unavailable. We pull candidate rows narrowed by the
+ *     partial index on `bash_mutation_kind IN ('git-rm', 'git-mv')` into
+ *     JS and run three checks per stored token: exact, directory-prefix
+ *     (`file === token || file.startsWith(token + '/')`), and a hand-
+ *     rolled fnmatch (`*`→`[^/]*`, `?`→`[^/]`, anchored, no `**`/nested
+ *     quantifiers). The `__TREE__` sentinel is excluded explicitly so a
+ *     tree-mutate event can't match real files. Cached compiled RegExp.
  *
  * The function returns one row per session, carrying the LATEST `ts` it
  * saw and the source/op identifying that row. The reducer's pass-1 upsert
@@ -1167,8 +1183,9 @@ interface RenderedAttribution {
  * UPSERT's WHERE clause gates the UPDATE on `excluded.last_mutation_at >
  * file_attributions.last_mutation_at`).
  *
- * Pure SQL — no liveness probe, no FS read. Every fact lives in the
- * `events` table so a from-scratch re-fold reproduces the same row set.
+ * Pure: no liveness probe, no FS read, no wall-clock. Every fact lives
+ * in the `events` table so a from-scratch re-fold reproduces the same
+ * row set byte-identically.
  */
 interface SessionMutation {
   session_id: string;
@@ -1176,6 +1193,119 @@ interface SessionMutation {
   last_event_id: number;
   op: string;
   source: "tool" | "bash";
+}
+
+/**
+ * The literal `__TREE__` token from `extractBashMutation` — used as the
+ * sole `targets[]` entry for git tree-mutators with no pathspec, for
+ * `git-rm`/`git-mv` with `--pathspec-from-file=`, and for any pathspec
+ * carrying `:`-magic. MUST never prefix- or glob-match a real file path,
+ * so the deletion-attribution path explicitly skips it before doing
+ * directory-prefix or fnmatch.
+ */
+const BASH_TREE_SENTINEL = "__TREE__";
+
+/**
+ * Module-scope cache of fnmatch token → compiled RegExp. The deletion-
+ * attribution path may probe the same stored bash_mutation_targets
+ * token across many dirty files within a single snapshot; cache the
+ * compiled RegExp so re-compilation cost stays O(distinct tokens).
+ * Cleared only on process restart — re-fold determinism is unaffected
+ * because the cache value is a pure function of the key.
+ */
+const FNMATCH_CACHE = new Map<string, RegExp>();
+
+/**
+ * Is `token` a glob pattern (contains an unescaped `*` or `?`)?
+ * We only compile fnmatch for these — exact + directory-prefix cover
+ * the rest and avoid the regex round-trip.
+ */
+function isGlobToken(token: string): boolean {
+  for (let i = 0; i < token.length; i++) {
+    const c = token.charCodeAt(i);
+    if (c === 0x2a /* * */ || c === 0x3f /* ? */) return true;
+  }
+  return false;
+}
+
+/**
+ * Compile a glob token to an anchored fnmatch RegExp. Dependency-free
+ * (the hook forbids third-party imports; we keep the helper reducer-
+ * side only, so it never enters the hook's import graph). Mapping:
+ *
+ *   - `*` → `[^/]*` (NEVER `.*` — `*` does not cross path separators)
+ *   - `?` → `[^/]`  (single non-separator char)
+ *   - every other regex meta (`. + ( ) [ ] { } ^ $ | \`) is escaped
+ *   - anchored with `^` / `$` so a substring can't accidentally match
+ *
+ * NO `**` recursive-glob support, NO nested quantifiers, NO POSIX
+ * character classes — every uncovered pattern degrades to "won't match
+ * this token" (the dirty file simply doesn't attribute via that
+ * token's row; pass-1 exact + directory-prefix still apply). ReDoS-
+ * safe by construction: the regex is a flat sequence of `[^/]*` /
+ * `[^/]` / single-char literals, no alternation, no backreferences,
+ * no nested quantifiers — worst-case linear in `path.length`.
+ */
+function compileFnmatch(token: string): RegExp {
+  const cached = FNMATCH_CACHE.get(token);
+  if (cached !== undefined) return cached;
+  let pattern = "^";
+  for (let i = 0; i < token.length; i++) {
+    const ch = token[i] as string;
+    if (ch === "*") {
+      pattern += "[^/]*";
+    } else if (ch === "?") {
+      pattern += "[^/]";
+    } else if (
+      ch === "." ||
+      ch === "+" ||
+      ch === "(" ||
+      ch === ")" ||
+      ch === "[" ||
+      ch === "]" ||
+      ch === "{" ||
+      ch === "}" ||
+      ch === "^" ||
+      ch === "$" ||
+      ch === "|" ||
+      ch === "\\"
+    ) {
+      pattern += `\\${ch}`;
+    } else {
+      pattern += ch;
+    }
+  }
+  pattern += "$";
+  const compiled = new RegExp(pattern);
+  FNMATCH_CACHE.set(token, compiled);
+  return compiled;
+}
+
+/**
+ * Does a stored bash_mutation_targets `token` (absolute path or glob)
+ * match `candidatePath` (also absolute)? Three modes, in order:
+ *
+ *   1. Exact: `token === candidatePath`.
+ *   2. Directory-prefix: `token` has no glob char AND no trailing `/`
+ *      AND `candidatePath === token || candidatePath.startsWith(token + '/')`.
+ *      Covers `git rm -r dir/` (post-resolveAgainstCwd: `/repo/dir`)
+ *      attributing every file under `/repo/dir/...`.
+ *   3. Fnmatch: only if `token` contains `*` or `?`; compile and probe.
+ *
+ * `__TREE__` is rejected up-front so a tree-wide sentinel can never
+ * match a real path — preserving the deriver's contract that the
+ * sentinel signals "no pathspec, attribute nothing via this token".
+ */
+function bashTargetMatches(token: string, candidatePath: string): boolean {
+  if (token === BASH_TREE_SENTINEL) return false;
+  if (token === candidatePath) return true;
+  if (isGlobToken(token)) {
+    return compileFnmatch(token).test(candidatePath);
+  }
+  if (token.length > 0 && !token.endsWith("/")) {
+    if (candidatePath.startsWith(`${token}/`)) return true;
+  }
+  return false;
 }
 
 function findExplicitAttributions(
@@ -1285,6 +1415,80 @@ function findExplicitAttributions(
           source: "bash",
         });
       }
+    }
+  }
+
+  // Deletion-attribution scan (git-rm / git-mv): SQL above probes only
+  // exact `j.value = ?` matches. `git-rm`/`git-mv` events legitimately
+  // store directory tokens (`git rm -r dir/` → `/repo/dir`) and glob
+  // tokens (`git rm '*.ts'` → `/repo/*.ts`) that an exact probe will
+  // never hit; the dirty files they touch carry `mtime_ms=null` (the
+  // file is gone), so the inferred pass-2 path also doesn't fire. Pull
+  // candidate rows narrowed by the kind filter into JS and apply
+  // exact / directory-prefix / fnmatch via `bashTargetMatches`. The
+  // SQL→JS boundary moves here for these kinds only: pure (no FS,
+  // no wall-clock), so re-fold determinism holds.
+  //
+  // The query enumerates every `git-rm` / `git-mv` event once; for each
+  // we walk its `bash_mutation_targets` JSON in JS and probe every
+  // candidate path. A typical session emits a handful of these per
+  // snapshot at most, so the JS-side cost is negligible compared to
+  // the SQL-side `json_each` pass.
+  const deletionRows = db
+    .prepare(
+      `SELECT id, ts, session_id, bash_mutation_kind AS kind,
+              bash_mutation_targets AS targets
+         FROM events
+        WHERE bash_mutation_kind IN ('git-rm', 'git-mv')`,
+    )
+    .all() as Array<{
+    id: number;
+    ts: number;
+    session_id: string;
+    kind: string;
+    targets: string | null;
+  }>;
+  for (const row of deletionRows) {
+    if (row.session_id == null || row.session_id.length === 0) continue;
+    if (row.targets == null || row.targets.length === 0) continue;
+    let tokens: unknown;
+    try {
+      tokens = JSON.parse(row.targets);
+    } catch {
+      // Malformed JSON folds to "no match" — safe-fold per the reducer's
+      // "never throw" invariant.
+      continue;
+    }
+    if (!Array.isArray(tokens)) continue;
+    let matched = false;
+    for (const rawToken of tokens) {
+      if (typeof rawToken !== "string") continue;
+      let hit = false;
+      for (const candidatePath of paths) {
+        if (bashTargetMatches(rawToken, candidatePath)) {
+          hit = true;
+          break;
+        }
+      }
+      if (hit) {
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) continue;
+    const existing = perSession.get(row.session_id);
+    if (
+      existing == null ||
+      row.ts > existing.last_mutation_at ||
+      (row.ts === existing.last_mutation_at && row.id > existing.last_event_id)
+    ) {
+      perSession.set(row.session_id, {
+        session_id: row.session_id,
+        last_mutation_at: row.ts,
+        last_event_id: row.id,
+        op: row.kind,
+        source: "bash",
+      });
     }
   }
 
