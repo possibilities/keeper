@@ -38,5 +38,5 @@ actually shipped (read the merged code, don't trust this spec verbatim).
 - [ ] BashMutation + findExplicitAttributions JSDoc updated to final shape.
 
 ## Done summary
-
+CLAUDE.md bash-mutation invariant + backfill contract and README ## Architecture schema-v31 paragraph integrate new git-rm/git-mv kinds, three reducer match modes (exact / directory-prefix / hand-rolled fnmatch), __TREE__ sentinel rejection, and v39 backfill+rewind. JSDoc on extractBashMutation and findExplicitAttributions already final from tasks .1/.2.
 ## Evidence
