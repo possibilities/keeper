@@ -55,5 +55,5 @@ the event's columns are backfilled AND a re-fold attributes the deletion
 - [ ] Migrate is idempotent on re-run; db.test.ts covers backfill + heal.
 
 ## Done summary
-
+Bumped SCHEMA_VERSION to v39 with a version-guarded forward-only slot: backfill re-derives events.bash_mutation_kind / bash_mutation_targets over every historical PostToolUse:Bash row via the shared extractBashMutation (defensive try/catch on JSON.parse folds malformed payloads to safe NULL), then rewinds the reducer cursor and DELETEs jobs/epics/git_status/file_attributions/subagent_invocations so the boot drain re-folds under the new .1 deriver + .2 reducer match logic. keeper-py SUPPORTED_SCHEMA_VERSIONS whitelist updated to include 39. Pre-existing migration tests that pinned post-migrate row survival rewritten to acknowledge the rewind; new test covers backfill + git-rm derivation + safe-NULL malformed branch + wipe + version-guarded idempotence. All 1551 bun tests pass.
 ## Evidence
