@@ -82,5 +82,5 @@ name_history. `bun test` + keep schema-version drift-guard green.
 - [ ] new db + reducer tests pass; full `bun test` green
 
 ## Done summary
-
+Added jobs.name_history TEXT NOT NULL DEFAULT '[]' column (schema v39). Reducer appends distinct titles on advance, seeds on spawn, no-touches on resume, caps at 20. v38→v39 guarded backfill seeds existing titled rows. keeper-py SUPPORTED_SCHEMA_VERSIONS updated with v39. All 421 tests pass.
 ## Evidence
