@@ -856,6 +856,62 @@ test("GitSnapshot deletion-attribution: git-rm -r directory-prefix attributes ev
   expect(jobRow?.git_orphan_count).toBe(1);
 });
 
+test("GitSnapshot deletion-attribution: git-rm -r dir/ (trailing slash) attributes every file under the dir", () => {
+  // fn-653: `git rm -r dir/` (resolveAgainstCwd preserves the trailing
+  // `/`) stamps `/repo/dir/` as the target token. The reducer must
+  // strip the trailing slash before the directory-prefix probe so
+  // slash-terminated tokens still attribute their children.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-rmslash" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rmslash" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-rmslash",
+    cwd: "/repo",
+    bash_mutation_kind: "git-rm",
+    bash_mutation_targets: JSON.stringify(["/repo/dir/"]),
+    data: JSON.stringify({ tool_input: { command: "git rm -r dir/" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        { path: "dir/file.ts", xy: " D", mtime_ms: null },
+        { path: "dir/sub/nested.ts", xy: " D", mtime_ms: null },
+        // Negative control: a sibling dir MUST NOT match.
+        { path: "other/c.ts", xy: " D", mtime_ms: null },
+      ],
+    }),
+  });
+  drainAll();
+  const inside1 = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-rmslash", "dir/file.ts");
+  const inside2 = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-rmslash", "dir/sub/nested.ts");
+  const outside = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-rmslash", "other/c.ts");
+  expect(inside1).not.toBeNull();
+  expect(inside2).not.toBeNull();
+  expect(outside).toBeNull();
+});
+
 test("GitSnapshot deletion-attribution: git-rm fnmatch glob token matches *.ts", () => {
   // `git rm '*.ts'` (post-resolveAgainstCwd) → `/repo/*.ts`. The
   // fnmatch path attributes files matching `[^/]*\.ts` (a single

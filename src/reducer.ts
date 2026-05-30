@@ -1285,11 +1285,15 @@ function compileFnmatch(token: string): RegExp {
  * Does a stored bash_mutation_targets `token` (absolute path or glob)
  * match `candidatePath` (also absolute)? Three modes, in order:
  *
- *   1. Exact: `token === candidatePath`.
- *   2. Directory-prefix: `token` has no glob char AND no trailing `/`
- *      AND `candidatePath === token || candidatePath.startsWith(token + '/')`.
- *      Covers `git rm -r dir/` (post-resolveAgainstCwd: `/repo/dir`)
- *      attributing every file under `/repo/dir/...`.
+ *   1. Exact: `token === candidatePath` (after stripping any trailing `/`).
+ *   2. Directory-prefix: `token` has no glob char AND
+ *      `candidatePath === token || candidatePath.startsWith(token + '/')`.
+ *      Covers `git rm -r dir/` (post-resolveAgainstCwd: `/repo/dir/`
+ *      with slash preserved, or `/repo/dir` without) attributing every
+ *      file under `/repo/dir/...`. A trailing `/` on the token is
+ *      stripped up-front so both shapes hit the same branch (the deriver
+ *      preserves the user's input verbatim, so a slash-terminated
+ *      directory pathspec must still match the prefix path).
  *   3. Fnmatch: only if `token` contains `*` or `?`; compile and probe.
  *
  * `__TREE__` is rejected up-front so a tree-wide sentinel can never
@@ -1298,12 +1302,18 @@ function compileFnmatch(token: string): RegExp {
  */
 function bashTargetMatches(token: string, candidatePath: string): boolean {
   if (token === BASH_TREE_SENTINEL) return false;
-  if (token === candidatePath) return true;
-  if (isGlobToken(token)) {
-    return compileFnmatch(token).test(candidatePath);
+  // Strip a trailing `/` so `git rm -r dir/` (resolveAgainstCwd preserves
+  // the slash) hits the directory-prefix branch the same as `git rm -r dir`.
+  // Reducer-side normalization keeps locality with the matcher; the
+  // deriver still stores the user's verbatim pathspec.
+  const normalized =
+    token.length > 1 && token.endsWith("/") ? token.slice(0, -1) : token;
+  if (normalized === candidatePath) return true;
+  if (isGlobToken(normalized)) {
+    return compileFnmatch(normalized).test(candidatePath);
   }
-  if (token.length > 0 && !token.endsWith("/")) {
-    if (candidatePath.startsWith(`${token}/`)) return true;
+  if (normalized.length > 0) {
+    if (candidatePath.startsWith(`${normalized}/`)) return true;
   }
   return false;
 }
