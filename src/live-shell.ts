@@ -1,94 +1,99 @@
 /**
- * `createLiveShell` — TUI-mode primitives shared by the three keeper scripts
- * (`scripts/autopilot.ts`, `scripts/board.ts`, `scripts/git.ts`) under their
- * forthcoming `--live` flag. Owns every side effect on `process.stdin` /
- * `process.stdout`: alt-screen enter/exit, cursor hide/show, raw-mode
- * lifecycle, per-line ANSI diff wrapped in DEC 2026 synchronized output,
- * ring-buffered frame history with keyboard navigation, the SIGWINCH-debounced
- * full re-render, and the safety-net teardown handlers (`exit` /
+ * `createLiveShell` — TUI primitives shared by the four keeper TUIs
+ * (`keeper board`, `keeper git`, `keeper usage`, `keeper autopilot`).
+ * Owns the OpenTUI renderer lifecycle: alt-screen enter/exit (via
+ * `screenMode: "alternate-screen"`), raw-mode + cursor handling
+ * (driven by OpenTUI's `setupTerminal()`), per-key dispatch via the
+ * renderer's `keyInput`, mutation-based content updates against a
+ * `TextRenderable` body (pooled — only the count changes on a row-
+ * count delta), and the safety-net teardown handlers (`exit` /
  * `uncaughtException` / `unhandledRejection`).
  *
- * Why a factory (no top-level side effects). The module is import-clean —
- * every state mutation happens inside `createLiveShell(opts)`. This means
- * `bun test --isolate` imports it without touching `process.stdin.setRawMode`,
- * without writing alt-screen escapes to the test runner's terminal, and without
- * attaching `process.on('exit', ...)` handlers that would leak between test
- * files. Tests construct an isolated shell against `PassThrough` streams,
- * exercise it, and dispose; no teardown crosstalk.
+ * Why a factory (no top-level side effects). The module is import-clean
+ * — every native allocation happens inside `createLiveShell(opts)`. This
+ * means `bun test --isolate` imports it without spawning an OpenTUI
+ * renderer, without touching `process.stdin.setRawMode`, and without
+ * attaching `process.on('exit', ...)` handlers that would leak between
+ * test files.
  *
- * Public surface
+ * Public surface (unchanged from pre-OpenTUI-port)
  * --------------
  * - `createLiveShell(opts)` — returns a `LiveShell` handle.
- * - `pushFrame(lines)` — called once per script emit. `lines` is one element
- *   per row; the live-shell never splits on `\n` and the caller's contract is
- *   "one row per element." Appends to history; the frozen render becomes the
- *   historical scroll-back for that frame.
- * - `refreshLive(lines)` — re-render the live view's body without appending
- *   to history. Sets a single-slot overlay applied only when the user is
- *   viewing live; historical frames keep their frozen at-capture rendering.
- *   Cleared by the next `pushFrame`. Use for time-driven re-renders (e.g.
- *   recomputing relative-time strings against the current clock) so the live
- *   view ticks forward while scroll-back stays consistent with what was on
- *   screen when each frame was captured.
- * - `dispose()` — synchronous, idempotent. Restores raw mode, leaves the
- *   alt-screen, shows the cursor, detaches all listeners.
+ * - `pushFrame(lines)` — called once per script emit. `lines` is one
+ *   element per row.
+ * - `refreshLive(lines)` — re-render the live view's body without
+ *   appending to history. Cleared by the next `pushFrame`.
+ * - `setStatus(status)` — update a short caller-controlled segment
+ *   folded into the banner row.
+ * - `dispose()` — synchronous, idempotent. Tears down the OpenTUI
+ *   renderer; restores the terminal.
  *
- * Non-TTY behavior. When `opts.enabled === false`, OR when either of the
- * detected `stdout` / `stdin` is not a TTY, the returned shell falls back to
- * plain `stdout.write(lines.join("\n") + "\n")` and `dispose()` is a true
- * no-op. This satisfies the epic's "non-TTY behaves as if `--live` was not
- * set" contract — the caller can pass `enabled: true` from `--live` and the
- * shell still does the right thing when piped to a file or running under CI.
+ * Non-TTY behavior. When `opts.enabled === false`, OR when either of
+ * the detected `stdout` / `stdin` is not a TTY, the returned shell
+ * NEVER constructs an OpenTUI renderer — it falls back to plain
+ * `stdout.write(lines.join("\n") + "\n")` and `dispose()` is a true
+ * no-op. The renderer-agnostic core (`src/live-shell-core.ts`) holds
+ * this decision so the same passthrough semantics hold whether the
+ * caller passes `enabled: true` to a piped invocation or `enabled:
+ * false` explicitly.
  *
- * Per-line diff contract
- * ----------------------
- * History is `string[][]` — each element is one frame, each frame is one
- * element per row (offset by 1 because row 1 is reserved for the banner). The
- * differ walks the rendered frame's rows against `prevLines`, emitting
- * `\x1b[<row>;1H\x1b[2K<line>` for every row where bytes changed and a
- * clear-line for rows past the new tip that existed in `prev`. The whole
- * buffer ships in ONE `stdout.write` wrapped in DEC 2026
- * (`\x1b[?2026h` … `\x1b[?2026l`) — supported terminals paint atomically;
- * unsupported terminals ignore the wrapper silently.
+ * Keyboard ownership. The ScrollBox stays UNFOCUSED — it captures
+ * arrow keys only when focused. `autoFocus: false` is set on the
+ * renderer; we own every key via `renderer.keyInput.on("keypress",
+ * ...)`, translate the OpenTUI `key.name` back to the raw-string
+ * contract the core's keymap dispatch expects (a single character
+ * for printable keys, or the full CSI/SS3 sequence for nav keys),
+ * and route everything else to the caller's `onUnhandledKey`.
  *
- * Keyboard. CSI/SS3 escape parser modeled after the StdinBuffer pattern:
- * accumulate bytes, classify CSI (`\x1b[` … 0x40–0x7E final byte) and SS3
- * (`\x1bO` + 1 byte), flush a bare `\x1b` after a configurable idle timeout
- * (default 10 ms) so arrow keys aren't lost AND bare Escape isn't swallowed
- * forever. Keymap: `←/h/k` step back; `→/l/j` step forward (snaps to live
- * past the tip); `g` jump to oldest; `G`/`End`/`Esc` snap to live; `q`/`Ctrl-C`
- * dispose+exit; anything else ignored.
+ * Why `dispose()` is synchronous. `process.on('exit')` cannot await;
+ * an async cleanup would skip in that path AND in `uncaughtException`
+ * / `unhandledRejection` safety-nets. OpenTUI's `destroy()` is
+ * synchronous so we can run it inline.
  *
- * Ring-buffer history. Capped at `historyCap` (default 500). Oldest frame
- * drops on overflow. `viewIdx` is either the integer index of a held frame OR
- * the sentinel `"live"` — meaning "always show the latest." New frames while
- * scrolled back silently append to history (banner's `M` count updates) and
- * do NOT auto-snap.
+ * Safety nets are LOAD-BEARING. OpenTUI does NOT hook `process.exit`
+ * / unhandled rejections — a hard exit without `renderer.destroy()`
+ * leaves the terminal in raw / alt mode. We attach `exit`,
+ * `uncaughtException`, and `unhandledRejection` listeners that call
+ * `dispose()` regardless of whether the caller did so explicitly.
  *
- * Why `dispose()` is synchronous. `process.on('exit')` cannot await; an async
- * cleanup would skip in that path AND in `uncaughtException` /
- * `unhandledRejection` safety-nets. Any caller cleanup that must await
- * (socket close, buffered flush) belongs in the script's own
- * `handle.dispose()`, not here.
- *
- * Re-entrant dispose. `dispose()` may be reached three ways in the same tick:
- * (a) explicit caller invocation on SIGINT; (b) `process.on('exit')`
- * safety-net; (c) `q`/`Ctrl-C` key handler. The `disposed` flag guards
- * idempotency — a second call writes no bytes and detaches no listeners.
- *
- * Out of scope. No mouse mode, no scrollback indicator on resize, no
- * windowed history pagination — those land in follow-up tasks if/when a
- * script needs them.
+ * Re-entrant dispose. `dispose()` may be reached three ways in the
+ * same tick: (a) explicit caller invocation on SIGINT; (b)
+ * `process.on('exit')` safety-net; (c) `q`/`Ctrl-C` key handler. The
+ * `disposed` flag guards idempotency.
  */
 
+// Type-only imports from `@opentui/core`. The runtime values
+// (`createCliRenderer`, `TextRenderable`, `ScrollBoxRenderable`,
+// `TextAttributes`) are dynamically imported inside the TUI-path
+// branch of `createLiveShell` and the body of `attachLiveShellPaint`
+// — see the docstrings on each. This split exists because the
+// `@opentui/core-<platform>-<arch>` native package has a top-level
+// `await import(...)` that races under `bun test --isolate` when
+// multiple test workers load `@opentui/core` cold; the type-only
+// import keeps the script-side tests (`test/git.test.ts` etc.)
+// from triggering that load at module-graph evaluation time, since
+// they exercise `cli/git.ts` only as far as `renderRowBlocks` and
+// never touch a live renderer.
+import type {
+  CliRenderer,
+  KeyEvent,
+  ScrollBoxRenderable,
+  TextRenderable,
+} from "@opentui/core";
+import {
+  createLiveShellCore,
+  type LiveShellCore,
+  type LiveShellTimers,
+} from "./live-shell-core";
+
 /**
- * Minimal writable-stream shape the shell drives. Matches the surface of
- * `process.stdout` that we touch: `write` to push bytes, `columns` / `rows` /
- * `isTTY` for size + TTY-gate detection, plus the `on`/`off` resize listener
- * pair. `getWindowSize()` is an escape-hatch read used iff `columns` / `rows`
- * are stale (see "Bun compiled-binary `stdout.columns` stale bug" in the
- * task spec). Defined structurally so tests can inject a `PassThrough`-style
- * sink and a real `process.stdout` both satisfy the type.
+ * Minimal writable-stream shape the shell reads (TTY probe + write
+ * fallback for the passthrough path). The OpenTUI renderer requires
+ * `process.stdout` to wire alt-screen / mouse / capability detection;
+ * the production path always uses `process.stdout` directly when in
+ * TUI mode. Tests boot the shell with `enabled: false` (or non-TTY
+ * fakes) to exercise the passthrough; paint tests use OpenTUI's
+ * `createTestRenderer` directly, not this factory.
  */
 export interface LiveShellStdout {
   write(data: string): boolean;
@@ -101,11 +106,10 @@ export interface LiveShellStdout {
 }
 
 /**
- * Minimal readable-stream shape the shell drives. Matches the surface of
- * `process.stdin` that we touch: raw-mode flip, `data` listener attach/detach,
- * `pause` / `resume`, and the encoding setter. `isRaw` reads the current
- * raw-mode state so `dispose()` can restore the exact pre-shell value
- * (protects nested-TUI invocations).
+ * Minimal readable-stream shape the shell touches for the TTY probe.
+ * In TUI mode OpenTUI's renderer drives raw-mode + `resume()` itself
+ * via `setupTerminal()`; we only read `isTTY` to decide whether to
+ * construct the renderer at all.
  */
 export interface LiveShellStdin {
   setRawMode?(mode: boolean): void;
@@ -118,34 +122,31 @@ export interface LiveShellStdin {
   readonly isRaw?: boolean;
 }
 
-/**
- * Injectable scheduler — mirrors the `SchedulerTimers` pattern in
- * `src/rescan.ts`. Tests pass a fake clock so the escape-flush idle and the
- * resize debounce fire deterministically; production omits the option and
- * the shell wires the global `setTimeout` / `clearTimeout`.
- */
-export interface LiveShellTimers {
-  setTimeout(
-    cb: () => void,
-    ms: number,
-  ): ReturnType<typeof setTimeout> | number;
-  clearTimeout(
-    handle: ReturnType<typeof setTimeout> | number | undefined,
-  ): void;
-}
+// Re-export the timer interface for callers that already import it
+// from `live-shell` (tests). The interface is owned by the core; this
+// is a forwarding alias so the public surface stays stable across
+// the OpenTUI port.
+export type { LiveShellTimers };
 
 /**
- * Construction options. `enabled` is the caller's `--live` flag — when false,
- * the factory returns a pass-through shell that never touches raw mode and
- * never writes ANSI. `stdout` / `stdin` default to the process streams; tests
- * inject `PassThrough` siblings. `historyCap` defaults to 500. `timers`
- * defaults to the global scheduler. `escFlushMs` defaults to 10 ms (bare-Esc
- * flush gate). `resizeDebounceMs` defaults to 100 ms (SIGWINCH debounce).
+ * Construction options. `enabled` is the caller's `--live` flag —
+ * when false, the factory returns a passthrough shell that never
+ * constructs an OpenTUI renderer and never touches raw mode. `stdout`
+ * / `stdin` default to the process streams. `historyCap` defaults to
+ * 500. `timers` defaults to the global scheduler — used by the core's
+ * bare-Esc flush.
  *
- * `safetyNetTarget` defaults to the live `process`. Tests inject a stub
- * (`new EventEmitter()`) so the shell can attach `exit` / `uncaughtException`
- * / `unhandledRejection` listeners without leaking onto the real process
- * across test files.
+ * `escFlushMs` / `resizeDebounceMs` are retained for back-compat but
+ * `resizeDebounceMs` is unused under the OpenTUI port (the renderer
+ * debounces resize internally). `escFlushMs` still drives the core's
+ * bare-Esc disambiguation.
+ *
+ * `safetyNetTarget` defaults to the live `process`. Tests inject a
+ * stub (`new EventEmitter()`) so the shell can attach `exit` /
+ * `uncaughtException` / `unhandledRejection` listeners without leaking
+ * onto the real process across test files. Pre-OpenTUI tests covered
+ * this against the bespoke renderer; the safety-net surface itself
+ * is preserved exactly.
  */
 export interface LiveShellOptions {
   readonly enabled: boolean;
@@ -156,38 +157,16 @@ export interface LiveShellOptions {
   readonly escFlushMs?: number;
   readonly resizeDebounceMs?: number;
   readonly safetyNetTarget?: SafetyNetTarget;
-  /**
-   * Called when `q` / `Ctrl-C` is pressed. Defaults to `() => process.exit(0)`.
-   * Tests inject a recorder so they can assert "exit was requested" without
-   * actually terminating the test runner.
-   */
   readonly onExit?: () => void;
-  /**
-   * Called for any key the shell's built-in keymap doesn't handle (anything
-   * other than nav keys, `g`, `G`/End/Esc, `q`/Ctrl-C). Lets the caller bind
-   * its own keys (e.g. `p` for pause/resume) without forking the shell. The
-   * `key` argument is the same raw string the internal dispatcher receives —
-   * a single character for printable keys, or the full CSI/SS3 sequence for
-   * escape-prefixed keys.
-   */
   readonly onUnhandledKey?: (key: string) => void;
-  /**
-   * Optional report name rendered at the head of the banner row (e.g.
-   * `"board"` → `[[board]] Showing live results (frame 13)`). Lets each
-   * live keeper script identify itself in the alt-screen without
-   * burning a body-line of vertical space. Omit / pass `""` for no
-   * prefix — back-compat for tests and any caller that doesn't need
-   * the chrome.
-   */
   readonly title?: string;
 }
 
 /**
  * Safety-net subscription target. The shell attaches `exit`,
- * `uncaughtException`, and `unhandledRejection` listeners so a process-level
- * crash still gets the alt-screen torn down. Structurally typed so tests can
- * inject an `EventEmitter` and verify (a) listeners attach on enable, (b)
- * `dispose()` detaches them, and (c) firing them invokes `dispose()`.
+ * `uncaughtException`, and `unhandledRejection` listeners so a
+ * process-level crash still tears down the OpenTUI renderer.
+ * Structurally typed so tests can inject an `EventEmitter`.
  */
 export interface SafetyNetTarget {
   on(event: string, listener: (...args: unknown[]) => void): void;
@@ -195,103 +174,32 @@ export interface SafetyNetTarget {
 }
 
 /**
- * Caller-facing handle. `pushFrame` ships one frame's worth of rendered rows
- * (one element per row). `dispose()` is synchronous and idempotent — a second
- * call writes nothing and detaches no listeners.
+ * Caller-facing handle — unchanged from pre-OpenTUI-port.
  */
 export interface LiveShell {
   pushFrame(lines: string[]): void;
-  /**
-   * Re-render the live view's body without appending a new frame to history.
-   * Sets a single-slot overlay applied only when `viewIdx === "live"`. The
-   * overlay is cleared by the next `pushFrame` (a fresh tip supersedes it).
-   * Historical frames keep their at-capture rendering — scroll-back is
-   * unaffected. No-op when the shell is the non-TTY pass-through (repainting
-   * the same frame to a pipe would dupe lines) or after `dispose()`.
-   */
   refreshLive(lines: string[]): void;
-  /**
-   * Update a short status segment folded into the banner row (appended
-   * after the existing `Showing live results …` / `frame N of M …` text).
-   * The status is live-only chrome: it's not part of any frame and does
-   * not push history, so toggling it never grows the ring buffer. Empty
-   * string hides the segment. The repaint is per-line-diffed against
-   * `prevLines`, so an unchanged status writes only the SYNC wrapper
-   * bytes; a changed status repaints the banner row alone.
-   */
   setStatus(status: string): void;
   dispose(): void;
 }
 
-// ---------------------------------------------------------------------------
-// ANSI primitives — captured at module scope so the byte sequences are
-// asserted byte-identically in tests (see `test/live-shell.test.ts`).
-// ---------------------------------------------------------------------------
-
-const ENTER_ALT = "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l";
-const LEAVE_ALT = "\x1b[?25h\x1b[?1049l\x1b[0m";
-const SYNC_BEGIN = "\x1b[?2026h";
-const SYNC_END = "\x1b[?2026l";
-const CLEAR_LINE = "\x1b[2K";
-// Erase entire alt-screen + home cursor — prepended to the force-repaint
-// buffer on SIGWINCH so any rogue content (from external stdout writes
-// outside `pushFrame`, terminal-side reflow, etc.) cannot survive a
-// resize. The differ's `prevLines` model becomes authoritative again
-// on the very next paint.
-const CLEAR_SCREEN_HOME = "\x1b[2J\x1b[H";
-
-function moveTo(row: number, col: number): string {
-  return `\x1b[${row};${col}H`;
-}
-
-// ---------------------------------------------------------------------------
-// Defaults
-// ---------------------------------------------------------------------------
-
-const DEFAULT_HISTORY_CAP = 500;
-const DEFAULT_ESC_FLUSH_MS = 10;
-const DEFAULT_RESIZE_DEBOUNCE_MS = 100;
-
-const DEFAULT_TIMERS: LiveShellTimers = {
-  setTimeout: (cb, ms) => globalThis.setTimeout(cb, ms),
-  clearTimeout: (handle) => {
-    if (handle !== undefined) {
-      globalThis.clearTimeout(
-        handle as Parameters<typeof globalThis.clearTimeout>[0],
-      );
-    }
-  },
-};
-
-// ---------------------------------------------------------------------------
-// View-index sentinel — "live" means "always render the tip"; an integer is
-// the index of a held frame. A type alias makes the disjunction explicit at
-// the call sites that branch on it.
-// ---------------------------------------------------------------------------
-
-type ViewIdx = number | "live";
-
-// ---------------------------------------------------------------------------
-// Factory
-// ---------------------------------------------------------------------------
-
 /**
- * Build a live-shell handle. See module docstring for the full contract.
+ * Build a live-shell handle. See module docstring for the full
+ * contract.
  *
- * Lifecycle (when `enabled` resolves to true):
- *   1. Save `wasRaw = stdin.isRaw ?? false`.
- *   2. Write `ENTER_ALT` (alt-screen + clear + home + hide cursor).
- *   3. `stdin.setRawMode(true)`; `setEncoding("utf8")`; `resume()`;
- *      attach `data` listener (escape-sequence parser).
- *   4. Attach `stdout.on('resize', ...)` debounced ~100 ms — re-render the
- *      currently-viewed frame at the new dimensions on each fire.
- *   5. Attach `exit` / `uncaughtException` / `unhandledRejection`
- *      safety-net listeners on `safetyNetTarget`.
+ * In TUI mode (when `opts.enabled === true` AND both streams are
+ * TTYs): synchronously constructs an OpenTUI `CliRenderer` over the
+ * process streams (the renderer ctor allocates native resources
+ * eagerly; `setupTerminal()` is fired-and-forgotten with frames
+ * queued during the brief async window). The root layout is a
+ * column Box of:
+ *   - row 0: a dim `TextRenderable` banner (height 1, width 100%);
+ *   - row 1+: a `ScrollBoxRenderable` body (height: rest of viewport)
+ *     containing one `TextRenderable` whose `content` is the joined
+ *     visible rows.
  *
- * Teardown reverses the lifecycle (detach listeners → pause stdin →
- * `setRawMode(wasRaw)` → write `LEAVE_ALT`). Order is load-bearing: pausing
- * before flipping raw mode protects against a buffered Ctrl-D closing the
- * parent shell over SSH (epic best-practice).
+ * In passthrough mode: no renderer is constructed; the core's
+ * passthrough writes are routed back to `stdout.write`.
  */
 export function createLiveShell(opts: LiveShellOptions): LiveShell {
   const stdout = (opts.stdout ?? process.stdout) as LiveShellStdout;
@@ -299,377 +207,62 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   const ttyOk = Boolean(stdout.isTTY) && Boolean(stdin.isTTY);
   const enabled = opts.enabled && ttyOk;
 
-  // ----- Non-TTY / disabled path: pass-through shell, no state, no listeners.
-  // `dispose()` is a no-op — we never touched anything to begin with.
+  // ----- Passthrough path: core handles plain writes; no renderer.
   if (!enabled) {
-    let disabledDisposed = false;
+    const core = createLiveShellCore({
+      enabled: opts.enabled,
+      ttyOk,
+      title: opts.title,
+      historyCap: opts.historyCap,
+      timers: opts.timers,
+      escFlushMs: opts.escFlushMs,
+      onPlainWrite: (data) => stdout.write(data),
+      onExit: opts.onExit,
+      onUnhandledKey: opts.onUnhandledKey,
+    });
     return {
-      pushFrame(lines: string[]): void {
-        if (disabledDisposed) {
-          return;
-        }
-        stdout.write(`${lines.join("\n")}\n`);
-      },
-      refreshLive(_lines: string[]): void {
-        // Silent no-op in pass-through: time-driven re-renders would print
-        // duplicate frame bodies when the script is piped to a file or
-        // running under CI.
-      },
-      setStatus(_status: string): void {
-        // Silent no-op in pass-through: there's no banner to update when
-        // we never wrote one in the first place.
-      },
-      dispose(): void {
-        // No-op; flag exists only so a post-dispose `pushFrame` is silent.
-        disabledDisposed = true;
-      },
+      pushFrame: (lines) => core.pushFrame(lines),
+      refreshLive: (lines) => core.refreshLive(lines),
+      setStatus: (status) => core.setStatus(status),
+      dispose: () => core.dispose(),
     };
   }
 
-  // ----- Enabled path: full TUI state machine.
-  const historyCap = Math.max(1, opts.historyCap ?? DEFAULT_HISTORY_CAP);
-  const timers = opts.timers ?? DEFAULT_TIMERS;
-  const escFlushMs = opts.escFlushMs ?? DEFAULT_ESC_FLUSH_MS;
-  const resizeDebounceMs = opts.resizeDebounceMs ?? DEFAULT_RESIZE_DEBOUNCE_MS;
+  // ----- TUI path: spin up OpenTUI; wire the core's render trigger
+  // through `renderer.requestRender()`.
   const safetyNetTarget = opts.safetyNetTarget ?? (process as SafetyNetTarget);
   const onExit = opts.onExit ?? (() => process.exit(0));
-  const onUnhandledKey = opts.onUnhandledKey;
-  // Pre-computed `[[<title>]] ` prefix folded into the banner row. Empty
-  // when no title was supplied so the banner reads exactly as it did
-  // pre-title.
-  const titlePrefix =
-    opts.title != null && opts.title !== "" ? `[[${opts.title}]] ` : "";
 
-  const history: string[][] = [];
-  // The currently-painted rows (offset by 1; index 0 is row 2, etc.). `null`
-  // before the first paint so the first frame full-paints.
-  let prevLines: string[] | null = null;
-  let viewIdx: ViewIdx = "live";
   let disposed = false;
-  const wasRaw = stdin.isRaw ?? false;
-  // Optional re-render of the live view's body. When set AND
-  // viewIdx === "live", `visibleRows` returns this overlay instead of the
-  // history tip — so a time-driven tick repaint (e.g. relative-time
-  // strings ticking against the wall clock) can update the live view
-  // without growing history. Cleared by `pushFrame` (a fresh tip
-  // supersedes the overlay). Historical scroll-back is unaffected: held
-  // frames keep their frozen at-capture rendering.
-  let liveOverlay: string[] | null = null;
-  // Short caller-controlled status segment folded into the banner row
-  // (after the existing `Showing live results …` / `frame N of M …`
-  // text). Live-only chrome — never part of any frame's history. Empty
-  // string hides the segment.
-  let bannerStatus = "";
+  let setupErrored = false;
+  let paint: LiveShellPaint | null = null;
 
-  // ---- Escape-parser state.
-  // `escBuf` accumulates bytes that begin with `\x1b`. When a complete CSI
-  // (final byte 0x40–0x7E) or SS3 (single byte after `\x1bO`) lands, we
-  // dispatch and clear. A bare `\x1b` (no follow-up byte within
-  // `escFlushMs`) flushes as the Escape key.
-  let escBuf = "";
-  let escFlushHandle: ReturnType<typeof setTimeout> | number | undefined;
+  const core = createLiveShellCore({
+    enabled: true,
+    ttyOk: true,
+    title: opts.title,
+    historyCap: opts.historyCap,
+    timers: opts.timers,
+    escFlushMs: opts.escFlushMs,
+    // onPlainWrite is required by the interface but never invoked in
+    // TUI mode. Keep it a defensive no-op rather than throwing so a
+    // logic bug doesn't crash the renderer.
+    onPlainWrite: () => {},
+    onRender: () => paint?.repaint(),
+    onExit: () => {
+      // Sequence: tear down the renderer first (restore terminal),
+      // then run the caller's exit hook. Matches the pre-OpenTUI
+      // ordering — terminal restored before any caller side effects.
+      dispose();
+      onExit();
+    },
+    onUnhandledKey: opts.onUnhandledKey,
+  });
 
-  // ---- Resize-debounce state.
-  let resizeHandle: ReturnType<typeof setTimeout> | number | undefined;
-
-  // ---------------------------------------------------------------------
-  // Rendering
-  // ---------------------------------------------------------------------
-
-  /**
-   * Compose the banner row (row 1, 1-indexed). "Showing live results" when
-   * live; "frame N of M — press G to return to live" when scrolled back.
-   * Rendered as part of the per-line diff so banner state can't desync from
-   * the frame.
-   */
-  function bannerFor(view: ViewIdx, total: number): string {
-    const statusSuffix = bannerStatus === "" ? "" : ` ${bannerStatus}`;
-    if (view === "live" || total === 0) {
-      return total === 0
-        ? `\x1b[2m${titlePrefix}Showing live results${statusSuffix}\x1b[0m`
-        : `\x1b[2m${titlePrefix}Showing live results (frame ${total})${statusSuffix}\x1b[0m`;
-    }
-    // `view` is 0-indexed within the held frames; humans count from 1.
-    return `\x1b[2m${titlePrefix}frame ${view + 1} of ${total} — press G to return to live${statusSuffix}\x1b[0m`;
-  }
-
-  /**
-   * Resolve the rows the user is currently viewing. `viewIdx === "live"`
-   * resolves to the tip; an integer index reads from history. Bounds are
-   * already clamped on the input side (the key handler), but this guard
-   * is cheap and defensive against an empty-history call.
-   */
-  function visibleRows(view: ViewIdx): string[] {
-    if (history.length === 0) {
-      return [];
-    }
-    if (view === "live") {
-      return liveOverlay ?? history[history.length - 1] ?? [];
-    }
-    return history[view] ?? [];
-  }
-
-  /**
-   * Per-line diff. Builds the diff buffer (banner row + every changed body
-   * row + clear-line for body rows past the new tip that existed in prev),
-   * wraps it in DEC 2026, and ships in one `stdout.write`. Updates
-   * `prevLines` to the new tip so the next call diffs against this state.
-   *
-   * `force` skips the diff and full-paints every row — used on resize.
-   */
-  function renderDiff(force: boolean): void {
-    const total = history.length;
-    const banner = bannerFor(viewIdx, total);
-    const body = visibleRows(viewIdx);
-    // Composite "rendered frame" — banner at index 0, body lines after.
-    const next = [banner, ...body];
-    const prev = force ? null : prevLines;
-
-    // Force-paint (resize): wipe the alt-screen first so any rogue
-    // content from outside the differ's model — past stdout writes,
-    // terminal-side reflow on resize, etc. — gets cleared. Lives inside
-    // the SYNC_BEGIN/END wrapper so supporting terminals still paint
-    // atomically.
-    let buf = SYNC_BEGIN + (force ? CLEAR_SCREEN_HOME : "");
-    const maxLen = Math.max(next.length, prev?.length ?? 0);
-    for (let i = 0; i < maxLen; i++) {
-      const nextLine = next[i];
-      const prevLine = prev?.[i];
-      if (i < next.length) {
-        if (force || prevLine === undefined || nextLine !== prevLine) {
-          // Row N in the protocol = our composite index N + 1 (1-indexed).
-          buf += `${moveTo(i + 1, 1)}${CLEAR_LINE}${nextLine ?? ""}`;
-        }
-      } else if (prevLine !== undefined) {
-        // Row existed in prev but not in next — clear it.
-        buf += `${moveTo(i + 1, 1)}${CLEAR_LINE}`;
-      }
-    }
-    buf += SYNC_END;
-    stdout.write(buf);
-    prevLines = next;
-  }
-
-  // ---------------------------------------------------------------------
-  // Key dispatch
-  // ---------------------------------------------------------------------
-
-  /**
-   * Move `viewIdx` one frame backward. From "live" we step to the
-   * second-to-last frame (the last is what's currently on screen, so
-   * "back" means stepping into the held history). Clamps at 0.
-   */
-  function stepBack(): void {
-    if (history.length === 0) {
-      return;
-    }
-    if (viewIdx === "live") {
-      // From live, "back" lands on the last held frame BEFORE the tip,
-      // i.e. `length - 2`. If history is length 1 (only a tip exists)
-      // there's nothing earlier; snap to 0.
-      viewIdx = Math.max(0, history.length - 2);
-    } else {
-      viewIdx = Math.max(0, viewIdx - 1);
-    }
-    renderDiff(false);
-  }
-
-  /**
-   * Move `viewIdx` one frame forward. Stepping past the tip snaps to
-   * "live" (the tip is always the visible "live" content).
-   */
-  function stepForward(): void {
-    if (history.length === 0) {
-      return;
-    }
-    if (viewIdx === "live") {
-      return;
-    }
-    const next = viewIdx + 1;
-    if (next >= history.length - 1) {
-      // Landing on (or past) the tip snaps to "live" — the tip IS live.
-      viewIdx = "live";
-    } else {
-      viewIdx = next;
-    }
-    renderDiff(false);
-  }
-
-  function jumpOldest(): void {
-    if (history.length === 0) {
-      return;
-    }
-    viewIdx = 0;
-    renderDiff(false);
-  }
-
-  function snapLive(): void {
-    if (viewIdx === "live") {
-      return;
-    }
-    viewIdx = "live";
-    renderDiff(false);
-  }
-
-  function dispatchKey(key: string): void {
-    switch (key) {
-      case "\x1b[A": // Up
-      case "\x1b[D": // Left
-      case "h":
-      case "k":
-        stepBack();
-        return;
-      case "\x1b[B": // Down
-      case "\x1b[C": // Right
-      case "j":
-      case "l":
-        stepForward();
-        return;
-      case "g":
-        jumpOldest();
-        return;
-      case "G":
-      case "\x1b[F": // End
-      case "\x1b": // bare Escape
-        snapLive();
-        return;
-      case "q":
-      case "\x03": // Ctrl-C
-        dispose();
-        onExit();
-        return;
-      default:
-        // Hand unmapped keys (printable letters, unmapped CSI, etc.) to the
-        // caller's `onUnhandledKey` if one was supplied; otherwise ignore.
-        if (onUnhandledKey !== undefined) {
-          onUnhandledKey(key);
-        }
-        return;
-    }
-  }
-
-  // ---------------------------------------------------------------------
-  // Escape parser
-  // ---------------------------------------------------------------------
-
-  /**
-   * Cancel any armed bare-Esc flush. Called when a follow-up byte arrives
-   * (the bare-Esc interpretation is wrong — we're in a sequence) AND on
-   * teardown.
-   */
-  function cancelEscFlush(): void {
-    if (escFlushHandle !== undefined) {
-      timers.clearTimeout(escFlushHandle);
-      escFlushHandle = undefined;
-    }
-  }
-
-  /**
-   * Arm the bare-Esc flush. Called after a fresh `\x1b` lands so that, if
-   * no follow-up byte arrives within `escFlushMs`, the buffer flushes as
-   * the Escape key. Re-arming replaces any prior timer (CSI bytes cancel
-   * via `cancelEscFlush`).
-   */
-  function armEscFlush(): void {
-    cancelEscFlush();
-    escFlushHandle = timers.setTimeout(() => {
-      escFlushHandle = undefined;
-      if (escBuf === "\x1b") {
-        escBuf = "";
-        dispatchKey("\x1b");
-      }
-    }, escFlushMs);
-  }
-
-  /**
-   * Feed one chunk of stdin bytes through the parser. Bytes are classified
-   * in three modes:
-   *   - In an escape sequence (`escBuf` non-empty): accumulate until the
-   *     sequence completes (CSI final 0x40–0x7E or SS3 single byte). On
-   *     completion, dispatch and clear.
-   *   - Bare `\x1b` arrival: stash in `escBuf` and arm the flush timer.
-   *   - Any other byte: dispatch directly as a single-char key.
-   */
-  function feedStdin(chunk: string | Buffer): void {
-    const str = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    for (const ch of str) {
-      if (escBuf.length > 0) {
-        escBuf += ch;
-        // SS3: `\x1bO` + 1 byte → 3-byte sequence.
-        if (escBuf.length === 3 && escBuf[1] === "O") {
-          const seq = escBuf;
-          escBuf = "";
-          cancelEscFlush();
-          dispatchKey(seq);
-          continue;
-        }
-        // CSI: `\x1b[` … final byte 0x40–0x7E. Once we see `\x1b[`, any
-        // byte in that range completes the sequence.
-        if (escBuf.length >= 3 && escBuf[1] === "[") {
-          const code = ch.charCodeAt(0);
-          if (code >= 0x40 && code <= 0x7e) {
-            const seq = escBuf;
-            escBuf = "";
-            cancelEscFlush();
-            dispatchKey(seq);
-            continue;
-          }
-          // Otherwise keep accumulating (parameter bytes 0x30–0x3F /
-          // intermediate bytes 0x20–0x2F).
-          cancelEscFlush();
-          continue;
-        }
-        // The second byte of an escape (anything other than `[` or `O`)
-        // is non-CSI/SS3 — treat as a two-byte Meta key; we don't map any
-        // today, so just clear and ignore. But cancel the bare-Esc flush
-        // because the `\x1b` was a real sequence prefix, not bare Esc.
-        if (escBuf.length === 2 && escBuf[1] !== "[" && escBuf[1] !== "O") {
-          escBuf = "";
-          cancelEscFlush();
-          continue;
-        }
-        // Still in `\x1b` waiting for the second byte — keep waiting.
-        continue;
-      }
-      if (ch === "\x1b") {
-        escBuf = "\x1b";
-        armEscFlush();
-        continue;
-      }
-      dispatchKey(ch);
-    }
-  }
-
-  // ---------------------------------------------------------------------
-  // Resize debounce
-  // ---------------------------------------------------------------------
-
-  /**
-   * SIGWINCH handler. Debounces `resizeDebounceMs` and full-paints the
-   * currently-viewed frame at the new dimensions. We don't try to ANSI-diff
-   * through a resize (the diff state's row indices may not map to the new
-   * geometry); a force re-render is correct and cheap.
-   */
-  function onResize(): void {
-    if (resizeHandle !== undefined) {
-      timers.clearTimeout(resizeHandle);
-      resizeHandle = undefined;
-    }
-    resizeHandle = timers.setTimeout(() => {
-      resizeHandle = undefined;
-      if (disposed) {
-        return;
-      }
-      renderDiff(true);
-    }, resizeDebounceMs);
-  }
-
-  // ---------------------------------------------------------------------
-  // Safety-net handlers
-  // ---------------------------------------------------------------------
-
-  // Wrap dispose so the unhandled-* listeners can be detached by identity.
-  // Listeners receive payload arguments we don't need — we just dispose.
+  // ----- Safety-net plumbing — load-bearing per OpenTUI best
+  // practices (the renderer does NOT hook process.exit /
+  // unhandledRejection). We attach by named handler so dispose()
+  // can detach by identity.
   const onProcessExit = (): void => {
     dispose();
   };
@@ -680,148 +273,343 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
     dispose();
   };
 
-  // The `data` listener must be referentially stable so `off()` removes
-  // the exact function we attached.
-  const onStdinData = (chunk: string | Buffer): void => {
-    if (disposed) {
-      return;
-    }
-    feedStdin(chunk);
-  };
-
-  // ---------------------------------------------------------------------
-  // Public surface
-  // ---------------------------------------------------------------------
-
-  function pushFrame(lines: string[]): void {
-    if (disposed) {
-      return;
-    }
-    // A fresh tip supersedes any time-driven overlay — clear it so the
-    // newly-pushed render becomes both the history tip and the live view.
-    liveOverlay = null;
-    // Store a shallow copy so caller mutation can't corrupt history.
-    const copy = lines.slice();
-    history.push(copy);
-    if (history.length > historyCap) {
-      // Drop oldest. If `viewIdx` is an integer index, also nudge it down
-      // so it keeps pointing at the same logical frame (or clamp to 0 if
-      // that frame just got evicted).
-      history.shift();
-      if (typeof viewIdx === "number") {
-        viewIdx = Math.max(0, viewIdx - 1);
-      }
-    }
-    if (viewIdx === "live") {
-      // Live: render this frame via per-line diff against prevLines.
-      renderDiff(false);
-    } else {
-      // Scrolled back: don't re-render the body — but the banner row
-      // shows `M` (total), so re-render JUST that. The differ does the
-      // right thing: only the banner row's bytes will have changed.
-      renderDiff(false);
-    }
-  }
-
-  function refreshLive(lines: string[]): void {
-    if (disposed) {
-      return;
-    }
-    // Store a shallow copy so caller mutation can't corrupt the overlay.
-    liveOverlay = lines.slice();
-    if (viewIdx === "live") {
-      // Re-render against the new overlay. The per-line diff naturally
-      // skips unchanged rows, so a tick that produces identical text
-      // costs only the SYNC_BEGIN/SYNC_END wrapper bytes.
-      renderDiff(false);
-    }
-    // When scrolled back, the overlay sits dormant until the user snaps
-    // back to live — `snapLive()` → `renderDiff(false)` picks it up via
-    // `visibleRows`.
-  }
-
-  function setStatus(status: string): void {
-    if (disposed) {
-      return;
-    }
-    if (bannerStatus === status) {
-      return;
-    }
-    bannerStatus = status;
-    // Banner-only repaint: the per-line diff sees an unchanged body and
-    // a changed row 0, so only the banner row's bytes ship. No frame is
-    // appended to history — toggling status is pure chrome.
-    renderDiff(false);
-  }
+  safetyNetTarget.on("exit", onProcessExit);
+  safetyNetTarget.on("uncaughtException", onUncaught);
+  safetyNetTarget.on("unhandledRejection", onUnhandledRejection);
 
   function dispose(): void {
     if (disposed) {
       return;
     }
     disposed = true;
-    // Cancel timers BEFORE detaching anything else so an in-flight resize
-    // or esc-flush doesn't fire on a torn-down shell.
-    if (resizeHandle !== undefined) {
-      timers.clearTimeout(resizeHandle);
-      resizeHandle = undefined;
-    }
-    cancelEscFlush();
-    // Detach the stdin listener; pause; restore raw mode (in that order).
-    // The `pause()` before `setRawMode(false)` protects a buffered Ctrl-D
-    // from closing the parent shell over SSH (epic best-practice).
-    try {
-      stdin.off("data", onStdinData);
-    } catch {
-      // listener was never attached (e.g. dispose() called twice racing
-      // with enable) — nothing to remove.
-    }
-    try {
-      stdin.pause();
-    } catch {
-      // already paused / closed
-    }
-    if (stdin.setRawMode) {
-      try {
-        stdin.setRawMode(wasRaw);
-      } catch {
-        // raw mode was already cleared
-      }
-    }
-    // Detach resize listener.
-    try {
-      stdout.off("resize", onResize);
-    } catch {
-      // already detached
-    }
-    // Detach safety-net listeners — by identity.
+    core.dispose();
+    // Detach safety-net listeners by identity. The wrapper catches
+    // any throw from a partial-emitter test stub.
     try {
       safetyNetTarget.off("exit", onProcessExit);
       safetyNetTarget.off("uncaughtException", onUncaught);
       safetyNetTarget.off("unhandledRejection", onUnhandledRejection);
     } catch {
-      // target was a partial emitter — best-effort detach.
+      // best-effort
     }
-    // Finally leave the alt-screen + show the cursor + reset SGR.
+    // Destroy the OpenTUI renderer if it managed to come up.
+    // Synchronous — restores the terminal in one shot.
+    if (paint != null) {
+      paint.destroy();
+      paint = null;
+    }
+  }
+
+  // ----- Async renderer setup. The handle MUST be returned
+  // synchronously to preserve the caller surface, so we kick the
+  // renderer up in a microtask and queue any pushFrame/refreshLive
+  // calls (via the core's history) until the renderer is ready —
+  // the first paint reads `core.bannerText()` / `core.visibleRows()`
+  // as soon as the renderer mounts.
+  //
+  // OpenTUI is dynamic-imported here (not at module scope) because
+  // its native-binary loader has a top-level `await import(...)` that
+  // races under `bun test --isolate`. Module-graph consumers that
+  // never hit this code path (e.g. `test/git.test.ts` exercising
+  // `renderRowBlocks` from `cli/git.ts`) avoid paying the load cost
+  // entirely.
+  void (async () => {
     try {
-      stdout.write(LEAVE_ALT);
-    } catch {
-      // stdout closed under us — nothing we can do.
+      const otui = await import("@opentui/core");
+      const r = await otui.createCliRenderer({
+        // OpenTUI does NOT hook exit / unhandledRejection — our
+        // safety-net listeners handle those. Drop SIGINT from
+        // exitSignals AND disable the dedicated Ctrl-C exit path
+        // so the `q`/Ctrl-C key handler in the core stays the
+        // canonical exit route.
+        exitOnCtrlC: false,
+        exitSignals: ["SIGTERM", "SIGHUP", "SIGQUIT"],
+        autoFocus: false,
+        // Use the dedicated alt-screen so we don't trash the user's
+        // scrollback. (Default; explicit for clarity.)
+        screenMode: "alternate-screen",
+      });
+      if (disposed) {
+        // Caller already disposed before setup completed — tear
+        // down the freshly-constructed renderer immediately.
+        try {
+          r.destroy();
+        } catch {
+          // best-effort
+        }
+        return;
+      }
+      paint = attachLiveShellPaint(
+        r,
+        core,
+        {
+          TextRenderable: otui.TextRenderable,
+          ScrollBoxRenderable: otui.ScrollBoxRenderable,
+          TextAttributes: otui.TextAttributes,
+        },
+        { onUnhandledKey: opts.onUnhandledKey },
+      );
+    } catch (err) {
+      setupErrored = true;
+      // Setup failure: log to stderr and dispose. We swallow rather
+      // than throw because the caller's invocation contract is
+      // "createLiveShell returns synchronously" — surfacing the
+      // failure here would already be past the caller's catch.
+      try {
+        process.stderr.write(
+          `live-shell: OpenTUI setup failed (${String(err)}); falling back to silent passthrough\n`,
+        );
+      } catch {
+        // best-effort
+      }
+      dispose();
     }
+  })();
+
+  return {
+    pushFrame: (lines: string[]): void => {
+      if (disposed || setupErrored) {
+        return;
+      }
+      core.pushFrame(lines);
+    },
+    refreshLive: (lines: string[]): void => {
+      if (disposed || setupErrored) {
+        return;
+      }
+      core.refreshLive(lines);
+    },
+    setStatus: (status: string): void => {
+      if (disposed || setupErrored) {
+        return;
+      }
+      core.setStatus(status);
+    },
+    dispose,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Paint layer — exposed for paint tests (`test/live-shell.test.ts`) so
+// they can build the same scene against `createTestRenderer` without
+// forking the renderer-construction code. Production callers go
+// through `createLiveShell` above; the paint layer is a private
+// implementation detail otherwise.
+// ---------------------------------------------------------------------------
+
+/**
+ * Options for `attachLiveShellPaint`. `onUnhandledKey` is the same
+ * callback the `createLiveShell` factory takes — used by the
+ * keypress handler for keys the core's keymap doesn't route. Note
+ * that printable keys (`c`, `z`, etc.) reach the caller via the
+ * CORE's `onUnhandledKey`, not this one — the paint layer's
+ * `onUnhandledKey` fires only on rare empty-sequence keys (an
+ * OpenTUI edge case).
+ */
+export interface LiveShellPaintOptions {
+  readonly onUnhandledKey?: (key: string) => void;
+}
+
+/**
+ * Runtime exports from `@opentui/core` that `attachLiveShellPaint`
+ * needs to construct the scene. Threaded through as a parameter so
+ * the live-shell module itself only carries a type-only import of
+ * `@opentui/core` — the runtime values get loaded lazily inside
+ * `createLiveShell`'s async setup block and (for tests) inside the
+ * paint test file that boots `createTestRenderer`. This avoids
+ * triggering OpenTUI's racy native-binary loader when an unrelated
+ * test file (e.g. `test/git.test.ts` exercising `renderRowBlocks`)
+ * just imports `cli/git.ts`'s pure-function exports.
+ */
+export interface LiveShellPaintRuntime {
+  readonly TextRenderable: typeof TextRenderable;
+  readonly ScrollBoxRenderable: typeof ScrollBoxRenderable;
+  readonly TextAttributes: { readonly DIM: number };
+}
+
+/**
+ * Paint handle — the test surface mirrors what `createLiveShell`'s
+ * dispose path uses. `repaint()` is what the core's `onRender`
+ * callback invokes (test code can also call it directly to force a
+ * paint after a state mutation). `destroy()` tears down the renderer
+ * synchronously.
+ */
+export interface LiveShellPaint {
+  readonly renderer: CliRenderer;
+  readonly banner: TextRenderable;
+  readonly body: TextRenderable;
+  readonly scrollBox: ScrollBoxRenderable;
+  repaint(): void;
+  destroy(): void;
+}
+
+/**
+ * Build the live-shell paint scene against an OpenTUI renderer:
+ * column layout with a dim banner pinned at row 0 and a ScrollBox
+ * body filling the rest of the viewport. Wires the renderer's
+ * `keyInput` to feed the core's `feedStdin` via a `key.name`-to-raw-
+ * string translation, and re-fits the ScrollBox height on resize.
+ *
+ * Production: called from `createLiveShell`'s async renderer setup
+ * over a `createCliRenderer({...})` result.
+ *
+ * Tests: called against a `createTestRenderer({...})` result so
+ * `captureCharFrame()` / `mockInput.press()` exercise the paint
+ * surface without spawning a real terminal.
+ */
+export function attachLiveShellPaint(
+  renderer: CliRenderer,
+  core: LiveShellCore,
+  runtime: LiveShellPaintRuntime,
+  opts: LiveShellPaintOptions = {},
+): LiveShellPaint {
+  let destroyed = false;
+  // Track the last applied banner / body content so a no-op render
+  // (identical content) is a true no-op on the TextRenderable side
+  // (avoids reflow + re-shape work for the same string).
+  let lastBannerText: string | null = null;
+  let lastBodyText: string | null = null;
+  let lastBodyLineCount = -1;
+
+  const bannerNode = new runtime.TextRenderable(renderer, {
+    id: "live-shell-banner",
+    position: "absolute",
+    top: 0,
+    left: 0,
+    width: "100%",
+    height: 1,
+    attributes: runtime.TextAttributes.DIM,
+    content: core.bannerText(),
+  });
+  const sb = new runtime.ScrollBoxRenderable(renderer, {
+    id: "live-shell-scroll",
+    position: "absolute",
+    top: 1,
+    left: 0,
+    width: "100%",
+    height: Math.max(0, renderer.height - 1),
+    viewportCulling: true,
+  });
+  const bodyNode = new runtime.TextRenderable(renderer, {
+    id: "live-shell-body",
+    content: core.visibleRows().join("\n"),
+  });
+  sb.add(bodyNode);
+  renderer.root.add(bannerNode);
+  renderer.root.add(sb);
+
+  lastBannerText = core.bannerText();
+  lastBodyText = core.visibleRows().join("\n");
+  lastBodyLineCount = core.visibleRows().length;
+
+  /**
+   * Translate an OpenTUI `KeyEvent` back to the raw-string contract
+   * the core's keymap dispatch expects: a single character for
+   * printable keys, a full CSI/SS3 sequence for nav keys, `\x03` for
+   * Ctrl-C, `\x1b` for bare Escape. The core dispatches `q` / `c` /
+   * etc. against the same raw strings the original bespoke parser
+   * produced, so callers' bindings keep working byte-identically.
+   */
+  function handleKeypress(key: KeyEvent): void {
+    if (destroyed) {
+      return;
+    }
+    if (key.ctrl && key.name === "c") {
+      core.feedStdin("\x03");
+      return;
+    }
+    if (key.name === "escape") {
+      core.feedStdin("\x1b");
+      return;
+    }
+    switch (key.name) {
+      case "up":
+        core.feedStdin("\x1b[A");
+        return;
+      case "down":
+        core.feedStdin("\x1b[B");
+        return;
+      case "right":
+        core.feedStdin("\x1b[C");
+        return;
+      case "left":
+        core.feedStdin("\x1b[D");
+        return;
+      case "end":
+        core.feedStdin("\x1b[F");
+        return;
+    }
+    if (key.sequence.length > 0) {
+      core.feedStdin(key.sequence);
+      return;
+    }
+    opts.onUnhandledKey?.(key.name);
   }
 
-  // ----- Initialize (after handles are defined, so any throw can be caught
-  // by the caller; the shell is not "live" until this block completes).
-  stdout.write(ENTER_ALT);
-  if (stdin.setRawMode) {
-    stdin.setRawMode(true);
-  }
-  stdin.setEncoding("utf8");
-  stdin.resume();
-  stdin.on("data", onStdinData);
-  stdout.on("resize", onResize);
-  safetyNetTarget.on("exit", onProcessExit);
-  safetyNetTarget.on("uncaughtException", onUncaught);
-  safetyNetTarget.on("unhandledRejection", onUnhandledRejection);
+  renderer.keyInput.on("keypress", handleKeypress);
 
-  return { pushFrame, refreshLive, setStatus, dispose };
+  const onResize = (): void => {
+    if (destroyed) {
+      return;
+    }
+    sb.height = Math.max(0, renderer.height - 1);
+    repaint();
+  };
+  renderer.on("resize", onResize);
+
+  function repaint(): void {
+    if (destroyed) {
+      return;
+    }
+    const bannerNext = core.bannerText();
+    if (bannerNext !== lastBannerText) {
+      bannerNode.content = bannerNext;
+      lastBannerText = bannerNext;
+    }
+    const rows = core.visibleRows();
+    const joined = rows.join("\n");
+    if (joined !== lastBodyText || rows.length !== lastBodyLineCount) {
+      bodyNode.content = joined;
+      lastBodyText = joined;
+      lastBodyLineCount = rows.length;
+    }
+    // On frame switch, snap the scroll position to the top so a
+    // tall historical frame doesn't surface its tail; the live tip
+    // is always rendered top-aligned too. Idempotent.
+    sb.scrollTo(0);
+    renderer.requestRender();
+  }
+
+  // First paint — the core may already have history queued from
+  // pushFrames that landed during the async renderer setup.
+  repaint();
+
+  return {
+    renderer,
+    banner: bannerNode,
+    body: bodyNode,
+    scrollBox: sb,
+    repaint,
+    destroy(): void {
+      if (destroyed) {
+        return;
+      }
+      destroyed = true;
+      try {
+        renderer.keyInput.off("keypress", handleKeypress);
+      } catch {
+        // best-effort
+      }
+      try {
+        renderer.off("resize", onResize);
+      } catch {
+        // best-effort
+      }
+      try {
+        renderer.destroy();
+      } catch {
+        // renderer was mid-setup or already torn down — best-effort.
+      }
+    },
+  };
 }

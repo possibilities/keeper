@@ -1,5 +1,5 @@
 /**
- * Lifecycle + renderer tests for `scripts/git.ts` and the
+ * Lifecycle + renderer tests for `cli/git.ts` and the
  * `subscribeCollection` helper it composes onto. Two surfaces under test:
  *
  *   1. `subscribeCollection` — the single-collection subscribe helper
@@ -11,7 +11,7 @@
  *      `result`), and the per-collection coalesce (a `meta` while in
  *      flight folds into one follow-up query).
  *
- *   2. `renderRowBlocks` from `scripts/git.ts` — the empty-row drop policy
+ *   2. `renderRowBlocks` from `cli/git.ts` — the empty-row drop policy
  *      (rows with `ahead === 0 && dirty === 0 && orphaned === 0` are
  *      skipped) plus the per-row block shape that the live-shell wrapper
  *      in task 2 will consume.
@@ -31,7 +31,7 @@
  */
 
 import { expect, test } from "bun:test";
-import { renderRowBlocks } from "../scripts/git";
+import { renderRowBlocks } from "../cli/git";
 import { encodeFrame, type ServerFrame } from "../src/protocol";
 import {
   type ConnectFactory,
