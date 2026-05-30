@@ -240,7 +240,7 @@ Keeper has no `install` verb. Wire it up manually:
    mkdir -p ~/.local/state/keeper
    ```
 
-3. **(Optional) Configure roots.** `~/.config/keeper/config.yaml` carries two
+3. **(Optional) Configure roots.** `~/.config/keeper/config.yaml` carries
    INDEPENDENT keys:
 
    - `roots` — the project roots the plan worker watches for
@@ -249,6 +249,15 @@ Keeper has no `install` verb. Wire it up manually:
    - `claude_projects_root` — the single tree the transcript worker watches for
      session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
      Override only if your Claude Code transcripts live elsewhere.
+   - `exec_backend` — the terminal-surface backend `keeper autopilot` uses to
+     spawn worker windows. One of `zellij` (default) or `ghostty`. `zellij`
+     opens each worker as a new tab inside a shared, lazily-created
+     background session (see `zellij_session` below); `ghostty` opens each
+     worker in its own macOS window via osascript and moves it to space 5
+     via yabai (yabai not installed → no-op).
+   - `zellij_session` — the zellij session name autopilot's zellij backend
+     lazily ensures (and reuses) for every tab it spawns. Default:
+     `autopilot`. Ignored when `exec_backend: ghostty`.
 
    ```sh
    mkdir -p ~/.config/keeper
@@ -257,14 +266,19 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/code
      - ~/src
    claude_projects_root: ~/.claude/projects
+   exec_backend: zellij
+   zellij_session: autopilot
    YAML
    ```
 
    A `~`-prefixed value is expanded to `$HOME`. For `roots`, a non-existent root
    is skipped (the others keep watching); for `claude_projects_root` a not-yet-
    existing path is returned as-is (the worker tolerates a late-appearing tree).
-   The two keys fall back independently — a missing/malformed one never disturbs
-   the other; a missing or malformed config falls back to both defaults.
+   All keys fall back independently — a missing/malformed one never disturbs
+   the others; a missing or malformed config falls back to every default
+   (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
+   `exec_backend: zellij`, `zellij_session: autopilot`). An unknown
+   `exec_backend` value also falls back to `zellij`.
 
    (The legacy `KEEPER_WATCH_ROOT` env var is retired; if still set, the daemon
    logs a one-line deprecation warning and ignores it.)
@@ -518,25 +532,32 @@ collapses to plain stream output. Run any of them with
   `--- predicted ---`, `--- completed ---`) of every dispatch fired so
   far this run (plus prior-run rehydrated `--- current ---` rows via
   `hydrateDispatchLog`). Fires on verdict edges: a row flipping to
-  `ready` spawns a Ghostty window running `cd <target_repo> && claude
+  `ready` spawns a terminal surface running `cd <target_repo> && claude
   '/plan:work|close <id>'`; a row flipping to `blocked:job-pending`
   spawns the matching `/plan:approve`. The launch goes through
   validated `$SHELL` (`-l -i`, `/bin/zsh` fallback) with `exec $SHELL
   -l -i` chained after claude exits so a dropped session leaves a
-  usable shell. Each launch records its Ghostty window id in
+  usable shell. The terminal-surface mechanics live behind an
+  `ExecBackend` interface (`src/exec-backend.ts`) selectable via the
+  `exec_backend` config key — `zellij` (default) spawns each worker
+  as a new tab in the lazily-created `zellij_session`, `ghostty` spawns
+  a Ghostty window via osascript and moves it to space 5 via yabai.
+  Each launch records its backend-shaped window/tab id in
   `~/.local/state/keeper/dispatch.log` (a `kind:"window"` row) and
-  auto-closes the window via osascript the moment the dispatch reaches
-  `--- completed ---` (terminal job state or post-fulfillment
-  disappearance), so parked "process exited" surfaces don't accumulate.
-  Re-dispatch is gated by durable `dispatchedKeys` / `fulfilledKeys`
-  sets seeded from `dispatch.log`. Alt-screen TUI when stdout is a TTY;
-  keymap `←/h/k` / `→/l/j` / `g` / `G/Esc` / `space` pause / `v` toggle
-  commands / `c` copy / `q` quit. SIGINT tears down the renderer (alt-
-  screen exit, raw mode off) then disposes the subscribe helper.
+  auto-closes the surface (backend-native: ghostty's osascript repeat-
+  loop close, or zellij's `action close-tab-by-id`) the moment the
+  dispatch reaches `--- completed ---` (terminal job state or post-
+  fulfillment disappearance), so parked "process exited" surfaces don't
+  accumulate. Re-dispatch is gated by durable `dispatchedKeys` /
+  `fulfilledKeys` sets seeded from `dispatch.log`. Alt-screen TUI when
+  stdout is a TTY; keymap `←/h/k` / `→/l/j` / `g` / `G/Esc` / `space`
+  pause / `v` toggle commands / `c` copy / `q` quit. SIGINT tears down
+  the renderer (alt-screen exit, raw mode off) then disposes the
+  subscribe helper.
 
   ```sh
   keeper autopilot            # four-section dispatch frame, default scope
-  keeper autopilot --dry-run  # log dispatches without spawning Ghostty
+  keeper autopilot --dry-run  # log dispatches without spawning a terminal surface
   ```
 
 - `git.ts` — single-collection subscribe client over the `git`

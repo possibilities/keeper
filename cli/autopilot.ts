@@ -187,7 +187,8 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
-import { resolveSockPath } from "../src/db";
+import { resolveConfig, resolveSockPath } from "../src/db";
+import { type ExecBackend, resolveExecBackend } from "../src/exec-backend";
 import { createLiveShell } from "../src/live-shell";
 import { computeReadiness, type Verdict } from "../src/readiness";
 import {
@@ -2162,6 +2163,20 @@ export async function main(argv: string[]): Promise<void> {
       // best-effort
     }
   };
+
+  // fn-650: resolve the autopilot terminal-surface backend ONCE per run
+  // from the keeper config (defaults to `zellij`, see `resolveConfig`
+  // in `src/db.ts`). All `launchWindow` + `closeWindow` calls route
+  // through `backend.launch` / `backend.close`; the orchestration
+  // (suppression / settling / dispatch-log persistence / dry-run gate)
+  // stays in `launchWindow` below, so the backend swap is purely the
+  // spawn/parse-id core.
+  const cfg = resolveConfig();
+  const backend: ExecBackend = resolveExecBackend(cfg.execBackend, {
+    noteLine,
+    session: cfg.zellijSession,
+  });
+
   // In-memory copy of the last emitted frame text (for the diff).
   let lastFrameText: string | null = null;
 
@@ -2290,13 +2305,15 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   /**
-   * Spawn a Ghostty window running `<command>` (already wrapped in `cd …
-   * && claude …` shape by the caller). Fire-and-forget — stdout/stderr
-   * captured into the lifecycle sidecar on failure. After the AppleScript
-   * returns we attempt `yabai -m window --space 5` to shove the newly-
-   * focused window onto space 5; yabai not being installed is fine.
+   * Dispatch a terminal-surface launch via the resolved `ExecBackend`.
+   * Orchestration is unchanged from the pre-fn-650 `launchInGhostty`:
+   * suppression guard → log entry → dry-run gate → settling slot →
+   * spawn → window-id stamp + persistent `kind:"window"` log row. The
+   * backend (`src/exec-backend.ts`) owns the spawn/parse-id core; the
+   * Ghostty osascript path, the zellij `action new-tab` path, and the
+   * follow-on yabai move (Ghostty only) live behind `backend.launch`.
    */
-  function launchInGhostty(
+  function launchWindow(
     workerShellCommand: string,
     rowId: string,
     dir: string,
@@ -2355,28 +2372,15 @@ export async function main(argv: string[]): Promise<void> {
     // zsh.
     const shell = validateShell(process.env.SHELL) ?? "/bin/zsh";
     // Wrap the worker command so claude is a child of $SHELL and a fresh
-    // interactive shell takes over on claude's exit. The outer `-l -i -c`
-    // runs the body string; the trailing `exec ${shell} -l -i` keeps a
-    // usable shell in the Ghostty window so a dropped session is not a
-    // dead window.
-    const shellInvocation = `${shell} -l -i -c ${JSON.stringify(`${workerShellCommand} ; exec ${shell} -l -i`)}`;
-    const appleScript = [
-      'tell application "Ghostty"',
-      "set cfg to new surface configuration",
-      `set command of cfg to ${JSON.stringify(shellInvocation)}`,
-      // `set w to new window …` captures the spawned window so we can
-      // `return id of w`; the AppleScript stdout is then piped to
-      // osascript's exit-0 stdout (`tab-group-…`) which we parse for the
-      // `windowId` stamp. Isolating the osascript spawn from the yabai
-      // tail keeps that capture clean.
-      "set w to new window with configuration cfg",
-      "return id of w",
-      "end tell",
-    ];
-    const osascriptArgs: string[] = [];
-    for (const line of appleScript) {
-      osascriptArgs.push("-e", line);
-    }
+    // interactive shell takes over on claude's exit. The body string is
+    // the worker command followed by `; exec ${shell} -l -i` so a dropped
+    // session leaves a usable login+interactive shell rather than a dead
+    // window. The argv shape `[shell, "-l", "-i", "-c", body]` is the
+    // safe quoting seam at the OS argv boundary — zellij forwards it
+    // verbatim after `--`, and the Ghostty backend re-joins it into the
+    // AppleScript `command of cfg` body.
+    const body = `${workerShellCommand} ; exec ${shell} -l -i`;
+    const argv = [shell, "-l", "-i", "-c", body];
     logDispatch({
       ts: new Date().toISOString(),
       kind: "launch",
@@ -2395,92 +2399,51 @@ export async function main(argv: string[]): Promise<void> {
     // `sweepSettleTimeouts` as a fail-open). The slot is wet-only;
     // dry-run never reaches this line.
     settling.set(`${verb}::${id}`, Date.now());
-    try {
-      // Spawn osascript as its OWN process so its stdout carries ONLY
-      // the bare window id (`tab-group-…`). The yabai move below is a
-      // separate fire-and-forget step so its output never pollutes the
-      // capture.
-      const proc = Bun.spawn(["osascript", ...osascriptArgs], {
-        stdout: "pipe",
-        stderr: "pipe",
-        stdin: "ignore",
-      });
-      Promise.all([
-        proc.exited,
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-      ])
-        .then(([exitCode, stdoutText, stderrText]) => {
-          if (stderrText.length > 0) {
-            noteLine(`# launch stderr (${rowId}): ${stderrText.trim()}`);
+    backend
+      .launch(argv, rowId, dirFull)
+      .then((windowId) => {
+        if (windowId == null) {
+          return; // backend already surfaced the failure via noteLine
+        }
+        // Mutate the LIVE in-memory entry by reference (find by
+        // `${verb}::${id}`). The just-pushed entry is the last
+        // matching `(verb, id)` in `dispatchLog`; scan backward to
+        // grab it without iterating the full array.
+        const liveKey = `${verb}::${id}`;
+        for (let i = dispatchLog.length - 1; i >= 0; i--) {
+          const e = dispatchLog[i];
+          if (e !== undefined && `${e.verb}::${e.id}` === liveKey) {
+            e.windowId = windowId;
+            break;
           }
-          const windowId = stdoutText.trim();
-          if (exitCode === 0 && windowId.length > 0) {
-            // Mutate the LIVE in-memory entry by reference (find by
-            // `${verb}::${id}`). The just-pushed entry is the last
-            // matching `(verb, id)` in `dispatchLog`; scan backward to
-            // grab it without iterating the full array.
-            const liveKey = `${verb}::${id}`;
-            for (let i = dispatchLog.length - 1; i >= 0; i--) {
-              const e = dispatchLog[i];
-              if (e !== undefined && `${e.verb}::${e.id}` === liveKey) {
-                e.windowId = windowId;
-                break;
-              }
-            }
-            // Persist the windowId to disk as a `window` kind row via
-            // a raw `appendFileSync` — NOT `logDispatch` (which would
-            // re-push a display entry and re-add to `dispatchedKeys`).
-            // Try/catch → noteLine on failure; the in-memory stamp
-            // still carries the same-run auto-close path forward.
-            try {
-              appendFileSync(
-                dispatchLogPath,
-                `${JSON.stringify({
-                  kind: "window",
-                  ts: new Date().toISOString(),
-                  verb,
-                  id,
-                  windowId,
-                })}\n`,
-              );
-            } catch (err) {
-              noteLine(
-                `# warn: window log write failed: ${(err as Error).message}`,
-              );
-            }
-          } else if (exitCode !== 0) {
-            noteLine(
-              `# warn: osascript spawn for ${rowId} exited non-zero (${exitCode}); window will not auto-close`,
-            );
-          }
-        })
-        .catch((err) => {
-          noteLine(
-            `# warn: launch spawn for ${rowId} failed: ${(err as Error).message}`,
+        }
+        // Persist the windowId to disk as a `window` kind row via a
+        // raw `appendFileSync` — NOT `logDispatch` (which would
+        // re-push a display entry and re-add to `dispatchedKeys`).
+        // Try/catch → noteLine on failure; the in-memory stamp still
+        // carries the same-run auto-close path forward.
+        try {
+          appendFileSync(
+            dispatchLogPath,
+            `${JSON.stringify({
+              kind: "window",
+              ts: new Date().toISOString(),
+              verb,
+              id,
+              windowId,
+            })}\n`,
           );
-        });
-      // Separate fire-and-forget yabai move — `yabai -m window --space 5`
-      // operates on the focused window, which is the brand-new Ghostty
-      // window. The 0.3s sleep gives Ghostty time to claim focus. yabai
-      // not being installed is fine (`|| true`).
-      try {
-        Bun.spawn(
-          [
-            "sh",
-            "-c",
-            "sleep 0.3 && yabai -m window --space 5 2>/dev/null || true",
-          ],
-          { stdout: "ignore", stderr: "ignore", stdin: "ignore" },
+        } catch (err) {
+          noteLine(
+            `# warn: window log write failed: ${(err as Error).message}`,
+          );
+        }
+      })
+      .catch((err) => {
+        noteLine(
+          `# warn: launch spawn for ${rowId} failed: ${(err as Error).message}`,
         );
-      } catch {
-        // best-effort; the dispatch already shipped via osascript.
-      }
-    } catch (err) {
-      noteLine(
-        `# warn: launch spawn for ${rowId} failed: ${(err as Error).message}`,
-      );
-    }
+      });
   }
 
   /**
@@ -2548,19 +2511,12 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   // Bridge from the exported `tryLaunch` gate primitive to the real
-  // `launchInGhostty` side effect. The `launch` callback signature is
-  // shared with the gate-tests' recording stub, so production and test
-  // paths exercise the same gate logic.
+  // `launchWindow` side effect (which routes through the resolved
+  // `ExecBackend`). The `launch` callback signature is shared with the
+  // gate-tests' recording stub, so production and test paths exercise
+  // the same gate logic.
   function fireLaunch(p: PendingLaunch): void {
-    launchInGhostty(
-      p.command,
-      p.rowId,
-      p.dir,
-      p.dirFull,
-      p.verb,
-      p.id,
-      lastSnap,
-    );
+    launchWindow(p.command, p.rowId, p.dir, p.dirFull, p.verb, p.id, lastSnap);
   }
 
   function gateAndDispatch(p: PendingLaunch): void {
@@ -2726,60 +2682,17 @@ export async function main(argv: string[]): Promise<void> {
       }
       if (dryRun) {
         noteLine(
-          `# closeWindow (dry) windowId=${windowId} — would close Ghostty window`,
+          `# closeWindow (dry) windowId=${windowId} — would close terminal surface`,
         );
         return;
       }
-      // Verified repeat-loop close pattern (tip Ghostty
-      // `cb36966a7`, 2026-05-29): `close window id "..."` errors
-      // -2741 (text vs integer specifier), `close <w>` errors -1708
-      // (verb belongs to the `terminal` class not `window`). The
-      // repeat-loop walks the window list, matches by id, and fires
-      // `close window <w>` against the AppleScript object reference
-      // — the only form that actually reaps the surface.
-      const appleScript = [
-        `set wid to ${JSON.stringify(windowId)}`,
-        'tell application "Ghostty"',
-        "repeat with w in every window",
-        "if id of w is wid then",
-        "close window w",
-        "return",
-        "end if",
-        "end repeat",
-        'return "not-found"',
-        "end tell",
-      ];
-      const args: string[] = [];
-      for (const line of appleScript) {
-        args.push("-e", line);
-      }
-      try {
-        const proc = Bun.spawn(["osascript", ...args], {
-          stdout: "ignore",
-          stderr: "pipe",
-          stdin: "ignore",
-        });
-        // Fire-and-forget; surface stderr (osascript error or
-        // "not-found") to the lifecycle sidecar but never throw
-        // back into the transitions loop.
-        Promise.all([proc.exited, new Response(proc.stderr).text()])
-          .then(([_exitCode, stderrText]) => {
-            if (stderrText.length > 0) {
-              noteLine(
-                `# closeWindow stderr (${windowId}): ${stderrText.trim()}`,
-              );
-            }
-          })
-          .catch((err) => {
-            noteLine(
-              `# warn: closeWindow spawn (${windowId}) failed: ${(err as Error).message}`,
-            );
-          });
-      } catch (err) {
-        noteLine(
-          `# warn: closeWindow spawn (${windowId}) failed: ${(err as Error).message}`,
-        );
-      }
+      // Route to the resolved backend (`src/exec-backend.ts`). The
+      // backend's `close` is fire-and-forget and never throws back —
+      // a stale id from a different backend (config flip across runs)
+      // no-ops gracefully on either side (ghostty's repeat-loop
+      // returns "not-found"; zellij surfaces a "tab id not found"
+      // stderr line via `noteLine`).
+      backend.close(windowId);
     },
   };
 
