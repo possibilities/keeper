@@ -690,7 +690,26 @@ export type SuppressionReason =
   // the same effective root already has a `running`-tag verdict OR
   // when a launched-but-unfulfilled dispatch on the same root is still
   // in the propagation gap. Fail-closed on a partial snapshot.
-  | "live-in-root";
+  | "live-in-root"
+  // Startup-stagger gate (fn-644). One-at-a-time gate over freshly-
+  // dispatched (launched but not yet observed `running`-tag) sessions.
+  // While the single settling slot is held, additional ready/job-pending
+  // edges are stashed in `pendingLaunches` and drained one at a time as
+  // the slot frees on the next snapshot's settle pass. Side effect of
+  // closing the duplicate-dispatch race at the fulfillment boundary.
+  // NOT a knob, NOT a concurrency cap — steady-state parallelism of
+  // already-running workers is unaffected.
+  | "settling-gate";
+
+/**
+ * Fail-open timeout for the startup-stagger gate (fn-644). If a key
+ * settles into the gate but never reaches a `running`-tag verdict
+ * within this many seconds, the settle pass drops it so the ramp
+ * cannot wedge on a dead startup (osascript spawn failed, Ghostty
+ * crashed before SessionStart, etc.). NOT a tuning knob; tied to the
+ * shape of the gate, not a config dial.
+ */
+export const SETTLE_TIMEOUT_SEC = 180;
 
 /**
  * Decide whether `launchInGhostty` must suppress this dispatch and, if
@@ -864,6 +883,266 @@ export function isLiveSessionInRoot(
     }
   }
   return false;
+}
+
+/**
+ * Deferred-dispatch record stashed in `pendingLaunches` when the
+ * startup-stagger gate is full (fn-644). Carries everything
+ * `launchInGhostty` needs to fire later, plus the `tier` channel for
+ * work dispatches (null for approve/close). One entry per `${verb}::${id}`
+ * key — repeat edges while a launch is pending are dedupe-collapsed
+ * onto the existing entry.
+ */
+export interface PendingLaunch {
+  verb: "work" | "close" | "approve";
+  id: string;
+  dir: string;
+  dirFull: string;
+  command: string;
+  rowId: string;
+  tier: string | null;
+}
+
+/**
+ * Startup-stagger gate (fn-644). Returns `true` when a launch for
+ * `key = ${verb}::${id}` must be deferred because the single settling
+ * slot is already held by a DIFFERENT key. A key that is itself the
+ * settling occupant returns `false` (its own re-edge is not deferred —
+ * `lastVerdictSig` is the authority on re-edge suppression).
+ *
+ * Hardcoded one-at-a-time: `settling.size >= 1 && !settling.has(key)`.
+ * No knob, no env override, no MAX constant — concurrency may be added
+ * later but never at startup/settling time.
+ *
+ * Exported so tests can drive the gate in isolation.
+ */
+export function isSettlingGateFull(
+  settling: Map<string, number>,
+  key: string,
+): boolean {
+  return settling.size >= 1 && !settling.has(key);
+}
+
+/**
+ * Settle pass (fn-644). For each settling key, look up its row verdict
+ * via `perTask` (task ids contain ".") or `perCloseRow` (close/epic ids
+ * don't). When the verdict tag is `running` OR the key has reached
+ * `completedKeys` (a fulfilled-then-disappeared row jumped the running
+ * stage), drop the key from `settling` — the slot is free.
+ *
+ * Pure observation: mutates `settling` only; no I/O. The `noteLine`
+ * callback receives a one-liner per released key so the lifecycle
+ * sidecar carries the slot-free transitions.
+ */
+export function releaseSettledKeys(
+  settling: Map<string, number>,
+  snap: ReadinessClientSnapshot,
+  completedKeys: Set<string>,
+  noteLine: (s: string) => void,
+  pid: number,
+): void {
+  for (const key of [...settling.keys()]) {
+    // Key shape is `${verb}::${id}`. Split once on the first `::`.
+    const sep = key.indexOf("::");
+    if (sep < 0) {
+      // Malformed key — drop it so the gate cannot wedge on a bad shape.
+      settling.delete(key);
+      continue;
+    }
+    const id = key.slice(sep + 2);
+    if (completedKeys.has(key)) {
+      settling.delete(key);
+      noteLine(
+        `${new Date().toISOString()} settling release pid=${pid} ${key} reason=completed`,
+      );
+      continue;
+    }
+    const verdict = id.includes(".")
+      ? snap.readiness.perTask.get(id)
+      : snap.readiness.perCloseRow.get(id);
+    if (verdict !== undefined && verdict.tag === "running") {
+      settling.delete(key);
+      noteLine(
+        `${new Date().toISOString()} settling release pid=${pid} ${key} reason=running`,
+      );
+    }
+  }
+}
+
+/**
+ * Gate a single dispatch through the startup-stagger gate (fn-644).
+ *
+ * When `dryRun` is true the gate is inert: the launch callback fires
+ * directly, mirroring the `paused` carve-out. When the gate is full
+ * (`isSettlingGateFull` returns true) the launch is stashed in
+ * `pendingLaunches` keyed by `${verb}::${id}` — a repeat edge for the
+ * same key while pending replaces the prior entry (the latest snapshot's
+ * command/dir/tier wins; key dedupes). Otherwise the launch fires
+ * synchronously; `launchInGhostty` itself stamps `settling.set` on the
+ * real-launch path so a same-tick re-entry would already see the slot
+ * occupied.
+ *
+ * `lastVerdictSig.set` happens at the call site BEFORE `tryLaunch` — the
+ * verdict edge is honest whether the launch fires or is deferred. The
+ * pending queue is the only re-drive path; we do not replay verdict
+ * edges.
+ *
+ * Exported so tests can drive the gate in isolation against a recording
+ * launch callback.
+ */
+export function tryLaunch(
+  pending: PendingLaunch,
+  settling: Map<string, number>,
+  pendingLaunches: Map<string, PendingLaunch>,
+  dryRun: boolean,
+  launch: (p: PendingLaunch) => void,
+  noteLine: (s: string) => void,
+  pid: number,
+): void {
+  const key = `${pending.verb}::${pending.id}`;
+  if (dryRun) {
+    launch(pending);
+    return;
+  }
+  if (isSettlingGateFull(settling, key)) {
+    pendingLaunches.set(key, pending);
+    noteLine(
+      `${new Date().toISOString()} re-dispatch suppressed (settling-gate) pid=${pid} ${key} dir=${pending.dirFull} (rowId=${pending.rowId})`,
+    );
+    return;
+  }
+  launch(pending);
+}
+
+/**
+ * Drain the deferred-launch queue against the current snapshot (fn-644).
+ * While the gate has room (`settling.size < 1`) and `pendingLaunches`
+ * is non-empty, pop the OLDEST entry (insertion order; `Map` preserves
+ * it) and RE-VALIDATE against `snap`:
+ *
+ *   - The row's verdict must still be `ready` (work/close) or
+ *     `blocked:job-pending` (approve), matching the original
+ *     `processLaunchTransitions` trigger conditions. If it has moved on
+ *     (already running, completed, or now blocked for some other
+ *     reason), discard the pending entry — re-edge will reopen it later
+ *     if appropriate.
+ *   - `shouldSuppressDispatch` must still return null. This is the
+ *     duplicate-race fix: a per-root mutex (`live-in-root`) that was
+ *     OPEN when the original ready edge fired may have CLOSED while the
+ *     entry was queued; re-validating drops the held duplicate cleanly.
+ *
+ * Returns the count of pending entries that fired so the caller can
+ * decide whether to repaint.
+ *
+ * Exported so tests can drive the drain deterministically.
+ */
+export function drainPendingLaunches(
+  snap: ReadinessClientSnapshot,
+  settling: Map<string, number>,
+  pendingLaunches: Map<string, PendingLaunch>,
+  dispatchedKeys: Set<string>,
+  fulfilledKeys: Set<string>,
+  dispatchLog: DispatchEntry[],
+  launch: (p: PendingLaunch) => void,
+  noteLine: (s: string) => void,
+  pid: number,
+): number {
+  let fired = 0;
+  // While the slot is free AND we have something queued, pop the oldest
+  // entry, re-validate, and either launch or discard. The launch path
+  // sets `settling` (via the wired `launch` callback's call to
+  // `launchInGhostty`), so the next iteration's `isSettlingGateFull`
+  // returns true and we stop after one fire per drain pass — matching
+  // the one-at-a-time invariant. The loop is upper-bounded by the queue
+  // size so a never-mutating launch callback (test injection) cannot
+  // infinite-loop.
+  const max = pendingLaunches.size;
+  for (let i = 0; i < max; i += 1) {
+    if (settling.size >= 1) {
+      return fired;
+    }
+    const firstKey = pendingLaunches.keys().next().value;
+    if (firstKey === undefined) {
+      return fired;
+    }
+    const entry = pendingLaunches.get(firstKey);
+    if (entry === undefined) {
+      pendingLaunches.delete(firstKey);
+      continue;
+    }
+    pendingLaunches.delete(firstKey);
+    // Re-validate the verdict against the current snapshot. The
+    // pending entry was queued at a ready/job-pending edge; if it
+    // has since moved on, drop it.
+    const verdict = entry.id.includes(".")
+      ? snap.readiness.perTask.get(entry.id)
+      : snap.readiness.perCloseRow.get(entry.id);
+    const expected: "ready" | "blocked:job-pending" =
+      entry.verb === "approve" ? "blocked:job-pending" : "ready";
+    const verdictSig =
+      verdict === undefined
+        ? "unknown"
+        : verdict.tag === "ready"
+          ? "ready"
+          : verdict.tag === "completed"
+            ? "completed"
+            : verdict.tag === "running"
+              ? `running:${verdict.reason.kind}`
+              : `blocked:${verdict.reason.kind}`;
+    if (verdictSig !== expected) {
+      noteLine(
+        `${new Date().toISOString()} pending discarded pid=${pid} ${entry.verb}::${entry.id} reason=verdict-${verdictSig}`,
+      );
+      continue;
+    }
+    // Re-validate the suppression gate. The per-root mutex may have
+    // closed since the original edge fired (a sibling launched first
+    // through a parallel path); drop the held duplicate.
+    const suppression = shouldSuppressDispatch(
+      entry.verb,
+      entry.id,
+      entry.dirFull,
+      snap,
+      dispatchedKeys,
+      fulfilledKeys,
+      dispatchLog,
+    );
+    if (suppression !== null) {
+      noteLine(
+        `${new Date().toISOString()} pending discarded pid=${pid} ${entry.verb}::${entry.id} reason=${suppression}`,
+      );
+      continue;
+    }
+    launch(entry);
+    fired += 1;
+  }
+  return fired;
+}
+
+/**
+ * Timeout sweep (fn-644). Fail-open against a wedged ramp: any settling
+ * key older than {@link SETTLE_TIMEOUT_SEC} is dropped so a launch that
+ * never reaches `running` (osascript spawn failed, Ghostty crashed
+ * before SessionStart, etc.) cannot freeze the gate forever. The
+ * `noteLine` callback receives one line per swept key.
+ *
+ * `nowMs` is injected so tests can drive the sweep deterministically.
+ */
+export function sweepSettleTimeouts(
+  settling: Map<string, number>,
+  nowMs: number,
+  noteLine: (s: string) => void,
+  pid: number,
+): void {
+  const cutoffMs = nowMs - SETTLE_TIMEOUT_SEC * 1000;
+  for (const [key, ts] of [...settling.entries()]) {
+    if (ts < cutoffMs) {
+      settling.delete(key);
+      noteLine(
+        `${new Date().toISOString()} settling timeout pid=${pid} ${key} age_sec=${Math.floor((nowMs - ts) / 1000)}`,
+      );
+    }
+  }
 }
 
 function previewRowFromTask(
@@ -1716,6 +1995,18 @@ async function main(): Promise<void> {
   // snapshot and the row moves to `--- completed ---`.
   const dispatchLog: DispatchEntry[] = restoredEntries;
 
+  // Startup-stagger gate (fn-644). `settling` holds 0 or 1 entries — a
+  // freshly-launched `${verb}::${id}` lives here from `launchInGhostty`'s
+  // real-launch path until the next snapshot observes the row at a
+  // `running`-tag verdict OR migrates the key to `completedKeys`. While
+  // the slot is occupied, further ready/job-pending edges are stashed in
+  // `pendingLaunches` and drained one at a time as the slot frees. Both
+  // maps are this-run-only — a restart re-derives running rows from the
+  // live snapshot and the durable `dispatchedKeys` guard still prevents
+  // work/close re-launch.
+  const settling = new Map<string, number>();
+  const pendingLaunches = new Map<string, PendingLaunch>();
+
   function renderDispatchFrame(): string[] {
     // Four named-header sections, each only emitted when non-empty,
     // rendered in this order: `--- current ---` (this-run dispatches
@@ -2082,6 +2373,12 @@ async function main(): Promise<void> {
       dry: dryRun || undefined,
     });
     if (dryRun) return;
+    // Startup-stagger gate (fn-644). A real-launch path always holds
+    // the single settling slot from here until the row is observed
+    // `running`-tag in `releaseSettledKeys` (or swept by
+    // `sweepSettleTimeouts` as a fail-open). The slot is wet-only;
+    // dry-run never reaches this line.
+    settling.set(`${verb}::${id}`, Date.now());
     try {
       // Spawn osascript as its OWN process so its stdout carries ONLY
       // the bare window id (`tab-group-…`). The yabai move below is a
@@ -2234,6 +2531,34 @@ async function main(): Promise<void> {
     return `approval=${seg(epic.approval)} status=${seg(epic.status)} jobs=${jobs.length}[${jobStates}] sub_running=${subRun}`;
   }
 
+  // Bridge from the exported `tryLaunch` gate primitive to the real
+  // `launchInGhostty` side effect. The `launch` callback signature is
+  // shared with the gate-tests' recording stub, so production and test
+  // paths exercise the same gate logic.
+  function fireLaunch(p: PendingLaunch): void {
+    launchInGhostty(
+      p.command,
+      p.rowId,
+      p.dir,
+      p.dirFull,
+      p.verb,
+      p.id,
+      lastSnap,
+    );
+  }
+
+  function gateAndDispatch(p: PendingLaunch): void {
+    tryLaunch(
+      p,
+      settling,
+      pendingLaunches,
+      dryRun,
+      fireLaunch,
+      noteLine,
+      process.pid,
+    );
+  }
+
   function processLaunchTransitions(snap: ReadinessClientSnapshot): void {
     // While paused (wet mode only), skip the entire transition walk —
     // including the `lastVerdictSig` update. The map stays frozen at its
@@ -2248,15 +2573,14 @@ async function main(): Promise<void> {
     for (const epic of snap.epics) {
       const projectDir = seg(epic.project_dir);
       const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
-      // Within a single epic, defer the side-effecting `launchInGhostty`
-      // calls into two buckets so approves fire ahead of any work/close
-      // dispatches. Edge detection (prev→cur diff, logTransition,
-      // lastVerdictSig.set) stays in the existing one-pass walk so every
-      // transition is still recorded exactly once. Matches the
-      // predicted-section ordering in `predictNextDispatches`
-      // (approvals → informational → workers → closers); an approve still
-      // requires `cur === "blocked:job-pending"` for that row, no trigger
-      // conditions are relaxed.
+      // Within a single epic, defer the side-effecting dispatches into
+      // two buckets so approves fire ahead of any work/close dispatches.
+      // Edge detection (prev→cur diff, logTransition, lastVerdictSig.set)
+      // stays in the existing one-pass walk so every transition is still
+      // recorded exactly once. Matches the predicted-section ordering in
+      // `predictNextDispatches` (approvals → informational → workers →
+      // closers); an approve still requires `cur === "blocked:job-pending"`
+      // for that row, no trigger conditions are relaxed.
       const approveDispatches: Array<() => void> = [];
       const workCloseDispatches: Array<() => void> = [];
 
@@ -2280,28 +2604,34 @@ async function main(): Promise<void> {
         const dirBase = dir === "" ? "" : basename(dir);
         if (cur === "ready") {
           workCloseDispatches.push(() =>
-            launchInGhostty(
-              buildWorkerCommand("work", taskId, dir, task.tier),
-              `task ${taskId}`,
-              dirBase,
-              dir,
-              "work",
-              taskId,
-              snap,
-            ),
+            gateAndDispatch({
+              verb: "work",
+              id: taskId,
+              dir: dirBase,
+              dirFull: dir,
+              command: buildWorkerCommand("work", taskId, dir, task.tier),
+              rowId: `task ${taskId}`,
+              tier: task.tier,
+            }),
           );
         } else if (cur === "blocked:job-pending") {
           approveDispatches.push(() =>
-            launchInGhostty(
-              buildWorkerCommand("approve", taskId, dir),
-              `approve task ${taskId}`,
-              dirBase,
-              dir,
-              "approve",
-              taskId,
-              snap,
-            ),
+            gateAndDispatch({
+              verb: "approve",
+              id: taskId,
+              dir: dirBase,
+              dirFull: dir,
+              command: buildWorkerCommand("approve", taskId, dir),
+              rowId: `approve task ${taskId}`,
+              tier: null,
+            }),
           );
+        } else {
+          // Verdict moved off ready / job-pending — drop any pending
+          // dispatch for this task. Re-edge into ready/job-pending will
+          // re-queue it via the branches above; we never replay edges.
+          pendingLaunches.delete(`work::${taskId}`);
+          pendingLaunches.delete(`approve::${taskId}`);
         }
       }
 
@@ -2318,28 +2648,33 @@ async function main(): Promise<void> {
           const dirBase = projectDir === "" ? "" : basename(projectDir);
           if (closeCur === "ready") {
             workCloseDispatches.push(() =>
-              launchInGhostty(
-                buildWorkerCommand("close", epicId, projectDir),
-                `close ${epicId}`,
-                dirBase,
-                projectDir,
-                "close",
-                epicId,
-                snap,
-              ),
+              gateAndDispatch({
+                verb: "close",
+                id: epicId,
+                dir: dirBase,
+                dirFull: projectDir,
+                command: buildWorkerCommand("close", epicId, projectDir),
+                rowId: `close ${epicId}`,
+                tier: null,
+              }),
             );
           } else if (closeCur === "blocked:job-pending") {
             approveDispatches.push(() =>
-              launchInGhostty(
-                buildWorkerCommand("approve", epicId, projectDir),
-                `approve close ${epicId}`,
-                dirBase,
-                projectDir,
-                "approve",
-                epicId,
-                snap,
-              ),
+              gateAndDispatch({
+                verb: "approve",
+                id: epicId,
+                dir: dirBase,
+                dirFull: projectDir,
+                command: buildWorkerCommand("approve", epicId, projectDir),
+                rowId: `approve close ${epicId}`,
+                tier: null,
+              }),
             );
+          } else {
+            // Close row left ready / job-pending — drop any pending
+            // dispatch for this epic-id surface.
+            pendingLaunches.delete(`close::${epicId}`);
+            pendingLaunches.delete(`approve::${epicId}`);
           }
         }
       }
@@ -2445,6 +2780,34 @@ async function main(): Promise<void> {
       appendDiagnostic(d, diagnosticsLogPath);
     }
     detectJobTransitions(detectJobTransitionsDeps, snap);
+    // Startup-stagger gate maintenance (fn-644). Order matters:
+    //   1. `releaseSettledKeys` frees the slot for any settling key
+    //      whose row is now `running` (or whose key migrated to
+    //      `completedKeys` via the disappearance branch above).
+    //   2. `sweepSettleTimeouts` fail-opens any settling key older
+    //      than SETTLE_TIMEOUT_SEC so a dead startup cannot wedge
+    //      the ramp.
+    //   3. `drainPendingLaunches` re-validates and fires pending
+    //      launches one at a time as the slot frees — also the
+    //      duplicate-race fix.
+    // Dry-run skips drain entirely (the gate is inert) but still
+    // runs release/sweep so any maps populated from a wet-tick
+    // crash don't sit forever.
+    releaseSettledKeys(settling, snap, completedKeys, noteLine, process.pid);
+    sweepSettleTimeouts(settling, Date.now(), noteLine, process.pid);
+    if (!dryRun) {
+      drainPendingLaunches(
+        snap,
+        settling,
+        pendingLaunches,
+        dispatchedKeys,
+        fulfilledKeys,
+        dispatchLog,
+        fireLaunch,
+        noteLine,
+        process.pid,
+      );
+    }
     if (!firstPaintLogged) {
       firstPaintLogged = true;
       const ready: string[] = [];

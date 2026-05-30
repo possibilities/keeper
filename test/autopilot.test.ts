@@ -30,17 +30,24 @@ import { join } from "node:path";
 import type {
   DetectJobTransitionsDeps,
   DispatchEntry,
+  PendingLaunch,
 } from "../scripts/autopilot";
 import {
   ARTHACK_ROOT,
   buildWorkerCommand,
   detectJobTransitions,
+  drainPendingLaunches,
   hydrateDispatchLog,
   isLiveSessionInRoot,
+  isSettlingGateFull,
   predictNextDispatches,
+  releaseSettledKeys,
   renderEpicCommands,
   renderEpicCommandsFiltered,
+  SETTLE_TIMEOUT_SEC,
   shouldSuppressDispatch,
+  sweepSettleTimeouts,
+  tryLaunch,
   validateShell,
 } from "../scripts/autopilot";
 import { computeReadiness } from "../src/readiness";
@@ -2039,4 +2046,422 @@ test("validateShell — existing absolute path with no quote → returned verbat
   // pinning it is the minimal positive case that exercises the
   // existsSync branch end-to-end.
   expect(validateShell("/bin/sh")).toBe("/bin/sh");
+});
+
+// ---------------------------------------------------------------------------
+// fn-644 — startup-stagger gate. One-at-a-time over freshly-dispatched
+// (launched but not yet running-tag) sessions. The gate is hardcoded
+// to size 1 with no knob, no env override. Tests pin the five
+// acceptance bullets: first-launch settles, second-while-occupied
+// defers, drain-on-settle fires next, drain re-validation drops a now-
+// mutex-blocked pending, and SETTLE_TIMEOUT_SEC fail-open.
+// ---------------------------------------------------------------------------
+
+function makePending(overrides: Partial<PendingLaunch>): PendingLaunch {
+  return {
+    verb: "work",
+    id: "fn-1-foo.1",
+    dir: "repo",
+    dirFull: "/repo",
+    command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+    rowId: "task fn-1-foo.1",
+    tier: null,
+    ...overrides,
+  };
+}
+
+test("isSettlingGateFull — empty map allows any key (slot is free)", () => {
+  const settling = new Map<string, number>();
+  expect(isSettlingGateFull(settling, "work::fn-1-foo.1")).toBe(false);
+});
+
+test("isSettlingGateFull — occupied slot blocks a different key", () => {
+  const settling = new Map<string, number>([["work::fn-1-foo.1", Date.now()]]);
+  expect(isSettlingGateFull(settling, "work::fn-1-foo.2")).toBe(true);
+});
+
+test("isSettlingGateFull — own key does not block itself", () => {
+  // Self-re-edge must not deadlock: a key already in `settling` is
+  // its own occupant; the gate returns false so a re-fire path could
+  // run, but in practice `launchInGhostty`'s `dispatchedKeys` /
+  // `fulfilledKeys` guards stop the re-launch upstream. The gate
+  // here is dispatch-shape correctness only.
+  const settling = new Map<string, number>([["work::fn-1-foo.1", Date.now()]]);
+  expect(isSettlingGateFull(settling, "work::fn-1-foo.1")).toBe(false);
+});
+
+test("tryLaunch — first call fires, leaves settling untouched (caller stamps slot)", () => {
+  // The gate primitive routes through; the real `launchInGhostty`
+  // stamps `settling.set` itself on the wet path. This test pins the
+  // routing — pending is empty, the launch callback fires once, no
+  // noteLine deferral is emitted.
+  const settling = new Map<string, number>();
+  const pendingLaunches = new Map<string, PendingLaunch>();
+  const fired: PendingLaunch[] = [];
+  const notes: string[] = [];
+  tryLaunch(
+    makePending({}),
+    settling,
+    pendingLaunches,
+    /*dryRun*/ false,
+    (p) => fired.push(p),
+    (s) => notes.push(s),
+    42,
+  );
+  expect(fired.length).toBe(1);
+  expect(fired[0]?.verb).toBe("work");
+  expect(fired[0]?.id).toBe("fn-1-foo.1");
+  expect(pendingLaunches.size).toBe(0);
+  // No deferral note on the launch path.
+  expect(notes.filter((s) => s.includes("settling-gate"))).toEqual([]);
+});
+
+test("tryLaunch — second call while slot occupied defers to pendingLaunches", () => {
+  // Slot already held by a DIFFERENT key. The second ready row gets
+  // stashed; no launch fires; a `settling-gate` deferral note is
+  // emitted for the lifecycle sidecar.
+  const settling = new Map<string, number>([["work::fn-1-foo.1", Date.now()]]);
+  const pendingLaunches = new Map<string, PendingLaunch>();
+  const fired: PendingLaunch[] = [];
+  const notes: string[] = [];
+  tryLaunch(
+    makePending({ id: "fn-1-foo.2", rowId: "task fn-1-foo.2" }),
+    settling,
+    pendingLaunches,
+    /*dryRun*/ false,
+    (p) => fired.push(p),
+    (s) => notes.push(s),
+    42,
+  );
+  expect(fired).toEqual([]);
+  expect(pendingLaunches.size).toBe(1);
+  expect(pendingLaunches.get("work::fn-1-foo.2")?.id).toBe("fn-1-foo.2");
+  // Deferral note carries the gate name + key + dirFull.
+  expect(notes.some((s) => s.includes("settling-gate"))).toBe(true);
+  expect(notes.some((s) => s.includes("work::fn-1-foo.2"))).toBe(true);
+});
+
+test("tryLaunch — dry-run bypasses the gate (gate is wet-only)", () => {
+  // Mirror of the `paused` carve-out: dry-run never holds the slot
+  // and never defers. The launch callback fires directly even when
+  // `settling` has another occupant.
+  const settling = new Map<string, number>([["work::fn-1-foo.1", Date.now()]]);
+  const pendingLaunches = new Map<string, PendingLaunch>();
+  const fired: PendingLaunch[] = [];
+  const notes: string[] = [];
+  tryLaunch(
+    makePending({ id: "fn-1-foo.2" }),
+    settling,
+    pendingLaunches,
+    /*dryRun*/ true,
+    (p) => fired.push(p),
+    (s) => notes.push(s),
+    42,
+  );
+  expect(fired.length).toBe(1);
+  expect(pendingLaunches.size).toBe(0);
+  expect(notes).toEqual([]);
+});
+
+test("releaseSettledKeys — running-tag verdict frees the slot", () => {
+  // settling holds the just-launched key; the snapshot has caught up
+  // and observed the row at a running-tag verdict. The settle pass
+  // frees the slot and notes the reason.
+  const epic = makeEpic({
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "approved",
+        jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
+      }),
+    ],
+  });
+  const snap = buildSnap([epic]);
+  expect(snap.readiness.perTask.get("fn-1-foo.1")?.tag).toBe("running");
+  const settling = new Map<string, number>([["work::fn-1-foo.1", Date.now()]]);
+  const notes: string[] = [];
+  releaseSettledKeys(
+    settling,
+    snap,
+    /*completedKeys*/ new Set(),
+    (s) => notes.push(s),
+    42,
+  );
+  expect(settling.size).toBe(0);
+  expect(notes.some((s) => s.includes("reason=running"))).toBe(true);
+  expect(notes.some((s) => s.includes("work::fn-1-foo.1"))).toBe(true);
+});
+
+test("releaseSettledKeys — completedKeys membership frees the slot", () => {
+  // Jumped the running stage (disappearance branch in
+  // `detectJobTransitions` migrated the key straight to
+  // `completedKeys`). Settle pass still releases.
+  const epic = makeEpic({ project_dir: "/repo" });
+  const snap = buildSnap([epic]);
+  const settling = new Map<string, number>([["approve::fn-1-foo", Date.now()]]);
+  const notes: string[] = [];
+  releaseSettledKeys(
+    settling,
+    snap,
+    new Set<string>(["approve::fn-1-foo"]),
+    (s) => notes.push(s),
+    42,
+  );
+  expect(settling.size).toBe(0);
+  expect(notes.some((s) => s.includes("reason=completed"))).toBe(true);
+});
+
+test("releaseSettledKeys — non-running, non-completed key stays in settling", () => {
+  // Row is still in the propagation gap (no verdict yet, or
+  // ready/blocked but not running). Slot stays held.
+  const epic = makeEpic({
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "approved",
+      }),
+    ],
+  });
+  const snap = buildSnap([epic]);
+  // Sanity: verdict is `ready`, NOT `running`.
+  expect(snap.readiness.perTask.get("fn-1-foo.1")?.tag).toBe("ready");
+  const settling = new Map<string, number>([["work::fn-1-foo.1", Date.now()]]);
+  const notes: string[] = [];
+  releaseSettledKeys(settling, snap, new Set(), (s) => notes.push(s), 42);
+  expect(settling.size).toBe(1);
+  expect(notes).toEqual([]);
+});
+
+test("sweepSettleTimeouts — entry older than SETTLE_TIMEOUT_SEC is fail-opened", () => {
+  // The fail-open guard: a launch that never reached `running` is
+  // dropped so the ramp can't wedge on a dead startup.
+  const now = 1_000_000_000_000;
+  const stale = now - (SETTLE_TIMEOUT_SEC + 1) * 1000;
+  const fresh = now - 5_000;
+  const settling = new Map<string, number>([
+    ["work::fn-1-foo.1", stale],
+    ["work::fn-1-foo.2", fresh],
+  ]);
+  const notes: string[] = [];
+  sweepSettleTimeouts(settling, now, (s) => notes.push(s), 42);
+  // Stale entry dropped; fresh entry preserved.
+  expect(settling.has("work::fn-1-foo.1")).toBe(false);
+  expect(settling.has("work::fn-1-foo.2")).toBe(true);
+  expect(notes.some((s) => s.includes("settling timeout"))).toBe(true);
+  expect(notes.some((s) => s.includes("work::fn-1-foo.1"))).toBe(true);
+});
+
+test("drainPendingLaunches — fires the oldest pending entry when slot frees", () => {
+  // The drain-on-settle fix. Slot is free, two entries are queued in
+  // insertion order; the drain pops the oldest, re-validates against
+  // the current snap (still ready, gate still clear), and fires the
+  // launch. The launch callback stamps `settling.set` (mirroring
+  // production's `launchInGhostty`) so the gate re-closes after the
+  // first fire and the second entry stays put. Two independent
+  // epics in DIFFERENT roots avoid the readiness-side per-epic /
+  // per-root mutex (predicates 11/12) so both rows can sit at
+  // `ready` simultaneously — the gate under test is autopilot's
+  // own one-at-a-time slot, not the readiness mutexes.
+  const epicA = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        epic_id: "fn-1-foo",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "approved",
+      }),
+    ],
+  });
+  const epicB = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/repo-b",
+    tasks: [
+      makeTask({
+        task_id: "fn-2-bar.1",
+        epic_id: "fn-2-bar",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "approved",
+      }),
+    ],
+  });
+  const snap = buildSnap([epicA, epicB]);
+  expect(snap.readiness.perTask.get("fn-1-foo.1")?.tag).toBe("ready");
+  expect(snap.readiness.perTask.get("fn-2-bar.1")?.tag).toBe("ready");
+  const settling = new Map<string, number>();
+  const pendingLaunches = new Map<string, PendingLaunch>([
+    ["work::fn-1-foo.1", makePending({ id: "fn-1-foo.1", dirFull: "/repo-a" })],
+    ["work::fn-2-bar.1", makePending({ id: "fn-2-bar.1", dirFull: "/repo-b" })],
+  ]);
+  const fired: PendingLaunch[] = [];
+  const notes: string[] = [];
+  const fireLaunch = (p: PendingLaunch): void => {
+    fired.push(p);
+    // Mirror production: `launchInGhostty` stamps `settling.set` on
+    // the real-launch path.
+    settling.set(`${p.verb}::${p.id}`, Date.now());
+  };
+  drainPendingLaunches(
+    snap,
+    settling,
+    pendingLaunches,
+    /*dispatchedKeys*/ new Set(),
+    /*fulfilledKeys*/ new Set(),
+    /*dispatchLog*/ [],
+    fireLaunch,
+    (s) => notes.push(s),
+    42,
+  );
+  expect(fired.length).toBe(1);
+  expect(fired[0]?.id).toBe("fn-1-foo.1");
+  // Second entry still pending after the slot re-closed.
+  expect(pendingLaunches.has("work::fn-2-bar.1")).toBe(true);
+  expect(pendingLaunches.has("work::fn-1-foo.1")).toBe(false);
+});
+
+test("drainPendingLaunches — discards a pending entry whose verdict moved off ready", () => {
+  // Pending was queued at the ready edge; by drain time the snapshot
+  // shows the row at a different verdict. Drop the entry; do not
+  // fire. (Re-edge would re-queue if the row becomes ready again.)
+  const epic = makeEpic({
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        // worker_phase=done + no jobs + approval=pending → blocked:job-pending
+        worker_phase: "done",
+        approval: "pending",
+      }),
+    ],
+  });
+  const snap = buildSnap([epic]);
+  expect(snap.readiness.perTask.get("fn-1-foo.1")?.tag).toBe("blocked");
+  const settling = new Map<string, number>();
+  const pendingLaunches = new Map<string, PendingLaunch>([
+    ["work::fn-1-foo.1", makePending({ verb: "work", id: "fn-1-foo.1" })],
+  ]);
+  const fired: PendingLaunch[] = [];
+  const notes: string[] = [];
+  drainPendingLaunches(
+    snap,
+    settling,
+    pendingLaunches,
+    new Set(),
+    new Set(),
+    [],
+    (p) => fired.push(p),
+    (s) => notes.push(s),
+    42,
+  );
+  expect(fired).toEqual([]);
+  expect(pendingLaunches.size).toBe(0);
+  expect(notes.some((s) => s.includes("pending discarded"))).toBe(true);
+  expect(notes.some((s) => s.includes("verdict-"))).toBe(true);
+});
+
+test("drainPendingLaunches — discards a pending entry now blocked by the per-root mutex", () => {
+  // The duplicate-race fix. Pending was queued at the original
+  // ready edge for .2 while the slot was held by another launch;
+  // by drain time .1 in the same root has gone to `running` and
+  // the readiness-side per-epic mutex (predicate 11) has demoted
+  // .2 to `blocked:single-task-per-epic`. Re-validation against
+  // the current snap drops the held duplicate so we never spawn
+  // the second worker — the exact race the epic was filed against
+  // (a `work::N+1` slipping past both the readiness mutex and the
+  // autopilot `live-in-root` gate on a transient stopped frame).
+  const epic = makeEpic({
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "approved",
+        jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        worker_phase: "open",
+        approval: "approved",
+      }),
+    ],
+  });
+  const snap = buildSnap([epic]);
+  // .1 is running, so the readiness mutex (predicate 11) demotes
+  // .2 from `ready` to `blocked:single-task-per-epic`. The drain's
+  // verdict re-check catches it.
+  expect(snap.readiness.perTask.get("fn-1-foo.1")?.tag).toBe("running");
+  expect(snap.readiness.perTask.get("fn-1-foo.2")?.tag).toBe("blocked");
+  const settling = new Map<string, number>();
+  const pendingLaunches = new Map<string, PendingLaunch>([
+    ["work::fn-1-foo.2", makePending({ verb: "work", id: "fn-1-foo.2" })],
+  ]);
+  const fired: PendingLaunch[] = [];
+  const notes: string[] = [];
+  drainPendingLaunches(
+    snap,
+    settling,
+    pendingLaunches,
+    /*dispatchedKeys*/ new Set(),
+    /*fulfilledKeys*/ new Set(),
+    /*dispatchLog*/ [],
+    (p) => fired.push(p),
+    (s) => notes.push(s),
+    42,
+  );
+  expect(fired).toEqual([]);
+  expect(pendingLaunches.size).toBe(0);
+  expect(notes.some((s) => s.includes("pending discarded"))).toBe(true);
+  // Re-validation drops on the verdict re-check (the readiness
+  // mutex demoted the row). The autopilot-side `live-in-root`
+  // backstop also covers the propagation-gap variant of the same
+  // race (covered in `shouldSuppressDispatch` tests above).
+  expect(notes.some((s) => s.includes("verdict-blocked"))).toBe(true);
+});
+
+test("drainPendingLaunches — returns early when slot is already occupied", () => {
+  // No drain happens while the slot is held; the entry stays queued.
+  const epic = makeEpic({
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "approved",
+      }),
+    ],
+  });
+  const snap = buildSnap([epic]);
+  const settling = new Map<string, number>([["work::fn-1-foo.9", Date.now()]]);
+  const pendingLaunches = new Map<string, PendingLaunch>([
+    ["work::fn-1-foo.1", makePending({ id: "fn-1-foo.1" })],
+  ]);
+  const fired: PendingLaunch[] = [];
+  drainPendingLaunches(
+    snap,
+    settling,
+    pendingLaunches,
+    new Set(),
+    new Set(),
+    [],
+    (p) => fired.push(p),
+    () => {},
+    42,
+  );
+  expect(fired).toEqual([]);
+  expect(pendingLaunches.size).toBe(1);
 });
