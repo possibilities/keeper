@@ -9,6 +9,18 @@ event log, reducer, the five worker threads, and the wire protocol — see
 **AGENTS.md symlink** — `AGENTS.md` is a symlink to this file
 (`ln -s CLAUDE.md AGENTS.md`). Edit this file in place; never `rm`+recreate it.
 
+**Plugin layout** (fn-647.3) — the repo root is itself the Claude plugin,
+loaded via `claude --plugin-dir ~/code/keeper`. Canonical manifest is
+`./.claude-plugin/plugin.json` (only `plugin.json` lives there); the hook
+command paths live in `./hooks/hooks.json` and point at
+`${CLAUDE_PLUGIN_ROOT}/plugin/hooks/events-writer.ts`. `plugin/` holds
+the hook source plus `plugin/bin/` (the `git` PATH-injection wrapper);
+`skills/` holds NL skills under the `keeper:` namespace. There is
+exactly ONE manifest and ONE `hooks.json` — never duplicate either under
+a subtree, and never restore the retired `~/.claude/plugins/keeper`
+symlink alongside the `--plugin-dir` load (double-registers the hook,
+double-writes every event).
+
 ## Design stance
 
 **Design the server for the ideal architecture; do not nickle-and-dime against

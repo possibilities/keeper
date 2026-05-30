@@ -155,8 +155,8 @@ its `replayed_event_id` for posterity). RPC handlers MAY write
 to the log AND flip the `dead_letters` audit row in one transaction;
 never reducer projections directly (see [CLAUDE.md](./CLAUDE.md)'s DO
 NOT list). Example clients ship under the unified `keeper` CLI
-(`keeper board`, `keeper autopilot`, `keeper git`, `keeper usage`, plus
-the single-shot `keeper approve` RPC client); see
+(`keeper board`, `keeper autopilot`, `keeper git`, `keeper usage`,
+`keeper await`, plus the single-shot `keeper approve` RPC client); see
 [Example clients](#example-clients) for usage.
 
 ## What keeper is NOT
@@ -269,10 +269,21 @@ Keeper has no `install` verb. Wire it up manually:
    (The legacy `KEEPER_WATCH_ROOT` env var is retired; if still set, the daemon
    logs a one-line deprecation warning and ignores it.)
 
-4. **Symlink the plugin into Claude Code** for hook auto-discovery:
+4. **Load the keeper plugin via the arthack launcher** (`--plugin-dir`). The
+   repo root carries `.claude-plugin/plugin.json` (canonical manifest) and
+   `hooks/hooks.json` (events-writer command paths). The arthack launcher
+   appends `--plugin-dir ~/code/keeper` for every profile, so a fresh
+   session auto-loads the hook (and any future `skills/`) from this repo.
+   No symlink step.
+
+   **Migration from the retired `~/.claude/plugins/keeper` symlink:** if
+   you have one from a prior install, REMOVE IT before the next session —
+   otherwise the launcher load and the symlink double-register the hook
+   and every invocation writes two `events` rows. There is no runtime
+   dedup guard (keeper's "no in-process self-heal" stance).
 
    ```sh
-   ln -s "$PWD/plugin" ~/.claude/plugins/keeper
+   rm -f ~/.claude/plugins/keeper
    ```
 
 5. **Symlink the LaunchAgent template** into `~/Library/LaunchAgents/`:
@@ -366,12 +377,16 @@ Keeper has no `install` verb. Wire it up manually:
 
 The unified `keeper` CLI exposes the example subscribe + RPC clients as
 typed subcommands (wired through `cli/keeper.ts`, the package.json
-`bin`). `keeper board` is the read-only subscribe client (combined epics
-+ jobs view on one connection); `keeper autopilot` is its
-dispatch-oriented sibling (flat command list plus a `===`-delimited
-"ready" block); `keeper git` watches the `git` worktree collection;
-`keeper usage` watches the `usage` collection; `keeper approve` is the
-RPC client (single-shot `rpc` → `rpc_result`, no subscription). The
+`bin` — a single dispatcher entrypoint that fans into all subcommands).
+`keeper board` is the read-only subscribe client (combined epics + jobs
+view on one connection); `keeper autopilot` is its dispatch-oriented
+sibling (flat command list plus a `===`-delimited "ready" block);
+`keeper git` watches the `git` worktree collection; `keeper usage`
+watches the `usage` collection; `keeper await` is the blocking
+wait-for-condition client (emits a Monitor-shaped `armed`/`met`/`failed`
+event stream on stdout and exits when an epic/task completes or
+unblocks); `keeper approve` is the RPC client (single-shot `rpc` →
+`rpc_result`, no subscription). The
 subscribe clients share helpers in `src/readiness-client.ts` —
 `subscribeReadiness` owns the three-collection lifecycle (board +
 autopilot) and `subscribeCollection` owns the single-collection
@@ -570,6 +585,22 @@ collapses to plain stream output. Run any of them with
   keeper usage --sock /tmp/x  # socket override
   ```
 
+- `await.ts` — the blocking wait-for-condition client (fn-647). Non-TUI:
+  emits a Monitor-shaped event stream on stdout — exactly one
+  `[keeper-await] armed …` line after the on-board check, then exactly
+  one terminal `[keeper-await] met …` or `[keeper-await] failed …` line
+  — and exits when the named epic/task completes (pops off the board) or
+  unblocks. Auto-detects epic vs task by the `.N` suffix; "unblocked"
+  deliberately excludes autopilot's `single-task-per-epic` /
+  `single-task-per-root` concurrency mutexes (every other blocker still
+  blocks). Exit codes: 0 met, 1 not-found/usage/connection, 3 timeout
+  (SIGTERM), 4 deleted, 5 stuck (only under `--fail-on-stuck`).
+
+  ```sh
+  keeper await complete fn-646-keeper-cli-opentui-port.1   # task done
+  keeper await unblocked fn-650-some-epic                  # epic ready
+  ```
+
 - `approve.ts` — the RPC client. Single-shot: opens a `Bun.connect`, sends
   one `rpc` frame for `set_task_approval` or `set_epic_approval`, awaits the
   `rpc_result` (or `error`), and exits. No subscription, no reconnect loop.
@@ -591,7 +622,8 @@ Reverse of install:
 ```sh
 launchctl bootout gui/$(id -u)/arthack.keeperd
 rm ~/Library/LaunchAgents/arthack.keeperd.plist
-rm ~/.claude/plugins/keeper
+# Stop loading the plugin: remove `--plugin-dir ~/code/keeper` from
+# whatever entrypoint launches `claude` (e.g. the arthack launcher).
 # Optional — drops all captured state, including the events log:
 rm -rf ~/.local/state/keeper
 ```
@@ -936,6 +968,11 @@ over the wire like the other collections) is a natural future
 extension and intentionally out of scope here — the inputs are already
 on the wire, so the helper-in-`src/` design preserves the option
 without paying its cost today.
+
+The unified `keeper` CLI is a single dispatcher entrypoint (`cli/keeper.ts`,
+the package.json `bin`) that fans into every subcommand — `board`,
+`autopilot`, `git`, `usage`, `await`, `approve` — so all example clients
+ship as one binary instead of N standalone scripts.
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).
