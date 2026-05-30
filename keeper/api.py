@@ -36,9 +36,11 @@ from pathlib import Path
 # touches only ``usage`` / ``profiles`` (keeper-py reads neither); v36 (fn-642
 # ``jobs.profile_name``) is an additive nullable column on ``jobs`` and doesn't
 # touch the file-attribution shape; v37 (fn-643 ``dead_letters`` operational
-# sidecar table + index) is additive and touches neither.
+# sidecar table + index) is additive and touches neither; v38 (fn-645 usage
+# envelope status / subscription / error axes) adds nullable columns to
+# ``usage`` only (keeper-py reads neither ``usage`` nor ``profiles``).
 # Bump this set when a keeper schema change alters those tables.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37, 38})
 
 
 class KeeperError(Exception):
