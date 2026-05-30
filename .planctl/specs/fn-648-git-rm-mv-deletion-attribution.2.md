@@ -60,5 +60,5 @@ directory-prefix, by `'*.ts'` glob; rename matched on both src and dst; a
   pass.
 
 ## Done summary
-
+Reducer's findExplicitAttributions now matches snapshot-known deleted/renamed paths against git-rm/git-mv bash_mutation_targets via exact / directory-prefix / hand-rolled fnmatch (no third-party deps); __TREE__ sentinel rejected up front so tree-mutate events can't cross-match real files; six new GitSnapshot tests cover all match modes plus negative controls.
 ## Evidence
