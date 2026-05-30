@@ -161,6 +161,11 @@ test("connection-local PRAGMAs are applied on every open", () => {
   };
   // 1 == NORMAL
   expect(sync.synchronous).toBe(1);
+
+  // fn-649: mmap is enabled (clamped to SQLite's compile-time max, but > 0)
+  // so folds touching cold pages don't pay read() syscalls on the ~850MB log.
+  const mmap = db.prepare("PRAGMA mmap_size").get() as { mmap_size: number };
+  expect(mmap.mmap_size).toBeGreaterThan(0);
   db.close();
 });
 

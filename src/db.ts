@@ -1063,6 +1063,14 @@ export interface KeeperDb {
  *   connection-local; the hook MUST re-set it per invocation.
  * - `foreign_keys = ON`: bun:sqlite does not auto-enable.
  * - `temp_store = MEMORY`: keeps spill files off disk.
+ * - `mmap_size`: memory-map the DB so pages are served from the OS page cache
+ *   instead of per-page `read()` syscalls. The event log is ~850MB; with mmap
+ *   OFF (the SQLite default) and an ~8MB page cache, a fold that touches cold
+ *   pages paid seconds of I/O and held the write lock long enough to starve
+ *   concurrent hook INSERTs into dead-letters (measured: a window scan
+ *   1486ms cold → 33ms with mmap). mmap is virtual address space backed by the
+ *   shared OS page cache — negligible per-connection cost, so the short-lived
+ *   hook benefits too without committing heap.
  */
 function applyPragmas(db: Database, busyTimeoutMs = 5000): void {
   // busy_timeout FIRST. The `journal_mode = WAL` switch below needs a brief
@@ -1076,6 +1084,9 @@ function applyPragmas(db: Database, busyTimeoutMs = 5000): void {
   db.run("PRAGMA synchronous = NORMAL");
   db.run("PRAGMA foreign_keys = ON");
   db.run("PRAGMA temp_store = MEMORY");
+  // 4 GiB cap (SQLite clamps to its compile-time max). Covers the current
+  // ~850MB log with growth room; revisit if the DB approaches the cap.
+  db.run("PRAGMA mmap_size = 4294967296");
 }
 
 /**
