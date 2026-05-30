@@ -348,18 +348,6 @@ const CREATE_EVENTS_INDEXES = [
   // cold cache (measured ~1.8s → ~274ms), so an orphan-heavy GitSnapshot fold
   // never starves a concurrent hook INSERT.
   "CREATE INDEX IF NOT EXISTS idx_events_hook_tool_ts ON events(hook_event, tool_name, ts)",
-  // COVERING indexes for the hoisted inferred-attribution window self-join
-  // (`computeRepoBashWindows`). Without them the join reads 64k bash-event full
-  // ROWS — ~400MB of `data` blobs — so a cold/evicted fold paid seconds of I/O
-  // and starved hook INSERTs even with a 256MB cache. These carry every column
-  // the query touches (filter + join + SELECT), so the planner uses COVERING
-  // INDEX and never visits a data page: measured 40ms cold with only an 8MB
-  // cache (cache-INDEPENDENT, doesn't grow with the log). `idx_events_bashwin_pre`
-  // serves the PreToolUse:Bash driver; `idx_events_bashwin_post` the
-  // tool_use_id-joined PostToolUse:Bash side (partial — only rows with a
-  // tool_use_id participate).
-  "CREATE INDEX IF NOT EXISTS idx_events_bashwin_pre ON events(hook_event, tool_name, ts, tool_use_id, session_id)",
-  "CREATE INDEX IF NOT EXISTS idx_events_bashwin_post ON events(tool_use_id, hook_event, tool_name, ts, cwd, session_id) WHERE tool_use_id IS NOT NULL",
   // Expression index on the Write/Edit tool's target path — THE hot path. The
   // explicit-attribution scan (`findExplicitAttributions`) matches
   // `json_extract(data,'$.tool_input.file_path') = ?` per dirty file; without
@@ -3748,6 +3736,29 @@ function migrate(db: Database): void {
     // audit log of what was never folded until the human recovered it.
     //
     // See `CREATE_DEAD_LETTERS` above for the column docstring.
+
+    // fn-649: COVERING indexes for the hoisted inferred-attribution window
+    // self-join (`computeRepoBashWindows`). Created HERE — after every column-
+    // adding version slot above — because they reference `tool_use_id` (added in
+    // the v16→v17 slot); placing them in the unconditional pre-migration
+    // `CREATE_EVENTS_INDEXES` block would fail "no such column" while migrating a
+    // pre-v17 DB. Idempotent `CREATE INDEX IF NOT EXISTS`, so no SCHEMA_VERSION
+    // bump is needed (and none claimed — leaves v38 free for fn-645/fn-648).
+    //
+    // Without them the window join reads 64k bash-event full ROWS (~400MB of
+    // `data` blobs), which evicts even a 256MB cache and leaves a cold fold
+    // holding the write lock multi-second — starving hook INSERTs into dead-
+    // letters. These carry every column the query touches (filter + join +
+    // SELECT) so the planner uses COVERING INDEX and never visits a data page:
+    // measured 15ms on the live DB with an 8MB cache (cache-independent, scales
+    // with the log). `_pre` serves the PreToolUse:Bash driver; `_post` the
+    // tool_use_id-joined PostToolUse:Bash side (partial on the sparse column).
+    db.run(
+      "CREATE INDEX IF NOT EXISTS idx_events_bashwin_pre ON events(hook_event, tool_name, ts, tool_use_id, session_id)",
+    );
+    db.run(
+      "CREATE INDEX IF NOT EXISTS idx_events_bashwin_post ON events(tool_use_id, hook_event, tool_name, ts, cwd, session_id) WHERE tool_use_id IS NOT NULL",
+    );
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
