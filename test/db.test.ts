@@ -93,6 +93,7 @@ test("all expected indexes are present", () => {
     "idx_events_planctl_target",
     // fn-649: attribution-fold perf indexes.
     "idx_events_hook_tool",
+    "idx_events_hook_tool_ts",
     "idx_events_tool_file_path",
   ];
   for (const name of required) {

@@ -342,6 +342,12 @@ const CREATE_EVENTS_INDEXES = [
   // PreToolUse:Bash. (`idx_events_pid_hook_tool` leads with `pid`, so it can't
   // serve a hook_event-first query.)
   "CREATE INDEX IF NOT EXISTS idx_events_hook_tool ON events(hook_event, tool_name)",
+  // (hook_event, tool_name, ts) — the hoisted inferred-attribution window scan
+  // (`computeRepoBashWindows`) bounds PreToolUse/PostToolUse:Bash by `ts`; the
+  // trailing `ts` keeps that scan under the hook's 1.2s busy_timeout even on a
+  // cold cache (measured ~1.8s → ~274ms), so an orphan-heavy GitSnapshot fold
+  // never starves a concurrent hook INSERT.
+  "CREATE INDEX IF NOT EXISTS idx_events_hook_tool_ts ON events(hook_event, tool_name, ts)",
   // Expression index on the Write/Edit tool's target path — THE hot path. The
   // explicit-attribution scan (`findExplicitAttributions`) matches
   // `json_extract(data,'$.tool_input.file_path') = ?` per dirty file; without
