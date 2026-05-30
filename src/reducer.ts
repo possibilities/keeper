@@ -2037,6 +2037,17 @@ interface UsageSnapshotPayload {
   week_resets_at: string | null;
   sonnet_week_percent: number | null;
   sonnet_week_resets_at: string | null;
+  // fn-645: envelope freshness / plan / stale-error axes.
+  status: string | null;
+  /**
+   * Coerced from the producer's bool|null to 1/0/null at extract time so the
+   * UPSERT binding matches the SQLite column type (INTEGER, nullable). The
+   * producer's wire shape stays boolean (see `UsageSnapshotMessage`).
+   */
+  subscription_active: 1 | 0 | null;
+  error_type: string | null;
+  error_message: string | null;
+  error_at: string | null;
 }
 
 function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
@@ -2044,7 +2055,14 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
     return null;
   }
   try {
-    const parsed = JSON.parse(event.data) as Partial<UsageSnapshotPayload>;
+    const parsed = JSON.parse(event.data) as Partial<
+      Omit<UsageSnapshotPayload, "subscription_active">
+    > & { subscription_active?: unknown };
+    // fn-645: bool|null → 1/0/null. Non-booleans (including missing) fold to
+    // null per the "safe value" invariant.
+    const subRaw = parsed.subscription_active;
+    const subscriptionActive: 1 | 0 | null =
+      subRaw === true ? 1 : subRaw === false ? 0 : null;
     return {
       target: typeof parsed.target === "string" ? parsed.target : null,
       multiplier:
@@ -2079,6 +2097,13 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
         typeof parsed.sonnet_week_resets_at === "string"
           ? parsed.sonnet_week_resets_at
           : null,
+      status: typeof parsed.status === "string" ? parsed.status : null,
+      subscription_active: subscriptionActive,
+      error_type:
+        typeof parsed.error_type === "string" ? parsed.error_type : null,
+      error_message:
+        typeof parsed.error_message === "string" ? parsed.error_message : null,
+      error_at: typeof parsed.error_at === "string" ? parsed.error_at : null,
     };
   } catch (err) {
     console.error(
@@ -2126,8 +2151,10 @@ function projectUsageRow(db: Database, event: Event): void {
     `INSERT INTO usage (
        id, target, multiplier, session_percent, session_resets_at,
        week_percent, week_resets_at, sonnet_week_percent,
-       sonnet_week_resets_at, last_event_id, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       sonnet_week_resets_at, status, subscription_active,
+       error_type, error_message, error_at,
+       last_event_id, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        target = excluded.target,
        multiplier = excluded.multiplier,
@@ -2137,6 +2164,11 @@ function projectUsageRow(db: Database, event: Event): void {
        week_resets_at = excluded.week_resets_at,
        sonnet_week_percent = excluded.sonnet_week_percent,
        sonnet_week_resets_at = excluded.sonnet_week_resets_at,
+       status = excluded.status,
+       subscription_active = excluded.subscription_active,
+       error_type = excluded.error_type,
+       error_message = excluded.error_message,
+       error_at = excluded.error_at,
        last_event_id = excluded.last_event_id,
        updated_at = excluded.updated_at`,
     [
@@ -2149,6 +2181,11 @@ function projectUsageRow(db: Database, event: Event): void {
       snapshot.week_resets_at,
       snapshot.sonnet_week_percent,
       snapshot.sonnet_week_resets_at,
+      snapshot.status,
+      snapshot.subscription_active,
+      snapshot.error_type,
+      snapshot.error_message,
+      snapshot.error_at,
       event.id,
       event.ts,
     ],

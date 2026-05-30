@@ -70,6 +70,7 @@ function envelopeBody(
     multiplier: 5,
     last_successful_fetch_at: "2026-05-26T15:49:02.302958-04:00",
     last_skipped_fetch_at: null,
+    last_failed_fetch_at: null,
     next_fetch_at: "2026-05-26T15:51:30.316687-04:00",
     fetched_at: "2026-05-26T15:49:02.302958-04:00",
     usage: {
@@ -137,6 +138,12 @@ test("buildUsageMessage maps id/target/multiplier and the two-window usage sub-b
     // safe-value invariant. (codex envelopes never carry this sub-object.)
     sonnet_week_percent: null,
     sonnet_week_resets_at: null,
+    // fn-645 fields: this envelope omits status/subscription/error → all null.
+    status: null,
+    subscription_active: null,
+    error_type: null,
+    error_message: null,
+    error_at: null,
   });
 });
 
@@ -200,14 +207,17 @@ test("buildUsageMessage drops every freshness field — they NEVER enter the mes
     next_fetch_at: "T2",
     last_successful_fetch_at: "T3",
     last_skipped_fetch_at: "T4",
+    // fn-645: `last_failed_fetch_at` joined the freshness exclusion set.
+    last_failed_fetch_at: "T5",
     usage: { session: { percent_used: 1, resets_at: "S" } },
   });
-  // None of the four freshness fields appear in the message shape.
+  // None of the freshness fields appear in the message shape.
   const json = JSON.stringify(msg);
   expect(json).not.toContain("fetched_at");
   expect(json).not.toContain("next_fetch_at");
   expect(json).not.toContain("last_successful_fetch_at");
   expect(json).not.toContain("last_skipped_fetch_at");
+  expect(json).not.toContain("last_failed_fetch_at");
 });
 
 // ---------------------------------------------------------------------------
@@ -254,6 +264,172 @@ test("FRESHNESS EXCLUSION: two envelopes differing ONLY in fetch timestamps prod
   expect(emitted.length).toBe(1);
 });
 
+test("buildUsageMessage projects fn-645 status / subscription_active / error axes", () => {
+  // A stale envelope: status carried, subscription_active false, full error
+  // sub-object flattened into error_type / error_message / error_at.
+  const stale = buildUsageMessage({
+    id: "claude-default",
+    target: "claude",
+    multiplier: 5,
+    status: "stale",
+    subscription_active: false,
+    error: {
+      type: "ClaudeUsageParseError",
+      message: "required label not found: 'Current session'",
+      at: "2026-05-29T11:42:17-07:00",
+    },
+    usage: null,
+  });
+  expect(stale?.status).toBe("stale");
+  expect(stale?.subscription_active).toBe(false);
+  expect(stale?.error_type).toBe("ClaudeUsageParseError");
+  expect(stale?.error_message).toBe(
+    "required label not found: 'Current session'",
+  );
+  expect(stale?.error_at).toBe("2026-05-29T11:42:17-07:00");
+
+  // An active subscribed envelope: status carried, subscription_active true,
+  // error sub-object null → all three error_* fields null.
+  const active = buildUsageMessage({
+    id: "x",
+    status: "active",
+    subscription_active: true,
+    error: null,
+  });
+  expect(active?.status).toBe("active");
+  expect(active?.subscription_active).toBe(true);
+  expect(active?.error_type).toBeNull();
+  expect(active?.error_message).toBeNull();
+  expect(active?.error_at).toBeNull();
+
+  // Codex never-observed-subscription: subscription_active null tri-state.
+  const unknown = buildUsageMessage({
+    id: "codex",
+    status: "active",
+    subscription_active: null,
+  });
+  expect(unknown?.subscription_active).toBeNull();
+});
+
+test("ERROR_AT GATE EXCLUSION: two envelopes differing ONLY in error.at produce ONE emit", () => {
+  // fn-645 introduces the first PROJECTED-but-GATE-EXCLUDED field. `error.at`
+  // advances on every failed scrape (~90s during an outage); without the
+  // exclusion, a stable outage would mint a synthetic event every cycle.
+  // The exclusion lives in `usageGateKey` — both `onChange` and `seedFromDb`
+  // route through it. This is the tripwire that catches a future regression
+  // that includes `error_at` in the gate.
+  const emitted: UsageMessage[] = [];
+  const scanner = new UsageScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  const path = writeEnvelope("claude-default", {
+    target: "claude",
+    multiplier: 5,
+    status: "stale",
+    subscription_active: true,
+    error: {
+      type: "ClaudeUsageParseError",
+      message: "required label not found: 'Current session'",
+      at: "2026-05-29T11:42:17-07:00",
+    },
+    usage: null,
+  });
+  scanner.onChange(path);
+  expect(emitted.length).toBe(1);
+
+  // Rewrite with ONLY error.at advanced (and the freshness fields that move
+  // with each scrape). Type/message/status all unchanged.
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "claude-default",
+      target: "claude",
+      multiplier: 5,
+      status: "stale",
+      subscription_active: true,
+      error: {
+        type: "ClaudeUsageParseError",
+        message: "required label not found: 'Current session'",
+        at: "2026-05-29T11:43:47-07:00",
+      },
+      usage: null,
+    }),
+  );
+  scanner.onChange(path);
+  // ZERO additional emits — gate suppresses. If this fails, error_at has
+  // leaked into the gate key. FIX BY REMOVING THE LEAK from `usageGateKey`.
+  expect(emitted.length).toBe(1);
+
+  // But: a status flip (stale → active) IS in the gate and re-emits, even if
+  // error.at stayed the same as a previous emit's stamp.
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "claude-default",
+      target: "claude",
+      multiplier: 5,
+      status: "active",
+      subscription_active: true,
+      error: null,
+      usage: {
+        session: { percent_used: 1, resets_at: "T" },
+        week: { percent_used: 1, resets_at: "T" },
+      },
+    }),
+  );
+  scanner.onChange(path);
+  expect(emitted.length).toBe(2);
+  // The full message DOES carry error_at when present — the gate exclusion
+  // only governs change detection, not the emitted payload. Here the new
+  // status is "active" so the error_at is null in the second emit.
+  expect((emitted[1] as { status: string }).status).toBe("active");
+  expect((emitted[1] as { error_at: string | null }).error_at).toBeNull();
+});
+
+test("a different error type/message DOES re-emit (gate fields moved)", () => {
+  // The flip-side of the error_at exclusion: error_type and error_message ARE
+  // in the gate (they're real content changes), so a different failure shape
+  // re-emits even if error_at advances on the same cadence as a noop scrape.
+  const emitted: UsageMessage[] = [];
+  const scanner = new UsageScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  const path = writeEnvelope("claude-default", {
+    target: "claude",
+    multiplier: 5,
+    status: "stale",
+    error: {
+      type: "ClaudeUsageParseError",
+      message: "first failure",
+      at: "2026-05-29T11:42:17-07:00",
+    },
+  });
+  scanner.onChange(path);
+  expect(emitted.length).toBe(1);
+
+  // Different message → re-emit.
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "claude-default",
+      target: "claude",
+      multiplier: 5,
+      status: "stale",
+      error: {
+        type: "ClaudeUsageParseError",
+        message: "second failure",
+        at: "2026-05-29T11:43:47-07:00",
+      },
+    }),
+  );
+  scanner.onChange(path);
+  expect(emitted.length).toBe(2);
+});
+
 // ---------------------------------------------------------------------------
 // (a) Pure-core determinism — onChange end-to-end with real files
 // ---------------------------------------------------------------------------
@@ -279,6 +455,11 @@ test("onChange emits a usage-snapshot for a real envelope, then change-gates an 
     week_resets_at: "2026-06-01T20:00:00-04:00",
     sonnet_week_percent: null,
     sonnet_week_resets_at: null,
+    status: null,
+    subscription_active: null,
+    error_type: null,
+    error_message: null,
+    error_at: null,
   });
 
   // Identical re-scan suppressed.
@@ -538,6 +719,99 @@ test("seedFromDb suppresses a re-emit of an already-folded projection row (slot-
   // (seeded by seedFromDb) MUST suppress the boot scan's onChange emit.
   writeEnvelope("claude-default", envelopeBody());
   scanner.onChange(join(stateDir, "claude-default.json"));
+  expect(emitted).toEqual([]);
+  db.close();
+});
+
+test("seedFromDb reconstructs fn-645 fields and suppresses re-emit (subscription_active boolean)", () => {
+  // The seed path stores `subscription_active` as 1/0/NULL; the reconstruction
+  // must coerce back to boolean | null so the gate key matches the live
+  // `buildUsageMessage` output byte-for-byte. Also: `error_at` is in the
+  // projection but NOT in the gate, so seeding from a row that carries a
+  // different `error_at` than the on-disk file must still suppress.
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  db.run(
+    `INSERT INTO usage (id, target, multiplier, session_percent, session_resets_at,
+                        week_percent, week_resets_at, status, subscription_active,
+                        error_type, error_message, error_at,
+                        last_event_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "claude-default",
+      "claude",
+      5,
+      12.0,
+      "2026-05-26T18:30:00-04:00",
+      8.0,
+      "2026-06-01T20:00:00-04:00",
+      "stale",
+      1, // SQLite stores boolean as integer
+      "ClaudeUsageParseError",
+      "required label not found",
+      "2026-05-29T11:42:17-07:00",
+      1,
+      100,
+    ],
+  );
+
+  const emitted: UsageMessage[] = [];
+  const scanner = new UsageScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+
+  // The on-disk file carries the SAME content as the projection row except
+  // `error.at` has advanced (the re-failed scrape stamp). The gate must
+  // suppress — error_at is excluded from the gate.
+  writeEnvelope("claude-default", {
+    target: "claude",
+    multiplier: 5,
+    status: "stale",
+    subscription_active: true,
+    error: {
+      type: "ClaudeUsageParseError",
+      message: "required label not found",
+      at: "2026-05-29T11:50:00-07:00", // different from seeded
+    },
+    usage: {
+      session: { percent_used: 12.0, resets_at: "2026-05-26T18:30:00-04:00" },
+      week: { percent_used: 8.0, resets_at: "2026-06-01T20:00:00-04:00" },
+    },
+  });
+  scanner.onChange(join(stateDir, "claude-default.json"));
+  expect(emitted).toEqual([]);
+  db.close();
+});
+
+test("seedFromDb handles subscription_active=0 (false) round-trip", () => {
+  // Confirm the 0→false coercion at seed time matches buildUsageMessage's
+  // false output (the no-subscription account case).
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  db.run(
+    `INSERT INTO usage (id, target, multiplier, status, subscription_active,
+                        last_event_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ["no-sub", "claude", 5, "active", 0, 1, 100],
+  );
+  const emitted: UsageMessage[] = [];
+  const scanner = new UsageScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+
+  // On-disk file matches the projection row.
+  writeEnvelope("no-sub", {
+    target: "claude",
+    multiplier: 5,
+    status: "active",
+    subscription_active: false,
+    error: null,
+  });
+  scanner.onChange(join(stateDir, "no-sub.json"));
   expect(emitted).toEqual([]);
   db.close();
 });

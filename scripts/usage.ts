@@ -253,10 +253,25 @@ export function renderRowLines(
 ): string[] {
   if (rows.length === 0) return [];
 
+  // fn-645: subscription_active gating. A row whose envelope confirmed no
+  // subscription (`subscription_active === 0` on the wire — the reducer
+  // coerced the producer's `false`) renders empty `?` bars with no actionable
+  // signal; suppress entirely. `null` (unknown — e.g. codex's never-observed
+  // axis) and `1` (true) both stay visible. The filter runs FIRST so width
+  // math + label-pool decisions only see visible rows; an all-hidden input
+  // returns an empty array (matching the empty-input early-out).
+  const visible = rows.filter((r) => r.subscription_active !== 0);
+  if (visible.length === 0) return [];
+
   interface RowCells {
     id: string;
     target: string;
     mult: string;
+    // fn-645: envelope freshness token rendered as a trailing chip on the
+    // header line ("active" / "idle" / "stale"). Empty when the envelope
+    // omitted the field (pre-fn-3 producer); rendered for all three real
+    // values.
+    status: string;
     sBar: string;
     sPct: string;
     sReset: string;
@@ -273,9 +288,16 @@ export function renderRowLines(
     // `last_rate_limit_at`, or the codex stack (no rate-limit concept).
     // Otherwise the same minute-rounded relative time as the reset cells.
     rlRel: string;
+    // fn-645: stale-error line body. Empty when no error to render
+    // (`error_type` NULL — implies non-stale status); otherwise the
+    // pre-formatted `<type>: <message>` content (without the trailing
+    // relative-time stamp). The matching `errRel` is the ISO-derived
+    // relative-time cell.
+    errContent: string;
+    errRel: string;
   }
 
-  const cells: RowCells[] = rows.map((row) => {
+  const cells: RowCells[] = visible.map((row) => {
     const hasSonnet = row.sonnet_week_percent != null;
     // codex has no rate-limit concept — suppress the line even if the
     // wire payload were to carry a non-null `last_rate_limit_at`.
@@ -285,10 +307,23 @@ export function renderRowLines(
       isCodex || rlRaw == null || typeof rlRaw !== "number"
         ? ""
         : relTimeFromUnixSec(rlRaw, nowMs);
+    // fn-645: stale-error line. Present only when `error_type` is set
+    // (mirrors the agentuse contract — the `error` sub-object is non-null
+    // only when status == "stale"). The content is `<type>: <message…>`;
+    // the matching cell width pad happens at render time once we know
+    // `wPct`. The relative-time cell uses the ISO `error_at` routed through
+    // `relTime` (the same helper the quota resets use) so it ticks on the
+    // 30s clock identically.
+    const errType = seg(row.error_type);
+    const errMsg = seg(row.error_message);
+    const errAtIso = seg(row.error_at);
+    const errContent = errType === "" ? "" : `${errType}: ${errMsg}`;
+    const errRel = errType === "" ? "" : relTime(errAtIso, nowMs);
     return {
       id: `(${seg(row.id)})`,
       target: seg(row.target),
       mult: seg(row.multiplier),
+      status: seg(row.status),
       sBar: bar(row.session_percent),
       sPct: pct(row.session_percent),
       sReset: relTime(seg(row.session_resets_at), nowMs),
@@ -299,6 +334,8 @@ export function renderRowLines(
       swPct: hasSonnet ? pct(row.sonnet_week_percent) : null,
       swReset: hasSonnet ? relTime(seg(row.sonnet_week_resets_at), nowMs) : "",
       rlRel,
+      errContent,
+      errRel,
     };
   });
 
@@ -322,10 +359,13 @@ export function renderRowLines(
   // less screen from padding `week` against an absent label. Same rule
   // for `rate-limited`: only joins the pool when at least one row will
   // render that line, so a limit-less screen doesn't pad the quota
-  // labels against the wider `rate-limited` literal.
+  // labels against the wider `rate-limited` literal. fn-645: `error` joins
+  // the pool only when at least one visible row will render a stale-error
+  // line, mirroring the same conditional-widen rule.
   const labels = ["session", "week"];
   if (cells.some((c) => c.swPct != null)) labels.push("sonnet");
   if (cells.some((c) => c.rlRel !== "")) labels.push("rate-limited");
+  if (cells.some((c) => c.errContent !== "")) labels.push("error");
   const wLabel = widest(labels);
 
   const indent = " ".repeat(wId + 1);
@@ -347,6 +387,26 @@ export function renderRowLines(
   const renderRateLimit = (rel: string): string =>
     `${indent}${"rate-limited".padEnd(wLabel, " ")} ${rel}`;
 
+  // fn-645: stale-error line. The body content `<type>: <message…>` occupies
+  // the same `BAR_WIDTH + 2 + 1 + wPct` cell width the bar+space+pct
+  // sequence does on quota lines (bracket + BAR_WIDTH cells + bracket =
+  // `BAR_WIDTH + 2`, one separator space, then `wPct`-wide pct), so the
+  // trailing relative-time stamp lands in the SAME column as the reset
+  // stamps. Truncation cuts oversize content with an ellipsis; under-width
+  // content padEnds with spaces to keep the rel-time column position
+  // stable. The matching `errRel` is the ISO-derived relative-time cell.
+  const errCellWidth = BAR_WIDTH + 2 + 1 + wPct;
+  const renderError = (content: string, rel: string): string => {
+    let body: string;
+    if (content.length > errCellWidth) {
+      body = `${content.slice(0, Math.max(0, errCellWidth - 1))}…`;
+    } else {
+      body = content.padEnd(errCellWidth, " ");
+    }
+    const head = `${indent}${"error".padEnd(wLabel, " ")} ${body}`;
+    return rel === "" ? head : `${head} ${rel}`;
+  };
+
   const lines: string[] = [];
   for (const c of cells) {
     const id = c.id.padStart(wId, " ");
@@ -354,7 +414,16 @@ export function renderRowLines(
       c.target === "" && c.mult === ""
         ? ""
         : `[${c.target.padEnd(wTarget, " ")} ${c.mult.padStart(wMult, " ")}x]`;
-    lines.push(targetChip === "" ? id : `${id} ${targetChip}`);
+    // fn-645: status token as a trailing chip on the header line. Rendered
+    // for any non-empty status; absent for pre-fn-3 envelopes (status NULL).
+    // Two-space separator before the token to clearly distance it from the
+    // chip — readability win over the single-space chip separator. When the
+    // chip is absent (no target/mult), the token tags directly after the id.
+    const header = (() => {
+      const head = targetChip === "" ? id : `${id} ${targetChip}`;
+      return c.status === "" ? head : `${head}  ${c.status}`;
+    })();
+    lines.push(header);
     lines.push(renderBody("session", c.sBar, c.sPct, c.sReset));
     lines.push(renderBody("week", c.wBar, c.wPct, c.wReset));
     if (c.swPct != null && c.swBar != null) {
@@ -362,6 +431,9 @@ export function renderRowLines(
     }
     if (c.rlRel !== "") {
       lines.push(renderRateLimit(c.rlRel));
+    }
+    if (c.errContent !== "") {
+      lines.push(renderError(c.errContent, c.errRel));
     }
   }
   return lines;
@@ -595,6 +667,17 @@ async function main(): Promise<void> {
         r.sonnet_week_percent,
         r.sonnet_week_resets_at,
         r.last_rate_limit_at,
+        // fn-645: envelope status / subscription / error axes. `error_at` is
+        // safe to include here because the WORKER's change-gate
+        // (`usageGateKey`) is what suppresses synthetic-event churn during
+        // an outage; the wire-side `error_at` only moves when the gated
+        // fields move, so including it in the renderer's hash key cannot
+        // forge a frame.
+        r.status,
+        r.subscription_active,
+        r.error_type,
+        r.error_message,
+        r.error_at,
       ]),
     );
   }

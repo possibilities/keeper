@@ -715,3 +715,305 @@ test("change-gate insensitivity: rendered tail moves with the clock", () => {
   expect(at2m[0]).toMatch(/ 2m ago$/);
   expect(at1h[0]).toMatch(/ 1h ago$/);
 });
+
+// ---------------------------------------------------------------------------
+// fn-645: envelope status / subscription_active / stale-error rendering
+// ---------------------------------------------------------------------------
+//
+// `renderRowLines` consumes three new axes:
+//   - `subscription_active`: `0` hides the row entirely; `1` and NULL render.
+//   - `status`: trailing token on the header line ("active"/"idle"/"stale").
+//   - `error_type` + `error_message` + `error_at`: a stale-error body line
+//     `<type>: <message…>` truncated to the bar+pct column width with
+//     `error_at` ticking on the 30s clock via `relTime`.
+
+test("subscription_active=0 rows are hidden from the render entirely", () => {
+  // A no-subscription row would render empty `?` bars with no actionable
+  // signal — suppress it. Subscribed rows + unknown (null) rows still render.
+  const lines = renderRowLines(
+    [
+      {
+        id: "no-sub",
+        target: "claude",
+        multiplier: 5,
+        subscription_active: 0,
+        session_percent: null,
+        session_resets_at: null,
+        week_percent: null,
+        week_resets_at: null,
+      },
+      {
+        id: "subscribed",
+        target: "claude",
+        multiplier: 5,
+        subscription_active: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+      },
+      {
+        id: "codex",
+        target: "codex",
+        multiplier: 1,
+        subscription_active: null,
+        session_percent: 5,
+        session_resets_at: isoOffset(60),
+        week_percent: 5,
+        week_resets_at: isoOffset(60),
+      },
+    ],
+    NOW_MS,
+  );
+  // Hidden row's id is absent; visible rows' ids are present.
+  expect(lines.join("\n")).not.toContain("no-sub");
+  expect(lines.join("\n")).toContain("subscribed");
+  expect(lines.join("\n")).toContain("codex");
+});
+
+test("an all-hidden input returns an empty array", () => {
+  const lines = renderRowLines(
+    [
+      {
+        id: "no-sub-1",
+        subscription_active: 0,
+        target: "claude",
+        multiplier: 5,
+      },
+      {
+        id: "no-sub-2",
+        subscription_active: 0,
+        target: "claude",
+        multiplier: 5,
+      },
+    ],
+    NOW_MS,
+  );
+  expect(lines).toEqual([]);
+});
+
+test("status renders as a trailing token on the header line", () => {
+  // The header line carries `(id) [target mult x]  <status>` when the
+  // envelope provided a status. All three real values render.
+  for (const status of ["active", "idle", "stale"]) {
+    const lines = renderRowLines(
+      [
+        {
+          id: "p",
+          target: "claude",
+          multiplier: 5,
+          status,
+          subscription_active: 1,
+          session_percent: 10,
+          session_resets_at: isoOffset(60),
+          week_percent: 10,
+          week_resets_at: isoOffset(60),
+        },
+      ],
+      NOW_MS,
+    );
+    // The header is the first line; status follows the chip with a separator.
+    expect(lines[0]).toMatch(new RegExp(`${status}$`));
+    expect(lines[0]).toContain("[claude 5x]");
+  }
+});
+
+test("missing/null status leaves the header without a status token", () => {
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        // status absent (pre-fn-3 envelope)
+        subscription_active: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+      },
+    ],
+    NOW_MS,
+  );
+  // Header ends at the chip's `]` — no trailing status.
+  expect(lines[0]).toMatch(/]$/);
+});
+
+test("stale error renders as an indented body line with type:message and ticking error_at", () => {
+  // The error line mirrors renderRateLimit's idiom — body indent + label
+  // padding matches the quota lines, with the relative-time stamp landing in
+  // the same column as the reset stamps. Content short enough to fit in the
+  // bar+pct cell width (BAR_WIDTH=30 + brackets + space + wPct=3 ≈ 36 chars).
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        status: "stale",
+        subscription_active: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+        error_type: "ParseError",
+        error_message: "label not found",
+        error_at: isoOffset(-3), // 3 minutes ago
+      },
+    ],
+    NOW_MS,
+  );
+  // header + session + week + error = 4 lines.
+  expect(lines).toHaveLength(4);
+  const errLine = lines.find((l) => l.trimStart().startsWith("error "));
+  expect(errLine).toBeDefined();
+  expect(errLine).toContain("ParseError: label not found");
+  expect(errLine).toMatch(/ 3m ago$/);
+});
+
+test("error_at ticks on the clock (different nowMs → different rendered tail)", () => {
+  const row = [
+    {
+      id: "p",
+      target: "claude",
+      multiplier: 5,
+      status: "stale",
+      subscription_active: 1,
+      session_percent: 10,
+      session_resets_at: isoOffset(60),
+      week_percent: 10,
+      week_resets_at: isoOffset(60),
+      error_type: "X",
+      error_message: "msg",
+      error_at: isoOffset(-2), // 2 minutes before NOW_MS
+    },
+  ];
+  const at2m = renderRowLines(row, NOW_MS);
+  const at1h = renderRowLines(row, NOW_MS + 58 * 60_000);
+  const err2m = at2m.find((l) => l.trimStart().startsWith("error "));
+  const err1h = at1h.find((l) => l.trimStart().startsWith("error "));
+  expect(err2m).toMatch(/ 2m ago$/);
+  expect(err1h).toMatch(/ 1h ago$/);
+});
+
+test("error line omitted when error_type is NULL (no stale error to show)", () => {
+  // A row without a stale error renders no `error` body line. No literal
+  // `error` leaks; no `error` joins the label pool either.
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        status: "active",
+        subscription_active: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+        error_type: null,
+        error_message: null,
+        error_at: null,
+      },
+    ],
+    NOW_MS,
+  );
+  // header + session + week = 3 lines; no error.
+  expect(lines).toHaveLength(3);
+  expect(lines.find((l) => l.trimStart().startsWith("error "))).toBeUndefined();
+});
+
+test("long error_message truncates with an ellipsis within the bar+pct cell width", () => {
+  // The error body content fits in the same column the bar+pct cell occupies
+  // so the trailing relative-time stamp lands in the same column as the
+  // quota resets. Oversize content truncates with an ellipsis.
+  const longMsg = "x".repeat(200);
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        status: "stale",
+        subscription_active: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+        error_type: "X",
+        error_message: longMsg,
+        error_at: isoOffset(-1),
+      },
+    ],
+    NOW_MS,
+  );
+  const errLine = lines.find((l) => l.trimStart().startsWith("error "));
+  expect(errLine).toBeDefined();
+  expect(errLine).toContain("…");
+  // Full 200-char message is not present verbatim.
+  expect(errLine).not.toContain(longMsg);
+  // The line still ends in the rel-time stamp.
+  expect(errLine).toMatch(/ 1m ago$/);
+});
+
+test("error_at column aligns under the quota reset column (same cell width)", () => {
+  // The error body content is padded to bar+pct cell width so the relative
+  // time stamp lands in the SAME column as the reset stamps on the
+  // session/week lines. This is the alignment contract that mirrors
+  // renderRateLimit's column landing.
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        status: "stale",
+        subscription_active: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+        error_type: "T",
+        error_message: "m",
+        error_at: isoOffset(-1),
+      },
+    ],
+    NOW_MS,
+  );
+  const session = lines.find((l) => l.trimStart().startsWith("session "));
+  const err = lines.find((l) => l.trimStart().startsWith("error "));
+  expect(session).toBeDefined();
+  expect(err).toBeDefined();
+  // The session reset (1h) and error stamp (1m ago) end the lines; find
+  // their starting column by stripping the trailing stamp. The cell-width
+  // padding guarantees both rel-times start at the same offset.
+  const sessIdx = (session as string).search(/ 1h$/);
+  const errIdx = (err as string).search(/ 1m ago$/);
+  expect(sessIdx).toBeGreaterThan(0);
+  expect(errIdx).toBe(sessIdx);
+});
+
+test("label padding ignores 'error' when no row renders a stale error", () => {
+  // Mirror of the rate-limited label-pool rule: `error` (5 chars) must only
+  // join the label-width pool when a row will render it; otherwise the
+  // quota labels stay at width 7 (`session`).
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        status: "active",
+        subscription_active: 1,
+        session_percent: 5,
+        session_resets_at: isoOffset(5),
+        week_percent: 5,
+        week_resets_at: isoOffset(5),
+      },
+    ],
+    NOW_MS,
+  );
+  expect(bodyLine(lines, "week")).toContain(
+    "week    [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 5%",
+  );
+});

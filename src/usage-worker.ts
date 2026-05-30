@@ -119,6 +119,46 @@ export interface UsageSnapshotMessage {
   sonnet_week_percent: number | null;
   /** Sonnet-specific weekly reset instant — ISO-8601 string when present, else null. */
   sonnet_week_resets_at: string | null;
+  /**
+   * Envelope freshness/liveness axis (fn-645): `"active" | "idle" | "stale"`.
+   * Stamped at write time by agentuse, never derived. Null when the envelope
+   * omits the field (forward-compat / pre-fn-3 envelopes).
+   */
+  status: string | null;
+  /**
+   * Plan axis (fn-645): `true` = subscribed, `false` = confirmed no
+   * subscription, `null` = unknown (codex; never observed yet). Carried as a
+   * boolean here; the reducer coerces to 1/0/NULL on the SQLite column.
+   */
+  subscription_active: boolean | null;
+  /**
+   * Stale-only error type (fn-645) — the agentuse-side exception class name,
+   * e.g. `"ClaudeUsageParseError"`. Present only when `status == "stale"`;
+   * null otherwise.
+   */
+  error_type: string | null;
+  /**
+   * Stale-only error message (fn-645) — the matching human-readable
+   * description. Present only when `status == "stale"`; null otherwise.
+   */
+  error_message: string | null;
+  /**
+   * Stale-only error timestamp (fn-645) — ISO-8601 with UTC offset, the
+   * stamp of the failed scrape. Present only when `status == "stale"`;
+   * null otherwise.
+   *
+   * **Change-gate exclusion.** `error.at` advances on every failed scrape
+   * (~90s during an outage), so {@link usageGateKey} omits it from the
+   * worker change-gate — the message still carries it (and the projection
+   * still stores it) so the renderer can show "stale since <first
+   * occurrence>", but a re-failed scrape with otherwise-unchanged error
+   * details produces zero synthetic events. Recovery (stale→active) clears
+   * the error_* columns because `status` IS in the gate, which flips and
+   * fires one emit. This is the FIRST field that is projected but excluded
+   * from the gate, distinct from the four freshness fields (which are
+   * neither projected nor gated).
+   */
+  error_at: string | null;
 }
 
 /**
@@ -189,16 +229,30 @@ interface RawUsage {
   target?: unknown;
   multiplier?: unknown;
   usage?: unknown;
+  // fn-645: envelope freshness/plan/error axes — projected.
+  status?: unknown;
+  subscription_active?: unknown;
+  error?: unknown;
   // Freshness fields — present in real agentuse envelopes, read and discarded.
+  // `last_failed_fetch_at` joined this set under fn-645 (the stale `error`
+  // sub-object carries the same info as `error.at`, projected instead).
   fetched_at?: unknown;
   next_fetch_at?: unknown;
   last_successful_fetch_at?: unknown;
   last_skipped_fetch_at?: unknown;
+  last_failed_fetch_at?: unknown;
 }
 
 interface RawUsageWindow {
   percent_used?: unknown;
   resets_at?: unknown;
+}
+
+/** Raw shape of the agentuse envelope's stale `error` sub-object. */
+interface RawUsageError {
+  type?: unknown;
+  message?: unknown;
+  at?: unknown;
 }
 
 /** Coerce a value to a non-empty string, else null. */
@@ -274,6 +328,23 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
       sonnetWeekResetsAt = asString(sw.resets_at);
     }
   }
+  // fn-645: envelope freshness + plan + stale-error axes. `subscription_active`
+  // is a true tri-state (true / false / null) — coerce only proper booleans;
+  // anything else (including missing) folds to null. The `error` sub-object is
+  // present only when `status == "stale"`; the projection columns mirror that.
+  const subRaw = raw.subscription_active;
+  const subscriptionActive: boolean | null =
+    typeof subRaw === "boolean" ? subRaw : null;
+  let errorType: string | null = null;
+  let errorMessage: string | null = null;
+  let errorAt: string | null = null;
+  const errorBlock = raw.error;
+  if (errorBlock != null && typeof errorBlock === "object") {
+    const e = errorBlock as RawUsageError;
+    errorType = asString(e.type);
+    errorMessage = asString(e.message);
+    errorAt = asString(e.at);
+  }
   return {
     kind: "usage-snapshot",
     id,
@@ -285,7 +356,39 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
     week_resets_at: weekResetsAt,
     sonnet_week_percent: sonnetWeekPercent,
     sonnet_week_resets_at: sonnetWeekResetsAt,
+    status: asString(raw.status),
+    subscription_active: subscriptionActive,
+    error_type: errorType,
+    error_message: errorMessage,
+    error_at: errorAt,
   };
+}
+
+/**
+ * Serialize a usage message into the change-gate key — the byte-stable string
+ * the worker compares to suppress re-emits for unchanged content.
+ *
+ * **fn-645: `error_at` exclusion.** Every other field is included in the gate
+ * (and projected onto the wire), but `error_at` is omitted because it
+ * advances on every failed scrape (~90s during an outage); including it
+ * would force a synthetic event every cycle. Net semantics: "stale since the
+ * first occurrence of this error" — the stamp holds while status / error_type
+ * / error_message are unchanged, and re-stamps on a status flip (e.g. a
+ * recovered scrape sets `status=active` + clears the error_* fields, both in
+ * the gate) or on a different error.
+ *
+ * **Slot order is load-bearing** — {@link seedFromDb}'s reconstruction must
+ * route through the SAME helper so a daemon restart's seed key matches the
+ * live emit's key byte-for-byte. The other change-gate consumer (the
+ * `onChange` path in {@link UsageScanner}) likewise routes through this
+ * helper.
+ *
+ * Pure. Exported for unit reach (the freshness-exclusion tripwire test in
+ * `test/usage-worker.test.ts`).
+ */
+export function usageGateKey(msg: UsageSnapshotMessage): string {
+  const { error_at: _errorAt, ...gated } = msg;
+  return JSON.stringify(gated);
 }
 
 /**
@@ -415,11 +518,15 @@ export class UsageScanner {
     }
 
     this.pathToId.set(path, msg.id);
-    const serialized = JSON.stringify(msg);
-    if (this.lastEmitted.get(msg.id) === serialized) {
+    // fn-645: the gate key omits `error_at` so a re-failed scrape with the
+    // same error type/message doesn't fire a synthetic event every ~90s.
+    // `onSnapshot` still posts the FULL message (carrying `error_at`) so the
+    // projection can show "stale since <first occurrence>".
+    const gateKey = usageGateKey(msg);
+    if (this.lastEmitted.get(msg.id) === gateKey) {
       return; // change-gate: unchanged snapshot, suppress.
     }
-    this.lastEmitted.set(msg.id, serialized);
+    this.lastEmitted.set(msg.id, gateKey);
     this.onSnapshot(msg);
   }
 
@@ -518,7 +625,8 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
     .query(
       `SELECT id, target, multiplier, session_percent, session_resets_at,
               week_percent, week_resets_at, sonnet_week_percent,
-              sonnet_week_resets_at
+              sonnet_week_resets_at, status, subscription_active,
+              error_type, error_message, error_at
          FROM usage`,
     )
     .all() as {
@@ -531,8 +639,18 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
     week_resets_at: string | null;
     sonnet_week_percent: number | null;
     sonnet_week_resets_at: string | null;
+    status: string | null;
+    subscription_active: number | null;
+    error_type: string | null;
+    error_message: string | null;
+    error_at: string | null;
   }[];
   for (const r of rows) {
+    // SQLite stores `subscription_active` as 1/0/NULL — reconstruct the
+    // boolean shape `buildUsageMessage` emits so the gate key matches
+    // byte-for-byte.
+    const sub: boolean | null =
+      r.subscription_active === null ? null : r.subscription_active !== 0;
     const msg: UsageSnapshotMessage = {
       kind: "usage-snapshot",
       id: r.id,
@@ -544,8 +662,13 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
       week_resets_at: r.week_resets_at,
       sonnet_week_percent: r.sonnet_week_percent,
       sonnet_week_resets_at: r.sonnet_week_resets_at,
+      status: r.status,
+      subscription_active: sub,
+      error_type: r.error_type,
+      error_message: r.error_message,
+      error_at: r.error_at,
     };
-    scanner.seed(r.id, JSON.stringify(msg));
+    scanner.seed(r.id, usageGateKey(msg));
   }
 }
 

@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 37;
+export const SCHEMA_VERSION = 38;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -644,6 +644,27 @@ CREATE TABLE IF NOT EXISTS git_status (
  * annotation a prior `RateLimited` fan-out wrote (mirrors the
  * `EpicSnapshot` carve-out for `tasks` / `jobs` / `job_links` /
  * `resolved_epic_deps`).
+ *
+ * **Schema v38 (fn-645): envelope status + subscription + error axes.** Five
+ * additional nullable columns project the agentuse envelope's freshness /
+ * plan-tier / stale-error axes natively so renderers can hide
+ * no-subscription rows, surface the freshness token, and render a stale
+ * error line:
+ * - `status TEXT` — `"active" | "idle" | "stale"`. NULL on a pre-v38 row
+ *   until the next `UsageSnapshot` repopulates.
+ * - `subscription_active INTEGER` — 1/0/NULL, coerced from the envelope's
+ *   bool|null. The renderer hides rows where this is 0.
+ * - `error_type` / `error_message` / `error_at TEXT` — the stale-only
+ *   error sub-object, flattened. Populated only when `status == "stale"`.
+ *   `error_at` is the ISO-8601 stamp of the failed scrape; the worker
+ *   EXCLUDES it from the change-gate (see `usageGateKey` in
+ *   `src/usage-worker.ts`) so a re-failed scrape with the same error does
+ *   not churn a synthetic event — but the column is still projected so the
+ *   renderer can show "stale since <first occurrence>".
+ *
+ * All five columns participate in `projectUsageRow`'s `ON CONFLICT DO UPDATE
+ * SET` clause (the rate-limit carve-out below is unique to the reverse
+ * fan-out from `profiles`).
  */
 const CREATE_USAGE = `
 CREATE TABLE IF NOT EXISTS usage (
@@ -658,6 +679,11 @@ CREATE TABLE IF NOT EXISTS usage (
     sonnet_week_resets_at TEXT,
     last_rate_limit_at REAL,
     last_rate_limit_session_id TEXT,
+    status TEXT,
+    subscription_active INTEGER,
+    error_type TEXT,
+    error_message TEXT,
+    error_at TEXT,
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0
 )
@@ -3737,13 +3763,44 @@ function migrate(db: Database): void {
     //
     // See `CREATE_DEAD_LETTERS` above for the column docstring.
 
+    // v37→v38: fn-645 — project the agentuse envelope's status /
+    // subscription_active / error axes onto the `usage` row so renderers can
+    // surface freshness, no-subscription gating, and stale-failure context.
+    // Five nullable columns, all matching the `CREATE_USAGE` literal above so
+    // a fresh v38 DB and a migrated v37→v38 DB converge to identical schema
+    // (the addColumnIfMissing/literal lockstep convention):
+    //   - `usage.status TEXT` (nullable) — `"active" | "idle" | "stale"`.
+    //   - `usage.subscription_active INTEGER` (nullable) — 1/0/NULL, the
+    //     plan-tier axis coerced from the envelope's bool|null.
+    //   - `usage.error_type TEXT` (nullable) — present only when status is
+    //     `"stale"`; carries the agentuse-side exception class name.
+    //   - `usage.error_message TEXT` (nullable) — the matching error message.
+    //   - `usage.error_at TEXT` (nullable) — ISO-8601 stamp of the failed
+    //     scrape. Projected but EXCLUDED from the worker change-gate
+    //     (`usageGateKey` in `src/usage-worker.ts`) since `error.at` advances
+    //     on every failed scrape (~90s during an outage) and including it
+    //     would force a synthetic event every cycle — the same discipline as
+    //     the four freshness fields, here applied per-field within an
+    //     otherwise-gated message.
+    //
+    // No data backfill — every column is NULL on pre-v38 rows and
+    // repopulated by the next `UsageSnapshot` fold against the new envelope
+    // (mirrors the v34→v35 `last_rate_limit_at` / `last_rate_limit_session_id`
+    // additions; same forward-only convention).
+    addColumnIfMissing(db, "usage", "status", "TEXT");
+    addColumnIfMissing(db, "usage", "subscription_active", "INTEGER");
+    addColumnIfMissing(db, "usage", "error_type", "TEXT");
+    addColumnIfMissing(db, "usage", "error_message", "TEXT");
+    addColumnIfMissing(db, "usage", "error_at", "TEXT");
+
     // fn-649: COVERING indexes for the hoisted inferred-attribution window
     // self-join (`computeRepoBashWindows`). Created HERE — after every column-
     // adding version slot above — because they reference `tool_use_id` (added in
     // the v16→v17 slot); placing them in the unconditional pre-migration
     // `CREATE_EVENTS_INDEXES` block would fail "no such column" while migrating a
     // pre-v17 DB. Idempotent `CREATE INDEX IF NOT EXISTS`, so no SCHEMA_VERSION
-    // bump is needed (and none claimed — leaves v38 free for fn-645/fn-648).
+    // bump is needed (and none claimed — v38 is taken by fn-645's `usage`
+    // envelope columns above).
     //
     // Without them the window join reads 64k bash-event full ROWS (~400MB of
     // `data` blobs), which evicts even a 256MB cache and leaves a cold fold

@@ -386,9 +386,13 @@ export const GIT_DESCRIPTOR: CollectionDescriptor = {
  *
  * **Freshness fields excluded by design.** The source envelope carries
  * `fetched_at` / `next_fetch_at` / `last_successful_fetch_at` /
- * `last_skipped_fetch_at` — these are read-and-discarded by the worker and
- * absent from the projection schema. See `src/usage-worker.ts` for the
- * change-gate discipline that enforces the exclusion.
+ * `last_skipped_fetch_at` / `last_failed_fetch_at` (fn-645 added the last
+ * one to the set) — these are read-and-discarded by the worker and absent
+ * from the projection schema. See `src/usage-worker.ts` for the change-gate
+ * discipline that enforces the exclusion. Distinct from `error_at` (also
+ * fn-645), which IS projected for "stale since" display but EXCLUDED from
+ * the worker change-gate via `usageGateKey` so a re-failed scrape with the
+ * same error details produces zero synthetic events.
  */
 export const USAGE_DESCRIPTOR: CollectionDescriptor = {
   name: "usage",
@@ -405,6 +409,11 @@ export const USAGE_DESCRIPTOR: CollectionDescriptor = {
     "sonnet_week_resets_at",
     "last_rate_limit_at",
     "last_rate_limit_session_id",
+    "status",
+    "subscription_active",
+    "error_type",
+    "error_message",
+    "error_at",
     "last_event_id",
     "updated_at",
   ],
