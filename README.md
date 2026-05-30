@@ -720,7 +720,16 @@ inside `BEGIN IMMEDIATE`). As of schema v31, the `git` collection is
 rebuilt around per-(session, file) attribution: `events` gains
 `bash_mutation_kind` + `bash_mutation_targets` (hook-side derived columns
 that name the mutation shape and the affected paths on every
-`PostToolUse:Bash` row whose command parses as a filesystem mutation),
+`PostToolUse:Bash` row whose command parses as a filesystem mutation —
+kinds cover `pkg-install` / `pkg-uninstall` / `fs-remove` / `fs-move` /
+`fs-copy` / `fs-mkdir` / `git-tree-mutate` plus `git-rm` (delete
+semantics) and `git-mv` (rename semantics, capturing BOTH source and
+destination); the reducer's attribution pass layers three match modes
+against these tokens — exact, directory-prefix for `git rm -r dir/`,
+and a hand-rolled dependency-free fnmatch (`*`→`[^/]*`, `?`→`[^/]`,
+anchored, no `**`/nested quantifiers, ReDoS-safe) with the `__TREE__`
+sentinel rejected up-front so a no-pathspec event can never glob-match
+a real file),
 `jobs` gains `git_unattributed_to_live_count` (the renamed former
 `git_orphan_count` — dirty files no live session is on the hook for) and
 redefines `git_orphan_count` to the strict mystery sense (dirty files

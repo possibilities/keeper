@@ -212,7 +212,19 @@ the native value" is the default.
   field on the envelope, set by `/plan:queue` and absent elsewhere — and
   the schema-v31 pair `bash_mutation_kind` + `bash_mutation_targets`
   naming the filesystem-mutation shape and the affected paths for the
-  reducer's git-attribution pass) at hook
+  reducer's git-attribution pass — the `kind` taxonomy is
+  `pkg-install` / `pkg-uninstall` / `fs-remove` / `fs-move` / `fs-copy`
+  / `fs-mkdir` / `git-tree-mutate` / `git-rm` / `git-mv`, with `git-rm`
+  carrying delete-semantics pathspecs and `git-mv` carrying BOTH
+  source(s) and destination resolved against cwd; the reducer's
+  `findExplicitAttributions` matches `git-rm`/`git-mv` tokens against
+  snapshot-known deleted/renamed paths in three layered modes (exact,
+  directory-prefix for `git rm -r dir/`, and a hand-rolled
+  dependency-free fnmatch — `*`→`[^/]*`, `?`→`[^/]`, anchored, no
+  `**`/nested quantifiers, ReDoS-safe — with the `__TREE__` sentinel
+  rejected up-front so it can never match a real path; tokenizer
+  also terminates at shell redirect tokens so `rm x > log` /
+  `cp a b 2>&1` no longer pollutes `bash_mutation_targets`) at hook
   write time — all pure functions of the hook payload, shared with the
   schema-migration backfill so a re-derive on stored events reproduces the
   same column values. The reducer's `syncJobIntoEpic` fan-out maintains the
@@ -307,9 +319,18 @@ the native value" is the default.
   NOT a floor/ceiling, so an additive bump keeper-py never reads (e.g. a
   `usage`-only column) still must be listed. The `test/schema-version.test.ts`
   assertion enforces this: it reads `SCHEMA_VERSION` and fails the build unless
-  the frozenset's max covers it. Current version: **v38** (fn-645 — additive
-  nullable `usage` columns for the agentuse envelope's status / subscription /
-  error axes; keeper-py reads neither `usage` nor `profiles`, so the bump is
+  the frozenset's max covers it. Current version: **v39** (fn-648 — the
+  `git-rm` / `git-mv` deriver fix ships with a version-guarded one-time
+  backfill that re-derives `bash_mutation_kind` + `bash_mutation_targets`
+  over every persisted `PostToolUse:Bash` row using the new deriver
+  (capturing previously-missed `git rm`/`git mv` events AND scrubbing
+  redirect-token pollution from existing `fs-*` rows), then rewinds
+  `reducer_state.last_event_id = 0` and clears `jobs` / `epics` so the
+  next boot drain re-folds the healed event log into byte-identical
+  projections — version-guarded so a re-run can't corrupt the
+  already-migrated schema. v38, fn-645: additive nullable `usage`
+  columns for the agentuse envelope's status / subscription / error
+  axes; keeper-py reads neither `usage` nor `profiles`, so the bump is
   whitelist-only with no reader logic change. v37, fn-643: `dead_letters`
   operational sidecar table for hook-INSERT failure recovery — the slot stamps
   the version-bump but adds no data backfill, the table populates exclusively
