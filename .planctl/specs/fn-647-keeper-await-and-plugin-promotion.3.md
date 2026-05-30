@@ -81,5 +81,5 @@ and `test/git-wrapper.test.ts` still pass (imports unchanged). Confirm
 - [ ] Hook invariants preserved (no third-party deps, exit 0, `{migrate:false}`).
 
 ## Done summary
-
+Promoted keeper repo root to a Claude plugin: canonical manifest at .claude-plugin/plugin.json and hook command paths at hooks/hooks.json point at ${CLAUDE_PLUGIN_ROOT}/plugin/hooks/events-writer.ts; inner plugin/.claude-plugin/plugin.json and plugin/hooks/hooks.json retired. README rewrites Install step 4 (launcher --plugin-dir, double-install migration note) and Uninstall (symlink rm removed); 'Example clients' adds keeper await with exit-code table; CLAUDE.md gains a plugin-layout pointer. events-writer + git-wrapper tests pass; AGENTS.md symlink intact.
 ## Evidence
