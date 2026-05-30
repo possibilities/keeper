@@ -285,11 +285,22 @@ the native value" is the default.
   slot in `migrate()`. Idempotent steps may run unguarded; a non-idempotent step
   (data backfill, destructive DROP) MUST be version-guarded so a re-run can't
   corrupt an already-migrated schema. Bump `SCHEMA_VERSION` only when adding an
-  ALTER; never reduce it, never branch. Current version: **v37** (fn-643 —
-  `dead_letters` operational sidecar table for hook-INSERT failure recovery;
-  the slot stamps the version-bump but adds no data backfill — the table
-  populates exclusively from the daemon's import scan against the per-pid
-  NDJSON dead-letter files). The daemon is the SOLE migrator; the
+  ALTER; never reduce it, never branch. **When you bump `SCHEMA_VERSION`, add
+  the new version to keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset in
+  `keeper/api.py` in the SAME change.** The Python reader (used by
+  `jobctl commit-work`) gates loud on any unrecognized version and will fail
+  *every* `commit-work` on the host until updated — it is a hard whitelist,
+  NOT a floor/ceiling, so an additive bump keeper-py never reads (e.g. a
+  `usage`-only column) still must be listed. The `test/schema-version.test.ts`
+  assertion enforces this: it reads `SCHEMA_VERSION` and fails the build unless
+  the frozenset's max covers it. Current version: **v38** (fn-645 — additive
+  nullable `usage` columns for the agentuse envelope's status / subscription /
+  error axes; keeper-py reads neither `usage` nor `profiles`, so the bump is
+  whitelist-only with no reader logic change. v37, fn-643: `dead_letters`
+  operational sidecar table for hook-INSERT failure recovery — the slot stamps
+  the version-bump but adds no data backfill, the table populates exclusively
+  from the daemon's import scan against the per-pid NDJSON dead-letter files).
+  The daemon is the SOLE migrator; the
   hook (`plugin/hooks/events-writer.ts`) opens with `{ migrate: false }` and
   never runs schema convergence. A hook arriving against a missing/stale schema
   fails its INSERT and — as of v37 — writes a per-pid NDJSON dead-letter file
