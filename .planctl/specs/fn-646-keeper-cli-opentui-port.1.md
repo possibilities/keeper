@@ -65,5 +65,5 @@ parsing, not by spawning a renderer.
 - [ ] Dispatch test passes; `bun run typecheck` + `bun run lint` green on `cli`.
 
 ## Done summary
-
+Added @opentui/core dep (hook import graph verified clean), created cli/ tree with keeper.ts dispatcher + four stub subcommand mains forwarding to scripts/, wired keeper bin, widened lint+typecheck to cover cli/, and added 15-case dispatch test.
 ## Evidence
