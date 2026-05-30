@@ -82,5 +82,5 @@ job-rejected and dep-on-epic-dangling; not-found for an absent id; the
 - [ ] `bun test test/await-conditions.test.ts` passes; `biome check` and `tsc --noEmit` clean.
 
 ## Done summary
-
+Added pure src/await-conditions.ts mirroring readiness.ts's no-I/O/no-clock ethos. Exports evaluateAwaitCondition + AwaitState discriminated union + workable() (concurrency carve-out: only single-task-per-epic / single-task-per-root count as workable) + classifyTargetId. Epic-unblocked reads off perTask+perCloseRow (NOT perEpic rollup) — pinned with a demoted-but-workable regression fixture. Stuck covers job-rejected + dep-on-epic-dangling. 40/40 tests pass; biome + tsc clean.
 ## Evidence
