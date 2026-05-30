@@ -10,7 +10,12 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { drainToCompletion, recoverOneDeadLetter } from "../src/daemon";
+import {
+  drainToCompletion,
+  recoverOneDeadLetter,
+  WAL_AUTOCHECKPOINT_PAGES,
+  withBootDrainCheckpointTuning,
+} from "../src/daemon";
 import { openDb } from "../src/db";
 import { drain } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
@@ -102,6 +107,85 @@ test("boot drain is idempotent — a second pass folds nothing", () => {
   ).last_event_id;
 
   expect(secondCursor).toBe(firstCursor);
+  db.close();
+});
+
+test("withBootDrainCheckpointTuning disables autocheckpoint inside the body and restores it after", () => {
+  const { db } = openDb(dbPath);
+
+  // Steady-state default before the wrapper runs.
+  const initial = (
+    db.query("PRAGMA wal_autocheckpoint").get() as { wal_autocheckpoint: number }
+  ).wal_autocheckpoint;
+  expect(initial).toBe(WAL_AUTOCHECKPOINT_PAGES);
+
+  let insideValue = -1;
+  withBootDrainCheckpointTuning(db, () => {
+    insideValue = (
+      db.query("PRAGMA wal_autocheckpoint").get() as {
+        wal_autocheckpoint: number;
+      }
+    ).wal_autocheckpoint;
+  });
+
+  // Auto-checkpoint is OFF during the boot drain so fold commits never absorb a
+  // synchronous checkpoint…
+  expect(insideValue).toBe(0);
+  // …and the steady-state threshold is restored once the drain completes.
+  const after = (
+    db.query("PRAGMA wal_autocheckpoint").get() as { wal_autocheckpoint: number }
+  ).wal_autocheckpoint;
+  expect(after).toBe(WAL_AUTOCHECKPOINT_PAGES);
+
+  db.close();
+});
+
+test("withBootDrainCheckpointTuning restores autocheckpoint even if the body throws", () => {
+  const { db } = openDb(dbPath);
+
+  expect(() =>
+    withBootDrainCheckpointTuning(db, () => {
+      throw new Error("drain blew up");
+    }),
+  ).toThrow("drain blew up");
+
+  // The `finally` must re-arm steady-state checkpointing — leaving the
+  // long-running writer with autocheckpoint=0 would let the WAL grow unbounded.
+  const after = (
+    db.query("PRAGMA wal_autocheckpoint").get() as { wal_autocheckpoint: number }
+  ).wal_autocheckpoint;
+  expect(after).toBe(WAL_AUTOCHECKPOINT_PAGES);
+
+  db.close();
+});
+
+test("withBootDrainCheckpointTuning still folds the boot backlog to completion", () => {
+  const { db } = openDb(dbPath);
+
+  seedEvent(db, "sess-a", "SessionStart", 1);
+  seedEvent(db, "sess-a", "Stop", 2);
+  seedEvent(db, "sess-b", "SessionStart", 3);
+
+  // The real boot shape: drain inside the checkpoint-tuning wrapper.
+  withBootDrainCheckpointTuning(db, () => {
+    drainToCompletion(db);
+  });
+
+  const cursor = (
+    db.query("SELECT last_event_id FROM reducer_state WHERE id = 1").get() as {
+      last_event_id: number;
+    }
+  ).last_event_id;
+  expect(cursor).toBe(3);
+
+  // The trailing TRUNCATE checkpoint reclaimed the WAL — frame count is 0.
+  const checkpoint = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as {
+    busy: number;
+    log: number;
+    checkpointed: number;
+  };
+  expect(checkpoint.log).toBe(0);
+
   db.close();
 });
 

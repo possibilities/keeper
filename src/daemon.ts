@@ -125,6 +125,54 @@ export function drainToCompletion(
 }
 
 /**
+ * SQLite's default WAL auto-checkpoint threshold (pages). `applyPragmas` does
+ * not set it, so the writer connection runs at this default in steady state.
+ * Made explicit so {@link withBootDrainCheckpointTuning} can disable it for the
+ * boot drain and restore the exact steady-state value afterward.
+ */
+export const WAL_AUTOCHECKPOINT_PAGES = 1000;
+
+/**
+ * Run the heavy boot drain with WAL auto-checkpointing DISABLED, then flush and
+ * truncate the WAL once and restore the steady-state threshold.
+ *
+ * Why: a from-scratch re-fold (every schema migration rewinds
+ * `reducer_state.last_event_id` and clears the projections) commits ~150k
+ * one-event transactions back to back. At the default `wal_autocheckpoint=1000`
+ * (~4MB) the WAL crosses that line constantly, and whichever commit trips it
+ * absorbs a synchronous PASSIVE checkpoint — random writes + fsync into the
+ * cold ~950MB main DB, stretching an ~11ms commit to seconds while it holds the
+ * single write lock. Concurrent hook INSERTs then exhaust their 1.2s
+ * `busy_timeout` (twice — `attempts=2`, `wait≈2.4s`) and dead-letter; this is
+ * the dominant `insert:SQLITE_BUSY` drop class the hook-drop diagnostics
+ * surfaced, and it recurs on EVERY restart that does a non-trivial drain, not
+ * just one migration.
+ *
+ * With auto-checkpoint off, every fold COMMIT is a pure WAL append
+ * (`synchronous=NORMAL` ⇒ commits don't fsync; only checkpoints do), so the
+ * write lock is released promptly and hook INSERTs interleave instead of
+ * starving. The WAL grows for the duration; a single `wal_checkpoint(TRUNCATE)`
+ * in the `finally` flushes it back into the main DB and reclaims the file, and
+ * we restore `wal_autocheckpoint` so steady state is unchanged (checkpoints
+ * spread across infrequent events on a warm cache). The `finally` guarantees
+ * we never leave the long-running writer with checkpointing disabled even if a
+ * drain throws. Cheap and harmless when the drain is small (a near-head
+ * restart): the truncate of a small WAL is milliseconds.
+ */
+export function withBootDrainCheckpointTuning(
+  db: Database,
+  body: () => void,
+): void {
+  db.run("PRAGMA wal_autocheckpoint = 0");
+  try {
+    body();
+  } finally {
+    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.run(`PRAGMA wal_autocheckpoint = ${WAL_AUTOCHECKPOINT_PAGES}`);
+  }
+}
+
+/**
  * Hard cap on the per-pid dead-letter NDJSON file size before we read it. The
  * hook writes one record per dropped INSERT and never truncates / rotates, so
  * a single file could in principle grow unbounded under sustained drop storms.
@@ -499,21 +547,26 @@ function runDaemon(): void {
   const planRoots = resolvePlanRoots();
   runPlanctlApprovalMigration(db, planRoots);
 
-  // Step 2 — boot drain. MUST finish before the worker spawns: otherwise the
-  // worker would fire wakes against a writer connection still iterating boot
-  // drain (harmless, drain is idempotent, but wasteful). The pre-sweep drain
-  // also brings the `jobs` projection up to the latest persisted lifecycle
-  // BEFORE `seedKilledSweep` reads it — without this, a SessionEnd that
-  // landed mid-boot would still look like a live row to the sweep.
-  drainToCompletion(db);
-
+  // Step 2 — boot drain + seed sweep, wrapped in boot-drain WAL tuning so the
+  // (potentially from-scratch) re-fold doesn't starve concurrent hook INSERTs
+  // on synchronous WAL checkpoints. See `withBootDrainCheckpointTuning`.
+  //
+  // The drain MUST finish before the worker spawns: otherwise the worker would
+  // fire wakes against a writer connection still iterating boot drain
+  // (harmless, drain is idempotent, but wasteful). The pre-sweep drain also
+  // brings the `jobs` projection up to the latest persisted lifecycle BEFORE
+  // `seedKilledSweep` reads it — without this, a SessionEnd that landed
+  // mid-boot would still look like a live row to the sweep.
+  //
   // Step 2a — seed sweep. Fold dead/recycled jobs to `killed` BEFORE the
   // workers spawn, so the projection is consistent the moment the UDS server
-  // starts serving. See `seedKilledSweep` for the Q7 match rules; the
-  // surrounding drain folds the synthetic Killed events the sweep just
-  // emitted.
-  seedKilledSweep(db);
-  drainToCompletion(db);
+  // starts serving. See `seedKilledSweep` for the Q7 match rules; the trailing
+  // drain folds the synthetic Killed events the sweep just emitted.
+  withBootDrainCheckpointTuning(db, () => {
+    drainToCompletion(db);
+    seedKilledSweep(db);
+    drainToCompletion(db);
+  });
 
   // Step 2b — dead-letter boot import (fn-643 task .3). Read every NDJSON
   // file the hook wrote during downtime / since the last daemon run and
