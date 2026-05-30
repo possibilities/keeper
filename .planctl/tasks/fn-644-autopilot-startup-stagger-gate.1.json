@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Autopilot startup-stagger gate",
-  "updated_at": "2026-05-29T15:11:52.344136Z"
+  "updated_at": "2026-05-30T00:15:29.333725Z",
+  "worker_done_at": "2026-05-30T00:15:29.333725Z"
 }

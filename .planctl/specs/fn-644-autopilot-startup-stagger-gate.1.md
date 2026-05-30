@@ -88,5 +88,5 @@ steady-state concurrency cap.
   re-validation drops a now-mutex-blocked pending, timeout fail-open.
 
 ## Done summary
-
+Hardcoded one-at-a-time startup gate added to autopilot dispatch loop. settling/pendingLaunches maps stash launches when the slot is held; releaseSettledKeys frees on running-tag verdict or completedKeys membership; sweepSettleTimeouts fail-opens after SETTLE_TIMEOUT_SEC=180s; drainPendingLaunches re-validates pending entries against the current snap (closing the duplicate-race against per-root mutex). Gate is wet-only; dry-run bypasses. Routed via tryLaunch in processLaunchTransitions. 14 new tests in test/autopilot.test.ts cover all five acceptance bullets.
 ## Evidence
