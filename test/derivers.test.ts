@@ -912,6 +912,133 @@ test("extractBashMutation: git status (non-mutator) → null", () => {
   expect(bashMutation("git")).toBeNull(); // no subcommand
 });
 
+// --- git rm / git mv ---
+
+test("extractBashMutation: git rm a b c → pathspec targets (no `--` needed)", () => {
+  const m = bashMutation("git rm a b c");
+  expect(m?.kind).toBe("git-rm");
+  expect(m?.targets).toEqual(["/repo/a", "/repo/b", "/repo/c"]);
+});
+
+test("extractBashMutation: git rm -r dir/ → flag skipped, dir captured", () => {
+  const m = bashMutation("git rm -r dir/");
+  expect(m?.kind).toBe("git-rm");
+  expect(m?.targets).toEqual(["/repo/dir/"]);
+});
+
+test("extractBashMutation: git rm --cached f → long-form flag skipped", () => {
+  const m = bashMutation("git rm --cached f");
+  expect(m?.kind).toBe("git-rm");
+  expect(m?.targets).toEqual(["/repo/f"]);
+});
+
+test("extractBashMutation: git rm '*.ts' → quoted glob token preserved verbatim", () => {
+  const m = bashMutation("git rm '*.ts'");
+  expect(m?.kind).toBe("git-rm");
+  expect(m?.targets).toEqual(["/repo/*.ts"]);
+});
+
+test("extractBashMutation: git rm --pathspec-from-file=list → bail to TREE sentinel", () => {
+  const m = bashMutation("git rm --pathspec-from-file=list");
+  expect(m?.kind).toBe("git-rm");
+  expect(m?.targets).toEqual(["__TREE__"]);
+});
+
+test("extractBashMutation: git rm -- -weird → `--` terminator lets dash-leading path through", () => {
+  const m = bashMutation("git rm -- -weird");
+  expect(m?.kind).toBe("git-rm");
+  expect(m?.targets).toEqual(["/repo/-weird"]);
+});
+
+test("extractBashMutation: git rm with `:`-magic pathspec → bail to TREE sentinel", () => {
+  const m = bashMutation("git rm ':(exclude)*.lock'");
+  expect(m?.kind).toBe("git-rm");
+  expect(m?.targets).toEqual(["__TREE__"]);
+});
+
+test("extractBashMutation: git rm with no targets → null", () => {
+  // All-flags, no positionals.
+  expect(bashMutation("git rm -r")).toBeNull();
+  expect(bashMutation("git rm")).toBeNull();
+});
+
+test("extractBashMutation: git mv src dst → both positionals captured", () => {
+  const m = bashMutation("git mv src dst");
+  expect(m?.kind).toBe("git-mv");
+  expect(m?.targets).toEqual(["/repo/src", "/repo/dst"]);
+});
+
+test("extractBashMutation: git mv a b destdir/ → multi-source + dest captured", () => {
+  const m = bashMutation("git mv a b destdir/");
+  expect(m?.kind).toBe("git-mv");
+  expect(m?.targets).toEqual(["/repo/a", "/repo/b", "/repo/destdir/"]);
+});
+
+test("extractBashMutation: git mv with `-k` flag → flag skipped, paths captured", () => {
+  const m = bashMutation("git mv -k a b");
+  expect(m?.kind).toBe("git-mv");
+  expect(m?.targets).toEqual(["/repo/a", "/repo/b"]);
+});
+
+test("extractBashMutation: git mv with no targets → null", () => {
+  expect(bashMutation("git mv")).toBeNull();
+});
+
+// --- Redirect-token termination (fs-commands + git rm/mv) ---
+
+test("extractBashMutation: rm x 2>&1 → redirect dropped, only real path remains", () => {
+  const m = bashMutation("rm x 2>&1");
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["/repo/x"]);
+});
+
+test("extractBashMutation: rm x > log → bare redirect + operand both dropped", () => {
+  const m = bashMutation("rm x > log");
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["/repo/x"]);
+});
+
+test("extractBashMutation: rm x 2> err → 2>+operand both dropped", () => {
+  const m = bashMutation("rm x 2> err");
+  expect(m?.kind).toBe("fs-remove");
+  expect(m?.targets).toEqual(["/repo/x"]);
+});
+
+test("extractBashMutation: cp a b 2>&1 → redirect dropped", () => {
+  const m = bashMutation("cp a b 2>&1");
+  expect(m?.kind).toBe("fs-copy");
+  expect(m?.targets).toEqual(["/repo/a", "/repo/b"]);
+});
+
+test("extractBashMutation: mv a b &> /tmp/log → &>+operand dropped", () => {
+  const m = bashMutation("mv a b &> /tmp/log");
+  expect(m?.kind).toBe("fs-move");
+  expect(m?.targets).toEqual(["/repo/a", "/repo/b"]);
+});
+
+test("extractBashMutation: git rm x > log → redirect dropped on git arm", () => {
+  const m = bashMutation("git rm x > log");
+  expect(m?.kind).toBe("git-rm");
+  expect(m?.targets).toEqual(["/repo/x"]);
+});
+
+test("extractBashMutation: git rm x 2>&1 → self-contained dup-fd dropped", () => {
+  const m = bashMutation("git rm x 2>&1");
+  expect(m?.kind).toBe("git-rm");
+  expect(m?.targets).toEqual(["/repo/x"]);
+});
+
+test("extractBashMutation: git mv a b 2> err → redirect dropped on git-mv", () => {
+  const m = bashMutation("git mv a b 2> err");
+  expect(m?.kind).toBe("git-mv");
+  expect(m?.targets).toEqual(["/repo/a", "/repo/b"]);
+});
+
+test("extractBashMutation: rm with only redirect (no real targets) → null", () => {
+  // `rm > log` — after dropping `> log` nothing remains.
+  expect(bashMutation("rm > log")).toBeNull();
+});
+
 // --- Negative & malformed ---
 
 test("extractBashMutation: cat file (read-only) → null", () => {

@@ -622,6 +622,24 @@ const TREE_SENTINEL = "__TREE__";
  * for package-manager kinds, or the `__TREE__` sentinel for git
  * tree-mutators with no pathspec.
  *
+ * Kind taxonomy:
+ * - `pkg-install` / `pkg-uninstall` — package-manager mutation; targets
+ *   are the manifest + lockfile paths.
+ * - `fs-remove` / `fs-move` / `fs-copy` / `fs-mkdir` — explicit
+ *   `rm`/`mv`/`cp`/`mkdir` command; targets are every non-flag positional,
+ *   resolved against `cwd`.
+ * - `git-tree-mutate` — `git checkout|restore|stash|reset`; targets are
+ *   the `__TREE__` sentinel (no pathspec) or every post-`--` pathspec.
+ * - `git-rm` — `git rm` with one or more pathspec targets (delete
+ *   semantics; reducer matches against snapshot-known deleted paths).
+ * - `git-mv` — `git mv` with one or more pathspec targets (rename
+ *   semantics; ALL positionals captured, both source(s) and destination,
+ *   resolved against `cwd`). The reducer matches both deletes and adds.
+ *
+ * For `git-rm` / `git-mv`, the `__TREE__` sentinel is also used when
+ * `--pathspec-from-file=` is present (we won't read the file) or any
+ * pathspec carries `:`-magic (`:(top)foo`, `:!foo`, etc.).
+ *
  * A null return from {@link extractBashMutation} signals "not a mutation
  * we recognize" — the column stays NULL on disk and the partial index
  * (`WHERE bash_mutation_kind IS NOT NULL`) stays selective.
@@ -634,7 +652,9 @@ export interface BashMutation {
     | "fs-move"
     | "fs-copy"
     | "fs-mkdir"
-    | "git-tree-mutate";
+    | "git-tree-mutate"
+    | "git-rm"
+    | "git-mv";
   targets: string[];
 }
 
@@ -789,6 +809,111 @@ function firstPositional(tokens: string[], startIdx: number): number {
 }
 
 /**
+ * Recognize a POSIX shell I/O redirect operator token (`>`, `>>`, `<`,
+ * `<<`, `2>`, `2>>`, `&>`, `2>&1`, `N>&M`, `N>` etc.). The tokenizer only
+ * splits on `;|&` so redirect tokens currently leak through as ordinary
+ * argv tokens; the target-collection paths (fs-commands + git rm/mv) use
+ * this predicate to drop them — and their operand, when the operator is
+ * not self-contained (`2>&1` carries its target inline; `> log` does
+ * not). The redirect form `&>file` is also self-contained.
+ *
+ * Self-contained forms (operator consumes its operand inside the same
+ * token) return `{redirect: true, consumesNext: false}`; bare forms (the
+ * next token is the file target) return `consumesNext: true`.
+ *
+ * Pure regex match — never throws. Patterns:
+ *   `^\d*>>?$` / `^<<?$` — bare `>`, `>>`, `<`, `<<`, `2>`, `2>>` (operand
+ *     is the next token).
+ *   `^\d*>&\d*$` — `2>&1`, `>&2`, `1>&2` (self-contained).
+ *   `^&>>?$` — `&>`, `&>>` (operand is the next token, both streams).
+ */
+function isRedirectToken(t: string): { match: boolean; consumesNext: boolean } {
+  // Self-contained: dup-fd (e.g. `2>&1`, `>&2`).
+  if (/^\d*>&\d*$/.test(t)) {
+    return { match: true, consumesNext: false };
+  }
+  // Bare redirect needing operand: `>`, `>>`, `<`, `<<`, `2>`, `2>>`,
+  // `&>`, `&>>`.
+  if (/^\d*>>?$/.test(t) || /^<<?$/.test(t) || /^&>>?$/.test(t)) {
+    return { match: true, consumesNext: true };
+  }
+  return { match: false, consumesNext: false };
+}
+
+/**
+ * Subset of `git rm` / `git mv` long-form options that take a glued
+ * `--name=value` argument we must NOT mis-classify as a path. We only
+ * key on the exact pathspec-magic case (`--pathspec-from-file=`) since
+ * its presence forces the deriver to bail to `__TREE__` (we won't read
+ * the file). Other `--name=value` flags (e.g. hypothetical) are still
+ * filtered by the leading-`-` flag-skip in {@link firstPositional}.
+ */
+const GIT_PATHSPEC_FROM_FILE = "--pathspec-from-file=";
+
+/**
+ * Detect pathspec magic prefixes (`:(top)foo`, `:!foo`, `:(exclude)foo`,
+ * `::foo`). Any token starting with bare `:` triggers a bail — we don't
+ * try to interpret the magic, the reducer's inferred pass handles it.
+ * Tokens starting with `./` or `/` are normal paths; only literal `:`
+ * at index 0 matches.
+ */
+function isPathspecMagic(t: string): boolean {
+  return t.length > 0 && t.startsWith(":");
+}
+
+/**
+ * Walk argv tail from `startIdx`, collecting positional pathspec tokens
+ * while honoring:
+ *   - leading flag tokens (`-x`, `--foo`) → skipped (all git rm/mv flags
+ *     are boolean; `--pathspec-from-file=…` triggers the caller's bail).
+ *   - explicit `--` terminator → switches to positional-only mode.
+ *   - shell redirect tokens (`2>&1`, `> log`, `2> file`, `&>`, …) →
+ *     skipped along with their operand when bare; mirrors the
+ *     fs-commands fix.
+ *
+ * Returns `{targets, bail}` — `bail = true` when a pathspec-from-file or
+ * `:`-magic token is seen, signaling the caller to fall back to the
+ * `__TREE__` sentinel.
+ */
+function collectPathspecs(
+  tokens: string[],
+  startIdx: number,
+  cwd: string | null,
+): { targets: string[]; bail: boolean } {
+  const targets: string[] = [];
+  let sawSeparator = false;
+  for (let j = startIdx; j < tokens.length; j++) {
+    const t = tokens[j] as string;
+    if (t === "--") {
+      sawSeparator = true;
+      continue;
+    }
+    // Skip leading flag tokens (but not after `--`).
+    if (!sawSeparator && t.startsWith("-") && t.length > 1) {
+      if (t.startsWith(GIT_PATHSPEC_FROM_FILE)) {
+        return { targets: [], bail: true };
+      }
+      continue;
+    }
+    const r = isRedirectToken(t);
+    if (r.match) {
+      if (r.consumesNext) {
+        j++;
+      }
+      continue;
+    }
+    if (t.length === 0) {
+      continue;
+    }
+    if (isPathspecMagic(t)) {
+      return { targets: [], bail: true };
+    }
+    targets.push(resolveAgainstCwd(t, cwd));
+  }
+  return { targets, bail: false };
+}
+
+/**
  * Extract the mutation kind + lexical target list from a `PostToolUse:Bash`
  * event's `data.tool_input.command` string. Returns `null` on every
  * non-matching hook event / tool name / data shape, every unrecognized
@@ -888,13 +1013,23 @@ export function extractBashMutation(
     return null;
   }
   // Explicit fs dispatch — argv[0] is the verb; every non-flag argv tail
-  // token is a target path.
+  // token is a target path. Redirect tokens (`2>&1`, `> log`, `&>file`,
+  // `N>&M`) are dropped here too — `tokenizeShell` only splits on
+  // `;|&`, so without this filter `rm x > log` would stamp `>` and `log`
+  // as bogus targets.
   const fsKind = FS_COMMANDS[head];
   if (fsKind !== undefined) {
     const firstArg = firstPositional(tokens, i + 1);
     const targets: string[] = [];
     for (let j = firstArg; j < tokens.length; j++) {
       const t = tokens[j] as string;
+      const r = isRedirectToken(t);
+      if (r.match) {
+        if (r.consumesNext) {
+          j++;
+        }
+        continue;
+      }
       if (t.length === 0) {
         continue;
       }
@@ -904,6 +1039,25 @@ export function extractBashMutation(
       return null;
     }
     return { kind: fsKind, targets };
+  }
+  // Git rm / mv dispatch — handled separately from the tree-mutator
+  // set. Their operands are pathspecs even without a `--` terminator
+  // (git's argv grammar; flags are all boolean). Empty pathspec set
+  // after stripping → return null (mirror the FS_COMMANDS guard above);
+  // `--pathspec-from-file=` or `:`-magic → bail to `__TREE__`.
+  if (head === "git") {
+    const sub = tokens[i + 1];
+    if (sub === "rm" || sub === "mv") {
+      const kind = sub === "rm" ? "git-rm" : "git-mv";
+      const collected = collectPathspecs(tokens, i + 2, cwd);
+      if (collected.bail) {
+        return { kind, targets: [TREE_SENTINEL] };
+      }
+      if (collected.targets.length === 0) {
+        return null;
+      }
+      return { kind, targets: collected.targets };
+    }
   }
   // Git tree-mutator dispatch — `git <subcommand> [args...]` where
   // subcommand is a tree-mutator. No pathspec → `__TREE__` sentinel.
