@@ -1676,12 +1676,13 @@ test("applySingleTaskPerRootMutex: standalone invocation mutates verdict maps in
 });
 
 test("applySingleTaskPerRootMutex: live-work blocked row claims the root", () => {
-  // Cross-epic pass-1 semantics: a verdict from the `isLiveWorkOccupant`
-  // whitelist — one of `job-running`, `sub-agent-running`, `planner-running`,
+  // Cross-epic pass-1 semantics: a verdict from the `isRootOccupant`
+  // whitelist — one of `job-running`, `sub-agent-running`, `sub-agent-stale`,
   // `job-pending` — in epic A occupies root /r so a later ready row in
-  // epic B gets demoted. Dependency / admin / repo-state / mutex-
-  // synthesized blocks do NOT claim in pass-1 (see the negative-control
-  // test below for `dep-on-task`).
+  // epic B gets demoted. Planners are root-exempt (fn-663) — see the
+  // dedicated planner-exemption tests below. Dependency / admin /
+  // repo-state / mutex-synthesized blocks also do NOT claim in pass-1
+  // (see the negative-control test below for `dep-on-task`).
   const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
   const e1 = makeEpic({
     epic_id: "fn-1-foo",
@@ -1962,13 +1963,15 @@ test("applySingleTaskPerRootMutex (fn-655) negative control: close row running f
   );
 });
 
-test("applySingleTaskPerRootMutex (fn-655) negative control: planner-running close row STILL claims project_dir", () => {
-  // Predicate 3 planner-running path. `epic.job_links` carries a working
+test("applySingleTaskPerRootMutex (fn-663): planner-running close row does NOT claim project_dir", () => {
+  // Planner exemption (fn-663). `epic.job_links` carries a working
   // creator/refiner link — `JobLinkEntry.kind` is `creator | refiner` so
-  // planners are epic-scoped by construction. Gate's `anyJobLinkRunning`
-  // disjunct fires, close row claims /keeper, sibling task on /keeper is
-  // demoted. Proves the gate retains predicate 3 — the #1 trap if a
-  // future cleanup omits it.
+  // planners are epic-scoped by construction. The close row's verdict is
+  // `running:planner-running`; `isRootOccupant` returns false for that
+  // kind, so the outer pass-1 guard skips the close row entirely. A
+  // sibling epic's ready task on /keeper stays ready and is dispatchable
+  // concurrently with the planner. The planner still blocks its OWN epic
+  // (predicate 3 + per-EPIC mutex remain unchanged).
   const e1 = makeEpic({
     epic_id: "fn-1-foo",
     project_dir: "/keeper",
@@ -1993,9 +1996,47 @@ test("applySingleTaskPerRootMutex (fn-655) negative control: planner-running clo
     ["fn-1-foo", running({ kind: "planner-running" })],
   ]);
   applySingleTaskPerRootMutex([e1, e2], perTask, perCloseRow);
-  expect(perTask.get("fn-2-bar.1")).toEqual(
-    blocked({ kind: "single-task-per-root" }),
+  expect(perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+});
+
+test("applySingleTaskPerRootMutex (fn-663): planner-running task verdict does NOT claim the root", () => {
+  // Per-task analog of the close-row exemption. A `running:planner-running`
+  // verdict on a TASK in epic A does NOT occupy root /keeper, so a ready
+  // sibling task in epic B on the same root stays ready. (In practice
+  // task-level verdicts read `planner-running` via predicate 3 when the
+  // task's parent epic has a working `job_links` planner.) Regression
+  // guard: if a future refactor swaps `isRootOccupant` back to
+  // `isLiveWorkOccupant` at the per-task pass-1 check, this test fires.
+  const e1t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    target_repo: "/keeper",
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/keeper",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/keeper",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/keeper",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", running({ kind: "planner-running" })],
+    ["fn-2-bar.1", { tag: "ready" }],
+  ]);
+  applySingleTaskPerRootMutex([e1, e2], perTask, new Map());
+  expect(perTask.get("fn-1-foo.1")).toEqual(
+    running({ kind: "planner-running" }),
   );
+  expect(perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
 });
 
 test("applySingleTaskPerRootMutex (fn-655) negative control: same-root task worker keeps root locked via the task's OWN claim", () => {

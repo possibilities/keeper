@@ -69,7 +69,20 @@
  *   9. dep-on-epic                 — any depends_on_epics upstream's close NOT completed
  *  10. dep-on-task-synthetic-close — for the synthetic close row: any non-completed task
  *  11. single-task-per-epic        — post-pass: one non-completed slot per epic
+ *                                    Occupancy keys on `isLiveWorkOccupant`, which
+ *                                    INCLUDES `planner-running` — a planner blocks its
+ *                                    OWN epic from dispatching sibling tasks.
  *  12. single-task-per-root        — post-pass: one non-completed slot per project root
+ *                                    Occupancy keys on `isRootOccupant`, which EXCLUDES
+ *                                    `planner-running` (fn-663) — a planner does NOT
+ *                                    claim the root, so a sibling epic's ready task on
+ *                                    the same root may dispatch concurrently with a
+ *                                    planner. Real workers (job-running,
+ *                                    sub-agent-running, sub-agent-stale, job-pending)
+ *                                    still claim. Per-epic and per-root therefore
+ *                                    diverge on `planner-running`: blocking inside the
+ *                                    planner's own epic, exempt across the rest of
+ *                                    the root.
  *
  * The two post-passes (11, 12) run in that order — per-epic FIRST so its
  * tighter scope wins the reason when both would apply. Both share one
@@ -892,12 +905,41 @@ function evaluateCloseRow(
  * `git-orphans`), mutex-synthesized blocks (`single-task-per-epic`,
  * `single-task-per-root`), and `unknown` — none of those represent a live
  * worker that would conflict with a freshly-dispatched sibling.
+ *
+ * Per-EPIC mutex (`applySingleTaskPerEpicMutex`) keys on this predicate as-is
+ * — a `planner-running` verdict still occupies the epic slot so the epic
+ * cannot dispatch a sibling task while its own planner is in-flight. The
+ * per-ROOT mutex narrows this set further via `isRootOccupant` to exempt
+ * planners from claiming the root (fn-663).
  */
 function isLiveWorkOccupant(verdict: Verdict): boolean {
   return (
     verdict.tag === "running" ||
     (verdict.tag === "blocked" && verdict.reason.kind === "job-pending")
   );
+}
+
+/**
+ * Per-root occupancy predicate (fn-663). Narrower than `isLiveWorkOccupant`:
+ * a `running` + `planner-running` verdict does NOT occupy the root, because a
+ * planner has no dispatched worker holding the working tree — letting a
+ * sibling epic's ready task dispatch concurrently in the same root is safe
+ * (git `index.lock` contention is absorbed by the git worker's
+ * `busy_timeout`, and dirty-file multi-attribution mid-flight is resolved
+ * after-the-fact by the mtime attribution pass). Real workers
+ * (`job-running`, `sub-agent-running`, `sub-agent-stale`, `job-pending`)
+ * still occupy via the `isLiveWorkOccupant` delegate.
+ *
+ * The per-EPIC mutex deliberately stays on `isLiveWorkOccupant` — a planner
+ * still blocks its OWN epic from dispatching sibling tasks (predicate 3
+ * still fires at the per-task verdict layer, so the planner's own tasks
+ * never read `ready` until the planner finishes).
+ */
+function isRootOccupant(verdict: Verdict): boolean {
+  if (verdict.tag === "running" && verdict.reason.kind === "planner-running") {
+    return false;
+  }
+  return isLiveWorkOccupant(verdict);
 }
 
 export function applySingleTaskPerEpicMutex(
@@ -949,32 +991,41 @@ export function applySingleTaskPerEpicMutex(
  * through to the next fallback — mirroring `scripts/autopilot.ts:206-210`
  * exactly).
  *
- * Pass 1 — live-work claim: scan every task and close row; any verdict
- * satisfying `isLiveWorkOccupant` (one of `job-running`, `sub-agent-running`,
- * `planner-running`, `job-pending`) claims its effective root regardless of
+ * Pass 1 — root-occupant claim: scan every task and close row; any verdict
+ * satisfying `isRootOccupant` (one of `job-running`, `sub-agent-running`,
+ * `sub-agent-stale`, `job-pending`) claims its effective root regardless of
  * iteration order relative to ready siblings in other epics on the same
- * root. Dependency / admin / repo-state / mutex-synthesized blocks and
- * `unknown` do NOT claim in pass-1 — they don't represent a live worker
- * that would conflict with a freshly-dispatched sibling.
+ * root. Planners are root-exempt (fn-663): a `planner-running` verdict does
+ * NOT claim the root, so a sibling epic's ready task on the same root may
+ * dispatch concurrently with a planner. Per-EPIC mutex still holds — a
+ * planner's own epic cannot dispatch sibling tasks while the planner is
+ * in-flight (predicate 3 keeps its tasks at `running:planner-running`).
+ * Dependency / admin / repo-state / mutex-synthesized blocks and `unknown`
+ * also do NOT claim in pass-1 — they don't represent a live worker that
+ * would conflict with a freshly-dispatched sibling.
  *
- * Close-row scoped attribution (fn-655): a running close-row's verdict can
- * be INHERITED from a task-level worker in a different `target_repo` —
- * `evaluateCloseRow` predicates 5/6 pool `epic.jobs` AND every `task.jobs`.
- * If the close row's running-ness comes purely from a task-level source,
- * the contributing task already claims its OWN correct root in this same
- * pass-1 loop, so an additional unconditional `epic.project_dir` claim on
- * the close row is redundant when same-root AND harmful when cross-root
- * (a phantom lock that starves unrelated epics on `project_dir`). The
- * close-row claim is therefore gated on whether at least one EPIC-LEVEL
- * source is live: `anyJobLinkRunning(epic)` (predicate 3 planner-running —
- * `JobLinkEntry.kind` is `creator | refiner`, epic-scoped by construction),
+ * Close-row scoped attribution (fn-655, narrowed by fn-663): a running
+ * close-row's verdict can be INHERITED from a task-level worker in a
+ * different `target_repo` — `evaluateCloseRow` predicates 5/6 pool
+ * `epic.jobs` AND every `task.jobs`. If the close row's running-ness comes
+ * purely from a task-level source, the contributing task already claims its
+ * OWN correct root in this same pass-1 loop, so an additional unconditional
+ * `epic.project_dir` claim on the close row is redundant when same-root AND
+ * harmful when cross-root (a phantom lock that starves unrelated epics on
+ * `project_dir`). The close-row claim is therefore gated on whether at
+ * least one EPIC-LEVEL non-planner source is live:
  * `anyEmbeddedJobWorking(epic.jobs)` (predicate 5 epic-level close-verb
- * job), or `anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId)`
+ * job) or `anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId)`
  * (predicate 6 epic-level sub-agent — staleness ignored: a
  * `sub-agent-stale` close row still legitimately occupies `project_dir`).
- * When all three are false the close row's running-ness is purely
- * task-derived and the per-task pass-1 claim above already locks the
- * correct root via `effectiveRoot(task.target_repo, project_dir)`.
+ * `anyJobLinkRunning(epic)` (predicate 3 planner-running — `JobLinkEntry.kind`
+ * is `creator | refiner`, epic-scoped by construction) is intentionally NOT
+ * a disjunct here: the outer `isRootOccupant(closeVerdict)` guard already
+ * filters out a purely planner-derived close row, so a `planner-running`
+ * close row never reaches this gate. When both disjuncts are false the
+ * close row's running-ness is purely task-derived and the per-task pass-1
+ * claim above already locks the correct root via
+ * `effectiveRoot(task.target_repo, project_dir)`.
  *
  * Pass 2 — ready tiebreak: walk tasks and close rows in iteration order. If
  * the root is already claimed by pass-1, every `{ tag: "ready" }` row on
@@ -993,32 +1044,34 @@ export function applySingleTaskPerRootMutex(
 ): void {
   const occupiedRoots = new Set<string>();
 
-  // Pass 1: every "live work" verdict (task OR close row) claims its
+  // Pass 1: every root-occupant verdict (task OR close row) claims its
   // root regardless of iteration order relative to ready siblings in
-  // other epics on the same root. See `isLiveWorkOccupant` — only
-  // running/queued worker activity counts; dependency / mutex-synthesized
-  // blocks do not, since they don't represent a live worker that would
-  // conflict with a freshly-dispatched sibling.
+  // other epics on the same root. See `isRootOccupant` — only real
+  // worker activity counts; planners are root-exempt (fn-663) and
+  // dependency / mutex-synthesized blocks do not claim either, since
+  // they don't represent a live worker that would conflict with a
+  // freshly-dispatched sibling.
   for (const epic of epicsArr) {
     const projectDir = stringOrNull(epic.project_dir);
 
     for (const task of epic.tasks) {
       const verdict = perTask.get(task.task_id);
-      if (verdict === undefined || !isLiveWorkOccupant(verdict)) {
+      if (verdict === undefined || !isRootOccupant(verdict)) {
         continue;
       }
       const root = effectiveRoot(stringOrNull(task.target_repo), projectDir);
       occupiedRoots.add(root);
     }
 
-    // Close-row claim is scoped (fn-655): only fires when at least one
-    // EPIC-LEVEL source is live. See the JSDoc above for the full rule —
-    // a purely task-derived running close row leaves the project_dir
-    // claim to the contributing task's own pass-1 entry above.
+    // Close-row claim is scoped (fn-655, narrowed by fn-663): only fires
+    // when at least one EPIC-LEVEL non-planner source is live. See the
+    // JSDoc above for the full rule — a purely task-derived running close
+    // row leaves the project_dir claim to the contributing task's own
+    // pass-1 entry above, and a purely planner-derived close row is
+    // filtered out by the outer `isRootOccupant` guard.
     const closeVerdict = perCloseRow.get(epic.epic_id);
-    if (closeVerdict !== undefined && isLiveWorkOccupant(closeVerdict)) {
+    if (closeVerdict !== undefined && isRootOccupant(closeVerdict)) {
       const epicLevelRunning =
-        anyJobLinkRunning(epic) ||
         anyEmbeddedJobWorking(epic.jobs) ||
         anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId);
       if (epicLevelRunning) {
