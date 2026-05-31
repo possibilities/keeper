@@ -1,17 +1,34 @@
-"""Public API: which dirty files is a session on the hook for?
+"""Public API: read-only views into keeper's projections.
 
-``get_session_dirty_files(session_id, cwd)`` is the one function consumers
-call (``jobctl commit-work`` and friends).  It reads keeper's
-``file_attributions`` and ``git_status`` projections from ``keeper.db``
-read-only and returns the session's currently-dirty, not-since-committed
-files grouped by repo.
+Six readers; all stdlib-only and gated on
+``SUPPORTED_SCHEMA_VERSIONS``:
 
-Attribution rule (mirrors the reducer's discharge semantic): a session is
-on the hook for a file iff it has a mutation row whose ``last_commit_at`` is
-NULL or older than ``last_mutation_at`` — editing puts you on the hook,
-committing what you edited takes you off.  We additionally intersect against
-``git_status.dirty_files`` so a file that was edited then reverted (still
-undischarged, but no longer dirty) does not surface.
+- ``get_session_dirty_files(session_id, cwd)`` — which dirty files a
+  session is on the hook for, grouped by repo.  Reads
+  ``file_attributions`` ⋂ ``git_status.dirty_files``.  Consumed by
+  ``jobctl commit-work`` and friends.
+- ``get_session_titles()`` — ``{session_id: title}`` for every titled
+  job.  Reads ``jobs``.  Consumed by claudectl's session search.
+- ``get_session_name_history()`` — ``{session_id: [title, ...]}`` for
+  every job's distinct-titles history.  Reads
+  ``jobs.name_history``.  Consumed by claudectl's by-any-name session
+  resolver.
+- ``get_session_for_pid(pid)`` — latest session id whose ``jobs.pid``
+  equals *pid*, or ``None``.  Reads ``jobs`` (the new ``idx_jobs_pid``
+  index covers the lookup).  Consumed by
+  ``cli_common.session_context``'s psutil ancestor walk.
+- ``get_latest_session()`` — most-recently-updated job's
+  ``{session-id, cwd, session-name}`` (``session-name`` omitted when
+  ``jobs.title`` is NULL), or ``None``.  Reads ``jobs``.  Consumed by
+  ``cli_common.session_context.show_context``.
+
+Attribution rule for ``get_session_dirty_files`` (mirrors the reducer's
+discharge semantic): a session is on the hook for a file iff it has a
+mutation row whose ``last_commit_at`` is NULL or older than
+``last_mutation_at`` — editing puts you on the hook, committing what
+you edited takes you off.  We additionally intersect against
+``git_status.dirty_files`` so a file that was edited then reverted
+(still undischarged, but no longer dirty) does not surface.
 
 The import graph is stdlib-only (``sqlite3``, ``json``, ``os``,
 ``pathlib``) — ``commit-work`` shells out to git repeatedly, so this module
@@ -287,6 +304,71 @@ def get_session_name_history() -> dict[str, list[str]]:
             except (ValueError, TypeError):
                 history = []
             out[job_id] = history
+        return out
+    finally:
+        conn.close()
+
+
+def get_session_for_pid(pid: int) -> str | None:
+    """Return the latest session id whose ``jobs.pid`` equals *pid*, or ``None``.
+
+    Reads keeper's ``jobs`` projection.  ``ORDER BY updated_at DESC LIMIT 1``
+    picks the freshest row for *pid* — pid reuse is real (the OS recycles
+    pids), so a long-running consumer can match a recycled pid's newer
+    unrelated job.  Callers that need authoritative identity should prefer the
+    ``CLAUDE_CODE_SESSION_ID`` env var and treat this lookup as best-effort
+    (the documented contract in ``cli_common.session_context``).
+
+    The ``idx_jobs_pid`` covering index added in fn-615.1 keeps the lookup
+    O(log n) even as ``jobs`` grows.
+
+    Raises ``KeeperDBMissing`` / ``KeeperSchemaError`` like the other readers
+    here — no silent fallback.
+    """
+    path = _resolve_db_path()
+    conn = _open_readonly(path)
+    try:
+        _check_schema(conn)
+        row = conn.execute(
+            "SELECT job_id FROM jobs WHERE pid = ? "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (pid,),
+        ).fetchone()
+        return row[0] if row is not None else None
+    finally:
+        conn.close()
+
+
+def get_latest_session() -> dict | None:
+    """Return the most-recently-updated job, or ``None`` when no jobs exist.
+
+    Shape (matches the ``cli_common.session_context.show_context`` schema)::
+
+        {"session-id": "<job_id>", "cwd": "<cwd or None>",
+         "session-name": "<title>"}  # session-name omitted when title is NULL
+
+    Reads keeper's ``jobs`` projection.  ``ORDER BY updated_at DESC LIMIT 1``
+    selects the freshest job — the reducer stamps ``updated_at`` on
+    SessionStart / resume / UserPromptSubmit and every projection-touching
+    fold, so "latest by updated_at" tracks the currently-active session.
+
+    Raises ``KeeperDBMissing`` / ``KeeperSchemaError`` like the other readers
+    here — no silent fallback.
+    """
+    path = _resolve_db_path()
+    conn = _open_readonly(path)
+    try:
+        _check_schema(conn)
+        row = conn.execute(
+            "SELECT job_id, cwd, title FROM jobs "
+            "ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        job_id, cwd, title = row
+        out: dict = {"session-id": job_id, "cwd": cwd}
+        if title is not None:
+            out["session-name"] = title
         return out
     finally:
         conn.close()

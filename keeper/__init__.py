@@ -11,11 +11,17 @@ from keeper.api import (
     KeeperDBMissing,
     KeeperError,
     KeeperSchemaError,
+    get_latest_session,
     get_session_dirty_files,
+    get_session_for_pid,
+    get_session_titles,
 )
 
 __all__ = [
+    "get_latest_session",
     "get_session_dirty_files",
+    "get_session_for_pid",
+    "get_session_titles",
     "KeeperError",
     "KeeperDBMissing",
     "KeeperSchemaError",

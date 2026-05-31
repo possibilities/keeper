@@ -626,6 +626,7 @@ const CREATE_EVENTS_PLANCTL_INDEXES = [
  */
 const CREATE_JOBS_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_jobs_created_state ON jobs(created_at DESC, job_id, state)",
+  "CREATE INDEX IF NOT EXISTS idx_jobs_pid ON jobs(pid)",
 ];
 
 const CREATE_JOBS = `

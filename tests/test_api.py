@@ -18,7 +18,9 @@ from pathlib import Path
 from keeper.api import (
     KeeperDBMissing,
     KeeperSchemaError,
+    get_latest_session,
     get_session_dirty_files,
+    get_session_for_pid,
     get_session_name_history,
     get_session_titles,
 )
@@ -159,13 +161,18 @@ def _build_jobs_db(path: Path, *, schema_version: int = 31) -> None:
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
         (str(schema_version),),
     )
-    # Minimal jobs shape — columns get_session_titles + get_session_name_history read.
+    # Minimal jobs shape — covers columns every keeper.api reader hits
+    # (title / name_history for the title readers, pid / cwd / updated_at for
+    # the fn-615.1 readers).
     conn.execute(
         "CREATE TABLE jobs ("
         "job_id TEXT PRIMARY KEY, "
         "title TEXT, "
         "title_source TEXT, "
-        "name_history TEXT NOT NULL DEFAULT '[]'"
+        "name_history TEXT NOT NULL DEFAULT '[]', "
+        "pid INTEGER, "
+        "cwd TEXT, "
+        "updated_at REAL NOT NULL DEFAULT 0"
         ")"
     )
     conn.commit()
@@ -293,6 +300,103 @@ class GetSessionNameHistoryTest(unittest.TestCase):
         os.environ["KEEPER_DB"] = str(Path(self._tmp.name) / "nope.db")
         with self.assertRaises(KeeperDBMissing):
             get_session_name_history()
+
+
+def _add_job_full(path, job_id, *, pid=None, cwd=None, title=None, updated_at=0.0):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO jobs (job_id, title, pid, cwd, updated_at) VALUES (?,?,?,?,?)",
+        (job_id, title, pid, cwd, updated_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+class GetSessionForPidTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self._tmp.name) / "keeper.db"
+        _build_jobs_db(self.db)
+        self._prev = os.environ.get("KEEPER_DB")
+        os.environ["KEEPER_DB"] = str(self.db)
+
+    def tearDown(self) -> None:
+        if self._prev is None:
+            os.environ.pop("KEEPER_DB", None)
+        else:
+            os.environ["KEEPER_DB"] = self._prev
+        self._tmp.cleanup()
+
+    def test_latest_wins_for_reused_pid(self):
+        # Two rows sharing pid=4242 — newer updated_at wins.
+        _add_job_full(self.db, "sess-old", pid=4242, updated_at=100.0)
+        _add_job_full(self.db, "sess-new", pid=4242, updated_at=200.0)
+        self.assertEqual(get_session_for_pid(4242), "sess-new")
+
+    def test_returns_none_when_pid_absent(self):
+        _add_job_full(self.db, "sess-1", pid=1111, updated_at=100.0)
+        self.assertIsNone(get_session_for_pid(9999))
+
+    def test_returns_none_on_empty_db(self):
+        self.assertIsNone(get_session_for_pid(1234))
+
+    def test_unsupported_schema_raises(self):
+        bad = Path(self._tmp.name) / "bad.db"
+        _build_jobs_db(bad, schema_version=30)
+        os.environ["KEEPER_DB"] = str(bad)
+        with self.assertRaises(KeeperSchemaError):
+            get_session_for_pid(1234)
+
+    def test_missing_db_raises(self):
+        os.environ["KEEPER_DB"] = str(Path(self._tmp.name) / "nope.db")
+        with self.assertRaises(KeeperDBMissing):
+            get_session_for_pid(1234)
+
+
+class GetLatestSessionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self._tmp.name) / "keeper.db"
+        _build_jobs_db(self.db)
+        self._prev = os.environ.get("KEEPER_DB")
+        os.environ["KEEPER_DB"] = str(self.db)
+
+    def tearDown(self) -> None:
+        if self._prev is None:
+            os.environ.pop("KEEPER_DB", None)
+        else:
+            os.environ["KEEPER_DB"] = self._prev
+        self._tmp.cleanup()
+
+    def test_returns_freshest_job_with_title(self):
+        _add_job_full(self.db, "sess-old", cwd="/old", title="old", updated_at=100.0)
+        _add_job_full(self.db, "sess-new", cwd="/new", title="new", updated_at=200.0)
+        self.assertEqual(
+            get_latest_session(),
+            {"session-id": "sess-new", "cwd": "/new", "session-name": "new"},
+        )
+
+    def test_omits_session_name_when_title_null(self):
+        _add_job_full(self.db, "sess-1", cwd="/repo", title=None, updated_at=100.0)
+        self.assertEqual(
+            get_latest_session(),
+            {"session-id": "sess-1", "cwd": "/repo"},
+        )
+
+    def test_returns_none_on_empty_db(self):
+        self.assertIsNone(get_latest_session())
+
+    def test_unsupported_schema_raises(self):
+        bad = Path(self._tmp.name) / "bad.db"
+        _build_jobs_db(bad, schema_version=30)
+        os.environ["KEEPER_DB"] = str(bad)
+        with self.assertRaises(KeeperSchemaError):
+            get_latest_session()
+
+    def test_missing_db_raises(self):
+        os.environ["KEEPER_DB"] = str(Path(self._tmp.name) / "nope.db")
+        with self.assertRaises(KeeperDBMissing):
+            get_latest_session()
 
 
 if __name__ == "__main__":

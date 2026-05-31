@@ -349,9 +349,15 @@ the native value" is the default.
   append is a pure function of the persisted cell + the incoming title,
   with no `Date.now`/env reads. Backfill is `preMigrateStoredVersion <
   40` guarded and seeds each existing titled row's array to `[title]`.
-  keeper-py does not read `name_history` — the consumer is claudectl
-  via a forthcoming `get_session_name_history()` — so the keeper-py
-  bump is whitelist-only with no reader logic change. v39, fn-648:
+  keeper-py reads `jobs.name_history` via `get_session_name_history()`
+  (consumed by claudectl's by-any-name session resolver) alongside the
+  other `jobs`-table readers it ships — `get_session_titles()`,
+  `get_session_for_pid(pid)`, and `get_latest_session()` (the latter
+  two added in fn-615.1 to back `cli_common.session_context`'s
+  psutil ancestor walk + `show_context`, lookup served by the
+  `idx_jobs_pid` index). The v40 bump is shape-compatible with the
+  existing readers, so it is whitelist-only with no reader logic
+  change. v39, fn-648:
   the `git-rm` / `git-mv` deriver fix ships with a version-guarded
   one-time backfill that re-derives `bash_mutation_kind` +
   `bash_mutation_targets` over every persisted `PostToolUse:Bash` row
