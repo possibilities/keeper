@@ -72,5 +72,5 @@ run — count must not increase.
 - [ ] `bun test` green; committed to main staging only the touched files
 
 ## Done summary
-
+Sandboxed KEEPER_DB / KEEPER_DEAD_LETTER_DIR / KEEPER_DROP_LOG across all six hook-firing test spawn sites via a shared sandboxedBaseEnv() helper in both test files; fireViaLauncherWithEnv applies the sandbox after its overlay-clear loop so callers can't re-open the leak. Verified zero appends to production hook-drops.ndjson across a full run of both suites. README + CLAUDE.md document the contract.
 ## Evidence
