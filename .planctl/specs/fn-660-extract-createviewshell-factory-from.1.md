@@ -19,5 +19,5 @@ that owns the shared lifecycle; each TUI sibling becomes a thin caller.
 - [ ] bunx tsc --noEmit passes; bun test suite passes; no behavior change
 
 ## Done summary
-
+Extracted createViewShell({ script, renderBody, ... }) factory into src/view-shell.ts owning sidecars + lifecycle + copy key + SIGINT. board/jobs/git delegate; usage + autopilot stay on inline harnesses with rationale comments (multi-stream + planner-loop entanglement). tsc + 1674 tests pass.
 ## Evidence
