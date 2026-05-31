@@ -42,5 +42,5 @@ order), empty-history → `[]`, missing-db-raises, unsupported-schema-raises.
 - [ ] `GetSessionNameHistoryTest` added; `python -m unittest tests.test_api` green
 
 ## Done summary
-
+Added keeper.api.get_session_name_history() mirroring get_session_titles — reads jobs.name_history with defensive JSON parsing (malformed/empty → []); 6 new tests in GetSessionNameHistoryTest cover happy-path, empty, malformed-cell, missing-db, unsupported-schema.
 ## Evidence
