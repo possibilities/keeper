@@ -78,5 +78,5 @@ claims), 2001 (same-root task worker keeps root locked via own claim),
 - [ ] Consumer suites green: `bun test test/await-conditions.test.ts test/board.test.ts`.
 
 ## Done summary
-
+Added isRootOccupant predicate that exempts planner-running verdicts from the per-root mutex while leaving the per-epic mutex on isLiveWorkOccupant; planners no longer demote sibling-epic ready tasks on the same root but still block their own epic. Flipped readiness.test.ts:1965 and added per-task analog; all 88 readiness tests and 104 consumer-suite tests green.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "exempt planner-running from root mutex",
-  "updated_at": "2026-05-31T23:11:37.618281Z"
+  "updated_at": "2026-05-31T23:17:26.583383Z",
+  "worker_done_at": "2026-05-31T23:17:26.583383Z"
 }
