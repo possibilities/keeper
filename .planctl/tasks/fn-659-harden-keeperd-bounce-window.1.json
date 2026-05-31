@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "measure and fix boot writer starvation",
-  "updated_at": "2026-05-31T20:06:43.975239Z"
+  "updated_at": "2026-05-31T20:48:50.594515Z",
+  "worker_done_at": "2026-05-31T20:48:50.594515Z"
 }

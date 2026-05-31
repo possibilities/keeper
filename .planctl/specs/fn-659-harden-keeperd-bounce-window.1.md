@@ -90,5 +90,5 @@ revert the drain-pacing change; the starvation test guards regression.
 - [ ] bun test green; committed to main staging only touched files
 
 ## Done summary
-
+Add stateless boot-phase DrainOptions (paceMs, paceEvents, sleep) on the same drain() steady state uses — boot inserts a 5ms post-COMMIT OS sleep (Atomics.wait) for ~500 events, opening a writer-lock window so concurrent hook INSERTs don't starve into dead-letters during the bounce window. Switch end-of-boot checkpoint TRUNCATE→PASSIVE (writer-skipping). Re-fold determinism preserved; large backlog can't wedge; deterministic starvation+fix subprocess tests added. CLAUDE.md + README boot-sequence prose updated.
 ## Evidence
