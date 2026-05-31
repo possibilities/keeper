@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "dispatch-failures event and projection substrate",
-  "updated_at": "2026-05-31T22:30:27.558408Z"
+  "updated_at": "2026-05-31T23:26:20.659908Z",
+  "worker_done_at": "2026-05-31T23:26:20.659908Z"
 }

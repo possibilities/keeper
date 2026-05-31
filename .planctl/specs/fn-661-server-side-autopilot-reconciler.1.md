@@ -60,5 +60,5 @@ diffs. Add 42 to `keeper/api.py` `SUPPORTED_SCHEMA_VERSIONS` (`:73`) in THIS cha
 - [ ] keeper/api.py SUPPORTED_SCHEMA_VERSIONS includes 42; test/schema-version.test.ts passes
 
 ## Done summary
-
+Schema v43 dispatch_failures projection (PK verb,id; reason/dir/ts/last_event_id/created_at/updated_at) plus DispatchFailed UPSERT and DispatchCleared DELETE fold arms inside BEGIN IMMEDIATE; table included in re-fold reset, DISPATCH_FAILURES collection descriptor registered, keeper-py SUPPORTED_SCHEMA_VERSIONS bumped to include 43. Substrate ready for the autopilot reconciler worker.
 ## Evidence
