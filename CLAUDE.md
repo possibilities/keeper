@@ -27,7 +27,7 @@ double-writes every event).
 client churn.** The server (event log, reducer, projections, schema, RPC
 surface) is the durable artifact and the source of truth; clients (the
 `keeper` CLI subcommands wired through `cli/keeper.ts` — `keeper board`,
-`keeper autopilot`, `keeper git`, `keeper usage`, `keeper approve` —
+`keeper jobs`, `keeper autopilot`, `keeper git`, `keeper usage`, `keeper approve` —
 plus future consumers) are cheap to change.
 When a question is "should the projection carry richer state X?" the answer
 is decided by what makes the projection most honest and expressive — never

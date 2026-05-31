@@ -162,9 +162,9 @@ its `replayed_event_id` for posterity). RPC handlers MAY write
 to the log AND flip the `dead_letters` audit row in one transaction;
 never reducer projections directly (see [CLAUDE.md](./CLAUDE.md)'s DO
 NOT list). Example clients ship under the unified `keeper` CLI
-(`keeper board`, `keeper autopilot`, `keeper git`, `keeper usage`,
-`keeper await`, plus the single-shot `keeper approve` RPC client); see
-[Example clients](#example-clients) for usage.
+(`keeper board`, `keeper jobs`, `keeper autopilot`, `keeper git`,
+`keeper usage`, `keeper await`, plus the single-shot `keeper approve`
+RPC client); see [Example clients](#example-clients) for usage.
 
 ## What keeper is NOT
 
@@ -399,20 +399,24 @@ Keeper has no `install` verb. Wire it up manually:
    `KEEPER_TRACE_SERVER=0`; flip to `1` then
    `launchctl kickstart -k gui/$UID/arthack.keeperd` to enable. Example
    clients ship under the unified `keeper` CLI — `keeper board` /
-   `keeper autopilot` / `keeper git` / `keeper usage` (subscribe; the
-   readiness clients go through `src/readiness-client.ts`) and
-   `keeper approve` (RPC) — see [Example clients](#example-clients).
+   `keeper jobs` / `keeper autopilot` / `keeper git` / `keeper usage`
+   (subscribe; the readiness clients go through
+   `src/readiness-client.ts`) and `keeper approve` (RPC) — see
+   [Example clients](#example-clients).
 
 ## Example clients
 
 The unified `keeper` CLI exposes the example subscribe + RPC clients as
 typed subcommands (wired through `cli/keeper.ts`, the package.json
 `bin` — a single dispatcher entrypoint that fans into all subcommands).
-`keeper board` is the read-only subscribe client (combined epics + jobs
-view on one connection); `keeper autopilot` is its dispatch-oriented
-sibling (flat command list plus a `===`-delimited "ready" block);
-`keeper git` watches the `git` worktree collection; `keeper usage`
-watches the `usage` collection; `keeper await` is the blocking
+`keeper board` is the read-only subscribe client (epics-only view);
+`keeper jobs` is its sibling (the bottom jobs list with the
+`[dead-letter:N]` banner and the `r` replay-dead-letter key — the two
+moved out of `keeper board` in fn-658 so each TUI owns one frame
+shape); `keeper autopilot` is its dispatch-oriented sibling (flat
+command list plus a `===`-delimited "ready" block); `keeper git`
+watches the `git` worktree collection; `keeper usage` watches the
+`usage` collection; `keeper await` is the blocking
 wait-for-condition client (emits a Monitor-shaped `armed`/`met`/`failed`
 event stream on stdout and exits when an epic/task completes or
 unblocks); `keeper approve` is the RPC client (single-shot `rpc` →
@@ -430,18 +434,21 @@ or stdin isn't a TTY (piped, redirected, or under CI) the TUI gate
 collapses to plain stream output. Run any of them with
 `keeper <subcommand> --help`, or `keeper` for top-level help.
 
-- `board.ts` — combined "board" UI over the `epics`, `jobs`, and
-  `subagent_invocations` collections. Subscribes to all three on a single
-  connection and emits one combined frame per change, led by `---`, with
-  a `~~~` divider between the epics body and the jobs body (and a second
-  `~~~` inside the jobs body splitting ambient sessions from
-  planner/worker/closer rows). Uses server-default scope for all three:
-  epics are scoped via the descriptor's `defaultClause` — schema v32
-  (fn-634) materializes the predicate "open OR not-yet-approved" as the
-  VIRTUAL generated column `default_visible` and serves it from the
-  partial index `idx_epics_default_visible WHERE default_visible = 1`
-  as a covering SEARCH — jobs live only (`working + stopped`),
-  `subagent_invocations` full per-job timeline. Each epic renders as a header line —
+- `board.ts` — epics-only "board" UI over the `epics`,
+  `subagent_invocations`, and `jobs` collections (the latter as a
+  passive feed for the per-task / per-link rendering nested inside each
+  epic block). Subscribes through the shared `subscribeReadiness`
+  helper and emits one epics-only frame per change, led by `---`. Uses
+  server-default scope: epics are scoped via the descriptor's
+  `defaultClause` — schema v32 (fn-634) materializes the predicate
+  "open OR not-yet-approved" as the VIRTUAL generated column
+  `default_visible` and serves it from the partial index
+  `idx_epics_default_visible WHERE default_visible = 1` as a covering
+  SEARCH — `subagent_invocations` full per-job timeline, `jobs` live
+  only (`working + stopped`). The flat bottom jobs list and the
+  `[dead-letter:N]` banner (with the `r` replay-dead-letter key) moved
+  to `keeper jobs` in fn-658 — see the `jobs.ts` bullet below. Each
+  epic renders as a header line —
   `({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated]
   [slotted-after-closer]? [ready|completed|blocked:<reason>]` — followed by indented task lines
   (the optional `[slotted-after-closer]` pill — schema v29, active/cyan
@@ -516,30 +523,49 @@ collapses to plain stream output. Run any of them with
   `pending` / `todo` / `unvalidated` / `unknown` / `open` and the role
   labels (`planner|worker|closer|creator|refiner`) out by absence of
   color.
-  The banner status line carries a persistent `[dead-letter:N]` warn pill
-  (schema v37, fn-643) when the `dead_letters` collection has waiting rows;
-  the `r` keypress fires the `replay_dead_letter` RPC (single-shot
-  `rpc` → `rpc_result`), recovering the OLDEST waiting row — the daemon
-  appends a plain real event and flips the audit row to `recovered` in one
-  transaction. The board flashes `[replaying…]` immediately, then
-  `[recovered <dl_id>]` / `[nothing to replay]` / `[replay failed: …]`
-  for ~1.5 s before the persistent `[dead-letter:N]` pill resumes; on
-  success the dropped session reappears in the next frame and `N` drops
-  by one.
   The byte-compare emit gate keeps the stream quiet when row churn
   doesn't surface in the render. Reconnects across keeperd restarts;
   Ctrl-C unsubscribes cleanly. Every emitted frame is mirrored to three
-  per-pid `/tmp` sidecar files (combined JSON state, frame text, unified
+  per-pid `/tmp` sidecar files (epics JSON state, frame text, unified
   diff vs. the previous emit); when stdout/stdin are both TTYs the
   client enters a real TUI (alt-screen + ring-buffered frame history
   with keyboard navigation) AND indexes the sidecars so past frames
   remain inspectable. The keymap is `←/h/k` previous frame, `→/l/j`
-  next, `g` jump to oldest, `G`/`End`/`Esc` snap to live, `q`/`Ctrl-C`
+  next, `g` jump to oldest, `G`/`End`/`Esc` snap to live, `c` copies
+  the current frame + sidecar paths to the clipboard, `q`/`Ctrl-C`
   quit; under non-TTY (piped, redirected, CI) the TUI gate collapses
   to plain stream output.
 
   ```sh
-  keeper board            # combined board, default scope
+  keeper board            # epics-only board, default scope
+  ```
+
+- `jobs.ts` — live jobs-list sibling of `board.ts` (fn-658). Renders the
+  bottom jobs list as a two-stack frame led by `---`: jobs with NO
+  `plan_verb` (ambient sessions) on top, jobs WITH `plan_verb`
+  (planner/worker/closer — epic-bound work) below, joined by a `~~~`
+  divider. The empty-side drop rule applies: a partition with zero rows
+  yields just the other one with no divider; both empty yields an empty
+  body (the frame is just the `---` lead). Each row is followed by its
+  nested sub-agent collapse lines (one per `(job_id, subagent_type)`
+  group via `collapseSubagentsByName` — `(×N)` and `N stuck`
+  annotations surface the folded count and any non-surviving `running`
+  rows). The banner status line carries a persistent `[dead-letter:N]`
+  warn pill (schema v37, fn-643) when the `dead_letters` collection has
+  waiting rows; the `r` keypress fires the `replay_dead_letter` RPC
+  (single-shot `rpc` → `rpc_result`), recovering the OLDEST waiting
+  row — the daemon appends a plain real event and flips the audit row
+  to `recovered` in one transaction. Jobs flashes `[replaying…]`
+  immediately, then `[recovered <dl_id>]` / `[nothing to replay]` /
+  `[replay failed: …]` for ~1.5 s before the persistent
+  `[dead-letter:N]` pill resumes; on success the dropped session
+  reappears in the next frame and `N` drops by one. The pill is
+  re-stamped on every snapshot BEFORE the body byte-compare
+  short-circuit, so the count tracks reality even when the rendered
+  body is byte-stable. Same sidecar / TUI / non-TTY contract as board.
+
+  ```sh
+  keeper jobs             # live jobs list, default scope
   ```
 
 - `autopilot.ts` — dispatch-oriented sibling of `board.ts`. Subscribes

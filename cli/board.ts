@@ -1,60 +1,51 @@
 #!/usr/bin/env bun
 /**
- * keeper-board — a combined "UI" over the read-only NDJSON-over-UDS subscribe
- * server (`src/server-worker.ts`) that streams the epics + jobs +
- * subagent_invocations collections as one frame per change: each frame is
- * the epics body + a `~~~` divider line + the jobs body, both refreshed
- * under the same poll/connect lifecycle so they always show the same
- * wall-clock snapshot of the daemon. `subagent_invocations` rows feed the
- * readiness pill AND nest as indented `[<status>]` lines under the
- * matching job row (in both the embedded-in-epic context and the bottom
- * jobs list), stamping the raw 5-value projection enum
- * `running|ok|failed|unknown|superseded` verbatim — `superseded` is
- * promoted natively by the projection (task fn-605.2). Same-name
- * invocations within one job ADDITIONALLY collapse on the client to a
- * single line representing the most-recent (max turn_seq) row via
- * `collapseSubagentsByName` in `src/readiness-client.ts` — a `(×N)`
- * multiplier and an optional `N stuck` orphan indicator surface the
- * collapsed count and any non-surviving `running` rows. The same
- * collapse feeds readiness, so an orphan `running` row whose matching
- * `SubagentStop` never landed no longer false-blocks predicate 6. Full
- * uncollapsed audit trail stays in sqlite.
+ * keeper-board — an epics-only "UI" over the read-only NDJSON-over-UDS
+ * subscribe server (`src/server-worker.ts`) that streams the epics +
+ * subagent_invocations collections (plus jobs as a passive feed for the
+ * nested per-task / per-link rendering) as one frame per change. Sibling
+ * of `cli/jobs.ts`, which owns the bottom jobs list + the dead-letter
+ * banner — those moved out of board in fn-658.3. `subagent_invocations`
+ * rows feed the readiness pill AND nest as indented `[<status>]` lines
+ * under the matching job row inside each epic block, stamping the raw
+ * 5-value projection enum `running|ok|failed|unknown|superseded`
+ * verbatim — `superseded` is promoted natively by the projection (task
+ * fn-605.2). Same-name invocations within one job ADDITIONALLY collapse
+ * on the client to a single line representing the most-recent (max
+ * turn_seq) row via `collapseSubagentsByName` in
+ * `src/readiness-client.ts` — a `(×N)` multiplier and an optional
+ * `N stuck` orphan indicator surface the collapsed count and any
+ * non-surviving `running` rows. The same collapse feeds readiness, so
+ * an orphan `running` row whose matching `SubagentStop` never landed no
+ * longer false-blocks predicate 6. Full uncollapsed audit trail stays
+ * in sqlite.
  *
  * Frame shape:
  *
  *   {epics body}     ← one block per epic, see `renderEpicBlock` below
- *   ~~~
- *   {jobs body}      ← one row per job, see `projectJobRow` below
  *
- * The jobs body itself is split into two stacked sub-lists separated by a
- * `~~~` line: jobs with NO `plan_verb` (ambient / ad-hoc sessions) on top,
- * jobs WITH a `plan_verb` (planner/worker/closer — epic/task-bound work) on
- * the bottom. So a fully-populated frame can carry TWO `~~~` lines — one
- * between epics and jobs, one inside the jobs section. The empty-side drop
- * rule (below) applies at both levels.
+ * Each epic block carries its own embedded creator/refiner link lines
+ * (one per `job_links` entry) AND its work-verb jobs nested under the
+ * matching task or close row — those are EPIC rendering, not the bottom
+ * jobs list. The flat bottom jobs list and its `[dead-letter:N]` banner
+ * live in `cli/jobs.ts`.
  *
  * Connection / poll / coalesce / first-paint lifecycle is owned by
  * `subscribeReadiness` in `src/readiness-client.ts`. The board is the
  * RENDERER: it owns the sidecar writes, the per-frame `job_id →
  * SubagentInvocation[]` index used to nest sub-agent lines under jobs,
  * the `lastBody` byte-compare that suppresses no-op frames, and the
- * stdout emit. The helper handles the all-three-strict first-paint
+ * stdout emit. The helper handles the all-five-strict first-paint
  * gate, the per-collection refetch coalesce, the capped-backoff
  * reconnect, the steady-poll backstop, and (load-bearing) reads
  * subagent_invocations through `state.rows` so re-entrant sub-agents
  * sharing one `job_id` all reach `computeReadiness`.
  *
- * Empty-section policy: an empty collection renders as NOTHING (no
- * placeholder text). The `~~~` divider is dropped when either side is
- * empty, so a single populated section reads as a clean block under the
- * `---` lead, and a frame with both sides empty is just the lead. The
- * same rule applies to the jobs section's internal split: if one of the
- * two job partitions is empty, the inner `~~~` is dropped and the
- * populated partition reads as a single flat list.
+ * Empty-section policy: an empty epics collection renders as NOTHING
+ * (no placeholder text) — the frame is just the `---` lead.
  *
- * Filters: this view uses the SERVER defaults for both collections — epics:
- * `status = 'open' AND approval != 'approved'`; jobs: live only
- * (`working + stopped`, terminal states hidden). That's the common-case
+ * Filters: this view uses the SERVER defaults for the epics collection —
+ * `status = 'open' AND approval != 'approved'`. That's the common-case
  * "board" view; for explicit filters drop down to a custom subscribe client.
  *
  * Sidecar / SIGINT semantics: THREE indexed sidecar files per frame
@@ -82,11 +73,14 @@
  * `renderEpicDepPills`, `renderDeadLetterPill`, `epicNumFromIdOrBare`,
  * `renderEpicDepPillsFromProjection`, and `sendReplayDeadLetterRpc`
  * survive the move so `test/board.test.ts` continues to assert against
- * them. Embedded SGR codes (`colorizePillsInLine`'s output) are parsed
- * into OpenTUI `StyledText` at paint time by `src/ansi-to-styled.ts` —
- * the live shell calls the shim on any line containing `\x1b`. Sidecars
- * stay PLAIN (the colorizer is only run on `pushFrame` lines, not on
- * sidecar / stdout writes); the non-TTY plain path emits uncolored.
+ * them — `renderDeadLetterPill` + `sendReplayDeadLetterRpc` survive
+ * as re-exports even though board no longer renders the banner (jobs
+ * owns it). Embedded SGR codes (`colorizePillsInLine`'s output) are
+ * parsed into OpenTUI `StyledText` at paint time by
+ * `src/ansi-to-styled.ts` — the live shell calls the shim on any line
+ * containing `\x1b`. Sidecars stay PLAIN (the colorizer is only run on
+ * `pushFrame` lines, not on sidecar / stdout writes); the non-TTY plain
+ * path emits uncolored.
  */
 
 import { appendFileSync, writeFileSync } from "node:fs";
@@ -97,8 +91,6 @@ import {
   colorizePillsInLine,
   inputRequestPillSeg,
   planVerbLabel,
-  renderDeadLetterPill,
-  sendReplayDeadLetterRpc,
   subagentLinesFor,
 } from "../src/board-render";
 import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
@@ -136,7 +128,7 @@ export {
   sendReplayDeadLetterRpc,
 } from "../src/board-render";
 
-const HELP = `keeper board — combined epics + jobs UI over the keeper subscribe server
+const HELP = `keeper board — epics-only UI over the keeper subscribe server
 
 Usage: keeper board [--sock <path>]
 
@@ -146,17 +138,16 @@ Usage: keeper board [--sock <path>]
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
   c copy current frame + sidecar paths to clipboard,
-  r replay one oldest waiting dead-letter (recovers a dropped hook event),
   q/Ctrl-C quit.
   Per-frame sidecars are indexed; lifecycle + warn output
   is appended to /tmp/keeper-board.<pid>.lifecycle.txt. Session paths
   print on exit.
 
-Renders both views as one frame per change:
+The bottom jobs list and the dead-letter banner (with the 'r' replay
+key) live in 'keeper jobs' (fn-658.3 split them out of board).
 
-  {epics body}      (one block per epic, see epic-header format below)
-  ~~~
-  {jobs body}       (one row per job: {basename(cwd)} {title} [role] [state])
+Renders one block per epic; the frame is just the '---' lead when no
+epics match the default scope.
 
 Each epic block opens with a header line of the form:
 
@@ -251,30 +242,22 @@ target_repo does NOT claim project_dir — the contributing task already
 holds its own correct root via its target_repo. See
 applySingleTaskPerRootMutex in src/readiness.ts for the full rule.
 
-The jobs body is itself split into two stacked sub-lists separated by a '~~~'
-line: jobs with NO plan_verb (ambient sessions) on top, jobs WITH a plan_verb
-(planner/worker/closer — epic-bound work) on the bottom. A fully-populated
-frame can therefore show two '~~~' lines (one between epics and jobs, one
-inside the jobs section).
-
-The first frame waits until ALL THREE collections have landed their first
-result, so first paint is never half-empty AND the readiness pill is never
-computed against a partial snapshot. An empty section renders as NOTHING
-(no placeholder text); the ~~~ divider is dropped when either side is
-empty (this applies to the inner jobs split too). The page is refetched on
-every change signal and on a steady poll; a new frame prints only when the
-combined rendered output changes. All three subscriptions ride one
-connection; an epics-only change refetches only epics (and vice versa).
+The first frame waits until ALL FIVE readiness collections have landed their
+first result, so first paint is never half-empty AND the readiness pill is
+never computed against a partial snapshot. An empty epics collection renders
+as NOTHING (no placeholder text); the frame is just the '---' lead. The page
+is refetched on every change signal and on a steady poll; a new frame prints
+only when the rendered output changes. All five subscriptions ride one
+connection; an epics-only change refetches only epics.
 Every emitted frame is mirrored to three indexed /tmp sidecar files
 (state JSON + frame text + unified diff vs. the previous emit); a session
 meta file at /tmp/keeper-board.<pid>.meta.txt accumulates the index.
 Connection-lifecycle events are appended to the lifecycle sidecar.
 Session sidecar paths print on exit (Ctrl-C).
 
-This view uses the SERVER defaults for all three collections (epics: open +
-not-yet-approved; jobs: live only; subagent_invocations: full per-job
-timeline). For explicit per-collection filters write a small custom
-subscribe client against src/protocol.ts.
+This view uses the SERVER defaults for the epics collection
+(open + not-yet-approved). For explicit per-collection filters write a small
+custom subscribe client against src/protocol.ts.
 `;
 
 /**
@@ -591,28 +574,9 @@ export async function main(argv: string[]): Promise<void> {
     process.stdin.isTTY === true &&
     process.env.NO_COLOR == null;
 
-  // `lastBody` byte-compares the COMBINED body — internal row churn that
+  // `lastBody` byte-compares the rendered body — internal row churn that
   // doesn't surface in the render is invisible by design.
   let lastBody: string | null = null;
-
-  // fn-643.5: latest waiting dead-letter count from the readiness
-  // snapshot. Persistent banner pill `[dead-letter:N]` reflects this on
-  // every frame; the replay-key flash temporarily overrides the banner
-  // via setStatus(), and the per-flash timer restores
-  // `setStatus(persistentBannerPill())` so the pill never disappears
-  // unintentionally. `0` (or null) collapses the pill to empty —
-  // dropped cleanly.
-  let waitingDeadLetterCount = 0;
-  // Pre-colorized banner status string for the persistent dead-letter
-  // pill. Recomputed every frame and after every flash timer. Empty
-  // string when there's no backlog (banner shows nothing).
-  function persistentBannerPill(): string {
-    const raw = renderDeadLetterPill(waitingDeadLetterCount);
-    if (raw === "") {
-      return "";
-    }
-    return colorEnabled ? colorizePillsInLine(raw) : raw;
-  }
 
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
@@ -818,96 +782,17 @@ export async function main(argv: string[]): Promise<void> {
       .join("\n");
   }
 
-  // --- job rendering ---
-
-  function projectJobRow(row: Record<string, unknown>): string {
-    const title = seg(row.title);
-    const cwd = row.cwd == null ? "" : basename(String(row.cwd));
-    const cwdSeg = cwd === "" ? "" : `(${cwd}) `;
-    const role = planVerbLabel(row.plan_verb);
-    const roleSeg = role == null ? "" : ` [${role}]`;
-    const awaiting = inputRequestPillSeg(
-      row.last_input_request_at,
-      row.last_input_request_kind,
-    );
-    const head = `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
-    // [awaiting:<kind>] drops to its own continuation line (two-space indent —
-    // same depth as this row's sub-agent lines, appended by the caller).
-    return awaiting === "" ? head : `${head}\n  ${awaiting.trimStart()}`;
-  }
-
   /**
-   * Jobs body is split into two stacked sub-lists by `plan_verb` presence:
-   * no-role (ambient sessions) on top, with-role (planner/worker/closer —
-   * epic-bound work) on the bottom, joined by a `~~~` line. Within each
-   * partition we preserve server order, and each job row is followed by
-   * its `subagentLinesFor` block (three-space indent — one level under
-   * the flush-left job line). Same empty-side drop rule as the outer
-   * `renderBody`: a partition with zero rows yields just the other one,
-   * no divider; both empty yields `""`.
-   *
-   * The helper delivers `jobs` as a `Map<job_id, Job>` (no ordered slice),
-   * so we iterate via `jobs.values()` — the Map preserves insertion order
-   * and the helper's `result`-handler inserts in wire order, so server
-   * order is preserved.
-   */
-  function renderJobsBody(
-    snap: ReadinessClientSnapshot,
-    subagentIndex: Map<string, SubagentInvocation[]>,
-  ): string {
-    if (snap.jobs.size === 0) {
-      return "";
-    }
-    const noRole: string[] = [];
-    const withRole: string[] = [];
-    for (const [id, row] of snap.jobs) {
-      const block = [
-        projectJobRow(row as unknown as Record<string, unknown>),
-        ...subagentLinesFor(subagentIndex, id, "  "),
-      ].join("\n");
-      if ((row as unknown as Record<string, unknown>).plan_verb == null) {
-        noRole.push(block);
-      } else {
-        withRole.push(block);
-      }
-    }
-    const top = noRole.join("\n");
-    const bottom = withRole.join("\n");
-    if (top === "") {
-      return bottom;
-    }
-    if (bottom === "") {
-      return top;
-    }
-    return `${top}\n~~~\n${bottom}`;
-  }
-
-  /**
-   * Combined frame body: epics on top, jobs on the bottom, a `~~~` divider
-   * on its own line between them (no blank-line padding — the divider IS
-   * the visual break). The divider is dropped when either side is empty,
-   * so a single populated section reads as a clean block; both empty
-   * yields an empty body (the frame is just the `---` lead). Same `---`
-   * lead as the sibling scripts — there's still one frame per change.
-   *
-   * Returns one element per output line so the live-shell can consume
-   * lines (per-line ANSI diff). The caller joins with `\n` for stdout /
-   * sidecar / byte-compare.
+   * Epics-only frame body. Returns one element per output line so the
+   * live-shell can consume lines (per-line ANSI diff). The caller joins
+   * with `\n` for stdout / sidecar / byte-compare. The bottom jobs list
+   * lives in `cli/jobs.ts` (fn-658.3).
    */
   function renderBody(
     snap: ReadinessClientSnapshot,
     subagentIndex: Map<string, SubagentInvocation[]>,
   ): string[] {
-    const e = renderEpicsBody(snap, subagentIndex);
-    const j = renderJobsBody(snap, subagentIndex);
-    let body: string;
-    if (e === "") {
-      body = j;
-    } else if (j === "") {
-      body = e;
-    } else {
-      body = `${e}\n~~~\n${j}`;
-    }
+    const body = renderEpicsBody(snap, subagentIndex);
     return body === "" ? [] : body.split("\n");
   }
 
@@ -944,7 +829,6 @@ export async function main(argv: string[]): Promise<void> {
     const sDiff = `/tmp/keeper-board.${process.pid}.diff.${frameCount}.txt`;
     const stateJson = {
       epics: snap.epics,
-      jobs: Array.from(snap.jobs.values()),
     };
     try {
       writeFileSync(sState, `${JSON.stringify(stateJson, null, 2)}\n`);
@@ -992,9 +876,9 @@ export async function main(argv: string[]): Promise<void> {
 
   /**
    * Helper-driven snapshot callback. Builds the per-frame `job_id →
-   * invocations` index, renders the combined body, byte-compares against
+   * invocations` index, renders the epics body, byte-compares against
    * the last emit, and writes sidecars + stdout when the render changes.
-   * The helper handles the all-three-strict first-paint gate AND the
+   * The helper handles the all-five-strict first-paint gate AND the
    * `computeReadiness` call — `snap.readiness` is fully populated when
    * we get here.
    */
@@ -1008,15 +892,9 @@ export async function main(argv: string[]): Promise<void> {
     for (const d of snap.readiness.diagnostics) {
       appendDiagnostic(d, diagnosticsLogPath);
     }
-    // fn-643.5: refresh the persistent banner pill BEFORE the
-    // body-stability short-circuit below — the dead-letter count can
-    // change independently of the body (a new waiting row landing while
-    // the epics/jobs render stays byte-stable). Always re-stamp the
-    // banner so the pill reflects every snapshot, even snapshots where
-    // the body byte-compare drops the frame. `setStatus` is itself a
-    // no-op when the string is unchanged.
-    waitingDeadLetterCount = snap.deadLetters.length;
-    liveShell.setStatus(persistentBannerPill());
+    // fn-658.3: the persistent `[dead-letter:N]` banner re-stamp moved
+    // to `cli/jobs.ts` along with the bottom jobs list and the `r` key.
+    // Board no longer touches `liveShell.setStatus` on snapshots.
     // Per-frame `job_id → invocations` index — re-entrant sub-agents within
     // one session sit on the same `job_id` bucket, ordered by `turn_seq asc`
     // so the nested list reads in invocation order. The projection now
@@ -1076,13 +954,11 @@ export async function main(argv: string[]): Promise<void> {
     }
   }
 
-  // Shared banner-flash timer. `c` (copy) and `r` (replay-dead-letter)
-  // both push a transient `[...]` status pill into the banner via
-  // `setStatus`; this single timer restores the persistent
-  // `[dead-letter:N]` (or empty) pill after the flash window. One timer
-  // (vs. per-key) means a fresh flash from EITHER key cancels a
-  // still-pending restore from the OTHER — last-flash-wins, no leaked
-  // banner state.
+  // Banner-flash timer for the `c` (copy) key. fn-658.3 removed the `r`
+  // replay-dead-letter key (it lives in `cli/jobs.ts` alongside the
+  // persistent `[dead-letter:N]` pill), so `c` is now the only key that
+  // flashes the banner. The flash restore targets `""` — board no
+  // longer maintains a persistent pill, so there's nothing to put back.
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   function scheduleFlashRestore(): void {
     if (flashTimer !== undefined) {
@@ -1090,15 +966,15 @@ export async function main(argv: string[]): Promise<void> {
     }
     flashTimer = setTimeout(() => {
       flashTimer = undefined;
-      liveShell.setStatus(persistentBannerPill());
+      liveShell.setStatus("");
     }, 1500);
   }
 
   // `c` copies a debug snapshot (current frame + sidecar paths) to
   // the clipboard via `pbcopy`. Flashes `[copied frame N]` / `[copy
   // failed]` in the banner via setStatus; the shared flash-restore
-  // timer puts the persistent dead-letter pill back after ~1.5 s.
-  // Skipped silently before the first frame lands.
+  // timer clears the banner back to `""` after ~1.5 s. Skipped silently
+  // before the first frame lands.
   function handleCopyKey(): void {
     if (lastFrameText == null) {
       return;
@@ -1124,60 +1000,12 @@ export async function main(argv: string[]): Promise<void> {
     });
   }
 
-  // `r` recovers ONE oldest waiting dead-letter via the `replay_dead_letter`
-  // RPC over a fresh short-lived UDS connection (board's subscribe socket
-  // is read-only; the RPC dispatch rides a SEPARATE connection per the
-  // approve.ts pattern). Flashes `[replaying…]` immediately, then
-  // `[recovered <dl_id>]` / `[nothing to replay]` / `[replay failed:
-  // <reason>]` on the RPC reply. A single-flight guard suppresses
-  // double-fires while a replay is in flight — the keypress would
-  // otherwise stack pending RPCs. The persistent `[dead-letter:N]` pill
-  // drops on the next frame (the recovered row leaves the waiting page);
-  // the recovered session appears via its `events`-side fold.
-  let replayInFlight = false;
-  function handleReplayKey(): void {
-    if (replayInFlight) {
-      // Already a replay in flight — refuse silently rather than queue
-      // another. The flash timer will restore the banner soon enough.
-      return;
-    }
-    replayInFlight = true;
-    liveShell.setStatus("[replaying…]");
-    // Do NOT schedule the flash restore yet — the `[replaying…]` pill
-    // must persist until the RPC resolves. The reply path schedules
-    // the restore AFTER stamping the final flash text.
-    void sendReplayDeadLetterRpc(sockPath)
-      .then(
-        (result) => {
-          if (result.recovered_dl_id === null) {
-            liveShell.setStatus("[nothing to replay]");
-          } else {
-            liveShell.setStatus(`[recovered ${result.recovered_dl_id}]`);
-          }
-          scheduleFlashRestore();
-        },
-        (err: Error) => {
-          noteLine(`# warn: dead-letter replay failed: ${err.message}`);
-          // Trim a possibly-multiline error message into a single
-          // banner-safe segment. The full message lives in the
-          // lifecycle sidecar via the noteLine above.
-          const oneLine = err.message.split("\n", 1)[0] ?? err.message;
-          liveShell.setStatus(`[replay failed: ${oneLine}]`);
-          scheduleFlashRestore();
-        },
-      )
-      .finally(() => {
-        replayInFlight = false;
-      });
-  }
-
+  // fn-658.3: the `r` replay-dead-letter handler moved to `cli/jobs.ts`
+  // along with the persistent `[dead-letter:N]` banner. Board now has a
+  // single key handler (`c`).
   onKey = (key: string): void => {
     if (key === "c") {
       handleCopyKey();
-      return;
-    }
-    if (key === "r") {
-      handleReplayKey();
       return;
     }
   };

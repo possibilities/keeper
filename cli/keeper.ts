@@ -39,8 +39,8 @@ Usage:
   keeper <subcommand> [options]
 
 Subcommands:
-  board       Combined epics + jobs board
-  jobs        Live jobs list
+  board       Epics board
+  jobs        Live jobs list (with dead-letter banner + 'r' replay key)
   git         Live git status frames
   usage       Live usage frames
   autopilot   Dispatch log viewer
