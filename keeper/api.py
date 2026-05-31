@@ -74,9 +74,16 @@ from pathlib import Path
 # helper, fixing an invisible default-account rate limit) gated on a
 # rewind-and-redrain — no shape change to any table keeper-py reads (it
 # reads neither ``usage`` nor ``profiles``), so the bump is whitelist-only
+# with no reader logic change; v43 (fn-661 server-side autopilot reconciler
+# substrate) adds a new ``dispatch_failures`` projection table carrying
+# one row per sticky ``(verb, id)`` dispatch failure — keeper-py does not
+# read ``dispatch_failures`` (the reader is the thin ``keeper autopilot``
+# viewer, fed via the UDS subscribe wire), so the bump is whitelist-only
 # with no reader logic change.
 # Bump this set when a keeper schema change alters those tables.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42})
+SUPPORTED_SCHEMA_VERSIONS = frozenset(
+    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43}
+)
 
 
 class KeeperError(Exception):

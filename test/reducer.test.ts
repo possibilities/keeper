@@ -12109,3 +12109,233 @@ test("title fold with a malformed persisted name_history blob folds to [] then a
   drainAll();
   expect(getNameHistory()).toEqual(["x"]);
 });
+
+// ---------------------------------------------------------------------------
+// Schema v43 (fn-661) — `dispatch_failures` reducer projection. The server-
+// side autopilot reconciler mints `DispatchFailed` / `DispatchCleared`
+// synthetic events that fold purely (no `Date.now`, no liveness re-probe,
+// no `jobs` SELECT) into the `dispatch_failures` table. UPSERT keyed on
+// `(verb, id)`; `created_at` preserved through UPSERT; DELETE on clear.
+// A from-scratch re-fold (rewind cursor, DELETE FROM dispatch_failures,
+// re-drain) MUST reproduce the table byte-identically.
+// ---------------------------------------------------------------------------
+
+function dispatchFailedEvent(
+  verb: string,
+  id: string,
+  reason: string,
+  dir: string | null,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: sessionId,
+    data: JSON.stringify({ verb, id, reason, dir, ts }),
+  });
+}
+
+function dispatchClearedEvent(
+  verb: string,
+  id: string,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "DispatchCleared",
+    session_id: sessionId,
+    data: JSON.stringify({ verb, id }),
+  });
+}
+
+function getDispatchFailure(verb: string, id: string) {
+  return db
+    .query("SELECT * FROM dispatch_failures WHERE verb = ? AND id = ?")
+    .get(verb, id) as {
+    verb: string;
+    id: string;
+    reason: string;
+    dir: string | null;
+    ts: number;
+    last_event_id: number;
+    created_at: number;
+    updated_at: number;
+  } | null;
+}
+
+test("DispatchFailed UPSERTs a new dispatch_failures row and advances the cursor", () => {
+  const eventId = dispatchFailedEvent(
+    "plan-plan",
+    "fn-661-server-side-autopilot-reconciler.2",
+    "confirm_timeout",
+    "/Users/mike/code/keeper",
+    1_700_000_000,
+  );
+  expect(drainAll()).toBe(1);
+  const row = getDispatchFailure(
+    "plan-plan",
+    "fn-661-server-side-autopilot-reconciler.2",
+  );
+  expect(row).not.toBeNull();
+  expect(row!.verb).toBe("plan-plan");
+  expect(row!.id).toBe("fn-661-server-side-autopilot-reconciler.2");
+  expect(row!.reason).toBe("confirm_timeout");
+  expect(row!.dir).toBe("/Users/mike/code/keeper");
+  expect(row!.ts).toBe(1_700_000_000);
+  expect(row!.last_event_id).toBe(eventId);
+  expect(row!.created_at).toBe(1_700_000_000);
+  expect(getCursor()).toBe(eventId);
+});
+
+test("DispatchFailed UPSERT preserves created_at but updates reason / dir / ts / last_event_id / updated_at", () => {
+  const firstId = dispatchFailedEvent(
+    "plan-plan",
+    "fn-X.1",
+    "confirm_timeout",
+    "/repo-a",
+    1_700_000_000,
+  );
+  drainAll();
+  const before = getDispatchFailure("plan-plan", "fn-X.1");
+  expect(before).not.toBeNull();
+  expect(before!.created_at).toBe(1_700_000_000);
+
+  // A second DispatchFailed for the same (verb, id) — different reason,
+  // different dir, later ts. The row must UPDATE in place, preserving
+  // created_at (the "sticky since" semantic).
+  const secondId = dispatchFailedEvent(
+    "plan-plan",
+    "fn-X.1",
+    "launch_failed",
+    "/repo-b",
+    1_700_000_500,
+  );
+  drainAll();
+  const after = getDispatchFailure("plan-plan", "fn-X.1");
+  expect(after).not.toBeNull();
+  expect(after!.reason).toBe("launch_failed");
+  expect(after!.dir).toBe("/repo-b");
+  expect(after!.ts).toBe(1_700_000_500);
+  expect(after!.last_event_id).toBe(secondId);
+  // Critical: created_at PRESERVED (not overwritten to 1_700_000_500).
+  expect(after!.created_at).toBe(1_700_000_000);
+  expect(after!.last_event_id).toBeGreaterThan(firstId);
+});
+
+test("DispatchFailed with a null/missing dir folds dir to NULL", () => {
+  dispatchFailedEvent("plan-plan", "fn-Y.1", "confirm_timeout", null, 1700);
+  drainAll();
+  const row = getDispatchFailure("plan-plan", "fn-Y.1");
+  expect(row).not.toBeNull();
+  expect(row!.dir).toBeNull();
+});
+
+test("DispatchCleared deletes the (verb, id) row and advances the cursor", () => {
+  dispatchFailedEvent("plan-plan", "fn-Z.1", "confirm_timeout", "/r", 1700);
+  drainAll();
+  expect(getDispatchFailure("plan-plan", "fn-Z.1")).not.toBeNull();
+
+  const clearId = dispatchClearedEvent("plan-plan", "fn-Z.1");
+  expect(drainAll()).toBe(1);
+  expect(getDispatchFailure("plan-plan", "fn-Z.1")).toBeNull();
+  expect(getCursor()).toBe(clearId);
+});
+
+test("DispatchCleared on a non-existent (verb, id) is a safe no-op (cursor still advances)", () => {
+  const id = dispatchClearedEvent("plan-plan", "fn-never-failed.1");
+  expect(drainAll()).toBe(1);
+  expect(getDispatchFailure("plan-plan", "fn-never-failed.1")).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("Distinct (verb, id) pairs coexist as separate rows", () => {
+  dispatchFailedEvent("plan-plan", "fn-A.1", "confirm_timeout", null, 1700);
+  dispatchFailedEvent("plan-defer", "fn-A.1", "launch_failed", null, 1701);
+  dispatchFailedEvent("plan-plan", "fn-B.1", "confirm_timeout", null, 1702);
+  drainAll();
+  const rows = db
+    .query("SELECT verb, id FROM dispatch_failures ORDER BY ts ASC")
+    .all() as { verb: string; id: string }[];
+  expect(rows).toEqual([
+    { verb: "plan-plan", id: "fn-A.1" },
+    { verb: "plan-defer", id: "fn-A.1" },
+    { verb: "plan-plan", id: "fn-B.1" },
+  ]);
+});
+
+test("DispatchFailed with a malformed payload is a safe no-op (cursor still advances, no row written)", () => {
+  // Malformed shapes the extractor must reject: bad JSON, missing verb,
+  // empty id, non-number ts, missing reason. Each must fold to a no-op.
+  const malformed = [
+    { hook_event: "DispatchFailed", data: "{ not json" },
+    {
+      hook_event: "DispatchFailed",
+      data: JSON.stringify({ id: "x", reason: "r", ts: 1 }),
+    }, // missing verb
+    {
+      hook_event: "DispatchFailed",
+      data: JSON.stringify({ verb: "v", id: "", reason: "r", ts: 1 }),
+    }, // empty id
+    {
+      hook_event: "DispatchFailed",
+      data: JSON.stringify({ verb: "v", id: "x", reason: "r", ts: "soon" }),
+    }, // non-number ts
+    {
+      hook_event: "DispatchFailed",
+      data: JSON.stringify({ verb: "v", id: "x", ts: 1 }),
+    }, // missing reason
+  ];
+  let lastId = 0;
+  for (const ev of malformed) {
+    lastId = insertEvent({
+      hook_event: ev.hook_event,
+      session_id: "reconciler",
+      data: ev.data,
+    });
+  }
+  expect(drainAll()).toBe(malformed.length);
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM dispatch_failures").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+  expect(getCursor()).toBe(lastId);
+});
+
+test("from-scratch re-fold reproduces the dispatch_failures projection byte-identically (fn-661)", () => {
+  // Seed a representative sequence: failure, UPSERT (same key, later
+  // reason+ts), distinct-key failure, clear of the first key.
+  dispatchFailedEvent("plan-plan", "fn-A.1", "confirm_timeout", "/r", 1700);
+  dispatchFailedEvent("plan-plan", "fn-A.1", "launch_failed", "/r2", 1750);
+  dispatchFailedEvent("plan-defer", "fn-B.1", "confirm_timeout", null, 1800);
+  dispatchClearedEvent("plan-plan", "fn-A.1");
+  // A second-clear after a re-fail proves stickiness through the clear:
+  dispatchFailedEvent("plan-plan", "fn-A.1", "confirm_timeout", "/r3", 1850);
+  drainAll();
+  const before = db
+    .query(
+      "SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC",
+    )
+    .all();
+  // Rewind cursor + wipe projection + re-drain. The post-rewind rows
+  // must equal the pre-rewind rows byte-for-byte — the from-scratch
+  // re-fold determinism invariant.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_failures");
+  drainAll();
+  const after = db
+    .query(
+      "SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC",
+    )
+    .all();
+  expect(after).toEqual(before);
+});
+
+test("zero-event projection: a fresh DB has zero dispatch_failures rows", () => {
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM dispatch_failures").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+});

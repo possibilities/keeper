@@ -2612,6 +2612,200 @@ function retractUsageRow(db: Database, event: Event): void {
 }
 
 /**
+ * Pre-flattened `DispatchFailed` synthetic event payload (fn-661). The
+ * server-side autopilot reconciler mints this event when a dispatch attempt
+ * for the `(verb, id)` pair fails (today: a confirm-poll timeout, but the
+ * `reason` field is free-form so future failure shapes ride the same arm
+ * without a schema change).
+ *
+ * The reconciler stamps `ts` at reconcile time — NOT the same as the
+ * synthetic event's `event.ts` (which is the producer-side mint clock).
+ * Carrying it in the payload is what keeps the fold pure: a re-fold of the
+ * stored event reproduces the same `dispatch_failures.ts` column value
+ * regardless of when the re-fold happens. The reducer NEVER reads
+ * `Date.now()` and NEVER re-probes liveness here — both would break re-fold
+ * determinism (see the `Killed` arm and CLAUDE.md "byte-identical re-fold").
+ */
+interface DispatchFailedPayload {
+  verb: string;
+  id: string;
+  reason: string;
+  dir: string | null;
+  ts: number;
+}
+
+/**
+ * Pre-flattened `DispatchCleared` synthetic event payload (fn-661). The
+ * reconciler mints this event when a human `retry_dispatch` RPC fires
+ * against the `(verb, id)` pair — the only legal way for a sticky failure
+ * row to leave `dispatch_failures` (no direct DELETE: every clear must
+ * round-trip through the event log so a from-scratch re-fold reproduces
+ * the post-clear empty-table state).
+ */
+interface DispatchClearedPayload {
+  verb: string;
+  id: string;
+}
+
+/**
+ * Parse a `DispatchFailed` event payload. Returns null on any structural
+ * miss — the surrounding {@link foldDispatchFailed} folds null to a safe
+ * no-op (cursor still advances). NEVER throws: per CLAUDE.md "a malformed
+ * `data` blob skips/folds to a safe value", a throw inside the fold rolls
+ * back the cursor and wedges the reducer.
+ *
+ * Strict typing: `verb` / `id` / `reason` MUST be non-empty strings;
+ * `dir` is nullable (null on payloads that omit it, accepts a string
+ * otherwise); `ts` MUST be a finite number (the reconciler's reconcile-
+ * time stamp). Any miss → null → safe no-op.
+ */
+function extractDispatchFailedPayload(
+  event: Event,
+): DispatchFailedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<DispatchFailedPayload>;
+    if (typeof parsed.verb !== "string" || parsed.verb.length === 0) {
+      return null;
+    }
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.reason !== "string" || parsed.reason.length === 0) {
+      return null;
+    }
+    if (typeof parsed.ts !== "number" || !Number.isFinite(parsed.ts)) {
+      return null;
+    }
+    const dir =
+      typeof parsed.dir === "string" && parsed.dir.length > 0
+        ? parsed.dir
+        : null;
+    return {
+      verb: parsed.verb,
+      id: parsed.id,
+      reason: parsed.reason,
+      dir,
+      ts: parsed.ts,
+    };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse DispatchFailed payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Parse a `DispatchCleared` event payload. Mirrors
+ * {@link extractDispatchFailedPayload}'s defensive shape — only `verb` +
+ * `id` required (the clear arm is keyed-by-pk only); anything missing
+ * folds to a safe no-op.
+ */
+function extractDispatchClearedPayload(
+  event: Event,
+): DispatchClearedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<DispatchClearedPayload>;
+    if (typeof parsed.verb !== "string" || parsed.verb.length === 0) {
+      return null;
+    }
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    return { verb: parsed.verb, id: parsed.id };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse DispatchCleared payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `DispatchFailed` event (fn-661). UPSERT on
+ * `(verb, id)` — the first failure for the pair INSERTs a new row stamped
+ * `created_at = payload.ts`; subsequent failures (a reconciler that retries
+ * itself without a human clear in between would be a bug, but a stale
+ * re-fire IS possible across keeperd restarts) UPDATE the row's mutable
+ * fields and PRESERVE `created_at` so the viewer's "sticky since" view
+ * stays honest.
+ *
+ * The fold is a pure function of the event payload + the persisted row:
+ * - `verb` / `id` / `reason` / `dir` / `ts` / `created_at` come from the
+ *   immutable event payload (`ts` is the reconciler's reconcile-time
+ *   stamp, frozen in by the producer — see {@link DispatchFailedPayload}).
+ * - `last_event_id` is `event.id`.
+ * - `updated_at` is `event.ts` (the synthetic event's own mint clock — the
+ *   table's last-touched discipline mirrors every other projection).
+ *
+ * No `Date.now()`, no liveness re-probe, no `jobs` SELECT inside the fold
+ * — all three would break re-fold determinism. Runs INSIDE the open
+ * `BEGIN IMMEDIATE` transaction opened by {@link applyEvent}; performs
+ * zero cursor work (the surrounding `applyEvent` advances the cursor).
+ *
+ * Malformed/missing payload → safe no-op; the cursor still advances.
+ */
+function foldDispatchFailed(db: Database, event: Event): void {
+  const payload = extractDispatchFailedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO dispatch_failures (
+       verb, id, reason, dir, ts, last_event_id, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(verb, id) DO UPDATE SET
+       reason = excluded.reason,
+       dir = excluded.dir,
+       ts = excluded.ts,
+       last_event_id = excluded.last_event_id,
+       -- created_at preserved through UPSERT: the row's "sticky since"
+       -- view is the FIRST observation of this failure, never the latest.
+       updated_at = excluded.updated_at`,
+    [
+      payload.verb,
+      payload.id,
+      payload.reason,
+      payload.dir,
+      payload.ts,
+      event.id,
+      payload.ts,
+      event.ts,
+    ],
+  );
+}
+
+/**
+ * Fold one synthetic `DispatchCleared` event (fn-661). DELETE on
+ * `(verb, id)` — idempotent (re-folding over a `(verb, id)` that's already
+ * gone matches zero rows, not an error). This is the ONLY legal clear
+ * path: any direct DELETE against `dispatch_failures` outside the fold
+ * arm would break the from-scratch re-fold determinism invariant (the
+ * event log is the sole source of truth).
+ *
+ * Runs INSIDE the open `BEGIN IMMEDIATE` transaction opened by
+ * {@link applyEvent}; performs zero cursor work.
+ *
+ * Malformed/missing payload → safe no-op; the cursor still advances.
+ */
+function foldDispatchCleared(db: Database, event: Event): void {
+  const payload = extractDispatchClearedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run("DELETE FROM dispatch_failures WHERE verb = ? AND id = ?", [
+    payload.verb,
+    payload.id,
+  ]);
+}
+
+/**
  * Sweep open `status='running'` subagent_invocations rows for a job to
  * `status='unknown'` in a single bulk UPDATE. Called from the SessionEnd and
  * Killed arms of {@link projectJobsRow} on the proven write path (after the
@@ -5575,6 +5769,10 @@ export function applyEvent(
       projectUsageRow(db, event);
     } else if (event.hook_event === "UsageDeleted") {
       retractUsageRow(db, event);
+    } else if (event.hook_event === "DispatchFailed") {
+      foldDispatchFailed(db, event);
+    } else if (event.hook_event === "DispatchCleared") {
+      foldDispatchCleared(db, event);
     } else {
       projectJobsRow(db, event);
       // The `subagent_invocations` projection rides the same transaction +

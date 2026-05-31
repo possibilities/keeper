@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 42;
+export const SCHEMA_VERSION = 43;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1008,6 +1008,81 @@ const CREATE_DEAD_LETTERS_INDEXES = [
 ];
 
 /**
+ * Schema-v43 `dispatch_failures` projection table (fn-661). The server-side
+ * autopilot reconciler (epic fn-661) owns one fact durably — that a confirm-
+ * timed-out (or otherwise failed) dispatch attempt for a `(verb, id)` pair
+ * has happened and must stay sticky until a human retries. The reconciler
+ * itself is stateless across keeperd restarts on every other axis (the
+ * paused flag is in-memory, dedup reads `jobs` directly); failure stickiness
+ * is the one axis that has to survive.
+ *
+ * Unlike `dead_letters` (which is an operational sidecar of events that
+ * NEVER MADE IT into the event log), `dispatch_failures` IS a reducer
+ * projection: the reconciler mints synthetic `DispatchFailed` /
+ * `DispatchCleared` events that fold into this table inside the same
+ * `BEGIN IMMEDIATE` cursor-advance transaction as every other projection
+ * write. A from-scratch re-fold (rewind `reducer_state.last_event_id` to 0,
+ * DELETE the projection tables, re-drain the event log) MUST reproduce this
+ * table byte-identically — so it goes in the re-fold reset DELETE list
+ * alongside `jobs`, `epics`, `git_status`, `file_attributions`,
+ * `subagent_invocations`, `usage`, and `profiles`, and is EXPLICITLY
+ * EXCLUDED from the `dead_letters` sidecar's re-fold-survivor status.
+ * `DispatchCleared` (folded from the `retry_dispatch` RPC) is the only
+ * legal clear path — never a direct DELETE.
+ *
+ * Field semantics:
+ * - `verb` (TEXT, part of PK): the dispatch verb the reconciler launched —
+ *   in practice the `plan_verb` correlation key the reconciler matches
+ *   against `jobs.plan_verb` during the confirm poll (`plan-plan`,
+ *   `plan-defer`, `plan-queue`, `keeper-work-task`, etc).
+ * - `id` (TEXT, part of PK): the dispatch target id — the planctl epic id
+ *   or task id the verb is bound to (the reconciler's enqueue key, also
+ *   the correlation key against `jobs.plan_ref`).
+ * - `reason` (TEXT, NOT NULL): the failure reason the reconciler stamped at
+ *   reconcile time — e.g. `"confirm_timeout"`, `"launch_failed"`. Free-form
+ *   text the viewer surfaces; the reconciler is the schema author.
+ * - `dir` (TEXT, nullable): the working directory the reconciler attempted
+ *   the dispatch against. Useful viewer context (the same epic id may
+ *   target different repos across worktrees); nullable so a future
+ *   dispatch shape that has no working directory doesn't need to
+ *   fabricate one.
+ * - `ts` (REAL, NOT NULL): unix-epoch seconds — the reconciler's reconcile-
+ *   time stamp, lifted off the synthetic `DispatchFailed` event's payload
+ *   (NOT `event.ts` and NOT `Date.now()` inside the fold — see the fold
+ *   arm docstring). Re-fold-deterministic because the payload is
+ *   immutable.
+ * - `last_event_id` (INTEGER, NOT NULL): the `events.id` of the
+ *   `DispatchFailed` (or last UPSERTing one for an existing row) that
+ *   stamped this row. Drives the `DISPATCH_FAILURES_DESCRIPTOR`'s wire
+ *   diff — every UPSERT bumps it, so the viewer's subscribe stream fires
+ *   on every reconcile failure.
+ * - `created_at` (REAL, NOT NULL): first-seen unix-seconds — set on the
+ *   initial INSERT and preserved through subsequent UPSERTs (the row's
+ *   "this failure has been sticky since" view). Sourced from the event's
+ *   payload `ts` so re-fold reproduces it exactly.
+ * - `updated_at` (REAL, NOT NULL): last-touched unix-seconds — bumped on
+ *   every UPSERT to the event's `ts`. Mirrors every other projection
+ *   table's `updated_at` discipline.
+ *
+ * Defaults match the zero-event projection: a fresh DB with zero events
+ * has zero rows here; the table populates organically from the reducer's
+ * `DispatchFailed` fold arm.
+ */
+const CREATE_DISPATCH_FAILURES = `
+CREATE TABLE IF NOT EXISTS dispatch_failures (
+    verb TEXT NOT NULL,
+    id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    dir TEXT,
+    ts REAL NOT NULL,
+    last_event_id INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (verb, id)
+)
+`;
+
+/**
  * Schema-v31 `file_attributions` projection table — one row per
  * `(project_dir, session_id, file_path)` triple. Records the attribution claim
  * that this session has at least one mutation (tool or bash) on this file in
@@ -1704,6 +1779,7 @@ function migrate(db: Database): void {
     for (const sql of CREATE_DEAD_LETTERS_INDEXES) {
       db.run(sql);
     }
+    db.run(CREATE_DISPATCH_FAILURES);
 
     // Seed singleton cursor on first boot. Subsequent boots are no-ops.
     db.run(
@@ -4188,7 +4264,39 @@ function migrate(db: Database): void {
       db.run("DELETE FROM subagent_invocations");
       db.run("DELETE FROM usage");
       db.run("DELETE FROM profiles");
+      // fn-661 (schema v43): `dispatch_failures` is a reducer projection
+      // (epic fn-661); it joins the rewind-and-redrain set here so the
+      // canonical "wipe every reducer-owned projection table" list stays
+      // complete for any FUTURE rewind. Harmless on a v41→v42 upgrade
+      // (the table exists by the bootstrap CREATE that runs first in
+      // migrate(), but is empty — no `DispatchFailed` events have ever
+      // landed in a pre-v43 log).
+      db.run("DELETE FROM dispatch_failures");
     }
+
+    // v42→v43: fn-661 — `dispatch_failures` projection table, the durable
+    // substrate the server-side autopilot reconciler writes to. Picked up
+    // unconditionally by the `CREATE TABLE IF NOT EXISTS
+    // CREATE_DISPATCH_FAILURES` in the bootstrap block above; this slot
+    // exists only for the version-bump stamp ordering. No data backfill —
+    // the table populates exclusively from the reducer's `DispatchFailed`
+    // / `DispatchCleared` fold arms (epic fn-661, downstream tasks), and
+    // stays empty on a fresh DB / a steady-state v43 re-open with no
+    // prior dispatch failures.
+    //
+    // The table IS a reducer projection (unlike `dead_letters`, which is
+    // the sidecar audit log of events that never made it into the event
+    // log to be folded). A from-scratch re-fold rebuilds it byte-
+    // identically from the synthetic `DispatchFailed` / `DispatchCleared`
+    // events in the log — so it MUST be included in any future rewind-
+    // and-redrain DELETE list (see the v41→v42 slot above) and in the
+    // v10→v11 from-scratch reset (the next time a slot needs to wipe and
+    // re-fold all projections together).
+    //
+    // No keeper-py reader change: keeper-py reads neither
+    // `dispatch_failures` nor any other autopilot surface, so the v43
+    // bump is whitelist-only on the Python side (`api.py`'s
+    // `SUPPORTED_SCHEMA_VERSIONS` frozenset adds 43 in the same change).
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

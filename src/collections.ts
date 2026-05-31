@@ -602,12 +602,69 @@ export const DEAD_LETTERS_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
+ * The `dispatch_failures` descriptor (schema v43, fn-661). The server-side
+ * autopilot reconciler's sticky-failure surface — one row per `(verb, id)`
+ * dispatch that the reconciler stamped as failed (confirm-timeout,
+ * launch-failed, etc) and that has not yet been cleared via a human
+ * `retry_dispatch` RPC. Drives the thin `keeper autopilot` viewer's "failed"
+ * pane.
+ *
+ * Schema lives in `src/db.ts`'s `CREATE_DISPATCH_FAILURES`; the population
+ * path is the reducer's `DispatchFailed` UPSERT + `DispatchCleared` DELETE
+ * fold arms, both inside the existing `BEGIN IMMEDIATE` transaction. The
+ * table is a reducer projection (unlike `dead_letters`), so a from-scratch
+ * re-fold rebuilds it byte-identically from the event log.
+ *
+ * Pk is composite (`verb`, `id`) — but `CollectionDescriptor.pk` expects a
+ * single column. We carry `verb` as the descriptor pk (the consumer-
+ * meaningful identity for the viewer is "what verb failed"; `id` rides in
+ * `columns` for display and `filters` for narrowing). A future detail-page
+ * subscribe needing single-row resolution by both fields would need a
+ * composite-pk extension to `CollectionDescriptor` — same situation as
+ * `SUBAGENT_INVOCATIONS_DESCRIPTOR`'s composite pk, deferred for the same
+ * reason (the wire surface is the failed-dispatch list, not per-row
+ * detail).
+ *
+ * `version: 'last_event_id'` so the wire diff fires on every UPSERT (the
+ * reducer bumps `last_event_id` on every fold). `defaultSort` is `ts DESC`
+ * (most-recent failure on top, matching the viewer's expected reverse-
+ * chronological "what just broke" feed). No `jsonColumns` — every column
+ * is a scalar.
+ */
+export const DISPATCH_FAILURES_DESCRIPTOR: CollectionDescriptor = {
+  name: "dispatch_failures",
+  table: "dispatch_failures",
+  columns: [
+    "verb",
+    "id",
+    "reason",
+    "dir",
+    "ts",
+    "last_event_id",
+    "created_at",
+    "updated_at",
+  ],
+  pk: "verb",
+  version: "last_event_id",
+  sortable: new Set(["verb", "id", "ts", "created_at", "updated_at"]),
+  defaultSort: { column: "ts", dir: "desc" },
+  filters: {
+    verb: "verb",
+    id: "id",
+    reason: "reason",
+  },
+  jsonColumns: new Set(),
+};
+
+/**
  * The registry, keyed by wire-facing collection name. `jobs` + the `epics`
  * plan collection (which embeds its tasks + plan/close-verb jobs as JSON-array
  * columns — the standalone `tasks` collection was dropped in schema v7 — and
  * carries `approval` as a real column as of schema v13) + `git` + the
  * `subagent_invocations` per-job Agent-timeline projection (schema v17) +
- * the `dead_letters` operational sidecar (schema v37, fn-643).
+ * the `dead_letters` operational sidecar (schema v37, fn-643) + the
+ * `dispatch_failures` autopilot-reconciler sticky-failure projection
+ * (schema v43, fn-661).
  */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
@@ -617,6 +674,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [USAGE_DESCRIPTOR.name, USAGE_DESCRIPTOR],
   [PROFILES_DESCRIPTOR.name, PROFILES_DESCRIPTOR],
   [DEAD_LETTERS_DESCRIPTOR.name, DEAD_LETTERS_DESCRIPTOR],
+  [DISPATCH_FAILURES_DESCRIPTOR.name, DISPATCH_FAILURES_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */
