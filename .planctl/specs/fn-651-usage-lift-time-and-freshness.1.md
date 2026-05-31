@@ -57,5 +57,5 @@ event whose folded `usage` row has non-NULL `status` /
 - [ ] No schema bump; old events fold to NULL without error.
 
 ## Done summary
-
+Extract UsageSnapshot serializer as exported serializeUsageSnapshot and forward the fn-645 freshness fields (status / subscription_active / error_type / error_message / error_at) plus sonnet_week_resets_at — the inline JSON.stringify previously dropped them, so those usage columns folded NULL forever. End-to-end fold + backwards-compat tests in test/daemon.test.ts pin the wire shape.
 ## Evidence
