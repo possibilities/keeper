@@ -61,5 +61,5 @@ columns.
 - [ ] cli/usage.ts header/HELP + README updated; render tests pass.
 
 ## Done summary
-
+Render v41 lift countdown ('rate-limited for <rel>') with past-reset guard ('n/a'), add per-row staleness warning ('stale Nm') driven off last_usage_fold_at against a 15m threshold, gate frame repaints on both new columns. Tests + README + JSDoc updated.
 ## Evidence
