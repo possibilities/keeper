@@ -1,0 +1,19 @@
+{
+  "branch_name": "fn-662-fix-default-profile-rate-limit",
+  "bundles": [],
+  "created_at": "2026-05-31T22:30:44.109664Z",
+  "depends_on_epics": [],
+  "id": "fn-662-fix-default-profile-rate-limit",
+  "last_validated_at": "2026-05-31T22:30:44.195139Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "fix default-profile rate-limit colocation",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-31T22:30:44.109664Z"
+}
