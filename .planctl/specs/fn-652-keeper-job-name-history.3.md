@@ -48,5 +48,5 @@ claudectl.
 - [ ] `resolve_identifier` still resolves a session by a historical name; no functional `hooks-tracker` reference remains in claudectl
 
 ## Done summary
-
+Repointed load_all_session_names onto keeper.api.get_session_name_history (strict), removed HOOKS_TRACKER_DB constant, cleaned stale hooks-tracker doc/comment refs in run_list_sessions/run_show_statusline/helpers.
 ## Evidence
