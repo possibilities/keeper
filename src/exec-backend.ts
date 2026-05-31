@@ -1,68 +1,70 @@
 /**
- * `ExecBackend` — narrow interface for autopilot's terminal-surface
- * spawn/close mechanics. Autopilot is the sole consumer; the interface
- * exists as a single seam so the zellij `action new-tab` path stays
- * pluggable (and tests can inject a fake `spawn`).
+ * `ExecBackend` — narrow interface for the autopilot reconciler's
+ * terminal-surface spawn/close mechanics. The server-side reconciler
+ * (fn-661) is the sole consumer; the interface exists as a single seam
+ * so the zellij `action new-tab` path stays pluggable (and tests can
+ * inject a fake `spawn`).
  *
  * Why a factory (no top-level side effects). The module mirrors
  * `src/live-shell.ts`: import-clean, interface first, `Default*` consts,
  * `create*({deps})` factories. Production callers construct the backend
- * once in `cli/autopilot.ts`'s `main()`; tests inject a fake `spawn` so
- * argv construction is asserted without launching real processes.
+ * once in the reconciler worker; tests inject a fake `spawn` so argv
+ * construction is asserted without launching real processes.
  *
  * Public surface
  * --------------
- * - `ExecBackend` — `launch(argv, rowId, dir)` resolves to a stable
- *   PANE id (`terminal_<n>` for zellij, or `null` when nothing usable
- *   was captured); `close(windowId, tabName?)` is fire-and-forget and
- *   skips when `tabName` is no longer live (wrap-safety token guard
- *   for `zellij --server` restarts).
+ * - `ExecBackend.launch(argv, name, cwd) -> { ok, error? }` — spawn an
+ *   agent in a zellij tab named `name` at `cwd`. Returns a plain
+ *   success/failure envelope; no pane id is captured or returned. The
+ *   reconciler correlates back to keeperd via the `--name` baked into
+ *   `argv` (the `claude --name verb::id`) → SessionStart hook event →
+ *   `jobs` projection. Zellij is stateless from autopilot's side; the
+ *   only durable spawn signal is the projection edge.
+ * - `ExecBackend.closeByName(name) -> Promise<void>` — fire-and-forget
+ *   reap. Runs `zellij action list-panes -a -j`, parses the JSON,
+ *   filters to the SINGLE pane whose `tab_name === name` (exact, no
+ *   substring), and `close-pane -p` it. Closing the pane terminates
+ *   the agent process (SIGHUP on pane close) AND removes the now-empty
+ *   tab in one shot (zellij auto-closes a tab when it drops to zero
+ *   selectable tiled panes). Zero or multiple matches → noteLine warn
+ *   and no-op (a dedup guarantee upstream maintains one live tab per
+ *   `verb::id`, so multiple is "shouldn't happen" territory; zero just
+ *   means the tab is already gone).
  * - `createZellijBackend({ noteLine, session, spawn? })` — lazy session-
- *   ensure (memoized once) + `action new-tab --cwd <abs> [--name <tab>]
- *   -- <argv>` + pane-id capture (newest `terminal_<n>` from `action
- *   list-panes`, resolved for the surgical close path); `action
- *   close-pane -p <paneId>` close, guarded by a name-exact `query-tab-
- *   names` token check on the launch-time tab name. When the ensure
- *   step MINTS the session (vs. attaching to a listed one), it captures
- *   the empty default `Tab #1` id and the first launch reaps it via
- *   `action close-tab-by-id` (the orphan reap deliberately closes a
- *   known-empty tab — both close builders coexist, only the agent-pane
- *   path moved to `close-pane`).
+ *   ensure (memoized once) + `action new-tab --cwd <abs> --name <name>
+ *   -- <argv>`. When the ensure step MINTS the session (vs. attaching
+ *   to a listed one), it captures the empty default `Tab #1` id and
+ *   the first launch reaps it via `action close-tab-by-id` (the orphan
+ *   reap deliberately closes a known-empty tab — both close builders
+ *   coexist, only the agent reap path is name-driven).
  * - `resolveExecBackend(deps)` — factory; always returns a zellij
- *   backend. Kept as a thin seam so call sites (cli/autopilot.ts) and
- *   tests do not need a structural rewrite.
+ *   backend. Kept as a thin seam so call sites and tests do not need a
+ *   structural rewrite.
  *
- * Fire-and-forget contract. The backend's `close` is true fire-and-
- * forget — it never throws back into the caller, and a stale or
- * unrecognized pane id no-ops (zellij `close-pane -p` against an
- * unknown id surfaces stderr via `noteLine` but never throws).
+ * Fire-and-forget contract. The backend's `closeByName` never throws
+ * back into the caller; an unparseable list-panes payload, a missing
+ * binary, or zero/multiple matches all degrade to a noteLine warn and
+ * no spawned close.
  *
- * Wrap-safety contract. Pane ids (`terminal_<n>`) are a process-global
- * monotonic counter inside a single `zellij --server` lifetime — never
- * reused — but RESET across server restarts. `dispatch.log` survives
- * restarts and rehydrates `windowId`s, so a recycled `terminal_N` from
- * the previous lifetime could reap a DIFFERENT live pane in the new
- * one. The `close` method guards against this by probing the launch-
- * time tab name via the same name-exact `query-tab-names` machinery
- * `isSurfaceLive` uses for the dispatch surface-live gate: a server
- * restart blows away the named tab too, so the probe returns false and
- * the close is skipped. Missing-token rows (pre-upgrade
- * `kind:"window"` entries without a `tabName` field, or with a bare-
- * numeric tab-id-shaped `windowId` from the old `close-tab-by-id`
- * regime) are skipped on shape — leaving the pane open is the safe
- * miss; reaping the wrong live pane is unrecoverable.
+ * Wrap-safety. The previous incarnation carried `windowId` (a
+ * `terminal_<n>` pane id) across launch and close and guarded against
+ * server-restart pane-id recycling via a name-exact `query-tab-names`
+ * token probe. The new shape is stateless from autopilot's side — the
+ * close is driven entirely by the live `list-panes -a -j` snapshot, so
+ * a server restart can't reap the wrong pane (no stashed id to recycle).
  *
  * ENOENT handling (zellij binary not installed): `launch` resolves
- * `null` and surfaces the missing-binary line via `noteLine`. The
- * dispatch already shipped to the dispatch log; autopilot's auto-close
- * just won't have an id to target.
+ * `{ ok: false, error }` and surfaces the missing-binary line via
+ * `noteLine`; `closeByName` no-ops with a noteLine warn. The reconciler
+ * treats a non-`ok` launch as a sticky `DispatchFailed` per the epic
+ * design.
  */
 
 /**
- * Minimal spawn function alias — Bun.spawn-shaped subset autopilot needs.
- * Threaded through `deps.spawn` so tests can inject a fake that captures
- * the constructed argv without running a real process. Production
- * defaults to `Bun.spawn`.
+ * Minimal spawn function alias — Bun.spawn-shaped subset the backend
+ * needs. Threaded through `deps.spawn` so tests can inject a fake that
+ * captures the constructed argv without running a real process.
+ * Production defaults to `Bun.spawn`.
  */
 export type SpawnFn = (
   cmd: string[],
@@ -78,93 +80,67 @@ export type SpawnFn = (
 };
 
 /**
- * Backend interface — async `launch`, sync fire-and-forget `close`.
- *
- * `launch` returns the captured pane id as a string (for the zellij
- * backend: `terminal_<n>` — the just-spawned pane, NOT the tab id), or
- * `null` when nothing usable was parsed from the spawn's stdout / the
- * pane-id capture (the dispatch still ships; autopilot's auto-close
- * path no-ops on the missing id).
- *
- * `close` swallows all errors. A stale pane id from a previous server
- * lifetime is caught by the wrap-safety token guard — the launch-time
- * `tabName` is probed via `query-tab-names` first, and a mismatch
- * skips the close so a recycled `terminal_<n>` can't reap the wrong
- * live pane. Unknown ids that DO pass the token check (rare — would
- * require the tab to still exist but the pane id to have shifted)
- * no-op via zellij's `close-pane -p` stderr→noteLine path.
+ * Result envelope from `launch`. `ok: true` means the new-tab spawn
+ * exited 0; `ok: false` carries a short `error` description for the
+ * reconciler to fold into a `DispatchFailed` event. No pane id, no
+ * surface ref — the reconciler correlates via the `--name` baked into
+ * `argv` and the resulting `SessionStart` hook event.
  */
-/**
- * Optional surface labels for a launch. `tabName` names the zellij tab
- * (`new-tab --name`) — the close-time generation token probed via
- * `query-tab-names`.
- */
-export interface LaunchOptions {
-  readonly tabName?: string;
-}
+export type LaunchResult = { ok: true } | { ok: false; error: string };
 
+/**
+ * Backend interface — async `launch`, async `closeByName`.
+ *
+ * `launch(argv, name, cwd)` spawns the worker argv inside a new zellij
+ * tab named `name` at `cwd`. Returns `{ ok }` — there is no pane id or
+ * tab id to capture. The launch's success/failure is the only signal
+ * the reconciler folds into the event log (sticky `DispatchFailed` on
+ * non-ok).
+ *
+ * `closeByName(name)` reaps the tab labeled exactly `name`. Fire-and-
+ * forget; never throws back. Resolves the pane id at close time via
+ * `list-panes -a -j` so server-restart pane-id recycling can't reap
+ * the wrong pane (no stashed id).
+ */
 export interface ExecBackend {
-  /** Spawn a terminal surface running argv at `dir`. Resolves to a
-   *  stable id, or `null` when no id was captured. `opts` carries
-   *  the optional zellij tab name (the close-time token).
+  /** Spawn a terminal surface running `argv` at `cwd` in a tab named
+   *  exactly `name` (zellij `new-tab --name`). Returns `{ ok: true }`
+   *  on exit code 0; `{ ok: false, error }` on spawn ENOENT or non-
+   *  zero exit. No pane id is captured — the reconciler correlates
+   *  the dispatch via the `--name verb::id` baked into `argv` plus
+   *  the resulting `SessionStart` hook event in the `jobs` projection,
+   *  not via a surface ref. */
+  launch(argv: string[], name: string, cwd: string): Promise<LaunchResult>;
+  /** Reap the zellij tab labeled exactly `name` by closing its single
+   *  agent pane. Fire-and-forget — resolves even when the underlying
+   *  spawn fails. Behavior:
    *
-   *  Return value: the just-created pane id (`terminal_<n>` for the
-   *  zellij backend) — NOT the tab id. The pane id is what `close`
-   *  feeds to `close-pane -p` for a surgical reap that leaves any
-   *  sibling tiled panes (e.g. a second pane the human added to the
-   *  same tab) intact. Returns `null` when no terminal pane was
-   *  resolved from `action list-panes` (parse failure / empty list /
-   *  zellij ENOENT). The autopilot caller's `closeWindow` no-ops on
-   *  `null` per the existing "no id → won't auto-close" contract. */
-  launch(
-    argv: string[],
-    rowId: string,
-    dir: string,
-    opts?: LaunchOptions,
-  ): Promise<string | null>;
-  /** Reap a previously-launched surface by pane id. Fire-and-forget;
-   *  never throws back. No-op on empty/undefined id.
+   *    1. `zellij action list-panes -a -j` — snapshot every pane in
+   *       the session.
+   *    2. Filter to the pane whose `tab_name === name` (exact, no
+   *       substring; dedup guarantees one live tab per `verb::id`).
+   *    3. Zero matches → noteLine warn + no-op (the tab is already
+   *       gone; safe). Multiple matches → noteLine warn + no-op
+   *       ("shouldn't happen" given the dedup invariant; refuse to
+   *       guess which one is the right one).
+   *    4. Single match → `zellij action close-pane -p <pane_id>`.
+   *       Closing the pane SIGHUPs the agent process and (because the
+   *       tab has no sibling panes) zellij auto-closes the tab.
    *
-   *  `tabName` (when provided) is the generation-token guard: the
-   *  backend probes `isSurfaceLive(tabName)` first and only fires the
-   *  pane close when the named tab is still live. A mismatched server
-   *  (the `zellij --server` restarted between launch and close — pane
-   *  ids reset on restart and a recycled id could reap a DIFFERENT
-   *  live pane) leaves no tab with the original `verb::id` name, so
-   *  the probe returns false and the close is skipped. A missing
-   *  `tabName` (pre-upgrade dispatch.log rows whose `kind:"window"`
-   *  payload predates the `tabName` field) ALSO skips the close per
-   *  the fail-safe direction — leaving the pane open is the safe
-   *  miss (the human can close it manually); reaping the wrong pane
-   *  is unrecoverable.
-   *
-   *  Additionally, `windowId` must match the post-launch pane-id
-   *  shape (`terminal_<n>`); pre-upgrade rows carry a bare-numeric
-   *  tab id from the previous `close-tab-by-id` regime and are
-   *  silently skipped — feeding a tab id to `close-pane -p` is
-   *  guaranteed to no-op AND leaves a parked tab, so we don't bother
-   *  trying. */
-  close(windowId: string, tabName?: string): void;
-  /** True when a terminal surface labeled `name` is already live in the
-   *  backend (zellij: a tab whose name === `name`). Drives autopilot's
-   *  name-exact re-dispatch gate — UNLIKE the root-scoped, self-EXCLUDING
-   *  `isLiveSessionInRoot`, this matches the exact `verb::id` INCLUDING
-   *  the row's own surface, so an already-running identical row blocks its
-   *  own re-dispatch even when `dispatch.log` did not survive a restart.
-   *  FAIL-CLOSED: resolves `true` when liveness cannot be determined
-   *  (query failed / binary missing / non-zero exit) so a probe error
-   *  never opens the double-spawn hole — a suppressed dispatch self-heals
-   *  on the next snapshot edge. */
-  isSurfaceLive(name: string): Promise<boolean>;
+   *  Unparseable JSON, missing binary, non-zero list-panes exit, etc.
+   *  all degrade to noteLine warn + no-op — leaving a stale tab is the
+   *  safe direction; the human can close it manually. */
+  closeByName(name: string): Promise<void>;
 }
 
 /**
- * ANSI CSI sequence matcher used by `zellijSessionListed` to strip
- * color codes from `zellij list-sessions` output. Built via
- * `new RegExp` so the source literal does not contain a control
- * character (biome's `noControlCharactersInRegex` rule). The pattern
- * matches an ESC (0x1B) followed by `[`, a possibly-empty run of
- * digits and semicolons, and a trailing letter terminator.
+ * ANSI CSI sequence matcher used by `zellijSessionListed` /
+ * `firstTabIdFromListTabs` to strip color codes from zellij's text
+ * output (the JSON path doesn't need it). Built via `new RegExp` so
+ * the source literal does not contain a control character (biome's
+ * `noControlCharactersInRegex` rule). The pattern matches an ESC
+ * (0x1B) followed by `[`, a possibly-empty run of digits and
+ * semicolons, and a trailing letter terminator.
  */
 const ANSI_CSI_RE = new RegExp(
   `${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`,
@@ -186,8 +162,8 @@ export const DEFAULT_ZELLIJ_SESSION = "autopilot" as const;
 
 /**
  * Zellij backend dependencies. `session` is the target session name;
- * `noteLine` is the lifecycle sidecar sink (autopilot's `noteLine`);
- * `spawn` defaults to `Bun.spawn` and is injectable for tests.
+ * `noteLine` is the lifecycle sidecar sink; `spawn` defaults to
+ * `Bun.spawn` and is injectable for tests.
  */
 export interface ZellijBackendDeps {
   readonly noteLine: (line: string) => void;
@@ -232,10 +208,12 @@ const defaultSpawn: SpawnFn = (cmd, options) =>
  * safe quoting seam (no injection surface). `dir` MUST be absolute —
  * zellij's `--cwd` does not expand `~`/`$HOME` (issue #2288).
  *
- * `name`, when non-empty, labels the new tab via `--name` (autopilot
- * passes the worker's `verb::id` spawn name so the tab bar mirrors the
- * `claude --name`). Omitted entirely when absent so zellij assigns its
- * default `Tab #N`.
+ * `name`, when non-empty, labels the new tab via `--name`. The
+ * reconciler always passes the worker's `verb::id` spawn name so the
+ * tab bar mirrors the `claude --name` and `closeByName(name)` can
+ * resolve the pane via `list-panes -a -j`'s `tab_name` field.
+ * Omitted entirely when absent so zellij assigns its default `Tab #N`
+ * (only used by tests; the reconciler never launches unnamed).
  */
 export function buildZellijNewTabArgs(
   session: string,
@@ -264,9 +242,9 @@ export function buildZellijNewTabArgs(
  * Used ONLY for the fresh-mint orphan default-tab reap path inside
  * `ensureSession` — the launch site deliberately closes a known-empty
  * default `Tab #1` zellij creates when the session is first minted, so
- * there's no risk of nuking a shared tab. The agent-pane auto-close
- * path takes `buildZellijClosePaneArgs` below instead (surgical: a tab
- * carrying a sibling human-added pane survives).
+ * there's no risk of nuking a shared tab. The agent-pane reap takes
+ * `buildZellijClosePaneArgs` below (surgical pane-level close, name-
+ * driven via `list-panes -a -j`).
  */
 export function buildZellijCloseTabArgs(
   session: string,
@@ -287,13 +265,9 @@ export function buildZellijCloseTabArgs(
  * exported for tests. Drives the auto-close path: a pane-scoped close
  * leaves any sibling tiled panes intact (zellij auto-closes a tab only
  * when it has zero selectable tiled panes left, per
- * `zellij-server/src/screen.rs:2518-2523`). The shared-tab-survives
- * case is surgical by construction — no pre-close `list-panes` guard
- * needed.
- *
- * Coexists with `buildZellijCloseTabArgs` above: the orphan-default-tab
- * reap deliberately closes a known-empty tab and so keeps the tab-level
- * builder; the agent-pane reap takes this pane-level one.
+ * `zellij-server/src/screen.rs:2518-2523`). The reconciler dedup
+ * invariant guarantees one agent pane per named tab, so the close
+ * always lands the tab too.
  */
 export function buildZellijClosePaneArgs(
   session: string,
@@ -307,37 +281,6 @@ export function buildZellijClosePaneArgs(
  */
 export function buildZellijListSessionsArgs(): string[] {
   return ["zellij", "list-sessions"];
-}
-
-/**
- * Build the zellij `action query-tab-names` argv. Pure — exported for
- * tests. Drives the name-exact live-surface gate: tabs are named with the
- * dispatch's `verb::id` (autopilot's `launchWindow` passes it as
- * `tabName`), so "is `work::fn-…` already live?" is an exact match over
- * this command's one-name-per-line output.
- */
-export function buildZellijQueryTabNamesArgs(session: string): string[] {
-  return ["zellij", "--session", session, "action", "query-tab-names"];
-}
-
-/**
- * Parse `action query-tab-names` output and decide whether a tab named
- * exactly `name` is live. zellij prints one tab name per line; we
- * ANSI-strip + trim each line (same colorblindness as
- * `zellijSessionListed`) and EXACT-match — not a substring match, so
- * `work::fn-6` never spuriously matches `work::fn-60`. Exported for tests.
- */
-export function tabNameListed(text: string, name: string): boolean {
-  for (const raw of text.split("\n")) {
-    const trimmed = raw.replace(ANSI_CSI_RE, "").trim();
-    if (trimmed.length === 0) {
-      continue;
-    }
-    if (trimmed === name) {
-      return true;
-    }
-  }
-  return false;
 }
 
 /**
@@ -375,36 +318,141 @@ export function firstTabIdFromListTabs(text: string): string | null {
 }
 
 /**
- * Build the zellij `action list-panes` argv. Pure — exported for tests.
- * Run right after `new-tab` to find the just-created agent pane id (the
- * newest `terminal_<n>`) for the surgical `close-pane -p` reap path.
+ * Build the zellij `action list-panes -a -j` argv. Pure — exported for
+ * tests. `-a` means "all panes across all tabs" (without `-a`,
+ * `list-panes` defaults to the active tab only). `-j` is JSON output:
+ * each pane object carries at minimum `id`, `tab_id`, `tab_name`,
+ * `terminal_command`, `exited` — the reconciler's `closeByName` filters
+ * on `tab_name` (exact match) and feeds the matching `id` to
+ * `close-pane -p`.
  */
-export function buildZellijListPanesArgs(session: string): string[] {
-  return ["zellij", "--session", session, "action", "list-panes"];
+export function buildZellijListPanesAllJsonArgs(session: string): string[] {
+  return ["zellij", "--session", session, "action", "list-panes", "-a", "-j"];
 }
 
 /**
- * Parse `action list-panes` output and return the newest terminal pane
- * id (`terminal_<n>` with the highest `n`). zellij's pane ids are a
- * global monotonic counter, so the highest-numbered terminal pane is the
- * one the immediately-preceding `new-tab` created — robust as long as
- * launches are serialized (autopilot's single settling slot guarantees
- * it). Skips `plugin_*` rows and the header. Returns `null` when no
- * terminal pane is found.
+ * Pane record parsed from `list-panes -a -j` output. The full zellij
+ * schema is wider (≈30 fields); we only model what the reconciler
+ * actually reads. `id` is the pane id we feed to `close-pane -p`;
+ * `tab_name` is the filter key. Other fields kept here for forensic
+ * use by callers / tests that want to log them but are otherwise
+ * unread by this module.
  */
-export function newestTerminalPaneId(text: string): string | null {
-  let best = -1;
-  for (const raw of text.split("\n")) {
-    const trimmed = raw.replace(ANSI_CSI_RE, "").trim();
-    const m = /^terminal_(\d+)\b/.exec(trimmed);
-    if (m?.[1] != null) {
-      const n = Number.parseInt(m[1], 10);
-      if (n > best) {
-        best = n;
+export interface ZellijPane {
+  readonly id: string;
+  readonly tab_name: string;
+  readonly tab_id?: number;
+  readonly terminal_command?: string | null;
+  readonly exited?: boolean;
+}
+
+/**
+ * Find a pane whose `tab_name === name` in a parsed `list-panes -a -j`
+ * payload. Pure — exported for tests.
+ *
+ * Returns:
+ *   - `{ found: "single", pane }` — exactly one match (the dedup-
+ *     invariant happy path).
+ *   - `{ found: "none" }` — zero matches (tab already gone; safe).
+ *   - `{ found: "multiple", count }` — more than one match
+ *     ("shouldn't happen" given the dedup invariant; caller refuses
+ *     to guess and no-ops).
+ *
+ * Accepts both observed JSON shapes defensively: a flat array of panes
+ * with `tab_name` fields, OR an object map keyed by tab name to arrays
+ * of panes (zellij has shipped both in different versions).
+ */
+export type FindPaneResult =
+  | { found: "single"; pane: ZellijPane }
+  | { found: "none" }
+  | { found: "multiple"; count: number };
+
+export function findPaneByTabName(
+  payload: unknown,
+  name: string,
+): FindPaneResult {
+  const matches: ZellijPane[] = [];
+  const collect = (raw: unknown, tabNameHint?: string): void => {
+    if (raw == null || typeof raw !== "object") {
+      return;
+    }
+    const rec = raw as Record<string, unknown>;
+    const idRaw = rec.id;
+    const id =
+      typeof idRaw === "string"
+        ? idRaw
+        : typeof idRaw === "number"
+          ? `terminal_${idRaw}`
+          : null;
+    const tabNameField =
+      typeof rec.tab_name === "string" ? rec.tab_name : undefined;
+    const tab_name = tabNameField ?? tabNameHint;
+    if (id == null || tab_name == null) {
+      return;
+    }
+    if (tab_name !== name) {
+      return;
+    }
+    matches.push({
+      id,
+      tab_name,
+      tab_id: typeof rec.tab_id === "number" ? rec.tab_id : undefined,
+      terminal_command:
+        typeof rec.terminal_command === "string"
+          ? rec.terminal_command
+          : rec.terminal_command === null
+            ? null
+            : undefined,
+      exited: typeof rec.exited === "boolean" ? rec.exited : undefined,
+    });
+  };
+  if (Array.isArray(payload)) {
+    for (const entry of payload) {
+      collect(entry);
+    }
+  } else if (payload != null && typeof payload === "object") {
+    // Object-map shape: `{ "tab_name_1": [pane, pane], ... }`. The
+    // tab name comes from the key when the pane object lacks it.
+    for (const [key, value] of Object.entries(
+      payload as Record<string, unknown>,
+    )) {
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          collect(entry, key);
+        }
+      } else {
+        collect(value, key);
       }
     }
   }
-  return best >= 0 ? `terminal_${best}` : null;
+  if (matches.length === 0) {
+    return { found: "none" };
+  }
+  if (matches.length > 1) {
+    return { found: "multiple", count: matches.length };
+  }
+  const only = matches[0];
+  if (only == null) {
+    return { found: "none" };
+  }
+  return { found: "single", pane: only };
+}
+
+/**
+ * Parse the JSON stdout of `list-panes -a -j`. Returns `null` on
+ * empty/unparseable input — the caller treats `null` as "couldn't
+ * read the snapshot, leave it alone" and no-ops the close.
+ */
+export function parseListPanesJson(text: string): unknown {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -456,10 +504,10 @@ function delay(ms: number): Promise<void> {
 
 /**
  * Zellij backend factory. Lazily ensures the session ONCE (memoized
- * `Promise<void>` shared across every `launch` call), then runs
- * `action new-tab --cwd <abs> -- <argv>` and captures the bare-number
- * tab id from stdout. `close` runs `action close-tab-by-id <id>`. No
- * yabai (zellij owns its own layout).
+ * `Promise<void>` shared across every `launch`/`closeByName` call),
+ * then runs `action new-tab --cwd <abs> --name <name> -- <argv>` for
+ * launches and `action list-panes -a -j` + `close-pane -p <id>` for
+ * closes. No yabai (zellij owns its own layout).
  *
  * #3733 mitigation: after `attach -b <session>` returns, the server is
  * not necessarily ready for actions — the first `new-tab` can no-op
@@ -541,195 +589,94 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
     return sessionReady;
   }
 
-  /**
-   * Shared name-exact tab-live probe used by BOTH the public
-   * `isSurfaceLive` method (dispatch's surface-live gate) AND the
-   * `close` token guard. Ensures the session, queries `query-tab-names`,
-   * and matches `name` exactly (no substring hazard). Fail-closed: a
-   * null/non-zero probe resolves `true` so a probe error suppresses
-   * the caller's action — for dispatch that means "don't risk a
-   * duplicate worker", for close that means "don't risk leaving a
-   * live agent pane parked when zellij itself is uncertain".
-   */
-  async function isSurfaceLiveInternal(name: string): Promise<boolean> {
-    await ensureSession();
-    const res = await runCapture(buildZellijQueryTabNamesArgs(session));
-    if (res == null) {
-      deps.noteLine(
-        `# warn: zellij query-tab-names failed (binary missing?); treating surface "${name}" as live (fail-closed)`,
-      );
-      return true;
-    }
-    if (res.exitCode !== 0) {
-      deps.noteLine(
-        `# warn: zellij query-tab-names exited non-zero (${res.exitCode}); treating surface "${name}" as live (fail-closed)`,
-      );
-      return true;
-    }
-    return tabNameListed(res.stdout, name);
-  }
-
   return {
     async launch(
       argv: string[],
-      rowId: string,
-      dir: string,
-      opts?: LaunchOptions,
-    ): Promise<string | null> {
+      name: string,
+      cwd: string,
+    ): Promise<LaunchResult> {
       await ensureSession();
-      const args = buildZellijNewTabArgs(session, dir, argv, opts?.tabName);
+      const args = buildZellijNewTabArgs(session, cwd, argv, name);
       const res = await runCapture(args);
       if (res == null) {
-        deps.noteLine(
-          `# warn: zellij new-tab for ${rowId} failed (ENOENT? binary missing); window will not auto-close`,
-        );
-        return null;
+        const error = `zellij new-tab for ${name} failed (ENOENT? binary missing)`;
+        deps.noteLine(`# warn: ${error}`);
+        return { ok: false, error };
       }
       if (res.stderr.length > 0) {
-        deps.noteLine(`# launch stderr (${rowId}): ${res.stderr.trim()}`);
+        deps.noteLine(`# launch stderr (${name}): ${res.stderr.trim()}`);
       }
-      const tabId = res.stdout.trim();
-      if (res.exitCode === 0 && tabId.length > 0) {
-        // Resolve the just-created agent pane id for the load-bearing
-        // surgical close path. The single settling slot upstream
-        // guarantees launches are serialized, so `newestTerminalPaneId`
-        // reliably picks the just-spawned pane (zellij's pane ids are a
-        // process-global monotonic counter).
-        const panes = await runCapture(buildZellijListPanesArgs(session));
-        const paneId =
-          panes != null ? newestTerminalPaneId(panes.stdout) : null;
-        // First launch after a fresh mint: reap the orphaned default
-        // `Tab #1` now that the agent tab exists, leaving a single named
-        // agent tab. Done AFTER the agent tab is confirmed so the session
-        // never drops to zero tabs (which would exit it). One-shot.
-        if (pendingOrphanTabId != null) {
-          await runCapture(
-            buildZellijCloseTabArgs(session, pendingOrphanTabId),
-          );
-          pendingOrphanTabId = null;
-        }
-        // Return the pane id — NOT the tab id. The autopilot caller
-        // persists this as the dispatch.log `windowId` and feeds it to
-        // `close-pane -p` for the surgical reap. Returning `null` on
-        // parse failure (rather than the tab id) is load-bearing: a
-        // tab id fed to `close-pane -p` cannot act and would leave a
-        // parked un-closeable pane. Null falls through the existing
-        // `closeWindow(undefined → no-op)` contract — the human can
-        // close the pane manually.
-        if (paneId == null) {
-          deps.noteLine(
-            `# warn: zellij list-panes returned no terminal pane for ${rowId}; pane will not auto-close`,
-          );
-        }
-        return paneId;
+      if (res.exitCode !== 0) {
+        const error = `zellij new-tab for ${name} exited non-zero (${res.exitCode})`;
+        deps.noteLine(`# warn: ${error}`);
+        return { ok: false, error };
+      }
+      // First launch after a fresh mint: reap the orphaned default
+      // `Tab #1` now that the agent tab exists, leaving a single named
+      // agent tab. Done AFTER the agent tab is confirmed so the session
+      // never drops to zero tabs (which would exit it). One-shot.
+      if (pendingOrphanTabId != null) {
+        await runCapture(buildZellijCloseTabArgs(session, pendingOrphanTabId));
+        pendingOrphanTabId = null;
+      }
+      return { ok: true };
+    },
+    async closeByName(name: string): Promise<void> {
+      await ensureSession();
+      const res = await runCapture(buildZellijListPanesAllJsonArgs(session));
+      if (res == null) {
+        deps.noteLine(
+          `# warn: zellij list-panes for closeByName(${name}) failed (binary missing?); leaving surface open`,
+        );
+        return;
       }
       if (res.exitCode !== 0) {
         deps.noteLine(
-          `# warn: zellij new-tab for ${rowId} exited non-zero (${res.exitCode}); window will not auto-close`,
-        );
-      }
-      return null;
-    },
-    close(windowId: string, tabName?: string): void {
-      // Surgical pane-level close, wrap-safe across `zellij --server`
-      // restarts. Three skip-conditions land us in "leave the pane
-      // open" — always the safe direction, since reaping the WRONG
-      // live pane (a recycled pane id from a different server lifetime
-      // mapping to whatever live pane currently owns `terminal_<N>`)
-      // is unrecoverable.
-      //
-      //   1. Pre-upgrade `dispatch.log` rows carry the old
-      //      `close-tab-by-id`-era tab id (a bare-numeric string like
-      //      "7") in `windowId`. Feeding a tab id to `close-pane -p`
-      //      is guaranteed to no-op AND would leave a parked tab
-      //      regardless, so we skip on shape.
-      //   2. Missing `tabName` (also a pre-upgrade signal — the
-      //      `kind:"window"` row didn't carry the name when it was
-      //      written, fold landed before the field existed) means
-      //      we have no token to verify against. Skip; fail-safe.
-      //   3. The named tab is no longer live in the current server.
-      //      A server restart between launch and close blows away the
-      //      `verb::id` tab AND resets the pane-id counter. Skip;
-      //      `isSurfaceLive` is the same name-exact gate the dispatch
-      //      side uses (`tabNameListed` exact match — no substring
-      //      hazard) and shares its fail-closed behavior (an
-      //      indeterminate probe reports live → close DOES fire,
-      //      matching dispatch's "indeterminate → don't risk
-      //      duplicate" precedent).
-      //
-      // The check fires asynchronously; the `close` method itself
-      // stays sync to honor the existing fire-and-forget contract.
-      if (!/^terminal_\d+$/.test(windowId)) {
-        deps.noteLine(
-          `# closeWindow skipped (pre-upgrade tab-id-shaped windowId ${windowId}); leaving surface open — close manually`,
+          `# warn: zellij list-panes for closeByName(${name}) exited non-zero (${res.exitCode}); leaving surface open`,
         );
         return;
       }
-      if (tabName == null || tabName === "") {
+      const payload = parseListPanesJson(res.stdout);
+      if (payload == null) {
         deps.noteLine(
-          `# closeWindow skipped (missing tabName token for ${windowId}); leaving surface open — close manually`,
+          `# warn: zellij list-panes for closeByName(${name}) returned empty/unparseable JSON; leaving surface open`,
         );
         return;
       }
-      // Anchor: bind the backend reference once so the async closure
-      // below survives a hypothetical re-entry without `this` games.
-      void (async () => {
-        // Token guard: name-exact tab-live check. A server restart
-        // between launch and close blows the named tab away (and
-        // recycles the pane-id counter), so this probe is the wrap-
-        // safety bar. `isSurfaceLive` fail-closes (probe error →
-        // `true`) so an indeterminate read prefers a missed-stale-
-        // close (`close-pane -p` against an unknown id no-ops via
-        // stderr→noteLine, the existing close contract) over leaving
-        // a live agent pane parked.
-        if (!(await isSurfaceLiveInternal(tabName))) {
-          deps.noteLine(
-            `# closeWindow skipped (token mismatch: tab "${tabName}" not live; ${windowId} likely belongs to a recycled server lifetime) — leaving any surviving surface open`,
-          );
-          return;
-        }
-        const args = buildZellijClosePaneArgs(session, windowId);
-        try {
-          const proc = spawn(args, {
-            stdout: "ignore",
-            stderr: "pipe",
-            stdin: "ignore",
-          });
-          Promise.all([proc.exited, streamToText(proc.stderr)])
-            .then(([_exitCode, stderrText]) => {
-              if (stderrText.length > 0) {
-                deps.noteLine(
-                  `# closeWindow stderr (${windowId}): ${stderrText.trim()}`,
-                );
-              }
-            })
-            .catch((err) => {
-              deps.noteLine(
-                `# warn: closeWindow spawn (${windowId}) failed: ${(err as Error).message}`,
-              );
-            });
-        } catch (err) {
-          deps.noteLine(
-            `# warn: closeWindow spawn (${windowId}) failed: ${(err as Error).message}`,
-          );
-        }
-      })();
-    },
-    async isSurfaceLive(name: string): Promise<boolean> {
-      // Name-exact live-surface gate. Delegates to the shared internal
-      // probe; the same primitive backs the `close` token guard. See
-      // `isSurfaceLiveInternal`'s docstring for the fail-closed
-      // rationale (probe error → `true` → caller suppresses its side
-      // effect, the safe direction for both dispatch and close).
-      return isSurfaceLiveInternal(name);
+      const match = findPaneByTabName(payload, name);
+      if (match.found === "none") {
+        deps.noteLine(
+          `# closeByName(${name}): no pane with tab_name=${name} found (already gone?); nothing to do`,
+        );
+        return;
+      }
+      if (match.found === "multiple") {
+        deps.noteLine(
+          `# warn: closeByName(${name}): ${match.count} panes match tab_name=${name} (dedup invariant violated?); refusing to guess, leaving surfaces open`,
+        );
+        return;
+      }
+      const args = buildZellijClosePaneArgs(session, match.pane.id);
+      const closeRes = await runCapture(args);
+      if (closeRes == null) {
+        deps.noteLine(
+          `# warn: closeByName(${name}) close-pane spawn failed (binary missing?)`,
+        );
+        return;
+      }
+      if (closeRes.stderr.length > 0) {
+        deps.noteLine(
+          `# closeByName(${name}) stderr: ${closeRes.stderr.trim()}`,
+        );
+      }
     },
   };
 }
 
 /**
  * Resolve the exec backend. Zellij is the only backend; the function
- * is retained as a thin seam so the call site in cli/autopilot.ts (and
- * future alternative backends) keep one stable entry point.
+ * is retained as a thin seam so the reconciler call site (and future
+ * alternative backends) keep one stable entry point.
  */
 export function resolveExecBackend(deps: ResolveExecBackendDeps): ExecBackend {
   return createZellijBackend({
