@@ -3636,12 +3636,31 @@ test("ON CONFLICT carve-out: a re-UsageSnapshot does NOT clobber a prior rate-li
   expect(row.last_rate_limit_session_id).toBe("sess-B");
 });
 
-test("'' sentinel never joins a usage row (fn-642)", () => {
-  // A default-`~/.claude` session (NULL config_dir → '' sentinel) seeds the
-  // '' profile row with profile_name=''. An agentuse profile whose id is
-  // literally "" cannot exist (`<id>.json` with empty basename is impossible
-  // on disk), and the join is guarded `profile_name != ''` so even if a
-  // pathological usage row with id='' existed, it would NOT participate.
+test("literal usage.id='' stays non-joinable — directional mapping is one-way (fn-662)", () => {
+  // The v42 (fn-662) `''↔'default'` mapping is DIRECTIONAL — the helper
+  // translates `''` → `'default'` (forward, profile→usage) and
+  // `'default'` → `''` (reverse, usage→profile), but NEVER `''` → `''`. So a
+  // pathological literal `usage.id=''` cannot join the `''` profile row.
+  //
+  // In steady state this is moot — `projectUsageRow`'s early empty-string
+  // guard rejects any event whose session_id is empty, so no usage row
+  // with id='' ever exists. This test asserts the early-guard's no-mint
+  // behavior is preserved (the concrete invariant from the pre-v42 test
+  // it replaces) AND that the `''` profile row's rate-limit annotation
+  // colocates onto `usage.default` via the forward fan-out's mapping.
+  // Seed `usage.default` first so the forward UPDATE has a row to land on.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 2.0,
+      session_resets_at: "T1",
+      week_percent: 2.0,
+      week_resets_at: "T2",
+    }),
+  });
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-default",
@@ -3649,8 +3668,9 @@ test("'' sentinel never joins a usage row (fn-642)", () => {
   });
   insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-default" });
   insertEvent({ hook_event: "RateLimited", session_id: "sess-default" });
-  // A pathological usage row with id='' is constructed to assert the guard
-  // (a defensive sanity check — in real usage agentuse cannot mint this).
+  // A pathological UsageSnapshot with session_id='' — agentuse cannot mint
+  // this in practice (`<id>.json` with empty basename is impossible on
+  // disk), but the early guard must reject it regardless.
   insertEvent({
     hook_event: "UsageSnapshot",
     session_id: "",
@@ -3664,15 +3684,15 @@ test("'' sentinel never joins a usage row (fn-642)", () => {
     }),
   });
   drainAll();
-  // The empty-string event.session_id is rejected by projectUsageRow's
-  // early null/empty-id guard (existing behavior, not v35) — so no row
-  // is minted in the first place. Sanity: no usage row exists.
-  const usageCount = (
-    db.query("SELECT COUNT(*) AS n FROM usage").get() as { n: number }
-  ).n;
-  expect(usageCount).toBe(0);
-  // The '' profile row was stamped with the rate-limit, but it did NOT
-  // cross-contaminate any usage row (because none exist).
+  // Sanity: no `usage.id=''` row was minted (empty session_id rejected by
+  // projectUsageRow's early guard).
+  const emptyIdRow = db.query("SELECT id FROM usage WHERE id = ''").get() as {
+    id: string;
+  } | null;
+  expect(emptyIdRow).toBeNull();
+  // The `''` profile row was stamped with the rate-limit (existing v33
+  // behavior). The v42 forward mapping additionally colocates it onto
+  // `usage.default`.
   const profileRow = db
     .query(
       "SELECT profile_name, last_rate_limit_session_id FROM profiles WHERE config_dir = ''",
@@ -3683,6 +3703,197 @@ test("'' sentinel never joins a usage row (fn-642)", () => {
   };
   expect(profileRow.profile_name).toBe("");
   expect(profileRow.last_rate_limit_session_id).toBe("sess-default");
+  // The seeded `usage.default` row carries the colocated annotation —
+  // v42's whole point.
+  const defaultRow = db
+    .query(
+      "SELECT last_rate_limit_at, last_rate_limit_session_id FROM usage WHERE id = 'default'",
+    )
+    .get() as {
+    last_rate_limit_at: number | null;
+    last_rate_limit_session_id: string | null;
+  };
+  expect(defaultRow.last_rate_limit_at).not.toBeNull();
+  expect(defaultRow.last_rate_limit_session_id).toBe("sess-default");
+});
+
+test("forward fan-out: NULL-config RateLimited colocates onto usage.default via '' → 'default' mapping (fn-662)", () => {
+  // The early-proof-point test for v42 (fn-662). A default-`~/.claude`
+  // session (NULL config_dir → `''` sentinel) hits a rate limit; the
+  // v42 forward mapping translates `''` → `"default"` so the existing
+  // `usage.default` row picks up `last_rate_limit_at`.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 15.0,
+      session_resets_at: "T1",
+      week_percent: 5.0,
+      week_resets_at: "T2",
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-default-fwd",
+    config_dir: null,
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-default-fwd",
+  });
+  const rlId = insertEvent({
+    hook_event: "RateLimited",
+    session_id: "sess-default-fwd",
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT last_rate_limit_at, last_rate_limit_session_id, last_event_id FROM usage WHERE id = 'default'",
+    )
+    .get() as {
+    last_rate_limit_at: number | null;
+    last_rate_limit_session_id: string | null;
+    last_event_id: number;
+  };
+  expect(row.last_rate_limit_at).not.toBeNull();
+  expect(row.last_rate_limit_session_id).toBe("sess-default-fwd");
+  // last_event_id bumped to the rate-limit event id (descriptor diff fires).
+  expect(row.last_event_id).toBe(rlId);
+});
+
+test("reverse fan-out: 'default' UsageSnapshot pulls the '' profiles annotation via 'default' → '' mapping (fn-662)", () => {
+  // The mirror direction. A NULL-config rate limit stamps the `''` profile
+  // row's annotation FIRST (no usage.default row yet); then a `default`
+  // UsageSnapshot lands and the reverse fan-out's post-UPSERT SELECT
+  // translates `'default'` → `''` to pull the annotation onto `usage.default`.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-default-rev",
+    config_dir: null,
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-default-rev",
+  });
+  insertEvent({
+    hook_event: "RateLimited",
+    session_id: "sess-default-rev",
+  });
+  // Now the UsageSnapshot for the default account lands.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 1,
+      session_percent: 25.0,
+      session_resets_at: "T1",
+      week_percent: 5.0,
+      week_resets_at: "T2",
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT last_rate_limit_at, last_rate_limit_session_id FROM usage WHERE id = 'default'",
+    )
+    .get() as {
+    last_rate_limit_at: number | null;
+    last_rate_limit_session_id: string | null;
+  };
+  expect(row.last_rate_limit_at).not.toBeNull();
+  expect(row.last_rate_limit_session_id).toBe("sess-default-rev");
+});
+
+test("from-scratch re-fold reproduces v42 default-mapped usage + profiles byte-identically (fn-662)", () => {
+  // Re-fold determinism across the v42 mapping. Mix default-profile and
+  // named-profile events in both forward and reverse orderings, then
+  // rewind + wipe + re-drain and assert byte-identical projections.
+  // (a) forward: usage.default exists, NULL-config SessionStart, RateLimited.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 7.0,
+      session_resets_at: "T1",
+      week_percent: 3.0,
+      week_resets_at: "T2",
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-default-fwd-rf",
+    config_dir: null,
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-default-fwd-rf",
+  });
+  insertEvent({
+    hook_event: "RateLimited",
+    session_id: "sess-default-fwd-rf",
+  });
+  // (b) reverse: default RateLimited lands BEFORE a default UsageSnapshot.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-default-rev-rf",
+    config_dir: null,
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-default-rev-rf",
+  });
+  insertEvent({
+    hook_event: "RateLimited",
+    session_id: "sess-default-rev-rf",
+  });
+  // (c) named profile mixed in — assert the mapping is one-way and named
+  // profiles still route to their own usage row, not to default.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "multi-claude-3",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 20,
+      session_percent: 12.0,
+      session_resets_at: "T1",
+      week_percent: 4.0,
+      week_resets_at: "T2",
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-named",
+    config_dir: "/Users/x/.claude-profiles/multi-claude-3",
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-named" });
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-named" });
+  drainAll();
+  const beforeUsage = db.query("SELECT * FROM usage ORDER BY id ASC").all();
+  const beforeProfiles = db
+    .query("SELECT * FROM profiles ORDER BY config_dir ASC")
+    .all();
+  // Sanity: default-account annotation actually landed on usage.default,
+  // not on usage with id='' (a pre-v42 regression check).
+  const defaultRow = db
+    .query("SELECT last_rate_limit_session_id FROM usage WHERE id = 'default'")
+    .get() as { last_rate_limit_session_id: string | null };
+  expect(defaultRow.last_rate_limit_session_id).not.toBeNull();
+  // Rewind + wipe + re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM usage");
+  db.run("DELETE FROM profiles");
+  drainAll();
+  const afterUsage = db.query("SELECT * FROM usage ORDER BY id ASC").all();
+  const afterProfiles = db
+    .query("SELECT * FROM profiles ORDER BY config_dir ASC")
+    .all();
+  expect(afterUsage).toEqual(beforeUsage);
+  expect(afterProfiles).toEqual(beforeProfiles);
 });
 
 test("from-scratch re-fold reproduces usage + profiles projections byte-identically (fn-642)", () => {

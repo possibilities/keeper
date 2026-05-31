@@ -896,27 +896,38 @@ shape). The `EpicSnapshot` ON CONFLICT carve-out widens to include
 `created_by_closer_of` / `sort_path` / `queue_jump` so a file-content
 re-observation (e.g. an approval-RPC round-trip) can't wipe the
 projection-derived dep resolution.
-As of schema v35 (fn-642), the `usage` projection colocates the
-Claude rate-limit annotation: `last_rate_limit_at` +
-`last_rate_limit_session_id` are populated server-side by a
-bidirectional fan-out against the matching `profiles` row, joined on
-the derived `profile_name = projectBasename(config_dir)` column
-(`profiles.profile_name = usage.id`). The forward direction lives in the
-`RateLimited` / `ApiError(kind='rate_limit')` arm — a pure UPDATE
-against `usage WHERE id = <profile_name>` (never UPSERT, so a
-rate-limit on a profile agentuse isn't tracking does NOT mint a
+As of schema v35 (fn-642, corrected at v42/fn-662), the `usage`
+projection colocates the Claude rate-limit annotation:
+`last_rate_limit_at` + `last_rate_limit_session_id` are populated
+server-side by a bidirectional fan-out against the matching `profiles`
+row, joined on the derived `profile_name = projectBasename(config_dir)`
+column (`profiles.profile_name = usage.id`). The forward direction
+lives in the `RateLimited` / `ApiError(kind='rate_limit')` arm — a
+pure UPDATE against `usage WHERE id = <profile_name>` (never UPSERT, so
+a rate-limit on a profile agentuse isn't tracking does NOT mint a
 phantom usage row). The reverse direction lives in `projectUsageRow`:
 the existing UPSERT carves the two rate-limit columns OUT of the
 `ON CONFLICT(id) DO UPDATE SET` clause (so a re-snapshot can't clobber
 the annotation), then a post-UPSERT SELECT against `profiles` pulls
-the current state forward. Both directions guard `profile_name != ''`
-so the `''` sentinel (default `~/.claude`, basename `""`) never
-cross-contaminates the join. The `profile_name` derivation is
-byte-identical at the SessionStart seed, the dual-case UPSERT, and the
-v34→v35 one-time migrate backfill — re-fold determinism converges.
-The colocation drops `scripts/usage.ts`'s "Rate limits by profile"
-block: each tracked profile's usage stack now carries a `rate-limited
-<rel>` line off the same row; untracked profiles render no rate-limit
+the current state forward. The shared directional mapping helper pair
+(`usageIdForProfileName` / `profileNameForUsageId` in
+`src/epic-deps.ts`, schema v42/fn-662) translates keeper's `''`
+default-profile sentinel (default `~/.claude`, basename `""`) to
+agentuse's `"default"` usage id at the join boundary in both directions:
+forward `''` → `'default'` colocates a default-account rate limit onto
+`usage.default`; reverse `'default'` → `''` pulls the `''` profile
+row's annotation onto `usage.default` on a re-snapshot. The mapping
+is one-way at each direction (`''` never maps to `''`), so a
+pathological literal `usage.id=''` stays non-joinable — the
+cross-contamination the original v35 `!= ''` guard prevented is now
+structurally impossible by mapping direction, and the `'default'`
+literal lives in exactly one place (the helper). The `profile_name`
+derivation is byte-identical at the SessionStart seed, the dual-case
+UPSERT, and the v34→v35 one-time migrate backfill — re-fold
+determinism converges. The colocation drops `scripts/usage.ts`'s
+"Rate limits by profile" block: each tracked profile's usage stack
+(including the default account) now carries a `rate-limited <rel>`
+line off the same row; untracked profiles render no rate-limit
 annotation.
 As of schema v37 (fn-643), keeper recovers dropped hook events instead
 of silently losing them. The hook's `events` INSERT gains a bounded retry
@@ -1169,7 +1180,7 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT * FROM usage ORDER BY target, id'
 
-# Profiles projection — schema v33 (fn-639). One row per Claude profile directory keyed by config_dir (the CLAUDE_CONFIG_DIR env value captured at SessionStart; the '' sentinel collapses default ~/.claude). Quiet profiles render with NULL last_rate_limit_at; a rate_limit stamps (last_rate_limit_at, last_rate_limit_session_id) keyed on the same COALESCE(config_dir,'') expression as the SessionStart seed so a NULL-config session's rate limit lands on the exact '' row it seeded:
+# Profiles projection — schema v33 (fn-639). One row per Claude profile directory keyed by config_dir (the CLAUDE_CONFIG_DIR env value captured at SessionStart; the '' sentinel collapses default ~/.claude). Quiet profiles render with NULL last_rate_limit_at; a rate_limit stamps (last_rate_limit_at, last_rate_limit_session_id) keyed on the same COALESCE(config_dir,'') expression as the SessionStart seed so a NULL-config session's rate limit lands on the exact '' row it seeded. v42 (fn-662): the v35 bidirectional fan-out now colocates the '' row's annotation onto usage.default via the shared usageIdForProfileName/profileNameForUsageId mapping in src/epic-deps.ts, so a default-account rate limit renders on `keeper usage`:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT config_dir, datetime(last_rate_limit_at,'unixepoch','localtime') AS last_rl_at, last_rate_limit_session_id FROM profiles ORDER BY config_dir ASC"
 

@@ -116,7 +116,13 @@ import {
   parsePlanRef,
   planVerbRefFromSpawnName,
 } from "./derivers";
-import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
+import {
+  epicIsCompleted,
+  profileNameForUsageId,
+  projectBasename,
+  resolveEpicDep,
+  usageIdForProfileName,
+} from "./epic-deps";
 import {
   type ClassifierInvocation,
   computePlanWindows,
@@ -2534,14 +2540,27 @@ function projectUsageRow(db: Database, event: Event): void {
       event.ts,
     ],
   );
-  // Schema v35 (fn-642): reverse fan-out. Pull the current rate-limit
-  // annotation from the matching `profiles` row and stamp it onto the just-
-  // UPSERTed usage row. The join key is `profiles.profile_name = usage.id`,
-  // guarded `profile_name != ''` so the `''` sentinel never joins. NULL-safe:
-  // a missing/quiet profile row leaves the columns NULL (`SELECT ... LIMIT 1`
-  // returns null → both bindings are NULL → the UPDATE writes NULLs, which
-  // is the correct zero-event shape). A later `RateLimited` will populate
-  // them via the forward fan-out.
+  // Schema v35 (fn-642), corrected at v42 (fn-662): reverse fan-out. Pull
+  // the current rate-limit annotation from the matching `profiles` row and
+  // stamp it onto the just-UPSERTed usage row. The join key is
+  // `profiles.profile_name = profileNameForUsageId(usage.id)` — v42's
+  // shared directional mapping translates agentuse's `"default"` usage id
+  // to keeper's `''` default-profile sentinel at the join boundary, so a
+  // `default` UsageSnapshot reads the `''` profile row's annotation. Every
+  // other usage id passes through unchanged. NULL-safe: a missing/quiet
+  // profile row leaves the columns NULL (`SELECT ... LIMIT 1` returns null
+  // → both bindings are NULL → the UPDATE writes NULLs, which is the
+  // correct zero-event shape). A later `RateLimited` will populate them
+  // via the forward fan-out.
+  //
+  // The pre-v42 `WHERE profile_name != ''` guard is gone: the reverse
+  // direction is one-way (`'default'` → `''`, never `''` → `''`), so a
+  // pathological literal `usage.id=''` would resolve to
+  // `profile_name=''` ONLY if the helper mapped it that way — it does
+  // not. And `projectUsageRow` rejects an empty `event.session_id` at
+  // the early guard above, so the SELECT can never see `id===''` in
+  // steady state. The cross-contamination the original guard prevented
+  // is now structurally impossible by the mapping direction.
   //
   // Pure function of the fold inputs + the in-transaction `profiles` row —
   // no `Date.now`/env/OS reads. Re-fold determinism: events fold in id
@@ -2554,9 +2573,9 @@ function projectUsageRow(db: Database, event: Event): void {
     .query(
       `SELECT last_rate_limit_at, last_rate_limit_session_id
          FROM profiles
-        WHERE profile_name = ? AND profile_name != ''`,
+        WHERE profile_name = ?`,
     )
-    .get(id) as {
+    .get(profileNameForUsageId(id)) as {
     last_rate_limit_at: number | null;
     last_rate_limit_session_id: string | null;
   } | null;
@@ -5211,10 +5230,20 @@ function projectJobsRow(db: Database, event: Event): void {
           // pull the rate-limit annotation back via the reverse fan-out
           // (the `projectUsageRow` post-UPSERT SELECT).
           //
-          // `WHERE id = <profile_name> AND profile_name != ''` keeps the
-          // `''` sentinel (default `~/.claude`, basename `""`) from
-          // ever joining a usage row whose id happens to be `""`. The
-          // `last_event_id` bump is load-bearing — the descriptor's
+          // Schema v42 (fn-662) mapping: `usageIdForProfileName` translates
+          // the `''` default-profile sentinel (default `~/.claude`, basename
+          // `""`) to agentuse's `"default"` usage id at the join boundary,
+          // so a default-account rate limit colocates on `usage.default`
+          // instead of stranding on the unjoinable `''` profile row. Every
+          // other profile name passes through unchanged — a named profile
+          // still binds to `WHERE id = <profile_name>`. A pathological
+          // literal `usage.id=''` is NOT cross-contaminated: an empty
+          // `event.session_id` is rejected by `projectUsageRow`'s early
+          // empty-string guard up the call stack, so no `usage.id=''` row
+          // ever exists in steady state — and the mapping is one-way (`''`
+          // forward → `'default'`), never `''` → `''`.
+          //
+          // The `last_event_id` bump is load-bearing — the descriptor's
           // version column drives the wire diff; without the bump the
           // subscribe wouldn't fire and the UI would stay stale.
           //
@@ -5236,17 +5265,16 @@ function projectJobsRow(db: Database, event: Event): void {
           // and let a stale rate-limit event clobber a fresh percentage
           // fold's freshness stamp.
           const profileName = projectBasename(profileRow.config_dir);
-          if (profileName !== "") {
-            db.run(
-              `UPDATE usage
-                  SET last_rate_limit_at = ?,
-                      last_rate_limit_session_id = ?,
-                      last_event_id = ?,
-                      updated_at = ?
-                WHERE id = ?`,
-              [ts, jobId, event.id, ts, profileName],
-            );
-          }
+          const usageId = usageIdForProfileName(profileName);
+          db.run(
+            `UPDATE usage
+                SET last_rate_limit_at = ?,
+                    last_rate_limit_session_id = ?,
+                    last_event_id = ?,
+                    updated_at = ?
+              WHERE id = ?`,
+            [ts, jobId, event.id, ts, usageId],
+          );
         }
       }
       break;

@@ -68,9 +68,15 @@ from pathlib import Path
 # time + freshness) adds two nullable columns to ``usage`` only
 # (``rate_limit_lifts_at TEXT`` + ``last_usage_fold_at REAL``) — keeper-py
 # does not read ``usage``, so the bump is whitelist-only with no reader
-# logic change.
+# logic change; v42 (fn-662 ``''↔'default'`` directional mapping) is a
+# fold-output change (the v35 rate-limit fan-out now colocates the
+# default-profile annotation onto ``usage.default`` via a shared pure
+# helper, fixing an invisible default-account rate limit) gated on a
+# rewind-and-redrain — no shape change to any table keeper-py reads (it
+# reads neither ``usage`` nor ``profiles``), so the bump is whitelist-only
+# with no reader logic change.
 # Bump this set when a keeper schema change alters those tables.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42})
 
 
 class KeeperError(Exception):
@@ -330,8 +336,7 @@ def get_session_for_pid(pid: int) -> str | None:
     try:
         _check_schema(conn)
         row = conn.execute(
-            "SELECT job_id FROM jobs WHERE pid = ? "
-            "ORDER BY updated_at DESC LIMIT 1",
+            "SELECT job_id FROM jobs WHERE pid = ? ORDER BY updated_at DESC LIMIT 1",
             (pid,),
         ).fetchone()
         return row[0] if row is not None else None
@@ -360,8 +365,7 @@ def get_latest_session() -> dict | None:
     try:
         _check_schema(conn)
         row = conn.execute(
-            "SELECT job_id, cwd, title FROM jobs "
-            "ORDER BY updated_at DESC LIMIT 1"
+            "SELECT job_id, cwd, title FROM jobs ORDER BY updated_at DESC LIMIT 1"
         ).fetchone()
         if row is None:
             return None

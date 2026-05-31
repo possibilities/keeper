@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 41;
+export const SCHEMA_VERSION = 42;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -4139,6 +4139,56 @@ function migrate(db: Database): void {
     // (pure index swap — fold results, and thus re-fold determinism, unchanged).
     db.run("DROP INDEX IF EXISTS idx_events_tool_file_path");
     db.run("DROP INDEX IF EXISTS idx_events_bash_mutation_kind");
+
+    // v41→v42: fn-662 — shared directional mapping between keeper's `''`
+    // default-profile sentinel and agentuse's `"default"` usage id. The
+    // v35/fn-642 bidirectional rate-limit fan-out joined `usage.id =
+    // profiles.profile_name` with both arms guarding `profile_name != ''`,
+    // so a default-account rate limit never colocated onto `usage.default`
+    // — the `keeper usage` TUI rendered no `rate-limited` line for the
+    // default `~/.claude` profile even when the account was hard-rate-
+    // limited. v42 fixes both arms via a single pure helper
+    // (`usageIdForProfileName` / `profileNameForUsageId` in
+    // `src/epic-deps.ts`) that translates `''↔'default'` at the join
+    // boundary.
+    //
+    // No schema-shape change: this bump exists to gate the rewind-and-
+    // redrain that backfills the historically-stranded annotations.
+    // Same justification as v39/fn-648 (the deriver's output changed,
+    // stored projections are stale until re-derived). Future SCHEMA_VERSION
+    // bumps without column shape changes are legitimate when the reducer's
+    // fold output changed for stored events.
+    //
+    // The version-guarded rewind below mirrors v17→v18 / v18→v19's shape
+    // (cursor reset + DELETE projections in the same `.immediate()`
+    // transaction as the version stamp). A re-open of an already-migrated
+    // v42+ DB skips it (`preMigrateStoredVersion < 42`). The boot drain
+    // after migrate() returns re-folds the full event log through the v42
+    // reducer logic, healing the stranded annotation so a default-account
+    // RateLimited event colocates onto `usage.default`.
+    //
+    // Scope of the DELETE: the standard projection set the v39 rewind
+    // sweeps (jobs / epics / git_status / file_attributions /
+    // subagent_invocations) PLUS `usage` + `profiles`. The fold-output
+    // change is in those two projections, so wiping them is what makes the
+    // re-fold byte-identical-determinism-safe. The boot drain rebuilds
+    // both from `UsageSnapshot` / `RateLimited` / `ApiError` /
+    // `SessionStart` events in id order.
+    //
+    // MUST NOT touch `dead_letters`: that table is NOT a reducer projection
+    // (per CLAUDE.md "Migrations are forward-only" — `dead_letters` is the
+    // audit log of events that NEVER made it into the event log to be
+    // folded, so a re-fold cannot reproduce them).
+    if (preMigrateStoredVersion < 42) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM git_status");
+      db.run("DELETE FROM file_attributions");
+      db.run("DELETE FROM subagent_invocations");
+      db.run("DELETE FROM usage");
+      db.run("DELETE FROM profiles");
+    }
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -127,27 +127,39 @@ the native value" is the default.
   byte-identical derivation is preserved across seed, UPSERT, backfill,
   and re-fold. The `profile_name` column is the join key against
   `usage.id` for the schema-v35 bidirectional usage↔profiles rate-limit
-  fan-out.) AND the schema-v35 (fn-642) bidirectional `usage`↔`profiles`
-  rate-limit fan-out: the `RateLimited`/`ApiError(kind='rate_limit')`
-  arm, after the existing `profiles` UPSERT, runs a pure
+  fan-out.) AND the schema-v35 (fn-642, corrected at v42/fn-662)
+  bidirectional `usage`↔`profiles` rate-limit fan-out: the
+  `RateLimited`/`ApiError(kind='rate_limit')` arm, after the existing
+  `profiles` UPSERT, runs a pure
   `UPDATE usage SET last_rate_limit_at=?, last_rate_limit_session_id=?,
   last_event_id=<event.id>, updated_at=? WHERE id =
-  projectBasename(config_dir)` — pure UPDATE, never UPSERT (a rate-limit
-  must NOT mint a phantom usage row for a profile agentuse isn't
-  tracking; `usage` is canonical for "tracked profiles"). The reverse
-  direction lives in `projectUsageRow`: the existing UPSERT carves
-  `last_rate_limit_at` + `last_rate_limit_session_id` OUT of the
-  `ON CONFLICT(id) DO UPDATE SET` clause (mirroring the `EpicSnapshot`
-  carve-out so a re-snapshot can't clobber the rate-limit annotation),
-  then a post-UPSERT
+  usageIdForProfileName(projectBasename(config_dir))` — pure UPDATE,
+  never UPSERT (a rate-limit must NOT mint a phantom usage row for a
+  profile agentuse isn't tracking; `usage` is canonical for "tracked
+  profiles"). The reverse direction lives in `projectUsageRow`: the
+  existing UPSERT carves `last_rate_limit_at` +
+  `last_rate_limit_session_id` OUT of the `ON CONFLICT(id) DO UPDATE
+  SET` clause (mirroring the `EpicSnapshot` carve-out so a re-snapshot
+  can't clobber the rate-limit annotation), then a post-UPSERT
   `SELECT last_rate_limit_at, last_rate_limit_session_id FROM profiles
-  WHERE profile_name = <usage.id> AND profile_name != ''` re-stamps the
+  WHERE profile_name = profileNameForUsageId(<usage.id>)` re-stamps the
   pair from the matching profiles row — NULL-safe when no row matches
-  (a later RateLimited fans them in via the forward path). Both
-  directions guard `profile_name != ''` so the `''` sentinel (default
-  `~/.claude`, basename `""`) never cross-contaminates the join. The
-  `last_event_id` bump on the forward UPDATE is load-bearing — it is
-  the descriptor's `version` column; without the bump the wire diff
+  (a later RateLimited fans them in via the forward path). The shared
+  directional mapping helper pair (`usageIdForProfileName` /
+  `profileNameForUsageId`, `src/epic-deps.ts`, schema v42/fn-662)
+  translates keeper's `''` default-profile sentinel (default
+  `~/.claude`, basename `""`) to agentuse's `"default"` usage id at the
+  join boundary in both directions: forward `''` → `'default'` colocates
+  a default-account rate limit onto `usage.default`; reverse `'default'`
+  → `''` pulls the `''` profile row's annotation onto `usage.default` on
+  a re-snapshot. The mapping is one-way at each direction (`''` never
+  maps to `''`), so a pathological literal `usage.id=''` stays
+  non-joinable — the cross-contamination the original v35 `!= ''`
+  guard prevented is now structurally impossible by mapping direction.
+  The `'default'` literal lives in exactly one place (the helper); a
+  second inline occurrence is the drift bug the v42 redesign closes.
+  The `last_event_id` bump on the forward UPDATE is load-bearing — it
+  is the descriptor's `version` column; without the bump the wire diff
   would not fire and the UI wouldn't refresh.) AND the schema-v36
   `jobs.profile_name` stamp: the SessionStart jobs UPSERT — the only arm
   that writes `jobs.config_dir` — also stamps the derived
@@ -363,7 +375,33 @@ the native value" is the default.
   NOT a floor/ceiling, so an additive bump keeper-py never reads (e.g. a
   `usage`-only column) still must be listed. The `test/schema-version.test.ts`
   assertion enforces this: it reads `SCHEMA_VERSION` and fails the build unless
-  the frozenset's max covers it. Current version: **v41** (fn-651 —
+  the frozenset's max covers it. Current version: **v42** (fn-662 —
+  shared directional mapping between keeper's `''` default-profile
+  sentinel and agentuse's `"default"` usage id, via the pure helper
+  pair `usageIdForProfileName` / `profileNameForUsageId` in
+  `src/epic-deps.ts`. The v35/fn-642 bidirectional rate-limit
+  fan-out joined `usage.id = profiles.profile_name` with both arms
+  guarding `profile_name != ''`, which stranded the default-account
+  annotation on the unjoinable `''` profile row — `keeper usage`
+  rendered no `rate-limited` line for a hard-rate-limited
+  `~/.claude` account. v42 wires the helper into both arms (forward:
+  `''` → `'default'` at the `WHERE id = ?` target; reverse:
+  `'default'` → `''` at the `profiles.profile_name` SELECT), so a
+  default-account rate limit colocates onto `usage.default` and the
+  existing renderer surfaces the line with no renderer change. The
+  mapping is one-way at each direction (`''` never maps to `''`),
+  so a pathological literal `usage.id=''` stays non-joinable — the
+  cross-contamination the original guard prevented is now
+  structurally impossible by mapping direction, not by an explicit
+  `!= ''` filter. No column ALTER — same justification as
+  v39/fn-648: the bump exists to gate a one-time rewind-and-redrain
+  inside the same `.immediate()` transaction (cursor reset + DELETE
+  jobs/epics/git_status/file_attributions/subagent_invocations PLUS
+  usage + profiles; `dead_letters` excluded as it is not a reducer
+  projection) so the boot drain re-folds historically-stranded
+  default-account annotations onto `usage.default`. keeper-py reads
+  neither `usage` nor `profiles`, so the bump is whitelist-only with
+  no reader logic change.). v41, fn-651:
   `usage.rate_limit_lifts_at TEXT` + `usage.last_usage_fold_at REAL`
   on the `usage` projection. The former is folded from the agentuse
   envelope's top-level `lift_at` (soonest `resets_at` among windows at
