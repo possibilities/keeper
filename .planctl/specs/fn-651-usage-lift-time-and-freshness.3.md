@@ -54,5 +54,5 @@ scheduled at/after `lift_at` and the idle/stale guards still hold.
 - [ ] Tests cover exclusion, post-lift re-rotation, all-excluded fail-open, and the daemon pause/resume; `uv run pytest` passes.
 
 ## Done summary
-
+agentuse now excludes future-lift_at profiles from the picker (with fail-open fallback when all are cooled down) and pauses scraping for rate-limited profiles via a new cooldown branch that mirrors the idle-skip mechanism, preserves lift_at/usage, and bypasses on a stale prior so failing accounts keep retrying.
 ## Evidence
