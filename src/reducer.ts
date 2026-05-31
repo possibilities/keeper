@@ -1700,6 +1700,13 @@ function inferFromWindows(
  * the UPDATE matches zero rows. The next snapshot after SessionStart
  * lands the counts.
  */
+/**
+ * Threshold above which a GitSnapshot fold emits a per-pass `[gitfold-breakdown]`
+ * line. Set high enough that normal folds stay silent — we only care about the
+ * multi-second outliers that hold the write lock and starve hook INSERTs.
+ */
+const GIT_FOLD_BREAKDOWN_MS = 1000;
+
 function projectGitStatus(db: Database, event: Event): void {
   const snapshot = extractGitSnapshot(event);
   if (snapshot == null) {
@@ -1708,6 +1715,12 @@ function projectGitStatus(db: Database, event: Event): void {
   const eventTs = event.ts;
   const eventId = event.id;
   const projectDir = snapshot.project_dir;
+
+  // Per-pass timing — emitted (below) ONLY when the whole fold is slow, so a
+  // [fold-slow] GitSnapshot line is always accompanied by a breakdown that
+  // localizes the cost to a specific pass. Timing is never persisted, so it
+  // has no bearing on re-fold determinism.
+  const _gfT0 = performance.now();
 
   // PASS 1 — Explicit attribution upsert. For each dirty file, scan the
   // event log for tool/bash mutations whose payload references the file
@@ -1740,6 +1753,8 @@ function projectGitStatus(db: Database, event: Event): void {
       );
     }
   }
+
+  const _gfT1 = performance.now();
 
   // PASS 2 — Inferred attribution. Files with no UNDISCHARGED explicit
   // attribution from any session (and a non-null mtime) get bracketed
@@ -1807,6 +1822,8 @@ function projectGitStatus(db: Database, event: Event): void {
     }
   }
 
+  const _gfT2 = performance.now();
+
   // PASS 3 — Render per-file `attributions[]`. Join `file_attributions`
   // against `jobs` (LEFT JOIN — a missing jobs row reads defaults), apply
   // the discharge filter, and embed the materialized view inside each
@@ -1862,6 +1879,8 @@ function projectGitStatus(db: Database, event: Event): void {
     renderedFiles.push({ ...file, attributions });
     fileToAttributions.set(file.path, attributions);
   }
+
+  const _gfT3 = performance.now();
 
   // PASS 4 — Per-job rollups.
   //
@@ -1986,6 +2005,7 @@ function projectGitStatus(db: Database, event: Event): void {
   // `{job_id, dirty: <count>}` so a downstream retract walks the
   // same structure (retractGitStatus reads `job_id` only).
   const projectionJobs: Array<{ job_id: string; dirty: number }> = [];
+  const _gfT4 = performance.now();
   for (const sessionId of sortedSessions) {
     const dirtyForSession = sessionDirtyCount.get(sessionId) ?? 0;
     jobUpdateStmt.run(
@@ -2003,6 +2023,8 @@ function projectGitStatus(db: Database, event: Event): void {
     syncIfPlanRef(db, sessionId, eventId, eventTs);
     projectionJobs.push({ job_id: sessionId, dirty: dirtyForSession });
   }
+
+  const _gfT5 = performance.now();
 
   // git_status write — after pass 1-4 have populated file_attributions
   // and per-job rollups. The rendered `dirty_files[].attributions[]`
@@ -2056,6 +2078,23 @@ function projectGitStatus(db: Database, event: Event): void {
       eventTs,
     ],
   );
+
+  // Slow-fold breakdown — localizes a [fold-slow] GitSnapshot to a pass. Only
+  // emitted above the threshold so steady folds stay silent. nfiles/nsessions
+  // give the fan-out cardinality alongside the per-pass wall times.
+  const _gfTotal = performance.now() - _gfT0;
+  if (_gfTotal >= GIT_FOLD_BREAKDOWN_MS) {
+    console.error(
+      `[gitfold-breakdown] id=${eventId} total=${_gfTotal.toFixed(0)}ms ` +
+        `nfiles=${snapshot.dirty_files.length} nsessions=${sortedSessions.length} ` +
+        `pass1_explicit=${(_gfT1 - _gfT0).toFixed(0)}ms ` +
+        `pass2_inferred=${(_gfT2 - _gfT1).toFixed(0)}ms ` +
+        `pass3_render=${(_gfT3 - _gfT2).toFixed(0)}ms ` +
+        `pass4_rollup=${(_gfT4 - _gfT3).toFixed(0)}ms ` +
+        `fanout=${(_gfT5 - _gfT4).toFixed(0)}ms ` +
+        `write=${(performance.now() - _gfT5).toFixed(0)}ms`,
+    );
+  }
 }
 
 /**
