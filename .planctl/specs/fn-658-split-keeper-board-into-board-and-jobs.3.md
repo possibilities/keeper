@@ -65,5 +65,5 @@ board even though board no longer renders the banner). Run
 - [ ] `bun test test/board.test.ts` passes; `keeper board` shows the epics-only frame
 
 ## Done summary
-
+Stripped jobs body + dead-letter banner from cli/board.ts (renderBody is now epics-only; removed projectJobRow / renderJobsBody / persistentBannerPill / handleReplayKey / 'r' key / banner re-stamp; flash restore targets ""); updated module JSDoc + HELP + keeper USAGE + README + CLAUDE.md to describe the board/jobs split and the dead-letter relocation.
 ## Evidence

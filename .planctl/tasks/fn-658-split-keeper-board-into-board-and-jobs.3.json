@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Trim board to epics-only and update docs",
-  "updated_at": "2026-05-31T19:49:10.928590Z"
+  "updated_at": "2026-05-31T20:26:48.058980Z",
+  "worker_done_at": "2026-05-31T20:26:48.058980Z"
 }
