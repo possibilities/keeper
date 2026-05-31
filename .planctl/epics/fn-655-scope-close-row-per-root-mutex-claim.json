@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-655-scope-close-row-per-root-mutex-claim",
   "bundles": [],
+  "closer_done_at": "2026-05-31T04:08:50.496790Z",
   "created_at": "2026-05-31T01:50:57.458683Z",
   "depends_on_epics": [],
   "id": "fn-655-scope-close-row-per-root-mutex-claim",
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Scope close-row per-root mutex claim",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-31T01:50:57.458683Z"
+  "updated_at": "2026-05-31T04:08:50.496790Z"
 }
