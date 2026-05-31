@@ -98,7 +98,11 @@ import type {
   TranscriptTitleMessage,
   TranscriptWorkerData,
 } from "./transcript-worker";
-import type { UsageMessage, UsageWorkerData } from "./usage-worker";
+import type {
+  UsageMessage,
+  UsageSnapshotMessage,
+  UsageWorkerData,
+} from "./usage-worker";
 import type {
   ShutdownMessage,
   WakeMessage,
@@ -183,6 +187,49 @@ export function withBootDrainCheckpointTuning(
  * the dir scan.
  */
 const MAX_DEAD_LETTER_FILE_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Serialize a `UsageSnapshotMessage` into the JSON string that rides in the
+ * synthetic `UsageSnapshot` event's `data` blob. The reducer
+ * (`extractUsageSnapshot` in `src/reducer.ts`) decodes the same shape; every
+ * projection-meaningful field MUST appear here or the corresponding `usage`
+ * column folds to NULL forever.
+ *
+ * fn-651 task .1: this was previously an inline `JSON.stringify({...})` in
+ * the worker handler that dropped the fn-645 envelope-freshness fields
+ * (`status` / `subscription_active` / `error_type` / `error_message` /
+ * `error_at`), so `mc1` (no subscription) never got redacted and the status
+ * chip never rendered. Extracted into a pure function so the test surface
+ * can pin the wire shape directly.
+ *
+ * NOT serialized: `kind` (event-tag discriminator, not a projection field)
+ * and `id` (the agentuse profile id, which rides in `events.session_id`
+ * via the synthetic-event pipeline's generic entity-key overload, not in
+ * the data blob).
+ *
+ * Object-literal slot order here is documentation only — the reducer's
+ * decoder is shape-tolerant. The load-bearing slot order lives in
+ * `usage-worker.ts` `buildUsageMessage` for the change-gate.
+ */
+export function serializeUsageSnapshot(msg: UsageSnapshotMessage): string {
+  return JSON.stringify({
+    target: msg.target,
+    multiplier: msg.multiplier,
+    session_percent: msg.session_percent,
+    session_resets_at: msg.session_resets_at,
+    week_percent: msg.week_percent,
+    week_resets_at: msg.week_resets_at,
+    sonnet_week_percent: msg.sonnet_week_percent,
+    sonnet_week_resets_at: msg.sonnet_week_resets_at,
+    // fn-645 envelope freshness / plan / stale-error axes — forwarded so
+    // the reducer's UPSERT populates the columns instead of folding NULL.
+    status: msg.status,
+    subscription_active: msg.subscription_active,
+    error_type: msg.error_type,
+    error_message: msg.error_message,
+    error_at: msg.error_at,
+  });
+}
 
 /**
  * Scan the dead-letter dir and import each NDJSON file's records into the
@@ -1265,19 +1312,11 @@ function runDaemon(): void {
     if (msg.kind === "usage-snapshot") {
       hookEvent = "UsageSnapshot";
       // Pre-flattened payload — the reducer never re-reads the on-disk file.
-      // Object-literal slot order is documentation only here (reducer is
-      // shape-tolerant); the load-bearing slot order lives in the worker's
-      // change-gate via `buildUsageMessage`.
-      data = JSON.stringify({
-        target: msg.target,
-        multiplier: msg.multiplier,
-        session_percent: msg.session_percent,
-        session_resets_at: msg.session_resets_at,
-        week_percent: msg.week_percent,
-        week_resets_at: msg.week_resets_at,
-        sonnet_week_percent: msg.sonnet_week_percent,
-        sonnet_week_resets_at: msg.sonnet_week_resets_at,
-      });
+      // Forwarded via the exported `serializeUsageSnapshot` so the wire
+      // shape is pinned by a direct test; fn-651 task .1 fixed the leak
+      // that dropped the fn-645 status / subscription_active / error_*
+      // fields (those columns folded to NULL forever before this).
+      data = serializeUsageSnapshot(msg);
     } else if (msg.kind === "usage-deleted") {
       // Tombstone: the reducer DELETEs the `usage` row whose primary key is
       // `id`. No payload beyond the pk in `session_id` — matches the

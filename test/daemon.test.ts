@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   drainToCompletion,
   recoverOneDeadLetter,
+  serializeUsageSnapshot,
   WAL_AUTOCHECKPOINT_PAGES,
   withBootDrainCheckpointTuning,
 } from "../src/daemon";
@@ -1018,5 +1019,202 @@ test("recoverOneDeadLetter does NOT touch dead_letters on a re-fold (the row sur
   // one record at a time, and a partial recovery is still strictly better
   // than the row never appearing on the board).
   expect(job.state).toBe("stopped");
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// fn-651 task .1 — UsageSnapshot serializer (the worker→event wire shape)
+// ---------------------------------------------------------------------------
+//
+// Pre-fix the inline `JSON.stringify({...})` in the `usage-snapshot` worker
+// handler dropped the fn-645 freshness fields (`status`,
+// `subscription_active`, `error_type`, `error_message`, `error_at`), so the
+// reducer's UPSERT folded them to NULL forever — `mc1` (no subscription)
+// never got redacted and the status chip never rendered. These tests pin
+// the extracted serializer's wire shape so the leak can't recur, then
+// run a full round-trip through the reducer to prove the columns
+// actually populate end-to-end.
+
+test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field", () => {
+  const wire = JSON.parse(
+    serializeUsageSnapshot({
+      kind: "usage-snapshot",
+      id: "claude-mc1",
+      target: "claude",
+      multiplier: 5,
+      session_percent: 42.5,
+      session_resets_at: "2026-05-30T18:30:00-04:00",
+      week_percent: 17.0,
+      week_resets_at: "2026-06-01T20:00:00-04:00",
+      sonnet_week_percent: 9.0,
+      sonnet_week_resets_at: "2026-06-01T20:00:00-04:00",
+      status: "stale",
+      subscription_active: false,
+      error_type: "ClaudeUsageParseError",
+      error_message: "cli output unparseable",
+      error_at: "2026-05-30T12:00:00-04:00",
+    }),
+  );
+  // Every fn-645 + earlier projection field present and round-trippable.
+  expect(wire).toEqual({
+    target: "claude",
+    multiplier: 5,
+    session_percent: 42.5,
+    session_resets_at: "2026-05-30T18:30:00-04:00",
+    week_percent: 17.0,
+    week_resets_at: "2026-06-01T20:00:00-04:00",
+    sonnet_week_percent: 9.0,
+    sonnet_week_resets_at: "2026-06-01T20:00:00-04:00",
+    status: "stale",
+    subscription_active: false,
+    error_type: "ClaudeUsageParseError",
+    error_message: "cli output unparseable",
+    error_at: "2026-05-30T12:00:00-04:00",
+  });
+  // `kind` / `id` are NOT projection fields — the discriminator is event
+  // metadata and `id` rides in `events.session_id` via the synthetic-event
+  // pipeline's generic entity-key overload.
+  expect(wire.kind).toBeUndefined();
+  expect(wire.id).toBeUndefined();
+});
+
+test("fn-651: serialized snapshot folds end-to-end — status / subscription_active / error_* are non-NULL after drain", () => {
+  const { db } = openDb(dbPath);
+  // Seed the events row exactly the way main's `usage-snapshot` handler
+  // would: session_id = profile pk, data = serialized payload.
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+       VALUES (?, ?, NULL, 'UsageSnapshot', 'usage_snapshot', ?)`,
+    [
+      1000,
+      "claude-mc1",
+      serializeUsageSnapshot({
+        kind: "usage-snapshot",
+        id: "claude-mc1",
+        target: "claude",
+        multiplier: 5,
+        session_percent: 0,
+        session_resets_at: null,
+        week_percent: 0,
+        week_resets_at: null,
+        sonnet_week_percent: null,
+        sonnet_week_resets_at: null,
+        status: "stale",
+        subscription_active: false,
+        error_type: "ClaudeUsageParseError",
+        error_message: "boom",
+        error_at: "2026-05-30T12:00:00-04:00",
+      }),
+    ],
+  );
+  drainToCompletion(db);
+  const row = db
+    .query(
+      `SELECT status, subscription_active, error_type, error_message, error_at,
+              sonnet_week_resets_at
+         FROM usage WHERE id = ?`,
+    )
+    .get("claude-mc1") as {
+    status: string | null;
+    subscription_active: number | null;
+    error_type: string | null;
+    error_message: string | null;
+    error_at: string | null;
+    sonnet_week_resets_at: string | null;
+  };
+  expect(row.status).toBe("stale");
+  // The reducer coerces boolean false → integer 0 on the column.
+  expect(row.subscription_active).toBe(0);
+  expect(row.error_type).toBe("ClaudeUsageParseError");
+  expect(row.error_message).toBe("boom");
+  expect(row.error_at).toBe("2026-05-30T12:00:00-04:00");
+  // sonnet_week_resets_at was null in the message; folds to NULL safely.
+  expect(row.sonnet_week_resets_at).toBeNull();
+  db.close();
+});
+
+test("fn-651: a no-subscription envelope folds subscription_active = 0 so the renderer redacts it", () => {
+  // The `mc1` case from the epic spec: subscription_active=false on the
+  // wire becomes 0 in the column, which is what `cli/usage.ts`'s
+  // `subscription_active !== 0` filter checks to redact the row.
+  const { db } = openDb(dbPath);
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+       VALUES (?, ?, NULL, 'UsageSnapshot', 'usage_snapshot', ?)`,
+    [
+      2000,
+      "claude-mc1",
+      serializeUsageSnapshot({
+        kind: "usage-snapshot",
+        id: "claude-mc1",
+        target: "claude",
+        multiplier: 1,
+        session_percent: null,
+        session_resets_at: null,
+        week_percent: null,
+        week_resets_at: null,
+        sonnet_week_percent: null,
+        sonnet_week_resets_at: null,
+        status: "active",
+        subscription_active: false,
+        error_type: null,
+        error_message: null,
+        error_at: null,
+      }),
+    ],
+  );
+  drainToCompletion(db);
+  const row = db
+    .query(`SELECT subscription_active, status FROM usage WHERE id = ?`)
+    .get("claude-mc1") as {
+    subscription_active: number | null;
+    status: string | null;
+  };
+  expect(row.subscription_active).toBe(0);
+  expect(row.status).toBe("active");
+  db.close();
+});
+
+test("fn-651: an old event missing the fn-645 fields folds them to NULL without error (backwards-compat)", () => {
+  // Pre-fix events on disk have the data blob WITHOUT status /
+  // subscription_active / error_*. The reducer must keep folding them
+  // safely; only NEW events carry the fields. This pins the
+  // backwards-compat contract spelled in the task spec.
+  const { db } = openDb(dbPath);
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+       VALUES (?, ?, NULL, 'UsageSnapshot', 'usage_snapshot', ?)`,
+    [
+      3000,
+      "claude-legacy",
+      JSON.stringify({
+        target: "claude",
+        multiplier: 5,
+        session_percent: 1.0,
+        session_resets_at: "T1",
+        week_percent: 1.0,
+        week_resets_at: "T2",
+        // fn-645 fields deliberately omitted — pre-fix shape.
+      }),
+    ],
+  );
+  drainToCompletion(db);
+  const row = db
+    .query(
+      `SELECT status, subscription_active, error_type, error_message, error_at
+         FROM usage WHERE id = ?`,
+    )
+    .get("claude-legacy") as {
+    status: string | null;
+    subscription_active: number | null;
+    error_type: string | null;
+    error_message: string | null;
+    error_at: string | null;
+  };
+  expect(row.status).toBeNull();
+  expect(row.subscription_active).toBeNull();
+  expect(row.error_type).toBeNull();
+  expect(row.error_message).toBeNull();
+  expect(row.error_at).toBeNull();
   db.close();
 });
