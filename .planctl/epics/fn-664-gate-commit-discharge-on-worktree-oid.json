@@ -2,9 +2,11 @@
   "branch_name": "fn-664-gate-commit-discharge-on-worktree-oid",
   "bundles": [],
   "created_at": "2026-05-31T23:38:16.221855Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-661-server-side-autopilot-reconciler"
+  ],
   "id": "fn-664-gate-commit-discharge-on-worktree-oid",
-  "last_validated_at": "2026-05-31T23:38:16.314389Z",
+  "last_validated_at": "2026-05-31T23:38:39.679741Z",
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -15,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-31T23:38:16.221855Z"
+  "updated_at": "2026-05-31T23:38:39.646887Z"
 }
