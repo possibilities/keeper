@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "make dispatch log survive restarts",
-  "updated_at": "2026-05-31T00:39:56.995464Z"
+  "updated_at": "2026-05-31T14:19:16.331619Z",
+  "worker_done_at": "2026-05-31T14:19:16.331619Z"
 }
