@@ -19,6 +19,7 @@ from keeper.api import (
     KeeperDBMissing,
     KeeperSchemaError,
     get_session_dirty_files,
+    get_session_name_history,
     get_session_titles,
 )
 
@@ -158,9 +159,14 @@ def _build_jobs_db(path: Path, *, schema_version: int = 31) -> None:
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
         (str(schema_version),),
     )
-    # Minimal jobs shape — only the columns get_session_titles reads.
+    # Minimal jobs shape — columns get_session_titles + get_session_name_history read.
     conn.execute(
-        "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, title TEXT, title_source TEXT)"
+        "CREATE TABLE jobs ("
+        "job_id TEXT PRIMARY KEY, "
+        "title TEXT, "
+        "title_source TEXT, "
+        "name_history TEXT NOT NULL DEFAULT '[]'"
+        ")"
     )
     conn.commit()
     conn.close()
@@ -169,6 +175,22 @@ def _build_jobs_db(path: Path, *, schema_version: int = 31) -> None:
 def _add_job(path, job_id, title):
     conn = sqlite3.connect(path)
     conn.execute("INSERT INTO jobs (job_id, title) VALUES (?, ?)", (job_id, title))
+    conn.commit()
+    conn.close()
+
+
+def _add_job_with_history(path, job_id, history_cell):
+    """Insert a job row with a literal ``name_history`` cell (str or None).
+
+    ``history_cell`` is written verbatim — pass a ``json.dumps([...])`` for
+    well-formed arrays or a raw string like ``"not-json"`` to exercise the
+    defensive parse path.
+    """
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO jobs (job_id, title, name_history) VALUES (?, ?, ?)",
+        (job_id, None, history_cell),
+    )
     conn.commit()
     conn.close()
 
@@ -215,6 +237,62 @@ class GetSessionTitlesTest(unittest.TestCase):
         os.environ["KEEPER_DB"] = str(Path(self._tmp.name) / "nope.db")
         with self.assertRaises(KeeperDBMissing):
             get_session_titles()
+
+
+class GetSessionNameHistoryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self._tmp.name) / "keeper.db"
+        _build_jobs_db(self.db)
+        self._prev = os.environ.get("KEEPER_DB")
+        os.environ["KEEPER_DB"] = str(self.db)
+
+    def tearDown(self) -> None:
+        if self._prev is None:
+            os.environ.pop("KEEPER_DB", None)
+        else:
+            os.environ["KEEPER_DB"] = self._prev
+        self._tmp.cleanup()
+
+    def test_multi_name_history_in_order(self):
+        _add_job_with_history(
+            self.db, "sess-1", json.dumps(["first", "second", "third"])
+        )
+        _add_job_with_history(self.db, "sess-2", json.dumps(["only"]))
+        self.assertEqual(
+            get_session_name_history(),
+            {"sess-1": ["first", "second", "third"], "sess-2": ["only"]},
+        )
+
+    def test_empty_history_returns_empty_list(self):
+        # The schema default '[]' applies when no name_history is supplied.
+        _add_job(self.db, "sess-1", "named")
+        self.assertEqual(get_session_name_history(), {"sess-1": []})
+
+    def test_malformed_cell_folds_to_empty(self):
+        _add_job_with_history(self.db, "sess-1", "not-json")
+        _add_job_with_history(self.db, "sess-2", json.dumps({"not": "a list"}))
+        # Non-string entries inside an array are filtered out, not the whole row.
+        _add_job_with_history(self.db, "sess-3", json.dumps(["ok", 42, None, "fine"]))
+        self.assertEqual(
+            get_session_name_history(),
+            {"sess-1": [], "sess-2": [], "sess-3": ["ok", "fine"]},
+        )
+
+    def test_empty_when_no_jobs(self):
+        self.assertEqual(get_session_name_history(), {})
+
+    def test_unsupported_schema_raises(self):
+        bad = Path(self._tmp.name) / "bad.db"
+        _build_jobs_db(bad, schema_version=30)
+        os.environ["KEEPER_DB"] = str(bad)
+        with self.assertRaises(KeeperSchemaError):
+            get_session_name_history()
+
+    def test_missing_db_raises(self):
+        os.environ["KEEPER_DB"] = str(Path(self._tmp.name) / "nope.db")
+        with self.assertRaises(KeeperDBMissing):
+            get_session_name_history()
 
 
 if __name__ == "__main__":

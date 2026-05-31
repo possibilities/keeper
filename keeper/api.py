@@ -252,3 +252,41 @@ def get_session_titles() -> dict[str, str]:
         }
     finally:
         conn.close()
+
+
+def get_session_name_history() -> dict[str, list[str]]:
+    """Return ``{session_id: [title, ...]}`` for every job's name history.
+
+    Reads keeper's ``jobs.name_history`` column (schema v40, fn-652): a JSON
+    array of the distinct titles a session has carried, oldest→newest, capped
+    at the most-recent 20.  Used by claudectl to resolve a session by any name
+    it ever had (retiring the old hooks-tracker ``load_all_session_names``).
+
+    A malformed or empty ``name_history`` cell folds to ``[]`` for that job
+    (defensive — never raise on a single bad row, mirroring
+    ``_dirty_paths_by_repo``).  Every job row is included, even ones whose
+    history is empty, so callers can distinguish "no history" from "no such
+    session".
+
+    Raises ``KeeperDBMissing`` / ``KeeperSchemaError`` like the other readers
+    here — no silent fallback.
+    """
+    path = _resolve_db_path()
+    conn = _open_readonly(path)
+    try:
+        _check_schema(conn)
+        out: dict[str, list[str]] = {}
+        for job_id, name_history in conn.execute(
+            "SELECT job_id, name_history FROM jobs"
+        ):
+            history: list[str] = []
+            try:
+                parsed = json.loads(name_history)
+                if isinstance(parsed, list):
+                    history = [n for n in parsed if isinstance(n, str)]
+            except (ValueError, TypeError):
+                history = []
+            out[job_id] = history
+        return out
+    finally:
+        conn.close()
