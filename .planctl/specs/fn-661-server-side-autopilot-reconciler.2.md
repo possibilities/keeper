@@ -45,5 +45,5 @@ shot. Retire `isSurfaceLive`, `buildZellijQueryTabNamesArgs` text-parsing,
 - [ ] exec-backend.test.ts updated and green
 
 ## Done summary
-
+Reshaped ExecBackend to launch(argv,name,cwd)->{ok,error?} and closeByName(name) (uses list-panes -a -j JSON, exact tab_name match, then close-pane -p). Retired isSurfaceLive, query-tab-names text parsing, newestTerminalPaneId, and windowId capture. 31 exec-backend tests pass; full suite green (1691 pass).
 ## Evidence

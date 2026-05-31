@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "reshape execbackend to launch and close-by-name",
-  "updated_at": "2026-05-31T22:30:27.558408Z"
+  "updated_at": "2026-05-31T23:41:09.411811Z",
+  "worker_done_at": "2026-05-31T23:41:09.411811Z"
 }
