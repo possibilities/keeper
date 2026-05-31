@@ -71,5 +71,5 @@ banner + keys.
 - [ ] `bun test test/jobs.test.ts test/keeper-cli.test.ts` passes
 
 ## Done summary
-
+Added cli/jobs.ts as the keeper jobs subcommand — sibling of board for the bottom jobs list (ambient/plan-bound partitions, nested sub-agent lines, [dead-letter:N] banner, r replay key on a fresh RPC connection). Wired jobs into the dispatcher (SUBCOMMANDS/USAGE/handlers) and added test/jobs.test.ts covering row shape, partition + empty-side drop, nested sub-agent routing, and the dead-letter pill.
 ## Evidence

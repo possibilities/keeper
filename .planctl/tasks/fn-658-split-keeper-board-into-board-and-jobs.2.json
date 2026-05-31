@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Add cli/jobs.ts TUI and wire the dispatcher",
-  "updated_at": "2026-05-31T19:49:10.928590Z"
+  "updated_at": "2026-05-31T20:17:22.135377Z",
+  "worker_done_at": "2026-05-31T20:17:22.135377Z"
 }
