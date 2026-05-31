@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-31T19:49:10.928590Z",
+  "depends_on": [],
+  "epic": "fn-658-split-keeper-board-into-board-and-jobs",
+  "id": "fn-658-split-keeper-board-into-board-and-jobs.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Extract shared render primitives to src/board-render.ts",
+  "updated_at": "2026-05-31T19:49:10.928590Z"
+}
