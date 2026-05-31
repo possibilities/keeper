@@ -482,6 +482,16 @@ the native value" is the default.
 - **The hook must always exit 0.** *Why:* a non-zero exit can fail-closed the
   human's session. Losing one event row is acceptable; wedging the agent is not.
   Never let a parse/DB failure propagate; log to stderr only.
+- **Test isolation: centralize hook-spawn env, never spread `...process.env`
+  for state-bearing vars.** Every test that spawns the real hook
+  (`plugin/hooks/events-writer.ts`) MUST route through a shared sandboxed
+  base-env helper that overrides ALL three state paths — `KEEPER_DB`,
+  `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG` — under the per-test `tmpDir`.
+  A bare `{ ...process.env, KEEPER_DB: ... }` strands the other two at
+  their production defaults and pollutes the user's real
+  `~/.local/state/keeper/` feed (fn-657 closed exactly this leak).
+  Helpers that accept a caller env overlay MUST apply the sandbox AFTER any
+  `undefined`-clears-key loop so a caller can't re-open the leak.
 - **No in-process self-heal.** Any unrecoverable error — including any worker's
   `error` event — calls `fatalExit` → `process.exit(1)` and the LaunchAgent
   restarts the single recovery path. Do not respawn a worker in-process. The

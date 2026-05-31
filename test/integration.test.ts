@@ -145,6 +145,22 @@ async function readStream(
 }
 
 /**
+ * Shared sandboxed base env for every test spawn that fires the real hook.
+ * Routes all three state-bearing env vars (`KEEPER_DB`,
+ * `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`) under the live per-test
+ * `tmpDir` so no spawn falls through to the production
+ * `~/.local/state/keeper/` paths. fn-657.
+ */
+function sandboxedBaseEnv(): Record<string, string> {
+  return {
+    ...(process.env as Record<string, string>),
+    KEEPER_DB: dbPath,
+    KEEPER_DEAD_LETTER_DIR: join(tmpDir, "dead-letters"),
+    KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
+  };
+}
+
+/**
  * Pipe one hook payload through the events-writer hook as a fresh process,
  * exactly as Claude Code invokes it. Awaits the hook's exit (always 0 by
  * contract) so the row is committed before the caller proceeds.
@@ -152,7 +168,7 @@ async function readStream(
 async function fireHook(payload: Record<string, unknown>): Promise<void> {
   const proc = Bun.spawn(["bun", HOOK_ENTRY], {
     cwd: ROOT,
-    env: { ...process.env, KEEPER_DB: dbPath },
+    env: sandboxedBaseEnv(),
     stdin: new TextEncoder().encode(JSON.stringify(payload)),
     stdout: "pipe",
     stderr: "pipe",
@@ -1730,10 +1746,12 @@ await new Promise(() => {});
   }
 
   // Spawn the victim launcher. Its pid is the hook's process.ppid, so
-  // events.pid + events.start_time describe it.
+  // events.pid + events.start_time describe it. The launcher's own inner
+  // hook spawn uses `env: { ...process.env }`, so the sandboxed state-path
+  // overrides propagate down one level to the hook process (fn-657).
   const victim = Bun.spawn(["bun", "run", launcherPath], {
     cwd: ROOT,
-    env: { ...process.env, KEEPER_DB: dbPath },
+    env: sandboxedBaseEnv(),
     stdout: "pipe",
     stderr: "pipe",
   });

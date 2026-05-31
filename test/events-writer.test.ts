@@ -88,6 +88,28 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
+/**
+ * Shared sandboxed base env for every test spawn that fires the real hook.
+ *
+ * The hook honors three state-bearing env vars: `KEEPER_DB` (events DB),
+ * `KEEPER_DEAD_LETTER_DIR` (per-pid NDJSON recovery files), and
+ * `KEEPER_DROP_LOG` (the diagnostic drop-log append). If any of these falls
+ * through to its production default, a test run pollutes the user's real
+ * `~/.local/state/keeper/` paths — the drop-log leak that fn-657 exists to
+ * close. Centralize them here so a new spawn site can't forget one.
+ *
+ * Computed from the LIVE per-test `tmpDir` (re-created each `beforeEach`),
+ * never frozen at module scope.
+ */
+function sandboxedBaseEnv(): Record<string, string> {
+  return {
+    ...(process.env as Record<string, string>),
+    KEEPER_DB: dbPath,
+    KEEPER_DEAD_LETTER_DIR: join(tmpDir, "dead-letters"),
+    KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
+  };
+}
+
 /** Run the launcher with a given session name + payload; resolve its exit code. */
 async function fireViaLauncher(
   sessionName: string | null,
@@ -100,7 +122,7 @@ async function fireViaLauncher(
   args.push("--payload", JSON.stringify(payload));
   const proc = Bun.spawn(args, {
     cwd: ROOT,
-    env: { ...process.env, KEEPER_DB: dbPath },
+    env: sandboxedBaseEnv(),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -293,8 +315,7 @@ test("hook exits 0 with NULL start_time when the ps probe is force-broken", asyn
   const proc = Bun.spawn(args, {
     cwd: ROOT,
     env: {
-      ...process.env,
-      KEEPER_DB: dbPath,
+      ...sandboxedBaseEnv(),
       PATH: `${shadowDir}:${process.env.PATH ?? ""}`,
     },
     stdout: "pipe",
@@ -1152,6 +1173,15 @@ async function fireViaLauncherWithEnv(
       env[k] = v;
     }
   }
+  // Apply the sandboxed state-bearing keys AFTER the overlay-clear loop so a
+  // caller overlay (which uses `undefined` to delete keys) can NEVER strand
+  // KEEPER_DROP_LOG / KEEPER_DEAD_LETTER_DIR back at their production
+  // defaults. fn-657: the drop-log leak class lived precisely in the gap a
+  // caller could open by clearing a state key on an inherited base.
+  const sandbox = sandboxedBaseEnv();
+  env.KEEPER_DB = sandbox.KEEPER_DB!;
+  env.KEEPER_DEAD_LETTER_DIR = sandbox.KEEPER_DEAD_LETTER_DIR!;
+  env.KEEPER_DROP_LOG = sandbox.KEEPER_DROP_LOG!;
   const proc = Bun.spawn(args, {
     cwd: ROOT,
     env,
@@ -1319,8 +1349,9 @@ async function fireViaLauncherWithDeadLetter(
   }
   args.push("--payload", JSON.stringify(payload));
   const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    KEEPER_DB: dbPath,
+    ...sandboxedBaseEnv(),
+    // Caller's deadLetterDir is the whole point of this helper — it overrides
+    // the sandbox default so the test can inspect the per-pid NDJSON file.
     KEEPER_DEAD_LETTER_DIR: deadLetterDir,
   };
   for (const [k, v] of Object.entries(extraEnv)) {
@@ -1330,6 +1361,11 @@ async function fireViaLauncherWithDeadLetter(
       env[k] = v;
     }
   }
+  // KEEPER_DROP_LOG is never a legitimate extraEnv target for these tests
+  // (the only state keys callers manipulate are KEEPER_DB and the dead-letter
+  // dir). Re-apply the sandbox value after the overlay loop so a future
+  // caller can't accidentally re-leak it. fn-657.
+  env.KEEPER_DROP_LOG = sandboxedBaseEnv().KEEPER_DROP_LOG!;
   const proc = Bun.spawn(args, {
     cwd: ROOT,
     env,

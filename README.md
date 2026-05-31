@@ -385,7 +385,13 @@ Keeper has no `install` verb. Wire it up manually:
 
    The subscribe server binds a Unix-domain socket at
    `~/.local/state/keeper/keeperd.sock` by default (a sibling of `keeper.db`).
-   Override the path with the `KEEPER_SOCK` environment variable. Set
+   Override the path with the `KEEPER_SOCK` environment variable. The hook
+   also honors `KEEPER_DROP_LOG` (path to the diagnostic drop-log NDJSON,
+   default `~/.local/state/keeper/hook-drops.ndjson`) and
+   `KEEPER_DEAD_LETTER_DIR` (directory for per-pid dead-letter NDJSON
+   recovery files, default `~/.local/state/keeper/dead-letters/`) — tests
+   that spawn the real hook MUST override both to keep production
+   diagnostic feeds clean. Set
    `KEEPER_TRACE_SERVER=1` to enable verbose server-worker diagnostic logging
    — `[srv-ts]` stage timings, frame byte counts, connection lifecycle — on
    `server.stderr`; off by default (the rare `[server-worker]` error class is
