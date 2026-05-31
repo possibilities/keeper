@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-05-31T17:20:34.633091Z",
+  "depends_on": [],
+  "epic": "fn-656-fix-gitstatus-fanout-ratchet",
+  "id": "fn-656-fix-gitstatus-fanout-ratchet.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "guard projectionjobs push on dirty",
+  "updated_at": "2026-05-31T17:20:34.633091Z"
+}
