@@ -64,5 +64,5 @@ Verify the suite passes before this task is considered done.
 - [ ] `bun test test/board.test.ts` passes; `keeper board --help` runs without an undefined-function error
 
 ## Done summary
-
+Extracted shared render primitives from cli/board.ts to a new src/board-render.ts (colorizePillsInLine + SGR/PILL_COLORS, apiErrorPillSeg, inputRequestPillSeg, planVerbLabel, pure subagentLinesFor, renderDeadLetterPill, sendReplayDeadLetterRpc + result type and timeout). cli/board.ts re-exports the five names test/board.test.ts imports plus sendReplayDeadLetterRpc/ReplayDeadLetterRpcResult for scripts/drain-dead-letters.ts. Zero behavior change; 64 board tests + 1642-test full suite green, keeper board --help clean.
 ## Evidence

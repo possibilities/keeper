@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Extract shared render primitives to src/board-render.ts",
-  "updated_at": "2026-05-31T19:49:10.928590Z"
+  "updated_at": "2026-05-31T20:02:28.300680Z",
+  "worker_done_at": "2026-05-31T20:02:28.300680Z"
 }
