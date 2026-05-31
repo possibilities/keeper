@@ -256,15 +256,10 @@ Keeper has no `install` verb. Wire it up manually:
    - `claude_projects_root` — the single tree the transcript worker watches for
      session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
      Override only if your Claude Code transcripts live elsewhere.
-   - `exec_backend` — the terminal-surface backend `keeper autopilot` uses to
-     spawn worker windows. One of `zellij` (default) or `ghostty`. `zellij`
-     opens each worker as a new tab inside a shared, lazily-created
-     background session (see `zellij_session` below); `ghostty` opens each
-     worker in its own macOS window via osascript and moves it to space 5
-     via yabai (yabai not installed → no-op).
    - `zellij_session` — the zellij session name autopilot's zellij backend
      lazily ensures (and reuses) for every tab it spawns. Default:
-     `autopilot`. Ignored when `exec_backend: ghostty`.
+     `autopilot`. Each worker opens as a new tab inside that shared
+     background session.
    - `autoclose_windows` — whether autopilot reaps a dispatched terminal
      surface once its work reaches a terminal state (the auto-close).
      Default: `true`. Set `false` to keep finished windows open — useful
@@ -280,7 +275,6 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/code
      - ~/src
    claude_projects_root: ~/.claude/projects
-   exec_backend: zellij
    zellij_session: autopilot
    autoclose_windows: true
    YAML
@@ -292,9 +286,9 @@ Keeper has no `install` verb. Wire it up manually:
    All keys fall back independently — a missing/malformed one never disturbs
    the others; a missing or malformed config falls back to every default
    (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
-   `exec_backend: zellij`, `zellij_session: autopilot`,
-   `autoclose_windows: true`). An unknown `exec_backend` value also falls
-   back to `zellij`.
+   `zellij_session: autopilot`, `autoclose_windows: true`). Unknown keys
+   are silently ignored — a legacy `exec_backend: ghostty` carried over
+   from a pre-fn-654 config has no effect.
 
    (The legacy `KEEPER_WATCH_ROOT` env var is retired; if still set, the daemon
    logs a one-line deprecation warning and ignores it.)
@@ -554,17 +548,14 @@ collapses to plain stream output. Run any of them with
   validated `$SHELL` (`-l -i`, `/bin/zsh` fallback) with `exec $SHELL
   -l -i` chained after claude exits so a dropped session leaves a
   usable shell. The terminal-surface mechanics live behind an
-  `ExecBackend` interface (`src/exec-backend.ts`) selectable via the
-  `exec_backend` config key — `zellij` (default) spawns each worker
-  as a new tab in the lazily-created `zellij_session`, `ghostty` spawns
-  a Ghostty window via osascript and moves it to space 5 via yabai.
-  Each launch records its backend-shaped window/tab id in
+  `ExecBackend` interface (`src/exec-backend.ts`) — zellij is the only
+  backend; each worker is spawned as a new tab in the lazily-created
+  `zellij_session`. Each launch records its tab id in
   `~/.local/state/keeper/dispatch.log` (a `kind:"window"` row) and
-  auto-closes the surface (backend-native: ghostty's osascript repeat-
-  loop close, or zellij's `action close-tab-by-id`) the moment the
-  dispatch reaches `--- completed ---` (terminal job state or post-
-  fulfillment disappearance), so parked "process exited" surfaces don't
-  accumulate. Re-dispatch is gated by durable `dispatchedKeys` /
+  auto-closes the surface (zellij `action close-tab-by-id`) the moment
+  the dispatch reaches `--- completed ---` (terminal job state or
+  post-fulfillment disappearance), so parked "process exited" surfaces
+  don't accumulate. Re-dispatch is gated by durable `dispatchedKeys` /
   `fulfilledKeys` sets seeded from `dispatch.log`. Alt-screen TUI when
   stdout is a TTY; keymap `←/h/k` / `→/l/j` / `g` / `G/Esc` / `space`
   pause / `v` toggle commands / `c` copy / `q` quit. SIGINT tears down

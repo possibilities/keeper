@@ -2172,7 +2172,7 @@ export async function main(argv: string[]): Promise<void> {
   // stays in `launchWindow` below, so the backend swap is purely the
   // spawn/parse-id core.
   const cfg = resolveConfig();
-  const backend: ExecBackend = resolveExecBackend(cfg.execBackend, {
+  const backend: ExecBackend = resolveExecBackend({
     noteLine,
     session: cfg.zellijSession,
   });

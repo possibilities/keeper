@@ -2,17 +2,13 @@
  * Pure-function + argv-construction tests for `src/exec-backend.ts`.
  *
  * Coverage:
- *  - `buildGhosttyLaunchArgs` / `buildGhosttyCloseArgs` produce the
- *    osascript shape the live Ghostty path used pre-fn-650 (so the
- *    backend extraction is verbatim).
  *  - `buildZellijNewTabArgs` / `buildZellijCloseTabArgs` /
  *    `buildZellijListSessionsArgs` / `buildZellijAttachBgArgs`
  *    produce the zellij CLI shape the live spec calls for.
- *  - `createGhosttyBackend` + `createZellijBackend` route through an
- *    INJECTED spawn fn — no real `osascript` or `zellij` process is
- *    ever launched.
- *  - `resolveExecBackend` picks ghostty/zellij by name, defaults to
- *    zellij, falls back to zellij on an unknown name with a noteLine.
+ *  - `createZellijBackend` routes through an INJECTED spawn fn — no
+ *    real `zellij` process is ever launched.
+ *  - `resolveExecBackend` returns a zellij backend; tolerates undefined
+ *    session via `DEFAULT_ZELLIJ_SESSION`.
  *
  * No filesystem or process side effects: every spawn is a stub that
  * returns canned stdout/stderr/exit-code via in-memory streams.
@@ -20,8 +16,6 @@
 
 import { expect, test } from "bun:test";
 import {
-  buildGhosttyCloseArgs,
-  buildGhosttyLaunchArgs,
   buildZellijAttachBgArgs,
   buildZellijCloseTabArgs,
   buildZellijListPanesArgs,
@@ -30,7 +24,6 @@ import {
   buildZellijNewTabArgs,
   buildZellijQueryTabNamesArgs,
   buildZellijRenamePaneArgs,
-  createGhosttyBackend,
   createZellijBackend,
   DEFAULT_EXEC_BACKEND,
   DEFAULT_ZELLIJ_SESSION,
@@ -44,10 +37,10 @@ import {
 /**
  * Build a `SpawnFn` stub that records every spawn into `calls` and
  * resolves with canned exit + stdout/stderr from a per-prefix table.
- * The table key matches the first argv element (e.g. `"osascript"`,
- * `"zellij"`, `"sh"`) — for zellij we need to vary by subcommand, so
- * the matching key is `"<cmd>:<arg2>"` (e.g. `"zellij:action"` vs
- * `"zellij:list-sessions"` vs `"zellij:attach"`).
+ * The table key matches the first argv element (e.g. `"zellij"`) — for
+ * zellij we need to vary by subcommand, so the matching key is
+ * `"<cmd>:<arg2>"` (e.g. `"zellij:action"` vs `"zellij:list-sessions"`
+ * vs `"zellij:attach"`).
  */
 function makeSpawnStub(
   table: Record<
@@ -80,45 +73,6 @@ function makeSpawnStub(
 // ---------------------------------------------------------------------------
 // Pure-builder coverage
 // ---------------------------------------------------------------------------
-
-test("buildGhosttyLaunchArgs: wraps argv into osascript surface-config sequence", () => {
-  const argv = [
-    "/bin/zsh",
-    "-l",
-    "-i",
-    "-c",
-    "cd /tmp/proj && claude --name work::fn-1-x.1 '/plan:work fn-1-x.1'",
-  ];
-  const got = buildGhosttyLaunchArgs(argv);
-  expect(got[0]).toBe("osascript");
-  // Each AppleScript line is preceded by a -e flag.
-  const eFlags = got.filter((s) => s === "-e");
-  expect(eFlags.length).toBeGreaterThan(0);
-  // The configured `tell application "Ghostty"` opener must be present.
-  expect(got).toContain('tell application "Ghostty"');
-  expect(got).toContain("set cfg to new surface configuration");
-  expect(got).toContain("set w to new window with configuration cfg");
-  expect(got).toContain("return id of w");
-  expect(got).toContain("end tell");
-  // The `command of cfg` line must contain the worker command body
-  // (so the AppleScript wraps the argv into a single command string).
-  const cmdSetLine = got.find((s) => s.startsWith("set command of cfg to "));
-  expect(cmdSetLine).toBeDefined();
-  expect(cmdSetLine).toContain("/plan:work fn-1-x.1");
-  expect(cmdSetLine).toContain("/bin/zsh");
-});
-
-test("buildGhosttyCloseArgs: repeat-loop osascript form with -2741/-1708 gotcha preserved in source", () => {
-  const got = buildGhosttyCloseArgs("tab-group-12345");
-  expect(got[0]).toBe("osascript");
-  expect(got).toContain('set wid to "tab-group-12345"');
-  // The repeat-loop is the ONLY form that reaps a Ghostty surface; the
-  // -2741/-1708 gotcha comments live in the module source.
-  expect(got).toContain("repeat with w in every window");
-  expect(got).toContain("if id of w is wid then");
-  expect(got).toContain("close window w");
-  expect(got).toContain('return "not-found"');
-});
 
 test("buildZellijNewTabArgs: emits --cwd <abs> -- <argv> after session+action selectors", () => {
   const got = buildZellijNewTabArgs("autopilot", "/Users/mike/code/keeper", [
@@ -264,82 +218,6 @@ test("tabNameListed: exact-matches a tab name, never a substring", () => {
   expect(tabNameListed("", "work::fn-1-x.1")).toBe(false);
   // ANSI-coded line still matches after strip.
   expect(tabNameListed("[1mwork::fn-1-x.1[0m\n", "work::fn-1-x.1")).toBe(true);
-});
-
-// ---------------------------------------------------------------------------
-// Ghostty backend behavior (injected spawn — no real osascript)
-// ---------------------------------------------------------------------------
-
-test("createGhosttyBackend.launch: captures windowId from osascript stdout", async () => {
-  const calls: string[][] = [];
-  const notes: string[] = [];
-  const spawn = makeSpawnStub(
-    {
-      osascript: { stdout: "tab-group-12345\n", exitCode: 0 },
-      // The yabai sh -c step is fire-and-forget; stub it to a no-op
-      // so the stub doesn't complain about an unmatched key.
-      sh: { stdout: "", exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = createGhosttyBackend({
-    noteLine: (s) => notes.push(s),
-    spawn,
-  });
-  const windowId = await backend.launch(
-    ["/bin/zsh", "-l", "-i", "-c", "echo hi"],
-    "row-1",
-    "/tmp/proj",
-  );
-  expect(windowId).toBe("tab-group-12345");
-  // Two spawn calls: osascript first, then the yabai fire-and-forget.
-  expect(calls[0]?.[0]).toBe("osascript");
-  expect(calls[1]?.[0]).toBe("sh");
-  // No stderr → no warn lines.
-  expect(notes).toEqual([]);
-});
-
-test("createGhosttyBackend.launch: non-zero exit returns null and warns", async () => {
-  const calls: string[][] = [];
-  const notes: string[] = [];
-  const spawn = makeSpawnStub(
-    {
-      osascript: { stdout: "", stderr: "boom", exitCode: 1 },
-      sh: { stdout: "" },
-    },
-    calls,
-  );
-  const backend = createGhosttyBackend({
-    noteLine: (s) => notes.push(s),
-    spawn,
-  });
-  const windowId = await backend.launch(
-    ["/bin/zsh", "-l", "-i", "-c", "x"],
-    "row-1",
-    "/tmp/proj",
-  );
-  expect(windowId).toBeNull();
-  // Both the stderr surface AND the exit-non-zero warn must land.
-  expect(notes.some((s) => s.includes("stderr (row-1)"))).toBe(true);
-  expect(notes.some((s) => s.includes("exited non-zero (1)"))).toBe(true);
-});
-
-test("createGhosttyBackend.close: spawns osascript with the repeat-loop close argv", () => {
-  const calls: string[][] = [];
-  const notes: string[] = [];
-  const spawn = makeSpawnStub(
-    { osascript: { stdout: "", exitCode: 0 } },
-    calls,
-  );
-  const backend = createGhosttyBackend({
-    noteLine: (s) => notes.push(s),
-    spawn,
-  });
-  backend.close("tab-group-42");
-  expect(calls.length).toBe(1);
-  expect(calls[0]?.[0]).toBe("osascript");
-  expect(calls[0]).toContain('set wid to "tab-group-42"');
-  expect(calls[0]).toContain("repeat with w in every window");
 });
 
 // ---------------------------------------------------------------------------
@@ -691,59 +569,11 @@ test("createZellijBackend.isSurfaceLive: fail-closed (true) on non-zero query ex
   );
 });
 
-test("createGhosttyBackend.isSurfaceLive: always false (no addressable registry)", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub({}, calls);
-  const backend = createGhosttyBackend({ noteLine: () => {}, spawn });
-  expect(await backend.isSurfaceLive("work::fn-1-x.1")).toBe(false);
-  // No process spawned — the Ghostty gate is a pure no-op.
-  expect(calls.length).toBe(0);
-});
-
 // ---------------------------------------------------------------------------
-// resolveExecBackend — factory selection
+// resolveExecBackend — thin zellij-only seam
 // ---------------------------------------------------------------------------
 
-test("resolveExecBackend: 'ghostty' returns the ghostty backend", () => {
-  const notes: string[] = [];
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      osascript: { stdout: "tab-x", exitCode: 0 },
-      sh: { stdout: "", exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = resolveExecBackend("ghostty", {
-    noteLine: (s) => notes.push(s),
-    spawn,
-  });
-  // Smoke: a launch should spawn osascript first.
-  void backend.launch(["sh"], "row", "/abs");
-  expect(calls[0]?.[0]).toBe("osascript");
-});
-
-test("resolveExecBackend: 'zellij' returns the zellij backend with default session", async () => {
-  const notes: string[] = [];
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "zellij:list-sessions": { stdout: "autopilot\n", exitCode: 0 },
-      "zellij:--session": { stdout: "0\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = resolveExecBackend("zellij", {
-    noteLine: (s) => notes.push(s),
-    spawn,
-  });
-  await backend.launch(["sh"], "row", "/abs");
-  // First spawn should be `zellij list-sessions`.
-  expect(calls[0]?.[0]).toBe("zellij");
-  expect(calls[0]?.[1]).toBe("list-sessions");
-});
-
-test("resolveExecBackend: undefined defaults to zellij", async () => {
+test("resolveExecBackend: returns the zellij backend (default session)", async () => {
   const notes: string[] = [];
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
@@ -752,42 +582,39 @@ test("resolveExecBackend: undefined defaults to zellij", async () => {
         stdout: `${DEFAULT_ZELLIJ_SESSION}\n`,
         exitCode: 0,
       },
-      "zellij:--session": { stdout: "0", exitCode: 0 },
+      "zellij:--session": { stdout: "0\n", exitCode: 0 },
     },
     calls,
   );
-  const backend = resolveExecBackend(undefined, {
+  const backend = resolveExecBackend({
     noteLine: (s) => notes.push(s),
     spawn,
   });
   await backend.launch(["sh"], "row", "/abs");
-  // The zellij branch fires first; default session name was threaded.
+  // First spawn is `zellij list-sessions`; default session name is threaded.
   expect(calls[0]?.[0]).toBe("zellij");
-  // The action call carries the default session name.
+  expect(calls[0]?.[1]).toBe("list-sessions");
   const actionCall = calls.find((c) => c[3] === "action");
   expect(actionCall?.[2]).toBe(DEFAULT_ZELLIJ_SESSION);
 });
 
-test("resolveExecBackend: unknown name falls back to zellij and warns", async () => {
-  const notes: string[] = [];
+test("resolveExecBackend: threads an explicit session through", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
-      "zellij:list-sessions": { stdout: "autopilot\n", exitCode: 0 },
-      "zellij:--session": { stdout: "0", exitCode: 0 },
+      "zellij:list-sessions": { stdout: "custom\n", exitCode: 0 },
+      "zellij:--session": { stdout: "0\n", exitCode: 0 },
     },
     calls,
   );
-  const backend = resolveExecBackend("tmux", {
-    noteLine: (s) => notes.push(s),
+  const backend = resolveExecBackend({
+    noteLine: () => {},
+    session: "custom",
     spawn,
   });
-  expect(notes.some((s) => s.includes('unknown exec_backend "tmux"'))).toBe(
-    true,
-  );
-  // Confirm a zellij command (not osascript) actually fires.
   await backend.launch(["sh"], "row", "/abs");
-  expect(calls[0]?.[0]).toBe("zellij");
+  const actionCall = calls.find((c) => c[3] === "action");
+  expect(actionCall?.[2]).toBe("custom");
 });
 
 test("DEFAULT_EXEC_BACKEND is 'zellij'", () => {

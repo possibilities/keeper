@@ -4564,38 +4564,26 @@ test("resolveConfig: malformed YAML and missing roots key fall back to default",
 });
 
 // ---------------------------------------------------------------------------
-// fn-650: autopilot exec backend selection (`exec_backend` + `zellij_session`)
+// fn-650 / fn-654: autopilot exec backend (zellij-only) + `zellij_session`
 // ---------------------------------------------------------------------------
 
-test("resolveConfig: exec_backend defaults to 'zellij' when absent", () => {
+test("resolveConfig: legacy `exec_backend` key is silently ignored (zellij-only backend)", () => {
   const original = process.env.KEEPER_CONFIG;
   try {
     const cfg = join(tmpDir, "config.yaml");
-    writeFileSync(cfg, "roots:\n  - ~/code\n");
+    // A live config carrying the retired `exec_backend: ghostty` key
+    // must resolve cleanly — the key is dropped from KeeperConfig and
+    // YAML's forward-compat behavior silently ignores unknowns. No
+    // throw, no `execBackend` field, and the other keys still resolve.
+    writeFileSync(
+      cfg,
+      "roots:\n  - /tmp/x\nexec_backend: ghostty\nzellij_session: legacy\n",
+    );
     process.env.KEEPER_CONFIG = cfg;
-    expect(resolveConfig().execBackend).toBe("zellij");
-  } finally {
-    if (original === undefined) delete process.env.KEEPER_CONFIG;
-    else process.env.KEEPER_CONFIG = original;
-  }
-});
-
-test("resolveConfig: exec_backend accepts 'ghostty' / 'zellij' and drops anything else", () => {
-  const original = process.env.KEEPER_CONFIG;
-  try {
-    const cfg = join(tmpDir, "config.yaml");
-    // Present and valid → kept.
-    writeFileSync(cfg, "exec_backend: ghostty\n");
-    process.env.KEEPER_CONFIG = cfg;
-    expect(resolveConfig().execBackend).toBe("ghostty");
-    writeFileSync(cfg, "exec_backend: zellij\n");
-    expect(resolveConfig().execBackend).toBe("zellij");
-    // Malformed (unknown name) → defaults to zellij.
-    writeFileSync(cfg, "exec_backend: tmux\n");
-    expect(resolveConfig().execBackend).toBe("zellij");
-    // Wrong type (number) → defaults to zellij.
-    writeFileSync(cfg, "exec_backend: 42\n");
-    expect(resolveConfig().execBackend).toBe("zellij");
+    const got = resolveConfig();
+    expect((got as { execBackend?: unknown }).execBackend).toBeUndefined();
+    expect(got.zellijSession).toBe("legacy");
+    expect(got.roots).toEqual(["/tmp/x"]);
   } finally {
     if (original === undefined) delete process.env.KEEPER_CONFIG;
     else process.env.KEEPER_CONFIG = original;
@@ -4625,11 +4613,11 @@ test("resolveConfig: zellij_session defaults to 'autopilot' when absent or non-s
   }
 });
 
-test("resolveConfig: exec_backend / zellij_session / roots resolve independently", () => {
+test("resolveConfig: zellij_session / roots resolve independently from a legacy ignored key", () => {
   const original = process.env.KEEPER_CONFIG;
   try {
     const cfg = join(tmpDir, "config.yaml");
-    // A bad exec_backend must NOT disturb the other two keys.
+    // A retired `exec_backend` value must NOT disturb the other keys.
     writeFileSync(
       cfg,
       "roots:\n  - /tmp/projects\nzellij_session: mike\nexec_backend: tmux\n",
@@ -4638,14 +4626,13 @@ test("resolveConfig: exec_backend / zellij_session / roots resolve independently
     const got = resolveConfig();
     expect(got.roots).toEqual(["/tmp/projects"]);
     expect(got.zellijSession).toBe("mike");
-    expect(got.execBackend).toBe("zellij"); // bad value → default
   } finally {
     if (original === undefined) delete process.env.KEEPER_CONFIG;
     else process.env.KEEPER_CONFIG = original;
   }
 });
 
-test("resolveConfig: catch-block defaults include exec_backend + zellij_session", () => {
+test("resolveConfig: catch-block defaults include zellij_session", () => {
   const original = process.env.KEEPER_CONFIG;
   try {
     const cfg = join(tmpDir, "config.yaml");
@@ -4655,7 +4642,6 @@ test("resolveConfig: catch-block defaults include exec_backend + zellij_session"
     writeFileSync(cfg, "roots:\n  - [unbalanced\n: : :\n");
     process.env.KEEPER_CONFIG = cfg;
     const got = resolveConfig();
-    expect(got.execBackend).toBe("zellij");
     expect(got.zellijSession).toBe("autopilot");
   } finally {
     if (original === undefined) delete process.env.KEEPER_CONFIG;

@@ -106,17 +106,6 @@ const DEFAULT_CLAUDE_PROJECTS_ROOT = "~/.claude/projects";
 const DEFAULT_AGENTUSE_ROOT = "~/.local/state/agentuse";
 
 /**
- * Default autopilot terminal-surface backend when the config file is absent
- * or carries no `exec_backend` (or `exec_backend` is malformed / not one of
- * the validated names). The epic ships zellij as the default; the legacy
- * Ghostty path is selectable via `exec_backend: ghostty`. The literal is
- * duplicated in `src/exec-backend.ts` as `DEFAULT_EXEC_BACKEND` — the two
- * MUST stay in lockstep (the resolver layer falls back to the same name a
- * missing/malformed config key falls back to here).
- */
-const DEFAULT_EXEC_BACKEND: "ghostty" | "zellij" = "zellij";
-
-/**
  * Default zellij session name when the config file is absent or carries no
  * `zellij_session` (or it is non-string). Mirrors `DEFAULT_ZELLIJ_SESSION`
  * in `src/exec-backend.ts`.
@@ -128,17 +117,16 @@ const DEFAULT_ZELLIJ_SESSION = "autopilot";
  * scans/watches for `.planctl` plan trees; `claude_projects_root` is the single
  * directory the transcript worker watches for session JSONL;
  * `agentuse_root` is the single directory the usage worker watches for
- * per-profile usage envelopes; `execBackend` is the autopilot terminal-
- * surface backend name (`"ghostty" | "zellij"`); `zellijSession` is the
- * zellij session name the zellij backend lazily ensures before its first
- * `new-tab`. The keys are INDEPENDENT — a malformed/missing one never
- * disturbs the others. Forward-compatible: unknown keys are ignored.
+ * per-profile usage envelopes; `zellijSession` is the zellij session name
+ * the autopilot exec backend lazily ensures before its first `new-tab`.
+ * The keys are INDEPENDENT — a malformed/missing one never disturbs the
+ * others. Forward-compatible: unknown keys are ignored (so a legacy
+ * `exec_backend: ghostty` in a live config becomes inert).
  */
 export interface KeeperConfig {
   roots: string[];
   claudeProjectsRoot?: string;
   agentuseRoot?: string;
-  execBackend?: "ghostty" | "zellij";
   zellijSession?: string;
   // Whether autopilot reaps a dispatched terminal surface once its work
   // reaches a terminal state (the `closeWindow` auto-close). Defaults to
@@ -173,23 +161,22 @@ export function resolveConfigPath(): string {
  * dependency). A missing file, a malformed document, or a missing/invalid
  * `roots:` key all fall back to the default single root (`~/code`); the same
  * goes for `claude_projects_root` (default `~/.claude/projects`),
- * `agentuse_root` (default `~/.local/state/agentuse`), `exec_backend`
- * (default `"zellij"`, validated against `{ghostty,zellij}` — anything
- * else falls back to the default), `zellij_session` (default
- * `"autopilot"`, non-empty string required), and `autoclose_windows`
- * (default `true`, explicit boolean required — anything else keeps the
- * default). The config is best-effort and
+ * `agentuse_root` (default `~/.local/state/agentuse`), `zellij_session`
+ * (default `"autopilot"`, non-empty string required), and
+ * `autoclose_windows` (default `true`, explicit boolean required —
+ * anything else keeps the default). The config is best-effort and
  * must never throw past this resolver. ALL keys resolve INDEPENDENTLY from
- * the same parsed document — a bad `roots` never disturbs `exec_backend`
+ * the same parsed document — a bad `roots` never disturbs `zellij_session`
  * and vice-versa. Only string entries of `roots` survive; non-string junk
- * is dropped.
+ * is dropped. Unknown keys are silently ignored — a legacy
+ * `exec_backend: ghostty` in a live config has no effect (zellij is the
+ * only backend).
  */
 export function resolveConfig(): KeeperConfig {
   const path = resolveConfigPath();
   let roots: string[] = [...DEFAULT_PLAN_ROOTS];
   let claudeProjectsRoot: string = DEFAULT_CLAUDE_PROJECTS_ROOT;
   let agentuseRoot: string = DEFAULT_AGENTUSE_ROOT;
-  let execBackend: "ghostty" | "zellij" = DEFAULT_EXEC_BACKEND;
   let zellijSession: string = DEFAULT_ZELLIJ_SESSION;
   let autocloseWindows: boolean = DEFAULT_AUTOCLOSE_WINDOWS;
   try {
@@ -198,7 +185,6 @@ export function resolveConfig(): KeeperConfig {
         roots,
         claudeProjectsRoot,
         agentuseRoot,
-        execBackend,
         zellijSession,
         autocloseWindows,
       };
@@ -222,10 +208,6 @@ export function resolveConfig(): KeeperConfig {
       if (typeof aur === "string" && aur.length > 0) {
         agentuseRoot = aur;
       }
-      const eb = (raw as { exec_backend?: unknown }).exec_backend;
-      if (eb === "ghostty" || eb === "zellij") {
-        execBackend = eb;
-      }
       const zs = (raw as { zellij_session?: unknown }).zellij_session;
       if (typeof zs === "string" && zs.length > 0) {
         zellijSession = zs;
@@ -246,7 +228,6 @@ export function resolveConfig(): KeeperConfig {
       roots: [...DEFAULT_PLAN_ROOTS],
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
       agentuseRoot: DEFAULT_AGENTUSE_ROOT,
-      execBackend: DEFAULT_EXEC_BACKEND,
       zellijSession: DEFAULT_ZELLIJ_SESSION,
       autocloseWindows: DEFAULT_AUTOCLOSE_WINDOWS,
     };
@@ -255,7 +236,6 @@ export function resolveConfig(): KeeperConfig {
     roots,
     claudeProjectsRoot,
     agentuseRoot,
-    execBackend,
     zellijSession,
     autocloseWindows,
   };

@@ -1,9 +1,8 @@
 /**
  * `ExecBackend` — narrow interface for autopilot's terminal-surface
  * spawn/close mechanics. Autopilot is the sole consumer; the interface
- * exists so the Ghostty osascript path and the zellij `action new-tab`
- * path live behind one shape and the backend is selectable by name
- * (`exec_backend: ghostty | zellij`) from `~/.config/keeper/config.yaml`.
+ * exists as a single seam so the zellij `action new-tab` path stays
+ * pluggable (and tests can inject a fake `spawn`).
  *
  * Why a factory (no top-level side effects). The module mirrors
  * `src/live-shell.ts`: import-clean, interface first, `Default*` consts,
@@ -16,8 +15,6 @@
  * - `ExecBackend` — `launch(argv, rowId, dir)` resolves to a stable
  *   window/tab id (or `null` when nothing usable was captured), `close
  *   (windowId)` is fire-and-forget.
- * - `createGhosttyBackend({ noteLine, spawn? })` — osascript launch +
- *   yabai move; osascript repeat-loop close.
  * - `createZellijBackend({ noteLine, session, spawn? })` — lazy session-
  *   ensure (memoized once) + `action new-tab --cwd <abs> [--name <tab>]
  *   -- <argv>` + tab-id capture; `action close-tab-by-id <id>` close.
@@ -28,22 +25,19 @@
  *   pane (newest `terminal_<n>` from `action list-panes`) and pins its
  *   title via `action rename-pane -p` — authoritative over the command-
  *   derived default and over later program OSC-2 titles.
- * - `resolveExecBackend(name, deps)` — factory by name; defaults to and
- *   falls back to `"zellij"` on an unknown name (the config layer
- *   validates upstream, this is belt-and-suspenders).
+ * - `resolveExecBackend(deps)` — factory; always returns a zellij
+ *   backend. Kept as a thin seam so call sites (cli/autopilot.ts) and
+ *   tests do not need a structural rewrite.
  *
- * Fire-and-forget contract. Both backends' `close` is true fire-and-
- * forget — they never throw back into the caller, and a stale or
- * unrecognized window/tab id no-ops (ghostty's repeat-loop returns
- * `"not-found"`; zellij `close-tab-by-id` against an unknown id surfaces
- * stderr via `noteLine` but never throws). This matters because
- * `dispatch.log` persists ids across restarts and a config-flip between
- * runs hands a foreign-format id to the other backend.
+ * Fire-and-forget contract. The backend's `close` is true fire-and-
+ * forget — it never throws back into the caller, and a stale or
+ * unrecognized tab id no-ops (zellij `close-tab-by-id` against an
+ * unknown id surfaces stderr via `noteLine` but never throws).
  *
  * ENOENT handling (zellij binary not installed): `launch` resolves
- * `null` and surfaces the missing-binary line via `noteLine`, mirroring
- * the ghostty non-zero-exit path. The dispatch already shipped to the
- * dispatch log; autopilot's auto-close just won't have an id to target.
+ * `null` and surfaces the missing-binary line via `noteLine`. The
+ * dispatch already shipped to the dispatch log; autopilot's auto-close
+ * just won't have an id to target.
  */
 
 /**
@@ -80,8 +74,7 @@ export type SpawnFn = (
  * Optional surface labels for a launch. `tabName` names the zellij tab
  * (`new-tab --name`); `paneName` pins the pane title via `rename-pane`
  * (authoritative — it survives later program OSC-2 titles from claude /
- * the fallback shell, verified on zellij 0.44). Both are ignored by the
- * Ghostty backend, which has no equivalent surface.
+ * the fallback shell, verified on zellij 0.44).
  */
 export interface LaunchOptions {
   readonly tabName?: string;
@@ -91,8 +84,7 @@ export interface LaunchOptions {
 export interface ExecBackend {
   /** Spawn a terminal surface running argv at `dir`. Resolves to a
    *  stable id, or `null` when no id was captured. `opts` carries
-   *  optional surface labels (zellij tab/pane names); the Ghostty
-   *  backend ignores them. */
+   *  optional surface labels (zellij tab/pane names). */
   launch(
     argv: string[],
     rowId: string,
@@ -111,8 +103,7 @@ export interface ExecBackend {
    *  FAIL-CLOSED: resolves `true` when liveness cannot be determined
    *  (query failed / binary missing / non-zero exit) so a probe error
    *  never opens the double-spawn hole — a suppressed dispatch self-heals
-   *  on the next snapshot edge. The Ghostty backend has no addressable
-   *  tab registry and resolves `false` (no gate). */
+   *  on the next snapshot edge. */
   isSurfaceLive(name: string): Promise<boolean>;
 }
 
@@ -130,8 +121,9 @@ const ANSI_CSI_RE = new RegExp(
 );
 
 /**
- * Default backend name when the config key is missing or fails
- * validation. The epic ships zellij as the default.
+ * Default backend name. Zellij is the only backend; the literal is
+ * retained as an exported const so the lockstep `db.ts` site and tests
+ * have one source of truth.
  */
 export const DEFAULT_EXEC_BACKEND = "zellij" as const;
 
@@ -142,18 +134,9 @@ export const DEFAULT_EXEC_BACKEND = "zellij" as const;
 export const DEFAULT_ZELLIJ_SESSION = "autopilot" as const;
 
 /**
- * Ghostty backend dependencies. `noteLine` is the lifecycle sidecar
- * sink (autopilot's `noteLine`); `spawn` defaults to `Bun.spawn` and
- * is injectable for tests.
- */
-export interface GhosttyBackendDeps {
-  readonly noteLine: (line: string) => void;
-  readonly spawn?: SpawnFn;
-}
-
-/**
  * Zellij backend dependencies. `session` is the target session name;
- * `noteLine` + `spawn` mirror `GhosttyBackendDeps`.
+ * `noteLine` is the lifecycle sidecar sink (autopilot's `noteLine`);
+ * `spawn` defaults to `Bun.spawn` and is injectable for tests.
  */
 export interface ZellijBackendDeps {
   readonly noteLine: (line: string) => void;
@@ -162,8 +145,8 @@ export interface ZellijBackendDeps {
 }
 
 /**
- * Resolver dependencies. The union of the two backend dep bags — the
- * resolver picks the matching subset based on the chosen backend name.
+ * Resolver dependencies. Matches the zellij dep bag minus the required
+ * `session` (the resolver fills in `DEFAULT_ZELLIJ_SESSION` when absent).
  */
 export interface ResolveExecBackendDeps {
   readonly noteLine: (line: string) => void;
@@ -188,70 +171,6 @@ async function streamToText(s: ReadableStream | null): Promise<string> {
  */
 const defaultSpawn: SpawnFn = (cmd, options) =>
   Bun.spawn(cmd, options) as ReturnType<SpawnFn>;
-
-/**
- * Build the ghostty osascript argv for a launch. Pure — exported for
- * tests so they can assert the AppleScript shape without spawning.
- *
- * Wraps `argv` (already shaped by the caller — typically
- * `[shell, "-l", "-i", "-c", body]`) into the `new surface configuration`
- * → `new window with configuration cfg` → `return id of w` sequence
- * that emits `tab-group-…` on stdout. The osascript-line array is
- * flattened into `-e <line>` pairs in the order osascript expects.
- */
-export function buildGhosttyLaunchArgs(argv: string[]): string[] {
-  // The shell invocation is a single command string; quote it so the
-  // AppleScript carries the body verbatim through `command of cfg`.
-  const shellInvocation = argv.map((a) => quoteForShell(a)).join(" ");
-  const appleScript = [
-    'tell application "Ghostty"',
-    "set cfg to new surface configuration",
-    `set command of cfg to ${JSON.stringify(shellInvocation)}`,
-    // `set w to new window …` captures the spawned window so we can
-    // `return id of w`; the AppleScript stdout is then piped to
-    // osascript's exit-0 stdout (`tab-group-…`) which we parse for the
-    // `windowId` stamp. Isolating the osascript spawn from the yabai
-    // tail keeps that capture clean.
-    "set w to new window with configuration cfg",
-    "return id of w",
-    "end tell",
-  ];
-  const out: string[] = ["osascript"];
-  for (const line of appleScript) {
-    out.push("-e", line);
-  }
-  return out;
-}
-
-/**
- * Build the ghostty osascript argv for a close. Pure — exported for
- * tests. Implements the verified repeat-loop close pattern (tip
- * Ghostty `cb36966a7`, 2026-05-29): `close window id "..."` errors
- * -2741 (text vs integer specifier), `close <w>` errors -1708 (verb
- * belongs to the `terminal` class not `window`). The repeat-loop walks
- * the window list, matches by id, and fires `close window <w>` against
- * the AppleScript object reference — the only form that actually reaps
- * the surface.
- */
-export function buildGhosttyCloseArgs(windowId: string): string[] {
-  const appleScript = [
-    `set wid to ${JSON.stringify(windowId)}`,
-    'tell application "Ghostty"',
-    "repeat with w in every window",
-    "if id of w is wid then",
-    "close window w",
-    "return",
-    "end if",
-    "end repeat",
-    'return "not-found"',
-    "end tell",
-  ];
-  const out: string[] = ["osascript"];
-  for (const line of appleScript) {
-    out.push("-e", line);
-  }
-  return out;
-}
 
 /**
  * Build the zellij `action new-tab` argv. Pure — exported for tests.
@@ -442,130 +361,6 @@ export function newestTerminalPaneId(text: string): string | null {
  */
 export function buildZellijAttachBgArgs(session: string): string[] {
   return ["zellij", "attach", "-b", session];
-}
-
-/**
- * Shell-quote a single argv element when re-joining for AppleScript's
- * `command of cfg` (which takes a single command-string, not an argv
- * array). The Ghostty launch path is the only consumer — zellij takes
- * argv after `--` directly, no quoting needed.
- *
- * Strategy: if the token contains only `[A-Za-z0-9_/.-]` it's safe
- * verbatim; otherwise single-quote-wrap and escape any embedded single
- * quotes with the `'\''` POSIX dance. This matches the verbatim
- * pre-extraction behavior of the old `launchInGhostty` — the caller
- * built `shell -l -i -c <JSON-quoted-body>` directly, so we recover the
- * same layout when the argv shape is `[shell, "-l", "-i", "-c", body]`.
- */
-function quoteForShell(token: string): string {
-  if (token.length > 0 && /^[A-Za-z0-9_/.-]+$/.test(token)) {
-    return token;
-  }
-  return `'${token.replace(/'/g, `'\\''`)}'`;
-}
-
-/**
- * Ghostty backend factory. Returns an `ExecBackend` whose `launch`
- * spawns osascript (captures `tab-group-…` from stdout) and fires a
- * fire-and-forget yabai move; `close` runs the repeat-loop osascript
- * close.
- */
-export function createGhosttyBackend(deps: GhosttyBackendDeps): ExecBackend {
-  const spawn = deps.spawn ?? defaultSpawn;
-  return {
-    async launch(
-      argv: string[],
-      rowId: string,
-      _dir: string,
-      _opts?: LaunchOptions,
-    ): Promise<string | null> {
-      const osascriptArgs = buildGhosttyLaunchArgs(argv);
-      try {
-        const proc = spawn(osascriptArgs, {
-          stdout: "pipe",
-          stderr: "pipe",
-          stdin: "ignore",
-        });
-        const [exitCode, stdoutText, stderrText] = await Promise.all([
-          proc.exited,
-          streamToText(proc.stdout),
-          streamToText(proc.stderr),
-        ]);
-        if (stderrText.length > 0) {
-          deps.noteLine(`# launch stderr (${rowId}): ${stderrText.trim()}`);
-        }
-        // Fire-and-forget yabai move — `yabai -m window --space 5`
-        // operates on the focused window, which is the brand-new Ghostty
-        // window. The 0.3s sleep gives Ghostty time to claim focus. yabai
-        // not being installed is fine (`|| true`).
-        try {
-          spawn(
-            [
-              "sh",
-              "-c",
-              "sleep 0.3 && yabai -m window --space 5 2>/dev/null || true",
-            ],
-            { stdout: "ignore", stderr: "ignore", stdin: "ignore" },
-          );
-        } catch {
-          // best-effort; the dispatch already shipped via osascript.
-        }
-        const windowId = stdoutText.trim();
-        if (exitCode === 0 && windowId.length > 0) {
-          return windowId;
-        }
-        if (exitCode !== 0) {
-          deps.noteLine(
-            `# warn: osascript spawn for ${rowId} exited non-zero (${exitCode}); window will not auto-close`,
-          );
-        }
-        return null;
-      } catch (err) {
-        deps.noteLine(
-          `# warn: launch spawn for ${rowId} failed: ${(err as Error).message}`,
-        );
-        return null;
-      }
-    },
-    close(windowId: string): void {
-      const args = buildGhosttyCloseArgs(windowId);
-      try {
-        const proc = spawn(args, {
-          stdout: "ignore",
-          stderr: "pipe",
-          stdin: "ignore",
-        });
-        // Fire-and-forget; surface stderr (osascript error or
-        // "not-found") to the lifecycle sidecar but never throw
-        // back into the transitions loop.
-        Promise.all([proc.exited, streamToText(proc.stderr)])
-          .then(([_exitCode, stderrText]) => {
-            if (stderrText.length > 0) {
-              deps.noteLine(
-                `# closeWindow stderr (${windowId}): ${stderrText.trim()}`,
-              );
-            }
-          })
-          .catch((err) => {
-            deps.noteLine(
-              `# warn: closeWindow spawn (${windowId}) failed: ${(err as Error).message}`,
-            );
-          });
-      } catch (err) {
-        deps.noteLine(
-          `# warn: closeWindow spawn (${windowId}) failed: ${(err as Error).message}`,
-        );
-      }
-    },
-    // Ghostty has no addressable tab/surface registry the launcher can
-    // query by name, so the name-exact gate is a no-op here — resolve
-    // `false` (never suppress). The duplicate-spawn protection the gate
-    // provides is zellij-only; the Ghostty backend is being retired, so
-    // this is the documented degradation, not a gap.
-    async isSurfaceLive(_name: string): Promise<boolean> {
-      return false;
-    },
-  };
 }
 
 /**
@@ -802,29 +597,11 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
 }
 
 /**
- * Resolve a backend by name. Hard-defaults to `"zellij"` and falls
- * back to `"zellij"` on any unknown name (the config layer already
- * validates, so this is belt-and-suspenders). An unknown name is
- * surfaced via `noteLine` so a typo in `~/.config/keeper/config.yaml`
- * is visible without crashing autopilot.
+ * Resolve the exec backend. Zellij is the only backend; the function
+ * is retained as a thin seam so the call site in cli/autopilot.ts (and
+ * future alternative backends) keep one stable entry point.
  */
-export function resolveExecBackend(
-  name: string | undefined,
-  deps: ResolveExecBackendDeps,
-): ExecBackend {
-  if (name === "ghostty") {
-    return createGhosttyBackend({ noteLine: deps.noteLine, spawn: deps.spawn });
-  }
-  if (name === "zellij" || name == null || name === "") {
-    return createZellijBackend({
-      noteLine: deps.noteLine,
-      session: deps.session ?? DEFAULT_ZELLIJ_SESSION,
-      spawn: deps.spawn,
-    });
-  }
-  deps.noteLine(
-    `# warn: unknown exec_backend "${name}"; falling back to "${DEFAULT_EXEC_BACKEND}"`,
-  );
+export function resolveExecBackend(deps: ResolveExecBackendDeps): ExecBackend {
   return createZellijBackend({
     noteLine: deps.noteLine,
     session: deps.session ?? DEFAULT_ZELLIJ_SESSION,
