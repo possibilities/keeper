@@ -47,6 +47,7 @@ function makeHarness(): Harness {
   const deps: DispatchDeps = {
     handlers: {
       board: mkHandler("board"),
+      jobs: mkHandler("jobs"),
       git: mkHandler("git"),
       usage: mkHandler("usage"),
       autopilot: mkHandler("autopilot"),
@@ -162,6 +163,7 @@ describe("cli/keeper dispatch", () => {
 
   test("isSubcommand narrows correctly", () => {
     expect(isSubcommand("board")).toBe(true);
+    expect(isSubcommand("jobs")).toBe(true);
     expect(isSubcommand("git")).toBe(true);
     expect(isSubcommand("usage")).toBe(true);
     expect(isSubcommand("autopilot")).toBe(true);

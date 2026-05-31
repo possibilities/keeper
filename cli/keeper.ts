@@ -25,6 +25,7 @@ import packageJson from "../package.json" with { type: "json" };
 
 export const SUBCOMMANDS = [
   "board",
+  "jobs",
   "git",
   "usage",
   "autopilot",
@@ -39,6 +40,7 @@ Usage:
 
 Subcommands:
   board       Combined epics + jobs board
+  jobs        Live jobs list
   git         Live git status frames
   usage       Live usage frames
   autopilot   Dispatch log viewer
@@ -117,6 +119,7 @@ export async function main(): Promise<void> {
   // OpenTUI-backed) renderers. Each `cli/<sub>.ts` exports `main(argv)`.
   const handlers: Record<Subcommand, SubcommandHandler> = {
     board: async (argv) => (await import("./board")).main(argv),
+    jobs: async (argv) => (await import("./jobs")).main(argv),
     git: async (argv) => (await import("./git")).main(argv),
     usage: async (argv) => (await import("./usage")).main(argv),
     autopilot: async (argv) => (await import("./autopilot")).main(argv),
