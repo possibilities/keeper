@@ -79,7 +79,16 @@ connection from a Worker thread (the only reliable change-detection primitive on
 macOS for keeper's DB — see [Architecture](#architecture)), then drains the log
 into the projection one short transaction per event. The reducer cursor advances in the same
 transaction as every projection write, so the fold is exactly-once-per-event
-and the boot drain re-converges idempotently after any downtime or crash.
+and the boot drain re-converges idempotently after any downtime or crash. The
+boot drain runs with WAL autocheckpointing OFF (so per-event commits never
+absorb a synchronous checkpoint that would hold the writer lock for seconds)
+and inserts a short OS-level yield AFTER each fold's COMMIT — a bounded
+event-count budget (~500 events × 5 ms ≈ 2.5 s) so the bounce window stays
+small under a normal backlog, and a from-scratch re-fold catches up to head
+without paying the per-event sleep for minutes. The end-of-boot WAL checkpoint
+is `PASSIVE` (writer-skipping), never `TRUNCATE` (writer-blocking), so a
+concurrent hook INSERT landing during the bounce window is never starved into
+a dead-letter while the checkpoint completes.
 
 Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names

@@ -85,7 +85,7 @@ import type {
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
 import type { GitWorkerData, GitWorkerMessage } from "./git-worker";
 import type { PlanMessage, PlanWorkerData } from "./plan-worker";
-import { DEFAULT_BATCH_SIZE, drain } from "./reducer";
+import { DEFAULT_BATCH_SIZE, type DrainOptions, drain } from "./reducer";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
   ReplayRequestMessage,
@@ -118,13 +118,54 @@ const WORKER_SHUTDOWN_DEADLINE_MS = 2000;
  * idempotent code path the design mandates. Each `drain()` call folds at most
  * `batchSize` events in their own transactions, so the writer lock is released
  * between batches and hook inserts are never starved.
+ *
+ * Pacing (boot only): the boot caller may pass `DrainOptions` to enable a
+ * short OS-level sleep AFTER each fold's COMMIT, opening a contention window
+ * for concurrent hook INSERTs to slip in instead of starving on the
+ * boot-drain's tight `BEGIN IMMEDIATE` loop. The pacing budget
+ * (`options.paceEvents`) is the TOTAL number of paced folds across all
+ * `drain()` batches in this call — once the budget is spent, the remaining
+ * batches run unpaced, so a large from-scratch re-fold catches up to head in
+ * bounded time. Steady-state callers (every wake-loop drain) pass no
+ * options and the function behaves exactly as before.
+ *
+ * Single drain code path: pacing is a stateless parameter on the SAME
+ * `drain()` function steady state uses — no forked boot drain, per the
+ * CLAUDE.md invariant.
  */
 export function drainToCompletion(
   db: Database,
   batchSize = DEFAULT_BATCH_SIZE,
+  options: DrainOptions = {},
 ): void {
-  while (drain(db, batchSize) > 0) {
-    // keep folding until caught up
+  // Carry the pacing budget across batches: each `drain()` call decrements it
+  // by the number of events paced inside that batch (capped by the batch
+  // size). When the budget reaches 0 we stop passing pacing options so the
+  // tail of a large backlog runs full-speed.
+  let remainingPaceEvents = options.paceEvents ?? 0;
+  const paceMs = options.paceMs ?? 0;
+  const sleep = options.sleep;
+  for (;;) {
+    const batchOptions: DrainOptions =
+      paceMs > 0 && (remainingPaceEvents > 0 || (options.paceEvents ?? 0) === 0)
+        ? {
+            paceMs,
+            // A bare `paceMs` with no `paceEvents` cap paces the whole batch;
+            // a budget caps it to at most `remainingPaceEvents` events this
+            // batch. The next iteration sees the post-decrement count.
+            paceEvents:
+              (options.paceEvents ?? 0) === 0
+                ? 0
+                : Math.min(remainingPaceEvents, batchSize),
+            sleep,
+          }
+        : {};
+    const folded = drain(db, batchSize, batchOptions);
+    if (folded === 0) return;
+    if (remainingPaceEvents > 0) {
+      // The batch paced at most min(remainingPaceEvents, folded) events.
+      remainingPaceEvents -= Math.min(remainingPaceEvents, folded);
+    }
   }
 }
 
@@ -137,8 +178,40 @@ export function drainToCompletion(
 export const WAL_AUTOCHECKPOINT_PAGES = 1000;
 
 /**
- * Run the heavy boot drain with WAL auto-checkpointing DISABLED, then flush and
- * truncate the WAL once and restore the steady-state threshold.
+ * Post-COMMIT sleep duration (ms) for the boot drain. A real OS sleep — the JS
+ * thread is blocked via `Atomics.wait` — opens a writer-lock window after
+ * every fold's COMMIT so a concurrent hook INSERT (separate process) lands in
+ * the gap instead of starving on the boot drain's tight `BEGIN IMMEDIATE`
+ * loop. WAL gives NO writer FIFO fairness, so without this gap a sleeping
+ * hook's busy-handler retry routinely loses the race to the reducer's next
+ * `BEGIN IMMEDIATE` (microseconds after COMMIT) and exhausts its 2.4s budget
+ * → dead-letter. `setImmediate` / event-loop yields do NOT help — they don't
+ * release the SQLite lock to a separate process.
+ *
+ * Sized as small-but-real: 5ms × `BOOT_DRAIN_PACE_EVENTS` = ~2.5s total paced
+ * latency budget, well under the bounce window's existing patience. Each gap
+ * is wider than the hook's 30ms retry sleep so a hook that catches a paced
+ * gap completes its INSERT comfortably.
+ */
+export const BOOT_DRAIN_PACE_MS = 5;
+
+/**
+ * Pacing budget (event count) for the boot drain. After this many paced
+ * folds, the remaining drain runs unpaced — guarantees a large from-scratch
+ * re-fold (the schema-migration path that rewinds the cursor and replays the
+ * ~150k-event log) catches up to head in bounded extra time
+ * (`BOOT_DRAIN_PACE_MS × BOOT_DRAIN_PACE_EVENTS` ≈ 2.5s) instead of paying
+ * `paceMs` per event for minutes. Normal bounce backlogs (since the last
+ * daemon run, seconds of events ≈ a few hundred) fit comfortably inside the
+ * budget — they get full coverage of the contention window. The bounce
+ * window for which the pacing matters is the first few seconds; events past
+ * that are folded with no concurrent hooks waiting on the writer.
+ */
+export const BOOT_DRAIN_PACE_EVENTS = 500;
+
+/**
+ * Run the heavy boot drain with WAL auto-checkpointing DISABLED, then flush the
+ * WAL once and restore the steady-state threshold.
  *
  * Why: a from-scratch re-fold (every schema migration rewinds
  * `reducer_state.last_event_id` and clears the projections) commits ~150k
@@ -155,13 +228,23 @@ export const WAL_AUTOCHECKPOINT_PAGES = 1000;
  * With auto-checkpoint off, every fold COMMIT is a pure WAL append
  * (`synchronous=NORMAL` ⇒ commits don't fsync; only checkpoints do), so the
  * write lock is released promptly and hook INSERTs interleave instead of
- * starving. The WAL grows for the duration; a single `wal_checkpoint(TRUNCATE)`
- * in the `finally` flushes it back into the main DB and reclaims the file, and
- * we restore `wal_autocheckpoint` so steady state is unchanged (checkpoints
- * spread across infrequent events on a warm cache). The `finally` guarantees
- * we never leave the long-running writer with checkpointing disabled even if a
- * drain throws. Cheap and harmless when the drain is small (a near-head
- * restart): the truncate of a small WAL is milliseconds.
+ * starving. The WAL grows for the duration; a single `wal_checkpoint(PASSIVE)`
+ * in the `finally` flushes COMMITted frames back into the main DB without
+ * waiting on any writer, and we restore `wal_autocheckpoint` so steady state
+ * is unchanged. The `finally` guarantees we never leave the long-running
+ * writer with checkpointing disabled even if a drain throws.
+ *
+ * Why PASSIVE and not TRUNCATE: TRUNCATE waits for any concurrent writers AND
+ * for any read transaction old enough to still need pre-WAL pages; under
+ * concurrent hook INSERTs landing during the bounce window, a TRUNCATE here
+ * absorbs a full hook `busy_timeout` (1.2s) of writer-lock-blocked latency and
+ * starves a second hook into dead-letters. PASSIVE skips writers — it
+ * checkpoints what it can without blocking — so the bounce window closes
+ * cleanly even if a hook is mid-INSERT. The WAL file is not reclaimed on this
+ * pass (TRUNCATE's only extra job), but it shrinks naturally on subsequent
+ * auto-checkpoints once steady state resumes; the alternative — wedging a
+ * concurrent hook into a drop — is strictly worse than carrying a slightly
+ * larger WAL forward for a few minutes.
  */
 export function withBootDrainCheckpointTuning(
   db: Database,
@@ -171,7 +254,7 @@ export function withBootDrainCheckpointTuning(
   try {
     body();
   } finally {
-    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.run("PRAGMA wal_checkpoint(PASSIVE)");
     db.run(`PRAGMA wal_autocheckpoint = ${WAL_AUTOCHECKPOINT_PAGES}`);
   }
 }
@@ -616,10 +699,26 @@ function runDaemon(): void {
   // workers spawn, so the projection is consistent the moment the UDS server
   // starts serving. See `seedKilledSweep` for the Q7 match rules; the trailing
   // drain folds the synthetic Killed events the sweep just emitted.
+  //
+  // Boot-pacing: a stateless boot-phase parameter that gates a short OS-level
+  // sleep AFTER each fold's COMMIT in the SAME `drain()` function steady
+  // state uses (single drain path; CLAUDE.md "one drain code path serves
+  // boot and steady-state" invariant preserved). Bounded by
+  // `BOOT_DRAIN_PACE_EVENTS` so a from-scratch re-fold catches up to head in
+  // bounded time; steady-state wakes pass no options and behave exactly as
+  // before. The seed sweep itself is a synchronous write block between the
+  // two drain passes, so the SECOND drain's pacing budget starts fresh —
+  // covering the post-sweep window where the freshly-emitted `Killed`
+  // events are folded and a concurrent hook might race the seed-sweep's
+  // own writer lock-release.
+  const bootPace: DrainOptions = {
+    paceMs: BOOT_DRAIN_PACE_MS,
+    paceEvents: BOOT_DRAIN_PACE_EVENTS,
+  };
   withBootDrainCheckpointTuning(db, () => {
-    drainToCompletion(db);
+    drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
     seedKilledSweep(db);
-    drainToCompletion(db);
+    drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
   });
 
   // Step 2b — dead-letter boot import (fn-643 task .3). Read every NDJSON

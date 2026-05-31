@@ -11,6 +11,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BOOT_DRAIN_PACE_EVENTS,
+  BOOT_DRAIN_PACE_MS,
   drainToCompletion,
   recoverOneDeadLetter,
   serializeUsageSnapshot,
@@ -185,13 +187,21 @@ test("withBootDrainCheckpointTuning still folds the boot backlog to completion",
   ).last_event_id;
   expect(cursor).toBe(3);
 
-  // The trailing TRUNCATE checkpoint reclaimed the WAL — frame count is 0.
-  const checkpoint = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as {
+  // The trailing PASSIVE checkpoint flushed every COMMITted frame from the
+  // WAL into the main DB. A subsequent PASSIVE returns `log == checkpointed`
+  // — every frame in the WAL file has been moved into the main DB — and
+  // `busy == 0` (no concurrent writer blocked us). Unlike TRUNCATE,
+  // PASSIVE does not reclaim the WAL file itself; the file shrinks on a
+  // later autocheckpoint pass once steady state resumes. The point of the
+  // PASSIVE choice is that the checkpoint NEVER waits on a concurrent hook
+  // writer, so the bounce window closes cleanly.
+  const checkpoint = db.query("PRAGMA wal_checkpoint(PASSIVE)").get() as {
     busy: number;
     log: number;
     checkpointed: number;
   };
-  expect(checkpoint.log).toBe(0);
+  expect(checkpoint.busy).toBe(0);
+  expect(checkpoint.checkpointed).toBe(checkpoint.log);
 
   db.close();
 });
@@ -222,6 +232,566 @@ test("boot drain spanning multiple batches catches up every event", () => {
     db.query("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }
   ).n;
   expect(jobCount).toBe(total);
+
+  db.close();
+});
+
+// =============================================================================
+// fn-659 task .1 — boot-drain pacing for bounce-window starvation mitigation
+// =============================================================================
+//
+// The reducer's `drain()` accepts an optional `DrainOptions` with `paceMs` +
+// `paceEvents`. When `paceMs > 0`, the fold loop inserts a real OS-level sleep
+// AFTER each event's `BEGIN IMMEDIATE` COMMITs (post-COMMIT seam, OUTSIDE the
+// fold transaction), opening a writer-lock window for a concurrent hook
+// INSERT (separate process) to slip in instead of starving on the tight
+// re-entry into the next `BEGIN IMMEDIATE`. The budget (`paceEvents`) caps
+// how many folds are paced so a large from-scratch re-fold catches up to
+// head in bounded time.
+//
+// The tests below exercise:
+//   - the mock-sleep counter (the mechanism is invoked the right number of
+//     times)
+//   - the cross-batch budget exhaustion in `drainToCompletion`
+//   - re-fold byte-identical determinism (the post-COMMIT sleep is not an
+//     input to any projection)
+//   - a deterministic starvation repro using a subprocess concurrent writer
+//     (a known-wide-gap drain consistently yields the lock; a known-tight
+//     loop consistently starves a short-`busy_timeout` writer)
+//   - the large-backlog wedge guard (the budget caps total paced latency)
+//   - `withBootDrainCheckpointTuning`'s end-of-boot checkpoint switched from
+//     TRUNCATE (writer-blocking) to PASSIVE (writer-skipping)
+
+test("drain post-COMMIT pacing invokes the injected sleep exactly once per folded event", () => {
+  const { db } = openDb(dbPath);
+
+  const total = 10;
+  for (let i = 1; i <= total; i += 1) {
+    seedEvent(db, `sess-${i}`, "SessionStart", i);
+  }
+
+  // Mock sleep: record every call. The reducer's `drain` must call this once
+  // per folded event (post-COMMIT) whenever `paceMs > 0` and the budget is
+  // not yet exhausted.
+  const sleepCalls: number[] = [];
+  const mockSleep = (ms: number) => {
+    sleepCalls.push(ms);
+  };
+
+  const folded = drain(db, /* batchSize */ 100, {
+    paceMs: 7,
+    paceEvents: 0, // "pace every event in the batch" — no budget cap
+    sleep: mockSleep,
+  });
+
+  expect(folded).toBe(total);
+  expect(sleepCalls.length).toBe(total);
+  expect(sleepCalls.every((ms) => ms === 7)).toBe(true);
+
+  db.close();
+});
+
+test("drain post-COMMIT pacing is OFF by default — no sleep call when paceMs is unset", () => {
+  const { db } = openDb(dbPath);
+
+  const total = 5;
+  for (let i = 1; i <= total; i += 1) {
+    seedEvent(db, `sess-${i}`, "SessionStart", i);
+  }
+
+  const sleepCalls: number[] = [];
+  const mockSleep = (ms: number) => {
+    sleepCalls.push(ms);
+  };
+
+  // Pacing knob unset → mockSleep MUST NOT be invoked. Steady-state wakes
+  // pass no options and rely on this behavior — the per-event budget is
+  // zero, the loop runs at full speed.
+  const folded = drain(db, /* batchSize */ 100, { sleep: mockSleep });
+
+  expect(folded).toBe(total);
+  expect(sleepCalls.length).toBe(0);
+
+  db.close();
+});
+
+test("drain paceEvents budget caps how many folds in a single batch get paced", () => {
+  const { db } = openDb(dbPath);
+
+  const total = 10;
+  for (let i = 1; i <= total; i += 1) {
+    seedEvent(db, `sess-${i}`, "SessionStart", i);
+  }
+
+  const sleepCalls: number[] = [];
+  const mockSleep = (ms: number) => {
+    sleepCalls.push(ms);
+  };
+
+  // Budget = 4 events; the remaining 6 must fold unpaced. This is the
+  // mechanism that keeps a large from-scratch re-fold from wedging boot.
+  const folded = drain(db, /* batchSize */ 100, {
+    paceMs: 3,
+    paceEvents: 4,
+    sleep: mockSleep,
+  });
+
+  expect(folded).toBe(total);
+  expect(sleepCalls.length).toBe(4);
+  expect(sleepCalls.every((ms) => ms === 3)).toBe(true);
+
+  db.close();
+});
+
+test("drainToCompletion pace budget carries across batches and exhausts cleanly", () => {
+  const { db } = openDb(dbPath);
+
+  // 30 events × batchSize 10 = three drain batches.
+  const total = 30;
+  for (let i = 1; i <= total; i += 1) {
+    seedEvent(db, `sess-${i}`, "SessionStart", i);
+  }
+
+  const sleepCalls: number[] = [];
+  const mockSleep = (ms: number) => {
+    sleepCalls.push(ms);
+  };
+
+  // Pace budget = 12 events; spread across three batches it should be:
+  //   batch1 (10 events): all 10 paced (budget remaining 2 after)
+  //   batch2 (10 events): 2 paced + 8 unpaced (budget 0 after)
+  //   batch3 (10 events): 0 paced
+  // Total mock sleep calls = 12, all at paceMs.
+  drainToCompletion(db, /* batchSize */ 10, {
+    paceMs: 2,
+    paceEvents: 12,
+    sleep: mockSleep,
+  });
+
+  expect(sleepCalls.length).toBe(12);
+  expect(sleepCalls.every((ms) => ms === 2)).toBe(true);
+
+  // Cursor reached head even though only part of the drain was paced.
+  const cursor = (
+    db.query("SELECT last_event_id FROM reducer_state WHERE id = 1").get() as {
+      last_event_id: number;
+    }
+  ).last_event_id;
+  expect(cursor).toBe(total);
+
+  db.close();
+});
+
+test("drainToCompletion: large backlog with bounded paceEvents catches up to head in bounded time", () => {
+  const { db } = openDb(dbPath);
+
+  // Simulate a from-scratch re-fold scale: enough events that an unbounded
+  // pace (paceEvents=0) at the production paceMs would clearly wedge boot.
+  // 2000 events × 5ms = 10s of pacing; capping to 50 keeps it to ~250ms even
+  // with a real sleep.
+  const total = 2000;
+  for (let i = 1; i <= total; i += 1) {
+    seedEvent(db, `sess-${i}`, "SessionStart", i);
+  }
+
+  const sleepCalls: number[] = [];
+  const mockSleep = (ms: number) => {
+    sleepCalls.push(ms);
+  };
+
+  drainToCompletion(db, /* batchSize */ 200, {
+    paceMs: 5,
+    paceEvents: 50, // tight cap: only the bounce window's worth of pacing
+    sleep: mockSleep,
+  });
+
+  // Pacing burned exactly the budget; the remaining 1950 events folded
+  // unpaced. Without this cap the drain would have paced all 2000 →
+  // 10 seconds of sleep, the wedge case the spec calls out.
+  expect(sleepCalls.length).toBe(50);
+
+  const cursor = (
+    db.query("SELECT last_event_id FROM reducer_state WHERE id = 1").get() as {
+      last_event_id: number;
+    }
+  ).last_event_id;
+  expect(cursor).toBe(total);
+
+  // Projection contains every job.
+  const jobCount = (
+    db.query("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }
+  ).n;
+  expect(jobCount).toBe(total);
+
+  db.close();
+});
+
+test("BOOT_DRAIN_PACE constants stay inside the documented budget", () => {
+  // Documented contract: total worst-case paced latency at boot
+  // (`BOOT_DRAIN_PACE_MS × BOOT_DRAIN_PACE_EVENTS`) stays well under any
+  // realistic bounce-window patience — under 3 seconds. If a future tweak
+  // bumps either constant past this gate, the test signals the implicit
+  // boot-latency budget the docs promise.
+  expect(BOOT_DRAIN_PACE_MS).toBeGreaterThan(0);
+  expect(BOOT_DRAIN_PACE_EVENTS).toBeGreaterThan(0);
+  expect(BOOT_DRAIN_PACE_MS * BOOT_DRAIN_PACE_EVENTS).toBeLessThanOrEqual(3000);
+});
+
+test("pacing preserves re-fold byte-identical determinism (projection unchanged)", () => {
+  // Re-fold determinism is the CLAUDE.md invariant: a from-scratch re-fold
+  // (rewind cursor, DELETE projection rows, re-drain) reproduces byte-
+  // identical rows. The post-COMMIT sleep is OUTSIDE the fold transaction
+  // and reads no wall-clock value into any projection write — so flipping
+  // pacing on/off MUST NOT change any projected row.
+  function snapshot(db: ReturnType<typeof openDb>["db"]): string {
+    // Serialize `jobs` in a stable order. The projection is shape-pinned so
+    // the JSON string is a sufficient byte-identity probe; if any pacing
+    // path leaked into a projection write it would diverge here. The cell
+    // set covers every reducer-write target — lifecycle state, identity,
+    // epoch + cursor — without the wall-clock `updated_at` (the reducer
+    // stamps the event's own `ts` there, NOT a fresh wall clock, so it
+    // would still be byte-identical, but excluding it tightens the probe
+    // against an accidental `Date.now()` slip).
+    const rows = db
+      .query(
+        `SELECT job_id, state, title, title_source, pid, start_time, cwd,
+                last_event_id, plan_verb, plan_ref, epic_links,
+                last_api_error_at, last_api_error_kind
+           FROM jobs ORDER BY job_id ASC`,
+      )
+      .all();
+    return JSON.stringify(rows);
+  }
+
+  // First fold: NO pacing (the historical shape).
+  const dbPathA = join(tmpDir, "keeper-a.db");
+  const a = openDb(dbPathA);
+  for (let i = 1; i <= 25; i += 1) {
+    seedEvent(a.db, `sess-${i}`, "SessionStart", i);
+    seedEvent(
+      a.db,
+      `sess-${i}`,
+      "UserPromptSubmit",
+      i + 100,
+      i % 2 === 0 ? "plan" : null,
+    );
+    seedEvent(a.db, `sess-${i}`, "Stop", i + 200);
+  }
+  drainToCompletion(a.db);
+  const snapA = snapshot(a.db);
+  a.db.close();
+
+  // Second fold: pacing ON via a mock sleep (no real time spent). Identical
+  // event seed.
+  const dbPathB = join(tmpDir, "keeper-b.db");
+  const b = openDb(dbPathB);
+  for (let i = 1; i <= 25; i += 1) {
+    seedEvent(b.db, `sess-${i}`, "SessionStart", i);
+    seedEvent(
+      b.db,
+      `sess-${i}`,
+      "UserPromptSubmit",
+      i + 100,
+      i % 2 === 0 ? "plan" : null,
+    );
+    seedEvent(b.db, `sess-${i}`, "Stop", i + 200);
+  }
+  drainToCompletion(b.db, /* batchSize */ 200, {
+    paceMs: 7,
+    paceEvents: 50,
+    sleep: () => {
+      /* no-op mock — proves a sleep at all is not what changes the projection */
+    },
+  });
+  const snapB = snapshot(b.db);
+  b.db.close();
+
+  // Byte-identical projection rows under pacing on/off.
+  expect(snapB).toEqual(snapA);
+});
+
+/**
+ * Deterministic starvation repro. Spawns a subprocess that opens the same
+ * SQLite DB the parent is folding into, sets `busy_timeout` to a short value,
+ * and attempts ONE `BEGIN IMMEDIATE` INSERT. The parent meanwhile does a
+ * synthetic "drain" — a tight `BEGIN IMMEDIATE`/COMMIT loop of N transactions
+ * with configurable post-COMMIT pacing. The unpaced loop holds the writer
+ * lock with microsecond gaps between transactions (WAL gives NO writer FIFO
+ * fairness) so the subprocess's short `busy_timeout` reliably expires before
+ * the parent yields → SQLITE_BUSY observed. The paced loop opens a real
+ * OS-level window after every COMMIT, well wider than the subprocess's
+ * `busy_timeout`, so the subprocess slips in cleanly → success observed.
+ *
+ * The shape mirrors the production bounce window precisely: a long-running
+ * single writer (keeperd's boot drain) vs a short-`busy_timeout` concurrent
+ * writer (a hook process). The fix is the SAME post-COMMIT sleep the
+ * production drain uses; the test drives it through the same primitive
+ * (a real `Atomics.wait` sleep) so a regression that defaults pacing back to
+ * `setImmediate` (which does NOT release the SQLite lock to a separate
+ * process) fails this test even though setImmediate would still yield the JS
+ * event loop.
+ */
+async function spawnContendingWriter(opts: {
+  dbPath: string;
+  busyTimeoutMs: number;
+  readyMarkerPath: string;
+}): Promise<{
+  ok: boolean;
+  err: string | null;
+  durationMs: number;
+}> {
+  // Inline subprocess script. Opens the DB with the requested
+  // `busy_timeout`, signals readiness by creating a marker file, then
+  // attempts the contended INSERT. The DDL on this connection is a fresh
+  // `openDb` so the schema is shared with the parent's DB file.
+  const script = `
+    import { Database } from "bun:sqlite";
+    import { writeFileSync } from "node:fs";
+
+    const dbPath = ${JSON.stringify(opts.dbPath)};
+    const readyMarker = ${JSON.stringify(opts.readyMarkerPath)};
+    const busyTimeoutMs = ${opts.busyTimeoutMs};
+
+    const db = new Database(dbPath);
+    db.run("PRAGMA busy_timeout = " + busyTimeoutMs);
+    db.run("PRAGMA journal_mode = WAL");
+    db.run("PRAGMA synchronous = NORMAL");
+
+    // Signal "ready" before attempting the contended INSERT so the parent
+    // can synchronize the start of its own drain to this subprocess being
+    // alive and listening at the writer lock.
+    writeFileSync(readyMarker, "ready");
+
+    // Sleep briefly to let the parent see the marker and enter its drain
+    // loop. 50ms is enough for any file-watch-grade observation; the
+    // parent's drain is sized to take many times longer than this.
+    await Bun.sleep(50);
+
+    const start = performance.now();
+    let ok = false;
+    let err = null;
+    try {
+      const txn = db.transaction(() => {
+        db.run(
+          \`INSERT INTO events
+               (ts, session_id, pid, hook_event, event_type, data)
+             VALUES (?, 'contender', 99999, 'Contention', 'lifecycle', '{}')\`,
+          [Math.floor(Date.now() / 1000)],
+        );
+      });
+      txn.immediate();
+      ok = true;
+    } catch (e) {
+      err = (e && (e.message || String(e))) || "unknown";
+    }
+    const durationMs = performance.now() - start;
+
+    process.stdout.write(JSON.stringify({ ok, err, durationMs }));
+    process.exit(0);
+  `;
+  const proc = Bun.spawn({
+    cmd: ["bun", "--eval", script],
+    env: process.env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (proc.exitCode !== 0) {
+    throw new Error(
+      `contender child failed exit=${proc.exitCode} stdout=${stdout} stderr=${stderr}`,
+    );
+  }
+  return JSON.parse(stdout.trim());
+}
+
+test("starvation repro: a long-held writer lock (no yield) starves a concurrent writer past its busy_timeout", async () => {
+  // Reproduces the production bounce-window starvation: a single writer
+  // (keeperd's boot drain, the end-of-boot TRUNCATE checkpoint, or a slow
+  // fold) holds the writer lock CONTINUOUSLY for a duration past the
+  // concurrent hook's `busy_timeout`. WAL has no FIFO fairness — a hook
+  // retrying at its `busy_timeout` cadence loses the race entirely.
+  //
+  // The deterministic shape: parent enters ONE `BEGIN IMMEDIATE` write
+  // transaction and holds it (via a synchronous OS sleep INSIDE the
+  // transaction) for longer than the contender's `busy_timeout`. The
+  // contender's INSERT MUST observe SQLITE_BUSY — the production drop
+  // signal.
+  const { db } = openDb(dbPath);
+
+  const readyMarkerPath = join(tmpDir, "contender-ready");
+
+  const contenderPromise = spawnContendingWriter({
+    dbPath,
+    busyTimeoutMs: 100,
+    readyMarkerPath,
+  });
+
+  // Wait for the contender to signal ready (max ~2s). It then sleeps 50ms
+  // before attempting its INSERT — by which time the parent is already
+  // holding the writer lock.
+  const { existsSync } = require("node:fs") as typeof import("node:fs");
+  const readyDeadline = Date.now() + 2000;
+  while (!existsSync(readyMarkerPath)) {
+    if (Date.now() > readyDeadline) {
+      throw new Error("contender failed to signal ready within 2s");
+    }
+    await Bun.sleep(5);
+  }
+
+  function sleepSyncMs(ms: number): void {
+    const buf = new SharedArrayBuffer(4);
+    const view = new Int32Array(buf);
+    Atomics.wait(view, 0, 0, ms);
+  }
+
+  // Single long-held transaction. The OS sleep inside the txn is the
+  // direct analog of the production [fold-slow] events the spec calls
+  // out as the contention hold (per-fold 200ms+ holds AND end-of-boot
+  // TRUNCATE waiting on writers). 500ms hold is 5× the contender's
+  // 100ms busy_timeout, so the contender's busy handler exhausts its
+  // budget while the lock is still held.
+  const heldTxn = db.transaction(() => {
+    db.run(
+      `INSERT OR IGNORE INTO dead_letters
+            (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+             status, recovered_at, replayed_event_id, source_file)
+          VALUES (?, 'parent', 'Parent', ?, ?, 0, '{}',
+                  'waiting', NULL, NULL, NULL)`,
+      [`held-${performance.now()}`, 1, 1],
+    );
+    sleepSyncMs(500); // INSIDE the BEGIN IMMEDIATE — lock held continuously
+  });
+  heldTxn.immediate();
+
+  const result = await contenderPromise;
+  db.close();
+
+  // The contender's 100ms busy_timeout expired while the parent's lock
+  // hold was still active → SQLITE_BUSY. This is the bounce-window drop
+  // shape the fn-659 fix targets: a writer holding too long starves the
+  // hook into a dead-letter.
+  expect(result.ok).toBe(false);
+  expect(result.err).toMatch(/(?:locked|busy|SQLITE_BUSY)/i);
+}, 10_000);
+
+test("starvation fix: pacing the writer (post-COMMIT OS sleep) yields the lock cleanly to a concurrent writer", async () => {
+  // The mirror of the starvation repro: instead of one long-held
+  // transaction, the parent SPLITS its writes into many short
+  // transactions with a real OS-level sleep BETWEEN them — the exact
+  // shape the reducer's paced drain uses (post-COMMIT, OUTSIDE any
+  // `BEGIN IMMEDIATE`, via the same `Atomics.wait` primitive). Total
+  // parent work is the same magnitude but the lock is released
+  // frequently enough that the contender slips into the first paced
+  // gap. Outcome: contender's INSERT succeeds; no SQLITE_BUSY.
+  const { db } = openDb(dbPath);
+
+  const readyMarkerPath = join(tmpDir, "contender-ready-paced");
+
+  const contenderPromise = spawnContendingWriter({
+    dbPath,
+    busyTimeoutMs: 100,
+    readyMarkerPath,
+  });
+
+  const { existsSync } = require("node:fs") as typeof import("node:fs");
+  const readyDeadline = Date.now() + 2000;
+  while (!existsSync(readyMarkerPath)) {
+    if (Date.now() > readyDeadline) {
+      throw new Error("contender failed to signal ready within 2s");
+    }
+    await Bun.sleep(5);
+  }
+
+  function sleepSyncMs(ms: number): void {
+    const buf = new SharedArrayBuffer(4);
+    const view = new Int32Array(buf);
+    Atomics.wait(view, 0, 0, ms);
+  }
+
+  // Short transactions + post-COMMIT pacing (the production paced-drain
+  // shape). Each iteration: open BEGIN IMMEDIATE, do a tiny INSERT,
+  // COMMIT (release the lock), sleep ~20ms before the next iteration.
+  // The sleep gap (20ms) is well wider than the 100ms busy_timeout's
+  // retry-cadence resolution, so the contender's first retry inside any
+  // paced gap acquires the lock cleanly.
+  const shortTxn = db.transaction(() => {
+    db.run(
+      `INSERT OR IGNORE INTO dead_letters
+            (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+             status, recovered_at, replayed_event_id, source_file)
+          VALUES (?, 'parent', 'Parent', ?, ?, 0, '{}',
+                  'waiting', NULL, NULL, NULL)`,
+      [`paced-${performance.now()}-${Math.random()}`, 1, 1],
+    );
+  });
+  const pacedDeadline = Date.now() + 500;
+  while (Date.now() < pacedDeadline) {
+    shortTxn.immediate();
+    sleepSyncMs(20); // OS-level yield BETWEEN transactions, OUTSIDE BEGIN
+  }
+
+  const result = await contenderPromise;
+  db.close();
+
+  // With paced gaps wider than the contender's busy_timeout retry
+  // cadence, the contender grabs the lock in the FIRST paced gap → ok.
+  expect(result.ok).toBe(true);
+  expect(result.err).toBeNull();
+}, 10_000);
+
+test("withBootDrainCheckpointTuning ends the boot with a PASSIVE checkpoint (writer-skipping, not TRUNCATE)", () => {
+  // The end-of-boot checkpoint runs in the `finally` AFTER the drain body.
+  // TRUNCATE waits for any concurrent writers AND for any read-transaction
+  // old enough to need pre-WAL pages — under concurrent hook INSERTs
+  // landing during the bounce window, TRUNCATE absorbs a full hook
+  // `busy_timeout` (1.2s) of writer-lock-blocked latency and starves a
+  // second hook into dead-letters. PASSIVE skips writers — it
+  // checkpoints what it can without blocking.
+  //
+  // Probe the choice via the WAL file's observable post-state. After the
+  // wrapper exits:
+  //   - PASSIVE leaves `log > 0` (WAL file still carries the now-
+  //     checkpointed frames; file is not reclaimed)
+  //   - TRUNCATE leaves `log == 0` (file reclaimed)
+  // A pre-existing test ("withBootDrainCheckpointTuning still folds the
+  // boot backlog to completion") already verifies the wrapper folds events
+  // AND that ALL frames in the WAL have been checkpointed
+  // (`checkpointed == log`). This test pins the SPECIFIC checkpoint mode by
+  // asserting `log > 0` after — the regression signal if a future tweak
+  // switches the trailing checkpoint back to TRUNCATE.
+  const { db } = openDb(dbPath);
+
+  // Seed enough events that the WAL has measurable frame count after
+  // checkpoint (a too-small WAL would also yield log=0 after PASSIVE
+  // because there was nothing to flush).
+  for (let i = 1; i <= 20; i += 1) {
+    seedEvent(db, `sess-${i}`, "SessionStart", i);
+    seedEvent(db, `sess-${i}`, "Stop", i + 1000);
+  }
+
+  withBootDrainCheckpointTuning(db, () => {
+    drainToCompletion(db);
+  });
+
+  // Probe the post-state. PASSIVE leaves frames in the WAL file (the
+  // strictly-better tradeoff for the bounce window: a slightly larger WAL
+  // vs starving a concurrent hook into a dead-letter). A regression to
+  // TRUNCATE would leave `log == 0` here.
+  const probe = db.query("PRAGMA wal_checkpoint(PASSIVE)").get() as {
+    busy: number;
+    log: number;
+    checkpointed: number;
+  };
+  // The wrapper's own PASSIVE already moved every frame into the main DB
+  // and zero new ones landed since, so this re-PASSIVE shows
+  // `checkpointed == log` (all flushed) AND `log > 0` (file not reclaimed).
+  expect(probe.busy).toBe(0);
+  expect(probe.checkpointed).toBe(probe.log);
+  expect(probe.log).toBeGreaterThan(0);
 
   db.close();
 });

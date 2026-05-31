@@ -5596,7 +5596,75 @@ export function applyEvent(
  */
 const SLOW_FOLD_LOG_MS = 200;
 
-export function drain(db: Database, batchSize = DEFAULT_BATCH_SIZE): number {
+/**
+ * Per-fold pacing knob for {@link drain}: how many milliseconds to sleep AFTER
+ * each fold's `BEGIN IMMEDIATE` transaction COMMITs, before issuing the next
+ * `BEGIN IMMEDIATE`. The sleep is a real OS-level pause (the JS thread is
+ * blocked via `Atomics.wait`) — `setImmediate` / event-loop yields do NOT
+ * release the SQLite writer lock to a separate process, so a real sleep is the
+ * only primitive that opens a contention window for concurrent hook INSERTs.
+ *
+ * Re-fold determinism: the sleep lives in `drain` AFTER `applyEvent` returns
+ * (the transaction has already COMMITted) — never inside `applyEvent`, never
+ * inside any `project*` fn, never inside a `BEGIN IMMEDIATE`. No wall-clock
+ * read feeds any projection write, so a from-scratch re-fold with pacing on or
+ * off reproduces byte-identical rows.
+ *
+ * Single drain path: pacing is a stateless parameter on the SAME `drain()`
+ * function steady state uses; the boot caller passes a positive `paceMs`, the
+ * steady-state wake loop passes the default `0` (no pace). There is no forked
+ * boot path — CLAUDE.md's "one drain code path serves boot and steady-state"
+ * invariant holds.
+ */
+export interface DrainOptions {
+  /**
+   * Milliseconds to sleep AFTER each fold's COMMIT, before the next event's
+   * `BEGIN IMMEDIATE`. `0` (or omitted) is "no pace" — the tight per-event
+   * loop steady state needs. The boot caller passes a small positive value
+   * (a few ms) to open a window for concurrent hook INSERTs to slip in.
+   */
+  paceMs?: number;
+  /**
+   * Budget on how many events `paceMs` applies to within a single `drain()`
+   * call. After this many paced folds the loop runs unpaced for the rest of
+   * the batch — so a large from-scratch re-fold (the schema-migration path
+   * that rewinds the cursor and replays the full ~150k-event log) catches
+   * up to head in bounded time instead of paying `paceMs` per event for
+   * minutes. `0` (or omitted) is "pace every event in the batch" — only
+   * appropriate when the caller knows the batch is small.
+   */
+  paceEvents?: number;
+  /**
+   * OS-level sleep primitive. Defaulted to a `SharedArrayBuffer`/`Atomics.wait`
+   * sleep (the same shape `plugin/hooks/events-writer.ts` uses for its bounded
+   * retry) — a real sleep that releases the SQLite writer lock to a separate
+   * process. Test-only injection point: a mock sleep can record call counts
+   * and durations without paying the actual wall-clock cost. Production
+   * callers leave this defaulted.
+   */
+  sleep?: (ms: number) => void;
+}
+
+/**
+ * Default OS-level synchronous sleep: blocks the JS thread for up to `ms`
+ * milliseconds via `Atomics.wait` on a fresh zero-initialized
+ * `SharedArrayBuffer`. Same shape `plugin/hooks/events-writer.ts` uses; the
+ * wait always returns `"timed-out"` because nothing holds a handle to the
+ * buffer to notify. A real OS sleep is the only primitive that releases the
+ * SQLite writer lock to a separate process — `setImmediate` does NOT.
+ */
+function defaultDrainSleep(ms: number): void {
+  if (ms <= 0) return;
+  const buf = new SharedArrayBuffer(4);
+  const view = new Int32Array(buf);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+export function drain(
+  db: Database,
+  batchSize = DEFAULT_BATCH_SIZE,
+  options: DrainOptions = {},
+): number {
   const cursorRow = db
     .query("SELECT last_event_id FROM reducer_state WHERE id = 1")
     .get() as { last_event_id: number } | null;
@@ -5617,6 +5685,16 @@ export function drain(db: Database, batchSize = DEFAULT_BATCH_SIZE): number {
     )
     .all(cursor, batchSize) as Event[];
 
+  // Pacing config: `paceMs` ≤ 0 disables, `paceEvents` ≤ 0 means "no event
+  // budget — pace every event in the batch". The budget is decremented per
+  // paced fold so a large backlog naturally drops out of paced mode after the
+  // budget is spent.
+  const paceMs = options.paceMs ?? 0;
+  const paceEventsBudget = options.paceEvents ?? 0;
+  const sleep = options.sleep ?? defaultDrainSleep;
+  let pacedRemaining =
+    paceMs > 0 ? (paceEventsBudget > 0 ? paceEventsBudget : rows.length) : 0;
+
   for (const row of rows) {
     const foldStart = performance.now();
     applyEvent(db, row);
@@ -5631,6 +5709,17 @@ export function drain(db: Database, batchSize = DEFAULT_BATCH_SIZE): number {
       console.error(
         `[fold-slow] id=${row.id} event=${row.hook_event ?? "?"} type=${row.event_type ?? "?"} dur=${Math.round(foldMs)}ms`,
       );
+    }
+    // Post-COMMIT yield. `applyEvent` has already returned — the transaction
+    // is closed and the writer lock is released. A real OS sleep here opens
+    // a window for a concurrent hook INSERT (separate process, separate
+    // `BEGIN IMMEDIATE`) to grab the writer lock instead of starving on the
+    // tight loop that would otherwise issue the next `BEGIN IMMEDIATE`
+    // microseconds after this fold's COMMIT. The budget `pacedRemaining`
+    // bounds total paced latency so a large backlog catches up to head.
+    if (pacedRemaining > 0) {
+      sleep(paceMs);
+      pacedRemaining -= 1;
     }
   }
 

@@ -193,9 +193,35 @@ the native value" is the default.
   the reducer's no-op / seed branches in sync, so a re-fold from an empty table
   reproduces the same rows.
 - **One drain code path serves boot and steady-state** (`drainToCompletion` loops
-  `drain()` until it returns 0). Do not add a separate boot path.
+  `drain()` until it returns 0). Do not add a separate boot path. **Boot may pass
+  a stateless `DrainOptions` (`paceMs`, `paceEvents`, optional injected `sleep`)**
+  to gate a post-COMMIT yield inside the SAME `drain()` loop — steady-state
+  callers pass nothing and the function behaves exactly as before. A forked
+  boot drain is still forbidden; pacing is one shared loop with a per-call
+  knob, never a parallel implementation.
 - **Drain folds one event per transaction** so the WAL writer lock releases
-  between events and hook inserts never starve.
+  between events. **Boot adds an OS-level yield after each fold's COMMIT**
+  (`BOOT_DRAIN_PACE_MS = 5`ms × `BOOT_DRAIN_PACE_EVENTS = 500` event budget
+  ≈ 2.5s worst-case extra boot latency — bounded, fn-659). The yield is the
+  documented bounce-window mitigation: WAL gives no writer FIFO fairness, so
+  without a real OS sleep between transactions a sleeping hook's
+  `busy_timeout` retry loses the race to the reducer's next `BEGIN IMMEDIATE`
+  (microseconds after COMMIT) and dead-letters. The sleep lives in `drain`
+  AFTER `applyEvent` returns — never inside `applyEvent`, never inside any
+  `project*` fn, never inside a `BEGIN IMMEDIATE` — so re-fold determinism
+  holds (no wall-clock read feeds any projection write). `setImmediate` /
+  event-loop yields do NOT count; only a real OS sleep (e.g. `Atomics.wait`)
+  releases the SQLite writer lock to a separate process. The event-count
+  budget caps total paced latency so a from-scratch re-fold (the schema-
+  migration path that rewinds the cursor and replays the full event log)
+  catches up to head in bounded time. **End-of-boot checkpoint uses
+  `wal_checkpoint(PASSIVE)`, never TRUNCATE** — TRUNCATE waits for any
+  concurrent writers and absorbs a full hook `busy_timeout` of writer-lock-
+  blocked latency under bounce-window contention, starving a second hook
+  into a dead-letter; PASSIVE skips writers and closes the bounce window
+  cleanly. The WAL file is not reclaimed on the boot pass (steady-state
+  autocheckpoint shrinks it), which is the strictly-better tradeoff vs
+  wedging a concurrent hook.
 - **A malformed `data` blob (or stored JSON array) skips/folds to a safe value and
   the cursor still advances** — never throw inside the fold transaction; a throw
   rolls back the cursor and wedges the reducer.
