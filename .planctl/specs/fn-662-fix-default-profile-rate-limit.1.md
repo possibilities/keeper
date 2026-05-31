@@ -93,5 +93,5 @@ Run `bun test test/reducer.test.ts test/schema-version.test.ts` then the full `b
 - [ ] CLAUDE.md + README.md revised in place (no stacked v42 paragraph)
 
 ## Done summary
-
+Add directional ''-to-'default' mapping helper pair in src/epic-deps.ts; wire into both arms of the v35 rate-limit fan-out so default-account RateLimited colocates onto usage.default. Schema v41->v42 bump with a version-guarded rewind-and-redrain (cursor reset + DELETE projections incl. usage+profiles, excl. dead_letters) backfills historically-stranded annotations. keeper-py whitelist extended to 42; CLAUDE.md + README.md revised in place; new forward/reverse/negative/re-fold-determinism tests + db migrate tests updated for the v42 wipe.
 ## Evidence

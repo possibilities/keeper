@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "map default to empty sentinel in fan-out",
-  "updated_at": "2026-05-31T22:30:44.109664Z"
+  "updated_at": "2026-05-31T22:55:13.501307Z",
+  "worker_done_at": "2026-05-31T22:55:13.501307Z"
 }
