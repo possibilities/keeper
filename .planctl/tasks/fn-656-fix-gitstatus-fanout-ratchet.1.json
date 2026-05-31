@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-05-31T17:20:34.633091Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "guard projectionjobs push on dirty",
-  "updated_at": "2026-05-31T17:56:07.064093Z",
+  "updated_at": "2026-05-31T18:00:41.384027Z",
   "worker_done_at": "2026-05-31T17:56:07.064093Z"
 }
