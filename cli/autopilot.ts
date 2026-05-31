@@ -179,6 +179,19 @@
  * verbatim. `setStatus` restores to `statusLine()` (carrying the
  * `[paused]` / `[playing]` / `[cmd]` chrome) — distinct from the other
  * three TUIs which restore to `""`.
+ *
+ * fn-660.1 deferral: `cli/autopilot.ts` does NOT use `createViewShell`
+ * (the shared TUI shell harness adopted by board / jobs / git). Reason:
+ * autopilot's `emitFrame` is intertwined with the planner / dispatch
+ * loop — it's not a pure render of the subscribe snapshot. The shell
+ * also carries autopilot-specific banner chrome (`statusLine()` with
+ * `[paused]` / `[playing]` / `[cmd]`), three custom keys (space / v / c
+ * with non-trivial side effects), pause-resume semantics that gate the
+ * dispatch loop, and a `setStatus` restore target that's NOT `""`.
+ * Folding any of that into the shared shell would require widening
+ * `createViewShell` to a leaky superset API for a single caller.
+ * Revisit when (or if) autopilot grows a sibling with the same loop
+ * shape.
  */
 
 import {

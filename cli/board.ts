@@ -83,20 +83,16 @@
  * path emits uncolored.
  */
 
-import { appendFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   apiErrorPillSeg,
-  colorizePillsInLine,
   inputRequestPillSeg,
   planVerbLabel,
   subagentLinesFor,
 } from "../src/board-render";
-import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveSockPath } from "../src/db";
 import type { EpicDepResolution } from "../src/epic-deps";
-import { createLiveShell } from "../src/live-shell";
 import { formatPill, type Verdict } from "../src/readiness";
 import {
   type ReadinessClientSnapshot,
@@ -109,6 +105,7 @@ import type {
   ResolvedEpicDep,
   SubagentInvocation,
 } from "../src/types";
+import { createViewShell } from "../src/view-shell";
 
 // ---------------------------------------------------------------------------
 // Re-export shims (fn-658.1)
@@ -544,40 +541,6 @@ export async function main(argv: string[]): Promise<void> {
     dirname(sockPath),
     "readiness-diagnostics.jsonl",
   );
-  const log = (s: string) => process.stdout.write(`${s}\n`);
-  // Forward-reference slot for the `c`-key copy handler — wired to a real
-  // closure further down once `lastFrameText`, sidecar paths, and
-  // `noteLine` are in scope. The wrapper passed to createLiveShell stays
-  // stable across the swap.
-  let onKey: ((key: string) => void) | undefined;
-  const liveShell = createLiveShell({
-    enabled: true,
-    title: "board",
-    onUnhandledKey: (key) => onKey?.(key),
-  });
-  let frameCount = 0;
-
-  // Color is for human eyes on a TTY. Pipes / redirects / NO_COLOR stay
-  // plain so consumers (grep, diff, `tee` to a file) see clean text.
-  // Sidecars are ALWAYS plain — only the lines passed to `pushFrame`
-  // pass through the colorizer.
-  //
-  // fn-646.4: gate matches the conditions under which `createLiveShell`
-  // takes the OpenTUI alt-screen branch (both stdout + stdin TTY) AND
-  // NO_COLOR is unset. Under the alt-screen branch the shell's paint
-  // layer parses the SGR escapes into StyledText via `linesToContent`;
-  // the non-TTY / NO_COLOR path takes `createLiveShell`'s passthrough
-  // branch and writes lines plain to stdout — emitting uncolored from
-  // here keeps the passthrough output free of literal escape bytes.
-  const colorEnabled =
-    process.stdout.isTTY === true &&
-    process.stdin.isTTY === true &&
-    process.env.NO_COLOR == null;
-
-  // `lastBody` byte-compares the rendered body — internal row churn that
-  // doesn't surface in the render is invisible by design.
-  let lastBody: string | null = null;
-
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
   // --- epic rendering ---
@@ -796,237 +759,61 @@ export async function main(argv: string[]): Promise<void> {
     return body === "" ? [] : body.split("\n");
   }
 
-  // Internal scratch path for the previous frame text — fed to `diff -u` as
-  // its "before" file. Overwritten each tick; not surfaced in the meta note.
-  const prevFrameTmp = `/tmp/keeper-board.${process.pid}.prev.frame.txt`;
-  // Session-level meta file: one tab-separated line per frame (index +
-  // per-frame sidecar paths). Accumulates across the session so every past
-  // frame remains inspectable.
-  const metaSidecar = `/tmp/keeper-board.${process.pid}.meta.txt`;
-  // The alt-screen owns stdout, so per-frame / per-event chatter goes here.
-  // Lifecycle events and warn lines append here instead; tail -f from another
-  // pane to watch.
-  const lifecycleSidecar = `/tmp/keeper-board.${process.pid}.lifecycle.txt`;
-  // Route warn/lifecycle output to the sidecar.
-  const noteLine = (s: string): void => {
-    try {
-      appendFileSync(lifecycleSidecar, `${s}\n`);
-    } catch {
-      // best-effort — the sidecar is observational
-    }
-  };
-  // In-memory copy of the last emitted frame's body+lead, used as the
-  // "before" side of the per-frame unified diff. `null` until the first
-  // frame lands (sentinel written instead).
-  let lastFrameText: string | null = null;
-
-  function writeSidecars(
-    snap: ReadinessClientSnapshot,
-    frameText: string,
-  ): void {
-    const sState = `/tmp/keeper-board.${process.pid}.state.${frameCount}.json`;
-    const sFrame = `/tmp/keeper-board.${process.pid}.frame.${frameCount}.txt`;
-    const sDiff = `/tmp/keeper-board.${process.pid}.diff.${frameCount}.txt`;
-    const stateJson = {
-      epics: snap.epics,
-    };
-    try {
-      writeFileSync(sState, `${JSON.stringify(stateJson, null, 2)}\n`);
-      writeFileSync(sFrame, `${frameText}\n`);
-    } catch (err) {
-      noteLine(`# warn: sidecar write failed: ${(err as Error).message}`);
-    }
-    // Per-frame unified diff against the previous emit. Uses system `diff -u`
-    // so the output is the universally-readable unified-diff format. `diff -u`
-    // exits 1 when files differ — that's expected here (we only get here when
-    // the body changed), so we ignore the exit code and take stdout. First
-    // frame has no prior, so we write a sentinel.
-    let diffText: string;
-    if (lastFrameText == null) {
-      diffText = "# first frame — no previous to diff against\n";
-    } else {
-      try {
-        writeFileSync(prevFrameTmp, `${lastFrameText}\n`);
-        const proc = Bun.spawnSync({
-          cmd: ["diff", "-u", prevFrameTmp, sFrame],
-        });
-        diffText = proc.stdout.toString();
-        if (diffText.length === 0) {
-          diffText = "# diff: no textual difference\n";
+  // fn-660.1: lifecycle + sidecars + copy key + SIGINT moved into
+  // `createViewShell` — see `src/view-shell.ts`. Board's only sibling-
+  // specific bits are the renderer, the `subscribeReadiness` wiring,
+  // and the diagnostics drain (snap-side, never on the body-stable
+  // suppression path so every observed ambiguity gets recorded).
+  const view = createViewShell<ReadinessClientSnapshot>({
+    script: "board",
+    title: "board",
+    renderBody: (snap) => {
+      // Per-frame `job_id → invocations` index — re-entrant sub-agents
+      // within one session sit on the same bucket, ordered by
+      // `turn_seq asc` so the nested list reads in invocation order.
+      // The projection promotes `superseded` natively (task fn-605.2),
+      // so no client-side marking pass is required — `subagentLinesFor`
+      // stamps the raw `[${status}]` enum verbatim.
+      const subagentIndex = new Map<string, SubagentInvocation[]>();
+      for (const inv of snap.subagentInvocations) {
+        const arr = subagentIndex.get(inv.job_id);
+        if (arr === undefined) {
+          subagentIndex.set(inv.job_id, [inv]);
+        } else {
+          arr.push(inv);
         }
-      } catch (err) {
-        diffText = `# diff failed: ${(err as Error).message}\n`;
       }
-    }
-    try {
-      writeFileSync(sDiff, diffText);
-    } catch (err) {
-      noteLine(`# warn: diff sidecar write failed: ${(err as Error).message}`);
-    }
-    try {
-      appendFileSync(
-        metaSidecar,
-        `${frameCount}\t${sState}\t${sFrame}\t${sDiff}\n`,
-      );
-    } catch (err) {
-      noteLine(`# warn: meta write failed: ${(err as Error).message}`);
-    }
-    lastFrameText = frameText;
-  }
+      for (const arr of subagentIndex.values()) {
+        arr.sort((a, b) => a.turn_seq - b.turn_seq);
+      }
+      return {
+        bodyLines: renderBody(snap, subagentIndex),
+        stateJson: { epics: snap.epics },
+      };
+    },
+  });
 
-  /**
-   * Helper-driven snapshot callback. Builds the per-frame `job_id →
-   * invocations` index, renders the epics body, byte-compares against
-   * the last emit, and writes sidecars + stdout when the render changes.
-   * The helper handles the all-five-strict first-paint gate AND the
-   * `computeReadiness` call — `snap.readiness` is fully populated when
-   * we get here.
-   */
   function emitFrame(snap: ReadinessClientSnapshot): void {
-    // fn-635: drain `snap.readiness.diagnostics` to the JSONL log before
-    // building the render. The drain is per-snapshot, not per-emit (we
+    // fn-635: drain `snap.readiness.diagnostics` to the JSONL log
+    // before the render. The drain is per-snapshot, not per-emit (we
     // want every observed ambiguity recorded even if the render is
-    // byte-stable and `lastBody` short-circuits). Best-effort append —
-    // `appendDiagnostic` swallows I/O errors so a transient FS hiccup
-    // doesn't wedge the frame loop.
+    // byte-stable and the view-shell's `lastBody` short-circuits).
+    // Best-effort append — `appendDiagnostic` swallows I/O errors so
+    // a transient FS hiccup doesn't wedge the frame loop.
     for (const d of snap.readiness.diagnostics) {
       appendDiagnostic(d, diagnosticsLogPath);
     }
-    // fn-658.3: the persistent `[dead-letter:N]` banner re-stamp moved
-    // to `cli/jobs.ts` along with the bottom jobs list and the `r` key.
-    // Board no longer touches `liveShell.setStatus` on snapshots.
-    // Per-frame `job_id → invocations` index — re-entrant sub-agents within
-    // one session sit on the same `job_id` bucket, ordered by `turn_seq asc`
-    // so the nested list reads in invocation order. The projection now
-    // promotes `superseded` natively (task fn-605.2), so no client-side
-    // marking pass is required — `subagentLinesFor` stamps the raw
-    // `[${status}]` enum verbatim.
-    const subagentIndex = new Map<string, SubagentInvocation[]>();
-    for (const inv of snap.subagentInvocations) {
-      const arr = subagentIndex.get(inv.job_id);
-      if (arr === undefined) {
-        subagentIndex.set(inv.job_id, [inv]);
-      } else {
-        arr.push(inv);
-      }
-    }
-    for (const arr of subagentIndex.values()) {
-      arr.sort((a, b) => a.turn_seq - b.turn_seq);
-    }
-    const bodyLines = renderBody(snap, subagentIndex);
-    const body = bodyLines.join("\n");
-    if (body === lastBody) {
-      return;
-    }
-    lastBody = body;
-    frameCount += 1;
-    const frameText = ["---", ...bodyLines].join("\n");
-    // Only lines shipped to the screen pick up SGR coloring. Gated on TTY +
-    // NO_COLOR so piped/redirected output stays clean. `---` is kept in
-    // frameText for sidecars/non-TTY output but not passed to the shell.
-    const linesForShell = colorEnabled
-      ? bodyLines.map(colorizePillsInLine)
-      : bodyLines;
-    liveShell.pushFrame(linesForShell);
-    writeSidecars(snap, frameText);
+    view.emit(snap);
   }
-
-  function emitLifecycle(
-    event: string,
-    detail: Record<string, unknown> = {},
-  ): void {
-    const lines: string[] = ["...", `event: ${event}`];
-    for (const [k, v] of Object.entries(detail)) {
-      lines.push(`${k}: ${String(v)}`);
-    }
-    lines.push("...");
-    try {
-      appendFileSync(lifecycleSidecar, `${lines.join("\n")}\n`);
-    } catch {
-      // best-effort
-    }
-    // On disconnect, clear `lastBody` so the next first-paint emits even
-    // if the post-reconnect snapshot happens to match the last pre-
-    // disconnect body byte-for-byte. (The helper resets its own collection
-    // state and re-gates first-paint behind all three `result`s.)
-    if (event === "disconnected") {
-      lastBody = null;
-    }
-  }
-
-  // Banner-flash timer for the `c` (copy) key. fn-658.3 removed the `r`
-  // replay-dead-letter key (it lives in `cli/jobs.ts` alongside the
-  // persistent `[dead-letter:N]` pill), so `c` is now the only key that
-  // flashes the banner. The flash restore targets `""` — board no
-  // longer maintains a persistent pill, so there's nothing to put back.
-  let flashTimer: ReturnType<typeof setTimeout> | undefined;
-  function scheduleFlashRestore(): void {
-    if (flashTimer !== undefined) {
-      clearTimeout(flashTimer);
-    }
-    flashTimer = setTimeout(() => {
-      flashTimer = undefined;
-      liveShell.setStatus("");
-    }, 1500);
-  }
-
-  // `c` copies a debug snapshot (current frame + sidecar paths) to
-  // the clipboard via `pbcopy`. Flashes `[copied frame N]` / `[copy
-  // failed]` in the banner via setStatus; the shared flash-restore
-  // timer clears the banner back to `""` after ~1.5 s. Skipped silently
-  // before the first frame lands.
-  function handleCopyKey(): void {
-    if (lastFrameText == null) {
-      return;
-    }
-    const payload = buildDebugSnapshot({
-      script: "board",
-      pid: process.pid,
-      frame: lastFrameText,
-      frameNumber: frameCount,
-      metaSidecar,
-      lifecycleSidecar,
-      nowIso: new Date().toISOString(),
-    });
-    const flashed = frameCount;
-    void copyToClipboard(payload).then((res) => {
-      if (res.ok) {
-        liveShell.setStatus(`[copied frame ${flashed}]`);
-      } else {
-        noteLine(`# warn: clipboard copy failed: ${res.error}`);
-        liveShell.setStatus("[copy failed]");
-      }
-      scheduleFlashRestore();
-    });
-  }
-
-  // fn-658.3: the `r` replay-dead-letter handler moved to `cli/jobs.ts`
-  // along with the persistent `[dead-letter:N]` banner. Board now has a
-  // single key handler (`c`).
-  onKey = (key: string): void => {
-    if (key === "c") {
-      handleCopyKey();
-      return;
-    }
-  };
 
   const handle = subscribeReadiness({
     sockPath,
     idPrefix: "board",
     onSnapshot: emitFrame,
-    onLifecycle: emitLifecycle,
+    onLifecycle: view.emitLifecycle,
   });
 
-  process.on("SIGINT", () => {
-    // Terminal restoration before subscription teardown.
-    liveShell.dispose();
-    handle.dispose();
-    log("...");
-    log(`meta: ${metaSidecar}`);
-    log(`lifecycle: ${lifecycleSidecar}`);
-    log("...");
-    process.exit(0);
-  });
+  view.installSigintHandler(() => handle.dispose());
 }
 
 // `import.meta.main` guard neutralized — `cli/keeper.ts` is the

@@ -23,13 +23,11 @@
  * handles everything below the rows.
  */
 
-import { appendFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
-import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveSockPath } from "../src/db";
-import { createLiveShell } from "../src/live-shell";
 import { subscribeCollection } from "../src/readiness-client";
+import { createViewShell } from "../src/view-shell";
 
 const COLLECTION = "git";
 
@@ -295,126 +293,17 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
-  // Forward-reference slot for the `c`-key copy handler — wired further
-  // down once sidecar paths and the last frame text are in scope.
-  let onKey: ((key: string) => void) | undefined;
-  const liveShell = createLiveShell({
-    enabled: true,
+
+  // fn-660.1: lifecycle + sidecars + copy key + SIGINT moved into
+  // `createViewShell` — see `src/view-shell.ts`.
+  const view = createViewShell<Record<string, unknown>[]>({
+    script: "git",
     title: "git",
-    onUnhandledKey: (key) => onKey?.(key),
+    renderBody: (rows) => ({
+      bodyLines: renderRowLines(rows),
+      stateJson: rows,
+    }),
   });
-  let lastFrame: string | null = null;
-  let frameCount = 0;
-  let lastRows: Record<string, unknown>[] = [];
-
-  const prevFrameTmp = `/tmp/keeper-git.${process.pid}.prev.frame.txt`;
-  const metaSidecar = `/tmp/keeper-git.${process.pid}.meta.txt`;
-  // The alt-screen owns stdout; lifecycle events append here instead.
-  const lifecycleSidecar = `/tmp/keeper-git.${process.pid}.lifecycle.txt`;
-
-  // `c` copies a debug snapshot to the clipboard. See board.ts for the
-  // shared shape — same payload, swap script name and sidecar paths.
-  let copyStatusTimer: ReturnType<typeof setTimeout> | undefined;
-  onKey = (key: string): void => {
-    if (key !== "c") return;
-    if (lastFrame == null) return;
-    const payload = buildDebugSnapshot({
-      script: "git",
-      pid: process.pid,
-      frame: lastFrame,
-      frameNumber: frameCount,
-      metaSidecar,
-      lifecycleSidecar,
-      nowIso: new Date().toISOString(),
-    });
-    const flashed = frameCount;
-    void copyToClipboard(payload).then((res) => {
-      if (res.ok) {
-        liveShell.setStatus(`[copied frame ${flashed}]`);
-      } else {
-        try {
-          appendFileSync(
-            lifecycleSidecar,
-            `# warn: clipboard copy failed: ${res.error}\n`,
-          );
-        } catch {
-          // best-effort
-        }
-        liveShell.setStatus("[copy failed]");
-      }
-      if (copyStatusTimer !== undefined) {
-        clearTimeout(copyStatusTimer);
-      }
-      copyStatusTimer = setTimeout(() => liveShell.setStatus(""), 1500);
-    });
-  };
-
-  function log(s: string): void {
-    process.stdout.write(`${s}\n`);
-  }
-
-  function writeSidecars(frameText: string): void {
-    const sState = `/tmp/keeper-git.${process.pid}.state.${frameCount}.json`;
-    const sFrame = `/tmp/keeper-git.${process.pid}.frame.${frameCount}.txt`;
-    const sDiff = `/tmp/keeper-git.${process.pid}.diff.${frameCount}.txt`;
-    writeFileSync(sState, `${JSON.stringify(lastRows, null, 2)}\n`);
-    writeFileSync(sFrame, `${frameText}\n`);
-    let diff = "# first frame - no previous to diff against\n";
-    if (lastFrame != null) {
-      writeFileSync(prevFrameTmp, `${lastFrame}\n`);
-      const res = Bun.spawnSync(["diff", "-u", prevFrameTmp, sFrame], {
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      diff = res.stdout.toString() || "# no rendered diff\n";
-    }
-    writeFileSync(sDiff, diff);
-    appendFileSync(
-      metaSidecar,
-      `${frameCount}\t${sState}\t${sFrame}\t${sDiff}\n`,
-    );
-  }
-
-  /**
-   * Helper-driven row callback. Renders the row list, byte-compares
-   * against the last emit, and writes sidecars + stdout when the render
-   * changes. The helper handles the first-paint gate, reconnect, and the
-   * `meta`/`patch` refetch coalescer — by the time this fires, `rows`
-   * carries the freshest `result` frame in wire order.
-   */
-  function emitFrame(rows: Record<string, unknown>[]): void {
-    lastRows = rows;
-    const bodyLines = renderRowLines(rows);
-    const frameText = ["---", ...bodyLines].join("\n");
-    if (frameText === lastFrame) return;
-    frameCount += 1;
-    liveShell.pushFrame(bodyLines);
-    writeSidecars(frameText);
-    lastFrame = frameText;
-  }
-
-  function emitLifecycle(
-    event: string,
-    detail: Record<string, unknown> = {},
-  ): void {
-    const lines: string[] = ["...", `event: ${event}`];
-    for (const [k, v] of Object.entries(detail)) {
-      lines.push(`${k}: ${String(v)}`);
-    }
-    lines.push("...");
-    try {
-      appendFileSync(lifecycleSidecar, `${lines.join("\n")}\n`);
-    } catch {
-      // best-effort
-    }
-    // On disconnect, clear `lastFrame` so the next first-paint emits even
-    // if the post-reconnect snapshot happens to match the last pre-
-    // disconnect frame byte-for-byte. (The helper resets its own
-    // collection state and re-gates first-paint behind a fresh `result`.)
-    if (event === "disconnected") {
-      lastFrame = null;
-    }
-  }
 
   const projectDir = values["project-dir"];
   const handle = subscribeCollection({
@@ -426,20 +315,11 @@ export async function main(argv: string[]): Promise<void> {
     ...(projectDir === undefined
       ? {}
       : { filter: { project_dir: projectDir } }),
-    onRows: emitFrame,
-    onLifecycle: emitLifecycle,
+    onRows: (rows) => view.emit(rows),
+    onLifecycle: view.emitLifecycle,
   });
 
-  process.on("SIGINT", () => {
-    // Terminal restoration before subscription teardown.
-    liveShell.dispose();
-    handle.dispose();
-    log("...");
-    log(`meta: ${metaSidecar}`);
-    log(`lifecycle: ${lifecycleSidecar}`);
-    log("...");
-    process.exit(0);
-  });
+  view.installSigintHandler(() => handle.dispose());
 }
 
 // `import.meta.main` guard neutralized — `cli/keeper.ts` is the

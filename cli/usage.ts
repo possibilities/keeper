@@ -74,6 +74,17 @@
  * circuit anyway), so the 30s tick never flickers; when the live view
  * is scrolled back into history the overlay is dormant (refreshLive
  * updates the live slot only; history frames stay frozen).
+ *
+ * fn-660.1 deferral: `cli/usage.ts` does NOT use `createViewShell` (the
+ * shared TUI shell harness adopted by board / jobs / git). Reason: usage
+ * blends TWO subscribe streams (`usage` rows + `jobs` rows) into one
+ * composed body, runs a 30s `refreshLive` tick for relative-time bleed
+ * without growing history, and gates emit on raw projection-subset hash
+ * keys (NOT rendered text) so a fetch-only `last_event_id` bump can't
+ * forge a frame. Folding any of that into the shared shell would either
+ * widen its API to a leaky abstraction or strip a load-bearing
+ * change-gate from this view. Revisit if a second multi-stream sibling
+ * appears.
  */
 
 import { appendFileSync, writeFileSync } from "node:fs";
