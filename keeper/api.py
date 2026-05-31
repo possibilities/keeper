@@ -47,9 +47,13 @@ from pathlib import Path
 # column on ``jobs`` carrying the ordered distinct titles a session has
 # carried — keeper-py does not read ``jobs.name_history`` (the consumer is
 # claudectl via a forthcoming ``get_session_name_history()``), so the bump
-# is whitelist-only with no reader logic change.
+# is whitelist-only with no reader logic change; v41 (fn-651 usage lift
+# time + freshness) adds two nullable columns to ``usage`` only
+# (``rate_limit_lifts_at TEXT`` + ``last_usage_fold_at REAL``) — keeper-py
+# does not read ``usage``, so the bump is whitelist-only with no reader
+# logic change.
 # Bump this set when a keeper schema change alters those tables.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37, 38, 39, 40})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41})
 
 
 class KeeperError(Exception):

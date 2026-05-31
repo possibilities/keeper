@@ -3428,6 +3428,300 @@ test("from-scratch re-fold reproduces usage + profiles projections byte-identica
   expect(afterProfiles).toEqual(beforeProfiles);
 });
 
+// ---------------------------------------------------------------------------
+// Schema v41 (fn-651) — UsageSnapshot ingests `lift_at` + stamps
+// `last_usage_fold_at` only on a successful usage fold; rate-limit fan-out
+// MUST NOT touch either column (carve-out symmetric to v35).
+// ---------------------------------------------------------------------------
+
+test("UsageSnapshot ingests top-level lift_at into usage.rate_limit_lifts_at (fn-651)", () => {
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-mc1",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 100.0,
+      session_resets_at: "2026-05-30T20:30:00-04:00",
+      week_percent: 50.0,
+      week_resets_at: "2026-06-01T20:00:00-04:00",
+      status: "active",
+      // agentuse's derived unblock instant — soonest resets_at among >=100%
+      // windows. Folds into usage.rate_limit_lifts_at on the percentage path.
+      lift_at: "2026-05-30T20:30:00-04:00",
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT rate_limit_lifts_at, last_usage_fold_at FROM usage WHERE id = ?",
+    )
+    .get("claude-mc1") as {
+    rate_limit_lifts_at: string | null;
+    last_usage_fold_at: number | null;
+  };
+  expect(row.rate_limit_lifts_at).toBe("2026-05-30T20:30:00-04:00");
+  // Status active → successful fold → freshness stamped (non-null).
+  expect(row.last_usage_fold_at).not.toBeNull();
+});
+
+test("UsageSnapshot stamps last_usage_fold_at from the event ts on a successful fold (fn-651)", () => {
+  const id = insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 12.0,
+      session_resets_at: "T1",
+      week_percent: 8.0,
+      week_resets_at: "T2",
+      status: "active",
+    }),
+  });
+  drainAll();
+  // The event was inserted via the test helper at the synthetic ts — read it
+  // back and assert the stamp equals it (the determinism boundary: never
+  // Date.now()).
+  const eventTs = (
+    db.query("SELECT ts FROM events WHERE id = ?").get(id) as {
+      ts: number;
+    }
+  ).ts;
+  const row = db
+    .query("SELECT last_usage_fold_at FROM usage WHERE id = ?")
+    .get("claude-default") as { last_usage_fold_at: number | null };
+  expect(row.last_usage_fold_at).toBe(eventTs);
+});
+
+test("UsageSnapshot does NOT bump last_usage_fold_at on an idle/stale fold (fn-651)", () => {
+  // First write — a SUCCESSFUL fold stamps the freshness column. Read it
+  // back so we can assert it survives a subsequent idle/stale write.
+  const firstId = insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 12.0,
+      session_resets_at: "T1",
+      week_percent: 8.0,
+      week_resets_at: "T2",
+      status: "active",
+    }),
+  });
+  drainAll();
+  const firstTs = (
+    db.query("SELECT ts FROM events WHERE id = ?").get(firstId) as {
+      ts: number;
+    }
+  ).ts;
+
+  // Second write — STALE envelope with NO usage percents. The
+  // `isSuccessfulFold` gate evaluates false (status != "active", all
+  // percents null) → excluded.last_usage_fold_at is NULL → the UPSERT's
+  // COALESCE preserves the prior successful stamp.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-default",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      // All percents null — a stale snapshot's typical shape.
+      status: "stale",
+    }),
+  });
+  drainAll();
+  const row = db
+    .query("SELECT status, last_usage_fold_at FROM usage WHERE id = ?")
+    .get("claude-default") as {
+    status: string | null;
+    last_usage_fold_at: number | null;
+  };
+  // Status updated to stale on the re-snapshot.
+  expect(row.status).toBe("stale");
+  // But the freshness stamp survived (carve-out preserves it via COALESCE).
+  expect(row.last_usage_fold_at).toBe(firstTs);
+});
+
+test("UsageSnapshot stamps last_usage_fold_at when any per-window percent is non-null (fn-651)", () => {
+  // The "successful fold" gate is `status === "active" OR any percent
+  // non-null`. A row with only `session_percent` (no status field at all)
+  // still qualifies — agentuse's `active` status is a sufficient signal but
+  // not a necessary one.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "codex-default",
+    data: JSON.stringify({
+      target: "codex",
+      multiplier: 1,
+      session_percent: 5.0,
+      session_resets_at: "T1",
+      // status field omitted; week_percent omitted.
+    }),
+  });
+  drainAll();
+  const row = db
+    .query("SELECT last_usage_fold_at FROM usage WHERE id = ?")
+    .get("codex-default") as { last_usage_fold_at: number | null };
+  expect(row.last_usage_fold_at).not.toBeNull();
+});
+
+test("RateLimited fan-out does NOT clobber rate_limit_lifts_at or last_usage_fold_at (v41 carve-out)", () => {
+  // The schema-v41 carve-out is symmetric to v35: the rate-limit fan-out's
+  // forward UPDATE writes ONLY `last_rate_limit_*` + descriptor bookkeeping
+  // and MUST NOT touch the two v41 columns. A percentage-path fold sets
+  // both; a subsequent RateLimited fold against the same profile must
+  // preserve them.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "multi-claude-1",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 1,
+      session_percent: 100.0,
+      session_resets_at: "T1",
+      week_percent: 5.0,
+      week_resets_at: "T2",
+      status: "active",
+      lift_at: "2026-05-30T20:30:00-04:00",
+    }),
+  });
+  drainAll();
+  const before = db
+    .query(
+      "SELECT rate_limit_lifts_at, last_usage_fold_at FROM usage WHERE id = ?",
+    )
+    .get("multi-claude-1") as {
+    rate_limit_lifts_at: string | null;
+    last_usage_fold_at: number | null;
+  };
+  expect(before.rate_limit_lifts_at).toBe("2026-05-30T20:30:00-04:00");
+  expect(before.last_usage_fold_at).not.toBeNull();
+
+  // Now fire a RateLimited fold against the same profile. The forward
+  // UPDATE writes only the rate-limit columns; the carve-out keeps the
+  // lift instant + freshness stamp intact.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rl-carveout",
+    config_dir: "/Users/x/.claude-profiles/multi-claude-1",
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-rl-carveout",
+  });
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-rl-carveout" });
+  drainAll();
+  const after = db
+    .query(
+      "SELECT rate_limit_lifts_at, last_usage_fold_at, last_rate_limit_session_id FROM usage WHERE id = ?",
+    )
+    .get("multi-claude-1") as {
+    rate_limit_lifts_at: string | null;
+    last_usage_fold_at: number | null;
+    last_rate_limit_session_id: string | null;
+  };
+  // Rate-limit fan-out DID stamp the rate-limit column (sanity check that
+  // the fan-out fired at all).
+  expect(after.last_rate_limit_session_id).toBe("sess-rl-carveout");
+  // Lift instant + freshness stamp preserved through the rate-limit fold.
+  expect(after.rate_limit_lifts_at).toBe(before.rate_limit_lifts_at);
+  expect(after.last_usage_fold_at).toBe(before.last_usage_fold_at);
+});
+
+test("UsageSnapshot re-snapshot does NOT clobber a prior successful last_usage_fold_at via NULL excluded (fn-651)", () => {
+  // ON CONFLICT carve-out check: even when a re-UsageSnapshot's gate
+  // evaluates false (idle/stale), COALESCE(excluded.last_usage_fold_at,
+  // usage.last_usage_fold_at) preserves the prior stamp. Companion to the
+  // "idle/stale does not bump" test above — this one specifically asserts
+  // the UPSERT's COALESCE preservation path.
+  const firstId = insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-coalesce",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      session_percent: 10.0,
+      session_resets_at: "T1",
+      week_percent: 10.0,
+      week_resets_at: "T2",
+      status: "active",
+    }),
+  });
+  drainAll();
+  const firstTs = (
+    db.query("SELECT ts FROM events WHERE id = ?").get(firstId) as {
+      ts: number;
+    }
+  ).ts;
+  // Idle envelope — empty usage block, no status field, no percents.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "claude-coalesce",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+    }),
+  });
+  drainAll();
+  const row = db
+    .query("SELECT last_usage_fold_at FROM usage WHERE id = ?")
+    .get("claude-coalesce") as { last_usage_fold_at: number | null };
+  expect(row.last_usage_fold_at).toBe(firstTs);
+});
+
+test("from-scratch re-fold reproduces usage.rate_limit_lifts_at + last_usage_fold_at byte-identically (fn-651)", () => {
+  // Cover all three branches of the freshness gate + the lift_at field:
+  // (a) successful fold with lift_at — both columns stamped;
+  // (b) successful fold without lift_at — only freshness stamped;
+  // (c) idle/stale fold against an existing row — preservation via COALESCE.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "rf-a",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 1,
+      session_percent: 100.0,
+      session_resets_at: "T1",
+      week_percent: 5.0,
+      week_resets_at: "T2",
+      status: "active",
+      lift_at: "2026-05-30T20:30:00-04:00",
+    }),
+  });
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "rf-b",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 1,
+      session_percent: 5.0,
+      session_resets_at: "T1",
+      week_percent: 5.0,
+      week_resets_at: "T2",
+      status: "active",
+    }),
+  });
+  // Idle re-snapshot on rf-b — must preserve the freshness stamp on re-fold.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "rf-b",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 1,
+      status: "stale",
+    }),
+  });
+  drainAll();
+  const before = db.query("SELECT * FROM usage ORDER BY id ASC").all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM usage");
+  drainAll();
+  const after = db.query("SELECT * FROM usage ORDER BY id ASC").all();
+  expect(after).toEqual(before);
+});
+
 function drainAll(): number {
   let total = 0;
   let n: number;

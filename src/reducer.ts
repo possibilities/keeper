@@ -2262,6 +2262,16 @@ interface UsageSnapshotPayload {
   error_type: string | null;
   error_message: string | null;
   error_at: string | null;
+  /**
+   * fn-651: rate-limit lift instant — ISO-8601 string carrying the soonest
+   * `resets_at` among windows at >=100% used (agentuse computes it). Null
+   * when the profile is not over any limit. Mirrors `session_resets_at` —
+   * stored opaque as TEXT; the renderer parses it. Folds into
+   * `usage.rate_limit_lifts_at` on the percentage path; the rate-limit
+   * fan-out's UPDATE carves it out so a RateLimited fold cannot clobber a
+   * lift time.
+   */
+  lift_at: string | null;
 }
 
 function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
@@ -2318,6 +2328,10 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
       error_message:
         typeof parsed.error_message === "string" ? parsed.error_message : null,
       error_at: typeof parsed.error_at === "string" ? parsed.error_at : null,
+      // fn-651: rate-limit lift instant — null-safe string parse mirroring
+      // `session_resets_at`. Pre-v41 events on disk that predate `lift_at`
+      // fold to null safely.
+      lift_at: typeof parsed.lift_at === "string" ? parsed.lift_at : null,
     };
   } catch (err) {
     console.error(
@@ -2361,14 +2375,39 @@ function projectUsageRow(db: Database, event: Event): void {
   if (snapshot == null) {
     return;
   }
+  // fn-651: freshness stamp gate. `last_usage_fold_at` is the event `ts`
+  // ONLY on a SUCCESSFUL usage fold (status `"active"` or any per-window
+  // usage present) — NOT on idle/stale snapshots, NEVER on the rate-limit
+  // fan-out (which carves both new columns out of its UPDATE). The
+  // renderer compares this against the wall clock to warn when ingestion
+  // has wedged; an idle/stale fold must NOT bump it or the warning loses
+  // its meaning. Determinism boundary: the value is the event ts, never
+  // `Date.now()` — a fold-time wall-clock read would break re-fold
+  // determinism (CLAUDE.md "byte-identical re-fold").
+  //
+  // "Successful usage" is defined as: status === "active" OR any of the
+  // three per-window percents is non-null (a row carrying real quota
+  // numbers from a recent scrape). Idle / stale snapshots typically carry
+  // status === "idle" / "stale" with NULL percents — these preserve the
+  // prior `last_usage_fold_at` via the carve-out spread in the UPSERT
+  // clause below, so a wedged ingestion path's last-good stamp does not
+  // get overwritten by a later idle/stale envelope that DID make it
+  // through.
+  const hasUsagePercents =
+    snapshot.session_percent != null ||
+    snapshot.week_percent != null ||
+    snapshot.sonnet_week_percent != null;
+  const isSuccessfulFold = snapshot.status === "active" || hasUsagePercents;
+  const lastUsageFoldAt: number | null = isSuccessfulFold ? event.ts : null;
   db.run(
     `INSERT INTO usage (
        id, target, multiplier, session_percent, session_resets_at,
        week_percent, week_resets_at, sonnet_week_percent,
        sonnet_week_resets_at, status, subscription_active,
        error_type, error_message, error_at,
+       rate_limit_lifts_at, last_usage_fold_at,
        last_event_id, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        target = excluded.target,
        multiplier = excluded.multiplier,
@@ -2383,6 +2422,19 @@ function projectUsageRow(db: Database, event: Event): void {
        error_type = excluded.error_type,
        error_message = excluded.error_message,
        error_at = excluded.error_at,
+       -- fn-651: percentage path owns the lift instant; a re-snapshot
+       -- rewrites it cleanly. The rate-limit fan-out (RateLimited /
+       -- ApiError(kind='rate_limit')) carves this out of its UPDATE in
+       -- the opposite direction, so a rate-limit fold cannot clobber a
+       -- lift time the percentage path wrote.
+       rate_limit_lifts_at = excluded.rate_limit_lifts_at,
+       -- fn-651: freshness stamp. COALESCE preserves a prior successful
+       -- fold's stamp when the current fold is idle/stale (excluded value
+       -- is NULL). On a successful fold the excluded value is the event
+       -- ts, which overwrites the prior. The rate-limit fan-out carves
+       -- this out of its UPDATE for the same carve-out reason as
+       -- rate_limit_lifts_at.
+       last_usage_fold_at = COALESCE(excluded.last_usage_fold_at, usage.last_usage_fold_at),
        last_event_id = excluded.last_event_id,
        updated_at = excluded.updated_at`,
     [
@@ -2400,6 +2452,8 @@ function projectUsageRow(db: Database, event: Event): void {
       snapshot.error_type,
       snapshot.error_message,
       snapshot.error_at,
+      snapshot.lift_at,
+      lastUsageFoldAt,
       event.id,
       event.ts,
     ],
@@ -5091,6 +5145,20 @@ function projectJobsRow(db: Database, event: Event): void {
           // Pure function of the fold inputs (`event.ts`, `event.id`,
           // `jobId`, in-transaction `jobs.config_dir`) — no
           // `Date.now`/env/OS reads.
+          //
+          // **Schema v41 (fn-651) carve-out (symmetric to v35).** This
+          // UPDATE writes ONLY the rate-limit columns + the descriptor
+          // bookkeeping (`last_event_id`, `updated_at`); it MUST NOT
+          // touch `rate_limit_lifts_at` or `last_usage_fold_at`. Those
+          // columns ride the percentage path (`projectUsageRow` — the
+          // UsageSnapshot fold), so a rate-limit fold cannot clobber a
+          // lift time or a freshness stamp the percentage path wrote.
+          // Symmetric to the v35 reverse carve-out where the percentage
+          // path's UPSERT excludes the rate-limit columns: each fold
+          // owns the columns it can speak to honestly. Adding either
+          // column to this UPDATE would break the two-paths discipline
+          // and let a stale rate-limit event clobber a fresh percentage
+          // fold's freshness stamp.
           const profileName = projectBasename(profileRow.config_dir);
           if (profileName !== "") {
             db.run(

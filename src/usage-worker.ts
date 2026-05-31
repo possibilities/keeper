@@ -159,6 +159,20 @@ export interface UsageSnapshotMessage {
    * neither projected nor gated).
    */
   error_at: string | null;
+  /**
+   * Rate-limit lift instant (fn-651) — ISO-8601 string carrying the soonest
+   * `resets_at` among windows at >=100% usage (the effective unblock time
+   * for a rate-limited profile). Null when no window is over the limit.
+   * Folds into `usage.rate_limit_lifts_at` via {@link projectUsageRow} on
+   * the percentage path; CARVED OUT of the rate-limit fan-out's UPDATE so
+   * a RateLimited event can never clobber it.
+   *
+   * Emitted by agentuse's envelope (top-level `lift_at`); the wire shape
+   * here mirrors `session_resets_at` (string | null). Preserved through
+   * idle/stale envelope writes on the agentuse side so a paused profile
+   * does not lose its lift mid-cooldown.
+   */
+  lift_at: string | null;
 }
 
 /**
@@ -233,6 +247,10 @@ interface RawUsage {
   status?: unknown;
   subscription_active?: unknown;
   error?: unknown;
+  // fn-651: rate-limit lift instant — top-level on the envelope, projected
+  // onto `usage.rate_limit_lifts_at`. ISO-8601 string when present, null when
+  // no window is at >=100%.
+  lift_at?: unknown;
   // Freshness fields — present in real agentuse envelopes, read and discarded.
   // `last_failed_fetch_at` joined this set under fn-645 (the stale `error`
   // sub-object carries the same info as `error.at`, projected instead).
@@ -361,6 +379,10 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
     error_type: errorType,
     error_message: errorMessage,
     error_at: errorAt,
+    // fn-651: rate-limit lift instant (the soonest `resets_at` among >=100%
+    // windows on the agentuse side; null when not over any limit). Top-level
+    // envelope field — mirrors `session_resets_at` shape.
+    lift_at: asString(raw.lift_at),
   };
 }
 
@@ -626,7 +648,7 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
       `SELECT id, target, multiplier, session_percent, session_resets_at,
               week_percent, week_resets_at, sonnet_week_percent,
               sonnet_week_resets_at, status, subscription_active,
-              error_type, error_message, error_at
+              error_type, error_message, error_at, rate_limit_lifts_at
          FROM usage`,
     )
     .all() as {
@@ -644,6 +666,7 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
     error_type: string | null;
     error_message: string | null;
     error_at: string | null;
+    rate_limit_lifts_at: string | null;
   }[];
   for (const r of rows) {
     // SQLite stores `subscription_active` as 1/0/NULL — reconstruct the
@@ -667,6 +690,9 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
       error_type: r.error_type,
       error_message: r.error_message,
       error_at: r.error_at,
+      // fn-651: lift_at rides the gate so a re-scrape with the same lift
+      // doesn't churn a synthetic event; a lift flip fires one emit.
+      lift_at: r.rate_limit_lifts_at,
     };
     scanner.seed(r.id, usageGateKey(msg));
   }

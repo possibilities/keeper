@@ -319,7 +319,27 @@ the native value" is the default.
   NOT a floor/ceiling, so an additive bump keeper-py never reads (e.g. a
   `usage`-only column) still must be listed. The `test/schema-version.test.ts`
   assertion enforces this: it reads `SCHEMA_VERSION` and fails the build unless
-  the frozenset's max covers it. Current version: **v40** (fn-652 —
+  the frozenset's max covers it. Current version: **v41** (fn-651 —
+  `usage.rate_limit_lifts_at TEXT` + `usage.last_usage_fold_at REAL`
+  on the `usage` projection. The former is folded from the agentuse
+  envelope's top-level `lift_at` (soonest `resets_at` among windows at
+  >=100% usage) via the `UsageSnapshot` percentage path; null when no
+  window is over the limit. The latter is stamped from the event `ts`
+  on a SUCCESSFUL usage fold — `snapshot.status === "active"` OR any of
+  the three per-window percents is non-null — and is NEVER bumped by an
+  idle/stale snapshot or by the rate-limit (RateLimited / ApiError)
+  fan-out. The COALESCE in the UPSERT preserves a prior successful
+  stamp through subsequent idle/stale folds so a wedged ingestion
+  path's last-good stamp is recoverable. Determinism boundary: the
+  stamp is the event ts, never `Date.now()` — a fold-time wall-clock
+  read would break re-fold determinism. Symmetric carve-out to v35's
+  rate-limit columns: the rate-limit fan-out's `UPDATE usage SET ...`
+  writes ONLY `last_rate_limit_*` + descriptor bookkeeping and MUST
+  NOT touch the v41 columns, so the two paths cannot clobber each
+  other. No data backfill (old events predate `lift_at`; old folds
+  predate "successful usage" semantics — both NULL on existing rows).
+  keeper-py does not read `usage`, so the bump is whitelist-only with
+  no reader logic change.). v40, fn-652:
   `jobs.name_history TEXT NOT NULL DEFAULT '[]'` ordered JSON array of
   the distinct titles a session has carried, oldest→newest, deduped
   against the tail, capped at the most-recent 20; appended in the
@@ -331,7 +351,7 @@ the native value" is the default.
   40` guarded and seeds each existing titled row's array to `[title]`.
   keeper-py does not read `name_history` — the consumer is claudectl
   via a forthcoming `get_session_name_history()` — so the keeper-py
-  bump is whitelist-only with no reader logic change.). v39, fn-648:
+  bump is whitelist-only with no reader logic change. v39, fn-648:
   the `git-rm` / `git-mv` deriver fix ships with a version-guarded
   one-time backfill that re-derives `bash_mutation_kind` +
   `bash_mutation_targets` over every persisted `PostToolUse:Bash` row

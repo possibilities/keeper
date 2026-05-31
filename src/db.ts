@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 40;
+export const SCHEMA_VERSION = 41;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -741,6 +741,34 @@ CREATE TABLE IF NOT EXISTS git_status (
  * All five columns participate in `projectUsageRow`'s `ON CONFLICT DO UPDATE
  * SET` clause (the rate-limit carve-out below is unique to the reverse
  * fan-out from `profiles`).
+ *
+ * **Schema v41 (fn-651): rate-limit lift time + freshness stamp.** Two
+ * additional nullable columns ride the same `UsageSnapshot` path (the
+ * percentage path, NOT the rate-limit fan-out):
+ * - `rate_limit_lifts_at TEXT` — ISO-8601 stamp of when a rate-limited
+ *   profile actually unblocks (agentuse computes it as the soonest
+ *   `resets_at` among windows at >=100%). Null when the profile is not
+ *   over any limit. Mirrors `session_resets_at` shape; folded by
+ *   `parseUsageSnapshot` from the envelope's top-level `lift_at` field.
+ * - `last_usage_fold_at REAL` — unix-seconds freshness stamp of the last
+ *   SUCCESSFUL usage fold, set from the event `ts` ONLY when the snapshot
+ *   carries successful usage (status `"active"` or per-window usage
+ *   present) — NOT on idle/stale snapshots, NEVER on the rate-limit
+ *   (RateLimited / ApiError) fold. The determinism boundary: the value is
+ *   the event ts, never `Date.now()`. Powers the renderer's "stale-fold"
+ *   warning so a wedged ingestion path becomes visible instead of
+ *   silently rendering frozen gauges.
+ *
+ * Both columns are CARVED OUT of the rate-limit fan-out's UPDATE clause
+ * (mirroring the schema-v35 `last_rate_limit_*` carve-out, but in the
+ * opposite direction): a RateLimited / ApiError(kind='rate_limit') fold
+ * MUST NOT touch them, so a rate-limit event can't clobber a lift time
+ * or freshness stamp that a percentage path wrote. Symmetrically, both
+ * participate in the `projectUsageRow` UPSERT's `ON CONFLICT DO UPDATE`
+ * (the percentage path owns them), so a re-snapshot rewrites them
+ * cleanly — `rate_limit_lifts_at` from the new envelope value,
+ * `last_usage_fold_at` from the event ts on the "successful usage"
+ * branch (else preserved by the carve-out spread).
  */
 const CREATE_USAGE = `
 CREATE TABLE IF NOT EXISTS usage (
@@ -760,6 +788,8 @@ CREATE TABLE IF NOT EXISTS usage (
     error_type TEXT,
     error_message TEXT,
     error_at TEXT,
+    rate_limit_lifts_at TEXT,
+    last_usage_fold_at REAL,
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0
 )
@@ -4043,6 +4073,36 @@ function migrate(db: Database): void {
       }
     }
 
+    // v40→v41: fn-651 — agentuse rate-limit lift time + last-successful-fold
+    // freshness stamp on the `usage` projection. Two additive nullable columns
+    // riding the existing `UsageSnapshot` percentage path:
+    //   - `usage.rate_limit_lifts_at TEXT` — ISO-8601 string mirroring
+    //     `session_resets_at`. Folded from the envelope's top-level
+    //     `lift_at` field (agentuse derives it as the soonest `resets_at`
+    //     among windows at >=100%). Null when not over any limit.
+    //   - `usage.last_usage_fold_at REAL` — unix-seconds freshness stamp
+    //     equal to the event `ts` of the last SUCCESSFUL usage fold (status
+    //     `"active"` or any per-window usage present). NEVER bumped by an
+    //     idle/stale fold or the rate-limit fan-out — the renderer compares
+    //     this against the wall clock to surface a freshness warning when
+    //     ingestion has wedged. The determinism boundary is the event ts;
+    //     a wall-clock read inside the fold would break re-fold determinism.
+    //
+    // Both columns are NULL on existing rows (no data backfill — old
+    // events predate `lift_at` and predate "successful usage" semantics).
+    // The literals above in `CREATE_USAGE` keep a fresh v41 DB and a
+    // migrated v40→v41 DB converged on identical schema (the
+    // addColumnIfMissing/literal lockstep convention).
+    //
+    // The `projectUsageRow` UPSERT includes both columns in its
+    // `ON CONFLICT DO UPDATE SET` clause via the percentage path; the
+    // rate-limit fan-out's UPDATE EXCLUDES both (mirroring the v35
+    // `last_rate_limit_*` carve-out in the opposite direction) — a
+    // rate-limit fold must not write a lift time or freshness stamp, and a
+    // percentage-path fold owns them outright.
+    addColumnIfMissing(db, "usage", "rate_limit_lifts_at", "TEXT");
+    addColumnIfMissing(db, "usage", "last_usage_fold_at", "REAL");
+
     // fn-649: COVERING indexes for the hoisted inferred-attribution window
     // self-join (`computeRepoBashWindows`). Created HERE — after every column-
     // adding version slot above — because they reference `tool_use_id` (added in
@@ -4051,7 +4111,8 @@ function migrate(db: Database): void {
     // pre-v17 DB. Idempotent `CREATE INDEX IF NOT EXISTS`, so no SCHEMA_VERSION
     // bump is needed (and none claimed — v38 is taken by fn-645's `usage`
     // envelope columns above, v39 by fn-648's backfill+rewind, v40 by
-    // fn-652's `jobs.name_history`).
+    // fn-652's `jobs.name_history`, v41 by fn-651's `usage` lift/freshness
+    // columns).
     //
     // Without them the window join reads 64k bash-event full ROWS (~400MB of
     // `data` blobs), which evicts even a 256MB cache and leaves a cold fold

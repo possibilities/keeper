@@ -108,7 +108,14 @@ percent and reset timestamps; schema v35 (fn-642) adds the colocated
 `last_rate_limit_at` + `last_rate_limit_session_id` columns, populated
 server-side by a bidirectional fan-out against the matching `profiles`
 row so a single-collection client sees both quota and rate-limit state
-together), and `profiles` (schema v33, fn-639 — one
+together; schema v41 (fn-651) adds `rate_limit_lifts_at` — the soonest
+`resets_at` among windows at >=100% used (when a rate-limited profile
+actually unblocks, folded from agentuse's top-level `lift_at`) — and
+`last_usage_fold_at`, a freshness stamp equal to the event `ts` of the
+last *successful* usage fold and never bumped by an idle/stale snapshot
+or the rate-limit fan-out; both ride the percentage path and are carved
+out of the rate-limit UPDATE so the two folds cannot clobber each
+other), and `profiles` (schema v33, fn-639 — one
 row per Claude profile directory, keyed by `config_dir`, correlating the
 last `rate_limit` ApiError with each profile; schema v35 adds the
 derived `profile_name = basename(config_dir)` join key against
@@ -885,6 +892,30 @@ the board (with its full lifecycle, since the original event log carried
 nothing for it) and `N` drops by one. The schema bump is v36→v37; fn-642
 (`profile_name` jobs column) occupies the v35→v36 slot ahead of this
 work.
+As of schema v41 (fn-651), the `usage` projection tells the truth about
+WHEN a rate-limited profile unblocks AND whether its numbers are fresh.
+Two additive nullable columns ride the existing `UsageSnapshot`
+percentage path. `rate_limit_lifts_at TEXT` is folded from the agentuse
+envelope's new top-level `lift_at` field — agentuse computes it as the
+soonest `resets_at` among windows at >=100% used, the effective unblock
+instant; null when not over any limit. `last_usage_fold_at REAL` is the
+unix-seconds freshness stamp equal to the event `ts` of the last
+SUCCESSFUL usage fold (`status === "active"` OR any per-window percent
+non-null), NEVER bumped by an idle/stale snapshot or the rate-limit
+(`RateLimited` / `ApiError(kind='rate_limit')`) fan-out — the
+determinism boundary is the event ts, never `Date.now()` inside a fold,
+and the COALESCE-preserve in the UPSERT keeps a prior successful stamp
+through later idle/stale folds so a wedged ingestion path's last-good
+stamp survives until a real successful fold replaces it. Both columns
+are symmetric to the v35 rate-limit columns: a rate-limit fold's
+`UPDATE usage SET ...` excludes both (so a stale rate-limit event
+cannot clobber a fresh percentage fold's lift / freshness), and the
+percentage path owns them outright. The renderer compares
+`last_usage_fold_at` against the wall clock to surface a staleness
+warning when ingestion has wedged, and renders the rate-limit line as
+a "rate-limited for `<rel>`" countdown off `rate_limit_lifts_at`
+(`n/a` when absent or already in the past — never a confusing
+"`<rel>` ago" countdown).
 As of schema v25, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `last_api_error_at` /
 `last_api_error_kind` / `last_input_request_at` /

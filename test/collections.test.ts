@@ -176,6 +176,10 @@ test("getCollection resolves the usage collection (fn-615)", () => {
     // Schema v35 (fn-642): colocated rate-limit columns.
     "last_rate_limit_at",
     "last_rate_limit_session_id",
+    // Schema v41 (fn-651): rate-limit lift instant + last-successful-fold
+    // freshness stamp on the usage wire.
+    "rate_limit_lifts_at",
+    "last_usage_fold_at",
     "last_event_id",
     "updated_at",
   ]) {

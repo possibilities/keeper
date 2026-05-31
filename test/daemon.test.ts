@@ -1053,6 +1053,10 @@ test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field"
       error_type: "ClaudeUsageParseError",
       error_message: "cli output unparseable",
       error_at: "2026-05-30T12:00:00-04:00",
+      // fn-651 task .4: rate-limit lift instant. The companion
+      // `last_usage_fold_at` is NOT a serialized field — the reducer
+      // derives it from the event ts on a successful fold.
+      lift_at: "2026-05-30T20:30:00-04:00",
     }),
   );
   // Every fn-645 + earlier projection field present and round-trippable.
@@ -1070,6 +1074,9 @@ test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field"
     error_type: "ClaudeUsageParseError",
     error_message: "cli output unparseable",
     error_at: "2026-05-30T12:00:00-04:00",
+    // fn-651 task .4: top-level envelope field, projected onto
+    // `usage.rate_limit_lifts_at` by parseUsageSnapshot.
+    lift_at: "2026-05-30T20:30:00-04:00",
   });
   // `kind` / `id` are NOT projection fields — the discriminator is event
   // metadata and `id` rides in `events.session_id` via the synthetic-event
@@ -1104,6 +1111,7 @@ test("fn-651: serialized snapshot folds end-to-end — status / subscription_act
         error_type: "ClaudeUsageParseError",
         error_message: "boom",
         error_at: "2026-05-30T12:00:00-04:00",
+        lift_at: null,
       }),
     ],
   );
@@ -1160,6 +1168,7 @@ test("fn-651: a no-subscription envelope folds subscription_active = 0 so the re
         error_type: null,
         error_message: null,
         error_at: null,
+        lift_at: null,
       }),
     ],
   );

@@ -228,6 +228,13 @@ export function serializeUsageSnapshot(msg: UsageSnapshotMessage): string {
     error_type: msg.error_type,
     error_message: msg.error_message,
     error_at: msg.error_at,
+    // fn-651: rate-limit lift instant — top-level envelope field, folded
+    // into `usage.rate_limit_lifts_at` by `parseUsageSnapshot`. The
+    // companion `last_usage_fold_at` freshness stamp is NOT a serialized
+    // payload field; the reducer derives it from the event `ts` on a
+    // "successful usage" fold (CLAUDE.md determinism boundary — never
+    // a wall-clock read inside the fold).
+    lift_at: msg.lift_at,
   });
 }
 

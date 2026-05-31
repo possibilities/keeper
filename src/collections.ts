@@ -414,6 +414,15 @@ export const USAGE_DESCRIPTOR: CollectionDescriptor = {
     "error_type",
     "error_message",
     "error_at",
+    // Schema v41 (fn-651): rate-limit lift instant + last-successful-fold
+    // freshness stamp. Both ride the `UsageSnapshot` percentage path; the
+    // rate-limit fan-out carves them out so a RateLimited event cannot
+    // clobber a lift or freshness value. `rate_limit_lifts_at` is an
+    // ISO-8601 string mirroring `session_resets_at`;
+    // `last_usage_fold_at` is the event ts of the last successful fold
+    // (renderer compares against wall clock for the freshness warning).
+    "rate_limit_lifts_at",
+    "last_usage_fold_at",
     "last_event_id",
     "updated_at",
   ],

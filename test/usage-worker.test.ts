@@ -144,6 +144,8 @@ test("buildUsageMessage maps id/target/multiplier and the two-window usage sub-b
     error_type: null,
     error_message: null,
     error_at: null,
+    // fn-651: envelope omits `lift_at` → null.
+    lift_at: null,
   });
 });
 
@@ -311,6 +313,29 @@ test("buildUsageMessage projects fn-645 status / subscription_active / error axe
   expect(unknown?.subscription_active).toBeNull();
 });
 
+test("fn-651: buildUsageMessage projects top-level lift_at; absent/non-string → null", () => {
+  // The rate-limit lift instant ships as a top-level envelope field
+  // alongside `target` / `multiplier` / `status`. Mirrors `session_resets_at`
+  // shape (ISO string | null) and is null-safe on missing/non-string.
+  const present = buildUsageMessage({
+    id: "claude-mc1",
+    target: "claude",
+    multiplier: 5,
+    lift_at: "2026-05-30T20:30:00-04:00",
+  });
+  expect(present?.lift_at).toBe("2026-05-30T20:30:00-04:00");
+
+  // Absent → null.
+  const absent = buildUsageMessage({ id: "x" });
+  expect(absent?.lift_at).toBeNull();
+
+  // Non-string (e.g. agentuse fault, or a typo'd envelope) → null per the
+  // safe-value invariant. The reducer's `parseUsageSnapshot` enforces the
+  // same string-guard on the wire side.
+  const bogus = buildUsageMessage({ id: "x", lift_at: 42 });
+  expect(bogus?.lift_at).toBeNull();
+});
+
 test("ERROR_AT GATE EXCLUSION: two envelopes differing ONLY in error.at produce ONE emit", () => {
   // fn-645 introduces the first PROJECTED-but-GATE-EXCLUDED field. `error.at`
   // advances on every failed scrape (~90s during an outage); without the
@@ -460,6 +485,8 @@ test("onChange emits a usage-snapshot for a real envelope, then change-gates an 
     error_type: null,
     error_message: null,
     error_at: null,
+    // fn-651: envelope omits lift_at → null.
+    lift_at: null,
   });
 
   // Identical re-scan suppressed.

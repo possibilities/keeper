@@ -24,11 +24,16 @@ import { SCHEMA_VERSION } from "../src/db";
 
 const API_PY = join(import.meta.dir, "..", "keeper", "api.py");
 
-/** Parse `SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, ...})` from api.py. */
+/** Parse `SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, ...})` from api.py.
+ *
+ * The frozenset literal may span multiple lines (Black reflowed it once the
+ * set crossed the line-length limit), so the regex is whitespace-tolerant
+ * across newlines via the `s` flag — matching the `{...}` body even when it
+ * is broken across lines. */
 function readSupportedVersions(): number[] {
   const src = readFileSync(API_PY, "utf8");
   const match = src.match(
-    /SUPPORTED_SCHEMA_VERSIONS\s*=\s*frozenset\(\{([^}]*)\}\)/,
+    /SUPPORTED_SCHEMA_VERSIONS\s*=\s*frozenset\(\s*\{([^}]*)\}\s*\)/s,
   );
   if (!match) {
     throw new Error(
