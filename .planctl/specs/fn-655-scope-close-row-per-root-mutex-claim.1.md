@@ -99,5 +99,5 @@ Run: `bun test test/readiness.test.ts`
 - [ ] `bun test test/readiness.test.ts` green
 
 ## Done summary
-
+Gated applySingleTaskPerRootMutex pass-1 close-row claim on an epic-level running OR (anyJobLinkRunning || anyEmbeddedJobWorking(epic.jobs) || anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId)) — a close row running solely from a cross-target_repo task worker (job or sub-agent) no longer phantom-locks epic.project_dir. Threaded subRunningByJobId into the mutex from computeReadiness; revised JSDoc on the mutex, evaluateCloseRow, and the cli/board.ts header to reflect scoped attribution. Added 2 regressions (job + sub-agent paths) and 3 negative controls (epic-level close-verb job, planner-running, same-root task) plus a mixed-source boundary; bun test test/readiness.test.ts green (87 pass).
 ## Evidence
