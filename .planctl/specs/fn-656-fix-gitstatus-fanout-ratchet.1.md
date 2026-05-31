@@ -85,5 +85,5 @@ verifies.
 - [ ] `bun test` passes; committed to main staging ONLY the touched files
 
 ## Done summary
-
+projectGitStatus pass-4 push guarded by if (dirtyForSession > 0); clearing UPDATE + syncIfPlanRef still fire unconditionally over sortedSessions so a session leaving the dirty set zeroes its per-job counts + embedded epic jobs[] on the transition snapshot before dropping from git_status.jobs. Offline verified on a copy of the live keeper.db: previously-slow GitSnapshot folds (157641/157682/157733, 2.3-2.8s live) now land in 2-15ms with correct projection state. CLAUDE.md + README.md tightened to state the dirty > 0 retention invariant; no schema bump.
 ## Evidence
