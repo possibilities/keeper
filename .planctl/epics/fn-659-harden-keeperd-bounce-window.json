@@ -1,0 +1,19 @@
+{
+  "branch_name": "fn-659-harden-keeperd-bounce-window",
+  "bundles": [],
+  "created_at": "2026-05-31T20:06:43.975239Z",
+  "depends_on_epics": [],
+  "id": "fn-659-harden-keeperd-bounce-window",
+  "last_validated_at": "2026-05-31T20:06:44.180828Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "harden keeperd bounce window",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-31T20:06:43.975239Z"
+}
