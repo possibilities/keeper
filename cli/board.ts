@@ -219,9 +219,17 @@ line carries one extra trailing pill '[task-repo:<basename>]' (yellow /
 warn bucket via the colorizer's 'task-repo:*' prefix fallback) so the
 unusual cross-repo routing surfaces visibly next to the verdict that
 references it (the same divergence drives which root the per-root mutex
-locks; see effectiveRoot in src/readiness.ts). The close row uses the
-epic's project_dir directly (no per-row override), so the pill never
-appears on the "Quality audit and close" line.
+locks; see effectiveRoot in src/readiness.ts). The close row has no
+per-row target_repo override, so the divergence pill never appears on
+the "Quality audit and close" line. The per-root mutex still keys the
+close row to the epic's project_dir, but the pass-1 claim is SCOPED
+(fn-655): the close row only locks project_dir when at least one
+epic-level running source is live (planner-running, an epic-level
+close-verb job, or an epic-level sub-agent). A close row whose running
+state is purely inherited from a task-level worker in a different
+target_repo does NOT claim project_dir — the contributing task already
+holds its own correct root via its target_repo. See
+applySingleTaskPerRootMutex in src/readiness.ts for the full rule.
 
 The jobs body is itself split into two stacked sub-lists separated by a '~~~'
 line: jobs with NO plan_verb (ambient sessions) on top, jobs WITH a plan_verb

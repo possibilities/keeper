@@ -432,7 +432,12 @@ export function computeReadiness(
   // order. Per-epic FIRST so its tighter scope reports the reason when both
   // would apply; per-root SECOND over the same maps.
   applySingleTaskPerEpicMutex(epicsArr, perTask);
-  applySingleTaskPerRootMutex(epicsArr, perTask, perCloseRow);
+  applySingleTaskPerRootMutex(
+    epicsArr,
+    perTask,
+    perCloseRow,
+    subRunningByJobId,
+  );
 
   // Epic header rollup.
   for (const epic of epicsArr) {
@@ -677,6 +682,27 @@ function evaluateTask(
   return { tag: "ready" };
 }
 
+/**
+ * Close-row verdict pipeline. Predicates 5 (own-progress-main) and 6
+ * (own-progress-sub) pool TWO scopes:
+ *   - EPIC-LEVEL: `epic.jobs` (close-verb embedded jobs) and `epic.job_links`
+ *     (planner-running, predicate 3).
+ *   - TASK-LEVEL: every `task.jobs` sub-array and any sub-agents under those
+ *     task workers — fanned in because predicate 1 (`evaluateTask`) marks a
+ *     task `completed` as soon as `worker_phase === "done" && approval ===
+ *     "approved"`, which can race ahead of the worker's Stop/SessionEnd.
+ *     Without the fan-out, the close row would flip to `ready` while a
+ *     worker is still alive.
+ *
+ * The verdict alone therefore does NOT carry attribution: a close row
+ * marked `running:job-running` or `running:sub-agent-running` may be
+ * "owned" by an epic-level source OR purely inherited from a task. That
+ * matters for `applySingleTaskPerRootMutex` — see its JSDoc for the
+ * scoped close-row claim (fn-655). The per-root mutex re-derives
+ * epic-level running-ness from `epic.jobs`/`job_links` plus the
+ * sub-agent index so a purely task-derived running close row no longer
+ * phantoms a `project_dir` lock that starves unrelated epics.
+ */
 function evaluateCloseRow(
   epic: Epic,
   // See `evaluateTask` for why this is `_jobs` — schema v21's embedded
@@ -931,6 +957,25 @@ export function applySingleTaskPerEpicMutex(
  * `unknown` do NOT claim in pass-1 — they don't represent a live worker
  * that would conflict with a freshly-dispatched sibling.
  *
+ * Close-row scoped attribution (fn-655): a running close-row's verdict can
+ * be INHERITED from a task-level worker in a different `target_repo` —
+ * `evaluateCloseRow` predicates 5/6 pool `epic.jobs` AND every `task.jobs`.
+ * If the close row's running-ness comes purely from a task-level source,
+ * the contributing task already claims its OWN correct root in this same
+ * pass-1 loop, so an additional unconditional `epic.project_dir` claim on
+ * the close row is redundant when same-root AND harmful when cross-root
+ * (a phantom lock that starves unrelated epics on `project_dir`). The
+ * close-row claim is therefore gated on whether at least one EPIC-LEVEL
+ * source is live: `anyJobLinkRunning(epic)` (predicate 3 planner-running —
+ * `JobLinkEntry.kind` is `creator | refiner`, epic-scoped by construction),
+ * `anyEmbeddedJobWorking(epic.jobs)` (predicate 5 epic-level close-verb
+ * job), or `anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId)`
+ * (predicate 6 epic-level sub-agent — staleness ignored: a
+ * `sub-agent-stale` close row still legitimately occupies `project_dir`).
+ * When all three are false the close row's running-ness is purely
+ * task-derived and the per-task pass-1 claim above already locks the
+ * correct root via `effectiveRoot(task.target_repo, project_dir)`.
+ *
  * Pass 2 — ready tiebreak: walk tasks and close rows in iteration order. If
  * the root is already claimed by pass-1, every `{ tag: "ready" }` row on
  * that root is mutated to `{ kind: "single-task-per-root" }`. Otherwise the
@@ -944,6 +989,7 @@ export function applySingleTaskPerRootMutex(
   epicsArr: Epic[],
   perTask: Map<string, Verdict>,
   perCloseRow: Map<string, Verdict>,
+  subRunningByJobId: Map<string, SubagentInvocation[]> = new Map(),
 ): void {
   const occupiedRoots = new Set<string>();
 
@@ -965,10 +1011,20 @@ export function applySingleTaskPerRootMutex(
       occupiedRoots.add(root);
     }
 
+    // Close-row claim is scoped (fn-655): only fires when at least one
+    // EPIC-LEVEL source is live. See the JSDoc above for the full rule —
+    // a purely task-derived running close row leaves the project_dir
+    // claim to the contributing task's own pass-1 entry above.
     const closeVerdict = perCloseRow.get(epic.epic_id);
     if (closeVerdict !== undefined && isLiveWorkOccupant(closeVerdict)) {
-      const root = effectiveRoot(null, projectDir);
-      occupiedRoots.add(root);
+      const epicLevelRunning =
+        anyJobLinkRunning(epic) ||
+        anyEmbeddedJobWorking(epic.jobs) ||
+        anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId);
+      if (epicLevelRunning) {
+        const root = effectiveRoot(null, projectDir);
+        occupiedRoots.add(root);
+      }
     }
   }
 

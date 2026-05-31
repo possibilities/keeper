@@ -1813,6 +1813,283 @@ test("applySingleTaskPerRootMutex: ready close row in earlier epic blocked by jo
   expect(perTask.get("fn-2-bar.1")).toEqual(running({ kind: "job-running" }));
 });
 
+// fn-655: scoped close-row attribution — a close row whose `running:*`
+// verdict was INHERITED from a task-level worker in a different
+// `target_repo` must NOT claim `epic.project_dir`. The contributing task
+// already locks its own correct root via its `target_repo` entry in the
+// same pass-1 loop. These tests pin the gate down both job-running and
+// sub-agent paths (the fn-651 regression had both shapes), plus three
+// negative controls so a future cleanup can't silently drop one of the
+// three epic-level OR sources.
+test("applySingleTaskPerRootMutex (fn-655): close row running from a cross-target_repo task job does NOT claim project_dir", () => {
+  // Regression for the fn-651 shape: epic A's close row pools task A.1's
+  // worker job (running on /other-repo) and inherits a `running:job-running`
+  // verdict. With the legacy unconditional claim, epic A's project_dir
+  // (/keeper) would be locked and a ready sibling task in epic B on /keeper
+  // would be demoted to single-task-per-root. The fn-655 gate sees no
+  // epic-level running source (epic A's `jobs` is empty and `job_links`
+  // carries no `working` link) and skips the close-row claim — sibling
+  // epic B's task stays ready. Task A.1 still locks /other-repo correctly
+  // via its own pass-1 entry.
+  const e1t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    target_repo: "/other-repo",
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/keeper",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/keeper",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/keeper",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", running({ kind: "job-running" })],
+    ["fn-2-bar.1", { tag: "ready" }],
+  ]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", running({ kind: "job-running" })],
+  ]);
+  applySingleTaskPerRootMutex([e1, e2], perTask, perCloseRow);
+  // Sibling task on /keeper stays ready — close row did NOT phantom-lock
+  // the unrelated project_dir.
+  expect(perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+  // Cross-repo task still locks its own root (negative side of the gate).
+  expect(perTask.get("fn-1-foo.1")).toEqual(running({ kind: "job-running" }));
+});
+
+test("applySingleTaskPerRootMutex (fn-655): close row running from a cross-target_repo task sub-agent does NOT claim project_dir", () => {
+  // Sub-agent variant of the fn-651 shape: task A.1 has a stopped worker
+  // job but a still-running sub-agent under that job (cross-repo at
+  // /other-repo). evaluateCloseRow's predicate 6 pools task-level
+  // sub-agents and surfaces `running:sub-agent-running` on the close row.
+  // The fn-655 gate's third disjunct
+  // (`anyEmbeddedJobHasRunningSubagent(epic.jobs, ...)`) checks ONLY
+  // epic-level jobs, so it correctly returns false and the close row does
+  // not claim /keeper.
+  const e1t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    target_repo: "/other-repo",
+    jobs: [makeEmbeddedJob({ job_id: "worker-A1", state: "stopped" })],
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/keeper",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/keeper",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/keeper",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", running({ kind: "sub-agent-running" })],
+    ["fn-2-bar.1", { tag: "ready" }],
+  ]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", running({ kind: "sub-agent-running" })],
+  ]);
+  // Sub-agent index carries the running sub-agent under task A.1's worker.
+  // The epic-level jobs array on epic A is empty, so the gate's third
+  // disjunct returns false even though the index has an entry for a
+  // task-level worker job_id.
+  const subRunningByJobId = new Map<string, SubagentInvocation[]>([
+    ["worker-A1", [makeSub({ job_id: "worker-A1", status: "running" })]],
+  ]);
+  applySingleTaskPerRootMutex(
+    [e1, e2],
+    perTask,
+    perCloseRow,
+    subRunningByJobId,
+  );
+  expect(perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+  expect(perTask.get("fn-1-foo.1")).toEqual(
+    running({ kind: "sub-agent-running" }),
+  );
+});
+
+test("applySingleTaskPerRootMutex (fn-655) negative control: close row running from an epic-level close-verb job STILL claims project_dir", () => {
+  // Predicate 5 epic-level path. `epic.jobs` carries a working close-verb
+  // embedded job — the gate's `anyEmbeddedJobWorking(epic.jobs)` disjunct
+  // fires, the close row legitimately occupies /keeper, and a ready
+  // sibling task in epic B on /keeper must be demoted.
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/keeper",
+    tasks: [],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-A",
+        plan_verb: "close",
+        state: "working",
+      }),
+    ],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/keeper",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/keeper",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([["fn-2-bar.1", { tag: "ready" }]]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", running({ kind: "job-running" })],
+  ]);
+  applySingleTaskPerRootMutex([e1, e2], perTask, perCloseRow);
+  expect(perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("applySingleTaskPerRootMutex (fn-655) negative control: planner-running close row STILL claims project_dir", () => {
+  // Predicate 3 planner-running path. `epic.job_links` carries a working
+  // creator/refiner link — `JobLinkEntry.kind` is `creator | refiner` so
+  // planners are epic-scoped by construction. Gate's `anyJobLinkRunning`
+  // disjunct fires, close row claims /keeper, sibling task on /keeper is
+  // demoted. Proves the gate retains predicate 3 — the #1 trap if a
+  // future cleanup omits it.
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/keeper",
+    tasks: [],
+    job_links: [
+      makeLink({ kind: "creator", job_id: "planner-A", state: "working" }),
+    ],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/keeper",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/keeper",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([["fn-2-bar.1", { tag: "ready" }]]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", running({ kind: "planner-running" })],
+  ]);
+  applySingleTaskPerRootMutex([e1, e2], perTask, perCloseRow);
+  expect(perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("applySingleTaskPerRootMutex (fn-655) negative control: same-root task worker keeps root locked via the task's OWN claim", () => {
+  // Over-correction guard: when the contributing task IS on the same root
+  // (`target_repo === project_dir` or null) the root MUST still be locked
+  // — by the TASK's pass-1 entry, not the close row. The close row's
+  // skipped claim doesn't open a slot because the task's claim already
+  // closed it. A ready sibling task in epic B on the same root is still
+  // demoted to single-task-per-root.
+  const e1t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    target_repo: null, // falls through to epic A's project_dir == /keeper
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/keeper",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/keeper",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/keeper",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", running({ kind: "job-running" })],
+    ["fn-2-bar.1", { tag: "ready" }],
+  ]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", running({ kind: "job-running" })],
+  ]);
+  applySingleTaskPerRootMutex([e1, e2], perTask, perCloseRow);
+  // Sibling task is still demoted — the task's own pass-1 claim locked
+  // /keeper, so skipping the close-row claim didn't open a slot.
+  expect(perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+  expect(perTask.get("fn-1-foo.1")).toEqual(running({ kind: "job-running" }));
+});
+
+test("applySingleTaskPerRootMutex (fn-655) boundary: close row running from BOTH an epic-level source AND a cross-repo task worker STILL claims project_dir", () => {
+  // Mixed-source boundary: the close row's `running:*` verdict has BOTH a
+  // legitimate epic-level source (a working close-verb job on epic A) AND
+  // an inherited task-level source (task A.1's worker on /other-repo).
+  // The OR gate fires (epic-level disjunct true) and the close row claims
+  // /keeper — sibling task on /keeper is demoted. Locks in that the gate
+  // is "ANY epic-level source", not "EXCLUSIVELY task-derived".
+  const e1t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    target_repo: "/other-repo",
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/keeper",
+    tasks: [e1t1],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-A",
+        plan_verb: "close",
+        state: "working",
+      }),
+    ],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/keeper",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/keeper",
+    tasks: [e2t1],
+  });
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", running({ kind: "job-running" })],
+    ["fn-2-bar.1", { tag: "ready" }],
+  ]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", running({ kind: "job-running" })],
+  ]);
+  applySingleTaskPerRootMutex([e1, e2], perTask, perCloseRow);
+  expect(perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
 // ---------------------------------------------------------------------------
 // formatPill
 // ---------------------------------------------------------------------------
