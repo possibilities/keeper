@@ -185,6 +185,7 @@ import {
   appendFileSync,
   existsSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -204,9 +205,13 @@ import type { Epic, Task } from "../src/types";
 
 const HELP = `keeper-autopilot — dispatch log viewer over the keeper subscribe server
 
-Usage: keeper autopilot [--sock <path>] [--dry-run]
+Usage: keeper autopilot [--sock <path>] [--dry-run] [--reset]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
+  --reset          Delete the dispatch log (~/.local/state/keeper/dispatch.log)
+                   before doing anything else, dropping the durable
+                   cross-run re-dispatch guard so every ready/pending row
+                   is eligible to fire fresh this run.
   --dry-run        Log dispatches to the frame and disk but skip the
                    actual Ghostty spawn (and the matching auto-close).
                    The summary line carries a [dry] tag and is followed
@@ -2047,6 +2052,7 @@ export async function main(argv: string[]): Promise<void> {
     options: {
       sock: { type: "string" },
       "dry-run": { type: "boolean", default: false },
+      reset: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -2059,6 +2065,15 @@ export async function main(argv: string[]): Promise<void> {
 
   const sockPath = values.sock ?? resolveSockPath();
   const dispatchLogPath = join(dirname(sockPath), "dispatch.log");
+  // fn: --reset wipes the forensic dispatch log before anything else, so
+  // the durable cross-run re-dispatch guard starts empty this run and
+  // every ready/pending row is eligible to fire fresh. `force: true`
+  // makes the delete a no-op when the file is already absent (the common
+  // case on a clean state dir); `ensureDispatchLogExists` below re-creates
+  // it before hydration so the persistence contract holds.
+  if (values.reset === true) {
+    rmSync(dispatchLogPath, { force: true });
+  }
   // fn-635: readiness diagnostics JSONL log. Same path keeper-wide
   // (shared with `scripts/board.ts`'s drain) so two processes appending
   // concurrently land in one file. POSIX O_APPEND under PIPE_BUF gives
