@@ -124,6 +124,19 @@ export interface LiveShellCore {
   visibleRows(): string[];
   historyLen(): number;
   getViewIdx(): ViewIdx;
+  /**
+   * Read-and-clear the "a user-initiated frame switch happened since the
+   * last paint" flag. Set ONLY by the four navigation actions
+   * (`stepBack` / `stepForward` / `jumpOldest` / `snapLive`) — NOT by
+   * `pushFrame` (live data update or ring-buffer eviction), `refreshLive`
+   * (overlay), or `setStatus` (banner churn). The paint layer consumes
+   * this in `repaint()` to decide whether to snap the ScrollBox back to
+   * the top: a genuine frame switch resets scroll so a tall frame opens
+   * at its head; a live update preserves the human's scroll position so
+   * reading a long board isn't yanked to row 0 on every daemon tick.
+   * Passthrough mode always returns `false` (no scrollable surface).
+   */
+  takeScrollReset(): boolean;
   dispose(): void;
 }
 
@@ -186,6 +199,9 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
       getViewIdx(): ViewIdx {
         return "live";
       },
+      takeScrollReset(): boolean {
+        return false;
+      },
       dispose(): void {
         passthroughDisposed = true;
       },
@@ -209,6 +225,11 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
   let disposed = false;
   let liveOverlay: string[] | null = null;
   let bannerStatus = "";
+  // Set by the navigation actions, read-and-cleared by the paint layer
+  // via `takeScrollReset()`. Distinguishes a user-initiated frame switch
+  // (snap scroll to top) from a content update (preserve scroll). See
+  // the `takeScrollReset` docstring on `LiveShellCore`.
+  let scrollResetPending = false;
 
   // Escape-parser state. `escBuf` accumulates bytes that begin with
   // `\x1b`; the bare-Esc flush timer disambiguates a real Escape
@@ -261,6 +282,7 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
     } else {
       viewIdx = Math.max(0, viewIdx - 1);
     }
+    scrollResetPending = true;
     onRender();
   }
 
@@ -278,6 +300,7 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
     } else {
       viewIdx = next;
     }
+    scrollResetPending = true;
     onRender();
   }
 
@@ -286,6 +309,7 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
       return;
     }
     viewIdx = 0;
+    scrollResetPending = true;
     onRender();
   }
 
@@ -294,6 +318,7 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
       return;
     }
     viewIdx = "live";
+    scrollResetPending = true;
     onRender();
   }
 
@@ -462,6 +487,11 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
     visibleRows,
     historyLen: () => history.length,
     getViewIdx: () => viewIdx,
+    takeScrollReset: () => {
+      const pending = scrollResetPending;
+      scrollResetPending = false;
+      return pending;
+    },
     dispose,
   };
 }

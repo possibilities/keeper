@@ -604,10 +604,16 @@ export function attachLiveShellPaint(
       lastBodyText = joined;
       lastBodyLineCount = rows.length;
     }
-    // On frame switch, snap the scroll position to the top so a
-    // tall historical frame doesn't surface its tail; the live tip
-    // is always rendered top-aligned too. Idempotent.
-    sb.scrollTo(0);
+    // Snap the scroll position to the top ONLY on a user-initiated frame
+    // switch (the core sets the flag in its navigation actions) — so a
+    // tall historical frame opens at its head. A plain content update
+    // (live `pushFrame`, `refreshLive`, banner `setStatus`) leaves the
+    // scroll where the human left it, so reading a long board isn't
+    // yanked back to row 0 on every daemon tick. `takeScrollReset` is
+    // read-and-clear, so each navigation triggers exactly one snap.
+    if (core.takeScrollReset()) {
+      sb.scrollTo(0);
+    }
     renderer.requestRender();
   }
 

@@ -241,16 +241,44 @@ test("setStatus updates the banner without growing history", async () => {
   expect(core.historyLen()).toBe(1);
 });
 
-test("scrollBox.scrollTop is reset to 0 on every frame switch", async () => {
-  const { setup, core, paint } = await bootPaint({ width: 60, height: 8 });
-  // Push a frame tall enough to potentially scroll.
-  core.pushFrame(["row1", "row2", "row3", "row4", "row5", "row6", "row7"]);
+// A frame taller than the viewport so the ScrollBox has somewhere to
+// scroll. height 6 viewport → ~5 body rows visible, 30 rows of content.
+const tallFrame = (tag = ""): string[] =>
+  Array.from({ length: 30 }, (_, i) => `row${i}${tag}`);
+
+test("a live content update PRESERVES the human's scroll position", async () => {
+  // The reported bug: scroll down to read a long board, then a daemon
+  // tick yanks you back to the top. A live `pushFrame` keeps
+  // `viewIdx === "live"` (no frame switch), so the paint layer must
+  // leave the scroll where the human left it.
+  const { setup, core, paint } = await bootPaint({ width: 40, height: 6 });
+  core.pushFrame(tallFrame());
   await setup.renderOnce();
-  expect(paint.scrollBox.scrollTop).toBe(0);
-  // Force the body to a different frame; the ScrollBox snap fires
-  // inside repaint().
-  core.pushFrame(["only"]);
+  paint.scrollBox.scrollTop = 12;
   await setup.renderOnce();
+  expect(paint.scrollBox.scrollTop).toBe(12);
+  // New live frame at the same height — position must survive.
+  core.pushFrame(tallFrame("b"));
+  await setup.renderOnce();
+  expect(paint.scrollBox.scrollTop).toBe(12);
+});
+
+test("a user-initiated frame switch RESETS scroll to the top", async () => {
+  // Navigating history (arrow / h / k / g / G / Esc) should open the
+  // target frame at its head, not inherit a stale offset from the frame
+  // you were just reading. The core flags the switch; the paint layer
+  // snaps vertical scroll to 0.
+  const { setup, core, paint } = await bootPaint({ width: 40, height: 6 });
+  core.pushFrame(tallFrame("a"));
+  core.pushFrame(tallFrame("b"));
+  await setup.renderOnce();
+  paint.scrollBox.scrollTop = 15;
+  await setup.renderOnce();
+  expect(paint.scrollBox.scrollTop).toBe(15);
+  // Left arrow → stepBack → frame switch → scroll resets to 0.
+  setup.mockInput.pressArrow("left");
+  await setup.renderOnce();
+  expect(core.getViewIdx()).toBe(0);
   expect(paint.scrollBox.scrollTop).toBe(0);
 });
 

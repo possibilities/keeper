@@ -480,3 +480,56 @@ test("banner status suffix is preserved across scrolled-back state", () => {
     "[[git]] frame 1 of 2 — press G to return to live [copy failed]",
   );
 });
+
+test("takeScrollReset: set only by navigation, read-and-clear; content updates leave it unset", () => {
+  const { core } = bootCore();
+  // Fresh core — nothing navigated yet.
+  expect(core.takeScrollReset()).toBe(false);
+  // Content mutations must NOT request a scroll reset (the paint layer
+  // preserves the human's scroll on live updates / banner churn).
+  core.pushFrame(["a", "b", "c"]);
+  core.pushFrame(["d", "e", "f"]);
+  core.refreshLive(["g"]);
+  core.setStatus("[x]");
+  expect(core.takeScrollReset()).toBe(false);
+  // stepBack (left arrow) is a navigation — flag set, then cleared by read.
+  core.feedStdin("\x1b[D");
+  expect(core.takeScrollReset()).toBe(true);
+  expect(core.takeScrollReset()).toBe(false);
+});
+
+test("takeScrollReset: each of g / G fires it on a real frame switch", () => {
+  const { core } = bootCore();
+  core.pushFrame(["a"]);
+  core.pushFrame(["b"]);
+  core.pushFrame(["c"]);
+  core.takeScrollReset(); // clear any prior state
+  // jumpOldest (g) is a switch.
+  core.feedStdin("g");
+  expect(core.takeScrollReset()).toBe(true);
+  // snapLive (G) from a scrolled-back view is a switch.
+  core.feedStdin("G");
+  expect(core.takeScrollReset()).toBe(true);
+});
+
+test("takeScrollReset: a no-op navigation does NOT set the flag", () => {
+  const { core } = bootCore();
+  core.pushFrame(["only"]);
+  // stepForward (right arrow) from live is a no-op → no frame switch.
+  core.feedStdin("\x1b[C");
+  expect(core.takeScrollReset()).toBe(false);
+  // snapLive (G) while already live is a no-op → no frame switch.
+  core.feedStdin("G");
+  expect(core.takeScrollReset()).toBe(false);
+});
+
+test("takeScrollReset: passthrough mode always returns false", () => {
+  const core = createLiveShellCore({
+    enabled: false,
+    ttyOk: false,
+    onPlainWrite: () => {},
+  });
+  expect(core.takeScrollReset()).toBe(false);
+  core.pushFrame(["a"]);
+  expect(core.takeScrollReset()).toBe(false);
+});
