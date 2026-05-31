@@ -23,10 +23,23 @@
  * rate-limit annotation is colocated onto the same `usage` row via
  * `last_rate_limit_at` + `last_rate_limit_session_id`, so a tracked stack
  * carries a `rate-limited <rel>` line under its quota lines when the row
- * has been rate-limited; profiles that have never hit a limit (and the
- * codex stack, which has no rate-limit concept) omit the line. Untracked
- * profiles (a rate-limit without an agentuse usage row) do not render
- * anywhere — the "drop untracked" decision.
+ * has been rate-limited; as of schema v41 (fn-651) that line is a
+ * forward-looking lift countdown (`rate-limited for <rel>` when
+ * `rate_limit_lifts_at` is known and future, `rate-limited n/a` when it
+ * is absent or already past — never a confusing "<rel> ago" countdown
+ * and never falling back to the fired-time `last_rate_limit_at`).
+ * Profiles that have never hit a limit (and the codex stack, which has
+ * no rate-limit concept) omit the line. A v41 freshness signal rides
+ * the same row via `last_usage_fold_at`: a row whose stamp is older
+ * than `STALENESS_THRESHOLD_MS` (driven ONLY off that stamp — never
+ * `updated_at`, which a rate-limit fold bumps, and never agentuse's own
+ * `status`, which tracks its scrape failures rather than keeper's
+ * ingestion health) picks up an indented `stale Nm` line so a wedged
+ * usage worker becomes visible instead of silently frozen. Stale, idle,
+ * and rate-limited stay visually distinct (stale is its own labelled
+ * line; idle is a header chip; rate-limited is the colocated countdown
+ * line). Untracked profiles (a rate-limit without an agentuse usage
+ * row) do not render anywhere — the "drop untracked" decision.
  *
  * The daemon-side usage worker watches `~/.local/state/agentuse/<id>.json`
  * and folds synthetic `UsageSnapshot` / `UsageDeleted` events into the
@@ -92,10 +105,18 @@ window (session, week, and sonnet where present). Each body line
 carries a 30-wide ASCII bar (\`█\` filled / \`░\` empty) followed by
 the numeric pct and a bare relative reset time (\`5d 21h\` / \`1h 16m\`
 / \`5m\` / \`now\` / \`2m ago\`). A tracked stack carrying a rate-limit
-annotation (schema v35 / fn-642) gets a colocated \`rate-limited <rel>\`
-line under its quota lines; codex and never-limited stacks omit it.
-Untracked profiles (a rate-limit with no agentuse usage row) do not
-render. Below the profile stacks, a \`recent sessions\` block logs the
+annotation (schema v35 / fn-642) gets a colocated \`rate-limited\` line
+under its quota lines; as of schema v41 (fn-651) that line is a
+forward-looking lift countdown — \`rate-limited for <rel>\` when
+\`rate_limit_lifts_at\` is known and still in the future, \`rate-limited
+n/a\` when it is absent or already past (never a "<rel> ago"
+countdown, never a fallback to the fired-time). Codex and never-limited
+stacks omit the line. A v41 \`stale Nm\` line appears under any row
+whose \`last_usage_fold_at\` is older than the staleness threshold —
+driven only off that stamp, never \`updated_at\` and never agentuse's
+own \`status\` — surfacing a wedged ingestion path instead of silently
+frozen gauges. Untracked profiles (a rate-limit with no agentuse usage
+row) do not render. Below the profile stacks, a \`recent sessions\` block logs the
 last 20 jobs (any state) newest-first, each labeled with the profile
 it ran under (\`profile_name\`, schema v36) plus a short id, title,
 state, and age. The live frame re-renders every 30s so countdowns tick;
@@ -204,6 +225,19 @@ function relTimeFromMs(
 const BAR_WIDTH = 30;
 
 /**
+ * Cutoff for the `stale` per-row warning, in ms. A usage row whose
+ * `last_usage_fold_at` (v41, fn-651 — the unix-seconds event ts of
+ * the last successful usage fold) is older than this threshold against
+ * the renderer's `nowMs` picks up an indented `stale Nm` line under
+ * its quota lines. Tuned to ~3x agentuse's normal envelope-write
+ * cadence (the daemon refreshes every ~5m on idle / faster under load),
+ * so a brief lull between writes does not flap the warning while a
+ * genuinely wedged ingestion path surfaces within ~15-20m. Single
+ * named constant so future tuning is one edit.
+ */
+const STALENESS_THRESHOLD_MS = 15 * 60_000;
+
+/**
  * Fixed-width ASCII progress bar — bracket + `BAR_WIDTH` cells + bracket,
  * identical width across every row so the pct column to its right stays
  * aligned without per-row width math. `█` is filled, `░` is empty; the
@@ -228,15 +262,18 @@ function bar(v: unknown): string {
  *                    session       [█████░░░░░░░░░░░░░░░░░░░░░░░░░]  16% 29m
  *                    week          [███████████░░░░░░░░░░░░░░░░░░░]  36% 4d 5h
  *                    sonnet        [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   8% 4d 5h
- *                    rate-limited  3h 12m ago
+ *                    rate-limited  for 1h 2m
+ *                    stale         17m
  *
  * Body indent equals `wId + 1` so labels line up under the `[` of the
- * chip. Labels (`session` / `week` / `sonnet` / `rate-limited`) padEnd
- * to the widest of the labels ACTUALLY rendered across the row set —
- * `sonnet` only joins that pool when at least one row has
- * `sonnet_week_percent` data, and `rate-limited` only when at least one
- * non-codex row has `last_rate_limit_at` set — so a sonnet-less or
- * limit-less screen still aligns pct values cleanly. The bar is fixed
+ * chip. Labels (`session` / `week` / `sonnet` / `rate-limited` /
+ * `stale`) padEnd to the widest of the labels ACTUALLY rendered across
+ * the row set — `sonnet` only joins that pool when at least one row
+ * has `sonnet_week_percent` data, `rate-limited` only when at least
+ * one non-codex row has `last_rate_limit_at` set, and `stale` only
+ * when at least one row's `last_usage_fold_at` is older than the
+ * staleness threshold — so a sonnet-less / limit-less / fresh screen
+ * still aligns pct values cleanly. The bar is fixed
  * `BAR_WIDTH + 2`-col width (bracket + BAR_WIDTH cells + bracket) so no
  * per-row width math is needed; pct cells padStart to the widest pct
  * across every body line that will render (session, week, and sonnet
@@ -251,13 +288,27 @@ function bar(v: unknown): string {
  * render an empty placeholder. Same rule for the `rate-limited` line:
  * a NULL `last_rate_limit_at` omits the line (no `—` placeholder), and
  * the codex stack (id `codex` / target `codex` — no rate-limit concept)
- * omits it unconditionally.
+ * omits it unconditionally. The `rate-limited` line itself is a
+ * forward-looking lift countdown derived from `rate_limit_lifts_at`
+ * (schema v41 / fn-651) — it renders `rate-limited for <rel>` when the
+ * lift instant is known and still in the future, and `rate-limited
+ * n/a` when the column is NULL OR the lift instant is already `<= now`
+ * (a past-reset guard — never the misleading "<rel> ago" countdown
+ * `relTime` would otherwise produce, and never a fallback to the
+ * fired-time `last_rate_limit_at`). The `stale` line (also v41) renders
+ * only when `last_usage_fold_at` is older than `STALENESS_THRESHOLD_MS`
+ * — driven exclusively off that stamp, not `updated_at` (which a
+ * rate-limit fold bumps) or agentuse's own `status` (which tracks its
+ * scrape failures rather than keeper's ingestion health).
  *
  * Reset cells are rendered against the supplied `nowMs` — the caller
  * passes `Date.now()` from the data-change emit AND from the 30s tick,
  * and tests pass a fixed clock. The `rate-limited` cell uses the same
- * `nowMs`, routed through {@link relTimeFromUnixSec} since
- * `last_rate_limit_at` is REAL unix-SECONDS on the wire.
+ * `nowMs`, routed through {@link relTime} against the ISO
+ * `rate_limit_lifts_at` value (the v35 fired-time `last_rate_limit_at`
+ * — REAL unix-SECONDS — is no longer rendered; only used to detect
+ * whether the row has ever been rate-limited). The `stale` cell renders
+ * the age of `last_usage_fold_at` against the same `nowMs`.
  */
 export function renderRowLines(
   rows: Record<string, unknown>[],
@@ -298,8 +349,22 @@ export function renderRowLines(
     swReset: string;
     // Empty string when no rate-limit annotation to render — NULL
     // `last_rate_limit_at`, or the codex stack (no rate-limit concept).
-    // Otherwise the same minute-rounded relative time as the reset cells.
+    // Otherwise the rendered tail of the `rate-limited` line as of
+    // schema v41 (fn-651): `for <rel>` when `rate_limit_lifts_at` is
+    // known and still in the future (the lift countdown), `n/a` when
+    // the lift column is NULL OR the lift instant is already past (the
+    // past-reset guard — never the misleading "<rel> ago" countdown
+    // `relTime` would otherwise produce, and never a fallback to the
+    // fired-time `last_rate_limit_at`).
     rlRel: string;
+    // Empty string when this row is fresh per
+    // `STALENESS_THRESHOLD_MS` (or `last_usage_fold_at` is NULL —
+    // unknown → no claim either way). Otherwise the rendered age tail
+    // for the `stale` line (e.g. "17m" / "1h 2m"). Driven exclusively
+    // off `last_usage_fold_at`, never `updated_at` (a rate-limit fold
+    // bumps that) and never agentuse's own `status` (which tracks its
+    // scrape failures rather than keeper's ingestion health).
+    staleRel: string;
     // fn-645: stale-error line body. Empty when no error to render
     // (`error_type` NULL — implies non-stale status); otherwise the
     // pre-formatted `<type>: <message>` content (without the trailing
@@ -315,10 +380,50 @@ export function renderRowLines(
     // wire payload were to carry a non-null `last_rate_limit_at`.
     const isCodex = row.id === "codex" || row.target === "codex";
     const rlRaw = row.last_rate_limit_at;
+    // Schema v41 (fn-651): the rate-limited line is a forward-looking
+    // lift countdown rather than the fired-time. `rate_limit_lifts_at`
+    // (ISO) is the soonest reset among >=100% windows. Render the line
+    // when the row has ever been rate-limited (presence of
+    // `last_rate_limit_at` — the v35 fired-time still gates whether
+    // the line appears at all, just no longer what it renders) AND
+    // skip for the codex stack. The tail is `for <rel>` when the lift
+    // is known and STILL IN THE FUTURE; `n/a` when the lift column is
+    // NULL OR the lift instant is `<= now` — the past-reset guard,
+    // which intercepts `relTime`'s default "<rel> ago" rendering so
+    // the row never claims to be rate-limited "for 3h ago".
+    const liftIso = seg(row.rate_limit_lifts_at);
+    const liftMs = liftIso === "" ? Number.NaN : Date.parse(liftIso);
+    const liftKnownFuture = !Number.isNaN(liftMs) && liftMs > nowMs;
+    const hasFiredTime = rlRaw != null && typeof rlRaw === "number";
     const rlRel =
-      isCodex || rlRaw == null || typeof rlRaw !== "number"
+      isCodex || !hasFiredTime
         ? ""
-        : relTimeFromUnixSec(rlRaw, nowMs);
+        : liftKnownFuture
+          ? `for ${relTime(liftIso, nowMs)}`
+          : "n/a";
+    // Schema v41 (fn-651): per-row freshness warning. `last_usage_fold_at`
+    // is REAL unix-SECONDS stamped from the event ts of the last
+    // SUCCESSFUL usage fold (never bumped by a rate-limit fold or an
+    // idle/stale snapshot). Compare its age against `STALENESS_THRESHOLD_MS`
+    // to decide whether the row picks up the `stale Nm` line. A NULL
+    // stamp means we have no successful fold to age — leave the
+    // warning off (a row that has never folded would otherwise always
+    // flap stale on first paint). Codex carries the same freshness
+    // contract — its envelope also stamps `last_usage_fold_at` — so
+    // no codex exception here.
+    const foldAtRaw = row.last_usage_fold_at;
+    const foldAtMs =
+      typeof foldAtRaw === "number" ? foldAtRaw * 1000 : Number.NaN;
+    const staleAgeMs = Number.isNaN(foldAtMs) ? -1 : nowMs - foldAtMs;
+    const staleRel =
+      staleAgeMs >= STALENESS_THRESHOLD_MS
+        ? // Use the same minute-rounding body as the reset cells so the
+          // rendered tail matches the rest of the row's relative-time
+          // vocabulary. `relTimeFromMs` returns "<body> ago" for past
+          // times; the `stale` label already conveys direction so trim
+          // the suffix for a tighter `stale 17m` body.
+          relTimeFromUnixSec(foldAtRaw as number, nowMs).replace(/ ago$/, "")
+        : "";
     // fn-645: stale-error line. Present only when `error_type` is set
     // (mirrors the agentuse contract — the `error` sub-object is non-null
     // only when status == "stale"). The content is `<type>: <message…>`;
@@ -346,6 +451,7 @@ export function renderRowLines(
       swPct: hasSonnet ? pct(row.sonnet_week_percent) : null,
       swReset: hasSonnet ? relTime(seg(row.sonnet_week_resets_at), nowMs) : "",
       rlRel,
+      staleRel,
       errContent,
       errRel,
     };
@@ -377,6 +483,7 @@ export function renderRowLines(
   const labels = ["session", "week"];
   if (cells.some((c) => c.swPct != null)) labels.push("sonnet");
   if (cells.some((c) => c.rlRel !== "")) labels.push("rate-limited");
+  if (cells.some((c) => c.staleRel !== "")) labels.push("stale");
   if (cells.some((c) => c.errContent !== "")) labels.push("error");
   const wLabel = widest(labels);
 
@@ -395,9 +502,18 @@ export function renderRowLines(
 
   // The rate-limit line has no bar and no pct — just `label rel`. Indent
   // and label-padding match the quota body lines so the relative time
-  // aligns under the quota cells' relative times.
+  // aligns under the quota cells' relative times. The `rel` body is
+  // either `for <rel>` (lift countdown) or `n/a` (past / unknown lift)
+  // — composed in the cell mapping above.
   const renderRateLimit = (rel: string): string =>
     `${indent}${"rate-limited".padEnd(wLabel, " ")} ${rel}`;
+
+  // The stale line mirrors the rate-limit line — `label age` with the
+  // same indent + label-padding so it column-aligns under the other
+  // body lines. The age body is bare (no `ago` suffix) since the
+  // `stale` label already conveys direction.
+  const renderStale = (age: string): string =>
+    `${indent}${"stale".padEnd(wLabel, " ")} ${age}`;
 
   // fn-645: stale-error line. The body content `<type>: <message…>` occupies
   // the same `BAR_WIDTH + 2 + 1 + wPct` cell width the bar+space+pct
@@ -443,6 +559,9 @@ export function renderRowLines(
     }
     if (c.rlRel !== "") {
       lines.push(renderRateLimit(c.rlRel));
+    }
+    if (c.staleRel !== "") {
+      lines.push(renderStale(c.staleRel));
     }
     if (c.errContent !== "") {
       lines.push(renderError(c.errContent, c.errRel));
@@ -692,6 +811,15 @@ export async function main(argv: string[]): Promise<void> {
         r.error_type,
         r.error_message,
         r.error_at,
+        // fn-651 (v41): the lift instant and the freshness stamp. Both
+        // drive renderer-visible state (the `rate-limited for <rel>` /
+        // `n/a` countdown and the per-row `stale Nm` warning) but
+        // neither is currently in the gate above, so a lift-only or
+        // freshness-only change would silently fail to repaint without
+        // these. Raw ISO + raw unix-seconds — never the minute-rounded
+        // rendered prose — so a clock tick can't forge a frame.
+        r.rate_limit_lifts_at,
+        r.last_usage_fold_at,
       ]),
     );
   }

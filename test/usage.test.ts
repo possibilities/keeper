@@ -417,9 +417,11 @@ function bodyLineExact(lines: string[], label: string): string | undefined {
   return lines.find((l) => l.trimStart().startsWith(`${label} `));
 }
 
-test("emits 'rate-limited <rel>' when last_rate_limit_at is set", () => {
-  // A tracked stack with last_rate_limit_at 3h 12m in the past should
-  // render a `rate-limited` body line carrying that relative time.
+test("emits 'rate-limited for <rel>' when rate_limit_lifts_at is known and future (v41)", () => {
+  // Schema v41 (fn-651): the rate-limited line is a forward-looking lift
+  // countdown. A tracked stack with a known future `rate_limit_lifts_at`
+  // renders `rate-limited for <rel>` — never the fired-time
+  // `last_rate_limit_at`.
   const lines = renderRowLines(
     [
       {
@@ -432,6 +434,8 @@ test("emits 'rate-limited <rel>' when last_rate_limit_at is set", () => {
         week_resets_at: isoOffset(4 * 24 * 60 + 5 * 60),
         last_rate_limit_at: NOW_SEC - (3 * 3600 + 12 * 60),
         last_rate_limit_session_id: "s2",
+        // Lift in 1h 2m.
+        rate_limit_lifts_at: isoOffset(62),
       },
     ],
     NOW_MS,
@@ -440,7 +444,60 @@ test("emits 'rate-limited <rel>' when last_rate_limit_at is set", () => {
   expect(lines).toHaveLength(4);
   const row = bodyLineExact(lines, "rate-limited");
   expect(row, "expected a rate-limited line").toBeDefined();
-  expect(row as string).toMatch(/ 3h 12m ago$/);
+  expect(row as string).toMatch(/ for 1h 2m$/);
+  // Defensive: never a fallback to the fired-time "ago" rendering.
+  expect(row as string).not.toMatch(/ ago$/);
+});
+
+test("renders 'rate-limited n/a' when rate_limit_lifts_at is NULL (v41)", () => {
+  // The lift column is NULL → render the explicit `n/a` token, not the
+  // fired-time fallback.
+  const lines = renderRowLines(
+    [
+      {
+        id: "claude-multi-3",
+        target: "claude",
+        multiplier: 20,
+        session_percent: 16,
+        session_resets_at: isoOffset(29),
+        week_percent: 36,
+        week_resets_at: isoOffset(4 * 24 * 60 + 5 * 60),
+        last_rate_limit_at: NOW_SEC - (3 * 3600 + 12 * 60),
+        last_rate_limit_session_id: "s2",
+        rate_limit_lifts_at: null,
+      },
+    ],
+    NOW_MS,
+  );
+  const row = bodyLineExact(lines, "rate-limited") as string;
+  expect(row).toMatch(/ n\/a$/);
+  expect(row).not.toMatch(/ ago$/);
+});
+
+test("renders 'rate-limited n/a' when rate_limit_lifts_at is in the past (v41 guard)", () => {
+  // Past-reset guard: `relTime` would otherwise render "<rel> ago" for a
+  // past lift instant — the rate-limited line MUST intercept that and
+  // render `n/a` instead. Lift was 2h ago.
+  const lines = renderRowLines(
+    [
+      {
+        id: "claude-multi-3",
+        target: "claude",
+        multiplier: 20,
+        session_percent: 16,
+        session_resets_at: isoOffset(29),
+        week_percent: 36,
+        week_resets_at: isoOffset(4 * 24 * 60 + 5 * 60),
+        last_rate_limit_at: NOW_SEC - (3 * 3600 + 12 * 60),
+        last_rate_limit_session_id: "s2",
+        rate_limit_lifts_at: isoOffset(-120),
+      },
+    ],
+    NOW_MS,
+  );
+  const row = bodyLineExact(lines, "rate-limited") as string;
+  expect(row).toMatch(/ n\/a$/);
+  expect(row).not.toMatch(/ ago$/);
 });
 
 test("omits the rate-limited line when last_rate_limit_at is NULL", () => {
@@ -514,6 +571,10 @@ test("rate-limited line indent + label-padding align under the chip", () => {
         week_percent: 5,
         week_resets_at: isoOffset(5),
         last_rate_limit_at: NOW_SEC - 5 * 60,
+        // v41: a known future lift renders `rate-limited for <rel>`;
+        // a 5m offset round-trips to body "5m" so the trailing tail
+        // is "for 5m".
+        rate_limit_lifts_at: isoOffset(5),
       },
     ],
     NOW_MS,
@@ -525,8 +586,9 @@ test("rate-limited line indent + label-padding align under the chip", () => {
   // The rate-limited literal lands at the chip's `[` column.
   expect(rl.indexOf("rate-limited")).toBe(bracket);
   // `rate-limited` is 12 chars (the widest label here), padEnd(12) leaves
-  // zero trailing spaces; one separator space precedes the relative time.
-  expect(rl).toBe(`${" ".repeat(bracket)}rate-limited 5m ago`);
+  // zero trailing spaces; one separator space precedes the lift-countdown
+  // body `for 5m`.
+  expect(rl).toBe(`${" ".repeat(bracket)}rate-limited for 5m`);
   // Quota labels are padded to width 12 too so they share the column
   // landing; session is 7 → 5 trailing spaces, week is 4 → 8 trailing.
   const session = bodyLineExact(lines, "session") as string;
@@ -564,13 +626,10 @@ test("label padding ignores 'rate-limited' when no row renders one", () => {
   );
 });
 
-test("unix-seconds input renders as relative time (no raw-float leakage)", () => {
-  // The colocated `usage.last_rate_limit_at` column is REAL unix-SECONDS
-  // to match `profiles.last_rate_limit_at` / `jobs.last_api_error_at`.
-  // Feeding it straight into `relTime` would do `Date.parse` and yield
-  // NaN, leaking the raw float into the rendered text. The numeric
-  // variant routes through `relTimeFromUnixSec` so the rendered cell is
-  // the same minute-rounded prose as the quota reset times.
+test("rate-limited line absent when last_rate_limit_at is NULL even if lift is set", () => {
+  // The presence-gate is still `last_rate_limit_at` (the v35 fired-time —
+  // proof the row has ever been rate-limited). A future lift without an
+  // underlying fired-time renders no rate-limited line at all.
   const lines = renderRowLines(
     [
       {
@@ -581,38 +640,118 @@ test("unix-seconds input renders as relative time (no raw-float leakage)", () =>
         session_resets_at: isoOffset(10),
         week_percent: 10,
         week_resets_at: isoOffset(10),
-        last_rate_limit_at: NOW_SEC - 120, // 2 minutes ago
+        last_rate_limit_at: null,
+        rate_limit_lifts_at: isoOffset(60),
       },
     ],
     NOW_MS,
   );
-  const row = bodyLineExact(lines, "rate-limited") as string;
-  expect(row).toMatch(/ 2m ago$/);
-  // Defensive: no raw float anywhere in the rendered text.
-  expect(row).not.toMatch(/\d+\.\d+/);
+  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("rate-limited");
 });
 
-test("renders 'now' at the round boundary for the rate-limit cell", () => {
-  // A unix-seconds input within 30s of `nowMs` rounds to the same minute
-  // and renders as "now" — same contract as the quota cells, shared via
-  // `relTimeFromMs`.
+// ---------------------------------------------------------------------------
+// Staleness warning (schema v41 / fn-651). A row whose `last_usage_fold_at`
+// is older than the renderer's `STALENESS_THRESHOLD_MS` cutoff (~15m)
+// picks up an indented `stale Nm` body line — driven exclusively off
+// that stamp, never `updated_at` (a rate-limit fold bumps it) and never
+// agentuse's own `status`. NULL stamp leaves the warning off; codex
+// gets the same contract.
+// ---------------------------------------------------------------------------
+
+test("emits a 'stale <age>' line when last_usage_fold_at is older than threshold", () => {
+  // 20m-old fold > 15m threshold → stale warning. Age tail is bare (no
+  // "ago" suffix; the `stale` label already conveys direction).
   const lines = renderRowLines(
     [
       {
-        id: "p1",
+        id: "p",
         target: "claude",
-        multiplier: 1,
+        multiplier: 5,
         session_percent: 10,
-        session_resets_at: isoOffset(10),
+        session_resets_at: isoOffset(60),
         week_percent: 10,
-        week_resets_at: isoOffset(10),
-        last_rate_limit_at: NOW_SEC, // exact now
+        week_resets_at: isoOffset(60),
+        last_usage_fold_at: NOW_SEC - 20 * 60,
       },
     ],
     NOW_MS,
   );
-  const row = bodyLineExact(lines, "rate-limited") as string;
-  expect(row).toMatch(/ now$/);
+  const stale = bodyLineExact(lines, "stale");
+  expect(stale, "expected a stale line").toBeDefined();
+  expect(stale as string).toMatch(/ 20m$/);
+  expect(stale as string).not.toMatch(/ ago$/);
+});
+
+test("no 'stale' line when last_usage_fold_at is fresh under the threshold", () => {
+  // 5m-old fold < 15m threshold → no warning.
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+        last_usage_fold_at: NOW_SEC - 5 * 60,
+      },
+    ],
+    NOW_MS,
+  );
+  expect(bodyLineExact(lines, "stale")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("stale");
+});
+
+test("no 'stale' line when last_usage_fold_at is NULL (no successful fold to age)", () => {
+  // NULL stamp means we have no successful fold to compare against — leave
+  // the warning off so a never-folded row doesn't flap stale on first paint.
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+        last_usage_fold_at: null,
+      },
+    ],
+    NOW_MS,
+  );
+  expect(bodyLineExact(lines, "stale")).toBeUndefined();
+});
+
+test("stale and rate-limited render together as visually distinct lines", () => {
+  // Both warnings can fire on the same row — the three states (idle is a
+  // header chip, rate-limited is the colocated line, stale is its own
+  // labelled line) must stay visually distinct.
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+        last_rate_limit_at: NOW_SEC - 3 * 60 * 60,
+        rate_limit_lifts_at: isoOffset(30),
+        last_usage_fold_at: NOW_SEC - 20 * 60,
+      },
+    ],
+    NOW_MS,
+  );
+  // header + session + week + rate-limited + stale = 5 lines.
+  expect(lines).toHaveLength(5);
+  const rl = bodyLineExact(lines, "rate-limited") as string;
+  const stale = bodyLineExact(lines, "stale") as string;
+  expect(rl).toMatch(/ for 30m$/);
+  expect(stale).toMatch(/ 20m$/);
 });
 
 // ---------------------------------------------------------------------------

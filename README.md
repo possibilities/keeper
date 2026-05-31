@@ -609,9 +609,21 @@ collapses to plain stream output. Run any of them with
   agentuse profile observed at `~/.local/state/agentuse/<id>.json`:
   target, multiplier, session+week percent + reset timestamps, plus the
   schema-v35 colocated `last_rate_limit_at` +
-  `last_rate_limit_session_id`). Each row's stack carries the colocated
-  rate-limit line when set; untracked profiles (rate-limited but with no
-  agentuse usage row) do not render. Per-frame sidecars
+  `last_rate_limit_session_id` and the schema-v41 `rate_limit_lifts_at` +
+  `last_usage_fold_at`). Each row's stack carries the colocated
+  rate-limit line when set — as of schema v41 (fn-651) that line is a
+  forward-looking lift countdown (`rate-limited for <rel>` when the
+  lift instant is known and still in the future, `rate-limited n/a`
+  when it is absent or already past — never a "<rel> ago" countdown
+  and never a fallback to the fired-time). A v41 `stale Nm` line also
+  surfaces under any row whose `last_usage_fold_at` is older than the
+  renderer's `STALENESS_THRESHOLD_MS` cutoff (currently ~15m) —
+  driven only off that stamp, never `updated_at` (a rate-limit fold
+  bumps that) and never agentuse's own `status` (which tracks its
+  scrape failures rather than keeper's ingestion health) — so a wedged
+  usage worker becomes visible instead of silently frozen. Untracked
+  profiles (rate-limited but with no agentuse usage row) do not render.
+  Per-frame sidecars
   (`/tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*`, indexed via a meta
   sidecar) carry the row set so the JSON sidecar captures the full input
   to the rendered frame. SIGINT disposes the subscription handle and
