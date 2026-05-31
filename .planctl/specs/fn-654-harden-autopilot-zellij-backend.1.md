@@ -60,5 +60,5 @@ Delete the named Ghostty tests rather than skipping them. Add a `test/config.tes
 - [ ] `bunx tsc --noEmit` and `bun test test/exec-backend.test.ts test/config.test.ts test/autopilot.test.ts` all green
 
 ## Done summary
-
+Removed the Ghostty/osascript backend from src/exec-backend.ts (createGhosttyBackend, buildGhosttyLaunchArgs/CloseArgs, quoteForShell, GhosttyBackendDeps, yabai move, isSurfaceLive no-op); collapsed resolveExecBackend to a zellij-only seam; dropped exec_backend from KeeperConfig/resolveConfig (legacy ghostty value silently ignored, covered by a new test); updated both DEFAULT_EXEC_BACKEND lockstep sites + cli/autopilot.ts call site; deleted Ghostty tests; removed CLAUDE.md Ghostty-OOM block + README ghostty prose.
 ## Evidence
