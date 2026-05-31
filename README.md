@@ -788,7 +788,14 @@ deterministically from a `Session-Id:` commit trailer stamped by the
 falls back to a global discharge when the trailer is absent), and the
 reducer's `Commit` fold updates `file_attributions.last_commit_at`
 (never deletes rows) so a re-edit re-arms attribution by re-stamping
-`last_mutation_at`. `GitRootDropped` retracts symmetrically. As of
+`last_mutation_at`. As of fn-656.1, the pass-4 fan-out persists ONLY
+`dirty > 0` sessions into `git_status.jobs` (the clearing UPDATE +
+`syncIfPlanRef` still fire unconditionally for every session in the
+union — including ones leaving the dirty set via `priorSessions` — so a
+session zeroes out exactly once on the transition snapshot before
+dropping from the persisted JSON; the guard collapses the steady-state
+fan-out from a monotonically ratcheting set to the currently-dirty
+set). `GitRootDropped` retracts symmetrically. As of
 schema v32 (fn-634), `epics` adds `default_visible` as a VIRTUAL
 generated column SQLite computes from
 `CASE WHEN status='open' OR approval!='approved' THEN 1 ELSE 0 END`,

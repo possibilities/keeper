@@ -580,6 +580,289 @@ test("GitRootDropped zeroes git counts via the canonical attribution; unrelated 
 });
 
 // ---------------------------------------------------------------------------
+// fn-656.1: `git_status.jobs` retains only `dirty > 0` sessions
+// ---------------------------------------------------------------------------
+
+test("fn-656.1 dirty->clean transition: session zeroes once on transition snapshot then drops from git_status.jobs", () => {
+  // Lifecycle:
+  //  1. SessionStart for a worker with plan_ref → epic jobs[] mirrors counts.
+  //  2. PostToolUse mints a file_attributions row.
+  //  3. GitSnapshot with the file dirty → sess-w lands in git_status.jobs
+  //     with dirty=1 and jobs.git_dirty_count=1.
+  //  4. GitSnapshot with no dirty_files → sess-w STILL enumerated via
+  //     priorSessions, its UPDATE zeroes jobs.git_dirty_count, embedded
+  //     epic jobs[] count clears to 0, AND sess-w is DROPPED from the
+  //     persisted git_status.jobs JSON (dirty == 0).
+  //  5. Third GitSnapshot, still no dirty_files → sess-w no longer in
+  //     priorSessions, not enumerated; still absent from git_status.jobs.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-w",
+    spawn_name: "work::fn-1-foo.1",
+  });
+  insertEvent({
+    hook_event: "TaskSnapshot",
+    session_id: "fn-1-foo.1",
+    data: JSON.stringify({
+      task_id: "fn-1-foo.1",
+      epic_id: "fn-1-foo",
+      task_number: 1,
+      title: "task",
+      target_repo: null,
+      worker_phase: "open",
+      runtime_status: "todo",
+      approval: "pending",
+      depends_on: [],
+    }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-w",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "src/a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+
+  // Step 3 assertions: sess-w in git_status.jobs with dirty=1.
+  type JobsEntry = { job_id: string; dirty: number };
+  const gitRowDirty = db
+    .query("SELECT jobs FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { jobs: string } | null;
+  expect(gitRowDirty).not.toBeNull();
+  const jobsDirty = JSON.parse(gitRowDirty?.jobs ?? "[]") as JobsEntry[];
+  expect(jobsDirty).toEqual([{ job_id: "sess-w", dirty: 1 }]);
+  const jobsRowDirty = db
+    .query("SELECT git_dirty_count FROM jobs WHERE job_id = ?")
+    .get("sess-w") as { git_dirty_count: number } | null;
+  expect(jobsRowDirty?.git_dirty_count).toBe(1);
+
+  // Step 4: clean snapshot. sess-w still enumerated (via priorSessions);
+  // gets its clearing UPDATE + epic jobs[] clear; THEN drops from
+  // git_status.jobs.
+  // Commit discharge first so file_attributions stops keeping sess-w in
+  // sessionsWithAttribution. Otherwise the undischarged attribution
+  // would re-enumerate sess-w even after dirty_files emptied, but the
+  // dirty count remains 0 — so it would STILL drop from git_status.jobs
+  // under the guard. Discharging makes the test exercise the explicit
+  // priorSessions-only transition path.
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: "deadbeef",
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: "sess-w",
+      committed_at_ms: 5_000_000,
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [],
+    }),
+  });
+  drainAll();
+
+  const gitRowClean = db
+    .query("SELECT jobs FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { jobs: string } | null;
+  expect(gitRowClean).not.toBeNull();
+  const jobsClean = JSON.parse(gitRowClean?.jobs ?? "[]") as JobsEntry[];
+  // sess-w DROPPED from git_status.jobs on the transition snapshot.
+  expect(jobsClean).toEqual([]);
+  // jobs row counts zeroed.
+  const jobsRowClean = db
+    .query("SELECT git_dirty_count FROM jobs WHERE job_id = ?")
+    .get("sess-w") as { git_dirty_count: number } | null;
+  expect(jobsRowClean?.git_dirty_count).toBe(0);
+  // Embedded epic jobs[] git count cleared.
+  const epicRow = db
+    .query("SELECT tasks FROM epics WHERE epic_id = ?")
+    .get("fn-1-foo") as { tasks: string } | null;
+  expect(epicRow).not.toBeNull();
+  const tasksArr = JSON.parse(epicRow?.tasks ?? "[]") as Array<{
+    task_id: string;
+    jobs: Array<{ job_id: string; git_dirty_count: number }>;
+  }>;
+  const task = tasksArr.find((t) => t.task_id === "fn-1-foo.1");
+  const embeddedJob = task?.jobs.find((j) => j.job_id === "sess-w");
+  expect(embeddedJob).not.toBeUndefined();
+  expect(embeddedJob?.git_dirty_count).toBe(0);
+
+  // Step 5: another clean snapshot. priorSessions is now empty for
+  // sess-w (we just dropped it), so it isn't enumerated; still absent.
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [],
+    }),
+  });
+  drainAll();
+  const gitRowStill = db
+    .query("SELECT jobs FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { jobs: string } | null;
+  const jobsStill = JSON.parse(gitRowStill?.jobs ?? "[]") as JobsEntry[];
+  expect(jobsStill).toEqual([]);
+});
+
+test("fn-656.1 undischarged-but-not-currently-dirty session is absent from git_status.jobs; retract-after-zero is a no-op", () => {
+  // Lifecycle:
+  //  1. Two sessions mutate two different files in /repo.
+  //  2. GitSnapshot with BOTH files dirty → both in git_status.jobs.
+  //  3. GitSnapshot with only file-a dirty → sess-a remains; sess-b
+  //     has dirtyForSession==0 (its file isn't in dirty_files, but its
+  //     undischarged attribution keeps it in allActiveSessions). sess-b
+  //     gets its clearing UPDATE and DROPS from git_status.jobs.
+  //  4. GitRootDropped retract → walks git_status.jobs (sess-a only),
+  //     zeroes sess-a; sess-b is NOT walked (already zeroed in step 3)
+  //     and that's the safe no-op behavior.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-b" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-a",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/file-a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-b",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/file-b.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        { path: "file-a.ts", xy: " M", mtime_ms: null },
+        { path: "file-b.ts", xy: " M", mtime_ms: null },
+      ],
+    }),
+  });
+  drainAll();
+  type JobsEntry = { job_id: string; dirty: number };
+  const both = JSON.parse(
+    (
+      db
+        .query("SELECT jobs FROM git_status WHERE project_dir = ?")
+        .get("/repo") as { jobs: string }
+    ).jobs,
+  ) as JobsEntry[];
+  // Sorted by sortedSessions order: alphabetical sess-a, sess-b.
+  expect(both).toEqual([
+    { job_id: "sess-a", dirty: 1 },
+    { job_id: "sess-b", dirty: 1 },
+  ]);
+
+  // Step 3: GitSnapshot drops file-b from dirty_files. sess-b's
+  // attribution is still undischarged (no Commit), so it's reachable
+  // via allActiveSessions and STILL gets a clearing UPDATE — but its
+  // dirtyForSession is 0, so the guard sheds it from git_status.jobs.
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "file-a.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+
+  const onlyA = JSON.parse(
+    (
+      db
+        .query("SELECT jobs FROM git_status WHERE project_dir = ?")
+        .get("/repo") as { jobs: string }
+    ).jobs,
+  ) as JobsEntry[];
+  expect(onlyA).toEqual([{ job_id: "sess-a", dirty: 1 }]);
+  // sess-b's jobs.git_dirty_count cleared by the unconditional UPDATE.
+  const rowB = db
+    .query("SELECT git_dirty_count FROM jobs WHERE job_id = ?")
+    .get("sess-b") as { git_dirty_count: number } | null;
+  expect(rowB?.git_dirty_count).toBe(0);
+  // sess-a still counted.
+  const rowA = db
+    .query("SELECT git_dirty_count FROM jobs WHERE job_id = ?")
+    .get("sess-a") as { git_dirty_count: number } | null;
+  expect(rowA?.git_dirty_count).toBe(1);
+
+  // Step 4: GitRootDropped. retractGitStatus walks the persisted
+  // git_status.jobs (sess-a only) and zeroes it. sess-b stays zero
+  // (already zeroed in step 3) — safe no-op for the dropped session.
+  insertEvent({
+    hook_event: "GitRootDropped",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: "",
+  });
+  drainAll();
+  const rowAAfter = db
+    .query("SELECT git_dirty_count FROM jobs WHERE job_id = ?")
+    .get("sess-a") as { git_dirty_count: number } | null;
+  expect(rowAAfter?.git_dirty_count).toBe(0);
+  const rowBAfter = db
+    .query("SELECT git_dirty_count FROM jobs WHERE job_id = ?")
+    .get("sess-b") as { git_dirty_count: number } | null;
+  expect(rowBAfter?.git_dirty_count).toBe(0);
+  // git_status row gone.
+  const gone = db
+    .query("SELECT COUNT(*) AS n FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { n: number };
+  expect(gone.n).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
 // Schema-v31 attribution fold (fn-633.6) — file_attributions / per-file
 // attributions[] / per-job rollups / discharge rule
 // ---------------------------------------------------------------------------

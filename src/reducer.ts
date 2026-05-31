@@ -2044,7 +2044,21 @@ function projectGitStatus(db: Database, event: Event): void {
     // matched zero rows (no SessionStart yet) returns null from the
     // SELECT and the helper exits without a write.
     syncIfPlanRef(db, sessionId, eventId, eventTs);
-    projectionJobs.push({ job_id: sessionId, dirty: dirtyForSession });
+    // fn-656.1: persist ONLY currently-dirty sessions into
+    // git_status.jobs. The UPDATE + syncIfPlanRef above STILL fire for
+    // every session in sortedSessions (including ones that just
+    // transitioned to dirty == 0 via priorSessions), so a session
+    // leaving the dirty set gets its clearing UPDATE + embedded epic
+    // jobs[] clear exactly once — on the transition snapshot — and
+    // then drops from the persisted JSON. Without this guard the set
+    // ratchets: every session that has ever been dirty is re-persisted
+    // forever (it becomes the next snapshot's priorSessions and re-
+    // enters sortedSessions). Steady-state fan-out collapses to the
+    // currently-dirty set; the pure dependency on sessionDirtyCount
+    // keeps the decision a fold-deterministic function of the event.
+    if (dirtyForSession > 0) {
+      projectionJobs.push({ job_id: sessionId, dirty: dirtyForSession });
+    }
   }
 
   const _gfT5 = performance.now();

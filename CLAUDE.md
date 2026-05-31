@@ -71,15 +71,33 @@ the native value" is the default.
   for) and the redefined strict-mystery `jobs.git_orphan_count` (dirty
   files with zero attribution after the inference pass) are stamped onto
   every enumerated job and re-fanned via `syncJobIntoEpic` so the
-  embedded `jobs[]` arrays carry the counts, and the new
+  embedded `jobs[]` arrays carry the counts. The pass-4 fan-out
+  enumerates `sortedSessions` (the union of "sessions with current
+  active attribution" and `priorSessions`, the canonical
+  `git_status.jobs` set from the prior snapshot) and runs the clearing
+  UPDATE + `syncIfPlanRef` UNCONDITIONALLY against every entry — so a
+  session transitioning to `dirty == 0` (still in `priorSessions`) gets
+  its per-job counts zeroed and its embedded epic `jobs[]` git-count
+  cleared exactly once, on the transition snapshot, before being dropped
+  from the persisted set. As of fn-656.1, `git_status.jobs` retains
+  ONLY `dirty > 0` sessions: the `projectionJobs.push` inside the loop
+  is guarded by `if (dirtyForSession > 0)`. Without that guard the set
+  ratchets — every session that has ever been dirty is re-persisted as
+  a `dirty:0` entry, becomes the next snapshot's `priorSessions`, and
+  is re-fanned forever; the guard collapses steady-state fan-out to the
+  currently-dirty set. The new
   `file_attributions` projection table (one row per
   `(project_dir, file_path, session_id)` carrying `last_mutation_at` +
   `last_commit_at`) is maintained inside the SAME `BEGIN IMMEDIATE` —
   `Commit` folds update `last_commit_at` (never delete rows; a re-edit
   re-arms attribution by re-stamping `last_mutation_at`), and the
   `GitRootDropped` clear walks the SAME canonical `git_status.jobs`
-  enumeration the last write fanned over and zeroes the per-job columns
-  symmetrically — so an unrelated project's jobs running in another
+  enumeration the last write fanned over (now the `dirty > 0` set) and
+  zeroes the per-job columns symmetrically — the zero-before-remove
+  invariant from the pass-4 loop is what makes this safe: a session
+  that already left `git_status.jobs` has already had its counts
+  zeroed on the transition snapshot, so the retract's no-op for that
+  session is correct. An unrelated project's jobs running in another
   worktree stay untouched. Producer-side `stat()` is forbidden inside
   the reducer's transaction; mtimes are computed at snapshot build time
   in the git worker, embedded in the payload, and consumed pure-SQL by
