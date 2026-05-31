@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-655-scope-close-row-per-root-mutex-claim",
   "bundles": [],
   "closer_done_at": "2026-05-31T04:08:50.496790Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-31T04:08:50.496790Z"
+  "updated_at": "2026-05-31T04:09:00.973317Z"
 }
