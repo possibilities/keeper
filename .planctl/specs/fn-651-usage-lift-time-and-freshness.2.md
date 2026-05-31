@@ -61,5 +61,5 @@ carries `lift_at`; idle/stale writes preserve the prior `lift_at`.
 - [ ] Tests cover binding-limit selection, no-limit → None, and idle/stale preservation; `uv run pytest` passes.
 
 ## Done summary
-
+Added agentuse-side lift_at field: pure derive_lift_at() helper (soonest resets_at among >=100% windows, else None) in parse_claude_usage.py; daemon emits it via ENVELOPE_KEYS + _build_envelope, recomputed on success and preserved through idle/stale writes; README envelope contract documents the new field. 13 tests pass (parser binding-limit selection + idle/stale preservation).
 ## Evidence
