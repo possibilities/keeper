@@ -95,5 +95,5 @@ uses close-tab. Confirm `isSurfaceLive` + autoclose_windows tests stay green.
 - [ ] `bunx tsc --noEmit` + `bun test test/exec-backend.test.ts test/autopilot.test.ts test/config.test.ts` green
 
 ## Done summary
-
+Switched zellij ExecBackend auto-close from whole-tab close-tab-by-id to surgical close-pane -p; launch() returns the pane id (terminal_<n>) instead of the tab id, un-gated from opts.paneName. Wrap-safety: a tabName token (the launch-time verb::id) rides in the dispatch.log kind:"window" row and round-trips through hydrateDispatchLog; the backend's close(windowId, tabName) probes query-tab-names for the name and skips close-pane when the tab is no longer live (server restart wrap-safety). Pre-upgrade rows (bare-numeric tab-id windowId OR missing tabName) skip on shape — fail-safe direction. Token mechanism: no-token name-check variant (the verb::id tab name IS the token), reusing the existing isSurfaceLive/tabNameListed/query-tab-names machinery via a shared internal probe — chosen over server pid/start_time and socket-birth-time because it's platform-portable, reuses well-tested code, and is robust against ALL forms of staleness, not just server-restart wrap. Orphan-default-tab reap KEEPS close-tab-by-id (deliberately closes a known-empty Tab #1). 110/110 unit tests + 1637/1638 full-suite tests green; bunx tsc --noEmit clean.
 ## Evidence
