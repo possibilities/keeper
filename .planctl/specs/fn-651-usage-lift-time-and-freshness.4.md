@@ -72,5 +72,5 @@ schema. collections: both columns ride the usage wire.
 - [ ] Both columns ride `USAGE_DESCRIPTOR`; CLAUDE.md + README updated.
 
 ## Done summary
-
+Bumped SCHEMA_VERSION 40→41 with two additive nullable usage columns (rate_limit_lifts_at TEXT, last_usage_fold_at REAL) riding the existing UsageSnapshot percentage path. The lift_at envelope field ingests via parseUsageSnapshot into rate_limit_lifts_at; last_usage_fold_at is stamped from the event ts ONLY on a successful usage fold (status active or any per-window percent non-null), preserved through idle/stale folds via COALESCE, and carved out of the rate-limit fan-out's UPDATE (symmetric to v35's last_rate_limit_* carve-out) so the two folds can't clobber each other. Determinism boundary preserved (event ts, never Date.now). Tests cover schema-shape + v40→v41 migration in db.test.ts; the lift_at fold, freshness gate (successful/idle/stale), carve-out, COALESCE preservation, and from-scratch re-fold byte-identity in reducer.test.ts; descriptor columns in collections.test.ts; serializer in daemon.test.ts; buildUsageMessage and gate-emit shape in usage-worker.test.ts. keeper-py whitelist bumped (whitelist-only, no reader logic change). CLAUDE.md + README v41 prose added.
 ## Evidence
