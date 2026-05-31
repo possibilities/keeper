@@ -104,7 +104,13 @@ import type {
 // Tuning constants — same values the prior board.ts standalone code used.
 // ---------------------------------------------------------------------------
 
-const JOBS_PAGE_LIMIT = 10;
+// Full set — the board's default jobs scope is LIVE-only (working + stopped;
+// the descriptor's `defaultFilter` hides `ended`/`killed`), so the streamed
+// set is bounded by concurrently-live sessions, not the full job history.
+// Page limit 0 streams them all; without it the `created_at DESC` sort drops
+// the oldest-created live session off the bottom once more than the cap are
+// live at once (e.g. a long-lived session buried under newer ones).
+const JOBS_PAGE_LIMIT = 0;
 const EPICS_PAGE_LIMIT = 0;
 const SUBAGENT_INVOCATIONS_PAGE_LIMIT = 0;
 // Full set — one row per planctl-backed git worktree; the watched set is
