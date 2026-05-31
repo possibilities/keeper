@@ -990,6 +990,106 @@ test("detectJobTransitions — fulfilled key disappears from snapshot reaches co
 //     second close on a repeat tick.
 // ---------------------------------------------------------------------------
 
+test("detectJobTransitions — closeWindow receives BOTH windowId AND tabName at terminal-state edge (fn-654.2 token round-trip)", () => {
+  // Acceptance: the surgical pane-close path wires (windowId,
+  // tabName) through to the backend so close-pane -p can be guarded
+  // on a name-exact tab-live probe. detectJobTransitions must pass
+  // entry.tabName through; missing it would break the wrap-safety
+  // token guard at the close site.
+  const entry = makeDispatchEntry({
+    verb: "work",
+    id: "fn-1-foo.1",
+    dir: "repo",
+    dirFull: "/repo",
+    windowId: "terminal_42",
+    tabName: "work::fn-1-foo.1",
+  });
+  const dispatchLog: DispatchEntry[] = [entry];
+  const fulfilledKeys = new Set<string>();
+  const completedKeys = new Set<string>();
+  const calls: Array<{
+    windowId: string | undefined;
+    tabName: string | undefined;
+  }> = [];
+  const deps: DetectJobTransitionsDeps = {
+    dispatchLog,
+    fulfilledKeys,
+    completedKeys,
+    dispatchLogPath: "/tmp/keeper-autopilot.test.dispatch.log",
+    noteLine: () => {},
+    pid: 4242,
+    appendLine: () => {},
+    closeWindow: (windowId, tabName) => calls.push({ windowId, tabName }),
+  };
+
+  // Frame 1: working → fulfilled. No close yet.
+  const taskWorking = makeTask({
+    task_id: "fn-1-foo.1",
+    task_number: 1,
+    jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
+  });
+  detectJobTransitions(deps, buildSnap([makeEpic({ tasks: [taskWorking] })]));
+  expect(calls).toEqual([]);
+
+  // Frame 2: ended → terminal-state branch fires with both fields.
+  const taskEnded = makeTask({
+    task_id: "fn-1-foo.1",
+    task_number: 1,
+    jobs: [makeEmbeddedJob({ plan_verb: "work", state: "ended" })],
+  });
+  detectJobTransitions(deps, buildSnap([makeEpic({ tasks: [taskEnded] })]));
+  expect(calls).toEqual([
+    { windowId: "terminal_42", tabName: "work::fn-1-foo.1" },
+  ]);
+});
+
+test("detectJobTransitions — closeWindow receives BOTH windowId AND tabName at disappearance edge (fn-654.2 token round-trip)", () => {
+  // Sibling of the terminal-state token round-trip: post-fulfillment
+  // disappearance is the other completedKeys-entry site. Same
+  // (windowId, tabName) pair must reach the close callback.
+  const entry = makeDispatchEntry({
+    verb: "approve",
+    id: "fn-1-foo",
+    dir: "repo",
+    dirFull: "/repo",
+    windowId: "terminal_77",
+    tabName: "approve::fn-1-foo",
+  });
+  const dispatchLog: DispatchEntry[] = [entry];
+  const fulfilledKeys = new Set<string>();
+  const completedKeys = new Set<string>();
+  const calls: Array<{
+    windowId: string | undefined;
+    tabName: string | undefined;
+  }> = [];
+  const deps: DetectJobTransitionsDeps = {
+    dispatchLog,
+    fulfilledKeys,
+    completedKeys,
+    dispatchLogPath: "/tmp/keeper-autopilot.test.dispatch.log",
+    noteLine: () => {},
+    pid: 4242,
+    appendLine: () => {},
+    closeWindow: (windowId, tabName) => calls.push({ windowId, tabName }),
+  };
+  // Frame 1: matching approve job → fulfilled.
+  detectJobTransitions(
+    deps,
+    buildSnap([
+      makeEpic({
+        epic_id: "fn-1-foo",
+        jobs: [makeEmbeddedJob({ plan_verb: "approve", state: "working" })],
+      }),
+    ]),
+  );
+  expect(calls).toEqual([]);
+  // Frame 2: epic gone → disappearance branch.
+  detectJobTransitions(deps, buildSnap([]));
+  expect(calls).toEqual([
+    { windowId: "terminal_77", tabName: "approve::fn-1-foo" },
+  ]);
+});
+
 test("detectJobTransitions — closeWindow fires with entry.windowId at terminal-state edge AND on repeat tick stays silent", () => {
   // Entry carries a stamped windowId from the live-spawn capture. A
   // matching embedded job in `working` state on frame 1 → fulfilled;
@@ -1254,6 +1354,127 @@ test("hydrateDispatchLog — window row folds windowId onto matching restored en
   expect(restoredEntries.length).toBe(1);
   const entry = restoredEntries[0] as DispatchEntry;
   expect(entry.windowId).toBe("tab-group-AAA");
+});
+
+test("hydrateDispatchLog — window row with tabName (fn-654.2) round-trips both windowId AND tabName onto restored entry", () => {
+  // Acceptance: a server-generation token (tabName) is stamped at
+  // launch, persisted in the kind:"window" row, and round-tripped
+  // through hydrateDispatchLog so a cross-run auto-close can guard
+  // close-pane -p on the live-tab probe.
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-1",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+      pid: 42,
+    },
+    {
+      kind: "window",
+      ts: "2026-05-27T00:00:01.500Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      windowId: "terminal_5",
+      tabName: "work::fn-1-foo.1",
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:02.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries } = hydrateDispatchLog(path);
+  expect(restoredEntries.length).toBe(1);
+  const entry = restoredEntries[0] as DispatchEntry;
+  expect(entry.windowId).toBe("terminal_5");
+  expect(entry.tabName).toBe("work::fn-1-foo.1");
+});
+
+test("hydrateDispatchLog — pre-fn-654.2 window row without tabName leaves tabName undefined on restored entry (missing-token signal)", () => {
+  // Pre-upgrade dispatch.log rows lacked tabName; the backend's
+  // close guard treats undefined tabName as "skip the close"
+  // (fail-safe direction). hydrate must propagate the missing-token
+  // shape — never synthesize a tabName the launch never recorded.
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-1",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+      pid: 42,
+    },
+    {
+      // Old-format window row — no tabName field.
+      kind: "window",
+      ts: "2026-05-27T00:00:01.500Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      windowId: "7",
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:02.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries } = hydrateDispatchLog(path);
+  expect(restoredEntries.length).toBe(1);
+  const entry = restoredEntries[0] as DispatchEntry;
+  expect(entry.windowId).toBe("7");
+  expect(entry.tabName).toBeUndefined();
+});
+
+test("hydrateDispatchLog — malformed window row (non-string tabName) skips the tabName but keeps the windowId", () => {
+  // Symmetric to the existing non-string-windowId case: a tabName
+  // shape mismatch lifts to undefined (the backend's close guard
+  // treats it as missing-token → skip) but the windowId still rides
+  // along, so a cross-run row with a stomped tabName fails safe
+  // without losing the rest of the restore.
+  const path = writeDispatchLog([
+    {
+      kind: "launch",
+      ts: "2026-05-27T00:00:01.000Z",
+      rowId: "row-1",
+      dir: "repo",
+      dirFull: "/repo",
+      verb: "work",
+      id: "fn-1-foo.1",
+      command: "cd /repo && claude '/plan:work fn-1-foo.1'",
+      pid: 42,
+    },
+    {
+      kind: "window",
+      ts: "2026-05-27T00:00:01.500Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      windowId: "terminal_5",
+      tabName: 9001, // wrong type
+    },
+    {
+      kind: "fulfilled",
+      ts: "2026-05-27T00:00:02.000Z",
+      verb: "work",
+      id: "fn-1-foo.1",
+      pid: 42,
+    },
+  ]);
+  const { restoredEntries } = hydrateDispatchLog(path);
+  expect(restoredEntries.length).toBe(1);
+  const entry = restoredEntries[0] as DispatchEntry;
+  expect(entry.windowId).toBe("terminal_5");
+  expect(entry.tabName).toBeUndefined();
 });
 
 test("hydrateDispatchLog — duplicate window rows for same (verb, id) → latest-ts wins", () => {

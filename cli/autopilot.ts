@@ -21,16 +21,20 @@
  *   `{"kind":"launch", ts, rowId, dir, dirFull, verb, id, command,
  *    dry?, pid?}` — written by `logDispatch` the moment autopilot
  *    fires (or would-have-fired in dry mode).
- *   `{"kind":"window", ts, verb, id, windowId}` — written by
- *    `launchInGhostty` right after osascript's `new window with
- *    configuration cfg` call returns the freshly-spawned Ghostty
- *    window's stable id (a `tab-group-…` token). Stamps `windowId`
+ *   `{"kind":"window", ts, verb, id, windowId, tabName}` — written by
+ *    `launchWindow` right after `ExecBackend.launch` returns the
+ *    freshly-spawned surface's stable PANE id (zellij:
+ *    `terminal_<n>`). `tabName` is the launch-time `verb::id`, the
+ *    wrap-safety token for the surgical pane-close path (fn-654.2 —
+ *    the backend probes `query-tab-names` for `tabName` before firing
+ *    `close-pane -p windowId`, so a `zellij --server`-restart-recycled
+ *    pane id never reaps the wrong live pane). Stamps both fields
  *    onto the in-memory `DispatchEntry` by reference so the same-run
  *    auto-close can fire, and survives a restart via
- *    `hydrateDispatchLog`'s second `Map<string,string>` keyed by
- *    `${verb}::${id}` (latest-ts-wins). Raw `appendFileSync` — NOT
- *    `logDispatch` — to avoid re-pushing a display entry. Fire-and-
- *    forget on failure (window simply won't auto-close).
+ *    `hydrateDispatchLog`'s second-pass `Map` keyed by `${verb}::${id}`
+ *    (latest-ts-wins). Raw `appendFileSync` — NOT `logDispatch` — to
+ *    avoid re-pushing a display entry. Fire-and-forget on failure
+ *    (surface simply won't auto-close).
  *   `{"kind":"fulfilled", ts, verb, id, pid?}` — written by
  *    `detectJobTransitions` the first time an embedded job for the
  *    dispatched `(verb, id)` appears in the readiness snapshot. Marks
@@ -272,16 +276,22 @@ before SessionStart folds); in dry mode it persists for the lifetime
 of the run, and dry launches are deliberately NOT restored across
 runs since they can never reach fulfillment. The JSONL log at
 ~/.local/state/keeper/dispatch.log carries four kinds — 'launch'
-(every dispatch), 'window' (the freshly-spawned Ghostty window's
-stable id, emitted right after the osascript spawn returns),
-'fulfilled' (first observation of the registered session), and
-'completed' (first observation of completion on any of three axes:
-terminal session state, stopped-while-board-verdict-completed, or
-post-fulfillment disappearance) — and drives both the durable
-re-dispatch guard and the cross-run current-section restore. The
-'completed' edge ALSO fires the Ghostty window auto-close
-(closeWindow on the persisted windowId) so the dispatched window
-exits in lockstep with the work actually being done — including the
+(every dispatch), 'window' (the freshly-spawned surface's stable
+PANE id and launch-time tab name, emitted right after the backend
+launch returns; the pane id replaces the old tab id under fn-654.2's
+surgical pane-close path, the tab name is the wrap-safety token for
+the cross-server-restart close guard), 'fulfilled' (first observation
+of the registered session), and 'completed' (first observation of
+completion on any of three axes: terminal session state,
+stopped-while-board-verdict-completed, or post-fulfillment
+disappearance) — and drives both the durable re-dispatch guard and
+the cross-run current-section restore. The 'completed' edge ALSO
+fires the surface auto-close (closeWindow on the persisted
+windowId+tabName pair routed through ExecBackend.close, which probes
+zellij's query-tab-names for an exact tabName match before firing
+close-pane -p windowId — so a server-restart-recycled pane id can
+never reap the wrong live pane) so the dispatched surface exits in
+lockstep with the work actually being done — including the
 stopped-and-approved case, which previously kept its window open
 until the human closed it by hand. A real mid-flight crash
 now preserves '--- current ---' (next run rehydrates it from disk);
@@ -407,17 +417,35 @@ export interface DispatchEntry {
   // dispatch.log row to a specific autopilot process without grepping
   // sidecar mtimes. Frames don't render this field.
   pid?: number;
-  // Ghostty window id (`tab-group-…`) captured from osascript stdout
-  // right after the `new window with configuration cfg` call returns —
-  // stamped on the LIVE in-memory entry by reference so the same-run
-  // auto-close in `detectJobTransitions` can fire `closeWindow(entry.windowId)`
-  // when the dispatched row reaches `completedKeys`. Also persisted to
-  // disk via a `{"kind":"window", ts, verb, id, windowId}` row that
-  // `hydrateDispatchLog` folds back onto the restored entry across runs.
-  // `undefined` when the osascript capture failed or hasn't landed yet;
-  // `closeWindow` no-ops on that shape (the shell-fallback covers the
-  // window — it just won't auto-close).
+  // Stable surface id captured from the backend right after the
+  // launch spawn returns. With the zellij backend this is now the
+  // PANE id (`terminal_<n>`, not the tab id) — fn-654.2 moved auto-
+  // close from whole-tab `close-tab-by-id` to surgical pane-level
+  // `close-pane -p`, so a sibling tiled pane the human added to the
+  // same tab survives the auto-reap. Stamped on the LIVE in-memory
+  // entry by reference so the same-run auto-close in
+  // `detectJobTransitions` can fire `closeWindow(entry.windowId,
+  // entry.tabName)` when the dispatched row reaches `completedKeys`.
+  // Also persisted to disk via a `{"kind":"window", ts, verb, id,
+  // windowId, tabName}` row that `hydrateDispatchLog` folds back onto
+  // the restored entry across runs. `undefined` when the backend
+  // returned `null` (no terminal pane parsed from `list-panes` /
+  // zellij ENOENT / launch failed); `closeWindow` no-ops on that
+  // shape (the surface is still up — the human can close the pane
+  // manually).
   windowId?: string;
+  // Launch-time tab name (`verb::id`) — the wrap-safety token for the
+  // surgical pane-close path (fn-654.2). The backend's `close` probes
+  // `query-tab-names` for an exact `tabName` match before firing
+  // `close-pane -p windowId`: a server-generation mismatch (the
+  // `zellij --server` restarted between launch and close, blowing
+  // away the tab and resetting the pane-id counter) leaves no live
+  // tab with this name → close is skipped, no risk of reaping a
+  // recycled pane id that now belongs to a different live pane.
+  // `undefined` on pre-fn-654.2 dispatch.log rows (the
+  // `kind:"window"` payload didn't carry `tabName` then); the backend
+  // also skips on the missing-token signal — fail-safe.
+  tabName?: string;
 }
 
 // --- command rendering (module-scope so test/autopilot.test.ts can import) ---
@@ -1527,12 +1555,17 @@ export function hydrateDispatchLog(path: string): {
   // to finish populating the three sets.
   const launchRows = new Map<string, DispatchEntry>();
   // Buffer every parsed `kind:"window"` row keyed by `(verb, id)` so
-  // we can stamp `windowId` onto the matching surviving restored
-  // launch entry in pass 2. Latest-ts-wins (an old log can carry a
-  // stale id if the window was already reaped; the freshest row is
-  // the closest live signal). Track the `ts` alongside the id so the
-  // comparison doesn't pin to insertion order.
-  const windowRows = new Map<string, { windowId: string; ts: string }>();
+  // we can stamp `windowId` + `tabName` onto the matching surviving
+  // restored launch entry in pass 2. Latest-ts-wins (an old log can
+  // carry a stale id if the window was already reaped; the freshest
+  // row is the closest live signal). Track the `ts` alongside the id
+  // so the comparison doesn't pin to insertion order. `tabName` is
+  // the fn-654.2 wrap-safety token — undefined on pre-upgrade rows
+  // whose `kind:"window"` payload predates the field.
+  const windowRows = new Map<
+    string,
+    { windowId: string; tabName: string | undefined; ts: string }
+  >();
   let content: string;
   try {
     content = readFileSync(path, "utf8");
@@ -1612,17 +1645,27 @@ export function hydrateDispatchLog(path: string): {
     } else if (row.kind === "window") {
       const ts = row.ts;
       const windowId = row.windowId;
-      // Type-guard every field; a shape mismatch (e.g. `windowId`
-      // recorded as a number by a future log-format quirk) skips
-      // silently per the "malformed lines skip" forensic-log
-      // contract. The latest-ts-wins comparison string-compares ISO
-      // timestamps (their lex order matches chronological order).
+      // Type-guard every required field; a shape mismatch (e.g.
+      // `windowId` recorded as a number by a future log-format
+      // quirk) skips silently per the "malformed lines skip"
+      // forensic-log contract. The latest-ts-wins comparison string-
+      // compares ISO timestamps (their lex order matches chronological
+      // order).
       if (typeof ts !== "string" || typeof windowId !== "string") {
         continue;
       }
+      // `tabName` is the fn-654.2 wrap-safety token. Optional: pre-
+      // upgrade rows didn't carry it, and a non-string lifts to
+      // undefined (treated as "missing token" by the backend's close
+      // guard — fail-safe skip). A present-and-string value rides
+      // along onto the restored entry so a cross-run close has the
+      // full pair (windowId, tabName) for the surgical pane-close
+      // path.
+      const rawTabName = row.tabName;
+      const tabName = typeof rawTabName === "string" ? rawTabName : undefined;
       const prev = windowRows.get(key);
       if (prev === undefined || prev.ts <= ts) {
-        windowRows.set(key, { windowId, ts });
+        windowRows.set(key, { windowId, tabName, ts });
       }
     }
   }
@@ -1646,6 +1689,13 @@ export function hydrateDispatchLog(path: string): {
     const window = windowRows.get(key);
     if (window !== undefined) {
       entry.windowId = window.windowId;
+      // `tabName` may still be undefined (pre-fn-654.2 window rows
+      // without the field). The backend's close guard treats a
+      // missing tabName as a "skip the close" signal, so leaving the
+      // field undefined here is the right propagation.
+      if (window.tabName !== undefined) {
+        entry.tabName = window.tabName;
+      }
     }
     restoredEntries.push(entry);
   }
@@ -1765,15 +1815,21 @@ export interface DetectJobTransitionsDeps {
   // the filesystem.
   appendLine: (line: string) => void;
   // Auto-close trigger. Fired at BOTH `completedKeys`-entry sites
-  // (terminal-state branch AND disappearance branch) so the dispatched
-  // Ghostty window exits in lockstep with the underlying agent's
-  // terminal state. Production wires a fire-and-forget osascript spawn
-  // using the verified repeat-loop close pattern; tests inject a
-  // recording closure to assert the windowId reached the callback. The
-  // `entry.windowId` (which may be `undefined`) is passed through
-  // unconditionally — the production implementation no-ops on
-  // `undefined` so the call site can stay branch-free.
-  closeWindow: (windowId: string | undefined) => void;
+  // (terminal-state branch AND disappearance branch) so the
+  // dispatched surface exits in lockstep with the underlying agent's
+  // terminal state. Production wires a fire-and-forget pane-close
+  // through the resolved `ExecBackend.close(windowId, tabName)` —
+  // surgical via `close-pane -p` and gated by a name-exact tab-live
+  // token check (fn-654.2). Tests inject a recording closure to
+  // assert the (windowId, tabName) pair reached the callback. Both
+  // `entry.windowId` and `entry.tabName` (either may be `undefined`,
+  // independently — pre-fn-654.2 logs lacked tabName; failed launches
+  // lacked windowId) pass through unconditionally — the production
+  // implementation skips on either missing.
+  closeWindow: (
+    windowId: string | undefined,
+    tabName: string | undefined,
+  ) => void;
 }
 
 /**
@@ -1854,12 +1910,13 @@ export function detectJobTransitions(
           `# warn: completed log write failed: ${(err as Error).message}`,
         );
       }
-      // Auto-close trigger (disappearance branch). `entry.windowId`
-      // may be `undefined`; the production implementation no-ops on
-      // that shape so the call here stays branch-free. The
-      // `completedKeys.has(key)` guard at the top of the loop ensures
-      // a subsequent snapshot doesn't fire `closeWindow` twice.
-      closeWindow(entry.windowId);
+      // Auto-close trigger (disappearance branch). Either
+      // `entry.windowId` or `entry.tabName` may be `undefined`; the
+      // production implementation skips on either missing (fail-
+      // safe). The `completedKeys.has(key)` guard at the top of the
+      // loop ensures a subsequent snapshot doesn't fire `closeWindow`
+      // twice.
+      closeWindow(entry.windowId, entry.tabName);
       continue;
     }
     // Constraint: the disappearance branch above MUST stay above this
@@ -1925,8 +1982,10 @@ export function detectJobTransitions(
       // Auto-close trigger. Mirrors the disappearance branch above —
       // same once-per-key guarantee via the `completedKeys.has(key)`
       // top-of-loop guard. Fires for both the terminal and the
-      // stopped-and-board-complete paths.
-      closeWindow(entry.windowId);
+      // stopped-and-board-complete paths. Passes both `windowId`
+      // (pane id) and `tabName` (wrap-safety token) so the production
+      // backend can guard `close-pane -p` on a name-exact live check.
+      closeWindow(entry.windowId, entry.tabName);
     }
   }
 }
@@ -2454,17 +2513,24 @@ export async function main(argv: string[]): Promise<void> {
         // Mutate the LIVE in-memory entry by reference (find by
         // `${verb}::${id}`). The just-pushed entry is the last matching
         // `(verb, id)` in `dispatchLog`; scan backward to grab it without
-        // iterating the full array.
+        // iterating the full array. Stamp BOTH `windowId` (the just-
+        // returned pane id) and `tabName` (the wrap-safety token — the
+        // `verb::id` we passed as `opts.tabName`) so the same-run auto-
+        // close has the full pair for the surgical close path.
         for (let i = dispatchLog.length - 1; i >= 0; i--) {
           const e = dispatchLog[i];
           if (e !== undefined && `${e.verb}::${e.id}` === key) {
             e.windowId = windowId;
+            e.tabName = key;
             break;
           }
         }
-        // Persist the windowId to disk as a `window` kind row via a raw
-        // `appendFileSync` — NOT `logDispatch` (which would re-push a
-        // display entry and re-add to `dispatchedKeys`). Try/catch →
+        // Persist the (windowId, tabName) pair to disk as a `window`
+        // kind row via a raw `appendFileSync` — NOT `logDispatch`
+        // (which would re-push a display entry and re-add to
+        // `dispatchedKeys`). Both fields round-trip through
+        // `hydrateDispatchLog` so a cross-run auto-close still has the
+        // tabName token to gate `close-pane -p` on. Try/catch →
         // noteLine on failure; the in-memory stamp still carries the
         // same-run auto-close path forward.
         try {
@@ -2476,6 +2542,7 @@ export async function main(argv: string[]): Promise<void> {
               verb,
               id,
               windowId,
+              tabName: key,
             })}\n`,
           );
         } catch (err) {
@@ -2715,12 +2782,15 @@ export async function main(argv: string[]): Promise<void> {
     appendLine: (line: string): void => {
       appendFileSync(dispatchLogPath, line);
     },
-    closeWindow: (windowId: string | undefined): void => {
-      // No-op on undefined (no id was captured at launch — the
-      // shell-fallback covers the window; it just won't auto-close)
-      // and under `--dry-run` (the spawn itself was suppressed, so
-      // there's no window to close). Under dry-run we still
-      // `noteLine` the intended close so the lifecycle sidecar
+    closeWindow: (
+      windowId: string | undefined,
+      tabName: string | undefined,
+    ): void => {
+      // No-op on undefined windowId (no pane id captured at launch —
+      // the shell-fallback covers the surface; it just won't auto-
+      // close) and under `--dry-run` (the spawn itself was
+      // suppressed, so there's no surface to close). Under dry-run we
+      // still `noteLine` the intended close so the lifecycle sidecar
       // shows the would-have-fired path.
       if (windowId === undefined || windowId === "") {
         return;
@@ -2734,23 +2804,28 @@ export async function main(argv: string[]): Promise<void> {
       // would-have-closed id so the lifecycle sidecar shows the skip.
       if (!cfg.autocloseWindows) {
         noteLine(
-          `# closeWindow (autoclose disabled) windowId=${windowId} — leaving surface open`,
+          `# closeWindow (autoclose disabled) windowId=${windowId} tabName=${tabName ?? "∅"} — leaving surface open`,
         );
         return;
       }
       if (dryRun) {
         noteLine(
-          `# closeWindow (dry) windowId=${windowId} — would close terminal surface`,
+          `# closeWindow (dry) windowId=${windowId} tabName=${tabName ?? "∅"} — would close terminal pane`,
         );
         return;
       }
       // Route to the resolved backend (`src/exec-backend.ts`). The
-      // backend's `close` is fire-and-forget and never throws back —
-      // a stale id from a different backend (config flip across runs)
-      // no-ops gracefully on either side (ghostty's repeat-loop
-      // returns "not-found"; zellij surfaces a "tab id not found"
-      // stderr line via `noteLine`).
-      backend.close(windowId);
+      // backend's `close` is fire-and-forget and never throws back.
+      // It now takes BOTH the pane id and the launch-time tab name
+      // (the wrap-safety token, fn-654.2): the backend probes
+      // `query-tab-names` for the tab name and only fires
+      // `close-pane -p windowId` when it's live. A server-restart-
+      // induced pane-id wrap (the old `terminal_N` now belongs to a
+      // different live pane) leaves no tab with the launch-time name,
+      // so the probe returns false and the close is skipped — never
+      // reaps the wrong live pane. A missing tabName (pre-fn-654.2
+      // dispatch.log rows) also skips, same fail-safe direction.
+      backend.close(windowId, tabName);
     },
   };
 
