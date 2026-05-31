@@ -1,0 +1,21 @@
+{
+  "branch_name": "fn-660-extract-createviewshell-factory-from",
+  "bundles": [],
+  "created_at": "2026-05-31T21:51:50.279435Z",
+  "depends_on_epics": [
+    "fn-658-split-keeper-board-into-board-and-jobs"
+  ],
+  "id": "fn-660-extract-createviewshell-factory-from",
+  "last_validated_at": "2026-05-31T21:51:50.367691Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "extract createViewShell factory from TUI view siblings",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-05-31T21:51:50.279435Z"
+}
