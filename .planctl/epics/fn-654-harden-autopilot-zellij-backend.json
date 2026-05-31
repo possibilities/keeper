@@ -2,9 +2,12 @@
   "branch_name": "fn-654-harden-autopilot-zellij-backend",
   "bundles": [],
   "created_at": "2026-05-31T00:39:56.995464Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-651-usage-lift-time-and-freshness",
+    "fn-652-keeper-job-name-history"
+  ],
   "id": "fn-654-harden-autopilot-zellij-backend",
-  "last_validated_at": "2026-05-31T00:39:57.228406Z",
+  "last_validated_at": "2026-05-31T00:40:22.210959Z",
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -15,5 +18,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-31T00:39:56.995464Z"
+  "updated_at": "2026-05-31T00:40:22.018075Z"
 }
