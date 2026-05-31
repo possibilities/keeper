@@ -91,10 +91,13 @@ test("all expected indexes are present", () => {
     "idx_jobs_created_state",
     "idx_events_planctl_epic",
     "idx_events_planctl_target",
-    // fn-649: attribution-fold perf indexes.
+    // fn-649: attribution-fold perf indexes (covering variants — the prior
+    // key-only idx_events_tool_file_path / idx_events_bash_mutation_kind are
+    // dropped in the migrate tail and replaced by these).
     "idx_events_hook_tool",
     "idx_events_hook_tool_ts",
-    "idx_events_tool_file_path",
+    "idx_events_tool_attr",
+    "idx_events_bash_attr",
     "idx_events_bashwin_pre",
     "idx_events_bashwin_post",
   ];
@@ -104,24 +107,50 @@ test("all expected indexes are present", () => {
   db.close();
 });
 
-test("idx_events_tool_file_path turns the explicit-attribution scan into a SEEK", () => {
-  // fn-649: findExplicitAttributions matches this exact json_extract expression
-  // per dirty file. Without the expression index it scans all PostToolUse rows
-  // (measured 3.5s/file → multi-second GitSnapshot folds); with it, a seek.
+test("idx_events_tool_attr makes the explicit-attribution tool scan COVERING", () => {
+  // fn-649 follow-up: findExplicitAttributions matches this exact json_extract
+  // expression per dirty file and SELECTs id,ts,session_id,tool_name. The
+  // covering index carries all of them so the planner never reads a data page —
+  // the key-only predecessor was a SEEK but faulted one cold page per match,
+  // regressing PASS 1 to ~4.5s/file under concurrent load.
   const { db } = openDb(dbPath);
   const plan = db
     .prepare(
       `EXPLAIN QUERY PLAN
-         SELECT id FROM events
+         SELECT id, ts, session_id, tool_name FROM events
           WHERE hook_event = 'PostToolUse'
             AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
             AND json_extract(data, '$.tool_input.file_path') = ?`,
     )
     .all("/x") as { detail: string }[];
   const detail = plan.map((r) => r.detail).join(" | ");
-  expect(detail).toContain("idx_events_tool_file_path");
-  expect(detail).toContain("SEARCH"); // a seek, not SCAN
+  expect(detail).toContain("idx_events_tool_attr");
+  expect(detail).toContain("USING COVERING INDEX");
   expect(detail).not.toContain("SCAN events");
+  // The retired key-only index must be gone so the planner can't pick it.
+  expect(detail).not.toContain("idx_events_tool_file_path");
+  db.close();
+});
+
+test("idx_events_bash_attr makes the explicit-attribution bash scan COVERING", () => {
+  // fn-649 follow-up: the bash scan filters bash_mutation_kind IS NOT NULL,
+  // expands json_each(bash_mutation_targets), SELECTs id,ts,session_id,kind.
+  // Covering means no per-row table read even under concurrent I/O.
+  const { db } = openDb(dbPath);
+  const plan = db
+    .prepare(
+      `EXPLAIN QUERY PLAN
+         SELECT e.id, e.ts, e.session_id, e.bash_mutation_kind
+           FROM events e
+          WHERE e.bash_mutation_kind IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM json_each(e.bash_mutation_targets) j WHERE j.value = ?
+            )`,
+    )
+    .all("/x") as { detail: string }[];
+  const detail = plan.map((r) => r.detail).join(" | ");
+  expect(detail).toContain("USING COVERING INDEX idx_events_bash_attr");
+  expect(detail).not.toContain("idx_events_bash_mutation_kind");
   db.close();
 });
 
@@ -5448,19 +5477,29 @@ test("fresh v31 DB has file_attributions table with the right PK + indexes", () 
   db.close();
 });
 
-test("fresh v31 DB has idx_events_bash_mutation_kind partial index", () => {
+test("fresh DB has idx_events_bash_attr covering partial index (replaces idx_events_bash_mutation_kind)", () => {
   const { db } = openDb(dbPath);
   const indexes = db
     .prepare(
-      "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_bash_mutation_kind'",
+      "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_bash_attr'",
     )
     .all() as { name: string; sql: string }[];
   expect(indexes.length).toBe(1);
-  // Verify the partial-index predicate is present (so the planner can match
-  // a `WHERE bash_mutation_kind = ?` query under Rule 2).
+  // Partial-index predicate present (so the planner matches a
+  // `WHERE bash_mutation_kind = ?` query under Rule 2)…
   expect(indexes[0]?.sql).toMatch(
     /WHERE\s+bash_mutation_kind\s+IS\s+NOT\s+NULL/i,
   );
+  // …and it carries bash_mutation_targets so json_each() reads from the index
+  // (covering) rather than faulting the data page.
+  expect(indexes[0]?.sql).toContain("bash_mutation_targets");
+  // The key-only predecessor is retired in the migrate tail.
+  const old = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_bash_mutation_kind'",
+    )
+    .all();
+  expect(old.length).toBe(0);
   db.close();
 });
 
@@ -5635,10 +5674,11 @@ test("v30 DB migrates to v31: events sparse columns added, jobs column rename + 
   ).map((t) => t.name);
   expect(tables).toEqual(["file_attributions"]);
 
-  // Partial index on bash_mutation_kind created.
+  // Covering partial index on bash_mutation_kind created (the key-only
+  // idx_events_bash_mutation_kind was replaced by idx_events_bash_attr).
   const ix = reopened
     .prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_bash_mutation_kind'",
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_bash_attr'",
     )
     .all() as { name: string }[];
   expect(ix.length).toBe(1);

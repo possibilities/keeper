@@ -432,7 +432,18 @@ const CREATE_EVENTS_INDEXES = [
   // query EXACTLY so SQLite turns the scan into a sub-ms SEEK (verified). Pure
   // performance: index choice never changes fold results, so re-fold
   // determinism is untouched and no SCHEMA_VERSION bump is needed (idempotent).
-  "CREATE INDEX IF NOT EXISTS idx_events_tool_file_path ON events(json_extract(data, '$.tool_input.file_path')) WHERE hook_event = 'PostToolUse' AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')",
+  //
+  // COVERING (fn-649 follow-up): the explicit-attribution SELECT pulls
+  // `id,ts,session_id,tool_name`, so the key carries those (id = rowid,
+  // implicit) plus `hook_event` (named in the WHERE) — the planner reports
+  // USING COVERING INDEX and never visits a data page. The prior key-only index
+  // was a SEEK but still read ONE data page per match; a hot file (hundreds of
+  // edits) faulted hundreds of cold pages under concurrent load, regressing
+  // PASS 1 to ~4.5s/file (measured 13.5s GitSnapshot folds holding the write
+  // lock, starving hook INSERTs into dead-letters). Covering makes the scan
+  // cache-independent. The old `idx_events_tool_file_path` is DROPped in the
+  // migrate tail so the planner can't keep choosing the uncovered key.
+  "CREATE INDEX IF NOT EXISTS idx_events_tool_attr ON events(json_extract(data, '$.tool_input.file_path'), ts, session_id, tool_name, hook_event) WHERE hook_event = 'PostToolUse' AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')",
   // Partial index on the sparse subagent bridge column. Only PostToolUse:Agent
   // rows populate it; the WHERE predicate must match consumer queries
   // exactly for SQLite to use the index instead of a scan.
@@ -1120,7 +1131,15 @@ const CREATE_FILE_ATTRIBUTIONS_INDEXES = [
  * instead of a full events scan.
  */
 const CREATE_V31_INDEXES = [
-  "CREATE INDEX IF NOT EXISTS idx_events_bash_mutation_kind ON events(bash_mutation_kind) WHERE bash_mutation_kind IS NOT NULL",
+  // COVERING (fn-649 follow-up): the explicit-attribution bash scan filters
+  // `bash_mutation_kind IS NOT NULL`, expands `json_each(bash_mutation_targets)`,
+  // and SELECTs `id,ts,session_id,bash_mutation_kind`. Carry every one of those
+  // (id = rowid) so the planner reports USING COVERING INDEX — no data-page read
+  // per candidate row even under concurrent I/O. The `IS NOT NULL` partial still
+  // serves the `bash_mutation_kind = 'x'` / `IN ('git-rm','git-mv')` equality
+  // probes (sqlite.org/partialindex.html §2 Rule 2). Replaces the key-only
+  // `idx_events_bash_mutation_kind`, which is DROPped in the migrate tail.
+  "CREATE INDEX IF NOT EXISTS idx_events_bash_attr ON events(bash_mutation_kind, bash_mutation_targets, ts, session_id) WHERE bash_mutation_kind IS NOT NULL",
 ];
 
 const CREATE_REDUCER_STATE = `
@@ -4128,6 +4147,17 @@ function migrate(db: Database): void {
     db.run(
       "CREATE INDEX IF NOT EXISTS idx_events_bashwin_post ON events(tool_use_id, hook_event, tool_name, ts, cwd, session_id) WHERE tool_use_id IS NOT NULL",
     );
+
+    // fn-649 follow-up: retire the pre-covering attribution indexes now that
+    // idx_events_tool_attr / idx_events_bash_attr (built above via the
+    // CREATE_EVENTS_INDEXES / CREATE_V31_INDEXES arrays at lines ~1681 / ~3508)
+    // carry every column the PASS-1 explicit-attribution scans touch. Ordered
+    // AFTER those CREATEs in the SAME migrate transaction, so an existing DB
+    // sheds the uncovered key (forcing the planner onto the covering one) and a
+    // fresh DB no-ops. DROP IF EXISTS is idempotent; no SCHEMA_VERSION bump
+    // (pure index swap — fold results, and thus re-fold determinism, unchanged).
+    db.run("DROP INDEX IF EXISTS idx_events_tool_file_path");
+    db.run("DROP INDEX IF EXISTS idx_events_bash_mutation_kind");
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
