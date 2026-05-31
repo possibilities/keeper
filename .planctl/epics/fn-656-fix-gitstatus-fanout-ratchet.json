@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-656-fix-gitstatus-fanout-ratchet",
   "bundles": [],
   "closer_done_at": "2026-05-31T18:04:55.505566Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-05-31T18:04:55.505566Z"
+  "updated_at": "2026-05-31T18:05:11.707994Z"
 }
