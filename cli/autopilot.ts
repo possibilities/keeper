@@ -1504,6 +1504,57 @@ export function predictNextDispatches(
 // fulfillment) don't leak into the UI.
 
 /**
+ * Touch-without-truncate `dispatch.log` at boot so the durable
+ * `dispatchedKeys` re-dispatch guard has a stable on-disk substrate from
+ * the very first append site, EVEN IF the file was externally removed
+ * between the prior autopilot run and this one (e.g. an operator-side
+ * state-dir cleanup, a `rm` typed into the autopilot tab, or any future
+ * tool that prunes the run dir without knowing dispatch.log is durable).
+ *
+ * fn-654.3 motivation: the in-repo write path is already 100% append-only
+ * (`appendFileSync` everywhere — `logDispatch`, the `kind:"window"` row,
+ * the `kind:"fulfilled"` / `kind:"completed"` rows; no truncating open
+ * anywhere in `cli/`, `src/`, or `plugin/`), and no installed LaunchAgent
+ * or shell-init script touches dispatch.log. The fresh-birth symptom that
+ * triggered this guard came from an external `rm` between runs — the
+ * file simply didn't exist when autopilot booted, so the first append
+ * created a fresh-birth-time file and `hydrateDispatchLog` quietly
+ * returned empty sets. This guard makes the file's existence an
+ * explicit, testable boot-time invariant rather than an emergent
+ * property of "the first append site happens to use O_CREAT".
+ *
+ * Mechanism: `appendFileSync(path, "")` issues an `open(O_APPEND|O_CREAT)`
+ * + a zero-byte write + close. The open never truncates (no O_TRUNC),
+ * so existing content is preserved exactly. If the file is absent the
+ * open creates it empty.
+ *
+ * Do NOT switch to `createWriteStream({flags:"a"})` here either — Bun
+ * issue #3395 truncated despite the append flag. Per-call
+ * `appendFileSync` stays the primitive; this guard just calls it once
+ * with an empty string before `hydrateDispatchLog` reads.
+ *
+ * I/O failures (EACCES, ENOSPC, parent-dir-missing race) are swallowed
+ * to `noteLine` — autopilot still boots, hydration still works against
+ * whatever state exists, and the next real `logDispatch` will surface
+ * the same failure through its own error path. Never throw here; the
+ * forensic log is not on the critical path.
+ */
+export function ensureDispatchLogExists(
+  path: string,
+  noteLine?: (s: string) => void,
+): void {
+  try {
+    appendFileSync(path, "");
+  } catch (err) {
+    if (noteLine) {
+      noteLine(
+        `# warn: ensureDispatchLogExists failed for ${path}: ${(err as Error).message}`,
+      );
+    }
+  }
+}
+
+/**
  * Re-fold `dispatch.log` from disk into the three durable sets that
  * survive across runs:
  *
@@ -2056,6 +2107,21 @@ export async function main(argv: string[]): Promise<void> {
   // `kind:"fulfilled"` and `kind:"completed"` lines are written the
   // first time the snapshot shows an embedded job for the dispatched
   // row+verb and the first time that job's `state` is observed terminal.
+  // fn-654.3: defensive touch-without-truncate before hydration. The
+  // in-repo write path is already 100% append-only, but an external `rm`
+  // between runs (e.g. an operator-side state-dir cleanup) can leave the
+  // file absent at boot — `hydrateDispatchLog` would then quietly return
+  // empty sets and the durable re-dispatch guard would silently lose its
+  // substrate until the first launch landed. Explicitly create-if-absent
+  // (never truncate) here so the persistence contract is a load-bearing
+  // boot-time invariant, not an emergent property of "the first append
+  // site happens to use O_CREAT". See `ensureDispatchLogExists` for the
+  // mechanism + Bun #3395 rationale for staying on `appendFileSync`.
+  // Boot-time call: `noteLine` (the liveShell scratchpad) isn't yet
+  // declared at this point in `main`. A real I/O failure here surfaces
+  // through the next `logDispatch`'s own try/catch — silent swallow is
+  // the right default for the touch primitive.
+  ensureDispatchLogExists(dispatchLogPath);
   const { dispatchedKeys, fulfilledKeys, completedKeys, restoredEntries } =
     hydrateDispatchLog(dispatchLogPath);
   // Seed the in-memory display array from any prior-run launches that

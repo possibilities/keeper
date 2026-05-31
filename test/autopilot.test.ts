@@ -24,7 +24,13 @@
  */
 
 import { expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -37,6 +43,7 @@ import {
   buildWorkerCommand,
   detectJobTransitions,
   drainPendingLaunches,
+  ensureDispatchLogExists,
   hydrateDispatchLog,
   isLiveSessionInRoot,
   isSettlingGateFull,
@@ -1309,6 +1316,115 @@ test("detectJobTransitions — stopped job that is NOT board-completed stays cur
   expect(fulfilledKeys.has("work::fn-1-foo.1")).toBe(true);
   expect(completedKeys.has("work::fn-1-foo.1")).toBe(false);
   expect(closedIds).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// ensureDispatchLogExists — fn-654.3 touch-without-truncate guard.
+//
+// Boot-time defensive guard against an external `rm` between autopilot
+// runs. Cements `dispatch.log`'s existence as a load-bearing invariant
+// before `hydrateDispatchLog` reads — but MUST NEVER truncate existing
+// content (Bun #3395-class hazard avoided by staying on per-call
+// `appendFileSync` with the empty string).
+//
+// Three properties to pin:
+//   (a) existing file with content survives byte-for-byte (no truncation).
+//   (b) missing file is created empty.
+//   (c) repeated calls are idempotent (no growth, no truncation).
+// ---------------------------------------------------------------------------
+
+test("ensureDispatchLogExists — existing file content survives byte-for-byte (no truncation)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-autopilot-ensure-"));
+  const path = join(dir, "dispatch.log");
+  const seed = `${JSON.stringify({
+    kind: "launch",
+    ts: "2026-05-31T07:48:23.939Z",
+    rowId: "approve task fn-1-foo.1",
+    dir: "repo",
+    dirFull: "/repo",
+    verb: "approve",
+    id: "fn-1-foo.1",
+    command: "cd /repo && claude",
+    pid: 12345,
+  })}\n`;
+  writeFileSync(path, seed);
+  const beforeBytes = statSync(path).size;
+  expect(beforeBytes).toBe(seed.length);
+
+  ensureDispatchLogExists(path);
+
+  // Content is byte-identical to the pre-call seed — never truncated.
+  expect(readFileSync(path, "utf8")).toBe(seed);
+  expect(statSync(path).size).toBe(beforeBytes);
+
+  // And hydration still re-derives the durable key off the surviving
+  // content — proving the guard does not weaken the persistence contract
+  // it exists to enforce.
+  const { dispatchedKeys } = hydrateDispatchLog(path);
+  expect(dispatchedKeys.has("approve::fn-1-foo.1")).toBe(true);
+});
+
+test("ensureDispatchLogExists — missing file is created empty", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-autopilot-ensure-"));
+  const path = join(dir, "dispatch.log");
+  expect(existsSync(path)).toBe(false);
+
+  ensureDispatchLogExists(path);
+
+  expect(existsSync(path)).toBe(true);
+  expect(statSync(path).size).toBe(0);
+  // Hydration over the empty file folds to empty sets without throwing.
+  const { dispatchedKeys, fulfilledKeys, completedKeys, restoredEntries } =
+    hydrateDispatchLog(path);
+  expect(dispatchedKeys.size).toBe(0);
+  expect(fulfilledKeys.size).toBe(0);
+  expect(completedKeys.size).toBe(0);
+  expect(restoredEntries.length).toBe(0);
+});
+
+test("ensureDispatchLogExists — repeated calls are idempotent (no growth, no truncation)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-autopilot-ensure-"));
+  const path = join(dir, "dispatch.log");
+  const seed = `${JSON.stringify({
+    kind: "launch",
+    ts: "2026-05-31T07:48:23.939Z",
+    rowId: "row-1",
+    dir: "repo",
+    dirFull: "/repo",
+    verb: "work",
+    id: "fn-2-bar.1",
+    command: "cd /repo && claude",
+    pid: 12345,
+  })}\n`;
+  writeFileSync(path, seed);
+  const baselineBytes = statSync(path).size;
+
+  for (let i = 0; i < 5; i += 1) {
+    ensureDispatchLogExists(path);
+  }
+
+  // Size is unchanged after five repeated touches — no zero-byte
+  // appends accumulate (empty-string append writes 0 bytes).
+  expect(statSync(path).size).toBe(baselineBytes);
+  expect(readFileSync(path, "utf8")).toBe(seed);
+});
+
+test("ensureDispatchLogExists — swallows I/O failure (parent dir missing) without throwing", () => {
+  // Path inside a directory that does not exist. The internal
+  // appendFileSync raises ENOENT; the guard's try/catch swallows it so
+  // the caller proceeds and the next real `logDispatch` surfaces the
+  // same failure through its own error path. This pins the
+  // "never-throw" boot-time contract.
+  const path = join(
+    tmpdir(),
+    `keeper-autopilot-ensure-nonexistent-${process.pid}-${Date.now()}`,
+    "deeper",
+    "still-deeper",
+    "dispatch.log",
+  );
+  expect(existsSync(path)).toBe(false);
+  // Must not throw — boot-time guard is best-effort.
+  expect(() => ensureDispatchLogExists(path)).not.toThrow();
 });
 
 // ---------------------------------------------------------------------------
