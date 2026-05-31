@@ -1568,6 +1568,27 @@ interface BashWindow {
  * per-file bracket is applied in {@link inferFromWindows}, so re-fold
  * determinism is byte-identical to the pre-hoist behavior.
  */
+/**
+ * Lower-bound slack (seconds) on the `pre.ts` range scan in
+ * {@link computeRepoBashWindows}. A bracket is a single `(PreToolUse:Bash,
+ * PostToolUse:Bash)` pair = ONE bash command, hard-capped by the Bash tool's
+ * 600s timeout; the longest window ever observed on the live log is ~240s. So
+ * any window straddling a file mtime `M` has `pre.ts >= M - 600`. We use 3600
+ * (1h) as a defensive cap — far above the 600s ceiling, robust to clock skew /
+ * hook latency / a future timeout bump, yet still bounding the `pre` scan to a
+ * tight time range instead of ALL history.
+ *
+ * Why this matters: `pre.ts < maxMtimeSec` alone is NON-selective (files are
+ * usually modified ~now, so it matches the whole log). Without a lower bound
+ * the self-join scanned all ~38k PreToolUse:Bash events every fold — index-
+ * covering but huge, ballooning to 6-22s under concurrent load and starving
+ * hook INSERTs. The lower bound makes it a bounded range scan (measured 20x
+ * fewer candidate windows, byte-identical inferred result). Loss-free: it only
+ * prunes windows LONGER than the cap, which cannot exist under the tool
+ * timeout. Constant ⇒ re-fold deterministic.
+ */
+const MAX_BASH_WINDOW_SEC = 3600;
+
 function computeRepoBashWindows(
   db: Database,
   projectDir: string,
@@ -1590,11 +1611,13 @@ function computeRepoBashWindows(
         WHERE pre.hook_event = 'PreToolUse'
           AND pre.tool_name = 'Bash'
           AND pre.tool_use_id IS NOT NULL
+          AND pre.ts >= ?
           AND pre.ts < ?
           AND post.ts >= ?
           AND (post.cwd = ? OR post.cwd LIKE ?)`,
     )
     .all(
+      minMtimeSec - MAX_BASH_WINDOW_SEC,
       maxMtimeSec,
       minMtimeSec,
       projectDir,

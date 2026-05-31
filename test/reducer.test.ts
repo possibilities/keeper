@@ -1540,6 +1540,64 @@ test("GitSnapshot inferred attribution: bash bracket containing the mtime mints 
   expect(row?.last_mutation_at).toBe(150); // mtime_ms / 1000
 });
 
+test("GitSnapshot inferred attribution: a window longer than MAX_BASH_WINDOW_SEC is NOT used (pre.ts lower-bound)", () => {
+  // computeRepoBashWindows bounds the pre-side scan with
+  // `pre.ts >= minMtime - MAX_BASH_WINDOW_SEC` (3600s). That bound is loss-free
+  // for real windows (a bash command can't outlast the 600s tool timeout), but
+  // it DOES exclude a synthetic window whose pre starts >3600s before the file
+  // mtime. Here: pre @ ts=1000, post @ ts=5000 (a 4000s "window"), file
+  // mtime=5000s. The exact bracket (1000 < 5000 <= 5000) would otherwise match,
+  // but pre.ts=1000 < (5000 - 3600 = 1400), so the window is pruned and NO
+  // inferred row is minted. This pins the bound that keeps the scan tight.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-cap" });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-cap",
+    cwd: "/repo",
+    ts: 1000,
+    tool_use_id: "toolu_cap_x",
+    data: JSON.stringify({ tool_input: { command: "sleep 4000" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-cap",
+    cwd: "/repo",
+    ts: 5000,
+    tool_use_id: "toolu_cap_x",
+    data: JSON.stringify({ tool_input: { command: "sleep 4000" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: "build/slow.o",
+          xy: "??",
+          mtime_ms: 5_000_000, // 5000s; inside (1000, 5000] but window > cap
+        },
+      ],
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ?",
+    )
+    .get("/repo", "sess-cap") as { op: string; source: string } | null;
+  // Pruned by the lower bound — the file falls through to orphan, not inferred.
+  expect(row).toBeNull();
+});
+
 test("GitSnapshot inferred attribution: skipped when explicit attribution exists", () => {
   // Same setup as the inferred test, but ALSO a tool Write at ts=80
   // (BEFORE the bash bracket). Pass 2 skips the file because pass 1
