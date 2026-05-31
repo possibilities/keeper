@@ -20,15 +20,14 @@
  * - `createZellijBackend({ noteLine, session, spawn? })` — lazy session-
  *   ensure (memoized once) + `action new-tab --cwd <abs> [--name <tab>]
  *   -- <argv>` + pane-id capture (newest `terminal_<n>` from `action
- *   list-panes`, ALWAYS resolved, not gated on `opts.paneName`); `action
+ *   list-panes`, resolved for the surgical close path); `action
  *   close-pane -p <paneId>` close, guarded by a name-exact `query-tab-
  *   names` token check on the launch-time tab name. When the ensure
  *   step MINTS the session (vs. attaching to a listed one), it captures
  *   the empty default `Tab #1` id and the first launch reaps it via
  *   `action close-tab-by-id` (the orphan reap deliberately closes a
  *   known-empty tab — both close builders coexist, only the agent-pane
- *   path moved to `close-pane`). When `opts.paneName` is set, the
- *   resolved pane id is renamed via `action rename-pane -p`.
+ *   path moved to `close-pane`).
  * - `resolveExecBackend(deps)` — factory; always returns a zellij
  *   backend. Kept as a thin seam so call sites (cli/autopilot.ts) and
  *   tests do not need a structural rewrite.
@@ -97,19 +96,17 @@ export type SpawnFn = (
  */
 /**
  * Optional surface labels for a launch. `tabName` names the zellij tab
- * (`new-tab --name`); `paneName` pins the pane title via `rename-pane`
- * (authoritative — it survives later program OSC-2 titles from claude /
- * the fallback shell, verified on zellij 0.44).
+ * (`new-tab --name`) — the close-time generation token probed via
+ * `query-tab-names`.
  */
 export interface LaunchOptions {
   readonly tabName?: string;
-  readonly paneName?: string;
 }
 
 export interface ExecBackend {
   /** Spawn a terminal surface running argv at `dir`. Resolves to a
    *  stable id, or `null` when no id was captured. `opts` carries
-   *  optional surface labels (zellij tab/pane names).
+   *  the optional zellij tab name (the close-time token).
    *
    *  Return value: the just-created pane id (`terminal_<n>` for the
    *  zellij backend) — NOT the tab id. The pane id is what `close`
@@ -380,34 +377,10 @@ export function firstTabIdFromListTabs(text: string): string | null {
 /**
  * Build the zellij `action list-panes` argv. Pure — exported for tests.
  * Run right after `new-tab` to find the just-created agent pane id (the
- * newest `terminal_<n>`) so `rename-pane -p` can pin its title.
+ * newest `terminal_<n>`) for the surgical `close-pane -p` reap path.
  */
 export function buildZellijListPanesArgs(session: string): string[] {
   return ["zellij", "--session", session, "action", "list-panes"];
-}
-
-/**
- * Build the zellij `action rename-pane -p <paneId> <name>` argv. Pure —
- * exported for tests. `-p` targets a specific pane id (vs. the focused
- * pane, which is unreliable when no client is attached) and the assigned
- * name is authoritative — it overrides the command-derived default AND
- * pins against later program OSC-2 titles.
- */
-export function buildZellijRenamePaneArgs(
-  session: string,
-  paneId: string,
-  name: string,
-): string[] {
-  return [
-    "zellij",
-    "--session",
-    session,
-    "action",
-    "rename-pane",
-    "-p",
-    paneId,
-    name,
-  ];
 }
 
 /**
@@ -617,25 +590,14 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       }
       const tabId = res.stdout.trim();
       if (res.exitCode === 0 && tabId.length > 0) {
-        // Pane resolution drives BOTH the optional rename-pane (when
-        // `opts.paneName` is set) AND the load-bearing pane-id return
-        // for the surgical close path — so it ALWAYS runs (no longer
-        // gated on `paneName`). The single settling slot upstream
+        // Resolve the just-created agent pane id for the load-bearing
+        // surgical close path. The single settling slot upstream
         // guarantees launches are serialized, so `newestTerminalPaneId`
         // reliably picks the just-spawned pane (zellij's pane ids are a
         // process-global monotonic counter).
         const panes = await runCapture(buildZellijListPanesArgs(session));
         const paneId =
           panes != null ? newestTerminalPaneId(panes.stdout) : null;
-        // Pin the pane title to the role label (Worker/Closer/Approver).
-        // Best-effort: a missing/unparsable list or a failed rename
-        // leaves zellij's command-derived default — never blocks the
-        // launch.
-        if (paneId != null && opts?.paneName != null && opts.paneName !== "") {
-          await runCapture(
-            buildZellijRenamePaneArgs(session, paneId, opts.paneName),
-          );
-        }
         // First launch after a fresh mint: reap the orphaned default
         // `Tab #1` now that the agent tab exists, leaving a single named
         // agent tab. Done AFTER the agent tab is confirmed so the session

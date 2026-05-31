@@ -24,7 +24,6 @@ import {
   buildZellijListTabsArgs,
   buildZellijNewTabArgs,
   buildZellijQueryTabNamesArgs,
-  buildZellijRenamePaneArgs,
   createZellijBackend,
   DEFAULT_EXEC_BACKEND,
   DEFAULT_ZELLIJ_SESSION,
@@ -154,7 +153,7 @@ test("buildZellijClosePaneArgs: routes through close-pane -p <paneId> (surgical 
   ]);
 });
 
-test("buildZellijListTabsArgs / buildZellijListPanesArgs / buildZellijRenamePaneArgs: well-formed", () => {
+test("buildZellijListTabsArgs / buildZellijListPanesArgs: well-formed", () => {
   expect(buildZellijListTabsArgs("autopilot")).toEqual([
     "zellij",
     "--session",
@@ -168,18 +167,6 @@ test("buildZellijListTabsArgs / buildZellijListPanesArgs / buildZellijRenamePane
     "autopilot",
     "action",
     "list-panes",
-  ]);
-  expect(
-    buildZellijRenamePaneArgs("autopilot", "terminal_3", "Worker"),
-  ).toEqual([
-    "zellij",
-    "--session",
-    "autopilot",
-    "action",
-    "rename-pane",
-    "-p",
-    "terminal_3",
-    "Worker",
   ]);
 });
 
@@ -246,9 +233,9 @@ test("tabNameListed: exact-matches a tab name, never a substring", () => {
 // ---------------------------------------------------------------------------
 
 test("createZellijBackend.launch: session already listed → new-tab then list-panes; returns pane id (terminal_<n>), not tab id", async () => {
-  // fn-654.2: launch always resolves the pane id via list-panes
-  // (no longer gated on opts.paneName) and returns it instead of the
-  // tab id, so the autopilot caller can feed it to `close-pane -p`
+  // launch always resolves the pane id via list-panes and returns it
+  // instead of the tab id, so the autopilot caller can feed it to
+  // `close-pane -p`
   // for the surgical reap.
   const calls: string[][] = [];
   const notes: string[] = [];
@@ -303,8 +290,7 @@ test("createZellijBackend.launch: session already listed → new-tab then list-p
     "-c",
     "echo hi",
   ]);
-  // list-panes ALWAYS runs now (no longer gated on opts.paneName) so
-  // the pane id is captured for the close path.
+  // list-panes always runs so the pane id is captured for the close path.
   expect(calls.some((c) => c[4] === "list-panes")).toBe(true);
 });
 
@@ -519,7 +505,7 @@ test("createZellijBackend.launch: fresh mint reaps the orphan default tab via cl
   expect(calls.some((c) => c[4] === "close-tab-by-id")).toBe(false);
 });
 
-test("createZellijBackend.launch: paneName pins the agent pane via rename-pane on the newest terminal; launch returns the pane id", async () => {
+test("createZellijBackend.launch: resolves the newest terminal pane id for the close path and returns it; never renames the pane", async () => {
   const calls: string[][] = [];
   const notes: string[] = [];
   const spawn: SpawnFn = (cmd, _options) => {
@@ -545,58 +531,17 @@ test("createZellijBackend.launch: paneName pins the agent pane via rename-pane o
   });
   const paneId = await backend.launch(["sh"], "row-1", "/abs", {
     tabName: "work::fn-1-x.1",
-    paneName: "Worker",
   });
   // launch returns the pane id (newest terminal_<n>), not the tab id "3".
   expect(paneId).toBe("terminal_4");
-  // new-tab carried the tab name.
+  // new-tab carried the tab name (the close-time token).
   const newTab = calls.find((c) => c[4] === "new-tab");
   expect(newTab).toContain("--name");
   expect(newTab).toContain("work::fn-1-x.1");
-  // rename-pane targeted the newest terminal pane with the role label.
-  const rename = calls.find((c) => c[4] === "rename-pane");
-  expect(rename).toEqual([
-    "zellij",
-    "--session",
-    "autopilot",
-    "action",
-    "rename-pane",
-    "-p",
-    "terminal_4",
-    "Worker",
-  ]);
-});
-
-test("createZellijBackend.launch: no paneName → list-panes still runs (un-gated) but no rename-pane call", async () => {
-  // fn-654.2 un-gated list-panes from `opts.paneName` so the pane id
-  // is always available for the close path. rename-pane stays gated
-  // on `opts.paneName` (rename is purely cosmetic).
-  const calls: string[][] = [];
-  const spawn: SpawnFn = (cmd, _options) => {
-    calls.push([...cmd]);
-    const reply = (stdout: string) => ({
-      exited: Promise.resolve(0),
-      stdout: new Response(stdout).body,
-      stderr: new Response("").body,
-    });
-    if (cmd[1] === "list-sessions") return reply("autopilot\n");
-    if (cmd[1] === "--session" && cmd[4] === "new-tab") return reply("1\n");
-    if (cmd[1] === "--session" && cmd[4] === "list-panes") {
-      return reply(
-        "PANE_ID  TYPE  TITLE\nterminal_2  terminal  /bin/zsh ...\n",
-      );
-    }
-    return reply("");
-  };
-  const backend = createZellijBackend({
-    noteLine: () => {},
-    session: "autopilot",
-    spawn,
-  });
-  await backend.launch(["sh"], "row-1", "/abs", { tabName: "work::x" });
-  expect(calls.some((c) => c[4] === "rename-pane")).toBe(false);
-  // list-panes ALWAYS runs now — needed to capture the pane id.
+  // list-panes always runs — it captures the load-bearing pane id.
   expect(calls.some((c) => c[4] === "list-panes")).toBe(true);
+  // panes are never decorated: no rename-pane call is ever issued.
+  expect(calls.some((c) => c[4] === "rename-pane")).toBe(false);
 });
 
 test("createZellijBackend.close: fires close-pane -p <paneId> when token tabName is live", async () => {

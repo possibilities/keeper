@@ -2561,17 +2561,12 @@ export async function main(argv: string[]): Promise<void> {
         id,
         command: workerShellCommand,
       });
-      // Surface labels (zellij only; Ghostty ignores both): the tab
-      // carries the full `verb::id` (mirrors the `claude --name`) so the
-      // tab bar identifies the task; the pane carries the short role word
-      // so the pane frame reads clean instead of the wrapped shell
-      // command.
-      const paneRole =
-        verb === "work" ? "Worker" : verb === "close" ? "Closer" : "Approver";
+      // Surface label (zellij): the tab carries the full `verb::id`
+      // (mirrors the `claude --name`) so the tab bar identifies the
+      // task. It is also the close-time wrap-safety token.
       try {
         const windowId = await backend.launch(argv, rowId, dirFull, {
           tabName: key,
-          paneName: paneRole,
         });
         if (windowId == null) {
           return; // backend already surfaced the failure via noteLine
