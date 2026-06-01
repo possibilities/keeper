@@ -10,10 +10,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractCommit, parseSessionIdTrailer } from "../src/derivers";
+import {
+  extractCommit,
+  parseSessionIdTrailer,
+  parseTaskTrailers,
+} from "../src/derivers";
 import {
   buildGitSnapshot,
   decideHeadDivergence,
+  enumerateCommitsInDelta,
   type GitDirtyFile,
   parsePorcelainV2,
   resolveHeadOidViaFs,
@@ -539,6 +544,10 @@ test("extractCommit accepts a well-formed v45+ payload (files: [{path, blob_oid,
       { path: "src/b.ts", blob_oid: null, committed_mode: null },
     ],
     committer_session_id: VALID_UUID,
+    // Epic fn-670: `task_ids` joins the payload. Empty array here is
+    // the round-trip case (the producer would emit [] for a commit
+    // carrying no Task: trailer).
+    task_ids: [],
     committed_at_ms: 1_700_000_000_000,
   };
   expect(extractCommit({ data: JSON.stringify(payload) })).toEqual(payload);
@@ -920,4 +929,386 @@ test("decideHeadDivergence: a transient blip (commit race) that re-agrees never 
   // ...then the next read agrees → reset, so the grace timer never accumulates.
   const recovered = decideHeadDivergence(B, B, blip.sinceMs, 5500, GRACE);
   expect(recovered).toEqual({ suppress: false, sinceMs: null, trip: false });
+});
+
+// ---------------------------------------------------------------------------
+// parseTaskTrailers — collect-all policy on the `Task:` trailer block.
+// Distinct from parseSessionIdTrailer's take-last: a commit closing N tasks
+// must light N entries on the link fold.
+// ---------------------------------------------------------------------------
+
+const VALID_TASK_1 = "fn-670-deterministic-committing-session.1";
+const VALID_TASK_2 = "fn-670-deterministic-committing-session.2";
+
+test("parseTaskTrailers returns [] on null/empty/whitespace/non-string input", () => {
+  expect(parseTaskTrailers(null)).toEqual([]);
+  expect(parseTaskTrailers(undefined)).toEqual([]);
+  expect(parseTaskTrailers("")).toEqual([]);
+  expect(parseTaskTrailers("   \n\t\n")).toEqual([]);
+  expect(parseTaskTrailers(42)).toEqual([]);
+});
+
+test("parseTaskTrailers collects ALL valid task-id lines on the value block", () => {
+  // Newline-separated (the default git separator with our format string).
+  expect(parseTaskTrailers(`${VALID_TASK_1}\n${VALID_TASK_2}\n`)).toEqual([
+    VALID_TASK_1,
+    VALID_TASK_2,
+  ]);
+  // NUL-separated (the belt-and-suspenders accept path).
+  expect(parseTaskTrailers(`${VALID_TASK_1}\0${VALID_TASK_2}\0`)).toEqual([
+    VALID_TASK_1,
+    VALID_TASK_2,
+  ]);
+  // Single value, no trailing newline.
+  expect(parseTaskTrailers(VALID_TASK_1)).toEqual([VALID_TASK_1]);
+});
+
+test("parseTaskTrailers drops garbage entries without failing the whole list", () => {
+  // Partial-validation: keep the validated subset, drop malformed entries.
+  expect(
+    parseTaskTrailers(`${VALID_TASK_1}\nNOT-A-TASK\n${VALID_TASK_2}\n`),
+  ).toEqual([VALID_TASK_1, VALID_TASK_2]);
+  // Epic-only ref (no `.N` tail) — drops (the link fold keys on task id).
+  expect(parseTaskTrailers("fn-1-foo\n")).toEqual([]);
+  // Uppercase — drops (case-sensitive shape).
+  expect(parseTaskTrailers("FN-1-FOO.1\n")).toEqual([]);
+  // Leading/trailing whitespace — trimmed then validated.
+  expect(parseTaskTrailers(`  ${VALID_TASK_1}  \n`)).toEqual([VALID_TASK_1]);
+});
+
+test("parseTaskTrailers preserves order across multiple values", () => {
+  // The T2 link fold doesn't depend on order (it stamps both tasks
+  // identically), but iteration-order stability matters for re-fold
+  // determinism on later consumers — assert it explicitly.
+  expect(parseTaskTrailers(`${VALID_TASK_2}\n${VALID_TASK_1}\n`)).toEqual([
+    VALID_TASK_2,
+    VALID_TASK_1,
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// enumerateCommitsInDelta — real-git round-trip for Session-Id, Job-Id, and
+// Task trailers. Pins the widened format string + stride parser against a
+// concrete commit so an off-by-one regression in the 6-field consume loop is
+// caught at the trailer assertion (rather than silently misaligning fields).
+// ---------------------------------------------------------------------------
+
+function gitCommit(
+  root: string,
+  filename: string,
+  body: string,
+  trailers: Record<string, string[]>,
+): string {
+  writeFileSync(join(root, filename), `${filename} contents\n`);
+  let res = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!res.success) throw new Error("git add failed");
+  // Build the message via `git interpret-trailers` so the trailers land
+  // in the canonical kebab-case + colon-space shape the producer's
+  // format string keys on. `-c` top-level overrides must come BEFORE the
+  // subcommand; one `--trailer` per value (multi-`Task:` is supported
+  // via `addIfDifferent`).
+  const topConfig: string[] = [];
+  const trailerArgs: string[] = [];
+  for (const [key, values] of Object.entries(trailers)) {
+    topConfig.push(
+      "-c",
+      `trailer.${key.toLowerCase()}.ifExists=addIfDifferent`,
+    );
+    for (const v of values) {
+      trailerArgs.push("--trailer", `${key}=${v}`);
+    }
+  }
+  const it = Bun.spawnSync(
+    ["git", ...topConfig, "-C", root, "interpret-trailers", ...trailerArgs],
+    {
+      stdin: new TextEncoder().encode(body),
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  if (!it.success) {
+    throw new Error(`git interpret-trailers failed: ${it.stderr.toString()}`);
+  }
+  const msg = it.stdout.toString();
+  res = Bun.spawnSync(["git", "-C", root, "commit", "-q", "-F", "-"], {
+    stdin: new TextEncoder().encode(msg),
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!res.success) throw new Error("git commit failed");
+  const rev = Bun.spawnSync(["git", "-C", root, "rev-parse", "HEAD"], {
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  if (!rev.success) throw new Error("git rev-parse HEAD failed");
+  return rev.stdout.toString().trim();
+}
+
+const REAL_UUID_A = "01234567-89ab-cdef-0123-456789abcdef";
+const REAL_UUID_B = "fedcba98-7654-3210-fedc-ba9876543210";
+
+test("enumerateCommitsInDelta: Session-Id-only commit → committer_session_id set, task_ids=[]", () => {
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Session-Id": [REAL_UUID_A],
+  });
+  const commits = enumerateCommitsInDelta(root, null, oid);
+  expect(commits).toHaveLength(1);
+  expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
+  expect(commits[0].task_ids).toEqual([]);
+});
+
+test("enumerateCommitsInDelta: Job-Id-only commit → committer_session_id coalesces from Job-Id", () => {
+  // This is the load-bearing case: a jobctl-stamped commit (no Session-Id,
+  // Job-Id only). Pre-fn-670 this commit's committer_session_id was NULL
+  // and the v45 per-session discharge arm in foldCommit lay dormant.
+  // Post-fn-670 the coalesce lifts Job-Id into committer_session_id, so
+  // the per-session arm finally fires for jobctl commits.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Job-Id": [REAL_UUID_A],
+  });
+  const commits = enumerateCommitsInDelta(root, null, oid);
+  expect(commits).toHaveLength(1);
+  expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
+  expect(commits[0].task_ids).toEqual([]);
+});
+
+test("enumerateCommitsInDelta: Session-Id + Job-Id equal → Session-Id wins (no warn)", () => {
+  // The canonical commit-work commit: jobctl stamps Job-Id == Session-Id
+  // (keeper invariant). The coalesce takes Session-Id and emits NO warn.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Session-Id": [REAL_UUID_A],
+    "Job-Id": [REAL_UUID_A],
+  });
+  // Capture stderr by spying on console.error. The producer's only stderr
+  // surface in this path is the both-differing warn; equality must not
+  // trip it.
+  const errs: unknown[] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => {
+    errs.push(args);
+  };
+  try {
+    const commits = enumerateCommitsInDelta(root, null, oid);
+    expect(commits).toHaveLength(1);
+    expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
+  } finally {
+    console.error = orig;
+  }
+  expect(errs).toEqual([]);
+});
+
+test("enumerateCommitsInDelta: Session-Id + Job-Id DIFFER → Session-Id wins AND stderr warn fires", () => {
+  // Bug-signal case: the keeper invariant `job_id === session_id` is
+  // violated. We don't fail the commit (the producer-only liveness
+  // invariant + hook exit-0 contract forbid escalating from a trailer
+  // mismatch), but we log a stderr warn so a forensic grep can find it.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Session-Id": [REAL_UUID_A],
+    "Job-Id": [REAL_UUID_B],
+  });
+  const errs: string[] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => {
+    errs.push(args.map((a) => String(a)).join(" "));
+  };
+  try {
+    const commits = enumerateCommitsInDelta(root, null, oid);
+    expect(commits).toHaveLength(1);
+    // Session-Id wins per take-last canonical policy.
+    expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
+  } finally {
+    console.error = orig;
+  }
+  expect(errs).toHaveLength(1);
+  expect(errs[0]).toContain("DIFFER");
+  expect(errs[0]).toContain(REAL_UUID_A);
+  expect(errs[0]).toContain(REAL_UUID_B);
+});
+
+test("enumerateCommitsInDelta: no trailers → committer_session_id=null, task_ids=[]", () => {
+  // The historical-shape commit: human commit / CI commit / pre-jobctl
+  // commit. Global-discharge semantic preserved (foldCommit's null arm).
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {});
+  const commits = enumerateCommitsInDelta(root, null, oid);
+  expect(commits).toHaveLength(1);
+  expect(commits[0].committer_session_id).toBeNull();
+  expect(commits[0].task_ids).toEqual([]);
+});
+
+test("enumerateCommitsInDelta: one Task: trailer → task_ids carries one entry", () => {
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Session-Id": [REAL_UUID_A],
+    Task: [VALID_TASK_1],
+  });
+  const commits = enumerateCommitsInDelta(root, null, oid);
+  expect(commits).toHaveLength(1);
+  expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
+  expect(commits[0].task_ids).toEqual([VALID_TASK_1]);
+});
+
+test("enumerateCommitsInDelta: multiple Task: trailers → task_ids collects ALL entries", () => {
+  // The multi-close case: one commit closes two tasks. Both must land on
+  // the link fold; take-last would lose one.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Session-Id": [REAL_UUID_A],
+    Task: [VALID_TASK_1, VALID_TASK_2],
+  });
+  const commits = enumerateCommitsInDelta(root, null, oid);
+  expect(commits).toHaveLength(1);
+  expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
+  expect(commits[0].task_ids).toEqual([VALID_TASK_1, VALID_TASK_2]);
+});
+
+test("enumerateCommitsInDelta: all three trailers together → stride parser holds (no off-by-one)", () => {
+  // The full-fan-out case. If the 6-field stride parser is off by one,
+  // task_ids would silently swap with another field and one of the
+  // assertions below would fail.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Session-Id": [REAL_UUID_A],
+    "Job-Id": [REAL_UUID_A],
+    Task: [VALID_TASK_1, VALID_TASK_2],
+  });
+  const commits = enumerateCommitsInDelta(root, null, oid);
+  expect(commits).toHaveLength(1);
+  expect(commits[0].commit_oid).toBe(oid);
+  expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
+  expect(commits[0].task_ids).toEqual([VALID_TASK_1, VALID_TASK_2]);
+  expect(commits[0].committed_at_ms).toBeGreaterThan(0);
+});
+
+test("enumerateCommitsInDelta: multi-commit delta — each commit's trailers parse independently", () => {
+  // Stride parser exercise across N>1 commits. A regression that drifts
+  // the field offset would surface as one commit reading the next
+  // commit's session/tasks.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid1 = gitCommit(root, "a.ts", "first\n", {
+    "Job-Id": [REAL_UUID_A],
+    Task: [VALID_TASK_1],
+  });
+  const oid2 = gitCommit(root, "b.ts", "second\n", {
+    "Session-Id": [REAL_UUID_B],
+    Task: [VALID_TASK_2],
+  });
+  // `oid1..oid2` walks commits strictly after oid1; oid2 is included.
+  const commits = enumerateCommitsInDelta(root, oid1, oid2);
+  // Just the second commit in the delta.
+  expect(commits).toHaveLength(1);
+  expect(commits[0].commit_oid).toBe(oid2);
+  expect(commits[0].committer_session_id).toBe(REAL_UUID_B);
+  expect(commits[0].task_ids).toEqual([VALID_TASK_2]);
+
+  // Full-delta walk: null prev → both commits emitted (newest-first).
+  const fullCommits = enumerateCommitsInDelta(root, null, oid2);
+  expect(fullCommits).toHaveLength(1); // fallback path is `-1 <next>` only
+  expect(fullCommits[0].commit_oid).toBe(oid2);
+
+  // Walk the whole history via the parent of oid1 → null prev fallback
+  // covers only HEAD; assert independent re-enumeration of oid1.
+  const firstAlone = enumerateCommitsInDelta(root, null, oid1);
+  expect(firstAlone).toHaveLength(1);
+  expect(firstAlone[0].commit_oid).toBe(oid1);
+  expect(firstAlone[0].committer_session_id).toBe(REAL_UUID_A);
+  expect(firstAlone[0].task_ids).toEqual([VALID_TASK_1]);
+});
+
+// ---------------------------------------------------------------------------
+// extractCommit — fn-670 task_ids defensive decode
+// ---------------------------------------------------------------------------
+
+test("extractCommit decodes task_ids when present (round-trip the producer's shape)", () => {
+  const res = extractCommit({
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: VALID_OID,
+      parent_oid: null,
+      files: [
+        { path: "src/a.ts", blob_oid: VALID_OID, committed_mode: "100644" },
+      ],
+      committer_session_id: VALID_UUID,
+      task_ids: [VALID_TASK_1, VALID_TASK_2],
+      committed_at_ms: 1000,
+    }),
+  });
+  expect(res?.task_ids).toEqual([VALID_TASK_1, VALID_TASK_2]);
+});
+
+test("extractCommit defaults task_ids to [] on pre-fn-670 events (missing field)", () => {
+  // Re-fold determinism: every historical Commit event in the log lacks
+  // `task_ids`; the deriver must decode it as `[]` so the T2 link fold
+  // sees the same "no linkage" input the live producer would emit on a
+  // commit with no Task: trailer.
+  const res = extractCommit({
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: VALID_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: VALID_UUID,
+      committed_at_ms: 1000,
+    }),
+  });
+  expect(res?.task_ids).toEqual([]);
+});
+
+test("extractCommit drops malformed task_ids entries (per-entry validation, not all-or-nothing)", () => {
+  // Per-entry shape gate via TASK_TRAILER_RE: epic-only refs, uppercase,
+  // non-strings drop; valid entries pass through in input order.
+  const res = extractCommit({
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: VALID_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: VALID_UUID,
+      task_ids: [
+        VALID_TASK_1,
+        "fn-1-foo", // epic-only ref → drops
+        "FN-1-FOO.1", // uppercase → drops
+        42, // non-string → drops
+        "", // empty → drops
+        VALID_TASK_2,
+      ],
+      committed_at_ms: 0,
+    }),
+  });
+  expect(res?.task_ids).toEqual([VALID_TASK_1, VALID_TASK_2]);
+});
+
+test("extractCommit normalizes non-array task_ids to []", () => {
+  // Object instead of array, scalar instead of array, null — all fold to
+  // [] without failing the whole payload.
+  for (const bad of [{ foo: 1 }, "fn-1-foo.1", 42, null] as const) {
+    const res = extractCommit({
+      data: JSON.stringify({
+        project_dir: "/repo",
+        commit_oid: VALID_OID,
+        parent_oid: null,
+        files: ["src/a.ts"],
+        committer_session_id: VALID_UUID,
+        task_ids: bad,
+        committed_at_ms: 0,
+      }),
+    });
+    expect(res?.task_ids).toEqual([]);
+  }
 });

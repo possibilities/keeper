@@ -3530,6 +3530,116 @@ test("Commit with a malformed committer_session_id folds to global discharge", (
   expect(getCursor()).toBe(id);
 });
 
+// ---------------------------------------------------------------------------
+// fn-670 (T1): a Job-Id-coalesced Commit now takes the PER-SESSION discharge
+// arm (foldCommit's `committer_session_id != null` branch), not the global
+// fall-through. The git-worker's coalesce lifts `Job-Id:` → `committer_
+// session_id`; by the time the event reaches the reducer, the per-session vs
+// global decision is already made by the payload's non-null vs null field —
+// these tests pin that the fold honors the producer's classification. The
+// re-fold-determinism cousin: a legacy no-trailer Commit (committer_session_
+// id=null) still global-discharges over the historical event log.
+// ---------------------------------------------------------------------------
+
+test("fn-670: Job-Id-coalesced Commit (committer_session_id non-null) takes per-session discharge arm, not global", () => {
+  // Two sessions touched the same file. The fn-670 git-worker coalesce
+  // would have lifted the `Job-Id:` trailer on a `jobctl commit-work`
+  // commit into `committer_session_id` — so by reducer entry the field
+  // is non-null and the per-session arm fires. The OTHER session's
+  // attribution stays undischarged (still on-the-hook).
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID_2,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      // Non-null committer_session_id — produced by the git-worker
+      // coalesce on a Job-Id-only commit. The reducer cannot tell the
+      // value's provenance (Session-Id vs Job-Id) and that's correct —
+      // the discharge gate is per-session regardless of which trailer
+      // carried the UUID.
+      committer_session_id: TEST_UUID,
+      task_ids: [],
+      committed_at_ms: 200_000,
+    }),
+  });
+  expect(drainAll()).toBe(1);
+  // Per-session arm fired for TEST_UUID — last_commit_at stamped.
+  expect(getAttribution("/repo", TEST_UUID, "src/a.ts")?.last_commit_at).toBe(
+    200,
+  );
+  // Other session's attribution untouched — proves NOT global discharge.
+  expect(
+    getAttribution("/repo", TEST_UUID_2, "src/a.ts")?.last_commit_at,
+  ).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("fn-670: historical no-trailer Commit (pre-fn-670, no task_ids field, committer_session_id=null) still global-discharges", () => {
+  // Re-fold determinism: replay a historical Commit event (predating
+  // fn-670 entirely — no `task_ids` field on the payload, no coalesce
+  // applied to its `committer_session_id` because the producer ran on
+  // an older binary that only knew about Session-Id). The defensive
+  // extractCommit decoder defaults `task_ids` to `[]`, and the fold
+  // path stays global because `committer_session_id` is null. Both
+  // sessions' attributions clear identically to pre-fn-670 semantics.
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  insertAttribution({
+    project_dir: "/repo",
+    session_id: TEST_UUID_2,
+    file_path: "src/a.ts",
+    last_mutation_at: 100,
+  });
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      // Legacy string-array files shape (pre-v44) — exercises the
+      // extractCommit legacy-normalize path alongside the missing
+      // task_ids field.
+      files: ["src/a.ts"],
+      committer_session_id: null,
+      // No `task_ids` field at all — pre-fn-670 events lack it. The
+      // defensive decode defaults to []; the global-discharge arm
+      // still fires because committer_session_id is null.
+      committed_at_ms: 300_000,
+    }),
+  });
+  expect(drainAll()).toBe(1);
+  // Both rows discharged — global fall-through preserved.
+  expect(getAttribution("/repo", TEST_UUID, "src/a.ts")?.last_commit_at).toBe(
+    300,
+  );
+  expect(getAttribution("/repo", TEST_UUID_2, "src/a.ts")?.last_commit_at).toBe(
+    300,
+  );
+  expect(getCursor()).toBe(id);
+});
+
 test("Commit per-session discharge does NOT touch rows in a different project_dir", () => {
   // Same session_id + file_path under two different worktrees lands two
   // distinct file_attributions rows (the composite PK carries project_dir

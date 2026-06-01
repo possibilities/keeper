@@ -1216,6 +1216,59 @@ export function parseSessionIdTrailer(raw: unknown): string | null {
 }
 
 /**
+ * Anchored planctl TASK-id pattern (`fn-\d+-[a-z0-9-]+\.\d+`). Tighter
+ * than {@link PLAN_REF_RE} on purpose — a `Task:` trailer naming an
+ * epic-form ref (`fn-1-foo` with no `.N` tail) is malformed and drops,
+ * because the epic→committing-session link fold in T2 keys on a task
+ * id, not an epic id. Module-scope literal so V8/JSC tier up once at
+ * process start.
+ */
+const TASK_TRAILER_RE = /^fn-\d+-[a-z0-9-]+\.\d+$/;
+
+/**
+ * Collect-all policy on a multi-line `Task:` trailer block as produced by
+ * `git log --format='%(trailers:key=Task,valueonly,unfold,separator=%x00)'`
+ * with `%x00` as the value separator. A commit may close multiple tasks in
+ * a single message (the jobctl trailer block is multi-valued for `Task:`),
+ * so the parser collects EVERY validated value rather than taking-last —
+ * this is what differentiates the link fold from session attribution
+ * (sessions are take-last canonical; tasks are union-of-all).
+ *
+ * Each value is trimmed, dropped if empty or whitespace-only, and
+ * validated against {@link TASK_TRAILER_RE}. Garbage entries (malformed
+ * shape, epic-only ref, uppercase) drop silently; a partially-malformed
+ * block yields the validated subset rather than failing the whole list.
+ * Returns `[]` for null / non-string / empty / all-invalid input.
+ *
+ * Pure function of its argument so re-fold determinism holds: the live
+ * worker emission, the defensive deriver re-decode in {@link extractCommit},
+ * and a future from-scratch re-fold all produce the same array for the
+ * same input.
+ *
+ * Accepts both `\n` and `\0` (NUL) as the inter-value separator — the
+ * producer requests `separator=%x00` so the git wrapper emits NULs
+ * between trailer values, but the same parser is reused by the
+ * defensive re-decode in {@link extractCommit} which reads back a
+ * JSON `string[]`. Either separator round-trips cleanly.
+ */
+export function parseTaskTrailers(raw: unknown): string[] {
+  if (typeof raw !== "string" || raw.length === 0) {
+    return [];
+  }
+  const out: string[] = [];
+  // Split on BOTH `\n` (legacy, single-valued unfold) and `\0` (the
+  // multi-value separator the producer requests). One pass via the
+  // character class.
+  const lines = raw.split(/[\n\0]/);
+  for (const line of lines) {
+    const v = line.trim();
+    if (v.length === 0) continue;
+    if (TASK_TRAILER_RE.test(v)) out.push(v);
+  }
+  return out;
+}
+
+/**
  * The shape returned by {@link extractCommit}. Mirrors the
  * git-worker's `CommitMessage` field-for-field minus the `kind`
  * discriminator. A `null` return signals "not a parseable Commit
@@ -1277,6 +1330,30 @@ export interface CommitPayload {
   parent_oid: string | null;
   files: CommitFileEntry[];
   committer_session_id: string | null;
+  /**
+   * Epic fn-670: the validated, planctl-shaped `Task:` trailer values
+   * the producer collected from this commit's message. Multi-valued —
+   * one commit may close more than one task in a single message — so
+   * the array is union-of-all (NOT take-last like
+   * {@link committer_session_id}). Empty `[]` on:
+   *   - the commit carried no `Task:` trailer (human commit, CI
+   *     commit, planctl chore commit, jobctl commit predating fn-670),
+   *   - every collected value was malformed (epic-only ref, uppercase,
+   *     garbage),
+   *   - a historical pre-fn-670 `Commit` event whose payload predates
+   *     the `task_ids` field — extractCommit defaults `task_ids` to
+   *     `[]` so re-fold determinism over the historical event log
+   *     holds (the link fold treats `[]` as "no task linkage" — same
+   *     no-op semantic as the missing-field path).
+   *
+   * The reducer's T2 link fold reads this array AND
+   * {@link committer_session_id} together to stamp
+   * `last_commit_for_task_at` on the per-task embedded job element;
+   * either array-empty OR session-null short-circuits the link write.
+   * This task (T1) plumbs the field end-to-end; the fold write is
+   * T2.
+   */
+  task_ids: string[];
   committed_at_ms: number;
 }
 
@@ -1405,6 +1482,31 @@ export function extractCommit(event: { data: string }): CommitPayload | null {
     typeof rawSession === "string" && UUID_RE.test(rawSession)
       ? rawSession
       : null;
+  // Epic fn-670: defensively decode `task_ids` (the planctl-shaped
+  // `Task:` trailer values the producer collected at git-worker time).
+  // Pre-fn-670 events lack this field entirely — default to `[]` so a
+  // from-scratch re-fold over the historical event log reproduces the
+  // same projection as today's pre-link semantic (`[]` is the no-op
+  // input to the T2 link fold). Defensive against any non-array shape
+  // (object, scalar, string-instead-of-array) and against per-entry
+  // garbage: each entry must be a non-empty string that matches the
+  // anchored task-id regex {@link TASK_TRAILER_RE} (mirrored via
+  // {@link parseTaskTrailers} which round-trips a NUL-separated value
+  // block AND a JSON `string[]`); anything else drops at entry
+  // granularity without failing the whole payload.
+  const rawTaskIds = obj.task_ids;
+  let taskIds: string[];
+  if (Array.isArray(rawTaskIds)) {
+    taskIds = [];
+    for (const t of rawTaskIds) {
+      if (typeof t !== "string") continue;
+      const v = t.trim();
+      if (v.length === 0) continue;
+      if (TASK_TRAILER_RE.test(v)) taskIds.push(v);
+    }
+  } else {
+    taskIds = [];
+  }
   const rawTs = obj.committed_at_ms;
   const committedAtMs =
     typeof rawTs === "number" && Number.isFinite(rawTs) && rawTs > 0
@@ -1416,6 +1518,7 @@ export function extractCommit(event: { data: string }): CommitPayload | null {
     parent_oid: parentOid,
     files,
     committer_session_id: committerSessionId,
+    task_ids: taskIds,
     committed_at_ms: committedAtMs,
   };
 }

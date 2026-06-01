@@ -34,7 +34,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
-import { parseSessionIdTrailer } from "./derivers";
+import { parseSessionIdTrailer, parseTaskTrailers } from "./derivers";
 import { isDropError, RescanScheduler } from "./rescan";
 import type { ShutdownMessage } from "./wake-worker";
 
@@ -219,6 +219,21 @@ export interface CommitMessage {
   parent_oid: string | null;
   files: CommitMessageFile[];
   committer_session_id: string | null;
+  /**
+   * Epic fn-670 (T1): the validated, planctl-shaped `Task:` trailer
+   * values the producer collected from this commit's message via
+   * `%(trailers:key=Task,valueonly,unfold,separator=%x00)`. Multi-
+   * valued by design — `Task:` is collect-all, distinct from
+   * {@link committer_session_id} which is take-last canonical — so
+   * one `jobctl commit-work` closing two tasks lights both entries.
+   * Empty `[]` on the common path (no `Task:` trailer present, or
+   * every collected value was malformed). Rides the {@link
+   * daemon.ts:onmessage} spread-serialize into the synthetic `Commit`
+   * event's `data` JSON; the reducer's T2 link fold reads it back
+   * via {@link extractCommit} (which defaults `[]` for pre-fn-670
+   * events — re-fold determinism).
+   */
+  task_ids: string[];
   committed_at_ms: number;
 }
 
@@ -640,11 +655,12 @@ interface EnumeratedCommitFile {
  * `project_dir` discriminators (those ride in at the message boundary so the
  * enumerator stays a pure git-output parser).
  */
-interface EnumeratedCommit {
+export interface EnumeratedCommit {
   commit_oid: string;
   parent_oid: string | null;
   files: EnumeratedCommitFile[];
   committer_session_id: string | null;
+  task_ids: string[];
   committed_at_ms: number;
 }
 
@@ -756,13 +772,28 @@ function commitFiles(root: string, oid: string): EnumeratedCommitFile[] {
  * in batch per delta), so iteration order doesn't affect the final
  * projection.
  */
-function enumerateCommitsInDelta(
+export function enumerateCommitsInDelta(
   root: string,
   prev: string | null,
   next: string,
 ): EnumeratedCommit[] {
+  // Epic fn-670 (T1): widen from 4 fields (OID, P, ct, Session-Id) to
+  // SIX (… + Job-Id + Task). Session-Id stays `valueonly,only,unfold`
+  // (take-last canonical session); Job-Id mirrors that policy (also a
+  // session-UUID-shaped value, and the coalesce below picks one); Task
+  // is `valueonly,unfold` with the DEFAULT `\n` separator — we want a
+  // human-newline-separated block of values inside that ONE field so
+  // the outer `%x00` field delimiter survives. Switching the Task
+  // separator to `%x00` would collide with the field boundary and
+  // realign the stride parser off-by-one. The parser below splits the
+  // Task field on `\n` (via {@link parseTaskTrailers}); `\0` is also
+  // accepted by that helper as a defensive belt-and-suspenders, but is
+  // not used on the live wire here.
   const format =
-    "%H%x00%P%x00%ct%x00%(trailers:key=Session-Id,valueonly,only,unfold)";
+    "%H%x00%P%x00%ct%x00" +
+    "%(trailers:key=Session-Id,valueonly,only,unfold)%x00" +
+    "%(trailers:key=Job-Id,valueonly,only,unfold)%x00" +
+    "%(trailers:key=Task,valueonly,unfold)";
   let out: string | null = null;
   if (prev !== null) {
     out = gitOutput([
@@ -797,15 +828,16 @@ function enumerateCommitsInDelta(
     return [];
   }
   // Parse: with `-z`, git replaces the per-record `\n` terminator with `\0`
-  // — but the `%x00` separators inside the format string also emit literal
-  // NULs in-stream. So the wire format for N commits is:
-  //   OID1\0PARENTS1\0CT1\0TRAILERS1\0OID2\0PARENTS2\0CT2\0TRAILERS2\0...
-  // — i.e. a flat sequence of 4N NUL-delimited fields with a trailing
+  // — and the `%x00` separators inside the format string also emit literal
+  // NULs in-stream. With the fn-670 widening to six format fields per
+  // record, the wire format for N commits is:
+  //   OID1\0P1\0CT1\0SESSION1\0JOBID1\0TASK1\0OID2\0P2\0CT2\0SESSION2\0JOBID2\0TASK2\0...
+  // — i.e. a flat sequence of 6N NUL-delimited fields with a trailing
   // empty element after the final NUL. Split on `\0` and consume in
-  // groups of 4.
+  // groups of 6.
   const fields = out.split("\0");
   const commits: EnumeratedCommit[] = [];
-  for (let i = 0; i + 3 < fields.length; i += 4) {
+  for (let i = 0; i + 5 < fields.length; i += 6) {
     const oid = (fields[i] ?? "").trim();
     if (oid.length === 0) continue;
     const parentsRaw = (fields[i + 1] ?? "").trim();
@@ -820,18 +852,79 @@ function enumerateCommitsInDelta(
       Number.isFinite(ctSeconds) && ctSeconds > 0
         ? Math.floor(ctSeconds * 1000)
         : 0;
-    const trailers = fields[i + 3] ?? "";
-    const committerSessionId = parseSessionIdTrailer(trailers);
+    const sessionTrailers = fields[i + 3] ?? "";
+    const jobIdTrailers = fields[i + 4] ?? "";
+    const taskTrailers = fields[i + 5] ?? "";
+    const committerSessionId = coalesceCommitterSessionId(
+      sessionTrailers,
+      jobIdTrailers,
+      oid,
+    );
+    const taskIds = parseTaskTrailers(taskTrailers);
     const files = commitFiles(root, oid);
     commits.push({
       commit_oid: oid,
       parent_oid: parentOid,
       files,
       committer_session_id: committerSessionId,
+      task_ids: taskIds,
       committed_at_ms: committedAtMs,
     });
   }
   return commits;
+}
+
+/**
+ * Epic fn-670 (T1): canonicalize a commit's session attribution by
+ * merging the `Session-Id:` and `Job-Id:` trailer values. Both are
+ * parsed via {@link parseSessionIdTrailer} (UUID-anchored take-last,
+ * shared with the Session-Id-only path).
+ *
+ * Policy:
+ *   - Session-Id WINS when both are valid and equal (canonical agreement).
+ *   - Session-Id WINS when both are valid but DIFFER — and a one-shot
+ *     stderr warning fires (a bug signal: `job_id === session_id` is a
+ *     keeper invariant, see CLAUDE.md / planctl session-context). Never
+ *     fatal; the producer-only liveness invariant + hook's exit-0
+ *     contract forbid escalating from a trailer mismatch.
+ *   - Job-Id wins when Session-Id is null (the path that REVIVES the
+ *     dormant v45 per-session discharge arm — jobctl's `_append_job_id
+ *     _trailer` stamps `Job-Id` on every `commit-work` source commit,
+ *     so coalescing it into `committer_session_id` finally lets
+ *     `foldCommit`'s per-session arm fire on those commits).
+ *   - Both null → return null (global discharge, unchanged).
+ *
+ * Pure-ish: emits a single `console.error` warn line on the
+ * both-differing branch. The whole producer side already writes
+ * stderr on git failures, so this is the same surface. The reducer
+ * NEVER reads/probes/computes here — the field is frozen in the
+ * Commit event payload at producer time.
+ */
+function coalesceCommitterSessionId(
+  sessionTrailers: string,
+  jobIdTrailers: string,
+  commitOid: string,
+): string | null {
+  const session = parseSessionIdTrailer(sessionTrailers);
+  const jobId = parseSessionIdTrailer(jobIdTrailers);
+  if (session !== null && jobId !== null && session !== jobId) {
+    // `job_id === session_id` is a keeper invariant — a divergence here
+    // is a bug signal worth surfacing. Stderr-only (LaunchAgent stdlog),
+    // never throws, never blocks. Include both values + commit OID so a
+    // forensic grep can locate the offending commit.
+    console.error(
+      `[git-worker] commit ${commitOid}: Session-Id (${session}) and Job-Id (${jobId}) trailers DIFFER; Session-Id wins per take-last policy`,
+    );
+  }
+  // Session-Id preferred — its presence is the canonical signal
+  // (jobctl stamps Job-Id too, but a hand-written Session-Id wins).
+  // Fall through to Job-Id when Session-Id is absent / malformed —
+  // both pass the same UUID gate in parseSessionIdTrailer, so the
+  // coalesced value is always either a UUID-shaped string or null
+  // (never a bare value that could poison the UUID gate on the
+  // deriver side).
+  if (session !== null) return session;
+  return jobId;
 }
 
 function discoverProjectRoots(
