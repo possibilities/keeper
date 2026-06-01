@@ -38,5 +38,5 @@ Add the v47→v48 migration test next to existing ones; run `test/schema-version
 - [ ] New v47→v48 migration test passes; `test/db.test.ts` + `test/schema-version.test.ts` green.
 
 ## Done summary
-
+Schema v48 lands the backend-exec coordinate columns end-to-end at the DB layer: 3 nullable TEXT columns on events (type/session_id/pane_id) and 5 on jobs (those three plus tab_id/tab_name), with a lockstep v47→v48 ADD-COLUMN block whose literals byte-match CREATE_EVENTS/CREATE_JOBS. insertEvent + hook insertBindings + every daemon.ts synthetic-event call site carry the new keys (NULL until T3); keeper/api.py SUPPORTED_SCHEMA_VERSIONS adds 48 in the same change. Event/Job types extended, makeEvent canary updated, new v47→v48 migration test asserts PRAGMA table_info byte-identity between fresh and migrated DBs.
 ## Evidence
