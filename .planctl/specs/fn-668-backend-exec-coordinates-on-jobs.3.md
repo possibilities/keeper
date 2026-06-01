@@ -35,5 +35,5 @@ Add reducer tests: latest-non-null across multiple event types; NULL-carrying ev
 - [ ] New reducer tests green; `config_dir` fold unchanged.
 
 ## Done summary
-
+Hook captures backend_exec_{type,session_id,pane_id} on every event as pure env reads (ZELLIJ sentinel gates type, COALESCE-friendly per-field NULLs). Reducer adds an every-event COALESCE arm onto jobs.backend_exec_*, leaving tab_* for T4. CLAUDE.md carve-out + drain() SELECT widened; new reducer + hook unit tests cover latest-non-null fold, NULL-non-clobber, partial capture, and cursor=0 re-fold determinism.
 ## Evidence
