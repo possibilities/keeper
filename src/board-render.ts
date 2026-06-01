@@ -153,9 +153,11 @@ export function inputRequestPillSeg(at: unknown, kind: unknown): string {
  *
  * Bucket rationale:
  *   - active  (bright cyan): in motion right now, look here
- *   - blue    (bright blue): a `running` work pill specifically (distinct
- *                            from the cyan `active` family so live worker /
- *                            sub-agent / planner motion reads as its own hue)
+ *   - blue    (bright blue): live in-motion work — a `running` work pill
+ *                            (worker / sub-agent / planner motion) and the
+ *                            `working` interactive-session state pill, both
+ *                            in their own hue distinct from the cyan `active`
+ *                            family
  *   - success (green):       positive resolution
  *   - error   (red):         failure / needs intervention
  *   - warn    (yellow):      blocked / something is in the way
@@ -184,7 +186,15 @@ type PillBucket = Exclude<keyof typeof SGR, "reset">;
 const PILL_COLORS: Record<string, PillBucket> = {
   running: "blue",
   in_progress: "active",
-  working: "active",
+  // fn-669: `working` (a live interactive session in the `keeper jobs`
+  // TUI) joins `running` in the bright-blue "in motion right now" hue.
+  // It was previously `active`/cyan, which reads as nearly-default
+  // foreground on many terminals — the blue is the visible signal a
+  // live working session deserves. `running` and `working` never share
+  // a single TUI (the board emits `running:*` verdicts; `keeper jobs`
+  // emits the bare `working` state pill), so the shared hue introduces
+  // no in-view ambiguity.
+  working: "blue",
   // Schema v29: the `[slotted-after-closer]` epic-header pill (rendered
   // when `epics.created_by_closer_of != null`). Active/cyan bucket — this
   // is "live, structural relationship visible to the human" rather than

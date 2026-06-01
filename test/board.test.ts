@@ -738,7 +738,7 @@ test("colorizePillsInLine: each bucket colors its representative tokens", () => 
   expect(colorizePillsInLine("[in_progress]")).toBe(
     `[${ACTIVE}in_progress${RESET}]`,
   );
-  expect(colorizePillsInLine("[working]")).toBe(`[${ACTIVE}working${RESET}]`);
+  expect(colorizePillsInLine("[working]")).toBe(`[${BLUE}working${RESET}]`);
   expect(colorizePillsInLine("[ok]")).toBe(`[${SUCCESS}ok${RESET}]`);
   expect(colorizePillsInLine("[approved]")).toBe(
     `[${SUCCESS}approved${RESET}]`,
