@@ -14,13 +14,25 @@
  *   --- autopilot ---
  *   {plan-bound jobs body} ← jobs WITH a plan_verb (planner/worker/closer)
  *
- * Each row is followed by its nested sub-agent collapse lines (one per
- * `(job_id, subagent_type)` group via `collapseSubagentsByName`). The
- * `--- interactive ---` / `--- autopilot ---` headings mirror
- * `cli/autopilot.ts`'s `--- current --- / --- predicted ---` style: a
- * heading is emitted ONLY when its section is non-empty. A partition
- * with zero rows yields neither its heading nor a placeholder; both
- * empty yields an empty body.
+ * Each job row CAN be followed by its nested sub-agent collapse lines
+ * (one per `(job_id, subagent_type)` group via `collapseSubagentsByName`)
+ * — but those are COLLAPSE-BY-DEFAULT, shown only when the job has been
+ * expanded in insert mode (see below). The `--- interactive ---` /
+ * `--- autopilot ---` headings mirror `cli/autopilot.ts`'s
+ * `--- current --- / --- predicted ---` style: a heading is emitted ONLY
+ * when its section is non-empty. A partition with zero rows yields
+ * neither its heading nor a placeholder; both empty yields an empty body.
+ *
+ * Insert mode (`i` to enter, `Esc` to leave): a modal, job-local
+ * navigation layer. While active the view CAPTURES the whole keyboard
+ * (via `createViewShell`'s `captureKeys`), so the global frame-scrub /
+ * copy / replay keys go inert and only Ctrl-C still quits. The whole UI
+ * indents two spaces, each job row gains a Nerd Font disclosure triangle
+ * (`GLYPH_COLLAPSED`/`GLYPH_EXPANDED`), and the selected row is marked
+ * `> `. `j`/`k`/↓/↑ move the selection; space toggles the selected job's
+ * sub-agent visibility (`expanded`). The render state lives in `main`
+ * and is threaded into `renderJobsBody` via `JobsRenderOptions`; a
+ * keypress re-emits the stashed snapshot so the repaint is immediate.
  *
  * Sidecars + lifecycle / SIGINT / first-paint contract mirror the sibling
  * mains. Sidecar basenames key on `script: "jobs"` so files write to
@@ -83,7 +95,13 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
   c copy current frame + sidecar paths to clipboard,
   r replay one oldest waiting dead-letter (recovers a dropped hook event),
-  q/Ctrl-C quit.
+  i enter insert mode, q/Ctrl-C quit.
+  Insert mode (job-local navigation): the whole UI indents two spaces,
+  each job row gains a disclosure triangle, and the selected row is
+  marked with '> '. j/k or ↓/↑ move the selection; space expands /
+  collapses the selected job's sub-agent lines; Esc leaves insert mode.
+  While in insert mode every other (global) key is inert — only Ctrl-C
+  still quits.
   Per-frame sidecars are indexed; lifecycle + warn output is appended
   to /tmp/keeper-jobs.<pid>.lifecycle.txt. Session paths print on exit.
 
@@ -107,7 +125,8 @@ reads without wrapping; [state] / [failed:<kind>] stay inline. Nested
 sub-agent lines collapse same-name invocations within one job to a
 single line representing the most-recent (max turn_seq) row; (×N) and
 'N stuck' annotations surface the folded count and any non-surviving
-'running' rows.
+'running' rows. Sub-agent lines are COLLAPSE-BY-DEFAULT — hidden until
+their job is expanded (space, in insert mode).
 
 A persistent [dead-letter:N] warn pill stamps in the banner whenever the
 daemon's dead_letters collection has waiting rows (events the hook
@@ -157,6 +176,55 @@ export function projectJobRow(row: Record<string, unknown>): string {
   return awaiting === "" ? head : `${head}\n  ${awaiting.trimStart()}`;
 }
 
+// Nerd Font disclosure-triangle glyphs (the human's call): caret-right
+// for collapsed, caret-down for expanded. One cell each.
+const GLYPH_COLLAPSED = "\uf0da"; // nf-fa-caret_right (U+F0DA) ▸
+const GLYPH_EXPANDED = "\uf0d7"; // nf-fa-caret_down (U+F0D7) ▾
+
+/**
+ * Insert-mode render state, owned by `cli/jobs.ts:main` and threaded into
+ * `renderJobsBody`. Absent → normal mode: rows render flush-left exactly
+ * as before, EXCEPT sub-agent lines are collapse-by-default (shown only
+ * when their job is in `expanded`).
+ *
+ * - `insertMode` — when true, every line gets a 2-space base indent, job
+ *   rows additionally carry a disclosure column (triangle when they have
+ *   children) and the selected row is marked with `> `.
+ * - `selectedIndex` — index into the selectable job rows (interactive
+ *   first, then autopilot — the order `selectableJobIds` produces).
+ *   Clamped to range inside `renderJobsBody` so a stale index from a
+ *   since-shrunk list is safe.
+ * - `expanded` — set of `job_id`s whose sub-agent lines are visible. The
+ *   one piece of state that survives leaving insert mode.
+ */
+export interface JobsRenderOptions {
+  insertMode: boolean;
+  selectedIndex: number;
+  expanded: Set<string>;
+}
+
+/**
+ * The job rows insert-mode selection can land on, in render order
+ * (interactive partition first, then autopilot). Headings and sub-agent
+ * lines are NOT selectable. Shared by `renderJobsBody` (to mark the
+ * selected row) and `cli/jobs.ts:main`'s key handler (to clamp the
+ * selection and resolve the selected `job_id` for space-to-expand) so
+ * the two never disagree on ordering.
+ */
+export function selectableJobIds(jobs: Map<string, unknown>): string[] {
+  const interactive: string[] = [];
+  const autopilot: string[] = [];
+  for (const [id, row] of jobs) {
+    const r = row as Record<string, unknown>;
+    if (r.plan_verb == null) {
+      interactive.push(id);
+    } else {
+      autopilot.push(id);
+    }
+  }
+  return [...interactive, ...autopilot];
+}
+
 /**
  * Render the full jobs body — two stacked partitions, each introduced by
  * an autopilot-style heading (`cli/autopilot.ts:renderBody`). Top
@@ -164,8 +232,17 @@ export function projectJobRow(row: Record<string, unknown>): string {
  * sessions). Bottom partition `--- autopilot ---`: jobs WITH `plan_verb`
  * (planner/worker/closer — epic-bound work). Within each partition we
  * preserve the helper's wire order (the `Map<job_id, Job>` insertion
- * order matches the server's row order), and each row is followed by its
- * `subagentLinesFor(..., "  ")` block.
+ * order matches the server's row order).
+ *
+ * Sub-agent lines are COLLAPSE-BY-DEFAULT: a job's `subagentLinesFor`
+ * block renders only when its `job_id` is in `render.expanded`. Without
+ * a `render` arg (or with an empty `expanded`) no sub-agents show.
+ *
+ * Insert-mode decoration (`render.insertMode === true`): every line gets
+ * a 2-space base indent; job rows carry a disclosure column
+ * (`GLYPH_COLLAPSED`/`GLYPH_EXPANDED` when they have children, else
+ * blank); the selected job row (`render.selectedIndex` into
+ * `selectableJobIds`) is prefixed with `> `.
  *
  * Heading-drop rule (mirrors autopilot): a heading is emitted ONLY when
  * its partition has rows. A partition with zero rows yields neither its
@@ -174,30 +251,80 @@ export function projectJobRow(row: Record<string, unknown>): string {
 export function renderJobsBody(
   jobs: Map<string, unknown>,
   subagentIndex: Map<string, SubagentInvocation[]>,
+  render?: JobsRenderOptions,
 ): string {
   if (jobs.size === 0) {
     return "";
   }
+  const insertMode = render?.insertMode === true;
+  const expanded = render?.expanded ?? new Set<string>();
+  const selectableCount = selectableJobIds(jobs).length;
+  const selectedIndex =
+    selectableCount === 0
+      ? -1
+      : Math.min(Math.max(render?.selectedIndex ?? 0, 0), selectableCount - 1);
+
+  // Insert-mode line prefixing. A heading or sub-agent ("child") line
+  // gets a flat 4-space indent (2 base + 2 for the disclosure column it
+  // doesn't own). A job row gets `<sel><tri>`: the 2-col selection gutter
+  // (`> ` when selected) followed by the 2-col disclosure column (a
+  // triangle when it has children, else blank). Normal mode is a
+  // pass-through.
+  const decorateHeadingOrChild = (line: string): string =>
+    insertMode ? `    ${line}` : line;
+  const decorateJobRow = (
+    line: string,
+    o: { hasChildren: boolean; isExpanded: boolean; isSelected: boolean },
+  ): string => {
+    if (!insertMode) {
+      return line;
+    }
+    const sel = o.isSelected ? "> " : "  ";
+    const tri = o.hasChildren
+      ? `${o.isExpanded ? GLYPH_EXPANDED : GLYPH_COLLAPSED} `
+      : "  ";
+    return `${sel}${tri}${line}`;
+  };
+
   const interactive: string[] = [];
   const autopilot: string[] = [];
+  let idx = 0; // running selectable-row index, in render order
   for (const [id, row] of jobs) {
     const r = row as Record<string, unknown>;
-    const block = [
-      projectJobRow(r),
-      ...subagentLinesFor(subagentIndex, id, "  "),
-    ].join("\n");
+    const hasChildren = (subagentIndex.get(id)?.length ?? 0) > 0;
+    const isExpanded = expanded.has(id);
+    const lines: string[] = [
+      decorateJobRow(projectJobRow(r), {
+        hasChildren,
+        isExpanded,
+        isSelected: insertMode && idx === selectedIndex,
+      }),
+    ];
+    if (isExpanded) {
+      for (const sub of subagentLinesFor(subagentIndex, id, "  ")) {
+        lines.push(decorateHeadingOrChild(sub));
+      }
+    }
+    const block = lines.join("\n");
     if (r.plan_verb == null) {
       interactive.push(block);
     } else {
       autopilot.push(block);
     }
+    idx += 1;
   }
   const sections: string[] = [];
   if (interactive.length > 0) {
-    sections.push(["--- interactive ---", ...interactive].join("\n"));
+    sections.push(
+      [decorateHeadingOrChild("--- interactive ---"), ...interactive].join(
+        "\n",
+      ),
+    );
   }
   if (autopilot.length > 0) {
-    sections.push(["--- autopilot ---", ...autopilot].join("\n"));
+    sections.push(
+      [decorateHeadingOrChild("--- autopilot ---"), ...autopilot].join("\n"),
+    );
   }
   return sections.join("\n");
 }
@@ -294,15 +421,94 @@ export async function main(argv: string[]): Promise<void> {
       });
   }
 
+  // Insert-mode state. Sub-agent lines are collapse-by-default; the
+  // human enters a modal "insert mode" (`i`) to navigate job rows
+  // (`j`/`k`/↑/↓), toggle a row's sub-agents (space), and leaves with
+  // Escape. While in insert mode the view captures EVERY key (via
+  // `captureKeys` below) so it's fully local to the job list — the
+  // global frame-scrub / copy / replay keys go inert. `expanded` is the
+  // only piece that survives leaving the mode. `lastSnap` is the most
+  // recent snapshot, re-emitted on each keypress so a mode/selection/
+  // expansion change repaints without waiting for the next daemon tick.
+  let insertMode = false;
+  let selectedIndex = 0;
+  const expanded = new Set<string>();
+  let lastSnap: ReadinessClientSnapshot | null = null;
+
+  function reemit(): void {
+    if (lastSnap !== null) {
+      view.emit(lastSnap);
+    }
+  }
+
+  // Handle a key while the insert-mode state machine owns it. Returns
+  // `true` when the key was consumed (so the caller skips the normal-mode
+  // `r` binding). Outside insert mode only `i` is consumed (to enter);
+  // inside insert mode EVERY key is consumed — `escape`/nav/space act,
+  // all others are swallowed so globals stay inert. Ctrl-C still quits
+  // (the core handles it before it ever reaches here).
+  function handleInsertKey(key: string): boolean {
+    if (!insertMode) {
+      if (key === "i") {
+        insertMode = true;
+        selectedIndex = 0;
+        reemit();
+        return true;
+      }
+      return false;
+    }
+    const ids = lastSnap
+      ? selectableJobIds(lastSnap.jobs as unknown as Map<string, unknown>)
+      : [];
+    const maxIdx = Math.max(ids.length - 1, 0);
+    switch (key) {
+      case "escape":
+        insertMode = false;
+        break;
+      case "up":
+      case "k":
+        selectedIndex = Math.max(0, selectedIndex - 1);
+        break;
+      case "down":
+      case "j":
+        selectedIndex = Math.min(maxIdx, selectedIndex + 1);
+        break;
+      case "space":
+      case " ": {
+        const id = ids[Math.min(Math.max(selectedIndex, 0), maxIdx)];
+        if (id !== undefined) {
+          if (expanded.has(id)) {
+            expanded.delete(id);
+          } else {
+            expanded.add(id);
+          }
+        }
+        break;
+      }
+      default:
+        // Swallow — insert mode is local; everything else is inert.
+        break;
+    }
+    reemit();
+    return true;
+  }
+
   // fn-660.1: lifecycle + sidecars + copy key + SIGINT moved into
   // `createViewShell` — see `src/view-shell.ts`. Jobs adds the
-  // persistent `[dead-letter:N]` banner (via `persistentBannerPill`)
-  // and the `r` replay key (via `onKey`).
+  // persistent `[dead-letter:N]` banner (via `persistentBannerPill`),
+  // the `r` replay key, and the `i`-driven insert mode (via `onKey` +
+  // `captureKeys`).
   const view = createViewShell<ReadinessClientSnapshot>({
     script: "jobs",
     title: "jobs",
     persistentBannerPill,
+    // Insert mode captures the whole keyboard so navigation is local to
+    // the job list (frame-scrub / copy / replay suppressed).
+    captureKeys: () => insertMode,
     onKey: (key) => {
+      if (handleInsertKey(key)) {
+        return;
+      }
       if (key === "r") {
         handleReplayKey();
       }
@@ -326,6 +532,7 @@ export async function main(argv: string[]): Promise<void> {
       const body = renderJobsBody(
         snap.jobs as unknown as Map<string, unknown>,
         subagentIndex,
+        { insertMode, selectedIndex, expanded },
       );
       return {
         bodyLines: body === "" ? ["no jobs"] : body.split("\n"),
@@ -345,6 +552,9 @@ export async function main(argv: string[]): Promise<void> {
   });
 
   function emitFrame(snap: ReadinessClientSnapshot): void {
+    // Stash for keypress-driven re-emits (insert-mode nav/expand repaint
+    // without waiting for the next daemon snapshot).
+    lastSnap = snap;
     for (const d of snap.readiness.diagnostics) {
       appendDiagnostic(d, diagnosticsLogPath);
     }

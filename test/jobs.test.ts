@@ -14,7 +14,7 @@
  */
 
 import { expect, test } from "bun:test";
-import { projectJobRow, renderJobsBody } from "../cli/jobs";
+import { projectJobRow, renderJobsBody, selectableJobIds } from "../cli/jobs";
 import { colorizePillsInLine, renderDeadLetterPill } from "../src/board-render";
 import type { SubagentInvocation } from "../src/types";
 
@@ -233,16 +233,19 @@ test("renderJobsBody: within-partition order preserves the helper's wire order",
 });
 
 // ---------------------------------------------------------------------------
-// renderJobsBody: nested sub-agent lines — each row is followed by its
-// `subagentLinesFor(..., "  ")` block (two-space indent). The collapse
-// + annotation rules (same-name within one job collapses; `×N` /
-// `N stuck` annotations) are unit-tested in test/board.test.ts via
-// collapseSubagentsByName; here we cover that the lines actually nest
-// under the right job.
+// renderJobsBody: nested sub-agent lines — COLLAPSE-BY-DEFAULT. A job's
+// `subagentLinesFor(..., "  ")` block (two-space indent) renders only
+// when the job is in `render.expanded`. The collapse + annotation rules
+// (same-name within one job collapses; `×N` / `N stuck` annotations) are
+// unit-tested in test/board.test.ts via collapseSubagentsByName; here we
+// cover default-hidden + expand-to-show + correct partition nesting.
 // ---------------------------------------------------------------------------
 
-test("renderJobsBody: nested sub-agent line appears immediately under the matching job row", () => {
-  const jobs = new Map<string, unknown>([
+const ambWithSub = (): {
+  jobs: Map<string, unknown>;
+  subagentIndex: Map<string, SubagentInvocation[]>;
+} => ({
+  jobs: new Map<string, unknown>([
     [
       "j-amb",
       {
@@ -253,8 +256,8 @@ test("renderJobsBody: nested sub-agent line appears immediately under the matchi
         state: "working",
       },
     ],
-  ]);
-  const subagentIndex = new Map<string, SubagentInvocation[]>([
+  ]),
+  subagentIndex: new Map<string, SubagentInvocation[]>([
     [
       "j-amb",
       [
@@ -266,8 +269,25 @@ test("renderJobsBody: nested sub-agent line appears immediately under the matchi
         }),
       ],
     ],
-  ]);
+  ]),
+});
+
+test("renderJobsBody: sub-agents are collapse-by-default (hidden with no render opts)", () => {
+  const { jobs, subagentIndex } = ambWithSub();
   const body = renderJobsBody(jobs, subagentIndex);
+  expect(body).toBe(
+    ["--- interactive ---", "(x) ambient [working]"].join("\n"),
+  );
+  expect(body).not.toContain("general-purpose");
+});
+
+test("renderJobsBody: expanding a job reveals its nested sub-agent line beneath it", () => {
+  const { jobs, subagentIndex } = ambWithSub();
+  const body = renderJobsBody(jobs, subagentIndex, {
+    insertMode: false,
+    selectedIndex: 0,
+    expanded: new Set(["j-amb"]),
+  });
   expect(body).toBe(
     [
       "--- interactive ---",
@@ -327,7 +347,11 @@ test("renderJobsBody: sub-agent lines route to the correct partition (ambient vs
       ],
     ],
   ]);
-  const body = renderJobsBody(jobs, subagentIndex);
+  const body = renderJobsBody(jobs, subagentIndex, {
+    insertMode: false,
+    selectedIndex: 0,
+    expanded: new Set(["j-amb", "j-work"]),
+  });
   // Expected:
   //   --- interactive ---
   //   (x) ambient [working]
@@ -344,6 +368,150 @@ test("renderJobsBody: sub-agent lines route to the correct partition (ambient vs
       "(y) worker [worker] [stopped]",
       "  build: build-task [running]",
     ].join("\n"),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// selectableJobIds — the render-order list insert-mode selection walks
+// (interactive partition first, then autopilot). Shared by renderJobsBody
+// and the key handler so the two never disagree on ordering.
+// ---------------------------------------------------------------------------
+
+test("selectableJobIds: interactive jobs first, then autopilot, preserving wire order", () => {
+  // Insertion order interleaves the partitions; the result must still be
+  // all-interactive-then-all-autopilot, each in wire order.
+  const jobs = new Map<string, unknown>([
+    ["w1", { job_id: "w1", plan_verb: "work" }],
+    ["a1", { job_id: "a1", plan_verb: null }],
+    ["w2", { job_id: "w2", plan_verb: "plan" }],
+    ["a2", { job_id: "a2", plan_verb: null }],
+  ]);
+  expect(selectableJobIds(jobs)).toEqual(["a1", "a2", "w1", "w2"]);
+});
+
+// ---------------------------------------------------------------------------
+// renderJobsBody insert-mode decoration: 2-space base indent on every
+// line, a disclosure triangle on job rows that have children, and a
+// `> ` marker on the selected row. Nerd Font glyphs: caret-right
+// (collapsed) / caret-down (expanded).
+// ---------------------------------------------------------------------------
+
+const TRI_RIGHT = "\uf0da"; // GLYPH_COLLAPSED // GLYPH_COLLAPSED
+const TRI_DOWN = "\uf0d7"; // GLYPH_EXPANDED // GLYPH_EXPANDED
+
+test("renderJobsBody insert mode: indent + selection marker + collapsed triangle", () => {
+  const jobs = new Map<string, unknown>([
+    [
+      "j1",
+      {
+        job_id: "j1",
+        cwd: "/repo/a",
+        title: "first",
+        plan_verb: null,
+        state: "working",
+      },
+    ],
+    [
+      "j2",
+      {
+        job_id: "j2",
+        cwd: "/repo/b",
+        title: "second",
+        plan_verb: null,
+        state: "working",
+      },
+    ],
+  ]);
+  // j1 has a sub-agent (so it gets a triangle); j2 has none (blank gutter).
+  const subagentIndex = new Map<string, SubagentInvocation[]>([
+    [
+      "j1",
+      [
+        makeSub({
+          job_id: "j1",
+          subagent_type: "scout",
+          description: "d",
+          status: "ok",
+        }),
+      ],
+    ],
+  ]);
+  const body = renderJobsBody(jobs, subagentIndex, {
+    insertMode: true,
+    selectedIndex: 0,
+    expanded: new Set(),
+  });
+  expect(body).toBe(
+    [
+      "    --- interactive ---", // heading: 2 base + 2 disclosure pad
+      `> ${TRI_RIGHT} (a) first [working]`, // selected, collapsed-with-children
+      "    (b) second [working]", // unselected, no children → blank gutter
+    ].join("\n"),
+  );
+});
+
+test("renderJobsBody insert mode: selected + expanded shows down-triangle and reveals child", () => {
+  const jobs = new Map<string, unknown>([
+    [
+      "j1",
+      {
+        job_id: "j1",
+        cwd: "/repo/a",
+        title: "first",
+        plan_verb: null,
+        state: "working",
+      },
+    ],
+  ]);
+  const subagentIndex = new Map<string, SubagentInvocation[]>([
+    [
+      "j1",
+      [
+        makeSub({
+          job_id: "j1",
+          subagent_type: "scout",
+          description: "d",
+          status: "ok",
+        }),
+      ],
+    ],
+  ]);
+  const body = renderJobsBody(jobs, subagentIndex, {
+    insertMode: true,
+    selectedIndex: 0,
+    expanded: new Set(["j1"]),
+  });
+  expect(body).toBe(
+    [
+      "    --- interactive ---",
+      `> ${TRI_DOWN} (a) first [working]`, // selected, expanded
+      "      scout: d [ok]", // child: 2 base + 2 pad + its own 2
+    ].join("\n"),
+  );
+});
+
+test("renderJobsBody insert mode: out-of-range selectedIndex clamps (no marker leak / no crash)", () => {
+  const jobs = new Map<string, unknown>([
+    [
+      "j1",
+      {
+        job_id: "j1",
+        cwd: "/repo/a",
+        title: "first",
+        plan_verb: null,
+        state: "working",
+      },
+    ],
+  ]);
+  // selectedIndex past the end clamps to the last row, which gets the marker.
+  const body = renderJobsBody(jobs, new Map(), {
+    insertMode: true,
+    selectedIndex: 99,
+    expanded: new Set(),
+  });
+  expect(body).toBe(
+    // `> ` selection marker + `  ` blank disclosure gutter (no children).
+    ["    --- interactive ---", ">   (a) first [working]"].join("\n"),
   );
 });
 
