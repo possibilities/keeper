@@ -553,6 +553,80 @@ test("createZellijBackend.launch: session missing → attach -b, then poll, then
   expect(actionIdx).toBeGreaterThan(1);
 });
 
+test("createZellijBackend.launch: session-mint attach -b carries color env (TERM/COLORTERM)", async () => {
+  // The zellij server inherits the mint spawn's env, and every pane it
+  // launches inherits the server's. keeperd's LaunchAgent env strips
+  // TERM/COLORTERM, so the mint spawn MUST inject color-capable defaults
+  // or every worker pane renders monochrome. Capture the options bag on
+  // the `attach -b` call and assert the color vars are present.
+  const notes: string[] = [];
+  let attachEnv: Record<string, string> | undefined;
+  let listCalls = 0;
+  const spawn: SpawnFn = (cmd, options) => {
+    if (cmd[1] === "list-sessions") {
+      listCalls++;
+      const body = listCalls === 1 ? "" : "autopilot\n";
+      return {
+        exited: Promise.resolve(0),
+        stdout: new Response(body).body,
+        stderr: new Response("").body,
+      };
+    }
+    if (cmd[1] === "attach" && cmd[2] === "-b") {
+      attachEnv = options.env;
+    }
+    return {
+      exited: Promise.resolve(0),
+      stdout: new Response("").body,
+      stderr: new Response("").body,
+    };
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    session: "autopilot",
+    spawn,
+  });
+  await backend.launch(["/bin/zsh", "-c", "echo hi"], "work::fn-1-x.1", "/abs");
+  expect(attachEnv).toBeDefined();
+  expect(attachEnv?.TERM).toBe(process.env.TERM ?? "xterm-256color");
+  expect(attachEnv?.COLORTERM).toBe(process.env.COLORTERM ?? "truecolor");
+  // PATH is spread through so the server can still resolve binaries.
+  expect(attachEnv?.PATH).toBe(process.env.PATH);
+});
+
+test("createZellijBackend: control commands (list-sessions/new-tab) carry NO env override", async () => {
+  // Only the mint spawn opts into a custom env; every other control
+  // command inherits process.env (options.env stays undefined) so we
+  // don't churn the env surface on the hot path.
+  const envByKey: Record<string, Record<string, string> | undefined> = {};
+  let listCalls = 0;
+  const spawn: SpawnFn = (cmd, options) => {
+    const key = `${cmd[1]}${cmd[4] != null ? `:${cmd[4]}` : ""}`;
+    envByKey[key] = options.env;
+    if (cmd[1] === "list-sessions") {
+      listCalls++;
+      return {
+        exited: Promise.resolve(0),
+        stdout: new Response(listCalls === 1 ? "" : "autopilot\n").body,
+        stderr: new Response("").body,
+      };
+    }
+    return {
+      exited: Promise.resolve(0),
+      stdout: new Response("").body,
+      stderr: new Response("").body,
+    };
+  };
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  await backend.launch(["/bin/zsh", "-c", "echo hi"], "work::fn-1-x.1", "/abs");
+  expect(envByKey["list-sessions"]).toBeUndefined();
+  expect(envByKey["--session:new-tab"]).toBeUndefined();
+});
+
 test("createZellijBackend.launch: session listed but EXITED → attach -b (resurrect), then new-tab", async () => {
   // Regression: a dead session lingers in `list-sessions` branded
   // `(EXITED - attach to resurrect)`. It is NOT a live server — a

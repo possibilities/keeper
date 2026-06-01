@@ -72,6 +72,13 @@ export type SpawnFn = (
     stdout: "pipe" | "ignore";
     stderr: "pipe" | "ignore";
     stdin: "ignore";
+    /**
+     * Optional child env. Omitted on every control command (Bun inherits
+     * `process.env`); set ONLY on the session-mint `attach -b` spawn so
+     * the zellij server — and every pane it later launches — boots with a
+     * color-capable `TERM`/`COLORTERM`. See `ensureSession`.
+     */
+    env?: Record<string, string>;
   },
 ) => {
   exited: Promise<number>;
@@ -544,12 +551,14 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
 
   async function runCapture(
     args: string[],
+    env?: Record<string, string>,
   ): Promise<{ exitCode: number; stdout: string; stderr: string } | null> {
     try {
       const proc = spawn(args, {
         stdout: "pipe",
         stderr: "pipe",
         stdin: "ignore",
+        ...(env != null ? { env } : {}),
       });
       const [exitCode, stdout, stderr] = await Promise.all([
         proc.exited,
@@ -581,7 +590,20 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       }
       // Not listed — fire `attach -b <session>` to mint a detached
       // background session, then poll `list-sessions` until it appears.
-      await runCapture(buildZellijAttachBgArgs(session));
+      //
+      // The zellij server inherits THIS spawn's env, and every pane it
+      // later launches inherits the server's. keeperd runs as a
+      // LaunchAgent whose env is stripped to `PATH` (no `TERM`/
+      // `COLORTERM`), so a session minted here would render every worker
+      // pane colorblind. Carry color-capable defaults — preserving a real
+      // terminal's values on the off chance one exists (tests, a future
+      // non-LaunchAgent run) — so the autopilot worker's `claude` TUI
+      // shows color. Spread `process.env` first to keep `PATH` et al.
+      await runCapture(buildZellijAttachBgArgs(session), {
+        ...(process.env as Record<string, string>),
+        TERM: process.env.TERM ?? "xterm-256color",
+        COLORTERM: process.env.COLORTERM ?? "truecolor",
+      });
       const deadline = Date.now() + 5000;
       while (Date.now() < deadline) {
         const probe = await runCapture(buildZellijListSessionsArgs());
