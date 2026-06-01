@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-669-harden-hook-against-schema-skew",
   "bundles": [],
   "closer_done_at": "2026-06-01T20:51:19.644461Z",
@@ -18,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-01T20:51:19.644461Z"
+  "updated_at": "2026-06-01T20:51:40.057743Z"
 }
