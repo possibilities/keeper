@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-01T03:08:15.686599Z",
+  "depends_on": [],
+  "epic": "fn-667-persist-autopilot-control-state",
+  "id": "fn-667-persist-autopilot-control-state.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Event-source autopilot paused flag",
+  "updated_at": "2026-06-01T03:08:15.686599Z"
+}
