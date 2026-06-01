@@ -107,6 +107,18 @@ export interface ViewShell<TSnap> {
    */
   emit: (snap: TSnap) => boolean;
   /**
+   * Repaint the live view from `snap` WITHOUT minting a history frame.
+   * Renders + byte-compares exactly like `emit`, but on change ships the
+   * body via `liveShell.refreshLive` (a live overlay that does not grow the
+   * frame-history ring) and skips the per-frame sidecar triple + frameCount
+   * bump. Updates the same `lastBody` gate `emit` reads, so a subsequent
+   * `emit` with identical content suppresses (the overlay content becomes
+   * the new baseline). Use for ephemeral, key-driven UI state (e.g. jobs'
+   * insert-mode selection / expand) that should repaint in place rather
+   * than record a data frame. Returns `true` when it repainted.
+   */
+  repaintLocal: (snap: TSnap) => boolean;
+  /**
    * Append a standardized lifecycle event to the lifecycle sidecar
    * (`...`, `event: <event>`, key/value detail lines, `...`). Also
    * clears the internal `lastBody` gate on `event === "disconnected"`
@@ -313,6 +325,24 @@ export function createViewShell<TSnap>(
     return true;
   }
 
+  function repaintLocal(snap: TSnap): boolean {
+    const { bodyLines } = renderBody(snap);
+    const body = bodyLines.join("\n");
+    if (body === lastBody) {
+      return false;
+    }
+    // Adopt the overlay content as the new baseline so a following live
+    // `emit` of the same data suppresses instead of re-minting this body as
+    // a history frame. No frameCount bump, no sidecar write — selection /
+    // expand churn is ephemeral UI state, not a data frame.
+    lastBody = body;
+    const linesForShell = colorEnabled
+      ? bodyLines.map(colorizePillsInLine)
+      : bodyLines;
+    liveShell.refreshLive(linesForShell);
+    return true;
+  }
+
   function emitLifecycle(
     event: string,
     detail: Record<string, unknown> = {},
@@ -375,6 +405,7 @@ export function createViewShell<TSnap>(
     liveShell,
     noteLine,
     emit,
+    repaintLocal,
     emitLifecycle,
     flashStatus,
     metaSidecar,

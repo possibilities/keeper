@@ -659,6 +659,37 @@ test("renderJobsBody insert mode: out-of-range selectedIndex clamps (no marker l
   );
 });
 
+test("renderJobsBody insert mode: selectedIndex marks by selectableJobIds order, not raw Map order (interleaved partitions)", () => {
+  // Regression: the Map interleaves interactive/autopilot as sessions arrive,
+  // but `selectedIndex` indexes `selectableJobIds` (interactive-then-autopilot).
+  // Marking by raw Map-iteration index landed the `> ` marker in the wrong
+  // partition. Here Map order is I,A,I,A; selectableJobIds is [I0,I1,A0,A1].
+  const mk = (id: string, plan_verb: string | null) => ({
+    job_id: id,
+    cwd: `/r/${id.toLowerCase()}`,
+    title: id === "I1" ? "inter-1" : id,
+    plan_verb,
+    state: "working",
+  });
+  const jobs = new Map<string, unknown>([
+    ["I0", mk("I0", null)],
+    ["A0", mk("A0", "worker")],
+    ["I1", mk("I1", null)],
+    ["A1", mk("A1", "planner")],
+  ]);
+  // selectedIndex 1 → selectableJobIds[1] = I1 (the SECOND interactive job).
+  const body = renderJobsBody(jobs, new Map(), {
+    insertMode: true,
+    selectedIndex: 1,
+    expanded: new Set(),
+  });
+  const marked = body.split("\n").find((l) => l.startsWith("> "));
+  // The marker must land on inter-1 (I1), never on auto-0 (the raw-index-1 row).
+  expect(marked).toBe(">   (i1) inter-1 [working]");
+  // And exactly one row is marked.
+  expect(body.split("\n").filter((l) => l.startsWith("> ")).length).toBe(1);
+});
+
 // ---------------------------------------------------------------------------
 // Dead-letter banner pill — re-exercised here (same assertions as
 // test/board.test.ts) so jobs.test.ts owns the surface its renderer

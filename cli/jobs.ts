@@ -319,11 +319,24 @@ export function renderJobsBody(
   }
   const insertMode = render?.insertMode === true;
   const expanded = render?.expanded ?? new Set<string>();
-  const selectableCount = selectableJobIds(jobs).length;
-  const selectedIndex =
-    selectableCount === 0
-      ? -1
-      : Math.min(Math.max(render?.selectedIndex ?? 0, 0), selectableCount - 1);
+  // Resolve the selected row by `job_id`, NOT by raw Map-iteration index.
+  // `selectedIndex` indexes `selectableJobIds` (interactive-then-autopilot),
+  // but the render loop below walks `jobs` in raw Map order, which interleaves
+  // the two partitions as sessions arrive. Marking on `idx === selectedIndex`
+  // compared an index from one ordering against an index from the other, so
+  // the `> ` marker landed in the wrong partition and `space` toggled a
+  // different job than the one marked. Deriving the selected id once from the
+  // same ordering the key handler uses keeps render and selection in lockstep.
+  const selectableIds = selectableJobIds(jobs);
+  const selectedId =
+    selectableIds.length === 0
+      ? undefined
+      : selectableIds[
+          Math.min(
+            Math.max(render?.selectedIndex ?? 0, 0),
+            selectableIds.length - 1,
+          )
+        ];
 
   // Insert-mode line prefixing. A heading or sub-agent ("child") line
   // gets a flat 4-space indent (2 base + 2 for the disclosure column it
@@ -349,7 +362,6 @@ export function renderJobsBody(
 
   const interactive: string[] = [];
   const autopilot: string[] = [];
-  let idx = 0; // running selectable-row index, in render order
   for (const [id, row] of jobs) {
     const r = row as Record<string, unknown>;
     const hasChildren = (subagentIndex.get(id)?.length ?? 0) > 0;
@@ -358,7 +370,7 @@ export function renderJobsBody(
       decorateJobRow(projectJobRow(r), {
         hasChildren,
         isExpanded,
-        isSelected: insertMode && idx === selectedIndex,
+        isSelected: insertMode && id === selectedId,
       }),
     ];
     if (isExpanded) {
@@ -372,7 +384,6 @@ export function renderJobsBody(
     } else {
       autopilot.push(block);
     }
-    idx += 1;
   }
   const sections: string[] = [];
   if (interactive.length > 0) {
@@ -498,7 +509,11 @@ export async function main(argv: string[]): Promise<void> {
 
   function reemit(): void {
     if (lastSnap !== null) {
-      view.emit(lastSnap);
+      // Insert-mode nav/expand repaint: `repaintLocal` ships the body via a
+      // live overlay so moving the selection cursor doesn't mint a history
+      // frame (or a sidecar triple) on every keypress — selection is
+      // ephemeral UI state, not a data frame.
+      view.repaintLocal(lastSnap);
     }
   }
 
