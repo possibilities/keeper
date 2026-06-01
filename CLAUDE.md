@@ -114,6 +114,26 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   (the worktree oid is a per-file fact, not per-session). A chmod-only
   dirty file (equal blob, different mode) is also caught — content-equality
   alone would have wrongly discharged it.
+- **Planctl-written files attribute honestly (schema v46 / fn-666).** The
+  planctl CLI's stdout `planctl_invocation` envelope carries a
+  repo-relative `files[]` array naming every `.planctl/{epics,tasks}/*.json`
+  and `.planctl/specs/*.md` it wrote during the op. The deriver
+  (`extractPlanctlInvocation`) lifts it into `events.planctl_files`
+  (JSON-array TEXT, NULL on miss / non-array / empty / runaway-size), and
+  the reducer's `planctl_op != null` fold seam mints one
+  `source='planctl'` `file_attributions` row per path under
+  `project_dir = state_repo` (the envelope's absolute repo path, extracted
+  in-fold from `event.data`) + `event.session_id` + the repo-relative path
+  + `last_mutation_at = event.ts` + `op = event.planctl_op`. The pass-2
+  inferred-guard widens to `source IN ('tool','bash','planctl')` so a
+  planctl file does NOT also get a spurious inferred attribution; the
+  pass-3 render whitelist accepts `'planctl'` so the source badge
+  surfaces honestly. Discharge flows through the same `foldCommit` path
+  as `'tool'`/`'bash'`/`'inferred'` (a `chore(planctl)` commit clears
+  the attribution row via the same `last_commit_at` UPDATE) — no
+  per-source branch. Without this mint, `.planctl/` files orphaned the
+  instant they flashed dirty (the 559-orphan spike documented in
+  fn-666's epic spec).
 
 ## DO NOT
 

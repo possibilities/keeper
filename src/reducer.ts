@@ -1192,7 +1192,7 @@ interface RenderedAttribution {
   state: string;
   last_touch_at: number;
   op: string;
-  source: "tool" | "bash" | "inferred";
+  source: "tool" | "bash" | "inferred" | "planctl";
 }
 
 /**
@@ -1236,7 +1236,7 @@ interface SessionMutation {
   last_mutation_at: number;
   last_event_id: number;
   op: string;
-  source: "tool" | "bash";
+  source: "tool" | "bash" | "planctl";
 }
 
 /**
@@ -1888,7 +1888,7 @@ function projectGitStatus(db: Database, event: Event): void {
     `SELECT 1 FROM file_attributions
       WHERE project_dir = ?
         AND file_path = ?
-        AND source IN ('tool', 'bash')
+        AND source IN ('tool', 'bash', 'planctl')
         AND last_mutation_at > COALESCE(last_commit_at, 0)
       LIMIT 1`,
   );
@@ -1994,7 +1994,10 @@ function projectGitStatus(db: Database, event: Event): void {
       last_touch_at: r.last_touch_at,
       op: r.op,
       source:
-        r.source === "tool" || r.source === "bash" || r.source === "inferred"
+        r.source === "tool" ||
+        r.source === "bash" ||
+        r.source === "inferred" ||
+        r.source === "planctl"
           ? r.source
           : "inferred",
     }));
@@ -4076,6 +4079,189 @@ function syncJobLinksOnJobWrite(
 }
 
 /**
+ * Schema v46 / fn-666: extract the envelope's `state_repo` (the absolute
+ * path of the repo planctl wrote `.planctl/{epics,tasks,specs}/...` into)
+ * from the stored event payload. Pure parse — no `Date.now`/env/OS reads,
+ * no probe; a malformed payload, missing envelope, or non-string `state_repo`
+ * folds to `null` (the mint is a no-op then). The producer (planctl) writes
+ * `state_repo` on EVERY planctl envelope (both `planctl init` carve-out and
+ * every mutating verb), so a non-null `planctl_op` SHOULD always carry one;
+ * the defensive null fall-back keeps the fold tx sacred per the CLAUDE.md
+ * "safe value on malformed payload" invariant.
+ */
+function extractPlanctlStateRepo(event: Event): string | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(event.data);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return null;
+  }
+  // Two equivalent envelope shapes exist in the wild:
+  //   1. `{tool_response:{stdout:"{...planctl_invocation:{state_repo,...}}"}}`
+  //      — the canonical PostToolUse:Bash hook payload. We dive through
+  //      `tool_response.stdout` (a JSON-string) → the envelope.
+  //   2. Synthetic / test events may inline `planctl_invocation` at the top
+  //      level (the test reducer harness does this) — we accept that shape
+  //      too for symmetry.
+  const obj = parsed as Record<string, unknown>;
+  // Path 1: hook payload — dive through tool_response.stdout.
+  const toolResponse = obj.tool_response;
+  if (typeof toolResponse === "object" && toolResponse !== null) {
+    const stdout = (toolResponse as Record<string, unknown>).stdout;
+    if (typeof stdout === "string" && stdout.length > 0) {
+      let inner: unknown;
+      try {
+        inner = JSON.parse(stdout);
+      } catch {
+        // Fall through to path 2 — the stdout might not be JSON for a
+        // non-planctl event, but the planctl_op gate above already ensured
+        // this IS a planctl envelope, so the stdout should parse. A parse
+        // miss here is a malformed payload — fold to null.
+        inner = null;
+      }
+      if (typeof inner === "object" && inner !== null) {
+        const env = (inner as Record<string, unknown>).planctl_invocation;
+        if (typeof env === "object" && env !== null) {
+          const sr = (env as Record<string, unknown>).state_repo;
+          if (typeof sr === "string" && sr.length > 0) {
+            return sr;
+          }
+        }
+      }
+    }
+  }
+  // Path 2: top-level inlined envelope (synthetic / test shape).
+  const topLevelEnv = obj.planctl_invocation;
+  if (typeof topLevelEnv === "object" && topLevelEnv !== null) {
+    const sr = (topLevelEnv as Record<string, unknown>).state_repo;
+    if (typeof sr === "string" && sr.length > 0) {
+      return sr;
+    }
+  }
+  return null;
+}
+
+/**
+ * Schema v46 / fn-666: mint one `source='planctl'` `file_attributions` row
+ * per path in the event's `planctl_files` array, keyed under the envelope's
+ * `state_repo` (the repo planctl wrote the `.planctl/` tree into) +
+ * `event.session_id` + the repo-relative path. Runs INSIDE the open
+ * transaction opened by {@link applyEvent}; performs zero cursor work.
+ *
+ * **Why this exists.** `.planctl/{epics,tasks}/*.json` and
+ * `.planctl/specs/*.md` are written by the planctl CLI, NOT by a Claude
+ * Write/Edit or recognized bash mutation — so without this mint they would
+ * appear as strict-mystery orphans on the next `GitSnapshot` fold (no
+ * attribution row → pass-4 `orphan_count` increments). The envelope's
+ * `files` array names exactly what the op wrote; we lift it via
+ * `extractPlanctlInvocation` at hook time (stored in
+ * `events.planctl_files`) and mint here at fold time.
+ *
+ * **Tuple invariant.** The `(project_dir, file_path)` tuple MUST match the
+ * `(GitSnapshot.project_dir, dirty_files[].path)` tuple downstream so
+ * pass-3 render and `foldCommit` discharge work without divergence:
+ *   - `project_dir = state_repo` (absolute, no trailing slash — planctl
+ *     emits the canonical path already).
+ *   - `file_path = <repo-relative>` (the envelope's `files[]` strings).
+ *     Skip absolute paths and paths with `..` traversal — defensive, but
+ *     planctl's `files[]` is always repo-relative in practice.
+ *
+ * **Re-fold determinism.** All inputs are pure event-derived:
+ *   - `event.session_id`, `event.ts`, `event.id` — frozen at insert time;
+ *   - `event.planctl_files` — backfilled from the stored envelope via the
+ *     SHARED `extractPlanctlInvocation` deriver, so a from-scratch re-fold
+ *     reproduces the same JSON-encoded array byte-identically;
+ *   - `state_repo` — read from the stored envelope blob; pure parse.
+ *
+ * **Upsert shape.** Mirrors pass-1's `(file_attributions)` UPSERT:
+ *   - `last_mutation_at = event.ts` (newest-wins per `(project_dir,
+ *     session_id, file_path)`);
+ *   - `op = event.planctl_op` (the verb — `scaffold`, `done`, `approve`, …);
+ *   - `source = 'planctl'`;
+ *   - `worktree_oid` / `worktree_mode` left NULL — they're per-file
+ *     snapshot facts written by the GitSnapshot fold's pass-1 / pass-2
+ *     refresh, not the planctl mint. A subsequent GitSnapshot will stamp
+ *     them via the `refreshWorktreeOidStmt` UPDATE, so the discharge
+ *     gate behaves identically to today's pre-mint behavior for these
+ *     rows.
+ *
+ * **No-op when:**
+ * - `event.planctl_op == null` (caller-gated; defensive double-check via the
+ *   `length > 0` branch below).
+ * - `event.planctl_files == null` or JSON-parses to a non-array (the
+ *   deriver's null-on-miss contract, plus defensive re-check here).
+ * - `state_repo` can't be lifted from the event's payload (malformed
+ *   envelope or pre-fn-666 historical row whose envelope predates the
+ *   field). The mint silently skips; the cursor still advances.
+ *
+ * NEVER throws inside the open transaction.
+ */
+function mintPlanctlFileAttributions(db: Database, event: Event): void {
+  if (event.planctl_op == null || event.planctl_files == null) {
+    return;
+  }
+  let files: unknown;
+  try {
+    files = JSON.parse(event.planctl_files);
+  } catch {
+    return;
+  }
+  if (!Array.isArray(files) || files.length === 0) {
+    return;
+  }
+  const stateRepo = extractPlanctlStateRepo(event);
+  if (stateRepo === null) {
+    return;
+  }
+  // Same UPSERT shape as projectGitStatus pass-1 (mirrors the
+  // `(project_dir, session_id, file_path)` PK + newest-wins-on-mutation
+  // semantics). `worktree_oid` / `worktree_mode` ride NULL — the next
+  // GitSnapshot's `refreshWorktreeOidStmt` will stamp them. The UPDATE
+  // gate `excluded.last_mutation_at > file_attributions.last_mutation_at`
+  // ensures a stale planctl event (e.g., during re-fold ordering)
+  // never overwrites a newer attribution.
+  const upsertStmt = db.prepare(
+    `INSERT INTO file_attributions
+       (project_dir, session_id, file_path, last_mutation_at,
+        last_commit_at, op, source, last_event_id, updated_at,
+        worktree_oid, worktree_mode)
+       VALUES (?, ?, ?, ?, NULL, ?, 'planctl', ?, ?, NULL, NULL)
+       ON CONFLICT(project_dir, session_id, file_path) DO UPDATE SET
+         last_mutation_at = excluded.last_mutation_at,
+         op = excluded.op,
+         source = excluded.source,
+         last_event_id = excluded.last_event_id,
+         updated_at = excluded.updated_at
+       WHERE excluded.last_mutation_at > file_attributions.last_mutation_at`,
+  );
+  for (const rawPath of files) {
+    if (typeof rawPath !== "string" || rawPath.length === 0) continue;
+    // Skip absolute paths (planctl emits relative; an absolute path would
+    // never match the `dirty_files[].path` tuple downstream and would
+    // strand as an orphan attribution forever).
+    if (rawPath.startsWith("/")) continue;
+    // Skip paths with `..` traversal — defensive; planctl never emits
+    // these but a corrupt envelope might.
+    if (rawPath.includes("..")) continue;
+    upsertStmt.run(
+      stateRepo,
+      event.session_id,
+      rawPath,
+      event.ts,
+      event.planctl_op,
+      event.id,
+      event.ts,
+    );
+  }
+}
+
+/**
  * Fan a planctl-CLI invocation (or a `/plan:plan` window opener) into the
  * `jobs.epic_links` + per-touched-epic `epics.job_links` projections. Runs
  * INSIDE the open transaction opened by {@link applyEvent}; performs zero
@@ -5855,6 +6041,18 @@ function projectJobsRow(db: Database, event: Event): void {
     syncPlanctlLinks(db, jobId, event.id, ts);
   }
 
+  // Schema v46 / fn-666: planctl-written tracked files get a
+  // `source='planctl'` `file_attributions` row per path the envelope's
+  // `files` array names. Gated on `event.planctl_op != null` (only planctl
+  // events carry a non-null `planctl_files`) + the deriver's defensive
+  // `length > 0` guard re-asserted here. Without this mint the
+  // `.planctl/{epics,tasks}/*.json` and `.planctl/specs/*.md` files
+  // appeared as strict-mystery orphans the instant they flashed dirty
+  // (the 559-orphan spike documented in fn-666's epic spec).
+  if (event.planctl_op != null && event.planctl_files != null) {
+    mintPlanctlFileAttributions(db, event);
+  }
+
   // Title precedence rule: a `session_title` in the data blob folds into
   // `jobs.title`, layered on top of any lifecycle write above. The source is
   // resolved per-event by titleSourceForEvent — 'transcript' (priority 3) for a
@@ -6133,7 +6331,7 @@ export function drain(
               stop_hook_active, data, subagent_agent_id, spawn_name,
               start_time, slash_command, skill_name,
               planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-              planctl_subject_present, tool_use_id, config_dir
+              planctl_subject_present, tool_use_id, config_dir, planctl_files
          FROM events
         WHERE id > ?
         ORDER BY id ASC

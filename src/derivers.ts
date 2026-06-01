@@ -334,6 +334,21 @@ export function parsePlanRef(ref: string | null): ParsedPlanRef | null {
  * v29→v30 boundary: every legacy event folds to `queue_jump=false`. Projected
  * to `epics.queue_jump` by `syncPlanctlLinks`; drives the `!`-prefix `sort_path`
  * branch for root epics so queued work sorts atop the dashctl board.
+ *
+ * `files` (schema v46 / fn-666) mirrors the envelope's `files` array — the
+ * repo-relative paths planctl wrote during this op (e.g. `.planctl/epics/
+ * fn-1-foo.json` + every spec/task JSON the scaffold/approve/close/done
+ * touched). Lifted defensively: a non-array value, an array containing
+ * non-string elements, or a missing field all fold to `null` (NOT an empty
+ * array) so the column's `IS NOT NULL` partial-index predicate stays
+ * selective on rows that actually name files. Mirrors the
+ * `bash_mutation_targets` Array.isArray + per-element string filter shape.
+ * Capped at PLANCTL_FILES_CAP entries — a runaway op is almost certainly
+ * a planctl bug or a corrupt envelope, so we drop the lift entirely
+ * (NULL) rather than store an outsized JSON blob. The reducer's
+ * planctl_op fold mints `source='planctl'` `file_attributions` rows for
+ * every path, keyed under the envelope's `state_repo` (the absolute path
+ * of the repo whose `.planctl/` tree planctl wrote into).
  */
 export interface PlanctlInvocation {
   op: string;
@@ -342,6 +357,15 @@ export interface PlanctlInvocation {
   task_id: string | null;
   subject_present: boolean;
   queue_jump: boolean;
+  /**
+   * Schema v46 / fn-666: repo-relative paths planctl wrote during this op
+   * (every JSON / spec under `.planctl/`). NULL when the envelope omits
+   * the field, when it's not an array, when filtering leaves zero string
+   * elements, or when the array size exceeds PLANCTL_FILES_CAP (the
+   * runaway guard). Non-empty arrays of strings only — a re-fold over the
+   * historical log reproduces the same value via the same deriver.
+   */
+  files: string[] | null;
 }
 
 /**
@@ -352,6 +376,16 @@ export interface PlanctlInvocation {
  * elsewhere in the hook surface.
  */
 const PLANCTL_STDOUT_CAP = 64_000;
+
+/**
+ * Defensive cap on the number of entries we will lift from the envelope's
+ * `files` array. A scaffold op typically writes <20 files (epic JSON +
+ * meta.json + per-task JSON + specs); a runaway op past this threshold is
+ * almost certainly a buggy planctl or a corrupt envelope, so we drop the
+ * lift entirely (NULL) rather than store an outsized JSON blob. Generous
+ * enough to never bite a real op.
+ */
+const PLANCTL_FILES_CAP = 500;
 
 /**
  * Extract a planctl-CLI invocation envelope from a `PostToolUse:Bash` event's
@@ -458,7 +492,30 @@ export function extractPlanctlInvocation(
   const refParsed = target !== null ? parsePlanRef(target) : null;
   const epic_id = refParsed?.epic_id ?? null;
   const task_id = refParsed?.kind === "task" ? refParsed.task_id : null;
-  return { op, target, epic_id, task_id, subject_present, queue_jump };
+  // Schema v46 / fn-666: lift the repo-relative `files` array. Mirrors
+  // `bash_mutation_targets`'s shape — Array.isArray + per-element string
+  // filter; runaway-size guard drops to NULL (the partial-index `WHERE
+  // planctl_files IS NOT NULL` predicate stays selective on rows that
+  // actually name files). A zero-length array (read-only ops, scaffold
+  // that wrote nothing) folds to NULL too — the reducer's mint guard
+  // (`Array.isArray && length > 0`) double-checks anyway, but keeping
+  // empty arrays out of the column matches the planctl_queue_jump /
+  // bash_mutation_targets sparse convention.
+  let files: string[] | null = null;
+  const rawFiles = envObj.files;
+  if (
+    Array.isArray(rawFiles) &&
+    rawFiles.length > 0 &&
+    rawFiles.length <= PLANCTL_FILES_CAP
+  ) {
+    const filtered = rawFiles.filter(
+      (v): v is string => typeof v === "string" && v.length > 0,
+    );
+    if (filtered.length > 0) {
+      files = filtered;
+    }
+  }
+  return { op, target, epic_id, task_id, subject_present, queue_jump, files };
 }
 
 /**

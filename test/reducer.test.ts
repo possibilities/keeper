@@ -52,6 +52,7 @@ function insertEvent(
     hook_event: string;
     bash_mutation_kind?: string | null;
     bash_mutation_targets?: string | null;
+    planctl_files?: string | null;
   },
 ): number {
   const ts = overrides.ts ?? tsCounter++;
@@ -93,6 +94,10 @@ function insertEvent(
     // these explicitly via the overrides.
     bash_mutation_kind: overrides.bash_mutation_kind ?? null,
     bash_mutation_targets: overrides.bash_mutation_targets ?? null,
+    // Schema v46 / fn-666: planctl_files sparse JSON-array column carrying
+    // the envelope's repo-relative `files` array. NULL on every non-planctl
+    // event; planctl-mint tests pass this explicitly via overrides.
+    planctl_files: overrides.planctl_files ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -101,8 +106,8 @@ function insertEvent(
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
-       bash_mutation_kind, bash_mutation_targets
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       bash_mutation_kind, bash_mutation_targets, planctl_files
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -132,6 +137,7 @@ function insertEvent(
       row.planctl_queue_jump,
       row.bash_mutation_kind,
       row.bash_mutation_targets,
+      row.planctl_files,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -8424,8 +8430,36 @@ function planctlEvent(args: {
   // (every one written before v30) keep their old shape; new tests opt in by
   // passing `queueJump: true` to drive the `/plan:queue` projection path.
   queueJump?: boolean;
+  // Schema v46 / fn-666: optional repo-relative `files[]` to lift into
+  // `events.planctl_files` AND inline into the envelope's `state_repo`
+  // payload (so the reducer's mint can read `state_repo` from event.data).
+  // Defaults `undefined` — existing tests keep their old null-on-planctl
+  // shape and the mint becomes a no-op for them.
+  files?: string[];
+  stateRepo?: string;
   ts?: number;
 }): number {
+  // When mint-test args (`files` + `stateRepo`) are passed, also inline the
+  // canonical envelope `{tool_response:{stdout:JSON({planctl_invocation:
+  // {state_repo, files, op, target, ...}})}}` into `data` so the reducer's
+  // `extractPlanctlStateRepo` can lift `state_repo` at fold time. Existing
+  // tests pass neither and get the default empty `data: '{}'` (mint no-ops).
+  const data =
+    args.files != null && args.stateRepo != null
+      ? JSON.stringify({
+          tool_response: {
+            stdout: JSON.stringify({
+              planctl_invocation: {
+                op: args.op,
+                target: args.target,
+                state_repo: args.stateRepo,
+                files: args.files,
+                subject: args.subjectPresent ? "x" : null,
+              },
+            }),
+          },
+        })
+      : undefined;
   return insertEvent({
     hook_event: "PostToolUse",
     session_id: args.sessionId,
@@ -8437,6 +8471,8 @@ function planctlEvent(args: {
     planctl_task_id: args.taskId ?? null,
     planctl_subject_present: args.subjectPresent ? 1 : 0,
     planctl_queue_jump: args.queueJump ? 1 : 0,
+    planctl_files: args.files != null ? JSON.stringify(args.files) : null,
+    data,
   });
 }
 
@@ -12732,13 +12768,13 @@ test("DispatchFailed UPSERTs a new dispatch_failures row and advances the cursor
     "fn-661-server-side-autopilot-reconciler.2",
   );
   expect(row).not.toBeNull();
-  expect(row!.verb).toBe("plan-plan");
-  expect(row!.id).toBe("fn-661-server-side-autopilot-reconciler.2");
-  expect(row!.reason).toBe("confirm_timeout");
-  expect(row!.dir).toBe("/Users/mike/code/keeper");
-  expect(row!.ts).toBe(1_700_000_000);
-  expect(row!.last_event_id).toBe(eventId);
-  expect(row!.created_at).toBe(1_700_000_000);
+  expect(row?.verb).toBe("plan-plan");
+  expect(row?.id).toBe("fn-661-server-side-autopilot-reconciler.2");
+  expect(row?.reason).toBe("confirm_timeout");
+  expect(row?.dir).toBe("/Users/mike/code/keeper");
+  expect(row?.ts).toBe(1_700_000_000);
+  expect(row?.last_event_id).toBe(eventId);
+  expect(row?.created_at).toBe(1_700_000_000);
   expect(getCursor()).toBe(eventId);
 });
 
@@ -12753,7 +12789,7 @@ test("DispatchFailed UPSERT preserves created_at but updates reason / dir / ts /
   drainAll();
   const before = getDispatchFailure("plan-plan", "fn-X.1");
   expect(before).not.toBeNull();
-  expect(before!.created_at).toBe(1_700_000_000);
+  expect(before?.created_at).toBe(1_700_000_000);
 
   // A second DispatchFailed for the same (verb, id) — different reason,
   // different dir, later ts. The row must UPDATE in place, preserving
@@ -12768,13 +12804,13 @@ test("DispatchFailed UPSERT preserves created_at but updates reason / dir / ts /
   drainAll();
   const after = getDispatchFailure("plan-plan", "fn-X.1");
   expect(after).not.toBeNull();
-  expect(after!.reason).toBe("launch_failed");
-  expect(after!.dir).toBe("/repo-b");
-  expect(after!.ts).toBe(1_700_000_500);
-  expect(after!.last_event_id).toBe(secondId);
+  expect(after?.reason).toBe("launch_failed");
+  expect(after?.dir).toBe("/repo-b");
+  expect(after?.ts).toBe(1_700_000_500);
+  expect(after?.last_event_id).toBe(secondId);
   // Critical: created_at PRESERVED (not overwritten to 1_700_000_500).
-  expect(after!.created_at).toBe(1_700_000_000);
-  expect(after!.last_event_id).toBeGreaterThan(firstId);
+  expect(after?.created_at).toBe(1_700_000_000);
+  expect(after?.last_event_id).toBeGreaterThan(firstId);
 });
 
 test("DispatchFailed with a null/missing dir folds dir to NULL", () => {
@@ -12782,7 +12818,7 @@ test("DispatchFailed with a null/missing dir folds dir to NULL", () => {
   drainAll();
   const row = getDispatchFailure("plan-plan", "fn-Y.1");
   expect(row).not.toBeNull();
-  expect(row!.dir).toBeNull();
+  expect(row?.dir).toBeNull();
 });
 
 test("DispatchCleared deletes the (verb, id) row and advances the cursor", () => {
@@ -12890,4 +12926,450 @@ test("zero-event projection: a fresh DB has zero dispatch_failures rows", () => 
     }
   ).n;
   expect(count).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// Schema v46 / fn-666 — planctl-file attribution mint
+// ---------------------------------------------------------------------------
+
+test("planctl mint: scaffold envelope mints source='planctl' file_attributions for every named file", () => {
+  // A planctl scaffold envelope carries a `files[]` of the JSON/spec paths
+  // planctl wrote. The reducer's mint fold lands one file_attributions row
+  // per path, keyed under (state_repo, session, path), source='planctl',
+  // last_mutation_at=event.ts.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-mint" });
+  const eventId = planctlEvent({
+    sessionId: "sess-mint",
+    op: "scaffold",
+    target: "fn-1-foo",
+    epicId: "fn-1-foo",
+    subjectPresent: true,
+    stateRepo: "/repo-mint",
+    files: [
+      ".planctl/epics/fn-1-foo.json",
+      ".planctl/meta.json",
+      ".planctl/specs/fn-1-foo.md",
+      ".planctl/tasks/fn-1-foo.1.json",
+    ],
+    ts: 555,
+  });
+  drainAll();
+  const rows = db
+    .query(
+      `SELECT file_path, source, op, last_mutation_at, last_event_id
+         FROM file_attributions
+        WHERE project_dir = ? AND session_id = ?
+        ORDER BY file_path`,
+    )
+    .all("/repo-mint", "sess-mint") as Array<{
+    file_path: string;
+    source: string;
+    op: string;
+    last_mutation_at: number;
+    last_event_id: number;
+  }>;
+  expect(rows.length).toBe(4);
+  for (const r of rows) {
+    expect(r.source).toBe("planctl");
+    expect(r.op).toBe("scaffold");
+    expect(r.last_mutation_at).toBe(555);
+    expect(r.last_event_id).toBe(eventId);
+  }
+  expect(rows.map((r) => r.file_path)).toEqual([
+    ".planctl/epics/fn-1-foo.json",
+    ".planctl/meta.json",
+    ".planctl/specs/fn-1-foo.md",
+    ".planctl/tasks/fn-1-foo.1.json",
+  ]);
+});
+
+test("planctl mint: null planctl_files (read-only verb) mints no rows", () => {
+  // A read-only verb (`planctl epics`) writes no files — the envelope's
+  // `files` field is null, the deriver lifts to null, the mint is a no-op.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-readonly" });
+  planctlEvent({
+    sessionId: "sess-readonly",
+    op: "epics",
+    target: null,
+    epicId: null,
+    subjectPresent: false,
+    // No files / stateRepo passed → planctl_files=null, data='{}'.
+  });
+  drainAll();
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM file_attributions").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+});
+
+test("planctl mint: empty planctl_files array mints no rows (defensive)", () => {
+  // Should never happen at hook write time (the deriver folds empty to
+  // null), but a backfill bug could theoretically write `[]` — the
+  // reducer's `length > 0` guard catches it.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-empty" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    session_id: "sess-empty",
+    tool_name: "Bash",
+    planctl_op: "scaffold",
+    planctl_target: "fn-1-foo",
+    planctl_epic_id: "fn-1-foo",
+    planctl_subject_present: 1,
+    planctl_queue_jump: 0,
+    planctl_files: "[]",
+    data: JSON.stringify({
+      tool_response: {
+        stdout: JSON.stringify({
+          planctl_invocation: {
+            op: "scaffold",
+            target: "fn-1-foo",
+            state_repo: "/repo-empty",
+          },
+        }),
+      },
+    }),
+  });
+  drainAll();
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM file_attributions").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+});
+
+test("planctl mint: missing state_repo (corrupt envelope) mints no rows", () => {
+  // Defensive: a planctl event whose envelope payload doesn't carry
+  // state_repo (corrupt envelope or pre-fn-666 historical row) lands no
+  // attributions. The mint silently no-ops, cursor still advances.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-norepo" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    session_id: "sess-norepo",
+    tool_name: "Bash",
+    planctl_op: "scaffold",
+    planctl_target: "fn-1-foo",
+    planctl_epic_id: "fn-1-foo",
+    planctl_subject_present: 1,
+    planctl_queue_jump: 0,
+    planctl_files: JSON.stringify([".planctl/epics/fn-1-foo.json"]),
+    // data missing the state_repo field
+    data: JSON.stringify({
+      tool_response: {
+        stdout: JSON.stringify({
+          planctl_invocation: {
+            op: "scaffold",
+            target: "fn-1-foo",
+            // no state_repo
+          },
+        }),
+      },
+    }),
+  });
+  drainAll();
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM file_attributions").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+});
+
+test("planctl mint: malformed event.data folds to no-op (safe value invariant)", () => {
+  // CLAUDE.md "a malformed `data` blob folds to a safe value" — the mint
+  // catches the JSON.parse exception, falls to null state_repo, no-ops.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-garbage" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    session_id: "sess-garbage",
+    tool_name: "Bash",
+    planctl_op: "scaffold",
+    planctl_target: "fn-1-foo",
+    planctl_epic_id: "fn-1-foo",
+    planctl_subject_present: 1,
+    planctl_queue_jump: 0,
+    planctl_files: JSON.stringify([".planctl/epics/fn-1-foo.json"]),
+    data: "{this is not valid json",
+  });
+  drainAll();
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM file_attributions").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+});
+
+test("planctl mint: malformed planctl_files JSON folds to no-op", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-badjson" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    session_id: "sess-badjson",
+    tool_name: "Bash",
+    planctl_op: "scaffold",
+    planctl_target: "fn-1-foo",
+    planctl_epic_id: "fn-1-foo",
+    planctl_subject_present: 1,
+    planctl_queue_jump: 0,
+    planctl_files: "not valid json",
+    data: JSON.stringify({
+      tool_response: {
+        stdout: JSON.stringify({
+          planctl_invocation: { op: "scaffold", state_repo: "/repo" },
+        }),
+      },
+    }),
+  });
+  drainAll();
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM file_attributions").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+});
+
+test("planctl mint: absolute path in files[] is filtered out", () => {
+  // Defensive: planctl emits repo-relative paths, but a corrupt envelope
+  // might carry an absolute path. The mint skips it (would never match the
+  // dirty_files[].path tuple downstream, would strand as an orphan
+  // attribution forever).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-abs" });
+  planctlEvent({
+    sessionId: "sess-abs",
+    op: "scaffold",
+    target: "fn-1-foo",
+    epicId: "fn-1-foo",
+    subjectPresent: true,
+    stateRepo: "/repo-abs",
+    files: [
+      "/abs/path/spec.md", // skipped
+      ".planctl/epics/fn-1-foo.json", // minted
+    ],
+  });
+  drainAll();
+  const rows = db
+    .query("SELECT file_path FROM file_attributions ORDER BY file_path")
+    .all() as Array<{ file_path: string }>;
+  expect(rows.map((r) => r.file_path)).toEqual([
+    ".planctl/epics/fn-1-foo.json",
+  ]);
+});
+
+test("planctl mint: path with `..` traversal is filtered out (defensive)", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-trav" });
+  planctlEvent({
+    sessionId: "sess-trav",
+    op: "scaffold",
+    target: "fn-1-foo",
+    epicId: "fn-1-foo",
+    subjectPresent: true,
+    stateRepo: "/repo-trav",
+    files: ["../outside.md", ".planctl/specs/fn-1-foo.md"],
+  });
+  drainAll();
+  const rows = db
+    .query("SELECT file_path FROM file_attributions ORDER BY file_path")
+    .all() as Array<{ file_path: string }>;
+  expect(rows.map((r) => r.file_path)).toEqual([".planctl/specs/fn-1-foo.md"]);
+});
+
+test("planctl mint: GitSnapshot following a mint renders the planctl-source attribution (not orphan)", () => {
+  // The end-to-end orphan-fix proof. A planctl mint lands the
+  // file_attributions row; the next GitSnapshot on a dirty .planctl file
+  // surfaces it through pass-3 render (source='planctl' badge), NOT
+  // through the orphan_count rollup.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-snap" });
+  planctlEvent({
+    sessionId: "sess-snap",
+    op: "scaffold",
+    target: "fn-1-foo",
+    epicId: "fn-1-foo",
+    subjectPresent: true,
+    stateRepo: "/repo-snap",
+    files: [".planctl/epics/fn-1-foo.json"],
+    ts: 1000,
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo-snap",
+    cwd: "/repo-snap",
+    ts: 1001,
+    data: JSON.stringify({
+      project_dir: "/repo-snap",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: ".planctl/epics/fn-1-foo.json",
+          xy: "??",
+          mtime_ms: null,
+        },
+      ],
+    }),
+  });
+  drainAll();
+  // The git_status row's attributions array carries the planctl mint.
+  // orphaned_count is the project-wide rollup of zero-attribution files
+  // (the strict-mystery semantic) — with the mint live, it stays 0 on a
+  // .planctl file that's dirty.
+  const gs = db
+    .query(
+      "SELECT dirty_files, orphaned_count FROM git_status WHERE project_dir = ?",
+    )
+    .get("/repo-snap") as {
+    dirty_files: string;
+    orphaned_count: number;
+  };
+  expect(gs.orphaned_count).toBe(0);
+  const dirty = JSON.parse(gs.dirty_files) as Array<{
+    path: string;
+    attributions: Array<{ session_id: string; source: string; op: string }>;
+  }>;
+  expect(dirty.length).toBe(1);
+  expect(dirty[0].attributions.length).toBe(1);
+  expect(dirty[0].attributions[0]).toEqual(
+    expect.objectContaining({
+      session_id: "sess-snap",
+      source: "planctl",
+      op: "scaffold",
+    }),
+  );
+});
+
+test("planctl mint: a planctl file does NOT also get an inferred attribution (guard widened)", () => {
+  // The pass-2 inferred-guard widened to `IN ('tool','bash','planctl')`
+  // so a planctl-attributed file is NOT also bracketed against this
+  // session's Bash windows. Without the widening, the file would receive
+  // TWO active attribution rows — `planctl` AND `inferred` — which would
+  // mislabel the file's authorship.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-both", ts: 500 });
+  // Pre-bracket Bash window so inference WOULD attribute if the guard
+  // missed.
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-both",
+    cwd: "/repo-both",
+    ts: 900,
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-both",
+    cwd: "/repo-both",
+    ts: 1100,
+  });
+  // Planctl event INSIDE the window, mints the file_attributions row.
+  planctlEvent({
+    sessionId: "sess-both",
+    op: "scaffold",
+    target: "fn-1-foo",
+    epicId: "fn-1-foo",
+    subjectPresent: true,
+    stateRepo: "/repo-both",
+    files: [".planctl/epics/fn-1-foo.json"],
+    ts: 1000,
+  });
+  // GitSnapshot triggers pass-2 inference; the planctl row should suppress
+  // the inferred attribution on this file.
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo-both",
+    cwd: "/repo-both",
+    ts: 1200,
+    data: JSON.stringify({
+      project_dir: "/repo-both",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: ".planctl/epics/fn-1-foo.json",
+          xy: "??",
+          mtime_ms: 1050 * 1000, // inside the bash window
+        },
+      ],
+    }),
+  });
+  drainAll();
+  // Only ONE row, source='planctl' — NOT planctl + inferred.
+  const rows = db
+    .query(
+      `SELECT source, op FROM file_attributions
+        WHERE project_dir = ? AND session_id = ?
+          AND file_path = ?
+        ORDER BY source`,
+    )
+    .all("/repo-both", "sess-both", ".planctl/epics/fn-1-foo.json") as Array<{
+    source: string;
+    op: string;
+  }>;
+  expect(rows).toEqual([{ source: "planctl", op: "scaffold" }]);
+});
+
+test("planctl mint: re-fold determinism — cursor=0 reproduces byte-identical file_attributions", () => {
+  // Drive a planctl-op + snapshot + commit sequence, capture the
+  // projection, rewind cursor + wipe table, re-fold from scratch, assert
+  // byte-identical rows. The re-fold determinism invariant for the new
+  // mint path.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-rd", ts: 100 });
+  planctlEvent({
+    sessionId: "sess-rd",
+    op: "scaffold",
+    target: "fn-1-foo",
+    epicId: "fn-1-foo",
+    subjectPresent: true,
+    stateRepo: "/repo-rd",
+    files: [".planctl/epics/fn-1-foo.json", ".planctl/specs/fn-1-foo.md"],
+    ts: 200,
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo-rd",
+    cwd: "/repo-rd",
+    ts: 300,
+    data: JSON.stringify({
+      project_dir: "/repo-rd",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        { path: ".planctl/epics/fn-1-foo.json", xy: "??", mtime_ms: null },
+        { path: ".planctl/specs/fn-1-foo.md", xy: "??", mtime_ms: null },
+      ],
+    }),
+  });
+  drainAll();
+  const before = db
+    .query(
+      `SELECT project_dir, session_id, file_path, last_mutation_at,
+              last_commit_at, op, source, last_event_id, updated_at
+         FROM file_attributions ORDER BY project_dir, session_id, file_path`,
+    )
+    .all();
+  // Rewind cursor + wipe projection + re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM file_attributions");
+  drainAll();
+  const after = db
+    .query(
+      `SELECT project_dir, session_id, file_path, last_mutation_at,
+              last_commit_at, op, source, last_event_id, updated_at
+         FROM file_attributions ORDER BY project_dir, session_id, file_path`,
+    )
+    .all();
+  expect(after).toEqual(before);
 });

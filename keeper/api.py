@@ -92,10 +92,21 @@ from pathlib import Path
 # ``worktree_oid`` on the discharge gate (a chmod-only dirty file with
 # equal blob oid but differing mode stays attributed) — keeper-py does
 # not project ``worktree_mode`` for the same reason as ``worktree_oid``,
-# so the bump is whitelist-only with no reader logic change.
+# so the bump is whitelist-only with no reader logic change; v46 (fn-666
+# planctl-file attribution) widens the ``file_attributions.source`` CHECK
+# enum to include ``'planctl'`` (a row-preserving table rebuild) and
+# adds the additive nullable ``events.planctl_files TEXT`` column lifted
+# from the envelope's ``files`` array by ``extractPlanctlInvocation`` —
+# the reducer's planctl_op fold mints ``source='planctl'`` rows for
+# every named path so ``.planctl`` JSONs + specs no longer orphan.
+# keeper-py reads ``file_attributions`` only for the
+# ``session_id`` / ``file_path`` / ``last_mutation_at`` /
+# ``last_commit_at`` tuple — it never reads ``source`` or
+# ``planctl_files`` — so the bump is whitelist-only with no reader
+# logic change.
 # Bump this set when a keeper schema change alters those tables.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
-    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45}
+    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46}
 )
 
 

@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 45;
+export const SCHEMA_VERSION = 46;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -380,7 +380,8 @@ CREATE TABLE IF NOT EXISTS events (
     config_dir TEXT,
     planctl_queue_jump INTEGER,
     bash_mutation_kind TEXT,
-    bash_mutation_targets TEXT
+    bash_mutation_targets TEXT,
+    planctl_files TEXT
 )
 `;
 
@@ -1167,7 +1168,7 @@ CREATE TABLE IF NOT EXISTS file_attributions (
     last_mutation_at REAL NOT NULL,
     last_commit_at REAL,
     op TEXT NOT NULL,
-    source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred')),
+    source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred','planctl')),
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0,
     worktree_oid TEXT,
@@ -4380,6 +4381,181 @@ function migrate(db: Database): void {
     // 45 in the same change).
     addColumnIfMissing(db, "file_attributions", "worktree_mode", "TEXT");
 
+    // v45→v46: fn-666 — attribute planctl file writes. Three coordinated
+    // schema-level changes plus a backfill + cursor rewind:
+    //
+    //   1. Additive nullable `events.planctl_files TEXT` column carrying the
+    //      JSON-encoded repo-relative paths planctl wrote during a single op
+    //      (every JSON / spec under `.planctl/`). Lifted defensively by
+    //      `extractPlanctlInvocation` at hook write time (Array.isArray +
+    //      string filter + runaway cap; NULL on miss). Mirrors
+    //      `bash_mutation_targets`'s sparse-column pattern.
+    //   2. `file_attributions.source` CHECK widens to include `'planctl'`.
+    //      SQLite cannot ALTER a CHECK in place, so this is a row-preserving
+    //      TABLE REBUILD: create the new shape, INSERT…SELECT every existing
+    //      row byte-identical, DROP the old, RENAME the new. PRESERVES every
+    //      existing row's column tuple, primary key, indexes (re-created
+    //      against the new table via `CREATE_FILE_ATTRIBUTIONS_INDEXES`).
+    //   3. Backfill `events.planctl_files` over historical
+    //      `PostToolUse:Bash` planctl events from the stored envelope (same
+    //      pure deriver the hook calls steady-state, so re-fold determinism
+    //      is mechanical). Then cursor-rewind + DELETE the four projection
+    //      tables so the next boot drain re-folds the healed log under the
+    //      new mint path (the new reducer rule wouldn't otherwise re-attribute
+    //      historical planctl events). Mirrors fn-648's v38→v39 git-rm/mv
+    //      backfill + rewind shape exactly.
+    //
+    // The CHECK rebuild MUST run BEFORE the rewind (which DELETEs the table,
+    // not DROPs it — DELETE preserves the new CHECK shape) AND before the
+    // post-migrate boot drain re-folds (which writes `source='planctl'`
+    // rows that the OLD CHECK would reject). Three version-guarded steps so
+    // a re-open of an already-migrated v46+ DB skips them all (idempotence).
+    //
+    // No keeper-py reader change: keeper-py reads `file_attributions` only
+    // for the `session_id` / `file_path` / `last_mutation_at` /
+    // `last_commit_at` tuple — neither `planctl_files` (on events) nor the
+    // widened `source` enum changes that wire surface. The v46 bump is
+    // whitelist-only on the Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS`
+    // frozenset adds 46 in the same change — test/schema-version.test.ts
+    // enforces).
+    addColumnIfMissing(db, "events", "planctl_files", "TEXT");
+
+    // Read the stored version BEFORE any version-guarded step runs, so all
+    // three steps gate on the SAME pre-migrate value. We can't trust the
+    // pre-migrate guard the loop above used because that guard already
+    // raised the version (`INSERT INTO meta ... ON CONFLICT DO UPDATE`
+    // hasn't fired yet at this point — but the v44/v45 guards above used
+    // `storedVersionV39Backfill` reads, so following their precedent).
+    const storedVersionV46 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+
+    // Step 2: file_attributions CHECK rebuild. SQLite has no `ALTER TABLE …
+    // ALTER CONSTRAINT`, so the canonical pattern is create-new + copy +
+    // drop-old + rename. Row order in INSERT…SELECT is preserved
+    // byte-identical (we SELECT every column in CREATE order); a re-fold
+    // from cursor 0 would write the same rows again so the post-rebuild
+    // table converges with a from-scratch re-fold (the rewind below
+    // wipes the table anyway, so the copy is mostly a no-op in practice
+    // — but it MUST be byte-faithful on the chance the rewind ever
+    // gets removed). The indexes get re-created against the new table
+    // via the index DDL loop below — SQLite drops indexes when their
+    // base table is dropped.
+    if (storedVersionV46 < 46) {
+      // Use a temp name so the new table doesn't clash with the old one.
+      // Drop any leftover from an interrupted prior migration attempt
+      // first — defensive idempotence (a half-applied v45→v46 boot
+      // would leave the temp table dangling).
+      db.run("DROP TABLE IF EXISTS file_attributions_v46_tmp");
+      db.run(`
+        CREATE TABLE file_attributions_v46_tmp (
+            project_dir TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            last_mutation_at REAL NOT NULL,
+            last_commit_at REAL,
+            op TEXT NOT NULL,
+            source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred','planctl')),
+            last_event_id INTEGER,
+            updated_at REAL NOT NULL DEFAULT 0,
+            worktree_oid TEXT,
+            worktree_mode TEXT,
+            PRIMARY KEY (project_dir, session_id, file_path)
+        )
+      `);
+      // Byte-faithful copy. ORDER BY rowid to keep the physical-row order
+      // stable across the rebuild — re-fold determinism gates on row
+      // SET equality, not order, but matching the original order makes
+      // the migration easier to audit.
+      db.run(`
+        INSERT INTO file_attributions_v46_tmp
+            (project_dir, session_id, file_path, last_mutation_at,
+             last_commit_at, op, source, last_event_id, updated_at,
+             worktree_oid, worktree_mode)
+          SELECT project_dir, session_id, file_path, last_mutation_at,
+                 last_commit_at, op, source, last_event_id, updated_at,
+                 worktree_oid, worktree_mode
+            FROM file_attributions
+        ORDER BY rowid
+      `);
+      db.run("DROP TABLE file_attributions");
+      db.run(
+        "ALTER TABLE file_attributions_v46_tmp RENAME TO file_attributions",
+      );
+      // Re-create the indexes (SQLite drops indexes with their base table).
+      // Reads the same array the unconditional CREATE uses on fresh DBs so
+      // the migrated and fresh-v46 paths produce byte-identical schemas.
+      for (const sql of CREATE_FILE_ATTRIBUTIONS_INDEXES) {
+        db.run(sql);
+      }
+    }
+
+    // Step 3a: backfill `events.planctl_files` over historical planctl
+    // events. Mirrors v38→v39 git-rm/mv backfill shape: walk every
+    // `PostToolUse:Bash` row, JSON.parse the payload defensively, re-derive
+    // via the SHARED `extractPlanctlInvocation` deriver, UPDATE the new
+    // sparse column in place. The deriver returns `null` for non-planctl
+    // rows — we skip the UPDATE then (the column stays NULL).
+    if (storedVersionV46 < 46) {
+      const rows = db
+        .prepare(
+          `SELECT id, hook_event, tool_name, data FROM events
+             WHERE tool_name = 'Bash' AND hook_event = 'PostToolUse'`,
+        )
+        .all() as {
+        id: number;
+        hook_event: string;
+        tool_name: string | null;
+        data: string;
+      }[];
+      const updateStmt = db.prepare(
+        "UPDATE events SET planctl_files = ? WHERE id = ?",
+      );
+      for (const row of rows) {
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(row.data) as Record<string, unknown>;
+          if (typeof parsed !== "object" || parsed === null) {
+            continue;
+          }
+        } catch {
+          // Malformed historical payload — leave planctl_files NULL.
+          continue;
+        }
+        const inv = extractPlanctlInvocation(
+          row.hook_event,
+          row.tool_name,
+          parsed,
+        );
+        if (inv === null) continue;
+        // `files` is null when the deriver couldn't lift a non-empty
+        // string array. The UPDATE binds NULL in that case, matching
+        // the default — no need to clear; an UPDATE with NULL is a
+        // no-op on a NULL column. Keep the stmt run uniform.
+        const json = inv.files === null ? null : JSON.stringify(inv.files);
+        updateStmt.run(json, row.id);
+      }
+    }
+
+    // Step 3b: cursor-rewind + DELETE projection tables. The new mint
+    // path in the planctl_op fold seam (`syncPlanctlLinks` arm) wouldn't
+    // otherwise re-attribute historical planctl events — the rewind
+    // forces a from-scratch re-fold over the immutable (now-backfilled)
+    // event log so historical .planctl orphans heal. Mirrors v38→v39
+    // rewind block exactly.
+    if (storedVersionV46 < 46) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM git_status");
+      db.run("DELETE FROM file_attributions");
+      db.run("DELETE FROM subagent_invocations");
+    }
+
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(String(SCHEMA_VERSION));
@@ -4428,14 +4604,14 @@ function prepareStmts(db: Database): Stmts {
         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
         planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
         planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
-        bash_mutation_kind, bash_mutation_targets
+        bash_mutation_kind, bash_mutation_targets, planctl_files
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
         $subagent_agent_id, $spawn_name, $start_time, $slash_command, $skill_name,
         $planctl_op, $planctl_target, $planctl_epic_id, $planctl_task_id,
         $planctl_subject_present, $tool_use_id, $config_dir, $planctl_queue_jump,
-        $bash_mutation_kind, $bash_mutation_targets
+        $bash_mutation_kind, $bash_mutation_targets, $planctl_files
       )
     `),
     selectWorldRev: db.prepare(

@@ -293,6 +293,21 @@ export interface Event {
    * preserves the prior non-NULL projection.
    */
   config_dir: string | null;
+  /**
+   * Schema v46 / fn-666: JSON-encoded array of repo-relative paths planctl
+   * wrote during this op (the envelope's `files` array, lifted by
+   * `extractPlanctlInvocation` with `Array.isArray` + per-element string
+   * filter + size cap). NULL on every non-planctl-Bash event row AND on
+   * planctl rows whose envelope omitted `files`, carried a non-array, or
+   * filtered to zero strings. The reducer's planctl_op fold mints
+   * `source='planctl'` `file_attributions` rows under the envelope's
+   * `state_repo` (parsed in-fold from `event.data`) for every path in
+   * this array, so `.planctl/{epics,tasks}/*.json` and `.planctl/specs/*.md`
+   * no longer orphan after a planctl mutating call. NOT a wire-surface
+   * column — only the reducer reads it, the projection still surfaces the
+   * attribution via the existing `file_attributions` → `git_status` join.
+   */
+  planctl_files: string | null;
 }
 
 /**

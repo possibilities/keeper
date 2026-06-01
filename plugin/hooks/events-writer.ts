@@ -516,6 +516,16 @@ async function main(): Promise<void> {
   // so a re-fold from cursor=0 reproduces the column byte-identically.
   const planctlQueueJump =
     planctlInvocation === null ? null : planctlInvocation.queue_jump ? 1 : 0;
+  // v46 (fn-666): the envelope's repo-relative `files[]` array, JSON-encoded
+  // for the SQLite TEXT column. NULL when the deriver couldn't lift a
+  // non-empty string array (non-planctl events, read-only ops with `files:
+  // null`/`[]`, or runaway-size payloads). Mirrors `bash_mutation_targets`'s
+  // sparse JSON-or-NULL convention; the partial-index `WHERE planctl_files
+  // IS NOT NULL` predicate (when one is added) would stay selective.
+  const planctlFiles =
+    planctlInvocation?.files == null
+      ? null
+      : JSON.stringify(planctlInvocation.files);
 
   // v17: index the Anthropic tool_use_id correlator on every event payload
   // carrying it. Unlike `slashCommandFromPrompt` / `extractSkillName` /
@@ -609,6 +619,7 @@ async function main(): Promise<void> {
     $planctl_queue_jump: planctlQueueJump,
     $bash_mutation_kind: bashMutationKind,
     $bash_mutation_targets: bashMutationTargets,
+    $planctl_files: planctlFiles,
   };
 
   // Dead-letter on FINAL INSERT failure (fn-643 task .2). The closure

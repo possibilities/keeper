@@ -106,7 +106,7 @@ on close (NULL on rows that never observed a SubagentStop — `superseded`
 peers + lifecycle-swept `unknown` orphans)), `git` (per-worktree planctl-backed
 git status — branch, ahead/behind, and a file-centric `dirty_files` list where
 each entry carries a per-file `attributions[]` array with `source` badges
-(`tool` / `bash` / `inferred`) naming every session that mutated the file
+(`tool` / `bash` / `inferred` / `planctl`) naming every session that mutated the file
 since its last commit; a session is attributed iff it has mutated the file
 AND has not committed it more recently than its last mutation, so commit
 discharges attribution and a re-edit reinstates it; as of schema v45 /
@@ -621,7 +621,10 @@ collapses to plain stream output. Run any of them with
   per-session `attributions[]`, each rendered with a colored source
   badge (`tool` = direct Edit/Write/MultiEdit, `bash` = derived from a
   Bash mutation event, `inferred` = time-bracketed against the
-  session's Bash intervals); a single file can carry multiple
+  session's Bash intervals, `planctl` = lifted from a planctl-CLI
+  invocation envelope's `files[]` — so `.planctl/{epics,tasks}/*.json`
+  and `.planctl/specs/*.md` attribute to the session that ran
+  `planctl scaffold/done/approve/...`); a single file can carry multiple
   attribution rows when several live sessions edited it without an
   intervening commit, and the strict `orphan_files` bucket is rendered
   as a separate trailing block for dirty files with zero attribution). Uses `subscribeCollection` from `src/readiness-client.ts`
@@ -862,7 +865,28 @@ attribution claim. Symmetric across per-session and global discharge
 equal blob but differing mode is also caught — oid-equality alone would
 have wrongly discharged it. The four discharge READ predicates
 (passes 2 / 3 / 4) are byte-identical to pre-v45 — only the WRITE
-site changed. As of fn-656.1, the pass-4 fan-out persists ONLY
+site changed. As of schema v46 / fn-666, the planctl-CLI invocation
+envelope's `files[]` array (every `.planctl/{epics,tasks}/*.json` and
+`.planctl/specs/*.md` planctl wrote during the op) is lifted into a
+new sparse `events.planctl_files TEXT` column by `extractPlanctlInvocation`
+(Array.isArray + per-element string filter + runaway-size guard; NULL
+on miss / non-array / empty / oversized), and the reducer's
+`planctl_op != null` fold seam mints one `source='planctl'`
+`file_attributions` row per path under `project_dir = state_repo` (the
+absolute repo path, extracted in-fold from the stored envelope) +
+`event.session_id` + the repo-relative path + `event.ts` + the verb
+(`scaffold` / `done` / `approve` / …) as `op`. The
+`file_attributions.source` CHECK widens to include `'planctl'` via a
+row-preserving table rebuild; pass-2's inferred-guard widens to
+`source IN ('tool','bash','planctl')` so a planctl file does NOT also
+get a spurious inferred attribution; pass-3 renders `'planctl'` as a
+honest badge. Discharge flows through the SAME `foldCommit` path as
+`'tool'`/`'bash'`/`'inferred'` — a `chore(planctl)` commit clears
+the row via the same `last_commit_at` UPDATE; no per-source branch.
+Fixes the 559-orphan spike (`.planctl/{epics,tasks}/*.json` and
+`.planctl/specs/*.md` were strict-mystery orphans the instant they
+flashed dirty, since planctl writes them outside any Claude
+Write/Edit / bash mutation deriver match). As of fn-656.1, the pass-4 fan-out persists ONLY
 `dirty > 0` sessions into `git_status.jobs` (the clearing UPDATE +
 `syncIfPlanRef` still fire unconditionally for every session in the
 union — including ones leaving the dirty set via `priorSessions` — so a
@@ -1253,7 +1277,7 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.sort_path ASC, task_id ASC LIMIT 10"
 
-# Git projection — one row per planctl-backed worktree. dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, worktree_oid, worktree_mode, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred and commit-discharge timestamps; schema v44/v45 — fn-664 — adds the producer-frozen worktree_oid + worktree_mode so foldCommit can gate discharge on content equality):
+# Git projection — one row per planctl-backed worktree. dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, worktree_oid, worktree_mode, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred|planctl (planctl added in schema v46 / fn-666 — minted by the reducer's planctl_op fold from the envelope's files[] array so .planctl/ JSONs+specs no longer orphan) and commit-discharge timestamps; schema v44/v45 — fn-664 — adds the producer-frozen worktree_oid + worktree_mode so foldCommit can gate discharge on content equality):
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT project_dir, branch, ahead, behind, json_extract(dirty_files, '\$[0]') AS first_dirty FROM git_status LIMIT 5"
 

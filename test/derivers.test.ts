@@ -172,6 +172,11 @@ interface Envelope {
   // check with non-boolean values too (the string `"true"`, `1`, an object,
   // etc., all of which MUST fold to `false`).
   queue_jump?: unknown;
+  // Schema v46 / fn-666: the repo-relative `files` array planctl emits on
+  // every mutating verb. Optional + arbitrary type (`unknown`) so tests can
+  // drive the deriver's `Array.isArray` + per-element-string filter against
+  // non-array, non-string-element, and size-cap edges.
+  files?: unknown;
 }
 
 /**
@@ -323,6 +328,7 @@ test("extractPlanctlInvocation parses epic-create envelope with epic ref", () =>
     task_id: null,
     subject_present: true,
     queue_jump: false,
+    files: null,
   });
 });
 
@@ -344,6 +350,7 @@ test("extractPlanctlInvocation parses scaffold envelope with epic ref", () => {
     task_id: null,
     subject_present: true,
     queue_jump: false,
+    files: null,
   });
 });
 
@@ -362,6 +369,7 @@ test("extractPlanctlInvocation parses epic-close envelope with epic ref", () => 
     task_id: null,
     subject_present: false,
     queue_jump: false,
+    files: null,
   });
 });
 
@@ -378,6 +386,7 @@ test("extractPlanctlInvocation parses task-set-tier envelope into epic_id + task
     task_id: "fn-575-foo.3",
     subject_present: true,
     queue_jump: false,
+    files: null,
   });
 });
 
@@ -394,6 +403,7 @@ test("extractPlanctlInvocation parses envelope with null target (bare-verb mutat
     task_id: null,
     subject_present: false,
     queue_jump: false,
+    files: null,
   });
 });
 
@@ -411,6 +421,7 @@ test("extractPlanctlInvocation treats non-ref target as parseable but unresolved
     task_id: null,
     subject_present: true,
     queue_jump: false,
+    files: null,
   });
 });
 
@@ -463,6 +474,7 @@ test("extractPlanctlInvocation lifts queue_jump:true from the envelope (schema v
     task_id: null,
     subject_present: true,
     queue_jump: true,
+    files: null,
   });
 });
 
@@ -590,6 +602,180 @@ test("extractPlanctlInvocation never throws on arbitrary garbage", () => {
         "PostToolUse",
         "Bash",
         data as Record<string, unknown>,
+      ),
+    ).not.toThrow();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// extractPlanctlInvocation — schema v46 / fn-666: `files` lift
+// ---------------------------------------------------------------------------
+
+test("extractPlanctlInvocation lifts non-empty files array from the envelope (schema v46)", () => {
+  // Canonical scaffold envelope shape — `files` carries repo-relative
+  // paths planctl wrote (every .planctl/{epics,tasks,specs}/...).
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({
+      op: "scaffold",
+      target: "fn-1-foo",
+      subject: "title",
+      files: [
+        ".planctl/epics/fn-1-foo.json",
+        ".planctl/meta.json",
+        ".planctl/specs/fn-1-foo.md",
+        ".planctl/tasks/fn-1-foo.1.json",
+      ],
+    }),
+  );
+  expect(got?.files).toEqual([
+    ".planctl/epics/fn-1-foo.json",
+    ".planctl/meta.json",
+    ".planctl/specs/fn-1-foo.md",
+    ".planctl/tasks/fn-1-foo.1.json",
+  ]);
+});
+
+test("extractPlanctlInvocation folds an absent files key to null", () => {
+  // Read-only verbs and legacy planctl envelopes omit the field entirely.
+  // The deriver folds the absence to `null` so the `events.planctl_files`
+  // column's partial-index `WHERE planctl_files IS NOT NULL` stays
+  // selective. Re-fold determinism: every legacy event reproduces null.
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({ op: "epics", target: null, subject: null }),
+  );
+  expect(got?.files).toBeNull();
+});
+
+test("extractPlanctlInvocation folds an explicit null files field to null", () => {
+  // The planctl CLI's emit() writes `files: null` on read-only ops
+  // (`epics`, `cat`, etc.). Same null-fold path as the absent-key test.
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({ op: "epics", target: null, subject: null, files: null }),
+  );
+  expect(got?.files).toBeNull();
+});
+
+test("extractPlanctlInvocation folds an empty files array to null", () => {
+  // An empty `files: []` is functionally equivalent to absent — no mint
+  // would land. We collapse it to `null` so the column shape stays
+  // sparse + the partial index stays selective.
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({ op: "scaffold", target: "fn-1-foo", subject: "x", files: [] }),
+  );
+  expect(got?.files).toBeNull();
+});
+
+test("extractPlanctlInvocation filters non-string elements out of files", () => {
+  // Defensive — `extractPlanctlInvocation` mirrors `bash_mutation_targets`'s
+  // Array.isArray + per-element string filter. Mixed-type entries (a buggy
+  // planctl) are dropped; valid strings ride through. If filtering empties
+  // the array entirely, the result folds to `null` (no mint).
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({
+      op: "scaffold",
+      target: "fn-1-foo",
+      subject: "x",
+      files: [
+        ".planctl/epics/fn-1-foo.json",
+        42,
+        null,
+        { x: 1 },
+        ".planctl/meta.json",
+      ],
+    }),
+  );
+  expect(got?.files).toEqual([
+    ".planctl/epics/fn-1-foo.json",
+    ".planctl/meta.json",
+  ]);
+});
+
+test("extractPlanctlInvocation folds an all-non-string files array to null", () => {
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({
+      op: "scaffold",
+      target: "fn-1-foo",
+      subject: "x",
+      files: [42, null, { x: 1 }],
+    }),
+  );
+  expect(got?.files).toBeNull();
+});
+
+test("extractPlanctlInvocation folds a non-array files value to null (defensive)", () => {
+  // A corrupt envelope might carry a string / object / number for `files`.
+  // The deriver folds these to `null` (matching every other shape-mismatch
+  // path) — never throws, never coerces.
+  const stringFiles = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({
+      op: "scaffold",
+      target: "fn-1-foo",
+      subject: "x",
+      files: ".planctl/epics/fn-1-foo.json",
+    }),
+  );
+  expect(stringFiles?.files).toBeNull();
+  const objectFiles = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({
+      op: "scaffold",
+      target: "fn-1-foo",
+      subject: "x",
+      files: { a: 1 },
+    }),
+  );
+  expect(objectFiles?.files).toBeNull();
+});
+
+test("extractPlanctlInvocation folds an oversized files array to null (runaway guard)", () => {
+  // Generous cap — a real scaffold writes <20 paths. An array way past the
+  // cap is almost certainly a corrupt envelope, and storing it would burn
+  // disk space + parse budget downstream. The deriver folds the whole lift
+  // to `null` rather than truncating (truncation is silently lossy).
+  const oversized = Array.from({ length: 1000 }, (_, i) => `f${i}.txt`);
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post({
+      op: "scaffold",
+      target: "fn-1-foo",
+      subject: "x",
+      files: oversized,
+    }),
+  );
+  expect(got?.files).toBeNull();
+});
+
+test("extractPlanctlInvocation files lift never throws on arbitrary garbage", () => {
+  // Mirrors the existing exit-0-contract test — the new files branch must
+  // also be unconditionally defensive.
+  const garbageFiles: unknown[] = [
+    Symbol("x"),
+    new Map(),
+    new Set([1, 2]),
+    () => "fn",
+  ];
+  for (const files of garbageFiles) {
+    expect(() =>
+      extractPlanctlInvocation(
+        "PostToolUse",
+        "Bash",
+        post({ op: "scaffold", target: "fn-1-foo", subject: "x", files }),
       ),
     ).not.toThrow();
   }
