@@ -720,6 +720,7 @@ test("renderJobLinkLines: multiple entries iterate in provided order (projection
 // imported) so a regression that flips a bucket's color is caught — the
 // test fails until the change is intentional in both places.
 const ACTIVE = "\x1b[96m";
+const BLUE = "\x1b[94m";
 const SUCCESS = "\x1b[32m";
 const ERROR = "\x1b[31m";
 const WARN = "\x1b[33m";
@@ -733,7 +734,7 @@ test("colorizePillsInLine: unknown tokens pass through verbatim", () => {
 });
 
 test("colorizePillsInLine: each bucket colors its representative tokens", () => {
-  expect(colorizePillsInLine("[running]")).toBe(`[${ACTIVE}running${RESET}]`);
+  expect(colorizePillsInLine("[running]")).toBe(`[${BLUE}running${RESET}]`);
   expect(colorizePillsInLine("[in_progress]")).toBe(
     `[${ACTIVE}in_progress${RESET}]`,
   );
@@ -831,22 +832,22 @@ test("colorizePillsInLine: stopped + failed + awaiting stack colors independentl
 
 // fn-638.4: the `running:*` prefix fallback colors the three "fresh
 // in-flight" RunningReason kinds (`job-running`, `sub-agent-running`,
-// `planner-running`) as `active` (cyan) — same bucket as the bare
+// `planner-running`) as `blue` (bright blue) — same bucket as the bare
 // `[running]` exact match — while the more-specific
 // `running:sub-agent-stale` branch above the fallback routes the
 // possibly-stuck orphan variant to `warn` (yellow). Asserts the
 // distinct color so a regression that drops the more-specific branch
 // would surface here instead of silently re-collapsing stale into
-// cyan.
-test("colorizePillsInLine: running:<kind> fresh variants take the active bucket via prefix fallback", () => {
+// blue.
+test("colorizePillsInLine: running:<kind> fresh variants take the blue bucket via prefix fallback", () => {
   expect(colorizePillsInLine("[running:job-running]")).toBe(
-    `[${ACTIVE}running:job-running${RESET}]`,
+    `[${BLUE}running:job-running${RESET}]`,
   );
   expect(colorizePillsInLine("[running:sub-agent-running]")).toBe(
-    `[${ACTIVE}running:sub-agent-running${RESET}]`,
+    `[${BLUE}running:sub-agent-running${RESET}]`,
   );
   expect(colorizePillsInLine("[running:planner-running]")).toBe(
-    `[${ACTIVE}running:planner-running${RESET}]`,
+    `[${BLUE}running:planner-running${RESET}]`,
   );
 });
 

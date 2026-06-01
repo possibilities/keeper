@@ -153,6 +153,9 @@ export function inputRequestPillSeg(at: unknown, kind: unknown): string {
  *
  * Bucket rationale:
  *   - active  (bright cyan): in motion right now, look here
+ *   - blue    (bright blue): a `running` work pill specifically (distinct
+ *                            from the cyan `active` family so live worker /
+ *                            sub-agent / planner motion reads as its own hue)
  *   - success (green):       positive resolution
  *   - error   (red):         failure / needs intervention
  *   - warn    (yellow):      blocked / something is in the way
@@ -168,6 +171,7 @@ export function inputRequestPillSeg(at: unknown, kind: unknown): string {
  */
 const SGR = {
   active: "\x1b[96m",
+  blue: "\x1b[94m",
   success: "\x1b[32m",
   error: "\x1b[31m",
   warn: "\x1b[33m",
@@ -178,7 +182,7 @@ const SGR = {
 type PillBucket = Exclude<keyof typeof SGR, "reset">;
 
 const PILL_COLORS: Record<string, PillBucket> = {
-  running: "active",
+  running: "blue",
   in_progress: "active",
   working: "active",
   // Schema v29: the `[slotted-after-closer]` epic-header pill (rendered
@@ -222,8 +226,8 @@ const PILL_COLORS: Record<string, PillBucket> = {
  * interactive tool — color the same as a bare `[blocked]`) AND to the
  * `warn` bucket for any `task-repo:*` payload (so the
  * `[task-repo:<basename>]` divergence pill minted by `taskRepoPillSeg`
- * colors the same as `[blocked]`) AND to the `active` (cyan) bucket for
- * any `running:*` payload (so the `[running:<kind>]` motion pills minted
+ * colors the same as `[blocked]`) AND to the `blue` (bright blue) bucket
+ * for any `running:*` payload (so the `[running:<kind>]` motion pills minted
  * by `formatPill` for the four reasons split out of `BlockReason` —
  * `job-running`, `sub-agent-running`, `planner-running`, and (fn-638.4)
  * `sub-agent-stale` — color the same as a bare `[running]`, EXCEPT the
@@ -286,7 +290,7 @@ export function colorizePillsInLine(line: string): string {
       bucket = "warn";
     }
     if (bucket === undefined && inner.startsWith("running:")) {
-      bucket = "active";
+      bucket = "blue";
     }
     if (bucket === undefined) {
       return match;
