@@ -84,11 +84,11 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   version-guarded. The daemon is the SOLE migrator; the hook opens with
   `{ migrate: false }`. **When you bump `SCHEMA_VERSION`, add the new version to
   keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset in `keeper/api.py` in the
-  SAME change** — the Python reader (used by `jobctl commit-work`) is a hard
-  whitelist, not a floor/ceiling, and gates loud on any unrecognized version,
-  failing *every* `commit-work` on the host until updated. Additive bumps
-  keeper-py never reads still must be listed; `test/schema-version.test.ts`
-  enforces it.
+  SAME change** — the Python reader (used by `jobctl commit-work` and
+  `planctl render-approve-context`) is a hard whitelist, not a floor/ceiling,
+  and gates loud on any unrecognized version, failing *every* `commit-work`
+  on the host until updated. Additive bumps keeper-py never reads still must
+  be listed; `test/schema-version.test.ts` enforces it.
 - **Commit discharge is content-aware (schema v45 / fn-664.2).** The
   `GitSnapshot` payload's `dirty_files[]` carries per-file
   `{worktree_oid, index_oid, worktree_mode}` (the filter-correct

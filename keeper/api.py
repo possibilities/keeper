@@ -1,6 +1,6 @@
 """Public API: read-only views into keeper's projections.
 
-Six readers; all stdlib-only and gated on
+Seven readers; all stdlib-only and gated on
 ``SUPPORTED_SCHEMA_VERSIONS``:
 
 - ``get_session_dirty_files(session_id, cwd)`` — which dirty files a
@@ -21,6 +21,16 @@ Six readers; all stdlib-only and gated on
   ``{session-id, cwd, session-name}`` (``session-name`` omitted when
   ``jobs.title`` is NULL), or ``None``.  Reads ``jobs``.  Consumed by
   ``cli_common.session_context.show_context``.
+- ``get_epic(epic_id)`` — one epic row as ``dict`` (with
+  ``tasks`` / ``jobs`` JSON-TEXT cells defensively decoded to lists)
+  or ``None`` when the row is absent.  Reads ``epics``.  Consumed by
+  ``planctl render-approve-context`` to pick a target job from the
+  epic's embedded ``jobs`` / ``tasks[].jobs`` arrays.
+- ``get_job(job_id)`` — one job row as ``dict`` (real columns:
+  ``job_id`` / ``transcript_path`` / ``cwd`` / ``state``) or ``None``
+  when the row is absent.  Reads ``jobs``.  Consumed by ``planctl
+  render-approve-context`` to look up the target session's transcript
+  path + cwd for the final-message read.
 
 Attribution rule for ``get_session_dirty_files`` (mirrors the reducer's
 discharge semantic): a session is on the hook for a file iff it has a
@@ -111,6 +121,14 @@ from pathlib import Path
 # subscribe wire), so the bump is whitelist-only with no reader logic
 # change.
 # Bump this set when a keeper schema change alters those tables.
+#
+# ``get_epic`` / ``get_job`` (fn-627) consume columns that pre-date the
+# supported range: ``jobs.transcript_path`` / ``jobs.cwd`` / ``jobs.state``
+# are first-class columns in ``CREATE_JOBS`` (no version gate), ``jobs.plan_verb``
+# landed in v10 (well below v31), and ``epics.tasks`` / ``epics.jobs`` are
+# JSON-TEXT cells whose embedded shapes (``EmbeddedJob.created_at`` etc.)
+# are stable across the whole v31-v47 window — so the new readers add no
+# tighter version dependency than the existing scaffold.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}
 )
@@ -377,6 +395,115 @@ def get_session_for_pid(pid: int) -> str | None:
             (pid,),
         ).fetchone()
         return row[0] if row is not None else None
+    finally:
+        conn.close()
+
+
+def _decode_json_list(cell: object) -> list:
+    """Decode a JSON-TEXT cell defensively to a ``list``.
+
+    Mirrors the ``Array.isArray(x) ? x : []`` defense the TS renderer relies
+    on and the ``_dirty_paths_by_repo`` malformed-cell handler: a parse error,
+    a non-string cell, or a non-list payload all fold to ``[]`` rather than
+    raising — so a single bad row never breaks the reader.
+    """
+    if not isinstance(cell, (str, bytes, bytearray)):
+        return []
+    try:
+        parsed = json.loads(cell)
+    except (ValueError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def get_epic(epic_id: str) -> dict | None:
+    """Return one epic row as a ``dict``, or ``None`` when no row matches.
+
+    Shape::
+
+        {
+          "epic_id": "<id>",
+          "project_dir": "<abs path>" | None,
+          "tasks": [<embedded task dict>, ...],   # decoded from JSON-TEXT
+          "jobs":  [<embedded job dict>, ...],    # decoded from JSON-TEXT
+        }
+
+    Reads keeper's ``epics`` projection.  The ``tasks`` / ``jobs`` columns
+    are JSON-TEXT (``NOT NULL DEFAULT '[]'``) and are decoded DEFENSIVELY
+    via :func:`_decode_json_list` — a malformed cell folds to ``[]``,
+    mirroring the TS renderer's ``Array.isArray(x) ? x : []`` defense.
+    Embedded items inside the arrays (e.g. ``EmbeddedJob`` fields like
+    ``created_at`` the downstream freshest-pick relies on) ride opaque —
+    the reader does not validate their inner shape.
+
+    Consumed by ``planctl render-approve-context`` to walk an epic's
+    embedded ``jobs`` / ``tasks[].jobs`` arrays when picking a target job
+    for the ``/plan:approve`` evidence read.
+
+    Raises ``KeeperDBMissing`` / ``KeeperSchemaError`` like the other
+    readers here — no silent fallback.
+    """
+    path = _resolve_db_path()
+    conn = _open_readonly(path)
+    try:
+        _check_schema(conn)
+        row = conn.execute(
+            "SELECT epic_id, project_dir, tasks, jobs FROM epics WHERE epic_id = ?",
+            (epic_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        epic_id_, project_dir, tasks_cell, jobs_cell = row
+        return {
+            "epic_id": epic_id_,
+            "project_dir": project_dir,
+            "tasks": _decode_json_list(tasks_cell),
+            "jobs": _decode_json_list(jobs_cell),
+        }
+    finally:
+        conn.close()
+
+
+def get_job(job_id: str) -> dict | None:
+    """Return one job row as a ``dict``, or ``None`` when no row matches.
+
+    Shape::
+
+        {
+          "job_id": "<id>",
+          "transcript_path": "<abs path>" | None,
+          "cwd": "<abs path>" | None,
+          "state": "<lifecycle state>",
+        }
+
+    Reads keeper's ``jobs`` projection.  All four columns are real columns
+    on ``CREATE_JOBS`` (no JSON decode); ``transcript_path`` / ``cwd`` are
+    nullable, ``state`` is ``NOT NULL DEFAULT 'stopped'``.
+
+    Consumed by ``planctl render-approve-context`` to resolve the target
+    session's transcript file (read live, fresh) and project working dir
+    for the ``/plan:approve`` final-message extract.
+
+    Raises ``KeeperDBMissing`` / ``KeeperSchemaError`` like the other
+    readers here — no silent fallback.
+    """
+    path = _resolve_db_path()
+    conn = _open_readonly(path)
+    try:
+        _check_schema(conn)
+        row = conn.execute(
+            "SELECT job_id, transcript_path, cwd, state FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        job_id_, transcript_path, cwd, state = row
+        return {
+            "job_id": job_id_,
+            "transcript_path": transcript_path,
+            "cwd": cwd,
+            "state": state,
+        }
     finally:
         conn.close()
 
