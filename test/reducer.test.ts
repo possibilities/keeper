@@ -12929,6 +12929,145 @@ test("zero-event projection: a fresh DB has zero dispatch_failures rows", () => 
 });
 
 // ---------------------------------------------------------------------------
+// Schema v47 (fn-667) — `autopilot_state` singleton reducer projection. Main
+// mints `AutopilotPaused{paused:boolean}` events (steady-state via the
+// `set_autopilot_paused` RPC bridge, boot via the daemon's boot-append
+// re-arm). The reducer folds them purely (no `Date.now`, no env, no
+// `jobs` SELECT) into the singleton `autopilot_state` row keyed on
+// `id = 1`. UPSERT on `id`; `created_at` preserved through UPSERT (the
+// row's "first observation" stamp); no DELETE arm (a singleton control
+// flag never "clears" — it just flips). A from-scratch re-fold (rewind
+// cursor, DELETE FROM autopilot_state, re-drain) MUST reproduce the
+// table byte-identically.
+// ---------------------------------------------------------------------------
+
+function autopilotPausedEvent(
+  paused: boolean,
+  sessionId = "autopilot",
+): number {
+  return insertEvent({
+    hook_event: "AutopilotPaused",
+    session_id: sessionId,
+    data: JSON.stringify({ paused }),
+  });
+}
+
+function getAutopilotState() {
+  return db.query("SELECT * FROM autopilot_state WHERE id = 1").get() as {
+    id: number;
+    paused: number;
+    last_event_id: number;
+    created_at: number;
+    updated_at: number;
+  } | null;
+}
+
+test("AutopilotPaused UPSERTs the singleton row and advances the cursor (fn-667)", () => {
+  const eventId = autopilotPausedEvent(true);
+  expect(drainAll()).toBe(1);
+  const row = getAutopilotState();
+  expect(row).not.toBeNull();
+  expect(row?.id).toBe(1);
+  expect(row?.paused).toBe(1);
+  expect(row?.last_event_id).toBe(eventId);
+  expect(getCursor()).toBe(eventId);
+});
+
+test("AutopilotPaused UPSERT preserves created_at across flips but updates paused / last_event_id / updated_at (fn-667)", () => {
+  // First event lands the row.
+  const firstId = autopilotPausedEvent(true);
+  drainAll();
+  const before = getAutopilotState();
+  expect(before).not.toBeNull();
+  const createdAt = before?.created_at;
+  expect(createdAt).not.toBeUndefined();
+
+  // Flip to playing — UPSERT must change `paused` + bump `last_event_id`
+  // + bump `updated_at`, but PRESERVE `created_at` (the row's "first
+  // observation" stamp, mirroring foldDispatchFailed).
+  const secondId = autopilotPausedEvent(false);
+  drainAll();
+  const after = getAutopilotState();
+  expect(after).not.toBeNull();
+  expect(after?.paused).toBe(0);
+  expect(after?.last_event_id).toBe(secondId);
+  expect(after?.last_event_id).toBeGreaterThan(firstId);
+  // Critical: created_at PRESERVED across the flip.
+  expect(after?.created_at).toBe(createdAt as number);
+});
+
+test("AutopilotPaused with a malformed payload is a safe no-op (cursor still advances, no row written) (fn-667)", () => {
+  // Malformed shapes the extractor must reject: bad JSON, missing
+  // `paused`, non-boolean `paused`, empty/missing data. Each must fold
+  // to a no-op (no row, cursor still advances).
+  const malformed = [
+    { hook_event: "AutopilotPaused", data: "{ not json" },
+    { hook_event: "AutopilotPaused", data: JSON.stringify({}) }, // missing paused
+    {
+      hook_event: "AutopilotPaused",
+      data: JSON.stringify({ paused: 1 }),
+    }, // non-boolean (number)
+    {
+      hook_event: "AutopilotPaused",
+      data: JSON.stringify({ paused: "true" }),
+    }, // non-boolean (string)
+    {
+      hook_event: "AutopilotPaused",
+      data: JSON.stringify({ paused: null }),
+    }, // non-boolean (null)
+  ];
+  let lastId = 0;
+  for (const ev of malformed) {
+    lastId = insertEvent({
+      hook_event: ev.hook_event,
+      session_id: "autopilot",
+      data: ev.data,
+    });
+  }
+  expect(drainAll()).toBe(malformed.length);
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM autopilot_state").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+  expect(getCursor()).toBe(lastId);
+});
+
+test("from-scratch re-fold reproduces the autopilot_state projection byte-identically (fn-667)", () => {
+  // Seed a representative sequence: pause (boot-style), play (RPC flip),
+  // pause again, play again. The row must end at the final state's
+  // `paused` and the latest `last_event_id` / `updated_at`, with
+  // `created_at` stuck at the FIRST event's ts (the "first observation"
+  // semantic).
+  autopilotPausedEvent(true);
+  autopilotPausedEvent(false);
+  autopilotPausedEvent(true);
+  autopilotPausedEvent(false);
+  drainAll();
+  const before = db
+    .query("SELECT * FROM autopilot_state ORDER BY id ASC")
+    .all();
+  // Rewind cursor + wipe projection + re-drain. The post-rewind rows
+  // must equal the pre-rewind rows byte-for-byte — the from-scratch
+  // re-fold determinism invariant.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM autopilot_state");
+  drainAll();
+  const after = db.query("SELECT * FROM autopilot_state ORDER BY id ASC").all();
+  expect(after).toEqual(before);
+});
+
+test("zero-event projection: a fresh DB has zero autopilot_state rows (fn-667)", () => {
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM autopilot_state").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
 // Schema v46 / fn-666 — planctl-file attribution mint
 // ---------------------------------------------------------------------------
 

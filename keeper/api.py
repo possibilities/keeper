@@ -103,10 +103,16 @@ from pathlib import Path
 # ``session_id`` / ``file_path`` / ``last_mutation_at`` /
 # ``last_commit_at`` tuple — it never reads ``source`` or
 # ``planctl_files`` — so the bump is whitelist-only with no reader
-# logic change.
+# logic change; v47 (fn-667 persist autopilot control state) adds a new
+# ``autopilot_state`` singleton projection table carrying the autopilot
+# worker's paused/playing flag plus a new ``AutopilotPaused`` synthetic
+# event — keeper-py reads neither the new table nor the event (the
+# reader is the thin ``keeper autopilot`` viewer, fed via the UDS
+# subscribe wire), so the bump is whitelist-only with no reader logic
+# change.
 # Bump this set when a keeper schema change alters those tables.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
-    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46}
+    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}
 )
 
 

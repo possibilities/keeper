@@ -39,16 +39,23 @@
  *    connection (server descriptor: `src/collections.ts`'s
  *    `DISPATCH_FAILURES_DESCRIPTOR`). Default-sort is `ts DESC`, so the
  *    freshest failure is on top.
+ *  - The `autopilot_state` singleton (schema v47 / fn-667) rides its own
+ *    `subscribeCollection` connection (descriptor:
+ *    `AUTOPILOT_STATE_DESCRIPTOR`). One row at most (`id = 1`) carrying
+ *    the durable paused/playing flag — the banner-truth substrate.
  *
- * Paused-state surfacing:
- *  - The daemon does NOT expose a `get_autopilot_paused` query — the
- *    `paused` flag is in-memory on main and boots `true` by safety
- *    invariant. The viewer mirrors that: starts the banner at `[paused]`
- *    and flips to `[playing]` / back when a successful pause/play RPC
- *    round-trips. Until the human runs `play` / `pause`, the banner is
- *    showing the boot-time default, not a real read — that's an
- *    intentional simplification of the epic ("never persisted" applies to
- *    the daemon side too).
+ * Paused-state surfacing (schema v47 / fn-667):
+ *  - The viewer subscribes the singleton `autopilot_state` projection
+ *    alongside `dispatch_failures` and reflects the daemon's REAL
+ *    paused/playing flag in the banner. The projection is fed by the
+ *    reducer's `AutopilotPaused` fold arm — every pause/play RPC appends
+ *    one synthetic event before flipping the in-memory worker gate, so
+ *    the banner is byte-honest with the worker's dispatch decision.
+ *  - The daemon boot-appends `AutopilotPaused{paused:true}` BEFORE the
+ *    server worker spawns, so a viewer subscribing the instant the socket
+ *    opens reads a real row (the boot re-arm), never an empty surface.
+ *    The seed `paused: true` on first launch is only visible for the
+ *    sub-ms window between viewer launch and the first subscribe edge.
  *
  * Sidecar / SIGINT semantics: identical to the other view-shell siblings —
  * three indexed sidecar files per frame (state JSON + frame text + per-
@@ -497,6 +504,28 @@ export function projectFailedRows(
   return out;
 }
 
+/**
+ * Coerce a singleton `autopilot_state` wire row's `paused` column to the
+ * banner-facing boolean. The column is stored as INTEGER (`1` paused,
+ * `0` playing). Defensive: an empty row set (singleton hasn't folded
+ * yet — sub-ms boot race) returns `null` so the caller leaves the
+ * seed `state.paused` untouched; a non-0/1 value falls back to `true`
+ * (safer side, matches the daemon's boot default). Pure — exported for
+ * tests. fn-667.
+ */
+export function projectAutopilotPaused(
+  rows: Record<string, unknown>[],
+): boolean | null {
+  if (rows.length === 0) {
+    return null;
+  }
+  const raw = rows[0]?.paused;
+  if (typeof raw !== "number") {
+    return true;
+  }
+  return raw !== 0;
+}
+
 // ---------------------------------------------------------------------------
 // Body renderer — pure (fixtures → lines).
 // ---------------------------------------------------------------------------
@@ -749,8 +778,13 @@ async function runViewer(sockPath: string): Promise<void> {
   const state: ViewerState = {
     snap: null,
     failed: [],
-    // Boot-time invariant — the daemon also boots paused. The banner
-    // flips on the first successful pause/play RPC round-trip.
+    // fn-667: seed `true` matches the daemon's boots-paused safety default
+    // — the same value the boot-append re-arm folded into
+    // `autopilot_state.paused` before the server worker spawned. As soon
+    // as the `autopilot_state` subscribe below produces its first `result`
+    // frame, `state.paused` is overwritten with the real folded value
+    // (`row.paused === 1`), so this seed is only ever visible for the
+    // sub-ms window between viewer launch and the first subscribe edge.
     paused: true,
   };
 
@@ -811,9 +845,36 @@ async function runViewer(sockPath: string): Promise<void> {
     onLifecycle: view.emitLifecycle,
   });
 
+  // fn-667: subscribe the singleton `autopilot_state` projection so the
+  // banner reflects the daemon's real paused/playing flag (pre-fn-667 the
+  // banner was hardcoded `true` because there was no read surface for the
+  // in-memory flag). The collection is keyed on `id = 1` (singleton); we
+  // expect at most one row. Defensive on empty/missing rows: if the row
+  // hasn't folded yet (sub-ms boot race) `rows` is empty and we leave
+  // the seed `state.paused` untouched. Re-subscribes cleanly on socket
+  // drop via the shared `subscribeCollection` reconnect contract.
+  const pausedHandle = subscribeCollection({
+    sockPath,
+    idPrefix: "autopilot",
+    collection: "autopilot_state",
+    onRows: (rows) => {
+      const paused = projectAutopilotPaused(rows);
+      if (paused === null) {
+        // Singleton hasn't folded yet (sub-ms boot race). Leave the
+        // seed `state.paused` untouched and wait for the next edge.
+        return;
+      }
+      state.paused = paused;
+      view.liveShell.setStatus(state.paused ? "[paused]" : "[playing]");
+      view.emit(state);
+    },
+    onLifecycle: view.emitLifecycle,
+  });
+
   view.installSigintHandler(() => {
     readinessHandle.dispose();
     failuresHandle.dispose();
+    pausedHandle.dispose();
   });
 }
 

@@ -241,11 +241,19 @@ test("end-to-end: hook writes → wake worker → reducer folds → jobs project
       await Bun.sleep(200);
     }
 
-    // --- events table: exactly the four rows we fired, in id order. ---
+    // --- events table: exactly the four rows we fired, in id order.
+    // Filter out the `AutopilotPaused` boot-append re-arm (schema v47 /
+    // fn-667 — main writes one of these from the boot drain alongside
+    // `seedKilledSweep` so the autopilot_state singleton boots paused
+    // honestly). It rides on session_id="autopilot", not our test
+    // session, so the lifecycle assertions on `sessionId` are unaffected;
+    // we just exclude it from this raw-events count + ordering check. ---
     const events = await retryUntil(() => {
       const rows = reader
         .query(
-          "SELECT id, hook_event, permission_mode FROM events ORDER BY id ASC",
+          `SELECT id, hook_event, permission_mode FROM events
+             WHERE hook_event != 'AutopilotPaused'
+             ORDER BY id ASC`,
         )
         .all() as Array<{
         id: number;

@@ -593,9 +593,19 @@ collapses to plain stream output. Run any of them with
   `dispatch_failures` projection) plus a paused/playing banner, and
   exposes three control RPCs:
 
-  - `keeper autopilot play` / `keeper autopilot pause` — flip the in-memory
-    pause flag on the daemon via `set_autopilot_paused` (boots paused; the
-    flag is never persisted, so a restart returns to safe-by-default paused).
+  - `keeper autopilot play` / `keeper autopilot pause` — flip the autopilot
+    pause flag on the daemon via `set_autopilot_paused`. The RPC appends an
+    `AutopilotPaused{paused}` synthetic event onto main's writable
+    connection FIRST (the reducer folds it into the singleton
+    `autopilot_state` projection — the banner-truth substrate added in
+    schema v47 / fn-667), THEN flips the in-memory worker gate + relays to
+    the autopilot worker. Boots paused: the daemon's boot drain
+    unconditionally appends `AutopilotPaused{paused:true}` BEFORE
+    `serverWorker` spawns, so a restart returns to safe-by-default paused
+    via the boot-append re-arm (not via a "never persisted" volatility
+    guarantee — the flag IS persisted as of v47; the safe-by-default is
+    maintained by the boot re-arm event the reducer folds before any
+    viewer can subscribe).
   - `keeper autopilot retry <verb::id>` — clear a sticky `dispatch_failures`
     row via `retry_dispatch`. The RPC bridges through main, which appends a
     `DispatchCleared` synthetic event; the reducer DELETEs the row on the
@@ -1011,6 +1021,33 @@ the board (with its full lifecycle, since the original event log carried
 nothing for it) and `N` drops by one. The schema bump is v36→v37; fn-642
 (`profile_name` jobs column) occupies the v35→v36 slot ahead of this
 work.
+As of schema v47 (fn-667), the autopilot pause/playing flag is event-sourced
+into a new singleton `autopilot_state` projection table (`id INTEGER PRIMARY
+KEY CHECK (id = 1)`, `paused INTEGER NOT NULL`, plus `last_event_id` /
+`created_at` / `updated_at` per the standard projection discipline). Main
+mints `AutopilotPaused{paused:boolean}` synthetic events (steady-state via
+the `set_autopilot_paused` RPC bridge, which appends the event FIRST then
+flips the in-memory worker gate only on a successful insert — so the gate
+and the projection cannot diverge on partial failure; boot via the daemon's
+boot drain, which unconditionally appends `AutopilotPaused{paused:true}`
+BEFORE `serverWorker` spawns, so a viewer subscribing the instant the
+socket opens reads a real `paused=1` row, never an empty surface). The
+reducer's `foldAutopilotPaused` arm UPSERTs on the singleton id and
+preserves `created_at` through subsequent flips (mirrors
+`foldDispatchFailed`'s "first observation" semantic). A from-scratch
+re-fold reproduces the row byte-identically (no `Date.now`, no env reads,
+no `jobs` SELECT — `created_at` and `updated_at` both derive from
+`event.ts`). The `keeper autopilot` viewer subscribes the singleton via
+`subscribeCollection({collection: "autopilot_state"})` and drives its
+`[paused]` / `[playing]` banner from the folded `paused` column —
+replacing the pre-fn-667 hardcoded `state.paused = true` which made the
+banner ALWAYS read `[paused]` even while the worker was actively
+dispatching (the divergence bug this epic fixes). Trade-off: ~1 extra
+event per daemon restart (the boot-append re-arm), accepted in exchange
+for re-fold determinism (no migration seed → `created_at` derived purely
+from the event log). keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
+gains `47` (whitelist-only; keeper-py reads neither `autopilot_state`
+nor `AutopilotPaused`).
 As of schema v42 (fn-661), the new `dispatch_failures` projection table
 (keyed by `(verb, ref)` — the same `verb::id` correlation key the autopilot
 reconciler uses to dedup against `jobs`) carries the sticky failure record
@@ -1158,9 +1195,16 @@ scratch and reconciles desired-vs-observed against the live `jobs` projection
 — never an edge trigger, never a re-probe of the zellij surface. Dedup is
 keeperd job presence (correlated by `--name` → `plan_verb`+`plan_ref`), not a
 `zellij query-tab-names` round-trip; the surface-probe wedge of the standalone
-CLI is structurally impossible. The reconciler boots PAUSED (in-memory only,
-never persisted, so a restart is always safe-by-default) and flips on the
-`set_autopilot_paused` RPC. The terminal-surface mechanics live behind the
+CLI is structurally impossible. The reconciler boots PAUSED (the in-memory
+worker gate is seeded `true` from `workerData.paused`, and the daemon's
+boot drain unconditionally appends an `AutopilotPaused{paused:true}`
+synthetic event so the durable `autopilot_state` singleton projection
+also boots paused — schema v47 / fn-667; safe-by-default after restart
+is maintained by the boot-append re-arm event, not by flag volatility)
+and flips on the `set_autopilot_paused` RPC, which appends an
+`AutopilotPaused{paused}` event FIRST then flips the worker gate only
+on a successful insert (so the gate and the projection cannot diverge
+on partial failure). The terminal-surface mechanics live behind the
 shrunken `ExecBackend` (`src/exec-backend.ts`, `launch` + `closeByName` only)
 — zellij is the only backend; each dispatch opens as a new tab in the
 lazily-created `zellij_session`. Launch failure or a bounded single-attempt

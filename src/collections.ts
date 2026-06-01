@@ -657,6 +657,36 @@ export const DISPATCH_FAILURES_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
+ * Schema-v47 `autopilot_state` singleton descriptor (fn-667). The autopilot
+ * worker's paused/playing flag as a wire-readable collection — the substrate
+ * that makes `keeper autopilot`'s banner reflect the worker's real state
+ * (pre-v47 the viewer hardcoded `paused = true` because there was no
+ * read surface for the in-memory flag). One row at most (`id = 1`); the
+ * reducer's `foldAutopilotPaused` UPSERTs every pause/play event.
+ *
+ * Pk is the singleton `id` column — `CollectionDescriptor.pk` expects a
+ * single column, and the singleton CHECK constraint sidesteps the
+ * composite-pk limit `DISPATCH_FAILURES_DESCRIPTOR` documented above.
+ *
+ * No filters — there is only ever one row; `subscribeCollection` reads it
+ * unconditionally. Sortable columns track the typical viewer/debug
+ * ordering even though they only ever land one row.
+ */
+export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
+  name: "autopilot_state",
+  table: "autopilot_state",
+  columns: ["id", "paused", "last_event_id", "created_at", "updated_at"],
+  pk: "id",
+  version: "last_event_id",
+  sortable: new Set(["id", "last_event_id", "created_at", "updated_at"]),
+  defaultSort: { column: "id", dir: "asc" },
+  filters: {
+    id: "id",
+  },
+  jsonColumns: new Set(),
+};
+
+/**
  * The registry, keyed by wire-facing collection name. `jobs` + the `epics`
  * plan collection (which embeds its tasks + plan/close-verb jobs as JSON-array
  * columns — the standalone `tasks` collection was dropped in schema v7 — and
@@ -664,7 +694,8 @@ export const DISPATCH_FAILURES_DESCRIPTOR: CollectionDescriptor = {
  * `subagent_invocations` per-job Agent-timeline projection (schema v17) +
  * the `dead_letters` operational sidecar (schema v37, fn-643) + the
  * `dispatch_failures` autopilot-reconciler sticky-failure projection
- * (schema v43, fn-661).
+ * (schema v43, fn-661) + the `autopilot_state` singleton paused/playing
+ * projection (schema v47, fn-667).
  */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
@@ -675,6 +706,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [PROFILES_DESCRIPTOR.name, PROFILES_DESCRIPTOR],
   [DEAD_LETTERS_DESCRIPTOR.name, DEAD_LETTERS_DESCRIPTOR],
   [DISPATCH_FAILURES_DESCRIPTOR.name, DISPATCH_FAILURES_DESCRIPTOR],
+  [AUTOPILOT_STATE_DESCRIPTOR.name, AUTOPILOT_STATE_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

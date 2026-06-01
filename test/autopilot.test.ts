@@ -32,6 +32,7 @@ import {
   buildSetPausedFrame,
   type FailedRow,
   predictNextDispatches,
+  projectAutopilotPaused,
   projectFailedRows,
   renderBody,
 } from "../cli/autopilot";
@@ -675,4 +676,96 @@ test("buildRetryFrame — passes the dispatch key verbatim (server validates the
   expect((frame as unknown as { params: { id: string } }).params.id).toBe(
     "garbage",
   );
+});
+
+// ---------------------------------------------------------------------------
+// projectAutopilotPaused — coerce singleton `autopilot_state.paused` rows to
+// the banner-facing boolean. fn-667.
+// ---------------------------------------------------------------------------
+
+test("projectAutopilotPaused — paused=1 row → true (banner reads [paused])", () => {
+  const rows = [
+    { id: 1, paused: 1, last_event_id: 42, created_at: 1, updated_at: 1 },
+  ];
+  expect(projectAutopilotPaused(rows)).toBe(true);
+});
+
+test("projectAutopilotPaused — paused=0 row → false (banner reads [playing])", () => {
+  const rows = [
+    { id: 1, paused: 0, last_event_id: 50, created_at: 1, updated_at: 2 },
+  ];
+  expect(projectAutopilotPaused(rows)).toBe(false);
+});
+
+test("projectAutopilotPaused — empty rows (singleton not folded yet) → null", () => {
+  // The boot-append in daemon.ts folds the row BEFORE serverWorker spawns,
+  // so this is only ever observed in a sub-ms window between the viewer
+  // launching and the first subscribe result. The caller leaves the seed
+  // `state.paused` untouched on null.
+  expect(projectAutopilotPaused([])).toBeNull();
+});
+
+test("projectAutopilotPaused — non-number `paused` falls back to true (safer side)", () => {
+  // Defensive against a wire row whose `paused` column got coerced
+  // through a JSON layer that stringified it / NULLed it / etc. The
+  // safer side is paused — matches the daemon's boot default.
+  const rows = [
+    { id: 1, paused: "1", last_event_id: 1, created_at: 1, updated_at: 1 },
+  ];
+  expect(projectAutopilotPaused(rows)).toBe(true);
+  const rows2 = [
+    {
+      id: 1,
+      paused: null,
+      last_event_id: 1,
+      created_at: 1,
+      updated_at: 1,
+    },
+  ];
+  expect(projectAutopilotPaused(rows2)).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// renderBody — paused field is part of the input contract (the
+// `state.paused` driving the banner via `view.liveShell.setStatus`), so
+// renderBody itself does NOT emit a `[paused]`/`[playing]` line — the
+// banner lives on the live shell, not the body. Pin that contract: the
+// rendered body must NOT contain a paused-state line regardless of the
+// flag, so the live shell remains the sole banner owner. fn-667.
+// ---------------------------------------------------------------------------
+
+test("renderBody — paused=true does NOT emit a banner line into the body (live shell owns banner)", () => {
+  const lines = renderBody({
+    current: [{ verb: "work", id: "fn-1.1", dir: "repo", created_at: 1 }],
+    predicted: {
+      approvals: [],
+      informational: [],
+      workers: [],
+      closers: [],
+    },
+    failed: [],
+    paused: true,
+  });
+  for (const line of lines) {
+    expect(line).not.toContain("[paused]");
+    expect(line).not.toContain("[playing]");
+  }
+});
+
+test("renderBody — paused=false does NOT emit a banner line into the body either", () => {
+  const lines = renderBody({
+    current: [{ verb: "work", id: "fn-1.1", dir: "repo", created_at: 1 }],
+    predicted: {
+      approvals: [],
+      informational: [],
+      workers: [],
+      closers: [],
+    },
+    failed: [],
+    paused: false,
+  });
+  for (const line of lines) {
+    expect(line).not.toContain("[paused]");
+    expect(line).not.toContain("[playing]");
+  }
 });

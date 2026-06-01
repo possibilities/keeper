@@ -64,13 +64,13 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   events (`TranscriptTitle`, `ApiError`, `InputRequest`, `EpicSnapshot` /
   `TaskSnapshot` / `EpicDeleted` / `TaskDeleted`, `UsageSnapshot` /
   `UsageDeleted`, `Killed`, `GitSnapshot` / `GitRootDropped` / `Commit`,
-  `DispatchFailed` / `DispatchCleared`), of the `dead_letters` operational
-  sidecar, and of the dead-letter replay path. The server-worker writes only
-  the `approval` field on external `.planctl` JSON (atomic temp+rename) and
-  bridges `replay_dead_letter`, `set_autopilot_paused`, and `retry_dispatch` to
-  main — it never writes the event log itself. Producer workers (including the
-  autopilot reconciler) feed the log only via main's writable connection; they
-  never write the DB.
+  `DispatchFailed` / `DispatchCleared`, `AutopilotPaused`), of the
+  `dead_letters` operational sidecar, and of the dead-letter replay path. The
+  server-worker writes only the `approval` field on external `.planctl` JSON
+  (atomic temp+rename) and bridges `replay_dead_letter`,
+  `set_autopilot_paused`, and `retry_dispatch` to main — it never writes the
+  event log itself. Producer workers (including the autopilot reconciler) feed
+  the log only via main's writable connection; they never write the DB.
 - **Producer-only liveness probing.** The boot seed sweep and the exit-watcher
   worker are the ONLY places that probe liveness (`kill(pid,0)`, kqueue, pidfd,
   `(pid, start_time)` recycle check). Folds NEVER re-probe — a re-probe inside a
@@ -142,20 +142,27 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   scoped to exactly four surfaces: (1) the `approval` field on `.planctl` files
   (`set_task_approval` / `set_epic_approval`, atomic temp+rename), (2) the
   delayed-real-event replay path (`replay_dead_letter`), (3) the autopilot
-  in-memory pause flag (`set_autopilot_paused`), and (4) the autopilot
   failure-clear path (`retry_dispatch`, which appends a `DispatchCleared`
   synthetic event and lets the reducer DELETE the matching `dispatch_failures`
-  row on the next drain). RPC handlers MUST NOT write `jobs`/`epics`/
-  `dispatch_failures` directly — approval changes round-trip through the
-  plan-worker watcher → `EpicSnapshot`/`TaskSnapshot` → reducer, and retry
-  round-trips through main → synthetic event → reducer, so a re-fold sees them
-  all. *Why only these four:* approval is the one piece of human state with no
-  hook to attach it to; replay recovers events the hook failed to insert;
-  autopilot pause is human-intent state with no hook attachment point and is
-  deliberately in-memory only (boots paused, never persisted); retry clears a
-  sticky failure (no auto-retry — every cleared failure is an explicit human
-  decision). Everything else is the planner's/worker's job or belongs to the
-  hook.
+  row on the next drain), and (4) the autopilot pause flag
+  (`set_autopilot_paused`, which appends an `AutopilotPaused{paused}` synthetic
+  event FIRST — so the reducer folds it into the singleton `autopilot_state`
+  projection on the next drain and the viewer's banner reflects truth — THEN
+  flips the in-memory worker gate + relays to the autopilot worker only on a
+  successful insert; schema v47, fn-667). RPC handlers MUST NOT write
+  `jobs`/`epics`/`dispatch_failures`/`autopilot_state` directly — approval
+  changes round-trip through the plan-worker watcher →
+  `EpicSnapshot`/`TaskSnapshot` → reducer, retry round-trips through main →
+  synthetic event → reducer, and pause round-trips through main → synthetic
+  event → reducer, so a re-fold sees them all. *Why only these four:* approval
+  is the one piece of human state with no hook to attach it to; replay
+  recovers events the hook failed to insert; retry clears a sticky failure (no
+  auto-retry — every cleared failure is an explicit human decision); pause is
+  human-intent control state event-sourced through the same fold path as every
+  other projection (boots paused via the daemon's boot-append re-arm, fn-667
+  — the in-memory `autopilotPaused` is retained as the worker-relay + boot-race
+  guard but is no longer the source of viewer truth). Everything else is the
+  planner's/worker's job or belongs to the hook.
 - **No kernel file watchers ON KEEPER'S OWN SQLite DB** (`fs.watch`, FSEvents,
   kqueue, chokidar) — they drop same-process writes and miss WAL writes on macOS.
   Use `PRAGMA data_version` polling on a read-only autocommit connection as the
@@ -231,10 +238,20 @@ firing correctly — check them before concluding it is broken:
   DB write (a hook event, a fold). `set_autopilot_paused {paused:false}` (play)
   additionally kicks one cycle, and one cycle runs at boot — but absent those, a
   quiescent DB leaves ready work undispatched until the next incidental write.
-- **The `[paused]` banner in `keeper autopilot` is NOT authoritative.** There is
-  no `get_autopilot_paused` query; the viewer always opens showing `[paused]`
-  regardless of the worker's real flag. To confirm the real state, watch for a
-  dispatch (a new live `jobs` row / `dispatch_failures`), not the banner.
-- **Boots paused (safety default), one-at-a-time stagger.** The flag is in-memory
-  only and never persisted; `confirmRunning` serializes launches, so dispatch is
-  paced, not a burst.
+- **The `[paused]` banner in `keeper autopilot` IS authoritative (schema v47 / fn-667).**
+  The viewer subscribes the singleton `autopilot_state` projection — fed by
+  the reducer's `AutopilotPaused` fold arm, mint-ordered ahead of every gate
+  flip (the `set_autopilot_paused` RPC appends the event FIRST, then flips
+  the in-memory worker gate only on a successful insert). The banner reads
+  the row's `paused` column verbatim. A seed `paused: true` shows for the
+  sub-ms window between viewer launch and the first subscribe edge; after
+  that the banner is byte-honest with the worker's dispatch decision.
+- **Boots paused (safety default), one-at-a-time stagger.** The flag is
+  event-sourced — the daemon's boot drain unconditionally appends
+  `AutopilotPaused{paused:true}` BEFORE `serverWorker` spawns, so a viewer
+  subscribing the instant the socket opens reads a real `paused=1` row (not
+  a hardcoded fallback). The in-memory `autopilotPaused` variable on main
+  is retained as the autopilot-worker relay channel + the boot-race guard
+  for the worker spawn ordering, but is no longer the viewer's source of
+  truth. `confirmRunning` serializes launches, so dispatch is paced, not a
+  burst.

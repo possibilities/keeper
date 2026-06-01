@@ -728,6 +728,67 @@ function runDaemon(): void {
   withBootDrainCheckpointTuning(db, () => {
     drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
     seedKilledSweep(db);
+    // fn-667 task .1: unconditional boot-append of an
+    // `AutopilotPaused{paused:true}` re-arm. The autopilot worker boots
+    // PAUSED in memory (safety default); this synthetic event preserves
+    // that safety guarantee in the durable `autopilot_state` projection
+    // so the viewer's banner reads `[paused]` honestly from boot, not
+    // from a hardcoded fallback. The trailing `drainToCompletion` folds
+    // the re-arm BEFORE `serverWorker` spawns below — so a viewer
+    // subscribing the instant the socket opens reads a real row (the
+    // boot re-arm), never an empty surface.
+    //
+    // Raw `db.run` INSERT (not `stmts.insertEvent.run`) mirrors
+    // `seedKilledSweep`'s `insertKilledEvent` pattern — the column list
+    // MUST stay in sync with the prepared-statement form in
+    // `prepareStmts`. A future events-column add touches both sites.
+    //
+    // Re-fold cost: ~1 event per daemon restart. Documented in CLAUDE.md
+    // ("Boot-event-every-start is a generic-ES anti-pattern — but
+    // keeper's re-fold ≠ replay") and in db.ts's v46→v47 stamp slot
+    // — accepted in exchange for re-fold determinism (no migration
+    // seed → `created_at` derived purely from the event log).
+    db.run(
+      `INSERT INTO events (
+         ts, session_id, pid, hook_event, event_type, tool_name, matcher,
+         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
+         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+         planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+         planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+         bash_mutation_kind, bash_mutation_targets, planctl_files
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        Date.now() / 1000, // unix seconds as REAL — matches the hook + every other synthetic
+        "autopilot", // stable synthetic session_id (matches the RPC bridge mint above)
+        null, // pid — synthetic event has no process identity
+        "AutopilotPaused",
+        "autopilot_state", // synthetic event_type tag
+        null, // tool_name
+        null, // matcher
+        null, // cwd
+        null, // permission_mode
+        null, // agent_id
+        null, // agent_type
+        null, // stop_hook_active
+        JSON.stringify({ paused: true }), // boot re-arm — always paused
+        null, // subagent_agent_id
+        null, // spawn_name
+        null, // start_time
+        null, // slash_command
+        null, // skill_name
+        null, // planctl_op
+        null, // planctl_target
+        null, // planctl_epic_id
+        null, // planctl_task_id
+        null, // planctl_subject_present
+        null, // tool_use_id
+        null, // config_dir
+        null, // planctl_queue_jump
+        null, // bash_mutation_kind
+        null, // bash_mutation_targets
+        null, // planctl_files
+      ],
+    );
     drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
   });
 
@@ -883,13 +944,30 @@ function runDaemon(): void {
       return;
     }
     if (msg.kind === "set-autopilot-paused-request") {
-      // Fn-661 task .4. Flip the in-memory `paused` flag AND relay a
-      // `{type:"set-paused"}` command to the autopilot worker. The relay
-      // is a fire-and-forget postMessage — the autopilot worker handles
-      // the command on its next event-loop tick. Surfaces `ok:false`
-      // ONLY if the autopilot worker isn't constructed yet (a narrow
-      // boot race between this bridge wire-up and the worker spawn
-      // below); the worker is always present in steady state.
+      // Fn-661 task .4 / fn-667 task .1. APPEND an `AutopilotPaused`
+      // synthetic event FIRST onto the writable connection so the reducer
+      // folds it into the `autopilot_state` singleton on the next drain
+      // (the viewer's banner-truth substrate). THEN — only on a successful
+      // insert — flip the in-memory `autopilotPaused` flag and relay a
+      // `{type:"set-paused"}` command to the autopilot worker. Order
+      // matters: the gate (worker dispatch decision) and the projection
+      // (viewer-visible state) MUST NOT diverge on a partial failure. If
+      // the insert throws, neither side flips and the RPC returns
+      // `ok:false` — the human's pause/play attempt is rejected loud
+      // rather than silently dropped half-way.
+      //
+      // Mirrors the retry-dispatch handler's mint pattern (same column
+      // list — keep them in sync on any future events-column add). The
+      // session_id is a stable synthetic constant (`"autopilot"`) so
+      // every AutopilotPaused row groups onto the same key — useful for
+      // event-log scans and matches the producer-side convention every
+      // other singleton-bound synthetic uses.
+      //
+      // Surfaces `ok:false` ONLY if the autopilot worker isn't constructed
+      // yet (a narrow boot race between this bridge wire-up and the worker
+      // spawn below) OR the insert throws (a writer-lock contention or DB
+      // failure). The worker is always present in steady state; the
+      // insert is one prepared-statement run, no scan.
       let reply: SetAutopilotPausedResultMessage;
       if (autopilotWorker === null) {
         reply = {
@@ -899,8 +977,43 @@ function runDaemon(): void {
           error: "autopilot worker not yet ready",
         };
       } else {
-        autopilotPaused = msg.paused;
         try {
+          stmts.insertEvent.run({
+            $ts: Date.now() / 1000,
+            $session_id: "autopilot",
+            $pid: null,
+            $hook_event: "AutopilotPaused",
+            $event_type: "autopilot_state",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: null,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: JSON.stringify({ paused: msg.paused }),
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+            $slash_command: null,
+            $skill_name: null,
+            $planctl_op: null,
+            $planctl_target: null,
+            $planctl_epic_id: null,
+            $planctl_task_id: null,
+            $planctl_subject_present: null,
+            $config_dir: null,
+            $planctl_queue_jump: null,
+            $bash_mutation_kind: null,
+            $bash_mutation_targets: null,
+            $planctl_files: null,
+          });
+          wakePending = true;
+          pumpWakes();
+          // Only AFTER the event is durably appended do we flip the
+          // in-memory gate + relay to the worker. A throw above leaves
+          // both untouched.
+          autopilotPaused = msg.paused;
           autopilotWorker.postMessage({
             type: "set-paused",
             paused: msg.paused,

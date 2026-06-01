@@ -3039,6 +3039,106 @@ function foldDispatchCleared(db: Database, event: Event): void {
 }
 
 /**
+ * Pre-flattened `AutopilotPaused` synthetic event payload (fn-667). Carries
+ * the single boolean knob the autopilot worker reads (and the viewer
+ * banner reflects). Pause/play round-trips through the
+ * `set_autopilot_paused` RPC → server-worker bridge → main, which appends
+ * one `AutopilotPaused` event onto the writable connection; the reducer
+ * folds it into the singleton `autopilot_state.paused` column inside the
+ * same `BEGIN IMMEDIATE` cursor-advance transaction.
+ *
+ * The fold reads NOTHING outside the event payload + the persisted row —
+ * no `Date.now()` (uses `event.ts` for created_at / updated_at), no env,
+ * no `jobs` SELECT — so a from-scratch re-fold reproduces the row byte-
+ * deterministically. Mirrors {@link DispatchFailedPayload}'s pure-fold
+ * shape.
+ *
+ * Why a typed value-carrying event over a generic `SettingChanged{key,value}`:
+ * each future autopilot knob (concurrency caps, per-repo gates, stagger)
+ * gets its own value-carrying event so per-knob invariants stay co-located
+ * and validatable (planetgeek event-versioning playbook; epic spec).
+ */
+interface AutopilotPausedPayload {
+  paused: boolean;
+}
+
+/**
+ * Parse an `AutopilotPaused` event payload. Returns null on any structural
+ * miss — {@link foldAutopilotPaused} folds null to a safe no-op (cursor
+ * still advances). NEVER throws: per CLAUDE.md "a malformed `data` blob
+ * skips/folds to a safe value", a throw inside the fold rolls back the
+ * cursor and wedges the reducer.
+ *
+ * Strict typing: `paused` MUST be a literal boolean. We do NOT coerce
+ * `0`/`1`, `"true"`/`"false"`, or `null`/`undefined` — the only legal
+ * producers are main's `set_autopilot_paused` bridge (steady-state) and
+ * the daemon's boot-append (boot re-arm), both of which emit a literal
+ * `true`/`false`. Any other shape signals a corrupted producer and folds
+ * to a safe no-op rather than a guessed value.
+ */
+function extractAutopilotPausedPayload(
+  event: Event,
+): AutopilotPausedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<AutopilotPausedPayload>;
+    if (typeof parsed.paused !== "boolean") {
+      return null;
+    }
+    return { paused: parsed.paused };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse AutopilotPaused payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `AutopilotPaused` event (fn-667). UPSERT on the
+ * singleton `id = 1` — the first event INSERTs the row stamped
+ * `created_at = event.ts`; subsequent events UPDATE `paused` /
+ * `last_event_id` / `updated_at` and PRESERVE `created_at` (mirrors
+ * {@link foldDispatchFailed}'s sticky-first-observation semantic).
+ *
+ * Pure function of the event payload + the persisted row:
+ * - `paused` from the immutable event payload.
+ * - `last_event_id` from `event.id`.
+ * - `created_at` / `updated_at` from `event.ts` (the synthetic event's
+ *   producer-side mint clock — for the boot-append, this is the boot
+ *   instant; for a steady-state pause/play, this is the RPC service
+ *   instant).
+ *
+ * No `Date.now()`, no env read, no `jobs` SELECT — all would break re-fold
+ * determinism. Runs INSIDE the open `BEGIN IMMEDIATE` transaction opened
+ * by {@link applyEvent}; performs zero cursor work (the surrounding
+ * `applyEvent` advances the cursor).
+ *
+ * Malformed/missing payload → safe no-op; the cursor still advances.
+ */
+function foldAutopilotPaused(db: Database, event: Event): void {
+  const payload = extractAutopilotPausedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO autopilot_state (
+       id, paused, last_event_id, created_at, updated_at
+     ) VALUES (1, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       paused = excluded.paused,
+       last_event_id = excluded.last_event_id,
+       -- created_at preserved through UPSERT: the row's "since" view is
+       -- the FIRST AutopilotPaused observation (typically the boot-append
+       -- re-arm), never the latest flip.
+       updated_at = excluded.updated_at`,
+    [payload.paused ? 1 : 0, event.id, event.ts, event.ts],
+  );
+}
+
+/**
  * Sweep open `status='running'` subagent_invocations rows for a job to
  * `status='unknown'` in a single bulk UPDATE. Called from the SessionEnd and
  * Killed arms of {@link projectJobsRow} on the proven write path (after the
@@ -6201,6 +6301,8 @@ export function applyEvent(
       foldDispatchFailed(db, event);
     } else if (event.hook_event === "DispatchCleared") {
       foldDispatchCleared(db, event);
+    } else if (event.hook_event === "AutopilotPaused") {
+      foldAutopilotPaused(db, event);
     } else {
       projectJobsRow(db, event);
       // The `subagent_invocations` projection rides the same transaction +

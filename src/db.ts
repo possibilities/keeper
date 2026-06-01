@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 46;
+export const SCHEMA_VERSION = 47;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1084,6 +1084,77 @@ CREATE TABLE IF NOT EXISTS dispatch_failures (
 `;
 
 /**
+ * Schema-v47 `autopilot_state` projection table (fn-667) — a SINGLETON row
+ * (`id INTEGER PRIMARY KEY CHECK (id = 1)`) carrying the autopilot worker's
+ * paused/playing flag as durable, viewer-readable state. Before v47 the flag
+ * lived only in main's memory and the `keeper autopilot` TUI hardcoded
+ * `paused = true`, so the banner ALWAYS read `[paused]` while the worker
+ * was actually playing and dispatching — a chronic divergence bug. This
+ * projection is the substrate that makes the banner tell the truth.
+ *
+ * Singleton shape: the table holds AT MOST ONE row (`id = 1`). New control
+ * knobs (concurrency caps, per-repo gates, stagger) land here as future
+ * columns + their own typed value-carrying events — not as a generic
+ * `SettingChanged{key,value}` event (each knob keeps its own invariants
+ * co-located and validatable, per the planetgeek event-versioning playbook
+ * cited in the epic spec).
+ *
+ * Maintained by the reducer's `foldAutopilotPaused` arm (an UPSERT keyed on
+ * `id = 1`, mirroring `foldDispatchFailed`'s preserve-`created_at`-on-UPDATE
+ * shape). Like `dispatch_failures`, this IS a reducer projection — folded
+ * inside the same `BEGIN IMMEDIATE` cursor-advance transaction so every
+ * pause/play write is captured by the from-scratch re-fold invariant. The
+ * table goes in the rewind-and-redrain DELETE list (`v41→v42` slot above
+ * already covers every "wipe every reducer-owned projection" rewind).
+ *
+ * Field semantics:
+ * - `id` (INTEGER, PK, `CHECK (id = 1)`): the singleton constraint.
+ *   Any INSERT/UPSERT MUST bind `id = 1`; a stray write to id != 1 violates
+ *   the CHECK and the fold rejects it (safer than a silent multi-row
+ *   blow-up that would let the viewer read whichever row sorted first).
+ * - `paused` (INTEGER, NOT NULL): the durable flag — `1` for paused
+ *   (no dispatch), `0` for playing (autopilot reconciler dispatches as
+ *   `computeReadiness` admits). Lifted from the `AutopilotPaused` event's
+ *   `paused` boolean payload (true → 1, false → 0).
+ * - `last_event_id` (INTEGER, NOT NULL): the `events.id` of the latest
+ *   `AutopilotPaused` event. Drives the `AUTOPILOT_STATE_DESCRIPTOR`'s
+ *   wire-diff version column — every UPSERT bumps it so a subscribed
+ *   viewer's banner re-renders on every pause/play flip.
+ * - `created_at` (REAL, NOT NULL): unix-seconds of the first
+ *   `AutopilotPaused` event folded into this row (typically the boot-append
+ *   `paused: true` re-arm — see daemon.ts's boot drain). Preserved through
+ *   subsequent UPSERTs (mirrors `foldDispatchFailed`'s "sticky since"
+ *   semantic). Sourced from `event.ts` so re-fold reproduces it byte-
+ *   deterministically.
+ * - `updated_at` (REAL, NOT NULL): unix-seconds of the latest UPSERT to
+ *   `event.ts`. Mirrors every other projection table's `updated_at`
+ *   discipline.
+ *
+ * Defaults match the zero-event projection: a fresh DB with zero events has
+ * zero rows here. Boot is responsible for unconditionally appending a
+ * `AutopilotPaused{paused:true}` re-arm BEFORE the server-worker spawns —
+ * so a viewer subscribing the instant the socket opens reads a real row
+ * (the boot re-arm), never an empty surface. The trade-off is ~1 extra
+ * event per daemon restart (accepted; documented in the v46→v47 migration
+ * slot below).
+ *
+ * NO migration seed row: the unconditional boot-append (`AutopilotPaused`)
+ * folds the row before any viewer reads it, so seeding here would be
+ * redundant. Skipping the seed keeps `created_at` derived purely from the
+ * event log (re-fold determinism — the row's `created_at` matches a
+ * from-scratch re-fold's first-`AutopilotPaused` event ts byte-for-byte).
+ */
+const CREATE_AUTOPILOT_STATE = `
+CREATE TABLE IF NOT EXISTS autopilot_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    paused INTEGER NOT NULL,
+    last_event_id INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+)
+`;
+
+/**
  * Schema-v31 `file_attributions` projection table — one row per
  * `(project_dir, session_id, file_path)` triple. Records the attribution claim
  * that this session has at least one mutation (tool or bash) on this file in
@@ -1806,6 +1877,7 @@ function migrate(db: Database): void {
       db.run(sql);
     }
     db.run(CREATE_DISPATCH_FAILURES);
+    db.run(CREATE_AUTOPILOT_STATE);
 
     // Seed singleton cursor on first boot. Subsequent boots are no-ops.
     db.run(
@@ -4298,6 +4370,14 @@ function migrate(db: Database): void {
       // migrate(), but is empty — no `DispatchFailed` events have ever
       // landed in a pre-v43 log).
       db.run("DELETE FROM dispatch_failures");
+      // fn-667 (schema v47): `autopilot_state` is a reducer projection
+      // (epic fn-667); it joins the rewind-and-redrain set here so the
+      // canonical "wipe every reducer-owned projection table" list stays
+      // complete for any FUTURE rewind. Harmless on a v41→v42 upgrade
+      // (the table exists by the bootstrap CREATE that runs first in
+      // migrate(), but is empty — no `AutopilotPaused` events have ever
+      // landed in a pre-v47 log).
+      db.run("DELETE FROM autopilot_state");
     }
 
     // v42→v43: fn-661 — `dispatch_failures` projection table, the durable
@@ -4555,6 +4635,43 @@ function migrate(db: Database): void {
       db.run("DELETE FROM file_attributions");
       db.run("DELETE FROM subagent_invocations");
     }
+
+    // v46→v47: fn-667 — `autopilot_state` singleton projection table, the
+    // durable substrate the `keeper autopilot` viewer subscribes to so its
+    // banner reflects the autopilot worker's real paused/playing state
+    // (pre-v47 the flag lived only in main's memory and the viewer
+    // hardcoded `paused = true`, a chronic divergence). Picked up
+    // unconditionally by the `CREATE TABLE IF NOT EXISTS
+    // CREATE_AUTOPILOT_STATE` in the bootstrap block above; this slot
+    // exists only for the version-bump stamp ordering. No data backfill —
+    // the table populates exclusively from the reducer's `AutopilotPaused`
+    // fold arm, and the daemon's boot drain appends a
+    // `AutopilotPaused{paused:true}` re-arm before `serverWorker` spawns so
+    // a viewer subscribing the instant the socket opens reads a real row
+    // (never an empty surface). Stays empty on a fresh DB until the first
+    // boot-append folds; steady-state v47 boots already carry rows.
+    //
+    // NO migration seed row: the boot-append folds the row through the same
+    // pure fold path a steady-state pause/play write uses, so seeding here
+    // would be redundant — and skipping it keeps `created_at` derived
+    // purely from the event log (re-fold determinism). The trade-off is
+    // ~1 extra event per daemon restart (the boot-append), accepted per
+    // CLAUDE.md's "Boot-event-every-start is generic-ES anti-pattern, but
+    // keeper's re-fold ≠ replay" carve-out — re-fold re-drains the
+    // existing log and never re-runs boot, so the boot-append is safe and
+    // matches the `seedKilledSweep` precedent.
+    //
+    // The table IS a reducer projection. A from-scratch re-fold rebuilds it
+    // byte-identically from the `AutopilotPaused` events in the log — so it
+    // MUST be included in any future rewind-and-redrain DELETE list (see
+    // the v41→v42 slot above which already collects the canonical "wipe
+    // every reducer-owned projection" set; future rewinds add
+    // `DELETE FROM autopilot_state` alongside).
+    //
+    // No keeper-py reader change: keeper-py reads neither `autopilot_state`
+    // nor `AutopilotPaused`, so the v47 bump is whitelist-only on the
+    // Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset adds
+    // 47 in the same change — test/schema-version.test.ts enforces).
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
