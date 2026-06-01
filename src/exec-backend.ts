@@ -349,6 +349,7 @@ export interface ZellijPane {
   readonly id: string;
   readonly tab_name: string;
   readonly tab_id?: number;
+  readonly tab_position?: number;
   readonly terminal_command?: string | null;
   readonly exited?: boolean;
 }
@@ -460,6 +461,215 @@ export function parseListPanesJson(text: string): unknown {
   } catch {
     return null;
   }
+}
+
+/**
+ * Backend env-var metadata for a given backend type. Single source of
+ * truth for the env-var NAMES the hook reads on every event (T3) — by
+ * funnelling the literals through this seam, the hook stays
+ * backend-agnostic and a future tmux/wezterm backend slots in without
+ * the hook learning new keys.
+ *
+ * Defaults to `DEFAULT_EXEC_BACKEND`. For `"zellij"`, returns the
+ * official `ZELLIJ_SESSION_NAME` / `ZELLIJ_PANE_ID` env vars zellij
+ * stamps into every pane's environment.
+ */
+export interface ExecBackendEnvMeta {
+  readonly backendType: string;
+  readonly sessionIdEnvVar: string;
+  readonly paneIdEnvVar: string;
+}
+
+export function execBackendEnvMeta(backendType?: string): ExecBackendEnvMeta {
+  const t = backendType ?? DEFAULT_EXEC_BACKEND;
+  if (t === "zellij") {
+    return {
+      backendType: t,
+      sessionIdEnvVar: "ZELLIJ_SESSION_NAME",
+      paneIdEnvVar: "ZELLIJ_PANE_ID",
+    };
+  }
+  // Future backend types slot in here. For now we still return the
+  // backendType verbatim so the caller can log the unknown name; the
+  // env-var fields fall back to the zellij defaults rather than empty
+  // strings, which would silently null out every hook event.
+  return {
+    backendType: t,
+    sessionIdEnvVar: "ZELLIJ_SESSION_NAME",
+    paneIdEnvVar: "ZELLIJ_PANE_ID",
+  };
+}
+
+/**
+ * Find a pane whose `id` matches `paneId` in a parsed `list-panes -a -j`
+ * payload. Pure — exported for tests. Mirrors `findPaneByTabName`'s
+ * none/single/multiple envelope.
+ *
+ * Identity is the load-bearing concern here: zellij ships `id` as a
+ * bare number (e.g. `11`), but the value stored on the events / job row
+ * comes from the `ZELLIJ_PANE_ID` env var which is always a string
+ * (`"11"`). We normalize both sides to string for comparison so the
+ * join lands. Skips `is_plugin === true` panes — the daemon worker
+ * only cares about terminal panes (plugin panes carry their own ids in
+ * an unrelated namespace and would never appear in `ZELLIJ_PANE_ID`).
+ *
+ * Multiple matches "shouldn't happen" — pane ids are unique within a
+ * zellij session — but we surface the count so the caller can log it
+ * rather than guess.
+ */
+export function findPaneById(payload: unknown, paneId: string): FindPaneResult {
+  const target = String(paneId);
+  const matches: ZellijPane[] = [];
+  const collect = (raw: unknown, tabNameHint?: string): void => {
+    if (raw == null || typeof raw !== "object") {
+      return;
+    }
+    const rec = raw as Record<string, unknown>;
+    if (rec.is_plugin === true) {
+      return;
+    }
+    const idRaw = rec.id;
+    const idStr =
+      typeof idRaw === "string"
+        ? idRaw
+        : typeof idRaw === "number"
+          ? String(idRaw)
+          : null;
+    if (idStr == null) {
+      return;
+    }
+    if (idStr !== target) {
+      return;
+    }
+    const tabNameField =
+      typeof rec.tab_name === "string" ? rec.tab_name : undefined;
+    const tab_name = tabNameField ?? tabNameHint ?? "";
+    matches.push({
+      // Preserve the raw id shape (string-coerced) — this finder is
+      // for env-pane-id matching, not for `close-pane -p`, so we don't
+      // re-normalize to the `terminal_<n>` form.
+      id: idStr,
+      tab_name,
+      tab_id: typeof rec.tab_id === "number" ? rec.tab_id : undefined,
+      tab_position:
+        typeof rec.tab_position === "number" ? rec.tab_position : undefined,
+      terminal_command:
+        typeof rec.terminal_command === "string"
+          ? rec.terminal_command
+          : rec.terminal_command === null
+            ? null
+            : undefined,
+      exited: typeof rec.exited === "boolean" ? rec.exited : undefined,
+    });
+  };
+  if (Array.isArray(payload)) {
+    for (const entry of payload) {
+      collect(entry);
+    }
+  } else if (payload != null && typeof payload === "object") {
+    for (const [key, value] of Object.entries(
+      payload as Record<string, unknown>,
+    )) {
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          collect(entry, key);
+        }
+      } else {
+        collect(value, key);
+      }
+    }
+  }
+  if (matches.length === 0) {
+    return { found: "none" };
+  }
+  if (matches.length > 1) {
+    return { found: "multiple", count: matches.length };
+  }
+  const only = matches[0];
+  if (only == null) {
+    return { found: "none" };
+  }
+  return { found: "single", pane: only };
+}
+
+/**
+ * Resolved tab coordinates for a known (session, paneId). Returned by
+ * `resolveTabForPane` and folded into `jobs.backend_exec_tab_{id,name}`
+ * (plus `tab_position` for future render use) by the daemon worker
+ * landing in T4.
+ */
+export interface ResolvedTabCoords {
+  readonly tab_id: number | null;
+  readonly tab_name: string;
+  readonly tab_position: number | null;
+}
+
+/**
+ * Resolve the tab a given pane lives in by running
+ * `zellij --session <session> action list-panes -a -j` once and
+ * filtering by pane id. Returns `null` (never throws) on:
+ *  - spawn failure (`ENOENT` — zellij not installed)
+ *  - non-zero exit (session gone, no active server, etc.)
+ *  - empty / unparseable JSON
+ *  - zero matches OR multiple matches (refuse to guess)
+ *
+ * The caller (the T4 daemon worker) treats `null` as "no snapshot;
+ * leave the existing tab columns alone" — never as "clear them." Pure
+ * w.r.t. the DB; the worker is the writer.
+ */
+export interface ResolveTabForPaneDeps {
+  readonly spawn?: SpawnFn;
+}
+
+export async function resolveTabForPane(
+  session: string,
+  paneId: string,
+  deps: ResolveTabForPaneDeps = {},
+): Promise<ResolvedTabCoords | null> {
+  const spawn = deps.spawn ?? defaultSpawn;
+  let proc: ReturnType<SpawnFn>;
+  try {
+    proc = spawn(buildZellijListPanesAllJsonArgs(session), {
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+    });
+  } catch {
+    // ENOENT (zellij not installed) lands here.
+    return null;
+  }
+  let exitCode: number;
+  let stdout: string;
+  try {
+    // Drain stdout + stderr concurrently with `exited` so a chatty
+    // zellij can't pipe-deadlock; we ignore the stderr value (the
+    // worker logs zellij errors elsewhere if it cares).
+    const [code, out] = await Promise.all([
+      proc.exited,
+      streamToText(proc.stdout),
+      streamToText(proc.stderr),
+    ]);
+    exitCode = code;
+    stdout = out;
+  } catch {
+    return null;
+  }
+  if (exitCode !== 0) {
+    return null;
+  }
+  const payload = parseListPanesJson(stdout);
+  if (payload == null) {
+    return null;
+  }
+  const match = findPaneById(payload, paneId);
+  if (match.found !== "single") {
+    return null;
+  }
+  return {
+    tab_id: match.pane.tab_id ?? null,
+    tab_name: match.pane.tab_name,
+    tab_position: match.pane.tab_position ?? null,
+  };
 }
 
 /**

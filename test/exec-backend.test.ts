@@ -35,10 +35,13 @@ import {
   createZellijBackend,
   DEFAULT_EXEC_BACKEND,
   DEFAULT_ZELLIJ_SESSION,
+  execBackendEnvMeta,
+  findPaneById,
   findPaneByTabName,
   firstTabIdFromListTabs,
   parseListPanesJson,
   resolveExecBackend,
+  resolveTabForPane,
   type SpawnFn,
 } from "../src/exec-backend";
 
@@ -1024,4 +1027,206 @@ test("resolveExecBackend: threads an explicit session through", async () => {
 
 test("DEFAULT_EXEC_BACKEND is 'zellij'", () => {
   expect(DEFAULT_EXEC_BACKEND).toBe("zellij");
+});
+
+// ---------------------------------------------------------------------------
+// execBackendEnvMeta — env-var names per backend type (T3 hook seam)
+// ---------------------------------------------------------------------------
+
+test("execBackendEnvMeta: defaults to DEFAULT_EXEC_BACKEND, returns ZELLIJ_SESSION_NAME/ZELLIJ_PANE_ID", () => {
+  const meta = execBackendEnvMeta();
+  expect(meta.backendType).toBe(DEFAULT_EXEC_BACKEND);
+  expect(meta.sessionIdEnvVar).toBe("ZELLIJ_SESSION_NAME");
+  expect(meta.paneIdEnvVar).toBe("ZELLIJ_PANE_ID");
+});
+
+test("execBackendEnvMeta: explicit 'zellij' matches the default", () => {
+  const meta = execBackendEnvMeta("zellij");
+  expect(meta.backendType).toBe("zellij");
+  expect(meta.sessionIdEnvVar).toBe("ZELLIJ_SESSION_NAME");
+  expect(meta.paneIdEnvVar).toBe("ZELLIJ_PANE_ID");
+});
+
+// ---------------------------------------------------------------------------
+// findPaneById — match list-panes numeric id against env string pane id
+// ---------------------------------------------------------------------------
+
+test("findPaneById: matches numeric pane id against string env value (the type-coercion hazard)", () => {
+  // zellij ships `id` as a bare number (`11`); the env's
+  // `ZELLIJ_PANE_ID` is always a string (`"11"`). The finder
+  // string-coerces both sides so the join lands.
+  const payload = [
+    { id: 11, tab_id: 3, tab_name: "agent", tab_position: 2, is_plugin: false },
+  ];
+  const got = findPaneById(payload, "11");
+  expect(got.found).toBe("single");
+  if (got.found === "single") {
+    expect(got.pane.id).toBe("11");
+    expect(got.pane.tab_id).toBe(3);
+    expect(got.pane.tab_name).toBe("agent");
+    expect(got.pane.tab_position).toBe(2);
+  }
+});
+
+test("findPaneById: numeric env value (defensive) is coerced via String()", () => {
+  // The seam contract is `string`, but a sloppy caller could feed in a
+  // number; we coerce both sides so the comparison still lands.
+  const payload = [{ id: 7, tab_id: 0, tab_name: "x", is_plugin: false }];
+  // biome-ignore lint/suspicious/noExplicitAny: deliberate sloppy caller
+  const got = findPaneById(payload, 7 as any);
+  expect(got.found).toBe("single");
+});
+
+test("findPaneById: zero matches → 'none' (pane already gone)", () => {
+  const payload = [{ id: 11, tab_name: "x", is_plugin: false }];
+  expect(findPaneById(payload, "999").found).toBe("none");
+});
+
+test("findPaneById: multiple matches → 'multiple' with count (shouldn't happen, surface it)", () => {
+  const payload = [
+    { id: 11, tab_name: "a", is_plugin: false },
+    { id: "11", tab_name: "b", is_plugin: false },
+  ];
+  const got = findPaneById(payload, "11");
+  expect(got.found).toBe("multiple");
+  if (got.found === "multiple") {
+    expect(got.count).toBe(2);
+  }
+});
+
+test("findPaneById: skips is_plugin=true panes (plugin id namespace is unrelated)", () => {
+  const payload = [
+    { id: 11, tab_name: "real", is_plugin: false, tab_id: 4 },
+    { id: 11, tab_name: "plugin", is_plugin: true, tab_id: 99 },
+  ];
+  const got = findPaneById(payload, "11");
+  expect(got.found).toBe("single");
+  if (got.found === "single") {
+    expect(got.pane.tab_id).toBe(4);
+    expect(got.pane.tab_name).toBe("real");
+  }
+});
+
+test("findPaneById: object-map shape (tab name → panes), tab_name pulled from key", () => {
+  const payload = {
+    agent: [{ id: 11, tab_id: 1, tab_position: 0, is_plugin: false }],
+    other: [{ id: 12, tab_id: 2, tab_position: 1, is_plugin: false }],
+  };
+  const got = findPaneById(payload, "12");
+  expect(got.found).toBe("single");
+  if (got.found === "single") {
+    expect(got.pane.tab_name).toBe("other");
+    expect(got.pane.tab_id).toBe(2);
+    expect(got.pane.tab_position).toBe(1);
+  }
+});
+
+test("findPaneById: garbage payload (null / non-object) → none", () => {
+  expect(findPaneById(null, "11").found).toBe("none");
+  expect(findPaneById("string", "11").found).toBe("none");
+  expect(findPaneById(42, "11").found).toBe("none");
+});
+
+// ---------------------------------------------------------------------------
+// resolveTabForPane — spawn list-panes once, return {tab_id, tab_name, tab_position} | null
+// ---------------------------------------------------------------------------
+
+test("resolveTabForPane: spawns list-panes once and returns the matching tab triple", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "zellij:--session": {
+        stdout: JSON.stringify([
+          {
+            id: 11,
+            tab_id: 3,
+            tab_name: "agent",
+            tab_position: 2,
+            is_plugin: false,
+          },
+          {
+            id: 12,
+            tab_id: 4,
+            tab_name: "other",
+            tab_position: 3,
+            is_plugin: false,
+          },
+        ]),
+        exitCode: 0,
+      },
+    },
+    calls,
+  );
+  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  expect(got).toEqual({ tab_id: 3, tab_name: "agent", tab_position: 2 });
+  // The spawn was the well-formed list-panes -a -j argv.
+  expect(calls[0]).toEqual(buildZellijListPanesAllJsonArgs("autopilot"));
+});
+
+test("resolveTabForPane: ENOENT-style spawn throw → null (zellij not installed)", async () => {
+  const spawn: SpawnFn = () => {
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  };
+  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  expect(got).toBeNull();
+});
+
+test("resolveTabForPane: non-zero exit → null (no clobbering snapshot)", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "zellij:--session": {
+        stdout: "",
+        stderr: "no active session",
+        exitCode: 1,
+      },
+    },
+    calls,
+  );
+  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  expect(got).toBeNull();
+});
+
+test("resolveTabForPane: empty / unparseable JSON → null", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    { "zellij:--session": { stdout: "not json", exitCode: 0 } },
+    calls,
+  );
+  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  expect(got).toBeNull();
+});
+
+test("resolveTabForPane: pane not in payload → null (refuse to clear)", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "zellij:--session": {
+        stdout: JSON.stringify([
+          { id: 99, tab_id: 7, tab_name: "elsewhere", is_plugin: false },
+        ]),
+        exitCode: 0,
+      },
+    },
+    calls,
+  );
+  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  expect(got).toBeNull();
+});
+
+test("resolveTabForPane: missing tab_id / tab_position → null fields (still resolves the tab_name)", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "zellij:--session": {
+        stdout: JSON.stringify([
+          { id: 11, tab_name: "agent", is_plugin: false },
+        ]),
+        exitCode: 0,
+      },
+    },
+    calls,
+  );
+  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  expect(got).toEqual({ tab_id: null, tab_name: "agent", tab_position: null });
 });
