@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-668-backend-exec-coordinates-on-jobs",
   "bundles": [],
   "closer_done_at": "2026-06-01T18:51:04.569899Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-01T18:51:04.569899Z"
+  "updated_at": "2026-06-01T18:51:31.739758Z"
 }
