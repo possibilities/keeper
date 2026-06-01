@@ -273,7 +273,7 @@ export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
  */
 export function renderRowLines(rows: Record<string, unknown>[]): string[] {
   const body = renderRowBlocks(rows).join("\n");
-  return body === "" ? [] : body.split("\n");
+  return body === "" ? ["no changes"] : body.split("\n");
 }
 
 export async function main(argv: string[]): Promise<void> {

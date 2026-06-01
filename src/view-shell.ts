@@ -170,6 +170,13 @@ export function createViewShell<TSnap>(
   let lastFrameText: string | null = null;
   let frameCount = 0;
 
+  // Connecting-indicator spinner state (see `emitLifecycle`). Braille dots
+  // advance one step per lifecycle tick while the first real frame is still
+  // pending, so the user isn't staring at a blank alt-screen while keeperd
+  // finishes its boot drain (the subscribe socket isn't up yet).
+  const CONNECTING_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  let connectingSpinnerIdx = 0;
+
   // Shared banner-flash timer. Transient `[copied …]` / caller-driven
   // flashes share one timer so a fresh flash from any source cancels a
   // pending restore from any other — last-flash-wins, no leaked state.
@@ -313,6 +320,21 @@ export function createViewShell<TSnap>(
     // pre-disconnect body byte-for-byte.
     if (event === "disconnected") {
       lastBody = null;
+    }
+    // Connecting indicator: until the first real frame paints, surface a
+    // spinner placeholder so the user knows the view is waiting on keeperd
+    // (the subscribe socket isn't up during boot drain — the client sits in
+    // its capped-backoff retry loop emitting `connecting` / `waiting`). The
+    // spinner advances one step per lifecycle tick — no timer. The first
+    // snapshot's `emit()` repaints over it; the `frameCount === 0` gate means
+    // a transient disconnect after data is on screen keeps the last good
+    // frame rather than flicking back to "connecting".
+    if (frameCount === 0 && event !== "connected") {
+      connectingSpinnerIdx =
+        (connectingSpinnerIdx + 1) % CONNECTING_SPINNER.length;
+      liveShell.pushFrame([
+        `${CONNECTING_SPINNER[connectingSpinnerIdx]} connecting to keeperd…`,
+      ]);
     }
   }
 

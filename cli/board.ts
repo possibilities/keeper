@@ -760,7 +760,7 @@ export async function main(argv: string[]): Promise<void> {
     subagentIndex: Map<string, SubagentInvocation[]>,
   ): string[] {
     const body = renderEpicsBody(snap, subagentIndex);
-    return body === "" ? [] : body.split("\n");
+    return body === "" ? ["no epics"] : body.split("\n");
   }
 
   // fn-660.1: lifecycle + sidecars + copy key + SIGINT moved into

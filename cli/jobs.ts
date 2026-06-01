@@ -321,7 +321,7 @@ export async function main(argv: string[]): Promise<void> {
         subagentIndex,
       );
       return {
-        bodyLines: body === "" ? [] : body.split("\n"),
+        bodyLines: body === "" ? ["no jobs"] : body.split("\n"),
         // State JSON carries the inputs this view actually rendered
         // against — jobs (the row source), subagentInvocations (the
         // nested-line source), and the dead-letter backlog (the banner
