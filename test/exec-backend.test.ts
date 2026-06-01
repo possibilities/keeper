@@ -390,6 +390,70 @@ test("createZellijBackend.launch: non-zero new-tab exit → { ok: false, error }
   }
 });
 
+test("createZellijBackend.launch: stale memo — session dies, new-tab fails 'not found' → re-mint + retry succeeds", async () => {
+  // Regression: the session-ensure memo caches liveness for the worker's
+  // whole life. If the session dies after the first launch (zellij exits
+  // a session when its last tab closes, or a reboot/kill drops it), a
+  // stale memo wedged EVERY future dispatch — `new-tab` hit a corpse and
+  // returned "Session '<name>' not found" forever. The fix invalidates
+  // the memo on that signature and re-mints once.
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  // alive=false after the first successful launch simulates the session
+  // dying out from under the daemon; attach -b brings it back.
+  let alive = true;
+  let firstLaunchDone = false;
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string, exitCode = 0, stderr = "") => ({
+      exited: Promise.resolve(exitCode),
+      stdout: new Response(stdout).body,
+      stderr: new Response(stderr).body,
+    });
+    if (cmd[1] === "list-sessions") {
+      return reply(alive ? "autopilot\n" : "dash\n");
+    }
+    if (cmd[1] === "attach") {
+      alive = true; // attach -b resurrects the session
+      return reply("");
+    }
+    if (cmd[1] === "--session" && cmd[4] === "new-tab") {
+      if (!alive) {
+        return reply(
+          "",
+          1,
+          "Session 'autopilot' not found. The following sessions are active:\ndash",
+        );
+      }
+      const r = reply("9\n");
+      firstLaunchDone = true;
+      return r;
+    }
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    session: "autopilot",
+    spawn,
+  });
+  // First launch: session listed → straight to new-tab, succeeds.
+  const first = await backend.launch(["sh"], "work::a", "/abs");
+  expect(first).toEqual({ ok: true });
+  expect(firstLaunchDone).toBe(true);
+  // Session dies. Second launch's new-tab fails "not found" → re-mint.
+  alive = false;
+  const second = await backend.launch(["sh"], "work::b", "/abs");
+  expect(second).toEqual({ ok: true });
+  // The recovery ran attach -b to re-mint the vanished session.
+  expect(calls.some((c) => c[1] === "attach")).toBe(true);
+  expect(notes.some((s) => s.includes("vanished"))).toBe(true);
+  // Two new-tab spawns for work::b (the failed one + the retry).
+  const bNewTabs = calls.filter(
+    (c) => c[4] === "new-tab" && c.includes("work::b"),
+  );
+  expect(bNewTabs.length).toBe(2);
+});
+
 test("createZellijBackend.launch: ENOENT (binary missing) → { ok: false, error }", async () => {
   const notes: string[] = [];
   // A spawn that throws synchronously (Bun.spawn surfaces ENOENT this way

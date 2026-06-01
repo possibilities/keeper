@@ -506,6 +506,19 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
+ * Internal: does this `new-tab` stderr mean the target session is gone
+ * (rather than some other failure)? zellij prints `Session '<name>' not
+ * found. The following sessions are active:` when the session vanished,
+ * and `There is no active session!` against an EXITED corpse. Either
+ * signature means "re-mint and retry" — any other non-zero exit is a
+ * real launch failure we surface as-is. ANSI-tolerant via case-
+ * insensitive substring match.
+ */
+function looksLikeSessionGone(stderr: string): boolean {
+  return /not found/i.test(stderr) || /no active session/i.test(stderr);
+}
+
+/**
  * Zellij backend factory. Lazily ensures the session ONCE (memoized
  * `Promise<void>` shared across every `launch`/`closeByName` call),
  * then runs `action new-tab --cwd <abs> --name <name> -- <argv>` for
@@ -600,7 +613,27 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
     ): Promise<LaunchResult> {
       await ensureSession();
       const args = buildZellijNewTabArgs(session, cwd, argv, name);
-      const res = await runCapture(args);
+      let res = await runCapture(args);
+      // The memoized session can die out from under us — zellij exits a
+      // session when its last tab closes, and a reboot/kill drops it too.
+      // A stale `sessionReady` memo would then wedge EVERY future dispatch
+      // ("Session '<name>' not found") until the daemon restarts. On a
+      // session-gone new-tab failure, invalidate the memo, re-ensure
+      // (which re-mints via `attach -b` + poll, re-capturing any orphan
+      // default tab), and retry the new-tab exactly once. The success
+      // path keeps the memo untouched (one list-sessions per worker life).
+      if (
+        res != null &&
+        res.exitCode !== 0 &&
+        looksLikeSessionGone(res.stderr)
+      ) {
+        deps.noteLine(
+          `# warn: zellij session "${session}" vanished; re-minting and retrying new-tab for ${name}`,
+        );
+        sessionReady = null;
+        await ensureSession();
+        res = await runCapture(args);
+      }
       if (res == null) {
         const error = `zellij new-tab for ${name} failed (ENOENT? binary missing)`;
         deps.noteLine(`# warn: ${error}`);
