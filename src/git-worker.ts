@@ -1268,6 +1268,14 @@ function startWorker(): void {
               parent_oid: c.parent_oid,
               files: c.files,
               committer_session_id: c.committer_session_id,
+              // Epic fn-670 (T1): the validated, planctl-shaped `Task:`
+              // trailer values the git-worker collected for this
+              // commit. Empty `[]` on the common path (no Task trailer,
+              // or all values malformed). The reducer's T2 link fold
+              // reads this array together with `committer_session_id`
+              // to stamp the per-task `last_commit_for_task_at` on the
+              // embedded job element under each named task.
+              task_ids: c.task_ids,
               committed_at_ms: c.committed_at_ms,
             } satisfies CommitMessage);
           }

@@ -2506,6 +2506,48 @@ function foldCommit(db: Database, event: Event): void {
         filePath,
       );
     }
+    // v49 / fn-670 (T2): task→committing-session link write. Gated on
+    // BOTH `committer_session_id != null` (the enclosing per-session
+    // arm) AND `task_ids.length > 0` — either-empty short-circuits to
+    // a no-op (the link semantic is "the committing session
+    // demonstrably finished work for THIS task"; without both a
+    // session and at least one task id, there's nothing honest to
+    // stamp). Multi-task commits stamp ALL named tasks symmetrically
+    // (a jobctl commit may close more than one task in one message,
+    // and the union-of-all `task_ids` was frozen at producer time —
+    // {@link parseTaskTrailers}).
+    //
+    // Pure function of the Commit payload + the existing epics rows;
+    // no wall-clock, no env, no fs, no liveness probe. The per-task
+    // RMW (parse, find element, stamp `last_commit_for_task_at`,
+    // bump `last_event_id`/`updated_at`, re-sort via
+    // {@link sortEmbeddedJobs}, write back) preserves the
+    // byte-identical re-fold invariant — sortEmbeddedJobs is the same
+    // deterministic key {@link syncJobIntoEpic} uses.
+    //
+    // Commit-before-claim ordering: when no embedded job element yet
+    // exists for `committer_session_id` under a named task (the
+    // Commit fold lands before SessionStart's `syncJobIntoEpic` for
+    // this session), the link is dropped at this site rather than
+    // shelling a job element foldCommit doesn't otherwise own.
+    // Justified two ways: (a) a real worker's SessionStart precedes
+    // its own commit by definition (the session must exist to spawn
+    // a `git commit` invocation), so the order on the live wire is
+    // claim-then-commit; and (b) a cursor=0 re-fold replays events
+    // strictly in id order — the SessionStart row, having a lower
+    // id, folds first, so the embedded job element is present by
+    // the time this fold lands. The drop-on-miss path is reachable
+    // only on a hand-crafted event sequence (test injection,
+    // human-edited DB) and stays deterministic.
+    if (commit.task_ids.length > 0) {
+      foldCommitTaskLinks(db, {
+        committerSessionId: commit.committer_session_id,
+        taskIds: commit.task_ids,
+        lastCommitForTaskAt: lastCommitAtSeconds,
+        eventId,
+        eventTs,
+      });
+    }
     return;
   }
   // Global discharge: no trailer or malformed trailer → no honest way to
@@ -2544,6 +2586,147 @@ function foldCommit(db: Database, event: Event): void {
       eventTs,
       commit.project_dir,
       filePath,
+    );
+  }
+}
+
+/**
+ * Schema v49 / fn-670 (T2): stamp the per-(task, job) task→committing-
+ * session link on the embedded job element under each named task. Called
+ * from {@link foldCommit}'s per-session arm when BOTH
+ * `committer_session_id != null` AND `task_ids.length > 0`. Pure function
+ * of the inputs + the existing `epics` rows; runs INSIDE the open
+ * `BEGIN IMMEDIATE` transaction opened by {@link applyEvent}. NEVER
+ * throws (a parse failure inside a JSON-TEXT cell folds to "skip this
+ * task" via guarded JSON.parse + Array.isArray; the cursor still
+ * advances).
+ *
+ * For each `task_id` in the payload:
+ *   1. Resolve the parent `epic_id` via {@link parsePlanRef} — a
+ *      malformed id drops at entry granularity (extractCommit already
+ *      gated on {@link TASK_TRAILER_RE} so this is a defensive belt
+ *      inside the fold tx, not a typical path).
+ *   2. SELECT the epic's `tasks` JSON-TEXT cell; absent epic row →
+ *      skip (commit-before-snapshot ordering — the snapshot will land
+ *      later and `syncJobIntoEpic`'s carve-out preserves whatever the
+ *      link is at that moment; on a re-fold from cursor=0 the
+ *      snapshot row precedes this commit row in id order so the
+ *      ordering inverts — re-fold determinism still holds because the
+ *      link is set by THIS fold, not by `syncJobIntoEpic`).
+ *   3. Parse the array, find the task element by id; not found →
+ *      skip (the task is not yet known to this epic — same ordering
+ *      defense as above).
+ *   4. Find the embedded job element whose `job_id ===
+ *      committerSessionId` under the task's `jobs[]` sub-array; not
+ *      found → skip (commit-before-claim path, documented above the
+ *      call site).
+ *   5. Stamp `last_commit_for_task_at = lastCommitForTaskAt`, bump
+ *      `last_event_id = eventId` + `updated_at = eventTs`, re-sort
+ *      via {@link sortEmbeddedJobs} (NEVER append — re-fold
+ *      determinism), re-serialise the tasks array, UPDATE the epic
+ *      row's `tasks` + `last_event_id` + `updated_at`.
+ *
+ * The re-sort is deterministic — `sortEmbeddedJobs` keys on
+ * `(created_at desc, job_id asc)` which a same-task stamp does not
+ * change (we're updating an existing element in place), but the sort
+ * stays for safety: a future field rename or sort-key change must
+ * stay consistent with `syncJobIntoEpic`'s write site, and re-running
+ * the same sort is byte-deterministic.
+ */
+function foldCommitTaskLinks(
+  db: Database,
+  opts: {
+    committerSessionId: string;
+    taskIds: string[];
+    lastCommitForTaskAt: number;
+    eventId: number;
+    eventTs: number;
+  },
+): void {
+  const { committerSessionId, taskIds, lastCommitForTaskAt, eventId, eventTs } =
+    opts;
+  // Minimal shape of an `epics.tasks[]` element this helper reads/writes.
+  // Mirrors the local `TaskElement` interface inside `syncJobIntoEpic` but
+  // narrowed to the fields we touch — the OPAQUE pass-through of the
+  // other fields lives in `unknownFields` so a re-serialise round-trips
+  // byte-identical bytes (the JSON-TEXT cell is opaque to keeper-py and
+  // every other reader, but the round-trip must preserve unknowns for
+  // byte-identical re-fold).
+  interface TaskElementJson {
+    task_id: string;
+    jobs?: EmbeddedJobElement[];
+    [key: string]: unknown;
+  }
+  for (const taskId of taskIds) {
+    // Defensive: extractCommit already gated on TASK_TRAILER_RE, but
+    // re-parse here so the helper is robust against future callers and
+    // the parse step extracts the parent epic_id in one go.
+    const parsed = parsePlanRef(taskId);
+    if (parsed == null || parsed.kind !== "task") {
+      continue;
+    }
+    const epicRow = db
+      .query("SELECT tasks FROM epics WHERE epic_id = ?")
+      .get(parsed.epic_id) as { tasks: string | null } | null;
+    if (
+      epicRow == null ||
+      epicRow.tasks == null ||
+      epicRow.tasks.length === 0
+    ) {
+      continue;
+    }
+    let tasksArr: TaskElementJson[];
+    try {
+      const parsedTasks = JSON.parse(epicRow.tasks);
+      if (!Array.isArray(parsedTasks)) {
+        continue;
+      }
+      tasksArr = parsedTasks as TaskElementJson[];
+    } catch {
+      // Malformed JSON cell — skip this task, never throw inside the
+      // fold tx (CLAUDE.md re-fold invariant).
+      continue;
+    }
+    const taskIdx = tasksArr.findIndex((t) => t.task_id === parsed.task_id);
+    if (taskIdx < 0) {
+      continue; // task not yet known to this epic — skip, cursor advances.
+    }
+    const oldTask = tasksArr[taskIdx];
+    const oldJobs =
+      oldTask != null && Array.isArray(oldTask.jobs) ? oldTask.jobs : [];
+    const jobIdx = oldJobs.findIndex((j) => j.job_id === committerSessionId);
+    if (jobIdx < 0) {
+      // Commit-before-claim path — no embedded job element exists yet
+      // for the committing session under this task. Lose the link
+      // deterministically (documented above the call site). Cursor
+      // still advances.
+      continue;
+    }
+    // RMW: stamp last_commit_for_task_at + bump axes on the matched job
+    // element, then re-sort and write the tasks array back. The job's
+    // `created_at` is unchanged so the sort key is stable, but we sort
+    // anyway for consistency with `syncJobIntoEpic`'s write site.
+    const oldJob = oldJobs[jobIdx];
+    const newJob: EmbeddedJobElement = {
+      ...oldJob,
+      last_commit_for_task_at: lastCommitForTaskAt,
+      last_event_id: eventId,
+      updated_at: eventTs,
+    };
+    const newJobs = oldJobs.slice();
+    newJobs[jobIdx] = newJob;
+    sortEmbeddedJobs(newJobs);
+    // OLD-element carve-out spread: preserve EVERY other scalar field on
+    // the task element (worker_phase, runtime_status, tier, depends_on,
+    // …) so a Commit fold does NOT clobber plan-snapshot-derived state.
+    // Mirrors `syncJobIntoEpic`'s task-side carve-out.
+    const newTask: TaskElementJson = { ...oldTask, jobs: newJobs };
+    const newTasksArr = tasksArr.slice();
+    newTasksArr[taskIdx] = newTask;
+    const tasksJson = JSON.stringify(newTasksArr);
+    db.run(
+      "UPDATE epics SET tasks = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+      [tasksJson, eventId, eventTs, parsed.epic_id],
     );
   }
 }
@@ -3650,6 +3833,31 @@ interface EmbeddedJobElement {
   // attribution from any session). Reads 0 on every entry until the
   // reducer fold rewrite in fn-633.6 lands. INTEGER NOT NULL DEFAULT 0.
   git_orphan_count: number;
+  /**
+   * Schema v49 / fn-670 (T2): the per-(task, job) task→committing-session
+   * link. Stamped by {@link foldCommit} on the embedded job element whose
+   * `job_id == committer_session_id` under the task element matching each
+   * id in the `Commit` payload's `task_ids[]`. Producer-time frozen
+   * `committed_at_ms / 1000` (mirroring the existing discharge timestamp
+   * conversion). `null` on every job that has not yet committed for this
+   * task (the common steady-state read) AND on every pre-v49 stored
+   * element (re-fold determinism — re-fold over the historical event log
+   * leaves the field absent → JSON-decode reads `undefined` → coerced to
+   * `null` by {@link buildEmbeddedJob}'s preservation slot).
+   *
+   * Lives on the JSON-TEXT `jobs` cell on `epics` (kind === "task" path
+   * inside the parent epic's `tasks[].jobs[]`); NO new real column. The
+   * v48→v49 bump is whitelist-only.
+   *
+   * **Clobber guard:** this field is a Commit-event fact, NOT a jobs-row
+   * fact, so {@link buildEmbeddedJob} reads it BACK from the prior
+   * embedded element (the OLD-element carve-out spread pattern) — a
+   * later job-tick re-sync via {@link syncJobIntoEpic} MUST preserve it.
+   * The consumer (planctl `pick_target_job`) prefers the job with the
+   * freshest commit-for-this-task, falling back to freshest-claim when
+   * no job committed.
+   */
+  last_commit_for_task_at?: number | null;
 }
 
 /**
@@ -3729,8 +3937,29 @@ function sortEmbeddedJobs(jobs: EmbeddedJobElement[]): void {
  * via `parsePlanRef` before invoking this on a row whose `plan_verb` is null
  * (a job carrying `plan_ref` always carries `plan_verb`, set-once at
  * SessionStart together).
+ *
+ * Schema v49 / fn-670 (T2): `last_commit_for_task_at` is a Commit-event
+ * fact, NOT a jobs-row fact — it lives on the embedded element solely
+ * via {@link foldCommit}'s write site. To prevent a later job-tick
+ * re-sync from clobbering it, the caller passes the PRIOR embedded
+ * element (the OLD-element carve-out — the same pattern
+ * {@link syncJobIntoEpic}'s task-side spread uses for `worker_phase` /
+ * `runtime_status` / `tier`) and this builder lifts the field forward
+ * deterministically. A missing prior (first-sight job, never-committed
+ * job) yields `null`; an undefined-on-prior (pre-v49 stored element)
+ * also coerces to `null`. Re-fold determinism holds: the lift is a pure
+ * function of the prior element + the jobs row.
  */
-function buildEmbeddedJob(row: JobsRowForSync): EmbeddedJobElement {
+function buildEmbeddedJob(
+  row: JobsRowForSync,
+  prior?: EmbeddedJobElement | undefined,
+): EmbeddedJobElement {
+  // v49 / fn-670: preserve the Commit-event fact across a jobs-row
+  // re-sync. `prior == null` (first-sight under this task / epic) →
+  // null. `prior?.last_commit_for_task_at` may be `undefined` on a
+  // pre-v49 stored element decoded from JSON-TEXT; nullish-coalesce to
+  // `null` so the field round-trips byte-deterministically.
+  const lastCommitForTaskAt = prior?.last_commit_for_task_at ?? null;
   return {
     job_id: row.job_id,
     plan_verb: row.plan_verb ?? "",
@@ -3746,6 +3975,7 @@ function buildEmbeddedJob(row: JobsRowForSync): EmbeddedJobElement {
     git_dirty_count: row.git_dirty_count,
     git_unattributed_to_live_count: row.git_unattributed_to_live_count,
     git_orphan_count: row.git_orphan_count,
+    last_commit_for_task_at: lastCommitForTaskAt,
   };
 }
 
@@ -3790,13 +4020,21 @@ function syncJobIntoEpic(
   if (parsed == null) {
     return; // shape mismatch — skip the fan-out, cursor still advances.
   }
-  const element = buildEmbeddedJob(jobsRow);
 
   if (parsed.kind === "epic") {
     const epicRow = db
       .query("SELECT jobs FROM epics WHERE epic_id = ?")
       .get(parsed.epic_id) as { jobs: string | null } | null;
     const existing = parseEmbeddedJobs(epicRow?.jobs);
+    // v49 / fn-670 (T2): pass the PRIOR embedded element (if any) into
+    // buildEmbeddedJob so the Commit-event-fed `last_commit_for_task_at`
+    // field survives this re-sync. For kind === "epic" (verbs plan /
+    // close) the field is conceptually irrelevant (closer/planner
+    // sessions are not task-bound), but the carve-out preserves any
+    // existing value byte-deterministically — re-fold determinism is
+    // the invariant, not a per-verb pretty-printing.
+    const priorEpicSide = existing.find((j) => j.job_id === jobsRow.job_id);
+    const element = buildEmbeddedJob(jobsRow, priorEpicSide);
     const next = existing.filter((j) => j.job_id !== element.job_id);
     next.push(element);
     sortEmbeddedJobs(next);
@@ -3871,6 +4109,16 @@ function syncJobIntoEpic(
   const oldTask = tasksArr.find((t) => t.task_id === parsed.task_id);
   const oldJobs =
     oldTask != null && Array.isArray(oldTask.jobs) ? oldTask.jobs : [];
+  // v49 / fn-670 (T2): pass the PRIOR embedded element (if any, matched
+  // by job_id under this task) into buildEmbeddedJob so a job-tick
+  // re-sync preserves the Commit-event-fed `last_commit_for_task_at`.
+  // This is THE task-level clobber guard — without it, every jobs-row
+  // write would zero the link the consumer (`pick_target_job`) relies
+  // on. NOT bumped to the latest-jobs-row-derived value because the
+  // link is a per-(task, job) commit FACT, not a derivable jobs-row
+  // axis.
+  const priorTaskSide = oldJobs.find((j) => j.job_id === jobsRow.job_id);
+  const element = buildEmbeddedJob(jobsRow, priorTaskSide);
   const nextTaskJobs = oldJobs.filter((j) => j.job_id !== element.job_id);
   nextTaskJobs.push(element);
   sortEmbeddedJobs(nextTaskJobs);

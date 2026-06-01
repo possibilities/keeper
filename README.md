@@ -912,15 +912,22 @@ row for the file (per-file facts; every attribution row for the same
 `(project_dir, file_path)` converges on the snapshot's freshest pair).
 The git-worker also emits a new `Commit` synthetic event on every
 HEAD-oid change (carrying `{project_dir, commit_oid, parent_oid, files,
-committer_session_id}` where `files` is `Array<{path, blob_oid,
-committed_mode}>` — `blob_oid` and `committed_mode` lifted off
-`git diff-tree -r --no-commit-id -z <oid>` — the committer is resolved
-deterministically from a `Session-Id:` commit trailer stamped by the
-`plugin/bin/git` PATH wrapper when `CLAUDE_CODE_SESSION_ID` is set, or
-falls back to a global discharge when the trailer is absent), and the
-reducer's `Commit` fold updates `file_attributions.last_commit_at`
-(never deletes rows) so a re-edit re-arms attribution by re-stamping
-`last_mutation_at`. As of schema v45 / fn-664.2, that discharge is
+committer_session_id, task_ids}` where `files` is
+`Array<{path, blob_oid, committed_mode}>` — `blob_oid` and
+`committed_mode` lifted off `git diff-tree -r --no-commit-id -z <oid>`).
+`committer_session_id` is resolved from THREE possible trailer sources
+(take-last canonical UUID): the historical `Session-Id:` trailer stamped
+by the `plugin/bin/git` PATH wrapper when `CLAUDE_CODE_SESSION_ID` is
+set (preferred), then `Job-Id:` (fn-670 / T1 — the jobctl-stamped
+trailer; `job_id === session_id` is a keeper invariant, so the value is
+the same UUID), and finally `null` (global discharge) when both are
+absent or malformed. A hand-edited `Session-Id:` wins by take-last
+policy if it disagrees with the coalesced fallback. `task_ids` is the
+collect-all `Task:` trailer values (multi-valued by design — one
+commit may close more than one task); empty `[]` on the common path
+(no `Task:` trailer, or all values malformed). The reducer's `Commit`
+fold updates `file_attributions.last_commit_at` (never deletes rows) so
+a re-edit re-arms attribution by re-stamping `last_mutation_at`. As of schema v45 / fn-664.2, that discharge is
 content-aware: `foldCommit` stamps `last_commit_at` ONLY when the four
 axes are all non-null AND `blob_oid === worktree_oid &&
 committed_mode === worktree_mode` (the commit truly captured the
@@ -955,7 +962,28 @@ the row via the same `last_commit_at` UPDATE; no per-source branch.
 Fixes the 559-orphan spike (`.planctl/{epics,tasks}/*.json` and
 `.planctl/specs/*.md` were strict-mystery orphans the instant they
 flashed dirty, since planctl writes them outside any Claude
-Write/Edit / bash mutation deriver match). As of fn-656.1, the pass-4 fan-out persists ONLY
+Write/Edit / bash mutation deriver match). As of schema v49 / fn-670
+T2, the same `Commit` fold also stamps a deterministic task→committing-
+session link: when BOTH `committer_session_id` is non-null AND
+`task_ids[]` is non-empty, the per-session arm writes a new
+`last_commit_for_task_at` field (producer-time `committed_at_ms / 1000`)
+on the embedded job element whose `job_id == committer_session_id`
+under each named task element inside the parent epic's
+`tasks[].jobs[]`. The link rides FREE in the opaque JSON-TEXT `tasks`
+cell on `epics` (no new real column — the v48→v49 bump is whitelist-
+only on `keeper/api.py`'s `SUPPORTED_SCHEMA_VERSIONS`). `buildEmbeddedJob`
+preserves the field across every `syncJobIntoEpic` re-sync via the
+OLD-element carve-out — without that guard, a later jobs-row write
+would clobber the link the consumer (`planctl pick_target_job`) relies
+on to prefer the committing session over a stale empty re-claim.
+Commit-before-claim (no embedded job element yet under the named task)
+drops the link rather than shelling a job element foldCommit doesn't
+otherwise own; a real worker's SessionStart always precedes its own
+commit by definition, and a cursor=0 re-fold replays events in id
+order so the ordering inverts anyway. Pre-fn-670 Commit events lack
+`task_ids`; `extractCommit` defaults to `[]` so the link write is a
+no-op over the historical log, and a re-fold reproduces byte-identical
+`epics` rows. As of fn-656.1, the pass-4 fan-out persists ONLY
 `dirty > 0` sessions into `git_status.jobs` (the clearing UPDATE +
 `syncIfPlanRef` still fire unconditionally for every session in the
 union — including ones leaving the dirty set via `priorSessions` — so a

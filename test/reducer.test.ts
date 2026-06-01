@@ -13999,3 +13999,387 @@ test("BackendExecSnapshot is deterministic on re-fold (rewind cursor + re-drain 
 
   expect(after).toEqual(before);
 });
+
+// ---------------------------------------------------------------------------
+// fn-670 (T2): task→committing-session link write on foldCommit. Stamps
+// `last_commit_for_task_at` on the embedded job element whose
+// `job_id == committer_session_id` under each task element matching every
+// id in the Commit payload's `task_ids[]`. Gated on BOTH non-null. The
+// link survives a later jobs-row re-sync (clobber guard via the OLD-
+// element carve-out in `buildEmbeddedJob`). A cursor=0 re-fold over a
+// mixed pre-/post-v49 log reproduces byte-identical `epics` rows.
+// ---------------------------------------------------------------------------
+
+/**
+ * Helper: read a specific embedded job element by (taskId, jobId), or
+ * null if either the task or job is missing. Returns the raw object
+ * including `last_commit_for_task_at` so the T2 link write can be
+ * asserted directly.
+ */
+function getEmbeddedTaskJob(
+  taskId: string,
+  jobId: string,
+): {
+  job_id: string;
+  plan_verb: string;
+  state: string;
+  last_event_id: number;
+  updated_at: number;
+  last_commit_for_task_at?: number | null;
+} | null {
+  const task = getTask(taskId);
+  if (task == null || !Array.isArray(task.jobs)) {
+    return null;
+  }
+  const j = (task.jobs as { job_id: string }[]).find((j) => j.job_id === jobId);
+  return (j ?? null) as ReturnType<typeof getEmbeddedTaskJob>;
+}
+
+test("fn-670 T2: foldCommit stamps last_commit_for_task_at on the embedded job whose job_id == committer_session_id under each named task", () => {
+  // Seed: a worker session under task `fn-1-foo.3`. The SessionStart
+  // fan-out lands the embedded job element via `syncJobIntoEpic`. The
+  // Commit event carries `committer_session_id == <session UUID>` and
+  // `task_ids: ['fn-1-foo.3']`. `extractCommit` validates
+  // `committer_session_id` against UUID_RE (job_id === session_id is a
+  // keeper invariant), so the test session id IS a UUID — mirroring
+  // production where Claude Code session IDs are UUIDs.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.3",
+  });
+  drainAll();
+  const before = getEmbeddedTaskJob("fn-1-foo.3", TEST_UUID);
+  expect(before).not.toBeNull();
+  expect(before?.last_commit_for_task_at).toBeNull();
+
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      task_ids: ["fn-1-foo.3"],
+      committed_at_ms: 1_700_000_000_000,
+    }),
+  });
+  expect(drainAll()).toBe(1);
+
+  // (a) The link is stamped on the embedded job element under the task.
+  // (b) The job's `last_event_id` / `updated_at` advanced.
+  const after = getEmbeddedTaskJob("fn-1-foo.3", TEST_UUID);
+  expect(after?.last_commit_for_task_at).toBe(1_700_000_000); // ms → s
+  expect(after?.last_event_id).toBe(id);
+  // (c) Cursor advanced.
+  expect(getCursor()).toBe(id);
+});
+
+test("fn-670 T2: multi-task Commit stamps the link on EVERY named task symmetrically", () => {
+  // A single commit closing two tasks under different epics — the link
+  // write fans across BOTH. (jobctl supports multi-Task commits; the
+  // git-worker collect-all parser feeds this exact shape.)
+  // `committer_session_id` must be a UUID per extractCommit's gate
+  // (job_id === session_id is a keeper invariant).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.1",
+  });
+  drainAll();
+
+  // Seed the second task. The session's plan_ref binds it to fn-1-foo.1
+  // so the syncJobIntoEpic fan-out only lands it under THAT task; for
+  // fn-2-bar.2 we patch the epics row directly to inject the embedded
+  // job element (test-only — the live path lands embedded jobs via
+  // syncJobIntoEpic, and a single session can only have one plan_ref).
+  epicSnapshotEvent("fn-2-bar", { epic_number: 2, title: "Bar" });
+  taskSnapshotEvent("fn-2-bar.2", {
+    epic_id: "fn-2-bar",
+    task_number: 2,
+    title: "Bar 2",
+  });
+  drainAll();
+  const row = db
+    .query("SELECT tasks FROM epics WHERE epic_id = ?")
+    .get("fn-2-bar") as { tasks: string };
+  const tasks = JSON.parse(row.tasks);
+  const t2 = tasks.find(
+    (t: { task_id: string }) => t.task_id === "fn-2-bar.2",
+  ) as { jobs: unknown[] };
+  t2.jobs = [
+    {
+      job_id: TEST_UUID,
+      plan_verb: "work",
+      state: "working",
+      title: null,
+      created_at: 1,
+      updated_at: 1,
+      last_event_id: 1,
+      last_api_error_at: null,
+      last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
+      git_dirty_count: 0,
+      git_unattributed_to_live_count: 0,
+      git_orphan_count: 0,
+      last_commit_for_task_at: null,
+    },
+  ];
+  db.run("UPDATE epics SET tasks = ? WHERE epic_id = ?", [
+    JSON.stringify(tasks),
+    "fn-2-bar",
+  ]);
+
+  // Now fire one Commit event naming BOTH tasks.
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID_2,
+      parent_oid: null,
+      files: ["src/x.ts"],
+      committer_session_id: TEST_UUID,
+      task_ids: ["fn-1-foo.1", "fn-2-bar.2"],
+      committed_at_ms: 1_800_000_000_000,
+    }),
+  });
+  expect(drainAll()).toBe(1);
+
+  // Both embedded job elements stamped.
+  const j1 = getEmbeddedTaskJob("fn-1-foo.1", TEST_UUID);
+  const j2 = getEmbeddedTaskJob("fn-2-bar.2", TEST_UUID);
+  expect(j1?.last_commit_for_task_at).toBe(1_800_000_000);
+  expect(j2?.last_commit_for_task_at).toBe(1_800_000_000);
+  expect(getCursor()).toBe(id);
+});
+
+test("fn-670 T2: no-op when committer_session_id is null (global-discharge path skips the link write)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.5",
+  });
+  drainAll();
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: null,
+      task_ids: ["fn-1-foo.5"],
+      committed_at_ms: 1_700_000_000_000,
+    }),
+  });
+  expect(drainAll()).toBe(1);
+  // Link still null — the global-discharge arm doesn't stamp the link.
+  const j = getEmbeddedTaskJob("fn-1-foo.5", TEST_UUID);
+  expect(j?.last_commit_for_task_at).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("fn-670 T2: no-op when task_ids is empty (pre-fn-670 historical event or no-trailer commit)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.6",
+  });
+  drainAll();
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      task_ids: [],
+      committed_at_ms: 1_700_000_000_000,
+    }),
+  });
+  expect(drainAll()).toBe(1);
+  const j = getEmbeddedTaskJob("fn-1-foo.6", TEST_UUID);
+  expect(j?.last_commit_for_task_at).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("fn-670 T2: pre-fn-670 Commit payload (no task_ids field) folds to []: link write is a safe no-op", () => {
+  // Re-fold determinism over the historical event log. A pre-fn-670
+  // Commit event has no `task_ids` field; extractCommit defaults to
+  // `[]`. The fold treats `[]` exactly as the "no task linkage" case.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.7",
+  });
+  drainAll();
+  const id = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      // NO task_ids field at all — pre-fn-670 shape.
+      committed_at_ms: 1_700_000_000_000,
+    }),
+  });
+  expect(drainAll()).toBe(1);
+  const j = getEmbeddedTaskJob("fn-1-foo.7", TEST_UUID);
+  expect(j?.last_commit_for_task_at).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("fn-670 T2: clobber guard — a later syncJobIntoEpic re-sync PRESERVES last_commit_for_task_at", () => {
+  // The headline-risk test. Stamp the link via foldCommit, then drive a
+  // jobs-row re-sync (e.g. a UserPromptSubmit flipping state →
+  // working) and assert the link survives. Without the
+  // `buildEmbeddedJob` carve-out, the link would be clobbered by the
+  // jobs-row re-emit.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.8",
+  });
+  drainAll();
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      task_ids: ["fn-1-foo.8"],
+      committed_at_ms: 1_900_000_000_000,
+    }),
+  });
+  drainAll();
+  const stamped = getEmbeddedTaskJob("fn-1-foo.8", TEST_UUID);
+  expect(stamped?.last_commit_for_task_at).toBe(1_900_000_000);
+
+  // Drive a jobs-row re-sync via UserPromptSubmit (flips state →
+  // working AND fires `syncJobIntoEpic` for this session).
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: TEST_UUID });
+  drainAll();
+
+  const after = getEmbeddedTaskJob("fn-1-foo.8", TEST_UUID);
+  // State flipped to working (the re-sync DID fire) — proving the path
+  // exercised the carve-out.
+  expect(after?.state).toBe("working");
+  // The link survived.
+  expect(after?.last_commit_for_task_at).toBe(1_900_000_000);
+});
+
+test("fn-670 T2: commit-before-claim (no embedded job element yet) is a deterministic no-op", () => {
+  // The commit fold lands BEFORE the worker's SessionStart — the
+  // documented edge case. On a synthetic event stream we craft this
+  // by inserting Commit first, then SessionStart. The fold drops the
+  // link rather than shelling a job element foldCommit doesn't
+  // otherwise own; the cursor still advances. The SessionStart's
+  // syncJobIntoEpic then lands the embedded job element with
+  // `last_commit_for_task_at = null` (no prior element to carry the
+  // field forward from).
+  const idCommit = insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: TEST_UUID,
+      task_ids: ["fn-1-foo.9"],
+      committed_at_ms: 2_000_000_000_000,
+    }),
+  });
+  drainAll();
+  expect(getCursor()).toBe(idCommit);
+  // No epic row, no task element — the link write skipped at every
+  // level.
+  expect(getTask("fn-1-foo.9")).toBeNull();
+
+  // Now SessionStart lands; the embedded job element appears with
+  // `last_commit_for_task_at = null` (no prior to carry from).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.9",
+  });
+  drainAll();
+  const j = getEmbeddedTaskJob("fn-1-foo.9", TEST_UUID);
+  expect(j).not.toBeNull();
+  expect(j?.last_commit_for_task_at).toBeNull();
+});
+
+test("fn-670 T2: cursor=0 re-fold reproduces byte-identical epics rows over a mixed pre-/post-v49 Commit log", () => {
+  // Determinism over a log carrying BOTH a pre-fn-670 Commit (no
+  // task_ids field, extractCommit defaults to []) AND a post-fn-670
+  // Commit (with task_ids). A from-scratch re-fold must reproduce
+  // byte-identical `epics` rows.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.10",
+  });
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      // Legacy shape: no task_ids field.
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["src/legacy.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 1_500_000_000_000,
+    }),
+  });
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      // Post-fn-670 shape: task_ids present.
+      project_dir: "/repo",
+      commit_oid: TEST_OID_2,
+      parent_oid: TEST_OID,
+      files: ["src/new.ts"],
+      committer_session_id: TEST_UUID,
+      task_ids: ["fn-1-foo.10"],
+      committed_at_ms: 1_900_000_000_000,
+    }),
+  });
+  drainAll();
+  const before = db
+    .query("SELECT * FROM epics ORDER BY epic_id ASC")
+    .all() as Record<string, unknown>[];
+
+  // Rewind cursor + DELETE the projection, then re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM epics");
+  drainAll();
+  const after = db
+    .query("SELECT * FROM epics ORDER BY epic_id ASC")
+    .all() as Record<string, unknown>[];
+
+  expect(after).toEqual(before);
+});

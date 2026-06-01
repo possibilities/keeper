@@ -105,11 +105,19 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   deterministic. The `Commit` payload's `files[]` carries per-file
   `{path, blob_oid, committed_mode}` (the porcelain `mI` mode + new blob
   oid lifted off `git diff-tree -r --no-commit-id <oid>` — `null` on
-  deletion / parse-miss). `foldCommit` reads back the file's stored
-  `(worktree_oid, worktree_mode)` from its `file_attributions` row (written
-  by the latest GitSnapshot fold's pass-1 / pass-2 UPSERT + post-pass
-  refresh — pure event-derived, in-tx) and stamps `last_commit_at` ONLY
-  when the four axes are all non-null AND `blob_oid === worktree_oid && committed_mode === worktree_mode`. The four discharge READ predicates
+  deletion / parse-miss). `committer_session_id` is the take-last
+  canonical UUID lifted from a `Session-Id:` trailer (the historical
+  source — preferred), falling back to `Job-Id:` (fn-670 / T1, the
+  jobctl-stamped trailer — `job_id === session_id` is a keeper
+  invariant, so `Job-Id:` carries the same UUID) when `Session-Id:` is
+  absent or malformed; `null` when both are absent / malformed (global
+  discharge). The hand-edited trailer wins per take-last policy if it
+  disagrees with the coalesced fallback. `foldCommit` reads back the
+  file's stored `(worktree_oid, worktree_mode)` from its
+  `file_attributions` row (written by the latest GitSnapshot fold's
+  pass-1 / pass-2 UPSERT + post-pass refresh — pure event-derived,
+  in-tx) and stamps `last_commit_at` ONLY when the four axes are all
+  non-null AND `blob_oid === worktree_oid && committed_mode === worktree_mode`. The four discharge READ predicates
   (`projectGitStatus` passes 2/3/4) are byte-identical to pre-v45 — only
   the WRITE site changed. ANY null axis falls back to the legacy
   UNCONDITIONAL timestamp discharge (the same path historical events
@@ -121,6 +129,36 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   (the worktree oid is a per-file fact, not per-session). A chmod-only
   dirty file (equal blob, different mode) is also caught — content-equality
   alone would have wrongly discharged it.
+- **Task→committing-session link (schema v49 / fn-670 T2).** The git-
+  worker also parses `Task:` trailers (multi-valued, take-all per
+  `parseTaskTrailers`, validated against `TASK_TRAILER_RE` —
+  `fn-N-slug.M`) and freezes them as `task_ids: string[]` on the same
+  Commit event payload. The reducer's `foldCommit` per-session arm,
+  gated on BOTH `committer_session_id != null` AND
+  `task_ids.length > 0`, stamps a new `last_commit_for_task_at` field
+  (producer-time `committed_at_ms / 1000`) on the embedded job
+  element whose `job_id == committer_session_id` under each named
+  task element inside the parent epic's `tasks[].jobs[]` — bumping
+  `last_event_id` / `updated_at` and re-sorting via
+  `sortEmbeddedJobs`. The field rides FREE in the opaque JSON-TEXT
+  `tasks` cell on `epics` (NO new real column — v48→v49 is a
+  whitelist-only schema bump, listed in `keeper/api.py`'s
+  `SUPPORTED_SCHEMA_VERSIONS` in the same change). **Clobber guard:**
+  `buildEmbeddedJob` reads the prior element's field forward across
+  every `syncJobIntoEpic` re-sync (the OLD-element carve-out — the
+  same pattern that preserves `worker_phase` / `runtime_status` /
+  `tier`), because the field is a Commit-event fact, NOT a jobs-row
+  fact; without the carve-out, every job-tick would clobber the link
+  the consumer (`planctl pick_target_job`) relies on. The
+  commit-before-claim edge case (no embedded job element yet under
+  the named task) loses the link deterministically rather than
+  shelling a job element foldCommit doesn't otherwise own — a real
+  worker's SessionStart precedes its own commit by definition, and
+  the cursor=0 re-fold replays events in id order so the ordering
+  reverses anyway. Re-fold determinism is preserved: pre-fn-670
+  Commit events lack the `task_ids` field; `extractCommit` defaults
+  to `[]` so the link write is a no-op over the historical log, and
+  a from-scratch re-fold reproduces byte-identical `epics` rows.
 - **Planctl-written files attribute honestly (schema v46 / fn-666).** The
   planctl CLI's stdout `planctl_invocation` envelope carries a
   repo-relative `files[]` array naming every `.planctl/{epics,tasks}/*.json`

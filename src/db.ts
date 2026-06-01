@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 48;
+export const SCHEMA_VERSION = 49;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -4728,6 +4728,28 @@ function migrate(db: Database): void {
     addColumnIfMissing(db, "jobs", "backend_exec_pane_id", "TEXT");
     addColumnIfMissing(db, "jobs", "backend_exec_tab_id", "TEXT");
     addColumnIfMissing(db, "jobs", "backend_exec_tab_name", "TEXT");
+
+    // v48→v49: fn-670 (T2) — task→committing-session link. Adds a new
+    // `last_commit_for_task_at` field to the embedded job element shape
+    // stored inside the parent epic's `tasks[].jobs[]` JSON-TEXT cell on
+    // `epics.tasks`. NO new real column — the link rides FREE inside the
+    // opaque JSON-TEXT cell that the plan-snapshot fold already
+    // serialises; this is a whitelist-only schema bump (the field
+    // surfaces with no SQL change, the JSON-decoder reads it as
+    // `undefined` on pre-v49 stored elements and `buildEmbeddedJob`
+    // coerces to `null` for byte-deterministic re-fold).
+    //
+    // No ALTER step here. The bump's purpose is the cross-language
+    // version-gate handshake: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
+    // adds 49 in the SAME change so `jobctl commit-work` (and
+    // `planctl render-approve-context`'s `get_epic` read) continue to
+    // pass after the daemon stamps v49 on this host. test/schema-
+    // version.test.ts enforces. The reducer's `foldCommit` per-session
+    // arm grows a new write site (the link stamp); a cursor=0 re-fold
+    // over a mixed pre-/post-v49 Commit event log reproduces
+    // byte-identical `epics` rows because the link write is a pure
+    // function of the Commit payload (which carries `task_ids: []` on
+    // every pre-fn-670 event via {@link extractCommit}'s default).
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
