@@ -12313,9 +12313,7 @@ test("from-scratch re-fold reproduces the dispatch_failures projection byte-iden
   dispatchFailedEvent("plan-plan", "fn-A.1", "confirm_timeout", "/r3", 1850);
   drainAll();
   const before = db
-    .query(
-      "SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC",
-    )
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
     .all();
   // Rewind cursor + wipe projection + re-drain. The post-rewind rows
   // must equal the pre-rewind rows byte-for-byte — the from-scratch
@@ -12324,9 +12322,7 @@ test("from-scratch re-fold reproduces the dispatch_failures projection byte-iden
   db.run("DELETE FROM dispatch_failures");
   drainAll();
   const after = db
-    .query(
-      "SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC",
-    )
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
     .all();
   expect(after).toEqual(before);
 });
