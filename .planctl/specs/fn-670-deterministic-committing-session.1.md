@@ -63,5 +63,5 @@ Add to test/git-worker.test.ts: real-git commits (via Bun.spawnSync + git interp
 - [ ] New git-worker + reducer tests green; existing tests unaffected.
 
 ## Done summary
-
+git-worker now parses Session-Id, Job-Id, and Task trailers; coalesceCommitterSessionId prefers Session-Id then falls back to Job-Id (UUID-gated), with a stderr warn on the both-differing bug-signal. parseTaskTrailers collects ALL Task: values with per-entry TASK_TRAILER_RE validation. CommitMessage/EnumeratedCommit/CommitPayload carry task_ids end-to-end; extractCommit defaults [] on pre-fn-670 events for re-fold determinism. The dormant v45 per-session discharge arm now fires for jobctl Job-Id-only commits without a schema bump. New tests green (real-git round-trip + reducer fold-arm verification); existing tests unaffected. 531/531 pass on bun test test/git-worker.test.ts test/reducer.test.ts test/db.test.ts test/schema-version.test.ts.
 ## Evidence
