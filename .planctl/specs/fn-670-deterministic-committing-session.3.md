@@ -61,5 +61,5 @@ tests/test_render_approve_context.py: pick_target_job prefers the job with max l
 - [ ] pytest test_render_approve_context.py green incl. flipped + new cases.
 
 ## Done summary
-
+Flipped pick_target_job to prefer last_commit_for_task_at (server-stamped by keeper foldCommit v49) for task ids with freshest-claim fallback, and narrowed extract_last_assistant_message to assistant-role turns only — structurally drops interrupt markers, task-notification injections, and human prompts. Updated SKILL.md Rule 1, planctl-bug-history.md, and jobctl _FORBIDDEN_TRAILER_RE comment.
 ## Evidence

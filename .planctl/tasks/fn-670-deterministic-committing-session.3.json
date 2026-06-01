@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "high",
   "title": "planctl prefers committing session and assistant-only extract",
-  "updated_at": "2026-06-01T15:49:40.840347Z"
+  "updated_at": "2026-06-01T22:29:39.161738Z",
+  "worker_done_at": "2026-06-01T22:29:39.161738Z"
 }
