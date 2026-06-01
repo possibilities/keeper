@@ -87,10 +87,15 @@ from pathlib import Path
 # ``file_attributions`` only for the ``session_id`` / ``file_path`` /
 # ``last_mutation_at`` / ``last_commit_at`` tuple and does not project
 # ``worktree_oid``, so the bump is whitelist-only with no reader logic
-# change.
+# change; v45 (fn-664.2 content-aware discharge gate) adds the additive
+# nullable ``file_attributions.worktree_mode`` column pairing with
+# ``worktree_oid`` on the discharge gate (a chmod-only dirty file with
+# equal blob oid but differing mode stays attributed) — keeper-py does
+# not project ``worktree_mode`` for the same reason as ``worktree_oid``,
+# so the bump is whitelist-only with no reader logic change.
 # Bump this set when a keeper schema change alters those tables.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
-    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44}
+    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45}
 )
 
 

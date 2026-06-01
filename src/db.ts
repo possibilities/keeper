@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 44;
+export const SCHEMA_VERSION = 45;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1139,9 +1139,21 @@ CREATE TABLE IF NOT EXISTS dispatch_failures (
  *   it byte-deterministically (no fold-time git probe). NULL when the
  *   producer's `hash-object` failed for that file (single-file failure, the
  *   snapshot is never wedged), when the row pre-dates v44, or when the
- *   producer-observed worktree shape didn't admit a hash (the discharge gate
- *   in task .2 falls back to timestamp discharge on a NULL oid — "cannot
- *   confirm content equality → keep attribution active").
+ *   producer-observed worktree shape didn't admit a hash (the content-aware
+ *   discharge gate in `foldCommit` falls back to timestamp discharge on a
+ *   NULL oid — "cannot confirm content equality → keep attribution active").
+ * - `worktree_mode` (TEXT, nullable): schema v45 / epic fn-664.2. The
+ *   porcelain v2 `mW` file mode (`100644` / `100755` / `120000` for
+ *   symlinks / `160000` for submodules — `000000` / empty folds to NULL).
+ *   Pairs with `worktree_oid` on the discharge gate so a chmod-only dirty
+ *   file (`committed_oid == worktree_oid`, modes differ) is NOT wrongly
+ *   discharged — the bytes are equal but the file is still on the hook
+ *   for its mode change. Same freezing rule + null-fallback as
+ *   `worktree_oid`: a NULL `worktree_mode` (pre-v45 row, producer
+ *   couldn't observe the mode) falls back to the legacy timestamp
+ *   discharge in `foldCommit`. Both axes always converge on the freshest
+ *   snapshot value (the post-pass-1 `refreshWorktreeOidStmt` UPDATE
+ *   writes both columns in one statement).
  *
  * Defaults match the zero-event projection: every required field has either
  * a `NOT NULL` constraint requiring an explicit insert value, or a `DEFAULT`
@@ -1159,6 +1171,7 @@ CREATE TABLE IF NOT EXISTS file_attributions (
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0,
     worktree_oid TEXT,
+    worktree_mode TEXT,
     PRIMARY KEY (project_dir, session_id, file_path)
 )
 `;
@@ -4336,6 +4349,36 @@ function migrate(db: Database): void {
     // the Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset
     // adds 44 in the same change).
     addColumnIfMissing(db, "file_attributions", "worktree_oid", "TEXT");
+
+    // v44→v45: fn-664.2 — additive nullable `file_attributions.worktree_mode`
+    // column pairing with `worktree_oid` on the content-aware discharge
+    // gate. The porcelain v2 `mW` mode (`100644` / `100755` / `120000` /
+    // `160000`) frozen by the producer at GitSnapshot time; reducer pass-1
+    // / pass-2 UPSERT stamps it alongside `worktree_oid`, post-pass refresh
+    // UPDATE keeps every row for a `(project_dir, file_path)` aligned on the
+    // freshest snapshot value. `foldCommit` reads both axes back and gates
+    // discharge on `committed_oid == worktree_oid AND committed_mode ==
+    // worktree_mode` (both pairs non-null) — so a chmod-only dirty file
+    // with `committed_oid == worktree_oid` but a differing mode is NOT
+    // wrongly discharged.
+    //
+    // Forward-only, nullable, NO data backfill — pre-v45 rows keep
+    // `worktree_mode = null` and the discharge gate falls back to today's
+    // UNCONDITIONAL timestamp discharge on a NULL mode (safer side,
+    // re-fold-deterministic over historical pre-v45 events whose payload
+    // never carried `worktree_mode` / `committed_mode`). Idempotent via
+    // `addColumnIfMissing` — fresh v45 DBs land it via the
+    // CREATE_FILE_ATTRIBUTIONS literal above, migrating v44 DBs land it
+    // here; no version guard needed because both paths converge on the
+    // same column shape and ADD COLUMN never rewrites existing rows.
+    //
+    // No keeper-py reader change: keeper-py reads `file_attributions` only
+    // for the `session_id` / `file_path` / `last_mutation_at` /
+    // `last_commit_at` tuple; `worktree_mode` is server-side fold input,
+    // not part of the wire surface — so v45 is whitelist-only on the
+    // Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset adds
+    // 45 in the same change).
+    addColumnIfMissing(db, "file_attributions", "worktree_mode", "TEXT");
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

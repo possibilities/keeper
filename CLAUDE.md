@@ -89,6 +89,31 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   failing *every* `commit-work` on the host until updated. Additive bumps
   keeper-py never reads still must be listed; `test/schema-version.test.ts`
   enforces it.
+- **Commit discharge is content-aware (schema v45 / fn-664.2).** The
+  `GitSnapshot` payload's `dirty_files[]` carries per-file
+  `{worktree_oid, index_oid, worktree_mode}` (the filter-correct
+  `git hash-object` of the worktree bytes — WITHOUT `--no-filters`, so
+  clean/CRLF filters match the stored blob — plus porcelain v2 `hI` / `mW`,
+  both free off the parse), all frozen at producer time so a re-fold is
+  deterministic. The `Commit` payload's `files[]` carries per-file
+  `{path, blob_oid, committed_mode}` (the porcelain `mI` mode + new blob
+  oid lifted off `git diff-tree -r --no-commit-id <oid>` — `null` on
+  deletion / parse-miss). `foldCommit` reads back the file's stored
+  `(worktree_oid, worktree_mode)` from its `file_attributions` row (written
+  by the latest GitSnapshot fold's pass-1 / pass-2 UPSERT + post-pass
+  refresh — pure event-derived, in-tx) and stamps `last_commit_at` ONLY
+  when the four axes are all non-null AND `blob_oid === worktree_oid && committed_mode === worktree_mode`. The four discharge READ predicates
+  (`projectGitStatus` passes 2/3/4) are byte-identical to pre-v45 — only
+  the WRITE site changed. ANY null axis falls back to the legacy
+  UNCONDITIONAL timestamp discharge (the same path historical events
+  take, so a cursor=0 re-fold over the pre-v44/v45 log reproduces
+  byte-identical projections). This fixes the stage→re-edit→commit
+  orphan: the worktree diverged from the staged-then-committed bytes,
+  the gate suppresses discharge, and the editing session keeps its
+  attribution claim. Symmetric across per-session and global discharge
+  (the worktree oid is a per-file fact, not per-session). A chmod-only
+  dirty file (equal blob, different mode) is also caught — content-equality
+  alone would have wrongly discharged it.
 
 ## DO NOT
 

@@ -520,20 +520,23 @@ test("parseSessionIdTrailer skips trailing empty lines when taking last", () => 
 const VALID_OID = "0123456789abcdef0123456789abcdef01234567";
 const VALID_OID_2 = "fedcba9876543210fedcba9876543210fedcba98";
 
-test("extractCommit accepts a well-formed v44+ payload (files: [{path, blob_oid}])", () => {
+test("extractCommit accepts a well-formed v45+ payload (files: [{path, blob_oid, committed_mode}])", () => {
   // v44 / fn-664: producer emits `files` as `Array<{path, blob_oid}>`. The
   // blob_oid is the per-file committed blob from `git diff-tree -r` —
-  // validated as a 40/64-hex OID, `null` on a parse miss (extractCommit
-  // accepts `null` here; task .2's discharge gate treats `null` as
-  // "cannot confirm content equality" and falls back to timestamp
-  // discharge).
+  // validated as a 40/64-hex OID, `null` on a parse miss (the discharge
+  // gate in `foldCommit` treats `null` as "cannot confirm content
+  // equality" and falls back to timestamp discharge).
+  // v45 / fn-664.2: each entry also carries `committed_mode` (the
+  // porcelain `mI` mode lifted off the same `diff-tree` record) so the
+  // discharge gate can suppress a chmod-only dirty file's wrong
+  // discharge.
   const payload = {
     project_dir: "/repo",
     commit_oid: VALID_OID,
     parent_oid: VALID_OID_2,
     files: [
-      { path: "src/a.ts", blob_oid: VALID_OID },
-      { path: "src/b.ts", blob_oid: null },
+      { path: "src/a.ts", blob_oid: VALID_OID, committed_mode: "100644" },
+      { path: "src/b.ts", blob_oid: null, committed_mode: null },
     ],
     committer_session_id: VALID_UUID,
     committed_at_ms: 1_700_000_000_000,
@@ -541,13 +544,38 @@ test("extractCommit accepts a well-formed v44+ payload (files: [{path, blob_oid}
   expect(extractCommit({ data: JSON.stringify(payload) })).toEqual(payload);
 });
 
-test("extractCommit normalizes legacy string-array files into [{path, blob_oid: null}]", () => {
+test("extractCommit normalizes v44 payload (files: [{path, blob_oid}] with no committed_mode) into [{path, blob_oid, committed_mode: null}]", () => {
+  // v44 events carried `{path, blob_oid}` per file but no `committed_mode`
+  // — extractCommit folds the absent `committed_mode` to `null` so a
+  // re-fold over historical v44 events takes the legacy discharge
+  // fall-back (identical to today's pre-gate behavior).
+  const res = extractCommit({
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: VALID_OID,
+      parent_oid: null,
+      files: [
+        { path: "src/a.ts", blob_oid: VALID_OID }, // v44 shape (no committed_mode)
+        { path: "src/b.ts", blob_oid: null },
+      ],
+      committer_session_id: null,
+      committed_at_ms: 1000,
+    }),
+  });
+  expect(res?.files).toEqual([
+    { path: "src/a.ts", blob_oid: VALID_OID, committed_mode: null },
+    { path: "src/b.ts", blob_oid: null, committed_mode: null },
+  ]);
+});
+
+test("extractCommit normalizes legacy string-array files into [{path, blob_oid: null, committed_mode: null}]", () => {
   // Pre-v44 events stored `files: string[]`. Re-fold determinism requires
   // the new extractor to accept both shapes; each legacy string becomes
-  // `{path, blob_oid: null}` so the reducer reads a uniform interface.
-  // The discharge gate (task .2) treats `null` blob_oid as "cannot
-  // confirm content equality → fall back to timestamp discharge",
-  // preserving today's behavior on the historical log.
+  // `{path, blob_oid: null, committed_mode: null}` so the reducer reads
+  // a uniform interface. The discharge gate treats a null oid OR null
+  // mode as "cannot confirm content+mode equality → fall back to
+  // timestamp discharge", preserving today's behavior on the historical
+  // log.
   const res = extractCommit({
     data: JSON.stringify({
       project_dir: "/repo",
@@ -559,37 +587,46 @@ test("extractCommit normalizes legacy string-array files into [{path, blob_oid: 
     }),
   });
   expect(res?.files).toEqual([
-    { path: "src/a.ts", blob_oid: null },
-    { path: "src/b.ts", blob_oid: null },
+    { path: "src/a.ts", blob_oid: null, committed_mode: null },
+    { path: "src/b.ts", blob_oid: null, committed_mode: null },
   ]);
 });
 
-test("extractCommit normalizes bad blob_oid entries to null without dropping the path", () => {
+test("extractCommit normalizes bad blob_oid / committed_mode entries to null without dropping the path", () => {
   // A producer-side `diff-tree` parse miss for one file shouldn't drop
-  // that file's discharge — it should keep the path but null the oid so
-  // task .2 falls back to timestamp discharge for that file alone.
+  // that file's discharge — it should keep the path but null the oid /
+  // mode so the discharge gate falls back to timestamp discharge for
+  // that file alone.
   const res = extractCommit({
     data: JSON.stringify({
       project_dir: "/repo",
       commit_oid: VALID_OID,
       parent_oid: null,
       files: [
-        { path: "src/a.ts", blob_oid: VALID_OID }, // valid
-        { path: "src/b.ts", blob_oid: "not-an-oid" }, // bad → null
-        { path: "src/c.ts", blob_oid: "" }, // empty → null
-        { path: "src/d.ts" }, // missing key → null
-        { path: "src/e.ts", blob_oid: 42 }, // non-string → null
+        { path: "src/a.ts", blob_oid: VALID_OID, committed_mode: "100644" }, // valid
+        { path: "src/b.ts", blob_oid: "not-an-oid", committed_mode: "100644" }, // bad oid → null
+        { path: "src/c.ts", blob_oid: "", committed_mode: "100644" }, // empty oid → null
+        { path: "src/d.ts", committed_mode: "100644" }, // missing oid → null
+        { path: "src/e.ts", blob_oid: 42, committed_mode: "100644" }, // non-string oid → null
+        { path: "src/f.ts", blob_oid: VALID_OID, committed_mode: "000000" }, // zero mode → null (deletion sentinel)
+        { path: "src/g.ts", blob_oid: VALID_OID, committed_mode: "" }, // empty mode → null
+        { path: "src/h.ts", blob_oid: VALID_OID, committed_mode: 42 }, // non-string mode → null
+        { path: "src/i.ts", blob_oid: VALID_OID }, // missing mode → null
       ],
       committer_session_id: null,
       committed_at_ms: 0,
     }),
   });
   expect(res?.files).toEqual([
-    { path: "src/a.ts", blob_oid: VALID_OID },
-    { path: "src/b.ts", blob_oid: null },
-    { path: "src/c.ts", blob_oid: null },
-    { path: "src/d.ts", blob_oid: null },
-    { path: "src/e.ts", blob_oid: null },
+    { path: "src/a.ts", blob_oid: VALID_OID, committed_mode: "100644" },
+    { path: "src/b.ts", blob_oid: null, committed_mode: "100644" },
+    { path: "src/c.ts", blob_oid: null, committed_mode: "100644" },
+    { path: "src/d.ts", blob_oid: null, committed_mode: "100644" },
+    { path: "src/e.ts", blob_oid: null, committed_mode: "100644" },
+    { path: "src/f.ts", blob_oid: VALID_OID, committed_mode: null },
+    { path: "src/g.ts", blob_oid: VALID_OID, committed_mode: null },
+    { path: "src/h.ts", blob_oid: VALID_OID, committed_mode: null },
+    { path: "src/i.ts", blob_oid: VALID_OID, committed_mode: null },
   ]);
 });
 
@@ -674,8 +711,8 @@ test("extractCommit normalizes empty/null/missing parent_oid to null", () => {
 
 test("extractCommit filters non-string and empty files entries (legacy mixed-shape)", () => {
   // Defensive parse over the legacy `string[]` shape: empty strings, nulls,
-  // and non-strings drop; valid strings normalize to {path, blob_oid: null}
-  // entries so the consumer sees a uniform v44+ array.
+  // and non-strings drop; valid strings normalize to {path, blob_oid: null,
+  // committed_mode: null} entries so the consumer sees a uniform v45+ array.
   const res = extractCommit({
     data: JSON.stringify({
       project_dir: "/repo",
@@ -687,8 +724,8 @@ test("extractCommit filters non-string and empty files entries (legacy mixed-sha
     }),
   });
   expect(res?.files).toEqual([
-    { path: "src/a.ts", blob_oid: null },
-    { path: "src/b.ts", blob_oid: null },
+    { path: "src/a.ts", blob_oid: null, committed_mode: null },
+    { path: "src/b.ts", blob_oid: null, committed_mode: null },
   ]);
 });
 

@@ -1805,12 +1805,19 @@ function projectGitStatus(db: Database, event: Event): void {
   // every row for the same `(project_dir, file_path)` must hold the
   // SAME oid in this snapshot. The split keeps the existing newer-wins
   // semantics for the mutation columns byte-identical while making the
-  // worktree_oid the freshest-per-snapshot value the task .2 discharge
-  // gate will read.
+  // worktree_oid the freshest-per-snapshot value the discharge gate
+  // (in `foldCommit`) reads.
+  //
+  // v45 / fn-664.2: `worktree_mode` rides alongside `worktree_oid` on
+  // the same INSERT VALUES and refresh UPDATE — the mode is also a
+  // per-file snapshot fact, so the same "every row converges on the
+  // freshest snapshot value" invariant holds. The discharge gate pairs
+  // the mode against the commit's `committed_mode` so a chmod-only
+  // dirty file does not wrongly discharge.
   const upsertStmt = db.prepare(
     `INSERT INTO file_attributions
-       (project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at, worktree_oid)
-       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+       (project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at, worktree_oid, worktree_mode)
+       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(project_dir, session_id, file_path) DO UPDATE SET
          last_mutation_at = excluded.last_mutation_at,
          op = excluded.op,
@@ -1819,13 +1826,16 @@ function projectGitStatus(db: Database, event: Event): void {
          updated_at = excluded.updated_at
        WHERE excluded.last_mutation_at > file_attributions.last_mutation_at`,
   );
-  // v44 / fn-664: stamp the latest snapshot's `worktree_oid` onto every
-  // file_attributions row for this file. Runs AFTER the upsert so a
-  // brand-new row (just INSERTed) and a stale row (UPDATE WHERE was
-  // false) both converge on the snapshot's freshest oid value.
+  // v44 / fn-664 + v45 / fn-664.2: stamp the latest snapshot's
+  // `worktree_oid` AND `worktree_mode` onto every file_attributions row
+  // for this file. Runs AFTER the upsert so a brand-new row (just
+  // INSERTed) and a stale row (UPDATE WHERE was false) both converge
+  // on the snapshot's freshest content axes. Both columns written in
+  // ONE statement so a transient mid-statement crash can't leave the
+  // pair desynced.
   const refreshWorktreeOidStmt = db.prepare(
     `UPDATE file_attributions
-        SET worktree_oid = ?
+        SET worktree_oid = ?, worktree_mode = ?
       WHERE project_dir = ?
         AND file_path = ?`,
   );
@@ -1842,9 +1852,15 @@ function projectGitStatus(db: Database, event: Event): void {
         m.last_event_id,
         eventTs,
         file.worktree_oid,
+        file.worktree_mode,
       );
     }
-    refreshWorktreeOidStmt.run(file.worktree_oid, projectDir, file.path);
+    refreshWorktreeOidStmt.run(
+      file.worktree_oid,
+      file.worktree_mode,
+      projectDir,
+      file.path,
+    );
   }
 
   const _gfT1 = performance.now();
@@ -1901,10 +1917,11 @@ function projectGitStatus(db: Database, event: Event): void {
       const mtimeSec = (file.mtime_ms as number) / 1000;
       const inferred = inferFromWindows(bashWindows, mtimeSec);
       for (const m of inferred) {
-        // v44 / fn-664: same UPSERT shape as pass 1 — `worktree_oid` is
-        // the per-file snapshot fact; it rides on the INSERT VALUES of a
-        // brand-new inferred row, and the post-loop refresh UPDATE keeps
-        // every existing row aligned to the freshest oid.
+        // v44 / fn-664 + v45 / fn-664.2: same UPSERT shape as pass 1 —
+        // `worktree_oid` AND `worktree_mode` are per-file snapshot facts;
+        // they ride on the INSERT VALUES of a brand-new inferred row, and
+        // the post-loop refresh UPDATE keeps every existing row aligned
+        // to the freshest snapshot pair.
         upsertStmt.run(
           projectDir,
           m.session_id,
@@ -1915,9 +1932,15 @@ function projectGitStatus(db: Database, event: Event): void {
           m.last_event_id,
           eventTs,
           file.worktree_oid,
+          file.worktree_mode,
         );
       }
-      refreshWorktreeOidStmt.run(file.worktree_oid, projectDir, file.path);
+      refreshWorktreeOidStmt.run(
+        file.worktree_oid,
+        file.worktree_mode,
+        projectDir,
+        file.path,
+      );
     }
   }
 
@@ -2287,8 +2310,7 @@ function retractGitStatus(db: Database, event: Event): void {
  * import("./git-worker").enumerateCommitsInDelta}); main lifts the message
  * into the synthetic event row this arm reads.
  *
- * Discharge semantic: for each `(project_dir, file_path)` pair in the
- * commit's `files` list,
+ * Discharge semantic (schema v45 / fn-664.2 — content-aware):
  *   - `committer_session_id` non-null → UPDATE the matching
  *     `file_attributions` row for `(project_dir, committer_session_id,
  *     file_path)`, setting `last_commit_at = committed_at_ms / 1000`. Per
@@ -2298,22 +2320,63 @@ function retractGitStatus(db: Database, event: Event): void {
  *     commit (no `Session-Id:` trailer, or malformed value) globally
  *     discharges every session's attribution claim for the named files.
  *
+ * Content-aware gate (the fn-664.2 fix): for each file the commit would
+ * discharge, compare the commit's payload `blob_oid` + `committed_mode`
+ * against the file's CURRENT `worktree_oid` + `worktree_mode` stored on
+ * the `file_attributions` row (written by the latest GitSnapshot fold —
+ * see `projectGitStatus`).
+ *
+ *   - All four axes non-null AND the (oid, mode) pairs match → STAMP
+ *     `last_commit_at` (the legacy discharge path — the commit truly
+ *     captured the worktree, so the session is off-the-hook).
+ *   - All four axes non-null AND either pair MISMATCHES → DO NOTHING
+ *     (the worktree diverged from the committed bytes/mode; the session
+ *     is still on-the-hook for the still-dirty file, and a re-edit is
+ *     ALREADY accounted for via `last_mutation_at`). This is the
+ *     stage→re-edit→commit case the epic exists to fix; without this
+ *     branch the file falls to `<orphan>` even though the editing session
+ *     should retain attribution.
+ *   - ANY of the four axes IS NULL → fall back to today's UNCONDITIONAL
+ *     timestamp discharge (the SAME code path pre-v45 events traversed,
+ *     so a cursor=0 re-fold over NULL-oid / NULL-mode history reproduces
+ *     byte-identical projections). The null sources: pre-v44 producer
+ *     events (`worktree_oid` / `committed_*` absent), pre-v45 producer
+ *     events (`committed_mode` / `worktree_mode` absent), the producer's
+ *     per-file `hash-object` / `diff-tree` parse miss, racy-clean rows
+ *     (the GitSnapshot fold ran without observing this file), inferred /
+ *     untracked entries that never carried a meaningful committed
+ *     baseline. The fall-back is the safer side per the epic's "Best
+ *     practices": "Treat NULL worktree_oid (racy-clean / lstat miss /
+ *     inferred / untracked) as 'cannot confirm → keep attribution
+ *     active'" was the intent — but for re-fold determinism against
+ *     historical events we MUST converge on the EXISTING semantic, which
+ *     was unconditional discharge. The pre-existing semantics
+ *     unconditionally discharge; the new gate only KICKS IN when both
+ *     sides have non-null evidence, so historical re-folds are
+ *     untouched.
+ *
  * The UPDATE matches zero rows when no session has yet recorded a mutation
  * on the file (file_attributions rows are created by the mutation-event
- * fold in task .6, not here). That's intentional — a discharge can't
- * resurrect a non-existent attribution. The cursor still advances per the
- * fold-tx invariant.
+ * fold, not here). That's intentional — a discharge can't resurrect a
+ * non-existent attribution. The cursor still advances per the fold-tx
+ * invariant.
  *
- * Producer-only liveness: this arm reads ONLY the payload fields. No
- * `git log` re-shell, no FS probe, no env read — every fact it touches
- * lives in the event log, so a from-scratch re-fold reproduces the same
- * `file_attributions.last_commit_at` byte-deterministically.
+ * Producer-only liveness: this arm reads ONLY the payload fields and the
+ * already-folded `file_attributions` row (event-derived). No `git log`
+ * re-shell, no FS probe, no env read — every fact it touches lives in
+ * the event log, so a from-scratch re-fold reproduces the same
+ * `file_attributions.last_commit_at` byte-deterministically. The
+ * worktree_oid / worktree_mode read-back is on the IN-TX projection
+ * (post-pass-1 of any prior GitSnapshot fold), so re-fold determinism
+ * holds.
  *
  * Runs inside the same `BEGIN IMMEDIATE` transaction as the cursor
  * advance (via {@link applyEvent}); a throw anywhere here rolls back
  * both writes. The defensive {@link import("./derivers").extractCommit}
  * parser returns `null` on every shape-mismatch path so a malformed
- * payload folds to a safe no-op; the cursor still advances.
+ * payload folds to a safe no-op; the cursor still advances. The
+ * four discharge READ predicates downstream (`projectGitStatus`
+ * passes 2/3/4) are byte-identical — only the WRITE site here changes.
  */
 function foldCommit(db: Database, event: Event): void {
   const commit = extractCommit(event);
@@ -2338,6 +2401,68 @@ function foldCommit(db: Database, event: Event): void {
   const lastCommitAtSeconds = commit.committed_at_ms / 1000;
   const eventTs = event.ts;
   const eventId = event.id;
+
+  // Helper: decide whether the content-aware gate should suppress
+  // discharge for this `(project_dir, file_path)` against the commit's
+  // payload entry. Returns `true` if the commit's `(blob_oid,
+  // committed_mode)` pair both DIFFER from the file's current
+  // `(worktree_oid, worktree_mode)` stored on `file_attributions` — i.e.
+  // the worktree diverged from the committed bytes/mode, so the session
+  // stays on-the-hook. Returns `false` (DISCHARGE) when (a) any of the
+  // four axes is NULL (legacy timestamp fall-back — same path historical
+  // events take, re-fold determinism), or (b) all four are non-null AND
+  // the (oid, mode) pairs MATCH (the commit captured the worktree).
+  //
+  // The read targets the post-pass-1 `file_attributions` projection —
+  // pure event-derived, in-tx with this fold. Re-fold determinism
+  // preserved.
+  const worktreeProbeStmt = db.prepare(
+    `SELECT worktree_oid, worktree_mode FROM file_attributions
+      WHERE project_dir = ? AND file_path = ? LIMIT 1`,
+  );
+  function shouldSkipDischarge(
+    projectDir: string,
+    filePath: string,
+    committedOid: string | null,
+    committedMode: string | null,
+  ): boolean {
+    if (committedOid === null || committedMode === null) {
+      // Pre-v44/v45 event, producer parse miss, or deletion — fall back
+      // to today's unconditional timestamp discharge. Identical to
+      // pre-fn-664.2 behavior.
+      return false;
+    }
+    // The worktree_oid / worktree_mode is a per-file fact — any
+    // attribution row for `(project_dir, file_path)` carries the SAME
+    // pair (the GitSnapshot refresh UPDATE writes both columns onto
+    // every row for the file). LIMIT 1 is safe.
+    const row = worktreeProbeStmt.get(projectDir, filePath) as
+      | { worktree_oid: string | null; worktree_mode: string | null }
+      | null
+      | undefined;
+    if (row == null) {
+      // No attribution row exists yet — nothing to gate; the
+      // discharging UPDATE will match zero rows below either way. Fall
+      // through to the legacy path (zero-row UPDATE is a safe no-op).
+      return false;
+    }
+    if (row.worktree_oid === null || row.worktree_mode === null) {
+      // No GitSnapshot has yet folded a content-aware payload for this
+      // file (pre-v44/v45 events, or never observed dirty). Fall back to
+      // today's unconditional timestamp discharge — re-fold determinism
+      // over historical events.
+      return false;
+    }
+    // All four axes non-null: gate on EQUALITY. Suppress discharge only
+    // when EITHER pair MISMATCHES (the worktree diverged from the
+    // committed bytes/mode — the session stays on-the-hook). When BOTH
+    // pairs MATCH, fall through to discharge (the commit truly captured
+    // the worktree).
+    return (
+      row.worktree_oid !== committedOid || row.worktree_mode !== committedMode
+    );
+  }
+
   if (commit.committer_session_id !== null) {
     // Per-session discharge: only the committing session clears its claim
     // on each named file. Other sessions that also touched these files
@@ -2349,15 +2474,26 @@ function foldCommit(db: Database, event: Event): void {
           AND session_id = ?
           AND file_path = ?`,
     );
-    // v44 / fn-664: `commit.files[]` is now `{path, blob_oid}[]`; this task
-    // (.1) reads only `path` so discharge behavior is UNCHANGED — the
-    // content-aware gate that consumes `blob_oid` lands in task .2. The
-    // extractCommit defensive parser has already guarded both new- and
-    // legacy-shape entries; we re-check `path` here for safety inside the
-    // fold tx (mirrors the prior per-string defensive check).
+    // v45 / fn-664.2: content-aware gate. The extractCommit defensive
+    // parser already guarded the entry shape; we re-check `path` here
+    // for safety inside the fold tx (mirrors the prior per-string
+    // defensive check). When the gate suppresses, we skip the UPDATE
+    // entirely — `last_mutation_at` is unchanged, the row stays in
+    // the dirty/attributed bucket via the (mutation > commit)
+    // inequality the four discharge read predicates use.
     for (const entry of commit.files) {
       const filePath = entry.path;
       if (typeof filePath !== "string" || filePath.length === 0) continue;
+      if (
+        shouldSkipDischarge(
+          commit.project_dir,
+          filePath,
+          entry.blob_oid,
+          entry.committed_mode,
+        )
+      ) {
+        continue;
+      }
       stmt.run(
         lastCommitAtSeconds,
         eventId,
@@ -2380,11 +2516,25 @@ function foldCommit(db: Database, event: Event): void {
       WHERE project_dir = ?
         AND file_path = ?`,
   );
-  // v44 / fn-664: same shape switch as the per-session arm above; read only
-  // `path` for discharge in this task (`blob_oid` is unread until task .2).
+  // v45 / fn-664.2: same content-aware gate as the per-session arm
+  // above. The oid/mode read is per-file (a property of the worktree,
+  // not the session), so the same `shouldSkipDischarge` probe gates
+  // both the per-session and global discharge paths symmetrically — a
+  // chmod-only dirty file under a human/CI commit is NOT discharged
+  // either, for the same reason a session-commit doesn't discharge it.
   for (const entry of commit.files) {
     const filePath = entry.path;
     if (typeof filePath !== "string" || filePath.length === 0) continue;
+    if (
+      shouldSkipDischarge(
+        commit.project_dir,
+        filePath,
+        entry.blob_oid,
+        entry.committed_mode,
+      )
+    ) {
+      continue;
+    }
     globalStmt.run(
       lastCommitAtSeconds,
       eventId,

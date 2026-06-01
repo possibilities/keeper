@@ -1194,15 +1194,24 @@ export function parseSessionIdTrailer(raw: unknown): string | null {
  * event was emitted by a pre-v44 producer that carried the legacy
  * `files: string[]` shape; `extractCommit` accepts both shapes for backward
  * compatibility (re-fold determinism over the historical event log) and
- * normalizes the legacy form into `{path, blob_oid: null}` rows. Task .2
- * of the epic gates content-aware discharge on `blob_oid != null && blob_oid
- * === worktree_oid`; a `null` here falls back to today's timestamp
- * discharge (safer side — "cannot confirm content equality → discharge as
- * a no-op probe via the timestamp rule").
+ * normalizes the legacy form into `{path, blob_oid: null, committed_mode:
+ * null}` rows.
+ *
+ * Schema v45 / fn-664.2: `committed_mode` joins the entry — the porcelain
+ * `mI` mode (`100644` / `100755` / `120000` / `160000`) lifted off the same
+ * `diff-tree -r` record at producer time. The reducer's discharge gate now
+ * stamps `last_commit_at` ONLY when `blob_oid === worktree_oid && committed
+ * _mode === worktree_mode` (both pairs present on the row); on any null in
+ * either pair it falls back to today's UNCONDITIONAL timestamp discharge
+ * (the safer side — "cannot confirm content+mode equality → discharge
+ * via the legacy rule"). `committed_mode` is `null` for legacy
+ * pre-v45 events, for deletion records (zero-mode sentinel), and for
+ * parse misses.
  */
 export interface CommitFileEntry {
   path: string;
   blob_oid: string | null;
+  committed_mode: string | null;
 }
 
 export interface CommitPayload {
@@ -1275,24 +1284,33 @@ export function extractCommit(event: { data: string }): CommitPayload | null {
   } else {
     parentOid = null;
   }
-  // v44 / fn-664: `files[]` is now `Array<{path, blob_oid}>` carrying the
-  // committed blob oid per file (used by task .2 for content-aware
-  // discharge). Pre-v44 events stored `files: string[]`; we accept BOTH
+  // v44 / fn-664: `files[]` is now `Array<{path, blob_oid, committed_mode}>`
+  // carrying the committed blob oid + porcelain `mI` mode per file (used by
+  // the content-aware discharge gate in `foldCommit`). Pre-v44 events
+  // stored `files: string[]`; v44 events stored `{path, blob_oid}` without
+  // `committed_mode`; v45+ events carry the full tuple. We accept ALL
   // shapes so a from-scratch re-fold over the historical event log
   // reproduces the same projection — a legacy string entry normalizes to
-  // `{path, blob_oid: null}` and the reducer's discharge fold treats
-  // `blob_oid: null` exactly as today's timestamp discharge (safer side).
+  // `{path, blob_oid: null, committed_mode: null}` and an absent
+  // `committed_mode` on a v44 entry folds to `null` (the discharge fold
+  // treats either null exactly as today's UNCONDITIONAL timestamp
+  // discharge — the safer side).
   // Per-entry shape misses fold to null/skip; never throws (the fold tx is
   // sacred). The blob_oid validation reuses GIT_OID_RE so a producer
   // diff-tree parse miss or a non-hex token folds to `null` for that one
-  // file without wedging the whole payload.
+  // file without wedging the whole payload. `committed_mode` is a
+  // string-equality token (the reducer compares against the snapshot's
+  // `worktree_mode` byte-identically), so any non-empty string passes —
+  // length/shape mismatch with the snapshot's mode falls through the
+  // discharge gate naturally as a non-equal compare, and a zero-mode /
+  // empty / non-string folds to `null`.
   const rawFiles = obj.files;
   const files: CommitFileEntry[] = [];
   if (Array.isArray(rawFiles)) {
     for (const f of rawFiles) {
       if (typeof f === "string") {
         if (f.length > 0) {
-          files.push({ path: f, blob_oid: null });
+          files.push({ path: f, blob_oid: null, committed_mode: null });
         }
         continue;
       }
@@ -1310,7 +1328,19 @@ export function extractCommit(event: { data: string }): CommitPayload | null {
       } else {
         blobOid = null;
       }
-      files.push({ path: rawPath, blob_oid: blobOid });
+      const rawMode = entry.committed_mode;
+      let committedMode: string | null;
+      if (typeof rawMode === "string") {
+        committedMode =
+          rawMode.length === 0 || /^0+$/.test(rawMode) ? null : rawMode;
+      } else {
+        committedMode = null;
+      }
+      files.push({
+        path: rawPath,
+        blob_oid: blobOid,
+        committed_mode: committedMode,
+      });
     }
   }
   const rawSession = obj.committer_session_id;

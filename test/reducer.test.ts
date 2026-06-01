@@ -1692,6 +1692,555 @@ test("GitSnapshot re-discharge: mutate → commit → re-mutate → file back in
   expect(files[0]?.attributions[0]?.session_id).toBe(TEST_UUID);
 });
 
+// ---------------------------------------------------------------------------
+// fn-664.2: content-aware discharge gate. `foldCommit` compares the commit's
+// per-file `(blob_oid, committed_mode)` against the file_attributions row's
+// stored `(worktree_oid, worktree_mode)` and SUPPRESSES discharge when the
+// worktree diverged from the committed bytes/mode — the stage→re-edit→commit
+// case that orphaned dirty files pre-v45.
+// ---------------------------------------------------------------------------
+
+test("fn-664.2 content-aware gate: stage→re-edit→commit (committed_oid != worktree_oid) STAYS attributed", () => {
+  // Session writes src/a.ts at ts=100, snapshot at ts=150 observes
+  // worktree_oid=A (the latest dirty bytes). Commit at ts=200 captures
+  // a DIFFERENT blob_oid=B (e.g. the user staged earlier, then re-edited
+  // the worktree, then committed the staged blob). Without the gate the
+  // discharge would orphan the file. With the gate, foldCommit reads
+  // back worktree_oid=A != committed B → suppresses discharge →
+  // attribution stays live, file does NOT orphan.
+  const WORKTREE_OID = TEST_OID; // bytes currently in the worktree
+  const COMMITTED_OID = TEST_OID_2; // the (older, staged) bytes the commit captured
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
+  });
+  // GitSnapshot freezes the latest worktree_oid into file_attributions.
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 150,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: "src/a.ts",
+          xy: " M",
+          mtime_ms: null,
+          worktree_oid: WORKTREE_OID,
+          worktree_mode: "100644",
+        },
+      ],
+    }),
+  });
+  // Commit captures a different blob (the staged bytes, not the
+  // worktree bytes). Same mode, mismatching oid.
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID_2,
+      parent_oid: null,
+      files: [
+        {
+          path: "src/a.ts",
+          blob_oid: COMMITTED_OID,
+          committed_mode: "100644",
+        },
+      ],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 200_000,
+    }),
+  });
+  // A subsequent snapshot still shows the file dirty with the same
+  // worktree_oid (still the post-re-edit bytes).
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 300,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: "src/a.ts",
+          xy: " M",
+          mtime_ms: null,
+          worktree_oid: WORKTREE_OID,
+          worktree_mode: "100644",
+        },
+      ],
+    }),
+  });
+  drainAll();
+  // The gate suppressed discharge: last_commit_at is still NULL on
+  // the attribution row.
+  const fa = db
+    .query(
+      "SELECT last_commit_at FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", TEST_UUID, "src/a.ts") as
+    | { last_commit_at: number | null }
+    | undefined;
+  expect(fa?.last_commit_at).toBeNull();
+  // The dirty file's attributions[] still carries the session — it did
+  // NOT orphan.
+  const row = db
+    .query("SELECT dirty_files FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { dirty_files: string } | null;
+  const files = JSON.parse(row?.dirty_files ?? "[]") as Array<{
+    attributions: Array<{ session_id: string }>;
+  }>;
+  expect(files[0]?.attributions.length).toBe(1);
+  expect(files[0]?.attributions[0]?.session_id).toBe(TEST_UUID);
+  // And `git_orphan_count` is 0 (the file has an active attribution).
+  const status = db
+    .query("SELECT orphaned_count FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { orphaned_count: number } | null;
+  expect(status?.orphaned_count).toBe(0);
+});
+
+test("fn-664.2 content-aware gate: commit captured the worktree (committed_oid == worktree_oid && mode ==) DISCHARGES as before", () => {
+  // Regression: the legacy discharge path must still fire when the
+  // commit really did capture the latest worktree bytes + mode. Verifies
+  // the gate didn't accidentally break the happy path.
+  const OID = TEST_OID;
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 150,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: "src/a.ts",
+          xy: " M",
+          mtime_ms: null,
+          worktree_oid: OID,
+          worktree_mode: "100644",
+        },
+      ],
+    }),
+  });
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID_2,
+      parent_oid: null,
+      files: [{ path: "src/a.ts", blob_oid: OID, committed_mode: "100644" }],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 200_000,
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 300,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: "src/a.ts",
+          xy: " M",
+          mtime_ms: null,
+          worktree_oid: OID,
+          worktree_mode: "100644",
+        },
+      ],
+    }),
+  });
+  drainAll();
+  // Discharge fired: last_commit_at stamped, attribution dropped from
+  // the rendered list.
+  const fa = db
+    .query(
+      "SELECT last_commit_at FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", TEST_UUID, "src/a.ts") as
+    | { last_commit_at: number | null }
+    | undefined;
+  expect(fa?.last_commit_at).toBe(200);
+  const row = db
+    .query("SELECT dirty_files FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { dirty_files: string } | null;
+  const files = JSON.parse(row?.dirty_files ?? "[]") as Array<{
+    attributions: Array<{ session_id: string }>;
+  }>;
+  expect(files[0]?.attributions).toEqual([]);
+});
+
+test("fn-664.2 content-aware gate: chmod-only (equal blob_oid, different worktree_mode) STAYS attributed", () => {
+  // The worktree bytes equal the committed bytes (worktree_oid ==
+  // blob_oid), but the worktree mode is 100755 while the commit
+  // captured 100644 (e.g. user chmod +x'd the worktree, then committed
+  // the bytes without the mode change). Without the mode check the
+  // file would wrongly discharge; with it, attribution stays live.
+  const OID = TEST_OID;
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/script.sh" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 150,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: "script.sh",
+          xy: " M",
+          mtime_ms: null,
+          worktree_oid: OID,
+          worktree_mode: "100755",
+        },
+      ],
+    }),
+  });
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID_2,
+      parent_oid: null,
+      files: [{ path: "script.sh", blob_oid: OID, committed_mode: "100644" }],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 200_000,
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 300,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: "script.sh",
+          xy: " M",
+          mtime_ms: null,
+          worktree_oid: OID,
+          worktree_mode: "100755",
+        },
+      ],
+    }),
+  });
+  drainAll();
+  // Gate suppressed discharge on mode mismatch.
+  const fa = db
+    .query(
+      "SELECT last_commit_at FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", TEST_UUID, "script.sh") as
+    | { last_commit_at: number | null }
+    | undefined;
+  expect(fa?.last_commit_at).toBeNull();
+  const row = db
+    .query("SELECT dirty_files FROM git_status WHERE project_dir = ?")
+    .get("/repo") as { dirty_files: string } | null;
+  const files = JSON.parse(row?.dirty_files ?? "[]") as Array<{
+    attributions: Array<{ session_id: string }>;
+  }>;
+  expect(files[0]?.attributions.length).toBe(1);
+  expect(files[0]?.attributions[0]?.session_id).toBe(TEST_UUID);
+});
+
+test("fn-664.2 NULL-oid legacy event: pre-v44 Commit payload (files: string[]) falls back to unconditional timestamp discharge", () => {
+  // Re-fold determinism guard: a legacy-shape Commit event (files
+  // as a string array, no blob_oid / committed_mode) MUST discharge
+  // unconditionally — identical to pre-v45 behavior. Otherwise a
+  // cursor=0 re-fold over historical events would diverge from the
+  // live projection. extractCommit normalizes legacy strings to
+  // `{path, blob_oid: null, committed_mode: null}`; foldCommit's
+  // gate sees both null and falls through to the legacy UPDATE.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/legacy.ts" } }),
+  });
+  // Snapshot WITH a worktree_oid (the live producer always emits it
+  // now). The Commit event itself is legacy (string array) — so the
+  // gate's `committed_oid` is null → fall back path.
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 150,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: "src/legacy.ts",
+          xy: " M",
+          mtime_ms: null,
+          worktree_oid: TEST_OID,
+          worktree_mode: "100644",
+        },
+      ],
+    }),
+  });
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID_2,
+      parent_oid: null,
+      // Legacy shape: string array, no blob_oid / committed_mode.
+      files: ["src/legacy.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 200_000,
+    }),
+  });
+  drainAll();
+  // Legacy fall-back fired: last_commit_at stamped.
+  const fa = db
+    .query(
+      "SELECT last_commit_at FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", TEST_UUID, "src/legacy.ts") as
+    | { last_commit_at: number | null }
+    | undefined;
+  expect(fa?.last_commit_at).toBe(200);
+});
+
+test("fn-664.2 cursor=0 re-fold determinism: content-aware gate reproduces byte-identical projections", () => {
+  // Plant a mixed-shape stream: legacy-shape commit + v45 mismatching
+  // commit + v45 matching commit. Drain to steady state, snapshot
+  // git_status + file_attributions, rewind cursor to 0, DELETE both
+  // projection tables, re-drain, snapshot again. Byte-identical or
+  // re-fold determinism is broken.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  // File 1: legacy commit (will discharge via fall-back).
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/legacy.ts" } }),
+  });
+  // File 2: v45 mismatching commit (gate suppresses discharge).
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 110,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/mismatch.ts" } }),
+  });
+  // File 3: v45 matching commit (discharge).
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 120,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/match.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 150,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: "legacy.ts",
+          xy: " M",
+          mtime_ms: null,
+          worktree_oid: null,
+          worktree_mode: null,
+        },
+        {
+          path: "mismatch.ts",
+          xy: " M",
+          mtime_ms: null,
+          worktree_oid: TEST_OID,
+          worktree_mode: "100644",
+        },
+        {
+          path: "match.ts",
+          xy: " M",
+          mtime_ms: null,
+          worktree_oid: TEST_OID_2,
+          worktree_mode: "100644",
+        },
+      ],
+    }),
+  });
+  // Legacy commit: discharges legacy.ts via fall-back.
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["legacy.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 200_000,
+    }),
+  });
+  // v45 mismatching commit: gate suppresses. blob_oid=TEST_OID_2 but
+  // worktree_oid=TEST_OID.
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 210,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID_2,
+      parent_oid: null,
+      files: [
+        {
+          path: "mismatch.ts",
+          blob_oid: TEST_OID_2,
+          committed_mode: "100644",
+        },
+      ],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 210_000,
+    }),
+  });
+  // v45 matching commit: discharges match.ts (oid + mode equal).
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 220,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: [
+        {
+          path: "match.ts",
+          blob_oid: TEST_OID_2,
+          committed_mode: "100644",
+        },
+      ],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 220_000,
+    }),
+  });
+  drainAll();
+
+  // Snapshot live projection.
+  const liveGitStatus = db
+    .query("SELECT * FROM git_status ORDER BY project_dir")
+    .all();
+  const liveAttributions = db
+    .query(
+      "SELECT project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at, worktree_oid, worktree_mode FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+
+  // Rewind: cursor=0 + DELETE both projections, then re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM file_attributions");
+  // Also drop jobs counts that the fan-out wrote (re-fold also rewrites
+  // them; comparing the file-attribution / git-status projections is
+  // sufficient for the gate's determinism).
+  drainAll();
+
+  const refoldedGitStatus = db
+    .query("SELECT * FROM git_status ORDER BY project_dir")
+    .all();
+  const refoldedAttributions = db
+    .query(
+      "SELECT project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at, worktree_oid, worktree_mode FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+
+  expect(refoldedGitStatus).toEqual(liveGitStatus);
+  expect(refoldedAttributions).toEqual(liveAttributions);
+});
+
 test("GitSnapshot global discharge: NULL committer clears every session's attribution", () => {
   // Two sessions write the same file. A NULL-committer commit (human or
   // CI commit, trailer-less) globally clears both attributions. The

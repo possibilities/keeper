@@ -195,11 +195,21 @@ export interface GitRootDroppedMessage {
  * path). `blob_oid` is `null` for deletions (no blob to compare against),
  * for parse misses, and on producer fall-backs — the reducer treats
  * `null` as "cannot confirm content equality" and falls back to the
- * timestamp discharge rule in task .2.
+ * timestamp discharge rule.
+ *
+ * Schema v45 / fn-664.2: `committed_mode` joins the entry — the porcelain
+ * `mI` field (`100644` / `100755` / `120000` / `160000`) lifted off the
+ * same `diff-tree -r` record at parse time. The reducer's content-aware
+ * discharge pairs `committed_mode` against the snapshot's `worktree_mode`
+ * so a chmod-only dirty file (`committed_oid == worktree_oid`, modes
+ * differ) is not wrongly discharged. Folds to `null` for deletions
+ * (zero-mode sentinel) and for parse misses — null modes pair the same
+ * way as null oids on the discharge gate (timestamp fall-back).
  */
 export interface CommitMessageFile {
   path: string;
   blob_oid: string | null;
+  committed_mode: string | null;
 }
 
 export interface CommitMessage {
@@ -606,10 +616,22 @@ function readStatus(root: string): ParsedGitStatus | null {
  * `git diff-tree -r --no-commit-id <commit>` (the "new" oid in each
  * record); a malformed/missing oid folds to `null` so a single bad record
  * never wedges the whole commit message.
+ *
+ * Schema v45 / fn-664.2: `committed_mode` joins the entry — the porcelain
+ * mode `mI` from the same `diff-tree` record (`100644` / `100755` /
+ * `120000` for symlinks / `160000` for submodules / `000000` for the
+ * deletion side). The reducer's content-aware discharge gate pairs
+ * `committed_mode` against the snapshot's `worktree_mode` so a chmod-only
+ * dirty file — `committed_oid == worktree_oid` but mode differs — is NOT
+ * wrongly discharged (the blob bytes are equal but the file is still on
+ * the hook for its mode change). Folds to `null` symmetrically with
+ * `blob_oid` on any parse miss; the discharge gate treats null modes the
+ * same as null oids (fall back to today's timestamp discharge).
  */
 interface EnumeratedCommitFile {
   path: string;
   blob_oid: string | null;
+  committed_mode: string | null;
 }
 
 /**
@@ -683,13 +705,20 @@ function commitFiles(root: string, oid: string): EnumeratedCommitFile[] {
     if (path.length === 0) continue;
     // diff-tree's `-r` meta line starts with `:` and uses single-space
     // separators: `:<mH> <mI> <hH> <hI> <STATUS>`. After splitting on space,
-    // index 3 carries `hI` (the new/committed blob oid). For deletions
-    // git emits `hI = 0000...000` — the all-zeros sentinel; validate via
-    // PRODUCER_OID_RE and additionally reject the zero-oid (the file was
-    // deleted in this commit — there's nothing to compare worktree bytes
-    // against, so `null` is the honest signal).
+    // index 1 carries `mI` (the new/committed mode) and index 3 carries `hI`
+    // (the new/committed blob oid). For deletions git emits
+    // `hI = 0000...000` and `mI = 000000` — the all-zeros sentinels;
+    // validate the oid via PRODUCER_OID_RE and additionally reject the
+    // zero-oid (the file was deleted in this commit — there's nothing to
+    // compare worktree bytes against, so `null` is the honest signal). The
+    // mode side accepts any non-empty token shape (the reducer compares
+    // string-equality against the snapshot's `mW`, so the exact byte
+    // sequence matters more than a regex shape check); a leading
+    // all-zeros mode for a deletion folds to `null` symmetrically with
+    // the zero-oid sentinel — there is no honest worktree mode to
+    // compare against a deleted-in-commit path.
     if (!meta.startsWith(":")) {
-      files.push({ path, blob_oid: null });
+      files.push({ path, blob_oid: null, committed_mode: null });
       continue;
     }
     const parts = meta.slice(1).split(" ");
@@ -700,7 +729,10 @@ function commitFiles(root: string, oid: string): EnumeratedCommitFile[] {
       /^0+$/.test(rawOid)
         ? null
         : rawOid;
-    files.push({ path, blob_oid: blobOid });
+    const rawMode = parts[1] ?? "";
+    const committedMode =
+      rawMode.length === 0 || /^0+$/.test(rawMode) ? null : rawMode;
+    files.push({ path, blob_oid: blobOid, committed_mode: committedMode });
   }
   return files;
 }

@@ -109,9 +109,13 @@ each entry carries a per-file `attributions[]` array with `source` badges
 (`tool` / `bash` / `inferred`) naming every session that mutated the file
 since its last commit; a session is attributed iff it has mutated the file
 AND has not committed it more recently than its last mutation, so commit
-discharges attribution and a re-edit reinstates it; the strict
-`orphan_files` bucket holds dirty files with zero attribution after the
-inference pass), `usage` (one row per agentuse profile observed
+discharges attribution and a re-edit reinstates it; as of schema v45 /
+fn-664.2 the discharge is content-aware — a commit only discharges a
+session's claim when its captured `(blob_oid, committed_mode)` matches
+the file's current `(worktree_oid, worktree_mode)`, so a
+stage→re-edit→commit file (committed bytes != worktree bytes) STAYS
+attributed; the strict `orphan_files` bucket holds dirty files with
+zero attribution after the inference pass), `usage` (one row per agentuse profile observed
 at `~/.local/state/agentuse/<id>.json` — target, multiplier, session+week
 percent and reset timestamps; schema v35 (fn-642) adds the colocated
 `last_rate_limit_at` + `last_rate_limit_session_id` columns, populated
@@ -824,15 +828,41 @@ rule is indexable. The producer worker `stat`s every dirty file at
 snapshot build time and embeds `mtime_ms` in the `GitSnapshot` payload;
 the reducer's attribution pass joins the event log against those
 frozen-in-payload mtimes inside `BEGIN IMMEDIATE` (never `stat`s inside
-the transaction). The git-worker also emits a new `Commit` synthetic
-event on every HEAD-oid change (carrying `{project_dir, commit_oid,
-parent_oid, files, committer_session_id}` — the committer is resolved
+the transaction). As of schema v44 / fn-664, the producer additionally
+freezes per-file `{worktree_oid, index_oid, worktree_mode}` into every
+`dirty_files[]` entry — the filter-correct
+`git hash-object --stdin-paths` (one batched spawn per snapshot,
+WITHOUT `--no-filters` so clean/CRLF filters match the stored blob)
+plus porcelain v2 `hI` / `mW` lifted free off the parse — and the
+reducer's `projectGitStatus` pass-1 / pass-2 UPSERT + post-pass refresh
+stamp `worktree_oid` + `worktree_mode` onto every `file_attributions`
+row for the file (per-file facts; every attribution row for the same
+`(project_dir, file_path)` converges on the snapshot's freshest pair).
+The git-worker also emits a new `Commit` synthetic event on every
+HEAD-oid change (carrying `{project_dir, commit_oid, parent_oid, files,
+committer_session_id}` where `files` is `Array<{path, blob_oid,
+committed_mode}>` — `blob_oid` and `committed_mode` lifted off
+`git diff-tree -r --no-commit-id -z <oid>` — the committer is resolved
 deterministically from a `Session-Id:` commit trailer stamped by the
 `plugin/bin/git` PATH wrapper when `CLAUDE_CODE_SESSION_ID` is set, or
 falls back to a global discharge when the trailer is absent), and the
 reducer's `Commit` fold updates `file_attributions.last_commit_at`
 (never deletes rows) so a re-edit re-arms attribution by re-stamping
-`last_mutation_at`. As of fn-656.1, the pass-4 fan-out persists ONLY
+`last_mutation_at`. As of schema v45 / fn-664.2, that discharge is
+content-aware: `foldCommit` stamps `last_commit_at` ONLY when the four
+axes are all non-null AND `blob_oid === worktree_oid &&
+committed_mode === worktree_mode` (the commit truly captured the
+current worktree bytes + mode). On any null axis it falls back to
+today's unconditional timestamp discharge (re-fold determinism over
+pre-v44/v45 events). The stage→re-edit→commit orphan is the bug the
+gate fixes: the worktree diverges from the staged-then-committed bytes,
+the gate suppresses discharge, and the editing session keeps its
+attribution claim. Symmetric across per-session and global discharge
+(the worktree axes are per-file facts). A chmod-only dirty file with
+equal blob but differing mode is also caught — oid-equality alone would
+have wrongly discharged it. The four discharge READ predicates
+(passes 2 / 3 / 4) are byte-identical to pre-v45 — only the WRITE
+site changed. As of fn-656.1, the pass-4 fan-out persists ONLY
 `dirty > 0` sessions into `git_status.jobs` (the clearing UPDATE +
 `syncIfPlanRef` still fire unconditionally for every session in the
 union — including ones leaving the dirty set via `priorSessions` — so a
@@ -1223,13 +1253,13 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.sort_path ASC, task_id ASC LIMIT 10"
 
-# Git projection — one row per planctl-backed worktree. dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred and commit-discharge timestamps):
+# Git projection — one row per planctl-backed worktree. dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, worktree_oid, worktree_mode, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred and commit-discharge timestamps; schema v44/v45 — fn-664 — adds the producer-frozen worktree_oid + worktree_mode so foldCommit can gate discharge on content equality):
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT project_dir, branch, ahead, behind, json_extract(dirty_files, '\$[0]') AS first_dirty FROM git_status LIMIT 5"
 
-# file_attributions — one row per (project_dir, file_path, session_id) carrying the discharge-rule facts (last_mutation_at vs last_commit_at; a row is live-attributed iff last_commit_at IS NULL OR last_commit_at < last_mutation_at). Indexed for both per-file and per-session scans:
+# file_attributions — one row per (project_dir, file_path, session_id) carrying the discharge-rule facts (last_mutation_at vs last_commit_at; a row is live-attributed iff last_commit_at IS NULL OR last_commit_at < last_mutation_at) plus the per-file worktree_oid + worktree_mode the v45 content-aware discharge gate reads back at commit time. Indexed for both per-file and per-session scans:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  "SELECT project_dir, file_path, session_id, last_mutation_at, last_commit_at FROM file_attributions ORDER BY last_mutation_at DESC LIMIT 20"
+  "SELECT project_dir, file_path, session_id, last_mutation_at, last_commit_at, worktree_oid, worktree_mode FROM file_attributions ORDER BY last_mutation_at DESC LIMIT 20"
 
 # Usage projection — one row per agentuse profile observed at ~/.local/state/agentuse/<id>.json (freshness fields are excluded by design — keeper has no freshness signal yet):
 sqlite3 ~/.local/state/keeper/keeper.db \
