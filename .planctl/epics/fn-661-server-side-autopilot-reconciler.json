@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-661-server-side-autopilot-reconciler",
   "bundles": [],
   "closer_done_at": "2026-06-01T02:13:43.290059Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-01T02:13:43.290059Z"
+  "updated_at": "2026-06-01T02:42:07.419029Z"
 }
