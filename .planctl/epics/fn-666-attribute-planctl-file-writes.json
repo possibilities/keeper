@@ -1,0 +1,21 @@
+{
+  "branch_name": "fn-666-attribute-planctl-file-writes",
+  "bundles": [],
+  "created_at": "2026-06-01T02:19:24.813782Z",
+  "depends_on_epics": [
+    "fn-664-gate-commit-discharge-on-worktree-oid"
+  ],
+  "id": "fn-666-attribute-planctl-file-writes",
+  "last_validated_at": "2026-06-01T02:19:24.837055Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "attribute planctl file writes",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-01T02:19:24.813782Z"
+}

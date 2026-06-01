@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-01T02:19:24.813782Z",
+  "depends_on": [],
+  "epic": "fn-666-attribute-planctl-file-writes",
+  "id": "fn-666-attribute-planctl-file-writes.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "max",
+  "title": "mint planctl file attributions",
+  "updated_at": "2026-06-01T02:19:24.813782Z"
+}
