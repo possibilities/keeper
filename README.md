@@ -814,7 +814,31 @@ changed file, and posts a `plan-epic`/`plan-task` snapshot message to main (and 
 events row and pumps a wake; the reducer folds an `EpicSnapshot` as an idempotent
 upsert into the single `epics` projection and a `TaskSnapshot` into its parent
 epic's embedded `tasks` JSON array (a task change `patch`es the parent epic;
-tombstones retract). As of schema v14, the `epics` projection adds
+tombstones retract).
+As of fn-629, the producer carries the **observation gate** that closes
+the autopilot-dispatch-against-uncommitted-epic window (the fn-627
+duplicate-incident shape). `PlanScanner` takes an `isTracked(path) =>
+boolean` predicate fed by the live worker as `isPathInHead` — a
+`git cat-file -e HEAD:<relpath>` shell-out scoped to the resolved
+planctl repo root, bounded by a 1s timeout and fail-closed (any git
+failure reads as not-in-HEAD). When the predicate returns false, the
+path lands in a per-scanner `pending` set and NO `EpicSnapshot` /
+`TaskSnapshot` is emitted — so the reducer never folds an uncommitted
+epic and the autopilot dispatch gate (see CLAUDE.md § Autopilot
+dispatch gates) cannot observe it. Critically, the gate lives at the
+**producer**, not the reducer: re-fold determinism is non-negotiable
+(the reducer must never read git / fs / wallclock), so the predicate
+fires once at fold-time on the producer side, never inside the
+`BEGIN IMMEDIATE` transaction. A `git commit` does not change the file's
+worktree bytes so FSEvents will not re-fire on commit; main posts a
+`recheck-pending` message to the worker on every `GitSnapshot` /
+`Commit` it writes, and the worker's `recheckPending()` re-runs
+`onChange` per pending path — a freshly-committed path emits its
+snapshot and leaves the set, with no permanent strand. The gate trusts
+planctl's commit-at-the-seam contract (`apps/planctl/docs/reference/
+commit-at-mutation-boundary.md` §3): every mutating verb's `output.emit()`
+owns the write→commit transaction inline, so the file is in HEAD by
+the time the envelope `success: true` lands on stdout. As of schema v14, the `epics` projection adds
 `last_validated_at` (TEXT, nullable) — the validation timestamp planctl writes
 via `planctl validate --epic <id>` and the board client renders as a
 `[validated|unvalidated]` pill. As of schema v22, `jobs.config_dir` captures `CLAUDE_CONFIG_DIR` from the

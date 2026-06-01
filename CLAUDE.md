@@ -233,6 +233,26 @@ Operational behavior of the server-side reconciler (`src/autopilot-worker.ts`).
 An unpaused autopilot that "does nothing" is almost always one of these gates
 firing correctly — check them before concluding it is broken:
 
+- **Won't dispatch against an uncommitted epic (fn-629).** The plan-worker
+  producer (`src/plan-worker.ts`, the **fourth** Worker thread) gates
+  `EpicSnapshot` / `TaskSnapshot` emission on a synchronous
+  `git cat-file -e HEAD:<relpath>` check (the live worker passes
+  `isPathInHead` into `PlanScanner`; the `.planctl/{epics,tasks}/<id>.json`
+  is bounced into a per-scanner `pending` set instead of emitted when the
+  path is not in HEAD). The reducer NEVER reads git/fs/wallclock — the
+  gate lives entirely at the producer, per the event-sourcing invariants
+  above. A `git commit` does not change the file's worktree bytes so
+  FSEvents will not re-fire on commit; main posts `recheck-pending` on
+  every `GitSnapshot` / `Commit` it writes, and the worker's
+  `recheckPending()` re-runs `onChange` per pending path — a freshly
+  committed path emits its snapshot and leaves pending, no permanent
+  strand. This is the load-bearing harm-fix for the fn-627 duplicate-
+  dispatch incident: an epic that planctl wrote but had not yet committed
+  is never visible to `computeReadiness`, so the autopilot cannot
+  dispatch a worker against it. The planctl side commits at the
+  `output.emit()` seam (one transaction per mutating verb), so the gate
+  trusts that an envelope `success: true` on stdout means the file is in
+  HEAD.
 - **Won't dispatch into a dirty repo.** `computeReadiness` predicate 6.5
   (`src/readiness.ts`, block reason `git-uncommitted`) suppresses every dispatch
   whose target repo has `git_status.dirty_count > 0` — so a spawned worker can
