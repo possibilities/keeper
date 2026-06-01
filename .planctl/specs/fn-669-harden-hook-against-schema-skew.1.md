@@ -74,5 +74,5 @@ synthetic-mint INSERTs are untouched (run the existing daemon/reducer tests).
 - [ ] CLAUDE.md (2 bullets) + README hook narrative updated; committed to main staging only touched files
 
 ## Done summary
-
+Column-adaptive hook INSERT via PRAGMA table_info intersection. Added KNOWN_EVENT_COLUMNS set, openDb({prepareStmts:false}), and adaptive INSERT builder. 88 tests pass including skew-sim, negative (no events table), and happy-path. CLAUDE.md and README updated.
 ## Evidence
