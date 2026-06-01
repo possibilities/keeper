@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-669-harden-hook-against-schema-skew",
   "bundles": [],
+  "closer_done_at": "2026-06-01T20:51:19.644461Z",
   "created_at": "2026-06-01T14:50:14.094421Z",
   "depends_on_epics": [
     "fn-668-backend-exec-coordinates-on-jobs"
@@ -12,10 +13,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "harden hook against schema skew",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-01T14:50:14.094421Z"
+  "updated_at": "2026-06-01T20:51:19.644461Z"
 }
