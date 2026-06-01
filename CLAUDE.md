@@ -83,9 +83,15 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
 - **Migrations are forward-only** via `meta(schema_version)` + the ALTER slot in
   `migrate()`. Non-idempotent steps (backfill, destructive DROP) MUST be
   version-guarded. The daemon is the SOLE migrator; the hook opens with
-  `{ migrate: false }`. **When you bump `SCHEMA_VERSION`, add the new version to
-  keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset in `keeper/api.py` in the
-  SAME change** — the Python reader (used by `jobctl commit-work` and
+  `{ migrate: false, prepareStmts: false }` and tolerates a behind-schema
+  live DB by intersecting its known `events` columns with the live shape via
+  `PRAGMA table_info('events')` once per invocation (fn-669) — a column the
+  live DB lacks is omitted from the INSERT and lands NULL after migration,
+  identical to the deriver's zero-event value. Turns the schema-bump deploy
+  race from a total-drop window into a lossless-degraded one. **When you
+  bump `SCHEMA_VERSION`, add the new version to keeper-py's
+  `SUPPORTED_SCHEMA_VERSIONS` frozenset in `keeper/api.py` in the SAME
+  change** — the Python reader (used by `jobctl commit-work` and
   `planctl render-approve-context`) is a hard whitelist, not a floor/ceiling,
   and gates loud on any unrecognized version, failing *every* `commit-work`
   on the host until updated. Additive bumps keeper-py never reads still must
@@ -181,7 +187,11 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   session. Losing one event row is acceptable; wedging the agent is not. On a
   failed INSERT the hook writes a per-pid NDJSON dead-letter file (recoverable via
   `replay_dead_letter`) and still exits 0. Never let a parse/DB failure propagate;
-  log to stderr only.
+  log to stderr only. A column-narrowed INSERT (`known ∩ live` via
+  `PRAGMA table_info`, fn-669) is a SUCCESS path — the row lands with the
+  not-yet-migrated column NULL'd — NOT a dead-letter. The dead-letter path
+  still fires for genuine failures (missing `events` table, corrupt DB, real
+  BUSY exhaustion).
 - **Test isolation: never spread `...process.env` for state-bearing vars.** Every
   test that spawns the real hook MUST route through a shared sandboxed base-env
   helper overriding ALL three state paths (`KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`,

@@ -1604,3 +1604,158 @@ test("A non-string tool_use_id (defensive path) lands NULL, hook still exits 0",
     db.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Schema-skew degrade (fn-669)
+// ---------------------------------------------------------------------------
+//
+// The schema-bump deploy race the hook MUST tolerate: the daemon is the sole
+// migrator (hook opens `{migrate:false}`), so during the window between the
+// hook's latest committed code and keeperd's next restart-with-migration, the
+// live DB lacks columns the hook knows. The pre-fn-669 hook total-dropped
+// every INSERT in that window (prepare threw "no such column" inside
+// `prepareStmts`). Post-fn-669, the hook probes `PRAGMA table_info('events')`
+// once, intersects known ∩ live, and INSERTs the narrowed shape; the
+// not-yet-migrated column lands NULL after migration — identical to the
+// deriver's zero-event value.
+
+test("fn-669 SKEW: hook degrades and writes a row when a known column is missing live", async () => {
+  // Hand-build a fresh DB whose `events` table is missing one (current) known
+  // hook column — simulating exactly the deploy race: hook code knows the
+  // column, daemon hasn't migrated yet. We DROP `backend_exec_pane_id` (the
+  // v48 column the 2026-06-01 incident centered on) from the migrated
+  // beforeEach-built table. SQLite supports `ALTER TABLE ... DROP COLUMN`
+  // since 3.35; bun:sqlite ships a newer build.
+  const skewDb = join(tmpDir, "skew.db");
+  // Start from a fully-migrated table, then drop the column to mimic an
+  // old-schema daemon. (Easier than re-CREATEing a stripped-down events
+  // shape and re-applying every dependent index.)
+  openDb(skewDb).db.close();
+  {
+    const { Database } = await import("bun:sqlite");
+    const raw = new Database(skewDb);
+    raw.run("ALTER TABLE events DROP COLUMN backend_exec_pane_id");
+    raw.close();
+  }
+
+  const dlDir = join(tmpDir, "dead-letters-skew");
+  const { code } = await fireViaLauncherWithDeadLetter(
+    "my-session",
+    {
+      hook_event_name: "SessionStart",
+      session_id: "sess-skew",
+      cwd: "/tmp/work",
+    },
+    dlDir,
+    { KEEPER_DB: skewDb },
+  );
+  // Exit-0 contract holds — same as always.
+  expect(code).toBe(0);
+
+  // The lossless degrade — NO dead-letter file. Either the dir was never
+  // created, or it is empty.
+  if (existsSync(dlDir)) {
+    const files = readdirSync(dlDir);
+    expect(files.length).toBe(0);
+  }
+
+  // The row LANDED on the narrowed INSERT, carrying every other column.
+  // Read it back through bun:sqlite directly so we don't trip our own
+  // openDb's schema expectations against the dropped column.
+  const { Database } = await import("bun:sqlite");
+  const raw = new Database(skewDb, { readonly: true });
+  try {
+    const row = raw
+      .prepare(
+        "SELECT spawn_name, backend_exec_session_id FROM events WHERE session_id = 'sess-skew'",
+      )
+      .get() as {
+      spawn_name: string | null;
+      backend_exec_session_id: string | null;
+    } | null;
+    expect(row).not.toBeNull();
+    // Sibling columns kept their values — narrowing intersects, never
+    // reorders.
+    expect(row?.spawn_name).toBe("my-session");
+  } finally {
+    raw.close();
+  }
+});
+
+test("fn-669 NEGATIVE: a genuinely-broken DB (no events table) STILL dead-letters and exits 0", async () => {
+  // Carve-out: the degrade covers ONLY known-missing columns. A missing
+  // `events` table is a genuine failure and must flow to the dead-letter
+  // path unchanged — otherwise a fresh-install pre-daemon-boot session
+  // would silently swallow rows it cannot persist.
+  const brokenDb = join(tmpDir, "no-events-table.db");
+  {
+    const { Database } = await import("bun:sqlite");
+    const raw = new Database(brokenDb, { create: true });
+    // Open & close — file exists, but it has no `events` table. The hook
+    // opens with `migrate: false` so it does NOT mint the table itself.
+    raw.close();
+  }
+
+  const dlDir = join(tmpDir, "dead-letters-broken");
+  const { code } = await fireViaLauncherWithDeadLetter(
+    "my-session",
+    {
+      hook_event_name: "SessionStart",
+      session_id: "sess-broken",
+      cwd: "/tmp/work",
+    },
+    dlDir,
+    { KEEPER_DB: brokenDb },
+  );
+  // Exit-0 contract holds even on the dead-letter path.
+  expect(code).toBe(0);
+
+  // The dead-letter recovery file lands — confirming the carve-out: a
+  // genuinely broken DB still flows to deadLetter(), it is NOT silently
+  // swallowed by the column-intersection degrade.
+  expect(existsSync(dlDir)).toBe(true);
+  const files = readdirSync(dlDir).filter((f) => f.endsWith(".ndjson"));
+  expect(files.length).toBe(1);
+});
+
+test("fn-669 HAPPY: full-column INSERT (intersection is identity) on a migrated DB", async () => {
+  // Sanity: when the daemon HAS migrated and the live `events` carries every
+  // known column, the intersection is identity and the INSERT shape is the
+  // full column list — no narrowing, no stderr warning, no behavioral drift
+  // from pre-fn-669. The existing happy-path tests above already cover this
+  // implicitly; this test asserts every known column round-trips, so a
+  // future regression that breaks the intersection ordering or drops a
+  // legitimate column shows up here.
+  const code = await fireViaLauncher("happy-session", {
+    hook_event_name: "SessionStart",
+    session_id: "sess-fullcols",
+    cwd: "/tmp/work",
+  });
+  expect(code).toBe(0);
+
+  // Pull every known column off the row and confirm at least the
+  // SessionStart-attributable ones populate. Sibling columns may be NULL
+  // (they're not lifted on SessionStart), but the SELECT compiling proves
+  // the live schema has every name.
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        `SELECT ts, session_id, pid, hook_event, event_type, tool_name, matcher,
+                cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
+                subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+                planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+                planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+                bash_mutation_kind, bash_mutation_targets, planctl_files,
+                backend_exec_type, backend_exec_session_id, backend_exec_pane_id
+         FROM events WHERE session_id = 'sess-fullcols'`,
+      )
+      .get() as Record<string, unknown> | null;
+    expect(row).not.toBeNull();
+    expect(row?.hook_event).toBe("SessionStart");
+    expect(row?.event_type).toBe("session_start");
+    expect(row?.spawn_name).toBe("happy-session");
+  } finally {
+    db.close();
+  }
+});

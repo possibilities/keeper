@@ -1363,6 +1363,19 @@ export interface OpenDbOptions {
    * re-reading cold pages from the ~850MB log.
    */
   cacheSizeKb?: number;
+  /**
+   * Build the {@link Stmts} bundle on the returned connection. Defaults to
+   * `true`. The hook (`plugin/hooks/events-writer.ts`) passes `false` because
+   * the static `insertEvent` statement names every events column known at
+   * build time — on a schema-skewed live DB (daemon hasn't migrated yet,
+   * fn-669) `db.prepare()` throws "no such column" and `openDb` itself fails
+   * before returning. The hook builds a column-adaptive INSERT instead, using
+   * `PRAGMA table_info('events')` to intersect known ∩ live columns. The
+   * daemon's synthetic-mint sites and the boot path always run post-migrate
+   * and keep `prepareStmts: true` (the default), so the shared statement is
+   * unaffected.
+   */
+  prepareStmts?: boolean;
 }
 
 export interface KeeperDb {
@@ -4830,8 +4843,42 @@ export function openDb(path: string, options: OpenDbOptions = {}): KeeperDb {
     migrate(db);
   }
 
-  const stmts = prepareStmts(db);
+  // Skip-stmts carve-out for the hook (fn-669): the static `insertEvent`
+  // statement names every events column known at build time, so on a
+  // schema-skewed live DB `db.prepare()` throws "no such column" inside
+  // `prepareStmts` and `openDb` itself fails before returning. The hook
+  // passes `prepareStmts: false` and builds a column-adaptive INSERT from
+  // `PRAGMA table_info('events')` instead. The returned `stmts` is a
+  // throwing stub — touching `insertEvent` or `selectWorldRev` on this
+  // connection is a programming error (the hook never does so). Every
+  // other caller stays on the default `true` path and gets the populated
+  // bundle.
+  const stmts = (options.prepareStmts ?? true) ? prepareStmts(db) : noStmts();
   return { db, stmts };
+}
+
+/**
+ * Throwing-stub {@link Stmts} returned by `openDb({ prepareStmts: false })`
+ * (fn-669). Accessing either statement is a programming error — the only
+ * caller passing the flag is the hook, which discards the field and builds
+ * its own column-adaptive INSERT via `PRAGMA table_info`. Centralized so a
+ * future consumer accidentally reading `stmts.insertEvent` after opting
+ * out fails loudly instead of hitting a typed `null`.
+ */
+function noStmts(): Stmts {
+  const trap = (): never => {
+    throw new Error(
+      "openDb({ prepareStmts: false }) — statement bundle is unavailable on this connection",
+    );
+  };
+  return {
+    get insertEvent(): never {
+      return trap();
+    },
+    get selectWorldRev(): never {
+      return trap();
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------

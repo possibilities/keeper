@@ -362,12 +362,25 @@ Keeper has no `install` verb. Wire it up manually:
    daemon is the sole migrator (see CLAUDE.md "Migrations are forward-only").
    On a fresh install the LaunchAgent runs the daemon at login, which creates
    the DB and runs `migrate()` to converge the schema; only after that does
-   the hook have tables to INSERT into. If the hook fires against a missing
-   schema (e.g. you started a Claude Code session before the LaunchAgent
-   booted the daemon for the first time) the INSERT fails, the hook's outer
-   try/catch logs to stderr, and the process exits 0 — the event is lost but
-   the session is not blocked. The manual recovery is `launchctl bootstrap`
-   above; subsequent sessions write normally.
+   the hook have tables to INSERT into. Two failure modes, two outcomes:
+
+   1. **No `events` table at all** (fresh install, pre-daemon-boot, or a
+      corrupt DB). The hook's `PRAGMA table_info('events')` probe returns
+      empty, the INSERT cannot run, the hook writes a per-pid NDJSON
+      dead-letter file (recoverable via `replay_dead_letter`), logs to
+      stderr, and exits 0 — the event is captured for replay but the
+      session is not blocked. The manual recovery is `launchctl bootstrap`
+      above; subsequent sessions write normally.
+   2. **`events` table behind by a column** (the daemon hasn't yet applied
+      a fresh `ALTER TABLE` from the latest commit). The hook intersects
+      its known column set with the live one and INSERTs a narrowed shape
+      via `$col` named bindings — the not-yet-migrated column is simply
+      omitted and lands NULL after the daemon next runs `migrate()`,
+      identical to the deriver's zero-event value. The hook writes a
+      stderr line naming the dropped columns for observability but the
+      row LANDS — no dead-letter. fn-669 added this; before it, a
+      schema-bump deploy race total-dropped every hook INSERT in the
+      window between the hook's new code and keeperd's next restart.
 
    **Upgrade-from-pre-trace-gate note:** if you are re-bootstrapping over an
    existing install whose `server.stderr` predates the `KEEPER_TRACE_SERVER`

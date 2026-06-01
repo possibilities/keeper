@@ -476,6 +476,64 @@ function writeDeadLetter(record: DeadLetterRecord): void {
 const HOOK_BUSY_TIMEOUT_MS = 1200;
 
 /**
+ * The full set of `events`-column names the hook knows how to populate.
+ * MUST stay in lockstep with the canonical `CREATE TABLE events` literal at
+ * `src/db.ts` `CREATE_EVENTS` (~:353-389) and with the `insertBindings` map
+ * below — every key here is the bare column name (no `$` prefix); every
+ * value in `insertBindings` is prefixed `$col`.
+ *
+ * The adaptive INSERT (fn-669) takes the intersection of this set with
+ * the live DB's `events` columns (probed once per invocation via
+ * `PRAGMA table_info('events')`) and binds only the survivors. A column
+ * the live DB lacks — because the daemon (sole migrator) hasn't applied a
+ * fresh `ALTER TABLE` yet — is simply omitted from the INSERT and lands
+ * NULL after migration runs; identical to the deriver's zero-event value.
+ * This turns the schema-bump-deploy-skew window from a total-drop into a
+ * lossless-degraded one (~78-row whole-feed drop on the 2026-06-01 v48
+ * incident; see `~/docs/keeper-reliability/findings.md`).
+ *
+ * Adding a new column means TWO local edits: this Set + the corresponding
+ * `insertBindings` entry below. The daemon's shared `prepareStmts().insertEvent`
+ * (`src/db.ts:4750-4783`) is updated in lockstep with its own CREATE TABLE
+ * literal — that path is post-migrate, so the static all-columns INSERT
+ * never races.
+ */
+const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
+  "ts",
+  "session_id",
+  "pid",
+  "hook_event",
+  "event_type",
+  "tool_name",
+  "matcher",
+  "cwd",
+  "permission_mode",
+  "agent_id",
+  "agent_type",
+  "stop_hook_active",
+  "data",
+  "subagent_agent_id",
+  "spawn_name",
+  "start_time",
+  "slash_command",
+  "skill_name",
+  "planctl_op",
+  "planctl_target",
+  "planctl_epic_id",
+  "planctl_task_id",
+  "planctl_subject_present",
+  "tool_use_id",
+  "config_dir",
+  "planctl_queue_jump",
+  "bash_mutation_kind",
+  "bash_mutation_targets",
+  "planctl_files",
+  "backend_exec_type",
+  "backend_exec_session_id",
+  "backend_exec_pane_id",
+]);
+
+/**
  * Diagnostic drop-log path. One NDJSON line per dead-lettered INSERT —
  * SEPARATE from the dead-letter recovery records (those drive replay; this is
  * pure instrumentation to attribute drop bursts: error code, attempts, wait).
@@ -780,14 +838,25 @@ async function main(): Promise<void> {
   // `migrate: false` — the daemon is the sole migrator (see CLAUDE.md
   // "Migrations are forward-only"). A fresh install must boot the daemon
   // at least once before the hook can write; the LaunchAgent handles this
-  // on login. A hook arriving against a missing/stale schema fails inside
-  // `openDb` at `prepareStmts` time (the prepared INSERT names a column
-  // that doesn't yet exist) — that throw is a post-binding failure too, so
-  // the dead-letter path captures it. The exit-0 contract still holds.
+  // on login.
+  //
+  // `prepareStmts: false` — the shared static `insertEvent` statement names
+  // every events column known at build time, so on a schema-bump deploy race
+  // (daemon hasn't yet applied the new ALTER) `db.prepare()` would throw
+  // "no such column" INSIDE `openDb` before it returned. By skipping the
+  // shared prepare, the hook can intersect known ∩ live columns via
+  // `PRAGMA table_info` below and build a narrowed INSERT that lands
+  // every column the live DB has — fn-669, the lossless-degraded fix for
+  // the 2026-06-01 v48 backend_exec total-drop incident.
+  //
+  // A genuinely-broken DB (no `events` table, corrupt DB, real BUSY on
+  // open) still throws inside `openDb` / the PRAGMA probe — the
+  // dead-letter path below captures it. The exit-0 contract still holds.
   let opened: ReturnType<typeof openDb>;
   try {
     opened = openDb(resolveDbPath(), {
       migrate: false,
+      prepareStmts: false,
       // Pass the hook's tight budget so `applyPragmas` sets busy_timeout BEFORE
       // the `journal_mode = WAL` switch — otherwise that switch fails instantly
       // under contention (the `open:SQLITE_BUSY` drops). No later override
@@ -798,8 +867,61 @@ async function main(): Promise<void> {
     deadLetter(err);
     return;
   }
-  const { db, stmts } = opened;
+  const { db } = opened;
   try {
+    // Probe the live `events` columns ONCE per invocation (fn-669). sqlite_schema
+    // is page 1 and warm in the daemon's open WAL, so this is microseconds —
+    // well inside the ~30ms cold-start budget. The probe runs OUTSIDE the
+    // retry loop: one prepared statement, reused on every attempt. A failure
+    // here (missing `events` table → "no such table" / corrupt DB) falls
+    // through to `deadLetter` per the carve-out — the lossless degrade
+    // covers ONLY known-missing columns, not a broken DB.
+    let adaptiveInsert: ReturnType<typeof db.prepare>;
+    try {
+      const rows = db.prepare("PRAGMA table_info('events')").all() as {
+        name: string;
+      }[];
+      const liveColumns = new Set(rows.map((r) => r.name));
+      if (liveColumns.size === 0) {
+        // Empty `PRAGMA table_info` on a non-existent table is silent — surface
+        // it explicitly so the dead-letter / drop-log records the right cause.
+        throw new Error("events table is missing from live schema");
+      }
+      // Intersect known ∩ live in the order of KNOWN_EVENT_COLUMNS so the
+      // INSERT shape is deterministic (no Set-iteration order surprises).
+      const bindingCols: string[] = [];
+      const droppedCols: string[] = [];
+      for (const col of KNOWN_EVENT_COLUMNS) {
+        if (liveColumns.has(col)) {
+          bindingCols.push(col);
+        } else {
+          droppedCols.push(col);
+        }
+      }
+      if (droppedCols.length > 0) {
+        // One stderr line per invocation listing every dropped column, so the
+        // skew window is greppable in `claude --debug` output AND survives the
+        // hook's exit. Observability without failing the write: the dropped
+        // columns LAND NULL after the daemon migrates — same as the deriver's
+        // zero-event value, so the fold is unchanged.
+        process.stderr.write(
+          `keeper events-writer: schema skew — INSERT narrowed, dropping columns: ${droppedCols.join(", ")}\n`,
+        );
+      }
+      // Named `$col` bindings only — preserve the canonical convention; the
+      // bindings object below stays keyed by `$col`, and `bun:sqlite`
+      // silently ignores extra named-binding keys (already verified by the
+      // existing `insertBindings` map carrying every column unconditionally).
+      const colList = bindingCols.join(", ");
+      const valList = bindingCols.map((c) => `$${c}`).join(", ");
+      adaptiveInsert = db.prepare(
+        `INSERT INTO events (${colList}) VALUES (${valList})`,
+      );
+    } catch (err) {
+      deadLetter(err);
+      return;
+    }
+
     // busy_timeout is already HOOK_BUSY_TIMEOUT_MS — `openDb` set it FIRST in
     // applyPragmas (before the journal_mode=WAL switch), so the hook stays
     // inside Claude's SessionEnd 1.5s budget AND the WAL switch no longer fails
@@ -822,8 +944,9 @@ async function main(): Promise<void> {
       // Named bindings: a missed column on a future ALTER no longer silently
       // shifts data into the next slot. `start_time` is captured on
       // SessionStart only as a platform-tagged opaque string — null on every
-      // other event by design.
-      stmts.insertEvent.run(insertBindings);
+      // other event by design. The narrowed `adaptiveInsert` ignores any
+      // `insertBindings` keys whose columns aren't live on this DB.
+      adaptiveInsert.run(insertBindings);
     });
 
     const insertStartedAt = Date.now();
