@@ -106,5 +106,5 @@ asserting on `snap.perTask.get(task.task_id)`:
 - [ ] No schema bump, no migration, no keeper-py change
 
 ## Done summary
-
+Added two-clause worker-liveness guard to evaluateTask predicate 1: a done+approved task now only collapses to {tag:'completed'} when no embedded job is working and no running sub-agent is bound to any embedded job — otherwise it falls through to predicate 5/6, holding the per-epic + per-root mutex while the Claude session is still alive. Close-row fan-in retained as re-fold-determinism backstop (now provably unreachable). Six JSDoc sites synced (module-top predicate table, predicate-1 block, evaluateCloseRow JSDoc + predicate-5/6 blocks, closeRowHasRunningSubagent, applySingleTaskPerRootMutex). One CLAUDE.md autopilot-dispatch-gates bullet added. Flipped the line-216 must-flip test, added 5 new per-task tests (job-running mutex, sub-agent-running, sub-agent-stale via runWithNow, clean collapse, dep regression), rewrote 5 close-row tests to assert the new contract at both layers. 96 readiness tests + 938 readiness-related unit tests green.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "guard predicate 1 on embedded-job liveness",
-  "updated_at": "2026-06-01T19:24:20.847668Z"
+  "updated_at": "2026-06-01T20:35:56.487286Z",
+  "worker_done_at": "2026-06-01T20:35:56.487286Z"
 }
