@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Event-source autopilot paused flag",
-  "updated_at": "2026-06-01T03:08:15.686599Z"
+  "updated_at": "2026-06-01T05:22:06.123537Z",
+  "worker_done_at": "2026-06-01T05:22:06.123537Z"
 }

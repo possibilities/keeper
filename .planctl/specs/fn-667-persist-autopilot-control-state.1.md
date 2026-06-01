@@ -123,5 +123,5 @@ boot-race guard); the projection is added alongside, not as a replacement.
 - [ ] reducer fold tests (UPSERT, created_at preserve, malformed no-op + cursor advance, re-fold determinism) + viewer banner test added; full suite + lint pass
 
 ## Done summary
-
+Schema v47 autopilot_state singleton projection with AutopilotPaused synthetic event end-to-end: schema + fold + collection descriptor + RPC bridge (event-FIRST, then in-memory flip) + boot-append re-arm + viewer subscribe. keeper-py whitelist updated; tests + docs in same change.
 ## Evidence
