@@ -161,6 +161,54 @@ function sandboxedBaseEnv(): Record<string, string> {
 }
 
 /**
+ * fn-629 observation-gate helper: initialize a git repo in `dir` (so HEAD
+ * resolves) with one empty commit. The plan-worker's fn-629 gate suppresses
+ * snapshot emission for any `.planctl/*.json` not in HEAD — every
+ * integration test that pre-writes plan files (mimicking what planctl
+ * eventually commits at the seam) must init + commit, or the gate
+ * (correctly) keeps them out of the projection.
+ */
+function gitInitPlanRoot(dir: string): void {
+  for (const args of [
+    ["init", "-q", "-b", "main"],
+    ["config", "user.email", "test@example.com"],
+    ["config", "user.name", "Test"],
+    ["config", "commit.gpgsign", "false"],
+    ["commit", "--allow-empty", "-q", "-m", "init"],
+  ] as const) {
+    const res = Bun.spawnSync(["git", "-C", dir, ...args], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    if (!res.success) {
+      throw new Error(`git ${args.join(" ")} failed in ${dir}`);
+    }
+  }
+}
+
+/**
+ * fn-629 observation-gate helper: stage + commit every `.planctl/*.json`
+ * already present in `dir`, so the plan-worker's `isPathInHead` predicate
+ * passes them through the gate. Mirrors what planctl does at the
+ * `output.emit()` seam (commits the tree before the envelope returns) —
+ * the keeper-side gate trusts that contract.
+ */
+function gitCommitPlanRoot(dir: string, message: string = "plan files"): void {
+  for (const args of [
+    ["add", ".planctl"],
+    ["commit", "-q", "-m", message],
+  ] as const) {
+    const res = Bun.spawnSync(["git", "-C", dir, ...args], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    if (!res.success) {
+      throw new Error(`git ${args.join(" ")} failed in ${dir}`);
+    }
+  }
+}
+
+/**
  * Pipe one hook payload through the events-writer hook as a fresh process,
  * exactly as Claude Code invokes it. Awaits the hook's exit (always 0 by
  * contract) so the row is committed before the caller proceeds.
@@ -1139,6 +1187,14 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
     }),
   );
 
+  // fn-629 observation gate: plan-worker suppresses snapshot emission for
+  // any .planctl/*.json not yet in git HEAD. Mirror the planctl
+  // `output.emit()` contract by initializing a repo and committing the
+  // plan tree before the daemon boots — otherwise the boot scan correctly
+  // gates these files into the pending set and no synthetic event lands.
+  gitInitPlanRoot(planRoot);
+  gitCommitPlanRoot(planRoot, "add epic + task");
+
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
     env: {
@@ -1561,6 +1617,14 @@ test("end-to-end: downtime file deletion is reconciled on restart via the boot s
       target_repo: repo,
     }),
   );
+
+  // fn-629 observation gate: plan-worker only emits snapshots for files in
+  // git HEAD. Init + commit the plan tree before the first boot — the
+  // boot sweep folds the committed files, and the second boot's downtime
+  // delete + sweep retraction is unaffected by the gate (onDelete is
+  // ungated; the boot sweep diffs the projection against disk, not git).
+  gitInitPlanRoot(planRoot);
+  gitCommitPlanRoot(planRoot, "add survivor + gone");
 
   const spawnDaemon = (): Subprocess<"ignore", "pipe", "pipe"> =>
     Bun.spawn(["bun", "run", DAEMON_ENTRY], {

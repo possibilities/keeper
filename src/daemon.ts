@@ -89,7 +89,11 @@ import type {
 } from "./dead-letter-worker";
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
 import type { GitWorkerData, GitWorkerMessage } from "./git-worker";
-import type { PlanMessage, PlanWorkerData } from "./plan-worker";
+import type {
+  PlanMessage,
+  PlanWorkerData,
+  RecheckPendingMessage,
+} from "./plan-worker";
 import { DEFAULT_BATCH_SIZE, type DrainOptions, drain } from "./reducer";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
@@ -1653,6 +1657,18 @@ function runDaemon(): void {
       $backend_exec_session_id: null,
       $backend_exec_pane_id: null,
     });
+    // fn-629 observation-gate drain: a `git-snapshot` or `commit` from
+    // the git-worker is the cross-worker "HEAD may have moved" signal a
+    // plan-worker cannot observe on its own (a `git commit` leaves the
+    // `.planctl/*.json` bytes identical, so FSEvents will not re-fire on
+    // the worktree path). Fire `recheck-pending` so the scanner re-runs
+    // its tracked-in-HEAD predicate over every path currently held in
+    // pending. Cheap (no-op when the set is empty); idempotent.
+    if (msg.kind === "git-snapshot" || msg.kind === "commit") {
+      planWorker.postMessage({
+        type: "recheck-pending",
+      } satisfies RecheckPendingMessage);
+    }
     wakePending = true;
     pumpWakes();
   };

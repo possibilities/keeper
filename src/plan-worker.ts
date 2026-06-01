@@ -68,7 +68,7 @@ import {
   readFileSync,
   statSync,
 } from "node:fs";
-import { join, sep } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
@@ -206,6 +206,22 @@ export type PlanMessage =
 export interface ShutdownMessage {
   type: "shutdown";
 }
+
+/**
+ * Message the parent sends to drain the observation gate's pending set
+ * (fn-629). Posted on every `GitSnapshot` events row main writes — that is
+ * the "HEAD may have moved" cross-worker signal a plan-worker can't observe
+ * on its own (a `git commit` does not change the file's content so the
+ * `.planctl/*.json` FSEvent will not re-fire). The worker calls
+ * {@link PlanScanner.recheckPending} on receipt; a freshly-committed epic
+ * drains and emits its snapshot.
+ */
+export interface RecheckPendingMessage {
+  type: "recheck-pending";
+}
+
+/** Inbound message protocol — every shape main sends to the worker. */
+export type InboundMessage = ShutdownMessage | RecheckPendingMessage;
 
 /**
  * Cap a plan file's size before `JSON.parse`. Plan JSONs live under a
@@ -554,12 +570,43 @@ function parseStringArrayColumn(text: string | null): string[] {
  * last-emitted serialized snapshot. `seedFromDb` (below) primes it from the
  * `epics`/`tasks` projection so a daemon restart full-scan does not re-emit a
  * synthetic event per plan file every boot.
+ *
+ * Observation gate (fn-629 / epic fn-629-planctl-epic-mutation-atomicity): an
+ * optional `isTracked(path) => boolean` predicate fed in at construction
+ * suppresses emission for any epic/task file that is NOT yet in git HEAD
+ * (untracked, or staged-but-not-committed). Suppressed paths land in the
+ * {@link pending} set. The reducer continues to fold ONLY committed
+ * snapshots, so the autopilot cannot dispatch against an uncommitted epic.
+ * A planctl `git commit` does not change the file content, so FSEvents will
+ * NOT re-fire on commit — the caller (the worker, driven by git-worker
+ * snapshot pulses) drives {@link recheckPending} to drain the set. The
+ * predicate is a producer-side gate; the reducer NEVER reads git/fs/wallclock
+ * (re-fold determinism preserved). When omitted (default `() => true`) the
+ * scanner is gateless — preserves test back-compat and lets the pure-core
+ * tests drive `onChange` without a fake git tree.
  */
 export class PlanScanner {
   /** id → last-emitted serialized snapshot (the change-gate). */
   private readonly lastEmitted = new Map<string, string>();
   /** path → id, so a delete can drop the right change-gate entry. */
   private readonly pathToId = new Map<string, string>();
+  /**
+   * Paths of epic/task files whose last `onChange` was gated by
+   * {@link isTracked} (file not in HEAD — untracked or staged-but-not-committed).
+   * Drained by {@link recheckPending}, called by the worker on every git-worker
+   * snapshot pulse (the cross-worker signal that commit/checkout/branch-switch
+   * may have moved HEAD). A pending path that was never emitted holds NO
+   * `lastEmitted` / `pathToId` entry — so a delete while pending is a no-op
+   * (nothing to retract, since the reducer never saw it).
+   *
+   * NOT tracked for `task-state` (sidecar) paths — those bypass the gate
+   * entirely (state files are runtime data, planctl's `.gitignore` excludes
+   * them). A state-file change re-emits a TaskSnapshot through the
+   * still-gated def-file path; if the def file is pending, the state-file
+   * change is effectively pending too (the re-emit lands in `pending`
+   * keyed by the def path).
+   */
+  private readonly pending = new Set<string>();
   /**
    * Per-task cache of the latest runtime-status enum value observed in
    * `.planctl/state/tasks/<task_id>.state.json` (top-level `status` field).
@@ -596,6 +643,21 @@ export class PlanScanner {
   constructor(
     private readonly onSnapshot: (msg: PlanMessage) => void,
     private readonly log: (msg: string) => void = (m) => console.error(m),
+    /**
+     * Optional git-tracked predicate. Returns `true` when the epic/task file
+     * at `path` is in git HEAD (committed); `false` when untracked or
+     * staged-but-not-committed. A `false` from {@link onChange} routes the
+     * path into {@link pending} instead of emitting a snapshot — the
+     * fn-629 observation gate. Defaults to `() => true` (no gating) so the
+     * pure-core unit tests don't need a fake git tree; the live worker
+     * passes a `git cat-file -e HEAD:<relpath>` closure.
+     *
+     * The predicate is producer-side ONLY — the reducer never reads git
+     * (re-fold determinism preserved). Path is the absolute filesystem
+     * path passed to onChange; the predicate is responsible for resolving
+     * the repo root + relpath itself.
+     */
+    private readonly isTracked: (path: string) => boolean = () => true,
   ) {}
 
   /**
@@ -673,7 +735,13 @@ export class PlanScanner {
 
     const id = this.pathToId.get(path);
     if (id === undefined) {
-      return; // never folded this path — nothing to retract.
+      // Never folded this path. If the path was held in the fn-629
+      // observation gate's pending set (uncommitted epic/task whose file
+      // got removed before it ever made HEAD — e.g. a planctl scaffold
+      // unwind on commit_failed), drop it: there's nothing to retract
+      // since the reducer never saw the entity. Either way, no tombstone.
+      this.pending.delete(path);
+      return;
     }
     if (kind === "epic") {
       this.onSnapshot({ kind: "plan-epic-deleted", id });
@@ -760,6 +828,15 @@ export class PlanScanner {
     if (msg === null) {
       return;
     }
+    // Observation gate (fn-629): same producer-side gate as {@link onChange}.
+    // The sidecar state file fired this re-emit, but the def file is what
+    // we project; if the def file isn't in HEAD yet, stash and wait for
+    // the next git-worker pulse to drain it via {@link recheckPending}.
+    if (!this.isTracked(defPath)) {
+      this.pending.add(defPath);
+      return;
+    }
+    this.pending.delete(defPath);
     this.pathToId.set(defPath, msg.id);
     const serialized = JSON.stringify(msg);
     if (this.lastEmitted.get(msg.id) === serialized) {
@@ -874,6 +951,29 @@ export class PlanScanner {
       return;
     }
 
+    // Observation gate (fn-629): for epic/task DEFINITION files, suppress
+    // emission unless the file is in git HEAD. An uncommitted file goes to
+    // {@link pending}; the worker drains the set on the next git-worker
+    // snapshot pulse (commit/checkout/branch-switch may have moved HEAD,
+    // and a `git commit` does not change file content so FSEvents will
+    // not re-fire). State-file (`task-state`) paths bypass this gate
+    // because they bypass this code path entirely (they early-returned
+    // above via the `task-state` arm). `isTracked` defaults to
+    // `() => true`, so a gateless scanner emits unconditionally.
+    //
+    // We do NOT touch `pathToId` / `lastEmitted` for a gated path: the
+    // reducer never saw the entity, so there is nothing to retract on a
+    // delete, and the change-gate has no "last good" to compare against
+    // when the file finally lands in HEAD. A pending path is its own
+    // index — see {@link pending} / {@link recheckPending} / {@link onDelete}.
+    if (!this.isTracked(path)) {
+      this.pending.add(path);
+      return;
+    }
+    // The file IS in HEAD now (or the gate is disabled). If this path was
+    // previously pending, drop it from the set — it has now drained.
+    this.pending.delete(path);
+
     this.pathToId.set(path, msg.id);
     const serialized = JSON.stringify(msg);
     if (this.lastEmitted.get(msg.id) === serialized) {
@@ -881,6 +981,35 @@ export class PlanScanner {
     }
     this.lastEmitted.set(msg.id, serialized);
     this.onSnapshot(msg);
+  }
+
+  /**
+   * Re-run {@link onChange} for every path the gate has stashed in
+   * {@link pending}. Called by the worker on every git-worker snapshot
+   * pulse — a `git commit` does not change the file's content so FSEvents
+   * will not re-fire on commit, and without this drain a freshly-committed
+   * epic would sit in pending forever (projection-absent, never dispatched).
+   *
+   * `onChange` re-checks the gate, so a still-uncommitted path stays in
+   * pending. The set is iterated by snapshot (`[...]`) so an `onChange`
+   * mutation during the loop is safe.
+   */
+  recheckPending(): void {
+    if (this.pending.size === 0) {
+      return;
+    }
+    for (const path of [...this.pending]) {
+      this.onChange(path);
+    }
+  }
+
+  /**
+   * Number of paths currently held in the observation gate (uncommitted
+   * epic/task files). Test-reach + diagnostic; the live worker doesn't
+   * branch on this.
+   */
+  pendingSize(): number {
+    return this.pending.size;
   }
 
   /**
@@ -1096,6 +1225,96 @@ export function buildTaskMessage(
 function stringifyErr(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
+
+/**
+ * Find the `.planctl` ancestor of `path` — the parent of the parent (because
+ * `path` is `.planctl/{epics,tasks}/<id>.json`). Returns the parent dir of
+ * `.planctl` (the planctl-managed repo root in keeper's layout) or `null` if
+ * `.planctl` isn't found in the ancestry. Pure path arithmetic.
+ *
+ * fn-629 observation gate: the live worker uses this to derive the repo
+ * root to run `git cat-file -e HEAD:<relpath>` against without a per-path
+ * shell-out (`git rev-parse --show-toplevel` per call would be a
+ * 100ms-class per-file cost on a `~/code` storm). The planctl tree IS
+ * always at the repo root — planctl writes via `_resolve_repo_root` which
+ * calls `git rev-parse --show-toplevel` and refuses to operate on a
+ * non-git tree — so the `.planctl` parent equals the repo root by
+ * construction. A future subtree-planctl layout would need to switch to
+ * `git rev-parse`.
+ */
+export function repoRootFromPlanctlPath(path: string): string | null {
+  // Walk up from `path` looking for a `.planctl` directory; return its parent.
+  // The shape is always `.../<root>/.planctl/{epics,tasks}/<id>.json` so the
+  // `.planctl` element sits at depth `n-3` from the basename. We could index
+  // directly, but a walk is more robust against any future shape drift.
+  let cur = dirname(path);
+  while (cur !== "" && cur !== "/" && cur !== ".") {
+    const parent = dirname(cur);
+    if (parent === cur) {
+      return null; // hit filesystem root without finding .planctl
+    }
+    const segments = cur.split(sep);
+    if (segments[segments.length - 1] === ".planctl") {
+      return parent;
+    }
+    cur = parent;
+  }
+  return null;
+}
+
+/**
+ * fn-629 observation gate predicate: is `path` in git HEAD (committed)?
+ * Returns `false` for untracked paths AND for staged-but-not-committed
+ * paths (the planctl commit-failed window the gate exists to close).
+ *
+ * Implementation: `git -C <root> cat-file -e HEAD:<relpath>` — exits 0 iff
+ * the path exists in the HEAD tree. Hits the object DB without scanning
+ * the index or worktree, so it's fast (~5-10ms per call) and cannot block
+ * the watcher callback for long even under a churning planctl tree. The
+ * subprocess is bounded by {@link GIT_CHECK_TIMEOUT_MS}.
+ *
+ * Edge cases handled by returning `false` (fail closed — never wrongly
+ * announce a file as committed):
+ * - Path is not inside a `.planctl` tree (shouldn't happen, the caller
+ *   already classified) — no repo root resolvable → `false`.
+ * - `git` shell-out fails (not a git repo, no commits yet, timeout) →
+ *   `false`. The next git-worker pulse will retry.
+ * - Path is outside the resolved repo root → `false`.
+ *
+ * Exported for unit reach.
+ */
+export function isPathInHead(path: string): boolean {
+  const root = repoRootFromPlanctlPath(path);
+  if (root === null) {
+    return false;
+  }
+  const rel = relative(root, path);
+  if (rel.length === 0 || rel.startsWith("..") || rel.startsWith(sep)) {
+    return false;
+  }
+  try {
+    const res = Bun.spawnSync(
+      ["git", "-C", root, "cat-file", "-e", `HEAD:${rel}`],
+      {
+        stdout: "ignore",
+        stderr: "ignore",
+        timeout: GIT_CHECK_TIMEOUT_MS,
+      },
+    );
+    return res.success && res.exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Subprocess timeout for {@link isPathInHead}. 1s is far above the
+ * ~5-10ms object-DB lookup but well under a watcher-callback budget — a
+ * pathological git repo can hang on `cat-file` (corrupt loose object,
+ * locked index, NFS stall) and we'd rather fail closed (file reads as
+ * not-in-HEAD; the next git-worker pulse retries) than wedge the callback.
+ */
+const GIT_CHECK_TIMEOUT_MS = 1000;
 
 /**
  * Boot scan: recursively walk `root` for `.planctl/{epics,tasks}/*.json` files
@@ -1432,9 +1651,18 @@ function main(): void {
 
   const { db } = openDb(data.dbPath, { readonly: true });
   const port = parentPort;
-  const scanner = new PlanScanner((msg) => {
-    port.postMessage(msg);
-  });
+  // fn-629 observation gate: the live worker passes `isPathInHead` so an
+  // uncommitted epic/task file lands in the scanner's pending set instead
+  // of emitting a snapshot. Main drives the drain by posting
+  // {@link RecheckPendingMessage} on every git-worker `GitSnapshot` pulse
+  // (the cross-worker "HEAD may have moved" signal).
+  const scanner = new PlanScanner(
+    (msg) => {
+      port.postMessage(msg);
+    },
+    (m) => console.error(m),
+    isPathInHead,
+  );
 
   // Restart-seed: don't re-emit a snapshot already folded into the projection.
   try {
@@ -1460,8 +1688,24 @@ function main(): void {
     }
   };
 
-  parentPort.on("message", (msg: ShutdownMessage | undefined) => {
-    if (msg && msg.type === "shutdown") {
+  parentPort.on("message", (msg: InboundMessage | undefined) => {
+    if (!msg) return;
+    if (msg.type === "recheck-pending") {
+      // fn-629: main observed a `GitSnapshot` events row land — HEAD may
+      // have advanced. Drain the observation gate's pending set so a
+      // freshly-committed epic/task file emits its snapshot. Idempotent
+      // and cheap when the set is empty.
+      if (shuttingDown) return;
+      try {
+        scanner.recheckPending();
+      } catch (err) {
+        console.error(
+          `[plan-worker] recheckPending failed: ${stringifyErr(err)}`,
+        );
+      }
+      return;
+    }
+    if (msg.type === "shutdown") {
       shuttingDown = true;
       // Clear every armed re-scan timer FIRST (before unsubscribe / db close) so
       // a pending drop-recovery scan can't fire against a closing connection.

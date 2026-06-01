@@ -16,7 +16,13 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
@@ -26,9 +32,11 @@ import {
   classifyPlanPath,
   coerceRuntimeStatus,
   epicNumberFromId,
+  isPathInHead,
   isWithinRoots,
   type PlanMessage,
   PlanScanner,
+  repoRootFromPlanctlPath,
   scanRoot,
   seedFromDb,
   taskDefPathFromStatePath,
@@ -1422,6 +1430,335 @@ test("scanRoot: invalid runtime_status in a state file skips the cache prime (ta
   expect(
     (taskMsgs[0] as { id: string; runtimeStatus: string }).runtimeStatus,
   ).toBe("todo");
+});
+
+// ---------------------------------------------------------------------------
+// (a''') fn-629 observation gate — plan-worker emits epic/task snapshots ONLY
+// for files in git HEAD. Uncommitted files land in the pending set; a
+// `recheckPending()` (driven by the live worker on every git-worker snapshot
+// pulse, since `git commit` does not change file content and FSEvents will
+// not re-fire on the worktree path) drains the set once the file is
+// committed.
+// ---------------------------------------------------------------------------
+
+/** Shell out to git in a test repo (synchronous, throws on non-zero). */
+function git(cwd: string, ...args: string[]): void {
+  const res = Bun.spawnSync(["git", "-C", cwd, ...args], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!res.success || res.exitCode !== 0) {
+    throw new Error(`git ${args.join(" ")} failed in ${cwd}`);
+  }
+}
+
+/** Initialize a quiet test git repo so `isPathInHead` has a HEAD to read. */
+function gitInit(root: string): void {
+  for (const args of [
+    ["init", "-q", "-b", "main"],
+    ["config", "user.email", "test@example.com"],
+    ["config", "user.name", "Test"],
+    ["config", "commit.gpgsign", "false"],
+  ] as const) {
+    git(root, ...args);
+  }
+  // An initial empty commit so HEAD resolves (no commits → cat-file -e HEAD:
+  // fails uniformly; the gate correctly suppresses, but tests want HEAD to
+  // exist so the predicate's "committed" arm is reachable).
+  git(root, "commit", "--allow-empty", "-q", "-m", "init");
+}
+
+test("repoRootFromPlanctlPath: walks up to .planctl's parent (the repo root)", () => {
+  // Pure path arithmetic — no I/O required.
+  expect(repoRootFromPlanctlPath("/a/b/proj/.planctl/epics/fn-1-x.json")).toBe(
+    "/a/b/proj",
+  );
+  expect(
+    repoRootFromPlanctlPath("/a/b/proj/.planctl/tasks/fn-1-x.2.json"),
+  ).toBe("/a/b/proj");
+  // No .planctl in the ancestry → null.
+  expect(repoRootFromPlanctlPath("/a/b/proj/foo/fn-1-x.json")).toBeNull();
+});
+
+test("isPathInHead: untracked file → false; committed file → true", () => {
+  gitInit(tmpDir);
+  const path = writeEpic("fn-3-demo", { title: "Demo" });
+
+  // Untracked.
+  expect(isPathInHead(path)).toBe(false);
+
+  // Staged but not committed — the very window the fn-629 gate exists to
+  // close (planctl writes the file, then commits in a separate step).
+  git(tmpDir, "add", path);
+  expect(isPathInHead(path)).toBe(false);
+
+  // Committed.
+  git(tmpDir, "commit", "-q", "-m", "add epic");
+  expect(isPathInHead(path)).toBe(true);
+});
+
+test("isPathInHead: path outside any .planctl tree → false (fail closed)", () => {
+  gitInit(tmpDir);
+  const path = join(tmpDir, "not-planctl.json");
+  writeFileSync(path, "{}");
+  git(tmpDir, "add", path);
+  git(tmpDir, "commit", "-q", "-m", "add file");
+  // `repoRootFromPlanctlPath` returns null → predicate falls closed.
+  expect(isPathInHead(path)).toBe(false);
+});
+
+test("onChange: uncommitted epic file does NOT emit (gated to pending); recheckPending after commit drains and emits", () => {
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  // Write the epic file — it's untracked. The gate must suppress.
+  const epicPath = writeEpic("fn-3-demo", {
+    title: "Demo",
+    status: "open",
+    primary_repo: tmpDir,
+  });
+  scanner.onChange(epicPath);
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(1);
+
+  // A `recheckPending()` BEFORE commit re-runs the gate. Still uncommitted
+  // → still in pending, still no emit.
+  scanner.recheckPending();
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(1);
+
+  // Stage. Still not in HEAD — gate still suppresses (the fn-629 window).
+  git(tmpDir, "add", epicPath);
+  scanner.recheckPending();
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(1);
+
+  // Commit. Now the file is in HEAD. The next recheckPending drains it
+  // and emits the snapshot — the autopilot can now act.
+  git(tmpDir, "commit", "-q", "-m", "add epic");
+  scanner.recheckPending();
+  expect(emitted.length).toBe(1);
+  expect(emitted[0].kind).toBe("plan-epic");
+  expect((emitted[0] as { id: string }).id).toBe("fn-3-demo");
+  expect(scanner.pendingSize()).toBe(0);
+});
+
+test("onChange: uncommitted task file is gated; commit drains it via recheckPending", () => {
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  const taskPath = writeTask("fn-3-demo.1", {
+    epic: "fn-3-demo",
+    title: "T",
+    target_repo: tmpDir,
+  });
+  scanner.onChange(taskPath);
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(1);
+
+  git(tmpDir, "add", taskPath);
+  git(tmpDir, "commit", "-q", "-m", "add task");
+  scanner.recheckPending();
+  expect(emitted.length).toBe(1);
+  expect(emitted[0].kind).toBe("plan-task");
+  expect((emitted[0] as { id: string }).id).toBe("fn-3-demo.1");
+  expect(scanner.pendingSize()).toBe(0);
+});
+
+test("onChange: multi-file tree — epic committed before its task lands → only the epic emits; task remains gated", () => {
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  const epicPath = writeEpic("fn-4-multi", {
+    title: "Multi",
+    status: "open",
+    primary_repo: tmpDir,
+  });
+  const taskPath = writeTask("fn-4-multi.1", {
+    epic: "fn-4-multi",
+    title: "Subtask",
+    target_repo: tmpDir,
+  });
+
+  // Both uncommitted — both gated.
+  scanner.onChange(epicPath);
+  scanner.onChange(taskPath);
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(2);
+
+  // Commit ONLY the epic (the partial-tree case — a planctl `epic_create`
+  // could finish its commit while `task_create` is still pre-commit).
+  git(tmpDir, "add", epicPath);
+  git(tmpDir, "commit", "-q", "-m", "add epic only");
+  scanner.recheckPending();
+
+  // Only the epic drains; the task is still pending.
+  const epicMsgs = emitted.filter((m) => m.kind === "plan-epic");
+  const taskMsgs = emitted.filter((m) => m.kind === "plan-task");
+  expect(epicMsgs.length).toBe(1);
+  expect(taskMsgs.length).toBe(0);
+  expect(scanner.pendingSize()).toBe(1);
+
+  // Commit the task too — drains.
+  git(tmpDir, "add", taskPath);
+  git(tmpDir, "commit", "-q", "-m", "add task");
+  scanner.recheckPending();
+  expect(emitted.filter((m) => m.kind === "plan-task").length).toBe(1);
+  expect(scanner.pendingSize()).toBe(0);
+});
+
+test("zero-task epic: a committed epic file with no task files emits without sibling tasks", () => {
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  const epicPath = writeEpic("fn-5-empty", {
+    title: "Empty",
+    status: "open",
+    primary_repo: tmpDir,
+  });
+  // No task files at all under .planctl/tasks.
+
+  git(tmpDir, "add", epicPath);
+  git(tmpDir, "commit", "-q", "-m", "add empty epic");
+
+  // The watcher fired on the epic file. Even with zero tasks, the epic
+  // must emit once committed.
+  scanner.onChange(epicPath);
+  expect(emitted.length).toBe(1);
+  expect(emitted[0].kind).toBe("plan-epic");
+  expect((emitted[0] as { id: string }).id).toBe("fn-5-empty");
+  expect(scanner.pendingSize()).toBe(0);
+});
+
+test("onDelete: a pending uncommitted file that gets removed drops from pending without emitting a tombstone", () => {
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  // Simulates the planctl scaffold unwind path: write tree, gate fires,
+  // commit fails, planctl removes the tree. The gate suppressed the
+  // snapshot, so there's nothing to retract.
+  const epicPath = writeEpic("fn-6-orphan", {
+    title: "Orphan",
+    primary_repo: tmpDir,
+  });
+  scanner.onChange(epicPath);
+  expect(scanner.pendingSize()).toBe(1);
+  expect(emitted).toEqual([]);
+
+  // Remove the file — the unwind. No tombstone should fire because the
+  // reducer never saw an EpicSnapshot for this id.
+  unlinkSync(epicPath);
+  scanner.onDelete(epicPath);
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(0);
+});
+
+test("onDelete: a previously-committed file emits a real tombstone (gate doesn't suppress retraction)", () => {
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  // Write + commit + emit.
+  const epicPath = writeEpic("fn-7-real", {
+    title: "Real",
+    primary_repo: tmpDir,
+  });
+  git(tmpDir, "add", epicPath);
+  git(tmpDir, "commit", "-q", "-m", "add epic");
+  scanner.onChange(epicPath);
+  expect(emitted.length).toBe(1);
+
+  // git rm + commit (or just file removal — the gate is for emission, not
+  // deletion). The scanner's delete arm reads `pathToId` → emits the
+  // tombstone. The reducer needs the tombstone to retract the projection.
+  unlinkSync(epicPath);
+  scanner.onDelete(epicPath);
+  expect(emitted.length).toBe(2);
+  expect(emitted[1]).toEqual({ kind: "plan-epic-deleted", id: "fn-7-real" });
+  expect(scanner.pendingSize()).toBe(0);
+});
+
+test("recheckPending: no-op when pending set is empty", () => {
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  // No files at all — recheck is a no-op.
+  scanner.recheckPending();
+  expect(emitted).toEqual([]);
+
+  // A committed file fires through onChange normally, never lands in
+  // pending. A subsequent recheckPending is still a no-op.
+  const epicPath = writeEpic("fn-8-direct", {
+    title: "Direct",
+    primary_repo: tmpDir,
+  });
+  git(tmpDir, "add", epicPath);
+  git(tmpDir, "commit", "-q", "-m", "add");
+  scanner.onChange(epicPath);
+  expect(emitted.length).toBe(1);
+
+  const before = emitted.length;
+  scanner.recheckPending();
+  expect(emitted.length).toBe(before);
+  expect(scanner.pendingSize()).toBe(0);
+});
+
+test("default scanner (no isTracked) emits unconditionally — back-compat with pre-fn-629 tests", () => {
+  // Construct without the predicate. The default `() => true` means a
+  // freshly-written, uncommitted epic still emits — preserves the test
+  // pattern every existing pure-core test uses.
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  const epicPath = writeEpic("fn-9-default", { title: "Default" });
+  scanner.onChange(epicPath);
+  expect(emitted.length).toBe(1);
+  expect(emitted[0].kind).toBe("plan-epic");
+  expect(scanner.pendingSize()).toBe(0);
 });
 
 // ---------------------------------------------------------------------------
