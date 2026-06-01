@@ -9,5 +9,5 @@ Addresses F1 from the fn-669 audit. `KNOWN_EVENT_COLUMNS` (events-writer.ts:501)
 - [ ] Full `test/events-writer.test.ts` suite green.
 
 ## Done summary
-
+Added test in test/events-writer.test.ts asserting set-equality between KNOWN_EVENT_COLUMNS, the migrated DB's PRAGMA table_info('events') (minus id), and the bare-column key set parsed from the insertBindings literal. Exported KNOWN_EVENT_COLUMNS from events-writer.ts. Closes F1: a CREATE_EVENTS column added without a matching KNOWN_EVENT_COLUMNS entry now fails loud.
 ## Evidence

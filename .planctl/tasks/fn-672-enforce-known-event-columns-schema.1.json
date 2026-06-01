@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "add KNOWN_EVENT_COLUMNS schema-lockstep test",
-  "updated_at": "2026-06-01T20:51:14.226727Z"
+  "updated_at": "2026-06-01T22:25:24.389398Z",
+  "worker_done_at": "2026-06-01T22:25:24.389398Z"
 }
