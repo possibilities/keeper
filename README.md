@@ -265,17 +265,18 @@ Keeper has no `install` verb. Wire it up manually:
    - `claude_projects_root` — the single tree the transcript worker watches for
      session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
      Override only if your Claude Code transcripts live elsewhere.
-   - `zellij_session` — the zellij session name autopilot's zellij backend
+   - `zellij_session` — the zellij session name keeperd's server-side
+     autopilot reconciler (the autopilot worker thread inside the daemon)
      lazily ensures (and reuses) for every tab it spawns. Default:
-     `autopilot`. Each worker opens as a new tab inside that shared
+     `autopilot`. Each dispatch opens as a new tab inside that shared
      background session.
-   - `autoclose_windows` — whether autopilot reaps a dispatched terminal
-     surface once its work reaches a terminal state (the auto-close).
-     Default: `true`. Set `false` to keep finished windows open — useful
-     while troubleshooting a worker whose surface would otherwise vanish the
-     moment it goes idle/done. Only an explicit boolean overrides the default
-     (a string like `"false"` is ignored). The completed-row bookkeeping
-     still fires; only the window reap is suppressed.
+   - `autoclose_windows` — whether the reconciler reaps (kills the agent
+     and closes the zellij tab) a dispatch whose role is no longer needed.
+     Default: `false` (leave-open — finished windows stay open for
+     observe-after-the-fact). Set `true` to enable the reap. Only an explicit
+     boolean overrides the default (a string like `"true"` is ignored). The
+     completed-row bookkeeping still fires regardless; the flag only gates the
+     window reap.
 
    ```sh
    mkdir -p ~/.config/keeper
@@ -285,7 +286,7 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/src
    claude_projects_root: ~/.claude/projects
    zellij_session: autopilot
-   autoclose_windows: true
+   autoclose_windows: false
    YAML
    ```
 
@@ -295,7 +296,7 @@ Keeper has no `install` verb. Wire it up manually:
    All keys fall back independently — a missing/malformed one never disturbs
    the others; a missing or malformed config falls back to every default
    (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
-   `zellij_session: autopilot`, `autoclose_windows: true`). Unknown keys
+   `zellij_session: autopilot`, `autoclose_windows: false`). Unknown keys
    are silently ignored — a legacy `exec_backend: ghostty` carried over
    from a pre-fn-654 config has no effect.
 
@@ -577,35 +578,37 @@ collapses to plain stream output. Run any of them with
   keeper jobs             # live jobs list, default scope
   ```
 
-- `autopilot.ts` — dispatch-oriented sibling of `board.ts`. Subscribes
-  through the same `src/readiness-client.ts` helper and renders a
-  four-section frame (`--- current ---`, `--- queued ---`,
-  `--- predicted ---`, `--- completed ---`) of every dispatch fired so
-  far this run (plus prior-run rehydrated `--- current ---` rows via
-  `hydrateDispatchLog`). Fires on verdict edges: a row flipping to
-  `ready` spawns a terminal surface running `cd <target_repo> && claude
-  '/plan:work|close <id>'`; a row flipping to `blocked:job-pending`
-  spawns the matching `/plan:approve`. The launch goes through
-  validated `$SHELL` (`-l -i`, `/bin/zsh` fallback) with `exec $SHELL
-  -l -i` chained after claude exits so a dropped session leaves a
-  usable shell. The terminal-surface mechanics live behind an
-  `ExecBackend` interface (`src/exec-backend.ts`) — zellij is the only
-  backend; each worker is spawned as a new tab in the lazily-created
-  `zellij_session`. Each launch records its tab id in
-  `~/.local/state/keeper/dispatch.log` (a `kind:"window"` row) and
-  auto-closes the surface (zellij `action close-tab-by-id`) the moment
-  the dispatch reaches `--- completed ---` (terminal job state or
-  post-fulfillment disappearance), so parked "process exited" surfaces
-  don't accumulate. Re-dispatch is gated by durable `dispatchedKeys` /
-  `fulfilledKeys` sets seeded from `dispatch.log`. Alt-screen TUI when
-  stdout is a TTY; keymap `←/h/k` / `→/l/j` / `g` / `G/Esc` / `space`
-  pause / `v` toggle commands / `c` copy / `q` quit. SIGINT tears down
-  the renderer (alt-screen exit, raw mode off) then disposes the
-  subscribe helper.
+- `autopilot.ts` — thin viewer + control surface over the server-side
+  autopilot reconciler (the autopilot worker thread inside keeperd; see
+  `## Architecture`). All dispatch decision, launch, confirmation, dedup,
+  and (config-gated) reap live in the daemon; the CLI carries no dispatch
+  logic of its own. It subscribes through `src/readiness-client.ts` and the
+  `dispatch_failures` collection, renders a three-section frame
+  (`--- current ---` from `jobs` correlated by `plan_verb`+`plan_ref`,
+  `--- predicted ---` from `computeReadiness`, `--- failed ---` from the
+  `dispatch_failures` projection) plus a paused/playing banner, and
+  exposes three control RPCs:
+
+  - `keeper autopilot play` / `keeper autopilot pause` — flip the in-memory
+    pause flag on the daemon via `set_autopilot_paused` (boots paused; the
+    flag is never persisted, so a restart returns to safe-by-default paused).
+  - `keeper autopilot retry <verb::id>` — clear a sticky `dispatch_failures`
+    row via `retry_dispatch`. The RPC bridges through main, which appends a
+    `DispatchCleared` synthetic event; the reducer DELETEs the row on the
+    next drain and the reconciler is free to re-attempt. There is no
+    auto-retry — a failed dispatch is sticky and visible in the `--- failed
+    ---` section until a human runs `retry`.
+
+  Alt-screen TUI when stdout is a TTY; keymap `←/h/k` / `→/l/j` / `g` /
+  `G/Esc` / `space` pause / `c` copy / `q` quit. SIGINT tears down the
+  renderer (alt-screen exit, raw mode off) then disposes the subscribe
+  helper.
 
   ```sh
-  keeper autopilot            # four-section dispatch frame, default scope
-  keeper autopilot --dry-run  # log dispatches without spawning a terminal surface
+  keeper autopilot                       # viewer: current / predicted / failed + paused state
+  keeper autopilot play                  # un-pause the reconciler
+  keeper autopilot pause                 # pause the reconciler (default at boot)
+  keeper autopilot retry work::fn-1-x.3  # clear a sticky DispatchFailed
   ```
 
 - `git.ts` — single-collection subscribe client over the `git`
@@ -954,6 +957,22 @@ the board (with its full lifecycle, since the original event log carried
 nothing for it) and `N` drops by one. The schema bump is v36→v37; fn-642
 (`profile_name` jobs column) occupies the v35→v36 slot ahead of this
 work.
+As of schema v42 (fn-661), the new `dispatch_failures` projection table
+(keyed by `(verb, ref)` — the same `verb::id` correlation key the autopilot
+reconciler uses to dedup against `jobs`) carries the sticky failure record
+for the server-side reconciler. It is folded purely from the event log: a
+`DispatchFailed` synthetic event UPSERTs a row (`failed_at`, `reason`,
+`source` — `launch` / `confirm_timeout` / `precheck`); a `DispatchCleared`
+synthetic event DELETEs by the same key. No auto-retry; the only way to
+clear a row is the `retry_dispatch` RPC (human-driven), which routes through
+the server-worker → main → `DispatchCleared` mint. A from-scratch re-fold
+reproduces the table byte-identically (no fold-time wall clock; the event's
+own `ts` lands in `failed_at`). The pre-fn-661 standalone `keeper autopilot`
+loop (with `isLiveSessionInRoot` / `zellij query-tab-names` dedup) is
+retired; the CLI collapses to a thin viewer + the `play` / `pause` / `retry`
+controls. keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `42`
+(whitelist-only; keeper-py reads `jobs` / `git_status` / `meta`, not
+`dispatch_failures`).
 As of schema v41 (fn-651), the `usage` projection tells the truth about
 WHEN a rate-limited profile unblocks AND whether its numbers are fresh.
 Two additive nullable columns ride the existing `UsageSnapshot`
@@ -1076,19 +1095,55 @@ the shared debounced re-scan scheduler. Distinct from the other six
 producers it does NOT mint synthetic `events` rows — the import is a
 direct operational-table write — and it is NOT a fold.
 
-The seven workers are fully independent; main supervises all seven lifecycles
+An **eighth** Worker thread is the autopilot reconciler (schema v42, fn-661):
+a server-side, level-triggered, change-driven control loop that owns dispatch
+decision, launch, confirmation, dedup, and (config-gated) reap. It polls
+`PRAGMA data_version` on its own read-only connection like the other
+projection consumers, but on each wake it re-runs `computeReadiness` from
+scratch and reconciles desired-vs-observed against the live `jobs` projection
+— never an edge trigger, never a re-probe of the zellij surface. Dedup is
+keeperd job presence (correlated by `--name` → `plan_verb`+`plan_ref`), not a
+`zellij query-tab-names` round-trip; the surface-probe wedge of the standalone
+CLI is structurally impossible. The reconciler boots PAUSED (in-memory only,
+never persisted, so a restart is always safe-by-default) and flips on the
+`set_autopilot_paused` RPC. The terminal-surface mechanics live behind the
+shrunken `ExecBackend` (`src/exec-backend.ts`, `launch` + `closeByName` only)
+— zellij is the only backend; each dispatch opens as a new tab in the
+lazily-created `zellij_session`. Launch failure or a bounded single-attempt
+confirm timeout posts a `DispatchFailedMessage` to main; main — again the
+sole writer — turns it into a synthetic `DispatchFailed` events row and pumps
+a wake, and the reducer folds it into the new `dispatch_failures` projection.
+There is NO auto-retry — a failed dispatch is sticky and visible in `keeper
+autopilot`'s `--- failed ---` section until the human runs `keeper autopilot
+retry <verb::id>`, which routes through the server-worker's `retry_dispatch`
+RPC → main → a synthetic `DispatchCleared` events row → the reducer DELETEs
+the matching `dispatch_failures` row on the next drain. The only durable
+autopilot-owned state is the event-sourced `dispatch_failures` projection; a
+from-scratch re-fold reproduces it byte-identically (DispatchFailed UPSERTs by
+`(verb, ref)`, DispatchCleared DELETEs by the same key). When the
+`autoclose_windows` config flag is on, the reconciler reaps (kills the agent
+and closes the tab via `ExecBackend.closeByName`) a dispatch whose role is no
+longer needed; default-off preserves today's leave-open behavior.
+
+The eight workers are fully independent; main supervises all eight lifecycles
 but routes none of their traffic, and any worker's `error` event escalates
 the whole process to a clean restart — with that single scoped exception, the
 recoverable drop signal on the transcript, plan, usage, and dead-letter
 watchers, which deliberately does NOT escalate (a re-scan throw is swallowed,
 never reaching the restart path).
 
-Readiness is a client-side library today, not a server-side collection.
-`src/readiness.ts` is the shared verdict pipeline consumed by
-`scripts/board.ts` and `scripts/autopilot.ts` via the
-`src/readiness-client.ts` helper, which subscribes to the three input
-collections (`epics`, `jobs`, `subagent_invocations`) and runs
-`computeReadiness` per emit. Each per-collection state carries a stable
+Readiness is a client-side library, not a server-side collection.
+`src/readiness.ts` is the shared verdict pipeline consumed both by
+`scripts/board.ts` (via the `src/readiness-client.ts` helper, which
+subscribes to the three input collections `epics` / `jobs` /
+`subagent_invocations` and runs `computeReadiness` per emit) and by the
+in-daemon autopilot reconciler worker (which subscribes to the same
+collections on its own read-only connection and runs `computeReadiness`
+against them on every `data_version` wake). The `scripts/autopilot.ts`
+viewer subscribes only to the `dispatch_failures` collection plus the
+helper-driven verdict stream to render the `--- predicted ---` /
+`--- failed ---` sections; the dispatch decision itself does NOT run
+client-side anymore. Each per-collection state carries a stable
 constant `subId` (`${idPrefix}-<collection>`) that the helper sends on
 every `query` frame and uses to route inbound `patch`/`meta` frames
 back to the originating state via a `bySubId` map — collection lookup
@@ -1192,7 +1247,7 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT count(*) FROM dead_letters WHERE status = 'waiting'"
 
-# Raw event log tail (synthetic EpicSnapshot/TaskSnapshot/EpicDeleted/TaskDeleted rows appear here too):
+# Raw event log tail (synthetic EpicSnapshot/TaskSnapshot/EpicDeleted/TaskDeleted/DispatchFailed/DispatchCleared rows appear here too):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT id, hook_event, session_id FROM events ORDER BY id DESC LIMIT 10'
 

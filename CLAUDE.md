@@ -29,10 +29,11 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
 ## Event-sourcing invariants
 
 - **Cursor + projection advance in the SAME `BEGIN IMMEDIATE` transaction.** Each
-  fold writes the projection AND bumps `reducer_state.last_event_id` in one
-  transaction. A crash mid-fold rolls back both; boot drain re-folds
-  idempotently. This is the exactly-once-per-event guarantee — never split the
-  two writes across transactions.
+  fold writes the projection (`jobs` / `epics` / `usage` / `git_status` /
+  `profiles` / `file_attributions` / `dispatch_failures`) AND bumps
+  `reducer_state.last_event_id` in one transaction. A crash mid-fold rolls back
+  both; boot drain re-folds idempotently. This is the exactly-once-per-event
+  guarantee — never split the two writes across transactions.
 - **Re-fold determinism is sacred.** Every projection-driving fact lives in the
   immutable event log; nothing is written straight to `jobs`/`epics`. A re-fold
   from scratch (rewind cursor, `DELETE FROM` the projections, re-drain) must
@@ -59,12 +60,17 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   `wal_checkpoint(PASSIVE)`, never TRUNCATE (TRUNCATE waits on writers and starves
   a contending hook).
 - **Sole-writer rules.** The hook is the sole writer of *hook* events and of
-  per-pid NDJSON dead-letter files. Main is the sole writer of *synthetic* events,
-  of the `dead_letters` operational sidecar, and of the dead-letter replay path.
-  The server-worker writes only the `approval` field on external `.planctl` JSON
-  (atomic temp+rename) and bridges `replay_dead_letter` to main — it never writes
-  the event log itself. Producer workers feed the log only via main's writable
-  connection; they never write the DB.
+  per-pid NDJSON dead-letter files. Main is the sole writer of *synthetic*
+  events (`TranscriptTitle`, `ApiError`, `InputRequest`, `EpicSnapshot` /
+  `TaskSnapshot` / `EpicDeleted` / `TaskDeleted`, `UsageSnapshot` /
+  `UsageDeleted`, `Killed`, `GitSnapshot` / `GitRootDropped` / `Commit`,
+  `DispatchFailed` / `DispatchCleared`), of the `dead_letters` operational
+  sidecar, and of the dead-letter replay path. The server-worker writes only
+  the `approval` field on external `.planctl` JSON (atomic temp+rename) and
+  bridges `replay_dead_letter`, `set_autopilot_paused`, and `retry_dispatch` to
+  main — it never writes the event log itself. Producer workers (including the
+  autopilot reconciler) feed the log only via main's writable connection; they
+  never write the DB.
 - **Producer-only liveness probing.** The boot seed sweep and the exit-watcher
   worker are the ONLY places that probe liveness (`kill(pid,0)`, kqueue, pidfd,
   `(pid, start_time)` recycle check). Folds NEVER re-probe — a re-probe inside a
@@ -88,14 +94,23 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
 
 - **No general write path into the reducer.** The socket carries `query` (read,
   unchanged and read-only) and `rpc` (mutate) frames — no reactor. RPC writes are
-  scoped to exactly two surfaces: (1) the `approval` field on `.planctl` files
-  (`set_task_approval` / `set_epic_approval`, atomic temp+rename), and (2) the
-  delayed-real-event replay path (`replay_dead_letter`). RPC handlers MUST NOT
-  write `jobs`/`epics` directly — approval changes round-trip through the
-  plan-worker watcher → `EpicSnapshot`/`TaskSnapshot` → reducer so re-fold sees
-  them. *Why only these two:* approval is the one piece of human state with no
-  hook to attach it to; replay recovers events the hook failed to insert.
-  Everything else is the planner's/worker's job or belongs to the hook.
+  scoped to exactly four surfaces: (1) the `approval` field on `.planctl` files
+  (`set_task_approval` / `set_epic_approval`, atomic temp+rename), (2) the
+  delayed-real-event replay path (`replay_dead_letter`), (3) the autopilot
+  in-memory pause flag (`set_autopilot_paused`), and (4) the autopilot
+  failure-clear path (`retry_dispatch`, which appends a `DispatchCleared`
+  synthetic event and lets the reducer DELETE the matching `dispatch_failures`
+  row on the next drain). RPC handlers MUST NOT write `jobs`/`epics`/
+  `dispatch_failures` directly — approval changes round-trip through the
+  plan-worker watcher → `EpicSnapshot`/`TaskSnapshot` → reducer, and retry
+  round-trips through main → synthetic event → reducer, so a re-fold sees them
+  all. *Why only these four:* approval is the one piece of human state with no
+  hook to attach it to; replay recovers events the hook failed to insert;
+  autopilot pause is human-intent state with no hook attachment point and is
+  deliberately in-memory only (boots paused, never persisted); retry clears a
+  sticky failure (no auto-retry — every cleared failure is an explicit human
+  decision). Everything else is the planner's/worker's job or belongs to the
+  hook.
 - **No kernel file watchers ON KEEPER'S OWN SQLite DB** (`fs.watch`, FSEvents,
   kqueue, chokidar) — they drop same-process writes and miss WAL writes on macOS.
   Use `PRAGMA data_version` polling on a read-only autocommit connection as the
