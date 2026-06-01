@@ -38,5 +38,5 @@ Test the worker's pure tick logic with a spawn stub: dedup-by-session, skip coor
 - [ ] `BackendExecSnapshot` added to CLAUDE.md Sole-writer list; worker error → fatalExit; re-fold deterministic.
 
 ## Done summary
-
+Added the backend-exec tab-resolver producer worker (src/backend-worker.ts), wired it through daemon.ts to mint synthetic BackendExecSnapshot events, and added the reducer fold that UPDATEs jobs.backend_exec_tab_{id,name} with last-known-sticks tombstone semantics. CLAUDE.md sole-writer list updated; worker + fold tests cover dedup, tombstone, throw, and re-fold determinism.
 ## Evidence
