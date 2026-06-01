@@ -34,5 +34,5 @@ Unit-test `execBackendEnvMeta()` (default + explicit type) and `findPaneById` (n
 - [ ] Tests pass via injected spawn stub; no rename/mutation code added.
 
 ## Done summary
-
+Added execBackendEnvMeta() (single source of truth for ZELLIJ_SESSION_NAME / ZELLIJ_PANE_ID env-var names) and resolveTabForPane(session, paneId, deps) (spawns list-panes -a -j once, returns {tab_id, tab_name, tab_position} | null, never throws). findPaneById mirrors findPaneByTabName's none/single/multiple envelope and normalizes numeric list-panes id against string env value via String(). 16 new tests, all 50 in test/exec-backend.test.ts pass.
 ## Evidence
