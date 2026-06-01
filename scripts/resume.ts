@@ -7,11 +7,17 @@
  * sweeps the `jobs` collection and prints, per job, the shell command that
  * re-attaches to that session:
  *
- *   cd <cwd> && claude [--plugin-dir <tier-dir>] --resume "<job_id>"
+ *   cd <cwd> && claude [--plugin-dir <tier-dir>] --resume "<session-name>"
  *
- * The `--resume` target is the job's `job_id` — keeper's `job_id` IS the
- * Claude Code session id (`src/reducer.ts`: "job_id === session_id"), so it
- * is exactly what `claude --resume <session-id>` re-opens.
+ * The `--resume` target is the job's latest session NAME (keeper's `title` —
+ * seeded from the launch `--name`/`spawn_name` and kept equal to
+ * `name_history`'s newest entry as the name is promoted). `claude --resume
+ * [value]` resolves an exact session id directly, OR opens the /resume picker
+ * filtered by `value` as a search term; since `--name` is "shown in the
+ * /resume picker", passing the display name filters the picker straight to
+ * that session. A job that never carried a name falls back to its `job_id`
+ * (keeper's `job_id` IS the Claude session id — `src/reducer.ts`: "job_id ===
+ * session_id"), which `claude --resume` resolves directly.
  *
  * The `--plugin-dir` is reconstructed to match what the worker launched
  * with: autopilot's `work` dispatch adds
@@ -82,11 +88,14 @@ Usage: bun scripts/resume.ts [--sock <path>] [--all]
 
 Output (per job, two lines):
   # ({cwd-basename}) {title} [{role}]? [{state}]
-  cd <cwd> && claude [--plugin-dir <tier-dir>] --resume "<job_id>"
+  cd <cwd> && claude [--plugin-dir <tier-dir>] --resume "<session-name>"
 
-The --plugin-dir tier directory is reconstructed only for 'work'-bound jobs
-(looked up off the owning epic's task, exactly as scripts/commands.ts does);
-every other job gets the plain 'cd <cwd> && claude --resume "<job_id>"' form.
+--resume uses the job's latest session name (keeper's title) so 'claude
+--resume' filters the /resume picker straight to it; a job with no name falls
+back to its session id. The --plugin-dir tier directory is reconstructed only
+for 'work'-bound jobs (looked up off the owning epic's task, exactly as
+scripts/commands.ts does); every other job gets the plain
+'cd <cwd> && claude --resume "<session-name>"' form.
 
 On success: prints the commands to stdout and exits 0 (zero jobs → no output).
 On failure (daemon down, timeout, malformed args): prints the reason to
@@ -326,14 +335,21 @@ async function tierForJob(
 
 /**
  * Build the resume shell command for a job. Mirrors `buildWorkerCommand`'s
- * `cd`-prefix + `--plugin-dir` shape, but the payload is `--resume "<id>"`
+ * `cd`-prefix + `--plugin-dir` shape, but the payload is `--resume "<target>"`
  * instead of `--name ... '/plan:<verb> ...'`. A null/empty `cwd` drops the
  * `cd` prefix (same degenerate-path rule as `buildWorkerCommand`); a null
- * tier drops the `--plugin-dir`. Pure.
+ * tier drops the `--plugin-dir`.
+ *
+ * `target` is the job's latest session NAME when it has one, else its session
+ * id (see {@link resumeTarget}). `claude --resume [value]` resolves an exact
+ * session id directly, OR opens the /resume picker filtered by `value` as a
+ * search term — and `--name` is "shown in the /resume picker" — so passing the
+ * display name filters the picker straight to that session. Double-quoted
+ * because a promoted (auto-generated) name can contain spaces. Pure.
  */
 function buildResumeCommand(
   cwd: string,
-  sessionId: string,
+  target: string,
   tier: string | null,
 ): string {
   const cdPrefix = cwd === "" ? "" : `cd ${cwd} && `;
@@ -341,8 +357,22 @@ function buildResumeCommand(
   if (tier != null && tier !== "") {
     flags.push("--plugin-dir", workPluginDir(tier));
   }
-  flags.push("--resume", `"${sessionId}"`);
+  flags.push("--resume", `"${target}"`);
   return `${cdPrefix}claude ${flags.join(" ")}`;
+}
+
+/**
+ * The `--resume` target for a job: its latest session NAME when it has one,
+ * else the session id as a fallback. keeper's `title` is the current session
+ * name — it is seeded from the launch `--name` (`spawn_name`) and kept equal
+ * to `name_history`'s newest entry as the name is promoted, so it is exactly
+ * the "latest session name" the keeper DB knows. A job that never carried a
+ * name (NULL `title`) falls back to `job_id` (= the Claude session id), which
+ * `claude --resume` resolves directly.
+ */
+function resumeTarget(job: Job): string {
+  const name = seg(job.title);
+  return name !== "" ? name : seg(job.job_id);
 }
 
 /**
@@ -388,7 +418,7 @@ async function main(): Promise<void> {
     const tier = await tierForJob(sockPath, job, epicCache);
     const cwd = job.cwd == null ? "" : seg(job.cwd);
     stanzas.push(
-      `${jobLabel(job)}\n${buildResumeCommand(cwd, sessionId, tier)}`,
+      `${jobLabel(job)}\n${buildResumeCommand(cwd, resumeTarget(job), tier)}`,
     );
   }
 
