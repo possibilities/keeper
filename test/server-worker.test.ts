@@ -1315,7 +1315,7 @@ test("spawned Worker shuts down cleanly and removes the socket file", async () =
   const worker = new Worker(
     new URL("../src/server-worker.ts", import.meta.url).href,
     {
-      workerData: { dbPath, sockPath, lockPath },
+      workerData: { role: "server", dbPath, sockPath, lockPath },
     } as WorkerOptions & { workerData: unknown },
   );
 
