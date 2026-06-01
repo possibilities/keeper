@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-01T15:49:40.840347Z",
+  "depends_on": [
+    "fn-670-deterministic-committing-session.2"
+  ],
+  "epic": "fn-670-deterministic-committing-session",
+  "id": "fn-670-deterministic-committing-session.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": "high",
+  "title": "planctl prefers committing session and assistant-only extract",
+  "updated_at": "2026-06-01T15:49:40.840347Z"
+}
