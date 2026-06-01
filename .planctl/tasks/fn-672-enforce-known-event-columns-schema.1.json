@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-01T20:51:14.226727Z",
+  "depends_on": [],
+  "epic": "fn-672-enforce-known-event-columns-schema",
+  "id": "fn-672-enforce-known-event-columns-schema.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "add KNOWN_EVENT_COLUMNS schema-lockstep test",
+  "updated_at": "2026-06-01T20:51:14.226727Z"
+}
