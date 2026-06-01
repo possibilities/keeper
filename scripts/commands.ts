@@ -14,10 +14,10 @@
  *     command, both `cd`'d to the epic's `project_dir`.
  *
  * The commands are rendered through `buildWorkerCommand` imported from
- * `scripts/autopilot.ts` — the single source autopilot itself dispatches
- * through — so the printed strings are byte-identical to what a live
- * autopilot run launches on the matching readiness edge (`work`/`close`
- * on `→ ready`, `approve` on `→ job-pending`). The approve line is the
+ * `src/autopilot-worker.ts` — the single source the server-side autopilot
+ * reconciler dispatches through — so the printed strings are byte-identical
+ * to what a live reconciler launches on the matching readiness edge
+ * (`work`/`close` on `→ ready`, `approve` on `→ job-pending`). The approve line is the
  * `/plan:approve` claude command (autopilot's live job-pending dispatch),
  * NOT the `bun approve.ts <id>` form autopilot's static display-helper
  * uses.
@@ -47,6 +47,7 @@
  */
 
 import { parseArgs } from "node:util";
+import { buildWorkerCommand } from "../src/autopilot-worker";
 import { resolveSockPath } from "../src/db";
 import {
   type ClientFrame,
@@ -55,7 +56,6 @@ import {
   type ServerFrame,
 } from "../src/protocol";
 import type { Epic, Task } from "../src/types";
-import { buildWorkerCommand } from "../cli/autopilot";
 
 /**
  * Hard upper bound on how long the CLI waits for the `result` frame after a

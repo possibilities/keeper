@@ -1,724 +1,145 @@
 #!/usr/bin/env bun
 /**
- * keeper-autopilot — dispatch log viewer over the keeper subscribe server.
+ * `keeper autopilot` — thin viewer + control surface for the server-side
+ * autopilot reconciler (fn-661).
  *
- * Subscribes to keeperd and auto-dispatches ready rows. Each frame lists
- * every command dispatched so far, oldest first. Each line is prefixed
- * with the basename of the cd target so the project is scannable at a
- * glance (matches the `(dir)` shape used by `board.ts`). The summary
- * form is `(<dir>) <verb>::<id>`; dry runs append the would-have-run
- * shell command on two indented lines beneath:
+ * The reconciler itself lives in `src/autopilot-worker.ts` as a daemon
+ * worker thread; this CLI does NOT dispatch, dedup, suppress, settle,
+ * confirm, reap, or persist anything. Its only jobs are:
  *
- *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
- *   (keeper) [dry] approve::fn-619-pin-inputrequest-mid-subagent-state.1
- *     cd /Users/mike/code/keeper && \
- *       claude '/plan:approve fn-619-pin-inputrequest-mid-subagent-state.1'
+ *   1. Render three sections of state, refreshed on every subscribe edge:
+ *        --- current ---   live `jobs` rows (the reconciler's observed
+ *                          dispatches), ordered for human scan
+ *        --- predicted --- `predictNextDispatches` over the live readiness
+ *                          snapshot — pure preview, NO dispatch behind it
+ *        --- failed ---    rows from the `dispatch_failures` projection
+ *                          (the only durable autopilot-owned state, fed by
+ *                          the reducer's `DispatchFailed` fold arm)
+ *      plus a `[paused]` / `[playing]` banner indicator.
  *
- * Dispatches are persisted to ~/.local/state/keeper/dispatch.log (JSONL)
- * for forensic tailing AND for the cross-run re-dispatch guard. Four
- * line kinds:
+ *   2. Three control subcommands that round-trip a single RPC each:
+ *        keeper autopilot pause          → set_autopilot_paused {paused:true}
+ *        keeper autopilot play           → set_autopilot_paused {paused:false}
+ *        keeper autopilot retry <key>    → retry_dispatch       {id:<key>}
+ *      Where `<key>` is the canonical `${verb}::${id}` composite (e.g.
+ *      `work::fn-619-foo.3`). Each subcommand opens a fresh `Bun.connect`,
+ *      sends ONE `rpc` frame, awaits the matching `rpc_result` / `error`,
+ *      and exits — same one-shot shape as `scripts/approve.ts`.
  *
- *   `{"kind":"launch", ts, rowId, dir, dirFull, verb, id, command,
- *    dry?, pid?}` — written by `logDispatch` the moment autopilot
- *    fires (or would-have-fired in dry mode).
- *   `{"kind":"window", ts, verb, id, windowId, tabName}` — written by
- *    `launchWindow` right after `ExecBackend.launch` returns the
- *    freshly-spawned surface's stable PANE id (zellij:
- *    `terminal_<n>`). `tabName` is the launch-time `verb::id`, the
- *    wrap-safety token for the surgical pane-close path (fn-654.2 —
- *    the backend probes `query-tab-names` for `tabName` before firing
- *    `close-pane -p windowId`, so a `zellij --server`-restart-recycled
- *    pane id never reaps the wrong live pane). Stamps both fields
- *    onto the in-memory `DispatchEntry` by reference so the same-run
- *    auto-close can fire, and survives a restart via
- *    `hydrateDispatchLog`'s second-pass `Map` keyed by `${verb}::${id}`
- *    (latest-ts-wins). Raw `appendFileSync` — NOT `logDispatch` — to
- *    avoid re-pushing a display entry. Fire-and-forget on failure
- *    (surface simply won't auto-close).
- *   `{"kind":"fulfilled", ts, verb, id, pid?}` — written by
- *    `detectJobTransitions` the first time an embedded job for the
- *    dispatched `(verb, id)` appears in the readiness snapshot. Marks
- *    the dispatch as claimed for life — section 1's "queued → current"
- *    move pivots on this, and the durable re-dispatch guard rides on
- *    the matching `dispatchedKeys` set so a session-ended → verdict-
- *    flips-back-to-ready cycle cannot open a second Ghostty window.
- *   `{"kind":"completed", ts, verb, id, pid?}` — written by
- *    `detectJobTransitions` the first time the dispatched `(verb, id)`
- *    is observed completed on EITHER axis: (a) the embedded job reaches
- *    a terminal session state (`state === "ended" | "killed"`), or (b)
- *    the job is parked at `state === "stopped"` AND the row's board
- *    readiness verdict is already `{ tag: "completed" }` — the same
- *    signal `board.ts` stamps `[completed]` on (worker done + approved,
- *    or epic done + approved). Migrates the row from `--- current ---`
- *    to `--- completed ---`. ALSO triggers the
- *    `closeWindow(entry.windowId)` auto-close at this edge (terminal-
- *    state branch, stopped-and-board-complete branch, AND the
- *    disappearance branch), reaping the Ghostty window in lockstep with
- *    the work actually being done so the human's screen doesn't
- *    accumulate parked surfaces. Branch (b) is what reaps a finished-
- *    and-approved worker that would otherwise linger at `stopped` (and
- *    keep its window open) until the human closed it by hand.
+ * Bare invocation (`keeper autopilot` with no subcommand) opens the
+ * viewer. The viewer shares the `createViewShell` harness with `board` /
+ * `jobs` / `git` — same alt-screen UX, same sidecar contract.
  *
- * The frame has four named-header sections, each emitted only when
- * non-empty, rendered in this order: `--- current ---`, `--- queued ---`,
- * `--- predicted ---`, `--- completed ---`. The ordering is attention-
- * first (live agents at the top, then about-to-be-active, then future,
- * then growing history at the bottom so completed entries don't push
- * live state around).
+ * Data plumbing:
+ *  - The readiness collections (epics + jobs + subagent_invocations + git
+ *    + dead_letters) ride one `subscribeReadiness` connection — same
+ *    surface board.ts consumes, identical first-paint gating and
+ *    capped-backoff reconnect contract.
+ *  - The `dispatch_failures` collection rides its own `subscribeCollection`
+ *    connection (server descriptor: `src/collections.ts`'s
+ *    `DISPATCH_FAILURES_DESCRIPTOR`). Default-sort is `ts DESC`, so the
+ *    freshest failure is on top.
  *
- * `--- current ---` survives a restart; `--- queued ---` and
- * `--- completed ---` are scoped to THIS RUN. On startup
- * `hydrateDispatchLog` folds the on-disk log back into the durable
- * `dispatchedKeys` / `fulfilledKeys` / `completedKeys` sets (so the
- * re-dispatch guard survives restarts) AND walks the parsed launch
- * rows a second time, returning `restoredEntries`: every
- * `kind:"launch"` row where `fulfilledKeys.has(key) &&
- * !completedKeys.has(key) && !dry`, deduped latest-per-key (later
- * `ts` wins), sorted by `ts` ascending. The matching `kind:"window"`
- * row (if any) is folded onto the restored entry's `windowId`
- * (latest-ts-wins) so cross-run auto-close still works. `main()`
- * seeds the in-memory `dispatchLog` array from `restoredEntries`, so
- * a prior-run still-running dispatch renders under `--- current ---`
- * on the very first frame. If the matching embedded job has since
- * fallen off the projection (parent epic became done+approved or was
- * `planctl epic-delete`d), `detectJobTransitions`'s disappearance
- * branch migrates the key to `completedKeys` on the first
- * post-startup snapshot, the row moves to `--- completed ---`, AND
- * `closeWindow(entry.windowId)` fires to reap the parked Ghostty
- * window — same auto-close path the terminal-state branch takes.
- * Dispatches partition three ways: rows whose key has been observed
- * terminal (`state in {ended, killed}`) or whose fulfilled job has
- * disappeared from the snapshot render under `--- completed ---`;
- * rows whose key has been observed registered but not yet terminal
- * render under `--- current ---`; rows still waiting on the agent to
- * boot render under `--- queued ---`. In wet mode queued is transient
- * (~1-3 frames between dispatch and SessionStart fold); in dry mode
- * it persists for the lifetime of the run since no claude session is
- * actually spawned (and dry launches are deliberately NOT restored
- * across runs — they can never reach fulfillment). A real mid-flight
- * crash now PRESERVES `--- current ---` (the next run rehydrates it
- * from disk via the filter above); `--- queued ---` is still lost
- * across the crash because a queued dispatch has no `fulfilled` line
- * yet, and `--- completed ---` is still scoped to this run because
- * completed entries are forensic history the human can tail in
- * `dispatch.log`.
+ * Paused-state surfacing:
+ *  - The daemon does NOT expose a `get_autopilot_paused` query — the
+ *    `paused` flag is in-memory on main and boots `true` by safety
+ *    invariant. The viewer mirrors that: starts the banner at `[paused]`
+ *    and flips to `[playing]` / back when a successful pause/play RPC
+ *    round-trips. Until the human runs `play` / `pause`, the banner is
+ *    showing the boot-time default, not a real read — that's an
+ *    intentional simplification of the epic ("never persisted" applies to
+ *    the daemon side too).
  *
- * A new frame is emitted immediately after each dispatch AND whenever
- * `detectJobTransitions` observes a key flip from queued → current or
- * current → completed.
- *
- * The `--- predicted ---` section previews the next dispatches
- * autopilot will fire as current sessions finish — approvals first,
- * then informational `git-dirty::<id>` rows (worker's future verdict
- * is `git-uncommitted` / `git-orphans`, collapsed to one signal;
- * renders alongside the others but has NO dispatch behind it — the
- * human resolves it by cleaning the worktree, after which the row
- * drops off and re-appears as `approve::<id>`), then workers, then
- * closers (rows that flip blocked→ready in a simulation that forces
- * every currently-active row to completed). Preview rows are
- * single-line `(<dir>) <verb>::<id>`; the dir column is padded to the
- * widest `(<dir>) ` across the predicted rows so `<verb>::<id>` aligns
- * across projects. No `[dry]` tag, no shell-command footer. The
- * preview recomputes from the live readiness snapshot on every emit:
- *
- *   --- current ---
- *   (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
- *   --- predicted ---
- *   (arthack) approve::fn-594-fix-silent-failure-paths-in-templates.1
- *   (arthack) git-dirty::fn-594-fix-silent-failure-paths-in-templates.1
- *   (keeper)  work::fn-619-pin-inputrequest-mid-subagent-state.3
- *   (keeper)  close::fn-619-pin-inputrequest-mid-subagent-state
- *
- * The `v` key toggles a per-row command display: every command-bearing
- * row (dispatched current/queued/completed rows and dispatch-backed
- * predicted work/close/approve rows) grows one indented line carrying
- * the full `cd … && claude --name … '/plan:…'` shell command for
- * copy-paste when the human wants to run it manually. The
- * informational `git-dirty` preview row has no dispatch behind it and
- * is never annotated. The toggle repaints the live body without
- * growing frame history and lights a `[cmd]` marker in the banner.
- *
- * Fires side effects on EDGES in the readiness verdicts:
- *   → ready          spawn a Ghostty window running the worker command
- *                    (`cd … && claude '/plan:work …'` or '/plan:close …')
- *   → job-pending    spawn a Ghostty window running the approve command
- *                    (`cd … && claude '/plan:approve …'`) so the human
- *                    lands directly in the review session.
- * Per-row verdict signature is carried in a Map across snapshots; the
- * map is NOT cleared on reconnect so reconnects don't refire already
- * -seen edges.
- *
- * Connection / sidecar / SIGINT: the helper (`src/readiness-client.ts`)
- * owns capped-backoff reconnect, the all-three-strict first-paint gate,
- * per-collection coalesce, and the computeReadiness handoff. SIGINT calls
- * the live-shell's `dispose()` THEN `handle.dispose()`. THREE indexed
- * sidecar files per frame (state JSON + frame text + per-frame unified
- * diff) plus a session meta file at
- * `/tmp/keeper-autopilot.<pid>.meta.txt`.
+ * Sidecar / SIGINT semantics: identical to the other view-shell siblings —
+ * three indexed sidecar files per frame (state JSON + frame text + per-
+ * frame unified diff), plus the session meta + lifecycle sidecar.
  *
  * Usage:
- *   keeper autopilot [--sock <path>] [--dry-run]
- *
- *   --sock <path>    Socket path override (else $KEEPER_SOCK, else the
- *                    ~/.local/state/keeper/keeperd.sock default).
- *   --dry-run        Log edges without spawning Ghostty or notifyctl.
- *   --help           Show this help.
- *
- * fn-646.5 cutover: moved from `scripts/autopilot.ts` to `cli/autopilot.ts`.
- * The `main(argv: string[])` signature lets the `cli/keeper.ts` dispatcher
- * pass through subcommand argv directly; the `import.meta.main` guard is
- * neutralized — the dispatcher is the canonical entry. The exported
- * dispatch/render helpers (`renderEpicCommands`, `predictNextDispatches`,
- * `tryLaunch`, `hydrateDispatchLog`, etc.) survive the move so
- * `test/autopilot.test.ts` continues to assert against them. The stateful
- * `onUnhandledKey` keymap (space → pause/resume gated on `!dryRun`, `v` →
- * toggle command display via `refreshLive`, `c` → copy debug snapshot)
- * keeps the live-shell's raw-string contract — `dispatchKey` in
- * `src/live-shell-core.ts` routes " ", "v", "c" straight through to the
- * caller, so the existing pause/toggle/copy behavior is preserved
- * verbatim. `setStatus` restores to `statusLine()` (carrying the
- * `[paused]` / `[playing]` / `[cmd]` chrome) — distinct from the other
- * three TUIs which restore to `""`.
- *
- * fn-660.1 deferral: `cli/autopilot.ts` does NOT use `createViewShell`
- * (the shared TUI shell harness adopted by board / jobs / git). Reason:
- * autopilot's `emitFrame` is intertwined with the planner / dispatch
- * loop — it's not a pure render of the subscribe snapshot. The shell
- * also carries autopilot-specific banner chrome (`statusLine()` with
- * `[paused]` / `[playing]` / `[cmd]`), three custom keys (space / v / c
- * with non-trivial side effects), pause-resume semantics that gate the
- * dispatch loop, and a `setStatus` restore target that's NOT `""`.
- * Folding any of that into the shared shell would require widening
- * `createViewShell` to a leaky superset API for a single caller.
- * Revisit when (or if) autopilot grows a sibling with the same loop
- * shape.
+ *   keeper autopilot [--sock <path>]            # viewer
+ *   keeper autopilot pause [--sock <path>]      # control
+ *   keeper autopilot play  [--sock <path>]      # control
+ *   keeper autopilot retry <verb::id> [--sock <path>]  # control
+ *   keeper autopilot --help
  */
 
-import {
-  appendFileSync,
-  existsSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename } from "node:path";
 import { parseArgs } from "node:util";
-import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
-import { resolveConfig, resolveSockPath } from "../src/db";
-import { type ExecBackend, resolveExecBackend } from "../src/exec-backend";
-import { createLiveShell } from "../src/live-shell";
-import { computeReadiness, type Verdict } from "../src/readiness";
+import { resolveSockPath } from "../src/db";
+import {
+  type ClientFrame,
+  encodeFrame,
+  LineBuffer,
+  type ServerFrame,
+} from "../src/protocol";
+import { computeReadiness } from "../src/readiness";
 import {
   type ReadinessClientSnapshot,
+  subscribeCollection,
   subscribeReadiness,
 } from "../src/readiness-client";
-import { appendDiagnostic } from "../src/readiness-diagnostics";
 import type { Epic, Task } from "../src/types";
+import { createViewShell } from "../src/view-shell";
 
-const HELP = `keeper-autopilot — dispatch log viewer over the keeper subscribe server
+const HELP = `keeper autopilot — thin viewer + control surface for the server-side autopilot reconciler
 
-Usage: keeper autopilot [--sock <path>] [--dry-run] [--reset]
+Usage:
+  keeper autopilot [--sock <path>]
+  keeper autopilot pause [--sock <path>]
+  keeper autopilot play  [--sock <path>]
+  keeper autopilot retry <verb::id> [--sock <path>]
+  keeper autopilot --help
 
-  --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
-  --reset          Delete the dispatch log (~/.local/state/keeper/dispatch.log)
-                   before doing anything else, dropping the durable
-                   cross-run re-dispatch guard so every ready/pending row
-                   is eligible to fire fresh this run.
-  --dry-run        Log dispatches to the frame and disk but skip the
-                   actual Ghostty spawn (and the matching auto-close).
-                   The summary line carries a [dry] tag and is followed
-                   by the would-have-run shell command on two indented
-                   lines. Live mode launches each worker through
-                   $SHELL (validated absolute path, /bin/zsh fallback)
-                   with -l -i and chains an interactive shell after
-                   claude exits, so a dropped session leaves a
-                   keyboard-usable shell in the window.
-  --help           Show this help
+Subcommands:
+  (none)   Open the alt-screen viewer rendering the live current /
+           predicted / failed sections plus the paused indicator.
+  pause    Send set_autopilot_paused {paused:true} and exit.
+  play     Send set_autopilot_paused {paused:false} and exit.
+  retry    Send retry_dispatch {id:<verb::id>} and exit. <verb::id> is
+           the canonical composite key (e.g. work::fn-619-foo.3).
 
-Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
-  ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
-  space pause/resume dispatches,
-  v toggle per-row command display (for copy-paste / manual run),
-  c copy current frame + sidecar paths to clipboard, q/Ctrl-C quit.
-  Per-frame sidecars are indexed; lifecycle + warn output is appended to
-  /tmp/keeper-autopilot.<pid>.lifecycle.txt. Session paths print on
-  exit.
+Options:
+  --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)
+  --help         Show this help
 
-Always starts paused — the banner row carries a '[paused]' /
-'[playing]' indicator (live-only chrome; toggling it doesn't push a
-frame to history). Pressing space flips the state; on unpause any
-currently ready/pending rows fire immediately against the last
-snapshot, no wait for keeperd's next push. Pause has no effect in
---dry-run mode (dispatches are already side-effect-free there), so
-the indicator is suppressed and the space key is a silent no-op.
-
-Each frame lists every command dispatched so far, oldest first. Each
-line is prefixed with the basename of the cd target so the project is
-scannable at a glance (matches the (dir) shape used by board.ts). The
-summary form is '(<dir>) <verb>::<id>'; dry runs append the would-have
--run shell command on two indented lines:
-
-  (keeper) work::fn-619-pin-inputrequest-mid-subagent-state.1
-  (keeper) [dry] approve::fn-619-pin-inputrequest-mid-subagent-state.1
-    cd /Users/mike/code/keeper && \\
-      claude '/plan:approve fn-619-pin-inputrequest-mid-subagent-state.1'
-
-The frame has four named-header sections, each emitted only when
-non-empty, rendered in this order: '--- current ---',
-'--- queued ---', '--- predicted ---', '--- completed ---'.
-
-'--- current ---' survives a restart; '--- queued ---' and
-'--- completed ---' are scoped to this run. On startup
-hydrateDispatchLog folds the on-disk log back into the durable
-dispatchedKeys / fulfilledKeys / completedKeys sets AND restores any
-launch row where fulfilled && !completed && !dry (latest-per-key
-wins, sorted by ts ascending) into the in-memory display array, so
-prior-run still-running dispatches re-appear under '--- current ---'
-on the first frame. If a restored entry's matching embedded job has
-since disappeared from the projection (parent epic became
-done+approved or was planctl epic-deleted), the disappearance rule
-in detectJobTransitions migrates it to '--- completed ---' on the
-first post-startup snapshot.
-
-Within a run, dispatches partition three ways: rows observed
-completed render under '--- completed ---' — completed means the
-session went terminal (state in {ended, killed}), OR it is parked at
-'stopped' while the row's board readiness verdict is already
-[completed] (same semantics as board.ts: worker done + approved, or
-epic done + approved), OR (post-fulfillment) its job disappeared from
-the snapshot; rows observed registered but not yet completed render
-under '--- current ---'; rows still waiting on the agent to boot
-render under '--- queued ---'. In wet mode queued is transient (~1-3 frames
-before SessionStart folds); in dry mode it persists for the lifetime
-of the run, and dry launches are deliberately NOT restored across
-runs since they can never reach fulfillment. The JSONL log at
-~/.local/state/keeper/dispatch.log carries four kinds — 'launch'
-(every dispatch), 'window' (the freshly-spawned surface's stable
-PANE id and launch-time tab name, emitted right after the backend
-launch returns; the pane id replaces the old tab id under fn-654.2's
-surgical pane-close path, the tab name is the wrap-safety token for
-the cross-server-restart close guard), 'fulfilled' (first observation
-of the registered session), and 'completed' (first observation of
-completion on any of three axes: terminal session state,
-stopped-while-board-verdict-completed, or post-fulfillment
-disappearance) — and drives both the durable re-dispatch guard and
-the cross-run current-section restore. The 'completed' edge ALSO
-fires the surface auto-close (closeWindow on the persisted
-windowId+tabName pair routed through ExecBackend.close, which probes
-zellij's query-tab-names for an exact tabName match before firing
-close-pane -p windowId — so a server-restart-recycled pane id can
-never reap the wrong live pane) so the dispatched surface exits in
-lockstep with the work actually being done — including the
-stopped-and-approved case, which previously kept its window open
-until the human closed it by hand. A real mid-flight crash
-now preserves '--- current ---' (next run rehydrates it from disk);
-'--- queued ---' is still lost across the crash because a queued
-dispatch has no fulfilled line yet. A new frame is emitted after each
-dispatch AND whenever a row moves between sections.
-
-The '--- predicted ---' section previews the next dispatches autopilot
-will fire as a direct consequence of the embedded jobs currently in
-flight. All four buckets fall out of one simulation pass: every
-working embedded job has its post-completion effect mirrored onto the
-owning row (work→worker_phase=done, close→epic.status=done,
-approve→approval=approved; jobs[i].state=ended) and approval is NEVER
-auto-flipped for rows whose only in-flight job is a worker. Rows whose
-verdict flips to blocked:job-pending in the simulated re-run emit
-'approve::<id>'; rows whose verdict flips to blocked:git-uncommitted
-or blocked:git-orphans emit an informational 'git-dirty::<id>' row
-(same edge shape as approve but autopilot has no dispatch behind it —
-the human resolves it by cleaning the worktree, after which the row
-drops off and re-emerges as 'approve::<id>'); rows that flip to ready
-emit 'work::<task>' / 'close::<epic>'. Preview rows are single-line
-'(<dir>) <verb>::<id>'; the dir column is padded to the widest
-'(<dir>) ' so '<verb>::<id>' aligns across projects. No [dry] tag, no
-shell-command footer.
-
-The 'v' key toggles a per-row command display: every command-bearing
-row (dispatched current/queued/completed rows and dispatch-backed
-predicted work/close/approve rows) grows one indented line carrying
-the full 'cd … && claude --name … /plan:…' shell command for copy-
-paste when you want to run it manually. The informational 'git-dirty'
-preview row has no dispatch behind it and is never annotated. Toggling
-repaints the live body without growing frame history and lights a
-'[cmd]' marker in the banner.
-
-The helper waits for keeperd to come up and reconnects across restarts;
-each connection-lifecycle change is appended to the lifecycle sidecar.
-Ctrl-C calls dispose() and exits 0.
+The viewer is read-only — every dispatch, dedup, confirm, settle, and reap
+decision happens in keeperd's autopilot worker thread. Use pause / play
+to toggle the worker (boots PAUSED for safety) and retry to clear a
+sticky failure row.
 `;
 
-const seg = (v: unknown) => (v == null ? "" : String(v));
+const seg = (v: unknown): string => (v == null ? "" : String(v));
 
 /**
- * Filesystem root of the arthack monorepo, hosting the per-tier
- * `claude/work-plugins/<tier>/` directories autopilot points the
- * `work` verb at via `--plugin-dir`. fn-602 moves this selection
- * upstream from `arthack-claude.py` into autopilot, so the launcher
- * no longer needs to know about planctl, tiers, or plan-role prompts.
- *
- * Env-overridable via `ARTHACK_ROOT` (mostly for tests / a future
- * non-default workspace layout); the default `~/code/arthack` is the
- * correct path on the dispatch desktop autopilot runs on. `~` is
- * expanded eagerly at module load so downstream `--plugin-dir <root>/…`
- * strings carry an absolute path the launcher's cwd doesn't break.
+ * Hard upper bound on how long a control subcommand waits for the
+ * `rpc_result` / `error` frame after a successful connect. Matches the
+ * sibling shape in `scripts/approve.ts` — 5s is generous; a healthy
+ * daemon answers in sub-ms on local UDS.
  */
-export const ARTHACK_ROOT: string = ((): string => {
-  const raw = process.env.ARTHACK_ROOT;
-  const v = raw != null && raw !== "" ? raw : "~/code/arthack";
-  if (v === "~" || v.startsWith("~/")) {
-    return v === "~" ? homedir() : join(homedir(), v.slice(2));
-  }
-  return v;
-})();
+const RESPONSE_TIMEOUT_MS = 5000;
+
+// ---------------------------------------------------------------------------
+// Predicted-section preview — pure transform over the live readiness snapshot.
+// ---------------------------------------------------------------------------
 
 /**
- * Sanity-check a `$SHELL` candidate before threading it into the
- * AppleScript `command` field. Returns the path on success, `null` on
- * any rejection — callers then fall back to `/bin/zsh`.
- *
- * Three rules — minimal but load-bearing:
- *   1. Must be a non-empty string.
- *   2. Must be an absolute path (`/`-rooted) that `fs.existsSync` says
- *      exists. Drops malformed env values and stale paths to deleted
- *      shells. (No `X_OK` mode check — Bun's `existsSync` lacks the
- *      mode flag, and `osascript` will surface an unexec error if the
- *      file is non-executable; falling back on `existsSync` alone is
- *      the right minimum.)
- *   3. Must contain no `"` (AppleScript string-literal injection
- *      guard). The shell path is interpolated into the `set command of
- *      cfg to ...` literal via `JSON.stringify`, but a `"` in the path
- *      itself would still break out of the outer literal once the
- *      JSON-encoded string is re-encoded by AppleScript's parser. A
- *      shell binary with `"` in its name is pathological; reject
- *      defensively.
- *
- * Exported so test/autopilot.test.ts can exercise the validation
- * boundaries without spinning up a real `$SHELL`.
+ * One row in the predicted section's preview. `verb` is the dispatch verb
+ * (`work` / `close` / `approve`) or the informational `git-dirty` signal
+ * (no dispatch behind it — surfaces when the worker has uncommitted /
+ * orphan files that block the approve dispatch).
  */
-export function validateShell(candidate: string | undefined): string | null {
-  if (typeof candidate !== "string" || candidate === "") {
-    return null;
-  }
-  if (!candidate.startsWith("/")) {
-    return null;
-  }
-  if (candidate.includes('"')) {
-    return null;
-  }
-  if (!existsSync(candidate)) {
-    return null;
-  }
-  return candidate;
-}
-
-export interface DispatchEntry {
-  ts: string;
-  kind: "launch";
-  rowId: string;
-  // Basename of the cd target — empty string when none. Rendered as the
-  // leading `(<dir>) ` segment of the frame line.
-  dir: string;
-  // Full cd target path — used to reconstruct the indented `cd … && \`
-  // line in the dry-run multi-line frame form. Empty string when none.
-  dirFull: string;
-  verb: "work" | "close" | "approve";
-  id: string;
-  // The fused `cd … && claude …` shell string used by the actual `sh -c`
-  // spawn AND persisted to the JSONL dispatch log for forensic tailing
-  // across restarts. Frames render `verb`/`id`/`dirFull` instead; this
-  // field exists so a re-fold of dispatch.log doesn't lose what ran.
-  command: string;
-  dry?: boolean;
-  // Stamped at logDispatch time; lets future post-mortems correlate a
-  // dispatch.log row to a specific autopilot process without grepping
-  // sidecar mtimes. Frames don't render this field.
-  pid?: number;
-  // Stable surface id captured from the backend right after the
-  // launch spawn returns. With the zellij backend this is now the
-  // PANE id (`terminal_<n>`, not the tab id) — fn-654.2 moved auto-
-  // close from whole-tab `close-tab-by-id` to surgical pane-level
-  // `close-pane -p`, so a sibling tiled pane the human added to the
-  // same tab survives the auto-reap. Stamped on the LIVE in-memory
-  // entry by reference so the same-run auto-close in
-  // `detectJobTransitions` can fire `closeWindow(entry.windowId,
-  // entry.tabName)` when the dispatched row reaches `completedKeys`.
-  // Also persisted to disk via a `{"kind":"window", ts, verb, id,
-  // windowId, tabName}` row that `hydrateDispatchLog` folds back onto
-  // the restored entry across runs. `undefined` when the backend
-  // returned `null` (no terminal pane parsed from `list-panes` /
-  // zellij ENOENT / launch failed); `closeWindow` no-ops on that
-  // shape (the surface is still up — the human can close the pane
-  // manually).
-  windowId?: string;
-  // Launch-time tab name (`verb::id`) — the wrap-safety token for the
-  // surgical pane-close path (fn-654.2). The backend's `close` probes
-  // `query-tab-names` for an exact `tabName` match before firing
-  // `close-pane -p windowId`: a server-generation mismatch (the
-  // `zellij --server` restarted between launch and close, blowing
-  // away the tab and resetting the pane-id counter) leaves no live
-  // tab with this name → close is skipped, no risk of reaping a
-  // recycled pane id that now belongs to a different live pane.
-  // `undefined` on pre-fn-654.2 dispatch.log rows (the
-  // `kind:"window"` payload didn't carry `tabName` then); the backend
-  // also skips on the missing-token signal — fail-safe.
-  tabName?: string;
-}
-
-// --- command rendering (module-scope so test/autopilot.test.ts can import) ---
-
-/**
- * Single source of the `claude '/plan:<verb> <id>'` shell command for
- * every autopilot consumer: the live `launchInGhostty` dispatch sites
- * AND the display/dry-run renderers (`renderEpicCommands`,
- * `renderEpicCommandsFiltered`, the predicted-section `v` toggle).
- * Routing both through one helper is the whole point of fn-602.2 — a
- * dry-run vs live drift would be invisible until a real dispatch.
- *
- * Encodes the load-bearing linkage contract: every spawned `claude`
- * carries `--name <verb>::<id>` so the SessionStart hook freezes
- * `events.spawn_name`, the deriver yields `plan_ref={verb,id}`, and
- * the reducer's `syncJobIntoEpic` fan-out routes the session into the
- * embedded `task.jobs[]` array (or epic `jobs[]` for close/approve-close).
- *
- * The emitted name MUST match the deriver regex in `src/derivers.ts`
- * (`SPAWN_VERB_REF_RE`): `^(plan|work|close|approve)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$`.
- * Per the epic spec: `work` uses the task id (`fn-N-slug.M`), `close` and
- * `approve` use the appropriate id form chosen by the caller (task id for
- * a task-level approve, epic id for close + approve-close).
- *
- * Flag mapping (fn-602.2 — moves model/effort/work-tier-plugin selection
- * upstream from `arthack-claude.py` into autopilot):
- *   - work, close → `--model sonnet --effort max`
- *   - approve     → `--model sonnet --effort low`
- *   - work        → additionally `--plugin-dir <ARTHACK_ROOT>/claude/work-plugins/<tier>`,
- *                   SKIPPED when `tier == null` (degrade to launcher default)
- *
- * The optional `tier` is consumed only by `work`; passing it for
- * close/approve is a no-op so call sites at the epic level don't need
- * a branch.
- */
-export function buildWorkerCommand(
-  verb: "work" | "close" | "approve",
-  id: string,
-  projectDir: string,
-  tier?: string | null,
-): string {
-  const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
-  const flags: string[] = [];
-  if (verb === "approve") {
-    flags.push("--model", "sonnet", "--effort", "low");
-  } else {
-    // work, close
-    flags.push("--model", "sonnet", "--effort", "max");
-  }
-  flags.push("--name", `${verb}::${id}`);
-  if (verb === "work" && tier != null && tier !== "") {
-    flags.push("--plugin-dir", `${ARTHACK_ROOT}/claude/work-plugins/${tier}`);
-  }
-  return `${cdPrefix}claude ${flags.join(" ")} '/plan:${verb} ${id}'`;
-}
-
-/**
- * Render the command block for a single epic: two lines per task (work +
- * approve), then two lines for the virtual close row (close + approve).
- *
- * `task.target_repo` is the cd path for worker commands (the task may
- * live in a different repo than its epic). Falls back to `epic.project_dir`
- * when `target_repo` is null or empty — same fallback used by the plan
- * worker when seeding tasks.
- *
- * Block 1 calls this directly. Block 2 calls
- * `renderEpicCommandsFiltered` below with a verdict predicate.
- */
-export function renderEpicCommands(epic: Epic): string {
-  const projectDir = seg(epic.project_dir);
-  const epicId = seg(epic.epic_id);
-  const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
-  const lines: string[] = [];
-
-  for (const task of tasks) {
-    const taskId = seg(task.task_id);
-    const dir =
-      task.target_repo != null && seg(task.target_repo) !== ""
-        ? seg(task.target_repo)
-        : projectDir;
-    lines.push(
-      buildWorkerCommand("work", taskId, dir, task.tier),
-      `bun ~/code/keeper/scripts/approve.ts ${taskId}`,
-    );
-  }
-
-  // Virtual close row — always appended, mirrors board.ts.
-  lines.push(
-    buildWorkerCommand("close", epicId, projectDir),
-    `bun ~/code/keeper/scripts/approve.ts ${epicId}`,
-  );
-
-  return lines.join(" &&\n");
-}
-
-/**
- * Render a filtered command block for a single epic: emits ONLY the
- * task pairs and the close pair for which `isReady(kind, id)` returns
- * true. Returns `null` when no row passes — caller drops the epic from
- * block 2 entirely.
- *
- * Sibling of `renderEpicCommands` rather than a retrofitted filter
- * parameter: keeps the unfiltered renderer pure and trivial, and the
- * filtered renderer self-contained for the (currently single) block-2
- * call site.
- */
-export function renderEpicCommandsFiltered(
-  epic: Epic,
-  isReady: (kind: "task" | "close", id: string) => boolean,
-): string | null {
-  const projectDir = seg(epic.project_dir);
-  const epicId = seg(epic.epic_id);
-  const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
-  const lines: string[] = [];
-
-  for (const task of tasks) {
-    const taskId = seg(task.task_id);
-    if (!isReady("task", taskId)) {
-      continue;
-    }
-    const dir =
-      task.target_repo != null && seg(task.target_repo) !== ""
-        ? seg(task.target_repo)
-        : projectDir;
-    lines.push(
-      buildWorkerCommand("work", taskId, dir, task.tier),
-      `bun ~/code/keeper/scripts/approve.ts ${taskId}`,
-    );
-  }
-
-  if (isReady("close", epicId)) {
-    lines.push(
-      buildWorkerCommand("close", epicId, projectDir),
-      `bun ~/code/keeper/scripts/approve.ts ${epicId}`,
-    );
-  }
-
-  if (lines.length === 0) {
-    return null;
-  }
-  return lines.join(" &&\n");
-}
-
-// --- next-dispatch prediction (module-scope so tests can import) ---------
-//
-// Section 2 of the autopilot frame previews the next dispatches that will
-// fire as a direct consequence of the embedded jobs currently in flight.
-// All four buckets (approvals, informational, workers, closers) fall out
-// of ONE `computeReadiness` pass over a verb-aware simulated tree. The
-// `informational` bucket is the carve-out for rows whose future verdict
-// is `blocked:git-uncommitted` / `blocked:git-orphans` — same edge shape
-// as approve (worker_phase flipped to done) but no `/plan:<verb>`
-// command resolves it, so autopilot renders it as `git-dirty::<id>`
-// purely as a signal to the human and never dispatches against it.
-//
-// Simulation rules (per embedded `EmbeddedJob` whose `state === "working"`):
-//   - `plan_verb === "work"`    → owning task's `worker_phase = "done"`
-//   - `plan_verb === "close"`   → owning epic's `status        = "done"`
-//   - `plan_verb === "approve"` → owning row's `approval       = "approved"`
-//   In every case the job's own `state` is stamped `"ended"` AND its
-//   `git_dirty_count` / `git_unattributed_to_live_count` / `git_orphan_count`
-//   are zeroed (schema v31 split the legacy `git_orphan_count` into the
-//   renamed-and-preserved `git_unattributed_to_live_count` and the new
-//   strict-mystery `git_orphan_count`; the sim zeroes BOTH so a future
-//   predicate-6.5 source flip is covered symmetrically) — the sim models a
-//   worker that finishes AND commits before going idle, so predicate 6.5
-//   (git-uncommitted / git-orphans) does not fire in `futureReadiness`
-//   and mask the post-completion approve prediction. If the worker
-//   actually stops WITHOUT committing, the informational pre-pass off
-//   CURRENT readiness catches it as `git-dirty::<id>` once `worker_phase`
-//   flips to `"done"` for real; the prediction's job is "next dispatch on
-//   the normal path".
-//
-// Additionally: a row whose CURRENT verdict is `ready` has its own next
-// dispatch advanced too (a ready task/close-row is about to fire its
-// worker/closer in this frame's section-1 block; previewing the NEXT step
-// means modeling that dispatch's completion). For a ready task,
-// `worker_phase = "done"`; for a ready close-row, `epic.status = "done"`.
-//
-// Approval is NEVER auto-flipped for rows whose only in-flight job is a
-// worker — approval is a human action, not an in-flight one. This is the
-// key fix vs. the prior "force every active row to done+approved" sim,
-// which over-eagerly flipped a close-row to `completed` whenever a TASK's
-// worker was running and then re-derived approvals from a bespoke
-// "active + not approved" rule that emitted spurious `approve::<epic>`
-// lines (the close-row's "active" status had fanned up from the task
-// worker, not from an in-flight closer).
-//
-// Bucketing — for each row, compare `snap.readiness` against
-// `futureReadiness`:
-//   - `cur=blocked → fut=blocked:job-pending` → push `approve::<id>`.
-//   - `cur=blocked → fut=ready`               → push `work::<task>` /
-//                                                `close::<epic>`.
-// Other transitions (incl. `cur=blocked → fut=completed`, which happens
-// for rows whose own worker AND approver are both in flight) emit
-// nothing — those rows are already past the next-dispatch edge.
-//
-// The `informational` bucket is sourced separately, off CURRENT readiness
-// (NOT the simulated future): a row pushes `git-dirty::<id>` only when
-// `cur.tag === "blocked"` and `cur.reason.kind` is `"git-uncommitted"` or
-// `"git-orphans"`. Real readiness predicate 6.5 only fires once the
-// worker has actually stopped (predicates 5 / 6 must clear first), so
-// this gate keeps the informational row from surfacing while a worker
-// is still actively editing — the dirtiness might resolve when the
-// worker commits before going idle, and previewing it too early would
-// be misleading.
-//
-// Subagent invocations are dropped from the simulation: every running sub
-// belongs to an in-flight job whose `state` we just stamped `"ended"`,
-// so passing `[]` is equivalent to ending every sub.
-//
-// `computeReadiness` is pure, so we just hand it the simulated `Epic[]`
-// and diff its output. The post-pass mutexes (single-task-per-epic /
-// per-root) self-correct in the re-run: if two dependents would both be
-// eligible, the first-in-traversal-order wins the slot and the others
-// stay blocked under the simulated mutex.
-//
-// Pause-invariance: `predictNextDispatches` is a PURE function of `snap`
-// — no read of `paused`, `lastVerdictSig`, `dispatchedKeys`, or any other
-// module-level state. The pause gate lives on the side-effecting
-// `processLaunchTransitions` path; the preview keeps rendering
-// identically whether autopilot is `[paused]` or `[playing]`.
-
 export interface PreviewRow {
-  // `git-dirty` is informational — section 2 renders it as
-  // `git-dirty::<id>` to signal "the worker has uncommitted/orphan
-  // files that block the approve dispatch", but autopilot itself
-  // never dispatches on this verb. Collapses readiness's
-  // `git-uncommitted` + `git-orphans` reasons into one preview signal.
   verb: "work" | "close" | "approve" | "git-dirty";
   id: string;
-  // Basename of the cd target — empty string when none. Rendered as the
-  // leading `(<dir>) ` segment of the preview line.
+  /** Basename of the cd target — empty string when none. */
   dir: string;
-  // Full cd target path — retained on the descriptor so future renderers
-  // (e.g. a multi-line preview shape) can reconstruct the shell command.
-  // Today's renderer only consumes `dir` for the `(<dir>)` prefix.
+  /** Full cd target path — empty string when none. */
   dirFull: string;
-  // Owning task's `tier` — present only for `work` rows sourced from a
-  // task, threaded into `buildWorkerCommand` by the `v` toggle so the
-  // copy-paste command carries `--plugin-dir <work-plugins/<tier>>`.
-  // `null` on close/approve/git-dirty rows (no work-tier selection),
-  // and `null` on work rows whose task spec carries no tier (legacy
-  // pre-fn-602.1 / fn-N.1 tasks; degrades to launcher default).
+  /** Task tier (work rows only); `null` for close/approve/git-dirty. */
   tier: string | null;
 }
 
 export interface PreviewSections {
   approvals: PreviewRow[];
-  // Informational rows whose future verdict is `git-uncommitted` or
-  // `git-orphans` — the worker has filesystem state to clean up before
-  // its approve dispatch can fire. Rendered between approvals and
-  // workers; never produces a dispatch. Falls off the frame as soon
-  // as the worker commits / clears orphans (predicate 6.5 stops firing
-  // and the row migrates to `approvals` on the next emit).
   informational: PreviewRow[];
   workers: PreviewRow[];
   closers: PreviewRow[];
@@ -729,483 +150,6 @@ function taskCdDir(task: Task, projectDir: string): string {
     return seg(task.target_repo);
   }
   return projectDir;
-}
-
-/**
- * Suppression-reason union for `shouldSuppressDispatch` (fn-638.3). A
- * `null` return means "fire the dispatch"; any other value names the
- * specific suppression rule that fired. Exported so tests can pin the
- * exact reason per case.
- */
-export type SuppressionReason =
-  // Once-for-life launch suppression on `work`/`close`. Set on every
-  // launch and persists across restarts via `dispatch.log` →
-  // `hydrateDispatchLog`. Double-spawning a worker/closer risks git
-  // corruption, so this is intentionally irreversible.
-  | "launch-suppressed"
-  // Approve-only fulfillment suppression. An approve verb's only side
-  // effect happens when the human runs `/plan:approve` (the resulting
-  // SessionStart fold lands an embedded job for the row and fulfills
-  // the key). A dismissed approve window (launched, never fulfilled)
-  // must re-dispatch on the next `job-pending` edge to self-heal.
-  | "fulfilled-suppressed"
-  // Pre-spawn live-session-in-root gate. Suppress when a sibling row in
-  // the same effective root already has a `running`-tag verdict OR
-  // when a launched-but-unfulfilled dispatch on the same root is still
-  // in the propagation gap. Fail-closed on a partial snapshot.
-  | "live-in-root"
-  // Startup-stagger gate (fn-644). One-at-a-time gate over freshly-
-  // dispatched (launched but not yet observed `running`-tag) sessions.
-  // While the single settling slot is held, additional ready/job-pending
-  // edges are stashed in `pendingLaunches` and drained one at a time as
-  // the slot frees on the next snapshot's settle pass. Side effect of
-  // closing the duplicate-dispatch race at the fulfillment boundary.
-  // NOT a knob, NOT a concurrency cap — steady-state parallelism of
-  // already-running workers is unaffected.
-  | "settling-gate";
-
-/**
- * Fail-open timeout for the startup-stagger gate (fn-644). If a key
- * settles into the gate but never reaches a `running`-tag verdict
- * within this many seconds, the settle pass drops it so the ramp
- * cannot wedge on a dead startup (osascript spawn failed, Ghostty
- * crashed before SessionStart, etc.). NOT a tuning knob; tied to the
- * shape of the gate, not a config dial.
- */
-export const SETTLE_TIMEOUT_SEC = 180;
-
-/**
- * Decide whether `launchInGhostty` must suppress this dispatch and, if
- * so, name the rule that fired. Pure function over the four pieces of
- * state the call site holds — exported so the test suite can drive it
- * with hand-rolled snapshots and dispatch logs.
- *
- * Three suppression rules, in priority order (matching the `launchInGhostty`
- * branching):
- *
- *   1. `verb === "approve"` AND `fulfilledKeys.has(key)` →
- *      `"fulfilled-suppressed"`. Approve is fulfillment-keyed (not
- *      launch-keyed) so a dismissed approve window re-dispatches on
- *      the next `job-pending` edge.
- *   2. `verb in ("work","close")` AND `dispatchedKeys.has(key)` →
- *      `"launch-suppressed"`. Once-for-life launch suppression.
- *   3. `isLiveSessionInRoot(...)` → `"live-in-root"`. The target root
- *      already has a live session (running-tag verdict OR
- *      launched-but-unfulfilled dispatch); self is excluded.
- *
- * Returns `null` to fire the dispatch.
- */
-export function shouldSuppressDispatch(
-  verb: "work" | "close" | "approve",
-  id: string,
-  dir: string,
-  snap: ReadinessClientSnapshot | null,
-  dispatchedKeys: Set<string>,
-  fulfilledKeys: Set<string>,
-  dispatchLog: DispatchEntry[],
-): SuppressionReason | null {
-  const key = `${verb}::${id}`;
-  if (verb === "approve") {
-    if (fulfilledKeys.has(key)) {
-      return "fulfilled-suppressed";
-    }
-  } else if (dispatchedKeys.has(key)) {
-    return "launch-suppressed";
-  }
-  if (isLiveSessionInRoot(snap, dir, verb, id, dispatchLog, fulfilledKeys)) {
-    return "live-in-root";
-  }
-  return null;
-}
-
-/**
- * Pre-spawn live-session-in-root gate (fn-638.3).
- *
- * Returns `true` when the target `dir` already hosts a live session that
- * autopilot is NOT about to dispatch itself, so the caller must suppress.
- * "Live" means EITHER:
- *
- *   - the snapshot carries a `running`-tag verdict on a row whose effective
- *     root (task `target_repo` || epic `project_dir`) equals `dir`. The
- *     `running` tag (`{job-running, sub-agent-running, planner-running}`)
- *     is the readiness signal for "a real worker is in motion on this
- *     row"; a second dispatch to the same root would land two live
- *     workers on one target and risk git corruption — the
- *     false-negative-safe failure mode the epic's "best practices"
- *     section calls out.
- *   - the in-memory `dispatchLog` carries a launch line for the same root
- *     whose key is NOT yet in `fulfilledKeys` (autopilot fired the
- *     window but the SessionStart fold has not yet round-tripped into
- *     an embedded job). Skipping this branch would let a second dispatch
- *     race the first inside the dispatch→projection propagation gap.
- *
- * Self is excluded by `(excludeVerb, excludeId)` so a row never blocks
- * its own dispatch. A row that disappeared from the snapshot post-
- * fulfillment (terminal job, epic-delete) does NOT contribute — only
- * `running`-tag verdicts on rows still on the page count.
- *
- * Fail-closed on a partial/empty snapshot: when `snap === null` OR
- * `snap.epics.length === 0`, return `true` (suppress) — duplicate
- * workers on one task corrupt git history; suppressing a dispatch is
- * recoverable on the next snapshot edge.
- *
- * Exported separately so the test suite can drive it with hand-rolled
- * snapshots and dispatch logs.
- */
-export function isLiveSessionInRoot(
-  snap: ReadinessClientSnapshot | null,
-  dir: string,
-  excludeVerb: "work" | "close" | "approve",
-  excludeId: string,
-  dispatchLog: DispatchEntry[],
-  fulfilledKeys: Set<string>,
-): boolean {
-  // Fail-closed on a partial/empty snapshot — see jsdoc above.
-  if (snap === null || snap.epics.length === 0) {
-    return true;
-  }
-  // `dir === ""` is the no-cd case; a target with no root cannot collide
-  // with another root, but we still scan the dispatch log + snapshot so
-  // the helper is symmetric. An empty-root collision is degenerate (only
-  // happens if the caller passes through an empty `project_dir`); treat
-  // it as "no collision possible" by short-circuiting empty `dir`.
-  if (dir === "") {
-    return false;
-  }
-  const excludeKey = `${excludeVerb}::${excludeId}`;
-  // Branch 1: snapshot-driven check. Walk every epic + task in the
-  // snapshot. For each row whose effective root === `dir`, look up its
-  // verdict; a `running` tag means live work. Self is excluded by id.
-  //
-  // The close-row verdict deliberately is NOT consulted here: the close
-  // row's `running` tag fans up from a task worker's verdict via
-  // predicate 5 in `evaluateCloseRow`, so a close row at
-  // `epic.project_dir` will report `running` even when the actual worker
-  // is editing a task's `target_repo` (a different root entirely). To
-  // detect "a real session is about to write to `dir`", check ONLY
-  // task-level verdicts whose effective root === `dir`, plus the epic's
-  // OWN embedded jobs (close-verb / plan-verb) when
-  // `epic.project_dir === dir`. That keeps the gate scoped to "actual
-  // worker overlap in this root" instead of being tripped by sibling-
-  // root activity that rolls up.
-  for (const epic of snap.epics) {
-    const projectDir = seg(epic.project_dir);
-    const epicId = seg(epic.epic_id);
-    const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
-    for (const task of tasks) {
-      const taskId = seg(task.task_id);
-      if (taskId === "") {
-        continue;
-      }
-      const taskRoot = taskCdDir(task as Task, projectDir);
-      if (taskRoot !== dir) {
-        continue;
-      }
-      // Skip self. A task-scope row dispatches as
-      // `(work|approve, task_id)`; the close-row dispatches as
-      // `(close|approve, epic_id)`. Either id form may be the self
-      // exclusion.
-      if (taskId === excludeId) {
-        continue;
-      }
-      const verdict = snap.readiness.perTask.get(taskId);
-      if (verdict !== undefined && verdict.tag === "running") {
-        return true;
-      }
-    }
-    // Epic-level: check the epic's OWN jobs (close-verb / plan-verb /
-    // approve-close) when `epic.project_dir === dir`. The epic's close-
-    // row verdict is intentionally NOT consulted (it fans up from task
-    // workers — see the block-doc above). A close-verb or plan-verb job
-    // in `state === "working"` IS a session about to write to
-    // `epic.project_dir`, so it counts.
-    if (projectDir === dir && epicId !== "" && epicId !== excludeId) {
-      const epicJobs = Array.isArray(epic.jobs) ? epic.jobs : [];
-      for (const job of epicJobs) {
-        if (job.state === "working") {
-          return true;
-        }
-      }
-    }
-  }
-  // Branch 2: launched-but-unfulfilled check. A dispatch that has fired
-  // (a `kind:"launch"` line in `dispatchLog`) but whose matching
-  // embedded job has not yet appeared in the snapshot (the key is NOT
-  // in `fulfilledKeys`) is a live session in the propagation gap.
-  // Self is excluded by `(verb, id)`.
-  for (const entry of dispatchLog) {
-    if (entry.dirFull !== dir) {
-      continue;
-    }
-    const key = `${entry.verb}::${entry.id}`;
-    if (key === excludeKey) {
-      continue;
-    }
-    if (!fulfilledKeys.has(key)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Deferred-dispatch record stashed in `pendingLaunches` when the
- * startup-stagger gate is full (fn-644). Carries everything
- * `launchInGhostty` needs to fire later, plus the `tier` channel for
- * work dispatches (null for approve/close). One entry per `${verb}::${id}`
- * key — repeat edges while a launch is pending are dedupe-collapsed
- * onto the existing entry.
- */
-export interface PendingLaunch {
-  verb: "work" | "close" | "approve";
-  id: string;
-  dir: string;
-  dirFull: string;
-  command: string;
-  rowId: string;
-  tier: string | null;
-}
-
-/**
- * Startup-stagger gate (fn-644). Returns `true` when a launch for
- * `key = ${verb}::${id}` must be deferred because the single settling
- * slot is already held by a DIFFERENT key. A key that is itself the
- * settling occupant returns `false` (its own re-edge is not deferred —
- * `lastVerdictSig` is the authority on re-edge suppression).
- *
- * Hardcoded one-at-a-time: `settling.size >= 1 && !settling.has(key)`.
- * No knob, no env override, no MAX constant — concurrency may be added
- * later but never at startup/settling time.
- *
- * Exported so tests can drive the gate in isolation.
- */
-export function isSettlingGateFull(
-  settling: Map<string, number>,
-  key: string,
-): boolean {
-  return settling.size >= 1 && !settling.has(key);
-}
-
-/**
- * Settle pass (fn-644). For each settling key, look up its row verdict
- * via `perTask` (task ids contain ".") or `perCloseRow` (close/epic ids
- * don't). When the verdict tag is `running` OR the key has reached
- * `completedKeys` (a fulfilled-then-disappeared row jumped the running
- * stage), drop the key from `settling` — the slot is free.
- *
- * Pure observation: mutates `settling` only; no I/O. The `noteLine`
- * callback receives a one-liner per released key so the lifecycle
- * sidecar carries the slot-free transitions.
- */
-export function releaseSettledKeys(
-  settling: Map<string, number>,
-  snap: ReadinessClientSnapshot,
-  completedKeys: Set<string>,
-  noteLine: (s: string) => void,
-  pid: number,
-): void {
-  for (const key of [...settling.keys()]) {
-    // Key shape is `${verb}::${id}`. Split once on the first `::`.
-    const sep = key.indexOf("::");
-    if (sep < 0) {
-      // Malformed key — drop it so the gate cannot wedge on a bad shape.
-      settling.delete(key);
-      continue;
-    }
-    const id = key.slice(sep + 2);
-    if (completedKeys.has(key)) {
-      settling.delete(key);
-      noteLine(
-        `${new Date().toISOString()} settling release pid=${pid} ${key} reason=completed`,
-      );
-      continue;
-    }
-    const verdict = id.includes(".")
-      ? snap.readiness.perTask.get(id)
-      : snap.readiness.perCloseRow.get(id);
-    if (verdict !== undefined && verdict.tag === "running") {
-      settling.delete(key);
-      noteLine(
-        `${new Date().toISOString()} settling release pid=${pid} ${key} reason=running`,
-      );
-    }
-  }
-}
-
-/**
- * Gate a single dispatch through the startup-stagger gate (fn-644).
- *
- * When `dryRun` is true the gate is inert: the launch callback fires
- * directly, mirroring the `paused` carve-out. When the gate is full
- * (`isSettlingGateFull` returns true) the launch is stashed in
- * `pendingLaunches` keyed by `${verb}::${id}` — a repeat edge for the
- * same key while pending replaces the prior entry (the latest snapshot's
- * command/dir/tier wins; key dedupes). Otherwise the launch fires
- * synchronously; `launchInGhostty` itself stamps `settling.set` on the
- * real-launch path so a same-tick re-entry would already see the slot
- * occupied.
- *
- * `lastVerdictSig.set` happens at the call site BEFORE `tryLaunch` — the
- * verdict edge is honest whether the launch fires or is deferred. The
- * pending queue is the only re-drive path; we do not replay verdict
- * edges.
- *
- * Exported so tests can drive the gate in isolation against a recording
- * launch callback.
- */
-export function tryLaunch(
-  pending: PendingLaunch,
-  settling: Map<string, number>,
-  pendingLaunches: Map<string, PendingLaunch>,
-  dryRun: boolean,
-  launch: (p: PendingLaunch) => void,
-  noteLine: (s: string) => void,
-  pid: number,
-): void {
-  const key = `${pending.verb}::${pending.id}`;
-  if (dryRun) {
-    launch(pending);
-    return;
-  }
-  if (isSettlingGateFull(settling, key)) {
-    pendingLaunches.set(key, pending);
-    noteLine(
-      `${new Date().toISOString()} re-dispatch suppressed (settling-gate) pid=${pid} ${key} dir=${pending.dirFull} (rowId=${pending.rowId})`,
-    );
-    return;
-  }
-  launch(pending);
-}
-
-/**
- * Drain the deferred-launch queue against the current snapshot (fn-644).
- * While the gate has room (`settling.size < 1`) and `pendingLaunches`
- * is non-empty, pop the OLDEST entry (insertion order; `Map` preserves
- * it) and RE-VALIDATE against `snap`:
- *
- *   - The row's verdict must still be `ready` (work/close) or
- *     `blocked:job-pending` (approve), matching the original
- *     `processLaunchTransitions` trigger conditions. If it has moved on
- *     (already running, completed, or now blocked for some other
- *     reason), discard the pending entry — re-edge will reopen it later
- *     if appropriate.
- *   - `shouldSuppressDispatch` must still return null. This is the
- *     duplicate-race fix: a per-root mutex (`live-in-root`) that was
- *     OPEN when the original ready edge fired may have CLOSED while the
- *     entry was queued; re-validating drops the held duplicate cleanly.
- *
- * Returns the count of pending entries that fired so the caller can
- * decide whether to repaint.
- *
- * Exported so tests can drive the drain deterministically.
- */
-export function drainPendingLaunches(
-  snap: ReadinessClientSnapshot,
-  settling: Map<string, number>,
-  pendingLaunches: Map<string, PendingLaunch>,
-  dispatchedKeys: Set<string>,
-  fulfilledKeys: Set<string>,
-  dispatchLog: DispatchEntry[],
-  launch: (p: PendingLaunch) => void,
-  noteLine: (s: string) => void,
-  pid: number,
-): number {
-  let fired = 0;
-  // While the slot is free AND we have something queued, pop the oldest
-  // entry, re-validate, and either launch or discard. The launch path
-  // sets `settling` (via the wired `launch` callback's call to
-  // `launchInGhostty`), so the next iteration's `isSettlingGateFull`
-  // returns true and we stop after one fire per drain pass — matching
-  // the one-at-a-time invariant. The loop is upper-bounded by the queue
-  // size so a never-mutating launch callback (test injection) cannot
-  // infinite-loop.
-  const max = pendingLaunches.size;
-  for (let i = 0; i < max; i += 1) {
-    if (settling.size >= 1) {
-      return fired;
-    }
-    const firstKey = pendingLaunches.keys().next().value;
-    if (firstKey === undefined) {
-      return fired;
-    }
-    const entry = pendingLaunches.get(firstKey);
-    if (entry === undefined) {
-      pendingLaunches.delete(firstKey);
-      continue;
-    }
-    pendingLaunches.delete(firstKey);
-    // Re-validate the verdict against the current snapshot. The
-    // pending entry was queued at a ready/job-pending edge; if it
-    // has since moved on, drop it.
-    const verdict = entry.id.includes(".")
-      ? snap.readiness.perTask.get(entry.id)
-      : snap.readiness.perCloseRow.get(entry.id);
-    const expected: "ready" | "blocked:job-pending" =
-      entry.verb === "approve" ? "blocked:job-pending" : "ready";
-    const verdictSig =
-      verdict === undefined
-        ? "unknown"
-        : verdict.tag === "ready"
-          ? "ready"
-          : verdict.tag === "completed"
-            ? "completed"
-            : verdict.tag === "running"
-              ? `running:${verdict.reason.kind}`
-              : `blocked:${verdict.reason.kind}`;
-    if (verdictSig !== expected) {
-      noteLine(
-        `${new Date().toISOString()} pending discarded pid=${pid} ${entry.verb}::${entry.id} reason=verdict-${verdictSig}`,
-      );
-      continue;
-    }
-    // Re-validate the suppression gate. The per-root mutex may have
-    // closed since the original edge fired (a sibling launched first
-    // through a parallel path); drop the held duplicate.
-    const suppression = shouldSuppressDispatch(
-      entry.verb,
-      entry.id,
-      entry.dirFull,
-      snap,
-      dispatchedKeys,
-      fulfilledKeys,
-      dispatchLog,
-    );
-    if (suppression !== null) {
-      noteLine(
-        `${new Date().toISOString()} pending discarded pid=${pid} ${entry.verb}::${entry.id} reason=${suppression}`,
-      );
-      continue;
-    }
-    launch(entry);
-    fired += 1;
-  }
-  return fired;
-}
-
-/**
- * Timeout sweep (fn-644). Fail-open against a wedged ramp: any settling
- * key older than {@link SETTLE_TIMEOUT_SEC} is dropped so a launch that
- * never reaches `running` (osascript spawn failed, Ghostty crashed
- * before SessionStart, etc.) cannot freeze the gate forever. The
- * `noteLine` callback receives one line per swept key.
- *
- * `nowMs` is injected so tests can drive the sweep deterministically.
- */
-export function sweepSettleTimeouts(
-  settling: Map<string, number>,
-  nowMs: number,
-  noteLine: (s: string) => void,
-  pid: number,
-): void {
-  const cutoffMs = nowMs - SETTLE_TIMEOUT_SEC * 1000;
-  for (const [key, ts] of [...settling.entries()]) {
-    if (ts < cutoffMs) {
-      settling.delete(key);
-      noteLine(
-        `${new Date().toISOString()} settling timeout pid=${pid} ${key} age_sec=${Math.floor((nowMs - ts) / 1000)}`,
-      );
-    }
-  }
 }
 
 function previewRowFromTask(
@@ -1219,8 +163,6 @@ function previewRowFromTask(
     id: seg(task.task_id),
     dir: dirFull === "" ? "" : basename(dirFull),
     dirFull,
-    // Only `work` consumes `tier` in `buildWorkerCommand`; approve /
-    // git-dirty rows zero it so the field shape stays uniform.
     tier: verb === "work" ? task.tier : null,
   };
 }
@@ -1235,25 +177,38 @@ function previewRowFromEpic(
     id: seg(epic.epic_id),
     dir: projectDir === "" ? "" : basename(projectDir),
     dirFull: projectDir,
-    // Epic-scoped rows (close / approve-close / git-dirty fan-up) have
-    // no tier; the work-tier-plugin selection only applies to work.
     tier: null,
   };
 }
 
+/**
+ * Predict the next dispatches the reconciler will fire as in-flight jobs
+ * finish. Pure transform of the snapshot:
+ *
+ *   - `--- predicted ---` sources four buckets from ONE `computeReadiness`
+ *     pass over a verb-aware simulated tree. Each `working` embedded job
+ *     has its post-completion effect mirrored onto the owning row keyed
+ *     off `plan_verb` (work → worker_phase=done; close → status=done;
+ *     approve → approval=approved). A row currently at `ready` is treated
+ *     as if its section-1 dispatch already completed (one step ahead).
+ *
+ *   - The `git-dirty::<id>` informational bucket is sourced OFF current
+ *     readiness, NOT the simulated future — predicate 6.5 only fires once
+ *     the worker has stopped, so a `git-dirty` row only surfaces when the
+ *     worker is genuinely done and the worktree's dirtiness is the next
+ *     blocker.
+ *
+ * Approval is NEVER auto-flipped for rows whose only in-flight job is a
+ * worker — that prevents spurious `approve::<epic>` rows that the legacy
+ * "active + not approved" rule emitted via close-row fan-up.
+ *
+ * Pause-invariance: the function reads ONLY the snapshot; no module-level
+ * state, no I/O, no clock.
+ */
 export function predictNextDispatches(
   snap: ReadinessClientSnapshot,
 ): PreviewSections {
-  // Informational pre-pass. Source `git-dirty::<id>` rows from CURRENT
-  // readiness, NOT from the simulated future. Predicate 6.5 in real
-  // readiness (`git-uncommitted` / `git-orphans`) only fires once the
-  // worker has actually stopped — predicates 5 and 6 must clear first,
-  // which requires every embedded job to leave `working` AND every
-  // sub-agent to finish. So sourcing off `cur` is the gate the human
-  // wants: a row only renders `git-dirty::<id>` once the worker is done
-  // and the worktree's dirtiness is genuinely the next blocker; an
-  // actively-editing worker's transient dirty state never surfaces
-  // here. The fut-driven sim below intentionally omits this bucket.
+  // Informational pre-pass — see jsdoc above for why this reads `cur`.
   const informational: PreviewRow[] = [];
   for (const epic of snap.epics) {
     const projectDir = seg(epic.project_dir);
@@ -1289,14 +244,7 @@ export function predictNextDispatches(
   // Build a verb-aware simulated tree. For each embedded job whose
   // `state === "working"`, mirror its post-completion effect onto the
   // owning row keyed off `plan_verb`. For each row whose CURRENT verdict
-  // is `ready`, advance its own dispatch-completion flag too (a ready
-  // row is about to fire its own worker/closer in section 1; this
-  // preview models the step AFTER that). Approval is NEVER auto-flipped
-  // for rows whose only in-flight job is a worker — that's the
-  // semantics that makes downstream approve::<row> emit correctly while
-  // refusing to predict an approve beat for a row whose own scope has
-  // no running job (e.g. a close-row whose blocked:job-running verdict
-  // fans up from a task worker, not from a closer).
+  // is `ready`, advance its own dispatch-completion flag too.
   let dirty = false;
   const simulatedEpics: Epic[] = snap.epics.map((epic) => {
     const epicJobs = Array.isArray(epic.jobs) ? epic.jobs : [];
@@ -1403,14 +351,9 @@ export function predictNextDispatches(
     return { approvals: [], informational, workers: [], closers: [] };
   }
 
-  // Empty git-status map is deliberate: the autopilot simulator builds a
-  // synthetic `Epic[]` and doesn't model real git state. Passing an empty
-  // map keeps the simulator's "predicate 6.5 doesn't fire" semantics — the
-  // real `subscribeReadiness` pipeline does the live `git_status` lookup
-  // before approve/dispatch lands. Don't "fix" this to forward
-  // `snap.gitStatus` without first re-checking what the simulator should
-  // do with it (today: nothing, the worker hasn't run yet so the live row
-  // is the wrong sample).
+  // Empty git-status map: the simulator builds a synthetic `Epic[]` and
+  // doesn't model live git state. The real readiness pipeline does the
+  // live `git_status` lookup before approve/dispatch lands.
   const futureReadiness = computeReadiness(
     simulatedEpics,
     snap.jobs,
@@ -1430,16 +373,6 @@ export function predictNextDispatches(
         continue;
       }
       const cur = snap.readiness.perTask.get(taskId);
-      // `cur === completed` rows are already past the next-dispatch edge;
-      // `cur === undefined` is a defensive miss (no prediction). Approve
-      // predictions flow from EITHER `blocked → job-pending` (in-flight
-      // worker / approver chain) OR `ready → job-pending` (section 1's
-      // about-to-dispatch worker, modelled as completed). Worker
-      // predictions flow only from `blocked → ready` — a row already at
-      // `ready` is firing its worker in section 1, not section 2. The
-      // `git-dirty` informational bucket is NOT sourced here — see the
-      // pre-pass at the top of this function for why it reads `cur`
-      // instead of the simulated `fut`.
       if (cur === undefined || cur.tag === "completed") {
         continue;
       }
@@ -1475,801 +408,134 @@ export function predictNextDispatches(
   return { approvals, informational, workers, closers };
 }
 
-// --- dispatch.log hydration + fulfillment detection ---------------------
-//
-// `dispatch.log` is a forensic JSONL append-only log under
-// `~/.local/state/keeper/dispatch.log`. Each line is a JSON object with a
-// `kind` discriminator:
-//
-//   - `{"kind":"launch", ts, rowId, dir, dirFull, verb, id, command,
-//     dry?, pid?}` — written by `logDispatch` the moment autopilot fires
-//     (or would-have-fired in dry mode).
-//   - `{"kind":"fulfilled", ts, verb, id, pid?}` — written by
-//     `detectJobTransitions` the first time an embedded job appears in
-//     the readiness snapshot for the dispatched `(verb, id)` pair. Marks
-//     the dispatch as "claimed forever"; once fulfilled, no other
-//     autopilot automation re-fires for it (in this run or any future
-//     run).
-//   - `{"kind":"completed", ts, verb, id, pid?}` — written by
-//     `detectJobTransitions` from ANY of three triggers:
-//       (a) the matching embedded job is observed in a terminal state
-//           (`"ended"` / `"killed"`); OR
-//       (b) the matching embedded job is parked at `"stopped"` AND the
-//           row's board readiness verdict is already `{ tag: "completed" }`
-//           (`isDispatchVerdictCompleted` — same `[completed]` semantics
-//           board.ts uses: worker done + approved, or epic done +
-//           approved); OR
-//       (c) the dispatch was already fulfilled in a prior snapshot and
-//           `findSessionJob` now returns `undefined` — the parent epic
-//           has fallen off the default subscription scope (typically
-//           because it's done+approved per `src/collections.ts:251-254`,
-//           or was explicitly `planctl epic-delete`d). All three forms
-//           migrate the row from `--- current ---` to `--- completed ---`
-//           and fire `closeWindow`.
-//
-//     The disappearance trigger relies on the all-three-collections
-//     gate in `subscribeReadiness.emitSnapshotIfReady`
-//     (`src/readiness-client.ts:840-841`): the client only emits a
-//     snapshot once every collection's `result` frame has landed
-//     post-reconnect, so a partial mid-reconnect frame cannot
-//     spuriously fire the rule.
-//
-// On startup, `hydrateDispatchLog` folds all three kinds into the
-// durable `dispatchedKeys` + `fulfilledKeys` + `completedKeys` sets so
-// the cross-run re-dispatch guard survives restarts. The display array
-// (`dispatchLog`) is NOT hydrated — it starts empty each run, so prior-
-// run dispatches (including dry-run dispatches that can never reach
-// fulfillment) don't leak into the UI.
+// ---------------------------------------------------------------------------
+// Live + failed row shapes — the viewer's internal projections.
+// ---------------------------------------------------------------------------
 
 /**
- * Touch-without-truncate `dispatch.log` at boot so the durable
- * `dispatchedKeys` re-dispatch guard has a stable on-disk substrate from
- * the very first append site, EVEN IF the file was externally removed
- * between the prior autopilot run and this one (e.g. an operator-side
- * state-dir cleanup, a `rm` typed into the autopilot tab, or any future
- * tool that prunes the run dir without knowing dispatch.log is durable).
- *
- * fn-654.3 motivation: the in-repo write path is already 100% append-only
- * (`appendFileSync` everywhere — `logDispatch`, the `kind:"window"` row,
- * the `kind:"fulfilled"` / `kind:"completed"` rows; no truncating open
- * anywhere in `cli/`, `src/`, or `plugin/`), and no installed LaunchAgent
- * or shell-init script touches dispatch.log. The fresh-birth symptom that
- * triggered this guard came from an external `rm` between runs — the
- * file simply didn't exist when autopilot booted, so the first append
- * created a fresh-birth-time file and `hydrateDispatchLog` quietly
- * returned empty sets. This guard makes the file's existence an
- * explicit, testable boot-time invariant rather than an emergent
- * property of "the first append site happens to use O_CREAT".
- *
- * Mechanism: `appendFileSync(path, "")` issues an `open(O_APPEND|O_CREAT)`
- * + a zero-byte write + close. The open never truncates (no O_TRUNC),
- * so existing content is preserved exactly. If the file is absent the
- * open creates it empty.
- *
- * Do NOT switch to `createWriteStream({flags:"a"})` here either — Bun
- * issue #3395 truncated despite the append flag. Per-call
- * `appendFileSync` stays the primitive; this guard just calls it once
- * with an empty string before `hydrateDispatchLog` reads.
- *
- * I/O failures (EACCES, ENOSPC, parent-dir-missing race) are swallowed
- * to `noteLine` — autopilot still boots, hydration still works against
- * whatever state exists, and the next real `logDispatch` will surface
- * the same failure through its own error path. Never throw here; the
- * forensic log is not on the critical path.
+ * One live dispatch row rendered under `--- current ---`. Sourced from
+ * the `jobs` map in the readiness snapshot — every `working` /
+ * `stopped` row whose `plan_verb` is one of the three dispatch verbs is
+ * a current dispatch the reconciler launched.
  */
-export function ensureDispatchLogExists(
-  path: string,
-  noteLine?: (s: string) => void,
-): void {
-  try {
-    appendFileSync(path, "");
-  } catch (err) {
-    if (noteLine) {
-      noteLine(
-        `# warn: ensureDispatchLogExists failed for ${path}: ${(err as Error).message}`,
-      );
-    }
-  }
+export interface CurrentRow {
+  verb: "work" | "close" | "approve";
+  id: string;
+  /** Basename of `project_dir` — empty when none. */
+  dir: string;
+  /** Sort key: created_at descending puts the freshest at the bottom. */
+  created_at: number;
 }
 
 /**
- * Re-fold `dispatch.log` from disk into the three durable sets that
- * survive across runs:
- *
- *   - `dispatchedKeys` — every `${verb}::${id}` autopilot has ever
- *     dispatched (this run + every prior run). Drives the re-dispatch
- *     guard in `launchInGhostty` so a session-ended → verdict-flips-back-
- *     to-ready cycle cannot open a second Ghostty window for the same
- *     row, and the guard survives restarts.
- *   - `fulfilledKeys` — every `${verb}::${id}` autopilot has observed
- *     register (an embedded job for that row+verb appeared in the
- *     readiness snapshot). Marks the dispatch as claimed for life; the
- *     "queued → current" partition pivots on this for this-run
- *     dispatches.
- *   - `completedKeys` — every `${verb}::${id}` autopilot has observed
- *     reach a terminal job state (`"ended"` / `"killed"`). Drives the
- *     "current → completed" partition for this-run dispatches.
- *
- * The display array is intentionally NOT seeded from the log — prior-
- * run dispatches never appear in this run's UI. The three sets above
- * are enough to make the durable re-dispatch guard work.
- *
- * Malformed JSONL lines skip silently — `dispatch.log` is a forensic
- * audit log, not the event store, so re-fold determinism isn't a goal
- * here. A truncated/corrupt line cannot wedge startup.
+ * One row of `dispatch_failures` shipped to the viewer. The wire shape is
+ * `Record<string, unknown>` (subscribeCollection's general output); this
+ * is the typed projection we render against. The reducer guarantees the
+ * column set per `DISPATCH_FAILURES_DESCRIPTOR`.
  */
-export function hydrateDispatchLog(path: string): {
-  dispatchedKeys: Set<string>;
-  fulfilledKeys: Set<string>;
-  completedKeys: Set<string>;
-  // Launch rows that were fulfilled but NOT completed and NOT dry,
-  // parsed back into the in-memory `DispatchEntry` shape so the
-  // `--- current ---` section can survive a restart. Latest-per-key
-  // wins (a later `ts` overwrites an earlier launch for the same
-  // `(verb, id)`), then the array is sorted by `ts` ascending so the
-  // oldest-first frame ordering is preserved. The partition logic at
-  // the render seam already keys off `completedKeys` /
-  // `fulfilledKeys`, so the restored entries automatically land under
-  // `--- current ---` without further main()-side intervention.
-  restoredEntries: DispatchEntry[];
-} {
-  const dispatchedKeys = new Set<string>();
-  const fulfilledKeys = new Set<string>();
-  const completedKeys = new Set<string>();
-  // Buffer every parsed `kind:"launch"` row keyed by `(verb, id)` so
-  // we can apply the latest-per-key rule in a second pass — at parse
-  // time we don't yet know whether the key will end up in
-  // `completedKeys`, so the filter (`fulfilledKeys.has(key) &&
-  // !completedKeys.has(key) && !dry`) has to wait for the first pass
-  // to finish populating the three sets.
-  const launchRows = new Map<string, DispatchEntry>();
-  // Buffer every parsed `kind:"window"` row keyed by `(verb, id)` so
-  // we can stamp `windowId` + `tabName` onto the matching surviving
-  // restored launch entry in pass 2. Latest-ts-wins (an old log can
-  // carry a stale id if the window was already reaped; the freshest
-  // row is the closest live signal). Track the `ts` alongside the id
-  // so the comparison doesn't pin to insertion order. `tabName` is
-  // the fn-654.2 wrap-safety token — undefined on pre-upgrade rows
-  // whose `kind:"window"` payload predates the field.
-  const windowRows = new Map<
-    string,
-    { windowId: string; tabName: string | undefined; ts: string }
-  >();
-  let content: string;
-  try {
-    content = readFileSync(path, "utf8");
-  } catch {
-    return {
-      dispatchedKeys,
-      fulfilledKeys,
-      completedKeys,
-      restoredEntries: [],
-    };
-  }
-  for (const line of content.split("\n")) {
-    if (line.trim() === "") {
-      continue;
-    }
-    let row: Record<string, unknown>;
-    try {
-      row = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    const verb = row.verb;
-    const id = row.id;
-    if (typeof verb !== "string" || typeof id !== "string") {
-      continue;
-    }
-    const key = `${verb}::${id}`;
-    if (row.kind === "launch") {
-      dispatchedKeys.add(key);
-      // Parse the launch row into a `DispatchEntry` shape. Every
-      // field needed by the renderer already lives on the line (see
-      // `logDispatch`); type-guard each one and skip silently on a
-      // shape mismatch (forensic log, not the event store).
-      if (verb !== "work" && verb !== "close" && verb !== "approve") {
-        continue;
-      }
-      const ts = row.ts;
-      const rowId = row.rowId;
-      const dir = row.dir;
-      const dirFull = row.dirFull;
-      const command = row.command;
-      if (
-        typeof ts !== "string" ||
-        typeof rowId !== "string" ||
-        typeof dir !== "string" ||
-        typeof dirFull !== "string" ||
-        typeof command !== "string"
-      ) {
-        continue;
-      }
-      const dry = row.dry === true;
-      const pid = typeof row.pid === "number" ? row.pid : undefined;
-      const entry: DispatchEntry = {
-        ts,
-        kind: "launch",
-        rowId,
-        dir,
-        dirFull,
-        verb,
-        id,
-        command,
-        ...(dry ? { dry: true } : {}),
-        ...(pid !== undefined ? { pid } : {}),
-      };
-      // Latest-per-key wins. A historical re-dispatch for the same
-      // `(verb, id)` (rare — the durable guard suppresses it — but
-      // possible if `dispatch.log` is older than `dispatchedKeys`)
-      // collapses to the most recent row.
-      const prev = launchRows.get(key);
-      if (prev === undefined || prev.ts <= ts) {
-        launchRows.set(key, entry);
-      }
-    } else if (row.kind === "fulfilled") {
-      fulfilledKeys.add(key);
-    } else if (row.kind === "completed") {
-      completedKeys.add(key);
-    } else if (row.kind === "window") {
-      const ts = row.ts;
-      const windowId = row.windowId;
-      // Type-guard every required field; a shape mismatch (e.g.
-      // `windowId` recorded as a number by a future log-format
-      // quirk) skips silently per the "malformed lines skip"
-      // forensic-log contract. The latest-ts-wins comparison string-
-      // compares ISO timestamps (their lex order matches chronological
-      // order).
-      if (typeof ts !== "string" || typeof windowId !== "string") {
-        continue;
-      }
-      // `tabName` is the fn-654.2 wrap-safety token. Optional: pre-
-      // upgrade rows didn't carry it, and a non-string lifts to
-      // undefined (treated as "missing token" by the backend's close
-      // guard — fail-safe skip). A present-and-string value rides
-      // along onto the restored entry so a cross-run close has the
-      // full pair (windowId, tabName) for the surgical pane-close
-      // path.
-      const rawTabName = row.tabName;
-      const tabName = typeof rawTabName === "string" ? rawTabName : undefined;
-      const prev = windowRows.get(key);
-      if (prev === undefined || prev.ts <= ts) {
-        windowRows.set(key, { windowId, tabName, ts });
-      }
-    }
-  }
-  // Second pass: apply the restore filter (`fulfilled && !completed
-  // && !dry`) against the now-complete three sets, then sort by `ts`
-  // ascending to preserve the oldest-first frame ordering. Stamp the
-  // matching `windowRows` entry's `windowId` (if any) onto the
-  // restored entry so cross-run auto-close still works on a launch
-  // that had a window-id capture before the crash/restart.
-  const restoredEntries: DispatchEntry[] = [];
-  for (const [key, entry] of launchRows) {
-    if (!fulfilledKeys.has(key)) {
-      continue;
-    }
-    if (completedKeys.has(key)) {
-      continue;
-    }
-    if (entry.dry === true) {
-      continue;
-    }
-    const window = windowRows.get(key);
-    if (window !== undefined) {
-      entry.windowId = window.windowId;
-      // `tabName` may still be undefined (pre-fn-654.2 window rows
-      // without the field). The backend's close guard treats a
-      // missing tabName as a "skip the close" signal, so leaving the
-      // field undefined here is the right propagation.
-      if (window.tabName !== undefined) {
-        entry.tabName = window.tabName;
-      }
-    }
-    restoredEntries.push(entry);
-  }
-  restoredEntries.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
-  return { dispatchedKeys, fulfilledKeys, completedKeys, restoredEntries };
+export interface FailedRow {
+  verb: string;
+  id: string;
+  reason: string;
+  dir: string;
+  ts: string;
 }
 
 /**
- * Returns the embedded job that matches this dispatched `(verb, id)`
- * pair, or `undefined` if no such job is in the snapshot yet. Drives
- * both transitions:
- *
- *   - **fulfillment**: any return value (defined job) means an embedded
- *     job for the dispatched row+verb has landed in keeper's
- *     projection — the agent has booted (or any matching session
- *     exists) via the reducer's `syncJobIntoEpic` fan-out (schema v26
- *     widened the verb whitelist to accept `approve` alongside
- *     `work` / `close`).
- *   - **completion**: the matched job's `state` field carries the
- *     observed lifecycle state; the caller treats `"ended"` /
- *     `"killed"` as terminal.
- *
- * Dispatches by `id` shape: a dotted `id` (`fn-619-foo.1`) targets a
- * task — scan that task's `jobs[]`. An undotted `id` (`fn-619-foo`)
- * targets an epic-level row (close or approve on the epic) — scan the
- * epic's `jobs[]`. The matching entry's `plan_verb` must equal the
- * dispatched verb.
+ * Project the readiness snapshot's `jobs` map into a `current` row per
+ * non-terminal dispatch (verbs work / close / approve, state
+ * working|stopped). Pure transform — exported for tests.
  */
-export function findSessionJob(
-  snap: ReadinessClientSnapshot,
-  verb: string,
-  id: string,
-): { state: string } | undefined {
-  const isTaskForm = id.includes(".");
-  if (isTaskForm) {
-    for (const epic of snap.epics) {
-      const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
-      for (const task of tasks) {
-        if (task.task_id !== id) {
-          continue;
-        }
-        const jobs = Array.isArray(task.jobs) ? task.jobs : [];
-        return jobs.find((j) => j.plan_verb === verb);
-      }
-    }
-    return undefined;
-  }
-  for (const epic of snap.epics) {
-    if (epic.epic_id !== id) {
+export function buildCurrentRows(snap: ReadinessClientSnapshot): CurrentRow[] {
+  const out: CurrentRow[] = [];
+  for (const job of snap.jobs.values()) {
+    if (job.state !== "working" && job.state !== "stopped") {
       continue;
     }
-    const jobs = Array.isArray(epic.jobs) ? epic.jobs : [];
-    return jobs.find((j) => j.plan_verb === verb);
+    const verb = job.plan_verb;
+    if (verb !== "work" && verb !== "close" && verb !== "approve") {
+      continue;
+    }
+    const id = seg(job.plan_ref);
+    if (id === "") {
+      continue;
+    }
+    const cwd = seg(job.cwd);
+    out.push({
+      verb,
+      id,
+      dir: cwd === "" ? "" : basename(cwd),
+      created_at:
+        typeof job.created_at === "number" ? job.created_at : Number(0),
+    });
   }
-  return undefined;
+  // Sort ascending by created_at (oldest first) so the freshest dispatch
+  // is at the bottom — same scan-order convention the predicted /
+  // completed sections used in the legacy renderer.
+  out.sort((a, b) => a.created_at - b.created_at);
+  return out;
 }
 
 /**
- * True when the dispatched row's board readiness verdict is
- * `{ tag: "completed" }` — the SAME signal `board.ts` uses to stamp a
- * task / close-row `[completed]` pill (task: `worker_phase === "done" &&
- * approval === "approved"`; close: `epic.status === "done" &&
- * epic.approval === "approved"`). This is the planctl + approval axis,
- * independent of the session's lifecycle `state`.
- *
- * Id-shape split mirrors `findSessionJob`: a dotted id (`fn-…-foo.1`)
- * is a task row → read `perTask`; an undotted id (`fn-…-foo`) is the
- * epic's close row → read `perCloseRow`. So `work` / task-level
- * `approve` consult the task verdict, and `close` / epic-level
- * `approve` consult the close-row verdict. A renderer-side lookup miss
- * (verdict map has no entry) is treated as "not completed".
- *
- * Exported so `test/autopilot.test.ts` can pin the id-shape routing
- * without standing up the subscribe loop.
+ * Convert `dispatch_failures` wire rows to typed `FailedRow`s. The
+ * descriptor sorts `ts DESC` server-side, so the freshest failure is the
+ * first element. Pure transform — exported for tests.
  */
-export function isDispatchVerdictCompleted(
-  snap: ReadinessClientSnapshot,
-  id: string,
-): boolean {
-  const verdict = id.includes(".")
-    ? snap.readiness.perTask.get(id)
-    : snap.readiness.perCloseRow.get(id);
-  return verdict?.tag === "completed";
+export function projectFailedRows(
+  rows: Record<string, unknown>[],
+): FailedRow[] {
+  const out: FailedRow[] = [];
+  for (const r of rows) {
+    out.push({
+      verb: seg(r.verb),
+      id: seg(r.id),
+      reason: seg(r.reason),
+      dir: seg(r.dir),
+      ts: seg(r.ts),
+    });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Body renderer — pure (fixtures → lines).
+// ---------------------------------------------------------------------------
+
+export interface RenderInput {
+  current: CurrentRow[];
+  predicted: PreviewSections;
+  failed: FailedRow[];
+  paused: boolean;
 }
 
 /**
- * Closure-dependency record for `detectJobTransitions`. The function
- * was extracted from `main()` so the new fulfilled-then-disappeared
- * branch could be unit-tested in isolation; the production call site
- * inside `main()` wires `appendLine` to `appendFileSync(dispatchLogPath, …)`
- * and the test wires it to an in-memory recorder.
+ * Render the body lines for one viewer frame. Three sections, each
+ * emitted only when non-empty, in priority order: current (live work),
+ * predicted (next dispatches), failed (sticky failures awaiting human
+ * retry). The leading `[paused]` / `[playing]` indicator lives on the
+ * live-shell banner row, not the body — same convention as board's
+ * persistent-pill restoration.
+ *
+ * Pure — exported for tests.
  */
-export interface DetectJobTransitionsDeps {
-  // Mutable display array. `detectJobTransitions` does not push to it
-  // (only `logDispatch` does), but it walks the array each call to
-  // partition keys into the three durable sets.
-  dispatchLog: DispatchEntry[];
-  // Durable cross-snapshot set: a key lands here the first time
-  // `findSessionJob` returns a defined job for `(verb, id)`. Survives
-  // restarts via `hydrateDispatchLog`.
-  fulfilledKeys: Set<string>;
-  // Durable cross-snapshot set: a key lands here when the matching job
-  // is observed terminal OR (post-fulfillment) when the key disappears
-  // from the snapshot. Survives restarts.
-  completedKeys: Set<string>;
-  // Production wires to the on-disk JSONL path; tests reuse it for
-  // warn-line context only.
-  dispatchLogPath: string;
-  // Lifecycle-warn sink — wraps `appendFileSync(lifecycleSidecar, …)`
-  // in production; tests can hand a no-op.
-  noteLine: (s: string) => void;
-  // The autopilot process pid stamped into every emitted log line.
-  pid: number;
-  // The disk-append callback. Production wires
-  // `(line) => appendFileSync(dispatchLogPath, line)`; tests inject an
-  // in-memory recorder to assert the exact JSON shape without touching
-  // the filesystem.
-  appendLine: (line: string) => void;
-  // Auto-close trigger. Fired at BOTH `completedKeys`-entry sites
-  // (terminal-state branch AND disappearance branch) so the
-  // dispatched surface exits in lockstep with the underlying agent's
-  // terminal state. Production wires a fire-and-forget pane-close
-  // through the resolved `ExecBackend.close(windowId, tabName)` —
-  // surgical via `close-pane -p` and gated by a name-exact tab-live
-  // token check (fn-654.2). Tests inject a recording closure to
-  // assert the (windowId, tabName) pair reached the callback. Both
-  // `entry.windowId` and `entry.tabName` (either may be `undefined`,
-  // independently — pre-fn-654.2 logs lacked tabName; failed launches
-  // lacked windowId) pass through unconditionally — the production
-  // implementation skips on either missing.
-  closeWindow: (
-    windowId: string | undefined,
-    tabName: string | undefined,
-  ) => void;
-}
+export function renderBody(input: RenderInput): string[] {
+  const out: string[] = [];
 
-/**
- * Walk every dispatch and check whether the snapshot has advanced
- * its matching embedded job:
- *
- *   queued → current      first time a job for (verb, id) is observed
- *                         in the snapshot at all (kind:"fulfilled"
- *                         log line).
- *   current → completed   ANY of three first-observations:
- *                         (1) the job's `state` reaches a terminal value
- *                             (`"ended"` / `"killed"`); OR
- *                         (2) the job is parked at `"stopped"` AND the
- *                             row's board readiness verdict is already
- *                             `{ tag: "completed" }` (`board.ts`'s
- *                             `[completed]` semantics —
- *                             `isDispatchVerdictCompleted`); OR
- *                         (3) (post-fulfillment) the matching job
- *                             disappears from the snapshot entirely —
- *                             the parent epic fell off the default
- *                             subscription scope (typically done+approved
- *                             per `src/collections.ts:251-254`) or was
- *                             `planctl epic-delete`d.
- *                         All three emit a `kind:"completed"` log line
- *                         with the same `{kind, ts, verb, id, pid}` JSON
- *                         shape and fire `closeWindow(entry.windowId)`.
- *
- * First observation wins for each transition. No-op when nothing
- * changes.
- *
- * The disappearance branch is gated on `fulfilledKeys.has(key)`:
- * without that gate a queued dispatch whose agent hasn't booted yet
- * (also `findSessionJob === undefined`) would migrate to completed
- * instantly. The gate is load-bearing — do not remove it. The branch
- * also relies on `subscribeReadiness.emitSnapshotIfReady`'s
- * all-three-collections gate (`src/readiness-client.ts:840-841`) to
- * avoid firing on a partial post-reconnect frame.
- */
-export function detectJobTransitions(
-  deps: DetectJobTransitionsDeps,
-  snap: ReadinessClientSnapshot,
-): void {
-  const {
-    dispatchLog,
-    fulfilledKeys,
-    completedKeys,
-    noteLine,
-    pid,
-    appendLine,
-    closeWindow,
-  } = deps;
-  for (const entry of dispatchLog) {
-    const key = `${entry.verb}::${entry.id}`;
-    if (completedKeys.has(key)) {
-      continue;
-    }
-    const job = findSessionJob(snap, entry.verb, entry.id);
-    // Disappearance branch — MUST precede the `job === undefined`
-    // early-return below; a future drive-by reorder would silently
-    // break the rule. The `fulfilledKeys.has(key)` gate is what
-    // distinguishes "epic dropped off the page after fulfillment"
-    // (terminal, migrate to completed) from "agent hasn't booted yet"
-    // (queued, stay put).
-    if (job === undefined && fulfilledKeys.has(key)) {
-      completedKeys.add(key);
-      try {
-        appendLine(
-          `${JSON.stringify({
-            kind: "completed",
-            ts: new Date().toISOString(),
-            verb: entry.verb,
-            id: entry.id,
-            pid,
-          })}\n`,
-        );
-      } catch (err) {
-        noteLine(
-          `# warn: completed log write failed: ${(err as Error).message}`,
-        );
-      }
-      // Auto-close trigger (disappearance branch). Either
-      // `entry.windowId` or `entry.tabName` may be `undefined`; the
-      // production implementation skips on either missing (fail-
-      // safe). The `completedKeys.has(key)` guard at the top of the
-      // loop ensures a subsequent snapshot doesn't fire `closeWindow`
-      // twice.
-      closeWindow(entry.windowId, entry.tabName);
-      continue;
-    }
-    // Constraint: the disappearance branch above MUST stay above this
-    // early-return — otherwise the `fulfilled && undefined` case is
-    // preempted and never reaches `completed`.
-    if (job === undefined) {
-      continue;
-    }
-    if (!fulfilledKeys.has(key)) {
-      fulfilledKeys.add(key);
-      try {
-        appendLine(
-          `${JSON.stringify({
-            kind: "fulfilled",
-            ts: new Date().toISOString(),
-            verb: entry.verb,
-            id: entry.id,
-            pid,
-          })}\n`,
-        );
-      } catch (err) {
-        noteLine(
-          `# warn: fulfilled log write failed: ${(err as Error).message}`,
-        );
-      }
-    }
-    // Migrate to completed on EITHER axis:
-    //   - terminal: the session lifecycle reached `"ended"` / `"killed"`
-    //     (e.g. the window was closed or the agent crashed). Always
-    //     completes regardless of board verdict — a killed/ended session
-    //     is gone either way.
-    //   - board-verdict: the session is parked at `"stopped"` AND its
-    //     board readiness verdict is already `{ tag: "completed" }` (the
-    //     same signal `board.ts` stamps `[completed]` on — worker done +
-    //     approved, or epic done + approved). This is the fix for
-    //     finished-and-approved workers that linger in `--- current ---`
-    //     until the human closes their window: completing here ALSO
-    //     fires `closeWindow`, so a parked surface is reaped in lockstep
-    //     with the work actually being done. Gated on `state ===
-    //     "stopped"` so an actively-`working` session is never reaped
-    //     mid-flight on a verdict race (board predicate 1
-    //     terminal-completed outranks the running predicates).
-    const terminal = job.state === "ended" || job.state === "killed";
-    const stoppedAndComplete =
-      job.state === "stopped" && isDispatchVerdictCompleted(snap, entry.id);
-    if (terminal || stoppedAndComplete) {
-      completedKeys.add(key);
-      try {
-        appendLine(
-          `${JSON.stringify({
-            kind: "completed",
-            ts: new Date().toISOString(),
-            verb: entry.verb,
-            id: entry.id,
-            pid,
-          })}\n`,
-        );
-      } catch (err) {
-        noteLine(
-          `# warn: completed log write failed: ${(err as Error).message}`,
-        );
-      }
-      // Auto-close trigger. Mirrors the disappearance branch above —
-      // same once-per-key guarantee via the `completedKeys.has(key)`
-      // top-of-loop guard. Fires for both the terminal and the
-      // stopped-and-board-complete paths. Passes both `windowId`
-      // (pane id) and `tabName` (wrap-safety token) so the production
-      // backend can guard `close-pane -p` on a name-exact live check.
-      closeWindow(entry.windowId, entry.tabName);
+  if (input.current.length > 0) {
+    out.push("--- current ---");
+    for (const r of input.current) {
+      const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
+      out.push(`${dirSeg}${r.verb}::${r.id}`);
     }
   }
-}
 
-export async function main(argv: string[]): Promise<void> {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      sock: { type: "string" },
-      "dry-run": { type: "boolean", default: false },
-      reset: { type: "boolean", default: false },
-      help: { type: "boolean", default: false },
-    },
-    allowPositionals: false,
-  });
-
-  if (values.help) {
-    process.stdout.write(HELP);
-    process.exit(0);
-  }
-
-  const sockPath = values.sock ?? resolveSockPath();
-  const dispatchLogPath = join(dirname(sockPath), "dispatch.log");
-  // fn: --reset wipes the forensic dispatch log before anything else, so
-  // the durable cross-run re-dispatch guard starts empty this run and
-  // every ready/pending row is eligible to fire fresh. `force: true`
-  // makes the delete a no-op when the file is already absent (the common
-  // case on a clean state dir); `ensureDispatchLogExists` below re-creates
-  // it before hydration so the persistence contract holds.
-  if (values.reset === true) {
-    rmSync(dispatchLogPath, { force: true });
-  }
-  // fn-635: readiness diagnostics JSONL log. Same path keeper-wide
-  // (shared with `scripts/board.ts`'s drain) so two processes appending
-  // concurrently land in one file. POSIX O_APPEND under PIPE_BUF gives
-  // atomicity without flock.
-  const diagnosticsLogPath = join(
-    dirname(sockPath),
-    "readiness-diagnostics.jsonl",
-  );
-  const dryRun = values["dry-run"] === true;
-  let frameCount = 0;
-
-  // Always starts paused. While `paused && !dryRun`,
-  // `processLaunchTransitions` returns early — no Ghostty windows open and
-  // `lastVerdictSig` stays frozen, so any currently ready/pending row will
-  // fire on the next snapshot once unpaused. On the unpause edge we ALSO
-  // immediately re-run `processLaunchTransitions(lastSnap)` so the human
-  // doesn't have to wait for keeperd to push the next snapshot. In
-  // --dry-run mode the flag is tracked but ignored: dispatches are
-  // already side-effect-free, so the 'p' key is a silent no-op and the
-  // title never carries the [PAUSED] tag.
-  let paused = true;
-
-  // `v` toggles command display. When on, every command-bearing row
-  // (dispatched current/queued/completed + predicted work/close/approve)
-  // gets one extra indented line carrying the full shell command, so the
-  // human can mouse-select it and run it manually. Informational
-  // `git-dirty` predicted rows have no command behind them and are never
-  // annotated. The toggle repaints the live body via `refreshLive` (no
-  // history growth) and adds a `[cmd]` marker to the banner.
-  let showCommands = false;
-
-  let lastBody: string | null = null;
-  // Latest readiness snapshot, captured at the top of `onSnapshot`. The
-  // section-2 preview (`predictNextDispatches`) recomputes from this on
-  // every frame emit. `null` until the first paint lands.
-  let lastSnap: ReadinessClientSnapshot | null = null;
-
-  // Hydrate the durable cross-run guard from disk. `dispatchedKeys`
-  // carries every key from every prior run (durable guard against
-  // double-fire); `fulfilledKeys` carries every `(verb, id)` autopilot
-  // has observed register; `completedKeys` carries every key autopilot
-  // has observed reach a terminal job state. The display array
-  // (`dispatchLog`) starts empty each run — prior-run dispatches never
-  // appear in this run's UI. This run's launches push onto `dispatchLog`
-  // as they fire and write a `kind:"launch"` line; the matching
-  // `kind:"fulfilled"` and `kind:"completed"` lines are written the
-  // first time the snapshot shows an embedded job for the dispatched
-  // row+verb and the first time that job's `state` is observed terminal.
-  // fn-654.3: defensive touch-without-truncate before hydration. The
-  // in-repo write path is already 100% append-only, but an external `rm`
-  // between runs (e.g. an operator-side state-dir cleanup) can leave the
-  // file absent at boot — `hydrateDispatchLog` would then quietly return
-  // empty sets and the durable re-dispatch guard would silently lose its
-  // substrate until the first launch landed. Explicitly create-if-absent
-  // (never truncate) here so the persistence contract is a load-bearing
-  // boot-time invariant, not an emergent property of "the first append
-  // site happens to use O_CREAT". See `ensureDispatchLogExists` for the
-  // mechanism + Bun #3395 rationale for staying on `appendFileSync`.
-  // Boot-time call: `noteLine` (the liveShell scratchpad) isn't yet
-  // declared at this point in `main`. A real I/O failure here surfaces
-  // through the next `logDispatch`'s own try/catch — silent swallow is
-  // the right default for the touch primitive.
-  ensureDispatchLogExists(dispatchLogPath);
-  const { dispatchedKeys, fulfilledKeys, completedKeys, restoredEntries } =
-    hydrateDispatchLog(dispatchLogPath);
-  // Seed the in-memory display array from any prior-run launches that
-  // were fulfilled but not completed (and not dry) — so a still-running
-  // cross-run dispatch renders under `--- current ---` immediately on
-  // startup instead of waiting for the next snapshot transition. The
-  // partition logic in `renderDispatchFrame` already keys off
-  // `completedKeys` / `fulfilledKeys`, so the restored entries land
-  // under `--- current ---` automatically; if the matching job has
-  // since fallen off the projection (epic became done+approved or was
-  // epic-deleted), `detectJobTransitions`'s disappearance branch
-  // migrates the key to `completedKeys` on the first post-startup
-  // snapshot and the row moves to `--- completed ---`.
-  const dispatchLog: DispatchEntry[] = restoredEntries;
-
-  // Startup-stagger gate (fn-644). `settling` holds 0 or 1 entries — a
-  // freshly-launched `${verb}::${id}` lives here from `launchInGhostty`'s
-  // real-launch path until the next snapshot observes the row at a
-  // `running`-tag verdict OR migrates the key to `completedKeys`. While
-  // the slot is occupied, further ready/job-pending edges are stashed in
-  // `pendingLaunches` and drained one at a time as the slot frees. Both
-  // maps are this-run-only — a restart re-derives running rows from the
-  // live snapshot and the durable `dispatchedKeys` guard still prevents
-  // work/close re-launch.
-  const settling = new Map<string, number>();
-  const pendingLaunches = new Map<string, PendingLaunch>();
-
-  function renderDispatchFrame(): string[] {
-    // Four named-header sections, each only emitted when non-empty,
-    // rendered in this order: `--- current ---` (this-run dispatches
-    // observed registered but not yet terminal), `--- queued ---`
-    // (this-run dispatches still waiting on the agent to boot),
-    // `--- predicted ---` (`predictNextDispatches` output for the next
-    // edges as in-flight jobs finish), and `--- completed ---` (this-
-    // run dispatches whose matching embedded job has either reached a
-    // terminal state `"ended"` / `"killed"` OR — after the dispatch was
-    // already fulfilled in a prior snapshot — has disappeared from the
-    // subscription page entirely, typically because the parent epic
-    // became done+approved and fell out of the default epics scope
-    // per `src/collections.ts:251-254`, or because the human ran an
-    // explicit `planctl epic-delete` against the fulfilled target).
-    // The ordering is attention-first — live agents at the top, growing
-    // history at the bottom so completed rows don't push live state
-    // around. In wet mode queued is typically transient (1-3 frames
-    // between dispatch and SessionStart fold); in dry mode it persists
-    // until the human runs the command manually (no real session ever
-    // boots, so neither `current` nor `completed` ever populates for a
-    // dry dispatch).
-    const current: string[] = [];
-    const queued: string[] = [];
-    const completed: string[] = [];
-    for (const e of dispatchLog) {
-      const key = `${e.verb}::${e.id}`;
-      const target = completedKeys.has(key)
-        ? completed
-        : fulfilledKeys.has(key)
-          ? current
-          : queued;
-      const dirSeg = e.dir === "" ? "" : `(${e.dir}) `;
-      const dryTag = e.dry ? "[dry] " : "";
-      target.push(`${dirSeg}${dryTag}${e.verb}::${e.id}`);
-      if (e.dry) {
-        // Dry runs append the would-have-run shell command, split
-        // across two indented lines for readability: `  cd <full> &&
-        // \` then `    claude '/plan:<verb> <id>'`. The `cd` line is
-        // dropped when there's no dir, so a no-dir dry dispatch shows
-        // just the claude line under the summary.
-        if (e.dirFull !== "") {
-          target.push(`  cd ${e.dirFull} && \\`);
-          target.push(`    claude '/plan:${e.verb} ${e.id}'`);
-        } else {
-          target.push(`  claude '/plan:${e.verb} ${e.id}'`);
-        }
-      } else if (showCommands) {
-        // `v` toggle: surface the real fused command (`cd … && claude
-        // --name … '/plan:…'`) on one indented line for copy-paste.
-        // Dry rows already carry their footer above, so they're skipped.
-        target.push(`  ${e.command}`);
-      }
-    }
-
-    const out: string[] = [];
-    if (current.length > 0) {
-      out.push("--- current ---");
-      out.push(...current);
-    }
-    if (queued.length > 0) {
-      out.push("--- queued ---");
-      out.push(...queued);
-    }
-
-    if (lastSnap !== null) {
-      const { approvals, informational, workers, closers } =
-        predictNextDispatches(lastSnap);
-      if (
-        approvals.length !== 0 ||
-        informational.length !== 0 ||
-        workers.length !== 0 ||
-        closers.length !== 0
-      ) {
-        out.push(
-          ...renderPredictedSection(approvals, informational, workers, closers),
-        );
-      }
-    }
-
-    if (completed.length > 0) {
-      out.push("--- completed ---");
-      out.push(...completed);
-    }
-    return out;
-  }
-
-  function renderPredictedSection(
-    approvals: PreviewRow[],
-    informational: PreviewRow[],
-    workers: PreviewRow[],
-    closers: PreviewRow[],
-  ): string[] {
-    const out: string[] = [];
+  const { approvals, informational, workers, closers } = input.predicted;
+  if (
+    approvals.length !== 0 ||
+    informational.length !== 0 ||
+    workers.length !== 0 ||
+    closers.length !== 0
+  ) {
     out.push("--- predicted ---");
     const predictedRows = [
       ...approvals,
@@ -2277,10 +543,6 @@ export async function main(argv: string[]): Promise<void> {
       ...workers,
       ...closers,
     ];
-    // Dir column width so `verb::id` aligns across all predicted rows:
-    // `(<dir>) ` is `dir.length + 3` chars; widen to the max so e.g.
-    // `(keeper) ` gets a trailing space to match `(arthack) `. Zero when
-    // no row has a dir.
     const maxDirLen = predictedRows.reduce(
       (m, r) => Math.max(m, r.dir.length),
       0,
@@ -2290,808 +552,333 @@ export async function main(argv: string[]): Promise<void> {
       const dirSegRaw = r.dir === "" ? "" : `(${r.dir}) `;
       const dirSeg = dirSegRaw.padEnd(dirColWidth);
       out.push(`${dirSeg}${r.verb}::${r.id}`);
-      // `v` toggle: every dispatch-backed preview row (work/close/approve)
-      // gets its would-run command on one indented line for copy-paste.
-      // The informational `git-dirty` row has no dispatch behind it, so
-      // it's never annotated.
-      if (showCommands && r.verb !== "git-dirty") {
-        out.push(`  ${buildWorkerCommand(r.verb, r.id, r.dirFull, r.tier)}`);
-      }
     }
-    return out;
   }
 
-  // --- sidecar paths ---
-
-  // Internal scratch path for the previous frame text — fed to `diff -u`.
-  const prevFrameTmp = `/tmp/keeper-autopilot.${process.pid}.prev.frame.txt`;
-  // Session-level meta file: one tab-separated line per frame.
-  const metaSidecar = `/tmp/keeper-autopilot.${process.pid}.meta.txt`;
-  // The alt-screen owns stdout; lifecycle events and warn lines append here.
-  const lifecycleSidecar = `/tmp/keeper-autopilot.${process.pid}.lifecycle.txt`;
-  const noteLine = (s: string): void => {
-    try {
-      appendFileSync(lifecycleSidecar, `${s}\n`);
-    } catch {
-      // best-effort
+  if (input.failed.length > 0) {
+    out.push("--- failed ---");
+    for (const r of input.failed) {
+      const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
+      out.push(`${dirSeg}${r.verb}::${r.id} — ${r.reason}`);
     }
+  }
+
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Control RPC round-trip — one-shot client, mirrors scripts/approve.ts.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a well-formed RPC client frame for `set_autopilot_paused`. Pure —
+ * exported so tests can assert the wire shape.
+ */
+export function buildSetPausedFrame(id: string, paused: boolean): ClientFrame {
+  return {
+    type: "rpc",
+    id,
+    method: "set_autopilot_paused",
+    params: { paused },
   };
+}
 
-  // fn-650: resolve the autopilot terminal-surface backend ONCE per run
-  // from the keeper config (defaults to `zellij`, see `resolveConfig`
-  // in `src/db.ts`). All `launchWindow` + `closeWindow` calls route
-  // through `backend.launch` / `backend.close`; the orchestration
-  // (suppression / settling / dispatch-log persistence / dry-run gate)
-  // stays in `launchWindow` below, so the backend swap is purely the
-  // spawn/parse-id core.
-  const cfg = resolveConfig();
-  const backend: ExecBackend = resolveExecBackend({
-    noteLine,
-    session: cfg.zellijSession,
-  });
+/**
+ * Build a well-formed RPC client frame for `retry_dispatch`. Pure —
+ * exported so tests can assert the wire shape.
+ */
+export function buildRetryFrame(id: string, dispatchKey: string): ClientFrame {
+  return {
+    type: "rpc",
+    id,
+    method: "retry_dispatch",
+    params: { id: dispatchKey },
+  };
+}
 
-  // In-memory copy of the last emitted frame text (for the diff).
-  let lastFrameText: string | null = null;
+/**
+ * One round-trip on a fresh UDS connection — copy of the proven shape
+ * from `scripts/approve.ts:roundTrip`. Opens, writes the frame, awaits
+ * the server frame whose `id === matchId`, closes. Resolves with the
+ * matching frame; rejects on connect-fail, transport error, malformed
+ * frame, server close before reply, or `RESPONSE_TIMEOUT_MS` elapsing
+ * post-connect.
+ */
+async function roundTrip(
+  sockPath: string,
+  send: ClientFrame,
+  matchId: string,
+): Promise<ServerFrame> {
+  return new Promise<ServerFrame>((resolve, reject) => {
+    const buffer = new LineBuffer();
+    let settled = false;
+    let sock: Awaited<ReturnType<typeof Bun.connect>> | null = null;
 
-  function writeSidecars(frameText: string): void {
-    const sState = `/tmp/keeper-autopilot.${process.pid}.state.${frameCount}.json`;
-    const sFrame = `/tmp/keeper-autopilot.${process.pid}.frame.${frameCount}.txt`;
-    const sDiff = `/tmp/keeper-autopilot.${process.pid}.diff.${frameCount}.txt`;
-
-    const stateJson = { dispatches: dispatchLog };
-    try {
-      writeFileSync(sState, `${JSON.stringify(stateJson, null, 2)}\n`);
-      writeFileSync(sFrame, `${frameText}\n`);
-    } catch (err) {
-      noteLine(`# warn: sidecar write failed: ${(err as Error).message}`);
-    }
-
-    // Per-frame unified diff against the previous emit.
-    let diffText: string;
-    if (lastFrameText == null) {
-      diffText = "# first frame — no previous to diff against\n";
-    } else {
+    const settle = (err: Error | null, frame: ServerFrame | null): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
       try {
-        writeFileSync(prevFrameTmp, `${lastFrameText}\n`);
-        const proc = Bun.spawnSync({
-          cmd: ["diff", "-u", prevFrameTmp, sFrame],
-        });
-        diffText = proc.stdout.toString();
-        if (diffText.length === 0) {
-          diffText = "# diff: no textual difference\n";
-        }
-      } catch (err) {
-        diffText = `# diff failed: ${(err as Error).message}\n`;
+        sock?.end();
+      } catch {
+        // best-effort
       }
-    }
-    try {
-      writeFileSync(sDiff, diffText);
-    } catch (err) {
-      noteLine(`# warn: diff sidecar write failed: ${(err as Error).message}`);
-    }
-    try {
-      appendFileSync(
-        metaSidecar,
-        `${frameCount}\t${sState}\t${sFrame}\t${sDiff}\n`,
+      if (err) {
+        reject(err);
+      } else if (frame) {
+        resolve(frame);
+      } else {
+        reject(new Error("internal: settle called with neither err nor frame"));
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      settle(
+        new Error(
+          `no response from daemon within ${RESPONSE_TIMEOUT_MS}ms (id ${matchId})`,
+        ),
+        null,
       );
-    } catch (err) {
-      noteLine(`# warn: meta write failed: ${(err as Error).message}`);
-    }
-    lastFrameText = frameText;
-  }
+    }, RESPONSE_TIMEOUT_MS);
+    timeout.unref?.();
 
-  function emitFrame(): void {
-    const bodyLines = renderDispatchFrame();
-    const body = bodyLines.join("\n");
-    if (body === lastBody) {
-      return;
-    }
-    lastBody = body;
-    frameCount += 1;
-    const frameText = ["---", ...bodyLines].join("\n");
-    liveShell.pushFrame(bodyLines);
-    writeSidecars(frameText);
-  }
-
-  function emitLifecycle(
-    event: string,
-    detail: Record<string, unknown> = {},
-  ): void {
-    const lines: string[] = ["...", `event: ${event}`];
-    for (const [k, v] of Object.entries(detail)) {
-      lines.push(`${k}: ${String(v)}`);
-    }
-    lines.push("...");
-    try {
-      appendFileSync(lifecycleSidecar, `${lines.join("\n")}\n`);
-    } catch {
-      // best-effort
-    }
-    // On disconnect, clear `lastBody` so the next first-paint emits even
-    // if the post-reconnect snapshot happens to match the last pre-
-    // disconnect body byte-for-byte.
-    if (event === "disconnected") {
-      lastBody = null;
-    }
-  }
-
-  // --- --launch dispatch ---
-  //
-  // Per-row verdict signature carried across snapshots. We fire side
-  // effects (Ghostty window for "→ ready" running the worker/closer verb,
-  // Ghostty window for "→ approval pending" running the approve verb) on
-  // the EDGE — `prev !== cur` with `cur` being one of those two
-  // signatures. The map is INTENTIONALLY not cleared on disconnect: a
-  // reconnect's first paint will see the same signatures as the last
-  // pre-disconnect frame and produce no spurious fires. The empty
-  // initial map means autopilot's first paint DOES fire for everything
-  // currently ready / pending — that is desired: "start autopilot,
-  // things you need to do open up."
-  const lastVerdictSig = new Map<string, string>();
-
-  function verdictSignature(v: Verdict | undefined): string {
-    if (v === undefined) {
-      return "unknown";
-    }
-    if (v.tag === "ready") {
-      return "ready";
-    }
-    if (v.tag === "completed") {
-      return "completed";
-    }
-    if (v.tag === "running") {
-      return `running:${v.reason.kind}`;
-    }
-    return `blocked:${v.reason.kind}`;
-  }
-
-  function logDispatch(entry: DispatchEntry): void {
-    const stamped: DispatchEntry = { ...entry, pid: process.pid };
-    dispatchLog.push(stamped);
-    dispatchedKeys.add(`${stamped.verb}::${stamped.id}`);
-    try {
-      appendFileSync(dispatchLogPath, `${JSON.stringify(stamped)}\n`);
-    } catch (err) {
-      noteLine(`# warn: dispatch log write failed: ${(err as Error).message}`);
-    }
-    emitFrame();
-  }
-
-  /**
-   * Dispatch a terminal-surface launch via the resolved `ExecBackend`.
-   * Orchestration is unchanged from the pre-fn-650 `launchInGhostty`:
-   * suppression guard → log entry → dry-run gate → settling slot →
-   * spawn → window-id stamp + persistent `kind:"window"` log row. The
-   * backend (`src/exec-backend.ts`) owns the spawn/parse-id core; the
-   * Ghostty osascript path, the zellij `action new-tab` path, and the
-   * follow-on yabai move (Ghostty only) live behind `backend.launch`.
-   */
-  function launchWindow(
-    workerShellCommand: string,
-    rowId: string,
-    dir: string,
-    dirFull: string,
-    verb: "work" | "close" | "approve",
-    id: string,
-    snap: ReadinessClientSnapshot | null,
-  ): void {
-    // Re-dispatch guard (fn-638.3). Three suppression rules, evaluated
-    // in `shouldSuppressDispatch` (pure, exported for testing):
-    //
-    //   - `launch-suppressed`: once-for-life launch guard for `work` /
-    //     `close`. Double-spawning a worker or closer can corrupt git
-    //     history, so once-dispatched stays once-dispatched across
-    //     this run AND across restarts (seeded from `dispatch.log` on
-    //     startup via `hydrateDispatchLog`).
-    //   - `fulfilled-suppressed`: approve-only fulfillment guard. An
-    //     approve verb has no side effect until the human runs
-    //     `/plan:approve` — so a dismissed approve window (launch line
-    //     written, never fulfilled) must re-dispatch on the next
-    //     `job-pending` edge to self-heal. Keying on launch would
-    //     deadlock everything queued behind the dismissed approve.
-    //   - `live-in-root`: pre-spawn live-session-in-root gate. Refuse
-    //     when a sibling row in the same effective root already has a
-    //     `running`-tag verdict OR a launched-but-unfulfilled dispatch
-    //     on the same root. Self is excluded. Fail-closed on a
-    //     partial/empty snapshot.
-    //
-    // `lastVerdictSig` still handles same-signature edges in-memory at
-    // the call site; these guards are the persistent backstop.
-    const key = `${verb}::${id}`;
-    const suppression = shouldSuppressDispatch(
-      verb,
-      id,
-      dirFull,
-      snap,
-      dispatchedKeys,
-      fulfilledKeys,
-      dispatchLog,
-    );
-    if (suppression !== null) {
-      noteLine(
-        `${new Date().toISOString()} re-dispatch suppressed (${suppression}) pid=${process.pid} ${key} dir=${dirFull} (rowId=${rowId})`,
-      );
-      return;
-    }
-    // `-l -i` = login + interactive — login alone sources `.zprofile` only,
-    // so `claude` (and most user PATH additions) live in the interactive
-    // rc file (`.zshrc` / `.bashrc`) which is interactive-only. Without
-    // `-i` the spawned shell can't find `claude`. zsh's `exec_opt` is OFF
-    // under `-i` (verified live), so `exec <shell>` re-spawns rather than
-    // replacing — claude stays a CHILD of a live login+interactive shell,
-    // and on claude's exit the shell drops into an interactive prompt the
-    // human can use (vim fallback for the rare case auto-close fails to
-    // fire). Applies to any POSIX-ish login+interactive shell, not just
-    // zsh.
-    const shell = validateShell(process.env.SHELL) ?? "/bin/zsh";
-    // Wrap the worker command so claude is a child of $SHELL and a fresh
-    // interactive shell takes over on claude's exit. The body string is
-    // the worker command followed by `; exec ${shell} -l -i` so a dropped
-    // session leaves a usable login+interactive shell rather than a dead
-    // window. The argv shape `[shell, "-l", "-i", "-c", body]` is the
-    // safe quoting seam at the OS argv boundary — zellij forwards it
-    // verbatim after `--`, and the Ghostty backend re-joins it into the
-    // AppleScript `command of cfg` body.
-    const body = `${workerShellCommand} ; exec ${shell} -l -i`;
-    const argv = [shell, "-l", "-i", "-c", body];
-    // Dry-run: log the would-have-dispatched row and stop — no surface
-    // probe, no settling slot, no real spawn.
-    if (dryRun) {
-      logDispatch({
-        ts: new Date().toISOString(),
-        kind: "launch",
-        rowId,
-        dir,
-        dirFull,
-        verb,
-        id,
-        command: workerShellCommand,
-        dry: true,
-      });
-      return;
-    }
-    // Startup-stagger gate (fn-644). A real-launch path always holds the
-    // single settling slot from here until the row is observed
-    // `running`-tag in `releaseSettledKeys` (or swept by
-    // `sweepSettleTimeouts` as a fail-open). Take it SYNCHRONOUSLY,
-    // before the async surface probe below, so a concurrent same-tick
-    // edge can't double-fill it; rolled back via `settling.delete(key)`
-    // if the surface-live gate suppresses.
-    settling.set(key, Date.now());
-    void (async () => {
-      // Name-exact live-surface gate (fn-652 hotfix). UNLIKE the
-      // root-scoped, self-excluding `isLiveSessionInRoot`, this asks the
-      // backend whether a surface named EXACTLY `verb::id` is already live
-      // — INCLUDING this row's own surface — so a worker that survived an
-      // autopilot restart (re-parented onto the long-lived zellij server)
-      // blocks its own re-dispatch even when `dispatch.log` was born fresh
-      // and `dispatchedKeys` is empty (the exact fn-652 double-spawn). The
-      // backend fail-closes (an indeterminate probe reports live), so a
-      // query error suppresses rather than risking a duplicate worker; the
-      // caller re-fires on the next verdict edge.
-      if (await backend.isSurfaceLive(key)) {
-        settling.delete(key);
-        noteLine(
-          `${new Date().toISOString()} re-dispatch suppressed (surface-live) pid=${process.pid} ${key} dir=${dirFull} (rowId=${rowId})`,
-        );
-        return;
-      }
-      // No live surface — commit the dispatch (log row + frame emit + the
-      // `dispatchedKeys` add) only now, so a surface-suppressed dispatch
-      // never writes a misleading launch line.
-      logDispatch({
-        ts: new Date().toISOString(),
-        kind: "launch",
-        rowId,
-        dir,
-        dirFull,
-        verb,
-        id,
-        command: workerShellCommand,
-      });
-      // Surface label (zellij): the tab carries the full `verb::id`
-      // (mirrors the `claude --name`) so the tab bar identifies the
-      // task. It is also the close-time wrap-safety token.
-      try {
-        const windowId = await backend.launch(argv, rowId, dirFull, {
-          tabName: key,
-        });
-        if (windowId == null) {
-          return; // backend already surfaced the failure via noteLine
-        }
-        // Mutate the LIVE in-memory entry by reference (find by
-        // `${verb}::${id}`). The just-pushed entry is the last matching
-        // `(verb, id)` in `dispatchLog`; scan backward to grab it without
-        // iterating the full array. Stamp BOTH `windowId` (the just-
-        // returned pane id) and `tabName` (the wrap-safety token — the
-        // `verb::id` we passed as `opts.tabName`) so the same-run auto-
-        // close has the full pair for the surgical close path.
-        for (let i = dispatchLog.length - 1; i >= 0; i--) {
-          const e = dispatchLog[i];
-          if (e !== undefined && `${e.verb}::${e.id}` === key) {
-            e.windowId = windowId;
-            e.tabName = key;
-            break;
-          }
-        }
-        // Persist the (windowId, tabName) pair to disk as a `window`
-        // kind row via a raw `appendFileSync` — NOT `logDispatch`
-        // (which would re-push a display entry and re-add to
-        // `dispatchedKeys`). Both fields round-trip through
-        // `hydrateDispatchLog` so a cross-run auto-close still has the
-        // tabName token to gate `close-pane -p` on. Try/catch →
-        // noteLine on failure; the in-memory stamp still carries the
-        // same-run auto-close path forward.
-        try {
-          appendFileSync(
-            dispatchLogPath,
-            `${JSON.stringify({
-              kind: "window",
-              ts: new Date().toISOString(),
-              verb,
-              id,
-              windowId,
-              tabName: key,
-            })}\n`,
-          );
-        } catch (err) {
-          noteLine(
-            `# warn: window log write failed: ${(err as Error).message}`,
-          );
-        }
-      } catch (err) {
-        noteLine(
-          `# warn: launch spawn for ${rowId} failed: ${(err as Error).message}`,
-        );
-      }
-    })();
-  }
-
-  /**
-   * Walk every task + close row in the snapshot and fire side effects on
-   * EDGES into "ready" (Ghostty: worker/closer verb) or
-   * "blocked:job-pending" (Ghostty: approve verb). `lastVerdictSig` is
-   * updated unconditionally so transitions out of those states (back to
-   * running, etc.) are recorded for the next edge.
-   *
-   * Worker commands MIRROR `renderEpicCommands` but DROP the approval
-   * line — the approve verb is now its own dispatch path on the
-   * job-pending edge.
-   */
-  // Silent instrumentation: every verdict-signature edge is appended to the
-  // lifecycle sidecar so future post-mortems can reconstruct the prev → cur
-  // sequence. Compact one-liner shape (sortable, greppable):
-  //   <iso-ts> transition pid=<pid> <key> <prev> → <cur> | <detail>
-  // <detail> carries the row-state fields that drive predicates 5/6/7:
-  // approval, worker_phase (task) / status (close), jobs.length, and the
-  // count of running sub-agents for the row's worker jobs.
-  function logTransition(
-    key: string,
-    prev: string | undefined,
-    cur: string,
-    detail: string,
-  ): void {
-    noteLine(
-      `${new Date().toISOString()} transition pid=${process.pid} ${key} ${prev ?? "∅"} → ${cur} | ${detail}`,
-    );
-  }
-
-  function taskDetail(
-    task: ReadinessClientSnapshot["epics"][number]["tasks"][number],
-    snap: ReadinessClientSnapshot,
-  ): string {
-    const subRunByJob = new Map<string, number>();
-    for (const inv of snap.subagentInvocations) {
-      if (inv.status === "running") {
-        subRunByJob.set(inv.job_id, (subRunByJob.get(inv.job_id) ?? 0) + 1);
-      }
-    }
-    const jobs = Array.isArray(task.jobs) ? task.jobs : [];
-    let subRun = 0;
-    for (const j of jobs) {
-      subRun += subRunByJob.get(seg(j.job_id)) ?? 0;
-    }
-    const jobStates = jobs.map((j) => seg(j.state)).join(",");
-    return `approval=${seg(task.approval)} worker_phase=${seg(task.worker_phase)} jobs=${jobs.length}[${jobStates}] sub_running=${subRun}`;
-  }
-
-  function closeDetail(epic: Epic, snap: ReadinessClientSnapshot): string {
-    const subRunByJob = new Map<string, number>();
-    for (const inv of snap.subagentInvocations) {
-      if (inv.status === "running") {
-        subRunByJob.set(inv.job_id, (subRunByJob.get(inv.job_id) ?? 0) + 1);
-      }
-    }
-    const jobs = Array.isArray(epic.jobs) ? epic.jobs : [];
-    let subRun = 0;
-    for (const j of jobs) {
-      subRun += subRunByJob.get(seg(j.job_id)) ?? 0;
-    }
-    const jobStates = jobs.map((j) => seg(j.state)).join(",");
-    return `approval=${seg(epic.approval)} status=${seg(epic.status)} jobs=${jobs.length}[${jobStates}] sub_running=${subRun}`;
-  }
-
-  // Bridge from the exported `tryLaunch` gate primitive to the real
-  // `launchWindow` side effect (which routes through the resolved
-  // `ExecBackend`). The `launch` callback signature is shared with the
-  // gate-tests' recording stub, so production and test paths exercise
-  // the same gate logic.
-  function fireLaunch(p: PendingLaunch): void {
-    launchWindow(p.command, p.rowId, p.dir, p.dirFull, p.verb, p.id, lastSnap);
-  }
-
-  function gateAndDispatch(p: PendingLaunch): void {
-    tryLaunch(
-      p,
-      settling,
-      pendingLaunches,
-      dryRun,
-      fireLaunch,
-      noteLine,
-      process.pid,
-    );
-  }
-
-  function processLaunchTransitions(snap: ReadinessClientSnapshot): void {
-    // While paused (wet mode only), skip the entire transition walk —
-    // including the `lastVerdictSig` update. The map stays frozen at its
-    // pre-pause shape, so on the unpause edge the next snapshot (or the
-    // eager call from the 'p' key handler) sees the same prev → cur edge
-    // and fires anything currently ready/pending. Already-dispatched rows
-    // are still protected by the durable `dispatchedKeys` re-dispatch
-    // guard. Dry-run bypasses the gate so pause has no observable effect.
-    if (paused && !dryRun) {
-      return;
-    }
-    for (const epic of snap.epics) {
-      const projectDir = seg(epic.project_dir);
-      const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
-      // Within a single epic, defer the side-effecting dispatches into
-      // two buckets so approves fire ahead of any work/close dispatches.
-      // Edge detection (prev→cur diff, logTransition, lastVerdictSig.set)
-      // stays in the existing one-pass walk so every transition is still
-      // recorded exactly once. Matches the predicted-section ordering in
-      // `predictNextDispatches` (approvals → informational → workers →
-      // closers); an approve still requires `cur === "blocked:job-pending"`
-      // for that row, no trigger conditions are relaxed.
-      const approveDispatches: Array<() => void> = [];
-      const workCloseDispatches: Array<() => void> = [];
-
-      for (const task of tasks) {
-        const taskId = seg(task.task_id);
-        if (taskId === "") {
-          continue;
-        }
-        const key = `task:${taskId}`;
-        const cur = verdictSignature(snap.readiness.perTask.get(taskId));
-        const prev = lastVerdictSig.get(key);
-        if (prev === cur) {
-          continue;
-        }
-        logTransition(key, prev, cur, taskDetail(task, snap));
-        lastVerdictSig.set(key, cur);
-        const dir =
-          task.target_repo != null && seg(task.target_repo) !== ""
-            ? seg(task.target_repo)
-            : projectDir;
-        const dirBase = dir === "" ? "" : basename(dir);
-        if (cur === "ready") {
-          workCloseDispatches.push(() =>
-            gateAndDispatch({
-              verb: "work",
-              id: taskId,
-              dir: dirBase,
-              dirFull: dir,
-              command: buildWorkerCommand("work", taskId, dir, task.tier),
-              rowId: `task ${taskId}`,
-              tier: task.tier,
-            }),
-          );
-        } else if (cur === "blocked:job-pending") {
-          approveDispatches.push(() =>
-            gateAndDispatch({
-              verb: "approve",
-              id: taskId,
-              dir: dirBase,
-              dirFull: dir,
-              command: buildWorkerCommand("approve", taskId, dir),
-              rowId: `approve task ${taskId}`,
-              tier: null,
-            }),
-          );
-        } else {
-          // Verdict moved off ready / job-pending — drop any pending
-          // dispatch for this task. Re-edge into ready/job-pending will
-          // re-queue it via the branches above; we never replay edges.
-          pendingLaunches.delete(`work::${taskId}`);
-          pendingLaunches.delete(`approve::${taskId}`);
-        }
-      }
-
-      const epicId = seg(epic.epic_id);
-      if (epicId !== "") {
-        const closeKey = `close:${epicId}`;
-        const closeCur = verdictSignature(
-          snap.readiness.perCloseRow.get(epicId),
-        );
-        const closePrev = lastVerdictSig.get(closeKey);
-        if (closePrev !== closeCur) {
-          logTransition(closeKey, closePrev, closeCur, closeDetail(epic, snap));
-          lastVerdictSig.set(closeKey, closeCur);
-          const dirBase = projectDir === "" ? "" : basename(projectDir);
-          if (closeCur === "ready") {
-            workCloseDispatches.push(() =>
-              gateAndDispatch({
-                verb: "close",
-                id: epicId,
-                dir: dirBase,
-                dirFull: projectDir,
-                command: buildWorkerCommand("close", epicId, projectDir),
-                rowId: `close ${epicId}`,
-                tier: null,
-              }),
+    Bun.connect({
+      unix: sockPath,
+      socket: {
+        open(s) {
+          sock = s;
+          s.write(encodeFrame(send));
+        },
+        data(_s, chunk) {
+          let lines: string[];
+          try {
+            lines = buffer.push(chunk.toString("utf8"));
+          } catch (err) {
+            settle(
+              new Error(`protocol error: ${(err as Error).message}`),
+              null,
             );
-          } else if (closeCur === "blocked:job-pending") {
-            approveDispatches.push(() =>
-              gateAndDispatch({
-                verb: "approve",
-                id: epicId,
-                dir: dirBase,
-                dirFull: projectDir,
-                command: buildWorkerCommand("approve", epicId, projectDir),
-                rowId: `approve close ${epicId}`,
-                tier: null,
-              }),
-            );
-          } else {
-            // Close row left ready / job-pending — drop any pending
-            // dispatch for this epic-id surface.
-            pendingLaunches.delete(`close::${epicId}`);
-            pendingLaunches.delete(`approve::${epicId}`);
+            return;
           }
-        }
-      }
-
-      for (const fire of approveDispatches) {
-        fire();
-      }
-      for (const fire of workCloseDispatches) {
-        fire();
-      }
-    }
-  }
-
-  const detectJobTransitionsDeps: DetectJobTransitionsDeps = {
-    dispatchLog,
-    fulfilledKeys,
-    completedKeys,
-    dispatchLogPath,
-    noteLine,
-    pid: process.pid,
-    appendLine: (line: string): void => {
-      appendFileSync(dispatchLogPath, line);
-    },
-    closeWindow: (
-      windowId: string | undefined,
-      tabName: string | undefined,
-    ): void => {
-      // No-op on undefined windowId (no pane id captured at launch —
-      // the shell-fallback covers the surface; it just won't auto-
-      // close) and under `--dry-run` (the spawn itself was
-      // suppressed, so there's no surface to close). Under dry-run we
-      // still `noteLine` the intended close so the lifecycle sidecar
-      // shows the would-have-fired path.
-      if (windowId === undefined || windowId === "") {
-        return;
-      }
-      // Auto-close kill switch (config `autoclose_windows: false`). When
-      // disabled the finished dispatch's terminal surface is LEFT OPEN —
-      // the human is troubleshooting and doesn't want windows vanishing
-      // the moment a worker goes idle/done. The completed-edge bookkeeping
-      // in `detectJobTransitions` still fires (the row migrates to
-      // `--- completed ---`); only the reap is suppressed. Note the
-      // would-have-closed id so the lifecycle sidecar shows the skip.
-      if (!cfg.autocloseWindows) {
-        noteLine(
-          `# closeWindow (autoclose disabled) windowId=${windowId} tabName=${tabName ?? "∅"} — leaving surface open`,
-        );
-        return;
-      }
-      if (dryRun) {
-        noteLine(
-          `# closeWindow (dry) windowId=${windowId} tabName=${tabName ?? "∅"} — would close terminal pane`,
-        );
-        return;
-      }
-      // Route to the resolved backend (`src/exec-backend.ts`). The
-      // backend's `close` is fire-and-forget and never throws back.
-      // It now takes BOTH the pane id and the launch-time tab name
-      // (the wrap-safety token, fn-654.2): the backend probes
-      // `query-tab-names` for the tab name and only fires
-      // `close-pane -p windowId` when it's live. A server-restart-
-      // induced pane-id wrap (the old `terminal_N` now belongs to a
-      // different live pane) leaves no tab with the launch-time name,
-      // so the probe returns false and the close is skipped — never
-      // reaps the wrong live pane. A missing tabName (pre-fn-654.2
-      // dispatch.log rows) also skips, same fail-safe direction.
-      backend.close(windowId, tabName);
-    },
-  };
-
-  let firstPaintLogged = false;
-  const onSnapshot = (snap: ReadinessClientSnapshot): void => {
-    lastSnap = snap;
-    // fn-635: drain readiness diagnostics first. Verdict-edge handling
-    // (`processLaunchTransitions`, `detectJobTransitions`) is unchanged;
-    // the drain is a pure observation step that records the resolver's
-    // ambiguity findings to a shared JSONL log siblings the dispatch
-    // log. Same single-O_APPEND-line-under-PIPE_BUF atomicity contract
-    // as the dispatch log.
-    for (const d of snap.readiness.diagnostics) {
-      appendDiagnostic(d, diagnosticsLogPath);
-    }
-    detectJobTransitions(detectJobTransitionsDeps, snap);
-    // Startup-stagger gate maintenance (fn-644). Order matters:
-    //   1. `releaseSettledKeys` frees the slot for any settling key
-    //      whose row is now `running` (or whose key migrated to
-    //      `completedKeys` via the disappearance branch above).
-    //   2. `sweepSettleTimeouts` fail-opens any settling key older
-    //      than SETTLE_TIMEOUT_SEC so a dead startup cannot wedge
-    //      the ramp.
-    //   3. `drainPendingLaunches` re-validates and fires pending
-    //      launches one at a time as the slot frees — also the
-    //      duplicate-race fix.
-    // Dry-run skips drain entirely (the gate is inert) but still
-    // runs release/sweep so any maps populated from a wet-tick
-    // crash don't sit forever.
-    releaseSettledKeys(settling, snap, completedKeys, noteLine, process.pid);
-    sweepSettleTimeouts(settling, Date.now(), noteLine, process.pid);
-    if (!dryRun) {
-      drainPendingLaunches(
-        snap,
-        settling,
-        pendingLaunches,
-        dispatchedKeys,
-        fulfilledKeys,
-        dispatchLog,
-        fireLaunch,
-        noteLine,
-        process.pid,
-      );
-    }
-    if (!firstPaintLogged) {
-      firstPaintLogged = true;
-      const ready: string[] = [];
-      const pending: string[] = [];
-      for (const epic of snap.epics) {
-        for (const task of Array.isArray(epic.tasks) ? epic.tasks : []) {
-          const sig = verdictSignature(
-            snap.readiness.perTask.get(seg(task.task_id)),
+          for (const line of lines) {
+            if (line.trim().length === 0) {
+              continue;
+            }
+            let frame: ServerFrame;
+            try {
+              frame = JSON.parse(line) as ServerFrame;
+            } catch (err) {
+              settle(
+                new Error(`malformed server frame: ${(err as Error).message}`),
+                null,
+              );
+              return;
+            }
+            if ((frame as { id?: string }).id !== matchId) {
+              continue;
+            }
+            settle(null, frame);
+            return;
+          }
+        },
+        close() {
+          settle(
+            new Error(
+              `daemon closed connection before responding (id ${matchId})`,
+            ),
+            null,
           );
-          if (sig === "ready") ready.push(`task:${seg(task.task_id)}`);
-          else if (sig === "blocked:job-pending")
-            pending.push(`task:${seg(task.task_id)}`);
-        }
-        const cSig = verdictSignature(
-          snap.readiness.perCloseRow.get(seg(epic.epic_id)),
-        );
-        if (cSig === "ready") ready.push(`close:${seg(epic.epic_id)}`);
-        else if (cSig === "blocked:job-pending")
-          pending.push(`close:${seg(epic.epic_id)}`);
-      }
-      noteLine(
-        `${new Date().toISOString()} first-paint pid=${process.pid} epics=${snap.epics.length} ready=[${ready.join(",")}] pending=[${pending.join(",")}]`,
+        },
+        error(_s, err) {
+          settle(new Error(`socket error: ${err.message}`), null);
+        },
+      },
+    }).catch((err: Error) => {
+      settle(
+        new Error(`failed to connect to ${sockPath}: ${err.message}`),
+        null,
       );
-    }
-    processLaunchTransitions(snap);
-    emitFrame();
-  };
-
-  // Space toggles `paused`. On the unpause edge in wet mode we eagerly
-  // re-run `processLaunchTransitions` against the cached snapshot so the
-  // human doesn't have to wait for keeperd's next push to see things
-  // fire. In dry-run the flag toggles but nothing else moves and the
-  // banner indicator stays hidden, so the keypress is invisible. The
-  // banner indicator is updated via `liveShell.setStatus` — live-only
-  // chrome that repaints just row 0 and never grows the frame history.
-  // Constructed AFTER the functions it closes over are defined so the
-  // closure captures live references.
-  const statusLine = (): string => {
-    const parts: string[] = [];
-    if (!dryRun) {
-      parts.push(paused ? "[paused]" : "[playing]");
-    }
-    if (showCommands) {
-      parts.push("[cmd]");
-    }
-    return parts.join(" ");
-  };
-  // `c` flashes a debug snapshot to the clipboard. Status is briefly
-  // overridden with `[copied frame N]` / `[copy failed]`, then restored
-  // to the pause indicator (NOT cleared to "") so the human doesn't
-  // lose track of `[paused]` / `[playing]` after pressing c.
-  let copyStatusTimer: ReturnType<typeof setTimeout> | undefined;
-  const liveShell = createLiveShell({
-    enabled: true,
-    title: "autopilot",
-    onUnhandledKey: (key) => {
-      if (key === " " && !dryRun) {
-        paused = !paused;
-        liveShell.setStatus(statusLine());
-        if (!paused && lastSnap !== null) {
-          processLaunchTransitions(lastSnap);
-        }
-        return;
-      }
-      if (key === "v") {
-        // Toggle command display. Repaint the live body via `refreshLive`
-        // so the per-row command lines appear/disappear without pushing a
-        // frame to history (a pure view toggle, like the pause indicator),
-        // and reflect the state in the banner with a `[cmd]` marker.
-        showCommands = !showCommands;
-        liveShell.setStatus(statusLine());
-        liveShell.refreshLive(renderDispatchFrame());
-        return;
-      }
-      if (key === "c") {
-        if (lastFrameText == null) {
-          return;
-        }
-        const payload = buildDebugSnapshot({
-          script: "autopilot",
-          pid: process.pid,
-          frame: lastFrameText,
-          frameNumber: frameCount,
-          metaSidecar,
-          lifecycleSidecar,
-          nowIso: new Date().toISOString(),
-        });
-        const flashed = frameCount;
-        void copyToClipboard(payload).then((res) => {
-          if (res.ok) {
-            liveShell.setStatus(`[copied frame ${flashed}]`);
-          } else {
-            noteLine(`# warn: clipboard copy failed: ${res.error}`);
-            liveShell.setStatus("[copy failed]");
-          }
-          if (copyStatusTimer !== undefined) {
-            clearTimeout(copyStatusTimer);
-          }
-          // Restore the status indicator (not "") so the [paused] /
-          // [playing] / [cmd] state survives the copy flash.
-          copyStatusTimer = setTimeout(
-            () => liveShell.setStatus(statusLine()),
-            1500,
-          );
-        });
-      }
-    },
-  });
-  // Seed the banner indicator so the user sees `[paused]` from the very
-  // first paint, before keeperd's first snapshot lands. setStatus does a
-  // banner-only repaint with no body content, which is exactly what we
-  // want here.
-  liveShell.setStatus(statusLine());
-
-  const handle = subscribeReadiness({
-    sockPath,
-    idPrefix: "autopilot",
-    onSnapshot,
-    onLifecycle: emitLifecycle,
-  });
-
-  process.on("SIGINT", () => {
-    liveShell.dispose();
-    handle.dispose();
-    process.stdout.write("...\n");
-    process.stdout.write(`meta: ${metaSidecar}\n`);
-    process.stdout.write(`lifecycle: ${lifecycleSidecar}\n`);
-    process.stdout.write("...\n");
-    process.exit(0);
+    });
   });
 }
 
-// `import.meta.main` guard neutralized — `cli/keeper.ts` is the
-// canonical entry. Direct invocation via `bun cli/autopilot.ts` would
-// bypass the dispatcher's arg-pruning; if you really need it, run
-// `bun cli/keeper.ts autopilot <args>` instead.
+function die(message: string): never {
+  process.stderr.write(`autopilot: ${message}\n`);
+  process.exit(1);
+}
+
+/**
+ * Send one control RPC and exit. On `rpc_result` writes the value as one
+ * JSON line to stdout and exits 0; on `error` / connect-fail / timeout
+ * surfaces the reason via `die` (exit 1).
+ */
+async function sendControlRpc(
+  sockPath: string,
+  frame: ClientFrame,
+  matchId: string,
+): Promise<void> {
+  let response: ServerFrame;
+  try {
+    response = await roundTrip(sockPath, frame, matchId);
+  } catch (err) {
+    die((err as Error).message);
+  }
+  if (response.type === "rpc_result") {
+    process.stdout.write(`${JSON.stringify(response.value)}\n`);
+    process.exit(0);
+  }
+  if (response.type === "error") {
+    die(`server error ${response.code}: ${response.message}`);
+  }
+  die(`unexpected frame type: ${response.type}`);
+}
+
+// ---------------------------------------------------------------------------
+// Viewer entry point.
+// ---------------------------------------------------------------------------
+
+interface ViewerState {
+  snap: ReadinessClientSnapshot | null;
+  failed: FailedRow[];
+  paused: boolean;
+}
+
+async function runViewer(sockPath: string): Promise<void> {
+  const state: ViewerState = {
+    snap: null,
+    failed: [],
+    // Boot-time invariant — the daemon also boots paused. The banner
+    // flips on the first successful pause/play RPC round-trip.
+    paused: true,
+  };
+
+  const view = createViewShell<ViewerState>({
+    script: "autopilot",
+    title: "autopilot",
+    persistentBannerPill: () => (state.paused ? "[paused]" : "[playing]"),
+    renderBody: (snap) => {
+      // The view-shell's TSnap is our own `ViewerState`; we ignore the
+      // arg (`snap === state` because we pass it through `view.emit`)
+      // and pull from the live `state` reference so a `failed` update
+      // that arrives between snapshots can still trigger a body change.
+      const current = snap.snap === null ? [] : buildCurrentRows(snap.snap);
+      const predicted =
+        snap.snap === null
+          ? { approvals: [], informational: [], workers: [], closers: [] }
+          : predictNextDispatches(snap.snap);
+      return {
+        bodyLines: renderBody({
+          current,
+          predicted,
+          failed: snap.failed,
+          paused: snap.paused,
+        }),
+        stateJson: {
+          paused: snap.paused,
+          current,
+          predicted,
+          failed: snap.failed,
+        },
+      };
+    },
+  });
+
+  // Seed the banner immediately so the human sees `[paused]` before the
+  // first snapshot lands — same shape as board's persistent-pill restore
+  // pattern.
+  view.liveShell.setStatus(state.paused ? "[paused]" : "[playing]");
+
+  const readinessHandle = subscribeReadiness({
+    sockPath,
+    idPrefix: "autopilot",
+    onSnapshot: (snap) => {
+      state.snap = snap;
+      view.emit(state);
+    },
+    onLifecycle: view.emitLifecycle,
+  });
+
+  const failuresHandle = subscribeCollection({
+    sockPath,
+    idPrefix: "autopilot",
+    collection: "dispatch_failures",
+    onRows: (rows) => {
+      state.failed = projectFailedRows(rows);
+      view.emit(state);
+    },
+    onLifecycle: view.emitLifecycle,
+  });
+
+  view.installSigintHandler(() => {
+    readinessHandle.dispose();
+    failuresHandle.dispose();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher entry — routes the (none) / pause / play / retry subcommands.
+// ---------------------------------------------------------------------------
+
+export async function main(argv: string[]): Promise<void> {
+  const parsed = parseArgs({
+    args: argv,
+    options: {
+      sock: { type: "string" },
+      help: { type: "boolean", default: false },
+    },
+    allowPositionals: true,
+  });
+
+  if (parsed.values.help) {
+    process.stdout.write(HELP);
+    process.exit(0);
+  }
+
+  const sockPath = parsed.values.sock ?? resolveSockPath();
+  const [subcommand, ...rest] = parsed.positionals;
+
+  if (subcommand === undefined) {
+    await runViewer(sockPath);
+    return;
+  }
+
+  if (subcommand === "pause" || subcommand === "play") {
+    if (rest.length > 0) {
+      die(
+        `'${subcommand}' takes no positional args (got ${rest.length}); pass --help for usage.`,
+      );
+    }
+    const id = crypto.randomUUID();
+    await sendControlRpc(
+      sockPath,
+      buildSetPausedFrame(id, subcommand === "pause"),
+      id,
+    );
+    return;
+  }
+
+  if (subcommand === "retry") {
+    if (rest.length !== 1) {
+      die(
+        `'retry' takes exactly one positional <verb::id> (got ${rest.length}); pass --help for usage.`,
+      );
+    }
+    const dispatchKey = rest[0];
+    if (dispatchKey === undefined || dispatchKey === "") {
+      die("'retry' requires a non-empty <verb::id> key");
+    }
+    const id = crypto.randomUUID();
+    await sendControlRpc(sockPath, buildRetryFrame(id, dispatchKey), id);
+    return;
+  }
+
+  die(
+    `unknown subcommand '${subcommand}' (expected pause | play | retry); pass --help for usage.`,
+  );
+}
+
+// `import.meta.main` guard neutralized — `cli/keeper.ts` is the canonical
+// entry. Direct `bun cli/autopilot.ts` invocation would bypass the
+// dispatcher's arg-pruning.
