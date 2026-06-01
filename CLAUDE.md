@@ -202,8 +202,13 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   transcript worker only (never the hook). The hook MAY scrape the parent claude
   process's `--name`/`-n` and read `CLAUDE_CONFIG_DIR` — but ONLY on
   `SessionStart`, ONLY single-level `process.ppid` (no PPID-walking), frozen into
-  that one event. FORBIDDEN: periodic/other-event scraping, multi-session lineage,
-  any other env read, and any env read inside a fold.
+  that one event. The hook ALSO reads `ZELLIJ` / `ZELLIJ_SESSION_NAME` /
+  `ZELLIJ_PANE_ID` (schema v48 / fn-668) on EVERY event as pure synchronous
+  `process.env` reads (no fork, no fs, no PPID-walk) and freezes the captured
+  coordinates onto the events row; the reducer's COALESCE fold lifts them onto
+  `jobs` from the row payload alone, NEVER re-reads env. FORBIDDEN: any OTHER
+  periodic/other-event scraping, multi-session lineage, any other env read, and
+  any env read inside a fold.
 - **Out of scope:** prise/env-var integration, multi-session lineage, harness_meta.
 
 ## Worker contract

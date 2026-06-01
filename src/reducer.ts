@@ -6107,6 +6107,58 @@ function projectJobsRow(db: Database, event: Event): void {
       break;
   }
 
+  // Backend-exec coordinates (fn-668 / schema v48): latest-non-NULL-
+  // wins COALESCE fold from `events.backend_exec_{type,session_id,
+  // pane_id}` onto `jobs.backend_exec_{type,session_id,pane_id}`.
+  // Fires on EVERY event_type (not SessionStart-gated like `config_dir`)
+  // — the hook stamps the three columns on every hook event as pure
+  // env reads (see `backendExecCoordsFromEnv` in
+  // `plugin/hooks/events-writer.ts`), so a session that opens panes
+  // mid-life or moves between panes lands the freshest coords on the
+  // next event without waiting for a resume.
+  //
+  // Gated on `event.backend_exec_type != null`: the all-NULL shape
+  // (every event outside a zellij pane) is a fast no-op, avoiding a
+  // wasteful UPDATE on every non-multiplexer event. A partial capture
+  // (type set, one sub-var NULL) still fires the COALESCE so the
+  // non-NULL fields advance and the NULL field preserves whatever was
+  // previously stamped — never clobbers a prior captured value.
+  //
+  // The UPDATE leaves `backend_exec_tab_{id,name}` untouched — those
+  // columns are stamped only by the T4 tab-resolver worker's synthetic
+  // event (a separate fold arm). The tombstone semantics for the tab
+  // pair (last-known sticks) live there, not here.
+  //
+  // Re-fold determinism: the fold reads only `event.backend_exec_*`
+  // (frozen onto the row at hook time) and the persisted `jobs` cell
+  // (COALESCE inside SQL). NO env reads, NO wall-clock, NO process
+  // probes — so a cursor=0 re-fold reproduces byte-identical rows.
+  // Job-row precondition: the SessionStart arm above must have
+  // INSERTed the `jobs` row before this UPDATE can land, which holds
+  // by construction since SessionStart fires first per session and is
+  // the only mint path. An UPDATE against a missing row is a no-op
+  // (zero rows affected); the next event after the SessionStart will
+  // catch up the coords.
+  if (event.backend_exec_type != null) {
+    db.run(
+      `UPDATE jobs SET
+         backend_exec_type = COALESCE(?, backend_exec_type),
+         backend_exec_session_id = COALESCE(?, backend_exec_session_id),
+         backend_exec_pane_id = COALESCE(?, backend_exec_pane_id),
+         last_event_id = ?,
+         updated_at = ?
+       WHERE job_id = ?`,
+      [
+        event.backend_exec_type,
+        event.backend_exec_session_id,
+        event.backend_exec_pane_id,
+        event.id,
+        ts,
+        jobId,
+      ],
+    );
+  }
+
   // Planctl-CLI invocation fan-out. Re-derive the session's epic_links +
   // every touched epic's job_links from scratch via the pure classifier in
   // `src/plan-classifier.ts`. Gated on:
@@ -6433,7 +6485,8 @@ export function drain(
               stop_hook_active, data, subagent_agent_id, spawn_name,
               start_time, slash_command, skill_name,
               planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-              planctl_subject_present, tool_use_id, config_dir, planctl_files
+              planctl_subject_present, tool_use_id, config_dir, planctl_files,
+              backend_exec_type, backend_exec_session_id, backend_exec_pane_id
          FROM events
         WHERE id > ?
         ORDER BY id ASC

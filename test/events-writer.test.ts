@@ -30,6 +30,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  backendExecCoordsFromEnv,
   configDirFromEnv,
   nameFromArgs,
   parseLinuxStarttime,
@@ -1142,6 +1143,68 @@ test("configDirFromEnv: a bare '/' value passes through unchanged", () => {
   // Edge case: stripping a trailing slash from '/' would yield empty string,
   // which collides with the absent shape. The helper guards on length > 1.
   expect(configDirFromEnv({ CLAUDE_CONFIG_DIR: "/" })).toBe("/");
+});
+
+// ---------------------------------------------------------------------------
+// backendExecCoordsFromEnv unit (schema v48 / fn-668 — every-event capture)
+// ---------------------------------------------------------------------------
+
+test("backendExecCoordsFromEnv: absent ZELLIJ sentinel returns all-NULL", () => {
+  // Outside a zellij pane (the typical case for any Claude session not
+  // launched under zellij) every coord stays NULL — never stamp a
+  // bogus `type='zellij'` per the task acceptance.
+  expect(backendExecCoordsFromEnv({})).toEqual({
+    type: null,
+    sessionId: null,
+    paneId: null,
+  });
+});
+
+test("backendExecCoordsFromEnv: empty ZELLIJ sentinel collapses to all-NULL", () => {
+  // Empty-string env is the same shape as absent — both collapse so the
+  // reducer's COALESCE arm can't be clobbered by an empty stamp.
+  expect(
+    backendExecCoordsFromEnv({
+      ZELLIJ: "",
+      ZELLIJ_SESSION_NAME: "mike-main",
+      ZELLIJ_PANE_ID: "7",
+    }),
+  ).toEqual({ type: null, sessionId: null, paneId: null });
+});
+
+test("backendExecCoordsFromEnv: ZELLIJ sentinel set stamps type + both sub-vars verbatim", () => {
+  expect(
+    backendExecCoordsFromEnv({
+      ZELLIJ: "0",
+      ZELLIJ_SESSION_NAME: "mike-main",
+      ZELLIJ_PANE_ID: "11",
+    }),
+  ).toEqual({ type: "zellij", sessionId: "mike-main", paneId: "11" });
+});
+
+test("backendExecCoordsFromEnv: empty sub-var collapses to NULL while sentinel + the other sub-var stay populated", () => {
+  // Partial capture: type fires (so the reducer's gate triggers the
+  // COALESCE) but the NULL sub-var preserves the prior captured value.
+  expect(
+    backendExecCoordsFromEnv({
+      ZELLIJ: "0",
+      ZELLIJ_SESSION_NAME: "",
+      ZELLIJ_PANE_ID: "7",
+    }),
+  ).toEqual({ type: "zellij", sessionId: null, paneId: "7" });
+});
+
+test("backendExecCoordsFromEnv: pane id passes through as raw TEXT (no numeric coercion)", () => {
+  // The T4 tab resolver joins on string-equality against `list-panes`'
+  // numeric `id`, but the env stamp is always TEXT — we preserve the
+  // raw env string verbatim so the join lands.
+  const got = backendExecCoordsFromEnv({
+    ZELLIJ: "0",
+    ZELLIJ_SESSION_NAME: "mike-main",
+    ZELLIJ_PANE_ID: "42",
+  });
+  expect(got.paneId).toBe("42");
+  expect(typeof got.paneId).toBe("string");
 });
 
 // ---------------------------------------------------------------------------

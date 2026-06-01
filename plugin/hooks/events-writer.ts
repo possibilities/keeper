@@ -40,6 +40,7 @@ import {
   extractToolUseId,
   slashCommandFromPrompt,
 } from "../../src/derivers";
+import { execBackendEnvMeta } from "../../src/exec-backend";
 
 /**
  * Hook event names that get renamed when stored as `event_type`. Matches
@@ -227,6 +228,74 @@ export function configDirFromEnv(env: NodeJS.ProcessEnv): string | null {
     return null;
   }
   return raw.endsWith("/") && raw.length > 1 ? raw.slice(0, -1) : raw;
+}
+
+/**
+ * Three-tuple of backend-exec coordinates captured on EVERY hook event
+ * (not SessionStart-gated like {@link configDirFromEnv}). Each field is
+ * an independent `string | null` so the reducer's COALESCE
+ * latest-non-NULL-wins fold can layer them onto `jobs` cleanly: a hook
+ * event firing inside a zellij pane but with one sub-var absent stamps
+ * that one as NULL and never clobbers a prior captured value.
+ */
+export interface BackendExecCoords {
+  readonly type: string | null;
+  readonly sessionId: string | null;
+  readonly paneId: string | null;
+}
+
+/**
+ * Capture the terminal-multiplexer ("backend-exec") coordinates from
+ * `env`. Pure + exported so the normalization is unit-testable without
+ * spawning a real hook process. Called on EVERY hook event — the read
+ * is a synchronous `process.env` access (no fork/fs/PPID-walk), so it
+ * is cheap enough to run inside the cold-start budget on every fire.
+ * The CLAUDE.md "Scraping is scoped" invariant is widened in lockstep
+ * with this fn to carve out `ZELLIJ`/`ZELLIJ_SESSION_NAME`/`ZELLIJ_PANE_ID`
+ * as permitted pure every-event reads.
+ *
+ * Sentinel gating: zellij stamps the bare `ZELLIJ` env var into every
+ * pane's environment as the "we are running inside a zellij pane"
+ * signal. When `ZELLIJ` is absent/empty we return all-NULL — never
+ * stamp a bogus `type='zellij'` for a Claude session that was launched
+ * outside zellij. When `ZELLIJ` IS present, we stamp
+ * `type = meta.backendType` (the {@link execBackendEnvMeta} default,
+ * `'zellij'`) and read the two named env vars; each sub-var is
+ * normalized independently — absent/empty collapses to NULL so the
+ * reducer's COALESCE arm cannot be clobbered by a partial capture.
+ *
+ * Re-fold determinism: the captured values are frozen onto the events
+ * row at hook time, so the reducer NEVER re-reads env. A cursor=0
+ * re-fold over historical events reproduces byte-identical `jobs`
+ * rows from the stored payload alone (the CLAUDE.md "no env read
+ * inside a fold" invariant).
+ */
+export function backendExecCoordsFromEnv(
+  env: NodeJS.ProcessEnv,
+): BackendExecCoords {
+  // Sentinel: zellij stamps `ZELLIJ` into every pane. An absent/empty
+  // value means this Claude session was NOT launched under zellij and
+  // every coord stays NULL — `type='zellij'` would be a lie.
+  const sentinel = env.ZELLIJ;
+  if (sentinel === undefined || sentinel === "") {
+    return { type: null, sessionId: null, paneId: null };
+  }
+  // Funnel the env-var names through `execBackendEnvMeta` (T1's seam)
+  // so a future tmux/wezterm backend slots in without the hook
+  // learning new keys. Defaults to `DEFAULT_EXEC_BACKEND` ('zellij').
+  const meta = execBackendEnvMeta();
+  const rawSession = env[meta.sessionIdEnvVar];
+  const rawPane = env[meta.paneIdEnvVar];
+  return {
+    type: meta.backendType,
+    // Each sub-var collapses absent/empty to NULL independently. The
+    // value passes through verbatim otherwise — pane id is the raw
+    // numeric TEXT zellij stamps (e.g. `'11'`), which the T4 tab
+    // resolver joins against `list-panes -a -j`'s numeric `id`.
+    sessionId:
+      rawSession === undefined || rawSession === "" ? null : rawSession,
+    paneId: rawPane === undefined || rawPane === "" ? null : rawPane,
+  };
 }
 
 /**
@@ -581,6 +650,18 @@ async function main(): Promise<void> {
   const configDir =
     hookEvent === "SessionStart" ? configDirFromEnv(process.env) : null;
 
+  // Backend-exec coordinates (fn-668 / schema v48): captured on EVERY
+  // hook event, not SessionStart-gated. The read is a pure synchronous
+  // `process.env` access funneled through `execBackendEnvMeta()` (T1's
+  // backend-agnostic seam) — no fork/fs/PPID-walk, so it stays inside
+  // the cold-start budget on every fire. The CLAUDE.md "Scraping is
+  // scoped" invariant is widened in lockstep to carve out
+  // `ZELLIJ`/`ZELLIJ_SESSION_NAME`/`ZELLIJ_PANE_ID` as permitted pure
+  // every-event reads. Absent sentinel (`ZELLIJ` env unset/empty) ⇒
+  // all three NULL — never a bogus `type='zellij'` on a non-zellij
+  // session. See {@link backendExecCoordsFromEnv} for the locked rules.
+  const backendExecCoords = backendExecCoordsFromEnv(process.env);
+
   // Resolve the full named-bindings map ONCE up front, outside the open/
   // retry block. The same object is reused for every retry attempt and is
   // the canonical source the dead-letter record reads from on final failure —
@@ -620,13 +701,16 @@ async function main(): Promise<void> {
     $bash_mutation_kind: bashMutationKind,
     $bash_mutation_targets: bashMutationTargets,
     $planctl_files: planctlFiles,
-    // Schema v48 / fn-668: backend-exec coordinates land NULL until T3 wires
-    // the pure-env capture (`ZELLIJ`/`ZELLIJ_SESSION_NAME`/`ZELLIJ_PANE_ID`
-    // reads). The bindings exist now so the prepared statement compiles
-    // against the v48 events column set; T3 just swaps in the real values.
-    $backend_exec_type: null,
-    $backend_exec_session_id: null,
-    $backend_exec_pane_id: null,
+    // Schema v48 / fn-668: backend-exec coordinates captured on EVERY
+    // event as pure env reads via `backendExecCoordsFromEnv` (no
+    // SessionStart gate, no fork/fs/PPID-walk). The reducer's every-
+    // event COALESCE arm in `projectJobsRow` lifts these onto
+    // `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL
+    // wins. Re-fold determinism holds because the values are frozen
+    // on the events row at hook time — the fold never re-reads env.
+    $backend_exec_type: backendExecCoords.type,
+    $backend_exec_session_id: backendExecCoords.sessionId,
+    $backend_exec_pane_id: backendExecCoords.paneId,
   };
 
   // Dead-letter on FINAL INSERT failure (fn-643 task .2). The closure

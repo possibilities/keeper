@@ -13525,3 +13525,247 @@ test("planctl mint: re-fold determinism — cursor=0 reproduces byte-identical f
     .all();
   expect(after).toEqual(before);
 });
+
+// ---------------------------------------------------------------------------
+// Backend-exec coordinates fold (fn-668 / schema v48)
+// ---------------------------------------------------------------------------
+
+test("backend_exec_* folds latest-non-NULL onto jobs across all event types", () => {
+  // SessionStart seeds the job row; the new every-event arm fires on
+  // any subsequent event whose hook stamped a non-null type. Cover a
+  // mix of hook_events (UserPromptSubmit, PreToolUse, Stop) to prove
+  // the fold isn't gated to a single hook_event.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-be",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-main",
+    backend_exec_pane_id: "7",
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-be",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-main",
+    backend_exec_pane_id: "7",
+  });
+  // A different pane id arrives on PreToolUse — the latest-non-NULL
+  // arm must advance the pane id to '11'.
+  insertEvent({
+    hook_event: "PreToolUse",
+    session_id: "sess-be",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-main",
+    backend_exec_pane_id: "11",
+  });
+  // Stop event also carries coords — proves the arm is fully hook-
+  // event-agnostic, not just SessionStart-or-prompt.
+  insertEvent({
+    hook_event: "Stop",
+    session_id: "sess-be",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-main",
+    backend_exec_pane_id: "11",
+  });
+  drainAll();
+
+  const row = db
+    .query(
+      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-be") as {
+    backend_exec_type: string | null;
+    backend_exec_session_id: string | null;
+    backend_exec_pane_id: string | null;
+  } | null;
+  expect(row).not.toBeNull();
+  expect(row?.backend_exec_type).toBe("zellij");
+  expect(row?.backend_exec_session_id).toBe("mike-main");
+  expect(row?.backend_exec_pane_id).toBe("11");
+});
+
+test("NULL-carrying backend_exec event does NOT clobber a prior non-null capture", () => {
+  // SessionStart stamps coords; a subsequent event fires outside the
+  // multiplexer (all-NULL coords) and the prior values must stick.
+  // This is the load-bearing COALESCE property — a single bare PreToolUse
+  // outside zellij can't wipe the session's identity.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-stick",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-main",
+    backend_exec_pane_id: "7",
+  });
+  drainAll();
+  // Confirm seed landed.
+  const seeded = db
+    .query(
+      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-stick") as {
+    backend_exec_type: string | null;
+    backend_exec_session_id: string | null;
+    backend_exec_pane_id: string | null;
+  } | null;
+  expect(seeded?.backend_exec_type).toBe("zellij");
+  expect(seeded?.backend_exec_session_id).toBe("mike-main");
+  expect(seeded?.backend_exec_pane_id).toBe("7");
+
+  // Now a NULL-carrying event — the fold's `type != null` gate skips
+  // the UPDATE entirely, so the prior values stick byte-identically.
+  insertEvent({
+    hook_event: "PreToolUse",
+    session_id: "sess-stick",
+    backend_exec_type: null,
+    backend_exec_session_id: null,
+    backend_exec_pane_id: null,
+  });
+  drainAll();
+
+  const after = db
+    .query(
+      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-stick") as {
+    backend_exec_type: string | null;
+    backend_exec_session_id: string | null;
+    backend_exec_pane_id: string | null;
+  } | null;
+  expect(after?.backend_exec_type).toBe("zellij");
+  expect(after?.backend_exec_session_id).toBe("mike-main");
+  expect(after?.backend_exec_pane_id).toBe("7");
+});
+
+test("partial backend_exec capture: COALESCE preserves the non-null field, advances the other", () => {
+  // A partial capture (type + session set, pane NULL) must advance
+  // the session if it changed and preserve the prior pane. This
+  // covers the "one sub-var temporarily absent" edge case the
+  // task spec explicitly calls out.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-part",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-main",
+    backend_exec_pane_id: "7",
+  });
+  // Partial: type set (gate fires), session changes, pane NULL —
+  // pane must remain '7' under COALESCE.
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-part",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-other",
+    backend_exec_pane_id: null,
+  });
+  drainAll();
+
+  const row = db
+    .query(
+      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-part") as {
+    backend_exec_type: string | null;
+    backend_exec_session_id: string | null;
+    backend_exec_pane_id: string | null;
+  } | null;
+  expect(row?.backend_exec_type).toBe("zellij");
+  expect(row?.backend_exec_session_id).toBe("mike-other");
+  expect(row?.backend_exec_pane_id).toBe("7");
+});
+
+test("backend_exec fold: cursor=0 re-fold reproduces byte-identical jobs rows", () => {
+  // Re-fold determinism check: insert a sequence of mixed events
+  // (SessionStart, UserPromptSubmit, PreToolUse, NULL-carrying PreToolUse,
+  // Stop), drain once, snapshot, rewind cursor + DELETE jobs, re-drain.
+  // The post-rewind jobs row MUST equal the pre-rewind row byte-for-byte
+  // — proves the fold reads only the event payload (frozen at hook
+  // time) and never re-reads env / wall-clock / process state.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-refold",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-main",
+    backend_exec_pane_id: "7",
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-refold",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-main",
+    backend_exec_pane_id: "7",
+  });
+  // Pane moves.
+  insertEvent({
+    hook_event: "PreToolUse",
+    session_id: "sess-refold",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-main",
+    backend_exec_pane_id: "11",
+  });
+  // NULL-carrying event (gate skips the UPDATE — re-fold must produce
+  // the same skip).
+  insertEvent({
+    hook_event: "PreToolUse",
+    session_id: "sess-refold",
+    backend_exec_type: null,
+    backend_exec_session_id: null,
+    backend_exec_pane_id: null,
+  });
+  insertEvent({
+    hook_event: "Stop",
+    session_id: "sess-refold",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-other",
+    backend_exec_pane_id: "11",
+  });
+  drainAll();
+
+  const before = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-refold");
+  expect(before).not.toBeNull();
+
+  // Rewind cursor + wipe jobs + re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+
+  const after = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-refold");
+  expect(after).toEqual(before);
+});
+
+test("config_dir fold unchanged: only SessionStart seeds it, subsequent events do not touch it", () => {
+  // Regression guard: the new every-event backend_exec arm must NOT
+  // disturb `config_dir`'s SessionStart-only fold. config_dir lands
+  // via the SessionStart UPSERT's COALESCE ON CONFLICT; a non-
+  // SessionStart event carrying NULL config_dir must NOT clobber.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-cfg",
+    config_dir: "/tmp/profile-x",
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-cfg",
+    // Non-SessionStart events always carry NULL config_dir per the
+    // hook contract; assert the fold leaves the prior value alone.
+    config_dir: null,
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "mike-main",
+    backend_exec_pane_id: "7",
+  });
+  drainAll();
+
+  const row = db
+    .query("SELECT config_dir, backend_exec_type FROM jobs WHERE job_id = ?")
+    .get("sess-cfg") as {
+    config_dir: string | null;
+    backend_exec_type: string | null;
+  } | null;
+  // config_dir held through the every-event fold; backend_exec_type
+  // landed via the new arm — proves the two fold paths are independent.
+  expect(row?.config_dir).toBe("/tmp/profile-x");
+  expect(row?.backend_exec_type).toBe("zellij");
+});
