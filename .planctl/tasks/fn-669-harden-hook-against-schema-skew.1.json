@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-01T14:50:14.094421Z",
+  "depends_on": [],
+  "epic": "fn-669-harden-hook-against-schema-skew",
+  "id": "fn-669-harden-hook-against-schema-skew.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "column-adaptive hook event insert",
+  "updated_at": "2026-06-01T14:50:14.094421Z"
+}
