@@ -2342,3 +2342,89 @@ test("close row: all task workers stopped, no sub-agents running → ready", () 
   const snap = run([epic]);
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual({ tag: "ready" });
 });
+
+// ---------------------------------------------------------------------------
+// Close-row predicate 5/6 fan-in is scoped to COMPLETED tasks: an in-flight
+// (not-yet-completed) task's running worker must NOT mislabel the close row
+// as `running:*`. The close row is blocked on that task via predicate 10
+// (`dep-on-task`), not running its own work.
+// ---------------------------------------------------------------------------
+
+test("close row: in-flight (non-completed) task working → dep-on-task, NOT job-running", () => {
+  // The reported bug: a task genuinely in flight (worker_phase still open,
+  // embedded job `working`) made the close row read `running:job-running`.
+  // The task is not `completed`, so predicate 5's fan-in must skip it and the
+  // close row falls through to predicate 10's accurate `dep-on-task` block.
+  const t = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "open",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
+  });
+  const epic = makeEpic({ tasks: [t] });
+  const snap = run([epic]);
+  // The task row itself still reads its own running state.
+  expect(snap.perTask.get(t.task_id)).toEqual(running({ kind: "job-running" }));
+  // The close row is blocked on the incomplete task, not running.
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
+  );
+});
+
+test("close row: in-flight task with running sub-agent → dep-on-task, NOT sub-agent-running", () => {
+  // Sub-agent variant of the same bug: a not-yet-completed task carrying a
+  // running sub-agent must not fan its running-ness onto the close row.
+  const t = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "open",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
+  });
+  const epic = makeEpic({ tasks: [t] });
+  const sub = makeSub({ job_id: "worker-1", status: "running" });
+  const snap = run([epic], new Map(), [sub]);
+  // The close row blocks on the incomplete task (predicate 5's job scan
+  // already short-circuits to dep-on-task before predicate 6 is reached).
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
+  );
+});
+
+test("close row: completed-racing worker still wins over an incomplete sibling", () => {
+  // Mirrors the reported epic's shape: task-1 completed (workers stopped),
+  // task-2 in flight. The completed task's worker has stopped, so the close
+  // row is NOT running — it blocks on the incomplete task-2 via predicate 10.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    worker_phase: "open",
+    approval: "pending",
+    jobs: [makeEmbeddedJob({ job_id: "worker-2", state: "working" })],
+  });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.2" }),
+  );
+
+  // But if task-1 is still racing (completed yet its worker hasn't Stopped),
+  // the completed-scoped fan-in DOES fire and the close row stays running —
+  // predicate 5 outranks the dep-on-task block from task-2.
+  const t1Racing = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
+  });
+  const epicRacing = makeEpic({ tasks: [t1Racing, t2] });
+  const snapRacing = run([epicRacing]);
+  expect(snapRacing.perCloseRow.get(epicRacing.epic_id)).toEqual(
+    running({ kind: "job-running" }),
+  );
+});

@@ -19,12 +19,12 @@
  *                                    ranks ABOVE the session-running checks; pending is split off
  *                                    to predicate 7 so it cannot fire while a worker is still alive)
  *   5. own-progress-main           — task: any embedded jobs[] entry on this row state==="working"
- *                                    close: any embedded jobs[] entry on the epic OR on ANY of its
- *                                    tasks state==="working" (fan-out — see `evaluateCloseRow` for why)
+ *                                    close: any embedded jobs[] entry on the epic OR on any ALREADY-COMPLETED
+ *                                    task state==="working" (completed-scoped fan-in — see `evaluateCloseRow`)
  *   6. own-progress-sub            — task: any subagentInvocations row job_id===<this row's worker.session_id>
  *                                    && status==="running"
  *                                    close: same predicate but joined against worker session ids from
- *                                    epic-level AND every task-level embedded jobs[]
+ *                                    epic-level AND every ALREADY-COMPLETED task's embedded jobs[]
  *   6.5. git-uncommitted / git-orphans
  *                                  — task (gated worker_phase==="done"): look up the live `git_status`
  *                                    row for `task.target_repo ?? epic.project_dir` via
@@ -700,21 +700,28 @@ function evaluateTask(
  * (own-progress-sub) pool TWO scopes:
  *   - EPIC-LEVEL: `epic.jobs` (close-verb embedded jobs) and `epic.job_links`
  *     (planner-running, predicate 3).
- *   - TASK-LEVEL: every `task.jobs` sub-array and any sub-agents under those
- *     task workers — fanned in because predicate 1 (`evaluateTask`) marks a
- *     task `completed` as soon as `worker_phase === "done" && approval ===
- *     "approved"`, which can race ahead of the worker's Stop/SessionEnd.
- *     Without the fan-out, the close row would flip to `ready` while a
- *     worker is still alive.
+ *   - TASK-LEVEL: the `task.jobs` sub-array (and sub-agents under those task
+ *     workers) of every ALREADY-COMPLETED task — fanned in because predicate 1
+ *     (`evaluateTask`) marks a task `completed` as soon as `worker_phase ===
+ *     "done" && approval === "approved"`, which can race ahead of the worker's
+ *     Stop/SessionEnd. Without the fan-in, the close row would flip to `ready`
+ *     while that worker is still alive. The task-level scan is scoped to
+ *     `completed` tasks (via the `perTask` verdict map): a not-yet-completed
+ *     task is already blocked-on by predicate 10's `dep-on-task`, so fanning
+ *     its running-ness onto the close row would only mislabel a
+ *     dependency-blocked close as `running:*` (predicates 5/6 outrank 10).
  *
- * The verdict alone therefore does NOT carry attribution: a close row
+ * The verdict alone therefore still does NOT carry attribution: a close row
  * marked `running:job-running` or `running:sub-agent-running` may be
- * "owned" by an epic-level source OR purely inherited from a task. That
- * matters for `applySingleTaskPerRootMutex` — see its JSDoc for the
+ * "owned" by an epic-level source OR inherited from a completed-but-racing
+ * task. That matters for `applySingleTaskPerRootMutex` — see its JSDoc for the
  * scoped close-row claim (fn-655). The per-root mutex re-derives
  * epic-level running-ness from `epic.jobs`/`job_links` plus the
  * sub-agent index so a purely task-derived running close row no longer
- * phantoms a `project_dir` lock that starves unrelated epics.
+ * phantoms a `project_dir` lock that starves unrelated epics. (That gate
+ * stays load-bearing: a completed-but-racing task does not claim its own root
+ * either, so the mutex must still distinguish epic-level from task-derived
+ * close-running.)
  */
 function evaluateCloseRow(
   epic: Epic,
@@ -757,39 +764,56 @@ function evaluateCloseRow(
   }
 
   // 5. own-progress-main — close-row blocks on a running worker session at
-  // EITHER scope: epic-level (close-verb) embedded jobs, OR any task-level
-  // (work-verb) embedded job on a task in this epic. The task-level scan
-  // matters because predicate 1 (`evaluateTask`) marks a task `completed`
-  // as soon as `worker_phase==="done" && approval==="approved"` — which
-  // can race ahead of the worker session's Stop/SessionEnd (planctl can
-  // record `worker_done_at` and the human can approve before the session
-  // exits). Without this fan-out, predicate 10 sees every task `completed`
-  // and the close row flips to `ready` while a worker is still alive.
+  // EITHER scope: epic-level (close-verb) embedded jobs, OR a task-level
+  // (work-verb) embedded job on an ALREADY-COMPLETED task in this epic.
+  // The task-level scan is scoped to `completed` tasks because that is the
+  // only race it exists to guard: predicate 1 (`evaluateTask`) marks a task
+  // `completed` as soon as `worker_phase==="done" && approval==="approved"`,
+  // which can race ahead of the worker session's Stop/SessionEnd (planctl
+  // can record `worker_done_at` and the human can approve before the session
+  // exits, while the embedded job's live state is still `working`). Without
+  // the fan-in, predicate 10 sees every task `completed` and the close row
+  // flips to `ready` while that worker is still alive.
+  //
+  // A task that is NOT yet completed (genuinely in-flight) is deliberately
+  // EXCLUDED here: predicate 10 below already blocks the close row on it with
+  // the accurate `dep-on-task` reason, and fanning its running-ness onto the
+  // close row would mislabel a dependency-blocked close as `running:job-running`
+  // (it outranks predicate 10) — the close row isn't running its own work, it's
+  // waiting on an incomplete task.
   if (anyEmbeddedJobWorking(epic.jobs)) {
     return { tag: "running", reason: { kind: "job-running" } };
   }
   for (const task of epic.tasks) {
-    if (anyEmbeddedJobWorking(task.jobs)) {
+    if (
+      perTask.get(task.task_id)?.tag === "completed" &&
+      anyEmbeddedJobWorking(task.jobs)
+    ) {
       return { tag: "running", reason: { kind: "job-running" } };
     }
   }
 
-  // 6. own-progress-sub — sub-agent invocation under ANY worker session
-  // bound to this epic (close-verb at epic level, work-verb at task level).
-  // Same race as predicate 5: a task's worker can still be running a
-  // sub-agent after planctl/human have driven the task to completed.
+  // 6. own-progress-sub — sub-agent invocation under a worker session bound
+  // to this epic (close-verb at epic level, work-verb on an ALREADY-COMPLETED
+  // task). Same race + same `completed`-scoping as predicate 5: a completed
+  // task's worker can still be running a sub-agent after planctl/human have
+  // driven the task to completed; a not-yet-completed task is excluded here
+  // and falls through to predicate 10's `dep-on-task` block (the `perTask`
+  // gate lives inside the two helpers below).
   //
   // fn-638.4: same stale split as the task path's predicate 6 — render
   // `sub-agent-stale` iff every surviving running sub-agent across the
-  // checked scopes (epic-level close jobs + every task-level work job)
+  // checked scopes (epic-level close jobs + every completed task's work job)
   // is past `SUBAGENT_STALENESS_SEC` relative to `now`; otherwise
-  // `sub-agent-running`. The check pools every scope so a single fresh
-  // sub-agent on any task keeps the close row at `sub-agent-running`
+  // `sub-agent-running`. The check pools every in-scope source so a single
+  // fresh sub-agent on any of them keeps the close row at `sub-agent-running`
   // (the close row is genuinely blocked on live work somewhere); the
   // close row only flips to `sub-agent-stale` once every surviving
   // sub-agent across every contributing scope is suspect.
-  if (closeRowHasRunningSubagent(epic, subRunningByJobId)) {
-    if (allCloseRowRunningSubagentsAreStale(epic, subRunningByJobId, now)) {
+  if (closeRowHasRunningSubagent(epic, perTask, subRunningByJobId)) {
+    if (
+      allCloseRowRunningSubagentsAreStale(epic, perTask, subRunningByJobId, now)
+    ) {
       return { tag: "running", reason: { kind: "sub-agent-stale" } };
     }
     return { tag: "running", reason: { kind: "sub-agent-running" } };
@@ -1322,21 +1346,31 @@ function allRunningSubagentsAreStale(
 /**
  * fn-638.4: close-row variant of
  * {@link anyEmbeddedJobHasRunningSubagent}, pooling the
- * epic-level jobs AND every task-level jobs sub-array. Used by
- * `evaluateCloseRow`'s predicate 6 so the close row stalls on any
+ * epic-level jobs AND every ALREADY-COMPLETED task-level jobs sub-array.
+ * Used by `evaluateCloseRow`'s predicate 6 so the close row stalls on any
  * surviving running sub-agent across either scope (mirroring the
  * existing close-row scan that was inlined as two separate calls before
  * the fn-638.4 stale-split). Returns `true` iff at least one running
  * sub-agent is present in any scope.
+ *
+ * The task-level scan is scoped to `completed` tasks via `perTask` for the
+ * same reason as predicate 5's main scan: a not-yet-completed task is
+ * already blocked-on by predicate 10's `dep-on-task`, so fanning its running
+ * sub-agent onto the close row would mislabel a dependency-blocked close as
+ * `running:sub-agent-running`.
  */
 function closeRowHasRunningSubagent(
   epic: Epic,
+  perTask: Map<string, Verdict>,
   subRunningByJobId: Map<string, SubagentInvocation[]>,
 ): boolean {
   if (anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId)) {
     return true;
   }
   for (const task of epic.tasks) {
+    if (perTask.get(task.task_id)?.tag !== "completed") {
+      continue;
+    }
     if (anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId)) {
       return true;
     }
@@ -1347,14 +1381,16 @@ function closeRowHasRunningSubagent(
 /**
  * fn-638.4: close-row variant of {@link allRunningSubagentsAreStale},
  * pooling every contributing scope (epic-level close jobs + every
- * task-level work jobs). Returns `true` iff EVERY surviving running
- * sub-agent across every scope is past `SUBAGENT_STALENESS_SEC` — one
+ * ALREADY-COMPLETED task's work jobs). Returns `true` iff EVERY surviving
+ * running sub-agent across every scope is past `SUBAGENT_STALENESS_SEC` — one
  * fresh sub-agent anywhere keeps the verdict at `sub-agent-running`.
  * Callers MUST gate on `closeRowHasRunningSubagent` first; vacuous-
- * truth otherwise.
+ * truth otherwise. The task-level scan is scoped to `completed` tasks via
+ * `perTask` to mirror `closeRowHasRunningSubagent`'s scope exactly.
  */
 function allCloseRowRunningSubagentsAreStale(
   epic: Epic,
+  perTask: Map<string, Verdict>,
   subRunningByJobId: Map<string, SubagentInvocation[]>,
   now: number,
 ): boolean {
@@ -1369,6 +1405,9 @@ function allCloseRowRunningSubagentsAreStale(
     return false;
   }
   for (const task of epic.tasks) {
+    if (perTask.get(task.task_id)?.tag !== "completed") {
+      continue;
+    }
     if (
       !allRunningSubagentsAreStale(
         task.jobs,
