@@ -364,8 +364,20 @@ test("renderBody — empty input renders no lines", () => {
 test("renderBody — only current populated renders only the current header + rows", () => {
   const lines = renderBody({
     current: [
-      { verb: "work", id: "fn-1-foo.1", dir: "repo", created_at: 10 },
-      { verb: "close", id: "fn-1-foo", dir: "repo", created_at: 20 },
+      {
+        verb: "work",
+        id: "fn-1-foo.1",
+        dir: "repo",
+        state: "working",
+        created_at: 10,
+      },
+      {
+        verb: "close",
+        id: "fn-1-foo",
+        dir: "repo",
+        state: "working",
+        created_at: 20,
+      },
     ],
     predicted: {
       approvals: [],
@@ -473,9 +485,24 @@ test("renderBody — only failed populated renders failed header + reason-tagged
   ]);
 });
 
-test("renderBody — all three sections emit together in current → predicted → failed order", () => {
+test("renderBody — all four sections emit together in current → predicted → stopped → failed order", () => {
   const lines = renderBody({
-    current: [{ verb: "work", id: "fn-1-foo.1", dir: "repo", created_at: 10 }],
+    current: [
+      {
+        verb: "work",
+        id: "fn-1-foo.1",
+        dir: "repo",
+        state: "working",
+        created_at: 10,
+      },
+      {
+        verb: "close",
+        id: "fn-1-foo",
+        dir: "repo",
+        state: "stopped",
+        created_at: 30,
+      },
+    ],
     predicted: {
       approvals: [
         {
@@ -506,8 +533,44 @@ test("renderBody — all three sections emit together in current → predicted �
     "(repo) work::fn-1-foo.1",
     "--- predicted ---",
     "(repo) approve::fn-1-foo.2",
+    "--- stopped ---",
+    "(repo) close::fn-1-foo",
     "--- failed ---",
     "(/repo) work::fn-1-foo.3 — confirm timeout",
+  ]);
+});
+
+test("renderBody — only stopped populated renders only the stopped header + rows", () => {
+  const lines = renderBody({
+    current: [
+      {
+        verb: "work",
+        id: "fn-1-foo.1",
+        dir: "repo",
+        state: "stopped",
+        created_at: 10,
+      },
+      {
+        verb: "close",
+        id: "fn-1-foo",
+        dir: "repo",
+        state: "stopped",
+        created_at: 20,
+      },
+    ],
+    predicted: {
+      approvals: [],
+      informational: [],
+      workers: [],
+      closers: [],
+    },
+    failed: [],
+    paused: false,
+  });
+  expect(lines).toEqual([
+    "--- stopped ---",
+    "(repo) work::fn-1-foo.1",
+    "(repo) close::fn-1-foo",
   ]);
 });
 
@@ -736,7 +799,15 @@ test("projectAutopilotPaused — non-number `paused` falls back to true (safer s
 
 test("renderBody — paused=true does NOT emit a banner line into the body (live shell owns banner)", () => {
   const lines = renderBody({
-    current: [{ verb: "work", id: "fn-1.1", dir: "repo", created_at: 1 }],
+    current: [
+      {
+        verb: "work",
+        id: "fn-1.1",
+        dir: "repo",
+        state: "working",
+        created_at: 1,
+      },
+    ],
     predicted: {
       approvals: [],
       informational: [],
@@ -754,7 +825,15 @@ test("renderBody — paused=true does NOT emit a banner line into the body (live
 
 test("renderBody — paused=false does NOT emit a banner line into the body either", () => {
   const lines = renderBody({
-    current: [{ verb: "work", id: "fn-1.1", dir: "repo", created_at: 1 }],
+    current: [
+      {
+        verb: "work",
+        id: "fn-1.1",
+        dir: "repo",
+        state: "working",
+        created_at: 1,
+      },
+    ],
     predicted: {
       approvals: [],
       informational: [],

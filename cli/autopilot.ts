@@ -7,11 +7,15 @@
  * worker thread; this CLI does NOT dispatch, dedup, suppress, settle,
  * confirm, reap, or persist anything. Its only jobs are:
  *
- *   1. Render three sections of state, refreshed on every subscribe edge:
- *        --- current ---   live `jobs` rows (the reconciler's observed
- *                          dispatches), ordered for human scan
+ *   1. Render four sections of state, refreshed on every subscribe edge:
+ *        --- current ---   live `working` `jobs` rows (the reconciler's
+ *                          observed in-flight dispatches), ordered for scan
  *        --- predicted --- `predictNextDispatches` over the live readiness
  *                          snapshot — pure preview, NO dispatch behind it
+ *        --- stopped ---   `jobs` rows whose turn has ended (state
+ *                          `stopped`) but whose session may still be alive
+ *                          — the same working+stopped stream as `current`,
+ *                          partitioned by state
  *        --- failed ---    rows from the `dispatch_failures` projection
  *                          (the only durable autopilot-owned state, fed by
  *                          the reducer's `DispatchFailed` fold arm)
@@ -98,7 +102,7 @@ Usage:
 
 Subcommands:
   (none)   Open the alt-screen viewer rendering the live current /
-           predicted / failed sections plus the paused indicator.
+           predicted / stopped / failed sections plus the paused indicator.
   pause    Send set_autopilot_paused {paused:true} and exit.
   play     Send set_autopilot_paused {paused:false} and exit.
   retry    Send retry_dispatch {id:<verb::id>} and exit. <verb::id> is
@@ -430,6 +434,14 @@ export interface CurrentRow {
   id: string;
   /** Basename of `project_dir` — empty when none. */
   dir: string;
+  /**
+   * Live job state — `working` (actively running) splits into the
+   * `--- current ---` section; `stopped` (turn ended, session may still
+   * be alive) splits into `--- stopped ---`. The readiness `jobs` stream
+   * is server-filtered to exactly these two states (`state NOT IN
+   * ("ended","killed")`), so this is total.
+   */
+  state: "working" | "stopped";
   /** Sort key: created_at descending puts the freshest at the bottom. */
   created_at: number;
 }
@@ -472,6 +484,8 @@ export function buildCurrentRows(snap: ReadinessClientSnapshot): CurrentRow[] {
       verb,
       id,
       dir: cwd === "" ? "" : basename(cwd),
+      // The guard above narrowed `job.state` to working|stopped.
+      state: job.state === "working" ? "working" : "stopped",
       created_at:
         typeof job.created_at === "number" ? job.created_at : Number(0),
     });
@@ -538,23 +552,36 @@ export interface RenderInput {
 }
 
 /**
- * Render the body lines for one viewer frame. Three sections, each
- * emitted only when non-empty, in priority order: current (live work),
- * predicted (next dispatches), failed (sticky failures awaiting human
- * retry). The leading `[paused]` / `[playing]` indicator lives on the
- * live-shell banner row, not the body — same convention as board's
- * persistent-pill restoration.
+ * Render the body lines for one viewer frame. Four sections, each
+ * emitted only when non-empty, in priority order: current (live
+ * `working` jobs), predicted (next dispatches), stopped (jobs whose turn
+ * ended but whose session may still be alive), failed (sticky failures
+ * awaiting human retry). The `current` and `stopped` sections both source
+ * from `input.current` — `buildCurrentRows` projects the whole
+ * working+stopped jobs stream and `renderBody` partitions by `state`. The
+ * leading `[paused]` / `[playing]` indicator lives on the live-shell
+ * banner row, not the body — same convention as board's persistent-pill
+ * restoration.
  *
  * Pure — exported for tests.
  */
 export function renderBody(input: RenderInput): string[] {
   const out: string[] = [];
 
-  if (input.current.length > 0) {
+  // `(dir) verb::id` — shared by the current + stopped sections (neither
+  // pads the dir column; only predicted aligns).
+  const dispatchLine = (r: CurrentRow): string => {
+    const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
+    return `${dirSeg}${r.verb}::${r.id}`;
+  };
+
+  const working = input.current.filter((r) => r.state === "working");
+  const stopped = input.current.filter((r) => r.state === "stopped");
+
+  if (working.length > 0) {
     out.push("--- current ---");
-    for (const r of input.current) {
-      const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
-      out.push(`${dirSeg}${r.verb}::${r.id}`);
+    for (const r of working) {
+      out.push(dispatchLine(r));
     }
   }
 
@@ -581,6 +608,13 @@ export function renderBody(input: RenderInput): string[] {
       const dirSegRaw = r.dir === "" ? "" : `(${r.dir}) `;
       const dirSeg = dirSegRaw.padEnd(dirColWidth);
       out.push(`${dirSeg}${r.verb}::${r.id}`);
+    }
+  }
+
+  if (stopped.length > 0) {
+    out.push("--- stopped ---");
+    for (const r of stopped) {
+      out.push(dispatchLine(r));
     }
   }
 
