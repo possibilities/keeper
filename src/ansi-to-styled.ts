@@ -11,17 +11,18 @@
  * literal garbage (`^[[96m`, `^[[0m`).
  *
  * This module bridges the gap. It parses a string carrying any subset
- * of the six SGR codes board emits and produces an OpenTUI `StyledText`
+ * of the SGR codes board emits and produces an OpenTUI `StyledText`
  * whose chunks carry the equivalent foreground color / DIM attribute.
  * Unrecognized escape sequences are STRIPPED — never passed through as
  * visible bytes — so a typo or a future SGR addition fails clean (no
  * color) rather than leaking `^[[...m` garbage onto the screen.
  *
- * Six semantic buckets, mirroring `board.ts`'s `SGR` table (the only
+ * Semantic buckets, mirroring `board.ts`'s `SGR` table (the only
  * site that emits these escapes today; sidecars and lifecycle output
  * stay plain and never reach this shim):
  *
  *   active  (bright cyan, `\x1b[96m`)   — in motion / cyan
+ *   blue    (bright blue, `\x1b[94m`)   — a `running` work pill
  *   success (green,       `\x1b[32m`)   — positive resolution
  *   error   (red,         `\x1b[31m`)   — failure
  *   warn    (yellow,      `\x1b[33m`)   — blocked / in the way
@@ -54,7 +55,7 @@
 import type { RGBA, StyledText, TextChunk } from "@opentui/core";
 
 /**
- * The six semantic buckets `colorizePillsInLine` emits. `plain` is the
+ * The semantic buckets `colorizePillsInLine` emits. `plain` is the
  * absence of an SGR open — text outside any colored span, before the
  * first open, after a reset, or between adjacent resets. The parser's
  * output is a flat sequence of these; the chunk-builder maps each to
@@ -63,6 +64,7 @@ import type { RGBA, StyledText, TextChunk } from "@opentui/core";
 export type SegmentKind =
   | "plain"
   | "active"
+  | "blue"
   | "success"
   | "error"
   | "warn"
@@ -90,6 +92,7 @@ export interface ParsedSegment {
  */
 const SGR_OPEN_TO_KIND: Record<string, SegmentKind> = {
   "96": "active",
+  "94": "blue",
   "32": "success",
   "31": "error",
   "33": "warn",
@@ -103,6 +106,7 @@ const SGR_OPEN_TO_KIND: Record<string, SegmentKind> = {
  * vs `keeper board` is visually identical:
  *
  *   active  → bright cyan  (\x1b[96m) ≈ #5FFFFF / pure cyan family
+ *   blue    → bright blue  (\x1b[94m) ≈ #5C5CFF (xterm bright-blue index 12)
  *   success → green        (\x1b[32m) ≈ standard green
  *   error   → red          (\x1b[31m) ≈ standard red
  *   warn    → yellow       (\x1b[33m) ≈ standard yellow
@@ -115,6 +119,7 @@ const SGR_OPEN_TO_KIND: Record<string, SegmentKind> = {
  */
 const SEGMENT_FG_HEX: Record<Exclude<SegmentKind, "plain">, string> = {
   active: "#00FFFF",
+  blue: "#5C5CFF",
   success: "#00CD00",
   error: "#CD0000",
   warn: "#CDCD00",

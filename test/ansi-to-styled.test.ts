@@ -50,10 +50,11 @@ const RUNTIME: AnsiToStyledRuntime = {
   TextAttributes,
 };
 
-// The six SGR opens board.ts emits, mirrored here so the tests pin
+// The SGR opens board.ts emits, mirrored here so the tests pin
 // the exact byte sequences the shim consumes.
 const SGR = {
   active: "\x1b[96m", // bright cyan
+  blue: "\x1b[94m", // bright blue ([running] pills)
   success: "\x1b[32m", // green
   error: "\x1b[31m", // red
   warn: "\x1b[33m", // yellow
@@ -75,12 +76,13 @@ test("parseAnsiSegments: plain line passes through as one plain segment", () => 
   ]);
 });
 
-test("parseAnsiSegments: each of the six SGR codes maps to the right bucket", () => {
-  // Six independent runs — each opens its bucket, writes text, resets.
+test("parseAnsiSegments: each SGR code maps to the right bucket", () => {
+  // Independent runs — each opens its bucket, writes text, resets.
   const cases: Array<
-    ["active" | "success" | "error" | "warn" | "faded", string]
+    ["active" | "blue" | "success" | "error" | "warn" | "faded", string]
   > = [
     ["active", SGR.active],
+    ["blue", SGR.blue],
     ["success", SGR.success],
     ["error", SGR.error],
     ["warn", SGR.warn],
@@ -185,7 +187,7 @@ test("ansiLineToStyled: each colored bucket → one chunk with a defined fg", ()
   // The hex map is internal; what we assert is "every styled bucket
   // produces a chunk carrying an fg color". We don't pin the exact
   // RGBA bytes — that's an implementation detail of the hex palette.
-  for (const open of [SGR.active, SGR.success, SGR.error, SGR.warn]) {
+  for (const open of [SGR.active, SGR.blue, SGR.success, SGR.error, SGR.warn]) {
     const styled = ansiLineToStyled(`${open}x${SGR.reset}`, RUNTIME);
     expect(styled.chunks).toHaveLength(1);
     const chunk = styled.chunks[0];
