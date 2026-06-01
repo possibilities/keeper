@@ -66,5 +66,5 @@ pure. The module's `main()` (isMainThread-guarded) owns its read-only conn, a
 - [ ] isMainThread-guarded main() with readonly conn, data_version wake loop, shutdown aborts in-flight confirm
 
 ## Done summary
-
+Added src/autopilot-worker.ts: pure reconcile(snapshot,state,liveDispatches,config,now) + confirmRunning(verb,id,cwd,argv,signal,deps) with injected deps (launch/findJob/maxEventId/now/sleep/emitDispatchFailed). Dedup by occupying-job presence on (plan_verb,plan_ref) in {working,stopped}; sticky failure via dispatch_failures keys; watermark-before-launch excludes stale terminal rows; ~18s ceiling, no auto-retry. git_status fed to computeReadiness (fn-638 6.5). runReconcileCycle serializes launches one-at-a-time (fn-644). isMainThread-guarded main() with readonly conn, watchLoop, shutdown AbortController. 29 worker tests + 431 epic suite pass.
 ## Evidence

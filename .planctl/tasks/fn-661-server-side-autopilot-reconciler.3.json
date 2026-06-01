@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "autopilot reconciler worker core",
-  "updated_at": "2026-05-31T22:30:27.558408Z"
+  "updated_at": "2026-06-01T00:09:26.444687Z",
+  "worker_done_at": "2026-06-01T00:09:26.444687Z"
 }
