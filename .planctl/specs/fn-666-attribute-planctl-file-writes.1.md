@@ -109,5 +109,5 @@ existing rows inert).
 - [ ] discharge on the chore(planctl) commit confirmed; CLAUDE.md + README updated; committed to main staging only touched files
 
 ## Done summary
-
+Lifted planctl envelope's files[] into events.planctl_files, minted source='planctl' file_attributions in the reducer's planctl_op fold seam keyed on state_repo+session+path so .planctl/ JSONs and specs no longer orphan; widened source CHECK enum via row-preserving rebuild, bumped SCHEMA_VERSION to 46 with keeper-py whitelist, backfilled historical events.planctl_files + rewound cursor for from-scratch re-fold healing.
 ## Evidence
