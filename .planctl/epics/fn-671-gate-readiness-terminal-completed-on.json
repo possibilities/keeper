@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-671-gate-readiness-terminal-completed-on",
   "bundles": [],
   "closer_done_at": "2026-06-01T20:45:11.799940Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-01T20:45:11.799940Z"
+  "updated_at": "2026-06-01T20:46:15.187108Z"
 }
