@@ -28,6 +28,7 @@ import {
   buildZellijAttachBgArgs,
   buildZellijClosePaneArgs,
   buildZellijCloseTabArgs,
+  buildZellijFocusPaneArgs,
   buildZellijListPanesAllJsonArgs,
   buildZellijListSessionsArgs,
   buildZellijListTabsArgs,
@@ -41,7 +42,6 @@ import {
   firstTabIdFromListTabs,
   parseListPanesJson,
   resolveExecBackend,
-  resolveTabForPane,
   type SpawnFn,
 } from "../src/exec-backend";
 
@@ -1128,10 +1128,29 @@ test("findPaneById: garbage payload (null / non-object) → none", () => {
 });
 
 // ---------------------------------------------------------------------------
-// resolveTabForPane — spawn list-panes once, return {tab_id, tab_name, tab_position} | null
+// ExecBackend.resolveTabForPane — session-agnostic, on-interface. Spawn
+// list-panes once, return {tab_id, tab_name, tab_position} | null.
 // ---------------------------------------------------------------------------
 
-test("resolveTabForPane: spawns list-panes once and returns the matching tab triple", async () => {
+/**
+ * Construct a zellij backend wired with the test `spawn` stub and a
+ * no-op noteLine. The construction-`session` field is irrelevant for
+ * the session-agnostic ops (`focusPane` / `resolveTabForPane` take the
+ * target session per call), so we let the default ride.
+ */
+function backendForSessionAgnosticTests(spawn: SpawnFn) {
+  return createZellijBackend({ noteLine: () => {}, spawn });
+}
+
+/**
+ * Construct a backend with a known `session` to assert that the
+ * session-agnostic ops ignore it and use the per-call session instead.
+ */
+function createFocusBackend(spawn: SpawnFn, session: string) {
+  return createZellijBackend({ noteLine: () => {}, session, spawn });
+}
+
+test("ExecBackend.resolveTabForPane: spawns list-panes once and returns the matching tab triple", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -1157,21 +1176,28 @@ test("resolveTabForPane: spawns list-panes once and returns the matching tab tri
     },
     calls,
   );
-  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  const got = await backendForSessionAgnosticTests(spawn).resolveTabForPane(
+    "autopilot",
+    "11",
+  );
   expect(got).toEqual({ tab_id: 3, tab_name: "agent", tab_position: 2 });
-  // The spawn was the well-formed list-panes -a -j argv.
+  // The spawn was the well-formed list-panes -a -j argv against the
+  // PER-CALL session (not the construction-default).
   expect(calls[0]).toEqual(buildZellijListPanesAllJsonArgs("autopilot"));
 });
 
-test("resolveTabForPane: ENOENT-style spawn throw → null (zellij not installed)", async () => {
+test("ExecBackend.resolveTabForPane: ENOENT-style spawn throw → null (zellij not installed)", async () => {
   const spawn: SpawnFn = () => {
     throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
   };
-  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  const got = await backendForSessionAgnosticTests(spawn).resolveTabForPane(
+    "autopilot",
+    "11",
+  );
   expect(got).toBeNull();
 });
 
-test("resolveTabForPane: non-zero exit → null (no clobbering snapshot)", async () => {
+test("ExecBackend.resolveTabForPane: non-zero exit → null (no clobbering snapshot)", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -1183,21 +1209,27 @@ test("resolveTabForPane: non-zero exit → null (no clobbering snapshot)", async
     },
     calls,
   );
-  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  const got = await backendForSessionAgnosticTests(spawn).resolveTabForPane(
+    "autopilot",
+    "11",
+  );
   expect(got).toBeNull();
 });
 
-test("resolveTabForPane: empty / unparseable JSON → null", async () => {
+test("ExecBackend.resolveTabForPane: empty / unparseable JSON → null", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     { "zellij:--session": { stdout: "not json", exitCode: 0 } },
     calls,
   );
-  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  const got = await backendForSessionAgnosticTests(spawn).resolveTabForPane(
+    "autopilot",
+    "11",
+  );
   expect(got).toBeNull();
 });
 
-test("resolveTabForPane: pane not in payload → null (refuse to clear)", async () => {
+test("ExecBackend.resolveTabForPane: pane not in payload → null (refuse to clear)", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -1210,11 +1242,14 @@ test("resolveTabForPane: pane not in payload → null (refuse to clear)", async 
     },
     calls,
   );
-  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  const got = await backendForSessionAgnosticTests(spawn).resolveTabForPane(
+    "autopilot",
+    "11",
+  );
   expect(got).toBeNull();
 });
 
-test("resolveTabForPane: missing tab_id / tab_position → null fields (still resolves the tab_name)", async () => {
+test("ExecBackend.resolveTabForPane: missing tab_id / tab_position → null fields (still resolves the tab_name)", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -1227,6 +1262,122 @@ test("resolveTabForPane: missing tab_id / tab_position → null fields (still re
     },
     calls,
   );
-  const got = await resolveTabForPane("autopilot", "11", { spawn });
+  const got = await backendForSessionAgnosticTests(spawn).resolveTabForPane(
+    "autopilot",
+    "11",
+  );
   expect(got).toEqual({ tab_id: null, tab_name: "agent", tab_position: null });
+});
+
+test("ExecBackend.resolveTabForPane: target session is per-call, not the construction session", async () => {
+  // Construct with one session, call with another — the spawn argv
+  // must carry the PER-CALL session, proving session-agnostic dispatch.
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "zellij:--session": {
+        stdout: JSON.stringify([
+          { id: 11, tab_id: 3, tab_name: "agent", is_plugin: false },
+        ]),
+        exitCode: 0,
+      },
+    },
+    calls,
+  );
+  const backend = createFocusBackend(spawn, "construction-session");
+  await backend.resolveTabForPane("per-call-session", "11");
+  expect(calls[0]).toEqual(buildZellijListPanesAllJsonArgs("per-call-session"));
+});
+
+// ---------------------------------------------------------------------------
+// buildZellijFocusPaneArgs — pure builder for `action focus-pane-id <id>`
+// ---------------------------------------------------------------------------
+
+test("buildZellijFocusPaneArgs: well-formed argv with --session + bare numeric pane id", () => {
+  expect(buildZellijFocusPaneArgs("autopilot", "11")).toEqual([
+    "zellij",
+    "--session",
+    "autopilot",
+    "action",
+    "focus-pane-id",
+    "11",
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// ExecBackend.focusPane — session-agnostic, on-interface. Exit 0 → ok;
+// ENOENT / non-zero exit → { ok: false, error }; never throws.
+// ---------------------------------------------------------------------------
+
+test("ExecBackend.focusPane: exit 0 → { ok: true }, spawns focus-pane-id with the per-call session", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    { "zellij:--session": { stdout: "", exitCode: 0 } },
+    calls,
+  );
+  const got = await createFocusBackend(spawn, "construction-default").focusPane(
+    "per-call-session",
+    "42",
+  );
+  expect(got).toEqual({ ok: true });
+  // The spawn used the PER-CALL session, not the construction session,
+  // proving the session-agnostic contract.
+  expect(calls[0]).toEqual(buildZellijFocusPaneArgs("per-call-session", "42"));
+});
+
+test("ExecBackend.focusPane: non-zero exit → { ok: false, error } carrying the exit code", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "zellij:--session": {
+        stdout: "",
+        stderr: "pane not found",
+        exitCode: 2,
+      },
+    },
+    calls,
+  );
+  const got = await createFocusBackend(spawn, "autopilot").focusPane(
+    "autopilot",
+    "99",
+  );
+  expect(got.ok).toBe(false);
+  if (got.ok === false) {
+    expect(got.error).toContain("exited 2");
+    expect(got.error).toContain("pane not found");
+  }
+});
+
+test("ExecBackend.focusPane: ENOENT spawn throw → { ok: false, error }, NEVER throws back", async () => {
+  const spawn: SpawnFn = () => {
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  };
+  const got = await createFocusBackend(spawn, "autopilot").focusPane(
+    "autopilot",
+    "11",
+  );
+  expect(got.ok).toBe(false);
+  if (got.ok === false) {
+    expect(got.error).toContain("ENOENT");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ZellijBackendDeps.session is optional — constructing with just
+// { noteLine } lets a session-agnostic-only consumer (e.g. cli/jobs.ts'
+// `v` focus key) skip the construction-session entirely.
+// ---------------------------------------------------------------------------
+
+test("createZellijBackend: omitting session is allowed (session-agnostic-only consumer)", async () => {
+  // Just exercising that this compiles + constructs without throwing —
+  // the focus call uses the per-call session, so the absent
+  // construction default is never read.
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    { "zellij:--session": { stdout: "", exitCode: 0 } },
+    calls,
+  );
+  const backend = createZellijBackend({ noteLine: () => {}, spawn });
+  const got = await backend.focusPane("any", "1");
+  expect(got).toEqual({ ok: true });
 });

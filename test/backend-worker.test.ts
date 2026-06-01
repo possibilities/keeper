@@ -3,7 +3,8 @@
  *
  * Exercise the pure `runTick` + `readLiveJobsWithCoords` symbols against a
  * fresh writer DB seeded by direct `INSERT INTO jobs`, with a stubbed
- * `resolveTab` so no real `zellij` ever spawns. The worker's lifecycle
+ * `backend` carrying just the `resolveTabForPane` slot so no real `zellij`
+ * ever spawns. The worker's lifecycle
  * (Worker thread, setInterval, parentPort.postMessage) is exercised
  * indirectly through these helpers — the same shape the autopilot-worker
  * + git-worker tests use.
@@ -36,7 +37,7 @@ import {
   runTick,
 } from "../src/backend-worker";
 import { openDb } from "../src/db";
-import type { resolveTabForPane } from "../src/exec-backend";
+import type { ExecBackend, ResolvedTabCoords } from "../src/exec-backend";
 
 let tmpDir: string;
 let dbPath: string;
@@ -86,25 +87,21 @@ function insertJob(opts: {
 }
 
 /**
- * Build a `resolveTabForPane`-shaped stub that records each (session,
+ * Build an `ExecBackend`-shaped backend stub (only the slot `runTick`
+ * actually reads — `resolveTabForPane`) that records each (session,
  * pane) invocation into `calls` and returns canned answers from a
  * (session, pane) → resolved-or-null table.
  */
-function makeResolveStub(
-  table: Record<
-    string,
-    {
-      tab_id: number | null;
-      tab_name: string;
-      tab_position: number | null;
-    } | null
-  >,
+function makeBackendStub(
+  table: Record<string, ResolvedTabCoords | null>,
   calls: Array<{ session: string; pane: string }>,
-): typeof resolveTabForPane {
-  return async (session, pane, _deps) => {
-    calls.push({ session, pane });
-    const key = `${session} ${pane}`;
-    return table[key] ?? null;
+): Pick<ExecBackend, "resolveTabForPane"> {
+  return {
+    async resolveTabForPane(session, pane) {
+      calls.push({ session, pane });
+      const key = `${session} ${pane}`;
+      return table[key] ?? null;
+    },
   };
 }
 
@@ -195,7 +192,7 @@ test("runTick: one resolve per distinct session (dedup), one snapshot per job", 
   }); // Different session — separate spawn
 
   const calls: Array<{ session: string; pane: string }> = [];
-  const resolveTab = makeResolveStub(
+  const backend = makeBackendStub(
     {
       "autopilot 11": { tab_id: 3, tab_name: "agent-a", tab_position: 0 },
       "autopilot 12": { tab_id: 4, tab_name: "agent-c", tab_position: 1 },
@@ -208,7 +205,7 @@ test("runTick: one resolve per distinct session (dedup), one snapshot per job", 
   await runTick({
     db,
     inFlight: new Set(),
-    resolveTab,
+    backend,
     post: (m) => posted.push(m),
     isShuttingDown: () => false,
   });
@@ -253,13 +250,13 @@ test("runTick: one resolve per distinct session (dedup), one snapshot per job", 
 test("runTick: no live jobs → no resolver calls, no posts", async () => {
   // No jobs inserted.
   const calls: Array<{ session: string; pane: string }> = [];
-  const resolveTab = makeResolveStub({}, calls);
+  const backend = makeBackendStub({}, calls);
   const posted: BackendWorkerMessage[] = [];
 
   await runTick({
     db,
     inFlight: new Set(),
-    resolveTab,
+    backend,
     post: (m) => posted.push(m),
     isShuttingDown: () => false,
   });
@@ -276,13 +273,13 @@ test("runTick: null resolve result → NO post (tab tombstone = last-known stick
   });
 
   const calls: Array<{ session: string; pane: string }> = [];
-  const resolveTab = makeResolveStub({ "autopilot 11": null }, calls);
+  const backend = makeBackendStub({ "autopilot 11": null }, calls);
   const posted: BackendWorkerMessage[] = [];
 
   await runTick({
     db,
     inFlight: new Set(),
-    resolveTab,
+    backend,
     post: (m) => posted.push(m),
     isShuttingDown: () => false,
   });
@@ -304,19 +301,21 @@ test("runTick: resolver throw → log + skip (no post, no wedge)", async () => {
   });
 
   const calls: Array<{ session: string; pane: string }> = [];
-  const resolveTab: typeof resolveTabForPane = async (session, pane) => {
-    calls.push({ session, pane });
-    if (session === "autopilot") {
-      throw new Error("simulated resolver crash");
-    }
-    return { tab_id: 1, tab_name: "elsewhere", tab_position: 0 };
+  const backend: Pick<ExecBackend, "resolveTabForPane"> = {
+    async resolveTabForPane(session, pane) {
+      calls.push({ session, pane });
+      if (session === "autopilot") {
+        throw new Error("simulated resolver crash");
+      }
+      return { tab_id: 1, tab_name: "elsewhere", tab_position: 0 };
+    },
   };
   const posted: BackendWorkerMessage[] = [];
 
   await runTick({
     db,
     inFlight: new Set(),
-    resolveTab,
+    backend,
     post: (m) => posted.push(m),
     isShuttingDown: () => false,
   });
@@ -340,7 +339,7 @@ test("runTick: per-session in-flight lock suppresses re-spawn against the same s
   // entirely.
   const inFlight = new Set<string>(["autopilot"]);
   const calls: Array<{ session: string; pane: string }> = [];
-  const resolveTab = makeResolveStub(
+  const backend = makeBackendStub(
     { "autopilot 11": { tab_id: 3, tab_name: "agent", tab_position: 0 } },
     calls,
   );
@@ -349,7 +348,7 @@ test("runTick: per-session in-flight lock suppresses re-spawn against the same s
   await runTick({
     db,
     inFlight,
-    resolveTab,
+    backend,
     post: (m) => posted.push(m),
     isShuttingDown: () => false,
   });
@@ -370,7 +369,7 @@ test("runTick: per-session in-flight slot is released after the resolve settles"
 
   const inFlight = new Set<string>();
   const calls: Array<{ session: string; pane: string }> = [];
-  const resolveTab = makeResolveStub(
+  const backend = makeBackendStub(
     { "autopilot 11": { tab_id: 3, tab_name: "agent", tab_position: 0 } },
     calls,
   );
@@ -379,7 +378,7 @@ test("runTick: per-session in-flight slot is released after the resolve settles"
   await runTick({
     db,
     inFlight,
-    resolveTab,
+    backend,
     post: (m) => posted.push(m),
     isShuttingDown: () => false,
   });
@@ -398,16 +397,18 @@ test("runTick: isShuttingDown=true between resolve and post suppresses the messa
   });
 
   let didResolve = false;
-  const resolveTab: typeof resolveTabForPane = async () => {
-    didResolve = true;
-    return { tab_id: 3, tab_name: "agent", tab_position: 0 };
+  const backend: Pick<ExecBackend, "resolveTabForPane"> = {
+    async resolveTabForPane() {
+      didResolve = true;
+      return { tab_id: 3, tab_name: "agent", tab_position: 0 };
+    },
   };
   const posted: BackendWorkerMessage[] = [];
 
   await runTick({
     db,
     inFlight: new Set(),
-    resolveTab,
+    backend,
     post: (m) => posted.push(m),
     // Shutdown flips between the resolve await and the post — runTick
     // must NOT post post-shutdown.
@@ -431,7 +432,7 @@ test("runTick: numeric tab_id from resolver is coerced to TEXT; null tab_id flow
   });
 
   const calls: Array<{ session: string; pane: string }> = [];
-  const resolveTab = makeResolveStub(
+  const backend = makeBackendStub(
     {
       "autopilot 11": { tab_id: 42, tab_name: "named", tab_position: 0 },
       "autopilot 12": { tab_id: null, tab_name: "id-less", tab_position: null },
@@ -443,7 +444,7 @@ test("runTick: numeric tab_id from resolver is coerced to TEXT; null tab_id flow
   await runTick({
     db,
     inFlight: new Set(),
-    resolveTab,
+    backend,
     post: (m) => posted.push(m),
     isShuttingDown: () => false,
   });

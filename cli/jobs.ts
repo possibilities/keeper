@@ -78,6 +78,7 @@ import {
   subagentLinesFor,
 } from "../src/board-render";
 import { resolveSockPath } from "../src/db";
+import { resolveExecBackend } from "../src/exec-backend";
 import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
@@ -102,7 +103,8 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   each job row gains a disclosure triangle, and the selected row is shown
   by a full-width background highlight. j/k or ↓/↑ move the selection;
   space expands / collapses the selected job's sub-agent lines (no-op on a
-  job with none); Esc leaves insert mode.
+  job with none); v focuses the selected job's zellij pane (no-op on a
+  job with no captured backend coords); Esc leaves insert mode.
   While in insert mode every other (global) key is inert — only Ctrl-C
   still quits.
   Per-frame sidecars are indexed; lifecycle + warn output is appended
@@ -520,6 +522,93 @@ export async function main(argv: string[]): Promise<void> {
       });
   }
 
+  // `v` focuses the selected job's zellij pane via the session-agnostic
+  // `ExecBackend.focusPane(session, paneId)` op. Constructs the backend
+  // once for the lifetime of the view; `noteLine` funnels backend
+  // warnings to the same lifecycle sidecar `view.noteLine` writes to.
+  // The backend has no managed session of its own here — we only ever
+  // call `focusPane`, which takes the target session per call from the
+  // selected job's `backend_exec_session_id`.
+  const backend = resolveExecBackend({
+    noteLine: (line: string) => {
+      view.noteLine(line);
+    },
+  });
+
+  // `v` (insert mode only) — focus the selected job's zellij pane. Looks
+  // up the row by `job_id` (the same resolution `space` uses for
+  // expand-toggle), reads `backend_exec_session_id` /
+  // `backend_exec_pane_id`; either null → flash `[no zellij pane]` and
+  // exit. Otherwise stamp `[focusing…]` via setStatus (persistent until
+  // the RPC resolves — `flashStatus` would restore the banner too
+  // quickly), then await `backend.focusPane(session, pane)` and flash
+  // the result (`[focused]` / `[focus failed: <reason>]`). Single-flight
+  // guarded so a mashed key never stacks RPCs against zellij — shaped
+  // identically to `handleReplayKey`.
+  let focusInFlight = false;
+  function handleFocusKey(): void {
+    if (focusInFlight) {
+      return;
+    }
+    if (lastSnap === null) {
+      return;
+    }
+    const ids = selectableJobIds(
+      lastSnap.jobs as unknown as Map<string, unknown>,
+    );
+    if (ids.length === 0) {
+      return;
+    }
+    const id = ids[Math.min(Math.max(selectedIndex, 0), ids.length - 1)];
+    if (id === undefined) {
+      return;
+    }
+    const row = (
+      lastSnap.jobs as unknown as Map<string, Record<string, unknown>>
+    ).get(id);
+    if (row == null) {
+      return;
+    }
+    const sessionId = row.backend_exec_session_id;
+    const paneId = row.backend_exec_pane_id;
+    if (
+      sessionId == null ||
+      typeof sessionId !== "string" ||
+      sessionId === "" ||
+      paneId == null ||
+      typeof paneId !== "string" ||
+      paneId === ""
+    ) {
+      view.flashStatus("[no zellij pane]");
+      return;
+    }
+    focusInFlight = true;
+    view.liveShell.setStatus("[focusing…]");
+    void backend
+      .focusPane(sessionId, paneId)
+      .then(
+        (result) => {
+          if (result.ok) {
+            view.flashStatus("[focused]");
+          } else {
+            view.noteLine(`# warn: zellij focus-pane failed: ${result.error}`);
+            const oneLine = result.error.split("\n", 1)[0] ?? result.error;
+            view.flashStatus(`[focus failed: ${oneLine}]`);
+          }
+        },
+        (err: Error) => {
+          // Defense-in-depth — `focusPane` is documented never to throw,
+          // but a future code path could. Treat the same as `ok: false`.
+          view.noteLine(`# warn: zellij focus-pane threw: ${err.message}`);
+          const oneLine = err.message.split("\n", 1)[0] ?? err.message;
+          view.flashStatus(`[focus failed: ${oneLine}]`);
+        },
+      )
+      .finally(() => {
+        focusInFlight = false;
+      });
+  }
+
   // Insert-mode state. Sub-agent lines are collapse-by-default; the
   // human enters a modal "insert mode" (`i`) to navigate job rows
   // (`j`/`k`/↑/↓), toggle a row's sub-agents (space), and leaves with
@@ -588,6 +677,12 @@ export async function main(argv: string[]): Promise<void> {
         }
         break;
       }
+      case "v":
+        // Focus the selected job's zellij pane via `ExecBackend.focusPane`.
+        // No re-emit needed — the visual feedback is the banner flash from
+        // `handleFocusKey` itself; the row list shape is unchanged.
+        handleFocusKey();
+        return true;
       default:
         // Swallow — insert mode is local; everything else is inert.
         break;

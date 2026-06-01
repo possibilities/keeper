@@ -43,7 +43,7 @@
 
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb } from "./db";
-import { resolveTabForPane } from "./exec-backend";
+import { type ExecBackend, resolveExecBackend } from "./exec-backend";
 import type { ShutdownMessage } from "./wake-worker";
 
 /**
@@ -140,8 +140,8 @@ export function readLiveJobsWithCoords(
  * failure → skip). Exceptions inside the resolve are caught and logged
  * per-pane so one bad pane can't poison the rest of the session's walk.
  *
- * Exported for tests: a fake `resolveTab` (typed identically to
- * `resolveTabForPane`) lets the test drive the dedup + skip behavior
+ * Exported for tests: an injected `backend` (a `Pick<ExecBackend,
+ * "resolveTabForPane">`) lets the test drive the dedup + skip behavior
  * without spawning processes.
  */
 export interface TickDeps {
@@ -149,8 +149,10 @@ export interface TickDeps {
   readonly db: import("bun:sqlite").Database;
   /** Per-session in-flight lock — shared across ticks. */
   readonly inFlight: Set<string>;
-  /** Resolver injection point. Defaults to `resolveTabForPane`. */
-  readonly resolveTab?: typeof resolveTabForPane;
+  /** Backend injection point. Defaults to a fresh `resolveExecBackend`
+   *  forwarding warnings to stderr. Tests inject a stub carrying just
+   *  the `resolveTabForPane` slot the tick driver actually reads. */
+  readonly backend?: Pick<ExecBackend, "resolveTabForPane">;
   /** Message sink. Production posts to `parentPort`; tests capture. */
   readonly post: (msg: BackendWorkerMessage) => void;
   /** Shutdown predicate — gates the post AFTER an await so a late
@@ -160,7 +162,13 @@ export interface TickDeps {
 
 export async function runTick(deps: TickDeps): Promise<void> {
   const { db, inFlight, post, isShuttingDown } = deps;
-  const resolveTab = deps.resolveTab ?? resolveTabForPane;
+  const backend =
+    deps.backend ??
+    resolveExecBackend({
+      noteLine: (line: string) => {
+        console.error(line);
+      },
+    });
   const rows = readLiveJobsWithCoords(db);
   if (rows.length === 0) return;
 
@@ -226,7 +234,10 @@ export async function runTick(deps: TickDeps): Promise<void> {
             tab_position: number | null;
           } | null;
           try {
-            resolved = await resolveTab(bucket.session, bucket.pane);
+            resolved = await backend.resolveTabForPane(
+              bucket.session,
+              bucket.pane,
+            );
           } catch (err) {
             // `resolveTabForPane` is designed to swallow spawn / parse
             // errors internally and return null — but defense-in-depth
