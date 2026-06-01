@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-01T14:24:23.117818Z",
+  "depends_on": [
+    "fn-668-backend-exec-coordinates-on-jobs.1",
+    "fn-668-backend-exec-coordinates-on-jobs.2"
+  ],
+  "epic": "fn-668-backend-exec-coordinates-on-jobs",
+  "id": "fn-668-backend-exec-coordinates-on-jobs.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "hook capture and reducer fold",
+  "updated_at": "2026-06-01T14:24:23.117818Z"
+}

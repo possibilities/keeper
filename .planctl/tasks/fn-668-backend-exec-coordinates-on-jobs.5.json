@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-01T14:24:23.117818Z",
+  "depends_on": [
+    "fn-668-backend-exec-coordinates-on-jobs.2",
+    "fn-668-backend-exec-coordinates-on-jobs.4"
+  ],
+  "epic": "fn-668-backend-exec-coordinates-on-jobs",
+  "id": "fn-668-backend-exec-coordinates-on-jobs.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "render coords on jobs surface and TUI",
+  "updated_at": "2026-06-01T14:24:23.117818Z"
+}
