@@ -489,6 +489,62 @@ test("createZellijBackend.launch: session missing → attach -b, then poll, then
   expect(actionIdx).toBeGreaterThan(1);
 });
 
+test("createZellijBackend.launch: session listed but EXITED → attach -b (resurrect), then new-tab", async () => {
+  // Regression: a dead session lingers in `list-sessions` branded
+  // `(EXITED - attach to resurrect)`. It is NOT a live server — a
+  // `new-tab` against it exits non-zero ("There is no active
+  // session!"). ensureSession must treat the corpse as not-listed and
+  // route to `attach -b`, which resurrects it in place.
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  let listCalls = 0;
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "list-sessions") {
+      listCalls++;
+      // First probe: the session is present but EXITED. After
+      // `attach -b` resurrects it, the re-poll shows it live.
+      return reply(
+        listCalls === 1
+          ? "autopilot [Created 3h 51m ago] (EXITED - attach to resurrect)\n"
+          : "autopilot [Created 0s ago]\n",
+      );
+    }
+    if (cmd[1] === "attach" && cmd[2] === "-b") return reply("");
+    if (cmd[1] === "--session" && cmd[4] === "list-tabs")
+      return reply("TAB_ID  POSITION  NAME\n0  0  Tab #1\n");
+    if (cmd[1] === "--session" && cmd[4] === "new-tab") return reply("12\n");
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    session: "autopilot",
+    spawn,
+  });
+  const res = await backend.launch(
+    ["/bin/zsh", "-l", "-i", "-c", "echo hi"],
+    "approve::fn-661-x",
+    "/abs/dir",
+  );
+  expect(res).toEqual({ ok: true });
+  // The EXITED line did NOT short-circuit ensureSession — `attach -b`
+  // fired to resurrect, and new-tab landed after a re-poll.
+  expect(
+    calls.some(
+      (c) => c[1] === "attach" && c[2] === "-b" && c[3] === "autopilot",
+    ),
+  ).toBe(true);
+  const actionIdx = calls.findIndex(
+    (c) => c[1] === "--session" && c[4] === "new-tab",
+  );
+  expect(actionIdx).toBeGreaterThan(1);
+});
+
 test("createZellijBackend.launch: session-ensure is memoized — second launch skips list/attach", async () => {
   const calls: string[][] = [];
   const notes: string[] = [];

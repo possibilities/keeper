@@ -467,10 +467,16 @@ export function buildZellijAttachBgArgs(session: string): string[] {
 
 /**
  * Internal: parse zellij `list-sessions` output and decide whether
- * `session` is already listed. zellij prints one session per line,
- * usually annotated like `autopilot [Created 5s ago]`; we substring-
- * match on the bare name as the first whitespace-delimited token. Robust
- * to ANSI escape codes and the `EXITED - ` prefix.
+ * `session` is already listed AND LIVE. zellij prints one session per
+ * line, usually annotated like `autopilot [Created 5s ago]`; we
+ * substring-match on the bare name as the first whitespace-delimited
+ * token. Robust to ANSI escape codes.
+ *
+ * A line carrying zellij's EXITED marker (`autopilot [Created 3h ago]
+ * (EXITED - attach to resurrect)`) is a CORPSE, not a live server —
+ * `action new-tab` against it exits non-zero ("There is no active
+ * session!"). We treat such a line as NOT listed so `ensureSession`
+ * routes to `attach -b`, which resurrects the session in place.
  */
 function zellijSessionListed(text: string, session: string): boolean {
   const lines = text.split("\n");
@@ -484,13 +490,10 @@ function zellijSessionListed(text: string, session: string): boolean {
     if (trimmed.length === 0) {
       continue;
     }
-    // Drop any leading "EXITED - " marker (zellij brands closed sessions
-    // that way). Then peel off the first whitespace token as the name.
-    const noExit = trimmed.startsWith("EXITED - ")
-      ? trimmed.slice("EXITED - ".length)
-      : trimmed;
-    const firstTok = noExit.split(/\s+/)[0];
-    if (firstTok === session) {
+    // First whitespace token is the bare session name. ANSI is already
+    // stripped, so the EXITED brand surfaces as a bare `EXITED` token.
+    const firstTok = trimmed.split(/\s+/)[0];
+    if (firstTok === session && !/\bEXITED\b/.test(trimmed)) {
       return true;
     }
   }
