@@ -827,7 +827,7 @@ function runDaemon(): void {
   const serverWorker = new Worker(
     new URL("./server-worker.ts", import.meta.url).href,
     {
-      workerData: { dbPath } satisfies ServerWorkerData,
+      workerData: { dbPath, role: "server" } satisfies ServerWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );
 

@@ -86,8 +86,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb } from "./db";
+import { resolveExecBackend } from "./exec-backend";
 import { computeReadiness, type Verdict } from "./readiness";
-import type { Epic, Job, SubagentInvocation, Task } from "./types";
+import {
+  collapseSubagentsByName,
+  projectGitStatusByProjectDir,
+} from "./readiness-client";
+import { runQuery } from "./server-worker";
+import type { Epic, GitStatus, Job, SubagentInvocation, Task } from "./types";
 import { watchLoop } from "./wake-worker";
 
 /**
@@ -880,8 +886,105 @@ export interface DispatchFailedMessage {
 
 type IncomingMessage = SetPausedMessage | ShutdownMessage;
 // `DispatchFailedMessage` is the outgoing wire shape main consumes when the
-// reconcile + dispatch loop is wired (a sibling fn-661 task); kept exported
-// so the supervisor's message handler types against the same record.
+// reconcile + dispatch loop is wired; the supervisor's message handler types
+// against the same record.
+
+/**
+ * Load a fresh {@link ReconcileSnapshot} from the worker's read-only
+ * connection. Every collection is read through the SAME `runQuery` the
+ * server-worker answers client subscriptions with, so the reconciler's
+ * desired-vs-observed view matches the wire snapshot the readiness client
+ * (board / viewer) sees byte-for-byte — no second decode path to drift.
+ *
+ * Each collection is read with NO wire filter, so each descriptor's
+ * DEFAULT scope applies (epics: open-OR-not-approved; jobs: live-only
+ * `working`/`stopped`) — exactly the live work set the reconciler acts on.
+ * `limit: 0` is the "all rows" sentinel.
+ *
+ * Mirrors the readiness client's assembly (`src/readiness-client.ts`):
+ *  - sub-agents are collapsed same-name → most-recent before readiness
+ *    sees them (orphaned `running` rows whose `SubagentStop` never landed
+ *    must not false-block predicate 6);
+ *  - git rows are projected through the shared
+ *    {@link projectGitStatusByProjectDir} helper (identical attribution
+ *    math);
+ *  - `failedKeys` is the set of `(verb, id)` with an open `dispatch_failures`
+ *    row — sticky until a human `retry_dispatch` mints a `DispatchCleared`
+ *    (cleared failures are deleted from the projection, so every row present
+ *    is an open failure).
+ */
+function loadReconcileSnapshot(db: Parameters<typeof runQuery>[0]): {
+  epics: Epic[];
+  jobs: Map<string, Job>;
+  subagentInvocations: SubagentInvocation[];
+  gitStatusByProjectDir: Map<
+    string,
+    { dirty_count: number; unattributed_to_live_count: number }
+  >;
+  failedKeys: Set<DispatchKey>;
+} {
+  const read = (collection: string): Record<string, unknown>[] => {
+    const frame = {
+      type: "query" as const,
+      collection,
+      id: `autopilot-${collection}`,
+      limit: 0,
+    };
+    const res = runQuery(db, 0, frame);
+    return res.type === "result" ? (res.rows as Record<string, unknown>[]) : [];
+  };
+
+  const epics = read("epics") as unknown as Epic[];
+
+  const jobs = new Map<string, Job>();
+  for (const row of read("jobs") as unknown as Job[]) {
+    jobs.set(row.job_id, row);
+  }
+
+  const subagentInvocations = collapseSubagentsByName(
+    read("subagent_invocations") as unknown as SubagentInvocation[],
+  ).map((g) => g.row);
+
+  const gitStatusByProjectDir = projectGitStatusByProjectDir(
+    read("git") as unknown as GitStatus[],
+  );
+
+  const failedKeys = new Set<DispatchKey>();
+  for (const row of read("dispatch_failures")) {
+    const verb = (row as { verb?: unknown }).verb;
+    const id = (row as { id?: unknown }).id;
+    if (typeof verb === "string" && typeof id === "string") {
+      failedKeys.add(dispatchKey(verb as Verb, id));
+    }
+  }
+
+  return {
+    epics,
+    jobs,
+    subagentInvocations,
+    gitStatusByProjectDir,
+    failedKeys,
+  };
+}
+
+/** Resolve `ms` later, or early if `signal` aborts (treated as shutdown). */
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 /** Wire the worker. Spawned by `src/daemon.ts` after the boot drain. */
 function main(): void {
@@ -900,13 +1003,25 @@ function main(): void {
     paused: data.paused ?? true,
     inFlight: new Set(),
   };
-  // `liveDispatches` + the worker-scoped abort controller live in scope
-  // for the sibling fn-661 wiring task that lights up the reconcile +
-  // dispatch loop. Today the shell is `watchLoop` + shutdown handler
-  // only; the controller is constructed (so shutdown still aborts a
-  // future in-flight confirm) but unused until then.
+  // `liveDispatches` tracks the in-flight surfaces this reconciler still
+  // owns confirm/reap work for (keyed `${verb}::${id}`). Boots EMPTY: a
+  // cold restart re-derives "already running" from the durable `jobs`
+  // projection (the snapshot's occupying-job gate suppresses re-dispatch
+  // of survivors), so no surface is double-launched even though
+  // liveDispatches starts cold. The worker-scoped abort controller aborts
+  // every in-flight confirm sleep on shutdown.
   const shutdownController = new AbortController();
+  const liveDispatches = new Map<DispatchKey, LiveDispatch>();
   let shutdown = false;
+  // Late-bound reconcile kick. The reconciler is level-triggered on
+  // `data_version` (the `watchLoop` below), but two edges have no DB write
+  // to ride: (1) `play` (set-paused → false) flips an in-memory flag only,
+  // and (2) a boot into an already-unpaused state. Without an explicit
+  // kick, a quiescent DB leaves ready work undispatched until some
+  // unrelated event happens to pulse `data_version`. `requestCycle` is
+  // assigned once `driveCycle` is constructed below; it stays a no-op until
+  // then (no message can arrive before `main()` finishes synchronous setup).
+  let requestCycle: () => void = () => {};
 
   parentPort.on("message", (msg: IncomingMessage | undefined) => {
     if (!msg) return;
@@ -916,7 +1031,13 @@ function main(): void {
       return;
     }
     if (msg.type === "set-paused") {
+      const wasPaused = state.paused;
       state.paused = msg.paused;
+      // Unpause edge (play): kick a cycle so ready work dispatches now
+      // instead of waiting for the next incidental `data_version` pulse.
+      if (wasPaused && !msg.paused) {
+        requestCycle();
+      }
       return;
     }
   });
@@ -929,24 +1050,122 @@ function main(): void {
     }
   };
 
-  // The full data-loading + reconcile + dispatch loop is intentionally
-  // NOT inlined here — its individual pieces (loadSnapshot, post to
-  // main, etc) belong in a future fn-661 task that wires this worker
-  // into the daemon. This entrypoint exists today as the structural
-  // shell required by the worker contract (isMainThread guard,
-  // readonly conn, data_version wake loop, shutdown handler aborts
-  // in-flight confirm). The pure `reconcile` / `confirmRunning` /
-  // `runReconcileCycle` symbols ARE the production decision logic —
-  // they're exported and covered by the test suite; the daemon
-  // wiring task (a sibling fn-661 task) glues them to a real
-  // snapshot loader and the synthetic-event mint path on main.
+  // The terminal-surface backend (zellij). `noteLine` funnels the
+  // backend's forensic warnings to stderr — the worker has no lifecycle
+  // sidecar, so stderr is the visibility seam.
+  const backend = resolveExecBackend({
+    noteLine: (line: string) => {
+      console.error(line);
+    },
+    session: data.zellijSession,
+  });
+  const config: ReconcileConfig = {
+    autocloseWindows: data.autocloseWindows ?? false,
+  };
+  // `$SHELL` for the launch argv (`buildLaunchArgv`). Resolved once.
+  const shell = process.env.SHELL ?? "/bin/sh";
+
+  // Side-effect deps for the reconcile + confirm cycle. Reads run on the
+  // worker's OWN read-only connection; the worker NEVER writes the DB —
+  // a DispatchFailed is described to main via `postMessage` (main is the
+  // sole writer of the synthetic event, mirroring the git-worker mint).
+  const deps: ConfirmRunningDeps & {
+    closeByName(name: string): Promise<void>;
+  } = {
+    launch: (argv, name, cwd) => backend.launch(argv, name, cwd),
+    closeByName: (name) => backend.closeByName(name),
+    emitDispatchFailed: (payload) => {
+      parentPort?.postMessage({
+        kind: "dispatch-failed",
+        payload,
+      } satisfies DispatchFailedMessage);
+    },
+    maxEventId: () => {
+      const row = db.query("SELECT MAX(id) AS m FROM events").get() as
+        | { m: number | null }
+        | undefined;
+      return row?.m ?? 0;
+    },
+    findJob: (plan_verb, plan_ref, last_event_id_gt) => {
+      const row = db
+        .query(
+          `SELECT job_id, last_event_id FROM jobs
+              WHERE plan_verb = ? AND plan_ref = ?
+                AND state IN ('working', 'stopped')
+                AND last_event_id > ?
+              LIMIT 1`,
+        )
+        .get(plan_verb, plan_ref, last_event_id_gt) as
+        | { job_id: string; last_event_id: number }
+        | undefined;
+      return row ?? null;
+    },
+    now: () => Math.floor(Date.now() / 1000),
+    sleep: (ms, signal) => abortableSleep(ms, signal),
+  };
+
+  // Single-flight reconcile drive. `watchLoop` fires this callback on
+  // every `data_version` pulse; if a cycle is already running we set
+  // `wakePending` and the running cycle loops once more after it finishes
+  // — coalescing a burst of wakes into one trailing re-run (the same
+  // shape `src/daemon.ts` keeps for the reducer pump). The cycle is fully
+  // re-entrant-safe: `reconcile` is pure over a freshly-loaded snapshot,
+  // and `runReconcileCycle` owns the one-at-a-time `inFlight` stagger.
+  let cycleRunning = false;
+  let wakePending = false;
+  const driveCycle = async (): Promise<void> => {
+    if (cycleRunning) {
+      wakePending = true;
+      return;
+    }
+    cycleRunning = true;
+    try {
+      do {
+        wakePending = false;
+        if (shutdown) {
+          return;
+        }
+        const snapshot = loadReconcileSnapshot(db);
+        const decision = reconcile(
+          snapshot,
+          state,
+          liveDispatches,
+          config,
+          deps.now(),
+        );
+        await runReconcileCycle(
+          decision,
+          state,
+          liveDispatches,
+          shell,
+          shutdownController.signal,
+          deps,
+        );
+      } while (wakePending && !shutdown);
+    } catch (err) {
+      // A reconcile/dispatch throw must not wedge the wake loop — log and
+      // let the next pulse re-drive. (Per-launch failures are already
+      // funnelled to DispatchFailed inside `confirmRunning`; this catch is
+      // the snapshot-load / unexpected-throw backstop.)
+      console.error("[autopilot-worker] reconcile cycle threw:", err);
+    } finally {
+      cycleRunning = false;
+    }
+  };
+
+  // Bind the unpause/boot kick now that `driveCycle` exists, then run one
+  // cycle immediately. The boot cycle is a no-op for launches while paused
+  // (the safety default) but still computes reaps; the play-edge kick
+  // (above) is what dispatches ready work the instant the human unpauses.
+  requestCycle = () => {
+    void driveCycle();
+  };
+  requestCycle();
 
   watchLoop(
     db,
     () => {
-      // No-op for now. The wiring task replaces this with a
-      // single-flight `runReconcileCycle` drive; the supervisor's
-      // `wakePending` flag coalesces wakes that arrive mid-cycle.
+      void driveCycle();
     },
     () => shutdown,
     data.pollMs,

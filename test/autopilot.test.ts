@@ -672,5 +672,7 @@ test("buildRetryFrame — passes the dispatch key verbatim (server validates the
   // wire boundary's canonical validator. Pass the malformed shape through
   // unchanged so the server's typed rejection surfaces to the caller.
   const frame = buildRetryFrame("rpc-uuid-4", "garbage");
-  expect((frame as unknown as { params: { id: string } }).params.id).toBe("garbage");
+  expect((frame as unknown as { params: { id: string } }).params.id).toBe(
+    "garbage",
+  );
 });

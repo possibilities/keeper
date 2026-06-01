@@ -97,6 +97,15 @@ export interface ServerWorkerData {
   lockPath?: string;
   /** Realtime poll cadence in ms (defaults to `DEFAULT_POLL_MS`, floored at 25). */
   pollMs?: number;
+  /**
+   * Worker-role discriminator. The bottom-of-file entrypoint runs `main()`
+   * (bind socket, acquire lock, serve) ONLY when this is `"server"`. Other
+   * worker modules (e.g. `src/autopilot-worker.ts`) import this module for
+   * its pure `runQuery` export and run as `!isMainThread` themselves — the
+   * gate stops their import from spawning a SECOND server that fights the
+   * real one for the lock (`LockHeldError`) and crashes the daemon.
+   */
+  role?: "server";
 }
 
 /** Message posted to the parent when the listener is bound and serving. */
@@ -2111,7 +2120,7 @@ function main(): void {
         }, REPLAY_DEADLINE_MS);
         timer.unref?.();
         pendingReplays.set(reqId, { resolve, reject, timer });
-        parentPort!.postMessage({
+        parentPort?.postMessage({
           kind: "replay-request",
           id: reqId,
         } satisfies ReplayRequestMessage);
@@ -2131,7 +2140,7 @@ function main(): void {
         }, REPLAY_DEADLINE_MS);
         timer.unref?.();
         pendingSetPaused.set(reqId, { resolve, reject, timer });
-        parentPort!.postMessage({
+        parentPort?.postMessage({
           kind: "set-autopilot-paused-request",
           id: reqId,
           paused,
@@ -2155,7 +2164,7 @@ function main(): void {
         }, REPLAY_DEADLINE_MS);
         timer.unref?.();
         pendingRetryDispatch.set(reqId, { resolve, reject, timer });
-        parentPort!.postMessage({
+        parentPort?.postMessage({
           kind: "retry-dispatch-request",
           id: reqId,
           verb,
@@ -2289,7 +2298,13 @@ function main(): void {
   parentPort.postMessage({ kind: "ready" } satisfies ReadyMessage);
 }
 
-// Only run inside a real Worker; a plain import on the main thread is inert.
-if (!isMainThread) {
+// Only run inside a real Worker spawned AS the server (`role: "server"`).
+// A plain import on the main thread is inert; an import from ANOTHER worker
+// module (which needs `runQuery` but is not the server) must NOT spawn a
+// competing server — the role gate enforces that.
+if (
+  !isMainThread &&
+  (workerData as ServerWorkerData | undefined)?.role === "server"
+) {
   main();
 }

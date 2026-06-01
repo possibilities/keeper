@@ -368,6 +368,65 @@ export function projectRows<T>(state: { rows: readonly unknown[] }): T[] {
 }
 
 /**
+ * Project raw `git_status` rows into the
+ * `Map<project_dir, {dirty_count, unattributed_to_live_count}>` shape
+ * `computeReadiness` consumes. `unattributed_to_live_count` is computed
+ * client-side by walking each row's `dirty_files[].attributions[]` and
+ * counting files with NO attribution in a live (`working`/`stopped`)
+ * state — the mirror of the reducer's PASS-4 fan-out, redone from the
+ * same materialized JSON the reducer wrote so both numbers reconcile.
+ *
+ * Defensive parsing throughout: every nested field is `unknown` at the
+ * wire boundary, so each access is guarded (no-attribution rows count,
+ * malformed rows fall through to no-attribution by design — mirrors the
+ * reducer's "fold must never throw" safe-value discipline).
+ *
+ * Exported so the server-side autopilot reconciler worker
+ * (`src/autopilot-worker.ts`) builds its `ReconcileSnapshot.gitStatusByProjectDir`
+ * from the IDENTICAL math the live readiness client uses — the snapshot
+ * the reconciler folds must match the wire snapshot byte-for-byte, so
+ * this logic lives in exactly one place.
+ */
+export function projectGitStatusByProjectDir(
+  rows: GitStatus[],
+): Map<string, { dirty_count: number; unattributed_to_live_count: number }> {
+  const out = new Map<
+    string,
+    { dirty_count: number; unattributed_to_live_count: number }
+  >();
+  const LIVE_ATTRIBUTION_STATES = new Set(["working", "stopped"]);
+  for (const row of rows) {
+    let unattributedToLive = 0;
+    for (const file of row.dirty_files) {
+      if (typeof file !== "object" || file === null) {
+        unattributedToLive++;
+        continue;
+      }
+      const attrs = (file as { attributions?: unknown }).attributions;
+      if (!Array.isArray(attrs) || attrs.length === 0) {
+        unattributedToLive++;
+        continue;
+      }
+      let hasLive = false;
+      for (const a of attrs) {
+        if (typeof a !== "object" || a === null) continue;
+        const state = (a as { state?: unknown }).state;
+        if (typeof state === "string" && LIVE_ATTRIBUTION_STATES.has(state)) {
+          hasLive = true;
+          break;
+        }
+      }
+      if (!hasLive) unattributedToLive++;
+    }
+    out.set(row.project_dir, {
+      dirty_count: row.dirty_count,
+      unattributed_to_live_count: unattributedToLive,
+    });
+  }
+  return out;
+}
+
+/**
  * Client-side collapse of `subagent_invocations` by `(job_id,
  * subagent_type)`. For each group, the row with the highest
  * `turn_seq` wins; the count of folded rows AND the count of stuck
@@ -1160,45 +1219,7 @@ export function subscribeReadiness(
     // redone here from the same materialized JSON the reducer wrote so
     // both numbers reconcile.
     const gitTyped = projectRows<GitStatus>(gitStatus);
-    const gitStatusByProjectDir = new Map<
-      string,
-      { dirty_count: number; unattributed_to_live_count: number }
-    >();
-    const LIVE_ATTRIBUTION_STATES = new Set(["working", "stopped"]);
-    for (const row of gitTyped) {
-      // Walk `dirty_files[].attributions[]` and count files with no live
-      // attribution. Defensive parsing: every nested field is `unknown`
-      // at the wire boundary, so guard each access (no-attribution rows
-      // count, malformed rows fall through to no-attribution by design —
-      // mirrors the reducer's "fold must never throw" safe-value
-      // discipline).
-      let unattributedToLive = 0;
-      for (const file of row.dirty_files) {
-        if (typeof file !== "object" || file === null) {
-          unattributedToLive++;
-          continue;
-        }
-        const attrs = (file as { attributions?: unknown }).attributions;
-        if (!Array.isArray(attrs) || attrs.length === 0) {
-          unattributedToLive++;
-          continue;
-        }
-        let hasLive = false;
-        for (const a of attrs) {
-          if (typeof a !== "object" || a === null) continue;
-          const state = (a as { state?: unknown }).state;
-          if (typeof state === "string" && LIVE_ATTRIBUTION_STATES.has(state)) {
-            hasLive = true;
-            break;
-          }
-        }
-        if (!hasLive) unattributedToLive++;
-      }
-      gitStatusByProjectDir.set(row.project_dir, {
-        dirty_count: row.dirty_count,
-        unattributed_to_live_count: unattributedToLive,
-      });
-    }
+    const gitStatusByProjectDir = projectGitStatusByProjectDir(gitTyped);
     const readiness = computeReadiness(
       epicsTyped,
       jobsTyped,
