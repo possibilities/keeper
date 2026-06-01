@@ -45,5 +45,5 @@ Edit CLAUDE.md in place — never rm+recreate the AGENTS.md symlink.
 - [ ] Worker count consistent across both docs; AGENTS.md symlink untouched
 
 ## Done summary
-
+Updated CLAUDE.md (BEGIN IMMEDIATE projection list, synthetic-event sole-writer enumeration, DO NOT RPC-scoped-surface paragraph widened to four surfaces) and README.md (Install config keys, thin-viewer Example-clients entry, Architecture eighth-worker reconciler paragraph + v42 schema-history line + readiness-client-side note) to reflect the server-side autopilot reconciler. AGENTS.md symlink untouched.
 ## Evidence
