@@ -978,6 +978,240 @@ test("createZellijBackend.closeByName: never substring-matches a near-miss tab n
 });
 
 // ---------------------------------------------------------------------------
+// tabExistsByName / liveTabNames (fn-674)
+// ---------------------------------------------------------------------------
+
+test("createZellijBackend.tabExistsByName: exact match → true (recycle-safe, no substring)", async () => {
+  const spawn: SpawnFn = (cmd) => {
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "--session" && cmd[4] === "list-panes") {
+      return reply(
+        JSON.stringify([
+          { id: "terminal_1", tab_name: "work::fn-60-x.1" },
+          { id: "terminal_2", tab_name: "approve::fn-2-y.1" },
+        ]),
+      );
+    }
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  // Exact match → true.
+  expect(await backend.tabExistsByName("work::fn-60-x.1")).toBe(true);
+  expect(await backend.tabExistsByName("approve::fn-2-y.1")).toBe(true);
+  // Substring of an existing tab name → false (the recycle-safety guard
+  // that mirrors `findPaneByTabName`'s exact-match rule; the fn-6 vs
+  // fn-60-x.1 hazard the closeByName tests already cover).
+  expect(await backend.tabExistsByName("work::fn-6")).toBe(false);
+  expect(await backend.tabExistsByName("work::fn-60")).toBe(false);
+  // Missing key → false.
+  expect(await backend.tabExistsByName("work::missing")).toBe(false);
+});
+
+test("createZellijBackend.tabExistsByName: same pane id under a different tab name → false (recycle-safety)", async () => {
+  // Pane id `terminal_1` is unchanged across the zellij server life,
+  // but its tab name was renamed from `work::fn-1-x.1` to
+  // `work::fn-1-x.2`. The probe MUST gate on the new tab_name and
+  // return false for the stale name — recycle-safety mirrors the
+  // resolveTabForPane parse semantics the spec calls out.
+  const spawn: SpawnFn = (cmd) => {
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "--session" && cmd[4] === "list-panes") {
+      return reply(
+        JSON.stringify([{ id: "terminal_1", tab_name: "work::fn-1-x.2" }]),
+      );
+    }
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  expect(await backend.tabExistsByName("work::fn-1-x.1")).toBe(false);
+  expect(await backend.tabExistsByName("work::fn-1-x.2")).toBe(true);
+});
+
+test("createZellijBackend.tabExistsByName: zellij missing (ENOENT spawn throw) → false (inert, no throw)", async () => {
+  const spawn: SpawnFn = () => {
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  };
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  // The dedup arm degrades open on a missing binary — false, no throw.
+  expect(await backend.tabExistsByName("work::fn-1-x.1")).toBe(false);
+});
+
+test("createZellijBackend.tabExistsByName: non-zero list-panes exit → false (inert)", async () => {
+  const spawn: SpawnFn = (cmd) => {
+    const reply = (stdout: string, exitCode = 0) => ({
+      exited: Promise.resolve(exitCode),
+      stdout: new Response(stdout).body,
+      stderr: new Response("no active session").body,
+    });
+    if (cmd[1] === "--session" && cmd[4] === "list-panes") {
+      return reply("", 1);
+    }
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  expect(await backend.tabExistsByName("work::fn-1-x.1")).toBe(false);
+});
+
+test("createZellijBackend.tabExistsByName: unparseable JSON → false (inert)", async () => {
+  const spawn: SpawnFn = (cmd) => {
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "--session" && cmd[4] === "list-panes") {
+      return reply("not json");
+    }
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  expect(await backend.tabExistsByName("work::fn-1-x.1")).toBe(false);
+});
+
+test("createZellijBackend.tabExistsByName: object-map shape (tab_name → panes) — key fallback honored", async () => {
+  // Defensive: zellij has shipped both a flat array AND an object-map
+  // shape for list-panes -a -j across versions. The probe must work
+  // against both, matching `findPaneByTabName`'s tolerance.
+  const spawn: SpawnFn = (cmd) => {
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "--session" && cmd[4] === "list-panes") {
+      return reply(
+        JSON.stringify({
+          "work::fn-1-x.1": [{ id: "terminal_3" }],
+          "approve::fn-2-y.1": [{ id: "terminal_4" }],
+        }),
+      );
+    }
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  expect(await backend.tabExistsByName("work::fn-1-x.1")).toBe(true);
+  expect(await backend.tabExistsByName("approve::fn-2-y.1")).toBe(true);
+  expect(await backend.tabExistsByName("missing")).toBe(false);
+});
+
+test("createZellijBackend.liveTabNames: returns the full set of tab_name strings (one list-panes round-trip)", async () => {
+  // The bulk variant the autopilot reconciler's snapshot loader uses
+  // — one list-panes call per cycle, set returned with every distinct
+  // tab name in the session.
+  const calls: string[][] = [];
+  const spawn: SpawnFn = (cmd) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "--session" && cmd[4] === "list-panes") {
+      return reply(
+        JSON.stringify([
+          { id: "terminal_1", tab_name: "work::fn-1-x.1" },
+          { id: "terminal_2", tab_name: "approve::fn-2-y.1" },
+          // Duplicate tab_name across panes — should collapse to one
+          // entry in the returned set.
+          { id: "terminal_3", tab_name: "work::fn-1-x.1" },
+        ]),
+      );
+    }
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  const got = await backend.liveTabNames();
+  expect(got).toEqual(new Set(["work::fn-1-x.1", "approve::fn-2-y.1"]));
+  // Exactly one list-panes call (no per-name fanout — the load-bearing
+  // efficiency claim the loader relies on).
+  const listPanesCalls = calls.filter((c) => c[4] === "list-panes");
+  expect(listPanesCalls.length).toBe(1);
+});
+
+test("createZellijBackend.liveTabNames: ENOENT / non-zero exit / unparseable → empty Set (inert)", async () => {
+  // ENOENT throw.
+  const throwSpawn: SpawnFn = () => {
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  };
+  const enoentBackend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn: throwSpawn,
+  });
+  expect((await enoentBackend.liveTabNames()).size).toBe(0);
+
+  // Non-zero exit.
+  const failSpawn: SpawnFn = (cmd) => {
+    const reply = (stdout: string, exitCode = 0) => ({
+      exited: Promise.resolve(exitCode),
+      stdout: new Response(stdout).body,
+      stderr: new Response("nope").body,
+    });
+    if (cmd[1] === "--session" && cmd[4] === "list-panes") return reply("", 2);
+    return reply("");
+  };
+  const failBackend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn: failSpawn,
+  });
+  expect((await failBackend.liveTabNames()).size).toBe(0);
+
+  // Unparseable JSON.
+  const garbleSpawn: SpawnFn = (cmd) => {
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "--session" && cmd[4] === "list-panes") return reply("xxx");
+    return reply("");
+  };
+  const garbleBackend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn: garbleSpawn,
+  });
+  expect((await garbleBackend.liveTabNames()).size).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
 // resolveExecBackend — thin zellij-only seam
 // ---------------------------------------------------------------------------
 

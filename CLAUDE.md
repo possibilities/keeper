@@ -346,3 +346,32 @@ firing correctly — check them before concluding it is broken:
   for the worker spawn ordering, but is no longer the viewer's source of
   truth. `confirmRunning` serializes launches, so dispatch is paced, not a
   burst.
+- **Closes the launch → SessionStart blind window via a per-cycle zellij
+  tab probe (schema-stable, fn-674).** Every worker launches into a zellij
+  tab named exactly `verb::id` (the same `--name` baked into the worker
+  argv that becomes the `plan_verb` / `plan_ref` correlator at SessionStart).
+  At snapshot load the autopilot worker calls `ExecBackend.liveTabNames()`
+  once, intersects the returned `Set<string>` with the candidate
+  `verb::id` dispatch keys for the current epic / task / close-row set,
+  and freezes the intersection into the new `liveTabKeys: Set<DispatchKey>`
+  field on `ReconcileSnapshot`. A fifth suppression arm in `reconcile()`
+  fires when `liveTabKeys.has(key)` is true — alongside the legacy
+  `state.paused`, `state.inFlight`, `snapshot.failedKeys`, and
+  `isOccupyingJob` arms — and `confirmRunning` resolves `"ok"` (no
+  DispatchFailed mint, no slot freed) the instant `deps.tabExistsByName`
+  goes true OR `deps.findJob` returns the row, whichever fires first.
+  `reconcile()` itself stays pure — it reads the synchronous Set, never
+  the backend, so the re-fold determinism invariant on the no-DB-write
+  side holds. `DEFAULT_CEILING_MS` was bumped from 18s to 60s as
+  defense-in-depth — with early-resolve the ceiling rarely matters; a
+  ceiling elapsed while the tab is alive resolves `"ok"` and mints
+  nothing (the standing arm keeps the slot held on the next cycle),
+  and only a ceiling elapsed with NEITHER tab NOR jobs row visible
+  mints `DispatchFailed`. The probe runs against the managed zellij
+  session ONLY (no ensure-session side effect inside the dedup arm)
+  and degrades to `false` / empty Set on every failure mode — ENOENT,
+  non-zero exit, unparseable JSON — so a transient zellij outage
+  opens the arm gracefully rather than wedging dispatch. Restart
+  safety is free: the probe re-derives launch-window occupation
+  against zellij on every wake, so a daemon restart never
+  double-dispatches a slot already claimed by a live worker tab.

@@ -12,6 +12,13 @@
  *         - skip if an open `dispatch_failures` row exists for `(V, id)`.
  *         - skip if a dispatch for `(V, id)` is already in-flight on this
  *           reconciler (one-at-a-time stagger preserved, fn-644).
+ *         - skip if the snapshot's `liveTabKeys` set carries `${V}::${id}`
+ *           (fn-674): a zellij tab labeled exactly `verb::id` exists in
+ *           the managed session — proof a launched worker is occupying
+ *           the slot in the launch → SessionStart blind window before
+ *           its `jobs` row lands. The set is probed ONCE per cycle at
+ *           snapshot load via `ExecBackend.tabExistsByName`; the reduce
+ *           stays pure.
  *         - else dispatch via `confirmRunning(verb, id, deps)`.
  *     → symmetric reap: when the autoclose config flag is on, for each
  *       live dispatch whose role is no longer needed (occupying job
@@ -26,13 +33,21 @@
  *      watermark is the one that proves THIS dispatch made it).
  *   2. `res = await deps.launch(argv, name)`. `{ok:false}` → emit
  *      `DispatchFailed` immediately with the surfaced reason and return.
- *   3. Poll `deps.findJob(plan_verb, plan_ref, last_event_id > watermark)`
- *      every `pollIntervalMs` (~1-2s) until present (GOOD; resolve) or
- *      a `ceilingMs` (~15-20s) elapses (BAD; emit `DispatchFailed
- *      reason="confirm timeout"` and return). The last tick uses
- *      `Math.min(interval, remaining)` so the ceiling is honored even
- *      when the remaining budget is shorter than the poll interval.
- *   4. The polled rows are NEVER mutated; reads only — the reducer is the
+ *   3. Poll BOTH `deps.findJob(plan_verb, plan_ref, last_event_id >
+ *      watermark)` AND `deps.tabExistsByName(name)` every
+ *      `pollIntervalMs` (~1-2s) until EITHER returns truthy — the
+ *      named tab is visible OR the jobs row appears, whichever fires
+ *      first — and resolve `"ok"` (fn-674 early-resolve). Releases
+ *      the fn-644 one-at-a-time stagger in ~zellij latency rather
+ *      than the full ceiling.
+ *   4. Ceiling (`ceilingMs`, default 60s) elapses with NEITHER signal
+ *      → emit `DispatchFailed reason="confirm timeout"` and resolve
+ *      `"failed"`. A timeout while the tab DOES exist mints NOTHING
+ *      and resolves `"ok"` instead (the launch succeeded; the slot
+ *      stays held by the standing `liveTabKeys` dedup arm until the
+ *      tab disappears OR a `jobs` row binds). The last tick uses
+ *      `Math.min(interval, remaining)` so the ceiling is honored.
+ *   5. The polled rows are NEVER mutated; reads only — the reducer is the
  *      sole writer of `jobs` (per the event-sourcing invariants).
  *
  * Correlation: the reducer derives `(plan_verb, plan_ref)` from the
@@ -208,6 +223,25 @@ export interface ReconcileSnapshot {
    * are sticky until a human `retry_dispatch` mints a `DispatchCleared`.
    */
   failedKeys: Set<DispatchKey>;
+  /**
+   * `(verb, id)` keys whose `verb::id`-named zellij tab is currently
+   * live in the managed session (fn-674). Probed once per cycle at
+   * snapshot load via `ExecBackend.liveTabNames()` (a single
+   * `list-panes -a -j` round-trip), then intersected with the
+   * candidate dispatch keys. `reconcile()` is pure and reads this
+   * synchronous set, never the backend. A tab present in the
+   * session is proof a worker has been launched into the slot even
+   * before its `SessionStart` hook lands in `jobs`, closing the
+   * launch → SessionStart blind window the legacy `isOccupyingJob`
+   * arm could not see.
+   *
+   * Inert on probe failure: a missing zellij binary or stale
+   * session returns an empty set so the dedup arm degrades open
+   * (the worker may re-dispatch on a transient zellij outage; the
+   * in-flight set, sticky `failedKeys`, and the legacy
+   * `isOccupyingJob` arm still cover the steady state).
+   */
+  liveTabKeys: Set<DispatchKey>;
 }
 
 /**
@@ -216,7 +250,11 @@ export interface ReconcileSnapshot {
  * "In-flight" spans the moment `reconcile` decides to dispatch (set on
  * the key) through the `confirmRunning` resolution path (clear on
  * either success OR failure). NEVER persisted — the reconciler restarts
- * cold (the durable signal is the `jobs` projection itself).
+ * cold; the durable signal is the `jobs` projection itself PLUS the
+ * fn-674 per-cycle `liveTabKeys` probe, which re-derives the launch →
+ * SessionStart occupation against zellij on every wake so a daemon
+ * restart never double-dispatches a slot already claimed by a live
+ * worker tab.
  */
 export interface ReconcileState {
   paused: boolean;
@@ -329,6 +367,20 @@ export interface ConfirmRunningDeps {
     plan_ref: string,
     last_event_id_gt: number,
   ): FoundJob | null;
+  /**
+   * Name-exact zellij tab probe (fn-674). Returns `true` iff some
+   * pane in the managed session lives in a tab whose `tab_name`
+   * matches `${verb}::${id}` exactly; `false` (inert) on probe
+   * failure (ENOENT, non-zero exit, unparseable JSON) so a
+   * transient zellij outage degrades the confirm to the legacy
+   * findJob path rather than a spurious early-resolve OR a
+   * spurious DispatchFailed mint.
+   *
+   * Wired to `ExecBackend.tabExistsByName` in production; tests
+   * inject a fake that flips `true` at a controlled tick to drive
+   * the early-resolve branch deterministically.
+   */
+  tabExistsByName(name: DispatchKey): Promise<boolean>;
   /** Producer-side wall-clock for the reconcile-time `ts` stamp. */
   now(): number;
   /**
@@ -385,12 +437,19 @@ export type ConfirmOutcome = "ok" | "failed" | "aborted";
 export const DEFAULT_POLL_INTERVAL_MS = 1000;
 
 /**
- * Default ceiling — 18s. Spec says ~15-20s. Chosen comfortably above
- * the practical worst-case zellij `action new-tab` + shell login +
- * `claude` boot (~5-8s in the field) so transient slow boots GOOD-
- * confirm rather than racing the timeout.
+ * Default ceiling — 60s (bumped from 18s in fn-674). With the
+ * fn-674 early-resolve, `confirmRunning` returns `"ok"` the instant
+ * EITHER the named zellij tab OR the `jobs` row is visible, so the
+ * ceiling rarely matters in the happy path — it just bounds active
+ * polling on a launch that produces no tab AND no jobs row (genuine
+ * spawn failure). Bumped because the 18s ceiling raced ~24-33s
+ * `claude` cold boots (~60 plugin dirs on the work tier), false-
+ * timing-out the confirm WHILE the worker was still booting; the
+ * standing `liveTabKeys` dedup arm now covers the long tail, so a
+ * generous ceiling here is defense-in-depth, not the load-bearing
+ * dedup signal.
  */
-export const DEFAULT_CEILING_MS = 18_000;
+export const DEFAULT_CEILING_MS = 60_000;
 
 /**
  * Worker shell wrapping. Mirrors the CLI autopilot's launch body so the
@@ -481,7 +540,7 @@ export function isOccupyingJob(
 /**
  * The pure reconcile decision. Walks every epic / task / close-row,
  * computes the verb each verdict wants, and emits a `PlannedLaunch`
- * IFF none of the three suppression rules fires:
+ * IFF none of the five suppression rules fires:
  *
  *   1. `state.paused` (boots-paused safety default; never auto-cleared).
  *   2. `state.inFlight.has(key)` (one-at-a-time stagger preserved).
@@ -489,6 +548,12 @@ export function isOccupyingJob(
  *      by a human `retry_dispatch` minting `DispatchCleared`).
  *   4. `isOccupyingJob(jobs, verb, id)` (a non-terminal jobs row for
  *      the same `(plan_verb, plan_ref)` already exists — dedup).
+ *   5. `snapshot.liveTabKeys.has(key)` (fn-674: a zellij tab named
+ *      exactly `verb::id` already lives in the managed session,
+ *      i.e. a worker has been launched into the slot but its
+ *      SessionStart hook hasn't reached `jobs` yet — the launch →
+ *      SessionStart blind window the legacy `isOccupyingJob` arm
+ *      could not see).
  *
  * Reap pass: for each entry in `liveDispatches`, mark it for `closeByName`
  * iff `config.autocloseWindows === true` AND:
@@ -572,6 +637,14 @@ export function reconcile(
       if (isOccupyingJob(snapshot.jobs, verb, taskId)) {
         continue;
       }
+      if (snapshot.liveTabKeys.has(key)) {
+        // fn-674: a tab named verb::id is live in the managed session;
+        // a launched worker is occupying the slot in the launch →
+        // SessionStart window, before its jobs row binds. Suppress
+        // the dispatch — the standing arm complements `isOccupyingJob`
+        // by covering the pre-SessionStart gap.
+        continue;
+      }
       const cwd =
         task.target_repo != null && task.target_repo !== ""
           ? task.target_repo
@@ -602,7 +675,11 @@ export function reconcile(
         !state.paused &&
         !state.inFlight.has(closeKey) &&
         !snapshot.failedKeys.has(closeKey) &&
-        !isOccupyingJob(snapshot.jobs, closeVerb, epicId);
+        !isOccupyingJob(snapshot.jobs, closeVerb, epicId) &&
+        // fn-674 standing dedup arm: a live `close::<epic>` tab in the
+        // session is proof a launched closer occupies the slot before
+        // its SessionStart binds. Same shape as the task arm above.
+        !snapshot.liveTabKeys.has(closeKey);
       if (okToPlan && projectDir !== "") {
         launches.push({
           verb: closeVerb,
@@ -667,18 +744,34 @@ export function reconcile(
 
 /**
  * The confirm-runner. Captures the `events.id` watermark, fires the
- * launch via `deps.launch`, then polls `deps.findJob` until either a
- * row appears (GOOD; resolve `"ok"`) or `ceilingMs` elapses (BAD;
- * resolve `"failed"` after `emitDispatchFailed`). The launch envelope's
+ * launch via `deps.launch`, then polls BOTH `deps.findJob` AND
+ * `deps.tabExistsByName(verb::id)` until either resolves truthy (GOOD;
+ * resolve `"ok"`) or `ceilingMs` elapses. The launch envelope's
  * `{ ok: false, error }` path SHORT-CIRCUITS to `"failed"` with the
  * surfaced error string — no poll if the launch itself didn't fire.
+ *
+ * fn-674 early-resolve. The tab probe is a producer-side liveness
+ * signal visible the instant `new-tab` returns, long before the
+ * worker's `SessionStart` hook lands in `jobs`. Resolving `"ok"`
+ * on tab-visible releases the fn-644 one-at-a-time stagger in
+ * ~zellij latency rather than waiting for the full ceiling — a
+ * 24-33s `claude` cold boot no longer races the timeout.
+ *
+ * fn-674 timeout-but-tab-alive. On ceiling elapse, probe the tab
+ * one final time. If it exists, the launch DID succeed and a
+ * worker IS occupying the slot — resolve `"ok"` and mint NOTHING
+ * (the standing `liveTabKeys` dedup arm in the next reconcile
+ * keeps the slot held until either the tab dies or SessionStart
+ * binds). If it does NOT exist AND no jobs row appeared, the
+ * launch is dead — emit `DispatchFailed` and resolve `"failed"`.
  *
  * Abort handling: `signal.aborted` after any internal sleep resolves
  * `"aborted"` without emitting `DispatchFailed`. Shutdown is a clean
  * teardown, not a sticky failure.
  *
  * Pure with-injected-deps — tests pass fake `launch` / `findJob` /
- * `now` / `sleep` to drive every branch deterministically.
+ * `tabExistsByName` / `now` / `sleep` to drive every branch
+ * deterministically.
  */
 export async function confirmRunning(
   verb: Verb,
@@ -715,7 +808,10 @@ export async function confirmRunning(
   if (signal.aborted) {
     return "aborted";
   }
-  // 3. Poll loop.
+  // 3. Poll loop — fn-674 polls BOTH the jobs row AND the tab probe.
+  //    The first signal wins; the tab probe typically fires first
+  //    (visible the instant `new-tab` returns), the jobs row closes
+  //    the determinism gap once SessionStart actually folds.
   const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const ceilingMs = deps.ceilingMs ?? DEFAULT_CEILING_MS;
   const startMs = deps.now() * 1000; // `now` returns unix seconds, scale up.
@@ -736,11 +832,33 @@ export async function confirmRunning(
     if (hit != null) {
       return "ok";
     }
+    // fn-674 early-resolve: the named tab is live in the session.
+    // The launch succeeded and a worker is occupying the slot — no
+    // need to wait for SessionStart to fold the jobs row. Probe
+    // failures (ENOENT, parse miss) return false, so the loop
+    // continues on the legacy findJob path — never a spurious
+    // early-resolve on a broken backend.
+    const tabAlive = await deps.tabExistsByName(key).catch(() => false);
+    if (tabAlive) {
+      return "ok";
+    }
+    if (signal.aborted) {
+      return "aborted";
+    }
   }
   // Use the start-ms anchor to log latency; not strictly required for
   // the outcome path. Kept out of the success path to avoid the cost
   // when the row appears on the first tick.
   void startMs;
+  // fn-674 timeout-but-tab-alive: one final probe before declaring
+  // failure. If the tab DOES exist, the launch succeeded — a slow
+  // worker is still booting (e.g. 24-33s `claude` cold start) and
+  // the standing `liveTabKeys` dedup arm will keep the slot held on
+  // the next reconcile. Resolve "ok" and mint NOTHING.
+  const tabAliveAtCeiling = await deps.tabExistsByName(key).catch(() => false);
+  if (tabAliveAtCeiling) {
+    return "ok";
+  }
   deps.emitDispatchFailed({
     verb,
     id,
@@ -924,16 +1042,10 @@ type IncomingMessage = SetPausedMessage | ShutdownMessage;
  *    (cleared failures are deleted from the projection, so every row present
  *    is an open failure).
  */
-function loadReconcileSnapshot(db: Parameters<typeof runQuery>[0]): {
-  epics: Epic[];
-  jobs: Map<string, Job>;
-  subagentInvocations: SubagentInvocation[];
-  gitStatusByProjectDir: Map<
-    string,
-    { dirty_count: number; unattributed_to_live_count: number }
-  >;
-  failedKeys: Set<DispatchKey>;
-} {
+async function loadReconcileSnapshot(
+  db: Parameters<typeof runQuery>[0],
+  liveTabNames: () => Promise<Set<string>>,
+): Promise<ReconcileSnapshot> {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
       type: "query" as const,
@@ -969,12 +1081,42 @@ function loadReconcileSnapshot(db: Parameters<typeof runQuery>[0]): {
     }
   }
 
+  // fn-674: probe zellij ONCE per cycle for the full set of live
+  // tab names and intersect with the candidate `(verb, id)` keys.
+  // The reduce stays pure — it reads the synchronous Set and never
+  // touches the backend. Candidate keys are every `(verb, id)` the
+  // row partition could possibly dispatch (every task → work::id,
+  // every epic → close::id, every task → approve::id); the
+  // intersection drops tab names that don't match a dispatch key
+  // (e.g. a human-opened scratch tab) so `reconcile()` only sees
+  // keys it would actually act on.
+  //
+  // A transient zellij outage returns an empty Set (the backend's
+  // inert-on-failure contract), so the dedup arm opens up and the
+  // legacy `isOccupyingJob` arm carries the steady state.
+  const candidateKeys = new Set<DispatchKey>();
+  for (const epic of epics) {
+    candidateKeys.add(dispatchKey("close", epic.epic_id));
+    for (const task of epic.tasks) {
+      candidateKeys.add(dispatchKey("work", task.task_id));
+      candidateKeys.add(dispatchKey("approve", task.task_id));
+    }
+  }
+  const allTabNames = await liveTabNames().catch(() => new Set<string>());
+  const liveTabKeys = new Set<DispatchKey>();
+  for (const name of allTabNames) {
+    if (candidateKeys.has(name)) {
+      liveTabKeys.add(name);
+    }
+  }
+
   return {
     epics,
     jobs,
     subagentInvocations,
     gitStatusByProjectDir,
     failedKeys,
+    liveTabKeys,
   };
 }
 
@@ -1111,6 +1253,11 @@ function main(): void {
         | undefined;
       return row ?? null;
     },
+    // fn-674: forward to the backend's name-exact tab probe. The
+    // backend implementation is inert-on-failure (false on ENOENT /
+    // non-zero exit / unparseable JSON) so confirmRunning never
+    // sees a thrown error from this dep.
+    tabExistsByName: (name) => backend.tabExistsByName(name),
     now: () => Math.floor(Date.now() / 1000),
     sleep: (ms, signal) => abortableSleep(ms, signal),
   };
@@ -1136,7 +1283,9 @@ function main(): void {
         if (shutdown) {
           return;
         }
-        const snapshot = loadReconcileSnapshot(db);
+        const snapshot = await loadReconcileSnapshot(db, () =>
+          backend.liveTabNames(),
+        );
         const decision = reconcile(
           snapshot,
           state,

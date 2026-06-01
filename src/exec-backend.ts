@@ -54,6 +54,21 @@
  *   and no-op (a dedup guarantee upstream maintains one live tab per
  *   `verb::id`, so multiple is "shouldn't happen" territory; zero just
  *   means the tab is already gone).
+ * - `ExecBackend.tabExistsByName(name) -> Promise<boolean>` — name-exact
+ *   tab probe sharing `closeByName`'s `list-panes -a -j` parse. Returns
+ *   `true` iff some pane carries `tab_name === name` exactly (single
+ *   OR multiple match counts as "exists"). Returns `false` (inert) on
+ *   zero matches, ENOENT, unparseable JSON, or non-zero exit — never
+ *   throws. Drives fn-674's `confirmRunning` early-resolve: a tab
+ *   present in the session is proof the slot is occupied, visible the
+ *   instant `new-tab` returns and long before SessionStart folds.
+ * - `ExecBackend.liveTabNames() -> Promise<Set<string>>` — bulk variant
+ *   of `tabExistsByName`. One `list-panes -a -j` round-trip; returns
+ *   the set of every distinct `tab_name` in the session. Drives the
+ *   autopilot reconciler's per-cycle `liveTabKeys` snapshot — the
+ *   loader intersects the returned set with candidate `verb::id`
+ *   dispatch keys without paying N subprocess spawns. Same
+ *   inert-on-failure semantics: empty Set on any failure mode.
  * - `ExecBackend.focusPane(session, paneId) -> { ok, error? }` —
  *   session-agnostic. Runs `zellij --session <session> action
  *   focus-pane-id <paneId>`; on success zellij focuses the pane AND
@@ -160,6 +175,36 @@ export interface ExecBackend {
    *  resulting `SessionStart` hook event in the `jobs` projection, not
    *  via a surface ref. */
   launch(argv: string[], name: string, cwd: string): Promise<LaunchResult>;
+  /** Session-bound lifecycle. Probe whether ANY zellij pane in the
+   *  managed session lives in a tab whose `tab_name === name` EXACTLY
+   *  (recycle-safe, no substring match — same parse as `closeByName`
+   *  and `resolveTabForPane`). Returns `true` on a single OR multiple
+   *  match; `false` on zero matches, ENOENT (binary missing),
+   *  unparseable JSON, or any non-zero list-panes exit. NEVER throws.
+   *
+   *  Drives the autopilot reconciler's `confirmRunning` early-resolve
+   *  (fn-674): a tab present in the session is proof a worker is
+   *  occupying the slot — visible the moment `zellij action new-tab`
+   *  returns, long before the worker's `SessionStart` hook event
+   *  reaches `jobs`. Closes the launch → SessionStart blind window
+   *  that fn-674 was opened to fix.
+   *
+   *  Inert on failure: a missing binary or stale session probe
+   *  returns `false` so the dedup arm degrades open (the worker may
+   *  re-dispatch on a transient zellij outage; the in-flight set
+   *  and the legacy `isOccupyingJob` arm still cover the steady
+   *  state). */
+  tabExistsByName(name: string): Promise<boolean>;
+  /** Session-bound lifecycle. Bulk variant of `tabExistsByName` —
+   *  returns the FULL set of distinct `tab_name` strings present in
+   *  the managed session via a single `list-panes -a -j` round-trip.
+   *  Drives the autopilot reconciler's per-cycle `liveTabKeys`
+   *  snapshot (fn-674): the loader intersects this set with the
+   *  candidate `verb::id` dispatch keys without paying N subprocess
+   *  spawns. Same inert-on-failure semantic as `tabExistsByName` —
+   *  returns an empty `Set` on ENOENT, non-zero exit, or unparseable
+   *  JSON; NEVER throws. */
+  liveTabNames(): Promise<Set<string>>;
   /** Session-bound lifecycle. Reap the zellij tab labeled exactly
    *  `name` inside the backend's managed session by closing its single
    *  agent pane. Fire-and-forget — resolves even when the underlying
@@ -855,6 +900,67 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
     return sessionReady;
   }
 
+  /**
+   * Shared `list-panes -a -j` -> Set<tab_name> primitive. Used by
+   * both `tabExistsByName(name)` (the spec-required per-name probe)
+   * and `liveTabNames()` (the bulk variant the autopilot reconciler's
+   * snapshot loader uses to populate `liveTabKeys` in a single
+   * round-trip per cycle, fn-674). NEVER throws — every failure
+   * mode (ENOENT, non-zero exit, unparseable JSON, missing
+   * tab_name field on a pane) degrades to a partial / empty set.
+   * No `ensureSession` call: a missing session means there is by
+   * definition no tab to find, and minting a session inside a
+   * dedup probe would be a surprising side effect.
+   */
+  async function liveTabNamesImpl(): Promise<Set<string>> {
+    const res = await runCapture(buildZellijListPanesAllJsonArgs(session));
+    if (res == null) {
+      return new Set();
+    }
+    if (res.exitCode !== 0) {
+      return new Set();
+    }
+    const payload = parseListPanesJson(res.stdout);
+    if (payload == null) {
+      return new Set();
+    }
+    const names = new Set<string>();
+    const collect = (raw: unknown, tabNameHint?: string): void => {
+      if (raw == null || typeof raw !== "object") {
+        return;
+      }
+      const rec = raw as Record<string, unknown>;
+      const tabNameField =
+        typeof rec.tab_name === "string" ? rec.tab_name : undefined;
+      const name = tabNameField ?? tabNameHint;
+      if (name != null && name !== "") {
+        names.add(name);
+      }
+    };
+    if (Array.isArray(payload)) {
+      for (const entry of payload) {
+        collect(entry);
+      }
+    } else if (payload != null && typeof payload === "object") {
+      // Object-map shape: `{ "tab_name_1": [pane, pane], ... }` — the
+      // tab name comes from the key when the pane object lacks it.
+      // Mirrors `findPaneByTabName`'s tolerance for both observed
+      // zellij JSON shapes.
+      for (const [key, value] of Object.entries(
+        payload as Record<string, unknown>,
+      )) {
+        if (Array.isArray(value)) {
+          for (const entry of value) {
+            collect(entry, key);
+          }
+        } else {
+          collect(value, key);
+        }
+      }
+    }
+    return names;
+  }
+
   return {
     async launch(
       argv: string[],
@@ -956,6 +1062,24 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         );
       }
     },
+    async tabExistsByName(name: string): Promise<boolean> {
+      // Session-bound — operates against the managed `session`. We
+      // deliberately DO NOT call `ensureSession` here: a missing
+      // session means there is by definition no tab to find, and
+      // minting a session inside a dedup probe would be a surprising
+      // side effect. The probe degrades to `false` on every failure
+      // mode — ENOENT, non-zero exit, unparseable JSON — and NEVER
+      // throws back, so the autopilot reconciler's per-cycle
+      // snapshot load can treat the call as best-effort information.
+      const names = await liveTabNamesImpl();
+      // `single` OR `multiple` both mean "name occupies the surface";
+      // only `none` is "no tab" — the multiple case is "shouldn't
+      // happen" (dedup invariant violated) but is just as conclusive
+      // about occupation. closeByName's "refuse to guess" semantics
+      // are for the REAP path, not this probe.
+      return names.has(name);
+    },
+    liveTabNames: liveTabNamesImpl,
     async focusPane(
       targetSession: string,
       paneId: string,

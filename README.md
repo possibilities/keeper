@@ -1315,10 +1315,21 @@ decision, launch, confirmation, dedup, and (config-gated) reap. It polls
 `PRAGMA data_version` on its own read-only connection like the other
 projection consumers, but on each wake it re-runs `computeReadiness` from
 scratch and reconciles desired-vs-observed against the live `jobs` projection
-— never an edge trigger, never a re-probe of the zellij surface. Dedup is
-keeperd job presence (correlated by `--name` → `plan_verb`+`plan_ref`), not a
-`zellij query-tab-names` round-trip; the surface-probe wedge of the standalone
-CLI is structurally impossible. The reconciler boots PAUSED (the in-memory
+— never an edge trigger. Dedup is primarily keeperd job presence
+(correlated by `--name` → `plan_verb`+`plan_ref`), backed by a per-cycle
+zellij tab-name probe added in fn-674: at snapshot load the worker calls
+`ExecBackend.liveTabNames()` once, intersects the returned `Set<string>`
+with the candidate `verb::id` dispatch keys, and feeds the result into
+`reconcile()` as a new `liveTabKeys: Set<DispatchKey>` snapshot field; a
+fifth suppression arm sitting alongside the legacy `isOccupyingJob` arm
+fires when `liveTabKeys.has(key)` is true. `reconcile()` stays pure — it
+reads the synchronous Set, never the backend, so re-fold determinism on
+the no-DB-write side is preserved. The probe closes the launch →
+SessionStart blind window that produced fn-674's duplicate-dispatch
+incident (24-33s `claude` cold boots racing an 18s confirm ceiling on a
+`claude --plugin-dir` work tier with ~60 plugins); a worker launched into
+a `verb::id`-named tab is visible the instant `zellij action new-tab`
+returns, long before its `SessionStart` hook folds a `jobs` row. The reconciler boots PAUSED (the in-memory
 worker gate is seeded `true` from `workerData.paused`, and the daemon's
 boot drain unconditionally appends an `AutopilotPaused{paused:true}`
 synthetic event so the durable `autopilot_state` singleton projection

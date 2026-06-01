@@ -131,6 +131,7 @@ function makeSnapshot(
     subagentInvocations: [],
     gitStatusByProjectDir: new Map(),
     failedKeys: new Set(),
+    liveTabKeys: new Set(),
     ...overrides,
   };
 }
@@ -153,6 +154,8 @@ interface FakeDepsLog {
   findJobCalls: Array<{ verb: string; id: string; watermark: number }>;
   maxEventIdCalls: number;
   closeByNameCalls: string[];
+  /** fn-674 tab-probe calls: every `verb::id` name confirmRunning queried. */
+  tabProbeCalls: string[];
 }
 
 interface FakeDepsOptions {
@@ -163,6 +166,14 @@ interface FakeDepsOptions {
    * filter is honored by the fake too).
    */
   jobsByKey?: Map<string, FoundJob>;
+  /**
+   * fn-674 tab probe — initial set of live `verb::id` tab names. The
+   * fake `tabExistsByName` returns `true` iff the polled name is in
+   * this set; tests can mutate the set live via `setLiveTab` to drive
+   * the early-resolve branch deterministically (tab flips alive on
+   * the second poll tick, etc.).
+   */
+  liveTabs?: Set<string>;
   maxEventId?: number;
   now?: number | (() => number);
   pollIntervalMs?: number;
@@ -174,6 +185,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
   log: FakeDepsLog;
   advanceMaxEventId(n: number): void;
   setJobByKey(verb: string, id: string, job: FoundJob): void;
+  setLiveTab(name: string, alive: boolean): void;
 } {
   const log: FakeDepsLog = {
     launches: [],
@@ -181,9 +193,11 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     findJobCalls: [],
     maxEventIdCalls: 0,
     closeByNameCalls: [],
+    tabProbeCalls: [],
   };
   let maxEventId = opts.maxEventId ?? 100;
   const jobsByKey = new Map<string, FoundJob>(opts.jobsByKey ?? []);
+  const liveTabs = new Set<string>(opts.liveTabs ?? []);
   const nowFn: () => number =
     typeof opts.now === "function"
       ? opts.now
@@ -217,6 +231,10 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
       }
       return null;
     },
+    async tabExistsByName(name) {
+      log.tabProbeCalls.push(name);
+      return liveTabs.has(name);
+    },
     now: nowFn,
     async sleep(ms, signal) {
       // Synchronous-ish microtask sleep so tests don't spin real time.
@@ -249,6 +267,13 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
     setJobByKey(verb: string, id: string, job: FoundJob) {
       jobsByKey.set(`${verb}::${id}`, job);
+    },
+    setLiveTab(name: string, alive: boolean) {
+      if (alive) {
+        liveTabs.add(name);
+      } else {
+        liveTabs.delete(name);
+      }
     },
   };
 }
@@ -496,6 +521,41 @@ test("reconcile dedup: open dispatch_failures row blocks re-dispatch (sticky fai
   expect(decision.launches).toEqual([]);
 });
 
+test("reconcile dedup (fn-674): liveTabKeys.has(key) blocks re-dispatch in the launch → SessionStart window", () => {
+  // The launch → SessionStart blind window: the autopilot launched
+  // a worker into a verb::id-named tab, the tab is live, but the
+  // worker's SessionStart hook hasn't folded a jobs row yet. The
+  // legacy `isOccupyingJob` arm sees nothing (empty jobs map, empty
+  // inFlight, empty failedKeys). The fn-674 standing arm fires.
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    liveTabKeys: new Set(["work::fn-1-foo.1"]),
+  });
+  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  expect(decision.launches).toEqual([]);
+});
+
+test("reconcile dedup (fn-674): liveTabKeys on close::<epic> blocks the close-row dispatch", () => {
+  // Same shape as the task arm but for the close row — proves the
+  // standing arm covers the (verb='close', id=epic_id) shape too.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    status: "done",
+    approval: "pending",
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    liveTabKeys: new Set(["approve::fn-1-foo"]),
+  });
+  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  // The `approve` verb dispatches for status=done + approval=pending,
+  // and the liveTabKeys arm gates it identically to the task path.
+  expect(decision.launches.find((p) => p.verb === "approve")).toBeUndefined();
+});
+
 // ---------------------------------------------------------------------------
 // reconcile — git_status feed (fn-638 predicate 6.5)
 // ---------------------------------------------------------------------------
@@ -574,7 +634,11 @@ test("confirmRunning GOOD: job appears before ceiling → ok, no emission", asyn
   expect(log.emissions).toEqual([]); // no DispatchFailed
 });
 
-test("confirmRunning BAD: ceiling elapses with no matching job → failed + DispatchFailed", async () => {
+test("confirmRunning BAD (fn-674 dead launch): ceiling elapses, NO tab and NO jobs row → failed + DispatchFailed", async () => {
+  // The post-fn-674 BAD case is narrower: a timeout MINTS DispatchFailed
+  // only when the zellij tab never appeared AND the jobs row never
+  // appeared — the launch genuinely failed to materialize a worker.
+  // The fake's default `liveTabs` set is empty, mirroring "no tab".
   const { deps, log } = makeFakeDeps({
     maxEventId: 100,
     pollIntervalMs: 5,
@@ -596,6 +660,67 @@ test("confirmRunning BAD: ceiling elapses with no matching job → failed + Disp
   expect(emission?.id).toBe("fn-1-foo.1");
   expect(emission?.reason).toContain("confirm timeout");
   expect(emission?.dir).toBe("/repo");
+});
+
+test("confirmRunning fn-674 alive-at-ceiling: tab exists but no jobs row → ok, NO emit, slot held by liveTabKeys arm", async () => {
+  // The pre-fn-674 BAD test asserted a timeout always mints
+  // DispatchFailed. That's the load-bearing bug fn-674 fixes: when
+  // the launch succeeded but the worker is still booting (e.g. a
+  // 24-33s `claude` cold start), the named tab is live in the
+  // session even though the jobs row hasn't folded yet. The confirm
+  // must resolve `"ok"` (the launch DID succeed), mint NOTHING (the
+  // slot remains held by the standing liveTabKeys dedup arm on the
+  // next reconcile), and free no slot for a spurious re-dispatch.
+  const { deps, log } = makeFakeDeps({
+    maxEventId: 100,
+    pollIntervalMs: 5,
+    ceilingMs: 20,
+    liveTabs: new Set(["work::fn-1-foo.1"]), // tab present, jobs row absent
+  });
+  const ctrl = new AbortController();
+  const outcome = await confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh", "-c", "true"],
+    ctrl.signal,
+    deps,
+  );
+  // Either the in-loop early-resolve OR the ceiling-elapsed final
+  // probe resolves "ok"; both code paths converge on the same
+  // outcome — no emit, slot held.
+  expect(outcome).toBe("ok");
+  expect(log.emissions).toEqual([]);
+});
+
+test("confirmRunning fn-674 early-resolve: tab appears before jobs row → ok, no emit", async () => {
+  // The first poll tick sees an empty liveTabs set; mid-flight we
+  // flip the tab alive. The confirm must resolve "ok" on the next
+  // tick from the tab probe alone — without waiting for the jobs
+  // row to fold (the launch → SessionStart blind window the
+  // fn-674 dedup arm closes).
+  const fake = makeFakeDeps({
+    maxEventId: 100,
+    pollIntervalMs: 5,
+    ceilingMs: 200,
+  });
+  const ctrl = new AbortController();
+  const promise = confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh", "-c", "true"],
+    ctrl.signal,
+    fake.deps,
+  );
+  // Give the launch + first poll tick a moment, then flip the tab live.
+  await Bun.sleep(15);
+  fake.setLiveTab("work::fn-1-foo.1", true);
+  const outcome = await promise;
+  expect(outcome).toBe("ok");
+  expect(fake.log.emissions).toEqual([]);
+  // Tab probe was queried — confirms the new dep is wired.
+  expect(fake.log.tabProbeCalls.length).toBeGreaterThan(0);
 });
 
 test("confirmRunning BAD: launch returns {ok:false} → failed immediately with surfaced reason", async () => {
