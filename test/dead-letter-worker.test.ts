@@ -97,7 +97,7 @@ test("scanDeadLetterDir skips a truncated trailing line", () => {
   const validLines = valid.map(serializeDeadLetterRecord).join("");
   // Append a partial JSON line (no closing brace, no newline) — simulates a
   // hook process killed mid-write.
-  const truncated = validLines + '{"dl_id":"ccc","sess';
+  const truncated = `${validLines}{"dl_id":"ccc","sess`;
   const file = join(deadLetterDir, "12345.ndjson");
   writeFileSync(file, truncated);
 
