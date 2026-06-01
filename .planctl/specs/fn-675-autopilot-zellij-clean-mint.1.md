@@ -58,5 +58,5 @@ now fresh-mints (forgets) rather than resurrecting.
 - [ ] `bun test test/exec-backend.test.ts` passes.
 
 ## Done summary
-
+Added --forget to buildZellijAttachBgArgs so every keeper-initiated zellij mint deletes any saved session before connecting — fresh-builds instead of resurrecting a degraded session-layout.kdl cache. Updated exec-backend tests + README ExecBackend prose.
 ## Evidence
