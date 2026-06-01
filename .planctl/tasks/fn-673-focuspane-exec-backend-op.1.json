@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-01T21:25:15.514057Z",
+  "depends_on": [],
+  "epic": "fn-673-focuspane-exec-backend-op",
+  "id": "fn-673-focuspane-exec-backend-op.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "focuspane exec backend op",
+  "updated_at": "2026-06-01T21:25:15.514057Z"
+}
