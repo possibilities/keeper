@@ -14,7 +14,12 @@
  */
 
 import { expect, test } from "bun:test";
-import { projectJobRow, renderJobsBody, selectableJobIds } from "../cli/jobs";
+import {
+  backendCoordsSeg,
+  projectJobRow,
+  renderJobsBody,
+  selectableJobIds,
+} from "../cli/jobs";
 import { colorizePillsInLine, renderDeadLetterPill } from "../src/board-render";
 import type { SubagentInvocation } from "../src/types";
 
@@ -108,6 +113,145 @@ test("projectJobRow: last_input_request_at drops [awaiting:<kind>] onto its own 
   // row's sub-agent lines, which the caller appends below).
   expect(line).toBe(
     "(x) asking [worker] [stopped]\n  [awaiting:ask_user_question]",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// backendCoordsSeg + projectJobRow with backend coords — schema v48 /
+// fn-668. The optional trailing `· <type> <session>/<tab> p<pane>` segment
+// is present-only (renders nothing when `backend_exec_type` is null) and
+// gracefully falls back when inner fields are missing.
+// ---------------------------------------------------------------------------
+
+test("backendCoordsSeg: all coords present — composes the full ' · <type> <session>/<tab> p<pane>' segment", () => {
+  expect(
+    backendCoordsSeg({
+      backend_exec_type: "zellij",
+      backend_exec_session_id: "ada",
+      backend_exec_pane_id: "11",
+      backend_exec_tab_id: "3",
+      backend_exec_tab_name: "main",
+    }),
+  ).toBe(" · zellij ada/main p11");
+});
+
+test("backendCoordsSeg: absent backend_exec_type → empty string (present-only)", () => {
+  expect(
+    backendCoordsSeg({
+      // Type null — every other coord is irrelevant; the segment should
+      // never render. Guards against `undefined`/`null` leaking into the
+      // composed line.
+      backend_exec_type: null,
+      backend_exec_session_id: "ada",
+      backend_exec_pane_id: "11",
+      backend_exec_tab_id: "3",
+      backend_exec_tab_name: "main",
+    }),
+  ).toBe("");
+});
+
+test("backendCoordsSeg: tab name missing → falls back to raw tab_id", () => {
+  expect(
+    backendCoordsSeg({
+      backend_exec_type: "zellij",
+      backend_exec_session_id: "ada",
+      backend_exec_pane_id: "11",
+      backend_exec_tab_id: "3",
+      backend_exec_tab_name: null,
+    }),
+  ).toBe(" · zellij ada/3 p11");
+});
+
+test("backendCoordsSeg: tab fully missing → bare session, no '/<…>' slot", () => {
+  // Typical between hook capture and the tab-resolver worker's first
+  // snapshot — `backend_exec_session_id` + `backend_exec_pane_id` land
+  // immediately, the tab columns trail by one tick.
+  expect(
+    backendCoordsSeg({
+      backend_exec_type: "zellij",
+      backend_exec_session_id: "ada",
+      backend_exec_pane_id: "11",
+      backend_exec_tab_id: null,
+      backend_exec_tab_name: null,
+    }),
+  ).toBe(" · zellij ada p11");
+});
+
+test("backendCoordsSeg: pane missing → drops the ' p<…>' suffix", () => {
+  expect(
+    backendCoordsSeg({
+      backend_exec_type: "zellij",
+      backend_exec_session_id: "ada",
+      backend_exec_pane_id: null,
+      backend_exec_tab_id: "3",
+      backend_exec_tab_name: "main",
+    }),
+  ).toBe(" · zellij ada/main");
+});
+
+test("backendCoordsSeg: type only — every other coord null → bare type", () => {
+  // Defense-in-depth: ENV-capture stamped `ZELLIJ=1` but somehow no
+  // session/pane/tab. Renders the bare backend type rather than
+  // collapsing to `· zellij` with trailing-space artifacts.
+  expect(
+    backendCoordsSeg({
+      backend_exec_type: "zellij",
+      backend_exec_session_id: null,
+      backend_exec_pane_id: null,
+      backend_exec_tab_id: null,
+      backend_exec_tab_name: null,
+    }),
+  ).toBe(" · zellij");
+});
+
+test("projectJobRow: backend coords append to the row inline (after the state pill)", () => {
+  const line = projectJobRow({
+    job_id: "j1",
+    cwd: "/Users/alice/code/keeper",
+    title: "live session",
+    plan_verb: null,
+    state: "working",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "ada",
+    backend_exec_pane_id: "11",
+    backend_exec_tab_id: "3",
+    backend_exec_tab_name: "main",
+  });
+  expect(line).toBe("(keeper) live session [working] · zellij ada/main p11");
+});
+
+test("projectJobRow: absent backend coords render as nothing (no placeholder, no 'undefined')", () => {
+  const line = projectJobRow({
+    job_id: "j1",
+    cwd: "/Users/alice/code/keeper",
+    title: "live session",
+    plan_verb: null,
+    state: "working",
+    // No backend_exec_* keys at all — the row predates schema v48 OR
+    // the session is running outside a multiplexer.
+  });
+  expect(line).toBe("(keeper) live session [working]");
+  expect(line).not.toContain("undefined");
+  expect(line).not.toContain("·");
+});
+
+test("projectJobRow: backend coords + awaiting continuation — backend sits on the head line, awaiting drops below", () => {
+  const line = projectJobRow({
+    cwd: "/repo/x",
+    title: "asking",
+    plan_verb: "work",
+    state: "stopped",
+    last_input_request_at: 999,
+    last_input_request_kind: "ask_user_question",
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "ada",
+    backend_exec_pane_id: "11",
+    backend_exec_tab_name: "main",
+  });
+  // Backend segment sits on the head line (after the state pill);
+  // the awaiting pill keeps its own indented continuation line.
+  expect(line).toBe(
+    "(x) asking [worker] [stopped] · zellij ada/main p11\n  [awaiting:ask_user_question]",
   );
 });
 

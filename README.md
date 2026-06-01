@@ -42,15 +42,27 @@ Skill-tool invocation, e.g. `plan:plan` or `arthack:check`),
 `PostToolUse:Agent`), `events.config_dir` (the `CLAUDE_CONFIG_DIR` env
 value captured by the hook on `SessionStart` — the arthack-claude profile
 directory the session ran under, projected onto `jobs.config_dir` with
-latest-non-NULL-wins via `COALESCE` on resume), and a five-column
+latest-non-NULL-wins via `COALESCE` on resume), a five-column
 planctl-invocation envelope (`planctl_op`, `planctl_target`,
 `planctl_epic_id`, `planctl_task_id`, `planctl_subject_present`) stamped
 on every `PostToolUse:Bash` row whose `data.tool_response.stdout` parses
 as JSON carrying a top-level `planctl_invocation` key — the authoritative
-envelope planctl writes on every mutating call. Consumers can find
+envelope planctl writes on every mutating call — and (schema v48 / fn-668)
+three terminal-multiplexer backend-exec coordinates
+(`events.backend_exec_type`, `events.backend_exec_session_id`,
+`events.backend_exec_pane_id`) captured by the hook on EVERY event as pure
+synchronous `process.env` reads (`ZELLIJ` / `ZELLIJ_SESSION_NAME` /
+`ZELLIJ_PANE_ID`; no fork, no fs, no PPID-walk), folded onto
+`jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins via
+`COALESCE` — and a daemon-side tab-resolver worker stamps the matched
+`jobs.backend_exec_tab_{id,name}` via a `BackendExecSnapshot` synthetic
+event (one `zellij action list-panes -a -j` per distinct live session per
+tick, deduped). Generic `backend_exec_*` naming lets a future
+tmux/wezterm backend slot in without a schema change. Consumers can find
 `/plan:work` calls, `Skill` invocations, every Task-tool subagent
-lifecycle, every session's profile attribution, AND every planctl-CLI
-mutation cheaply without JSON-scanning the event `data` blob. The
+lifecycle, every session's profile attribution, every planctl-CLI
+mutation, AND the terminal location each live session lives in cheaply
+without JSON-scanning the event `data` blob. The
 `planctl_*` columns drive the creator/refiner classifier (see
 [Architecture](#architecture)) — `op === "create"` and `op === "scaffold"`
 both classify as creators (scaffold is the canonical epic-create path on
@@ -576,7 +588,17 @@ collapses to plain stream output. Run any of them with
   reappears in the next frame and `N` drops by one. The pill is
   re-stamped on every snapshot BEFORE the body byte-compare
   short-circuit, so the count tracks reality even when the rendered
-  body is byte-stable. Same sidecar / TUI / non-TTY contract as board.
+  body is byte-stable. Each job row also carries an optional trailing
+  ` · <type> <session>/<tab> p<pane>` segment (schema v48 / fn-668) —
+  the terminal-multiplexer backend-exec coordinates lifted off the
+  five `jobs.backend_exec_*` columns by the shared `projectJobRow`
+  helper, so the CLI list and the TUI both surface where each live
+  session lives. Plain text (no SGR baked in) so sidecars and
+  non-TTY output stay clean; inner fields fall back gracefully (tab
+  name → raw id; tab missing → bare `<session>`; pane missing →
+  drop the ` p<…>` suffix); rows with no backend coords show nothing
+  at all (never `undefined`, never a placeholder). Same sidecar / TUI
+  / non-TTY contract as board.
 
   ```sh
   keeper jobs             # live jobs list, default scope
@@ -1021,6 +1043,40 @@ the board (with its full lifecycle, since the original event log carried
 nothing for it) and `N` drops by one. The schema bump is v36→v37; fn-642
 (`profile_name` jobs column) occupies the v35→v36 slot ahead of this
 work.
+As of schema v48 (fn-668), each Claude session's terminal-multiplexer
+backend-exec coordinates are materialized as first-class columns on the
+`events` row and (folded onto) the `jobs` projection. The hook reads
+three pure synchronous `process.env` values on EVERY event —
+`ZELLIJ` → `backend_exec_type` (currently the only recognized backend),
+`ZELLIJ_SESSION_NAME` → `backend_exec_session_id`,
+`ZELLIJ_PANE_ID` → `backend_exec_pane_id` (raw, e.g. `"11"`; no
+fork, no fs, no PPID-walk; absent env ⇒ NULL coords, never bogus
+`type='zellij'`) — and the reducer's `applyEvent` arm folds the three
+onto `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins
+via `COALESCE`, so a re-fold from cursor=0 reproduces byte-identical
+rows. A daemon-side tab-resolver Worker thread (the ninth producer
+worker; see [Architecture](#architecture)) wakes on
+`PRAGMA data_version`, dedups distinct `(session, pane)` across the
+live jobs, spawns one `zellij action list-panes -a -j` per distinct
+session, matches the captured pane id against each pane's numeric `id`
+(normalized equality), and posts a `BackendExecSnapshot` synthetic
+event the reducer folds into `jobs.backend_exec_tab_{id,name}` (tab
+tombstone = last-known sticks; env absent ⇒ NULL coords). Generic
+`backend_exec_*` naming lets a future tmux/wezterm backend slot in
+without a schema change — only the hook's env-name table changes. The
+five `jobs.backend_exec_*` columns are display-only on
+`JOBS_DESCRIPTOR` (like `profile_name` — read by the renderer, never
+a `sortable` / `filters` / `jsonColumns` key); the shared
+`projectJobRow` + `renderJobsBody` helpers append an optional trailing
+` · <type> <session>/<tab> p<pane>` segment when `backend_exec_type`
+is non-null, gracefully showing nothing when coords are absent. The
+segment surfaces identically on `keeper jobs` (CLI list mode) and the
+TUI (the view-shell's shared `renderBody` callback). Tab/pane
+RENAMING is explicitly out of scope — this layer only gets the data in
+place and visible so the human can see where each live session lives.
+keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `48`
+(whitelist-only; keeper-py reads `jobs` / `git_status` / `meta`, not
+the `backend_exec_*` columns).
 As of schema v47 (fn-667), the autopilot pause/playing flag is event-sourced
 into a new singleton `autopilot_state` projection table (`id INTEGER PRIMARY
 KEY CHECK (id = 1)`, `paused INTEGER NOT NULL`, plus `last_event_id` /
@@ -1223,7 +1279,30 @@ from-scratch re-fold reproduces it byte-identically (DispatchFailed UPSERTs by
 and closes the tab via `ExecBackend.closeByName`) a dispatch whose role is no
 longer needed; default-off preserves today's leave-open behavior.
 
-The eight workers are fully independent; main supervises all eight lifecycles
+A **ninth** Worker thread is the backend-exec tab resolver (schema v48,
+fn-668): a level-triggered producer that wakes on `PRAGMA data_version`,
+SELECTs the live jobs carrying both a `backend_exec_session_id` and a
+`backend_exec_pane_id` off its own read-only connection, dedups by
+distinct `(session, pane)`, and for each distinct live `backend_exec_session_id`
+spawns one `zellij action list-panes -a -j`. The resolver matches the
+captured `backend_exec_pane_id` against each pane's numeric `id` field
+(normalized equality), reads the matched pane's `tab_id` + `tab_name`,
+and posts one `{kind:"backend-exec-snapshot", job_id, tab_id, tab_name}`
+per resolved row to main. Main — again the sole writer — lifts the
+message into a synthetic `BackendExecSnapshot` event whose reducer fold
+arm UPDATEs `jobs.backend_exec_tab_{id,name}` (tab tombstone = last-known
+sticks; a session that disappears from `list-panes` does NOT clear the
+column). It is the fourth producer-worker instance — read-only /
+write-free, feeding the log only via main — and follows the same
+worker-contract discipline: stdout+stderr drained concurrently on the
+`Bun.spawn`, explicit two-phase TERM→KILL timeout, non-zero exit treated
+as expected "no such session" and log-and-skip, per-session in-flight
+lock + per-tick `isRunning` guard so a slow `list-panes` cannot stack.
+Like the other producers it does NOT write the DB directly; the fold
+keeps re-fold determinism on the synthetic-event side (no fold-time
+spawn, no env reads inside `applyEvent`).
+
+The nine workers are fully independent; main supervises all nine lifecycles
 but routes none of their traffic, and any worker's `error` event escalates
 the whole process to a clean restart — with that single scoped exception, the
 recoverable drop signal on the transcript, plan, usage, and dead-letter

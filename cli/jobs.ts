@@ -155,12 +155,25 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
  * `test/jobs.test.ts` can assert the row shape directly without standing
  * up the subscribe loop.
  *
- * Shape: `({cwd-basename}) {title} [{role}]? [{state}]{[failed:<kind>]}?`
+ * Shape: `({cwd-basename}) {title} [{role}]? [{state}]{[failed:<kind>]}?{ · backend-seg}?`
  * with the optional `[awaiting:<kind>]` segment dropped onto a continuation
  * line (two-space indent — same depth as the row's sub-agent lines, which
  * are appended by the caller via `subagentLinesFor`). The `(cwd)` prefix
  * is suppressed when `cwd` is null/empty; the role pill is suppressed
  * when `plan_verb` is null.
+ *
+ * Schema v48 / fn-668 — the optional trailing backend-coords segment
+ * (` · zellij <session>/<tab_name> p<pane_id>`) is rendered ONLY when
+ * `backend_exec_type` is non-null on the row. Emitted as plain text
+ * (no SGR codes baked in here — leaves sidecars + non-TTY output
+ * clean); the `·` bullet + trailing free-text shape is the design
+ * choice for "restrained, recede behind the pill grid". Absent coords
+ * render as nothing — never a placeholder, never `undefined`. Inner
+ * fields fall back gracefully: a missing tab name drops to the raw
+ * tab id; a missing tab fully drops the `/<…>` slot; a missing pane
+ * drops the ` p<…>` slot. Reads via {@link backendCoordsSeg} so
+ * `test/jobs.test.ts` can assert the composition without the
+ * subscribe loop.
  */
 export function projectJobRow(row: Record<string, unknown>): string {
   const title = seg(row.title);
@@ -172,8 +185,56 @@ export function projectJobRow(row: Record<string, unknown>): string {
     row.last_input_request_at,
     row.last_input_request_kind,
   );
-  const head = `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
+  const backend = backendCoordsSeg(row);
+  const head = `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}${backend}`;
   return awaiting === "" ? head : `${head}\n  ${awaiting.trimStart()}`;
+}
+
+/**
+ * Compose the optional trailing backend-coords segment for one jobs row.
+ * Present-only: returns `""` when `backend_exec_type` is null (the typical
+ * "session lives outside a multiplexer" shape). When the type is present,
+ * builds ` · <type> <session>/<tab_name> p<pane_id>`, dropping any inner
+ * slot whose source field is null (a missing tab fully drops the
+ * `<session>/<tab>` substitution to bare `<session>`; a missing pane drops
+ * the ` p<…>` suffix; a tab id without a name falls back to the raw id).
+ *
+ * Emitted as plain text (no SGR codes) — keeps sidecars + non-TTY output
+ * clean. The `·` bullet + free-text shape is itself the visual cue; the
+ * pill colorizer (`colorizePillsInLine`) is bracket-scoped and doesn't
+ * touch this run. Strings the segment composes from are bound from the
+ * projection; never interpolated as SQL or shell.
+ *
+ * Exported for `test/jobs.test.ts`.
+ */
+export function backendCoordsSeg(row: Record<string, unknown>): string {
+  const type = row.backend_exec_type;
+  if (type == null) {
+    return "";
+  }
+  const sessionId = row.backend_exec_session_id;
+  const paneId = row.backend_exec_pane_id;
+  const tabName = row.backend_exec_tab_name;
+  const tabId = row.backend_exec_tab_id;
+  // Location component — `<session>/<tab>` when both present, bare
+  // `<session>` when the tab hasn't resolved (typical between hook
+  // capture and the tab-resolver worker's first snapshot), tab-name
+  // preferred over raw id when both exist.
+  const tabLabel =
+    tabName != null ? String(tabName) : tabId != null ? String(tabId) : "";
+  const sessionPart =
+    sessionId == null
+      ? ""
+      : tabLabel === ""
+        ? String(sessionId)
+        : `${String(sessionId)}/${tabLabel}`;
+  const paneSeg = paneId == null ? "" : ` p${String(paneId)}`;
+  const locSeg = sessionPart === "" ? "" : ` ${sessionPart}`;
+  // Bare-type fallback — coords got captured (type is non-null) but
+  // every downstream field is null. Render the type alone so the
+  // human can still see "this session lives in zellij somewhere".
+  const inner = `${String(type)}${locSeg}${paneSeg}`;
+  return ` · ${inner}`;
 }
 
 // Nerd Font disclosure-triangle glyphs (the human's call): caret-right
