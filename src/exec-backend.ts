@@ -736,13 +736,20 @@ export interface ResolvedTabCoords {
 }
 
 /**
- * Build the zellij `attach -b <session>` argv. Pure — exported for
- * tests. `-b` creates a detached background session if absent; we
- * follow with a poll loop in the runtime to beat the #3733 race
- * (`action new-tab` against a not-yet-ready server can no-op).
+ * Build the zellij `attach -b --forget <session>` argv. Pure —
+ * exported for tests. `-b` creates a detached background session if
+ * absent; `--forget` deletes any saved (serialized) session before
+ * connecting, so a stale/EXITED corpse is fresh-rebuilt rather than
+ * resurrected from a degraded `session-layout.kdl` cache (the
+ * root-cause fix for fn-675's bar-less mint). `--forget` is a
+ * harmless no-op when no saved session exists, and `ensureSession`
+ * short-circuits before this argv when the target is already LIVE —
+ * so `--forget` never runs against a live session. We follow with a
+ * poll loop in the runtime to beat the #3733 race (`action new-tab`
+ * against a not-yet-ready server can no-op).
  */
 export function buildZellijAttachBgArgs(session: string): string[] {
-  return ["zellij", "attach", "-b", session];
+  return ["zellij", "attach", "-b", "--forget", session];
 }
 
 /**
@@ -756,7 +763,9 @@ export function buildZellijAttachBgArgs(session: string): string[] {
  * (EXITED - attach to resurrect)`) is a CORPSE, not a live server —
  * `action new-tab` against it exits non-zero ("There is no active
  * session!"). We treat such a line as NOT listed so `ensureSession`
- * routes to `attach -b`, which resurrects the session in place.
+ * routes to `attach -b --forget`, which FORGETS the saved session
+ * and mints a fresh one (rather than resurrecting the degraded
+ * `session-layout.kdl` cache, which produced fn-675's bar-less mint).
  */
 function zellijSessionListed(text: string, session: string): boolean {
   const lines = text.split("\n");
@@ -861,8 +870,12 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       if (zellijSessionListed(listed.stdout, session)) {
         return;
       }
-      // Not listed — fire `attach -b <session>` to mint a detached
-      // background session, then poll `list-sessions` until it appears.
+      // Not listed (absent OR EXITED corpse) — fire
+      // `attach -b --forget <session>` to FORGET any saved/serialized
+      // session and mint a fresh detached background session, then
+      // poll `list-sessions` until it appears. `--forget` defeats the
+      // bar-less resurrection from a degraded `session-layout.kdl`
+      // cache (fn-675); it is a harmless no-op when nothing is saved.
       //
       // The zellij server inherits THIS spawn's env, and every pane it
       // later launches inherits the server's. keeperd runs as a
@@ -975,8 +988,9 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       // A stale `sessionReady` memo would then wedge EVERY future dispatch
       // ("Session '<name>' not found") until the daemon restarts. On a
       // session-gone new-tab failure, invalidate the memo, re-ensure
-      // (which re-mints via `attach -b` + poll, re-capturing any orphan
-      // default tab), and retry the new-tab exactly once. The success
+      // (which re-mints via `attach -b --forget` + poll, re-capturing
+      // any orphan default tab), and retry the new-tab exactly once.
+      // The success
       // path keeps the memo untouched (one list-sessions per worker life).
       if (
         res != null &&

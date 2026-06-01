@@ -201,6 +201,7 @@ test("buildZellijListSessionsArgs / buildZellijAttachBgArgs: well-formed", () =>
     "zellij",
     "attach",
     "-b",
+    "--forget",
     "autopilot",
   ]);
 });
@@ -417,7 +418,7 @@ test("createZellijBackend.launch: stale memo — session dies, new-tab fails 'no
       return reply(alive ? "autopilot\n" : "dash\n");
     }
     if (cmd[1] === "attach") {
-      alive = true; // attach -b resurrects the session
+      alive = true; // attach -b --forget fresh-mints the session
       return reply("");
     }
     if (cmd[1] === "--session" && cmd[4] === "new-tab") {
@@ -447,8 +448,15 @@ test("createZellijBackend.launch: stale memo — session dies, new-tab fails 'no
   alive = false;
   const second = await backend.launch(["sh"], "work::b", "/abs");
   expect(second).toEqual({ ok: true });
-  // The recovery ran attach -b to re-mint the vanished session.
-  expect(calls.some((c) => c[1] === "attach")).toBe(true);
+  // The recovery ran attach -b --forget to re-mint the vanished
+  // session — the mid-life retry path rides the same argv builder,
+  // so `--forget` lands here too (fn-675). A future regression that
+  // drops it on the retry path would surface as a missing assertion.
+  const attachCalls = calls.filter((c) => c[1] === "attach");
+  expect(attachCalls.length).toBeGreaterThan(0);
+  for (const c of attachCalls) {
+    expect(c).toEqual(["zellij", "attach", "-b", "--forget", "autopilot"]);
+  }
   expect(notes.some((s) => s.includes("vanished"))).toBe(true);
   // Two new-tab spawns for work::b (the failed one + the retry).
   const bNewTabs = calls.filter(
@@ -484,7 +492,7 @@ test("createZellijBackend.launch: ENOENT (binary missing) → { ok: false, error
   }
 });
 
-test("createZellijBackend.launch: session missing → attach -b, then poll, then new-tab", async () => {
+test("createZellijBackend.launch: session missing → attach -b --forget, then poll, then new-tab", async () => {
   const calls: string[][] = [];
   const notes: string[] = [];
   // First list-sessions: empty. attach -b returns 0. Second list-
@@ -544,9 +552,15 @@ test("createZellijBackend.launch: session missing → attach -b, then poll, then
   // We saw at minimum: list, attach, list, action. (More list polls
   // are tolerated since timing varies; we assert the orderable shape.)
   expect(calls[0]?.[1]).toBe("list-sessions");
+  // Mint argv must carry `--forget` so a stale/EXITED corpse is
+  // fresh-rebuilt rather than resurrected (fn-675).
   expect(
     calls.some(
-      (c) => c[1] === "attach" && c[2] === "-b" && c[3] === "autopilot",
+      (c) =>
+        c[1] === "attach" &&
+        c[2] === "-b" &&
+        c[3] === "--forget" &&
+        c[4] === "autopilot",
     ),
   ).toBe(true);
   // The new-tab action call comes after at least one re-poll.
@@ -556,7 +570,7 @@ test("createZellijBackend.launch: session missing → attach -b, then poll, then
   expect(actionIdx).toBeGreaterThan(1);
 });
 
-test("createZellijBackend.launch: session-mint attach -b carries color env (TERM/COLORTERM)", async () => {
+test("createZellijBackend.launch: session-mint attach -b --forget carries color env (TERM/COLORTERM)", async () => {
   // The zellij server inherits the mint spawn's env, and every pane it
   // launches inherits the server's. keeperd's LaunchAgent env strips
   // TERM/COLORTERM, so the mint spawn MUST inject color-capable defaults
@@ -564,6 +578,7 @@ test("createZellijBackend.launch: session-mint attach -b carries color env (TERM
   // the `attach -b` call and assert the color vars are present.
   const notes: string[] = [];
   let attachEnv: Record<string, string> | undefined;
+  let attachArgv: string[] | undefined;
   let listCalls = 0;
   const spawn: SpawnFn = (cmd, options) => {
     if (cmd[1] === "list-sessions") {
@@ -577,6 +592,7 @@ test("createZellijBackend.launch: session-mint attach -b carries color env (TERM
     }
     if (cmd[1] === "attach" && cmd[2] === "-b") {
       attachEnv = options.env;
+      attachArgv = [...cmd];
     }
     return {
       exited: Promise.resolve(0),
@@ -595,6 +611,14 @@ test("createZellijBackend.launch: session-mint attach -b carries color env (TERM
   expect(attachEnv?.COLORTERM).toBe(process.env.COLORTERM ?? "truecolor");
   // PATH is spread through so the server can still resolve binaries.
   expect(attachEnv?.PATH).toBe(process.env.PATH);
+  // Mint argv carries `--forget` (fn-675) alongside the color env.
+  expect(attachArgv).toEqual([
+    "zellij",
+    "attach",
+    "-b",
+    "--forget",
+    "autopilot",
+  ]);
 });
 
 test("createZellijBackend: control commands (list-sessions/new-tab) carry NO env override", async () => {
@@ -630,12 +654,14 @@ test("createZellijBackend: control commands (list-sessions/new-tab) carry NO env
   expect(envByKey["--session:new-tab"]).toBeUndefined();
 });
 
-test("createZellijBackend.launch: session listed but EXITED → attach -b (resurrect), then new-tab", async () => {
+test("createZellijBackend.launch: session listed but EXITED → attach -b --forget (fresh-mint), then new-tab", async () => {
   // Regression: a dead session lingers in `list-sessions` branded
   // `(EXITED - attach to resurrect)`. It is NOT a live server — a
   // `new-tab` against it exits non-zero ("There is no active
   // session!"). ensureSession must treat the corpse as not-listed and
-  // route to `attach -b`, which resurrects it in place.
+  // route to `attach -b --forget`, which FORGETS the saved/serialized
+  // session and mints fresh (rather than resurrecting the degraded
+  // `session-layout.kdl` cache that produced fn-675's bar-less mint).
   const calls: string[][] = [];
   const notes: string[] = [];
   let listCalls = 0;
@@ -649,7 +675,7 @@ test("createZellijBackend.launch: session listed but EXITED → attach -b (resur
     if (cmd[1] === "list-sessions") {
       listCalls++;
       // First probe: the session is present but EXITED. After
-      // `attach -b` resurrects it, the re-poll shows it live.
+      // `attach -b --forget` fresh-mints it, the re-poll shows it live.
       return reply(
         listCalls === 1
           ? "autopilot [Created 3h 51m ago] (EXITED - attach to resurrect)\n"
@@ -673,13 +699,21 @@ test("createZellijBackend.launch: session listed but EXITED → attach -b (resur
     "/abs/dir",
   );
   expect(res).toEqual({ ok: true });
-  // The EXITED line did NOT short-circuit ensureSession — `attach -b`
-  // fired to resurrect, and new-tab landed after a re-poll.
-  expect(
-    calls.some(
-      (c) => c[1] === "attach" && c[2] === "-b" && c[3] === "autopilot",
-    ),
-  ).toBe(true);
+  // The EXITED line did NOT short-circuit ensureSession —
+  // `attach -b --forget` fired to fresh-mint, and new-tab landed after
+  // a re-poll. The argv asserts `--forget` is present so a future
+  // regression that drops it would surface here as a fresh-mint
+  // failure (the corpse would otherwise resurrect bar-less).
+  const attachCall = calls.find(
+    (c) => c[1] === "attach" && c[2] === "-b" && c[4] === "autopilot",
+  );
+  expect(attachCall).toEqual([
+    "zellij",
+    "attach",
+    "-b",
+    "--forget",
+    "autopilot",
+  ]);
   const actionIdx = calls.findIndex(
     (c) => c[1] === "--session" && c[4] === "new-tab",
   );

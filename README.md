@@ -1341,7 +1341,14 @@ on a successful insert (so the gate and the projection cannot diverge
 on partial failure). The terminal-surface mechanics live behind the
 shrunken `ExecBackend` (`src/exec-backend.ts`, `launch` + `closeByName` only)
 — zellij is the only backend; each dispatch opens as a new tab in the
-lazily-created `zellij_session`. Launch failure or a bounded single-attempt
+lazily-created `zellij_session`. The session is FRESH-MINTED on every
+keeper-initiated `attach -b --forget` (fn-675) — `--forget` deletes any
+saved/serialized session before connecting, so a stale/EXITED corpse is
+rebuilt from scratch rather than resurrected from a degraded
+`session-layout.kdl` cache (the bar-less-mint failure mode that motivated
+the change). `--forget` is a harmless no-op when no saved session exists,
+and `ensureSession` short-circuits before the attach when the target is
+already LIVE — so it never runs against a live session. Launch failure or a bounded single-attempt
 confirm timeout posts a `DispatchFailedMessage` to main; main — again the
 sole writer — turns it into a synthetic `DispatchFailed` events row and pumps
 a wake, and the reducer folds it into the new `dispatch_failures` projection.
