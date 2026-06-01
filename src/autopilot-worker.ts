@@ -135,6 +135,17 @@ export const ARTHACK_ROOT: string = ((): string => {
 })();
 
 /**
+ * The tier work-plugins directory autopilot launches a `work` worker under:
+ * `${ARTHACK_ROOT}/claude/work-plugins/<tier>`. Factored out so both the
+ * dispatch command ({@link buildWorkerCommand}) and the resume-command
+ * renderer (`scripts/resume.ts`) build the identical path from one formula.
+ * Pure — exported for the resume script and tests.
+ */
+export function workPluginDir(tier: string): string {
+  return `${ARTHACK_ROOT}/claude/work-plugins/${tier}`;
+}
+
+/**
  * Build the `claude` worker shell command for a `(verb, id, cwd, tier)`
  * combination — mirrors `buildWorkerCommand` in `cli/autopilot.ts:502`
  * byte-for-byte (same flag ordering, same tier `--plugin-dir` rule, same
@@ -162,7 +173,7 @@ export function buildWorkerCommand(
   }
   flags.push("--name", `${verb}::${id}`);
   if (verb === "work" && tier != null && tier !== "") {
-    flags.push("--plugin-dir", `${ARTHACK_ROOT}/claude/work-plugins/${tier}`);
+    flags.push("--plugin-dir", workPluginDir(tier));
   }
   return `${cdPrefix}claude ${flags.join(" ")} '/plan:${verb} ${id}'`;
 }
