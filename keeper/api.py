@@ -1,6 +1,6 @@
 """Public API: read-only views into keeper's projections.
 
-Seven readers; all stdlib-only and gated on
+Eight readers; all stdlib-only and gated on
 ``SUPPORTED_SCHEMA_VERSIONS``:
 
 - ``get_session_dirty_files(session_id, cwd)`` — which dirty files a
@@ -17,6 +17,10 @@ Seven readers; all stdlib-only and gated on
   equals *pid*, or ``None``.  Reads ``jobs`` (the new ``idx_jobs_pid``
   index covers the lookup).  Consumed by
   ``cli_common.session_context``'s psutil ancestor walk.
+- ``get_session_identity_for_pid(pid)`` — live identity of the session
+  owning *pid* as ``{session_id, title, name_history}``, or ``None``.
+  Reads ``jobs`` in one pid-keyed query.  Consumed by chatctl to attribute
+  and resolve agents by their current title or any former name.
 - ``get_latest_session()`` — most-recently-updated job's
   ``{session-id, cwd, session-name}`` (``session-name`` omitted when
   ``jobs.title`` is NULL), or ``None``.  Reads ``jobs``.  Consumed by
@@ -395,6 +399,54 @@ def get_session_for_pid(pid: int) -> str | None:
             (pid,),
         ).fetchone()
         return row[0] if row is not None else None
+    finally:
+        conn.close()
+
+
+def get_session_identity_for_pid(pid: int) -> dict | None:
+    """Return the live identity of the session owning *pid*, or ``None``.
+
+    Shape::
+
+        {"session_id": "<job_id>",
+         "title": "<current name>" | None,    # NULL title -> None
+         "name_history": ["<oldest>", ..., "<newest>"]}
+
+    Purpose-built single-read seam for chatctl, which keys its channels by the
+    Claude harness pid and needs the *live* (post-rename) session title plus
+    the full name history together — replacing the frozen launch-argv name
+    that went stale on every rename.  Composes what ``get_session_for_pid`` /
+    ``get_session_titles`` / ``get_session_name_history`` each expose, but in
+    one ``jobs`` read keyed by pid so callers don't open the db three times.
+
+    ``ORDER BY updated_at DESC LIMIT 1`` mirrors ``get_session_for_pid`` — pid
+    reuse is real (the OS recycles pids), so the freshest row for *pid* wins
+    and callers treat this as best-effort correlation, not authoritative
+    identity.  ``name_history`` decodes DEFENSIVELY (malformed / non-list cell
+    folds to ``[]``), mirroring ``get_session_name_history``.
+
+    Raises ``KeeperDBMissing`` / ``KeeperSchemaError`` like the other readers
+    here — no silent fallback.
+    """
+    path = _resolve_db_path()
+    conn = _open_readonly(path)
+    try:
+        _check_schema(conn)
+        row = conn.execute(
+            "SELECT job_id, title, name_history FROM jobs "
+            "WHERE pid = ? ORDER BY updated_at DESC LIMIT 1",
+            (pid,),
+        ).fetchone()
+        if row is None:
+            return None
+        job_id, title, name_history = row
+        return {
+            "session_id": job_id,
+            "title": title if title else None,
+            "name_history": [
+                n for n in _decode_json_list(name_history) if isinstance(n, str)
+            ],
+        }
     finally:
         conn.close()
 

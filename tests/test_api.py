@@ -23,6 +23,7 @@ from keeper.api import (
     get_latest_session,
     get_session_dirty_files,
     get_session_for_pid,
+    get_session_identity_for_pid,
     get_session_name_history,
     get_session_titles,
 )
@@ -353,6 +354,126 @@ class GetSessionForPidTest(unittest.TestCase):
         os.environ["KEEPER_DB"] = str(Path(self._tmp.name) / "nope.db")
         with self.assertRaises(KeeperDBMissing):
             get_session_for_pid(1234)
+
+
+def _add_job_identity(path, job_id, *, pid, title, name_history, updated_at=0.0):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO jobs (job_id, title, name_history, pid, updated_at) "
+        "VALUES (?,?,?,?,?)",
+        (job_id, title, name_history, pid, updated_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+class GetSessionIdentityForPidTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self._tmp.name) / "keeper.db"
+        _build_jobs_db(self.db)
+        self._prev = os.environ.get("KEEPER_DB")
+        os.environ["KEEPER_DB"] = str(self.db)
+
+    def tearDown(self) -> None:
+        if self._prev is None:
+            os.environ.pop("KEEPER_DB", None)
+        else:
+            os.environ["KEEPER_DB"] = self._prev
+        self._tmp.cleanup()
+
+    def test_returns_live_title_and_history(self):
+        _add_job_identity(
+            self.db,
+            "sess-1",
+            pid=4242,
+            title="renamed-live",
+            name_history=json.dumps(["launch-name", "renamed-live"]),
+            updated_at=100.0,
+        )
+        self.assertEqual(
+            get_session_identity_for_pid(4242),
+            {
+                "session_id": "sess-1",
+                "title": "renamed-live",
+                "name_history": ["launch-name", "renamed-live"],
+            },
+        )
+
+    def test_latest_wins_for_reused_pid(self):
+        _add_job_identity(
+            self.db,
+            "sess-old",
+            pid=7,
+            title="old",
+            name_history=json.dumps(["old"]),
+            updated_at=100.0,
+        )
+        _add_job_identity(
+            self.db,
+            "sess-new",
+            pid=7,
+            title="new",
+            name_history=json.dumps(["new"]),
+            updated_at=200.0,
+        )
+        ident = get_session_identity_for_pid(7)
+        assert ident is not None
+        self.assertEqual(ident["session_id"], "sess-new")
+        self.assertEqual(ident["title"], "new")
+
+    def test_null_title_folds_to_none(self):
+        _add_job_identity(
+            self.db,
+            "sess-1",
+            pid=9,
+            title=None,
+            name_history=json.dumps(["a"]),
+            updated_at=100.0,
+        )
+        ident = get_session_identity_for_pid(9)
+        assert ident is not None
+        self.assertIsNone(ident["title"])
+        self.assertEqual(ident["name_history"], ["a"])
+
+    def test_malformed_history_folds_to_empty_list(self):
+        _add_job_identity(
+            self.db,
+            "sess-1",
+            pid=11,
+            title="t",
+            name_history="not-json",
+            updated_at=100.0,
+        )
+        ident = get_session_identity_for_pid(11)
+        assert ident is not None
+        self.assertEqual(ident["name_history"], [])
+
+    def test_returns_none_when_pid_absent(self):
+        _add_job_identity(
+            self.db,
+            "sess-1",
+            pid=1,
+            title="t",
+            name_history=json.dumps([]),
+            updated_at=100.0,
+        )
+        self.assertIsNone(get_session_identity_for_pid(9999))
+
+    def test_returns_none_on_empty_db(self):
+        self.assertIsNone(get_session_identity_for_pid(1234))
+
+    def test_unsupported_schema_raises(self):
+        bad = Path(self._tmp.name) / "bad.db"
+        _build_jobs_db(bad, schema_version=30)
+        os.environ["KEEPER_DB"] = str(bad)
+        with self.assertRaises(KeeperSchemaError):
+            get_session_identity_for_pid(1234)
+
+    def test_missing_db_raises(self):
+        os.environ["KEEPER_DB"] = str(Path(self._tmp.name) / "nope.db")
+        with self.assertRaises(KeeperDBMissing):
+            get_session_identity_for_pid(1234)
 
 
 class GetLatestSessionTest(unittest.TestCase):
