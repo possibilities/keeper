@@ -71,5 +71,5 @@ CLAUDE.md (event-sourcing invariants bullet) and README.md (## Architecture,
 - [ ] The four discharge read predicates are unchanged (write-site fix); CLAUDE.md + README.md prose updated.
 
 ## Done summary
-
+foldCommit now gates discharge on per-file (blob_oid, committed_mode) equality against the file's stored (worktree_oid, worktree_mode). The stage->re-edit->commit orphan no longer fires: the worktree diverges from the committed bytes, the gate suppresses discharge, the editing session keeps its attribution claim. Falls back to today's unconditional timestamp discharge on any null axis so cursor=0 re-fold over pre-v44/v45 history is byte-identical. Symmetric across per-session and global discharge. Schema bumped to v45 (file_attributions.worktree_mode); keeper-py SUPPORTED_SCHEMA_VERSIONS adds 45. The four discharge READ predicates are byte-identical — only the WRITE site changed.
 ## Evidence
