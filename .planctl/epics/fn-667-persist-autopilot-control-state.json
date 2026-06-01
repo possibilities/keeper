@@ -2,9 +2,13 @@
   "branch_name": "fn-667-persist-autopilot-control-state",
   "bundles": [],
   "created_at": "2026-06-01T03:08:15.686599Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-664-gate-commit-discharge-on-worktree-oid",
+    "fn-666-attribute-planctl-file-writes",
+    "fn-665-fix-server-worker-test-spawn-role-field"
+  ],
   "id": "fn-667-persist-autopilot-control-state",
-  "last_validated_at": "2026-06-01T03:08:15.784670Z",
+  "last_validated_at": "2026-06-01T03:08:47.488353Z",
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -15,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-01T03:08:15.686599Z"
+  "updated_at": "2026-06-01T03:08:47.456071Z"
 }
