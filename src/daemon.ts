@@ -72,6 +72,11 @@ import type {
   AutopilotWorkerData,
   DispatchFailedMessage,
 } from "./autopilot-worker";
+import type {
+  BackendExecSnapshotMessage,
+  BackendWorkerData,
+  BackendWorkerMessage,
+} from "./backend-worker";
 import {
   openDb,
   resolveClaudeProjectsRoot,
@@ -1776,6 +1781,88 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
+  // Spawn the backend-exec tab-resolver worker (fn-668 / schema v48). Reads
+  // live jobs carrying both a `backend_exec_session_id` and a
+  // `backend_exec_pane_id` on each tick, dedups by distinct (session, pane),
+  // and posts a `{kind:"backend-exec-snapshot", job_id, tab_id, tab_name}`
+  // per resolved pane after running one `zellij action list-panes -a -j`
+  // per distinct session. Main lifts each message into a synthetic
+  // `BackendExecSnapshot` event whose reducer fold updates
+  // `jobs.backend_exec_tab_{id,name}` (tab tombstone = last-known sticks).
+  // Producer-only: opens read-only DB; main is the sole writer of the
+  // synthetic event per CLAUDE.md sole-writer rules.
+  const backendWorker = new Worker(
+    new URL("./backend-worker.ts", import.meta.url).href,
+    {
+      workerData: { dbPath } satisfies BackendWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  backendWorker.onmessage = (
+    ev: MessageEvent<BackendWorkerMessage | undefined>,
+  ): void => {
+    const msg = ev.data;
+    if (!msg) return;
+    if (msg.kind !== "backend-exec-snapshot") return;
+    // Synthetic event mint: `session_id` carries the job pk (the generic
+    // entity-key overload the synthetic-event pipeline uses — same shape
+    // as UsageSnapshot's profile id and EpicSnapshot's epic id). The tab
+    // payload rides in `data` JSON; the reducer's fold arm extracts
+    // `tab_id` + `tab_name` from `data` and UPDATEs the matching `jobs`
+    // row. Re-fold determinism: the payload is frozen into the event
+    // log here, so a cursor=0 re-fold reproduces byte-identical
+    // `jobs.backend_exec_tab_*` rows — the reducer never re-runs
+    // `list-panes`.
+    const snapshot: BackendExecSnapshotMessage = msg;
+    stmts.insertEvent.run({
+      $ts: Date.now() / 1000,
+      $session_id: snapshot.job_id,
+      $pid: null,
+      $hook_event: "BackendExecSnapshot",
+      $event_type: "backend_exec_snapshot",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: JSON.stringify({
+        tab_id: snapshot.tab_id,
+        tab_name: snapshot.tab_name,
+      }),
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $planctl_op: null,
+      $planctl_target: null,
+      $planctl_epic_id: null,
+      $planctl_task_id: null,
+      $planctl_subject_present: null,
+      $config_dir: null,
+      $planctl_queue_jump: null,
+      $bash_mutation_kind: null,
+      $bash_mutation_targets: null,
+      $planctl_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
+    });
+    wakePending = true;
+    pumpWakes();
+  };
+
+  backendWorker.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] backend worker error:", err.message ?? err);
+    fatalExit();
+  };
+
+  backendWorker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
+
   // Spawn the dead-letter worker (fn-643 task .3) in the SAME post-migration
   // window — the seventh worker thread (and sixth file-watcher producer
   // instance). It watches the dead-letters dir for changes and posts a
@@ -2006,6 +2093,7 @@ function runDaemon(): void {
     exitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     gitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     usageWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
+    backendWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     deadLetterWorker.postMessage({
       type: "shutdown",
     } satisfies ShutdownMessage);
@@ -2035,6 +2123,7 @@ function runDaemon(): void {
         exited(exitWorker),
         exited(gitWorker),
         exited(usageWorker),
+        exited(backendWorker),
         exited(deadLetterWorker),
         exited(autopilotWorkerInstance),
       ]),
@@ -2073,6 +2162,11 @@ function runDaemon(): void {
     }
     try {
       usageWorker.terminate();
+    } catch {
+      // best-effort if it already exited
+    }
+    try {
+      backendWorker.terminate();
     } catch {
       // best-effort if it already exited
     }

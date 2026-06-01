@@ -64,7 +64,8 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   events (`TranscriptTitle`, `ApiError`, `InputRequest`, `EpicSnapshot` /
   `TaskSnapshot` / `EpicDeleted` / `TaskDeleted`, `UsageSnapshot` /
   `UsageDeleted`, `Killed`, `GitSnapshot` / `GitRootDropped` / `Commit`,
-  `DispatchFailed` / `DispatchCleared`, `AutopilotPaused`), of the
+  `DispatchFailed` / `DispatchCleared`, `AutopilotPaused`,
+  `BackendExecSnapshot`), of the
   `dead_letters` operational sidecar, and of the dead-letter replay path. The
   server-worker writes only the `approval` field on external `.planctl` JSON
   (atomic temp+rename) and bridges `replay_dead_letter`,
