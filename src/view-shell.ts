@@ -52,9 +52,23 @@
  */
 
 import { appendFileSync, writeFileSync } from "node:fs";
+import { SELECTION_BG_SGR } from "./ansi-to-styled";
 import { colorizePillsInLine } from "./board-render";
 import { buildDebugSnapshot, copyToClipboard } from "./clipboard-debug";
 import { createLiveShell, type LiveShell } from "./live-shell";
+
+/**
+ * Selection-highlight protocol. A `renderBody` may prefix exactly one of
+ * its `bodyLines` with this non-printing Private-Use char to mark it as the
+ * selected row. The view-shell strips the prefix before colorizing, then —
+ * on a color-enabled TTY — prepends the selection-background SGR so the
+ * paint layer renders that row as a full-width highlight (see
+ * `src/ansi-to-styled.ts`). The prefix stays in the byte-compare body so a
+ * selection move invalidates the frame cache and repaints; it is stripped
+ * from the sidecar frame text so postmortem output stays clean. Non-TTY
+ * output drops both the prefix and the highlight.
+ */
+export const SELECTED_LINE_PREFIX = "\u{E000}";
 
 /** Output of one render pass — the body the view wants to emit. */
 export interface ViewRender {
@@ -305,23 +319,54 @@ export function createViewShell<TSnap>(
     lastFrameText = frameText;
   }
 
+  // Strip the selection-highlight prefix off one line. Returns whether the
+  // line was the selected row and its prefix-free text.
+  function stripSelectionPrefix(line: string): {
+    selected: boolean;
+    text: string;
+  } {
+    return line.startsWith(SELECTED_LINE_PREFIX)
+      ? { selected: true, text: line.slice(SELECTED_LINE_PREFIX.length) }
+      : { selected: false, text: line };
+  }
+
+  // Map render `bodyLines` to the strings shipped to the live shell. Each
+  // line is de-prefixed, then (on a color-enabled TTY) pill-colorized; the
+  // selected row additionally gets the selection-background SGR prepended
+  // AFTER colorization so the pill regex never sees the escape. Non-TTY
+  // output is de-prefixed plain text — no SGR, no highlight.
+  function toShellLines(bodyLines: string[]): string[] {
+    return bodyLines.map((line) => {
+      const { selected, text } = stripSelectionPrefix(line);
+      if (!colorEnabled) {
+        return text;
+      }
+      const colored = colorizePillsInLine(text);
+      return selected ? `${SELECTION_BG_SGR}${colored}` : colored;
+    });
+  }
+
+  // Sidecar frame text strips the selection prefix so postmortem output
+  // stays clean (the prefix is a live-paint protocol, not data).
+  function sidecarFrameText(bodyLines: string[]): string {
+    return ["---", ...bodyLines.map((l) => stripSelectionPrefix(l).text)].join(
+      "\n",
+    );
+  }
+
   function emit(snap: TSnap): boolean {
     const { bodyLines, stateJson } = renderBody(snap);
+    // The byte-compare body KEEPS the selection prefix so moving the
+    // selection (which only changes which line carries the prefix)
+    // invalidates the cache and repaints.
     const body = bodyLines.join("\n");
     if (body === lastBody) {
       return false;
     }
     lastBody = body;
     frameCount += 1;
-    const frameText = ["---", ...bodyLines].join("\n");
-    // Only lines shipped to the screen pick up SGR coloring. Gated on
-    // TTY + NO_COLOR so piped/redirected output stays clean. `---` is
-    // kept in frameText for sidecars/non-TTY output but not painted.
-    const linesForShell = colorEnabled
-      ? bodyLines.map(colorizePillsInLine)
-      : bodyLines;
-    liveShell.pushFrame(linesForShell);
-    writeSidecars(stateJson, frameText);
+    liveShell.pushFrame(toShellLines(bodyLines));
+    writeSidecars(stateJson, sidecarFrameText(bodyLines));
     return true;
   }
 
@@ -336,10 +381,7 @@ export function createViewShell<TSnap>(
     // a history frame. No frameCount bump, no sidecar write — selection /
     // expand churn is ephemeral UI state, not a data frame.
     lastBody = body;
-    const linesForShell = colorEnabled
-      ? bodyLines.map(colorizePillsInLine)
-      : bodyLines;
-    liveShell.refreshLive(linesForShell);
+    liveShell.refreshLive(toShellLines(bodyLines));
     return true;
   }
 

@@ -22,6 +22,7 @@ import {
 } from "../cli/jobs";
 import { colorizePillsInLine, renderDeadLetterPill } from "../src/board-render";
 import type { SubagentInvocation } from "../src/types";
+import { SELECTED_LINE_PREFIX } from "../src/view-shell";
 
 // ---------------------------------------------------------------------------
 // SubagentInvocation fixture — minimal shape, copied from
@@ -204,7 +205,7 @@ test("backendCoordsSeg: type only — every other coord null → bare type", () 
   ).toBe(" · zellij");
 });
 
-test("projectJobRow: backend coords append to the row inline (after the state pill)", () => {
+test("projectJobRow: backend coords drop to an indented continuation line under the head", () => {
   const line = projectJobRow({
     job_id: "j1",
     cwd: "/Users/alice/code/keeper",
@@ -217,7 +218,9 @@ test("projectJobRow: backend coords append to the row inline (after the state pi
     backend_exec_tab_id: "3",
     backend_exec_tab_name: "main",
   });
-  expect(line).toBe("(keeper) live session [working] · zellij ada/main p11");
+  // fn-668 follow-up: coords moved off the head line to their own 2-space
+  // indented `· …` continuation line so the head stays a single scannable row.
+  expect(line).toBe("(keeper) live session [working]\n  · zellij ada/main p11");
 });
 
 test("projectJobRow: absent backend coords render as nothing (no placeholder, no 'undefined')", () => {
@@ -235,7 +238,7 @@ test("projectJobRow: absent backend coords render as nothing (no placeholder, no
   expect(line).not.toContain("·");
 });
 
-test("projectJobRow: backend coords + awaiting continuation — backend sits on the head line, awaiting drops below", () => {
+test("projectJobRow: awaiting + backend each drop to their own indented continuation line (awaiting first)", () => {
   const line = projectJobRow({
     cwd: "/repo/x",
     title: "asking",
@@ -248,10 +251,10 @@ test("projectJobRow: backend coords + awaiting continuation — backend sits on 
     backend_exec_pane_id: "11",
     backend_exec_tab_name: "main",
   });
-  // Backend segment sits on the head line (after the state pill);
-  // the awaiting pill keeps its own indented continuation line.
+  // Head stays single-line; awaiting pill then backend coords each get their
+  // own 2-space continuation line, awaiting above backend.
   expect(line).toBe(
-    "(x) asking [worker] [stopped] · zellij ada/main p11\n  [awaiting:ask_user_question]",
+    "(x) asking [worker] [stopped]\n  [awaiting:ask_user_question]\n  · zellij ada/main p11",
   );
 });
 
@@ -534,16 +537,19 @@ test("selectableJobIds: interactive jobs first, then autopilot, preserving wire 
 });
 
 // ---------------------------------------------------------------------------
-// renderJobsBody insert-mode decoration: 2-space base indent on every
-// line, a disclosure triangle on job rows that have children, and a
-// `> ` marker on the selected row. Nerd Font glyphs: caret-right
-// (collapsed) / caret-down (expanded).
+// renderJobsBody insert-mode decoration: a 2-space base indent on headings
+// and child/continuation lines, a disclosure triangle on job rows that have
+// children, and a full-width selection highlight on the selected row. The
+// selected row carries no `> ` marker — instead its HEAD line is prefixed
+// with SELECTED_LINE_PREFIX (the view-shell turns that into a background
+// highlight). Nerd Font glyphs: caret-right (collapsed) / caret-down
+// (expanded).
 // ---------------------------------------------------------------------------
 
 const TRI_RIGHT = "\uf0da"; // GLYPH_COLLAPSED // GLYPH_COLLAPSED
 const TRI_DOWN = "\uf0d7"; // GLYPH_EXPANDED // GLYPH_EXPANDED
 
-test("renderJobsBody insert mode: indent + selection marker + collapsed triangle", () => {
+test("renderJobsBody insert mode: indent + selection-prefix + collapsed triangle", () => {
   const jobs = new Map<string, unknown>([
     [
       "j1",
@@ -587,9 +593,9 @@ test("renderJobsBody insert mode: indent + selection marker + collapsed triangle
   });
   expect(body).toBe(
     [
-      "    --- interactive ---", // heading: 2 base + 2 disclosure pad
-      `> ${TRI_RIGHT} (a) first [working]`, // selected, collapsed-with-children
-      "    (b) second [working]", // unselected, no children → blank gutter
+      "  --- interactive ---", // heading: 2-space base indent
+      `${SELECTED_LINE_PREFIX}${TRI_RIGHT} (a) first [working]`, // selected (prefix), collapsed-with-children
+      "  (b) second [working]", // unselected, no children → blank gutter
     ].join("\n"),
   );
 });
@@ -627,14 +633,14 @@ test("renderJobsBody insert mode: selected + expanded shows down-triangle and re
   });
   expect(body).toBe(
     [
-      "    --- interactive ---",
-      `> ${TRI_DOWN} (a) first [working]`, // selected, expanded
-      "      scout: d [ok]", // child: 2 base + 2 pad + its own 2
+      "  --- interactive ---",
+      `${SELECTED_LINE_PREFIX}${TRI_DOWN} (a) first [working]`, // selected (prefix), expanded
+      "    scout: d [ok]", // child: 2 base + its own 2
     ].join("\n"),
   );
 });
 
-test("renderJobsBody insert mode: out-of-range selectedIndex clamps (no marker leak / no crash)", () => {
+test("renderJobsBody insert mode: out-of-range selectedIndex clamps (no prefix leak / no crash)", () => {
   const jobs = new Map<string, unknown>([
     [
       "j1",
@@ -647,22 +653,25 @@ test("renderJobsBody insert mode: out-of-range selectedIndex clamps (no marker l
       },
     ],
   ]);
-  // selectedIndex past the end clamps to the last row, which gets the marker.
+  // selectedIndex past the end clamps to the last row, which gets the prefix.
   const body = renderJobsBody(jobs, new Map(), {
     insertMode: true,
     selectedIndex: 99,
     expanded: new Set(),
   });
   expect(body).toBe(
-    // `> ` selection marker + `  ` blank disclosure gutter (no children).
-    ["    --- interactive ---", ">   (a) first [working]"].join("\n"),
+    // selection prefix + `  ` blank disclosure gutter (no children).
+    [
+      "  --- interactive ---",
+      `${SELECTED_LINE_PREFIX}  (a) first [working]`,
+    ].join("\n"),
   );
 });
 
 test("renderJobsBody insert mode: selectedIndex marks by selectableJobIds order, not raw Map order (interleaved partitions)", () => {
   // Regression: the Map interleaves interactive/autopilot as sessions arrive,
   // but `selectedIndex` indexes `selectableJobIds` (interactive-then-autopilot).
-  // Marking by raw Map-iteration index landed the `> ` marker in the wrong
+  // Marking by raw Map-iteration index landed the highlight in the wrong
   // partition. Here Map order is I,A,I,A; selectableJobIds is [I0,I1,A0,A1].
   const mk = (id: string, plan_verb: string | null) => ({
     job_id: id,
@@ -683,11 +692,15 @@ test("renderJobsBody insert mode: selectedIndex marks by selectableJobIds order,
     selectedIndex: 1,
     expanded: new Set(),
   });
-  const marked = body.split("\n").find((l) => l.startsWith("> "));
-  // The marker must land on inter-1 (I1), never on auto-0 (the raw-index-1 row).
-  expect(marked).toBe(">   (i1) inter-1 [working]");
-  // And exactly one row is marked.
-  expect(body.split("\n").filter((l) => l.startsWith("> ")).length).toBe(1);
+  const marked = body
+    .split("\n")
+    .find((l) => l.startsWith(SELECTED_LINE_PREFIX));
+  // The highlight must land on inter-1 (I1), never on auto-0 (the raw-index-1 row).
+  expect(marked).toBe(`${SELECTED_LINE_PREFIX}  (i1) inter-1 [working]`);
+  // And exactly one row is selection-prefixed.
+  expect(
+    body.split("\n").filter((l) => l.startsWith(SELECTED_LINE_PREFIX)).length,
+  ).toBe(1);
 });
 
 // ---------------------------------------------------------------------------

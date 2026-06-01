@@ -82,7 +82,29 @@ export type SegmentKind =
 export interface ParsedSegment {
   readonly kind: SegmentKind;
   readonly text: string;
+  /**
+   * `true` when this run sits under an active selection background (opened
+   * by {@link SELECTION_BG_SGR}). Omitted (not `false`) on the common path
+   * so the board's plain/fg-only segments compare `.toEqual({kind,text})`
+   * unchanged. Tracked INDEPENDENTLY of `kind`: a foreground reset
+   * (`\x1b[0m`) clears the fg bucket but NOT the background, so a selected
+   * row keeps its full-row highlight behind its individually-colored pills.
+   */
+  readonly bg?: true;
 }
+
+/**
+ * The SGR open that marks a run as selection-highlighted. Emitted by the
+ * view-shell when it ships the selected row to the live shell (prepended
+ * AFTER pill colorization, so the pill regex never sees it). `48;5;238`
+ * (xterm dark grey) is the wire code; the shim maps it to {@link
+ * SELECTION_BG_HEX} on the chunk's `bg`. There is no explicit close — the
+ * background is line-scoped (the parser runs per line) and runs to EOL,
+ * which is exactly the full-row-highlight semantics we want.
+ */
+export const SELECTION_BG_SGR = "\x1b[48;5;238m";
+const SELECTION_BG_BODY = "48;5;238";
+const SELECTION_BG_HEX = "#444444";
 
 /**
  * Map of SGR open code → bucket. The six entries match
@@ -168,14 +190,18 @@ export function parseAnsiSegments(line: string): ParsedSegment[] {
     return [];
   }
   const out: ParsedSegment[] = [];
-  // `current` is the in-progress run; `kind` is its bucket. We flush
-  // when the bucket changes (or when we hit EOL). An empty `current`
-  // skips the flush.
+  // `current` is the in-progress run; `kind` is its fg bucket; `bgActive`
+  // is the selection-background layer (set by SELECTION_BG_SGR, survives
+  // fg resets, line-scoped). We flush when either changes (or at EOL). An
+  // empty `current` skips the flush.
   let current = "";
   let kind: SegmentKind = "plain";
+  let bgActive = false;
   const flush = (): void => {
     if (current.length === 0) return;
-    out.push({ kind, text: current });
+    out.push(
+      bgActive ? { kind, text: current, bg: true } : { kind, text: current },
+    );
     current = "";
   };
   let i = 0;
@@ -216,6 +242,16 @@ export function parseAnsiSegments(line: string): ParsedSegment[] {
       i = close + 1;
       continue;
     }
+    // Selection-background open. Flush the prior run, then raise the
+    // background layer — independent of the fg bucket, so the row's pills
+    // keep their own colors on top. No matching close: the parser runs per
+    // line, so the highlight naturally runs to EOL (full-row select).
+    if (body === SELECTION_BG_BODY) {
+      flush();
+      bgActive = true;
+      i = close + 1;
+      continue;
+    }
     // Recognized open. Flush the in-progress run (if any) under its
     // current bucket, then switch buckets — the next character (if
     // any) starts a new run under the new bucket.
@@ -250,19 +286,18 @@ function buildChunks(
   runtime: AnsiToStyledRuntime,
 ): TextChunk[] {
   const chunks: TextChunk[] = [];
+  const selectionBg = runtime.RGBA.fromHex(SELECTION_BG_HEX);
   for (const seg of segments) {
     if (seg.text.length === 0) continue;
-    if (seg.kind === "plain") {
-      chunks.push({ __isChunk: true, text: seg.text });
-      continue;
+    const chunk: TextChunk = { __isChunk: true, text: seg.text };
+    if (seg.kind !== "plain") {
+      chunk.fg = runtime.RGBA.fromHex(SEGMENT_FG_HEX[seg.kind]);
+      if (seg.kind === "faded") {
+        chunk.attributes = runtime.TextAttributes.DIM;
+      }
     }
-    const fgHex = SEGMENT_FG_HEX[seg.kind];
-    const fg = runtime.RGBA.fromHex(fgHex);
-    const attributes =
-      seg.kind === "faded" ? runtime.TextAttributes.DIM : undefined;
-    const chunk: TextChunk = { __isChunk: true, text: seg.text, fg };
-    if (attributes !== undefined) {
-      chunk.attributes = attributes;
+    if (seg.bg === true) {
+      chunk.bg = selectionBg;
     }
     chunks.push(chunk);
   }
@@ -318,11 +353,13 @@ export function linesContainAnsi(lines: readonly string[]): boolean {
 export function linesToContent(
   lines: readonly string[],
   runtime: AnsiToStyledRuntime,
+  width?: number,
 ): StyledText | string {
   if (lines.length === 0) return "";
   if (!linesContainAnsi(lines)) {
     return lines.join("\n");
   }
+  const selectionBg = runtime.RGBA.fromHex(SELECTION_BG_HEX);
   const chunks: TextChunk[] = [];
   for (let i = 0; i < lines.length; i++) {
     if (i > 0) {
@@ -331,6 +368,32 @@ export function linesToContent(
     const line = lines[i] as string;
     const segments = parseAnsiSegments(line);
     chunks.push(...buildChunks(segments, runtime));
+    // Full-row selection highlight: when the line ends under an active
+    // selection background (a SELECTION_BG_SGR-prefixed row) and a render
+    // width is known, extend the background to the right edge with a
+    // trailing space-run. Width comes from the paint layer's live viewport
+    // width, so a terminal resize re-pads correctly on the next repaint —
+    // the padding is NOT baked into the stored frame string. Skipped when
+    // width is absent (tests / non-paint callers) or the row already fills
+    // the width (padCount <= 0).
+    if (
+      width !== undefined &&
+      segments.length > 0 &&
+      segments[segments.length - 1]?.bg === true
+    ) {
+      let visible = 0;
+      for (const seg of segments) {
+        visible += seg.text.length;
+      }
+      const padCount = width - visible;
+      if (padCount > 0) {
+        chunks.push({
+          __isChunk: true,
+          text: " ".repeat(padCount),
+          bg: selectionBg,
+        });
+      }
+    }
   }
   return new runtime.StyledText(chunks);
 }

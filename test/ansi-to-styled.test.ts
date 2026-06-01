@@ -38,6 +38,7 @@ import {
   linesContainAnsi,
   linesToContent,
   parseAnsiSegments,
+  SELECTION_BG_SGR,
 } from "../src/ansi-to-styled";
 
 // Runtime helper bag the chunk-builder needs from `@opentui/core`. The
@@ -299,4 +300,75 @@ test("linesToContent: round-trip reconstructed text matches the input minus SGR 
   }
   const reconstructed = out.chunks.map((c) => c.text).join("");
   expect(reconstructed).toBe("A\nB\nC\nD\nE");
+});
+
+// ---------------------------------------------------------------------------
+// Selection-background layer (fn-668 follow-up). SELECTION_BG_SGR opens a
+// background that survives fg resets (so a selected row keeps its pill
+// colors on a highlight) and runs to EOL; `linesToContent` pads the
+// highlighted line to the supplied width so the highlight spans full-width.
+// ---------------------------------------------------------------------------
+
+test("parseAnsiSegments: SELECTION_BG_SGR marks the run bg, surviving a fg reset", () => {
+  // bg open, then a warn pill that resets fg mid-line — bg must persist.
+  const line = `${SELECTION_BG_SGR}head ${SGR.warn}[pill]${SGR.reset} tail`;
+  expect(parseAnsiSegments(line)).toEqual([
+    { kind: "plain", text: "head ", bg: true },
+    { kind: "warn", text: "[pill]", bg: true },
+    { kind: "plain", text: " tail", bg: true },
+  ]);
+});
+
+test("parseAnsiSegments: no SELECTION_BG_SGR → no bg field (board path unchanged)", () => {
+  expect(parseAnsiSegments(`${SGR.warn}x${SGR.reset}`)).toEqual([
+    { kind: "warn", text: "x" },
+  ]);
+});
+
+test("buildChunks (via ansiLineToStyled): bg segment carries a chunk.bg; plain chunk does not", () => {
+  const styled = ansiLineToStyled(`${SELECTION_BG_SGR}sel`, RUNTIME);
+  expect(styled.chunks).toHaveLength(1);
+  expect(styled.chunks[0]?.text).toBe("sel");
+  expect(styled.chunks[0]?.bg).toBeDefined();
+  const plain = ansiLineToStyled("plain", RUNTIME);
+  expect(plain.chunks[0]?.bg).toBeUndefined();
+});
+
+test("linesToContent: width pads a highlighted line to full width with a trailing bg space-run", () => {
+  // Visible "sel" is 3 cols; width 8 → a 5-space bg pad chunk is appended.
+  const out = linesToContent([`${SELECTION_BG_SGR}sel`], RUNTIME, 8);
+  if (!(out instanceof StyledText)) {
+    throw new Error("expected StyledText");
+  }
+  const last = out.chunks[out.chunks.length - 1];
+  expect(last?.text).toBe("     "); // 5 spaces
+  expect(last?.bg).toBeDefined();
+  const visible = out.chunks.map((c) => c.text).join("");
+  expect(visible.length).toBe(8); // full width
+});
+
+test("linesToContent: no width → highlighted line is NOT padded (test/non-paint callers)", () => {
+  const out = linesToContent([`${SELECTION_BG_SGR}sel`], RUNTIME);
+  if (!(out instanceof StyledText)) {
+    throw new Error("expected StyledText");
+  }
+  expect(out.chunks.map((c) => c.text).join("")).toBe("sel");
+});
+
+test("linesToContent: a row already at/over width gets no negative pad", () => {
+  const out = linesToContent([`${SELECTION_BG_SGR}exactly8!`], RUNTIME, 8);
+  if (!(out instanceof StyledText)) {
+    throw new Error("expected StyledText");
+  }
+  expect(out.chunks.map((c) => c.text).join("")).toBe("exactly8!"); // 9 cols, no pad
+});
+
+test("linesToContent: only the highlighted line is padded, plain lines untouched", () => {
+  const out = linesToContent(["plain", `${SELECTION_BG_SGR}sel`], RUNTIME, 6);
+  if (!(out instanceof StyledText)) {
+    throw new Error("expected StyledText");
+  }
+  // chunks: "plain", "\n", "sel", "   " (3-space pad). The plain line is not padded.
+  const texts = out.chunks.map((c) => c.text);
+  expect(texts).toEqual(["plain", "\n", "sel", "   "]);
 });

@@ -526,6 +526,10 @@ export function attachLiveShellPaint(
   let lastBannerText: string | null = null;
   let lastBodyText: string | null = null;
   let lastBodyLineCount = -1;
+  // Last viewport width the body was padded against — a resize that changes
+  // the width re-runs `linesToContent` even when the rows are byte-stable,
+  // so the full-row selection highlight re-extends to the new right edge.
+  let lastBodyWidth = -1;
 
   const bannerNode = new runtime.TextRenderable(renderer, {
     id: "live-shell-banner",
@@ -557,7 +561,7 @@ export function attachLiveShellPaint(
   };
   const bodyNode = new runtime.TextRenderable(renderer, {
     id: "live-shell-body",
-    content: linesToContent(core.visibleRows(), shimRuntime),
+    content: linesToContent(core.visibleRows(), shimRuntime, sb.viewport.width),
   });
   sb.add(bodyNode);
   renderer.root.add(bannerNode);
@@ -566,6 +570,7 @@ export function attachLiveShellPaint(
   lastBannerText = core.bannerText();
   lastBodyText = core.visibleRows().join("\n");
   lastBodyLineCount = core.visibleRows().length;
+  lastBodyWidth = sb.viewport.width;
 
   /**
    * Translate an OpenTUI `KeyEvent` back to the raw-string contract
@@ -694,10 +699,21 @@ export function attachLiveShellPaint(
     // bearing lines). Avoids re-running the parser when rows are
     // byte-identical to the last paint.
     const joined = rows.join("\n");
-    if (joined !== lastBodyText || rows.length !== lastBodyLineCount) {
-      bodyNode.content = linesToContent(rows, shimRuntime);
+    // Re-pad on every paint (not just content changes) so the selection
+    // highlight tracks the live viewport width across a resize: a width
+    // change with byte-identical rows still needs the trailing bg-pad
+    // recomputed. Cheap — `linesToContent` short-circuits plain (no-ANSI)
+    // bodies to a single string with no per-line work.
+    const bodyWidth = sb.viewport.width;
+    if (
+      joined !== lastBodyText ||
+      rows.length !== lastBodyLineCount ||
+      bodyWidth !== lastBodyWidth
+    ) {
+      bodyNode.content = linesToContent(rows, shimRuntime, bodyWidth);
       lastBodyText = joined;
       lastBodyLineCount = rows.length;
+      lastBodyWidth = bodyWidth;
     }
     // Snap the scroll position to the top ONLY on a user-initiated frame
     // switch (the core sets the flag in its navigation actions) — so a

@@ -28,8 +28,10 @@
  * (via `createViewShell`'s `captureKeys`), so the global frame-scrub /
  * copy / replay keys go inert and only Ctrl-C still quits. The whole UI
  * indents two spaces, each job row gains a Nerd Font disclosure triangle
- * (`GLYPH_COLLAPSED`/`GLYPH_EXPANDED`), and the selected row is marked
- * `> `. `j`/`k`/↓/↑ move the selection; space toggles the selected job's
+ * (`GLYPH_COLLAPSED`/`GLYPH_EXPANDED`), and the selected row is shown by a
+ * full-width background highlight (no `> ` marker — the head line is
+ * prefixed with `SELECTED_LINE_PREFIX`, which the view-shell paints as the
+ * highlight). `j`/`k`/↓/↑ move the selection; space toggles the selected job's
  * sub-agent visibility (`expanded`). The render state lives in `main`
  * and is threaded into `renderJobsBody` via `JobsRenderOptions`; a
  * keypress re-emits the stashed snapshot so the repaint is immediate.
@@ -82,7 +84,7 @@ import {
 } from "../src/readiness-client";
 import { appendDiagnostic } from "../src/readiness-diagnostics";
 import type { SubagentInvocation } from "../src/types";
-import { createViewShell } from "../src/view-shell";
+import { createViewShell, SELECTED_LINE_PREFIX } from "../src/view-shell";
 
 const HELP = `keeper jobs — live jobs list over the keeper subscribe server
 
@@ -97,9 +99,10 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   r replay one oldest waiting dead-letter (recovers a dropped hook event),
   i enter insert mode, q/Ctrl-C quit.
   Insert mode (job-local navigation): the whole UI indents two spaces,
-  each job row gains a disclosure triangle, and the selected row is
-  marked with '> '. j/k or ↓/↑ move the selection; space expands /
-  collapses the selected job's sub-agent lines; Esc leaves insert mode.
+  each job row gains a disclosure triangle, and the selected row is shown
+  by a full-width background highlight. j/k or ↓/↑ move the selection;
+  space expands / collapses the selected job's sub-agent lines (no-op on a
+  job with none); Esc leaves insert mode.
   While in insert mode every other (global) key is inert — only Ctrl-C
   still quits.
   Per-frame sidecars are indexed; lifecycle + warn output is appended
@@ -186,8 +189,21 @@ export function projectJobRow(row: Record<string, unknown>): string {
     row.last_input_request_kind,
   );
   const backend = backendCoordsSeg(row);
-  const head = `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}${backend}`;
-  return awaiting === "" ? head : `${head}\n  ${awaiting.trimStart()}`;
+  const head = `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
+  // Continuation lines under the head, each at the 2-space depth shared
+  // with sub-agent lines. `awaiting` (an input-request pill) and `backend`
+  // (the zellij/exec coords, fn-668) each drop to their own line so the
+  // head row stays a single scannable `(cwd) title [role] [state]` line.
+  // The backend coords moved off the head line in fn-668 follow-up — they
+  // were crowding the pill grid; on their own dim ` · …` line they recede.
+  const lines = [head];
+  if (awaiting !== "") {
+    lines.push(`  ${awaiting.trimStart()}`);
+  }
+  if (backend !== "") {
+    lines.push(`  ${backend.trimStart()}`);
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -250,7 +266,9 @@ const GLYPH_EXPANDED = "\uf0d7"; // nf-fa-caret_down (U+F0D7) ▾
  *
  * - `insertMode` — when true, every line gets a 2-space base indent, job
  *   rows additionally carry a disclosure column (triangle when they have
- *   children) and the selected row is marked with `> `.
+ *   children) and the selected job's head line is prefixed with
+ *   `SELECTED_LINE_PREFIX` (the view-shell paints it as a full-width
+ *   background highlight).
  * - `selectedIndex` — index into the selectable job rows (interactive
  *   first, then autopilot — the order `selectableJobIds` produces).
  *   Clamped to range inside `renderJobsBody` so a stale index from a
@@ -303,7 +321,8 @@ export function selectableJobIds(jobs: Map<string, unknown>): string[] {
  * a 2-space base indent; job rows carry a disclosure column
  * (`GLYPH_COLLAPSED`/`GLYPH_EXPANDED` when they have children, else
  * blank); the selected job row (`render.selectedIndex` into
- * `selectableJobIds`) is prefixed with `> `.
+ * `selectableJobIds`) has its head line prefixed with
+ * `SELECTED_LINE_PREFIX` for the view-shell's full-width highlight.
  *
  * Heading-drop rule (mirrors autopilot): a heading is emitted ONLY when
  * its partition has rows. A partition with zero rows yields neither its
@@ -338,14 +357,16 @@ export function renderJobsBody(
           )
         ];
 
-  // Insert-mode line prefixing. A heading or sub-agent ("child") line
-  // gets a flat 4-space indent (2 base + 2 for the disclosure column it
-  // doesn't own). A job row gets `<sel><tri>`: the 2-col selection gutter
-  // (`> ` when selected) followed by the 2-col disclosure column (a
-  // triangle when it has children, else blank). Normal mode is a
-  // pass-through.
+  // Insert-mode line prefixing. The selected row is shown by a full-width
+  // background highlight (not a `> ` marker), so there is no selection
+  // gutter — insert mode just adds a flat 2-space base indent to headings,
+  // continuation lines, and sub-agent ("child") lines, and a 2-col
+  // disclosure column to job rows (a triangle when they have children, else
+  // blank). The selected job's HEAD line is prefixed with
+  // `SELECTED_LINE_PREFIX`; the view-shell strips that and repaints the row
+  // as a highlighted full-width line. Normal mode is a pass-through.
   const decorateHeadingOrChild = (line: string): string =>
-    insertMode ? `    ${line}` : line;
+    insertMode ? `  ${line}` : line;
   const decorateJobRow = (
     line: string,
     o: { hasChildren: boolean; isExpanded: boolean; isSelected: boolean },
@@ -353,11 +374,10 @@ export function renderJobsBody(
     if (!insertMode) {
       return line;
     }
-    const sel = o.isSelected ? "> " : "  ";
     const tri = o.hasChildren
       ? `${o.isExpanded ? GLYPH_EXPANDED : GLYPH_COLLAPSED} `
       : "  ";
-    return `${sel}${tri}${line}`;
+    return `${o.isSelected ? SELECTED_LINE_PREFIX : ""}${tri}${line}`;
   };
 
   const interactive: string[] = [];
@@ -366,12 +386,19 @@ export function renderJobsBody(
     const r = row as Record<string, unknown>;
     const hasChildren = (subagentIndex.get(id)?.length ?? 0) > 0;
     const isExpanded = expanded.has(id);
+    // `projectJobRow` may return a multi-line block: the head row plus
+    // continuation lines (awaiting pill, backend coords) already carrying
+    // their own 2-space indent. Decorate the head line as the job row; the
+    // continuations are decorated like child lines so the whole block
+    // shares the insert-mode base indent.
+    const [headLine = "", ...contLines] = projectJobRow(r).split("\n");
     const lines: string[] = [
-      decorateJobRow(projectJobRow(r), {
+      decorateJobRow(headLine, {
         hasChildren,
         isExpanded,
         isSelected: insertMode && id === selectedId,
       }),
+      ...contLines.map(decorateHeadingOrChild),
     ];
     if (isExpanded) {
       for (const sub of subagentLinesFor(subagentIndex, id, "  ")) {
