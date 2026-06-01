@@ -79,10 +79,18 @@ from pathlib import Path
 # one row per sticky ``(verb, id)`` dispatch failure — keeper-py does not
 # read ``dispatch_failures`` (the reader is the thin ``keeper autopilot``
 # viewer, fed via the UDS subscribe wire), so the bump is whitelist-only
-# with no reader logic change.
+# with no reader logic change; v44 (fn-664 content-aware discharge
+# substrate) adds an additive nullable ``file_attributions.worktree_oid``
+# column carrying the filter-correct git blob oid of each dirty file's
+# worktree bytes (frozen into the ``GitSnapshot`` event payload by the
+# producer's ``git hash-object --stdin-paths`` batch) — keeper-py reads
+# ``file_attributions`` only for the ``session_id`` / ``file_path`` /
+# ``last_mutation_at`` / ``last_commit_at`` tuple and does not project
+# ``worktree_oid``, so the bump is whitelist-only with no reader logic
+# change.
 # Bump this set when a keeper schema change alters those tables.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
-    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43}
+    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44}
 )
 
 

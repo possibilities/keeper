@@ -1049,6 +1049,21 @@ interface ReducerDirtyFile {
   xy: string;
   orig_path: string | null;
   mtime_ms: number | null;
+  /**
+   * Schema v44 / fn-664: filter-correct worktree blob oid (`git hash-object
+   * --stdin-paths` per file at producer time), staged blob oid (porcelain v2
+   * `hI`), and worktree file mode (porcelain v2 `mW`). All three are
+   * frozen-into-payload pure facts — no fold-time git probe, re-fold
+   * deterministic. Each parses to `null` independently when (a) the producer
+   * couldn't compute it, (b) the event pre-dates v44 and the field is
+   * absent, or (c) the per-file shape is malformed. Task .1 stamps
+   * `worktree_oid` into `file_attributions` (additive UPSERT column) but
+   * does NOT yet read it for discharge; task .2 of the epic switches
+   * `foldCommit` to gate on `committed_oid == worktree_oid`.
+   */
+  worktree_oid: string | null;
+  index_oid: string | null;
+  worktree_mode: string | null;
 }
 
 /**
@@ -1116,11 +1131,34 @@ function extractGitSnapshot(event: Event): ParsedGitSnapshot | null {
         typeof f.mtime_ms === "number" && Number.isFinite(f.mtime_ms)
           ? f.mtime_ms
           : null;
+      // v44 / fn-664: three new per-file content axes. All `string|null`
+      // with the defensive parse: a non-string folds to `null` so a
+      // malformed payload never wedges the fold tx. Validation of
+      // worktree_oid / index_oid against GIT_OID_RE shape isn't done here
+      // (the producer is the trusted writer); a bad oid round-trips into
+      // file_attributions as-is and the task .2 discharge gate will
+      // reject the comparison, falling back to timestamp discharge —
+      // identical safe-side behavior to today's pre-v44 fold.
+      const worktreeOid =
+        typeof f.worktree_oid === "string" && f.worktree_oid.length > 0
+          ? f.worktree_oid
+          : null;
+      const indexOid =
+        typeof f.index_oid === "string" && f.index_oid.length > 0
+          ? f.index_oid
+          : null;
+      const worktreeMode =
+        typeof f.worktree_mode === "string" && f.worktree_mode.length > 0
+          ? f.worktree_mode
+          : null;
       dirtyFiles.push({
         path: f.path,
         xy,
         orig_path: origPath,
         mtime_ms: mtimeMs,
+        worktree_oid: worktreeOid,
+        index_oid: indexOid,
+        worktree_mode: worktreeMode,
       });
     }
   }
@@ -1755,10 +1793,24 @@ function projectGitStatus(db: Database, event: Event): void {
   // event log for tool/bash mutations whose payload references the file
   // path (or its rename's orig_path). Per session, take the LATEST
   // matching event (newest-wins via the UPSERT's WHERE clause).
+  //
+  // v44 / fn-664: the per-file `worktree_oid` is added to the INSERT
+  // VALUES so a brand-new row carries it from the start; the existing
+  // UPDATE WHERE remains gated on "newer mutation wins" (no
+  // discharge-behavior change). For pre-existing rows whose mutation
+  // didn't advance, a follow-up `refreshWorktreeOidStmt` UPDATE stamps
+  // the latest snapshot's `worktree_oid` onto every attribution row for
+  // this `file_path` — the oid is a PER-FILE fact (the file's worktree
+  // bytes are what they are, regardless of who attributes to it), so
+  // every row for the same `(project_dir, file_path)` must hold the
+  // SAME oid in this snapshot. The split keeps the existing newer-wins
+  // semantics for the mutation columns byte-identical while making the
+  // worktree_oid the freshest-per-snapshot value the task .2 discharge
+  // gate will read.
   const upsertStmt = db.prepare(
     `INSERT INTO file_attributions
-       (project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at)
-       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+       (project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at, worktree_oid)
+       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
        ON CONFLICT(project_dir, session_id, file_path) DO UPDATE SET
          last_mutation_at = excluded.last_mutation_at,
          op = excluded.op,
@@ -1766,6 +1818,16 @@ function projectGitStatus(db: Database, event: Event): void {
          last_event_id = excluded.last_event_id,
          updated_at = excluded.updated_at
        WHERE excluded.last_mutation_at > file_attributions.last_mutation_at`,
+  );
+  // v44 / fn-664: stamp the latest snapshot's `worktree_oid` onto every
+  // file_attributions row for this file. Runs AFTER the upsert so a
+  // brand-new row (just INSERTed) and a stale row (UPDATE WHERE was
+  // false) both converge on the snapshot's freshest oid value.
+  const refreshWorktreeOidStmt = db.prepare(
+    `UPDATE file_attributions
+        SET worktree_oid = ?
+      WHERE project_dir = ?
+        AND file_path = ?`,
   );
   for (const file of snapshot.dirty_files) {
     const explicit = findExplicitAttributions(db, projectDir, file);
@@ -1779,8 +1841,10 @@ function projectGitStatus(db: Database, event: Event): void {
         m.source,
         m.last_event_id,
         eventTs,
+        file.worktree_oid,
       );
     }
+    refreshWorktreeOidStmt.run(file.worktree_oid, projectDir, file.path);
   }
 
   const _gfT1 = performance.now();
@@ -1837,6 +1901,10 @@ function projectGitStatus(db: Database, event: Event): void {
       const mtimeSec = (file.mtime_ms as number) / 1000;
       const inferred = inferFromWindows(bashWindows, mtimeSec);
       for (const m of inferred) {
+        // v44 / fn-664: same UPSERT shape as pass 1 — `worktree_oid` is
+        // the per-file snapshot fact; it rides on the INSERT VALUES of a
+        // brand-new inferred row, and the post-loop refresh UPDATE keeps
+        // every existing row aligned to the freshest oid.
         upsertStmt.run(
           projectDir,
           m.session_id,
@@ -1846,8 +1914,10 @@ function projectGitStatus(db: Database, event: Event): void {
           "inferred",
           m.last_event_id,
           eventTs,
+          file.worktree_oid,
         );
       }
+      refreshWorktreeOidStmt.run(file.worktree_oid, projectDir, file.path);
     }
   }
 
@@ -2279,7 +2349,14 @@ function foldCommit(db: Database, event: Event): void {
           AND session_id = ?
           AND file_path = ?`,
     );
-    for (const filePath of commit.files) {
+    // v44 / fn-664: `commit.files[]` is now `{path, blob_oid}[]`; this task
+    // (.1) reads only `path` so discharge behavior is UNCHANGED — the
+    // content-aware gate that consumes `blob_oid` lands in task .2. The
+    // extractCommit defensive parser has already guarded both new- and
+    // legacy-shape entries; we re-check `path` here for safety inside the
+    // fold tx (mirrors the prior per-string defensive check).
+    for (const entry of commit.files) {
+      const filePath = entry.path;
       if (typeof filePath !== "string" || filePath.length === 0) continue;
       stmt.run(
         lastCommitAtSeconds,
@@ -2303,7 +2380,10 @@ function foldCommit(db: Database, event: Event): void {
       WHERE project_dir = ?
         AND file_path = ?`,
   );
-  for (const filePath of commit.files) {
+  // v44 / fn-664: same shape switch as the per-session arm above; read only
+  // `path` for discharge in this task (`blob_oid` is unread until task .2).
+  for (const entry of commit.files) {
+    const filePath = entry.path;
     if (typeof filePath !== "string" || filePath.length === 0) continue;
     globalStmt.run(
       lastCommitAtSeconds,

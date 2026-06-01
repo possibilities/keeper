@@ -32,9 +32,9 @@ test("parsePorcelainV2 captures branch metadata and dirty file statuses", () => 
     "# branch.head main",
     "# branch.upstream origin/main",
     "# branch.ab +2 -1",
-    "1 .M N... 100644 100644 100644 aaaaa bbbbb src/a.ts",
+    "1 .M N... 100644 100644 100755 aaaaa bbbbb src/a.ts",
     "? src/new file.ts",
-    "2 R. N... 100644 100644 100644 aaaaa bbbbb R100 src/new-name.ts",
+    "2 R. N... 100644 100644 100644 aaaaa ccccc R100 src/new-name.ts",
     "src/old-name.ts",
     "",
   ].join("\0");
@@ -45,6 +45,9 @@ test("parsePorcelainV2 captures branch metadata and dirty file statuses", () => 
   expect(parsed.upstream).toBe("origin/main");
   expect(parsed.ahead).toBe(2);
   expect(parsed.behind).toBe(1);
+  // v44 / fn-664: ordinary + renamed records now carry `index_oid` (hI) +
+  // `worktree_mode` (mW) lifted off the porcelain-v2 record at parse time.
+  // Untracked records have neither (`?` records carry no oids/modes).
   expect(parsed.files).toEqual([
     {
       path: "src/a.ts",
@@ -52,6 +55,8 @@ test("parsePorcelainV2 captures branch metadata and dirty file statuses", () => 
       index: ".",
       worktree: "M",
       kind: "ordinary",
+      index_oid: "bbbbb",
+      worktree_mode: "100755",
     },
     {
       path: "src/new file.ts",
@@ -59,6 +64,8 @@ test("parsePorcelainV2 captures branch metadata and dirty file statuses", () => 
       index: "?",
       worktree: "?",
       kind: "untracked",
+      index_oid: null,
+      worktree_mode: null,
     },
     {
       path: "src/new-name.ts",
@@ -67,6 +74,8 @@ test("parsePorcelainV2 captures branch metadata and dirty file statuses", () => 
       worktree: ".",
       kind: "renamed",
       orig_path: "src/old-name.ts",
+      index_oid: "ccccc",
+      worktree_mode: "100644",
     },
   ]);
 });
@@ -146,6 +155,8 @@ test("buildGitSnapshot on a mixed dirty worktree stamps mtime_ms per file", () =
         index: ".",
         worktree: "M",
         kind: "ordinary",
+        index_oid: "1111111111111111111111111111111111111111",
+        worktree_mode: "100644",
       },
       {
         path: "b.ts",
@@ -154,6 +165,8 @@ test("buildGitSnapshot on a mixed dirty worktree stamps mtime_ms per file", () =
         worktree: ".",
         kind: "renamed",
         orig_path: "a-old.ts",
+        index_oid: "2222222222222222222222222222222222222222",
+        worktree_mode: "100644",
       },
     ],
   });
@@ -165,6 +178,13 @@ test("buildGitSnapshot on a mixed dirty worktree stamps mtime_ms per file", () =
   expect(a.xy).toBe(".M");
   expect(a.mtime_ms).toBe(1_700_000_000_000);
   expect(a).not.toHaveProperty("orig_path");
+  // v44 / fn-664: per-file content axes — `index_oid` + `worktree_mode`
+  // pass through from the porcelain parse; `worktree_oid` is the
+  // filter-correct hash of the actual bytes, validated as a 40-hex SHA-1
+  // (git hash-object produced it).
+  expect(a.index_oid).toBe("1111111111111111111111111111111111111111");
+  expect(a.worktree_mode).toBe("100644");
+  expect(a.worktree_oid).toMatch(/^[0-9a-f]{40}$/);
 
   const b = snapshot.dirty_files[1] as GitDirtyFile;
   expect(b.path).toBe("b.ts");
@@ -172,6 +192,12 @@ test("buildGitSnapshot on a mixed dirty worktree stamps mtime_ms per file", () =
   expect(b.xy).toBe("R.");
   expect(b.orig_path).toBe("a-old.ts");
   expect(b.mtime_ms).toBe(1_700_000_100_000);
+  expect(b.index_oid).toBe("2222222222222222222222222222222222222222");
+  expect(b.worktree_mode).toBe("100644");
+  expect(b.worktree_oid).toMatch(/^[0-9a-f]{40}$/);
+  // Different bytes → different worktree oid (the whole point — content
+  // equality is what task .2's discharge gate reads).
+  expect(b.worktree_oid).not.toBe(a.worktree_oid);
 });
 
 test("buildGitSnapshot on an all-untracked worktree returns the untracked list with mtimes", () => {
@@ -195,6 +221,8 @@ test("buildGitSnapshot on an all-untracked worktree returns the untracked list w
         index: "?",
         worktree: "?",
         kind: "untracked",
+        index_oid: null,
+        worktree_mode: null,
       },
       {
         path: "sub/new file.ts",
@@ -202,6 +230,8 @@ test("buildGitSnapshot on an all-untracked worktree returns the untracked list w
         index: "?",
         worktree: "?",
         kind: "untracked",
+        index_oid: null,
+        worktree_mode: null,
       },
     ],
   });
@@ -216,6 +246,19 @@ test("buildGitSnapshot on an all-untracked worktree returns the untracked list w
   expect(snapshot.dirty_files.map((f) => f.mtime_ms)).toEqual([
     1_650_001_000_000, 1_650_000_000_000,
   ]);
+  // v44 / fn-664: untracked porcelain records carry no `hI`/`mW`, so the
+  // parse and payload preserve `null` for both — but the worktree blob
+  // hash IS available (the bytes are on disk), so `worktree_oid` still
+  // parses as a valid 40-hex SHA-1.
+  expect(snapshot.dirty_files.every((f) => f.index_oid === null)).toBe(true);
+  expect(snapshot.dirty_files.every((f) => f.worktree_mode === null)).toBe(
+    true,
+  );
+  expect(
+    snapshot.dirty_files.every(
+      (f) => f.worktree_oid != null && /^[0-9a-f]{40}$/.test(f.worktree_oid),
+    ),
+  ).toBe(true);
 });
 
 test("buildGitSnapshot tolerates a stat race (file gone) by stamping mtime_ms: null", () => {
@@ -240,6 +283,8 @@ test("buildGitSnapshot tolerates a stat race (file gone) by stamping mtime_ms: n
         index: ".",
         worktree: "M",
         kind: "ordinary",
+        index_oid: "3333333333333333333333333333333333333333",
+        worktree_mode: "100644",
       },
       {
         path: "real.ts",
@@ -247,6 +292,8 @@ test("buildGitSnapshot tolerates a stat race (file gone) by stamping mtime_ms: n
         index: ".",
         worktree: "M",
         kind: "ordinary",
+        index_oid: "4444444444444444444444444444444444444444",
+        worktree_mode: "100644",
       },
     ],
   });
@@ -254,8 +301,24 @@ test("buildGitSnapshot tolerates a stat race (file gone) by stamping mtime_ms: n
   expect(snapshot.dirty_files).toHaveLength(2);
   expect(snapshot.dirty_files[0].path).toBe("gone.ts");
   expect(snapshot.dirty_files[0].mtime_ms).toBeNull();
+  // v44 / fn-664: the producer-side stat race extends to `worktree_oid` —
+  // a file that vanished between `git status` and the batched
+  // `hash-object` call gets `worktree_oid: null` without wedging the
+  // snapshot. `index_oid` / `worktree_mode` came off the porcelain parse
+  // (no fs probe) so they survive. `real.ts` was hashable, so its
+  // `worktree_oid` is a valid 40-hex SHA-1.
+  expect(snapshot.dirty_files[0].worktree_oid).toBeNull();
+  expect(snapshot.dirty_files[0].index_oid).toBe(
+    "3333333333333333333333333333333333333333",
+  );
+  expect(snapshot.dirty_files[0].worktree_mode).toBe("100644");
   expect(snapshot.dirty_files[1].path).toBe("real.ts");
   expect(snapshot.dirty_files[1].mtime_ms).toBe(1_700_000_200_000);
+  expect(snapshot.dirty_files[1].worktree_oid).toMatch(/^[0-9a-f]{40}$/);
+  expect(snapshot.dirty_files[1].index_oid).toBe(
+    "4444444444444444444444444444444444444444",
+  );
+  expect(snapshot.dirty_files[1].worktree_mode).toBe("100644");
 });
 
 test("buildGitSnapshot uses lstat so a symlink reports the link's own mtime, not the target's", () => {
@@ -306,6 +369,8 @@ test("buildGitSnapshot uses lstat so a symlink reports the link's own mtime, not
         index: "?",
         worktree: "?",
         kind: "untracked",
+        index_oid: null,
+        worktree_mode: null,
       },
     ],
   });
@@ -313,6 +378,91 @@ test("buildGitSnapshot uses lstat so a symlink reports the link's own mtime, not
   expect(snapshot.dirty_files).toHaveLength(1);
   expect(snapshot.dirty_files[0].mtime_ms).toBe(linkMtimeMs);
   expect(snapshot.dirty_files[0].mtime_ms).not.toBe(targetMtimeMs);
+});
+
+// ---------------------------------------------------------------------------
+// v44 / fn-664: filter-correct worktree_oid via `git hash-object`. The whole
+// point of omitting `--no-filters` is so the result equals `git`'s own
+// stored blob — the discharge gate in task .2 compares this against the
+// `Commit` event's `blob_oid` (which IS the stored hash). Verify equality
+// by initializing a real repo, staging the file, and reading `git
+// hash-object -w` / `ls-files -s` for the stored oid.
+// ---------------------------------------------------------------------------
+
+function gitInit(root: string): void {
+  // Minimal config so `git add` / `git commit` work without a global git
+  // identity. Suppress stderr to keep the test output clean on hosts that
+  // print upgrade-suggestion banners.
+  for (const args of [
+    ["init", "-q", "-b", "main"],
+    ["config", "user.email", "test@example.com"],
+    ["config", "user.name", "Test"],
+  ] as const) {
+    const res = Bun.spawnSync(["git", "-C", root, ...args], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    if (!res.success) throw new Error(`git ${args.join(" ")} failed`);
+  }
+}
+
+function gitHashObjectStored(root: string, relPath: string): string {
+  // Use `git hash-object` (no `-w`, no `--no-filters`) to compute the SAME
+  // filter-correct oid the producer would compute. Used as the ground
+  // truth in the equality test below.
+  const res = Bun.spawnSync(["git", "-C", root, "hash-object", relPath], {
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  if (!res.success || res.exitCode !== 0) {
+    throw new Error(`git hash-object failed for ${relPath}`);
+  }
+  return res.stdout.toString().trim();
+}
+
+test("buildGitSnapshot worktree_oid matches git's stored blob oid (filter-correct)", () => {
+  const root = mkTmpWorktree();
+  gitInit(root);
+  // Two distinct files so we exercise the batched path with >1 entry.
+  writeFileSync(join(root, "a.ts"), "alpha contents\n");
+  writeFileSync(join(root, "b.md"), "# Beta\n\nsome markdown\n");
+
+  const expectedA = gitHashObjectStored(root, "a.ts");
+  const expectedB = gitHashObjectStored(root, "b.md");
+
+  const snapshot = buildGitSnapshot(root, {
+    branch: "main",
+    head_oid: null,
+    upstream: null,
+    ahead: null,
+    behind: null,
+    files: [
+      {
+        path: "a.ts",
+        xy: "??",
+        index: "?",
+        worktree: "?",
+        kind: "untracked",
+        index_oid: null,
+        worktree_mode: null,
+      },
+      {
+        path: "b.md",
+        xy: "??",
+        index: "?",
+        worktree: "?",
+        kind: "untracked",
+        index_oid: null,
+        worktree_mode: null,
+      },
+    ],
+  });
+
+  expect(snapshot.dirty_files).toHaveLength(2);
+  // Both oids equal git's own ground-truth — i.e. the producer's batched
+  // hash-object call is producing the exact bytes git would store.
+  expect(snapshot.dirty_files[0].worktree_oid).toBe(expectedA);
+  expect(snapshot.dirty_files[1].worktree_oid).toBe(expectedB);
 });
 
 // ---------------------------------------------------------------------------
@@ -370,16 +520,77 @@ test("parseSessionIdTrailer skips trailing empty lines when taking last", () => 
 const VALID_OID = "0123456789abcdef0123456789abcdef01234567";
 const VALID_OID_2 = "fedcba9876543210fedcba9876543210fedcba98";
 
-test("extractCommit accepts a well-formed payload", () => {
+test("extractCommit accepts a well-formed v44+ payload (files: [{path, blob_oid}])", () => {
+  // v44 / fn-664: producer emits `files` as `Array<{path, blob_oid}>`. The
+  // blob_oid is the per-file committed blob from `git diff-tree -r` —
+  // validated as a 40/64-hex OID, `null` on a parse miss (extractCommit
+  // accepts `null` here; task .2's discharge gate treats `null` as
+  // "cannot confirm content equality" and falls back to timestamp
+  // discharge).
   const payload = {
     project_dir: "/repo",
     commit_oid: VALID_OID,
     parent_oid: VALID_OID_2,
-    files: ["src/a.ts", "src/b.ts"],
+    files: [
+      { path: "src/a.ts", blob_oid: VALID_OID },
+      { path: "src/b.ts", blob_oid: null },
+    ],
     committer_session_id: VALID_UUID,
     committed_at_ms: 1_700_000_000_000,
   };
   expect(extractCommit({ data: JSON.stringify(payload) })).toEqual(payload);
+});
+
+test("extractCommit normalizes legacy string-array files into [{path, blob_oid: null}]", () => {
+  // Pre-v44 events stored `files: string[]`. Re-fold determinism requires
+  // the new extractor to accept both shapes; each legacy string becomes
+  // `{path, blob_oid: null}` so the reducer reads a uniform interface.
+  // The discharge gate (task .2) treats `null` blob_oid as "cannot
+  // confirm content equality → fall back to timestamp discharge",
+  // preserving today's behavior on the historical log.
+  const res = extractCommit({
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: VALID_OID,
+      parent_oid: null,
+      files: ["src/a.ts", "src/b.ts"],
+      committer_session_id: null,
+      committed_at_ms: 1000,
+    }),
+  });
+  expect(res?.files).toEqual([
+    { path: "src/a.ts", blob_oid: null },
+    { path: "src/b.ts", blob_oid: null },
+  ]);
+});
+
+test("extractCommit normalizes bad blob_oid entries to null without dropping the path", () => {
+  // A producer-side `diff-tree` parse miss for one file shouldn't drop
+  // that file's discharge — it should keep the path but null the oid so
+  // task .2 falls back to timestamp discharge for that file alone.
+  const res = extractCommit({
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: VALID_OID,
+      parent_oid: null,
+      files: [
+        { path: "src/a.ts", blob_oid: VALID_OID }, // valid
+        { path: "src/b.ts", blob_oid: "not-an-oid" }, // bad → null
+        { path: "src/c.ts", blob_oid: "" }, // empty → null
+        { path: "src/d.ts" }, // missing key → null
+        { path: "src/e.ts", blob_oid: 42 }, // non-string → null
+      ],
+      committer_session_id: null,
+      committed_at_ms: 0,
+    }),
+  });
+  expect(res?.files).toEqual([
+    { path: "src/a.ts", blob_oid: VALID_OID },
+    { path: "src/b.ts", blob_oid: null },
+    { path: "src/c.ts", blob_oid: null },
+    { path: "src/d.ts", blob_oid: null },
+    { path: "src/e.ts", blob_oid: null },
+  ]);
 });
 
 test("extractCommit returns null on empty data, non-string data, non-JSON data", () => {
@@ -461,7 +672,10 @@ test("extractCommit normalizes empty/null/missing parent_oid to null", () => {
   }
 });
 
-test("extractCommit filters non-string and empty files entries", () => {
+test("extractCommit filters non-string and empty files entries (legacy mixed-shape)", () => {
+  // Defensive parse over the legacy `string[]` shape: empty strings, nulls,
+  // and non-strings drop; valid strings normalize to {path, blob_oid: null}
+  // entries so the consumer sees a uniform v44+ array.
   const res = extractCommit({
     data: JSON.stringify({
       project_dir: "/repo",
@@ -472,7 +686,10 @@ test("extractCommit filters non-string and empty files entries", () => {
       committed_at_ms: 0,
     }),
   });
-  expect(res?.files).toEqual(["src/a.ts", "src/b.ts"]);
+  expect(res?.files).toEqual([
+    { path: "src/a.ts", blob_oid: null },
+    { path: "src/b.ts", blob_oid: null },
+  ]);
 });
 
 test("extractCommit normalizes invalid committer_session_id to null", () => {

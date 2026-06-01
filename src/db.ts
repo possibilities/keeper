@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 43;
+export const SCHEMA_VERSION = 44;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1131,6 +1131,17 @@ CREATE TABLE IF NOT EXISTS dispatch_failures (
  *   contributing event. Display/debug.
  * - `updated_at` (REAL, NOT NULL, DEFAULT 0): unix-seconds of the latest
  *   reducer write — mirrors the convention on every other projection table.
+ * - `worktree_oid` (TEXT, nullable): schema v44 / epic fn-664. The
+ *   filter-correct git blob oid of the file's WORKTREE bytes, as observed by
+ *   the producer at GitSnapshot time (one `git hash-object --stdin-paths`
+ *   batch per snapshot, WITHOUT `--no-filters` so clean/CRLF filters match
+ *   the stored blob). Frozen into the event payload so a re-fold reproduces
+ *   it byte-deterministically (no fold-time git probe). NULL when the
+ *   producer's `hash-object` failed for that file (single-file failure, the
+ *   snapshot is never wedged), when the row pre-dates v44, or when the
+ *   producer-observed worktree shape didn't admit a hash (the discharge gate
+ *   in task .2 falls back to timestamp discharge on a NULL oid — "cannot
+ *   confirm content equality → keep attribution active").
  *
  * Defaults match the zero-event projection: every required field has either
  * a `NOT NULL` constraint requiring an explicit insert value, or a `DEFAULT`
@@ -1147,6 +1158,7 @@ CREATE TABLE IF NOT EXISTS file_attributions (
     source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred')),
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0,
+    worktree_oid TEXT,
     PRIMARY KEY (project_dir, session_id, file_path)
 )
 `;
@@ -4297,6 +4309,33 @@ function migrate(db: Database): void {
     // `dispatch_failures` nor any other autopilot surface, so the v43
     // bump is whitelist-only on the Python side (`api.py`'s
     // `SUPPORTED_SCHEMA_VERSIONS` frozenset adds 43 in the same change).
+
+    // v43→v44: fn-664 — additive nullable `file_attributions.worktree_oid`
+    // column carrying the filter-correct git blob oid of each dirty file's
+    // worktree bytes, frozen into the `GitSnapshot` event payload by the
+    // producer (`git hash-object --stdin-paths`, WITHOUT `--no-filters`, one
+    // batch per snapshot). Task .2 of the epic will switch `foldCommit`'s
+    // discharge rule to gate on `committed_oid == worktree_oid`; this slot
+    // ships only the column + producer plumbing so discharge behavior is
+    // UNCHANGED at v44. Forward-only, nullable, NO data backfill — pre-v44
+    // `file_attributions` rows keep `worktree_oid = null` (the oid cannot be
+    // re-derived from stored events; the producer paid for it at snapshot
+    // time only). The reducer's content-aware discharge in task .2 treats
+    // NULL as "cannot confirm content equality → keep attribution active"
+    // (the safer fall-back to today's timestamp-only discharge), so a NULL
+    // here never silently drops a claim.
+    //
+    // Idempotent via `addColumnIfMissing` (fresh v44 DBs land it via the
+    // CREATE_FILE_ATTRIBUTIONS literal above, migrating v43 DBs land it
+    // here); no version guard needed because both paths converge on the
+    // same column shape and ADD COLUMN never rewrites existing rows. No
+    // keeper-py reader change: keeper-py reads `file_attributions` only for
+    // the `session_id` / `file_path` / `last_mutation_at` / `last_commit_at`
+    // tuple via the existing query; `worktree_oid` is server-side fold
+    // input, not part of the wire surface — so v44 is whitelist-only on
+    // the Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset
+    // adds 44 in the same change).
+    addColumnIfMissing(db, "file_attributions", "worktree_oid", "TEXT");
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

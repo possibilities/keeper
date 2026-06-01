@@ -222,12 +222,19 @@ test("GitSnapshot folds into git_status and advances the cursor", () => {
   expect(row?.orphaned_count).toBe(1);
   // The rendered `dirty_files[].attributions[]` is empty (no mutation
   // events → no explicit attribution; no mtime → no inferred either).
+  // v44 / fn-664: the rendered shape now also carries `worktree_oid` /
+  // `index_oid` / `worktree_mode` lifted straight from the snapshot
+  // payload — additive, all `null` here because this test's
+  // GitSnapshot payload doesn't set them.
   expect(JSON.parse(row?.dirty_files ?? "[]")).toEqual([
     {
       path: "src/a.ts",
       xy: " M",
       orig_path: null,
       mtime_ms: null,
+      worktree_oid: null,
+      index_oid: null,
+      worktree_mode: null,
       attributions: [],
     },
   ]);

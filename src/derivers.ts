@@ -1179,11 +1179,37 @@ export function parseSessionIdTrailer(raw: unknown): string | null {
  * stamp `file_attributions.last_commit_at` without re-reading the
  * commit (producer-only liveness invariant).
  */
+/**
+ * One entry in a {@link CommitPayload}'s `files[]` — the committed path plus
+ * the new blob oid that the commit introduced for that path (schema v44 /
+ * epic fn-664). `blob_oid` carries the validated 40-hex SHA-1 (or 64-hex
+ * SHA-256 on a future repo) of the committed bytes, derived by the producer
+ * via `git diff-tree -r --no-commit-id <commit_oid>` at event-build time
+ * (frozen — re-fold determinism, no fold-time git probe).
+ *
+ * `blob_oid` is `null` when (a) the producer's `diff-tree` parse couldn't
+ * recover a clean oid for that path (parse miss, weird record, deletion-mode
+ * line we elected not to attribute) — every such single-file failure folds
+ * to `null` rather than wedging the entire `CommitPayload` — OR (b) the
+ * event was emitted by a pre-v44 producer that carried the legacy
+ * `files: string[]` shape; `extractCommit` accepts both shapes for backward
+ * compatibility (re-fold determinism over the historical event log) and
+ * normalizes the legacy form into `{path, blob_oid: null}` rows. Task .2
+ * of the epic gates content-aware discharge on `blob_oid != null && blob_oid
+ * === worktree_oid`; a `null` here falls back to today's timestamp
+ * discharge (safer side — "cannot confirm content equality → discharge as
+ * a no-op probe via the timestamp rule").
+ */
+export interface CommitFileEntry {
+  path: string;
+  blob_oid: string | null;
+}
+
 export interface CommitPayload {
   project_dir: string;
   commit_oid: string;
   parent_oid: string | null;
-  files: string[];
+  files: CommitFileEntry[];
   committer_session_id: string | null;
   committed_at_ms: number;
 }
@@ -1249,13 +1275,42 @@ export function extractCommit(event: { data: string }): CommitPayload | null {
   } else {
     parentOid = null;
   }
+  // v44 / fn-664: `files[]` is now `Array<{path, blob_oid}>` carrying the
+  // committed blob oid per file (used by task .2 for content-aware
+  // discharge). Pre-v44 events stored `files: string[]`; we accept BOTH
+  // shapes so a from-scratch re-fold over the historical event log
+  // reproduces the same projection — a legacy string entry normalizes to
+  // `{path, blob_oid: null}` and the reducer's discharge fold treats
+  // `blob_oid: null` exactly as today's timestamp discharge (safer side).
+  // Per-entry shape misses fold to null/skip; never throws (the fold tx is
+  // sacred). The blob_oid validation reuses GIT_OID_RE so a producer
+  // diff-tree parse miss or a non-hex token folds to `null` for that one
+  // file without wedging the whole payload.
   const rawFiles = obj.files;
-  const files: string[] = [];
+  const files: CommitFileEntry[] = [];
   if (Array.isArray(rawFiles)) {
     for (const f of rawFiles) {
-      if (typeof f === "string" && f.length > 0) {
-        files.push(f);
+      if (typeof f === "string") {
+        if (f.length > 0) {
+          files.push({ path: f, blob_oid: null });
+        }
+        continue;
       }
+      if (typeof f !== "object" || f === null) continue;
+      const entry = f as Record<string, unknown>;
+      const rawPath = entry.path;
+      if (typeof rawPath !== "string" || rawPath.length === 0) continue;
+      const rawOid = entry.blob_oid;
+      let blobOid: string | null;
+      if (rawOid === null || rawOid === undefined) {
+        blobOid = null;
+      } else if (typeof rawOid === "string") {
+        blobOid =
+          rawOid.length === 0 ? null : GIT_OID_RE.test(rawOid) ? rawOid : null;
+      } else {
+        blobOid = null;
+      }
+      files.push({ path: rawPath, blob_oid: blobOid });
     }
   }
   const rawSession = obj.committer_session_id;

@@ -49,6 +49,16 @@ export interface GitFileStatus {
   worktree: string;
   kind: "ordinary" | "renamed" | "unmerged" | "untracked";
   orig_path?: string;
+  /**
+   * Schema v44 / fn-664: the porcelain-v2 `hI` (index blob oid) and `mW`
+   * (worktree mode) fields, lifted straight off the `1`/`2` record at parse
+   * time. `untracked` (`?`) and `unmerged` (`u`) records have no `hI`/`mW`
+   * fields in porcelain output and parse as `null`. The producer's
+   * {@link buildGitSnapshot} threads these into the {@link GitDirtyFile}
+   * payload alongside the (separately-computed) `worktree_oid`.
+   */
+  index_oid: string | null;
+  worktree_mode: string | null;
 }
 
 /**
@@ -69,12 +79,41 @@ export interface GitFileStatus {
  * table. The producer's contract narrows to "enumerate dirty files,
  * `lstat` each, embed mtime, post the payload".
  */
+/**
+ * Schema v44 / epic fn-664 additive content axes. All three are pulled at
+ * producer time from one `git status --porcelain=v2` + one `git hash-object
+ * --stdin-paths` shell-out per snapshot — frozen into the event payload so a
+ * re-fold reproduces them byte-deterministically (no fold-time git probe).
+ *
+ * - `worktree_oid`: the filter-correct git blob oid of this file's WORKTREE
+ *   bytes — `git hash-object --stdin-paths` (single batched spawn per
+ *   snapshot, NOT per-file), critically WITHOUT `--no-filters` so
+ *   clean/CRLF smudge filters match the stored blob. Task .2 of the epic
+ *   gates content-aware discharge on `committed_oid == worktree_oid`; a
+ *   `null` here falls back to today's timestamp discharge (the producer
+ *   couldn't hash this file — staged-deleted, untracked-symlink-to-nowhere,
+ *   submodule, the `hash-object` exit signaled a per-path failure, etc.).
+ * - `index_oid`: the porcelain-v2 `hI` field (free — already parsed off the
+ *   `1`/`2` record). Captures the staged blob; lets task .2 distinguish
+ *   "staged but unwritten" vs "staged + re-edited" (the orphan case the
+ *   epic exists to fix). `null` for `untracked` / `unmerged` records that
+ *   don't carry `hI`.
+ * - `worktree_mode`: the porcelain-v2 `mW` field (also free). Records the
+ *   worktree's file mode (`100644` / `100755` / `120000` for symlinks /
+ *   `160000` for submodules / `000000` for staged-deleted). Task .2 uses
+ *   this only to recognize the modes where a blob-oid equality test is
+ *   meaningful (regular files + symlinks); other modes fall back to
+ *   timestamp discharge.
+ */
 export interface GitDirtyFile {
   path: string;
   xy: string;
   kind: "ordinary" | "renamed" | "unmerged" | "untracked";
   orig_path?: string;
   mtime_ms: number | null;
+  worktree_oid: string | null;
+  index_oid: string | null;
+  worktree_mode: string | null;
 }
 
 /**
@@ -149,12 +188,26 @@ export interface GitRootDroppedMessage {
  * discharge for this file set" (a human / CI commit clears every session's
  * attribution).
  */
+/**
+ * One file entry on the wire/payload of a {@link CommitMessage}. Schema v44
+ * / fn-664: the producer's `diff-tree -r` parse pairs each committed path
+ * with the new blob's oid (the bytes that just landed in HEAD for that
+ * path). `blob_oid` is `null` for deletions (no blob to compare against),
+ * for parse misses, and on producer fall-backs — the reducer treats
+ * `null` as "cannot confirm content equality" and falls back to the
+ * timestamp discharge rule in task .2.
+ */
+export interface CommitMessageFile {
+  path: string;
+  blob_oid: string | null;
+}
+
 export interface CommitMessage {
   kind: "commit";
   project_dir: string;
   commit_oid: string;
   parent_oid: string | null;
-  files: string[];
+  files: CommitMessageFile[];
   committer_session_id: string | null;
   committed_at_ms: number;
 }
@@ -290,6 +343,12 @@ export function parsePorcelainV2(raw: string): ParsedGitStatus {
 
     const parts = rec.split(" ");
     if (parts[0] === "1") {
+      // Porcelain v2 ordinary record:
+      //   `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>`
+      // So `mW = parts[5]` and `hI = parts[7]` are the v44 / fn-664 free
+      // adds. Defensive `?? null` keeps a malformed shorter record from
+      // throwing; the consumer reads `null` as "no oid/mode available"
+      // and falls back to the timestamp discharge.
       const xy = parts[1] ?? "??";
       const path = parts.slice(8).join(" ");
       if (path.length > 0) {
@@ -299,9 +358,16 @@ export function parsePorcelainV2(raw: string): ParsedGitStatus {
           index: xy[0] ?? ".",
           worktree: xy[1] ?? ".",
           kind: "ordinary",
+          index_oid: parts[7] ?? null,
+          worktree_mode: parts[5] ?? null,
         });
       }
     } else if (parts[0] === "2") {
+      // Porcelain v2 renamed/copied record:
+      //   `2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>`
+      // Same offsets as record `1` for `mW` (parts[5]) and `hI` (parts[7]);
+      // the rename score sits at parts[8] and the new path starts at
+      // parts[9]. The orig path follows in the next NUL-separated record.
       const xy = parts[1] ?? "??";
       const path = parts.slice(9).join(" ");
       const orig = records[++i] ?? "";
@@ -313,9 +379,15 @@ export function parsePorcelainV2(raw: string): ParsedGitStatus {
           worktree: xy[1] ?? ".",
           kind: "renamed",
           ...(orig.length > 0 ? { orig_path: orig } : {}),
+          index_oid: parts[7] ?? null,
+          worktree_mode: parts[5] ?? null,
         });
       }
     } else if (parts[0] === "u") {
+      // Porcelain v2 unmerged records carry three oids and three modes
+      // (stages 1/2/3) — none of which map onto a single `index_oid`
+      // semantically. Leave both fields null; task .2 falls back to
+      // timestamp discharge for any unmerged path.
       const xy = parts[1] ?? "UU";
       const path = parts.slice(10).join(" ");
       if (path.length > 0) {
@@ -325,9 +397,12 @@ export function parsePorcelainV2(raw: string): ParsedGitStatus {
           index: xy[0] ?? "U",
           worktree: xy[1] ?? "U",
           kind: "unmerged",
+          index_oid: null,
+          worktree_mode: null,
         });
       }
     } else if (parts[0] === "?") {
+      // Untracked records carry no oids and no mode — only the path.
       const path = rec.slice(2);
       if (path.length > 0) {
         files.push({
@@ -336,6 +411,8 @@ export function parsePorcelainV2(raw: string): ParsedGitStatus {
           index: "?",
           worktree: "?",
           kind: "untracked",
+          index_oid: null,
+          worktree_mode: null,
         });
       }
     }
@@ -522,6 +599,20 @@ function readStatus(root: string): ParsedGitStatus | null {
 }
 
 /**
+ * One file entry in an {@link EnumeratedCommit}. Schema v44 / fn-664: the
+ * commit-time blob oid joins the path so the reducer's content-aware
+ * discharge (task .2) can compare `committed_oid` against the snapshot's
+ * `worktree_oid` per-file. The producer derives `blob_oid` from
+ * `git diff-tree -r --no-commit-id <commit>` (the "new" oid in each
+ * record); a malformed/missing oid folds to `null` so a single bad record
+ * never wedges the whole commit message.
+ */
+interface EnumeratedCommitFile {
+  path: string;
+  blob_oid: string | null;
+}
+
+/**
  * Per-commit shape produced by {@link enumerateCommitsInDelta}. Field-for-
  * field this is the {@link CommitMessage} payload minus the `kind` /
  * `project_dir` discriminators (those ride in at the message boundary so the
@@ -530,47 +621,86 @@ function readStatus(root: string): ParsedGitStatus | null {
 interface EnumeratedCommit {
   commit_oid: string;
   parent_oid: string | null;
-  files: string[];
+  files: EnumeratedCommitFile[];
   committer_session_id: string | null;
   committed_at_ms: number;
 }
 
 /**
- * Shell-out + parse for one commit's file list via
- * `git -C <root> log -1 <oid> --name-only --no-renames --first-parent
- * --format= -z`. `-z` swaps the per-record newline terminator for NUL,
- * keeping paths that contain spaces or newlines whole. The `--format=` empty
- * format string suppresses the commit-info header so the output is just the
- * NUL-separated file list. `--first-parent` matches the "diff vs first
- * parent" mental model for merge commits — subsequent parents' file changes
- * attribute via their own commits in the parents' history (see the task
- * spec's "Risks" section on merge-commit semantics).
- *
- * Returns the file list, or an empty array on any non-zero exit / parse
- * miss (the producer-only invariant means a failed shell-out can't wedge
- * the worker; the next snapshot or commit will re-attempt).
+ * Anchored full-OID match — same shape as `derivers.ts` `GIT_OID_RE`.
+ * Module-scope literal so V8/JSC tier up once at process start.
  */
-function commitFiles(root: string, oid: string): string[] {
+const PRODUCER_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+/**
+ * Shell-out + parse for one commit's file list via
+ * `git -C <root> diff-tree -r --no-commit-id --no-renames -z <oid>`. Schema
+ * v44 / epic fn-664: switched from `git log -1 <oid> --name-only` to
+ * `diff-tree -r` so each record carries the new BLOB OID for the path
+ * alongside the path itself — task .2 of the epic uses this to gate
+ * content-aware discharge on `committed_oid == worktree_oid`.
+ *
+ * Output format (per the git docs, with `-z`):
+ *   `:<mH> <mI> <hH> <hI> <STATUS>\0<path>\0` ... per file
+ * — where `hI` here is the NEW blob's oid (the committed bytes for the
+ * non-merge path). `-z` swaps the per-record `\n` terminator and the
+ * intra-record TAB into NULs, keeping paths with spaces/newlines whole.
+ * `--no-renames` is load-bearing — without it, renames emit two paths per
+ * record and the alignment math here would have to special-case them; the
+ * task spec also recommends `--no-renames` to keep the discharge surface
+ * file-path-keyed (a rename is recorded as add+delete from the
+ * attribution perspective, which is the honest semantic).
+ *
+ * Returns the file list with each path paired against its validated
+ * `blob_oid` (40-hex / 64-hex). Bad/missing oid → `null` for that one
+ * entry without dropping the path (the discharge gate falls back to the
+ * timestamp rule on a `null` oid; that's safer than silently omitting the
+ * file from the commit's discharge set). Empty array on any non-zero exit
+ * / parse miss (the producer-only invariant means a failed shell-out can't
+ * wedge the worker; the next snapshot or commit will re-attempt).
+ */
+function commitFiles(root: string, oid: string): EnumeratedCommitFile[] {
   const out = gitOutput([
     "-C",
     root,
-    "log",
-    "-1",
-    oid,
-    "--name-only",
+    "diff-tree",
+    "-r",
+    "--no-commit-id",
     "--no-renames",
-    "--first-parent",
-    "--format=",
     "-z",
+    oid,
   ]);
   if (out == null) return [];
-  // `--format=` empty output is just the NUL-separated file list followed
-  // by a trailing NUL. Split on NUL and drop empties (trailing NUL ⇒ last
-  // element is empty; format-empty ⇒ leading NUL may produce an empty
-  // leading element too — defensive filter on both).
-  const files: string[] = [];
-  for (const f of out.split("\0")) {
-    if (f.length > 0) files.push(f);
+  // With `-z`, diff-tree's output is `:<mH> <mI> <hH> <hI> <STATUS>\0<path>\0`
+  // per file. Split on NUL and consume in pairs. Defensive: drop trailing
+  // empties (the last \0 produces an empty tail element) and ignore any
+  // record where the meta-line doesn't carry a recognizable shape.
+  const fields = out.split("\0");
+  const files: EnumeratedCommitFile[] = [];
+  for (let i = 0; i + 1 < fields.length; i += 2) {
+    const meta = fields[i] ?? "";
+    const path = fields[i + 1] ?? "";
+    if (path.length === 0) continue;
+    // diff-tree's `-r` meta line starts with `:` and uses single-space
+    // separators: `:<mH> <mI> <hH> <hI> <STATUS>`. After splitting on space,
+    // index 3 carries `hI` (the new/committed blob oid). For deletions
+    // git emits `hI = 0000...000` — the all-zeros sentinel; validate via
+    // PRODUCER_OID_RE and additionally reject the zero-oid (the file was
+    // deleted in this commit — there's nothing to compare worktree bytes
+    // against, so `null` is the honest signal).
+    if (!meta.startsWith(":")) {
+      files.push({ path, blob_oid: null });
+      continue;
+    }
+    const parts = meta.slice(1).split(" ");
+    const rawOid = parts[3] ?? "";
+    const blobOid =
+      rawOid.length === 0 ||
+      !PRODUCER_OID_RE.test(rawOid) ||
+      /^0+$/.test(rawOid)
+        ? null
+        : rawOid;
+    files.push({ path, blob_oid: blobOid });
   }
   return files;
 }
@@ -719,6 +849,101 @@ function discoverProjectRoots(
 }
 
 /**
+ * Schema v44 / epic fn-664: batch-compute one filter-correct git blob oid
+ * per dirty-file path via a single `git -C <projectDir> hash-object
+ * --stdin-paths` spawn. CRITICAL — `--stdin-paths` (not per-file
+ * shell-outs); a dirty-heavy tree with hundreds of paths would otherwise
+ * pay the spawn cost N times and hold the worker for seconds. Equally
+ * critical — NO `--no-filters` flag; we want the cleaned/CRLF-normalized
+ * hash so the result equals what git stored in the index/HEAD, not the raw
+ * worktree bytes.
+ *
+ * Per-file failure folds to `null` for that one file without wedging the
+ * batch. Both failure shapes are handled:
+ *
+ *   1. `hash-object` itself exits non-zero (typically when ONE path in the
+ *      batch is unreadable — a staged-deleted file, a permissions miss, a
+ *      broken symlink to nowhere — git aborts the whole batch). We re-shell
+ *      with `--ignore-missing` to recover oids for the survivors; in the
+ *      worst case we accept `null` for every file in the batch (the next
+ *      snapshot's mtime-debounce will retry).
+ *   2. `hash-object` exits 0 but emits fewer oid lines than we sent paths
+ *      (rare; the writer mid-flight could lose alignment). We pair lines
+ *      with paths in input order; surplus paths fold to `null`.
+ *
+ * Producer-only contract: a throw here cannot wedge the worker. Every
+ * failure mode is funneled to "the file reads `null`" and the snapshot
+ * still emits.
+ *
+ * Returns a `Map<relPath, oid|null>` so the caller can join against the
+ * porcelain parse without re-ordering. Empty input returns an empty map.
+ */
+function batchHashObjectOids(
+  projectDir: string,
+  relPaths: string[],
+): Map<string, string | null> {
+  const out = new Map<string, string | null>();
+  if (relPaths.length === 0) return out;
+  // Pre-seed every requested path with `null`. Any path the hash-object
+  // batch doesn't successfully emit an oid for stays at `null`.
+  for (const p of relPaths) out.set(p, null);
+
+  // Pre-filter to paths that actually exist on disk. `hash-object
+  // --stdin-paths` aborts the WHOLE batch on the first unreadable path —
+  // the producer-side stat race (`git status` enumerated a file that's
+  // since been removed) would otherwise null-out every survivor. We pay
+  // a per-path `existsSync` here (cheap fs metadata read) to keep the
+  // single batched spawn cost intact for the common all-files-exist
+  // path. Missing files keep their `null` seed; existing files line up
+  // 1:1 with the spawn's stdout lines (git preserves --stdin-paths
+  // order, the documented contract).
+  const presentPaths: string[] = [];
+  for (const p of relPaths) {
+    const abs = isAbsolute(p) ? p : join(projectDir, p);
+    if (existsSync(abs)) presentPaths.push(p);
+  }
+  if (presentPaths.length === 0) return out;
+
+  // Strict `--stdin-paths`. WITHOUT `--no-filters` so the emitted oids
+  // match what git would have stored (clean/CRLF filters applied) —
+  // the whole point of this column.
+  let stdout: string | null = null;
+  try {
+    const res = Bun.spawnSync(["git", "hash-object", "--stdin-paths"], {
+      cwd: projectDir,
+      stdin: new TextEncoder().encode(`${presentPaths.join("\n")}\n`),
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: GIT_TIMEOUT_MS,
+    });
+    if (res.success && res.exitCode === 0) {
+      stdout = res.stdout.toString();
+    }
+  } catch {
+    stdout = null;
+  }
+  if (stdout == null) return out;
+
+  const lines = stdout.split("\n");
+  // Pair output lines with the SAME index in the input path list. git's
+  // `--stdin-paths` preserves order; this is the documented contract.
+  // Surplus paths (fewer lines than paths) fold to `null` via the seed.
+  for (let i = 0; i < presentPaths.length && i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.length === 0) continue;
+    // Validate via the same OID shape the reducer accepts (40-hex SHA-1
+    // or 64-hex SHA-256). A non-OID line is the rare "git emitted a
+    // warning where an oid should be" case — fold to `null` for that
+    // file rather than persist a garbage value the discharge gate would
+    // misread.
+    if (/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(line)) {
+      out.set(presentPaths[i], line);
+    }
+  }
+  return out;
+}
+
+/**
  * Best-effort `lstat` of one worktree-relative dirty-file path, anchored on
  * `projectDir`. Returns the file's mtime in unix-epoch milliseconds, or
  * `null` if `lstat` failed (the file was enumerated by `git status` but
@@ -765,12 +990,25 @@ export function buildGitSnapshot(
   projectDir: string,
   status: ParsedGitStatus,
 ): GitSnapshotPayload {
+  // v44 / fn-664: ONE batched `git hash-object --stdin-paths` call per
+  // snapshot, covering every dirty file. Untracked/unmerged entries are
+  // included — `hash-object` of an untracked file is a meaningful oid; the
+  // discharge gate just won't have an `index_oid`/`worktree_mode` to pair
+  // it with from the porcelain side, which is fine. The single spawn keeps
+  // the producer latency budget tight (a dirty-heavy tree on a slow disk
+  // would otherwise pay N spawn costs).
+  const oidPaths = status.files.map((f) => f.path);
+  const worktreeOidByPath = batchHashObjectOids(projectDir, oidPaths);
+
   const dirty: GitDirtyFile[] = status.files.map((file) => {
     const entry: GitDirtyFile = {
       path: file.path,
       xy: file.xy,
       kind: file.kind,
       mtime_ms: lstatMtimeMs(projectDir, file.path),
+      worktree_oid: worktreeOidByPath.get(file.path) ?? null,
+      index_oid: file.index_oid,
+      worktree_mode: file.worktree_mode,
     };
     if (file.orig_path != null) entry.orig_path = file.orig_path;
     return entry;
