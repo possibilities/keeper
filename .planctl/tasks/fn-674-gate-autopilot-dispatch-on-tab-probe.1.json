@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-01T22:38:46.714897Z",
+  "depends_on": [],
+  "epic": "fn-674-gate-autopilot-dispatch-on-tab-probe",
+  "id": "fn-674-gate-autopilot-dispatch-on-tab-probe.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Gate dedup on zellij tab probe",
+  "updated_at": "2026-06-01T22:38:46.714897Z"
+}
