@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-05-31T22:30:27.558408Z",
   "depends_on": [
@@ -12,6 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "autopilot reconciler worker core",
-  "updated_at": "2026-06-01T00:09:26.444687Z",
+  "updated_at": "2026-06-01T00:35:23.876169Z",
   "worker_done_at": "2026-06-01T00:09:26.444687Z"
 }
