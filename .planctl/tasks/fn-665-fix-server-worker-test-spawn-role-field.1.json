@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "add role server to spawned-worker test",
-  "updated_at": "2026-06-01T02:13:38.164225Z"
+  "updated_at": "2026-06-01T03:24:27.064971Z",
+  "worker_done_at": "2026-06-01T03:24:27.064971Z"
 }

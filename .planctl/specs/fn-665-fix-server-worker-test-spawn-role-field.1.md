@@ -18,5 +18,5 @@ The other `server-worker.ts` reference in the file (line ~2150) is a
 - [ ] No other tests regressed.
 
 ## Done summary
-
+Added role: 'server' to workerData in the spawned-Worker shutdown test; bun test test/server-worker.test.ts now passes 94/94 with no timeout.
 ## Evidence
