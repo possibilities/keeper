@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-665-fix-server-worker-test-spawn-role-field",
   "bundles": [],
   "closer_done_at": "2026-06-01T03:28:53.264305Z",
@@ -18,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-01T03:28:53.264305Z"
+  "updated_at": "2026-06-01T03:29:04.771675Z"
 }
