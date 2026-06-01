@@ -27,7 +27,7 @@
  *     `scrollTop`).
  */
 
-import { afterEach, beforeAll, expect, test } from "bun:test";
+import { afterEach, beforeAll, expect, spyOn, test } from "bun:test";
 import {
   RGBA,
   ScrollBoxRenderable,
@@ -87,8 +87,46 @@ afterEach(() => {
   }
 });
 
+/**
+ * A `SuspendSignalTarget` stub: records `kill(pid, signal)` calls and
+ * lets the test fire the SIGCONT that `fg` would deliver, without
+ * stopping the test runner. `once`/`removeListener` mirror the live
+ * `process` EventEmitter surface the suspend dance uses.
+ */
+function makeSignalStub() {
+  const killed: Array<{ pid: number; signal: string }> = [];
+  let contListener: (() => void) | null = null;
+  return {
+    pid: 4242,
+    killed,
+    kill(pid: number, signal: string) {
+      killed.push({ pid, signal });
+    },
+    once(_event: "SIGCONT", listener: () => void) {
+      contListener = listener;
+    },
+    removeListener(_event: "SIGCONT", listener: () => void) {
+      if (contListener === listener) {
+        contListener = null;
+      }
+    },
+    /** Simulate the SIGCONT delivered on `fg`. `once` auto-disarms. */
+    fireCont() {
+      const l = contListener;
+      contListener = null;
+      l?.();
+    },
+    hasContListener: () => contListener != null,
+  };
+}
+
 async function bootPaint(
-  options: { title?: string; width?: number; height?: number } = {},
+  options: {
+    title?: string;
+    width?: number;
+    height?: number;
+    signalTarget?: ReturnType<typeof makeSignalStub>;
+  } = {},
 ) {
   const width = options.width ?? 60;
   const height = options.height ?? 8;
@@ -106,7 +144,9 @@ async function bootPaint(
     },
     onUnhandledKey: (k) => unhandledKeys.push(k),
   });
-  const paint = attachLiveShellPaint(setup.renderer, core, PAINT_RUNTIME);
+  const paint = attachLiveShellPaint(setup.renderer, core, PAINT_RUNTIME, {
+    signalTarget: options.signalTarget,
+  });
   pendingPaints.push(paint);
   return {
     setup,
@@ -199,6 +239,41 @@ test("Ctrl-C triggers the core's onExit (same path as q)", async () => {
   await setup.renderOnce();
   setup.mockInput.pressCtrlC();
   expect(getExitCount()).toBe(1);
+});
+
+test("Ctrl-Z suspends: restores terminal, re-raises SIGTSTP, then resumes on SIGCONT", async () => {
+  const signalTarget = makeSignalStub();
+  const { setup, getExitCount, unhandledKeys } = await bootPaint({
+    signalTarget,
+  });
+  // Stub the renderer's native suspend/resume so the dance doesn't
+  // tear down the test runner's TTY — we only assert the wiring.
+  const suspendSpy = spyOn(setup.renderer, "suspend").mockImplementation(
+    () => {},
+  );
+  const resumeSpy = spyOn(setup.renderer, "resume").mockImplementation(
+    () => {},
+  );
+
+  setup.mockInput.pressKey("z", { ctrl: true });
+
+  // Terminal restored, then the process group stopped via SIGTSTP —
+  // and a SIGCONT listener armed before stopping.
+  expect(suspendSpy).toHaveBeenCalledTimes(1);
+  expect(signalTarget.killed).toEqual([{ pid: 4242, signal: "SIGTSTP" }]);
+  expect(signalTarget.hasContListener()).toBe(true);
+  // Ctrl-Z is NOT an exit and NOT forwarded as an unhandled key.
+  expect(getExitCount()).toBe(0);
+  expect(unhandledKeys).toEqual([]);
+
+  // `fg` delivers SIGCONT → renderer re-enters; the one-shot listener
+  // disarms itself.
+  signalTarget.fireCont();
+  expect(resumeSpy).toHaveBeenCalledTimes(1);
+  expect(signalTarget.hasContListener()).toBe(false);
+
+  suspendSpy.mockRestore();
+  resumeSpy.mockRestore();
 });
 
 test("unmapped printable key 'c' reaches the caller's onUnhandledKey with the raw char", async () => {

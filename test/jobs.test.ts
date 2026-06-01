@@ -112,8 +112,9 @@ test("projectJobRow: last_input_request_at drops [awaiting:<kind>] onto its own 
 });
 
 // ---------------------------------------------------------------------------
-// renderJobsBody — partitions by plan_verb (no-role on top, with-role on
-// bottom), separates by `~~~`, drops the divider when either side is empty.
+// renderJobsBody — partitions by plan_verb (no-role on top under
+// `--- interactive ---`, with-role on bottom under `--- autopilot ---`),
+// drops a heading when its side is empty (autopilot-style).
 // ---------------------------------------------------------------------------
 
 test("renderJobsBody: empty jobs map → empty string", () => {
@@ -122,7 +123,7 @@ test("renderJobsBody: empty jobs map → empty string", () => {
   ).toBe("");
 });
 
-test("renderJobsBody: only ambient (no plan_verb) → single partition, no `~~~`", () => {
+test("renderJobsBody: only ambient (no plan_verb) → interactive heading only, no autopilot heading", () => {
   const jobs = new Map<string, unknown>([
     [
       "j-amb",
@@ -136,11 +137,13 @@ test("renderJobsBody: only ambient (no plan_verb) → single partition, no `~~~`
     ],
   ]);
   const body = renderJobsBody(jobs, new Map());
-  expect(body).toBe("(x) ambient [working]");
-  expect(body).not.toContain("~~~");
+  expect(body).toBe(
+    ["--- interactive ---", "(x) ambient [working]"].join("\n"),
+  );
+  expect(body).not.toContain("--- autopilot ---");
 });
 
-test("renderJobsBody: only plan-bound (plan_verb set) → single partition, no `~~~`", () => {
+test("renderJobsBody: only plan-bound (plan_verb set) → autopilot heading only, no interactive heading", () => {
   const jobs = new Map<string, unknown>([
     [
       "j-work",
@@ -154,11 +157,13 @@ test("renderJobsBody: only plan-bound (plan_verb set) → single partition, no `
     ],
   ]);
   const body = renderJobsBody(jobs, new Map());
-  expect(body).toBe("(y) worker [worker] [stopped]");
-  expect(body).not.toContain("~~~");
+  expect(body).toBe(
+    ["--- autopilot ---", "(y) worker [worker] [stopped]"].join("\n"),
+  );
+  expect(body).not.toContain("--- interactive ---");
 });
 
-test("renderJobsBody: both partitions present → ambient on top, `~~~` divider, plan-bound below", () => {
+test("renderJobsBody: both partitions present → interactive heading + rows on top, autopilot heading + rows below", () => {
   // Insertion order: plan-bound first, ambient second. The partition
   // assignment must be by plan_verb (not iteration order), so ambient
   // still renders on top.
@@ -186,9 +191,12 @@ test("renderJobsBody: both partitions present → ambient on top, `~~~` divider,
   ]);
   const body = renderJobsBody(jobs, new Map());
   expect(body).toBe(
-    ["(x) ambient [working]", "~~~", "(y) worker [worker] [stopped]"].join(
-      "\n",
-    ),
+    [
+      "--- interactive ---",
+      "(x) ambient [working]",
+      "--- autopilot ---",
+      "(y) worker [worker] [stopped]",
+    ].join("\n"),
   );
 });
 
@@ -217,7 +225,11 @@ test("renderJobsBody: within-partition order preserves the helper's wire order",
     ],
   ]);
   const body = renderJobsBody(jobs, new Map());
-  expect(body).toBe(["(a) first [working]", "(b) second [working]"].join("\n"));
+  expect(body).toBe(
+    ["--- interactive ---", "(a) first [working]", "(b) second [working]"].join(
+      "\n",
+    ),
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -257,16 +269,18 @@ test("renderJobsBody: nested sub-agent line appears immediately under the matchi
   ]);
   const body = renderJobsBody(jobs, subagentIndex);
   expect(body).toBe(
-    ["(x) ambient [working]", "  general-purpose: investigate [running]"].join(
-      "\n",
-    ),
+    [
+      "--- interactive ---",
+      "(x) ambient [working]",
+      "  general-purpose: investigate [running]",
+    ].join("\n"),
   );
 });
 
 test("renderJobsBody: sub-agent lines route to the correct partition (ambient vs plan-bound)", () => {
   // One ambient job + one plan-bound job, each with its own sub-agent.
   // The sub-agent line must appear inside the SAME partition as its
-  // parent job — never on the wrong side of the `~~~` divider.
+  // parent job — never on the wrong side of the heading boundary.
   const jobs = new Map<string, unknown>([
     [
       "j-amb",
@@ -315,16 +329,18 @@ test("renderJobsBody: sub-agent lines route to the correct partition (ambient vs
   ]);
   const body = renderJobsBody(jobs, subagentIndex);
   // Expected:
+  //   --- interactive ---
   //   (x) ambient [working]
   //     scout: scout-task [ok]
-  //   ~~~
+  //   --- autopilot ---
   //   (y) worker [worker] [stopped]
   //     build: build-task [running]
   expect(body).toBe(
     [
+      "--- interactive ---",
       "(x) ambient [working]",
       "  scout: scout-task [ok]",
-      "~~~",
+      "--- autopilot ---",
       "(y) worker [worker] [stopped]",
       "  build: build-task [running]",
     ].join("\n"),

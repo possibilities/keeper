@@ -77,6 +77,15 @@ export interface ViewShellOptions<TSnap> {
    */
   onKey?: (key: string) => void;
   /**
+   * Optional modal-capture predicate. When it returns `true`, the shell
+   * forwards EVERY key to `onKey` — including the shell-owned `c` (copy)
+   * and the core's frame-history keys — so a view can run a fully local
+   * sub-mode (e.g. jobs' insert mode). Threaded into `createLiveShell`
+   * (frame-nav bypass) AND consulted here (copy-key bypass) so capture
+   * is honored at both layers. Absent/false → today's behavior.
+   */
+  captureKeys?: () => boolean;
+  /**
    * Optional persistent banner pill. Called after a transient flash
    * expires (~1.5s) to restore the standing banner text. Default
    * restores to `""` (no banner).
@@ -225,8 +234,11 @@ export function createViewShell<TSnap>(
   const liveShell: LiveShell = createLiveShell({
     enabled: true,
     title,
+    captureKeys: opts.captureKeys,
     onUnhandledKey: (key) => {
-      if (key === "c") {
+      // Modal capture: the view owns every key — skip the shell's `c`
+      // (copy) so the sub-mode is fully local.
+      if (opts.captureKeys?.() !== true && key === "c") {
         handleCopyKey();
         return;
       }

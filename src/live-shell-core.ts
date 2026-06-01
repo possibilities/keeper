@@ -104,6 +104,17 @@ export interface LiveShellCoreOptions {
   readonly onRender?: () => void;
   readonly onExit?: () => void;
   readonly onUnhandledKey?: (key: string) => void;
+  /**
+   * Modal-capture predicate. When supplied AND it returns `true`,
+   * `dispatchKey` routes EVERY key to `onUnhandledKey` (normalized to
+   * friendly tokens — `up`/`down`/`left`/`right`/`end`/`escape`/`space`,
+   * else the raw char) and SKIPS the built-in frame-history keymap, so a
+   * view can own the keyboard while in a sub-mode (e.g. jobs' insert
+   * mode). Ctrl-C still quits as a safety hatch. Absent/false → the
+   * keymap behaves byte-identically to before (board/git/autopilot are
+   * untouched).
+   */
+  readonly captureKeys?: () => boolean;
 }
 
 /**
@@ -217,6 +228,7 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
   const onRender = opts.onRender ?? (() => {});
   const onExit = opts.onExit ?? (() => {});
   const onUnhandledKey = opts.onUnhandledKey;
+  const captureKeys = opts.captureKeys;
   const titlePrefix =
     opts.title != null && opts.title !== "" ? `[[${opts.title}]] ` : "";
 
@@ -322,7 +334,50 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
     onRender();
   }
 
+  /**
+   * Map the raw dispatch string to a friendly token for modal-capture
+   * consumers. CSI/SS3 nav sequences collapse to `up`/`down`/`left`/
+   * `right`/`end`, bare Escape to `escape`, the space char to `space`;
+   * any other single char passes through unchanged (`j`, `k`, `i`, …).
+   */
+  function normalizeCaptureKey(key: string): string {
+    switch (key) {
+      case "\x1b[A":
+      case "\x1bOA":
+        return "up";
+      case "\x1b[B":
+      case "\x1bOB":
+        return "down";
+      case "\x1b[C":
+      case "\x1bOC":
+        return "right";
+      case "\x1b[D":
+      case "\x1bOD":
+        return "left";
+      case "\x1b[F":
+        return "end";
+      case "\x1b":
+        return "escape";
+      case " ":
+        return "space";
+      default:
+        return key;
+    }
+  }
+
   function dispatchKey(key: string): void {
+    // Modal capture: a view owns the keyboard. Ctrl-C still quits (never
+    // trap the user); everything else is normalized and handed to the
+    // view, bypassing the frame-history keymap entirely.
+    if (captureKeys?.()) {
+      if (key === "\x03") {
+        dispose();
+        onExit();
+        return;
+      }
+      onUnhandledKey?.(normalizeCaptureKey(key));
+      return;
+    }
     switch (key) {
       case "\x1b[A": // Up
       case "\x1b[D": // Left

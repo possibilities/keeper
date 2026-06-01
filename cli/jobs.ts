@@ -9,14 +9,18 @@
  *
  * Frame shape:
  *
+ *   --- interactive ---
  *   {ambient jobs body}    ← jobs with NO plan_verb (one row per job)
- *   ~~~
+ *   --- autopilot ---
  *   {plan-bound jobs body} ← jobs WITH a plan_verb (planner/worker/closer)
  *
  * Each row is followed by its nested sub-agent collapse lines (one per
  * `(job_id, subagent_type)` group via `collapseSubagentsByName`). The
- * empty-side drop rule applies: a partition with zero rows yields just
- * the other one, no divider; both empty yields an empty body.
+ * `--- interactive ---` / `--- autopilot ---` headings mirror
+ * `cli/autopilot.ts`'s `--- current --- / --- predicted ---` style: a
+ * heading is emitted ONLY when its section is non-empty. A partition
+ * with zero rows yields neither its heading nor a placeholder; both
+ * empty yields an empty body.
  *
  * Sidecars + lifecycle / SIGINT / first-paint contract mirror the sibling
  * mains. Sidecar basenames key on `script: "jobs"` so files write to
@@ -83,11 +87,12 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   Per-frame sidecars are indexed; lifecycle + warn output is appended
   to /tmp/keeper-jobs.<pid>.lifecycle.txt. Session paths print on exit.
 
-Renders one row per live job, split into two stacked partitions separated
-by a '~~~' line:
+Renders one row per live job, split into two stacked partitions each
+introduced by an autopilot-style heading:
 
+  --- interactive ---
   {ambient body}    (jobs with NO plan_verb — ad-hoc sessions)
-  ~~~
+  --- autopilot ---
   {plan-bound body} (jobs WITH a plan_verb — planner/worker/closer)
 
 Row shape:
@@ -112,8 +117,8 @@ drops cleanly at N=0.
 The first frame waits until ALL FIVE readiness collections have landed
 their first result (the shared subscribeReadiness gate; jobs view
 ignores epics/git/readiness but the gate is non-negotiable for the
-shared helper). An empty section renders as NOTHING (no placeholder);
-the '~~~' divider is dropped when either partition is empty. A new
+shared helper). An empty section renders as NOTHING — neither its
+heading nor a placeholder — when its partition is empty. A new
 frame prints only when the rendered body changes; the dead-letter
 banner re-stamps on every snapshot regardless of body stability.
 
@@ -153,15 +158,18 @@ export function projectJobRow(row: Record<string, unknown>): string {
 }
 
 /**
- * Render the full jobs body — two stacked partitions joined by `~~~`.
- * Top partition: jobs with NO `plan_verb` (ambient sessions). Bottom:
- * jobs WITH `plan_verb` (planner/worker/closer — epic-bound work).
- * Within each partition we preserve the helper's wire order (the
- * `Map<job_id, Job>` insertion order matches the server's row order),
- * and each row is followed by its `subagentLinesFor(..., "  ")` block.
+ * Render the full jobs body — two stacked partitions, each introduced by
+ * an autopilot-style heading (`cli/autopilot.ts:renderBody`). Top
+ * partition `--- interactive ---`: jobs with NO `plan_verb` (ambient
+ * sessions). Bottom partition `--- autopilot ---`: jobs WITH `plan_verb`
+ * (planner/worker/closer — epic-bound work). Within each partition we
+ * preserve the helper's wire order (the `Map<job_id, Job>` insertion
+ * order matches the server's row order), and each row is followed by its
+ * `subagentLinesFor(..., "  ")` block.
  *
- * Empty-side drop rule: a partition with zero rows yields just the
- * other one with no divider; both empty yields `""`.
+ * Heading-drop rule (mirrors autopilot): a heading is emitted ONLY when
+ * its partition has rows. A partition with zero rows yields neither its
+ * heading nor a placeholder; both empty yields `""`.
  */
 export function renderJobsBody(
   jobs: Map<string, unknown>,
@@ -170,8 +178,8 @@ export function renderJobsBody(
   if (jobs.size === 0) {
     return "";
   }
-  const noRole: string[] = [];
-  const withRole: string[] = [];
+  const interactive: string[] = [];
+  const autopilot: string[] = [];
   for (const [id, row] of jobs) {
     const r = row as Record<string, unknown>;
     const block = [
@@ -179,20 +187,19 @@ export function renderJobsBody(
       ...subagentLinesFor(subagentIndex, id, "  "),
     ].join("\n");
     if (r.plan_verb == null) {
-      noRole.push(block);
+      interactive.push(block);
     } else {
-      withRole.push(block);
+      autopilot.push(block);
     }
   }
-  const top = noRole.join("\n");
-  const bottom = withRole.join("\n");
-  if (top === "") {
-    return bottom;
+  const sections: string[] = [];
+  if (interactive.length > 0) {
+    sections.push(["--- interactive ---", ...interactive].join("\n"));
   }
-  if (bottom === "") {
-    return top;
+  if (autopilot.length > 0) {
+    sections.push(["--- autopilot ---", ...autopilot].join("\n"));
   }
-  return `${top}\n~~~\n${bottom}`;
+  return sections.join("\n");
 }
 
 export async function main(argv: string[]): Promise<void> {

@@ -43,7 +43,11 @@
  * ...)`, translate the OpenTUI `key.name` back to the raw-string
  * contract the core's keymap dispatch expects (a single character
  * for printable keys, or the full CSI/SS3 sequence for nav keys),
- * and route everything else to the caller's `onUnhandledKey`.
+ * and route everything else to the caller's `onUnhandledKey`. Ctrl-Z
+ * is intercepted in the paint layer for the job-control suspend dance
+ * (`renderer.suspend()` → re-raise SIGTSTP → `renderer.resume()` on the
+ * SIGCONT that `fg` delivers) since raw mode suppresses the kernel's
+ * own ISIG handling.
  *
  * Why `dispose()` is synchronous. `process.on('exit')` cannot await;
  * an async cleanup would skip in that path AND in `uncaughtException`
@@ -162,6 +166,12 @@ export interface LiveShellOptions {
   readonly safetyNetTarget?: SafetyNetTarget;
   readonly onExit?: () => void;
   readonly onUnhandledKey?: (key: string) => void;
+  /**
+   * Modal-capture predicate forwarded to the core. When it returns
+   * `true`, every key routes to `onUnhandledKey` and the frame-history
+   * keymap is bypassed (see `LiveShellCoreOptions.captureKeys`).
+   */
+  readonly captureKeys?: () => boolean;
   readonly title?: string;
 }
 
@@ -222,6 +232,7 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
       onPlainWrite: (data) => stdout.write(data),
       onExit: opts.onExit,
       onUnhandledKey: opts.onUnhandledKey,
+      captureKeys: opts.captureKeys,
     });
     return {
       pushFrame: (lines) => core.pushFrame(lines),
@@ -260,6 +271,7 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
       onExit();
     },
     onUnhandledKey: opts.onUnhandledKey,
+    captureKeys: opts.captureKeys,
   });
 
   // ----- Safety-net plumbing — load-bearing per OpenTUI best
@@ -417,6 +429,29 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
  */
 export interface LiveShellPaintOptions {
   readonly onUnhandledKey?: (key: string) => void;
+  /**
+   * Process-signal surface the Ctrl-Z suspend dance drives. Defaults to
+   * the live `process`. Tests inject a stub so they can assert the
+   * `kill(pid, "SIGTSTP")` + `SIGCONT`-rearm wiring without actually
+   * stopping the test runner. Structurally typed so `process` satisfies
+   * it.
+   */
+  readonly signalTarget?: SuspendSignalTarget;
+}
+
+/**
+ * Minimal process-signal surface the Ctrl-Z handler needs. `process`
+ * satisfies this structurally. Ctrl-Z arrives as the literal byte
+ * `\x1a` (raw mode disables ISIG, so the terminal never generates
+ * SIGTSTP itself) — the app must restore the terminal, then re-raise
+ * SIGTSTP to actually stop the process group, then re-enter the
+ * renderer on the SIGCONT that `fg` delivers.
+ */
+export interface SuspendSignalTarget {
+  readonly pid: number;
+  kill(pid: number, signal: NodeJS.Signals): void;
+  once(event: "SIGCONT", listener: () => void): void;
+  removeListener(event: "SIGCONT", listener: () => void): void;
 }
 
 /**
@@ -481,6 +516,10 @@ export function attachLiveShellPaint(
   opts: LiveShellPaintOptions = {},
 ): LiveShellPaint {
   let destroyed = false;
+  const signalTarget = opts.signalTarget ?? (process as SuspendSignalTarget);
+  // The armed SIGCONT listener while suspended — `null` when running.
+  // Tracked so `destroy()` can detach it if teardown races a suspend.
+  let pendingCont: (() => void) | null = null;
   // Track the last applied banner / body content so a no-op render
   // (identical content) is a true no-op on the TextRenderable side
   // (avoids reflow + re-shape work for the same string).
@@ -535,9 +574,16 @@ export function attachLiveShellPaint(
    * Ctrl-C, `\x1b` for bare Escape. The core dispatches `q` / `c` /
    * etc. against the same raw strings the original bespoke parser
    * produced, so callers' bindings keep working byte-identically.
+   *
+   * Ctrl-Z is intercepted here (NOT forwarded to the core) — it drives
+   * the job-control suspend dance via `suspendToBackground()`.
    */
   function handleKeypress(key: KeyEvent): void {
     if (destroyed) {
+      return;
+    }
+    if (key.ctrl && key.name === "z") {
+      suspendToBackground();
       return;
     }
     if (key.ctrl && key.name === "c") {
@@ -582,6 +628,55 @@ export function attachLiveShellPaint(
     repaint();
   };
   renderer.on("resize", onResize);
+
+  /**
+   * Ctrl-Z job-control suspend. OpenTUI does NOT wire SIGTSTP/SIGCONT,
+   * and raw mode disables the kernel's own ISIG handling — so a naive
+   * Ctrl-Z would just feed `\x1a` to a keymap that ignores it, leaving
+   * the human stuck in the alt-screen with no way to drop to the shell.
+   *
+   * The dance, in order:
+   *   1. `renderer.suspend()` restores the terminal (cooked mode, leave
+   *      alt-screen, show cursor, detach stdin) — so the shell we're
+   *      about to return to sees a sane TTY.
+   *   2. Arm a one-shot SIGCONT listener BEFORE stopping, so the
+   *      foreground (`fg`) resume is guaranteed caught.
+   *   3. Re-raise SIGTSTP at ourselves to actually stop the process
+   *      group (we suppressed the kernel default by being in raw mode).
+   *
+   * On SIGCONT we `renderer.resume()` (re-enter alt-screen + raw mode)
+   * and force a repaint. Re-entrant Ctrl-Z while already suspended is a
+   * no-op (`pendingCont` guards it; stdin is paused anyway).
+   */
+  function suspendToBackground(): void {
+    if (destroyed || pendingCont != null) {
+      return;
+    }
+    const onCont = (): void => {
+      pendingCont = null;
+      if (destroyed) {
+        return;
+      }
+      try {
+        renderer.resume();
+      } catch {
+        // best-effort — a resume throw must not wedge the key loop.
+      }
+      repaint();
+    };
+    pendingCont = onCont;
+    signalTarget.once("SIGCONT", onCont);
+    try {
+      renderer.suspend();
+    } catch {
+      // best-effort — still re-raise SIGTSTP so the human escapes.
+    }
+    try {
+      signalTarget.kill(signalTarget.pid, "SIGTSTP");
+    } catch {
+      // best-effort
+    }
+  }
 
   function repaint(): void {
     if (destroyed) {
@@ -632,6 +727,17 @@ export function attachLiveShellPaint(
         return;
       }
       destroyed = true;
+      // Detach a SIGCONT listener still armed from an unresumed suspend
+      // (teardown racing a backgrounded process) so it can't leak onto
+      // the real `process` across test files.
+      if (pendingCont != null) {
+        try {
+          signalTarget.removeListener("SIGCONT", pendingCont);
+        } catch {
+          // best-effort
+        }
+        pendingCont = null;
+      }
       try {
         renderer.keyInput.off("keypress", handleKeypress);
       } catch {
