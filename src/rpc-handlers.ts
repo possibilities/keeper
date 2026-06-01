@@ -387,6 +387,217 @@ export async function replayDeadLetterHandler(
   };
 }
 
+// ---------------------------------------------------------------------------
+// `set_autopilot_paused` (async — bridges through main to flip the in-memory
+// paused flag and relay a `{type:"set-paused"}` command to the autopilot
+// worker; fn-661 task .4)
+// ---------------------------------------------------------------------------
+
+/** `set_autopilot_paused` wire params. */
+export interface SetAutopilotPausedParams {
+  paused: boolean;
+}
+
+/** Successful return shape for `set_autopilot_paused`. */
+export interface SetAutopilotPausedResult {
+  ok: true;
+  paused: boolean;
+}
+
+function validateSetAutopilotPausedParams(
+  params: unknown,
+): SetAutopilotPausedParams {
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    throw new BadParamsError(
+      "set_autopilot_paused: params must be an object with `paused: boolean`",
+    );
+  }
+  const obj = params as Record<string, unknown>;
+  if (typeof obj.paused !== "boolean") {
+    throw new BadParamsError(
+      "set_autopilot_paused: `paused` must be a boolean",
+    );
+  }
+  return { paused: obj.paused };
+}
+
+/**
+ * `set_autopilot_paused` handler. Validates the `paused: boolean` wire
+ * shape and bridges to main, which (a) flips the in-memory `paused` flag
+ * and (b) relays a `{ type: "set-paused", paused }` command to the
+ * autopilot worker. Returns `{ ok: true, paused }` once main has
+ * acknowledged. Failure modes (main reports `ok:false`, bridge timeout)
+ * surface as `rpc_failed` per the {@link replayDeadLetterHandler}
+ * pattern.
+ *
+ * The flag is in-memory only on main and NEVER persisted — boots-paused
+ * is the safety default (every keeperd restart re-enters paused).
+ */
+export async function setAutopilotPausedHandler(
+  params: unknown,
+  bridge: ReplayBridge,
+): Promise<SetAutopilotPausedResult> {
+  const { paused } = validateSetAutopilotPausedParams(params);
+  const result = await bridge.setAutopilotPaused(paused);
+  if (!result.ok) {
+    throw new Error(
+      result.error ?? "set_autopilot_paused: main reported failure",
+    );
+  }
+  return { ok: true, paused };
+}
+
+// ---------------------------------------------------------------------------
+// `retry_dispatch` (async — bridges through main to mint a `DispatchCleared`
+// synthetic event; fn-661 task .4)
+// ---------------------------------------------------------------------------
+
+/**
+ * The three planctl verbs the reconciler dispatches. Mirrors the
+ * `Verb` union in `src/autopilot-worker.ts` (kept local rather than
+ * re-imported to keep the rpc-handlers module's import graph narrow —
+ * no `bun:sqlite` / `Database` types cross from the worker file).
+ */
+export type RetryDispatchVerb = "work" | "close" | "approve";
+
+const RETRY_DISPATCH_VERBS = new Set<RetryDispatchVerb>([
+  "work",
+  "close",
+  "approve",
+]);
+
+/** `retry_dispatch` wire params. */
+export interface RetryDispatchParams {
+  /** Composite dispatch key — exactly `${verb}::${id}`. */
+  id: string;
+}
+
+/** Successful return shape for `retry_dispatch`. */
+export interface RetryDispatchResult {
+  ok: true;
+  verb: RetryDispatchVerb;
+  id: string;
+}
+
+/**
+ * Split + validate a `${verb}::${id}` composite key. Returns the parsed
+ * pair; throws `BadParamsError` on any miss. Pure — exported for unit
+ * reach.
+ *
+ * Validation rules (id shape ONLY — launch params come from the
+ * projection read at the next reconcile, never the RPC payload):
+ *
+ * - Non-empty string with exactly one `::` separator.
+ * - `verb` is one of `work` / `close` / `approve`.
+ * - `id` is a non-empty token AND passes the {@link rejectPathTraversal}
+ *   filename-safety predicate (no path separators, no embedded null, no
+ *   leading dot). The `dispatch_id` never feeds a filesystem path, but
+ *   the predicate is a cheap belt-and-suspenders against a wire token
+ *   that looks like a path-traversal probe.
+ */
+export function parseDispatchKey(value: unknown): {
+  verb: RetryDispatchVerb;
+  id: string;
+} {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new BadParamsError(
+      "retry_dispatch: `id` must be a non-empty string of the form `verb::id` (e.g. `work::fn-1-foo.3`)",
+    );
+  }
+  const sep = value.indexOf("::");
+  if (sep <= 0 || sep === value.length - 2) {
+    throw new BadParamsError(
+      "retry_dispatch: `id` must contain exactly one `::` separator with non-empty halves",
+    );
+  }
+  // A second `::` is also a malformed key — the verb half MUST be a
+  // simple token, and the id half MUST NOT contain `::` either (the
+  // composite key is `verb::id`, not nested).
+  if (value.indexOf("::", sep + 2) !== -1) {
+    throw new BadParamsError(
+      "retry_dispatch: `id` must contain exactly ONE `::` separator",
+    );
+  }
+  const verbRaw = value.slice(0, sep);
+  const idRaw = value.slice(sep + 2);
+  if (!RETRY_DISPATCH_VERBS.has(verbRaw as RetryDispatchVerb)) {
+    throw new BadParamsError(
+      `retry_dispatch: \`verb\` must be one of work|close|approve (got ${JSON.stringify(verbRaw)})`,
+    );
+  }
+  rejectDispatchIdToken(idRaw);
+  return { verb: verbRaw as RetryDispatchVerb, id: idRaw };
+}
+
+/**
+ * Reject any `id` half that looks like a path-traversal probe or an
+ * empty token. The id never feeds a filesystem path inside the
+ * reconciler, but rejecting weaponizable shapes at the wire boundary is
+ * cheap defense against future code paths that might (e.g. a viewer
+ * that ever serialized an id into a path). Mirrors the
+ * {@link rejectPathTraversal} predicate the approval handlers apply.
+ */
+function rejectDispatchIdToken(value: string): void {
+  if (
+    value.length === 0 ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    value.includes("\0") ||
+    value.startsWith(".")
+  ) {
+    throw new BadParamsError(
+      "retry_dispatch: `id` half is empty or weaponizable (path-traversal token rejected)",
+    );
+  }
+}
+
+function validateRetryDispatchParams(params: unknown): RetryDispatchParams {
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    throw new BadParamsError(
+      "retry_dispatch: params must be an object with `id: 'verb::id'` (e.g. `work::fn-1-foo.3`)",
+    );
+  }
+  const obj = params as Record<string, unknown>;
+  // Reject any field other than `id` — the spec says "launch params
+  // come from the projection read, never the RPC payload"; a stray
+  // `cwd` / `tier` / `verb` / `command` field is a sign of param
+  // injection and gets surfaced as a typed bad_params rather than
+  // silently ignored.
+  const stray = Object.keys(obj).filter((k) => k !== "id");
+  if (stray.length > 0) {
+    throw new BadParamsError(
+      `retry_dispatch: params must contain ONLY \`id\` (got stray keys: ${stray.join(", ")})`,
+    );
+  }
+  return { id: obj.id as string };
+}
+
+/**
+ * `retry_dispatch` handler. Validates the wire `id` shape (the
+ * canonical `${verb}::${id}` composite key) — and ONLY the id shape;
+ * no command / cwd / tier rides the RPC. The next reconcile pulls
+ * launch params from the projection itself, so a malicious caller
+ * cannot inject params via this surface.
+ *
+ * Bridges to main, which appends a `DispatchCleared` synthetic event
+ * carrying the split `verb` / `id` pair. The reducer's fold arm
+ * DELETEs the matching `dispatch_failures` row on the next drain, and
+ * the autopilot reconciler will re-attempt the dispatch on its next
+ * wake. Fn-661 task .4.
+ */
+export async function retryDispatchHandler(
+  params: unknown,
+  bridge: ReplayBridge,
+): Promise<RetryDispatchResult> {
+  const { id } = validateRetryDispatchParams(params);
+  const { verb, id: dispatchId } = parseDispatchKey(id);
+  const result = await bridge.retryDispatch(verb, dispatchId);
+  if (!result.ok) {
+    throw new Error(result.error ?? "retry_dispatch: main reported failure");
+  }
+  return { ok: true, verb, id: dispatchId };
+}
+
 /**
  * Install every handler in this module into the process-global registries
  * (`RPC_REGISTRY` for sync handlers, `ASYNC_RPC_REGISTRY` for async ones).
@@ -402,4 +613,6 @@ export function installRpcHandlers(): void {
   registerRpc("set_task_approval", setTaskApprovalHandler);
   registerRpc("set_epic_approval", setEpicApprovalHandler);
   registerAsyncRpc("replay_dead_letter", replayDeadLetterHandler);
+  registerAsyncRpc("set_autopilot_paused", setAutopilotPausedHandler);
+  registerAsyncRpc("retry_dispatch", retryDispatchHandler);
 }

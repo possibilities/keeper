@@ -163,6 +163,70 @@ export interface ReplayResultMessage {
 }
 
 /**
+ * Worker→main request bridge for the `set_autopilot_paused` RPC (fn-661
+ * task .4). The async-RPC handler posts this message with a correlation
+ * `id` and a `paused` boolean, then awaits the matching
+ * {@link SetAutopilotPausedResultMessage} reply. Main flips its in-memory
+ * `paused` flag (the safety default — boots-paused, never persisted, see
+ * `src/daemon.ts` shutdown comments) AND relays a `{ type: "set-paused",
+ * paused }` command to the autopilot worker, then replies success.
+ *
+ * Why route through main: the `paused` flag is single-source-of-truth on
+ * main (the autopilot worker is told via the existing main→worker
+ * command channel). The server-worker has no direct line to the
+ * autopilot worker — every cross-worker message hops through main.
+ */
+export interface SetAutopilotPausedRequestMessage {
+  kind: "set-autopilot-paused-request";
+  id: string;
+  paused: boolean;
+}
+
+/** Main→worker reply paired with {@link SetAutopilotPausedRequestMessage}. */
+export interface SetAutopilotPausedResultMessage {
+  type: "set-autopilot-paused-result";
+  id: string;
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * Worker→main request bridge for the `retry_dispatch` RPC (fn-661 task
+ * .4). The async-RPC handler validates the wire `id` shape (the
+ * canonical `${verb}::${id}` `DispatchKey`), splits it into the `verb` /
+ * `id` pair, posts this message, and awaits the matching
+ * {@link RetryDispatchResultMessage} reply. Main appends a
+ * `DispatchCleared` synthetic event onto the writable connection so the
+ * reducer folds the failure row OUT of `dispatch_failures` (the only
+ * legal clear path — direct DELETEs would break re-fold determinism).
+ *
+ * Wire shape is the SPLIT pair, not the composite key, so main's mint
+ * site stays a pure forward: insert with `verb` / `id` exactly as
+ * received. Validation is the handler's job (verb is one of
+ * `work` / `close` / `approve`; id is a non-empty token).
+ */
+export interface RetryDispatchRequestMessage {
+  kind: "retry-dispatch-request";
+  id: string;
+  /** The dispatch verb half of the failed `${verb}::${id}` key. */
+  verb: "work" | "close" | "approve";
+  /**
+   * The planctl id (epic id for `close`; task id for `work` / `approve`).
+   * Validated by the handler to be a non-empty string; main treats it as
+   * an opaque token to mint into the `DispatchCleared` event payload.
+   */
+  dispatch_id: string;
+}
+
+/** Main→worker reply paired with {@link RetryDispatchRequestMessage}. */
+export interface RetryDispatchResultMessage {
+  type: "retry-dispatch-result";
+  id: string;
+  ok: boolean;
+  error?: string;
+}
+
+/**
  * Poll cadence (ms) for the realtime `data_version` loop. Mirrors the wake
  * worker's defaults — 50 ms is the sweet spot, floored at 25 ms to avoid
  * burning a core.
@@ -742,6 +806,42 @@ export interface ReplayBridge {
   replay(): Promise<{
     ok: boolean;
     recovered_dl_id?: string | null;
+    error?: string;
+  }>;
+  /**
+   * Ask main to flip the in-memory `paused` flag AND relay a
+   * `{ type: "set-paused", paused }` command to the autopilot worker.
+   * Resolves `{ok:true}` once main has both updated its flag and posted
+   * the relay (synchronous on the main thread). `{ok:false, error}`
+   * surfaces if main isn't currently running an autopilot worker (boot
+   * race; should never happen post-boot). Rejects on bridge timeout —
+   * same shape as {@link ReplayBridge.replay}.
+   *
+   * Fn-661 task .4. The flag is in-memory only on main and NEVER
+   * persisted; the rollout invariant is "first run after deploy
+   * dispatches nothing until the human plays".
+   */
+  setAutopilotPaused(paused: boolean): Promise<{
+    ok: boolean;
+    error?: string;
+  }>;
+  /**
+   * Ask main to append a `DispatchCleared` synthetic event onto the
+   * writable connection — the only legal way to clear a sticky failure
+   * row out of `dispatch_failures`. Resolves `{ok:true}` once main has
+   * inserted the event and pumped a wake (so the reducer's fold lands
+   * in bounded time). Rejects on bridge timeout.
+   *
+   * The split `verb` + `dispatch_id` pair lands on the wire (not the
+   * composite `${verb}::${id}` key) so the handler does its splitting
+   * validation once and main treats the parts as opaque tokens. Fn-661
+   * task .4.
+   */
+  retryDispatch(
+    verb: "work" | "close" | "approve",
+    dispatch_id: string,
+  ): Promise<{
+    ok: boolean;
     error?: string;
   }>;
 }
@@ -1940,22 +2040,58 @@ function main(): void {
   // single install point.
   installRpcHandlers();
 
-  // Worker→main async-RPC bridge state (fn-643 task .4). Outgoing
-  // {@link ReplayRequestMessage} posts await their matching `replay-result`
+  // Worker→main async-RPC bridge state (fn-643 task .4; extended for
+  // fn-661 task .4 with the autopilot pause/retry pair). Outgoing
+  // request messages ({@link ReplayRequestMessage} /
+  // {@link SetAutopilotPausedRequestMessage} /
+  // {@link RetryDispatchRequestMessage}) await their matching result
   // reply by correlation id. Resolves the awaiting promise with the
-  // typed `{ok, recovered_dl_id?, error?}` shape; a timeout rejects with
-  // a thrown Error. The bridge implementation is the SOLE place this
-  // worker thread exchanges messages with main outside the shutdown /
-  // ready protocol.
+  // typed `{ok, …}` shape; a timeout rejects with a thrown Error. The
+  // bridge implementation is the SOLE place this worker thread exchanges
+  // messages with main outside the shutdown / ready protocol.
   type ReplayResolution = {
     ok: boolean;
     recovered_dl_id?: string | null;
+    error?: string;
+  };
+  /**
+   * Reply shape the two fn-661 bridge calls resolve with — same `{ok,
+   * error?}` two-field union as the replay bridge minus the
+   * dead-letter-specific `recovered_dl_id`. Kept as a single internal
+   * type so both pending-map entries share one resolve signature.
+   */
+  type SimpleResolution = {
+    ok: boolean;
     error?: string;
   };
   const pendingReplays = new Map<
     string,
     {
       resolve: (r: ReplayResolution) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  /**
+   * Pending `set_autopilot_paused` requests, correlated by id. Distinct
+   * map from `pendingReplays` so a stale `replay-result` carrying a
+   * `set-autopilot-paused-request` id can't wrong-resolve the awaiting
+   * promise (the message-kind discrimination on the inbound handler
+   * already separates the two; the separate map is defense-in-depth).
+   */
+  const pendingSetPaused = new Map<
+    string,
+    {
+      resolve: (r: SimpleResolution) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  /** Pending `retry_dispatch` requests, correlated by id. */
+  const pendingRetryDispatch = new Map<
+    string,
+    {
+      resolve: (r: SimpleResolution) => void;
       reject: (e: Error) => void;
       timer: ReturnType<typeof setTimeout>;
     }
@@ -1979,6 +2115,52 @@ function main(): void {
           kind: "replay-request",
           id: reqId,
         } satisfies ReplayRequestMessage);
+      });
+    },
+    setAutopilotPaused(paused: boolean): Promise<SimpleResolution> {
+      return new Promise<SimpleResolution>((resolve, reject) => {
+        const reqId = crypto.randomUUID();
+        const timer = setTimeout(() => {
+          if (pendingSetPaused.delete(reqId)) {
+            reject(
+              new Error(
+                `no response from main within ${REPLAY_DEADLINE_MS}ms (id ${reqId})`,
+              ),
+            );
+          }
+        }, REPLAY_DEADLINE_MS);
+        timer.unref?.();
+        pendingSetPaused.set(reqId, { resolve, reject, timer });
+        parentPort!.postMessage({
+          kind: "set-autopilot-paused-request",
+          id: reqId,
+          paused,
+        } satisfies SetAutopilotPausedRequestMessage);
+      });
+    },
+    retryDispatch(
+      verb: "work" | "close" | "approve",
+      dispatch_id: string,
+    ): Promise<SimpleResolution> {
+      return new Promise<SimpleResolution>((resolve, reject) => {
+        const reqId = crypto.randomUUID();
+        const timer = setTimeout(() => {
+          if (pendingRetryDispatch.delete(reqId)) {
+            reject(
+              new Error(
+                `no response from main within ${REPLAY_DEADLINE_MS}ms (id ${reqId})`,
+              ),
+            );
+          }
+        }, REPLAY_DEADLINE_MS);
+        timer.unref?.();
+        pendingRetryDispatch.set(reqId, { resolve, reject, timer });
+        parentPort!.postMessage({
+          kind: "retry-dispatch-request",
+          id: reqId,
+          verb,
+          dispatch_id,
+        } satisfies RetryDispatchRequestMessage);
       });
     },
   };
@@ -2023,8 +2205,18 @@ function main(): void {
 
   parentPort.on(
     "message",
-    (msg: ShutdownMessage | ReplayResultMessage | undefined) => {
+    (
+      msg:
+        | ShutdownMessage
+        | ReplayResultMessage
+        | SetAutopilotPausedResultMessage
+        | RetryDispatchResultMessage
+        | undefined,
+    ) => {
       if (!msg) return;
+      // Discriminate by message kind — every inbound shape carries a
+      // distinct `type` so a stale reply for one bridge can't
+      // wrong-resolve another bridge's awaiting promise.
       if ((msg as ShutdownMessage).type === "shutdown") {
         shutdown();
         return;
@@ -2046,6 +2238,30 @@ function main(): void {
           recovered_dl_id: r.recovered_dl_id,
           error: r.error,
         });
+        return;
+      }
+      if (
+        (msg as SetAutopilotPausedResultMessage).type ===
+        "set-autopilot-paused-result"
+      ) {
+        const r = msg as SetAutopilotPausedResultMessage;
+        const entry = pendingSetPaused.get(r.id);
+        if (!entry) return;
+        pendingSetPaused.delete(r.id);
+        clearTimeout(entry.timer);
+        entry.resolve({ ok: r.ok, error: r.error });
+        return;
+      }
+      if (
+        (msg as RetryDispatchResultMessage).type === "retry-dispatch-result"
+      ) {
+        const r = msg as RetryDispatchResultMessage;
+        const entry = pendingRetryDispatch.get(r.id);
+        if (!entry) return;
+        pendingRetryDispatch.delete(r.id);
+        clearTimeout(entry.timer);
+        entry.resolve({ ok: r.ok, error: r.error });
+        return;
       }
     },
   );

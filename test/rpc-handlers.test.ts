@@ -24,8 +24,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb, serializePlanctlJson } from "../src/db";
 import {
+  parseDispatchKey,
   replayDeadLetterHandler,
   resolvePlanFile,
+  retryDispatchHandler,
+  setAutopilotPausedHandler,
   setEpicApprovalHandler,
   setTaskApprovalHandler,
 } from "../src/rpc-handlers";
@@ -502,6 +505,14 @@ function stubBridge(
       state.calls += 1;
       return result;
     },
+    // Not exercised by the replay-dead-letter handler tests; satisfies
+    // the fn-661-extended interface without affecting these test cases.
+    async setAutopilotPaused() {
+      return { ok: true };
+    },
+    async retryDispatch() {
+      return { ok: true };
+    },
   };
   return { bridge, state };
 }
@@ -558,4 +569,169 @@ test("replay_dead_letter throws a generic message when ok:false carries no error
   expect(replayDeadLetterHandler(undefined, bridge)).rejects.toThrow(
     /main reported failure/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-661 task .4 — `set_autopilot_paused`
+// ---------------------------------------------------------------------------
+
+/**
+ * Stub bridge for the fn-661 autopilot pause/retry handlers. Records every
+ * call so a test can assert the exact (paused) / (verb, id) the handler
+ * forwarded. The `replay` arm is untouched (the autopilot handlers never
+ * call it) but must be present to satisfy the {@link ReplayBridge}
+ * interface.
+ */
+function autopilotStubBridge(opts: {
+  setPaused?: { ok: boolean; error?: string };
+  retry?: { ok: boolean; error?: string };
+}): {
+  bridge: ReplayBridge;
+  state: {
+    setPausedCalls: boolean[];
+    retryCalls: Array<{ verb: string; id: string }>;
+  };
+} {
+  const state = {
+    setPausedCalls: [] as boolean[],
+    retryCalls: [] as Array<{ verb: string; id: string }>,
+  };
+  const bridge: ReplayBridge = {
+    async replay() {
+      return { ok: true, recovered_dl_id: null };
+    },
+    async setAutopilotPaused(paused) {
+      state.setPausedCalls.push(paused);
+      return opts.setPaused ?? { ok: true };
+    },
+    async retryDispatch(verb, id) {
+      state.retryCalls.push({ verb, id });
+      return opts.retry ?? { ok: true };
+    },
+  };
+  return { bridge, state };
+}
+
+test("set_autopilot_paused forwards the boolean to the bridge and returns ok+paused", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setAutopilotPausedHandler({ paused: true }, bridge);
+  expect(result).toEqual({ ok: true, paused: true });
+  expect(state.setPausedCalls).toEqual([true]);
+
+  const result2 = await setAutopilotPausedHandler({ paused: false }, bridge);
+  expect(result2).toEqual({ ok: true, paused: false });
+  expect(state.setPausedCalls).toEqual([true, false]);
+});
+
+test("set_autopilot_paused throws BadParamsError on non-object params", async () => {
+  const { bridge } = autopilotStubBridge({});
+  for (const bad of [null, "nope", 1, true, [], undefined]) {
+    expect(setAutopilotPausedHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
+test("set_autopilot_paused throws BadParamsError when `paused` is missing or non-boolean", async () => {
+  const { bridge } = autopilotStubBridge({});
+  for (const bad of [{}, { paused: "true" }, { paused: 1 }, { paused: null }]) {
+    expect(setAutopilotPausedHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
+test("set_autopilot_paused throws rpc_failed when the bridge reports ok:false", async () => {
+  const { bridge } = autopilotStubBridge({
+    setPaused: { ok: false, error: "no autopilot worker" },
+  });
+  expect(setAutopilotPausedHandler({ paused: true }, bridge)).rejects.toThrow(
+    /no autopilot worker/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// fn-661 task .4 — `retry_dispatch`
+// ---------------------------------------------------------------------------
+
+test("parseDispatchKey: splits the composite key into a typed {verb, id} pair", () => {
+  expect(parseDispatchKey("work::fn-1-foo.3")).toEqual({
+    verb: "work",
+    id: "fn-1-foo.3",
+  });
+  expect(parseDispatchKey("approve::fn-1-foo.3")).toEqual({
+    verb: "approve",
+    id: "fn-1-foo.3",
+  });
+  expect(parseDispatchKey("close::fn-1-foo")).toEqual({
+    verb: "close",
+    id: "fn-1-foo",
+  });
+});
+
+test("parseDispatchKey: rejects empty / non-string / missing-separator inputs", () => {
+  for (const bad of ["", undefined, null, 42, true, "no-sep", "work::"]) {
+    expect(() => parseDispatchKey(bad)).toThrow(BadParamsError);
+  }
+});
+
+test("parseDispatchKey: rejects unknown verbs", () => {
+  expect(() => parseDispatchKey("rm::fn-1-foo")).toThrow(BadParamsError);
+  expect(() => parseDispatchKey("plan::fn-1-foo")).toThrow(BadParamsError);
+});
+
+test("parseDispatchKey: rejects nested `::` separators (no command injection)", () => {
+  expect(() => parseDispatchKey("work::fn-1::pwned")).toThrow(BadParamsError);
+});
+
+test("parseDispatchKey: rejects path-traversal tokens in the id half", () => {
+  for (const bad of [
+    "work::../etc/passwd",
+    "work::/abs/path",
+    "work::a/b",
+    "work::a\\b",
+    "work::.hidden",
+    "work::a\0b",
+  ]) {
+    expect(() => parseDispatchKey(bad)).toThrow(BadParamsError);
+  }
+});
+
+test("retry_dispatch forwards the split (verb, id) to the bridge and returns ok+verb+id", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await retryDispatchHandler({ id: "work::fn-1-foo.3" }, bridge);
+  expect(result).toEqual({ ok: true, verb: "work", id: "fn-1-foo.3" });
+  expect(state.retryCalls).toEqual([{ verb: "work", id: "fn-1-foo.3" }]);
+});
+
+test("retry_dispatch rejects params with extra keys (no command/param injection)", async () => {
+  const { bridge } = autopilotStubBridge({});
+  for (const bad of [
+    { id: "work::fn-1-foo", command: "rm -rf /" },
+    { id: "work::fn-1-foo", verb: "approve" }, // redundant + injected
+    { id: "work::fn-1-foo", cwd: "/etc" },
+    { id: "work::fn-1-foo", tier: "explore" },
+  ]) {
+    expect(retryDispatchHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
+test("retry_dispatch rejects non-object / missing-id params", async () => {
+  const { bridge } = autopilotStubBridge({});
+  for (const bad of [null, undefined, "work::fn-1", {}, { other: 1 }]) {
+    expect(retryDispatchHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
+test("retry_dispatch surfaces bridge ok:false as a thrown error (rpc_failed framing)", async () => {
+  const { bridge } = autopilotStubBridge({
+    retry: { ok: false, error: "insertEvent failed" },
+  });
+  expect(
+    retryDispatchHandler({ id: "work::fn-1-foo.3" }, bridge),
+  ).rejects.toThrow(/insertEvent failed/);
 });

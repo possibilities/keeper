@@ -1797,3 +1797,103 @@ test("fn-651: an old event missing the fn-645 fields folds them to NULL without 
   expect(row.error_at).toBeNull();
   db.close();
 });
+
+// ---------------------------------------------------------------------------
+// fn-661 task .4 — autopilot worker spawn + shutdown contract
+// ---------------------------------------------------------------------------
+
+/**
+ * Spawn the autopilot worker against a tmp DB, await its first
+ * `data_version`-poll tick by sleeping briefly, send the standard
+ * `{type:"shutdown"}` message, and assert the worker's `close` event
+ * fires within the test deadline. Mirrors the server-worker shutdown
+ * test pattern (`test/server-worker.test.ts`): spawn → exercise →
+ * shutdown → race against a 2s deadline.
+ *
+ * Why a direct spawn rather than a full `runDaemon()` boot: the daemon
+ * module is import-safe behind its `import.meta.main` guard, but a
+ * full boot opens the writer DB, launches eight other workers, binds
+ * a UDS, and writes the LaunchAgent state dir — far outside the scope
+ * of "does the autopilot worker accept its initial workerData and
+ * shut down cleanly". Each test below targets one contract piece.
+ */
+test("autopilot worker spawns with paused=true workerData and shuts down cleanly on {type:'shutdown'}", async () => {
+  // Fresh DB so the worker's readonly openDb has a real schema to open
+  // against. The migrate path is the daemon's job; for this contract
+  // test we just need the file to exist.
+  openDb(dbPath).db.close();
+
+  const worker = new Worker(
+    new URL("../src/autopilot-worker.ts", import.meta.url).href,
+    {
+      workerData: {
+        dbPath,
+        paused: true,
+        autocloseWindows: false,
+        zellijSession: "autopilot-test",
+        pollMs: 25,
+      },
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  const exited = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+
+  // Give the worker time to construct its own readonly conn, attach
+  // its `parentPort.on("message", …)` listener, and enter the
+  // `watchLoop` poll. 100ms is generous; the worker's bootstrap is
+  // synchronous JS after `openDb`.
+  await Bun.sleep(100);
+
+  worker.postMessage({ type: "shutdown" });
+
+  const result = await Promise.race([
+    exited.then(() => "exited" as const),
+    Bun.sleep(2000).then(() => "timeout" as const),
+  ]);
+  expect(result).toBe("exited");
+});
+
+test("autopilot worker accepts {type:'set-paused', paused} commands without crashing the loop", async () => {
+  openDb(dbPath).db.close();
+
+  const worker = new Worker(
+    new URL("../src/autopilot-worker.ts", import.meta.url).href,
+    {
+      workerData: {
+        dbPath,
+        paused: true,
+        autocloseWindows: false,
+        zellijSession: "autopilot-test",
+        pollMs: 25,
+      },
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  const exited = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+
+  // Bootstrap window.
+  await Bun.sleep(100);
+
+  // Flip paused both directions. The worker's loop is a no-op today
+  // (the reconcile glue is a sibling task), but the message handler
+  // MUST accept these without throwing — that's the boot-pause +
+  // play/pause contract this task wires up.
+  worker.postMessage({ type: "set-paused", paused: false });
+  await Bun.sleep(50);
+  worker.postMessage({ type: "set-paused", paused: true });
+  await Bun.sleep(50);
+  worker.postMessage({ type: "set-paused", paused: false });
+  await Bun.sleep(50);
+
+  worker.postMessage({ type: "shutdown" });
+
+  const result = await Promise.race([
+    exited.then(() => "exited" as const),
+    Bun.sleep(2000).then(() => "timeout" as const),
+  ]);
+  expect(result).toBe("exited");
+});

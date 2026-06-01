@@ -973,6 +973,14 @@ function asyncCtxStub(opts: {
       bridgeCalls.count += 1;
       return opts.replay();
     },
+    // Not exercised by the replay async-RPC tests; satisfies the
+    // fn-661-extended interface without affecting these test cases.
+    async setAutopilotPaused() {
+      return { ok: true };
+    },
+    async retryDispatch() {
+      return { ok: true };
+    },
   };
   const ctx: DispatchAsyncCtx = {
     bridge,
@@ -1130,6 +1138,102 @@ test("registerRpc collides with a same-name async registration", () => {
     );
   } finally {
     teardown();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// fn-661 task .4 — async dispatch via the extended ReplayBridge
+// ---------------------------------------------------------------------------
+
+test("dispatchLine async rpc → handler reaches bridge.setAutopilotPaused (round-trip + rpc_result delivery)", async () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const teardown = withAsyncRpc("ap_paused_probe", async (_p, bridge) => {
+    const r = await bridge.setAutopilotPaused(true);
+    return { ok: true, relay: r.ok };
+  });
+  try {
+    const conn = newConn();
+    const setPausedCalls: boolean[] = [];
+    const delivered: ServerFrame[][] = [];
+    const bridge: ReplayBridge = {
+      async replay() {
+        return { ok: true, recovered_dl_id: null };
+      },
+      async setAutopilotPaused(paused) {
+        setPausedCalls.push(paused);
+        return { ok: true };
+      },
+      async retryDispatch() {
+        return { ok: true };
+      },
+    };
+    const ctx: DispatchAsyncCtx = {
+      bridge,
+      onAsyncResult: (frames) => delivered.push(frames),
+    };
+    const inline = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "ap_paused_probe" }),
+      db,
+      ctx,
+    );
+    expect(inline).toEqual([]);
+    await Bun.sleep(10);
+    expect(setPausedCalls).toEqual([true]);
+    expect(delivered).toHaveLength(1);
+    const frame = delivered[0][0] as RpcResultFrame;
+    expect(frame.type).toBe("rpc_result");
+    expect(frame.id).toBe("r1");
+    expect(frame.value).toEqual({ ok: true, relay: true });
+  } finally {
+    teardown();
+    db.close();
+  }
+});
+
+test("dispatchLine async rpc → handler reaches bridge.retryDispatch with the split (verb, id) pair", async () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const teardown = withAsyncRpc("retry_dispatch_probe", async (_p, bridge) => {
+    return await bridge.retryDispatch("work", "fn-1-foo.3");
+  });
+  try {
+    const conn = newConn();
+    const retryCalls: Array<{ verb: string; id: string }> = [];
+    const delivered: ServerFrame[][] = [];
+    const bridge: ReplayBridge = {
+      async replay() {
+        return { ok: true, recovered_dl_id: null };
+      },
+      async setAutopilotPaused() {
+        return { ok: true };
+      },
+      async retryDispatch(verb, id) {
+        retryCalls.push({ verb, id });
+        return { ok: true };
+      },
+    };
+    const ctx: DispatchAsyncCtx = {
+      bridge,
+      onAsyncResult: (frames) => delivered.push(frames),
+    };
+    const inline = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "retry_dispatch_probe" }),
+      db,
+      ctx,
+    );
+    expect(inline).toEqual([]);
+    await Bun.sleep(10);
+    expect(retryCalls).toEqual([{ verb: "work", id: "fn-1-foo.3" }]);
+    expect(delivered).toHaveLength(1);
+    const frame = delivered[0][0] as RpcResultFrame;
+    expect(frame.type).toBe("rpc_result");
+    expect(frame.id).toBe("r1");
+  } finally {
+    teardown();
+    db.close();
   }
 });
 

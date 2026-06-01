@@ -834,6 +834,27 @@ export interface AutopilotWorkerData {
   paused?: boolean;
   /** Poll cadence for the data_version wake loop (ms). */
   pollMs?: number;
+  /**
+   * Whether the reconciler reaps a dispatch whose role is no longer
+   * needed (the `closeByName` path). Threaded in from
+   * `resolveConfig().autocloseWindows` so the worker doesn't read
+   * `~/.config/keeper/config.yaml` itself — config I/O happens once on
+   * main, every worker receives the resolved value. Mirrors the
+   * `ReconcileConfig.autocloseWindows` field the pure `reconcile`
+   * function takes.
+   */
+  autocloseWindows?: boolean;
+  /**
+   * Zellij session name the (future) in-worker `ExecBackend` will lazily
+   * ensure before its first `new-tab`. Threaded in from
+   * `resolveConfig().zellijSession` for the same reason as
+   * `autocloseWindows`: keep config reads on main, hand workers the
+   * resolved values. Today the worker's `main()` is a no-op shell — the
+   * field is plumbed through workerData so the sibling reconcile-wiring
+   * task can build the backend inside the worker without re-reading
+   * config (and without needing main to round-trip every `launch`).
+   */
+  zellijSession?: string;
 }
 
 /** Main → worker: paused-flag flip. */

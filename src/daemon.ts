@@ -68,9 +68,14 @@
 import type { Database } from "bun:sqlite";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import type {
+  AutopilotWorkerData,
+  DispatchFailedMessage,
+} from "./autopilot-worker";
 import {
   openDb,
   resolveClaudeProjectsRoot,
+  resolveConfig,
   resolveDbPath,
   resolveDeadLetterDir,
   resolvePlanRoots,
@@ -90,7 +95,11 @@ import { seedKilledSweep } from "./seed-sweep";
 import type {
   ReplayRequestMessage,
   ReplayResultMessage,
+  RetryDispatchRequestMessage,
+  RetryDispatchResultMessage,
   ServerWorkerData,
+  SetAutopilotPausedRequestMessage,
+  SetAutopilotPausedResultMessage,
 } from "./server-worker";
 import type {
   ApiErrorMessage,
@@ -741,6 +750,24 @@ function runDaemon(): void {
   let draining = false;
   let shuttingDown = false;
 
+  // Autopilot in-memory paused flag (fn-661 task .4). Boots PAUSED — the
+  // safety default per the epic rollout invariant "first run after deploy
+  // dispatches nothing until the human plays". Lives ONLY in main's
+  // memory (never persisted; never RPC-writable except via the
+  // `set_autopilot_paused` RPC below, which round-trips through the
+  // worker-→main bridge and back). The autopilot worker is told via
+  // the existing main→worker `{ type: "set-paused", paused }` channel.
+  let autopilotPaused = true;
+  // Forward reference filled in below when the autopilot worker spawns.
+  // The server-worker's bridge handlers (registered just below) capture
+  // this via closure so the relay can target the autopilot worker even
+  // though the worker reference is assigned later in this function. Until
+  // the worker is constructed (a narrow boot window between the bridge
+  // wire-up and the actual `new Worker(...)` call), bridge requests
+  // resolve `ok:false, error="autopilot worker not yet ready"` — a
+  // best-effort surface for the otherwise-impossible boot race.
+  let autopilotWorker: Worker | null = null;
+
   /**
    * Process the wake signal. Re-entrancy guard (`draining`) ensures we never
    * call drain recursively if a wake lands while we're already inside the loop;
@@ -804,50 +831,160 @@ function runDaemon(): void {
     } as WorkerOptions & { workerData: unknown },
   );
 
-  // Server-worker → main bridge (fn-643 task .4). The server-worker posts
-  // {kind:"replay-request", id} when a board client invokes the
-  // `replay_dead_letter` RPC; main runs `recoverOneDeadLetter` and posts
-  // back {type:"replay-result", id, ok, recovered_dl_id?, error?}. This
-  // is the SOLE worker→main request/reply path; the existing
-  // {kind:"ready"} signal is one-way (worker→main only) and a stale
-  // message that's neither matches no branch and is silently dropped.
+  // Server-worker → main bridge. Originally the `replay_dead_letter`
+  // round-trip (fn-643 task .4); extended for fn-661 task .4 with the
+  // autopilot pause/retry pair. Every inbound message carries a `kind`
+  // discriminator so a stale reply for one verb can't wrong-resolve
+  // another. The `{kind:"ready"}` signal is one-way (worker→main only)
+  // and matches no branch — silently dropped.
   serverWorker.onmessage = (
-    ev: MessageEvent<ReplayRequestMessage | { kind: "ready" } | undefined>,
+    ev: MessageEvent<
+      | ReplayRequestMessage
+      | SetAutopilotPausedRequestMessage
+      | RetryDispatchRequestMessage
+      | { kind: "ready" }
+      | undefined
+    >,
   ): void => {
     const msg = ev.data;
-    if (!msg || msg.kind !== "replay-request") {
+    if (!msg) return;
+    if (msg.kind === "replay-request") {
+      const id = msg.id;
+      let reply: ReplayResultMessage;
+      try {
+        const recoveredDlId = recoverOneDeadLetter(db);
+        reply = {
+          type: "replay-result",
+          id,
+          ok: true,
+          recovered_dl_id: recoveredDlId,
+        };
+        if (recoveredDlId !== null) {
+          // We appended a real `events` row. Pump a wake so the reducer
+          // folds it (jobs / epics / etc.) without waiting for the wake
+          // worker's `data_version` poll — symmetry with the other
+          // synthetic-event mint sites in this file.
+          wakePending = true;
+          pumpWakes();
+        }
+      } catch (err) {
+        // The recovery transaction crashed (programming bug or a DB-level
+        // failure). Surface as a typed `ok:false` reply; the worker's
+        // dispatcher frames `rpc_failed` on the wire.
+        reply = {
+          type: "replay-result",
+          id,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+      serverWorker.postMessage(reply);
       return;
     }
-    const id = msg.id;
-    let reply: ReplayResultMessage;
-    try {
-      const recoveredDlId = recoverOneDeadLetter(db);
-      reply = {
-        type: "replay-result",
-        id,
-        ok: true,
-        recovered_dl_id: recoveredDlId,
-      };
-      if (recoveredDlId !== null) {
-        // We appended a real `events` row. Pump a wake so the reducer
-        // folds it (jobs / epics / etc.) without waiting for the wake
-        // worker's `data_version` poll — symmetry with the other
-        // synthetic-event mint sites in this file.
+    if (msg.kind === "set-autopilot-paused-request") {
+      // Fn-661 task .4. Flip the in-memory `paused` flag AND relay a
+      // `{type:"set-paused"}` command to the autopilot worker. The relay
+      // is a fire-and-forget postMessage — the autopilot worker handles
+      // the command on its next event-loop tick. Surfaces `ok:false`
+      // ONLY if the autopilot worker isn't constructed yet (a narrow
+      // boot race between this bridge wire-up and the worker spawn
+      // below); the worker is always present in steady state.
+      let reply: SetAutopilotPausedResultMessage;
+      if (autopilotWorker === null) {
+        reply = {
+          type: "set-autopilot-paused-result",
+          id: msg.id,
+          ok: false,
+          error: "autopilot worker not yet ready",
+        };
+      } else {
+        autopilotPaused = msg.paused;
+        try {
+          autopilotWorker.postMessage({
+            type: "set-paused",
+            paused: msg.paused,
+          });
+          reply = {
+            type: "set-autopilot-paused-result",
+            id: msg.id,
+            ok: true,
+          };
+        } catch (err) {
+          reply = {
+            type: "set-autopilot-paused-result",
+            id: msg.id,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      }
+      serverWorker.postMessage(reply);
+      return;
+    }
+    if (msg.kind === "retry-dispatch-request") {
+      // Fn-661 task .4. Append a `DispatchCleared` synthetic event onto
+      // the writable connection so the reducer's fold arm DELETEs the
+      // matching `dispatch_failures` row on the next drain. Mirrors the
+      // git-worker mint pattern (insertEvent.run + wakePending=true +
+      // pumpWakes). The wire `verb` is already validated to be one of
+      // `work` / `close` / `approve`; the wire `dispatch_id` is a
+      // non-empty token (validated handler-side); main treats both as
+      // opaque payload tokens.
+      const id = msg.id;
+      let reply: RetryDispatchResultMessage;
+      try {
+        const data = JSON.stringify({
+          verb: msg.verb,
+          id: msg.dispatch_id,
+        });
+        stmts.insertEvent.run({
+          $ts: Date.now() / 1000,
+          // The dispatch key rides as the entity-key overload so a
+          // re-fold can correlate the event to its dispatch_failures
+          // row without re-parsing the data blob. Same convention as
+          // every other synthetic minted on main (the producer-side
+          // composite `${verb}::${id}` is unambiguous).
+          $session_id: `${msg.verb}::${msg.dispatch_id}`,
+          $pid: null,
+          $hook_event: "DispatchCleared",
+          $event_type: "dispatch_failures",
+          $tool_name: null,
+          $matcher: null,
+          $cwd: null,
+          $permission_mode: null,
+          $agent_id: null,
+          $agent_type: null,
+          $stop_hook_active: null,
+          $data: data,
+          $subagent_agent_id: null,
+          $spawn_name: null,
+          $start_time: null,
+          $slash_command: null,
+          $skill_name: null,
+          $planctl_op: null,
+          $planctl_target: null,
+          $planctl_epic_id: null,
+          $planctl_task_id: null,
+          $planctl_subject_present: null,
+          $config_dir: null,
+          $planctl_queue_jump: null,
+          $bash_mutation_kind: null,
+          $bash_mutation_targets: null,
+        });
         wakePending = true;
         pumpWakes();
+        reply = { type: "retry-dispatch-result", id, ok: true };
+      } catch (err) {
+        reply = {
+          type: "retry-dispatch-result",
+          id,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
       }
-    } catch (err) {
-      // The recovery transaction crashed (programming bug or a DB-level
-      // failure). Surface as a typed `ok:false` reply; the worker's
-      // dispatcher frames `rpc_failed` on the wire.
-      reply = {
-        type: "replay-result",
-        id,
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      };
+      serverWorker.postMessage(reply);
+      return;
     }
-    serverWorker.postMessage(reply);
   };
 
   // Same crash policy as the wake worker: any thread failure → fatalExit → exit
@@ -1539,6 +1676,128 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
+  // Spawn the autopilot reconciler worker (fn-661 task .4) — the eighth
+  // worker thread. It runs the level-triggered dispatch reconcile loop
+  // server-side: data_version wake → desired-vs-observed verdict →
+  // launch via the ExecBackend → confirm via the worker's own read conn
+  // → DispatchFailed mint on ceiling (bridged through main, see the
+  // `onmessage` handler below). The pure decision logic (`reconcile`,
+  // `confirmRunning`, `runReconcileCycle`) lives in `src/autopilot-worker.ts`
+  // and is exercised directly by the test suite; this spawn is the
+  // structural glue that lights up the worker's main() body.
+  //
+  // Boots PAUSED: the autopilot worker initializes its in-memory
+  // `paused = true` from the supervisor's `paused: true` workerData
+  // (the safety default; see the `autopilotPaused` declaration above).
+  // The flag flips ONLY via the `set_autopilot_paused` RPC → bridge →
+  // main → `{type:"set-paused"}` relay above.
+  //
+  // Config (`autocloseWindows` / `zellijSession`) is read here on main
+  // and threaded into workerData so the worker doesn't open
+  // `~/.config/keeper/config.yaml` itself — every config I/O lives on
+  // main, every worker receives the resolved values.
+  const apConfig = resolveConfig();
+  const autopilotWorkerInstance = new Worker(
+    new URL("./autopilot-worker.ts", import.meta.url).href,
+    {
+      workerData: {
+        dbPath,
+        paused: autopilotPaused,
+        autocloseWindows: apConfig.autocloseWindows ?? false,
+        zellijSession: apConfig.zellijSession,
+      } satisfies AutopilotWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
+  // Wire the forward reference declared above so the server-worker's
+  // bridge handler (registered earlier) can target the autopilot worker
+  // via `autopilotWorker.postMessage({...})`. Assign BEFORE the
+  // onmessage / onerror / close handlers fire so the first bridge
+  // request never sees a `null` autopilot worker.
+  autopilotWorker = autopilotWorkerInstance;
+
+  // Worker → main: `DispatchFailed` mint request. Mirrors the git-worker
+  // synthetic-event mint pattern (see `:1309-1376`): the worker posts a
+  // `{kind:"dispatch-failed", payload}` message, main runs
+  // `stmts.insertEvent.run` on its writable connection, then sets
+  // `wakePending = true; pumpWakes()` so the reducer folds the row into
+  // `dispatch_failures` without waiting for the wake worker's
+  // `data_version` poll. Workers never write the DB; the producer-side
+  // `ts` rides in the payload so re-fold determinism holds.
+  autopilotWorkerInstance.onmessage = (
+    ev: MessageEvent<DispatchFailedMessage | undefined>,
+  ): void => {
+    const msg = ev.data;
+    if (!msg || msg.kind !== "dispatch-failed") {
+      return;
+    }
+    const payload = msg.payload;
+    // The dispatch key (`${verb}::${id}`) rides as the entity-key
+    // overload on `session_id` so a re-fold can correlate the synthetic
+    // event to its `dispatch_failures` row without re-parsing the
+    // `data` blob. Same convention the retry-dispatch mint above uses.
+    const data = JSON.stringify(payload);
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${payload.verb}::${payload.id}`,
+        $pid: null,
+        $hook_event: "DispatchFailed",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: payload.dir,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: data,
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $planctl_op: null,
+        $planctl_target: null,
+        $planctl_epic_id: null,
+        $planctl_task_id: null,
+        $planctl_subject_present: null,
+        $config_dir: null,
+        $planctl_queue_jump: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      // Defense-in-depth: an insert failure (DB-level) must NOT crash
+      // the daemon. Log + continue — the next reconcile wake will
+      // re-attempt the dispatch (the sticky failure state is bounded
+      // by an event in the log; a missed insert is just an extra retry
+      // round-trip, not a correctness hazard).
+      console.error(
+        `[keeperd] DispatchFailed mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  };
+
+  // Same crash policy as the other workers: any thread failure →
+  // fatalExit → exit 1 → launchd restart.
+  autopilotWorkerInstance.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] autopilot worker error:", err.message ?? err);
+    fatalExit();
+  };
+
+  // Same crash-via-`close` gap as every other worker: a
+  // `process.exit(1)` inside the autopilot worker fires `close`, not
+  // `onerror`. Without this the reconciler could silently vanish while
+  // the rest of keeperd kept running. `!shuttingDown` makes it inert
+  // on the clean shutdown path.
+  autopilotWorkerInstance.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
+
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -1581,15 +1840,19 @@ function runDaemon(): void {
     deadLetterWorker.postMessage({
       type: "shutdown",
     } satisfies ShutdownMessage);
+    autopilotWorkerInstance.postMessage({
+      type: "shutdown",
+    } satisfies ShutdownMessage);
 
-    // Bun surfaces worker exit via the "close" event. Await ALL EIGHT
+    // Bun surfaces worker exit via the "close" event. Await ALL NINE
     // workers' close (the server worker releases its socket + lock, the
     // transcript + plan + usage + dead-letter workers unsubscribe their
-    // watchers, and the exit-watcher releases its kqueue/pidfd fd in their
-    // own shutdown handlers — that teardown must land, or the socket /
-    // native watches / kernel fd leak into the next boot), raced against a
-    // single shared deadline so a wedged worker can't block our clean
-    // shutdown forever.
+    // watchers, the exit-watcher releases its kqueue/pidfd fd, and the
+    // autopilot worker aborts its in-flight confirm in their own
+    // shutdown handlers — that teardown must land, or the socket /
+    // native watches / kernel fd leak into the next boot), raced
+    // against a single shared deadline so a wedged worker can't block
+    // our clean shutdown forever.
     const exited = (w: Worker): Promise<void> =>
       new Promise<void>((resolve) => {
         w.addEventListener("close", () => resolve());
@@ -1604,6 +1867,7 @@ function runDaemon(): void {
         exited(gitWorker),
         exited(usageWorker),
         exited(deadLetterWorker),
+        exited(autopilotWorkerInstance),
       ]),
       Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS),
     ]);
@@ -1645,6 +1909,11 @@ function runDaemon(): void {
     }
     try {
       deadLetterWorker.terminate();
+    } catch {
+      // best-effort if it already exited
+    }
+    try {
+      autopilotWorkerInstance.terminate();
     } catch {
       // best-effort if it already exited
     }
