@@ -32,6 +32,7 @@ import { join } from "node:path";
 import {
   backendExecCoordsFromEnv,
   configDirFromEnv,
+  KNOWN_EVENT_COLUMNS,
   nameFromArgs,
   parseLinuxStarttime,
   splitArgsLstart,
@@ -1758,4 +1759,60 @@ test("fn-669 HAPPY: full-column INSERT (intersection is identity) on a migrated 
   } finally {
     db.close();
   }
+});
+
+test("fn-672 LOCKSTEP: KNOWN_EVENT_COLUMNS == events table columns == insertBindings keys", async () => {
+  // F1 from the fn-669 audit: three hand-maintained lists must stay in
+  // lockstep — `KNOWN_EVENT_COLUMNS` (events-writer.ts), `insertBindings`
+  // (same file), and `CREATE_EVENTS` (src/db.ts). The pre-fn-672 happy
+  // test SELECTs a literal column list — catches removal (SQL won't
+  // compile) but a NEW column added to `CREATE_EVENTS` without a matching
+  // `KNOWN_EVENT_COLUMNS` entry silently drops from every hook INSERT
+  // permanently. This test pins all three to the same set.
+
+  // Axis 1: live migrated DB's `events` columns (minus the auto-`id` PK)
+  // == `KNOWN_EVENT_COLUMNS`. `beforeEach` already migrated `dbPath`.
+  const { db } = openDb(dbPath, { readonly: true });
+  let liveCols: Set<string>;
+  try {
+    const rows = db.prepare("PRAGMA table_info('events')").all() as {
+      name: string;
+    }[];
+    liveCols = new Set(rows.map((r) => r.name).filter((n) => n !== "id"));
+  } finally {
+    db.close();
+  }
+  // Symmetric set-equality: every live column is in KNOWN, every KNOWN
+  // is in live. Sorting + deep-equality gives a readable diff on failure.
+  expect([...liveCols].sort()).toEqual([...KNOWN_EVENT_COLUMNS].sort());
+
+  // Axis 2: `KNOWN_EVENT_COLUMNS` == bare-column key set of the
+  // `insertBindings` literal in events-writer.ts. The literal is local to
+  // `main()` and built from live values, so we parse the source text:
+  // grab the `const insertBindings = { ... };` block, strip the `$`
+  // prefix from each key, and compare. A new column added to KNOWN that
+  // forgets the bindings entry (or vice-versa) lights up here.
+  const writerSrc = readFileSync(
+    join(ROOT, "plugin", "hooks", "events-writer.ts"),
+    "utf8",
+  );
+  const literalMatch = writerSrc.match(
+    /const insertBindings = \{([\s\S]*?)\n {2}\};/,
+  );
+  expect(literalMatch).not.toBeNull();
+  // biome-ignore lint/style/noNonNullAssertion: asserted above
+  const literalBody = literalMatch![1]!;
+  // Each binding line looks like `    $col_name: someValue,` (possibly
+  // preceded by comments). Match the `$ident:` shape only.
+  const bindingKeys = new Set<string>();
+  for (const m of literalBody.matchAll(/^\s*\$([a-z_][a-z0-9_]*):/gim)) {
+    // biome-ignore lint/style/noNonNullAssertion: capture group always present on match
+    bindingKeys.add(m[1]!);
+  }
+  // Sanity: parser found the expected order-of-magnitude number of keys.
+  // Guards against a future refactor that re-shapes the literal in a way
+  // the regex no longer recognizes — better to fail loud here than to
+  // silently pass with an empty set on both sides.
+  expect(bindingKeys.size).toBeGreaterThan(20);
+  expect([...bindingKeys].sort()).toEqual([...KNOWN_EVENT_COLUMNS].sort());
 });

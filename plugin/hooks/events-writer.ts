@@ -498,7 +498,7 @@ const HOOK_BUSY_TIMEOUT_MS = 1200;
  * literal — that path is post-migrate, so the static all-columns INSERT
  * never races.
  */
-const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
+export const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
   "ts",
   "session_id",
   "pid",
