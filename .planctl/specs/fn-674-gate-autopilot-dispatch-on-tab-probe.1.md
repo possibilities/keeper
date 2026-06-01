@@ -98,5 +98,5 @@ re-dispatch.
 - [ ] README eighth-worker paragraph, CLAUDE.md autopilot-dispatch-gates + `confirmRunning` sentence, and the `confirmRunning`/in-flight-map/`DEFAULT_CEILING_MS` JSDoc updated to the new contract
 
 ## Done summary
-
+ExecBackend gained tabExistsByName + bulk liveTabNames; ReconcileSnapshot.liveTabKeys feeds a fifth dedup arm; confirmRunning early-resolves on tab-visible OR jobs-row, mints DispatchFailed only on launch failure or ceiling-elapsed with neither signal; DEFAULT_CEILING_MS bumped 18s→60s.
 ## Evidence
