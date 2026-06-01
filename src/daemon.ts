@@ -1007,6 +1007,9 @@ function runDaemon(): void {
             $bash_mutation_kind: null,
             $bash_mutation_targets: null,
             $planctl_files: null,
+            $backend_exec_type: null,
+            $backend_exec_session_id: null,
+            $backend_exec_pane_id: null,
           });
           wakePending = true;
           pumpWakes();
@@ -1085,6 +1088,9 @@ function runDaemon(): void {
           $bash_mutation_kind: null,
           $bash_mutation_targets: null,
           $planctl_files: null,
+          $backend_exec_type: null,
+          $backend_exec_session_id: null,
+          $backend_exec_pane_id: null,
         });
         wakePending = true;
         pumpWakes();
@@ -1186,6 +1192,9 @@ function runDaemon(): void {
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $planctl_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
       });
       // Our own INSERT bumps data_version, so the wake worker would re-drain
       // anyway — but pump directly so the title folds without a poll-cycle delay.
@@ -1241,6 +1250,9 @@ function runDaemon(): void {
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $planctl_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
       });
       wakePending = true;
       pumpWakes();
@@ -1294,6 +1306,9 @@ function runDaemon(): void {
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $planctl_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
       });
       wakePending = true;
       pumpWakes();
@@ -1424,6 +1439,9 @@ function runDaemon(): void {
       $bash_mutation_kind: null,
       $bash_mutation_targets: null,
       $planctl_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
     });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the snapshot folds without a poll-cycle delay.
@@ -1538,6 +1556,9 @@ function runDaemon(): void {
       $bash_mutation_kind: null,
       $bash_mutation_targets: null,
       $planctl_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
     });
     // Our own INSERT bumps data_version, so the wake worker would re-drain
     // anyway — but pump directly so the Killed fold lands without a poll-
@@ -1628,6 +1649,9 @@ function runDaemon(): void {
       $bash_mutation_kind: null,
       $bash_mutation_targets: null,
       $planctl_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
     });
     wakePending = true;
     pumpWakes();
@@ -1719,6 +1743,9 @@ function runDaemon(): void {
       $bash_mutation_kind: null,
       $bash_mutation_targets: null,
       $planctl_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
     });
     wakePending = true;
     pumpWakes();
@@ -1888,6 +1915,9 @@ function runDaemon(): void {
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $planctl_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
       });
       wakePending = true;
       pumpWakes();

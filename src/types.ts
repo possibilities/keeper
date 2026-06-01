@@ -308,6 +308,42 @@ export interface Event {
    * attribution via the existing `file_attributions` → `git_status` join.
    */
   planctl_files: string | null;
+  /**
+   * Schema v48 / fn-668: terminal-multiplexer backend tag the hook
+   * captured at event time via pure `process.env` reads (no fork, no
+   * fs, no PPID-walk). Currently always `'zellij'` when set — the hook
+   * stamps it iff `process.env.ZELLIJ === '0'` (zellij sets the env
+   * var to `'0'` for every pane it owns). NULL on every event whose
+   * env did not carry the marker AND on every event minted before T3
+   * lands the capture. Generic naming so a future tmux/wezterm backend
+   * can ride the same column without a schema change. Paired with
+   * {@link Event.backend_exec_session_id} and
+   * {@link Event.backend_exec_pane_id} — the three coords stamp
+   * together (the hook reads them in one go and binds NULL if any one
+   * is missing, so the row is never inconsistent).
+   */
+  backend_exec_type: string | null;
+  /**
+   * Schema v48 / fn-668: backend session name the hook captured (the
+   * `ZELLIJ_SESSION_NAME` env value for `backend_exec_type='zellij'`).
+   * NULL when {@link Event.backend_exec_type} is NULL. Folded into
+   * `jobs.backend_exec_session_id` by T3's reducer arm — latest-non-
+   * NULL-wins via the same COALESCE pattern config_dir uses, so a
+   * non-multiplexer event row never clobbers a prior captured session.
+   */
+  backend_exec_session_id: string | null;
+  /**
+   * Schema v48 / fn-668: backend pane id the hook captured (the raw
+   * `ZELLIJ_PANE_ID` env value for `backend_exec_type='zellij'` — e.g.
+   * `'11'`, stored as TEXT so the daemon worker's `list-panes` numeric
+   * `id` can be matched via normalized equality). NULL when
+   * {@link Event.backend_exec_type} is NULL. Folded into
+   * `jobs.backend_exec_pane_id`; the daemon's tab-resolver worker
+   * (T4) joins on `(backend_exec_session_id, backend_exec_pane_id)`
+   * to compute `jobs.backend_exec_tab_{id,name}` via a synthetic
+   * event the reducer folds.
+   */
+  backend_exec_pane_id: string | null;
 }
 
 /**
@@ -503,6 +539,57 @@ export interface Job {
    * on the more honest semantic without code churn.
    */
   git_orphan_count: number;
+  /**
+   * Schema v48 / fn-668: backend tag projected from the latest event
+   * whose hook stamped it (`'zellij'` when set). Latest-non-NULL-wins
+   * via COALESCE in T3's fold so a non-multiplexer event row never
+   * clobbers a prior captured backend. Paired with
+   * {@link Job.backend_exec_session_id} /
+   * {@link Job.backend_exec_pane_id} (T3 fold) and
+   * {@link Job.backend_exec_tab_id} / {@link Job.backend_exec_tab_name}
+   * (T4 worker-fed synthetic-event fold). NULL on every pre-v48 job
+   * and on jobs whose hook never observed the multiplexer env. The
+   * `keeper jobs` CLI + TUI surface these in T5 via the shared
+   * board-render — never computed in the renderer, always read from
+   * the projection.
+   */
+  backend_exec_type: string | null;
+  /**
+   * Schema v48 / fn-668: backend session name projected from the
+   * latest event whose hook captured it (the `ZELLIJ_SESSION_NAME`
+   * for `backend_exec_type='zellij'`). NULL paired with
+   * {@link Job.backend_exec_type}. See that field's doc for the
+   * fold rules and render contract.
+   */
+  backend_exec_session_id: string | null;
+  /**
+   * Schema v48 / fn-668: backend pane id projected from the latest
+   * event whose hook captured it (the raw `ZELLIJ_PANE_ID` TEXT for
+   * `backend_exec_type='zellij'`, e.g. `'11'`). NULL paired with
+   * {@link Job.backend_exec_type}. The daemon's tab-resolver worker
+   * (T4) keys on `(backend_exec_session_id, backend_exec_pane_id)`
+   * to compute `backend_exec_tab_{id,name}`.
+   */
+  backend_exec_pane_id: string | null;
+  /**
+   * Schema v48 / fn-668: backend tab id resolved by the daemon's
+   * tab-resolver worker (T4) for the pane projected above, fed
+   * through a synthetic event the reducer folds. Tombstone
+   * semantics: last-known sticks — a stale `list-panes` (the pane
+   * has since closed) leaves the prior tab id intact rather than
+   * clobbering to NULL. NULL on jobs whose pane has never resolved
+   * yet (the worker has not run, or the pane wasn't in any
+   * `list-panes` output). The CLI + TUI surface this dim segment
+   * gracefully when absent (T5).
+   */
+  backend_exec_tab_id: string | null;
+  /**
+   * Schema v48 / fn-668: backend tab name resolved alongside
+   * {@link Job.backend_exec_tab_id} — both stamp together from the
+   * same `list-panes` row, both retain their last-known value when
+   * a snapshot drops the pane. NULL paired with `backend_exec_tab_id`.
+   */
+  backend_exec_tab_name: string | null;
 }
 
 /**

@@ -53,6 +53,9 @@ function insertEvent(
     bash_mutation_kind?: string | null;
     bash_mutation_targets?: string | null;
     planctl_files?: string | null;
+    backend_exec_type?: string | null;
+    backend_exec_session_id?: string | null;
+    backend_exec_pane_id?: string | null;
   },
 ): number {
   const ts = overrides.ts ?? tsCounter++;
@@ -98,6 +101,12 @@ function insertEvent(
     // the envelope's repo-relative `files` array. NULL on every non-planctl
     // event; planctl-mint tests pass this explicitly via overrides.
     planctl_files: overrides.planctl_files ?? null,
+    // Schema v48 / fn-668: backend-exec coordinates (terminal-multiplexer
+    // session/pane the parent Claude ran under). NULL on every non-zellij
+    // event; backend-exec-mint tests pass these explicitly via overrides.
+    backend_exec_type: overrides.backend_exec_type ?? null,
+    backend_exec_session_id: overrides.backend_exec_session_id ?? null,
+    backend_exec_pane_id: overrides.backend_exec_pane_id ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -106,8 +115,9 @@ function insertEvent(
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
-       bash_mutation_kind, bash_mutation_targets, planctl_files
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       bash_mutation_kind, bash_mutation_targets, planctl_files,
+       backend_exec_type, backend_exec_session_id, backend_exec_pane_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -138,6 +148,9 @@ function insertEvent(
       row.bash_mutation_kind,
       row.bash_mutation_targets,
       row.planctl_files,
+      row.backend_exec_type,
+      row.backend_exec_session_id,
+      row.backend_exec_pane_id,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {

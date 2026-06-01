@@ -620,6 +620,13 @@ async function main(): Promise<void> {
     $bash_mutation_kind: bashMutationKind,
     $bash_mutation_targets: bashMutationTargets,
     $planctl_files: planctlFiles,
+    // Schema v48 / fn-668: backend-exec coordinates land NULL until T3 wires
+    // the pure-env capture (`ZELLIJ`/`ZELLIJ_SESSION_NAME`/`ZELLIJ_PANE_ID`
+    // reads). The bindings exist now so the prepared statement compiles
+    // against the v48 events column set; T3 just swaps in the real values.
+    $backend_exec_type: null,
+    $backend_exec_session_id: null,
+    $backend_exec_pane_id: null,
   };
 
   // Dead-letter on FINAL INSERT failure (fn-643 task .2). The closure

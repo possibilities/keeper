@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 47;
+export const SCHEMA_VERSION = 48;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -381,7 +381,10 @@ CREATE TABLE IF NOT EXISTS events (
     planctl_queue_jump INTEGER,
     bash_mutation_kind TEXT,
     bash_mutation_targets TEXT,
-    planctl_files TEXT
+    planctl_files TEXT,
+    backend_exec_type TEXT,
+    backend_exec_session_id TEXT,
+    backend_exec_pane_id TEXT
 )
 `;
 
@@ -635,7 +638,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     git_unattributed_to_live_count INTEGER NOT NULL DEFAULT 0,
     git_orphan_count INTEGER NOT NULL DEFAULT 0,
     profile_name TEXT,
-    name_history TEXT NOT NULL DEFAULT '[]'
+    name_history TEXT NOT NULL DEFAULT '[]',
+    backend_exec_type TEXT,
+    backend_exec_session_id TEXT,
+    backend_exec_pane_id TEXT,
+    backend_exec_tab_id TEXT,
+    backend_exec_tab_name TEXT
 )
 `;
 
@@ -4673,6 +4681,41 @@ function migrate(db: Database): void {
     // Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset adds
     // 47 in the same change — test/schema-version.test.ts enforces).
 
+    // v47→v48: fn-668 — backend-exec coordinates on jobs. Three nullable
+    // TEXT columns on `events` (`backend_exec_{type,session_id,pane_id}`)
+    // carry the hook's pure-env capture of the terminal-multiplexer
+    // coordinates the parent Claude session ran under (the
+    // `ZELLIJ`/`ZELLIJ_SESSION_NAME`/`ZELLIJ_PANE_ID` env reads — added in
+    // T3, NULL on every row until then). Five nullable TEXT columns on
+    // `jobs` (`backend_exec_{type,session_id,pane_id,tab_id,tab_name}`)
+    // project those three plus the daemon worker's per-pane tab
+    // resolution (`backend_exec_tab_{id,name}` — added in T4 via
+    // synthetic events the reducer folds). Pre-feature events / jobs read
+    // NULL after the upgrade — no backfill, no surface change in this
+    // task; just the contract end-to-end so T3 and T4 land additively.
+    // Generic `backend_exec_*` naming lets a future tmux/wezterm backend
+    // slot in without a schema change.
+    //
+    // Lockstep ALTER vs CREATE: the column literals here byte-match the
+    // CREATE_EVENTS / CREATE_JOBS literals above so a fresh v48 DB and
+    // an upgraded v47-shaped DB produce byte-identical PRAGMA table_info
+    // rows. Mirrors the v21→v22 config_dir block. addColumnIfMissing is
+    // idempotent on column presence so a re-open after upgrade is a no-op.
+    //
+    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds
+    // 48 in the same change — whitelist-only (keeper-py reads neither
+    // events.backend_exec_* nor jobs.backend_exec_*), but the bump is
+    // required so jobctl commit-work on this host doesn't fail-loud
+    // (test/schema-version.test.ts enforces).
+    addColumnIfMissing(db, "events", "backend_exec_type", "TEXT");
+    addColumnIfMissing(db, "events", "backend_exec_session_id", "TEXT");
+    addColumnIfMissing(db, "events", "backend_exec_pane_id", "TEXT");
+    addColumnIfMissing(db, "jobs", "backend_exec_type", "TEXT");
+    addColumnIfMissing(db, "jobs", "backend_exec_session_id", "TEXT");
+    addColumnIfMissing(db, "jobs", "backend_exec_pane_id", "TEXT");
+    addColumnIfMissing(db, "jobs", "backend_exec_tab_id", "TEXT");
+    addColumnIfMissing(db, "jobs", "backend_exec_tab_name", "TEXT");
+
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(String(SCHEMA_VERSION));
@@ -4721,14 +4764,16 @@ function prepareStmts(db: Database): Stmts {
         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
         planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
         planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
-        bash_mutation_kind, bash_mutation_targets, planctl_files
+        bash_mutation_kind, bash_mutation_targets, planctl_files,
+        backend_exec_type, backend_exec_session_id, backend_exec_pane_id
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
         $subagent_agent_id, $spawn_name, $start_time, $slash_command, $skill_name,
         $planctl_op, $planctl_target, $planctl_epic_id, $planctl_task_id,
         $planctl_subject_present, $tool_use_id, $config_dir, $planctl_queue_jump,
-        $bash_mutation_kind, $bash_mutation_targets, $planctl_files
+        $bash_mutation_kind, $bash_mutation_targets, $planctl_files,
+        $backend_exec_type, $backend_exec_session_id, $backend_exec_pane_id
       )
     `),
     selectWorldRev: db.prepare(

@@ -127,10 +127,10 @@ from pathlib import Path
 # are first-class columns in ``CREATE_JOBS`` (no version gate), ``jobs.plan_verb``
 # landed in v10 (well below v31), and ``epics.tasks`` / ``epics.jobs`` are
 # JSON-TEXT cells whose embedded shapes (``EmbeddedJob.created_at`` etc.)
-# are stable across the whole v31-v47 window — so the new readers add no
+# are stable across the whole v31-v48 window — so the new readers add no
 # tighter version dependency than the existing scaffold.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
-    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}
+    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48}
 )
 
 
