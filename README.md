@@ -1079,13 +1079,15 @@ fork, no fs, no PPID-walk; absent env ⇒ NULL coords, never bogus
 onto `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins
 via `COALESCE`, so a re-fold from cursor=0 reproduces byte-identical
 rows. A daemon-side tab-resolver Worker thread (the ninth producer
-worker; see [Architecture](#architecture)) wakes on
-`PRAGMA data_version`, dedups distinct `(session, pane)` across the
-live jobs, spawns one `zellij action list-panes -a -j` per distinct
-session, matches the captured pane id against each pane's numeric `id`
-(normalized equality), and posts a `BackendExecSnapshot` synthetic
-event the reducer folds into `jobs.backend_exec_tab_{id,name}` (tab
-tombstone = last-known sticks; env absent ⇒ NULL coords). Generic
+worker; see [Architecture](#architecture)) ticks every 5 seconds
+(interval-driven rather than `data_version`-triggered — tab renames
+produce no DB write, so a `data_version` gate would miss them), dedups
+distinct `(session, pane)` across the live jobs, spawns one
+`zellij action list-panes -a -j` per distinct session, matches the
+captured pane id against each pane's numeric `id` (normalized equality),
+and posts a `BackendExecSnapshot` synthetic event the reducer folds into
+`jobs.backend_exec_tab_{id,name}` (tab tombstone = last-known sticks;
+env absent ⇒ NULL coords). Generic
 `backend_exec_*` naming lets a future tmux/wezterm backend slot in
 without a schema change — only the hook's env-name table changes. The
 five `jobs.backend_exec_*` columns are display-only on
@@ -1304,27 +1306,29 @@ and closes the tab via `ExecBackend.closeByName`) a dispatch whose role is no
 longer needed; default-off preserves today's leave-open behavior.
 
 A **ninth** Worker thread is the backend-exec tab resolver (schema v48,
-fn-668): a level-triggered producer that wakes on `PRAGMA data_version`,
-SELECTs the live jobs carrying both a `backend_exec_session_id` and a
-`backend_exec_pane_id` off its own read-only connection, dedups by
-distinct `(session, pane)`, and for each distinct live `backend_exec_session_id`
-spawns one `zellij action list-panes -a -j`. The resolver matches the
-captured `backend_exec_pane_id` against each pane's numeric `id` field
-(normalized equality), reads the matched pane's `tab_id` + `tab_name`,
-and posts one `{kind:"backend-exec-snapshot", job_id, tab_id, tab_name}`
-per resolved row to main. Main — again the sole writer — lifts the
-message into a synthetic `BackendExecSnapshot` event whose reducer fold
-arm UPDATEs `jobs.backend_exec_tab_{id,name}` (tab tombstone = last-known
-sticks; a session that disappears from `list-panes` does NOT clear the
-column). It is the fourth producer-worker instance — read-only /
-write-free, feeding the log only via main — and follows the same
-worker-contract discipline: stdout+stderr drained concurrently on the
-`Bun.spawn`, explicit two-phase TERM→KILL timeout, non-zero exit treated
-as expected "no such session" and log-and-skip, per-session in-flight
-lock + per-tick `isRunning` guard so a slow `list-panes` cannot stack.
-Like the other producers it does NOT write the DB directly; the fold
-keeps re-fold determinism on the synthetic-event side (no fold-time
-spawn, no env reads inside `applyEvent`).
+fn-668): an interval-driven producer that ticks every 5 seconds (rather
+than waking on `PRAGMA data_version` — tab renames produce no DB write,
+so a `data_version` gate would miss them), SELECTs the live jobs carrying
+both a `backend_exec_session_id` and a `backend_exec_pane_id` off its
+own read-only connection, dedups by distinct `(session, pane)`, and for
+each distinct live `backend_exec_session_id` spawns one
+`zellij action list-panes -a -j`. The resolver matches the captured
+`backend_exec_pane_id` against each pane's numeric `id` field (normalized
+equality), reads the matched pane's `tab_id` + `tab_name`, and posts one
+`{kind:"backend-exec-snapshot", job_id, tab_id, tab_name}` per resolved
+row to main. Main — again the sole writer — lifts the message into a
+synthetic `BackendExecSnapshot` event whose reducer fold arm UPDATEs
+`jobs.backend_exec_tab_{id,name}` (tab tombstone = last-known sticks; a
+session that disappears from `list-panes` does NOT clear the column). It
+is the fourth producer-worker instance — read-only / write-free, feeding
+the log only via main — and follows the same worker-contract discipline:
+stdout+stderr drained concurrently on the `Bun.spawn`, non-zero exit
+treated as expected "no such session" and log-and-skip, per-session
+in-flight lock + per-tick `isRunning` guard so a slow `list-panes` cannot
+stack. Shutdown clears the tick interval and `process.exit(0)`s. Like the
+other producers it does NOT write the DB directly; the fold keeps re-fold
+determinism on the synthetic-event side (no fold-time spawn, no env reads
+inside `applyEvent`).
 
 The nine workers are fully independent; main supervises all nine lifecycles
 but routes none of their traffic, and any worker's `error` event escalates
