@@ -83,5 +83,5 @@ discharge yet — that is task `.2`).
 - [ ] Discharge behavior is UNCHANGED in this task; all existing tests pass.
 
 ## Done summary
-
+Plumbed worktree_oid (batched filter-correct git hash-object), index_oid, worktree_mode through GitSnapshot; switched Commit events to git diff-tree -r for per-file blob_oid; added nullable file_attributions.worktree_oid column at schema v44 with matching keeper-py whitelist entry. Discharge behavior unchanged; task .2 will land the content-aware gate.
 ## Evidence

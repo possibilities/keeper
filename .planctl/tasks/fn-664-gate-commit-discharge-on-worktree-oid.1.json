@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "freeze worktree and committed blob oids",
-  "updated_at": "2026-05-31T23:38:16.221855Z"
+  "updated_at": "2026-06-01T03:00:40.546844Z",
+  "worker_done_at": "2026-06-01T03:00:40.546844Z"
 }
