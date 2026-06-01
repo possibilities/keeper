@@ -270,6 +270,23 @@ firing correctly — check them before concluding it is broken:
   itself, dirtied by your own edits or a not-yet-committed `.planctl` approval
   chore. Confirm: `git status` + `SELECT project_dir, dirty_count FROM
   git_status`.
+- **Won't release the mutex while the worker session is still alive (fn-671).**
+  `computeReadiness` predicate 1 (`src/readiness.ts`) only collapses a task to
+  `{tag:"completed"}` when `worker_phase==="done"` AND `approval==="approved"`
+  AND no embedded job is `working` AND no running sub-agent is bound to any
+  embedded job — administrative completion (planctl `done` + human approval)
+  is orthogonal to process liveness, and they race. Until the Claude session
+  Stop/SessionEnd lands AND every sub-agent finishes, the task stays at
+  `running:job-running` / `running:sub-agent-running` / `running:sub-agent-stale`
+  and occupies both the per-epic AND per-root mutex via `isLiveWorkOccupant` /
+  `isRootOccupant` — so a dependent / sibling ready task on the same root is
+  held at `single-task-per-root` until the prior worker truly winds down.
+  Crash-robust on the main-job axis via the reducer's `Killed` arm
+  (exit-watcher + boot `seedKilledSweep` unilaterally fire the exit signal on
+  OS-level death). A sub-agent that dies silently without emitting
+  SubagentStop has no `Killed`-equivalent backstop and surfaces as
+  `sub-agent-stale` (still mutex-occupying — correctness over throughput);
+  clear by autopilot pause + manual replay rather than auto-reaper.
 - **Level-triggered on `PRAGMA data_version`.** The worker reconciles only on a
   DB write (a hook event, a fold). `set_autopilot_paused {paused:false}` (play)
   additionally kicks one cycle, and one cycle runs at boot — but absent those, a

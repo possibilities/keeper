@@ -213,8 +213,17 @@ function runWithNow(
 // Predicate-ordering matrix
 // ---------------------------------------------------------------------------
 
-test("predicate 1 (terminal-completed) wins over 5 (own-progress-main)", () => {
-  // A completed task whose embedded job hasn't transitioned to `stopped` yet.
+test("predicate 5 (own-progress-main) wins over 1 (terminal-completed): done+approved with working job → job-running (fn-671)", () => {
+  // fn-671: the per-task predicate 1 now guards on worker liveness — a
+  // `done+approved` task whose embedded session is still `working`
+  // (planctl stamped `worker_done_at` and the human approved before the
+  // Claude Stop/SessionEnd landed) must NOT collapse to `completed`,
+  // because that would free both the per-epic and per-root mutex while
+  // the worker is still alive and let the autopilot dispatch a sibling
+  // into the same root. The verdict falls through to predicate 5
+  // (`job-running`), which IS a mutex occupant via `isLiveWorkOccupant`.
+  // Pre-fn-671 this test asserted the OLD inversion ("predicate 1 wins
+  // over 5") — the autopilot incident that motivated the rename.
   const task = makeTask({
     worker_phase: "done",
     approval: "approved",
@@ -222,7 +231,139 @@ test("predicate 1 (terminal-completed) wins over 5 (own-progress-main)", () => {
   });
   const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
-  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "job-running" }),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// fn-671: per-task worker-liveness guard on predicate 1. The five tests
+// below mirror the close-row race tests further down (where the
+// completed-but-still-alive race used to be caught) — but now assert on
+// `perTask` directly, because the per-task predicate is the primary lock
+// path after fn-671. The close-row fan-in remains as a backstop but is
+// normally unreachable.
+// ---------------------------------------------------------------------------
+
+test("fn-671: done+approved task with working embedded job → running:job-running, occupies per-root mutex AND blocks sibling on same root", () => {
+  // The exact incident: T1 is administratively complete (planctl done +
+  // human approved) but the Claude session hasn't Stopped yet. T2 lives
+  // on the same project root and would otherwise be `ready`. The
+  // per-task guard holds T1 at `running:job-running`, which is a root
+  // occupant via `isRootOccupant`, so the per-root mutex demotes T2 to
+  // `single-task-per-root` — preventing the autopilot from dispatching
+  // T2 while T1's worker is still alive.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
+  });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    // T2 is fully ready in isolation (no deps, validated epic).
+  });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t1.task_id)).toEqual(
+    running({ kind: "job-running" }),
+  );
+  // T2 is demoted by the per-EPIC mutex (T1 occupies the slot). The
+  // per-epic check runs first; per-root would also have demoted it.
+  expect(snap.perTask.get(t2.task_id)).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("fn-671: done+approved task with stopped job + running sub-agent → running:sub-agent-running", () => {
+  // Main job has Stopped but a sub-agent under that worker session is
+  // still running. The per-task guard's second clause (sub-agent
+  // liveness via `anyEmbeddedJobHasRunningSubagent`) holds the task at
+  // `running:sub-agent-running` — same mutex implications as above.
+  // makeEmbeddedJob and makeSub both default `job_id: "session-1"`, so
+  // an unkeyed pair already lines up for `subRunningByJobId`.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subs = [makeSub({ status: "running" })];
+  const snap = run([epic], new Map(), subs);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "sub-agent-running" }),
+  );
+});
+
+test("fn-671: done+approved task with stale running sub-agent → running:sub-agent-stale (asserted via runWithNow)", () => {
+  // The sub-agent died silently — still in `running` status, ts beyond
+  // SUBAGENT_STALENESS_SEC=120s. The verdict surfaces `sub-agent-stale`
+  // for human visibility but STILL occupies the per-root mutex (no
+  // auto-reaper; correctness over throughput, cleared by autopilot
+  // pause + manual replay).
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subs = [makeSub({ status: "running", ts: 1000 })];
+  // now=1200: age=200, threshold=120 → stale.
+  const snap = runWithNow([epic], subs, 1200);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "sub-agent-stale" }),
+  );
+});
+
+test("fn-671: done+approved task with idle session → completed (clean collapse, mutex frees, sibling dispatches)", () => {
+  // The clean-collapse path: every liveness clause is false. T1
+  // genuinely completes, its mutex slot frees, and a ready sibling T2
+  // on the same root may dispatch.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+  });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t1.task_id)).toEqual({ tag: "completed" });
+  // T2 wins the slot — completed T1 doesn't occupy.
+  expect(snap.perTask.get(t2.task_id)).toEqual({ tag: "ready" });
+});
+
+test("fn-671 regression: T1 done+approved with session-still-working; T2 depends_on T1 → T2 NOT ready", () => {
+  // The exact incident reproduced. Pre-fn-671: T1 collapsed to
+  // `completed` while its session was still alive; T2's dep was
+  // satisfied; T2 read `ready`; autopilot dispatched T2 into the same
+  // root before T1's worker had wound down. Post-fn-671: T1 stays at
+  // `running:job-running` (the per-task guard), T2's dep on T1 is NOT
+  // satisfied (predicate 8 requires `tag === "completed"`), T2 stays
+  // blocked on `dep-on-task`.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
+  });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    depends_on: ["fn-1-foo.1"],
+  });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t1.task_id)).toEqual(
+    running({ kind: "job-running" }),
+  );
+  expect(snap.perTask.get(t2.task_id)).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
+  );
 });
 
 test("predicate 1 wins over 2 (epic-not-validated)", () => {
@@ -2242,11 +2383,27 @@ test("close row: any non-completed task → dep-on-task with FIRST non-completed
 // Close-row predicate 5/6 fan-out across task-level embedded jobs
 // ---------------------------------------------------------------------------
 
-test("close row: task-level worker still working → job-running (even with task completed)", () => {
-  // Task verdict goes to `completed` via predicate 1 (worker_phase done +
-  // approval approved), but its embedded work-verb job is still `working`
-  // because Stop/SessionEnd hasn't fired yet. The close row must block on
-  // `job-running`, not flip to `ready`.
+// fn-671: the four tests below previously documented the close-row fan-in's
+// completed-task scan as the load-bearing anti-collapse path. After fn-671
+// the per-task predicate 1 catches the same race FIRST (the task verdict
+// reads `running:*`, not `completed`), so the close-row fan-in is normally
+// unreachable — the close row's predicate 10 (dep-on-task) blocks on the
+// now-non-completed task instead. Code at `src/readiness.ts:790-799` and
+// `closeRowHasRunningSubagent` is retained as a re-fold-determinism
+// backstop (see their JSDoc) but the assertion shape moves from
+// "close row stays running" to "task stays running, close row blocks on
+// dep-on-task". These tests therefore now verify the post-fn-671 contract
+// at both layers.
+
+test("fn-671: task-level worker still working — task stays at job-running, close row blocks on dep-on-task", () => {
+  // Pre-fn-671: task collapsed to `completed`, close-row fan-in fired to
+  // surface `job-running` on the close row. Post-fn-671: per-task
+  // predicate 1's liveness guard keeps the task at `running:job-running`,
+  // so the close row's predicate 10 finds a non-completed task and
+  // blocks on `dep-on-task`. Net effect on the autopilot: identical
+  // (both rows occupy the per-root mutex via `isLiveWorkOccupant`
+  // / dep-on-task is a blocked verdict; the per-task running row is the
+  // primary lock).
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -2255,15 +2412,16 @@ test("close row: task-level worker still working → job-running (even with task
   });
   const epic = makeEpic({ tasks: [t] });
   const snap = run([epic]);
-  expect(snap.perTask.get(t.task_id)).toEqual({ tag: "completed" });
+  expect(snap.perTask.get(t.task_id)).toEqual(running({ kind: "job-running" }));
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
-    running({ kind: "job-running" }),
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
   );
 });
 
-test("close row: task-level worker has running sub-agent → sub-agent-running", () => {
-  // Task completed, worker job stopped, but a sub-agent invocation under
-  // that worker session id is still `running`. Close row must block.
+test("fn-671: task-level worker has running sub-agent — task stays at sub-agent-running, close row blocks on dep-on-task", () => {
+  // Sub-agent variant of the above. Per-task predicate 1's second
+  // liveness clause holds the task at `running:sub-agent-running`; close
+  // row falls through to predicate 10's `dep-on-task` block.
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -2273,18 +2431,17 @@ test("close row: task-level worker has running sub-agent → sub-agent-running",
   const epic = makeEpic({ tasks: [t] });
   const sub = makeSub({ job_id: "worker-1", status: "running" });
   const snap = run([epic], new Map(), [sub]);
-  expect(snap.perTask.get(t.task_id)).toEqual({ tag: "completed" });
-  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+  expect(snap.perTask.get(t.task_id)).toEqual(
     running({ kind: "sub-agent-running" }),
+  );
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
   );
 });
 
-// fn-638.4: close-row variant of the per-task staleness split. The
-// close row pools every contributing scope (epic-level close jobs + each
-// task's work jobs) — only when EVERY surviving running sub-agent
-// across every scope is past the threshold does the close row flip to
-// `sub-agent-stale`.
-test("close row: task-level running sub-agent past staleness window → sub-agent-stale", () => {
+// fn-638.4 / fn-671: staleness split surfaces at the per-task verdict.
+// The close row is blocked on the (non-completed) task via predicate 10.
+test("fn-671: task-level running sub-agent past staleness window — task is sub-agent-stale, close row blocks on dep-on-task", () => {
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -2295,17 +2452,20 @@ test("close row: task-level running sub-agent past staleness window → sub-agen
   const sub = makeSub({ job_id: "worker-1", status: "running", ts: 1000 });
   // `now=1200`: age=200, threshold=120 → stale.
   const snap = runWithNow([epic], [sub], 1200);
-  expect(snap.perTask.get(t.task_id)).toEqual({ tag: "completed" });
-  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+  expect(snap.perTask.get(t.task_id)).toEqual(
     running({ kind: "sub-agent-stale" }),
+  );
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
   );
 });
 
-test("close row: a single fresh sub-agent anywhere keeps the verdict at sub-agent-running", () => {
-  // Two tasks; task-1's worker has a stale sub-agent, task-2's has a
-  // fresh one. The close row pools both scopes — one fresh sub-agent
-  // anywhere keeps the verdict at `sub-agent-running` (the close row
-  // genuinely is blocked on live work somewhere).
+test("fn-671: a fresh sub-agent on one task keeps that task at sub-agent-running, close row blocks on dep-on-task with FIRST non-completed id", () => {
+  // Two tasks, both done+approved with stopped main jobs but running
+  // sub-agents (one stale, one fresh). Per-task: t1 has only a stale
+  // sub-agent → `sub-agent-stale`; t2 has a fresh sub-agent →
+  // `sub-agent-running`. Close row picks up the FIRST non-completed task
+  // (t1) for the dep-on-task upstream id (predicate 10 traversal order).
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -2314,6 +2474,7 @@ test("close row: a single fresh sub-agent anywhere keeps the verdict at sub-agen
   });
   const t2 = makeTask({
     task_id: "fn-1-foo.2",
+    task_number: 2,
     worker_phase: "done",
     approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-2", state: "stopped" })],
@@ -2324,8 +2485,14 @@ test("close row: a single fresh sub-agent anywhere keeps the verdict at sub-agen
     makeSub({ job_id: "worker-2", status: "running", ts: 1150 }), // fresh
   ];
   const snap = runWithNow([epic], subs, 1200);
-  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+  expect(snap.perTask.get(t1.task_id)).toEqual(
+    running({ kind: "sub-agent-stale" }),
+  );
+  expect(snap.perTask.get(t2.task_id)).toEqual(
     running({ kind: "sub-agent-running" }),
+  );
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
   );
 });
 
@@ -2390,10 +2557,19 @@ test("close row: in-flight task with running sub-agent → dep-on-task, NOT sub-
   );
 });
 
-test("close row: completed-racing worker still wins over an incomplete sibling", () => {
-  // Mirrors the reported epic's shape: task-1 completed (workers stopped),
-  // task-2 in flight. The completed task's worker has stopped, so the close
-  // row is NOT running — it blocks on the incomplete task-2 via predicate 10.
+test("fn-671: completed-racing worker holds per-task running, close row blocks on dep-on-task upstream first non-completed", () => {
+  // Mirrors the reported epic's shape: task-1 done+approved, task-2 in
+  // flight. Two scenarios:
+  //
+  // (a) task-1 worker stopped (clean collapse): t1 = `completed`, close row
+  //     blocks on t2 via predicate 10 → upstream `fn-1-foo.2`.
+  // (b) task-1 worker still working (racing): per-fn-671 the per-task
+  //     guard holds t1 at `running:job-running`. Close row's predicate 10
+  //     finds the FIRST non-completed task (t1, traversal order) → upstream
+  //     `fn-1-foo.1`. Pre-fn-671 the close-row fan-in would have surfaced
+  //     `running:job-running` on the close row instead; the autopilot
+  //     consequence is unchanged (t1's per-task running verdict now claims
+  //     the root via pass-1).
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -2409,13 +2585,12 @@ test("close row: completed-racing worker still wins over an incomplete sibling",
   });
   const epic = makeEpic({ tasks: [t1, t2] });
   const snap = run([epic]);
+  expect(snap.perTask.get(t1.task_id)).toEqual({ tag: "completed" });
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
     blocked({ kind: "dep-on-task", upstream: "fn-1-foo.2" }),
   );
 
-  // But if task-1 is still racing (completed yet its worker hasn't Stopped),
-  // the completed-scoped fan-in DOES fire and the close row stays running —
-  // predicate 5 outranks the dep-on-task block from task-2.
+  // (b) Racing case — t1's worker still alive.
   const t1Racing = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -2424,7 +2599,10 @@ test("close row: completed-racing worker still wins over an incomplete sibling",
   });
   const epicRacing = makeEpic({ tasks: [t1Racing, t2] });
   const snapRacing = run([epicRacing]);
-  expect(snapRacing.perCloseRow.get(epicRacing.epic_id)).toEqual(
+  expect(snapRacing.perTask.get(t1Racing.task_id)).toEqual(
     running({ kind: "job-running" }),
+  );
+  expect(snapRacing.perCloseRow.get(epicRacing.epic_id)).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
   );
 });
