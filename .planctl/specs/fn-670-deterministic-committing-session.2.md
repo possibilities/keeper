@@ -62,5 +62,5 @@ test/reducer.test.ts: a Commit event with committer_session_id + task_ids stamps
 - [ ] CLAUDE.md + README.md updated (3 trailer sources + v49 link).
 
 ## Done summary
-
+foldCommit's per-session arm now stamps  on the embedded job element whose job_id matches the committer under each Commit payload task_id; buildEmbeddedJob preserves the field across syncJobIntoEpic re-syncs via OLD-element carve-out. Schema bumped to v49 (whitelist-only — link rides FREE in the JSON-TEXT tasks cell); keeper/api.py whitelist + CLAUDE.md/README docs updated in same change. 7 new T2 reducer tests + v48→v49 migration test green; 540/540 across the epic-required suites.
 ## Evidence
