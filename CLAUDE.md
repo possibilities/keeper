@@ -168,3 +168,28 @@ Every keeper Worker thread follows the same durable contract:
   file, watcher subscription, re-scan timer, kqueue/pidfd fd) MUST release it in
   its own shutdown handler — `terminate()` alone leaks it.
 - **No in-process self-heal** — a worker's `error` event escalates to `fatalExit`.
+
+## Autopilot dispatch gates
+
+Operational behavior of the server-side reconciler (`src/autopilot-worker.ts`).
+An unpaused autopilot that "does nothing" is almost always one of these gates
+firing correctly — check them before concluding it is broken:
+
+- **Won't dispatch into a dirty repo.** `computeReadiness` predicate 6.5
+  (`src/readiness.ts`, block reason `git-uncommitted`) suppresses every dispatch
+  whose target repo has `git_status.dirty_count > 0` — so a spawned worker can
+  never commit unrelated uncommitted changes. The target is usually keeper
+  itself, dirtied by your own edits or a not-yet-committed `.planctl` approval
+  chore. Confirm: `git status` + `SELECT project_dir, dirty_count FROM
+  git_status`.
+- **Level-triggered on `PRAGMA data_version`.** The worker reconciles only on a
+  DB write (a hook event, a fold). `set_autopilot_paused {paused:false}` (play)
+  additionally kicks one cycle, and one cycle runs at boot — but absent those, a
+  quiescent DB leaves ready work undispatched until the next incidental write.
+- **The `[paused]` banner in `keeper autopilot` is NOT authoritative.** There is
+  no `get_autopilot_paused` query; the viewer always opens showing `[paused]`
+  regardless of the worker's real flag. To confirm the real state, watch for a
+  dispatch (a new live `jobs` row / `dispatch_failures`), not the banner.
+- **Boots paused (safety default), one-at-a-time stagger.** The flag is in-memory
+  only and never persisted; `confirmRunning` serializes launches, so dispatch is
+  paced, not a burst.
