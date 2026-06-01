@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "render coords on jobs surface and TUI",
-  "updated_at": "2026-06-01T14:24:23.117818Z"
+  "updated_at": "2026-06-01T18:21:00.495503Z",
+  "worker_done_at": "2026-06-01T18:21:00.495503Z"
 }

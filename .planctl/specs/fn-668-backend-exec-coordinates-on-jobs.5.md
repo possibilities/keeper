@@ -32,5 +32,5 @@ Snapshot/format test for `formatJobLine` with and without backend coords (presen
 - [ ] Format test green; no sort/filter behavior added.
 
 ## Done summary
-
+Surface backend-exec coords on keeper jobs CLI + TUI through the shared renderer. Five backend_exec_* columns added to JOBS_DESCRIPTOR as display-only; new backendCoordsSeg helper composes the present-only ' · <type> <session>/<tab> p<pane>' trailing segment with graceful fallbacks; projectJobRow appends it inline so both CLI and TUI light up through the shared renderJobsBody path. README updated (sparse signals + ninth-worker inventory + 'As of schema v48' changelog + keeper jobs bullet). Snapshot tests cover present, absent, tab-fallback, tab-missing, pane-missing, type-only, and awaiting-continuation cases.
 ## Evidence
