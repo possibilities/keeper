@@ -101,7 +101,11 @@ afterEach(() => {
  * Computed from the LIVE per-test `tmpDir` (re-created each `beforeEach`),
  * never frozen at module scope.
  */
-function sandboxedBaseEnv(): Record<string, string> {
+function sandboxedBaseEnv(): Record<string, string> & {
+  KEEPER_DB: string;
+  KEEPER_DEAD_LETTER_DIR: string;
+  KEEPER_DROP_LOG: string;
+} {
   return {
     ...(process.env as Record<string, string>),
     KEEPER_DB: dbPath,
@@ -1179,9 +1183,9 @@ async function fireViaLauncherWithEnv(
   // defaults. fn-657: the drop-log leak class lived precisely in the gap a
   // caller could open by clearing a state key on an inherited base.
   const sandbox = sandboxedBaseEnv();
-  env.KEEPER_DB = sandbox.KEEPER_DB!;
-  env.KEEPER_DEAD_LETTER_DIR = sandbox.KEEPER_DEAD_LETTER_DIR!;
-  env.KEEPER_DROP_LOG = sandbox.KEEPER_DROP_LOG!;
+  env.KEEPER_DB = sandbox.KEEPER_DB;
+  env.KEEPER_DEAD_LETTER_DIR = sandbox.KEEPER_DEAD_LETTER_DIR;
+  env.KEEPER_DROP_LOG = sandbox.KEEPER_DROP_LOG;
   const proc = Bun.spawn(args, {
     cwd: ROOT,
     env,
@@ -1365,7 +1369,7 @@ async function fireViaLauncherWithDeadLetter(
   // (the only state keys callers manipulate are KEEPER_DB and the dead-letter
   // dir). Re-apply the sandbox value after the overlay loop so a future
   // caller can't accidentally re-leak it. fn-657.
-  env.KEEPER_DROP_LOG = sandboxedBaseEnv().KEEPER_DROP_LOG!;
+  env.KEEPER_DROP_LOG = sandboxedBaseEnv().KEEPER_DROP_LOG;
   const proc = Bun.spawn(args, {
     cwd: ROOT,
     env,
@@ -1407,23 +1411,28 @@ test("a forced INSERT failure writes a per-pid NDJSON dead-letter and exits 0", 
   expect(existsSync(dlDir)).toBe(true);
   const files = readdirSync(dlDir).filter((f) => f.endsWith(".ndjson"));
   expect(files.length).toBe(1);
+  const [fileName] = files;
+  if (fileName === undefined) throw new Error("expected one dead-letter file");
   // Filename is <pid>.ndjson.
-  expect(/^\d+\.ndjson$/.test(files[0]!)).toBe(true);
+  expect(/^\d+\.ndjson$/.test(fileName)).toBe(true);
 
-  const lines = readFileSync(join(dlDir, files[0]!), "utf-8")
+  const lines = readFileSync(join(dlDir, fileName), "utf-8")
     .split("\n")
     .filter((s) => s.length > 0);
   expect(lines.length).toBe(1);
-  const record = parseDeadLetterLine(lines[0]!);
+  const [line] = lines;
+  if (line === undefined) throw new Error("expected one dead-letter line");
+  const record = parseDeadLetterLine(line);
   expect(record).not.toBeNull();
-  expect(record!.dl_id).toMatch(
+  if (record === null) throw new Error("expected a parsed dead-letter record");
+  expect(record.dl_id).toMatch(
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
   );
-  expect(record!.session_id).toBe("sess-deadletter-ss");
-  expect(record!.hook_event).toBe("SessionStart");
-  expect(typeof record!.ts).toBe("number");
-  expect(typeof record!.dl_written_at).toBe("number");
-  expect(typeof record!.pid).toBe("number");
+  expect(record.session_id).toBe("sess-deadletter-ss");
+  expect(record.hook_event).toBe("SessionStart");
+  expect(typeof record.ts).toBe("number");
+  expect(typeof record.dl_written_at).toBe("number");
+  expect(typeof record.pid).toBe("number");
 
   // SessionStart-scraped fields MUST round-trip into the dead-letter
   // record — they're not in stdin and are unrecoverable later. The launcher
@@ -1431,16 +1440,16 @@ test("a forced INSERT failure writes a per-pid NDJSON dead-letter and exits 0", 
   // On darwin the ps probe captures both spawn_name AND start_time
   // simultaneously; on linux they're independent /proc reads. Assert
   // structurally regardless of platform.
-  expect(record!.bindings.session_id).toBe("sess-deadletter-ss");
-  expect(record!.bindings.hook_event).toBe("SessionStart");
-  expect(record!.bindings.event_type).toBe("session_start");
-  expect("spawn_name" in record!.bindings).toBe(true);
-  expect("start_time" in record!.bindings).toBe(true);
-  expect("config_dir" in record!.bindings).toBe(true);
+  expect(record.bindings.session_id).toBe("sess-deadletter-ss");
+  expect(record.bindings.hook_event).toBe("SessionStart");
+  expect(record.bindings.event_type).toBe("session_start");
+  expect("spawn_name" in record.bindings).toBe(true);
+  expect("start_time" in record.bindings).toBe(true);
+  expect("config_dir" in record.bindings).toBe(true);
   if (process.platform === "darwin" || process.platform === "linux") {
     // The launcher (the hook's parent) DOES carry `--name my-session` on its
     // argv, so the spawn_name capture lands.
-    expect(record!.bindings.spawn_name).toBe("my-session");
+    expect(record.bindings.spawn_name).toBe("my-session");
   }
 });
 
@@ -1462,7 +1471,9 @@ test("dead-letter file is mode 0o600 (private — bindings can carry secrets)", 
 
   const files = readdirSync(dlDir).filter((f) => f.endsWith(".ndjson"));
   expect(files.length).toBe(1);
-  const path = join(dlDir, files[0]!);
+  const [fileName] = files;
+  if (fileName === undefined) throw new Error("expected one dead-letter file");
+  const path = join(dlDir, fileName);
   // Stat: file mode masked to permission bits = 0o600 on platforms that
   // honor chmod (everywhere bun runs except Windows, which we don't ship).
   const { statSync } = await import("node:fs");

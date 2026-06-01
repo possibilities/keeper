@@ -42,20 +42,20 @@ test("round-trip: parseDeadLetterLine(serializeDeadLetterRecord(r)) === r", () =
   const line = serializeDeadLetterRecord(BASE);
   const parsed = parseDeadLetterLine(line);
   expect(parsed).not.toBeNull();
-  expect(parsed!.dl_id).toBe(BASE.dl_id);
-  expect(parsed!.session_id).toBe(BASE.session_id);
-  expect(parsed!.hook_event).toBe(BASE.hook_event);
-  expect(parsed!.ts).toBe(BASE.ts);
-  expect(parsed!.dl_written_at).toBe(BASE.dl_written_at);
-  expect(parsed!.pid).toBe(BASE.pid);
-  expect(parsed!.bindings).toEqual(BASE.bindings);
+  expect(parsed?.dl_id).toBe(BASE.dl_id);
+  expect(parsed?.session_id).toBe(BASE.session_id);
+  expect(parsed?.hook_event).toBe(BASE.hook_event);
+  expect(parsed?.ts).toBe(BASE.ts);
+  expect(parsed?.dl_written_at).toBe(BASE.dl_written_at);
+  expect(parsed?.pid).toBe(BASE.pid);
+  expect(parsed?.bindings).toEqual(BASE.bindings);
 });
 
 test("round-trip: pid null is preserved", () => {
   const rec = { ...BASE, pid: null };
   const parsed = parseDeadLetterLine(serializeDeadLetterRecord(rec));
   expect(parsed).not.toBeNull();
-  expect(parsed!.pid).toBeNull();
+  expect(parsed?.pid).toBeNull();
 });
 
 test("round-trip: bindings with all scalar types round-trips cleanly", () => {
@@ -71,7 +71,7 @@ test("round-trip: bindings with all scalar types round-trips cleanly", () => {
   };
   const parsed = parseDeadLetterLine(serializeDeadLetterRecord(rec));
   expect(parsed).not.toBeNull();
-  expect(parsed!.bindings).toEqual(rec.bindings);
+  expect(parsed?.bindings).toEqual(rec.bindings);
 });
 
 test("parseDeadLetterLine: empty string returns null", () => {
@@ -146,8 +146,8 @@ test("parseDeadLetterLine: top-level array returns null", () => {
 });
 
 test("parseDeadLetterLine: tolerates trailing newline (caller may or may not strip it)", () => {
-  const withNewline = JSON.stringify(BASE) + "\n";
+  const withNewline = `${JSON.stringify(BASE)}\n`;
   const parsed = parseDeadLetterLine(withNewline);
   expect(parsed).not.toBeNull();
-  expect(parsed!.dl_id).toBe(BASE.dl_id);
+  expect(parsed?.dl_id).toBe(BASE.dl_id);
 });
