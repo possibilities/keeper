@@ -89,5 +89,5 @@ string from `ZELLIJ_PANE_ID`.
 - [ ] bun test passes for exec-backend, backend-worker, jobs.
 
 ## Done summary
-
+ExecBackend port now carries focusPane + resolveTabForPane as session-agnostic ops alongside launch/closeByName; cli/jobs `v` focuses the selected job's zellij pane via backend.focusPane.
 ## Evidence
