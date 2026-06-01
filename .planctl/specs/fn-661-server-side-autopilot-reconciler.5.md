@@ -46,5 +46,5 @@ dispatch or dedup logic may remain client-side.
 - [ ] autopilot.test.ts rewritten and green; no dispatch/dedup logic remains client-side
 
 ## Done summary
-
+Rewrote cli/autopilot.ts as a thin read-only viewer reusing createViewShell + subscribeReadiness + subscribeCollection(dispatch_failures), plus three one-shot control subcommands (pause/play/retry) that send set_autopilot_paused / retry_dispatch RPCs. Deleted ~2400 lines of dispatch loop, dispatch.log + hydration, settling/suppression gate, isLiveSessionInRoot, surfaceRef/windowId, and the dispatchedKeys/fulfilledKeys/completedKeys tracking sets — no dispatch or dedup logic remains client-side. Test suite rewritten end-to-end to assert the three render sections and well-formed RPC frame shape; scripts/commands.ts re-routed to import buildWorkerCommand from src/autopilot-worker.
 ## Evidence
