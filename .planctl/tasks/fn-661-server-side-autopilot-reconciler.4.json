@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "wire reconciler worker into keeperd and add rpcs",
-  "updated_at": "2026-05-31T22:30:27.558408Z"
+  "updated_at": "2026-06-01T00:51:43.219216Z",
+  "worker_done_at": "2026-06-01T00:51:43.219216Z"
 }

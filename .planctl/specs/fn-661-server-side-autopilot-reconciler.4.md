@@ -61,5 +61,5 @@ projection directly.
 - [ ] emitDispatchFailed mints a DispatchFailed event via main (git-worker mint pattern)
 
 ## Done summary
-
+Spawned the autopilot worker as the 8th supervisor thread after migrate+boot-drain with paused=true workerData and autoclose/zellijSession config threaded through; wired worker→main mint pattern for DispatchFailed and DispatchCleared; added set_autopilot_paused + retry_dispatch async RPCs bridging server-worker→main with id-shape-only validation (no param injection); worker is in shutdown() + SIGTERM fan-out with onerror+close both wired.
 ## Evidence
