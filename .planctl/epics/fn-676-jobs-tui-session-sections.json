@@ -1,0 +1,19 @@
+{
+  "branch_name": "fn-676-jobs-tui-session-sections",
+  "bundles": [],
+  "created_at": "2026-06-01T23:53:29.644762Z",
+  "depends_on_epics": [],
+  "id": "fn-676-jobs-tui-session-sections",
+  "last_validated_at": "2026-06-01T23:53:29.789419Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": true,
+  "snippets": [],
+  "status": "open",
+  "title": "jobs tui session sections",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-01T23:53:29.644762Z"
+}

@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-01T23:53:29.644762Z",
+  "depends_on": [],
+  "epic": "fn-676-jobs-tui-session-sections",
+  "id": "fn-676-jobs-tui-session-sections.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "jobs tui session sections",
+  "updated_at": "2026-06-01T23:53:29.644762Z"
+}
