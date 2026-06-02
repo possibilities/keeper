@@ -54,5 +54,5 @@ throw without crashing the daemon.
 - [ ] No wallclock read occurs inside any fold
 
 ## Done summary
-
+Wired producer-side Dispatched / DispatchExpired mint handlers on main's writable connection (non-fatal) and a 60s heartbeat TTL sweep that mints DispatchExpired for pending_dispatches rows past the 120s ceiling (with LEFT JOIN guard skipping rows that already have an open dispatch_failures entry); plumbed emitDispatched through ConfirmRunningDeps for .5 to call. All wallclock lives in the producer; the fold remains pure.
 ## Evidence

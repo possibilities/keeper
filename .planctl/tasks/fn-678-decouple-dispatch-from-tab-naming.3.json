@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Daemon mint seams + producer TTL sweep",
-  "updated_at": "2026-06-02T13:56:01.478550Z"
+  "updated_at": "2026-06-02T16:26:38.130898Z",
+  "worker_done_at": "2026-06-02T16:26:38.130898Z"
 }
