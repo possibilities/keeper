@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/dotfiles",
   "tier": "medium",
   "title": "Disable zellij session serialization in dotfiles",
-  "updated_at": "2026-06-01T23:48:19.639405Z"
+  "updated_at": "2026-06-02T00:03:03.728709Z",
+  "worker_done_at": "2026-06-02T00:03:03.728709Z"
 }

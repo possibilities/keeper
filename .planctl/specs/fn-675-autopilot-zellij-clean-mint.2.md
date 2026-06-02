@@ -42,5 +42,5 @@ After landing, `rg session_serialization ~/.config/zellij/config.kdl` shows the 
 - [ ] `rg -n 'session_serialization false' ~/.config/zellij/config.kdl` returns the line.
 
 ## Done summary
-
+Added 'session_serialization false' to zellij/.config/zellij/config.kdl (stowed to ~/.config/zellij/config.kdl) with a comment explaining it disables the resurrection cache that caused bar-less autopilot sessions.
 ## Evidence
