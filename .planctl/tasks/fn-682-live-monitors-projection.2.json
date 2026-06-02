@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "render monitors in jobs view",
-  "updated_at": "2026-06-02T21:52:42.014014Z"
+  "updated_at": "2026-06-02T23:35:50.620839Z",
+  "worker_done_at": "2026-06-02T23:35:50.620839Z"
 }

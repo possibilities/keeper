@@ -32,5 +32,5 @@ Visual: `keeper jobs`, expand a session running monitors (e.g. chatctl bus + a k
 - [ ] README v51 changelog block + jobs CLI bullet row-anatomy updated.
 
 ## Done summary
-
+Render Monitors section in expanded keeper jobs row via new monitorLinesFor helper (parses jobs.monitors JSON, three-way provenance pill, command/description/id fallback, multi-line truncate). README v51 block + jobs CLI bullet row-anatomy updated.
 ## Evidence
