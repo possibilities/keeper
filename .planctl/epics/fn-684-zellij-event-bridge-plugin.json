@@ -2,9 +2,12 @@
   "branch_name": "fn-684-zellij-event-bridge-plugin",
   "bundles": [],
   "created_at": "2026-06-02T23:06:05.621401Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-681-commit-driven-planctl-ingestion",
+    "fn-682-live-monitors-projection"
+  ],
   "id": "fn-684-zellij-event-bridge-plugin",
-  "last_validated_at": "2026-06-02T23:06:05.902054Z",
+  "last_validated_at": "2026-06-02T23:06:31.466977Z",
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -15,5 +18,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-02T23:06:05.621401Z"
+  "updated_at": "2026-06-02T23:06:31.303837Z"
 }
