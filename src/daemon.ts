@@ -73,6 +73,7 @@ import type {
   DispatchExpiredMessage,
   DispatchedMessage,
   DispatchFailedMessage,
+  Verb,
 } from "./autopilot-worker";
 import type {
   BackendExecSnapshotMessage,
@@ -2305,7 +2306,7 @@ function runDaemon(): void {
       // Mint the expire event. Failures inside the helper are logged
       // and swallowed (non-fatal), so a per-row throw does not abort
       // the sweep — every aged row gets its own shot.
-      handleDispatchExpiredMint({ verb: row.verb, id: row.id });
+      handleDispatchExpiredMint({ verb: row.verb as Verb, id: row.id });
     }
     // `handleDispatchExpiredMint` already pumps wakes on each mint;
     // the trailing flag is defense-in-depth in case the helper ever
