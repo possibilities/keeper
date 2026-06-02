@@ -44,5 +44,5 @@ returns only historical/changelog mentions, no current control-path guidance.
 - [ ] No stale name-as-oracle control-path guidance remains in either doc
 
 ## Done summary
-
+Updated CLAUDE.md sole-writer list (added Dispatched/DispatchExpired) and autopilot-gate bullet (replaced fn-674 name-probe rationale with fn-678 pending_dispatches description). Updated README.md eighth-worker paragraph and added schema v50 changelog paragraph.
 ## Evidence
