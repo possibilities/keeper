@@ -1175,6 +1175,18 @@ for re-fold determinism (no migration seed → `created_at` derived purely
 from the event log). keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
 gains `47` (whitelist-only; keeper-py reads neither `autopilot_state`
 nor `AutopilotPaused`).
+As of schema v50 (fn-678), the new `pending_dispatches` projection table
+(keyed by `(verb, id)`) is the durable launch-window occupancy signal that
+replaced the fn-674 live zellij tab-name probe. A `Dispatched` synthetic
+event UPSERTs a row (`dir`, `dispatched_at`, `last_event_id`); a
+`SessionStart` fold DELETEs by the same key (discharge-on-bind); a
+`DispatchExpired` synthetic event DELETEs the key when the TTL sweep fires.
+`DispatchFailed` also DELETEs the pending row so a failed dispatch does not
+block the failure as permanently occupied. A from-scratch re-fold reproduces
+the table byte-identically (no fold-time wall clock; `dispatched_at` derives
+from the event's own `ts`; no `Dispatched` events in the pre-v50 log →
+empty table on historical replay). keeper-py's `SUPPORTED_SCHEMA_VERSIONS`
+frozenset gains `50` (whitelist-only).
 As of schema v42 (fn-661), the new `dispatch_failures` projection table
 (keyed by `(verb, ref)` — the same `verb::id` correlation key the autopilot
 reconciler uses to dedup against `jobs`) carries the sticky failure record
@@ -1320,20 +1332,19 @@ decision, launch, confirmation, dedup, and (config-gated) reap. It polls
 projection consumers, but on each wake it re-runs `computeReadiness` from
 scratch and reconciles desired-vs-observed against the live `jobs` projection
 — never an edge trigger. Dedup is primarily keeperd job presence
-(correlated by `--name` → `plan_verb`+`plan_ref`), backed by a per-cycle
-zellij tab-name probe added in fn-674: at snapshot load the worker calls
-`ExecBackend.liveTabNames()` once, intersects the returned `Set<string>`
-with the candidate `verb::id` dispatch keys, and feeds the result into
-`reconcile()` as a new `liveTabKeys: Set<DispatchKey>` snapshot field; a
-fifth suppression arm sitting alongside the legacy `isOccupyingJob` arm
-fires when `liveTabKeys.has(key)` is true. `reconcile()` stays pure — it
-reads the synchronous Set, never the backend, so re-fold determinism on
-the no-DB-write side is preserved. The probe closes the launch →
-SessionStart blind window that produced fn-674's duplicate-dispatch
-incident (24-33s `claude` cold boots racing an 18s confirm ceiling on a
-`claude --plugin-dir` work tier with ~60 plugins); a worker launched into
-a `verb::id`-named tab is visible the instant `zellij action new-tab`
-returns, long before its `SessionStart` hook folds a `jobs` row. The reconciler boots PAUSED (the in-memory
+(correlated by `--name` → `plan_verb`+`plan_ref`), backed by the durable
+`pending_dispatches` projection (schema v50, fn-678): before calling
+`launch()`, `confirmRunning` mints a `Dispatched` synthetic event (outbox
+ordering — intent before side-effect); the reducer folds it into a
+`pending_dispatches` row keyed `(verb, id)`; `loadReconcileSnapshot` reads
+the table each cycle and populates `liveTabKeys: Set<DispatchKey>`; a fifth
+suppression arm fires when `liveTabKeys.has(key)` is true, sitting alongside
+the `isOccupyingJob` arm. `reconcile()` stays pure — it reads the synchronous
+Set, never the backend, so re-fold determinism is preserved. The row
+discharges when `SessionStart` folds (reducer DELETE) or via a producer-side
+TTL sweep on the 60s heartbeat (120s ceiling, `DispatchExpired`) — closing
+the launch → SessionStart blind window without any live zellij probe (the
+`verb::id` tab name is now a cosmetic label only). The reconciler boots PAUSED (the in-memory
 worker gate is seeded `true` from `workerData.paused`, and the daemon's
 boot drain unconditionally appends an `AutopilotPaused{paused:true}`
 synthetic event so the durable `autopilot_state` singleton projection
@@ -1343,14 +1354,11 @@ and flips on the `set_autopilot_paused` RPC, which appends an
 `AutopilotPaused{paused}` event FIRST then flips the worker gate only
 on a successful insert (so the gate and the projection cannot diverge
 on partial failure). The terminal-surface mechanics live behind the
-`ExecBackend` (`src/exec-backend.ts`) — two op categories sharing one
-port: session-bound lifecycle (`launch` + `closeByName`, against the
-managed reconciler session that is memoized once) and session-agnostic
-(`focusPane` / `resolveTabForPane` / `ensureLaunched`, against an
-arbitrary session per call). `ensureLaunched(session, argv, cwd, name?)`
-get-or-creates the target session with its own per-call mint + orphan
-reap (sharing no memo with the lifecycle path) and launches an unnamed
-tab — `restore-agents.ts` is the consumer. Zellij is the only backend;
+`ExecBackend` (`src/exec-backend.ts`) — four ops: `launch`,
+`closeByTabId`, `focusPane`, and `resolveTabForPane`. `ensureLaunched`
+(session-agnostic) get-or-creates the target session with its own
+per-call mint + orphan reap and launches an unnamed tab —
+`restore-agents.ts` is the consumer. Zellij is the only backend;
 each reconciler dispatch opens as a new tab in the lazily-created
 `zellij_session`. The session is FRESH-MINTED on every
 keeper-initiated `attach -b --forget` (fn-675) — `--forget` deletes any
@@ -1368,12 +1376,13 @@ autopilot`'s `--- failed ---` section until the human runs `keeper autopilot
 retry <verb::id>`, which routes through the server-worker's `retry_dispatch`
 RPC → main → a synthetic `DispatchCleared` events row → the reducer DELETEs
 the matching `dispatch_failures` row on the next drain. The only durable
-autopilot-owned state is the event-sourced `dispatch_failures` projection; a
-from-scratch re-fold reproduces it byte-identically (DispatchFailed UPSERTs by
-`(verb, ref)`, DispatchCleared DELETEs by the same key). When the
-`autoclose_windows` config flag is on, the reconciler reaps (kills the agent
-and closes the tab via `ExecBackend.closeByName`) a dispatch whose role is no
-longer needed; default-off preserves today's leave-open behavior.
+autopilot-owned state is the event-sourced `dispatch_failures` and
+`pending_dispatches` projections; a from-scratch re-fold reproduces both
+byte-identically. When the `autoclose_windows` config flag is on, the
+reconciler reaps a dispatch whose role is no longer needed via
+`ExecBackend.closeByTabId(session, tabId)` off the
+`jobs.backend_exec_{session_id,tab_id}` coordinates (fn-668); default-off
+preserves today's leave-open behavior.
 
 A **ninth** Worker thread is the backend-exec tab resolver (schema v48,
 fn-668): an interval-driven producer that ticks every 5 seconds (rather
