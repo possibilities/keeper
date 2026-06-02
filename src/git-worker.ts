@@ -237,10 +237,48 @@ export interface CommitMessage {
   committed_at_ms: number;
 }
 
+/**
+ * Per-commit message announcing the `.planctl/**` paths that changed in
+ * the just-observed commit (epic fn-681). Sibling to {@link CommitMessage}
+ * — same trigger (a HEAD-oid delta), same `diff-tree -r` parse — but
+ * dedicated to driving the plan-worker's commit-triggered ingest channel
+ * instead of an `events`-row insert. Main forwards this verbatim to
+ * plan-worker; the reducer never sees it (so re-fold determinism stays
+ * intact — the planctl files are re-read from committed worktree state
+ * on every ingest call, never from the message payload).
+ *
+ * The producer filters {@link EnumeratedCommitFile} to planctl-shaped
+ * paths via {@link classifyPlanctlPath} so the worker receives a tight
+ * list — no recipient-side re-classification. One message per commit
+ * even when several arrive in a single push, so the worker can attribute
+ * each path back to its commit if a future use case needs it; the common
+ * path (one push, one commit) lands one message regardless.
+ *
+ * `project_dir` is the absolute committing-repo root the worker is
+ * watching; plan-worker joins it with each {@link PlanctlChangedFile.path}
+ * to recover the absolute path it stats + reads. {@link changes} is
+ * non-empty by construction — the producer suppresses emission when no
+ * planctl path moved in the delta.
+ */
+export interface PlanctlChangedFile {
+  /** Repo-relative path (forward-slash on POSIX). */
+  path: string;
+  /** `"upsert"` (present in HEAD) or `"delete"` (`git rm`'d in this commit). */
+  op: "upsert" | "delete";
+}
+
+export interface PlanctlCommitChangedMessage {
+  kind: "planctl-commit-changed";
+  project_dir: string;
+  commit_oid: string;
+  changes: PlanctlChangedFile[];
+}
+
 export type GitWorkerMessage =
   | GitSnapshotMessage
   | GitRootDroppedMessage
-  | CommitMessage;
+  | CommitMessage
+  | PlanctlCommitChangedMessage;
 
 interface ParsedGitStatus {
   branch: string | null;
@@ -669,6 +707,67 @@ export interface EnumeratedCommit {
  * Module-scope literal so V8/JSC tier up once at process start.
  */
 const PRODUCER_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+/**
+ * Is this repo-relative path one the plan-worker projects (epic fn-681)?
+ * Matches the SAME shapes plan-worker's `classifyPlanPath` recognizes,
+ * intentionally duplicated here so the two workers stay independent (no
+ * cross-worker module import — the producer/consumer contract is the
+ * message shape, not a shared classifier function). If this set ever
+ * widens, BOTH classifiers must move in lockstep.
+ *
+ * Recognised shapes (forward-slash split — `git diff-tree` always emits
+ * POSIX separators regardless of platform):
+ * - `.planctl/epics/<id>.json` (3-segment)
+ * - `.planctl/tasks/<id>.json` (3-segment)
+ * - `.planctl/state/tasks/<id>.state.json` (4-segment)
+ *
+ * Pure — does no I/O. Exported for unit reach.
+ */
+export function isPlanctlChangedPath(path: string): boolean {
+  if (!path.endsWith(".json")) return false;
+  const segments = path.split("/");
+  const n = segments.length;
+  // 3-segment tail: `.planctl/<epics|tasks>/<file>.json`.
+  if (n >= 3 && segments[n - 3] === ".planctl") {
+    const dir = segments[n - 2];
+    return dir === "epics" || dir === "tasks";
+  }
+  // 4-segment tail: `.planctl/state/tasks/<id>.state.json`.
+  if (
+    n >= 4 &&
+    segments[n - 4] === ".planctl" &&
+    segments[n - 3] === "state" &&
+    segments[n - 2] === "tasks" &&
+    segments[n - 1].endsWith(".state.json")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Filter a commit's enumerated file list to planctl-shaped paths and
+ * pair each with its add/update-vs-delete tag (epic fn-681). Delete is
+ * signalled by the producer's null sentinels on the {@link
+ * EnumeratedCommitFile} record — `commitFiles` lifts a zero-oid /
+ * zero-mode `diff-tree` line to `{blob_oid: null, committed_mode: null}`,
+ * which is the producer's honest "the file was removed" marker. We treat
+ * a null `blob_oid` as `"delete"` and every other shape as `"upsert"` —
+ * matching the plan-worker's `onChange` / `onDelete` dispatch.
+ *
+ * Pure — does no I/O. Exported for unit reach.
+ */
+export function filterPlanctlChanges(
+  files: EnumeratedCommitFile[],
+): PlanctlChangedFile[] {
+  const out: PlanctlChangedFile[] = [];
+  for (const f of files) {
+    if (!isPlanctlChangedPath(f.path)) continue;
+    out.push({ path: f.path, op: f.blob_oid === null ? "delete" : "upsert" });
+  }
+  return out;
+}
 
 /**
  * Shell-out + parse for one commit's file list via
@@ -1278,6 +1377,26 @@ function startWorker(): void {
               task_ids: c.task_ids,
               committed_at_ms: c.committed_at_ms,
             } satisfies CommitMessage);
+            // Epic fn-681: authoritative commit-driven planctl ingest.
+            // Filter the commit's enumerated file list to planctl-shaped
+            // paths (epics / tasks / state-tasks) and post one
+            // {@link PlanctlCommitChangedMessage} per commit carrying any
+            // such paths. Suppressed when the commit touched no planctl
+            // files — the common case for source commits. Main forwards
+            // the message verbatim to plan-worker, which re-ingests each
+            // path from the committed worktree via the existing
+            // `onChange` / `onDelete` pipeline (drop-proof; no partial-
+            // read race). The reducer never sees this message — it lives
+            // entirely on the worker→main→worker side channel.
+            const planctlChanges = filterPlanctlChanges(c.files);
+            if (planctlChanges.length > 0) {
+              port.postMessage({
+                kind: "planctl-commit-changed",
+                project_dir: root,
+                commit_oid: c.commit_oid,
+                changes: planctlChanges,
+              } satisfies PlanctlCommitChangedMessage);
+            }
           }
         } catch (err) {
           // Producer-only contract: a failed enumeration cannot wedge the

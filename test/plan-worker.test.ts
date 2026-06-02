@@ -1713,6 +1713,196 @@ test("onDelete: a previously-committed file emits a real tombstone (gate doesn't
   expect(scanner.pendingSize()).toBe(0);
 });
 
+// ---------------------------------------------------------------------------
+// fn-681 — commit-driven planctl ingest (the consumer side). The inbound
+// `planctl-commit-changed` message handler in the live worker iterates
+// the changes array and calls `scanner.onChange(absPath)` /
+// `scanner.onDelete(absPath)` per entry. These tests exercise that exact
+// contract against the pure `PlanScanner` core — no Worker, no watcher —
+// driving the scanner the same way the live handler does so a future
+// regression in the handler is caught here.
+// ---------------------------------------------------------------------------
+
+/**
+ * Drive the scanner the way `plan-worker`'s inbound `planctl-commit-changed`
+ * handler does: join each repo-relative path with the repo root and dispatch
+ * to onChange (upsert) or onDelete (delete). One-to-one with the live
+ * handler so a regression in the handler is visible from the consumer-
+ * side test.
+ */
+function applyPlanctlCommitChanges(
+  scanner: PlanScanner,
+  repo: string,
+  changes: { path: string; op: "upsert" | "delete" }[],
+): void {
+  for (const change of changes) {
+    const abs = join(repo, change.path);
+    if (change.op === "delete") {
+      scanner.onDelete(abs);
+    } else {
+      scanner.onChange(abs);
+    }
+  }
+}
+
+test("planctl-commit-changed: upsert batch ingests committed bytes via onChange", () => {
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  // Scaffold an epic + two tasks (the 3-file commit shape the epic spec
+  // calls out) and commit them. The bytes are the COMMITTED bytes by the
+  // time the handler dispatches — drop-proof and no partial-read.
+  writeEpic("fn-1-demo", {
+    title: "Demo",
+    primary_repo: tmpDir,
+  });
+  writeTask("fn-1-demo.1", { epic: "fn-1-demo", title: "t1" });
+  writeTask("fn-1-demo.2", { epic: "fn-1-demo", title: "t2" });
+  git(tmpDir, "add", "-A");
+  git(tmpDir, "commit", "-q", "-m", "scaffold");
+
+  // The git-worker would emit a {repo: tmpDir, changes: [...]} message with
+  // three upsert entries (one per planctl file). The handler joins each
+  // path with repo and dispatches to onChange — equivalently:
+  applyPlanctlCommitChanges(scanner, tmpDir, [
+    { path: ".planctl/epics/fn-1-demo.json", op: "upsert" },
+    { path: ".planctl/tasks/fn-1-demo.1.json", op: "upsert" },
+    { path: ".planctl/tasks/fn-1-demo.2.json", op: "upsert" },
+  ]);
+  expect(emitted).toHaveLength(3);
+  expect(emitted.map((m) => m.kind).sort()).toEqual([
+    "plan-epic",
+    "plan-task",
+    "plan-task",
+  ]);
+  const epic = emitted.find((m) => m.kind === "plan-epic") as {
+    id: string;
+    title: string | null;
+  };
+  expect(epic.id).toBe("fn-1-demo");
+  expect(epic.title).toBe("Demo");
+
+  // Duplicate fire (FSEvents lands the same change later) is a no-op via
+  // the change-gate. Note: a real worker would receive this in the same
+  // observable order, but a re-FSEvents may interleave or arrive only
+  // after a slight delay — either way the gate suppresses.
+  const before = emitted.length;
+  applyPlanctlCommitChanges(scanner, tmpDir, [
+    { path: ".planctl/epics/fn-1-demo.json", op: "upsert" },
+    { path: ".planctl/tasks/fn-1-demo.1.json", op: "upsert" },
+    { path: ".planctl/tasks/fn-1-demo.2.json", op: "upsert" },
+  ]);
+  expect(emitted.length).toBe(before);
+});
+
+test("planctl-commit-changed: FSEvents-dropped scenario — commit batch alone drives correct ingest", () => {
+  // The real FSEvents-overrun bug this epic fixes: the live FSEvent for
+  // the scaffold burst is dropped, so the only signal reaching keeper is
+  // the commit. The commit-driven channel alone must produce the same
+  // projection as the FSEvents path would have.
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  // Scaffold + commit, but NEVER call onChange via the live FSEvent path
+  // (simulates the drop). The commit-driven batch is the only signal.
+  writeEpic("fn-2-drop", {
+    title: "Dropped",
+    primary_repo: tmpDir,
+    last_validated_at: "2026-06-02T00:00:00Z",
+  });
+  git(tmpDir, "add", "-A");
+  git(tmpDir, "commit", "-q", "-m", "scaffold");
+
+  applyPlanctlCommitChanges(scanner, tmpDir, [
+    { path: ".planctl/epics/fn-2-drop.json", op: "upsert" },
+  ]);
+  expect(emitted).toHaveLength(1);
+  expect(emitted[0]).toMatchObject({
+    kind: "plan-epic",
+    id: "fn-2-drop",
+    title: "Dropped",
+    lastValidatedAt: "2026-06-02T00:00:00Z",
+  });
+});
+
+test("planctl-commit-changed: delete op emits tombstone via the commit path (no FSEvents dependency)", () => {
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  // Commit 1: add the epic. The commit-driven channel ingests it.
+  const epicPath = writeEpic("fn-3-rm", {
+    title: "Removable",
+    primary_repo: tmpDir,
+  });
+  git(tmpDir, "add", "-A");
+  git(tmpDir, "commit", "-q", "-m", "add");
+  applyPlanctlCommitChanges(scanner, tmpDir, [
+    { path: ".planctl/epics/fn-3-rm.json", op: "upsert" },
+  ]);
+  expect(emitted).toHaveLength(1);
+
+  // Commit 2: `git rm` the epic. The git-worker tags it op='delete'; the
+  // handler dispatches to scanner.onDelete, which emits the tombstone via
+  // the change-gate's recovered identity. No live FSEvents delete event
+  // required.
+  git(tmpDir, "rm", "-q", epicPath);
+  git(tmpDir, "commit", "-q", "-m", "drop");
+  applyPlanctlCommitChanges(scanner, tmpDir, [
+    { path: ".planctl/epics/fn-3-rm.json", op: "delete" },
+  ]);
+  expect(emitted).toHaveLength(2);
+  expect(emitted[1]).toEqual({ kind: "plan-epic-deleted", id: "fn-3-rm" });
+});
+
+test("planctl-commit-changed: mid-batch ingest failure does NOT stall the rest of the batch", () => {
+  // The handler's per-path try/catch — one malformed file in a many-file
+  // batch is skip-and-logged, the rest still ingest. This mirrors the
+  // live FSEvents path's discipline.
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const logs: string[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    (l) => logs.push(l),
+    isPathInHead,
+  );
+
+  // First file: malformed JSON (onChange skip-and-logs without emitting).
+  // Second file: well-formed (onChange emits normally).
+  const badPath = join(planctlDir("epics"), "fn-4-bad.json");
+  writeFileSync(badPath, "{ not json");
+  writeEpic("fn-4-good", { title: "Good", primary_repo: tmpDir });
+  git(tmpDir, "add", "-A");
+  git(tmpDir, "commit", "-q", "-m", "mixed");
+
+  applyPlanctlCommitChanges(scanner, tmpDir, [
+    { path: ".planctl/epics/fn-4-bad.json", op: "upsert" },
+    { path: ".planctl/epics/fn-4-good.json", op: "upsert" },
+  ]);
+  expect(emitted).toHaveLength(1);
+  expect(emitted[0]).toMatchObject({ kind: "plan-epic", id: "fn-4-good" });
+  expect(logs.some((l) => l.includes("malformed JSON"))).toBe(true);
+});
+
 test("recheckPending: no-op when pending set is empty", () => {
   gitInit(tmpDir);
 

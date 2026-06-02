@@ -98,6 +98,7 @@ import type {
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
 import type { GitWorkerData, GitWorkerMessage } from "./git-worker";
 import type {
+  PlanctlCommitChangedMessage,
   PlanMessage,
   PlanWorkerData,
   RecheckPendingMessage,
@@ -1684,6 +1685,23 @@ function runDaemon(): void {
   ): void => {
     const msg = ev.data;
     if (!msg) return;
+    if (msg.kind === "planctl-commit-changed") {
+      // Epic fn-681: authoritative commit-driven planctl ingest. The
+      // git-worker observed a commit in `msg.project_dir` carrying
+      // changed `.planctl/**` paths; forward the path list verbatim to
+      // plan-worker so it re-ingests each from the COMMITTED worktree
+      // bytes via the existing idempotent `onChange` / `onDelete`. NOT
+      // written to the `events` log — the reducer must stay a pure
+      // function of the immutable log, and this channel exists to drive
+      // a producer worker, not a projection. Duplicate fires from a
+      // live FSEvent are no-ops via plan-worker's change-gate.
+      planWorker.postMessage({
+        type: "planctl-commit-changed",
+        repo: msg.project_dir,
+        changes: msg.changes,
+      } satisfies PlanctlCommitChangedMessage);
+      return;
+    }
     let hookEvent: string;
     let data: string;
     if (msg.kind === "git-snapshot") {

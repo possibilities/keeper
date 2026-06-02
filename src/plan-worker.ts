@@ -220,8 +220,62 @@ export interface RecheckPendingMessage {
   type: "recheck-pending";
 }
 
+/**
+ * One entry on a {@link PlanctlCommitChangedMessage} — a single
+ * `.planctl/**` path that changed in the committed delta the git-worker
+ * just observed. `path` is repo-relative (forward-slash on POSIX), tagged
+ * by the git-side `diff-tree` parse with the file's commit-time fate.
+ *
+ * `op` partitions the change:
+ * - `"upsert"` — the file is present in HEAD (add or modify); plan-worker
+ *   calls {@link PlanScanner.onChange} on the joined absolute path, which
+ *   reads the COMMITTED bytes from the worktree (atomic post-commit, no
+ *   partial-read race) and runs the existing classify→parse→gate→emit
+ *   pipeline. Duplicate fires from a live FSEvent are no-ops via the
+ *   change-gate.
+ * - `"delete"` — the file was `git rm`'d in this commit (zero blob_oid in
+ *   the diff-tree record); plan-worker calls
+ *   {@link PlanScanner.onDelete}, which emits the existing tombstone via
+ *   the change-gate's recovered epicId. This gives commit-path deletion
+ *   without relying on FSEvents delete events.
+ */
+export interface PlanctlCommitChange {
+  path: string;
+  op: "upsert" | "delete";
+}
+
+/**
+ * Message the parent sends when a commit landed in a keeper-tracked repo
+ * carrying changed `.planctl/**` paths (epic fn-681). Authoritative ingest
+ * trigger: the COMMITTED bytes are atomically written, so re-ingest from
+ * the worktree is drop-proof and free of the mid-write partial-read race
+ * the broader `~/code` FSEvents subscription is exposed to. The git-worker
+ * filters the per-commit diff to `.planctl/{epics,tasks}/*.json` +
+ * `.planctl/state/tasks/*.state.json` producer-side via
+ * {@link classifyPlanPath}, so the worker receives a tight list.
+ *
+ * One message per commit (even when several arrive in a single push) so
+ * the boundary between commits stays visible — a many-file scaffold burst
+ * collapses to one message carrying every changed path.
+ *
+ * `repo` is the absolute path to the committing worktree root (joined with
+ * each `change.path` to recover an absolute path the scanner can stat +
+ * read). Plan-worker iterates {@link changes}, calling
+ * {@link PlanScanner.onChange} or {@link PlanScanner.onDelete} per entry;
+ * any per-path failure (stat race, malformed JSON) skip-and-logs without
+ * stalling the rest, mirroring the live FSEvents path.
+ */
+export interface PlanctlCommitChangedMessage {
+  type: "planctl-commit-changed";
+  repo: string;
+  changes: PlanctlCommitChange[];
+}
+
 /** Inbound message protocol — every shape main sends to the worker. */
-export type InboundMessage = ShutdownMessage | RecheckPendingMessage;
+export type InboundMessage =
+  | ShutdownMessage
+  | RecheckPendingMessage
+  | PlanctlCommitChangedMessage;
 
 /**
  * Cap a plan file's size before `JSON.parse`. Plan JSONs live under a
@@ -1702,6 +1756,34 @@ function main(): void {
         console.error(
           `[plan-worker] recheckPending failed: ${stringifyErr(err)}`,
         );
+      }
+      return;
+    }
+    if (msg.type === "planctl-commit-changed") {
+      // fn-681: authoritative ingest trigger. The git-worker just observed
+      // a commit landing in `msg.repo` carrying changed `.planctl/**`
+      // paths; re-ingest each from the COMMITTED worktree bytes via the
+      // existing idempotent `onChange` / `onDelete` paths. Drop-proof
+      // (independent of the broad `~/code` FSEvents subscription) and
+      // free of the mid-write partial-read race (planctl commits
+      // atomically). Duplicate fires from a live FSEvent are no-ops via
+      // the change-gate. The per-path try/catch mirrors `onChange`'s own
+      // skip-and-log discipline so one malformed file in a many-file
+      // commit can't stall the rest of the batch.
+      if (shuttingDown) return;
+      for (const change of msg.changes) {
+        const abs = join(msg.repo, change.path);
+        try {
+          if (change.op === "delete") {
+            scanner.onDelete(abs);
+          } else {
+            scanner.onChange(abs);
+          }
+        } catch (err) {
+          console.error(
+            `[plan-worker] commit-driven ingest failed for ${abs}: ${stringifyErr(err)}`,
+          );
+        }
       }
       return;
     }

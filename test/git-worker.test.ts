@@ -19,7 +19,9 @@ import {
   buildGitSnapshot,
   decideHeadDivergence,
   enumerateCommitsInDelta,
+  filterPlanctlChanges,
   type GitDirtyFile,
+  isPlanctlChangedPath,
   parsePorcelainV2,
   resolveHeadOidViaFs,
 } from "../src/git-worker";
@@ -1311,4 +1313,226 @@ test("extractCommit normalizes non-array task_ids to []", () => {
     });
     expect(res?.task_ids).toEqual([]);
   }
+});
+
+// ---------------------------------------------------------------------------
+// fn-681 — commit-driven planctl ingest. Pure-helper coverage first
+// (classifier + filter), then a real-git round-trip pinning that the
+// `git rm` path produces the `delete` op (the FSEvents-bypass
+// correctness gate). The cross-worker message wiring is exercised by
+// `test/plan-worker.test.ts` against the consumer side.
+// ---------------------------------------------------------------------------
+
+test("isPlanctlChangedPath: epics/tasks json + state-tasks state.json accepted, else rejected", () => {
+  // Accept: the three shapes the plan-worker's classifyPlanPath projects.
+  expect(isPlanctlChangedPath(".planctl/epics/fn-1-x.json")).toBe(true);
+  expect(isPlanctlChangedPath(".planctl/tasks/fn-1-x.2.json")).toBe(true);
+  expect(isPlanctlChangedPath(".planctl/state/tasks/fn-1-x.2.state.json")).toBe(
+    true,
+  );
+  // Accept under nested repo paths — git diff-tree emits POSIX separators
+  // regardless of platform, so a forward-slash split is sufficient.
+  expect(isPlanctlChangedPath("sub/.planctl/epics/fn-1-x.json")).toBe(true);
+
+  // Reject: wrong extension, wrong subdir, missing state.json suffix, non-
+  // planctl paths, deeper nesting under the 3-segment shapes.
+  expect(isPlanctlChangedPath(".planctl/specs/fn-1-x.md")).toBe(false);
+  expect(isPlanctlChangedPath(".planctl/epics/fn-1-x.md")).toBe(false);
+  expect(isPlanctlChangedPath("epics/fn-1-x.json")).toBe(false);
+  expect(isPlanctlChangedPath(".planctl/state/tasks/fn-1-x.json")).toBe(false);
+  expect(isPlanctlChangedPath(".planctl/epics/sub/fn-1-x.json")).toBe(false);
+  expect(isPlanctlChangedPath("src/a.ts")).toBe(false);
+});
+
+test("filterPlanctlChanges: tags add/update vs delete by blob_oid null sentinel", () => {
+  // The producer's commitFiles already lifts a zero-oid diff-tree record
+  // to {blob_oid: null, committed_mode: null} — the filter reads that
+  // shape as "delete" and every other shape as "upsert". A non-planctl
+  // file in the same commit drops out of the result list entirely.
+  const out = filterPlanctlChanges([
+    {
+      path: ".planctl/epics/fn-1-x.json",
+      blob_oid: "0123456789abcdef0123456789abcdef01234567",
+      committed_mode: "100644",
+    },
+    {
+      path: ".planctl/tasks/fn-1-x.2.json",
+      blob_oid: null,
+      committed_mode: null,
+    },
+    {
+      // Sidecar runtime state — also routed to the consumer via
+      // onChange's task-state arm.
+      path: ".planctl/state/tasks/fn-1-x.2.state.json",
+      blob_oid: "fedcba9876543210fedcba9876543210fedcba98",
+      committed_mode: "100644",
+    },
+    {
+      // Non-planctl file in the same commit — must drop.
+      path: "src/a.ts",
+      blob_oid: "abc1234567890abc1234567890abc1234567890a",
+      committed_mode: "100644",
+    },
+  ]);
+  expect(out).toEqual([
+    { path: ".planctl/epics/fn-1-x.json", op: "upsert" },
+    { path: ".planctl/tasks/fn-1-x.2.json", op: "delete" },
+    { path: ".planctl/state/tasks/fn-1-x.2.state.json", op: "upsert" },
+  ]);
+});
+
+test("filterPlanctlChanges: a commit with no planctl files returns []", () => {
+  // The common case for source commits — none of the changed files match
+  // the planctl shapes, so the producer suppresses the message entirely
+  // (the live worker checks `result.length > 0` before posting).
+  expect(
+    filterPlanctlChanges([
+      {
+        path: "src/a.ts",
+        blob_oid: "abc1234567890abc1234567890abc1234567890a",
+        committed_mode: "100644",
+      },
+      {
+        path: "README.md",
+        blob_oid: "def4567890abcdef4567890abcdef4567890abcd",
+        committed_mode: "100644",
+      },
+    ]),
+  ).toEqual([]);
+});
+
+test("enumerateCommitsInDelta: a `git rm` of a planctl json → filterPlanctlChanges tags it 'delete'", () => {
+  // End-to-end producer round-trip: scaffold a planctl file under a real
+  // tmp repo, commit it (commit 1), then `git rm` it + commit (commit 2),
+  // and assert the delta-enumeration → filter chain surfaces the
+  // deletion as op='delete'. This is the path that gives commit-driven
+  // tombstones without relying on FSEvents.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  // Commit 1 — add the planctl file.
+  mkdirSync(join(root, ".planctl", "epics"), { recursive: true });
+  writeFileSync(
+    join(root, ".planctl", "epics", "fn-1-x.json"),
+    JSON.stringify({ id: "fn-1-x", title: "demo" }),
+  );
+  let res = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!res.success) throw new Error("git add (1) failed");
+  res = Bun.spawnSync(["git", "-C", root, "commit", "-q", "-m", "add epic"], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!res.success) throw new Error("git commit (1) failed");
+  const oid1 = Bun.spawnSync(["git", "-C", root, "rev-parse", "HEAD"], {
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+    .stdout.toString()
+    .trim();
+
+  // Commit 2 — `git rm` the planctl file.
+  res = Bun.spawnSync(
+    ["git", "-C", root, "rm", "-q", ".planctl/epics/fn-1-x.json"],
+    { stdout: "ignore", stderr: "ignore" },
+  );
+  if (!res.success) throw new Error("git rm failed");
+  res = Bun.spawnSync(["git", "-C", root, "commit", "-q", "-m", "drop epic"], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!res.success) throw new Error("git commit (2) failed");
+  const oid2 = Bun.spawnSync(["git", "-C", root, "rev-parse", "HEAD"], {
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+    .stdout.toString()
+    .trim();
+
+  // Enumerate the oid1..oid2 delta (the live worker's HEAD-oid delta
+  // path) and filter. The deletion lands with blob_oid=null on
+  // EnumeratedCommitFile (the diff-tree zero-sentinel), which the
+  // filter reads as op='delete'.
+  const commits = enumerateCommitsInDelta(root, oid1, oid2);
+  expect(commits).toHaveLength(1);
+  expect(filterPlanctlChanges(commits[0].files)).toEqual([
+    { path: ".planctl/epics/fn-1-x.json", op: "delete" },
+  ]);
+});
+
+test("enumerateCommitsInDelta: an `add` of planctl files → filterPlanctlChanges tags every entry 'upsert'", () => {
+  // The 9-file scaffold-burst shape the epic spec calls out: one commit
+  // touching several planctl paths, every one of them tagged upsert.
+  // The plan-worker receives the message and re-ingests from the
+  // committed worktree — drop-proof for the FSEvents storm scenario.
+  //
+  // We use a seed commit + a scaffold commit so the delta has a parent
+  // (git diff-tree of a parentless commit emits no file list — that's
+  // the "bootstrap-from-null" producer fallback, and not the shape the
+  // live worker hits in steady state).
+  const root = mkTmpWorktree();
+  gitInit(root);
+  writeFileSync(join(root, "README.md"), "seed\n");
+  let res = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!res.success) throw new Error("git add (seed) failed");
+  res = Bun.spawnSync(["git", "-C", root, "commit", "-q", "-m", "seed"], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!res.success) throw new Error("git commit (seed) failed");
+  const oidSeed = Bun.spawnSync(["git", "-C", root, "rev-parse", "HEAD"], {
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+    .stdout.toString()
+    .trim();
+
+  mkdirSync(join(root, ".planctl", "epics"), { recursive: true });
+  mkdirSync(join(root, ".planctl", "tasks"), { recursive: true });
+  writeFileSync(
+    join(root, ".planctl", "epics", "fn-1-x.json"),
+    JSON.stringify({ id: "fn-1-x", title: "epic" }),
+  );
+  writeFileSync(
+    join(root, ".planctl", "tasks", "fn-1-x.1.json"),
+    JSON.stringify({ id: "fn-1-x.1", epic: "fn-1-x", title: "t1" }),
+  );
+  writeFileSync(
+    join(root, ".planctl", "tasks", "fn-1-x.2.json"),
+    JSON.stringify({ id: "fn-1-x.2", epic: "fn-1-x", title: "t2" }),
+  );
+  res = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!res.success) throw new Error("git add failed");
+  res = Bun.spawnSync(["git", "-C", root, "commit", "-q", "-m", "scaffold"], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!res.success) throw new Error("git commit failed");
+  const oid = Bun.spawnSync(["git", "-C", root, "rev-parse", "HEAD"], {
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+    .stdout.toString()
+    .trim();
+
+  const commits = enumerateCommitsInDelta(root, oidSeed, oid);
+  expect(commits).toHaveLength(1);
+  const changes = filterPlanctlChanges(commits[0].files);
+  // Order is the producer's diff-tree output order; just assert the set.
+  expect(new Set(changes.map((c) => c.path))).toEqual(
+    new Set([
+      ".planctl/epics/fn-1-x.json",
+      ".planctl/tasks/fn-1-x.1.json",
+      ".planctl/tasks/fn-1-x.2.json",
+    ]),
+  );
+  // Every entry is an upsert.
+  expect(changes.every((c) => c.op === "upsert")).toBe(true);
 });
