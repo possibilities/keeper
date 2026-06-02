@@ -3195,6 +3195,19 @@ function foldDispatchFailed(db: Database, event: Event): void {
       event.ts,
     ],
   );
+  // fn-678 (schema v50): a `DispatchFailed` for `(verb, id)` also discharges
+  // any in-flight `pending_dispatches` row for the same pair. The outbox
+  // ordering (mint `Dispatched` BEFORE `launch()`) means a launch failure
+  // leaves both rows: this arm is what reconciles them in the same fold
+  // transaction. Idempotent DELETE — no-op when no pending row exists (the
+  // common case: a confirm-poll timeout that beat the producer to minting
+  // `DispatchExpired`, or a re-fold over a log carrying `DispatchFailed`
+  // events that pre-date this epic). Pure fold: no `Date.now`, no env, no
+  // `jobs` SELECT — re-fold determinism holds.
+  db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
+    payload.verb,
+    payload.id,
+  ]);
 }
 
 /**
@@ -3216,6 +3229,179 @@ function foldDispatchCleared(db: Database, event: Event): void {
     return;
   }
   db.run("DELETE FROM dispatch_failures WHERE verb = ? AND id = ?", [
+    payload.verb,
+    payload.id,
+  ]);
+}
+
+/**
+ * Pre-flattened `Dispatched` synthetic event payload (fn-678, schema v50).
+ * The autopilot reconciler mints this BEFORE invoking `ExecBackend.launch()`
+ * — outbox-ordered intent so a crash between mint and launch leaves a
+ * phantom pending row that the producer-side TTL sweep clears via
+ * `DispatchExpired` (strictly preferable to double-dispatch in the
+ * launch→SessionStart blind window the fn-674 live tab probe used to
+ * cover).
+ *
+ * `ts` is the producer-side wall-clock at the mint moment — NOT
+ * `event.ts` (the synthetic event's own clock); carrying it in the payload
+ * is what keeps the fold pure. The reducer NEVER reads `Date.now()` here;
+ * a re-fold reproduces `pending_dispatches.dispatched_at` byte-identically
+ * regardless of when the re-fold happens. The TTL sweep in main compares
+ * this value against `Date.now()` IN MAIN (never inside the fold).
+ */
+interface DispatchedPayload {
+  verb: string;
+  id: string;
+  dir: string | null;
+  ts: number;
+}
+
+/**
+ * Pre-flattened `DispatchExpired` synthetic event payload (fn-678,
+ * schema v50). The producer-side TTL sweep (task .3 of this epic) mints
+ * this on the 60s heartbeat for any `pending_dispatches` row whose
+ * `dispatched_at` is older than the 120s ceiling — discharges the phantom
+ * launch-window slot without forcing a redispatch decision (a real worker
+ * that booted will still bind via discharge-on-bind; a worker that never
+ * spawned needs the slot freed before the autopilot can try again).
+ *
+ * Strictly `(verb, id)` — the clear arm is keyed-by-pk only. Mirrors
+ * `DispatchClearedPayload`'s minimal shape.
+ */
+interface DispatchExpiredPayload {
+  verb: string;
+  id: string;
+}
+
+/**
+ * Parse a `Dispatched` event payload. Returns null on any structural miss
+ * — the surrounding {@link foldDispatched} folds null to a safe no-op
+ * (cursor still advances). NEVER throws: per CLAUDE.md "a malformed `data`
+ * blob folds to a safe value"; a throw inside the fold would roll back the
+ * cursor and wedge the reducer.
+ *
+ * Strict typing mirroring {@link extractDispatchFailedPayload}: `verb` /
+ * `id` MUST be non-empty strings; `dir` is nullable (null on payloads that
+ * omit it, accepts a string otherwise); `ts` MUST be a finite number (the
+ * reconciler's mint-time stamp). Any miss → null → safe no-op.
+ */
+function extractDispatchedPayload(event: Event): DispatchedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<DispatchedPayload>;
+    if (typeof parsed.verb !== "string" || parsed.verb.length === 0) {
+      return null;
+    }
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.ts !== "number" || !Number.isFinite(parsed.ts)) {
+      return null;
+    }
+    const dir =
+      typeof parsed.dir === "string" && parsed.dir.length > 0
+        ? parsed.dir
+        : null;
+    return { verb: parsed.verb, id: parsed.id, dir, ts: parsed.ts };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse Dispatched payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Parse a `DispatchExpired` event payload. Mirrors
+ * {@link extractDispatchClearedPayload}'s defensive shape — only `verb` +
+ * `id` required (the expire arm is keyed-by-pk only); anything missing
+ * folds to a safe no-op.
+ */
+function extractDispatchExpiredPayload(
+  event: Event,
+): DispatchExpiredPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<DispatchExpiredPayload>;
+    if (typeof parsed.verb !== "string" || parsed.verb.length === 0) {
+      return null;
+    }
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    return { verb: parsed.verb, id: parsed.id };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse DispatchExpired payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `Dispatched` event (fn-678, schema v50). UPSERT on
+ * `(verb, id)` — the reconciler mints a fresh `Dispatched` per launch
+ * attempt, so a re-dispatch after a prior `DispatchExpired` / failure
+ * lands here without a unique-constraint violation. An UPSERT collision
+ * (same `(verb, id)` minted twice without an intervening discharge — a
+ * bug in the reconciler, but possible across keeperd restarts) refreshes
+ * `dispatched_at` / `dir` / `last_event_id` to the latest event's values
+ * so the TTL sweep is keyed off the most recent attempt.
+ *
+ * The fold is a pure function of the event payload + the persisted row:
+ * - `verb` / `id` / `dir` / `dispatched_at` come from the immutable event
+ *   payload (`dispatched_at` is the producer's mint-time stamp, frozen in
+ *   by main — see {@link DispatchedPayload}).
+ * - `last_event_id` is `event.id`.
+ *
+ * No `Date.now()`, no liveness re-probe, no `jobs` SELECT inside the fold
+ * — all three would break re-fold determinism. Runs INSIDE the open
+ * `BEGIN IMMEDIATE` transaction opened by {@link applyEvent}; performs
+ * zero cursor work.
+ *
+ * Malformed/missing payload → safe no-op; the cursor still advances.
+ */
+function foldDispatched(db: Database, event: Event): void {
+  const payload = extractDispatchedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO pending_dispatches (
+       verb, id, dir, dispatched_at, last_event_id
+     ) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(verb, id) DO UPDATE SET
+       dir = excluded.dir,
+       dispatched_at = excluded.dispatched_at,
+       last_event_id = excluded.last_event_id`,
+    [payload.verb, payload.id, payload.dir, payload.ts, event.id],
+  );
+}
+
+/**
+ * Fold one synthetic `DispatchExpired` event (fn-678, schema v50). DELETE
+ * on `(verb, id)` — idempotent (re-folding over a `(verb, id)` that's
+ * already gone matches zero rows, not an error). MUST NOT throw on a
+ * missing row: a boot-drain race where `SessionStart` already discharged
+ * the row before the TTL sweep's `DispatchExpired` lands would otherwise
+ * wedge the reducer.
+ *
+ * Runs INSIDE the open `BEGIN IMMEDIATE` transaction opened by
+ * {@link applyEvent}; performs zero cursor work.
+ *
+ * Malformed/missing payload → safe no-op; the cursor still advances.
+ */
+function foldDispatchExpired(db: Database, event: Event): void {
+  const payload = extractDispatchExpiredPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
     payload.verb,
     payload.id,
   ]);
@@ -5808,6 +5994,21 @@ function projectJobsRow(db: Database, event: Event): void {
         const { plan_verb, plan_ref } = planVerbRefFromSpawnName(
           event.spawn_name,
         );
+        // fn-678 (schema v50): discharge-on-bind gating. Read the jobs row
+        // BEFORE the UPSERT to detect spawn-INSERT (no prior row) versus
+        // resume ON CONFLICT (a row already exists). The discharge of any
+        // matching `pending_dispatches` row fires ONLY on the spawn-INSERT
+        // branch — a RESUME must NOT discharge a legitimately re-pending
+        // dispatch (the autopilot may have minted a fresh `Dispatched` for
+        // the same `(verb, id)` after the original session ended; a resume
+        // arriving in the same `(plan_verb, plan_ref)` namespace would
+        // otherwise wrongly free a real in-flight slot). The pre-INSERT
+        // SELECT is pure (reads only the persisted row), so re-fold
+        // determinism holds.
+        const priorJob = db
+          .query("SELECT 1 AS one FROM jobs WHERE job_id = ?")
+          .get(jobId) as { one: number } | null;
+        const isSpawnInsert = priorJob == null;
         // Schema v40 (fn-652): seed `name_history` with `["<spawn_name>"]`
         // on the spawn INSERT when `spawn_name != null`, else `'[]'` (the
         // schema default, also written explicitly for symmetry). RESUME is
@@ -5898,6 +6099,25 @@ function projectJobsRow(db: Database, event: Event): void {
           `INSERT OR IGNORE INTO profiles (config_dir, profile_name, last_event_id, updated_at) VALUES (COALESCE(?, ''), ?, ?, ?)`,
           [event.config_dir, projectBasename(event.config_dir), event.id, ts],
         );
+        // fn-678 (schema v50): discharge-on-bind. Fires ONLY on the
+        // spawn-INSERT branch (set-once stamp of `plan_verb`/`plan_ref`),
+        // NEVER on the resume ON CONFLICT branch. A successful bind of a
+        // session to a `(plan_verb, plan_ref)` pair means the autopilot's
+        // `Dispatched` intent has materialized into a real keeper job — the
+        // launch-window slot is no longer in-flight, the row is reaped.
+        // Idempotent DELETE: no-op when no pending row exists (the row
+        // already cleared via `DispatchFailed` / `DispatchExpired`, or
+        // this session bound to a `(verb, id)` no autopilot ever
+        // dispatched — a human-launched session whose spawn name happens
+        // to match the verb whitelist). Pure fold: reads only the
+        // payload-derived `plan_verb`/`plan_ref` and `isSpawnInsert` from
+        // the in-fold pre-SELECT, re-fold deterministic.
+        if (isSpawnInsert && plan_verb != null && plan_ref != null) {
+          db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
+            plan_verb,
+            plan_ref,
+          ]);
+        }
       }
       syncIfPlanRef(db, jobId, event.id, ts);
       break;
@@ -6699,6 +6919,10 @@ export function applyEvent(
       foldDispatchFailed(db, event);
     } else if (event.hook_event === "DispatchCleared") {
       foldDispatchCleared(db, event);
+    } else if (event.hook_event === "Dispatched") {
+      foldDispatched(db, event);
+    } else if (event.hook_event === "DispatchExpired") {
+      foldDispatchExpired(db, event);
     } else if (event.hook_event === "AutopilotPaused") {
       foldAutopilotPaused(db, event);
     } else if (event.hook_event === "BackendExecSnapshot") {

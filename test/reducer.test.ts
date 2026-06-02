@@ -13052,6 +13052,413 @@ test("zero-event projection: a fresh DB has zero dispatch_failures rows", () => 
 });
 
 // ---------------------------------------------------------------------------
+// Schema v50 (fn-678) — `pending_dispatches` reducer projection. The autopilot
+// reconciler mints `Dispatched{verb, id, dir, ts}` BEFORE invoking
+// `ExecBackend.launch()` (outbox ordering); the reducer UPSERTs into
+// `pending_dispatches` keyed on `(verb, id)`. Discharge fans out through
+// three event-sourced paths — discharge-on-bind (SessionStart spawn-INSERT
+// for a matching `(plan_verb, plan_ref)`), `DispatchFailed` (loops out the
+// pending row in the same fold), and `DispatchExpired` (producer-side TTL
+// sweep). All folds are pure (no `Date.now`, no env, no liveness re-probe)
+// and a from-scratch re-fold reproduces the table byte-identically.
+// ---------------------------------------------------------------------------
+
+function dispatchedEvent(
+  verb: string,
+  id: string,
+  dir: string | null,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "Dispatched",
+    session_id: sessionId,
+    data: JSON.stringify({ verb, id, dir, ts }),
+  });
+}
+
+function dispatchExpiredEvent(
+  verb: string,
+  id: string,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "DispatchExpired",
+    session_id: sessionId,
+    data: JSON.stringify({ verb, id }),
+  });
+}
+
+function getPendingDispatch(verb: string, id: string) {
+  return db
+    .query("SELECT * FROM pending_dispatches WHERE verb = ? AND id = ?")
+    .get(verb, id) as {
+    verb: string;
+    id: string;
+    dir: string | null;
+    dispatched_at: number;
+    last_event_id: number;
+  } | null;
+}
+
+test("Dispatched UPSERTs a new pending_dispatches row and advances the cursor (fn-678)", () => {
+  const eventId = dispatchedEvent(
+    "plan-plan",
+    "fn-678-decouple-dispatch-from-tab-naming.3",
+    "/Users/mike/code/keeper",
+    1_700_000_000,
+  );
+  expect(drainAll()).toBe(1);
+  const row = getPendingDispatch(
+    "plan-plan",
+    "fn-678-decouple-dispatch-from-tab-naming.3",
+  );
+  expect(row).not.toBeNull();
+  expect(row?.verb).toBe("plan-plan");
+  expect(row?.id).toBe("fn-678-decouple-dispatch-from-tab-naming.3");
+  expect(row?.dir).toBe("/Users/mike/code/keeper");
+  expect(row?.dispatched_at).toBe(1_700_000_000);
+  expect(row?.last_event_id).toBe(eventId);
+  expect(getCursor()).toBe(eventId);
+});
+
+test("Dispatched UPSERT updates dir / dispatched_at / last_event_id on collision (fn-678)", () => {
+  const firstId = dispatchedEvent("plan-plan", "fn-X.1", "/repo-a", 1700);
+  drainAll();
+  const before = getPendingDispatch("plan-plan", "fn-X.1");
+  expect(before).not.toBeNull();
+  expect(before?.dir).toBe("/repo-a");
+  expect(before?.dispatched_at).toBe(1700);
+
+  // A second Dispatched for the same `(verb, id)` (a re-dispatch after a
+  // prior failure/expire — possible across keeperd restarts). The UPSERT
+  // refreshes every column to the latest mint's values: row presence IS
+  // the signal, so there's no "first observation" semantic to preserve.
+  const secondId = dispatchedEvent("plan-plan", "fn-X.1", "/repo-b", 1900);
+  drainAll();
+  const after = getPendingDispatch("plan-plan", "fn-X.1");
+  expect(after).not.toBeNull();
+  expect(after?.dir).toBe("/repo-b");
+  expect(after?.dispatched_at).toBe(1900);
+  expect(after?.last_event_id).toBe(secondId);
+  expect(after?.last_event_id).toBeGreaterThan(firstId);
+});
+
+test("Dispatched with a null/missing dir folds dir to NULL (fn-678)", () => {
+  dispatchedEvent("plan-plan", "fn-Y.1", null, 1700);
+  drainAll();
+  const row = getPendingDispatch("plan-plan", "fn-Y.1");
+  expect(row).not.toBeNull();
+  expect(row?.dir).toBeNull();
+});
+
+test("Dispatched with a malformed payload is a safe no-op (cursor still advances, no row written) (fn-678)", () => {
+  // Malformed shapes the extractor must reject: bad JSON, missing verb,
+  // empty id, non-number ts. Each must fold to a no-op.
+  const malformed = [
+    { hook_event: "Dispatched", data: "{ not json" },
+    {
+      hook_event: "Dispatched",
+      data: JSON.stringify({ id: "x", ts: 1 }),
+    }, // missing verb
+    {
+      hook_event: "Dispatched",
+      data: JSON.stringify({ verb: "v", id: "", ts: 1 }),
+    }, // empty id
+    {
+      hook_event: "Dispatched",
+      data: JSON.stringify({ verb: "v", id: "x", ts: "soon" }),
+    }, // non-number ts
+    { hook_event: "Dispatched", data: JSON.stringify({ verb: "v", id: "x" }) }, // missing ts
+  ];
+  let lastId = 0;
+  for (const ev of malformed) {
+    lastId = insertEvent({
+      hook_event: ev.hook_event,
+      session_id: "reconciler",
+      data: ev.data,
+    });
+  }
+  expect(drainAll()).toBe(malformed.length);
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM pending_dispatches").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+  expect(getCursor()).toBe(lastId);
+});
+
+test("DispatchExpired deletes the (verb, id) row and advances the cursor (fn-678)", () => {
+  dispatchedEvent("plan-plan", "fn-Z.1", "/r", 1700);
+  drainAll();
+  expect(getPendingDispatch("plan-plan", "fn-Z.1")).not.toBeNull();
+
+  const expireId = dispatchExpiredEvent("plan-plan", "fn-Z.1");
+  expect(drainAll()).toBe(1);
+  expect(getPendingDispatch("plan-plan", "fn-Z.1")).toBeNull();
+  expect(getCursor()).toBe(expireId);
+});
+
+test("DispatchExpired on a non-existent (verb, id) is a safe no-op (cursor still advances, no throw) (fn-678)", () => {
+  // The boot-drain race the spec calls out: a SessionStart already
+  // discharged the row when the TTL sweep's `DispatchExpired` lands.
+  // The fold MUST NOT throw on a missing row — a throw rolls back the
+  // cursor and wedges the reducer.
+  const id = dispatchExpiredEvent("plan-plan", "fn-never-pending.1");
+  expect(drainAll()).toBe(1);
+  expect(getPendingDispatch("plan-plan", "fn-never-pending.1")).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("DispatchExpired with a malformed payload is a safe no-op (cursor still advances) (fn-678)", () => {
+  const malformed = [
+    { hook_event: "DispatchExpired", data: "{ not json" },
+    { hook_event: "DispatchExpired", data: JSON.stringify({}) }, // missing both
+    {
+      hook_event: "DispatchExpired",
+      data: JSON.stringify({ verb: "v" }),
+    }, // missing id
+    {
+      hook_event: "DispatchExpired",
+      data: JSON.stringify({ verb: "", id: "x" }),
+    }, // empty verb
+  ];
+  let lastId = 0;
+  for (const ev of malformed) {
+    lastId = insertEvent({
+      hook_event: ev.hook_event,
+      session_id: "reconciler",
+      data: ev.data,
+    });
+  }
+  expect(drainAll()).toBe(malformed.length);
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM pending_dispatches").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+  expect(getCursor()).toBe(lastId);
+});
+
+test("DispatchFailed deletes the matching pending_dispatches row in the same fold tx (fn-678)", () => {
+  // The outbox ordering: `Dispatched` mints BEFORE `launch()`, so a launch
+  // failure leaves the pending row + the dispatch_failures row both alive.
+  // The widened `foldDispatchFailed` reconciles them in one fold.
+  dispatchedEvent("plan-plan", "fn-fail.1", "/repo", 1700);
+  drainAll();
+  expect(getPendingDispatch("plan-plan", "fn-fail.1")).not.toBeNull();
+
+  // Mint the DispatchFailed for the same `(verb, id)`. Reuse the
+  // dispatchFailedEvent helper defined earlier in this file.
+  dispatchFailedEvent("plan-plan", "fn-fail.1", "launch_failed", "/repo", 1750);
+  drainAll();
+
+  // Both projections must reflect: the failure row exists (sticky), the
+  // pending row is gone.
+  expect(getDispatchFailure("plan-plan", "fn-fail.1")).not.toBeNull();
+  expect(getPendingDispatch("plan-plan", "fn-fail.1")).toBeNull();
+});
+
+test("DispatchFailed without a prior Dispatched is still a safe no-op on pending_dispatches (fn-678)", () => {
+  // Idempotent: the widened DELETE matches zero rows — no error, the
+  // dispatch_failures arm still UPSERTs normally.
+  dispatchFailedEvent(
+    "plan-plan",
+    "fn-orphan.1",
+    "confirm_timeout",
+    "/r",
+    1700,
+  );
+  drainAll();
+  expect(getDispatchFailure("plan-plan", "fn-orphan.1")).not.toBeNull();
+  expect(getPendingDispatch("plan-plan", "fn-orphan.1")).toBeNull();
+});
+
+test("discharge-on-bind: SessionStart spawn-INSERT clears the matching pending_dispatches row (fn-678)", () => {
+  // Outbox flow: autopilot mints `Dispatched` then `launch()`s a worker
+  // whose spawn name is `work::fn-678-foo.1`. The worker's first
+  // `SessionStart` carries that spawn name and seeds the row's
+  // `plan_verb='work' / plan_ref='fn-678-foo.1'`. The set-once stamp on
+  // the spawn-INSERT branch discharges the pending dispatch in the SAME
+  // fold transaction.
+  dispatchedEvent("work", "fn-678-foo.1", "/repo", 1700);
+  drainAll();
+  expect(getPendingDispatch("work", "fn-678-foo.1")).not.toBeNull();
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-bind",
+    spawn_name: "work::fn-678-foo.1",
+  });
+  drainAll();
+  // The session's row carries the plan correlator AND the pending row
+  // was discharged inline.
+  const job = getJob("sess-bind");
+  expect(job?.plan_verb).toBe("work");
+  expect(job?.plan_ref).toBe("fn-678-foo.1");
+  expect(getPendingDispatch("work", "fn-678-foo.1")).toBeNull();
+});
+
+test("discharge-on-bind: a SessionStart on a spawn name NOT matching the plan-verb whitelist leaves pending_dispatches untouched (fn-678)", () => {
+  // `planVerbRefFromSpawnName` returns `{ plan_verb: null, plan_ref: null }`
+  // for any spawn name outside the strict `{plan|work|close|approve}::<ref>`
+  // whitelist. The discharge guard requires BOTH non-null, so a non-matching
+  // session leaves any pending row alive (it would only ever match a row
+  // with verb/id null — which the table forbids).
+  dispatchedEvent("work", "fn-678-keep.1", "/repo", 1700);
+  drainAll();
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-arbitrary",
+    spawn_name: "human-launched-session",
+  });
+  drainAll();
+  expect(getPendingDispatch("work", "fn-678-keep.1")).not.toBeNull();
+});
+
+test("discharge-on-bind: SessionStart with NO matching pending row is a safe no-op (fn-678)", () => {
+  // A worker can be human-launched with a `work::fn-X.1` spawn name even
+  // when the autopilot never minted a `Dispatched` for it — the DELETE
+  // must be idempotent.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-human",
+    spawn_name: "work::fn-678-no-autopilot.1",
+  });
+  drainAll();
+  const job = getJob("sess-human");
+  expect(job?.plan_verb).toBe("work");
+  expect(job?.plan_ref).toBe("fn-678-no-autopilot.1");
+  // No pending row was ever minted; the discharge is a no-op DELETE.
+  expect(getPendingDispatch("work", "fn-678-no-autopilot.1")).toBeNull();
+});
+
+test("discharge-on-bind FIRES ONLY on the spawn-INSERT branch, NOT on resume (fn-678)", () => {
+  // First SessionStart with a matching spawn name → spawn-INSERT branch,
+  // discharge fires.
+  dispatchedEvent("work", "fn-678-resume.1", "/repo", 1700);
+  drainAll();
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-resume",
+    spawn_name: "work::fn-678-resume.1",
+  });
+  drainAll();
+  expect(getPendingDispatch("work", "fn-678-resume.1")).toBeNull();
+
+  // Now: the autopilot mints a FRESH `Dispatched` for the SAME
+  // `(verb, id)` (the prior session ended; the reconciler re-dispatched
+  // a new worker). A subsequent duplicate SessionStart on the SAME
+  // `sess-resume` (a resume of the original session — NOT the freshly
+  // dispatched worker) MUST NOT discharge the legitimately re-pending
+  // row. This is the "resume must not clear a re-pending dispatch"
+  // invariant the spec calls out.
+  dispatchedEvent("work", "fn-678-resume.1", "/repo", 1800);
+  drainAll();
+  expect(getPendingDispatch("work", "fn-678-resume.1")).not.toBeNull();
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-resume",
+    spawn_name: "work::fn-678-resume.1",
+  });
+  drainAll();
+  // The pending row survives — the resume hit the ON CONFLICT branch,
+  // not the spawn-INSERT branch.
+  const row = getPendingDispatch("work", "fn-678-resume.1");
+  expect(row).not.toBeNull();
+  expect(row?.dispatched_at).toBe(1800);
+});
+
+test("zero-event projection: a fresh DB has zero pending_dispatches rows (fn-678)", () => {
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM pending_dispatches").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+});
+
+test("from-scratch re-fold over a historical pre-fn-678 log reproduces an empty pending_dispatches (fn-678)", () => {
+  // Simulate a pre-v50 event log: SessionStart events but NO `Dispatched`
+  // events. A from-scratch re-fold MUST reproduce an empty
+  // `pending_dispatches` table — matching the zero-event projection
+  // default (no events historically minted `Dispatched`).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-historical-1",
+    spawn_name: "work::fn-678-old.1",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-historical-2",
+    spawn_name: "plan::fn-678-old-epic",
+  });
+  drainAll();
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM pending_dispatches");
+  db.run("DELETE FROM jobs");
+  drainAll();
+
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM pending_dispatches").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+});
+
+test("from-scratch re-fold reproduces the pending_dispatches projection byte-identically (fn-678)", () => {
+  // Seed a representative sequence exercising every fold arm:
+  // - Dispatched (UPSERT)
+  // - Dispatched UPSERT collision (same (verb, id), new dir/ts)
+  // - Discharge-on-bind via SessionStart spawn-INSERT
+  // - Distinct-key Dispatched (survives a sibling's discharge)
+  // - DispatchFailed widened DELETE (loop-out a pending row)
+  // - DispatchExpired idempotent DELETE
+  dispatchedEvent("work", "fn-678-a.1", "/r1", 1700);
+  dispatchedEvent("work", "fn-678-a.1", "/r2", 1750); // UPSERT collision
+  dispatchedEvent("plan", "fn-678-b-epic", "/r3", 1800);
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-A",
+    spawn_name: "work::fn-678-a.1",
+  });
+  // After this point: fn-678-a.1 discharged (gone), fn-678-b-epic still pending.
+  dispatchedEvent("work", "fn-678-c.1", "/r4", 1900);
+  dispatchFailedEvent("work", "fn-678-c.1", "launch_failed", "/r4", 1950);
+  // After this point: fn-678-c.1 also gone (failed → widened DELETE).
+  dispatchedEvent("close", "fn-678-d-epic", "/r5", 2000);
+  dispatchExpiredEvent("close", "fn-678-d-epic");
+  // After this point: fn-678-d-epic also gone (TTL expired).
+  dispatchedEvent("approve", "fn-678-e.1", "/r6", 2100);
+  // After this point: ONLY fn-678-b-epic + fn-678-e.1 are still pending.
+  drainAll();
+
+  const before = db
+    .query("SELECT * FROM pending_dispatches ORDER BY verb ASC, id ASC")
+    .all();
+  expect(before.length).toBe(2);
+
+  // Rewind cursor + wipe projection + re-drain. The post-rewind rows
+  // must equal the pre-rewind rows byte-for-byte — the from-scratch
+  // re-fold determinism invariant.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM pending_dispatches");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM dispatch_failures");
+  drainAll();
+
+  const after = db
+    .query("SELECT * FROM pending_dispatches ORDER BY verb ASC, id ASC")
+    .all();
+  expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
 // Schema v47 (fn-667) — `autopilot_state` singleton reducer projection. Main
 // mints `AutopilotPaused{paused:boolean}` events (steady-state via the
 // `set_autopilot_paused` RPC bridge, boot via the daemon's boot-append
