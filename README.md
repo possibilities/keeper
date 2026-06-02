@@ -1400,7 +1400,29 @@ other producers it does NOT write the DB directly; the fold keeps re-fold
 determinism on the synthetic-event side (no fold-time spawn, no env reads
 inside `applyEvent`).
 
-The nine workers are fully independent; main supervises all nine lifecycles
+A **tenth** Worker thread is the restore-snapshot worker (epic fn-677):
+a pure CONSUMER that opens its own read-only connection, polls
+`PRAGMA data_version` via the shared `watchLoop` primitive, and on every
+change reads the `jobs` + `epics` projections through the same `runQuery`
+read seam the autopilot worker uses. It builds a stable
+{`schema_version`, `captured_at`, `sessions`} descriptor of the live
+(`working` / `stopped`) jobs grouped by zellij `backend_exec_session_id`,
+hashes the serialized bytes (excluding `captured_at` so an informational
+timestamp doesn't churn the hash on every pulse), and rewrites
+`~/.local/state/keeper/restore.json` via `atomicWriteFile` ONLY when the
+hash differs from the in-memory `lastHash`. The file is a derived
+side-file — NOT a projection, NOT in the event log — so the worker
+sidesteps the event-sourcing invariants entirely (no schema bump, no
+reducer arm, no `keeper/api.py` whitelist change). The worker carries no
+`onmessage` handler — it never posts to main, never writes the DB. Write
+failures are swallowed to stderr (next pulse retries); only an unhandled
+throw out of the watch loop escalates to `onerror`/`close` → fatalExit.
+The `scripts/restore-agents.ts` util is the sole reader; its `--apply`
+mode relaunches the surviving agents via the exact `claude --resume`
+shape `scripts/resume.ts` emits, deduplicated against jobs still live in
+the projection.
+
+The ten workers are fully independent; main supervises all ten lifecycles
 but routes none of their traffic, and any worker's `error` event escalates
 the whole process to a clean restart — with that single scoped exception, the
 recoverable drop signal on the transcript, plan, usage, and dead-letter

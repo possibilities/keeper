@@ -9,7 +9,7 @@
  *   2. Boot drain: `while (drain(db, BATCH) > 0) {}` — fold every unfolded event
  *      using the SAME code path as steady-state. After downtime this catches the
  *      projection up before the daemon goes live.
- *   3. Spawn SEVEN worker threads (all AFTER migrate + boot drain + seed sweep,
+ *   3. Spawn TEN worker threads (all AFTER migrate + boot drain + seed sweep,
  *      so their read-only `openDb` connections never race a missing/un-migrated
  *      DB and the exit-watcher's data_version diff sees a settled projection):
  *      - the wake worker — opens its own read-only connection, polls
@@ -49,7 +49,7 @@
  *      no event is missed (drain always re-reads from the cursor) and drain is
  *      never invoked re-entrantly. A `transcript-title` / `exit` message
  *      inserts the synthetic event then pumps a wake to fold it.
- *   5. SIGTERM: post `{ type: "shutdown" }` to ALL SEVEN workers, await their
+ *   5. SIGTERM: post `{ type: "shutdown" }` to ALL TEN workers, await their
  *      `close` events against a short deadline, terminate them, close the db,
  *      exit 0. This is the ONLY clean exit. The server worker releases its
  *      socket + lock, the transcript + plan workers unsubscribe their watchers,
@@ -100,6 +100,7 @@ import type {
   RecheckPendingMessage,
 } from "./plan-worker";
 import { DEFAULT_BATCH_SIZE, type DrainOptions, drain } from "./reducer";
+import type { RestoreWorkerData } from "./restore-worker";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
   ReplayRequestMessage,
@@ -2054,6 +2055,38 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
+  // Spawn the restore-snapshot worker (fn-677 task .3) — the TENTH worker
+  // thread. A pure CONSUMER: it opens its own read-only connection, polls
+  // `PRAGMA data_version`, and on every change reads the `jobs` + `epics`
+  // projections via the shared `runQuery` seam, builds a stable descriptor
+  // of the live (`working`/`stopped`) jobs grouped by zellij
+  // `backend_exec_session_id`, and rewrites `~/.local/state/keeper/restore.json`
+  // via `atomicWriteFile` ONLY when the content hash differs. The file is
+  // a derived side-file (NOT a projection, NOT in the event log), so the
+  // worker carries no `onmessage` handler — it never posts to main, never
+  // writes the DB, and never feeds the event log. The `scripts/restore-agents.ts`
+  // util (T4) is the sole reader.
+  //
+  // Write failures inside the worker are SWALLOWED to stderr (the next
+  // pulse re-writes); only an unhandled throw out of the watch loop
+  // escalates to `onerror`/`close` → fatalExit. Consistent with the other
+  // workers' crash policy.
+  const restoreWorker = new Worker(
+    new URL("./restore-worker.ts", import.meta.url).href,
+    {
+      workerData: { dbPath } satisfies RestoreWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  restoreWorker.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] restore worker error:", err.message ?? err);
+    fatalExit();
+  };
+
+  restoreWorker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
+
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -2100,16 +2133,20 @@ function runDaemon(): void {
     autopilotWorkerInstance.postMessage({
       type: "shutdown",
     } satisfies ShutdownMessage);
+    restoreWorker.postMessage({
+      type: "shutdown",
+    } satisfies ShutdownMessage);
 
-    // Bun surfaces worker exit via the "close" event. Await ALL NINE
+    // Bun surfaces worker exit via the "close" event. Await ALL TEN
     // workers' close (the server worker releases its socket + lock, the
     // transcript + plan + usage + dead-letter workers unsubscribe their
-    // watchers, the exit-watcher releases its kqueue/pidfd fd, and the
-    // autopilot worker aborts its in-flight confirm in their own
-    // shutdown handlers — that teardown must land, or the socket /
-    // native watches / kernel fd leak into the next boot), raced
-    // against a single shared deadline so a wedged worker can't block
-    // our clean shutdown forever.
+    // watchers, the exit-watcher releases its kqueue/pidfd fd, the
+    // autopilot worker aborts its in-flight confirm, and the restore
+    // worker closes its read-only DB connection in their own shutdown
+    // handlers — that teardown must land, or the socket / native
+    // watches / kernel fd leak into the next boot), raced against a
+    // single shared deadline so a wedged worker can't block our clean
+    // shutdown forever.
     const exited = (w: Worker): Promise<void> =>
       new Promise<void>((resolve) => {
         w.addEventListener("close", () => resolve());
@@ -2126,6 +2163,7 @@ function runDaemon(): void {
         exited(backendWorker),
         exited(deadLetterWorker),
         exited(autopilotWorkerInstance),
+        exited(restoreWorker),
       ]),
       Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS),
     ]);
@@ -2177,6 +2215,11 @@ function runDaemon(): void {
     }
     try {
       autopilotWorkerInstance.terminate();
+    } catch {
+      // best-effort if it already exited
+    }
+    try {
+      restoreWorker.terminate();
     } catch {
       // best-effort if it already exited
     }

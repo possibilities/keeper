@@ -70,8 +70,16 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   server-worker writes only the `approval` field on external `.planctl` JSON
   (atomic temp+rename) and bridges `replay_dead_letter`,
   `set_autopilot_paused`, and `retry_dispatch` to main — it never writes the
-  event log itself. Producer workers (including the autopilot reconciler) feed
-  the log only via main's writable connection; they never write the DB.
+  event log itself. The restore-worker (epic fn-677) is the sole writer of
+  `~/.local/state/keeper/restore.json` — a pure CONSUMER derived side-file
+  that is NOT a projection, NOT in the event log, and never feeds either; the
+  worker carries no `onmessage` handler and writes nothing through main. Test
+  isolation env-var list extends accordingly: `KEEPER_RESTORE_FILE` joins
+  `KEEPER_DB` / `KEEPER_DEAD_LETTER_DIR` / `KEEPER_DROP_LOG` as a path that
+  must be sandbox-overridden in every spawn test so the user's real
+  `restore.json` is never touched. Producer workers (including the autopilot
+  reconciler) feed the log only via main's writable connection; they never
+  write the DB.
 - **Producer-only liveness probing.** The boot seed sweep and the exit-watcher
   worker are the ONLY places that probe liveness (`kill(pid,0)`, kqueue, pidfd,
   `(pid, start_time)` recycle check). Folds NEVER re-probe — a re-probe inside a
