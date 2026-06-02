@@ -1649,3 +1649,370 @@ test("createZellijBackend: omitting session is allowed (session-agnostic-only co
   const got = await backend.focusPane("any", "1");
   expect(got).toEqual({ ok: true });
 });
+
+// ---------------------------------------------------------------------------
+// ExecBackend.ensureLaunched — session-agnostic get-or-create + launch.
+// Mirrors `launch`'s mint + orphan-reap + session-gone-retry resiliences
+// but parameterized by the per-call session, no shared memo.
+// ---------------------------------------------------------------------------
+
+test("ExecBackend.ensureLaunched: pre-existing live session → new-tab (no attach, no orphan reap), omits --name when absent", async () => {
+  // The restore path passes no tab name — buildZellijNewTabArgs omits
+  // `--name` entirely so the restored agent looks identical to a
+  // human-opened tab. And a session that's already live MUST NOT be
+  // `--forget`'d (the EXITED gate inside `zellijSessionListed` is what
+  // guarantees this); no `attach` spawn fires.
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "list-sessions") return reply("other-session\n");
+    if (cmd[1] === "--session" && cmd[4] === "new-tab") return reply("");
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    spawn,
+  });
+  const res = await backend.ensureLaunched(
+    "other-session",
+    ["/bin/zsh", "-l", "-i", "-c", "echo hi"],
+    "/tmp/proj",
+  );
+  expect(res).toEqual({ ok: true });
+  // Order: list-sessions (already live → skip attach) → new-tab.
+  expect(calls[0]?.[1]).toBe("list-sessions");
+  const newTab = calls.find((c) => c[1] === "--session" && c[4] === "new-tab");
+  expect(newTab).toBeDefined();
+  // The PER-CALL session is on the wire, not the construction default.
+  expect(newTab?.[2]).toBe("other-session");
+  // No --name flag — buildZellijNewTabArgs omits it when undefined.
+  expect(newTab).not.toContain("--name");
+  // No attach spawn — the pre-existing live session was respected.
+  expect(calls.some((c) => c[1] === "attach")).toBe(false);
+  // No orphan reap — only mints leave a default tab to clean up.
+  expect(calls.some((c) => c[4] === "close-tab-by-id")).toBe(false);
+});
+
+test("ExecBackend.ensureLaunched: absent session → attach -b --forget, poll, new-tab, then reap orphan default Tab #1", async () => {
+  // Full mint path: list-sessions empty → attach -b --forget mints →
+  // poll shows it live → list-tabs captures default tab id → new-tab
+  // lands → close-tab-by-id reaps the orphan default. All
+  // parameterized by the per-call session, no `pendingOrphanTabId`
+  // clobber on the closure's managed-session slot.
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  let listCalls = 0;
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "list-sessions") {
+      listCalls++;
+      return reply(listCalls === 1 ? "" : "restored\n");
+    }
+    if (cmd[1] === "attach") return reply("");
+    if (cmd[1] === "--session" && cmd[4] === "list-tabs") {
+      return reply("TAB_ID  POSITION  NAME\n0  0  Tab #1\n");
+    }
+    if (cmd[1] === "--session" && cmd[4] === "new-tab") return reply("");
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    // Construction-session is irrelevant — ensureLaunched targets the
+    // per-call session. We pick a different name on purpose.
+    session: "autopilot",
+    spawn,
+  });
+  const res = await backend.ensureLaunched(
+    "restored",
+    ["/bin/zsh", "-c", "echo hi"],
+    "/abs/dir",
+  );
+  expect(res).toEqual({ ok: true });
+  // Mint argv MUST carry --forget for fn-675 (don't resurrect a
+  // degraded session-layout.kdl cache) and must target the per-call
+  // session.
+  const attachCall = calls.find((c) => c[1] === "attach");
+  expect(attachCall).toEqual([
+    "zellij",
+    "attach",
+    "-b",
+    "--forget",
+    "restored",
+  ]);
+  // list-tabs captured the default tab id against the per-call session.
+  const listTabsCall = calls.find(
+    (c) => c[1] === "--session" && c[4] === "list-tabs",
+  );
+  expect(listTabsCall?.[2]).toBe("restored");
+  // new-tab fires AFTER the mint + poll cycle (so its index is past
+  // the first list-sessions probe).
+  const newTabIdx = calls.findIndex(
+    (c) => c[1] === "--session" && c[4] === "new-tab" && c[2] === "restored",
+  );
+  expect(newTabIdx).toBeGreaterThan(1);
+  // Orphan reap: close-tab-by-id with the captured id (0), targeting
+  // the per-call session, AFTER the new-tab lands.
+  const closeIdx = calls.findIndex(
+    (c) =>
+      c[1] === "--session" &&
+      c[2] === "restored" &&
+      c[4] === "close-tab-by-id" &&
+      c[5] === "0",
+  );
+  expect(closeIdx).toBeGreaterThan(newTabIdx);
+});
+
+test("ExecBackend.ensureLaunched: session-gone new-tab stderr → re-ensure + retry once succeeds", async () => {
+  // Mid-call resilience: session was live on the probe but the
+  // new-tab spawn hits "Session 'X' not found" (or "no active
+  // session"). The method re-runs the get-or-create (which mints
+  // via attach -b --forget) and retries new-tab exactly once. The
+  // re-ensure is its OWN cycle — no closure memo to invalidate.
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  // Liveness flips: first probe says alive, first new-tab fails
+  // session-gone, second probe says dead → mint → re-probe shows
+  // alive → retry new-tab succeeds.
+  let listCalls = 0;
+  let newTabCalls = 0;
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string, exitCode = 0, stderr = "") => ({
+      exited: Promise.resolve(exitCode),
+      stdout: new Response(stdout).body,
+      stderr: new Response(stderr).body,
+    });
+    if (cmd[1] === "list-sessions") {
+      listCalls++;
+      // 1st probe (pre-launch): listed live. 2nd probe (re-ensure
+      // after session-gone): empty (forcing the mint). 3rd probe
+      // (re-ensure poll after attach): live again.
+      if (listCalls === 1) return reply("restored\n");
+      if (listCalls === 2) return reply("");
+      return reply("restored\n");
+    }
+    if (cmd[1] === "attach") return reply("");
+    if (cmd[1] === "--session" && cmd[4] === "list-tabs") {
+      return reply("TAB_ID  POSITION  NAME\n0  0  Tab #1\n");
+    }
+    if (cmd[1] === "--session" && cmd[4] === "new-tab") {
+      newTabCalls++;
+      if (newTabCalls === 1) {
+        return reply(
+          "",
+          1,
+          "Session 'restored' not found. The following sessions are active:\nother",
+        );
+      }
+      return reply("");
+    }
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    spawn,
+  });
+  const res = await backend.ensureLaunched(
+    "restored",
+    ["/bin/zsh", "-c", "echo hi"],
+    "/abs",
+  );
+  expect(res).toEqual({ ok: true });
+  // The session-gone path fired exactly one attach -b --forget
+  // against the per-call session (the re-ensure mint).
+  const attachCalls = calls.filter((c) => c[1] === "attach");
+  expect(attachCalls.length).toBe(1);
+  expect(attachCalls[0]).toEqual([
+    "zellij",
+    "attach",
+    "-b",
+    "--forget",
+    "restored",
+  ]);
+  // Exactly two new-tab spawns: the failed one and the retry.
+  const newTabs = calls.filter(
+    (c) => c[1] === "--session" && c[4] === "new-tab",
+  );
+  expect(newTabs.length).toBe(2);
+  // Diagnostic noteLine fired so a human reading the sidecar sees
+  // why the retry happened.
+  expect(notes.some((s) => s.includes("vanished mid-ensureLaunched"))).toBe(
+    true,
+  );
+});
+
+test("ExecBackend.ensureLaunched: ENOENT (binary missing) → { ok: false, error }, never throws", async () => {
+  // A spawn that throws on the new-tab call simulates a missing
+  // zellij binary. runCapture catches and returns null; ensureLaunched
+  // surfaces a typed failure envelope. The pre-launch list-sessions
+  // probe also returns null (the noteLine path inside ensureSessionFor
+  // warns), then new-tab fails the same way.
+  const notes: string[] = [];
+  const spawn: SpawnFn = () => {
+    throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" });
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    spawn,
+  });
+  const res = await backend.ensureLaunched(
+    "restored",
+    ["/bin/zsh", "-c", "echo hi"],
+    "/abs",
+  );
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.error).toContain("ENOENT");
+  }
+});
+
+test("ExecBackend.ensureLaunched: non-zero new-tab exit (not session-gone) → { ok: false, error }, no retry", async () => {
+  // Any non-zero new-tab exit whose stderr does NOT look like
+  // session-gone is a real launch failure — surface it as-is, no
+  // mint, no retry.
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string, exitCode = 0, stderr = "") => ({
+      exited: Promise.resolve(exitCode),
+      stdout: new Response(stdout).body,
+      stderr: new Response(stderr).body,
+    });
+    if (cmd[1] === "list-sessions") return reply("restored\n");
+    if (cmd[1] === "--session" && cmd[4] === "new-tab") {
+      return reply("", 7, "permission denied or something else");
+    }
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    spawn,
+  });
+  const res = await backend.ensureLaunched("restored", ["sh"], "/abs");
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.error).toContain("exited non-zero");
+    expect(res.error).toContain("7");
+  }
+  // No re-mint, exactly one new-tab spawn, no attach.
+  expect(calls.filter((c) => c[1] === "attach").length).toBe(0);
+  expect(
+    calls.filter((c) => c[1] === "--session" && c[4] === "new-tab").length,
+  ).toBe(1);
+});
+
+test("ExecBackend.ensureLaunched: shares no state with managed-session memo (separate launches into different sessions)", async () => {
+  // The managed `launch` path uses the construction-time `session`
+  // and a memoized `sessionReady` + one-shot `pendingOrphanTabId`.
+  // `ensureLaunched` MUST NOT consume that memo or clobber the
+  // orphan slot — otherwise a restore-time call into a non-managed
+  // session would either short-circuit the ensure (wrong session
+  // listed) or steal the managed path's orphan reap. We exercise
+  // both methods back-to-back against different sessions and assert
+  // each ran its OWN list-sessions probe + mint cycle.
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  // Both sessions appear in different list-sessions outputs depending
+  // on which one each probe is asking about. We can't disambiguate
+  // by argv (the probe is just `zellij list-sessions`), so we serve
+  // a different listing per probe by counting calls.
+  let listCalls = 0;
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "list-sessions") {
+      listCalls++;
+      // Probe 1 (launch managed): autopilot is live. Probe 2
+      // (ensureLaunched into "restored"): only autopilot is live, so
+      // "restored" is absent → mint. Probe 3+ (poll for restored):
+      // both live.
+      if (listCalls === 1) return reply("autopilot\n");
+      if (listCalls === 2) return reply("autopilot\n");
+      return reply("autopilot\nrestored\n");
+    }
+    if (cmd[1] === "attach") return reply("");
+    if (cmd[1] === "--session" && cmd[4] === "list-tabs") {
+      return reply("TAB_ID  POSITION  NAME\n0  0  Tab #1\n");
+    }
+    return reply("");
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    session: "autopilot",
+    spawn,
+  });
+  // Managed launch first — primes the sessionReady memo for "autopilot".
+  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  // Now ensureLaunched into a DIFFERENT session. It must NOT see the
+  // memo as "session already ensured" — it must run its own probe,
+  // see "restored" missing, attach, poll, new-tab, reap.
+  await backend.ensureLaunched(
+    "restored",
+    ["/bin/zsh", "-c", "echo hi"],
+    "/abs",
+  );
+  // Two list-sessions: one for managed launch (probe 1), at least
+  // one more for ensureLaunched (probe 2 + post-attach poll).
+  expect(
+    calls.filter((c) => c[1] === "list-sessions").length,
+  ).toBeGreaterThanOrEqual(2);
+  // The attach for "restored" fired — proving ensureLaunched ran its
+  // own mint and did NOT short-circuit on the managed memo.
+  const restoredAttach = calls.find(
+    (c) => c[1] === "attach" && c[4] === "restored",
+  );
+  expect(restoredAttach).toEqual([
+    "zellij",
+    "attach",
+    "-b",
+    "--forget",
+    "restored",
+  ]);
+  // And the orphan reap on "restored" targeted the per-call session,
+  // not the managed one.
+  const restoredReap = calls.find(
+    (c) =>
+      c[1] === "--session" && c[2] === "restored" && c[4] === "close-tab-by-id",
+  );
+  expect(restoredReap?.[5]).toBe("0");
+});
+
+test("ExecBackend.ensureLaunched: empty `name` string still omits --name (defensive)", async () => {
+  // Spec calls for unnamed tabs; the API accepts an optional `name`
+  // but the restore caller may pass an empty string. The argv
+  // builder already collapses both undefined and "" to no flag —
+  // this test pins the contract end-to-end so a regression that
+  // forwards an empty `--name ""` would surface here.
+  const calls: string[][] = [];
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string) => ({
+      exited: Promise.resolve(0),
+      stdout: new Response(stdout).body,
+      stderr: new Response("").body,
+    });
+    if (cmd[1] === "list-sessions") return reply("restored\n");
+    return reply("");
+  };
+  const backend = createZellijBackend({ noteLine: () => {}, spawn });
+  await backend.ensureLaunched("restored", ["sh"], "/abs", "");
+  const newTab = calls.find((c) => c[1] === "--session" && c[4] === "new-tab");
+  expect(newTab).toBeDefined();
+  expect(newTab).not.toContain("--name");
+});

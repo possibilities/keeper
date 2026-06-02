@@ -24,16 +24,21 @@
  *    and put agent panes into it"; the session id is baked into the
  *    backend at construction so the call sites read clean.
  * 2. **Session-agnostic ops** — `focusPane(session, paneId)`,
- *    `resolveTabForPane(session, paneId)`. These take the target session
- *    PER CALL and operate on already-live external sessions — the daemon
- *    tab-resolver worker walks every live job's `(session, pane)` across
- *    arbitrary zellij sessions, and `keeper jobs`'s `v` key focuses the
- *    pane the human's selected job lives in (which may or may not be the
- *    autopilot-managed session). NO session-ensure runs for these ops;
- *    a non-existent session degrades to `null` / `{ ok: false }` without
- *    minting anything. Construction may omit `session` (it defaults to
- *    `DEFAULT_ZELLIJ_SESSION`) when the consumer only touches this
- *    category — the field is required for the lifecycle ops alone.
+ *    `resolveTabForPane(session, paneId)`, `ensureLaunched(session,
+ *    argv, cwd, name?)`. These take the target session PER CALL and
+ *    operate on (or get-or-create) arbitrary external sessions — the
+ *    daemon tab-resolver worker walks every live job's `(session,
+ *    pane)`, `keeper jobs`'s `v` key focuses the pane the human's
+ *    selected job lives in, and the restore-agents util relaunches
+ *    each surviving agent back into its original session.
+ *    `focusPane`/`resolveTabForPane` run NO session-ensure (degrade
+ *    to `null` / `{ ok: false }` against a missing session);
+ *    `ensureLaunched` runs its OWN per-call get-or-create that mirrors
+ *    the managed session's `attach -b --forget` + poll logic but
+ *    shares no memo or orphan-reap state with it. Construction may
+ *    omit `session` (it defaults to `DEFAULT_ZELLIJ_SESSION`) when the
+ *    consumer only touches this category — the field is required for
+ *    the lifecycle ops alone.
  *
  * Public surface
  * --------------
@@ -82,6 +87,16 @@
  *   `null` on ENOENT / non-zero exit / unparseable JSON / zero or
  *   multiple matches. The caller treats `null` as "no snapshot; leave
  *   existing tab columns alone" — never as "clear them."
+ * - `ExecBackend.ensureLaunched(session, argv, cwd, name?) -> { ok,
+ *   error? }` — session-agnostic. Get-or-creates the target `session`
+ *   (probe `list-sessions` → `attach -b --forget` + poll only when
+ *   absent / EXITED) and launches `argv` in a new tab at `cwd` inside
+ *   it. `name` is optional and unset on the restore path (no `--name`
+ *   on the tab). Returns the same `LaunchResult` envelope as `launch`;
+ *   ENOENT / non-zero exit collapse to `{ ok: false, error }`, never
+ *   throws. Shares NO state with the managed `session` memo or its
+ *   `pendingOrphanTabId` — per-call orphan reap, per-call session-gone
+ *   single-retry. Drives the `restore-agents.ts` util's replay path.
  * - `createZellijBackend({ noteLine, session?, spawn? })` — lazy
  *   session-ensure (memoized once) + `action new-tab --cwd <abs>
  *   --name <name> -- <argv>` for the lifecycle ops; session-agnostic
@@ -159,11 +174,15 @@ export type LaunchResult = { ok: true } | { ok: false; error: string };
  * `createZellijBackend({ session })`. The session is memoized once per
  * backend; agent-pane dispatch / reap go through this surface.
  *
- * Session-agnostic ops (`focusPane`, `resolveTabForPane`) take the
- * target session per call and operate on already-live external
- * sessions — no session-ensure runs and a non-existent session
- * degrades to `null` / `{ ok: false }`. Used by the daemon's
- * tab-resolver worker and the `keeper jobs` `v` focus key.
+ * Session-agnostic ops (`focusPane`, `resolveTabForPane`,
+ * `ensureLaunched`) take the target session per call. `focusPane`
+ * and `resolveTabForPane` operate on already-live external sessions
+ * (no session-ensure; missing session → `null` / `{ ok: false }`).
+ * `ensureLaunched` runs its OWN per-call get-or-create that mirrors
+ * the managed ensure path but shares no memo with it, then launches
+ * an unnamed tab — driving the restore-agents replay. Used by the
+ * daemon's tab-resolver worker, the `keeper jobs` `v` focus key,
+ * and `restore-agents.ts`.
  */
 export interface ExecBackend {
   /** Session-bound lifecycle. Spawn a terminal surface running `argv`
@@ -248,6 +267,33 @@ export interface ExecBackend {
     session: string,
     paneId: string,
   ): Promise<ResolvedTabCoords | null>;
+  /** Session-agnostic. Get-or-create the target `session` (mint via
+   *  `attach -b --forget` + `list-sessions` poll only when absent /
+   *  EXITED — already-live sessions are NEVER `--forget`'d) and launch
+   *  `argv` in a new tab at `cwd` inside it. The tab is unnamed —
+   *  `buildZellijNewTabArgs` omits `--name` when `name` is empty /
+   *  absent, mirroring the restore use case (Chrome-style restore-
+   *  previous-session emits no `verb::id` tab name). Returns the same
+   *  `LaunchResult` envelope as `launch` — exit 0 → `{ ok: true }`;
+   *  ENOENT / non-zero exit → `{ ok: false, error }`; NEVER throws.
+   *
+   *  Shares NO state with the construction-time `session` memo or its
+   *  `pendingOrphanTabId`: this op runs against an arbitrary external
+   *  session per call (the restore-agents util replays into the
+   *  session each agent originally lived in). The mint path is its
+   *  own — the orphan default `Tab #1` is reaped per-call after the
+   *  agent tab lands (only when this op minted the session; an
+   *  already-live session has no orphan to reap). A session-gone
+   *  new-tab stderr (`Session '<n>' not found` / `no active session`)
+   *  triggers a one-shot re-ensure + retry, mirroring `launch`'s
+   *  resilience for the case where the target session died between
+   *  the ensure probe and the new-tab spawn. */
+  ensureLaunched(
+    session: string,
+    argv: string[],
+    cwd: string,
+    name?: string,
+  ): Promise<LaunchResult>;
 }
 
 /**
@@ -854,61 +900,93 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
     }
   }
 
+  /**
+   * Session-parameterized get-or-create. Shared between the managed
+   * `ensureSession` memo (called with the construction `session`) and
+   * the per-call `ensureLaunched` path (called with the caller's
+   * target session). Mirrors the original ensureSession control flow
+   * exactly — list-sessions probe, `attach -b --forget` mint when
+   * absent/EXITED, color-capable env on the mint spawn, ~50ms poll
+   * up to 5s, fresh-mint default-tab id capture — but returns the
+   * captured orphan-tab id (null when the session pre-existed or the
+   * list-tabs capture failed) instead of mutating the closure's
+   * memoized `pendingOrphanTabId`. The two callers own their own
+   * orphan-reap state: the managed `launch` path stashes into the
+   * closure's one-shot field (cleared after first reap); the
+   * `ensureLaunched` path keeps the id local to the call. NEVER
+   * throws — every failure mode (binary missing, mint timeout)
+   * degrades to a noteLine warn + null orphan id, and the caller
+   * proceeds with the new-tab spawn (which will then fail honestly
+   * if the session truly never came up).
+   */
+  async function ensureSessionFor(
+    targetSession: string,
+  ): Promise<{ orphanTabId: string | null }> {
+    // Probe first — a session already listed is the steady state.
+    const listed = await runCapture(buildZellijListSessionsArgs());
+    if (listed == null) {
+      deps.noteLine(
+        `# warn: zellij list-sessions failed (binary missing?); subsequent launches will no-op`,
+      );
+      return { orphanTabId: null };
+    }
+    if (zellijSessionListed(listed.stdout, targetSession)) {
+      // Pre-existing live session — never `--forget` it, never reap a
+      // default tab (there isn't one we minted).
+      return { orphanTabId: null };
+    }
+    // Not listed (absent OR EXITED corpse) — fire
+    // `attach -b --forget <session>` to FORGET any saved/serialized
+    // session and mint a fresh detached background session, then
+    // poll `list-sessions` until it appears. `--forget` defeats the
+    // bar-less resurrection from a degraded `session-layout.kdl`
+    // cache (fn-675); it is a harmless no-op when nothing is saved.
+    //
+    // The zellij server inherits THIS spawn's env, and every pane it
+    // later launches inherits the server's. keeperd runs as a
+    // LaunchAgent whose env is stripped to `PATH` (no `TERM`/
+    // `COLORTERM`), so a session minted here would render every worker
+    // pane colorblind. Carry color-capable defaults — preserving a real
+    // terminal's values on the off chance one exists (tests, a future
+    // non-LaunchAgent run) — so the autopilot worker's `claude` TUI
+    // shows color. Spread `process.env` first to keep `PATH` et al.
+    await runCapture(buildZellijAttachBgArgs(targetSession), {
+      ...(process.env as Record<string, string>),
+      TERM: process.env.TERM ?? "xterm-256color",
+      COLORTERM: process.env.COLORTERM ?? "truecolor",
+    });
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const probe = await runCapture(buildZellijListSessionsArgs());
+      if (probe != null && zellijSessionListed(probe.stdout, targetSession)) {
+        // Freshly minted: capture the default `Tab #1` id so the first
+        // launch can reap it once the agent tab exists. Best-effort —
+        // a missing/unparsable list returns null and we simply keep
+        // the default tab.
+        const tabs = await runCapture(buildZellijListTabsArgs(targetSession));
+        if (tabs != null) {
+          return { orphanTabId: firstTabIdFromListTabs(tabs.stdout) };
+        }
+        return { orphanTabId: null };
+      }
+      await delay(50);
+    }
+    deps.noteLine(
+      `# warn: zellij session "${targetSession}" never appeared in list-sessions after 5s; new-tab may no-op`,
+    );
+    return { orphanTabId: null };
+  }
+
   function ensureSession(): Promise<void> {
     if (sessionReady != null) {
       return sessionReady;
     }
     sessionReady = (async () => {
-      // Probe first — a session already listed is the steady state.
-      const listed = await runCapture(buildZellijListSessionsArgs());
-      if (listed == null) {
-        deps.noteLine(
-          `# warn: zellij list-sessions failed (binary missing?); subsequent launches will no-op`,
-        );
-        return;
-      }
-      if (zellijSessionListed(listed.stdout, session)) {
-        return;
-      }
-      // Not listed (absent OR EXITED corpse) — fire
-      // `attach -b --forget <session>` to FORGET any saved/serialized
-      // session and mint a fresh detached background session, then
-      // poll `list-sessions` until it appears. `--forget` defeats the
-      // bar-less resurrection from a degraded `session-layout.kdl`
-      // cache (fn-675); it is a harmless no-op when nothing is saved.
-      //
-      // The zellij server inherits THIS spawn's env, and every pane it
-      // later launches inherits the server's. keeperd runs as a
-      // LaunchAgent whose env is stripped to `PATH` (no `TERM`/
-      // `COLORTERM`), so a session minted here would render every worker
-      // pane colorblind. Carry color-capable defaults — preserving a real
-      // terminal's values on the off chance one exists (tests, a future
-      // non-LaunchAgent run) — so the autopilot worker's `claude` TUI
-      // shows color. Spread `process.env` first to keep `PATH` et al.
-      await runCapture(buildZellijAttachBgArgs(session), {
-        ...(process.env as Record<string, string>),
-        TERM: process.env.TERM ?? "xterm-256color",
-        COLORTERM: process.env.COLORTERM ?? "truecolor",
-      });
-      const deadline = Date.now() + 5000;
-      while (Date.now() < deadline) {
-        const probe = await runCapture(buildZellijListSessionsArgs());
-        if (probe != null && zellijSessionListed(probe.stdout, session)) {
-          // Freshly minted: capture the default `Tab #1` id so the first
-          // launch can reap it once the agent tab exists. Best-effort —
-          // a missing/unparsable list leaves `pendingOrphanTabId` null
-          // and we simply keep the default tab.
-          const tabs = await runCapture(buildZellijListTabsArgs(session));
-          if (tabs != null) {
-            pendingOrphanTabId = firstTabIdFromListTabs(tabs.stdout);
-          }
-          return;
-        }
-        await delay(50);
-      }
-      deps.noteLine(
-        `# warn: zellij session "${session}" never appeared in list-sessions after 5s; new-tab may no-op`,
-      );
+      const { orphanTabId } = await ensureSessionFor(session);
+      // Stash for the FIRST `launch` to reap one-shot after the agent
+      // tab lands. A pre-existing session returns null; a failed mint
+      // also returns null.
+      pendingOrphanTabId = orphanTabId;
     })();
     return sessionReady;
   }
@@ -1146,6 +1224,69 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         tab_name: match.pane.tab_name,
         tab_position: match.pane.tab_position ?? null,
       };
+    },
+    async ensureLaunched(
+      targetSession: string,
+      argv: string[],
+      cwd: string,
+      name?: string,
+    ): Promise<LaunchResult> {
+      // Session-agnostic get-or-create + launch. Mirrors `launch`'s
+      // shape (ensure → new-tab → orphan reap → session-gone single
+      // retry) but parameterized by `targetSession` and with all
+      // session-state local — no `sessionReady` memo, no
+      // `pendingOrphanTabId` clobber. The orphan id captured here
+      // belongs to THIS mint; the per-call closure reaps it after
+      // the agent tab lands and discards the binding when the
+      // method returns. A pre-existing session returns
+      // `orphanTabId: null` from `ensureSessionFor`, so the reap is
+      // skipped — only freshly-minted sessions ever leave a default
+      // `Tab #1` to clean up.
+      let { orphanTabId } = await ensureSessionFor(targetSession);
+      const args = buildZellijNewTabArgs(targetSession, cwd, argv, name);
+      let res = await runCapture(args);
+      // Session can die between ensure and new-tab (an OS reboot, a
+      // last-tab close, a manual kill). One-shot re-ensure + retry on
+      // the matching stderr signatures. The re-ensure is a fresh
+      // probe → mint cycle (no memo to invalidate), and any orphan
+      // captured on the retry mint REPLACES the original — that's the
+      // tab we then reap below. Any other non-zero exit is a real
+      // launch failure surfaced as-is.
+      if (
+        res != null &&
+        res.exitCode !== 0 &&
+        looksLikeSessionGone(res.stderr)
+      ) {
+        deps.noteLine(
+          `# warn: zellij session "${targetSession}" vanished mid-ensureLaunched; re-minting and retrying new-tab`,
+        );
+        const retry = await ensureSessionFor(targetSession);
+        orphanTabId = retry.orphanTabId;
+        res = await runCapture(args);
+      }
+      if (res == null) {
+        const error = `zellij new-tab into session "${targetSession}" failed (ENOENT? binary missing)`;
+        deps.noteLine(`# warn: ${error}`);
+        return { ok: false, error };
+      }
+      if (res.stderr.length > 0) {
+        deps.noteLine(
+          `# ensureLaunched stderr (session=${targetSession}): ${res.stderr.trim()}`,
+        );
+      }
+      if (res.exitCode !== 0) {
+        const error = `zellij new-tab into session "${targetSession}" exited non-zero (${res.exitCode})`;
+        deps.noteLine(`# warn: ${error}`);
+        return { ok: false, error };
+      }
+      // Per-call orphan reap. Only fires when ensureSessionFor MINTED
+      // the session this call (pre-existing sessions return
+      // orphanTabId=null). Done after the agent tab is confirmed so
+      // the session never drops to zero tabs (which would exit it).
+      if (orphanTabId != null) {
+        await runCapture(buildZellijCloseTabArgs(targetSession, orphanTabId));
+      }
+      return { ok: true };
     },
   };
 }

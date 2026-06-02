@@ -1343,9 +1343,16 @@ and flips on the `set_autopilot_paused` RPC, which appends an
 `AutopilotPaused{paused}` event FIRST then flips the worker gate only
 on a successful insert (so the gate and the projection cannot diverge
 on partial failure). The terminal-surface mechanics live behind the
-shrunken `ExecBackend` (`src/exec-backend.ts`, `launch` + `closeByName` only)
-— zellij is the only backend; each dispatch opens as a new tab in the
-lazily-created `zellij_session`. The session is FRESH-MINTED on every
+`ExecBackend` (`src/exec-backend.ts`) — two op categories sharing one
+port: session-bound lifecycle (`launch` + `closeByName`, against the
+managed reconciler session that is memoized once) and session-agnostic
+(`focusPane` / `resolveTabForPane` / `ensureLaunched`, against an
+arbitrary session per call). `ensureLaunched(session, argv, cwd, name?)`
+get-or-creates the target session with its own per-call mint + orphan
+reap (sharing no memo with the lifecycle path) and launches an unnamed
+tab — `restore-agents.ts` is the consumer. Zellij is the only backend;
+each reconciler dispatch opens as a new tab in the lazily-created
+`zellij_session`. The session is FRESH-MINTED on every
 keeper-initiated `attach -b --forget` (fn-675) — `--forget` deletes any
 saved/serialized session before connecting, so a stale/EXITED corpse is
 rebuilt from scratch rather than resurrected from a degraded
