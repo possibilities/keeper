@@ -86,5 +86,5 @@ exit 0. `TabNamerWorkerData { dbPath; tickMs? }`.
 - [ ] `bun test test/tab-namer-worker.test.ts` is green
 
 ## Done summary
-
+Added src/tab-namer-worker.ts — pure side-effector worker (read-only openDb, no DB write, no event mint) that renames live job tabs to their sanitized transcript titles via ExecBackend.renameTab, with a success-gated lastSet debounce and (session, tab_id) dedup. Test suite covers sanitization, dedup, debounce, retry-on-failure, shutdown gating, and lastSet pruning (20 tests, all green).
 ## Evidence
