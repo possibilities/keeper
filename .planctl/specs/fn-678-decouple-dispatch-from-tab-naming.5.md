@@ -58,5 +58,5 @@ re-arms suppression from the durable projection.
 - [ ] deps-injection harness updated; autopilot tests pass with no double-dispatch
 
 ## Done summary
-
+Removed tabExistsByName/liveTabNames/closeByName from autopilot worker. loadReconcileSnapshot reads pending_dispatches for liveTabKeys. confirmRunning mints emitDispatched before launch. runReconcileCycle calls closeByTabId with session+tabId from jobs. Tests updated. 572/572 pass.
 ## Evidence
