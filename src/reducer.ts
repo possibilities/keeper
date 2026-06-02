@@ -111,8 +111,10 @@
 
 import type { Database } from "bun:sqlite";
 import {
+  extractBackgroundTasks,
   extractCommit,
   isKilledTaskNotification,
+  type MonitorEntry,
   parsePlanRef,
   planVerbRefFromSpawnName,
 } from "./derivers";
@@ -6199,6 +6201,67 @@ function projectJobsRow(db: Database, event: Event): void {
     }
 
     case "Stop": {
+      // Schema v51 (fn-682): live monitors snapshot-replace. Hoisted
+      // ABOVE the sub-agent guard so a guard-swallowed Stop (the
+      // parent yielded to a Task tool sub-agent and is conceptually
+      // still working) STILL refreshes `jobs.monitors` from this
+      // Stop's `data.background_tasks` snapshot. The snapshot is
+      // authoritative — Claude Code re-emits the FULL live set on
+      // every Stop — and a dead background shell that just dropped
+      // from the snapshot must not linger because the parent's
+      // lifecycle write happened to be suppressed.
+      //
+      // Pure function of (this event's payload, the immutable event
+      // log up to event.id - 1, the persisted row). Empty / missing
+      // / malformed `background_tasks` → `'[]'` (drop-when-dead, the
+      // snapshot paradox). Three-way provenance — `monitor` /
+      // `bash-bg` / `ambient` — resolved by `computeMonitors`'s
+      // index-backed scan against `idx_events_background_task_id`.
+      // Re-fold determinism: every input is event-derived; no
+      // wallclock / env / fs / DB-liveness probe.
+      //
+      // The UPDATE writes ONLY `monitors` and `last_event_id` /
+      // `updated_at` — NOT `state`. State flips are owned by the
+      // lifecycle UPDATE below (and gated by the sub-agent guard). A
+      // monitors-only write must NOT touch state because a sub-agent
+      // is potentially mid-flight; an unconditional state flip here
+      // would re-open the predicate-5 / predicate-7 dup-fire window
+      // the sub-agent guard exists to close. The matches=0 case (no
+      // jobs row for this session yet) is a clean no-op — same
+      // signal as the lifecycle UPDATE below for an unknown session.
+      let stopData: unknown = null;
+      try {
+        stopData = JSON.parse(event.data);
+      } catch {
+        // Malformed data blob — `extractBackgroundTasks(null)` returns
+        // [], so `computeMonitors` returns '[]' (the snapshot paradox:
+        // an unreadable Stop is treated as "no live monitors"). Cursor
+        // still advances per the CLAUDE.md "safe value on malformed
+        // payload" invariant.
+        stopData = null;
+      }
+      const nextMonitors = computeMonitors(
+        db,
+        event.session_id,
+        event.id,
+        stopData,
+      );
+      // Gated by the same terminal guard as the state UPDATE below: a
+      // stray Stop on an already-terminal row (ENDED / KILLED) must
+      // not re-touch `last_event_id` / `updated_at` — the terminal
+      // write already cleared `monitors` to '[]', and a second write
+      // would bump the event-id stamp on a row whose lifecycle is
+      // closed (regression-tested by "Stop on a killed row is a
+      // no-op (terminal guard)"). The hoist above the SUB-AGENT guard
+      // is what matters for fn-682's snapshot-refresh contract — a
+      // sub-agent-yielded Stop on a STILL-LIVE row reaches here and
+      // refreshes monitors. A terminal row has no live monitors by
+      // definition; the no-op is correct.
+      db.run(
+        `UPDATE jobs SET monitors = ?, last_event_id = ?, updated_at = ?
+           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
+        [nextMonitors, event.id, ts, jobId],
+      );
       // Keeps the terminal guard: a stray Stop landing on a still-terminal job
       // (no intervening re-open) must not resurrect it. The guard now covers
       // BOTH terminal states — 'ended' (from SessionEnd) and 'killed' (from a
@@ -6304,10 +6367,20 @@ function projectJobsRow(db: Database, event: Event): void {
       // would mask it). Matches zero rows for a terminal event with no prior
       // SessionStart — a correct no-op.
       const res = db.run(
-        `UPDATE jobs SET state = 'ended', last_event_id = ?, updated_at = ?
+        `UPDATE jobs SET state = 'ended', monitors = '[]', last_event_id = ?, updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
         [event.id, ts, jobId],
       );
+      // Schema v51 (fn-682): clear `monitors` to `'[]'` as part of the
+      // terminal write — a terminal job has no live monitors by
+      // definition. Carried inside the same UPDATE (rather than a
+      // second statement) so the cursor=0 re-fold reproduces a
+      // byte-identical row write order. Gated by the same terminal
+      // guard as `state`: a stray SessionEnd on an already-terminal
+      // row must NOT clobber `monitors` (the prior terminal write
+      // already cleared it; a second clobber would still write '[]'
+      // but with a stale `last_event_id` — the guard keeps the
+      // matches=0 no-op honest).
       if (res.changes > 0) {
         sweepRunningSubagentsToUnknown(db, jobId, event.id, ts);
         syncIfPlanRef(db, jobId, event.id, ts);
@@ -6352,10 +6425,14 @@ function projectJobsRow(db: Database, event: Event): void {
           break; // stale/recycled — safe no-op.
         }
         db.run(
-          `UPDATE jobs SET state = 'killed', last_event_id = ?, updated_at = ?
+          `UPDATE jobs SET state = 'killed', monitors = '[]', last_event_id = ?, updated_at = ?
              WHERE job_id = ?`,
           [event.id, ts, jobId],
         );
+        // Schema v51 (fn-682): clear `monitors` to `'[]'` on the
+        // proven-kill write — same terminal-cleanup contract as the
+        // SessionEnd arm. Carried inside the same UPDATE so the
+        // re-fold reproduces a byte-identical row write order.
         // Sweep fires ONLY on the proven write path, mirroring sync. The
         // earlier `break` arms (malformed payload, missing row, stale
         // mismatch) MUST NOT sweep — no lifecycle write happened, so a
@@ -6859,6 +6936,92 @@ function appendNameHistory(persisted: string, title: string): string {
     history = history.slice(history.length - NAME_HISTORY_CAP);
   }
   return JSON.stringify(history);
+}
+
+/**
+ * Schema v51 (fn-682): compute the next `jobs.monitors` JSON-array
+ * value from the Stop event's `data.background_tasks` snapshot, the
+ * persisted live entries, and an in-fold scan of `events` for
+ * three-way provenance lookup. Snapshot-replace (NOT append): the
+ * returned JSON IS the full new value, byte-identical across re-folds
+ * because every input is event-derived (no wallclock / env / fs / DB-
+ * liveness probe). The empty / missing case returns `'[]'` —
+ * authoritative drop-when-dead per CLAUDE.md "snapshot paradox".
+ *
+ * Provenance:
+ * - `monitor` — an earlier PostToolUse:Monitor event in this session
+ *   minted `tool_response.taskId === entry.id`.
+ * - `bash-bg` — an earlier PostToolUse:Bash with `run_in_background`
+ *   minted `tool_response.backgroundTaskId === entry.id`.
+ * - `ambient` — no launch event in this session's event stream
+ *   matches (plugin/harness-armed before the session existed, or
+ *   launched by a SubagentStart that we never saw a PostToolUse for).
+ *
+ * The provenance scan is gated on `id < currentEventId` so it reads
+ * only the immutable log up to but not including the current Stop —
+ * a future event minted later cannot influence this fold's result, so
+ * a cursor=0 re-fold reproduces byte-identical output. Index-backed
+ * via `idx_events_background_task_id`'s partial composite predicate;
+ * the trailing `tool_name` makes the index covering for the projected
+ * read. Pure function of `(persistedJson, eventDataPayload, sessionId,
+ * currentEventId, dbScan)` — `dbScan` reads only the event log.
+ *
+ * NEVER throws — `extractBackgroundTasks` already swallows malformed
+ * `background_tasks` shapes (returns `[]`), and the in-fold scan is
+ * a strict SELECT against a known column shape.
+ */
+function computeMonitors(
+  db: Database,
+  sessionId: string,
+  currentEventId: number,
+  data: unknown,
+): string {
+  const ids = extractBackgroundTasks(data);
+  if (ids.length === 0) {
+    return "[]";
+  }
+  // Index-backed provenance scan: the partial composite
+  // `idx_events_background_task_id (session_id, background_task_id,
+  // id, tool_name) WHERE background_task_id IS NOT NULL` makes this a
+  // direct seek + range lookup, never a full-table scan. The trailing
+  // `tool_name` makes the index covering — no heap row lookup.
+  const rows = db
+    .query(
+      `SELECT background_task_id AS task_id, tool_name
+         FROM events
+        WHERE session_id = ?
+          AND background_task_id IS NOT NULL
+          AND id < ?`,
+    )
+    .all(sessionId, currentEventId) as {
+    task_id: string;
+    tool_name: string | null;
+  }[];
+  // Map<id, provenance>: a re-launch with the same id (extremely
+  // unlikely but defensive) keeps the FIRST observed mint, since
+  // background-task ids are session-scoped and the launch event is
+  // by definition the one that minted the id we see in the snapshot.
+  // The forEach order is the same on every re-fold (the SELECT is
+  // ordered by the index's natural order — `(session_id,
+  // background_task_id, id)` — so the dedupe is deterministic).
+  const provenance = new Map<string, "monitor" | "bash-bg">();
+  for (const row of rows) {
+    if (provenance.has(row.task_id)) continue;
+    if (row.tool_name === "Monitor") {
+      provenance.set(row.task_id, "monitor");
+    } else if (row.tool_name === "Bash") {
+      provenance.set(row.task_id, "bash-bg");
+    }
+    // tool_name not in {Monitor, Bash}: skip — the deriver should
+    // never have stamped background_task_id, but if a future event
+    // shape adds a third kind we leave it as `ambient` until the
+    // deriver+projection learn how to name it.
+  }
+  const entries: MonitorEntry[] = ids.map((id) => ({
+    id,
+    kind: provenance.get(id) ?? "ambient",
+  }));
+  return JSON.stringify(entries);
 }
 
 /**

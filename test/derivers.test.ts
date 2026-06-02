@@ -7,6 +7,8 @@
 
 import { expect, test } from "bun:test";
 import {
+  extractBackgroundTaskId,
+  extractBackgroundTasks,
   extractBashMutation,
   extractPlanctlInvocation,
   extractToolUseId,
@@ -1311,4 +1313,244 @@ test("extractBashMutation: round-trip determinism — same input → same output
   const c = bashMutation("rm -rf src/old");
   const d = bashMutation("rm -rf src/old");
   expect(c).toEqual(d);
+});
+
+// ---------------------------------------------------------------------------
+// extractBackgroundTaskId — schema v51 / fn-682
+//
+// Stamps `events.background_task_id` at hook INSERT time for the two launch
+// shapes — PostToolUse:Monitor → `tool_response.taskId`, PostToolUse:Bash with
+// `run_in_background` → `tool_response.backgroundTaskId`. The migrate-time
+// backfill calls the SAME function so a re-fold reproduces byte-identical
+// provenance.
+// ---------------------------------------------------------------------------
+
+test("extractBackgroundTaskId: PostToolUse:Monitor returns tool_response.taskId", () => {
+  expect(
+    extractBackgroundTaskId("PostToolUse", "Monitor", {
+      tool_response: { taskId: "bash-1234" },
+    }),
+  ).toBe("bash-1234");
+});
+
+test("extractBackgroundTaskId: PostToolUse:Bash returns tool_response.backgroundTaskId", () => {
+  expect(
+    extractBackgroundTaskId("PostToolUse", "Bash", {
+      tool_response: { backgroundTaskId: "bash-5678" },
+    }),
+  ).toBe("bash-5678");
+});
+
+test("extractBackgroundTaskId: PostToolUse:Bash WITHOUT backgroundTaskId returns null (foreground)", () => {
+  // The vast majority of Bash invocations are foreground — the launcher
+  // field is absent on the foreground payload. Must NOT match.
+  expect(
+    extractBackgroundTaskId("PostToolUse", "Bash", {
+      tool_response: { stdout: "hello", interrupted: false },
+    }),
+  ).toBeNull();
+});
+
+test("extractBackgroundTaskId: non-PostToolUse hook event returns null", () => {
+  // The launch fields only exist on PostToolUse; pre/other events with the
+  // same tool name must NOT stamp the column (gate fires before the lookup).
+  expect(
+    extractBackgroundTaskId("PreToolUse", "Monitor", {
+      tool_response: { taskId: "bash-1234" },
+    }),
+  ).toBeNull();
+  expect(
+    extractBackgroundTaskId("UserPromptSubmit", "Bash", {
+      tool_response: { backgroundTaskId: "bash-5678" },
+    }),
+  ).toBeNull();
+});
+
+test("extractBackgroundTaskId: PostToolUseFailure does NOT match (defense vs prefix-startsWith)", () => {
+  // Mirrors the extractPlanctlInvocation hardening for PostToolUseFailure —
+  // a strict `===` keeps the gate honest.
+  expect(
+    extractBackgroundTaskId("PostToolUseFailure", "Monitor", {
+      tool_response: { taskId: "bash-1234" },
+    }),
+  ).toBeNull();
+});
+
+test("extractBackgroundTaskId: unrelated tool name returns null", () => {
+  // The gate excludes every tool other than Monitor / Bash so the partial
+  // index `WHERE background_task_id IS NOT NULL` stays selective.
+  expect(
+    extractBackgroundTaskId("PostToolUse", "Edit", {
+      tool_response: { taskId: "bash-1234" },
+    }),
+  ).toBeNull();
+  expect(
+    extractBackgroundTaskId("PostToolUse", null, {
+      tool_response: { taskId: "bash-1234" },
+    }),
+  ).toBeNull();
+});
+
+test("extractBackgroundTaskId: missing tool_response returns null", () => {
+  expect(extractBackgroundTaskId("PostToolUse", "Monitor", {})).toBeNull();
+  expect(
+    extractBackgroundTaskId("PostToolUse", "Monitor", { tool_response: null }),
+  ).toBeNull();
+  expect(
+    extractBackgroundTaskId("PostToolUse", "Bash", {
+      tool_response: "not-an-object",
+    }),
+  ).toBeNull();
+});
+
+test("extractBackgroundTaskId: non-string taskId / backgroundTaskId returns null", () => {
+  // Defensive: a malformed payload (number, object, null, missing field)
+  // must NEVER throw — the hook's exit-0 contract is non-negotiable.
+  expect(
+    extractBackgroundTaskId("PostToolUse", "Monitor", {
+      tool_response: { taskId: 42 },
+    }),
+  ).toBeNull();
+  expect(
+    extractBackgroundTaskId("PostToolUse", "Bash", {
+      tool_response: { backgroundTaskId: { id: "x" } },
+    }),
+  ).toBeNull();
+  expect(
+    extractBackgroundTaskId("PostToolUse", "Monitor", {
+      tool_response: { taskId: null },
+    }),
+  ).toBeNull();
+  expect(
+    extractBackgroundTaskId("PostToolUse", "Monitor", {
+      tool_response: { taskId: "" },
+    }),
+  ).toBeNull();
+});
+
+test("extractBackgroundTaskId: round-trip determinism — same input → same output", () => {
+  // The migration backfill and the hook call the same deriver — assert
+  // the function is deterministic by calling twice and comparing.
+  const a = extractBackgroundTaskId("PostToolUse", "Monitor", {
+    tool_response: { taskId: "bash-1234" },
+  });
+  const b = extractBackgroundTaskId("PostToolUse", "Monitor", {
+    tool_response: { taskId: "bash-1234" },
+  });
+  expect(a).toBe(b);
+});
+
+// ---------------------------------------------------------------------------
+// extractBackgroundTasks — schema v51 / fn-682
+//
+// Defensive lift of a Stop event payload's `data.background_tasks` array.
+// Allowlist `type === "shell"` (subagent entries drop silently), stable
+// sort by id, cap at 50 entries. NEVER throws — empty / missing /
+// malformed folds to `[]` (the snapshot paradox: an unreadable Stop is
+// drop-when-dead).
+// ---------------------------------------------------------------------------
+
+test("extractBackgroundTasks: shell allowlist returns the ids", () => {
+  expect(
+    extractBackgroundTasks({
+      background_tasks: [
+        { id: "bash-1", type: "shell" },
+        { id: "bash-2", type: "shell" },
+      ],
+    }),
+  ).toEqual(["bash-1", "bash-2"]);
+});
+
+test("extractBackgroundTasks: subagent entries drop silently (allowlist not denylist)", () => {
+  // The deriver is an ALLOWLIST on `type === "shell"`, not a denylist on
+  // `!== "subagent"` — a future Claude Code task type we don't yet
+  // understand must NOT leak into `jobs.monitors`.
+  expect(
+    extractBackgroundTasks({
+      background_tasks: [
+        { id: "bash-1", type: "shell" },
+        { id: "subagent-1", type: "subagent" },
+        { id: "future-1", type: "some-new-kind" },
+      ],
+    }),
+  ).toEqual(["bash-1"]);
+});
+
+test("extractBackgroundTasks: empty array returns []", () => {
+  expect(extractBackgroundTasks({ background_tasks: [] })).toEqual([]);
+});
+
+test("extractBackgroundTasks: missing field returns []", () => {
+  expect(extractBackgroundTasks({})).toEqual([]);
+});
+
+test("extractBackgroundTasks: non-object data returns []", () => {
+  expect(extractBackgroundTasks(null)).toEqual([]);
+  expect(extractBackgroundTasks("string")).toEqual([]);
+  expect(extractBackgroundTasks(42)).toEqual([]);
+});
+
+test("extractBackgroundTasks: malformed entries (non-object, missing id, non-string id) drop silently", () => {
+  expect(
+    extractBackgroundTasks({
+      background_tasks: [
+        null,
+        "string",
+        42,
+        { type: "shell" }, // missing id
+        { id: 42, type: "shell" }, // non-string id
+        { id: "", type: "shell" }, // empty id
+        { id: "bash-good", type: "shell" }, // the one good entry
+      ],
+    }),
+  ).toEqual(["bash-good"]);
+});
+
+test("extractBackgroundTasks: non-array background_tasks returns []", () => {
+  expect(extractBackgroundTasks({ background_tasks: "not-array" })).toEqual([]);
+  expect(extractBackgroundTasks({ background_tasks: null })).toEqual([]);
+  expect(extractBackgroundTasks({ background_tasks: { id: "x" } })).toEqual([]);
+});
+
+test("extractBackgroundTasks: stable sort by id (lexicographic)", () => {
+  // Stable sort is REQUIRED for re-fold determinism — the persisted
+  // `jobs.monitors` JSON must be byte-identical across re-folds.
+  expect(
+    extractBackgroundTasks({
+      background_tasks: [
+        { id: "bash-3", type: "shell" },
+        { id: "bash-1", type: "shell" },
+        { id: "bash-2", type: "shell" },
+      ],
+    }),
+  ).toEqual(["bash-1", "bash-2", "bash-3"]);
+});
+
+test("extractBackgroundTasks: cap at 50 entries (defensive)", () => {
+  // The cap bites AFTER the stable sort, so the truncated set is
+  // deterministic across re-folds (lexicographic ordering keeps the
+  // same 50 entries every time).
+  const tasks = Array.from({ length: 75 }, (_, i) => ({
+    id: `bash-${String(i).padStart(3, "0")}`,
+    type: "shell",
+  }));
+  const got = extractBackgroundTasks({ background_tasks: tasks });
+  expect(got.length).toBe(50);
+  // The sorted order is bash-000 … bash-074; the cap retains the first
+  // 50 (bash-000 … bash-049).
+  expect(got[0]).toBe("bash-000");
+  expect(got[49]).toBe("bash-049");
+});
+
+test("extractBackgroundTasks: round-trip determinism — same input → same output", () => {
+  // The reducer calls this once per Stop; a re-fold must produce
+  // byte-identical output (pure function invariant).
+  const input = {
+    background_tasks: [
+      { id: "bash-c", type: "shell" },
+      { id: "bash-a", type: "shell" },
+      { id: "bash-b", type: "shell" },
+    ],
+  };
+  expect(extractBackgroundTasks(input)).toEqual(extractBackgroundTasks(input));
 });

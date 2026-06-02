@@ -56,6 +56,11 @@ function insertEvent(
     backend_exec_type?: string | null;
     backend_exec_session_id?: string | null;
     backend_exec_pane_id?: string | null;
+    // Schema v51 / fn-682: sparse derived column carrying the
+    // PostToolUse:Monitor `tool_response.taskId` or PostToolUse:Bash
+    // `tool_response.backgroundTaskId`. NULL on every other event;
+    // monitors-projection tests pass this explicitly via overrides.
+    background_task_id?: string | null;
   },
 ): number {
   const ts = overrides.ts ?? tsCounter++;
@@ -107,6 +112,11 @@ function insertEvent(
     backend_exec_type: overrides.backend_exec_type ?? null,
     backend_exec_session_id: overrides.backend_exec_session_id ?? null,
     backend_exec_pane_id: overrides.backend_exec_pane_id ?? null,
+    // Schema v51 / fn-682: sparse `background_task_id` deriver column
+    // (PostToolUse:Monitor `tool_response.taskId` or PostToolUse:Bash
+    // `tool_response.backgroundTaskId`). NULL on every other event;
+    // monitors-projection tests pass this explicitly via overrides.
+    background_task_id: overrides.background_task_id ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -116,8 +126,9 @@ function insertEvent(
        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
        bash_mutation_kind, bash_mutation_targets, planctl_files,
-       backend_exec_type, backend_exec_session_id, backend_exec_pane_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+       background_task_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -151,6 +162,7 @@ function insertEvent(
       row.backend_exec_type,
       row.backend_exec_session_id,
       row.backend_exec_pane_id,
+      row.background_task_id,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -14791,4 +14803,230 @@ test("fn-670 T2: cursor=0 re-fold reproduces byte-identical epics rows over a mi
     .all() as Record<string, unknown>[];
 
   expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
+// Schema v51 (fn-682): jobs.monitors snapshot-replace on Stop +
+// clear-on-terminal on SessionEnd / Killed.
+// ---------------------------------------------------------------------------
+
+/** Read the persisted `monitors` JSON for `jobId`, parsed. */
+function getMonitors(jobId = "sess-a"): { id: string; kind: string }[] | null {
+  const row = db
+    .query("SELECT monitors FROM jobs WHERE job_id = ?")
+    .get(jobId) as { monitors: string } | null;
+  if (row == null) return null;
+  return JSON.parse(row.monitors) as { id: string; kind: string }[];
+}
+
+/**
+ * Insert one PostToolUse:Monitor launch event in `sessionId`, stamping
+ * the deriver column directly (the hook would do this at INSERT time;
+ * tests skip the deriver call and pass the column explicitly).
+ */
+function insertMonitorLaunch(taskId: string, sessionId = "sess-a"): number {
+  return insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Monitor",
+    session_id: sessionId,
+    background_task_id: taskId,
+    data: JSON.stringify({ tool_response: { taskId } }),
+  });
+}
+
+/**
+ * Insert one PostToolUse:Bash `run_in_background` launch event in
+ * `sessionId`.
+ */
+function insertBashBgLaunch(taskId: string, sessionId = "sess-a"): number {
+  return insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: sessionId,
+    background_task_id: taskId,
+    data: JSON.stringify({ tool_response: { backgroundTaskId: taskId } }),
+  });
+}
+
+/**
+ * Insert one Stop event whose `data.background_tasks` carries the given
+ * `(id, type)` entries.
+ */
+function insertStopWithTasks(
+  tasks: { id: string; type: string }[],
+  sessionId = "sess-a",
+): number {
+  return insertEvent({
+    hook_event: "Stop",
+    session_id: sessionId,
+    data: JSON.stringify({ background_tasks: tasks }),
+  });
+}
+
+test("v51 monitors: Stop seeds jobs.monitors from data.background_tasks (shell allowlist)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertStopWithTasks([
+    { id: "bash-a", type: "shell" },
+    { id: "subagent-x", type: "subagent" },
+  ]);
+  drainAll();
+  expect(getMonitors()).toEqual([{ id: "bash-a", kind: "ambient" }]);
+});
+
+test("v51 monitors: empty background_tasks drops to '[]' (snapshot paradox)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertStopWithTasks([{ id: "bash-a", type: "shell" }]);
+  drainAll();
+  expect(getMonitors()).toEqual([{ id: "bash-a", kind: "ambient" }]);
+  // Now a Stop with no live shells — the snapshot is authoritative.
+  insertStopWithTasks([]);
+  drainAll();
+  expect(getMonitors()).toEqual([]);
+});
+
+test("v51 monitors: missing background_tasks field folds to []", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "Stop", data: "{}" });
+  drainAll();
+  expect(getMonitors()).toEqual([]);
+});
+
+test("v51 monitors: malformed Stop data blob folds to [] and cursor advances", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  const stopId = insertEvent({ hook_event: "Stop", data: "{not-json" });
+  drainAll();
+  expect(getMonitors()).toEqual([]);
+  expect(getCursor()).toBe(stopId);
+});
+
+test("v51 monitors: three-way provenance (monitor / bash-bg / ambient)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  // Monitor launch precedes the Stop; provenance for bash-m must be `monitor`.
+  insertMonitorLaunch("bash-m");
+  // Bash bg launch precedes the Stop; provenance for bash-b must be `bash-bg`.
+  insertBashBgLaunch("bash-b");
+  // bash-amb has no launch event in this session's stream → `ambient`.
+  insertStopWithTasks([
+    { id: "bash-amb", type: "shell" },
+    { id: "bash-b", type: "shell" },
+    { id: "bash-m", type: "shell" },
+  ]);
+  drainAll();
+  expect(getMonitors()).toEqual([
+    { id: "bash-amb", kind: "ambient" },
+    { id: "bash-b", kind: "bash-bg" },
+    { id: "bash-m", kind: "monitor" },
+  ]);
+});
+
+test("v51 monitors: provenance scan is session-scoped (a launch in another session is NOT seen)", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-b" });
+  // Monitor launch in sess-b mints task-1; sess-a's Stop sees the same id
+  // but the in-fold scan is gated on session_id so provenance is `ambient`.
+  insertMonitorLaunch("task-1", "sess-b");
+  insertStopWithTasks([{ id: "task-1", type: "shell" }], "sess-a");
+  drainAll();
+  expect(getMonitors("sess-a")).toEqual([{ id: "task-1", kind: "ambient" }]);
+});
+
+test("v51 monitors: SessionEnd clears monitors to []", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertStopWithTasks([{ id: "bash-a", type: "shell" }]);
+  drainAll();
+  expect(getMonitors()).toEqual([{ id: "bash-a", kind: "ambient" }]);
+  insertEvent({ hook_event: "SessionEnd" });
+  drainAll();
+  expect(getMonitors()).toEqual([]);
+});
+
+test("v51 monitors: Killed clears monitors to []", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 4242,
+    start_time: "stamp-1",
+  });
+  insertStopWithTasks([{ id: "bash-a", type: "shell" }]);
+  drainAll();
+  expect(getMonitors()).toEqual([{ id: "bash-a", kind: "ambient" }]);
+  killedEvent(4242, "stamp-1");
+  drainAll();
+  expect(getMonitors()).toEqual([]);
+});
+
+test("v51 monitors: Stop on a still-live row refreshes monitors EVEN when the sub-agent guard would swallow the state flip", () => {
+  // The monitors snapshot-replace is hoisted ABOVE the sub-agent guard
+  // so a mid-Task-yield Stop still keeps `jobs.monitors` honest. The
+  // state flip is suppressed (sub-agent still running) but the live
+  // monitor set updates.
+  insertEvent({ hook_event: "SessionStart" });
+  insertStopWithTasks([{ id: "bash-a", type: "shell" }]);
+  drainAll();
+  expect(getMonitors()).toEqual([{ id: "bash-a", kind: "ambient" }]);
+  // Inject a still-running subagent_invocations row so the guard fires.
+  const subTs = tsCounter++;
+  db.run(
+    `INSERT INTO subagent_invocations (job_id, agent_id, turn_seq,
+      subagent_type, status, ts, last_event_id, updated_at)
+     VALUES ('sess-a', 'sub-1', 1, 'general', 'running', ?, ?, ?)`,
+    [subTs, getCursor(), subTs],
+  );
+  // A second Stop with a different monitor set. The state flip is
+  // swallowed by the sub-agent guard, but monitors still refresh.
+  insertStopWithTasks([{ id: "bash-b", type: "shell" }]);
+  drainAll();
+  expect(getMonitors()).toEqual([{ id: "bash-b", kind: "ambient" }]);
+});
+
+test("v51 monitors: cursor=0 re-fold reproduces byte-identical jobs.monitors", () => {
+  // Seed a mixed-provenance projection.
+  insertEvent({ hook_event: "SessionStart" });
+  insertMonitorLaunch("bash-m");
+  insertBashBgLaunch("bash-b");
+  insertStopWithTasks([
+    { id: "bash-amb", type: "shell" },
+    { id: "bash-b", type: "shell" },
+    { id: "bash-m", type: "shell" },
+  ]);
+  drainAll();
+  const before = db
+    .query("SELECT job_id, monitors FROM jobs ORDER BY job_id ASC")
+    .all() as { job_id: string; monitors: string }[];
+  expect(before.length).toBeGreaterThan(0);
+  // Rewind + wipe; re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = db
+    .query("SELECT job_id, monitors FROM jobs ORDER BY job_id ASC")
+    .all() as { job_id: string; monitors: string }[];
+  expect(after).toEqual(before);
+});
+
+test("v51 monitors: stable sort by id (re-fold determinism)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  // Insertion order in the snapshot is c, a, b — projected sort must be a, b, c.
+  insertStopWithTasks([
+    { id: "bash-c", type: "shell" },
+    { id: "bash-a", type: "shell" },
+    { id: "bash-b", type: "shell" },
+  ]);
+  drainAll();
+  expect(getMonitors()).toEqual([
+    { id: "bash-a", kind: "ambient" },
+    { id: "bash-b", kind: "ambient" },
+    { id: "bash-c", kind: "ambient" },
+  ]);
+});
+
+test("v51 monitors: a launch AFTER this Stop is NOT seen (id < current gate)", () => {
+  // The in-fold scan reads `id < event.id` strictly, so a launch that
+  // arrives after the current Stop must NOT participate in provenance —
+  // this guards against any future re-fold seeing the wrong order.
+  insertEvent({ hook_event: "SessionStart" });
+  insertStopWithTasks([{ id: "bash-late", type: "shell" }]);
+  insertMonitorLaunch("bash-late"); // arrives AFTER the Stop
+  drainAll();
+  // Provenance for the Stop is `ambient` — the launch came later.
+  expect(getMonitors()).toEqual([{ id: "bash-late", kind: "ambient" }]);
 });

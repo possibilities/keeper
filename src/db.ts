@@ -35,6 +35,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  extractBackgroundTaskId,
   extractBashMutation,
   extractPlanctlInvocation,
   extractSkillName,
@@ -57,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 50;
+export const SCHEMA_VERSION = 51;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -404,7 +405,8 @@ CREATE TABLE IF NOT EXISTS events (
     planctl_files TEXT,
     backend_exec_type TEXT,
     backend_exec_session_id TEXT,
-    backend_exec_pane_id TEXT
+    backend_exec_pane_id TEXT,
+    background_task_id TEXT
 )
 `;
 
@@ -512,6 +514,31 @@ const CREATE_V14_INDEXES = [
  */
 const CREATE_V17_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_events_tool_use_id ON events(tool_use_id) WHERE tool_use_id IS NOT NULL",
+];
+
+/**
+ * Indexes added in schema v51 (fn-682) that depend on the
+ * `background_task_id` column added by the v50→v51 `addColumnIfMissing`
+ * step. Mirrors {@link CREATE_V10_INDEXES} / {@link CREATE_V14_INDEXES} /
+ * {@link CREATE_V17_INDEXES} structure: KEPT OUT of
+ * {@link CREATE_EVENTS_INDEXES} so the unconditional CREATE block
+ * doesn't reference a column that doesn't exist yet on a migrating v50
+ * DB. `migrate()` runs these AFTER the matching ADD COLUMN in the
+ * v50→v51 block; a fresh v51 DB picks them up via the same block (the
+ * addColumnIfMissing no-ops on the freshly CREATE'd table).
+ *
+ * The composite `(session_id, background_task_id)` partial index serves
+ * the reducer's Stop-arm in-fold provenance scan (`SELECT
+ * background_task_id, tool_name FROM events WHERE session_id = ? AND
+ * background_task_id IS NOT NULL AND id < ?`). The `WHERE
+ * background_task_id IS NOT NULL` partial predicate keeps the index
+ * narrow — only PostToolUse:Monitor / PostToolUse:Bash-bg rows populate
+ * the column, a tiny subset of the full events table. Trailing
+ * `tool_name` makes the index covering for the projected `tool_name`
+ * read — no heap row-lookup per scan row.
+ */
+const CREATE_V51_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_events_background_task_id ON events(session_id, background_task_id, id, tool_name) WHERE background_task_id IS NOT NULL",
 ];
 
 /**
@@ -663,7 +690,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     backend_exec_session_id TEXT,
     backend_exec_pane_id TEXT,
     backend_exec_tab_id TEXT,
-    backend_exec_tab_name TEXT
+    backend_exec_tab_name TEXT,
+    monitors TEXT NOT NULL DEFAULT '[]'
 )
 `;
 
@@ -4887,6 +4915,104 @@ function migrate(db: Database): void {
     // — test/schema-version.test.ts enforces; a missing bump fails
     // every `jobctl commit-work` host-wide).
 
+    // v50→v51: fn-682 — live monitors projection. Adds the sparse
+    // `events.background_task_id TEXT` deriver column (NULL on every
+    // row except PostToolUse:Monitor — where it carries
+    // `tool_response.taskId` — and PostToolUse:Bash with
+    // `run_in_background` — where it carries
+    // `tool_response.backgroundTaskId`), the
+    // `jobs.monitors TEXT NOT NULL DEFAULT '[]'` JSON-array projection
+    // column (live per-session background-shell snapshot folded from
+    // each Stop's `data.background_tasks` allowlist of `type:shell`
+    // entries, with three-way provenance — `monitor` / `bash-bg` /
+    // `ambient` — resolved by the reducer's in-fold scan against the
+    // new column), and the
+    // `idx_events_background_task_id (session_id, background_task_id,
+    // id, tool_name) WHERE background_task_id IS NOT NULL` partial
+    // composite index that makes the in-fold scan index-backed and
+    // covering for the projected `tool_name` read. Lockstep: literals
+    // above on CREATE_EVENTS / CREATE_JOBS / CREATE_V51_INDEXES match
+    // these addColumnIfMissing + CREATE INDEX statements so a fresh
+    // v51 DB and a migrated v50→v51 DB produce byte-identical PRAGMA
+    // table_info + sqlite_master rows.
+    //
+    // Mirrors the v30→v31 / v38→v39 bash_mutation_* pattern: an
+    // additive sparse column whose deriver fires only on a narrow
+    // PostToolUse subset, with a version-guarded one-time backfill
+    // that re-derives the column for historical rows via the SAME
+    // pure deriver the hook uses (so a cursor=0 re-fold against the
+    // backfilled column reproduces byte-identical `jobs.monitors`).
+    // The reducer NEVER reads wallclock/env/fs inside the fold, so the
+    // CLAUDE.md "every projection-driving fact lives in the immutable
+    // event log" + "re-fold determinism is sacred" invariants hold.
+    addColumnIfMissing(db, "events", "background_task_id", "TEXT");
+    addColumnIfMissing(db, "jobs", "monitors", "TEXT NOT NULL DEFAULT '[]'");
+    // The partial composite index lives in CREATE_V51_INDEXES (kept
+    // OUT of CREATE_EVENTS_INDEXES so a v50→v51 migrate doesn't
+    // reference the column before the ADD COLUMN above runs). Apply
+    // unconditionally — `CREATE INDEX IF NOT EXISTS` is idempotent on
+    // re-open of an already-migrated DB, and a fresh v51 bootstrap
+    // hits this slot too (the addColumnIfMissing no-ops on the
+    // freshly CREATE'd table).
+    for (const sql of CREATE_V51_INDEXES) {
+      db.run(sql);
+    }
+
+    // Version-guarded one-time backfill: re-derive
+    // `events.background_task_id` for every historical PostToolUse row
+    // whose tool_name is `Monitor` or `Bash`. The deriver is pure (no
+    // wallclock / env / fs reads) and the SAME function the live hook
+    // calls at INSERT time, so a from-scratch re-fold over the
+    // backfilled column reproduces byte-identical `jobs.monitors`.
+    // Defensive parse: a malformed historical `data` blob folds to
+    // NULL (the deriver's `typeof toolResponse !== "object"` /
+    // `typeof candidate !== "string"` guards short-circuit on every
+    // bad shape; the surrounding try/catch keeps a corrupt JSON
+    // payload from throwing inside the migrate transaction). Mirrors
+    // the v30→v31 / v38→v39 backfill loops above.
+    if (preMigrateStoredVersion < 51) {
+      const rows = db
+        .prepare(
+          `SELECT id, hook_event, tool_name, data FROM events
+             WHERE hook_event = 'PostToolUse'
+               AND tool_name IN ('Monitor', 'Bash')`,
+        )
+        .all() as {
+        id: number;
+        hook_event: string;
+        tool_name: string | null;
+        data: string;
+      }[];
+      const updateStmt = db.prepare(
+        "UPDATE events SET background_task_id = ? WHERE id = ?",
+      );
+      for (const row of rows) {
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(row.data) as Record<string, unknown>;
+          if (typeof parsed !== "object" || parsed === null) {
+            continue; // schema default NULL already in place.
+          }
+        } catch {
+          continue; // schema default NULL already in place.
+        }
+        const id = extractBackgroundTaskId(
+          row.hook_event,
+          row.tool_name,
+          parsed,
+        );
+        if (id !== null) {
+          updateStmt.run(id, row.id);
+        }
+      }
+    }
+    //
+    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
+    // adds 51 in the same change — whitelist-only (keeper-py reads
+    // neither `events.background_task_id` nor `jobs.monitors`), but
+    // the bump is required so `jobctl commit-work` on this host
+    // doesn't fail-loud (test/schema-version.test.ts enforces).
+
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(String(SCHEMA_VERSION));
@@ -4936,7 +5062,8 @@ function prepareStmts(db: Database): Stmts {
         planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
         planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
         bash_mutation_kind, bash_mutation_targets, planctl_files,
-        backend_exec_type, backend_exec_session_id, backend_exec_pane_id
+        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+        background_task_id
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
@@ -4944,7 +5071,8 @@ function prepareStmts(db: Database): Stmts {
         $planctl_op, $planctl_target, $planctl_epic_id, $planctl_task_id,
         $planctl_subject_present, $tool_use_id, $config_dir, $planctl_queue_jump,
         $bash_mutation_kind, $bash_mutation_targets, $planctl_files,
-        $backend_exec_type, $backend_exec_session_id, $backend_exec_pane_id
+        $backend_exec_type, $backend_exec_session_id, $backend_exec_pane_id,
+        $background_task_id
       )
     `),
     selectWorldRev: db.prepare(

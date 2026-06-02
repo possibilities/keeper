@@ -157,8 +157,18 @@ from pathlib import Path
 # the new ``Dispatched`` / ``DispatchExpired`` synthetic events
 # (autopilot surface, not the attribution surface keeper-py serves), so
 # the bump is whitelist-only with no reader logic change.
+#
+# v51 (fn-682 epic, T1) is a whitelist-only bump: adds the new
+# ``jobs.monitors`` JSON-array projection column (live per-session
+# background-shell snapshot with three-way provenance —
+# ``monitor`` / ``bash-bg`` / ``ambient``) plus the sparse
+# ``events.background_task_id`` deriver column + its partial index that
+# feeds the reducer's in-fold provenance scan. keeper-py reads neither
+# ``jobs.monitors`` nor ``events.background_task_id`` (attribution
+# surface only — the monitors projection serves the ``keeper jobs``
+# viewer), so the bump is whitelist-only with no reader logic change.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
-    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50}
+    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51}
 )
 
 
