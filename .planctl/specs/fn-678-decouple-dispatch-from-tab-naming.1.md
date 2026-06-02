@@ -52,5 +52,5 @@ THIS change — a missing bump fails every `commit-work` host-wide.
 - [ ] `keeper/api.py` `SUPPORTED_SCHEMA_VERSIONS` includes 50; `test/schema-version.test.ts` passes
 
 ## Done summary
-
+Added pending_dispatches projection table (schema v50): CREATE DDL keyed (verb, id), bumped SCHEMA_VERSION 49→50 with v49→v50 migrate slot, joined the rewind-and-redrain DELETE list, registered PENDING_DISPATCHES_DESCRIPTOR + PendingDispatch row type, and added 50 to keeper/api.py SUPPORTED_SCHEMA_VERSIONS.
 ## Evidence
