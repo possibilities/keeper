@@ -35,6 +35,7 @@ import {
   buildWorkerCommand,
   type ConfirmRunningDeps,
   confirmRunning,
+  type DispatchedPayload,
   type DispatchFailedPayload,
   type FoundJob,
   isOccupyingJob,
@@ -151,6 +152,14 @@ const AUTOCLOSE: ReconcileConfig = { autocloseWindows: true };
 interface FakeDepsLog {
   launches: Array<{ argv: string[]; name: string; cwd: string }>;
   emissions: DispatchFailedPayload[];
+  /**
+   * fn-678 task .3 plumbing: every `Dispatched` mint the reconciler hands
+   * to `deps.emitDispatched`. The autopilot collapse in task .5 is the
+   * sole caller in production; today the log just records the plumbing
+   * is wired (this task's contract is "plumbed into ConfirmRunningDeps,"
+   * not "called from reconcile").
+   */
+  dispatchedEmissions: DispatchedPayload[];
   findJobCalls: Array<{ verb: string; id: string; watermark: number }>;
   maxEventIdCalls: number;
   closeByNameCalls: string[];
@@ -190,6 +199,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
   const log: FakeDepsLog = {
     launches: [],
     emissions: [],
+    dispatchedEmissions: [],
     findJobCalls: [],
     maxEventIdCalls: 0,
     closeByNameCalls: [],
@@ -218,6 +228,9 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
     emitDispatchFailed(payload) {
       log.emissions.push({ ...payload });
+    },
+    emitDispatched(payload) {
+      log.dispatchedEmissions.push({ ...payload });
     },
     maxEventId() {
       log.maxEventIdCalls += 1;

@@ -14,7 +14,10 @@ import {
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
   drainToCompletion,
+  PENDING_DISPATCH_SWEEP_INTERVAL_MS,
+  PENDING_DISPATCH_TTL_MS,
   recoverOneDeadLetter,
+  selectExpiredPendingDispatches,
   serializeUsageSnapshot,
   WAL_AUTOCHECKPOINT_PAGES,
   withBootDrainCheckpointTuning,
@@ -1896,4 +1899,124 @@ test("autopilot worker accepts {type:'set-paused', paused} commands without cras
     Bun.sleep(2000).then(() => "timeout" as const),
   ]);
   expect(result).toBe("exited");
+});
+
+// ---------------------------------------------------------------------------
+// fn-678 task .3 — pending_dispatches TTL sweep (producer-side, 60s heartbeat)
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert a row directly into `pending_dispatches`. Bypasses the reducer
+ * — fine for unit testing the sweep selector, which doesn't depend on
+ * how the row arrived (the reducer's `foldDispatched` UPSERT path is
+ * covered by `reducer.test.ts`).
+ */
+function seedPendingDispatch(
+  db: ReturnType<typeof openDb>["db"],
+  verb: string,
+  id: string,
+  dispatchedAtSec: number,
+  dir: string | null = null,
+  lastEventId = 1,
+): void {
+  db.run(
+    `INSERT INTO pending_dispatches (verb, id, dir, dispatched_at, last_event_id)
+       VALUES (?, ?, ?, ?, ?)`,
+    [verb, id, dir, dispatchedAtSec, lastEventId],
+  );
+}
+
+function seedDispatchFailure(
+  db: ReturnType<typeof openDb>["db"],
+  verb: string,
+  id: string,
+  tsSec: number,
+): void {
+  db.run(
+    `INSERT INTO dispatch_failures (
+       verb, id, reason, dir, ts, last_event_id, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [verb, id, "ceiling-elapsed", null, tsSec, 1, tsSec, tsSec],
+  );
+}
+
+test("PENDING_DISPATCH_TTL_MS is 120s (>= 2x the documented 60s cold-start ceiling)", () => {
+  // The constant defends the fn-627 double-dispatch invariant: a worker
+  // mid-boot must NEVER be re-dispatched over. Documented cold start P99
+  // is ~24-33s; 120s gives ~3-4x margin. A regression here would
+  // re-create the hazard the projection exists to eliminate.
+  expect(PENDING_DISPATCH_TTL_MS).toBe(120_000);
+});
+
+test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
+  // The sweep MUST ride the heartbeat, not the data_version wake — a
+  // crashed dispatch can be the only pending row on a quiescent board,
+  // and a write-triggered wake would never fire. The 60s cadence
+  // matches the git-worker / git-status / readiness heartbeats keeper
+  // already uses elsewhere.
+  expect(PENDING_DISPATCH_SWEEP_INTERVAL_MS).toBe(60_000);
+});
+
+test("selectExpiredPendingDispatches returns aged rows past the TTL", () => {
+  const { db } = openDb(dbPath);
+  const now = 1_700_000_000_000; // arbitrary fixed epoch (ms)
+  const nowSec = now / 1000;
+  // Aged: dispatched 121s ago (past the 120s TTL).
+  seedPendingDispatch(db, "work", "fn-1-foo.1", nowSec - 121);
+  // Fresh: dispatched 30s ago (well inside the TTL).
+  seedPendingDispatch(db, "work", "fn-1-foo.2", nowSec - 30);
+  // Exact boundary: dispatched exactly 120s ago — equal is NOT past,
+  // so this row is NOT expired (cutoff is strict less-than).
+  seedPendingDispatch(db, "work", "fn-1-foo.3", nowSec - 120);
+
+  const expired = selectExpiredPendingDispatches(db, now);
+  expect(expired.map((r) => r.id).sort()).toEqual(["fn-1-foo.1"]);
+  db.close();
+});
+
+test("selectExpiredPendingDispatches skips rows with an open dispatch_failures row (LEFT JOIN guard)", () => {
+  const { db } = openDb(dbPath);
+  const now = 1_700_000_000_000;
+  const nowSec = now / 1000;
+  // Aged row that should expire …
+  seedPendingDispatch(db, "work", "fn-1-foo.1", nowSec - 200);
+  // … but an open dispatch_failures row for the same (verb, id) shields it.
+  // The reducer's foldDispatchFailed already discharges the pending row
+  // through the same DELETE path; the sweep's LEFT JOIN guard is
+  // belt-and-braces against a transient ordering race.
+  seedDispatchFailure(db, "work", "fn-1-foo.1", nowSec - 200);
+  // Another aged row WITHOUT a matching failure — should expire.
+  seedPendingDispatch(db, "work", "fn-1-foo.2", nowSec - 200);
+
+  const expired = selectExpiredPendingDispatches(db, now);
+  expect(expired.map((r) => r.id).sort()).toEqual(["fn-1-foo.2"]);
+  db.close();
+});
+
+test("selectExpiredPendingDispatches measures TTL against frozen dispatched_at (a daemon restart never resets the clock)", () => {
+  const { db } = openDb(dbPath);
+  // The frozen `dispatched_at` lifts off the synthetic event's payload,
+  // not `Date.now()` inside the fold (CLAUDE.md re-fold determinism).
+  // This test confirms the SWEEP side honors the same contract: the
+  // expire decision is `Date.now() - dispatched_at*1000 > TTL`,
+  // independent of when the daemon (re)started.
+  const dispatchedAtSec = 1_699_000_000;
+  seedPendingDispatch(db, "work", "fn-1-bar.1", dispatchedAtSec);
+
+  // Sweep "shortly after" — fresh row, not expired.
+  const justAfter = dispatchedAtSec * 1000 + 30_000;
+  expect(selectExpiredPendingDispatches(db, justAfter)).toEqual([]);
+
+  // Sweep "after a daemon restart that took 2 minutes" — same row,
+  // same frozen dispatched_at, NOW past the TTL.
+  const muchLater = dispatchedAtSec * 1000 + PENDING_DISPATCH_TTL_MS + 1;
+  const aged = selectExpiredPendingDispatches(db, muchLater);
+  expect(aged.map((r) => r.id)).toEqual(["fn-1-bar.1"]);
+  db.close();
+});
+
+test("selectExpiredPendingDispatches on an empty pending_dispatches table returns []", () => {
+  const { db } = openDb(dbPath);
+  expect(selectExpiredPendingDispatches(db, 1_700_000_000_000)).toEqual([]);
+  db.close();
 });

@@ -344,6 +344,22 @@ export interface ConfirmRunningDeps {
    */
   emitDispatchFailed(payload: DispatchFailedPayload): void;
   /**
+   * Emit a synthetic `Dispatched` event onto the writable connection (via
+   * the parent thread — workers never write the DB). Outbox-ordered intent
+   * (fn-678): the reconciler mints this BEFORE `launch()` so a crash
+   * between mint and the side-effect leaves a phantom `pending_dispatches`
+   * row the producer-side TTL sweep clears via `DispatchExpired`. Strictly
+   * preferable to double-dispatch in the launch→SessionStart blind window
+   * the fn-674 live-tab probe used to cover.
+   *
+   * Carries the reconcile-time `ts` so the reducer's `Dispatched` fold
+   * lands `pending_dispatches.dispatched_at` byte-identically across a
+   * re-fold (all wallclock lives in the producer; the fold never reads
+   * `Date.now()`). This task only plumbs the dep through; the autopilot
+   * reconcile collapse in `.5` is the sole caller.
+   */
+  emitDispatched(payload: DispatchedPayload): void;
+  /**
    * `SELECT MAX(id) FROM events` against the reconciler's own read-only
    * connection. Captured BEFORE `launch` so the post-launch poll can
    * filter out any stale `jobs` row carrying the same `(plan_verb,
@@ -419,6 +435,37 @@ export interface DispatchFailedPayload {
   reason: string;
   dir: string | null;
   ts: number;
+}
+
+/**
+ * Payload shape the reconciler hands to `emitDispatched` (fn-678,
+ * schema v50). Mirrors the `DispatchedPayload` interface in
+ * `src/reducer.ts` exactly — the producer-side stamp (`ts`) is the
+ * unix-seconds wall-clock at mint time and flows through the fold as
+ * `pending_dispatches.dispatched_at`, so a re-fold reproduces the row
+ * byte-identically (the reducer never reads `Date.now()`). The
+ * producer-side TTL sweep in main compares `ts` against `Date.now()`
+ * IN MAIN (never in a fold) to decide whether to mint
+ * `DispatchExpired`.
+ */
+export interface DispatchedPayload {
+  verb: Verb;
+  id: string;
+  dir: string | null;
+  ts: number;
+}
+
+/**
+ * Payload shape for the producer-side TTL sweep's `DispatchExpired`
+ * mint (fn-678, schema v50). Mirrors `src/reducer.ts`'s
+ * `DispatchExpiredPayload` shape — the discharge arm is keyed-by-pk
+ * only (`(verb, id)`), no `ts` carried (the fold is a DELETE; no row
+ * field to populate). Strictly `verb` + `id`, mirroring
+ * `DispatchClearedPayload`'s minimal shape.
+ */
+export interface DispatchExpiredPayload {
+  verb: Verb;
+  id: string;
 }
 
 /**
@@ -1013,10 +1060,39 @@ export interface DispatchFailedMessage {
   payload: DispatchFailedPayload;
 }
 
+/**
+ * Worker → main: Dispatched mint request (fn-678, schema v50). Main is
+ * the sole writer of the synthetic event onto the events log; the worker
+ * only describes what to mint. Outbox-ordered intent — the reconciler
+ * posts this BEFORE invoking `launch()` so a crash between mint and the
+ * tab-spawn side-effect leaves a phantom `pending_dispatches` row the
+ * producer-side TTL sweep discharges via `DispatchExpired` (strictly
+ * preferable to double-dispatch in the launch→SessionStart blind window
+ * the fn-674 live-tab probe used to cover).
+ */
+export interface DispatchedMessage {
+  kind: "dispatched";
+  payload: DispatchedPayload;
+}
+
+/**
+ * Worker → main: DispatchExpired mint request (fn-678, schema v50).
+ * Reserved for future worker-side use — the producer-side TTL sweep in
+ * `daemon.ts` is the live caller and mints directly on the writable
+ * connection (no Worker round-trip). The wire shape exists for parity
+ * with `DispatchedMessage` / `DispatchFailedMessage` and for any future
+ * worker-side discharge path.
+ */
+export interface DispatchExpiredMessage {
+  kind: "dispatch-expired";
+  payload: DispatchExpiredPayload;
+}
+
 type IncomingMessage = SetPausedMessage | ShutdownMessage;
-// `DispatchFailedMessage` is the outgoing wire shape main consumes when the
-// reconcile + dispatch loop is wired; the supervisor's message handler types
-// against the same record.
+// `DispatchFailedMessage`, `DispatchedMessage`, and `DispatchExpiredMessage`
+// are the outgoing wire shapes main consumes when the reconcile + dispatch
+// loop is wired; the supervisor's message handler types against the same
+// records.
 
 /**
  * Load a fresh {@link ReconcileSnapshot} from the worker's read-only
@@ -1232,6 +1308,16 @@ function main(): void {
         kind: "dispatch-failed",
         payload,
       } satisfies DispatchFailedMessage);
+    },
+    // fn-678 task .3 plumbing: the Dispatched mint bridge. Mirrors the
+    // DispatchFailed bridge above — workers never write the DB; main is
+    // the sole writer of the synthetic event onto the events log. The
+    // autopilot reconcile collapse in task .5 is the sole caller.
+    emitDispatched: (payload) => {
+      parentPort?.postMessage({
+        kind: "dispatched",
+        payload,
+      } satisfies DispatchedMessage);
     },
     maxEventId: () => {
       const row = db.query("SELECT MAX(id) AS m FROM events").get() as

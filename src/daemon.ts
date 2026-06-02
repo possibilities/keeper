@@ -70,6 +70,8 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type {
   AutopilotWorkerData,
+  DispatchExpiredMessage,
+  DispatchedMessage,
   DispatchFailedMessage,
 } from "./autopilot-worker";
 import type {
@@ -227,6 +229,80 @@ export const BOOT_DRAIN_PACE_MS = 5;
  * that are folded with no concurrent hooks waiting on the writer.
  */
 export const BOOT_DRAIN_PACE_EVENTS = 500;
+
+/**
+ * TTL (ms) for an open `pending_dispatches` row before the producer-side
+ * sweep mints a `DispatchExpired` discharge (fn-678, schema v50, task .3).
+ *
+ * Sized at 120s — strictly greater than the documented worker cold-start
+ * P99 (24-33s for a `claude` boot with ~60 plugin dirs on the work tier)
+ * with comfortable margin so a slow booting worker is NEVER re-dispatched
+ * over while it's still initializing. A shorter TTL re-creates the fn-627
+ * double-dispatch hazard the projection exists to eliminate; a phantom
+ * row outliving its slot by a few minutes is strictly preferable to a
+ * second worker landing on the same task.
+ *
+ * Compared against `Date.now()` IN MAIN by {@link sweepExpiredPendingDispatches}
+ * — the fold reads only `event.ts` so a re-fold remains deterministic
+ * (CLAUDE.md "all wallclock lives in the producer" invariant).
+ */
+export const PENDING_DISPATCH_TTL_MS = 120_000;
+
+/**
+ * Heartbeat cadence (ms) for the producer-side `pending_dispatches` TTL
+ * sweep (fn-678, schema v50, task .3). The sweep MUST ride a heartbeat,
+ * not the level-triggered `data_version` wake: a crashed dispatch can
+ * be the only pending row on a quiescent board, and a write-triggered
+ * wake would never fire — the slot would stay held indefinitely.
+ *
+ * 60s matches the existing 60s heartbeat cadence the git-worker
+ * documents in its header (`src/git-worker.ts:13`) and the task spec's
+ * "60s heartbeat" reference.
+ */
+export const PENDING_DISPATCH_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * Pure helper: select every `pending_dispatches` row aged past the TTL
+ * that does NOT already have an open `dispatch_failures` row for the
+ * same `(verb, id)`. Used by the producer-side TTL sweep in
+ * {@link runDaemon} to know which rows to mint a `DispatchExpired` for
+ * on each 60s heartbeat.
+ *
+ * Exported so the daemon test suite can drive the sweep deterministically
+ * (seed `pending_dispatches`, advance the wall-clock argument, assert
+ * the returned keys). Reads the projection on the passed connection —
+ * production passes main's writable connection so the read is sequenced
+ * inside the same writer that mints the synthetic events; tests can
+ * pass a tmp-DB connection.
+ *
+ * The LEFT JOIN guard suppresses an expire-mint for a `(verb, id)` whose
+ * `DispatchFailed` already discharged the pending row through the same
+ * fold path — defensive, since the reducer's `foldDispatchFailed`
+ * already DELETEs the matching pending row when present (fn-678,
+ * task .2), but the guard protects a transient race where the
+ * `DispatchFailed` event has been written but not yet folded into
+ * `dispatch_failures` and `pending_dispatches` simultaneously. Belt
+ * and braces.
+ */
+export function selectExpiredPendingDispatches(
+  db: Database,
+  nowMs: number,
+): { verb: string; id: string; dispatched_at: number }[] {
+  const rows = db
+    .query(
+      `SELECT pd.verb AS verb, pd.id AS id, pd.dispatched_at AS dispatched_at
+         FROM pending_dispatches pd
+         LEFT JOIN dispatch_failures df
+           ON df.verb = pd.verb AND df.id = pd.id
+         WHERE df.verb IS NULL`,
+    )
+    .all() as { verb: string; id: string; dispatched_at: number }[];
+  const cutoffMs = nowMs - PENDING_DISPATCH_TTL_MS;
+  // `dispatched_at` is unix-epoch SECONDS (matches the schema's REAL
+  // column and `event.ts` everywhere else in keeper). Compare in
+  // milliseconds for a clean TTL constant.
+  return rows.filter((r) => r.dispatched_at * 1000 < cutoffMs);
+}
 
 /**
  * Run the heavy boot drain with WAL auto-checkpointing DISABLED, then flush the
@@ -1968,26 +2044,53 @@ function runDaemon(): void {
   // request never sees a `null` autopilot worker.
   autopilotWorker = autopilotWorkerInstance;
 
-  // Worker → main: `DispatchFailed` mint request. Mirrors the git-worker
-  // synthetic-event mint pattern (see `:1309-1376`): the worker posts a
-  // `{kind:"dispatch-failed", payload}` message, main runs
-  // `stmts.insertEvent.run` on its writable connection, then sets
-  // `wakePending = true; pumpWakes()` so the reducer folds the row into
-  // `dispatch_failures` without waiting for the wake worker's
-  // `data_version` poll. Workers never write the DB; the producer-side
-  // `ts` rides in the payload so re-fold determinism holds.
+  // Worker → main: `DispatchFailed` / `Dispatched` / `DispatchExpired`
+  // mint requests. Mirrors the git-worker synthetic-event mint pattern
+  // (see `:1309-1376`): the worker posts a `{kind, payload}` message,
+  // main runs `stmts.insertEvent.run` on its writable connection, then
+  // sets `wakePending = true; pumpWakes()` so the reducer folds the row
+  // into `dispatch_failures` / `pending_dispatches` without waiting for
+  // the wake worker's `data_version` poll. Workers never write the DB;
+  // the producer-side `ts` rides in the payload (where the fold reads
+  // it) so re-fold determinism holds.
+  //
+  // The three mint paths share an identical column-binding shape — the
+  // only differences are `$hook_event` (`DispatchFailed` / `Dispatched`
+  // / `DispatchExpired`), `$event_type` (the projection tag the
+  // reducer matches on), and `$cwd` (carried from the payload `dir`
+  // when present; `null` for `DispatchExpired`, which is keyed by-pk
+  // only). NON-FATAL catch — a failed INSERT logs to stderr and
+  // continues; the next reconcile cycle re-attempts the dispatch.
   autopilotWorkerInstance.onmessage = (
-    ev: MessageEvent<DispatchFailedMessage | undefined>,
+    ev: MessageEvent<
+      | DispatchFailedMessage
+      | DispatchedMessage
+      | DispatchExpiredMessage
+      | undefined
+    >,
   ): void => {
     const msg = ev.data;
-    if (!msg || msg.kind !== "dispatch-failed") {
-      return;
+    if (!msg) return;
+    if (msg.kind === "dispatch-failed") {
+      handleDispatchFailedMint(msg.payload);
+    } else if (msg.kind === "dispatched") {
+      handleDispatchedMint(msg.payload);
+    } else if (msg.kind === "dispatch-expired") {
+      handleDispatchExpiredMint(msg.payload);
     }
-    const payload = msg.payload;
-    // The dispatch key (`${verb}::${id}`) rides as the entity-key
-    // overload on `session_id` so a re-fold can correlate the synthetic
-    // event to its `dispatch_failures` row without re-parsing the
-    // `data` blob. Same convention the retry-dispatch mint above uses.
+  };
+
+  /**
+   * Mint a synthetic `DispatchFailed` event on the writable connection.
+   * The dispatch key (`${verb}::${id}`) rides as the entity-key
+   * overload on `session_id` so a re-fold can correlate the synthetic
+   * event to its `dispatch_failures` row without re-parsing the `data`
+   * blob. Same convention the retry-dispatch mint above uses. NON-FATAL
+   * on insert failure — the next reconcile wake re-attempts.
+   */
+  function handleDispatchFailedMint(
+    payload: DispatchFailedMessage["payload"],
+  ): void {
     const data = JSON.stringify(payload);
     try {
       stmts.insertEvent.run({
@@ -2037,7 +2140,190 @@ function runDaemon(): void {
         }`,
       );
     }
-  };
+  }
+
+  /**
+   * Mint a synthetic `Dispatched` event on the writable connection
+   * (fn-678, schema v50). The reducer's `Dispatched` fold UPSERTs a
+   * `pending_dispatches` row keyed `(verb, id)` carrying the
+   * producer-side `dispatched_at` lifted off the payload's `ts` —
+   * outbox-ordered intent so a crash between mint and `launch()`
+   * leaves a phantom row the TTL sweep clears. NON-FATAL on insert
+   * failure: a missed mint means the launch-window dedup arm opens up
+   * for that `(verb, id)` until the next reconcile cycle, which is
+   * preferable to wedging the daemon (the worst case is one extra
+   * launch attempt, identical to fn-674's transient-failure
+   * degradation).
+   */
+  function handleDispatchedMint(payload: DispatchedMessage["payload"]): void {
+    const data = JSON.stringify(payload);
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${payload.verb}::${payload.id}`,
+        $pid: null,
+        $hook_event: "Dispatched",
+        $event_type: "pending_dispatches",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: payload.dir,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: data,
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $planctl_op: null,
+        $planctl_target: null,
+        $planctl_epic_id: null,
+        $planctl_task_id: null,
+        $planctl_subject_present: null,
+        $config_dir: null,
+        $planctl_queue_jump: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $planctl_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] Dispatched mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Mint a synthetic `DispatchExpired` event on the writable connection
+   * (fn-678, schema v50). The reducer's fold DELETEs the matching
+   * `pending_dispatches` row keyed `(verb, id)` — idempotent
+   * (re-folding over a missing row is a no-op). NON-FATAL on insert
+   * failure: the row stays put until the next heartbeat sweep mints
+   * again (the TTL comparison is keyed off the FROZEN
+   * `dispatched_at`, so a daemon restart never resets the clock —
+   * worst case is one extra TTL window before the row clears).
+   */
+  function handleDispatchExpiredMint(
+    payload: DispatchExpiredMessage["payload"],
+  ): void {
+    const data = JSON.stringify(payload);
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${payload.verb}::${payload.id}`,
+        $pid: null,
+        $hook_event: "DispatchExpired",
+        $event_type: "pending_dispatches",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: data,
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $planctl_op: null,
+        $planctl_target: null,
+        $planctl_epic_id: null,
+        $planctl_task_id: null,
+        $planctl_subject_present: null,
+        $config_dir: null,
+        $planctl_queue_jump: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $planctl_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] DispatchExpired mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  // Producer-side TTL sweep for `pending_dispatches` (fn-678, schema
+  // v50, task .3). Mints a synthetic `DispatchExpired` event for every
+  // row whose `dispatched_at` is older than `PENDING_DISPATCH_TTL_MS`
+  // and that does NOT already have an open `dispatch_failures` row for
+  // the same `(verb, id)` — the LEFT JOIN guard prevents the
+  // already-failed dispatch from getting a redundant expire mint (the
+  // reducer's `DispatchFailed` fold arm already discharges the pending
+  // row through the same `DELETE FROM pending_dispatches` path).
+  //
+  // MUST ride the 60s HEARTBEAT timer, not the level-triggered
+  // `data_version` wake: a crashed dispatch can be the only pending
+  // row on an otherwise-quiescent board, and a write-triggered wake
+  // would never fire — the row would never expire and the slot would
+  // stay held indefinitely. All wallclock (`Date.now()`) lives HERE
+  // in the producer, never inside a fold (CLAUDE.md re-fold
+  // determinism invariant); the fold reads only `event.ts` and the
+  // FROZEN payload, so a re-fold reproduces `pending_dispatches`
+  // byte-identically regardless of when the re-fold happens.
+  //
+  // The sweep reads the projection on main's writable connection
+  // (rather than via a separate read-only handle) so the read is
+  // sequenced inside the same writer that mints the synthetic event
+  // — no read/mint race against the reducer's own UPSERT.
+  function sweepExpiredPendingDispatches(): void {
+    if (shuttingDown) return;
+    let aged: { verb: string; id: string; dispatched_at: number }[];
+    try {
+      aged = selectExpiredPendingDispatches(db, Date.now());
+    } catch (err) {
+      // The pending_dispatches / dispatch_failures tables exist from
+      // schema v50; a read failure here is unexpected. Log non-fatally
+      // and let the next heartbeat retry.
+      console.error(
+        `[keeperd] pending_dispatches TTL sweep read threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
+    if (aged.length === 0) return;
+    for (const row of aged) {
+      // Mint the expire event. Failures inside the helper are logged
+      // and swallowed (non-fatal), so a per-row throw does not abort
+      // the sweep — every aged row gets its own shot.
+      handleDispatchExpiredMint({ verb: row.verb, id: row.id });
+    }
+    // `handleDispatchExpiredMint` already pumps wakes on each mint;
+    // the trailing flag is defense-in-depth in case the helper ever
+    // stops pumping (e.g. on insert throw — every row's mint is
+    // independent).
+    wakePending = true;
+    pumpWakes();
+  }
+
+  // Schedule the producer-side TTL sweep on the 60s heartbeat. Stored
+  // so the shutdown path can `clearInterval` it (otherwise the
+  // outstanding timer keeps a ref on the main loop and the daemon
+  // would hang at the shutdown deadline). The timer fires its
+  // callback ON THE MAIN THREAD against the writable connection —
+  // matching the synthetic-event mint sites the heartbeat targets.
+  const pendingDispatchSweepTimer = setInterval(() => {
+    sweepExpiredPendingDispatches();
+  }, PENDING_DISPATCH_SWEEP_INTERVAL_MS);
 
   // Same crash policy as the other workers: any thread failure →
   // fatalExit → exit 1 → launchd restart.
@@ -2116,6 +2402,11 @@ function runDaemon(): void {
       return;
     }
     shuttingDown = true;
+
+    // Clear the producer-side TTL sweep timer FIRST so the heartbeat
+    // can't fire a mint into the writer connection mid-teardown.
+    // (`clearInterval` is a no-op if the timer already fired.)
+    clearInterval(pendingDispatchSweepTimer);
 
     worker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     serverWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
