@@ -1,8 +1,9 @@
 /**
- * Restore-snapshot worker (epic fn-677 task .3). keeperd's TENTH Bun Worker
+ * Restore-snapshot worker (epic fn-677 task .3). keeperd's tenth Bun Worker
  * thread, joining the producer / consumer fleet (`wake-worker`, `server-worker`,
  * `transcript-worker`, `plan-worker`, `exit-watcher`, `git-worker`,
- * `usage-worker`, `dead-letter-worker`, `autopilot-worker`, `backend-worker`).
+ * `usage-worker`, `dead-letter-worker`, `autopilot-worker`, `backend-worker`,
+ * `tab-namer-worker`).
  *
  * On every `PRAGMA data_version` change (the same change-detection primitive
  * the wake worker and autopilot worker use), the worker reads the `jobs` +

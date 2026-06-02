@@ -369,7 +369,11 @@ firing correctly — check them before concluding it is broken:
   or via a producer-side TTL sweep on the 60s heartbeat (120s ceiling,
   `DispatchExpired`) when the bind never arrives — so a phantom row from a
   crash between mint and launch self-clears without human intervention. The
-  tab name is now a purely cosmetic label; `ExecBackend` exposes only
-  `launch`, `closeByTabId`, `focusPane`, and `resolveTabForPane`.
-  Reap (`autoclose_windows`) uses `closeByTabId(session, tabId)` off
-  `jobs.backend_exec_{session_id,tab_id}` (fn-668), not the tab name.
+  tab name is now a purely cosmetic label as far as dispatch dedup and reap
+  are concerned (fn-678 stands — neither path reads it); `ExecBackend`
+  exposes `launch`, `closeByTabId`, `focusPane`, `resolveTabForPane`, and
+  `renameTab` — the focus-safe `rename-tab-by-id` op used by the
+  tab-namer worker (fn-680, the eleventh worker thread, the aesthetic
+  side-effector) to converge live job tabs onto transcript-derived
+  titles. Reap (`autoclose_windows`) uses `closeByTabId(session, tabId)`
+  off `jobs.backend_exec_{session_id,tab_id}` (fn-668), not the tab name.

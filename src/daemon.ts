@@ -9,7 +9,7 @@
  *   2. Boot drain: `while (drain(db, BATCH) > 0) {}` — fold every unfolded event
  *      using the SAME code path as steady-state. After downtime this catches the
  *      projection up before the daemon goes live.
- *   3. Spawn TEN worker threads (all AFTER migrate + boot drain + seed sweep,
+ *   3. Spawn ELEVEN worker threads (all AFTER migrate + boot drain + seed sweep,
  *      so their read-only `openDb` connections never race a missing/un-migrated
  *      DB and the exit-watcher's data_version diff sees a settled projection):
  *      - the wake worker — opens its own read-only connection, polls
@@ -49,7 +49,7 @@
  *      no event is missed (drain always re-reads from the cursor) and drain is
  *      never invoked re-entrantly. A `transcript-title` / `exit` message
  *      inserts the synthetic event then pumps a wake to fold it.
- *   5. SIGTERM: post `{ type: "shutdown" }` to ALL TEN workers, await their
+ *   5. SIGTERM: post `{ type: "shutdown" }` to ALL ELEVEN workers, await their
  *      `close` events against a short deadline, terminate them, close the db,
  *      exit 0. This is the ONLY clean exit. The server worker releases its
  *      socket + lock, the transcript + plan workers unsubscribe their watchers,
@@ -114,6 +114,7 @@ import type {
   SetAutopilotPausedRequestMessage,
   SetAutopilotPausedResultMessage,
 } from "./server-worker";
+import type { TabNamerWorkerData } from "./tab-namer-worker";
 import type {
   ApiErrorMessage,
   InputRequestMessage,
@@ -2342,7 +2343,7 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
-  // Spawn the restore-snapshot worker (fn-677 task .3) — the TENTH worker
+  // Spawn the restore-snapshot worker (fn-677 task .3) — the tenth worker
   // thread. A pure CONSUMER: it opens its own read-only connection, polls
   // `PRAGMA data_version`, and on every change reads the `jobs` + `epics`
   // projections via the shared `runQuery` seam, builds a stable descriptor
@@ -2371,6 +2372,36 @@ function runDaemon(): void {
   };
 
   restoreWorker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
+
+  // Spawn the tab-namer worker (fn-680 task .3) — the ELEVENTH worker
+  // thread. A PURE SIDE-EFFECTOR: it opens its own read-only connection,
+  // ticks every ~5s, reads the live jobs that carry a resolved
+  // `(backend_exec_session_id, backend_exec_tab_id)` pair AND a non-NULL
+  // transcript `title`, and shells the focus-safe zellij
+  // `action rename-tab-by-id` op via `ExecBackend.renameTab` whenever
+  // the sanitized title differs from the last-observed
+  // `backend_exec_tab_name` and from the value already issued in a
+  // prior tick. The worker writes NOTHING to the DB, mints no events,
+  // and posts nothing to main — fn-678 made the tab name purely
+  // cosmetic (reap is by `backend_exec_tab_id`, launch dedup by
+  // `pending_dispatches`), so renaming every tab is safe and the
+  // convergence loop closes through the backend-worker's read-back of
+  // `backend_exec_tab_name`. No `onmessage` handler — pure consumer.
+  const tabNamerWorker = new Worker(
+    new URL("./tab-namer-worker.ts", import.meta.url).href,
+    {
+      workerData: { dbPath } satisfies TabNamerWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  tabNamerWorker.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] tab-namer worker error:", err.message ?? err);
+    fatalExit();
+  };
+
+  tabNamerWorker.addEventListener("close", () => {
     if (!shuttingDown) fatalExit();
   });
 
@@ -2428,17 +2459,21 @@ function runDaemon(): void {
     restoreWorker.postMessage({
       type: "shutdown",
     } satisfies ShutdownMessage);
+    tabNamerWorker.postMessage({
+      type: "shutdown",
+    } satisfies ShutdownMessage);
 
-    // Bun surfaces worker exit via the "close" event. Await ALL TEN
+    // Bun surfaces worker exit via the "close" event. Await ALL ELEVEN
     // workers' close (the server worker releases its socket + lock, the
     // transcript + plan + usage + dead-letter workers unsubscribe their
     // watchers, the exit-watcher releases its kqueue/pidfd fd, the
-    // autopilot worker aborts its in-flight confirm, and the restore
-    // worker closes its read-only DB connection in their own shutdown
-    // handlers — that teardown must land, or the socket / native
-    // watches / kernel fd leak into the next boot), raced against a
-    // single shared deadline so a wedged worker can't block our clean
-    // shutdown forever.
+    // autopilot worker aborts its in-flight confirm, the restore
+    // worker closes its read-only DB connection, and the tab-namer
+    // worker clears its tick interval + closes its read-only DB
+    // connection in their own shutdown handlers — that teardown must
+    // land, or the socket / native watches / kernel fd leak into the
+    // next boot), raced against a single shared deadline so a wedged
+    // worker can't block our clean shutdown forever.
     const exited = (w: Worker): Promise<void> =>
       new Promise<void>((resolve) => {
         w.addEventListener("close", () => resolve());
@@ -2456,6 +2491,7 @@ function runDaemon(): void {
         exited(deadLetterWorker),
         exited(autopilotWorkerInstance),
         exited(restoreWorker),
+        exited(tabNamerWorker),
       ]),
       Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS),
     ]);
@@ -2512,6 +2548,11 @@ function runDaemon(): void {
     }
     try {
       restoreWorker.terminate();
+    } catch {
+      // best-effort if it already exited
+    }
+    try {
+      tabNamerWorker.terminate();
     } catch {
       // best-effort if it already exited
     }

@@ -1369,8 +1369,10 @@ and flips on the `set_autopilot_paused` RPC, which appends an
 `AutopilotPaused{paused}` event FIRST then flips the worker gate only
 on a successful insert (so the gate and the projection cannot diverge
 on partial failure). The terminal-surface mechanics live behind the
-`ExecBackend` (`src/exec-backend.ts`) — four ops: `launch`,
-`closeByTabId`, `focusPane`, and `resolveTabForPane`. `ensureLaunched`
+`ExecBackend` (`src/exec-backend.ts`) — five ops: `launch`,
+`closeByTabId`, `focusPane`, `resolveTabForPane`, and `renameTab`
+(the focus-safe `rename-tab-by-id` op used by the tab-namer worker
+to converge zellij tab labels onto transcript titles). `ensureLaunched`
 (session-agnostic) get-or-creates the target session with its own
 per-call mint + orphan reap and launches an unnamed tab —
 `restore-agents.ts` is the consumer. Zellij is the only backend;
@@ -1446,7 +1448,29 @@ mode relaunches the surviving agents via the exact `claude --resume`
 shape `scripts/resume.ts` emits, deduplicated against jobs still live in
 the projection.
 
-The ten workers are fully independent; main supervises all ten lifecycles
+An **eleventh** Worker thread is the tab-namer worker (epic fn-680):
+a pure SIDE-EFFECTOR that opens its own read-only connection, ticks
+every ~5 seconds, and reads the live jobs that carry both a resolved
+`(backend_exec_session_id, backend_exec_tab_id)` pair and a non-NULL
+transcript-derived `title`. For each row whose sanitized title differs
+from the last-observed `backend_exec_tab_name` AND from the value
+already issued in a prior tick (the success-gated `lastSet` debounce),
+it shells the focus-safe `zellij action rename-tab-by-id <id> <name>`
+op via `ExecBackend.renameTab` — the `-t`/`--tab-id` flag form has an
+open focus-switch bug (zellij #4602) that would yank the human's
+visible focus to the renamed tab. fn-678 made the tab name purely
+cosmetic (reap is by `backend_exec_tab_id`, launch dedup by
+`pending_dispatches`), so renaming every tab — autopilot's included
+— is safe; the backend-worker is the single reader of zellij tab
+state, closing the convergence loop without a read-back from this
+worker. The worker writes NOTHING to the DB, mints no events, no
+schema bump, no reducer arm, no `keeper/api.py` whitelist change. It
+carries no `onmessage` handler — it never posts to main. Rename
+failures (tab gone, session dead, ENOENT) are silent no-ops; only an
+unhandled throw out of the tick escalates to `onerror`/`close` →
+fatalExit.
+
+The eleven workers are fully independent; main supervises all eleven lifecycles
 but routes none of their traffic, and any worker's `error` event escalates
 the whole process to a clean restart — with that single scoped exception, the
 recoverable drop signal on the transcript, plan, usage, and dead-letter
