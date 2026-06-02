@@ -152,19 +152,10 @@ const AUTOCLOSE: ReconcileConfig = { autocloseWindows: true };
 interface FakeDepsLog {
   launches: Array<{ argv: string[]; name: string; cwd: string }>;
   emissions: DispatchFailedPayload[];
-  /**
-   * fn-678 task .3 plumbing: every `Dispatched` mint the reconciler hands
-   * to `deps.emitDispatched`. The autopilot collapse in task .5 is the
-   * sole caller in production; today the log just records the plumbing
-   * is wired (this task's contract is "plumbed into ConfirmRunningDeps,"
-   * not "called from reconcile").
-   */
   dispatchedEmissions: DispatchedPayload[];
   findJobCalls: Array<{ verb: string; id: string; watermark: number }>;
   maxEventIdCalls: number;
-  closeByNameCalls: string[];
-  /** fn-674 tab-probe calls: every `verb::id` name confirmRunning queried. */
-  tabProbeCalls: string[];
+  closeByTabIdCalls: Array<{ session: string; tabId: string }>;
 }
 
 interface FakeDepsOptions {
@@ -175,14 +166,6 @@ interface FakeDepsOptions {
    * filter is honored by the fake too).
    */
   jobsByKey?: Map<string, FoundJob>;
-  /**
-   * fn-674 tab probe — initial set of live `verb::id` tab names. The
-   * fake `tabExistsByName` returns `true` iff the polled name is in
-   * this set; tests can mutate the set live via `setLiveTab` to drive
-   * the early-resolve branch deterministically (tab flips alive on
-   * the second poll tick, etc.).
-   */
-  liveTabs?: Set<string>;
   maxEventId?: number;
   now?: number | (() => number);
   pollIntervalMs?: number;
@@ -190,11 +173,12 @@ interface FakeDepsOptions {
 }
 
 function makeFakeDeps(opts: FakeDepsOptions = {}): {
-  deps: ConfirmRunningDeps & { closeByName(name: string): Promise<void> };
+  deps: ConfirmRunningDeps & {
+    closeByTabId(session: string, tabId: string): Promise<void>;
+  };
   log: FakeDepsLog;
   advanceMaxEventId(n: number): void;
   setJobByKey(verb: string, id: string, job: FoundJob): void;
-  setLiveTab(name: string, alive: boolean): void;
 } {
   const log: FakeDepsLog = {
     launches: [],
@@ -202,12 +186,10 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     dispatchedEmissions: [],
     findJobCalls: [],
     maxEventIdCalls: 0,
-    closeByNameCalls: [],
-    tabProbeCalls: [],
+    closeByTabIdCalls: [],
   };
   let maxEventId = opts.maxEventId ?? 100;
   const jobsByKey = new Map<string, FoundJob>(opts.jobsByKey ?? []);
-  const liveTabs = new Set<string>(opts.liveTabs ?? []);
   const nowFn: () => number =
     typeof opts.now === "function"
       ? opts.now
@@ -217,7 +199,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
         })();
 
   const deps: ConfirmRunningDeps & {
-    closeByName(name: string): Promise<void>;
+    closeByTabId(session: string, tabId: string): Promise<void>;
   } = {
     async launch(argv, name, cwd) {
       log.launches.push({ argv: [...argv], name, cwd });
@@ -244,10 +226,6 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
       }
       return null;
     },
-    async tabExistsByName(name) {
-      log.tabProbeCalls.push(name);
-      return liveTabs.has(name);
-    },
     now: nowFn,
     async sleep(ms, signal) {
       // Synchronous-ish microtask sleep so tests don't spin real time.
@@ -267,8 +245,8 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
     pollIntervalMs: opts.pollIntervalMs ?? 5,
     ceilingMs: opts.ceilingMs ?? 50,
-    async closeByName(name) {
-      log.closeByNameCalls.push(name);
+    async closeByTabId(session, tabId) {
+      log.closeByTabIdCalls.push({ session, tabId });
     },
   };
 
@@ -280,13 +258,6 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
     setJobByKey(verb: string, id: string, job: FoundJob) {
       jobsByKey.set(`${verb}::${id}`, job);
-    },
-    setLiveTab(name: string, alive: boolean) {
-      if (alive) {
-        liveTabs.add(name);
-      } else {
-        liveTabs.delete(name);
-      }
     },
   };
 }
@@ -675,67 +646,6 @@ test("confirmRunning BAD (fn-674 dead launch): ceiling elapses, NO tab and NO jo
   expect(emission?.dir).toBe("/repo");
 });
 
-test("confirmRunning fn-674 alive-at-ceiling: tab exists but no jobs row → ok, NO emit, slot held by liveTabKeys arm", async () => {
-  // The pre-fn-674 BAD test asserted a timeout always mints
-  // DispatchFailed. That's the load-bearing bug fn-674 fixes: when
-  // the launch succeeded but the worker is still booting (e.g. a
-  // 24-33s `claude` cold start), the named tab is live in the
-  // session even though the jobs row hasn't folded yet. The confirm
-  // must resolve `"ok"` (the launch DID succeed), mint NOTHING (the
-  // slot remains held by the standing liveTabKeys dedup arm on the
-  // next reconcile), and free no slot for a spurious re-dispatch.
-  const { deps, log } = makeFakeDeps({
-    maxEventId: 100,
-    pollIntervalMs: 5,
-    ceilingMs: 20,
-    liveTabs: new Set(["work::fn-1-foo.1"]), // tab present, jobs row absent
-  });
-  const ctrl = new AbortController();
-  const outcome = await confirmRunning(
-    "work",
-    "fn-1-foo.1",
-    "/repo",
-    ["sh", "-c", "true"],
-    ctrl.signal,
-    deps,
-  );
-  // Either the in-loop early-resolve OR the ceiling-elapsed final
-  // probe resolves "ok"; both code paths converge on the same
-  // outcome — no emit, slot held.
-  expect(outcome).toBe("ok");
-  expect(log.emissions).toEqual([]);
-});
-
-test("confirmRunning fn-674 early-resolve: tab appears before jobs row → ok, no emit", async () => {
-  // The first poll tick sees an empty liveTabs set; mid-flight we
-  // flip the tab alive. The confirm must resolve "ok" on the next
-  // tick from the tab probe alone — without waiting for the jobs
-  // row to fold (the launch → SessionStart blind window the
-  // fn-674 dedup arm closes).
-  const fake = makeFakeDeps({
-    maxEventId: 100,
-    pollIntervalMs: 5,
-    ceilingMs: 200,
-  });
-  const ctrl = new AbortController();
-  const promise = confirmRunning(
-    "work",
-    "fn-1-foo.1",
-    "/repo",
-    ["sh", "-c", "true"],
-    ctrl.signal,
-    fake.deps,
-  );
-  // Give the launch + first poll tick a moment, then flip the tab live.
-  await Bun.sleep(15);
-  fake.setLiveTab("work::fn-1-foo.1", true);
-  const outcome = await promise;
-  expect(outcome).toBe("ok");
-  expect(fake.log.emissions).toEqual([]);
-  // Tab probe was queried — confirms the new dep is wired.
-  expect(fake.log.tabProbeCalls.length).toBeGreaterThan(0);
-});
-
 test("confirmRunning BAD: launch returns {ok:false} → failed immediately with surfaced reason", async () => {
   const { deps, log } = makeFakeDeps({
     launch: async () => ({ ok: false, error: "zellij ENOENT" }),
@@ -898,10 +808,10 @@ test("runReconcileCycle: two launches serialize one-at-a-time (fn-644 stagger)",
   expect(liveDispatches.size).toBe(2);
 });
 
-test("runReconcileCycle reap: autoclose=on + role discharged → closeByName called, live entry forgotten", async () => {
-  // Pre-stage a live dispatch. The snapshot has NO matching epic/task
-  // anymore (the row was completed, dropped from default scope) — so
-  // the reconcile pass marks it role-discharged.
+test("runReconcileCycle reap: autoclose=on + role discharged → closeByTabId called when coords present, live entry forgotten", async () => {
+  // Pre-stage a live dispatch with a matching job that has backend_exec
+  // coords. The snapshot has no epic — role-discharged — but the job row
+  // carries session/tab ids so closeByTabId fires.
   const liveDispatches = new Map<string, LiveDispatch>();
   liveDispatches.set("work::fn-1-foo.1", {
     verb: "work",
@@ -910,11 +820,26 @@ test("runReconcileCycle reap: autoclose=on + role discharged → closeByName cal
     cwd: "/repo",
     controller: new AbortController(),
   });
-  const snap = makeSnapshot({ epics: [] });
+  const jobs = new Map<string, Job>();
+  jobs.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "work",
+      plan_ref: "fn-1-foo.1",
+      state: "ended",
+      last_event_id: 200,
+      backend_exec_session_id: "zellij-session-1",
+      backend_exec_tab_id: "42",
+    }),
+  );
+  const snap = makeSnapshot({ epics: [], jobs });
   const decision = reconcile(snap, makeState(), liveDispatches, AUTOCLOSE, 0);
   expect(decision.reaps.length).toBe(1);
   expect(decision.reaps[0]?.key).toBe("work::fn-1-foo.1");
-  expect(decision.reaps[0]?.reason).toBe("role-discharged");
+  expect(decision.reaps[0]?.reason).toBe("job-terminal");
+  expect(decision.reaps[0]?.sessionId).toBe("zellij-session-1");
+  expect(decision.reaps[0]?.tabId).toBe("42");
 
   const { deps, log } = makeFakeDeps();
   const ctrl = new AbortController();
@@ -926,7 +851,9 @@ test("runReconcileCycle reap: autoclose=on + role discharged → closeByName cal
     ctrl.signal,
     deps,
   );
-  expect(log.closeByNameCalls).toEqual(["work::fn-1-foo.1"]);
+  expect(log.closeByTabIdCalls).toEqual([
+    { session: "zellij-session-1", tabId: "42" },
+  ]);
   expect(liveDispatches.has("work::fn-1-foo.1")).toBe(false);
 });
 

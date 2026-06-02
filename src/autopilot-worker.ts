@@ -224,22 +224,12 @@ export interface ReconcileSnapshot {
    */
   failedKeys: Set<DispatchKey>;
   /**
-   * `(verb, id)` keys whose `verb::id`-named zellij tab is currently
-   * live in the managed session (fn-674). Probed once per cycle at
-   * snapshot load via `ExecBackend.liveTabNames()` (a single
-   * `list-panes -a -j` round-trip), then intersected with the
-   * candidate dispatch keys. `reconcile()` is pure and reads this
-   * synchronous set, never the backend. A tab present in the
-   * session is proof a worker has been launched into the slot even
-   * before its `SessionStart` hook lands in `jobs`, closing the
-   * launch → SessionStart blind window the legacy `isOccupyingJob`
-   * arm could not see.
-   *
-   * Inert on probe failure: a missing zellij binary or stale
-   * session returns an empty set so the dedup arm degrades open
-   * (the worker may re-dispatch on a transient zellij outage; the
-   * in-flight set, sticky `failedKeys`, and the legacy
-   * `isOccupyingJob` arm still cover the steady state).
+   * `(verb, id)` keys with an open `pending_dispatches` row (fn-678).
+   * Populated once per cycle from the durable projection; `reconcile()`
+   * is pure and reads this synchronous set, never the backend. A row's
+   * presence means a `Dispatched` event was minted BEFORE `launch()` and
+   * the corresponding `SessionStart` (which deletes the row) has not
+   * folded yet — i.e., the launch → SessionStart blind window is occupied.
    */
   liveTabKeys: Set<DispatchKey>;
 }
@@ -311,11 +301,17 @@ export type ReapReason = "job-terminal" | "role-discharged";
 /**
  * Reap decision the reconciler emits — one per `liveDispatches` entry
  * whose role is no longer needed. The autoclose flag is checked BEFORE
- * pushing into this list, so the caller blindly calls `closeByName(key)`.
+ * pushing into this list. `sessionId` / `tabId` carry the
+ * `jobs.backend_exec_{session_id,tab_id}` coordinates so `runReconcileCycle`
+ * can call `closeByTabId` without re-scanning the jobs map.
  */
 export interface PlannedReap {
   key: DispatchKey;
   reason: ReapReason;
+  /** `jobs.backend_exec_session_id` for the freshest occupying job, or null. */
+  sessionId: string | null;
+  /** `jobs.backend_exec_tab_id` for the freshest occupying job, or null. */
+  tabId: string | null;
 }
 
 /**
@@ -355,8 +351,7 @@ export interface ConfirmRunningDeps {
    * Carries the reconcile-time `ts` so the reducer's `Dispatched` fold
    * lands `pending_dispatches.dispatched_at` byte-identically across a
    * re-fold (all wallclock lives in the producer; the fold never reads
-   * `Date.now()`). This task only plumbs the dep through; the autopilot
-   * reconcile collapse in `.5` is the sole caller.
+   * `Date.now()`).
    */
   emitDispatched(payload: DispatchedPayload): void;
   /**
@@ -383,20 +378,6 @@ export interface ConfirmRunningDeps {
     plan_ref: string,
     last_event_id_gt: number,
   ): FoundJob | null;
-  /**
-   * Name-exact zellij tab probe (fn-674). Returns `true` iff some
-   * pane in the managed session lives in a tab whose `tab_name`
-   * matches `${verb}::${id}` exactly; `false` (inert) on probe
-   * failure (ENOENT, non-zero exit, unparseable JSON) so a
-   * transient zellij outage degrades the confirm to the legacy
-   * findJob path rather than a spurious early-resolve OR a
-   * spurious DispatchFailed mint.
-   *
-   * Wired to `ExecBackend.tabExistsByName` in production; tests
-   * inject a fake that flips `true` at a controlled tick to drive
-   * the early-resolve branch deterministically.
-   */
-  tabExistsByName(name: DispatchKey): Promise<boolean>;
   /** Producer-side wall-clock for the reconcile-time `ts` stamp. */
   now(): number;
   /**
@@ -753,11 +734,15 @@ export function reconcile(
       //    last_event_id as the freshest (monotonic per DB).
       let freshestState: string | null = null;
       let freshestEventId = -1;
+      let freshestSessionId: string | null = null;
+      let freshestTabId: string | null = null;
       for (const job of snapshot.jobs.values()) {
         if (job.plan_verb === live.verb && job.plan_ref === live.id) {
           if (job.last_event_id > freshestEventId) {
             freshestEventId = job.last_event_id;
             freshestState = job.state;
+            freshestSessionId = job.backend_exec_session_id;
+            freshestTabId = job.backend_exec_tab_id;
           }
         }
       }
@@ -772,9 +757,19 @@ export function reconcile(
       const roleDischarged = !wantedKeys.has(live.key);
 
       if (jobTerminal) {
-        reaps.push({ key: live.key, reason: "job-terminal" });
+        reaps.push({
+          key: live.key,
+          reason: "job-terminal",
+          sessionId: freshestSessionId,
+          tabId: freshestTabId,
+        });
       } else if (roleDischarged) {
-        reaps.push({ key: live.key, reason: "role-discharged" });
+        reaps.push({
+          key: live.key,
+          reason: "role-discharged",
+          sessionId: freshestSessionId,
+          tabId: freshestTabId,
+        });
       }
     }
   }
@@ -790,35 +785,26 @@ export function reconcile(
 }
 
 /**
- * The confirm-runner. Captures the `events.id` watermark, fires the
- * launch via `deps.launch`, then polls BOTH `deps.findJob` AND
- * `deps.tabExistsByName(verb::id)` until either resolves truthy (GOOD;
- * resolve `"ok"`) or `ceilingMs` elapses. The launch envelope's
- * `{ ok: false, error }` path SHORT-CIRCUITS to `"failed"` with the
- * surfaced error string — no poll if the launch itself didn't fire.
+ * The confirm-runner. Captures the `events.id` watermark, mints a
+ * `Dispatched` event (outbox-ordered intent, fn-678), fires `launch`,
+ * then polls `deps.findJob` until it resolves truthy (GOOD; resolve
+ * `"ok"`) or `ceilingMs` elapses. Launch failure (`ok: false`) SHORT-
+ * CIRCUITS to `"failed"` with the surfaced error string.
  *
- * fn-674 early-resolve. The tab probe is a producer-side liveness
- * signal visible the instant `new-tab` returns, long before the
- * worker's `SessionStart` hook lands in `jobs`. Resolving `"ok"`
- * on tab-visible releases the fn-644 one-at-a-time stagger in
- * ~zellij latency rather than waiting for the full ceiling — a
- * 24-33s `claude` cold boot no longer races the timeout.
- *
- * fn-674 timeout-but-tab-alive. On ceiling elapse, probe the tab
- * one final time. If it exists, the launch DID succeed and a
- * worker IS occupying the slot — resolve `"ok"` and mint NOTHING
- * (the standing `liveTabKeys` dedup arm in the next reconcile
- * keeps the slot held until either the tab dies or SessionStart
- * binds). If it does NOT exist AND no jobs row appeared, the
- * launch is dead — emit `DispatchFailed` and resolve `"failed"`.
+ * Launch-window dedup is served by the durable `pending_dispatches`
+ * projection (populated by the `Dispatched` event minted here) rather
+ * than the fn-674 live zellij tab probe. The standing `liveTabKeys` arm
+ * in `reconcile()` reads the projection on each cycle and suppresses
+ * re-dispatch for any key with an open row — so a worker that is still
+ * booting (24-33s cold `claude` start) keeps its slot held until
+ * `SessionStart` folds and discharges the row.
  *
  * Abort handling: `signal.aborted` after any internal sleep resolves
  * `"aborted"` without emitting `DispatchFailed`. Shutdown is a clean
  * teardown, not a sticky failure.
  *
  * Pure with-injected-deps — tests pass fake `launch` / `findJob` /
- * `tabExistsByName` / `now` / `sleep` to drive every branch
- * deterministically.
+ * `now` / `sleep` to drive every branch deterministically.
  */
 export async function confirmRunning(
   verb: Verb,
@@ -835,7 +821,18 @@ export async function confirmRunning(
   //    SessionStart that PROVES this dispatch lit up will carry
   //    `last_event_id > watermark`.
   const watermark = deps.maxEventId();
-  // 2. Launch.
+  // 2. Mint intent BEFORE launch (outbox ordering, fn-678). A crash
+  //    between this mint and the actual `launch()` call leaves a phantom
+  //    `pending_dispatches` row; the producer-side TTL sweep clears it via
+  //    `DispatchExpired`. A phantom row delaying a real dispatch by up to
+  //    120s is strictly preferable to double-dispatch.
+  deps.emitDispatched({
+    verb,
+    id,
+    dir: cwd === "" ? null : cwd,
+    ts: deps.now(),
+  });
+  // 3. Launch.
   const launchResult: LaunchResult | { ok: false; error: string } = await deps
     .launch(argv, key, cwd)
     .catch((err) => ({
@@ -855,17 +852,13 @@ export async function confirmRunning(
   if (signal.aborted) {
     return "aborted";
   }
-  // 3. Poll loop — fn-674 polls BOTH the jobs row AND the tab probe.
-  //    The first signal wins; the tab probe typically fires first
-  //    (visible the instant `new-tab` returns), the jobs row closes
-  //    the determinism gap once SessionStart actually folds.
+  // 4. Poll loop — wait for the SessionStart jobs row. The
+  //    `pending_dispatches` row (minted above) keeps the `liveTabKeys`
+  //    arm of `reconcile()` fired on every subsequent cycle, so
+  //    a slow-booting worker (24-33s cold `claude` start) holds its slot
+  //    without a live zellij probe.
   const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const ceilingMs = deps.ceilingMs ?? DEFAULT_CEILING_MS;
-  const startMs = deps.now() * 1000; // `now` returns unix seconds, scale up.
-  // Re-anchor with a millisecond clock derived from the seconds clock so
-  // the test can drive both off the same `deps.now`. We track remaining
-  // by counting elapsed sleep slices — the tick math doesn't depend on
-  // the actual wall-clock reading (which keeps tests deterministic).
   let elapsedMs = 0;
   while (elapsedMs < ceilingMs) {
     const remainingMs = ceilingMs - elapsedMs;
@@ -879,33 +872,11 @@ export async function confirmRunning(
     if (hit != null) {
       return "ok";
     }
-    // fn-674 early-resolve: the named tab is live in the session.
-    // The launch succeeded and a worker is occupying the slot — no
-    // need to wait for SessionStart to fold the jobs row. Probe
-    // failures (ENOENT, parse miss) return false, so the loop
-    // continues on the legacy findJob path — never a spurious
-    // early-resolve on a broken backend.
-    const tabAlive = await deps.tabExistsByName(key).catch(() => false);
-    if (tabAlive) {
-      return "ok";
-    }
     if (signal.aborted) {
       return "aborted";
     }
   }
-  // Use the start-ms anchor to log latency; not strictly required for
-  // the outcome path. Kept out of the success path to avoid the cost
-  // when the row appears on the first tick.
-  void startMs;
-  // fn-674 timeout-but-tab-alive: one final probe before declaring
-  // failure. If the tab DOES exist, the launch succeeded — a slow
-  // worker is still booting (e.g. 24-33s `claude` cold start) and
-  // the standing `liveTabKeys` dedup arm will keep the slot held on
-  // the next reconcile. Resolve "ok" and mint NOTHING.
-  const tabAliveAtCeiling = await deps.tabExistsByName(key).catch(() => false);
-  if (tabAliveAtCeiling) {
-    return "ok";
-  }
+  // Ceiling elapsed with no jobs row — the launch is dead.
   deps.emitDispatchFailed({
     verb,
     id,
@@ -929,7 +900,7 @@ export async function confirmRunning(
  * the supervisor's `wakePending` flag (same shape as
  * `src/daemon.ts` keeps).
  *
- * `closeByName` is fire-and-forget (the ExecBackend contract); we
+ * `closeByTabId` is fire-and-forget (the ExecBackend contract); we
  * await it nevertheless so a flooded reap pass doesn't run unbounded
  * in parallel — the backend's noteLine warns drive forensic visibility.
  */
@@ -940,18 +911,26 @@ export async function runReconcileCycle(
   shell: string,
   signal: AbortSignal,
   deps: ConfirmRunningDeps & {
-    closeByName(name: string): Promise<void>;
+    closeByTabId(session: string, tabId: string): Promise<void>;
   },
 ): Promise<void> {
-  // Reaps first — they free up zellij surfaces (and may make room for a
-  // queued launch's name). closeByName is fire-and-forget but we await
-  // sequentially so the reconciler doesn't fan out unbounded concurrent
-  // zellij actions.
+  // Reaps first — they free up zellij tabs (and may make room for a
+  // new launch). closeByTabId is fire-and-forget but we await sequentially
+  // so the reconciler doesn't fan out unbounded concurrent zellij actions.
   for (const reap of decision.reaps) {
     if (signal.aborted) {
       return;
     }
-    await deps.closeByName(reap.key);
+    if (reap.sessionId != null && reap.tabId != null) {
+      await deps.closeByTabId(reap.sessionId, reap.tabId);
+    } else {
+      // No resolved tab coordinates — the job either never received a
+      // BackendExecSnapshot or is pre-fn-668. Log and skip; the tab
+      // will linger until the user closes it manually.
+      console.error(
+        `[autopilot-worker] reap ${reap.key}: no tab coords, skipping closeByTabId`,
+      );
+    }
     liveDispatches.delete(reap.key);
   }
   // Launches: one-at-a-time. Each await covers the full confirm window
@@ -1120,7 +1099,6 @@ type IncomingMessage = SetPausedMessage | ShutdownMessage;
  */
 async function loadReconcileSnapshot(
   db: Parameters<typeof runQuery>[0],
-  liveTabNames: () => Promise<Set<string>>,
 ): Promise<ReconcileSnapshot> {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
@@ -1157,32 +1135,17 @@ async function loadReconcileSnapshot(
     }
   }
 
-  // fn-674: probe zellij ONCE per cycle for the full set of live
-  // tab names and intersect with the candidate `(verb, id)` keys.
-  // The reduce stays pure — it reads the synchronous Set and never
-  // touches the backend. Candidate keys are every `(verb, id)` the
-  // row partition could possibly dispatch (every task → work::id,
-  // every epic → close::id, every task → approve::id); the
-  // intersection drops tab names that don't match a dispatch key
-  // (e.g. a human-opened scratch tab) so `reconcile()` only sees
-  // keys it would actually act on.
-  //
-  // A transient zellij outage returns an empty Set (the backend's
-  // inert-on-failure contract), so the dedup arm opens up and the
-  // legacy `isOccupyingJob` arm carries the steady state.
-  const candidateKeys = new Set<DispatchKey>();
-  for (const epic of epics) {
-    candidateKeys.add(dispatchKey("close", epic.epic_id));
-    for (const task of epic.tasks) {
-      candidateKeys.add(dispatchKey("work", task.task_id));
-      candidateKeys.add(dispatchKey("approve", task.task_id));
-    }
-  }
-  const allTabNames = await liveTabNames().catch(() => new Set<string>());
+  // fn-678: read `pending_dispatches` for the launch-window occupancy
+  // signal. Each row represents a dispatched-but-not-yet-bound worker;
+  // a row's presence (minted via `Dispatched` BEFORE `launch()`) keeps
+  // the `liveTabKeys` arm of `reconcile()` fired until `SessionStart`
+  // folds and discharges the row. No backend probe needed.
   const liveTabKeys = new Set<DispatchKey>();
-  for (const name of allTabNames) {
-    if (candidateKeys.has(name)) {
-      liveTabKeys.add(name);
+  for (const row of read("pending_dispatches")) {
+    const verb = (row as { verb?: unknown }).verb;
+    const id = (row as { id?: unknown }).id;
+    if (typeof verb === "string" && typeof id === "string") {
+      liveTabKeys.add(dispatchKey(verb as Verb, id));
     }
   }
 
@@ -1299,20 +1262,16 @@ function main(): void {
   // a DispatchFailed is described to main via `postMessage` (main is the
   // sole writer of the synthetic event, mirroring the git-worker mint).
   const deps: ConfirmRunningDeps & {
-    closeByName(name: string): Promise<void>;
+    closeByTabId(session: string, tabId: string): Promise<void>;
   } = {
     launch: (argv, name, cwd) => backend.launch(argv, name, cwd),
-    closeByName: (name) => backend.closeByName(name),
+    closeByTabId: (session, tabId) => backend.closeByTabId(session, tabId),
     emitDispatchFailed: (payload) => {
       parentPort?.postMessage({
         kind: "dispatch-failed",
         payload,
       } satisfies DispatchFailedMessage);
     },
-    // fn-678 task .3 plumbing: the Dispatched mint bridge. Mirrors the
-    // DispatchFailed bridge above — workers never write the DB; main is
-    // the sole writer of the synthetic event onto the events log. The
-    // autopilot reconcile collapse in task .5 is the sole caller.
     emitDispatched: (payload) => {
       parentPort?.postMessage({
         kind: "dispatched",
@@ -1339,11 +1298,6 @@ function main(): void {
         | undefined;
       return row ?? null;
     },
-    // fn-674: forward to the backend's name-exact tab probe. The
-    // backend implementation is inert-on-failure (false on ENOENT /
-    // non-zero exit / unparseable JSON) so confirmRunning never
-    // sees a thrown error from this dep.
-    tabExistsByName: (name) => backend.tabExistsByName(name),
     now: () => Math.floor(Date.now() / 1000),
     sleep: (ms, signal) => abortableSleep(ms, signal),
   };
@@ -1369,9 +1323,7 @@ function main(): void {
         if (shutdown) {
           return;
         }
-        const snapshot = await loadReconcileSnapshot(db, () =>
-          backend.liveTabNames(),
-        );
+        const snapshot = await loadReconcileSnapshot(db);
         const decision = reconcile(
           snapshot,
           state,
