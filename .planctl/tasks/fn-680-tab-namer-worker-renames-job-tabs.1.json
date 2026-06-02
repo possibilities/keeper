@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-06-02T18:22:58.930985Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "ExecBackend renameTab op",
-  "updated_at": "2026-06-02T18:35:20.107174Z",
+  "updated_at": "2026-06-02T18:36:13.856614Z",
   "worker_done_at": "2026-06-02T18:35:20.107174Z"
 }
