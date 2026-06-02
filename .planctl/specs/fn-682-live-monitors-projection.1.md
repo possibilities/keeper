@@ -55,5 +55,5 @@ Build the full event-sourcing pipeline that produces a correct per-job `jobs.mon
 - [ ] bun test green.
 
 ## Done summary
-
+Schema v51 live monitors projection: jobs.monitors JSON-array column folded from each Stop's data.background_tasks (shell allowlist) with three-way provenance (monitor / bash-bg / ambient) via an in-fold scan against the new events.background_task_id sparse column + partial composite index; SessionEnd / Killed clear monitors to '[]'; cursor=0 re-fold is byte-identical via shared pure deriver; keeper-py SUPPORTED_SCHEMA_VERSIONS bumped to include 51.
 ## Evidence
