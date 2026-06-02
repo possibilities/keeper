@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Session-agnostic ensureLaunched on ExecBackend",
-  "updated_at": "2026-06-02T13:18:07.223474Z"
+  "updated_at": "2026-06-02T13:53:39.852135Z",
+  "worker_done_at": "2026-06-02T13:53:39.852135Z"
 }

@@ -64,5 +64,5 @@ zellij.
 - [ ] README ExecBackend paragraph updated; `test/exec-backend.test.ts` covers argv construction + the resiliences.
 
 ## Done summary
-
+Added session-agnostic ExecBackend.ensureLaunched: refactored ensureSession into ensureSessionFor(targetSession) shared by the managed memo and the new per-call path; new method get-or-creates the target session, launches an unnamed tab via the existing builder, reaps the orphan default Tab #1 per-call, and retries once on a session-gone stderr. Shares no memo/orphan state with launch(). README widened; 7 new exec-backend tests cover argv shape, mint path, session-gone retry, ENOENT/non-zero envelopes, and the no-shared-state invariant.
 ## Evidence
