@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-677-restore-previous-session",
   "bundles": [],
   "closer_done_at": "2026-06-02T14:39:51.921412Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-02T14:39:51.921412Z"
+  "updated_at": "2026-06-02T14:40:47.001053Z"
 }
