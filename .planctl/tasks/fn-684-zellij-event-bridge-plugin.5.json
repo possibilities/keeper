@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-02T23:06:05.621401Z",
+  "depends_on": [
+    "fn-684-zellij-event-bridge-plugin.3",
+    "fn-684-zellij-event-bridge-plugin.4"
+  ],
+  "epic": "fn-684-zellij-event-bridge-plugin",
+  "id": "fn-684-zellij-event-bridge-plugin.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "cutover and retire poller",
+  "updated_at": "2026-06-02T23:06:05.621401Z"
+}
