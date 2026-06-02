@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-676-jobs-tui-session-sections",
   "bundles": [],
   "closer_done_at": "2026-06-02T00:26:45.201418Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-02T00:26:45.201418Z"
+  "updated_at": "2026-06-02T00:27:14.128920Z"
 }
