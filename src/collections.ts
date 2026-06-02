@@ -705,6 +705,54 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
+ * The `pending_dispatches` descriptor (schema v50, epic fn-678). The durable
+ * substrate that replaces fn-674's live zellij tab-name probe for launch-
+ * window double-dispatch suppression — one row per `(verb, id)` dispatch the
+ * autopilot reconciler has minted a `Dispatched` event for and that has not
+ * yet been discharged (by SessionStart bind, `DispatchFailed`, or the TTL
+ * sweep's `DispatchExpired`). Drives a future "in-flight dispatches" pane on
+ * the `keeper autopilot` viewer and is the dedup source of truth the
+ * reconciler reads inside its readiness pass.
+ *
+ * Schema lives in `src/db.ts`'s `CREATE_PENDING_DISPATCHES`; the population
+ * path is the reducer's `Dispatched` UPSERT + `DispatchFailed` /
+ * `DispatchExpired` / SessionStart-bind DELETE fold arms (task .2 of this
+ * epic), all inside the existing `BEGIN IMMEDIATE` transaction. The table
+ * is a reducer projection (unlike `dead_letters`), so a from-scratch re-
+ * fold rebuilds it byte-identically from the event log.
+ *
+ * Pk is composite (`verb`, `id`) — but `CollectionDescriptor.pk` expects a
+ * single column. We carry `verb` as the descriptor pk and let `id` ride in
+ * `columns` for display and `filters` for narrowing, mirroring
+ * `DISPATCH_FAILURES_DESCRIPTOR`'s composite-pk workaround. A future
+ * detail-page subscribe needing single-row resolution by both fields would
+ * need a composite-pk extension to `CollectionDescriptor` — same situation
+ * as `SUBAGENT_INVOCATIONS_DESCRIPTOR`'s composite pk, deferred for the
+ * same reason (the wire surface is the in-flight list, not per-row
+ * detail).
+ *
+ * `version: 'last_event_id'` so the wire diff fires on every UPSERT (the
+ * reducer bumps `last_event_id` on every fold). `defaultSort` is
+ * `dispatched_at DESC` (most-recent dispatch on top, matching the viewer's
+ * expected reverse-chronological "what just launched" feed). No
+ * `jsonColumns` — every column is a scalar.
+ */
+export const PENDING_DISPATCHES_DESCRIPTOR: CollectionDescriptor = {
+  name: "pending_dispatches",
+  table: "pending_dispatches",
+  columns: ["verb", "id", "dir", "dispatched_at", "last_event_id"],
+  pk: "verb",
+  version: "last_event_id",
+  sortable: new Set(["verb", "id", "dispatched_at", "last_event_id"]),
+  defaultSort: { column: "dispatched_at", dir: "desc" },
+  filters: {
+    verb: "verb",
+    id: "id",
+  },
+  jsonColumns: new Set(),
+};
+
+/**
  * The registry, keyed by wire-facing collection name. `jobs` + the `epics`
  * plan collection (which embeds its tasks + plan/close-verb jobs as JSON-array
  * columns — the standalone `tasks` collection was dropped in schema v7 — and
@@ -713,7 +761,8 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
  * the `dead_letters` operational sidecar (schema v37, fn-643) + the
  * `dispatch_failures` autopilot-reconciler sticky-failure projection
  * (schema v43, fn-661) + the `autopilot_state` singleton paused/playing
- * projection (schema v47, fn-667).
+ * projection (schema v47, fn-667) + the `pending_dispatches` in-flight
+ * launch-window projection (schema v50, fn-678).
  */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
@@ -725,6 +774,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [DEAD_LETTERS_DESCRIPTOR.name, DEAD_LETTERS_DESCRIPTOR],
   [DISPATCH_FAILURES_DESCRIPTOR.name, DISPATCH_FAILURES_DESCRIPTOR],
   [AUTOPILOT_STATE_DESCRIPTOR.name, AUTOPILOT_STATE_DESCRIPTOR],
+  [PENDING_DISPATCHES_DESCRIPTOR.name, PENDING_DISPATCHES_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

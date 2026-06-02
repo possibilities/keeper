@@ -701,6 +701,63 @@ export interface DeadLetter {
 }
 
 /**
+ * One row of the schema-v50 `pending_dispatches` reducer projection (epic
+ * fn-678). Mirrors the `CREATE_PENDING_DISPATCHES` shape in `src/db.ts`
+ * column-for-column. The durable substrate that replaces fn-674's live
+ * zellij tab-name probe for launch-window double-dispatch suppression: a
+ * row exists for as long as the autopilot reconciler's `Dispatched` mint
+ * has not yet been discharged by a SessionStart bind (the job whose
+ * `(plan_verb, plan_ref)` matches `(verb, id)`), a `DispatchFailed` event,
+ * or the producer-side TTL sweep's `DispatchExpired` event.
+ *
+ * Row presence IS the signal — no `launched` boolean / status column. The
+ * row's absence is the slot-free fact every dedup arm reads.
+ *
+ * IS a reducer projection (mint via `Dispatched`; discharge via the three
+ * paths above), inside the same `BEGIN IMMEDIATE` cursor-advance
+ * transaction as every other projection write. A from-scratch re-fold
+ * rebuilds this table byte-identically from the immutable event log.
+ */
+export interface PendingDispatch {
+  /**
+   * The dispatch verb the reconciler launched — the `plan_verb` correlation
+   * key matched against `jobs.plan_verb` at discharge-on-bind
+   * (`plan-plan`, `plan-defer`, `plan-queue`, `keeper-work-task`, etc).
+   * Part of the composite primary key.
+   */
+  verb: string;
+  /**
+   * The dispatch target id — the planctl epic id or task id the verb is
+   * bound to (also the `jobs.plan_ref` correlation key). Part of the
+   * composite primary key.
+   */
+  id: string;
+  /**
+   * The working directory the reconciler launched the dispatch against.
+   * Useful for viewer context and a future re-launch path. Nullable so a
+   * dispatch shape with no working directory doesn't need to fabricate
+   * one. Mirrors `dispatch_failures.dir`.
+   */
+  dir: string | null;
+  /**
+   * Unix-epoch seconds — the producer-side wall-clock timestamp at the
+   * moment the reconciler decided to dispatch, frozen onto the `Dispatched`
+   * event payload by main. The TTL sweep (task .3) compares this against
+   * `Date.now()` IN MAIN (never inside the fold) when deciding whether to
+   * mint `DispatchExpired`. Re-fold-deterministic because the payload is
+   * immutable.
+   */
+  dispatched_at: number;
+  /**
+   * The `events.id` of the `Dispatched` event that stamped this row (the
+   * last UPSERTing one for an existing row). Drives the
+   * `PENDING_DISPATCHES_DESCRIPTOR`'s wire diff — every UPSERT bumps it so
+   * a subscribed viewer's pane re-renders on every dispatch event.
+   */
+  last_event_id: number;
+}
+
+/**
  * The display projection of a `jobs` row embedded inside an `epics` row's
  * `jobs` array (epic-form ref: verbs `plan` / `close` / `approve`) or inside
  * a task element's `jobs` sub-array (task-form ref: verbs `work` /

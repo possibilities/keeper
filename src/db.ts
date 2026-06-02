@@ -57,7 +57,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 49;
+export const SCHEMA_VERSION = 50;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1112,6 +1112,80 @@ CREATE TABLE IF NOT EXISTS dispatch_failures (
 `;
 
 /**
+ * Schema-v50 `pending_dispatches` projection table (epic fn-678). The durable
+ * substrate that replaces the live zellij tab-name probe (fn-674's
+ * `liveTabKeys` / `tabExistsByName` / `liveTabNames`) for launch-window
+ * double-dispatch suppression. The autopilot reconciler mints a synthetic
+ * `Dispatched{verb, id, dir}` event BEFORE invoking `ExecBackend.launch()`
+ * (outbox-ordered intent — a crash between mint and launch leaves a phantom
+ * row that TTL'd-clears, strictly preferable to double-dispatch); the
+ * reducer folds it into this table as an UPSERT keyed on `(verb, id)`.
+ * Discharge runs through three event-sourced paths — discharge-on-bind
+ * (the SessionStart fold for a job whose `(plan_verb, plan_ref)` matches
+ * an open row), `DispatchFailed` (the existing fn-661 mint loops the
+ * pending row out via the same fold arm), and `DispatchExpired` (the
+ * producer-side TTL sweep on the 60s heartbeat mints when a row has aged
+ * past the 120s ceiling without binding).
+ *
+ * Row presence IS the signal — no `launched` boolean / status column. A row
+ * exists for as long as the dispatch is in-flight; its absence (cleared by
+ * bind / fail / expire) means "slot free." A stored flag would re-create the
+ * live-query problem this projection is built to retire.
+ *
+ * Unlike `dead_letters` (an operational sidecar of events that NEVER made it
+ * into the event log), `pending_dispatches` IS a reducer projection: every
+ * UPSERT / DELETE lands inside the same `BEGIN IMMEDIATE` cursor-advance
+ * transaction as every other projection write. A from-scratch re-fold
+ * (rewind `reducer_state.last_event_id` to 0, DELETE the projection tables,
+ * re-drain the event log) MUST reproduce this table byte-identically — so
+ * it goes in the re-fold reset DELETE list alongside `jobs`, `epics`,
+ * `git_status`, `file_attributions`, `subagent_invocations`, `usage`,
+ * `profiles`, `dispatch_failures`, and `autopilot_state`. No `Dispatched`
+ * events exist in the historical log (pre-fn-678), so a from-scratch
+ * re-fold over a pre-v50 log reproduces an empty table — matching the
+ * zero-event projection default.
+ *
+ * Field semantics:
+ * - `verb` (TEXT, part of PK): the dispatch verb the reconciler launched —
+ *   the `plan_verb` correlation key matched against `jobs.plan_verb` at
+ *   discharge-on-bind (`plan-plan`, `plan-defer`, `plan-queue`,
+ *   `keeper-work-task`, etc). Mirrors `dispatch_failures.verb`.
+ * - `id` (TEXT, part of PK): the dispatch target id — the planctl epic id
+ *   or task id the verb is bound to (also the `jobs.plan_ref` correlation
+ *   key). Mirrors `dispatch_failures.id`.
+ * - `dir` (TEXT, nullable): the working directory the reconciler launched
+ *   the dispatch against. Useful for viewer context and for the future
+ *   re-launch path; nullable so a dispatch shape with no working directory
+ *   doesn't need to fabricate one. Mirrors `dispatch_failures.dir`.
+ * - `dispatched_at` (REAL, NOT NULL): unix-epoch seconds — the producer-
+ *   side wall-clock timestamp at the moment the reconciler decided to
+ *   dispatch (lifted off the synthetic `Dispatched` event's payload, NOT
+ *   `event.ts` and NOT `Date.now()` inside the fold). The TTL sweep
+ *   compares this against `Date.now()` IN MAIN (never in the fold) when
+ *   deciding whether to mint `DispatchExpired`. Re-fold-deterministic
+ *   because the payload is immutable.
+ * - `last_event_id` (INTEGER, NOT NULL): the `events.id` of the
+ *   `Dispatched` (or last UPSERTing one for an existing row) that stamped
+ *   this row. Drives the `PENDING_DISPATCHES_DESCRIPTOR`'s wire diff —
+ *   every UPSERT bumps it so a subscribed viewer's pane re-renders on
+ *   every dispatch event.
+ *
+ * Defaults match the zero-event projection: a fresh DB with zero events
+ * has zero rows here; the table populates organically from the reducer's
+ * `Dispatched` fold arm (task .2 of this epic).
+ */
+const CREATE_PENDING_DISPATCHES = `
+CREATE TABLE IF NOT EXISTS pending_dispatches (
+    verb TEXT NOT NULL,
+    id TEXT NOT NULL,
+    dir TEXT,
+    dispatched_at REAL NOT NULL,
+    last_event_id INTEGER NOT NULL,
+    PRIMARY KEY (verb, id)
+)
+`;
+
+/**
  * Schema-v47 `autopilot_state` projection table (fn-667) — a SINGLETON row
  * (`id INTEGER PRIMARY KEY CHECK (id = 1)`) carrying the autopilot worker's
  * paused/playing flag as durable, viewer-readable state. Before v47 the flag
@@ -1919,6 +1993,7 @@ function migrate(db: Database): void {
     }
     db.run(CREATE_DISPATCH_FAILURES);
     db.run(CREATE_AUTOPILOT_STATE);
+    db.run(CREATE_PENDING_DISPATCHES);
 
     // Seed singleton cursor on first boot. Subsequent boots are no-ops.
     db.run(
@@ -4419,6 +4494,14 @@ function migrate(db: Database): void {
       // migrate(), but is empty — no `AutopilotPaused` events have ever
       // landed in a pre-v47 log).
       db.run("DELETE FROM autopilot_state");
+      // fn-678 (schema v50): `pending_dispatches` is a reducer projection
+      // (epic fn-678); it joins the rewind-and-redrain set here so the
+      // canonical "wipe every reducer-owned projection table" list stays
+      // complete for any FUTURE rewind. Harmless on a v41→v42 upgrade
+      // (the table exists by the bootstrap CREATE that runs first in
+      // migrate(), but is empty — no `Dispatched` events have ever
+      // landed in a pre-v50 log).
+      db.run("DELETE FROM pending_dispatches");
     }
 
     // v42→v43: fn-661 — `dispatch_failures` projection table, the durable
@@ -4770,6 +4853,39 @@ function migrate(db: Database): void {
     // byte-identical `epics` rows because the link write is a pure
     // function of the Commit payload (which carries `task_ids: []` on
     // every pre-fn-670 event via {@link extractCommit}'s default).
+
+    // v49→v50: fn-678 — `pending_dispatches` projection table, the durable
+    // substrate that replaces the live zellij tab-name probe (fn-674's
+    // `liveTabKeys` / `tabExistsByName` / `liveTabNames`) for launch-window
+    // double-dispatch suppression. Picked up unconditionally by the
+    // `CREATE TABLE IF NOT EXISTS CREATE_PENDING_DISPATCHES` in the
+    // bootstrap block above; this slot exists only for the version-bump
+    // stamp ordering, mirroring the v46→v47 `autopilot_state` whitelist-
+    // only template. No data backfill — the table populates exclusively
+    // from the reducer's `Dispatched` / `DispatchExpired` fold arms (task
+    // .2 of this epic) plus the existing `DispatchFailed` arm's loop-out
+    // of the pending row, and stays empty on a fresh DB / a steady-state
+    // v50 re-open with no prior in-flight dispatch.
+    //
+    // The table IS a reducer projection (unlike `dead_letters`, the audit
+    // log of events that never made it into the event log). A from-
+    // scratch re-fold rebuilds it byte-identically from the synthetic
+    // `Dispatched` / `DispatchFailed` / `DispatchExpired` events in the
+    // log — so it MUST be included in any future rewind-and-redrain
+    // DELETE list (see the v41→v42 slot above which already collects the
+    // canonical "wipe every reducer-owned projection" set; this slot
+    // joins `pending_dispatches` to that list alongside
+    // `dispatch_failures` and `autopilot_state`). No `Dispatched` events
+    // exist in the historical pre-v50 log, so a cursor=0 re-fold over a
+    // pre-v50 event log reproduces an empty `pending_dispatches` table —
+    // matching the zero-event projection default.
+    //
+    // No keeper-py reader change: keeper-py reads neither
+    // `pending_dispatches` nor any other autopilot surface, so the v50
+    // bump is whitelist-only on the Python side (`api.py`'s
+    // `SUPPORTED_SCHEMA_VERSIONS` frozenset adds 50 in the same change
+    // — test/schema-version.test.ts enforces; a missing bump fails
+    // every `jobctl commit-work` host-wide).
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -22,6 +22,7 @@ import {
   GIT_DESCRIPTOR,
   getCollection,
   JOBS_DESCRIPTOR,
+  PENDING_DISPATCHES_DESCRIPTOR,
   PROFILES_DESCRIPTOR,
   selectByIdsChunked,
   selectVersionsByIds,
@@ -241,6 +242,91 @@ test("getCollection resolves the profiles collection (fn-639)", () => {
   // (a quiet seed-only profile is still surface-worthy).
   expect(PROFILES_DESCRIPTOR.defaultFilter).toBeUndefined();
   expect(PROFILES_DESCRIPTOR.defaultClause).toBeUndefined();
+});
+
+test("getCollection resolves the pending_dispatches collection (schema v50, fn-678)", () => {
+  // Schema v50 (epic fn-678): the durable substrate that replaces fn-674's
+  // live zellij tab-name probe for launch-window double-dispatch
+  // suppression. Mirrors `dispatch_failures` shape (composite-pk workaround:
+  // `verb` is the descriptor pk, `id` rides in columns + filters).
+  expect(getCollection("pending_dispatches")).toBe(
+    PENDING_DISPATCHES_DESCRIPTOR,
+  );
+  expect(PENDING_DISPATCHES_DESCRIPTOR.table).toBe("pending_dispatches");
+  expect(PENDING_DISPATCHES_DESCRIPTOR.pk).toBe("verb");
+  expect(PENDING_DISPATCHES_DESCRIPTOR.version).toBe("last_event_id");
+  // Composite PK workaround: descriptor pk is `verb`; `id` lives in
+  // columns + filters for narrowing.
+  expect(PENDING_DISPATCHES_DESCRIPTOR.filters.verb).toBe("verb");
+  expect(PENDING_DISPATCHES_DESCRIPTOR.filters.id).toBe("id");
+  // Default sort: most-recent dispatch on top (reverse-chronological "what
+  // just launched" feed for the autopilot viewer).
+  expect(PENDING_DISPATCHES_DESCRIPTOR.defaultSort).toEqual({
+    column: "dispatched_at",
+    dir: "desc",
+  });
+  // No JSON-decoded columns — every persisted field is a scalar.
+  expect(PENDING_DISPATCHES_DESCRIPTOR.jsonColumns.size).toBe(0);
+  // Columns include every persisted field byte-for-byte against
+  // CREATE_PENDING_DISPATCHES.
+  for (const col of ["verb", "id", "dir", "dispatched_at", "last_event_id"]) {
+    expect(PENDING_DISPATCHES_DESCRIPTOR.columns).toContain(col);
+  }
+  // Sortable allowlist covers verb/id (identity browse), dispatched_at
+  // (time-ordered), last_event_id (the version column).
+  expect(PENDING_DISPATCHES_DESCRIPTOR.sortable.has("verb")).toBe(true);
+  expect(PENDING_DISPATCHES_DESCRIPTOR.sortable.has("id")).toBe(true);
+  expect(PENDING_DISPATCHES_DESCRIPTOR.sortable.has("dispatched_at")).toBe(
+    true,
+  );
+  expect(PENDING_DISPATCHES_DESCRIPTOR.sortable.has("last_event_id")).toBe(
+    true,
+  );
+  // No defaultFilter / defaultClause — every in-flight row is interesting
+  // (an unconstrained pane shows the live launch window).
+  expect(PENDING_DISPATCHES_DESCRIPTOR.defaultFilter).toBeUndefined();
+  expect(PENDING_DISPATCHES_DESCRIPTOR.defaultClause).toBeUndefined();
+});
+
+test("runQuery pages an empty pending_dispatches collection on a fresh DB (schema v50, fn-678)", () => {
+  // Zero-event projection: a fresh DB has zero pending_dispatches rows
+  // (the table populates exclusively from the reducer's `Dispatched` fold
+  // arm — task .2 of the epic). `runQuery` must serve the empty collection
+  // without error so the autopilot viewer's "in-flight" pane renders
+  // cleanly on a quiescent system.
+  const { db } = openDb(dbPath, { readonly: false });
+  const res = asResult(
+    runQuery(db, 0, { type: "query", collection: "pending_dispatches" }),
+  );
+  expect(res.total).toBe(0);
+  expect(res.rows).toEqual([]);
+  db.close();
+});
+
+test("runQuery pages a seeded pending_dispatches row with the served columns (schema v50, fn-678)", () => {
+  // Hand-insert a row (no reducer needed — the descriptor + runQuery path
+  // is the unit under test). Mirrors the `epics` round-trip test shape.
+  const { db } = openDb(dbPath, { readonly: false });
+  db.query(
+    `INSERT INTO pending_dispatches (verb, id, dir, dispatched_at, last_event_id)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run("keeper-work-task", "fn-1-foo.1", "/repo", 1234.5, 42);
+  const res = asResult(
+    runQuery(db, 42, { type: "query", collection: "pending_dispatches" }),
+  );
+  expect(res.total).toBe(1);
+  const row = res.rows[0];
+  if (row == null) throw new Error("expected one pending_dispatches row");
+  expect(row.verb).toBe("keeper-work-task");
+  expect(row.id).toBe("fn-1-foo.1");
+  expect(row.dir).toBe("/repo");
+  expect(row.dispatched_at).toBe(1234.5);
+  expect(row.last_event_id).toBe(42);
+  // Served columns match the descriptor's column list.
+  expect(Object.keys(row).sort()).toEqual(
+    [...PENDING_DISPATCHES_DESCRIPTOR.columns].sort(),
+  );
+  db.close();
 });
 
 test("epics descriptor: version is last_event_id; filters include pk + status; tasks is a jsonColumn out of sort/filter", () => {

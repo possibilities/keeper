@@ -149,8 +149,16 @@ from pathlib import Path
 # because keeper-py is a hard whitelist (not a floor/ceiling), and a
 # v49 daemon would fail every ``commit-work`` on the host until this
 # set was updated. ``test/schema-version.test.ts`` enforces.
+#
+# v50 (fn-678 epic, T1) is a whitelist-only bump: adds the new
+# ``pending_dispatches`` reducer projection table (the durable substrate
+# that replaces fn-674's live zellij tab-name probe for launch-window
+# double-dispatch suppression). keeper-py reads neither this table nor
+# the new ``Dispatched`` / ``DispatchExpired`` synthetic events
+# (autopilot surface, not the attribution surface keeper-py serves), so
+# the bump is whitelist-only with no reader logic change.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
-    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49}
+    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50}
 )
 
 
