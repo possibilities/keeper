@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "autopilot-zellij-clean-mint",
   "bundles": [],
   "closer_done_at": "2026-06-02T00:20:02.497575Z",
@@ -17,5 +18,5 @@
     "/Users/mike/code/dotfiles",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-02T00:20:02.497575Z"
+  "updated_at": "2026-06-02T00:20:43.520834Z"
 }
