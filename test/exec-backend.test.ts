@@ -29,6 +29,7 @@ import {
   buildZellijListSessionsArgs,
   buildZellijListTabsArgs,
   buildZellijNewTabArgs,
+  buildZellijRenameTabArgs,
   createZellijBackend,
   DEFAULT_EXEC_BACKEND,
   DEFAULT_ZELLIJ_SESSION,
@@ -1637,4 +1638,144 @@ test("ExecBackend.ensureLaunched: empty `name` string still omits --name (defens
   const newTab = calls.find((c) => c[1] === "--session" && c[4] === "new-tab");
   expect(newTab).toBeDefined();
   expect(newTab).not.toContain("--name");
+});
+
+// ---------------------------------------------------------------------------
+// buildZellijRenameTabArgs — pure builder for the focus-safe rename op
+// (fn-680.1). We use `rename-tab-by-id <id> <name>`, NEVER
+// `rename-tab --tab-id` (open zellij bug #4602 steals focus).
+// ---------------------------------------------------------------------------
+
+test("buildZellijRenameTabArgs: well-formed argv with --session, action rename-tab-by-id <id> <name>", () => {
+  expect(
+    buildZellijRenameTabArgs("autopilot", "3", "fn-680 implement"),
+  ).toEqual([
+    "zellij",
+    "--session",
+    "autopilot",
+    "action",
+    "rename-tab-by-id",
+    "3",
+    "fn-680 implement",
+  ]);
+});
+
+test("buildZellijRenameTabArgs: name rides as the final argv positional (shell-free, embedded $()/backticks/quotes are literal)", () => {
+  // `Bun.spawn` is shell-free by default — a title carrying shell
+  // metacharacters is a literal positional. This pins the contract
+  // so a regression that quoted/escaped the name would surface.
+  const tricky = '$(rm -rf /) `whoami` ; echo "x"';
+  const got = buildZellijRenameTabArgs("s", "7", tricky);
+  expect(got[got.length - 1]).toBe(tricky);
+  // The argv positional sits AFTER the bare tab id — clap will
+  // never see the tricky string as a flag.
+  expect(got).toEqual([
+    "zellij",
+    "--session",
+    "s",
+    "action",
+    "rename-tab-by-id",
+    "7",
+    tricky,
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// ExecBackend.renameTab — session-agnostic, on-interface (fn-680.1).
+// Exit 0 → ok; ENOENT / non-zero exit → { ok: false, error }; never
+// throws; NO ensureSession spawn (mirrors closeByTabId / focusPane).
+// ---------------------------------------------------------------------------
+
+test("ExecBackend.renameTab: exit 0 → { ok: true }, spawns rename-tab-by-id with the per-call session", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    { "zellij:--session": { stdout: "", exitCode: 0 } },
+    calls,
+  );
+  const got = await createFocusBackend(spawn, "construction-default").renameTab(
+    "per-call-session",
+    "5",
+    "fn-680 implement",
+  );
+  expect(got).toEqual({ ok: true });
+  // PER-CALL session, not the construction default — proves the
+  // session-agnostic contract.
+  expect(calls[0]).toEqual(
+    buildZellijRenameTabArgs("per-call-session", "5", "fn-680 implement"),
+  );
+});
+
+test("ExecBackend.renameTab: non-zero exit → { ok: false, error } carrying the exit code + stderr detail", async () => {
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  const spawn: SpawnFn = (cmd) => {
+    calls.push([...cmd]);
+    return {
+      exited: Promise.resolve(2),
+      stdout: new Response("").body,
+      stderr: new Response("Tab '99' not found").body,
+    };
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    session: "autopilot",
+    spawn,
+  });
+  const got = await backend.renameTab("autopilot", "99", "fn-680 implement");
+  expect(got.ok).toBe(false);
+  if (got.ok === false) {
+    expect(got.error).toContain("exited 2");
+    expect(got.error).toContain("Tab '99' not found");
+  }
+  // Mirrors closeByTabId — non-zero exit also surfaces a noteLine warn.
+  expect(notes.some((s) => s.includes("exited 2"))).toBe(true);
+});
+
+test("ExecBackend.renameTab: ENOENT spawn throw → { ok: false, error }, NEVER throws back", async () => {
+  // A spawn that throws synchronously simulates a missing zellij
+  // binary. runCapture catches and returns null; renameTab surfaces
+  // a noteLine warn + `{ ok: false, error }` envelope rather than
+  // propagating — the caller's contract is fire-and-forget retry.
+  const notes: string[] = [];
+  const spawn: SpawnFn = () => {
+    throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" });
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    session: "autopilot",
+    spawn,
+  });
+  // No throw — the await resolves.
+  const got = await backend.renameTab("autopilot", "3", "fn-680 implement");
+  expect(got.ok).toBe(false);
+  if (got.ok === false) {
+    expect(got.error).toContain("ENOENT");
+  }
+  expect(notes.some((s) => s.includes("ENOENT"))).toBe(true);
+});
+
+test("ExecBackend.renameTab: skips ensureSession (no list-sessions / attach spawn — session-agnostic)", async () => {
+  // renameTab targets an already-live session (the job is running
+  // there). Minting a session inside a cosmetic rename would be a
+  // surprising side effect. The spawn log should carry ONLY the
+  // rename-tab-by-id call; no list-sessions probe, no attach mint.
+  const calls: string[][] = [];
+  const spawn: SpawnFn = (cmd) => {
+    calls.push([...cmd]);
+    return {
+      exited: Promise.resolve(0),
+      stdout: new Response("").body,
+      stderr: new Response("").body,
+    };
+  };
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  await backend.renameTab("autopilot", "7", "fn-680 implement");
+  expect(calls.some((c) => c[1] === "list-sessions")).toBe(false);
+  expect(calls.some((c) => c[1] === "attach")).toBe(false);
+  expect(calls.length).toBe(1);
+  expect(calls[0]?.[4]).toBe("rename-tab-by-id");
 });

@@ -225,6 +225,31 @@ export interface ExecBackend {
    *  runs; the consumer (`keeper jobs` `v` key) is operating on a
    *  pane that already exists in some live session. */
   focusPane(session: string, paneId: string): Promise<LaunchResult>;
+  /** Session-agnostic. Rename the zellij tab whose stable id is
+   *  `tabId` inside the external `session` to `name` via
+   *  `zellij --session <session> action rename-tab-by-id <tabId>
+   *  <name>`. Uses `rename-tab-by-id` (focus-safe, 0.44.3-verified),
+   *  NEVER `rename-tab --tab-id` (open bug #4602 — the flag form
+   *  steals the human's visible focus into the renamed tab, fatal
+   *  for a background poller). `name` rides as the final argv
+   *  positional via shell-free spawn, so embedded `$()`/backticks/
+   *  quotes are literal — the caller is responsible for stripping
+   *  control bytes + a leading `-` (clap-flag mitigation).
+   *
+   *  Returns the same `LaunchResult` envelope as `launch`/`focusPane`
+   *  — exit 0 → `{ ok: true }`; ENOENT (zellij missing) or non-zero
+   *  exit (tab gone, session dead) → `{ ok: false, error }`. NEVER
+   *  throws. No `ensureSession` runs: the caller is renaming a tab
+   *  in an already-live session (the job is running there); minting
+   *  a session inside a rename would be a surprising side effect.
+   *  Used by the daemon's tab-namer worker to converge the
+   *  cosmetic `verb::id` launch label onto the transcript-derived
+   *  `title` once it emerges. */
+  renameTab(
+    session: string,
+    tabId: string,
+    name: string,
+  ): Promise<LaunchResult>;
   /** Session-agnostic. Resolve the tab a given pane lives in by
    *  running `zellij --session <session> action list-panes -a -j` once
    *  and filtering by pane id. Returns the resolved tab triple
@@ -487,6 +512,38 @@ export function buildZellijFocusPaneArgs(
   paneId: string,
 ): string[] {
   return ["zellij", "--session", session, "action", "focus-pane-id", paneId];
+}
+
+/**
+ * Build the zellij `action rename-tab-by-id <tabId> <name>` argv. Pure
+ * — exported for tests. The focus-safe rename op: the alternate
+ * `rename-tab --tab-id <id> <name>` form has open zellij bug #4602
+ * (the flag steals the human's visible focus into the renamed tab),
+ * fatal for a 5s background poller. `rename-tab-by-id` is verified
+ * present in zellij 0.44.3, leaves the human's focus alone, and also
+ * locks the name against zellij auto-rename. The session is targeted
+ * via `--session <session>`, the same selector used by
+ * `close-tab-by-id`. `name` rides as the final positional argv
+ * element via shell-free `Bun.spawn` (no shell interpolation), so a
+ * transcript title containing `$()`, backticks, `;`, or quotes is a
+ * literal string — clap parses it as the positional name argument.
+ * Strip a leading `-` upstream so clap does not parse the name as a
+ * flag.
+ */
+export function buildZellijRenameTabArgs(
+  session: string,
+  tabId: string,
+  name: string,
+): string[] {
+  return [
+    "zellij",
+    "--session",
+    session,
+    "action",
+    "rename-tab-by-id",
+    tabId,
+    name,
+  ];
 }
 
 /**
@@ -999,6 +1056,46 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         const stderrTrim = res.stderr.trim();
         const detail = stderrTrim.length > 0 ? `: ${stderrTrim}` : "";
         const error = `zellij focus-pane-id for session=${targetSession} pane=${paneId} exited ${res.exitCode}${detail}`;
+        return { ok: false, error };
+      }
+      return { ok: true };
+    },
+    async renameTab(
+      targetSession: string,
+      tabId: string,
+      name: string,
+    ): Promise<LaunchResult> {
+      // Session-agnostic — like `closeByTabId`/`focusPane`, operates
+      // on an already-live external session. No `ensureSession`
+      // call: minting a session inside a cosmetic rename would be a
+      // surprising side effect. A missing session collapses to a
+      // non-zero exit and we surface `{ ok: false, error }` so the
+      // caller (tab-namer worker, fn-680.2) can leave its
+      // success-gated `lastSet` debounce untouched and retry next
+      // tick.
+      //
+      // `name` rides as the final positional argv element via
+      // shell-free `Bun.spawn` — no shell interpolation, so embedded
+      // `$()`/backticks/quotes are literal characters clap parses
+      // as the positional name argument. The caller strips control
+      // bytes + a leading `-` (clap-flag defense-in-depth) before
+      // calling.
+      //
+      // NEVER throws: ENOENT (zellij binary missing) and non-zero
+      // exit both degrade to a noteLine warn + `{ ok: false, error }`
+      // envelope, mirroring `focusPane`.
+      const args = buildZellijRenameTabArgs(targetSession, tabId, name);
+      const res = await runCapture(args);
+      if (res == null) {
+        const error = `zellij rename-tab-by-id for session=${targetSession} tab=${tabId} failed (ENOENT? binary missing)`;
+        deps.noteLine(`# warn: ${error}`);
+        return { ok: false, error };
+      }
+      if (res.exitCode !== 0) {
+        const stderrTrim = res.stderr.trim();
+        const detail = stderrTrim.length > 0 ? `: ${stderrTrim}` : "";
+        const error = `zellij rename-tab-by-id for session=${targetSession} tab=${tabId} exited ${res.exitCode}${detail}`;
+        deps.noteLine(`# warn: ${error}`);
         return { ok: false, error };
       }
       return { ok: true };
