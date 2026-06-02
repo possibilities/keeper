@@ -56,5 +56,5 @@ events reproduces an empty table.
 - [ ] Re-fold determinism test passes (empty over historical log; discharged over Dispatched+SessionStart)
 
 ## Done summary
-
+Implemented Dispatched / DispatchExpired event payloads, folds, and applyEvent dispatch wiring; widened foldDispatchFailed to also DELETE the matching pending_dispatches row in the same fold tx; added discharge-on-bind in the SessionStart spawn-INSERT branch (not on resume ON CONFLICT). 16 new reducer tests cover UPSERT, idempotent DELETE, widened FAIL-loop-out, discharge-on-bind spawn-only vs resume, malformed payloads, and full-sequence re-fold determinism. All 393 reducer tests pass; epic Quick commands (547 tests across 5 files) green.
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Reducer: Dispatched/Expired folds + discharge",
-  "updated_at": "2026-06-02T13:56:01.478550Z"
+  "updated_at": "2026-06-02T16:08:29.868941Z",
+  "worker_done_at": "2026-06-02T16:08:29.868941Z"
 }
