@@ -68,5 +68,5 @@ calls. Sandboxed env incl. `KEEPER_RESTORE_FILE`.
 - [ ] Warns when autopilot is unpaused; `test/restore-agents.test.ts` covers gate/filter/dedup/dry-run-vs-apply.
 
 ## Done summary
-
+Added scripts/restore-agents.ts (dry-run default, --apply / --session / --help) replaying surviving agents from restore.json via ExecBackend.ensureLaunched + buildResumeCommand. Parse-safe (missing/malformed=>exit-0 no-op), future-schema_version refuse gate, live-jobs dedup with daemon-down=>empty skip-set, autopilot-unpaused warning. test/restore-agents.test.ts (26 tests) covers schema gate, dedup, plan, shell-wrap, apply-vs-dry-run via fake ensureLaunched, and loadRestoreFile branches.
 ## Evidence
