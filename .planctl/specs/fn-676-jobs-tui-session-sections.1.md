@@ -49,5 +49,5 @@ interactive/autopilot frame shape and the ` · <type> <session>/<tab>` segment.
 - [ ] `bun test test/jobs.test.ts` passes; stale JSDoc updated
 
 ## Done summary
-
+Regrouped keeper jobs view by backend_exec_session_id (replacing the interactive/autopilot split), reshaped backendCoordsSeg into the bracketed '[<tab> p<pane>]' pill, moved the backend pill into the collapse-controlled region of renderJobsBody, and now show the disclosure caret on every job row in insert mode. The [awaiting:<kind>] line stays always-visible. 35/35 tests in test/jobs.test.ts pass.
 ## Evidence
