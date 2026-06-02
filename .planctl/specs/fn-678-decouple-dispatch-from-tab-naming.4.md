@@ -49,5 +49,5 @@ case; `rg` confirms no remaining references to the deleted methods across
 - [ ] exec-backend tests pass
 
 ## Done summary
-
+Slimmed ExecBackend to launch/closeByTabId/focusPane/resolveTabForPane (+ ensureLaunched). closeByTabId wraps buildZellijCloseTabArgs; deleted closeByName/tabExistsByName/liveTabNames/findPaneByTabName. tab_id TEXT pass-through covered.
 ## Evidence
