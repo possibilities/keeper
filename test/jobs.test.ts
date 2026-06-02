@@ -17,6 +17,7 @@
 import { expect, test } from "bun:test";
 import {
   backendCoordsSeg,
+  monitorLinesFor,
   projectJobRow,
   renderJobsBody,
   selectableJobIds,
@@ -823,4 +824,206 @@ test("colorizePillsInLine: dead-letter:<N> takes the warn bucket via prefix fall
   expect(colorizePillsInLine("[dead-letter:3]")).toBe(
     `[${WARN}dead-letter:3${RESET}]`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// monitorLinesFor — schema v51 / fn-682 per-job live-monitors rendering.
+// Pure JSON-parse with `[]` fallback; renders `[<kind>] <label>[ [<status>]]`
+// per entry. `label` prefers `command`, falls back to `description`, falls
+// back to `id`. A multi-line `command` truncates to its first non-empty line.
+// Today's task-1 projection ships only `{id, kind}` so most production rows
+// render with `id` as the label, but the helper is built to render the
+// future enrichment correctly the moment the projection grows.
+// ---------------------------------------------------------------------------
+
+test("monitorLinesFor: id-only projection (task-1 shape) renders [kind] <id> per entry", () => {
+  const json = JSON.stringify([
+    { id: "b5217wols", kind: "ambient" },
+    { id: "bnamgymkh", kind: "monitor" },
+    { id: "bt25vb1eo", kind: "bash-bg" },
+  ]);
+  expect(monitorLinesFor(json, "  ")).toEqual([
+    "  [ambient] b5217wols",
+    "  [monitor] bnamgymkh",
+    "  [bash-bg] bt25vb1eo",
+  ]);
+});
+
+test("monitorLinesFor: empty / missing / malformed JSON → no lines", () => {
+  expect(monitorLinesFor("[]", "  ")).toEqual([]);
+  expect(monitorLinesFor("", "  ")).toEqual([]);
+  expect(monitorLinesFor(null, "  ")).toEqual([]);
+  expect(monitorLinesFor(undefined, "  ")).toEqual([]);
+  // JSON parse failure does NOT throw.
+  expect(monitorLinesFor("{not json", "  ")).toEqual([]);
+  // Non-array JSON folds to no lines.
+  expect(monitorLinesFor('"a string"', "  ")).toEqual([]);
+  expect(monitorLinesFor('{"id":"x","kind":"ambient"}', "  ")).toEqual([]);
+});
+
+test("monitorLinesFor: future-enriched entry — command preferred over description over id", () => {
+  // Future projection shape: the deriver lifts command/description/status
+  // off the raw event payload alongside id+kind. The helper renders the
+  // richest available label without needing a separate code path.
+  const json = JSON.stringify([
+    {
+      id: "b1",
+      kind: "ambient",
+      command: "chatctl watch-chat",
+      description: "chatctl bus",
+      status: "running",
+    },
+  ]);
+  expect(monitorLinesFor(json, "  ")).toEqual([
+    "  [ambient] chatctl watch-chat [running]",
+  ]);
+});
+
+test("monitorLinesFor: empty command falls back to description (per spec)", () => {
+  const json = JSON.stringify([
+    {
+      id: "b1",
+      kind: "monitor",
+      command: "",
+      description: "chatctl bus",
+      status: "running",
+    },
+  ]);
+  expect(monitorLinesFor(json, "  ")).toEqual([
+    "  [monitor] chatctl bus [running]",
+  ]);
+});
+
+test("monitorLinesFor: missing command + missing description falls back to id", () => {
+  const json = JSON.stringify([{ id: "abc123", kind: "ambient" }]);
+  expect(monitorLinesFor(json, "  ")).toEqual(["  [ambient] abc123"]);
+});
+
+test("monitorLinesFor: multi-line command truncates to FIRST non-empty line", () => {
+  // The risk: a 1KB+ heredoc would wreck the row. The helper collapses
+  // a multi-line command to its first non-empty line so the row stays
+  // one terminal-line tall. Leading-blank-line case covered too.
+  const heredoc = "\n\n  cat <<'EOF'\nfirst body line\nsecond body line\nEOF";
+  const json = JSON.stringify([
+    { id: "b1", kind: "bash-bg", command: heredoc, status: "running" },
+  ]);
+  expect(monitorLinesFor(json, "  ")).toEqual([
+    "  [bash-bg]   cat <<'EOF' [running]",
+  ]);
+});
+
+test("monitorLinesFor: missing / empty status drops the trailing [status] slot", () => {
+  const json = JSON.stringify([
+    { id: "b1", kind: "ambient", command: "chatctl watch-chat" },
+    { id: "b2", kind: "ambient", command: "echo hi", status: "" },
+  ]);
+  expect(monitorLinesFor(json, "  ")).toEqual([
+    "  [ambient] chatctl watch-chat",
+    "  [ambient] echo hi",
+  ]);
+});
+
+test("monitorLinesFor: malformed entries (null / non-object) skip silently", () => {
+  const json = JSON.stringify([
+    null,
+    "string-entry",
+    { id: "ok", kind: "ambient" },
+  ]);
+  expect(monitorLinesFor(json, "  ")).toEqual(["  [ambient] ok"]);
+});
+
+test("monitorLinesFor: missing kind defaults to ambient (defensive)", () => {
+  const json = JSON.stringify([{ id: "x" }]);
+  expect(monitorLinesFor(json, "  ")).toEqual(["  [ambient] x"]);
+});
+
+test("renderJobsBody: expanded job renders monitors BETWEEN backend pill and sub-agents", () => {
+  // Wire order inside the collapse-controlled region:
+  //   backendCoordsSeg → monitors → subagentLinesFor
+  const { subagentIndex } = ambWithSub();
+  const jobs = new Map<string, unknown>([
+    [
+      "j-amb",
+      {
+        job_id: "j-amb",
+        cwd: "/repo/x",
+        title: "ambient",
+        plan_verb: null,
+        state: "working",
+        backend_exec_session_id: "ada",
+        backend_exec_pane_id: "11",
+        backend_exec_tab_name: "main",
+        monitors: JSON.stringify([
+          { id: "b5217wols", kind: "ambient" },
+          { id: "bnamgymkh", kind: "monitor" },
+        ]),
+      },
+    ],
+  ]);
+  const body = renderJobsBody(jobs, subagentIndex, {
+    insertMode: false,
+    selectedIndex: 0,
+    expanded: new Set(["j-amb"]),
+  });
+  expect(body).toBe(
+    [
+      "--- ada ---",
+      "(x) ambient [working]",
+      "  [main p11]",
+      "  [ambient] b5217wols",
+      "  [monitor] bnamgymkh",
+      "  general-purpose: investigate [running]",
+    ].join("\n"),
+  );
+});
+
+test("renderJobsBody: monitors are collapse-by-default (hidden when not expanded)", () => {
+  const jobs = new Map<string, unknown>([
+    [
+      "j1",
+      {
+        job_id: "j1",
+        cwd: "/repo/x",
+        title: "ambient",
+        plan_verb: null,
+        state: "working",
+        backend_exec_session_id: "ada",
+        monitors: JSON.stringify([{ id: "b1", kind: "ambient" }]),
+      },
+    ],
+  ]);
+  const body = renderJobsBody(jobs, new Map());
+  expect(body).toBe(["--- ada ---", "(x) ambient [working]"].join("\n"));
+  expect(body).not.toContain("[ambient] b1");
+});
+
+test("renderJobsBody: empty / missing monitors blob renders no Monitors section", () => {
+  // Three flavors — '[]', '', and the column absent entirely — all produce
+  // zero monitor lines but the rest of the expanded region renders normally.
+  for (const monitors of ["[]", "", undefined]) {
+    const jobs = new Map<string, unknown>([
+      [
+        "j1",
+        {
+          job_id: "j1",
+          cwd: "/repo/x",
+          title: "ambient",
+          plan_verb: null,
+          state: "working",
+          backend_exec_session_id: "ada",
+          backend_exec_pane_id: "11",
+          backend_exec_tab_name: "main",
+          monitors,
+        },
+      ],
+    ]);
+    const body = renderJobsBody(jobs, new Map(), {
+      insertMode: false,
+      selectedIndex: 0,
+      expanded: new Set(["j1"]),
+    });
+    expect(body).toBe(
+      ["--- ada ---", "(x) ambient [working]", "  [main p11]"].join("\n"),
+    );
+  }
 });

@@ -135,6 +135,7 @@ Row shape:
   ({basename(cwd)}) {title} [{role}]? [{state}]{[failed:<kind>]}?
     [awaiting:<kind>]?                     (always-visible continuation line)
     [{tab} p{pane}]?                       (collapse-controlled, when expanded)
+    [{kind}] {command|description|id} [{status}]?  (per live monitor, v51)
     {subagent_type}({annotations})?: {description} [{status}]   (per sub-agent)
 
 The optional [awaiting:<kind>] pill drops to its own indented
@@ -254,6 +255,84 @@ const GLYPH_COLLAPSED = "\uf0da"; // nf-fa-caret_right (U+F0DA) ▸
 const GLYPH_EXPANDED = "\uf0d7"; // nf-fa-caret_down (U+F0D7) ▾
 
 /**
+ * Per-job live-monitor lines (schema v51 / fn-682). Reads from the
+ * `jobs.monitors` JSON-array projection (snapshot-replace on each Stop —
+ * see `src/reducer.ts:computeMonitors`); each entry is `{id, kind}`
+ * where `kind` is the three-way provenance label `monitor` / `bash-bg`
+ * / `ambient` (Monitor tool / Bash `run_in_background` / plugin- or
+ * harness-armed).
+ *
+ * Output shape per entry: `<indent>[<kind>] <label>[ <status-pill>]`.
+ * `<label>` prefers `command`, falls back to `description`, falls back
+ * to the entry's id (the only field guaranteed to be present in the
+ * task-1 projection — the richer `command` / `description` / `status`
+ * fields are read defensively so this helper renders correctly the
+ * moment a future projection-enrichment carries them through). A
+ * multi-line command (1KB+ heredocs exist in the wild) collapses to
+ * the FIRST non-empty line so the row stays one terminal line tall;
+ * the spec's "truncate to one line" risk is per-monitor, never
+ * propagated upward. `status` is bracketed as `[status]` for the
+ * pill colorizer; absent / empty `status` drops the trailing slot
+ * entirely.
+ *
+ * Pure function of `monitorsJson` + `indent` — no SGR codes baked in
+ * (the colorize-at-render convention; `colorizePillsInLine` paints
+ * brackets at the view-shell layer). Malformed JSON folds to `[]`
+ * (return value) so a bad projection blob can never crash the render
+ * — matches the reducer's "safe value on malformed payload" stance.
+ *
+ * Exported for `test/jobs.test.ts`.
+ */
+export function monitorLinesFor(
+  monitorsJson: unknown,
+  indent: string,
+): string[] {
+  if (typeof monitorsJson !== "string" || monitorsJson === "") {
+    return [];
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(monitorsJson);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    return [];
+  }
+  const lines: string[] = [];
+  for (const raw of parsed) {
+    if (raw === null || typeof raw !== "object") {
+      continue;
+    }
+    const e = raw as Record<string, unknown>;
+    const kind = typeof e.kind === "string" ? e.kind : "ambient";
+    // Defensive lift of optional enrichment fields. Task 1's projection
+    // carries only `{id, kind}`; the command/description/status reads
+    // below are no-ops today but render correctly the moment the
+    // projection grows them.
+    const command = typeof e.command === "string" ? e.command : "";
+    const description = typeof e.description === "string" ? e.description : "";
+    const id = typeof e.id === "string" ? e.id : "";
+    // Truncate a multi-line command to the first non-empty line — a
+    // 1KB+ heredoc must stay one terminal row. `\r` normalized too so
+    // a CRLF payload is not exempt.
+    const firstLine = command.split(/\r?\n/).find((s) => s.trim() !== "") ?? "";
+    const label =
+      firstLine !== ""
+        ? firstLine
+        : description !== ""
+          ? description
+          : id !== ""
+            ? id
+            : "(unknown)";
+    const status = typeof e.status === "string" ? e.status : "";
+    const statusSeg = status === "" ? "" : ` [${status}]`;
+    lines.push(`${indent}[${kind}] ${label}${statusSeg}`);
+  }
+  return lines;
+}
+
+/**
  * Insert-mode render state, owned by `cli/jobs.ts:main` and threaded into
  * `renderJobsBody`. Absent → normal mode: rows render flush-left exactly
  * as before, EXCEPT sub-agent lines are collapse-by-default (shown only
@@ -341,12 +420,13 @@ export function selectableJobIds(jobs: Map<string, unknown>): string[] {
  * also what {@link selectableJobIds} uses — render order and selection
  * order stay in lockstep by construction.
  *
- * Sub-agent lines AND the backend-coords pill are COLLAPSE-BY-DEFAULT:
- * both render only when the job's `job_id` is in `render.expanded`. The
- * backend pill renders BEFORE sub-agent lines inside the expanded
- * region. Without a `render` arg (or with an empty `expanded`) neither
- * shows. The `[awaiting:<kind>]` continuation line stays always-visible
- * (it's emitted by `projectJobRow`).
+ * Sub-agent lines, the live-monitors lines (schema v51 / fn-682), AND
+ * the backend-coords pill are COLLAPSE-BY-DEFAULT: all three render
+ * only when the job's `job_id` is in `render.expanded`. Wire order
+ * inside the expanded region is `backendCoordsSeg` → monitors →
+ * `subagentLinesFor`. Without a `render` arg (or with an empty
+ * `expanded`) none of them show. The `[awaiting:<kind>]` continuation
+ * line stays always-visible (it's emitted by `projectJobRow`).
  *
  * Insert-mode decoration (`render.insertMode === true`): every line gets
  * a 2-space base indent; EVERY job row carries a disclosure column
@@ -442,6 +522,16 @@ export function renderJobsBody(
         const backend = backendCoordsSeg(r);
         if (backend !== "") {
           lines.push(decorateHeadingOrChild(`  ${backend}`));
+        }
+        // Schema v51 (fn-682): the live `Monitors` section — one line per
+        // entry in `jobs.monitors` (snapshot-replace on each Stop). Sits
+        // BETWEEN the backend-coords pill and the sub-agent lines inside
+        // the same collapse-controlled region, in spec wire order
+        // (`backendCoordsSeg` + monitors + `subagentLinesFor`). The
+        // helper is a pure JSON-parse with `[]` fallback; a missing /
+        // empty / malformed `monitors` value renders nothing here.
+        for (const mon of monitorLinesFor(r.monitors, "  ")) {
+          lines.push(decorateHeadingOrChild(mon));
         }
         for (const sub of subagentLinesFor(subagentIndex, id, "  ")) {
           lines.push(decorateHeadingOrChild(sub));

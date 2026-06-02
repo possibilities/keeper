@@ -614,8 +614,20 @@ collapses to plain stream output. Run any of them with
   non-TTY output stay clean; inner fields fall back gracefully (tab
   name → raw id; tab missing → bare `<session>`; pane missing →
   drop the ` p<…>` suffix); rows with no backend coords show nothing
-  at all (never `undefined`, never a placeholder). Same sidecar / TUI
-  / non-TTY contract as board.
+  at all (never `undefined`, never a placeholder). When the row is
+  expanded in insert mode, a per-job Monitors section (schema v51 /
+  fn-682) lists the live background shells the session is running —
+  one indented line per entry parsed off the `jobs.monitors`
+  JSON-array column: `[<kind>] <label>[ [<status>]]`, where `<kind>`
+  is the three-way provenance pill `monitor` / `bash-bg` / `ambient`
+  and `<label>` prefers `command`, falls back to `description`,
+  falls back to the entry's id (a 1KB+ multi-line heredoc collapses
+  to its first non-empty line so the row stays one terminal line
+  tall). The section sits BETWEEN the backend-coords pill and the
+  sub-agent lines inside the collapse-controlled region; an empty
+  / missing / malformed `monitors` blob produces no Monitors lines
+  and never crashes the render. Same sidecar / TUI / non-TTY
+  contract as board.
 
   ```sh
   keeper jobs             # live jobs list, default scope
@@ -1190,6 +1202,31 @@ for re-fold determinism (no migration seed → `created_at` derived purely
 from the event log). keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
 gains `47` (whitelist-only; keeper-py reads neither `autopilot_state`
 nor `AutopilotPaused`).
+As of schema v51 (fn-682), the new `jobs.monitors` JSON-array column is the
+live per-job view of the background shells a session is running — the
+plugin-armed chatctl bus, an agent-armed `keeper await`, a backgrounded
+`bun test`. It folds purely from each Stop event's `data.background_tasks`
+snapshot (`type:"shell"` allowlist, stable-sorted by id, capped at 50
+defensively): every entry carries a three-way `kind` provenance label
+recomputed from an in-fold scan of the immutable `events` log — `monitor`
+when an earlier PostToolUse:Monitor in the session minted the id,
+`bash-bg` when an earlier PostToolUse:Bash with `run_in_background` minted
+it, `ambient` for anything else (plugin/harness-armed before the session
+existed). The scan is gated on `id < currentEventId` and rides the partial
+composite `idx_events_background_task_id (session_id, background_task_id,
+id, tool_name) WHERE background_task_id IS NOT NULL` covering index, so
+the fold stays index-backed and pure: no wallclock, no env, no fs probe,
+no liveness check. Snapshot-replace (NOT append): each Stop's snapshot IS
+the new value, an empty / missing snapshot is AUTHORITATIVE (drop-when-
+dead per the CLAUDE.md "snapshot paradox" — a dead monitor must never
+linger), and SessionEnd / Killed clear the column to `'[]'` as part of the
+terminal write. A from-scratch cursor=0 re-fold reproduces the column
+byte-identically. The expanded `keeper jobs` row renders the live set as
+a per-entry line inside the same collapse-controlled region as the
+backend-coords pill and sub-agent lines (wire order: backend pill →
+monitors → sub-agents). keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
+gains `51` (whitelist-only; keeper-py reads neither `jobs.monitors` nor
+`background_tasks`).
 As of schema v50 (fn-678), the new `pending_dispatches` projection table
 (keyed by `(verb, id)`) is the durable launch-window occupancy signal that
 replaced the fn-674 live zellij tab-name probe. A `Dispatched` synthetic
