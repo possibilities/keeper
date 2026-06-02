@@ -34,6 +34,7 @@ import type {
 } from "../../src/dead-letter";
 import { serializeDeadLetterRecord } from "../../src/dead-letter";
 import {
+  extractBackgroundTaskId,
   extractBashMutation,
   extractPlanctlInvocation,
   extractSkillName,
@@ -531,6 +532,7 @@ export const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
   "backend_exec_type",
   "backend_exec_session_id",
   "backend_exec_pane_id",
+  "background_task_id",
 ]);
 
 /**
@@ -720,6 +722,19 @@ async function main(): Promise<void> {
   // session. See {@link backendExecCoordsFromEnv} for the locked rules.
   const backendExecCoords = backendExecCoordsFromEnv(process.env);
 
+  // v51 (fn-682): the launched background-task id on PostToolUse:Monitor
+  // (Monitor tool — `tool_response.taskId`) and PostToolUse:Bash with
+  // `run_in_background` (`tool_response.backgroundTaskId`). NULL on every
+  // other row so the partial index `WHERE background_task_id IS NOT NULL`
+  // stays selective. The reducer's Stop arm reads this column via an in-
+  // fold scan (gated on session_id + id<current) to resolve three-way
+  // provenance ('monitor' / 'bash-bg' / 'ambient') for each entry in the
+  // Stop's `background_tasks` snapshot. Pure deriver — the v50→v51
+  // backfill in `migrate()` calls the SAME `extractBackgroundTaskId` over
+  // historical PostToolUse:Monitor/Bash rows so a cursor=0 re-fold
+  // reproduces byte-identical `jobs.monitors`.
+  const backgroundTaskId = extractBackgroundTaskId(hookEvent, toolName, data);
+
   // Resolve the full named-bindings map ONCE up front, outside the open/
   // retry block. The same object is reused for every retry attempt and is
   // the canonical source the dead-letter record reads from on final failure —
@@ -769,6 +784,8 @@ async function main(): Promise<void> {
     $backend_exec_type: backendExecCoords.type,
     $backend_exec_session_id: backendExecCoords.sessionId,
     $backend_exec_pane_id: backendExecCoords.paneId,
+    // v51 (fn-682): sparse background-task launcher id (see deriver).
+    $background_task_id: backgroundTaskId,
   };
 
   // Dead-letter on FINAL INSERT failure (fn-643 task .2). The closure

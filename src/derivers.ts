@@ -207,6 +207,136 @@ export function extractToolUseId(data: unknown): string | null {
 }
 
 /**
+ * Schema v51 (fn-682): the launched background-task id minted by Claude
+ * Code on a PostToolUse:Monitor (Monitor tool) or PostToolUse:Bash with
+ * `run_in_background` (Bash tool). Stamped into the sparse
+ * `events.background_task_id` column at hook INSERT time so the reducer's
+ * Stop arm can resolve three-way provenance ('monitor' / 'bash-bg' /
+ * 'ambient') for each live entry in the session's `background_tasks`
+ * snapshot via an in-fold events scan against the (session_id,
+ * background_task_id) partial index.
+ *
+ * Gated EXACTLY on `(hookEvent === 'PostToolUse', toolName in {Monitor,
+ * Bash})`. The launcher fields live under `data.tool_response`:
+ * - Monitor's payload carries `taskId` (camelCase, the canonical Claude
+ *   Code wire shape — see `extractSubagentAgentId` precedent for the
+ *   same convention).
+ * - Bash's `run_in_background` payload carries `backgroundTaskId`.
+ *
+ * NEVER throws — the hook's exit-0 contract is non-negotiable. Every
+ * shape-mismatch path (missing `tool_response`, non-object, missing /
+ * non-string / empty id) returns `null` so the column stays NULL on
+ * unrelated rows and the partial index `WHERE background_task_id IS
+ * NOT NULL` predicate stays selective.
+ *
+ * Pure function of the parsed `data` object so the live hook stamp, the
+ * v50→v51 migration backfill, and a future from-scratch re-fold all
+ * derive byte-identically (re-fold determinism — the CLAUDE.md "every
+ * projection-driving fact lives in the immutable event log" invariant).
+ * Mirrors {@link extractPlanctlInvocation}'s defensive-probe shape.
+ */
+export function extractBackgroundTaskId(
+  hookEvent: string,
+  toolName: string | null,
+  data: Record<string, unknown>,
+): string | null {
+  if (hookEvent !== "PostToolUse") {
+    return null;
+  }
+  if (toolName !== "Monitor" && toolName !== "Bash") {
+    return null;
+  }
+  const toolResponse = data.tool_response;
+  if (typeof toolResponse !== "object" || toolResponse === null) {
+    return null;
+  }
+  const key = toolName === "Monitor" ? "taskId" : "backgroundTaskId";
+  const candidate = (toolResponse as Record<string, unknown>)[key];
+  return typeof candidate === "string" && candidate.length > 0
+    ? candidate
+    : null;
+}
+
+/**
+ * Schema v51 (fn-682): the shape of one entry in the reducer-projected
+ * `jobs.monitors` JSON array. Three-way provenance — `monitor` (Monitor
+ * tool launched it), `bash-bg` (a Bash `run_in_background` launched it),
+ * `ambient` (plugin/harness-armed; no launch event in this session's
+ * stream). Each Stop's `background_tasks` snapshot is fully replaced —
+ * live-only, drop-when-dead — so the entry id is a stable join key only
+ * within a single Stop's snapshot window.
+ */
+export interface MonitorEntry {
+  id: string;
+  kind: "monitor" | "bash-bg" | "ambient";
+}
+
+/**
+ * Schema v51 (fn-682): defensive cap on the number of background_tasks
+ * entries we will keep from one Stop's snapshot. The Claude Code shell
+ * is per-session, so >50 simultaneous shells is almost certainly a
+ * runaway / corrupt payload; truncate to the cap rather than store an
+ * outsized JSON blob on `jobs.monitors`. Stable-sort BEFORE the slice
+ * so the cap bites determistically across re-folds.
+ */
+const BACKGROUND_TASKS_CAP = 50;
+
+/**
+ * Schema v51 (fn-682): defensive lift of a Stop event payload's
+ * `data.background_tasks` array. Allowlist on `type === "shell"` (NOT a
+ * `!== "subagent"` denylist — Claude Code may add new background-task
+ * kinds in future and we want to drop them silently until we know how
+ * to project them), stable-sort by id, cap at {@link BACKGROUND_TASKS_CAP}
+ * entries. Each surviving entry returns its `id` only; provenance is
+ * recomputed by the reducer's in-fold events scan, NOT carried here.
+ *
+ * NEVER throws — the reducer's fold contract is non-negotiable (a throw
+ * inside the open BEGIN IMMEDIATE rolls back the cursor and wedges the
+ * reducer). Every shape-mismatch path (non-array, missing field,
+ * malformed entries) folds to `[]` per the CLAUDE.md "safe value on
+ * malformed payload" invariant. Pure function of `data` so a from-
+ * scratch re-fold reproduces byte-identical `jobs.monitors`.
+ *
+ * The empty / missing case is AUTHORITATIVE — the snapshot paradox: a
+ * Stop with no `background_tasks` field, or an empty array, REPLACES the
+ * persisted monitors with `[]` (drop-when-dead). A dead monitor must
+ * never linger.
+ */
+export function extractBackgroundTasks(data: unknown): string[] {
+  if (data === null || typeof data !== "object") {
+    return [];
+  }
+  const raw = (data as Record<string, unknown>).background_tasks;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const ids: string[] = [];
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== "object") {
+      continue;
+    }
+    const e = entry as Record<string, unknown>;
+    if (e.type !== "shell") {
+      continue;
+    }
+    const id = e.id;
+    if (typeof id !== "string" || id.length === 0) {
+      continue;
+    }
+    ids.push(id);
+  }
+  // Stable sort by id (lexicographic). The cap MUST bite AFTER the sort
+  // so a re-fold over the same payload produces the byte-identical
+  // truncated set (the cap is purely defensive — a real session should
+  // never approach it).
+  ids.sort();
+  if (ids.length > BACKGROUND_TASKS_CAP) {
+    return ids.slice(0, BACKGROUND_TASKS_CAP);
+  }
+  return ids;
+}
+
+/**
  * Anchored task-notification-killed envelope match. The strict shape:
  *
  *   `<task-notification>` ... `<status>killed</status>` ...
