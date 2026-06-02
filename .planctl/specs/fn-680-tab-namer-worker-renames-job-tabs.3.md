@@ -55,5 +55,5 @@ the aesthetic side-effector.
 - [ ] `bun test` full suite is green
 
 ## Done summary
-
+Spawned the tab-namer worker beside restoreWorker as keeperd's eleventh worker thread (onerror/close → fatalExit, no onmessage), added it to all three shutdown lists, and bumped worker-count prose to eleven across src/daemon.ts, src/restore-worker.ts, README.md, and CLAUDE.md (with renameTab now named on the ExecBackend op list).
 ## Evidence
