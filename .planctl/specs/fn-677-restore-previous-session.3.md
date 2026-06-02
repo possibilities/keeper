@@ -77,5 +77,5 @@ never touched.
 - [ ] Worker counts updated in daemon.ts + README; CLAUDE.md sole-writer carve-out added.
 
 ## Done summary
-
+Added src/restore-worker.ts as keeperd's tenth Worker: pure consumer that watches PRAGMA data_version, reads jobs+epics via the shared runQuery seam, builds a stable RestoreDescriptor (sessions keyed by backend_exec_session_id, agents sorted by job_id, tier pre-resolved via tierForJobFromEpics), and rewrites ~/.local/state/keeper/restore.json via atomicWriteFile only when the hashed shape (captured_at excluded) changes. Write failures swallowed; daemon spawn + shutdown wired; README tenth-worker paragraph + CLAUDE.md sole-writer carve-out added. 18 unit tests in test/restore-worker.test.ts.
 ## Evidence
