@@ -1,0 +1,19 @@
+{
+  "branch_name": "fn-683-stabilize-flaky-bun-test-suite",
+  "bundles": [],
+  "created_at": "2026-06-02T22:27:31.432124Z",
+  "depends_on_epics": [],
+  "id": "fn-683-stabilize-flaky-bun-test-suite",
+  "last_validated_at": "2026-06-02T22:27:31.574517Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Stabilize flaky bun test suite",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-02T22:27:31.432124Z"
+}
