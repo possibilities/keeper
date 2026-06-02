@@ -987,14 +987,29 @@ commit by definition, and a cursor=0 re-fold replays events in id
 order so the ordering inverts anyway. Pre-fn-670 Commit events lack
 `task_ids`; `extractCommit` defaults to `[]` so the link write is a
 no-op over the historical log, and a re-fold reproduces byte-identical
-`epics` rows. As of fn-656.1, the pass-4 fan-out persists ONLY
-`dirty > 0` sessions into `git_status.jobs` (the clearing UPDATE +
-`syncIfPlanRef` still fire unconditionally for every session in the
-union — including ones leaving the dirty set via `priorSessions` — so a
-session zeroes out exactly once on the transition snapshot before
-dropping from the persisted JSON; the guard collapses the steady-state
-fan-out from a monotonically ratcheting set to the currently-dirty
-set). `GitRootDropped` retracts symmetrically. As of
+`epics` rows. The pass-4 fan-out persists ONLY `dirty > 0` sessions
+into `git_status.jobs` (fn-656.1) AND iterates only `sessionDirtyCount`
+∪ `priorSessions` (fn-679 bound — the currently-dirty attributed set
+built from this snapshot's `dirty_files` ∪ the zero-out-transition set
+parsed from the prior `git_status.jobs`). The clearing UPDATE +
+`syncIfPlanRef` fire for every session in that bounded union —
+including ones leaving the dirty set via `priorSessions` — so a session
+zeroes out exactly once on the transition snapshot before dropping
+from the persisted JSON. The push guard collapses the persisted set
+from a monotonically ratcheting one to the currently-dirty set, and
+the fn-679 bound collapses the ITERATED set from the entire
+undischarged set under `project_dir` (dominated by non-discharging
+planctl attributions, 288 in production) to the same event-relevant
+union — pulling 4-7s GitSnapshot folds well under the 1.5s hook
+budget. Re-fold determinism is preserved: both the persisted set and
+the bound read only event-derived state (this snapshot's
+`dirty_files`, `file_attributions` populated by passes 1-3, and the
+prior `git_status.jobs` blob). Per-job project-wide counters
+(`git_orphan_count` / `git_unattributed_to_live_count`) broadcast onto
+the bounded set only — informational-only columns (readiness reads
+`git_status` scalars + per-file `dirty_files[].attributions[]`, not
+the per-job columns), so the narrowed broadcast is a cosmetic shrink.
+`GitRootDropped` retracts symmetrically. As of
 schema v32 (fn-634), `epics` adds `default_visible` as a VIRTUAL
 generated column SQLite computes from
 `CASE WHEN status='open' OR approval!='approved' THEN 1 ELSE 0 END`,

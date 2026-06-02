@@ -2024,7 +2024,6 @@ function projectGitStatus(db: Database, event: Event): void {
   // this project_dir. The per-session count is, well, per-session.
   let orphanCount = 0;
   let unattributedToLiveCount = 0;
-  const sessionsWithAttribution = new Set<string>();
   const sessionDirtyCount = new Map<string, number>(); // session_id → git_dirty_count
   const LIVE_STATES = new Set(["working", "stopped"]);
   for (const file of snapshot.dirty_files) {
@@ -2036,7 +2035,6 @@ function projectGitStatus(db: Database, event: Event): void {
     }
     let hasLive = false;
     for (const a of attributions) {
-      sessionsWithAttribution.add(a.session_id);
       sessionDirtyCount.set(
         a.session_id,
         (sessionDirtyCount.get(a.session_id) ?? 0) + 1,
@@ -2044,31 +2042,6 @@ function projectGitStatus(db: Database, event: Event): void {
       if (LIVE_STATES.has(a.state)) hasLive = true;
     }
     if (!hasLive) unattributedToLiveCount++;
-  }
-
-  // Also enumerate every session that has any active attribution for
-  // this project — even if NONE of its attributed files are in the
-  // current snapshot's dirty_files set. (A file that was attributed in
-  // an earlier snapshot but discharged in the current commit set would
-  // not appear in `dirty_files` — but if undischarged, the session's
-  // count should still reflect the project-wide rollup.) In practice
-  // the previous `attributions[]` build only considered current
-  // dirty_files, so we need a separate enumeration. This walks every
-  // active row under `project_dir` and includes its session in the
-  // fan-out set; the per-session `git_dirty_count` already counted only
-  // current dirty files (sessionDirtyCount entries default to 0 for
-  // sessions present here but absent from sessionDirtyCount — they're
-  // attributed to this project but to no file in the current snapshot).
-  const allActiveSessions = db
-    .prepare(
-      `SELECT DISTINCT session_id
-         FROM file_attributions
-        WHERE project_dir = ?
-          AND last_mutation_at > COALESCE(last_commit_at, 0)`,
-    )
-    .all(projectDir) as Array<{ session_id: string }>;
-  for (const row of allActiveSessions) {
-    sessionsWithAttribution.add(row.session_id);
   }
 
   // Enumerate every session that previously had a count stamped for
@@ -2101,11 +2074,24 @@ function projectGitStatus(db: Database, event: Event): void {
       // throw" invariant.
     }
   }
-  // Union of "sessions with at least one active attribution" and
-  // "sessions that had a count stamped in the prior snapshot" — every
-  // session in either set needs a fan-out write.
+  // fn-679: bound pass-4 fan-out to event-relevant sessions —
+  // `sessionDirtyCount.keys()` (currently-dirty attributed set, built
+  // above from this snapshot's dirty_files) ∪ `priorSessions` (the
+  // zero-out-transition set parsed from prior git_status.jobs).
+  // Drops the legacy `allActiveSessions` enumeration that dumped every
+  // undischarged session under project_dir into the loop (288 in
+  // production, inflated by fn-666's non-discharging planctl
+  // attributions, driving 4-7s folds → SQLITE_BUSY hook drops).
+  // Safe because the fn-656.1 push guard guarantees any nonzero
+  // per-session git_dirty_count was persisted into git_status.jobs in
+  // a prior snapshot → is in priorSessions on the next snapshot → no
+  // stale-count strand. The per-job project-wide counters
+  // (git_orphan_count / git_unattributed_to_live_count) narrow to the
+  // bounded set — informational-only columns (readiness reads
+  // git_status scalars, not the per-job columns; see readiness.ts
+  // ~:612-616), so the narrowed broadcast is cosmetic.
   const sessionsToFanOut = new Set<string>();
-  for (const s of sessionsWithAttribution) sessionsToFanOut.add(s);
+  for (const s of sessionDirtyCount.keys()) sessionsToFanOut.add(s);
   for (const s of priorSessions) sessionsToFanOut.add(s);
 
   // Stamp counts. UPDATE-only (no shell-row insert): a session whose

@@ -770,9 +770,10 @@ test("fn-656.1 undischarged-but-not-currently-dirty session is absent from git_s
   //  1. Two sessions mutate two different files in /repo.
   //  2. GitSnapshot with BOTH files dirty → both in git_status.jobs.
   //  3. GitSnapshot with only file-a dirty → sess-a remains; sess-b
-  //     has dirtyForSession==0 (its file isn't in dirty_files, but its
-  //     undischarged attribution keeps it in allActiveSessions). sess-b
-  //     gets its clearing UPDATE and DROPS from git_status.jobs.
+  //     has dirtyForSession==0 (its file isn't in dirty_files), but the
+  //     prior snapshot persisted sess-b into git_status.jobs, so it
+  //     surfaces in priorSessions on this fold. sess-b gets its
+  //     clearing UPDATE and DROPS from git_status.jobs.
   //  4. GitRootDropped retract → walks git_status.jobs (sess-a only),
   //     zeroes sess-a; sess-b is NOT walked (already zeroed in step 3)
   //     and that's the safe no-op behavior.
@@ -824,10 +825,11 @@ test("fn-656.1 undischarged-but-not-currently-dirty session is absent from git_s
     { job_id: "sess-b", dirty: 1 },
   ]);
 
-  // Step 3: GitSnapshot drops file-b from dirty_files. sess-b's
-  // attribution is still undischarged (no Commit), so it's reachable
-  // via allActiveSessions and STILL gets a clearing UPDATE — but its
-  // dirtyForSession is 0, so the guard sheds it from git_status.jobs.
+  // Step 3: GitSnapshot drops file-b from dirty_files. sess-b is NOT
+  // in this snapshot's sessionDirtyCount (no dirty attribution this
+  // tick) but the prior snapshot persisted it into git_status.jobs, so
+  // it surfaces via priorSessions and STILL gets a clearing UPDATE —
+  // its dirtyForSession is 0, so the guard sheds it from git_status.jobs.
   insertEvent({
     hook_event: "GitSnapshot",
     session_id: "/repo",
