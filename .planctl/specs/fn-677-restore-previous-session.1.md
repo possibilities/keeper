@@ -59,5 +59,5 @@ env-override + default asserted with `KEEPER_RESTORE_FILE` set/unset.
 - [ ] `test/resume-descriptor.test.ts` covers the pure exports + the resolver.
 
 ## Done summary
-
+Extracted pure resumeTarget / buildResumeCommand / tierForJobFromEpics into src/resume-descriptor.ts and added resolveRestorePath() with KEEPER_RESTORE_FILE override; resume.ts now imports the shared module (byte-identical output verified live).
 ## Evidence
