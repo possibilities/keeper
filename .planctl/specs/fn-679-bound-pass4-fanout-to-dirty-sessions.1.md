@@ -72,5 +72,5 @@ copy verifies + bounce to deploy.
 - [ ] no schema bump; README pass-4 description rewritten in-place; committed to main staging only touched files
 
 ## Done summary
-
+Bounded GitSnapshot pass-4 fan-out to sessionDirtyCount.keys() ∪ priorSessions (dropped allActiveSessions); verified on DB copy: prior 4-7s slow folds collapse to 9-96ms (well under the 1.5s hook budget) while preserving the fn-656.1 zero-out invariant and re-fold determinism.
 ## Evidence
