@@ -1,4 +1,5 @@
 {
+  "approval": "rejected",
   "branch_name": "fn-678-decouple-dispatch-from-tab-naming",
   "bundles": [],
   "closer_done_at": "2026-06-02T17:05:53.730879Z",
@@ -18,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-02T17:05:53.730879Z"
+  "updated_at": "2026-06-02T17:24:39.402227Z"
 }
