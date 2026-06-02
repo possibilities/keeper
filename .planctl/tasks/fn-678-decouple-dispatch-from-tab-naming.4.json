@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-02T13:56:01.478550Z",
+  "depends_on": [],
+  "epic": "fn-678-decouple-dispatch-from-tab-naming",
+  "id": "fn-678-decouple-dispatch-from-tab-naming.4",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "ExecBackend: closeByTabId + name-free contract",
+  "updated_at": "2026-06-02T13:56:01.478550Z"
+}

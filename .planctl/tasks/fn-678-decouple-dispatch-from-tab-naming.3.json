@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-02T13:56:01.478550Z",
+  "depends_on": [
+    "fn-678-decouple-dispatch-from-tab-naming.2"
+  ],
+  "epic": "fn-678-decouple-dispatch-from-tab-naming",
+  "id": "fn-678-decouple-dispatch-from-tab-naming.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Daemon mint seams + producer TTL sweep",
+  "updated_at": "2026-06-02T13:56:01.478550Z"
+}
