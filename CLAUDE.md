@@ -232,11 +232,11 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   BUSY exhaustion).
 - **Test isolation: never spread `...process.env` for state-bearing vars.** Every
   test that spawns the real hook MUST route through a shared sandboxed base-env
-  helper overriding ALL three state paths (`KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`,
-  `KEEPER_DROP_LOG`) under the per-test `tmpDir`. A bare `{ ...process.env,
-  KEEPER_DB: ... }` strands the other two at production defaults and pollutes the
-  user's real `~/.local/state/keeper/` feed. Apply the sandbox AFTER any
-  `undefined`-clears-key loop so a caller can't re-open the leak.
+  helper overriding ALL four state paths (`KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`,
+  `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`) under the per-test `tmpDir`. A bare
+  `{ ...process.env, KEEPER_DB: ... }` strands the others at production defaults
+  and pollutes the user's real `~/.local/state/keeper/` feed. Apply the sandbox
+  AFTER any `undefined`-clears-key loop so a caller can't re-open the leak.
 - **No in-process self-heal.** Any unrecoverable error (including any worker's
   `error` event) calls `fatalExit` → `process.exit(1)`; the LaunchAgent restarts
   the single recovery path. Never respawn a worker in-process. The producer

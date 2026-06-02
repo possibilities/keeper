@@ -9,27 +9,14 @@
  *
  *   cd <cwd> && claude [--plugin-dir <tier-dir>] --resume "<session-name>"
  *
- * The `--resume` target is the job's latest session NAME (keeper's `title` —
- * seeded from the launch `--name`/`spawn_name` and kept equal to
- * `name_history`'s newest entry as the name is promoted). `claude --resume
- * [value]` resolves an exact session id directly, OR opens the /resume picker
- * filtered by `value` as a search term; since `--name` is "shown in the
- * /resume picker", passing the display name filters the picker straight to
- * that session. A job that never carried a name falls back to its `job_id`
- * (keeper's `job_id` IS the Claude session id — `src/reducer.ts`: "job_id ===
- * session_id"), which `claude --resume` resolves directly.
- *
- * The `--plugin-dir` is reconstructed to match what the worker launched
- * with: autopilot's `work` dispatch adds
- * `${ARTHACK_ROOT}/claude/work-plugins/<tier>` (see `buildWorkerCommand` in
- * `src/autopilot-worker.ts`). The `jobs` projection carries the verb
- * (`plan_verb`) and ref (`plan_ref` — the task id) but NOT the tier, so for a
- * `work`-bound job we look the tier up the same way `commands.ts` does:
- * fetch the owning epic (strip the task's `.N` suffix), find the task, read
- * `task.tier`. The tier directory is rendered through the shared
- * `workPluginDir` helper so the path is byte-identical to the launch flag.
- * Ambient sessions and plan/close/approve jobs carry no tier and get the
- * plain `cd <cwd> && claude --resume "<job_id>"` form.
+ * The descriptor-building primitives — `resumeTarget` / `buildResumeCommand` /
+ * `tierForJobFromEpics` — live in the shared `src/resume-descriptor.ts`
+ * module so this script, the restore worker (epic fn-677, T3), and the
+ * `scripts/restore-agents.ts` util (T4) build byte-identical commands from
+ * one formula. This script keeps the lazy per-epic UDS fetch loop (one
+ * round-trip per distinct work-job epic, memoized) because it's read-on-
+ * demand against the daemon; the restore worker subscribes the full epics
+ * projection once and feeds the pure helper its in-memory map instead.
  *
  * Scope mirrors `keeper jobs`: by default only LIVE jobs (running + stopped)
  * are listed — terminal `ended`/`killed` rows are hidden unless `--all` is
@@ -60,7 +47,6 @@
 
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
-import { workPluginDir } from "../src/autopilot-worker";
 import { resolveSockPath } from "../src/db";
 import {
   type ClientFrame,
@@ -68,7 +54,12 @@ import {
   LineBuffer,
   type ServerFrame,
 } from "../src/protocol";
-import type { Epic, Job, Task } from "../src/types";
+import {
+  buildResumeCommand,
+  resumeTarget,
+  tierForJobFromEpics,
+} from "../src/resume-descriptor";
+import type { Epic, Job } from "../src/types";
 
 /**
  * Hard upper bound on how long the CLI waits for a `result` frame after a
@@ -302,6 +293,12 @@ async function fetchEpic(
  * epic costs one round-trip), find the task, return `task.tier`. Returns
  * `null` for any job that isn't a `work` job, has no parseable task ref, or
  * whose epic/task can't be found — those render without a `--plugin-dir`.
+ *
+ * Mixed lazy-fetch + pure-core: this function owns the per-epic UDS fetch
+ * loop (one round-trip per distinct work-job epic, memoized via `epicCache`)
+ * and delegates the actual epic→task→tier lookup to the shared pure
+ * `tierForJobFromEpics` so this script and the restore worker (epic fn-677)
+ * agree on tier resolution by construction.
  */
 async function tierForJob(
   sockPath: string,
@@ -325,54 +322,11 @@ async function tierForJob(
   if (epic === null) {
     return null;
   }
-  const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
-  const task = tasks.find((t: Task) => seg(t.task_id) === ref);
-  if (task === undefined || task.tier == null || seg(task.tier) === "") {
-    return null;
-  }
-  return seg(task.tier);
-}
-
-/**
- * Build the resume shell command for a job. Mirrors `buildWorkerCommand`'s
- * `cd`-prefix + `--plugin-dir` shape, but the payload is `--resume "<target>"`
- * instead of `--name ... '/plan:<verb> ...'`. A null/empty `cwd` drops the
- * `cd` prefix (same degenerate-path rule as `buildWorkerCommand`); a null
- * tier drops the `--plugin-dir`.
- *
- * `target` is the job's latest session NAME when it has one, else its session
- * id (see {@link resumeTarget}). `claude --resume [value]` resolves an exact
- * session id directly, OR opens the /resume picker filtered by `value` as a
- * search term — and `--name` is "shown in the /resume picker" — so passing the
- * display name filters the picker straight to that session. Double-quoted
- * because a promoted (auto-generated) name can contain spaces. Pure.
- */
-function buildResumeCommand(
-  cwd: string,
-  target: string,
-  tier: string | null,
-): string {
-  const cdPrefix = cwd === "" ? "" : `cd ${cwd} && `;
-  const flags: string[] = [];
-  if (tier != null && tier !== "") {
-    flags.push("--plugin-dir", workPluginDir(tier));
-  }
-  flags.push("--resume", `"${target}"`);
-  return `${cdPrefix}claude ${flags.join(" ")}`;
-}
-
-/**
- * The `--resume` target for a job: its latest session NAME when it has one,
- * else the session id as a fallback. keeper's `title` is the current session
- * name — it is seeded from the launch `--name` (`spawn_name`) and kept equal
- * to `name_history`'s newest entry as the name is promoted, so it is exactly
- * the "latest session name" the keeper DB knows. A job that never carried a
- * name (NULL `title`) falls back to `job_id` (= the Claude session id), which
- * `claude --resume` resolves directly.
- */
-function resumeTarget(job: Job): string {
-  const name = seg(job.title);
-  return name !== "" ? name : seg(job.job_id);
+  // Build a single-entry map for the pure helper. The map shape is what the
+  // restore worker passes too (its full epicsById), so both paths land on
+  // identical resolution semantics.
+  const singletonMap = new Map<string, Epic>([[epicId, epic]]);
+  return tierForJobFromEpics(job, singletonMap);
 }
 
 /**

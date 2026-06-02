@@ -88,6 +88,26 @@ export function resolveSockPath(): string {
   return join(homedir(), ".local", "state", "keeper", "keeperd.sock");
 }
 
+/**
+ * Resolve the keeper restore-snapshot file path (epic fn-677). The restore
+ * worker (T3) is the sole writer of this file — it serializes a stable
+ * descriptor of the live job + zellij backend-exec metadata after every
+ * change-gated tick — and the `scripts/restore-agents.ts` util (T4) is the
+ * sole reader. `KEEPER_RESTORE_FILE` env var wins (override pattern mirrors
+ * `resolveDbPath` / `resolveSockPath` / `resolveDeadLetterDir` — used by tests
+ * so the worker / util never touches the user's real `restore.json`);
+ * otherwise default to `~/.local/state/keeper/restore.json`, a sibling of
+ * the DB file. Pure — does no I/O; the caller (worker) is responsible for
+ * `mkdir -p` on the parent directory before its first write.
+ */
+export function resolveRestorePath(): string {
+  const override = process.env.KEEPER_RESTORE_FILE;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "restore.json");
+}
+
 /** Default plan roots when the config file is absent or carries no `roots`. */
 const DEFAULT_PLAN_ROOTS = ["~/code"];
 

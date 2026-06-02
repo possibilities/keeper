@@ -430,7 +430,11 @@ Keeper has no `install` verb. Wire it up manually:
    `KEEPER_DEAD_LETTER_DIR` (directory for per-pid dead-letter NDJSON
    recovery files, default `~/.local/state/keeper/dead-letters/`) — tests
    that spawn the real hook MUST override both to keep production
-   diagnostic feeds clean. Set
+   diagnostic feeds clean. The restore worker (epic fn-677) writes
+   `~/.local/state/keeper/restore.json` (the latest-always Chrome-style
+   "restore previous session" snapshot — agents + zellij metadata for
+   `scripts/restore-agents.ts` to replay against), overridable via
+   `KEEPER_RESTORE_FILE` for tests. Set
    `KEEPER_TRACE_SERVER=1` to enable verbose server-worker diagnostic logging
    — `[srv-ts]` stage timings, frame byte counts, connection lifecycle — on
    `server.stderr`; off by default (the rare `[server-worker]` error class is
