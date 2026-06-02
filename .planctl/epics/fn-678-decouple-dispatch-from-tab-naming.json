@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-678-decouple-dispatch-from-tab-naming",
   "bundles": [],
+  "closer_done_at": "2026-06-02T17:05:53.730879Z",
   "created_at": "2026-06-02T13:56:01.478550Z",
   "depends_on_epics": [
     "fn-677-restore-previous-session"
@@ -12,10 +13,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Decouple dispatch from tab naming",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-02T13:56:01.478550Z"
+  "updated_at": "2026-06-02T17:05:53.730879Z"
 }
