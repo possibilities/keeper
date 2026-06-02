@@ -1,0 +1,21 @@
+{
+  "branch_name": "fn-685-wire-monitors-column-through-jobs",
+  "bundles": [],
+  "created_at": "2026-06-02T23:43:17.167704Z",
+  "depends_on_epics": [
+    "fn-682-live-monitors-projection"
+  ],
+  "id": "fn-685-wire-monitors-column-through-jobs",
+  "last_validated_at": "2026-06-02T23:43:17.528631Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "wire monitors column through JOBS_DESCRIPTOR",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-02T23:43:17.167704Z"
+}
