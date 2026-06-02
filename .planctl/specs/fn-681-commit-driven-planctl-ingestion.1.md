@@ -76,5 +76,5 @@ message alone drives correct ingest.
 - [ ] New/extended message type lives in `src/protocol.ts` with types in `src/types.ts`; `bun test`, typecheck, lint pass
 
 ## Done summary
-
+Wired commit-triggered planctl ingest: git-worker filters each commit's diff-tree file list to planctl-shaped paths and posts a sibling planctl-commit-changed message tagging upsert/delete; main forwards it to plan-worker, which re-ingests via the existing onChange/onDelete pipeline against committed worktree bytes (drop-proof, no partial-read race). Reducer untouched — re-fold determinism preserved.
 ## Evidence
