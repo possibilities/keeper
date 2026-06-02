@@ -3,38 +3,44 @@
  * `keeper jobs` — live jobs-list view over the keeper subscribe server.
  *
  * Sibling of `cli/board.ts` (epics-only) and `cli/git.ts` (git status).
- * Renders ONLY the bottom jobs list — the ambient-vs-plan-bound two
- * partition stack with nested sub-agent lines — plus the persistent
- * `[dead-letter:N]` warn banner and the `r` replay-dead-letter key.
+ * Renders ONLY the bottom jobs list — one section per
+ * `backend_exec_session_id` (zellij session) with nested sub-agent lines
+ * — plus the persistent `[dead-letter:N]` warn banner and the `r`
+ * replay-dead-letter key.
  *
  * Frame shape:
  *
- *   --- interactive ---
- *   {ambient jobs body}    ← jobs with NO plan_verb (one row per job)
- *   --- autopilot ---
- *   {plan-bound jobs body} ← jobs WITH a plan_verb (planner/worker/closer)
+ *   --- <session-a> ---
+ *   {jobs whose backend_exec_session_id == session-a}
+ *   --- <session-b> ---
+ *   {jobs whose backend_exec_session_id == session-b}
+ *   --- (no session) ---
+ *   {jobs with null backend_exec_session_id}
  *
- * Each job row CAN be followed by its nested sub-agent collapse lines
- * (one per `(job_id, subagent_type)` group via `collapseSubagentsByName`)
- * — but those are COLLAPSE-BY-DEFAULT, shown only when the job has been
- * expanded in insert mode (see below). The `--- interactive ---` /
- * `--- autopilot ---` headings mirror `cli/autopilot.ts`'s
- * `--- current --- / --- predicted ---` style: a heading is emitted ONLY
- * when its section is non-empty. A partition with zero rows yields
- * neither its heading nor a placeholder; both empty yields an empty body.
+ * Sessions render in first-seen order (the wire order of the first job
+ * that names each session). Each job row CAN be followed by its nested
+ * sub-agent collapse lines (one per `(job_id, subagent_type)` group via
+ * `collapseSubagentsByName`) — but those are COLLAPSE-BY-DEFAULT, shown
+ * only when the job has been expanded in insert mode (see below). The
+ * session headings mirror `cli/autopilot.ts`'s `--- current --- /
+ * --- predicted ---` style: a heading is emitted ONLY when its section
+ * is non-empty. An empty `jobs` map yields an empty body.
  *
  * Insert mode (`i` to enter, `Esc` to leave): a modal, job-local
  * navigation layer. While active the view CAPTURES the whole keyboard
  * (via `createViewShell`'s `captureKeys`), so the global frame-scrub /
  * copy / replay keys go inert and only Ctrl-C still quits. The whole UI
- * indents two spaces, each job row gains a Nerd Font disclosure triangle
- * (`GLYPH_COLLAPSED`/`GLYPH_EXPANDED`), and the selected row is shown by a
- * full-width background highlight (no `> ` marker — the head line is
- * prefixed with `SELECTED_LINE_PREFIX`, which the view-shell paints as the
- * highlight). `j`/`k`/↓/↑ move the selection; space toggles the selected job's
- * sub-agent visibility (`expanded`). The render state lives in `main`
- * and is threaded into `renderJobsBody` via `JobsRenderOptions`; a
- * keypress re-emits the stashed snapshot so the repaint is immediate.
+ * indents two spaces, EVERY job row gains a Nerd Font disclosure
+ * triangle (`GLYPH_COLLAPSED`/`GLYPH_EXPANDED` — every row has SOMETHING
+ * to disclose, since the backend-coords pill is itself
+ * collapse-controlled), and the selected row is shown by a full-width
+ * background highlight (no `> ` marker — the head line is prefixed with
+ * `SELECTED_LINE_PREFIX`, which the view-shell paints as the highlight).
+ * `j`/`k`/↓/↑ move the selection; space toggles the selected job's
+ * collapse-controlled lines (`expanded` — the backend-coords pill and
+ * sub-agent lines). The render state lives in `main` and is threaded
+ * into `renderJobsBody` via `JobsRenderOptions`; a keypress re-emits the
+ * stashed snapshot so the repaint is immediate.
  *
  * Sidecars + lifecycle / SIGINT / first-paint contract mirror the sibling
  * mains. Sidecar basenames key on `script: "jobs"` so files write to
@@ -100,28 +106,35 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   r replay one oldest waiting dead-letter (recovers a dropped hook event),
   i enter insert mode, q/Ctrl-C quit.
   Insert mode (job-local navigation): the whole UI indents two spaces,
-  each job row gains a disclosure triangle, and the selected row is shown
+  EVERY job row gains a disclosure triangle, and the selected row is shown
   by a full-width background highlight. j/k or ↓/↑ move the selection;
-  space expands / collapses the selected job's sub-agent lines (no-op on a
-  job with none); v focuses the selected job's zellij pane (no-op on a
-  job with no captured backend coords); Esc leaves insert mode.
+  space expands / collapses the selected job's collapse-controlled lines
+  (backend-coords pill + any sub-agent lines); v focuses the selected
+  job's zellij pane (no-op on a job with no captured backend coords);
+  Esc leaves insert mode.
   While in insert mode every other (global) key is inert — only Ctrl-C
   still quits.
   Per-frame sidecars are indexed; lifecycle + warn output is appended
   to /tmp/keeper-jobs.<pid>.lifecycle.txt. Session paths print on exit.
 
-Renders one row per live job, split into two stacked partitions each
-introduced by an autopilot-style heading:
+Renders one row per live job, grouped into sections by
+backend_exec_session_id (zellij session), each introduced by an
+autopilot-style heading:
 
-  --- interactive ---
-  {ambient body}    (jobs with NO plan_verb — ad-hoc sessions)
-  --- autopilot ---
-  {plan-bound body} (jobs WITH a plan_verb — planner/worker/closer)
+  --- <session-a> ---
+  {jobs whose backend_exec_session_id == session-a}
+  --- <session-b> ---
+  {jobs whose backend_exec_session_id == session-b}
+  --- (no session) ---
+  {jobs with null backend_exec_session_id}
+
+Sessions render in first-seen wire order.
 
 Row shape:
 
   ({basename(cwd)}) {title} [{role}]? [{state}]{[failed:<kind>]}?
-    [awaiting:<kind>]?                     (continuation line, when present)
+    [awaiting:<kind>]?                     (always-visible continuation line)
+    [{tab} p{pane}]?                       (collapse-controlled, when expanded)
     {subagent_type}({annotations})?: {description} [{status}]   (per sub-agent)
 
 The optional [awaiting:<kind>] pill drops to its own indented
@@ -160,25 +173,19 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
  * `test/jobs.test.ts` can assert the row shape directly without standing
  * up the subscribe loop.
  *
- * Shape: `({cwd-basename}) {title} [{role}]? [{state}]{[failed:<kind>]}?{ · backend-seg}?`
+ * Shape: `({cwd-basename}) {title} [{role}]? [{state}]{[failed:<kind>]}?`
  * with the optional `[awaiting:<kind>]` segment dropped onto a continuation
  * line (two-space indent — same depth as the row's sub-agent lines, which
  * are appended by the caller via `subagentLinesFor`). The `(cwd)` prefix
  * is suppressed when `cwd` is null/empty; the role pill is suppressed
  * when `plan_verb` is null.
  *
- * Schema v48 / fn-668 — the optional trailing backend-coords segment
- * (` · zellij <session>/<tab_name> p<pane_id>`) is rendered ONLY when
- * `backend_exec_type` is non-null on the row. Emitted as plain text
- * (no SGR codes baked in here — leaves sidecars + non-TTY output
- * clean); the `·` bullet + trailing free-text shape is the design
- * choice for "restrained, recede behind the pill grid". Absent coords
- * render as nothing — never a placeholder, never `undefined`. Inner
- * fields fall back gracefully: a missing tab name drops to the raw
- * tab id; a missing tab fully drops the `/<…>` slot; a missing pane
- * drops the ` p<…>` slot. Reads via {@link backendCoordsSeg} so
- * `test/jobs.test.ts` can assert the composition without the
- * subscribe loop.
+ * The backend-coords pill (`[<tab> p<pane>]`, see {@link backendCoordsSeg})
+ * is NOT rendered here — `renderJobsBody` emits it as part of the
+ * collapse-controlled region so it appears only when the job is expanded
+ * in insert mode (alongside sub-agent lines). The `[awaiting:<kind>]`
+ * continuation line, by contrast, stays always-visible: an awaiting prompt
+ * is something the human needs to see at a glance.
  */
 export function projectJobRow(row: Record<string, unknown>): string {
   const title = seg(row.title);
@@ -190,69 +197,55 @@ export function projectJobRow(row: Record<string, unknown>): string {
     row.last_input_request_at,
     row.last_input_request_kind,
   );
-  const backend = backendCoordsSeg(row);
   const head = `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
-  // Continuation lines under the head, each at the 2-space depth shared
-  // with sub-agent lines. `awaiting` (an input-request pill) and `backend`
-  // (the zellij/exec coords, fn-668) each drop to their own line so the
-  // head row stays a single scannable `(cwd) title [role] [state]` line.
-  // The backend coords moved off the head line in fn-668 follow-up — they
-  // were crowding the pill grid; on their own dim ` · …` line they recede.
+  // Continuation lines under the head, at the 2-space depth shared with
+  // sub-agent lines. Only the always-visible `awaiting` pill rides here;
+  // the backend-coords pill moved out to `renderJobsBody`'s
+  // collapse-controlled region.
   const lines = [head];
   if (awaiting !== "") {
     lines.push(`  ${awaiting.trimStart()}`);
-  }
-  if (backend !== "") {
-    lines.push(`  ${backend.trimStart()}`);
   }
   return lines.join("\n");
 }
 
 /**
- * Compose the optional trailing backend-coords segment for one jobs row.
- * Present-only: returns `""` when `backend_exec_type` is null (the typical
- * "session lives outside a multiplexer" shape). When the type is present,
- * builds ` · <type> <session>/<tab_name> p<pane_id>`, dropping any inner
- * slot whose source field is null (a missing tab fully drops the
- * `<session>/<tab>` substitution to bare `<session>`; a missing pane drops
- * the ` p<…>` suffix; a tab id without a name falls back to the raw id).
+ * Compose the backend-coords PILL for one jobs row: `[<tab> p<pane>]`.
  *
- * Emitted as plain text (no SGR codes) — keeps sidecars + non-TTY output
- * clean. The `·` bullet + free-text shape is itself the visual cue; the
- * pill colorizer (`colorizePillsInLine`) is bracket-scoped and doesn't
- * touch this run. Strings the segment composes from are bound from the
- * projection; never interpolated as SQL or shell.
+ * Session-less and type-less by design — the row is already grouped under
+ * its `--- <session> ---` heading (see `renderJobsBody`), and the only
+ * backend keeper currently knows about is zellij, so the per-row pill
+ * just identifies the tab + pane within that session. Bracketed so
+ * `colorizePillsInLine` tints it like the other status pills.
+ *
+ * Fallbacks (per task spec):
+ *   - tab name preferred over raw tab id; both missing drops the tab.
+ *   - missing pane drops the ` p<pane>` slot.
+ *   - tab AND pane both missing → `""` (nothing left worth showing).
+ *
+ * Emitted as plain text (no SGR codes baked in) — the pill colorizer
+ * paints brackets at render time. Strings are bound from the projection;
+ * never interpolated as SQL or shell.
  *
  * Exported for `test/jobs.test.ts`.
  */
 export function backendCoordsSeg(row: Record<string, unknown>): string {
-  const type = row.backend_exec_type;
-  if (type == null) {
-    return "";
-  }
-  const sessionId = row.backend_exec_session_id;
   const paneId = row.backend_exec_pane_id;
   const tabName = row.backend_exec_tab_name;
   const tabId = row.backend_exec_tab_id;
-  // Location component — `<session>/<tab>` when both present, bare
-  // `<session>` when the tab hasn't resolved (typical between hook
-  // capture and the tab-resolver worker's first snapshot), tab-name
-  // preferred over raw id when both exist.
   const tabLabel =
     tabName != null ? String(tabName) : tabId != null ? String(tabId) : "";
-  const sessionPart =
-    sessionId == null
-      ? ""
-      : tabLabel === ""
-        ? String(sessionId)
-        : `${String(sessionId)}/${tabLabel}`;
-  const paneSeg = paneId == null ? "" : ` p${String(paneId)}`;
-  const locSeg = sessionPart === "" ? "" : ` ${sessionPart}`;
-  // Bare-type fallback — coords got captured (type is non-null) but
-  // every downstream field is null. Render the type alone so the
-  // human can still see "this session lives in zellij somewhere".
-  const inner = `${String(type)}${locSeg}${paneSeg}`;
-  return ` · ${inner}`;
+  const paneSeg = paneId == null ? "" : `p${String(paneId)}`;
+  if (tabLabel === "" && paneSeg === "") {
+    return "";
+  }
+  if (tabLabel === "") {
+    return `[${paneSeg}]`;
+  }
+  if (paneSeg === "") {
+    return `[${tabLabel}]`;
+  }
+  return `[${tabLabel} ${paneSeg}]`;
 }
 
 // Nerd Font disclosure-triangle glyphs (the human's call): caret-right
@@ -266,17 +259,19 @@ const GLYPH_EXPANDED = "\uf0d7"; // nf-fa-caret_down (U+F0D7) ▾
  * as before, EXCEPT sub-agent lines are collapse-by-default (shown only
  * when their job is in `expanded`).
  *
- * - `insertMode` — when true, every line gets a 2-space base indent, job
- *   rows additionally carry a disclosure column (triangle when they have
- *   children) and the selected job's head line is prefixed with
- *   `SELECTED_LINE_PREFIX` (the view-shell paints it as a full-width
- *   background highlight).
- * - `selectedIndex` — index into the selectable job rows (interactive
- *   first, then autopilot — the order `selectableJobIds` produces).
- *   Clamped to range inside `renderJobsBody` so a stale index from a
- *   since-shrunk list is safe.
- * - `expanded` — set of `job_id`s whose sub-agent lines are visible. The
- *   one piece of state that survives leaving insert mode.
+ * - `insertMode` — when true, every line gets a 2-space base indent,
+ *   EVERY job row carries a disclosure column (collapsed / expanded
+ *   triangle — the row always has SOMETHING to disclose, since the
+ *   backend-coords pill is itself collapse-controlled), and the selected
+ *   job's head line is prefixed with `SELECTED_LINE_PREFIX` (the
+ *   view-shell paints it as a full-width background highlight).
+ * - `selectedIndex` — index into the selectable job rows (sections
+ *   concatenated in first-seen `backend_exec_session_id` order — the
+ *   order `selectableJobIds` produces). Clamped to range inside
+ *   `renderJobsBody` so a stale index from a since-shrunk list is safe.
+ * - `expanded` — set of `job_id`s whose collapse-controlled lines (the
+ *   backend-coords pill + sub-agent lines) are visible. The one piece of
+ *   state that survives leaving insert mode.
  */
 export interface JobsRenderOptions {
   insertMode: boolean;
@@ -285,50 +280,84 @@ export interface JobsRenderOptions {
 }
 
 /**
- * The job rows insert-mode selection can land on, in render order
- * (interactive partition first, then autopilot). Headings and sub-agent
- * lines are NOT selectable. Shared by `renderJobsBody` (to mark the
- * selected row) and `cli/jobs.ts:main`'s key handler (to clamp the
- * selection and resolve the selected `job_id` for space-to-expand) so
- * the two never disagree on ordering.
+ * Group jobs by `backend_exec_session_id` in first-seen wire order.
+ * Jobs with a null/empty session id collect under the sentinel
+ * `NO_SESSION_KEY`. Shared by `renderJobsBody` and `selectableJobIds`
+ * so render order and selection order stay in lockstep.
+ *
+ * The return is an ordered Map keyed by the raw session id (or
+ * `NO_SESSION_KEY`); values are arrays of `[job_id, row]` in wire
+ * order. Re-folding the same `jobs` map produces a byte-identical
+ * grouping — pure function of the input order.
  */
-export function selectableJobIds(jobs: Map<string, unknown>): string[] {
-  const interactive: string[] = [];
-  const autopilot: string[] = [];
+export const NO_SESSION_KEY = "\0no-session";
+
+export function groupJobsBySession(
+  jobs: Map<string, unknown>,
+): Map<string, Array<[string, Record<string, unknown>]>> {
+  const groups = new Map<string, Array<[string, Record<string, unknown>]>>();
   for (const [id, row] of jobs) {
     const r = row as Record<string, unknown>;
-    if (r.plan_verb == null) {
-      interactive.push(id);
+    const sid = r.backend_exec_session_id;
+    const key =
+      sid == null || typeof sid !== "string" || sid === ""
+        ? NO_SESSION_KEY
+        : sid;
+    const arr = groups.get(key);
+    if (arr === undefined) {
+      groups.set(key, [[id, r]]);
     } else {
-      autopilot.push(id);
+      arr.push([id, r]);
     }
   }
-  return [...interactive, ...autopilot];
+  return groups;
 }
 
 /**
- * Render the full jobs body — two stacked partitions, each introduced by
- * an autopilot-style heading (`cli/autopilot.ts:renderBody`). Top
- * partition `--- interactive ---`: jobs with NO `plan_verb` (ambient
- * sessions). Bottom partition `--- autopilot ---`: jobs WITH `plan_verb`
- * (planner/worker/closer — epic-bound work). Within each partition we
- * preserve the helper's wire order (the `Map<job_id, Job>` insertion
- * order matches the server's row order).
+ * The job rows insert-mode selection can land on, in render order
+ * (one section per `backend_exec_session_id` in first-seen wire order,
+ * with null-session jobs collected under `--- (no session) ---`).
+ * Headings and sub-agent lines are NOT selectable. Shared by
+ * `renderJobsBody` (to mark the selected row) and `cli/jobs.ts:main`'s
+ * key handler (to clamp the selection and resolve the selected `job_id`
+ * for space-to-expand) so the two never disagree on ordering.
+ */
+export function selectableJobIds(jobs: Map<string, unknown>): string[] {
+  const out: string[] = [];
+  for (const group of groupJobsBySession(jobs).values()) {
+    for (const [id] of group) {
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+/**
+ * Render the full jobs body — one section per `backend_exec_session_id`
+ * in first-seen wire order, each introduced by an autopilot-style heading
+ * (`cli/autopilot.ts:renderBody`): `--- <session> ---`, or
+ * `--- (no session) ---` for the bucket of jobs with a null/empty
+ * session id. Grouping comes from {@link groupJobsBySession}, which is
+ * also what {@link selectableJobIds} uses — render order and selection
+ * order stay in lockstep by construction.
  *
- * Sub-agent lines are COLLAPSE-BY-DEFAULT: a job's `subagentLinesFor`
- * block renders only when its `job_id` is in `render.expanded`. Without
- * a `render` arg (or with an empty `expanded`) no sub-agents show.
+ * Sub-agent lines AND the backend-coords pill are COLLAPSE-BY-DEFAULT:
+ * both render only when the job's `job_id` is in `render.expanded`. The
+ * backend pill renders BEFORE sub-agent lines inside the expanded
+ * region. Without a `render` arg (or with an empty `expanded`) neither
+ * shows. The `[awaiting:<kind>]` continuation line stays always-visible
+ * (it's emitted by `projectJobRow`).
  *
  * Insert-mode decoration (`render.insertMode === true`): every line gets
- * a 2-space base indent; job rows carry a disclosure column
- * (`GLYPH_COLLAPSED`/`GLYPH_EXPANDED` when they have children, else
- * blank); the selected job row (`render.selectedIndex` into
- * `selectableJobIds`) has its head line prefixed with
- * `SELECTED_LINE_PREFIX` for the view-shell's full-width highlight.
+ * a 2-space base indent; EVERY job row carries a disclosure column
+ * (`GLYPH_COLLAPSED`/`GLYPH_EXPANDED` — the caret shows even on jobs
+ * with no sub-agents, because the pill itself is collapse-controlled);
+ * the selected job row (`render.selectedIndex` into `selectableJobIds`)
+ * has its head line prefixed with `SELECTED_LINE_PREFIX` for the
+ * view-shell's full-width highlight.
  *
- * Heading-drop rule (mirrors autopilot): a heading is emitted ONLY when
- * its partition has rows. A partition with zero rows yields neither its
- * heading nor a placeholder; both empty yields `""`.
+ * Heading-drop rule: a heading is emitted ONLY when its section has
+ * rows. An empty `jobs` map yields `""`.
  */
 export function renderJobsBody(
   jobs: Map<string, unknown>,
@@ -340,15 +369,19 @@ export function renderJobsBody(
   }
   const insertMode = render?.insertMode === true;
   const expanded = render?.expanded ?? new Set<string>();
-  // Resolve the selected row by `job_id`, NOT by raw Map-iteration index.
-  // `selectedIndex` indexes `selectableJobIds` (interactive-then-autopilot),
-  // but the render loop below walks `jobs` in raw Map order, which interleaves
-  // the two partitions as sessions arrive. Marking on `idx === selectedIndex`
-  // compared an index from one ordering against an index from the other, so
-  // the `> ` marker landed in the wrong partition and `space` toggled a
-  // different job than the one marked. Deriving the selected id once from the
-  // same ordering the key handler uses keeps render and selection in lockstep.
-  const selectableIds = selectableJobIds(jobs);
+  // Resolve the selected row by `job_id`, NOT by raw Map-iteration index —
+  // `selectedIndex` indexes `selectableJobIds`, which walks
+  // `groupJobsBySession` (sections concatenated in first-seen order). The
+  // render loop below walks the SAME grouping, so the two orderings agree
+  // by construction — but we still resolve the selected id up front so
+  // each iteration is a simple `id === selectedId` check.
+  const groups = groupJobsBySession(jobs);
+  const selectableIds: string[] = [];
+  for (const group of groups.values()) {
+    for (const [id] of group) {
+      selectableIds.push(id);
+    }
+  }
   const selectedId =
     selectableIds.length === 0
       ? undefined
@@ -363,69 +396,60 @@ export function renderJobsBody(
   // background highlight (not a `> ` marker), so there is no selection
   // gutter — insert mode just adds a flat 2-space base indent to headings,
   // continuation lines, and sub-agent ("child") lines, and a 2-col
-  // disclosure column to job rows (a triangle when they have children, else
-  // blank). The selected job's HEAD line is prefixed with
-  // `SELECTED_LINE_PREFIX`; the view-shell strips that and repaints the row
-  // as a highlighted full-width line. Normal mode is a pass-through.
+  // disclosure column to EVERY job row (a caret triangle — collapsed or
+  // expanded; not gated on `hasChildren` anymore because the backend pill
+  // itself is collapse-controlled, so every row has SOMETHING the caret
+  // discloses). The selected job's HEAD line is prefixed with
+  // `SELECTED_LINE_PREFIX`; the view-shell strips that and repaints the
+  // row as a highlighted full-width line. Normal mode is a pass-through.
   const decorateHeadingOrChild = (line: string): string =>
     insertMode ? `  ${line}` : line;
   const decorateJobRow = (
     line: string,
-    o: { hasChildren: boolean; isExpanded: boolean; isSelected: boolean },
+    o: { isExpanded: boolean; isSelected: boolean },
   ): string => {
     if (!insertMode) {
       return line;
     }
-    const tri = o.hasChildren
-      ? `${o.isExpanded ? GLYPH_EXPANDED : GLYPH_COLLAPSED} `
-      : "  ";
+    const tri = `${o.isExpanded ? GLYPH_EXPANDED : GLYPH_COLLAPSED} `;
     return `${o.isSelected ? SELECTED_LINE_PREFIX : ""}${tri}${line}`;
   };
 
-  const interactive: string[] = [];
-  const autopilot: string[] = [];
-  for (const [id, row] of jobs) {
-    const r = row as Record<string, unknown>;
-    const hasChildren = (subagentIndex.get(id)?.length ?? 0) > 0;
-    const isExpanded = expanded.has(id);
-    // `projectJobRow` may return a multi-line block: the head row plus
-    // continuation lines (awaiting pill, backend coords) already carrying
-    // their own 2-space indent. Decorate the head line as the job row; the
-    // continuations are decorated like child lines so the whole block
-    // shares the insert-mode base indent.
-    const [headLine = "", ...contLines] = projectJobRow(r).split("\n");
-    const lines: string[] = [
-      decorateJobRow(headLine, {
-        hasChildren,
-        isExpanded,
-        isSelected: insertMode && id === selectedId,
-      }),
-      ...contLines.map(decorateHeadingOrChild),
-    ];
-    if (isExpanded) {
-      for (const sub of subagentLinesFor(subagentIndex, id, "  ")) {
-        lines.push(decorateHeadingOrChild(sub));
-      }
-    }
-    const block = lines.join("\n");
-    if (r.plan_verb == null) {
-      interactive.push(block);
-    } else {
-      autopilot.push(block);
-    }
-  }
   const sections: string[] = [];
-  if (interactive.length > 0) {
-    sections.push(
-      [decorateHeadingOrChild("--- interactive ---"), ...interactive].join(
-        "\n",
-      ),
-    );
-  }
-  if (autopilot.length > 0) {
-    sections.push(
-      [decorateHeadingOrChild("--- autopilot ---"), ...autopilot].join("\n"),
-    );
+  for (const [sessionKey, group] of groups) {
+    const heading =
+      sessionKey === NO_SESSION_KEY
+        ? "--- (no session) ---"
+        : `--- ${sessionKey} ---`;
+    const blocks: string[] = [];
+    for (const [id, r] of group) {
+      const isExpanded = expanded.has(id);
+      // `projectJobRow` may return a multi-line block: the head row plus
+      // an always-visible `[awaiting:<kind>]` continuation line. Decorate
+      // the head line as the job row; any continuations are decorated
+      // like child lines so the whole block shares the insert-mode base
+      // indent. The backend pill is NOT in projectJobRow's output any
+      // more — it lives in the collapse-controlled region below.
+      const [headLine = "", ...contLines] = projectJobRow(r).split("\n");
+      const lines: string[] = [
+        decorateJobRow(headLine, {
+          isExpanded,
+          isSelected: insertMode && id === selectedId,
+        }),
+        ...contLines.map(decorateHeadingOrChild),
+      ];
+      if (isExpanded) {
+        const backend = backendCoordsSeg(r);
+        if (backend !== "") {
+          lines.push(decorateHeadingOrChild(`  ${backend}`));
+        }
+        for (const sub of subagentLinesFor(subagentIndex, id, "  ")) {
+          lines.push(decorateHeadingOrChild(sub));
+        }
+      }
+      blocks.push(lines.join("\n"));
+    }
+    sections.push([decorateHeadingOrChild(heading), ...blocks].join("\n"));
   }
   return sections.join("\n");
 }

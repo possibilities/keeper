@@ -1,8 +1,9 @@
 /**
  * Pure-function tests for `cli/jobs.ts` — the keeper-jobs view's job-row
- * shape, the ambient-vs-plan-bound partition + empty-side drop rule,
- * the nested per-job sub-agent lines, and the dead-letter banner pill
- * (re-exported from `src/board-render.ts`).
+ * shape, the per-session section grouping + empty-section drop rule, the
+ * nested per-job sub-agent lines (collapse-controlled), the
+ * collapse-controlled backend-coords pill, and the dead-letter banner
+ * pill (re-exported from `src/board-render.ts`).
  *
  * No live-shell, no subscribe loop — these helpers are pure module
  * functions, asserted directly. The mock-socket pattern from
@@ -117,95 +118,11 @@ test("projectJobRow: last_input_request_at drops [awaiting:<kind>] onto its own 
   );
 });
 
-// ---------------------------------------------------------------------------
-// backendCoordsSeg + projectJobRow with backend coords — schema v48 /
-// fn-668. The optional trailing `· <type> <session>/<tab> p<pane>` segment
-// is present-only (renders nothing when `backend_exec_type` is null) and
-// gracefully falls back when inner fields are missing.
-// ---------------------------------------------------------------------------
-
-test("backendCoordsSeg: all coords present — composes the full ' · <type> <session>/<tab> p<pane>' segment", () => {
-  expect(
-    backendCoordsSeg({
-      backend_exec_type: "zellij",
-      backend_exec_session_id: "ada",
-      backend_exec_pane_id: "11",
-      backend_exec_tab_id: "3",
-      backend_exec_tab_name: "main",
-    }),
-  ).toBe(" · zellij ada/main p11");
-});
-
-test("backendCoordsSeg: absent backend_exec_type → empty string (present-only)", () => {
-  expect(
-    backendCoordsSeg({
-      // Type null — every other coord is irrelevant; the segment should
-      // never render. Guards against `undefined`/`null` leaking into the
-      // composed line.
-      backend_exec_type: null,
-      backend_exec_session_id: "ada",
-      backend_exec_pane_id: "11",
-      backend_exec_tab_id: "3",
-      backend_exec_tab_name: "main",
-    }),
-  ).toBe("");
-});
-
-test("backendCoordsSeg: tab name missing → falls back to raw tab_id", () => {
-  expect(
-    backendCoordsSeg({
-      backend_exec_type: "zellij",
-      backend_exec_session_id: "ada",
-      backend_exec_pane_id: "11",
-      backend_exec_tab_id: "3",
-      backend_exec_tab_name: null,
-    }),
-  ).toBe(" · zellij ada/3 p11");
-});
-
-test("backendCoordsSeg: tab fully missing → bare session, no '/<…>' slot", () => {
-  // Typical between hook capture and the tab-resolver worker's first
-  // snapshot — `backend_exec_session_id` + `backend_exec_pane_id` land
-  // immediately, the tab columns trail by one tick.
-  expect(
-    backendCoordsSeg({
-      backend_exec_type: "zellij",
-      backend_exec_session_id: "ada",
-      backend_exec_pane_id: "11",
-      backend_exec_tab_id: null,
-      backend_exec_tab_name: null,
-    }),
-  ).toBe(" · zellij ada p11");
-});
-
-test("backendCoordsSeg: pane missing → drops the ' p<…>' suffix", () => {
-  expect(
-    backendCoordsSeg({
-      backend_exec_type: "zellij",
-      backend_exec_session_id: "ada",
-      backend_exec_pane_id: null,
-      backend_exec_tab_id: "3",
-      backend_exec_tab_name: "main",
-    }),
-  ).toBe(" · zellij ada/main");
-});
-
-test("backendCoordsSeg: type only — every other coord null → bare type", () => {
-  // Defense-in-depth: ENV-capture stamped `ZELLIJ=1` but somehow no
-  // session/pane/tab. Renders the bare backend type rather than
-  // collapsing to `· zellij` with trailing-space artifacts.
-  expect(
-    backendCoordsSeg({
-      backend_exec_type: "zellij",
-      backend_exec_session_id: null,
-      backend_exec_pane_id: null,
-      backend_exec_tab_id: null,
-      backend_exec_tab_name: null,
-    }),
-  ).toBe(" · zellij");
-});
-
-test("projectJobRow: backend coords drop to an indented continuation line under the head", () => {
+test("projectJobRow: backend coords NEVER appear in the per-row output (collapse-controlled)", () => {
+  // The backend-coords pill moved out of `projectJobRow` and into the
+  // collapse-controlled region of `renderJobsBody`. Even when every
+  // coord is populated, `projectJobRow` returns just the head line
+  // (plus an awaiting continuation when applicable) — no backend pill.
   const line = projectJobRow({
     job_id: "j1",
     cwd: "/Users/alice/code/keeper",
@@ -218,27 +135,12 @@ test("projectJobRow: backend coords drop to an indented continuation line under 
     backend_exec_tab_id: "3",
     backend_exec_tab_name: "main",
   });
-  // fn-668 follow-up: coords moved off the head line to their own 2-space
-  // indented `· …` continuation line so the head stays a single scannable row.
-  expect(line).toBe("(keeper) live session [working]\n  · zellij ada/main p11");
-});
-
-test("projectJobRow: absent backend coords render as nothing (no placeholder, no 'undefined')", () => {
-  const line = projectJobRow({
-    job_id: "j1",
-    cwd: "/Users/alice/code/keeper",
-    title: "live session",
-    plan_verb: null,
-    state: "working",
-    // No backend_exec_* keys at all — the row predates schema v48 OR
-    // the session is running outside a multiplexer.
-  });
   expect(line).toBe("(keeper) live session [working]");
-  expect(line).not.toContain("undefined");
   expect(line).not.toContain("·");
+  expect(line).not.toContain("[main");
 });
 
-test("projectJobRow: awaiting + backend each drop to their own indented continuation line (awaiting first)", () => {
+test("projectJobRow: awaiting drops to its own continuation line; backend never appears here", () => {
   const line = projectJobRow({
     cwd: "/repo/x",
     title: "asking",
@@ -251,17 +153,137 @@ test("projectJobRow: awaiting + backend each drop to their own indented continua
     backend_exec_pane_id: "11",
     backend_exec_tab_name: "main",
   });
-  // Head stays single-line; awaiting pill then backend coords each get their
-  // own 2-space continuation line, awaiting above backend.
+  // Head + always-visible awaiting line only. The backend pill is
+  // collapse-controlled and lives in `renderJobsBody`'s expanded region.
   expect(line).toBe(
-    "(x) asking [worker] [stopped]\n  [awaiting:ask_user_question]\n  · zellij ada/main p11",
+    "(x) asking [worker] [stopped]\n  [awaiting:ask_user_question]",
   );
 });
 
 // ---------------------------------------------------------------------------
-// renderJobsBody — partitions by plan_verb (no-role on top under
-// `--- interactive ---`, with-role on bottom under `--- autopilot ---`),
-// drops a heading when its side is empty (autopilot-style).
+// backendCoordsSeg — the session-less, type-less pill `[<tab> p<pane>]`.
+// Bracketed so `colorizePillsInLine` tints it like other status pills.
+// Fallbacks: tab name → tab id → drop; missing pane drops ` p<pane>`;
+// tab AND pane both missing → "".
+// ---------------------------------------------------------------------------
+
+test("backendCoordsSeg: tab name + pane → '[<tab> p<pane>]'", () => {
+  expect(
+    backendCoordsSeg({
+      backend_exec_type: "zellij",
+      backend_exec_session_id: "ada",
+      backend_exec_pane_id: "11",
+      backend_exec_tab_id: "3",
+      backend_exec_tab_name: "main",
+    }),
+  ).toBe("[main p11]");
+});
+
+test("backendCoordsSeg: no `·`, no type, no session id in the pill output", () => {
+  // Belt-and-suspenders against the old shape. Confirm the new pill
+  // never carries the old free-text segments.
+  const out = backendCoordsSeg({
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "ada",
+    backend_exec_pane_id: "11",
+    backend_exec_tab_id: "3",
+    backend_exec_tab_name: "main",
+  });
+  expect(out).not.toContain("·");
+  expect(out).not.toContain("zellij");
+  expect(out).not.toContain("ada");
+});
+
+test("backendCoordsSeg: tab name missing → falls back to raw tab_id", () => {
+  expect(
+    backendCoordsSeg({
+      backend_exec_type: "zellij",
+      backend_exec_session_id: "ada",
+      backend_exec_pane_id: "11",
+      backend_exec_tab_id: "3",
+      backend_exec_tab_name: null,
+    }),
+  ).toBe("[3 p11]");
+});
+
+test("backendCoordsSeg: tab fully missing → drops the tab slot, pane-only pill", () => {
+  expect(
+    backendCoordsSeg({
+      backend_exec_type: "zellij",
+      backend_exec_session_id: "ada",
+      backend_exec_pane_id: "11",
+      backend_exec_tab_id: null,
+      backend_exec_tab_name: null,
+    }),
+  ).toBe("[p11]");
+});
+
+test("backendCoordsSeg: pane missing → drops the ' p<pane>' slot, tab-only pill", () => {
+  expect(
+    backendCoordsSeg({
+      backend_exec_type: "zellij",
+      backend_exec_session_id: "ada",
+      backend_exec_pane_id: null,
+      backend_exec_tab_id: "3",
+      backend_exec_tab_name: "main",
+    }),
+  ).toBe("[main]");
+});
+
+test("backendCoordsSeg: tab AND pane both missing → '' (nothing worth showing)", () => {
+  expect(
+    backendCoordsSeg({
+      backend_exec_type: "zellij",
+      backend_exec_session_id: "ada",
+      backend_exec_pane_id: null,
+      backend_exec_tab_id: null,
+      backend_exec_tab_name: null,
+    }),
+  ).toBe("");
+});
+
+test("backendCoordsSeg: absent backend_exec_type still composes a pill from tab/pane", () => {
+  // The new shape is session-less AND type-less — the row is already
+  // grouped under its session heading by `renderJobsBody`, and the only
+  // backend keeper knows about is zellij. So a present tab/pane still
+  // produces a pill even when `backend_exec_type` is null. (Old shape
+  // gated on type; new shape doesn't need to.)
+  expect(
+    backendCoordsSeg({
+      backend_exec_type: null,
+      backend_exec_session_id: "ada",
+      backend_exec_pane_id: "11",
+      backend_exec_tab_id: "3",
+      backend_exec_tab_name: "main",
+    }),
+  ).toBe("[main p11]");
+});
+
+test("backendCoordsSeg: pill is bracketed so colorizePillsInLine can route it", () => {
+  // The whole point of moving from ` · <type> <session>/<tab> p<pane>` to
+  // `[<tab> p<pane>]` is to put the segment inside the pill grid — the
+  // colorizer's bracket-scoped regex now sees it as a candidate token.
+  // (Whether it actually tints depends on `PILL_COLORS` entries; the
+  // shape contract is just that it's bracketed.)
+  const pill = backendCoordsSeg({
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "ada",
+    backend_exec_pane_id: "11",
+    backend_exec_tab_name: "main",
+  });
+  expect(pill.startsWith("[")).toBe(true);
+  expect(pill.endsWith("]")).toBe(true);
+  // And the colorizer's pill regex matches against it (round-trips
+  // unchanged because there's no PILL_COLORS bucket yet, but the
+  // matcher doesn't crash on the input).
+  expect(colorizePillsInLine(pill)).toBe(pill);
+});
+
+// ---------------------------------------------------------------------------
+// renderJobsBody — sections by `backend_exec_session_id` in first-seen
+// order, each introduced by `--- <session> ---` (or `--- (no session) ---`
+// for jobs with null/empty session id). A section drops entirely when
+// it has no rows. Within a section we preserve wire order.
 // ---------------------------------------------------------------------------
 
 test("renderJobsBody: empty jobs map → empty string", () => {
@@ -270,123 +292,220 @@ test("renderJobsBody: empty jobs map → empty string", () => {
   ).toBe("");
 });
 
-test("renderJobsBody: only ambient (no plan_verb) → interactive heading only, no autopilot heading", () => {
+test("renderJobsBody: single session with one job → one section, one row", () => {
   const jobs = new Map<string, unknown>([
     [
-      "j-amb",
+      "j1",
       {
-        job_id: "j-amb",
+        job_id: "j1",
         cwd: "/repo/x",
         title: "ambient",
         plan_verb: null,
         state: "working",
+        backend_exec_session_id: "ada",
       },
     ],
   ]);
   const body = renderJobsBody(jobs, new Map());
-  expect(body).toBe(
-    ["--- interactive ---", "(x) ambient [working]"].join("\n"),
-  );
-  expect(body).not.toContain("--- autopilot ---");
+  expect(body).toBe(["--- ada ---", "(x) ambient [working]"].join("\n"));
 });
 
-test("renderJobsBody: only plan-bound (plan_verb set) → autopilot heading only, no interactive heading", () => {
+test("renderJobsBody: jobs with null session collect under '--- (no session) ---'", () => {
   const jobs = new Map<string, unknown>([
     [
-      "j-work",
+      "j1",
       {
-        job_id: "j-work",
-        cwd: "/repo/y",
-        title: "worker",
-        plan_verb: "work",
-        state: "stopped",
-      },
-    ],
-  ]);
-  const body = renderJobsBody(jobs, new Map());
-  expect(body).toBe(
-    ["--- autopilot ---", "(y) worker [worker] [stopped]"].join("\n"),
-  );
-  expect(body).not.toContain("--- interactive ---");
-});
-
-test("renderJobsBody: both partitions present → interactive heading + rows on top, autopilot heading + rows below", () => {
-  // Insertion order: plan-bound first, ambient second. The partition
-  // assignment must be by plan_verb (not iteration order), so ambient
-  // still renders on top.
-  const jobs = new Map<string, unknown>([
-    [
-      "j-work",
-      {
-        job_id: "j-work",
-        cwd: "/repo/y",
-        title: "worker",
-        plan_verb: "work",
-        state: "stopped",
-      },
-    ],
-    [
-      "j-amb",
-      {
-        job_id: "j-amb",
+        job_id: "j1",
         cwd: "/repo/x",
         title: "ambient",
         plan_verb: null,
         state: "working",
+        // No backend_exec_session_id at all.
+      },
+    ],
+  ]);
+  const body = renderJobsBody(jobs, new Map());
+  expect(body).toBe(
+    ["--- (no session) ---", "(x) ambient [working]"].join("\n"),
+  );
+});
+
+test("renderJobsBody: multiple sessions render in first-seen wire order", () => {
+  // Wire order: session-b first (one job), then session-a (one job).
+  // Sections must appear in that order — first-seen — independent of
+  // any alphabetical sort.
+  const jobs = new Map<string, unknown>([
+    [
+      "j-b",
+      {
+        job_id: "j-b",
+        cwd: "/repo/b",
+        title: "b-job",
+        plan_verb: null,
+        state: "working",
+        backend_exec_session_id: "session-b",
+      },
+    ],
+    [
+      "j-a",
+      {
+        job_id: "j-a",
+        cwd: "/repo/a",
+        title: "a-job",
+        plan_verb: "work",
+        state: "stopped",
+        backend_exec_session_id: "session-a",
       },
     ],
   ]);
   const body = renderJobsBody(jobs, new Map());
   expect(body).toBe(
     [
-      "--- interactive ---",
-      "(x) ambient [working]",
-      "--- autopilot ---",
-      "(y) worker [worker] [stopped]",
+      "--- session-b ---",
+      "(b) b-job [working]",
+      "--- session-a ---",
+      "(a) a-job [worker] [stopped]",
     ].join("\n"),
   );
 });
 
-test("renderJobsBody: within-partition order preserves the helper's wire order", () => {
-  // Two ambient jobs — the second one inserted should render second.
+test("renderJobsBody: jobs in the same session group together preserving wire order", () => {
   const jobs = new Map<string, unknown>([
     [
-      "j-first",
+      "j1",
       {
-        job_id: "j-first",
+        job_id: "j1",
         cwd: "/repo/a",
         title: "first",
         plan_verb: null,
         state: "working",
+        backend_exec_session_id: "ada",
       },
     ],
     [
-      "j-second",
+      "j2",
       {
-        job_id: "j-second",
+        job_id: "j2",
         cwd: "/repo/b",
         title: "second",
         plan_verb: null,
         state: "working",
+        backend_exec_session_id: "ada",
       },
     ],
   ]);
   const body = renderJobsBody(jobs, new Map());
   expect(body).toBe(
-    ["--- interactive ---", "(a) first [working]", "(b) second [working]"].join(
-      "\n",
-    ),
+    ["--- ada ---", "(a) first [working]", "(b) second [working]"].join("\n"),
+  );
+});
+
+test("renderJobsBody: interleaved sessions split into per-session sections, in first-seen order", () => {
+  // Wire order interleaves session-a / session-b / session-a — sections
+  // emit in first-seen order (a, then b) with wire order preserved
+  // within each section.
+  const jobs = new Map<string, unknown>([
+    [
+      "ja1",
+      {
+        job_id: "ja1",
+        cwd: "/r/a1",
+        title: "a-first",
+        plan_verb: null,
+        state: "working",
+        backend_exec_session_id: "session-a",
+      },
+    ],
+    [
+      "jb1",
+      {
+        job_id: "jb1",
+        cwd: "/r/b1",
+        title: "b-first",
+        plan_verb: "work",
+        state: "stopped",
+        backend_exec_session_id: "session-b",
+      },
+    ],
+    [
+      "ja2",
+      {
+        job_id: "ja2",
+        cwd: "/r/a2",
+        title: "a-second",
+        plan_verb: null,
+        state: "working",
+        backend_exec_session_id: "session-a",
+      },
+    ],
+  ]);
+  const body = renderJobsBody(jobs, new Map());
+  expect(body).toBe(
+    [
+      "--- session-a ---",
+      "(a1) a-first [working]",
+      "(a2) a-second [working]",
+      "--- session-b ---",
+      "(b1) b-first [worker] [stopped]",
+    ].join("\n"),
   );
 });
 
 // ---------------------------------------------------------------------------
-// renderJobsBody: nested sub-agent lines — COLLAPSE-BY-DEFAULT. A job's
-// `subagentLinesFor(..., "  ")` block (two-space indent) renders only
-// when the job is in `render.expanded`. The collapse + annotation rules
-// (same-name within one job collapses; `×N` / `N stuck` annotations) are
-// unit-tested in test/board.test.ts via collapseSubagentsByName; here we
-// cover default-hidden + expand-to-show + correct partition nesting.
+// renderJobsBody: collapse-controlled lines — sub-agent lines AND the
+// backend-coords pill. Both render only when the job is in
+// `render.expanded`. The pill renders BEFORE sub-agent lines inside the
+// expanded region. The `[awaiting:<kind>]` continuation line stays
+// always-visible (it's emitted by `projectJobRow`).
 // ---------------------------------------------------------------------------
+
+test("renderJobsBody: backend pill is hidden by default (collapse-controlled)", () => {
+  const jobs = new Map<string, unknown>([
+    [
+      "j1",
+      {
+        job_id: "j1",
+        cwd: "/repo/x",
+        title: "live",
+        plan_verb: null,
+        state: "working",
+        backend_exec_session_id: "ada",
+        backend_exec_pane_id: "11",
+        backend_exec_tab_name: "main",
+      },
+    ],
+  ]);
+  const body = renderJobsBody(jobs, new Map());
+  // No render opts → nothing in `expanded` → the pill stays hidden.
+  expect(body).toBe(["--- ada ---", "(x) live [working]"].join("\n"));
+  expect(body).not.toContain("[main");
+});
+
+test("renderJobsBody: expanding a job reveals the backend pill (no sub-agents present)", () => {
+  const jobs = new Map<string, unknown>([
+    [
+      "j1",
+      {
+        job_id: "j1",
+        cwd: "/repo/x",
+        title: "live",
+        plan_verb: null,
+        state: "working",
+        backend_exec_session_id: "ada",
+        backend_exec_pane_id: "11",
+        backend_exec_tab_name: "main",
+      },
+    ],
+  ]);
+  const body = renderJobsBody(jobs, new Map(), {
+    insertMode: false,
+    selectedIndex: 0,
+    expanded: new Set(["j1"]),
+  });
+  expect(body).toBe(
+    ["--- ada ---", "(x) live [working]", "  [main p11]"].join("\n"),
+  );
+});
 
 const ambWithSub = (): {
   jobs: Map<string, unknown>;
@@ -401,6 +520,9 @@ const ambWithSub = (): {
         title: "ambient",
         plan_verb: null,
         state: "working",
+        backend_exec_session_id: "ada",
+        backend_exec_pane_id: "11",
+        backend_exec_tab_name: "main",
       },
     ],
   ]),
@@ -422,13 +544,11 @@ const ambWithSub = (): {
 test("renderJobsBody: sub-agents are collapse-by-default (hidden with no render opts)", () => {
   const { jobs, subagentIndex } = ambWithSub();
   const body = renderJobsBody(jobs, subagentIndex);
-  expect(body).toBe(
-    ["--- interactive ---", "(x) ambient [working]"].join("\n"),
-  );
+  expect(body).toBe(["--- ada ---", "(x) ambient [working]"].join("\n"));
   expect(body).not.toContain("general-purpose");
 });
 
-test("renderJobsBody: expanding a job reveals its nested sub-agent line beneath it", () => {
+test("renderJobsBody: expanding shows backend pill BEFORE sub-agent lines", () => {
   const { jobs, subagentIndex } = ambWithSub();
   const body = renderJobsBody(jobs, subagentIndex, {
     insertMode: false,
@@ -437,119 +557,96 @@ test("renderJobsBody: expanding a job reveals its nested sub-agent line beneath 
   });
   expect(body).toBe(
     [
-      "--- interactive ---",
+      "--- ada ---",
       "(x) ambient [working]",
+      "  [main p11]", // backend pill — rendered before sub-agent lines
       "  general-purpose: investigate [running]",
     ].join("\n"),
   );
 });
 
-test("renderJobsBody: sub-agent lines route to the correct partition (ambient vs plan-bound)", () => {
-  // One ambient job + one plan-bound job, each with its own sub-agent.
-  // The sub-agent line must appear inside the SAME partition as its
-  // parent job — never on the wrong side of the heading boundary.
+test("renderJobsBody: awaiting line stays always-visible (NOT collapse-controlled)", () => {
+  // A collapsed job still shows its `[awaiting:<kind>]` continuation —
+  // it's an attention signal the human needs to see at a glance.
   const jobs = new Map<string, unknown>([
     [
-      "j-amb",
+      "j1",
       {
-        job_id: "j-amb",
+        job_id: "j1",
         cwd: "/repo/x",
-        title: "ambient",
-        plan_verb: null,
-        state: "working",
-      },
-    ],
-    [
-      "j-work",
-      {
-        job_id: "j-work",
-        cwd: "/repo/y",
-        title: "worker",
+        title: "asking",
         plan_verb: "work",
         state: "stopped",
+        backend_exec_session_id: "ada",
+        backend_exec_pane_id: "11",
+        backend_exec_tab_name: "main",
+        last_input_request_at: 999,
+        last_input_request_kind: "ask_user_question",
       },
     ],
   ]);
-  const subagentIndex = new Map<string, SubagentInvocation[]>([
-    [
-      "j-amb",
-      [
-        makeSub({
-          job_id: "j-amb",
-          subagent_type: "scout",
-          description: "scout-task",
-          status: "ok",
-        }),
-      ],
-    ],
-    [
-      "j-work",
-      [
-        makeSub({
-          job_id: "j-work",
-          subagent_type: "build",
-          description: "build-task",
-          status: "running",
-        }),
-      ],
-    ],
-  ]);
-  const body = renderJobsBody(jobs, subagentIndex, {
-    insertMode: false,
-    selectedIndex: 0,
-    expanded: new Set(["j-amb", "j-work"]),
-  });
-  // Expected:
-  //   --- interactive ---
-  //   (x) ambient [working]
-  //     scout: scout-task [ok]
-  //   --- autopilot ---
-  //   (y) worker [worker] [stopped]
-  //     build: build-task [running]
+  // No expansion → awaiting line visible, backend pill hidden.
+  const body = renderJobsBody(jobs, new Map());
   expect(body).toBe(
     [
-      "--- interactive ---",
-      "(x) ambient [working]",
-      "  scout: scout-task [ok]",
-      "--- autopilot ---",
-      "(y) worker [worker] [stopped]",
-      "  build: build-task [running]",
+      "--- ada ---",
+      "(x) asking [worker] [stopped]",
+      "  [awaiting:ask_user_question]",
     ].join("\n"),
   );
 });
 
 // ---------------------------------------------------------------------------
-// selectableJobIds — the render-order list insert-mode selection walks
-// (interactive partition first, then autopilot). Shared by renderJobsBody
-// and the key handler so the two never disagree on ordering.
+// selectableJobIds — the render-order list insert-mode selection walks.
+// Sections concatenated in first-seen `backend_exec_session_id` order,
+// each section's jobs in wire order. Shared with `renderJobsBody` so the
+// two never disagree on ordering.
 // ---------------------------------------------------------------------------
 
-test("selectableJobIds: interactive jobs first, then autopilot, preserving wire order", () => {
-  // Insertion order interleaves the partitions; the result must still be
-  // all-interactive-then-all-autopilot, each in wire order.
+test("selectableJobIds: jobs grouped by session in first-seen order, wire order within each", () => {
+  // Wire order interleaves session-a / session-b / session-a / null →
+  // the result is [a-jobs..., b-jobs..., null-jobs...] each in wire order.
   const jobs = new Map<string, unknown>([
-    ["w1", { job_id: "w1", plan_verb: "work" }],
-    ["a1", { job_id: "a1", plan_verb: null }],
-    ["w2", { job_id: "w2", plan_verb: "plan" }],
-    ["a2", { job_id: "a2", plan_verb: null }],
+    ["a1", { job_id: "a1", backend_exec_session_id: "session-a" }],
+    ["b1", { job_id: "b1", backend_exec_session_id: "session-b" }],
+    ["a2", { job_id: "a2", backend_exec_session_id: "session-a" }],
+    ["n1", { job_id: "n1", backend_exec_session_id: null }],
   ]);
-  expect(selectableJobIds(jobs)).toEqual(["a1", "a2", "w1", "w2"]);
+  expect(selectableJobIds(jobs)).toEqual(["a1", "a2", "b1", "n1"]);
+});
+
+test("selectableJobIds: empty session id collects under (no session) bucket", () => {
+  // Empty-string session id is treated the same as null — both land in
+  // the (no session) bucket.
+  const jobs = new Map<string, unknown>([
+    ["e1", { job_id: "e1", backend_exec_session_id: "" }],
+    ["a1", { job_id: "a1", backend_exec_session_id: "session-a" }],
+  ]);
+  // First-seen-section order: the (no session) bucket appears first
+  // because it was opened first.
+  expect(selectableJobIds(jobs)).toEqual(["e1", "a1"]);
 });
 
 // ---------------------------------------------------------------------------
-// renderJobsBody insert-mode decoration: a 2-space base indent on headings
-// and child/continuation lines, a disclosure triangle on job rows that have
-// children, and a full-width selection highlight on the selected row. The
-// selected row carries no `> ` marker — instead its HEAD line is prefixed
-// with SELECTED_LINE_PREFIX (the view-shell turns that into a background
+// renderJobsBody insert-mode decoration: a 2-space base indent on
+// headings and child/continuation lines, a disclosure triangle on EVERY
+// job row (not just rows with children — the backend pill is itself
+// collapse-controlled, so every row has something the caret discloses),
+// and a full-width selection highlight on the selected row. The selected
+// row carries no `> ` marker — instead its HEAD line is prefixed with
+// SELECTED_LINE_PREFIX (the view-shell turns that into a background
 // highlight). Nerd Font glyphs: caret-right (collapsed) / caret-down
 // (expanded).
 // ---------------------------------------------------------------------------
 
-const TRI_RIGHT = "\uf0da"; // GLYPH_COLLAPSED // GLYPH_COLLAPSED
-const TRI_DOWN = "\uf0d7"; // GLYPH_EXPANDED // GLYPH_EXPANDED
+const TRI_RIGHT = ""; // GLYPH_COLLAPSED
+const TRI_DOWN = ""; // GLYPH_EXPANDED
 
-test("renderJobsBody insert mode: indent + selection-prefix + collapsed triangle", () => {
+test("renderJobsBody insert mode: every job row gets a caret (even with no children)", () => {
+  // j1 has no sub-agents and no backend pill — but the caret still
+  // appears, because the row is collapse-toggleable in principle (any
+  // row could have collapse-controlled content). This is the spec
+  // change vs. the old `hasChildren` gating.
   const jobs = new Map<string, unknown>([
     [
       "j1",
@@ -559,6 +656,7 @@ test("renderJobsBody insert mode: indent + selection-prefix + collapsed triangle
         title: "first",
         plan_verb: null,
         state: "working",
+        backend_exec_session_id: "ada",
       },
     ],
     [
@@ -569,38 +667,27 @@ test("renderJobsBody insert mode: indent + selection-prefix + collapsed triangle
         title: "second",
         plan_verb: null,
         state: "working",
+        backend_exec_session_id: "ada",
       },
     ],
   ]);
-  // j1 has a sub-agent (so it gets a triangle); j2 has none (blank gutter).
-  const subagentIndex = new Map<string, SubagentInvocation[]>([
-    [
-      "j1",
-      [
-        makeSub({
-          job_id: "j1",
-          subagent_type: "scout",
-          description: "d",
-          status: "ok",
-        }),
-      ],
-    ],
-  ]);
-  const body = renderJobsBody(jobs, subagentIndex, {
+  const body = renderJobsBody(jobs, new Map(), {
     insertMode: true,
     selectedIndex: 0,
     expanded: new Set(),
   });
+  // Both rows get a caret-right (collapsed) — even though neither has
+  // children. The selected row also gets SELECTED_LINE_PREFIX.
   expect(body).toBe(
     [
-      "  --- interactive ---", // heading: 2-space base indent
-      `${SELECTED_LINE_PREFIX}${TRI_RIGHT} (a) first [working]`, // selected (prefix), collapsed-with-children
-      "  (b) second [working]", // unselected, no children → blank gutter
+      "  --- ada ---",
+      `${SELECTED_LINE_PREFIX}${TRI_RIGHT} (a) first [working]`,
+      `${TRI_RIGHT} (b) second [working]`,
     ].join("\n"),
   );
 });
 
-test("renderJobsBody insert mode: selected + expanded shows down-triangle and reveals child", () => {
+test("renderJobsBody insert mode: selected + expanded → down-triangle, backend pill + child revealed", () => {
   const jobs = new Map<string, unknown>([
     [
       "j1",
@@ -610,6 +697,9 @@ test("renderJobsBody insert mode: selected + expanded shows down-triangle and re
         title: "first",
         plan_verb: null,
         state: "working",
+        backend_exec_session_id: "ada",
+        backend_exec_pane_id: "11",
+        backend_exec_tab_name: "main",
       },
     ],
   ]);
@@ -633,14 +723,15 @@ test("renderJobsBody insert mode: selected + expanded shows down-triangle and re
   });
   expect(body).toBe(
     [
-      "  --- interactive ---",
-      `${SELECTED_LINE_PREFIX}${TRI_DOWN} (a) first [working]`, // selected (prefix), expanded
-      "    scout: d [ok]", // child: 2 base + its own 2
+      "  --- ada ---",
+      `${SELECTED_LINE_PREFIX}${TRI_DOWN} (a) first [working]`,
+      "    [main p11]", // backend pill: 2 base + its own 2
+      "    scout: d [ok]", // sub-agent line: 2 base + its own 2
     ].join("\n"),
   );
 });
 
-test("renderJobsBody insert mode: out-of-range selectedIndex clamps (no prefix leak / no crash)", () => {
+test("renderJobsBody insert mode: out-of-range selectedIndex clamps to last row", () => {
   const jobs = new Map<string, unknown>([
     [
       "j1",
@@ -650,6 +741,7 @@ test("renderJobsBody insert mode: out-of-range selectedIndex clamps (no prefix l
         title: "first",
         plan_verb: null,
         state: "working",
+        backend_exec_session_id: "ada",
       },
     ],
   ]);
@@ -660,33 +752,33 @@ test("renderJobsBody insert mode: out-of-range selectedIndex clamps (no prefix l
     expanded: new Set(),
   });
   expect(body).toBe(
-    // selection prefix + `  ` blank disclosure gutter (no children).
     [
-      "  --- interactive ---",
-      `${SELECTED_LINE_PREFIX}  (a) first [working]`,
+      "  --- ada ---",
+      // Caret always present in insert mode now (no `hasChildren` gate).
+      `${SELECTED_LINE_PREFIX}${TRI_RIGHT} (a) first [working]`,
     ].join("\n"),
   );
 });
 
-test("renderJobsBody insert mode: selectedIndex marks by selectableJobIds order, not raw Map order (interleaved partitions)", () => {
-  // Regression: the Map interleaves interactive/autopilot as sessions arrive,
-  // but `selectedIndex` indexes `selectableJobIds` (interactive-then-autopilot).
-  // Marking by raw Map-iteration index landed the highlight in the wrong
-  // partition. Here Map order is I,A,I,A; selectableJobIds is [I0,I1,A0,A1].
-  const mk = (id: string, plan_verb: string | null) => ({
+test("renderJobsBody insert mode: selectedIndex marks by selectableJobIds order, not raw Map order", () => {
+  // Wire-order Map: a1, b1, a2, b2 (interleaved sessions). selectableJobIds
+  // groups by session in first-seen order → [a1, a2, b1, b2].
+  // selectedIndex 1 picks a2 (the SECOND job in session-a, not the
+  // raw-index-1 row b1).
+  const mk = (id: string, sessionId: string, title: string) => ({
     job_id: id,
     cwd: `/r/${id.toLowerCase()}`,
-    title: id === "I1" ? "inter-1" : id,
-    plan_verb,
+    title,
+    plan_verb: null,
     state: "working",
+    backend_exec_session_id: sessionId,
   });
   const jobs = new Map<string, unknown>([
-    ["I0", mk("I0", null)],
-    ["A0", mk("A0", "worker")],
-    ["I1", mk("I1", null)],
-    ["A1", mk("A1", "planner")],
+    ["a1", mk("a1", "session-a", "a-first")],
+    ["b1", mk("b1", "session-b", "b-first")],
+    ["a2", mk("a2", "session-a", "a-second")],
+    ["b2", mk("b2", "session-b", "b-second")],
   ]);
-  // selectedIndex 1 → selectableJobIds[1] = I1 (the SECOND interactive job).
   const body = renderJobsBody(jobs, new Map(), {
     insertMode: true,
     selectedIndex: 1,
@@ -695,8 +787,10 @@ test("renderJobsBody insert mode: selectedIndex marks by selectableJobIds order,
   const marked = body
     .split("\n")
     .find((l) => l.startsWith(SELECTED_LINE_PREFIX));
-  // The highlight must land on inter-1 (I1), never on auto-0 (the raw-index-1 row).
-  expect(marked).toBe(`${SELECTED_LINE_PREFIX}  (i1) inter-1 [working]`);
+  // The highlight must land on a-second (a2), not b-first (the raw-index-1 row).
+  expect(marked).toBe(
+    `${SELECTED_LINE_PREFIX}${TRI_RIGHT} (a2) a-second [working]`,
+  );
   // And exactly one row is selection-prefixed.
   expect(
     body.split("\n").filter((l) => l.startsWith(SELECTED_LINE_PREFIX)).length,
