@@ -47,5 +47,5 @@ its debounce: `runCapture` null (ENOENT) -> `{ok:false,error}`; non-zero exit ->
 - [ ] `ExecBackend` interface documents `renameTab`; `bun test test/exec-backend.test.ts` is green
 
 ## Done summary
-
+Added pure builder buildZellijRenameTabArgs + ExecBackend.renameTab using focus-safe rename-tab-by-id; session-agnostic, LaunchResult envelope, never throws.
 ## Evidence
