@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-02T13:18:07.223474Z",
+  "depends_on": [],
+  "epic": "fn-677-restore-previous-session",
+  "id": "fn-677-restore-previous-session.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Shared resume-descriptor helper and restore path",
+  "updated_at": "2026-06-02T13:18:07.223474Z"
+}
