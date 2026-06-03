@@ -161,13 +161,33 @@ test("sanitizeTabName: caps length by code point (~50 chars)", () => {
   expect(Array.from(result).length).toBe(50);
 });
 
+test("sanitizeTabName: over-cap title elides the MIDDLE, preserving the trailing task number (fn-635)", () => {
+  // Regression for the fn-635 tab-name bug. The launch label
+  // `work::fn-635-extract-planctl-into-standalone-repo.5` is 51 code
+  // points — one over the 50 cap. The old head-slice dropped the final
+  // `5`, the single character distinguishing one sibling task's tab from
+  // another's. Middle-elision must keep both the `work::fn-635` head and
+  // the `.5` tail.
+  const label = "work::fn-635-extract-planctl-into-standalone-repo.5";
+  expect(Array.from(label).length).toBe(51);
+  const result = sanitizeTabName(label);
+  expect(Array.from(result).length).toBe(50);
+  expect(result.startsWith("work::fn-635")).toBe(true);
+  expect(result.endsWith("repo.5")).toBe(true);
+  expect(result).toContain("…");
+});
+
 test("sanitizeTabName: cap does NOT split a surrogate pair (emoji at the boundary)", () => {
-  // Each rocket emoji is one code point but two UTF-16 code units.
+  // Each rocket emoji is one code point but two UTF-16 code units. The
+  // middle-elision cut lands on emoji boundaries (head 24 + ellipsis +
+  // tail 25), never mid-surrogate, and the ellipsis is itself a single
+  // BMP code point — so no lone surrogate / replacement char appears.
   const emojis = "🚀".repeat(60);
   const result = sanitizeTabName(emojis);
-  // Should be exactly 50 code points (each a full emoji), never split.
+  // Should be exactly 50 code points total, never split.
   expect(Array.from(result).length).toBe(50);
-  expect(result).toBe("🚀".repeat(50));
+  expect(result).toBe(`${"🚀".repeat(24)}…${"🚀".repeat(25)}`);
+  expect(result).not.toContain("�"); // no replacement char from a split
 });
 
 test("sanitizeTabName: all-control input collapses to empty string", () => {
