@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-689-restore-snapshot-last-non-empty-wins",
   "bundles": [],
+  "closer_done_at": "2026-06-03T20:07:09.932397Z",
   "created_at": "2026-06-03T18:17:29.527254Z",
   "depends_on_epics": [],
   "id": "fn-689-restore-snapshot-last-non-empty-wins",
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Restore snapshot last-non-empty-wins",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T19:31:56.348133Z"
+  "updated_at": "2026-06-03T20:07:09.932397Z"
 }
