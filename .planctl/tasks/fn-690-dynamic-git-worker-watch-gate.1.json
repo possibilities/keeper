@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "dynamic watch gate + probe + reconcile",
-  "updated_at": "2026-06-03T20:02:05.946030Z"
+  "updated_at": "2026-06-03T20:52:06.462768Z",
+  "worker_done_at": "2026-06-03T20:52:06.462768Z"
 }

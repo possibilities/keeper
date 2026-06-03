@@ -107,5 +107,5 @@ MUST short-circuit `.planctl` first so `.planctl` repos never incur a probe spaw
 - [ ] `bun run lint && bun run typecheck && bun run test` all pass; no `SCHEMA_VERSION` bump (or, if bumped, keeper/api.py synced).
 
 ## Done summary
-
+Widened git-worker watch gate from .planctl-only to .planctl||dirty||ahead>0 dynamically per reconcile. Added shouldWatchRoot/probeWatchMembership/decideReconcileTransitions pure helpers, per-root TTL memo (hot 5s / cold 90s), bounded candidate set with full-sweep throttle (5min), cooling hysteresis (45s dwell), and subscribe cap (16/cycle). Producer-only change; reducer untouched; re-fold determinism verified.
 ## Evidence
