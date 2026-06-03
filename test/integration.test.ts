@@ -45,6 +45,15 @@ let watchRoot: string;
 let planRoot: string;
 let configPath: string;
 let daemon: Subprocess<"ignore", "pipe", "pipe"> | null = null;
+/**
+ * Registry of every victim-launcher subprocess spawned by a test. The
+ * launcher parks forever once its inner hook commits, so a test that throws
+ * or times out before its happy-path SIGKILL leaks the child — observed in
+ * the wild at >24h uptime, pegging a CPU at ~100% and cascading e2e
+ * timeouts. `afterEach` unconditionally reaps every entry (process-group
+ * kill so any in-flight grandchild hook also dies), mirroring `daemon`.
+ */
+const victimLaunchers: Subprocess<"ignore", "pipe", "pipe">[] = [];
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-integration-test-"));
@@ -93,6 +102,31 @@ afterEach(async () => {
     try {
       daemon.kill("SIGKILL");
       await daemon.exited;
+    } catch {
+      // already gone
+    }
+  }
+  // Reap every spawned victim-launcher. The happy path SIGKILLs and awaits
+  // exit, but a thrown / timed-out test bypasses that — and the launcher
+  // parks forever, so without this sweep it leaks. We spawn launchers
+  // `detached: true` (own process group), so a negative-pid kill takes out
+  // the launcher AND any in-flight grandchild hook in one shot.
+  while (victimLaunchers.length > 0) {
+    const v = victimLaunchers.pop();
+    if (!v || v.exitCode !== null) {
+      continue;
+    }
+    try {
+      // SIGKILL the whole process group. ESRCH is fine (already dead);
+      // EPERM shouldn't happen in tests but is also swallowed.
+      try {
+        process.kill(-v.pid, "SIGKILL");
+      } catch {
+        // pgid kill may fail if the leader already exited — fall back to
+        // direct-pid kill so we still reap the launcher itself.
+        v.kill("SIGKILL");
+      }
+      await v.exited;
     } catch {
       // already gone
     }
@@ -1792,7 +1826,15 @@ await proc.exited;
 // Tell the test we're ready (the hook row is committed) via a single stdout
 // line, then park. The launcher's pid is what jobs.pid will hold.
 process.stdout.write("READY\\n");
-await new Promise(() => {});
+// Park on a long-running keep-alive timer rather than \`await new Promise(() => {})\`.
+// A bare never-resolving promise in Bun keeps the event loop pinned at
+// ~100% CPU when there's no I/O — observed in the wild as multi-day leaked
+// launchers saturating cores. A pending timer holds the loop cheaply
+// (event loop sleeps until the next due timer; we set it to ~24.8d so it
+// never fires in practice). The test SIGKILLs us long before then.
+await new Promise(() => {
+  setTimeout(() => {}, 2_147_483_647);
+});
 `,
   );
 
@@ -1821,12 +1863,19 @@ await new Promise(() => {});
   // events.pid + events.start_time describe it. The launcher's own inner
   // hook spawn uses `env: { ...process.env }`, so the sandboxed state-path
   // overrides propagate down one level to the hook process (fn-657).
+  //
+  // `detached: true` puts the launcher in its own process group so a
+  // negative-pid SIGKILL in `afterEach` reaps the whole tree (launcher +
+  // any in-flight grandchild hook) if this test throws before its
+  // happy-path teardown — see the `victimLaunchers` registry above.
   const victim = Bun.spawn(["bun", "run", launcherPath], {
     cwd: ROOT,
     env: sandboxedBaseEnv(),
     stdout: "pipe",
     stderr: "pipe",
+    detached: true,
   });
+  victimLaunchers.push(victim);
   const victimPid = victim.pid;
 
   // Wait for the launcher's "READY" line — the hook's SessionStart row has
