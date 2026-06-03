@@ -12,6 +12,39 @@ from click.testing import CliRunner
 from planctl.cli import cli
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _git_global_config(tmp_path_factory):
+    """Hoist the per-repo git config out of every fixture into one global file.
+
+    Each test repo needs the same four settings — committer identity,
+    ``commit.gpgsign=false``, ``core.hooksPath=/dev/null`` — to commit
+    hermetically without prompts or signing. Setting them per-repo cost four
+    ``git config`` subprocesses (~6.6ms each) in every fixture instantiation.
+
+    Instead we write one throwaway gitconfig and point ``GIT_CONFIG_GLOBAL`` at
+    it for the whole session, so every ``git`` subprocess inherits the settings
+    — the fixtures below only ``git init``.  ``GIT_CONFIG_SYSTEM=/dev/null``
+    isolates the tests from a machine's ``/etc/gitconfig`` (e.g. a forced
+    ``commit.gpgsign=true``).  Session-scoped: fires once per worker process
+    under xdist, not once per test.
+    """
+    cfg = tmp_path_factory.mktemp("gitcfg") / "gitconfig"
+    cfg.write_text(
+        "[user]\n"
+        "\temail = test@example.com\n"
+        "\tname = Test User\n"
+        "[commit]\n"
+        "\tgpgsign = false\n"
+        "[core]\n"
+        "\thooksPath = /dev/null\n",
+        encoding="utf-8",
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+        mp.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+        yield
+
+
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     """Create a throwaway planctl project and chdir to it.
@@ -26,36 +59,14 @@ def project(tmp_path, monkeypatch):
     point at real ``.git/``-bearing directories.  We ``git init`` the project
     root so the integrity check passes — production-mode planctl projects
     always live inside a git repo, so this fixture matches the deployed
-    invariant.  ``git commit.gpgsign=false`` + ``core.hooksPath=/dev/null``
-    keep commits hermetic without prompts.
+    invariant.  Committer identity, ``commit.gpgsign=false``, and
+    ``core.hooksPath=/dev/null`` ride the session-scoped ``GIT_CONFIG_GLOBAL``
+    set by :func:`_git_global_config`, so commits stay hermetic without a
+    per-repo config subprocess here.
     """
     monkeypatch.setenv("PLANCTL_SESSION_ID", "test-session-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "commit.gpgsign", "false"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "core.hooksPath", "/dev/null"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
     runner = CliRunner()
     result = runner.invoke(cli, ["init"])
     assert result.exit_code == 0, result.output
@@ -66,8 +77,10 @@ def project(tmp_path, monkeypatch):
 def planctl_git_repo(tmp_path, monkeypatch):
     """A tmp_path with git init + planctl init, configured for commit tests.
 
-    git user.email, user.name, commit.gpgsign=false, and core.hooksPath=/dev/null
-    are set so commits succeed without prompts or signing overhead in CI.
+    Committer identity, commit.gpgsign=false, and core.hooksPath=/dev/null ride
+    the session-scoped ``GIT_CONFIG_GLOBAL`` set by :func:`_git_global_config`,
+    so commits succeed without prompts or signing overhead and without a
+    per-repo config subprocess here.
 
     PLANCTL_SESSION_ID is set to a fixed test value so build_planctl_commit()
     can resolve the session id without depending on any sidecar database.
@@ -79,30 +92,6 @@ def planctl_git_repo(tmp_path, monkeypatch):
 
     # Initialise git repo
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "commit.gpgsign", "false"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "core.hooksPath", "/dev/null"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
 
     # Create an initial commit so HEAD exists
     readme = tmp_path / "README.md"
@@ -146,6 +135,10 @@ def multi_repo_project(tmp_path, monkeypatch):
     Returns (primary_path, touched_path) — both are bare git repos with no
     planctl project; callers run ``planctl init`` themselves if needed.
 
+    Committer identity, commit.gpgsign=false, and core.hooksPath=/dev/null ride
+    the session-scoped ``GIT_CONFIG_GLOBAL`` set by :func:`_git_global_config`,
+    so the per-repo config subprocesses are gone from this loop.
+
     PLANCTL_SESSION_ID is pre-set so any mutating verb's session-id resolution
     short-circuits cleanly.
     """
@@ -158,30 +151,6 @@ def multi_repo_project(tmp_path, monkeypatch):
 
     for repo_dir in (primary, touched):
         subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
-        subprocess.run(
-            ["git", "config", "user.email", "test@example.com"],
-            cwd=repo_dir,
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "Test User"],
-            cwd=repo_dir,
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "config", "commit.gpgsign", "false"],
-            cwd=repo_dir,
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "config", "core.hooksPath", "/dev/null"],
-            cwd=repo_dir,
-            check=True,
-            capture_output=True,
-        )
         readme = repo_dir / "README.md"
         readme.write_text("# Test repo\n")
         subprocess.run(
