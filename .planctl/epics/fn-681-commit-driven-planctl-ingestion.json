@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-681-commit-driven-planctl-ingestion",
   "bundles": [],
   "closer_done_at": "2026-06-03T00:13:31.391069Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T00:13:31.391069Z"
+  "updated_at": "2026-06-03T00:13:52.497700Z"
 }
