@@ -807,7 +807,7 @@ def test_refine_apply_invocation_raise_unwinds_written_tree(
 
     import planctl.invocation as _inv
 
-    def _boom(*_a, **_kw):
+    def _boom(*_):
         raise RuntimeError("synthetic: invocation build blew up post-write")
 
     monkeypatch.setattr(_inv, "build_planctl_invocation", _boom)
@@ -843,7 +843,7 @@ def test_refine_apply_commit_failure_unwinds_written_tree(
     baseline_task3 = planctl_git_repo / ".planctl" / "tasks" / f"{epic_id}.3.json"
     baseline_spec3 = planctl_git_repo / ".planctl" / "specs" / f"{epic_id}.3.md"
 
-    def _boom(payload):
+    def _boom(_):
         raise commit_module.CommitFailed(
             "git_commit", "synthesized refine-apply commit rejection"
         )

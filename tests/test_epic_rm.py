@@ -530,7 +530,7 @@ def test_rm_commit_failure_emits_structured_envelope(planctl_git_repo, monkeypat
     monkeypatch.chdir(planctl_git_repo)
     epic_id, _ = seed_epic(planctl_git_repo, n_tasks=1)
 
-    def _boom(payload):
+    def _boom(_):
         raise commit_module.CommitFailed(
             "git_commit", "synthesized epic rm commit rejection"
         )

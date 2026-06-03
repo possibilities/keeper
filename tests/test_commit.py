@@ -300,7 +300,7 @@ def test_auto_commit_raises_commit_failed_on_git_commit_error(
     # against a config that won't allow it.  Simpler: monkeypatch
     # `_git_commit` in the commit module to raise.  Signature now carries the
     # pathspec-scoping `files` arg (fn-640).
-    def _boom(msg: str, files: list[str], cwd: str) -> str:
+    def _boom(*_) -> str:
         raise CommitFailed("git_commit", "synthesized failure")
 
     monkeypatch.setattr(commit_module, "_git_commit", _boom)
@@ -424,7 +424,7 @@ def test_auto_commit_raises_commit_contended_on_exhaustion(
     # with "File exists".  Stub the backoff so the 8 attempts run instantly.
     lock_file = planctl_git_repo / ".git" / "index.lock"
     lock_file.write_text("")
-    monkeypatch.setattr(commit_module.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(commit_module.time, "sleep", lambda _: None)
 
     try:
         with pytest.raises(CommitFailed) as ei:
@@ -453,12 +453,12 @@ def test_auto_commit_does_not_retry_genuine_commit_failure(
     """
     calls = {"n": 0}
 
-    def _boom(msg: str, files: list[str], cwd: str) -> str:
+    def _boom(*_) -> str:
         calls["n"] += 1
         raise CommitFailed("git_commit", "pre-commit hook rejected the change")
 
     monkeypatch.setattr(commit_module, "_git_commit", _boom)
-    monkeypatch.setattr(commit_module.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(commit_module.time, "sleep", lambda _: None)
 
     rel = _make_dirty(planctl_git_repo, ".planctl/epics/genuine.txt")
     with pytest.raises(CommitFailed) as ei:
