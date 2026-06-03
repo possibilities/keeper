@@ -103,15 +103,7 @@ Name what was found and offer ONE concrete recommended next step. Examples:
 
 Wait for human direction. Do not proceed past this gate without an explicit go-signal targeted at one specific subset.
 
-**Scale-up triggers from `/plan:plan` Phase 3c** — any of these flipping to YES means the work does NOT fit in one task and you stop:
-
-- **Cross-domain** — the change spans separate subsystems that would review separately (e.g. CLI + web UI + database migration).
-- **Cross-package / cross-repo** — touches multiple workspace packages or needs to land in a sequence across repos.
-- **Hard dep chain** — later work genuinely can't start until earlier work ships.
-- **Genuinely independent concerns** — two pieces of work that share nothing and bundling them would make the PR harder to reason about.
-- **Keystone-plus-fallback** — a risky technical approach with a known alternative.
-
-When in doubt between 1 task and 2, this skill is the wrong tool — stop and recommend `/plan:plan`. The queue/defer fast lane is for genuinely-one-task work.
+**Scale-up triggers** (`/plan:plan` Phase 3c) — any one flipping to YES means the work does NOT fit in one task and you stop: cross-domain, cross-package/cross-repo, hard dep chain, genuinely-independent concerns, or keystone-plus-fallback. When in doubt between 1 task and 2, this skill is the wrong tool — stop and recommend `/plan:plan`. The fast lane is for genuinely-one-task work.
 
 ---
 
@@ -199,5 +191,5 @@ No menu, no follow-up prompts, no epic close. The human picks when to run the ta
 - **Subject inference excludes `.planctl/`.** Same prompt-injection guard as `/plan:plan` Phase 1b — historical planctl state never seeds a new subject.
 - **One scout cap.** Phase 2 spawns at most one `repo-scout`. No fan-out, no gap-analyst, no Priority Questions loop — this is the fast lane.
 - **No `TodoWrite`.** planctl tracks all tasks.
-- **Cross-project epic deps (fn-600) do not apply.** Single-task scaffolds emit no `epic.depends_on_epics` — the cross-project resolver (`apps/planctl/docs/reference/cross-project-epic-deps.md`) is never exercised here. Use `/plan:plan` when the new work has a real upstream dep on another open epic.
+- **No cross-epic deps.** Single-task scaffolds emit no `epic.depends_on_epics`. Use `/plan:plan` when the new work has a real upstream dep on another open epic.
 {% if current_variant == "queue" %}- **`queue_jump: true` is the only differentiator from `/plan:defer`.** The scaffold YAML, the task spec, the scout, the one-task gate — all identical. The queue-jump signal rides the envelope to keeper, which projects `epics.queue_jump = 1` and stamps a `!`-prefixed `sort_path` for the board.{% else %}- **Defer is the default shape.** `epic.queue_jump` omitted in the YAML defaults to `false`. The epic sorts in normal `epic_number` order — use `/plan:queue` instead when the human wants priority.{% endif %}

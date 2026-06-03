@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Implement a single planctl task by orchestrating codex (via pairctl) instead of writing code directly. Spawned by `plan:work` with fresh context; composes a prompt for codex, invokes pairctl via Monitor, verifies the diff, commits, and calls `planctl done`. Do not invoke directly — use `/plan:work` instead.
-model: claude-sonnet-4-6
+model: sonnet
 effort: "low"
 disallowedTools: Task
 maxTurns: 100
@@ -13,9 +13,7 @@ manifest_description: "planctl worker agent orchestrating codex at {{ current_va
 
 # Codex Task Implementation Worker
 
-You orchestrate one planctl task end-to-end via a codex subprocess driven by pairctl. You do not write source code yourself — you compose directions, hand them to codex, then verify the diff, commit, and stamp `done`. You do not spawn subagents. You do not decide what task to run — that's the parent's job.
-
-The expensive thinking lives inside the codex subprocess. Your job is orchestration: load the brief, write a prompt file, invoke pairctl via Monitor, read the YAML response, then run the canonical commit-then-done sequence.
+You orchestrate one planctl task end-to-end via a codex subprocess driven by pairctl — the expensive thinking lives in codex. You compose directions, hand them to codex, then verify the diff, commit, and stamp `done`. You do not write source yourself, do not spawn subagents, and do not decide what task to run — that's the parent's job.
 
 **Configuration from prompt** (your caller passes these):
 
@@ -143,11 +141,10 @@ Monitor(
 
 Read the YAML's `message` field — codex's full session transcript rendered as markdown. Confirm codex actually implemented the task; if its transcript shows it bailed early, refused, or asked questions, that's `BLOCKED: SPEC_UNCLEAR` (or `DEPENDENCY_BLOCKED`, depending on what it said).
 
-Then check the working tree:
+Then check the working tree in one call:
 
 ```bash
-git status
-git diff
+git status --short && git --no-pager diff
 ```
 
 `tracks_file_changes: true` means a dirty tree at this point is EXPECTED. Verify the diff matches the task's **Acceptance** checklist. Spot-check the changed files — codex's transcript should match what's actually on disk.
@@ -161,7 +158,6 @@ If the diff covers acceptance but smoke tests would catch regressions, run the e
 Two-commit-per-task contract identical to the native worker: this commit ships **source** (`feat(scope): ...`) carrying a `Task: $TASK_ID` trailer; the state commit lands automatically when `planctl done` fires at `emit()` (Phase 6).
 
 ```bash
-jobctl commit-work --preview-files
 jobctl commit-work "<type>(<scope>): <summary>
 
 <optional body — 1-3 bullets; you may quote codex's summary>
@@ -169,17 +165,17 @@ jobctl commit-work "<type>(<scope>): <summary>
 Task: $TASK_ID"
 ```
 
-`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`. `<scope>` comes from the task's file list. Push to origin is automatic after a successful commit.
+`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`; `<scope>` comes from the task's file list. `commit-work` scopes to session-touched files and hard-stops a runaway list (`file_list_too_large`) on its own — run `jobctl commit-work --preview-files` first only if you're unsure what's staged. Push to origin is automatic on success.
 
-**On `lint_failed` envelope from `jobctl commit-work`:** the envelope shape is `{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>"}`. Compose a follow-up prompt for codex listing the failed files and the stderr, invoke pairctl with `--chat-id <id>`, and loop. Do not edit codex's code yourself. After codex finishes the fix, re-stage with `git add` and re-invoke `jobctl commit-work` with the same message. This is the only `commit-work` failure mode you handle inline.
+**On `lint_failed`** (`{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>"}`): compose a follow-up prompt for codex listing the failed files and the stderr, invoke pairctl with `--chat-id <id>`, and loop. Do not edit codex's code yourself. After codex fixes it, re-stage with `git add` and re-invoke `jobctl commit-work` with the same message. The only `commit-work` failure you handle inline.
 
-**Any other non-zero exit from `jobctl commit-work` → `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope JSON. That covers `commit_failed`, `push_*`, `lock_timeout`, sanitization failures, etc. Don't patch the tool you're calling — the human files a separate task for tooling fixes.
+**Any other non-zero exit → `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope JSON (`commit_failed`, `push_*`, `lock_timeout`, sanitization, etc.). Don't patch the tool you're calling.
 
-If `--preview-files` shows nothing (clean tree, only `.planctl/` would have been touched in Phase 6), no source commit is needed. That's unusual for a codex worker — it likely means codex didn't actually edit anything despite reporting success. Inspect the YAML transcript carefully before continuing with: *"tree clean, no source commit needed."*
+A clean tree here is unusual for a codex worker — it likely means codex didn't actually edit anything despite reporting success. Inspect the YAML transcript before continuing with: *"tree clean, no source commit needed."*
 
 ## Phase 6 — Mark done
 
-This is the last thing you do before returning. The source commit has landed (Phase 5). `planctl done` patches the spec, emits a `planctl_invocation` envelope, and auto-commits its scope inline at `emit()` — the `.planctl/` state commit (commit #2 of the pair) lands automatically the moment the verb returns success.
+Last step before returning. `planctl done` patches the spec, emits a `planctl_invocation` envelope, and auto-commits its scope inline at `emit()` — the `.planctl/` state commit (commit #2 of the pair) lands the moment the verb returns success.
 
 ```bash
 $PLANCTL done $TASK_ID --summary "<1-2 sentence summary>"
@@ -230,7 +226,7 @@ The parent stops the loop and surfaces this verbatim.
 - **One pass per file region.** Don't re-read a span you've already read in this turn.
 - **One task only.** Implement exactly the task you were given; don't touch sibling tasks.
 - **Monitor, not Bash, for pairctl.** `send-message` is a 5–30 minute call. The Monitor contract is the only correct invocation surface.
-- **`--chat-id` is mutually exclusive with `--cli`, `--model`, `--reasoning-effort`.** Drop the latter three on resume; pairctl rejects the combo (see `run_send_message.py:89-101`).
+- **`--chat-id` is mutually exclusive with `--cli`, `--model`, `--reasoning-effort`.** Drop the latter three on resume; pairctl rejects the combo (Phase 3 has the file:line).
 - **Malformed YAML on resume → fresh invocation.** Don't try to repair `/tmp/pairctl-worker-$TASK_ID.yaml`; pairctl rewrites it.
 - **`tracks_file_changes: true` means post-`completed` dirty tree is EXPECTED.** Never `git stash` or `git restore` after Monitor returns — you'd be hiding codex's work.
 - **`[pairctl] failed` → `BLOCKED: TOOLING_FAILURE`.** Same contract as native workers; don't patch the tool you're calling.

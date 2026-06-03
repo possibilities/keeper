@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Implement a single planctl task. Spawned by `plan:work` with fresh context; loads the task + epic spec, implements, commits, and calls `planctl done`. Do not invoke directly — use `/plan:work` instead.
-model: claude-opus-4-7
+model: opus
 effort: "{{ current_variant }}"
 disallowedTools: Task
 maxTurns: 100
@@ -88,7 +88,7 @@ If the task spec has `## Investigation targets`:
 
 If the spec has `### Design context` (frontend), open the referenced DESIGN.md once and apply its tokens. If it's missing, proceed without it — design context is advisory.
 
-**Snippet substrate is escape-valve only.** The `## Snippet context` section at the top of your brief (when present) is the planner's curated selection — already rendered, already authoritative. Run `promptctl find-snippets` / `show-snippet` / `render` ONLY if the curated context has a real gap for this specific task — never as a routine extra step. The planner paid the render cost once; don't re-pay it from inside the worker.
+**Snippet substrate is escape-valve only.** Run `promptctl find-snippets` / `show-snippet` / `render` ONLY if the curated `## Snippet context` (see header note) has a real gap for this task — never a routine step.
 
 If the spec has neither block, skip Phase 1.5.
 
@@ -115,12 +115,9 @@ If tests fail on code you just wrote and the fix is small, fix and re-run. If th
 
 ## Phase 4 — Commit
 
-Two-commit-per-task contract: this commit ships **source** (`feat(scope): ...`) carrying a `Task: $TASK_ID` trailer; the state commit lands automatically when `planctl done` fires at `emit()` (Phase 5). `commit-work` runs the full check matrix internally — ruff check + ruff format --check + ty (project-wide when any `.py` is staged) + cli-boundaries (project-wide when any `.py` is staged) + per-extension shellcheck/zig/lua/hadolint per staged file + npm lint per JS/TS package. Workers do not invoke linters separately.
-
-Preview, then commit:
+Two-commit-per-task contract: this commit ships **source** (`feat(scope): ...`) carrying a `Task: $TASK_ID` trailer; the state commit lands automatically when `planctl done` fires at `emit()` (Phase 5). `commit-work` runs the full check matrix internally — ruff check + ruff format --check + ty + cli-boundaries (project-wide when any `.py` is staged) + per-extension shellcheck/zig/lua/hadolint + npm lint per JS/TS package. Never invoke linters separately.
 
 ```bash
-jobctl commit-work --preview-files
 jobctl commit-work "<type>(<scope>): <summary>
 
 <optional body — 1-3 bullets>
@@ -128,17 +125,17 @@ jobctl commit-work "<type>(<scope>): <summary>
 Task: $TASK_ID"
 ```
 
-`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`. `<scope>` comes from the task's file list. Push to origin is automatic after a successful commit.
+`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`; `<scope>` comes from the task's file list. `commit-work` scopes to session-touched files and hard-stops a runaway list (`file_list_too_large`) on its own — run `jobctl commit-work --preview-files` first only if you're unsure what's staged. Push to origin is automatic on success.
 
-**On `lint_failed` envelope from `jobctl commit-work`:** the envelope shape is `{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>"}` (or `"linter": "multiple"` with aggregated stderr when several linters fired). Read the named files, fix the issues per the stderr, re-stage with `git add`, and re-invoke `jobctl commit-work` with the same message. This is the only `commit-work` failure mode you handle inline.
+**On `lint_failed`** (`{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>"}`, or `"linter": "multiple"` with aggregated stderr): read the named files, fix per the stderr, re-stage with `git add`, re-invoke `jobctl commit-work` with the same message. The only `commit-work` failure you handle inline.
 
-**Any other non-zero exit from `jobctl commit-work` → `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope JSON. That covers `commit_failed`, `push_*`, `lock_timeout`, sanitization failures, etc. Don't patch the tool you're calling — the human files a separate task for tooling fixes.
+**Any other non-zero exit → `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope JSON (`commit_failed`, `push_*`, `lock_timeout`, sanitization, etc.). Don't patch the tool you're calling.
 
-If `--preview-files` shows nothing (clean tree, only `.planctl/` would have been touched in Phase 5), no source commit is needed. Continue with: *"tree clean, no source commit needed."*
+If you reach this phase with a clean tree (a predecessor already shipped the source commit — see Phase 1), skip it: *"tree clean, no source commit needed."*
 
 ## Phase 5 — Mark done
 
-This is the last thing you do before returning. Tests have passed (Phase 3) and the source commit has landed (Phase 4). `planctl done` patches the spec, emits a `planctl_invocation` envelope, and auto-commits its scope inline at `emit()` — the `.planctl/` state commit (commit #2 of the pair) lands automatically the moment the verb returns success.
+Last step before returning. `planctl done` patches the spec, emits a `planctl_invocation` envelope, and auto-commits its scope inline at `emit()` — the `.planctl/` state commit (commit #2 of the pair) lands the moment the verb returns success.
 
 ```bash
 $PLANCTL done $TASK_ID --summary "<1-2 sentence summary>"
