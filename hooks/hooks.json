@@ -1,0 +1,27 @@
+{
+  "description": "planctl generated-file guard: PreToolUse(Write|Edit) blocks edits to _promptctl_path-marked files; PostToolUse(Read) warns",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/plugin/hooks/pre-hook.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/plugin/hooks/post-hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}
