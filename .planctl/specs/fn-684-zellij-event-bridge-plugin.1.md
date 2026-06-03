@@ -39,5 +39,5 @@ Factor the PaneManifest+TabInfo -> NDJSON-lines join as a pure Rust fn and unit-
 - [ ] Pure join fn has unit tests
 
 ## Done summary
-
+Created plugin/zellij-bridge crate — keeper's first Rust. Headless zellij plugin (zellij-tile =0.44.3, cdylib, wasm32-wasip1) that subscribes to PaneUpdate + TabUpdate, joins PaneManifest against the position->(tab_id,tab_name) map (skipping is_plugin panes; rename-only TabUpdates re-emit affected panes), and appends one metadata-only NDJSON line per pane to /host/<session>.ndjson (WASI sandbox; /host pinned by dotfiles load_plugins cwd in task .4). Append-only open tolerates #5177 double-load. Pure build_lines() join is unit-tested (9 tests pass: is_plugin skip, rename re-emit, missing-tab-map fall-through, deterministic ordering by (tab_position, pane_id), JSON escapes incl. control chars, path-traversal defang in session name). Built wasm: 796K (pre wasm-opt; that ships in .4). Includes per-crate .gitignore for target/.
 ## Evidence
