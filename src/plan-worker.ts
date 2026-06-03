@@ -58,6 +58,21 @@
  * re-emitted, not spuriously retracted. Each retraction rides the SAME task-2
  * tombstone path (`plan-epic-deleted` / `plan-task-deleted`) as a live delete —
  * no new event types.
+ *
+ * Three-layer ingest (epic fn-681): the authoritative path is the
+ * commit-trigger (`planctl-commit-changed` from git-worker → re-ingest the
+ * committed bytes, drop-proof and free of the mid-write partial-read race),
+ * backed by a periodic reconcile heartbeat ({@link reconcilePlanctlDirs}
+ * on the {@link RECONCILE_HEARTBEAT_MS} cadence — the brand-new-repo
+ * convergence backstop that fires even when git-worker isn't yet watching
+ * the repo and FSEvents dropped its scaffold burst) and the broad
+ * `@parcel/watcher` recursive subscription (the best-effort sub-second
+ * live path, the only path for uncommitted working-tree edits but the
+ * one exposed to FSEvents drops). The drop-recovery `RescanScheduler`
+ * callback is `.planctl`-scoped via {@link reconcilePlanctlDirs} so a
+ * drop on a broad root recovers in O(#projects), not O(`~/code` tree).
+ * All three layers are ADDITIVE re-ingest, idempotent via the change-gate;
+ * deletions stay owned by the commit path + boot sweep + live `onDelete`.
  */
 
 import type { Database } from "bun:sqlite";
@@ -1371,6 +1386,19 @@ export function isPathInHead(path: string): boolean {
 const GIT_CHECK_TIMEOUT_MS = 1000;
 
 /**
+ * Periodic reconcile cadence — mirrors `git-worker.ts` HEARTBEAT_MS so the
+ * two producer workers share one schedule and the steady-state cost is
+ * predictable. 60s is the cheap convergence backstop for the
+ * brand-new-repo case the commit-trigger can't cover (git-worker only
+ * watches a repo's `.git` after an epic row for it exists, so the FIRST
+ * `.planctl` scaffold in a fresh repo has no commit signal — only this
+ * heartbeat + the broad FSEvents subscription stand between it and
+ * "needs a daemon restart"). Exported for unit reach (tests assert on
+ * the constant rather than the timer plumbing).
+ */
+export const RECONCILE_HEARTBEAT_MS = 60_000;
+
+/**
  * Boot scan: recursively walk `root` for `.planctl/{epics,tasks}/*.json` files
  * and run each through the scanner. Called once after each subscribe resolves so
  * files that pre-existed the daemon's boot (or were changed while keeperd was
@@ -1533,6 +1561,93 @@ function scanPlanctlDir(planctlDir: string, scanner: PlanScanner): void {
         scanner.onChange(full);
       }
     }
+  }
+}
+
+/**
+ * Shallow discovery of `<root>/<project>/.planctl` dirs across the configured
+ * roots — the cheap convergence backstop the periodic reconcile and on-drop
+ * recovery share (epic fn-681).
+ *
+ * One level deep ONLY: for each `root`, read its top-level entries and emit
+ * `<root>/<entry>/.planctl` for every directory entry whose name isn't in
+ * {@link PRUNE_DIRS} and whose `.planctl` child is a real directory. Heavy
+ * vendored trees (`node_modules`, `.git`, …) are skipped at the project-name
+ * step, so a broad root like `~/code` stays O(#projects) instead of
+ * O(`~/code` tree). No recursive descent — a project nested deeper than one
+ * level under a configured root is intentionally out of scope (the live
+ * recursive FSEvents watch + boot {@link scanRoot} cover those cases; this
+ * helper exists for the cheap heartbeat / drop-recovery path).
+ *
+ * Symlinked directories are not followed (`Dirent.isDirectory()` is false
+ * for a symlink), so a symlink cycle can't trap the walk. A missing root
+ * skip-and-logs (same discipline as {@link scanRoot}). Pure I/O — no DB
+ * read, no event emission; the change-gate side effect lives downstream in
+ * {@link scanPlanctlDir}. Exported for unit reach.
+ */
+export function discoverPlanctlDirs(roots: readonly string[]): string[] {
+  const dirs: string[] = [];
+  for (const root of roots) {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(root, { withFileTypes: true });
+    } catch (err) {
+      console.error(
+        `[plan-worker] discoverPlanctlDirs failed to read ${root}: ${stringifyErr(err)}`,
+      );
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || PRUNE_DIRS.has(entry.name)) {
+        continue;
+      }
+      const planctl = join(root, entry.name, ".planctl");
+      let st: ReturnType<typeof statSync>;
+      try {
+        st = statSync(planctl);
+      } catch {
+        // No `.planctl` under this project — common case.
+        continue;
+      }
+      if (st.isDirectory()) {
+        dirs.push(planctl);
+      }
+    }
+  }
+  return dirs;
+}
+
+/**
+ * ADDITIVE re-ingest of every `<root>/<project>/.planctl` dir discovered by
+ * {@link discoverPlanctlDirs} via the change-gated {@link scanPlanctlDir}
+ * primitive — the heartbeat backstop and on-drop recovery path (epic
+ * fn-681).
+ *
+ * "Additive" is the load-bearing word: this path NEVER calls
+ * {@link PlanScanner.sweep}, so a transient read failure / mid-rewrite
+ * parse miss / file that hasn't shown up yet can NOT produce a false
+ * tombstone. Deletions stay owned exclusively by (1) the live FSEvents
+ * `onDelete`, (2) the commit-trigger `planctl-commit-changed` arm
+ * (`git rm` is a `committed_mode: 0` zero-oid sentinel), and (3) the
+ * one-shot boot sweep — none of which run on this code path.
+ *
+ * Steady-state cost: one shallow `readdirSync` per root + one `statSync`
+ * per top-level entry + one shallow `readdirSync` per `.planctl/{epics,tasks,
+ * state/tasks}` + one bounded read + parse per planctl file. The
+ * change-gate (`PlanScanner.lastEmitted`) suppresses re-emits for unchanged
+ * files, so a quiescent repo emits nothing across heartbeats.
+ *
+ * Per-dir failures inside {@link scanPlanctlDir} skip-and-log (the same
+ * discipline as the boot scan); the loop never throws. Exported for unit
+ * reach.
+ */
+export function reconcilePlanctlDirs(
+  roots: readonly string[],
+  scanner: PlanScanner,
+): void {
+  const dirs = discoverPlanctlDirs(roots);
+  for (const dir of dirs) {
+    scanPlanctlDir(dir, scanner);
   }
 }
 
@@ -1732,6 +1847,13 @@ function main(): void {
   // its own `root`). Cleared in shutdown BEFORE unsubscribe so a queued re-scan
   // can't touch a closing DB.
   const schedulers: RescanScheduler[] = [];
+  // fn-681 periodic reconcile backstop: a low-frequency heartbeat re-runs
+  // `reconcilePlanctlDirs` across every configured root, so a brand-new
+  // repo's first scaffold converges within one interval even if FSEvents
+  // dropped its burst AND git-worker isn't yet watching it (it only
+  // starts watching a repo's `.git` once an epic row for it exists).
+  // Cancelled in shutdown alongside the drop-recovery schedulers.
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let shuttingDown = false;
 
   const closeDb = (): void => {
@@ -1794,6 +1916,15 @@ function main(): void {
       for (const sched of schedulers.splice(0)) {
         sched.cancel();
       }
+      // fn-681: cancel the periodic-reconcile heartbeat alongside the
+      // drop-recovery schedulers so it can't tick against a closing DB
+      // (mirrors the schedulers' BEFORE-unsubscribe ordering — the scan
+      // re-checks `shuttingDown` belt-and-suspenders, but the clear is
+      // what prevents a leaked timer under `bun test --isolate`).
+      if (heartbeatTimer != null) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
       // Release every subscription (external resources), then the db, then exit
       // clean. Mirrors transcript-worker's teardown but over an array.
       void (async () => {
@@ -1809,6 +1940,24 @@ function main(): void {
       })();
     }
   });
+
+  // fn-681 periodic reconcile backstop. Independent of the @parcel/watcher
+  // subscription (so it still ticks if the addon load is delayed) and of
+  // git-worker's commit signal (so it covers the brand-new-repo case where
+  // no `.git` is yet watched). The scan re-checks `shuttingDown` belt-and-
+  // suspenders; the timer itself is cleared in the shutdown handler above.
+  // Reuses the change-gated {@link reconcilePlanctlDirs} primitive — a
+  // quiescent repo emits nothing across heartbeats.
+  heartbeatTimer = setInterval(() => {
+    if (shuttingDown) return;
+    try {
+      reconcilePlanctlDirs(data.roots, scanner);
+    } catch (err) {
+      console.error(
+        `[plan-worker] periodic reconcile failed: ${stringifyErr(err)}`,
+      );
+    }
+  }, RECONCILE_HEARTBEAT_MS);
 
   // ONE recursive subscribe per root. A missing root is tolerated (skip-and-log,
   // keep watching the others). A per-root subscribe rejection is logged but does
@@ -1851,17 +2000,25 @@ function main(): void {
           continue;
         }
         // Per-root drop-recovery scheduler: a recoverable FSEvents drop schedules
-        // a debounced, single-flight re-scan of THIS root via the change-gated
-        // boot-scan primitive (scanRoot) — never an unsubscribe+re-subscribe (the
-        // subscription stays alive; re-subscribing would open a no-watch gap). The
-        // warm in-memory change-gate (PlanScanner.lastEmitted) suppresses re-emits
-        // for unchanged files, so recovery is idempotent. The scan re-checks
-        // shuttingDown so a queued scan can't touch a closing DB.
+        // a debounced, single-flight re-scan of THIS root's `.planctl` dirs via
+        // the change-gated {@link reconcilePlanctlDirs} primitive — never an
+        // unsubscribe+re-subscribe (the subscription stays alive; re-subscribing
+        // would open a no-watch gap). The warm in-memory change-gate
+        // (PlanScanner.lastEmitted) suppresses re-emits for unchanged files, so
+        // recovery is idempotent. The scan re-checks shuttingDown so a queued
+        // scan can't touch a closing DB.
+        //
+        // fn-681: scoped to `.planctl` dirs (O(#projects)), NOT the full
+        // recursive walk over the whole `~/code` tree the boot scan does.
+        // The commit path (`planctl-commit-changed`) + the boot sweep
+        // continue to handle deletions, so an additive shallow rescan is
+        // sufficient for the live drop-recovery window and dramatically
+        // cheaper than re-walking the entire root.
         const rescan = new RescanScheduler(() => {
           if (shuttingDown) {
             return;
           }
-          scanRoot(root, scanner);
+          reconcilePlanctlDirs([root], scanner);
         });
         schedulers.push(rescan);
         watcher

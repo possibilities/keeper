@@ -31,11 +31,13 @@ import {
   buildTaskMessage,
   classifyPlanPath,
   coerceRuntimeStatus,
+  discoverPlanctlDirs,
   epicNumberFromId,
   isPathInHead,
   isWithinRoots,
   type PlanMessage,
   PlanScanner,
+  reconcilePlanctlDirs,
   repoRootFromPlanctlPath,
   scanRoot,
   seedFromDb,
@@ -1430,6 +1432,246 @@ test("scanRoot: invalid runtime_status in a state file skips the cache prime (ta
   expect(
     (taskMsgs[0] as { id: string; runtimeStatus: string }).runtimeStatus,
   ).toBe("todo");
+});
+
+// ---------------------------------------------------------------------------
+// (a'''') fn-681 shallow `.planctl` discovery + periodic reconcile backstop
+// — the cheap convergence layer that catches a brand-new repo's first
+// scaffold (git-worker isn't watching the repo's `.git` yet, so the commit
+// path can't fire) and the drop-recovery rescan (now O(#projects), not the
+// whole `~/code` tree). All paths are ADDITIVE — they NEVER tombstone an
+// epic, so a transient read failure can't produce a false retraction.
+// ---------------------------------------------------------------------------
+
+test("discoverPlanctlDirs: finds <root>/<project>/.planctl exactly one level deep", () => {
+  // Real layout the heartbeat needs to cover: each project sits as a top-
+  // level dir under the watched root, with its `.planctl` immediately
+  // inside. A bare root with no project dirs returns [].
+  const projA = join(tmpDir, "proja");
+  const projB = join(tmpDir, "projb");
+  mkdirSync(join(projA, ".planctl", "epics"), { recursive: true });
+  mkdirSync(join(projB, ".planctl", "tasks"), { recursive: true });
+  // A project WITHOUT `.planctl` is silently skipped (the common case for
+  // unrelated repos under a broad root like `~/code`).
+  mkdirSync(join(tmpDir, "projc"), { recursive: true });
+
+  const dirs = discoverPlanctlDirs([tmpDir]);
+  expect(dirs.sort()).toEqual(
+    [join(projA, ".planctl"), join(projB, ".planctl")].sort(),
+  );
+});
+
+test("discoverPlanctlDirs: prunes node_modules/.git (no descent through heavy vendored trees)", () => {
+  // A stray `.planctl` buried inside `node_modules/<pkg>/` MUST NOT be
+  // discovered — the prune set is what keeps the shallow walk cheap. A
+  // sibling `.git` dir is excluded for the same reason.
+  for (const heavy of ["node_modules", ".git", "dist", "target"]) {
+    const dir = join(tmpDir, heavy, "pkg", ".planctl", "epics");
+    mkdirSync(dir, { recursive: true });
+  }
+  // A real project alongside them IS found.
+  mkdirSync(join(tmpDir, "real", ".planctl"), { recursive: true });
+
+  const dirs = discoverPlanctlDirs([tmpDir]);
+  expect(dirs).toEqual([join(tmpDir, "real", ".planctl")]);
+});
+
+test("discoverPlanctlDirs: a missing root skip-and-logs and yields no entries", () => {
+  // Missing roots must not throw — the shallow walk mirrors `scanRoot`'s
+  // skip-and-log discipline. (Stderr is captured in production via the
+  // module log; here we just assert the call doesn't throw and returns
+  // entries only for the real root.)
+  mkdirSync(join(tmpDir, "real", ".planctl"), { recursive: true });
+  const ghost = join(tmpDir, "does-not-exist");
+
+  const dirs = discoverPlanctlDirs([ghost, tmpDir]);
+  expect(dirs).toEqual([join(tmpDir, "real", ".planctl")]);
+});
+
+test("discoverPlanctlDirs: does NOT recurse — a project nested 2 levels deep is out of scope", () => {
+  // The shallow walk is exactly one level. A `.planctl` under
+  // `<root>/group/<project>/.planctl` is intentionally NOT discovered —
+  // the recursive boot scan and the live FSEvents watch cover that case;
+  // the heartbeat backstop trades coverage of unusual nesting for
+  // predictable O(#projects) cost.
+  mkdirSync(join(tmpDir, "group", "nested", ".planctl"), { recursive: true });
+  mkdirSync(join(tmpDir, "flat", ".planctl"), { recursive: true });
+
+  const dirs = discoverPlanctlDirs([tmpDir]);
+  expect(dirs).toEqual([join(tmpDir, "flat", ".planctl")]);
+});
+
+test("reconcilePlanctlDirs: a new-repo first scaffold converges on one call (no FSEvents, no DB row)", () => {
+  // The exact bug fn-681 fixes: a fresh repo's first `planctl scaffold` is
+  // dropped by FSEvents AND git-worker isn't yet watching the repo's
+  // `.git` (no epic row drives `discoverProjectRoots`). The periodic
+  // reconcile must converge it from disk alone, on a single tick.
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  // Layout: <root>/freshrepo/.planctl/epics/<id>.json — what `planctl
+  // scaffold` writes on first use.
+  const proj = join(tmpDir, "freshrepo");
+  mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
+  mkdirSync(join(proj, ".planctl", "tasks"), { recursive: true });
+  writeFileSync(
+    join(proj, ".planctl", "epics", "fn-99-fresh.json"),
+    JSON.stringify({ id: "fn-99-fresh", title: "Fresh", status: "open" }),
+  );
+  writeFileSync(
+    join(proj, ".planctl", "tasks", "fn-99-fresh.1.json"),
+    JSON.stringify({ id: "fn-99-fresh.1", epic: "fn-99-fresh", title: "T" }),
+  );
+
+  reconcilePlanctlDirs([tmpDir], scanner);
+  expect(emitted.map((m) => m.id).sort()).toEqual([
+    "fn-99-fresh",
+    "fn-99-fresh.1",
+  ]);
+});
+
+test("reconcilePlanctlDirs: an in-sync reconcile emits nothing (change-gate)", () => {
+  // The steady-state cost: after one converged ingest, every subsequent
+  // reconcile over unchanged bytes is a stat/read/parse + change-gate
+  // suppress. Zero re-emits.
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  const proj = join(tmpDir, "p");
+  mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
+  writeFileSync(
+    join(proj, ".planctl", "epics", "fn-1-x.json"),
+    JSON.stringify({ id: "fn-1-x", title: "X", status: "open" }),
+  );
+
+  reconcilePlanctlDirs([tmpDir], scanner);
+  expect(emitted.length).toBe(1);
+
+  // Second reconcile over the same warm scanner: zero deltas.
+  reconcilePlanctlDirs([tmpDir], scanner);
+  expect(emitted.length).toBe(1);
+
+  // A real change DOES emit on the next reconcile (the change-gate is the
+  // gate, not a one-shot mute).
+  writeFileSync(
+    join(proj, ".planctl", "epics", "fn-1-x.json"),
+    JSON.stringify({ id: "fn-1-x", title: "X", status: "done" }),
+  );
+  reconcilePlanctlDirs([tmpDir], scanner);
+  expect(emitted.length).toBe(2);
+});
+
+test("reconcilePlanctlDirs: ADDITIVE — does NOT retract existing epics (no false tombstones)", () => {
+  // The load-bearing safety property: the periodic reconcile must NEVER
+  // emit a `plan-epic-deleted` or `plan-task-deleted`. Deletions stay
+  // owned exclusively by the commit path (`planctl-commit-changed`,
+  // `git rm` → zero-oid sentinel), the live `onDelete` FSEvents arm, and
+  // the one-shot boot {@link PlanScanner.sweep}. A reconcile run with the
+  // file still present (or temporarily missing) must not produce a
+  // tombstone message.
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  const proj = join(tmpDir, "p");
+  mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
+  writeFileSync(
+    join(proj, ".planctl", "epics", "fn-1-x.json"),
+    JSON.stringify({ id: "fn-1-x", title: "X", status: "open" }),
+  );
+
+  reconcilePlanctlDirs([tmpDir], scanner);
+  expect(emitted.length).toBe(1);
+  expect(emitted[0]?.kind).toBe("plan-epic");
+
+  // Delete the file on disk, then reconcile: the periodic path does NOT
+  // run a sweep, so no tombstone fires. (A real deletion is caught by
+  // the commit channel or live FSEvents.)
+  unlinkSync(join(proj, ".planctl", "epics", "fn-1-x.json"));
+  reconcilePlanctlDirs([tmpDir], scanner);
+  // Still 1 emit — no `plan-epic-deleted` message added.
+  expect(emitted.length).toBe(1);
+  expect(emitted.every((m) => m.kind !== "plan-epic-deleted")).toBe(true);
+});
+
+test("reconcilePlanctlDirs: on-drop callback is `.planctl`-scoped (visits only project `.planctl`s, NOT the whole root tree)", () => {
+  // The on-drop {@link RescanScheduler} callback was repointed from
+  // `scanRoot(root, scanner)` (whole-tree walk) to
+  // `reconcilePlanctlDirs([root], scanner)` (`.planctl` dirs only).
+  // Confirm the semantic difference: a heavy non-planctl subtree under
+  // the root must NOT be visited by the reconcile path. The proof: an
+  // epic NOT under any `.planctl/epics/` is invisible to the reconcile,
+  // while the same epic in a real `.planctl` IS picked up. This is the
+  // O(#projects) vs O(`~/code` tree) cost difference.
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  // A real planctl-bearing project (the reconcile target).
+  const proj = join(tmpDir, "real");
+  mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
+  writeFileSync(
+    join(proj, ".planctl", "epics", "fn-1-real.json"),
+    JSON.stringify({ id: "fn-1-real", title: "Real", status: "open" }),
+  );
+
+  // A stray `.planctl`-look-alike nested deeper than one level — the
+  // recursive {@link scanRoot} would discover this; the shallow
+  // reconcile does NOT.
+  const nested = join(tmpDir, "group", "nested-proj");
+  mkdirSync(join(nested, ".planctl", "epics"), { recursive: true });
+  writeFileSync(
+    join(nested, ".planctl", "epics", "fn-2-nested.json"),
+    JSON.stringify({ id: "fn-2-nested", title: "Nested", status: "open" }),
+  );
+
+  reconcilePlanctlDirs([tmpDir], scanner);
+  // Only the top-level project's epic was reached — the nested one is
+  // out of scope for the on-drop path (covered by live FSEvents and the
+  // boot scan).
+  expect(emitted.map((m) => m.id)).toEqual(["fn-1-real"]);
+});
+
+test("reconcilePlanctlDirs: covers multiple roots in one call", () => {
+  // The heartbeat passes the worker's entire `data.roots` array — a multi-
+  // root deployment must reconcile each independently. A failure to read
+  // one root is independent of the others.
+  const rootA = mkdtempSync(join(tmpdir(), "keeper-plan-rootA-"));
+  const rootB = mkdtempSync(join(tmpdir(), "keeper-plan-rootB-"));
+  try {
+    mkdirSync(join(rootA, "p", ".planctl", "epics"), { recursive: true });
+    mkdirSync(join(rootB, "q", ".planctl", "epics"), { recursive: true });
+    writeFileSync(
+      join(rootA, "p", ".planctl", "epics", "fn-1-a.json"),
+      JSON.stringify({ id: "fn-1-a", title: "A", status: "open" }),
+    );
+    writeFileSync(
+      join(rootB, "q", ".planctl", "epics", "fn-1-b.json"),
+      JSON.stringify({ id: "fn-1-b", title: "B", status: "open" }),
+    );
+
+    const emitted: PlanMessage[] = [];
+    const scanner = new PlanScanner(
+      (m) => emitted.push(m),
+      () => {},
+    );
+
+    reconcilePlanctlDirs([rootA, rootB], scanner);
+    expect(emitted.map((m) => m.id).sort()).toEqual(["fn-1-a", "fn-1-b"]);
+  } finally {
+    rmSync(rootA, { recursive: true, force: true });
+    rmSync(rootB, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
