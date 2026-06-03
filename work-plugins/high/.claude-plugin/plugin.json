@@ -1,8 +1,0 @@
-{
-  "name": "work",
-  "description": "planctl worker agent at claude opus high effort — loaded conditionally by arthack-claude routing for /plan:work",
-  "version": "1.0.0",
-  "author": {
-    "name": "ArtHack"
-  }
-}
