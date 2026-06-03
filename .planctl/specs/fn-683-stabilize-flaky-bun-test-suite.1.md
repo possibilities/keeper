@@ -46,5 +46,5 @@ repeated runs.
 - [ ] jobctl commit-work --session-id ce3a8c4c-3295-43c8-9c96-f32915dc1b8e gate passes (no new lint/type failures)
 
 ## Done summary
-
+Reaped leaked victim-launcher subprocesses via afterEach registry + process-group kill, and replaced the busy-spin park with a 24.8d setTimeout so idle launchers no longer peg CPU. 5x consecutive victim-test runs leave pgrep -f victim-launcher.ts empty.
 ## Evidence
