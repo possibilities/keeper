@@ -3,10 +3,11 @@
   "bundles": [],
   "created_at": "2026-06-03T01:34:53.535434Z",
   "depends_on_epics": [
-    "fn-635-extract-planctl-into-standalone-repo"
+    "fn-635-extract-planctl-into-standalone-repo",
+    "fn-684-zellij-event-bridge-plugin"
   ],
   "id": "fn-686-permission-and-elicitation-awaiting-pill",
-  "last_validated_at": "2026-06-03T01:35:13.188236Z",
+  "last_validated_at": "2026-06-03T01:36:12.728021Z",
   "plan_review_status": "unknown",
   "plan_reviewed_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -17,5 +18,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T01:35:13.153283Z"
+  "updated_at": "2026-06-03T01:36:12.691834Z"
 }
