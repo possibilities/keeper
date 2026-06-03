@@ -176,6 +176,17 @@ from pathlib import Path
 # reads neither column (attribution surface only — the pill renders out
 # of the ``keeper board`` viewer's projection read), so the bump is
 # whitelist-only with no reader logic change.
+#
+# v53 (fn-688 epic, T1) is a whitelist-only bump: adds the new
+# ``epic_tombstones`` projection table that guards every epic-shell-
+# INSERT site against the deleted-epic resurrection bug (a later
+# job-side fold whose ``plan_ref`` still points at the now-gone epic
+# re-shells the row with NULL scalars, rendering as a headerless
+# "ghost" block at the top of ``keeper board``). keeper-py reads
+# neither ``epic_tombstones`` nor any of the guarded shell-INSERT
+# code paths (attribution surface only — the board renderer is the
+# only consumer affected by the ghost-row fix), so the bump is
+# whitelist-only with no reader logic change.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -200,6 +211,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         50,
         51,
         52,
+        53,
     }
 )
 

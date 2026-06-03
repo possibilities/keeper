@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 52;
+export const SCHEMA_VERSION = 53;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1287,6 +1287,80 @@ CREATE TABLE IF NOT EXISTS pending_dispatches (
 `;
 
 /**
+ * Schema-v53 `epic_tombstones` projection table (fn-688) — a permanent
+ * "this epic was deleted" record minted by the reducer's `EpicDeleted`
+ * arm and cleared by a re-creating `EpicSnapshot`. Without it, a
+ * deleted epic resurrects as a headerless scalar-NULL "ghost" row on
+ * `keeper board` whenever a later job-side fold (a terminal
+ * `approve`/`SessionEnd` whose `plan_ref` still points at the now-gone
+ * epic) lands and `syncJobIntoEpic` finds `epicRow == null` — its
+ * shell-INSERT recreates the row with `epic_number` / `title` /
+ * `project_dir` / `status` all NULL. The board renders that as a
+ * decapitated block at the top of the screen.
+ *
+ * The fix: every epic-shell-INSERT site (`projectPlanRow` TaskSnapshot
+ * arm, both `syncJobIntoEpic` arms, `syncPlanctlLinks`) consults this
+ * table before its INSERT — skip the resurrection when the epic id has
+ * an active tombstone. The full-scalar `EpicSnapshot` INSERT is NOT a
+ * shell site: it is the CLEAR site (a legitimate re-create of the same
+ * id removes its tombstone). The legitimate before-arrival shell for
+ * never-deleted epics is preserved (no tombstone present → INSERT
+ * proceeds).
+ *
+ * Field semantics:
+ * - `epic_id` (TEXT, PK): the planctl epic id (`fn-N-slug`) whose
+ *   delete is being remembered. Mirrors `epics.epic_id`.
+ * - `deleted_at_event_id` (INTEGER, NOT NULL): the `events.id` of the
+ *   `EpicDeleted` event that minted this row. Event-id, NOT wallclock —
+ *   re-fold determinism requires that a from-scratch replay reproduces
+ *   the same value byte-identically (CLAUDE.md "every projection-
+ *   driving fact lives in the immutable event log").
+ *
+ * Mint discipline: `INSERT ... ON CONFLICT(epic_id) DO NOTHING`
+ * (idempotent on a double-delete; preserves the FIRST observed delete's
+ * event id, matching `foldDispatchFailed`'s "first observation"
+ * semantic). Minted UNCONDITIONALLY in the `EpicDeleted` arm —
+ * independent of whether a prior `epics` row existed — so a
+ * delete-before-snapshot or a snapshot-then-delete both produce the
+ * same projection state.
+ *
+ * Clear discipline: `DELETE FROM epic_tombstones WHERE epic_id = ?`
+ * in the `EpicSnapshot` arm, OUTSIDE the ON-CONFLICT scalar carve-out
+ * (so a re-fold reproduces it byte-deterministically — the clear is
+ * not conditional on a scalar change). A re-creating EpicSnapshot is
+ * the only signal that the deletion has been reverted (the planctl
+ * file is back); the same arm's existing UPSERT then lands the fresh
+ * row, and subsequent shell-INSERT sites see an absent tombstone +
+ * proceed normally.
+ *
+ * The table IS a reducer projection. A from-scratch cursor=0 re-fold
+ * rebuilds it byte-identically from the `EpicDeleted` / `EpicSnapshot`
+ * events in the log — so it MUST be included in any future rewind-
+ * and-redrain DELETE list (the v52→v53 slot in `migrate()` adds it
+ * alongside `jobs` / `epics` / `subagent_invocations` for the same
+ * SCHEMA_VERSION-bump rewind that the daemon's boot drain auto-fires
+ * — see `src/daemon.ts:350`, which is the mechanism that auto-evicts
+ * the existing ghost without a manual DELETE into the projection).
+ *
+ * Defaults match the zero-event projection: a fresh DB with zero
+ * events has zero rows here; the table populates organically from
+ * the reducer's `EpicDeleted` fold arm.
+ *
+ * **No GC.** Never garbage-collect a tombstone while the append-only
+ * event log can still replay events referencing that id — a re-fold
+ * with the tombstone gone would replay the resurrection. The table
+ * grows append-only with the count of distinct deleted epics, which
+ * is bounded by the human's planning cadence (~hundreds over a
+ * project lifetime, not the per-event tier).
+ */
+const CREATE_EPIC_TOMBSTONES = `
+CREATE TABLE IF NOT EXISTS epic_tombstones (
+    epic_id TEXT PRIMARY KEY,
+    deleted_at_event_id INTEGER NOT NULL
+)
+`;
+
+/**
  * Schema-v47 `autopilot_state` projection table (fn-667) — a SINGLETON row
  * (`id INTEGER PRIMARY KEY CHECK (id = 1)`) carrying the autopilot worker's
  * paused/playing flag as durable, viewer-readable state. Before v47 the flag
@@ -2095,6 +2169,7 @@ function migrate(db: Database): void {
     db.run(CREATE_DISPATCH_FAILURES);
     db.run(CREATE_AUTOPILOT_STATE);
     db.run(CREATE_PENDING_DISPATCHES);
+    db.run(CREATE_EPIC_TOMBSTONES);
 
     // Seed singleton cursor on first boot. Subsequent boots are no-ops.
     db.run(
@@ -5179,6 +5254,64 @@ function migrate(db: Database): void {
     // surfaces only through the board renderer), but the bump is
     // required so `jobctl commit-work` on this host doesn't fail-loud
     // (test/schema-version.test.ts enforces).
+
+    // v52→v53: fn-688 — `epic_tombstones` projection table guards every
+    // epic-shell-INSERT site against the deleted-epic resurrection bug
+    // (a later job-side fold whose `plan_ref` still points at the now-
+    // gone epic re-shells the row with NULL scalars, rendering as a
+    // headerless "ghost" block at the top of `keeper board`). The
+    // `EpicDeleted` arm mints a tombstone keyed by `epic_id`; the
+    // `EpicSnapshot` arm clears it on a re-create; every
+    // `epicRow == null` shell-INSERT site (`projectPlanRow`
+    // TaskSnapshot arm, both `syncJobIntoEpic` arms, `syncPlanctlLinks`)
+    // consults the table via a shared
+    // `insertEpicShellIfNotTombstoned` helper and skips the INSERT
+    // when a tombstone is present. The full-scalar EpicSnapshot INSERT
+    // is NOT a shell site — it is the clear site (a legitimate
+    // re-create reverts the deletion).
+    //
+    // Rewind-and-redrain: cursor=0 + DELETE projections + redrain so
+    // every existing `epics` ghost row sourced from a pre-fn-688
+    // resurrection is rebuilt from the immutable event log with the
+    // tombstone guard ENGAGED, evicting the ghost without any manual
+    // DELETE into the projection. `epic_tombstones` joins the
+    // projection-wipe list (jobs / epics / subagent_invocations) so a
+    // pre-existing rewind from v52 cannot strand a stale tombstone.
+    // Pure projection (`deleted_at_event_id = event.id`, no
+    // wallclock / env / fs reads); a from-scratch re-fold reproduces
+    // both `epics` and `epic_tombstones` byte-identically.
+    //
+    // Mirrors the v17→v18 / v18→v19 / v23→v24 / v24→v25 / v51→v52
+    // rewind-and-redrain pattern. Version-guarded on
+    // `storedVersionV53 < 53` so a steady-state v53+ re-open skips
+    // the rewind. The boot drain after `migrate()` returns rebuilds
+    // every projection from the event log.
+    //
+    // No new addColumnIfMissing on `events` / `jobs` / `epics` —
+    // `epic_tombstones` is a brand-new empty table (CREATE TABLE
+    // above), populated entirely from the immediately-following
+    // re-fold over the existing log.
+    const storedVersionV53 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV53 < 53) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM subagent_invocations");
+      db.run("DELETE FROM epic_tombstones");
+    }
+    //
+    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
+    // adds 53 in the same change — whitelist-only (keeper-py reads
+    // neither `epic_tombstones` nor any guarded shell-INSERT site; the
+    // board renderer is the only consumer affected by the ghost-row
+    // fix), but the bump is required so `jobctl commit-work` on this
+    // host doesn't fail-loud (test/schema-version.test.ts enforces).
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -109,7 +109,7 @@
  * and flows only through the title rule.
  */
 
-import type { Database } from "bun:sqlite";
+import type { Database, SQLQueryBindings } from "bun:sqlite";
 import {
   extractBackgroundTasks,
   extractCommit,
@@ -678,6 +678,78 @@ function extractPlanSnapshot(event: Event): PlanSnapshot | null {
 /** Zero-pad an integer to width 6 for schema-v29 `sort_path` keys. */
 const zeroPad6 = (n: number): string => String(n).padStart(6, "0");
 
+/**
+ * Schema v53 (fn-688) — predicate: is `epicId` an actively-tombstoned epic?
+ *
+ * Read against the `epic_tombstones` projection inside the open `BEGIN
+ * IMMEDIATE` transaction (a read off the same writable connection — every
+ * shell-INSERT site invoking this is already inside the fold's
+ * transaction via `applyEvent`). Returns `true` when an `EpicDeleted`
+ * has been folded for this id WITHOUT a subsequent `EpicSnapshot`
+ * clearing it; `false` for never-deleted or already-revived epics.
+ *
+ * Centralized so every shell-INSERT site uses the same gate — no
+ * silently-divergent open-coded shape, no risk of a new shell site
+ * skipping the check.
+ */
+function isEpicTombstoned(db: Database, epicId: string): boolean {
+  const row = db
+    .query("SELECT 1 AS hit FROM epic_tombstones WHERE epic_id = ?")
+    .get(epicId) as { hit: number } | null;
+  return row != null;
+}
+
+/**
+ * Schema v53 (fn-688) — shared epic-shell-INSERT helper. Routes ALL four
+ * shell-INSERT sites (`projectPlanRow` TaskSnapshot arm, both
+ * `syncJobIntoEpic` arms, `syncPlanctlLinks`) through one tombstone-
+ * checking choke-point.
+ *
+ * The full-scalar `EpicSnapshot` INSERT is NOT a shell site and does
+ * NOT call this helper — it is the CLEAR site (its arm deletes the
+ * tombstone unconditionally, then upserts the row scalars from the
+ * snapshot blob).
+ *
+ * Each shell site supplies its own SQL (the column lists differ across
+ * sites — `projectPlanRow` writes `tasks`; `syncJobIntoEpic` writes
+ * `jobs` or `tasks` + `jobs`; `syncPlanctlLinks` writes `job_links` +
+ * the schema-v29/v30 closer columns). The helper's only job is the
+ * tombstone gate: when an `EpicDeleted` has been folded for this id
+ * without a subsequent `EpicSnapshot` clearing it, the shell-INSERT
+ * is suppressed and a `console.error` notes the suppression for
+ * operator audit. The legitimate before-arrival shell for never-
+ * deleted epics still lands (tombstone absent → INSERT proceeds).
+ *
+ * Runs INSIDE the open `BEGIN IMMEDIATE` transaction (the caller is
+ * inside a reducer fold). Never throws — a SQL error inside the run
+ * propagates the same way every other `db.run` in the reducer would,
+ * and the tombstone gate is a pure read so it cannot fail in a way
+ * the unguarded path wouldn't.
+ *
+ * The `sql` parameter and `params` array are passed verbatim to
+ * `db.run` — slot the helper at the exact `INSERT INTO epics ...`
+ * statement each caller would otherwise have called inline.
+ */
+function insertEpicShellIfNotTombstoned(
+  db: Database,
+  epicId: string,
+  sql: string,
+  params: SQLQueryBindings[],
+): void {
+  if (isEpicTombstoned(db, epicId)) {
+    // The deleted-epic resurrection path the v53 tombstone guard
+    // closes (fn-688). A pre-fn-688 build would have shell-INSERTed
+    // here and surfaced as a headerless ghost row on `keeper board`;
+    // we skip and note. Cursor still advances upstream — never throw
+    // inside the fold.
+    console.error(
+      `keeper reducer: shell-INSERT for epic ${epicId} suppressed (epic is tombstoned — would resurrect as scalar-NULL ghost row)`,
+    );
+    return;
+  }
+  db.run(sql, params);
+}
+
 function projectPlanRow(db: Database, event: Event): void {
   const snapshot = extractPlanSnapshot(event);
   if (snapshot == null) {
@@ -687,6 +759,25 @@ function projectPlanRow(db: Database, event: Event): void {
   const entityId = event.session_id;
 
   if (event.hook_event === "EpicSnapshot") {
+    // Schema v53 (fn-688): CLEAR the tombstone for this epic_id BEFORE
+    // the upsert lands. A re-creating EpicSnapshot is the signal that
+    // the deletion has been reverted (the planctl file is back); the
+    // upsert below then lands the fresh row, and subsequent shell-
+    // INSERT sites (`projectPlanRow` TaskSnapshot arm, both
+    // `syncJobIntoEpic` arms, `syncPlanctlLinks`, all routed through
+    // `insertEpicShellIfNotTombstoned`) see an absent tombstone +
+    // proceed normally. The clear runs UNCONDITIONALLY (not gated on
+    // the ON-CONFLICT scalar-change carve-out below) — it MUST be a
+    // pure function of `event.hook_event === "EpicSnapshot"` so that
+    // a cursor=0 re-fold produces byte-identical `epic_tombstones`
+    // rows (CLAUDE.md "re-fold determinism"). Placing it INSIDE the
+    // carve-out would mean an unchanged-scalars re-emit would NOT
+    // clear the tombstone, breaking re-fold determinism on the
+    // delete→recreate interleaving. Idempotent: the DELETE is a no-op
+    // when no tombstone exists (every never-deleted epic's snapshot
+    // takes this path harmlessly).
+    db.run("DELETE FROM epic_tombstones WHERE epic_id = ?", [entityId]);
+
     // The ON CONFLICT update lists ONLY scalar columns and NEVER `tasks` /
     // `jobs` / `job_links` / `created_by_closer_of` / `sort_path` /
     // `queue_jump` / `resolved_epic_deps`: an epic snapshot carries no
@@ -981,7 +1072,15 @@ function projectPlanRow(db: Database, event: Event): void {
       // No epic row yet — insert a SHELL (epic_id set, scalar columns NULL,
       // the array carrying this one task). A later EpicSnapshot fills the
       // scalars without clobbering `tasks` (its ON CONFLICT omits the column).
-      db.run(
+      // Schema v53 (fn-688): routed through the shared tombstone-checking
+      // helper — a deleted epic's `EpicDeleted` mints a tombstone row,
+      // so a TaskSnapshot whose `epic_id` matches the dead epic
+      // suppresses this shell rather than resurrecting it as a NULL-
+      // scalar ghost. The legitimate task-before-epic shell for a
+      // never-deleted epic still lands (no tombstone present).
+      insertEpicShellIfNotTombstoned(
+        db,
+        epicId,
         `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
            VALUES (?, NULL, NULL, NULL, NULL, ?, ?, ?)`,
         [epicId, event.id, ts, tasksJson],
@@ -1033,6 +1132,27 @@ function retractPlanRow(db: Database, event: Event): void {
     // same retracted state. Idempotent: zero matches on a never-existed
     // / already-retracted edge.
     db.run("DELETE FROM epic_dep_edges WHERE consumer_id = ?", [entityId]);
+    // Schema v53 (fn-688): MINT a tombstone for this epic_id so every
+    // subsequent epic-shell-INSERT site (the four routed through
+    // `insertEpicShellIfNotTombstoned`) skips the resurrection. This
+    // is the entire ghost-row fix in three lines: without the mint, a
+    // later job-side fold (a terminal `approve`/`SessionEnd` whose
+    // `plan_ref` still points at the now-gone epic) would find
+    // `epicRow == null` and shell-INSERT the row back with NULL
+    // scalars — rendering as a decapitated block at the top of
+    // `keeper board`. Mint UNCONDITIONALLY (independent of whether
+    // `pre` was null — a delete-before-snapshot or double-delete still
+    // produces a tombstone). `ON CONFLICT(epic_id) DO NOTHING`
+    // preserves the FIRST observed delete's event id, matching
+    // `foldDispatchFailed`'s "first observation" semantic. The mint
+    // rides the SAME `BEGIN IMMEDIATE` as the DELETE + cursor bump —
+    // a crash mid-fold rolls back ALL three writes (CLAUDE.md
+    // "cursor + projection advance in the same transaction").
+    // `event.id`, NEVER `Date.now()` — re-fold determinism.
+    db.run(
+      "INSERT INTO epic_tombstones (epic_id, deleted_at_event_id) VALUES (?, ?) ON CONFLICT(epic_id) DO NOTHING",
+      [entityId, event.id],
+    );
     // Reverse fan-out — re-stamp every downstream consumer whose
     // `depends_on_epics` carried this epic's full id or bare id. The
     // resolver re-runs against the post-DELETE `epics` table: a
@@ -4312,7 +4432,15 @@ function syncJobIntoEpic(
       // entry. A later EpicSnapshot fills the scalars without clobbering
       // `jobs` (its ON CONFLICT omits the column). Mirror the
       // shell-row INSERT pattern from `projectPlanRow`.
-      db.run(
+      // Schema v53 (fn-688): routed through the shared tombstone-checking
+      // helper — this is the canonical "job-before-epic" vector for the
+      // ghost-row bug (a terminal `approve`/`SessionEnd` whose
+      // `plan_ref` still names the deleted epic). Suppressed when the
+      // epic is tombstoned; never-deleted epics still get their legit
+      // before-arrival shell.
+      insertEpicShellIfNotTombstoned(
+        db,
+        parsed.epic_id,
         `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, jobs)
            VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', ?)`,
         [parsed.epic_id, eventId, ts, jobsJson],
@@ -4444,7 +4572,13 @@ function syncJobIntoEpic(
     // A later EpicSnapshot fills the epic scalars; a later TaskSnapshot
     // fills the task element's scalars (and preserves its `jobs` via the
     // OLD-element-`jobs` RMW step).
-    db.run(
+    // Schema v53 (fn-688): routed through the shared tombstone-checking
+    // helper — symmetric to the epic-kind shell-INSERT above. A
+    // tombstoned epic suppresses the shell, never-deleted epics still
+    // get their legit before-arrival shell + task element.
+    insertEpicShellIfNotTombstoned(
+      db,
+      parsed.epic_id,
       `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, jobs)
          VALUES (?, NULL, NULL, NULL, NULL, ?, ?, ?, '[]')`,
       [parsed.epic_id, eventId, ts, tasksJson],
@@ -5391,7 +5525,14 @@ function syncPlanctlLinks(
       // `epic_number`; the `queue_jump` value is locked-in true on
       // first observation since the scan reads it from the immutable
       // event log).
-      db.run(
+      // Schema v53 (fn-688): routed through the shared tombstone-checking
+      // helper — the fourth and final epic-shell-INSERT vector. A
+      // planctl-event-before-epic shell for a deleted epic is
+      // suppressed; never-deleted epics still get their job_links +
+      // closer-link projections initialised on first sight.
+      insertEpicShellIfNotTombstoned(
+        db,
+        epicId,
         `INSERT INTO epics (
            epic_id, epic_number, title, project_dir, status,
            last_event_id, updated_at, tasks, jobs, job_links,

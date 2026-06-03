@@ -7972,8 +7972,15 @@ test("from-scratch re-fold reproduces the spliced state across a create→delete
     title: "Two",
   });
   taskDeletedEvent("fn-1.1", "fn-1");
-  // An EpicDeleted followed by a later TaskSnapshot legitimately re-creates a
-  // shell (the task still exists on disk) — replayed in id order it lands last.
+  // Schema v53 (fn-688): an EpicDeleted followed by a later TaskSnapshot
+  // for the same epic_id is the deleted-epic resurrection vector this
+  // change closes. The TaskSnapshot's shell-INSERT is now SUPPRESSED
+  // by the `epic_tombstones` guard — a deleted epic stays deleted, even
+  // when a later snapshot for one of its tasks lands (the task can't
+  // place against a missing parent; it folds to a no-op). Pre-fn-688
+  // this would have re-shelled `fn-3` as a NULL-scalar ghost row at
+  // the top of `keeper board`; the assertion below proves the ghost
+  // is gone.
   epicSnapshotEvent("fn-3", { epic_number: 3, title: "Gone", status: "open" });
   epicDeletedEvent("fn-3");
   taskSnapshotEvent("fn-3.1", {
@@ -7984,16 +7991,312 @@ test("from-scratch re-fold reproduces the spliced state across a create→delete
   drainAll();
 
   const epicsBefore = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const tombstonesBefore = db
+    .query("SELECT * FROM epic_tombstones ORDER BY epic_id")
+    .all();
   expect(getTasks("fn-1").map((t) => t.task_id)).toEqual(["fn-1.2"]);
-  // fn-3 was deleted then a later task re-created it as a shell.
-  expect(getTasks("fn-3").map((t) => t.task_id)).toEqual(["fn-3.1"]);
+  // Schema v53 (fn-688): fn-3 is tombstoned; the later TaskSnapshot's
+  // shell-INSERT is suppressed. The ghost row is gone.
+  expect(getEpic("fn-3")).toBeNull();
 
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
+  db.run("DELETE FROM epic_tombstones");
   drainAll();
 
   const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const tombstonesAfter = db
+    .query("SELECT * FROM epic_tombstones ORDER BY epic_id")
+    .all();
   expect(epicsAfter).toEqual(epicsBefore);
+  expect(tombstonesAfter).toEqual(tombstonesBefore);
+});
+
+// ---------------------------------------------------------------------------
+// Schema v53 (fn-688): epic_tombstones — deleted-epic resurrection guard
+// ---------------------------------------------------------------------------
+
+test("fn-688: EpicDeleted mints an epic_tombstones row carrying the delete event id", () => {
+  epicSnapshotEvent("fn-1", { epic_number: 1, title: "E", status: "open" });
+  drainAll();
+  expect(getEpic("fn-1")).not.toBeNull();
+  const delId = epicDeletedEvent("fn-1");
+  drainAll();
+
+  // Epic row is gone (existing behavior).
+  expect(getEpic("fn-1")).toBeNull();
+  // New: tombstone exists, carries the delete event id (NOT wallclock).
+  const tombstone = db
+    .query(
+      "SELECT epic_id, deleted_at_event_id FROM epic_tombstones WHERE epic_id = ?",
+    )
+    .get("fn-1") as { epic_id: string; deleted_at_event_id: number } | null;
+  expect(tombstone).toEqual({ epic_id: "fn-1", deleted_at_event_id: delId });
+});
+
+test("fn-688: delete-before-snapshot still mints a tombstone (unconditional mint)", () => {
+  // No EpicSnapshot — just an EpicDeleted. The reducer must still mint
+  // (the delete vanishes the file on disk; we may never see the snapshot).
+  const delId = epicDeletedEvent("fn-99");
+  drainAll();
+  const tombstone = db
+    .query(
+      "SELECT epic_id, deleted_at_event_id FROM epic_tombstones WHERE epic_id = ?",
+    )
+    .get("fn-99") as { epic_id: string; deleted_at_event_id: number } | null;
+  expect(tombstone).toEqual({ epic_id: "fn-99", deleted_at_event_id: delId });
+});
+
+test("fn-688: double-delete is idempotent — tombstone preserves the FIRST delete event id", () => {
+  epicSnapshotEvent("fn-2", { epic_number: 2, title: "E", status: "open" });
+  drainAll();
+  const firstDel = epicDeletedEvent("fn-2");
+  drainAll();
+  const secondDel = epicDeletedEvent("fn-2");
+  drainAll();
+  expect(firstDel).toBeLessThan(secondDel);
+  const tombstone = db
+    .query(
+      "SELECT epic_id, deleted_at_event_id FROM epic_tombstones WHERE epic_id = ?",
+    )
+    .get("fn-2") as { epic_id: string; deleted_at_event_id: number } | null;
+  // ON CONFLICT DO NOTHING — the first delete event id sticks.
+  expect(tombstone).toEqual({ epic_id: "fn-2", deleted_at_event_id: firstDel });
+});
+
+test("fn-688: a re-creating EpicSnapshot clears the tombstone", () => {
+  epicSnapshotEvent("fn-1", { epic_number: 1, title: "E", status: "open" });
+  drainAll();
+  epicDeletedEvent("fn-1");
+  drainAll();
+  // Tombstone present after the delete.
+  expect(
+    db
+      .query("SELECT 1 AS hit FROM epic_tombstones WHERE epic_id = ?")
+      .get("fn-1"),
+  ).not.toBeNull();
+  // Re-create.
+  epicSnapshotEvent("fn-1", {
+    epic_number: 1,
+    title: "Reborn",
+    status: "open",
+  });
+  drainAll();
+  // Tombstone is cleared; the new row landed.
+  expect(
+    db
+      .query("SELECT 1 AS hit FROM epic_tombstones WHERE epic_id = ?")
+      .get("fn-1"),
+  ).toBeNull();
+  expect(getEpic("fn-1")?.title).toBe("Reborn");
+});
+
+test("fn-688: TaskSnapshot shell-INSERT for a tombstoned epic is suppressed (no scalar-NULL ghost)", () => {
+  epicSnapshotEvent("fn-3", { epic_number: 3, title: "E", status: "open" });
+  drainAll();
+  epicDeletedEvent("fn-3");
+  drainAll();
+  // A later TaskSnapshot whose epic_id points at the tombstoned epic:
+  // the guard suppresses the shell-INSERT.
+  taskSnapshotEvent("fn-3.1", {
+    epic_id: "fn-3",
+    task_number: 1,
+    title: "Orphan",
+  });
+  drainAll();
+  // No ghost row.
+  expect(getEpic("fn-3")).toBeNull();
+});
+
+test("fn-688: legit job-before-epic shell still lands for a NEVER-deleted epic", () => {
+  // The legitimate shell-INSERT path the guard must NOT break. A
+  // SessionStart with `spawn_name = plan::fn-688-pristine` fans into
+  // the epic-kind syncJobIntoEpic arm; no tombstone exists, the shell
+  // is created.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-legit",
+    spawn_name: "plan::fn-688-pristine",
+  });
+  drainAll();
+  const row = getEpic("fn-688-pristine");
+  expect(row).not.toBeNull();
+  // Shell scalars are NULL (matches pre-fn-688 legit-shell shape).
+  expect(row?.epic_number).toBeNull();
+  expect(row?.title).toBeNull();
+  // The embedded job element is present.
+  const jobs = getEpicJobs("fn-688-pristine");
+  expect(jobs.length).toBe(1);
+  expect(jobs[0]?.job_id).toBe("sess-legit");
+});
+
+test("fn-688: shell -> delete -> shell skips the second shell (tombstone blocks resurrection)", () => {
+  // SessionStart creates a shell (job-before-epic vector).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-a",
+    spawn_name: "plan::fn-688-shelled",
+  });
+  drainAll();
+  expect(getEpic("fn-688-shelled")).not.toBeNull();
+  // Delete the shell.
+  epicDeletedEvent("fn-688-shelled");
+  drainAll();
+  expect(getEpic("fn-688-shelled")).toBeNull();
+  // Another SessionStart for the same epic — the second shell is
+  // BLOCKED by the tombstone (resurrection guard).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-b",
+    spawn_name: "plan::fn-688-shelled",
+  });
+  drainAll();
+  expect(getEpic("fn-688-shelled")).toBeNull();
+});
+
+test("fn-688: delete -> recreate -> job-fold lands the shell again (tombstone cleared)", () => {
+  epicSnapshotEvent("fn-688-revive", {
+    epic_number: 9,
+    title: "E",
+    status: "open",
+  });
+  drainAll();
+  epicDeletedEvent("fn-688-revive");
+  drainAll();
+  // Re-create the epic — clears the tombstone.
+  epicSnapshotEvent("fn-688-revive", {
+    epic_number: 9,
+    title: "Back",
+    status: "open",
+  });
+  drainAll();
+  // After recreate, the epic row is present; a later SessionStart
+  // UPDATES the existing row's `jobs` array (no shell INSERT needed,
+  // so the tombstone guard is not even consulted — the gate's
+  // `epicRow == null` branch never fires).
+  expect(getEpic("fn-688-revive")).not.toBeNull();
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-c",
+    spawn_name: "plan::fn-688-revive",
+  });
+  drainAll();
+  // The job folded into the existing (now-revived) row.
+  expect(getEpicJobs("fn-688-revive").length).toBe(1);
+});
+
+test("fn-688: from-scratch re-fold reproduces the full delete -> job-fold -> recreate -> job-fold interleaving byte-identically", () => {
+  // The reproduction sequence + a recreate + a second job-fold. Live
+  // drain vs. rewind+wipe(+epic_tombstones)+redrain produce
+  // byte-identical `epics` and `epic_tombstones` rows.
+  epicSnapshotEvent("fn-688-ghost", {
+    epic_number: 100,
+    title: "Ghost",
+    status: "open",
+  });
+  taskSnapshotEvent("fn-688-ghost.1", {
+    epic_id: "fn-688-ghost",
+    task_number: 1,
+    title: "One",
+  });
+  taskSnapshotEvent("fn-688-ghost.2", {
+    epic_id: "fn-688-ghost",
+    task_number: 2,
+    title: "Two",
+  });
+  epicDeletedEvent("fn-688-ghost");
+  taskDeletedEvent("fn-688-ghost.1", "fn-688-ghost");
+  // Job-side fold whose plan_ref points at the now-deleted epic — the
+  // canonical ghost-resurrection vector.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-orphan",
+    spawn_name: "approve::fn-688-ghost",
+  });
+  insertEvent({ hook_event: "SessionEnd", session_id: "sess-orphan" });
+  // Re-create the epic — clears tombstone.
+  epicSnapshotEvent("fn-688-ghost", {
+    epic_number: 100,
+    title: "Reborn",
+    status: "open",
+  });
+  // Another job-fold — folds into the existing row.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-revive",
+    spawn_name: "plan::fn-688-ghost",
+  });
+  drainAll();
+
+  // Capture live state.
+  const epicsBefore = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const tombstonesBefore = db
+    .query("SELECT * FROM epic_tombstones ORDER BY epic_id")
+    .all();
+  const jobsBefore = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+
+  // Rewind + wipe (INCLUDING epic_tombstones) + redrain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM epic_tombstones");
+  db.run("DELETE FROM subagent_invocations");
+  drainAll();
+
+  const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  const tombstonesAfter = db
+    .query("SELECT * FROM epic_tombstones ORDER BY epic_id")
+    .all();
+  const jobsAfter = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+
+  expect(epicsAfter).toEqual(epicsBefore);
+  expect(tombstonesAfter).toEqual(tombstonesBefore);
+  expect(jobsAfter).toEqual(jobsBefore);
+});
+
+test("fn-688: the ghost-event sequence yields ZERO scalar-NULL epic rows", () => {
+  // The exact repro from fn-637-throwaway-verify-fn-6356 (the bug):
+  // EpicSnapshot, TaskSnapshot x2, EpicDeleted, TaskDeleted,
+  // SessionEnd-approve whose plan_ref points at the deleted epic.
+  // Pre-fn-688, this left a scalar-NULL "ghost" row on `epics`.
+  epicSnapshotEvent("fn-688-bug", {
+    epic_number: 637,
+    title: "Bug",
+    status: "open",
+  });
+  taskSnapshotEvent("fn-688-bug.1", {
+    epic_id: "fn-688-bug",
+    task_number: 1,
+    title: "T1",
+  });
+  taskSnapshotEvent("fn-688-bug.2", {
+    epic_id: "fn-688-bug",
+    task_number: 2,
+    title: "T2",
+  });
+  epicDeletedEvent("fn-688-bug");
+  taskDeletedEvent("fn-688-bug.1", "fn-688-bug");
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-approve",
+    spawn_name: "approve::fn-688-bug",
+  });
+  insertEvent({ hook_event: "SessionEnd", session_id: "sess-approve" });
+  drainAll();
+
+  // The acceptance assertion from the task spec:
+  // `SELECT * FROM epics WHERE epic_id = '<deleted>'` returns zero rows.
+  expect(getEpic("fn-688-bug")).toBeNull();
+
+  // Generalised: no scalar-NULL ghost rows anywhere.
+  const ghosts = (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM epics WHERE title IS NULL AND epic_number IS NULL",
+      )
+      .get() as { n: number }
+  ).n;
+  expect(ghosts).toBe(0);
 });
 
 // ---------------------------------------------------------------------------
