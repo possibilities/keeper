@@ -67,5 +67,5 @@ Add to test/restore-worker.test.ts (keep the `KEEPER_RESTORE_FILE`-only sandbox 
 - [ ] `bun test test/restore-worker.test.ts` passes
 
 ## Done summary
-
+Added unconditional empty-descriptor skip in restorePulse before the hash gate so reboot (fresh lastHash=null + emptied live set) preserves the pre-crash restore.json; updated headers, README, and CLAUDE.md prose to last-non-empty-wins.
 ## Evidence
