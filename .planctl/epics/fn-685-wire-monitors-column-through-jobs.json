@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-685-wire-monitors-column-through-jobs",
   "bundles": [],
   "closer_done_at": "2026-06-03T01:04:51.975256Z",
@@ -18,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T01:04:51.975256Z"
+  "updated_at": "2026-06-03T01:06:12.021377Z"
 }
