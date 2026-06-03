@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "add monitors to JOBS_DESCRIPTOR and guard test",
-  "updated_at": "2026-06-02T23:43:17.167704Z"
+  "updated_at": "2026-06-03T00:59:52.486458Z",
+  "worker_done_at": "2026-06-03T00:59:52.486458Z"
 }

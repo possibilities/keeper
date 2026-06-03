@@ -9,5 +9,5 @@ Findings monitors-missing-from-descriptor and no-descriptor-wire-render-test bot
 - [ ] `test/collections.test.ts` asserts `JOBS_DESCRIPTOR.columns` contains `"monitors"` and that it is absent from sortable/filters/jsonColumns
 
 ## Done summary
-
+Added 'monitors' to JOBS_DESCRIPTOR.columns so the wire SELECT ships the field; companion test guards columns inclusion + absence from sortable/filters/jsonColumns. Display-only, matches profile_name / backend_exec_* pattern.
 ## Evidence
