@@ -58,9 +58,11 @@
  *
  * Sanitization. `sanitizeTabName` strips control / ANSI / OSC bytes
  * (`\x00-\x1f` + `\x7f`) that would corrupt the zellij tab bar, collapses
- * internal whitespace, trims, strips a leading `-` (so clap doesn't parse
- * the name as a flag), and caps to ~50 code points by middle-eliding
- * (so a trailing task number like `.5` survives the cut). Argv-array spawn handles
+ * internal whitespace, trims, and strips a leading `-` (so clap doesn't
+ * parse the name as a flag). It does NOT cap length — zellij stores tab
+ * names of any length verbatim and clips them at display time, so a
+ * keeper-side cap would only drop the trailing task number (the fn-635
+ * `…repo.5` bug). Argv-array spawn handles
  * injection — `Bun.spawn` is shell-free, so embedded `$()`, backticks,
  * `;`, quotes are literal positional bytes — so sanitization is purely
  * for DISPLAY safety, not for command-injection mitigation.
@@ -109,30 +111,18 @@ export interface TabNamerWorkerData {
 const DEFAULT_TICK_MS = 5_000;
 
 /**
- * Maximum sanitized tab name length. Zellij tab labels render in a
- * fixed-width bar; ~50 chars is comfortable across typical terminal
- * widths and well under any zellij internal limit. Cap by Unicode code
- * point (`Array.from`), NOT by UTF-16 code unit, so a 50-char cap
- * doesn't split a surrogate pair in half mid-emoji.
- */
-const MAX_TAB_NAME_LEN = 50;
-
-/**
- * Marker inserted where the middle of an over-cap title is elided. A
- * single-code-point ellipsis (U+2026) — zellij renders UTF-8 tab names
- * fine (see fn-687's emoji round-trip) and it costs only one slot of the
- * {@link MAX_TAB_NAME_LEN} budget, leaving the most room for the head +
- * tail it joins.
- */
-const ELLIPSIS = "…";
-
-/**
  * Strips control / ANSI / OSC bytes, collapses internal whitespace,
- * trims, strips a leading `-` (clap-flag mitigation), and caps to
- * {@link MAX_TAB_NAME_LEN} code points. Returns the empty string on
- * input that sanitizes to nothing — the caller skips the rename when
- * the result is empty (zellij would render a blank tab name, which is
- * a worse signal than the cosmetic `verb::id` default).
+ * trims, and strips a leading `-` (clap-flag mitigation). Does NOT cap
+ * length: zellij stores tab names of arbitrary length verbatim (verified
+ * 0.44.3 — a 112-char `rename-tab-by-id` round-trips byte-identical), so
+ * any keeper-side cap would only re-truncate the name BEFORE zellij sees
+ * it — which is exactly how the fn-635 `…repo.5` lost its trailing task
+ * number. We pass the full sanitized name through and leave display-time
+ * clipping (a render concern bounded by terminal width) to zellij's tab
+ * bar. Returns the empty string on input that sanitizes to nothing — the
+ * caller skips the rename when the result is empty (zellij would render a
+ * blank tab name, which is a worse signal than the cosmetic `verb::id`
+ * default).
  *
  * Pure — no I/O, no env reads, deterministic. Exported for direct
  * test reach.
@@ -159,27 +149,10 @@ export function sanitizeTabName(title: string): string {
   while (cleaned.startsWith("-")) {
     cleaned = cleaned.slice(1).trimStart();
   }
-  // Step 5: cap length by Unicode code point. When over the cap, elide
-  // the MIDDLE — NOT the tail. A naive head slice drops the trailing
-  // disambiguator (e.g. the `.5` task number on a
-  // `work::fn-635-…-repo.5` launch label), which is the single most
-  // important character on the tab — it's the only thing separating one
-  // sibling task's tab from another's (fn-635 bug: a 51-char label lost
-  // its `5`). Keep a head + an ellipsis + a tail whose code points sum
-  // to exactly MAX_TAB_NAME_LEN, giving the tail the odd slot so the
-  // suffix keeps the most room. Index by code point (`Array.from`), NOT
-  // UTF-16 code unit, so the cut never splits a surrogate pair mid-emoji
-  // (the ellipsis is itself a single BMP code point, so it can't split).
-  const codePoints = Array.from(cleaned);
-  if (codePoints.length > MAX_TAB_NAME_LEN) {
-    const budget = MAX_TAB_NAME_LEN - 1; // reserve one slot for the ellipsis
-    const headLen = Math.floor(budget / 2);
-    const tailLen = budget - headLen;
-    cleaned =
-      codePoints.slice(0, headLen).join("") +
-      ELLIPSIS +
-      codePoints.slice(codePoints.length - tailLen).join("");
-  }
+  // No length cap: zellij stores the full name and clips it at display
+  // time by terminal width. A keeper-side cap can only LOSE information
+  // (the fn-635 `…repo.5` truncation) without buying anything zellij's
+  // own tab-bar rendering doesn't already do.
   return cleaned;
 }
 
