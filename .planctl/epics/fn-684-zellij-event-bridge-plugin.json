@@ -6,6 +6,8 @@
     "fn-681-commit-driven-planctl-ingestion",
     "fn-682-live-monitors-projection"
   ],
+  "epic_review_status": "needs_work",
+  "epic_reviewed_at": "2026-06-03T04:12:28.413388Z",
   "id": "fn-684-zellij-event-bridge-plugin",
   "last_validated_at": "2026-06-03T01:52:07.701919Z",
   "plan_review_status": "unknown",
@@ -18,5 +20,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T01:52:07.702414Z"
+  "updated_at": "2026-06-03T04:12:28.414003Z"
 }
