@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "branch_name": "fn-683-stabilize-flaky-bun-test-suite",
   "bundles": [],
   "closer_done_at": "2026-06-03T01:03:38.422748Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T01:03:38.422748Z"
+  "updated_at": "2026-06-03T01:04:02.143640Z"
 }
