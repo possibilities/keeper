@@ -89,5 +89,5 @@ preserved.
 - [ ] `bun test` green.
 
 ## Done summary
-
+Added epic_tombstones projection table (schema v53): EpicDeleted mints tombstone, EpicSnapshot clears it, all four shell-INSERT sites guarded via insertEpicShellIfNotTombstoned(). Tests green including re-fold determinism and ghost reproduction sequence.
 ## Evidence
