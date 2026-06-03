@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-689-restore-snapshot-last-non-empty-wins",
   "bundles": [],
   "closer_done_at": "2026-06-03T20:07:09.932397Z",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T20:07:09.932397Z"
+  "updated_at": "2026-06-03T20:08:52.428178Z"
 }
