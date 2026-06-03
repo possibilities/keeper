@@ -97,14 +97,10 @@ If DESIGN.md exists and the feature involves UI:
 
 ## Rules
 
-- Think like a QA engineer — what would break this?
-- Prioritize questions by impact (critical → nice-to-have)
-- Be specific — "what about errors?" is too vague
-- Reference existing code patterns from the scout findings when relevant
-- Don't solve — just identify gaps
-- Keep it actionable — questions should have clear owners
-- Say "the human" not "the user"
-- Hard epic dependencies are always OK to control inter-epic work coordination; do not raise inter-epic file/data overlap as a Priority Question — the planner auto-wires overlaps via `epic add-dep` upstream.
+- Don't solve — just identify gaps. Be specific; "what about errors?" is too vague.
+- Prioritize by impact and keep questions actionable — each should have a clear owner.
+- Reference scout-finding code patterns when relevant. Say "the human" not "the user".
+- Do NOT raise inter-epic file/data overlap as a Priority Question — the planner auto-wires overlaps via `epic add-dep` upstream. Hard epic dependencies are the sanctioned coordination mechanism.
 
 ## Return the report
 

@@ -15,13 +15,15 @@ You receive a feature or change request as free text (1–5 sentences). It may a
 
 ## Search Strategy
 
-1. **Project docs first** (fast context — check each, skip silently if absent)
-   - `CLAUDE.md` / `AGENTS.md` — project-level agent instructions and conventions
-   - `README.md`, `CONTRIBUTING.md`, `ARCHITECTURE.md`
-   - `DESIGN.md` (design system — validate per rules below)
-   - Nearest owning package's `CLAUDE.md` / `AGENTS.md` for drift triggers and stale-value callouts in the affected area
-   - Any `docs/` or `documentation/` folders
-   - Manifests for deps + project type: `pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`, `build.zig`
+1. **Project docs first** (fast context). Dump everything present in one call, then read the owning package's `CLAUDE.md`/`AGENTS.md` nearest the affected area for drift triggers and stale-value callouts:
+   ```bash
+   for f in CLAUDE.md AGENTS.md README.md CONTRIBUTING.md ARCHITECTURE.md DESIGN.md \
+            pyproject.toml package.json Cargo.toml go.mod build.zig; do
+     [ -f "$f" ] && printf '\n===== %s =====\n' "$f" && cat "$f"
+   done
+   ls docs/ documentation/ 2>/dev/null
+   ```
+   `DESIGN.md` — validate per rules below. Manifests pin deps + project type.
 
 2. **Survey existing snippets.** Run `promptctl find-snippets <topic>` for the request's key concepts (e.g. "atomic write", "boundary lint", "schema migration"). For hits that look relevant, `promptctl show-snippet <name>` to read the body. The snippet substrate already encodes much of the repo's general-purpose conventions; reading the right snippets up front saves grep work and surfaces patterns you'd otherwise miss.
 
@@ -105,18 +107,8 @@ When `DESIGN.md` (or `.stitch/DESIGN.md`) is found, validate it is a design syst
 
 ## Rules
 
-- **Speed over completeness** — find the 80% fast. The planner will investigate deeper on specific tasks.
-- **Always include file:line references** for Related Code / Reusable Code.
-- **Flag code that MUST be reused** (don't reinvent).
-- **Note any CLAUDE.md / AGENTS.md rules** that apply to the change.
-- **Note drift triggers** from the nearest owning package's `CLAUDE.md` that touch the area — these are stale-by-design and may shift the approach.
-- **Skip deep analysis** — that's for the planner and downstream task work.
-- **Confidence tags** — append `[VERIFIED]` (confirmed via Read/Grep) or `[INFERRED]` (derived from naming/imports/structure) to findings. VERIFIED = tool output confirmed it. INFERRED = reasonable deduction, not mechanically confirmed.
-- **Return the report inline** — return the markdown report as your Task tool return value. The caller pins it in working memory.
-
-## Output Rules (for planning)
-
-- Show signatures, not full implementations
-- Keep code snippets to <10 lines illustrating the pattern shape
-- DO NOT output complete function bodies for the planner to copy
-- Focus on "where to look" not "what to write"
+- **Speed over completeness** — find the 80% fast; skip deep analysis. The planner investigates deeper per task.
+- **Always include file:line references** for Related Code / Reusable Code, and flag code that MUST be reused (don't reinvent).
+- **Confidence tags** — append `[VERIFIED]` (confirmed via Read/Grep) or `[INFERRED]` (derived from naming/imports/structure) to findings.
+- **Show shape, not implementation** — signatures and <10-line snippets that say "where to look", never full function bodies for the planner to copy.
+- **Return the report inline** as your Task tool return value. The caller pins it in working memory.

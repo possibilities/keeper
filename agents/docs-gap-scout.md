@@ -18,29 +18,12 @@ You receive:
 
 ### 1. Scan for doc locations
 
-Look for common documentation patterns:
+Probe every common doc location in one call (`-d` lists each match or stays silent):
 
 ```bash
-# User-facing docs
-ls -la README* CHANGELOG* CONTRIBUTING* 2>/dev/null
-ls -la docs/ documentation/ 2>/dev/null
-ls -la website/ site/ pages/ 2>/dev/null
-
-# API docs
-ls -la openapi.* swagger.* api-docs/ 2>/dev/null
-find . -name "*.openapi.yaml" -o -name "*.swagger.json" 2>/dev/null | head -5
-
-# Component docs
-ls -la .storybook/ stories/ 2>/dev/null
-
-# Design system
-ls -la DESIGN.md .stitch/DESIGN.md 2>/dev/null
-
-# Architecture
-ls -la adr/ adrs/ decisions/ architecture/ 2>/dev/null
-
-# Generated docs
-ls -la typedoc.json jsdoc.json mkdocs.yml 2>/dev/null
+ls -d README* CHANGELOG* CONTRIBUTING* docs/ documentation/ website/ site/ pages/ \
+      openapi.* swagger.* api-docs/ .storybook/ stories/ DESIGN.md .stitch/DESIGN.md \
+      adr/ adrs/ decisions/ architecture/ typedoc.json jsdoc.json mkdocs.yml 2>/dev/null
 ```
 
 ### 2. Categorize what exists

@@ -146,27 +146,12 @@ When you find a practice:
 
 ## Rules
 
-- Search for {{ shell("date +%Y") }} guidance (use the current year)
-- Prefer official docs over blog posts
-- Include source links for verification
-- **Validate GitHub sources** — check stars, activity, fork status
-- Cross-reference patterns across multiple repos
-- Focus on practical do/don't, not theory
-- Skip framework-agnostic generalities — be specific to the stack
-- Don't repeat what's obvious — focus on non-obvious gotchas
-- Note confidence level based on source quality: `[VERIFIED]` for official docs or multi-repo corroboration, `[INFERRED]` for single blog/limited evidence
+- Be specific to the stack — skip framework-agnostic generalities and the obvious; focus on non-obvious gotchas, each with a source link.
+- Prefer official docs; validate GitHub sources (stars/activity/fork) and cross-reference across repos before trusting a pattern.
+- Note confidence: `[VERIFIED]` for official docs or multi-repo corroboration, `[INFERRED]` for single blog/limited evidence.
 
 ## Output Rules (for planning)
 
-- Focus on DO/DON'T guidance, not complete implementations
-- Keep code snippets to <10 lines illustrating the point
-- Link to sources so implementer can dive deeper if needed
-
-**When to include code examples:**
-- Non-obvious gotchas that would cause bugs
-- Patterns that differ from common/expected approaches
-- Recent best practices that contradict older guidance
-- Security or performance pitfalls with specific fixes
-- Anything that surprised you or contradicted expectations
+DO/DON'T guidance over complete implementations; keep snippets <10 lines and link sources. Include a code example only when it earns its place: a non-obvious gotcha that would cause a bug, a pattern that differs from the expected approach, recent guidance that contradicts older advice, or a security/perf pitfall with a specific fix.
 
 Return the markdown report as your Task tool return value. The caller pins it in working memory.
