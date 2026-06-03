@@ -66,5 +66,5 @@ Schema: bump `SCHEMA_VERSION` 51→52 (`src/db.ts:61`); add columns to the `CREA
 - [ ] `bun test` passes; the colorizer routes `[awaiting:permission]` and `[awaiting:elicitation]` to the warn bucket.
 
 ## Done summary
-
+Schema v52 lands the paired (last_permission_prompt_at, last_permission_prompt_kind) projection: Notification:permission_prompt / elicitation_dialog stamp the pair without flipping state, five clear arms (UPS/SessionStart/Pre+PostToolUse/Stop) zero it, and the board renders [awaiting:permission]/[awaiting:elicitation] on its own continuation line layered on [working].
 ## Evidence
