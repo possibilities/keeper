@@ -1,0 +1,51 @@
+{
+  "fatal": false,
+  "fatal_reason": "",
+  "tier_0": [
+    {
+      "id": "F1",
+      "title": "Minor style: single-letter variable name",
+      "summary": "Variable 'x' used in loop body — acceptable in this context",
+      "rationale": "Advisory only — human explicitly accepted this style in codebase",
+      "severity_reason": "No functional risk",
+      "affected_paths": ["apps/planctl/planctl/helpers.py"],
+      "evidence": "helpers.py:12 — for x in items",
+      "suggested_fix": "Rename x to item if desired, but not required"
+    }
+  ],
+  "tier_1": [
+    {
+      "id": "F2",
+      "title": "Dead import in cli.py",
+      "summary": "os.path imported but never used in cli.py",
+      "rationale": "Targeted dead-code removal with localized user-visible impact — audit follow-up scope",
+      "severity_reason": "Clutters namespace; ruff would flag this",
+      "affected_paths": ["apps/planctl/planctl/cli.py"],
+      "evidence": "cli.py:3 — import os.path (no usages found by grep)",
+      "suggested_fix": "Remove the unused import line"
+    },
+    {
+      "id": "F3",
+      "title": "Missing error path test for validate command",
+      "summary": "validate command has no test for the case where epic JSON is malformed",
+      "rationale": "Targeted test addition with concrete user impact (unhandled exception) — audit follow-up scope",
+      "severity_reason": "Malformed epic JSON would produce an unhandled exception in production",
+      "affected_paths": ["apps/planctl/tests/test_validate_marker.py"],
+      "evidence": "Test Gaps section of auditor report — malformed epic scenario untested",
+      "suggested_fix": "Add test_validate_malformed_epic that writes a truncated JSON and asserts exit code 1"
+    }
+  ],
+  "tier_2": [
+    {
+      "id": "F4",
+      "title": "normalize_epic missing schema version field",
+      "summary": "Epic JSON has no version field making future migrations harder",
+      "rationale": "Architectural addition — needs planning and migration script, beyond worker scope",
+      "severity_reason": "Future schema migrations will require scanning all epic files without a version sentinel",
+      "affected_paths": ["apps/planctl/planctl/models.py"],
+      "evidence": "models.py:28-53 — normalize_epic has no version field in defaults",
+      "suggested_fix": "Add version: 1 to normalize_epic defaults and document the field in a schema changelog"
+    }
+  ],
+  "tier_3": []
+}

@@ -1,0 +1,19 @@
+{
+  "fatal": false,
+  "fatal_reason": "",
+  "tier_0": [],
+  "tier_1": [
+    {
+      "id": "F1",
+      "title": "Missing assertion in test_foo",
+      "summary": "test_foo calls the function but never asserts the return value",
+      "rationale": "Targeted, localized user-impact issue — audit follow-up scope",
+      "severity_reason": "Silent test passes even when function returns wrong value",
+      "affected_paths": ["apps/planctl/tests/test_foo.py"],
+      "evidence": "test_codex_review.py:42 — no assert after invoke",
+      "suggested_fix": "Add assert result.exit_code == 0 and assert payload['success'] is True"
+    }
+  ],
+  "tier_2": [],
+  "tier_3": []
+}

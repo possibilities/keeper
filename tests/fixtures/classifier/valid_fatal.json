@@ -1,0 +1,19 @@
+{
+  "fatal": true,
+  "fatal_reason": "SQL injection vector in run_query.py:87 — unsanitized user input concatenated directly into query string",
+  "tier_0": [],
+  "tier_1": [],
+  "tier_2": [
+    {
+      "id": "F1",
+      "title": "SQL injection in run_query",
+      "summary": "User input is concatenated directly into a SQL query string without parameterization",
+      "rationale": "Security breach risk — non-fatal classification on the tier scale, but flagged fatal for the show-stopper boolean (RCE / data exfiltration on real users)",
+      "severity_reason": "Remote code execution and data exfiltration possible via crafted input",
+      "affected_paths": ["apps/planctl/planctl/run_query.py"],
+      "evidence": "run_query.py:87 — f'SELECT * FROM tasks WHERE id = {user_id}'",
+      "suggested_fix": "Use parameterized queries: cursor.execute('SELECT * FROM tasks WHERE id = ?', (user_id,))"
+    }
+  ],
+  "tier_3": []
+}

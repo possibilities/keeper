@@ -1,0 +1,18 @@
+{
+  "fatal": false,
+  "fatal_reason": "",
+  "tier_0": [],
+  "tier_1": [
+    {
+      "id": "F1",
+      "title": "Some finding",
+      "summary": "A summary",
+      "rationale": "A rationale",
+      "severity_reason": "A severity reason",
+      "affected_paths": ["apps/planctl/planctl/cli.py"],
+      "suggested_fix": "Fix it"
+    }
+  ],
+  "tier_2": [],
+  "tier_3": []
+}

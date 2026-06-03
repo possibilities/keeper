@@ -1,0 +1,68 @@
+[project]
+name = "planctl"
+version = "0.0.0"
+description = "Manage epics, tasks, and specs in structured project workflows"
+requires-python = ">=3.11,<3.14"
+dependencies = ["click>=8.1,<8.2", "jsonschema>=4.21,<5", "pyyaml", "keeper-py"]
+
+[project.scripts]
+planctl = "planctl.cli:main"
+
+[tool.uv.sources]
+# Cross-repo editable install — keeper is a polyglot repo whose Python package
+# (keeper-py) lives at its root, so the source is the keeper checkout itself.
+# Assumes ~/code/keeper and ~/code/planctl are sibling checkouts. uv.lock stores
+# the relative path as written; same layout required on every machine.
+keeper-py = { path = "../keeper", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["planctl"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib --timeout=3"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ty.src]
+exclude = [
+    "**/tests/**",
+]
+
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.rules]
+# Mirrors arthack's suppression set (apps/planctl was checked under that
+# config). Each rule below is a documented false-positive surface ty cannot
+# narrow; the underlying invariant is validated in code. Errors at their
+# default severity (invalid-return-type, no-matching-overload,
+# call-non-callable) stay fatal so the commit-work gate catches real bugs.
+possibly-unresolved-reference = "ignore"
+invalid-assignment = "ignore"
+not-subscriptable = "ignore"
+unresolved-attribute = "ignore"
+invalid-await = "ignore"
+unsupported-operator = "ignore"
+invalid-argument-type = "ignore"
+
+[tool.ty.analysis]
+# keeper-py is an editable sibling install (../keeper); ty can't always
+# resolve it during static analysis even though uv sync wires it at runtime.
+allowed-unresolved-imports = [
+    "keeper",
+    "keeper.*",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=1.3.0",
+    "pytest-timeout>=2.3.1",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.14.14",
+    "ty>=0.0.14",
+]

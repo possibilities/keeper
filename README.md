@@ -1,0 +1,170 @@
+# planctl
+
+`planctl` is a file-based CLI for managing epics, tasks, dependencies, and markdown specs in structured software workflows.
+
+- Data lives in `.planctl/` inside the project directory, under version control.
+- Task runtime state is separated from task definitions.
+- Spec changes are written in place to `specs/{id}.md`. Git provides the audit trail.
+- Commands emit JSON by default. Pass `--format yaml` or `--format human` for alternate output. `cat` always emits raw markdown.
+
+Data lives in `.planctl/` inside the project directory, under version control.
+
+## Requirements
+
+- Python `>=3.11,<3.14`
+- [`uv`](https://docs.astral.sh/uv/) recommended for running/installing
+
+## Install
+
+From this repository:
+
+```bash
+uv sync
+uv run planctl --help
+```
+
+Optional tool install:
+
+```bash
+uv tool install .
+planctl --help
+```
+
+## Quick Start
+
+```bash
+# 1) Initialize current project
+planctl init
+
+# 2) Scaffold an epic + its tasks in one transactional call
+#    (plan.yaml: epic mapping + ordered tasks list, deps as 1-based ordinals)
+planctl scaffold --file plan.yaml
+
+# 3) Refine an existing epic later (add tasks, rewrite specs/deps)
+planctl refine-apply fn-1-add-auth --file delta.yaml
+
+# 4) Work the task lifecycle (claim asserts + claims + returns the worker briefing)
+planctl claim fn-1-add-auth.1
+planctl done fn-1-add-auth.1 --summary "Chose JWT strategy"
+
+# 5) Inspect state
+planctl list
+planctl validate
+```
+
+## Command Map
+
+Top-level commands:
+
+- `init`, `detect`, `status`, `validate`, `state-path`
+- `claim`, `resolve-task`, `done`, `block`, `ready`, `approve`
+- `show`, `epics`, `tasks`, `list`, `cat`
+- `epic`, `task`, `dep`
+
+`approve <epic_id> [<task_id>] <status>` (fn-592) — gated approval verb (renamed from the prior ungated verb removed in fn-592 task .1). Status is one of `approved | rejected | pending`. Gates: task→`status == done`; epic→`status == done` AND every embedded task `status == done` with `approval == approved`. Driven by `/plan:approve <id>` from a claude session.
+
+`resolve-task <task_id>` (fn-593) — read-only routing lookup returning the subset of `claim`'s envelope an external consumer needs to pick a tier-plugin and police cwd. Retained as a public CLI surface; no longer wired to the `arthack-claude.py` launcher (keeper reads `task.tier` from its own projected Task data and launches with the matching `--plugin-dir` itself). Cwd-agnostic (scans configured `roots`); supports `--project <path>` to disambiguate. Returns `{task_id, epic_id, project_path, target_repo, primary_repo, tier, status}` — `tier` is one of `medium|high|xhigh|max` or `null`. No `.planctl/` write, no commit. Typed errors: `BAD_TASK_ID | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID | NOT_A_PROJECT`.
+
+Subcommands:
+
+- `epic`: `create`, `set-plan`, `set-branch`, `set-title`, `close`, `rm`, `ack`, `add-dep`, `rm-dep`, `set-plan-review-status`, `set-work-review-status`, `set-epic-review-status`
+- `task`: `create`, `set-description`, `set-acceptance`, `set-spec`, `reset`, `ack`, `set-deps`
+- `dep`: `add`
+- `worker`: `resume`
+
+## Storage Layout
+
+All data lives in `.planctl/` inside the project directory:
+
+```text
+{project_root}/.planctl/
+  meta.json
+  epics/{epic-id}.json
+  specs/{epic-id}.md
+  specs/{task-id}.md
+  tasks/{task-id}.json
+  state/                    # gitignored -- ephemeral runtime data
+    tasks/{task-id}.state.json
+    locks/{task-id}.lock
+```
+
+Specs are written in place to `specs/{id}.md` by commands that mutate spec content (`done`, `task set-description`, `task set-acceptance`, `task set-spec`, `task reset`, `epic set-plan`, `task create`, `epic create`). Git history provides the audit trail.
+
+Environment variables:
+
+- `PLANCTL_ACTOR` (override identity)
+- `PLANCTL_SESSION_ID` (sole source of the session id used to key the touched-paths log under `.planctl/state/sessions/<session_id>/`; required for every mutating verb — the claude launcher exports it for spawned sessions, tests and manual invocations set it explicitly)
+
+## Auto-commit
+
+Every planctl CLI invocation emits a `planctl_invocation` NDJSON envelope on stdout. Mutating verbs additionally land a `chore(planctl): <op> <target>` commit inline at `output.emit()` via `planctl.commit.auto_commit_from_invocation` — the commit happens BEFORE the success envelope prints, so the envelope's appearance on stdout is the authoritative signal that the `.planctl/` commit landed. Read-only verbs (and runtime-only verbs like `claim`/`block`/`ack`) emit the envelope but skip the git commit (`files` is empty → no-op). On commit failure the runner prints a structured `{"success": false, "error": "commit_failed", "details": {...}}` envelope on stdout and exits 1 — the success envelope is NOT printed.
+
+For source-code commits from worker agents, use `jobctl commit-work`:
+
+```bash
+# Preview what will be staged
+jobctl commit-work --preview-files
+
+# Commit with a message (auto-pushes to origin on success)
+jobctl commit-work "feat(scope): add the feature
+
+Task: fn-N-slug.M"
+```
+
+On success, `jobctl commit-work` emits two NDJSON envelopes on stdout — the
+commit envelope (`{success, commit_sha, files}`) and the push envelope
+(`{success, pushed, remote, branch}`). If the branch has no upstream, it is
+auto-set via `git push -u origin HEAD` on the first push. On push failure the
+exit code is 1 and the push envelope carries `push_error_class` (one of
+`non_fast_forward | auth | hook_rejected | no_upstream | network | other`) plus
+verbatim stderr; the caller resolves inline (rebase/pull/auth fix) before
+retrying. There is no `--no-push` flag; `GIT_TERMINAL_PROMPT=0` is set on every
+push subprocess so non-TTY invocations fail fast instead of hanging on a
+prompt.
+
+For the full commit contract, see [`docs/reference/commit-at-mutation-boundary.md`](./docs/reference/commit-at-mutation-boundary.md).
+
+## Version Control Advice
+
+**Do not gitignore `.planctl/`.** Plan data is meant to be committed -- the `state/` subdirectory already has its own `.gitignore` for ephemeral runtime files (locks, active task state).
+
+If you use a context-dump tool, add `.planctl/` to its ignore file so plan data doesn't flood your context.
+
+## Output Contract
+
+Commands emit JSON by default:
+
+- Success: `{"success": true, ...}`
+- Failure: `{"success": false, "error": "..."}`
+- Non-JSON failures print `Error: ...` to stderr and exit non-zero.
+
+Pass `--format yaml` for YAML output or `--format human` for human-readable text/tables.
+`cat` always emits raw markdown regardless of `--format`.
+`validate` uses a custom envelope: `{"valid": bool, "errors": [...], "warnings": [...]}` (exits 1 on `valid: false`). When `--epic <id>` is given and the epic has never been validated before, the runner manually invokes `planctl.commit.auto_commit_from_invocation` (bypassing `emit()` to preserve the custom envelope shape) and prints a second NDJSON document `{"planctl_invocation": {...}}` describing the marker write. Re-validating an already-stamped epic produces only the one-line envelope (no second document, no commit).
+
+`planctl list` renders one row per epic with its title and status.
+
+## Planning Skills
+
+Four slash commands handle epic creation, refinement, the post-epic-close phase, and tier-1/2/3 followup audit:
+
+| Command | When to use |
+|---------|------------|
+| `/plan <request>` | Any new feature — spawns scouts, runs gap-analyst, full outer-loop quality pass. Use for anything non-trivial. |
+| `/plan:queue <subject>` | Single-task epic that jumps the queue (fn-595). Sets `queue_jump: true` on the `planctl_invocation` envelope — server-derived, immutable across event-log replay; keeperd projects `epics.queue_jump = 1` and stamps a `!`-prefixed `sort_path` so the epic sorts above all other root epics on the board. `queue_jump` is set skill-side, NOT via a CLI flag — there is no `--queue-jump` argument on `planctl scaffold`. Member of the `/plan:plan` family (not a job-launcher). Generated from `skill-templates/queue-defer.md.tmpl`. |
+| `/plan:defer <subject>` | Single-task epic without the priority jump (fn-595). Same shape as `/plan:queue` minus the `queue_jump` flag — sorts in normal epic-number order. Generated from the same shared template. Member of the `/plan:plan` family (not a job-launcher). |
+| `/plan:close <epic_id>` | After all tasks in an epic are done: spawn `quality-auditor` → spawn `classifier` subagent (parses `<VERDICT_JSON>` block) → branch on `fatal` (off the in-memory verdict) → `planctl epic close <epic_id>` (stamps `closer_done_at`). **fn-559**: the audit runs INLINE inside close before the irreversible close mutation — no `--audit-required` / `--no-audit-required` flag, no `auditor_done_at` stamp, no separate `/plan:audit` session. `fatal` is the only ship-block signal; the closed epic flips straight to `pending_approval` for the human ack. Halts without closing on fatal verdict or parse/schema failure; marks `epic_review_status needs_work` in those cases. The findings follow-up tree (when the inline audit produces one) is scaffolded as a normal epic — `epic.depends_on_epics: [<source_eid>]` carries the source-link, and the `scaffold` verb's inline auto-commit lands the tree. |
+
+## Help for Agents
+
+`planctl` includes hidden rich agent guidance:
+
+```bash
+planctl --agent-help
+```
+
+## License and Attribution
+
+This project is MIT licensed (see [`LICENSE`](./LICENSE)).
+
+`planctl` is derived from [flowctl](https://github.com/gmickel/claude-marketplace) by Gordon Mickel. See [`NOTICES`](./NOTICES) for attribution and license details.
