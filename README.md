@@ -491,13 +491,15 @@ keeper plugin-path
 # → /Users/.../keeper/plugin/zellij-bridge/keeper-zellij-bridge.wasm
 ```
 
-This is the **single source of truth** for the cross-repo byte-match
+This is the **single source of truth** for the cross-repo path
 contract: the human's dotfiles `~/.config/zellij/config.kdl`
-`load_plugins { "file:..." { cwd "<events dir>" } }` block and
-`~/.cache/zellij/permissions.kdl` `ReadApplicationState` grant must both
-derive their `file:` URL from `keeper plugin-path` rather than hardcoding
-the absolute path. The dotfiles install scripts (separate repo; see
-`fn-684.3` for the wiring contract) consume this verb.
+`load_plugins { "file:..." { cwd "<events dir>" } }` block and the zellij
+permission cache (`permissions.kdl`) both reference this absolute path
+rather than hardcoding it. Note the two references are NOT byte-identical:
+`config.kdl` uses the `file:`-scheme URL, while the permission cache keys
+on the bare path WITHOUT the `file:` prefix (zellij strips the scheme when
+it stores/matches a grant). The dotfiles install scripts (separate repo;
+see `fn-684.3` for the wiring contract) consume this verb.
 
 Version-skew safety:
 
@@ -513,7 +515,7 @@ Keeper is the PROVIDER of the bridge `.wasm` and ensures the events dir
 exists on daemon boot (`~/.local/state/keeper/zellij-events`, override
 via `KEEPER_ZELLIJ_EVENTS_DIR`). Keeper does NOT load the plugin into
 sessions itself — it never runs `zellij action start-or-reload-plugin`
-and never writes `~/.cache/zellij/permissions.kdl`. That side is owned
+and never writes the zellij permission cache. That side is owned
 by your dotfiles / arthack install scripts (separate repo), which load
 the plugin GLOBALLY into every zellij session via a `config.kdl`
 `load_plugins` block. The result: every zellij session (whether
@@ -522,12 +524,13 @@ one keeper-watched directory, and the keeperd daemon folds the lines
 through the existing `BackendExecSnapshot` synthetic event into
 `jobs.backend_exec_tab_*` (no schema bump).
 
-The wiring contract is a THREE-place byte-match: the committed `.wasm`
-file, the `config.kdl` `load_plugins` URL, and the
-`~/.cache/zellij/permissions.kdl` URL must all carry the same absolute
-`file:` URL. `keeper plugin-path` (above) is the single source of
-truth — derive both KDL URLs from it rather than hardcoding the path;
-otherwise a `~/code/keeper` checkout move silently strands the wiring.
+The wiring contract is a THREE-place path match: the committed `.wasm`
+file, the `config.kdl` `load_plugins` URL (`file:` scheme), and the
+zellij permission-cache key (bare path, NO `file:` scheme) must all point
+at the same absolute path. `keeper plugin-path` (above) is the single
+source of truth — derive both KDL references from it rather than
+hardcoding the path; otherwise a `~/code/keeper` checkout move silently
+strands the wiring.
 
 1. **`~/.config/zellij/config.kdl`** — add a `load_plugins` block that
    pins the plugin's `cwd` to keeper's events dir. zellij maps the
@@ -549,28 +552,49 @@ otherwise a `~/code/keeper` checkout move silently strands the wiring.
    scripts should template this block from `keeper plugin-path` so a
    checkout move regenerates the URL automatically.
 
-2. **`~/.cache/zellij/permissions.kdl`** — pre-seed a
-   `ReadApplicationState` grant for the SAME `file:` URL. Background /
-   headless plugins cannot surface a permission-grant UI (upstream
-   zellij#4982 — maintainer-confirmed workaround is the pre-seed), so
-   without this entry the plugin loads but its event subscription
-   silently no-ops.
+2. **`permissions.kdl`** — pre-seed BOTH a `ReadApplicationState` AND a
+   `ReadSessionEnvironmentVariables` grant. `ReadApplicationState` gates
+   the `PaneUpdate`/`TabUpdate` subscription; `ReadSessionEnvironmentVariables`
+   gates the `get_session_environment_variables()` call the plugin uses to
+   read `ZELLIJ_SESSION_NAME` (it names its `<session>.ndjson` after it).
+   The plugin requests both in `load()` and only reads the session env
+   after the grant lands (the async `PermissionRequestResult` arm), so a
+   missing seed does not crash it — but background plugins can't surface a
+   prompt reliably (upstream zellij#4982), so WITHOUT the pre-seed every
+   new session pops a `(y/n)` permission dialog (or silently no-ops the
+   subscription). The pre-seed is what makes the bridge load silently.
+
+   **Path is platform-specific.** zellij stores its permission cache in
+   its CACHE DIR, which is NOT `~/.cache/zellij` on macOS. Find it with:
+
+   ```sh
+   zellij setup --check | grep 'CACHE DIR'
+   # macOS:  ~/Library/Caches/org.Zellij-Contributors.Zellij
+   # Linux:  ~/.cache/zellij
+   ```
+
+   Seed `<CACHE DIR>/permissions.kdl`. **The key is the bare path WITHOUT
+   the `file:` scheme** — zellij strips the scheme before it stores/matches
+   a grant, so a `file:`-prefixed key never matches and the prompt fires
+   anyway:
 
    ```kdl
-   "file:/Users/you/code/keeper/plugin/zellij-bridge/keeper-zellij-bridge.wasm" {
+   "/Users/you/code/keeper/plugin/zellij-bridge/keeper-zellij-bridge.wasm" {
        ReadApplicationState
+       ReadSessionEnvironmentVariables
    }
    ```
 
-   The grant is the bare child-node NAME (`ReadApplicationState`), NOT
+   Each grant is the bare child-node NAME (`ReadApplicationState`), NOT
    `allowed_permissions "ReadApplicationState"`. zellij's parser
    (`PermissionCache::from_string`) reads each child node's *name* as a
    `PermissionType` and ignores arguments — so the `allowed_permissions`
    arg form parses to an EMPTY grant and the plugin silently no-ops.
 
-   The URL MUST byte-match the one in `config.kdl` above (and the
-   output of `keeper plugin-path`) — zellij keys permissions by exact
-   URL, so a one-byte drift silently strips the grant.
+   The path MUST match the one in `config.kdl` above (minus the `file:`
+   scheme) and the output of `keeper plugin-path` — zellij keys
+   permissions by exact path, so a one-byte drift silently strips the
+   grant.
 
 3. **Restart your zellij sessions** to pick up the new `config.kdl` /
    `permissions.kdl`. Long-lived existing sessions only acquire the
@@ -579,12 +603,11 @@ otherwise a `~/code/keeper` checkout move silently strands the wiring.
    `tail -f ~/.local/state/keeper/zellij-events/<session>.ndjson` —
    lines should append as panes/tabs move.
 
-4. **(Optional) Flip keeper's feed.** Until you set
-   `KEEPER_ZELLIJ_FEED=plugin` on the daemon (LaunchAgent plist
-   `EnvironmentVariables`), keeper runs the legacy poller as the
-   active tab-resolution feed and ignores the plugin's NDJSON files.
-   The plugin keeps writing harmlessly — its files turn live the
-   moment you flip the gate and restart keeperd.
+   The plugin's NDJSON feed is the daemon's sole tab-resolution source —
+   the legacy `zellij action list-panes` poller was retired (the
+   `KEEPER_ZELLIJ_FEED` gate is gone; the `zellij-events` worker is
+   always-on). keeperd folds each session's lines as they land, so a
+   freshly-loaded plugin's tab resolutions go live with no extra step.
 
 ## Example clients
 

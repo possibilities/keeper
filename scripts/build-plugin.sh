@@ -61,7 +61,10 @@ rustup target add wasm32-wasip1 >/dev/null
 echo "[build:plugin] cargo build --release --target wasm32-wasip1 …"
 cargo build --release --target wasm32-wasip1
 
-CARGO_OUT="$PLUGIN_DIR/target/wasm32-wasip1/release/keeper_zellij_bridge.wasm"
+# Binary crate (see Cargo.toml `[[bin]]`): cargo names the artifact after the
+# bin target (`keeper-zellij-bridge`, hyphens preserved), NOT the underscore
+# lib-crate form. A binary is required so the wasm exports `_start`.
+CARGO_OUT="$PLUGIN_DIR/target/wasm32-wasip1/release/keeper-zellij-bridge.wasm"
 if [ ! -f "$CARGO_OUT" ]; then
   echo "[build:plugin] error: expected cargo output not found at $CARGO_OUT" >&2
   exit 1

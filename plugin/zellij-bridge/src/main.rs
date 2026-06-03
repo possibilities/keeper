@@ -1,8 +1,19 @@
 //! keeper-zellij-bridge — a headless zellij plugin that emits pane/tab deltas as NDJSON.
 //!
-//! Subscribes to `PaneUpdate` and `TabUpdate`. On each event it joins the
-//! manifest against the latest tab map and appends one line per (non-plugin)
-//! pane to `/host/<session>.ndjson`. `/host` is pinned by the dotfiles
+//! Built as a BINARY crate (`[[bin]]`, `src/main.rs`), NOT a `cdylib`:
+//! zellij looks up the `_start` export (`register_plugin!` injects the
+//! `fn main` that becomes it) and fails the whole load with "could not find
+//! exported function" otherwise — a cdylib produces a reactor with no entry
+//! point and never instantiates.
+//!
+//! Subscribes to `PaneUpdate`, `TabUpdate`, and `PermissionRequestResult`,
+//! and requests `ReadApplicationState` + `ReadSessionEnvironmentVariables`.
+//! Permission grants resolve ASYNCHRONOUSLY — they are NOT active during the
+//! synchronous `load()` call — so the session name (and therefore the first
+//! emit) is deferred to the `PermissionRequestResult(Granted)` arm in
+//! `update()`. On each pane/tab event thereafter it joins the manifest
+//! against the latest tab map and appends one line per (non-plugin) pane to
+//! `/host/<session>.ndjson`. `/host` is pinned by the dotfiles
 //! `load_plugins { "file:..." { cwd "<events dir>" } }` block (see
 //! `fn-684.4`); the plugin never resolves a host path itself — the WASI
 //! sandbox forbids writing outside `/host` / `/data` / sandbox `/tmp`.
@@ -152,11 +163,19 @@ pub struct Plugin {
     /// opaque — only the change-of-epoch is meaningful (it signals a
     /// fresh instantiation, e.g. after the #5177 double-load race).
     epoch: u64,
-    /// Resolved session name from `ZELLIJ_SESSION_NAME`. Frozen at
-    /// `load()`. Empty if the env var was absent — we still write to
+    /// Resolved session name from `ZELLIJ_SESSION_NAME`. Set once on the
+    /// `PermissionRequestResult(Granted)` event (NOT in `load()` — see the
+    /// `update()` doc). Empty if the env var was absent — we still write to
     /// `/host/.ndjson` in that case so the file is greppable for the
     /// bug rather than silently dropped.
     session: String,
+    /// Set true once `PermissionRequestResult(Granted)` has fired and we've
+    /// resolved the session name + written the `plugin_start` sentinel.
+    /// `emit_lines()` is gated on this so a `PaneUpdate`/`TabUpdate` that
+    /// races ahead of the grant is held (in `last_panes`/`tab_map`) and
+    /// flushed once initialization completes — never emitted against an
+    /// unknown session.
+    initialized: bool,
     /// Last seen tab snapshot — position -> (tab_id, tab_name).
     /// A rename-only `TabUpdate` mutates the name here and triggers a
     /// re-emit of every pane in the affected position(s); without that
@@ -170,35 +189,73 @@ pub struct Plugin {
 
 impl ZellijPlugin for Plugin {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
-        subscribe(&[EventType::PaneUpdate, EventType::TabUpdate]);
-        request_permission(&[PermissionType::ReadApplicationState]);
+        // Subscribe to the pane/tab deltas AND to the permission-grant result.
+        // `request_permission` resolves ASYNCHRONOUSLY: zellij applies the
+        // grant (from the pre-seeded permissions cache, or after an
+        // interactive prompt) and then delivers `PermissionRequestResult` —
+        // it is NOT active during this synchronous `load()` call. So we must
+        // NOT call any permissioned host API here:
+        //   - `ReadApplicationState` gates delivery of PaneUpdate/TabUpdate.
+        //   - `ReadSessionEnvironmentVariables` gates
+        //     `get_session_environment_variables()`.
+        // Calling the latter in `load()` is denied → the shim unwraps an empty
+        // response → the wasm traps → the WHOLE plugin fails to instantiate
+        // (the bug that silently killed tab resolution). Defer all of it to
+        // the `PermissionRequestResult(Granted)` arm in `update()`.
+        subscribe(&[
+            EventType::PaneUpdate,
+            EventType::TabUpdate,
+            EventType::PermissionRequestResult,
+        ]);
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::ReadSessionEnvironmentVariables,
+        ]);
 
-        let env = get_session_environment_variables();
-        self.session = env
-            .get("ZELLIJ_SESSION_NAME")
-            .cloned()
-            .unwrap_or_default();
-
-        // Per-load nonce: combine the host plugin id with a coarse boot
-        // time so two concurrent instances (zellij#5177) get distinct
-        // epochs. The consumer treats it as opaque.
+        // `get_plugin_ids()` is permission-free, so the per-load epoch nonce
+        // (used to detect a fresh instantiation, e.g. the #5177 double-load
+        // race) is safe to derive here. The consumer treats it as opaque.
         let ids = get_plugin_ids();
         self.epoch = ids.plugin_id as u64;
-
-        let sentinel = format!(
-            "{{\"seq\":0,\"event\":\"plugin_start\",\"epoch\":{},\"session\":{}}}",
-            self.epoch,
-            json_string(&self.session),
-        );
-        append_line(&self.session, &sentinel);
-        SEQ.with(|s| s.set(1));
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
+            // The grant landed. NOW the permissioned APIs are live, so this is
+            // the earliest point we can read the session name and start
+            // emitting. Initialize exactly once; a `Denied` result (or a
+            // second `Granted`) is a no-op. Any pane/tab snapshot that raced
+            // ahead of the grant was held in `last_panes`/`tab_map` and is
+            // flushed here.
+            Event::PermissionRequestResult(status) => {
+                if matches!(status, PermissionStatus::Granted) && !self.initialized {
+                    let env = get_session_environment_variables();
+                    self.session = env
+                        .get("ZELLIJ_SESSION_NAME")
+                        .cloned()
+                        .unwrap_or_default();
+                    self.initialized = true;
+
+                    let sentinel = format!(
+                        "{{\"seq\":0,\"event\":\"plugin_start\",\"epoch\":{},\"session\":{}}}",
+                        self.epoch,
+                        json_string(&self.session),
+                    );
+                    append_line(&self.session, &sentinel);
+                    SEQ.with(|s| s.set(1));
+
+                    // Flush whatever we captured before the grant.
+                    if self.last_panes.is_some() {
+                        self.emit_lines();
+                    }
+                }
+            },
             Event::PaneUpdate(panes) => {
                 self.last_panes = Some(panes);
-                self.emit_lines();
+                // Hold until initialized (session known); flush on the grant.
+                if self.initialized {
+                    self.emit_lines();
+                }
             },
             Event::TabUpdate(tabs) => {
                 let mut new_map = BTreeMap::new();
@@ -208,7 +265,7 @@ impl ZellijPlugin for Plugin {
                 self.tab_map = new_map;
                 // Re-emit on every TabUpdate (incl. rename-only) so tab
                 // renames propagate — see the build_lines doc-comment.
-                if self.last_panes.is_some() {
+                if self.initialized && self.last_panes.is_some() {
                     self.emit_lines();
                 }
             },
