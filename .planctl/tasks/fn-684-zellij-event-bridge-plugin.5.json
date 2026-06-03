@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "cutover and retire poller",
-  "updated_at": "2026-06-03T01:04:44.772042Z"
+  "updated_at": "2026-06-03T04:04:02.270289Z",
+  "worker_done_at": "2026-06-03T04:04:02.270289Z"
 }

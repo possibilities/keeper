@@ -34,5 +34,5 @@ Migrate/remove the backend-worker tests; assert the daemon boots with twelve wor
 - [ ] A one-step rollback to the poller remains documented; daemon boots + shuts down cleanly with twelve workers
 
 ## Done summary
-
+Retired the backend-worker list-panes poller; the fn-684 zellij-events plugin feed is now the always-on producer of jobs.backend_exec_tab_{id,name}. Daemon boots twelve workers (down from a gated 11-or-12). KEEPER_ZELLIJ_FEED env var is no longer read; rollback to the poller is a single git revert. README Architecture, CLAUDE.md (Worker contract + parcel-watcher carve-outs), and module headers all updated. Backend-worker.ts reduced to the shared readLiveJobsWithCoords helper still used by scanZellijEventsDir.
 ## Evidence
