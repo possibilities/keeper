@@ -11,7 +11,9 @@
     "dev": "exec bun --watch run src/daemon.ts",
     "lint": "biome check --no-errors-on-unmatched cli src test",
     "typecheck": "tsc --noEmit",
-    "test": "bun test --isolate"
+    "test:isolated": "bun test --isolate --path-ignore-patterns='test/ansi-to-styled.test.ts' --path-ignore-patterns='test/live-shell.test.ts'",
+    "test:opentui": "bun test test/ansi-to-styled.test.ts test/live-shell.test.ts",
+    "test": "bun run test:isolated && bun run test:opentui"
   },
   "devDependencies": {
     "@biomejs/biome": "2.2.0",

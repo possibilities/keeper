@@ -6,6 +6,24 @@
  * translation from OpenTUI's `KeyEvent` back to the core's raw-string
  * contract, and clean teardown via `paint.destroy()`.
  *
+ * NB on test runner: this file (and `test/ansi-to-styled.test.ts`) are
+ * the only suites that load `@opentui/core` runtime values, and they
+ * MUST run under `bun test` (no `--isolate`). Under `--isolate`,
+ * `@opentui/core`'s native loader (built form
+ * `node_modules/.../@opentui/core/index-*.js` ~L12528, sourcemap to
+ * `src/zig.ts:67-68`) trips a top-level-await TDZ —
+ *   `ReferenceError: Cannot access 'default' before initialization`
+ * — because Bun's per-test-file fresh-global resets the loader chunk
+ * mid-evaluation. A `bunfig.toml` `[test] preload` that early-imports
+ * `@opentui/core` does NOT hold (the preload's own `await import` hits
+ * the same TDZ). `package.json`'s `test` script therefore runs the
+ * non-OpenTUI suite under `--isolate` (`test:isolated`) and this pair
+ * separately under plain `bun test` (`test:opentui`).
+ * Minimal upstream repro (Bun 1.3.14 / @opentui/core 0.3.0):
+ *   `bun test --isolate test/ansi-to-styled.test.ts test/live-shell.test.ts`
+ * — fails with the TDZ above; filing upstream is deferred to a
+ * separate human-approved task.
+ *
  * Per the OpenTUI docs the tests boot via `createTestRenderer` with:
  *   - explicit width/height (CI reports columns=0)
  *   - `exitSignals: []` (we don't want SIGINT teardown in test isolation)
