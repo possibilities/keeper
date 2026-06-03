@@ -116,8 +116,9 @@ subagent calls — one row per `PreToolUse:Agent` paired with its later
 `PostToolUse:Agent` via `events.tool_use_id`, carrying lifecycle status
 `running | ok | failed | unknown | superseded` and a populated `duration_ms`
 on close (NULL on rows that never observed a SubagentStop — `superseded`
-peers + lifecycle-swept `unknown` orphans)), `git` (per-worktree planctl-backed
-git status — branch, ahead/behind, and a file-centric `dirty_files` list where
+peers + lifecycle-swept `unknown` orphans)), `git` (per-watched-worktree
+git status — watch gate is `.planctl present || dirty || ahead of upstream > 0`,
+recomputed each reconcile (epic fn-690); branch, ahead/behind, and a file-centric `dirty_files` list where
 each entry carries a per-file `attributions[]` array with `source` badges
 (`tool` / `bash` / `inferred` / `planctl`) naming every session that mutated the file
 since its last commit; a session is attributed iff it has mutated the file
@@ -842,7 +843,9 @@ collapses to plain stream output. Run any of them with
   ```
 
 - `git.ts` — single-collection subscribe client over the `git`
-  collection (planctl-backed worktree status: branch, ahead/behind,
+  collection (watched-worktree status — membership gate
+  `.planctl present || dirty || ahead of upstream > 0`, recomputed each
+  reconcile (epic fn-690): branch, ahead/behind,
   and a file-centric layout — one line per dirty file followed by its
   per-session `attributions[]`, each rendered with a colored source
   badge (`tool` = direct Edit/Write/MultiEdit, `bash` = derived from a
@@ -1788,7 +1791,7 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.sort_path ASC, task_id ASC LIMIT 10"
 
-# Git projection — one row per planctl-backed worktree. dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, worktree_oid, worktree_mode, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred|planctl (planctl added in schema v46 / fn-666 — minted by the reducer's planctl_op fold from the envelope's files[] array so .planctl/ JSONs+specs no longer orphan) and commit-discharge timestamps; schema v44/v45 — fn-664 — adds the producer-frozen worktree_oid + worktree_mode so foldCommit can gate discharge on content equality):
+# Git projection — one row per watched worktree (membership gate `.planctl present || dirty || ahead of upstream > 0`, recomputed each reconcile, epic fn-690). dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, worktree_oid, worktree_mode, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred|planctl (planctl added in schema v46 / fn-666 — minted by the reducer's planctl_op fold from the envelope's files[] array so .planctl/ JSONs+specs no longer orphan) and commit-discharge timestamps; schema v44/v45 — fn-664 — adds the producer-frozen worktree_oid + worktree_mode so foldCommit can gate discharge on content equality):
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT project_dir, branch, ahead, behind, json_extract(dirty_files, '\$[0]') AS first_dirty FROM git_status LIMIT 5"
 

@@ -45,7 +45,8 @@
  *        writable connection — the third producer-worker instance. The kqueue/
  *        epoll fd is owned by the worker thread and released in its own
  *        shutdown handler.
- *      - the git worker — polls planctl-backed git worktrees via
+ *      - the git worker — polls watched git worktrees (see git-worker.ts's
+ *        dynamic membership gate: `.planctl present || dirty || ahead>0`) via
  *        `git status --porcelain=v2 -z`, mines file-tool events from the DB,
  *        and posts `{ kind: "git-snapshot", ... }`. Main turns each into a
  *        synthetic `GitSnapshot` events row — the fourth producer-worker

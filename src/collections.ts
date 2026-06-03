@@ -371,8 +371,9 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
- * The `git` descriptor — one row per planctl-backed git worktree observed by
- * the git worker. The row is a current-status snapshot plus derived per-live-job
+ * The `git` descriptor — one row per watched git worktree observed by the git
+ * worker (membership gate: `.planctl present || dirty || ahead of upstream > 0`,
+ * recomputed each reconcile, epic fn-690). The row is a current-status snapshot plus derived per-live-job
  * dirty/orphan buckets. It is produced by synthetic `GitSnapshot` events, so the
  * read surface still rides the normal SQLite subscription machinery.
  */

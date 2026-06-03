@@ -32,8 +32,8 @@
  * This worker is an event PRODUCER only: it owns no writable DB connection and
  * never mutates projections. Main inserts a `GitSnapshot` event, and the
  * reducer folds that persisted payload into `git_status`. When a watched root
- * stops satisfying the watch gate (its `.planctl/` directory was removed AND
- * the worktree is clean-and-pushed for ≥ the cooling dwell), the worker also
+ * stops satisfying the watch gate on reconcile (no `.planctl/` AND clean-and-
+ * pushed for ≥ the cooling dwell), the worker also
  * posts a `GitRootDropped` tombstone message from `unsubscribeRoot` — main
  * lifts it into a synthetic `GitRootDropped` event whose reducer fold DELETEs
  * the projection row, keeping `git_status` in sync with the worktree.
@@ -160,7 +160,7 @@ export interface GitSnapshotMessage extends GitSnapshotPayload {
 
 /**
  * Tombstone message: a watched root has stopped satisfying the watch gate
- * ({@link shouldWatchRoot}) — its `.planctl/` directory disappeared AND the
+ * ({@link shouldWatchRoot}) on reconcile — no `.planctl/` present AND the
  * worktree has been clean-and-pushed for ≥ {@link WATCH_DROP_DWELL_MS} (the
  * cooling-hysteresis dwell, epic fn-690). The worker is unsubscribing; main
  * lifts this into a synthetic `GitRootDropped` event whose reducer fold

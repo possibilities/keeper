@@ -2419,8 +2419,9 @@ function projectGitStatus(db: Database, event: Event): void {
 
 /**
  * Fold one synthetic `GitRootDropped` tombstone. The git-worker posts this
- * from `unsubscribeRoot()` when a watched worktree stops being planctl-backed
- * (its `.planctl/` directory was removed); without it, `projectGitStatus`'s
+ * from `unsubscribeRoot()` when a watched worktree no longer satisfies the
+ * watch gate on reconcile (no `.planctl/` AND clean-and-pushed past the
+ * cooling dwell, epic fn-690); without it, `projectGitStatus`'s
  * UPSERT-only path would leak the final pre-drop snapshot row forever.
  *
  * The primary key (`project_dir`) rides in `event.session_id`. An empty /
