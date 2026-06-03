@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-691-tui-re-fold-progress-indicator",
   "bundles": [],
+  "closer_done_at": "2026-06-03T21:34:18.810502Z",
   "created_at": "2026-06-03T20:20:04.064218Z",
   "depends_on_epics": [],
   "id": "fn-691-tui-re-fold-progress-indicator",
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "TUI re-fold progress indicator",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T20:20:04.064218Z"
+  "updated_at": "2026-06-03T21:34:18.810502Z"
 }
