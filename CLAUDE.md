@@ -73,7 +73,10 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   event log itself. The restore-worker (epic fn-677) is the sole writer of
   `~/.local/state/keeper/restore.json` — a pure CONSUMER derived side-file
   that is NOT a projection, NOT in the event log, and never feeds either; the
-  worker carries no `onmessage` handler and writes nothing through main. Test
+  worker carries no `onmessage` handler and writes nothing through main —
+  and under last-non-empty-wins (epic fn-689) an empty descriptor does NOT
+  overwrite a prior populated snapshot, so the file survives reboot /
+  seed-sweep zeroing for `scripts/restore-agents.ts` to read. Test
   isolation env-var list extends accordingly: `KEEPER_RESTORE_FILE` joins
   `KEEPER_DB` / `KEEPER_DEAD_LETTER_DIR` / `KEEPER_DROP_LOG` as a path that
   must be sandbox-overridden in every spawn test so the user's real

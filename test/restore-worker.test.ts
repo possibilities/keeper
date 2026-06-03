@@ -337,6 +337,88 @@ test("restorePulse skips the write when the hashed content is unchanged", () => 
   expect(statSync(restorePath).mtimeMs).toBe(firstMtime);
 });
 
+test("restorePulse last-non-empty-wins: populated→empty leaves prior file intact", () => {
+  // Populated pulse writes the file.
+  insertJob({ job_id: "a", backend_exec_session_id: "s1" });
+  const state = { lastHash: null as string | null, parentDirEnsured: false };
+  restorePulse(db, restorePath, state, () => 1000);
+  const firstMtime = statSync(restorePath).mtimeMs;
+  const firstHash = state.lastHash;
+  const firstBytes = readFileSync(restorePath);
+  expect(firstHash).not.toBeNull();
+
+  // Empty out the live set (mark the job ended). Bump mtime resolution
+  // so any rewrite would be observable.
+  Bun.sleepSync(2);
+  db.run("UPDATE jobs SET state='ended' WHERE job_id='a'");
+
+  restorePulse(db, restorePath, state, () => 9999);
+
+  // File still on disk, byte-intact, mtime unchanged, lastHash unchanged.
+  expect(existsSync(restorePath)).toBe(true);
+  expect(readFileSync(restorePath).equals(firstBytes)).toBe(true);
+  expect(statSync(restorePath).mtimeMs).toBe(firstMtime);
+  expect(state.lastHash).toBe(firstHash);
+});
+
+test("restorePulse last-non-empty-wins: reboot case (fresh lastHash=null + empty live set) preserves populated file", () => {
+  // Simulate a pre-crash populated snapshot on disk.
+  insertJob({ job_id: "a", backend_exec_session_id: "s1" });
+  const seedState = {
+    lastHash: null as string | null,
+    parentDirEnsured: false,
+  };
+  restorePulse(db, restorePath, seedState, () => 1000);
+  const preBytes = readFileSync(restorePath);
+  const preMtime = statSync(restorePath).mtimeMs;
+  expect(seedState.lastHash).not.toBeNull();
+
+  // Reboot: seedKilledSweep has emptied the live set BEFORE the worker
+  // spawns. The worker comes up fresh with lastHash=null.
+  Bun.sleepSync(2);
+  db.run("UPDATE jobs SET state='killed' WHERE job_id='a'");
+
+  // Fresh state — the load-bearing assertion.
+  const freshState = {
+    lastHash: null as string | null,
+    parentDirEnsured: false,
+  };
+  restorePulse(db, restorePath, freshState, () => 9999);
+
+  // The pre-crash file MUST survive.
+  expect(existsSync(restorePath)).toBe(true);
+  expect(readFileSync(restorePath).equals(preBytes)).toBe(true);
+  expect(statSync(restorePath).mtimeMs).toBe(preMtime);
+  // The empty-skip must NOT advance lastHash.
+  expect(freshState.lastHash).toBeNull();
+});
+
+test("restorePulse last-non-empty-wins: empty→non-empty still writes (skip does not advance lastHash)", () => {
+  // First pulse with empty live set → no file created, lastHash stays null.
+  const state = { lastHash: null as string | null, parentDirEnsured: false };
+  restorePulse(db, restorePath, state, () => 1000);
+  expect(existsSync(restorePath)).toBe(false);
+  expect(state.lastHash).toBeNull();
+
+  // Add a live job → next pulse must write (lastHash was not advanced).
+  insertJob({ job_id: "a", backend_exec_session_id: "s1" });
+  restorePulse(db, restorePath, state, () => 1000);
+  expect(existsSync(restorePath)).toBe(true);
+  expect(state.lastHash).not.toBeNull();
+  const parsed = JSON.parse(readFileSync(restorePath, "utf8")) as {
+    sessions: Record<string, { agents: { job_id: string }[] }>;
+  };
+  expect(parsed.sessions.s1.agents.map((a) => a.job_id)).toEqual(["a"]);
+});
+
+test("restorePulse last-non-empty-wins: cold start (no prior file, empty jobs) creates no file", () => {
+  // No jobs inserted, no prior file. The empty-skip fires unconditionally.
+  const state = { lastHash: null as string | null, parentDirEnsured: false };
+  restorePulse(db, restorePath, state, () => 1000);
+  expect(existsSync(restorePath)).toBe(false);
+  expect(state.lastHash).toBeNull();
+});
+
 test("restorePulse rewrites when the descriptor genuinely changes", () => {
   insertJob({ job_id: "a", backend_exec_session_id: "s1" });
   const state = { lastHash: null as string | null, parentDirEnsured: false };

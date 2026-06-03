@@ -3,7 +3,11 @@
  * restore-agents — Chrome-style "restore previous session" for keeper-managed
  * Claude Code agents (epic fn-677, T4). Reads the side-file
  * `~/.local/state/keeper/restore.json` that the restore-worker (T3) maintains
- * write-on-change, and replays each surviving agent back into its original
+ * under a **last-non-empty-wins** policy (epic fn-689: the worker rewrites
+ * the file on content change BUT unconditionally skips an empty descriptor,
+ * so the file intentionally outlives reboot / seed-sweep zeroing events and
+ * is NOT always current-state — it's the last populated snapshot), and
+ * replays each surviving agent back into its original
  * zellij session via `ExecBackend.ensureLaunched` (T2) using the resume
  * command `scripts/resume.ts` and the worker already agree on
  * (`buildResumeCommand` / `resumeTarget`, T1 — the shared `src/resume-descriptor`

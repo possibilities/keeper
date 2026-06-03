@@ -12,8 +12,16 @@
  * {@link buildRestoreDescriptor} snapshot of the live jobs grouped by zellij
  * `backend_exec_session_id`, stable-serializes it (sorted keys, ASCII-escaped
  * — same shape `serializePlanctlJson` produces), hashes the serialized bytes,
- * and rewrites `~/.local/state/keeper/restore.json` via `atomicWriteFile` ONLY
- * when the hash differs from the in-memory `lastHash`.
+ * and rewrites `~/.local/state/keeper/restore.json` via `atomicWriteFile`
+ * under a **last-non-empty-wins** policy: the worker UNCONDITIONALLY skips
+ * the write when the descriptor's `sessions` map is empty (preserving the
+ * last populated snapshot on disk), and otherwise rewrites only when the
+ * hash differs from the in-memory `lastHash`. The empty-skip survives the
+ * reboot / seed-sweep zeroing window (fn-689) where a fresh-process
+ * `lastHash===null` + an already-emptied live set would otherwise destroy
+ * the pre-crash snapshot — exactly when `scripts/restore-agents.ts` needs
+ * it. Browser "restore previous session" semantics: never overwrite a
+ * populated session file with an empty payload.
  *
  * The restore file is a derived side-file, NOT an event-log projection: it
  * sidesteps the event-sourcing invariants entirely (no schema bump, no
@@ -282,6 +290,21 @@ export function restorePulse(
   }
 
   const descriptor = buildRestoreDescriptor(jobs, epicsById, now());
+
+  // last-non-empty-wins: UNCONDITIONALLY skip the write whenever the
+  // descriptor is empty, preserving the last populated snapshot on disk.
+  // The skip MUST NOT be gated on `state.lastHash` — on reboot the worker
+  // is a fresh process (`lastHash===null`) and `seedKilledSweep` has
+  // already emptied the live set, so a hash-gated guard would fail to
+  // skip and overwrite the pre-crash file (the fn-689 bug). Returning
+  // BEFORE the hash gate also leaves `state.lastHash` untouched, so a
+  // later non-empty pulse computes a fresh hash and writes correctly.
+  // `buildRestoreDescriptor` never creates empty buckets, so an
+  // empty `sessions` object is an exact emptiness test.
+  if (Object.keys(descriptor.sessions).length === 0) {
+    return;
+  }
+
   const hashed = serializeForHash(descriptor);
   // `Bun.hash` returns a number — fine for an in-memory dedup key (we never
   // compare across daemon boots). Stringify so the equality check is by

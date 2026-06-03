@@ -432,10 +432,13 @@ Keeper has no `install` verb. Wire it up manually:
    recovery files, default `~/.local/state/keeper/dead-letters/`) — tests
    that spawn the real hook MUST override both to keep production
    diagnostic feeds clean. The restore worker (epic fn-677) writes
-   `~/.local/state/keeper/restore.json` (the latest-always Chrome-style
-   "restore previous session" snapshot — agents + zellij metadata for
-   `scripts/restore-agents.ts` to replay against), overridable via
-   `KEEPER_RESTORE_FILE` for tests. Set
+   `~/.local/state/keeper/restore.json` (the Chrome-style "restore
+   previous session" snapshot — agents + zellij metadata for
+   `scripts/restore-agents.ts` to replay against — maintained under a
+   **last-non-empty-wins** policy: the worker rewrites the file on
+   content change but UNCONDITIONALLY skips an empty descriptor, so
+   reboot / seed-sweep zeroing never destroys the pre-crash snapshot
+   — epic fn-689), overridable via `KEEPER_RESTORE_FILE` for tests. Set
    `KEEPER_TRACE_SERVER=1` to enable verbose server-worker diagnostic logging
    — `[srv-ts]` stage timings, frame byte counts, connection lifecycle — on
    `server.stderr`; off by default (the rare `[server-worker]` error class is
@@ -1644,8 +1647,15 @@ read seam the autopilot worker uses. It builds a stable
 (`working` / `stopped`) jobs grouped by zellij `backend_exec_session_id`,
 hashes the serialized bytes (excluding `captured_at` so an informational
 timestamp doesn't churn the hash on every pulse), and rewrites
-`~/.local/state/keeper/restore.json` via `atomicWriteFile` ONLY when the
-hash differs from the in-memory `lastHash`. The file is a derived
+`~/.local/state/keeper/restore.json` via `atomicWriteFile` under a
+**last-non-empty-wins** policy (epic fn-689): the worker UNCONDITIONALLY
+skips the write when the descriptor's `sessions` map is empty, and
+otherwise rewrites only when the hash differs from the in-memory
+`lastHash`. The empty-skip is what makes the file useful — without it
+the reboot / seed-sweep zeroing window (fresh-process `lastHash===null`
++ an already-emptied live set from `seedKilledSweep`) would overwrite
+the pre-crash snapshot with `{sessions:{}}`, exactly when
+`scripts/restore-agents.ts` needs it. The file is a derived
 side-file — NOT a projection, NOT in the event log — so the worker
 sidesteps the event-sourcing invariants entirely (no schema bump, no
 reducer arm, no `keeper/api.py` whitelist change). The worker carries no
