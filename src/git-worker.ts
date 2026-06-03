@@ -1173,8 +1173,8 @@ function coalesceCommitterSessionId(
  * ({@link WATCH_PROBE_TTL_HOT_MS}, currently watched) refreshes on every
  * fast reconcile, the cold tier ({@link WATCH_PROBE_TTL_COLD_MS}, candidate
  * but unwatched) holds a longer-lived verdict so a quiescent untouched
- * repo doesn't re-probe every cycle. `expiry` is monotonic
- * (`performance.now()` ms).
+ * repo doesn't re-probe every cycle. `expiry` is wall clock
+ * (`Date.now()` ms).
  *
  * Pruning is lazy-on-read inside {@link discoverProjectRoots} so we never
  * walk the map on the hot 100ms tick. The map is bounded by the candidate
@@ -1183,7 +1183,7 @@ function coalesceCommitterSessionId(
 interface WatchProbeCacheEntry {
   /** The last probe verdict (or `null` if the probe failed at expiry time). */
   verdict: { dirty: boolean; ahead: number } | null;
-  /** Monotonic-clock ms after which the entry is considered stale. */
+  /** Wall-clock ms (`Date.now()`) after which the entry is considered stale. */
   expiry: number;
 }
 
@@ -1202,7 +1202,7 @@ interface WatchProbeCacheEntry {
  *   tier selector (hot vs cold TTL) AND as the monotonicity floor (the
  *   slow sweep only ADDS candidates; the fast path always re-probes every
  *   already-watched root).
- * - `nowMs` — monotonic clock. Injected for tests.
+ * - `nowMs` — wall clock (`Date.now()`). Injected for tests.
  * - `runFullSweep` — `true` when the candidate set should widen to ALL
  *   `DISTINCT cwd` rows (the slow sweep), `false` for the recent+watched
  *   fast path. The caller decides cadence via
@@ -1298,11 +1298,11 @@ export function buildDiscoveryCandidates(
  * - `currentlyWatched` — the set of roots that are subscribed right now;
  * - `desiredNow` — the moment-in-time verdict set from
  *   {@link discoverProjectRoots};
- * - `cleanSinceByRoot` — per-root monotonic clock at which the root first
+ * - `cleanSinceByRoot` — per-root wall clock (`Date.now()`) at which the root first
  *   became clean-and-pushed (i.e. NOT in `desiredNow` while it WAS in
  *   `currentlyWatched`); cleared the moment a root re-qualifies. The
  *   caller mutates this Map in place across reconciles;
- * - `nowMs` — monotonic clock now;
+ * - `nowMs` — wall clock (`Date.now()`) now;
  * - `dwellMs` — the dwell threshold ({@link WATCH_DROP_DWELL_MS}).
  *
  * Returns:
@@ -1694,8 +1694,8 @@ function startWorker(): void {
    */
   const watchProbeCache = new Map<string, WatchProbeCacheEntry>();
   /**
-   * Epic fn-690: per-root "first observed clean-and-pushed" monotonic
-   * timestamp. Drives the cooling-hysteresis dwell — see
+   * Epic fn-690: per-root "first observed clean-and-pushed" wall-clock
+   * (`Date.now()`) timestamp. Drives the cooling-hysteresis dwell — see
    * {@link decideReconcileTransitions} and
    * {@link WATCH_DROP_DWELL_MS}. The entry is stamped the first reconcile
    * cycle a watched root falls out of the desired set, cleared the
@@ -1704,7 +1704,7 @@ function startWorker(): void {
    */
   const cleanSinceByRoot = new Map<string, number>();
   /**
-   * Epic fn-690: monotonic-clock timestamp of the last full-history sweep
+   * Epic fn-690: wall-clock (`Date.now()`) timestamp of the last full-history sweep
    * (`runFullSweep: true`). `null` until the first reconcile fires.
    * Throttled to {@link FULL_SWEEP_INTERVAL_MS} so the heavy
    * `SELECT DISTINCT cwd FROM jobs` walk + cold-tier re-probes runs ~5min
