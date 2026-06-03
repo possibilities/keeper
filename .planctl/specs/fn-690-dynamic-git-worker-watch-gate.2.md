@@ -38,5 +38,5 @@ Doc-only; verify `bun run lint` (and any markdown/JSDoc lint) passes. No behavio
 - [ ] `bun run lint` passes.
 
 ## Done summary
-
+Updated 6 sites (README + 5 src JSDocs) from '.planctl-backed' framing to the dynamic three-arm watch gate; git-worker.ts and reducer.ts tombstone descriptions now mutually consistent on 'no longer satisfies the watch gate on reconcile' as the drop trigger. Lint passes.
 ## Evidence
