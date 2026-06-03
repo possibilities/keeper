@@ -56,6 +56,10 @@ import { SELECTION_BG_SGR } from "./ansi-to-styled";
 import { colorizePillsInLine } from "./board-render";
 import { buildDebugSnapshot, copyToClipboard } from "./clipboard-debug";
 import { createLiveShell, type LiveShell } from "./live-shell";
+import {
+  createRefoldProgressPoller,
+  type RefoldProgressPoller,
+} from "./refold-progress";
 
 /**
  * Selection-highlight protocol. A `renderBody` may prefix exactly one of
@@ -105,6 +109,17 @@ export interface ViewShellOptions<TSnap> {
    * restores to `""` (no banner).
    */
   persistentBannerPill?: () => string;
+  /**
+   * Optional poller surfacing the reducer's re-fold progress (fn-691).
+   * Defaults to the real {@link createRefoldProgressPoller} bound to
+   * `resolveDbPath()`. Tests inject a fake whose `poll()` returns
+   * deterministic samples so the connecting-indicator's composition and
+   * teardown can be asserted without touching SQLite. The poller is
+   * lazily opened (first `poll()`) and closed by the shell on either
+   * first-frame self-stop or SIGINT — see `emitLifecycle`'s spinner block
+   * and `installSigintHandler`'s teardown.
+   */
+  refoldProgressPoller?: RefoldProgressPoller;
 }
 
 export interface ViewShell<TSnap> {
@@ -205,12 +220,98 @@ export function createViewShell<TSnap>(
   let lastFrameText: string | null = null;
   let frameCount = 0;
 
-  // Connecting-indicator spinner state (see `emitLifecycle`). Braille dots
-  // advance one step per lifecycle tick while the first real frame is still
-  // pending, so the user isn't staring at a blank alt-screen while keeperd
-  // finishes its boot drain (the subscribe socket isn't up yet).
+  // Connecting-indicator spinner state. A single `setInterval` (~125ms)
+  // animates the braille dots and re-polls the re-fold poller until the
+  // first real frame paints. Composition lives in `tickConnectingSpinner`
+  // below: when the poller has a `{cursor,max}` sample with `cursor<max`,
+  // the indicator carries the percentage + thousands-grouped counts;
+  // otherwise it falls back to the plain "connecting to keeperd…" line.
+  // Self-stops on `frameCount>0` (NOT on `connected` — that lifecycle
+  // event lands before the first frame paints, per
+  // `readiness-client.ts:800`). Also cleared from the SIGINT teardown
+  // so neither the interval nor the readonly fd leaks on Ctrl-C.
   const CONNECTING_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  const SPINNER_TICK_MS = 125;
+  // Drop to the plain spinner after this many consecutive null polls so a
+  // transient error doesn't hold a stale percentage on screen forever. The
+  // last-good `{cursor,max}` floor is preserved across misses up to this
+  // budget — the re-fold cursor is monotonic per the event-sourcing
+  // invariants (one cursor bump per fold-tx commit), so holding the floor
+  // smooths animation through a busy_timeout-blocked poll.
+  const REFOLD_MISS_BUDGET = 3;
   let connectingSpinnerIdx = 0;
+  let spinnerInterval: ReturnType<typeof setInterval> | undefined;
+  let lastRefold: { cursor: number; max: number } | null = null;
+  let refoldMisses = 0;
+  // Lazy default — only mint a real poller if the caller didn't inject one.
+  // Production callers omit the option; tests inject a fake.
+  const refoldPoller: RefoldProgressPoller =
+    opts.refoldProgressPoller ?? createRefoldProgressPoller();
+  let refoldPollerClosed = false;
+
+  function closeRefoldPoller(): void {
+    if (refoldPollerClosed) {
+      return;
+    }
+    refoldPollerClosed = true;
+    refoldPoller.close();
+  }
+
+  function stopConnectingSpinner(): void {
+    if (spinnerInterval !== undefined) {
+      clearInterval(spinnerInterval);
+      spinnerInterval = undefined;
+    }
+    closeRefoldPoller();
+  }
+
+  function formatRefoldLine(glyph: string): string {
+    // Keep last-good floor across REFOLD_MISS_BUDGET consecutive misses;
+    // beyond that the cursor presentation is too stale to be honest and
+    // we fall back to the plain "connecting" line.
+    if (lastRefold === null || refoldMisses > REFOLD_MISS_BUDGET) {
+      return `${glyph}  connecting to keeperd…`;
+    }
+    const { cursor, max } = lastRefold;
+    // Guard `max` falsy + `cursor>max` (non-monotonic / mid-rewind reset):
+    // never render `NaN%` / `>100%` / a fake 100%. 100% only on confirmed
+    // `connected` (which stops this interval before its next tick paints).
+    if (max <= 0 || cursor >= max) {
+      return `${glyph}  connecting to keeperd…`;
+    }
+    const pct = ((cursor / max) * 100).toFixed(1);
+    return `${glyph}  re-folding event log  ${pct}%  ${cursor.toLocaleString()} / ${max.toLocaleString()}`;
+  }
+
+  function tickConnectingSpinner(): void {
+    // Self-stop the moment a real data frame lands. Note: we deliberately
+    // do NOT stop on the `connected` lifecycle event — `connected` fires
+    // before any `result` frame arrives (see `readiness-client.ts:800`),
+    // and the first paint can take additional ms while collections
+    // resolve. `frameCount` is the only honest signal.
+    if (frameCount > 0) {
+      stopConnectingSpinner();
+      return;
+    }
+    connectingSpinnerIdx =
+      (connectingSpinnerIdx + 1) % CONNECTING_SPINNER.length;
+    const glyph = CONNECTING_SPINNER[connectingSpinnerIdx];
+    const sample = refoldPoller.poll();
+    if (sample !== null) {
+      lastRefold = sample;
+      refoldMisses = 0;
+    } else {
+      refoldMisses += 1;
+    }
+    liveShell.pushFrame([formatRefoldLine(glyph)]);
+  }
+
+  function armConnectingSpinner(): void {
+    if (spinnerInterval !== undefined) {
+      return;
+    }
+    spinnerInterval = setInterval(tickConnectingSpinner, SPINNER_TICK_MS);
+  }
 
   // Shared banner-flash timer. Transient `[copied …]` / caller-driven
   // flashes share one timer so a fresh flash from any source cancels a
@@ -365,6 +466,11 @@ export function createViewShell<TSnap>(
     }
     lastBody = body;
     frameCount += 1;
+    // The first real frame supersedes the connecting indicator — stop
+    // the spinner interval and release its readonly DB fd before pushing
+    // the data frame, so the next paint isn't fighting a final spinner
+    // tick.
+    stopConnectingSpinner();
     liveShell.pushFrame(toShellLines(bodyLines));
     writeSidecars(stateJson, sidecarFrameText(bodyLines));
     return true;
@@ -405,20 +511,19 @@ export function createViewShell<TSnap>(
     if (event === "disconnected") {
       lastBody = null;
     }
-    // Connecting indicator: until the first real frame paints, surface a
-    // spinner placeholder so the user knows the view is waiting on keeperd
-    // (the subscribe socket isn't up during boot drain — the client sits in
-    // its capped-backoff retry loop emitting `connecting` / `waiting`). The
-    // spinner advances one step per lifecycle tick — no timer. The first
-    // snapshot's `emit()` repaints over it; the `frameCount === 0` gate means
-    // a transient disconnect after data is on screen keeps the last good
-    // frame rather than flicking back to "connecting".
+    // Connecting indicator: arm a single ~125ms `setInterval` until the
+    // first real frame paints, so the spinner animates smoothly during a
+    // multi-minute boot re-fold (the subscribe socket isn't bound during
+    // boot drain — the client sits in capped-backoff `connecting` /
+    // `waiting`). The interval re-polls keeper's read-only SQLite each
+    // tick (`reducer_state.last_event_id` vs `MAX(events.id)`) and either
+    // renders the live percentage or the plain "connecting to keeperd…"
+    // line. The `frameCount === 0` gate means a transient disconnect
+    // after data is on screen keeps the last good frame rather than
+    // flicking back to "connecting". Self-stops on first frame; also
+    // cleared from the SIGINT teardown.
     if (frameCount === 0 && event !== "connected") {
-      connectingSpinnerIdx =
-        (connectingSpinnerIdx + 1) % CONNECTING_SPINNER.length;
-      liveShell.pushFrame([
-        `${CONNECTING_SPINNER[connectingSpinnerIdx]} connecting to keeperd…`,
-      ]);
+      armConnectingSpinner();
     }
   }
 
@@ -432,7 +537,15 @@ export function createViewShell<TSnap>(
       process.stdout.write(`${s}\n`);
     };
     process.on("SIGINT", () => {
-      // Terminal restoration before subscription teardown.
+      // Terminal restoration before subscription teardown. Also tear
+      // down the connecting-spinner interval + close its readonly DB
+      // fd here so neither leaks across a Ctrl-C exit. Bun
+      // `setInterval` has no `.unref()` — an explicit `clearInterval`
+      // on every teardown path is load-bearing for a clean TUI exit,
+      // not cosmetic. Both `stopConnectingSpinner` and
+      // `refoldPoller.close()` are idempotent so the first-frame
+      // self-stop + this SIGINT path are safe to co-fire.
+      stopConnectingSpinner();
       liveShell.dispose();
       onDispose();
       log("...");
