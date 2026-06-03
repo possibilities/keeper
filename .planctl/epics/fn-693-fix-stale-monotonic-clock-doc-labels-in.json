@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-693-fix-stale-monotonic-clock-doc-labels-in",
   "bundles": [],
+  "closer_done_at": "2026-06-03T22:01:17.282098Z",
   "created_at": "2026-06-03T21:48:37.483189Z",
   "depends_on_epics": [
     "fn-692-fix-clock-domain-mismatch-in-git-worker"
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "fix stale monotonic-clock doc-labels in git-worker",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T21:48:37.483189Z"
+  "updated_at": "2026-06-03T22:01:17.282098Z"
 }
