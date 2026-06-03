@@ -34,6 +34,7 @@ import {
   buildLaunchArgv,
   buildWorkerCommand,
   type ConfirmRunningDeps,
+  checkWorkPluginManifest,
   confirmRunning,
   type DispatchedPayload,
   type DispatchFailedPayload,
@@ -170,6 +171,15 @@ interface FakeDepsOptions {
   now?: number | (() => number);
   pollIntervalMs?: number;
   ceilingMs?: number;
+  /**
+   * Optional work-plugin manifest check. When provided, records the tier
+   * it was called with and returns the configured verdict; when omitted
+   * the dep is left unset (guard is a no-op, matching production tests
+   * that don't exercise the manifest path).
+   */
+  checkWorkPlugin?: (
+    tier: string,
+  ) => { ok: true } | { ok: false; reason: string };
 }
 
 function makeFakeDeps(opts: FakeDepsOptions = {}): {
@@ -248,6 +258,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     async closeByTabId(session, tabId) {
       log.closeByTabIdCalls.push({ session, tabId });
     },
+    ...(opts.checkWorkPlugin ? { checkWorkPlugin: opts.checkWorkPlugin } : {}),
   };
 
   return {
@@ -804,6 +815,99 @@ test("runReconcileCycle: two launches serialize one-at-a-time (fn-644 stagger)",
   ]);
   // Both promoted to live.
   expect(liveDispatches.size).toBe(2);
+});
+
+test("runReconcileCycle: missing work-plugin manifest blocks the launch with a sticky DispatchFailed (no launch, no Dispatched)", async () => {
+  // A ready `work` task on tier `high` whose generated manifest is absent.
+  // The guard must short-circuit BEFORE launch: no zellij spawn, no
+  // Dispatched intent minted, one DispatchFailed carrying the verdict's
+  // reason. Mirrors the planctl fn-637 incident — a `git rm`'d, never-
+  // regenerated `.claude-plugin/plugin.json` made claude register the
+  // agent as `high:worker`, so `/plan:work` couldn't find `work:worker`.
+  const { deps, log } = makeFakeDeps({
+    checkWorkPlugin: (tier) => ({
+      ok: false,
+      reason: `work-plugin manifest missing for tier '${tier}'`,
+    }),
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "high" })],
+    sort_path: "000001",
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, liveDispatches, NO_AUTOCLOSE, 0);
+  expect(decision.launches.length).toBe(1);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.launches).toEqual([]); // never spawned
+  expect(log.dispatchedEmissions).toEqual([]); // no intent minted
+  expect(liveDispatches.size).toBe(0); // nothing promoted to live
+  expect(log.emissions.length).toBe(1);
+  expect(log.emissions[0]).toMatchObject({
+    verb: "work",
+    id: "fn-1-foo.1",
+    dir: "/repo",
+    reason: "work-plugin manifest missing for tier 'high'",
+  });
+  // inFlight is left clean — the guard `continue`s before adding the key.
+  expect(state.inFlight.size).toBe(0);
+});
+
+test("runReconcileCycle: present work-plugin manifest (guard ok) launches normally", async () => {
+  // The same ready `work` task, but the guard passes → the launch fires.
+  let checkedTier = "";
+  const { deps, log, setJobByKey } = makeFakeDeps({
+    checkWorkPlugin: (tier) => {
+      checkedTier = tier;
+      return { ok: true };
+    },
+  });
+  setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 200 });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "high" })],
+    sort_path: "000001",
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, liveDispatches, NO_AUTOCLOSE, 0);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(checkedTier).toBe("high");
+  expect(log.launches.length).toBe(1);
+  expect(log.emissions).toEqual([]); // no failure
+  expect(liveDispatches.size).toBe(1);
+});
+
+test("checkWorkPluginManifest: missing dir → not ok with remediation hint", () => {
+  const res = checkWorkPluginManifest("definitely-not-a-real-tier-xyzzy-12345");
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.reason).toContain("work-plugin manifest missing");
+    expect(res.reason).toContain("render-plugin-templates");
+  }
 });
 
 test("runReconcileCycle reap: autoclose=on + role discharged → closeByTabId called when coords present, live entry forgotten", async () => {

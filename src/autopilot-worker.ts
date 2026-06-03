@@ -97,6 +97,7 @@
  * invariant.
  */
 
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
@@ -170,6 +171,72 @@ export const PLANCTL_ROOT: string = ((): string => {
  */
 export function workPluginDir(tier: string): string {
   return `${PLANCTL_ROOT}/work-plugins/${tier}`;
+}
+
+/** Result of validating a tier's work-plugin manifest before launch. */
+export type WorkPluginCheck = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Validate that the tier's work-plugin manifest exists and registers the
+ * plugin under the name `work` BEFORE the autopilot launches a worker
+ * against `workPluginDir(tier)`.
+ *
+ * The per-tier `.claude-plugin/plugin.json` is a GENERATED + gitignored
+ * artifact (planctl fn-637 — rendered from `agent-templates/worker*.tmpl`
+ * by `promptctl render-plugin-templates`, wired through
+ * `scripts/install.sh`). When that file is absent, `claude --plugin-dir
+ * <root>/work-plugins/<tier>` falls back to the DIRECTORY BASENAME as the
+ * plugin name (e.g. `high`), so the agent registers as `high:worker`.
+ * `/plan:work` hardcodes `Task(subagent_type="work:worker")`, which then
+ * fails with `Agent type 'work:worker' not found` AFTER the worker has
+ * burned a ~30s cold boot. Validating here turns that silent token-burn
+ * into a visible sticky `DispatchFailed` carrying a remediation hint —
+ * the autopilot never launches a doomed worker.
+ *
+ * Producer-side fs read — lives in the impure dispatch path
+ * (`runReconcileCycle`), NEVER a fold. Pure of wall-clock/env. Exported
+ * for tests.
+ */
+export function checkWorkPluginManifest(tier: string): WorkPluginCheck {
+  const manifestPath = join(
+    workPluginDir(tier),
+    ".claude-plugin",
+    "plugin.json",
+  );
+  let raw: string;
+  try {
+    raw = readFileSync(manifestPath, "utf8");
+  } catch {
+    return {
+      ok: false,
+      reason:
+        `work-plugin manifest missing for tier '${tier}' at ${manifestPath} — ` +
+        `regenerate with 'promptctl render-plugin-templates --project-root ${PLANCTL_ROOT}' ` +
+        `(or rerun scripts/install.sh); without it claude --plugin-dir falls back to ` +
+        `the dir basename and '/plan:work' cannot resolve 'work:worker'`,
+    };
+  }
+  let name: unknown;
+  try {
+    name = (JSON.parse(raw) as { name?: unknown }).name;
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `work-plugin manifest at ${manifestPath} is not valid JSON: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+  if (name !== "work") {
+    return {
+      ok: false,
+      reason:
+        `work-plugin manifest at ${manifestPath} has name='${String(name)}' ` +
+        `(expected 'work') — '/plan:work' would resolve '${String(name)}:worker', ` +
+        `not 'work:worker'`,
+    };
+  }
+  return { ok: true };
 }
 
 /**
@@ -398,6 +465,15 @@ export interface ConfirmRunningDeps {
    * treats an early resolve as "shutdown — stop polling".
    */
   sleep(ms: number, signal: AbortSignal): Promise<void>;
+  /**
+   * Validate the tier's work-plugin manifest before a `work` launch.
+   * Optional: when absent the guard is a no-op (tests that don't exercise
+   * the manifest path skip wiring it). The live worker always injects the
+   * real {@link checkWorkPluginManifest}. A `{ok:false, reason}` result
+   * blocks the launch with a sticky `DispatchFailed` rather than spawning
+   * a worker that registers under the wrong plugin name and dies.
+   */
+  checkWorkPlugin?(tier: string): WorkPluginCheck;
   /**
    * Tuning knobs — exposed as deps so tests can drive a 5ms / 50ms
    * cadence instead of seconds. Defaults applied in `runConfirmCycle`
@@ -957,6 +1033,25 @@ export async function runReconcileCycle(
       // call could double-queue. Skip to keep one-at-a-time honest.
       continue;
     }
+    // Pre-launch work-plugin manifest guard. A `work` launch points
+    // `claude --plugin-dir` at workPluginDir(tier); if that tier's
+    // generated `.claude-plugin/plugin.json` is missing/misnamed, claude
+    // falls back to the dir basename as the plugin name and `/plan:work`
+    // can't resolve `work:worker` — the worker dies after a cold boot.
+    // Block with a visible sticky DispatchFailed instead of burning it.
+    if (plan.verb === "work" && plan.tier != null && plan.tier !== "") {
+      const check = deps.checkWorkPlugin?.(plan.tier) ?? { ok: true };
+      if (!check.ok) {
+        deps.emitDispatchFailed({
+          verb: plan.verb,
+          id: plan.id,
+          reason: check.reason,
+          dir: plan.cwd === "" ? null : plan.cwd,
+          ts: deps.now(),
+        });
+        continue;
+      }
+    }
     state.inFlight.add(plan.key);
     const argv = buildLaunchArgv(shell, plan.workerCommand);
     try {
@@ -1312,6 +1407,7 @@ function main(): void {
     },
     now: () => Math.floor(Date.now() / 1000),
     sleep: (ms, signal) => abortableSleep(ms, signal),
+    checkWorkPlugin: (tier) => checkWorkPluginManifest(tier),
   };
 
   // Single-flight reconcile drive. `watchLoop` fires this callback on
