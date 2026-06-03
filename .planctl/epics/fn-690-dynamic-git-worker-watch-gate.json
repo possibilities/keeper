@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-690-dynamic-git-worker-watch-gate",
   "bundles": [],
   "closer_done_at": "2026-06-03T21:06:19.550534Z",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T21:06:19.550534Z"
+  "updated_at": "2026-06-03T21:07:18.671933Z"
 }
