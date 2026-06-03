@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Periodic reconcile and targeted drop recovery",
-  "updated_at": "2026-06-02T21:18:25.101893Z"
+  "updated_at": "2026-06-03T00:07:37.380225Z",
+  "worker_done_at": "2026-06-03T00:07:37.380225Z"
 }

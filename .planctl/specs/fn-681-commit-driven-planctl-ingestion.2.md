@@ -71,5 +71,5 @@ target / that only planctl dirs are visited). Use the existing
 - [ ] Heartbeat timer is cancelled on shutdown; `bun test`, typecheck, lint pass
 
 ## Done summary
-
+Added periodic .planctl reconcile heartbeat (60s) + repointed on-drop RescanScheduler callback to .planctl-scoped reconcile (O(#projects), not whole-tree). Shallow discoverPlanctlDirs + additive reconcilePlanctlDirs share the change-gated scanPlanctlDir primitive; deletions stay owned by commit channel + boot sweep + live onDelete. Heartbeat timer cancelled in shutdown handler.
 ## Evidence
