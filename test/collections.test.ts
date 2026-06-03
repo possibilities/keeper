@@ -206,6 +206,19 @@ test("JOBS_DESCRIPTOR serves profile_name for the recent-sessions log (v36)", ()
   expect(JOBS_DESCRIPTOR.jsonColumns.has("profile_name")).toBe(false);
 });
 
+test("JOBS_DESCRIPTOR serves monitors for the expanded-row Monitors section (v51)", () => {
+  // Schema v51 / fn-682 / fn-685: `monitors` is a JSON-TEXT array projected
+  // by the reducer and rendered by `cli/jobs.ts`'s expanded block via
+  // `monitorLinesFor` (which parses the raw JSON string itself). Display-only
+  // — out of sortable / filters / jsonColumns, same as `profile_name` and the
+  // `backend_exec_*` cluster. Without this entry the wire SELECT strands the
+  // field and the Monitors section never renders.
+  expect(JOBS_DESCRIPTOR.columns).toContain("monitors");
+  expect(JOBS_DESCRIPTOR.sortable.has("monitors")).toBe(false);
+  expect(JOBS_DESCRIPTOR.filters.monitors).toBeUndefined();
+  expect(JOBS_DESCRIPTOR.jsonColumns.has("monitors")).toBe(false);
+});
+
 test("getCollection resolves the profiles collection (fn-639)", () => {
   expect(getCollection("profiles")).toBe(PROFILES_DESCRIPTOR);
   expect(PROFILES_DESCRIPTOR.table).toBe("profiles");

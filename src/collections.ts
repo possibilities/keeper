@@ -141,6 +141,13 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "backend_exec_pane_id",
     "backend_exec_tab_id",
     "backend_exec_tab_name",
+    // Schema v51 / fn-682: `monitors` — JSON-TEXT array of live monitor
+    // entries snapshot-replaced on each Stop. Rendered by `cli/jobs.ts`'s
+    // expanded block via `monitorLinesFor`, which parses the raw JSON
+    // string itself, so this stays a raw TEXT scalar at the wire layer —
+    // OUT of `sortable` / `filters` / `jsonColumns` (display-only, same
+    // pattern as `profile_name` and the `backend_exec_*` cluster).
+    "monitors",
   ],
   pk: "job_id",
   version: "last_event_id",
