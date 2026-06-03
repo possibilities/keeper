@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-03T21:06:13.380989Z",
+  "depends_on": [],
+  "epic": "fn-692-fix-clock-domain-mismatch-in-git-worker",
+  "id": "fn-692-fix-clock-domain-mismatch-in-git-worker.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "fix nowMs clock domain and add cutoff test",
+  "updated_at": "2026-06-03T21:06:13.380989Z"
+}
