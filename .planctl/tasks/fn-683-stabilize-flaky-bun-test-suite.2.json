@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Fix opentui concurrent load TDZ",
-  "updated_at": "2026-06-02T22:27:31.432124Z"
+  "updated_at": "2026-06-03T00:57:09.020685Z",
+  "worker_done_at": "2026-06-03T00:57:09.020685Z"
 }
