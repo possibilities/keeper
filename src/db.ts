@@ -362,6 +362,44 @@ export function resolveDeadLetterDir(): string {
 }
 
 /**
+ * Absolute filesystem path of the committed `keeper-zellij-bridge.wasm`
+ * artifact (fn-684 / task .2). This is the single source of truth for the
+ * cross-repo byte-match contract documented in the epic spec:
+ *
+ *   1. THIS file (the committed `.wasm`).
+ *   2. The dotfiles `~/.config/zellij/config.kdl`
+ *      `load_plugins { "file:..." { cwd "<events dir>" } }` URL.
+ *   3. The dotfiles `~/.cache/zellij/permissions.kdl` URL granting
+ *      `ReadApplicationState` to the same `file:` URL.
+ *
+ * Dotfiles refer to `keeper plugin-path` (which is `cli/plugin.ts` printing
+ * this constant) rather than hardcoding the absolute path — so the path can
+ * never drift across the three sites. Moving / renaming the artifact requires
+ * coordinated dotfiles updates; never change the basename or directory.
+ *
+ * Resolution uses Bun's `new URL(..., import.meta.url)` asset idiom, identical
+ * to how `src/daemon.ts` resolves its worker-thread sources — works against
+ * the in-tree source layout (no separate "installed" path layer on this repo).
+ */
+export const KEEPER_ZELLIJ_PLUGIN_WASM = new URL(
+  "../plugin/zellij-bridge/keeper-zellij-bridge.wasm",
+  import.meta.url,
+).pathname;
+
+/**
+ * Absolute path of the sidecar `VERSION` file emitted next to
+ * `KEEPER_ZELLIJ_PLUGIN_WASM` by `scripts/build-plugin.sh`. Carries a single
+ * `zellij-tile=<X.Y.Z>` line read from `Cargo.lock` at build time. The
+ * version-skew test (`test/plugin-version-skew.test.ts`) reads this against
+ * the host's installed `zellij --version` and fails loudly on drift — the
+ * tripwire that keeps the "committed prebuilt" story honest across upgrades.
+ */
+export const KEEPER_ZELLIJ_PLUGIN_VERSION_FILE = new URL(
+  "../plugin/zellij-bridge/VERSION",
+  import.meta.url,
+).pathname;
+
+/**
  * SQLite default `SQLITE_MAX_VARIABLE_NUMBER` is 999 — `IN (?,?,...)` binds
  * one variable per id. Callers of `selectByIds` (`src/collections.ts`) must
  * chunk past this cap or cap their input. The server-worker page sizes

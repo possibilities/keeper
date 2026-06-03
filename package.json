@@ -11,6 +11,7 @@
     "dev": "exec bun --watch run src/daemon.ts",
     "lint": "biome check --no-errors-on-unmatched cli src test",
     "typecheck": "tsc --noEmit",
+    "build:plugin": "bash scripts/build-plugin.sh",
     "test:isolated": "bun test --isolate --path-ignore-patterns='test/ansi-to-styled.test.ts' --path-ignore-patterns='test/live-shell.test.ts'",
     "test:opentui": "bun test test/ansi-to-styled.test.ts test/live-shell.test.ts",
     "test": "bun run test:isolated && bun run test:opentui"

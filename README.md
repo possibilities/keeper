@@ -447,6 +447,65 @@ Keeper has no `install` verb. Wire it up manually:
    `src/readiness-client.ts`) and `keeper approve` (RPC) — see
    [Example clients](#example-clients).
 
+### Zellij bridge plugin (rebuild only)
+
+Keeper's zellij event-bridge plugin (`fn-684`) is committed in pre-built
+form at the canonical stable path
+
+```
+plugin/zellij-bridge/keeper-zellij-bridge.wasm
+```
+
+alongside a sidecar `VERSION` file pinning the `zellij-tile` version it was
+built against. **You do not need a Rust toolchain or `binaryen` to USE
+keeper or run a session** — the committed artifact ships with the repo.
+Toolchain prereqs apply ONLY when you want to rebuild the `.wasm` (e.g.
+after bumping the `zellij-tile` pin in `Cargo.toml`).
+
+Rebuild prereqs:
+
+- A Rust toolchain installed via `rustup` (the build script auto-adds the
+  `wasm32-wasip1` target on first run; `cargo` and `rustup` must be on PATH).
+- `binaryen` for size-optimised builds — `brew install binaryen` (provides
+  `wasm-opt`). When `wasm-opt` is missing the build script prints a loud
+  warning and ships the unoptimised cargo output verbatim; the `.wasm` is
+  still functional, just ~14% larger. CI / release builds should install
+  `binaryen`.
+
+Rebuild:
+
+```sh
+bun run build:plugin
+```
+
+This runs `rustup target add wasm32-wasip1` (idempotent), `cargo build
+--release --target wasm32-wasip1`, optionally `wasm-opt -Oz`, and emits
+both the `.wasm` and the `VERSION` sidecar. Commit all four files together
+(`Cargo.toml`, `Cargo.lock`, `keeper-zellij-bridge.wasm`, `VERSION`).
+
+Canonical path lookup:
+
+```sh
+keeper plugin-path
+# → /Users/.../keeper/plugin/zellij-bridge/keeper-zellij-bridge.wasm
+```
+
+This is the **single source of truth** for the cross-repo byte-match
+contract: the human's dotfiles `~/.config/zellij/config.kdl`
+`load_plugins { "file:..." { cwd "<events dir>" } }` block and
+`~/.cache/zellij/permissions.kdl` `ReadApplicationState` grant must both
+derive their `file:` URL from `keeper plugin-path` rather than hardcoding
+the absolute path. The dotfiles install scripts (separate repo; see
+`fn-684.3` for the wiring contract) consume this verb.
+
+Version-skew safety:
+
+`bun test test/plugin-version-skew.test.ts` reads the sidecar `VERSION`
+line and the host's `zellij --version` and fails loudly with rebuild
+instructions when they drift. Run it after every `brew upgrade zellij` —
+otherwise an agent will silently run a `.wasm` linked against the wrong
+host API.
+
 ## Example clients
 
 The unified `keeper` CLI exposes the example subscribe + RPC clients as

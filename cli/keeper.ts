@@ -30,6 +30,7 @@ export const SUBCOMMANDS = [
   "usage",
   "autopilot",
   "await",
+  "plugin-path",
 ] as const;
 export type Subcommand = (typeof SUBCOMMANDS)[number];
 
@@ -45,6 +46,7 @@ Subcommands:
   usage       Live usage frames
   autopilot   Dispatch log viewer
   await       Block until a planctl board condition holds
+  plugin-path Print the canonical absolute path of the committed zellij bridge .wasm
 
 Flags:
   --help, -h     Show this help
@@ -124,6 +126,7 @@ export async function main(): Promise<void> {
     usage: async (argv) => (await import("./usage")).main(argv),
     autopilot: async (argv) => (await import("./autopilot")).main(argv),
     await: async (argv) => (await import("./await")).main(argv),
+    "plugin-path": async (argv) => (await import("./plugin")).main(argv),
   };
 
   await dispatch(Bun.argv.slice(2), {
