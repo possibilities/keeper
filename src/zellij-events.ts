@@ -119,13 +119,28 @@ export function parseZellijEventLine(line: string): ZellijPaneEvent | null {
   if (typeof obj.seq !== "number" || !Number.isFinite(obj.seq)) {
     return null;
   }
-  if (typeof obj.epoch !== "string" || obj.epoch.length === 0) {
+  // `epoch` and `pane_id` are required join keys the reducer reads as TEXT.
+  // The plugin emits them as bare JSON numbers (lib.rs `to_json`) — accept a
+  // non-empty string or a finite number and coerce to decimal-string form,
+  // the same normalization `tab_id` gets below. Without the number branch,
+  // every real plugin line fails the guard and is silently dropped.
+  let epoch: string;
+  if (typeof obj.epoch === "string" && obj.epoch.length > 0) {
+    epoch = obj.epoch;
+  } else if (typeof obj.epoch === "number" && Number.isFinite(obj.epoch)) {
+    epoch = String(obj.epoch);
+  } else {
     return null;
   }
   if (typeof obj.session !== "string" || obj.session.length === 0) {
     return null;
   }
-  if (typeof obj.pane_id !== "string" || obj.pane_id.length === 0) {
+  let paneId: string;
+  if (typeof obj.pane_id === "string" && obj.pane_id.length > 0) {
+    paneId = obj.pane_id;
+  } else if (typeof obj.pane_id === "number" && Number.isFinite(obj.pane_id)) {
+    paneId = String(obj.pane_id);
+  } else {
     return null;
   }
   // `tab_id` is allowed to be a string (the plugin emits a stringified
@@ -151,9 +166,9 @@ export function parseZellijEventLine(line: string): ZellijPaneEvent | null {
   }
   return {
     seq: obj.seq,
-    epoch: obj.epoch,
+    epoch,
     session: obj.session,
-    pane_id: obj.pane_id,
+    pane_id: paneId,
     tab_id: tabId,
     tab_name: obj.tab_name,
     ts: obj.ts,

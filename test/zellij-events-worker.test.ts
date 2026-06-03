@@ -22,7 +22,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { scanZellijEventsDir } from "../src/daemon";
 import { openDb } from "../src/db";
-import type { ZellijPaneEvent } from "../src/zellij-events";
+import {
+  parseZellijEventLine,
+  type ZellijPaneEvent,
+} from "../src/zellij-events";
 
 let tmpDir: string;
 let dbPath: string;
@@ -479,4 +482,48 @@ test("scanZellijEventsDir watermark survives daemon restart (re-tail from offset
     expect(readBackendExecEvents(db).count).toBe(1);
     db.close();
   }
+});
+
+/**
+ * Golden wire bytes — the EXACT line `PaneLine::to_json`
+ * (plugin/zellij-bridge/src/lib.rs) emits. `epoch`, `pane_id`, and
+ * `tab_id` are bare JSON NUMBERS, not strings. The other tests build
+ * fixtures through `makePaneEvent` (string-typed) + `JSON.stringify`,
+ * which never reproduces this shape — so this is the one test that pins
+ * the producer↔consumer wire contract. Regenerate by copying a real
+ * `to_json` output if the producer's format string ever changes.
+ */
+const GOLDEN_PLUGIN_LINE =
+  '{"seq":7,"epoch":1717430400,"session":"sess-a","pane_id":1,"tab_id":5,"tab_name":"primary","ts":1717430400123}';
+
+test("parseZellijEventLine accepts the numeric epoch/pane_id the plugin actually emits", () => {
+  const ev = parseZellijEventLine(GOLDEN_PLUGIN_LINE);
+  expect(ev).not.toBeNull();
+  // Numeric wire values are coerced to the decimal-string form the
+  // reducer reads as TEXT — same normalization tab_id already gets.
+  expect(ev?.epoch).toBe("1717430400");
+  expect(ev?.pane_id).toBe("1");
+  expect(ev?.tab_id).toBe("5");
+  expect(ev?.session).toBe("sess-a");
+  expect(ev?.tab_name).toBe("primary");
+  expect(ev?.seq).toBe(7);
+  expect(ev?.ts).toBe(1_717_430_400_123);
+});
+
+test("scanZellijEventsDir mints a backend_exec event from the plugin's numeric wire line", () => {
+  const { db, stmts } = openDb(dbPath);
+  mkdirSync(eventsDir, { recursive: true });
+  // Live job carries pane_id "1" (TEXT); the wire's numeric pane_id 1
+  // coerces to "1" and joins. Before the coercion fix this line was
+  // dropped and nothing minted — starving tab-namer / reap-by-tab-id.
+  seedJob(db, "job-1", "sess-a", "1");
+  writeFileSync(join(eventsDir, "sess-a.ndjson"), `${GOLDEN_PLUGIN_LINE}\n`);
+
+  scanZellijEventsDir(db, stmts, eventsDir);
+
+  const { count, rows } = readBackendExecEvents(db);
+  expect(count).toBe(1);
+  expect(JSON.parse(rows[0]?.data ?? "{}").tab_name).toBe("primary");
+
+  db.close();
 });
