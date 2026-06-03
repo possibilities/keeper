@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-692-fix-clock-domain-mismatch-in-git-worker",
   "bundles": [],
   "closer_done_at": "2026-06-03T21:48:54.293877Z",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T21:48:54.293877Z"
+  "updated_at": "2026-06-03T21:49:26.558446Z"
 }
