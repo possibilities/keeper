@@ -28,5 +28,5 @@ truncation. All existing golden-line and ASCII fixtures must continue to pass.
 - [ ] Full `bun test` suite passes.
 
 ## Done summary
-
+Switched scanZellijEventsDir to read the events file as a Buffer and slice via buf.subarray(priorOffset).toString('utf8'), keeping the watermark byte-consistent across read and write sides; added a regression test feeding an emoji tab_name before the watermark followed by an ASCII line.
 ## Evidence

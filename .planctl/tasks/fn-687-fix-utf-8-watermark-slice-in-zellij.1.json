@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "fix daemon.ts utf-8 watermark slice",
-  "updated_at": "2026-06-03T11:42:02.006421Z"
+  "updated_at": "2026-06-03T13:07:29.803269Z",
+  "worker_done_at": "2026-06-03T13:07:29.803269Z"
 }
