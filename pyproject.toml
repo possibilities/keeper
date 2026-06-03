@@ -23,7 +23,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
-addopts = "--import-mode=importlib --timeout=3"
+# fn-638: -n auto parallelises across CPU cores (881 tests, ~3x speedup);
+# --timeout=30 lifts the prior 3s wall that was sub-budget for tests doing
+# real `scaffold` work (git init + `promptctl inline-sketch-refs` subprocess
+# + multiple commit subprocesses under flock). 30s still catches genuine
+# hangs without flagging routine subprocess-heavy paths under xdist load.
+addopts = "--import-mode=importlib --timeout=30 -n auto"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
