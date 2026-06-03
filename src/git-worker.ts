@@ -2043,7 +2043,15 @@ function startWorker(): void {
     }
     reconciling = true;
     try {
-      const nowMs = performance.now();
+      // Date.now() — not performance.now(). nowMs flows into
+      // buildDiscoveryCandidates where it derives `cutoffSec` for a
+      // SQL comparison against `jobs.updated_at` (REAL unix seconds);
+      // mixing performance.now()'s ms-since-process-start domain there
+      // produces a near-zero or negative cutoff and silently disables
+      // the recent-window filter. The downstream elapsed-time uses
+      // (dwell timer, FULL_SWEEP_INTERVAL_MS throttle) stay correct
+      // because they compare nowMs against a same-source stamp.
+      const nowMs = Date.now();
       // Throttle the full-history sweep — fast path otherwise. The fast
       // path's bounded candidate set + the TTL memo together keep
       // steady-state spawns ≈ 0. The slow sweep widens to all

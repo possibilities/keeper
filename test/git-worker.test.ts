@@ -17,6 +17,7 @@ import {
   parseTaskTrailers,
 } from "../src/derivers";
 import {
+  buildDiscoveryCandidates,
   buildGitSnapshot,
   type DiscoveryContext,
   decideHeadDivergence,
@@ -2113,5 +2114,51 @@ test("discoverProjectRoots: null probe + currentlyWatched → fail-open retains 
   };
   const desired = discoverProjectRoots(db, ctx);
   expect(desired).toContain(root);
+  db.close();
+});
+
+test("buildDiscoveryCandidates: performance.now()-scale nowMs would silently disable the fast-path window — Date.now()-scale rejects stale rows", () => {
+  // Pins the clock-units contract that fn-692 fixed. The fast path's
+  // SQL cutoff `(nowMs - RECENT_JOB_WINDOW_MS) / 1000` is compared
+  // against `jobs.updated_at` (REAL unix seconds). If a caller passes
+  // `performance.now()` (ms since process start, e.g. 60_000 = 1 min
+  // since boot) instead of `Date.now()`, the cutoff becomes deeply
+  // negative and the WHERE clause matches every row — the fast path
+  // silently degrades to a full scan. This test feeds both clock
+  // domains against the same DB and asserts the contract: a stale
+  // row (updated_at well outside the window) MUST be excluded under
+  // a real wall-clock `nowMs`, and would WRONGLY be included under
+  // a `performance.now()`-scale `nowMs`.
+  const db = makeDiscoveryDb();
+  const nowSec = Date.now() / 1000;
+  // Stale: updated_at 1 day ago — well outside the 2-hour window.
+  const staleSec = nowSec - 24 * 60 * 60;
+  const staleCwd = "/tmp/keeper-fn692-stale-cwd";
+  db.run(
+    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'stopped', ?)",
+    ["sess-stale", staleCwd, staleSec],
+  );
+
+  // Wall-clock nowMs (Date.now()-scale): cutoff sits at nowSec - 7200,
+  // so the day-old row is correctly excluded.
+  const wallClockCandidates = buildDiscoveryCandidates(db, {
+    nowMs: Date.now(),
+    runFullSweep: false,
+    watched: new Set<string>(),
+  });
+  expect(wallClockCandidates.has(staleCwd)).toBe(false);
+
+  // performance.now()-scale nowMs (e.g. 60_000ms = 1 minute since
+  // process start): cutoff becomes (60_000 - 7_200_000) / 1000 =
+  // -7140, so every non-null-cwd row satisfies `updated_at >= -7140`
+  // and the fast path collapses to a full scan. This branch documents
+  // the bug fn-692 fixed — the row WOULD have leaked through.
+  const perfNowCandidates = buildDiscoveryCandidates(db, {
+    nowMs: 60_000, // performance.now() shape, 1 min since process start
+    runFullSweep: false,
+    watched: new Set<string>(),
+  });
+  expect(perfNowCandidates.has(staleCwd)).toBe(true);
+
   db.close();
 });
