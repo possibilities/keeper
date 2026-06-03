@@ -873,11 +873,12 @@ add_tasks:
 
 
 def test_refine_apply_lock_disjoint_from_commit_lock(planctl_git_repo, monkeypatch):
-    """fn-629 task .2 acceptance: the ``_epic_id_lock`` (id-allocation,
-    sub-millisecond) and the commit lock (held across git commit) stay
-    disjoint — the id lock is RELEASED before the commit lock is taken.
-    Nesting would balloon the id-lock hold time across a git commit and
-    bottleneck concurrent scaffolds in sibling projects.
+    """fn-629 task .2 acceptance (fn-640 retune): the ``_epic_id_lock``
+    (id-allocation, sub-millisecond) is RELEASED before the auto-commit's git
+    commit runs. Nesting would balloon the id-lock hold time across a git
+    commit and bottleneck concurrent scaffolds in sibling projects. Since
+    fn-640 deleted the commit flock, we spy the surviving commit seam
+    (``_git_commit``) instead of the lock-acquire.
     """
     import contextlib as _ctxlib
 
@@ -888,7 +889,7 @@ def test_refine_apply_lock_disjoint_from_commit_lock(planctl_git_repo, monkeypat
 
     events: list[str] = []
     original_lock = _epic_create_mod._epic_id_lock
-    original_acquire = _commit_mod._acquire_commit_lock
+    original_commit = _commit_mod._git_commit
 
     @_ctxlib.contextmanager
     def _spy_id_lock():
@@ -899,17 +900,17 @@ def test_refine_apply_lock_disjoint_from_commit_lock(planctl_git_repo, monkeypat
             finally:
                 events.append("id_lock:exit")
 
-    def _spy_acquire(lock_path):
-        events.append("commit_lock:acquire")
-        fd = original_acquire(lock_path)
-        events.append("commit_lock:acquired")
-        return fd
+    def _spy_commit(msg, files, cwd):
+        events.append("commit:enter")
+        sha = original_commit(msg, files, cwd)
+        events.append("commit:done")
+        return sha
 
     # refine-apply uses a function-local ``from planctl.run_epic_create
     # import _epic_id_lock`` lookup, which resolves the attribute from the
     # source module each call — patching the source attribute is sufficient.
     monkeypatch.setattr(_epic_create_mod, "_epic_id_lock", _spy_id_lock)
-    monkeypatch.setattr(_commit_mod, "_acquire_commit_lock", _spy_acquire)
+    monkeypatch.setattr(_commit_mod, "_git_commit", _spy_commit)
 
     delta = f"""\
 add_tasks:
@@ -923,9 +924,9 @@ add_tasks:
     r = _invoke(["refine-apply", epic_id, "--file", delta_path])
     assert r.exit_code == 0, r.output
 
-    # The id lock RELEASED before the commit lock ACQUIRED — no nesting.
+    # The id lock RELEASED before the git commit runs — no nesting.
     id_exit_idx = events.index("id_lock:exit")
-    commit_acquire_idx = events.index("commit_lock:acquire")
-    assert id_exit_idx < commit_acquire_idx, (
-        f"id lock must release before commit lock acquires; event order: {events}"
+    commit_enter_idx = events.index("commit:enter")
+    assert id_exit_idx < commit_enter_idx, (
+        f"id lock must release before the git commit runs; event order: {events}"
     )

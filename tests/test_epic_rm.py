@@ -547,10 +547,11 @@ def test_rm_commit_failure_emits_structured_envelope(planctl_git_repo, monkeypat
 
 
 def test_rm_no_lock_nesting(planctl_git_repo, monkeypatch):
-    """fn-629 task .2 acceptance: epic rm doesn't take the ``_epic_id_lock``
-    at all (it's a delete verb, no id allocation), so the commit lock holds
-    independently. Smoke-check: the commit lock fires as expected and no
-    spurious id-lock acquisition leaks into the rm path.
+    """fn-629 task .2 acceptance (fn-640 retune): epic rm doesn't take the
+    ``_epic_id_lock`` at all (it's a delete verb, no id allocation). Since
+    fn-640 deleted the commit flock, we spy the surviving commit seam
+    (``_git_commit``) to prove the auto-commit fires and no spurious id-lock
+    acquisition leaks into the rm path.
     """
     import planctl.commit as _commit_mod
     import planctl.run_epic_create as _epic_create_mod
@@ -559,7 +560,7 @@ def test_rm_no_lock_nesting(planctl_git_repo, monkeypatch):
 
     events: list[str] = []
     original_lock = _epic_create_mod._epic_id_lock
-    original_acquire = _commit_mod._acquire_commit_lock
+    original_commit = _commit_mod._git_commit
 
     import contextlib as _ctxlib
 
@@ -572,14 +573,14 @@ def test_rm_no_lock_nesting(planctl_git_repo, monkeypatch):
             finally:
                 events.append("id_lock:exit")
 
-    def _spy_acquire(lock_path):
-        events.append("commit_lock:acquire")
-        fd = original_acquire(lock_path)
-        events.append("commit_lock:acquired")
-        return fd
+    def _spy_commit(msg, files, cwd):
+        events.append("commit:enter")
+        sha = original_commit(msg, files, cwd)
+        events.append("commit:done")
+        return sha
 
     monkeypatch.setattr(_epic_create_mod, "_epic_id_lock", _spy_id_lock)
-    monkeypatch.setattr(_commit_mod, "_acquire_commit_lock", _spy_acquire)
+    monkeypatch.setattr(_commit_mod, "_git_commit", _spy_commit)
 
     epic_id, _ = seed_epic(planctl_git_repo, n_tasks=1)
     # The seed went through scaffold which took the id lock — clear so we
@@ -590,9 +591,9 @@ def test_rm_no_lock_nesting(planctl_git_repo, monkeypatch):
     assert code == 0, output
     assert obj is not None and obj["success"] is True
 
-    # rm takes the commit lock (HEAD advances) and NEVER touches the id
-    # lock — there's no id to allocate.
-    assert "commit_lock:acquired" in events, events
+    # rm commits (HEAD advances) and NEVER touches the id lock — there's no
+    # id to allocate.
+    assert "commit:done" in events, events
     assert "id_lock:enter" not in events, (
         f"epic rm must not take the id-allocation lock; events: {events}"
     )

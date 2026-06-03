@@ -3,30 +3,31 @@
 Every mutating planctl verb's stdout envelope carries a ``planctl_invocation``
 payload (see ``planctl.invocation.build_planctl_invocation``).  The runner-side
 ``emit()`` calls :func:`auto_commit_from_invocation` to land the corresponding
-``chore(planctl): <op> <target>`` commit inline, under the
-``$GIT_COMMON_DIR/planctl-commit.lock`` flock.  Replaces the deleted seven-seam
-``planctl commit-plan`` model (fn-488 → fn-587).
+``chore(planctl): <op> <target>`` commit inline.  Replaces the deleted
+seven-seam ``planctl commit-plan`` model (fn-488 → fn-587).
 
 This module exposes one public entry point — :func:`auto_commit_from_invocation`.
-The flock + git plumbing was originally copied from
-``jobctl/run_commit_work.py::_acquire_commit_lock``; planctl now owns its own
-lock file (``planctl-commit.lock``) since the two sides stage disjoint
-pathspecs (planctl: ``.planctl/`` only; jobctl: excludes ``.planctl/``).
+There is no flock: each commit is pathspec-scoped to its own exact files
+(``git commit -F - -- <files>``), so concurrent same-repo verbs never
+cross-contaminate, and a bounded full-jitter retry handles the two git lock
+domains (``index.lock`` for staging, ref-lock for the commit) by re-running
+add+commit from the current HEAD each attempt (fn-640).
 """
 
 from __future__ import annotations
 
-import fcntl
-import os
+import random
 import subprocess
 import sys
 import time
 from typing import Any
 
-# How long to spin waiting for the commit lock (seconds).  Same value as
-# ``jobctl/run_commit_work.py::_LOCK_TIMEOUT_SECONDS`` so starvation
-# diagnostics surface with the same envelope shape on either side.
-_LOCK_TIMEOUT_SECONDS = 60
+# Bounded retry over git's own lock domains (index.lock + ref-lock).  Sized so
+# the worst case (8 × 2s cap ≈ 16s) fits the 30s xdist test timeout with
+# margin.  Full-jitter backoff: ``delay = random(0, min(cap, base * 2**n))``.
+_RETRY_MAX_ATTEMPTS = 8
+_RETRY_BASE_SECONDS = 0.1
+_RETRY_CAP_SECONDS = 2.0
 
 
 class CommitFailed(Exception):
@@ -37,11 +38,10 @@ class CommitFailed(Exception):
     a free-form message.
 
     Attributes:
-        error: Short error code (``"lock_timeout"``, ``"git_add"``,
+        error: Short error code (``"commit_contended"``, ``"git_add"``,
             ``"git_commit"``, ``"git_status"``).
         message: Human-readable detail (verbatim stderr where applicable).
-        extra: Optional structured fields (e.g. ``holder_pid`` for
-            lock_timeout).
+        extra: Optional structured fields.
     """
 
     def __init__(
@@ -55,108 +55,6 @@ class CommitFailed(Exception):
         self.message = message
         self.extra = extra or {}
         super().__init__(f"{error}: {message}")
-
-
-# ---------------------------------------------------------------------------
-# Flock — planctl-owned at $GIT_COMMON_DIR/planctl-commit.lock.
-# ---------------------------------------------------------------------------
-
-
-def _git_common_dir(cwd: str) -> str:
-    """Return the git common dir (shared across worktrees; same as .git in
-    non-worktrees).
-
-    Mirrors ``jobctl/run_commit_work.py::_git_common_dir`` so the lock path
-    resolution is byte-identical with jobctl's (independent file, same dir).
-    """
-    result = subprocess.run(
-        ["git", "rev-parse", "--git-common-dir"],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip() if result.returncode == 0 else ".git"
-
-
-def _acquire_commit_lock(lock_path: str) -> int:
-    """Acquire LOCK_EX on *lock_path* with a 60-second timeout.
-
-    Returns the open file descriptor (caller must close / release).  The FD
-    is ``O_CLOEXEC`` so child processes (git) don't inherit it.
-
-    On timeout, reads the lockfile to surface holder PID/cmdline and raises
-    :class:`CommitFailed` with ``error="lock_timeout"``.  Verbatim behavioural
-    mirror of ``jobctl/run_commit_work.py::_acquire_commit_lock`` — kept in
-    sync so diagnostics shape is consistent across the two independent locks.
-    """
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
-
-    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # Lock acquired — write holder info so waiters can diagnose timeout.
-            pid = os.getpid()
-            cmdline: str
-            try:
-                # Linux: /proc/<pid>/cmdline is null-separated argv.
-                with open(f"/proc/{pid}/cmdline", "rb") as f:
-                    cmdline = (
-                        f.read().replace(b"\x00", b" ").decode(errors="replace").strip()
-                    )
-            except Exception:
-                # macOS / BSD: no procfs — ask `ps` for the command.  Falls
-                # back to sys.argv if even ps fails so we always have
-                # *something* identifying the holder.
-                try:
-                    ps_result = subprocess.run(
-                        ["ps", "-p", str(pid), "-o", "command="],
-                        capture_output=True,
-                        text=True,
-                        timeout=2,
-                    )
-                    cmdline = ps_result.stdout.strip() or " ".join(sys.argv)
-                except Exception:
-                    cmdline = " ".join(sys.argv)
-            os.ftruncate(fd, 0)
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, f"pid={pid}\ncmdline={cmdline}\n".encode())
-            return fd
-        except OSError:
-            if time.monotonic() >= deadline:
-                # Read current holder info from lockfile for diagnostics.
-                holder_pid: int | None = None
-                holder_cmdline: str | None = None
-                try:
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    contents = os.read(fd, 4096).decode(errors="replace")
-                    for line in contents.splitlines():
-                        if line.startswith("pid="):
-                            holder_pid = int(line[4:].strip())
-                        elif line.startswith("cmdline="):
-                            holder_cmdline = line[8:].strip()
-                except Exception:
-                    pass
-                os.close(fd)
-                raise CommitFailed(
-                    "lock_timeout",
-                    f"timed out waiting {_LOCK_TIMEOUT_SECONDS}s for "
-                    f"{lock_path} (holder pid={holder_pid})",
-                    extra={
-                        "holder_pid": holder_pid,
-                        "holder_cmdline": holder_cmdline,
-                        "lock_path": lock_path,
-                    },
-                ) from None
-            time.sleep(0.1)
-
-
-def _release_commit_lock(fd: int) -> None:
-    """Release the flock and close the FD."""
-    try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -246,18 +144,24 @@ def _git_stage(files: list[str], cwd: str) -> None:
         )
 
 
-def _git_commit(msg: str, cwd: str) -> str:
-    """Commit whatever is currently staged with *msg*.  Returns the full SHA.
+def _git_commit(msg: str, files: list[str], cwd: str) -> str:
+    """Commit *files* with *msg* (pathspec-scoped).  Returns the full SHA.
 
-    Uses ``git commit -F -`` (message via stdin) for injection-safety.
-    Returns the long sha so downstream consumers (keeper's commit
-    attribution, log scans) see the canonical full-length identifier.
+    Uses ``git commit -F - -- <files>`` (message via stdin for
+    injection-safety; trailing pathspec to scope the commit).  The pathspec
+    builds the committed tree from HEAD plus exactly the listed paths, so a
+    concurrent sibling's staged-but-unrelated files never leak into this
+    commit even when both verbs share one index.  Returns the long sha so
+    downstream consumers (keeper's commit attribution, log scans) see the
+    canonical full-length identifier.
 
     Raises :class:`CommitFailed` with ``error="git_commit"`` on failure
-    (e.g. pre-commit hook rejection, empty tree, signing failure).
+    (e.g. pre-commit hook rejection, empty tree, signing failure, ref-lock
+    contention).  Ref-lock contention is distinguished by the caller via
+    :func:`_is_ref_lock_contention` and retried, not surfaced.
     """
     commit_result = subprocess.run(
-        ["git", "commit", "-F", "-"],
+        ["git", "commit", "-F", "-", "--", *files],
         input=msg,
         cwd=cwd,
         capture_output=True,
@@ -276,6 +180,42 @@ def _git_commit(msg: str, cwd: str) -> str:
         text=True,
     )
     return sha_result.stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# Contention detection — match git's lock-domain stderr, not exit codes.
+# ---------------------------------------------------------------------------
+#
+# Two distinct git lock domains can transiently lose a race against a
+# concurrent same-repo verb:
+#
+#   * the index lock (``.git/index.lock``) — guards ``git add`` / index
+#     writes; a loser sees ``Unable to create '<...>/index.lock': File
+#     exists``.
+#   * the ref lock (``.git/refs/...`` / ``packed-refs.lock``) — guards the
+#     final ref update inside ``git commit``; a loser sees ``cannot lock
+#     ref 'HEAD'`` (or a packed-refs variant).
+#
+# We match on the verbatim stderr substrings rather than git's numeric exit
+# codes: those codes are not stable across git versions, and matching them
+# would risk retrying genuine failures (hook rejection, signing, empty tree)
+# which must surface immediately.
+
+
+def _is_stage_contention(message: str) -> bool:
+    """True when *message* is an ``index.lock`` race (retryable stage loss)."""
+    return "index.lock" in message or "File exists" in message
+
+
+def _is_commit_contention(message: str) -> bool:
+    """True when *message* is a ref-lock race (retryable commit loss).
+
+    A ref-lock loser must NOT naively retry the bare ``git commit`` — that
+    would leave a second dangling commit off the stale parent.  The retry
+    re-runs add+commit from the current HEAD so the new commit re-parents off
+    the winner's tip; pathspec-scoping makes that merge-free.
+    """
+    return "cannot lock ref" in message
 
 
 # ---------------------------------------------------------------------------
@@ -310,11 +250,12 @@ def _build_message_with_trailers(
 
 
 def auto_commit_from_invocation(payload: dict[str, Any]) -> str | None:
-    """Commit ``payload['files']`` under the planctl commit flock.
+    """Commit ``payload['files']`` (pathspec-scoped, with a bounded retry).
 
     Returns the commit SHA on success, ``None`` on the no-op-clean path
     (no dirty files in scope), and raises :class:`CommitFailed` on any
-    hard failure (lock timeout, git status / add / commit error).
+    hard failure (git status / add / commit error, or
+    ``"commit_contended"`` on retry exhaustion).
 
     *payload* is the ``planctl_invocation`` envelope dict built by
     :func:`planctl.invocation.build_planctl_invocation`.  Relevant fields:
@@ -329,12 +270,19 @@ def auto_commit_from_invocation(payload: dict[str, Any]) -> str | None:
       ``.planctl/`` carries the state.  Falls back to ``repo_root`` with
       a stderr warning when absent or stale (older envelope shapes).
 
-    The git commit lands under ``LOCK_EX`` on
-    ``$GIT_COMMON_DIR/planctl-commit.lock``, so concurrent planctl verbs
-    on the same host serialise cleanly.  The lock is no longer shared
-    with ``jobctl commit-work`` — pathspecs are disjoint (planctl stages
-    ``.planctl/`` only; jobctl excludes it) and git's own ``index.lock``
-    guards simultaneous index writes.
+    There is no flock.  Each commit is scoped to its own exact paths via
+    ``git commit -F - -- <files>``, so two same-repo verbs sharing one index
+    never cross-contaminate (the loser's staged files never leak into the
+    winner's commit).  The two git lock domains that can transiently lose a
+    race — the index lock (stage) and the ref lock (commit) — are absorbed
+    by a bounded full-jitter retry that re-runs the FULL ``git add`` +
+    ``git commit`` from the current HEAD each attempt.  Re-reading HEAD inside
+    the retried body is the keystone: a ref-lock loser re-parents off the
+    winner's tip (safe — disjoint pathspec-scoped files need no merge) and
+    the ``Planctl-Prev-Op`` trailer reflects the FINAL parent.  Retry fires
+    ONLY on contention stderr; a genuine failure (hook reject, signing,
+    empty tree) surfaces immediately.  On exhaustion:
+    ``CommitFailed("commit_contended", ...)``.
     """
     files = payload.get("files")
     if not files:
@@ -372,32 +320,58 @@ def auto_commit_from_invocation(payload: dict[str, Any]) -> str | None:
     op = payload.get("op", "")
     target = payload.get("target") or ""
 
-    # Acquire the per-repo commit lock.  planctl-owned (not shared with
-    # `jobctl commit-work`) — pathspecs are disjoint and git's own
-    # `index.lock` guards simultaneous index writes.
-    git_common = _git_common_dir(state_repo)
-    if not os.path.isabs(git_common):
-        git_common = os.path.join(state_repo, git_common)
-    lock_path = os.path.join(git_common, "planctl-commit.lock")
+    # No flock.  Run the dirty-confirm → stage → commit sequence under a
+    # bounded full-jitter retry over git's own lock domains.  Each attempt
+    # re-runs the FULL add+commit from current HEAD — a ref-lock loser must
+    # re-parent off the winner's tip, never write a second dangling commit.
+    files = list(files)
+    for attempt in range(_RETRY_MAX_ATTEMPTS):
+        try:
+            # Re-confirm dirtiness each attempt — a concurrent verb may have
+            # already committed our files (harmless under pathspec-scoping,
+            # but short-circuits into the no-op path instead of an empty
+            # commit / spurious hook-reject retry).  Intersect payload['files']
+            # with what git reports dirty now.
+            dirty = _dirty_files_for_pathspecs(files, state_repo)
+            if not dirty:
+                return None
 
-    lock_fd = _acquire_commit_lock(lock_path)
-    try:
-        # Re-confirm dirtiness under the lock — a concurrent verb may have
-        # already committed our files between payload-build and lock-acquire.
-        # Intersect payload['files'] with what git reports dirty now.
-        dirty = _dirty_files_for_pathspecs(list(files), state_repo)
-        if not dirty:
-            return None
+            # Re-read HEAD inside the retried body so the Planctl-Prev-Op
+            # trailer reflects the FINAL parent after a ref-lock re-parent.
+            prev_sha = _current_head(state_repo)
+            msg = _build_message_with_trailers(subject, op, target, prev_sha)
 
-        prev_sha = _current_head(state_repo)
-        msg = _build_message_with_trailers(subject, op, target, prev_sha)
+            _git_stage(dirty, state_repo)
+            return _git_commit(msg, dirty, state_repo)
+        except CommitFailed as exc:
+            stage_contended = exc.error == "git_add" and _is_stage_contention(
+                exc.message
+            )
+            commit_contended = exc.error == "git_commit" and _is_commit_contention(
+                exc.message
+            )
+            if not (stage_contended or commit_contended):
+                # Genuine failure (hook reject, signing, empty tree, real
+                # add/status error) — surface immediately, never mask it.
+                raise
+            if attempt == _RETRY_MAX_ATTEMPTS - 1:
+                raise CommitFailed(
+                    "commit_contended",
+                    f"git lock contention persisted across "
+                    f"{_RETRY_MAX_ATTEMPTS} attempts: {exc.message}",
+                ) from exc
+            # Full-jitter backoff before re-running add+commit from HEAD.
+            delay = random.uniform(
+                0.0,
+                min(_RETRY_CAP_SECONDS, _RETRY_BASE_SECONDS * (2**attempt)),
+            )
+            time.sleep(delay)
 
-        _git_stage(dirty, state_repo)
-        new_sha = _git_commit(msg, state_repo)
-    finally:
-        _release_commit_lock(lock_fd)
-
-    return new_sha
+    # Unreachable — the loop either returns or raises on the final attempt.
+    raise CommitFailed(
+        "commit_contended",
+        f"git lock contention persisted across {_RETRY_MAX_ATTEMPTS} attempts",
+    )
 
 
 __all__ = (

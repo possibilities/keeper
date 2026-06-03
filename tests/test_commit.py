@@ -7,7 +7,7 @@ Coverage matrix:
   with the subject from the payload, returns the long sha, backfills the audit
   row when ``audit_row_id`` is present.
 - No-op path — empty / None ``files`` returns ``None`` without touching git.
-- No-op path under flock — files in payload but clean tree returns ``None``.
+- No-op path on a clean tree — files in payload but clean tree returns ``None``.
 - Hard failure path — commit fails (e.g. nothing actually dirty after a
   concurrent commit raced us, simulated by writing files outside the payload
   scope) raises :class:`CommitFailed`.
@@ -115,12 +115,12 @@ def test_auto_commit_returns_none_when_files_empty(planctl_git_repo):
     assert _git_commit_count(planctl_git_repo) == pre
 
 
-def test_auto_commit_returns_none_when_tree_clean_under_lock(planctl_git_repo):
+def test_auto_commit_returns_none_when_tree_clean(planctl_git_repo):
     """Payload lists files, but the worktree is clean for them — no-op return.
 
-    Mirrors the post-lock no-op check: a concurrent verb may have committed
-    our intended files between payload-build and lock-acquire, and we must
-    NOT create an empty commit in that case.
+    Mirrors the dirty re-confirm: a concurrent verb may have committed our
+    intended files between payload-build and the auto-commit call, and we
+    must NOT create an empty commit in that case.
     """
     # Create a tracked file, commit it, then call auto_commit with that path
     # in the payload — the path is clean now, so the call must no-op.
@@ -298,8 +298,9 @@ def test_auto_commit_raises_commit_failed_on_git_commit_error(
 
     # Force git commit to fail by wedging an unsigned-commit requirement
     # against a config that won't allow it.  Simpler: monkeypatch
-    # `_git_commit` in the commit module to raise.
-    def _boom(msg: str, cwd: str) -> str:
+    # `_git_commit` in the commit module to raise.  Signature now carries the
+    # pathspec-scoping `files` arg (fn-640).
+    def _boom(msg: str, files: list[str], cwd: str) -> str:
         raise CommitFailed("git_commit", "synthesized failure")
 
     monkeypatch.setattr(commit_module, "_git_commit", _boom)
@@ -320,19 +321,19 @@ def test_auto_commit_raises_commit_failed_on_git_commit_error(
 
 
 # ---------------------------------------------------------------------------
-# Flock acquisition — basic smoke test (full lock-timeout coverage stays
-# in test_commit_plan.py until task .5 deletes it).
+# Sequential commits + lock-domain retry (fn-640: no flock; bounded retry
+# over git's own index.lock / ref-lock domains).
 # ---------------------------------------------------------------------------
 
 
-def test_auto_commit_releases_lock_on_success(planctl_git_repo):
-    """After a successful commit, a second call on the same repo proceeds.
+def test_auto_commit_two_sequential_commits_succeed(planctl_git_repo):
+    """Two back-to-back commits on the same repo both land, distinct shas.
 
-    Smoke test for FD/lock cleanup — if the lock leaked, the second call
-    would either block 60s or fail.  We bound the second call's wall-clock
-    to a few seconds via a follow-up empty no-op payload.
+    Replaces the old lock-release smoke test — there is no flock to leak.
+    HEAD must advance once per call and the second commit re-parents off the
+    first.  Bounded wall-clock guards against an accidental retry-storm.
     """
-    rel = _make_dirty(planctl_git_repo, ".planctl/epics/lock1.txt")
+    rel = _make_dirty(planctl_git_repo, ".planctl/epics/seq1.txt")
     sha1 = auto_commit_from_invocation(
         {
             "files": [rel],
@@ -345,9 +346,8 @@ def test_auto_commit_releases_lock_on_success(planctl_git_repo):
     )
     assert sha1 is not None
 
-    # Second call should not block — measure wall-clock.
     start = time.monotonic()
-    rel2 = _make_dirty(planctl_git_repo, ".planctl/epics/lock2.txt")
+    rel2 = _make_dirty(planctl_git_repo, ".planctl/epics/seq2.txt")
     sha2 = auto_commit_from_invocation(
         {
             "files": [rel2],
@@ -361,4 +361,116 @@ def test_auto_commit_releases_lock_on_success(planctl_git_repo):
     elapsed = time.monotonic() - start
     assert sha2 is not None
     assert sha2 != sha1
-    assert elapsed < 5.0, f"lock acquisition took {elapsed:.2f}s — possible leak"
+    assert elapsed < 5.0, f"second commit took {elapsed:.2f}s — possible retry storm"
+
+
+def test_auto_commit_retries_past_preexisting_index_lock(planctl_git_repo):
+    """A stale ``index.lock`` makes the first stage attempt fail; once a side
+    thread removes it the bounded retry stages + commits successfully.
+
+    Deterministic and xdist-safe: no OS threads.  We pre-create the index
+    lock, then monkeypatch ``time.sleep`` in the commit module to remove the
+    lock on the first backoff — so attempt 2 finds a clean index.  Asserts the
+    commit ultimately lands and that a retry actually happened.
+    """
+    rel = _make_dirty(planctl_git_repo, ".planctl/epics/contend.txt")
+    pre = _git_commit_count(planctl_git_repo)
+
+    lock_file = planctl_git_repo / ".git" / "index.lock"
+    lock_file.write_text("")  # git add will refuse: "File exists"
+
+    backoffs: list[float] = []
+    real_sleep = time.sleep
+
+    def _sleep_then_clear(delay: float) -> None:
+        backoffs.append(delay)
+        # First backoff: clear the contention so the next attempt succeeds.
+        if lock_file.exists():
+            lock_file.unlink()
+        real_sleep(0)  # don't actually wait — keep the test fast
+
+    monkeypatch_sleep = pytest.MonkeyPatch()
+    monkeypatch_sleep.setattr(commit_module.time, "sleep", _sleep_then_clear)
+    try:
+        sha = auto_commit_from_invocation(
+            {
+                "files": [rel],
+                "op": "approve",
+                "target": "fn-640-retry",
+                "subject": "chore(planctl): approve fn-640-retry",
+                "state_repo": str(planctl_git_repo),
+                "repo_root": str(planctl_git_repo),
+            }
+        )
+    finally:
+        monkeypatch_sleep.undo()
+
+    assert sha is not None
+    assert len(sha) == 40
+    assert _git_commit_count(planctl_git_repo) == pre + 1
+    assert len(backoffs) >= 1, "expected at least one retry backoff"
+    assert not lock_file.exists(), "index.lock must be cleared after success"
+
+
+def test_auto_commit_raises_commit_contended_on_exhaustion(
+    planctl_git_repo, monkeypatch
+):
+    """Persistent ``index.lock`` contention across all attempts surfaces as
+    :class:`CommitFailed` ``"commit_contended"`` — never as ``git_add``.
+    """
+    rel = _make_dirty(planctl_git_repo, ".planctl/epics/exhaust.txt")
+
+    # A persistent index.lock that never clears — every stage attempt fails
+    # with "File exists".  Stub the backoff so the 8 attempts run instantly.
+    lock_file = planctl_git_repo / ".git" / "index.lock"
+    lock_file.write_text("")
+    monkeypatch.setattr(commit_module.time, "sleep", lambda _delay: None)
+
+    try:
+        with pytest.raises(CommitFailed) as ei:
+            auto_commit_from_invocation(
+                {
+                    "files": [rel],
+                    "op": "approve",
+                    "target": "fn-640-exhaust",
+                    "subject": "chore(planctl): approve fn-640-exhaust",
+                    "state_repo": str(planctl_git_repo),
+                    "repo_root": str(planctl_git_repo),
+                }
+            )
+    finally:
+        if lock_file.exists():
+            lock_file.unlink()
+
+    assert ei.value.error == "commit_contended"
+
+
+def test_auto_commit_does_not_retry_genuine_commit_failure(
+    planctl_git_repo, monkeypatch
+):
+    """A non-contention ``git_commit`` failure (e.g. hook reject) surfaces
+    immediately and is NOT retried — masking it would hide real errors.
+    """
+    calls = {"n": 0}
+
+    def _boom(msg: str, files: list[str], cwd: str) -> str:
+        calls["n"] += 1
+        raise CommitFailed("git_commit", "pre-commit hook rejected the change")
+
+    monkeypatch.setattr(commit_module, "_git_commit", _boom)
+    monkeypatch.setattr(commit_module.time, "sleep", lambda _delay: None)
+
+    rel = _make_dirty(planctl_git_repo, ".planctl/epics/genuine.txt")
+    with pytest.raises(CommitFailed) as ei:
+        auto_commit_from_invocation(
+            {
+                "files": [rel],
+                "op": "approve",
+                "target": "fn-640-genuine",
+                "subject": "chore(planctl): approve fn-640-genuine",
+                "state_repo": str(planctl_git_repo),
+                "repo_root": str(planctl_git_repo),
+            }
+        )
+    assert ei.value.error == "git_commit"
+    assert calls["n"] == 1, "genuine failure must not be retried"
