@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-691-tui-re-fold-progress-indicator",
   "bundles": [],
   "closer_done_at": "2026-06-03T21:34:18.810502Z",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T21:34:18.810502Z"
+  "updated_at": "2026-06-03T21:34:39.590668Z"
 }
