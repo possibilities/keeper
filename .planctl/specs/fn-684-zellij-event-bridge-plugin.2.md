@@ -41,5 +41,5 @@ Add `test/plugin-version-skew.test.ts`: read the installed `zellij --version`, r
 - [ ] README install section documents the Rust + `binaryen` prereq for rebuilds and the `build:plugin` step
 
 ## Done summary
-
+Wired the first Rust build into keeper as 'bun run build:plugin' (rustup target add + cargo --release + wasm-opt -Oz, with binaryen-missing fallback) producing the committed plugin/zellij-bridge/keeper-zellij-bridge.wasm + Cargo.lock-derived VERSION sidecar, exposed the canonical path as the KEEPER_ZELLIJ_PLUGIN_WASM constant + 'keeper plugin-path' subcommand so dotfiles consume one source of truth for the cross-repo byte-match contract, and added the version-skew tripwire test that fails loudly with rebuild instructions on drift (skips when zellij is absent).
 ## Evidence
