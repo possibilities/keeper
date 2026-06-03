@@ -100,11 +100,12 @@ def emit(
         # envelope is NOT printed. Replaced the seven-seam ``planctl
         # commit-plan`` model (fn-488) — every mutating verb now owns its
         # own commit at the verb boundary.
-        try:
-            from planctl import commit as _commit_mod
+        from planctl.commit import CommitFailed as _CommitFailed
+        from planctl.commit import auto_commit_from_invocation as _auto_commit
 
-            _commit_mod.auto_commit_from_invocation(planctl_invocation)
-        except _commit_mod.CommitFailed as exc:
+        try:
+            _auto_commit(planctl_invocation)
+        except _CommitFailed as exc:
             # Commit failure: a git status/add/commit error, or
             # ``commit_contended`` on bounded-retry exhaustion. The commit did
             # not land — emit the structured failure envelope and exit 1. No

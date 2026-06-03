@@ -1243,7 +1243,7 @@ def test_scaffold_integrity_failure_aborts_no_writes(planctl_git_repo, monkeypat
     monkeypatch.setattr(
         _integ,
         "check_epic_tree_in_memory",
-        lambda *_a, **_kw: (["synthetic: integrity says no"], []),
+        lambda *_, **__: (["synthetic: integrity says no"], []),
     )
 
     yaml_path = _write_yaml(planctl_git_repo, _two_task_yaml())
@@ -1785,7 +1785,7 @@ def test_scaffold_integrity_failure_leaves_scan_max_unchanged(
     monkeypatch.setattr(
         _integ,
         "check_epic_tree_in_memory",
-        lambda *_a, **_kw: (["synthetic: gate fails"], []),
+        lambda *_, **__: (["synthetic: gate fails"], []),
     )
 
     yaml_path = _write_yaml(planctl_git_repo, _two_task_yaml())
@@ -1829,7 +1829,7 @@ def test_scaffold_integrity_failure_writes_no_spec_files_at_all(
     monkeypatch.setattr(
         _integ,
         "check_epic_tree_in_memory",
-        lambda *_a, **_kw: (["synthetic: gate fails"], []),
+        lambda *_, **__: (["synthetic: gate fails"], []),
     )
 
     yaml_path = _write_yaml(planctl_git_repo, _two_task_yaml())
