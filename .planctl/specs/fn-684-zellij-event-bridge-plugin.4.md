@@ -41,5 +41,5 @@ Boot test (mirror the existing daemon boot tests, sandboxed `KEEPER_ZELLIJ_EVENT
 - [ ] Boot test covers events-dir creation + idempotent re-ensure, and asserts the retired keeper-side load path emits nothing
 
 ## Done summary
-
+keeper now mkdir -p's the zellij events dir unconditionally on daemon boot (runs regardless of KEEPER_ZELLIJ_FEED so the dotfiles-loaded plugin always finds its pinned /host); README Install gains a 'Zellij bridge plugin (dotfiles wiring)' subsection documenting the three-place byte-match contract (committed .wasm + config.kdl load_plugins cwd=events-dir + permissions.kdl ReadApplicationState grant) all sourced from 'keeper plugin-path'; boot test asserts dir creation + idempotent re-boot, and a regression guard scans src/ for the retired 'start-or-reload-plugin' argv.
 ## Evidence
