@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-06-02T23:06:05.621401Z",
   "depends_on": [
@@ -12,6 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "cutover and retire poller",
-  "updated_at": "2026-06-03T04:04:02.270289Z",
+  "updated_at": "2026-06-03T04:05:39.368761Z",
   "worker_done_at": "2026-06-03T04:04:02.270289Z"
 }
