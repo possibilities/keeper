@@ -3,6 +3,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -17,13 +18,18 @@ import {
 } from "../src/derivers";
 import {
   buildGitSnapshot,
+  type DiscoveryContext,
   decideHeadDivergence,
+  decideReconcileTransitions,
+  discoverProjectRoots,
   enumerateCommitsInDelta,
   filterPlanctlChanges,
   type GitDirtyFile,
   isPlanctlChangedPath,
   parsePorcelainV2,
+  probeWatchMembership,
   resolveHeadOidViaFs,
+  shouldWatchRoot,
 } from "../src/git-worker";
 
 // ---------------------------------------------------------------------------
@@ -1535,4 +1541,577 @@ test("enumerateCommitsInDelta: an `add` of planctl files → filterPlanctlChange
   );
   // Every entry is an upsert.
   expect(changes.every((c) => c.op === "upsert")).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// fn-690 — dynamic watch-membership gate. The watch verdict widens from
+// `.planctl`-only to `.planctl || dirty || ahead>0`, recomputed each
+// reconcile against a bounded + TTL-memoized candidate set with a
+// cooling-hysteresis drop. All the rules below live entirely on the
+// producer side; the reducer is untouched so re-fold determinism holds.
+// ---------------------------------------------------------------------------
+
+function gitCommitSimple(root: string, message: string): void {
+  const add = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!add.success) throw new Error("git add failed");
+  const commit = Bun.spawnSync(
+    ["git", "-C", root, "commit", "-q", "-m", message],
+    { stdout: "ignore", stderr: "ignore" },
+  );
+  if (!commit.success) throw new Error("git commit failed");
+}
+
+/**
+ * Set up a real-git tmp repo with an upstream tracking branch, so the
+ * watch-membership probe's `# branch.ab +N -M` parse has something to
+ * read. Uses a local bare repo as the remote so no network is required.
+ * Returns the resolved worktree path (symlinks resolved via realpathSync,
+ * matching what `git rev-parse --show-toplevel` reports — necessary on
+ * macOS where /tmp → /private/tmp).
+ */
+function mkTmpRepoWithUpstream(): string {
+  const bare = mkdtempSync(join(tmpdir(), "keeper-git-bare-"));
+  tmpDirs.push(bare);
+  // `git init --bare` directly inside the tmp dir.
+  const initBare = Bun.spawnSync(["git", "init", "--bare", "-q", bare], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (!initBare.success) throw new Error("git init --bare failed");
+
+  const root = realpathSync(mkTmpWorktree());
+  gitInit(root);
+  // Seed a commit so we have a HEAD to push.
+  writeFileSync(join(root, "seed.txt"), "seed\n");
+  gitCommitSimple(root, "seed");
+  // Configure the bare repo as `origin` and push main to set up tracking.
+  for (const args of [
+    ["remote", "add", "origin", bare],
+    ["push", "-q", "-u", "origin", "main"],
+  ] as const) {
+    const res = Bun.spawnSync(["git", "-C", root, ...args], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    if (!res.success) throw new Error(`git ${args.join(" ")} failed`);
+  }
+  return root;
+}
+
+// ---------------------------------------------------------------------------
+// shouldWatchRoot — pure verdict helper. Exercised against real-git tmpdir
+// fixtures the same way buildGitSnapshot is, so probe behavior + .planctl
+// short-circuit are tested without mocks.
+// ---------------------------------------------------------------------------
+
+test("shouldWatchRoot: .planctl present → watch without probe (short-circuit)", () => {
+  const root = mkTmpRepoWithUpstream();
+  mkdirSync(join(root, ".planctl"), { recursive: true });
+  // Pass a probe verdict that would otherwise say "skip" — `.planctl`
+  // wins anyway. The whole point: a plan-backed clean repo stays watched.
+  expect(
+    shouldWatchRoot(
+      root,
+      { dirty: false, ahead: 0 },
+      { currentlyWatched: false },
+    ),
+  ).toBe(true);
+  // And even a null probe (timeout / error) doesn't matter when
+  // `.planctl` is present.
+  expect(shouldWatchRoot(root, null, { currentlyWatched: false })).toBe(true);
+});
+
+test("shouldWatchRoot: clean + pushed (no .planctl) → don't watch", () => {
+  const root = mkTmpRepoWithUpstream();
+  // Probe verdict from a real git status: clean, ahead 0.
+  expect(
+    shouldWatchRoot(
+      root,
+      { dirty: false, ahead: 0 },
+      { currentlyWatched: false },
+    ),
+  ).toBe(false);
+});
+
+test("shouldWatchRoot: dirty worktree (no .planctl) → watch", () => {
+  const root = mkTmpRepoWithUpstream();
+  expect(
+    shouldWatchRoot(
+      root,
+      { dirty: true, ahead: 0 },
+      { currentlyWatched: false },
+    ),
+  ).toBe(true);
+});
+
+test("shouldWatchRoot: ahead > 0 clean (no .planctl) → watch", () => {
+  const root = mkTmpRepoWithUpstream();
+  expect(
+    shouldWatchRoot(
+      root,
+      { dirty: false, ahead: 2 },
+      { currentlyWatched: false },
+    ),
+  ).toBe(true);
+});
+
+test("shouldWatchRoot: no-upstream dirty (no .planctl) → watch", () => {
+  // No `# branch.ab` line means ahead=0 by convention; dirty alone is enough.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  writeFileSync(join(root, "x.ts"), "untracked\n");
+  expect(
+    shouldWatchRoot(
+      root,
+      { dirty: true, ahead: 0 },
+      { currentlyWatched: false },
+    ),
+  ).toBe(true);
+});
+
+test("shouldWatchRoot: no-upstream clean-with-commits (no .planctl) → don't watch", () => {
+  // No upstream, no dirty: ahead is 0 by convention; verdict is "don't watch".
+  // The whole point of the new gate — a quiescent repo with no work in flight
+  // isn't keeper's business.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  writeFileSync(join(root, "x.ts"), "seed\n");
+  gitCommitSimple(root, "seed");
+  expect(
+    shouldWatchRoot(
+      root,
+      { dirty: false, ahead: 0 },
+      { currentlyWatched: false },
+    ),
+  ).toBe(false);
+});
+
+test("shouldWatchRoot: null probe + currentlyWatched=true → retain (fail-open)", () => {
+  // Probe timeout / spawn error on an already-watched root: fail OPEN.
+  // Don't drop a watched root because one probe stuttered.
+  const root = mkTmpRepoWithUpstream();
+  expect(shouldWatchRoot(root, null, { currentlyWatched: true })).toBe(true);
+});
+
+test("shouldWatchRoot: null probe + currentlyWatched=false → skip (fail-closed)", () => {
+  // Probe failure on a cold candidate: skip. Don't join on a broken probe.
+  const root = mkTmpRepoWithUpstream();
+  expect(shouldWatchRoot(root, null, { currentlyWatched: false })).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// probeWatchMembership — combined `git status --porcelain=v2 --branch` parse
+// for dirty + ahead. Critically uses default `-unormal`, not `-uall`.
+// ---------------------------------------------------------------------------
+
+test("probeWatchMembership: clean + pushed → {dirty:false, ahead:0}", () => {
+  const root = mkTmpRepoWithUpstream();
+  expect(probeWatchMembership(root)).toEqual({ dirty: false, ahead: 0 });
+});
+
+test("probeWatchMembership: dirty (untracked file) → dirty:true", () => {
+  const root = mkTmpRepoWithUpstream();
+  writeFileSync(join(root, "untracked.ts"), "x\n");
+  const probe = probeWatchMembership(root);
+  expect(probe?.dirty).toBe(true);
+});
+
+test("probeWatchMembership: dirty (tracked + modified) → dirty:true", () => {
+  const root = mkTmpRepoWithUpstream();
+  writeFileSync(join(root, "seed.txt"), "modified\n");
+  const probe = probeWatchMembership(root);
+  expect(probe?.dirty).toBe(true);
+});
+
+test("probeWatchMembership: ahead of upstream by 2 → ahead:2", () => {
+  const root = mkTmpRepoWithUpstream();
+  // Make two local commits past the pushed HEAD.
+  writeFileSync(join(root, "a.ts"), "a\n");
+  gitCommitSimple(root, "a");
+  writeFileSync(join(root, "b.ts"), "b\n");
+  gitCommitSimple(root, "b");
+  expect(probeWatchMembership(root)).toEqual({ dirty: false, ahead: 2 });
+});
+
+test("probeWatchMembership: no upstream → ahead:0 (no `# branch.ab` line)", () => {
+  const root = mkTmpWorktree();
+  gitInit(root);
+  writeFileSync(join(root, "x.ts"), "seed\n");
+  gitCommitSimple(root, "seed");
+  // No remote configured → no `# branch.ab` line in porcelain output;
+  // probe reports ahead 0.
+  expect(probeWatchMembership(root)).toEqual({ dirty: false, ahead: 0 });
+});
+
+test("probeWatchMembership: returns null on a non-git path (timeout / error)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-probe-noegit-"));
+  tmpDirs.push(dir);
+  // No `.git/` here — `git status` exits non-zero, gitOutput returns null.
+  expect(probeWatchMembership(dir)).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// decideReconcileTransitions — cooling-hysteresis pure decision. The drop
+// path waits ≥ dwell ms before unsubscribing a clean+pushed root; a re-
+// dirty within the dwell cancels the drop.
+// ---------------------------------------------------------------------------
+
+test("decideReconcileTransitions: subscribe a new desired root immediately", () => {
+  const result = decideReconcileTransitions(
+    new Set(), // nothing watched yet
+    new Set(["/repo"]),
+    new Map(),
+    1000,
+    45_000,
+  );
+  expect(result.toAdd).toEqual(["/repo"]);
+  expect(result.toDrop).toEqual([]);
+});
+
+test("decideReconcileTransitions: watched + still desired → no transitions, dwell cleared", () => {
+  const dwell = new Map<string, number>([["/repo", 500]]); // a stale dwell entry
+  const result = decideReconcileTransitions(
+    new Set(["/repo"]),
+    new Set(["/repo"]),
+    dwell,
+    1000,
+    45_000,
+  );
+  expect(result.toAdd).toEqual([]);
+  expect(result.toDrop).toEqual([]);
+  // A re-qualifying root clears its dwell timer so a future drop starts a
+  // fresh window.
+  expect(dwell.has("/repo")).toBe(false);
+});
+
+test("decideReconcileTransitions: first cycle a watched root falls out → start dwell, don't drop", () => {
+  const dwell = new Map<string, number>();
+  const result = decideReconcileTransitions(
+    new Set(["/repo"]),
+    new Set(),
+    dwell,
+    1000,
+    45_000,
+  );
+  expect(result.toAdd).toEqual([]);
+  expect(result.toDrop).toEqual([]);
+  expect(dwell.get("/repo")).toBe(1000);
+});
+
+test("decideReconcileTransitions: watched + clean for ≥ dwell → drop", () => {
+  // Stamped at t=1000, now is 1000 + 45_000 = exactly at threshold.
+  const dwell = new Map<string, number>([["/repo", 1000]]);
+  const result = decideReconcileTransitions(
+    new Set(["/repo"]),
+    new Set(),
+    dwell,
+    46_000,
+    45_000,
+  );
+  expect(result.toAdd).toEqual([]);
+  expect(result.toDrop).toEqual(["/repo"]);
+  expect(dwell.has("/repo")).toBe(false);
+});
+
+test("decideReconcileTransitions: re-dirty within dwell cancels the drop", () => {
+  // Cycle 1: watched root falls out at t=1000 → start dwell.
+  const dwell = new Map<string, number>();
+  decideReconcileTransitions(
+    new Set(["/repo"]),
+    new Set(),
+    dwell,
+    1000,
+    45_000,
+  );
+  expect(dwell.get("/repo")).toBe(1000);
+
+  // Cycle 2: re-dirty at t=20_000 (well inside the 45s dwell). Root
+  // is desired again → dwell cleared, no drop.
+  const result = decideReconcileTransitions(
+    new Set(["/repo"]),
+    new Set(["/repo"]),
+    dwell,
+    20_000,
+    45_000,
+  );
+  expect(result.toDrop).toEqual([]);
+  expect(dwell.has("/repo")).toBe(false);
+
+  // Cycle 3: root falls out again at t=30_000 → dwell starts FRESH at
+  // 30_000, NOT carrying the original 1000 stamp. So at t=40_000 (10s
+  // later, still well inside the 45s dwell) we still don't drop.
+  decideReconcileTransitions(
+    new Set(["/repo"]),
+    new Set(),
+    dwell,
+    30_000,
+    45_000,
+  );
+  expect(dwell.get("/repo")).toBe(30_000);
+  const stillHolding = decideReconcileTransitions(
+    new Set(["/repo"]),
+    new Set(),
+    dwell,
+    40_000,
+    45_000,
+  );
+  expect(stillHolding.toDrop).toEqual([]);
+});
+
+test("decideReconcileTransitions: simultaneous add + drop in one cycle", () => {
+  // /repo-a is dropping (dwell elapsed), /repo-b is newly desired.
+  const dwell = new Map<string, number>([["/repo-a", 1000]]);
+  const result = decideReconcileTransitions(
+    new Set(["/repo-a"]),
+    new Set(["/repo-b"]),
+    dwell,
+    50_000,
+    45_000,
+  );
+  expect(result.toAdd).toEqual(["/repo-b"]);
+  expect(result.toDrop).toEqual(["/repo-a"]);
+});
+
+// ---------------------------------------------------------------------------
+// discoverProjectRoots — the dynamic discovery integration. Drives it
+// against a real bun:sqlite jobs table + epics table + the real probe
+// helper, exercising the bounded candidate set, TTL memo, and
+// monotonicity invariant.
+// ---------------------------------------------------------------------------
+
+import { Database } from "bun:sqlite";
+
+function makeDiscoveryDb(): Database {
+  const db = new Database(":memory:");
+  // Mirror the keeper schema columns discoverProjectRoots reads.
+  db.run(`CREATE TABLE jobs (
+    job_id TEXT PRIMARY KEY,
+    cwd TEXT,
+    state TEXT NOT NULL DEFAULT 'stopped',
+    updated_at REAL NOT NULL DEFAULT 0
+  )`);
+  db.run(`CREATE TABLE epics (
+    epic_id TEXT PRIMARY KEY,
+    project_dir TEXT,
+    tasks TEXT
+  )`);
+  return db;
+}
+
+function fakeProbe(
+  verdicts: Map<string, { dirty: boolean; ahead: number } | null>,
+  spawnCount?: { n: number },
+): (root: string) => { dirty: boolean; ahead: number } | null {
+  return (root: string) => {
+    if (spawnCount !== undefined) spawnCount.n += 1;
+    return verdicts.get(root) ?? { dirty: false, ahead: 0 };
+  };
+}
+
+test("discoverProjectRoots: .planctl repo always watched without probe spawn", () => {
+  const root = realpathSync(mkTmpWorktree());
+  gitInit(root);
+  mkdirSync(join(root, ".planctl"), { recursive: true });
+  const db = makeDiscoveryDb();
+  db.run(
+    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
+    ["sess-a", root],
+  );
+  const probeSpawnCount = { n: 0 };
+  const ctx: DiscoveryContext = {
+    cwdRootCache: new Map(),
+    watchProbeCache: new Map(),
+    currentlyWatched: new Set(),
+    nowMs: 1000,
+    runFullSweep: true,
+    probe: fakeProbe(new Map(), probeSpawnCount),
+  };
+  const desired = discoverProjectRoots(db, ctx);
+  expect(desired).toContain(root);
+  // Crucial: `.planctl` short-circuits — no probe spawn.
+  expect(probeSpawnCount.n).toBe(0);
+  db.close();
+});
+
+test("discoverProjectRoots: dirty non-.planctl repo joins desired set", () => {
+  const root = mkTmpRepoWithUpstream();
+  // Make the worktree dirty so a real probe would say "watch".
+  writeFileSync(join(root, "untracked.ts"), "x\n");
+  const db = makeDiscoveryDb();
+  db.run(
+    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
+    ["sess-a", root],
+  );
+  const ctx: DiscoveryContext = {
+    cwdRootCache: new Map(),
+    watchProbeCache: new Map(),
+    currentlyWatched: new Set(),
+    nowMs: 1000,
+    runFullSweep: true,
+    probe: probeWatchMembership, // real probe via spawnSync
+  };
+  const desired = discoverProjectRoots(db, ctx);
+  expect(desired).toContain(root);
+  db.close();
+});
+
+test("discoverProjectRoots: clean+pushed non-.planctl repo drops out of desired set", () => {
+  const root = mkTmpRepoWithUpstream();
+  const db = makeDiscoveryDb();
+  db.run(
+    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
+    ["sess-a", root],
+  );
+  const ctx: DiscoveryContext = {
+    cwdRootCache: new Map(),
+    watchProbeCache: new Map(),
+    currentlyWatched: new Set(),
+    nowMs: 1000,
+    runFullSweep: true,
+    probe: probeWatchMembership,
+  };
+  const desired = discoverProjectRoots(db, ctx);
+  expect(desired).not.toContain(root);
+  db.close();
+});
+
+test("discoverProjectRoots: TTL memo prevents repeated probe spawns in steady state", () => {
+  // A dirty repo's verdict is cached at the hot TTL when watched; calling
+  // discoverProjectRoots again within the TTL should NOT re-spawn the probe.
+  const root = mkTmpRepoWithUpstream();
+  writeFileSync(join(root, "untracked.ts"), "x\n");
+  const db = makeDiscoveryDb();
+  db.run(
+    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
+    ["sess-a", root],
+  );
+  const probeSpawnCount = { n: 0 };
+  const fakeVerdicts = new Map([[root, { dirty: true, ahead: 0 }]]);
+  const ctx: DiscoveryContext = {
+    cwdRootCache: new Map(),
+    watchProbeCache: new Map(),
+    currentlyWatched: new Set([root]), // already watched → hot tier
+    nowMs: 1000,
+    runFullSweep: true,
+    probe: fakeProbe(fakeVerdicts, probeSpawnCount),
+  };
+  // First call → one probe.
+  expect(discoverProjectRoots(db, ctx)).toContain(root);
+  expect(probeSpawnCount.n).toBe(1);
+  // Second call within hot TTL (5s) → memo hit, no new probe.
+  ctx.nowMs = 1500;
+  expect(discoverProjectRoots(db, ctx)).toContain(root);
+  expect(probeSpawnCount.n).toBe(1);
+  // After hot TTL elapses → re-probe.
+  ctx.nowMs = 10_000;
+  expect(discoverProjectRoots(db, ctx)).toContain(root);
+  expect(probeSpawnCount.n).toBe(2);
+  db.close();
+});
+
+test("discoverProjectRoots: monotonicity — already-watched root retained even when slow sweep is throttled", () => {
+  // The bug this prevents: a watched root's cwd ages out of the recent
+  // window, the fast path doesn't include it, and a throttled slow sweep
+  // (runFullSweep=false) would otherwise shrink `desired` below the
+  // watched set. The monotonicity floor in buildDiscoveryCandidates
+  // always includes currentlyWatched, so this can't happen.
+  const root = mkTmpRepoWithUpstream();
+  writeFileSync(join(root, "untracked.ts"), "x\n");
+  const db = makeDiscoveryDb();
+  // Job's `updated_at` is way in the past (before the recent window) AND
+  // state isn't 'working' — fast path would normally exclude it.
+  db.run(
+    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'stopped', 0)",
+    ["sess-a", root],
+  );
+  const ctx: DiscoveryContext = {
+    cwdRootCache: new Map(),
+    watchProbeCache: new Map(),
+    currentlyWatched: new Set([root]), // root is already watched
+    nowMs: Date.now(), // wall-clock-ish so cutoffSec is well past the row's 0
+    runFullSweep: false, // slow sweep throttled
+    probe: probeWatchMembership,
+  };
+  const desired = discoverProjectRoots(db, ctx);
+  // Monotonicity floor: still desired despite fast-path skip.
+  expect(desired).toContain(root);
+  db.close();
+});
+
+test("discoverProjectRoots: clean+pushed watched root drops from desired (caller layers dwell)", () => {
+  // discoverProjectRoots gives the moment-in-time verdict; the cooling
+  // dwell is decideReconcileTransitions' job. Here we verify the verdict:
+  // a clean+pushed watched root is NOT in `desired`, and the caller's
+  // dwell logic (tested above) converts that into a delayed drop.
+  const root = mkTmpRepoWithUpstream();
+  const db = makeDiscoveryDb();
+  db.run(
+    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
+    ["sess-a", root],
+  );
+  const ctx: DiscoveryContext = {
+    cwdRootCache: new Map(),
+    watchProbeCache: new Map(),
+    currentlyWatched: new Set([root]), // was watched
+    nowMs: 1000,
+    runFullSweep: true,
+    probe: probeWatchMembership,
+  };
+  const desired = discoverProjectRoots(db, ctx);
+  // Verdict: clean + pushed + no .planctl → not desired.
+  expect(desired).not.toContain(root);
+  db.close();
+});
+
+test("discoverProjectRoots: epic.project_dir + task.target_repo always candidates (plan-backed)", () => {
+  const planRoot = realpathSync(mkTmpWorktree());
+  gitInit(planRoot);
+  mkdirSync(join(planRoot, ".planctl"), { recursive: true });
+  const targetRoot = realpathSync(mkTmpWorktree());
+  gitInit(targetRoot);
+  mkdirSync(join(targetRoot, ".planctl"), { recursive: true });
+  const db = makeDiscoveryDb();
+  db.run(`INSERT INTO epics (epic_id, project_dir, tasks) VALUES (?, ?, ?)`, [
+    "fn-1-foo",
+    planRoot,
+    JSON.stringify([{ task_id: "fn-1-foo.1", target_repo: targetRoot }]),
+  ]);
+  // No jobs row — only epic-derived candidates exist.
+  const ctx: DiscoveryContext = {
+    cwdRootCache: new Map(),
+    watchProbeCache: new Map(),
+    currentlyWatched: new Set(),
+    nowMs: 1000,
+    runFullSweep: false, // even on the fast path, epic dirs are in
+    probe: probeWatchMembership,
+  };
+  const desired = new Set(discoverProjectRoots(db, ctx));
+  expect(desired.has(planRoot)).toBe(true);
+  expect(desired.has(targetRoot)).toBe(true);
+  db.close();
+});
+
+test("discoverProjectRoots: null probe + currentlyWatched → fail-open retains the root", () => {
+  // A timeout / spawn failure on the probe must NOT immediately drop an
+  // already-watched root. shouldWatchRoot fails-open under currentlyWatched.
+  const root = mkTmpRepoWithUpstream();
+  const db = makeDiscoveryDb();
+  db.run(
+    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
+    ["sess-a", root],
+  );
+  const ctx: DiscoveryContext = {
+    cwdRootCache: new Map(),
+    watchProbeCache: new Map(),
+    currentlyWatched: new Set([root]),
+    nowMs: 1000,
+    runFullSweep: true,
+    probe: () => null, // every probe fails
+  };
+  const desired = discoverProjectRoots(db, ctx);
+  expect(desired).toContain(root);
+  db.close();
 });

@@ -324,6 +324,121 @@ test("GitRootDropped on an unknown project_dir is a safe no-op", () => {
 });
 
 // ---------------------------------------------------------------------------
+// fn-690 — re-fold determinism. The dynamic watch-membership gate (epic
+// fn-690) is a producer-side decision that depends on wall-clock time, fs
+// state, and the live watched set. NONE of those facts leak into any
+// emitted event payload — `GitSnapshot`, `GitRootDropped`, and `Commit`
+// carry only what was true at producer time. So a re-fold from cursor=0
+// over the persisted event log MUST reproduce byte-identical projections
+// regardless of whether the events were emitted by a worker with empty
+// or pre-warmed membership history.
+// ---------------------------------------------------------------------------
+
+test("fn-690 re-fold determinism: same event log → byte-identical projections regardless of membership history", () => {
+  // Drive a non-trivial mix of GitSnapshot + Commit + GitRootDropped events
+  // across two projects, then re-fold from cursor=0 and assert the
+  // projections are byte-identical to the first fold. The test would FAIL
+  // if any membership-aware state (cwdRootCache, watchProbeCache,
+  // cleanSinceByRoot, currentlyWatched, performance.now) had leaked into
+  // an event payload — none of it does, by design.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-w",
+    spawn_name: "work::fn-1-foo.1",
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-w",
+    cwd: "/repo-a",
+    data: JSON.stringify({ tool_input: { file_path: "/repo-a/src/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo-a",
+    cwd: "/repo-a",
+    data: JSON.stringify({
+      project_dir: "/repo-a",
+      branch: "main",
+      head_oid: "abc",
+      upstream: "origin/main",
+      ahead: 1,
+      behind: 0,
+      dirty_files: [
+        { path: "src/a.ts", xy: " M", mtime_ms: 1_700_000_000_000 },
+      ],
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo-b",
+    cwd: "/repo-b",
+    data: JSON.stringify({
+      project_dir: "/repo-b",
+      branch: "feature",
+      head_oid: "def",
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [],
+    }),
+  });
+  insertEvent({
+    hook_event: "GitRootDropped",
+    session_id: "/repo-b",
+    cwd: "/repo-b",
+    data: "",
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+
+  // Capture the first fold's projection state. Snapshot every table whose
+  // shape any producer-side membership decision could conceivably affect.
+  const cursor1 = getCursor();
+  const gitStatus1 = db
+    .query("SELECT * FROM git_status ORDER BY project_dir")
+    .all();
+  const fileAttrib1 = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+  const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  const epics1 = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+
+  // Re-fold from cursor=0. Drop every projection row, reset the cursor,
+  // re-drain. The folded shape must be byte-identical (JSON.stringify
+  // equality on every row).
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM file_attributions");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(drainAll()).toBeGreaterThan(0);
+
+  expect(getCursor()).toBe(cursor1);
+  expect(
+    JSON.stringify(
+      db.query("SELECT * FROM git_status ORDER BY project_dir").all(),
+    ),
+  ).toBe(JSON.stringify(gitStatus1));
+  expect(
+    JSON.stringify(
+      db
+        .query(
+          "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+        )
+        .all(),
+    ),
+  ).toBe(JSON.stringify(fileAttrib1));
+  expect(
+    JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  ).toBe(JSON.stringify(jobs1));
+  expect(
+    JSON.stringify(db.query("SELECT * FROM epics ORDER BY epic_id").all()),
+  ).toBe(JSON.stringify(epics1));
+});
+
+// ---------------------------------------------------------------------------
 // Schema-v28 GitSnapshot → jobs fan-out — fn-620 mechanical git-cleanliness gate
 // ---------------------------------------------------------------------------
 

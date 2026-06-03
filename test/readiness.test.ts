@@ -747,6 +747,40 @@ test("predicate 6.5 uses task.target_repo when set, falling back to epic.project
   );
 });
 
+test("fn-690 scoping: an incidental watched non-target repo does not affect dispatch", () => {
+  // The fn-690 dynamic watch-membership gate (src/git-worker.ts) widens
+  // the watched set to ANY dirty / ahead-of-upstream repo, including
+  // ones that are not a `task.target_repo` or `epic.project_dir`. The
+  // load-bearing invariant is that predicate 6.5 ONLY consults the
+  // git_status row keyed by `task.target_repo ?? epic.project_dir`, so
+  // an incidental watched repo (no plan ties) cannot affect dispatch.
+  //
+  // Scenario: the task targets `/repo` (clean). The gitMap ALSO carries
+  // a `/other` row (the incidental watched repo) with dirty_count=5 +
+  // unattributed=5. Predicate 6.5 must read /repo (clean → skip the
+  // gate) and ignore /other entirely.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "pending",
+    target_repo: "/repo",
+  });
+  const epic = makeEpic({ tasks: [task], project_dir: "/repo" });
+  const gitMap = new Map([
+    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
+    // Incidental watched non-target repo — dirty + orphaned but it's NOT
+    // this task's target. Predicate 6.5 must not key on it.
+    ["/other", { dirty_count: 5, unattributed_to_live_count: 5 }],
+  ]);
+  const snap = run([epic], new Map(), [], gitMap);
+  // Falls through to predicate 7 (approval pending → job-pending).
+  // Specifically NOT blocked on git-uncommitted / git-orphans — the
+  // incidental watched repo is invisible to the task's gate.
+  const verdict = snap.perTask.get(task.task_id);
+  expect(verdict).toEqual(blocked({ kind: "job-pending" }));
+  expect(verdict).not.toEqual(blocked({ kind: "git-uncommitted" }));
+  expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
+});
+
 test("predicate 6.5 fires for evaluateCloseRow keyed by epic.project_dir", () => {
   // Close-row variant — the gate reads the live `git_status` row for
   // `epic.project_dir` (no per-row override on the synthetic close row).

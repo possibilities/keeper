@@ -1,6 +1,16 @@
 /**
- * Git status producer worker. Snapshots planctl-backed git worktrees and posts
- * a synthetic snapshot message when the rendered git view changes.
+ * Git status producer worker. Snapshots watched git worktrees and posts a
+ * synthetic snapshot message when the rendered git view changes.
+ *
+ * **Watch gate (epic fn-690).** A worktree is watched iff it satisfies the
+ * dynamic membership gate computed each reconcile:
+ *   `.planctl present || working tree dirty || ahead of upstream > 0`.
+ * Clean-and-pushed non-`.planctl` worktrees drop after a cooling dwell;
+ * `.planctl`-backed worktrees stay watched even when clean (legacy
+ * always-watched behavior) and incur no probe spawn (short-circuit). See
+ * {@link discoverProjectRoots} for the gate, {@link shouldWatchRoot} for
+ * the verdict helper, and {@link decideReconcileTransitions} for the
+ * dwell-aware drop logic.
  *
  * EVENT-DRIVEN, not polled: a snapshot fires only when one of four signals
  * arrives — (1) a `@parcel/watcher` event on the worktree (file content
@@ -22,10 +32,11 @@
  * This worker is an event PRODUCER only: it owns no writable DB connection and
  * never mutates projections. Main inserts a `GitSnapshot` event, and the
  * reducer folds that persisted payload into `git_status`. When a watched root
- * stops being planctl-backed (its `.planctl/` directory was removed), the
- * worker also posts a `GitRootDropped` tombstone message from `unsubscribeRoot`
- * — main lifts it into a synthetic `GitRootDropped` event whose reducer fold
- * DELETEs the projection row, keeping `git_status` in sync with the worktree.
+ * stops satisfying the watch gate (its `.planctl/` directory was removed AND
+ * the worktree is clean-and-pushed for ≥ the cooling dwell), the worker also
+ * posts a `GitRootDropped` tombstone message from `unsubscribeRoot` — main
+ * lifts it into a synthetic `GitRootDropped` event whose reducer fold DELETEs
+ * the projection row, keeping `git_status` in sync with the worktree.
  */
 
 import type { Database } from "bun:sqlite";
@@ -148,12 +159,14 @@ export interface GitSnapshotMessage extends GitSnapshotPayload {
 }
 
 /**
- * Tombstone message: a watched root has stopped being planctl-backed (its
- * `.planctl/` directory disappeared, so `gitRootFor()` now returns null) and
- * the worker is unsubscribing. Main lifts this into a synthetic
- * `GitRootDropped` event whose reducer fold DELETEs the corresponding
- * `git_status` row — without it the projection would leak the final pre-drop
- * snapshot forever (the reducer's `projectGitStatus` is UPSERT-only).
+ * Tombstone message: a watched root has stopped satisfying the watch gate
+ * ({@link shouldWatchRoot}) — its `.planctl/` directory disappeared AND the
+ * worktree has been clean-and-pushed for ≥ {@link WATCH_DROP_DWELL_MS} (the
+ * cooling-hysteresis dwell, epic fn-690). The worker is unsubscribing; main
+ * lifts this into a synthetic `GitRootDropped` event whose reducer fold
+ * DELETEs the corresponding `git_status` row — without it the projection
+ * would leak the final pre-drop snapshot forever (the reducer's
+ * `projectGitStatus` is UPSERT-only).
  */
 export interface GitRootDroppedMessage {
   kind: "git-root-dropped";
@@ -294,6 +307,54 @@ const DB_POLL_MS = 100;
 /** Silent-watcher backstop, same shape as `transcript-worker.ts`. */
 const HEARTBEAT_MS = 60_000;
 const GIT_TIMEOUT_MS = 2000;
+/**
+ * Per-root TTL on the watch-membership verdict ({@link probeWatchMembership})
+ * for roots that ARE currently watched. Short, because a watched root is the
+ * one most likely to flip — we want a recent `git status` for the dwell timer
+ * and for early drops on a clean+pushed transition. Cheap to re-probe (the
+ * candidate set is already tiny — the watched set is bounded).
+ */
+const WATCH_PROBE_TTL_HOT_MS = 5_000;
+/**
+ * Per-root TTL on the watch-membership verdict for roots that are NOT
+ * currently watched (cold candidates). Longer — a still-clean repo doesn't
+ * need re-checking every reconcile cycle. The full-history sweep also runs at
+ * a lower cadence, so a cold root is naturally re-probed less often.
+ */
+const WATCH_PROBE_TTL_COLD_MS = 90_000;
+/**
+ * Cadence at which the candidate set widens to ALL `DISTINCT cwd` rows from
+ * the jobs table (the slow sweep), instead of just the recent + watched set
+ * (the fast sweep). Lets a stale unpushed-but-clean repo surface after a
+ * keeper restart (empty watched-set memory). Throttled because the slow
+ * sweep can probe N candidates synchronously and we want steady-state
+ * spawns ≈ 0.
+ */
+const FULL_SWEEP_INTERVAL_MS = 5 * 60_000;
+/**
+ * Recent-job window for the fast-path candidate build: a `jobs` row is a
+ * candidate if `state='working'` OR `updated_at` falls within this many
+ * milliseconds of now. 2h covers human-paced multi-session days without
+ * dredging up week-old idle sessions whose repos are long gone.
+ */
+const RECENT_JOB_WINDOW_MS = 2 * 60 * 60 * 1000;
+/**
+ * Cooling dwell before a non-`.planctl` root that becomes clean-and-pushed
+ * is dropped. Must be ≥ HEARTBEAT_MS + one snapshot/commit-enumeration
+ * cycle so a post-commit `emitSnapshot` (HEAD-delta commit enumeration,
+ * fn-670 `Task:` link + discharge) drains BEFORE the tombstone wipes the
+ * file_attributions claim. 45s is one heartbeat (60s) reduced by the
+ * worst-case snapshot debounce; in practice the next heartbeat covers it.
+ */
+const WATCH_DROP_DWELL_MS = 45_000;
+/**
+ * Cap on new subscribes per reconcile cycle. Prevents the first full sweep
+ * (or a re-discovery after a keeper restart) from instantly subscribing
+ * hundreds of roots — which would balloon FSEvents streams into
+ * `fseventsd` bad-state. Remaining joins land on subsequent cycles
+ * (every DB-poll tick, every heartbeat).
+ */
+const MAX_SUBSCRIBES_PER_CYCLE = 16;
 /**
  * How long the worker's `git`-derived HEAD may CONTINUOUSLY disagree with the
  * fs-derived HEAD before the divergence watchdog escalates (`process.exit(1)`
@@ -501,13 +562,93 @@ function gitOutput(args: string[]): string | null {
   }
 }
 
-function gitRootFor(path: string): string | null {
+/**
+ * Resolve a candidate path (typically a `cwd`) to its containing git
+ * toplevel, or `null` if the path isn't inside a git worktree.
+ *
+ * Split out from the legacy `gitRootFor` (epic fn-690): cwd→toplevel
+ * resolution is stable for a session's lifetime and is the dominant cost in
+ * `discoverProjectRoots` (one `git rev-parse` shell-out per cwd, every
+ * reconcile). The membership verdict — whether keeper should ACTUALLY watch
+ * a resolved root — moves into {@link shouldWatchRoot}, which re-runs
+ * dynamically per reconcile against a fresh probe. The cwd→toplevel cache
+ * (in `discoverProjectRoots`) is permanent for the daemon's lifetime; the
+ * membership verdict's cache (`watchProbeCache`) has a short TTL.
+ */
+function resolveGitToplevel(path: string): string | null {
   const out = gitOutput(["-C", path, "rev-parse", "--show-toplevel"]);
   const root = out?.trim();
-  if (!root) {
-    return null;
+  if (!root) return null;
+  return root;
+}
+
+/**
+ * The dynamic per-reconcile watch-membership probe (epic fn-690). Returns
+ * the just-observed (dirty, ahead) verdict for `root` so {@link
+ * shouldWatchRoot} can decide whether the root qualifies for the watched
+ * set. ONE combined `git status --porcelain=v2 --branch` spawn yields both
+ * facts:
+ *   - dirty = any non-`#` record present in the parse,
+ *   - ahead = the `# branch.ab +N -M` count of local-commits-ahead-of-
+ *     upstream (`0` when no `# branch.ab` line is present, e.g. no upstream
+ *     configured / detached HEAD).
+ *
+ * Critically uses `-unormal` (the default), NOT `-uall`: the full untracked
+ * descent is the perf cliff that motivated the dynamic gate's bounded
+ * candidate set. `-unormal` is sufficient for an is-dirty verdict.
+ *
+ * Returns `null` on timeout/error so the caller can decide what to do:
+ * `shouldWatchRoot` fails OPEN for an already-watched root (retain it, the
+ * caller should re-probe next cycle), but CLOSED for a cold candidate
+ * (don't join on a broken probe).
+ */
+export function probeWatchMembership(
+  root: string,
+): { dirty: boolean; ahead: number } | null {
+  const out = gitOutput(["-C", root, "status", "--porcelain=v2", "--branch"]);
+  if (out == null) return null;
+  let dirty = false;
+  let ahead = 0;
+  for (const rec of out.split("\n")) {
+    if (rec.length === 0) continue;
+    if (rec.startsWith("#")) {
+      if (rec.startsWith("# branch.ab ")) {
+        const parsed = parseBranchAheadBehind(rec.slice("# branch.ab ".length));
+        if (parsed.ahead !== null) ahead = parsed.ahead;
+      }
+      continue;
+    }
+    // Any non-`#` record = a dirty entry (`1`/`2`/`u`/`?`). We don't need to
+    // count them; one is enough to flip the verdict.
+    dirty = true;
   }
-  return existsSync(join(root, ".planctl")) ? root : null;
+  return { dirty, ahead };
+}
+
+/**
+ * Pure decision (epic fn-690): given a resolved git `root` and an optional
+ * just-observed probe verdict, does keeper want to watch this root?
+ *
+ *   - `.planctl/` present → ALWAYS watch. Short-circuit BEFORE looking at
+ *     the probe, so a `.planctl` repo never incurs a probe spawn (this
+ *     keeps the historical zero-cost cycle for plan-backed roots).
+ *   - probe is `null` (timeout / error) → fail-open if `currentlyWatched`,
+ *     fail-closed otherwise. Don't join on a broken probe; don't drop a
+ *     watched root just because one probe stuttered.
+ *   - probe is non-null → watch iff dirty OR ahead > 0.
+ *
+ * Pure & exported for unit-testable verdict-only fixture coverage. The
+ * caller supplies the probe via {@link probeWatchMembership} so the test
+ * surface stays decoupled from the spawnSync side-effect.
+ */
+export function shouldWatchRoot(
+  root: string,
+  probe: { dirty: boolean; ahead: number } | null,
+  options: { currentlyWatched: boolean },
+): boolean {
+  if (existsSync(join(root, ".planctl"))) return true;
+  if (probe === null) return options.currentlyWatched;
+  return probe.dirty || probe.ahead > 0;
 }
 
 /**
@@ -1026,16 +1167,73 @@ function coalesceCommitterSessionId(
   return jobId;
 }
 
-function discoverProjectRoots(
-  db: Database,
-  cwdRootCache?: Map<string, string | null>,
-): string[] {
-  const candidates = new Set<string>();
-  const jobRows = db
-    .query("SELECT DISTINCT cwd FROM jobs WHERE cwd IS NOT NULL")
-    .all() as { cwd: string }[];
-  for (const row of jobRows) candidates.add(row.cwd);
+/**
+ * One TTL-memoized watch-membership verdict per root (epic fn-690). Entries
+ * live in the per-worker `watchProbeCache` Map; the hot tier
+ * ({@link WATCH_PROBE_TTL_HOT_MS}, currently watched) refreshes on every
+ * fast reconcile, the cold tier ({@link WATCH_PROBE_TTL_COLD_MS}, candidate
+ * but unwatched) holds a longer-lived verdict so a quiescent untouched
+ * repo doesn't re-probe every cycle. `expiry` is monotonic
+ * (`performance.now()` ms).
+ *
+ * Pruning is lazy-on-read inside {@link discoverProjectRoots} so we never
+ * walk the map on the hot 100ms tick. The map is bounded by the candidate
+ * set size (one entry per resolved root in flight).
+ */
+interface WatchProbeCacheEntry {
+  /** The last probe verdict (or `null` if the probe failed at expiry time). */
+  verdict: { dirty: boolean; ahead: number } | null;
+  /** Monotonic-clock ms after which the entry is considered stale. */
+  expiry: number;
+}
 
+/**
+ * State threaded into {@link discoverProjectRoots} by `reconcileRoots`.
+ * Separated as an interface so the discovery function can be exercised
+ * deterministically in tests against injectable Maps + an injected `now`
+ * + an injected probe function (the live caller passes
+ * {@link probeWatchMembership}).
+ *
+ * - `cwdRootCache` — cwd→toplevel memo, permanent for the daemon lifetime
+ *   (cwd→toplevel is stable for a session). One entry per distinct
+ *   candidate path.
+ * - `watchProbeCache` — per-root verdict TTL memo, hot/cold tiered.
+ * - `currentlyWatched` — the live set of subscribed roots. Used both as a
+ *   tier selector (hot vs cold TTL) AND as the monotonicity floor (the
+ *   slow sweep only ADDS candidates; the fast path always re-probes every
+ *   already-watched root).
+ * - `nowMs` — monotonic clock. Injected for tests.
+ * - `runFullSweep` — `true` when the candidate set should widen to ALL
+ *   `DISTINCT cwd` rows (the slow sweep), `false` for the recent+watched
+ *   fast path. The caller decides cadence via
+ *   {@link FULL_SWEEP_INTERVAL_MS}.
+ * - `probe` — the spawnSync-backed verdict probe. Injectable so tests can
+ *   drive a fake.
+ */
+export interface DiscoveryContext {
+  cwdRootCache: Map<string, string | null>;
+  watchProbeCache: Map<string, WatchProbeCacheEntry>;
+  currentlyWatched: Set<string>;
+  nowMs: number;
+  runFullSweep: boolean;
+  probe: (root: string) => { dirty: boolean; ahead: number } | null;
+}
+
+/**
+ * Build the candidate set for `discoverProjectRoots`. Pure & exported for
+ * unit reach. The fast path probes only the recent + watched cwds; the
+ * slow sweep widens to every `DISTINCT cwd` in the jobs table. Epic
+ * `project_dir` and `task.target_repo` are always in the set — they're
+ * cheap, bounded, and tied to plan-backed work.
+ */
+export function buildDiscoveryCandidates(
+  db: Database,
+  options: { nowMs: number; runFullSweep: boolean; watched: Set<string> },
+): Set<string> {
+  const candidates = new Set<string>();
+
+  // Always include plan-backed roots: epic.project_dir and every embedded
+  // task.target_repo. Bounded (one row per epic) and stable.
   const epicRows = db.query("SELECT project_dir, tasks FROM epics").all() as {
     project_dir: string | null;
     tasks: string | null;
@@ -1057,19 +1255,208 @@ function discoverProjectRoots(
     }
   }
 
-  const roots = new Set<string>();
-  for (const candidate of candidates) {
-    // cwd → root is stable for a session's lifetime, and a shell-out per cwd
-    // per reconcile is the dominant cost. Memoize across reconciles (cleared
-    // only by daemon restart).
-    let root: string | null | undefined = cwdRootCache?.get(candidate);
-    if (root === undefined) {
-      root = gitRootFor(candidate);
-      cwdRootCache?.set(candidate, root);
-    }
-    if (root != null) roots.add(root);
+  if (options.runFullSweep) {
+    // Slow path: every cwd a job has ever run from. Lets a stale unpushed-
+    // but-clean repo surface after a keeper restart (empty watched-set
+    // memory + empty cold cache).
+    const rows = db
+      .query("SELECT DISTINCT cwd FROM jobs WHERE cwd IS NOT NULL")
+      .all() as { cwd: string }[];
+    for (const row of rows) candidates.add(row.cwd);
+  } else {
+    // Fast path: only working jobs + recently-updated jobs. The `state`
+    // and `updated_at` columns are projection-derived (fold-time), so a
+    // job that just touched a file at all is in this set. RECENT_JOB_
+    // WINDOW_MS keeps the human-paced multi-session day on the fast
+    // path without dredging up week-old idle sessions.
+    //
+    // `updated_at` is REAL unix seconds; the cutoff converts ms to s.
+    const cutoffSec = (options.nowMs - RECENT_JOB_WINDOW_MS) / 1000;
+    const rows = db
+      .query(
+        `SELECT DISTINCT cwd FROM jobs
+         WHERE cwd IS NOT NULL
+           AND (state = 'working' OR updated_at >= ?)`,
+      )
+      .all(cutoffSec) as { cwd: string }[];
+    for (const row of rows) candidates.add(row.cwd);
   }
-  return [...roots].sort();
+
+  // Monotonicity floor: every already-watched root is a candidate
+  // regardless of which sweep ran. Without this a fast-path skip would
+  // shrink `desired` below the watched set on the very next reconcile
+  // (the cwd that bootstrapped a watched root might not be in the recent
+  // window anymore) and spuriously unsubscribe a live attribution claim.
+  for (const root of options.watched) candidates.add(root);
+
+  return candidates;
+}
+
+/**
+ * Pure cooling-hysteresis decision (epic fn-690). Given:
+ *
+ * - `currentlyWatched` — the set of roots that are subscribed right now;
+ * - `desiredNow` — the moment-in-time verdict set from
+ *   {@link discoverProjectRoots};
+ * - `cleanSinceByRoot` — per-root monotonic clock at which the root first
+ *   became clean-and-pushed (i.e. NOT in `desiredNow` while it WAS in
+ *   `currentlyWatched`); cleared the moment a root re-qualifies. The
+ *   caller mutates this Map in place across reconciles;
+ * - `nowMs` — monotonic clock now;
+ * - `dwellMs` — the dwell threshold ({@link WATCH_DROP_DWELL_MS}).
+ *
+ * Returns:
+ * - `toAdd` — roots to subscribe this cycle (in `desiredNow` and not in
+ *   `currentlyWatched`).
+ * - `toDrop` — roots to unsubscribe this cycle (have been clean-and-pushed
+ *   for ≥ `dwellMs`; satisfies the cooling-hysteresis invariant). A
+ *   `.planctl` (or otherwise still-desired) root is never in `toDrop`.
+ *
+ * Also mutates `cleanSinceByRoot`: stamps the first-clean ts when a
+ * watched root falls out of `desiredNow`, clears it when the root
+ * re-qualifies or has been dropped.
+ *
+ * Pure & exported for unit-testable hysteresis verification.
+ */
+export function decideReconcileTransitions(
+  currentlyWatched: Set<string>,
+  desiredNow: Set<string>,
+  cleanSinceByRoot: Map<string, number>,
+  nowMs: number,
+  dwellMs: number,
+): { toAdd: string[]; toDrop: string[] } {
+  const toAdd: string[] = [];
+  for (const root of desiredNow) {
+    if (!currentlyWatched.has(root)) toAdd.push(root);
+  }
+
+  const toDrop: string[] = [];
+  for (const root of currentlyWatched) {
+    if (desiredNow.has(root)) {
+      // Re-qualified — clear any dwell timer so a future drop starts a
+      // fresh window.
+      cleanSinceByRoot.delete(root);
+      continue;
+    }
+    // Watched but no longer desired → start (or check) the dwell timer.
+    const since = cleanSinceByRoot.get(root);
+    if (since === undefined) {
+      cleanSinceByRoot.set(root, nowMs);
+      continue;
+    }
+    if (nowMs - since >= dwellMs) {
+      toDrop.push(root);
+      cleanSinceByRoot.delete(root);
+    }
+  }
+
+  // Prune dwell entries for roots that aren't watched anymore (e.g. dropped
+  // on a previous cycle, or never subscribed).
+  for (const root of cleanSinceByRoot.keys()) {
+    if (!currentlyWatched.has(root)) cleanSinceByRoot.delete(root);
+  }
+
+  return { toAdd, toDrop };
+}
+
+/**
+ * The dynamic watch-membership discoverer (epic fn-690). Replaces the
+ * `.planctl`-only `gitRootFor`-filtered set with a probe-driven verdict
+ * tiered by hot/cold TTL. Returns the sorted set of roots that
+ * {@link reconcileRoots} should ensure are subscribed.
+ *
+ * Stages:
+ *   1. Build the candidate cwds via {@link buildDiscoveryCandidates}
+ *      (recent + watched fast path, or full-history slow sweep).
+ *   2. Resolve each cwd → toplevel via the permanent
+ *      `cwdRootCache`. Drops cwds that aren't inside a git worktree.
+ *   3. For each resolved root, consult the per-root TTL memo
+ *      (`watchProbeCache`). On miss / expiry, run {@link
+ *      probeWatchMembership} ONCE and cache the verdict at the
+ *      appropriate tier (hot if currently watched, cold otherwise).
+ *      `.planctl` short-circuits in {@link shouldWatchRoot} BEFORE the
+ *      probe even runs.
+ *   4. Compose the verdict via {@link shouldWatchRoot} (which folds in
+ *      `.planctl` short-circuit + fail-open-if-watched / fail-closed-
+ *      otherwise on a null probe).
+ *
+ * Returns the sorted list of roots keeper should watch. Cooling
+ * hysteresis ({@link WATCH_DROP_DWELL_MS}) is applied by `reconcileRoots`
+ * on the drop side — `discoverProjectRoots` is the moment-in-time
+ * verdict, NOT the dwell-aware drop list. The reconcile then layers
+ * `cleanSinceByRoot` on top to convert a clean+pushed candidate into a
+ * delayed drop.
+ */
+export function discoverProjectRoots(
+  db: Database,
+  ctx: DiscoveryContext,
+): string[] {
+  const candidates = buildDiscoveryCandidates(db, {
+    nowMs: ctx.nowMs,
+    runFullSweep: ctx.runFullSweep,
+    watched: ctx.currentlyWatched,
+  });
+
+  // Stage 2: resolve cwd → toplevel via the permanent cache. Drops cwds
+  // that aren't inside a git worktree. `.planctl` and dirty checks happen
+  // against the resolved root, NOT the candidate cwd.
+  const resolvedRoots = new Set<string>();
+  for (const candidate of candidates) {
+    let root: string | null | undefined = ctx.cwdRootCache.get(candidate);
+    if (root === undefined) {
+      root = resolveGitToplevel(candidate);
+      ctx.cwdRootCache.set(candidate, root);
+    }
+    if (root != null) resolvedRoots.add(root);
+  }
+
+  // Stage 3 + 4: per-root verdict TTL memo + probe + decide. Lazy-prune
+  // expired entries that aren't in the current candidate set so the map
+  // stays bounded by the live working set.
+  const desired = new Set<string>();
+  for (const root of resolvedRoots) {
+    const watched = ctx.currentlyWatched.has(root);
+    const ttl = watched ? WATCH_PROBE_TTL_HOT_MS : WATCH_PROBE_TTL_COLD_MS;
+    let probe: { dirty: boolean; ahead: number } | null;
+    const cached = ctx.watchProbeCache.get(root);
+    if (cached !== undefined && cached.expiry > ctx.nowMs) {
+      probe = cached.verdict;
+    } else {
+      // `.planctl` short-circuits inside shouldWatchRoot BEFORE the probe
+      // runs — but we need the probe verdict cached anyway for any future
+      // `.planctl` removal. Skip the probe for `.planctl` roots entirely;
+      // the verdict is `null` (unknown), shouldWatchRoot returns true on
+      // the `.planctl` check, and a future removal forces a re-probe via
+      // expiry.
+      if (existsSync(join(root, ".planctl"))) {
+        probe = null;
+        ctx.watchProbeCache.set(root, {
+          verdict: null,
+          expiry: ctx.nowMs + ttl,
+        });
+      } else {
+        probe = ctx.probe(root);
+        ctx.watchProbeCache.set(root, {
+          verdict: probe,
+          expiry: ctx.nowMs + ttl,
+        });
+      }
+    }
+    if (shouldWatchRoot(root, probe, { currentlyWatched: watched })) {
+      desired.add(root);
+    }
+  }
+
+  // Lazy prune: drop expired entries that aren't even candidates anymore.
+  // Bounds map size against churn (a stale cwd no longer in any candidate
+  // set drops within one TTL window).
+  for (const [root, entry] of ctx.watchProbeCache) {
+    if (!resolvedRoots.has(root) && entry.expiry <= ctx.nowMs) {
+      ctx.watchProbeCache.delete(root);
+    }
+  }
+
+  return [...desired].sort();
 }
 
 /**
@@ -1297,6 +1684,33 @@ function startWorker(): void {
   const subscriptions = new Map<string, RootSubscriptions>();
   const schedulers = new Map<string, RescanScheduler>();
   const cwdRootCache = new Map<string, string | null>();
+  /**
+   * Epic fn-690: per-root watch-membership verdict TTL memo. Distinct from
+   * `cwdRootCache` (cwd→toplevel, permanent) — this map holds the
+   * dirty/ahead probe verdict at hot ({@link WATCH_PROBE_TTL_HOT_MS}) or
+   * cold ({@link WATCH_PROBE_TTL_COLD_MS}) TTL so steady-state
+   * `git status` spawns are ≈ 0. Pruned lazily inside
+   * {@link discoverProjectRoots}.
+   */
+  const watchProbeCache = new Map<string, WatchProbeCacheEntry>();
+  /**
+   * Epic fn-690: per-root "first observed clean-and-pushed" monotonic
+   * timestamp. Drives the cooling-hysteresis dwell — see
+   * {@link decideReconcileTransitions} and
+   * {@link WATCH_DROP_DWELL_MS}. The entry is stamped the first reconcile
+   * cycle a watched root falls out of the desired set, cleared the
+   * moment it re-qualifies (re-dirty or new ahead commits), and
+   * deleted once the root is actually dropped.
+   */
+  const cleanSinceByRoot = new Map<string, number>();
+  /**
+   * Epic fn-690: monotonic-clock timestamp of the last full-history sweep
+   * (`runFullSweep: true`). `null` until the first reconcile fires.
+   * Throttled to {@link FULL_SWEEP_INTERVAL_MS} so the heavy
+   * `SELECT DISTINCT cwd FROM jobs` walk + cold-tier re-probes runs ~5min
+   * apart; the fast path covers everything in between.
+   */
+  let lastFullSweepMs: number | null = null;
   /**
    * Per-root monotonic timestamp (`performance.now()` ms) at which the worker's
    * `git`-derived HEAD first diverged from the fs-derived HEAD and has stayed
@@ -1629,13 +2043,52 @@ function startWorker(): void {
     }
     reconciling = true;
     try {
-      const desired = new Set(discoverProjectRoots(db, cwdRootCache));
-      const current = new Set(subscriptions.keys());
-      for (const root of desired) {
-        if (!current.has(root)) await subscribeRoot(root);
+      const nowMs = performance.now();
+      // Throttle the full-history sweep — fast path otherwise. The fast
+      // path's bounded candidate set + the TTL memo together keep
+      // steady-state spawns ≈ 0. The slow sweep widens to all
+      // `DISTINCT cwd` to surface a stale unpushed-but-clean repo after
+      // a keeper restart.
+      const runFullSweep =
+        lastFullSweepMs === null ||
+        nowMs - lastFullSweepMs >= FULL_SWEEP_INTERVAL_MS;
+      if (runFullSweep) lastFullSweepMs = nowMs;
+
+      const currentlyWatched = new Set(subscriptions.keys());
+      const desired = new Set(
+        discoverProjectRoots(db, {
+          cwdRootCache,
+          watchProbeCache,
+          currentlyWatched,
+          nowMs,
+          runFullSweep,
+          probe: probeWatchMembership,
+        }),
+      );
+
+      const { toAdd, toDrop } = decideReconcileTransitions(
+        currentlyWatched,
+        desired,
+        cleanSinceByRoot,
+        nowMs,
+        WATCH_DROP_DWELL_MS,
+      );
+
+      // Cap new subscribes per cycle so the first full sweep can't balloon
+      // FSEvents streams into `fseventsd` bad-state. Remaining joins land
+      // on subsequent reconciles (every DB-poll tick + heartbeat).
+      const capped = toAdd.slice(0, MAX_SUBSCRIBES_PER_CYCLE);
+      for (const root of capped) {
+        await subscribeRoot(root);
       }
-      for (const root of current) {
-        if (!desired.has(root)) await unsubscribeRoot(root);
+      // If we capped, request another reconcile cycle so the rest land
+      // promptly without waiting for the next data_version bump.
+      if (toAdd.length > MAX_SUBSCRIBES_PER_CYCLE) {
+        reconcilePending = true;
+      }
+
+      for (const root of toDrop) {
+        await unsubscribeRoot(root);
       }
     } finally {
       reconciling = false;
