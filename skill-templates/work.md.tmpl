@@ -62,7 +62,7 @@ The task is already claimed and the briefing is in working memory (Phase 1). The
 
 Use the Task tool to invoke the `work:worker` subagent with a minimal config-only prompt. The worker's shared body lives in `apps/planctl/agent-templates/worker.md.tmpl` (rendered into `claude/work-plugins/<tier>/agents/worker.md` per tier — exactly one tier-plugin loads per session, set by keeper pre-boot). Do **not** paraphrase those phases here.
 
-**Tier is already chosen and loaded.** The planner (`/plan:plan`) picks tier per task at decomposition time and writes it into the scaffold YAML; keeper reads the persisted tier from its own projected Task data and adds `--plugin-dir claude/work-plugins/<tier>` to claude's launch line. By the time this skill runs, exactly one `work:worker` is in scope for the session, pinned to that tier's `claude-opus-4-7` + matching `effort:` via the agent file. This skill never picks or persists a tier — the planner owns the cognitive decision, keeper owns the runtime routing, and the spawn target is a bare literal.
+**Tier is already chosen and loaded** (see the intro) — this skill never picks or persists one. By the time it runs, exactly one `work:worker` is in scope, pinned to its tier's model + `effort:` by the agent file. Spawn it as a bare literal, no `model=`.
 
 **Snippet context for the worker.** The `snippet_context` field from the Phase 1 envelope is the inheritor-tier substrate, already resolved: the planner authored `task.snippets` / `task.bundles` (and inherited `epic.snippets` / `epic.bundles`) at planning time, and `claim` folded in the `render-spec` resolution so this skill never shells it separately.
 
@@ -96,7 +96,7 @@ PRIMARY_REPO: <absolute path to the primary_repo (planctl state repo)>
 Follow your agent spec. If your turn opens with a directive from this skill instead of this template, the directive overrides the phase scaffolding.
 ```
 
-The `## Snippet context`, `## Task spec`, and `## Epic spec` sections sit between the configuration block and the `## Task` directive so the worker reads curated substrate and the full specs (already paid-for by the parent's `claim` envelope) first, and the action directive last. The worker's agent spec Phase 1 reads `## Task spec` and `## Epic spec` from the brief instead of shelling `planctl cat` twice — one fewer round trip per worker spawn. Both `worker.md.tmpl` and the worker's own Phase 1 / Phase 1.5 reference these sections by name. Omit any section entirely when the corresponding envelope field is empty (matches the `snippet_context` empty-string rule).
+These sections sit before the `## Task` directive so the worker reads substrate and specs first, action last. The worker's Phase 1 reads `## Task spec` / `## Epic spec` from the brief instead of shelling `planctl cat` twice — one fewer round trip per spawn. Omit any section whose envelope field is empty (matches the `snippet_context` empty-string rule).
 
 Populate `TARGET_REPO` and `PRIMARY_REPO` directly from the Phase 1 claim envelope — both are already fully resolved to absolute paths:
 - `TARGET_REPO` — the envelope's `target_repo`.
@@ -126,22 +126,21 @@ planctl show <task_id>
 
 If `status: done`, continue to Phase 3. If not:
 
-- `in_progress` → harness drop detected (worker vanished mid-`tool_use` before it could complete commit-then-done). The recovery budget is **5 attempts (1 spawn + 4 retries)** — each warm SendMessage resume and each cold fresh-respawn counts one attempt toward the budget. `RESUME_EXHAUSTED` fires only after the 5th attempt fails.
+- `in_progress` → harness drop detected (worker vanished mid-`tool_use` before it finished commit-then-done). Recovery budget is **5 attempts (1 spawn + 4 retries)**; each warm resume or cold respawn counts one. `RESUME_EXHAUSTED` fires only after the 5th fails.
 
-  **Cross-session counting (best-effort, per-invocation).** The warm path has an in-memory attempt counter scoped to this invocation: increment it once per SendMessage resume, and after the 5th drop flip to `RESUME_EXHAUSTED`. The cold path has **no shared in-memory counter** — a separate `/plan:work` invocation that opens with the task already `in_progress` cannot see prior invocations' attempts. So the budget is **best-effort per-invocation**: within one invocation it is enforced exactly (warm retries are counted); across separate cold-resume invocations each fresh `/plan:work` run gets its own budget (one cold spawn = one attempt, and a re-run after that cold spawn drops again starts fresh). There is no attempt-count field persisted on the task — the budget deliberately rides invocation-local memory, trading cross-invocation precision for zero new state. A task that genuinely cannot make progress will surface repeatedly as `in_progress`; the human eyeballs the pattern and blocks it by hand rather than relying on a persisted cross-session cap.
+  **The budget is best-effort per-invocation.** Warm retries are counted in an in-memory counter scoped to this invocation; nothing is persisted on the task. A separate `/plan:work` run that opens on an already-`in_progress` task can't see prior attempts, so each cold-resume run gets its own budget. A task that genuinely can't progress just keeps surfacing as `in_progress` — the human eyeballs the pattern and blocks it by hand.
 
-  **In-session vs cross-session split.** If `worker_agent_id` was captured in Phase 2a **this invocation**, you're in-session — go **warm**. If `worker_agent_id` is unset (this is a separate `/plan:work` invocation that opened with the task already `in_progress` — orchestrator has no shared memory across invocations), you're cross-session — go **cold**. The rule: Phase 2a didn't run this invocation but Phase 2b sees `in_progress` → cross-session.
+  **Warm vs cold:** `worker_agent_id` captured in Phase 2a *this invocation* → in-session, go **warm**. Unset (Phase 2a didn't run this invocation but Phase 2b sees `in_progress`) → cross-session, go **cold**.
 
   **Warm path (in-session, `worker_agent_id` set):**
 
-  1. Compute state-diff:
+  1. Compute state-diff in one call:
 
      ```bash
-     jobctl find-task-commit <task_id>
-     planctl show <task_id>
+     jobctl find-task-commit <task_id>; planctl show <task_id>
      ```
 
-     If `find-task-commit` returns a non-empty `commits` list, the source commit landed; only `planctl done` remains. Otherwise the worker dropped mid-implementation.
+     A non-empty `commits` list means the source commit landed; only `planctl done` remains. Otherwise the worker dropped mid-implementation.
 
   2. Build a tight resume directive — imperative, no narrative:
      - **No source commit landed:** *"Resume task `<id>`. Finish implementation, run tests, `jobctl commit-work`, `planctl done`."*
@@ -161,7 +160,7 @@ If `status: done`, continue to Phase 3. If not:
 
   **Cold path (cross-session, or warm SendMessage error):**
 
-  Keeper policed tier before claude booted (a missing or unsupported tier fails loud with `task <id> has unsupported tier ...` — fn-594), so by the time this cold path runs the tier-plugin matching `task.tier` is already loaded and `work:worker` resolves to the right agent. No tier-read here, no fallback heuristic — the work-plugin layer owns tier routing.
+  Keeper already policed and loaded the tier pre-boot (fn-594 fails loud on a missing/unsupported tier), so `work:worker` resolves correctly here — no tier-read, no fallback.
 
   1. Shell `planctl worker resume <task_id>` once and read the success envelope's `prompt` field — the CONTEXT preamble to pass into the spawn.
 
@@ -205,34 +204,21 @@ If tests fail, surface the failure verbatim. Do not auto-fix — the human makes
 
 ## Phase 4 — Ship
 
-1. **Validate the epic**:
+1. **Validate the epic and read tree state in one call.** `validate` exits non-zero on `valid: false`, so `&&` short-circuits — `session-state` only runs once the epic validates:
 
    ```bash
-   planctl validate --epic <epic_id>
+   planctl validate --epic <epic_id> && jobctl session-state
    ```
 
-   If `valid: false`, surface errors verbatim and stop (no auto-fix).
+   `valid: false` → surface errors verbatim and stop (no auto-fix; `session-state` never ran). Otherwise read the `session-state` envelope — never infer "everything committed" from the worker's narration alone (subagent result-overflow can truncate output).
 
-2. **Verify the tree is clean of session work.**
+   `status_porcelain` is the *whole tree's* uncommitted files; `session_files` is what this session (orchestrator + subagents, shared parent session_id) touched. **Trust `session_files` as your scope of authority** — anything dirty but not in it is concurrent-agent or human work; leave it alone (the Phase 1 shared-tree rule).
 
-   Read the combined git + session state yourself — never infer "everything committed" from the worker's narration alone (subagent result-overflow can truncate output):
+   Under commit-before-done, `status: done` implies the source commit landed. So: every `session_files` path committed → continue. Any *still* dirty → unexpected state; surface `jobctl session-state` verbatim and **stop** (no auto-resume, no auto-commit — the human investigates).
 
-   ```bash
-   jobctl session-state
-   ```
+2. **Do NOT close the epic.** `planctl epic close` stays manual.
 
-   Read `status_porcelain` (uncommitted files in the *whole tree*) and `session_files` (paths this session — orchestrator + subagents — touched). Subagent writes share the parent session_id in hookctl's tracker, so `session_files` already covers worker output without per-subagent lookups.
-
-   **Attribution rule:** trust `session_files` as your scope of authority. Anything in `status_porcelain` that is *not* in `session_files` is concurrent-agent or human work — leave it alone. Never inspect, classify, or commit those files.
-
-   Under the commit-before-done worker contract (worker Phase 5 → Phase 6), `status: done` is impossible without the source commit having landed first. So:
-
-   - If every path in `session_files` is committed (clean intersection with `status_porcelain`), continue to step 3.
-   - If any path in `session_files` is *still* dirty, this is an unexpected state — surface `jobctl session-state` verbatim and **stop**. Do not auto-resume, do not auto-commit. The contract says `done` ⇒ committed; if reality disagrees, the human investigates.
-
-3. **Do NOT close the epic.** `planctl epic close` stays manual.
-
-4. **`jobctl commit-work` failures surface as BLOCKED.** Lint, commit, or push failure → worker returns `BLOCKED: TOOLING_FAILURE` with the verbatim envelope JSON; Phase 2b short-circuits on BLOCKED. The human resolves (fix the lint runner, rebase/pull, fix auth, etc.) and re-runs `/plan:work`; on re-run, Phase 2b's harness-drop path picks up via `status: in_progress`. The flock at `$GIT_COMMON_DIR/jobctl-commit.lock` makes the intra-host commit race impossible; cross-host pushes that fail are rare and deserve a human eyeball.
+3. **`jobctl commit-work` failures surface as BLOCKED.** Lint/commit/push failure → worker returns `BLOCKED: TOOLING_FAILURE` with the verbatim envelope; Phase 2b short-circuits. The human resolves and re-runs `/plan:work`; Phase 2b's harness-drop path picks up via `status: in_progress`.
 
 ## Phase 5 — Report
 
@@ -247,13 +233,10 @@ Include per-task commit sha from worker return. No menu, no follow-up prompts.
 ## Guardrails
 
 - **Never auto-closes the epic** — `planctl epic close` stays the human's call.
-- **Commit-then-done worker contract.** Worker Phase 3 runs tests, Phase 5 runs `jobctl commit-work` (source commit), Phase 6 runs `planctl done` (state commit via hook). `done` is the last thing the worker fires — `status: done` from `planctl show` after the worker returns implies the source commit has already landed.
-- `jobctl commit-work` failures (lint, commit, push) all surface as `BLOCKED: TOOLING_FAILURE` with the verbatim envelope. Workers do not patch the tool they're calling, even if it has a real bug — the human files a separate task. The flock at `$GIT_COMMON_DIR/jobctl-commit.lock` prevents intra-host races; the human resolves cross-host push failures and re-runs.
-- **Never auto-retries a semantic failure** (worker returned `BLOCKED: <CATEGORY>`) — surface and stop. Lint auto-fix and similar tooling-recovery niceties belong in `jobctl commit-work` itself, not in this skill.
-- Harness drops auto-recover via Phase 2b's recovery budget — **5 attempts (1 spawn + 4 retries)**, warm SendMessage resume in-session or cold fresh-spawn cross-session, each attempt counting toward the budget. The budget is best-effort per-invocation (warm retries are counted in-memory; cold-resume invocations each get their own budget — no attempt count is persisted on the task). Only after the 5th attempt drops does the task flip to `blocked`+`RESUME_EXHAUSTED` — stop and surface.
-- **Tier routing is owned by keeper + planner, not this skill.** `/plan:plan` picks tier at decomposition time and writes it onto the task. Keeper reads it from its own projected Task data pre-boot and loads `claude/work-plugins/<tier>/`. This skill spawns `Task(subagent_type="work:worker")` as a bare literal — no tier-picking, no `task set-tier` write, no cold-resume tier-read. fn-594: scaffold / refine-apply now reject missing tier at mint time, so the only remaining null-tier surface is pre-fn-594 legacy on-disk records; keeper fails loud on them with `task <id> has unsupported tier ...`, and humans remediate via `/plan:plan <epic_id>` refine.
-- **Phase 4 attribution: `session_files`, not `status_porcelain`.** The repo runs concurrent agents and the human in parallel. Anything in the dirty tree that isn't in this session's `session_files` belongs to someone else — never inspect, classify, or commit it.
-- **`done` + dirty paths in this session's `session_files` is an unexpected state.** With commit-before-done, this can't happen on a happy path. If observed, surface verbatim and stop — never auto-resume, never auto-commit.
-- **Never reads or writes** anywhere outside planctl state + project code.
-- Never use `TodoWrite` — planctl tracks all tasks.
+- **Commit-then-done contract:** the worker commits source (`jobctl commit-work`) before stamping `planctl done`. `status: done` after the worker returns implies the source commit already landed.
+- **`jobctl commit-work` failures all surface as `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope. Workers never patch the tool they're calling — the human resolves and re-runs.
+- **Never auto-retries a semantic failure** (`BLOCKED: <CATEGORY>`) — surface and stop. Harness drops *do* auto-recover via Phase 2b's 5-attempt best-effort budget.
+- **Tier routing is owned by keeper + planner, not this skill** — spawn `work:worker` as a bare literal, no `model=`, no tier-read.
+- **Attribution is `session_files`, not `status_porcelain`** (Phase 1 shared-tree rule) — never inspect, classify, or commit dirty files this session didn't write. `done` + dirty session files is an off-happy-path state: surface and stop.
+- **Never reads or writes** outside planctl state + project code. Never use `TodoWrite` — planctl tracks all tasks.
 

@@ -200,7 +200,7 @@ Log: *"fatal finding: <verdict['fatal_reason']>"* and stop. Do NOT run `epic clo
 **Findings branch.** Inspect the in-memory `verdict`:
 
 - **Non-fatal findings present** (`verdict["tier_1"]` OR `verdict["tier_2"]` OR `verdict["tier_3"]` non-empty): run the inline audit, Phase 6.2 → Phase 7 → Phase 8.
-- **No findings** (all three tier arrays empty): skip straight to Phase 10 (close). No follow-up. `epic close` auto-commits its scope inline.
+- **No findings** (all three tier arrays empty): skip straight to Phase 10 (close). No follow-up.
 
 ---
 
@@ -210,7 +210,7 @@ For each finding in `verdict["tier_1"] + verdict["tier_2"] + verdict["tier_3"]` 
 
 ### Cull discipline
 
-If you can leave the code alone (with or without a code comment), cull the finding. Keep only when the issue has concrete user impact, breaks the spec's happy path, or would surprise the next reader. The classifier already filtered — your job is the second-pass cull. When in doubt, cull.
+If you can leave the code alone (with or without a code comment), cull. Keep only when the issue has concrete user impact, breaks the spec's happy path, or would surprise the next reader. The classifier already filtered — its bar is high; yours is higher. Treat its tiering as input, not consensus: you may cull a tier-1 finding or keep a tier-3 one, justified on its own evidence. When in doubt, cull.
 
 ### 6.2a. Claim
 
@@ -233,11 +233,6 @@ Issue exactly one of:
 
 Track the verdicts in working memory as a list of `(source_fid, action, rationale)` tuples. The Phase 8 audit-decisions table writes from this list verbatim.
 
-### Anti-sycophancy rules (apply throughout Phase 6.2)
-
-- Treat the classifier's tiering as input, not consensus. You may cull tier-1 findings; you may keep tier-3 findings. Justify each verdict on its own evidence.
-- If you can leave the code alone, cull. The classifier's bar is high; yours is higher.
-
 ### Clarifying-question budget — at most ONE across the whole audit
 
 Same explainer-then-question discipline as `/plan:plan` Phase 1.7:
@@ -257,7 +252,7 @@ After every finding has a verdict, partition the verdict list:
 - `kept_or_merged` — findings with action `kept` or `merged-into-<id>`.
 - `culled` — findings with action `culled`.
 
-**Empty-cull path:** if `kept_or_merged` is empty (every finding got culled), do NOT scaffold a follow-up. Print the cull table to the human (Source | Rationale, two columns), then proceed to Phase 10 (close) — same terminal path as the no-findings case. `epic close` auto-commits its scope inline. Emit, before closing:
+**Empty-cull path:** if `kept_or_merged` is empty (every finding got culled), do NOT scaffold a follow-up. Print the cull table to the human (Source | Rationale, two columns), then proceed to Phase 10 (close) — same terminal path as the no-findings case. Emit, before closing:
 
 ```
 All findings culled from `<epic_id>`. No followup epic created.
@@ -288,7 +283,7 @@ The verb scans open epics for the first one whose `depends_on_epics` contains th
 - `{"found": false, ...}` → no prior follow-up. Proceed to Phase 8 (scaffold).
 - `{"found": true, "epic_id": "<id>", "actual_tasks": <int>, ...}` → a follow-up already exists. Compare `actual_tasks` against the **expected count** in working memory (one task per surviving cluster from Phase 6.3) — the guard tests a **completeness invariant, not bare existence**, so a half-built follow-up from a crashed run must not be adopted as done:
 
-  - **`actual_tasks == expected_clusters`** → a prior run already scaffolded the follow-up. Pin the envelope's `epic_id` as `new_epic_id`, SKIP Phase 8, and proceed to Phase 10 (close). `epic close` auto-commits its scope inline.
+  - **`actual_tasks == expected_clusters`** → a prior run already scaffolded the follow-up. Pin the envelope's `epic_id` as `new_epic_id`, SKIP Phase 8, and proceed to Phase 10 (close).
   - **`actual_tasks < expected_clusters`** → PARTIAL (a crashed mid-scaffold run). Do NOT silently adopt or double-create. Surface it and stop for the human:
 
     ```

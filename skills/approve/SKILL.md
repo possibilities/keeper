@@ -27,12 +27,11 @@ free-text auto-invoke path exists.
 **Session-name format**: `/plan:approve <id>` invocations land a session named
 `approve::<id>` (see `apps/hookctl/CLAUDE.md` § Session naming).
 
-**Lean toward approve, not reject.** RLHF models default cautious; the explicit
-discipline below is "approve unless an error marker fires OR the agent's last
-message reads as needs-human OR a reject-only backstop token hits". Subjective
-doubts ("could be better") are NOT a rule and do not reject. Terse-but-done
-endings — `👍 approve fn-…`, `Closed fn-…`, `Done — committed…` — are the
-real shape of a clean finish and MUST read as approve, not as needs-human.
+**Lean toward approve, not reject.** RLHF models default cautious; the discipline
+below is "approve unless an error marker fires, the agent's last message reads as
+needs-human, or a reject-only backstop token hits". Subjective doubts ("could be
+better") are NOT a rule and do not reject. Terse-but-done endings are the real
+shape of a clean finish, not needs-human (examples in Rule 2) — read them as approve.
 
 ---
 
