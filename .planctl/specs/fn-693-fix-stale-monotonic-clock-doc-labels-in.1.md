@@ -23,5 +23,5 @@ git-worker.ts:1887 `performance.now()` (HEAD-divergence — still correct and un
 - [ ] `bun test test/git-worker.test.ts` passes
 
 ## Done summary
-
+Replaced stale 'monotonic clock' / 'performance.now()' doc-labels on nowMs, cleanSinceByRoot, lastFullSweepMs, and WatchProbeCacheEntry.expiry with 'wall clock (Date.now())' language at the seven listed sites in src/git-worker.ts; HEAD-divergence watchdog labels left untouched.
 ## Evidence
