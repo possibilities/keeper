@@ -105,5 +105,5 @@ idempotent (guard double-close across self-stop + SIGINT).
 - [ ] `bun test test/refold-progress.test.ts test/view-shell.test.ts` passes.
 
 ## Done summary
-
+Added src/refold-progress.ts (lazy readonly poller, naked autocommit SELECTs, busyTimeoutMs=100, idempotent close) and rewired view-shell's connecting indicator to a single ~125ms setInterval that arms on the first non-connected lifecycle event, composes 're-folding event log NN.N%  C / M' (thousands-grouped) when cursor<max, falls back to the plain spinner otherwise, holds the last-good {cursor,max} floor across 3 consecutive misses, and tears down both the interval and the readonly fd on first-frame self-stop + SIGINT (double-close safe). Guards max<=0 / cursor>=max against NaN%/>100%/fake-100%. 16/16 new tests pass (refold-progress + view-shell).
 ## Evidence
