@@ -8641,6 +8641,8 @@ function getJobLinks(epicId: string): {
   last_api_error_kind: string | null;
   last_input_request_at: number | null;
   last_input_request_kind: string | null;
+  last_permission_prompt_at: number | null;
+  last_permission_prompt_kind: string | null;
 }[] {
   const row = db
     .query("SELECT job_links FROM epics WHERE epic_id = ?")
@@ -8675,6 +8677,8 @@ test("syncPlanctlLinks: single-session single-window one creator emits creator e
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
 });
@@ -8715,6 +8719,8 @@ test("syncPlanctlLinks: single-session two windows creator-then-refiner-same-epi
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
     {
       kind: "refiner",
@@ -8725,6 +8731,8 @@ test("syncPlanctlLinks: single-session two windows creator-then-refiner-same-epi
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
 });
@@ -8789,6 +8797,8 @@ test("syncPlanctlLinks: two sessions touching the same epic both appear in job_l
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
     {
       kind: "refiner",
@@ -8799,6 +8809,8 @@ test("syncPlanctlLinks: two sessions touching the same epic both appear in job_l
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
 });
@@ -8882,6 +8894,8 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
     {
       kind: "refiner",
@@ -8892,6 +8906,8 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
 
@@ -8933,6 +8949,8 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
     {
       kind: "refiner",
@@ -8943,6 +8961,8 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
 });
@@ -8969,6 +8989,8 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
   // Now fold an EpicSnapshot for the same epic — the ON CONFLICT clause
@@ -8999,6 +9021,8 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
 });
@@ -10171,6 +10195,8 @@ test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded 
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
 
@@ -10189,6 +10215,8 @@ test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded 
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
 
@@ -10569,6 +10597,8 @@ test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other 
     last_api_error_kind: null,
     last_input_request_at: null,
     last_input_request_kind: null,
+    last_permission_prompt_at: null,
+    last_permission_prompt_kind: null,
   });
   // B: untouched (state still default "stopped").
   expect(after[1]).toEqual({
@@ -10580,6 +10610,8 @@ test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other 
     last_api_error_kind: null,
     last_input_request_at: null,
     last_input_request_kind: null,
+    last_permission_prompt_at: null,
+    last_permission_prompt_kind: null,
   });
 });
 
@@ -10664,6 +10696,8 @@ test("syncPlanctlLinks: missing jobs row at enrichment defaults to safe values (
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
 });
@@ -10701,6 +10735,8 @@ test("syncPlanctlLinks: widened-shape EpicSnapshot ON CONFLICT does not blank en
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
 
@@ -10726,6 +10762,8 @@ test("syncPlanctlLinks: widened-shape EpicSnapshot ON CONFLICT does not blank en
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     },
   ]);
 });
@@ -12343,6 +12381,374 @@ test("syncJobLinksOnJobWrite: InputRequest stamp propagates to epics.job_links; 
   expect(revived?.state).toBe("working");
   expect(revived?.last_input_request_at).toBeNull();
   expect(revived?.last_input_request_kind).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Notification:permission_prompt / Notification:elicitation_dialog fold
+// (schema v52, fn-686 task .1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read just `state` + the permission-prompt pair off a jobs row by id.
+ * Mirrors the v25 `getInputRequestState` helper so the fn-686 tests
+ * follow the same shape, but excluding the state→pair coupling assertion
+ * the input-request tests had (the permission-prompt arm intentionally
+ * does NOT flip `state`).
+ */
+function getPermissionPromptState(jobId: string): {
+  state: string;
+  last_permission_prompt_at: number | null;
+  last_permission_prompt_kind: string | null;
+} | null {
+  return db
+    .query(
+      "SELECT state, last_permission_prompt_at, last_permission_prompt_kind FROM jobs WHERE job_id = ?",
+    )
+    .get(jobId) as {
+    state: string;
+    last_permission_prompt_at: number | null;
+    last_permission_prompt_kind: string | null;
+  } | null;
+}
+
+test("Notification:permission_prompt fold: stamps both columns and does NOT flip state from 'working'", () => {
+  // Keystone bullet: a real `Notification` hook event whose `event_type`
+  // is `permission_prompt` stamps `(last_permission_prompt_at,
+  // last_permission_prompt_kind='permission')` and leaves state at
+  // 'working' — the WHOLE POINT of the divergence from the InputRequest
+  // arm. The pill layers on top of `[working]`, not replacing it.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-pp" });
+  drainAll();
+  const before = getPermissionPromptState("sess-pp");
+  expect(before?.state).toBe("working");
+  expect(before?.last_permission_prompt_at).toBeNull();
+  expect(before?.last_permission_prompt_kind).toBeNull();
+
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "permission_prompt",
+    session_id: "sess-pp",
+  });
+  drainAll();
+  const after = getPermissionPromptState("sess-pp");
+  expect(after?.state).toBe("working"); // NO state flip — distinct from InputRequest
+  expect(after?.last_permission_prompt_at).not.toBeNull();
+  expect(after?.last_permission_prompt_kind).toBe("permission");
+});
+
+test("Notification:elicitation_dialog fold: stamps kind='elicitation' and does NOT flip state", () => {
+  // The second whitelisted subtype — folds identically to permission_prompt
+  // but stamps `kind='elicitation'`. Both share the no-state-flip behavior.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-el" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-el" });
+  drainAll();
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "elicitation_dialog",
+    session_id: "sess-el",
+  });
+  drainAll();
+  const after = getPermissionPromptState("sess-el");
+  expect(after?.state).toBe("working");
+  expect(after?.last_permission_prompt_at).not.toBeNull();
+  expect(after?.last_permission_prompt_kind).toBe("elicitation");
+});
+
+test.each([
+  ["idle_prompt"],
+  ["auth_success"],
+  ["totally-unknown-subtype"],
+  [""],
+])(
+  "Notification:%s does NOT stamp (strict gate — only permission_prompt + elicitation_dialog stamp)",
+  (eventType: string) => {
+    // Strict gate: the four `event_type` values outside the allow-list
+    // are no-ops. Pin every one explicitly so a future code path that
+    // widens the map without widening the allow-list gets caught.
+    const sessionId = `sess-pp-gate-${eventType || "empty"}`;
+    insertEvent({ hook_event: "SessionStart", session_id: sessionId });
+    insertEvent({ hook_event: "UserPromptSubmit", session_id: sessionId });
+    drainAll();
+    const before = db
+      .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
+      .get(sessionId) as { last_event_id: number };
+    insertEvent({
+      hook_event: "Notification",
+      event_type: eventType,
+      session_id: sessionId,
+    });
+    drainAll();
+    const after = getPermissionPromptState(sessionId);
+    expect(after?.state).toBe("working");
+    expect(after?.last_permission_prompt_at).toBeNull();
+    expect(after?.last_permission_prompt_kind).toBeNull();
+    // last_event_id MUST NOT advance — strict gate means a no-op,
+    // not a defensive no-op-write.
+    const afterEvtId = db
+      .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
+      .get(sessionId) as { last_event_id: number };
+    expect(afterEvtId.last_event_id).toBe(before.last_event_id);
+  },
+);
+
+test("Notification fold: terminal-row guard preserved — permission_prompt on 'ended' / 'killed' does NOT stamp", () => {
+  // Clone of the v25 InputRequest terminal-guard test. The pair must NOT
+  // mid-life-stamp an already-terminal row.
+
+  // 'ended' row.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp-ended" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-pp-ended" });
+  insertEvent({ hook_event: "SessionEnd", session_id: "sess-pp-ended" });
+  drainAll();
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "permission_prompt",
+    session_id: "sess-pp-ended",
+  });
+  drainAll();
+  const ended = getPermissionPromptState("sess-pp-ended");
+  expect(ended?.state).toBe("ended");
+  expect(ended?.last_permission_prompt_at).toBeNull();
+  expect(ended?.last_permission_prompt_kind).toBeNull();
+
+  // 'killed' row — hand-set lifecycle.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp-killed" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-pp-killed" });
+  drainAll();
+  db.run("UPDATE jobs SET state = 'killed' WHERE job_id = 'sess-pp-killed'");
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "elicitation_dialog",
+    session_id: "sess-pp-killed",
+  });
+  drainAll();
+  const killed = getPermissionPromptState("sess-pp-killed");
+  expect(killed?.state).toBe("killed");
+  expect(killed?.last_permission_prompt_at).toBeNull();
+  expect(killed?.last_permission_prompt_kind).toBeNull();
+});
+
+test("Notification clear arms: UserPromptSubmit clears the pair (paired-NULL clear)", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp-ups" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-pp-ups" });
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "permission_prompt",
+    session_id: "sess-pp-ups",
+  });
+  drainAll();
+  const blocked = getPermissionPromptState("sess-pp-ups");
+  expect(blocked?.last_permission_prompt_at).not.toBeNull();
+  expect(blocked?.last_permission_prompt_kind).toBe("permission");
+
+  // Human answers the dialog → next UserPromptSubmit clears the pair.
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-pp-ups" });
+  drainAll();
+  const revived = getPermissionPromptState("sess-pp-ups");
+  expect(revived?.state).toBe("working");
+  expect(revived?.last_permission_prompt_at).toBeNull();
+  expect(revived?.last_permission_prompt_kind).toBeNull();
+});
+
+test("Notification clear arms: SessionStart resume clears the pair", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp-ss" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-pp-ss" });
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "elicitation_dialog",
+    session_id: "sess-pp-ss",
+  });
+  drainAll();
+  const blocked = getPermissionPromptState("sess-pp-ss");
+  expect(blocked?.last_permission_prompt_at).not.toBeNull();
+  expect(blocked?.last_permission_prompt_kind).toBe("elicitation");
+
+  // Resume via duplicate SessionStart — ON CONFLICT clears the pair.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp-ss" });
+  drainAll();
+  const resumed = getPermissionPromptState("sess-pp-ss");
+  expect(resumed?.last_permission_prompt_at).toBeNull();
+  expect(resumed?.last_permission_prompt_kind).toBeNull();
+});
+
+test("Notification clear arms: PreToolUse + PostToolUse clear the pair (gated on IS NOT NULL)", () => {
+  // PreToolUse arm.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp-pre" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-pp-pre" });
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "permission_prompt",
+    session_id: "sess-pp-pre",
+  });
+  drainAll();
+  expect(
+    getPermissionPromptState("sess-pp-pre")?.last_permission_prompt_at,
+  ).not.toBeNull();
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-pp-pre",
+  });
+  drainAll();
+  expect(
+    getPermissionPromptState("sess-pp-pre")?.last_permission_prompt_at,
+  ).toBeNull();
+  expect(
+    getPermissionPromptState("sess-pp-pre")?.last_permission_prompt_kind,
+  ).toBeNull();
+
+  // PostToolUse arm.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp-post" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-pp-post" });
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "elicitation_dialog",
+    session_id: "sess-pp-post",
+  });
+  drainAll();
+  expect(
+    getPermissionPromptState("sess-pp-post")?.last_permission_prompt_at,
+  ).not.toBeNull();
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-pp-post",
+  });
+  drainAll();
+  expect(
+    getPermissionPromptState("sess-pp-post")?.last_permission_prompt_at,
+  ).toBeNull();
+  expect(
+    getPermissionPromptState("sess-pp-post")?.last_permission_prompt_kind,
+  ).toBeNull();
+});
+
+test("Notification clear arms: Stop is the session-level backstop (gated on IS NOT NULL)", () => {
+  // The one NEW clear arm relative to v25. Even if the dialog resolved
+  // off-band (no tool call after, no UPS), a Stop sweeps the annotation —
+  // a Stop logically cannot fire while a permission dialog is up.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp-stop" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-pp-stop" });
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "permission_prompt",
+    session_id: "sess-pp-stop",
+  });
+  drainAll();
+  expect(
+    getPermissionPromptState("sess-pp-stop")?.last_permission_prompt_at,
+  ).not.toBeNull();
+  insertEvent({ hook_event: "Stop", session_id: "sess-pp-stop" });
+  drainAll();
+  expect(
+    getPermissionPromptState("sess-pp-stop")?.last_permission_prompt_at,
+  ).toBeNull();
+  expect(
+    getPermissionPromptState("sess-pp-stop")?.last_permission_prompt_kind,
+  ).toBeNull();
+});
+
+test("Notification clear gate: PreToolUse/PostToolUse on a session with last_permission_prompt_at IS NULL does NOT touch jobs", () => {
+  // Hot-path no-op gate clone of the v25 IR test. Without
+  // `IS NOT NULL`, every tool call would no-op-write the pair and
+  // re-fan embedded arrays. Pin the gate by asserting `last_event_id`
+  // does NOT advance.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp-gate-tool" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-pp-gate-tool",
+  });
+  drainAll();
+  const before = db
+    .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
+    .get("sess-pp-gate-tool") as { last_event_id: number };
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-pp-gate-tool",
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-pp-gate-tool",
+  });
+  drainAll();
+  const after = db
+    .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
+    .get("sess-pp-gate-tool") as { last_event_id: number };
+  expect(after.last_event_id).toBe(before.last_event_id);
+});
+
+test("Notification re-set: a second permission_prompt re-writes last_permission_prompt_at (not increment)", () => {
+  // Pure monotone fold: a re-prompt re-stamps `_at` to the new event ts.
+  // Re-fold determinism — the stamp value is `event.ts`, not a counter,
+  // so a from-scratch re-fold reproduces the same final value.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp-reset" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-pp-reset" });
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "permission_prompt",
+    session_id: "sess-pp-reset",
+  });
+  drainAll();
+  const first = getPermissionPromptState("sess-pp-reset");
+  expect(first?.last_permission_prompt_at).not.toBeNull();
+  const firstAt = first?.last_permission_prompt_at;
+
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "permission_prompt",
+    session_id: "sess-pp-reset",
+  });
+  drainAll();
+  const second = getPermissionPromptState("sess-pp-reset");
+  expect(second?.last_permission_prompt_at).not.toBeNull();
+  // Re-set, not increment — the second `_at` reflects the second event's
+  // ts, which is `tsCounter`-advanced past the first.
+  expect(second?.last_permission_prompt_at).not.toBe(firstAt);
+});
+
+test("Notification re-fold determinism: rewind-and-redrain reproduces byte-identical jobs row", () => {
+  // CLAUDE.md byte-identical re-fold invariant: from-scratch re-fold
+  // must reproduce the jobs row. Exercises permission_prompt stamp +
+  // UserPromptSubmit clear + a second permission_prompt + final
+  // UserPromptSubmit, so both arms ride the rewind. UNLIKE the v25 IR
+  // rewind which folded zero historical events, this rewind DOES fold
+  // real permission_prompt rows — the stamp value is pure `event.ts`,
+  // so the redrain reproduces deterministic stamps.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pp-redrain" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-pp-redrain",
+  });
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "permission_prompt",
+    session_id: "sess-pp-redrain",
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-pp-redrain",
+  });
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "elicitation_dialog",
+    session_id: "sess-pp-redrain",
+  });
+  drainAll();
+  const before = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-pp-redrain");
+  expect(before).not.toBeNull();
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-pp-redrain");
+  expect(after).toEqual(before);
 });
 
 // ---------------------------------------------------------------------------
@@ -14544,6 +14950,8 @@ test("fn-670 T2: multi-task Commit stamps the link on EVERY named task symmetric
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
       git_dirty_count: 0,
       git_unattributed_to_live_count: 0,
       git_orphan_count: 0,

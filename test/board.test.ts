@@ -133,6 +133,8 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     last_api_error_kind: null,
     last_input_request_at: null,
     last_input_request_kind: null,
+    last_permission_prompt_at: null,
+    last_permission_prompt_kind: null,
     git_dirty_count: 0,
     git_unattributed_to_live_count: 0,
     git_orphan_count: 0,
@@ -511,6 +513,8 @@ function makeLink(overrides: Partial<JobLinkEntry>): JobLinkEntry {
     last_api_error_kind: null,
     last_input_request_at: null,
     last_input_request_kind: null,
+    last_permission_prompt_at: null,
+    last_permission_prompt_kind: null,
     ...overrides,
   };
 }
@@ -691,6 +695,93 @@ test("renderJobLinkLines: failed stays inline, awaiting drops to its own line", 
   ]);
 });
 
+// Schema v52 / fn-686 — `[awaiting:permission]` and
+// `[awaiting:elicitation]` clone the v25 input-request pill onto a
+// distinct projection pair fed by the `Notification` hook fold. Same
+// "drop on continuation line" discipline; the two pills can co-occur if
+// a future fold-shape change ever lands both axes on one row, but
+// independently — each fires off its own paired-NULL field.
+test("renderJobLinkLines: last_permission_prompt_at non-null with kind='permission' appends [awaiting:permission] pill", () => {
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "creator",
+      job_id: "sess-pp",
+      title: "Plan epic 21",
+      state: "working",
+      last_permission_prompt_at: 1700000000,
+      last_permission_prompt_kind: "permission",
+    }),
+  ]);
+  expect(out).toEqual([
+    "  Plan epic 21 [creator] [working]",
+    "    [awaiting:permission]",
+  ]);
+});
+
+test("renderJobLinkLines: last_permission_prompt_at non-null with kind='elicitation' appends [awaiting:elicitation] pill", () => {
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "creator",
+      job_id: "sess-el",
+      title: "Plan epic 22",
+      state: "working",
+      last_permission_prompt_at: 1700000000,
+      last_permission_prompt_kind: "elicitation",
+    }),
+  ]);
+  expect(out).toEqual([
+    "  Plan epic 22 [creator] [working]",
+    "    [awaiting:elicitation]",
+  ]);
+});
+
+test("renderJobLinkLines: permission_prompt_at non-null, kind null defensively renders [awaiting:unknown]", () => {
+  // Same defensive fallback as the v25 input-request pill — should be
+  // unreachable per the paired-NULL invariant, but the pill must not
+  // collapse to `[awaiting:]` if a future shape-skew bug appears.
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "refiner",
+      job_id: "sess-pp-defensive",
+      title: "Plan epic 23",
+      state: "working",
+      last_permission_prompt_at: 1700000000,
+      last_permission_prompt_kind: null,
+    }),
+  ]);
+  expect(out).toEqual([
+    "  Plan epic 23 [refiner] [working]",
+    "    [awaiting:unknown]",
+  ]);
+});
+
+test("renderJobLinkLines: api-error + input-request + permission all stack on independent lines", () => {
+  // Stacking snapshot — a row carrying ALL THREE annotations renders
+  // `[state] [failed:<kind>]` inline, then drops both awaiting pills
+  // onto their OWN indented continuation lines beneath the row in
+  // (input-request, permission) order matching the source rendering
+  // order in `renderJobLinkLines`.
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "creator",
+      job_id: "sess-triple",
+      title: "Plan epic 24",
+      state: "working",
+      last_api_error_at: 1700000000,
+      last_api_error_kind: "rate_limit",
+      last_input_request_at: 1700000001,
+      last_input_request_kind: "ask_user_question",
+      last_permission_prompt_at: 1700000002,
+      last_permission_prompt_kind: "permission",
+    }),
+  ]);
+  expect(out).toEqual([
+    "  Plan epic 24 [creator] [working] [failed:rate_limit]",
+    "    [awaiting:ask_user_question]",
+    "    [awaiting:permission]",
+  ]);
+});
+
 test("renderJobLinkLines: multiple entries iterate in provided order (projection's own (kind, job_id) ASC sort)", () => {
   const out = renderJobLinkLines([
     makeLink({
@@ -800,6 +891,35 @@ test.each([
 test("colorizePillsInLine: awaiting:ask_user_question takes the warn bucket via prefix fallback", () => {
   expect(colorizePillsInLine("[awaiting:ask_user_question]")).toBe(
     `[${WARN}awaiting:ask_user_question${RESET}]`,
+  );
+});
+
+// Schema v52 / fn-686 — the two new awaiting pills inherit the SAME
+// warn-bucket coloring via the open-ended `awaiting:*` prefix fallback.
+// NO colorizer change was needed; pin both pills explicitly so a future
+// regression that special-cases one kind without the other is caught.
+test("colorizePillsInLine: awaiting:permission takes the warn bucket via the awaiting:* prefix fallback", () => {
+  expect(colorizePillsInLine("[awaiting:permission]")).toBe(
+    `[${WARN}awaiting:permission${RESET}]`,
+  );
+});
+
+test("colorizePillsInLine: awaiting:elicitation takes the warn bucket via the awaiting:* prefix fallback", () => {
+  expect(colorizePillsInLine("[awaiting:elicitation]")).toBe(
+    `[${WARN}awaiting:elicitation${RESET}]`,
+  );
+});
+
+// Stacking snapshot through the colorizer — a worker row layering
+// `[working]` (blue) + `[failed:rate_limit]` (red) + both awaiting pills
+// (yellow) — pins independent coloring across all five tokens.
+test("colorizePillsInLine: working + failed + input-request + permission stack colors independently", () => {
+  expect(
+    colorizePillsInLine(
+      "Plan epic 25 [creator] [working] [failed:rate_limit] [awaiting:ask_user_question] [awaiting:permission]",
+    ),
+  ).toBe(
+    `Plan epic 25 [creator] [${BLUE}working${RESET}] [${ERROR}failed:rate_limit${RESET}] [${WARN}awaiting:ask_user_question${RESET}] [${WARN}awaiting:permission${RESET}]`,
   );
 });
 

@@ -85,6 +85,29 @@ export const API_ERROR_KINDS: ReadonlySet<ApiErrorKind> = new Set([
 export type InputRequestKind = "ask_user_question";
 
 /**
+ * Canonical vocabulary of `Notification:permission_prompt` /
+ * `Notification:elicitation_dialog` kinds folded by the reducer's
+ * `Notification` arm (schema v52, fn-686). Unlike
+ * {@link InputRequestKind}, this fold is driven by REAL hook events whose
+ * `event_type` (= `events-writer.ts`'s `notification_type` passthrough)
+ * carries the discriminator — not by a synthetic mint. The reducer maps
+ * the two whitelisted `event_type` values onto the two members of this
+ * union one-for-one:
+ *   `permission_prompt` → `"permission"`
+ *   `elicitation_dialog` → `"elicitation"`
+ *
+ * Strict gate: `idle_prompt` / `auth_success` / unknown / empty
+ * `event_type` values do NOT stamp — they fall through the
+ * `Notification` arm unchanged. Future extensions widen this union AND
+ * the reducer's `validatePermissionPromptKind` allow-list in lockstep.
+ *
+ * Unlike {@link ApiErrorKind}, no `"unknown"` fallback is reserved: only
+ * the two whitelisted `event_type` values stamp at all, so the union
+ * carries exactly the matched set.
+ */
+export type PermissionPromptKind = "permission" | "elicitation";
+
+/**
  * One entry in {@link Epic.job_links} — the symmetric per-epic view of
  * {@link Link}. `kind` carries the same vocabulary; `job_id` identifies the
  * session whose planctl footprint touched this epic inside one of its
@@ -117,13 +140,16 @@ export type InputRequestKind = "ask_user_question";
  * last_input_request_kind: null}` — re-fold-safe "safe value" pattern
  * per CLAUDE.md (never throw inside the fold tx).
  *
- * **Paired-NULL invariant.** `last_api_error_at` / `last_api_error_kind`
- * AND `last_input_request_at` / `last_input_request_kind` each move
- * together: every reducer write that stamps one column of a pair stamps
- * the other, every clear (api-error: `UserPromptSubmit` revival;
- * input-request: `UserPromptSubmit` / `SessionStart` / gated
- * `PreToolUse` / `PostToolUse`) clears both columns of its pair. No
- * code path may write one without the other.
+ * **Paired-NULL invariant.** `last_api_error_at` / `last_api_error_kind`,
+ * `last_input_request_at` / `last_input_request_kind`, AND
+ * `last_permission_prompt_at` / `last_permission_prompt_kind` (schema
+ * v52, fn-686) each move together: every reducer write that stamps one
+ * column of a pair stamps the other, every clear (api-error:
+ * `UserPromptSubmit` revival; input-request: `UserPromptSubmit` /
+ * `SessionStart` / gated `PreToolUse` / `PostToolUse`;
+ * permission-prompt: `UserPromptSubmit` / `SessionStart` / gated
+ * `PreToolUse` / `PostToolUse` / `Stop`) clears both columns of its
+ * pair. No code path may write one without the other.
  */
 export interface JobLinkEntry {
   kind: "creator" | "refiner";
@@ -148,6 +174,24 @@ export interface JobLinkEntry {
    * this session. NULL whenever {@link last_input_request_at} is NULL.
    */
   last_input_request_kind: string | null;
+  /**
+   * Mirrors {@link Job.last_permission_prompt_at} (schema v52, fn-686) so
+   * a renderer reading the link entry shows the same permission /
+   * elicitation annotation on the symmetric per-epic projection that the
+   * top-level jobs collection shows on its own row. NULL on every entry
+   * that has never hit a `permission_prompt` / `elicitation_dialog`
+   * Notification (the common case). Paired with
+   * {@link last_permission_prompt_kind} — both fields move together; see
+   * the paired-NULL invariant above.
+   */
+  last_permission_prompt_at: number | null;
+  /**
+   * Mirrors {@link Job.last_permission_prompt_kind} — the
+   * {@link PermissionPromptKind} that fired the last permission-prompt /
+   * elicitation stamp on this session. NULL whenever
+   * {@link last_permission_prompt_at} is NULL.
+   */
+  last_permission_prompt_kind: string | null;
 }
 
 /**
@@ -491,6 +535,41 @@ export interface Job {
    */
   last_input_request_kind: string | null;
   /**
+   * Schema v52 (fn-686): timestamp the session was last parked on a
+   * `Notification:permission_prompt` (Claude Code's tool-permission
+   * dialog) or `Notification:elicitation_dialog` (an MCP server
+   * requesting input mid-tool-call) hook event. Diverges from
+   * {@link last_input_request_at}: the pair does NOT flip
+   * {@link state} — the worker is blocked on the human but
+   * structurally still mid-turn from keeper's POV (no Stop fired), so
+   * the `[awaiting:permission]` / `[awaiting:elicitation]` pill layers
+   * on top of the live `[working]` state rather than replacing it.
+   *
+   * Cleared on `UserPromptSubmit` (the human answered) / `SessionStart`
+   * (resume) unconditionally, on `PreToolUse` / `PostToolUse` gated on
+   * `last_permission_prompt_at IS NOT NULL` (any tool firing means the
+   * dialog has resolved — see anthropics/claude-code#19628), and on
+   * `Stop` as the session-level backstop. NULL on every job that has
+   * never hit a permission_prompt / elicitation_dialog.
+   *
+   * Pair: {@link last_permission_prompt_kind} carries the
+   * {@link PermissionPromptKind} value that fired. Paired-NULL: both
+   * stamp together, both clear together — see the {@link JobLinkEntry}
+   * note.
+   */
+  last_permission_prompt_at: number | null;
+  /**
+   * The {@link PermissionPromptKind} value that fired the last
+   * permission-prompt / elicitation stamp:
+   *   `Notification:permission_prompt` → `"permission"`
+   *   `Notification:elicitation_dialog` → `"elicitation"`
+   * Paired with {@link last_permission_prompt_at} — both stamp together
+   * in the fold, both clear together on the five clear arms (UPS /
+   * SessionStart / PreToolUse / PostToolUse / Stop). NULL on every job
+   * that has never hit a permission_prompt / elicitation_dialog.
+   */
+  last_permission_prompt_kind: string | null;
+  /**
    * Projection of `Event.config_dir` — the `CLAUDE_CONFIG_DIR` env value
    * the hook captured at SessionStart (schema v22). Latest-non-NULL-wins:
    * the reducer's SessionStart arm writes `config_dir =
@@ -815,6 +894,24 @@ export interface EmbeddedJob {
    * this session. NULL whenever {@link last_input_request_at} is NULL.
    */
   last_input_request_kind: string | null;
+  /**
+   * Mirrors {@link Job.last_permission_prompt_at} (schema v52, fn-686) so
+   * a renderer reading the embedded array shows the same permission /
+   * elicitation annotation on the in-epic / in-task job lines that the
+   * top-level jobs collection shows on its own row. NULL on every entry
+   * that has never hit a `permission_prompt` / `elicitation_dialog`
+   * Notification (the common case). Paired with
+   * {@link last_permission_prompt_kind} — both fields move together;
+   * see {@link JobLinkEntry} for the paired-NULL invariant.
+   */
+  last_permission_prompt_at: number | null;
+  /**
+   * Mirrors {@link Job.last_permission_prompt_kind} — the
+   * {@link PermissionPromptKind} that fired the last permission-prompt /
+   * elicitation stamp on this session. NULL whenever
+   * {@link last_permission_prompt_at} is NULL.
+   */
+  last_permission_prompt_kind: string | null;
   /**
    * Mirrors {@link Job.git_dirty_count} (schema v28) so a renderer reading
    * the embedded array shows the same per-job dirty-file count on the

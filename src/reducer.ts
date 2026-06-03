@@ -150,6 +150,7 @@ import type {
   Event,
   InputRequestKind,
   JobLinkEntry,
+  PermissionPromptKind,
   ResolvedEpicDep,
 } from "./types";
 import { API_ERROR_KINDS } from "./types";
@@ -312,6 +313,78 @@ function extractInputRequestKind(event: Event): InputRequestKind {
   } catch {
     return "ask_user_question";
   }
+}
+
+/**
+ * Canonical `PermissionPromptKind` allow-list (schema v52, fn-686) —
+ * the 2-member union backing the `Notification:permission_prompt` /
+ * `Notification:elicitation_dialog` fold. The values mirror
+ * {@link import("./types").PermissionPromptKind} exactly; if the type
+ * widens or narrows the set MUST be updated in lockstep.
+ *
+ * Map (driven by `Event.event_type`, set by
+ * `plugin/hooks/events-writer.ts`'s `notification_type` passthrough):
+ *   `permission_prompt` → `"permission"`
+ *   `elicitation_dialog` → `"elicitation"`
+ *
+ * Strict gate: anything else — `idle_prompt`, `auth_success`, unknown,
+ * empty — is a no-op (never stamps). The map lives in
+ * {@link permissionPromptKindFromEventType}; this set is the type-side
+ * mirror used by re-fold-safe validation in
+ * {@link validatePermissionPromptKind}.
+ */
+const PERMISSION_PROMPT_KINDS: ReadonlySet<PermissionPromptKind> = new Set([
+  "permission",
+  "elicitation",
+]);
+
+/**
+ * Map a `Notification` event's `event_type` (= the hook payload's
+ * `notification_type` passthrough) onto its canonical
+ * {@link PermissionPromptKind}, or `null` if the value is outside the
+ * 2-member allow-list. STRICT gate — `idle_prompt`, `auth_success`,
+ * unknown strings, and empty/non-string values all return `null` so
+ * the reducer arm short-circuits without stamping.
+ *
+ * Pure (no side effects, no throws); the fold arm calls it inside the
+ * open `BEGIN IMMEDIATE` transaction. Re-fold determinism is preserved:
+ * the input is a frozen `events` column, not env / wallclock / fs.
+ */
+function permissionPromptKindFromEventType(
+  eventType: unknown,
+): PermissionPromptKind | null {
+  if (typeof eventType !== "string") {
+    return null;
+  }
+  if (eventType === "permission_prompt") {
+    return "permission";
+  }
+  if (eventType === "elicitation_dialog") {
+    return "elicitation";
+  }
+  return null;
+}
+
+/**
+ * Validate a candidate {@link PermissionPromptKind} value against the
+ * canonical allow-list. Returns the validated value or `null` (NEVER
+ * throws). Mirrors {@link validateInputRequestKind}'s shape minus the
+ * single-member fallback — here a miss is a true no-op rather than a
+ * fallback-to-only-member coercion, because the upstream map already
+ * filtered the legal set via {@link permissionPromptKindFromEventType}.
+ * Defensive: kept as a separate helper so a future code path that
+ * carries a raw kind string (e.g. an RPC, a re-derive) routes through
+ * the same allow-list check.
+ */
+function validatePermissionPromptKind(
+  raw: unknown,
+): PermissionPromptKind | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  return PERMISSION_PROMPT_KINDS.has(raw as PermissionPromptKind)
+    ? (raw as PermissionPromptKind)
+    : null;
 }
 
 /**
@@ -3992,6 +4065,13 @@ interface EmbeddedJobElement {
   last_api_error_kind: string | null;
   last_input_request_at: number | null;
   last_input_request_kind: string | null;
+  // Schema v52 / fn-686: paired permission-prompt / elicitation
+  // annotation. NULL on every entry that has never hit a
+  // `Notification:permission_prompt` / `Notification:elicitation_dialog`
+  // (the common case). Paired-NULL with `last_permission_prompt_kind`;
+  // see {@link import("./types").JobLinkEntry}'s paired-NULL invariant.
+  last_permission_prompt_at: number | null;
+  last_permission_prompt_kind: string | null;
   // Schema v28: per-job dirty-file count. INTEGER NOT NULL DEFAULT 0 on the
   // underlying `jobs` row, so the read-side mirror is plain `number` (never
   // null). Drives the readiness pipeline's `git-uncommitted` predicate via
@@ -4057,6 +4137,13 @@ interface JobsRowForSync {
   last_api_error_kind: string | null;
   last_input_request_at: number | null;
   last_input_request_kind: string | null;
+  // Schema v52 / fn-686: paired permission-prompt / elicitation
+  // annotation. Required on this input shape so TypeScript surfaces any
+  // caller of `syncJobIntoEpic` (via the `syncIfPlanRef` SELECT path)
+  // that forgets to project them out of `jobs`. NULL on every never-
+  // prompted row (the steady-state zero-event reading).
+  last_permission_prompt_at: number | null;
+  last_permission_prompt_kind: string | null;
   git_dirty_count: number;
   // Schema v31: renamed from `git_orphan_count` — carries the legacy v28
   // semantic ("files-not-attributed-to-a-live-session") under the new
@@ -4146,6 +4233,8 @@ function buildEmbeddedJob(
     last_api_error_kind: row.last_api_error_kind,
     last_input_request_at: row.last_input_request_at,
     last_input_request_kind: row.last_input_request_kind,
+    last_permission_prompt_at: row.last_permission_prompt_at,
+    last_permission_prompt_kind: row.last_permission_prompt_kind,
     git_dirty_count: row.git_dirty_count,
     git_unattributed_to_live_count: row.git_unattributed_to_live_count,
     git_orphan_count: row.git_orphan_count,
@@ -4400,7 +4489,7 @@ function syncIfPlanRef(
 ): void {
   const row = db
     .query(
-      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
+      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_permission_prompt_at, last_permission_prompt_kind, git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
     )
     .get(jobId) as JobsRowForSync | null;
   if (row == null) {
@@ -4521,7 +4610,7 @@ function sortJobLinks(
 function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
   const row = db
     .query(
-      "SELECT title, state, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind FROM jobs WHERE job_id = ?",
+      "SELECT title, state, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_permission_prompt_at, last_permission_prompt_kind FROM jobs WHERE job_id = ?",
     )
     .get(classifierEntry.job_id) as {
     title: string | null;
@@ -4530,6 +4619,8 @@ function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
     last_api_error_kind: string | null;
     last_input_request_at: number | null;
     last_input_request_kind: string | null;
+    last_permission_prompt_at: number | null;
+    last_permission_prompt_kind: string | null;
   } | null;
   if (row == null) {
     return {
@@ -4541,6 +4632,8 @@ function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
       last_api_error_kind: null,
       last_input_request_at: null,
       last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
     };
   }
   return {
@@ -4552,6 +4645,8 @@ function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
     last_api_error_kind: row.last_api_error_kind,
     last_input_request_at: row.last_input_request_at,
     last_input_request_kind: row.last_input_request_kind,
+    last_permission_prompt_at: row.last_permission_prompt_at,
+    last_permission_prompt_kind: row.last_permission_prompt_kind,
   };
 }
 
@@ -6032,8 +6127,19 @@ function projectJobsRow(db: Database, event: Event): void {
              -- invariant. SessionStart is rare (once per session boot/
              -- resume), so the unconditional write — versus a gated one —
              -- is the trivially-cheap shape.
+             --
+             -- Schema v52 / fn-686 extends the same shape to the
+             -- (last_permission_prompt_at, last_permission_prompt_kind)
+             -- pair: a resume into a session that was parked on a
+             -- permission dialog / elicitation prompt means the dialog
+             -- is no longer the live worker's concern (either dismissed
+             -- by Claude Code's restart sequence, or the human moved
+             -- on and the next prompt will re-trigger if needed). Same
+             -- unconditional shape, same paired-NULL invariant.
              last_input_request_at = NULL,
              last_input_request_kind = NULL,
+             last_permission_prompt_at = NULL,
+             last_permission_prompt_kind = NULL,
              last_event_id = excluded.last_event_id,
              updated_at = excluded.updated_at`,
           [
@@ -6181,12 +6287,20 @@ function projectJobsRow(db: Database, event: Event): void {
       // "this stoppage was input-request-caused" annotation no longer
       // applies either. Unconditional (cheap, no-op when already NULL)
       // and paired with its sibling column.
+      // Schema v52 / fn-686 extends the same paired-clear to
+      // `last_permission_prompt_at` + `last_permission_prompt_kind`: a
+      // fresh prompt means the human answered the pending permission
+      // dialog or elicitation request (or moved on entirely), so the
+      // annotation no longer applies. Unconditional (cheap, no-op when
+      // already NULL) and paired with its sibling column.
       db.run(
         `UPDATE jobs SET state = 'working',
                          last_api_error_at = NULL,
                          last_api_error_kind = NULL,
                          last_input_request_at = NULL,
                          last_input_request_kind = NULL,
+                         last_permission_prompt_at = NULL,
+                         last_permission_prompt_kind = NULL,
                          pid = COALESCE(?, pid),
                          start_time = CASE
                            WHEN ? IS NOT NULL AND ? != pid THEN NULL
@@ -6201,6 +6315,28 @@ function projectJobsRow(db: Database, event: Event): void {
     }
 
     case "Stop": {
+      // Schema v52 / fn-686: session-level backstop clear for the
+      // permission-prompt / elicitation pair. Hoisted ABOVE the
+      // sub-agent guard for the same reason as the v51 monitors
+      // snapshot-replace below: even a guard-swallowed Stop (parent
+      // yielded to a Task sub-agent) means the dialog is no longer
+      // the live worker's concern — the worker cannot have reached
+      // Stop while the dialog was still up. Gated-on-IS-NOT-NULL so
+      // the overwhelming majority of Stops (no prior permission
+      // prompt) are a zero-cost no-op, matching the v25 Pre/PostToolUse
+      // gated-clear shape. Paired-NULL: both columns clear together.
+      // `changes > 0` gates the embedded re-fan.
+      const stopClearRes = db.run(
+        `UPDATE jobs SET last_permission_prompt_at = NULL,
+                         last_permission_prompt_kind = NULL,
+                         last_event_id = ?,
+                         updated_at = ?
+           WHERE job_id = ? AND last_permission_prompt_at IS NOT NULL`,
+        [event.id, ts, jobId],
+      );
+      if (stopClearRes.changes > 0) {
+        syncIfPlanRef(db, jobId, event.id, ts);
+      }
       // Schema v51 (fn-682): live monitors snapshot-replace. Hoisted
       // ABOVE the sub-agent guard so a guard-swallowed Stop (the
       // parent yielded to a Task tool sub-agent and is conceptually
@@ -6712,14 +6848,110 @@ function projectJobsRow(db: Database, event: Event): void {
       if (res.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
       }
+      // Schema v52 / fn-686: identically-shaped hot-path clear for the
+      // `(last_permission_prompt_at, last_permission_prompt_kind)` pair.
+      // `PostToolUse` is the highest-fidelity clear signal in the
+      // permission-dialog flow — the dialog logically cannot close while
+      // a tool is mid-fire — and clearing on `PreToolUse` too closes the
+      // narrow window where the human approved at the dialog and the
+      // worker fires its next tool before keeper sees a PostToolUse
+      // (anthropics/claude-code#19628 — no "permission dialog dismissed"
+      // hook exists, clearing must be inferred from the next downstream
+      // event).
+      //
+      // Same gate-on-IS-NOT-NULL discipline as the input-request clear
+      // above: no-op when the pair is already NULL (the overwhelming
+      // majority of tool calls). Same paired-NULL invariant: both
+      // columns clear together. Same `changes > 0` sync gate.
+      const resPP = db.run(
+        `UPDATE jobs SET last_permission_prompt_at = NULL,
+                         last_permission_prompt_kind = NULL,
+                         last_event_id = ?,
+                         updated_at = ?
+           WHERE job_id = ? AND last_permission_prompt_at IS NOT NULL`,
+        [event.id, ts, jobId],
+      );
+      if (resPP.changes > 0) {
+        syncIfPlanRef(db, jobId, event.id, ts);
+      }
+      break;
+    }
+
+    case "Notification": {
+      // Schema v52 (fn-686): hook-event-driven fold of
+      // `Notification:permission_prompt` (Claude Code's tool-permission
+      // dialog) and `Notification:elicitation_dialog` (MCP server
+      // requesting input mid-tool-call). One structural divergence from
+      // the v25 `InputRequest` arm: the source is a REAL hook event
+      // whose `event_type` (= `notification_type` passthrough, set by
+      // `plugin/hooks/events-writer.ts:581-582`) carries the
+      // discriminator. NOT a synthetic mint — no `src/daemon.ts` write
+      // path adds it.
+      //
+      // STRICT gate. Only the two whitelisted `event_type` values stamp
+      // — `idle_prompt`, `auth_success`, unknown, and empty values
+      // short-circuit via `permissionPromptKindFromEventType` returning
+      // `null`. The arm still falls through to the post-switch
+      // planctl fan-out + title precedence rule (those live OUTSIDE
+      // the switch), so a non-stamping Notification is identical to
+      // the pre-v52 default-arm no-op.
+      //
+      // **The stamp does NOT flip `state`.** Diverges from the
+      // InputRequest arm, which flips to `'stopped'`. The pill is the
+      // whole point: layer `[awaiting:permission]` /
+      // `[awaiting:elicitation]` on top of the live `[working]` state
+      // so the human sees the worker is parked on a dialog without
+      // losing the structural reading that the worker is still
+      // mid-turn from keeper's POV (no Stop fired). Consequently the
+      // clear arms only zero the pair — no state restore.
+      //
+      // Terminal-row guard cloned verbatim from the v25 InputRequest
+      // arm: a stray `permission_prompt` on an already-terminal row
+      // must NOT mid-life-stamp it (no resurrection, no annotation
+      // on `'ended'` / `'killed'`).
+      //
+      // Re-fold determinism: stamp value is `event.ts` only (no
+      // wallclock / env / fs). A cursor=0 re-fold over historical
+      // `permission_prompt` rows reproduces deterministic stamps; the
+      // five clear arms on subsequent events sweep them up the same
+      // way a steady-state install would.
+      const kind = permissionPromptKindFromEventType(event.event_type);
+      if (kind === null) {
+        // `idle_prompt` / `auth_success` / unknown / empty — strict
+        // gate: no jobs-write. The post-switch fan-outs (planctl,
+        // title precedence, backend-exec coords) still fire below.
+        break;
+      }
+      // Defensive double-check that the upstream map's return is
+      // still in the canonical allow-list — keeps a future
+      // refactor that adds a new map entry but forgets to widen the
+      // type from drifting silently.
+      const validated = validatePermissionPromptKind(kind);
+      if (validated === null) {
+        break;
+      }
+      const res = db.run(
+        `UPDATE jobs SET last_permission_prompt_at = ?,
+                         last_permission_prompt_kind = ?,
+                         last_event_id = ?,
+                         updated_at = ?
+           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
+        [ts, validated, event.id, ts, jobId],
+      );
+      // Sync only when the UPDATE actually wrote — a guarded no-op on a
+      // still-terminal row must NOT re-fan the embedded entry (it would
+      // re-write a stale-but-unchanged element with the new event_id).
+      if (res.changes > 0) {
+        syncIfPlanRef(db, jobId, event.id, ts);
+      }
       break;
     }
 
     default:
-      // PostToolUseFailure, Notification, and any unknown forward-compat
-      // event: no lifecycle write. Cursor still advances upstream. (No
-      // terminal guard needed — these branches never write the state
-      // column.) The `Pre/PostToolUse[Failure]` rows ALSO feed
+      // PostToolUseFailure and any unknown forward-compat event: no
+      // lifecycle write. Cursor still advances upstream. (No terminal
+      // guard needed — these branches never write the state column.)
+      // The `Pre/PostToolUse[Failure]` rows ALSO feed
       // `projectSubagentInvocationsRow` (via the per-event dispatch in
       // `applyEvent`); the no-op here is specifically the *jobs*
       // projection. SubagentStart / SubagentStop, formerly listed here
@@ -6730,9 +6962,13 @@ function projectJobsRow(db: Database, event: Event): void {
       //
       // Schema v25 lifts `PreToolUse` and `PostToolUse` out of this
       // default arm into their own gated-clear case (above) — but only
-      // for the `last_input_request_*` paired clear. The post-switch
-      // planctl fan-out + title precedence rule still fire for those
-      // events because they live OUTSIDE the switch.
+      // for the `last_input_request_*` paired clear. Schema v52 / fn-686
+      // lifts `Notification` out as well (was previously listed here as
+      // a no-op) into its own `case "Notification"` arm that branches on
+      // `event_type` and stamps `(last_permission_prompt_at,
+      // last_permission_prompt_kind)` for the two whitelisted subtypes.
+      // The post-switch planctl fan-out + title precedence rule still
+      // fire for those events because they live OUTSIDE the switch.
       break;
   }
 

@@ -140,6 +140,56 @@ export function inputRequestPillSeg(at: unknown, kind: unknown): string {
   return ` [awaiting:${k}]`;
 }
 
+/**
+ * Render the optional `[awaiting:<kind>]` pill segment from the
+ * `jobs.(last_permission_prompt_at, last_permission_prompt_kind)` pair
+ * (schema v52, fn-686 — a near-exact clone of {@link inputRequestPillSeg}
+ * with the one structural divergence noted below).
+ *
+ * The reducer stamps both columns together on the `Notification` fold
+ * for the two whitelisted `event_type` values (`permission_prompt` —
+ * Claude Code's tool-permission dialog; `elicitation_dialog` — an MCP
+ * server requesting input mid-tool-call), unlike the InputRequest pair
+ * which mints a synthetic event from a transcript match. The clear arms
+ * mirror the InputRequest set with one addition: `UserPromptSubmit` /
+ * `SessionStart` unconditionally, `PreToolUse` / `PostToolUse` gated on
+ * `last_permission_prompt_at IS NOT NULL`, AND `Stop` as the session-
+ * level backstop.
+ *
+ * The kind is taken straight off `last_permission_prompt_kind` — one of
+ * `"permission"` / `"elicitation"`, mapped one-for-one from the
+ * `event_type` value at the reducer boundary. No allow-list narrowing
+ * here; the kind comes off the reducer already and renders verbatim.
+ *
+ * **Structural divergence from {@link inputRequestPillSeg}.** The
+ * underlying reducer arm does NOT flip `state` — the pill layers on top
+ * of the live `[working]` state rather than replacing it (the worker is
+ * blocked on the human but structurally still mid-turn from keeper's
+ * POV; no Stop fired). The renderer side is unaffected: this seg only
+ * decides whether to drop the pill onto its own continuation line; the
+ * `[working]` state pill comes from the row's `state` column unchanged.
+ *
+ * **Paired-NULL invariant.** The reducer guarantees `at` and `kind`
+ * move together. The defensive fallback to `"unknown"` matches
+ * {@link inputRequestPillSeg}.
+ *
+ * Returns the leading `' '` so the segment is self-delimiting —
+ * empty string when `at` is null, ` [awaiting:<kind>]` otherwise. Every
+ * caller drops THIS segment onto its own indented continuation line
+ * beneath the row (`.trimStart()`-ed of the leading space) so a long-
+ * running parked dialog reads without wrapping. Colored yellow on a TTY
+ * via the colorizer's `awaiting:*` prefix fallback to the `warn` bucket
+ * (the same bucket as {@link inputRequestPillSeg}'s
+ * `[awaiting:ask_user_question]` — no colorizer change needed).
+ */
+export function permissionPromptPillSeg(at: unknown, kind: unknown): string {
+  if (at == null) {
+    return "";
+  }
+  const k = typeof kind === "string" && kind.length > 0 ? kind : "unknown";
+  return ` [awaiting:${k}]`;
+}
+
 // ---------------------------------------------------------------------------
 // Pill colorization
 // ---------------------------------------------------------------------------

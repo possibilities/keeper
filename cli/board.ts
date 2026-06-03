@@ -88,6 +88,7 @@ import { parseArgs } from "node:util";
 import {
   apiErrorPillSeg,
   inputRequestPillSeg,
+  permissionPromptPillSeg,
   planVerbLabel,
   subagentLinesFor,
 } from "../src/board-render";
@@ -508,6 +509,16 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
       link.last_input_request_at,
       link.last_input_request_kind,
     );
+    // Schema v52 / fn-686: permission-prompt / elicitation awaiting pill.
+    // Read off the SAME entry as the input-request awaiting pill above
+    // and dropped on its OWN indented continuation line below — both
+    // pills stack independently if a session somehow carries both
+    // (paired-NULL invariant means each pair fires on a distinct fold
+    // arm, but the render layer must not assume mutual exclusion).
+    const awaitingPP = permissionPromptPillSeg(
+      link.last_permission_prompt_at,
+      link.last_permission_prompt_kind,
+    );
     out.push(
       `  ${label} [${link.kind}] [${state}]${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}`,
     );
@@ -516,6 +527,9 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
     // without wrapping; [state]/[failed:<kind>] stay inline above.
     if (awaiting !== "") {
       out.push(`    ${awaiting.trimStart()}`);
+    }
+    if (awaitingPP !== "") {
+      out.push(`    ${awaitingPP.trimStart()}`);
     }
   }
   return out;
@@ -571,6 +585,13 @@ export async function main(argv: string[]): Promise<void> {
         job.last_input_request_at,
         job.last_input_request_kind,
       );
+      // Schema v52 / fn-686: permission-prompt / elicitation awaiting
+      // pill on the embedded-job line. Same stacking discipline as the
+      // input-request pill above — independent continuation line.
+      const awaitingPP = permissionPromptPillSeg(
+        job.last_permission_prompt_at,
+        job.last_permission_prompt_kind,
+      );
       out.push(
         `    ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}`,
       );
@@ -578,6 +599,9 @@ export async function main(argv: string[]): Promise<void> {
       // same depth as this row's sub-agent lines below).
       if (awaiting !== "") {
         out.push(`      ${awaiting.trimStart()}`);
+      }
+      if (awaitingPP !== "") {
+        out.push(`      ${awaitingPP.trimStart()}`);
       }
       out.push(
         ...subagentLinesFor(subagentIndex, String(job.job_id), "      "),

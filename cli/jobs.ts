@@ -78,6 +78,7 @@ import {
   apiErrorPillSeg,
   colorizePillsInLine,
   inputRequestPillSeg,
+  permissionPromptPillSeg,
   planVerbLabel,
   renderDeadLetterPill,
   sendReplayDeadLetterRpc,
@@ -198,14 +199,25 @@ export function projectJobRow(row: Record<string, unknown>): string {
     row.last_input_request_at,
     row.last_input_request_kind,
   );
+  // Schema v52 / fn-686: permission-prompt / elicitation awaiting pill,
+  // always-visible alongside the input-request pill so a parked dialog
+  // is visible at a glance even when the job row is collapsed in insert
+  // mode.
+  const awaitingPP = permissionPromptPillSeg(
+    row.last_permission_prompt_at,
+    row.last_permission_prompt_kind,
+  );
   const head = `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
   // Continuation lines under the head, at the 2-space depth shared with
-  // sub-agent lines. Only the always-visible `awaiting` pill rides here;
+  // sub-agent lines. Only the always-visible `awaiting` pills ride here;
   // the backend-coords pill moved out to `renderJobsBody`'s
   // collapse-controlled region.
   const lines = [head];
   if (awaiting !== "") {
     lines.push(`  ${awaiting.trimStart()}`);
+  }
+  if (awaitingPP !== "") {
+    lines.push(`  ${awaitingPP.trimStart()}`);
   }
   return lines.join("\n");
 }

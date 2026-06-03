@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 51;
+export const SCHEMA_VERSION = 52;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -762,7 +762,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     backend_exec_pane_id TEXT,
     backend_exec_tab_id TEXT,
     backend_exec_tab_name TEXT,
-    monitors TEXT NOT NULL DEFAULT '[]'
+    monitors TEXT NOT NULL DEFAULT '[]',
+    last_permission_prompt_at REAL,
+    last_permission_prompt_kind TEXT
 )
 `;
 
@@ -5083,6 +5085,100 @@ function migrate(db: Database): void {
     // neither `events.background_task_id` nor `jobs.monitors`), but
     // the bump is required so `jobctl commit-work` on this host
     // doesn't fail-loud (test/schema-version.test.ts enforces).
+
+    // v51→v52: fn-686 — surface "session blocked on a Claude Code
+    // permission dialog or MCP elicitation prompt" as a two-field signal
+    // mirroring the schema-v25 (input-request) shape. Add the pair
+    // `jobs.last_permission_prompt_at REAL` +
+    // `jobs.last_permission_prompt_kind TEXT`, matching the new
+    // {@link import("./types").PermissionPromptKind} union (`'permission'`
+    // / `'elicitation'`).
+    //
+    // **One structural divergence from the v24→v25 input-request clone:**
+    // the source is a REAL `Notification` hook event whose `event_type`
+    // (= `notification_type` passthrough, set by
+    // `plugin/hooks/events-writer.ts`) discriminates the two whitelisted
+    // subtypes. NOT a synthetic mint. The reducer fold lives in a new
+    // `case "Notification"` that branches on `event_type` — strict gate,
+    // `idle_prompt` / `auth_success` / unknown / empty `event_type` are
+    // no-ops. The stamp does NOT flip `state` (unlike the InputRequest
+    // arm) — the pill layers on top of the live `[working]` state, which
+    // is the whole point. Five clear arms zero both columns
+    // unconditionally: `UserPromptSubmit` + `SessionStart` (mirroring
+    // the v25 unconditional clears), `PreToolUse` + `PostToolUse` gated
+    // on `last_permission_prompt_at IS NOT NULL` (hot path), AND `Stop`
+    // as the session-level backstop (the one new clear arm relative to
+    // v25).
+    //
+    // Pair-step: the same two columns are added to the embedded `jobs`
+    // array shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
+    // `EmbeddedJob` in `src/types.ts`) AND to the `JobLinkEntry` shape on
+    // `epics.job_links`. Historical serialized JSON arrays from v51 do
+    // NOT carry the new field-pair; without a rewind, incremental
+    // `syncJobIntoEpic` / `syncJobLinksOnJobWrite` writes from later
+    // events would re-serialize entries WITH the new pair while
+    // neighbour entries in the same array stayed WITHOUT it, breaking
+    // the byte-identical re-fold invariant (CLAUDE.md). The rewind-and-
+    // redrain below harmonizes all three sides — `jobs` columns,
+    // `epics.jobs[]`, `epics.tasks[].jobs[]`, `epics.job_links[]` — to
+    // "new schema everywhere".
+    //
+    // **Re-fold over historical `permission_prompt` rows is NOT a
+    // no-op.** Unlike the v25 rewind (zero historical `InputRequest`
+    // events → cols read NULL), the live log ALREADY contains real
+    // `permission_prompt` Notification rows. The cursor=0 rewind WILL
+    // fold them and stamp `last_permission_prompt_at` on whatever
+    // sessions were parked. This is intended — the stamp is a pure
+    // function of `event.ts` (no `Date.now()` / env / fs / process
+    // probes inside the fold), so a re-fold reproduces deterministic
+    // stamps.
+    //
+    // Step 1: add the two new `jobs` columns. Both nullable, no DEFAULT —
+    // ADD COLUMN leaves prior rows reading NULL, which is exactly the
+    // zero-event / never-blocked-on-permission projection. Column defs
+    // match `CREATE_JOBS` so a fresh v52 DB and a migrated v51→v52 DB
+    // converge to identical schema (the addColumnIfMissing/literal
+    // lockstep convention).
+    addColumnIfMissing(db, "jobs", "last_permission_prompt_at", "REAL");
+    addColumnIfMissing(db, "jobs", "last_permission_prompt_kind", "TEXT");
+
+    // Step 2: rewind-and-redrain — same shape as the v17→v18, v18→v19,
+    // v23→v24, v24→v25 steps. Version-guarded: re-open of an already-
+    // migrated v52+ DB skips it (the guard reads the meta row written by
+    // a PRIOR migrate(); on a fresh v52 DB or one that crashed before
+    // stamping v52, `storedVersionV52 < 52` and the rewind runs; on
+    // steady-state v52+ DB it skips). The boot drain after migrate()
+    // returns rebuilds `jobs` / `epics` / `subagent_invocations` from
+    // the event log, re-emitting embedded `jobs` arrays + `job_links`
+    // arrays with the new field-pair on every entry. Historical
+    // `Notification:permission_prompt` / `Notification:elicitation_dialog`
+    // rows DO fold this time (unlike the v25 input-request rewind which
+    // saw zero historical events) — the stamps that result are honest
+    // re-derivations of what the projection would have read had the
+    // fold existed when those events landed, and the five clear arms
+    // (UPS / SessionStart / Pre+PostToolUse / Stop) on subsequent
+    // events sweep them up the same way a steady-state v52 install
+    // would.
+    const storedVersionV52 = Number(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string } | null
+      )?.value ?? "0",
+    );
+    if (storedVersionV52 < 52) {
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM subagent_invocations");
+    }
+    //
+    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
+    // adds 52 in the same change — whitelist-only (keeper-py reads
+    // neither of the new `last_permission_prompt_*` columns; the pill
+    // surfaces only through the board renderer), but the bump is
+    // required so `jobctl commit-work` on this host doesn't fail-loud
+    // (test/schema-version.test.ts enforces).
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

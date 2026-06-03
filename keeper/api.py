@@ -167,8 +167,40 @@ from pathlib import Path
 # ``jobs.monitors`` nor ``events.background_task_id`` (attribution
 # surface only — the monitors projection serves the ``keeper jobs``
 # viewer), so the bump is whitelist-only with no reader logic change.
+#
+# v52 (fn-686 epic, T1) is a whitelist-only bump: adds the paired
+# ``jobs.last_permission_prompt_at`` / ``jobs.last_permission_prompt_kind``
+# projection columns that surface "session blocked on a Claude Code
+# permission dialog or MCP elicitation prompt" via the board
+# ``[awaiting:permission]`` / ``[awaiting:elicitation]`` pill. keeper-py
+# reads neither column (attribution surface only — the pill renders out
+# of the ``keeper board`` viewer's projection read), so the bump is
+# whitelist-only with no reader logic change.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
-    {31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51}
+    {
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+    }
 )
 
 

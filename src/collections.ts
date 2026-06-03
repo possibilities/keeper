@@ -105,6 +105,14 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "last_api_error_kind",
     "last_input_request_at",
     "last_input_request_kind",
+    // Schema v52 / fn-686: paired permission-prompt / elicitation
+    // annotation. Mirrors the v25 input-request pair shape — read by
+    // the board renderer's `permissionPromptPillSeg` to draw the
+    // `[awaiting:permission]` / `[awaiting:elicitation]` continuation
+    // pill on top of the live `[working]` state. Display-only; OUT of
+    // `sortable` / `filters` / `jsonColumns`.
+    "last_permission_prompt_at",
+    "last_permission_prompt_kind",
     "git_dirty_count",
     // Schema v31: the legacy `git_orphan_count` (schema v28 — "files-not-
     // attributed-to-a-live-session") is renamed to

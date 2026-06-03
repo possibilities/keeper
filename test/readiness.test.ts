@@ -126,6 +126,8 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     last_api_error_kind: null,
     last_input_request_at: null,
     last_input_request_kind: null,
+    last_permission_prompt_at: null,
+    last_permission_prompt_kind: null,
     git_dirty_count: 0,
     git_unattributed_to_live_count: 0,
     git_orphan_count: 0,
@@ -171,6 +173,8 @@ function makeLink(overrides: Partial<JobLinkEntry>): JobLinkEntry {
     last_api_error_kind: null,
     last_input_request_at: null,
     last_input_request_kind: null,
+    last_permission_prompt_at: null,
+    last_permission_prompt_kind: null,
     ...overrides,
   };
 }
