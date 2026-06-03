@@ -42,7 +42,7 @@
 		  lifecycle on stderr. Read once at worker module load.
 		-->
 		<key>KEEPER_TRACE_SERVER</key>
-		<string>1</string>
+		<string>0</string>
 		<!--
 		  The subscribe server's UDS defaults to keeperd.sock in the state dir
 		  below (sibling of StandardOutPath / keeper.db). Uncomment to override:
