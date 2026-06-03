@@ -61,7 +61,9 @@ MAX_TS_SENTINEL = (1 << 53) - 1  # 9007199254740991
 # ---------------------------------------------------------------------------
 
 ARTHACK_ROOT = Path("/Users/mike/code/arthack")
-if not (ARTHACK_ROOT / "apps" / "cli_common" / "cli_common" / "planctl_invocations.py").exists():
+if not (
+    ARTHACK_ROOT / "apps" / "cli_common" / "cli_common" / "planctl_invocations.py"
+).exists():
     sys.stderr.write(
         f"error: cli_common not found at {ARTHACK_ROOT}/apps/cli_common — "
         "run this script from a checkout that has arthack at /Users/mike/code/arthack\n"
@@ -77,7 +79,7 @@ try:
     )
 except ImportError:
     sys.path.insert(0, str(ARTHACK_ROOT / "apps" / "cli_common"))
-    sys.path.insert(0, str(ARTHACK_ROOT / "apps" / "planctl"))
+    sys.path.insert(0, str(Path("/Users/mike/code/planctl")))
     from cli_common.planctl_invocations import (  # type: ignore[import-not-found]
         _compute_plan_windows,
         derive_epic_links,
@@ -124,7 +126,9 @@ def _to_planctl_invocations_python(invs_seconds: list[dict]) -> list[dict]:
     return out
 
 
-def _windows_python_to_seconds(windows_ms: list[tuple[int, float]]) -> list[list[int | float]]:
+def _windows_python_to_seconds(
+    windows_ms: list[tuple[int, float]],
+) -> list[list[int | float]]:
     """Translate the Python's int-ms windows to seconds-shaped TS pairs.
 
     The last window's end is `math.inf` in Python; we pin it to

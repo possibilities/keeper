@@ -455,9 +455,7 @@ test("reconcile: tier on a `work` row threads --plugin-dir into the command", ()
   const snap = makeSnapshot({ epics: [epic] });
   const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
   expect(decision.launches[0]?.tier).toBe("max");
-  expect(decision.launches[0]?.workerCommand).toContain(
-    "/claude/work-plugins/max",
-  );
+  expect(decision.launches[0]?.workerCommand).toContain("/work-plugins/max");
 });
 
 // ---------------------------------------------------------------------------

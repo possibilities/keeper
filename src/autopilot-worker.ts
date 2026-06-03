@@ -128,17 +128,10 @@ export type Verb = "work" | "close" | "approve";
 export type DispatchKey = string;
 
 /**
- * `~/code/arthack` root for the `--plugin-dir <root>/claude/work-plugins/<tier>`
- * flag (mirrors `ARTHACK_ROOT` in `cli/autopilot.ts:367`). Env-overridable
- * via `ARTHACK_ROOT` (for tests and a future non-default workspace). `~`
+ * `~/code/arthack` root (kept for any non-plugin-dir callers and for tests
+ * that pin the legacy variable). Env-overridable via `ARTHACK_ROOT`. `~`
  * is expanded eagerly at module load so the assembled string carries an
  * absolute path the launcher's cwd doesn't break.
- *
- * Kept as a worker-local const rather than imported from `cli/autopilot.ts`
- * — the cli module pulls in heavyweight clipboard/live-shell imports we
- * don't want crossing the Worker boundary. The viewer-rewrite sibling
- * task collapses cli/autopilot.ts to a thin viewer; at that point both
- * sides can be re-merged behind a shared module if desired.
  */
 export const ARTHACK_ROOT: string = ((): string => {
   const raw = process.env.ARTHACK_ROOT;
@@ -150,14 +143,33 @@ export const ARTHACK_ROOT: string = ((): string => {
 })();
 
 /**
+ * `~/code/planctl` root for the `--plugin-dir <root>/work-plugins/<tier>`
+ * flag. Env-overridable via `PLANCTL_ROOT` (for tests and a future
+ * non-default workspace). `~` is expanded eagerly at module load so the
+ * assembled string carries an absolute path the launcher's cwd doesn't
+ * break. Mirrors the `ARTHACK_ROOT` IIFE shape — planctl moved out of
+ * `apps/planctl/` into a standalone sibling repo (epic fn-635), so the
+ * tier plugin tree now lives under planctl's own root with no `claude/`
+ * segment.
+ */
+export const PLANCTL_ROOT: string = ((): string => {
+  const raw = process.env.PLANCTL_ROOT;
+  const v = raw != null && raw !== "" ? raw : "~/code/planctl";
+  if (v === "~" || v.startsWith("~/")) {
+    return v === "~" ? homedir() : join(homedir(), v.slice(2));
+  }
+  return v;
+})();
+
+/**
  * The tier work-plugins directory autopilot launches a `work` worker under:
- * `${ARTHACK_ROOT}/claude/work-plugins/<tier>`. Factored out so both the
+ * `${PLANCTL_ROOT}/work-plugins/<tier>`. Factored out so both the
  * dispatch command ({@link buildWorkerCommand}) and the resume-command
  * renderer (`scripts/resume.ts`) build the identical path from one formula.
  * Pure — exported for the resume script and tests.
  */
 export function workPluginDir(tier: string): string {
-  return `${ARTHACK_ROOT}/claude/work-plugins/${tier}`;
+  return `${PLANCTL_ROOT}/work-plugins/${tier}`;
 }
 
 /**

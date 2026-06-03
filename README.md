@@ -1026,7 +1026,7 @@ worktree bytes so FSEvents will not re-fire on commit; main posts a
 `Commit` it writes, and the worker's `recheckPending()` re-runs
 `onChange` per pending path — a freshly-committed path emits its
 snapshot and leaves the set, with no permanent strand. The gate trusts
-planctl's commit-at-the-seam contract (`apps/planctl/docs/reference/
+planctl's commit-at-the-seam contract (`~/code/planctl/docs/reference/
 commit-at-mutation-boundary.md` §3): every mutating verb's `output.emit()`
 owns the write→commit transaction inline, so the file is in HEAD by
 the time the envelope `success: true` lands on stdout. As of schema v14, the `epics` projection adds
