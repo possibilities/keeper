@@ -484,6 +484,59 @@ test("scanZellijEventsDir watermark survives daemon restart (re-tail from offset
   }
 });
 
+test("scanZellijEventsDir handles multi-byte UTF-8 in a pre-watermark line without truncating the next (fn-687)", () => {
+  // Regression for fn-687. Previously the scan computed
+  // `text.slice(priorOffset)` where `text` is a JS string (UTF-16
+  // code-unit indexed) but `priorOffset` is advanced by
+  // `Buffer.byteLength(line, "utf8") + 1` (byte-indexed) and compared
+  // against `st.size` (also bytes). The moment a consumed line carried
+  // any multi-byte character (emoji in a tab name is the common case),
+  // the slice over-shot, truncated the START of the next line, and
+  // `JSON.parse` silently dropped it — persisting the bad offset so the
+  // corruption compounded on every subsequent scan.
+  const { db, stmts } = openDb(dbPath);
+  mkdirSync(eventsDir, { recursive: true });
+  seedJob(db, "job-1", "sess-a", "1");
+
+  const file = join(eventsDir, "sess-a.ndjson");
+
+  // Pass 1: write a single line with an emoji in `tab_name`. "😀" is a
+  // 4-byte UTF-8 sequence but a 2-code-unit (surrogate pair) JS string,
+  // so the byte/code-unit divergence is 2 per emoji — enough to chop a
+  // few characters off the start of the next line.
+  writeFileSync(
+    file,
+    serializeLine(makePaneEvent({ seq: 1, pane_id: "1", tab_name: "😀main" })),
+  );
+  scanZellijEventsDir(db, stmts, eventsDir);
+  expect(readBackendExecEvents(db).count).toBe(1);
+  expect(
+    JSON.parse(readBackendExecEvents(db).rows[0]?.data ?? "{}").tab_name,
+  ).toBe("😀main");
+
+  // Pass 2: append a second normal ASCII line. The watermark advanced
+  // by the byte length of the emoji line on pass 1; pass 2 must slice
+  // the buffer by that byte offset and recover the second line in full.
+  // With the bug, the slice over-shoots by (emoji_count * 2) bytes and
+  // the second line's leading bytes are eaten — `JSON.parse` fails and
+  // the line is silently dropped.
+  writeFileSync(
+    file,
+    serializeLine(makePaneEvent({ seq: 1, pane_id: "1", tab_name: "😀main" })) +
+      serializeLine(
+        makePaneEvent({ seq: 2, pane_id: "1", tab_name: "second" }),
+      ),
+  );
+  scanZellijEventsDir(db, stmts, eventsDir);
+
+  const { count, rows } = readBackendExecEvents(db);
+  expect(count).toBe(2);
+  expect(JSON.parse(rows[0]?.data ?? "{}").tab_name).toBe("😀main");
+  expect(JSON.parse(rows[1]?.data ?? "{}").tab_name).toBe("second");
+
+  db.close();
+});
+
 /**
  * Golden wire bytes — the EXACT line `PaneLine::to_json`
  * (plugin/zellij-bridge/src/lib.rs) emits. `epoch`, `pane_id`, and

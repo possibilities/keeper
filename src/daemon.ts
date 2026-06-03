@@ -769,9 +769,9 @@ export function scanZellijEventsDir(
       continue;
     }
 
-    let text: string;
+    let buf: Buffer;
     try {
-      text = readFileSync(full, "utf8");
+      buf = readFileSync(full);
     } catch (err) {
       console.error(
         `[keeperd] zellij-events scan read failed for ${full}: ${
@@ -783,12 +783,19 @@ export function scanZellijEventsDir(
 
     // Tail from the prior offset. We re-read the whole file (simpler
     // than a streaming seek; bounded by `MAX_ZELLIJ_EVENTS_FILE_BYTES`)
-    // and slice off the already-tailed prefix. If the file shrank
-    // (epoch-less truncation — not a pattern the plugin uses, but
-    // tolerated), the priorOffset>size guard above already reset to 0
-    // for the slice; we still need to detect a fresh epoch on the
-    // first new line to also clear the persisted-epoch mismatch.
-    const tail = text.slice(priorOffset);
+    // and slice off the already-tailed prefix. The slice MUST be done
+    // on the Buffer (byte-indexed) before decoding to UTF-8 — slicing
+    // a JS string by `priorOffset` would mix byte offsets (the write
+    // side advances via `Buffer.byteLength`, the file's `st.size` is
+    // in bytes) with UTF-16 code-unit offsets and over-shoot the
+    // moment any consumed line contains a multi-byte character (e.g.
+    // an emoji in a tab name), silently truncating the next line and
+    // persisting the corrupt offset. If the file shrank (epoch-less
+    // truncation — not a pattern the plugin uses, but tolerated), the
+    // priorOffset>size guard above already reset to 0 for the slice;
+    // we still need to detect a fresh epoch on the first new line to
+    // also clear the persisted-epoch mismatch.
+    const tail = buf.subarray(priorOffset).toString("utf8");
 
     // Forward-tail line walk. Split on `\n` and process every COMPLETE
     // line (lines BEFORE the final `\n`). The last element of the
