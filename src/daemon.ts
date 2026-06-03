@@ -1289,38 +1289,46 @@ function runDaemon(): void {
   const deadLetterDir = resolveDeadLetterDir();
   scanDeadLetterDir(db, deadLetterDir);
 
-  // Step 2c — zellij-events boot import (fn-684 task .3). Read every
+  // Step 2c — ensure the zellij-events dir exists on boot (fn-684 task .4).
+  // The bridge plugin is loaded GLOBALLY into every zellij session by the
+  // human's dotfiles `~/.config/zellij/config.kdl` `load_plugins` block,
+  // which pins the plugin's `cwd` (= its WASI `/host` mount) to this
+  // directory. zellij silently refuses to load a plugin whose `cwd` is
+  // missing, so the dir MUST exist before ANY session's plugin loads —
+  // independent of whether keeper is currently consuming the feed
+  // (`KEEPER_ZELLIJ_FEED`). The mkdir is the FIRST thing we do for the
+  // zellij-events pipeline so it runs before BOTH the boot scan below
+  // AND the live watcher worker spawned downstream. `recursive: true`
+  // makes it idempotent across daemon restarts (already-exists is a
+  // no-op); a failure is logged non-fatally — a broken events dir leaves
+  // the feed dormant rather than wedging the daemon.
+  const zellijFeedMode = resolveZellijFeedMode();
+  const zellijEventsDir = resolveZellijEventsDir();
+  try {
+    mkdirSync(zellijEventsDir, { recursive: true });
+  } catch (err) {
+    console.error(
+      `[keeperd] failed to ensure zellij events dir ${zellijEventsDir}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
+  // Step 2c.1 — zellij-events boot import (fn-684 task .3). Read every
   // `<session>.ndjson` the bridge plugin wrote during downtime / since
   // the last daemon run, tail each from its persisted byte-offset
   // watermark, and mint one `BackendExecSnapshot` synthetic event per
   // new pane line whose `(session, pane_id)` joins to a live job. The
-  // scan is gated on the same `KEEPER_ZELLIJ_FEED=plugin` env that
-  // gates the worker spawn below: if the legacy poller feed is active,
-  // we don't tail the plugin's files (the poller's tick covers it).
-  // Missing dir is tolerated (fresh machine; the dir is created by
-  // task .4's daemon boot mkdir + by the plugin's first append).
+  // scan is gated on `KEEPER_ZELLIJ_FEED=plugin`: if the legacy poller
+  // feed is active, we don't tail the plugin's files (the poller's
+  // tick covers it). The dir-ensure above ALWAYS runs because the
+  // plugin loads in every session regardless of which feed keeper
+  // consumes — but the scan only runs when keeper is consuming.
   // MUST run before the zellij-events worker spawns: a watcher
   // notification on a half-imported set of files would re-fold work
   // we already have on disk — harmless but wasteful. The watermark
   // sidecar makes the boot scan idempotent across restarts.
-  const zellijFeedMode = resolveZellijFeedMode();
-  const zellijEventsDir = resolveZellijEventsDir();
   if (zellijFeedMode === "plugin") {
-    // Ensure the dir exists before the boot scan + worker subscribe.
-    // Task .4 carries the canonical boot mkdir; this is a defensive
-    // double-arm so the `KEEPER_ZELLIJ_FEED=plugin` rollout never
-    // races a fresh machine where task .4's mkdir hasn't landed yet.
-    if (!existsSync(zellijEventsDir)) {
-      try {
-        mkdirSync(zellijEventsDir, { recursive: true });
-      } catch (err) {
-        console.error(
-          `[keeperd] failed to ensure zellij events dir ${zellijEventsDir}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
-    }
     try {
       scanZellijEventsDir(db, stmts, zellijEventsDir);
     } catch (err) {

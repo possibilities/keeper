@@ -1998,3 +1998,152 @@ await new Promise(() => {
   daemon.kill("SIGTERM");
   expect(await daemon.exited).toBe(0);
 }, 30000);
+
+test("fn-684.4: daemon boot mkdir -p's the zellij events dir (idempotent on re-boot, runs even when KEEPER_ZELLIJ_FEED is unset)", async () => {
+  // The fn-684 bridge plugin is loaded GLOBALLY into every zellij session
+  // by the human's dotfiles `config.kdl` `load_plugins` block, which pins
+  // the plugin's `cwd` (= its WASI `/host` mount) to keeper's events dir.
+  // zellij silently refuses to load a plugin whose `cwd` is missing, so
+  // the daemon must ensure the dir exists on boot — INDEPENDENT of
+  // whether keeper itself is currently consuming the feed via
+  // `KEEPER_ZELLIJ_FEED=plugin` (the plugin loads regardless).
+  const zellijEventsDir = join(tmpDir, "zellij-events");
+  // Sanity: the dir does NOT exist before the first daemon boot.
+  expect(existsSync(zellijEventsDir)).toBe(false);
+
+  // First boot — KEEPER_ZELLIJ_FEED deliberately UNSET so we exercise the
+  // common-path rollout window where the plugin loads in every session
+  // but keeper still consumes via the legacy poller. The mkdir must
+  // still fire.
+  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_SOCK: sockPath,
+      KEEPER_CONFIG: configPath,
+      KEEPER_ZELLIJ_EVENTS_DIR: zellijEventsDir,
+      // Explicitly clear KEEPER_ZELLIJ_FEED so a host-set value doesn't
+      // leak into the test (e.g. a dev box running with =plugin would
+      // skew this assertion past the load_plugins-global guarantee).
+      KEEPER_ZELLIJ_FEED: "",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  // Wait for the zellij-events dir to appear — that proxies "boot reached
+  // step 2c (the mkdir) and continued past it". We don't gate on the socket
+  // binding because the mkdir runs MUCH earlier than the server-worker
+  // spawn — testing the cheaper signal lets a slow plan-worker boot scan
+  // (still on its way to bind) not flake this assertion.
+  const dirAppeared = await retryUntil(
+    () => (existsSync(zellijEventsDir) ? true : null),
+    5000,
+  );
+  if (!dirAppeared) {
+    const out = await readStream(daemon.stdout);
+    const err = await readStream(daemon.stderr);
+    throw new Error(
+      `zellij events dir never created.\nstdout:\n${out}\nstderr:\n${err}`,
+    );
+  }
+  expect(existsSync(zellijEventsDir)).toBe(true);
+
+  daemon.kill("SIGTERM");
+  await daemon.exited;
+  daemon = null;
+  // Best-effort socket cleanup so the second boot doesn't trip the lock.
+  for (const p of [sockPath, `${sockPath}.lock`]) {
+    try {
+      if (existsSync(p)) {
+        unlinkSync(p);
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
+  // Second boot — the dir is now pre-existing. mkdir's `recursive: true`
+  // makes the call a no-op, but assert end-to-end that re-boot does not
+  // throw / dirty the existing dir's contents. Pre-seed a file inside
+  // the dir so we can also verify the mkdir does not blow it away.
+  const sentinelPath = join(zellijEventsDir, "sentinel.ndjson");
+  writeFileSync(sentinelPath, "");
+  expect(existsSync(sentinelPath)).toBe(true);
+
+  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_SOCK: sockPath,
+      KEEPER_CONFIG: configPath,
+      KEEPER_ZELLIJ_EVENTS_DIR: zellijEventsDir,
+      KEEPER_ZELLIJ_FEED: "",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  // Give the second daemon enough time to reach step 2c and run mkdir
+  // again. We're asserting idempotency — the dir already exists, so
+  // there's no observable change to wait for; the win condition is "no
+  // throw, no sentinel loss". A short fixed wait is acceptable here
+  // because the assertion below doesn't poll a derived projection.
+  await Bun.sleep(1000);
+
+  // Dir still exists, sentinel file untouched — re-boot was idempotent
+  // (the boot mkdir's `recursive: true` made already-exists a no-op,
+  // not a wipe).
+  expect(existsSync(zellijEventsDir)).toBe(true);
+  expect(existsSync(sentinelPath)).toBe(true);
+
+  // SIGTERM the second daemon. We don't assert a graceful exit code (0)
+  // here because the test deliberately kills it mid-boot — before the
+  // server-worker spawns the SIGTERM may land before the handler is
+  // installed (143 = 128 + SIGTERM). The boot mkdir is what we exercise;
+  // shutdown grace is covered by the other integration tests.
+  daemon.kill("SIGTERM");
+  await daemon.exited;
+}, 20000);
+
+test("fn-684.4: keeper source carries NO `start-or-reload-plugin` argv (the retired keeper-side per-session-load mechanism stays retired)", async () => {
+  // The original task .4 plan had keeper imperatively load the plugin into
+  // each session via `zellij action start-or-reload-plugin` and seed
+  // `~/.cache/zellij/permissions.kdl` from the daemon. That mechanism was
+  // RETIRED — the plugin is now loaded GLOBALLY by the human's dotfiles
+  // `config.kdl` `load_plugins` block, so keeper owns NEITHER the load nor
+  // the permission seed. This test is a regression guard: scan every
+  // production source file under src/ for the retired argv literals and
+  // fail loud if they reappear. (Comments referencing the contract are
+  // allowed and helpful; the assertion is scoped to .ts source under src/.)
+  //
+  // Bun's filesystem reads from the same import.meta.dir-rooted ROOT the
+  // daemon spawn uses above.
+  const { Glob } = await import("bun");
+  const glob = new Glob("**/*.ts");
+  const srcDir = join(ROOT, "src");
+  const offenders: Array<{ path: string; line: number; text: string }> = [];
+  for await (const rel of glob.scan({ cwd: srcDir })) {
+    const abs = join(srcDir, rel);
+    const text = await Bun.file(abs).text();
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line === undefined) continue;
+      // A line that mentions the argv literal AND is not a comment
+      // discussing its retirement is a regression. The simple rule: if
+      // the line contains the literal `start-or-reload-plugin` AND does
+      // NOT start (after trim) with `*` or `//`, treat it as code.
+      if (line.includes("start-or-reload-plugin")) {
+        const trimmed = line.trimStart();
+        const isComment = trimmed.startsWith("//") || trimmed.startsWith("*");
+        if (!isComment) {
+          offenders.push({ path: rel, line: i + 1, text: line });
+        }
+      }
+    }
+  }
+  expect(offenders).toEqual([]);
+}, 5000);

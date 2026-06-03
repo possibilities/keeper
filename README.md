@@ -506,6 +506,79 @@ instructions when they drift. Run it after every `brew upgrade zellij` —
 otherwise an agent will silently run a `.wasm` linked against the wrong
 host API.
 
+### Zellij bridge plugin (dotfiles wiring)
+
+Keeper is the PROVIDER of the bridge `.wasm` and ensures the events dir
+exists on daemon boot (`~/.local/state/keeper/zellij-events`, override
+via `KEEPER_ZELLIJ_EVENTS_DIR`). Keeper does NOT load the plugin into
+sessions itself — it never runs `zellij action start-or-reload-plugin`
+and never writes `~/.cache/zellij/permissions.kdl`. That side is owned
+by your dotfiles / arthack install scripts (separate repo), which load
+the plugin GLOBALLY into every zellij session via a `config.kdl`
+`load_plugins` block. The result: every zellij session (whether
+keeper-launched or not) writes its `<session>.ndjson` event stream into
+one keeper-watched directory, and the keeperd daemon folds the lines
+through the existing `BackendExecSnapshot` synthetic event into
+`jobs.backend_exec_tab_*` (no schema bump).
+
+The wiring contract is a THREE-place byte-match: the committed `.wasm`
+file, the `config.kdl` `load_plugins` URL, and the
+`~/.cache/zellij/permissions.kdl` URL must all carry the same absolute
+`file:` URL. `keeper plugin-path` (above) is the single source of
+truth — derive both KDL URLs from it rather than hardcoding the path;
+otherwise a `~/code/keeper` checkout move silently strands the wiring.
+
+1. **`~/.config/zellij/config.kdl`** — add a `load_plugins` block that
+   pins the plugin's `cwd` to keeper's events dir. zellij maps the
+   plugin's `initial_cwd` to its WASI `/host` mount, so this `cwd` IS
+   where the plugin's `<session>.ndjson` lines land — and keeper
+   watches exactly that directory.
+
+   ```kdl
+   load_plugins {
+       "file:/Users/you/code/keeper/plugin/zellij-bridge/keeper-zellij-bridge.wasm" {
+           cwd "/Users/you/.local/state/keeper/zellij-events"
+       }
+   }
+   ```
+
+   Substitute the two paths from `keeper plugin-path` and your
+   `KEEPER_ZELLIJ_EVENTS_DIR` (default
+   `~/.local/state/keeper/zellij-events`). Arthack-style install
+   scripts should template this block from `keeper plugin-path` so a
+   checkout move regenerates the URL automatically.
+
+2. **`~/.cache/zellij/permissions.kdl`** — pre-seed a
+   `ReadApplicationState` grant for the SAME `file:` URL. Background /
+   headless plugins cannot surface a permission-grant UI (upstream
+   zellij#4982 — maintainer-confirmed workaround is the pre-seed), so
+   without this entry the plugin loads but its event subscription
+   silently no-ops.
+
+   ```kdl
+   "file:/Users/you/code/keeper/plugin/zellij-bridge/keeper-zellij-bridge.wasm" {
+       allowed_permissions "ReadApplicationState"
+   }
+   ```
+
+   The URL MUST byte-match the one in `config.kdl` above (and the
+   output of `keeper plugin-path`) — zellij keys permissions by exact
+   URL, so a one-byte drift silently strips the grant.
+
+3. **Restart your zellij sessions** to pick up the new `config.kdl` /
+   `permissions.kdl`. Long-lived existing sessions only acquire the
+   plugin on their next zellij (re)start. New sessions opened after
+   the dotfiles land bind the plugin immediately. Confirm with
+   `tail -f ~/.local/state/keeper/zellij-events/<session>.ndjson` —
+   lines should append as panes/tabs move.
+
+4. **(Optional) Flip keeper's feed.** Until you set
+   `KEEPER_ZELLIJ_FEED=plugin` on the daemon (LaunchAgent plist
+   `EnvironmentVariables`), keeper runs the legacy poller as the
+   active tab-resolution feed and ignores the plugin's NDJSON files.
+   The plugin keeps writing harmlessly — its files turn live the
+   moment you flip the gate and restart keeperd.
+
 ## Example clients
 
 The unified `keeper` CLI exposes the example subscribe + RPC clients as
