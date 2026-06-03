@@ -1,0 +1,22 @@
+[package]
+name = "keeper-zellij-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Headless zellij plugin that pushes PaneUpdate/TabUpdate deltas as NDJSON for keeper to fold"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Exact pin to the installed zellij (0.44.3). Re-pin on zellij upgrade — a
+# version-skew test (task .4) enforces this matches `zellij --version`.
+zellij-tile = "=0.44.3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
