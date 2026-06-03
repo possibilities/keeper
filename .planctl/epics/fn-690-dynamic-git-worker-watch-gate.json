@@ -1,0 +1,20 @@
+{
+  "approval": "pending",
+  "branch_name": "fn-690-dynamic-git-worker-watch-gate",
+  "bundles": [],
+  "created_at": "2026-06-03T20:02:05.946030Z",
+  "depends_on_epics": [],
+  "id": "fn-690-dynamic-git-worker-watch-gate",
+  "last_validated_at": "2026-06-03T20:02:06.025133Z",
+  "plan_review_status": "unknown",
+  "plan_reviewed_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "dynamic git-worker watch gate",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-03T20:02:05.946030Z"
+}

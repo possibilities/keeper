@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-03T20:02:05.946030Z",
+  "depends_on": [
+    "fn-690-dynamic-git-worker-watch-gate.1"
+  ],
+  "epic": "fn-690-dynamic-git-worker-watch-gate",
+  "id": "fn-690-dynamic-git-worker-watch-gate.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "refresh planctl-backed watch docs",
+  "updated_at": "2026-06-03T20:02:05.946030Z"
+}
