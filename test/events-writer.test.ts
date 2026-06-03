@@ -95,10 +95,14 @@ afterEach(() => {
  *
  * The hook honors three state-bearing env vars: `KEEPER_DB` (events DB),
  * `KEEPER_DEAD_LETTER_DIR` (per-pid NDJSON recovery files), and
- * `KEEPER_DROP_LOG` (the diagnostic drop-log append). If any of these falls
- * through to its production default, a test run pollutes the user's real
- * `~/.local/state/keeper/` paths — the drop-log leak that fn-657 exists to
- * close. Centralize them here so a new spawn site can't forget one.
+ * `KEEPER_DROP_LOG` (the diagnostic drop-log append). The daemon (not
+ * the hook directly, but spawned indirectly) also honors
+ * `KEEPER_ZELLIJ_EVENTS_DIR` (fn-684 task .3 — per-session zellij
+ * plugin NDJSON files). If any of these falls through to its
+ * production default, a test run pollutes the user's real
+ * `~/.local/state/keeper/` paths — the drop-log leak that fn-657
+ * exists to close. Centralize them here so a new spawn site can't
+ * forget one.
  *
  * Computed from the LIVE per-test `tmpDir` (re-created each `beforeEach`),
  * never frozen at module scope.
@@ -107,12 +111,14 @@ function sandboxedBaseEnv(): Record<string, string> & {
   KEEPER_DB: string;
   KEEPER_DEAD_LETTER_DIR: string;
   KEEPER_DROP_LOG: string;
+  KEEPER_ZELLIJ_EVENTS_DIR: string;
 } {
   return {
     ...(process.env as Record<string, string>),
     KEEPER_DB: dbPath,
     KEEPER_DEAD_LETTER_DIR: join(tmpDir, "dead-letters"),
     KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
+    KEEPER_ZELLIJ_EVENTS_DIR: join(tmpDir, "zellij-events"),
   };
 }
 

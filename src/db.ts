@@ -362,6 +362,54 @@ export function resolveDeadLetterDir(): string {
 }
 
 /**
+ * Resolve the keeper zellij-events directory (fn-684 task .3).
+ * `KEEPER_ZELLIJ_EVENTS_DIR` env wins (hermetic tests point it at a
+ * tmp dir, mirroring the dead-letter override); otherwise default to
+ * `~/.local/state/keeper/zellij-events`, a sibling of the DB file and
+ * the dead-letter dir.
+ *
+ * This directory is pinned as the zellij bridge plugin's `/host`
+ * mount by the human's dotfiles `~/.config/zellij/config.kdl`
+ * `load_plugins { "file:..." { cwd "<events dir>" } }` block — task
+ * .4 documents the contract and adds the daemon boot `mkdir -p` so
+ * the dir always exists before any session's plugin loads (zellij
+ * silently fails a plugin load whose `cwd` is missing).
+ *
+ * The directory may not exist at daemon boot on a fresh machine
+ * (before task .4's `mkdir`, or before the plugin has ever appended
+ * its first line); the zellij-events worker tolerates absence — see
+ * the worker's `existsSync` guard.
+ *
+ * Cross-process write contract: the zellij plugin is the SOLE writer
+ * of `<session>.ndjson` files (one per zellij session, append-only),
+ * and the daemon is the SOLE reader. There is no hook-side duplicate
+ * of this resolver (unlike `resolveDeadLetterDir`) — the plugin
+ * resolves its sandbox via WASI `/host`, not a path env var.
+ */
+export function resolveZellijEventsDir(): string {
+  const override = process.env.KEEPER_ZELLIJ_EVENTS_DIR;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "zellij-events");
+}
+
+/**
+ * Resolve the active zellij feed mode (fn-684 task .3). The default is
+ * the legacy `poller` (`backend-worker`'s `zellij action list-panes`
+ * tick loop); setting `KEEPER_ZELLIJ_FEED=plugin` enables the
+ * event-driven path (the `zellij-events-worker` + the plugin's NDJSON
+ * append-tail). During the rollout window both feeds can coexist —
+ * the reducer's `BackendExecSnapshot` fold is idempotent on matching
+ * `(tab_id, tab_name)` writes — but the worker spawn gate keeps the
+ * plugin path dormant until explicitly opted in. Anything other than
+ * the literal `"plugin"` (case-sensitive) falls back to the poller.
+ */
+export function resolveZellijFeedMode(): "poller" | "plugin" {
+  return process.env.KEEPER_ZELLIJ_FEED === "plugin" ? "plugin" : "poller";
+}
+
+/**
  * Absolute filesystem path of the committed `keeper-zellij-bridge.wasm`
  * artifact (fn-684 / task .2). This is the single source of truth for the
  * cross-repo byte-match contract documented in the epic spec:
