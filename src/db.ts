@@ -395,21 +395,6 @@ export function resolveZellijEventsDir(): string {
 }
 
 /**
- * Resolve the active zellij feed mode (fn-684 task .3). The default is
- * the legacy `poller` (`backend-worker`'s `zellij action list-panes`
- * tick loop); setting `KEEPER_ZELLIJ_FEED=plugin` enables the
- * event-driven path (the `zellij-events-worker` + the plugin's NDJSON
- * append-tail). During the rollout window both feeds can coexist —
- * the reducer's `BackendExecSnapshot` fold is idempotent on matching
- * `(tab_id, tab_name)` writes — but the worker spawn gate keeps the
- * plugin path dormant until explicitly opted in. Anything other than
- * the literal `"plugin"` (case-sensitive) falls back to the poller.
- */
-export function resolveZellijFeedMode(): "poller" | "plugin" {
-  return process.env.KEEPER_ZELLIJ_FEED === "plugin" ? "plugin" : "poller";
-}
-
-/**
  * Absolute filesystem path of the committed `keeper-zellij-bridge.wasm`
  * artifact (fn-684 / task .2). This is the single source of truth for the
  * cross-repo byte-match contract documented in the epic spec:

@@ -54,10 +54,11 @@ three terminal-multiplexer backend-exec coordinates
 synchronous `process.env` reads (`ZELLIJ` / `ZELLIJ_SESSION_NAME` /
 `ZELLIJ_PANE_ID`; no fork, no fs, no PPID-walk), folded onto
 `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins via
-`COALESCE` — and a daemon-side tab-resolver worker stamps the matched
+`COALESCE` — and a daemon-side zellij-events watcher stamps the matched
 `jobs.backend_exec_tab_{id,name}` via a `BackendExecSnapshot` synthetic
-event (one `zellij action list-panes -a -j` per distinct live session per
-tick, deduped). Generic `backend_exec_*` naming lets a future
+event (event-driven; the fn-684 wasm bridge plugin appends one NDJSON
+line per pane/tab delta to a session-scoped feed file, retiring the
+prior `zellij action list-panes -a -j` poller). Generic `backend_exec_*` naming lets a future
 tmux/wezterm backend slot in without a schema change. Consumers can find
 `/plan:work` calls, `Skill` invocations, every Task-tool subagent
 lifecycle, every session's profile attribution, every planctl-CLI
@@ -1282,16 +1283,20 @@ fork, no fs, no PPID-walk; absent env ⇒ NULL coords, never bogus
 `type='zellij'`) — and the reducer's `applyEvent` arm folds the three
 onto `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins
 via `COALESCE`, so a re-fold from cursor=0 reproduces byte-identical
-rows. A daemon-side tab-resolver Worker thread (the ninth producer
-worker; see [Architecture](#architecture)) ticks every 5 seconds
-(interval-driven rather than `data_version`-triggered — tab renames
-produce no DB write, so a `data_version` gate would miss them), dedups
-distinct `(session, pane)` across the live jobs, spawns one
-`zellij action list-panes -a -j` per distinct session, matches the
-captured pane id against each pane's numeric `id` (normalized equality),
-and posts a `BackendExecSnapshot` synthetic event the reducer folds into
-`jobs.backend_exec_tab_{id,name}` (tab tombstone = last-known sticks;
-env absent ⇒ NULL coords). Generic
+rows. A daemon-side zellij-events watcher Worker thread (the ninth
+producer worker; see [Architecture](#architecture)) consumes a
+session-scoped NDJSON feed appended by the fn-684 Rust wasm bridge
+plugin (loaded into every zellij session by the human's dotfiles
+`config.kdl`), watching the feed dir with `@parcel/watcher`. Main
+tails each `<session>.ndjson` from a persisted byte-offset watermark,
+joins `(session, pane_id) -> job_id` via `readLiveJobsWithCoords`,
+and mints a `BackendExecSnapshot` synthetic event per joined line
+the reducer folds into `jobs.backend_exec_tab_{id,name}` (tab
+tombstone = last-known sticks; env absent ⇒ NULL coords). The legacy
+`zellij action list-panes -a -j` polling producer (`backend-worker`)
+was retired by fn-684 task .5 after the plugin feed soaked for
+multi-day parity — rollback is a single `git revert` of that commit.
+Generic
 `backend_exec_*` naming lets a future tmux/wezterm backend slot in
 without a schema change — only the hook's env-name table changes. The
 five `jobs.backend_exec_*` columns are display-only on
@@ -1570,30 +1575,36 @@ reconciler reaps a dispatch whose role is no longer needed via
 `jobs.backend_exec_{session_id,tab_id}` coordinates (fn-668); default-off
 preserves today's leave-open behavior.
 
-A **ninth** Worker thread is the backend-exec tab resolver (schema v48,
-fn-668): an interval-driven producer that ticks every 5 seconds (rather
-than waking on `PRAGMA data_version` — tab renames produce no DB write,
-so a `data_version` gate would miss them), SELECTs the live jobs carrying
-both a `backend_exec_session_id` and a `backend_exec_pane_id` off its
-own read-only connection, dedups by distinct `(session, pane)`, and for
-each distinct live `backend_exec_session_id` spawns one
-`zellij action list-panes -a -j`. The resolver matches the captured
-`backend_exec_pane_id` against each pane's numeric `id` field (normalized
-equality), reads the matched pane's `tab_id` + `tab_name`, and posts one
-`{kind:"backend-exec-snapshot", job_id, tab_id, tab_name}` per resolved
-row to main. Main — again the sole writer — lifts the message into a
-synthetic `BackendExecSnapshot` event whose reducer fold arm UPDATEs
-`jobs.backend_exec_tab_{id,name}` (tab tombstone = last-known sticks; a
-session that disappears from `list-panes` does NOT clear the column). It
-is the fourth producer-worker instance — read-only / write-free, feeding
-the log only via main — and follows the same worker-contract discipline:
-stdout+stderr drained concurrently on the `Bun.spawn`, non-zero exit
-treated as expected "no such session" and log-and-skip, per-session
-in-flight lock + per-tick `isRunning` guard so a slow `list-panes` cannot
-stack. Shutdown clears the tick interval and `process.exit(0)`s. Like the
-other producers it does NOT write the DB directly; the fold keeps re-fold
-determinism on the synthetic-event side (no fold-time spawn, no env reads
-inside `applyEvent`).
+A **ninth** Worker thread is the zellij-events watcher (fn-684, schema
+v48 unchanged). It is the always-on event-driven replacement for the
+retired `backend-worker` poller: instead of shelling
+`zellij action list-panes -a -j` once per tick, keeper consumes a
+session-scoped NDJSON feed produced by a headless Rust wasm bridge
+plugin (`keeper-zellij-bridge.wasm`) that the human's dotfiles load
+into every zellij session via a `config.kdl` `load_plugins` block.
+The plugin subscribes to native `PaneUpdate` / `TabUpdate` events,
+joins `pane_id -> (tab_id, tab_name)` against the manifest, and
+appends one line per delta to `<events-dir>/<session>.ndjson` (its
+WASI `/host` is pinned to the keeper events dir by the dotfiles'
+per-plugin `cwd`). This worker uses `@parcel/watcher` on the events
+dir and posts a contentless `{kind:"zellij-events-changed"}` "go
+look" notification on every tree change. Main re-runs
+`scanZellijEventsDir`, which tails each file from its persisted
+byte-offset watermark, parses each new line, joins
+`(session, pane_id) -> job_id` via `readLiveJobsWithCoords` (the
+same projection-side helper the poller used), and mints one
+synthetic `BackendExecSnapshot` event per joined line through the
+EXACT same reducer fold the poller fed — last-known sticks
+tombstone semantics, no schema change, no reducer change. The worker
+itself holds NO DB handle. It is the eighth `@parcel/watcher`
+producer instance and, like every keeper producer, feeds the log
+only via main's writable connection. The watermark sidecar advances
+in lockstep with each scan so a daemon restart re-tails from the
+last byte rather than re-folding the whole feed; an epoch nonce
+stamped by every plugin `load()` resets the watermark cleanly when
+the plugin reloads. Rollback to the poller is a single `git revert`
+of the fn-684 task .5 commit — the poller worker is retired, not
+gated.
 
 A **tenth** Worker thread is the restore-snapshot worker (epic fn-677):
 a pure CONSUMER that opens its own read-only connection, polls
@@ -1630,21 +1641,22 @@ open focus-switch bug (zellij #4602) that would yank the human's
 visible focus to the renamed tab. fn-678 made the tab name purely
 cosmetic (reap is by `backend_exec_tab_id`, launch dedup by
 `pending_dispatches`), so renaming every tab — autopilot's included
-— is safe; the backend-worker is the single reader of zellij tab
-state, closing the convergence loop without a read-back from this
-worker. The worker writes NOTHING to the DB, mints no events, no
-schema bump, no reducer arm, no `keeper/api.py` whitelist change. It
-carries no `onmessage` handler — it never posts to main. Rename
-failures (tab gone, session dead, ENOENT) are silent no-ops; only an
-unhandled throw out of the tick escalates to `onerror`/`close` →
-fatalExit.
+— is safe; the zellij-events feed (worker nine) is the single reader
+of zellij tab state, closing the convergence loop without a read-back
+from this worker. The worker writes NOTHING to the DB, mints no
+events, no schema bump, no reducer arm, no `keeper/api.py` whitelist
+change. It carries no `onmessage` handler — it never posts to main.
+Rename failures (tab gone, session dead, ENOENT) are silent no-ops;
+only an unhandled throw out of the tick escalates to
+`onerror`/`close` → fatalExit.
 
-The eleven workers are fully independent; main supervises all eleven lifecycles
-but routes none of their traffic, and any worker's `error` event escalates
-the whole process to a clean restart — with that single scoped exception, the
-recoverable drop signal on the transcript, plan, usage, and dead-letter
-watchers, which deliberately does NOT escalate (a re-scan throw is swallowed,
-never reaching the restart path).
+The twelve workers are fully independent; main supervises all twelve
+lifecycles but routes none of their traffic, and any worker's `error`
+event escalates the whole process to a clean restart — with that single
+scoped exception, the recoverable drop signal on the transcript, plan,
+usage, dead-letter, and zellij-events watchers, which deliberately does
+NOT escalate (a re-scan throw is swallowed, never reaching the restart
+path).
 
 Readiness is a client-side library, not a server-side collection.
 `src/readiness.ts` is the shared verdict pipeline consumed both by

@@ -221,8 +221,11 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   Use `PRAGMA data_version` polling on a read-only autocommit connection as the
   only DB-change primitive. *Carve-out (files):* native `@parcel/watcher` on
   *external* trees written by other processes IS permitted (transcript files,
-  `.planctl` trees); treat an event (or a drop-overrun `err`) as "go look," never
-  as the data — always `fstat` + safe-parse. *Carve-out (processes):* kqueue
+  `.planctl` trees, the zellij-events plugin feed dir at
+  `~/.local/state/keeper/zellij-events/` written by the fn-684 wasm bridge
+  plugin — one append-only `<session>.ndjson` per zellij session); treat an
+  event (or a drop-overrun `err`) as "go look," never as the data — always
+  `fstat` + safe-parse. *Carve-out (processes):* kqueue
   `EVFILT_PROC|NOTE_EXIT` / `pidfd_open`+`epoll` on EXTERNAL process descriptors
   is permitted (exit-watcher), with a post-register `kill(pid,0)` probe and
   `(pid, start_time)` identity guarding pid recycling.
@@ -282,6 +285,23 @@ Every keeper Worker thread follows the same durable contract:
   file, watcher subscription, re-scan timer, kqueue/pidfd fd) MUST release it in
   its own shutdown handler — `terminate()` alone leaks it.
 - **No in-process self-heal** — a worker's `error` event escalates to `fatalExit`.
+
+*Carve-out (out-of-process producers, fn-684).* Not every producer is a Bun
+postMessage worker. The fn-684 zellij bridge plugin is a Rust wasm module the
+human's dotfiles load into every zellij session; it runs INSIDE the zellij
+server (a different process from keeperd) under WASI sandbox, and it pushes
+data to keeper by appending NDJSON lines to its pinned `/host` mount (=
+`~/.local/state/keeper/zellij-events/<session>.ndjson`). Its keeperd-side
+counterpart is the `zellij-events-worker` (a normal `@parcel/watcher`
+producer-archetype Worker thread) plus the main-side `scanZellijEventsDir`
+ingestion, both of which still follow the rules above. The plugin itself is
+not bound by the Bun-thread contract — but it inherits two adjacent
+disciplines: lines are flushed per complete NDJSON record (the consumer holds
+a carry-buffer for trailing partial bytes), and the file is opened
+`O_APPEND` so a #5177 double-load shares one append stream instead of
+corrupting it. Sole-writer rules are preserved: the plugin is the sole writer
+of the `.ndjson` files, and main remains the sole writer of the synthetic
+`BackendExecSnapshot` events it mints from those lines.
 
 ## Autopilot dispatch gates
 

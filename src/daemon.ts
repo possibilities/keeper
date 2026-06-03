@@ -11,10 +11,13 @@
  *      projection up before the daemon goes live.
  *   3. Spawn TWELVE worker threads (all AFTER migrate + boot drain + seed sweep,
  *      so their read-only `openDb` connections never race a missing/un-migrated
- *      DB and the exit-watcher's data_version diff sees a settled projection;
- *      the TWELFTH — the zellij-events watcher worker — is gated behind
- *      `KEEPER_ZELLIJ_FEED=plugin` and is dormant when the legacy poller feed
- *      is active, so a deployment that hasn't opted in runs ELEVEN threads):
+ *      DB and the exit-watcher's data_version diff sees a settled projection.
+ *      Worker fleet as of fn-684 task .5: the legacy `backend-worker` poller
+ *      (interval-driven `zellij action list-panes` tab resolver) is retired
+ *      and replaced by the always-on zellij-events watcher + main-side
+ *      `scanZellijEventsDir` ingestion, both feeding the existing
+ *      `BackendExecSnapshot` synthetic event — same fold path, event-driven
+ *      now instead of poll-driven):
  *      - the wake worker — opens its own read-only connection, polls
  *        `PRAGMA data_version`, and posts a contentless `{ kind: "wake" }`
  *        whenever another connection commits.
@@ -47,20 +50,33 @@
  *        and posts `{ kind: "git-snapshot", ... }`. Main turns each into a
  *        synthetic `GitSnapshot` events row — the fourth producer-worker
  *        instance.
+ *      - the zellij-events watcher worker (fn-684) — the always-on
+ *        replacement for the retired `backend-worker` poller. Watches
+ *        the keeper events dir with `@parcel/watcher` for plugin-written
+ *        `<session>.ndjson` files (one per zellij session, append-only)
+ *        and posts a contentless `{ kind: "zellij-events-changed" }`
+ *        "go look" notification. Main re-runs `scanZellijEventsDir`,
+ *        which tails each file from its persisted watermark, joins
+ *        `(session, pane_id) -> job_id` via `readLiveJobsWithCoords`,
+ *        and mints one synthetic `BackendExecSnapshot` event per
+ *        resolved line through the EXACT same fold path the poller
+ *        used — no reducer change, no schema change. Out-of-process
+ *        producer carve-out: the data source is the zellij plugin (a
+ *        different process), not a Bun postMessage worker — see
+ *        CLAUDE.md "Worker contract".
  *   4. Steady state: every wake triggers a full drain loop. Wakes that arrive
  *      mid-drain coalesce into the next pass via a single "wake pending" flag —
  *      no event is missed (drain always re-reads from the cursor) and drain is
  *      never invoked re-entrantly. A `transcript-title` / `exit` message
  *      inserts the synthetic event then pumps a wake to fold it.
- *   5. SIGTERM: post `{ type: "shutdown" }` to ALL TWELVE workers (the
- *      zellij-events worker is skipped cleanly when the gate is closed),
- *      await their `close` events against a short deadline, terminate them,
- *      close the db, exit 0. This is the ONLY clean exit. The server worker
- *      releases its socket + lock, the transcript + plan + dead-letter +
- *      zellij-events workers unsubscribe their watchers, and the
- *      exit-watcher releases its kqueue/pidfd fd — all inside their own
- *      shutdown handlers (those resources are process/thread-owned, so
- *      `terminate()` alone would leak them).
+ *   5. SIGTERM: post `{ type: "shutdown" }` to ALL TWELVE workers, await their
+ *      `close` events against a short deadline, terminate them, close the db,
+ *      exit 0. This is the ONLY clean exit. The server worker releases its
+ *      socket + lock, the transcript + plan + dead-letter + zellij-events
+ *      workers unsubscribe their watchers, and the exit-watcher releases its
+ *      kqueue/pidfd fd — all inside their own shutdown handlers (those
+ *      resources are process/thread-owned, so `terminate()` alone would leak
+ *      them).
  *
  * Crash policy (single recovery path): ANY unrecoverable error — either worker's
  * `error` event, an unhandled rejection, or a fold throw that escapes the
@@ -86,12 +102,7 @@ import type {
   DispatchFailedMessage,
   Verb,
 } from "./autopilot-worker";
-import {
-  type BackendExecSnapshotMessage,
-  type BackendWorkerData,
-  type BackendWorkerMessage,
-  readLiveJobsWithCoords,
-} from "./backend-worker";
+import { readLiveJobsWithCoords } from "./backend-worker";
 import {
   atomicWriteFile,
   openDb,
@@ -102,7 +113,6 @@ import {
   resolvePlanRoots,
   resolveUsageRoot,
   resolveZellijEventsDir,
-  resolveZellijFeedMode,
   runPlanctlApprovalMigration,
   type Stmts,
 } from "./db";
@@ -1294,15 +1304,13 @@ function runDaemon(): void {
   // human's dotfiles `~/.config/zellij/config.kdl` `load_plugins` block,
   // which pins the plugin's `cwd` (= its WASI `/host` mount) to this
   // directory. zellij silently refuses to load a plugin whose `cwd` is
-  // missing, so the dir MUST exist before ANY session's plugin loads —
-  // independent of whether keeper is currently consuming the feed
-  // (`KEEPER_ZELLIJ_FEED`). The mkdir is the FIRST thing we do for the
-  // zellij-events pipeline so it runs before BOTH the boot scan below
-  // AND the live watcher worker spawned downstream. `recursive: true`
-  // makes it idempotent across daemon restarts (already-exists is a
-  // no-op); a failure is logged non-fatally — a broken events dir leaves
-  // the feed dormant rather than wedging the daemon.
-  const zellijFeedMode = resolveZellijFeedMode();
+  // missing, so the dir MUST exist before ANY session's plugin loads.
+  // The mkdir is the FIRST thing we do for the zellij-events pipeline so
+  // it runs before BOTH the boot scan below AND the live watcher worker
+  // spawned downstream. `recursive: true` makes it idempotent across
+  // daemon restarts (already-exists is a no-op); a failure is logged
+  // non-fatally — a broken events dir leaves the feed dormant rather
+  // than wedging the daemon.
   const zellijEventsDir = resolveZellijEventsDir();
   try {
     mkdirSync(zellijEventsDir, { recursive: true });
@@ -1318,26 +1326,22 @@ function runDaemon(): void {
   // `<session>.ndjson` the bridge plugin wrote during downtime / since
   // the last daemon run, tail each from its persisted byte-offset
   // watermark, and mint one `BackendExecSnapshot` synthetic event per
-  // new pane line whose `(session, pane_id)` joins to a live job. The
-  // scan is gated on `KEEPER_ZELLIJ_FEED=plugin`: if the legacy poller
-  // feed is active, we don't tail the plugin's files (the poller's
-  // tick covers it). The dir-ensure above ALWAYS runs because the
-  // plugin loads in every session regardless of which feed keeper
-  // consumes — but the scan only runs when keeper is consuming.
-  // MUST run before the zellij-events worker spawns: a watcher
-  // notification on a half-imported set of files would re-fold work
-  // we already have on disk — harmless but wasteful. The watermark
-  // sidecar makes the boot scan idempotent across restarts.
-  if (zellijFeedMode === "plugin") {
-    try {
-      scanZellijEventsDir(db, stmts, zellijEventsDir);
-    } catch (err) {
-      console.error(
-        `[keeperd] zellij-events boot scan threw (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
+  // new pane line whose `(session, pane_id)` joins to a live job.
+  // Always-on as of fn-684 task .5 — the legacy `backend-worker`
+  // poller is retired; the plugin feed is now the sole producer of
+  // `jobs.backend_exec_tab_{id,name}`. MUST run before the
+  // zellij-events worker spawns: a watcher notification on a
+  // half-imported set of files would re-fold work we already have on
+  // disk — harmless but wasteful. The watermark sidecar makes the
+  // boot scan idempotent across restarts.
+  try {
+    scanZellijEventsDir(db, stmts, zellijEventsDir);
+  } catch (err) {
+    console.error(
+      `[keeperd] zellij-events boot scan threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
   }
 
   // Coalescing flag: every wake sets it; the run loop resets it before each
@@ -2325,87 +2329,16 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
-  // Spawn the backend-exec tab-resolver worker (fn-668 / schema v48). Reads
-  // live jobs carrying both a `backend_exec_session_id` and a
-  // `backend_exec_pane_id` on each tick, dedups by distinct (session, pane),
-  // and posts a `{kind:"backend-exec-snapshot", job_id, tab_id, tab_name}`
-  // per resolved pane after running one `zellij action list-panes -a -j`
-  // per distinct session. Main lifts each message into a synthetic
-  // `BackendExecSnapshot` event whose reducer fold updates
-  // `jobs.backend_exec_tab_{id,name}` (tab tombstone = last-known sticks).
-  // Producer-only: opens read-only DB; main is the sole writer of the
-  // synthetic event per CLAUDE.md sole-writer rules.
-  const backendWorker = new Worker(
-    new URL("./backend-worker.ts", import.meta.url).href,
-    {
-      workerData: { dbPath } satisfies BackendWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
-
-  backendWorker.onmessage = (
-    ev: MessageEvent<BackendWorkerMessage | undefined>,
-  ): void => {
-    const msg = ev.data;
-    if (!msg) return;
-    if (msg.kind !== "backend-exec-snapshot") return;
-    // Synthetic event mint: `session_id` carries the job pk (the generic
-    // entity-key overload the synthetic-event pipeline uses — same shape
-    // as UsageSnapshot's profile id and EpicSnapshot's epic id). The tab
-    // payload rides in `data` JSON; the reducer's fold arm extracts
-    // `tab_id` + `tab_name` from `data` and UPDATEs the matching `jobs`
-    // row. Re-fold determinism: the payload is frozen into the event
-    // log here, so a cursor=0 re-fold reproduces byte-identical
-    // `jobs.backend_exec_tab_*` rows — the reducer never re-runs
-    // `list-panes`.
-    const snapshot: BackendExecSnapshotMessage = msg;
-    stmts.insertEvent.run({
-      $ts: Date.now() / 1000,
-      $session_id: snapshot.job_id,
-      $pid: null,
-      $hook_event: "BackendExecSnapshot",
-      $event_type: "backend_exec_snapshot",
-      $tool_name: null,
-      $matcher: null,
-      $cwd: null,
-      $permission_mode: null,
-      $agent_id: null,
-      $agent_type: null,
-      $stop_hook_active: null,
-      $data: JSON.stringify({
-        tab_id: snapshot.tab_id,
-        tab_name: snapshot.tab_name,
-      }),
-      $subagent_agent_id: null,
-      $spawn_name: null,
-      $start_time: null,
-      $slash_command: null,
-      $skill_name: null,
-      $planctl_op: null,
-      $planctl_target: null,
-      $planctl_epic_id: null,
-      $planctl_task_id: null,
-      $planctl_subject_present: null,
-      $config_dir: null,
-      $planctl_queue_jump: null,
-      $bash_mutation_kind: null,
-      $bash_mutation_targets: null,
-      $planctl_files: null,
-      $backend_exec_type: null,
-      $backend_exec_session_id: null,
-      $backend_exec_pane_id: null,
-    });
-    wakePending = true;
-    pumpWakes();
-  };
-
-  backendWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] backend worker error:", err.message ?? err);
-    fatalExit();
-  };
-
-  backendWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
+  // (fn-684 task .5) The legacy backend-exec tab-resolver worker
+  // (fn-668 / schema v48) lived here and shelled
+  // `zellij action list-panes -a -j` once per tick per distinct session.
+  // It is retired in favor of the always-on zellij-events watcher worker
+  // (spawned just below) + main-side `scanZellijEventsDir` pipeline,
+  // which feeds the EXACT same `BackendExecSnapshot` synthetic event
+  // through the same reducer fold — event-driven now instead of
+  // poll-driven. Rollback: `git revert` the fn-684 task .5 commit
+  // restores this spawn block and the worker's body in
+  // `src/backend-worker.ts`.
 
   // Spawn the dead-letter worker (fn-643 task .3) in the SAME post-migration
   // window — the seventh worker thread (and sixth file-watcher producer
@@ -2482,85 +2415,76 @@ function runDaemon(): void {
   // `<session>.ndjson` from its persisted byte-offset watermark and
   // mints one `BackendExecSnapshot` synthetic event per new pane line
   // whose `(session, pane_id)` joins to a live job (no reducer or
-  // schema change — same fold path the legacy poller uses).
+  // schema change — same fold path the retired poller used).
   //
-  // GATED on `KEEPER_ZELLIJ_FEED=plugin`: when unset (default), the
-  // worker is not spawned and the legacy `backend-worker` poller
-  // remains the sole tab-resolution feed. Both feeds can safely
-  // coexist during the rollout window — the reducer's fold is
-  // idempotent on matching `(tab_id, tab_name)` writes — but the
-  // gate keeps the plugin path dormant until explicitly opted in.
+  // Always-on as of fn-684 task .5: the legacy `backend-worker`
+  // poller (`zellij action list-panes -a -j` per tick) is retired
+  // and removed. The plugin feed is now the sole producer of
+  // `jobs.backend_exec_tab_{id,name}`; rollback to the poller is a
+  // single `git revert` of the fn-684 task .5 commit.
   //
   // The boot scan above already imported every pre-existing file's
   // post-watermark tail; this live path covers lines the plugin
   // appends AFTER the daemon comes up. The worker spawns AFTER the
   // boot import so the file state is settled before any live
   // notification arrives — there is no race where a live message
-  // could fire against a half-imported boot state. Held as `null`
-  // when the gate is closed so the shutdown sequence can skip its
-  // postMessage / terminate calls cleanly.
-  const zellijEventsWorker: Worker | null =
-    zellijFeedMode === "plugin"
-      ? new Worker(new URL("./zellij-events-worker.ts", import.meta.url).href, {
-          workerData: { dir: zellijEventsDir } satisfies ZellijEventsWorkerData,
-        } as WorkerOptions & { workerData: unknown })
-      : null;
+  // could fire against a half-imported boot state.
+  const zellijEventsWorker = new Worker(
+    new URL("./zellij-events-worker.ts", import.meta.url).href,
+    {
+      workerData: { dir: zellijEventsDir } satisfies ZellijEventsWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
 
-  if (zellijEventsWorker) {
-    // Main owns the actual scan + event mint: a worker
-    // `zellij-events-changed` message triggers a fresh
-    // `scanZellijEventsDir` against the on-disk dir (treating the
-    // watcher event as "go look", never as the data). The scan is
-    // idempotent (watermark sidecar advances per file), so a burst of
-    // watcher events collapses into the same converged tail. Pumps a
-    // wake after any mint so the reducer folds the new
-    // `BackendExecSnapshot` rows into `jobs.backend_exec_tab_*`
-    // without waiting for the wake worker's `data_version` poll.
-    zellijEventsWorker.onmessage = (
-      ev: MessageEvent<ZellijEventsChangedMessage | undefined>,
-    ): void => {
-      const msg = ev.data;
-      if (!msg || msg.kind !== "zellij-events-changed") {
-        return;
-      }
-      try {
-        scanZellijEventsDir(db, stmts, zellijEventsDir);
-      } catch (err) {
-        // Defense-in-depth: scanZellijEventsDir's design contract is
-        // "never throw out of the scan", but an unexpected internal
-        // throw must NOT crash the daemon. Log and continue — the
-        // next watcher event will retry the import.
-        console.error(
-          `[keeperd] zellij-events live import threw (non-fatal): ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
-      // Pump a wake so the synthetic events fold into the projection
-      // promptly (matches the backend-worker.onmessage pattern; without
-      // this the reducer waits up to one wake-worker poll interval
-      // before folding the new rows).
-      wakePending = true;
-      pumpWakes();
-    };
-
-    // Same crash policy as the other workers: any thread failure →
-    // fatalExit.
-    zellijEventsWorker.onerror = (err: ErrorEvent): void => {
+  // Main owns the actual scan + event mint: a worker
+  // `zellij-events-changed` message triggers a fresh
+  // `scanZellijEventsDir` against the on-disk dir (treating the
+  // watcher event as "go look", never as the data). The scan is
+  // idempotent (watermark sidecar advances per file), so a burst of
+  // watcher events collapses into the same converged tail. Pumps a
+  // wake after any mint so the reducer folds the new
+  // `BackendExecSnapshot` rows into `jobs.backend_exec_tab_*`
+  // without waiting for the wake worker's `data_version` poll.
+  zellijEventsWorker.onmessage = (
+    ev: MessageEvent<ZellijEventsChangedMessage | undefined>,
+  ): void => {
+    const msg = ev.data;
+    if (!msg || msg.kind !== "zellij-events-changed") {
+      return;
+    }
+    try {
+      scanZellijEventsDir(db, stmts, zellijEventsDir);
+    } catch (err) {
+      // Defense-in-depth: scanZellijEventsDir's design contract is
+      // "never throw out of the scan", but an unexpected internal
+      // throw must NOT crash the daemon. Log and continue — the
+      // next watcher event will retry the import.
       console.error(
-        "[keeperd] zellij-events worker error:",
-        err.message ?? err,
+        `[keeperd] zellij-events live import threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
       );
-      fatalExit();
-    };
+    }
+    // Pump a wake so the synthetic events fold into the projection
+    // promptly; without this the reducer waits up to one wake-worker
+    // poll interval before folding the new rows.
+    wakePending = true;
+    pumpWakes();
+  };
 
-    // Same crash-via-`close` gap: a zellij-events-worker `process.exit(1)`
-    // fires `close`, not `onerror`. `!shuttingDown` makes it inert on
-    // clean shutdown.
-    zellijEventsWorker.addEventListener("close", () => {
-      if (!shuttingDown) fatalExit();
-    });
-  }
+  // Same crash policy as the other workers: any thread failure →
+  // fatalExit.
+  zellijEventsWorker.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] zellij-events worker error:", err.message ?? err);
+    fatalExit();
+  };
+
+  // Same crash-via-`close` gap: a zellij-events-worker `process.exit(1)`
+  // fires `close`, not `onerror`. `!shuttingDown` makes it inert on
+  // clean shutdown.
+  zellijEventsWorker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
 
   // Spawn the autopilot reconciler worker (fn-661 task .4) — the eighth
   // worker thread. It runs the level-triggered dispatch reconcile loop
@@ -2930,7 +2854,7 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
-  // Spawn the tab-namer worker (fn-680 task .3) — the ELEVENTH worker
+  // Spawn the tab-namer worker (fn-680 task .3) — the TWELFTH worker
   // thread. A PURE SIDE-EFFECTOR: it opens its own read-only connection,
   // ticks every ~5s, reads the live jobs that carry a resolved
   // `(backend_exec_session_id, backend_exec_tab_id)` pair AND a non-NULL
@@ -2942,8 +2866,8 @@ function runDaemon(): void {
   // and posts nothing to main — fn-678 made the tab name purely
   // cosmetic (reap is by `backend_exec_tab_id`, launch dedup by
   // `pending_dispatches`), so renaming every tab is safe and the
-  // convergence loop closes through the backend-worker's read-back of
-  // `backend_exec_tab_name`. No `onmessage` handler — pure consumer.
+  // convergence loop closes through the zellij-events feed's read-back
+  // of `backend_exec_tab_name`. No `onmessage` handler — pure consumer.
   const tabNamerWorker = new Worker(
     new URL("./tab-namer-worker.ts", import.meta.url).href,
     {
@@ -3004,7 +2928,6 @@ function runDaemon(): void {
     exitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     gitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     usageWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
-    backendWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     deadLetterWorker.postMessage({
       type: "shutdown",
     } satisfies ShutdownMessage);
@@ -3017,13 +2940,9 @@ function runDaemon(): void {
     tabNamerWorker.postMessage({
       type: "shutdown",
     } satisfies ShutdownMessage);
-    // zellij-events worker is gated behind KEEPER_ZELLIJ_FEED=plugin
-    // and may be null. Skip cleanly when the gate is closed.
-    if (zellijEventsWorker) {
-      zellijEventsWorker.postMessage({
-        type: "shutdown",
-      } satisfies ShutdownMessage);
-    }
+    zellijEventsWorker.postMessage({
+      type: "shutdown",
+    } satisfies ShutdownMessage);
 
     // Bun surfaces worker exit via the "close" event. Await ALL TWELVE
     // workers' close (the server worker releases its socket + lock, the
@@ -3035,9 +2954,7 @@ function runDaemon(): void {
     // read-only DB connection in their own shutdown handlers — that
     // teardown must land, or the socket / native watches / kernel fd
     // leak into the next boot), raced against a single shared deadline
-    // so a wedged worker can't block our clean shutdown forever. The
-    // zellij-events worker is gate-conditional and only awaited when
-    // spawned.
+    // so a wedged worker can't block our clean shutdown forever.
     const exited = (w: Worker): Promise<void> =>
       new Promise<void>((resolve) => {
         w.addEventListener("close", () => resolve());
@@ -3050,15 +2967,12 @@ function runDaemon(): void {
       exited(exitWorker),
       exited(gitWorker),
       exited(usageWorker),
-      exited(backendWorker),
       exited(deadLetterWorker),
       exited(autopilotWorkerInstance),
       exited(restoreWorker),
       exited(tabNamerWorker),
+      exited(zellijEventsWorker),
     ];
-    if (zellijEventsWorker) {
-      exitWaits.push(exited(zellijEventsWorker));
-    }
     await Promise.race([
       Promise.all(exitWaits),
       Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS),
@@ -3100,11 +3014,6 @@ function runDaemon(): void {
       // best-effort if it already exited
     }
     try {
-      backendWorker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
       deadLetterWorker.terminate();
     } catch {
       // best-effort if it already exited
@@ -3124,12 +3033,10 @@ function runDaemon(): void {
     } catch {
       // best-effort if it already exited
     }
-    if (zellijEventsWorker) {
-      try {
-        zellijEventsWorker.terminate();
-      } catch {
-        // best-effort if it already exited
-      }
+    try {
+      zellijEventsWorker.terminate();
+    } catch {
+      // best-effort if it already exited
     }
 
     try {

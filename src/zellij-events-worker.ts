@@ -1,10 +1,11 @@
 /**
- * Zellij-events watcher worker (fn-684 task .3). keeperd's TWELFTH Bun
- * Worker thread (the EIGHTH `@parcel/watcher` producer instance), joining
- * the producer fleet `plan-worker`, `transcript-worker`, `usage-worker`,
- * `git-worker`, `exit-watcher`, `server-worker`, `wake-worker`,
- * `backend-worker`, `dead-letter-worker`, `autopilot-worker`,
- * `restore-worker`, `tab-namer-worker`.
+ * Zellij-events watcher worker (fn-684 task .3). keeperd's eighth
+ * Bun Worker thread (and the EIGHTH `@parcel/watcher` producer
+ * instance), joining the fleet `plan-worker`, `transcript-worker`,
+ * `usage-worker`, `git-worker`, `exit-watcher`, `server-worker`,
+ * `wake-worker`, `dead-letter-worker`, `autopilot-worker`,
+ * `restore-worker`, `tab-namer-worker` (twelve workers total since
+ * fn-684 task .5 retired the `backend-worker` poller).
  *
  * The zellij bridge plugin (fn-684 task .1) appends one NDJSON line per
  * pane delta to its `/host/<session>.ndjson` (WASI sandbox; `/host` is
@@ -26,14 +27,15 @@
  * keeps the DB writer single-threaded; the worker holds only a watcher
  * subscription, no DB handle.
  *
- * Gated behind `KEEPER_ZELLIJ_FEED`: the default is the legacy poller
- * (`backend-worker`'s `zellij action list-panes`); this worker is
- * spawned ONLY when `KEEPER_ZELLIJ_FEED=plugin`. During the rollout
- * window both feeds can coexist — the reducer's fold is idempotent on
- * matching `(tab_id, tab_name)` writes, and a stale poller snapshot
- * never clobbers a fresh plugin snapshot (LWW by `last_event_id`,
- * which is monotone via SQLite AUTOINCREMENT). Once the plugin path
- * has soaked, the poller can be retired.
+ * Always-on as of fn-684 task .5. The legacy `backend-worker` poller
+ * (`zellij action list-panes -a -j` per tick) is retired and removed;
+ * this worker + main-side `scanZellijEventsDir` is now the sole
+ * producer of `jobs.backend_exec_tab_{id,name}`. Rollback path: a
+ * single `git revert` of the fn-684 task .5 commit restores the
+ * poller + its env-gated dual-feed coexistence. The reducer's fold
+ * remains idempotent on matching `(tab_id, tab_name)` writes (LWW by
+ * `last_event_id`, monotone via SQLite AUTOINCREMENT) so a
+ * re-introduction of the poller during a revert window is safe.
  *
  * Worker contract (see CLAUDE.md "Worker contract"):
  * - `isMainThread` guard — a plain import is inert (tests driving

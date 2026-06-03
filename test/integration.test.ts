@@ -2004,9 +2004,11 @@ test("fn-684.4: daemon boot mkdir -p's the zellij events dir (idempotent on re-b
   // by the human's dotfiles `config.kdl` `load_plugins` block, which pins
   // the plugin's `cwd` (= its WASI `/host` mount) to keeper's events dir.
   // zellij silently refuses to load a plugin whose `cwd` is missing, so
-  // the daemon must ensure the dir exists on boot — INDEPENDENT of
-  // whether keeper itself is currently consuming the feed via
-  // `KEEPER_ZELLIJ_FEED=plugin` (the plugin loads regardless).
+  // the daemon must ensure the dir exists on boot. As of fn-684 task .5
+  // the plugin feed is the always-on producer (legacy poller retired),
+  // so the `KEEPER_ZELLIJ_FEED` env var is no longer read — the
+  // explicit-clear below is retained as defense-in-depth against any
+  // host-set value perturbing future re-introductions.
   const zellijEventsDir = join(tmpDir, "zellij-events");
   // Sanity: the dir does NOT exist before the first daemon boot.
   expect(existsSync(zellijEventsDir)).toBe(false);
