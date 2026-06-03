@@ -39,5 +39,5 @@ Export a pure scan+join fn and test it against a tmp DB + tmp NDJSON tree (mirro
 - [ ] Spawn gated behind `KEEPER_ZELLIJ_FEED`; daemon header/teardown updated to TWELVE; pure scan+join fn has tests
 
 ## Done summary
-
+Added keeper ingestion worker — twelfth thread, eighth @parcel/watcher producer, gated behind KEEPER_ZELLIJ_FEED=plugin. New src/zellij-events.ts carries the NDJSON record schema + parser (never throws) + watermark sidecar serializer; new src/zellij-events-worker.ts mirrors dead-letter-worker (subscribe, RescanScheduler, missing-dir tolerant, no DB handle, shutdown unsubscribes). Main's scanZellijEventsDir tails each <session>.ndjson from its persisted byte-offset watermark, joins (session, pane_id) -> job_id via the existing readLiveJobsWithCoords, and mints the existing BackendExecSnapshot synthetic event verbatim — zero reducer/schema change. Watermark resets on epoch change (plugin reload), survives daemon restart, and skips empty-tab_name lines to honor the non-COALESCE fold. resolveZellijEventsDir + resolveZellijFeedMode added to db.ts; daemon header bumped ELEVEN -> TWELVE; shutdown teardown awaits + terminates the new worker. KEEPER_ZELLIJ_EVENTS_DIR joined to the integration + events-writer test sandbox base-env helpers. 13 unit tests pass; lint + typecheck clean.
 ## Evidence

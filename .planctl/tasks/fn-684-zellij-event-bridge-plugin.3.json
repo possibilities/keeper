@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "keeper ingestion worker",
-  "updated_at": "2026-06-02T23:06:05.621401Z"
+  "updated_at": "2026-06-03T02:59:15.830096Z",
+  "worker_done_at": "2026-06-03T02:59:15.830096Z"
 }
