@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-686-permission-and-elicitation-awaiting-pill",
   "bundles": [],
   "closer_done_at": "2026-06-03T18:41:39.123865Z",
@@ -20,5 +20,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T18:41:39.123865Z"
+  "updated_at": "2026-06-03T18:43:11.819867Z"
 }
