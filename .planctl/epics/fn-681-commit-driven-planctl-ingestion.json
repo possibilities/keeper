@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-681-commit-driven-planctl-ingestion",
   "bundles": [],
+  "closer_done_at": "2026-06-03T00:13:31.391069Z",
   "created_at": "2026-06-02T21:18:25.101893Z",
   "depends_on_epics": [],
   "id": "fn-681-commit-driven-planctl-ingestion",
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Commit-driven planctl ingestion",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-02T21:18:25.101893Z"
+  "updated_at": "2026-06-03T00:13:31.391069Z"
 }
