@@ -25,9 +25,5 @@ and confirms the row is NOT returned by the fast path — pinning the clock-unit
 - [ ] All existing git-worker tests pass (no changes to injected `nowMs` in existing tests needed)
 
 ## Done summary
-
+Replaced performance.now() with Date.now() at reconcileRoots' nowMs site so the SQL cutoff (compared against jobs.updated_at unix-seconds) actually filters; added a buildDiscoveryCandidates test pinning the clock-units contract.
 ## Evidence
-
-`src/git-worker.ts:2046` — `performance.now()` call site
-`src/git-worker.ts:1274` — `cutoffSec` SQL parameter, comment documents "REAL unix seconds"
-`test/git-worker.test.ts` — existing tests inject `Date.now()` for `nowMs`, confirming intent
