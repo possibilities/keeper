@@ -657,17 +657,6 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     data_dir = ctx.data_dir
     primary_repo = str(ctx.project_path)
 
-    # fn-629 task .4: sweep stale, unowned, untracked orphan epic trees
-    # left on disk by an earlier hard ``commit_failed`` (the §10 no-rollback
-    # carve-out). The reaper is fail-soft (NEVER raises), gated on BOTH a
-    # 5-minute mtime floor AND host-wide absence of any active session — so
-    # a concurrent in-flight pre-commit tree (the fn-627 window itself) is
-    # never reaped. Runs OUTSIDE ``_epic_id_lock`` so its deletions never
-    # extend the id-allocation lock hold time across a filesystem sweep.
-    from planctl.reaper import reap_orphan_epics
-
-    reap_orphan_epics(data_dir, ctx.project_path)
-
     with _epic_id_lock():
         # ----------------------------------------------------------------
         # fn-623 dup guard: reject a same-slug sibling epic up front so
@@ -965,18 +954,16 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # ------------------------------------------------------------------
     # Phase 5: emit ONE envelope covering the whole tree
     # ------------------------------------------------------------------
-    # fn-629 task .2: the central seam at output.emit() now owns the
-    # invocation build + commit transaction. emit(verb=..., written_paths=...)
-    # builds build_planctl_invocation internally and unwinds ``written_paths``
-    # on ANY pre-commit failure (invocation-build raise, commit lock-acquire
-    # timeout, git status/add/commit error) — generalising the fn-630 scaffold
-    # pattern across every multi-file mutating verb. The unwind STOPS at the
-    # commit boundary inside auto_commit_from_invocation: once the git commit
-    # lands, the files are tracked in HEAD and must never be unlinked
-    # (§10 no-rollback policy). The emit() call deliberately runs OUTSIDE
+    # The central seam at output.emit() owns the invocation build + commit.
+    # emit(verb=...) builds build_planctl_invocation internally and runs the
+    # per-verb auto-commit. The local write-phase try/except above already
+    # unwound any partial tree on a MID-WRITE crash; a pre-commit raise from
+    # the seam (invocation-build failure, git error) leaves the fully-written
+    # tree on disk (§10 no-rollback) — the keeper HEAD-gate keeps it invisible
+    # to the autopilot until it reaches HEAD. The emit() call runs OUTSIDE
     # ``_epic_id_lock`` (the lock's ``with`` block closed above) so the
-    # sub-millisecond id-allocation lock and the commit lock stay disjoint
-    # — nesting them would balloon the id-lock hold time across a git commit.
+    # sub-millisecond id-allocation lock stays off the git-commit critical
+    # path.
     task_ids = [f"{epic_id}.{i}" for i in range(1, n_tasks + 1)]
     # Per-task repo distribution: deterministic {repo_path: count} map built
     # from the in-scope resolved list (None -> primary_repo already applied).
@@ -1018,7 +1005,6 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
         repo_root=ctx.project_path,
         primary_repo=primary_repo,
         queue_jump=epic_queue_jump,
-        written_paths=written_paths,
     )
     return 0
 

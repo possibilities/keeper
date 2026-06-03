@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import sys
 from collections.abc import Callable
@@ -20,26 +19,6 @@ if TYPE_CHECKING:
 INVOCATION_EMITTED_SENTINEL = "_planctl_invocation_emitted"
 
 
-def _unwind_written_paths(written_paths: list[Path] | None) -> None:
-    """Best-effort unlink of *written_paths*.
-
-    Used by the central pre-commit seam (fn-629 task .2): any pre-commit
-    raise inside ``emit()`` — invocation-build raise, lock-acquire timeout,
-    git status / add / commit failure — unwinds the caller's tree so a
-    failed verb leaves zero on-disk side effects, matching the fn-623
-    atomicity invariant and the fn-630 scaffold pattern. Files committed
-    successfully are NOT unwound (§10 no-rollback policy); the unwind stops
-    at the commit boundary inside ``auto_commit_from_invocation``.
-    ``missing_ok=True`` because a partial ``atomic_write*`` may have failed
-    before rename, so the path may not exist.
-    """
-    if not written_paths:
-        return
-    for p in written_paths:
-        with contextlib.suppress(OSError):
-            p.unlink(missing_ok=True)
-
-
 def emit(
     data: dict,
     *,
@@ -51,7 +30,6 @@ def emit(
     repo_root: Path | None = None,
     primary_repo: str | None = None,
     queue_jump: bool = False,
-    written_paths: list[Path] | None = None,
 ) -> None:
     """Emit {"success": true, **data} to stdout in the ambient --format.
 
@@ -71,22 +49,16 @@ def emit(
         as compact single-line JSON (NDJSON) regardless of ``--format``. Mutual
         exclusive with the *verb* parameter — pass one or the other.
     verb / target / detail / repo_root / primary_repo / queue_jump:
-        fn-629 task .2 central seam: when *verb* is passed (mutating-verb
-        path), ``emit()`` builds the ``planctl_invocation`` payload itself by
-        invoking :func:`planctl.invocation.build_planctl_invocation` and unwinds
-        *written_paths* on any pre-commit exception (invocation build raise,
-        commit lock-acquire timeout, or a git status/add/commit failure) so a
-        failed verb leaves zero on-disk side effects — generalising the fn-630
-        scaffold pattern across every multi-file verb that routes through the
-        seam. Required when *planctl_invocation* is not pre-built.
-    written_paths:
-        Paths the caller wrote (atomic_write/atomic_write_json) during the
-        verb's mutate phase. ``emit()`` unwinds these on any pre-commit
-        failure. The unwind STOPS at the commit boundary: once
-        ``auto_commit_from_invocation`` commits, files are tracked and must
-        never be unlinked (§10 no-rollback policy). Optional — verbs whose
-        mutate phase already owns its own unwind (or that write nothing on
-        disk) pass nothing.
+        central seam: when *verb* is passed (mutating-verb path), ``emit()``
+        builds the ``planctl_invocation`` payload itself by invoking
+        :func:`planctl.invocation.build_planctl_invocation`, then runs the
+        per-verb auto-commit against it. Required when *planctl_invocation*
+        is not pre-built. There is no seam-level write-tree unwind: the three
+        multi-file mint verbs (``scaffold``, ``refine-apply``, ``epic
+        create``) own their own local write-phase unwind for a mid-write
+        crash; a pre-commit raise here surfaces verbatim and leaves any
+        written files in place (the keeper HEAD-gate is the sole
+        observability guard, so an untracked tree is never dispatched).
     """
     import click
 
@@ -97,38 +69,28 @@ def emit(
     # ------------------------------------------------------------------
     # Resolve planctl_invocation: caller pre-built it OR build it here.
     # ------------------------------------------------------------------
-    # fn-629 task .2 (the central seam): callers passing *verb* hand the
-    # invocation build INTO emit() so the same try-block that catches a
-    # commit failure also catches an invocation-build failure — generalising
-    # the fn-630 scaffold pattern across every multi-file mutating verb.
-    # The build runs BEFORE the auto-commit, so an invocation-build raise
-    # unwinds the written tree (no orphan), and a subsequent commit-lock
-    # / git failure does the same (the unwind stops AFTER the commit
-    # actually lands inside auto_commit_from_invocation — files tracked
-    # in HEAD are never unlinked, §10).
+    # The central seam: callers passing *verb* hand the invocation build INTO
+    # emit() so the same code path that runs the commit also owns the
+    # invocation build. The build runs BEFORE the auto-commit. A raise here
+    # surfaces verbatim to the CLI layer — there is no seam-level unwind; the
+    # multi-file mint verbs own their own local write-phase unwind for a
+    # mid-write crash, and the keeper HEAD-gate keeps any pre-commit tree
+    # invisible to the autopilot.
     if planctl_invocation is None and verb is not None:
         if repo_root is None:
             raise TypeError("emit(verb=...) requires repo_root=")
         if target is None:
             raise TypeError("emit(verb=...) requires target=")
-        try:
-            from planctl.invocation import build_planctl_invocation
+        from planctl.invocation import build_planctl_invocation
 
-            planctl_invocation = build_planctl_invocation(
-                verb,
-                target,
-                detail,
-                repo_root=repo_root,
-                primary_repo=primary_repo,
-                queue_jump=queue_jump,
-            )
-        except BaseException:
-            # Pre-commit raise: unwind the caller's tree and re-raise so the
-            # CLI layer surfaces the failure verbatim. No orphan files, no
-            # advanced scan_max_epic_id — the fn-623 / fn-630 atomicity
-            # invariant generalised to every seam-routed verb.
-            _unwind_written_paths(written_paths)
-            raise
+        planctl_invocation = build_planctl_invocation(
+            verb,
+            target,
+            detail,
+            repo_root=repo_root,
+            primary_repo=primary_repo,
+            queue_jump=queue_jump,
+        )
 
     if planctl_invocation is not None:
         # Per-verb auto-commit. Runs BEFORE the success envelope prints, so an
@@ -143,15 +105,12 @@ def emit(
 
             _commit_mod.auto_commit_from_invocation(planctl_invocation)
         except _commit_mod.CommitFailed as exc:
-            # Pre-commit failure: lock-acquire timeout OR git status/add/commit
-            # failure. Either case means the commit did not land — unwind the
-            # caller's tree so a failed commit leaves zero on-disk side
-            # effects (fn-629 task .2 generalisation of the fn-630 pattern).
-            # ``auto_commit_from_invocation`` only raises BEFORE the commit
-            # actually lands; once ``_git_commit`` returns, no further failure
-            # is possible inside the helper, so the unwind here is always
-            # pre-commit-safe (§10 no-rollback policy preserved).
-            _unwind_written_paths(written_paths)
+            # Commit failure: a git status/add/commit error, or
+            # ``commit_contended`` on bounded-retry exhaustion. The commit did
+            # not land — emit the structured failure envelope and exit 1. No
+            # write-tree unwind: any files written by a multi-file mint verb
+            # stay on disk (§10 no-rollback), invisible to the autopilot until
+            # they reach HEAD via the keeper HEAD-gate.
             failure: dict = {
                 "success": False,
                 "error": "commit_failed",

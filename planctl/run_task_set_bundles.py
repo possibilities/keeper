@@ -111,6 +111,5 @@ def run(args: SimpleNamespace) -> int:
         verb="set-bundles",
         target=task_id,
         repo_root=ctx.project_path,
-        written_paths=[],
     )
     return 0

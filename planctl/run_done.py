@@ -150,6 +150,5 @@ def run(args: SimpleNamespace) -> int:
         verb="done",
         target=task_id,
         repo_root=ctx.project_path,
-        written_paths=[],
     )
     return 0

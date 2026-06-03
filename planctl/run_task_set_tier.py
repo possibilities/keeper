@@ -55,6 +55,5 @@ def run(args: SimpleNamespace) -> int:
         verb="task-set-tier",
         target=task_id,
         repo_root=ctx.project_path,
-        written_paths=[],
     )
     return 0

@@ -357,14 +357,12 @@ def run(args: SimpleNamespace) -> int:
         if p.parent.name == "tasks" and p.parent.parent.name == ".planctl"
     )
 
-    # fn-629 task .2: route through the central seam. emit(verb=...) builds
-    # build_planctl_invocation internally and unwinds ``written_paths`` on
-    # any pre-commit failure (invocation-build raise, commit lock-acquire
-    # timeout, git status/add/commit error). For epic rm there are no
-    # written files to unwind — the verb is delete-only and the unwind would
-    # have to RECREATE files we just deleted (out of scope; the commit
-    # surfaces the failure and the human re-runs from a clean state). Pass
-    # written_paths=None so the seam treats this as a no-unwind path.
+    # Route through the central seam. emit(verb=...) builds
+    # build_planctl_invocation internally and runs the per-verb auto-commit.
+    # epic rm is delete-only — the deletes already landed on disk before this
+    # call, and a pre-commit raise from the seam leaves them deleted (§10
+    # no-rollback; the commit surfaces the failure and the human re-runs from
+    # a clean state).
     emit(
         {
             "epic_id": epic_id,

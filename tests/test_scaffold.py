@@ -1275,12 +1275,12 @@ def test_scaffold_integrity_failure_aborts_no_writes(planctl_git_repo, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# fn-630: scaffold commit-boundary atomicity — the gap fn-623 left open.
-# build_planctl_invocation (the sole PLANCTL_SESSION_ID consumer + commit step)
-# runs AFTER the full tree is on disk and OUTSIDE the write-unwind, so a raise
-# there used to orphan a complete uncommitted epic (exactly what produced the
-# fn-627 duplicate). (a) fails closed on a missing session id before any write;
-# (b) unwinds the written tree if invocation-building raises after it.
+# scaffold commit-boundary behavior. (a) the env guard still fails closed on a
+# missing PLANCTL_SESSION_ID BEFORE any write, so zero files land — this guard
+# is independent of the seam and survives fn-640. (b) post-fn-640 the seam
+# unwind is gone: a build_planctl_invocation raise AFTER the write phase
+# completed leaves the fully-written tree ON DISK (§10 no-rollback); the keeper
+# HEAD-gate keeps an uncommitted epic invisible to the autopilot.
 # ---------------------------------------------------------------------------
 
 
@@ -1331,18 +1331,20 @@ def test_scaffold_missing_session_id_writes_nothing(planctl_git_repo, monkeypatc
     )
 
 
-def test_scaffold_invocation_raise_unwinds_written_tree(planctl_git_repo, monkeypatch):
-    """fn-630 (b): a raise in build_planctl_invocation (after the tree is on
-    disk, pre-commit) unwinds every written file — no orphan, no advanced id.
+def test_scaffold_invocation_raise_persists_written_tree(planctl_git_repo, monkeypatch):
+    """fn-640: a raise in build_planctl_invocation (after the tree is on disk,
+    pre-commit) leaves every written file ON DISK — the seam unwind is gone.
 
-    This is the belt-and-suspenders residual past the (a) env guard: any other
-    pre-commit raise from invocation-building must not leave a complete
-    uncommitted epic the way the original fn-627 incident did.
+    The local write-phase try/except only unwinds a MID-WRITE crash; an
+    invocation-build raise fires after the write phase completed, so the full
+    tree persists (§10 no-rollback). The keeper HEAD-gate keeps this
+    uncommitted epic invisible to the autopilot until a re-run lands the
+    commit. Distinct from the env guard at (a), which fails closed BEFORE any
+    write.
     """
     from planctl.ids import scan_max_epic_id
 
     data_dir = planctl_git_repo / ".planctl"
-    next_id_before = scan_max_epic_id(data_dir)
 
     import planctl.invocation as _inv
 
@@ -1358,10 +1360,11 @@ def test_scaffold_invocation_raise_unwinds_written_tree(planctl_git_repo, monkey
     r = _invoke(["scaffold", "--file", yaml_path])
     assert r.exit_code != 0, r.output
 
-    # The raise propagated, but the write-tree was unwound: zero orphans, the
-    # next mint is unchanged (the bug was scan_max_epic_id silently advancing).
-    assert _no_epics_or_tasks_landed(planctl_git_repo)
-    assert scan_max_epic_id(data_dir) == next_id_before
+    # The raise propagated AFTER the write phase, and there is no seam unwind:
+    # the full epic + task + spec tree persists on disk. scan_max_epic_id
+    # reflects the just-minted id (the tree is real, just uncommitted).
+    assert not _no_epics_or_tasks_landed(planctl_git_repo)
+    assert scan_max_epic_id(data_dir) >= 1
 
 
 # ---------------------------------------------------------------------------

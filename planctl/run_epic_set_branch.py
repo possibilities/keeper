@@ -28,18 +28,15 @@ def run(args: SimpleNamespace) -> int:
     epic_def["updated_at"] = now_iso()
     atomic_write_json(epic_path, epic_def)
 
-    # fn-629 task .3: route through the central seam at output.emit() so the
-    # invocation-build + commit transaction lives inside one try-block. The
-    # write is a rewrite of a pre-existing tracked JSON file via atomic_write
-    # (rename-atomic), so ``written_paths`` is empty — unlinking the prior
-    # valid contents on a pre-commit raise would be destructive. Mirrors
-    # refine_apply's "existing-file rewrite NOT recorded for unwind" pattern.
+    # Route through the central seam at output.emit() so the invocation-build
+    # + commit run inside the verb boundary. The write is a rewrite of a
+    # pre-existing tracked JSON file via atomic_write (rename-atomic), so a
+    # pre-commit raise leaves the prior valid contents in place.
     emit(
         {"epic_id": epic_id, "branch_name": branch},
         text_renderer=_render_human,
         verb="set-branch",
         target=epic_id,
         repo_root=ctx.project_path,
-        written_paths=[],
     )
     return 0

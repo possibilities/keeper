@@ -10,8 +10,9 @@ Every mutating planctl verb commits its own `.planctl/` scope inline at
 the verb boundary. There is no `commit-plan` verb, no skill-seam table,
 no deferral mechanism, no skill cooperation needed. The runner-side
 `output.emit()` call lands the `chore(planctl): <op> <target>` git
-commit under the shared flock, then prints the `success: true`
-envelope. An envelope on stdout means the commit landed.
+commit — scoped to its own exact paths via `git commit -F - -- <files>`,
+with a bounded retry over git's own lock domains — then prints the
+`success: true` envelope. An envelope on stdout means the commit landed.
 
 ---
 
@@ -19,9 +20,9 @@ envelope. An envelope on stdout means the commit landed.
 
 Every planctl verb that mutates `.planctl/` carries its own commit. The
 verb knows mechanically which files it touched, derives a deterministic
-subject from its `op` and `target`, acquires the per-host flock, stages,
-commits, releases. No agent-authored commit messages. No outer skill
-coordination. No "what landed since last time" audit-table scan.
+subject from its `op` and `target`, stages its exact pathspec, commits.
+No agent-authored commit messages. No outer skill coordination. No "what
+landed since last time" audit-table scan.
 
 The principle replaces the seven-seam `commit-plan` model
 (fn-488 → fn-587). The seam model leaked state whenever a mutating verb
@@ -43,21 +44,22 @@ For every mutating verb invocation:
    (`chore(planctl): <op> <target>` via `commit_messages.build_subject`),
    `repo_root`, and `state_repo`.
 2. **Auto-commit** — `output.emit()` calls
-   `commit.auto_commit_from_invocation(payload)`. The helper:
+   `commit.auto_commit_from_invocation(payload)`. The helper runs a
+   stage → commit sequence under a bounded full-jitter retry over git's
+   own lock domains (see §7). Each attempt:
    - No-ops when `files` is `None`/`[]` (read-only verb, runtime-only
      verb, or no dirty intersection).
    - Resolves the cwd from `payload['state_repo']` (with a stderr-noisy
      fallback to `payload['repo_root']`).
-   - Acquires `LOCK_EX` on `$GIT_COMMON_DIR/planctl-commit.lock` (60s
-     timeout; see §7).
-   - Re-confirms dirtiness under the lock via
+   - Re-confirms dirtiness via
      `git diff --cached --quiet -- <files>` ∪ `git diff --quiet -- <files>`;
      returns `None` if a concurrent verb already swept the files.
-   - Captures `HEAD` SHA as `Planctl-Prev-Op`.
+   - Re-reads `HEAD` SHA as `Planctl-Prev-Op` (inside the retried body, so
+     a ref-lock loser re-parents off the winner's tip).
    - Stages with `git add -- <files>` (explicit pathspecs only — never
      `-A`, never `.`).
-   - Commits with `git commit -F -` piping the message on stdin.
-   - Releases the flock (kernel-released on process exit regardless).
+   - Commits with `git commit -F - -- <files>` piping the message on
+     stdin and scoping the commit to its own exact paths.
 3. **Print success envelope** — `output.emit()` prints the success
    envelope as compact single-line JSON (NDJSON). The envelope's
    appearance on stdout is the authoritative signal that the commit
@@ -125,47 +127,54 @@ the verb.
 
 ### Verb classification
 
-As of fn-629 (tasks .2 + .3), `output.emit()` owns the write→commit
-transaction for every mutating verb routed through the seam: it builds the
-`planctl_invocation` payload itself (the build moved INTO emit), then
-invokes `auto_commit_from_invocation`. Callers pass `verb=`, `target=`,
-`repo_root=`, and a `written_paths: list[Path]` carrying every freshly-minted
-path; on ANY pre-commit raise (invocation-build failure, commit-lock
-timeout, or a git status/add/commit error) `emit()` unwinds
-`written_paths` before re-raising. The unwind stops at the commit boundary:
-once `auto_commit_from_invocation` lands, files are tracked in HEAD and
-are never unlinked (§10 no-rollback is preserved post-commit). The commit
-lock (`$GIT_COMMON_DIR/planctl-commit.lock`) is acquired INSIDE
-`auto_commit_from_invocation`, not at the seam — `_epic_id_lock` (the
-sub-millisecond id-allocation lock in `run_epic_create`) stays disjoint
-from the commit lock; the two are never nested.
+`output.emit()` owns the build→commit path for every mutating verb routed
+through the seam: it builds the `planctl_invocation` payload itself (the
+build is INSIDE emit), then invokes `auto_commit_from_invocation`. Callers
+pass `verb=`, `target=`, and `repo_root=`. There is no seam-level write-tree
+unwind (the fn-629 `written_paths` unwind was deleted in fn-640): on a
+pre-commit raise (invocation-build failure or a git status/add/commit
+error) the verb's written files stay on disk (§10 no-rollback), and the
+keeper HEAD-gate keeps an uncommitted tree invisible to the autopilot until
+it reaches HEAD. The three multi-file mint verbs (`scaffold`,
+`refine-apply`, `epic create`) keep their own LOCAL write-phase try/except
+blocks that unwind a MID-WRITE crash (single-writer atomicity); those blocks
+do not cover the commit-failure window. There is no commit flock — the
+commit is scoped to its own exact paths via `git commit -F - -- <files>` and
+a bounded retry absorbs git's index/ref lock contention (§7).
+`_epic_id_lock` (the sub-millisecond id-allocation lock in `run_epic_create`)
+is released before the auto-commit runs; it stays off the git-commit
+critical path.
 
-| Class | Envelope | Auto-commit | Seam |
+| Class | Envelope | Auto-commit | Pre-commit-raise behavior |
 |---|---|---|---|
-| Mutating, single-field (`done`, `approve`, `epic close`, `epic invalidate`, `epic add-dep`/`add-deps`/`rm-dep`, every `epic set-*` / `task set-*`, `task reset`, ...) | non-null `subject`, populated `files` | yes (inline) | seam (`written_paths=[]` — every write is a rewrite of a pre-existing tracked file via atomic_write rename-atomic; prior valid contents stay in place on a pre-commit raise, so there is nothing to unwind) |
-| Mutating, whole-tree (`scaffold`, `refine-apply`, `epic create`) | non-null `subject`, `files` covers the full epic+tasks+specs+deps tree | yes (inline, one commit) | seam (`written_paths=[<every fresh-mint path>]` — emit unwinds on pre-commit raise so a failed commit leaves zero on-disk side effects) |
-| Mutating, whole-tree delete (`epic rm`, fn-623) | non-null `subject`, `files` lists every unlinked path (epic JSON, every task JSON, epic + task specs, runtime state, locks) — paths are recorded BEFORE the unlink so the `touched ∩ dirty` pathspec captures the deletions | yes (inline, one commit) | seam (`written_paths=[]` — the verb is a delete, nothing to unwind on pre-commit raise) |
+| Mutating, single-field (`done`, `approve`, `epic close`, `epic invalidate`, `epic add-dep`/`add-deps`/`rm-dep`, every `epic set-*` / `task set-*`, `task reset`, ...) | non-null `subject`, populated `files` | yes (inline) | every write is a rewrite of a pre-existing tracked file via atomic_write rename-atomic; prior valid contents stay in place |
+| Mutating, whole-tree (`scaffold`, `refine-apply`, `epic create`) | non-null `subject`, `files` covers the full epic+tasks+specs+deps tree | yes (inline, one commit) | the LOCAL write-phase block unwinds a mid-write crash; a pre-commit raise from the seam leaves the fully-written tree on disk (§10), invisible to the autopilot via the keeper HEAD-gate |
+| Mutating, whole-tree delete (`epic rm`, fn-623) | non-null `subject`, `files` lists every unlinked path (epic JSON, every task JSON, epic + task specs, runtime state, locks) — paths are recorded BEFORE the unlink so the `touched ∩ dirty` pathspec captures the deletions | yes (inline, one commit) | the verb is a delete — a pre-commit raise leaves the deletes in place (§10), nothing to re-create |
 | Runtime-state-only (`claim`, `block`) | `subject=null`, `files=null` | none (gitignored state) | n/a |
 | Read-only (`show`, `cat`, `list`, ...) | `subject=null`, `files=null` (via decorator) | none | n/a |
 | `validate --epic <id>` (first-ever valid) | non-null `subject`, single file | yes (manual `auto_commit_from_invocation` call from the validate runner, which bypasses `emit()` to preserve its `{valid, errors, warnings}` envelope shape) | bypass — documented out-of-scope per §13's `validate --epic` row, see the asymmetry note below |
-| `refine-context --invalidate` (conditionally-mutating) | non-null `subject`, single file | yes (inline) | seam (envelope shape is `emit()`-compatible; the single-field rewrite is a rename-atomic over a pre-existing tracked file, so `written_paths=[]`) |
+| `refine-context --invalidate` (conditionally-mutating) | non-null `subject`, single file | yes (inline) | envelope shape is `emit()`-compatible; the single-field rewrite is a rename-atomic over a pre-existing tracked file, so prior valid contents stay in place |
 
 `scaffold` is one mutating invocation that spans many `atomic_write` calls but
 emits exactly **one** envelope and produces one git commit covering every
-written path. `refine-apply` is its sibling on an existing epic: post-fn-629
-task .2, its Phase 4.5 re-write rides inside the seam (the pre-task-.2
-"outside-lock re-write with no unwind" bug is fixed), so a pre-commit
-raise unwinds the freshly-minted task/spec tree the same way scaffold does.
+written path. `refine-apply` is its sibling on an existing epic: its Phase 4.5
+re-write rides inside the same flow, and its LOCAL write-phase blocks unwind a
+mid-write crash on the freshly-minted task/spec tree the same way scaffold's
+does.
 
-**keeper-side observation gate.** keeper's plan-worker producer (the
-file watcher folding `.planctl/{epics,tasks}/*.json` into the `epics`
-projection) gates snapshot emission on a synchronous `git cat-file -e
-HEAD:<relpath>` check — until the file is in HEAD, no
+**keeper-side observation gate (the SOLE pre-commit guard).** keeper's
+plan-worker producer (the file watcher folding `.planctl/{epics,tasks}/*.json`
+into the `epics` projection) gates snapshot emission on a synchronous
+`git cat-file -e HEAD:<relpath>` check — until the file is in HEAD, no
 `EpicSnapshot`/`TaskSnapshot` is emitted and the autopilot cannot
-dispatch against it. The pair (planctl commits at the seam; keeper
-refuses to observe pre-commit files) closes the fn-627 duplicate-dispatch
-window end-to-end. See `~/code/keeper/CLAUDE.md` § Autopilot dispatch
-gates and `~/code/keeper/README.md` § Architecture (the **fourth**
+dispatch against it. This HEAD-gate is the single guard that closes the
+fn-627 duplicate-dispatch window: an uncommitted epic tree on disk (a tree
+that persisted past a hard `commit_failed`, or a fresh in-flight pre-commit
+tree) is simply never observed. planctl no longer carries a complementary
+seam unwind or an orphan reaper — an untracked tree is harmless because it
+is invisible, and the next mutating verb whose `touched ∩ dirty` intersects
+it sweeps it into a commit. See `~/code/keeper/CLAUDE.md` § Autopilot
+dispatch gates and `~/code/keeper/README.md` § Architecture (the **fourth**
 Worker thread) for the keeper-side detail; for planctl's commit
 contract, every seam-routed verb's success envelope on stdout means the
 file is in HEAD and observable.
@@ -188,35 +197,34 @@ The `details.error` codes are:
 
 | Code | Meaning |
 |---|---|
-| `lock_timeout` | 60s flock acquisition timed out. `details` carries `holder_pid`/`holder_cmdline` if the lockfile was readable. |
+| `commit_contended` | git index/ref lock contention persisted across the bounded retry (see §7). |
 | `git_status` | `git status` / `git diff` plumbing call failed. |
 | `git_add` | `git add -- <files>` failed (e.g. pathspec error, permission). |
-| `git_commit` | `git commit -F -` failed (hook rejected, gpg failed, etc.). |
+| `git_commit` | `git commit -F - -- <files>` failed (hook rejected, gpg failed, etc.). |
 | `missing_state_repo` | Payload lacked both `state_repo` and `repo_root` — envelope-shape drift. |
 | `missing_subject` | Payload lacked a `subject` — envelope-shape drift. |
 
-**Pre-commit failure unwind (fn-629 task .2).** Every seam-routed verb
-passes its freshly-minted paths to `emit(written_paths=[...])`. On a
-pre-commit raise — invocation-build failure (e.g. missing
-`PLANCTL_SESSION_ID`), commit-lock timeout, or a git status/add/commit
-error — `emit()` unwinds those paths before re-raising, so a failed
-commit leaves zero on-disk side effects for the multi-file verbs
-(`scaffold`, `refine-apply`, `epic create`, `epic rm`). The
-single-field seam-routed verbs (`done`, `approve`, every `set-*`, etc.)
-pass `written_paths=[]` because each write is a rename-atomic rewrite of
-a pre-existing tracked file — the prior valid contents stay in place on
-a pre-commit raise, so there is nothing to unwind. Either shape lands
-the failure envelope on stdout and exits 1 with zero new untracked
-files on disk.
+**Pre-commit failure leaves writes on disk (§10 no-rollback).** There is
+no seam-level write-tree unwind (the fn-629 `written_paths` unwind was
+deleted in fn-640). On a pre-commit raise — invocation-build failure
+(e.g. missing `PLANCTL_SESSION_ID`) or a git status/add/commit error —
+the verb's written files stay on disk and the failure envelope lands on
+stdout with exit 1. For the multi-file mint verbs (`scaffold`,
+`refine-apply`, `epic create`), a MID-WRITE crash is still unwound by
+their LOCAL write-phase try/except block (single-writer atomicity); the
+commit-failure window is NOT covered, so a fully-written tree persists.
+For the single-field verbs (`done`, `approve`, every `set-*`, etc.) each
+write is a rename-atomic rewrite of a pre-existing tracked file — the
+prior valid contents stay in place. An uncommitted tree is harmless: the
+keeper HEAD-gate (§3) never observes it, so the autopilot never dispatches
+against it.
 
-**Post-commit failure persists on disk.** The unwind STOPS at the
-commit boundary inside `auto_commit_from_invocation`. Once `git commit`
-returns success, no further failure path inside the helper exists —
-files are tracked in HEAD and will never be unlinked by the seam (§10
-no-rollback policy preserved).
+**Post-commit failure persists on disk.** Once `git commit` returns
+success, files are tracked in HEAD — no rollback is attempted, ever
+(§10 no-rollback policy).
 
-**`validate --epic` (the seam-bypass verb)** is the one remaining
-write-persists-on-failure case: the runner calls
+**`validate --epic` (the seam-bypass verb)** is the same
+write-persists-on-failure shape: the runner calls
 `auto_commit_from_invocation` directly to preserve its `{valid,
 errors, warnings}` envelope shape, so its single-field
 `atomic_write_json` (`last_validated_at` stamp) lands BEFORE the commit
@@ -224,12 +232,12 @@ and persists on disk on a commit failure. See §13's "validate --epic
 stamp-then-commit asymmetry" sub-section for the full reconcile path —
 the dirty file is swept into the next mutating verb's auto-commit.
 
-Reconcile path for either shape: re-run the verb (idempotent for most
-stamping verbs) or `git checkout -- .planctl/` to discard any persisted
-state. For an orphan epic tree that survived a hard `commit_failed` (a
-pre-fn-629-task-.2 verb, or a runaway), the orphan-epic reaper at the
-next `scaffold` / `refine-apply` pre-flight sweeps it automatically —
-see §10 for the reaper contract.
+Reconcile path for any shape: re-run the verb (idempotent for most
+stamping verbs) or `git checkout -- .planctl/` (and remove any untracked
+files with `git clean -- .planctl/`) to discard persisted state. An
+uncommitted epic tree that survived a hard `commit_failed` is invisible to
+the autopilot via the keeper HEAD-gate; the next mutating verb whose
+`touched ∩ dirty` intersects it sweeps it into a commit.
 
 ---
 
@@ -282,11 +290,12 @@ Task: fn-7-add-auth.2"
 
 `jobctl commit-work` uses its own flock at
 `$GIT_COMMON_DIR/jobctl-commit.lock`. Planctl's
-`auto_commit_from_invocation` uses its own flock at
-`$GIT_COMMON_DIR/planctl-commit.lock`. The two locks are independent —
-jobctl source commits and planctl `.planctl/` auto-commits target
-disjoint pathspecs, so they do not need to serialize against each
-other on the same host.
+`auto_commit_from_invocation` takes NO flock — it scopes each commit to
+its own exact paths via `git commit -F - -- <files>` and absorbs git's
+index/ref lock contention with a bounded retry (§7). The two paths are
+independent: jobctl source commits and planctl `.planctl/` auto-commits
+target disjoint pathspecs, so they never cross-contaminate on the same
+host even when racing the shared index.
 
 ### Push semantics
 
@@ -338,31 +347,41 @@ and exits 1.
 
 ---
 
-## 7. Per-Host Commit Flock
+## 7. Pathspec-Scoped Commit + Bounded Retry (no flock)
 
-Planctl's `auto_commit_from_invocation` takes an exclusive blocking
-flock on `$GIT_COMMON_DIR/planctl-commit.lock` for the full stage →
-commit window. `jobctl commit-work` uses its own independent flock at
-`$GIT_COMMON_DIR/jobctl-commit.lock` for the stage → lint → commit →
-push window. The two locks are not shared: planctl auto-commits and
-jobctl source commits target disjoint pathspecs, so cross-tool
-serialization on the same host is not required.
+Planctl's `auto_commit_from_invocation` takes NO flock. Each commit is
+scoped to its own exact paths via `git commit -F - -- <files>`, so two
+same-repo verbs sharing one index never cross-contaminate — the loser's
+staged files never leak into the winner's commit. The committed surface is
+conflict-free by construction: per-epic-namespaced files, gitignored runtime
+state, exact-name `git add`. `jobctl commit-work` keeps its own independent
+flock at `$GIT_COMMON_DIR/jobctl-commit.lock` for its stage → lint → commit
+→ push window; that flock is untouched by this change.
 
-- **Acquisition**: `fcntl.flock(fd, LOCK_EX)` — blocking, 60-second
-  timeout.
-- **FD flags**: `O_CLOEXEC` so child processes do not inherit the lock.
-- **Lockfile contents**: holder PID + cmdline written on acquisition for
-  diagnostic timeout errors.
-- **Release**: kernel auto-releases on process exit or crash
-  (SIGKILL-safe). Explicit `flock(fd, LOCK_UN)` on normal exit.
+Two git lock domains can transiently lose a same-host race:
 
-Rooted at `$GIT_COMMON_DIR` (not `.git/`) so the lock serializes across
-all worktrees that share the same object store.
+- **Index lock** (`.git/index.lock`) — a concurrent `git add` / `git
+  commit` holds it; the loser's stage step fails. Retryable in place.
+- **Ref lock** (`.git/refs/.../HEAD.lock`) — a concurrent commit holds it;
+  the loser writes a dangling commit unless it re-parents. The retry MUST
+  re-run the full `add` + `commit` from the current HEAD so the loser
+  re-parents off the winner's tip.
 
-Two planctl mutating verbs on the same host serialize on the planctl
-lock; two `jobctl commit-work` invocations serialize on the jobctl
-lock. Cross-host races are not covered by either flock; the human
-resolves any cross-host `non_fast_forward`.
+Both domains are absorbed by a bounded full-jitter retry:
+
+- **Attempts**: 8 (`_RETRY_MAX_ATTEMPTS`).
+- **Backoff**: full jitter, exponential base, capped at 2 seconds
+  (`_RETRY_CAP_SECONDS`).
+- **Re-run body**: each attempt re-confirms dirtiness, re-reads HEAD (so
+  `Planctl-Prev-Op` reflects the FINAL parent), re-stages, re-commits.
+- **Retry trigger**: ONLY contention stderr (index.lock / ref-lock). A
+  genuine failure (hook reject, signing, empty tree, real add/status error)
+  surfaces immediately, never masked by a retry.
+- **Exhaustion**: raises `CommitFailed("commit_contended", ...)`.
+
+Disjoint pathspec-scoped files need no merge, so a ref-lock re-parent off
+the winner's HEAD is always safe. Cross-host races are not covered by the
+retry; the human resolves any cross-host `non_fast_forward`.
 
 ---
 
@@ -450,19 +469,30 @@ Auto-commit failure is a **hard error** (the Option C contract). See
 
 - The verb does NOT print a success envelope.
 - The verb prints a structured failure envelope on stdout and exits 1.
-- **Pre-commit unwind** (fn-629 task .2, seam-routed verbs): for the
-  multi-file verbs (`scaffold`, `refine-apply`, `epic create`, `epic
-  rm`), `emit()` unwinds `written_paths` on any pre-commit raise — the
-  failed verb leaves zero on-disk side effects. For the single-field
-  seam-routed verbs (`done`, `approve`, every `set-*`, etc.), each
-  write is a rename-atomic rewrite of a pre-existing tracked file, so
-  prior valid contents stay in place on a pre-commit raise.
+- **Pre-commit: writes persist** (no seam unwind, deleted in fn-640).
+  For the multi-file mint verbs (`scaffold`, `refine-apply`, `epic
+  create`), a MID-WRITE crash is still unwound by their LOCAL
+  write-phase try/except block; a pre-commit raise after the write phase
+  completed leaves the fully-written tree on disk. For the single-field
+  verbs (`done`, `approve`, every `set-*`, etc.), each write is a
+  rename-atomic rewrite of a pre-existing tracked file, so prior valid
+  contents stay in place. For `epic rm` the deletes already landed and
+  stay deleted.
 - **Post-commit, no rollback**: once `git commit` returns success,
   files are tracked in HEAD; the seam never unlinks them. No partial
   rollback is attempted. Build-forward: fail visibly, let the human
   reconcile.
-- **`validate --epic` bypass** is the one remaining
-  write-persists-on-failure shape (§4 + §13).
+- **`validate --epic` bypass** is the same write-persists-on-failure
+  shape (§4 + §13).
+
+An uncommitted epic tree that persists past a hard `commit_failed` is
+**harmless**: keeper's plan-worker observation gate (§3) gates snapshot
+emission on `git cat-file -e HEAD:<relpath>`, so the autopilot never
+observes — and never dispatches against — a tree that is not yet in HEAD.
+That HEAD-gate is the SOLE guard against the fn-627 duplicate-dispatch
+window; planctl no longer carries a seam unwind or an orphan reaper. The
+next mutating verb whose `touched ∩ dirty` intersects the dirty file
+sweeps it into a commit.
 
 Reconcile path:
 
@@ -471,49 +501,9 @@ Reconcile path:
 planctl done fn-7-add-auth.2 --summary "..."
 
 # Option B — discard the writes
-git checkout -- .planctl/
+git checkout -- .planctl/      # tracked-file rewrites
+git clean -- .planctl/         # untracked mint trees
 ```
-
-### Orphan-epic reaper (fn-629 task .4)
-
-A hard `commit_failed` from a pre-fn-629-task-.2 verb (or any future
-runaway) could historically leave a fully-written but untracked epic
-tree on disk: keeper's plan-worker observation gate (§3) refuses to
-emit a snapshot for an uncommitted epic, no worker ever touches it,
-and no later mutating verb on a different epic revisits its files —
-the §10 "next mutating verb sweeps it" promise was, before task .4,
-true ONLY for files the next verb's `touched ∩ dirty` intersected.
-
-`planctl.reaper.reap_orphan_epics` makes that promise real for the
-disjoint case. The reaper runs as a Phase-3 pre-flight at the top of
-`scaffold` and `refine-apply` and unlinks every epic tree (epic JSON
-+ tasks + specs + runtime state + locks, mirroring `epic rm`'s
-unlink set) whose `.planctl/epics/<id>.json` is git-untracked.
-
-**Safety gate — two conjoined predicates, both must hold before reap:**
-
-1. **Stale by mtime.** Epic JSON mtime older than
-   `_REAP_MIN_AGE_SECONDS` (5 minutes). Any in-flight write is
-   sub-second; 5 minutes is conservative beyond the 60s commit-lock
-   timeout plus realistic clock skew.
-2. **No live session owns the project.** No file under
-   `.planctl/state/sessions/<sid>/touched/` has been modified within
-   `_LIVE_SESSION_WINDOW_SECONDS` (10 minutes). The touched-paths
-   log is written by every `atomic_write` / `_record_touched`, so a
-   freshly-running session leaves recent timestamps regardless of
-   whether the specific touched-path file names the orphan epic.
-   Coarse on purpose — naming-specific matching would race the write
-   that creates the touched-record itself, and waiting one verb-cycle
-   to reap costs nothing.
-
-When in doubt, do NOT reap. The reaper is fail-soft (a sweep error
-never blocks the actual scaffold/refine-apply), idempotent, and
-explicitly preserves the fn-627 in-flight pre-commit window: a fresh
-untracked tree owned by a live session is regression-tested as
-NOT-reaped. The reaper is the planctl-side complement to keeper's
-observation gate — together they close gap (2) of the §10
-no-rollback policy: even when files persist post-failure, no worker
-ever sees them and the next mutating verb sweeps them up.
 
 ---
 
@@ -573,9 +563,11 @@ At envelope-build time, `build_planctl_invocation`:
 3. Intersects the two sets — only paths that are both touched and dirty
    appear in `files`.
 
-`auto_commit_from_invocation` re-intersects under the flock to handle
-the race where a concurrent verb already swept the files between
-payload-build and lock-acquire.
+`auto_commit_from_invocation` re-intersects on each retry attempt to
+handle the race where a concurrent verb already swept the files between
+payload-build and commit. Pathspec-scoped commits mean even a lost race
+never cross-contaminates: the loser re-confirms clean and no-ops, or
+re-parents off the winner's HEAD and commits its own disjoint paths.
 
 ### Fail-closed on None session id
 
@@ -615,17 +607,17 @@ Per-test `tmp_path` + `git init` + `commit.gpgsign=false` +
 | Verb runner self-emit | Envelope emitted on stdout |
 | Mutating-verb auto-commit happy path | One `chore(planctl): <op> <target>` commit landed; subject + trailers correct |
 | Auto-commit no-op (clean) | `auto_commit_from_invocation` returns `None`; no commit; success envelope still prints |
-| Auto-commit failure | No success envelope on stdout; failure envelope with `error: commit_failed` and `details.error` ∈ {`lock_timeout`, `git_*`, `missing_*`}; exit 1 |
-| Lock contention | Mutating verb blocks until lock available; on 60s timeout raises `CommitFailed("lock_timeout", ...)` and exits via failure envelope |
-| Concurrent-sweep race | Verb A commits the files; Verb B sees clean files under the lock and returns `None` (no empty commit) |
+| Auto-commit failure | No success envelope on stdout; failure envelope with `error: commit_failed` and `details.error` ∈ {`commit_contended`, `git_*`, `missing_*`}; exit 1 |
+| Commit contention retry | Index/ref-lock contention stderr triggers the bounded retry (re-run add+commit from current HEAD); a ref-lock loser re-parents off the winner's tip; exhaustion raises `CommitFailed("commit_contended", ...)`; a genuine failure (hook reject, empty tree) surfaces immediately with NO retry |
+| Concurrent-sweep race | Verb A commits the files; Verb B re-confirms clean files and returns `None` (no empty commit); pathspec-scoped commits never cross-contaminate |
 | `done` verb | `chore(planctl): done <task_id>` commit lands in one verb call |
 | `task ack` | Writes `acks.db` only; no commit; envelope carries `subject=null`/`files=null` |
 | `approve` (paradigmatic leak case, formerly `set-approval`) | Verb fires from any cwd (no `/plan:*` skill) — commit still lands |
 | `scaffold` whole-tree | One commit covers epic + tasks + specs + deps; envelope `files` lists every written path |
 | `scaffold` integrity-gate failure (fn-623) | `scan_max_epic_id` unchanged; zero orphan `specs/fn-N-*.md` on disk (in-memory `epic_spec_content=` pass means no spec lands before the gate); failure envelope only, no commit |
-| Seam pre-commit unwind (fn-629 task .2) | Multi-file seam-routed verb raises BEFORE `auto_commit_from_invocation` returns (invocation-build raise, lock-timeout, or simulated `git` failure); `emit(written_paths=[...])` unwinds every freshly-minted path on the way out; zero new untracked files in `.planctl/` after the failure envelope lands; `_epic_id_lock` and the commit lock remain disjoint (no nesting regression) |
-| Keeper observation gate (fn-629 task .1) | An uncommitted `.planctl/epics/<id>.json` on disk does NOT produce an `EpicSnapshot` snapshot — the file lands in keeper's plan-worker `pending` set; once the file is committed (HEAD-resolvable via `git cat-file -e HEAD:<relpath>`), the next git-worker pulse drains pending and the snapshot emits. Autopilot cannot dispatch against an uncommitted epic |
-| Orphan-epic reaper safety (fn-629 task .4) | Stale (>5min) untracked orphan epic tree with NO live session activity in the last 10min → reaped by the next `scaffold` / `refine-apply` pre-flight (every artifact `epic rm` would unlink, gone); fresh in-flight untracked tree owned by a live session (recent touched-paths-log mtime) → NOT reaped (the fn-627 window stays safe); tracked epic tree → never touched; reaper exception → swallowed, scaffold/refine-apply proceeds |
+| Seam pre-commit persistence (fn-640) | Multi-file mint verb raises AFTER the write phase (invocation-build raise or simulated `git` failure); the fully-written tree PERSISTS on disk (no seam unwind); the failure envelope lands; `_epic_id_lock` releases before the git commit runs (no nesting regression) |
+| Local write-phase unwind | A MID-WRITE crash inside the mint verb's write loop (e.g. disk-full on the 2nd of N task writes) unwinds the partial FRESH-MINT tree via the verb's LOCAL try/except; the commit-failure window is NOT covered by this block |
+| Keeper observation gate (fn-629 task .1, sole pre-commit guard) | An uncommitted `.planctl/epics/<id>.json` on disk does NOT produce an `EpicSnapshot` snapshot — the file lands in keeper's plan-worker `pending` set; once the file is committed (HEAD-resolvable via `git cat-file -e HEAD:<relpath>`), the next git-worker pulse drains pending and the snapshot emits. Autopilot cannot dispatch against an uncommitted epic |
 | `epic rm` whole-tree delete | One `chore(planctl): rm <epic_id>` commit covers every unlinked path; touched paths recorded BEFORE unlink so `touched ∩ dirty` captures the deletions; `--dry-run` emits the same envelope shape minus `planctl_invocation` and lands no commit |
 | `validate --epic` first-stamp | Manual `auto_commit_from_invocation` call from the runner lands the marker commit; bypasses `emit()` to preserve the `{valid, errors, warnings}` envelope shape |
 | `epic followup-of` (read-only) | Envelope `{found, epic_id, actual_tasks, depends_on_epics, status}` for the first open epic whose `depends_on_epics` contains the source; `{found: false}` when none; envelope carries `subject=null`/`files=null`; no commit |
@@ -690,27 +682,24 @@ This asymmetry is by design for this epic — fn-588 explicitly scopes
 out rolling back the epic JSON write on commit failure. A future
 change can revisit if the recovery surprise proves load-bearing.
 
-**fn-629 task .3 seam coverage.** The migration that routed every
-single-field mutating verb through the `output.emit()` seam (`verb=…`
-form, written_paths-as-unwind) explicitly **excluded** `validate
---epic`. The verb's `{valid, errors, warnings}` envelope shape is
-incompatible with `emit()` (which always wraps in `{success: true,
-**data}`), so the runner keeps its direct
+**Seam coverage.** The migration that routed every single-field mutating
+verb through the `output.emit()` seam (`verb=…` form) explicitly
+**excluded** `validate --epic`. The verb's `{valid, errors, warnings}`
+envelope shape is incompatible with `emit()` (which always wraps in
+`{success: true, **data}`), so the runner keeps its direct
 `commit.auto_commit_from_invocation(pc)` call. The single tracked
 field this writes (`last_validated_at`) is a marker the next mutating
-verb's auto-commit reliably sweeps from the dirty set, so the absence
-of a parallel unwind wrapper is bounded by the existing recovery path
+verb's auto-commit reliably sweeps from the dirty set, so its
+stamp-persistence-after-commit-failure is bounded by the recovery path
 documented above — there is no orphan-tree class of failure to worry
-about here, only the documented stamp-persistence-after-commit-failure
-surprise.
+about here.
 
 `refine-context --invalidate` (the other conditionally-mutating verb)
-DOES route through the seam as of fn-629 task .3 because its envelope
-shape (`{success: true, ...}`) is `emit()`-compatible. The write is a
+DOES route through the seam because its envelope shape
+(`{success: true, ...}`) is `emit()`-compatible. The write is a
 single-field rewrite of a pre-existing tracked file (atomic_write
-rename-atomic), so `written_paths=[]` — no unwind, but the
-invocation-build + commit transaction lives inside one try-block per
-the seam contract.
+rename-atomic), so prior valid contents stay in place on a pre-commit
+raise — the invocation-build + commit lives inside the verb boundary.
 
 ---
 

@@ -587,17 +587,6 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # the post-delta graph. The flock guards scan_max_task_id against a
     # concurrent task add to the same epic (the suffix is epic-scoped).
     # ------------------------------------------------------------------
-    # fn-629 task .4: sweep stale, unowned, untracked orphan epic trees
-    # left on disk by an earlier hard ``commit_failed`` (the §10 no-rollback
-    # carve-out). The reaper is fail-soft (NEVER raises), gated on BOTH a
-    # 5-minute mtime floor AND host-wide absence of any active session — so
-    # a concurrent in-flight pre-commit tree (the fn-627 window itself) is
-    # never reaped. Runs OUTSIDE ``_epic_id_lock`` so its deletions never
-    # extend the id-allocation lock hold time across a filesystem sweep.
-    from planctl.reaper import reap_orphan_epics
-
-    reap_orphan_epics(data_dir, ctx.project_path)
-
     with _epic_id_lock():
         max_task = scan_max_task_id(data_dir, epic_id)
         # Two-pass: ordinal i (1-based into add_tasks) -> id `epic_id.{max+i}`.
@@ -758,11 +747,12 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             {tr for tr in existing_target_repos if tr}
             | {tr for tr in resolved_new_target_repos if tr}
         )
-        # fn-629 task .2: track FRESH-MINT writes under ``written_paths`` so
-        # the central seam at output.emit() (below) can unwind on a pre-commit
-        # failure. refine-apply previously wrote the whole delta outside any
-        # unwind — a raise mid-write or in Phase 4.5 left a half-applied delta
-        # on disk. Now new-task JSON / spec writes are recorded.
+        # Track FRESH-MINT writes under ``written_paths`` so the local
+        # write-phase try/except (and the Phase 4.5 re-stamp block below) can
+        # unwind on a MID-WRITE crash. refine-apply previously wrote the whole
+        # delta outside any unwind — a raise mid-write or in Phase 4.5 left a
+        # half-applied delta on disk. Now new-task JSON / spec writes are
+        # recorded for the single-writer mid-write atomicity guarantee.
         #
         # CRITICAL: existing-file rewrites (the epic JSON, epic spec, rewrite_
         # /rewire_ targets) are intentionally OMITTED from ``written_paths``.
@@ -893,11 +883,13 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # ------------------------------------------------------------------
     # Phase 5: emit ONE envelope covering the whole delta
     # ------------------------------------------------------------------
-    # fn-629 task .2: route through the central seam. emit(verb=...) builds
-    # build_planctl_invocation internally and unwinds ``written_paths`` on
-    # any pre-commit failure (invocation-build raise, lock-acquire timeout,
-    # git status/add/commit error). The commit lock and the (already
-    # released) ``_epic_id_lock`` stay disjoint — no nesting.
+    # Route through the central seam. emit(verb=...) builds
+    # build_planctl_invocation internally and runs the per-verb auto-commit.
+    # The local write-phase try/except blocks above already unwound any
+    # FRESH-MINT files on a MID-WRITE crash; a pre-commit raise from the seam
+    # leaves the written tree on disk (§10 no-rollback), invisible to the
+    # autopilot via the keeper HEAD-gate. The (already released)
+    # ``_epic_id_lock`` stays off the git-commit critical path.
     emit(
         {
             "epic_id": epic_id,
@@ -910,7 +902,6 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
         target=epic_id,
         repo_root=ctx.project_path,
         primary_repo=str(primary_repo),
-        written_paths=written_paths,
     )
     return 0
 

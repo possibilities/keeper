@@ -78,6 +78,5 @@ def run(args: SimpleNamespace) -> int:
         target=epic_id,
         repo_root=ctx.project_path,
         primary_repo=primary_repo,
-        written_paths=[],
     )
     return 0

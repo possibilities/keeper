@@ -487,13 +487,13 @@ def test_rm_registered_in_verb_templates():
 
 
 # ---------------------------------------------------------------------------
-# fn-629 task .2: epic rm now routes through the central seam at output.emit()
-# instead of building build_planctl_invocation itself. Unwind is a no-op for
-# rm (delete-only — there's nothing to re-create), but the seam still owns the
-# commit transaction so a CommitFailed still produces the structured
-# `commit_failed` envelope and the success envelope is NEVER printed. The
-# generalised regression: a missing PLANCTL_SESSION_ID surfaces from the seam
-# the same way it does for scaffold / refine-apply.
+# epic rm routes through the central seam at output.emit() instead of building
+# build_planctl_invocation itself. rm is delete-only — there's nothing to
+# re-create on a pre-commit raise (§10 no-rollback applies to the deletes the
+# same as to writes), but the seam still owns the commit so a CommitFailed
+# still produces the structured `commit_failed` envelope and the success
+# envelope is NEVER printed. Regression: a missing PLANCTL_SESSION_ID surfaces
+# from the seam the same way it does for scaffold / refine-apply.
 # ---------------------------------------------------------------------------
 
 

@@ -748,20 +748,20 @@ add_tasks:
 
 
 # ---------------------------------------------------------------------------
-# fn-629 task .2: refine-apply commit-boundary atomicity — generalised from the
-# fn-630 scaffold pattern via the central seam at output.emit(). The seam
-# builds build_planctl_invocation internally and unwinds ``written_paths`` on
-# any pre-commit failure (invocation-build raise, commit-lock timeout, git
-# status/add/commit error), so a failed refine-apply leaves zero on-disk side
-# effects — closing the original sibling gap (no unwind, Phase 4.5 atomic_write
-# outside the lock) the scout flagged on this verb.
+# fn-640: refine-apply commit-boundary behavior after the fn-629 seam unwind
+# was deleted. A pre-COMMIT failure (invocation-build raise, git error) now
+# leaves the freshly-minted task/spec tree ON DISK (§10 no-rollback) — the
+# keeper HEAD-gate is the sole guard that keeps an uncommitted tree invisible
+# to the autopilot. The local write-phase try/except blocks still unwind a
+# MID-WRITE crash, so these tests target the commit-failure window specifically
+# (the write phase completed before the raise).
 # ---------------------------------------------------------------------------
 
 
-def test_refine_apply_missing_session_id_unwinds_writes(planctl_git_repo, monkeypatch):
-    """fn-629 task .2: PLANCTL_SESSION_ID unset → invocation-build raises in
-    emit() → ``written_paths`` are unlinked. No orphan task JSON / spec from
-    the failed refine-apply lands on disk.
+def test_refine_apply_missing_session_id_persists_writes(planctl_git_repo, monkeypatch):
+    """fn-640: PLANCTL_SESSION_ID unset → invocation-build raises in emit()
+    AFTER the write phase already completed. With the seam unwind gone, the
+    freshly-minted task JSON / spec now PERSIST on disk (no automatic unwind).
     """
     epic_id = _seed_two_task_epic(planctl_git_repo)
 
@@ -785,20 +785,21 @@ add_tasks:
     r = _invoke(["refine-apply", epic_id, "--file", delta_path])
     assert r.exit_code != 0, r.output
 
-    # The new task tree was unwound: no orphan files under the freshly-
-    # allocated id. Before the seam, refine-apply wrote the whole delta and
-    # then raised when build_planctl_invocation tried to resolve the
-    # session id, leaving an uncommitted task on disk.
-    assert not baseline_task3.exists()
-    assert not baseline_spec3.exists()
+    # The new task tree PERSISTS: the write phase completed before the
+    # invocation-build raise, and there is no seam-level unwind anymore. The
+    # tree is untracked-on-disk and invisible to the autopilot via keeper's
+    # HEAD-gate until a re-run lands the commit.
+    assert baseline_task3.exists()
+    assert baseline_spec3.exists()
 
 
-def test_refine_apply_invocation_raise_unwinds_written_tree(
+def test_refine_apply_invocation_raise_persists_written_tree(
     planctl_git_repo, monkeypatch
 ):
-    """fn-629 task .2: a raise from build_planctl_invocation (after Phase 4
-    writes land) unwinds every freshly-written file via the central seam.
-    Generalised from the fn-630 scaffold regression.
+    """fn-640: a raise from build_planctl_invocation (after the write phase
+    completed, pre-commit) leaves the freshly-written tree on disk — no
+    seam-level unwind. The local write-phase block only unwinds a MID-WRITE
+    crash, which is not this window.
     """
     epic_id = _seed_two_task_epic(planctl_git_repo)
     baseline_task3 = planctl_git_repo / ".planctl" / "tasks" / f"{epic_id}.3.json"
@@ -824,18 +825,18 @@ add_tasks:
     r = _invoke(["refine-apply", epic_id, "--file", delta_path])
     assert r.exit_code != 0, r.output
 
-    # The fresh add_tasks write was unwound: no orphan task JSON / spec.
-    assert not baseline_task3.exists()
-    assert not baseline_spec3.exists()
+    # The fresh add_tasks write PERSISTS: pre-commit raise, no automatic unwind.
+    assert baseline_task3.exists()
+    assert baseline_spec3.exists()
 
 
-def test_refine_apply_commit_failure_unwinds_written_tree(
+def test_refine_apply_commit_failure_persists_written_tree(
     planctl_git_repo, monkeypatch
 ):
-    """fn-629 task .2: a CommitFailed from auto_commit_from_invocation
-    triggers the same unwind path. The commit lock-acquire / git status / git
-    add / git commit failures all happen pre-commit-land, so the unwind is
-    pre-commit-safe (§10 no-rollback policy preserved).
+    """fn-640: a CommitFailed from auto_commit_from_invocation yields the
+    structured ``commit_failed`` envelope (success envelope NEVER printed) and
+    leaves the freshly-written add_tasks files ON DISK (§10 no-rollback). The
+    deleted seam unwind no longer scrubs the pre-commit window.
     """
     from planctl import commit as commit_module
 
@@ -863,13 +864,13 @@ add_tasks:
     assert r.exit_code == 1, r.output
 
     # The failure envelope landed (compact NDJSON), the success envelope did
-    # NOT, and the freshly-written add_tasks files were unwound.
+    # NOT, and the freshly-written add_tasks files PERSIST (no unwind).
     env = _parse_envelope(r.output)
     assert env["success"] is False
     assert env["error"] == "commit_failed"
     assert env["details"]["error"] == "git_commit"
-    assert not baseline_task3.exists()
-    assert not baseline_spec3.exists()
+    assert baseline_task3.exists()
+    assert baseline_spec3.exists()
 
 
 def test_refine_apply_lock_disjoint_from_commit_lock(planctl_git_repo, monkeypatch):

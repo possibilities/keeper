@@ -179,17 +179,18 @@ def run(args: SimpleNamespace) -> int:
                     p.unlink(missing_ok=True)
             raise
 
-    # fn-629 task .2: route through the central seam. emit(verb=...) builds
-    # build_planctl_invocation internally and unwinds ``written_paths`` on
-    # any pre-commit failure (invocation-build raise, commit lock-acquire
-    # timeout, git status/add/commit error). The commit lock and the (now
-    # released) ``_epic_id_lock`` stay disjoint.
+    # Route through the central seam. emit(verb=...) builds
+    # build_planctl_invocation internally and runs the per-verb auto-commit.
+    # The local write-phase try/except above already unwound any partial tree
+    # on a MID-WRITE crash; a pre-commit raise from the seam leaves the
+    # written tree on disk (§10 no-rollback), invisible to the autopilot via
+    # the keeper HEAD-gate. The (now released) ``_epic_id_lock`` stays off the
+    # git-commit critical path.
     emit(
         {"epic": epic_def},
         verb="create",
         target=epic_id,
         repo_root=ctx.project_path,
         primary_repo=primary_repo,
-        written_paths=written_paths,
     )
     return 0
