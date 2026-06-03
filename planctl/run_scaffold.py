@@ -806,8 +806,6 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             "approval": "pending",
             "branch_name": branch_name,
             "depends_on_epics": list(depends_on_epics),
-            "plan_review_status": "unknown",
-            "plan_reviewed_at": None,
             "primary_repo": primary_repo,
             "touched_repos": touched_repos,
             "snippets": list(epic_snippets),

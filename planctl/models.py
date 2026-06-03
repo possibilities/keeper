@@ -81,18 +81,6 @@ def normalize_epic(data: dict) -> dict:
         data["branch_name"] = None
     if "depends_on_epics" not in data:
         data["depends_on_epics"] = []
-    if "plan_review_status" not in data:
-        data["plan_review_status"] = "unknown"
-    if "plan_reviewed_at" not in data:
-        data["plan_reviewed_at"] = None
-    if "work_review_status" not in data:
-        data["work_review_status"] = "unknown"
-    if "work_reviewed_at" not in data:
-        data["work_reviewed_at"] = None
-    if "epic_review_status" not in data:
-        data["epic_review_status"] = "unknown"
-    if "epic_reviewed_at" not in data:
-        data["epic_reviewed_at"] = None
     if "last_validated_at" not in data:
         data["last_validated_at"] = None
     # Multi-repo fields — null on legacy records (no migration, no SCHEMA_VERSION bump).
@@ -163,10 +151,6 @@ def normalize_task(data: dict) -> dict:
         data["priority"] = None
     if "depends_on" not in data:
         data["depends_on"] = data.get("deps", [])
-    if "work_review_status" not in data:
-        data["work_review_status"] = "unknown"
-    if "work_reviewed_at" not in data:
-        data["work_reviewed_at"] = None
     # Multi-repo field — null on legacy records.
     if "target_repo" not in data:
         data["target_repo"] = None

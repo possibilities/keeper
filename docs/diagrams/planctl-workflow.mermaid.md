@@ -103,7 +103,7 @@ flowchart TB
         parse_fail{"parse /\nschema fail?"}
 
         epic_close["planctl epic close\n(stamps closer_done_at;\nfn-559: audit ran inline)"]
-        halt_needs_work["set-epic-review-status\nneeds_work\n(do NOT close)"]
+        halt_needs_work["halt\n(do NOT close;\nno status stamp)"]
 
         spawn_auditor --> spawn_classifier
         spawn_classifier --> parse_verdict

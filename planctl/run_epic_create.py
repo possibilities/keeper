@@ -156,8 +156,6 @@ def run(args: SimpleNamespace) -> int:
             "approval": "pending",
             "branch_name": branch_name,
             "depends_on_epics": [],
-            "plan_review_status": "unknown",
-            "plan_reviewed_at": None,
             "primary_repo": primary_repo,
             "touched_repos": touched_repos,
             "created_at": now,

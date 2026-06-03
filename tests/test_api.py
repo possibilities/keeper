@@ -54,7 +54,7 @@ class TestLoadEpic:
         assert result["id"] == "fn-1-slug"
         assert result["title"] == "My Epic"
         # normalize_epic fills these defaults
-        assert "plan_review_status" in result
+        assert "last_validated_at" in result
 
     def test_raises_file_not_found_when_absent(self, tmp_path: Path) -> None:
         ctx, _ = _make_project(tmp_path)

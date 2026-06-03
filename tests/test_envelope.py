@@ -234,9 +234,6 @@ def test_session_id_none_raises(planctl_git_repo, monkeypatch):
         ["epic", "set-branch", "{epic_id}", "--branch", "test-branch"],
         ["epic", "set-title", "{epic_id}", "--title", "New title"],
         ["epic", "close", "{epic_id}", "--force"],
-        ["epic", "set-plan-review-status", "{epic_id}", "--status", "ship"],
-        ["epic", "set-work-review-status", "{epic_id}", "--status", "ship"],
-        ["epic", "set-epic-review-status", "{epic_id}", "--status", "ship"],
     ],
 )
 def test_epic_verbs_emit_planctl_mutation(planctl_git_repo, verb_args):

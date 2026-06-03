@@ -13,8 +13,7 @@ after a post-write integrity re-check."  ``epic invalidate`` remains the
 ONLY surviving null path (it explicitly nulls the marker).
 
 Verbs that do NOT re-stamp (no validation-relevant structural change):
-  done, start, block, set-*-review-status, epic close, epic set-branch,
-  epic set-title
+  done, start, block, epic close, epic set-branch, epic set-title
 """
 
 from __future__ import annotations

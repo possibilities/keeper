@@ -354,17 +354,13 @@ class TestVerdictParseAndValidate:
 
 
 class TestFatalCheck:
-    def test_fatal_true_triggers_needs_work_and_halt(self):
-        """When verdict['fatal'] is True, set-epic-review-status needs_work
-        must be called and epic close must NOT be called."""
+    def test_fatal_true_halts_without_closing(self):
+        """When verdict['fatal'] is True, the closer halts: epic close must
+        NOT be called. No status stamp is written (halt-without-stamp)."""
         verdict = _fatal_verdict()
         assert verdict["fatal"] is True
 
-        set_status_calls = []
         close_calls = []
-
-        def mock_set_status(epic_id: str, status: str) -> None:
-            set_status_calls.append((epic_id, status))
 
         def mock_epic_close(epic_id: str) -> None:
             close_calls.append(epic_id)
@@ -372,36 +368,29 @@ class TestFatalCheck:
         # Simulate the fatal check branch
         epic_id = "fn-42-add-auth"
         if verdict["fatal"]:
-            mock_set_status(epic_id, "needs_work")
-            # halt — do NOT call mock_epic_close
+            pass  # halt — do NOT call mock_epic_close
         else:
             mock_epic_close(epic_id)
 
-        assert set_status_calls == [("fn-42-add-auth", "needs_work")]
         assert close_calls == [], "epic close must NOT be called on fatal"
 
-    def test_fatal_false_does_not_set_needs_work(self):
-        """When verdict['fatal'] is False, set-epic-review-status must NOT be called."""
+    def test_fatal_false_closes(self):
+        """When verdict['fatal'] is False, the epic closes."""
         verdict = _clean_verdict()
         assert verdict["fatal"] is False
 
-        set_status_calls = []
         close_calls = []
-
-        def mock_set_status(epic_id: str, status: str) -> None:
-            set_status_calls.append((epic_id, status))
 
         def mock_epic_close(epic_id: str) -> None:
             close_calls.append(epic_id)
 
         epic_id = "fn-42-add-auth"
         if verdict["fatal"]:
-            mock_set_status(epic_id, "needs_work")
+            pass  # halt
         else:
             # fn-462: no tier-1 worker dispatch — non-fatal goes straight to close.
             mock_epic_close(epic_id)
 
-        assert set_status_calls == []
         assert close_calls == ["fn-42-add-auth"]
 
     def test_non_fatal_with_tier1_still_closes(self):
@@ -431,7 +420,7 @@ class TestCloserFlowHappyPath:
     """Happy path: clean audit, no fatal — epic close called regardless of tier_1 count."""
 
     def test_clean_audit_no_findings_closes_epic(self):
-        """Clean verdict (all tiers empty) — epic close is called, no set-epic-review-status."""
+        """Clean verdict (all tiers empty) — epic close is called."""
         verdict = {
             "fatal": False,
             "fatal_reason": "",
@@ -440,7 +429,6 @@ class TestCloserFlowHappyPath:
             "tier_2": [],
             "tier_3": [],
         }
-        set_status_calls = []
         close_calls = []
 
         # Simulate closer Phase 5–8 logic
@@ -450,11 +438,10 @@ class TestCloserFlowHappyPath:
         assert err is None
 
         if parsed["fatal"]:
-            set_status_calls.append("needs_work")
+            pass  # halt
         else:
             close_calls.append("fn-42-add-auth")
 
-        assert set_status_calls == []
         assert close_calls == ["fn-42-add-auth"]
 
     def test_populated_non_fatal_audit_closes_epic(self):
@@ -464,19 +451,17 @@ class TestCloserFlowHappyPath:
         fn-462 removes that loop and routes everything to /plan:audit.
         """
         verdict = _populated_verdict()
-        set_status_calls = []
         close_calls = []
         audit_hint_emitted = False
 
         if verdict["fatal"]:
-            set_status_calls.append("needs_work")
+            pass  # halt
         else:
             close_calls.append("fn-42-add-auth")
             # Audit hint emits when any of tier_1/tier_2/tier_3 is non-empty.
             if verdict["tier_1"] or verdict["tier_2"] or verdict["tier_3"]:
                 audit_hint_emitted = True
 
-        assert set_status_calls == []
         assert close_calls == ["fn-42-add-auth"]
         assert audit_hint_emitted is True
 
@@ -487,11 +472,10 @@ class TestCloserFlowHappyPath:
 
 
 class TestFatalHalt:
-    def test_fatal_verdict_sets_needs_work_and_skips_close(self):
+    def test_fatal_verdict_skips_close(self):
         verdict = _fatal_verdict()
         assert verdict["fatal"] is True
 
-        set_status_calls = []
         close_calls = []
 
         output = _make_classifier_output(verdict)
@@ -502,12 +486,10 @@ class TestFatalHalt:
         assert parsed["fatal"] is True
 
         if parsed["fatal"]:
-            set_status_calls.append(("fn-42-add-auth", "needs_work"))
-            # halt — never reach epic close
+            pass  # halt — never reach epic close
         else:
             close_calls.append("fn-42-add-auth")
 
-        assert ("fn-42-add-auth", "needs_work") in set_status_calls
         assert close_calls == []
 
 
@@ -517,18 +499,20 @@ class TestFatalHalt:
 
 
 class TestParseFailure:
-    def test_missing_verdict_block_sets_needs_work(self):
+    def test_missing_verdict_block_halts(self):
         output = "The audit looks fine. No structured verdict block."
         raw = extract_verdict_block(output)
         assert raw is None  # extraction failed
 
-        set_status_calls = []
+        close_calls = []
         if raw is None:
-            set_status_calls.append(("fn-42-add-auth", "needs_work"))
+            pass  # halt — never reach epic close
+        else:
+            close_calls.append("fn-42-add-auth")
 
-        assert set_status_calls == [("fn-42-add-auth", "needs_work")]
+        assert close_calls == []
 
-    def test_malformed_json_inside_block_sets_needs_work(self):
+    def test_malformed_json_inside_block_halts(self):
         output = "<VERDICT_JSON>{not json}</VERDICT_JSON>"
         raw = extract_verdict_block(output)
         assert raw is not None  # block was found
@@ -536,13 +520,15 @@ class TestParseFailure:
         assert verdict is None
         assert err is not None
 
-        set_status_calls = []
+        close_calls = []
         if err:
-            set_status_calls.append(("fn-42-add-auth", "needs_work"))
+            pass  # halt — never reach epic close
+        else:
+            close_calls.append("fn-42-add-auth")
 
-        assert set_status_calls == [("fn-42-add-auth", "needs_work")]
+        assert close_calls == []
 
-    def test_schema_incompliant_json_sets_needs_work(self):
+    def test_schema_incompliant_json_halts(self):
         """Valid JSON but missing required 'tier_2' fails schema."""
         bad_verdict = {
             "fatal": False,
@@ -559,11 +545,13 @@ class TestParseFailure:
         assert err is not None
         assert "schema validation failed" in err
 
-        set_status_calls = []
+        close_calls = []
         if err:
-            set_status_calls.append(("fn-42-add-auth", "needs_work"))
+            pass  # halt — never reach epic close
+        else:
+            close_calls.append("fn-42-add-auth")
 
-        assert set_status_calls == [("fn-42-add-auth", "needs_work")]
+        assert close_calls == []
 
 
 # ---------------------------------------------------------------------------

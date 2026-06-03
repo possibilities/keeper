@@ -55,7 +55,7 @@ class InvocationTrackedGroup(FormattedGroup):
         if cmd is None:
             return super().invoke(ctx)
 
-        # For subgroups (epic, task, dep, worker, codex),
+        # For subgroups (epic, task, worker),
         # let the parent handle — their own contexts will carry the right name.
         if isinstance(cmd, click.Group):
             return super().invoke(ctx)
@@ -1052,51 +1052,6 @@ def epic_set_branch_cmd(epic_id, branch):
     return _lazy_import("planctl.run_epic_set_branch")(epic_id=epic_id, branch=branch)
 
 
-@epic_group.command("set-plan-review-status")
-@click.argument("epic_id")
-@click.option(
-    "--status",
-    required=True,
-    type=click.Choice(["ship", "needs_work", "unknown"]),
-    help="Plan review verdict",
-)
-def epic_set_plan_review_status_cmd(epic_id, status):
-    """Set the plan review status on an epic."""
-    return _lazy_import("planctl.run_epic_set_plan_review_status")(
-        epic_id=epic_id, status=status
-    )
-
-
-@epic_group.command("set-work-review-status")
-@click.argument("epic_id")
-@click.option(
-    "--status",
-    required=True,
-    type=click.Choice(["ship", "needs_work", "unknown"]),
-    help="Work review verdict",
-)
-def epic_set_work_review_status_cmd(epic_id, status):
-    """Set the work review status on an epic."""
-    return _lazy_import("planctl.run_epic_set_work_review_status")(
-        epic_id=epic_id, status=status
-    )
-
-
-@epic_group.command("set-epic-review-status")
-@click.argument("epic_id")
-@click.option(
-    "--status",
-    required=True,
-    type=click.Choice(["ship", "needs_work", "unknown"]),
-    help="Epic review verdict",
-)
-def epic_set_epic_review_status_cmd(epic_id, status):
-    """Set the epic review status on an epic."""
-    return _lazy_import("planctl.run_epic_set_epic_review_status")(
-        epic_id=epic_id, status=status
-    )
-
-
 @epic_group.command("set-title")
 @click.argument("epic_id")
 @click.option("--title", required=True, help="New title")
@@ -1509,21 +1464,6 @@ def task_ack_cmd(task_id):
     return _lazy_import("planctl.run_task_ack")(task_id=task_id)
 
 
-@task_group.command("set-work-review-status")
-@click.argument("task_id")
-@click.option(
-    "--status",
-    required=True,
-    type=click.Choice(["ship", "needs_work", "unknown"]),
-    help="Work review verdict",
-)
-def task_set_work_review_status_cmd(task_id, status):
-    """Set the work review status on a task."""
-    return _lazy_import("planctl.run_task_set_work_review_status")(
-        task_id=task_id, status=status
-    )
-
-
 @task_group.command("set-target-repo")
 @click.argument("task_id")
 @click.option(
@@ -1606,95 +1546,6 @@ Codes: `BAD_TASK_ID` (regex), `TASK_NOT_FOUND` (spec/JSON absent).
 def worker_resume_cmd(task_id):
     """Emit a ready-to-paste respawn prompt for a dropped in-progress task."""
     return _lazy_import("planctl.run_worker_resume")(task_id=task_id)
-
-
-# --- Codex subgroup ---
-
-
-@cli.group("codex", cls=FormattedGroup)
-def codex_group():
-    """Codex CLI integration commands."""
-    pass
-
-
-@codex_group.command("plan-review")
-@click.argument("epic_id")
-@click.option(
-    "--sandbox",
-    default="auto",
-    type=click.Choice(["read-only", "workspace-write", "danger-full-access", "auto"]),
-    help="Codex sandbox mode (default: auto — read-only on Unix, danger-full-access on Windows)",
-)
-@click.option(
-    "--receipt",
-    default=None,
-    help="Path to receipt JSON (default: /tmp/plan-review-receipt-<epic_id>.json)",
-)
-@click.option("--model", default=None, help="Codex model ID (default: gpt-5.4)")
-def codex_plan_review_cmd(epic_id, sandbox, receipt, model):
-    """Run a Carmack-criteria plan review on an epic via Codex CLI."""
-    return _lazy_import("planctl.run_codex_plan_review")(
-        epic_id=epic_id,
-        sandbox=sandbox,
-        receipt=receipt,
-        model=model,
-    )
-
-
-@codex_group.command("work-review")
-@click.argument("id", required=False, default=None)
-@click.option(
-    "--base", default=None, help="Explicit base commit SHA for the diff range"
-)
-@click.option(
-    "--sandbox",
-    default="auto",
-    type=click.Choice(["read-only", "workspace-write", "danger-full-access", "auto"]),
-    help="Codex sandbox mode (default: auto — read-only on Unix, danger-full-access on Windows)",
-)
-@click.option(
-    "--receipt",
-    default=None,
-    help="Path to receipt JSON (default: /tmp/work-review-receipt-<id>.json)",
-)
-@click.option("--model", default=None, help="Codex model ID (default: gpt-5.4)")
-def codex_work_review_cmd(id, base, sandbox, receipt, model):
-    """Run a Carmack-criteria implementation review on a task or epic via Codex CLI."""
-    return _lazy_import("planctl.run_codex_work_review")(
-        id=id,
-        base=base,
-        sandbox=sandbox,
-        receipt=receipt,
-        model=model,
-    )
-
-
-@codex_group.command("epic-review")
-@click.argument("epic_id")
-@click.option(
-    "--base", default=None, help="Explicit base commit SHA for the diff range"
-)
-@click.option(
-    "--sandbox",
-    default="auto",
-    type=click.Choice(["read-only", "workspace-write", "danger-full-access", "auto"]),
-    help="Codex sandbox mode (default: auto — read-only on Unix, danger-full-access on Windows)",
-)
-@click.option(
-    "--receipt",
-    default=None,
-    help="Path to receipt JSON (default: /tmp/epic-review-receipt-<epic_id>.json)",
-)
-@click.option("--model", default=None, help="Codex model ID (default: gpt-5.4)")
-def codex_epic_review_cmd(epic_id, base, sandbox, receipt, model):
-    """Run a three-phase spec-compliance review on an epic via Codex CLI."""
-    return _lazy_import("planctl.run_codex_epic_review")(
-        epic_id=epic_id,
-        base=base,
-        sandbox=sandbox,
-        receipt=receipt,
-        model=model,
-    )
 
 
 def main() -> int:

@@ -112,7 +112,7 @@ Runs **before** scout spawn when Phase 1a captured an `inherited_bundle` or non-
 promptctl show-bundle <inherited_bundle>
 ```
 
-This emits the bundle's snippet-id list and one-line summaries. **Do NOT call `promptctl render <inherited_bundle>` here, and do NOT call `promptctl show-snippet` on every member.** Full bundle render is reserved for inheritor-tier `promptctl render-spec` calls in `/plan:work`, `/plan:close`, `/plan:audit`, and the review-* skills. At the router tier the planner browses the menu — context goes down, not up.
+This emits the bundle's snippet-id list and one-line summaries. **Do NOT call `promptctl render <inherited_bundle>` here, and do NOT call `promptctl show-snippet` on every member.** Full bundle render is reserved for inheritor-tier `promptctl render-spec` calls in `/plan:work`, `/plan:close`, and `/plan:audit`. At the router tier the planner browses the menu — context goes down, not up.
 
 Pin the resulting `{id, summary}` list in working memory as `inherited_bundle_menu`.
 
@@ -304,7 +304,7 @@ Drive the loop unconditionally (no kick-back, no escape to `/plan:interview` —
 
 **Silent skip on empty:** If the gap-analyst returned no Priority Questions, skip this phase entirely — create path proceeds to Phase 3, refine path proceeds to R4.
 
-**One-shot contract:** Do **not** re-spawn gap-analyst after Q&A. Trust the answers and proceed. `/plan:review-plan` is the downstream safety net for residual gaps.
+**One-shot contract:** Do **not** re-spawn gap-analyst after Q&A. Trust the answers and proceed.
 
 **No persistence (refine path):** Refine may re-ask questions that were answered on the original create run. This is expected.
 
@@ -854,8 +854,6 @@ Scouts: ran {repo-scout, docs-gap-scout, practice-scout, epic-scout}; skipped {}
 ```
 
 No menu, no follow-up prompts. The human can run `planctl list`, `planctl ready`, or `planctl show <id>` themselves.
-
-`/plan:review-plan` is **never auto-invoked** from Phase 8 — the human types it explicitly after planning is complete.
 
 ---
 

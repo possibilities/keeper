@@ -67,7 +67,6 @@ def _build_prompt(
     lines.append(f"TASK_ID: {task_id}")
     lines.append(f"EPIC_ID: {epic_id}")
     lines.append("PLANCTL: planctl")
-    lines.append("REVIEW_MODE: none")
     lines.append("")
     lines.append("Follow the phases in your agent spec exactly.")
     lines.append("")

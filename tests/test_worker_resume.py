@@ -66,7 +66,6 @@ def test_worker_resume_happy_path(project: Path, monkeypatch):
     assert f"TASK_ID: {task_id}" in out
     assert "EPIC_ID:" in out
     assert "PLANCTL: planctl" in out
-    assert "REVIEW_MODE: none" in out
     assert "CONTEXT:" in out
     assert "app/foo.py" in out  # from git state
     assert "Files changed:" in out
@@ -120,7 +119,6 @@ def test_worker_resume_json_envelope(project: Path, monkeypatch):
     assert "prompt" in payload
     assert f"TASK_ID: {task_id}" in payload["prompt"]
     assert "PLANCTL: planctl" in payload["prompt"]
-    assert "REVIEW_MODE: none" in payload["prompt"]
     assert "reopened" not in payload
 
 

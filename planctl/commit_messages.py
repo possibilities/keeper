@@ -48,18 +48,12 @@ VERB_TEMPLATES: dict[str, Callable[[str, str | None], str]] = {
     "rm-dep": lambda t, d: _subject("rm-dep", t, d),
     "set-branch": lambda t, d: _subject("set-branch", t, d),
     "set-title": lambda t, d: _subject("set-title", t, d),
-    "set-plan-review-status": lambda t, d: _subject("set-plan-review-status", t, d),
-    "set-work-review-status": lambda t, d: _subject("set-work-review-status", t, d),
-    "set-epic-review-status": lambda t, d: _subject("set-epic-review-status", t, d),
     # Task verbs
     # fn-565 removed `task-create` / `set-spec` / `set-deps` (and the `dep-add`
     # dep verb below) — the create/rewrite paths ride `scaffold` / `refine-apply`.
     "set-description": lambda t, d: _subject("set-description", t, d),
     "set-acceptance": lambda t, d: _subject("set-acceptance", t, d),
     "reset": lambda t, d: _subject("reset", t, d),
-    "task-set-work-review-status": lambda t, d: _subject(
-        "task-set-work-review-status", t, d
-    ),
     "claim": lambda t, d: _subject("claim", t, d),
     "block": lambda t, d: _subject("block", t, d),
     "done": lambda t, d: _subject("done", t, d),

@@ -31,7 +31,7 @@ Validate `$ARGUMENTS` before any shell interpolation (injection guard).
 Accepted pattern: `^fn-\d+(-[a-z0-9-]+)?$`
 
 - **Empty `$ARGUMENTS`:** ask *"which epic should I close? pass the epic id (`fn-N-slug`)."* Wait for reply, re-enter Phase 1.
-- **`$ARGUMENTS` matches `^fn-\d+(-[a-z0-9-]+)?\.\d+`** (task id): error — *"`close` operates on epics only. for a single-task audit use `/plan:review-quality <task_id>`."* Stop.
+- **`$ARGUMENTS` matches `^fn-\d+(-[a-z0-9-]+)?\.\d+`** (task id): error — *"`close` operates on epics only. pass the parent epic id (`fn-N-slug`)."* Stop.
 - **`$ARGUMENTS` matches `^fn-\d+(-[a-z0-9-]+)?$`** (epic id): capture `epic_id`, proceed to Phase 2.
 - **Otherwise:** error — *"invalid id format. pass an epic id like `fn-7-add-auth`."* Stop.
 
@@ -170,11 +170,7 @@ schema — every finding object MUST include all required keys, including
 
 Re-parse each re-spawn's output through the same extract → strip → normalize → `json.loads` → schema-validate pipeline. On the first attempt that parses and validates, pin it as `verdict` and continue to Phase 6. Only after the 2-retry budget is exhausted do you fall through to the `needs_work` arms below.
 
-**On missing block, `json.JSONDecodeError`, or schema validation failure — after re-classify recovery is exhausted** (validate with `jsonschema.Draft202012Validator` against `apps/planctl/skills/close/classifier/schema.json`; use `jsonschema.exceptions.best_match()` for the schema-error message):
-
-```bash
-planctl epic set-epic-review-status <epic_id> --status needs_work
-```
+**On missing block, `json.JSONDecodeError`, or schema validation failure — after re-classify recovery is exhausted** (validate with `jsonschema.Draft202012Validator` against `apps/planctl/skills/close/classifier/schema.json`; use `jsonschema.exceptions.best_match()` for the schema-error message): halt without closing. No status stamp is written — the epic simply stays open (the absence of a `closer_done_at` stamp is the signal).
 
 Log the specific failure verbatim — one of *"verdict parse failed: no `<VERDICT_JSON>` block found in classifier output (3 attempts)"*, *"verdict JSON parse failed after 3 attempts: <error>"*, or *"verdict schema validation failed after 3 attempts: <best_match error message>"* — and stop. Note this is a classifier-output defect, not an epic defect: re-running `/plan:close <epic_id>` re-runs the audit from scratch (the Phase 7 guard makes re-run safe), but if the classifier keeps emitting malformed output its agent prompt / schema-conformance instructions are the thing to fix.
 
@@ -189,9 +185,7 @@ if verdict["fatal"]:
     ...
 ```
 
-```bash
-planctl epic set-epic-review-status <epic_id> --status needs_work
-```
+Halt without closing. No status stamp is written — the epic stays open (the absence of a `closer_done_at` stamp is the signal).
 
 Log: *"fatal finding: <verdict['fatal_reason']>"* and stop. Do NOT run `epic close`. Do NOT scaffold a follow-up. Fire NO commit seam. This is the only ship-block path.
 
@@ -439,7 +433,7 @@ Closed `<epic_id>`. Epic closed. Audited inline (split exception — see each ep
 Fatal halt (Phase 6 path):
 
 ```
-Halted `<epic_id>`. fatal finding: <verdict['fatal_reason']>. epic_review_status set to needs_work; epic NOT closed.
+Halted `<epic_id>`. fatal finding: <verdict['fatal_reason']>. epic NOT closed.
 ```
 
 The `## Audit decisions` table on each new epic (visible via `planctl cat <new_epic_id>`), plus the new epic's `depends_on_epics: ["<source>"]`, are the durable trace of what the audit decided and why — no write to the source spec.

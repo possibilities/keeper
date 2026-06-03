@@ -23,11 +23,6 @@ def _render_human(data: dict) -> str:
         lines.append(f"Priority: {p if p is not None else '-'}")
         deps = t.get("depends_on", [])
         lines.append(f"Dependencies: {', '.join(deps) if deps else '(none)'}")
-        wrs = t.get("work_review_status", "unknown")
-        lines.append(f"Work review: {wrs}")
-        wra = t.get("work_reviewed_at")
-        if wra:
-            lines.append(f"Work reviewed at: {wra}")
         target_repo = t.get("target_repo")
         if target_repo:
             lines.append(f"Target repo: {target_repo}")
@@ -50,21 +45,6 @@ def _render_human(data: dict) -> str:
         deps = e.get("depends_on_epics", [])
         if deps:
             lines.append(f"Epic deps: {', '.join(deps)}")
-        prs = e.get("plan_review_status", "unknown")
-        lines.append(f"Plan review: {prs}")
-        pra = e.get("plan_reviewed_at")
-        if pra:
-            lines.append(f"Plan reviewed at: {pra}")
-        wrs = e.get("work_review_status", "unknown")
-        lines.append(f"Work review: {wrs}")
-        wra = e.get("work_reviewed_at")
-        if wra:
-            lines.append(f"Work reviewed at: {wra}")
-        ers = e.get("epic_review_status", "unknown")
-        lines.append(f"Epic review: {ers}")
-        era = e.get("epic_reviewed_at")
-        if era:
-            lines.append(f"Epic reviewed at: {era}")
         primary_repo = e.get("primary_repo")
         if primary_repo:
             lines.append(f"Primary repo: {primary_repo}")
@@ -126,8 +106,6 @@ def run(args: SimpleNamespace) -> int:
                     "claim_note": merged.get("claim_note"),
                     "evidence": merged.get("evidence"),
                     "blocked_reason": merged.get("blocked_reason"),
-                    "work_review_status": merged.get("work_review_status", "unknown"),
-                    "work_reviewed_at": merged.get("work_reviewed_at"),
                     "target_repo": merged.get("target_repo"),
                     "snippets": merged.get("snippets", []),
                     "bundles": merged.get("bundles", []),
@@ -176,12 +154,6 @@ def run(args: SimpleNamespace) -> int:
                     "branch_name": epic_def.get("branch_name"),
                     "depends_on_epics": epic_def.get("depends_on_epics", []),
                     "spec_path": f"specs/{id_str}.md",
-                    "plan_review_status": epic_def.get("plan_review_status", "unknown"),
-                    "plan_reviewed_at": epic_def.get("plan_reviewed_at"),
-                    "work_review_status": epic_def.get("work_review_status", "unknown"),
-                    "work_reviewed_at": epic_def.get("work_reviewed_at"),
-                    "epic_review_status": epic_def.get("epic_review_status", "unknown"),
-                    "epic_reviewed_at": epic_def.get("epic_reviewed_at"),
                     "primary_repo": epic_def.get("primary_repo"),
                     "touched_repos": epic_def.get("touched_repos"),
                     "snippets": epic_def.get("snippets", []),

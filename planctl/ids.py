@@ -116,7 +116,7 @@ def scan_epic_ids_global(project_paths) -> dict[str, Path]:
 
     Walks each project's ``.planctl/epics/*.json`` and ``.planctl/specs/fn-*.md``
     and returns ``{<bare_epic_id>: <project_path>}``. The bare id is the filename
-    without extension (``fn-12-add-plan-review-skill``). Used as a global-name
+    without extension (``fn-12-add-queue-skill``). Used as a global-name
     uniqueness check at allocation time so two projects can never mint the same
     full epic id, even though per-project numbering is independent.
 

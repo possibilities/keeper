@@ -67,8 +67,6 @@ def _make_untracked_epic_tree(
         "status": "open",
         "branch_name": epic_id,
         "depends_on_epics": [],
-        "plan_review_status": "unknown",
-        "plan_reviewed_at": None,
         "primary_repo": str(repo),
         "touched_repos": [str(repo)],
         "snippets": [],

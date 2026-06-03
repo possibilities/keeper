@@ -67,7 +67,7 @@ Top-level commands:
 
 Subcommands:
 
-- `epic`: `create`, `set-plan`, `set-branch`, `set-title`, `close`, `rm`, `ack`, `add-dep`, `rm-dep`, `set-plan-review-status`, `set-work-review-status`, `set-epic-review-status`
+- `epic`: `create`, `set-plan`, `set-branch`, `set-title`, `close`, `rm`, `ack`, `add-dep`, `rm-dep`
 - `task`: `create`, `set-description`, `set-acceptance`, `set-spec`, `reset`, `ack`, `set-deps`
 - `dep`: `add`
 - `worker`: `resume`
@@ -153,7 +153,7 @@ Four slash commands handle epic creation, refinement, the post-epic-close phase,
 | `/plan <request>` | Any new feature — spawns scouts, runs gap-analyst, full outer-loop quality pass. Use for anything non-trivial. |
 | `/plan:queue <subject>` | Single-task epic that jumps the queue (fn-595). Sets `queue_jump: true` on the `planctl_invocation` envelope — server-derived, immutable across event-log replay; keeperd projects `epics.queue_jump = 1` and stamps a `!`-prefixed `sort_path` so the epic sorts above all other root epics on the board. `queue_jump` is set skill-side, NOT via a CLI flag — there is no `--queue-jump` argument on `planctl scaffold`. Member of the `/plan:plan` family (not a job-launcher). Generated from `skill-templates/queue-defer.md.tmpl`. |
 | `/plan:defer <subject>` | Single-task epic without the priority jump (fn-595). Same shape as `/plan:queue` minus the `queue_jump` flag — sorts in normal epic-number order. Generated from the same shared template. Member of the `/plan:plan` family (not a job-launcher). |
-| `/plan:close <epic_id>` | After all tasks in an epic are done: spawn `quality-auditor` → spawn `classifier` subagent (parses `<VERDICT_JSON>` block) → branch on `fatal` (off the in-memory verdict) → `planctl epic close <epic_id>` (stamps `closer_done_at`). **fn-559**: the audit runs INLINE inside close before the irreversible close mutation — no `--audit-required` / `--no-audit-required` flag, no `auditor_done_at` stamp, no separate `/plan:audit` session. `fatal` is the only ship-block signal; the closed epic flips straight to `pending_approval` for the human ack. Halts without closing on fatal verdict or parse/schema failure; marks `epic_review_status needs_work` in those cases. The findings follow-up tree (when the inline audit produces one) is scaffolded as a normal epic — `epic.depends_on_epics: [<source_eid>]` carries the source-link, and the `scaffold` verb's inline auto-commit lands the tree. |
+| `/plan:close <epic_id>` | After all tasks in an epic are done: spawn `quality-auditor` → spawn `classifier` subagent (parses `<VERDICT_JSON>` block) → branch on `fatal` (off the in-memory verdict) → `planctl epic close <epic_id>` (stamps `closer_done_at`). **fn-559**: the audit runs INLINE inside close before the irreversible close mutation — no `--audit-required` / `--no-audit-required` flag, no `auditor_done_at` stamp, no separate `/plan:audit` session. `fatal` is the only ship-block signal; the closed epic flips straight to `pending_approval` for the human ack. Halts without closing on fatal verdict or parse/schema failure (no status stamp — the absence of a close is the signal). The findings follow-up tree (when the inline audit produces one) is scaffolded as a normal epic — `epic.depends_on_epics: [<source_eid>]` carries the source-link, and the `scaffold` verb's inline auto-commit lands the tree. |
 
 ## Help for Agents
 

@@ -646,10 +646,10 @@ marker.
 
 `scaffold` is intentionally NOT in `VALIDATION_RESTAMP_VERBS` — it mints
 a fresh epic and stamps the marker through its own scaffold-time path,
-not the restamp helper. `done`, `claim`, `block`, all
-`set-*-review-status`, `epic close`, ack verbs (runtime, not
-structural), and `epic invalidate` (peer of `validate`) are also out of
-the tuple. See the module docstring for the full exclusion list.
+not the restamp helper. `done`, `claim`, `block`, `epic close`, ack
+verbs (runtime, not structural), and `epic invalidate` (peer of
+`validate`) are also out of the tuple. See the module docstring for the
+full exclusion list.
 
 ### `validate --epic` stamp-then-commit asymmetry
 

@@ -32,7 +32,7 @@ The same critical directive appears at both the START and END of the classifier 
 
 | Tier | Meaning | Closer action |
 |------|---------|---------------|
-| `fatal` (bool) | Show-stopper for real users in production | Set `epic_review_status = needs_work`, halt, do NOT close |
+| `fatal` (bool) | Show-stopper for real users in production | Halt, do NOT close (no status stamp) |
 | `tier_0` | Ignored / advisory / theoretical / style | No action; `/plan:audit` does not vet |
 | `tier_1` | High-priority follow-up planning candidate; localized user-visible impact | No closer action; surfaces in `/plan:audit` |
 | `tier_2` | Scoped followup epic candidate; non-trivial user-visible improvement | No closer action; surfaces in `/plan:audit` |
@@ -75,7 +75,7 @@ The schema lives at `apps/planctl/skills/close/classifier/schema.json`. It is JS
 - All top-level fields required: `fatal`, `fatal_reason`, `tier_0`, `tier_1`, `tier_2`, `tier_3`
 - All Finding fields required: `id`, `title`, `summary`, `rationale`, `severity_reason`, `affected_paths`, `evidence`, `suggested_fix`
 
-The closer validates the extracted JSON with `jsonschema.Draft202012Validator` and uses `jsonschema.exceptions.best_match()` to surface actionable error messages. A schema validation failure is treated the same as a parse failure: `epic_review_status = needs_work`, halt.
+The closer validates the extracted JSON with `jsonschema.Draft202012Validator` and uses `jsonschema.exceptions.best_match()` to surface actionable error messages. A schema validation failure is treated the same as a parse failure: halt, do NOT close (no status stamp).
 
 ## Finding ID Stability
 

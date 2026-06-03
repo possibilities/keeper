@@ -196,21 +196,19 @@ def test_subject_via_verb_templates(planctl_git_repo):
     assert pc["subject"] == expected
 
 
-def test_subject_with_detail_via_verb_templates(planctl_git_repo):
-    """Verbs that pass detail= produce correct subject via VERB_TEMPLATES."""
+def test_subject_with_detail_formatting():
+    """A detail= argument is appended to the subject as ` — <detail>`."""
     from planctl.commit_messages import build_subject
 
-    r = _invoke(["epic", "create", "--title", "Detail subject test"])
-    assert r.exit_code == 0
-    epic_id = json.loads(r.output.strip())["epic"]["id"]
-
-    result = _invoke(["epic", "set-plan-review-status", epic_id, "--status", "ship"])
-    assert result.exit_code == 0
-    payload = json.loads(result.output.strip())
-    pc = payload["planctl_invocation"]
-
-    expected = build_subject("set-plan-review-status", epic_id, "ship")
-    assert pc["subject"] == expected
+    assert (
+        build_subject("set-branch", "fn-1-slug", "feat-x")
+        == "chore(planctl): set-branch fn-1-slug — feat-x"
+    )
+    # Newlines/control chars in detail are flattened to spaces.
+    assert (
+        build_subject("set-branch", "fn-1-slug", "feat\nx")
+        == "chore(planctl): set-branch fn-1-slug — feat x"
+    )
 
 
 # ---------------------------------------------------------------------------
