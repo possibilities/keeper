@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-688-epic-tombstone-guard-against-ghost",
   "bundles": [],
   "closer_done_at": "2026-06-03T19:17:54.093625Z",
@@ -19,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-03T19:17:54.093625Z"
+  "updated_at": "2026-06-03T19:18:36.319018Z"
 }
