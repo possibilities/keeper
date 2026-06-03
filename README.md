@@ -558,9 +558,15 @@ otherwise a `~/code/keeper` checkout move silently strands the wiring.
 
    ```kdl
    "file:/Users/you/code/keeper/plugin/zellij-bridge/keeper-zellij-bridge.wasm" {
-       allowed_permissions "ReadApplicationState"
+       ReadApplicationState
    }
    ```
+
+   The grant is the bare child-node NAME (`ReadApplicationState`), NOT
+   `allowed_permissions "ReadApplicationState"`. zellij's parser
+   (`PermissionCache::from_string`) reads each child node's *name* as a
+   `PermissionType` and ignores arguments — so the `allowed_permissions`
+   arg form parses to an EMPTY grant and the plugin silently no-ops.
 
    The URL MUST byte-match the one in `config.kdl` above (and the
    output of `keeper plugin-path`) — zellij keys permissions by exact
