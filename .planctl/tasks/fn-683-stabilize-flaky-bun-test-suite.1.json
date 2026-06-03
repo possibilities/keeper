@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-06-02T22:27:31.432124Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Reap leaked victim-launcher processes",
-  "updated_at": "2026-06-03T00:26:22.404878Z",
+  "updated_at": "2026-06-03T00:28:07.772310Z",
   "worker_done_at": "2026-06-03T00:26:22.404878Z"
 }
