@@ -38,6 +38,10 @@ from .conftest import (
     _git_head_sha,
 )
 
+# This module IS the commit-machinery unit test — it runs real git, opting out
+# of conftest's default auto-commit mock.
+pytestmark = pytest.mark.real_git
+
 # ---------------------------------------------------------------------------
 # now_iso() microsecond precision
 # ---------------------------------------------------------------------------

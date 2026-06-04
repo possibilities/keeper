@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 
+import pytest
 from click.testing import CliRunner
 from planctl.cli import cli
 
@@ -91,6 +92,7 @@ def test_queue_jump_false_to_true_sets_flag_and_envelope(tmp_path, monkeypatch):
     assert inv.get("queue_jump") is True
 
 
+@pytest.mark.real_git
 def test_queue_jump_already_true_short_circuits_readonly(tmp_path, monkeypatch):
     """already true: read-only short-circuit — no JSON rewrite, no mutating commit."""
     _create_project(tmp_path, monkeypatch)

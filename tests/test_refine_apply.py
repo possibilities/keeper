@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from click.testing import CliRunner
 from planctl.cli import cli
 
@@ -873,6 +874,7 @@ add_tasks:
     assert baseline_spec3.exists()
 
 
+@pytest.mark.real_git
 def test_refine_apply_lock_disjoint_from_commit_lock(planctl_git_repo, monkeypatch):
     """fn-629 task .2 acceptance (fn-640 retune): the ``_epic_id_lock``
     (id-allocation, sub-millisecond) is RELEASED before the auto-commit's git

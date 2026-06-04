@@ -12,6 +12,42 @@ from click.testing import CliRunner
 from planctl.cli import cli
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_git: exercise the real .planctl/ auto-commit (status+add+commit+"
+        "rev-parse). Default tests no-op it — git is tested only where asserted.",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _mock_autocommit(request, monkeypatch):
+    """No-op the ``.planctl/`` auto-commit unless a test opts into real git.
+
+    The commit-at-mutation-boundary machinery is the product, so it IS tested
+    for real — but only in the modules that assert on git state (marked
+    ``real_git``: ``test_commit``/``test_emit``/``test_init`` and friends).
+    Every other test merely needs the verb to succeed and the on-disk
+    ``.planctl/`` files to exist (planctl reads state from disk, never from
+    HEAD), so the real status+add+commit+rev-parse cycle is pure overhead —
+    ~4 git subprocesses per mutating verb.
+
+    Mocking (rather than a production bypass flag) keeps the speed-up entirely
+    in the harness: prod code carries no test-only branch. The stub mirrors the
+    real return contract (``None`` for a no-op payload, a sentinel sha
+    otherwise) so truthiness checks still behave.
+    """
+    if request.node.get_closest_marker("real_git"):
+        return
+
+    import planctl.commit as _commit
+
+    def _noop(payload: dict) -> str | None:
+        return None if not payload.get("files") else "0" * 40
+
+    monkeypatch.setattr(_commit, "auto_commit_from_invocation", _noop)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _git_global_config(tmp_path_factory):
     """Hoist the per-repo git config out of every fixture into one global file.

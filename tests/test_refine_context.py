@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
 from click.testing import CliRunner
 from planctl import run_refine_context
 from planctl.cli import cli
@@ -224,6 +225,7 @@ def test_run_directly_no_click_context(project):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_git
 class TestInvalidate:
     def test_invalidate_clears_marker_one_envelope_one_commit(self, project):
         """--invalidate clears last_validated_at and lands ONE commit."""

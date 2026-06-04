@@ -99,6 +99,7 @@ def _tracked(repo: Path, rel: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_git
 def test_rm_unlinks_full_artifact_set_and_commits(planctl_git_repo, monkeypatch):
     """Happy path: every artifact category vanishes and the auto-commit
     actually stages the deletions (HEAD shows them removed).
@@ -546,6 +547,7 @@ def test_rm_commit_failure_emits_structured_envelope(planctl_git_repo, monkeypat
     assert obj["details"]["error"] == "git_commit"
 
 
+@pytest.mark.real_git
 def test_rm_no_lock_nesting(planctl_git_repo, monkeypatch):
     """fn-629 task .2 acceptance (fn-640 retune): epic rm doesn't take the
     ``_epic_id_lock`` at all (it's a delete verb, no id allocation). Since

@@ -5,9 +5,14 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 from planctl.cli import cli
 from planctl.run_init import CLAUDE_MD_CONTENT
+
+# init's self-commit is the unit under test here, so it runs real git, opting
+# out of conftest's default auto-commit mock.
+pytestmark = pytest.mark.real_git
 
 
 def _planctl_dir(project: Path) -> Path:

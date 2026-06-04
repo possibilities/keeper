@@ -35,6 +35,10 @@ from click.testing import CliRunner
 from planctl import commit as commit_module
 from planctl.cli import cli
 
+# This module asserts the emit()->commit seam lands real commits, so it opts
+# out of conftest's default auto-commit mock.
+pytestmark = pytest.mark.real_git
+
 _ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-emit-fixture"}
 
 
