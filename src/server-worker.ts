@@ -394,6 +394,287 @@ export interface SubState {
 }
 
 /**
+ * One cached query answer, keyed in {@link ResultMemo} by its full query
+ * signature (collection + resolved filter + sort + limit + offset) within a
+ * single `worldRev` window. Shared read-only across every connection issuing
+ * the same query at the same rev: the FIRST runs `runQuery` + ONE
+ * `JSON.stringify(rows)`, the rest reuse this entry.
+ *
+ * - `rows` is the decoded row array runQuery returned — treated READ-ONLY by
+ *   consumers (the per-conn SubState seed copies it via `new Set`/`new Map`,
+ *   so sharing is safe).
+ * - `rowsJson` is `JSON.stringify(rows)` computed ONCE; the per-conn result
+ *   line concatenates the result envelope around it (no re-serialize).
+ * - `total` / `token` / `where` mirror runQuery's `out` out-param so the
+ *   SubState membership baseline seeds without a re-read.
+ */
+interface ResultMemoEntry {
+  rows: Row[];
+  rowsJson: string;
+  total: number;
+  token: string;
+  where: ResolvedFilter;
+}
+
+/**
+ * Per-server-instance, single-`worldRev` result memo (fn-698). Owned in the
+ * `startServer` closure (like `conns`/`writerDb`) — NOT module-global — and
+ * threaded into `handleData` → `dispatchLine` as an optional trailing param so
+ * existing direct-`dispatchLine` tests (which omit it) keep the un-memoized
+ * path. Holds entries for exactly ONE `worldRev` at a time: the instant the
+ * read worldRev moves, `entries` is REPLACED with a fresh Map (clean reset —
+ * no stale-rev entry can survive), so a line stamped rev-N+1 can never carry
+ * rev-N rows. `entries` is capped at {@link MEMO_SIGNATURE_CAP} distinct
+ * signatures per rev window; once full a NEW signature runs un-memoized rather
+ * than evicting the already-cached hot board signature mid-burst.
+ */
+export interface ResultMemo {
+  worldRev: number;
+  entries: Map<string, ResultMemoEntry>;
+}
+
+/** Distinct-signature cap per worldRev window (fn-698). */
+const MEMO_SIGNATURE_CAP = 256;
+
+/** Allocate a fresh per-server-instance result memo (worldRev sentinel `-1`). */
+export function newResultMemo(): ResultMemo {
+  // worldRev: -1 — a real `reducer_state.last_event_id` is always >= 0, so the
+  // first query always trips the replace-on-mismatch reset and stamps the live
+  // rev. Avoids a special-case "empty memo" branch.
+  return { worldRev: -1, entries: new Map() };
+}
+
+/**
+ * Internal write-path sentinel for a pre-serialized result LINE (fn-698). NOT
+ * a wire-protocol frame and NOT a member of the `ServerFrame` union — it never
+ * crosses the socket as an object; `writeFrames` recognizes the `__line`
+ * brand and writes the carried string verbatim (it is already a complete
+ * NDJSON line, trailing `\n` included, byte-identical to
+ * `encodeFrame(runQuery(...))`). Every other frame type still routes through
+ * `encodeFrame`.
+ */
+export interface PreSerialized {
+  __line: string;
+}
+
+/** Narrow a dispatch return element to the pre-serialized sentinel. */
+function isPreSerialized(f: ServerFrame | PreSerialized): f is PreSerialized {
+  return typeof (f as PreSerialized).__line === "string";
+}
+
+/**
+ * Full query signature (fn-698 memo key) for a `query` frame against a known
+ * descriptor: `collection + WHERE clause + bound params + sortCol + dir +
+ * limit + offset`. The sort/dir/limit/offset resolution MIRRORS `runQuery`
+ * exactly (same `sortable` allowlist + default-dir rule + `clampLimit` +
+ * offset floor) so two frames that produce the same page produce the same key
+ * and two that page differently never collide. The resolved filter is built by
+ * the same `resolveFilter` map lookup runQuery uses (cheap — no SELECT). Unlike
+ * `diffTick`'s coalescing key (which DELIBERATELY omits sort/limit/offset
+ * because the membership COUNT ignores them), the memo's key INCLUDES them —
+ * two subs sharing a filter but paging differently must NOT share a result.
+ */
+function querySignature(
+  descriptor: CollectionDescriptor,
+  frame: QueryFrame,
+  where: ResolvedFilter,
+): string {
+  const sortCol =
+    frame.sort && descriptor.sortable.has(frame.sort.column)
+      ? frame.sort.column
+      : descriptor.defaultSort.column;
+  const dir =
+    frame.sort?.dir === "asc" || frame.sort?.dir === "desc"
+      ? frame.sort.dir
+      : sortCol === descriptor.defaultSort.column
+        ? descriptor.defaultSort.dir
+        : "asc";
+  const limit = clampLimit(frame.limit);
+  const offset =
+    typeof frame.offset === "number" && frame.offset > 0
+      ? Math.floor(frame.offset)
+      : 0;
+  return JSON.stringify([
+    descriptor.name,
+    where.clause,
+    where.params,
+    sortCol,
+    dir,
+    limit,
+    offset,
+  ]);
+}
+
+/**
+ * Build the per-connection {@link SubState} for a fresh `query` subscription.
+ * Factored out so the memo-hit path (fn-698) and the un-memoized fallback
+ * build it identically. `rows` is treated READ-ONLY — `new Set`/`new Map`
+ * COPY the membership/version maps, so a shared cached `Entry.rows` array is
+ * safe to seed from concurrently.
+ */
+function seedSubState(
+  descriptor: CollectionDescriptor,
+  collection: string,
+  rows: Row[],
+  baseline: { where: ResolvedFilter; total: number; token: string },
+): SubState {
+  return {
+    collection,
+    watched: new Set(rows.map((r) => String(r[descriptor.pk]))),
+    lastSent: new Map(
+      rows.map((r) => [
+        String(r[descriptor.pk]),
+        r[descriptor.version] as number,
+      ]),
+    ),
+    where: baseline.where,
+    lastTotal: baseline.total,
+    lastToken: baseline.token,
+    // Seeded to 0 so the FIRST membership move on this fresh sub always
+    // emits (Date.now() - 0 >= META_MIN_INTERVAL_MS). The throttle only
+    // bites on the SECOND+ move within the interval.
+    lastMetaEmittedAt: 0,
+  };
+}
+
+/**
+ * fn-698 memo serve path. Returns the dispatch frames (a single
+ * {@link PreSerialized} result line) when the query resolves to a registered
+ * collection — seeding the per-conn SubState off the (possibly shared) cached
+ * Entry — or `null` to signal "fall through to the un-memoized path"
+ * (unknown collection: let runQuery mint the `unknown_collection` error so
+ * behavior is identical, never cached).
+ *
+ * Single-`worldRev` discipline: if the read `worldRev` differs from the
+ * holder's, REPLACE `entries` with a fresh Map and stamp the new rev FIRST —
+ * no stale-rev entry survives, so a line stamped rev-N+1 can never carry
+ * rev-N rows. On a MISS the entry is built (subject to the distinct-signature
+ * cap) and the rows serialized ONCE; on a HIT the rows/total/token are served
+ * with ZERO SELECT and ZERO countAndToken.
+ *
+ * Throwing is acceptable here — the caller wraps the whole block in try/catch
+ * and degrades to the un-memoized path.
+ */
+function serveFromMemo(
+  db: Database,
+  conn: ConnState,
+  frame: QueryFrame,
+  worldRev: number,
+  memo: ResultMemo,
+): (ServerFrame | PreSerialized)[] | null {
+  const descriptor = getCollection(frame.collection);
+  if (!descriptor) {
+    // Unknown collection: not memoizable — let the un-memoized path mint the
+    // `unknown_collection` ErrorFrame so the response is byte-identical.
+    return null;
+  }
+
+  // Replace-on-worldRev-mismatch reset: a clean wipe, so no entry keyed under a
+  // prior rev can ever be served. Stamp the new rev BEFORE any entry write.
+  if (memo.worldRev !== worldRev) {
+    memo.entries = new Map();
+    memo.worldRev = worldRev;
+  }
+
+  // Resolve the filter the same way runQuery does (cheap map lookup, no SELECT)
+  // to build the signature key. On a miss runQuery re-resolves the identical
+  // filter into `seed.where`, which is what the SubState baseline records.
+  const where = resolveFilter(descriptor, frame.filter);
+  const sigKey = querySignature(descriptor, frame, where);
+
+  let entry = memo.entries.get(sigKey);
+  if (!entry) {
+    // Distinct-signature cap: when the rev window already holds the max number
+    // of distinct signatures, a NEW signature runs un-memoized rather than
+    // evicting an already-cached (hot) signature mid-burst. 21 identical
+    // queries are ONE signature, so the hot board query is never shed.
+    if (memo.entries.size >= MEMO_SIGNATURE_CAP) {
+      if (TRACE)
+        srvTs(
+          `op=memo stage=cap-skip col=${descriptor.name} size=${memo.entries.size}`,
+        );
+      return null;
+    }
+    // MISS: one runQuery + one JSON.stringify, cached under the read worldRev.
+    const seed = {} as { where: ResolvedFilter; total: number; token: string };
+    const out = runQuery(db, worldRev, frame, seed);
+    if (out.type !== "result") {
+      // A known descriptor returning a non-result is unexpected (runQuery only
+      // errors on unknown_collection, handled above); don't cache — fall
+      // through so the un-memoized path returns the same frame.
+      return null;
+    }
+    const rowsJson = JSON.stringify(out.rows);
+    entry = {
+      rows: out.rows,
+      rowsJson,
+      total: seed.total,
+      token: seed.token,
+      where: seed.where,
+    };
+    memo.entries.set(sigKey, entry);
+    if (TRACE)
+      srvTs(
+        `op=memo stage=miss col=${descriptor.name} rows=${out.rows.length} serialize-once bytes=${rowsJson.length} sigs=${memo.entries.size}`,
+      );
+  } else {
+    if (TRACE)
+      srvTs(
+        `op=memo stage=hit col=${descriptor.name} rows=${entry.rows.length} bytes=${entry.rowsJson.length}`,
+      );
+  }
+
+  // Seed the per-conn subscription off the cached (shared, read-only) Entry —
+  // `new Set`/`new Map` copy, so sharing the rows array is safe.
+  const subId = frame.id ?? null;
+  conn.subs.set(
+    subId,
+    seedSubState(descriptor, descriptor.name, entry.rows, {
+      where: entry.where,
+      total: entry.total,
+      token: entry.token,
+    }),
+  );
+
+  // Per-conn pre-serialized line: the result envelope concatenated around the
+  // ONE shared `rowsJson` — byte-identical to `encodeFrame(runQuery(...))`.
+  const line = buildResultLine(
+    frame.id,
+    descriptor.name,
+    worldRev,
+    entry.total,
+    entry.rowsJson,
+  );
+  return [{ __line: line }];
+}
+
+/**
+ * Hand-concatenate a `result` LINE byte-identical to
+ * `encodeFrame(runQuery(...))`. The insertion key order MUST match the
+ * ResultFrame object literal runQuery builds: `type, [id], collection, rev,
+ * total, rows`. `id` and `collection` are `JSON.stringify`-d (typed `string`,
+ * not guaranteed escape-free); `rev`/`total` are unquoted numbers;
+ * `rowsJson` is the UNMODIFIED `JSON.stringify(rows)` output spliced in around
+ * the `"rows":` key. Trailing `\n` mirrors `encodeFrame`.
+ */
+function buildResultLine(
+  id: string | undefined,
+  collection: string,
+  rev: number,
+  total: number,
+  rowsJson: string,
+): string {
+  const idSeg = id !== undefined ? `,"id":${JSON.stringify(id)}` : "";
+  return (
+    `{"type":"result"${idSeg}` +
+    `,"collection":${JSON.stringify(collection)}` +
+    `,"rev":${rev}` +
+    `,"total":${total}` +
+    `,"rows":${rowsJson}}\n`
+  );
+}
+
+/**
  * Per-connection state, carried on `socket.data` (typed via the
  * `Bun.listen<ConnState>` generic).
  *
@@ -674,6 +955,12 @@ function pkFilterKey(descriptor: CollectionDescriptor): string | undefined {
  * and the result's `total` and the subscription's seeded `lastTotal`/`lastToken`
  * (see `runSubscription`) come from one snapshot. The optional `out` collects
  * the resolved filter + count so the caller seeds ConnState without a re-read.
+ *
+ * `runQuery` itself is unchanged by fn-698: the dispatch call site wraps it in
+ * the per-worldRev result memo (see `serveFromMemo`) so N identical queries at
+ * one `worldRev` collapse to ONE `runQuery` call (one SELECT + one serialize),
+ * the rest served from the cached entry — `runQuery` runs exactly once per
+ * (signature, worldRev) miss.
  */
 export function runQuery(
   db: Database,
@@ -1046,6 +1333,13 @@ export interface DispatchAsyncCtx {
  * An async-RPC frame arriving without `asyncCtx` returns `unknown_method`
  * (the dispatcher cannot route it to the async registry without the
  * bridge); this keeps the legacy sync-only test surface unchanged.
+ *
+ * fn-698: when a {@link ResultMemo} is threaded in (the worker passes the
+ * per-server-instance memo; direct-dispatch callers omit it), an identical
+ * `query` at the same `worldRev` is served from the memo as a single
+ * {@link PreSerialized} result line. The overload reflects this: WITHOUT a
+ * memo the return is the plain `ServerFrame[]` (no pre-serialized element can
+ * appear), so the legacy direct-dispatch test surface narrows unchanged.
  */
 export function dispatchLine(
   db: Database,
@@ -1053,7 +1347,23 @@ export function dispatchLine(
   line: string,
   writerDb?: Database,
   asyncCtx?: DispatchAsyncCtx,
-): ServerFrame[] {
+): ServerFrame[];
+export function dispatchLine(
+  db: Database,
+  conn: ConnState,
+  line: string,
+  writerDb: Database | undefined,
+  asyncCtx: DispatchAsyncCtx | undefined,
+  memo: ResultMemo,
+): (ServerFrame | PreSerialized)[];
+export function dispatchLine(
+  db: Database,
+  conn: ConnState,
+  line: string,
+  writerDb?: Database,
+  asyncCtx?: DispatchAsyncCtx,
+  memo?: ResultMemo,
+): (ServerFrame | PreSerialized)[] {
   if (line.trim().length === 0) {
     return []; // blank keep-alive line — ignore
   }
@@ -1089,6 +1399,30 @@ export function dispatchLine(
         ];
       }
       const worldRev = readWorldRev(db);
+
+      // fn-698 result memo: when N connections issue an identical query at the
+      // same worldRev, share ONE runQuery + ONE JSON.stringify and fan out a
+      // per-conn PRE-SERIALIZED result line. The whole block is wrapped so any
+      // failure DEGRADES to today's un-memoized runQuery + ResultFrame path
+      // (`dispatchLine` is no-self-heal — it must never throw). Only attempted
+      // when a memo was threaded in (the worker passes it; direct-dispatch
+      // tests omit it).
+      if (memo) {
+        try {
+          const memoResult = serveFromMemo(db, conn, frame, worldRev, memo);
+          if (memoResult) return memoResult;
+        } catch (err) {
+          // Memo path bug → fall through to the un-memoized path below; never
+          // let a memo throw kill the connection.
+          if (TRACE)
+            srvTs(
+              `op=memo stage=throw col=${String(frame.collection)} err=${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+        }
+      }
+
       // `seed` collects the resolved filter + count from the SAME read that
       // produced the result's `total`, so the result→first-tick boundary emits
       // no spurious `meta`. (The page-read-vs-count-read snapshot race is
@@ -1098,6 +1432,9 @@ export function dispatchLine(
         total: number;
         token: string;
       };
+      // runQuery is unchanged; the memo (when present) wraps THIS call so
+      // repeated identical queries within a worldRev collapse to one SELECT +
+      // one serialize. This is the un-memoized fallback path.
       const out = runQuery(db, worldRev, frame, seed);
       if (out.type !== "result") {
         // unknown_collection (or any error): do NOT mutate the subscription.
@@ -1113,24 +1450,10 @@ export function dispatchLine(
       // subscription" semantic). Id-keyed subs replace per-id and otherwise
       // coexist with every other sub on this connection.
       const subId = frame.id ?? null;
-      const subState: SubState = {
-        collection: out.collection,
-        watched: new Set(out.rows.map((r) => String(r[descriptor.pk]))),
-        lastSent: new Map(
-          out.rows.map((r) => [
-            String(r[descriptor.pk]),
-            r[descriptor.version] as number,
-          ]),
-        ),
-        where: seed.where,
-        lastTotal: seed.total,
-        lastToken: seed.token,
-        // Seeded to 0 so the FIRST membership move on this fresh sub always
-        // emits (Date.now() - 0 >= META_MIN_INTERVAL_MS). The throttle only
-        // bites on the SECOND+ move within the interval.
-        lastMetaEmittedAt: 0,
-      };
-      conn.subs.set(subId, subState);
+      conn.subs.set(
+        subId,
+        seedSubState(descriptor, out.collection, out.rows, seed),
+      );
       return [out];
     }
     case "unsubscribe": {
@@ -1345,6 +1668,18 @@ export interface Writable {
 const encoder = new TextEncoder();
 
 /**
+ * Encode one dispatch element to its NDJSON line. A {@link PreSerialized}
+ * sentinel (fn-698) is written VERBATIM — its `__line` is already a complete
+ * NDJSON line, byte-identical to `encodeFrame` of the same ResultFrame, so it
+ * skips the re-stringify. Every other frame routes through `encodeFrame`. Used
+ * at BOTH `writeFrames` encode sites (fresh + backpressure pending-append) so
+ * a re-encode never re-stringifies a large cached rows blob.
+ */
+function encodeFrameOrLine(f: ServerFrame | PreSerialized): string {
+  return isPreSerialized(f) ? f.__line : encodeFrame(f);
+}
+
+/**
  * Best-effort collection label for the `op=writeFrames` trace line. Most
  * server-emit batches carry one collection across all frames (a `runQuery`
  * result, a per-collection patch fanout, a meta emit); for frames that don't
@@ -1353,7 +1688,7 @@ const encoder = new TextEncoder();
  * frames — no socket access, so it stays safe regardless of which sub the
  * batch belongs to.
  */
-function firstFrameCollection(frames: ServerFrame[]): string {
+function firstFrameCollection(frames: (ServerFrame | PreSerialized)[]): string {
   const first = frames[0] as { collection?: unknown } | undefined;
   return first && typeof first.collection === "string" ? first.collection : "?";
 }
@@ -1368,7 +1703,10 @@ function firstFrameCollection(frames: ServerFrame[]): string {
  * If a `pending` write is already stashed, the new frames are appended to it
  * rather than racing ahead — preserves frame order on the wire.
  */
-export function writeFrames(sock: Writable, frames: ServerFrame[]): void {
+export function writeFrames(
+  sock: Writable,
+  frames: (ServerFrame | PreSerialized)[],
+): void {
   if (frames.length === 0 && !sock.data.pending) {
     return;
   }
@@ -1379,14 +1717,14 @@ export function writeFrames(sock: Writable, frames: ServerFrame[]): void {
     const tail = sock.data.pending.bytes.subarray(sock.data.pending.offset);
     const extra =
       frames.length > 0
-        ? encoder.encode(frames.map((f) => encodeFrame(f)).join(""))
+        ? encoder.encode(frames.map(encodeFrameOrLine).join(""))
         : new Uint8Array(0);
     buf = new Uint8Array(tail.length + extra.length);
     buf.set(tail, 0);
     buf.set(extra, tail.length);
     offset = 0;
   } else {
-    buf = encoder.encode(frames.map((f) => encodeFrame(f)).join(""));
+    buf = encoder.encode(frames.map(encodeFrameOrLine).join(""));
     offset = 0;
   }
 
@@ -1936,6 +2274,13 @@ export function startServer(
   // Writable so diffTick/writeFrames compose).
   const conns = new Set<Writable>();
 
+  // Per-server-instance result memo (fn-698): N connections issuing an
+  // identical query at the same worldRev share ONE runQuery + ONE serialize and
+  // fan out per-conn pre-serialized result lines. Owned here (not module-global)
+  // so a second server instance in-process never cross-contaminates; threaded
+  // into handleData → dispatchLine on every inbound chunk.
+  const memo = newResultMemo();
+
   const listener = Bun.listen<ConnState>({
     unix: sockPath,
     socket: {
@@ -1949,7 +2294,7 @@ export function startServer(
         const id = socket.data.id ?? -1;
         if (TRACE) srvTs(`conn ${id} data chunk=${chunk.length}`);
         const t0 = Date.now();
-        handleData(db, socket, chunk, writerDb, bridge);
+        handleData(db, socket, chunk, writerDb, bridge, memo);
         const dur = Date.now() - t0;
         if (dur >= 5) {
           if (TRACE) srvTs(`conn ${id} handleData duration=${dur}ms`);
@@ -2007,8 +2352,9 @@ function handleData(
   db: Database,
   socket: import("bun").Socket<ConnState>,
   chunk: Buffer,
-  writerDb?: Database,
-  bridge?: ReplayBridge,
+  writerDb: Database | undefined,
+  bridge: ReplayBridge | undefined,
+  memo: ResultMemo,
 ): void {
   const w = socket as unknown as Writable;
   let lines: string[];
@@ -2045,7 +2391,7 @@ function handleData(
     : undefined;
 
   for (const line of lines) {
-    let frames: ServerFrame[];
+    let frames: (ServerFrame | PreSerialized)[];
     // DEBUG: time each dispatchLine so we can spot a slow query / RPC.
     const _dispatchStart = Date.now();
     let _frameType = "unknown";
@@ -2062,7 +2408,7 @@ function handleData(
       // dispatchLine itself will surface the bad_frame; just log unknown.
     }
     try {
-      frames = dispatchLine(db, socket.data, line, writerDb, asyncCtx);
+      frames = dispatchLine(db, socket.data, line, writerDb, asyncCtx, memo);
     } catch (err) {
       // Defensive: dispatchLine is contracted not to throw, but a DB hiccup
       // mid-query shouldn't kill the connection.

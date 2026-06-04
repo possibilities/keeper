@@ -1011,7 +1011,16 @@ loop's convergence tick) emits the latest state. The throttle lives on
 share one window; it gates ONLY the meta pass — the patch pass above stays
 immediate. This coalesces a fold burst's ~21-subscriber refetch storm into
 fewer rounds without ever delaying a cell patch or losing the final membership
-state.
+state. The query-ANSWER seam coalesces the same way (fn-698): a
+per-server-instance, single-`worldRev` result memo means N connections issuing
+an identical `query` (same collection + resolved filter + sort + limit +
+offset) at the same `worldRev` run ONE `runQuery` SELECT + ONE
+`JSON.stringify(rows)` between them, then each connection gets a pre-serialized
+`result` line assembled by concatenating its own envelope (`id`/`rev`/`total`)
+around the shared `rows` blob — byte-identical to `encodeFrame`, no
+wire-protocol change; the memo's `entries` map is replaced wholesale the
+instant `worldRev` advances, and any memo-path throw degrades to the
+un-memoized `runQuery` + `encodeFrame` path.
 
 A **third** Worker thread is the transcript-title producer: it watches the
 external transcript tree (the `claude_projects_root` from

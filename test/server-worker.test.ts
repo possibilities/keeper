@@ -31,14 +31,15 @@ import {
   type Row,
 } from "../src/collections";
 import { openDb } from "../src/db";
-import type {
-  ErrorFrame,
-  FilterValue,
-  MetaFrame,
-  PatchFrame,
-  ResultFrame,
-  RpcResultFrame,
-  ServerFrame,
+import {
+  type ErrorFrame,
+  encodeFrame,
+  type FilterValue,
+  type MetaFrame,
+  type PatchFrame,
+  type ResultFrame,
+  type RpcResultFrame,
+  type ServerFrame,
 } from "../src/protocol";
 import {
   ASYNC_RPC_REGISTRY,
@@ -52,8 +53,11 @@ import {
   isPidAlive,
   LockHeldError,
   META_MIN_INTERVAL_MS,
+  newResultMemo,
+  type PreSerialized,
   pollLoop,
   type ReplayBridge,
+  type ResultMemo,
   RPC_REGISTRY,
   registerAsyncRpc,
   registerRpc,
@@ -2651,4 +2655,420 @@ test("KEEPER_TRACE_FRAME_BYTES: lower threshold emits writeFrames lines for smal
   const lines = stderr.split("\n").filter((l) => l.includes("op=writeFrames"));
   expect(lines.length).toBe(1);
   expect(lines[0]).toMatch(/bytes=\d+ frames=1/);
+});
+
+// ---------------------------------------------------------------------------
+// fn-698 — per-worldRev result memo + pre-serialized fan-out
+// ---------------------------------------------------------------------------
+
+/** Seed one epic with non-trivial JSON-column content (`tasks`, `epic_links`-
+ *  via `job_links`). The jsonColumn round-trip is the riskiest byte-fidelity
+ *  case — a `tasks` array decoded then re-serialized must match `encodeFrame`. */
+function seedEpic(
+  db: Database,
+  epic_id: string,
+  opts: Partial<{
+    epic_number: number;
+    last_event_id: number;
+    tasks: unknown[];
+    job_links: unknown[];
+    status: string;
+    sort_path: string;
+  }> = {},
+): void {
+  db.query(
+    `INSERT INTO epics (
+       epic_id, epic_number, title, project_dir, status, last_event_id,
+       updated_at, tasks, depends_on_epics, jobs, job_links, sort_path,
+       created_by_closer_of
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?, ?, NULL)`,
+  ).run(
+    epic_id,
+    opts.epic_number ?? 1,
+    `title-${epic_id}`,
+    "/repo",
+    opts.status ?? "open",
+    opts.last_event_id ?? 0,
+    1,
+    JSON.stringify(opts.tasks ?? []),
+    JSON.stringify(opts.job_links ?? []),
+    opts.sort_path ?? "000001",
+  );
+}
+
+/** Narrow + unwrap the single pre-serialized line a memo serve returns. */
+function asLine(frames: (ServerFrame | PreSerialized)[]): string {
+  expect(frames.length).toBe(1);
+  const f = frames[0] as PreSerialized;
+  if (typeof f.__line !== "string") {
+    throw new Error(`expected pre-serialized __line, got ${JSON.stringify(f)}`);
+  }
+  return f.__line;
+}
+
+test("fn-698 byte-fidelity: epics (jsonColumns) line === encodeFrame(runQuery) — id present", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1", {
+    last_event_id: 10,
+    tasks: [{ id: "fn-1.1", title: "t1", jobs: [{ job_id: "j1" }] }],
+    job_links: [{ from: "fn-1", to: "fn-2", kind: "refiner" }],
+  });
+  setWorldRev(db, 42);
+
+  const frame = { type: "query" as const, collection: "epics", id: "sub-A" };
+  const reference = encodeFrame(asResult(runQuery(db, 42, frame)));
+
+  const conn = newConn();
+  const memo = newResultMemo();
+  const line = asLine(
+    dispatchLine(db, conn, JSON.stringify(frame), db, undefined, memo),
+  );
+  expect(line).toBe(reference);
+  db.close();
+});
+
+test("fn-698 byte-fidelity: epics line === encodeFrame(runQuery) — id absent", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1", {
+    last_event_id: 10,
+    tasks: [{ id: "fn-1.1", title: "t1" }],
+  });
+  setWorldRev(db, 7);
+
+  const frame = { type: "query" as const, collection: "epics" };
+  const reference = encodeFrame(asResult(runQuery(db, 7, frame)));
+
+  const conn = newConn();
+  const memo = newResultMemo();
+  const line = asLine(
+    dispatchLine(db, conn, JSON.stringify(frame), db, undefined, memo),
+  );
+  expect(line).toBe(reference);
+  // No envelope `id` segment when the frame carried none: the line opens
+  // straight into `"collection":` after `"type":"result"` (a row's own nested
+  // `"id":` lives later inside `rows`, so we anchor on the envelope prefix).
+  expect(line.startsWith('{"type":"result","collection":')).toBe(true);
+  db.close();
+});
+
+test("fn-698 byte-fidelity: jobs (plain collection) line === encodeFrame(runQuery)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { created_at: 30, last_event_id: 3 });
+  seedJob(db, "b", { created_at: 10, last_event_id: 1 });
+  setWorldRev(db, 99);
+
+  const frame = { type: "query" as const, collection: "jobs", id: "jq" };
+  const reference = encodeFrame(asResult(runQuery(db, 99, frame)));
+
+  const conn = newConn();
+  const memo = newResultMemo();
+  const line = asLine(
+    dispatchLine(db, conn, JSON.stringify(frame), db, undefined, memo),
+  );
+  expect(line).toBe(reference);
+  db.close();
+});
+
+test("fn-698 byte-fidelity: empty rows line === encodeFrame(runQuery)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  // No epics seeded → empty filtered set.
+  setWorldRev(db, 5);
+
+  const frame = { type: "query" as const, collection: "epics", id: "empty" };
+  const reference = encodeFrame(asResult(runQuery(db, 5, frame)));
+  expect(JSON.parse(reference.trim()).rows).toEqual([]);
+
+  const conn = newConn();
+  const memo = newResultMemo();
+  const line = asLine(
+    dispatchLine(db, conn, JSON.stringify(frame), db, undefined, memo),
+  );
+  expect(line).toBe(reference);
+  db.close();
+});
+
+test("fn-698 single-flight: N identical-signature queries → ONE runQuery + ONE stringify", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  for (let i = 0; i < 5; i++) {
+    seedEpic(db, `fn-${i}`, {
+      epic_number: i,
+      last_event_id: i,
+      sort_path: String(i).padStart(6, "0"),
+      tasks: [{ id: `fn-${i}.1`, title: `t${i}` }],
+    });
+  }
+  setWorldRev(db, 100);
+
+  // Spy on Database.prepare to count the page SELECTs runQuery issues. The
+  // page SELECT carries `LIMIT ? OFFSET ?` — distinctive vs countAndToken.
+  const proto = Object.getPrototypeOf(db) as { prepare: Database["prepare"] };
+  const realPrepare = proto.prepare;
+  let pageSelects = 0;
+  proto.prepare = function (this: Database, sql: string, ...rest: unknown[]) {
+    if (/FROM epics/.test(sql) && /LIMIT \? OFFSET \?/.test(sql)) pageSelects++;
+    // @ts-expect-error variadic passthrough to the real prepare
+    return realPrepare.call(this, sql, ...rest);
+  } as Database["prepare"];
+
+  // Reference once (un-memoized) BEFORE installing the memo, then reset the
+  // counter so we count only the memo path's SELECTs.
+  const frame = (id: string) => ({
+    type: "query" as const,
+    collection: "epics",
+    id,
+  });
+  const reference = encodeFrame(
+    asResult(
+      runQuery(db, 100, { type: "query", collection: "epics", id: "ref" }),
+    ),
+  ).replace('"id":"ref"', '"id":"PLACEHOLDER"');
+  pageSelects = 0;
+
+  try {
+    const memo = newResultMemo();
+    const lines: string[] = [];
+    for (let i = 0; i < 21; i++) {
+      const conn = newConn();
+      const f = frame(`conn-${i}`);
+      lines.push(
+        asLine(dispatchLine(db, conn, JSON.stringify(f), db, undefined, memo)),
+      );
+    }
+    // Exactly ONE page SELECT across all 21 identical-signature queries.
+    expect(pageSelects).toBe(1);
+    // Each conn's bytes match the reference (modulo its own id segment).
+    for (let i = 0; i < 21; i++) {
+      expect(lines[i].replace(`"id":"conn-${i}"`, '"id":"PLACEHOLDER"')).toBe(
+        reference,
+      );
+    }
+    // One cached entry — 21 identical = ONE signature.
+    expect(memo.entries.size).toBe(1);
+  } finally {
+    proto.prepare = realPrepare;
+  }
+  db.close();
+});
+
+test("fn-698 distinct signatures cache separately; the rows blob is shared per entry", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-0", {
+    epic_number: 0,
+    last_event_id: 0,
+    sort_path: "000000",
+  });
+  seedEpic(db, "fn-1", {
+    epic_number: 1,
+    last_event_id: 1,
+    sort_path: "000001",
+  });
+  setWorldRev(db, 3);
+
+  const memo = newResultMemo();
+  // Two DIFFERENT signatures (limit differs) → two entries.
+  dispatchLine(
+    db,
+    newConn(),
+    JSON.stringify({ type: "query", collection: "epics", limit: 1 }),
+    db,
+    undefined,
+    memo,
+  );
+  dispatchLine(
+    db,
+    newConn(),
+    JSON.stringify({ type: "query", collection: "epics", limit: 2 }),
+    db,
+    undefined,
+    memo,
+  );
+  expect(memo.entries.size).toBe(2);
+  db.close();
+});
+
+test("fn-698 worldRev advance replaces the cache; new line carries the new rev", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1", { last_event_id: 1, tasks: [{ id: "fn-1.1" }] });
+  setWorldRev(db, 10);
+
+  const memo = newResultMemo();
+  const frame = { type: "query" as const, collection: "epics", id: "s" };
+  const line10 = asLine(
+    dispatchLine(db, newConn(), JSON.stringify(frame), db, undefined, memo),
+  );
+  expect(memo.worldRev).toBe(10);
+  expect(JSON.parse(line10.trim()).rev).toBe(10);
+  const entryCountAt10 = memo.entries.size;
+  expect(entryCountAt10).toBe(1);
+
+  // Advance the world rev + a row → the cache must be replaced (clean reset)
+  // and the fresh serialize stamped rev 11 with the updated rows.
+  setWorldRev(db, 11);
+  db.query(
+    "UPDATE epics SET last_event_id = 5, tasks = ? WHERE epic_id = ?",
+  ).run(JSON.stringify([{ id: "fn-1.1" }, { id: "fn-1.2" }]), "fn-1");
+  const reference11 = encodeFrame(asResult(runQuery(db, 11, frame)));
+  const line11 = asLine(
+    dispatchLine(db, newConn(), JSON.stringify(frame), db, undefined, memo),
+  );
+  expect(memo.worldRev).toBe(11);
+  expect(line11).toBe(reference11);
+  expect(JSON.parse(line11.trim()).rev).toBe(11);
+  // The rev-10 entry did NOT survive — the Map was replaced, not augmented.
+  expect(memo.entries.size).toBe(1);
+  db.close();
+});
+
+test("fn-698 memo-throw degrades to the un-memoized result path; dispatchLine never throws", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1", { last_event_id: 1 });
+  setWorldRev(db, 8);
+
+  // A memo whose `entries.get` throws on access — simulates any memo-path bug.
+  const poison = newResultMemo();
+  Object.defineProperty(poison, "entries", {
+    get() {
+      throw new Error("boom");
+    },
+  });
+
+  const conn = newConn();
+  const frame = { type: "query" as const, collection: "epics", id: "x" };
+  let frames: (ServerFrame | PreSerialized)[] = [];
+  expect(() => {
+    frames = dispatchLine(
+      db,
+      conn,
+      JSON.stringify(frame),
+      db,
+      undefined,
+      poison as ResultMemo,
+    );
+  }).not.toThrow();
+  // Degraded to the un-memoized path → a real ResultFrame OBJECT, not a line.
+  const f = frames[0] as ServerFrame;
+  expect((f as unknown as PreSerialized).__line).toBeUndefined();
+  expect(f.type).toBe("result");
+  // And the subscription still seeded normally.
+  expect(anonSub(conn)).toBeUndefined(); // id-keyed sub, not anonymous
+  expect(subFor(conn, "x")?.collection).toBe("epics");
+  db.close();
+});
+
+test("fn-698 unknown collection through the memo path mints the same error (not cached)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  setWorldRev(db, 1);
+  const memo = newResultMemo();
+  const frames = dispatchLine(
+    db,
+    newConn(),
+    JSON.stringify({ type: "query", collection: "nope", id: "e" }),
+    db,
+    undefined,
+    memo,
+  );
+  const f = frames[0] as ErrorFrame;
+  expect(f.type).toBe("error");
+  expect(f.code).toBe("unknown_collection");
+  expect(memo.entries.size).toBe(0);
+  db.close();
+});
+
+test("fn-698 writeFrames writes a PreSerialized line verbatim — fresh path", () => {
+  const sock = fakeSock();
+  const line =
+    '{"type":"result","id":"z","collection":"jobs","rev":4,"total":0,"rows":[]}\n';
+  writeFrames(sock, [{ __line: line }]);
+  // fakeSock decodes each NDJSON line back to an object — the verbatim line
+  // round-trips to the same frame, proving the bytes hit the socket unchanged.
+  expect(sock.frames.length).toBe(1);
+  expect(sock.frames[0]).toEqual({
+    type: "result",
+    id: "z",
+    collection: "jobs",
+    rev: 4,
+    total: 0,
+    rows: [],
+  });
+});
+
+test("fn-698 writeFrames writes a PreSerialized line verbatim — backpressure pending-append branch", () => {
+  const sock = fakeSock();
+  // First, stash a pending tail by refusing the write.
+  sock.accept = false;
+  const firstLine =
+    '{"type":"result","id":"a","collection":"jobs","rev":1,"total":0,"rows":[]}\n';
+  writeFrames(sock, [{ __line: firstLine }]);
+  expect(sock.data.pending).not.toBeNull();
+  expect(sock.frames.length).toBe(0);
+
+  // Now append a SECOND pre-serialized line while pending — it must be encoded
+  // verbatim (NOT re-stringified) behind the still-pending tail.
+  const secondLine =
+    '{"type":"result","id":"b","collection":"jobs","rev":2,"total":0,"rows":[]}\n';
+  writeFrames(sock, [{ __line: secondLine }]);
+
+  // Drain: accept everything; both lines flush in order, byte-for-byte.
+  sock.accept = true;
+  resumePending(sock);
+  expect(sock.frames.map((f) => (f as ResultFrame).id)).toEqual(["a", "b"]);
+});
+
+test("fn-698 a non-query frame still routes through encodeFrame (object path intact)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  setWorldRev(db, 2);
+  const memo = newResultMemo();
+  // An unsubscribe returns [] — never touches the memo / pre-serialized path.
+  const frames = dispatchLine(
+    db,
+    newConn(),
+    JSON.stringify({ type: "unsubscribe" }),
+    db,
+    undefined,
+    memo,
+  );
+  expect(frames).toEqual([]);
+  db.close();
+});
+
+test("fn-698 cap: a NEW signature past the cap runs un-memoized; the hot signature never sheds", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedEpic(db, "fn-1", { last_event_id: 1 });
+  setWorldRev(db, 1);
+
+  // Pre-fill the memo to its cap with distinct signatures (distinct offsets).
+  const memo = newResultMemo();
+  memo.worldRev = 1;
+  for (let i = 0; i < 256; i++) {
+    memo.entries.set(`sig-${i}`, {
+      rows: [],
+      rowsJson: "[]",
+      total: 0,
+      token: "",
+      where: { clause: "", params: [] },
+    });
+  }
+  expect(memo.entries.size).toBe(256);
+
+  // A genuinely NEW signature at the SAME worldRev: capped → un-memoized
+  // (object ResultFrame, no new entry minted).
+  const frames = dispatchLine(
+    db,
+    newConn(),
+    JSON.stringify({
+      type: "query",
+      collection: "epics",
+      id: "fresh",
+      limit: 7,
+    }),
+    db,
+    undefined,
+    memo,
+  );
+  const f = frames[0] as ServerFrame;
+  expect((f as unknown as PreSerialized).__line).toBeUndefined();
+  expect(f.type).toBe("result");
+  // Still 256 — the cap held, nothing evicted, nothing added.
+  expect(memo.entries.size).toBe(256);
+  db.close();
 });

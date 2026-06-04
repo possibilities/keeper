@@ -153,6 +153,11 @@ export interface UnsubscribeFrame {
  * limit/offset), so a paginated client can render "showing `rows.length` of
  * `total`". It seeds the subscription's membership baseline; subsequent `meta`
  * frames report when it (or the set's membership) moves.
+ *
+ * fn-698: the server MAY serve this frame pre-serialized (a shared per-worldRev
+ * result memo concatenates the per-conn envelope around one cached `rows`
+ * blob). The frame SHAPE on the wire is unchanged — bytes are byte-identical to
+ * `encodeFrame(...)` of this object.
  */
 export interface ResultFrame<R extends Row = Row> {
   type: "result";
