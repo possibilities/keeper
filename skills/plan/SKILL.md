@@ -342,19 +342,18 @@ Emit a sketch-shaped artifact (mirrors `/arthack:sketch`). Pull Touchpoints from
 
 Follow it with one explainer paragraph and one question (plain text, no `AskUserQuestion`):
 
-> *This looks like a single-commit job — SHORT depth, one task, no seams worth splitting on. I can skip the epic entirely and just commit, queue it as a single-task epic at the top of the board for next, defer it as a single-task epic at normal sort order for later, or write the full epic + task now if you'd rather have the planctl trail.*
+> *This looks like a single-commit job — SHORT depth, one task, no seams worth splitting on. I can skip the epic entirely and just commit, defer it as a single-task epic at normal sort order for later (then `/plan:next <epic_id>` if you want to jump it to the front), or write the full epic + task now if you'd rather have the planctl trail.*
 >
-> *Commit directly, queue for next, defer for later, or continue planning?*
+> *Commit directly, defer for later, or continue planning?*
 
 Wait for the answer. The human is the only one who knows whether they want the planctl trail or whether the change is one-and-done — always ask, never silently bypass.
 
-### Four trigger phrases on the sketch artifact
+### Three trigger phrases on the sketch artifact
 
-Word choice is load-bearing — the human picks the flow by picking the phrase. All four can land on the same artifact at different moments; never collapse them. When the urgency signal between queue and defer is ambiguous, **default to defer** — promoting later is cheaper than retracting a queue-jump.
+Word choice is load-bearing — the human picks the flow by picking the phrase. All three can land on the same artifact at different moments; never collapse them.
 
 - **"commit sketch"** (direct-commit) — accept any clear go-forth (*"ship it"*, *"go"*, *"do it"*, *"send it"*, *"commit"*, …). Stop the pipeline entirely — **no Phase 5/6/7/8**; the sketch is the plan. The affirmative is the directive to implement and commit: ask only the questions that block the work, don't re-litigate direction, drive arthack's normal commit-then-go workflow (`jobctl commit-work --preview-files` then `jobctl commit-work "<msg>"`).
-- **"queue sketch"** (queue-handoff) — accept *"queue"*, *"queue this"*, *"do this next"*, *"top of the board"*, any front-of-line signal. Stop this pipeline (no `scaffold` here) and invoke **`/plan:queue`** via the Skill tool with the sketch artifact (Goal + Direction + Touchpoints) as the subject. Single-task epic, `queue_jump: true`, no worker.
-- **"defer sketch"** (defer-handoff) — accept *"defer"*, *"later"*, *"not now"*, *"follow up"*, *"park it"*, any back-of-line signal. Stop this pipeline and invoke **`/plan:defer`** with the sketch artifact as the subject. Single-task epic at normal sort order, no worker.
+- **"defer sketch"** (defer-handoff) — accept *"defer"*, *"later"*, *"not now"*, *"follow up"*, *"park it"*, any back-of-line signal. Stop this pipeline and invoke **`/plan:defer`** with the sketch artifact as the subject. Single-task epic at normal sort order, no worker. If the human then wants it at the front of the board, `/plan:next <epic_id>` flips its priority post-hoc via `planctl epic queue-jump`.
 - **"plan sketch"** / **continue planning** — any answer that isn't an affirmative-to-proceed (*"continue"*, *"plan it"*, *"full plan"*, added context that shifts direction). Flows into Phase 5 unchanged. (When `/arthack:sketch` drives this, it saves the curated bundle via `promptctl save-bundle sketch/<slug> --append` and re-enters via the `--bundle sketch/<slug>` first-line wire format in Phase 1a.)
 
 ---

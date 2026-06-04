@@ -99,15 +99,17 @@ trail.
 
 Per §4, an envelope `success: true` confirms the git commit landed.
 
-`queue_jump` (optional, bool, default `false`) is set by `/plan:queue`
-on its scaffold invocation and rides through the existing scaffold
-path unchanged (no new role-launcher plumbing, no new CLI flag). It is
-the server-derived signal keeperd folds into the `epics.queue_jump`
+`queue_jump` (optional, bool, default `false`) rides envelopes from
+two verbs. `scaffold` carries it on a `/plan:defer`-class mint that
+opts in; `epic queue-jump` (the verb behind `/plan:next`) carries it
+on an *existing* epic to flip board priority post-hoc. It is the
+server-derived signal keeperd folds into the `epics.queue_jump`
 projection column (schema v30) to drive the `!`-prefix `sort_path`
-branch in `cascadeSortPath`. Old envelopes lacking the key fold to
-`false` per the standard `?? false` lift, preserving re-fold
-determinism. `/plan:defer` produces the same envelope shape with
-`queue_jump: false` (or omitted entirely).
+branch in `cascadeSortPath` — the reducer derives it sticky-true from
+any event carrying the signal, so a `queue-jump` envelope on an epic id
+that already has committed events projects the `!`-prefixed sort path
+without a keeper change. Old envelopes lacking the key fold to `false`
+per the standard `?? false` lift, preserving re-fold determinism.
 
 **`repo_root` vs `state_repo`** — two distinct fields, always present:
 
