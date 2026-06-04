@@ -48,5 +48,5 @@ stays wired as a valid raw-scaffold input.
 - [ ] `tests/test_defer_skill_consistency.py` passes; the old `tests/test_queue_defer_skill_consistency.py` is gone.
 
 ## Done summary
-
+Converted skills/defer/SKILL.md to hand-written tracked source (name: defer, no Generated-by header, no queue conditionals, no queue_jump literal); deleted skills/queue/, skill-templates/queue-defer.md.tmpl, and both .managed-file-dont-edit sidecars; untracked queue/defer in .gitignore (work stays ignored); replaced test_queue_defer_skill_consistency.py with test_defer_skill_consistency.py.
 ## Evidence

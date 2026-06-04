@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Collapse queue into defer source skill",
-  "updated_at": "2026-06-04T14:48:06.580804Z"
+  "updated_at": "2026-06-04T15:31:32.604970Z",
+  "worker_done_at": "2026-06-04T15:31:32.604970Z"
 }
