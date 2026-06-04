@@ -69,6 +69,11 @@ VERB_TEMPLATES: dict[str, Callable[[str, str | None], str]] = {
     "validate": lambda t, d: _subject("validate", t, d),
     # Invalidate verb (explicit clear; primary job is the clear, not a side-effect)
     "invalidate": lambda t, d: _subject("invalidate", t, d),
+    # Queue-jump verb (fn-1) — priority-flag verb, not structural: flips
+    # queue_jump=true post-hoc on an existing epic so keeper sorts it to the
+    # front of the board. NOT in VALIDATION_RESTAMP_VERBS (same stance as
+    # invalidate/approve/task-set-tier).
+    "queue-jump": lambda t, d: _subject("queue-jump", t, d),
     # Manual-approval-gate ack verbs (fn-386)
     "task-ack": lambda t, d: _subject("task-ack", t, d),
     "epic-ack": lambda t, d: _subject("epic-ack", t, d),

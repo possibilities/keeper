@@ -417,9 +417,12 @@ YAML schema (top-level mapping):
                                   # unresolvable sketch fails as `ref_invalid`
                                   # in the assert phase (fn-610).
     queue_jump: <bool>            # optional, default false. /plan:queue sets
-                                  # true; rides the planctl_invocation envelope
-                                  # so keeper sorts the epic above all others
-                                  # on the board (`!`-prefixed sort_path).
+                                  # true at mint; can also be flipped post-hoc
+                                  # on an existing epic via `planctl epic
+                                  # queue-jump` (/plan:next). Rides the
+                                  # planctl_invocation envelope so keeper sorts
+                                  # the epic above all others on the board
+                                  # (`!`-prefixed sort_path).
     spec: |                       # optional, raw markdown (no H2 validation)
       ...
   tasks:                    # required, ordered list (>=1 entry)
@@ -1171,6 +1174,13 @@ def epic_ack_cmd(epic_id):
 def epic_invalidate_cmd(epic_id):
     """Clear validation marker (force re-validate on next validate run)."""
     return _lazy_import("planctl.run_epic_invalidate")(epic_id=epic_id)
+
+
+@epic_group.command("queue-jump")
+@click.argument("epic_id")
+def epic_queue_jump_cmd(epic_id):
+    """Flip queue_jump=true so the epic sorts to the front of the board (/plan:next)."""
+    return _lazy_import("planctl.run_epic_queue_jump")(epic_id=epic_id)
 
 
 @epic_group.command("add-dep")
