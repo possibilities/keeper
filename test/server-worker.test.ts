@@ -48,6 +48,7 @@ import {
   type DispatchAsyncCtx,
   diffTick,
   dispatchLine,
+  handleKick,
   isPidAlive,
   LockHeldError,
   pollLoop,
@@ -1503,6 +1504,60 @@ test("diffTick does not double-send: a second tick with no change emits nothing"
   diffTick(db, [sock]);
   expect(sock.frames).toHaveLength(1);
   db.close();
+});
+
+// fn-694 lever B: the `{type:"kick"}` fast path runs diffTick on a post-fold
+// kick from main. `handleKick` is the try/catch-wrapped helper the worker's
+// message handler calls; driving it directly proves the kick emits the pending
+// patch and is idempotent against a subsequent poll/kick double-fire.
+test("handleKick emits the pending patch on a post-fold kick", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  setWorldRev(db, 42);
+  const sock = fakeSock();
+  watch(db, sock, { a: 5 });
+
+  advanceJob(db, "a", 6); // reducer folded; main kicks us
+  handleKick(db, [sock]);
+
+  expect(sock.frames).toHaveLength(1);
+  const patch = sock.frames[0] as PatchFrame;
+  expect(patch.type).toBe("patch");
+  expect(patch.row.last_event_id).toBe(6);
+  expect(patch.rev).toBe(42);
+  expect(sock.data.subs.get(null)?.lastSent.get("a")).toBe(6);
+  db.close();
+});
+
+test("handleKick + a subsequent kick/poll double-fire is idempotent", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const sock = fakeSock();
+  watch(db, sock, { a: 5 });
+
+  advanceJob(db, "a", 6);
+  handleKick(db, [sock]); // kick (main's post-fold message)
+  expect(sock.frames).toHaveLength(1);
+
+  // The poll's local `last` is not advanced by the kick, so the next poll
+  // re-diffs — and a second kick can race it. Neither re-emits: diffTick is
+  // version-gated, so both are harmless no-ops.
+  diffTick(db, [sock]); // backstop poll re-diff
+  handleKick(db, [sock]); // second kick
+  expect(sock.frames).toHaveLength(1);
+  db.close();
+});
+
+test("handleKick never throws out of the handler when diffTick fails", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const sock = fakeSock();
+  watch(db, sock, { a: 5 });
+  db.close(); // force diffTick's read to throw (connection closed)
+
+  // The worker message handler is in the no-self-heal path: a throw here would
+  // crash the worker and bounce the daemon. handleKick must swallow it.
+  expect(() => handleKick(db, [sock])).not.toThrow();
 });
 
 test("diffTick fans out only to connections watching the changed id", () => {

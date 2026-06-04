@@ -222,7 +222,16 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
 - **No kernel file watchers ON KEEPER'S OWN SQLite DB** (`fs.watch`, FSEvents,
   kqueue, chokidar) — they drop same-process writes and miss WAL writes on macOS.
   Use `PRAGMA data_version` polling on a read-only autocommit connection as the
-  only DB-change primitive. *Carve-out (files):* native `@parcel/watcher` on
+  only *external* DB-change primitive — the one detection mechanism for a write
+  another connection made. *Complementary same-process wake (fn-694 lever B):*
+  main may `postMessage({type:"kick"})` to the server-worker straight after
+  `drainToCompletion` returns (post-COMMIT) so it runs its diff without waiting
+  for the next poll tick. The kick is an in-process message bus signal, NOT a
+  file/DB watcher — it does not observe the DB; it is fired by main precisely
+  because main just folded. The `data_version` poll remains the level-triggered
+  backstop (the kick is edge-triggered and subject to a lost-wakeup race); the
+  kick handler is idempotent (the diff is version-gated) so a kick+poll
+  double-fire is a harmless no-op. *Carve-out (files):* native `@parcel/watcher` on
   *external* trees written by other processes IS permitted (transcript files,
   `.planctl` trees, the zellij-events plugin feed dir at
   `~/.local/state/keeper/zellij-events/` written by the fn-684 wasm bridge
@@ -281,7 +290,13 @@ Every keeper Worker thread follows the same durable contract:
 - **`isMainThread` guard** — a plain `import` of the worker module is inert.
 - **Own `openDb` connection** (read-only for readers); never shares main's.
 - **Typed message protocol** — `{ kind }` for worker→main, `{ type }` for
-  main→worker.
+  main→worker. The server-worker (the second thread) accepts a `{type:"kick"}`
+  message from main as a supplementary fast-path wake (fn-694 lever B): main
+  posts it after `drainToCompletion` returns so the worker runs `diffTick`
+  immediately. The kick handler is in the no-self-heal path, so `diffTick` is
+  wrapped in try/catch (log+continue, never propagate) — an uncaught throw there
+  would crash the worker and bounce the daemon. The worker's `data_version` poll
+  is now the stall-recovery backstop, not the primary fast path.
 - **Supervisor-owned lifecycle** — main spawns each worker after migrate + boot
   drain and is the only one that terminates it (`{ type: "shutdown" }`, await
   `close`, then `terminate`). A worker owning an external resource (socket, lock

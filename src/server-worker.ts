@@ -119,6 +119,21 @@ export interface ShutdownMessage {
 }
 
 /**
+ * Edge-triggered fast-path wake (fn-694 lever B). Main posts this AFTER
+ * `drainToCompletion` returns (post-COMMIT) so the server-worker runs
+ * `diffTick` immediately instead of waiting for its next ~50ms poll tick —
+ * collapsing the second of the two serial `data_version` polls in the
+ * hook→fold→patch pipeline. The level-triggered `pollLoop` is retained as
+ * the stall-recovery backstop (lost-wakeup races, missed kicks); the kick is
+ * purely additive and idempotent (diffTick is version-gated, so a kick+poll
+ * double-fire is a harmless no-op). Posted strictly after the commit so the
+ * worker never reads a pre-commit `data_version`.
+ */
+export interface KickMessage {
+  type: "kick";
+}
+
+/**
  * Worker→main request bridge for the {@link replayDeadLetterHandler} RPC
  * (fn-643 task .4). The async-RPC dispatch path posts this message with a
  * correlation `id` and awaits the matching {@link ReplayResultMessage} reply
@@ -1786,6 +1801,28 @@ export async function pollLoop(
   }
 }
 
+/**
+ * Run one `diffTick` in response to main's post-fold `{type:"kick"}` message
+ * (fn-694 lever B), wrapped so a throw can NEVER escape the worker's message
+ * handler. The handler is in the no-self-heal path: an uncaught throw there
+ * crashes the worker, exits the daemon, and bounces launchd — so this
+ * swallows any diffTick failure to stderr and continues. The kick does NOT
+ * advance `pollLoop`'s local `last`, so the next poll re-diffs harmlessly
+ * (diffTick is state-based, version-gated, and idempotent — a kick+poll
+ * double-fire emits nothing the second time). Exported so tests can drive the
+ * kick branch directly against the `fakeSock`/`watch` harness without a real
+ * Worker spawn.
+ */
+export function handleKick(db: Database, conns: Iterable<Writable>): void {
+  try {
+    diffTick(db, conns);
+  } catch (err) {
+    // No-self-heal path: log + continue, never propagate. A crashed diffTick
+    // must not take down the worker (and with it, the daemon).
+    console.error("[server-worker] kick diffTick failed:", err);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Worker server lifecycle
 // ---------------------------------------------------------------------------
@@ -2217,6 +2254,7 @@ function main(): void {
     (
       msg:
         | ShutdownMessage
+        | KickMessage
         | ReplayResultMessage
         | SetAutopilotPausedResultMessage
         | RetryDispatchResultMessage
@@ -2228,6 +2266,15 @@ function main(): void {
       // wrong-resolve another bridge's awaiting promise.
       if ((msg as ShutdownMessage).type === "shutdown") {
         shutdown();
+        return;
+      }
+      if ((msg as KickMessage).type === "kick") {
+        // fn-694 lever B fast path: main folded an event and kicked us so we
+        // run diffTick now instead of waiting for the next poll tick. The
+        // try/catch lives in `handleKick` — this handler must never throw
+        // (no-self-heal path). `server.conns` is the same iterable the
+        // backstop pollLoop reads.
+        handleKick(db, server.conns);
         return;
       }
       if ((msg as ReplayResultMessage).type === "replay-result") {

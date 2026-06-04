@@ -35,8 +35,10 @@ import { openDb } from "./db";
 export interface WakeWorkerData {
   dbPath: string;
   /**
-   * Poll cadence in ms. Defaults to 50ms (practice-scout's 25-100ms sweet
-   * spot). Floored at 25ms to avoid burning a core.
+   * Poll cadence in ms. Defaults to 25ms (fn-694 lever B2 — halved from 50 to
+   * cut the worst case of the FIRST, irreducible poll; the second poll is
+   * collapsed by main's post-fold kick to the server-worker). Floored at 25ms
+   * (`MIN_POLL_MS`) to avoid burning a core.
    */
   pollMs?: number;
 }
@@ -51,7 +53,11 @@ export interface ShutdownMessage {
   type: "shutdown";
 }
 
-const DEFAULT_POLL_MS = 50;
+// fn-694 lever B2: halved 50→25ms to cut the worst-case latency of the FIRST
+// (irreducible) `data_version` poll — the hook is fire-and-forget, so main can
+// only learn of a hook write via this poll. Floored at `MIN_POLL_MS`; the
+// extra idle `PRAGMA data_version` reads are negligible.
+const DEFAULT_POLL_MS = 25;
 const MIN_POLL_MS = 25;
 
 interface DataVersionRow {

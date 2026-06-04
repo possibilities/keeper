@@ -134,6 +134,7 @@ import { DEFAULT_BATCH_SIZE, type DrainOptions, drain } from "./reducer";
 import type { RestoreWorkerData } from "./restore-worker";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
+  KickMessage,
   ReplayRequestMessage,
   ReplayResultMessage,
   RetryDispatchRequestMessage,
@@ -1388,20 +1389,34 @@ function runDaemon(): void {
       return;
     }
     draining = true;
+    let folded = false;
     try {
       while (wakePending && !shuttingDown) {
         wakePending = false;
         drainToCompletion(db);
+        folded = true;
       }
     } finally {
       draining = false;
+    }
+    // fn-694 lever B: kick the server-worker AFTER the drain loop returns
+    // (post-COMMIT) so it runs `diffTick` immediately instead of waiting for
+    // its next ~50ms poll tick — collapsing the second of the two serial
+    // `data_version` polls in the hook→fold→patch pipeline. Posted strictly
+    // after `drainToCompletion` so the worker never reads a pre-commit
+    // `data_version`. The worker's level-triggered `pollLoop` stays as the
+    // backstop for any lost-wakeup; the kick handler is idempotent (diffTick
+    // is version-gated). Skip on a no-op pump (re-entrant wake that folded
+    // nothing) and during shutdown.
+    if (folded && !shuttingDown) {
+      serverWorker.postMessage({ type: "kick" } satisfies KickMessage);
     }
   }
 
   // Step 3 — spawn the wake worker. Bun uses the web Worker API; `workerData`
   // is a worker_threads option not in the DOM lib type, hence the cast.
   const worker = new Worker(new URL("./wake-worker.ts", import.meta.url).href, {
-    workerData: { dbPath, pollMs: 50 } satisfies WakeWorkerData,
+    workerData: { dbPath, pollMs: 25 } satisfies WakeWorkerData,
   } as WorkerOptions & { workerData: unknown });
 
   // Step 4 — each wake message triggers a (coalescing) drain pass.

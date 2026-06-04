@@ -958,7 +958,7 @@ top-level signals partial-indexed for cheap cross-session lookup —
 command parses as a filesystem-mutating shape; see [What keeper is](#what-keeper-is)); the reducer
 folds it into the `jobs` projection while advancing the `reducer_state`
 cursor in the same transaction (exactly-once-per-event). A Worker thread on its own read-only
-connection polls `PRAGMA data_version` at ~50ms and posts contentless wake
+connection polls `PRAGMA data_version` at ~25ms and posts contentless wake
 messages; each wake triggers a drain to completion. On macOS, FSEvents/kqueue
 drop same-process writes and miss WAL writes entirely, so `data_version`
 polling — not a file watcher — is the correct change-detection primitive.
@@ -967,7 +967,14 @@ A **second** Worker thread runs the read-only UDS subscribe server. It mirrors
 the wake worker's archetype — its own read-only connection, its own
 `data_version` poll — but instead of waking the reducer it owns an external
 endpoint: a Unix-domain socket (guarded by a PID-liveness lock file) speaking
-NDJSON. The surface is namespaced by collection: each query names a collection,
+NDJSON. Its **primary fast path** is not the poll, though: after main drains a
+fold to completion it posts a `{type:"kick"}` message to this worker (in-process
+postMessage, strictly post-COMMIT), so the server runs its diff immediately
+instead of waiting up to a full poll interval — collapsing the second of the two
+serial `data_version` polls that the hook→fold→patch pipeline used to cross. The
+`data_version` poll is retained as the level-triggered backstop for any
+lost-wakeup; the kick handler is idempotent (the diff is version-gated, so a
+kick+poll double-fire emits nothing the second time). The surface is namespaced by collection: each query names a collection,
 and everything collection-specific (which table to read, which columns to serve,
 which column the diff fires on) is described by a registry entry rather than
 hardcoded — `jobs` is the first such collection; `epics` and
