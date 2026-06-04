@@ -1,0 +1,18 @@
+{
+  "approval": "pending",
+  "branch_name": "fn-704-optimize-zellij-integration-throughput",
+  "bundles": [],
+  "created_at": "2026-06-04T16:18:07.325177Z",
+  "depends_on_epics": [],
+  "id": "fn-704-optimize-zellij-integration-throughput",
+  "last_validated_at": "2026-06-04T16:18:07.428201Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "optimize zellij integration throughput",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-04T16:18:07.325177Z"
+}
