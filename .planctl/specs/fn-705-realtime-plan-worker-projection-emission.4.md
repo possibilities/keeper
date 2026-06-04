@@ -58,5 +58,5 @@ docs in line with the new realtime architecture.
 - [ ] Docs reflect as-landed T1–T3 behavior (re-read code before editing)
 
 ## Done summary
-
+Demoted the plan-worker reconcile heartbeat from a 60s latency floor to a 5s should-never-fire paranoia backstop, made a heartbeat-tagged backstop emit a loud ALARM (db-poll/reflog fast-path tags stay non-alarm), and brought CLAUDE.md + README docs in line with the as-landed T1-T3 realtime architecture (data_version poll + .git/logs/HEAD reflog watch).
 ## Evidence
