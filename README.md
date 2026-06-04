@@ -1694,11 +1694,19 @@ retired `backend-worker` poller: instead of shelling
 session-scoped NDJSON feed produced by a headless Rust wasm bridge
 plugin (`keeper-zellij-bridge.wasm`) that the human's dotfiles load
 into every zellij session via a `config.kdl` `load_plugins` block.
-The plugin subscribes to native `PaneUpdate` / `TabUpdate` events,
-joins `pane_id -> (tab_id, tab_name)` against the manifest, and
-appends one line per delta to `<events-dir>/<session>.ndjson` (its
-WASI `/host` is pinned to the keeper events dir by the dotfiles'
-per-plugin `cwd`). This worker uses `@parcel/watcher` on the events
+The plugin subscribes to native `PaneUpdate` / `TabUpdate` events
+and joins `pane_id -> (tab_id, tab_name)` against the manifest. Since
+zellij delivers a FULL `PaneManifest` snapshot on every pane poll, the
+plugin diffs each freshly built manifest against a `last_emitted`
+`pane_id -> (tab_id, tab_name)` map (the pure `diff_lines` gate,
+fn-704.1) and appends a line ONLY for panes whose tuple changed — a
+zero-delta event does NO file I/O at all (the fix for the 20MB/30min
+feed-growth incident on a busy autopilot session). The changed panes
+land in one open + one batched `write_all` + one flush (was per-line
+open/flush/close), `last_emitted` is folded only after a successful
+flush and pruned of closed panes, and the file goes to
+`<events-dir>/<session>.ndjson` (its WASI `/host` is pinned to the
+keeper events dir by the dotfiles' per-plugin `cwd`). This worker uses `@parcel/watcher` on the events
 dir and posts a contentless `{kind:"zellij-events-changed"}` "go
 look" notification on every tree change. Main re-runs
 `scanZellijEventsDir`, which tails each file from its persisted

@@ -352,9 +352,24 @@ not bound by the Bun-thread contract — but it inherits two adjacent
 disciplines: lines are flushed per complete NDJSON record (the consumer holds
 a carry-buffer for trailing partial bytes), and the file is opened
 `O_APPEND` so a #5177 double-load shares one append stream instead of
-corrupting it. Sole-writer rules are preserved: the plugin is the sole writer
-of the `.ndjson` files, and main remains the sole writer of the synthetic
-`BackendExecSnapshot` events it mints from those lines.
+corrupting it. **Diff-before-emit (fn-704.1):** the plugin keeps a
+`last_emitted: pane_id -> (tab_id, tab_name)` map and a pure `diff_lines`
+gate; zellij delivers a FULL `PaneManifest` snapshot on every pane poll, so
+the plugin emits a pane line ONLY when its `(tab_id, tab_name)` tuple changed
+since last emit — a zero-delta event opens NO file at all (the fix for the
+20MB/30min feed-growth incident). The changed panes are written in ONE open +
+ONE batched `write_all` of the concatenated buffer + one `flush` (a single
+syscall keeps a #5177 double-load from interleaving mid-batch — O_APPEND
+atomicity is per-syscall), and `last_emitted` is folded ONLY after a
+successful flush (a pre-flush update + failed write would permanently
+false-suppress those panes) and pruned of closed panes so memory stays
+bounded. `SEQ` advances by the emitted-line count only (gaps are fine — the
+consumer dedups by byte-offset watermark — but it stays monotonic); the map
+starts empty (`Plugin::default()`) so the first post-grant flush and every
+epoch change (plugin reload = fresh `Plugin`) re-emit every pane. Sole-writer
+rules are preserved: the plugin is the sole writer of the `.ndjson` files,
+and main remains the sole writer of the synthetic `BackendExecSnapshot`
+events it mints from those lines.
 
 ## Autopilot dispatch gates
 

@@ -12,11 +12,25 @@
 //! synchronous `load()` call — so the session name (and therefore the first
 //! emit) is deferred to the `PermissionRequestResult(Granted)` arm in
 //! `update()`. On each pane/tab event thereafter it joins the manifest
-//! against the latest tab map and appends one line per (non-plugin) pane to
+//! against the latest tab map to build the FULL pane manifest, then diffs it
+//! against `last_emitted` (per-pane `(tab_id, tab_name)`) and emits ONLY the
+//! changed panes. A zero-delta event (the overwhelmingly common case — zellij
+//! delivers a full PaneManifest snapshot on every `GetPaneRunningCommand`
+//! poll) does NO file I/O at all. The lines that DID change are written in one
+//! open + one batched `write_all` of the concatenated buffer + one flush; a
+//! single `write_all` keeps a #5177 double-loaded instance from interleaving
+//! its bytes mid-batch (O_APPEND atomicity is per-syscall). Output lands at
 //! `/host/<session>.ndjson`. `/host` is pinned by the dotfiles
 //! `load_plugins { "file:..." { cwd "<events dir>" } }` block (see
 //! `fn-684.4`); the plugin never resolves a host path itself — the WASI
 //! sandbox forbids writing outside `/host` / `/data` / sandbox `/tmp`.
+//!
+//! `last_emitted` is updated ONLY after a successful flush (a pre-flush
+//! update + failed write would permanently false-suppress those panes), and
+//! panes no longer in the manifest are pruned from it so memory stays bounded
+//! across a long session. It starts empty (`Plugin::default()`), so the first
+//! post-grant flush re-emits every pane, and a plugin reload (fresh `Plugin`,
+//! new epoch) resets it automatically.
 //!
 //! The fold in keeper's `zellij-events-worker` is idempotent, so the
 //! `OpenOptions::append(true)` open survives zellij#5177 (double
@@ -147,6 +161,53 @@ pub fn build_lines(
     out
 }
 
+/// Filter a full manifest down to the panes whose `(tab_id, tab_name)`
+/// changed since the last emit, and renumber their `seq` densely from
+/// `seq_start`.
+///
+/// Pure function — no plugin state, no `SEQ` thread-local, no I/O — so it
+/// unit-tests standalone. `prev` is the per-pane snapshot of the LAST emitted
+/// `(tab_id, tab_name)` keyed by `pane_id`; `next` is the freshly built full
+/// manifest from `build_lines`. We keep a `next` line when its pane is absent
+/// from `prev` (new pane) OR its `(tab_id, tab_name)` tuple differs (moved /
+/// renamed tab). A pane present in both with an identical tuple is dropped —
+/// re-emitting it would be a no-op fold on the consumer and pure churn on the
+/// single-threaded zellij server.
+///
+/// We KEY on `(tab_id, tab_name)`, NOT pane presence: a rename-only
+/// `TabUpdate` leaves the pane set unchanged but flips `tab_name`, and the
+/// consumer's rename re-emit depends on the new name reaching it. A
+/// presence-only diff would silently swallow renames.
+///
+/// `seq` is renumbered densely from `seq_start` over the SURVIVING lines so
+/// the caller advances `SEQ` by exactly the emitted-line count (gaps from
+/// suppressed panes never reach the stream — the consumer's byte-offset
+/// watermark tolerates gaps, but dense numbering keeps the count honest).
+/// The input `next` lines' `seq` values (assigned over the full manifest)
+/// are discarded.
+pub fn diff_lines(
+    prev: &BTreeMap<u32, (u64, String)>,
+    next: &[PaneLine],
+    seq_start: u64,
+) -> Vec<PaneLine> {
+    let mut out = Vec::new();
+    let mut seq = seq_start;
+    for line in next {
+        let changed = match prev.get(&line.pane_id) {
+            Some((tab_id, tab_name)) => *tab_id != line.tab_id || *tab_name != line.tab_name,
+            None => true,
+        };
+        if !changed {
+            continue;
+        }
+        let mut emitted = line.clone();
+        emitted.seq = seq;
+        out.push(emitted);
+        seq = seq.wrapping_add(1);
+    }
+    out
+}
+
 // ===== Plugin state =====================================================
 
 thread_local! {
@@ -185,6 +246,16 @@ pub struct Plugin {
     /// re-emit the affected panes without waiting for the next
     /// `PaneUpdate`.
     last_panes: Option<PaneManifest>,
+    /// Per-pane snapshot of the LAST EMITTED `(tab_id, tab_name)`, keyed by
+    /// `pane_id`. The diff gate (`diff_lines`) compares each freshly built
+    /// manifest line against this map and emits ONLY the panes whose tuple
+    /// changed — so a no-change event does zero file I/O. Updated ONLY after
+    /// a successful flush (a pre-flush update + failed write would
+    /// permanently false-suppress those panes until their value next
+    /// changes), and pruned of panes no longer in the manifest so memory
+    /// stays bounded. Starts empty (`Default`) so the first post-grant flush
+    /// re-emits every pane; a plugin reload is a fresh `Plugin` and resets it.
+    last_emitted: BTreeMap<u32, (u64, String)>,
 }
 
 impl ZellijPlugin for Plugin {
@@ -281,13 +352,16 @@ impl ZellijPlugin for Plugin {
 }
 
 impl Plugin {
-    fn emit_lines(&self) {
+    fn emit_lines(&mut self) {
         let Some(panes) = self.last_panes.as_ref() else {
             return;
         };
         let seq_start = SEQ.with(|s| s.get());
         let ts_ms = now_ms();
-        let lines = build_lines(
+        // Build the FULL manifest (unchanged), then diff it down to the panes
+        // whose `(tab_id, tab_name)` actually changed. The full manifest is
+        // also the basis for the prune set below.
+        let full = build_lines(
             panes,
             &self.tab_map,
             &self.session,
@@ -295,14 +369,47 @@ impl Plugin {
             seq_start,
             ts_ms,
         );
-        if lines.is_empty() {
+        let changed = diff_lines(&self.last_emitted, &full, seq_start);
+
+        // Zero-delta event: do NOT open the file at all. This is the hot path
+        // — zellij delivers a full PaneManifest snapshot on every pane poll,
+        // and a quiescent-but-busy session re-emits an identical manifest
+        // dozens of times a second.
+        if changed.is_empty() {
             return;
         }
-        let new_seq = seq_start.wrapping_add(lines.len() as u64);
-        SEQ.with(|s| s.set(new_seq));
-        for line in lines {
-            append_line(&self.session, &line.to_json());
+
+        // One open + one batched `write_all` of the concatenated buffer + one
+        // flush. A single syscall keeps a #5177 double-loaded instance from
+        // interleaving its bytes mid-batch (O_APPEND atomicity is per-syscall).
+        let mut batch = String::new();
+        for line in &changed {
+            batch.push_str(&line.to_json());
+            batch.push('\n');
         }
+        if !append_batch(&self.session, &batch) {
+            // Write failed — do NOT advance SEQ and do NOT update
+            // `last_emitted`. Leaving the map untouched means these panes are
+            // re-attempted (still "changed") on the next event rather than
+            // false-suppressed forever.
+            return;
+        }
+
+        // Only AFTER a successful flush: advance SEQ by the emitted-line count
+        // and fold the changed tuples into `last_emitted`.
+        let new_seq = seq_start.wrapping_add(changed.len() as u64);
+        SEQ.with(|s| s.set(new_seq));
+        for line in &changed {
+            self.last_emitted
+                .insert(line.pane_id, (line.tab_id, line.tab_name.clone()));
+        }
+
+        // Prune panes no longer in the current manifest so memory stays
+        // bounded across a long session. `full` is the complete current pane
+        // set (post `is_plugin` skip); any `last_emitted` key absent from it
+        // is a closed pane.
+        let live: std::collections::BTreeSet<u32> = full.iter().map(|l| l.pane_id).collect();
+        self.last_emitted.retain(|pane_id, _| live.contains(pane_id));
     }
 }
 
@@ -323,26 +430,45 @@ fn ndjson_path(session: &str) -> PathBuf {
     PathBuf::from(format!("/host/{}.ndjson", safe))
 }
 
-/// Append one line + newline. Opens with `append(true).create(true)` so a
-/// #5177 double-load shares one O_APPEND stream rather than corrupting it.
-/// Errors are swallowed: the plugin runs in every zellij session
-/// (dotfiles global load) and must never panic on a wedged FS.
-fn append_line(session: &str, line: &str) {
+/// Append a pre-concatenated batch (already newline-terminated per line) in
+/// ONE `write_all` + one `flush`. Opens with `append(true).create(true)` so a
+/// #5177 double-load shares one O_APPEND stream rather than corrupting it; the
+/// single `write_all` keeps a double-loaded instance from interleaving its
+/// bytes mid-batch (O_APPEND atomicity is per-syscall). Returns `true` only
+/// when open + write + flush all succeed — the caller updates `last_emitted`
+/// ONLY on `true` so a failed write is re-attempted on the next event rather
+/// than false-suppressed. Errors are otherwise swallowed: the plugin runs in
+/// every zellij session (dotfiles global load) and must never panic on a
+/// wedged FS.
+fn append_batch(session: &str, batch: &str) -> bool {
     let path = ndjson_path(session);
     let open_res = OpenOptions::new()
         .append(true)
         .create(true)
         .open(&path);
     let Ok(file) = open_res else {
-        return;
+        return false;
     };
     let mut w = BufWriter::new(file);
-    let _ = w.write_all(line.as_bytes());
-    let _ = w.write_all(b"\n");
-    let _ = w.flush();
+    if w.write_all(batch.as_bytes()).is_err() {
+        return false;
+    }
+    if w.flush().is_err() {
+        return false;
+    }
+    true
     // NOTE: file mode 0600 is enforced by the dotfiles-managed events dir
     // (created by keeper's boot with restrictive perms, task .4). Setting
     // perms inside a WASI plugin is non-portable — leave it to the dir.
+}
+
+/// Append one line + newline (the `plugin_start` sentinel path). Delegates to
+/// `append_batch` so the open/write/flush discipline lives in one place.
+fn append_line(session: &str, line: &str) {
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    let _ = append_batch(session, &buf);
 }
 
 /// Current UNIX time in milliseconds. WASI preview1 exposes the host clock
@@ -482,6 +608,134 @@ mod tests {
         tabs.insert(0_usize, (1_u64, "t".to_string()));
         let lines = build_lines(&pm, &tabs, "s", 0, 0, 0);
         assert!(lines.is_empty());
+    }
+
+    // ----- diff_lines gate ---------------------------------------------
+
+    /// Build a `last_emitted`-shaped map from a batch of emitted lines, the
+    /// way `emit_lines` folds the survivors after a successful flush.
+    fn fold_emitted(lines: &[PaneLine]) -> BTreeMap<u32, (u64, String)> {
+        let mut m = BTreeMap::new();
+        for l in lines {
+            m.insert(l.pane_id, (l.tab_id, l.tab_name.clone()));
+        }
+        m
+    }
+
+    #[test]
+    fn diff_identical_manifest_emits_zero_lines() {
+        // First emit: empty prev → every pane is "changed".
+        let pm = manifest(&[(0, vec![pane(1, false), pane(2, false)])]);
+        let mut tabs = BTreeMap::new();
+        tabs.insert(0_usize, (10_u64, "main".to_string()));
+        let full = build_lines(&pm, &tabs, "s", 1, 0, 100);
+
+        let prev = BTreeMap::new();
+        let first = diff_lines(&prev, &full, 0);
+        assert_eq!(first.len(), 2, "first emit re-emits every pane");
+
+        // Fold the survivors, then diff the SAME manifest again.
+        let emitted = fold_emitted(&first);
+        let full2 = build_lines(&pm, &tabs, "s", 1, first.len() as u64, 200);
+        let second = diff_lines(&emitted, &full2, first.len() as u64);
+        assert!(
+            second.is_empty(),
+            "an identical re-PaneUpdate emits ZERO lines"
+        );
+    }
+
+    #[test]
+    fn diff_rename_only_tab_update_emits_affected_panes() {
+        // Pane set unchanged, but the tab NAME flips — the diff MUST emit it
+        // (keys on (tab_id, tab_name), not pane presence).
+        let pm = manifest(&[(0, vec![pane(7, false)])]);
+
+        let mut tabs_a = BTreeMap::new();
+        tabs_a.insert(0_usize, (5_u64, "old".to_string()));
+        let full_a = build_lines(&pm, &tabs_a, "s", 1, 0, 1);
+        let first = diff_lines(&BTreeMap::new(), &full_a, 0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].tab_name, "old");
+        let emitted = fold_emitted(&first);
+
+        let mut tabs_b = BTreeMap::new();
+        tabs_b.insert(0_usize, (5_u64, "new".to_string()));
+        let full_b = build_lines(&pm, &tabs_b, "s", 1, 1, 2);
+        let renamed = diff_lines(&emitted, &full_b, 1);
+        assert_eq!(renamed.len(), 1, "rename-only TabUpdate still emits the pane");
+        assert_eq!(renamed[0].pane_id, 7);
+        assert_eq!(renamed[0].tab_name, "new");
+        // seq is renumbered densely from the supplied seq_start.
+        assert_eq!(renamed[0].seq, 1);
+    }
+
+    #[test]
+    fn diff_real_tab_name_after_provisional_zero_reaches_output() {
+        // A PaneUpdate raced ahead of the TabUpdate → provisional (0, "").
+        let pm = manifest(&[(0, vec![pane(3, false)])]);
+        let empty_tabs = BTreeMap::new();
+        let full_prov = build_lines(&pm, &empty_tabs, "s", 1, 0, 1);
+        assert_eq!(full_prov[0].tab_id, 0);
+        assert_eq!(full_prov[0].tab_name, "");
+        let prov = diff_lines(&BTreeMap::new(), &full_prov, 0);
+        assert_eq!(prov.len(), 1, "provisional (0,\"\") still emits once");
+        let emitted = fold_emitted(&prov);
+
+        // The real TabUpdate lands → (tab_id, name) differs → emits, and the
+        // real name reaches the output (the consumer's empty-name clobber
+        // guard drops the provisional line, so this real one is load-bearing).
+        let mut tabs = BTreeMap::new();
+        tabs.insert(0_usize, (42_u64, "real".to_string()));
+        let full_real = build_lines(&pm, &tabs, "s", 1, 1, 2);
+        let real = diff_lines(&emitted, &full_real, 1);
+        assert_eq!(real.len(), 1);
+        assert_eq!(real[0].pane_id, 3);
+        assert_eq!(real[0].tab_id, 42);
+        assert_eq!(real[0].tab_name, "real");
+    }
+
+    #[test]
+    fn diff_closed_pane_pruned_from_last_emitted() {
+        // Emit two panes, then a manifest with one pane closed. The prune
+        // logic (mirrored from emit_lines) drops the closed pane's key so
+        // memory is bounded.
+        let pm_two = manifest(&[(0, vec![pane(1, false), pane(2, false)])]);
+        let mut tabs = BTreeMap::new();
+        tabs.insert(0_usize, (1_u64, "t".to_string()));
+        let full_two = build_lines(&pm_two, &tabs, "s", 1, 0, 1);
+        let first = diff_lines(&BTreeMap::new(), &full_two, 0);
+        let mut last_emitted = fold_emitted(&first);
+        assert_eq!(last_emitted.len(), 2);
+
+        // Pane 2 closed.
+        let pm_one = manifest(&[(0, vec![pane(1, false)])]);
+        let full_one = build_lines(&pm_one, &tabs, "s", 1, 2, 3);
+        // No tuple changed for the surviving pane → diff is empty …
+        let diff = diff_lines(&last_emitted, &full_one, 2);
+        assert!(diff.is_empty(), "surviving pane unchanged → no emit");
+        // … but the prune still fires off the full current manifest.
+        let live: std::collections::BTreeSet<u32> = full_one.iter().map(|l| l.pane_id).collect();
+        last_emitted.retain(|pane_id, _| live.contains(pane_id));
+        assert_eq!(last_emitted.len(), 1, "closed pane (id=2) pruned");
+        assert!(last_emitted.contains_key(&1));
+        assert!(!last_emitted.contains_key(&2));
+    }
+
+    #[test]
+    fn diff_lines_is_pure_empty_diff_no_output() {
+        // Same map content fed as prev and as the source of `next` → no
+        // surviving lines, no mutation of inputs (pure function).
+        let pm = manifest(&[(0, vec![pane(8, false), pane(9, false)])]);
+        let mut tabs = BTreeMap::new();
+        tabs.insert(0_usize, (3_u64, "z".to_string()));
+        let full = build_lines(&pm, &tabs, "s", 1, 0, 1);
+        let prev = fold_emitted(&full);
+        let prev_snapshot = prev.clone();
+
+        let out = diff_lines(&prev, &full, 99);
+        assert!(out.is_empty(), "no tuple changed → empty diff");
+        // `prev` is untouched — the fn reads it, never writes it.
+        assert_eq!(prev, prev_snapshot);
     }
 
     #[test]
