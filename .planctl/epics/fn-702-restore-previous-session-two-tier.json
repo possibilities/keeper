@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-702-restore-previous-session-two-tier",
   "bundles": [],
+  "closer_done_at": "2026-06-04T17:31:18.700716Z",
   "created_at": "2026-06-04T15:58:22.552358Z",
   "depends_on_epics": [],
   "id": "fn-702-restore-previous-session-two-tier",
@@ -9,10 +10,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Restore previous-session two-tier",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-04T15:58:22.552358Z"
+  "updated_at": "2026-06-04T17:31:18.700716Z"
 }
