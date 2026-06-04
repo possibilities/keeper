@@ -106,24 +106,12 @@ def planctl_git_repo(tmp_path, monkeypatch):
         capture_output=True,
     )
 
-    # Initialise planctl project
+    # Initialise planctl project. `init` self-commits its bootstrap files
+    # inline (a `chore(planctl): init <name>` commit), so the repo baseline is
+    # clean once the verb returns — no manual stage+commit needed here.
     runner = CliRunner()
     result = runner.invoke(cli, ["init"])
     assert result.exit_code == 0, result.output
-
-    # Stage + commit .planctl/init so the repo baseline is clean
-    subprocess.run(
-        ["git", "add", ".planctl/"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "chore: planctl init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
 
     return tmp_path
 

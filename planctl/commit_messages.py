@@ -74,6 +74,11 @@ VERB_TEMPLATES: dict[str, Callable[[str, str | None], str]] = {
     # front of the board. NOT in VALIDATION_RESTAMP_VERBS (same stance as
     # invalidate/approve/task-set-tier).
     "queue-jump": lambda t, d: _subject("queue-jump", t, d),
+    # Project bootstrap (fn-2) — the one mutating verb that builds its own
+    # invocation payload directly (explicit fixed file list), without the
+    # touched-paths log or CLAUDE_CODE_SESSION_ID. NOT in
+    # VALIDATION_RESTAMP_VERBS — it mints no epic. Target is the project name.
+    "init": lambda t, d: _subject("init", t, d),
     # Manual-approval-gate ack verbs (fn-386)
     "task-ack": lambda t, d: _subject("task-ack", t, d),
     "epic-ack": lambda t, d: _subject("epic-ack", t, d),

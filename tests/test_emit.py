@@ -73,16 +73,8 @@ def _make_planctl_git_project(tmp_path, monkeypatch) -> Path:
     result = runner.invoke(cli, ["init"], env=_ENV)
     assert result.exit_code == 0, result.output
 
-    # Commit the planctl baseline so any subsequent verb starts on a clean tree.
-    subprocess.run(
-        ["git", "add", ".planctl/"], cwd=tmp_path, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "chore: planctl init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
+    # `init` self-commits its bootstrap files inline, so any subsequent verb
+    # already starts on a clean tree — no manual stage+commit needed.
     return tmp_path
 
 

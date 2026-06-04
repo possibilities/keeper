@@ -145,11 +145,25 @@ a bounded retry absorbs git's index/ref lock contention (§7).
 is released before the auto-commit runs; it stays off the git-commit
 critical path.
 
+`init` is the one mutating verb that builds its own `planctl_invocation`
+payload directly and hands it to `emit(planctl_invocation=...)` — it does NOT
+route through the `verb=` build path, so it never calls
+`build_planctl_invocation` and carries no session-id requirement (§12). `init`
+writes a fixed, known bootstrap set (`.planctl/meta.json`,
+`.planctl/.gitignore`, `.planctl/CLAUDE.md`, the `.planctl/AGENTS.md` symlink),
+so the payload's `files` is the explicit list of paths it created this
+invocation — no touched-paths-log discovery needed. The payload omits the
+`session_id` key, so the resulting commit carries no `Session-Id:` trailer
+(§5). `init` self-commits only when it wrote at least one file AND the cwd is
+inside a git work tree; an idempotent re-run that writes nothing, or an `init`
+in a non-git dir, takes the read-only `emit()` path and lands no commit.
+
 | Class | Envelope | Auto-commit | Pre-commit-raise behavior |
 |---|---|---|---|
 | Mutating, single-field (`done`, `approve`, `epic close`, `epic invalidate`, `epic add-dep`/`add-deps`/`rm-dep`, every `epic set-*` / `task set-*`, `task reset`, ...) | non-null `subject`, populated `files` | yes (inline) | every write is a rewrite of a pre-existing tracked file via atomic_write rename-atomic; prior valid contents stay in place |
 | Mutating, whole-tree (`scaffold`, `refine-apply`, `epic create`) | non-null `subject`, `files` covers the full epic+tasks+specs+deps tree | yes (inline, one commit) | the LOCAL write-phase block unwinds a mid-write crash; a pre-commit raise from the seam leaves the fully-written tree on disk (§10), invisible to the autopilot via the keeper HEAD-gate |
 | Mutating, whole-tree delete (`epic rm`, fn-623) | non-null `subject`, `files` lists every unlinked path (epic JSON, every task JSON, epic + task specs, runtime state, locks) — paths are recorded BEFORE the unlink so the `touched ∩ dirty` pathspec captures the deletions | yes (inline, one commit) | the verb is a delete — a pre-commit raise leaves the deletes in place (§10), nothing to re-create |
+| Mutating, self-built payload (`init`) | non-null `subject`, `files` is the explicit bootstrap set it created; NO `session_id` key (no `Session-Id:` trailer) | yes (inline, via `emit(planctl_invocation=...)`), only when something was written AND inside a git work tree | the writes are fresh files; a pre-commit raise leaves them on disk (§10), and an idempotent re-run is the read-only `emit()` path |
 | Runtime-state-only (`claim`, `block`) | `subject=null`, `files=null` | none (gitignored state) | n/a |
 | Read-only (`show`, `cat`, `list`, ...) | `subject=null`, `files=null` (via decorator) | none | n/a |
 | `validate --epic <id>` (first-ever valid) | non-null `subject`, single file | yes (manual `auto_commit_from_invocation` call from the validate runner, which bypasses `emit()` to preserve its `{valid, errors, warnings}` envelope shape) | bypass — documented out-of-scope per §13's `validate --epic` row, see the asymmetry note below |
@@ -259,7 +273,14 @@ chore(planctl): done fn-7-add-auth.2
 chore(planctl): approve fn-7-add-auth
 chore(planctl): scaffold fn-7-add-auth
 chore(planctl): refine-apply fn-7-add-auth
+chore(planctl): init <project-name>
 ```
+
+For `init` the `<target>` is the project name (the repo root directory name),
+not an `fn-` id — it mints no epic. The `init` commit carries the
+`Planctl-Op` / `Planctl-Target` / `Planctl-Prev-Op` trailers but no
+`Session-Id:` trailer: `init` builds its own payload without a `session_id`
+key (§12).
 
 ### Trailers
 
@@ -578,6 +599,16 @@ tests and manual invocations set it explicitly.
 If `CLAUDE_CODE_SESSION_ID` is unset / empty, `build_planctl_invocation`
 raises `RuntimeError` naming the env var — no process-tree walk, no
 wildcard fallback.
+
+`init` is the one mutating verb exempt from this requirement: it builds its
+own `planctl_invocation` payload directly (an explicit fixed file list of the
+bootstrap set it created) and hands it to `emit(planctl_invocation=...)`,
+never calling `build_planctl_invocation`. The session id is only needed by
+variable-file verbs that discover their commit set through the touched-paths
+log; `init` writes a known set, so it needs neither the log nor the env var.
+Its payload omits the `session_id` key, so the commit lands with no
+`Session-Id:` trailer (§5), and `init` runs identically whether or not
+`CLAUDE_CODE_SESSION_ID` is set.
 
 ---
 

@@ -97,33 +97,16 @@ def two_projects(tmp_path, monkeypatch):
     cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
     monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
 
-    # Stand up project A.
+    # Stand up project A. `init` self-commits its bootstrap files inline, so
+    # the baseline is clean once the verb returns — no manual commit needed.
     monkeypatch.chdir(proj_a)
     _git_init(proj_a)
     _planctl_init()
-    subprocess.run(
-        ["git", "add", ".planctl/"], cwd=proj_a, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "chore: planctl init"],
-        cwd=proj_a,
-        check=True,
-        capture_output=True,
-    )
 
-    # Stand up project B.
+    # Stand up project B (same self-committing init).
     monkeypatch.chdir(proj_b)
     _git_init(proj_b)
     _planctl_init()
-    subprocess.run(
-        ["git", "add", ".planctl/"], cwd=proj_b, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "chore: planctl init"],
-        cwd=proj_b,
-        check=True,
-        capture_output=True,
-    )
 
     # Cwd stays in project B for the cross-project write paths.
     monkeypatch.chdir(proj_b)
