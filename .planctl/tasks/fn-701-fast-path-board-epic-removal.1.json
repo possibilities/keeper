@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Commit-driven ingest bypasses fn-629 gate",
-  "updated_at": "2026-06-04T14:59:20.642422Z"
+  "updated_at": "2026-06-04T15:40:39.468453Z",
+  "worker_done_at": "2026-06-04T15:40:39.468453Z"
 }

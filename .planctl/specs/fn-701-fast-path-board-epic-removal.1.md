@@ -60,5 +60,5 @@ is visible. Keep all logging through the existing `this.log` sink (stderr,
 - [ ] tests cover bypass-emits and gate-preserved-on-uncertain-path
 
 ## Done summary
-
+Threaded a triggeredByCommit discriminant through PlanScanner.onChange (now returns bool); commit-driven ingest bypasses the fn-629 isPathInHead gate (path is provably in HEAD), while FSEvents/recheckPending stay gated. The gate bounce now logs path+reason, and a heartbeat/FSEvents-drop rescan logs a trigger-tagged 'did real work' line when it delivers a snapshot a fast path missed. reemitTaskFromDef :904 gate unchanged. Added 3 tests.
 ## Evidence
