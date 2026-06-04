@@ -101,7 +101,7 @@ Both paths run this block. The **create path** enters here and runs **all four s
 
 Runs **before** scout spawn only when Phase 1a captured an `inherited_bundle` or non-empty `inherited_snippets`. Skip entirely otherwise (the usual refine case).
 
-**Goal:** know what's in scope without rendering the full bundle into context. At the router tier the planner **browses the menu, never full-renders** — context goes down, not up. Full bundle render is reserved for inheritor-tier `render-spec` in `/plan:work`, `/plan:close`, `/plan:audit`.
+**Goal:** know what's in scope without rendering the full bundle into context. At the router tier the planner **browses the menu, never full-renders** — context goes down, not up. Full bundle render is reserved for inheritor-tier `render-spec` in `/plan:work` and `/plan:close`.
 
 1. **Show the bundle** (`inherited_bundle` set): `promptctl show-bundle <inherited_bundle>` — emits snippet-ids + one-line summaries. Pin as `inherited_bundle_menu`. Do **not** `promptctl render` it or `show-snippet` every member.
 2. **Spot-show** a decision-relevant snippet selectively: `promptctl show-snippet <name>`. Pull only what bears on a decision (naming convention, error-handling pattern, validation contract). Multiple calls fine; rendering the whole bundle one snippet at a time is not.
