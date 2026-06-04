@@ -52,5 +52,5 @@ instead (single-slot, no history growth, auto-cleared by the next real
 - [ ] `bun test test/view-shell.test.ts test/live-shell-core.test.ts` green.
 
 ## Done summary
-
+Routed the connecting spinner through the ephemeral refreshLive overlay instead of pushFrame: ticks no longer grow the history ring, visibleRows honors the overlay on empty history so connect still paints, and passthrough refreshLive now emits plain for non-TTY stdout. Added a live-shell-core regression for empty-history overlay + zero history growth.
 ## Evidence
