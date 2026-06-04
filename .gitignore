@@ -34,8 +34,6 @@ agents/practice-scout.md
 # Generated skills (rendered from skill-templates/*.md.tmpl;
 # each SKILL.md carries _promptctl_path marker).
 skills/work/
-skills/queue/
-skills/defer/
 
 # macOS
 .DS_Store
