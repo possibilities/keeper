@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-04T01:54:35.851189Z",
+  "depends_on": [],
+  "epic": "fn-697-cut-board-subagent-refetch-storm",
+  "id": "fn-697-cut-board-subagent-refetch-storm.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Column-narrow subagent_invocations frame",
+  "updated_at": "2026-06-04T01:54:35.851189Z"
+}
