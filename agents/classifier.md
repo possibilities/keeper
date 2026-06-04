@@ -50,7 +50,7 @@ Theoretical issues, style preferences, minor optimizations, naming nitpicks, and
 
 ## Multi-Repo Discipline
 
-Prefer paths within `primary_repo` when possible — `/plan:audit` plans tasks against the source repo by default. Findings touching files outside `primary_repo` are still valid (escalate to `tier_2` / `tier_3` so the audit pass can scope the cross-repo work properly), but a finding that's localizable to `primary_repo` should be tiered there.
+Prefer paths within `primary_repo` when possible — the closer's inline audit plans tasks against the source repo by default. Findings touching files outside `primary_repo` are still valid (escalate to `tier_2` / `tier_3` so the audit pass can scope the cross-repo work properly), but a finding that's localizable to `primary_repo` should be tiered there.
 
 Include the full path within the repo in `affected_paths`.
 
