@@ -416,8 +416,8 @@ YAML schema (top-level mapping):
                                   # epic stays portable across projects; an
                                   # unresolvable sketch fails as `ref_invalid`
                                   # in the assert phase (fn-610).
-    queue_jump: <bool>            # optional, default false. /plan:queue sets
-                                  # true at mint; can also be flipped post-hoc
+    queue_jump: <bool>            # optional, default false. A scaffold YAML
+                                  # opt-in sets true at mint; can also be flipped post-hoc
                                   # on an existing epic via `planctl epic
                                   # queue-jump` (/plan:next). Rides the
                                   # planctl_invocation envelope so keeper sorts

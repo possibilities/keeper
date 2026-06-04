@@ -71,13 +71,13 @@ def build_planctl_invocation(
         Populated from ``epic.primary_repo`` for verbs targeting an epic/task;
         defaults to ``None`` (falls back to ``repo_root`` in the envelope).
     queue_jump:
-        fn-595: whether the originating scaffold event requested a priority
-        jump (``/plan:queue`` sets True; ``/plan:defer`` and everything else
-        leave False). The field is server-derived from the scaffold YAML —
-        keeperd lifts it off this envelope into ``epics.queue_jump`` and
-        derives the ``!``-prefixed ``sort_path``. Old envelopes lacking the
-        key fold to False deterministically (``?? false`` on the keeper
-        side). Mutating verbs that aren't ``scaffold`` always pass False.
+        fn-595: whether the epic requested a priority jump. Two sources set
+        True: a ``scaffold`` whose epic YAML opts in (``queue_jump: true``),
+        and the ``epic queue-jump`` verb (``/plan:next``) flipping an existing
+        epic. The field is server-derived from the epic record — keeperd lifts
+        it off this envelope into ``epics.queue_jump`` and derives the
+        ``!``-prefixed ``sort_path``. Old envelopes lacking the key fold to
+        False deterministically (``?? false`` on the keeper side).
 
     Returns
     -------

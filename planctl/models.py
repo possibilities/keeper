@@ -128,7 +128,8 @@ def normalize_epic(data: dict) -> dict:
         data["approval"] = "pending"
     # fn-595: queue_jump signals to keeper that this epic should sort above all
     # other root epics on the board (via a `!`-prefixed sort_path).
-    # The signal is server-derived from the /plan:queue scaffold event — the
+    # The signal is server-derived from a scaffold YAML opt-in (`queue_jump:
+    # true`) or the `epic queue-jump` verb (`/plan:next`) — the
     # field rides the planctl_invocation envelope (the canonical seam keeper
     # folds) so a re-fold from event 0 reproduces it deterministically. Missing
     # field defaults to False; mirrors the additive precedents (snippets,
