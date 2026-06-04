@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-04T00:42:06.342711Z",
+  "depends_on": [],
+  "epic": "fn-694-reduce-tui-surface-latency",
+  "id": "fn-694-reduce-tui-surface-latency.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Diagnose server poll-loop stalls",
+  "updated_at": "2026-06-04T00:42:06.342711Z"
+}
