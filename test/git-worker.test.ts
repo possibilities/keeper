@@ -19,7 +19,9 @@ import {
 import {
   buildDiscoveryCandidates,
   buildGitSnapshot,
+  COMMIT_ENUM_MAX_RETRIES,
   type DiscoveryContext,
+  decideHeadCacheAdvance,
   decideHeadDivergence,
   decideReconcileTransitions,
   discoverProjectRoots,
@@ -947,6 +949,227 @@ test("decideHeadDivergence: a transient blip (commit race) that re-agrees never 
 });
 
 // ---------------------------------------------------------------------------
+// decideHeadCacheAdvance — epic fn-705 (T2). The pure policy gating whether
+// emitSnapshot advances `lastHeadOidByRoot` after `enumerateCommitsInDelta`.
+// The bug: a transient enumeration throw used to advance the cache anyway,
+// permanently skipping (dropping) the failed commit's `planctl-commit-changed`
+// + `Commit` discharge. The fix holds the cache so the next observation
+// re-enumerates — bounded by COMMIT_ENUM_MAX_RETRIES so a permanently corrupt
+// range can't hot-spin.
+// ---------------------------------------------------------------------------
+
+test("decideHeadCacheAdvance: success advances and resets the failure counter", () => {
+  // Clean enumeration → advance the cache, clear any accumulated failures.
+  expect(decideHeadCacheAdvance(true, 0, 5)).toEqual({
+    advance: true,
+    nextFailures: 0,
+    loudBackstop: false,
+  });
+  // A success AFTER prior throws still resets (the commit re-emitted on retry).
+  expect(decideHeadCacheAdvance(true, 3, 5)).toEqual({
+    advance: true,
+    nextFailures: 0,
+    loudBackstop: false,
+  });
+});
+
+test("decideHeadCacheAdvance: a transient throw HOLDS the cache so the range re-enumerates", () => {
+  // First throw: hold (advance=false), bump the counter, no loud alarm.
+  const first = decideHeadCacheAdvance(false, 0, 5);
+  expect(first).toEqual({
+    advance: false,
+    nextFailures: 1,
+    loudBackstop: false,
+  });
+  // Still under cap on a repeated throw — keep holding, keep counting.
+  expect(decideHeadCacheAdvance(false, 1, 5)).toEqual({
+    advance: false,
+    nextFailures: 2,
+    loudBackstop: false,
+  });
+  expect(decideHeadCacheAdvance(false, 3, 5)).toEqual({
+    advance: false,
+    nextFailures: 4,
+    loudBackstop: false,
+  });
+});
+
+test("decideHeadCacheAdvance: at the retry cap, force-advance with a loud backstop (no hot spin)", () => {
+  // priorFailures+1 === maxRetries → advance anyway, reset, raise the alarm.
+  expect(decideHeadCacheAdvance(false, 4, 5)).toEqual({
+    advance: true,
+    nextFailures: 0,
+    loudBackstop: true,
+  });
+  // maxRetries=1 degenerate cap: a single throw immediately force-advances.
+  expect(decideHeadCacheAdvance(false, 0, 1)).toEqual({
+    advance: true,
+    nextFailures: 0,
+    loudBackstop: true,
+  });
+});
+
+test("decideHeadCacheAdvance: COMMIT_ENUM_MAX_RETRIES holds for N-1 throws then force-advances on the Nth", () => {
+  // Walk the real production cap exactly: the first MAX-1 throws hold the
+  // cache (drop-proof re-enumeration), the MAX-th breaks the spin.
+  let failures = 0;
+  for (let i = 0; i < COMMIT_ENUM_MAX_RETRIES - 1; i++) {
+    const d = decideHeadCacheAdvance(false, failures, COMMIT_ENUM_MAX_RETRIES);
+    expect(d.advance).toBe(false);
+    expect(d.loudBackstop).toBe(false);
+    failures = d.nextFailures;
+  }
+  expect(failures).toBe(COMMIT_ENUM_MAX_RETRIES - 1);
+  const last = decideHeadCacheAdvance(false, failures, COMMIT_ENUM_MAX_RETRIES);
+  expect(last).toEqual({ advance: true, nextFailures: 0, loudBackstop: true });
+});
+
+// ---------------------------------------------------------------------------
+// fn-705 (T2) re-enumeration integration: model the emitSnapshot HEAD-oid
+// delta loop against a real git repo and assert that a transient enumeration
+// throw does NOT skip the commit — the held cache re-enumerates it on the next
+// (clean) observation, re-emitting its `planctl-commit-changed` payload. Also
+// covers the divergence-wedge window (suppression holds the cache → re-enumerates
+// on clear), since both share the same "don't advance `prev`" mechanism.
+// ---------------------------------------------------------------------------
+
+// Faithful re-creation of emitSnapshot's HEAD-oid delta + advance arms, driving
+// the same `decideHeadCacheAdvance` policy + `enumerateCommitsInDelta` /
+// `filterPlanctlChanges` the worker uses. `enumThrows` lets a test simulate a
+// transient enumeration failure for one observation.
+function stepHeadDelta(
+  root: string,
+  cache: Map<string, string | null>,
+  failures: Map<string, number>,
+  currentHeadOid: string | null,
+  enumThrows: boolean,
+): { planctlEmits: string[][]; loud: boolean } {
+  const planctlEmits: string[][] = [];
+  let loud = false;
+  if (!cache.has(root)) {
+    cache.set(root, currentHeadOid);
+    return { planctlEmits, loud };
+  }
+  const prev = cache.get(root) ?? null;
+  if (currentHeadOid !== null && currentHeadOid !== prev) {
+    let enumOk = true;
+    try {
+      if (enumThrows) throw new Error("simulated enumeration failure");
+      const commits = enumerateCommitsInDelta(root, prev, currentHeadOid);
+      for (const c of commits) {
+        const changes = filterPlanctlChanges(c.files);
+        if (changes.length > 0) planctlEmits.push(changes.map((ch) => ch.path));
+      }
+    } catch {
+      enumOk = false;
+    }
+    const decision = decideHeadCacheAdvance(
+      enumOk,
+      failures.get(root) ?? 0,
+      COMMIT_ENUM_MAX_RETRIES,
+    );
+    if (decision.nextFailures === 0) failures.delete(root);
+    else failures.set(root, decision.nextFailures);
+    loud = decision.loudBackstop;
+    if (decision.advance) cache.set(root, currentHeadOid);
+  }
+  return { planctlEmits, loud };
+}
+
+test("emitSnapshot delta: a transient enumeration throw re-emits planctl-commit-changed on the next clean observation", () => {
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const cache = new Map<string, string | null>();
+  const failures = new Map<string, number>();
+
+  // Initial commit so HEAD resolves, then seed the cache on first sighting (no
+  // emit) — mirrors emitSnapshot's bootstrap arm.
+  const seedOid = gitCommit(root, "init.ts", "init\n", {});
+  const seed = stepHeadDelta(root, cache, failures, seedOid, false);
+  expect(seed.planctlEmits).toEqual([]);
+
+  // A planctl-shaped commit lands.
+  const planctlOid = gitCommit(
+    root,
+    ".planctl/epics/fn-999-demo.json",
+    "scaffold\n",
+    {},
+  );
+
+  // Observation #1: enumeration THROWS transiently. The pre-fn-705 bug would
+  // advance the cache past this commit and drop it forever.
+  const obs1 = stepHeadDelta(root, cache, failures, planctlOid, true);
+  expect(obs1.planctlEmits).toEqual([]); // nothing emitted — the throw ate it
+  expect(cache.get(root)).toBe(seedOid); // cache HELD at the pre-commit head
+  expect(failures.get(root)).toBe(1); // one failure recorded
+
+  // Observation #2: same (or any newer) head, enumeration succeeds. Because the
+  // cache was held, the SAME range re-enumerates and the dropped commit's
+  // planctl change re-emits — drop-proof.
+  const obs2 = stepHeadDelta(root, cache, failures, planctlOid, false);
+  expect(obs2.planctlEmits).toHaveLength(1);
+  expect(obs2.planctlEmits[0]).toContain(".planctl/epics/fn-999-demo.json");
+  expect(cache.get(root)).toBe(planctlOid); // advanced now that it succeeded
+  expect(failures.has(root)).toBe(false); // counter reset on success
+});
+
+test("emitSnapshot delta: persistent enumeration failure force-advances after COMMIT_ENUM_MAX_RETRIES (no hot spin)", () => {
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const cache = new Map<string, string | null>();
+  const failures = new Map<string, number>();
+  const seedOid = gitCommit(root, "init.ts", "init\n", {});
+  stepHeadDelta(root, cache, failures, seedOid, false); // seed
+
+  const nextOid = gitCommit(root, "a.ts", "src\n", {});
+
+  // Throw on every observation. For the first MAX-1 the cache holds (the range
+  // keeps re-enumerating); on the MAX-th it force-advances with a loud alarm so
+  // the worker can't spin forever on a poisoned range.
+  for (let i = 0; i < COMMIT_ENUM_MAX_RETRIES - 1; i++) {
+    const obs = stepHeadDelta(root, cache, failures, nextOid, true);
+    expect(obs.loud).toBe(false);
+    expect(cache.get(root)).toBe(seedOid); // still held
+  }
+  const final = stepHeadDelta(root, cache, failures, nextOid, true);
+  expect(final.loud).toBe(true); // loud backstop alarm
+  expect(cache.get(root)).toBe(nextOid); // force-advanced past the poison
+  expect(failures.has(root)).toBe(false); // counter reset post force-advance
+});
+
+test("emitSnapshot delta: divergence-wedge window holds the cache → commits re-enumerate on clear", () => {
+  // The divergence guard `return`s before the delta arm, so during suppression
+  // the cache is never touched. Model that as "skip the step entirely while
+  // suppressed" and assert the post-clear observation re-enumerates the full
+  // window — the same drop-proof property as the throw path.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const cache = new Map<string, string | null>();
+  const failures = new Map<string, number>();
+  const seedOid = gitCommit(root, "init.ts", "init\n", {});
+  stepHeadDelta(root, cache, failures, seedOid, false); // seed
+
+  // Two planctl commits land DURING a divergence-suppression window — emitSnapshot
+  // returns early, so we run NO step for them (the cache stays at seedOid).
+  gitCommit(root, ".planctl/tasks/fn-999-demo.1.json", "task 1\n", {});
+  const headDuringWedge = gitCommit(
+    root,
+    ".planctl/tasks/fn-999-demo.2.json",
+    "task 2\n",
+    {},
+  );
+  expect(cache.get(root)).toBe(seedOid); // untouched through the wedge
+
+  // Wedge clears: the next clean observation re-enumerates the WHOLE window
+  // (seed..headDuringWedge), re-emitting both planctl commits.
+  const cleared = stepHeadDelta(root, cache, failures, headDuringWedge, false);
+  const flatPaths = cleared.planctlEmits.flat();
+  expect(flatPaths).toContain(".planctl/tasks/fn-999-demo.1.json");
+  expect(flatPaths).toContain(".planctl/tasks/fn-999-demo.2.json");
+  expect(cache.get(root)).toBe(headDuringWedge);
+});
+
+// ---------------------------------------------------------------------------
 // parseTaskTrailers — collect-all policy on the `Task:` trailer block.
 // Distinct from parseSessionIdTrailer's take-last: a commit closing N tasks
 // must light N entries on the link fold.
@@ -1014,6 +1237,10 @@ function gitCommit(
   body: string,
   trailers: Record<string, string[]>,
 ): string {
+  // `filename` may be a nested repo-relative path (e.g. `.planctl/epics/x.json`
+  // for the fn-705 re-enumeration tests); ensure its parent dir exists. A flat
+  // name leaves `dirname` === `root`, so the recursive mkdir is a no-op there.
+  mkdirSync(join(root, filename, ".."), { recursive: true });
   writeFileSync(join(root, filename), `${filename} contents\n`);
   let res = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
     stdout: "ignore",

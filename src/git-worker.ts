@@ -384,6 +384,21 @@ const MAX_SUBSCRIBES_PER_CYCLE = 16;
 const HEAD_DIVERGENCE_GRACE_MS = 90_000;
 
 /**
+ * Epic fn-705 (T2): retry cap for a failed `enumerateCommitsInDelta` in
+ * `emitSnapshot`. The commit channel (fn-681 `planctl-commit-changed` + the
+ * `Commit` discharge) MUST NOT silently drop a commit when enumeration throws
+ * transiently — so on a throw the per-root HEAD-oid cache is held back, and
+ * the next HEAD-oid observation re-enumerates the same range. To bound the
+ * spin on a PERMANENTLY broken object (a corrupt pack, a missing loose
+ * object), after this many consecutive failures the cache advances anyway
+ * with a loud one-time alarm, accepting the lost commit rather than
+ * re-enumerating the same poisoned range on every observation forever. The
+ * 60s heartbeat backstop still recovers the projection in that pathological
+ * case. See {@link decideHeadCacheAdvance}.
+ */
+export const COMMIT_ENUM_MAX_RETRIES = 5;
+
+/**
  * Positive ignore globs for `@parcel/watcher`. Mirrors `plan-worker.ts`'s
  * `IGNORE_GLOBS` — the same noise (build outputs, vendored deps, package
  * caches) that floods FSEvents under a broad watch root. Duplicated rather
@@ -808,6 +823,57 @@ export function decideHeadDivergence(
   }
   const sinceMs = priorSinceMs ?? nowMs;
   return { suppress: true, sinceMs, trip: nowMs - sinceMs >= graceMs };
+}
+
+/**
+ * Pure decision for whether `emitSnapshot` may advance the per-root HEAD-oid
+ * cache (`lastHeadOidByRoot`) after attempting `enumerateCommitsInDelta` over
+ * a HEAD-oid delta. Split out of the closure so the retry/backstop policy is
+ * unit-testable (mirrors {@link decideHeadDivergence}).
+ *
+ * Epic fn-705 (T2). The old `emitSnapshot` advanced the cache UNCONDITIONALLY
+ * (even when enumeration threw), so a single transient enumeration failure
+ * skipped the failed range forever: the commit's `planctl-commit-changed`
+ * (and `Commit` discharge) was never re-emitted and the projection fell back
+ * to FSEvents + the 60s heartbeat. The fix:
+ *
+ * - `enumOk === true` (enumeration succeeded — including the no-commits and
+ *   no-planctl-changes cases): advance, reset the failure counter to 0.
+ * - `enumOk === false` (enumeration threw) AND `priorFailures + 1 < maxRetries`:
+ *   HOLD the cache (`advance=false`) so the next HEAD-oid observation
+ *   re-enumerates the same range. Carry the bumped failure count.
+ * - `enumOk === false` AND `priorFailures + 1 >= maxRetries`: a persistently
+ *   broken range (corrupt object). Advance anyway (`advance=true`,
+ *   `loudBackstop=true`) to break the re-enumeration spin, reset the counter,
+ *   and let the caller emit a one-time loud alarm. The 60s heartbeat still
+ *   recovers the projection.
+ *
+ * Note `advance` only gates the head-cache write; the divergence wedge gate is
+ * upstream and `return`s before this is ever consulted, so a suppressed
+ * snapshot likewise never advances the cache (and re-enumerates on clear).
+ */
+export interface HeadCacheAdvanceDecision {
+  advance: boolean;
+  nextFailures: number;
+  loudBackstop: boolean;
+}
+
+export function decideHeadCacheAdvance(
+  enumOk: boolean,
+  priorFailures: number,
+  maxRetries: number,
+): HeadCacheAdvanceDecision {
+  if (enumOk) {
+    return { advance: true, nextFailures: 0, loudBackstop: false };
+  }
+  const failures = priorFailures + 1;
+  if (failures < maxRetries) {
+    // Hold the cache so the next observation re-enumerates the failed range.
+    return { advance: false, nextFailures: failures, loudBackstop: false };
+  }
+  // Retry budget exhausted — advance anyway (loud) to avoid a hot spin on a
+  // permanently poisoned range; the heartbeat backstop covers the lost commit.
+  return { advance: true, nextFailures: 0, loudBackstop: true };
 }
 
 function readStatus(root: string): ParsedGitStatus | null {
@@ -1778,6 +1844,16 @@ function startWorker(): void {
    * observed commits", not "exhaustive historical replay".
    */
   const lastHeadOidByRoot = new Map<string, string | null>();
+  /**
+   * Epic fn-705 (T2): per-root consecutive `enumerateCommitsInDelta` failure
+   * count. Bumped on each throw while the HEAD-oid cache is held back (so the
+   * failed range re-enumerates next observation), reset to 0 on the first
+   * success, and reset when {@link COMMIT_ENUM_MAX_RETRIES} is hit and the
+   * cache is force-advanced past a permanently-broken range. Drives
+   * {@link decideHeadCacheAdvance}. Cleared with the other per-root caches on
+   * unsubscribe.
+   */
+  const headEnumFailuresByRoot = new Map<string, number>();
   // Each watched root holds a worktree subscription and (best-effort) a
   // git-common-dir subscription. The git-dir sub may be null if the
   // common-dir lookup failed or the subscribe itself rejected (logged,
@@ -1878,6 +1954,14 @@ function startWorker(): void {
     } else {
       const prev = lastHeadOidByRoot.get(root) ?? null;
       if (currentHeadOid !== null && currentHeadOid !== prev) {
+        // Epic fn-705 (T2): track whether enumeration succeeded so the
+        // head-cache advance below is gated on it — a transient throw must
+        // NOT skip the failed range (which would permanently drop the
+        // commit's `planctl-commit-changed` + `Commit` discharge), so we hold
+        // the cache and re-enumerate on the next HEAD-oid observation. Bounded
+        // by COMMIT_ENUM_MAX_RETRIES so a permanently corrupt range doesn't
+        // hot-spin. See decideHeadCacheAdvance.
+        let enumOk = true;
         try {
           const commits = enumerateCommitsInDelta(root, prev, currentHeadOid);
           for (const c of commits) {
@@ -1930,19 +2014,45 @@ function startWorker(): void {
           }
         } catch (err) {
           // Producer-only contract: a failed enumeration cannot wedge the
-          // worker; log to stderr and continue. The next HEAD-oid change
-          // will re-attempt (with `prev` updated below to the current
-          // head, so we don't perpetually re-enumerate the same range).
+          // worker; log to stderr and continue. Unlike the pre-fn-705 code we
+          // do NOT advance the head cache past this range below — `enumOk`
+          // gates the advance so the next HEAD-oid observation re-enumerates
+          // and re-emits the dropped commit's `planctl-commit-changed`.
+          enumOk = false;
           console.error(
             `[git-worker] commit enumeration failed for ${root}: ${stringifyErr(err)}`,
           );
         }
+        // Epic fn-705 (T2): advance the head cache ONLY when enumeration
+        // succeeded, or when the retry budget is spent (force-advance with a
+        // loud backstop alarm to break a hot re-enumeration spin on a
+        // permanently corrupt range). Holding the cache on a transient throw
+        // is the whole fix — the dropped commit re-enumerates next time.
+        const advanceDecision = decideHeadCacheAdvance(
+          enumOk,
+          headEnumFailuresByRoot.get(root) ?? 0,
+          COMMIT_ENUM_MAX_RETRIES,
+        );
+        if (advanceDecision.nextFailures === 0) {
+          headEnumFailuresByRoot.delete(root);
+        } else {
+          headEnumFailuresByRoot.set(root, advanceDecision.nextFailures);
+        }
+        if (advanceDecision.loudBackstop) {
+          console.error(
+            `[git-worker] commit enumeration failed ${COMMIT_ENUM_MAX_RETRIES}x for ${root} (${(prev ?? "null").slice(0, 12)}..${currentHeadOid.slice(0, 12)}) — force-advancing head cache; the commit channel dropped this range, the heartbeat backstop must recover it`,
+          );
+        }
+        if (advanceDecision.advance) {
+          // NULL head_oid is unreachable here (guarded by the `!== null`
+          // above), but the same-head no-op is still absorbed by the
+          // `currentHeadOid !== prev` branch guard.
+          lastHeadOidByRoot.set(root, currentHeadOid);
+        }
+        // When `advance` is false (transient throw, retries remain) the cache
+        // stays at `prev`, so the next observation with the same or a newer
+        // head re-enumerates the failed range — drop-proof.
       }
-      // Update prev unconditionally so a snapshot with the same head_oid
-      // doesn't re-enumerate, AND a one-off failed enumeration doesn't
-      // get stuck retrying the same range forever. NULL head_oid (e.g.
-      // a worktree with no commits) also stores as null.
-      lastHeadOidByRoot.set(root, currentHeadOid);
     }
 
     let snapshot: GitSnapshotPayload;
@@ -2147,8 +2257,11 @@ function startWorker(): void {
     lastByRoot.delete(root);
     // Clear the HEAD-oid bootstrap cache too so a re-subscribe of the same
     // root (planctl dir re-created) re-seeds from the current head and
-    // doesn't emit a phantom delta against the pre-drop state.
+    // doesn't emit a phantom delta against the pre-drop state. The fn-705
+    // enumeration-failure counter is per-root and meaningless across a
+    // re-subscribe, so drop it in lockstep.
     lastHeadOidByRoot.delete(root);
+    headEnumFailuresByRoot.delete(root);
   }
 
   async function reconcileRoots(): Promise<void> {
