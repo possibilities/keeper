@@ -51,5 +51,5 @@ New `tests/test_next_skill_consistency.py`: assert `skills/next/SKILL.md` exists
 - [ ] `tests/test_next_skill_consistency.py` passes (including the verb `--help` guard).
 
 ## Done summary
-
+Added hand-written /plan:next source skill (name: next) that resolves an epic id from arg or most-recent scaffold-envelope inference, acks, then calls planctl epic queue-jump; plus tests/test_next_skill_consistency.py with existence, name, and verb --help guards.
 ## Evidence
