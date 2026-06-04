@@ -47,5 +47,5 @@ planctl's own suite: a scaffold/refine commit carries `Session-Id: <PLANCTL_SESS
 - [ ] planctl test suite green
 
 ## Done summary
-
+Thread PLANCTL_SESSION_ID onto the planctl_invocation envelope and stamp Session-Id: <uuid> in _build_message_with_trailers; trailer omitted (commit still lands) when the env var is absent. Existing Planctl-Op/Target/Prev-Op trailers unchanged.
 ## Evidence
