@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-705-realtime-plan-worker-projection-emission",
   "bundles": [],
   "closer_done_at": "2026-06-04T21:38:41.052576Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-04T21:38:41.052576Z"
+  "updated_at": "2026-06-04T21:39:12.776881Z"
 }
