@@ -851,8 +851,14 @@ export class PlanScanner {
    * A missing/unreadable/malformed definition file is skip-and-logged
    * without emitting (mirrors {@link onChange}); the next true `task` event
    * will replay through the same path.
+   *
+   * Returns `true` iff a snapshot was emitted (mirrors {@link onChange}'s
+   * contract). The fn-629 def-file gate at `:904` STAYS in force here:
+   * task-state sidecars are gitignored and never appear in a commit's file
+   * list, so the commit-driven bypass never reaches this method — the gate
+   * is correct for every path that does.
    */
-  private reemitTaskFromDef(defPath: string): void {
+  private reemitTaskFromDef(defPath: string): boolean {
     let st: ReturnType<typeof statSync>;
     try {
       st = statSync(defPath);
@@ -861,10 +867,10 @@ export class PlanScanner {
       // changed for a task whose definition hasn't appeared yet. The cache
       // already updated; when the def lands, its `task` `onChange` reads
       // the cache and emits correctly.
-      return;
+      return false;
     }
     if (!st.isFile() || st.size > MAX_PLAN_FILE_BYTES) {
-      return;
+      return false;
     }
     let text: string;
     try {
@@ -873,7 +879,7 @@ export class PlanScanner {
       this.log(
         `[plan-worker] read failed for ${defPath}: ${stringifyErr(err)}`,
       );
-      return;
+      return false;
     }
     let parsed: unknown;
     try {
@@ -882,20 +888,20 @@ export class PlanScanner {
       this.log(
         `[plan-worker] malformed JSON in ${defPath}: ${stringifyErr(err)}`,
       );
-      return;
+      return false;
     }
     if (!parsed || typeof parsed !== "object") {
-      return;
+      return false;
     }
     const raw = parsed as RawTask;
     const id = asString(raw.id);
     if (id === null) {
-      return;
+      return false;
     }
     const runtimeStatus = this.runtimeStatusCache.get(id) ?? "todo";
     const msg = buildTaskMessage(raw, runtimeStatus, this.log);
     if (msg === null) {
-      return;
+      return false;
     }
     // Observation gate (fn-629): same producer-side gate as {@link onChange}.
     // The sidecar state file fired this re-emit, but the def file is what
@@ -903,26 +909,45 @@ export class PlanScanner {
     // the next git-worker pulse to drain it via {@link recheckPending}.
     if (!this.isTracked(defPath)) {
       this.pending.add(defPath);
-      return;
+      return false;
     }
     this.pending.delete(defPath);
     this.pathToId.set(defPath, msg.id);
     const serialized = JSON.stringify(msg);
     if (this.lastEmitted.get(msg.id) === serialized) {
-      return;
+      return false;
     }
     this.lastEmitted.set(msg.id, serialized);
     this.onSnapshot(msg);
+    return true;
   }
 
   /**
    * Process a change for `path`. Classifies → reads (bounded) → safe-parses →
    * derives → change-gates → emits. Any failure skips-and-logs without emitting.
+   *
+   * Returns `true` iff this call emitted a snapshot through {@link onSnapshot}
+   * (a fresh entity or a changed one that cleared the change-gate); `false` for
+   * every no-op outcome (non-plan path, gated-to-pending, unchanged snapshot,
+   * parse skip, task-state cache poke). The boolean lets a backstop caller
+   * ({@link reconcilePlanctlDirs} via heartbeat / FSEvents-drop rescan) detect
+   * that it delivered work a fast path missed and log a trigger-tagged line.
+   *
+   * `triggeredByCommit` (default `false`): when `true`, the fn-629 `isTracked`
+   * observation gate at the epic/task arm is BYPASSED — the
+   * `planctl-commit-changed` signal already proves the path is in HEAD (the
+   * git-worker enumerated it from a landed commit), so re-running the
+   * fail-closed `git cat-file -e HEAD` probe is redundant and (on its 1s
+   * timeout fail-closed window) is exactly what silently bounced a
+   * just-committed file into {@link pending}, delaying its snapshot until the
+   * 60s heartbeat (fn-701). The live `@parcel/watcher` callback and
+   * {@link recheckPending} pass `false` — those are the genuinely-uncertain
+   * paths and stay gated.
    */
-  onChange(path: string): void {
+  onChange(path: string, triggeredByCommit = false): boolean {
     const kind = classifyPlanPath(path);
     if (kind === null) {
-      return;
+      return false;
     }
 
     let st: ReturnType<typeof statSync>;
@@ -932,16 +957,16 @@ export class PlanScanner {
       // Read-vs-delete race (file vanished between the watch event and the
       // stat): skip-and-log, keep last good, don't emit.
       this.log(`[plan-worker] stat failed for ${path}: ${stringifyErr(err)}`);
-      return;
+      return false;
     }
     if (!st.isFile()) {
-      return;
+      return false;
     }
     if (st.size > MAX_PLAN_FILE_BYTES) {
       this.log(
         `[plan-worker] ${path} exceeds ${MAX_PLAN_FILE_BYTES} bytes (${st.size}); skipping`,
       );
-      return;
+      return false;
     }
 
     let text: string;
@@ -949,7 +974,7 @@ export class PlanScanner {
       text = readFileSync(path, "utf8");
     } catch (err) {
       this.log(`[plan-worker] read failed for ${path}: ${stringifyErr(err)}`);
-      return;
+      return false;
     }
 
     let parsed: unknown;
@@ -957,11 +982,11 @@ export class PlanScanner {
       parsed = JSON.parse(text);
     } catch (err) {
       this.log(`[plan-worker] malformed JSON in ${path}: ${stringifyErr(err)}`);
-      return;
+      return false;
     }
     if (!parsed || typeof parsed !== "object") {
       this.log(`[plan-worker] non-object JSON in ${path}; skipping`);
-      return;
+      return false;
     }
 
     // `task-state` (sidecar) updates the per-task runtime-status cache and
@@ -973,7 +998,7 @@ export class PlanScanner {
     if (kind === "task-state") {
       const taskId = taskIdFromStatePath(path);
       if (taskId === null) {
-        return;
+        return false;
       }
       const raw = parsed as RawTaskState;
       const runtimeStatus = coerceRuntimeStatus(raw.status, (bad) => {
@@ -987,14 +1012,16 @@ export class PlanScanner {
         // Same value as already cached: the composed TaskSnapshot wouldn't
         // change and the change-gate would suppress it anyway. Skip the
         // re-emit work.
-        return;
+        return false;
       }
       const defPath = taskDefPathFromStatePath(path);
       if (defPath === null) {
-        return;
+        return false;
       }
-      this.reemitTaskFromDef(defPath);
-      return;
+      // `task-state` paths are gitignored sidecars that never appear in a
+      // commit's file list, so `triggeredByCommit` is always `false` here —
+      // the def-file gate inside `reemitTaskFromDef` stays in force.
+      return this.reemitTaskFromDef(defPath);
     }
 
     // Pass the scanner's own `log` so a malformed `approval` field is logged
@@ -1017,7 +1044,7 @@ export class PlanScanner {
     if (msg === null) {
       // No usable id — can't key the projection. Skip-and-log.
       this.log(`[plan-worker] ${path} has no usable id; skipping`);
-      return;
+      return false;
     }
 
     // Observation gate (fn-629): for epic/task DEFINITION files, suppress
@@ -1030,26 +1057,42 @@ export class PlanScanner {
     // above via the `task-state` arm). `isTracked` defaults to
     // `() => true`, so a gateless scanner emits unconditionally.
     //
+    // fn-701: a commit-driven ingest (`triggeredByCommit === true`) BYPASSES
+    // the gate entirely — the `planctl-commit-changed` signal already proves
+    // the path is in HEAD (the git-worker enumerated it from a landed commit),
+    // so re-running the fail-closed probe is redundant and (on its 1s
+    // fail-closed timeout) is the silent-bounce-to-pending bug this epic
+    // fixes. A bounce on the commit path is now impossible by construction;
+    // only the genuinely-uncertain FSEvents/recheck paths reach `isTracked`.
+    //
     // We do NOT touch `pathToId` / `lastEmitted` for a gated path: the
     // reducer never saw the entity, so there is nothing to retract on a
     // delete, and the change-gate has no "last good" to compare against
     // when the file finally lands in HEAD. A pending path is its own
     // index — see {@link pending} / {@link recheckPending} / {@link onDelete}.
-    if (!this.isTracked(path)) {
+    if (!triggeredByCommit && !this.isTracked(path)) {
+      // Make the silent bounce LOUD (fn-701): a heartbeat-only recovery from
+      // here is the signature of the fast path failing. This is the gated
+      // FSEvents / recheckPending path — the commit path never reaches it.
+      this.log(
+        `[plan-worker] fn-629 gate bounced ${path} to pending (not in HEAD; gated FSEvents/recheck path)`,
+      );
       this.pending.add(path);
-      return;
+      return false;
     }
-    // The file IS in HEAD now (or the gate is disabled). If this path was
-    // previously pending, drop it from the set — it has now drained.
+    // The file IS in HEAD now (or the gate is disabled, or this is a
+    // commit-driven bypass). If this path was previously pending, drop it
+    // from the set — it has now drained.
     this.pending.delete(path);
 
     this.pathToId.set(path, msg.id);
     const serialized = JSON.stringify(msg);
     if (this.lastEmitted.get(msg.id) === serialized) {
-      return; // change-gate: unchanged snapshot, suppress.
+      return false; // change-gate: unchanged snapshot, suppress.
     }
     this.lastEmitted.set(msg.id, serialized);
     this.onSnapshot(msg);
+    return true;
   }
 
   /**
@@ -1079,6 +1122,27 @@ export class PlanScanner {
    */
   pendingSize(): number {
     return this.pending.size;
+  }
+
+  /**
+   * Log that a BACKSTOP path (the 60s heartbeat reconcile, or an FSEvents-drop
+   * rescan) delivered a snapshot a fast path missed (fn-701). Routed through
+   * the scanner's own `log` sink (the private field the backstop callers can't
+   * reach) so a heartbeat firing in NORMAL operation — the signature of the
+   * commit/FSEvents fast path being broken — is visible in the logs.
+   *
+   * The caller gates this on `onChange` having RETURNED `true` (it emitted),
+   * which the in-memory change-gate (`lastEmitted`) already dedups against a
+   * fast-path emit earlier this cycle — so a normal first-time emit from the
+   * fast path is never double-logged here.
+   *
+   * Never a synthetic event — re-fold determinism forbids a fold-driving fact
+   * from a backstop log line.
+   */
+  logBackstopEmit(path: string, reason: "heartbeat" | "fswatcher-drop"): void {
+    this.log(
+      `[plan-worker] backstop (${reason}) emitted ${path} — a fast path missed it`,
+    );
   }
 
   /**
@@ -1463,8 +1527,19 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
  * via their definition file under `tasks/`. The boot-reconciliation sweep
  * retracts on missing definition files; a sidecar's absence is the cache's
  * `"todo"` default, not a tombstone.
+ *
+ * `triggerReason` (fn-701): when set (a backstop caller — the 60s heartbeat or
+ * an FSEvents-drop rescan), a definition-file `onChange` that RETURNS `true`
+ * (it emitted a snapshot a fast path missed) logs a trigger-tagged line via
+ * {@link PlanScanner.logBackstopEmit}. The boot scan ({@link scanRoot}) passes
+ * `undefined` and stays silent — a first-time boot emit is expected, not a
+ * fast-path failure signal.
  */
-function scanPlanctlDir(planctlDir: string, scanner: PlanScanner): void {
+function scanPlanctlDir(
+  planctlDir: string,
+  scanner: PlanScanner,
+  triggerReason?: "heartbeat" | "fswatcher-drop",
+): void {
   // Pass 1: prime `runtimeStatusCache` from `state/tasks/*.state.json`. A
   // missing dir is fine (fresh clone with no state files yet). Each file is
   // bounded-read + safe-parsed + coerced through the same guard as the live
@@ -1558,7 +1633,15 @@ function scanPlanctlDir(planctlDir: string, scanner: PlanScanner): void {
         // this census; marking before onChange keeps a mid-rewrite parse
         // failure from looking "absent".
         scanner.markSeen(full);
-        scanner.onChange(full);
+        // Boot/heartbeat/drop ingest is FSEvents-gated (`triggeredByCommit`
+        // stays false) — this is the genuinely-uncertain path the fn-629 gate
+        // exists for. When a backstop trigger drove this scan and `onChange`
+        // actually emitted, surface it: a backstop delivering work means a
+        // fast path missed it (fn-701).
+        const emitted = scanner.onChange(full);
+        if (emitted && triggerReason !== undefined) {
+          scanner.logBackstopEmit(full, triggerReason);
+        }
       }
     }
   }
@@ -1640,14 +1723,20 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
  * Per-dir failures inside {@link scanPlanctlDir} skip-and-log (the same
  * discipline as the boot scan); the loop never throws. Exported for unit
  * reach.
+ *
+ * `triggerReason` (fn-701) tags the backstop caller — `"heartbeat"` for the
+ * 60s reconcile, `"fswatcher-drop"` for an FSEvents-drop rescan — so an
+ * emission a fast path missed logs a trigger-tagged "did real work" line. Pass
+ * `undefined` (boot / silent reconcile) to suppress the log.
  */
 export function reconcilePlanctlDirs(
   roots: readonly string[],
   scanner: PlanScanner,
+  triggerReason?: "heartbeat" | "fswatcher-drop",
 ): void {
   const dirs = discoverPlanctlDirs(roots);
   for (const dir of dirs) {
-    scanPlanctlDir(dir, scanner);
+    scanPlanctlDir(dir, scanner, triggerReason);
   }
 }
 
@@ -1899,7 +1988,12 @@ function main(): void {
           if (change.op === "delete") {
             scanner.onDelete(abs);
           } else {
-            scanner.onChange(abs);
+            // fn-701: commit-driven ingest — the git-worker enumerated this
+            // path from a landed commit, so it is provably in HEAD. Pass
+            // `triggeredByCommit=true` to BYPASS the redundant fail-closed
+            // `isTracked` probe whose 1s timeout silently bounced just-
+            // committed files into pending (the ~60s board-removal lag).
+            scanner.onChange(abs, true);
           }
         } catch (err) {
           console.error(
@@ -1951,7 +2045,10 @@ function main(): void {
   heartbeatTimer = setInterval(() => {
     if (shuttingDown) return;
     try {
-      reconcilePlanctlDirs(data.roots, scanner);
+      // fn-701: tag as "heartbeat" so an emission here (a snapshot the
+      // commit/FSEvents fast path missed) logs a "did real work" line —
+      // the signature of the fast path being broken.
+      reconcilePlanctlDirs(data.roots, scanner, "heartbeat");
     } catch (err) {
       console.error(
         `[plan-worker] periodic reconcile failed: ${stringifyErr(err)}`,
@@ -2018,7 +2115,10 @@ function main(): void {
           if (shuttingDown) {
             return;
           }
-          reconcilePlanctlDirs([root], scanner);
+          // fn-701: tag as "fswatcher-drop" so a snapshot recovered here
+          // (one the dropped FSEvents change would otherwise have lost) logs
+          // a "did real work" line.
+          reconcilePlanctlDirs([root], scanner, "fswatcher-drop");
         });
         schedulers.push(rescan);
         watcher

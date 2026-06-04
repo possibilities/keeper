@@ -1867,6 +1867,118 @@ test("onChange: multi-file tree — epic committed before its task lands → onl
   expect(scanner.pendingSize()).toBe(0);
 });
 
+test("onChange(triggeredByCommit=true): emits WITHOUT invoking isPathInHead (fn-701 commit bypass)", () => {
+  // No git tree at all — the gate probe is the ONLY thing that would block,
+  // and the commit bypass must skip it. We inject an `isTracked` that THROWS
+  // if called, so the test fails loudly if the bypass regresses to re-probing.
+  const emitted: PlanMessage[] = [];
+  let probed = false;
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    () => {
+      probed = true;
+      throw new Error("isPathInHead must NOT be called on the commit path");
+    },
+  );
+
+  // Write an UNCOMMITTED epic file — a gated onChange would bounce it to
+  // pending; the commit-driven bypass must emit it directly.
+  const epicPath = writeEpic("fn-7-bypass", {
+    title: "Bypass",
+    status: "open",
+    primary_repo: tmpDir,
+  });
+
+  const didEmit = scanner.onChange(epicPath, true);
+  expect(didEmit).toBe(true);
+  expect(probed).toBe(false);
+  expect(emitted.length).toBe(1);
+  expect(emitted[0].kind).toBe("plan-epic");
+  expect((emitted[0] as { id: string }).id).toBe("fn-7-bypass");
+  expect(scanner.pendingSize()).toBe(0);
+});
+
+test("onChange(triggeredByCommit=false): an uncommitted file still bounces to pending AND logs the bounce (fn-701)", () => {
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const logs: string[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    (l) => logs.push(l),
+    isPathInHead,
+  );
+
+  const epicPath = writeEpic("fn-8-gated", {
+    title: "Gated",
+    status: "open",
+    primary_repo: tmpDir,
+  });
+
+  // Default false (the FSEvents/recheck path) — the gate stays in force.
+  const didEmit = scanner.onChange(epicPath);
+  expect(didEmit).toBe(false);
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(1);
+  // The silent bounce is now LOUD: it names the path and the gated reason.
+  expect(logs.some((l) => l.includes(epicPath))).toBe(true);
+  expect(logs.some((l) => l.includes("gate bounced"))).toBe(true);
+
+  // recheckPending also passes false — the gate is preserved across the drain.
+  logs.length = 0;
+  scanner.recheckPending();
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(1);
+  expect(logs.some((l) => l.includes(epicPath))).toBe(true);
+});
+
+test("reconcilePlanctlDirs(heartbeat): a backstop emit logs a trigger-tagged 'did real work' line (fn-701)", () => {
+  // `reconcilePlanctlDirs` discovers `<root>/<project>/.planctl` one level
+  // deep, so the project must sit under tmpDir as its own git repo.
+  const proj = join(tmpDir, "proj");
+  const epicDir = join(proj, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+  gitInit(proj);
+
+  const emitted: PlanMessage[] = [];
+  const logs: string[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    (l) => logs.push(l),
+    isPathInHead,
+  );
+
+  // A committed epic the fast path never saw — the heartbeat reconcile picks
+  // it up. (The gate passes: the file IS in HEAD.)
+  const epicPath = join(epicDir, "fn-9-backstop.json");
+  writeFileSync(
+    epicPath,
+    JSON.stringify({
+      id: "fn-9-backstop",
+      title: "Backstop",
+      status: "open",
+      primary_repo: proj,
+    }),
+  );
+  git(proj, "add", epicPath);
+  git(proj, "commit", "-q", "-m", "add epic");
+
+  reconcilePlanctlDirs([tmpDir], scanner, "heartbeat");
+  expect(emitted.length).toBe(1);
+  expect((emitted[0] as { id: string }).id).toBe("fn-9-backstop");
+  expect(
+    logs.some((l) => l.includes("heartbeat") && l.includes(epicPath)),
+  ).toBe(true);
+
+  // A SECOND heartbeat over the unchanged file is change-gate-suppressed — no
+  // emit, and so no "did real work" log (the dedup the spec requires).
+  logs.length = 0;
+  reconcilePlanctlDirs([tmpDir], scanner, "heartbeat");
+  expect(emitted.length).toBe(1);
+  expect(logs.some((l) => l.includes("heartbeat"))).toBe(false);
+});
+
 test("zero-task epic: a committed epic file with no task files emits without sibling tasks", () => {
   gitInit(tmpDir);
 
