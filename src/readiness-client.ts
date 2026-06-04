@@ -49,6 +49,9 @@
  * (`own-progress-sub`) doesn't false-negative. `byId` collapses them
  * last-write-wins; `rows` carries the full wire-order stream. This is the
  * load-bearing invariant covered by `test/board.test.ts`'s regression.
+ * (fn-697.2 narrowed the wire frame to the safe-7 columns — `agent_id` is no
+ * longer projected — but every row is still streamed; the all-rows-not-byId
+ * invariant is unaffected by the column narrow.)
  *
  * Lifecycle contract:
  *   - First-paint gate. `subscribeReadiness` withholds `onSnapshot` until
@@ -113,6 +116,13 @@ import type {
 // live at once (e.g. a long-lived session buried under newer ones).
 const JOBS_PAGE_LIMIT = 0;
 const EPICS_PAGE_LIMIT = 0;
+// Full set — page limit 0 streams every per-job sub-agent row (NOT
+// latest-per-job), which the renderer's ×N count / N-stuck annotation and
+// superseded-orphan detection plus predicate-6 all require. fn-697.2 narrowed
+// the descriptor's COLUMNS to the safe-7 (halving per-frame serialize cost)
+// but kept ALL rows — column projection, not a row filter/page (paging would
+// fight the `job_id` wire-pk / `byId` diff; a latest-per-job aggregate would
+// break the count/stuck math).
 const SUBAGENT_INVOCATIONS_PAGE_LIMIT = 0;
 // Full set — one row per planctl-backed git worktree; the watched set is
 // scoped to project roots that have produced events, which is bounded by the

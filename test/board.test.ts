@@ -373,6 +373,74 @@ test("collapseSubagentsByName: out-of-order input still keeps max turn_seq", () 
   expect(g?.stuck).toBe(1);
 });
 
+test("collapseSubagentsByName: fn-697.2 safe-7 narrowed wire shape collapses losslessly", () => {
+  // fn-697.2 narrowed SUBAGENT_INVOCATIONS_DESCRIPTOR.columns from 12 to the
+  // safe-7 {job_id, subagent_type, turn_seq, ts, status, description,
+  // last_event_id}. The wire decode no longer surfaces agent_id /
+  // tool_use_id / prompt_chars / duration_ms / updated_at — those cells
+  // arrive `undefined`. This asserts the renderer's collapse (the heaviest
+  // consumer: ×N count + stuck-orphan detection + the surviving row's
+  // type/desc/status used by `subagentLinesFor`) is byte-identical when fed
+  // ONLY the safe-7, proving no dropped column is load-bearing.
+  const safe7 = (
+    over: Pick<
+      SubagentInvocation,
+      | "job_id"
+      | "subagent_type"
+      | "turn_seq"
+      | "ts"
+      | "status"
+      | "description"
+      | "last_event_id"
+    >,
+  ): SubagentInvocation =>
+    ({
+      // Exactly the columns the narrowed descriptor projects; the dropped
+      // five are absent (would be `undefined` off the wire), matching the
+      // real narrowed frame rather than the full SQL row.
+      ...over,
+    }) as unknown as SubagentInvocation;
+  const rows: SubagentInvocation[] = [
+    safe7({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 0,
+      ts: 10,
+      status: "ok",
+      description: "first",
+      last_event_id: 100,
+    }),
+    safe7({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 1,
+      ts: 11,
+      status: "running",
+      description: "orphan",
+      last_event_id: 101,
+    }),
+    safe7({
+      job_id: "j",
+      subagent_type: "plan:worker-high",
+      turn_seq: 2,
+      ts: 12,
+      status: "ok",
+      description: "surviving",
+      last_event_id: 102,
+    }),
+  ];
+  const out = collapseSubagentsByName(rows);
+  expect(out).toHaveLength(1);
+  // ×N count, stuck-orphan, surviving row's render fields all derive from the
+  // safe-7 alone — no dropped column touched.
+  expect(out[0]?.count).toBe(3);
+  expect(out[0]?.stuck).toBe(1);
+  expect(out[0]?.row.turn_seq).toBe(2);
+  expect(out[0]?.row.status).toBe("ok");
+  expect(out[0]?.row.subagent_type).toBe("plan:worker-high");
+  expect(out[0]?.row.description).toBe("surviving");
+});
+
 test("collapseSubagentsByName: null subagent_type groups together within a job", () => {
   // Two null-subagent_type rows on the same job collapse to one group —
   // null is treated as its own key value, not as "always distinct."

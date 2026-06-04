@@ -539,19 +539,28 @@ export const PROFILES_DESCRIPTOR: CollectionDescriptor = {
 export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
   name: "subagent_invocations",
   table: "subagent_invocations",
+  // fn-697.2: narrowed from 12 columns to the safe-7 every consumer
+  // actually reads — wire render (`collapseSubagentsByName` +
+  // `subagentLinesFor` read `{job_id, subagent_type, turn_seq, status,
+  // description}` for the ×N/stuck/superseded annotations), readiness
+  // predicate-6 (`{job_id, status, ts}`), and the in-process autopilot read
+  // (autopilot-worker `loadReconcileSnapshot` → `collapseSubagentsByName`,
+  // same read-set). `last_event_id` MUST stay — it's the `version` column
+  // the diff (`selectVersionsByIds`) and result re-seed read. Dropped
+  // `agent_id, tool_use_id, prompt_chars, duration_ms, updated_at` are read
+  // by NO consumer (`countAndToken` reads only `pk`; `selectVersionsByIds`
+  // reads `(pk, version)`). Halves the dominant per-frame serialize cost of
+  // the ~2005-row subagent set. Wire + in-process only — no SCHEMA_VERSION
+  // bump, no keeper-py touch. NOT a row-filter or page (those break render's
+  // count/stuck + the byId diff).
   columns: [
     "job_id",
-    "agent_id",
+    "subagent_type",
     "turn_seq",
     "ts",
-    "tool_use_id",
-    "subagent_type",
-    "description",
-    "prompt_chars",
     "status",
-    "duration_ms",
+    "description",
     "last_event_id",
-    "updated_at",
   ],
   pk: "job_id",
   version: "last_event_id",
