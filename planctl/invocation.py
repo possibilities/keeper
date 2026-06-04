@@ -17,7 +17,7 @@ Commit message format (produced by the hook for mutating verbs)::
     Planctl-Op: <verb>
     Planctl-Target: <id>
     Planctl-Prev-Op: <sha of HEAD captured BEFORE git commit>
-    Session-Id: <PLANCTL_SESSION_ID>   (omitted when the env var is absent)
+    Session-Id: <CLAUDE_CODE_SESSION_ID>   (omitted when the env var is absent)
 
 Envelope fields (mutating verbs):
     repo_root   — the cwd-derived repo at invocation time (always present).
@@ -91,16 +91,17 @@ def build_planctl_invocation(
 
     planctl_dir = _planctl_dir(repo_root)
 
-    # Resolve session id — PLANCTL_SESSION_ID is the sole source. Fail closed
-    # on None: producer (the claude launcher) MUST export this for every
-    # planctl mutating verb invocation.
-    session_id = os.environ.get("PLANCTL_SESSION_ID") or None
+    # Resolve session id — CLAUDE_CODE_SESSION_ID is the sole source. Fail
+    # closed on None: the claude binary ships this intrinsically on every
+    # session (including resumed ones), so it is always present for a planctl
+    # mutating verb invocation inside a Claude harness.
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or None
     if session_id is None:
         raise RuntimeError(
             "planctl build_planctl_invocation requires a resolvable session_id; "
-            "export PLANCTL_SESSION_ID (the claude launcher does this for you "
-            "inside a Claude harness; tests and manual invocations must set it "
-            "themselves)."
+            "CLAUDE_CODE_SESSION_ID must be set (the claude binary ships it "
+            "intrinsically inside a Claude harness; tests and manual invocations "
+            "must set it themselves)."
         )
 
     # Touched files record paths (for hook cleanup, G7).

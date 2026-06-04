@@ -240,7 +240,7 @@ def _build_message_with_trailers(
                                         post-hook's ``Planctl-Prev-Op``)
       ``Session-Id: <uuid>``          — the committing session (the same opaque
                                         v4 UUID the keeper hook uses, resolved
-                                        from ``PLANCTL_SESSION_ID``). Lets the
+                                        from ``CLAUDE_CODE_SESSION_ID``). Lets the
                                         keeper derive the creator/refiner edge
                                         from the durable commit instead of the
                                         fragile stdout-envelope scrape (fn-695).
@@ -338,7 +338,7 @@ def auto_commit_from_invocation(payload: dict[str, Any]) -> str | None:
 
     op = payload.get("op", "")
     target = payload.get("target") or ""
-    # fn-695: the committing session id (PLANCTL_SESSION_ID), carried on the
+    # fn-695: the committing session id (CLAUDE_CODE_SESSION_ID), carried on the
     # envelope by build_planctl_invocation. Fail-open — when absent (older
     # envelope shapes / manual non-interactive calls) the Session-Id trailer is
     # simply omitted and the commit still lands.

@@ -1,6 +1,7 @@
 """Tests for planctl roots config + multi-project discovery + epic-id allocation.
 
-fn-614 task .3: session-id env renamed JOBCTL_SESSION_ID → PLANCTL_SESSION_ID.
+Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
+tests set it explicitly.
 
 Covers:
 - config loader: present / absent→default / malformed→default / path expansion
@@ -21,7 +22,7 @@ from planctl.config import load_roots
 from planctl.discovery import discover_projects
 from planctl.ids import scan_epic_ids_global
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-roots-discovery-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-roots-discovery-fixture"}
 
 
 # --------------------------------------------------------------------------
@@ -211,7 +212,7 @@ def test_creates_are_per_project_numbered(tmp_path, monkeypatch):
     With per-project numbering, project A's first epic is fn-1 and project B's
     first epic is ALSO fn-1 — discovery no longer participates in the number.
     """
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-roots-discovery-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-roots-discovery-fixture")
 
     root = tmp_path / "code"
     root.mkdir()
@@ -244,7 +245,7 @@ def test_creates_are_per_project_numbered(tmp_path, monkeypatch):
 
 def test_create_rejects_global_name_collision(tmp_path, monkeypatch):
     """When two projects would mint the same full epic id, the second fails."""
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-roots-discovery-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-roots-discovery-fixture")
 
     root = tmp_path / "code"
     root.mkdir()

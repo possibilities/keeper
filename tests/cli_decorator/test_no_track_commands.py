@@ -39,7 +39,7 @@ def _parse_json_stream(text: str) -> list[dict]:
 
 def _create_project(tmp_path, monkeypatch):
     """Init a planctl project in tmp_path and return the path."""
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-no-track-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-no-track-fixture")
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()
     result = runner.invoke(cli, ["init"])
@@ -55,7 +55,7 @@ def _create_epic(project_path) -> str:
     fail otherwise.
     """
     runner = CliRunner()
-    env = {**os.environ, "PLANCTL_SESSION_ID": "test-no-track-fixture"}
+    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-no-track-fixture"}
     result = runner.invoke(
         cli,
         ["epic", "create", "--title", "No-track test epic"],
@@ -87,7 +87,7 @@ def test_cat_stdout_is_pure_markdown(tmp_path, monkeypatch):
 
     expected = spec_path.read_bytes()
 
-    env = {**os.environ, "PLANCTL_SESSION_ID": "test-no-track-fixture"}
+    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-no-track-fixture"}
     actual = subprocess.check_output(
         ["planctl", "cat", epic_id],
         cwd=str(project_path),
@@ -113,7 +113,7 @@ def test_validate_stdout_contract(tmp_path, monkeypatch):
     project_path = _create_project(tmp_path, monkeypatch)
     epic_id = _create_epic(project_path)
 
-    env = {**os.environ, "PLANCTL_SESSION_ID": "test-no-track-fixture"}
+    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-no-track-fixture"}
 
     # First validate: never-validated epic, structurally valid → two JSON docs.
     raw = subprocess.check_output(

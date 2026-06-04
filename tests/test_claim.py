@@ -373,7 +373,7 @@ def _git_init(repo) -> None:
 # pytest 3s signal timeout under heavy parallel xdist load — see conftest).
 _RESOLUTION_ENV = {
     "PLANCTL_ACTOR": "alice@example.com",
-    "PLANCTL_SESSION_ID": "test-claim-resolution-fixture",
+    "CLAUDE_CODE_SESSION_ID": "test-claim-resolution-fixture",
 }
 
 

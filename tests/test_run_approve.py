@@ -1,6 +1,7 @@
 """Tests for planctl approve — approval gate field + gates (fn-592 task .1).
 
-fn-614 task .3: session-id env renamed JOBCTL_SESSION_ID → PLANCTL_SESSION_ID.
+Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
+tests set it explicitly.
 
 Renamed from ``test_set_approval.py`` when the verb was renamed from
 ``set-approval`` to ``approve``.  Covers the original four cases plus the
@@ -35,14 +36,14 @@ from planctl.models import APPROVAL_STATUSES, normalize_epic, normalize_task
 from planctl.store import LocalFileStateStore, atomic_write_json, now_iso
 from planctl.validation_restamp import VALIDATION_RESTAMP_VERBS
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-approve-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-approve-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
     """Init a planctl project under a fresh git repo."""
     import subprocess
 
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-approve-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-approve-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     runner = CliRunner()

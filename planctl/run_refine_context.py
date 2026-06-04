@@ -204,7 +204,7 @@ def run(args: SimpleNamespace) -> int:
         # fn-629 task .3: route through the central seam at output.emit().
         # Rewrite of a pre-existing tracked file (atomic_write rename-atomic)
         # → no unwind. The previous direct ``build_planctl_invocation`` call
-        # lived outside the seam's try-block, so a missing PLANCTL_SESSION_ID
+        # lived outside the seam's try-block, so a missing CLAUDE_CODE_SESSION_ID
         # raise from the build would have surfaced AFTER the write landed
         # without the structured ``commit_failed`` envelope contract.
         emit(

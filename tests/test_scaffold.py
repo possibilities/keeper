@@ -1276,7 +1276,7 @@ def test_scaffold_integrity_failure_aborts_no_writes(planctl_git_repo, monkeypat
 
 # ---------------------------------------------------------------------------
 # scaffold commit-boundary behavior. (a) the env guard still fails closed on a
-# missing PLANCTL_SESSION_ID BEFORE any write, so zero files land — this guard
+# missing CLAUDE_CODE_SESSION_ID BEFORE any write, so zero files land — this guard
 # is independent of the seam and survives fn-640. (b) post-fn-640 the seam
 # unwind is gone: a build_planctl_invocation raise AFTER the write phase
 # completed leaves the fully-written tree ON DISK (§10 no-rollback); the keeper
@@ -1285,7 +1285,7 @@ def test_scaffold_integrity_failure_aborts_no_writes(planctl_git_repo, monkeypat
 
 
 def test_scaffold_missing_session_id_writes_nothing(planctl_git_repo, monkeypatch):
-    """fn-630 (a): a missing PLANCTL_SESSION_ID fails closed BEFORE any write.
+    """A missing CLAUDE_CODE_SESSION_ID fails closed BEFORE any write (fn-630 a).
 
     Proves the orphan-epic incident can't recur via the env path: the verb
     refuses up front with ``missing_session_id``, ``scan_max_epic_id`` does not
@@ -1305,7 +1305,7 @@ def test_scaffold_missing_session_id_writes_nothing(planctl_git_repo, monkeypatc
         check=True,
     ).stdout.strip()
 
-    monkeypatch.delenv("PLANCTL_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
 
     yaml_path = _write_yaml(planctl_git_repo, _two_task_yaml())
     r = _invoke(["scaffold", "--file", yaml_path])

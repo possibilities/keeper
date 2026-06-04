@@ -1,6 +1,7 @@
 """Tests for fn-586 `preferred_backend` task field validation.
 
-fn-614 task .3: session-id env renamed JOBCTL_SESSION_ID → PLANCTL_SESSION_ID.
+Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
+tests set it explicitly.
 
 Covers the allowlist `validate` check in `run_validate.py`:
 - None / "claude" / "codex" accepted
@@ -44,7 +45,7 @@ def _parse_json_stream(text: str) -> list[dict]:
 
 def _create_project(tmp_path, monkeypatch):
     """Init a planctl project (git-init so validate path-checks resolve)."""
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-preferred-backend-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-preferred-backend-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     runner = CliRunner()
@@ -56,7 +57,7 @@ def _create_project(tmp_path, monkeypatch):
 def _seed_epic_with_task(project_path):
     """Scaffold an epic + 1 task, null out multi-repo fields so legacy-path
     validate skips path checks, return (epic_id, task_id)."""
-    env = {**os.environ, "PLANCTL_SESSION_ID": "test-preferred-backend-fixture"}
+    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-preferred-backend-fixture"}
     epic_id, task_ids = seed_epic(
         project_path,
         title="preferred_backend test epic",
@@ -85,7 +86,7 @@ def _patch_task(project_path, task_id: str, **fields) -> None:
 
 
 def _run_validate(project_path, epic_id: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PLANCTL_SESSION_ID": "test-preferred-backend-fixture"}
+    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-preferred-backend-fixture"}
     return subprocess.run(
         ["planctl", "validate", "--epic", epic_id],
         cwd=str(project_path),

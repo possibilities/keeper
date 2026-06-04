@@ -204,7 +204,7 @@ The `details.error` codes are:
 
 **Pre-commit failure leaves writes on disk (§10 no-rollback).** There is
 no seam-level write-tree unwind. On a pre-commit raise — invocation-build failure
-(e.g. missing `PLANCTL_SESSION_ID`) or a git status/add/commit error —
+(e.g. missing `CLAUDE_CODE_SESSION_ID`) or a git status/add/commit error —
 the verb's written files stay on disk and the failure envelope lands on
 stdout with exit 1. For the multi-file mint verbs (`scaffold`,
 `refine-apply`, `epic create`), a MID-WRITE crash is still unwound by
@@ -569,11 +569,11 @@ re-parents off the winner's HEAD and commits its own disjoint paths.
 ### Fail-closed on None session id
 
 `invocation.py::build_planctl_invocation` resolves the session id from
-the `PLANCTL_SESSION_ID` env var — the sole source. The claude
-launcher exports this for every spawned session; tests and manual
-invocations set it explicitly.
+the `CLAUDE_CODE_SESSION_ID` env var — the sole source. The claude
+binary ships this intrinsically on every session including resumed ones;
+tests and manual invocations set it explicitly.
 
-If `PLANCTL_SESSION_ID` is unset / empty, `build_planctl_invocation`
+If `CLAUDE_CODE_SESSION_ID` is unset / empty, `build_planctl_invocation`
 raises `RuntimeError` naming the env var — no process-tree walk, no
 wildcard fallback.
 

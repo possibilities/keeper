@@ -107,7 +107,7 @@ def test_done_emits_planctl_mutation(planctl_git_repo):
 def test_no_git_repo(tmp_path, monkeypatch):
     """In a directory without git, mutations succeed and still emit planctl_invocation."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-session-no-git")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-no-git")
     runner = CliRunner()
     r = runner.invoke(cli, ["init"])
     assert r.exit_code == 0, r.output
@@ -209,28 +209,28 @@ def test_peer_session_excluded_from_planctl_mutation_files(
 
 
 def test_session_id_none_raises(planctl_git_repo, monkeypatch):
-    """build_planctl_invocation must raise RuntimeError when PLANCTL_SESSION_ID is unset.
+    """build_planctl_invocation must raise RuntimeError when CLAUDE_CODE_SESSION_ID is unset.
 
-    After fn-614 the env var is the sole source — no process-tree fallback.
+    The env var is the sole source — no process-tree fallback.
     """
-    monkeypatch.delenv("PLANCTL_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
 
     from planctl.invocation import build_planctl_invocation
     from planctl.project import resolve_project
 
     ctx = resolve_project()
-    with pytest.raises(RuntimeError, match="PLANCTL_SESSION_ID"):
+    with pytest.raises(RuntimeError, match="CLAUDE_CODE_SESSION_ID"):
         build_planctl_invocation("create", "fn-test", repo_root=ctx.project_path)
 
 
 def test_build_invocation_carries_session_id(planctl_git_repo, monkeypatch):
-    """fn-695: the envelope carries session_id == PLANCTL_SESSION_ID verbatim.
+    """fn-695: the envelope carries session_id == CLAUDE_CODE_SESSION_ID verbatim.
 
     The auto-commit reads this off the payload to stamp the Session-Id trailer;
     it must be the same opaque uuid the launcher exported, not a fresh one.
     """
     sid = "deadbeef-0000-4000-8000-000000000001"
-    monkeypatch.setenv("PLANCTL_SESSION_ID", sid)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
 
     from planctl.invocation import build_planctl_invocation
     from planctl.project import resolve_project

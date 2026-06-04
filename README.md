@@ -93,7 +93,7 @@ Specs are written in place to `specs/{id}.md` by commands that mutate spec conte
 Environment variables:
 
 - `PLANCTL_ACTOR` (override identity)
-- `PLANCTL_SESSION_ID` (sole source of the session id used to key the touched-paths log under `.planctl/state/sessions/<session_id>/`; required for every mutating verb — the claude launcher exports it for spawned sessions, tests and manual invocations set it explicitly)
+- `CLAUDE_CODE_SESSION_ID` (sole source of the session id used to key the touched-paths log under `.planctl/state/sessions/<session_id>/`; required for every mutating verb — the claude binary ships it intrinsically on every session including resumed ones, tests and manual invocations set it explicitly)
 
 ## Auto-commit
 

@@ -31,7 +31,7 @@ from planctl.cli import cli
 
 from .conftest import parse_cli_output, seed_epic
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-epic-rm-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-epic-rm-fixture"}
 
 
 def _invoke(args: list[str]) -> tuple[int, dict | None, str]:
@@ -338,7 +338,7 @@ def two_projects(tmp_path, monkeypatch):
 
     Returns (root_parent, project_a, project_b, dup_epic_id).
     """
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-epic-rm-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-epic-rm-fixture")
 
     parent = tmp_path / "roots"
     parent.mkdir()
@@ -492,14 +492,14 @@ def test_rm_registered_in_verb_templates():
 # re-create on a pre-commit raise (§10 no-rollback applies to the deletes the
 # same as to writes), but the seam still owns the commit so a CommitFailed
 # still produces the structured `commit_failed` envelope and the success
-# envelope is NEVER printed. Regression: a missing PLANCTL_SESSION_ID surfaces
+# envelope is NEVER printed. Regression: a missing CLAUDE_CODE_SESSION_ID surfaces
 # from the seam the same way it does for scaffold / refine-apply.
 # ---------------------------------------------------------------------------
 
 
 def test_rm_missing_session_id_routes_through_seam(planctl_git_repo, monkeypatch):
-    """fn-629 task .2: PLANCTL_SESSION_ID unset → invocation-build raises from
-    inside the seam. The rm verb has nothing to unwind (delete-only), but the
+    """CLAUDE_CODE_SESSION_ID unset → invocation-build raises from
+    inside the seam (fn-629 task .2). The rm verb has nothing to unwind (delete-only), but the
     raise surfaces and the verb fails — the previous direct
     build_planctl_invocation call had the same behavior, but it ran outside
     the seam. Generalised consistency check.
@@ -512,9 +512,9 @@ def test_rm_missing_session_id_routes_through_seam(planctl_git_repo, monkeypatch
     # Strip the env var so the seam's build_planctl_invocation raises.
     # CliRunner.invoke env-dict overlays on os.environ, so we must delete
     # the variable in the process env too.
-    monkeypatch.delenv("PLANCTL_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     runner = CliRunner()
-    stripped_env = {k: v for k, v in _ENV.items() if k != "PLANCTL_SESSION_ID"}
+    stripped_env = {k: v for k, v in _ENV.items() if k != "CLAUDE_CODE_SESSION_ID"}
     result = runner.invoke(cli, ["epic", "rm", epic_id], env=stripped_env)
     assert result.exit_code != 0, result.output
 

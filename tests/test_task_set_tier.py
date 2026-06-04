@@ -1,6 +1,7 @@
 """Tests for planctl task set-tier — worker reasoning tier persistence (fn-405).
 
-fn-614 task .3: session-id env renamed JOBCTL_SESSION_ID → PLANCTL_SESSION_ID.
+Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
+tests set it explicitly.
 
 Cases:
 - normalize_task: legacy task missing `tier` gets null default; existing value preserved.
@@ -22,14 +23,14 @@ from planctl.cli import cli
 from planctl.models import normalize_task
 from planctl.validation_restamp import VALIDATION_RESTAMP_VERBS
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-task-set-tier-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-task-set-tier-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
     """Init a planctl project under a fresh git repo (fn-589 task .1, item 2)."""
     import subprocess
 
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-task-set-tier-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-task-set-tier-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     runner = CliRunner()

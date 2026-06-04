@@ -1,7 +1,8 @@
 """Tests for validate --epic marker-write behavior (last_validated_at) and
 re-stamp-on-mutation behavior (VALIDATION_RESTAMP_VERBS).
 
-fn-614 task .3: session-id env renamed JOBCTL_SESSION_ID → PLANCTL_SESSION_ID.
+Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
+tests set it explicitly.
 
 fn-587 task .4: the 14 structural verbs in VALIDATION_RESTAMP_VERBS now
 RE-STAMP ``last_validated_at`` to a fresh ``now_iso()`` value on success
@@ -53,7 +54,7 @@ def _parse_json_stream(text: str) -> list[dict]:
 
 def _create_project(tmp_path, monkeypatch):
     """Init a planctl project in tmp_path and return the path."""
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-validate-marker-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-validate-marker-fixture")
     monkeypatch.chdir(tmp_path)
     # git init so the `claim` verb's `promptctl render-spec` shell-out resolves
     # its project root (.git walk) to this project, not a parent repo. Epics
@@ -73,7 +74,7 @@ def _create_epic(project_path) -> str:
     the paths as invalid.  Legacy null-field epics skip multi-repo validation.
     """
     runner = CliRunner()
-    env = {**os.environ, "PLANCTL_SESSION_ID": "test-validate-marker-fixture"}
+    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
     result = runner.invoke(
         cli,
         ["epic", "create", "--title", "Validate marker test epic"],
@@ -98,7 +99,7 @@ def _read_epic_json(project_path, epic_id) -> dict:
 
 
 def _run_validate(project_path, extra_args=()) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PLANCTL_SESSION_ID": "test-validate-marker-fixture"}
+    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
     return subprocess.run(
         ["planctl", "validate", *extra_args],
         cwd=str(project_path),
@@ -252,7 +253,7 @@ def test_validate_all_never_writes_markers(tmp_path, monkeypatch):
 # last_validated_at to a strictly-newer timestamp
 # ---------------------------------------------------------------------------
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-validate-marker-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
 
 
 def _run_planctl(
@@ -576,7 +577,7 @@ def _create_epic_with_primary_repo(project_path, repo_path: str) -> str:
     the set-*-repo verbs validate that primary_repo points at a real .git/ dir.
     """
     runner = CliRunner()
-    env = {**os.environ, "PLANCTL_SESSION_ID": "test-validate-marker-fixture"}
+    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
     result = runner.invoke(
         cli,
         ["epic", "create", "--title", "Validate marker repo test epic"],
@@ -871,7 +872,7 @@ def _create_project_in_git_repo(tmp_path, monkeypatch, subdir_name="project"):
     project_path = tmp_path / subdir_name
     project_path.mkdir()
     _init_git_repo(project_path)
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-validate-marker-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-validate-marker-fixture")
     monkeypatch.chdir(project_path)
     runner = CliRunner()
     result = runner.invoke(cli, ["init"])

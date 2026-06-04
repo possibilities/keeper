@@ -19,11 +19,11 @@ import subprocess
 from click.testing import CliRunner
 from planctl.cli import cli
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-task-ack-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-task-ack-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-task-ack-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-task-ack-fixture")
     monkeypatch.chdir(tmp_path)
     # git init so the `claim` verb's `promptctl render-spec` shell-out (which
     # resolves its project root via .git) lands in this project, not a parent.

@@ -1,6 +1,7 @@
 """Tests for planctl epic close (fn-559 — audit-required flag torn down).
 
-fn-614 task .3: session-id env renamed JOBCTL_SESSION_ID → PLANCTL_SESSION_ID.
+Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
+tests set it explicitly.
 
 `epic close` stamps `closer_done_at` only. The fn-521 `--audit-required` /
 `--no-audit-required` flag and the parity `auditor_done_at` stamp were removed
@@ -17,11 +18,11 @@ import os
 from click.testing import CliRunner
 from planctl.cli import cli
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-epic-close-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-epic-close-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-epic-close-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-epic-close-fixture")
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()
     result = runner.invoke(cli, ["init"], env=_ENV)

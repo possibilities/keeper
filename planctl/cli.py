@@ -461,7 +461,7 @@ Failure envelope (no writes land):
   {"success": false,
    "error": {"code": "<code>", "message": "<msg>", "details": [<per-entry>]}}
 
-Codes: `missing_session_id` (fn-630: `PLANCTL_SESSION_ID` unset — scaffold
+Codes: `missing_session_id` (fn-630: `CLAUDE_CODE_SESSION_ID` unset — scaffold
 cannot build its commit envelope, so it refuses up front rather than writing
 a tree it could not commit), `bad_yaml` (parse/shape/type — includes
 non-string `target_repo` / non-string `tier`), `spec_invalid` (task spec
@@ -482,7 +482,7 @@ guard, or a raise while building the commit envelope — leaves
 `scan_max_epic_id` unchanged and zero orphan files on disk. fn-623 moved the
 integrity gate to an in-memory content pass (`check_epic_tree_in_memory`
 accepts `epic_spec_content=`) so no spec lands before the gate passes; fn-630
-closed the gap the original fix left open by (a) validating `PLANCTL_SESSION_ID`
+closed the gap the original fix left open by (a) validating `CLAUDE_CODE_SESSION_ID`
 before the first write and (b) unwinding the written tree if
 `build_planctl_invocation` raises after it. The lone carve-out is a hard
 commit failure AT the `emit()` boundary (`commit_failed`): the structural

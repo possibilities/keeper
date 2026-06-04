@@ -35,16 +35,16 @@ from click.testing import CliRunner
 from planctl import commit as commit_module
 from planctl.cli import cli
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-emit-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-emit-fixture"}
 
 
 def _make_planctl_git_project(tmp_path, monkeypatch) -> Path:
     """Init a git repo + planctl project, commit baseline, and return the path.
 
     Differs from the shared ``planctl_git_repo`` fixture only in that we
-    chdir + set ``PLANCTL_SESSION_ID`` here for click-runner invocations.
+    chdir + set ``CLAUDE_CODE_SESSION_ID`` here for click-runner invocations.
     """
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-emit-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-emit-fixture")
     monkeypatch.chdir(tmp_path)
 
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)

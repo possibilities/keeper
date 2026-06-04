@@ -1,6 +1,7 @@
 """Tests for planctl epic ack — the manual approval gate clear verb (fn-386).
 
-fn-614 task .3: session-id env renamed JOBCTL_SESSION_ID → PLANCTL_SESSION_ID.
+Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
+tests set it explicitly.
 
 Cases:
 - Happy path: ack a closed epic, assert closer_acked_at is set.
@@ -19,14 +20,14 @@ import os
 from click.testing import CliRunner
 from planctl.cli import cli
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-epic-ack-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-epic-ack-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
     """Init a planctl project under a fresh git repo (fn-589 task .1, item 2)."""
     import subprocess
 
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-epic-ack-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-epic-ack-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     runner = CliRunner()

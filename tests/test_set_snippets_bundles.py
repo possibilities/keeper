@@ -22,11 +22,11 @@ import subprocess
 from click.testing import CliRunner  # type: ignore[import-untyped]
 from planctl.cli import cli
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-set-snippets-bundles-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-set-snippets-bundles-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-set-snippets-bundles-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-set-snippets-bundles-fixture")
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()
     result = runner.invoke(cli, ["init"])

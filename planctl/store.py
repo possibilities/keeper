@@ -28,12 +28,12 @@ def _record_touched(path: Path, data_dir: Path | None = None) -> None:
     try:
         import os as _os
 
-        # PLANCTL_SESSION_ID env var is the sole source of the session id —
-        # producer (the claude launcher) MUST export it, or this call silently
-        # skips and the verb falls back to wildcard staging at commit time
-        # (rejected by the planctl auto-commit step). Tests and manual
-        # invocations also set this directly.
-        sid = _os.environ.get("PLANCTL_SESSION_ID") or None
+        # CLAUDE_CODE_SESSION_ID env var is the sole source of the session id —
+        # the claude binary ships it intrinsically on every session, or this
+        # call silently skips and the verb falls back to wildcard staging at
+        # commit time (rejected by the planctl auto-commit step). Tests and
+        # manual invocations also set this directly.
+        sid = _os.environ.get("CLAUDE_CODE_SESSION_ID") or None
         if not sid:
             return
 

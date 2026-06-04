@@ -84,7 +84,7 @@ def two_projects(tmp_path, monkeypatch):
     sketch in A and write the planctl record from B — exercising the
     cross-project anchor that fn-610 fixes.
     """
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-cross-sketch-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-cross-sketch-fixture")
 
     root = tmp_path / "_xsketch_root"
     root.mkdir()

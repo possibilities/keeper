@@ -2,7 +2,8 @@
 epic create, task create, validate, atomic_write data_dir, and the
 planctl_invocation state_repo field.
 
-fn-614 task .3: session-id env renamed JOBCTL_SESSION_ID → PLANCTL_SESSION_ID.
+Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
+tests set it explicitly.
 """
 
 from __future__ import annotations
@@ -195,7 +196,7 @@ def test_normalize_task_preferred_backend_round_trip_idempotent():
 # Epic create — new-record field assignment
 # ---------------------------------------------------------------------------
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-models-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-models-fixture"}
 
 
 def _run_planctl(args: list[str], cwd: str) -> subprocess.CompletedProcess:

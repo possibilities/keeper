@@ -49,9 +49,9 @@ def _git_global_config(tmp_path_factory):
 def project(tmp_path, monkeypatch):
     """Create a throwaway planctl project and chdir to it.
 
-    Sets PLANCTL_SESSION_ID so any mutating verb's session-id resolution
+    Sets CLAUDE_CODE_SESSION_ID so any mutating verb's session-id resolution
     finds a non-None value (planctl mutating verbs fail closed when the env
-    is unset — there is no fallback after fn-614).
+    is unset — there is no fallback).
 
     fn-587 task .3: ``scaffold`` (used by many tests via ``seed_epic``) now
     runs the shared integrity check at mint time, which asserts the resolved
@@ -64,7 +64,7 @@ def project(tmp_path, monkeypatch):
     set by :func:`_git_global_config`, so commits stay hermetic without a
     per-repo config subprocess here.
     """
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-session-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     runner = CliRunner()
@@ -82,12 +82,12 @@ def planctl_git_repo(tmp_path, monkeypatch):
     so commits succeed without prompts or signing overhead and without a
     per-repo config subprocess here.
 
-    PLANCTL_SESSION_ID is set to a fixed test value so build_planctl_commit()
+    CLAUDE_CODE_SESSION_ID is set to a fixed test value so build_planctl_commit()
     can resolve the session id without depending on any sidecar database.
 
     Scope: function — each test gets a fresh repo.
     """
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-session-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
     monkeypatch.chdir(tmp_path)
 
     # Initialise git repo
@@ -139,10 +139,10 @@ def multi_repo_project(tmp_path, monkeypatch):
     the session-scoped ``GIT_CONFIG_GLOBAL`` set by :func:`_git_global_config`,
     so the per-repo config subprocesses are gone from this loop.
 
-    PLANCTL_SESSION_ID is pre-set so any mutating verb's session-id resolution
+    CLAUDE_CODE_SESSION_ID is pre-set so any mutating verb's session-id resolution
     short-circuits cleanly.
     """
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-session-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
 
     primary = tmp_path / "primary"
     touched = tmp_path / "touched"

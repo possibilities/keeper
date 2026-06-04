@@ -1,6 +1,7 @@
 """Tests for `planctl worker resume` subcommand (arthack divergence).
 
-fn-614 task .3: session-id env renamed JOBCTL_SESSION_ID → PLANCTL_SESSION_ID.
+Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; the
+tests below set it explicitly.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ def project(tmp_path, monkeypatch):
     """
     import subprocess
 
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-session-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     runner = CliRunner()

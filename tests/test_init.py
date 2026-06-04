@@ -36,7 +36,7 @@ def test_init_is_idempotent_and_preserves_human_edits(
     custom = "# my notes\nthe human modified this file\n"
     claude_md.write_text(custom, encoding="utf-8")
 
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-session-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
     runner = CliRunner()
     result = runner.invoke(cli, ["init"])
     assert result.exit_code == 0, result.output
@@ -48,7 +48,7 @@ def test_init_backfills_existing_project(tmp_path: Path, monkeypatch) -> None:
     """A planctl project that pre-dates the advice-file drop gets backfilled."""
     import json
 
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-session-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
     monkeypatch.chdir(tmp_path)
 
     planctl_dir = tmp_path / ".planctl"

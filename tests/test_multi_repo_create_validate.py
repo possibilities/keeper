@@ -15,7 +15,10 @@ import os
 from click.testing import CliRunner
 from planctl.cli import cli
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-multi-repo-create-validate-fixture"}
+_ENV = {
+    **os.environ,
+    "CLAUDE_CODE_SESSION_ID": "test-multi-repo-create-validate-fixture",
+}
 
 
 def _invoke(*args):
@@ -25,7 +28,9 @@ def _invoke(*args):
 
 def test_epic_create_touched_repos_nonexistent_succeeds(tmp_path, monkeypatch):
     """epic create --touched-repos with a nonexistent path: create succeeds, path stored verbatim."""
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-multi-repo-create-validate-fixture")
+    monkeypatch.setenv(
+        "CLAUDE_CODE_SESSION_ID", "test-multi-repo-create-validate-fixture"
+    )
     monkeypatch.chdir(tmp_path)
 
     result = _invoke("init")
@@ -59,7 +64,9 @@ def test_epic_create_touched_repos_nonexistent_succeeds(tmp_path, monkeypatch):
 
 def test_epic_create_touched_repos_nonexistent_validate_fails(tmp_path, monkeypatch):
     """validate --epic <id> fails when touched_repos contains a nonexistent path."""
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-multi-repo-create-validate-fixture")
+    monkeypatch.setenv(
+        "CLAUDE_CODE_SESSION_ID", "test-multi-repo-create-validate-fixture"
+    )
     monkeypatch.chdir(tmp_path)
 
     result = _invoke("init")

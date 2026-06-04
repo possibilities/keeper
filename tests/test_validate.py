@@ -1,6 +1,7 @@
 """Tests for ``planctl.integrity`` and ``planctl.run_validate`` (fn-587 task .3).
 
-fn-614 task .3: session-id env renamed JOBCTL_SESSION_ID → PLANCTL_SESSION_ID.
+Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
+tests set it explicitly.
 
 The structural-integrity check used to live inline in ``run_validate.py``'s
 ``--epic`` block — task .3 factored it out into a shared helper so scaffold
@@ -49,7 +50,7 @@ _VALID_TASK_SPEC = (
 
 def _seed(tmp_path, monkeypatch) -> tuple[Path, str, str]:
     """Scaffold a one-task epic in tmp_path; return (project_path, epic_id, task_id)."""
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-validate-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-validate-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(

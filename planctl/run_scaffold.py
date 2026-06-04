@@ -23,7 +23,7 @@ which prints ``commit_failed`` and leaves the written tree on disk uncommitted
 per the §10 no-rollback policy (the next mutating verb's auto-commit sweeps it).
 Codes:
 
-- ``missing_session_id`` — ``PLANCTL_SESSION_ID`` is unset (fn-630): scaffold
+- ``missing_session_id`` — ``CLAUDE_CODE_SESSION_ID`` is unset (fn-630): scaffold
   cannot build its commit envelope, so it refuses up front rather than writing a
   tree it could not commit
 - ``bad_yaml`` — parse/shape/type failure
@@ -123,7 +123,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # has to opt in explicitly. Threaded from cli.scaffold_cmd via SimpleNamespace.
     allow_duplicate: bool = getattr(args, "allow_duplicate", False)
 
-    # fn-630 (a): fail closed on a missing PLANCTL_SESSION_ID BEFORE any write.
+    # fn-630 (a): fail closed on a missing CLAUDE_CODE_SESSION_ID BEFORE any write.
     # build_planctl_invocation (Phase 5) is the SOLE consumer of this env var and
     # runs AFTER the full epic tree is already on disk. A missing session id used
     # to let scaffold write the complete tree, then raise at the commit boundary,
@@ -133,13 +133,13 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # here keeps the assert-all -> mutate -> emit contract honest: no resolvable
     # session id => zero filesystem mutation. build_planctl_invocation re-checks
     # this and stays the authoritative raise; this is the early fail-closed guard.
-    if not os.environ.get("PLANCTL_SESSION_ID"):
+    if not os.environ.get("CLAUDE_CODE_SESSION_ID"):
         return _emit_failure(
             "missing_session_id",
-            "PLANCTL_SESSION_ID is unset; scaffold cannot build its commit "
-            "envelope and refuses to write a tree it could not commit. Export it "
-            "(the claude launcher does this inside a Claude harness; tests and "
-            "manual invocations must set it themselves).",
+            "CLAUDE_CODE_SESSION_ID is unset; scaffold cannot build its commit "
+            "envelope and refuses to write a tree it could not commit. The claude "
+            "binary ships it intrinsically inside a Claude harness; tests and "
+            "manual invocations must set it themselves.",
             [],
         )
 

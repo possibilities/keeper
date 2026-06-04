@@ -189,7 +189,7 @@ def _make_two_projects_with_same_task(tmp_path, monkeypatch):
     Overrides the autouse CONFIG_PATH to point at the two-project root so
     discovery surfaces both as candidates.
     """
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-session-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
     root = tmp_path / "_ambiguous_root"
     root.mkdir()
 

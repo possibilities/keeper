@@ -759,8 +759,8 @@ add_tasks:
 
 
 def test_refine_apply_missing_session_id_persists_writes(planctl_git_repo, monkeypatch):
-    """fn-640: PLANCTL_SESSION_ID unset → invocation-build raises in emit()
-    AFTER the write phase already completed. With the seam unwind gone, the
+    """CLAUDE_CODE_SESSION_ID unset → invocation-build raises in emit()
+    AFTER the write phase already completed (fn-640). With the seam unwind gone, the
     freshly-minted task JSON / spec now PERSIST on disk (no automatic unwind).
     """
     epic_id = _seed_two_task_epic(planctl_git_repo)
@@ -771,7 +771,7 @@ def test_refine_apply_missing_session_id_persists_writes(planctl_git_repo, monke
     assert not baseline_task3.exists()
     assert not baseline_spec3.exists()
 
-    monkeypatch.delenv("PLANCTL_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
 
     delta = f"""\
 add_tasks:

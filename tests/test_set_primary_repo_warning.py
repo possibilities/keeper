@@ -16,12 +16,14 @@ import subprocess
 from click.testing import CliRunner  # type: ignore[import-untyped]
 from planctl.cli import cli
 
-_ENV = {**os.environ, "PLANCTL_SESSION_ID": "test-set-primary-repo-warning-fixture"}
+_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-set-primary-repo-warning-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
     """Init a planctl project in tmp_path and return the path."""
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-set-primary-repo-warning-fixture")
+    monkeypatch.setenv(
+        "CLAUDE_CODE_SESSION_ID", "test-set-primary-repo-warning-fixture"
+    )
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()
     result = runner.invoke(cli, ["init"])

@@ -1,6 +1,7 @@
 """Tests for fn-600 cross-project epic-level dependencies.
 
-fn-614 task .3: session-id env renamed JOBCTL_SESSION_ID → PLANCTL_SESSION_ID.
+Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
+tests set it explicitly.
 
 Covers the global resolver primitive (``discovery.resolve_epic_globally``) and
 the write-side rewires across ``epic add-dep`` / ``epic add-deps`` / scaffold,
@@ -79,7 +80,7 @@ def two_projects(tmp_path, monkeypatch):
     in: a local dep id (B's own epic) short-circuits cwd; a cross-project
     dep (an A epic) resolves via the global step.
     """
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-cross-project-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-cross-project-fixture")
 
     root = tmp_path / "_xproject_root"
     root.mkdir()
@@ -136,7 +137,7 @@ def three_projects(tmp_path, monkeypatch):
     must NOT carry the dup. ``three_projects`` provides exactly that
     neutral-cwd scenario.
     """
-    monkeypatch.setenv("PLANCTL_SESSION_ID", "test-cross-project-fixture")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-cross-project-fixture")
 
     root = tmp_path / "_xproject3_root"
     root.mkdir()
