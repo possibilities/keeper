@@ -188,9 +188,18 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
         }
         onPlainWrite(`${lines.join("\n")}\n`);
       },
-      refreshLive(_lines: string[]): void {
-        // Silent no-op in passthrough: time-driven re-renders would
-        // print duplicate frame bodies when piped to a file or under CI.
+      refreshLive(lines: string[]): void {
+        // Write plain exactly like passthrough `pushFrame` so the
+        // connecting spinner (fn-696, now routed through `refreshLive`)
+        // still emits when non-TTY/piped and the view-shell tests that
+        // observe spinner text via stdout keep working. Safe from
+        // duplicate-body floods: the only other `refreshLive` caller
+        // (`repaintLocal`) is key-driven and passthrough `feedStdin` is a
+        // no-op, so it can never fire here.
+        if (passthroughDisposed) {
+          return;
+        }
+        onPlainWrite(`${lines.join("\n")}\n`);
       },
       setStatus(_status: string): void {
         // Silent no-op in passthrough: no banner to update.
@@ -275,7 +284,11 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
    */
   function visibleRows(): string[] {
     if (history.length === 0) {
-      return [];
+      // Empty history but an overlay may be set — the connecting spinner
+      // (fn-696) paints via `refreshLive` before the first real frame
+      // lands. Honor it so the indicator is visible during connect; cold
+      // start with no overlay still yields `[]`.
+      return liveOverlay ?? [];
     }
     if (viewIdx === "live") {
       return liveOverlay ?? history[history.length - 1] ?? [];

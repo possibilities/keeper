@@ -338,6 +338,18 @@ test("refreshLive overlay is cleared by the next pushFrame", () => {
   expect(core.visibleRows()).toEqual(["fresh-data"]);
 });
 
+test("refreshLive on empty history paints the overlay without growing history (fn-696)", () => {
+  const { core } = bootCore();
+  // The connecting spinner repaints via `refreshLive` before any real
+  // data frame lands. Honor the overlay on empty history so the spinner
+  // is visible during connect, and keep history at 0 so frame nav and
+  // the banner counter aren't flooded.
+  core.refreshLive(["⠋  connecting to keeperd…"]);
+  expect(core.visibleRows()).toEqual(["⠋  connecting to keeperd…"]);
+  expect(core.historyLen()).toBe(0);
+  expect(core.bannerText()).toBe("Showing live results");
+});
+
 test("refreshLive while scrolled back does not redraw but applies on snap-to-live", () => {
   const { core, renderCount } = bootCore();
   core.pushFrame(["A"]);
@@ -414,14 +426,17 @@ test("passthrough mode: enabled=false writes plain joined text and is otherwise 
   expect(core.mode).toBe("passthrough");
   core.pushFrame(["one", "two", "three"]);
   expect(writes).toEqual(["one\ntwo\nthree\n"]);
+  // Passthrough `refreshLive` writes plain like `pushFrame` (fn-696) so the
+  // connecting spinner still emits when non-TTY/piped.
   core.refreshLive(["row-ticked"]);
-  expect(writes).toEqual(["one\ntwo\nthree\n"]);
+  expect(writes).toEqual(["one\ntwo\nthree\n", "row-ticked\n"]);
   core.setStatus("[copied]");
-  expect(writes).toEqual(["one\ntwo\nthree\n"]);
+  expect(writes).toEqual(["one\ntwo\nthree\n", "row-ticked\n"]);
   core.dispose();
-  // Post-dispose pushFrame is silent.
+  // Post-dispose pushFrame / refreshLive are silent.
   core.pushFrame(["should be silent"]);
-  expect(writes).toEqual(["one\ntwo\nthree\n"]);
+  core.refreshLive(["also silent"]);
+  expect(writes).toEqual(["one\ntwo\nthree\n", "row-ticked\n"]);
 });
 
 test("passthrough mode: ttyOk=false also flips to passthrough", () => {

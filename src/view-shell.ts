@@ -222,7 +222,10 @@ export function createViewShell<TSnap>(
 
   // Connecting-indicator spinner state. A single `setInterval` (~125ms)
   // animates the braille dots and re-polls the re-fold poller until the
-  // first real frame paints. Composition lives in `tickConnectingSpinner`
+  // first real frame paints. Each tick repaints via the ephemeral
+  // `refreshLive` overlay (single-slot, no history growth — auto-cleared
+  // by the first real `pushFrame`), so the connect animation never floods
+  // the frame-history ring. Composition lives in `tickConnectingSpinner`
   // below: when the poller has a `{cursor,max}` sample with `cursor<max`,
   // the indicator carries the percentage + thousands-grouped counts;
   // otherwise it falls back to the plain "connecting to keeperd…" line.
@@ -303,7 +306,7 @@ export function createViewShell<TSnap>(
     } else {
       refoldMisses += 1;
     }
-    liveShell.pushFrame([formatRefoldLine(glyph)]);
+    liveShell.refreshLive([formatRefoldLine(glyph)]);
   }
 
   function armConnectingSpinner(): void {
