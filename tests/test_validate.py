@@ -89,15 +89,8 @@ def _seed(tmp_path, monkeypatch) -> tuple[Path, str, str]:
     runner = CliRunner()
     result = runner.invoke(cli, ["init"])
     assert result.exit_code == 0, result.output
-    subprocess.run(
-        ["git", "add", ".planctl/"], cwd=tmp_path, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "planctl init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
+    # `init` self-commits the `.planctl/` tree inline (commit-at-mutation
+    # boundary), so there is no separate manual commit to make here.
 
     spec_block = "\n".join("      " + ln for ln in _VALID_TASK_SPEC.splitlines())
     plan = (
