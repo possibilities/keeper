@@ -171,7 +171,7 @@ def test_agentid_regex_requires_search_not_match():
 #     were deleted in fn-593 task .6 and the agent-template fan-out now
 #     emits directly into `claude/work-plugins/<tier>/agents/worker.md`.
 #   - The NEW `claude/work-plugins/<tier>/agents/worker.md` files MUST exist
-#     for every claude tier, pin `model: claude-opus-4-7`, and declare the
+#     for every claude tier, set `model: opus`, and declare the
 #     matching `effort:`.
 
 _PLANCTL_AGENTS_DIR: Path = Path(__file__).resolve().parents[1] / "agents"
@@ -238,7 +238,7 @@ def test_old_tier_suffixed_agent_files_removed(basename: str):
 @pytest.mark.parametrize("tier", _TIERS)
 def test_work_plugin_worker_agent_rendered_and_pinned(tier: str):
     """Each `claude/work-plugins/<tier>/agents/worker.md` exists, names
-    itself `worker`, pins opus-4-7, and declares the matching effort.
+    itself `worker`, sets `model: opus`, and declares the matching effort.
 
     If this fails with "file not rendered," run `scripts/install.sh` to
     regenerate from `apps/planctl/agent-templates/worker.md.tmpl`.
@@ -251,10 +251,10 @@ def test_work_plugin_worker_agent_rendered_and_pinned(tier: str):
         f"(the agent is addressed as `work:worker` — scope from the plugin "
         f"name, not the agent name)"
     )
-    assert fm.get("model") == "claude-opus-4-7", (
-        f"{path}: frontmatter model={fm.get('model')!r}, expected "
-        f"'claude-opus-4-7' (full id, not the 'opus' alias — pinning prevents "
-        f"silent model drift on Claude Code updates)"
+    assert fm.get("model") == "opus", (
+        f"{path}: frontmatter model={fm.get('model')!r}, expected the bare "
+        f"'opus' alias — refer to the model family, not a version number, and "
+        f"let the harness resolve the concrete model id"
     )
     assert fm.get("effort") == tier, (
         f"{path}: frontmatter effort={fm.get('effort')!r}, expected {tier!r}"

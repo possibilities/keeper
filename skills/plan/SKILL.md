@@ -391,7 +391,7 @@ For each task, decide:
 - **size**: S (a few hours) or M (a day or two). L must be split.
 - **files** (disjoint = parallel-safe; overlapping = needs an explicit dep)
 - **deps** on sibling tasks (only when files overlap or there's a hard "must-finish-first")
-- **tier** (worker reasoning effort) — `medium | high | xhigh | max`; folds into the per-task entry in 5e, no extra round trip. Every worker runs `claude-opus-4-7`; tier picks which `claude/work-plugins/<tier>/` keeper loads. Bands:
+- **tier** (worker reasoning effort) — `medium | high | xhigh | max`; folds into the per-task entry in 5e, no extra round trip. Every worker runs `opus`; tier picks which `claude/work-plugins/<tier>/` keeper loads. Bands:
   - **`medium`** — single-file edit, mechanical refactor, straight test addition. Acceptance is "do exactly this."
   - **`high`** — multi-file feature in a known pattern, typical bug fix with the root cause named, anything following an obvious in-repo template.
   - **`xhigh`** — multi-step refactor, new-pattern introduction, contract-touching work (RPC, schema, public API, wire format), anything where a wrong abstraction propagates. **Default when in doubt** (the Opus 4.7 default).
