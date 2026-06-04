@@ -53,30 +53,8 @@ def _seed(tmp_path, monkeypatch) -> tuple[Path, str, str]:
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-validate-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "commit.gpgsign", "false"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "core.hooksPath", "/dev/null"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
+    # Committer identity / gpgsign / hooksPath ride GIT_CONFIG_GLOBAL (set by
+    # the session-scoped _git_global_config fixture) — no per-repo config here.
     readme = tmp_path / "README.md"
     readme.write_text("# test\n")
     subprocess.run(

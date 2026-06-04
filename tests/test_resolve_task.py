@@ -200,30 +200,8 @@ def _make_two_projects_with_same_task(tmp_path, monkeypatch):
 
     for proj in (proj_a, proj_b):
         subprocess.run(["git", "init"], cwd=proj, check=True, capture_output=True)
-        subprocess.run(
-            ["git", "config", "user.email", "test@example.com"],
-            cwd=proj,
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "Test User"],
-            cwd=proj,
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "config", "commit.gpgsign", "false"],
-            cwd=proj,
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "config", "core.hooksPath", "/dev/null"],
-            cwd=proj,
-            check=True,
-            capture_output=True,
-        )
+        # Committer identity / gpgsign / hooksPath ride GIT_CONFIG_GLOBAL (set by
+        # the session-scoped _git_global_config fixture) — no per-repo config.
         # Initial commit so HEAD exists for the no-commit assertion later.
         (proj / "README.md").write_text("# Test repo\n")
         subprocess.run(

@@ -41,17 +41,12 @@ from .conftest import seed_epic
 
 
 def _git_init(proj: Path) -> None:
-    """Initialise a hermetic git repo so scaffold's filesystem check passes."""
+    """Initialise a hermetic git repo so scaffold's filesystem check passes.
+
+    Committer identity / gpgsign / hooksPath ride GIT_CONFIG_GLOBAL (set by the
+    session-scoped _git_global_config fixture) — no per-repo config needed.
+    """
     subprocess.run(["git", "init"], cwd=proj, check=True, capture_output=True)
-    for k, v in [
-        ("user.email", "test@example.com"),
-        ("user.name", "Test User"),
-        ("commit.gpgsign", "false"),
-        ("core.hooksPath", "/dev/null"),
-    ]:
-        subprocess.run(
-            ["git", "config", k, v], cwd=proj, check=True, capture_output=True
-        )
     (proj / "README.md").write_text("# Test repo\n")
     subprocess.run(
         ["git", "add", "README.md"], cwd=proj, check=True, capture_output=True

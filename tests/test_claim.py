@@ -348,17 +348,13 @@ def test_claim_snippet_render_failed(planctl_git_repo, monkeypatch):
 
 
 def _git_init(repo) -> None:
-    """git init + minimal config + an initial commit so the dir is a clean repo."""
+    """git init + an initial commit so the dir is a clean repo.
+
+    Committer identity, ``commit.gpgsign=false`` and ``core.hooksPath=/dev/null``
+    ride the session-scoped ``GIT_CONFIG_GLOBAL`` set by ``_git_global_config``,
+    so no per-repo ``git config`` is needed here.
+    """
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    for k, v in (
-        ("user.email", "test@example.com"),
-        ("user.name", "Test User"),
-        ("commit.gpgsign", "false"),
-        ("core.hooksPath", "/dev/null"),
-    ):
-        subprocess.run(
-            ["git", "config", k, v], cwd=repo, check=True, capture_output=True
-        )
     (repo / "README.md").write_text("# repo\n")
     subprocess.run(
         ["git", "add", "README.md"], cwd=repo, check=True, capture_output=True
