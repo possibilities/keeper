@@ -22,5 +22,5 @@ current model: scaffold YAML opt-in path and/or `epic queue-jump` verb (`/plan:n
 - [ ] `grep -r '/plan:queue' planctl/` returns no results in non-historical comment sites
 
 ## Done summary
-
+Refreshed three queue_jump comment sites (invocation.py, models.py, cli.py) to the defer+next model: scaffold YAML opt-in plus epic queue-jump verb. Removed all /plan:queue references and the false 'non-scaffold verbs always pass False' claim.
 ## Evidence
