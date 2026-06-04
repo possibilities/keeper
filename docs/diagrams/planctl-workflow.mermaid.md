@@ -129,7 +129,7 @@ flowchart TB
     end
 
     %% ===== APPROVE SKILL (fn-592; fn-625 fail-closed + inference-primary) =====
-    subgraph approve_skill["Approve Skill (fn-592 — replaces prior ack agent + producer pipeline)"]
+    subgraph approve_skill["Approve Skill"]
         direction TB
 
         approve_render["render-approve-context\n(keeperd-only; no fallback;\nfull-transcript reverse-walk\nskips <task-notification>)"]

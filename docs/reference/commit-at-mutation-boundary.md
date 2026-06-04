@@ -24,12 +24,10 @@ subject from its `op` and `target`, stages its exact pathspec, commits.
 No agent-authored commit messages. No outer skill coordination. No "what
 landed since last time" audit-table scan.
 
-The principle replaces the seven-seam `commit-plan` model
-(fn-488 → fn-587). The seam model leaked state whenever a mutating verb
-fired outside a `/plan:*` skill — notably `approve` (formerly
-`set-approval`) from a human-typed CLI. The per-verb model is
-fail-safe at the verb: any path that emits a `planctl_invocation`
-envelope commits its own scope.
+The model is fail-safe at the verb: any path that emits a
+`planctl_invocation` envelope commits its own scope, including a verb
+fired outside a `/plan:*` skill — notably `approve` from a human-typed
+CLI.
 
 ---
 
@@ -131,9 +129,9 @@ the verb.
 through the seam: it builds the `planctl_invocation` payload itself (the
 build is INSIDE emit), then invokes `auto_commit_from_invocation`. Callers
 pass `verb=`, `target=`, and `repo_root=`. There is no seam-level write-tree
-unwind (the fn-629 `written_paths` unwind was deleted in fn-640): on a
-pre-commit raise (invocation-build failure or a git status/add/commit
-error) the verb's written files stay on disk (§10 no-rollback), and the
+unwind: on a pre-commit raise (invocation-build failure or a git
+status/add/commit error) the verb's written files stay on disk (§10
+no-rollback), and the
 keeper HEAD-gate keeps an uncommitted tree invisible to the autopilot until
 it reaches HEAD. The three multi-file mint verbs (`scaffold`,
 `refine-apply`, `epic create`) keep their own LOCAL write-phase try/except
@@ -170,8 +168,8 @@ into the `epics` projection) gates snapshot emission on a synchronous
 dispatch against it. This HEAD-gate is the single guard that closes the
 fn-627 duplicate-dispatch window: an uncommitted epic tree on disk (a tree
 that persisted past a hard `commit_failed`, or a fresh in-flight pre-commit
-tree) is simply never observed. planctl no longer carries a complementary
-seam unwind or an orphan reaper — an untracked tree is harmless because it
+tree) is simply never observed. planctl carries no complementary
+seam unwind or orphan reaper — an untracked tree is harmless because it
 is invisible, and the next mutating verb whose `touched ∩ dirty` intersects
 it sweeps it into a commit. See `~/code/keeper/CLAUDE.md` § Autopilot
 dispatch gates and `~/code/keeper/README.md` § Architecture (the **fourth**
@@ -205,8 +203,7 @@ The `details.error` codes are:
 | `missing_subject` | Payload lacked a `subject` — envelope-shape drift. |
 
 **Pre-commit failure leaves writes on disk (§10 no-rollback).** There is
-no seam-level write-tree unwind (the fn-629 `written_paths` unwind was
-deleted in fn-640). On a pre-commit raise — invocation-build failure
+no seam-level write-tree unwind. On a pre-commit raise — invocation-build failure
 (e.g. missing `PLANCTL_SESSION_ID`) or a git status/add/commit error —
 the verb's written files stay on disk and the failure envelope lands on
 stdout with exit 1. For the multi-file mint verbs (`scaffold`,
@@ -469,7 +466,7 @@ Auto-commit failure is a **hard error** (the Option C contract). See
 
 - The verb does NOT print a success envelope.
 - The verb prints a structured failure envelope on stdout and exits 1.
-- **Pre-commit: writes persist** (no seam unwind, deleted in fn-640).
+- **Pre-commit: writes persist** (no seam unwind).
   For the multi-file mint verbs (`scaffold`, `refine-apply`, `epic
   create`), a MID-WRITE crash is still unwound by their LOCAL
   write-phase try/except block; a pre-commit raise after the write phase
@@ -490,7 +487,7 @@ An uncommitted epic tree that persists past a hard `commit_failed` is
 emission on `git cat-file -e HEAD:<relpath>`, so the autopilot never
 observes — and never dispatches against — a tree that is not yet in HEAD.
 That HEAD-gate is the SOLE guard against the fn-627 duplicate-dispatch
-window; planctl no longer carries a seam unwind or an orphan reaper. The
+window; planctl carries no seam unwind or orphan reaper. The
 next mutating verb whose `touched ∩ dirty` intersects the dirty file
 sweeps it into a commit.
 
@@ -550,9 +547,9 @@ directory:
 ```
 
 One path per file — concurrent verbs in the same session never contend,
-and no `fcntl` dance is needed. `scout promote` / `interview promote`
-(now removed) historically called `_record_touched()` explicitly after
-each `shutil.move` (which bypasses `atomic_write`).
+and no `fcntl` dance is needed. Any verb that moves files via
+`shutil.move` (which bypasses `atomic_write`) must call `_record_touched()`
+explicitly after each move.
 
 At envelope-build time, `build_planctl_invocation`:
 
@@ -612,7 +609,7 @@ Per-test `tmp_path` + `git init` + `commit.gpgsign=false` +
 | Concurrent-sweep race | Verb A commits the files; Verb B re-confirms clean files and returns `None` (no empty commit); pathspec-scoped commits never cross-contaminate |
 | `done` verb | `chore(planctl): done <task_id>` commit lands in one verb call |
 | `task ack` | Writes `acks.db` only; no commit; envelope carries `subject=null`/`files=null` |
-| `approve` (paradigmatic leak case, formerly `set-approval`) | Verb fires from any cwd (no `/plan:*` skill) — commit still lands |
+| `approve` (paradigmatic any-cwd case) | Verb fires from any cwd (no `/plan:*` skill) — commit still lands |
 | `scaffold` whole-tree | One commit covers epic + tasks + specs + deps; envelope `files` lists every written path |
 | `scaffold` integrity-gate failure (fn-623) | `scan_max_epic_id` unchanged; zero orphan `specs/fn-N-*.md` on disk (in-memory `epic_spec_content=` pass means no spec lands before the gate); failure envelope only, no commit |
 | Seam pre-commit persistence (fn-640) | Multi-file mint verb raises AFTER the write phase (invocation-build raise or simulated `git` failure); the fully-written tree PERSISTS on disk (no seam unwind); the failure envelope lands; `_epic_id_lock` releases before the git commit runs (no nesting regression) |
