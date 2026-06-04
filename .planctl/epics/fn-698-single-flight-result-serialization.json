@@ -1,0 +1,18 @@
+{
+  "approval": "pending",
+  "branch_name": "fn-698-single-flight-result-serialization",
+  "bundles": [],
+  "created_at": "2026-06-04T12:36:52.328985Z",
+  "depends_on_epics": [],
+  "id": "fn-698-single-flight-result-serialization",
+  "last_validated_at": "2026-06-04T12:36:52.400093Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Single-flight result serialization",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-04T12:36:52.328985Z"
+}
