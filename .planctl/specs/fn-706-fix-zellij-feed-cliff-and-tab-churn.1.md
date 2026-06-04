@@ -66,5 +66,5 @@ comment updated to "tail-read instead of skip."
 - [ ] README ninth-worker doc + superseded `daemon.ts` comment updated.
 
 ## Done summary
-
+scanZellijEventsDir now tail-reads an oversize zellij feed from max(priorOffset, size-cap) instead of skip-and-freezing it: discards the mid-line leading partial, seeds the epoch from the first parsed window line, and advances the watermark from the true window base (tailBase + discardedPartialBytes + consumedBytesInTail). Exported MAX_ZELLIJ_EVENTS_FILE_BYTES with an injectable maxBytes arg and added a green oversize tail-read test; README ninth-worker doc updated.
 ## Evidence
