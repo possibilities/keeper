@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-704-optimize-zellij-integration-throughput",
   "bundles": [],
   "closer_done_at": "2026-06-04T18:10:58.876579Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-04T18:10:58.876579Z"
+  "updated_at": "2026-06-04T18:12:04.630106Z"
 }
