@@ -48,5 +48,5 @@ only — no tombstones, no "formerly /plan:queue" phrasing (CLAUDE.md
 - [ ] No tombstone phrasing introduced.
 
 ## Done summary
-
+Updated all prose (SKILL.md menu, README, CLAUDE.md/AGENTS.md, commit-at-mutation-boundary.md) to the defer+next model present-tense: defer is the sole hand-written scaffolder, /plan:next flips priority on an existing epic via epic queue-jump. No /plan:queue references remain, no tombstones.
 ## Evidence
