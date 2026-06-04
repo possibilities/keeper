@@ -1,4 +1,5 @@
 {
+  "approval": "rejected",
   "bundles": [],
   "created_at": "2026-06-04T15:56:27.105726Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "medium",
   "title": "fix stale queue_jump comment references",
-  "updated_at": "2026-06-04T16:46:39.306377Z",
+  "updated_at": "2026-06-04T17:00:06.306359Z",
   "worker_done_at": "2026-06-04T16:46:39.306377Z"
 }
