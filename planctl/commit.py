@@ -158,7 +158,7 @@ def _git_commit(msg: str, files: list[str], cwd: str) -> str:
     Raises :class:`CommitFailed` with ``error="git_commit"`` on failure
     (e.g. pre-commit hook rejection, empty tree, signing failure, ref-lock
     contention).  Ref-lock contention is distinguished by the caller via
-    :func:`_is_ref_lock_contention` and retried, not surfaced.
+    :func:`_is_commit_contention` and retried, not surfaced.
     """
     commit_result = subprocess.run(
         ["git", "commit", "-F", "-", "--", *files],
