@@ -35,6 +35,8 @@ import {
   epicNumberFromId,
   isPathInHead,
   isWithinRoots,
+  makeSingleFlight,
+  PLAN_DB_POLL_MS,
   type PlanMessage,
   PlanScanner,
   reconcilePlanctlDirs,
@@ -1979,6 +1981,242 @@ test("reconcilePlanctlDirs(heartbeat): a backstop emit logs a trigger-tagged 'di
   expect(logs.some((l) => l.includes("heartbeat"))).toBe(false);
 });
 
+// ---------------------------------------------------------------------------
+// (a''''') fn-705 fast `data_version` poll: db-poll trigger semantics +
+// single-flight coalescing. The poll itself (timer + PRAGMA read) lives inside
+// the worker `main`; here we exercise the PURE pieces it composes — the
+// `reconcilePlanctlDirs(..., "db-poll")` trigger tag and the `makeSingleFlight`
+// coalescing wrapper — and assert idempotency on repeated triggers. The
+// realtime end-to-end behavior is covered by the spawned-Worker test below.
+// ---------------------------------------------------------------------------
+
+test("reconcilePlanctlDirs(db-poll): a poll-driven emit logs a 'did real work' line WITHOUT the heartbeat alarm wording (fn-705)", () => {
+  const proj = join(tmpDir, "proj");
+  const epicDir = join(proj, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+  gitInit(proj);
+
+  const emitted: PlanMessage[] = [];
+  const logs: string[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    (l) => logs.push(l),
+    isPathInHead,
+  );
+
+  const epicPath = join(epicDir, "fn-9-dbpoll.json");
+  writeFileSync(
+    epicPath,
+    JSON.stringify({
+      id: "fn-9-dbpoll",
+      title: "DbPoll",
+      status: "open",
+      primary_repo: proj,
+    }),
+  );
+  git(proj, "add", epicPath);
+  git(proj, "commit", "-q", "-m", "add epic");
+
+  reconcilePlanctlDirs([tmpDir], scanner, "db-poll");
+  expect(emitted.length).toBe(1);
+  expect((emitted[0] as { id: string }).id).toBe("fn-9-dbpoll");
+  // The db-poll path logs a low-key "did real work" line tagged `db-poll`...
+  expect(logs.some((l) => l.includes("db-poll") && l.includes(epicPath))).toBe(
+    true,
+  );
+  // ...but NEVER the loud "a fast path missed it" alarm (db-poll IS a fast
+  // path — an emit here is expected, not a missed-fast-path signal).
+  expect(logs.some((l) => l.includes("a fast path missed it"))).toBe(false);
+  expect(logs.some((l) => l.includes("backstop"))).toBe(false);
+});
+
+test("reconcilePlanctlDirs(db-poll): a repeated trigger over an unchanged board emits nothing (change-gate idempotency, fn-705)", () => {
+  const proj = join(tmpDir, "proj");
+  const epicDir = join(proj, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+  gitInit(proj);
+
+  const emitted: PlanMessage[] = [];
+  const logs: string[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    (l) => logs.push(l),
+    isPathInHead,
+  );
+
+  const epicPath = join(epicDir, "fn-9-quiescent.json");
+  writeFileSync(
+    epicPath,
+    JSON.stringify({
+      id: "fn-9-quiescent",
+      title: "Quiescent",
+      status: "open",
+      primary_repo: proj,
+    }),
+  );
+  git(proj, "add", epicPath);
+  git(proj, "commit", "-q", "-m", "add epic");
+
+  // First trigger emits once.
+  reconcilePlanctlDirs([tmpDir], scanner, "db-poll");
+  expect(emitted.length).toBe(1);
+
+  // Repeated triggers over the unchanged file are fully absorbed by the
+  // change-gate — no emit, no "did real work" log. This is the self-induced
+  // poll-storm guard: the worker's own emit → fold → data_version bump → poll
+  // must NOT re-emit a quiescent board.
+  logs.length = 0;
+  reconcilePlanctlDirs([tmpDir], scanner, "db-poll");
+  reconcilePlanctlDirs([tmpDir], scanner, "db-poll");
+  reconcilePlanctlDirs([tmpDir], scanner, "db-poll");
+  expect(emitted.length).toBe(1);
+  expect(logs.length).toBe(0);
+});
+
+test("db-poll trigger: recheckPending stays GATED (an uncommitted file does not emit on poll; fn-629 preserved)", () => {
+  // The poll's `onWake` runs `recheckPending()` + `reconcilePlanctlDirs`. Both
+  // route through the fn-629 in-HEAD gate, so a poll bump must NOT emit an
+  // uncommitted plan file (the fn-627 dup-dispatch guard). We exercise the
+  // exact two-call body the worker's `onWake` runs.
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  // Uncommitted epic — boot/FSEvents onChange bounces it to pending.
+  const epicPath = writeEpic("fn-6-gated", {
+    title: "Gated",
+    status: "open",
+    primary_repo: tmpDir,
+  });
+  scanner.onChange(epicPath);
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(1);
+
+  // A poll bump fires the onWake body. Still uncommitted → both the recheck
+  // and the reconcile re-run the in-HEAD probe and KEEP it gated → NO emit.
+  const onWakeBody = (): void => {
+    scanner.recheckPending();
+    reconcilePlanctlDirs([tmpDir], scanner, "db-poll");
+  };
+  onWakeBody();
+  onWakeBody();
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(1);
+
+  // Commit it (the close→approve seam, accompanied by a DB write in the live
+  // system). Now in HEAD; the next poll bump drains pending and emits.
+  git(tmpDir, "add", epicPath);
+  git(tmpDir, "commit", "-q", "-m", "commit epic");
+  onWakeBody();
+  expect(emitted.length).toBe(1);
+  expect((emitted[0] as { id: string }).id).toBe("fn-6-gated");
+  expect(scanner.pendingSize()).toBe(0);
+});
+
+test("makeSingleFlight: a re-entrant trigger mid-work coalesces into EXACTLY ONE trailing re-run (fn-705)", () => {
+  // The poll's coalescing contract: a `data_version` bump landing while the
+  // previous bump's wake body runs must NOT queue a second full cycle — it
+  // sets `wakePending` and the running cycle loops once more. We simulate the
+  // re-entrancy by having `work` re-trigger on its FIRST run only.
+  let runs = 0;
+  let trigger: () => void = () => {};
+  trigger = makeSingleFlight(
+    () => {
+      runs += 1;
+      if (runs === 1) {
+        // A bump arrives mid-work. The guard sets `wakePending`; the running
+        // cycle loops once more — NOT a re-entrant second cycle.
+        trigger();
+      }
+    },
+    () => false,
+  );
+
+  trigger();
+  // One outer call + one re-entrant call = exactly two body runs (the trailing
+  // coalesced re-run), never three+ and never a queued backlog.
+  expect(runs).toBe(2);
+
+  // A burst of triggers after the cycle is idle each run once (no in-flight to
+  // coalesce against), proving the guard only coalesces CONCURRENT triggers.
+  trigger();
+  trigger();
+  expect(runs).toBe(4);
+});
+
+test("makeSingleFlight: a burst of triggers DURING one cycle yields one trailing re-run, not a queue (fn-705)", () => {
+  let runs = 0;
+  let trigger: () => void = () => {};
+  trigger = makeSingleFlight(
+    () => {
+      runs += 1;
+      if (runs === 1) {
+        // Five bumps land mid-work — they must collapse to a SINGLE trailing
+        // re-run, not five queued cycles.
+        trigger();
+        trigger();
+        trigger();
+        trigger();
+        trigger();
+      }
+    },
+    () => false,
+  );
+
+  trigger();
+  expect(runs).toBe(2);
+});
+
+test("makeSingleFlight: a throw in work is swallowed (log+continue) and never wedges the loop or leaks the in-flight guard (fn-705)", () => {
+  const errors: unknown[] = [];
+  let runs = 0;
+  const trigger = makeSingleFlight(
+    () => {
+      runs += 1;
+      throw new Error("boom");
+    },
+    () => false,
+    (err) => errors.push(err),
+  );
+
+  // First trigger throws — swallowed via onError, guard cleared by `finally`.
+  trigger();
+  expect(runs).toBe(1);
+  expect(errors.length).toBe(1);
+
+  // A subsequent trigger still runs (the guard did not leak), proving a throw
+  // doesn't wedge the poll loop.
+  trigger();
+  expect(runs).toBe(2);
+  expect(errors.length).toBe(2);
+});
+
+test("makeSingleFlight: isShutdown short-circuits the trailing re-run (fn-705)", () => {
+  let runs = 0;
+  let shuttingDown = false;
+  let trigger: () => void = () => {};
+  trigger = makeSingleFlight(
+    () => {
+      runs += 1;
+      if (runs === 1) {
+        // A bump lands mid-work, then shutdown is requested. The trailing
+        // re-run must NOT fire against a closing worker.
+        trigger();
+        shuttingDown = true;
+      }
+    },
+    () => shuttingDown,
+  );
+
+  trigger();
+  expect(runs).toBe(1);
+});
+
 test("kick → gated recheckPending: an UNCOMMITTED approval stays gated (no emit); a committed file then emits (fn-701 task .2 fn-627 guard)", () => {
   // The plan-worker's inbound `kick` branch runs `scanner.recheckPending()` —
   // the SAME GATED drain the `recheck-pending` branch runs (NOT a bypass). An
@@ -2075,6 +2313,119 @@ test("spawned Worker tolerates a kick message (gated recheck, no crash) and stil
   await Bun.sleep(100);
   expect(crashed).toBe(false);
 
+  worker.postMessage({ type: "shutdown" });
+  const result = await Promise.race([
+    exited.then(() => "exited" as const),
+    Bun.sleep(3000).then(() => "timeout" as const),
+  ]);
+  expect(result).toBe("exited");
+  expect(crashed).toBe(false);
+});
+
+test("PLAN_DB_POLL_MS is the documented 25ms-floor cadence (mirrors git-worker DB_POLL_MS)", () => {
+  // The poll must not run faster than the 25ms macOS-kqueue floor and matches
+  // the sibling producer's cadence so all workers share one schedule.
+  expect(PLAN_DB_POLL_MS).toBe(100);
+  expect(PLAN_DB_POLL_MS).toBeGreaterThanOrEqual(25);
+});
+
+test("spawned Worker: a planctl change accompanied by a DB write emits in ~poll-time, NOT a heartbeat interval (fn-705 realtime poll)", async () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  // Bootstrap the schema with a writer so the worker's read-only open succeeds.
+  openDb(dbPath).db.close();
+
+  // A real git root with an UNCOMMITTED epic file: at boot it lands in the
+  // fn-629 pending set (NOT emitted). Committing it makes it in-HEAD; the
+  // accompanying DB write bumps `data_version`, and the fast poll's gated
+  // `recheckPending()` drains pending → emits — WITHOUT waiting the 60s
+  // heartbeat. This is the core fn-705 thesis (close→emit ≈ poll cadence).
+  const root = join(tmpDir, "root");
+  mkdirSync(root);
+  gitInit(root);
+  const epicDir = join(root, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+  const epicPath = join(epicDir, "fn-1-realtime.json");
+  writeFileSync(
+    epicPath,
+    JSON.stringify({
+      id: "fn-1-realtime",
+      title: "Realtime",
+      status: "open",
+      primary_repo: root,
+    }),
+  );
+
+  const worker = new Worker(
+    new URL("../src/plan-worker.ts", import.meta.url).href,
+    {
+      // A tight poll so the test resolves in a fraction of a second; the live
+      // daemon uses PLAN_DB_POLL_MS.
+      workerData: { dbPath, roots: [root], pollMs: 25 },
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  const epicMsgs: PlanMessage[] = [];
+  worker.addEventListener("message", (ev: MessageEvent) => {
+    const m = ev.data as PlanMessage;
+    if (
+      m &&
+      m.kind === "plan-epic" &&
+      (m as { id: string }).id === "fn-1-realtime"
+    ) {
+      epicMsgs.push(m);
+    }
+  });
+  const exited = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+  let crashed = false;
+  worker.addEventListener("error", () => {
+    crashed = true;
+  });
+
+  // Let it boot, open its read-only connection, subscribe + boot-scan. The
+  // uncommitted file is gated into pending — assert nothing emitted yet.
+  await Bun.sleep(250);
+  expect(crashed).toBe(false);
+  expect(epicMsgs.length).toBe(0);
+
+  // Commit the epic (now in HEAD) AND make a DB write from a SEPARATE writer
+  // connection so the worker's read-only `data_version` actually moves (it
+  // only bumps for a write by a DIFFERENT connection). In the live system the
+  // close→approve `Commit` fold IS that DB write; here we synthesize it.
+  git(root, "add", epicPath);
+  git(root, "commit", "-q", "-m", "commit epic");
+  const writer = openDb(dbPath).db;
+  writer
+    .query(
+      "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (1, 's', 'Stop', 'lifecycle', '{}')",
+    )
+    .run();
+
+  // Poll-cadence is 25ms; the heartbeat is 60s. Wait a window that ONLY the
+  // poll can clear (sub-second), then assert the snapshot landed. If this
+  // emits, the close→emit collapse holds via the poll alone.
+  const deadline = Date.now() + 2000;
+  while (epicMsgs.length === 0 && Date.now() < deadline) {
+    await Bun.sleep(25);
+  }
+  expect(epicMsgs.length).toBeGreaterThanOrEqual(1);
+
+  // Single-flight + change-gate guard: a burst of further DB writes must NOT
+  // re-emit the unchanged epic (the self-induced poll-storm the change-gate
+  // absorbs). Fire several writes and confirm no duplicate snapshot.
+  const before = epicMsgs.length;
+  for (let i = 2; i <= 6; i++) {
+    writer
+      .query(
+        "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (?, 's', 'Stop', 'lifecycle', '{}')",
+      )
+      .run(i);
+  }
+  await Bun.sleep(200);
+  expect(epicMsgs.length).toBe(before);
+
+  writer.close();
   worker.postMessage({ type: "shutdown" });
   const result = await Promise.race([
     exited.then(() => "exited" as const),

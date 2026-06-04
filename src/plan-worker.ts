@@ -27,12 +27,17 @@
  * Why a native file watcher here when keeper's DO-NOT bans `fs.watch`/FSEvents
  * for its OWN SQLite DB: same carve-out as the transcript worker. The `.planctl`
  * trees are EXTERNAL files written by other processes (planctl), so the
- * same-process-write blind spot does not apply and there is no `data_version`
- * for a foreign file tree. Every watch event is treated as "something changed,
- * go look" — never as the data: each notification triggers an `fstat` +
+ * same-process-write blind spot does not apply — the file watcher observes the
+ * FOREIGN tree, not keeper's DB. Every watch event is treated as "something
+ * changed, go look" — never as the data: each notification triggers an `fstat` +
  * size-bounded re-read + safe-parse from the current file (routed on
  * path+existence, not `event.type`, since planctl writes via atomic
- * `os.replace`, so an update may surface as create/rename).
+ * `os.replace`, so an update may surface as create/rename). SEPARATELY (fn-705),
+ * the worker ALSO runs a fast `PRAGMA data_version` poll — but that poll is on
+ * keeper's OWN read-only connection, the SANCTIONED DB-change primitive (the
+ * same one `wake-worker.ts` / `git-worker.ts` use), NOT the foreign tree. A DB
+ * bump is purely a TRIGGER ("a fold landed; re-check") — the snapshot data still
+ * comes only from a parsed `.planctl` file.
  *
  * Watching strategy (the keystone risk this task isolates): ONE recursive
  * `@parcel/watcher` subscribe per root, with aggressive POSITIVE ignore globs
@@ -59,20 +64,27 @@
  * tombstone path (`plan-epic-deleted` / `plan-task-deleted`) as a live delete —
  * no new event types.
  *
- * Three-layer ingest (epic fn-681): the authoritative path is the
+ * Multi-layer ingest (epic fn-681 + fn-705): the authoritative path is the
  * commit-trigger (`planctl-commit-changed` from git-worker → re-ingest the
- * committed bytes, drop-proof and free of the mid-write partial-read race),
- * backed by a periodic reconcile heartbeat ({@link reconcilePlanctlDirs}
- * on the {@link RECONCILE_HEARTBEAT_MS} cadence — the brand-new-repo
- * convergence backstop that fires even when git-worker isn't yet watching
- * the repo and FSEvents dropped its scaffold burst) and the broad
- * `@parcel/watcher` recursive subscription (the best-effort sub-second
- * live path, the only path for uncommitted working-tree edits but the
- * one exposed to FSEvents drops). The drop-recovery `RescanScheduler`
- * callback is `.planctl`-scoped via {@link reconcilePlanctlDirs} so a
- * drop on a broad root recovers in O(#projects), not O(`~/code` tree).
- * All three layers are ADDITIVE re-ingest, idempotent via the change-gate;
- * deletions stay owned by the commit path + boot sweep + live `onDelete`.
+ * committed bytes, drop-proof and free of the mid-write partial-read race);
+ * the fast `PRAGMA data_version` poll ({@link PLAN_DB_POLL_MS} cadence, fn-705)
+ * — every keeper DB write (including the close→approve `Commit` fold that makes
+ * a planctl file "ready") drives a gated {@link PlanScanner.recheckPending}
+ * drain PLUS a change-gated {@link reconcilePlanctlDirs} re-scan, collapsing
+ * close→emit to ~50ms for any repo keeper already watches; the periodic
+ * reconcile heartbeat ({@link reconcilePlanctlDirs} on the
+ * {@link RECONCILE_HEARTBEAT_MS} cadence — the should-never-fire paranoia
+ * backstop for the brand-new-repo case the poll can't reach because no DB write
+ * accompanies a first-ever scaffold) and the broad `@parcel/watcher` recursive
+ * subscription (the best-effort sub-second live path, the only path for
+ * uncommitted working-tree edits but the one exposed to FSEvents drops). The
+ * drop-recovery `RescanScheduler` callback is `.planctl`-scoped via
+ * {@link reconcilePlanctlDirs} so a drop on a broad root recovers in
+ * O(#projects), not O(`~/code` tree). All layers are ADDITIVE re-ingest,
+ * idempotent via the change-gate; deletions stay owned by the commit path +
+ * boot sweep + live `onDelete`. The poll is a TRIGGER ONLY — it never writes
+ * the DB nor bypasses the fn-629 in-HEAD gate (recheck + reconcile both stay
+ * gated), preserving re-fold determinism and the fn-627 dup-dispatch guard.
  */
 
 import type { Database } from "bun:sqlite";
@@ -101,6 +113,13 @@ export interface PlanWorkerData {
    * existing dirs). Overridable so tests point at hermetic tmp dirs.
    */
   roots: string[];
+  /**
+   * Fast `data_version` poll cadence in ms (fn-705). Defaults to
+   * {@link PLAN_DB_POLL_MS} when omitted; tests pass a small value to assert
+   * realtime emission without a heartbeat-length wait. The live daemon leaves
+   * it unset (the production cadence is the constant).
+   */
+  pollMs?: number;
 }
 
 /**
@@ -1147,21 +1166,38 @@ export class PlanScanner {
   }
 
   /**
-   * Log that a BACKSTOP path (the 60s heartbeat reconcile, or an FSEvents-drop
-   * rescan) delivered a snapshot a fast path missed (fn-701). Routed through
-   * the scanner's own `log` sink (the private field the backstop callers can't
-   * reach) so a heartbeat firing in NORMAL operation — the signature of the
-   * commit/FSEvents fast path being broken — is visible in the logs.
+   * Log that a TRIGGER-driven reconcile (the 60s heartbeat, an FSEvents-drop
+   * rescan, or the fn-705 `data_version` poll) delivered a snapshot. Routed
+   * through the scanner's own `log` sink (the private field the callers can't
+   * reach).
+   *
+   * Log SEMANTICS branch on whether the trigger is a FAST path or a BACKSTOP:
+   * - `"heartbeat"` / `"fswatcher-drop"` are BACKSTOPS — an emit here means a
+   *   fast path missed it (fn-701), so it logs the loud alarm wording. A
+   *   heartbeat firing in NORMAL operation is the signature of the
+   *   commit/FSEvents fast path being broken, and must be visible.
+   * - `"db-poll"` is itself a FAST path (fn-705 — every keeper DB write drives
+   *   it, including the close→approve fold), so an emit here is EXPECTED, not a
+   *   missed-fast-path alarm. It logs a low-key "did real work" line WITHOUT
+   *   the alarm wording so a poll-rescued emit is distinguishable from (and not
+   *   confused with) a heartbeat-rescued one.
    *
    * The caller gates this on `onChange` having RETURNED `true` (it emitted),
    * which the in-memory change-gate (`lastEmitted`) already dedups against a
-   * fast-path emit earlier this cycle — so a normal first-time emit from the
-   * fast path is never double-logged here.
+   * fast-path emit earlier this cycle — so a normal first-time emit is never
+   * double-logged here.
    *
    * Never a synthetic event — re-fold determinism forbids a fold-driving fact
-   * from a backstop log line.
+   * from a trigger log line.
    */
-  logBackstopEmit(path: string, reason: "heartbeat" | "fswatcher-drop"): void {
+  logBackstopEmit(
+    path: string,
+    reason: "heartbeat" | "fswatcher-drop" | "db-poll",
+  ): void {
+    if (reason === "db-poll") {
+      this.log(`[plan-worker] db-poll emitted ${path}`);
+      return;
+    }
     this.log(
       `[plan-worker] backstop (${reason}) emitted ${path} — a fast path missed it`,
     );
@@ -1485,6 +1521,74 @@ const GIT_CHECK_TIMEOUT_MS = 1000;
 export const RECONCILE_HEARTBEAT_MS = 60_000;
 
 /**
+ * Fast `PRAGMA data_version` poll cadence (fn-705) — same value as
+ * `git-worker.ts` `DB_POLL_MS` / `wake-worker.ts` so all producer/reader
+ * workers share one schedule. A bump means SOMETHING committed to keeper's DB
+ * (a hook event, a fold, a `Commit` discharge); since the close→approve flow
+ * that makes a planctl file "ready" IS such a write, polling the DB collapses
+ * close→emit to ~50ms for any repo keeper already watches — no longer bound by
+ * the 60s heartbeat. 25ms is the documented floor (don't poll faster, it can
+ * interfere with @parcel/watcher's kqueue subscription on macOS); 100ms is
+ * comfortably above it and matches the sibling producer. Exported for unit
+ * reach. Overridable per-worker via `PlanWorkerData.pollMs` so tests can drive
+ * a tighter cadence without a heartbeat-length wait.
+ */
+export const PLAN_DB_POLL_MS = 100;
+
+/**
+ * Single-flight coalescing wrapper (fn-705) — the same `cycleRunning` /
+ * `wakePending` shape `src/autopilot-worker.ts` keeps for its reconcile drive.
+ * Returns a trigger function: invoking it while the `work` body is mid-flight
+ * sets a pending flag rather than re-entering, and the running cycle loops once
+ * more after `work` returns — so a BURST of triggers coalesces into EXACTLY ONE
+ * trailing re-run, never a queue.
+ *
+ * The `work` body is synchronous here (the plan-worker's recheck + reconcile
+ * are both sync), so the in-flight window only spans a re-entrant trigger
+ * (`work` calling the returned trigger). That re-entrancy is exactly what the
+ * fn-705 poll must coalesce — a `data_version` bump landing while the previous
+ * bump's scan runs — and it makes the contract pure-unit-testable without a
+ * real timer (a test passes a `work` that re-triggers and asserts the trailing
+ * single re-run).
+ *
+ * `isShutdown` is checked before each loop iteration so a shutdown mid-cycle
+ * stops the trailing re-run. `onError` (optional) receives any throw from
+ * `work`; the wrapper swallows it (log+continue, no self-heal) and the
+ * `finally` always clears the in-flight guard so a throw can't wedge the loop.
+ * Exported for unit reach.
+ */
+export function makeSingleFlight(
+  work: () => void,
+  isShutdown: () => boolean,
+  onError?: (err: unknown) => void,
+): () => void {
+  let cycleRunning = false;
+  let wakePending = false;
+  return (): void => {
+    if (cycleRunning) {
+      wakePending = true;
+      return;
+    }
+    cycleRunning = true;
+    try {
+      do {
+        wakePending = false;
+        if (isShutdown()) {
+          return;
+        }
+        try {
+          work();
+        } catch (err) {
+          onError?.(err);
+        }
+      } while (wakePending && !isShutdown());
+    } finally {
+      cycleRunning = false;
+    }
+  };
+}
+
+/**
  * Boot scan: recursively walk `root` for `.planctl/{epics,tasks}/*.json` files
  * and run each through the scanner. Called once after each subscribe resolves so
  * files that pre-existed the daemon's boot (or were changed while keeperd was
@@ -1550,17 +1654,19 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
  * retracts on missing definition files; a sidecar's absence is the cache's
  * `"todo"` default, not a tombstone.
  *
- * `triggerReason` (fn-701): when set (a backstop caller — the 60s heartbeat or
- * an FSEvents-drop rescan), a definition-file `onChange` that RETURNS `true`
- * (it emitted a snapshot a fast path missed) logs a trigger-tagged line via
- * {@link PlanScanner.logBackstopEmit}. The boot scan ({@link scanRoot}) passes
- * `undefined` and stays silent — a first-time boot emit is expected, not a
- * fast-path failure signal.
+ * `triggerReason` (fn-701, extended fn-705): when set (a trigger caller — the
+ * 60s heartbeat, an FSEvents-drop rescan, or the fn-705 `data_version` poll), a
+ * definition-file `onChange` that RETURNS `true` (it emitted a snapshot) logs a
+ * trigger-tagged line via {@link PlanScanner.logBackstopEmit} (which keeps the
+ * loud "a fast path missed it" alarm for the two BACKSTOP reasons only — a
+ * `db-poll` emit is a normal fast-path success). The boot scan
+ * ({@link scanRoot}) passes `undefined` and stays silent — a first-time boot
+ * emit is expected, not a noteworthy event.
  */
 function scanPlanctlDir(
   planctlDir: string,
   scanner: PlanScanner,
-  triggerReason?: "heartbeat" | "fswatcher-drop",
+  triggerReason?: "heartbeat" | "fswatcher-drop" | "db-poll",
 ): void {
   // Pass 1: prime `runtimeStatusCache` from `state/tasks/*.state.json`. A
   // missing dir is fine (fresh clone with no state files yet). Each file is
@@ -1746,15 +1852,17 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
  * discipline as the boot scan); the loop never throws. Exported for unit
  * reach.
  *
- * `triggerReason` (fn-701) tags the backstop caller — `"heartbeat"` for the
- * 60s reconcile, `"fswatcher-drop"` for an FSEvents-drop rescan — so an
- * emission a fast path missed logs a trigger-tagged "did real work" line. Pass
+ * `triggerReason` (fn-701, extended fn-705) tags the calling trigger —
+ * `"heartbeat"` for the 60s reconcile, `"fswatcher-drop"` for an FSEvents-drop
+ * rescan, `"db-poll"` for the fn-705 `data_version` poll — so an emission logs
+ * a trigger-tagged "did real work" line (the BACKSTOP reasons carry the loud
+ * "a fast path missed it" alarm; `db-poll` does not — it IS a fast path). Pass
  * `undefined` (boot / silent reconcile) to suppress the log.
  */
 export function reconcilePlanctlDirs(
   roots: readonly string[],
   scanner: PlanScanner,
-  triggerReason?: "heartbeat" | "fswatcher-drop",
+  triggerReason?: "heartbeat" | "fswatcher-drop" | "db-poll",
 ): void {
   const dirs = discoverPlanctlDirs(roots);
   for (const dir of dirs) {
@@ -1965,6 +2073,11 @@ function main(): void {
   // starts watching a repo's `.git` once an epic row for it exists).
   // Cancelled in shutdown alongside the drop-recovery schedulers.
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  // fn-705 fast `data_version` poll timer — armed AFTER seedFromDb (below) so
+  // the seeded change-gate suppresses a first-bump re-emit storm; cleared in
+  // shutdown alongside the heartbeat. Declared here so the shutdown handler
+  // (registered before the timer is armed) can close over it.
+  let dbPollTimer: ReturnType<typeof setInterval> | null = null;
   let shuttingDown = false;
 
   const closeDb = (): void => {
@@ -2063,6 +2176,14 @@ function main(): void {
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;
       }
+      // fn-705: cancel the fast `data_version` poll BEFORE unsubscribe + db
+      // close so a queued tick can't read `data_version` / drive a reconcile
+      // against a closing connection (a leaked interval strands
+      // `bun test --isolate`). Same ordering as the heartbeat + schedulers.
+      if (dbPollTimer != null) {
+        clearInterval(dbPollTimer);
+        dbPollTimer = null;
+      }
       // Release every subscription (external resources), then the db, then exit
       // clean. Mirrors transcript-worker's teardown but over an array.
       void (async () => {
@@ -2099,6 +2220,58 @@ function main(): void {
       );
     }
   }, RECONCILE_HEARTBEAT_MS);
+
+  // fn-705 fast `data_version` poll — the realtime trigger that collapses
+  // close→emit to ~50ms. A bump means SOMETHING committed to keeper's DB; the
+  // close→approve `Commit` fold that makes a planctl file "ready" IS such a
+  // write, so polling the DB surfaces it without waiting on the 60s heartbeat.
+  //
+  // The poll is a TRIGGER, not a data source: on a bump it runs the GATED
+  // `recheckPending()` (drains the pending set through `onChange`, preserving
+  // the fn-629 in-HEAD gate / fn-627 dup-dispatch guard) AND a change-gated
+  // `reconcilePlanctlDirs(..., "db-poll")` re-scan (so a `.planctl` change
+  // whose FSEvent was dropped — and was therefore NEVER gated into pending —
+  // is still recovered; the recheck-only path cannot fix that). The poll NEVER
+  // writes the DB.
+  //
+  // Single-flight coalescing (cloned from `src/autopilot-worker.ts`): a bump
+  // arriving while the wake body runs coalesces into exactly ONE trailing
+  // re-run, never a queue. The recheck stays gated (fn-629); the reconcile is
+  // change-gated so a quiescent board emits nothing across bumps. The body is
+  // try/catch-wrapped (log+continue, no self-heal) — a throw must not wedge
+  // the poll loop nor leak the in-flight guard.
+  const onWake = makeSingleFlight(
+    () => {
+      scanner.recheckPending();
+      reconcilePlanctlDirs(data.roots, scanner, "db-poll");
+    },
+    () => shuttingDown,
+    (err) =>
+      console.error(`[plan-worker] db-poll wake failed: ${stringifyErr(err)}`),
+  );
+
+  // Init the baseline ONCE at startup from a naked autocommit `PRAGMA
+  // data_version` read on the worker's existing read-only connection — NEVER
+  // reset to 0 on recheck/restart (a reconnect would reset the baseline and
+  // false-suppress). The read MUST stay in autocommit (no open BEGIN, or the
+  // counter freezes for this connection). Armed AFTER seedFromDb so the seeded
+  // change-gate absorbs the first bump's re-scan without a re-emit storm.
+  const dataVersionQuery = db.query("PRAGMA data_version");
+  let lastDataVersion = (dataVersionQuery.get() as { data_version: number })
+    .data_version;
+  const pollMs = Math.max(25, data.pollMs ?? PLAN_DB_POLL_MS);
+  dbPollTimer = setInterval(() => {
+    if (shuttingDown) return;
+    // Read OUTSIDE any open BEGIN (autocommit) so the counter is live; only a
+    // change is meaningful. Store the new version BEFORE onWake so a bump that
+    // lands during the wake is observed on the next tick (its own re-run, or
+    // the wakePending coalesce if it raced the running cycle).
+    const cur = (dataVersionQuery.get() as { data_version: number })
+      .data_version;
+    if (cur === lastDataVersion) return;
+    lastDataVersion = cur;
+    onWake();
+  }, pollMs);
 
   // ONE recursive subscribe per root. A missing root is tolerated (skip-and-log,
   // keep watching the others). A per-root subscribe rejection is logged but does
