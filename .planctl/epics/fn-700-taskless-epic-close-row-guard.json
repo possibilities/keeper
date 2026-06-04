@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-700-taskless-epic-close-row-guard",
   "bundles": [],
   "closer_done_at": "2026-06-04T14:05:40.702994Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-04T14:05:40.702994Z"
+  "updated_at": "2026-06-04T14:06:19.680007Z"
 }
