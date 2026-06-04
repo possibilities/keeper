@@ -138,6 +138,57 @@ const DEFAULT_POLL_MS = 2_500;
 /** Floor on the poll cadence so a tight workerData override can't busy-spin. */
 const MIN_POLL_MS = 25;
 
+// Env-gated tracing (epic fn-704 task .2). Mirrors the `KEEPER_TRACE_SERVER`
+// convention in `server-worker.ts`: read the flag ONCE at module load into a
+// `const`, gate AT THE CALL SITE so the increment + template literal never
+// allocate when off (V8/JSC elides the `if (TRACE_TABNAMER)` branch in
+// steady-state), and trace to `console.error` in an awk-parseable shape on a
+// rolling window. Counts the two loop-diagnostic signals on the tab-namer
+// side: real `renameTab` shell-outs (AFTER the convergence / memo / empty-name
+// gates, so the count reflects shell-outs not suppressed iterations) and kicks
+// received. A high rename rate that tracks main's `BackendExecSnapshot` mint
+// rate (the `KEEPER_TRACE_ZELLIJ` counterpart) confirms the suspected
+// feed -> rename -> TabUpdate -> re-emit -> feed loop.
+const TRACE_TABNAMER = process.env.KEEPER_TRACE_TABNAMER === "1";
+
+/** Rolling trace window (ms). A counter flushes one rate line per window. */
+const TRACE_WINDOW_MS = 10_000;
+
+/**
+ * Allocation-free rolling-window event counter for env-gated tracing. The
+ * caller MUST gate the `tick()` call behind its module-level `const` flag, so
+ * a counter on a disabled flag is never even touched. On the first `tick()` of
+ * a window the start is stamped; once the window elapses the accumulated count
+ * is flushed as a single awk-parseable `[<tag>] T=<ms> count=<N> window_ms=<W>`
+ * line to stderr and the window resets. Exception-free: the only operation is
+ * integer arithmetic + a `console.error` (which the no-self-heal callers wrap
+ * is unnecessary — `console.error` does not throw on a plain string), so it is
+ * safe to call from kick/tick handlers and main's drain.
+ */
+class TraceCounter {
+  private count = 0;
+  private windowStart = 0;
+  constructor(private readonly tag: string) {}
+  tick(now: number): void {
+    if (this.windowStart === 0) this.windowStart = now;
+    this.count++;
+    if (now - this.windowStart >= TRACE_WINDOW_MS) {
+      console.error(
+        `[${this.tag}] T=${now} count=${this.count} window_ms=${now - this.windowStart}`,
+      );
+      this.count = 0;
+      this.windowStart = now;
+    }
+  }
+}
+
+// Module-scope counters so the running totals survive across `runTick` calls
+// and kick deliveries. Constructed unconditionally (cheap — two integers each)
+// but `tick()`ed ONLY behind `TRACE_TABNAMER` at the call sites below, so they
+// are wholly inert when the flag is off.
+const traceRenames = new TraceCounter("trace-tabnamer-renames");
+const traceKicks = new TraceCounter("trace-tabnamer-kicks");
+
 /**
  * Strips control / ANSI / OSC bytes, collapses internal whitespace,
  * trims, and strips a leading `-` (clap-flag mitigation). Does NOT cap
@@ -349,6 +400,11 @@ export async function runTick(deps: TickDeps): Promise<void> {
         // We're tearing down; let the next worker boot resume.
         return;
       }
+      // fn-704.2 trace: count REAL shell-outs only — past the empty-name
+      // (:above), convergence, and memo gates — so the rate reflects actual
+      // `rename-tab-by-id` invocations, not suppressed iterations. Call-site
+      // gated so the increment never runs when the flag is off.
+      if (TRACE_TABNAMER) traceRenames.tick(Date.now());
       let result: Awaited<ReturnType<ExecBackend["renameTab"]>>;
       try {
         result = await backend.renameTab(
@@ -486,6 +542,9 @@ function main(): void {
       // reconcile tick now instead of waiting for the next poll tick. The
       // try/catch lives inside `tick` — this handler must never throw
       // (no-self-heal path).
+      // fn-704.2 trace: count kicks received = the input pressure driving the
+      // rename ticks. Call-site gated; the counter is exception-free.
+      if (TRACE_TABNAMER) traceKicks.tick(Date.now());
       void tick();
       return;
     }

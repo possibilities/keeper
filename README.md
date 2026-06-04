@@ -459,7 +459,32 @@ Keeper has no `install` verb. Wire it up manually:
    `server.stderr`; off by default (the rare `[server-worker]` error class is
    always logged). The plist's `EnvironmentVariables` block carries
    `KEEPER_TRACE_SERVER=0`; flip to `1` then
-   `launchctl kickstart -k gui/$UID/arthack.keeperd` to enable. Example
+   `launchctl kickstart -k gui/$UID/arthack.keeperd` to enable.
+
+   Two sibling flags (epic fn-704 task .2) trace the suspected zellij feed
+   amplification loop; both default OFF and cost ZERO when off (read once into
+   a module `const`, gated at the call site so the counter never even
+   increments). Each emits an awk-parseable rolling-window rate line to stderr
+   — `[<tag>] T=<epoch-ms> count=<N> window_ms=<W>` — once per ~10s window.
+   - `KEEPER_TRACE_TABNAMER=1` — tab-namer-worker counters:
+     `[trace-tabnamer-renames]` = REAL `rename-tab-by-id` shell-outs (past the
+     convergence / memo / empty-name gates), `[trace-tabnamer-kicks]` = kicks
+     received from main.
+   - `KEEPER_TRACE_ZELLIJ=1` — both ends of the feed→mint path:
+     `[trace-zellij-notifications]` = watcher notifications posted by the
+     zellij-events-worker (raw bridge write pressure), and `[trace-zellij-mints]`
+     = actual `BackendExecSnapshot` mints in main's `scanZellijEventsDir` (the
+     real `data_version`-bumping driver — the worker has no DB handle, so the
+     bump is only observable at main's mint site).
+
+   **How to read the trace (spotting the loop).** Run
+   `KEEPER_TRACE_TABNAMER=1 KEEPER_TRACE_ZELLIJ=1 keeperd` on a busy session and
+   compare the four rates. A high `notifications` rate with a LOW `mints` rate
+   means the feed is noisy-but-harmless (a producer-side / task .1 concern, not
+   a loop). A high `mints` rate that TRACKS the `renames` rate is the loop
+   signature: each rename emits a TabUpdate → bridge re-emit → feed line → mint
+   → `data_version` bump → tab-namer kick → another rename. The `kicks` rate is
+   the upstream pressure feeding the rename ticks. Example
    clients ship under the unified `keeper` CLI — `keeper board` /
    `keeper jobs` / `keeper autopilot` / `keeper git` / `keeper usage`
    (subscribe; the readiness clients go through

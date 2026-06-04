@@ -603,6 +603,49 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
  */
 const MAX_ZELLIJ_EVENTS_FILE_BYTES = 16 * 1024 * 1024;
 
+// Env-gated tracing (epic fn-704 task .2). Mirrors the `KEEPER_TRACE_SERVER`
+// convention in `server-worker.ts`: read the flag ONCE at module load into a
+// `const`, gate AT THE CALL SITE so the increment never allocates when off,
+// and trace to `console.error` in an awk-parseable shape on a rolling window.
+// This is the MAIN side of `KEEPER_TRACE_ZELLIJ`: it counts actual
+// `BackendExecSnapshot` mints/sec inside `scanZellijEventsDir` — the real
+// `data_version`-bumping loop driver (the zellij-events worker has NO DB handle
+// by design, so the true bump is only observable here, not at the worker's
+// notification-post). Pairs with the worker-side notification counter: a high
+// notification rate with a LOW mint rate means the feed is noisy-but-harmless;
+// a high mint rate that tracks the tab-namer rename rate confirms the suspected
+// feed -> rename -> TabUpdate -> re-emit -> feed loop. ADDITIVE + fully gated —
+// touches no fold/projection logic, so re-fold determinism is untouched.
+const TRACE_ZELLIJ = process.env.KEEPER_TRACE_ZELLIJ === "1";
+
+/** Rolling trace window (ms). The counter flushes one rate line per window. */
+const TRACE_ZELLIJ_WINDOW_MS = 10_000;
+
+/**
+ * Allocation-free rolling-window mint counter for `KEEPER_TRACE_ZELLIJ`. The
+ * caller MUST gate `tick()` behind `TRACE_ZELLIJ`. Exception-free (integer
+ * arithmetic + a `console.error` on a plain string), so it is safe inside the
+ * scan loop which runs on main's drain path (no-self-heal: a throw here would
+ * bounce the daemon).
+ */
+const traceZellijMints = (() => {
+  let count = 0;
+  let windowStart = 0;
+  return {
+    tick(now: number): void {
+      if (windowStart === 0) windowStart = now;
+      count++;
+      if (now - windowStart >= TRACE_ZELLIJ_WINDOW_MS) {
+        console.error(
+          `[trace-zellij-mints] T=${now} count=${count} window_ms=${now - windowStart}`,
+        );
+        count = 0;
+        windowStart = now;
+      }
+    },
+  };
+})();
+
 /**
  * Hidden sidecar filename for the per-session watermark map. Lives at
  * `<events-dir>/.keeperd-watermarks.json` — a dot-prefixed sibling so
@@ -911,6 +954,11 @@ export function scanZellijEventsDir(
           $backend_exec_pane_id: null,
           $background_task_id: null,
         });
+        // fn-704.2 trace: count REAL mints (post-INSERT = the actual
+        // `data_version` bump) — the loop driver. Inside the `try` so a failed
+        // INSERT (counted in the catch's skip) is not tallied as a bump.
+        // Call-site gated so the counter is inert when the flag is off.
+        if (TRACE_ZELLIJ) traceZellijMints.tick(Date.now());
       } catch (err) {
         // A failed INSERT must not wedge the rest of the scan. The
         // next watcher message will retry (the watermark still

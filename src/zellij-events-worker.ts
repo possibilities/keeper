@@ -107,6 +107,51 @@ export interface ShutdownMessage {
   type: "shutdown";
 }
 
+// Env-gated tracing (epic fn-704 task .2). Mirrors the `KEEPER_TRACE_SERVER`
+// convention in `server-worker.ts`: read the flag ONCE at module load into a
+// `const`, gate AT THE CALL SITE so the increment never allocates when off,
+// and trace to `console.error` in an awk-parseable shape on a rolling window.
+// This worker side counts notification-posts/sec = the RAW input pressure from
+// the bridge's write volume (a high rate here with a LOW mint rate at main's
+// `scanZellijEventsDir` means the feed is noisy-but-harmless; a high rate that
+// tracks the mint rate is the loop driver). The worker has NO DB handle by
+// design (sole-writer rule), so the actual `data_version`-bumping mint is only
+// observable at main's `scanZellijEventsDir` (gated by `KEEPER_TRACE_ZELLIJ`
+// there too) — the RATIO of the two is the loop diagnosis.
+const TRACE_ZELLIJ = process.env.KEEPER_TRACE_ZELLIJ === "1";
+
+/** Rolling trace window (ms). A counter flushes one rate line per window. */
+const TRACE_WINDOW_MS = 10_000;
+
+/**
+ * Allocation-free rolling-window event counter for env-gated tracing. Mirrors
+ * the helper in `tab-namer-worker.ts` / `daemon.ts`. The caller MUST gate the
+ * `tick()` call behind its module-level `const` flag. Exception-free (integer
+ * arithmetic + a `console.error` on a plain string), so it is safe in the
+ * notification-post path which must never throw.
+ */
+class TraceCounter {
+  private count = 0;
+  private windowStart = 0;
+  constructor(private readonly tag: string) {}
+  tick(now: number): void {
+    if (this.windowStart === 0) this.windowStart = now;
+    this.count++;
+    if (now - this.windowStart >= TRACE_WINDOW_MS) {
+      console.error(
+        `[${this.tag}] T=${now} count=${this.count} window_ms=${now - this.windowStart}`,
+      );
+      this.count = 0;
+      this.windowStart = now;
+    }
+  }
+}
+
+// Module-scope counter so the running total survives across watcher
+// notifications and drop-recovery re-scans. Inert when `TRACE_ZELLIJ` is off
+// (never `tick()`ed).
+const traceNotifications = new TraceCounter("trace-zellij-notifications");
+
 function stringifyErr(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -147,6 +192,8 @@ function main(): void {
     if (shuttingDown) {
       return;
     }
+    // fn-704.2 trace: drop-recovery re-scan notification. Call-site gated.
+    if (TRACE_ZELLIJ) traceNotifications.tick(Date.now());
     port.postMessage({
       kind: "zellij-events-changed",
     } satisfies ZellijEventsChangedMessage);
@@ -213,6 +260,9 @@ function main(): void {
         // batched-but-otherwise-empty event list (which
         // @parcel/watcher can deliver under low-rate churn) still
         // triggers the safe re-read.
+        // fn-704.2 trace: raw watcher notification = bridge write pressure.
+        // Call-site gated so the counter is inert when the flag is off.
+        if (TRACE_ZELLIJ) traceNotifications.tick(Date.now());
         port.postMessage({
           kind: "zellij-events-changed",
         } satisfies ZellijEventsChangedMessage);

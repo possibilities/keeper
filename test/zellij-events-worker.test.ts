@@ -10,7 +10,7 @@
  * Parallel-shape with `test/dead-letter-worker.test.ts`.
  */
 
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import {
   mkdirSync,
   mkdtempSync,
@@ -140,6 +140,35 @@ test("scanZellijEventsDir mints one BackendExecSnapshot per joinable pane line",
     expect(data.tab_id).toBe("5");
     expect(data.tab_name).toBe("alpha");
   }
+
+  db.close();
+});
+
+test("scanZellijEventsDir emits NO [trace-zellij-mints] line when KEEPER_TRACE_ZELLIJ is off (fn-704.2)", () => {
+  // `TRACE_ZELLIJ` in daemon.ts is read once into a module `const` at load;
+  // the test process leaves the env var unset, so the call-site gate is false
+  // and the mint counter is never `tick()`ed. Drive a real mint and assert no
+  // trace line reaches stderr — the zero-cost-when-off acceptance bullet.
+  const { db, stmts } = openDb(dbPath);
+  mkdirSync(eventsDir, { recursive: true });
+  seedJob(db, "job-1", "sess-a", "1");
+  writeFileSync(
+    join(eventsDir, "sess-a.ndjson"),
+    serializeLine(makePaneEvent({ pane_id: "1", tab_name: "alpha" })),
+  );
+
+  const errSpy = spyOn(console, "error");
+  try {
+    scanZellijEventsDir(db, stmts, eventsDir);
+  } finally {
+    errSpy.mockRestore();
+  }
+  expect(readBackendExecEvents(db).count).toBe(1); // the mint happened
+  const traced = errSpy.mock.calls.some(
+    (args) =>
+      typeof args[0] === "string" && args[0].includes("[trace-zellij-mints]"),
+  );
+  expect(traced).toBe(false);
 
   db.close();
 });

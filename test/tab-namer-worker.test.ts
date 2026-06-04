@@ -34,7 +34,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -349,6 +349,37 @@ test("runTick: clears the memo on observed convergence (tab_name === sanitized)"
   expect(calls).toEqual([]);
   // Memo entry cleared on observed convergence.
   expect(memo.has(key("s", "p1"))).toBe(false);
+});
+
+test("runTick: emits NO [trace-tabnamer-renames] line when KEEPER_TRACE_TABNAMER is off (fn-704.2)", async () => {
+  // `TRACE_TABNAMER` is read once into a module `const` at load; the test
+  // process leaves the env var unset, so the call-site gate is false and the
+  // renames counter is never `tick()`ed. Drive a real rename and assert no
+  // trace line reaches stderr — the zero-cost-when-off acceptance bullet.
+  insertJob({
+    job_id: "a",
+    backend_exec_session_id: "s",
+    backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p1",
+    title: "needs rename",
+    backend_exec_tab_name: "old",
+  });
+
+  const calls: RenameCall[] = [];
+  const backend = makeBackendStub(calls);
+  const memo = new Map<string, string>();
+  const errSpy = spyOn(console, "error");
+  try {
+    await runTick({ db, backend, memo, isShuttingDown: () => false });
+  } finally {
+    errSpy.mockRestore();
+  }
+  expect(calls).toHaveLength(1); // the rename fired (gate is past it)
+  const traced = errSpy.mock.calls.some(
+    (args) =>
+      typeof args[0] === "string" && args[0].includes("[trace-tabnamer-"),
+  );
+  expect(traced).toBe(false);
 });
 
 test("runTick: a drift back to the zellij default after convergence re-fires the rename (fn-699)", async () => {
