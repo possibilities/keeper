@@ -910,10 +910,98 @@ test("checkWorkPluginManifest: missing dir → not ok with remediation hint", ()
   }
 });
 
-test("runReconcileCycle reap: autoclose=on + role discharged → closeByTabId called when coords present, live entry forgotten", async () => {
-  // Pre-stage a live dispatch with a matching job that has backend_exec
-  // coords. The snapshot has no epic — role-discharged — but the job row
-  // carries session/tab ids so closeByTabId fires.
+test("runReconcileCycle reap: autoclose=on + approved-complete → BOTH worker and approve tabs reaped together, coords per dispatch, live entries forgotten", async () => {
+  // The row reached APPROVED completion (worker_phase done + approval
+  // approved + idle → verdict `completed`). Both the work dispatch AND
+  // the approve dispatch share the task id, so the approval reaps both
+  // tabs in one pass — each with its own freshest jobs-row coords.
+  const liveDispatches = new Map<string, LiveDispatch>();
+  liveDispatches.set("work::fn-1-foo.1", {
+    verb: "work",
+    id: "fn-1-foo.1",
+    key: "work::fn-1-foo.1",
+    cwd: "/repo",
+    controller: new AbortController(),
+  });
+  liveDispatches.set("approve::fn-1-foo.1", {
+    verb: "approve",
+    id: "fn-1-foo.1",
+    key: "approve::fn-1-foo.1",
+    cwd: "/repo",
+    controller: new AbortController(),
+  });
+  const jobs = new Map<string, Job>();
+  jobs.set(
+    "j-work",
+    makeJob({
+      job_id: "j-work",
+      plan_verb: "work",
+      plan_ref: "fn-1-foo.1",
+      state: "ended",
+      last_event_id: 200,
+      backend_exec_session_id: "zellij-session-1",
+      backend_exec_tab_id: "42",
+    }),
+  );
+  jobs.set(
+    "j-approve",
+    makeJob({
+      job_id: "j-approve",
+      plan_verb: "approve",
+      plan_ref: "fn-1-foo.1",
+      state: "ended",
+      last_event_id: 201,
+      backend_exec_session_id: "zellij-session-1",
+      backend_exec_tab_id: "43",
+    }),
+  );
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        worker_phase: "done",
+        approval: "approved",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], jobs });
+  const decision = reconcile(snap, makeState(), liveDispatches, AUTOCLOSE, 0);
+  expect(decision.reaps.length).toBe(2);
+  for (const r of decision.reaps) {
+    expect(r.reason).toBe("approved-complete");
+  }
+  const workReap = decision.reaps.find((x) => x.key === "work::fn-1-foo.1");
+  const approveReap = decision.reaps.find(
+    (x) => x.key === "approve::fn-1-foo.1",
+  );
+  expect(workReap?.tabId).toBe("42");
+  expect(approveReap?.tabId).toBe("43");
+
+  const { deps, log } = makeFakeDeps();
+  const ctrl = new AbortController();
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    liveDispatches,
+    "/bin/zsh",
+    ctrl.signal,
+    deps,
+  );
+  expect(log.closeByTabIdCalls).toContainEqual({
+    session: "zellij-session-1",
+    tabId: "42",
+  });
+  expect(log.closeByTabIdCalls).toContainEqual({
+    session: "zellij-session-1",
+    tabId: "43",
+  });
+  expect(liveDispatches.has("work::fn-1-foo.1")).toBe(false);
+  expect(liveDispatches.has("approve::fn-1-foo.1")).toBe(false);
+});
+
+test("runReconcileCycle reap: autoclose=on + row gone from snapshot → reap fires with row-gone reason", () => {
+  // The row vanished from the snapshot (deleted task/epic). Cleanup reap
+  // so the orphaned tab does not leak.
   const liveDispatches = new Map<string, LiveDispatch>();
   liveDispatches.set("work::fn-1-foo.1", {
     verb: "work",
@@ -939,28 +1027,15 @@ test("runReconcileCycle reap: autoclose=on + role discharged → closeByTabId ca
   const decision = reconcile(snap, makeState(), liveDispatches, AUTOCLOSE, 0);
   expect(decision.reaps.length).toBe(1);
   expect(decision.reaps[0]?.key).toBe("work::fn-1-foo.1");
-  expect(decision.reaps[0]?.reason).toBe("job-terminal");
-  expect(decision.reaps[0]?.sessionId).toBe("zellij-session-1");
+  expect(decision.reaps[0]?.reason).toBe("row-gone");
   expect(decision.reaps[0]?.tabId).toBe("42");
-
-  const { deps, log } = makeFakeDeps();
-  const ctrl = new AbortController();
-  await runReconcileCycle(
-    decision,
-    makeState(),
-    liveDispatches,
-    "/bin/zsh",
-    ctrl.signal,
-    deps,
-  );
-  expect(log.closeByTabIdCalls).toEqual([
-    { session: "zellij-session-1", tabId: "42" },
-  ]);
-  expect(liveDispatches.has("work::fn-1-foo.1")).toBe(false);
 });
 
-test("runReconcileCycle reap: autoclose=on + job terminal → reap fires with job-terminal reason", async () => {
-  // Live dispatch exists; the matching job has reached `ended`.
+test("runReconcileCycle reap: autoclose=on + worker ended but approval PENDING → NOT reaped (inspection window stays open)", () => {
+  // The worker session ended (state `ended`) but the row is still
+  // awaiting approval (worker_phase done + approval pending → verdict
+  // job-pending). The window stays OPEN — a finished-but-unapproved tab
+  // is the inspection surface, NOT a reap trigger.
   const liveDispatches = new Map<string, LiveDispatch>();
   liveDispatches.set("work::fn-1-foo.1", {
     verb: "work",
@@ -980,19 +1055,24 @@ test("runReconcileCycle reap: autoclose=on + job terminal → reap fires with jo
       last_event_id: 999,
     }),
   );
-  // Keep the row in the snapshot so it's not also role-discharged —
-  // the more specific job-terminal branch should win.
   const epic = makeEpic({
-    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        worker_phase: "done",
+        approval: "pending",
+      }),
+    ],
   });
   const snap = makeSnapshot({ epics: [epic], jobs });
   const decision = reconcile(snap, makeState(), liveDispatches, AUTOCLOSE, 0);
-  // The single reap reflects job-terminal.
-  const r = decision.reaps.find((x) => x.key === "work::fn-1-foo.1");
-  expect(r?.reason).toBe("job-terminal");
+  expect(decision.reaps).toEqual([]);
 });
 
-test("runReconcileCycle reap: autoclose=off → no reap even when role discharged", () => {
+test("runReconcileCycle reap: autoclose=on + approval REJECTED → neither worker nor approve tab reaped (left open for inspection)", () => {
+  // Rejection is best-effort leave-open: both the worker tab and the
+  // approve tab stay open so the human can inspect the rejection
+  // reasoning and reap later (on rerun or by hand).
   const liveDispatches = new Map<string, LiveDispatch>();
   liveDispatches.set("work::fn-1-foo.1", {
     verb: "work",
@@ -1001,7 +1081,57 @@ test("runReconcileCycle reap: autoclose=off → no reap even when role discharge
     cwd: "/repo",
     controller: new AbortController(),
   });
-  const snap = makeSnapshot({ epics: [] });
+  liveDispatches.set("approve::fn-1-foo.1", {
+    verb: "approve",
+    id: "fn-1-foo.1",
+    key: "approve::fn-1-foo.1",
+    cwd: "/repo",
+    controller: new AbortController(),
+  });
+  const jobs = new Map<string, Job>();
+  jobs.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "work",
+      plan_ref: "fn-1-foo.1",
+      state: "ended",
+      last_event_id: 999,
+    }),
+  );
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        worker_phase: "done",
+        approval: "rejected",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], jobs });
+  const decision = reconcile(snap, makeState(), liveDispatches, AUTOCLOSE, 0);
+  expect(decision.reaps).toEqual([]);
+});
+
+test("runReconcileCycle reap: autoclose=off → no reap even when approved-complete", () => {
+  const liveDispatches = new Map<string, LiveDispatch>();
+  liveDispatches.set("work::fn-1-foo.1", {
+    verb: "work",
+    id: "fn-1-foo.1",
+    key: "work::fn-1-foo.1",
+    cwd: "/repo",
+    controller: new AbortController(),
+  });
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        worker_phase: "done",
+        approval: "approved",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
   const decision = reconcile(
     snap,
     makeState(),

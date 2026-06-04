@@ -374,8 +374,21 @@ export interface LiveDispatch {
   controller: AbortController;
 }
 
-/** Reasons the reconciler MAY surface for a reap pass. */
-export type ReapReason = "job-terminal" | "role-discharged";
+/**
+ * Reasons the reconciler MAY surface for a reap pass.
+ *
+ * - `approved-complete` — the row this dispatch serves reached APPROVED
+ *   completion (readiness verdict `completed`). Every live dispatch
+ *   sharing the row's id is reaped together at this moment, so the
+ *   worker/closer tab AND the approve tab close as a pair on approval.
+ * - `row-gone` — the row vanished from the snapshot (deleted task/epic);
+ *   reaped as cleanup so an orphaned tab does not leak.
+ *
+ * A merely job-terminal (worker ended but not yet approved) OR rejected
+ * dispatch is intentionally NOT reaped — that window is left open for
+ * human inspection (and reaped later on rerun or by hand).
+ */
+export type ReapReason = "approved-complete" | "row-gone";
 
 /**
  * Reap decision the reconciler emits — one per `liveDispatches` entry
@@ -671,18 +684,20 @@ export function isOccupyingJob(
  *      SessionStart blind window the legacy `isOccupyingJob` arm
  *      could not see).
  *
- * Reap pass: for each entry in `liveDispatches`, mark it for `closeByName`
- * iff `config.autocloseWindows === true` AND:
- *   - the occupying job for `(verb, id)` has reached a terminal state
- *     (`'ended'` or `'killed'`), OR
- *   - the readiness verdict for the row no longer wants that verb (the
- *     row moved off `ready` / `job-pending` to something else, OR the
- *     row dropped from the snapshot entirely).
+ * Reap pass: for each entry in `liveDispatches`, mark it for
+ * `closeByTabId` iff `config.autocloseWindows === true` AND:
+ *   - the row this dispatch serves reached APPROVED completion (readiness
+ *     verdict `completed` — `approval==="approved"` + done + idle), OR
+ *   - the row vanished from the snapshot entirely (deleted task/epic).
  *
- * The reap pass is "role-discharged" — orthogonal to the launch path.
- * Default-off preserves today's leave-open observe-after-the-fact
- * behavior; opt-in (`autoclose_windows: true`) reaps as soon as the
- * verdict says so.
+ * A finished worker/closer/approve window is NOT reaped on the worker's
+ * own session ending, nor on rejection — those windows stay open through
+ * the pending/rejected window for human inspection (reaped later on
+ * rerun or by hand). Because the worker/closer dispatch and the approve
+ * dispatch share the row's id (`live.id`), approval reaps BOTH tabs in
+ * the same pass — the worker/closer surface and its approve surface close
+ * together. Default-off preserves the leave-open observe-after-the-fact
+ * behavior; opt-in (`autoclose_windows: true`) reaps on approval.
  *
  * Pure — exported for testing. Side effects (launch, closeByName,
  * emitDispatchFailed) live in `runReconcileCycle`.
@@ -697,9 +712,9 @@ export function reconcile(
   const launches: PlannedLaunch[] = [];
   const reaps: PlannedReap[] = [];
 
-  // Cap nothing: even when paused, we still need to compute reaps so a
-  // role-discharged dispatch can be cleaned up on the next wake. But we
-  // never enqueue a NEW launch while paused.
+  // Cap nothing: even when paused, we still need to compute reaps so an
+  // approved-complete / row-gone dispatch can be cleaned up on the next
+  // wake. But we never enqueue a NEW launch while paused.
   // Use `Number.NEGATIVE_INFINITY` for the sub-agent staleness `now`
   // when the caller didn't bother (matches `computeReadiness`'s default
   // — keeps the staleness branch inert if undefined).
@@ -710,10 +725,6 @@ export function reconcile(
     snapshot.gitStatusByProjectDir,
     now,
   );
-
-  // Set of verb::id keys whose row IS still actively wanted by some
-  // verdict — used in the reap pass to detect "role-discharged".
-  const wantedKeys = new Set<DispatchKey>();
 
   // Pre-build a quick lookup: task_id → Task and epic_id → Epic for
   // the reap pass (cheaper than scanning every epic each time).
@@ -740,7 +751,6 @@ export function reconcile(
         continue;
       }
       const key = dispatchKey(verb, taskId);
-      wantedKeys.add(key);
       if (state.paused) {
         continue;
       }
@@ -786,7 +796,6 @@ export function reconcile(
     const closeVerb = verbForVerdict("close", closeVerdict);
     if (closeVerb !== null) {
       const closeKey = dispatchKey(closeVerb, epicId);
-      wantedKeys.add(closeKey);
       const okToPlan =
         !state.paused &&
         !state.inFlight.has(closeKey) &&
@@ -813,14 +822,49 @@ export function reconcile(
   // confirmRunning entries that never made it to liveDispatches — those
   // are handled at confirm time, not here. Only consult dispatches we're
   // actively tracking as "running" post-confirm.
+  //
+  // A dispatch is reaped ONLY when the row it serves reached APPROVED
+  // completion (verdict `completed`) OR the row vanished from the
+  // snapshot. A finished-but-pending or rejected window is left OPEN for
+  // human inspection — the worker's own session ending is NOT a reap
+  // trigger. Because the worker/closer dispatch and the approve dispatch
+  // share the row id (`live.id`), the approval reap closes BOTH tabs in
+  // the same pass.
   if (config.autocloseWindows) {
+    // Rows that reached approved completion this cycle — task verdicts
+    // keyed by task_id, close-row verdicts keyed by epic_id. The two id
+    // spaces are disjoint, so one set serves both dispatch families.
+    const completedRowIds = new Set<string>();
+    for (const [taskId, verdict] of readiness.perTask) {
+      if (verdict.tag === "completed") {
+        completedRowIds.add(taskId);
+      }
+    }
+    for (const [epicId, verdict] of readiness.perCloseRow) {
+      if (verdict.tag === "completed") {
+        completedRowIds.add(epicId);
+      }
+    }
+    // Every row id present in the snapshot — a `live.id` absent here is a
+    // deleted task/epic (or an epic that completed and dropped from
+    // default scope) and gets reaped as cleanup.
+    const presentRowIds = new Set<string>();
+    for (const epic of snapshot.epics) {
+      presentRowIds.add(epic.epic_id);
+      for (const task of epic.tasks) {
+        presentRowIds.add(task.task_id);
+      }
+    }
+
     for (const live of liveDispatches.values()) {
-      // 1. Job terminal — find ANY occupying-or-terminal jobs row for the
-      //    pair and check its state. Multiple jobs can share a
-      //    (plan_verb, plan_ref) across resumes; we care whether the
-      //    FRESHEST one is terminal. We pick the one with highest
-      //    last_event_id as the freshest (monotonic per DB).
-      let freshestState: string | null = null;
+      const approvedComplete = completedRowIds.has(live.id);
+      const rowGone = !presentRowIds.has(live.id);
+      if (!approvedComplete && !rowGone) {
+        continue;
+      }
+      // Freshest jobs row for the pair carries the tab coords. Multiple
+      // jobs can share a (plan_verb, plan_ref) across resumes; pick the
+      // one with highest last_event_id (monotonic per DB).
       let freshestEventId = -1;
       let freshestSessionId: string | null = null;
       let freshestTabId: string | null = null;
@@ -828,37 +872,19 @@ export function reconcile(
         if (job.plan_verb === live.verb && job.plan_ref === live.id) {
           if (job.last_event_id > freshestEventId) {
             freshestEventId = job.last_event_id;
-            freshestState = job.state;
             freshestSessionId = job.backend_exec_session_id;
             freshestTabId = job.backend_exec_tab_id;
           }
         }
       }
-      const jobTerminal =
-        freshestState === "ended" || freshestState === "killed";
-
-      // 2. Role discharged — the row no longer wants this verb. Tested by
-      //    whether the (verb, id) key shows up in `wantedKeys`. If it
-      //    doesn't, EITHER the verdict moved off ready / job-pending, OR
-      //    the row vanished from the snapshot (epic/task delete, epic
-      //    completed and dropped from default scope).
-      const roleDischarged = !wantedKeys.has(live.key);
-
-      if (jobTerminal) {
-        reaps.push({
-          key: live.key,
-          reason: "job-terminal",
-          sessionId: freshestSessionId,
-          tabId: freshestTabId,
-        });
-      } else if (roleDischarged) {
-        reaps.push({
-          key: live.key,
-          reason: "role-discharged",
-          sessionId: freshestSessionId,
-          tabId: freshestTabId,
-        });
-      }
+      reaps.push({
+        key: live.key,
+        // `approved-complete` wins when both apply (a completed row still
+        // present in scope) — the more informative reason.
+        reason: approvedComplete ? "approved-complete" : "row-gone",
+        sessionId: freshestSessionId,
+        tabId: freshestTabId,
+      });
     }
   }
 
