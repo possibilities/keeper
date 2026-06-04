@@ -70,5 +70,5 @@ Extend the inline `#[cfg(test)]` mod: (a) an identical re-PaneUpdate emits ZERO 
 - [ ] Module `//!` doc, CLAUDE.md fn-684 carve-out, and README "ninth worker" prose updated to the diff-gate + batched-write contract
 
 ## Done summary
-
+Added pure diff_lines gate (keyed on per-pane (tab_id, tab_name)) so a zero-delta PaneUpdate does no file I/O; changed panes write in one open + one batched write_all + one flush, with last_emitted folded only after a successful flush and pruned of closed panes. SEQ stays monotonic by emitted-line count; #5177 O_APPEND share, plugin_start sentinel, and epoch reset preserved. 5 new cargo tests green, wasm regenerated via wasm-opt -Oz, version-skew tripwire passes.
 ## Evidence

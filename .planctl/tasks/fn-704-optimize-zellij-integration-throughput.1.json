@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "diff-before-emit batched bridge writes",
-  "updated_at": "2026-06-04T16:18:07.325177Z"
+  "updated_at": "2026-06-04T17:36:50.878029Z",
+  "worker_done_at": "2026-06-04T17:36:50.878029Z"
 }
