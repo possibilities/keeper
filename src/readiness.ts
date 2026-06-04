@@ -1177,6 +1177,18 @@ export function applySingleTaskPerEpicMutex(
  * filters out a purely planner-derived close row, so a `planner-running`
  * close row never reaches this gate.
  *
+ * fn-703 close-row mirror: the epic-level-running gate above does NOT cover a
+ * quiescent done-but-unapproved epic on a dirty repo — predicate 6.5 renders
+ * its close row `git-uncommitted` / `git-orphans` (gated on `epic.status ===
+ * "done"`) with ZERO live epic-level job/sub-agent, so `epicLevelRunning` is
+ * false yet the approval-pending window must still hold the epic's OWN root.
+ * So the gate also claims when the close verdict is one of those two
+ * predicate-6.5 git kinds. This stays strictly scoped to
+ * `effectiveRoot(null, epic.project_dir)` — a git close row NEVER claims any
+ * other root, so the fn-655/fn-663 cross-root phantom-lock narrowing is
+ * preserved (the git state is the epic's own project_dir fact). Mirrors the
+ * task-level fn-703 widening of `isLiveWorkOccupant`.
+ *
  * Pass 2 — ready tiebreak: walk tasks and close rows in iteration order. If
  * the root is already claimed by pass-1, every `{ tag: "ready" }` row on
  * that root is mutated to `{ kind: "single-task-per-root" }`. Otherwise the
@@ -1213,8 +1225,10 @@ export function applySingleTaskPerRootMutex(
       occupiedRoots.add(root);
     }
 
-    // Close-row claim is scoped (fn-655, narrowed by fn-663): only fires
-    // when at least one EPIC-LEVEL non-planner source is live. See the
+    // Close-row claim is scoped (fn-655, narrowed by fn-663): fires when at
+    // least one EPIC-LEVEL non-planner source is live, OR (fn-703) when the
+    // close verdict is a predicate-6.5 git kind (a quiescent done+pending
+    // epic on a dirty repo, which holds NO live epic-level job). See the
     // JSDoc above for the full rule — a purely task-derived running close
     // row leaves the project_dir claim to the contributing task's own
     // pass-1 entry above, and a purely planner-derived close row is
@@ -1224,7 +1238,21 @@ export function applySingleTaskPerRootMutex(
       const epicLevelRunning =
         anyEmbeddedJobWorking(epic.jobs) ||
         anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId);
-      if (epicLevelRunning) {
+      // fn-703: a quiescent done-but-unapproved epic on a dirty repo renders
+      // a close-row git verdict (predicate 6.5, gated on `epic.status ===
+      // "done"`) with NO live epic-level job/sub-agent — so `epicLevelRunning`
+      // is false and the running-derived claim above never fires, yet the
+      // approval-pending window must still hold the epic's OWN root (the
+      // close-row mirror of the task-level fn-703 fix). The git-verdict
+      // disjunct claims on either of the two predicate-6.5 reason kinds.
+      // Strictly scoped to `effectiveRoot(null, projectDir)` (the epic's own
+      // project_dir) — it does NOT broaden to any other root, preserving the
+      // fn-655/fn-663 narrowing that prevents cross-root phantom locks.
+      const closeRowGitVerdict =
+        closeVerdict.tag === "blocked" &&
+        (closeVerdict.reason.kind === "git-uncommitted" ||
+          closeVerdict.reason.kind === "git-orphans");
+      if (epicLevelRunning || closeRowGitVerdict) {
         const root = effectiveRoot(null, projectDir);
         occupiedRoots.add(root);
       }

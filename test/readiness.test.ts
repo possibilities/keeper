@@ -1383,6 +1383,141 @@ test("per-root: git-uncommitted (done+pending+dirty) in one epic occupies the ro
   );
 });
 
+// fn-703 (task .2): a QUIESCENT done-but-unapproved epic on a dirty repo —
+// all tasks completed, NO live epic-level job/sub-agent — renders a close-row
+// git verdict (predicate 6.5). That close row claims the epic's OWN root, so a
+// sibling epic's ready task on the SAME root is demoted single-task-per-root.
+// This is the close-row mirror of the task-level fn-703 occupancy fix; it FAILS
+// with only task .1's change (the close-row claim gate was epicLevelRunning-only
+// and never fired on a quiescent git close verdict) and passes with the gate
+// edit adding the git-verdict disjunct.
+test("per-root: quiescent done+pending epic with close-row git-uncommitted claims its root → cross-epic ready task blocks", () => {
+  // epic 1: status=done, approval=pending, all tasks completed
+  // (done+approved → per-task predicate 1 collapses to `completed`, NOT an
+  // occupant), NO jobs/subs. Close row hits predicate 6.5 → git-uncommitted.
+  const e1t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    target_repo: "/r",
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/r",
+    status: "done",
+    approval: "pending",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [e2t1],
+  });
+  const gitMap = new Map([
+    ["/r", { dirty_count: 3, unattributed_to_live_count: 0 }],
+  ]);
+  const snap = run([e1, e2], new Map(), [], gitMap);
+  // sanity: the quiescent epic's completed task is NOT a root occupant, and
+  // the close row carries the git verdict.
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "completed" });
+  expect(snap.perCloseRow.get("fn-1-foo")).toEqual(
+    blocked({ kind: "git-uncommitted" }),
+  );
+  // the close-row git verdict claims /r → epic 2's ready task demoted.
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+// fn-703 (task .2): the git-verdict disjunct stays STRICTLY scoped to the
+// epic's OWN project_dir — a quiescent git close row in epic 1 (root /r1)
+// must NOT phantom-lock an UNRELATED root /r2 where a sibling epic's ready
+// task lives. Pins the fn-655/fn-663 narrowing against regression.
+test("per-root: quiescent close-row git verdict does NOT claim a different root (no phantom lock)", () => {
+  const e1t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    target_repo: "/r1",
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/r1",
+    status: "done",
+    approval: "pending",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r2",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r2",
+    tasks: [e2t1],
+  });
+  const gitMap = new Map([
+    ["/r1", { dirty_count: 3, unattributed_to_live_count: 0 }],
+  ]);
+  const snap = run([e1, e2], new Map(), [], gitMap);
+  expect(snap.perCloseRow.get("fn-1-foo")).toEqual(
+    blocked({ kind: "git-uncommitted" }),
+  );
+  // epic 2 is on /r2 — untouched by the /r1 close-row claim.
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+});
+
+// fn-703 (task .2) regression: the NON-git close-row path is unchanged. A
+// quiescent done+pending epic on a CLEAN repo with no live epic-level work
+// renders its close row `job-pending` (predicate 7) — NOT a git verdict and
+// NOT epicLevelRunning — so it does NOT claim the root, and a sibling epic's
+// ready task on the same root stays ready. Confirms the git-verdict disjunct
+// did not widen the claim beyond the two predicate-6.5 kinds.
+test("per-root: quiescent non-git close row (clean repo, job-pending) does NOT claim the root", () => {
+  const e1t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    target_repo: "/r",
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/r",
+    status: "done",
+    approval: "pending",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [e2t1],
+  });
+  // clean repo (no git map entry / zero counts) → predicate 6.5 skipped →
+  // close row falls through to job-pending (predicate 7), NOT a root occupant.
+  const snap = run([e1, e2]);
+  expect(snap.perCloseRow.get("fn-1-foo")).toEqual(
+    blocked({ kind: "job-pending" }),
+  );
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+});
+
 test("per-root: different roots in different epics → both ready", () => {
   const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r1" });
   const e1 = makeEpic({
