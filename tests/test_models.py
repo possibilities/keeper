@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 
 from click.testing import CliRunner
 from planctl.cli import cli
 from planctl.models import normalize_epic, normalize_task
+
+from .conftest import run_cli
 
 # ---------------------------------------------------------------------------
 # normalize_epic / normalize_task — null tolerance on legacy records
@@ -199,14 +200,8 @@ def test_normalize_task_preferred_backend_round_trip_idempotent():
 _ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-models-fixture"}
 
 
-def _run_planctl(args: list[str], cwd: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["planctl", *args],
-        cwd=cwd,
-        env=_ENV,
-        capture_output=True,
-        text=True,
-    )
+def _run_planctl(args: list[str], cwd: str):
+    return run_cli(args, cwd=cwd, env=_ENV)
 
 
 def test_epic_create_sets_primary_repo_default(project):

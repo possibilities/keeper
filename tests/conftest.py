@@ -190,6 +190,74 @@ def multi_repo_project(tmp_path, monkeypatch):
     return primary, touched
 
 
+class _CliResult:
+    """``subprocess.CompletedProcess``-compatible shim for in-process CliRunner.
+
+    Exposes ``returncode`` / ``stdout`` / ``stderr`` so call sites that were
+    written against ``subprocess.run(["planctl", ...])`` keep their assertions
+    unchanged after switching to :func:`run_cli`.
+    """
+
+    def __init__(self, returncode: int, stdout: str, stderr: str) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def run_cli(
+    args,
+    *,
+    cwd=None,
+    env: dict | None = None,
+    input_text: str | None = None,
+) -> _CliResult:
+    """Invoke the planctl CLI in-process, mimicking
+    ``subprocess.run(["planctl", *args], cwd=cwd, env=env)``.
+
+    Replaces a real ``planctl`` subprocess — which boots a fresh Python
+    interpreter (~0.3s) — by driving ``cli.main(..., standalone_mode=False)``,
+    the exact entry the console script (``planctl._util.run_cli``) uses. That
+    faithfully reproduces the shell contract a ``CliRunner`` invocation does
+    not: a command callback's int return value becomes the exit code (e.g.
+    ``validate`` returning 1), and stdout/stderr are captured separately so
+    callers asserting on stderr (``WARN:`` lines) keep working.
+    """
+    import contextlib
+    import io
+    import sys
+
+    import click
+
+    out, err = io.StringIO(), io.StringIO()
+    saved_env: dict[str, str | None] = {}
+    if env:
+        for key, val in env.items():
+            saved_env[key] = os.environ.get(key)
+            os.environ[key] = val
+    saved_stdin = sys.stdin
+    try:
+        cd = contextlib.chdir(cwd) if cwd is not None else contextlib.nullcontext()
+        with cd, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            if input_text is not None:
+                sys.stdin = io.StringIO(input_text)
+            try:
+                rv = cli.main(list(args), standalone_mode=False)
+                rc = rv if isinstance(rv, int) else 0
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 0
+            except click.ClickException as exc:
+                exc.show()
+                rc = exc.exit_code
+    finally:
+        sys.stdin = saved_stdin
+        for key, val in saved_env.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+    return _CliResult(rc, out.getvalue(), err.getvalue())
+
+
 def _first_json_payload(output: str) -> dict:
     """Return the first stdout line that parses as a JSON object.
 

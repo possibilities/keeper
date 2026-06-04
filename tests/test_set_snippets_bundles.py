@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 
 from click.testing import CliRunner  # type: ignore[import-untyped]
 from planctl.cli import cli
+
+from .conftest import run_cli
 
 _ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-set-snippets-bundles-fixture"}
 
@@ -59,14 +60,8 @@ def _create_task(project_path, epic_id) -> str:
     return add_task(project_path, epic_id, title="Snippet test task", env=_ENV)
 
 
-def _run(args: list[str], cwd: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["planctl", *args],
-        cwd=cwd,
-        env=_ENV,
-        capture_output=True,
-        text=True,
-    )
+def _run(args: list[str], cwd: str):
+    return run_cli(args, cwd=cwd, env=_ENV)
 
 
 def _read_task_json(project_path, task_id) -> dict:
@@ -110,12 +105,12 @@ def _parse_json_stream(text: str) -> list[dict]:
     return docs
 
 
-def _envelope(result: subprocess.CompletedProcess) -> dict:
+def _envelope(result) -> dict:
     """First JSON doc on stdout (the mutating-verb envelope)."""
     return _parse_json_stream(result.stdout)[0]
 
 
-def _invocation(result: subprocess.CompletedProcess) -> dict | None:
+def _invocation(result) -> dict | None:
     for doc in _parse_json_stream(result.stdout):
         if "planctl_invocation" in doc:
             return doc["planctl_invocation"]

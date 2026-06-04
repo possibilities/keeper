@@ -33,6 +33,8 @@ from click.testing import CliRunner  # type: ignore[import-untyped]
 from planctl.cli import cli
 from planctl.validation_restamp import VALIDATION_RESTAMP_VERBS
 
+from .conftest import run_cli
+
 
 def _parse_json_stream(text: str) -> list[dict]:
     """Extract all JSON objects from a string that may contain pretty-printed
@@ -98,15 +100,9 @@ def _read_epic_json(project_path, epic_id) -> dict:
     return json.loads(epic_path.read_text())
 
 
-def _run_validate(project_path, extra_args=()) -> subprocess.CompletedProcess:
+def _run_validate(project_path, extra_args=()):
     env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
-    return subprocess.run(
-        ["planctl", "validate", *extra_args],
-        cwd=str(project_path),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    return run_cli(["validate", *extra_args], cwd=str(project_path), env=env)
 
 
 def test_validate_epic_stamps_marker_on_first_run(tmp_path, monkeypatch):
@@ -256,17 +252,8 @@ def test_validate_all_never_writes_markers(tmp_path, monkeypatch):
 _ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
 
 
-def _run_planctl(
-    args: list[str], cwd: str, input_text: str | None = None
-) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["planctl", *args],
-        cwd=cwd,
-        env=_ENV,
-        capture_output=True,
-        text=True,
-        input=input_text,
-    )
+def _run_planctl(args: list[str], cwd: str, input_text: str | None = None):
+    return run_cli(args, cwd=cwd, env=_ENV, input_text=input_text)
 
 
 # Canonical pre-stamp seed value used by every coverage test below.  Chosen

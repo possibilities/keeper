@@ -23,7 +23,7 @@ import subprocess
 from click.testing import CliRunner  # type: ignore[import-untyped]
 from planctl.cli import cli
 
-from .conftest import seed_epic
+from .conftest import run_cli, seed_epic
 
 
 def _parse_json_stream(text: str) -> list[dict]:
@@ -85,15 +85,9 @@ def _patch_task(project_path, task_id: str, **fields) -> None:
     task_path.write_text(json.dumps(data))
 
 
-def _run_validate(project_path, epic_id: str) -> subprocess.CompletedProcess:
+def _run_validate(project_path, epic_id: str):
     env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-preferred-backend-fixture"}
-    return subprocess.run(
-        ["planctl", "validate", "--epic", epic_id],
-        cwd=str(project_path),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    return run_cli(["validate", "--epic", epic_id], cwd=str(project_path), env=env)
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,8 @@ import subprocess
 from click.testing import CliRunner  # type: ignore[import-untyped]
 from planctl.cli import cli
 
+from .conftest import run_cli
+
 _ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-set-primary-repo-warning-fixture"}
 
 
@@ -48,14 +50,8 @@ def _read_epic_json(project_path, epic_id) -> dict:
     return json.loads(epic_path.read_text())
 
 
-def _run_planctl(args: list[str], cwd: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["planctl", *args],
-        cwd=cwd,
-        env=_ENV,
-        capture_output=True,
-        text=True,
-    )
+def _run_planctl(args: list[str], cwd: str):
+    return run_cli(args, cwd=cwd, env=_ENV)
 
 
 def _init_git_repo(path) -> None:
