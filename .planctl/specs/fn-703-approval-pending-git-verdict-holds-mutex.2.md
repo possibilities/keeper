@@ -50,5 +50,5 @@ cross-root phantom locks. `evaluateCloseRow`'s 6.5 arm (:889-919, gated on
 - [ ] Non-git close-row behavior unchanged (epicLevelRunning still gates the running path).
 
 ## Done summary
-
+Added a git-verdict disjunct to the close-row pass-1 per-root claim so a quiescent done-but-unapproved epic on a dirty repo holds its own project_dir root through the approval window; scoped strictly to the epic's project_dir to preserve the fn-655/fn-663 cross-root narrowing. Three new tests pin the claim, the no-phantom-lock scoping, and the unchanged non-git path.
 ## Evidence
