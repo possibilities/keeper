@@ -9446,6 +9446,273 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
 });
 
 // ---------------------------------------------------------------------------
+// Schema v54 / fn-695 (T3): syncPlanctlLinks unions the durable commit-
+// trailer facts (Planctl-Op / Planctl-Target / Session-Id, frozen on the
+// `Commit` payload by task .2) with the legacy stdout-scrape rows. A
+// scaffold whose stdout scrape NULLed out still mints a creator edge via
+// the commit channel; a scrape + a commit for the same op dedup to one
+// edge; pre-fn-695 Commit events (no payload fields) are a re-fold no-op.
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert a synthetic `Commit` event carrying the fn-695 trailer facts the
+ * git-worker freezes on the payload. `committerSessionId` MUST be a valid
+ * UUID (extractCommit gates it via UUID_RE) and `planctlOp` is already
+ * normalized (`scaffold`, not `epic-scaffold`) — mirroring the producer's
+ * `normalizePlanctlOp` lift at git-worker time. `committedAtMs/1000` is the
+ * classifier ts the `/plan:plan` windows compare against.
+ */
+function commitTrailerEvent(args: {
+  projectDir: string;
+  commitOid: string;
+  committerSessionId: string;
+  planctlOp: string | null;
+  planctlTarget: string | null;
+  committedAtMs: number;
+  ts?: number;
+}): number {
+  return insertEvent({
+    hook_event: "Commit",
+    session_id: args.projectDir,
+    cwd: args.projectDir,
+    ts: args.ts,
+    data: JSON.stringify({
+      project_dir: args.projectDir,
+      commit_oid: args.commitOid,
+      parent_oid: null,
+      // A `chore(planctl)` commit names the .planctl JSON it wrote — one
+      // file is enough for foldCommit's `files.length === 0` guard to pass.
+      files: [
+        { path: ".planctl/epics/x.json", blob_oid: null, committed_mode: null },
+      ],
+      committer_session_id: args.committerSessionId,
+      task_ids: [],
+      planctl_op: args.planctlOp,
+      planctl_target: args.planctlTarget,
+      committed_at_ms: args.committedAtMs,
+    }),
+  });
+}
+
+test("fn-695: commit-only scaffold (scrape NULL) still mints a creator edge via the commit trailer", () => {
+  // The fn-635-class fix-forward proof. The session opened /plan:plan and
+  // ran `planctl scaffold` BUT its stdout was piped through grep, so the
+  // envelope scrape never landed (`events.planctl_op` is NULL — we insert
+  // NO planctlEvent at all). The durable commit trailer carries the op.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  planPlanOpener(TEST_UUID, 1_000);
+  // No planctlEvent — the scrape NULLed out (the whole point of fn-695).
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID,
+    committerSessionId: TEST_UUID,
+    planctlOp: "scaffold",
+    planctlTarget: "fn-1-commitonly",
+    committedAtMs: 5_000_000, // ts=5000, inside the open-ended window
+  });
+  drainAll();
+  // The creator edge appears in BOTH directions via the commit channel.
+  expect(getEpicLinks(TEST_UUID)).toEqual([
+    { kind: "creator", target: "fn-1-commitonly" },
+  ]);
+  expect(getJobLinks("fn-1-commitonly")).toEqual([
+    {
+      kind: "creator",
+      job_id: TEST_UUID,
+      title: null,
+      state: "stopped",
+      last_api_error_at: null,
+      last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
+    },
+  ]);
+});
+
+test("fn-695: scrape + commit for the same (epic, kind, job) dedup to one creator edge", () => {
+  // Both channels fire for the same scaffold op. The classifier dedups by
+  // `(kind, target)` / `(kind, job_id)`, so the union is exactly one edge.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  planPlanOpener(TEST_UUID, 1_000);
+  // Scrape channel: the stdout envelope DID land this time.
+  planctlEvent({
+    sessionId: TEST_UUID,
+    op: "epic-scaffold",
+    target: "fn-2-dedup",
+    epicId: "fn-2-dedup",
+    subjectPresent: true,
+    ts: 2_000,
+  });
+  // Commit channel: the same op's durable trailer (normalized op).
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID,
+    committerSessionId: TEST_UUID,
+    planctlOp: "scaffold",
+    planctlTarget: "fn-2-dedup",
+    committedAtMs: 5_000_000,
+  });
+  drainAll();
+  // Exactly one creator edge, not two — the dedup collapsed the channels.
+  expect(getEpicLinks(TEST_UUID)).toEqual([
+    { kind: "creator", target: "fn-2-dedup" },
+  ]);
+  expect(getJobLinks("fn-2-dedup")).toEqual([
+    {
+      kind: "creator",
+      job_id: TEST_UUID,
+      title: null,
+      state: "stopped",
+      last_api_error_at: null,
+      last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
+    },
+  ]);
+});
+
+test("fn-695: commit-channel refiner edge surfaces for a non-create op (set-title)", () => {
+  // Session A creates the epic via the scrape channel. Session B refines it
+  // via the commit channel ONLY (its scrape NULLed out). The commit-channel
+  // session must appear in the per-epic job_links sweep (the
+  // loadCommitTrailerSessionsForEpics widening).
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  planPlanOpener(TEST_UUID, 1_000);
+  planctlEvent({
+    sessionId: TEST_UUID,
+    op: "epic-create",
+    target: "fn-3-refine",
+    epicId: "fn-3-refine",
+    subjectPresent: true,
+    ts: 2_000,
+  });
+  // Session B refines via the commit trailer alone.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID_2 });
+  planPlanOpener(TEST_UUID_2, 3_000);
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID_2,
+    committerSessionId: TEST_UUID_2,
+    planctlOp: "set-title",
+    planctlTarget: "fn-3-refine",
+    committedAtMs: 6_000_000,
+  });
+  drainAll();
+  expect(getEpicLinks(TEST_UUID)).toEqual([
+    { kind: "creator", target: "fn-3-refine" },
+  ]);
+  expect(getEpicLinks(TEST_UUID_2)).toEqual([
+    { kind: "refiner", target: "fn-3-refine" },
+  ]);
+  // The epic's job_links carries BOTH the scrape creator AND the commit-only
+  // refiner — proof the cross-session sweep saw the commit-channel session.
+  expect(getJobLinks("fn-3-refine")).toEqual([
+    {
+      kind: "creator",
+      job_id: TEST_UUID,
+      title: null,
+      state: "stopped",
+      last_api_error_at: null,
+      last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
+    },
+    {
+      kind: "refiner",
+      job_id: TEST_UUID_2,
+      title: null,
+      state: "stopped",
+      last_api_error_at: null,
+      last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
+    },
+  ]);
+});
+
+test("fn-695: pre-feature Commit event (NULL planctl_op/target) mints no edge", () => {
+  // A historical / non-planctl Commit (a source commit, or a pre-fn-695
+  // chore commit whose payload predates the trailer fields). extractCommit
+  // defaults planctl_op/target to null → the foldCommit trigger gate is
+  // closed → no edge. Re-fold no-op over the historical log.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  planPlanOpener(TEST_UUID, 1_000);
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID,
+    committerSessionId: TEST_UUID,
+    planctlOp: null,
+    planctlTarget: null,
+    committedAtMs: 5_000_000,
+  });
+  drainAll();
+  expect(getEpicLinks(TEST_UUID)).toEqual([]);
+  // No epic shell created.
+  expect(
+    db
+      .query("SELECT epic_id FROM epics WHERE epic_id = ?")
+      .get("fn-1-commitonly"),
+  ).toBeNull();
+});
+
+test("fn-695: from-scratch re-fold is byte-identical over a log with commit-trailer + pre-feature Commit events", () => {
+  // Mixed log: a SessionStart, a /plan:plan opener, a commit-trailer
+  // scaffold (mints an edge), AND a pre-feature Commit (NULL op → no-op).
+  // The re-fold from cursor=0 must reproduce byte-identical jobs / epics.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  planPlanOpener(TEST_UUID, 1_000);
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID,
+    committerSessionId: TEST_UUID,
+    planctlOp: "scaffold",
+    planctlTarget: "fn-9-refold",
+    committedAtMs: 5_000_000,
+  });
+  // Pre-feature Commit — re-fold no-op.
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID_2,
+    committerSessionId: TEST_UUID,
+    planctlOp: null,
+    planctlTarget: null,
+    committedAtMs: 6_000_000,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+
+  const cursor1 = getCursor();
+  const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  const epics1 = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+  // Sanity: the commit-channel edge actually formed in the first fold.
+  expect(getEpicLinks(TEST_UUID)).toEqual([
+    { kind: "creator", target: "fn-9-refold" },
+  ]);
+
+  // Re-fold from cursor=0.
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM file_attributions");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(drainAll()).toBeGreaterThan(0);
+
+  expect(getCursor()).toBe(cursor1);
+  expect(
+    JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  ).toBe(JSON.stringify(jobs1));
+  expect(
+    JSON.stringify(db.query("SELECT * FROM epics ORDER BY epic_id").all()),
+  ).toBe(JSON.stringify(epics1));
+});
+
+// ---------------------------------------------------------------------------
 // Schema v29: syncPlanctlLinks computes `created_by_closer_of` + `sort_path`
 // + transitive cascade on the epics projection
 // ---------------------------------------------------------------------------

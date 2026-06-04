@@ -187,6 +187,19 @@ from pathlib import Path
 # code paths (attribution surface only — the board renderer is the
 # only consumer affected by the ghost-row fix), so the bump is
 # whitelist-only with no reader logic change.
+#
+# v54 (fn-695 epic, T3) is a whitelist-only bump: the reducer's
+# ``syncPlanctlLinks`` now derives the creator/refiner edges
+# (``epics.job_links`` / ``jobs.epic_links``) from the UNION of the
+# legacy ``events.planctl_op`` stdout-scrape rows and durable commit-
+# trailer facts (``Planctl-Op`` / ``Planctl-Target`` / ``Session-Id``)
+# lifted off ``Commit`` events, so the edge survives any stdout
+# mangling / client+server reboot. The union rides FREE inside the
+# existing JSON-TEXT edge cells — no new column, no schema shape
+# change. keeper-py reads neither the edge cells nor the commit-
+# trailer payload (attribution surface only — the board renderer is
+# the only consumer), so the bump is whitelist-only with no reader
+# logic change.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -212,6 +225,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         51,
         52,
         53,
+        54,
     }
 )
 

@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 53;
+export const SCHEMA_VERSION = 54;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -5312,6 +5312,40 @@ function migrate(db: Database): void {
     // board renderer is the only consumer affected by the ghost-row
     // fix), but the bump is required so `jobctl commit-work` on this
     // host doesn't fail-loud (test/schema-version.test.ts enforces).
+
+    // v53→v54: fn-695 (T3) — durable commit-derived creator/refiner
+    // edges. The reducer's `syncPlanctlLinks` now derives the
+    // `epics.job_links` / `jobs.epic_links` edges from the UNION of (a)
+    // today's `events.planctl_op` stdout-scrape rows and (b) commit-
+    // trailer facts lifted off `Commit` events (`Planctl-Op` /
+    // `Planctl-Target` / `Session-Id`, frozen on the payload by task
+    // .2), deduped by `(kind, job_id)` and classified through the
+    // EXISTING `deriveEpicLinks` / `deriveJobLinks` predicate.
+    // `foldCommit` TRIGGERS the per-session rebuild (it never writes the
+    // edge cells directly — the single-writer invariant is preserved).
+    //
+    // NO new real column — the union rides FREE inside the existing
+    // `jobs.epic_links` / `epics.job_links` JSON-TEXT cells that
+    // `syncPlanctlLinks` already serialises; this is a whitelist-only
+    // schema bump, mirroring the v48→v49 (fn-670 T2) template above.
+    //
+    // No ALTER step here, and (unlike the rewind-and-redrain v51→v52 /
+    // v52→v53 slots) no cursor rewind: this is a FIX-FORWARD epic. Both
+    // union inputs are immutable events, and every pre-fn-695 `Commit`
+    // event lacks the `planctl_op` / `planctl_target` payload fields —
+    // {@link import("./derivers").extractCommit} defaults each to
+    // `null`, so the commit-channel union is a no-op over the historical
+    // log and a from-scratch re-fold reproduces byte-identical
+    // `job_links` / `epic_links`. Existing orphaned edges (fn-635) are
+    // deliberately NOT backfilled; only commits landing post-upgrade
+    // mint the durable edge.
+    //
+    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
+    // adds 54 in the SAME change — whitelist-only (keeper-py reads
+    // neither the edge cells nor the commit-trailer payload; the board
+    // renderer is the only consumer), but the bump is required so
+    // `jobctl commit-work` on this host doesn't fail-loud
+    // (test/schema-version.test.ts enforces).
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
