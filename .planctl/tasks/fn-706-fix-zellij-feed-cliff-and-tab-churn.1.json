@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-04T23:35:15.266144Z",
+  "depends_on": [],
+  "epic": "fn-706-fix-zellij-feed-cliff-and-tab-churn",
+  "id": "fn-706-fix-zellij-feed-cliff-and-tab-churn.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "kill the oversize feed cliff with tail-read",
+  "updated_at": "2026-06-04T23:35:15.266144Z"
+}

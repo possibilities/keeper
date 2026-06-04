@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-04T23:35:15.266144Z",
+  "depends_on": [
+    "fn-706-fix-zellij-feed-cliff-and-tab-churn.1"
+  ],
+  "epic": "fn-706-fix-zellij-feed-cliff-and-tab-churn",
+  "id": "fn-706-fix-zellij-feed-cliff-and-tab-churn.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "live-feed rotation in bridge plus consumer detect",
+  "updated_at": "2026-06-04T23:35:15.266144Z"
+}
