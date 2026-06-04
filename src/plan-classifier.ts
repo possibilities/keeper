@@ -46,10 +46,14 @@
  *
  * **Re-fold determinism.** Every function here is a pure function of its
  * arguments — no I/O, no mutation of inputs, no time/clock reads. The
- * reducer's `syncPlanctlLinks` fan-out (added in a later task) will call
- * these on every triggering event; a from-scratch re-fold must reproduce
+ * reducer's `syncPlanctlLinks` fan-out calls these from the deduped UNION of
+ * `planctl_op` stdout-scrape events AND durable `Commit`-event trailer facts
+ * (`Planctl-Op` / `Planctl-Target` / `Session-Id`, epic fn-695) — the
+ * classifier is agnostic to which channel an invocation came from; it sees
+ * the merged invocation list. A from-scratch re-fold must reproduce
  * byte-identical `epic_links` / `job_links` arrays (CLAUDE.md
- * "byte-identical re-fold" invariant).
+ * "byte-identical re-fold" invariant); pre-fn-695 `Commit` events lack the
+ * trailer fields so the commit channel is a no-op over the historical log.
  */
 
 import { parsePlanRef } from "./derivers";

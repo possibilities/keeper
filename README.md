@@ -64,10 +64,16 @@ tmux/wezterm backend slot in without a schema change. Consumers can find
 lifecycle, every session's profile attribution, every planctl-CLI
 mutation, AND the terminal location each live session lives in cheaply
 without JSON-scanning the event `data` blob. The
-`planctl_*` columns drive the creator/refiner classifier (see
+`planctl_*` columns feed the creator/refiner classifier (see
 [Architecture](#architecture)) — `op === "create"` and `op === "scaffold"`
 both classify as creators (scaffold is the canonical epic-create path on
-this codebase). The non-`config_dir` signals are partial-indexed
+this codebase). As of epic fn-695 the classifier reads the deduped UNION of
+these stdout-scrape rows AND the durable `Commit`-event trailer facts
+(`Planctl-Op` / `Planctl-Target` / `Session-Id`), so an edge still forms when
+this column lands NULL because the planctl stdout was piped / `grep`'d /
+truncated (the fn-635 failure). The `planctl_*` columns remain the SOLE
+driver of the `file_attributions` planctl-source rows (schema v46 / fn-666) —
+the commit channel feeds ONLY the creator/refiner edge. The non-`config_dir` signals are partial-indexed
 on `WHERE col IS NOT NULL`. The planctl columns ride three partial indexes
 sharing the `WHERE planctl_op IS NOT NULL` predicate: `idx_events_planctl_session`
 on `(session_id, id)` for the per-session ordered scan, plus the Tier 2
@@ -1153,7 +1159,11 @@ the row via the same `last_commit_at` UPDATE; no per-source branch.
 Fixes the 559-orphan spike (`.planctl/{epics,tasks}/*.json` and
 `.planctl/specs/*.md` were strict-mystery orphans the instant they
 flashed dirty, since planctl writes them outside any Claude
-Write/Edit / bash mutation deriver match). As of schema v49 / fn-670
+Write/Edit / bash mutation deriver match). This envelope `files[]` scrape
+remains the SOLE driver of the planctl `file_attributions` rows — epic
+fn-695 added a SECOND, independent use of the commit channel (the
+creator/refiner edge below) but did NOT touch the attribution mint; the
+two are orthogonal. As of schema v49 / fn-670
 T2, the same `Commit` fold also stamps a deterministic task→committing-
 session link: when BOTH `committer_session_id` is non-null AND
 `task_ids[]` is non-empty, the per-session arm writes a new
@@ -1174,7 +1184,24 @@ commit by definition, and a cursor=0 re-fold replays events in id
 order so the ordering inverts anyway. Pre-fn-670 Commit events lack
 `task_ids`; `extractCommit` defaults to `[]` so the link write is a
 no-op over the historical log, and a re-fold reproduces byte-identical
-`epics` rows. The pass-4 fan-out persists ONLY `dirty > 0` sessions
+`epics` rows. As of schema v54 / fn-695, the git-worker ALSO freezes the
+`Planctl-Op` / `Planctl-Target` / `Session-Id` trailers (stamped by
+planctl on every `chore(planctl)` commit) onto the `Commit` payload, and
+`foldCommit` — when all three axes are non-null and the target parses —
+TRIGGERS the per-session creator/refiner edge rebuild by calling
+`syncPlanctlLinks(committer_session_id, …)`. `foldCommit` never writes
+the `epic_links` / `job_links` cells itself: `syncPlanctlLinks` stays the
+SINGLE writer and re-derives the edge from the deduped UNION of the
+legacy stdout scrape AND this durable commit-trailer fact. The motivating
+failure (fn-635) piped planctl stdout through `grep`, NULLing
+`events.planctl_op` so the scrape-only edge never formed; the commit
+channel reconstructs it from the `Session-Id`-stamped commit, surviving
+client + server reboots and any stdout mangling. Whitelist-only schema
+bump (v53→v54 — the union rides free in the existing JSON cells;
+`keeper/api.py`'s `SUPPORTED_SCHEMA_VERSIONS` adds 54 in the same change).
+Pre-fn-695 `Commit` events lack the trailer fields, so the commit channel
+is a no-op over the historical log and a from-scratch re-fold reproduces
+byte-identical `epics` / `jobs` rows. The pass-4 fan-out persists ONLY `dirty > 0` sessions
 into `git_status.jobs` (fn-656.1) AND iterates only `sessionDirtyCount`
 ∪ `priorSessions` (fn-679 bound — the currently-dirty attributed set
 built from this snapshot's `dirty_files` ∪ the zero-out-transition set
@@ -1484,13 +1511,19 @@ from the reducer's jobs-side writes whenever a SessionStart spawn name
 parses as `{plan|work|close|approve}::<ref>`
 (the `syncJobIntoEpic` helper), so the single `epics` collection serves epic
 + tasks + associated sessions in one subscribe. As of schema v14 a second
-fan-out rides alongside: every `planctl_op != NULL` event triggers the
-`syncPlanctlLinks` helper, which re-derives per-session `jobs.epic_links` and
-per-epic `epics.job_links` from the session's planctl-CLI footprint
-classified against its `/plan:plan` windows (creator = `epic-create` OR
-`scaffold` mutation inside a window — scaffold is the canonical
-epic-create path on this codebase; refiner = any other epic-touching
-mutation inside a window). Both fan-outs run INSIDE the same `BEGIN IMMEDIATE` transaction
+fan-out rides alongside: every `planctl_op != NULL` event AND (epic fn-695,
+schema v54) every `Commit` event carrying the `Planctl-Op` / `Planctl-Target`
+/ `Session-Id` trailers triggers the `syncPlanctlLinks` helper, which
+re-derives per-session `jobs.epic_links` and per-epic `epics.job_links` from
+the session's planctl-CLI footprint — the deduped UNION of the legacy
+stdout-scrape rows and the durable commit-trailer facts — classified against
+its `/plan:plan` windows (creator = `epic-create` OR `scaffold` mutation
+inside a window — scaffold is the canonical epic-create path on this
+codebase; refiner = any other epic-touching mutation inside a window).
+`syncPlanctlLinks` stays the SINGLE writer of both cells; `foldCommit` only
+triggers the rebuild, never writes the edge directly. The commit channel
+makes the edge survive any stdout pipe / `grep` / truncation that NULLs
+`planctl_op` (the fn-635 failure) plus client + server reboots. Both fan-outs run INSIDE the same `BEGIN IMMEDIATE` transaction
 as the triggering event's projection write + cursor advance, so the embedded
 arrays + link projections are pure functions of the event log and a
 from-scratch re-fold reproduces them byte-identically. File deletions are filesystem-synchronized: a live delete fires
@@ -1770,11 +1803,11 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT COUNT(*) FROM events WHERE tool_use_id IS NOT NULL"
 
-# Jobs that created or refined an epic during a /plan:plan window (creator/refiner classifier output — jobs.epic_links is the per-session fan-out written by syncPlanctlLinks):
+# Jobs that created or refined an epic during a /plan:plan window (creator/refiner classifier output — jobs.epic_links is the per-session fan-out written by syncPlanctlLinks from the deduped UNION of the planctl_op stdout scrape AND the durable Commit-event Planctl-Op/Target/Session-Id trailers, epic fn-695, so an edge survives a stdout pipe that NULLs planctl_op):
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT job_id, plan_verb, plan_ref, epic_links FROM jobs WHERE json_array_length(epic_links) > 0 ORDER BY updated_at DESC LIMIT 10"
 
-# Epics by inbound-link density — every job whose planctl-CLI footprint created or refined the epic during a /plan:plan window (epics.job_links is the symmetric per-epic fan-out; as of schema v25 each entry embeds the linked job's title/state/last_api_error_(at,kind)/last_input_request_(at,kind) denormalized off the jobs row at the reducer's write boundary, so renderers + predicates no longer need a live-jobs join):
+# Epics by inbound-link density — every job whose planctl-CLI footprint (stdout scrape ∪ durable commit-trailer facts, epic fn-695) created or refined the epic during a /plan:plan window (epics.job_links is the symmetric per-epic fan-out; as of schema v25 each entry embeds the linked job's title/state/last_api_error_(at,kind)/last_input_request_(at,kind) denormalized off the jobs row at the reducer's write boundary, so renderers + predicates no longer need a live-jobs join):
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT epic_id, epic_number, title, json_array_length(job_links) AS n FROM epics WHERE json_array_length(job_links) > 0 ORDER BY n DESC, sort_path ASC LIMIT 10"
 # Unnest job_links to see each link's embedded display payload (schema v25: kind, job_id, title, state, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind):

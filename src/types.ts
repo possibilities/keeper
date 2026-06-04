@@ -15,6 +15,18 @@
  * inside a window (subject to per-window creator suppression — see
  * `src/plan-classifier.ts`).
  *
+ * **Source of truth (epic fn-695).** The footprint is now the deduped UNION
+ * of two channels: the legacy `planctl_op` stdout-scrape rows AND the durable
+ * `Commit`-event trailer facts (`Planctl-Op` / `Planctl-Target` /
+ * `Session-Id`) the git-worker freezes on every `chore(planctl)` commit. The
+ * reducer's `syncPlanctlLinks` is the single writer of both `epic_links` and
+ * `job_links` and merges the two channels before classifying — so an edge
+ * survives any stdout pipe/redirect/truncation that NULLs `events.planctl_op`
+ * (the fn-635 failure) as long as the planctl commit landed, and survives
+ * client + server reboots. Dedup is by `(kind, target)` / `(kind, job_id)`;
+ * re-fold converges by construction (pre-fn-695 `Commit` events lack the
+ * trailer fields, so the commit channel is a no-op over the historical log).
+ *
  * Mirrors `EpicLink` in `src/plan-classifier.ts` field-for-field; kept here
  * so the projection types are self-describing without importing the
  * classifier module.
@@ -111,7 +123,9 @@ export type PermissionPromptKind = "permission" | "elicitation";
  * One entry in {@link Epic.job_links} — the symmetric per-epic view of
  * {@link Link}. `kind` carries the same vocabulary; `job_id` identifies the
  * session whose planctl footprint touched this epic inside one of its
- * `/plan:plan` windows.
+ * `/plan:plan` windows. The footprint is the same scrape ∪ commit-trailer
+ * union documented on {@link Link} (epic fn-695) — `syncPlanctlLinks` is the
+ * sole writer of this symmetric cell too.
  *
  * **Embedded display payload** (schema v25): `title` / `state` /
  * `last_api_error_at` / `last_api_error_kind` / `last_input_request_at` /
@@ -263,6 +277,14 @@ export interface Event {
    * stamps NULL on misses so the partial-index `WHERE planctl_op IS NOT
    * NULL` predicate stays selective). Examples: `epic-create`, `scaffold`,
    * `task-set-title`, `done`, `epic-close`.
+   *
+   * **No longer the sole creator/refiner source (epic fn-695).** This scrape
+   * is now ONE of two channels feeding `syncPlanctlLinks` — the durable
+   * `Commit`-event trailer facts (`Planctl-Op` / `Planctl-Target` /
+   * `Session-Id`) are unioned in, so an edge still forms when this column
+   * lands NULL because the planctl stdout was piped / truncated. The scrape
+   * remains the sole driver of the `file_attributions` planctl rows (the
+   * envelope `files[]` mint, schema v46 / fn-666) — that path is unchanged.
    */
   planctl_op: string | null;
   /**

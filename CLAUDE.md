@@ -139,7 +139,21 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   attribution claim. Symmetric across per-session and global discharge
   (the worktree oid is a per-file fact, not per-session). A chmod-only
   dirty file (equal blob, different mode) is also caught — content-equality
-  alone would have wrongly discharged it.
+  alone would have wrongly discharged it. **Commit-trailer fact set (schema
+  v54 / fn-695).** The same `Commit` payload also freezes three planctl
+  trailers the git-worker lifts off the commit message — `Planctl-Op`,
+  `Planctl-Target`, and a v4-UUID `Session-Id` (stamped by planctl on every
+  `chore(planctl)` commit; omitted when `PLANCTL_SESSION_ID` is absent and
+  the commit still lands). When all three are non-null and the target
+  parses, `foldCommit` ALSO triggers the per-session creator/refiner edge
+  rebuild (`syncPlanctlLinks(committer_session_id, …)`) — it NEVER writes
+  the `epic_links` / `job_links` cells itself; `syncPlanctlLinks` stays the
+  single writer and re-derives the edge from the deduped UNION of the legacy
+  `planctl_op` stdout scrape AND this durable commit-trailer fact (so an edge
+  survives a stdout pipe / `grep` / truncation that NULLs `planctl_op` — the
+  fn-635 failure — plus client + server reboots). Pre-fn-695 `Commit` events
+  lack the three trailers, so the commit channel is a no-op over the
+  historical log and a from-scratch re-fold stays byte-identical.
 - **Task→committing-session link (schema v49 / fn-670 T2).** The git-
   worker also parses `Task:` trailers (multi-valued, take-all per
   `parseTaskTrailers`, validated against `TASK_TRAILER_RE` —
@@ -189,7 +203,12 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   the attribution row via the same `last_commit_at` UPDATE) — no
   per-source branch. Without this mint, `.planctl/` files orphaned the
   instant they flashed dirty (the 559-orphan spike documented in
-  fn-666's epic spec).
+  fn-666's epic spec). The stdout envelope remains the SOLE driver of this
+  `file_attributions` mint — epic fn-695 moved only the creator/refiner edge
+  off the envelope onto the durable commit-trailer union (see the v54 / fn-695
+  callout on the content-aware discharge bullet above); the two uses of the
+  envelope/commit channels are orthogonal and this attribution path is
+  unchanged.
 
 ## DO NOT
 

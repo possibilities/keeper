@@ -803,6 +803,54 @@ test("renderJobLinkLines: multiple entries iterate in provided order (projection
   ]);
 });
 
+// Epic fn-695 (T4): the durable commit-trailer union (`syncPlanctlLinks`) can
+// land MANY creator + refiner edges on one epic's `job_links` — one entry per
+// session whose planctl footprint (scrape OR commit trailer) created/refined
+// the epic inside a `/plan:plan` window. `renderJobLinkLines` must emit one
+// line per entry, unchanged: no field change, no per-source branch. Pins that
+// N creator + M refiner edges render N+M lines in projection order.
+test("renderJobLinkLines: many creator + refiner edges per epic each render their own line (commit-trailer union, no field change)", () => {
+  const out = renderJobLinkLines([
+    makeLink({
+      kind: "creator",
+      job_id: "sess-c1",
+      title: "Creator one",
+      state: "stopped",
+    }),
+    makeLink({
+      kind: "creator",
+      job_id: "sess-c2",
+      title: "Creator two",
+      state: "working",
+    }),
+    makeLink({
+      kind: "refiner",
+      job_id: "sess-r1",
+      title: "Refiner one",
+      state: "stopped",
+    }),
+    makeLink({
+      kind: "refiner",
+      job_id: "sess-r2",
+      title: "Refiner two",
+      state: "working",
+    }),
+    makeLink({
+      kind: "refiner",
+      job_id: "sess-r3",
+      title: "Refiner three",
+      state: "stopped",
+    }),
+  ]);
+  expect(out).toEqual([
+    "  Creator one [creator] [stopped]",
+    "  Creator two [creator] [working]",
+    "  Refiner one [refiner] [stopped]",
+    "  Refiner two [refiner] [working]",
+    "  Refiner three [refiner] [stopped]",
+  ]);
+});
+
 // ---------------------------------------------------------------------------
 // colorizePillsInLine — pure string→string SGR coloring of bracketed pills
 // ---------------------------------------------------------------------------
