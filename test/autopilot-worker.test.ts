@@ -306,6 +306,18 @@ test("verbForVerdict: other blocked / running / completed / undefined → null",
   expect(verbForVerdict("task", undefined)).toBeNull();
 });
 
+// fn-703: the predicate-6.5 git verdicts now hold the mutex slot, but the held
+// slot must stay UNDISPATCHABLE — `verbForVerdict` returns null so the
+// occupied root isn't handed an approve/work dispatch while the repo is dirty.
+test("verbForVerdict: git-uncommitted / git-orphans → null (held slot stays undispatchable)", () => {
+  const gu: Verdict = { tag: "blocked", reason: { kind: "git-uncommitted" } };
+  const go: Verdict = { tag: "blocked", reason: { kind: "git-orphans" } };
+  expect(verbForVerdict("task", gu)).toBeNull();
+  expect(verbForVerdict("close", gu)).toBeNull();
+  expect(verbForVerdict("task", go)).toBeNull();
+  expect(verbForVerdict("close", go)).toBeNull();
+});
+
 test("fn-700: verbForVerdict('close', blocked:epic-no-tasks) → null (autopilot lock)", () => {
   // Locks the autopilot side to the fn-700 readiness fix: a zero-task epic's
   // close verdict is `blocked:epic-no-tasks`, and the only blocked reason

@@ -397,13 +397,46 @@ firing correctly — check them before concluding it is broken:
   `output.emit()` seam (one transaction per mutating verb), so the gate
   trusts that an envelope `success: true` on stdout means the file is in
   HEAD.
-- **Won't dispatch into a dirty repo.** `computeReadiness` predicate 6.5
-  (`src/readiness.ts`, block reason `git-uncommitted`) suppresses every dispatch
-  whose target repo has `git_status.dirty_count > 0` — so a spawned worker can
-  never commit unrelated uncommitted changes. The target is usually keeper
-  itself, dirtied by your own edits or a not-yet-committed `.planctl` approval
-  chore. Confirm: `git status` + `SELECT project_dir, dirty_count FROM
-  git_status`.
+- **The mutex occupancy definition (one canonical set — fn-663 / fn-671 / fn-703).**
+  Both the per-epic mutex (`applySingleTaskPerEpicMutex`) and the per-root
+  mutex (predicate 12) decide which verdicts CLAIM a slot via two shared
+  predicates in `src/readiness.ts`: `isLiveWorkOccupant` (per-epic) and the
+  narrower `isRootOccupant` (per-root, exempts `planner-running` — a planner
+  holds no working tree, fn-663). The occupant set is: every `running` verdict
+  (job-running, sub-agent-running, sub-agent-stale, planner-running) PLUS the
+  three approval-pending blocked verdicts `job-pending`, `git-uncommitted`, and
+  `git-orphans`. Two facets fall out of that set:
+  - *Won't dispatch into a dirty repo.* Predicate 6.5 (block reason
+    `git-uncommitted` / `git-orphans`) suppresses every approve dispatch whose
+    target repo has `git_status.dirty_count > 0` (or unattributed-to-live
+    orphans) — a spawned worker can never commit unrelated changes. The target
+    is usually keeper itself, dirtied by your own edits or a not-yet-committed
+    `.planctl` approval chore. Confirm: `git status` + `SELECT project_dir,
+    dirty_count FROM git_status`.
+  - *Won't release the mutex mid-approval-window (fn-671 + fn-703).*
+    Administrative completion (planctl `done` + human approval) is orthogonal
+    to process liveness AND to repo cleanliness, and both race the mutex.
+    Predicate 1 only collapses a task to `{tag:"completed"}` when
+    `worker_phase==="done"` AND `approval==="approved"` AND no embedded job is
+    `working` AND no running sub-agent is bound — so until the Claude session
+    Stop/SessionEnd lands AND every sub-agent finishes, the task stays
+    `running:*` and occupies both mutexes (fn-671). And once the worker is idle
+    but approval is still pending, the task renders `job-pending` OR — if its
+    target repo is dirty — a predicate-6.5 git verdict; ALL THREE occupy, so the
+    WHOLE done+approval-pending window holds the slot and a depless ready
+    sibling can't jump the queue (fn-703 — fixes the observed "task 3 running
+    before task 2"). The git verdict is a sound occupant because predicate 6.5
+    is `worker_phase==="done"`-gated and ranks below predicate 1 (`completed`)
+    and predicate 4 (`job-rejected`), so it strictly implies the done+pending
+    window — same administrative-state-vs-mutex race class as fn-671, one rank
+    lower. The held slot stays UNDISPATCHABLE: `verbForVerdict` returns `null`
+    for both git kinds (a test pins it), so occupancy never leaks into a
+    dispatch. Crash-robust on the main-job axis via the reducer's `Killed` arm
+    (exit-watcher + boot `seedKilledSweep` fire the exit signal on OS-level
+    death). A sub-agent that dies silently without emitting SubagentStop has no
+    `Killed`-equivalent backstop and surfaces as `sub-agent-stale` (still
+    mutex-occupying — correctness over throughput); clear by autopilot pause +
+    manual replay rather than auto-reaper.
 - **Won't dispatch the closer against a taskless epic (fn-700).** A keeper
   epic and its tasks fold as two separate single-event transactions
   (`EpicSnapshot`, then `TaskSnapshot`); between them the epic exists with
@@ -422,23 +455,6 @@ firing correctly — check them before concluding it is broken:
   (`src/autopilot-worker.ts`) returns `null` for every blocked reason except
   `job-pending`, and a test pins that lock. No reducer / schema / keeper-py
   change — the `Verdict` is computed client-side at read time, not folded.
-- **Won't release the mutex while the worker session is still alive (fn-671).**
-  `computeReadiness` predicate 1 (`src/readiness.ts`) only collapses a task to
-  `{tag:"completed"}` when `worker_phase==="done"` AND `approval==="approved"`
-  AND no embedded job is `working` AND no running sub-agent is bound to any
-  embedded job — administrative completion (planctl `done` + human approval)
-  is orthogonal to process liveness, and they race. Until the Claude session
-  Stop/SessionEnd lands AND every sub-agent finishes, the task stays at
-  `running:job-running` / `running:sub-agent-running` / `running:sub-agent-stale`
-  and occupies both the per-epic AND per-root mutex via `isLiveWorkOccupant` /
-  `isRootOccupant` — so a dependent / sibling ready task on the same root is
-  held at `single-task-per-root` until the prior worker truly winds down.
-  Crash-robust on the main-job axis via the reducer's `Killed` arm
-  (exit-watcher + boot `seedKilledSweep` unilaterally fire the exit signal on
-  OS-level death). A sub-agent that dies silently without emitting
-  SubagentStop has no `Killed`-equivalent backstop and surfaces as
-  `sub-agent-stale` (still mutex-occupying — correctness over throughput);
-  clear by autopilot pause + manual replay rather than auto-reaper.
 - **Level-triggered on `PRAGMA data_version`.** The worker reconciles only on a
   DB write (a hook event, a fold). `set_autopilot_paused {paused:false}` (play)
   additionally kicks one cycle, and one cycle runs at boot — but absent those, a

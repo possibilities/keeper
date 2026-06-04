@@ -1237,6 +1237,81 @@ test("per-epic: doesn't fire when only one non-completed task exists", () => {
   expect(snap.perTask.get("fn-1-foo.2")).toEqual({ tag: "ready" });
 });
 
+// fn-703: a done-but-unapproved task whose target repo is dirty renders a
+// predicate-6.5 git verdict. That verdict now occupies the mutex slot for the
+// whole approval-pending window, so a depless ready sibling is held instead of
+// jumping the queue (the observed "task 3 running before task 2" bug).
+test("per-epic: git-uncommitted (done+pending+dirty) occupies → depless ready sibling blocks", () => {
+  const blocked6_5 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "pending",
+    target_repo: "/r",
+  });
+  const ready = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    target_repo: "/r",
+  });
+  const epic = makeEpic({ tasks: [blocked6_5, ready], project_dir: "/r" });
+  const gitMap = new Map([
+    ["/r", { dirty_count: 2, unattributed_to_live_count: 0 }],
+  ]);
+  const snap = run([epic], new Map(), [], gitMap);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "git-uncommitted" }),
+  );
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("per-epic: git-orphans variant (done+pending, orphans>0) occupies identically", () => {
+  const blocked6_5 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "pending",
+    target_repo: "/r",
+  });
+  const ready = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    target_repo: "/r",
+  });
+  const epic = makeEpic({ tasks: [blocked6_5, ready], project_dir: "/r" });
+  const gitMap = new Map([
+    ["/r", { dirty_count: 0, unattributed_to_live_count: 1 }],
+  ]);
+  const snap = run([epic], new Map(), [], gitMap);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "git-orphans" }),
+  );
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+// Guard (fn-703): occupancy here relies on predicate 6.5's done-gate, which
+// makes the git verdict strictly imply the done+approval-pending window. Pin
+// that gate so a future ladder reorder fails loudly instead of silently
+// over-claiming. A NOT-done task in a dirty repo must NOT render a git verdict.
+test("guard: a not-done task in a dirty repo does NOT get a git verdict (pins 6.5 done-gate)", () => {
+  const notDone = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "open",
+    approval: "pending",
+    target_repo: "/r",
+  });
+  const epic = makeEpic({ tasks: [notDone], project_dir: "/r" });
+  const gitMap = new Map([
+    ["/r", { dirty_count: 9, unattributed_to_live_count: 9 }],
+  ]);
+  const snap = run([epic], new Map(), [], gitMap);
+  // worker_phase !== "done" → predicate 6.5 is skipped → falls through to
+  // ready (no blocking predicate above it applies).
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+});
+
 // ---------------------------------------------------------------------------
 // Per-root post-pass (predicate 12)
 // ---------------------------------------------------------------------------
@@ -1264,6 +1339,45 @@ test("per-root: same-root tasks in DIFFERENT epics → first wins, second blocks
   });
   const snap = run([e1, e2]);
   expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+// fn-703: a done+pending+dirty task (git verdict) in epic 1 claims its root,
+// so a ready task in epic 2 on the SAME root is demoted to single-task-per-root
+// — the cross-epic mirror of the per-epic occupancy fix.
+test("per-root: git-uncommitted (done+pending+dirty) in one epic occupies the root → cross-epic ready task blocks", () => {
+  const e1t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "pending",
+    target_repo: "/r",
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/r",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [e2t1],
+  });
+  const gitMap = new Map([
+    ["/r", { dirty_count: 1, unattributed_to_live_count: 0 }],
+  ]);
+  const snap = run([e1, e2], new Map(), [], gitMap);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "git-uncommitted" }),
+  );
   expect(snap.perTask.get("fn-2-bar.1")).toEqual(
     blocked({ kind: "single-task-per-root" }),
   );

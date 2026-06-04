@@ -79,7 +79,10 @@
  *  11. single-task-per-epic        — post-pass: one non-completed slot per epic
  *                                    Occupancy keys on `isLiveWorkOccupant`, which
  *                                    INCLUDES `planner-running` — a planner blocks its
- *                                    OWN epic from dispatching sibling tasks.
+ *                                    OWN epic from dispatching sibling tasks — AND the
+ *                                    approval-pending git verdicts (git-uncommitted,
+ *                                    git-orphans), so the whole done+pending window
+ *                                    holds the slot (fn-703).
  *  12. single-task-per-root        — post-pass: one non-completed slot per project root
  *                                    Occupancy keys on `isRootOccupant`, which EXCLUDES
  *                                    `planner-running` (fn-663) — a planner does NOT
@@ -87,10 +90,11 @@
  *                                    the same root may dispatch concurrently with a
  *                                    planner. Real workers (job-running,
  *                                    sub-agent-running, sub-agent-stale, job-pending)
- *                                    still claim. Per-epic and per-root therefore
- *                                    diverge on `planner-running`: blocking inside the
- *                                    planner's own epic, exempt across the rest of
- *                                    the root.
+ *                                    and the approval-pending git verdicts
+ *                                    (git-uncommitted, git-orphans, fn-703) still claim.
+ *                                    Per-epic and per-root therefore diverge on
+ *                                    `planner-running`: blocking inside the planner's
+ *                                    own epic, exempt across the rest of the root.
  *
  * The two post-passes (11, 12) run in that order — per-epic FIRST so its
  * tighter scope wins the reason when both would apply. Both share one
@@ -1006,16 +1010,31 @@ function evaluateCloseRow(
  */
 /**
  * "Live work" predicate. A row whose verdict claims a mutex slot in pass-1
- * regardless of iteration order. The set is the running/queued states that
- * represent ACTUAL ongoing or imminent worker activity on a target — the
- * states where dispatching another job to the same scope would land us with
- * two live workers on the same target.
+ * regardless of iteration order. The set is the running/queued/approval-pending
+ * states that represent ACTUAL ongoing worker activity OR an open
+ * approval-pending window on a target — the states where dispatching another
+ * job to the same scope would land us with two live workers on one target, or
+ * jump a sibling ahead of an in-flight approval.
+ *
+ * Occupants:
+ *   - every `running` verdict (job-running, sub-agent-running,
+ *     sub-agent-stale, planner-running);
+ *   - `job-pending` — the approval-pending notify window, ranked below the
+ *     session-liveness checks (predicate 7);
+ *   - `git-uncommitted` / `git-orphans` — the two predicate-6.5 git verdicts.
+ *     These are sound occupants because predicate 6.5 is `worker_phase==="done"`-
+ *     gated (:638) and ranks below predicate 1 (`completed`, requires approved)
+ *     and predicate 4 (`job-rejected`), so a git verdict STRICTLY IMPLIES the
+ *     done + approval-pending window — same administrative-state-vs-mutex race
+ *     class as fn-671, one rank lower. Holding the slot keeps a depless ready
+ *     sibling from jumping the queue while the dirty repo blocks the approve
+ *     dispatch (fn-703).
  *
  * Excluded: dependency blocks (`dep-on-task`, `dep-on-epic`), admin blocks
- * (`epic-not-validated`, `job-rejected`), repo-state blocks (`git-uncommitted`,
- * `git-orphans`), mutex-synthesized blocks (`single-task-per-epic`,
- * `single-task-per-root`), and `unknown` — none of those represent a live
- * worker that would conflict with a freshly-dispatched sibling.
+ * (`epic-not-validated`, `job-rejected`), mutex-synthesized blocks
+ * (`single-task-per-epic`, `single-task-per-root`), and `unknown` — none of
+ * those represent a live worker or an open approval window that would conflict
+ * with a freshly-dispatched sibling.
  *
  * Per-EPIC mutex (`applySingleTaskPerEpicMutex`) keys on this predicate as-is
  * — a `planner-running` verdict still occupies the epic slot so the epic
@@ -1026,7 +1045,15 @@ function evaluateCloseRow(
 function isLiveWorkOccupant(verdict: Verdict): boolean {
   return (
     verdict.tag === "running" ||
-    (verdict.tag === "blocked" && verdict.reason.kind === "job-pending")
+    (verdict.tag === "blocked" &&
+      (verdict.reason.kind === "job-pending" ||
+        // fn-703: a git verdict ⟹ done + approval-pending window (predicate
+        // 6.5 is done-gated and ranks below `completed`/`job-rejected`), so
+        // the whole approval-pending window — not just the bare `job-pending`
+        // pill — holds the mutex. Additive, placed AFTER `job-pending`; never
+        // outranks `running`.
+        verdict.reason.kind === "git-uncommitted" ||
+        verdict.reason.kind === "git-orphans"))
   );
 }
 
@@ -1038,8 +1065,9 @@ function isLiveWorkOccupant(verdict: Verdict): boolean {
  * (git `index.lock` contention is absorbed by the git worker's
  * `busy_timeout`, and dirty-file multi-attribution mid-flight is resolved
  * after-the-fact by the mtime attribution pass). Real workers
- * (`job-running`, `sub-agent-running`, `sub-agent-stale`, `job-pending`)
- * still occupy via the `isLiveWorkOccupant` delegate.
+ * (`job-running`, `sub-agent-running`, `sub-agent-stale`, `job-pending`) and
+ * the approval-pending git verdicts (`git-uncommitted`, `git-orphans`) still
+ * occupy via the `isLiveWorkOccupant` delegate (fn-703).
  *
  * The per-EPIC mutex deliberately stays on `isLiveWorkOccupant` — a planner
  * still blocks its OWN epic from dispatching sibling tasks (predicate 3
