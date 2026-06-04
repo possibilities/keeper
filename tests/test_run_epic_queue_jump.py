@@ -58,16 +58,17 @@ def _read_epic(project_path, epic_id) -> dict:
     return json.loads(epic_path.read_text())
 
 
-def _make_epic(tmp_path) -> str:
+def _make_epic() -> str:
     code, obj, output = _invoke(["epic", "create", "--title", "Jumpable epic"])
     assert code == 0, output
+    assert obj is not None, f"epic create produced no JSON:\n{output}"
     return obj["epic"]["id"]
 
 
 def test_queue_jump_false_to_true_sets_flag_and_envelope(tmp_path, monkeypatch):
     """false → true: writes queue_jump on the JSON; envelope carries queue_jump:true."""
     _create_project(tmp_path, monkeypatch)
-    epic_id = _make_epic(tmp_path)
+    epic_id = _make_epic()
 
     # The create path leaves queue_jump unset on the persisted JSON
     # (normalize_epic defaults it to False on load); the verb keys off
@@ -93,7 +94,7 @@ def test_queue_jump_false_to_true_sets_flag_and_envelope(tmp_path, monkeypatch):
 def test_queue_jump_already_true_short_circuits_readonly(tmp_path, monkeypatch):
     """already true: read-only short-circuit — no JSON rewrite, no mutating commit."""
     _create_project(tmp_path, monkeypatch)
-    epic_id = _make_epic(tmp_path)
+    epic_id = _make_epic()
 
     code, _, output = _invoke(["epic", "queue-jump", epic_id])
     assert code == 0, output
