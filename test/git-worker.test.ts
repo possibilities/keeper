@@ -2621,3 +2621,34 @@ test("buildDiscoveryCandidates: performance.now()-scale nowMs would silently dis
 
   db.close();
 });
+
+test("buildDiscoveryCandidates: fn-705 extraCandidates folded in unconditionally (no job-cwd row required)", () => {
+  // The fn-705 discovery nudge case: a brand-new repo keeper has never seen a
+  // session in — it has NO `jobs.cwd` row and NO `epics.project_dir` entry, so
+  // neither the fast path nor the full sweep would surface it. The plan-worker
+  // hands it over via `extraCandidates`; the candidate set must include it
+  // regardless of sweep mode, so the `.planctl` short-circuit in
+  // `shouldWatchRoot` can subscribe it.
+  const db = makeDiscoveryDb();
+  const nudgeRoot = "/tmp/keeper-fn705-never-seen-repo";
+
+  for (const runFullSweep of [false, true]) {
+    const candidates = buildDiscoveryCandidates(db, {
+      nowMs: Date.now(),
+      runFullSweep,
+      watched: new Set<string>(),
+      extraCandidates: new Set([nudgeRoot]),
+    });
+    expect(candidates.has(nudgeRoot)).toBe(true);
+  }
+
+  // Sanity: absent the nudge, the never-seen repo is NOT a candidate.
+  const without = buildDiscoveryCandidates(db, {
+    nowMs: Date.now(),
+    runFullSweep: true,
+    watched: new Set<string>(),
+  });
+  expect(without.has(nudgeRoot)).toBe(false);
+
+  db.close();
+});

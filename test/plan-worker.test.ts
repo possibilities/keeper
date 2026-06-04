@@ -1869,6 +1869,75 @@ test("onChange: multi-file tree — epic committed before its task lands → onl
   expect(scanner.pendingSize()).toBe(0);
 });
 
+test("pendingRepos: derives repo roots from pending paths; empties as paths drain (fn-705)", () => {
+  // Pure-core: drive the gate with an always-untracked predicate so every
+  // onChange bounces to pending, and assert pendingRepos() reflects the repo
+  // roots the live worker watches `.git/logs/HEAD` for.
+  const scanner = new PlanScanner(
+    () => {},
+    () => {},
+    () => false, // nothing is in HEAD → everything pends
+  );
+
+  // Two distinct repos, each with one epic file (paths need a `.planctl`
+  // ancestor for repoRootFromPlanctlPath to resolve; the files need not exist
+  // on disk because the untracked predicate short-circuits before any read…
+  // but onChange DOES read the file, so write them under tmpDir).
+  const repoA = join(tmpDir, "repoA");
+  const repoB = join(tmpDir, "repoB");
+  const epicA = join(repoA, ".planctl", "epics", "fn-1-a.json");
+  const epicB = join(repoB, ".planctl", "epics", "fn-2-b.json");
+  mkdirSync(join(repoA, ".planctl", "epics"), { recursive: true });
+  mkdirSync(join(repoB, ".planctl", "epics"), { recursive: true });
+  writeFileSync(epicA, JSON.stringify({ id: "fn-1-a", title: "A" }));
+  writeFileSync(epicB, JSON.stringify({ id: "fn-2-b", title: "B" }));
+
+  expect(scanner.pendingRepos().size).toBe(0);
+
+  scanner.onChange(epicA);
+  expect([...scanner.pendingRepos()]).toEqual([repoA]);
+
+  scanner.onChange(epicB);
+  expect(scanner.pendingRepos()).toEqual(new Set([repoA, repoB]));
+
+  // Drop one pending path via onDelete (unwind) — repoA leaves the set.
+  unlinkSync(epicA);
+  scanner.onDelete(epicA);
+  expect([...scanner.pendingRepos()]).toEqual([repoB]);
+
+  unlinkSync(epicB);
+  scanner.onDelete(epicB);
+  expect(scanner.pendingRepos().size).toBe(0);
+});
+
+test("onPendingChange observer fires on every pending mutation (fn-705 reflog-watch driver)", () => {
+  // The live worker passes this observer to reconcile its `.git/logs/HEAD`
+  // watches; assert it fires on both the gate-fail add AND the drain delete.
+  let calls = 0;
+  const scanner = new PlanScanner(
+    () => {},
+    () => {},
+    () => false,
+    () => {
+      calls += 1;
+    },
+  );
+
+  const repo = join(tmpDir, "repo");
+  const epicPath = join(repo, ".planctl", "epics", "fn-1-x.json");
+  mkdirSync(join(repo, ".planctl", "epics"), { recursive: true });
+  writeFileSync(epicPath, JSON.stringify({ id: "fn-1-x", title: "X" }));
+
+  scanner.onChange(epicPath); // gate-fail add → fires
+  expect(calls).toBe(1);
+  expect(scanner.pendingRepos().has(repo)).toBe(true);
+
+  unlinkSync(epicPath);
+  scanner.onDelete(epicPath); // pending drop → fires
+  expect(calls).toBe(2);
+  expect(scanner.pendingRepos().size).toBe(0);
+});
+
 test("onChange(triggeredByCommit=true): emits WITHOUT invoking isPathInHead (fn-701 commit bypass)", () => {
   // No git tree at all — the gate probe is the ONLY thing that would block,
   // and the commit bypass must skip it. We inject an `isTracked` that THROWS
@@ -2426,6 +2495,145 @@ test("spawned Worker: a planctl change accompanied by a DB write emits in ~poll-
   expect(epicMsgs.length).toBe(before);
 
   writer.close();
+  worker.postMessage({ type: "shutdown" });
+  const result = await Promise.race([
+    exited.then(() => "exited" as const),
+    Bun.sleep(3000).then(() => "timeout" as const),
+  ]);
+  expect(result).toBe("exited");
+  expect(crashed).toBe(false);
+});
+
+test("spawned Worker: a brand-new epic committed in a repo with NO DB write emits realtime via the .git/logs/HEAD reflog watch (fn-705 tail)", async () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  // Bootstrap the schema; then NEVER write the DB again — this test proves the
+  // reflog channel in ISOLATION (no `data_version` bump, no `recheck-pending`
+  // post, no FSEvent on the unchanged committed bytes). The ONLY realtime
+  // trigger left is the `.git/logs/HEAD` append.
+  openDb(dbPath).db.close();
+
+  const root = join(tmpDir, "newrepo");
+  mkdirSync(root);
+  gitInit(root); // reflogs ON by default → `.git/logs/HEAD` exists
+  const epicDir = join(root, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+  const epicPath = join(epicDir, "fn-1-reflog.json");
+  writeFileSync(
+    epicPath,
+    JSON.stringify({
+      id: "fn-1-reflog",
+      title: "Reflog",
+      status: "open",
+      primary_repo: root,
+    }),
+  );
+
+  const worker = new Worker(
+    new URL("../src/plan-worker.ts", import.meta.url).href,
+    {
+      // A LONG poll so the data_version poll can't be the thing that drains
+      // pending — only the reflog watch can fire in the test window. The
+      // heartbeat is 60s, also far outside the window.
+      workerData: { dbPath, roots: [root], pollMs: 5000 },
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  const epicMsgs: PlanMessage[] = [];
+  const nudges: string[] = [];
+  worker.addEventListener("message", (ev: MessageEvent) => {
+    const m = ev.data as { kind: string; id?: string; root?: string };
+    if (!m) return;
+    if (m.kind === "plan-epic" && m.id === "fn-1-reflog") {
+      epicMsgs.push(m as unknown as PlanMessage);
+    } else if (m.kind === "nudge-discovery" && typeof m.root === "string") {
+      nudges.push(m.root);
+    }
+  });
+  const exited = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+  let crashed = false;
+  worker.addEventListener("error", () => {
+    crashed = true;
+  });
+
+  // Boot + subscribe + boot-scan: the uncommitted epic gates into pending (NOT
+  // emitted) and the worker arms a `.git/logs/HEAD` watch for `root`.
+  await Bun.sleep(300);
+  expect(crashed).toBe(false);
+  expect(epicMsgs.length).toBe(0);
+  // The discovery nudge fired the moment the plan-worker saw the `.planctl`
+  // tree (boot scan path).
+  expect(nudges).toContain(root);
+
+  // Commit the epic — appends to `.git/logs/HEAD`. NO DB write. The reflog
+  // watch fires → gated recheckPending → in-HEAD now → emit.
+  git(root, "add", epicPath);
+  git(root, "commit", "-q", "-m", "add epic");
+
+  // Window that ONLY the reflog watch can clear (sub-second): the poll is 5s,
+  // the heartbeat 60s. If the snapshot lands here, the reflog channel works.
+  const deadline = Date.now() + 3000;
+  while (epicMsgs.length === 0 && Date.now() < deadline) {
+    await Bun.sleep(25);
+  }
+  expect(epicMsgs.length).toBeGreaterThanOrEqual(1);
+
+  worker.postMessage({ type: "shutdown" });
+  const result = await Promise.race([
+    exited.then(() => "exited" as const),
+    Bun.sleep(3000).then(() => "timeout" as const),
+  ]);
+  expect(result).toBe("exited");
+  expect(crashed).toBe(false);
+});
+
+test("spawned Worker: a repo with reflogs OFF degrades gracefully (no crash; heartbeat floor covers it) (fn-705)", async () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  openDb(dbPath).db.close();
+
+  const root = join(tmpDir, "noreflog");
+  mkdirSync(root);
+  gitInit(root);
+  // Turn reflogs OFF and remove the existing `.git/logs/HEAD` so the only
+  // fallback is `.git/HEAD` (present). resolveReflogTarget must not throw.
+  git(root, "config", "core.logAllRefUpdates", "false");
+  rmSync(join(root, ".git", "logs"), { recursive: true, force: true });
+
+  const epicDir = join(root, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+  writeFileSync(
+    join(epicDir, "fn-1-noreflog.json"),
+    JSON.stringify({
+      id: "fn-1-noreflog",
+      title: "NoReflog",
+      status: "open",
+      primary_repo: root,
+    }),
+  );
+
+  const worker = new Worker(
+    new URL("../src/plan-worker.ts", import.meta.url).href,
+    {
+      workerData: { dbPath, roots: [root], pollMs: 5000 },
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  const exited = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+  let crashed = false;
+  worker.addEventListener("error", () => {
+    crashed = true;
+  });
+
+  // Boot: the uncommitted epic gates to pending; the worker resolves the
+  // fallback `.git/HEAD` watch (or skips if neither exists) — either way, no
+  // crash. We only assert the worker stays alive and shuts down cleanly; the
+  // heartbeat floor (not under test) covers the in-HEAD transition.
+  await Bun.sleep(300);
+  expect(crashed).toBe(false);
+
   worker.postMessage({ type: "shutdown" });
   const result = await Promise.race([
     exited.then(() => "exited" as const),

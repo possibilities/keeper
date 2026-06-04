@@ -236,6 +236,33 @@ export type PlanMessage =
   | PlanEpicDeletedMessage
   | PlanTaskDeletedMessage;
 
+/**
+ * fn-705 discovery nudge. Posted by the plan-worker when it first observes a
+ * `.planctl` tree in a repo, so main can hand the repo root to the git-worker's
+ * discovery candidate set IMMEDIATELY (the git-worker's `.planctl`
+ * short-circuit in `shouldWatchRoot` then subscribes it) instead of waiting for
+ * the next full discovery sweep. Closes the attribution/GitSnapshot blind spot
+ * for a repo keeper has never seen a session in: the git-worker discovers repos
+ * from `jobs.cwd` seen-cwds, so a brand-new repo's `.git` is otherwise
+ * unwatched until a session runs there.
+ *
+ * NOT a synthetic event and NOT routed through the scanner's `onSnapshot` (it
+ * drives a producer worker, not a projection — re-fold determinism preserved).
+ * Main forwards it to the git-worker verbatim as an
+ * {@link AddDiscoveryRootMessage}; the forward tolerates a null git-worker ref
+ * during the boot window (a dropped nudge is recovered by the next full
+ * discovery sweep + the heartbeat floor). The worker de-dupes per root so a
+ * busy `.planctl` tree posts one nudge per root, not one per file event.
+ */
+export interface PlanDiscoveryNudgeMessage {
+  kind: "nudge-discovery";
+  /** Absolute repo root (the `.planctl` parent) the git-worker should watch. */
+  root: string;
+}
+
+/** Every shape the plan-worker posts to main (snapshots + the fn-705 nudge). */
+export type PlanWorkerOutbound = PlanMessage | PlanDiscoveryNudgeMessage;
+
 /** Message the parent sends to ask the worker to stop. */
 export interface ShutdownMessage {
   type: "shutdown";
@@ -768,7 +795,72 @@ export class PlanScanner {
      * the repo root + relpath itself.
      */
     private readonly isTracked: (path: string) => boolean = () => true,
+    /**
+     * Optional observer fired AFTER any public mutation
+     * ({@link onChange} / {@link onDelete} / {@link recheckPending}) that may
+     * have changed the {@link pending} set. The live worker (fn-705) uses it
+     * to reconcile its per-repo `.git/logs/HEAD` reflog watches against
+     * {@link pendingRepos}: a commit in an OTHERWISE-UNWATCHED repo (one
+     * keeper has never seen a session in, so the git-worker isn't watching
+     * its `.git`) produces no DB write — so neither the `recheck-pending`
+     * post nor the `data_version` poll wakes — AND leaves the file's
+     * worktree bytes unchanged, so FSEvents won't re-fire. Watching
+     * `.git/logs/HEAD` (a commit always appends there) is the only realtime
+     * trigger for that path's in-HEAD transition.
+     *
+     * Called UNCONDITIONALLY at each mutation exit (even when `pending` is
+     * unchanged) — the worker's reconcile is idempotent + cheap, and a
+     * conditional "only on real change" would have to diff the set anyway.
+     * Defaults to a no-op so the pure-core unit tests need no watch infra.
+     * Try/catch is the CALLER's responsibility — the scanner is in the
+     * no-self-heal path and must not swallow the worker's reconcile throw
+     * inside the gate logic.
+     */
+    private readonly onPendingChange: () => void = () => {},
   ) {}
+
+  /**
+   * The set of repo roots that currently own at least one path in the fn-629
+   * observation gate's {@link pending} set, derived via
+   * {@link repoRootFromPlanctlPath} (pure path arithmetic). The live worker
+   * (fn-705) reconciles its `.git/logs/HEAD` reflog watches against this set:
+   * a repo enters when it gains a first pending path and leaves when its last
+   * pending path drains, keeping the watch lifecycle bounded. A path whose
+   * repo root can't be derived (shape drift) is silently skipped — it simply
+   * gets no reflog watch and falls back to the heartbeat floor.
+   */
+  pendingRepos(): Set<string> {
+    const repos = new Set<string>();
+    for (const path of this.pending) {
+      const root = repoRootFromPlanctlPath(path);
+      if (root !== null) {
+        repos.add(root);
+      }
+    }
+    return repos;
+  }
+
+  /**
+   * Add `path` to the observation gate's {@link pending} set and notify the
+   * {@link onPendingChange} observer. Single choke point for every gate-fail
+   * stash so the fn-705 reflog-watch reconcile never misses a pending-set
+   * transition.
+   */
+  private addPending(path: string): void {
+    this.pending.add(path);
+    this.onPendingChange();
+  }
+
+  /**
+   * Drop `path` from {@link pending} and notify the {@link onPendingChange}
+   * observer. The mirror of {@link addPending}: a drain (path made HEAD, or a
+   * pending file deleted) may have emptied a repo's pending set, so the
+   * worker must reconcile its reflog watches down.
+   */
+  private deletePending(path: string): void {
+    this.pending.delete(path);
+    this.onPendingChange();
+  }
 
   /**
    * Seed the change-gate for an entity from the persisted projection so an
@@ -850,7 +942,7 @@ export class PlanScanner {
       // got removed before it ever made HEAD — e.g. a planctl scaffold
       // unwind on commit_failed), drop it: there's nothing to retract
       // since the reducer never saw the entity. Either way, no tombstone.
-      this.pending.delete(path);
+      this.deletePending(path);
       return;
     }
     if (kind === "epic") {
@@ -949,10 +1041,10 @@ export class PlanScanner {
     // we project; if the def file isn't in HEAD yet, stash and wait for
     // the next git-worker pulse to drain it via {@link recheckPending}.
     if (!this.isTracked(defPath)) {
-      this.pending.add(defPath);
+      this.addPending(defPath);
       return false;
     }
-    this.pending.delete(defPath);
+    this.deletePending(defPath);
     this.pathToId.set(defPath, msg.id);
     const serialized = JSON.stringify(msg);
     if (this.lastEmitted.get(msg.id) === serialized) {
@@ -1118,13 +1210,13 @@ export class PlanScanner {
       this.log(
         `[plan-worker] fn-629 gate bounced ${path} to pending (not in HEAD; gated FSEvents/recheck path)`,
       );
-      this.pending.add(path);
+      this.addPending(path);
       return false;
     }
     // The file IS in HEAD now (or the gate is disabled, or this is a
     // commit-driven bypass). If this path was previously pending, drop it
     // from the set — it has now drained.
-    this.pending.delete(path);
+    this.deletePending(path);
 
     this.pathToId.set(path, msg.id);
     const serialized = JSON.stringify(msg);
@@ -1858,14 +1950,24 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
  * a trigger-tagged "did real work" line (the BACKSTOP reasons carry the loud
  * "a fast path missed it" alarm; `db-poll` does not — it IS a fast path). Pass
  * `undefined` (boot / silent reconcile) to suppress the log.
+ *
+ * `onPlanctlDir` (fn-705) is invoked once per `.planctl` dir surfaced by this
+ * sweep, BEFORE its scan — the live worker uses it to nudge git-worker
+ * discovery for a newly-seen `.planctl` repo (de-duped worker-side). The walk
+ * already paid for the directory enumeration, so this rides free; pure unit
+ * tests omit it.
  */
 export function reconcilePlanctlDirs(
   roots: readonly string[],
   scanner: PlanScanner,
   triggerReason?: "heartbeat" | "fswatcher-drop" | "db-poll",
+  onPlanctlDir?: (planctlDir: string) => void,
 ): void {
   const dirs = discoverPlanctlDirs(roots);
   for (const dir of dirs) {
+    if (onPlanctlDir !== undefined) {
+      onPlanctlDir(dir);
+    }
     scanPlanctlDir(dir, scanner, triggerReason);
   }
 }
@@ -2039,17 +2141,183 @@ function main(): void {
 
   const { db } = openDb(data.dbPath, { readonly: true });
   const port = parentPort;
+
+  // Shared shutdown flag — read by every timer/callback so a queued tick can't
+  // touch a closing connection or post against a torn-down port. Declared up
+  // front so the scanner's fn-705 `onPendingChange` reflog reconcile (below)
+  // can close over it.
+  let shuttingDown = false;
+
+  // ── fn-705 `.git/logs/HEAD` reflog watches ────────────────────────────────
+  // The last non-realtime tail: a brand-new epic scaffolded+committed in a repo
+  // keeper has never seen a session in. The plan-worker watches CONFIGURED
+  // roots, so the new epic file appears via FSEvents (bounces to `pending`, not
+  // in HEAD). But the git-worker discovers repos from `jobs.cwd` seen-cwds, so
+  // it isn't watching that repo's `.git`; the commit produces NO DB write (the
+  // poll never wakes) and leaves the file bytes unchanged (no second FSEvent).
+  // The in-HEAD transition has no realtime trigger. Fix: watch
+  // `.git/logs/HEAD` (a commit ALWAYS appends there) for every repo that
+  // currently holds a `pending` path, and run the GATED `recheckPending()`
+  // scoped to that repo on the append — now in HEAD → emit.
+  //
+  // Lifecycle is bounded: a watch is ADDED when a repo gains a pending path and
+  // DROPPED when its pending set empties (`reconcileReflogWatches` diffs
+  // `scanner.pendingRepos()` against `reflogSubs.keys()`). Per FSEvents
+  // discipline the append is a HINT, not data — `recheckPending` re-probes
+  // `isPathInHead`, so a spurious fire is an idempotent no-op and a missed fire
+  // is covered by the lowered heartbeat floor.
+  let reflogWatcherModule: typeof import("@parcel/watcher") | null = null;
+  // root → its `.git/logs/HEAD` (or `.git/HEAD` fallback) subscription.
+  const reflogSubs = new Map<string, AsyncSubscription>();
+  // Roots whose reflog subscribe is mid-flight, so a re-entrant reconcile
+  // (another pending mutation lands while a subscribe `await`s) doesn't
+  // double-subscribe the same root.
+  const reflogSubscribing = new Set<string>();
+
+  // Resolve the reflog file to watch for `repoRoot`, degrading gracefully
+  // (Risk: `core.logAllRefUpdates=false` repos have no `.git/logs/HEAD`).
+  // Prefer `.git/logs/HEAD` (appended on every commit when reflogs are on);
+  // fall back to `.git/HEAD` (rewritten on branch-switch — weaker but present
+  // even with reflogs off). `null` when neither exists (degrade to the
+  // heartbeat floor + T1's poll for any repo that produces a DB write).
+  const resolveReflogTarget = (repoRoot: string): string | null => {
+    const logsHead = join(repoRoot, ".git", "logs", "HEAD");
+    if (existsSync(logsHead)) return logsHead;
+    const head = join(repoRoot, ".git", "HEAD");
+    if (existsSync(head)) return head;
+    return null;
+  };
+
+  // Bring the live reflog-watch set into agreement with the repos that
+  // currently own a pending path. Idempotent + cheap (a no-op when the pending
+  // repo set hasn't changed). Fired by the scanner's `onPendingChange` on every
+  // pending mutation AND once after the watcher module loads (to catch any
+  // pending accrued before the module was ready).
+  const reconcileReflogWatches = (): void => {
+    if (shuttingDown || reflogWatcherModule === null) return;
+    const watcher = reflogWatcherModule;
+    const desired = scanner.pendingRepos();
+    // Drop watches for repos whose pending set has drained.
+    for (const [root, sub] of [...reflogSubs]) {
+      if (!desired.has(root)) {
+        reflogSubs.delete(root);
+        void sub.unsubscribe().catch(() => {
+          // best-effort; the repo is no longer pending either way.
+        });
+      }
+    }
+    // Add watches for newly-pending repos (skip ones already subscribed or
+    // mid-subscribe).
+    for (const root of desired) {
+      if (reflogSubs.has(root) || reflogSubscribing.has(root)) continue;
+      const target = resolveReflogTarget(root);
+      if (target === null) {
+        // No reflog/HEAD file (e.g. `core.logAllRefUpdates=false` + no HEAD):
+        // degrade to the heartbeat floor; nothing to subscribe.
+        continue;
+      }
+      reflogSubscribing.add(root);
+      // `@parcel/watcher` subscribes a DIRECTORY recursively; point it at the
+      // dir holding the target file and filter the callback to that file. The
+      // dir is tiny (`.git/logs` or `.git`), so the recursive watch is cheap.
+      const watchDir = dirname(target);
+      watcher
+        .subscribe(watchDir, (err) => {
+          // The event is a HINT — re-probe via the GATED `recheckPending`
+          // (re-checks `isPathInHead`), NEVER a `triggeredByCommit` bypass
+          // (preserves fn-629 / the fn-627 dup-dispatch guard). Idempotent
+          // under repeat fires. A watcher `err` (incl. a drop) is also treated
+          // as "go look" — the same defensive re-check.
+          if (shuttingDown) return;
+          if (err) {
+            console.error(
+              `[plan-worker] reflog watcher error for ${root}: ${stringifyErr(err)}`,
+            );
+          }
+          try {
+            scanner.recheckPending();
+          } catch (e) {
+            console.error(
+              `[plan-worker] reflog recheckPending failed for ${root}: ${stringifyErr(e)}`,
+            );
+          }
+        })
+        .then((sub) => {
+          reflogSubscribing.delete(root);
+          // Lost-the-race teardown: shutdown or the repo drained while we were
+          // subscribing — release immediately.
+          if (shuttingDown || !scanner.pendingRepos().has(root)) {
+            void sub.unsubscribe().catch(() => {});
+            return;
+          }
+          reflogSubs.set(root, sub);
+        })
+        .catch((err) => {
+          reflogSubscribing.delete(root);
+          console.error(
+            `[plan-worker] failed to subscribe reflog for ${root}: ${stringifyErr(err)}`,
+          );
+        });
+    }
+  };
+
+  // ── fn-705 discovery nudge ─────────────────────────────────────────────────
+  // The git-worker discovers repos to watch from `jobs.cwd` seen-cwds, so a
+  // repo keeper has never seen a session in is unwatched — no GitSnapshot /
+  // attribution data flows. When the plan-worker first sees a `.planctl` tree
+  // in a repo, hand the repo root to git-worker discovery immediately so its
+  // `.planctl` short-circuit in `shouldWatchRoot` subscribes it on the next
+  // reconcile, rather than waiting for the next full discovery sweep. De-duped
+  // per root (one nudge per repo for the worker's lifetime); main null-guards
+  // the git-worker forward-ref during the boot window (a dropped nudge is
+  // recovered by the next full sweep + heartbeat floor).
+  const nudgedRoots = new Set<string>();
+  const maybeNudgeDiscovery = (repoRoot: string | null): void => {
+    if (repoRoot === null || nudgedRoots.has(repoRoot) || shuttingDown) return;
+    nudgedRoots.add(repoRoot);
+    port.postMessage({
+      kind: "nudge-discovery",
+      root: repoRoot,
+    } satisfies PlanDiscoveryNudgeMessage);
+  };
+  // The planctl-dir callback `reconcilePlanctlDirs` invokes per discovered
+  // `.planctl` dir — derive the repo root and nudge if new.
+  const nudgeFromPlanctlDir = (planctlDir: string): void => {
+    // `planctlDir` is `<root>/.planctl`; its parent is the repo root. Reuse the
+    // pure ancestor walk by appending a synthetic child so it sees `.planctl`.
+    maybeNudgeDiscovery(dirname(planctlDir));
+  };
+
   // fn-629 observation gate: the live worker passes `isPathInHead` so an
   // uncommitted epic/task file lands in the scanner's pending set instead
   // of emitting a snapshot. Main drives the drain by posting
   // {@link RecheckPendingMessage} on every git-worker `GitSnapshot` pulse
-  // (the cross-worker "HEAD may have moved" signal).
+  // (the cross-worker "HEAD may have moved" signal). The fourth ctor arg is the
+  // fn-705 `onPendingChange` observer — it reconciles the reflog watches AND
+  // nudges git-worker discovery for any repo that just gained a pending path
+  // (a brand-new uncommitted epic is the load-bearing case for both).
   const scanner = new PlanScanner(
     (msg) => {
       port.postMessage(msg);
     },
     (m) => console.error(m),
     isPathInHead,
+    () => {
+      // No-self-heal: a throw here would crash the worker and bounce the
+      // daemon, so log+continue. Nudge BEFORE the reflog reconcile so a
+      // brand-new repo gets its git-worker discovery hint even if the reflog
+      // subscribe later fails.
+      try {
+        for (const root of scanner.pendingRepos()) {
+          maybeNudgeDiscovery(root);
+        }
+        reconcileReflogWatches();
+      } catch (err) {
+        console.error(
+          `[plan-worker] onPendingChange reconcile failed: ${stringifyErr(err)}`,
+        );
+      }
+    },
   );
 
   // Restart-seed: don't re-emit a snapshot already folded into the projection.
@@ -2078,7 +2346,8 @@ function main(): void {
   // shutdown alongside the heartbeat. Declared here so the shutdown handler
   // (registered before the timer is armed) can close over it.
   let dbPollTimer: ReturnType<typeof setInterval> | null = null;
-  let shuttingDown = false;
+  // (fn-705) `shuttingDown` is declared at the top of `main` so the reflog
+  // reconcile + nudge callbacks can close over it.
 
   const closeDb = (): void => {
     try {
@@ -2194,6 +2463,17 @@ function main(): void {
             // best-effort
           }
         }
+        // fn-705: release every `.git/logs/HEAD` reflog watch too (each is an
+        // owned external resource — `terminate()` alone leaks it). Drain the
+        // map so a racing reconcile can't re-add into a closing worker.
+        for (const [root, sub] of [...reflogSubs]) {
+          reflogSubs.delete(root);
+          try {
+            await sub.unsubscribe();
+          } catch {
+            // best-effort
+          }
+        }
         closeDb();
         process.exit(0);
       })();
@@ -2213,7 +2493,12 @@ function main(): void {
       // fn-701: tag as "heartbeat" so an emission here (a snapshot the
       // commit/FSEvents fast path missed) logs a "did real work" line —
       // the signature of the fast path being broken.
-      reconcilePlanctlDirs(data.roots, scanner, "heartbeat");
+      reconcilePlanctlDirs(
+        data.roots,
+        scanner,
+        "heartbeat",
+        nudgeFromPlanctlDir,
+      );
     } catch (err) {
       console.error(
         `[plan-worker] periodic reconcile failed: ${stringifyErr(err)}`,
@@ -2243,7 +2528,7 @@ function main(): void {
   const onWake = makeSingleFlight(
     () => {
       scanner.recheckPending();
-      reconcilePlanctlDirs(data.roots, scanner, "db-poll");
+      reconcilePlanctlDirs(data.roots, scanner, "db-poll", nudgeFromPlanctlDir);
     },
     () => shuttingDown,
     (err) =>
@@ -2303,6 +2588,15 @@ function main(): void {
 
   void import("@parcel/watcher")
     .then((watcher) => {
+      // fn-705: publish the module so `reconcileReflogWatches` can subscribe.
+      // Set BEFORE the boot scans below so a pending path accrued during a
+      // root's `scanRoot` immediately gets its `.git/logs/HEAD` watch.
+      reflogWatcherModule = watcher;
+      // Catch-up: a pending path may have been gated in before the module was
+      // ready (e.g. a `recheck-pending`/`kick` post raced the addon load).
+      // The boot scans below each fire `onPendingChange` too, but this guards
+      // the no-boot-pending-but-message-arrived window.
+      reconcileReflogWatches();
       for (const root of data.roots) {
         if (!existsSync(root)) {
           console.error(
@@ -2335,7 +2629,12 @@ function main(): void {
           // fn-701: tag as "fswatcher-drop" so a snapshot recovered here
           // (one the dropped FSEvents change would otherwise have lost) logs
           // a "did real work" line.
-          reconcilePlanctlDirs([root], scanner, "fswatcher-drop");
+          reconcilePlanctlDirs(
+            [root],
+            scanner,
+            "fswatcher-drop",
+            nudgeFromPlanctlDir,
+          );
         });
         schedulers.push(rescan);
         watcher

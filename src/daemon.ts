@@ -123,11 +123,15 @@ import type {
   DeadLetterWorkerData,
 } from "./dead-letter-worker";
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
-import type { GitWorkerData, GitWorkerMessage } from "./git-worker";
+import type {
+  AddDiscoveryRootMessage,
+  GitWorkerData,
+  GitWorkerMessage,
+} from "./git-worker";
 import type {
   PlanctlCommitChangedMessage,
-  PlanMessage,
   PlanWorkerData,
+  PlanWorkerOutbound,
   RecheckPendingMessage,
 } from "./plan-worker";
 import { DEFAULT_BATCH_SIZE, type DrainOptions, drain } from "./reducer";
@@ -1492,6 +1496,15 @@ function runDaemon(): void {
   // autopilot forward-ref above guards), a kick request is a tolerated no-op
   // — the heartbeat backstop covers the gap, identical to a dropped signal.
   let planWorkerRef: Worker | null = null;
+  // Forward reference to the git worker (constructed AFTER the plan worker),
+  // captured by the plan-worker `onmessage` handler's fn-705 discovery-nudge
+  // forward. The plan-worker posts a `nudge-discovery` the first time it sees a
+  // `.planctl` tree in a repo; main relays it to the git-worker as an
+  // `add-discovery-root` so the git-worker watches that repo's `.git`
+  // immediately. `null` until the git worker is constructed — a nudge during
+  // that boot window is a tolerated no-op (the next full discovery sweep
+  // recovers it), mirroring the `planWorkerRef` ordering tolerance.
+  let gitWorkerRef: Worker | null = null;
 
   /**
    * Process the wake signal. Re-entrancy guard (`draining`) ensures we never
@@ -2086,9 +2099,24 @@ function runDaemon(): void {
   // `transcript-title` branch exactly; bindings are named (see `stmts.insertEvent`
   // in `src/db.ts`). Everything other than session_id/hook_event/event_type/data
   // is NULL (synthetic — never carries a process identity).
-  planWorker.onmessage = (ev: MessageEvent<PlanMessage | undefined>): void => {
+  planWorker.onmessage = (
+    ev: MessageEvent<PlanWorkerOutbound | undefined>,
+  ): void => {
     const msg = ev.data;
     if (!msg) {
+      return;
+    }
+    if (msg.kind === "nudge-discovery") {
+      // fn-705 discovery nudge: the plan-worker first saw a `.planctl` tree in
+      // `msg.root`. Forward to the git-worker so it folds the root into its
+      // discovery candidates and watches that repo's `.git` immediately
+      // (attribution/GitSnapshot data then flows). NOT written to the event log
+      // — it drives a producer worker, not a projection. The forward-ref
+      // null-guards the boot window before the git worker is constructed.
+      gitWorkerRef?.postMessage({
+        type: "add-discovery-root",
+        root: msg.root,
+      } satisfies AddDiscoveryRootMessage);
       return;
     }
     let hookEvent: string;
@@ -2323,6 +2351,10 @@ function runDaemon(): void {
       workerData: { dbPath } satisfies GitWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );
+  // fn-705: publish the git-worker ref so the plan-worker `onmessage` handler's
+  // discovery-nudge forward (wired ABOVE) can post `add-discovery-root` to it.
+  // Any nudge posted before this line is a tolerated no-op (null-guarded).
+  gitWorkerRef = gitWorker;
 
   gitWorker.onmessage = (
     ev: MessageEvent<GitWorkerMessage | undefined>,

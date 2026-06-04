@@ -58,6 +58,26 @@ export interface GitWorkerData {
   dbPath: string;
 }
 
+/**
+ * fn-705 discovery nudge (main → git-worker). The plan-worker observed a
+ * `.planctl` tree in a repo keeper has never seen a session in; main forwards
+ * the repo root so the git-worker adds it to its discovery candidate set
+ * IMMEDIATELY (the `.planctl` short-circuit in {@link shouldWatchRoot} then
+ * subscribes it on the next reconcile) instead of waiting for the next full
+ * `SELECT DISTINCT cwd` sweep. Without this, a brand-new repo's `.git` stays
+ * unwatched until a session runs there — no GitSnapshot / attribution flows.
+ * Idempotent: a re-nudge of an already-watched root is a no-op (the candidate
+ * set is a Set + the reconcile is convergent).
+ */
+export interface AddDiscoveryRootMessage {
+  type: "add-discovery-root";
+  /** Absolute repo root to fold into discovery candidates. */
+  root: string;
+}
+
+/** Every shape main sends to the git-worker. */
+export type GitWorkerInbound = ShutdownMessage | AddDiscoveryRootMessage;
+
 export interface GitFileStatus {
   path: string;
   xy: string;
@@ -1384,6 +1404,12 @@ export interface DiscoveryContext {
   nowMs: number;
   runFullSweep: boolean;
   probe: (root: string) => { dirty: boolean; ahead: number } | null;
+  /**
+   * fn-705 discovery-nudge roots forwarded from the plan-worker — folded into
+   * the candidate set unconditionally (see {@link buildDiscoveryCandidates}).
+   * Optional; omitted by tests that don't exercise the nudge.
+   */
+  extraCandidates?: Set<string>;
 }
 
 /**
@@ -1395,9 +1421,27 @@ export interface DiscoveryContext {
  */
 export function buildDiscoveryCandidates(
   db: Database,
-  options: { nowMs: number; runFullSweep: boolean; watched: Set<string> },
+  options: {
+    nowMs: number;
+    runFullSweep: boolean;
+    watched: Set<string>;
+    /**
+     * fn-705 discovery-nudge roots: repo roots the plan-worker handed over
+     * (a `.planctl` tree in a repo with no seen-cwd job history). Always
+     * included so the `.planctl` short-circuit in {@link shouldWatchRoot}
+     * subscribes them on the next reconcile, without waiting for a session
+     * to populate `jobs.cwd`. Optional — pure tests omit it.
+     */
+    extraCandidates?: Set<string>;
+  },
 ): Set<string> {
   const candidates = new Set<string>();
+
+  // fn-705: nudge roots are unconditional candidates (independent of the
+  // recent/full-sweep job-cwd partition — a never-seen repo has no job rows).
+  if (options.extraCandidates !== undefined) {
+    for (const root of options.extraCandidates) candidates.add(root);
+  }
 
   // Always include plan-backed roots: epic.project_dir and every embedded
   // task.target_repo. Bounded (one row per epic) and stable.
@@ -1562,6 +1606,7 @@ export function discoverProjectRoots(
     nowMs: ctx.nowMs,
     runFullSweep: ctx.runFullSweep,
     watched: ctx.currentlyWatched,
+    extraCandidates: ctx.extraCandidates,
   });
 
   // Stage 2: resolve cwd → toplevel via the permanent cache. Drops cwds
@@ -1886,6 +1931,18 @@ function startWorker(): void {
    * deleted once the root is actually dropped.
    */
   const cleanSinceByRoot = new Map<string, number>();
+  /**
+   * fn-705 discovery-nudge roots forwarded by main (an
+   * {@link AddDiscoveryRootMessage} per repo the plan-worker first saw a
+   * `.planctl` tree in). Folded into the candidate set on every reconcile via
+   * {@link buildDiscoveryCandidates} so a repo with no seen-cwd job history is
+   * still discovered. Grows monotonically across the worker's lifetime; bounded
+   * by the number of distinct planctl repos (small, and the membership floor it
+   * provides is harmless — `shouldWatchRoot` still gates on `.planctl` presence
+   * / dirty / ahead, so a nudge for a repo whose `.planctl` later vanishes
+   * simply stops qualifying).
+   */
+  const extraCandidateRoots = new Set<string>();
   /**
    * Epic fn-690: wall-clock (`Date.now()`) timestamp of the last full-history sweep
    * (`runFullSweep: true`). `null` until the first reconcile fires.
@@ -2300,6 +2357,7 @@ function startWorker(): void {
           nowMs,
           runFullSweep,
           probe: probeWatchMembership,
+          extraCandidates: extraCandidateRoots,
         }),
       );
 
@@ -2336,8 +2394,22 @@ function startWorker(): void {
     }
   }
 
-  port.on("message", (msg: ShutdownMessage | undefined) => {
-    if (msg?.type !== "shutdown") return;
+  port.on("message", (msg: GitWorkerInbound | undefined) => {
+    if (msg == null) return;
+    if (msg.type === "add-discovery-root") {
+      // fn-705 discovery nudge: fold the plan-worker's repo root into the
+      // candidate set and request an immediate reconcile so the `.planctl`
+      // short-circuit in `shouldWatchRoot` subscribes it now, not on the next
+      // full sweep. Idempotent (Set add) + convergent (reconcile is
+      // single-flighted). Tolerated no-op during the boot window where
+      // `watcherModule` is still null — `reconcileRoots` early-returns and the
+      // root stays queued for the boot reconcile.
+      if (shuttingDown) return;
+      extraCandidateRoots.add(msg.root);
+      void reconcileRoots();
+      return;
+    }
+    if (msg.type !== "shutdown") return;
     shuttingDown = true;
     if (dbPollTimer != null) clearInterval(dbPollTimer);
     if (heartbeatTimer != null) clearInterval(heartbeatTimer);
