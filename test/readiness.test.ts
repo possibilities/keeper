@@ -845,6 +845,52 @@ test("predicate 6.5 skipped when no git_status entry for epic.project_dir (close
 });
 
 // ---------------------------------------------------------------------------
+// fn-700: epic-no-tasks close-row guard. An epic and its tasks fold as two
+// separate single-event transactions (EpicSnapshot, then TaskSnapshot);
+// between them the epic exists with ZERO tasks. Predicate 10's
+// `for…of epic.tasks` loop is vacuously true over an empty list, so the
+// close row would otherwise fall through to `ready` and the autopilot would
+// dispatch a closer against an epic with no work (the fn-698 incident). The
+// guard at rank 9.5 (before predicate 10) blocks it explicitly while every
+// more-specific verdict above still wins.
+// ---------------------------------------------------------------------------
+
+test("fn-700 close-row: validated open zero-task epic → blocked:epic-no-tasks (not ready)", () => {
+  // makeEpic defaults `tasks: []` and a non-null `last_validated_at`, so this
+  // is the canonical partial-projection window: validated, open, no tasks.
+  // Without the guard predicate 10's vacuous loop falls through to `ready`.
+  const epic = makeEpic({});
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "epic-no-tasks" }),
+  );
+  // Explicitly NOT ready — the hole this epic closes.
+  expect(snap.perCloseRow.get(epic.epic_id)).not.toEqual({ tag: "ready" });
+});
+
+test("fn-700 precedence: UNvalidated zero-task epic still reports epic-not-validated", () => {
+  // Predicate 2 (epic-not-validated) ranks above the rank-9.5 guard, so a
+  // pre-EpicSnapshot stub is NOT masked. This is why the guard is placed
+  // late, not first.
+  const epic = makeEpic({ last_validated_at: null });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "epic-not-validated" }),
+  );
+});
+
+test("fn-700 rollup: zero-task epic header surfaces blocked:epic-no-tasks (no rollup code change)", () => {
+  // rollupEpicHeader inherits the close-row verdict for a zero-task epic
+  // (its per-task loops are empty), so the epic header pill reads
+  // `epic-no-tasks` for free.
+  const epic = makeEpic({});
+  const snap = run([epic]);
+  expect(snap.perEpic.get(epic.epic_id)).toEqual(
+    blocked({ kind: "epic-no-tasks" }),
+  );
+});
+
+// ---------------------------------------------------------------------------
 // fn-626 regression: terminal worker carries a stale per-job count, but the
 // live `git_status` row says zero. The fix moved predicate 6.5 off the
 // embedded per-job columns (which freeze on terminal worker transition)
@@ -1361,13 +1407,22 @@ test("ordering: same-epic same-root collision → reported as single-task-per-ep
 // Epic header rollup
 // ---------------------------------------------------------------------------
 
-test("epic header rollup: zero-task epic — header = close-row verdict (ready)", () => {
-  // No tasks, so close-row's synthetic dep-on-task-synthetic-close passes
-  // vacuously → close is ready → header is ready.
+test("epic header rollup: zero-task epic — header = close-row verdict (blocked:epic-no-tasks)", () => {
+  // fn-700: a zero-task epic is the partial-projection window between an
+  // EpicSnapshot and its first TaskSnapshot fold. Predicate 10's
+  // `for…of epic.tasks` loop is vacuously true over an empty list, so the
+  // close row would historically fall through to `ready` (the fn-698
+  // dispatch-a-closer-against-an-empty-epic hole). The rank-9.5 guard now
+  // blocks it `epic-no-tasks`, and the rollup inherits that verdict for the
+  // header (its per-task loops are empty).
   const epic = makeEpic({ tasks: [] });
   const snap = run([epic]);
-  expect(snap.perCloseRow.get(epic.epic_id)).toEqual({ tag: "ready" });
-  expect(snap.perEpic.get(epic.epic_id)).toEqual({ tag: "ready" });
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "epic-no-tasks" }),
+  );
+  expect(snap.perEpic.get(epic.epic_id)).toEqual(
+    blocked({ kind: "epic-no-tasks" }),
+  );
 });
 
 test("epic header rollup: all tasks done+approved + close blocked → header inherits close reason", () => {

@@ -198,6 +198,14 @@ export function resolveEpicDep(
  *                                        problem signal), distinct from the amber `dep-on-epic`.
  * - `single-task-per-epic`             — lost the per-epic mutex (a sibling row in the same epic is non-completed).
  * - `single-task-per-root`             — lost the per-root mutex (a row in another epic in the same project root is non-completed).
+ * - `epic-no-tasks`                    — close-row only: the epic has ZERO tasks (the partial-projection
+ *                                        window between an `EpicSnapshot` and its first `TaskSnapshot`
+ *                                        fold). Predicate 10's `for…of epic.tasks` loop is vacuously
+ *                                        true over an empty list, so the close row would otherwise fall
+ *                                        through to `ready` and the autopilot would dispatch a closer
+ *                                        against an epic with no work (the fn-698 incident). Placed at
+ *                                        rank 9.5 (after every more-specific verdict, before predicate
+ *                                        10) so it catches ONLY that vacuous fall-through. Payload-less.
  * - `unknown`                          — defensive default for verdict/renderer mismatch.
  */
 export type BlockReason =
@@ -211,6 +219,7 @@ export type BlockReason =
   | { kind: "dep-on-epic-dangling"; upstream: string }
   | { kind: "single-task-per-epic" }
   | { kind: "single-task-per-root" }
+  | { kind: "epic-no-tasks" }
   | { kind: "unknown" };
 
 /**
@@ -927,6 +936,26 @@ function evaluateCloseRow(
   // assigns cross-epic deps to the task rows; the close row's deps
   // cascade transitively through tasks).
 
+  // 9.5. epic-no-tasks — the epic has ZERO tasks. Predicate 10's
+  // `for…of epic.tasks` loop below is vacuously true over an empty list,
+  // so the close row would fall through to the `ready` return at the
+  // bottom and the autopilot would dispatch a closer against an epic with
+  // no work (the fn-698 incident: an `EpicSnapshot` folds before its first
+  // `TaskSnapshot`, and a reconcile that lands in that partial-projection
+  // window saw the vacuous `ready`). Block it explicitly.
+  //
+  // DELIBERATELY ranked LATE (here, after predicates 1–7, immediately
+  // before predicate 10) — NOT first. First-placement would mask
+  // `epic-not-validated` on a pre-`EpicSnapshot` stub and `planner-running`
+  // during active scaffolding, and perturb the predicate-2-precedence
+  // tests. This rank catches EXACTLY the vacuous fall-through and nothing
+  // else: every more-specific verdict above (completed, epic-not-validated,
+  // planner-running, job-rejected, job-running / sub-agent-running,
+  // git-uncommitted, job-pending) still wins.
+  if (epic.tasks.length === 0) {
+    return { tag: "blocked", reason: { kind: "epic-no-tasks" } };
+  }
+
   // 10. dep-on-task-synthetic-close — every real task in the epic must be
   // completed. Reason carries the first non-completed task id in
   // traversal (pre-sorted tasks) order.
@@ -1555,6 +1584,8 @@ function formatReasonShort(reason: BlockReason): string {
       return "single-task-per-epic";
     case "single-task-per-root":
       return "single-task-per-root";
+    case "epic-no-tasks":
+      return "epic-no-tasks";
     case "unknown":
       return "unknown";
     default: {

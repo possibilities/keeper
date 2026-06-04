@@ -377,6 +377,24 @@ firing correctly — check them before concluding it is broken:
   itself, dirtied by your own edits or a not-yet-committed `.planctl` approval
   chore. Confirm: `git status` + `SELECT project_dir, dirty_count FROM
   git_status`.
+- **Won't dispatch the closer against a taskless epic (fn-700).** A keeper
+  epic and its tasks fold as two separate single-event transactions
+  (`EpicSnapshot`, then `TaskSnapshot`); between them the epic exists with
+  ZERO tasks. `evaluateCloseRow` predicate 10's `for…of epic.tasks` loop is
+  vacuously true over an empty list, so the close-row verdict would fall
+  through to `ready` and a reconcile landing in that partial-projection
+  window would dispatch a closer against an epic with no work (observed live
+  on fn-698 — closer + worker dispatched ~8s apart; functionally an
+  auth-bypass-on-empty-collection in a dispatch gate). `evaluateCloseRow`
+  (`src/readiness.ts`) blocks it with block reason `epic-no-tasks` at a
+  DELIBERATELY LATE rank 9.5 — after predicates 1–7, immediately before
+  predicate 10 — so every more-specific verdict still wins (first-placement
+  would mask `epic-not-validated` on a pre-`EpicSnapshot` stub and
+  `planner-running` during active scaffolding). The autopilot side is
+  non-dispatchable by construction: `verbForVerdict`
+  (`src/autopilot-worker.ts`) returns `null` for every blocked reason except
+  `job-pending`, and a test pins that lock. No reducer / schema / keeper-py
+  change — the `Verdict` is computed client-side at read time, not folded.
 - **Won't release the mutex while the worker session is still alive (fn-671).**
   `computeReadiness` predicate 1 (`src/readiness.ts`) only collapses a task to
   `{tag:"completed"}` when `worker_phase==="done"` AND `approval==="approved"`

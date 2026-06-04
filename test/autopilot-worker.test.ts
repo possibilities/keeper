@@ -306,6 +306,18 @@ test("verbForVerdict: other blocked / running / completed / undefined → null",
   expect(verbForVerdict("task", undefined)).toBeNull();
 });
 
+test("fn-700: verbForVerdict('close', blocked:epic-no-tasks) → null (autopilot lock)", () => {
+  // Locks the autopilot side to the fn-700 readiness fix: a zero-task epic's
+  // close verdict is `blocked:epic-no-tasks`, and the only blocked reason
+  // that maps to a verb is `job-pending`. This guards against a future
+  // verdict refactor silently re-opening the dispatch-a-closer-against-an-
+  // empty-epic hole — even if a regression made the close row `ready` again,
+  // this assertion pins the contract that the closer must NOT be dispatched
+  // for an epic-no-tasks verdict.
+  const v: Verdict = { tag: "blocked", reason: { kind: "epic-no-tasks" } };
+  expect(verbForVerdict("close", v)).toBeNull();
+});
+
 // ---------------------------------------------------------------------------
 // isOccupyingJob
 // ---------------------------------------------------------------------------
