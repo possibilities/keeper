@@ -49,5 +49,5 @@ test/git-worker.test.ts: trailer-lift cases (Op+Target present / absent / malfor
 - [ ] new + existing git-worker tests green
 
 ## Done summary
-
+Lifted Planctl-Op/Target trailers onto the Commit event payload: widened enumerateCommitsInDelta's format string + stride parser from 6 to 8 fields, froze the normalized op + validated target ref on EnumeratedCommit/CommitMessage/CommitPayload, and defaulted both to null in extractCommit for pre-fn-695 events. daemon.ts carries the new fields free via the existing spread.
 ## Evidence
