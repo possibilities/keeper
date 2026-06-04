@@ -54,5 +54,5 @@ test/reducer.test.ts: union dedup (scrape + commit for the same `(epic, kind, jo
 - [ ] from-scratch re-fold reproduces byte-identical `job_links`/`epic_links` over a log containing pre-feature `Commit` events
 
 ## Done summary
-
+Widened syncPlanctlLinks to derive creator/refiner edges from the UNION of legacy planctl_op stdout-scrape rows and durable Commit-event trailer facts, deduped via the existing classifier; foldCommit triggers (never directly writes) the per-session edge rebuild so the single-writer invariant holds. Schema v53->v54 whitelist-only bump (api.py SUPPORTED_SCHEMA_VERSIONS adds 54). A scaffold whose stdout scrape NULLed out now still mints a creator edge via the commit channel; re-fold stays byte-identical over pre-feature Commit events.
 ## Evidence
