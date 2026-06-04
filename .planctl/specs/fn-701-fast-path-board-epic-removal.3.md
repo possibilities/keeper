@@ -55,5 +55,5 @@ daemon's actual bun (1.3.14) and whether pre-warm alone eliminates it
 - [ ] No in-process worker respawn introduced
 
 ## Done summary
-
+Pre-warm @parcel/watcher on main (synchronous require) before the worker spawn block to fix the napi_register_module_v1 concurrent-dlopen crash-loop (residual Bun #15942); repro confirmed on bun 1.3.14, pre-warm alone closes it (no staggering). Loud boot assertion + fatalExit on a genuine load failure. README @parcel/watcher load-ordering note added.
 ## Evidence
