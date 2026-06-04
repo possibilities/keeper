@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-04T01:35:51.400180Z",
+  "depends_on": [],
+  "epic": "fn-695-durable-commit-derived-creatorrefiner",
+  "id": "fn-695-durable-commit-derived-creatorrefiner.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "git-worker lifts Planctl-Op and Target trailers",
+  "updated_at": "2026-06-04T01:35:51.400180Z"
+}

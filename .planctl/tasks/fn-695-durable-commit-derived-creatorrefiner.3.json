@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-04T01:35:51.400180Z",
+  "depends_on": [
+    "fn-695-durable-commit-derived-creatorrefiner.1",
+    "fn-695-durable-commit-derived-creatorrefiner.2"
+  ],
+  "epic": "fn-695-durable-commit-derived-creatorrefiner",
+  "id": "fn-695-durable-commit-derived-creatorrefiner.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Reducer unions commit-trailer facts; schema v54",
+  "updated_at": "2026-06-04T01:35:51.400180Z"
+}
