@@ -17,6 +17,7 @@ Commit message format (produced by the hook for mutating verbs)::
     Planctl-Op: <verb>
     Planctl-Target: <id>
     Planctl-Prev-Op: <sha of HEAD captured BEFORE git commit>
+    Session-Id: <PLANCTL_SESSION_ID>   (omitted when the env var is absent)
 
 Envelope fields (mutating verbs):
     repo_root   — the cwd-derived repo at invocation time (always present).
@@ -82,7 +83,8 @@ def build_planctl_invocation(
     -------
     dict
         Payload with keys: ``files``, ``op``, ``target``, ``subject``,
-        ``touched_path_files``, ``repo_root``, ``state_repo``, ``queue_jump``.
+        ``touched_path_files``, ``repo_root``, ``state_repo``, ``queue_jump``,
+        ``session_id``.
     """
     from planctl.commit_messages import build_subject
     from planctl.store import _read_touched_files
@@ -125,6 +127,12 @@ def build_planctl_invocation(
         "repo_root": str(repo_root),
         "state_repo": state_repo,
         "queue_jump": queue_jump,
+        # fn-695: the resolved committing session id, threaded into the
+        # `chore(planctl)` commit's `Session-Id` trailer by
+        # `auto_commit_from_invocation`. Same opaque v4 UUID the keeper hook
+        # uses (job_id === session_id). Always populated here — the resolve
+        # above fails closed for mutating verbs.
+        "session_id": session_id,
     }
 
 

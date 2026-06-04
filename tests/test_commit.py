@@ -193,6 +193,107 @@ def test_auto_commit_happy_path_returns_sha_and_commits(planctl_git_repo):
     assert rel in _git_head_files(planctl_git_repo)
 
 
+# ---------------------------------------------------------------------------
+# fn-695: Session-Id trailer
+# ---------------------------------------------------------------------------
+
+
+def test_auto_commit_stamps_session_id_trailer(planctl_git_repo):
+    """A payload carrying ``session_id`` stamps ``Session-Id: <uuid>``.
+
+    The stamped uuid equals the payload value verbatim — never a freshly
+    minted one — and rides alongside the existing forensic trailers.
+    """
+    rel = _make_dirty(planctl_git_repo, ".planctl/epics/session_marker.txt")
+    sid = "11111111-2222-4333-8444-555555555555"
+
+    sha = auto_commit_from_invocation(
+        {
+            "files": [rel],
+            "op": "scaffold",
+            "target": "fn-695-x",
+            "subject": "chore(planctl): scaffold fn-695-x",
+            "session_id": sid,
+            "state_repo": str(planctl_git_repo),
+            "repo_root": str(planctl_git_repo),
+        }
+    )
+
+    assert sha is not None
+    msg = _git_head_message(planctl_git_repo)
+    assert f"Session-Id: {sid}" in msg
+    # Existing trailers are unchanged and Session-Id rides alongside.
+    assert "Planctl-Op: scaffold" in msg
+    assert "Planctl-Target: fn-695-x" in msg
+    assert "Planctl-Prev-Op: " in msg
+
+
+def test_auto_commit_omits_session_id_trailer_when_absent(planctl_git_repo):
+    """Missing ``session_id`` → trailer omitted, commit still lands (fail-open)."""
+    rel = _make_dirty(planctl_git_repo, ".planctl/epics/no_session_marker.txt")
+    pre = _git_commit_count(planctl_git_repo)
+
+    sha = auto_commit_from_invocation(
+        {
+            "files": [rel],
+            "op": "scaffold",
+            "target": "fn-695-y",
+            "subject": "chore(planctl): scaffold fn-695-y",
+            # no session_id key at all
+            "state_repo": str(planctl_git_repo),
+            "repo_root": str(planctl_git_repo),
+        }
+    )
+
+    assert sha is not None
+    assert _git_commit_count(planctl_git_repo) == pre + 1
+    msg = _git_head_message(planctl_git_repo)
+    assert "Session-Id:" not in msg
+    # Existing trailers still present.
+    assert "Planctl-Op: scaffold" in msg
+    assert "Planctl-Target: fn-695-y" in msg
+
+
+def test_auto_commit_omits_session_id_trailer_when_none(planctl_git_repo):
+    """An explicit ``session_id=None`` is treated the same as absent."""
+    rel = _make_dirty(planctl_git_repo, ".planctl/epics/none_session_marker.txt")
+
+    sha = auto_commit_from_invocation(
+        {
+            "files": [rel],
+            "op": "refine-apply",
+            "target": "fn-695-z",
+            "subject": "chore(planctl): refine-apply fn-695-z",
+            "session_id": None,
+            "state_repo": str(planctl_git_repo),
+            "repo_root": str(planctl_git_repo),
+        }
+    )
+
+    assert sha is not None
+    msg = _git_head_message(planctl_git_repo)
+    assert "Session-Id:" not in msg
+
+
+def test_build_message_with_trailers_session_id_round_trips():
+    """``_build_message_with_trailers`` stamps the exact uuid, omits when falsy."""
+    sid = "abcdabcd-1234-4567-89ab-cdefcdefcdef"
+    with_sid = commit_module._build_message_with_trailers(
+        "chore(planctl): scaffold fn-1", "scaffold", "fn-1", "deadbeef", sid
+    )
+    assert with_sid.rstrip().endswith(f"Session-Id: {sid}")
+
+    without_sid = commit_module._build_message_with_trailers(
+        "chore(planctl): scaffold fn-1", "scaffold", "fn-1", "deadbeef", None
+    )
+    assert "Session-Id:" not in without_sid
+    # Default arg (no session_id passed) also omits.
+    default = commit_module._build_message_with_trailers(
+        "chore(planctl): scaffold fn-1", "scaffold", "fn-1", "deadbeef"
+    )
+    assert "Session-Id:" not in default
+
+
 def test_auto_commit_skips_files_not_in_payload(planctl_git_repo):
     """A second dirty file outside the payload's scope is NOT staged.
 

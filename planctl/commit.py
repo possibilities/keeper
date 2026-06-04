@@ -224,9 +224,13 @@ def _is_commit_contention(message: str) -> bool:
 
 
 def _build_message_with_trailers(
-    subject: str, op: str, target: str, prev_op_sha: str
+    subject: str,
+    op: str,
+    target: str,
+    prev_op_sha: str,
+    session_id: str | None = None,
 ) -> str:
-    """Build the full commit message with the three forensic trailers.
+    """Build the full commit message with the forensic trailers.
 
     Trailers:
       ``Planctl-Op: <op>``            — verb that fired (envelope ``op``)
@@ -234,14 +238,29 @@ def _build_message_with_trailers(
       ``Planctl-Prev-Op: <sha>``      — HEAD before this commit (forensics
                                         continuity; matches the legacy
                                         post-hook's ``Planctl-Prev-Op``)
+      ``Session-Id: <uuid>``          — the committing session (the same opaque
+                                        v4 UUID the keeper hook uses, resolved
+                                        from ``PLANCTL_SESSION_ID``). Lets the
+                                        keeper derive the creator/refiner edge
+                                        from the durable commit instead of the
+                                        fragile stdout-envelope scrape (fn-695).
+                                        OMITTED — never stamped empty — when
+                                        ``session_id`` is absent (manual CLI /
+                                        non-interactive); the commit still
+                                        lands and keeper falls back to the
+                                        scrape path. ``job_id === session_id``,
+                                        so no separate ``Job-Id`` is stamped.
     """
-    return (
+    msg = (
         f"{subject}\n"
         f"\n"
         f"Planctl-Op: {op}\n"
         f"Planctl-Target: {target}\n"
         f"Planctl-Prev-Op: {prev_op_sha}\n"
     )
+    if session_id:
+        msg += f"Session-Id: {session_id}\n"
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +338,11 @@ def auto_commit_from_invocation(payload: dict[str, Any]) -> str | None:
 
     op = payload.get("op", "")
     target = payload.get("target") or ""
+    # fn-695: the committing session id (PLANCTL_SESSION_ID), carried on the
+    # envelope by build_planctl_invocation. Fail-open — when absent (older
+    # envelope shapes / manual non-interactive calls) the Session-Id trailer is
+    # simply omitted and the commit still lands.
+    session_id = payload.get("session_id") or None
 
     # No flock.  Run the dirty-confirm → stage → commit sequence under a
     # bounded full-jitter retry over git's own lock domains.  Each attempt
@@ -339,7 +363,9 @@ def auto_commit_from_invocation(payload: dict[str, Any]) -> str | None:
             # Re-read HEAD inside the retried body so the Planctl-Prev-Op
             # trailer reflects the FINAL parent after a ref-lock re-parent.
             prev_sha = _current_head(state_repo)
-            msg = _build_message_with_trailers(subject, op, target, prev_sha)
+            msg = _build_message_with_trailers(
+                subject, op, target, prev_sha, session_id
+            )
 
             _git_stage(dirty, state_repo)
             return _git_commit(msg, dirty, state_repo)

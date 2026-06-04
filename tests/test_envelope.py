@@ -223,6 +223,23 @@ def test_session_id_none_raises(planctl_git_repo, monkeypatch):
         build_planctl_invocation("create", "fn-test", repo_root=ctx.project_path)
 
 
+def test_build_invocation_carries_session_id(planctl_git_repo, monkeypatch):
+    """fn-695: the envelope carries session_id == PLANCTL_SESSION_ID verbatim.
+
+    The auto-commit reads this off the payload to stamp the Session-Id trailer;
+    it must be the same opaque uuid the launcher exported, not a fresh one.
+    """
+    sid = "deadbeef-0000-4000-8000-000000000001"
+    monkeypatch.setenv("PLANCTL_SESSION_ID", sid)
+
+    from planctl.invocation import build_planctl_invocation
+    from planctl.project import resolve_project
+
+    ctx = resolve_project()
+    pc = build_planctl_invocation("create", "fn-test", repo_root=ctx.project_path)
+    assert pc["session_id"] == sid
+
+
 # ---------------------------------------------------------------------------
 # Multiple mutating verbs all emit planctl_invocation
 # ---------------------------------------------------------------------------
