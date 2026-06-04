@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-697-cut-board-subagent-refetch-storm",
   "bundles": [],
+  "closer_done_at": "2026-06-04T09:54:16.821025Z",
   "created_at": "2026-06-04T01:54:35.851189Z",
   "depends_on_epics": [],
   "id": "fn-697-cut-board-subagent-refetch-storm",
@@ -9,10 +10,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Cut board subagent refetch storm",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-04T01:54:35.851189Z"
+  "updated_at": "2026-06-04T09:54:16.821025Z"
 }
