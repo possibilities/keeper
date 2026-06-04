@@ -294,9 +294,11 @@ export interface RecheckPendingMessage {
  *
  * The shape is `{type:"kick"}` — byte-identical to the server-worker /
  * tab-namer `KickMessage` so main's existing `satisfies KickMessage` post
- * sites can target the plan-worker without a new wire shape. The 60s heartbeat
- * remains the level-triggered lost-wakeup backstop (the plan-worker has no
- * `data_version` poll to fall back on).
+ * sites can target the plan-worker without a new wire shape. The fn-705 fast
+ * `data_version` poll ({@link PLAN_DB_POLL_MS}) is now the level-triggered
+ * lost-wakeup backstop for this kick (the kick is edge-triggered); the
+ * lowered {@link RECONCILE_HEARTBEAT_MS} heartbeat is the should-never-fire
+ * paranoia floor beneath that.
  */
 export interface KickMessage {
   type: "kick";
@@ -1264,15 +1266,22 @@ export class PlanScanner {
    * reach).
    *
    * Log SEMANTICS branch on whether the trigger is a FAST path or a BACKSTOP:
-   * - `"heartbeat"` / `"fswatcher-drop"` are BACKSTOPS — an emit here means a
-   *   fast path missed it (fn-701), so it logs the loud alarm wording. A
-   *   heartbeat firing in NORMAL operation is the signature of the
-   *   commit/FSEvents fast path being broken, and must be visible.
+   * - `"heartbeat"` is the SHOULD-NEVER-FIRE paranoia floor (fn-705). With the
+   *   `data_version` poll + reflog watch landed, an emit here means EVERY fast
+   *   path missed a change — a genuine ALARM that the realtime architecture is
+   *   broken (or a `.planctl` file is genuinely abandoned-uncommitted), so it
+   *   logs the loudest wording. It must NEVER fire in normal operation.
+   * - `"fswatcher-drop"` is the FSEvents-drop rescan backstop (fn-701) — an
+   *   emit means the kernel coalesced/dropped a watcher edge the poll/reflog
+   *   fast paths then also missed; loud, but expected on a known macOS FSEvents
+   *   overrun, not a realtime-architecture failure.
    * - `"db-poll"` is itself a FAST path (fn-705 — every keeper DB write drives
    *   it, including the close→approve fold), so an emit here is EXPECTED, not a
    *   missed-fast-path alarm. It logs a low-key "did real work" line WITHOUT
    *   the alarm wording so a poll-rescued emit is distinguishable from (and not
-   *   confused with) a heartbeat-rescued one.
+   *   confused with) a heartbeat-rescued one. (The `.git/logs/HEAD` reflog
+   *   trigger drives {@link recheckPending} directly, not this sink, so it too
+   *   never logs the alarm.)
    *
    * The caller gates this on `onChange` having RETURNED `true` (it emitted),
    * which the in-memory change-gate (`lastEmitted`) already dedups against a
@@ -1288,6 +1297,15 @@ export class PlanScanner {
   ): void {
     if (reason === "db-poll") {
       this.log(`[plan-worker] db-poll emitted ${path}`);
+      return;
+    }
+    if (reason === "heartbeat") {
+      // Paranoia floor fired in normal operation: every realtime fast path
+      // (data_version poll, reflog watch, FSEvents) missed this change. Loudest
+      // wording so a grep on the alarm count surfaces a broken fast path.
+      this.log(
+        `[plan-worker] ALARM: backstop (heartbeat) emitted ${path} — every fast path missed it; the realtime path is broken or the file is abandoned-uncommitted`,
+      );
       return;
     }
     this.log(
@@ -1600,17 +1618,25 @@ export function isPathInHead(path: string): boolean {
 const GIT_CHECK_TIMEOUT_MS = 1000;
 
 /**
- * Periodic reconcile cadence — mirrors `git-worker.ts` HEARTBEAT_MS so the
- * two producer workers share one schedule and the steady-state cost is
- * predictable. 60s is the cheap convergence backstop for the
- * brand-new-repo case the commit-trigger can't cover (git-worker only
- * watches a repo's `.git` after an epic row for it exists, so the FIRST
- * `.planctl` scaffold in a fresh repo has no commit signal — only this
- * heartbeat + the broad FSEvents subscription stand between it and
- * "needs a daemon restart"). Exported for unit reach (tests assert on
- * the constant rather than the timer plumbing).
+ * Periodic reconcile cadence — the SHOULD-NEVER-FIRE paranoia backstop
+ * (fn-705). With T1-T3 landed, three realtime triggers cover every case:
+ * the fast {@link PLAN_DB_POLL_MS} `data_version` poll (every keeper DB
+ * write — the close→approve fold included — drives a gated rescan in
+ * ~50ms), the per-repo `.git/logs/HEAD` reflog watch (a commit always
+ * appends there, closing the brand-new/never-seen-repo tail the
+ * commit-ingest channel can't cover), and the broad FSEvents
+ * subscription. The heartbeat is the FINAL FLOOR for the lone residual
+ * case with literally no other signal — a `.planctl` file that flashed
+ * dirty, never committed, and sits in a repo with no DB write and no
+ * reflog append. In normal operation it must NEVER deliver a snapshot; a
+ * `"heartbeat"`-tagged backstop emit is a loud alarm that a fast path is
+ * broken (see {@link PlanScanner.logBackstopEmit}). Lowered from 60s to
+ * 5s so even that residual case is near-realtime — the change-gate makes a
+ * quiescent reconcile a near-no-op, so the higher tick rate is cheap.
+ * Exported for unit reach (tests assert on the constant rather than the
+ * timer plumbing).
  */
-export const RECONCILE_HEARTBEAT_MS = 60_000;
+export const RECONCILE_HEARTBEAT_MS = 5_000;
 
 /**
  * Fast `PRAGMA data_version` poll cadence (fn-705) — same value as

@@ -1639,8 +1639,9 @@ function runDaemon(): void {
       // no reply, no correlation id. Null-guarded for the boot race (the plan
       // worker is constructed later in this function); wrapped in try/catch so
       // a transport hiccup on this cosmetic fast-path can NEVER bounce the
-      // daemon (no in-process self-heal). The 60s plan-worker heartbeat is the
-      // level-triggered lost-wakeup backstop.
+      // daemon (no in-process self-heal). The fn-705 plan-worker `data_version`
+      // poll is the level-triggered lost-wakeup backstop (the 5s heartbeat is
+      // the should-never-fire paranoia floor beneath it).
       try {
         planWorkerRef?.postMessage({ type: "kick" } satisfies KickMessage);
       } catch (err) {

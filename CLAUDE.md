@@ -264,13 +264,22 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   folded. The `data_version` poll remains the level-triggered backstop (the
   kick is edge-triggered and subject to a lost-wakeup race); each kick handler
   is idempotent (the diff / rename is version- or convergence-gated) so a
-  kick+poll double-fire is a harmless no-op. *Carve-out (files):* native `@parcel/watcher` on
-  *external* trees written by other processes IS permitted (transcript files,
-  `.planctl` trees, the zellij-events plugin feed dir at
-  `~/.local/state/keeper/zellij-events/` written by the fn-684 wasm bridge
-  plugin — one append-only `<session>.ndjson` per zellij session); treat an
-  event (or a drop-overrun `err`) as "go look," never as the data — always
-  `fstat` + safe-parse. *Carve-out (processes):* kqueue
+  kick+poll double-fire is a harmless no-op. *The plan-worker now runs this
+  same `data_version` poll too (fn-705 — `PLAN_DB_POLL_MS`, 100ms):* every
+  keeper DB write (the close→approve fold included) drives a single-flight
+  gated rescan that drains the fn-629 `pending` set + re-ingests changed
+  `.planctl` files in ~50ms, so plan/epic emission is realtime end to end and
+  no longer bound by the 60s (now 5s) heartbeat. The poll is on keeper's OWN
+  DB — the sanctioned primitive, not a kernel watcher on it. *Carve-out
+  (files):* native `@parcel/watcher` on *external* trees written by other
+  processes IS permitted (transcript files, `.planctl` trees, the plan-worker's
+  per-repo `.git/logs/HEAD` reflog watch (fn-705 — an external git tree; a
+  commit always appends there, closing the brand-new/never-seen-repo tail where
+  the in-HEAD transition has no other realtime trigger), the zellij-events
+  plugin feed dir at `~/.local/state/keeper/zellij-events/` written by the
+  fn-684 wasm bridge plugin — one append-only `<session>.ndjson` per zellij
+  session); treat an event (or a drop-overrun `err`) as "go look," never as the
+  data — always `fstat` + safe-parse. *Carve-out (processes):* kqueue
   `EVFILT_PROC|NOTE_EXIT` / `pidfd_open`+`epoll` on EXTERNAL process descriptors
   is permitted (exit-watcher), with a post-register `kill(pid,0)` probe and
   `(pid, start_time)` identity guarding pid recycling.
@@ -323,15 +332,18 @@ Every keeper Worker thread follows the same durable contract:
 - **`isMainThread` guard** — a plain `import` of the worker module is inert.
 - **Own `openDb` connection** (read-only for readers); never shares main's.
 - **Typed message protocol** — `{ kind }` for worker→main, `{ type }` for
-  main→worker. Two reader workers accept a `{type:"kick"}` message from main as
-  a supplementary fast-path wake (fn-694 lever B, extended fn-699): the
-  server-worker (second thread, runs `diffTick`) and the tab-namer worker
-  (twelfth thread, runs its rename reconcile tick). Main posts it after
-  `drainToCompletion` returns so the worker reconciles immediately. The kick
-  handler is in the no-self-heal path, so the tick is wrapped in try/catch
-  (log+continue, never propagate) — an uncaught throw there would crash the
-  worker and bounce the daemon. Each worker's `data_version` poll is the
-  stall-recovery backstop, not the primary fast path.
+  main→worker. Three workers accept a `{type:"kick"}` message from main as a
+  supplementary fast-path wake (fn-694 lever B, extended fn-699/fn-705): the
+  server-worker (second thread, runs `diffTick`), the tab-namer worker (twelfth
+  thread, runs its rename reconcile tick) — both kicked after
+  `drainToCompletion` returns so they reconcile immediately — and the
+  plan-worker (fourth thread; kicked off the `set_*_approval` RPC seam into a
+  GATED `recheckPending`, fn-701). The kick handler is in the no-self-heal
+  path, so the tick is wrapped in try/catch (log+continue, never propagate) —
+  an uncaught throw there would crash the worker and bounce the daemon. Each of
+  these workers ALSO runs a `data_version` poll (the plan-worker's is fn-705 —
+  it was the last producer without one) as the level-triggered stall-recovery
+  backstop for its edge-triggered kick, not the primary fast path.
 - **Supervisor-owned lifecycle** — main spawns each worker after migrate + boot
   drain and is the only one that terminates it (`{ type: "shutdown" }`, await
   `close`, then `terminate`). A worker owning an external resource (socket, lock
@@ -386,11 +398,20 @@ firing correctly — check them before concluding it is broken:
   path is not in HEAD). The reducer NEVER reads git/fs/wallclock — the
   gate lives entirely at the producer, per the event-sourcing invariants
   above. A `git commit` does not change the file's worktree bytes so
-  FSEvents will not re-fire on commit; main posts `recheck-pending` on
-  every `GitSnapshot` / `Commit` it writes, and the worker's
-  `recheckPending()` re-runs `onChange` per pending path — a freshly
-  committed path emits its snapshot and leaves pending, no permanent
-  strand. This is the load-bearing harm-fix for the fn-627 duplicate-
+  FSEvents will not re-fire on commit; the `pending` set is drained by FOUR
+  triggers, all running the SAME gated `recheckPending()` (re-run `onChange`
+  per pending path — a freshly committed path emits its snapshot and leaves
+  pending, no permanent strand): main's `recheck-pending` post on every
+  `GitSnapshot` / `Commit` it writes; the fn-705 `data_version` poll (every
+  keeper DB write); the fn-705 per-repo `.git/logs/HEAD` reflog watch (closes
+  the brand-new/never-seen-repo tail where no DB write or recheck post fires);
+  and the lowered 5s heartbeat (the should-never-fire paranoia floor). The
+  gate itself is UNCHANGED — every drain trigger re-runs the in-HEAD probe and
+  leaves a still-uncommitted path in `pending`, so only git-proven-in-HEAD
+  paths emit (the fn-705 realtime work added triggers, never a bypass; the
+  commit-ingest channel's `triggeredByCommit` bypass predates it and is the
+  sole exception, justified because the git-worker enumerated the path from a
+  landed commit). This is the load-bearing harm-fix for the fn-627 duplicate-
   dispatch incident: an epic that planctl wrote but had not yet committed
   is never visible to `computeReadiness`, so the autopilot cannot
   dispatch a worker against it. The planctl side commits at the

@@ -1102,15 +1102,35 @@ dispatch gates) cannot observe it. Critically, the gate lives at the
 (the reducer must never read git / fs / wallclock), so the predicate
 fires once at fold-time on the producer side, never inside the
 `BEGIN IMMEDIATE` transaction. A `git commit` does not change the file's
-worktree bytes so FSEvents will not re-fire on commit; main posts a
-`recheck-pending` message to the worker on every `GitSnapshot` /
-`Commit` it writes, and the worker's `recheckPending()` re-runs
-`onChange` per pending path — a freshly-committed path emits its
-snapshot and leaves the set, with no permanent strand. The gate trusts
-planctl's commit-at-the-seam contract (`~/code/planctl/docs/reference/
-commit-at-mutation-boundary.md` §3): every mutating verb's `output.emit()`
-owns the write→commit transaction inline, so the file is in HEAD by
-the time the envelope `success: true` lands on stdout. As of schema v14, the `epics` projection adds
+worktree bytes so FSEvents will not re-fire on commit; the `pending` set is
+drained by the same gated `recheckPending()` from FOUR triggers. As of fn-705
+the plan producer is realtime end to end, mirroring the eighth-worker
+(autopilot) model: it polls `PRAGMA data_version` on its own read-only
+connection (`PLAN_DB_POLL_MS`, 100ms — the cadence the sibling producers
+share) so every keeper DB write, the close→approve fold included, drives a
+single-flight gated rescan that drains `pending` + re-ingests changed
+`.planctl` files in ~50ms — the realtime complement to the best-effort
+FSEvents subscription, closing the up-to-60s fold lag the heartbeat used to
+impose. It ALSO watches each watched repo's `.git/logs/HEAD` reflog with
+`@parcel/watcher` (a commit always appends there) to close the
+brand-new/never-seen-repo tail, where the in-HEAD transition fires no DB
+write and no `recheck-pending` post — the worker reconciles those external
+reflog watches against its live `pending` repo set. The two remaining drain
+triggers are main's `recheck-pending` post on every `GitSnapshot` / `Commit`
+it writes, and the heartbeat — DEMOTED from a 60s latency floor to a 5s
+should-never-fire paranoia backstop (`RECONCILE_HEARTBEAT_MS`); a
+`"heartbeat"`-tagged backstop emit is now a loud ALARM that every fast path
+missed a change (or a `.planctl` file is genuinely abandoned-uncommitted),
+never normal operation. The poll is a TRIGGER only — it never writes the DB
+nor drives a synthetic event from anything but a parsed `.planctl` file, so
+re-fold determinism is intact. Every drain trigger re-runs the in-HEAD probe
+and a still-uncommitted path stays in `pending` (no fn-627 regression — the
+fn-629 gate is preserved exactly, only the realtime drain triggers are new).
+A freshly-committed path emits its snapshot and leaves the set, with no
+permanent strand. The gate trusts planctl's commit-at-the-seam contract
+(`~/code/planctl/docs/reference/commit-at-mutation-boundary.md` §3): every
+mutating verb's `output.emit()` owns the write→commit transaction inline, so
+the file is in HEAD by the time the envelope `success: true` lands on stdout. As of schema v14, the `epics` projection adds
 `last_validated_at` (TEXT, nullable) — the validation timestamp planctl writes
 via `planctl validate --epic <id>` and the board client renders as a
 `[validated|unvalidated]` pill. As of schema v22, `jobs.config_dir` captures `CLAUDE_CONFIG_DIR` from the
