@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Diagnose server poll-loop stalls",
-  "updated_at": "2026-06-04T00:42:06.342711Z"
+  "updated_at": "2026-06-04T01:26:42.662573Z",
+  "worker_done_at": "2026-06-04T01:26:42.662573Z"
 }

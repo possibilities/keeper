@@ -57,5 +57,5 @@ gets its own test against the pollLoop/diffTick harness.
 - [ ] decision + evidence recorded in Evidence
 
 ## Done summary
-
+Lever C diagnose-only: reproduced the stall signature from real KEEPER_TRACE_SERVER traces against the live 795-epic/2073-job DB. Root cause is NOT diffTick (the post-overrun diffTick is only 20-29ms) but a subagent_invocations refetch storm on the server-worker's single event loop: every fold nudges all ~21 keeper-board subscribers, each of which synchronously refetches the full subagent_invocations set (2005 rows / 665KB frame), serializing 20-84ms handleData bursts that block the poll-loop sleep for 382-538ms. GATED DECISION: out-of-scope for fn-694 (the epic explicitly deferred board subscribeReadiness direct-render). Filed finding + recommend a follow-up epic to cut the board refetch storm (direct-render subagent_invocations patches, OR page/limit the board's subagent_invocations subscription, OR coalesce nudge-driven refetches). No production code change in this task.
 ## Evidence
