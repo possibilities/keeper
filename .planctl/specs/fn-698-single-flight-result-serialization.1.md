@@ -98,5 +98,5 @@ open boards.
 - [ ] README architecture + runQuery JSDoc/call-site updated; full suite green; bench-latency residual band reduced (record in Evidence)
 
 ## Done summary
-
+Added a per-server-instance, single-worldRev result memo: N identical queries at one worldRev share ONE runQuery + ONE JSON.stringify, fanned out as per-conn pre-serialized result lines byte-identical to encodeFrame. Memo wrapped to degrade on any throw; distinct-signature cap never sheds the hot board signature; KEEPER_TRACE_SERVER hit/miss/serialize-once lines added. 115/115 server-worker tests green incl. byte-fidelity (epics+jobs, id present/absent, empty), single-flight counter, both writeFrames encode sites, worldRev-replace, and memo-throw degrade.
 ## Evidence

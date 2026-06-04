@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Per-worldRev result memo + pre-serialized fan-out",
-  "updated_at": "2026-06-04T12:36:52.328985Z"
+  "updated_at": "2026-06-04T12:59:41.158537Z",
+  "worker_done_at": "2026-06-04T12:59:41.158537Z"
 }
