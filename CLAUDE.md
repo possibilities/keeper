@@ -70,19 +70,31 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   server-worker writes only the `approval` field on external `.planctl` JSON
   (atomic temp+rename) and bridges `replay_dead_letter`,
   `set_autopilot_paused`, and `retry_dispatch` to main — it never writes the
-  event log itself. The restore-worker (epic fn-677) is the sole writer of
-  `~/.local/state/keeper/restore.json` — a pure CONSUMER derived side-file
-  that is NOT a projection, NOT in the event log, and never feeds either; the
-  worker carries no `onmessage` handler and writes nothing through main —
-  and under last-non-empty-wins (epic fn-689) an empty descriptor does NOT
-  overwrite a prior populated snapshot, so the file survives reboot /
-  seed-sweep zeroing for `scripts/restore-agents.ts` to read. Test
-  isolation env-var list extends accordingly: `KEEPER_RESTORE_FILE` joins
-  `KEEPER_DB` / `KEEPER_DEAD_LETTER_DIR` / `KEEPER_DROP_LOG` as a path that
-  must be sandbox-overridden in every spawn test so the user's real
-  `restore.json` is never touched. Producer workers (including the autopilot
-  reconciler) feed the log only via main's writable connection; they never
-  write the DB.
+  event log itself. The restore-worker (epic fn-677, two-tier rework fn-702)
+  is the sole writer of `~/.local/state/keeper/restore.json` — a pure
+  CONSUMER derived side-file that is NOT a projection, NOT in the event log,
+  and never feeds either; the worker carries no `onmessage` handler and
+  writes nothing through main. The file is a **two-tier descriptor**
+  `{schema_version: 2, last_session, current}` (the browser "restore previous
+  session" model): `current` is the continuous live mirror (MAY be empty —
+  the fn-689 last-non-empty empty-skip floor is RETIRED), and `last_session`
+  is the FROZEN restore source written ONLY at two seams — boot-promote (the
+  first pulse reads the persisted FILE, not the `seedKilledSweep`-emptied jobs
+  table, and lifts its populated tier forward by precedence `current ‖
+  last_session ‖` v1-legacy `sessions`) and the `>0→0` collapse edge (freeze
+  the high-water peak, NOT the last survivor; a partial collapse freezes
+  nothing). The write gate hashes the WHOLE two-tier file sans per-tier
+  `captured_at` so a freeze forces a write even when `current` is byte-stable;
+  the schema bump (`RESTORE_SCHEMA_VERSION` 1→2 — NO DB `SCHEMA_VERSION` bump,
+  NO `keeper/api.py` change) couples worker-writes-v2 and reader-reads-v2 into
+  one commit. So the frozen `last_session` survives reboot / seed-sweep
+  zeroing for `scripts/restore-agents.ts` to read (it resolves the restore
+  source `last_session ‖ current ‖` v1-legacy `sessions`). Test isolation
+  env-var list extends accordingly: `KEEPER_RESTORE_FILE` joins `KEEPER_DB` /
+  `KEEPER_DEAD_LETTER_DIR` / `KEEPER_DROP_LOG` as a path that must be
+  sandbox-overridden in every spawn test so the user's real `restore.json` is
+  never touched. Producer workers (including the autopilot reconciler) feed
+  the log only via main's writable connection; they never write the DB.
 - **Producer-only liveness probing.** The boot seed sweep and the exit-watcher
   worker are the ONLY places that probe liveness (`kill(pid,0)`, kqueue, pidfd,
   `(pid, start_time)` recycle check). Folds NEVER re-probe — a re-probe inside a

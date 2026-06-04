@@ -3,15 +3,18 @@
  * restore-agents — Chrome-style "restore previous session" for keeper-managed
  * Claude Code agents (epic fn-677, T4). Reads the side-file
  * `~/.local/state/keeper/restore.json` that the restore-worker (T3) maintains
- * under a **last-non-empty-wins** policy (epic fn-689: the worker rewrites
- * the file on content change BUT unconditionally skips an empty descriptor,
- * so the file intentionally outlives reboot / seed-sweep zeroing events and
- * is NOT always current-state — it's the last populated snapshot), and
- * replays each surviving agent back into its original
- * zellij session via `ExecBackend.ensureLaunched` (T2) using the resume
- * command `scripts/resume.ts` and the worker already agree on
- * (`buildResumeCommand` / `resumeTarget`, T1 — the shared `src/resume-descriptor`
- * substrate that makes the three resume-command producers byte-identical).
+ * as a **two-tier descriptor** (epic fn-702, schema v2):
+ * `{ schema_version: 2, last_session, current }`. `last_session` is the FROZEN
+ * restore source (written only at boot-promote + the `>0→0` collapse edge);
+ * `current` is the continuous live mirror. This util resolves the restore
+ * source by precedence — `last_session ‖ current ‖` (v1) legacy top-level
+ * `sessions` — so a reboot that reseeds a smaller live set still offers the
+ * full pre-crash set from the frozen `last_session`. It then replays each
+ * surviving agent back into its original zellij session via
+ * `ExecBackend.ensureLaunched` (T2) using the resume command
+ * `scripts/resume.ts` and the worker already agree on (`buildResumeCommand` /
+ * `resumeTarget`, T1 — the shared `src/resume-descriptor` substrate that makes
+ * the three resume-command producers byte-identical).
  *
  * The side-file is a HINT, not truth — the util always validates each agent
  * against live jobs at restore time (one `query` round-trip for the `jobs`
@@ -57,7 +60,7 @@ import {
 import {
   RESTORE_SCHEMA_VERSION,
   type RestoreAgent,
-  type RestoreDescriptor,
+  type RestoreSession,
 } from "../src/restore-worker";
 import { buildResumeCommand } from "../src/resume-descriptor";
 import type { Job } from "../src/types";
@@ -352,10 +355,12 @@ export function buildLiveJobIdSet(jobs: Job[]): Set<string> {
 }
 
 /**
- * Pure: pick the agents to act on, given the parsed descriptor, the optional
- * `--session` filter, and the live `job_id` skip-set. Returns the per-agent
- * outcome list in stable order: sessions alpha-sorted, agents in their
- * pre-sorted order (the worker sorts by `job_id` on disk).
+ * Pure: pick the agents to act on, given the resolved `sessions` map (the
+ * RESTORE SOURCE — `last_session ‖ current ‖` v1-legacy `sessions`, picked by
+ * {@link loadRestoreFile}), the optional `--session` filter, and the live
+ * `job_id` skip-set. Returns the per-agent outcome list in stable order:
+ * sessions alpha-sorted, agents in their pre-sorted order (the worker sorts
+ * by `job_id` on disk).
  *
  * Exported for tests — this is the heart of the util's selection logic.
  *
@@ -363,17 +368,17 @@ export function buildLiveJobIdSet(jobs: Job[]): Set<string> {
  * to `"restored"` / `"failed"` on the `--apply` path.
  */
 export function planRestore(
-  descriptor: RestoreDescriptor,
+  sessions: Record<string, RestoreSession>,
   sessionFilter: string | null,
   liveSkipSet: Set<string>,
 ): AgentOutcome[] {
   const out: AgentOutcome[] = [];
-  const sessionNames = Object.keys(descriptor.sessions).sort();
+  const sessionNames = Object.keys(sessions).sort();
   for (const sessionName of sessionNames) {
     if (sessionFilter !== null && sessionName !== sessionFilter) {
       continue;
     }
-    const bucket = descriptor.sessions[sessionName];
+    const bucket = sessions[sessionName];
     if (!bucket) {
       continue;
     }
@@ -548,17 +553,50 @@ export function renderOutcomes(
     : `${summary}\n`;
 }
 
+/** Coerce a parsed value to a v2 tier's `sessions` map, or `null` on any
+ * garbage / wrong shape. A tier is `{ captured_at, sessions }`; we only read
+ * `sessions`. A present-but-empty `sessions` ({}) coerces to `null` so the
+ * restore-source precedence chain skips an empty tier. */
+function tierSessionsOrNull(
+  raw: unknown,
+): Record<string, RestoreSession> | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const sessionsRaw = (raw as Record<string, unknown>).sessions;
+  if (
+    sessionsRaw === null ||
+    typeof sessionsRaw !== "object" ||
+    Array.isArray(sessionsRaw)
+  ) {
+    return null;
+  }
+  const sessions = sessionsRaw as Record<string, RestoreSession>;
+  return Object.keys(sessions).length > 0 ? sessions : null;
+}
+
 /**
- * Pure: load the side-file off disk. Returns either the parsed descriptor or
- * a typed reason — caller maps `"missing"` / `"parse-error"` to the no-op
- * exit-0 path, `"future"` to die(), and `"ok"` to the action path.
+ * Pure: load the side-file off disk and resolve the RESTORE SOURCE to a
+ * single `sessions` map. Returns either the resolved map or a typed reason —
+ * caller maps `"missing"` / `"parse-error"` to the no-op exit-0 path,
+ * `"future"` to die(), and `"ok"` to the action path.
+ *
+ * **Two-tier resolution (epic fn-702, schema v2).** The restore source is
+ * picked by precedence: `last_session ‖ current ‖` (v1) legacy top-level
+ * `sessions`. `last_session` is the frozen restore source the worker writes
+ * at boot-promote / collapse-freeze; `current` is the live mirror fallback
+ * (used when `last_session` is empty/absent — e.g. a freshly-written file
+ * that hasn't hit a collapse edge yet); a v1 legacy file's top-level
+ * `sessions` (frozen under the fn-689 last-non-empty-wins policy) is read as
+ * the `last_session` source, not as `current`. The resolved map MAY be empty
+ * ({}) when every tier is empty — "nothing to restore".
  *
  * Exported for tests.
  */
 export async function loadRestoreFile(
   path: string,
 ): Promise<
-  | { kind: "ok"; descriptor: RestoreDescriptor }
+  | { kind: "ok"; sessions: Record<string, RestoreSession> }
   | { kind: "missing" }
   | { kind: "parse-error"; message: string }
   | { kind: "future"; version: number }
@@ -590,19 +628,17 @@ export async function loadRestoreFile(
         typeof rec.schema_version === "number" ? rec.schema_version : NaN,
     };
   }
-  // Coerce defensively — older versions may have minor shape drift; we only
-  // touch `sessions` from here on, so a missing `sessions` falls back to {}.
-  const sessions =
-    rec.sessions != null && typeof rec.sessions === "object"
-      ? (rec.sessions as RestoreDescriptor["sessions"])
-      : {};
-  const descriptor: RestoreDescriptor = {
-    schema_version:
-      typeof rec.schema_version === "number" ? rec.schema_version : 0,
-    captured_at: typeof rec.captured_at === "number" ? rec.captured_at : 0,
-    sessions,
-  };
-  return { kind: "ok", descriptor };
+  // Resolve the restore source by precedence. `last_session` (frozen) wins,
+  // then `current` (live mirror), then a v1 legacy top-level `sessions` block
+  // — treated as a `last_session` source (it was frozen under
+  // last-non-empty-wins, so a single empty post-upgrade pulse must not be
+  // able to mask it). Each `…OrNull` coerces an empty/absent tier to null so
+  // the chain skips it.
+  const v2Last = tierSessionsOrNull(rec.last_session);
+  const v2Current = tierSessionsOrNull(rec.current);
+  const v1Legacy = tierSessionsOrNull({ sessions: rec.sessions });
+  const sessions = v2Last ?? v2Current ?? v1Legacy ?? {};
+  return { kind: "ok", sessions };
 }
 
 async function main(): Promise<void> {
@@ -644,7 +680,7 @@ async function main(): Promise<void> {
     );
   }
 
-  const plan = planRestore(loaded.descriptor, args.session, skipSet);
+  const plan = planRestore(loaded.sessions, args.session, skipSet);
   const shell = process.env.SHELL ?? DEFAULT_SHELL;
 
   if (!args.apply) {

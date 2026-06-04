@@ -26,7 +26,7 @@ import {
   planRestore,
   renderOutcomes,
 } from "../scripts/restore-agents";
-import type { RestoreAgent, RestoreDescriptor } from "../src/restore-worker";
+import type { RestoreAgent, RestoreSession } from "../src/restore-worker";
 import type { Job } from "../src/types";
 
 let tmpDir: string;
@@ -47,7 +47,12 @@ afterEach(() => {
 // classifySchemaVersion — future-refuse / safe-default gate
 // ---------------------------------------------------------------------------
 
-test("classifySchemaVersion returns ok for the current version", () => {
+test("classifySchemaVersion returns ok for the current version (v2)", () => {
+  expect(classifySchemaVersion(2)).toBe("ok");
+});
+
+test("classifySchemaVersion returns ok for an older version (v1)", () => {
+  // v1 is <= RESTORE_SCHEMA_VERSION (now 2), so it falls through, not future.
   expect(classifySchemaVersion(1)).toBe("ok");
 });
 
@@ -62,7 +67,7 @@ test("classifySchemaVersion treats non-numeric schema_version as 0 (ok)", () => 
 });
 
 test("classifySchemaVersion refuses a future version", () => {
-  expect(classifySchemaVersion(2)).toBe("future");
+  expect(classifySchemaVersion(3)).toBe("future");
   expect(classifySchemaVersion(999)).toBe("future");
 });
 
@@ -110,18 +115,23 @@ function fakeAgent(opts: {
   };
 }
 
-function fakeDescriptor(
+/**
+ * Build the resolved `sessions` map `planRestore` now consumes directly
+ * (epic fn-702 reshape — `planRestore` takes the restore-source `sessions`
+ * map, not the full two-tier descriptor).
+ */
+function fakeSessions(
   sessions: Record<string, RestoreAgent[]>,
-): RestoreDescriptor {
-  const out: RestoreDescriptor["sessions"] = {};
+): Record<string, RestoreSession> {
+  const out: Record<string, RestoreSession> = {};
   for (const [name, agents] of Object.entries(sessions)) {
     out[name] = { agents };
   }
-  return { schema_version: 1, captured_at: 1234, sessions: out };
+  return out;
 }
 
 test("planRestore marks every agent would-restore when the skip-set is empty", () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "a" }), fakeAgent({ job_id: "b" })],
   });
   const plan = planRestore(desc, null, new Set());
@@ -129,7 +139,7 @@ test("planRestore marks every agent would-restore when the skip-set is empty", (
 });
 
 test("planRestore skips agents whose job_id is in the live skip-set", () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "live" }), fakeAgent({ job_id: "dead" })],
   });
   const plan = planRestore(desc, null, new Set(["live"]));
@@ -141,7 +151,7 @@ test("planRestore skips agents whose job_id is in the live skip-set", () => {
 });
 
 test("planRestore respects the --session filter (single session)", () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "a" })],
     side: [fakeAgent({ job_id: "b" })],
   });
@@ -152,14 +162,14 @@ test("planRestore respects the --session filter (single session)", () => {
 });
 
 test("planRestore session filter that matches no session yields an empty plan", () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "a" })],
   });
   expect(planRestore(desc, "nope", new Set())).toEqual([]);
 });
 
 test("planRestore visits sessions in alpha-sorted order", () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     zeta: [fakeAgent({ job_id: "z1" })],
     alpha: [fakeAgent({ job_id: "a1" })],
     mid: [fakeAgent({ job_id: "m1" })],
@@ -222,7 +232,7 @@ test("buildResumeLaunchArgv includes --plugin-dir when tier is set", () => {
 // ---------------------------------------------------------------------------
 
 test("applyRestore is a no-op for non-would-restore entries (skipped-live carries through)", async () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "a" }), fakeAgent({ job_id: "b" })],
   });
   const plan = planRestore(desc, null, new Set(["a"]));
@@ -244,7 +254,7 @@ test("applyRestore is a no-op for non-would-restore entries (skipped-live carrie
 });
 
 test("applyRestore continues past a single agent's launch failure", async () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "fail" }), fakeAgent({ job_id: "ok" })],
   });
   const plan = planRestore(desc, null, new Set());
@@ -267,7 +277,7 @@ test("applyRestore continues past a single agent's launch failure", async () => 
 });
 
 test("applyRestore traps a thrown ensureLaunched and marks the entry failed", async () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "boom" })],
   });
   const plan = planRestore(desc, null, new Set());
@@ -284,7 +294,7 @@ test("applyRestore traps a thrown ensureLaunched and marks the entry failed", as
 });
 
 test("applyRestore makes ZERO ensureLaunched calls when the plan is all skipped-live", async () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "a" }), fakeAgent({ job_id: "b" })],
   });
   const plan = planRestore(desc, null, new Set(["a", "b"]));
@@ -306,7 +316,7 @@ test("applyRestore makes ZERO ensureLaunched calls when the plan is all skipped-
 // ---------------------------------------------------------------------------
 
 test("renderOutcomes dry-run summary names would-restore + skipped-live", () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "a" }), fakeAgent({ job_id: "b" })],
   });
   const plan = planRestore(desc, null, new Set(["a"]));
@@ -317,7 +327,7 @@ test("renderOutcomes dry-run summary names would-restore + skipped-live", () => 
 });
 
 test("renderOutcomes apply summary names restored / skipped-live / failed", async () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     autopilot: [
       fakeAgent({ job_id: "x" }),
       fakeAgent({ job_id: "y" }),
@@ -343,7 +353,7 @@ test("renderOutcomes apply summary names restored / skipped-live / failed", asyn
 });
 
 test("renderOutcomes labels use the resolved title, not the session id", () => {
-  const desc = fakeDescriptor({
+  const desc = fakeSessions({
     autopilot: [
       fakeAgent({
         job_id: "sess-aaaa",
@@ -386,39 +396,86 @@ test("loadRestoreFile returns parse-error when top-level isn't an object", async
   expect(res.kind).toBe("parse-error");
 });
 
-test("loadRestoreFile returns future when schema_version is from the future", async () => {
+test("loadRestoreFile returns future when schema_version is from the future (v3)", async () => {
   writeFileSync(
     restorePath,
-    JSON.stringify({ schema_version: 999, sessions: {} }),
+    JSON.stringify({ schema_version: 3, current: { sessions: {} } }),
     "utf8",
   );
   const res = await loadRestoreFile(restorePath);
   expect(res.kind).toBe("future");
-  expect((res as { version: number }).version).toBe(999);
+  expect((res as { version: number }).version).toBe(3);
 });
 
-test("loadRestoreFile returns ok for a current-version file", async () => {
-  const descriptor: RestoreDescriptor = {
-    schema_version: 1,
-    captured_at: 1234,
-    sessions: {
-      autopilot: { agents: [fakeAgent({ job_id: "a" })] },
-    },
-  };
-  writeFileSync(restorePath, JSON.stringify(descriptor), "utf8");
-  const res = await loadRestoreFile(restorePath);
+function okSessions(
+  res: Awaited<ReturnType<typeof loadRestoreFile>>,
+): Record<string, RestoreSession> {
   expect(res.kind).toBe("ok");
-  expect(
-    (res as { descriptor: RestoreDescriptor }).descriptor.sessions.autopilot
-      .agents[0].job_id,
-  ).toBe("a");
+  return (res as { sessions: Record<string, RestoreSession> }).sessions;
+}
+
+test("loadRestoreFile v2: resolves the restore source to last_session", async () => {
+  // Both tiers populated — last_session (frozen) wins over current (mirror).
+  writeFileSync(
+    restorePath,
+    JSON.stringify({
+      schema_version: 2,
+      last_session: {
+        captured_at: 100,
+        sessions: { autopilot: { agents: [fakeAgent({ job_id: "frozen" })] } },
+      },
+      current: {
+        captured_at: 200,
+        sessions: { autopilot: { agents: [fakeAgent({ job_id: "live" })] } },
+      },
+    }),
+    "utf8",
+  );
+  const sessions = okSessions(await loadRestoreFile(restorePath));
+  expect(sessions.autopilot.agents[0].job_id).toBe("frozen");
 });
 
-test("loadRestoreFile tolerates a missing sessions field with empty default", async () => {
-  writeFileSync(restorePath, JSON.stringify({ schema_version: 1 }), "utf8");
-  const res = await loadRestoreFile(restorePath);
-  expect(res.kind).toBe("ok");
-  expect(
-    (res as { descriptor: RestoreDescriptor }).descriptor.sessions,
-  ).toEqual({});
+test("loadRestoreFile v2: falls back to current when last_session is empty", async () => {
+  writeFileSync(
+    restorePath,
+    JSON.stringify({
+      schema_version: 2,
+      last_session: { captured_at: 100, sessions: {} },
+      current: {
+        captured_at: 200,
+        sessions: { autopilot: { agents: [fakeAgent({ job_id: "live" })] } },
+      },
+    }),
+    "utf8",
+  );
+  const sessions = okSessions(await loadRestoreFile(restorePath));
+  expect(sessions.autopilot.agents[0].job_id).toBe("live");
+});
+
+test("loadRestoreFile v1: reads legacy top-level sessions as the last_session source", async () => {
+  // A pre-fn-702 v1 file frozen under last-non-empty-wins.
+  writeFileSync(
+    restorePath,
+    JSON.stringify({
+      schema_version: 1,
+      captured_at: 1234,
+      sessions: { autopilot: { agents: [fakeAgent({ job_id: "v1" })] } },
+    }),
+    "utf8",
+  );
+  const sessions = okSessions(await loadRestoreFile(restorePath));
+  expect(sessions.autopilot.agents[0].job_id).toBe("v1");
+});
+
+test("loadRestoreFile resolves to {} when every tier is empty", async () => {
+  writeFileSync(
+    restorePath,
+    JSON.stringify({
+      schema_version: 2,
+      last_session: { captured_at: 1, sessions: {} },
+      current: { captured_at: 2, sessions: {} },
+    }),
+    "utf8",
+  );
+  expect(okSessions(await loadRestoreFile(restorePath))).toEqual({});
 });

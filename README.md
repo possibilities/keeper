@@ -444,14 +444,16 @@ Keeper has no `install` verb. Wire it up manually:
    `KEEPER_DEAD_LETTER_DIR` (directory for per-pid dead-letter NDJSON
    recovery files, default `~/.local/state/keeper/dead-letters/`) — tests
    that spawn the real hook MUST override both to keep production
-   diagnostic feeds clean. The restore worker (epic fn-677) writes
-   `~/.local/state/keeper/restore.json` (the Chrome-style "restore
-   previous session" snapshot — agents + zellij metadata for
-   `scripts/restore-agents.ts` to replay against — maintained under a
-   **last-non-empty-wins** policy: the worker rewrites the file on
-   content change but UNCONDITIONALLY skips an empty descriptor, so
-   reboot / seed-sweep zeroing never destroys the pre-crash snapshot
-   — epic fn-689), overridable via `KEEPER_RESTORE_FILE` for tests. Set
+   diagnostic feeds clean. The restore worker (epic fn-677, two-tier
+   rework fn-702) writes `~/.local/state/keeper/restore.json` (the
+   Chrome-style "restore previous session" snapshot — agents + zellij
+   metadata for `scripts/restore-agents.ts` to replay against) as a
+   **two-tier descriptor** `{schema_version: 2, last_session, current}`:
+   `current` is the continuous live mirror (may be empty — the fn-689
+   empty-skip floor is retired), and `last_session` is the FROZEN restore
+   source written only at boot-promote and the `>0→0` collapse edge, so a
+   reboot that reseeds a smaller set still offers the full pre-crash set
+   from `last_session`. Overridable via `KEEPER_RESTORE_FILE` for tests. Set
    `KEEPER_TRACE_SERVER=1` to enable verbose server-worker diagnostic logging
    — `[srv-ts]` stage timings, frame byte counts, connection lifecycle — on
    `server.stderr`; off by default (the rare `[server-worker]` error class is
@@ -1716,34 +1718,55 @@ the plugin reloads. Rollback to the poller is a single `git revert`
 of the fn-684 task .5 commit — the poller worker is retired, not
 gated.
 
-A **tenth** Worker thread is the restore-snapshot worker (epic fn-677):
-a pure CONSUMER that opens its own read-only connection, polls
-`PRAGMA data_version` via the shared `watchLoop` primitive, and on every
-change reads the `jobs` + `epics` projections through the same `runQuery`
-read seam the autopilot worker uses. It builds a stable
-{`schema_version`, `captured_at`, `sessions`} descriptor of the live
-(`working` / `stopped`) jobs grouped by zellij `backend_exec_session_id`,
-hashes the serialized bytes (excluding `captured_at` so an informational
-timestamp doesn't churn the hash on every pulse), and rewrites
-`~/.local/state/keeper/restore.json` via `atomicWriteFile` under a
-**last-non-empty-wins** policy (epic fn-689): the worker UNCONDITIONALLY
-skips the write when the descriptor's `sessions` map is empty, and
-otherwise rewrites only when the hash differs from the in-memory
-`lastHash`. The empty-skip is what makes the file useful — without it
-the reboot / seed-sweep zeroing window (fresh-process `lastHash===null`
-+ an already-emptied live set from `seedKilledSweep`) would overwrite
-the pre-crash snapshot with `{sessions:{}}`, exactly when
-`scripts/restore-agents.ts` needs it. The file is a derived
-side-file — NOT a projection, NOT in the event log — so the worker
-sidesteps the event-sourcing invariants entirely (no schema bump, no
-reducer arm, no `keeper/api.py` whitelist change). The worker carries no
-`onmessage` handler — it never posts to main, never writes the DB. Write
-failures are swallowed to stderr (next pulse retries); only an unhandled
-throw out of the watch loop escalates to `onerror`/`close` → fatalExit.
-The `scripts/restore-agents.ts` util is the sole reader; its `--apply`
-mode relaunches the surviving agents via the exact `claude --resume`
-shape `scripts/resume.ts` emits, deduplicated against jobs still live in
-the projection.
+A **tenth** Worker thread is the restore-snapshot worker (epic fn-677,
+two-tier rework fn-702): a pure CONSUMER that opens its own read-only
+connection, polls `PRAGMA data_version` via the shared `watchLoop`
+primitive, and on every change reads the `jobs` + `epics` projections
+through the same `runQuery` read seam the autopilot worker uses. It builds
+a stable `{captured_at, sessions}` TIER of the live (`working` / `stopped`)
+jobs grouped by zellij `backend_exec_session_id` and rewrites
+`~/.local/state/keeper/restore.json` via `atomicWriteFile` as a **two-tier
+descriptor** — `{schema_version: 2, last_session, current}`, the browser
+"restore previous session" model (Chrome "Current Session" / "Last
+Session"):
+
+- **`current`** — the continuous live mirror. Rewritten on every content
+  change (MAY be empty: the fn-689 last-non-empty empty-skip floor is
+  RETIRED). NOT the restore source.
+- **`last_session`** — the FROZEN restore source, written ONLY at two
+  discrete seams. (1) **Boot-promote:** the first pulse reads the persisted
+  FILE — not the seed-swept `jobs` table, which `seedKilledSweep` has
+  already emptied by the time the worker spawns, so the file is the only
+  pre-crash evidence — and lifts its populated tier forward by precedence
+  `current ‖ last_session ‖` (v1) legacy top-level `sessions`. (2) **The
+  `>0→0` collapse edge:** when the live set drains to empty, the worker
+  freezes the high-water peak (the full pre-collapse count tracked since
+  the set was last empty, NOT the last survivor) into `last_session`; the
+  epoch resets only on a successful write, so a freeze-write failure
+  retries on the next empty pulse. A partial collapse (survivors remain,
+  never reaching 0) freezes nothing by design — it relies on the next
+  boot-promote to capture the survivors.
+
+The write gate hashes the WHOLE two-tier file (excluding each tier's
+`captured_at` so an informational timestamp doesn't churn the hash), so a
+`last_session` freeze forces a write even when `current` is byte-stable.
+This fixes the observed 8→2 reboot incident: a reboot that reseeds a
+smaller live set still offers the full pre-crash set from the frozen
+`last_session`. The file is a derived side-file — NOT a projection, NOT in
+the event log — so the worker sidesteps the event-sourcing invariants
+entirely (no DB `SCHEMA_VERSION` bump, no reducer arm, no `keeper/api.py`
+whitelist change; only the side-file's own `RESTORE_SCHEMA_VERSION` bumps
+1→2). The worker carries no `onmessage` handler — it never posts to main,
+never writes the DB. Write failures are swallowed to stderr (next pulse
+retries); only an unhandled throw out of the watch loop escalates to
+`onerror`/`close` → fatalExit. The `scripts/restore-agents.ts` util is the
+sole reader; it resolves the restore source `last_session ‖ current ‖`
+(v1) legacy `sessions`, and its `--apply` mode relaunches the surviving
+agents via the exact `claude --resume` shape `scripts/resume.ts` emits,
+deduplicated against jobs still live in the projection. The schema bump is
+the load-bearing coupling: the moment the worker writes
+`schema_version: 2`, the OLD reader treats it as "future" and refuses, so
+the v2 writer and v2 reader ship in the same commit.
 
 An **eleventh** Worker thread is the tab-namer worker (epic fn-680,
 reworked fn-699): a pure SIDE-EFFECTOR that opens its own read-only

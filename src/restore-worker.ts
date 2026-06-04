@@ -9,19 +9,35 @@
  * the wake worker and autopilot worker use), the worker reads the `jobs` +
  * `epics` projections off its own read-only connection via the shared
  * {@link runQuery} server-worker read seam, builds a pure
- * {@link buildRestoreDescriptor} snapshot of the live jobs grouped by zellij
+ * {@link buildRestoreTier} snapshot of the live jobs grouped by zellij
  * `backend_exec_session_id`, stable-serializes it (sorted keys, ASCII-escaped
  * — same shape `serializePlanctlJson` produces), hashes the serialized bytes,
- * and rewrites `~/.local/state/keeper/restore.json` via `atomicWriteFile`
- * under a **last-non-empty-wins** policy: the worker UNCONDITIONALLY skips
- * the write when the descriptor's `sessions` map is empty (preserving the
- * last populated snapshot on disk), and otherwise rewrites only when the
- * hash differs from the in-memory `lastHash`. The empty-skip survives the
- * reboot / seed-sweep zeroing window (fn-689) where a fresh-process
- * `lastHash===null` + an already-emptied live set would otherwise destroy
- * the pre-crash snapshot — exactly when `scripts/restore-agents.ts` needs
- * it. Browser "restore previous session" semantics: never overwrite a
- * populated session file with an empty payload.
+ * and rewrites `~/.local/state/keeper/restore.json` via `atomicWriteFile`.
+ *
+ * **Two-tier model (epic fn-702, schema v2).** The file carries
+ * `{ schema_version: 2, last_session, current }` where each tier is a
+ * `{ captured_at, sessions }` snapshot:
+ *  - `current` — the continuous live mirror. Rewritten on every content
+ *    change (MAY be empty: the fn-689 last-non-empty empty-skip floor is
+ *    RETIRED). NOT the restore source.
+ *  - `last_session` — the frozen restore source, written ONLY at two discrete
+ *    seams: BOOT-PROMOTE (the first pulse lifts the persisted file's
+ *    populated tier forward — `current ‖ last_session ‖` v1-legacy `sessions`
+ *    — because the worker's own DB read at boot already sees the
+ *    `seedKilledSweep`-emptied set, so the FILE is the only pre-crash
+ *    evidence) and the `>0→0` COLLAPSE EDGE (the live set drains to empty,
+ *    freezing the high-water peak since the set was last empty — the full
+ *    pre-collapse count, not the last survivor). The write gate is an
+ *    in-memory `lastHash` over the WHOLE two-tier file (sans per-tier
+ *    `captured_at`), so a `last_session` freeze forces a write even when
+ *    `current` is byte-stable.
+ *
+ * This is the browser "restore previous session" model (Chrome "Current
+ * Session" / "Last Session"): the live mirror is decoupled from the frozen
+ * restore source, so a reboot that reseeds a smaller set (the observed 8→2
+ * incident) offers the full pre-crash 8 from `last_session`. A partial
+ * collapse (survivors remain, never reaching 0) freezes nothing by design —
+ * it relies on the next boot-promote to capture the survivors.
  *
  * The restore file is a derived side-file, NOT an event-log projection: it
  * sidesteps the event-sourcing invariants entirely (no schema bump, no
@@ -52,7 +68,7 @@
  * autopilot's snapshot does with its own informational timestamps.
  */
 
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import {
@@ -94,8 +110,16 @@ export interface ShutdownMessage {
  * restore-agents util refuse to act on a future-version file rather than
  * trust garbage. Bump only when the on-disk descriptor shape changes in a
  * way restore-agents must adapt to.
+ *
+ * **v2 (epic fn-702): two-tier shape.** The descriptor splits into a frozen
+ * `last_session` restore source and a continuously-mirrored `current`. The
+ * schema bump is the load-bearing coupling — the moment the worker writes
+ * `schema_version: 2`, the OLD reader's `classifySchemaVersion` treats it as
+ * "future" and refuses, so the v2 writer and the v2 reader MUST ship in the
+ * same commit. No DB `SCHEMA_VERSION` bump and no `keeper/api.py` change: the
+ * restore file is a non-projection side-file with its own version.
  */
-export const RESTORE_SCHEMA_VERSION = 1;
+export const RESTORE_SCHEMA_VERSION = 2;
 
 /**
  * Per-agent record under a session bucket. One per live (`working` / `stopped`)
@@ -135,23 +159,48 @@ export interface RestoreSession {
 }
 
 /**
- * The full on-disk descriptor. `captured_at` is INCLUDED in the serialized
+ * One tier of the two-tier descriptor (epic fn-702). A snapshot of the live
+ * jobs at a moment in time: the `sessions` map plus the `captured_at`
+ * timestamp of when it was taken. `captured_at` is INCLUDED in the serialized
  * file (informational — the util surfaces it in the dry-run header) but
  * EXCLUDED from the hashed shape (or every tick would churn the file). The
- * `sessions` field is an object keyed by zellij session name; alpha key
- * sort happens at serialize time via `sortObjectKeys`.
+ * `sessions` field is an object keyed by zellij session name; alpha key sort
+ * happens at serialize time via `sortObjectKeys`.
  */
-export interface RestoreDescriptor {
-  schema_version: number;
+export interface RestoreTier {
   captured_at: number;
   sessions: Record<string, RestoreSession>;
 }
 
 /**
- * Build the restore descriptor from the projection rows. PURE — no I/O, no
- * Date.now() (the `capturedAt` value is threaded in by the caller), no env
- * reads. Exported for unit reach: the tests drive this directly off a
- * seeded writer DB.
+ * The full on-disk descriptor (epic fn-702, schema v2). Two tiers, mirroring
+ * a browser's "restore previous session" model:
+ *
+ *  - `current` — the continuous live mirror. Rewritten on every content
+ *    change of the live set (MAY be empty: the fn-689 empty-skip floor is
+ *    retired here). It is NOT the restore source.
+ *  - `last_session` — the frozen restore source. Written ONLY at two discrete
+ *    seams: boot-promote (the worker's first pulse lifts the persisted file's
+ *    populated tier forward) and the `>0→0` collapse edge (the live set
+ *    drains to empty, freezing the high-water peak since the set was last
+ *    empty). NEVER mirrored on every shrink — freezing on each shrink would
+ *    restore agents the human deliberately stopped (the Chrome/Firefox model).
+ *
+ * Either tier MAY be `null` (no snapshot yet). `scripts/restore-agents.ts`
+ * resolves the restore source as `last_session ‖ current ‖` (v1) legacy
+ * top-level `sessions`.
+ */
+export interface RestoreDescriptor {
+  schema_version: number;
+  last_session: RestoreTier | null;
+  current: RestoreTier | null;
+}
+
+/**
+ * Build one restore TIER (the `current` snapshot) from the projection rows.
+ * PURE — no I/O, no Date.now() (the `capturedAt` value is threaded in by the
+ * caller), no env reads. Exported for unit reach: the tests drive this
+ * directly off a seeded writer DB.
  *
  * Filtering:
  *  - Only `working` and `stopped` jobs survive — the same "live" cutoff
@@ -172,12 +221,16 @@ export interface RestoreDescriptor {
  * Pre-resolution: `tierForJobFromEpics` runs once per agent against the
  * provided `epicsById` map, so the restore-agents util doesn't need to
  * re-fetch epics to rebuild the resume command — the tier rides the file.
+ *
+ * The returned tier MAY be empty (`sessions: {}`) — the fn-689 empty-skip
+ * floor is retired (epic fn-702); an empty live set yields an empty `current`
+ * tier without losing `last_session`.
  */
-export function buildRestoreDescriptor(
+export function buildRestoreTier(
   jobs: Job[],
   epicsById: Map<string, Epic>,
   capturedAt: number,
-): RestoreDescriptor {
+): RestoreTier {
   const sessions: Record<string, RestoreSession> = {};
   for (const job of jobs) {
     if (job.state !== "working" && job.state !== "stopped") {
@@ -211,36 +264,70 @@ export function buildRestoreDescriptor(
       a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0,
     );
   }
-  return {
-    schema_version: RESTORE_SCHEMA_VERSION,
-    captured_at: capturedAt,
-    sessions,
-  };
+  return { captured_at: capturedAt, sessions };
+}
+
+/** Count the agents across every session bucket in a tier (the high-water
+ * comparison metric). A `null` tier counts as 0. */
+export function tierAgentCount(tier: RestoreTier | null): number {
+  if (tier == null) {
+    return 0;
+  }
+  let n = 0;
+  for (const bucket of Object.values(tier.sessions)) {
+    n += bucket.agents.length;
+  }
+  return n;
+}
+
+/** True when a tier carries at least one session bucket (the
+ * `buildRestoreTier` invariant means a present bucket is always non-empty,
+ * so an empty `sessions` object is the exact emptiness test). */
+export function tierIsPopulated(tier: RestoreTier | null): boolean {
+  return tier != null && Object.keys(tier.sessions).length > 0;
+}
+
+/** Strip a tier's `captured_at` for hashing (or `null` passes through). The
+ * informational timestamp must not churn the hash on every pulse. */
+function tierForHash(
+  tier: RestoreTier | null,
+): { sessions: Record<string, RestoreSession> } | null {
+  if (tier == null) {
+    return null;
+  }
+  const { captured_at: _capturedAt, ...rest } = tier;
+  return rest;
 }
 
 /**
- * Stable-serialize the descriptor for HASHING. Strips `captured_at` so the
- * informational timestamp doesn't churn the hash on every pulse, then runs
- * the same `sortObjectKeys` → `JSON.stringify(_, null, 2)` → ASCII-escape →
- * trailing-`\n` pipeline `serializePlanctlJson` uses for `.planctl` files.
- * Exported for unit reach (the tests drive the "did content change" gate
- * directly).
+ * Stable-serialize the WHOLE two-tier descriptor for HASHING. Strips each
+ * tier's `captured_at` so the informational timestamps don't churn the hash
+ * on every pulse, then runs the same `sortObjectKeys` → `JSON.stringify(_,
+ * null, 2)` → ASCII-escape → trailing-`\n` pipeline `serializePlanctlJson`
+ * uses for `.planctl` files. Exported for unit reach (the tests drive the
+ * "did content change" gate directly).
  *
- * The disk write itself goes through `serializeForWrite` (with the timestamp
- * intact); only the hash input strips it.
+ * The hash scope covers the ENTIRE file (both tiers + `schema_version`, sans
+ * per-tier `captured_at`) — so a `last_session` freeze forces a write even
+ * when `current` is byte-stable. The disk write itself goes through
+ * {@link serializeForWrite} (with the timestamps intact); only the hash
+ * input strips them.
  */
 export function serializeForHash(descriptor: RestoreDescriptor): string {
-  const { captured_at: _capturedAt, ...rest } = descriptor;
-  return serializePlanctlJson(rest);
+  return serializePlanctlJson({
+    schema_version: descriptor.schema_version,
+    last_session: tierForHash(descriptor.last_session),
+    current: tierForHash(descriptor.current),
+  });
 }
 
 /**
  * Stable-serialize the descriptor for DISK. Same pipeline as
- * {@link serializeForHash} but keeps `captured_at` so a human (or the
- * restore-agents util) can see when the snapshot was last written. The
- * `sortObjectKeys` pass in `serializePlanctlJson` alpha-sorts every nested
- * object's keys, including the `sessions` map's session-name keys, so the
- * output is byte-stable across SELECT order shuffles.
+ * {@link serializeForHash} but keeps each tier's `captured_at` so a human
+ * (or the restore-agents util) can see when the snapshot was last written.
+ * The `sortObjectKeys` pass in `serializePlanctlJson` alpha-sorts every
+ * nested object's keys, including the `sessions` map's session-name keys, so
+ * the output is byte-stable across SELECT order shuffles.
  */
 export function serializeForWrite(descriptor: RestoreDescriptor): string {
   // Run the descriptor through sortObjectKeys explicitly so the test suite
@@ -250,17 +337,158 @@ export function serializeForWrite(descriptor: RestoreDescriptor): string {
   return serializePlanctlJson(sortObjectKeys(descriptor));
 }
 
-/** One restore pulse — read projections, build descriptor, gate, write. */
+/**
+ * Coerce an arbitrary parsed value to a {@link RestoreTier}, or `null` on any
+ * garbage / wrong shape. Mirrors {@link parseZellijWatermarks}'s defensive
+ * coercion: never throws, always returns either a well-formed tier or `null`.
+ * The agent records themselves are NOT deep-validated — the reader
+ * (`scripts/restore-agents.ts`) only reads them, and a malformed agent is the
+ * producer's invariant violation, not the boot-read's concern.
+ */
+function coerceTier(raw: unknown): RestoreTier | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const rec = raw as Record<string, unknown>;
+  const sessionsRaw = rec.sessions;
+  if (
+    sessionsRaw === null ||
+    typeof sessionsRaw !== "object" ||
+    Array.isArray(sessionsRaw)
+  ) {
+    return null;
+  }
+  const captured_at =
+    typeof rec.captured_at === "number" && Number.isFinite(rec.captured_at)
+      ? rec.captured_at
+      : 0;
+  return {
+    captured_at,
+    sessions: sessionsRaw as Record<string, RestoreSession>,
+  };
+}
+
+/**
+ * The persisted-file view the boot-promote read resolves to. Carries the two
+ * v2 tiers PLUS the v1 legacy top-level `sessions` block (frozen under the
+ * fn-689 last-non-empty-wins policy — so it is treated as a `last_session`
+ * source, not as `current`).
+ */
+export interface PersistedRestore {
+  last_session: RestoreTier | null;
+  current: RestoreTier | null;
+  /** v1 legacy top-level `sessions` as a tier, else `null`. */
+  legacy: RestoreTier | null;
+}
+
+/**
+ * Parse the persisted `restore.json` text for boot-promote. SYNCHRONOUS,
+ * never throws — mirrors {@link parseZellijWatermarks} + the daemon's boot
+ * read at `src/daemon.ts:676-689`. Any garbage / non-object / wrong shape
+ * coerces each tier to `null`. Exported for unit reach.
+ *
+ * Reads three sources so boot-promote can apply the precedence chain:
+ *  - v2 `current` / `last_session` tiers.
+ *  - v1 legacy top-level `sessions` (a pre-fn-702 file frozen under
+ *    last-non-empty-wins) lifted into a `legacy` tier — treated as a
+ *    `last_session` source so a single empty post-upgrade pulse cannot
+ *    clobber it.
+ */
+export function parsePersistedRestore(text: string): PersistedRestore {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { last_session: null, current: null, legacy: null };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { last_session: null, current: null, legacy: null };
+  }
+  const rec = parsed as Record<string, unknown>;
+  const last_session = coerceTier(rec.last_session);
+  const current = coerceTier(rec.current);
+  // v1 legacy: a top-level `sessions` block with no tier wrapper. Synthesize
+  // a tier (captured_at falls back to the legacy file's top-level value, else
+  // 0). Only present in pre-fn-702 files; a v2 file has no top-level
+  // `sessions`, so `legacy` is null there.
+  const legacy = coerceTier({
+    captured_at: rec.captured_at,
+    sessions: rec.sessions,
+  });
+  return { last_session, current, legacy };
+}
+
+/**
+ * Read + parse the persisted `restore.json` off disk for boot-promote.
+ * SYNCHRONOUS, never throws — `existsSync` → `readFileSync` → safe parse.
+ * Returns all-`null` tiers on a missing file or any read/parse failure (the
+ * first-ever-boot path). Exported for unit reach.
+ */
+export function readPersistedRestore(restorePath: string): PersistedRestore {
+  if (!existsSync(restorePath)) {
+    return { last_session: null, current: null, legacy: null };
+  }
+  let text: string;
+  try {
+    text = readFileSync(restorePath, "utf8");
+  } catch (err) {
+    console.error(
+      `[restore-worker] boot read of ${restorePath} failed (degrading to empty): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return { last_session: null, current: null, legacy: null };
+  }
+  return parsePersistedRestore(text);
+}
+
+/**
+ * One restore pulse's mutable state. Two-tier model (epic fn-702):
+ *
+ *  - `lastHash` — the in-memory write-dedup gate over the WHOLE two-tier file
+ *    (sans per-tier `captured_at`); a `last_session` freeze flips the file
+ *    shape so the hash changes and forces a write.
+ *  - `parentDirEnsured` — once-flag for the parent-dir mkdir.
+ *  - `epochHighWater` — the full descriptor TIER of the peak live set since it
+ *    was last empty (a SNAPSHOT, not a count). Captured so a `>0→0` collapse
+ *    freezes the richest snapshot, not the last survivor. Reset to `null` once
+ *    a freeze succeeds (a new epoch begins).
+ *  - `lastSession` — the frozen restore source tier (or `null`). Written ONLY
+ *    at boot-promote and the collapse-freeze edge.
+ *  - `bootPromoted` — once-flag; the first pulse reads the persisted FILE and
+ *    seeds `lastSession` before mirroring `current`.
+ */
 interface PulseState {
   lastHash: string | null;
   parentDirEnsured: boolean;
+  epochHighWater: RestoreTier | null;
+  lastSession: RestoreTier | null;
+  bootPromoted: boolean;
 }
 
 /**
  * Drive one restore pulse against the worker's read-only connection. PURE-ish
- * in the same shape as `loadReconcileSnapshot`: reads the projections via
- * the `read(collection)` helper (identical frame shape to the autopilot
- * worker's), builds the descriptor, hashes, writes on change.
+ * in the same shape as `loadReconcileSnapshot`: reads the projections via the
+ * `read(collection)` helper (identical frame shape to the autopilot worker's),
+ * builds the `current` tier, tracks the high-water peak, freezes `last_session`
+ * on the `>0→0` collapse edge, hashes the WHOLE two-tier file, writes on change.
+ *
+ * Two-tier write semantics (epic fn-702):
+ *  - First pulse (`!bootPromoted`): read the persisted FILE (NOT the
+ *    seed-swept jobs table — at boot the live set is already empty) and seed
+ *    `lastSession` from `current ‖ last_session ‖` (v1) legacy `sessions ‖`
+ *    nothing. This survives today's 8→2 reboot incident: `last_session`
+ *    becomes the pre-crash 8, not the reseeded 2.
+ *  - `current` is the continuous live mirror (may be empty — the fn-689
+ *    empty-skip floor is RETIRED).
+ *  - `epochHighWater` tracks the larger (by agent count) of itself and a
+ *    populated `current`.
+ *  - On the `>0→0` collapse edge (empty `current` AND populated high-water),
+ *    FREEZE: `lastSession = epochHighWater`, reset `epochHighWater = null`.
+ *    If the freeze write throws, `epochHighWater` is NOT reset, so the freeze
+ *    retries on the next empty pulse.
+ *  - Always assemble `{ schema_version: 2, last_session, current }` and write
+ *    on a whole-file hash change.
  *
  * Exported for unit reach: tests drive this directly against a seeded writer
  * DB (re-opened read-only for the pulse).
@@ -282,6 +510,26 @@ export function restorePulse(
     return res.type === "result" ? (res.rows as Record<string, unknown>[]) : [];
   };
 
+  // Boot-promote: ONCE, on the first pulse, seed `lastSession` from the
+  // persisted FILE before building `current`. The worker's DB read at boot
+  // sees the post-`seedKilledSweep` empty set, so the persisted file is the
+  // only pre-crash evidence (see CLAUDE.md autopilot/boot ordering). Precedence:
+  // a populated `current` (the live mirror at the moment of the last write)
+  // wins over a `last_session` (which may be stale), then v1 legacy
+  // top-level `sessions`, else nothing.
+  if (!state.bootPromoted) {
+    const persisted = readPersistedRestore(restorePath);
+    if (tierIsPopulated(persisted.current)) {
+      state.lastSession = persisted.current;
+    } else if (tierIsPopulated(persisted.last_session)) {
+      state.lastSession = persisted.last_session;
+    } else if (tierIsPopulated(persisted.legacy)) {
+      state.lastSession = persisted.legacy;
+    }
+    // else: leave state.lastSession as-is (null on first-ever boot).
+    state.bootPromoted = true;
+  }
+
   const jobs = read("jobs") as unknown as Job[];
   const epics = read("epics") as unknown as Epic[];
   const epicsById = new Map<string, Epic>();
@@ -289,21 +537,38 @@ export function restorePulse(
     epicsById.set(epic.epic_id, epic);
   }
 
-  const descriptor = buildRestoreDescriptor(jobs, epicsById, now());
+  const current = buildRestoreTier(jobs, epicsById, now());
 
-  // last-non-empty-wins: UNCONDITIONALLY skip the write whenever the
-  // descriptor is empty, preserving the last populated snapshot on disk.
-  // The skip MUST NOT be gated on `state.lastHash` — on reboot the worker
-  // is a fresh process (`lastHash===null`) and `seedKilledSweep` has
-  // already emptied the live set, so a hash-gated guard would fail to
-  // skip and overwrite the pre-crash file (the fn-689 bug). Returning
-  // BEFORE the hash gate also leaves `state.lastHash` untouched, so a
-  // later non-empty pulse computes a fresh hash and writes correctly.
-  // `buildRestoreDescriptor` never creates empty buckets, so an
-  // empty `sessions` object is an exact emptiness test.
-  if (Object.keys(descriptor.sessions).length === 0) {
-    return;
+  // Track the high-water peak (by agent count) of the live set since it was
+  // last empty. A populated `current` that exceeds the recorded peak replaces
+  // it — so the collapse-freeze captures the RICHEST snapshot, not the last
+  // survivor before the drain to zero.
+  if (
+    tierIsPopulated(current) &&
+    tierAgentCount(current) > tierAgentCount(state.epochHighWater)
+  ) {
+    state.epochHighWater = current;
   }
+
+  // Collapse-freeze: the `>0→0` edge. When `current` drained to empty AND we
+  // have a populated high-water peak, FREEZE the peak into `last_session`.
+  // The reset of `epochHighWater` is GATED on a successful write below — if
+  // the freeze write throws, the peak survives and the freeze retries on the
+  // next empty pulse (the set stays empty, so the edge won't re-fire on its
+  // own). A populated `current` does NOT freeze — `last_session` is written
+  // only at boot-promote and this discrete collapse seam, never on each
+  // shrink (the Chrome/Firefox "Last Session" model).
+  const freezing =
+    !tierIsPopulated(current) && tierIsPopulated(state.epochHighWater);
+  if (freezing) {
+    state.lastSession = state.epochHighWater;
+  }
+
+  const descriptor: RestoreDescriptor = {
+    schema_version: RESTORE_SCHEMA_VERSION,
+    last_session: state.lastSession,
+    current,
+  };
 
   const hashed = serializeForHash(descriptor);
   // `Bun.hash` returns a number — fine for an in-memory dedup key (we never
@@ -311,6 +576,15 @@ export function restorePulse(
   // value, not by Number coercion edge cases.
   const hash = String(Bun.hash(hashed));
   if (state.lastHash === hash) {
+    // No content change → no write. If a freeze was pending but the file is
+    // already byte-stable, `last_session` on disk ALREADY reflects the
+    // high-water peak (the descriptor we hashed carries the frozen tier and
+    // it matched the gate), so the freeze is durable — reset the epoch so the
+    // next peak starts clean. A normal no-op pulse (not freezing) leaves the
+    // peak untouched.
+    if (freezing) {
+      state.epochHighWater = null;
+    }
     return;
   }
 
@@ -333,6 +607,13 @@ export function restorePulse(
   try {
     atomicWriteFile(restorePath, serialized);
     state.lastHash = hash;
+    // The freeze landed durably — start a new epoch. GATED on the write
+    // succeeding: if `atomicWriteFile` throws below, `epochHighWater` is NOT
+    // reset, so the freeze retries on the next empty pulse (the live set
+    // stays empty, so the `>0→0` edge won't re-fire on its own).
+    if (freezing) {
+      state.epochHighWater = null;
+    }
   } catch (err) {
     // Per design contract: write failure is SWALLOWED to stderr. The next
     // data_version pulse re-runs this; lastHash stays unchanged so we
@@ -364,7 +645,13 @@ function main(): void {
 
   const { db } = openDb(data.dbPath, { readonly: true });
   const restorePath = resolveRestorePath();
-  const state: PulseState = { lastHash: null, parentDirEnsured: false };
+  const state: PulseState = {
+    lastHash: null,
+    parentDirEnsured: false,
+    epochHighWater: null,
+    lastSession: null,
+    bootPromoted: false,
+  };
   let shutdown = false;
 
   parentPort.on("message", (msg: ShutdownMessage | undefined) => {
