@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-701-fast-path-board-epic-removal",
   "bundles": [],
   "closer_done_at": "2026-06-04T17:03:43.041788Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-04T17:03:43.041788Z"
+  "updated_at": "2026-06-04T17:04:48.238953Z"
 }
