@@ -64,5 +64,5 @@ not silently drop a commit.
 - [ ] `bun test test/git-worker.test.ts` passes including the new re-enumeration test
 
 ## Done summary
-
+Confirmed silence mode from live server.stderr: 10 'backstop (heartbeat) emitted' lines for keeper .planctl close commits (fn-702..fn-705) with ZERO 'commit enumeration failed' lines, plus 2 'HEAD divergence for /Users/mike/code/keeper' suppression events — the commit channel went silent and the 60s heartbeat had to recover. Fixed the unconditional lastHeadOidByRoot advance: gated it on enumeration success (new pure decideHeadCacheAdvance helper) so a transient enumerateCommitsInDelta throw HOLDS the head cache and re-enumerates/re-emits planctl-commit-changed on the next HEAD-oid observation. Bounded the spin with COMMIT_ENUM_MAX_RETRIES (5): a permanently corrupt range force-advances with a loud backstop alarm rather than hot-looping. Verified the divergence-wedge path already holds the cache (early return at :1865 before the advance) and re-enumerates the full window on clear — added a test pinning it. Producer-only contract intact (log+continue), no reducer/schema change. 101 git-worker + 80 plan-worker tests pass.
 ## Evidence

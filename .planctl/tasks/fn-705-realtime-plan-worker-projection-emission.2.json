@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "harden fn-681 commit-ingest channel",
-  "updated_at": "2026-06-04T20:31:26.982864Z"
+  "updated_at": "2026-06-04T20:59:24.066011Z",
+  "worker_done_at": "2026-06-04T20:59:24.066011Z"
 }
