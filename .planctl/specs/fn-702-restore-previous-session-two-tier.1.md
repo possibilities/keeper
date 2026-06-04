@@ -117,5 +117,5 @@ spawn test overrides all four state paths
 - [ ] `bun test` green (revised floor tests + new boot-promote / collapse / high-water / v1-compat cases); lint clean.
 
 ## Done summary
-
+Reshaped restore.json into a two-tier descriptor {schema_version:2, last_session, current}: current is the continuous live mirror (fn-689 empty-skip floor retired), last_session is the frozen restore source written only at boot-promote (reads the persisted FILE, precedence current||last_session||v1-legacy sessions) and the >0->0 collapse edge (freezes the high-water peak, not the last survivor). Reader resolves last_session||current||v1-legacy and refuses a v3 file. RESTORE_SCHEMA_VERSION 1->2, no DB schema or keeper-py change. Docs (README tenth-worker + env-var, CLAUDE.md sole-writer) updated; 62 restore tests green.
 ## Evidence
