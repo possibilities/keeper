@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Widen isLiveWorkOccupant to git verdicts",
-  "updated_at": "2026-06-04T16:06:45.289968Z"
+  "updated_at": "2026-06-04T18:16:29.622174Z",
+  "worker_done_at": "2026-06-04T18:16:29.622174Z"
 }

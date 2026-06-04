@@ -64,5 +64,5 @@ style documenting the "git verdict ⟹ done+pending window" implication.
 - [ ] No schema/reducer/keeper-py change; no new BlockReason variant.
 
 ## Done summary
-
+Widened isLiveWorkOccupant to treat git-uncommitted/git-orphans verdicts as mutex occupants so the whole done+approval-pending window holds the per-epic/per-root slot; added per-epic, per-root, git-orphans, and done-gate guard tests plus a verbForVerdict null mirror, and consolidated the CLAUDE.md occupancy docs.
 ## Evidence
