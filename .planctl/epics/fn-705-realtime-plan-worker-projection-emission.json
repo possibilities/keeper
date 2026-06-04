@@ -1,0 +1,18 @@
+{
+  "approval": "pending",
+  "branch_name": "fn-705-realtime-plan-worker-projection-emission",
+  "bundles": [],
+  "created_at": "2026-06-04T20:31:26.982864Z",
+  "depends_on_epics": [],
+  "id": "fn-705-realtime-plan-worker-projection-emission",
+  "last_validated_at": "2026-06-04T20:31:27.012017Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Realtime plan-worker projection emission",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-04T20:31:26.982864Z"
+}
