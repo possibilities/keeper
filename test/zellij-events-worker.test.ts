@@ -315,6 +315,95 @@ test("scanZellijEventsDir resets the watermark on an epoch change (plugin reload
   db.close();
 });
 
+test("scanZellijEventsDir tail-reads an oversize feed instead of skipping it (fn-706.1)", () => {
+  const { db, stmts } = openDb(dbPath);
+  mkdirSync(eventsDir, { recursive: true });
+  seedJob(db, "job-1", "sess-a", "1");
+
+  // The real cap is 16 MiB — too large to materialize per-test — so we
+  // inject a TINY `maxBytes` cap (a pure function arg, not an env read)
+  // to exercise the same tail-read path. Each line is a complete pane
+  // delta for the same (session, pane_id); the LAST line carries the
+  // current tab name we expect to resolve. Pre-fn-706 the whole file
+  // was `continue`-skipped forever (no mint, frozen watermark).
+  const file = join(eventsDir, "sess-a.ndjson");
+  const padLine = serializeLine(
+    makePaneEvent({
+      seq: 1,
+      pane_id: "1",
+      tab_id: "5",
+      tab_name: "pad",
+      epoch: "epoch-big",
+    }),
+  );
+  const tailLine = serializeLine(
+    makePaneEvent({
+      seq: 2,
+      pane_id: "1",
+      tab_id: "9",
+      tab_name: "current-title",
+      epoch: "epoch-big",
+    }),
+  );
+  // ~10 pad lines + the tail line. The injected cap is set BELOW this
+  // total so the window base lands mid-pad-line (forcing the leading
+  // partial discard) yet still contains the tail line.
+  const padBlock = padLine.repeat(10);
+  writeFileSync(file, padBlock + tailLine);
+  const totalSize = padBlock.length + tailLine.length;
+
+  // Cap = just enough to hold the tail line plus a fractional pad line,
+  // so `tailBase = size - cap` slices INTO a pad line (mid-record).
+  const injectedCap = tailLine.length + Math.floor(padLine.length / 2);
+  expect(injectedCap).toBeLessThan(totalSize);
+
+  const errSpy = spyOn(console, "error");
+  try {
+    scanZellijEventsDir(db, stmts, eventsDir, injectedCap);
+  } finally {
+    errSpy.mockRestore();
+  }
+
+  // The oversize path no longer emits the skip warning.
+  const skipped = errSpy.mock.calls.some(
+    (args) =>
+      typeof args[0] === "string" &&
+      args[0].includes("exceeds") &&
+      args[0].includes("skipping"),
+  );
+  expect(skipped).toBe(false);
+
+  // The latest pane snapshot minted from the tail window.
+  const { count, rows } = readBackendExecEvents(db);
+  expect(count).toBeGreaterThanOrEqual(1);
+  const latest = JSON.parse(rows[rows.length - 1]?.data ?? "{}") as {
+    tab_id: string;
+    tab_name: string;
+  };
+  expect(latest.tab_id).toBe("9");
+  expect(latest.tab_name).toBe("current-title");
+
+  // The watermark advanced to the tail-base-relative offset. The feed
+  // ends in a clean `\n` and every complete line in the window was
+  // consumed, so the offset lands at exactly the file size — proving
+  // the `tailBase + discardedPartialBytes + consumedBytesInTail`
+  // arithmetic accounts for the mid-line resync, not `priorOffset + …`.
+  const watermarkPath = join(eventsDir, ".keeperd-watermarks.json");
+  const sidecar = JSON.parse(readFileSync(watermarkPath, "utf8")) as Record<
+    string,
+    { epoch: string; offset: number }
+  >;
+  expect(sidecar["sess-a"]?.epoch).toBe("epoch-big");
+  expect(sidecar["sess-a"]?.offset).toBe(totalSize);
+
+  // Re-scan is idempotent — no new bytes, no new mints.
+  const before = readBackendExecEvents(db).count;
+  scanZellijEventsDir(db, stmts, eventsDir, injectedCap);
+  expect(readBackendExecEvents(db).count).toBe(before);
+
+  db.close();
+});
+
 test("scanZellijEventsDir isolates per-session pane-id collision (same pane_id, different sessions)", () => {
   const { db, stmts } = openDb(dbPath);
   mkdirSync(eventsDir, { recursive: true });

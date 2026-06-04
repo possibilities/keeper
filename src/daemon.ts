@@ -600,12 +600,19 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
  * The plugin appends one ~200-byte line per pane/tab delta, never
  * truncates; over weeks a busy session's file can grow to MiB. 16 MiB
  * matches `MAX_DEAD_LETTER_FILE_BYTES` and bounds the per-scan memory
- * cost. An oversized file is skip-and-logged — never throws — so one
- * pathological file doesn't wedge the rest of the dir scan or the
- * live message loop. The watermark for that file is left untouched so
- * a future hand-truncated re-tail picks up where we'd have been.
+ * cost. An oversized file is TAIL-READ instead of skipped (fn-706.1):
+ * we seek to `max(priorOffset, size - cap)`, discard the partial
+ * leading line to the next `\n`, and parse complete lines only — so a
+ * noisy session degrades to "tail-only" and never freezes forever.
+ * (Superseded the pre-fn-706 skip-and-hand-truncate path, which left
+ * the watermark frozen and silently stopped minting `BackendExecSnapshot`
+ * for the whole session.) Still never throws — bounded memory, one
+ * record lost at the resync seam, the rest of the scan unaffected.
+ *
+ * Exported so a test can drive an oversize tail-read at a small
+ * injected size without materializing a real 16 MiB feed.
  */
-const MAX_ZELLIJ_EVENTS_FILE_BYTES = 16 * 1024 * 1024;
+export const MAX_ZELLIJ_EVENTS_FILE_BYTES = 16 * 1024 * 1024;
 
 // Env-gated tracing (epic fn-704 task .2). Mirrors the `KEEPER_TRACE_SERVER`
 // convention in `server-worker.ts`: read the flag ONCE at module load into a
@@ -705,11 +712,19 @@ const ZELLIJ_WATERMARK_BASENAME = ".keeperd-watermarks.json";
  *
  * Exported so the test surface can drive it directly without spawning
  * the worker — mirrors `scanDeadLetterDir` next door.
+ *
+ * `maxBytes` is the per-file tail-read cap (fn-706.1), defaulting to
+ * the production {@link MAX_ZELLIJ_EVENTS_FILE_BYTES}. It is a pure
+ * function argument — NOT an env read (the scan stays env/wallclock-free
+ * except the synthetic-event `ts`, per the event-sourcing invariants) —
+ * so a test can drive the oversize tail-read path with a tiny injected
+ * cap instead of materializing a real 16 MiB feed.
  */
 export function scanZellijEventsDir(
   db: Database,
   stmts: Stmts,
   dir: string,
+  maxBytes: number = MAX_ZELLIJ_EVENTS_FILE_BYTES,
 ): void {
   // Missing-dir tolerance: task .4's daemon boot `mkdir` covers the
   // production case, but a fresh test harness may not have created
@@ -801,13 +816,6 @@ export function scanZellijEventsDir(
     if (!st.isFile()) {
       continue;
     }
-    if (st.size > MAX_ZELLIJ_EVENTS_FILE_BYTES) {
-      console.error(
-        `[keeperd] zellij-events file ${full} exceeds ${MAX_ZELLIJ_EVENTS_FILE_BYTES} bytes (${st.size}); skipping`,
-      );
-      continue;
-    }
-
     // The session key is the basename without the `.ndjson` suffix —
     // matches the plugin's `/host/<session>.ndjson` naming.
     const sessionKey = name.slice(0, -".ndjson".length);
@@ -818,6 +826,17 @@ export function scanZellijEventsDir(
       // No new bytes since the last scan — nothing to do for this file.
       continue;
     }
+
+    // Tail-read cap (fn-706.1): an oversize feed is read from a bounded
+    // tail window, NOT skipped. The window base is
+    // `max(priorOffset, size - cap)` so a behind-consumer never reads
+    // more than `cap` bytes in one pass; a noisy session degrades to
+    // "tail-only" and the watermark keeps advancing (the pre-fn-706
+    // skip-and-log froze the watermark forever, stopping all
+    // `BackendExecSnapshot` mints for the session). When the base jumps
+    // PAST the prior offset we landed mid-line, so the leading partial
+    // bytes are discarded to the first `\n` below.
+    const tailBase = Math.max(priorOffset, st.size - maxBytes);
 
     let buf: Buffer;
     try {
@@ -831,21 +850,52 @@ export function scanZellijEventsDir(
       continue;
     }
 
-    // Tail from the prior offset. We re-read the whole file (simpler
+    // Tail from the window base. We re-read the whole file (simpler
     // than a streaming seek; bounded by `MAX_ZELLIJ_EVENTS_FILE_BYTES`)
-    // and slice off the already-tailed prefix. The slice MUST be done
+    // and slice off everything before `tailBase`. The slice MUST be done
     // on the Buffer (byte-indexed) before decoding to UTF-8 — slicing
-    // a JS string by `priorOffset` would mix byte offsets (the write
-    // side advances via `Buffer.byteLength`, the file's `st.size` is
-    // in bytes) with UTF-16 code-unit offsets and over-shoot the
-    // moment any consumed line contains a multi-byte character (e.g.
-    // an emoji in a tab name), silently truncating the next line and
-    // persisting the corrupt offset. If the file shrank (epoch-less
-    // truncation — not a pattern the plugin uses, but tolerated), the
-    // priorOffset>size guard above already reset to 0 for the slice;
-    // we still need to detect a fresh epoch on the first new line to
-    // also clear the persisted-epoch mismatch.
-    const tail = buf.subarray(priorOffset).toString("utf8");
+    // a JS string by the offset would mix byte offsets (the write side
+    // advances via `Buffer.byteLength`, the file's `st.size` is in
+    // bytes) with UTF-16 code-unit offsets and over-shoot the moment
+    // any consumed line contains a multi-byte character (e.g. an emoji
+    // in a tab name), silently truncating the next line and persisting
+    // the corrupt offset. If the file shrank (epoch-less truncation —
+    // not a pattern the plugin uses, but tolerated), the priorOffset>size
+    // guard above already reset to 0; we still detect a fresh epoch on
+    // the first new line to clear the persisted-epoch mismatch.
+    //
+    // Mid-line resync (fn-706.1): when `tailBase > priorOffset` we
+    // jumped past unconsumed bytes to honor the cap, so the window
+    // starts mid-record. Discard the leading partial line (bytes up to
+    // and including the first `\n`) and count those bytes as
+    // `discardedPartialBytes` — the new watermark accounts for them so
+    // the next scan resumes from the right absolute offset. One record
+    // is lost at the seam, which is safe: both consumers (tab-namer
+    // rename, autopilot reap) are last-writer-wins on per-pane facts
+    // and the latest line carries the current `(tab_id, tab_name)`.
+    let windowBuf = buf.subarray(tailBase);
+    let discardedPartialBytes = 0;
+    if (tailBase > priorOffset) {
+      const firstNl = windowBuf.indexOf(0x0a); // `\n`
+      if (firstNl === -1) {
+        // No newline in the entire tail window — the whole window is one
+        // incomplete record. Nothing complete to consume; defer the
+        // whole partial. Advance the watermark to the window base so we
+        // re-read this partial (and whatever completes it) next scan
+        // without re-reading the skipped-over prefix. The read-back guard
+        // only validates `offset`, so an empty carried-forward epoch is
+        // tolerated until a parseable line stamps the real one.
+        watermarks[sessionKey] = {
+          epoch: prior?.epoch ?? "",
+          offset: tailBase,
+        };
+        anyWatermarkAdvanced = true;
+        continue;
+      }
+      discardedPartialBytes = firstNl + 1; // include the `\n`
+      windowBuf = windowBuf.subarray(discardedPartialBytes);
+    }
+    const tail = windowBuf.toString("utf8");
 
     // Forward-tail line walk. Split on `\n` and process every COMPLETE
     // line (lines BEFORE the final `\n`). The last element of the
@@ -859,7 +909,17 @@ export function scanZellijEventsDir(
       "utf8",
     );
 
-    let sessionEpoch = prior?.epoch ?? null;
+    // When the window jumped past the prior offset (an oversize tail-read),
+    // the persisted epoch is stale relative to the window content — we
+    // skipped over the bytes it described. Seed `sessionEpoch` from the
+    // FIRST successfully parsed line in the window instead, so a stale
+    // persisted epoch can't mis-trigger the reset path on line 0. We
+    // can't assume line 0 parses (it may be a `plugin_start` sentinel or
+    // garbage → `null`), so seeding happens lazily at the first non-null
+    // parse below, gated by `needsEpochSeed`.
+    const windowJumped = tailBase > priorOffset;
+    let sessionEpoch = windowJumped ? null : (prior?.epoch ?? null);
+    let needsEpochSeed = windowJumped;
     let consumedBytesInTail = 0;
     let pendingEpochReset = false;
 
@@ -876,6 +936,14 @@ export function scanZellijEventsDir(
       const record = parseZellijEventLine(line);
       if (record === null) {
         continue;
+      }
+
+      // Seed the epoch from the first parsed line in a jumped window so
+      // the reset detection below doesn't mis-fire against a stale
+      // persisted epoch.
+      if (needsEpochSeed) {
+        sessionEpoch = record.epoch;
+        needsEpochSeed = false;
       }
 
       // Epoch reset detection: an incoming epoch that differs from the
@@ -985,15 +1053,18 @@ export function scanZellijEventsDir(
     // counts — we don't want to re-scan the same garbage on every
     // watcher event.
     if (consumedBytesInTail > 0 || pendingEpochReset) {
-      const newOffset = priorOffset + consumedBytesInTail;
+      // The watermark is the absolute byte position we've consumed up
+      // to, measured from the ACTUAL window base — not `priorOffset`.
+      // `tailBase` honors the oversize cap (== priorOffset on a normal
+      // in-cap scan), `discardedPartialBytes` accounts for the mid-line
+      // leading partial we dropped on a jumped window (0 on a normal
+      // scan), and `consumedBytesInTail` is the complete-line bytes
+      // walked this pass. Subsequent scans tail forward from here; the
+      // plugin's append-only open keeps writing at the file's tail
+      // across reloads (zellij#5177-style double-load is handled by the
+      // plugin's append-create mode).
+      const newOffset = tailBase + discardedPartialBytes + consumedBytesInTail;
       const newEpoch = sessionEpoch ?? prior?.epoch ?? "";
-      // An epoch reset that happened MID-tail means the post-reset
-      // offset is the absolute byte position we've consumed up to —
-      // we want subsequent scans to read from there forward. The
-      // simple `priorOffset + consumedBytesInTail` is the right value
-      // because the plugin's append-only open keeps writing at the
-      // file's tail across reloads (zellij#5177-style double-load is
-      // handled by the plugin's append-create mode).
       if (newEpoch.length > 0) {
         watermarks[sessionKey] = { epoch: newEpoch, offset: newOffset };
         anyWatermarkAdvanced = true;

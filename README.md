@@ -1767,9 +1767,18 @@ only via main's writable connection. The watermark sidecar advances
 in lockstep with each scan so a daemon restart re-tails from the
 last byte rather than re-folding the whole feed; an epoch nonce
 stamped by every plugin `load()` resets the watermark cleanly when
-the plugin reloads. Rollback to the poller is a single `git revert`
-of the fn-684 task .5 commit — the poller worker is retired, not
-gated.
+the plugin reloads. An oversize feed (over the 16 MiB
+`MAX_ZELLIJ_EVENTS_FILE_BYTES` cap) is TAIL-READ instead of skipped
+(fn-706.1): the scan seeks to `max(priorOffset, size - cap)`,
+discards the partial leading line to the next `\n`, seeds the epoch
+from the first parsed line in the window, and advances the watermark
+from the actual window base (`tailBase + discardedPartialBytes +
+consumedBytesInTail`). A noisy session degrades to "tail-only" and
+keeps minting `BackendExecSnapshot` — the pre-fn-706 skip-and-log
+froze the watermark forever, silently stopping all mints for the
+session (the recurring hand-truncate mole). Rollback to the poller is
+a single `git revert` of the fn-684 task .5 commit — the poller
+worker is retired, not gated.
 
 A **tenth** Worker thread is the restore-snapshot worker (epic fn-677,
 two-tier rework fn-702): a pure CONSUMER that opens its own read-only
