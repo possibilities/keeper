@@ -75,5 +75,5 @@ IS a DB write, this collapses close→emit to ~50ms.
 - [ ] `bun test test/plan-worker.test.ts` passes; no leaked timers under `bun test --isolate`
 
 ## Done summary
-
+Added a fast PRAGMA data_version poll to the plan-worker (PLAN_DB_POLL_MS=100, mirroring the git-worker archetype) that drives a gated recheckPending() + change-gated reconcilePlanctlDirs('db-poll') re-scan on every keeper DB write, collapsing close→emit to ~50ms; extracted makeSingleFlight coalescing, added a db-poll trigger tag that omits the heartbeat alarm wording, and cleared the poll timer in shutdown before unsubscribe/close. 9 new tests; full plan-worker suite passes clean (incl. --isolate).
 ## Evidence

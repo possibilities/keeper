@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "plan-worker data_version poll loop",
-  "updated_at": "2026-06-04T20:31:26.982864Z"
+  "updated_at": "2026-06-04T20:47:47.729132Z",
+  "worker_done_at": "2026-06-04T20:47:47.729132Z"
 }
