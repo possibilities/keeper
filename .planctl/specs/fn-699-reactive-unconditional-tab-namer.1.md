@@ -107,5 +107,5 @@ always converges a tab's name to its session title, mirroring the
 - [ ] Stale prose rewritten: worker header (:1-86), daemon `:2893` comment, README tab-namer paragraph, CLAUDE.md kick bullet + watcher carve-out
 
 ## Done summary
-
+Reworked the tab-namer worker from a 5s setInterval + permanent job-id lastSet debounce into a reactive (kick + data_version poll, mirroring server-worker) unconditional reconciler: renames whenever sanitize(title) != backend_exec_tab_name, with a SESSION::PANE_ID memo cleared on observed convergence so a tab that drifts to Tab #N on resume re-converges within one kick/poll cycle. Wired the daemon pumpWakes kick, re-keyed tests to pane-id with new drift/post-write/clear-on-convergence cases, and rewrote the worker header, daemon comment, README paragraph, and CLAUDE.md kick + watcher-carveout prose.
 ## Evidence
