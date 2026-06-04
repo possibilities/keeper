@@ -494,7 +494,9 @@ export async function applyRestore(
 
 /**
  * Pure renderer: turn the outcome list into the stdout block. One stanza per
- * agent (a `#` comment label line + the resume command) plus a trailing
+ * agent (a `#` comment label line — keyed by the resolved title
+ * (`resume_target`), not the raw session id, so it reads like what
+ * `claude --resume` targets — plus the resume command) followed by a trailing
  * `# summary:` line. Exported for tests so the rendering shape is locked
  * down without parsing real stdout.
  */
@@ -512,22 +514,23 @@ export function renderOutcomes(
   for (const o of outcomes) {
     const cwd = o.agent.cwd == null ? "" : seg(o.agent.cwd);
     const cmd = buildResumeCommand(cwd, o.agent.resume_target, o.agent.tier);
+    // Label each line with the resolved title (`resume_target` — the latest
+    // session name, falling back to the session id only for a job that never
+    // carried a name), so the human-readable label matches what the
+    // `claude --resume` command actually targets.
+    const label = o.agent.resume_target;
     if (o.kind === "would-restore") {
       wouldRestore++;
-      stanzas.push(`# (${o.session}) would restore ${o.agent.job_id}\n${cmd}`);
+      stanzas.push(`# (${o.session}) would restore ${label}\n${cmd}`);
     } else if (o.kind === "skipped-live") {
       skippedLive++;
-      stanzas.push(
-        `# (${o.session}) skipping ${o.agent.job_id} — already live`,
-      );
+      stanzas.push(`# (${o.session}) skipping ${label} — already live`);
     } else if (o.kind === "restored") {
       restored++;
-      stanzas.push(`# (${o.session}) restored ${o.agent.job_id}\n${cmd}`);
+      stanzas.push(`# (${o.session}) restored ${label}\n${cmd}`);
     } else {
       failed++;
-      stanzas.push(
-        `# (${o.session}) FAILED ${o.agent.job_id}: ${o.error}\n${cmd}`,
-      );
+      stanzas.push(`# (${o.session}) FAILED ${label}: ${o.error}\n${cmd}`);
     }
   }
 

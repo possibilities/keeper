@@ -342,6 +342,29 @@ test("renderOutcomes apply summary names restored / skipped-live / failed", asyn
   expect(rendered).toContain("FAILED z");
 });
 
+test("renderOutcomes labels use the resolved title, not the session id", () => {
+  const desc = fakeDescriptor({
+    autopilot: [
+      fakeAgent({
+        job_id: "sess-aaaa",
+        resume_target: "epic-benchmark-monitor",
+      }),
+      fakeAgent({
+        job_id: "sess-bbbb",
+        resume_target: "tab-naming-resume-issue",
+      }),
+    ],
+  });
+  const plan = planRestore(desc, null, new Set(["sess-bbbb"]));
+  const out = renderOutcomes(plan, "/bin/zsh", false);
+  // Labels are keyed by the resolved title.
+  expect(out).toContain("would restore epic-benchmark-monitor");
+  expect(out).toContain("skipping tab-naming-resume-issue — already live");
+  // The raw session ids never appear (label was the only place they showed).
+  expect(out).not.toContain("sess-aaaa");
+  expect(out).not.toContain("sess-bbbb");
+});
+
 // ---------------------------------------------------------------------------
 // loadRestoreFile — parse / missing / future / ok branches
 // ---------------------------------------------------------------------------
