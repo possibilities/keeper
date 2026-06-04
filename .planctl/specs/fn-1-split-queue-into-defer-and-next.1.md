@@ -58,5 +58,5 @@ New `tests/test_run_epic_queue_jump.py`: (1) verb flips `queue_jump` false→tru
 - [ ] New test file passes; `ruff`/`ty` clean.
 
 ## Done summary
-
+Added planctl epic queue-jump verb: flips queue_jump=true on an existing epic and rides queue_jump:true on the planctl_invocation envelope (mirrors run_epic_invalidate). Read-only short-circuit when already true; not in VALIDATION_RESTAMP_VERBS. New test file covers false→true, idempotent short-circuit, and missing-epic error.
 ## Evidence
