@@ -1979,6 +1979,111 @@ test("reconcilePlanctlDirs(heartbeat): a backstop emit logs a trigger-tagged 'di
   expect(logs.some((l) => l.includes("heartbeat"))).toBe(false);
 });
 
+test("kick → gated recheckPending: an UNCOMMITTED approval stays gated (no emit); a committed file then emits (fn-701 task .2 fn-627 guard)", () => {
+  // The plan-worker's inbound `kick` branch runs `scanner.recheckPending()` —
+  // the SAME GATED drain the `recheck-pending` branch runs (NOT a bypass). An
+  // approval RPC write makes the plan file dirty/uncommitted; the kick must
+  // re-run the fn-629 in-HEAD probe and keep it in pending, or the fn-627
+  // duplicate-dispatch incident re-opens. We exercise the drain directly (the
+  // kick branch is a thin try/catch wrapper around this call) so the gate
+  // semantics are asserted without a Worker spawn.
+  gitInit(tmpDir);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+
+  // An UNCOMMITTED epic whose `approval` was just flipped by the RPC — the
+  // file is dirty and NOT in HEAD. onChange bounces it into pending.
+  const epicPath = writeEpic("fn-6-kick", {
+    title: "Kick",
+    status: "open",
+    approval: "approved",
+    primary_repo: tmpDir,
+  });
+  scanner.onChange(epicPath);
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(1);
+
+  // The kick fires `recheckPending()`. Still uncommitted → still gated → NO
+  // emit. This is the load-bearing fn-627 regression assertion: an approval
+  // that never commits must NOT emit on kick.
+  scanner.recheckPending();
+  expect(emitted).toEqual([]);
+  expect(scanner.pendingSize()).toBe(1);
+
+  // Commit the approval (the task-.1 commit-driven path). Now in HEAD; the
+  // next gated recheck drains it and emits.
+  git(tmpDir, "add", epicPath);
+  git(tmpDir, "commit", "-q", "-m", "approve epic");
+  scanner.recheckPending();
+  expect(emitted.length).toBe(1);
+  expect(emitted[0].kind).toBe("plan-epic");
+  expect((emitted[0] as { id: string }).id).toBe("fn-6-kick");
+  expect((emitted[0] as { approval: string }).approval).toBe("approved");
+  expect(scanner.pendingSize()).toBe(0);
+});
+
+test("spawned Worker tolerates a kick message (gated recheck, no crash) and still shuts down cleanly (fn-701 task .2)", async () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  // Bootstrap the schema with a writer so the worker's read-only open succeeds.
+  openDb(dbPath).db.close();
+
+  // A real git root with an UNCOMMITTED plan file — the kick's gated recheck
+  // probes HEAD and must keep it in pending (no emit) WITHOUT throwing.
+  const root = join(tmpDir, "root");
+  mkdirSync(root);
+  gitInit(root);
+  const epicDir = join(root, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+  writeFileSync(
+    join(epicDir, "fn-1-kick.json"),
+    JSON.stringify({
+      id: "fn-1-kick",
+      title: "Kick",
+      status: "open",
+      approval: "approved",
+      primary_repo: root,
+    }),
+  );
+
+  const worker = new Worker(
+    new URL("../src/plan-worker.ts", import.meta.url).href,
+    {
+      workerData: { dbPath, roots: [root] },
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  const exited = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+  let crashed = false;
+  worker.addEventListener("error", () => {
+    crashed = true;
+  });
+
+  // Let it boot, open its connection, and subscribe the root.
+  await Bun.sleep(200);
+
+  // Post a kick — the worker must run a gated recheckPending() without
+  // crashing. (The uncommitted file stays gated; we assert liveness via the
+  // clean shutdown that follows.)
+  worker.postMessage({ type: "kick" });
+  await Bun.sleep(100);
+  expect(crashed).toBe(false);
+
+  worker.postMessage({ type: "shutdown" });
+  const result = await Promise.race([
+    exited.then(() => "exited" as const),
+    Bun.sleep(3000).then(() => "timeout" as const),
+  ]);
+  expect(result).toBe("exited");
+  expect(crashed).toBe(false);
+});
+
 test("zero-task epic: a committed epic file with no task files emits without sibling tasks", () => {
   gitInit(tmpDir);
 

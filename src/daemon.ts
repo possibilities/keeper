@@ -135,6 +135,7 @@ import type { RestoreWorkerData } from "./restore-worker";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
   KickMessage,
+  KickPlanWorkerRequestMessage,
   ReplayRequestMessage,
   ReplayResultMessage,
   RetryDispatchRequestMessage,
@@ -1378,6 +1379,15 @@ function runDaemon(): void {
   // resolve `ok:false, error="autopilot worker not yet ready"` — a
   // best-effort surface for the otherwise-impossible boot race.
   let autopilotWorker: Worker | null = null;
+  // Forward reference to the plan worker (constructed later in this function),
+  // captured by the server-worker bridge's `kick-plan-worker-request` handler
+  // (fn-701 task .2). A `set_*_approval` write makes the plan file
+  // dirty/uncommitted; the kick drives the plan-worker to re-run its GATED
+  // `recheckPending()` promptly instead of waiting on the 60s heartbeat.
+  // Until the plan worker is constructed (the same narrow boot window the
+  // autopilot forward-ref above guards), a kick request is a tolerated no-op
+  // — the heartbeat backstop covers the gap, identical to a dropped signal.
+  let planWorkerRef: Worker | null = null;
 
   /**
    * Process the wake signal. Re-entrancy guard (`draining`) ensures we never
@@ -1475,12 +1485,34 @@ function runDaemon(): void {
       | ReplayRequestMessage
       | SetAutopilotPausedRequestMessage
       | RetryDispatchRequestMessage
+      | KickPlanWorkerRequestMessage
       | { kind: "ready" }
       | undefined
     >,
   ): void => {
     const msg = ev.data;
     if (!msg) return;
+    if (msg.kind === "kick-plan-worker-request") {
+      // fn-701 task .2: a `set_*_approval` write succeeded in the
+      // server-worker. The approval mutation left the plan file
+      // dirty/uncommitted, so kick the plan-worker into a GATED
+      // `recheckPending()` (NOT a bypass — an uncommitted approval must stay
+      // gated, or the fn-627 duplicate-dispatch incident re-opens). One-way:
+      // no reply, no correlation id. Null-guarded for the boot race (the plan
+      // worker is constructed later in this function); wrapped in try/catch so
+      // a transport hiccup on this cosmetic fast-path can NEVER bounce the
+      // daemon (no in-process self-heal). The 60s plan-worker heartbeat is the
+      // level-triggered lost-wakeup backstop.
+      try {
+        planWorkerRef?.postMessage({ type: "kick" } satisfies KickMessage);
+      } catch (err) {
+        console.error(
+          "[keeperd] plan-worker kick post failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+      return;
+    }
     if (msg.kind === "replay-request") {
       const id = msg.id;
       let reply: ReplayResultMessage;
@@ -1913,6 +1945,11 @@ function runDaemon(): void {
       } satisfies PlanWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );
+  // fn-701 task .2: publish the plan-worker reference so the server-worker
+  // bridge's `kick-plan-worker-request` handler (wired ABOVE, before this
+  // construction) can post a `{type:"kick"}` to it. The forward-ref is `null`
+  // until this line runs; the bridge handler null-guards for that boot window.
+  planWorkerRef = planWorker;
 
   // Main stays the SOLE writer: a `plan-epic`/`plan-task` snapshot message
   // becomes a synthetic `EpicSnapshot`/`TaskSnapshot` events row inserted on the

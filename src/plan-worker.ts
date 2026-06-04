@@ -236,6 +236,27 @@ export interface RecheckPendingMessage {
 }
 
 /**
+ * Edge-triggered fast-path kick (fn-701 task .2). Main posts this when a
+ * `set_*_approval` RPC write succeeds in the server-worker — the approval
+ * mutation left the plan file dirty/uncommitted, so absent a follow-on git
+ * pulse the only thing that would drain the observation gate's pending set is
+ * the 60s heartbeat (the board-removal lag this kick closes). The handler runs
+ * the SAME GATED {@link PlanScanner.recheckPending} the `recheck-pending`
+ * branch does — NOT a bypass: an uncommitted approval re-runs the fn-629
+ * in-HEAD probe and stays in pending, so it does NOT emit (re-opening the
+ * fn-627 duplicate-dispatch incident is the regression this gate prevents).
+ *
+ * The shape is `{type:"kick"}` — byte-identical to the server-worker /
+ * tab-namer `KickMessage` so main's existing `satisfies KickMessage` post
+ * sites can target the plan-worker without a new wire shape. The 60s heartbeat
+ * remains the level-triggered lost-wakeup backstop (the plan-worker has no
+ * `data_version` poll to fall back on).
+ */
+export interface KickMessage {
+  type: "kick";
+}
+
+/**
  * One entry on a {@link PlanctlCommitChangedMessage} — a single
  * `.planctl/**` path that changed in the committed delta the git-worker
  * just observed. `path` is repo-relative (forward-slash on POSIX), tagged
@@ -290,6 +311,7 @@ export interface PlanctlCommitChangedMessage {
 export type InboundMessage =
   | ShutdownMessage
   | RecheckPendingMessage
+  | KickMessage
   | PlanctlCommitChangedMessage;
 
 /**
@@ -1966,6 +1988,28 @@ function main(): void {
       } catch (err) {
         console.error(
           `[plan-worker] recheckPending failed: ${stringifyErr(err)}`,
+        );
+      }
+      return;
+    }
+    if (msg.type === "kick") {
+      // fn-701 task .2: a `set_*_approval` RPC write succeeded in the
+      // server-worker; main kicked us. The approval mutation left the plan
+      // file dirty/uncommitted, so re-run the GATED observation-gate drain so
+      // an approval that never commits still converges promptly instead of
+      // waiting on the 60s heartbeat. SAME gated `recheckPending()` the
+      // `recheck-pending` branch runs — NOT a bypass: an uncommitted approval
+      // re-runs the fn-629 in-HEAD probe and stays in pending (the fn-627
+      // duplicate-dispatch guard). Idempotent and cheap when pending is empty.
+      // Try/catch-wrapped — a throw here is in the no-self-heal path; log and
+      // continue so a recheck failure can't crash the worker (and bounce the
+      // daemon).
+      if (shuttingDown) return;
+      try {
+        scanner.recheckPending();
+      } catch (err) {
+        console.error(
+          `[plan-worker] kick recheckPending failed: ${stringifyErr(err)}`,
         );
       }
       return;
