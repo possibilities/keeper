@@ -58,5 +58,5 @@ removing it is the deferred scope-5 follow-up, not this task.
 - [ ] tests cover kick-delivers-gated-recheck and the uncommitted-no-emit guard
 
 ## Done summary
-
+Approval RPC writes now kick the plan-worker into a GATED recheckPending via a worker->main->plan-worker bridge (boot-race null-guarded, try/catch-wrapped). An uncommitted approval stays gated (fn-627 guard); a committed one emits via the task-.1 path. The 60s heartbeat remains the lost-wakeup backstop.
 ## Evidence
