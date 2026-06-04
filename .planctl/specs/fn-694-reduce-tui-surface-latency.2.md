@@ -77,5 +77,5 @@ OTHER sessions, which exercise the kick path).
 - [ ] full test suite green; bench-latency shows reduced fold→surface latency (record in Evidence)
 
 ## Done summary
-
+Lever B: main kicks the server-worker after each fold (post-COMMIT) so it runs diffTick immediately, collapsing the second of two serial data_version polls; wake-worker poll halved 50->25ms. handleKick wraps diffTick in try/catch (no-self-heal path); pollLoop retained as backstop. bench-latency under an isolated daemon + identical feeder: jobs p50 43->13ms, p90 69->23ms, mean 44->14ms (n=60 each).
 ## Evidence

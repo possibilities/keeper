@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Kick server-worker on fold; halve wake poll",
-  "updated_at": "2026-06-04T00:42:06.342711Z"
+  "updated_at": "2026-06-04T01:18:10.009162Z",
+  "worker_done_at": "2026-06-04T01:18:10.009162Z"
 }
