@@ -86,6 +86,22 @@ class _OkSlot:
 SketchResolveSlot = _OkSlot | SketchRefError
 
 
+def _dedup_first_seen(snippets: list[str]) -> list[str]:
+    """First-occurrence-order dedup, matching promptctl's ``_push`` semantics.
+
+    ``promptctl inline-sketch-refs`` builds ``merged_snippets`` by pushing each
+    input snippet through a first-seen-wins filter (``api.inline_sketch_refs``).
+    The sketch-free short-circuit below replicates that exact transform locally.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for sid in snippets:
+        if sid not in seen:
+            seen.add(sid)
+            out.append(sid)
+    return out
+
+
 def inline_sketch_refs_batch(
     groups: list[dict[str, list[str]]],
     *,
@@ -103,7 +119,28 @@ def inline_sketch_refs_batch(
     Returns a per-slot list of :class:`_OkSlot` or :class:`SketchRefError`.
     Raises :class:`SketchToolingError` when the verb itself fails (spawn,
     timeout, non-zero exit, or non-JSON stdout) — fail-visibly, no fallback.
+
+    Sketch-free fast path: ``promptctl inline-sketch-refs`` only acts on
+    ``sketch/`` refs — ``bundle/`` / ``arc/`` refs and bare ids pass through
+    unchanged, and the sole transform on a sketch-free group is a first-seen
+    dedup of its ``snippets`` (``promptctl.api.inline_sketch_refs``). So when
+    NO group in the batch carries a ``sketch/`` ref, the subprocess is a pure
+    no-op pass-through: we replicate it locally and skip the ~240ms interpreter
+    spawn entirely. Any ``sketch/`` ref anywhere in the batch falls through to
+    the real verb so resolution stays single-sourced in promptctl.
     """
+    if not any(
+        any(ref.startswith("sketch/") for ref in group.get("bundles", []))
+        for group in groups
+    ):
+        return [
+            _OkSlot(
+                remaining_bundles=list(group.get("bundles", [])),
+                merged_snippets=_dedup_first_seen(list(group.get("snippets", []))),
+            )
+            for group in groups
+        ]
+
     payload = json.dumps(groups)
     cwd = str(project_root)
     argv = ["promptctl", "inline-sketch-refs", "--project-root", cwd]
