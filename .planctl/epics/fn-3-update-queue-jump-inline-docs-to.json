@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-3-update-queue-jump-inline-docs-to",
   "bundles": [],
   "closer_done_at": "2026-06-04T17:04:21.964047Z",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/planctl"
   ],
-  "updated_at": "2026-06-04T17:04:21.964047Z"
+  "updated_at": "2026-06-04T17:05:04.701895Z"
 }
