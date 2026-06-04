@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-1-split-queue-into-defer-and-next",
   "bundles": [],
   "closer_done_at": "2026-06-04T15:56:34.750719Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/planctl"
   ],
-  "updated_at": "2026-06-04T15:56:34.750719Z"
+  "updated_at": "2026-06-04T16:00:47.488663Z"
 }
