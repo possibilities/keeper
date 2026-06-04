@@ -70,5 +70,5 @@ before/after: subagent frame bytes ~halve. No schema-version test impact
 - [ ] bench-latency shows reduced subagent frame size / board surfacing latency (record in Evidence)
 
 ## Done summary
-
+Narrowed SUBAGENT_INVOCATIONS_DESCRIPTOR.columns from 12 to the safe-7 {job_id, subagent_type, turn_seq, ts, status, description, last_event_id}. Audited all consumers (wire collapse + subagentLinesFor, predicate-6, in-process autopilot read, countAndToken pk-only, selectVersionsByIds pk+version) read only kept columns. Bench: ~39% smaller subagent refetch frame (833KB to 507KB at 2005 rows, ~6.7MB saved per 21-subscriber fold burst). No SCHEMA_VERSION/keeper-py change.
 ## Evidence
