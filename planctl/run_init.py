@@ -49,15 +49,9 @@ def _inside_git_work_tree(project_root: Path) -> bool:
     outside one (a fresh non-git ``/tmp`` dir) it writes the files and exits 0
     without a commit.
     """
-    import subprocess
+    from planctl.project import find_git_root
 
-    result = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"],
-        cwd=project_root,
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0 and result.stdout.strip() == "true"
+    return find_git_root(Path(project_root)) is not None
 
 
 def run(args: SimpleNamespace) -> int:
