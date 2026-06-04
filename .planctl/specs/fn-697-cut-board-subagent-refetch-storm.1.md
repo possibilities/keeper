@@ -68,5 +68,5 @@ KEEPER_TRACE_SERVER under several open boards.
 - [ ] bench-latency + KEEPER_TRACE_SERVER show fewer/shorter sleep-overrun clusters (record in Evidence)
 
 ## Done summary
-
+Lever 1: per-SubState meta-emission throttle (META_MIN_INTERVAL_MS=150). diffTick meta pass now defers a total/token move within the interval and advances lastTotal/lastToken/lastMetaEmittedAt ONLY on an actual emit, so a throttled-away membership delta persists and converges on the next eligible tick (kick or pollLoop). Patch pass stays immediate. New SubState.lastMetaEmittedAt seeded to 0 (first move always emits). 5 deterministic tests prove: one meta per interval, no lost-final-update (post-interval emits LATEST state), pollLoop convergence flush, patch-pass-never-throttled, and per-SubState window shared across handleKick+pollLoop. MetaFrame docstring + README meta-nudge prose updated. Full server-worker/board/readiness-client suites green (102+92 pass). Bench-latency+KEEPER_TRACE_SERVER evidence deferred: the in-sandbox daemon cannot load @parcel/watcher (napi ABI break), so a live multi-board storm bench must be run on the host before final approval.
 ## Evidence
