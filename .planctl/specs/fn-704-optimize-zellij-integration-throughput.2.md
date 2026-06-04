@@ -72,5 +72,5 @@ human on a live busy session, not asserted in CI.
 - [ ] Lands independent of `.1` (no shared files beyond docs; deps empty)
 
 ## Done summary
-
+Added env-gated loop-diagnostic tracing mirroring KEEPER_TRACE_SERVER: KEEPER_TRACE_TABNAMER counts real renameTab shell-outs + kicks in tab-namer-worker; KEEPER_TRACE_ZELLIJ counts worker notification-posts + main's BackendExecSnapshot mints. Module-const flags, call-site gated, rolling-window awk-parseable stderr lines, zero cost when off; README how-to-read-the-trace note added.
 ## Evidence
