@@ -81,5 +81,5 @@ pill vocabulary) and README BlockReason vocabulary to name
 - [ ] `bun test test/board.test.ts` passes.
 
 ## Done summary
-
+Extracted pure epicHeaderLabel helper to src/board-render.ts (epic_id fallback when epic_number/title are null), wired renderEpicBlock to it, and tested the helper plus the [blocked:epic-no-tasks] formatPill/colorize contract. Updated cli/board.ts doc-comment and README BlockReason vocab.
 ## Evidence
