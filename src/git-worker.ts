@@ -564,7 +564,13 @@ export function parsePorcelainV2(raw: string): ParsedGitStatus {
 
 function gitOutput(args: string[]): string | null {
   try {
-    const res = Bun.spawnSync(["git", ...args], {
+    // `--no-optional-locks`: the daemon is a pure OBSERVER and must never take
+    // `.git/index.lock`. A plain `git status` opportunistically refreshes the
+    // index stat-cache, which grabs the lock and races the watched session's
+    // own `git add` / commit — surfacing as a `fatal: Unable to create
+    // index.lock` "tooling error" in the agent, and (when our 2s timeout kills
+    // git mid-refresh) leaving a stale lock that wedges the repo until cleared.
+    const res = Bun.spawnSync(["git", "--no-optional-locks", ...args], {
       stdout: "pipe",
       stderr: "ignore",
       timeout: GIT_TIMEOUT_MS,
@@ -1615,13 +1621,19 @@ function batchHashObjectOids(
   // the whole point of this column.
   let stdout: string | null = null;
   try {
-    const res = Bun.spawnSync(["git", "hash-object", "--stdin-paths"], {
-      cwd: projectDir,
-      stdin: new TextEncoder().encode(`${presentPaths.join("\n")}\n`),
-      stdout: "pipe",
-      stderr: "ignore",
-      timeout: GIT_TIMEOUT_MS,
-    });
+    // `--no-optional-locks` for the same observer invariant as `gitOutput`
+    // (hash-object doesn't touch the index, but keep the daemon uniformly
+    // lock-free so no future arg change can reintroduce index.lock contention).
+    const res = Bun.spawnSync(
+      ["git", "--no-optional-locks", "hash-object", "--stdin-paths"],
+      {
+        cwd: projectDir,
+        stdin: new TextEncoder().encode(`${presentPaths.join("\n")}\n`),
+        stdout: "pipe",
+        stderr: "ignore",
+        timeout: GIT_TIMEOUT_MS,
+      },
+    );
     if (res.success && res.exitCode === 0) {
       stdout = res.stdout.toString();
     }
