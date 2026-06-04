@@ -44,5 +44,5 @@ test/board.test.ts: assert `renderJobLinkLines` renders N creator + M refiner li
 - [ ] the board renders multiple creator/refiner lines (verified by test); no `renderJobLinkLines` code change
 
 ## Done summary
-
+Reconciled CLAUDE.md, README Architecture, types.ts + plan-classifier.ts JSDoc to the commit-trailer creator/refiner source of truth (scrape ∪ commit-trailer union; foldCommit triggers the rebuild, syncPlanctlLinks stays sole writer); added a board test asserting many creator/refiner edges each render their own line with no renderJobLinkLines code change.
 ## Evidence
