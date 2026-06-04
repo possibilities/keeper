@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-694-reduce-tui-surface-latency",
   "bundles": [],
   "closer_done_at": "2026-06-04T01:30:45.225544Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-04T01:30:45.225544Z"
+  "updated_at": "2026-06-04T01:31:08.848865Z"
 }
