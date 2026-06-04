@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-699-reactive-unconditional-tab-namer",
   "bundles": [],
   "closer_done_at": "2026-06-04T13:40:08.669287Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-04T13:40:08.669287Z"
+  "updated_at": "2026-06-04T13:42:02.076539Z"
 }
