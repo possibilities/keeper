@@ -544,7 +544,7 @@ export function renderOutcomes(
     : `# summary: would-restore=${wouldRestore} skipped-live=${skippedLive}`;
 
   return stanzas.length > 0
-    ? `${stanzas.join("\n\n")}\n${summary}\n`
+    ? `${stanzas.join("\n\n")}\n\n${summary}\n`
     : `${summary}\n`;
 }
 
