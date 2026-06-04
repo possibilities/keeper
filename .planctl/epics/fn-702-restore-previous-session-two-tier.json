@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-702-restore-previous-session-two-tier",
   "bundles": [],
   "closer_done_at": "2026-06-04T17:31:18.700716Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-04T17:31:18.700716Z"
+  "updated_at": "2026-06-04T17:31:40.147834Z"
 }
