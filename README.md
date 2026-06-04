@@ -672,6 +672,11 @@ collapses to plain stream output. Run any of them with
   epic renders as a header line —
   `({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated]
   [slotted-after-closer]? [ready|completed|blocked:<reason>]` — followed by indented task lines
+  (the `{epic_number} {title}` label falls back to `{epic_id}` when BOTH
+  are null — a pre-`EpicSnapshot` stub row in the partial-projection
+  window between the `EpicSnapshot` and `TaskSnapshot` folds — so the
+  header stays legible and identifiable instead of collapsing to a blank
+  `({dir})  [unvalidated]` line; the row is never hidden, fn-700)
   (the optional `[slotted-after-closer]` pill — schema v29, active/cyan
   bucket — appears only when the epic was minted by another epic's
   closer session, i.e. `epics.created_by_closer_of != null`; its
@@ -710,7 +715,12 @@ collapses to plain stream output. Run any of them with
   prefixes the pill `dep-on-epic <project>::<id>` (e.g.
   `[blocked:dep-on-epic arthack::fn-633-git-attribution]`) so the
   cross-project provenance reads at a glance; intra-project deps keep
-  the bare-id render. The board's epic-header summary pill uses the
+  the bare-id render. A close-row-specific reason `epic-no-tasks` (amber /
+  warn) fires on the "Quality audit and close" row of an epic with ZERO
+  tasks (the partial-projection window between the `EpicSnapshot` and
+  `TaskSnapshot` folds) so the autopilot never dispatches a closer
+  against an epic with no work — `verbForVerdict` returns `null` for the
+  blocked verdict (fn-700). The board's epic-header summary pill uses the
   same shared `resolveEpicDep` so the summary and the row pill agree:
   `[#N]` intra-project, `[arthack::#N]` cross-project,
   `[?#N]` dangling. Ambiguous-bare-id resolutions (2+ matches with no

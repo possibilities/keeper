@@ -360,6 +360,52 @@ export function colorizePillsInLine(line: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Epic header label
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the `{epic_number} {title}` label portion of an epic header line,
+ * with an `epic_id` fallback so a half-scaffolded epic still renders a
+ * legible, non-blank header.
+ *
+ * A keeper epic and its tasks fold as two separate single-event
+ * transactions (`EpicSnapshot`, then `TaskSnapshot`); a freshly-minted
+ * stub row exists before its `EpicSnapshot` lands with BOTH `epic_number`
+ * and `title` still null. The legacy header build
+ * (`${seg(epic_number)} ${seg(title)}`) collapsed that to a lone space —
+ * surfacing as a blank `(keeper)  [unvalidated]` line with no way to tell
+ * WHICH epic the row belonged to. Per the fn-700 "show it blocked, don't
+ * hide" decision, fall back to the `epic_id` (non-null on the `Epic`
+ * projection — `src/types.ts`) so the row is always identifiable, never
+ * hidden.
+ *
+ * Pure module function — fn-700.2 extracted this out of `cli/board.ts`'s
+ * non-exported `renderEpicBlock` closure (mirroring the
+ * {@link renderJobLinkLines} / {@link subagentLinesFor} extractions) so
+ * `test/board.test.ts` can assert the fallback directly without standing
+ * up the subscribe loop. The trivial `v == null ? "" : String(v)`
+ * coalescer the closure used (`seg`) is inlined here for the one call
+ * site — no closure capture.
+ *
+ * Returns ONLY the label (no `(dir)` prefix, no dep / validated /
+ * readiness pills); the caller assembles those around it unchanged.
+ *   - both `epic_number` and `title` present → `"12 Add OAuth"`
+ *   - `epic_number` null, `title` present    → `"Add OAuth"`
+ *   - `title` null, `epic_number` present    → `"12"`
+ *   - both null                              → `epicId` (the fallback)
+ */
+export function epicHeaderLabel(
+  epicNumber: unknown,
+  title: unknown,
+  epicId: string,
+): string {
+  const numSeg = epicNumber == null ? "" : String(epicNumber);
+  const titleSeg = title == null ? "" : String(title);
+  const label = `${numSeg} ${titleSeg}`.trim();
+  return label === "" ? epicId : label;
+}
+
+// ---------------------------------------------------------------------------
 // Dead-letter banner pill
 // ---------------------------------------------------------------------------
 

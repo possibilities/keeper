@@ -87,6 +87,7 @@ import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   apiErrorPillSeg,
+  epicHeaderLabel,
   inputRequestPillSeg,
   permissionPromptPillSeg,
   planVerbLabel,
@@ -154,6 +155,14 @@ Each epic block opens with a header line of the form:
 (a [blocked:<reason>] readiness pill drops to its own indented line beneath
 the header instead of stamping at the end; ready/completed/running stay inline)
 
+The {epic_number} {title} label falls back to {epic_id} when BOTH are null —
+a pre-EpicSnapshot stub row (a keeper epic and its tasks fold as two separate
+transactions; between them the epic exists with zero tasks and a still-null
+number/title). The fallback keeps the header legible and identifiable instead
+of collapsing to a blank '({dir})  [unvalidated]' line; such a taskless epic's
+close row reads [blocked:epic-no-tasks] (fn-700) until its first task folds.
+The row is never hidden ("show it blocked, don't hide").
+
 The cross-epic dependency pills carry the dep's project-name prefix
 (e.g. [arthack#633]) so deps that cross topics/projects read unambiguously;
 the bare task-dep pills below stay [#n] (same-epic, no prefix needed).
@@ -214,7 +223,11 @@ in sqlite — only the client view collapses.
 
 The [<readiness>] pill is one of [ready], [completed], or
 [blocked:<reason>] — a pure-function verdict computed by src/readiness.ts
-from the (epics, jobs, subagent_invocations) snapshot. For tasks and the
+from the (epics, jobs, subagent_invocations) snapshot. One blocked reason is
+close-row-specific: [blocked:epic-no-tasks] (fn-700) fires on the "Quality
+audit and close" row of an epic with ZERO tasks (the partial-projection
+window between the EpicSnapshot and TaskSnapshot folds) so the autopilot
+never dispatches a closer against an epic with no work. For tasks and the
 close row a [ready] / [completed] / [running:<kind>] pill stamps inline on
 the indented "[<id>]" reference line beneath the header; a [blocked:<reason>]
 pill instead drops to its OWN line directly beneath the id line (so the
@@ -694,7 +707,12 @@ export async function main(argv: string[]): Promise<void> {
     // Same rule as the task/close rows: a [blocked:<reason>] verdict drops
     // to its own line (two-space indent) beneath the header; ready/
     // completed/running stay inline at the end of the header itself.
-    const epicHeader = `${dirSeg}${seg(row.epic_number)} ${seg(row.title)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}]${slottedSeg}`;
+    // fn-700.2: the `{epic_number} {title}` label falls back to `epic_id`
+    // when both are null (a pre-`EpicSnapshot` stub row), so the header is
+    // never the blank `(keeper)  [unvalidated]` line. The pure assembly
+    // lives in `epicHeaderLabel` (`src/board-render.ts`) for testability;
+    // `epicId` is the already-coalesced `seg(row.epic_id)` above.
+    const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}]${slottedSeg}`;
     const epicHeaderLines =
       epicVerdict.tag === "blocked"
         ? [epicHeader, `  ${formatPill(epicVerdict)}`]

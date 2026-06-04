@@ -35,6 +35,7 @@ import {
   renderEpicDepPills,
   renderJobLinkLines,
 } from "../cli/board";
+import { epicHeaderLabel } from "../src/board-render";
 import {
   computeReadiness,
   type EpicDepResolution,
@@ -976,6 +977,53 @@ test("colorizePillsInLine: blocked:<reason> takes the warn bucket via prefix fal
   expect(colorizePillsInLine("[blocked:unknown]")).toBe(
     `[${WARN}blocked:unknown${RESET}]`,
   );
+});
+
+// fn-700.2: `epic-no-tasks` is the close-row reason for a zero-task epic
+// (the partial-projection window between the EpicSnapshot and TaskSnapshot
+// folds). `formatPill` produces `[blocked:epic-no-tasks]` and
+// `colorizePillsInLine` auto-warns it via the generic `blocked:*` → warn
+// prefix branch — no render-code change beyond the union member added in
+// task .1.
+test("formatPill: epic-no-tasks blocked verdict renders [blocked:epic-no-tasks]", () => {
+  expect(
+    formatPill({ tag: "blocked", reason: { kind: "epic-no-tasks" } }),
+  ).toBe("[blocked:epic-no-tasks]");
+});
+
+test("colorizePillsInLine: blocked:epic-no-tasks takes the warn bucket", () => {
+  expect(colorizePillsInLine("[blocked:epic-no-tasks]")).toBe(
+    `[${WARN}blocked:epic-no-tasks${RESET}]`,
+  );
+});
+
+// fn-700.2: the epic-header label falls back to `epic_id` when both
+// `epic_number` and `title` are null (a pre-EpicSnapshot stub row) so the
+// header is never the blank `({dir})  [unvalidated]` line. Pure helper —
+// asserted directly, mirroring the renderJobLinkLines / subagentLinesFor
+// extraction precedent.
+test("epicHeaderLabel: both number and title present → '{number} {title}'", () => {
+  expect(epicHeaderLabel(12, "Add OAuth", "fn-12-add-oauth")).toBe(
+    "12 Add OAuth",
+  );
+});
+
+test("epicHeaderLabel: title null, number present → bare number", () => {
+  expect(epicHeaderLabel(12, null, "fn-12-add-oauth")).toBe("12");
+});
+
+test("epicHeaderLabel: number null, title present → bare title", () => {
+  expect(epicHeaderLabel(null, "Add OAuth", "fn-12-add-oauth")).toBe(
+    "Add OAuth",
+  );
+});
+
+test("epicHeaderLabel: both null → epic_id fallback (no blank header)", () => {
+  const label = epicHeaderLabel(null, null, "fn-12-add-oauth");
+  expect(label).toBe("fn-12-add-oauth");
+  // The fallback must be non-blank so the assembled header never collapses
+  // to '({dir})  [unvalidated]'.
+  expect(label.trim().length).toBeGreaterThan(0);
 });
 
 // `failed:<kind>` prefix fallback — the six ApiErrorKind tokens minted
