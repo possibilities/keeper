@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-2-init-self-commits-bootstrap-files",
   "bundles": [],
   "closer_done_at": "2026-06-04T16:51:44.559595Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/planctl"
   ],
-  "updated_at": "2026-06-04T16:51:44.559595Z"
+  "updated_at": "2026-06-04T16:59:45.011652Z"
 }
