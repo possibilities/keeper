@@ -1169,6 +1169,62 @@ export function recoverOneDeadLetter(db: Database): string | null {
 }
 
 /**
+ * Force the native `@parcel/watcher` N-API addon to dlopen ONCE on the main
+ * thread before any watcher worker spawns (fn-701 task .3).
+ *
+ * The bug: the daemon spawns six `@parcel/watcher`-loading workers (transcript,
+ * plan, git, usage, dead-letter, zellij-events) back-to-back. Each does its own
+ * `import("@parcel/watcher")` — and if those FIRST dlopens of the addon race
+ * concurrently, Bun crashes the workers with `symbol 'napi_register_module_v1'
+ * not found in native module` (residual Bun #15942 many-worker-spawn fragility;
+ * Bun v1.3.5 already fixed the original main+worker double-load case). On the
+ * daemon's actual bun (1.3.14) this was reproduced reliably under N≥16 concurrent
+ * worker dlopens; it crash-loops the daemon at boot (every worker rejects → main
+ * `fatalExit` → launchd restart → same race).
+ *
+ * The fix: a synchronous `require("@parcel/watcher")` on main. CJS `require` is
+ * synchronous, so it forces the addon's first dlopen + `napi_register_module_v1`
+ * to complete on main BEFORE the spawn block runs. Each worker still does its own
+ * `import()` and gets its own `napi_env` (this is NOT a shared watcher — the
+ * Worker contract's per-worker subscription ownership is untouched), but the
+ * addon is already registered, so the worker dlopens no longer race a
+ * not-yet-registered module. The repro check confirmed pre-warm ALONE eliminates
+ * the failure (0 failures across 40+ runs at N=8/16/24), so NO spawn staggering
+ * is needed — the workers may still spawn back-to-back.
+ *
+ * A GENUINE permanent load failure (missing `node_modules`, ABI mismatch, a
+ * truly broken addon) is unrecoverable — there is no in-process self-heal. This
+ * helper logs a LOUD boot assertion (bun version + clear context) so a recurrence
+ * is diagnosable instead of a silent crash-loop, then RE-THROWS; the caller takes
+ * the single recovery path (`process.exit(1)` → launchd restart). It is split out
+ * (pure, injectable `loader` + `logError`) so a test can force the failure branch
+ * and assert the loud assertion fires without a real broken addon.
+ *
+ * Exported for direct test reach.
+ */
+export function prewarmWatcherAddon(
+  loader: () => unknown = () => require("@parcel/watcher"),
+  logError: (msg: string) => void = (msg) => console.error(msg),
+): void {
+  try {
+    // Synchronous — forces the first dlopen to finish on main before any worker
+    // thread runs its own `import("@parcel/watcher")`.
+    loader();
+  } catch (err) {
+    // Loud boot assertion. Bun version + explicit context so a recurrence is a
+    // greppable signal, not a silent loop. The caller escalates to fatalExit;
+    // we do NOT downgrade a genuine missing-addon to a warning.
+    logError(
+      `[keeperd] FATAL: @parcel/watcher addon failed to load after pre-warm ` +
+        `on bun ${Bun.version} — the daemon cannot watch filesystem trees and ` +
+        `will exit for the LaunchAgent to restart. ` +
+        `(${err instanceof Error ? err.message : String(err)})`,
+    );
+    throw err;
+  }
+}
+
+/**
  * Run the daemon. Returns once the process is wired up and the steady-state
  * wake loop is running; the loop itself keeps the event loop alive until SIGTERM
  * or a crash. Exported (rather than executed at import) so a test can drive boot
@@ -1429,6 +1485,27 @@ function runDaemon(): void {
       // double-fire is a harmless no-op.
       tabNamerWorker.postMessage({ type: "kick" } satisfies KickMessage);
     }
+  }
+
+  // Step 2d — pre-warm the native @parcel/watcher addon ON MAIN before ANY
+  // worker spawns (fn-701 task .3). Six of the workers below
+  // (transcript / plan / git / usage / dead-letter / zellij-events) each run
+  // their own `import("@parcel/watcher")`; spawned back-to-back, their FIRST
+  // dlopens race and crash with `napi_register_module_v1 not found` (residual
+  // Bun #15942). A synchronous main-thread require forces a single serialized
+  // first dlopen so the addon is already registered when the workers import it
+  // — the repro check showed this ALONE fixes the race (no spawn staggering
+  // needed). A genuine permanent load failure logs the loud boot assertion
+  // inside the helper, then we take the single recovery path. See
+  // {@link prewarmWatcherAddon}.
+  try {
+    prewarmWatcherAddon();
+  } catch {
+    // The loud assertion (bun version + context) already fired inside the
+    // helper. Escalate to the sole recovery path — exit non-zero so launchd
+    // restarts us. NO in-process self-heal.
+    fatalExit();
+    return;
   }
 
   // Step 3 — spawn the wake worker. Bun uses the web Worker API; `workerData`

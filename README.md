@@ -1785,6 +1785,23 @@ usage, dead-letter, and zellij-events watchers, which deliberately does
 NOT escalate (a re-scan throw is swallowed, never reaching the restart
 path).
 
+**`@parcel/watcher` load ordering (as of fn-701).** Six of the workers
+(transcript, plan, git, usage, dead-letter, zellij-events) each run their own
+`import("@parcel/watcher")`. Spawned back-to-back, their FIRST dlopens of the
+native N-API addon race and crash with `symbol 'napi_register_module_v1' not
+found` — residual [Bun #15942](https://github.com/oven-sh/bun/issues/15942)
+many-worker-spawn fragility (Bun v1.3.5 fixed the original main+worker
+double-load case, but the daemon's bun 1.3.14 still crash-looped at boot).
+The operational rule: main **pre-warms** the addon with a synchronous
+`require("@parcel/watcher")` (`prewarmWatcherAddon` in `src/daemon.ts`) BEFORE
+the spawn block, forcing a single serialized first dlopen so the addon is
+already registered when each worker imports it. This is dlopen-only — each
+worker still owns its own subscription and `napi_env`; pre-warm shares no
+watcher. The repro check showed pre-warm ALONE closes the race (no spawn
+staggering needed). A genuine permanent load failure (missing `node_modules`,
+ABI mismatch) logs a loud boot assertion (bun version + context) and takes the
+single recovery path (`fatalExit` → launchd restart) — never a silent loop.
+
 Readiness is a client-side library, not a server-side collection.
 `src/readiness.ts` is the shared verdict pipeline consumed both by
 `scripts/board.ts` (via the `src/readiness-client.ts` helper, which

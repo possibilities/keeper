@@ -16,6 +16,7 @@ import {
   drainToCompletion,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
+  prewarmWatcherAddon,
   recoverOneDeadLetter,
   selectExpiredPendingDispatches,
   serializeUsageSnapshot,
@@ -2020,3 +2021,104 @@ test("selectExpiredPendingDispatches on an empty pending_dispatches table return
   expect(selectExpiredPendingDispatches(db, 1_700_000_000_000)).toEqual([]);
   db.close();
 });
+
+// fn-701 task .3 — @parcel/watcher pre-warm. The native-addon dlopen race is
+// timing-dependent and cannot be regression-tested directly, so these cover the
+// helper's two contractual branches: a healthy load is a silent no-op (invoking
+// the loader exactly once), and a genuine load failure fires the LOUD boot
+// assertion (bun version + context) and RE-THROWS so the caller can take the
+// single recovery path. The real boot wiring (`prewarmWatcherAddon()` →
+// `fatalExit()`) is exercised by the live daemon; here we inject the loader +
+// logger to drive the failure branch without a real broken addon.
+test("prewarmWatcherAddon invokes the loader exactly once and stays silent on success", () => {
+  let loaderCalls = 0;
+  const logs: string[] = [];
+  prewarmWatcherAddon(
+    () => {
+      loaderCalls += 1;
+      return {};
+    },
+    (msg) => logs.push(msg),
+  );
+  expect(loaderCalls).toBe(1);
+  expect(logs).toEqual([]);
+});
+
+test("prewarmWatcherAddon logs a loud boot assertion (bun version + context) and re-throws on a genuine load failure", () => {
+  const logs: string[] = [];
+  const boom = new Error("symbol 'napi_register_module_v1' not found");
+  expect(() =>
+    prewarmWatcherAddon(
+      () => {
+        throw boom;
+      },
+      (msg) => logs.push(msg),
+    ),
+  ).toThrow(boom);
+  // Exactly one loud assertion line, and it must carry the diagnostic anchors:
+  // the FATAL marker, the addon name, the actual bun version, and the
+  // underlying error message — so a recurrence is greppable, not silent.
+  expect(logs).toHaveLength(1);
+  const line = logs[0] ?? "";
+  expect(line).toContain("FATAL");
+  expect(line).toContain("@parcel/watcher");
+  expect(line).toContain(Bun.version);
+  expect(line).toContain("napi_register_module_v1");
+});
+
+test("prewarmWatcherAddon: the loud assertion does NOT downgrade a genuine failure to a warning (it re-throws)", () => {
+  // A no-op logger that swallows the line proves the escalation is in the
+  // THROW, not the log — the caller (boot) escalates to fatalExit regardless of
+  // what the logger does with the message.
+  expect(() =>
+    prewarmWatcherAddon(
+      () => {
+        throw new Error("ABI mismatch");
+      },
+      () => {},
+    ),
+  ).toThrow("ABI mismatch");
+});
+
+// fn-701 task .3 — boot smoke test for the concurrent-dlopen fix. Mirrors the
+// daemon's boot sequence (pre-warm @parcel/watcher on MAIN, THEN spawn the
+// watcher-loading workers back-to-back) and asserts every worker reaches
+// "subscribed" without exiting. Without the pre-warm, N≥16 concurrent FIRST
+// dlopens of the native addon reproduce `symbol 'napi_register_module_v1' not
+// found` on bun 1.3.14 (residual Bun #15942); with it, the addon is already
+// registered on main so the worker imports never race. Spawns more workers than
+// the daemon's six to stress the race the fix closes.
+test("boot smoke: after main pre-warm, a fleet of @parcel/watcher workers all subscribe without exit", async () => {
+  // Pre-warm on the main test thread — the SAME synchronous require the daemon
+  // runs before its spawn block. This is the load-bearing step under test.
+  prewarmWatcherAddon();
+
+  const N = 16;
+  const results = await Promise.all(
+    Array.from({ length: N }, () => {
+      const worker = new Worker(
+        new URL("./fixtures/parcel-watcher-worker.ts", import.meta.url).href,
+      );
+      return new Promise<{ ok: boolean; err?: string }>((resolve) => {
+        worker.onmessage = (
+          ev: MessageEvent<{ ok: boolean; err?: string }>,
+        ) => {
+          worker.terminate();
+          resolve(ev.data);
+        };
+        // A worker that crashes on the addon load fires `error`, NOT a message —
+        // surface it as a failure so the assertion below catches the race.
+        worker.addEventListener("error", (ev: ErrorEvent) => {
+          worker.terminate();
+          resolve({ ok: false, err: ev.message ?? "worker error" });
+        });
+      });
+    }),
+  );
+
+  const failures = results.filter((r) => !r.ok);
+  // Every worker must have loaded + subscribed cleanly. Any failure here is the
+  // concurrent-dlopen race re-opening.
+  expect(failures).toEqual([]);
+  expect(results.filter((r) => r.ok)).toHaveLength(N);
+}, 20_000);
