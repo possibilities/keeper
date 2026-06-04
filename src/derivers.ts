@@ -1484,6 +1484,39 @@ export interface CommitPayload {
    * T2.
    */
   task_ids: string[];
+  /**
+   * Epic fn-695: the planctl operation this commit performed, lifted
+   * from the `Planctl-Op:` trailer and NORMALIZED at producer time via
+   * {@link import("./plan-classifier").normalizePlanctlOp} (so
+   * `epic-scaffold` → `scaffold`, identical to the legacy stdout-scrape
+   * path's classifier input — the reducer's `syncPlanctlLinks` union
+   * compares the two sources on the SAME normalized vocabulary). `null`
+   * when:
+   *   - the commit carried no `Planctl-Op:` trailer (every commit that
+   *     is not a `chore(planctl)` op — source commits, human commits),
+   *   - the trailer value was empty / whitespace-only,
+   *   - a historical pre-fn-695 `Commit` event whose payload predates
+   *     this field — {@link extractCommit} defaults it to `null` so a
+   *     from-scratch re-fold over the historical event log holds (the
+   *     edge-rebuild fold treats `null` as "no commit-derived edge" —
+   *     a no-op, identical to the legacy scrape-only semantic).
+   *
+   * Paired with {@link planctl_target} + {@link committer_session_id};
+   * the T3 edge fold needs all three non-null to mint a creator/refiner
+   * edge from the commit channel.
+   */
+  planctl_op: string | null;
+  /**
+   * Epic fn-695: the planctl target ref this commit operated on, lifted
+   * from the `Planctl-Target:` trailer and validated via
+   * {@link parsePlanRef} (the same epic-ref shape gate the legacy scrape
+   * path uses). Carries the raw validated ref string (`fn-1-foo` or
+   * `fn-1-foo.3`) — the edge fold folds a task-form ref up to its parent
+   * epic via `parsePlanRef` exactly as `extractPlanctlInvocation` does.
+   * `null` on a missing / empty / malformed-shape trailer, and on a
+   * pre-fn-695 event (re-fold determinism — see {@link planctl_op}).
+   */
+  planctl_target: string | null;
   committed_at_ms: number;
 }
 
@@ -1637,6 +1670,25 @@ export function extractCommit(event: { data: string }): CommitPayload | null {
   } else {
     taskIds = [];
   }
+  // Epic fn-695: defensively decode `planctl_op` / `planctl_target` (the
+  // commit-trailer facts the git-worker lifted from `Planctl-Op:` /
+  // `Planctl-Target:`). Pre-fn-695 events lack BOTH fields entirely —
+  // default each to `null` so a from-scratch re-fold over the historical
+  // event log reproduces the same projection as today's scrape-only
+  // semantic (`null`/`null` is the no-op input to the T3 edge fold,
+  // identical to the missing-field path). Mirrors the `task_ids` block:
+  // the producer already validated + normalized at git-worker time, so
+  // this is a type-gate re-check (non-empty string for the op;
+  // `parsePlanRef`-valid ref for the target — anything else folds to
+  // `null` without failing the whole payload).
+  const rawOp = obj.planctl_op;
+  const planctlOp: string | null =
+    typeof rawOp === "string" && rawOp.length > 0 ? rawOp : null;
+  const rawTarget = obj.planctl_target;
+  const planctlTarget: string | null =
+    typeof rawTarget === "string" && parsePlanRef(rawTarget) !== null
+      ? rawTarget
+      : null;
   const rawTs = obj.committed_at_ms;
   const committedAtMs =
     typeof rawTs === "number" && Number.isFinite(rawTs) && rawTs > 0
@@ -1649,6 +1701,8 @@ export function extractCommit(event: { data: string }): CommitPayload | null {
     files,
     committer_session_id: committerSessionId,
     task_ids: taskIds,
+    planctl_op: planctlOp,
+    planctl_target: planctlTarget,
     committed_at_ms: committedAtMs,
   };
 }

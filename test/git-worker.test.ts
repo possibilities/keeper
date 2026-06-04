@@ -557,6 +557,12 @@ test("extractCommit accepts a well-formed v45+ payload (files: [{path, blob_oid,
     // the round-trip case (the producer would emit [] for a commit
     // carrying no Task: trailer).
     task_ids: [],
+    // Epic fn-695: `planctl_op` / `planctl_target` join the payload.
+    // Both null here — a source commit (no `Planctl-Op:`/`Planctl-Target:`
+    // trailer). The dedicated decode cases below exercise present/legacy/
+    // malformed shapes.
+    planctl_op: null,
+    planctl_target: null,
     committed_at_ms: 1_700_000_000_000,
   };
   expect(extractCommit({ data: JSON.stringify(payload) })).toEqual(payload);
@@ -1241,6 +1247,144 @@ test("enumerateCommitsInDelta: multi-commit delta — each commit's trailers par
 });
 
 // ---------------------------------------------------------------------------
+// enumerateCommitsInDelta — fn-695 Planctl-Op / Planctl-Target trailer lift.
+// The stride parser widened from 6 fields to 8; these cases pin that the
+// new fields land on the right commit (no off-by-one) and normalize/validate
+// identically to the legacy stdout-scrape path.
+// ---------------------------------------------------------------------------
+
+const VALID_EPIC = "fn-670-deterministic-committing-session";
+
+test("enumerateCommitsInDelta: Planctl-Op + Planctl-Target present → lifted, op normalized", () => {
+  // The canonical `chore(planctl)` scaffold commit: planctl stamps
+  // `Planctl-Op: epic-scaffold` + `Planctl-Target: <epic>`. The op
+  // normalizes (`epic-scaffold` → `scaffold`) exactly like the scrape
+  // path's classifier input; the target validates via parsePlanRef.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Session-Id": [REAL_UUID_A],
+    "Planctl-Op": ["epic-scaffold"],
+    "Planctl-Target": [VALID_EPIC],
+  });
+  const commits = enumerateCommitsInDelta(root, null, oid);
+  expect(commits).toHaveLength(1);
+  expect(commits[0].planctl_op).toBe("scaffold");
+  expect(commits[0].planctl_target).toBe(VALID_EPIC);
+  // The fn-670 fields still parse alongside (stride holds).
+  expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
+  expect(commits[0].task_ids).toEqual([]);
+});
+
+test("enumerateCommitsInDelta: a task-form Planctl-Target validates and rides verbatim", () => {
+  // A `task-done` commit stamps a task-form target. parsePlanRef accepts
+  // it; we store the raw validated ref (the edge fold folds it up to the
+  // parent epic downstream, exactly as extractPlanctlInvocation does).
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Session-Id": [REAL_UUID_A],
+    "Planctl-Op": ["task-done"],
+    "Planctl-Target": [VALID_TASK_1],
+  });
+  const commits = enumerateCommitsInDelta(root, null, oid);
+  expect(commits).toHaveLength(1);
+  expect(commits[0].planctl_op).toBe("done");
+  expect(commits[0].planctl_target).toBe(VALID_TASK_1);
+});
+
+test("enumerateCommitsInDelta: no Planctl-* trailers → planctl_op/target null", () => {
+  // A source commit (`feat(...)`) carrying Session-Id + Task but no
+  // Planctl-* trailers — both new fields stay null (the no-commit-edge
+  // input to the T3 fold).
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Session-Id": [REAL_UUID_A],
+    Task: [VALID_TASK_1],
+  });
+  const commits = enumerateCommitsInDelta(root, null, oid);
+  expect(commits).toHaveLength(1);
+  expect(commits[0].planctl_op).toBeNull();
+  expect(commits[0].planctl_target).toBeNull();
+  // Adjacent fields still parse — the absent Planctl-* fields don't drift
+  // the stride.
+  expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
+  expect(commits[0].task_ids).toEqual([VALID_TASK_1]);
+});
+
+test("enumerateCommitsInDelta: malformed Planctl-Target → null, op still lifts", () => {
+  // A garbage target ref must not poison the edge fold: parsePlanRef
+  // rejects it and the producer folds planctl_target to null. The op
+  // (a valid shape) still lifts independently.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Planctl-Op": ["epic-close"],
+    "Planctl-Target": ["not-a-plan-ref"],
+  });
+  const commits = enumerateCommitsInDelta(root, null, oid);
+  expect(commits).toHaveLength(1);
+  expect(commits[0].planctl_op).toBe("close");
+  expect(commits[0].planctl_target).toBeNull();
+});
+
+test("enumerateCommitsInDelta: ALL eight fields together → stride parser holds (no off-by-one)", () => {
+  // The full-fan-out case across the widened 8-field stride. If the
+  // 6→8 widening drifted the offsets, one of these assertions would
+  // read a neighboring field and fail.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid = gitCommit(root, "a.ts", "msg\n", {
+    "Session-Id": [REAL_UUID_A],
+    "Job-Id": [REAL_UUID_A],
+    Task: [VALID_TASK_1, VALID_TASK_2],
+    "Planctl-Op": ["task-done"],
+    "Planctl-Target": [VALID_TASK_1],
+  });
+  const commits = enumerateCommitsInDelta(root, null, oid);
+  expect(commits).toHaveLength(1);
+  expect(commits[0].commit_oid).toBe(oid);
+  expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
+  expect(commits[0].task_ids).toEqual([VALID_TASK_1, VALID_TASK_2]);
+  expect(commits[0].planctl_op).toBe("done");
+  expect(commits[0].planctl_target).toBe(VALID_TASK_1);
+  expect(commits[0].committed_at_ms).toBeGreaterThan(0);
+});
+
+test("enumerateCommitsInDelta: multi-commit delta — Planctl-* parse per-commit (no field bleed)", () => {
+  // Stride exercise across N>1 commits with the new fields. A regression
+  // that drifts the 8-field offset would surface as one commit reading
+  // the next commit's op/target.
+  const root = mkTmpWorktree();
+  gitInit(root);
+  const oid1 = gitCommit(root, "a.ts", "first\n", {
+    "Planctl-Op": ["epic-scaffold"],
+    "Planctl-Target": [VALID_EPIC],
+  });
+  const oid2 = gitCommit(root, "b.ts", "second\n", {
+    "Session-Id": [REAL_UUID_B],
+    "Planctl-Op": ["task-done"],
+    "Planctl-Target": [VALID_TASK_2],
+  });
+  // `oid1..oid2` includes only oid2.
+  const second = enumerateCommitsInDelta(root, oid1, oid2);
+  expect(second).toHaveLength(1);
+  expect(second[0].commit_oid).toBe(oid2);
+  expect(second[0].committer_session_id).toBe(REAL_UUID_B);
+  expect(second[0].planctl_op).toBe("done");
+  expect(second[0].planctl_target).toBe(VALID_TASK_2);
+
+  // Re-enumerate oid1 alone — its own op/target, no bleed from oid2.
+  const first = enumerateCommitsInDelta(root, null, oid1);
+  expect(first).toHaveLength(1);
+  expect(first[0].commit_oid).toBe(oid1);
+  expect(first[0].planctl_op).toBe("scaffold");
+  expect(first[0].planctl_target).toBe(VALID_EPIC);
+  expect(first[0].committer_session_id).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
 // extractCommit — fn-670 task_ids defensive decode
 // ---------------------------------------------------------------------------
 
@@ -1319,6 +1463,94 @@ test("extractCommit normalizes non-array task_ids to []", () => {
       }),
     });
     expect(res?.task_ids).toEqual([]);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// extractCommit — fn-695 planctl_op / planctl_target defensive decode.
+// Mirrors the task_ids decode cases: well-formed round-trip, legacy-null
+// (pre-feature event), and bad-shape per-field fold-to-null.
+// ---------------------------------------------------------------------------
+
+test("extractCommit decodes planctl_op / planctl_target when present", () => {
+  const res = extractCommit({
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: VALID_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: VALID_UUID,
+      task_ids: [],
+      planctl_op: "scaffold",
+      planctl_target: "fn-695-durable-commit-derived-creatorrefiner",
+      committed_at_ms: 1000,
+    }),
+  });
+  expect(res?.planctl_op).toBe("scaffold");
+  expect(res?.planctl_target).toBe(
+    "fn-695-durable-commit-derived-creatorrefiner",
+  );
+});
+
+test("extractCommit defaults planctl_op / planctl_target to null on pre-fn-695 events", () => {
+  // Re-fold determinism: every historical Commit event lacks BOTH fields;
+  // the deriver must decode each as null so the T3 edge fold sees the same
+  // "no commit-derived edge" input as the scrape-only legacy semantic.
+  const res = extractCommit({
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: VALID_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: VALID_UUID,
+      task_ids: [],
+      committed_at_ms: 1000,
+    }),
+  });
+  expect(res?.planctl_op).toBeNull();
+  expect(res?.planctl_target).toBeNull();
+});
+
+test("extractCommit folds a malformed planctl_target to null (parsePlanRef gate)", () => {
+  // A bad-shape target ref must not reach the edge fold. The op (a
+  // non-empty string) survives independently — per-field gating, not
+  // all-or-nothing.
+  const res = extractCommit({
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: VALID_OID,
+      parent_oid: null,
+      files: ["src/a.ts"],
+      committer_session_id: VALID_UUID,
+      task_ids: [],
+      planctl_op: "close",
+      planctl_target: "not-a-plan-ref",
+      committed_at_ms: 0,
+    }),
+  });
+  expect(res?.planctl_op).toBe("close");
+  expect(res?.planctl_target).toBeNull();
+});
+
+test("extractCommit folds non-string / empty planctl_op / planctl_target to null", () => {
+  // Object/scalar/empty-string instead of a string — each folds to null
+  // without failing the whole payload.
+  for (const bad of [{ foo: 1 }, 42, "", null] as const) {
+    const res = extractCommit({
+      data: JSON.stringify({
+        project_dir: "/repo",
+        commit_oid: VALID_OID,
+        parent_oid: null,
+        files: ["src/a.ts"],
+        committer_session_id: VALID_UUID,
+        task_ids: [],
+        planctl_op: bad,
+        planctl_target: bad,
+        committed_at_ms: 0,
+      }),
+    });
+    expect(res?.planctl_op).toBeNull();
+    expect(res?.planctl_target).toBeNull();
   }
 });
 

@@ -45,7 +45,12 @@ import { isAbsolute, join, resolve } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
-import { parseSessionIdTrailer, parseTaskTrailers } from "./derivers";
+import {
+  parsePlanRef,
+  parseSessionIdTrailer,
+  parseTaskTrailers,
+} from "./derivers";
+import { normalizePlanctlOp } from "./plan-classifier";
 import { isDropError, RescanScheduler } from "./rescan";
 import type { ShutdownMessage } from "./wake-worker";
 
@@ -247,6 +252,17 @@ export interface CommitMessage {
    * events — re-fold determinism).
    */
   task_ids: string[];
+  /**
+   * Epic fn-695: the normalized planctl op + validated target ref the
+   * producer lifted from this commit's `Planctl-Op:` / `Planctl-Target:`
+   * trailers (see {@link EnumeratedCommit}). Both `null` on a non-planctl
+   * commit. Ride the {@link daemon.ts:onmessage} commit-arm spread-
+   * serialize into the synthetic `Commit` event's `data` JSON; the
+   * reducer's edge fold reads them back via {@link extractCommit} (which
+   * defaults both to `null` for pre-fn-695 events — re-fold determinism).
+   */
+  planctl_op: string | null;
+  planctl_target: string | null;
   committed_at_ms: number;
 }
 
@@ -840,6 +856,17 @@ export interface EnumeratedCommit {
   files: EnumeratedCommitFile[];
   committer_session_id: string | null;
   task_ids: string[];
+  /**
+   * Epic fn-695: the normalized planctl op (`Planctl-Op:` trailer →
+   * {@link normalizePlanctlOp}) and the validated target ref
+   * (`Planctl-Target:` trailer → {@link parsePlanRef}). Both `null`
+   * when the commit carried no such trailer (every non-`chore(planctl)`
+   * commit) or the value was empty / malformed. Frozen here at producer
+   * time and read back unchanged by the reducer's edge fold — re-fold
+   * determinism (no fold-time git probe).
+   */
+  planctl_op: string | null;
+  planctl_target: string | null;
   committed_at_ms: number;
 }
 
@@ -1018,22 +1045,29 @@ export function enumerateCommitsInDelta(
   next: string,
 ): EnumeratedCommit[] {
   // Epic fn-670 (T1): widen from 4 fields (OID, P, ct, Session-Id) to
-  // SIX (… + Job-Id + Task). Session-Id stays `valueonly,only,unfold`
-  // (take-last canonical session); Job-Id mirrors that policy (also a
-  // session-UUID-shaped value, and the coalesce below picks one); Task
-  // is `valueonly,unfold` with the DEFAULT `\n` separator — we want a
-  // human-newline-separated block of values inside that ONE field so
+  // SIX (… + Job-Id + Task). Epic fn-695 widens to EIGHT (… + Planctl-Op
+  // + Planctl-Target). Session-Id / Job-Id / Planctl-Op / Planctl-Target
+  // all use `valueonly,only,unfold` (take-last single value per key);
+  // Task is `valueonly,unfold` with the DEFAULT `\n` separator — we want
+  // a human-newline-separated block of values inside that ONE field so
   // the outer `%x00` field delimiter survives. Switching the Task
   // separator to `%x00` would collide with the field boundary and
   // realign the stride parser off-by-one. The parser below splits the
   // Task field on `\n` (via {@link parseTaskTrailers}); `\0` is also
   // accepted by that helper as a defensive belt-and-suspenders, but is
   // not used on the live wire here.
+  //
+  // FIELD ORDER IS LOAD-BEARING: the stride loop below consumes fields in
+  // groups of EIGHT, in this exact order. Adding / reordering / dropping a
+  // `%x00` here MUST move the loop's stride (`i += 8`) + every `fields[i+N]`
+  // offset in lockstep, or every field realigns off-by-one for EVERY commit.
   const format =
     "%H%x00%P%x00%ct%x00" +
     "%(trailers:key=Session-Id,valueonly,only,unfold)%x00" +
     "%(trailers:key=Job-Id,valueonly,only,unfold)%x00" +
-    "%(trailers:key=Task,valueonly,unfold)";
+    "%(trailers:key=Task,valueonly,unfold)%x00" +
+    "%(trailers:key=Planctl-Op,valueonly,only,unfold)%x00" +
+    "%(trailers:key=Planctl-Target,valueonly,only,unfold)";
   let out: string | null = null;
   if (prev !== null) {
     out = gitOutput([
@@ -1069,15 +1103,16 @@ export function enumerateCommitsInDelta(
   }
   // Parse: with `-z`, git replaces the per-record `\n` terminator with `\0`
   // — and the `%x00` separators inside the format string also emit literal
-  // NULs in-stream. With the fn-670 widening to six format fields per
-  // record, the wire format for N commits is:
-  //   OID1\0P1\0CT1\0SESSION1\0JOBID1\0TASK1\0OID2\0P2\0CT2\0SESSION2\0JOBID2\0TASK2\0...
-  // — i.e. a flat sequence of 6N NUL-delimited fields with a trailing
+  // NULs in-stream. With the fn-695 widening to EIGHT format fields per
+  // record (fn-670's six + Planctl-Op + Planctl-Target), the wire format
+  // for N commits is:
+  //   OID1\0P1\0CT1\0SESSION1\0JOBID1\0TASK1\0POP1\0PTARGET1\0OID2\0...
+  // — i.e. a flat sequence of 8N NUL-delimited fields with a trailing
   // empty element after the final NUL. Split on `\0` and consume in
-  // groups of 6.
+  // groups of 8.
   const fields = out.split("\0");
   const commits: EnumeratedCommit[] = [];
-  for (let i = 0; i + 5 < fields.length; i += 6) {
+  for (let i = 0; i + 7 < fields.length; i += 8) {
     const oid = (fields[i] ?? "").trim();
     if (oid.length === 0) continue;
     const parentsRaw = (fields[i + 1] ?? "").trim();
@@ -1095,12 +1130,16 @@ export function enumerateCommitsInDelta(
     const sessionTrailers = fields[i + 3] ?? "";
     const jobIdTrailers = fields[i + 4] ?? "";
     const taskTrailers = fields[i + 5] ?? "";
+    const opTrailers = fields[i + 6] ?? "";
+    const targetTrailers = fields[i + 7] ?? "";
     const committerSessionId = coalesceCommitterSessionId(
       sessionTrailers,
       jobIdTrailers,
       oid,
     );
     const taskIds = parseTaskTrailers(taskTrailers);
+    const planctlOp = parsePlanctlOpTrailer(opTrailers);
+    const planctlTarget = parsePlanctlTargetTrailer(targetTrailers);
     const files = commitFiles(root, oid);
     commits.push({
       commit_oid: oid,
@@ -1108,6 +1147,8 @@ export function enumerateCommitsInDelta(
       files,
       committer_session_id: committerSessionId,
       task_ids: taskIds,
+      planctl_op: planctlOp,
+      planctl_target: planctlTarget,
       committed_at_ms: committedAtMs,
     });
   }
@@ -1165,6 +1206,60 @@ function coalesceCommitterSessionId(
   // deriver side).
   if (session !== null) return session;
   return jobId;
+}
+
+/**
+ * Epic fn-695: lift the planctl operation from a commit's `Planctl-Op:`
+ * trailer block and NORMALIZE it the same way the legacy stdout-scrape
+ * path does — via {@link normalizePlanctlOp} (`epic-scaffold` →
+ * `scaffold`, etc.) — so the reducer's `syncPlanctlLinks` union compares
+ * the commit-derived op against the scrape-derived op on one normalized
+ * vocabulary. Take-last on the unfolded value block (mirrors
+ * {@link parseSessionIdTrailer}): the producer requests
+ * `valueonly,only,unfold`, so the common case is a single line, but a
+ * hand-edited stacked block resolves to the last non-empty line. Returns
+ * `null` on empty / whitespace-only / non-string input (no `Planctl-Op:`
+ * trailer — every non-`chore(planctl)` commit). Pure function of its
+ * argument so re-fold determinism holds (the reducer never re-derives —
+ * the normalized op is frozen in the Commit payload at producer time).
+ */
+function parsePlanctlOpTrailer(raw: string): string | null {
+  if (typeof raw !== "string" || raw.length === 0) {
+    return null;
+  }
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = (lines[i] ?? "").trim();
+    if (line.length === 0) continue;
+    return normalizePlanctlOp(line);
+  }
+  return null;
+}
+
+/**
+ * Epic fn-695: lift the planctl target ref from a commit's
+ * `Planctl-Target:` trailer block and validate it against the SAME
+ * epic-ref shape gate the legacy scrape path uses ({@link parsePlanRef}).
+ * Take-last on the unfolded value block (mirrors
+ * {@link parsePlanctlOpTrailer}); returns the raw validated ref string
+ * (`fn-1-foo` or `fn-1-foo.3` — the edge fold folds a task-form ref up to
+ * its parent epic downstream, exactly as `extractPlanctlInvocation` does).
+ * Returns `null` on empty / whitespace-only / non-string input AND on a
+ * value that {@link parsePlanRef} rejects (malformed ref) — so a garbage
+ * trailer never poisons the edge fold. Pure function of its argument
+ * (re-fold determinism — frozen in the Commit payload at producer time).
+ */
+function parsePlanctlTargetTrailer(raw: string): string | null {
+  if (typeof raw !== "string" || raw.length === 0) {
+    return null;
+  }
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = (lines[i] ?? "").trim();
+    if (line.length === 0) continue;
+    return parsePlanRef(line) !== null ? line : null;
+  }
+  return null;
 }
 
 /**
@@ -1789,6 +1884,15 @@ function startWorker(): void {
               // to stamp the per-task `last_commit_for_task_at` on the
               // embedded job element under each named task.
               task_ids: c.task_ids,
+              // Epic fn-695: the normalized planctl op + validated target
+              // ref lifted from this commit's `Planctl-Op:` /
+              // `Planctl-Target:` trailers. Both null on a non-planctl
+              // commit. The reducer's edge fold reads them (with
+              // `committer_session_id`) to mint the commit-derived
+              // creator/refiner edge, deduped against the legacy stdout
+              // scrape in `syncPlanctlLinks`.
+              planctl_op: c.planctl_op,
+              planctl_target: c.planctl_target,
               committed_at_ms: c.committed_at_ms,
             } satisfies CommitMessage);
             // Epic fn-681: authoritative commit-driven planctl ingest.
