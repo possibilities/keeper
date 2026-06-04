@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-04T15:58:22.552358Z",
+  "depends_on": [],
+  "epic": "fn-702-restore-previous-session-two-tier",
+  "id": "fn-702-restore-previous-session-two-tier.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Two-tier restore snapshot end-to-end",
+  "updated_at": "2026-06-04T15:58:22.552358Z"
+}
