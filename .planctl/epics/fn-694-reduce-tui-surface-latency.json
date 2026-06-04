@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-694-reduce-tui-surface-latency",
   "bundles": [],
+  "closer_done_at": "2026-06-04T01:30:45.225544Z",
   "created_at": "2026-06-04T00:42:06.342711Z",
   "depends_on_epics": [],
   "id": "fn-694-reduce-tui-surface-latency",
@@ -9,10 +10,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Reduce TUI surface latency",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-04T00:42:06.342711Z"
+  "updated_at": "2026-06-04T01:30:45.225544Z"
 }
