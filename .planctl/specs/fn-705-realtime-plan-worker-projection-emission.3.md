@@ -70,5 +70,5 @@ attribution/GitSnapshot data flows normally thereafter.
 - [ ] `bun test test/plan-worker.test.ts` passes; no leaked watchers/timers under `--isolate`
 
 ## Done summary
-
+Plan-worker watches each pending repo's .git/logs/HEAD and runs the gated recheckPending() on the commit-append, closing the brand-new/never-seen-repo realtime tail (bounded watch lifecycle, graceful degrade where reflogs are off). It also nudges git-worker discovery the first time it sees a .planctl tree in a repo so attribution/GitSnapshot data flows for never-seen repos.
 ## Evidence
