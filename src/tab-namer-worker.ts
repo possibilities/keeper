@@ -1,19 +1,33 @@
 /**
- * Tab-namer worker (epic fn-680 / task .2). keeperd's ELEVENTH Bun Worker
- * thread, joining the producer / consumer fleet (`wake-worker`,
+ * Tab-namer worker (epic fn-680, reworked fn-699). keeperd's TWELFTH Bun
+ * Worker thread, joining the producer / consumer fleet (`wake-worker`,
  * `server-worker`, `transcript-worker`, `plan-worker`, `exit-watcher`,
  * `git-worker`, `usage-worker`, `dead-letter-worker`, `autopilot-worker`,
  * `backend-worker`, `restore-worker`).
  *
- * On every ~5s tick, the worker reads the live jobs that carry a resolved
+ * On every tick the worker reads the live jobs that carry a resolved
  * `(backend_exec_session_id, backend_exec_tab_id)` pair AND a non-NULL
- * transcript-derived `title`, sanitizes the title for display safety, and
- * (when the sanitized name differs from the last-seen `backend_exec_tab_name`
- * AND from the value already issued in a prior tick) shells the focus-safe
- * zellij `action rename-tab-by-id <id> <name>` op via
- * {@link ExecBackend.renameTab}. End state: `keeper jobs` tabs converge from
- * the cosmetic `verb::id` launch label onto the human transcript title within
- * ~5s of the title becoming available.
+ * transcript-derived `title`, sanitizes the title for display safety, and —
+ * UNCONDITIONALLY, whenever the sanitized name differs from the last-observed
+ * `backend_exec_tab_name` — shells the focus-safe zellij
+ * `action rename-tab-by-id <id> <name>` op via {@link ExecBackend.renameTab}.
+ * End state: `keeper jobs` tabs converge from the cosmetic `verb::id` launch
+ * label onto the human transcript title, and FOLLOW it across drift — a tab
+ * that zellij resets to `Tab #N` on resume (or a tab-mate renames) is
+ * re-asserted within one kick/poll cycle. There is NO permanent
+ * "already-sent" suppression: convergence is idempotent and self-terminating
+ * (the loop stops the moment `tab_name === sanitize(title)`).
+ *
+ * Reactive, mirroring `server-worker.ts` (fn-699). The renamer is driven the
+ * same way the subscribe server is: main posts a `{type:"kick"}` after every
+ * `drainToCompletion` (the fn-694 lever-B fast path), and a `data_version`
+ * poll backstop (~2.5s, autocommit) catches any lost kick. The kick carries
+ * no payload — every tick re-reads current `jobs` state and reconciles from
+ * scratch (edge + level; never derive from the kick). This replaced the old
+ * 5s `setInterval`: the zellij-events feed (fn-684) made drift reach keeper as
+ * a real DB write (a `Tab #N` reset emits a feed line → reducer folds
+ * `backend_exec_tab_name` → `data_version` bumps), so a quiescent DB has no
+ * pending rename and a wall-clock sweep buys nothing.
  *
  * PURE SIDE-EFFECTOR. The worker:
  *  - opens its own READ-ONLY `openDb` connection (the producer-worker
@@ -23,7 +37,8 @@
  *  - NEVER mints a synthetic event (no schema, no reducer arm, no
  *    `keeper/api.py` whitelist change).
  *  - NEVER posts to main (no `parentPort.postMessage` call, no message
- *    kind defined). It accepts only `{type:"shutdown"}` from main.
+ *    kind defined). It RECEIVES `{type:"shutdown"}` and `{type:"kick"}`
+ *    from main; it sends nothing back.
  *
  * The rename is a cosmetic shell-out; no control path reads
  * `backend_exec_tab_name` (fn-678 made tab names purely cosmetic — reap is
@@ -31,22 +46,24 @@
  * `pending_dispatches`), so renaming every live tab — autopilot's
  * included — is safe.
  *
- * Convergence with backend-worker. The fn-668 backend-worker reads zellij's
- * authoritative tab name back into `jobs.backend_exec_tab_name` on ITS own
- * ~5s tick. The two workers form a producer/observer loop:
+ * Convergence with the zellij-events feed. The fn-684 zellij-events worker
+ * reads zellij's authoritative tab name back into `jobs.backend_exec_tab_name`
+ * as feed lines fold. The two form a producer/observer loop:
  *
- *     transcript-worker  -> title    (writes via main, no rename trigger)
- *     tab-namer-worker   -> renames  (read-only, shells zellij)
- *     backend-worker     -> tab_name (writes via main, observation)
+ *     transcript-worker    -> title    (writes via main, kicks the renamer)
+ *     tab-namer-worker     -> renames  (read-only, shells zellij)
+ *     zellij-events-worker -> tab_name (writes via main, observation)
  *
- * The `tab_name` compare alone is NOT the durable debounce — zellij may
- * normalize/escape the stored copy so the round-trip byte-mismatches even
- * after a successful rename, which would oscillate spawns. The success-gated
- * `lastSet` map (keyed on `job_id`, valued by the EXACT sanitized name we
- * sent on the last `{ ok: true }` rename) is the durable suppression: a
- * second tick that produces the same sanitized name skips the spawn
- * regardless of what `backend_exec_tab_name` shows. A failed rename leaves
- * `lastSet` untouched so the next tick retries.
+ * Clear-on-convergence memo. The `tab_name` compare alone is not a sufficient
+ * suppressor — between a `renameTab` success and the feed reporting the new
+ * name there is a post-write observe window in which a kick/poll re-reads the
+ * OLD `tab_name`. A `memo` (keyed `SESSION::PANE_ID`, valued by the EXACT
+ * sanitized name sent on the last `{ ok: true }` rename) suppresses the
+ * re-issue in that window. It is NOT a permanent debounce: the entry is
+ * DELETED the moment a tick observes `tab_name === sanitized` (convergence
+ * observed), so a later drift away from the title re-fires the rename. A
+ * failed rename does NOT write the memo, so the next cycle retries. (Even a
+ * memo miss is harmless: a redundant rename to the same value is idempotent.)
  *
  * Multiple jobs per tab. The schema doesn't enforce one-job-per-tab; in the
  * happy path the autopilot mints one tab per agent so the invariant holds,
@@ -54,7 +71,9 @@
  * fighting over one tab (oscillation), the tick dedups by
  * `(session, tab_id)` deterministically — the job with the lowest `job_id`
  * wins each tick. This degrades a violation to "stable-arbitrary," not
- * "thrash."
+ * "thrash." (`tab_id` is a positional zellij index, stable within one
+ * snapshot, so the per-tick dedup is anti-tab-fight; the memo is keyed by the
+ * stable `pane_id` so it survives a tab_id reshuffle.)
  *
  * Sanitization. `sanitizeTabName` strips control / ANSI / OSC bytes
  * (`\x00-\x1f` + `\x7f`) that would corrupt the zellij tab bar, collapses
@@ -67,48 +86,57 @@
  * `;`, quotes are literal positional bytes — so sanitization is purely
  * for DISPLAY safety, not for command-injection mitigation.
  *
- * Lifecycle. Modelled on `backend-worker.ts`:
- *  - `setInterval` with a default 5s `tickMs` (workerData-overridable for
- *    tests that want a tight cadence). NOT the `watchLoop` /
- *    `PRAGMA data_version` model — the rename converges with the
- *    backend-worker's wall-clock 5s tick, so a clock-driven tick is the
- *    right primitive (a quiescent DB shouldn't block a rename that's
- *    waiting on the backend-worker's next refresh).
- *  - Per-tick `isRunning` re-entry guard: `setInterval` does NOT
- *    self-throttle, so a slow tick (a hung `renameTab` spawn) must not
- *    spawn a parallel tick on top of itself.
- *  - Immediate first tick so a freshly-spawned worker doesn't wait the
- *    full interval before its first sweep.
- *  - Shutdown handler clears the interval, sets the `shuttingDown` flag
- *    (gates the `renameTab` call AFTER the read so a late shutdown
- *    suppresses the spawn), closes the DB, and `setImmediate(exit 0)`s
- *    after a yield so any in-flight tick can settle.
+ * Lifecycle. Modelled on `server-worker.ts` (fn-699):
+ *  - A `pollLoop` reads a naked autocommit `PRAGMA data_version` every
+ *    `pollMs` (default 2500, workerData-overridable for tests) and re-ticks
+ *    only when the counter moves. The poll connection MUST stay autocommit —
+ *    a surrounding `BEGIN` freezes `data_version` and the loop goes blind.
+ *  - A `kick` message branch runs an immediate tick (the fast path); the poll
+ *    is the lost-wakeup backstop. Both are wrapped so a throw never escapes
+ *    (no-self-heal — an uncaught throw crashes the worker and bounces the
+ *    daemon).
+ *  - Per-tick `isRunning` re-entry guard + a `pendingKick` drain-then-arm
+ *    flag: a kick arriving mid-tick sets the flag and the in-flight tick
+ *    re-runs once on completion. Coalesces a burst of kicks into at most one
+ *    trailing tick.
+ *  - Immediate first tick on spawn so a freshly-restarted worker re-converges
+ *    every live tab without waiting for a kick or the first poll interval.
+ *  - Shutdown handler sets the `shuttingDown` flag (gates the `renameTab`
+ *    call AFTER the read so a late shutdown suppresses the spawn), closes the
+ *    DB, and `setImmediate(exit 0)`s after a yield so any in-flight tick can
+ *    settle.
  */
 
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb } from "./db";
 import { type ExecBackend, resolveExecBackend } from "./exec-backend";
+import type { KickMessage } from "./server-worker";
 import type { ShutdownMessage } from "./wake-worker";
 
 /**
- * workerData payload — same shape as the other producer workers
- * (`BackendWorkerData`, `GitWorkerData`): only the absolute DB path is
+ * workerData payload — same shape as the other reader workers
+ * (`ServerWorkerData`, `BackendWorkerData`): only the absolute DB path is
  * required; the worker opens its own read-only connection on the worker
- * thread. `tickMs` is optional (defaults to 5000) — exposed for tests
- * that need a tight cadence without sleeping.
+ * thread. `pollMs` is optional (defaults to 2500) — the `data_version`
+ * poll backstop cadence, exposed for tests that need a tight cadence
+ * without sleeping.
  */
 export interface TabNamerWorkerData {
   dbPath: string;
-  tickMs?: number;
+  pollMs?: number;
 }
 
 /**
- * Default tick cadence. 5s matches `backend-worker`'s read-back cadence
- * so the rename/observe loop converges in one tick when the title is
- * stable. Shorter would spam zellij; longer would stretch the visible
- * lag between transcript title and tab label.
+ * Default `data_version` poll backstop cadence. The kick is the primary
+ * fast path (main posts it after every drain); the poll only catches a
+ * lost kick, so a slacker 2.5s cadence is fine — it never gates the common
+ * case. Floored at {@link MIN_POLL_MS} so a too-tight test override can't
+ * busy-spin.
  */
-const DEFAULT_TICK_MS = 5_000;
+const DEFAULT_POLL_MS = 2_500;
+
+/** Floor on the poll cadence so a tight workerData override can't busy-spin. */
+const MIN_POLL_MS = 25;
 
 /**
  * Strips control / ANSI / OSC bytes, collapses internal whitespace,
@@ -161,6 +189,7 @@ interface LiveJobRow {
   job_id: string;
   backend_exec_session_id: string;
   backend_exec_tab_id: string;
+  backend_exec_pane_id: string | null;
   title: string;
   backend_exec_tab_name: string | null;
 }
@@ -173,6 +202,13 @@ interface LiveJobRow {
  * job's tab is presumed reaped (or about to be), so renaming it would
  * be either a no-op or a race against the autopilot's close pass.
  *
+ * `backend_exec_pane_id` is selected for the convergence memo key (the
+ * stable per-pane identity that survives a `tab_id` reshuffle), but the
+ * `backend_exec_tab_id IS NOT NULL` filter STAYS: the rename targets the
+ * tab id, and pane vs. tab resolve on INDEPENDENT reducer arms
+ * (`src/reducer.ts`), so a pane can be set while the tab is still NULL.
+ * A row missing a tab id can't be renamed and is filtered here.
+ *
  * Exported for test reach so the per-tick logic can be exercised
  * against a known fixture without spawning the worker.
  */
@@ -182,7 +218,7 @@ export function readLiveJobsForTabNaming(
   return db
     .query(
       `SELECT job_id, backend_exec_session_id, backend_exec_tab_id,
-              title, backend_exec_tab_name
+              backend_exec_pane_id, title, backend_exec_tab_name
          FROM jobs
         WHERE backend_exec_session_id IS NOT NULL
           AND backend_exec_tab_id IS NOT NULL
@@ -194,15 +230,21 @@ export function readLiveJobsForTabNaming(
 
 /**
  * Per-tick driver. Pure w.r.t. the DB (read-only); side effect is the
- * `renameTab` call for each (session, tab) whose sanitized title
- * differs from the last-observed `backend_exec_tab_name` AND from the
- * value already issued in a prior tick (the `lastSet` debounce). The
- * `lastSet` map (keyed on `job_id`) lives across ticks in the worker's
- * `main` closure so a successful rename suppresses redundant spawns
- * until the title changes again.
+ * UNCONDITIONAL `renameTab` call for each (session, tab) whose sanitized
+ * title differs from the last-observed `backend_exec_tab_name`. There is no
+ * `job_id`-keyed permanent suppression: convergence is idempotent and
+ * self-terminating (the rename stops firing the moment the observed
+ * `tab_name` equals the sanitized title), so a tab that drifts to the zellij
+ * default after a resume re-converges within one tick.
+ *
+ * The `memo` (keyed `SESSION::PANE_ID`) is a NARROW post-write observe-window
+ * suppressor, not a debounce: it holds the last name we sent on a `{ ok:true }`
+ * rename, suppresses a re-issue while `tab_name` still shows the OLD value, and
+ * is DELETED the moment a tick observes `tab_name === sanitized` (so a later
+ * drift re-fires). It lives across ticks in the worker's `main` closure.
  *
  * Exported for tests: an injected `backend` (a `Pick<ExecBackend,
- * "renameTab">`) lets the test drive the dedup, debounce, and skip
+ * "renameTab">`) lets the test drive the dedup, convergence, and memo
  * behavior without spawning processes.
  */
 export interface TickDeps {
@@ -212,18 +254,28 @@ export interface TickDeps {
    *  forwarding warnings to stderr. Tests inject a stub carrying just
    *  the `renameTab` slot the tick driver actually reads. */
   readonly backend?: Pick<ExecBackend, "renameTab">;
-  /** Success-gated debounce — keyed on `job_id`, valued by the EXACT
-   *  sanitized name sent on the last `{ ok: true }` rename. Mutated
-   *  in place (writes on success, prunes dead jobs at the end of the
-   *  tick). Lives across ticks in the worker's `main` closure. */
-  readonly lastSet: Map<string, string>;
+  /** Post-write observe-window memo — keyed `SESSION::PANE_ID`, valued by
+   *  the EXACT sanitized name sent on the last `{ ok: true }` rename.
+   *  Mutated in place (set on success, deleted on observed convergence,
+   *  pruned of dead panes at the end of the tick). Lives across ticks in
+   *  the worker's `main` closure. */
+  readonly memo: Map<string, string>;
   /** Shutdown predicate — gates the rename call AFTER the read so a
    *  late shutdown suppresses the spawn. */
   readonly isShuttingDown: () => boolean;
 }
 
+/** Memo key — the stable per-pane identity. Survives a `tab_id` reshuffle
+ *  (positional, can move) so the post-write suppression doesn't false-clear
+ *  when zellij renumbers tabs. A row with a NULL pane id (pane not resolved
+ *  yet) keys distinctly off the literal `null` slot — harmless, since the
+ *  memo is only an observe-window optimization. */
+function memoKey(row: LiveJobRow): string {
+  return `${row.backend_exec_session_id}::${row.backend_exec_pane_id ?? "null"}`;
+}
+
 export async function runTick(deps: TickDeps): Promise<void> {
-  const { db, lastSet, isShuttingDown } = deps;
+  const { db, memo, isShuttingDown } = deps;
   const backend =
     deps.backend ??
     resolveExecBackend({
@@ -236,9 +288,10 @@ export async function runTick(deps: TickDeps): Promise<void> {
   // Dedup by `(session, tab_id)`. If two jobs share the same tab (an
   // invariant violation — one tab should host one agent), pick the
   // lowest `job_id` deterministically so the cell's behavior degrades
-  // to stable-arbitrary rather than oscillation. Sorting by `job_id`
-  // first then bucketing by `(session, tab_id)` with "first wins" is
-  // the simplest realization.
+  // to stable-arbitrary rather than oscillation. `tab_id` is the rename
+  // target and is stable within one snapshot, so the per-tick dedup is
+  // the anti-tab-fight guard. Sorting by `job_id` first then bucketing by
+  // `(session, tab_id)` with "first wins" is the simplest realization.
   const sorted = [...rows].sort((a, b) =>
     a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0,
   );
@@ -250,21 +303,21 @@ export async function runTick(deps: TickDeps): Promise<void> {
     }
   }
 
-  // Track which job_ids the live set carries this tick, so we can
-  // prune `lastSet` of dead jobs at the end. Bounds memory under a
-  // never-ending stream of new sessions (each prior agent's id stays
-  // in `lastSet` forever otherwise).
-  const liveJobIds = new Set<string>();
+  // Track which `SESSION::PANE_ID` keys the live set carries this tick, so
+  // we can prune the memo of dead panes at the end. Bounds memory under a
+  // never-ending stream of new sessions (each prior pane's key would stay
+  // in the memo forever otherwise).
+  const livePaneKeys = new Set<string>();
   for (const row of dedup.values()) {
-    liveJobIds.add(row.job_id);
+    livePaneKeys.add(memoKey(row));
   }
 
   // Drive the renames in parallel across distinct (session, tab) —
   // zellij handles concurrent `rename-tab-by-id` against different
-  // tabs cleanly, and the per-(job, name) `lastSet` write happens
-  // only on the resolved promise so there's no race within a job.
-  // (Two jobs sharing a tab won't both reach this loop — the dedup
-  // above keeps only the lowest-job_id winner.)
+  // tabs cleanly, and the per-pane memo write happens only on the
+  // resolved promise so there's no race within a pane. (Two jobs sharing
+  // a tab won't both reach this loop — the dedup above keeps only the
+  // lowest-job_id winner.)
   await Promise.all(
     [...dedup.values()].map(async (row) => {
       const sanitized = sanitizeTabName(row.title);
@@ -274,19 +327,21 @@ export async function runTick(deps: TickDeps): Promise<void> {
         // `verb::id` default, so we don't.
         return;
       }
+      const key = memoKey(row);
       if (sanitized === row.backend_exec_tab_name) {
-        // Already correct (covers the cold-restart case where
-        // backend-worker has folded the name back into the DB and
-        // our `lastSet` is empty after a worker restart). Skip the
-        // spawn.
+        // Convergence OBSERVED: the feed has reported the tab name back
+        // and it matches the sanitized title. Clear any memo entry — this
+        // is what lets a LATER drift away from the title re-fire the
+        // rename (the headline fn-699 fix) — and skip the spawn.
+        memo.delete(key);
         return;
       }
-      if (lastSet.get(row.job_id) === sanitized) {
-        // In-flight debounce: we already issued this exact sanitized
-        // name on a prior tick. Zellij may normalize/escape its
-        // stored copy so the `backend_exec_tab_name` round-trip
-        // byte-mismatches even after the rename landed; without this
-        // gate we'd spawn every 5s forever. Skip.
+      if (memo.get(key) === sanitized) {
+        // Post-write observe window: we already issued this exact sanitized
+        // name and the feed hasn't reported it back yet (or zellij
+        // normalized its stored copy so the `tab_name` round-trip
+        // byte-mismatches). Suppress the redundant re-issue. (Even if this
+        // slips through, a rename to the same value is idempotent.)
         return;
       }
       if (isShuttingDown()) {
@@ -306,7 +361,7 @@ export async function runTick(deps: TickDeps): Promise<void> {
         // depth here keeps a rogue throw (a future code path that
         // surfaces an error, an injected backend in a test) from
         // wedging the tick's `Promise.all` walk. Log + skip; the
-        // next tick retries (we don't write `lastSet`).
+        // next tick retries (we don't write the memo).
         console.error(
           `[tab-namer-worker] renameTab threw for session=${row.backend_exec_session_id} tab=${row.backend_exec_tab_id}: ${
             err instanceof Error ? err.message : String(err)
@@ -315,25 +370,25 @@ export async function runTick(deps: TickDeps): Promise<void> {
         return;
       }
       if (result.ok) {
-        // Success-gated debounce: record the EXACT name we sent (not
-        // the title, not whatever zellij chooses to store) so the
-        // next-tick compare against `lastSet` lands even if
-        // `backend_exec_tab_name` shows a normalized form.
-        lastSet.set(row.job_id, sanitized);
+        // Record the EXACT name we sent (not the title, not whatever
+        // zellij chooses to store) so the next-tick compare against the
+        // memo suppresses the redundant re-issue during the observe
+        // window even if `backend_exec_tab_name` shows a normalized form.
+        memo.set(key, sanitized);
       }
       // A failed rename (tab gone, session dead, zellij missing) does
-      // NOT write `lastSet`. The next tick will retry — a transient
+      // NOT write the memo. The next tick will retry — a transient
       // failure self-heals when the tab/session comes back; a
       // permanent failure (the job ended) gets pruned below.
     }),
   );
 
-  // Prune dead job_ids from `lastSet` (jobs that left the live set —
-  // ended, killed, or had their session/tab cleared). Bounds memory
+  // Prune dead pane keys from the memo (panes that left the live set —
+  // ended, killed, or had their session/pane cleared). Bounds memory
   // so the map doesn't grow unbounded across a long-running daemon.
-  for (const jobId of [...lastSet.keys()]) {
-    if (!liveJobIds.has(jobId)) {
-      lastSet.delete(jobId);
+  for (const key of [...memo.keys()]) {
+    if (!livePaneKeys.has(key)) {
+      memo.delete(key);
     }
   }
 }
@@ -351,50 +406,91 @@ function main(): void {
   const port = parentPort;
 
   const { db } = openDb(data.dbPath, { readonly: true });
-  const tickMs = data.tickMs ?? DEFAULT_TICK_MS;
-  const lastSet = new Map<string, string>();
+  const pollMs = Math.max(MIN_POLL_MS, data.pollMs ?? DEFAULT_POLL_MS);
+  const memo = new Map<string, string>();
   let shuttingDown = false;
   let isRunning = false;
+  // Drain-then-arm: a kick/poll arriving while a tick is in flight sets this
+  // flag instead of stacking a parallel tick; the in-flight tick re-runs once
+  // on completion if set. Coalesces a burst into at most one trailing tick.
+  let pendingKick = false;
 
   const isShuttingDown = (): boolean => shuttingDown;
 
+  // Run one reconcile tick. Re-entrancy-safe via `isRunning`; a concurrent
+  // request sets `pendingKick` and the in-flight tick drains it on the way
+  // out. Wrapped so a throw NEVER escapes (no-self-heal — an uncaught throw
+  // would crash the worker and bounce the daemon).
   const tick = async (): Promise<void> => {
-    if (isRunning) return; // Per-tick guard — `setInterval` does NOT self-throttle.
     if (shuttingDown) return;
+    if (isRunning) {
+      // A tick is already running; arm a trailing re-run instead of stacking.
+      pendingKick = true;
+      return;
+    }
     isRunning = true;
     try {
-      await runTick({
-        db,
-        lastSet,
-        isShuttingDown,
-      });
-    } catch (err) {
-      // `runTick` already catches per-rename throws; this catches anything
-      // upstream (DB read failure on the live-jobs query, etc.). Log +
-      // continue — the next tick will retry. NEVER throw out of here,
-      // or the interval callback rejects and the event loop logs a stderr
-      // trace but the interval keeps firing — we want the explicit log
-      // line instead.
-      console.error(
-        `[tab-namer-worker] tick threw: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      do {
+        pendingKick = false;
+        try {
+          await runTick({ db, memo, isShuttingDown });
+        } catch (err) {
+          // `runTick` already catches per-rename throws; this catches anything
+          // upstream (DB read failure on the live-jobs query, etc.). Log +
+          // continue — the next kick/poll retries. NEVER throw out of here.
+          console.error(
+            `[tab-namer-worker] tick threw: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        // Loop again if a kick landed mid-tick (drain-then-arm coalescing).
+      } while (pendingKick && !shuttingDown);
     } finally {
       isRunning = false;
     }
   };
 
-  const tickTimer = setInterval(() => {
-    void tick();
-  }, tickMs);
+  // Realtime `data_version` poll backstop. Mirrors `server-worker.ts`'s
+  // `pollLoop`: a naked autocommit `PRAGMA data_version` read, re-tick only on
+  // a change. The kick is the primary fast path; this catches any lost kick.
+  // CRITICAL: the poll connection stays autocommit — a surrounding `BEGIN`
+  // freezes `data_version` for this connection and the loop goes blind.
+  const pollLoop = async (): Promise<void> => {
+    const query = db.query("PRAGMA data_version");
+    let last = (query.get() as { data_version: number }).data_version;
+    while (!shuttingDown) {
+      await Bun.sleep(pollMs);
+      if (shuttingDown) break;
+      const cur = (query.get() as { data_version: number }).data_version;
+      if (cur !== last) {
+        last = cur;
+        await tick();
+      }
+    }
+  };
 
-  // Run one immediate tick so a freshly-spawned worker doesn't wait
-  // the full interval before sweeping the first batch.
+  // Run one immediate tick so a freshly-spawned worker re-converges every
+  // live tab without waiting for a kick or the first poll interval
+  // (cold-restart re-convergence).
   void tick();
 
-  port.on("message", (msg: ShutdownMessage | undefined) => {
+  // Start the poll backstop. A crash in the loop is unrecoverable: no
+  // self-heal, exit non-zero → LaunchAgent restart.
+  pollLoop().catch((err) => {
+    console.error("[tab-namer-worker] poll loop crashed:", err);
+    process.exit(1);
+  });
+
+  port.on("message", (msg: ShutdownMessage | KickMessage | undefined) => {
+    if (msg?.type === "kick") {
+      // fn-699 fast path: main folded an event and kicked us so we run the
+      // reconcile tick now instead of waiting for the next poll tick. The
+      // try/catch lives inside `tick` — this handler must never throw
+      // (no-self-heal path).
+      void tick();
+      return;
+    }
     if (msg?.type !== "shutdown") return;
     shuttingDown = true;
-    clearInterval(tickTimer);
     try {
       db.close();
     } catch {

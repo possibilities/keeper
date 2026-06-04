@@ -1,32 +1,35 @@
 /**
- * Tab-namer worker tests (epic fn-680 / task .2).
+ * Tab-namer worker tests (epic fn-680, reworked fn-699).
  *
  * Exercise the pure `runTick` + `readLiveJobsForTabNaming` +
  * `sanitizeTabName` symbols against a fresh writer DB seeded by direct
  * `INSERT INTO jobs`, with a stubbed `backend` carrying just the
  * `renameTab` slot so no real `zellij` ever spawns. The worker's
- * lifecycle (Worker thread, setInterval, parentPort.postMessage) is
- * exercised indirectly through these helpers — the same shape the
- * backend-worker test uses.
+ * lifecycle (Worker thread, kick + `data_version` poll, parentPort
+ * messaging) is exercised indirectly through these helpers — the same
+ * shape the server-worker test uses.
  *
  * Coverage:
  *  - `sanitizeTabName`: strips control / ANSI bytes (incl. embedded ESC
  *    sequences), collapses whitespace, trims, strips a leading `-`,
- *    caps length by Unicode code point.
+ *    no length cap.
  *  - `readLiveJobsForTabNaming`: only jobs with session+tab_id+title set
  *    AND non-resting state surface; null fields and ended/killed jobs
- *    are filtered out.
- *  - `runTick`: renames only when the sanitized title differs from
- *    `backend_exec_tab_name`; success-gated `lastSet` debounce
- *    suppresses redundant renames across ticks; a `{ok:false}` return
- *    is NOT recorded in `lastSet` (retried next tick).
+ *    are filtered out; `backend_exec_pane_id` is selected.
+ *  - `runTick`: renames UNCONDITIONALLY when the sanitized title differs
+ *    from `backend_exec_tab_name`; the `SESSION::PANE_ID` memo suppresses
+ *    a re-issue only in the post-write observe window; a `{ok:false}`
+ *    return is NOT recorded in the memo (retried next tick).
+ *  - `runTick`: a drift back to the zellij default after convergence
+ *    re-fires the rename (the headline fn-699 fix), because the memo is
+ *    cleared on observed convergence.
  *  - `runTick`: dedups by `(session, tab_id)` deterministically (lowest
  *    job_id wins) — invariant-violation cases degrade to stable-
  *    arbitrary, not oscillation.
  *  - `runTick`: empty sanitized title → no rename (never sends blank).
  *  - `runTick`: `isShuttingDown=true` between the read and the rename
  *    suppresses the call.
- *  - `runTick`: `lastSet` prunes job_ids that left the live set
+ *  - `runTick`: the memo prunes pane keys that left the live set
  *    (memory-bound).
  */
 
@@ -74,6 +77,7 @@ function insertJob(opts: {
   state?: string;
   backend_exec_session_id?: string | null;
   backend_exec_tab_id?: string | null;
+  backend_exec_pane_id?: string | null;
   title?: string | null;
   backend_exec_tab_name?: string | null;
 }): void {
@@ -81,14 +85,15 @@ function insertJob(opts: {
   db.run(
     `INSERT INTO jobs (
        job_id, created_at, state, last_event_id, updated_at,
-       backend_exec_session_id, backend_exec_tab_id,
+       backend_exec_session_id, backend_exec_tab_id, backend_exec_pane_id,
        title, backend_exec_tab_name
-     ) VALUES (?, 1000, ?, 0, 1000, ?, ?, ?, ?)`,
+     ) VALUES (?, 1000, ?, 0, 1000, ?, ?, ?, ?, ?)`,
     [
       opts.job_id,
       state,
       opts.backend_exec_session_id ?? null,
       opts.backend_exec_tab_id ?? null,
+      opts.backend_exec_pane_id ?? null,
       opts.title ?? null,
       opts.backend_exec_tab_name ?? null,
     ],
@@ -201,6 +206,7 @@ test("readLiveJobsForTabNaming: surfaces only jobs with session+tab_id+title set
     job_id: "a",
     backend_exec_session_id: "autopilot",
     backend_exec_tab_id: "3",
+    backend_exec_pane_id: "p-a",
     title: "the title",
   });
   insertJob({
@@ -212,7 +218,9 @@ test("readLiveJobsForTabNaming: surfaces only jobs with session+tab_id+title set
   insertJob({
     job_id: "c",
     backend_exec_session_id: "autopilot",
-    backend_exec_tab_id: null, // missing tab_id → filtered
+    backend_exec_tab_id: null, // missing tab_id → filtered (pane can resolve
+    // before the tab, but rename targets the tab id)
+    backend_exec_pane_id: "p-c",
     title: "x",
   });
   insertJob({
@@ -224,6 +232,8 @@ test("readLiveJobsForTabNaming: surfaces only jobs with session+tab_id+title set
 
   const rows = readLiveJobsForTabNaming(db);
   expect(rows.map((r) => r.job_id).sort()).toEqual(["a"]);
+  // The pane id is selected for the convergence memo key.
+  expect(rows[0]?.backend_exec_pane_id).toBe("p-a");
 });
 
 test("readLiveJobsForTabNaming: filters out ended / killed jobs", () => {
@@ -246,14 +256,20 @@ test("readLiveJobsForTabNaming: filters out ended / killed jobs", () => {
 });
 
 // ---------------------------------------------------------------------------
-// runTick — rename, dedup, debounce, skip behavior
+// runTick — rename, dedup, memo, drift, skip behavior
 // ---------------------------------------------------------------------------
+
+/** Memo key the worker uses for a row: `SESSION::PANE_ID`. */
+function key(session: string, paneId: string): string {
+  return `${session}::${paneId}`;
+}
 
 test("runTick: renames only when sanitized title differs from backend_exec_tab_name", async () => {
   insertJob({
     job_id: "a",
     backend_exec_session_id: "s",
     backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p1",
     title: "new title",
     backend_exec_tab_name: "old name",
   });
@@ -262,57 +278,124 @@ test("runTick: renames only when sanitized title differs from backend_exec_tab_n
     job_id: "b",
     backend_exec_session_id: "s",
     backend_exec_tab_id: "2",
+    backend_exec_pane_id: "p2",
     title: "stable",
     backend_exec_tab_name: "stable",
   });
 
   const calls: RenameCall[] = [];
   const backend = makeBackendStub(calls);
-  const lastSet = new Map<string, string>();
+  const memo = new Map<string, string>();
   await runTick({
     db,
     backend,
-    lastSet,
+    memo,
     isShuttingDown: () => false,
   });
 
   expect(calls).toHaveLength(1);
   expect(calls[0]).toEqual({ session: "s", tabId: "1", name: "new title" });
-  // Success-gated lastSet records the sent name keyed on job_id.
-  expect(lastSet.get("a")).toBe("new title");
-  expect(lastSet.has("b")).toBe(false);
+  // The memo records the sent name keyed on SESSION::PANE_ID.
+  expect(memo.get(key("s", "p1"))).toBe("new title");
+  expect(memo.has(key("s", "p2"))).toBe(false);
 });
 
-test("runTick: lastSet debounce suppresses a redundant rename across ticks", async () => {
+test("runTick: memo suppresses a redundant re-issue in the post-write observe window", async () => {
   insertJob({
     job_id: "a",
     backend_exec_session_id: "s",
     backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p1",
+    // tab_name still shows the old value (the feed hasn't observed the new
+    // name back yet) → only the memo protects us from a re-issue.
     title: "new title",
-    backend_exec_tab_name: "old name", // never matches; only debounce protects us
+    backend_exec_tab_name: "old name",
   });
 
   const calls: RenameCall[] = [];
   const backend = makeBackendStub(calls);
-  const lastSet = new Map<string, string>();
+  const memo = new Map<string, string>();
 
-  // Tick 1: renames and records lastSet.
-  await runTick({ db, backend, lastSet, isShuttingDown: () => false });
+  // Tick 1: renames and records the memo.
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
   expect(calls).toHaveLength(1);
-  expect(lastSet.get("a")).toBe("new title");
+  expect(memo.get(key("s", "p1"))).toBe("new title");
 
-  // Tick 2: backend_exec_tab_name still shows "old name" (the live
-  // worker hasn't observed back yet) but lastSet shows we already
-  // issued "new title" — skip.
-  await runTick({ db, backend, lastSet, isShuttingDown: () => false });
+  // Tick 2: backend_exec_tab_name STILL shows "old name" (post-write observe
+  // window — the feed hasn't reported the rename back yet) but the memo shows
+  // we already issued "new title" → suppress.
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
   expect(calls).toHaveLength(1); // unchanged
 });
 
-test("runTick: { ok: false } from the backend is NOT recorded in lastSet (retried next tick)", async () => {
+test("runTick: clears the memo on observed convergence (tab_name === sanitized)", async () => {
+  // Pre-seed the memo as if we sent "title" on a prior tick; now the feed has
+  // reported it back so tab_name matches. The tick must DELETE the memo entry
+  // (so a later drift can re-fire) and issue no rename.
   insertJob({
     job_id: "a",
     backend_exec_session_id: "s",
     backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p1",
+    title: "title",
+    backend_exec_tab_name: "title", // converged
+  });
+
+  const calls: RenameCall[] = [];
+  const backend = makeBackendStub(calls);
+  const memo = new Map<string, string>([[key("s", "p1"), "title"]]);
+
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
+  expect(calls).toEqual([]);
+  // Memo entry cleared on observed convergence.
+  expect(memo.has(key("s", "p1"))).toBe(false);
+});
+
+test("runTick: a drift back to the zellij default after convergence re-fires the rename (fn-699)", async () => {
+  // The headline fix. Converge, then simulate the tab drifting back to the
+  // zellij default (`Tab #5`) after a resume; the renamer must re-assert.
+  insertJob({
+    job_id: "a",
+    backend_exec_session_id: "s",
+    backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p1",
+    title: "my session",
+    backend_exec_tab_name: "old", // initial: needs a rename
+  });
+
+  const calls: RenameCall[] = [];
+  const backend = makeBackendStub(calls);
+  const memo = new Map<string, string>();
+
+  // Tick 1: rename to "my session", memo set.
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]?.name).toBe("my session");
+  expect(memo.get(key("s", "p1"))).toBe("my session");
+
+  // Feed observes the rename back → convergence. A tick now clears the memo.
+  db.run(
+    "UPDATE jobs SET backend_exec_tab_name = 'my session' WHERE job_id = 'a'",
+  );
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
+  expect(calls).toHaveLength(1); // no new rename
+  expect(memo.has(key("s", "p1"))).toBe(false); // cleared on convergence
+
+  // DRIFT: zellij resets the tab to its default on resume. The renamer must
+  // re-converge — the old job-id `lastSet` model permanently suppressed this.
+  db.run("UPDATE jobs SET backend_exec_tab_name = 'Tab #5' WHERE job_id = 'a'");
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
+  expect(calls).toHaveLength(2); // re-asserted
+  expect(calls[1]?.name).toBe("my session");
+  expect(memo.get(key("s", "p1"))).toBe("my session");
+});
+
+test("runTick: { ok: false } from the backend is NOT recorded in the memo (retried next tick)", async () => {
+  insertJob({
+    job_id: "a",
+    backend_exec_session_id: "s",
+    backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p1",
     title: "new title",
     backend_exec_tab_name: "old name",
   });
@@ -326,17 +409,17 @@ test("runTick: { ok: false } from the backend is NOT recorded in lastSet (retrie
     }
     return { ok: true };
   });
-  const lastSet = new Map<string, string>();
+  const memo = new Map<string, string>();
 
-  // Tick 1: backend returns failure → no lastSet write.
-  await runTick({ db, backend, lastSet, isShuttingDown: () => false });
+  // Tick 1: backend returns failure → no memo write.
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
   expect(calls).toHaveLength(1);
-  expect(lastSet.has("a")).toBe(false);
+  expect(memo.has(key("s", "p1"))).toBe(false);
 
-  // Tick 2: lastSet still empty → retry; this time success.
-  await runTick({ db, backend, lastSet, isShuttingDown: () => false });
+  // Tick 2: memo still empty → retry; this time success.
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
   expect(calls).toHaveLength(2);
-  expect(lastSet.get("a")).toBe("new title");
+  expect(memo.get(key("s", "p1"))).toBe("new title");
 });
 
 test("runTick: skips a job whose sanitized title is empty", async () => {
@@ -344,17 +427,18 @@ test("runTick: skips a job whose sanitized title is empty", async () => {
     job_id: "a",
     backend_exec_session_id: "s",
     backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p1",
     title: "   \n\t  ", // sanitizes to ""
     backend_exec_tab_name: "old name",
   });
 
   const calls: RenameCall[] = [];
   const backend = makeBackendStub(calls);
-  const lastSet = new Map<string, string>();
+  const memo = new Map<string, string>();
 
-  await runTick({ db, backend, lastSet, isShuttingDown: () => false });
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
   expect(calls).toEqual([]);
-  expect(lastSet.has("a")).toBe(false);
+  expect(memo.has(key("s", "p1"))).toBe(false);
 });
 
 test("runTick: dedup by (session, tab_id) keeps the lowest job_id", async () => {
@@ -364,6 +448,7 @@ test("runTick: dedup by (session, tab_id) keeps the lowest job_id", async () => 
     job_id: "z-job",
     backend_exec_session_id: "s",
     backend_exec_tab_id: "1",
+    backend_exec_pane_id: "pz",
     title: "loser",
     backend_exec_tab_name: "old",
   });
@@ -371,20 +456,21 @@ test("runTick: dedup by (session, tab_id) keeps the lowest job_id", async () => 
     job_id: "a-job",
     backend_exec_session_id: "s",
     backend_exec_tab_id: "1",
+    backend_exec_pane_id: "pa",
     title: "winner",
     backend_exec_tab_name: "old",
   });
 
   const calls: RenameCall[] = [];
   const backend = makeBackendStub(calls);
-  const lastSet = new Map<string, string>();
+  const memo = new Map<string, string>();
 
-  await runTick({ db, backend, lastSet, isShuttingDown: () => false });
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
   expect(calls).toHaveLength(1);
   expect(calls[0]?.name).toBe("winner");
-  // lastSet is keyed by job_id; the winner is the one recorded.
-  expect(lastSet.get("a-job")).toBe("winner");
-  expect(lastSet.has("z-job")).toBe(false);
+  // memo is keyed SESSION::PANE_ID; only the winner's pane is recorded.
+  expect(memo.get(key("s", "pa"))).toBe("winner");
+  expect(memo.has(key("s", "pz"))).toBe(false);
 });
 
 test("runTick: distinct (session, tab) pairs each get one rename", async () => {
@@ -392,6 +478,7 @@ test("runTick: distinct (session, tab) pairs each get one rename", async () => {
     job_id: "a",
     backend_exec_session_id: "s1",
     backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p1",
     title: "A",
     backend_exec_tab_name: "old",
   });
@@ -399,6 +486,7 @@ test("runTick: distinct (session, tab) pairs each get one rename", async () => {
     job_id: "b",
     backend_exec_session_id: "s1",
     backend_exec_tab_id: "2",
+    backend_exec_pane_id: "p2",
     title: "B",
     backend_exec_tab_name: "old",
   });
@@ -406,15 +494,16 @@ test("runTick: distinct (session, tab) pairs each get one rename", async () => {
     job_id: "c",
     backend_exec_session_id: "s2",
     backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p3",
     title: "C",
     backend_exec_tab_name: "old",
   });
 
   const calls: RenameCall[] = [];
   const backend = makeBackendStub(calls);
-  const lastSet = new Map<string, string>();
+  const memo = new Map<string, string>();
 
-  await runTick({ db, backend, lastSet, isShuttingDown: () => false });
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
   expect(calls).toHaveLength(3);
   expect(calls.map((c) => `${c.session}/${c.tabId}=${c.name}`).sort()).toEqual([
     "s1/1=A",
@@ -428,47 +517,49 @@ test("runTick: isShuttingDown=true between read and rename suppresses the call",
     job_id: "a",
     backend_exec_session_id: "s",
     backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p1",
     title: "new title",
     backend_exec_tab_name: "old",
   });
 
   const calls: RenameCall[] = [];
   const backend = makeBackendStub(calls);
-  const lastSet = new Map<string, string>();
+  const memo = new Map<string, string>();
 
   await runTick({
     db,
     backend,
-    lastSet,
+    memo,
     isShuttingDown: () => true, // already shut down
   });
 
   expect(calls).toEqual([]);
-  expect(lastSet.has("a")).toBe(false);
+  expect(memo.has(key("s", "p1"))).toBe(false);
 });
 
-test("runTick: prunes lastSet of job_ids that left the live set", async () => {
+test("runTick: prunes the memo of pane keys that left the live set", async () => {
   insertJob({
     job_id: "still-live",
     backend_exec_session_id: "s",
     backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p-live",
     title: "T",
     backend_exec_tab_name: "old",
   });
-  // "dead" is NOT in the live set this tick (e.g. it ended between
-  // ticks). Pre-seed lastSet with it.
-  const lastSet = new Map<string, string>([
-    ["still-live", "stale"],
-    ["dead", "old"],
+  // The "p-dead" pane is NOT in the live set this tick (e.g. it ended
+  // between ticks). Pre-seed the memo with it.
+  const memo = new Map<string, string>([
+    [key("s", "p-live"), "stale"],
+    [key("s", "p-dead"), "old"],
   ]);
 
   const calls: RenameCall[] = [];
   const backend = makeBackendStub(calls);
 
-  await runTick({ db, backend, lastSet, isShuttingDown: () => false });
-  // "dead" pruned; "still-live" gets an updated lastSet entry.
-  expect(lastSet.has("dead")).toBe(false);
-  expect(lastSet.get("still-live")).toBe("T");
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
+  // "p-dead" pruned; "p-live" gets an updated memo entry.
+  expect(memo.has(key("s", "p-dead"))).toBe(false);
+  expect(memo.get(key("s", "p-live"))).toBe("T");
 });
 
 test("runTick: skips a job whose title only differs from tab_name AFTER sanitization", async () => {
@@ -478,14 +569,15 @@ test("runTick: skips a job whose title only differs from tab_name AFTER sanitiza
     job_id: "a",
     backend_exec_session_id: "s",
     backend_exec_tab_id: "1",
+    backend_exec_pane_id: "p1",
     title: "  stable\t",
     backend_exec_tab_name: "stable",
   });
 
   const calls: RenameCall[] = [];
   const backend = makeBackendStub(calls);
-  const lastSet = new Map<string, string>();
+  const memo = new Map<string, string>();
 
-  await runTick({ db, backend, lastSet, isShuttingDown: () => false });
+  await runTick({ db, backend, memo, isShuttingDown: () => false });
   expect(calls).toEqual([]);
 });

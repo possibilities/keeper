@@ -1410,6 +1410,14 @@ function runDaemon(): void {
     // nothing) and during shutdown.
     if (folded && !shuttingDown) {
       serverWorker.postMessage({ type: "kick" } satisfies KickMessage);
+      // fn-699: also kick the tab-namer so it runs its reconcile tick
+      // immediately. A fold may have moved `title` (transcript worker) or
+      // `backend_exec_tab_name` (zellij-events feed drift), and the renamer
+      // must re-converge the tab name. Same edge-triggered hint as the
+      // server-worker kick; the tab-namer's `data_version` poll is the
+      // lost-wakeup backstop, and its tick is idempotent so a kick+poll
+      // double-fire is a harmless no-op.
+      tabNamerWorker.postMessage({ type: "kick" } satisfies KickMessage);
     }
   }
 
@@ -2877,20 +2885,23 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
-  // Spawn the tab-namer worker (fn-680 task .3) — the TWELFTH worker
-  // thread. A PURE SIDE-EFFECTOR: it opens its own read-only connection,
-  // ticks every ~5s, reads the live jobs that carry a resolved
+  // Spawn the tab-namer worker (fn-680, reworked fn-699) — the TWELFTH
+  // worker thread. A PURE SIDE-EFFECTOR: it opens its own read-only
+  // connection and — reactively, kicked by main after every drain plus a
+  // `data_version` poll backstop (mirroring the server-worker) — reads the
+  // live jobs that carry a resolved
   // `(backend_exec_session_id, backend_exec_tab_id)` pair AND a non-NULL
-  // transcript `title`, and shells the focus-safe zellij
-  // `action rename-tab-by-id` op via `ExecBackend.renameTab` whenever
-  // the sanitized title differs from the last-observed
-  // `backend_exec_tab_name` and from the value already issued in a
-  // prior tick. The worker writes NOTHING to the DB, mints no events,
-  // and posts nothing to main — fn-678 made the tab name purely
-  // cosmetic (reap is by `backend_exec_tab_id`, launch dedup by
-  // `pending_dispatches`), so renaming every tab is safe and the
-  // convergence loop closes through the zellij-events feed's read-back
-  // of `backend_exec_tab_name`. No `onmessage` handler — pure consumer.
+  // transcript `title`, then shells the focus-safe zellij
+  // `action rename-tab-by-id` op via `ExecBackend.renameTab` UNCONDITIONALLY
+  // whenever the sanitized title differs from the last-observed
+  // `backend_exec_tab_name` (no permanent suppression — a tab that drifts
+  // back to `Tab #N` on resume re-converges within one kick/poll cycle).
+  // The worker writes NOTHING to the DB, mints no events, and posts nothing
+  // back to main — fn-678 made the tab name purely cosmetic (reap is by
+  // `backend_exec_tab_id`, launch dedup by `pending_dispatches`), so
+  // renaming every tab is safe and the convergence loop closes through the
+  // zellij-events feed's read-back of `backend_exec_tab_name`. It RECEIVES
+  // `{type:"kick"}` and `{type:"shutdown"}` from main; it sends nothing.
   const tabNamerWorker = new Worker(
     new URL("./tab-namer-worker.ts", import.meta.url).href,
     {
