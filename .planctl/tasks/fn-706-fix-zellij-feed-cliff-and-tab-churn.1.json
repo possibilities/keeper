@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-06-04T23:35:15.266144Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "kill the oversize feed cliff with tail-read",
-  "updated_at": "2026-06-04T23:50:23.972686Z",
+  "updated_at": "2026-06-04T23:57:02.644916Z",
   "worker_done_at": "2026-06-04T23:50:23.972686Z"
 }
