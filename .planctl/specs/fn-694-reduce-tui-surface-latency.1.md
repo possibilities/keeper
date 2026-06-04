@@ -72,5 +72,5 @@ after — jobs p50/p90 should drop.
 - [ ] bench-latency jobs p50/p90 measurably lower after the change (record numbers in Evidence)
 
 ## Done summary
-
+Lever A1: subscribeCollection now direct-merges the server's patch row in place and renders via onRows with no refetch round-trip; meta still refetches. Threads the descriptor's real pk+version via getCollection, guards on gotResult + a per-(collection,pk) strictly-newer version cursor + page membership, and copies out a fresh array. bench-latency jobs p50 321->176ms (-45%), p90 406->356ms, min 230->33ms.
 ## Evidence

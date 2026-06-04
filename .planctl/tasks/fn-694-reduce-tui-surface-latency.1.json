@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Direct-render patch frames in sidecar subscriptions",
-  "updated_at": "2026-06-04T00:42:06.342711Z"
+  "updated_at": "2026-06-04T00:55:35.090472Z",
+  "worker_done_at": "2026-06-04T00:55:35.090472Z"
 }
