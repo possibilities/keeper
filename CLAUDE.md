@@ -143,7 +143,7 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   v54 / fn-695).** The same `Commit` payload also freezes three planctl
   trailers the git-worker lifts off the commit message — `Planctl-Op`,
   `Planctl-Target`, and a v4-UUID `Session-Id` (stamped by planctl on every
-  `chore(planctl)` commit; omitted when `PLANCTL_SESSION_ID` is absent and
+  `chore(planctl)` commit; omitted when `CLAUDE_CODE_SESSION_ID` is absent and
   the commit still lands). When all three are non-null and the target
   parses, `foldCommit` ALSO triggers the per-session creator/refiner edge
   rebuild (`syncPlanctlLinks(committer_session_id, …)`) — it NEVER writes
