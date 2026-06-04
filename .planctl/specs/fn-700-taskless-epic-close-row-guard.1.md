@@ -90,5 +90,5 @@ implements this task.
 - [ ] `bun test test/readiness.test.ts` passes.
 
 ## Done summary
-
+Added BlockReason variant epic-no-tasks with a rank-9.5 guard in evaluateCloseRow so a validated zero-task epic blocks instead of vacuously falling through to ready; locked the autopilot side via verbForVerdict and documented the gate in CLAUDE.md.
 ## Evidence
