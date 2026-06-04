@@ -83,6 +83,7 @@
  *     SIGINT-prints stay per-script).
  */
 
+import { getCollection } from "./collections";
 import {
   encodeFrame,
   type FilterValue,
@@ -298,10 +299,40 @@ interface CollectionState {
   readonly collection: string;
   readonly subId: string;
   readonly pk: string;
+  /**
+   * The descriptor's monotonic per-row version column name (`last_event_id`
+   * for most collections; `dl_written_at` for `dead_letters`). Read off each
+   * patched/result row to drive the per-`(collection, pk)` version guard in
+   * the direct-merge path. Empty string when the collection is unknown — the
+   * guard then degrades to "always accept" (no column to compare), which is
+   * inert for `subscribeReadiness` since it never direct-merges.
+   */
+  readonly version: string;
+  /**
+   * When true, a `patch` frame merges its `frame.row` directly into this
+   * state and fires `onResult` — no refetch round-trip (Lever A1, fn-694.1).
+   * Set ONLY by `subscribeCollection` (the sidecar helper); left false for
+   * `subscribeReadiness` (the board, whose re-entrant-rows merge is
+   * deliberately out of scope and stays on `scheduleRefetchFor`). `meta`
+   * frames always refetch regardless — a membership change can't be
+   * reconstructed from one row.
+   */
+  readonly directMergePatch: boolean;
   readonly query: QueryFrame;
   order: string[];
   byId: Map<string, Record<string, unknown>>;
   rows: unknown[];
+  /**
+   * Per-`(collection, pk-value)` last-seen version cursor for the direct-
+   * merge guard. Keyed by the row's pk VALUE (collection is fixed per state,
+   * so this satisfies the per-`(collection, pk)` requirement); value is the
+   * row's `version`-column value at the time it was last rendered. A `patch`
+   * whose row version isn't strictly greater than the stored cursor is
+   * dropped (belt-and-suspenders against reconnect-replay / out-of-order
+   * delivery; the server already gates and UDS is in-order). Seeded from the
+   * `result` frame's rows and cleared on teardown alongside `byId`/`order`.
+   */
+  lastSeenVersion: Map<string, number>;
   gotResult: boolean;
   queryInFlight: boolean;
   refetchDirty: boolean;
@@ -331,15 +362,19 @@ function makeState(
   subId: string,
   pk: string,
   query: QueryFrame,
+  opts?: { version?: string; directMergePatch?: boolean },
 ): CollectionState {
   return {
     collection,
     subId,
     pk,
+    version: opts?.version ?? "",
+    directMergePatch: opts?.directMergePatch ?? false,
     query,
     order: [],
     byId: new Map(),
     rows: [],
+    lastSeenVersion: new Map(),
     gotResult: false,
     queryInFlight: false,
     refetchDirty: false,
@@ -671,6 +706,77 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     }
   }
 
+  /**
+   * Read a row's monotonic version-column value as a number, or `null` when
+   * the column is absent / non-numeric (or the state has no version column —
+   * an unknown collection). The descriptor's `version` is `last_event_id`
+   * (an integer) for every collection but `dead_letters`, whose
+   * `dl_written_at` is an epoch-ms integer — both compare with `>` cleanly.
+   */
+  function rowVersion(
+    state: CollectionState,
+    row: Record<string, unknown>,
+  ): number | null {
+    if (state.version === "") {
+      return null;
+    }
+    const raw = row[state.version];
+    return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+  }
+
+  /**
+   * Merge a `patch` frame's full row into `state` in place, mirroring the
+   * `result` branch's upsert shape (upsert `byId`, append to `order` if new,
+   * replace the matching `rows` entry / append if new), then re-arm the
+   * per-pk version cursor. Returns true iff the merge happened and `onResult`
+   * should fire; false when the patch is dropped — missing pk, or its version
+   * is not strictly newer than the last-seen cursor for that pk (the
+   * per-`(collection, pk)` version guard against reconnect-replay / out-of-
+   * order delivery). Page membership is respected: a patch for a pk NOT in
+   * the current page is dropped (the server only watches in-page ids, so this
+   * is defensive — never blind-append an off-page row).
+   */
+  function mergePatchRow(
+    state: CollectionState,
+    row: Record<string, unknown>,
+  ): boolean {
+    const pkVal = row[state.pk];
+    if (pkVal === undefined || pkVal === null) {
+      return false;
+    }
+    const id = String(pkVal);
+    // Membership guard: the server only emits patches for ids in the active
+    // page, so an id we don't already track is off-page noise — drop it
+    // rather than blind-append (a blind append would surface a row outside
+    // the page/sort/limit). A genuine membership change arrives as `meta`.
+    if (!state.byId.has(id)) {
+      return false;
+    }
+    // Version guard, keyed per-pk: drop a patch whose version isn't strictly
+    // newer than what we last rendered for this pk. When the column is
+    // absent/non-numeric (`rowVersion` → null) the guard is inert (accept),
+    // matching the pre-guard behavior for versionless rows.
+    const v = rowVersion(state, row);
+    if (v !== null) {
+      const last = state.lastSeenVersion.get(id);
+      if (last !== undefined && v <= last) {
+        return false;
+      }
+    }
+    state.byId.set(id, row);
+    // Replace the matching `rows` entry in wire/page order (what `onRows`
+    // reads). The id is in `order` by the membership guard above, so the
+    // index lookup always hits.
+    const idx = state.order.indexOf(id);
+    if (idx !== -1) {
+      state.rows[idx] = row;
+    }
+    if (v !== null) {
+      state.lastSeenVersion.set(id, v);
+    }
+    return true;
+  }
+
   function handleFrame(frame: ServerFrame): void {
     if (frame.type === "result") {
       // Id-first routing: prefer the echoed sub `id` (multi-sub-aware
@@ -698,6 +804,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       state.lastSlowFlightAt = null;
       state.order.length = 0;
       state.byId.clear();
+      state.lastSeenVersion.clear();
       // Re-snapshot `rows` from this frame — see module docstring on why
       // the readiness handoff reads from here.
       state.rows = frame.rows.slice();
@@ -705,6 +812,13 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         const id = String(row[state.pk]);
         state.order.push(id);
         state.byId.set(id, row);
+        // Re-arm the per-pk version cursor from the authoritative page so a
+        // subsequent direct-merge `patch` is compared against the version
+        // this `result` rendered (a stale/equal-version patch is dropped).
+        const v = rowVersion(state, row);
+        if (v !== null) {
+          state.lastSeenVersion.set(id, v);
+        }
       }
       state.gotResult = true;
       onResult(state);
@@ -712,14 +826,44 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         state.refetchDirty = false;
         scheduleRefetchFor(state);
       }
-    } else if (frame.type === "patch" || frame.type === "meta") {
+    } else if (frame.type === "patch") {
       // Id-first routing, same fallback chain as `result`. A new server
-      // (fn-632.1+) emits `id` on every patch/meta on behalf of a sub
-      // with a non-null id; a legacy server emits neither, and the
-      // collection lookup is the only routable signal. Either way, the
-      // helper schedules a refetch for the matching state — patches +
-      // metas are pure "data changed, fetch fresh" nudges in this
-      // pipeline.
+      // (fn-632.1+) echoes `id` on every patch on behalf of a sub with a
+      // non-null id; a legacy server emits neither, and the collection
+      // lookup is the only routable signal.
+      const state =
+        (frame.id !== undefined ? bySubId.get(frame.id) : undefined) ??
+        byCollection.get(frame.collection);
+      if (!state) {
+        return;
+      }
+      // Lever A1 (fn-694.1): direct-merge the pushed row instead of a
+      // refetch round-trip — but ONLY for the sidecar helper
+      // (`subscribeCollection` sets `directMergePatch`), and ONLY once the
+      // initial page is seeded (`gotResult`). A patch that arrives before
+      // the first `result` — e.g. mid-reconnect, with `byId`/`order`/
+      // `lastSeenVersion` all reset by teardown — has no page to merge
+      // into; falling through to `scheduleRefetchFor` re-pages it cleanly.
+      // The board (`subscribeReadiness`) leaves `directMergePatch` false
+      // and stays on the refetch path (deliberately out of scope).
+      if (state.directMergePatch && state.gotResult) {
+        if (
+          mergePatchRow(state, (frame as { row: Record<string, unknown> }).row)
+        ) {
+          onResult(state);
+        }
+        // A dropped patch (stale/equal version, or missing pk) is a no-op
+        // — the server already pushed the freshest row, so there is
+        // nothing to re-query; the steady-poll backstop covers any genuine
+        // lost-wakeup.
+        return;
+      }
+      scheduleRefetchFor(state);
+    } else if (frame.type === "meta") {
+      // A `meta` is a membership-change nudge and is UNMERGEABLE from one
+      // row (a row entered or left the filtered set), so it always
+      // refetches — for both helpers. Id-first routing, same fallback
+      // chain as `result`/`patch`.
       const state =
         (frame.id !== undefined ? bySubId.get(frame.id) : undefined) ??
         byCollection.get(frame.collection);
@@ -777,6 +921,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     for (const s of states) {
       s.order.length = 0;
       s.byId.clear();
+      s.lastSeenVersion.clear();
       s.rows.length = 0;
       s.queryInFlight = false;
       s.refetchDirty = false;
@@ -1005,20 +1150,31 @@ export function subscribeCollection(
     ...(opts.sort === undefined ? {} : { sort: opts.sort }),
     ...(opts.filter === undefined ? {} : { filter: opts.filter }),
   };
-  // The single-collection pk is unused by the public surface (we hand
-  // back `state.rows` verbatim), but the driver indexes `byId` / `order`
-  // by it for `meta`/`patch` refetch coalescing. Empty-string pk is fine
-  // because the helper never reads the resulting map from outside —
-  // `byId` only matters when `onResult` consumes it, and we don't.
-  const state = makeState(opts.collection, subId, "", query);
+  // Thread the descriptor's REAL pk + version column so the direct-merge
+  // path keys correctly (Lever A1, fn-694.1). Pre-fn-694 this passed pk=""
+  // because the helper never read `byId`/`order` from outside — but the
+  // direct-merge `patch` path now upserts into `byId`/`order`/`rows` by pk,
+  // and the version guard compares the `version` column, so both must be the
+  // descriptor's actual columns. An unknown collection (no descriptor) keeps
+  // pk="" / version="" — `getCollection` returns undefined; the merge then
+  // no-ops on a missing pk and the version guard is inert, so an unknown
+  // collection still rides the refetch path harmlessly.
+  const descriptor = getCollection(opts.collection);
+  const state = makeState(opts.collection, subId, descriptor?.pk ?? "", query, {
+    version: descriptor?.version ?? "",
+    directMergePatch: true,
+  });
   return subscribeMulti({
     sockPath: opts.sockPath,
     states: [state],
     onResult(s) {
-      // Hand back a typed array of rows from the most recent `result`.
-      // Slice copy already lives on `s.rows` (`handleFrame` did
-      // `frame.rows.slice()`), so the caller is free to retain it.
-      opts.onRows(s.rows as Record<string, unknown>[]);
+      // Hand back a FRESH array copy of the current rows. On a `result`
+      // frame `s.rows` is already a fresh `frame.rows.slice()`, but the
+      // direct-merge `patch` path mutates `s.rows` in place, so a copy-out
+      // here is load-bearing — consumers retain the slice (see the
+      // `onRows(s.rows)` handoff contract), and handing back the live array
+      // would let a later patch mutate a slice the caller still holds.
+      opts.onRows((s.rows as Record<string, unknown>[]).slice());
     },
     isTerminal: (sts) => sts.every((s) => !s.gotResult),
     ...(opts.onLifecycle === undefined

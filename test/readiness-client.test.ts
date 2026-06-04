@@ -53,6 +53,7 @@ import {
   type ReadinessClientSnapshot,
   type ReadinessSocket,
   type SocketHandlers,
+  subscribeCollection,
   subscribeReadiness,
 } from "../src/readiness-client";
 
@@ -1217,4 +1218,245 @@ test("subscribeReadiness: pollAll no longer schedules per-state refetches — fr
   } finally {
     harness.restore();
   }
+});
+
+// ---------------------------------------------------------------------------
+// subscribeCollection direct-merge (Lever A1, fn-694.1)
+//
+// A `patch` frame on a sidecar subscription renders its row DIRECTLY via
+// `onRows` with NO refetch round-trip; `meta` still refetches; stale/equal-
+// version and pre-`gotResult` patches are dropped; `onRows` hands back a
+// fresh array copy.
+// ---------------------------------------------------------------------------
+
+/** A `result` for `jobs` carrying real versioned rows (pk `job_id`). */
+function jobsResult(
+  id: string,
+  rows: Record<string, unknown>[],
+  rev = 1,
+): ServerFrame {
+  return {
+    type: "result",
+    id,
+    collection: "jobs",
+    rev,
+    total: rows.length,
+    rows,
+  };
+}
+
+/** A `patch` for `jobs` carrying one full versioned row. */
+function jobsPatch(
+  id: string | undefined,
+  row: Record<string, unknown>,
+  rev = 2,
+): ServerFrame {
+  return {
+    type: "patch",
+    ...(id === undefined ? {} : { id }),
+    collection: "jobs",
+    rev,
+    row,
+  };
+}
+
+function makeJobsSidecar(idPrefix: string): {
+  sock: MockSocket;
+  rowsLog: Record<string, unknown>[][];
+  handle: ReturnType<typeof subscribeCollection>;
+} {
+  const { factory, socketRef } = makeMockConnect();
+  const rowsLog: Record<string, unknown>[][] = [];
+  const handle = subscribeCollection({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix,
+    collection: "jobs",
+    onRows: (rows) => rowsLog.push(rows),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  return { sock, rowsLog, handle };
+}
+
+test("subscribeCollection: patch merges the row and renders via onRows with NO refetch", () => {
+  const { sock, rowsLog, handle } = makeJobsSidecar("test-merge");
+  const subId = "test-merge-jobs";
+
+  // Seed the page.
+  expect(sock.takeOutbound()).toHaveLength(1);
+  sock.deliver([
+    jobsResult(subId, [
+      { job_id: "j1", state: "working", last_event_id: 10 },
+      { job_id: "j2", state: "stopped", last_event_id: 11 },
+    ]),
+  ]);
+  expect(rowsLog).toHaveLength(1);
+  expect(rowsLog[0]).toHaveLength(2);
+  sock.takeOutbound();
+
+  // A patch on j1 with a strictly-newer version merges + renders directly.
+  sock.deliver([
+    jobsPatch(subId, { job_id: "j1", state: "stopped", last_event_id: 20 }),
+  ]);
+  // NO refetch query went out.
+  expect(sock.takeOutbound()).toHaveLength(0);
+  // onRows fired again with the merged row in wire/page order.
+  expect(rowsLog).toHaveLength(2);
+  const merged = rowsLog[1] as Record<string, unknown>[];
+  expect(merged).toHaveLength(2);
+  expect(merged[0]).toEqual({
+    job_id: "j1",
+    state: "stopped",
+    last_event_id: 20,
+  });
+  // j2 untouched, order preserved.
+  expect(merged[1]).toEqual({
+    job_id: "j2",
+    state: "stopped",
+    last_event_id: 11,
+  });
+
+  handle.dispose();
+});
+
+test("subscribeCollection: meta still triggers a refetch", () => {
+  const { sock, rowsLog, handle } = makeJobsSidecar("test-meta");
+  const subId = "test-meta-jobs";
+
+  expect(sock.takeOutbound()).toHaveLength(1);
+  sock.deliver([
+    jobsResult(subId, [{ job_id: "j1", state: "working", last_event_id: 10 }]),
+  ]);
+  expect(rowsLog).toHaveLength(1);
+  sock.takeOutbound();
+
+  // A `meta` (membership change) is unmergeable from one row → refetch.
+  sock.deliver([
+    { type: "meta", id: subId, collection: "jobs", rev: 3, total: 2 },
+  ]);
+  const follow = sock.takeOutbound();
+  expect(follow).toHaveLength(1);
+  expect((follow[0] as { collection: string }).collection).toBe("jobs");
+  // No new render yet — the refetch result hasn't arrived.
+  expect(rowsLog).toHaveLength(1);
+
+  handle.dispose();
+});
+
+test("subscribeCollection: a stale / equal-version patch is dropped", () => {
+  const { sock, rowsLog, handle } = makeJobsSidecar("test-stale");
+  const subId = "test-stale-jobs";
+
+  expect(sock.takeOutbound()).toHaveLength(1);
+  sock.deliver([
+    jobsResult(subId, [{ job_id: "j1", state: "working", last_event_id: 30 }]),
+  ]);
+  expect(rowsLog).toHaveLength(1);
+  sock.takeOutbound();
+
+  // Equal version → dropped (not strictly newer).
+  sock.deliver([
+    jobsPatch(subId, { job_id: "j1", state: "stopped", last_event_id: 30 }),
+  ]);
+  // Older version → dropped.
+  sock.deliver([
+    jobsPatch(subId, { job_id: "j1", state: "stopped", last_event_id: 5 }),
+  ]);
+  // Neither rendered nor refetched.
+  expect(sock.takeOutbound()).toHaveLength(0);
+  expect(rowsLog).toHaveLength(1);
+
+  // …but a strictly-newer one still merges.
+  sock.deliver([
+    jobsPatch(subId, { job_id: "j1", state: "ended", last_event_id: 31 }),
+  ]);
+  expect(sock.takeOutbound()).toHaveLength(0);
+  expect(rowsLog).toHaveLength(2);
+  expect((rowsLog[1] as Record<string, unknown>[])[0]).toEqual({
+    job_id: "j1",
+    state: "ended",
+    last_event_id: 31,
+  });
+
+  handle.dispose();
+});
+
+test("subscribeCollection: a patch before the first result is dropped (gotResult guard)", () => {
+  const { sock, rowsLog, handle } = makeJobsSidecar("test-preseed");
+  const subId = "test-preseed-jobs";
+
+  // Initial query is out, but NO result has landed yet.
+  expect(sock.takeOutbound()).toHaveLength(1);
+
+  // A patch arriving pre-seed has no page to merge into → dropped, and
+  // (since gotResult is false) it falls through to scheduleRefetchFor. The
+  // initial query is still in flight, so the refetch coalesces into
+  // refetchDirty rather than writing a second query immediately.
+  sock.deliver([
+    jobsPatch(subId, { job_id: "j1", state: "working", last_event_id: 10 }),
+  ]);
+  // No render — gotResult guard held.
+  expect(rowsLog).toHaveLength(0);
+  // No second query yet (coalesced behind the in-flight initial query).
+  expect(sock.takeOutbound()).toHaveLength(0);
+
+  // When the initial result lands, the coalesced refetchDirty fires exactly
+  // one follow-up query (the standard scheduleRefetchFor recovery path).
+  sock.deliver([
+    jobsResult(subId, [{ job_id: "j1", state: "working", last_event_id: 10 }]),
+  ]);
+  expect(rowsLog).toHaveLength(1);
+  expect(sock.takeOutbound()).toHaveLength(1);
+
+  handle.dispose();
+});
+
+test("subscribeCollection: a patch for an off-page row is dropped (membership guard)", () => {
+  const { sock, rowsLog, handle } = makeJobsSidecar("test-offpage");
+  const subId = "test-offpage-jobs";
+
+  expect(sock.takeOutbound()).toHaveLength(1);
+  sock.deliver([
+    jobsResult(subId, [{ job_id: "j1", state: "working", last_event_id: 10 }]),
+  ]);
+  expect(rowsLog).toHaveLength(1);
+  sock.takeOutbound();
+
+  // A patch for an id NOT in the current page is dropped (membership change
+  // arrives as `meta`, not a blind-appended patch).
+  sock.deliver([
+    jobsPatch(subId, { job_id: "j99", state: "working", last_event_id: 99 }),
+  ]);
+  expect(sock.takeOutbound()).toHaveLength(0);
+  expect(rowsLog).toHaveLength(1);
+
+  handle.dispose();
+});
+
+test("subscribeCollection: onRows hands back a fresh array copy per render", () => {
+  const { sock, rowsLog, handle } = makeJobsSidecar("test-copy");
+  const subId = "test-copy-jobs";
+
+  expect(sock.takeOutbound()).toHaveLength(1);
+  sock.deliver([
+    jobsResult(subId, [{ job_id: "j1", state: "working", last_event_id: 10 }]),
+  ]);
+  sock.deliver([
+    jobsPatch(subId, { job_id: "j1", state: "stopped", last_event_id: 20 }),
+  ]);
+  expect(rowsLog).toHaveLength(2);
+  // Distinct array instances — a retained earlier slice is not mutated by a
+  // later in-place patch merge.
+  expect(rowsLog[0]).not.toBe(rowsLog[1]);
+  // The retained first slice still shows the ORIGINAL row, not the patched one.
+  expect((rowsLog[0] as Record<string, unknown>[])[0]).toEqual({
+    job_id: "j1",
+    state: "working",
+    last_event_id: 10,
+  });
+
+  handle.dispose();
 });
