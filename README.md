@@ -217,7 +217,13 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
 - **No live membership stream** — `meta.total` signals that the filtered set's
   size or membership *changed*, but it does NOT deliver the new members. Frozen
   membership stands: the live page never reflows. `meta` is a count/staleness
-  nudge ("re-query if you care"), not a live insert/remove/reorder feed.
+  nudge ("re-query if you care"), not a live insert/remove/reorder feed. The
+  server may COALESCE meta emission — at most one nudge per
+  `META_MIN_INTERVAL_MS` per subscription (fn-697) — so a burst of folds
+  collapses into fewer client-refetch rounds; a throttled-away move is never
+  lost (the latest membership state always converges on a later tick, with the
+  server poll loop as the convergence backstop). Patches (the cell stream) are
+  never throttled, so this never delays a live cell update.
 - **No UI** — `sqlite3` is the inspection surface.
 - **No multi-machine** — single host, single DB file.
 - **No general name scraping; no transcript tailing in the hook** — the hook
@@ -995,7 +1001,17 @@ query per distinct filter (the token is a `group_concat` over the matching pk
 identities, ordered by pk so it's stable and fingerprints membership, not cell
 values), and emits a `meta` frame to any subscription whose `total` or token
 moved — the count/staleness signal, sharing one query across same-filter clients
-exactly as the patch pass shares one re-read per collection.
+exactly as the patch pass shares one re-read per collection. That meta EMISSION
+is throttled per subscription to at most one nudge per `META_MIN_INTERVAL_MS`
+(fn-697 lever 1): a total/token move within the interval is deferred — but
+`lastTotal`/`lastToken`/`lastMetaEmittedAt` advance ONLY on an actual emit, so
+the membership delta persists and the next eligible tick (a kick or the poll
+loop's convergence tick) emits the latest state. The throttle lives on
+`SubState` (not `diffTick`-local) so the `handleKick` and `pollLoop` wake paths
+share one window; it gates ONLY the meta pass — the patch pass above stays
+immediate. This coalesces a fold burst's ~21-subscriber refetch storm into
+fewer rounds without ever delaying a cell patch or losing the final membership
+state.
 
 A **third** Worker thread is the transcript-title producer: it watches the
 external transcript tree (the `claude_projects_root` from

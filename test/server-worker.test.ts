@@ -51,6 +51,7 @@ import {
   handleKick,
   isPidAlive,
   LockHeldError,
+  META_MIN_INTERVAL_MS,
   pollLoop,
   type ReplayBridge,
   RPC_REGISTRY,
@@ -1420,6 +1421,10 @@ function watch(
     where,
     lastTotal: total,
     lastToken: token,
+    // Matches the real subscribe path (server-worker.ts): a fresh sub seeds the
+    // meta-emit clock to 0 so its FIRST membership move always emits. Throttle
+    // tests override this to Date.now() to simulate a recent emit.
+    lastMetaEmittedAt: 0,
   });
 }
 
@@ -1724,6 +1729,7 @@ test("diffTick property: K changes ⇒ K patches; only changed rows are fetched/
           where: { clause: "", params: [] },
           lastTotal: 0,
           lastToken: "",
+          lastMetaEmittedAt: 0,
         }]]),
         pending: null,
         buffer: "",
@@ -2151,6 +2157,185 @@ test("diffTick backpressure: a pending conn gets no meta and does NOT advance; n
 });
 
 // ---------------------------------------------------------------------------
+// fn-697 lever 1: per-SubState meta-emission throttle (META_MIN_INTERVAL_MS).
+// The throttle clock is `sub.lastMetaEmittedAt`; tests drive it deterministically
+// by stamping that field rather than faking wall-clock — `Date.now()` in the
+// meta pass then reads a real "recently emitted" / "interval elapsed" state.
+// ---------------------------------------------------------------------------
+
+/**
+ * Grab the anonymous sub off a fakeSock as a DEFINITE `SubState` (throwing if
+ * absent) — the throttle tests mutate `lastMetaEmittedAt` and assert on
+ * `lastTotal`, so they need a concrete reference, not the `| undefined` that
+ * `anonSub` returns. Throwing keeps it biome-clean (no `!`).
+ */
+function requireAnonSub(sock: Writable): SubState {
+  const sub = anonSub(sock.data);
+  if (!sub) {
+    throw new Error("requireAnonSub: no anonymous sub on socket");
+  }
+  return sub;
+}
+
+test("meta throttle: rapid total moves within the interval emit exactly ONE meta", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  setWorldRev(db, 5);
+  const sock = fakeSock();
+  watch(db, sock, { a: 1 }); // baseline total=1, lastMetaEmittedAt=0
+
+  // First move emits (fresh sub, clock=0) and stamps lastMetaEmittedAt≈now.
+  seedJob(db, "b", { last_event_id: 1 }); // total → 2
+  diffTick(db, [sock]);
+  expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(1);
+  const after1 = requireAnonSub(sock);
+  expect(after1.lastTotal).toBe(2);
+  expect(after1.lastMetaEmittedAt).toBeGreaterThan(0);
+  const tokenAfterEmit1 = after1.lastToken; // frozen-baseline reference
+
+  // Two further moves WITHIN the interval (the just-stamped clock is recent):
+  // both are throttled away, and the baseline must NOT advance.
+  seedJob(db, "c", { last_event_id: 1 }); // total → 3
+  diffTick(db, [sock]);
+  seedJob(db, "d", { last_event_id: 1 }); // total → 4
+  diffTick(db, [sock]);
+
+  expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(1);
+  // CONVERGENCE INVARIANT: baseline + clock frozen on a throttled-away move.
+  expect(after1.lastTotal).toBe(2);
+  expect(after1.lastToken).toBe(tokenAfterEmit1); // unchanged from emit-1
+  db.close();
+});
+
+test("meta throttle: a move after the interval emits the LATEST state (no lost-final-update)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  setWorldRev(db, 5);
+  const sock = fakeSock();
+  watch(db, sock, { a: 1 }); // baseline total=1
+
+  // First move emits.
+  seedJob(db, "b", { last_event_id: 1 }); // total → 2
+  diffTick(db, [sock]);
+  const sub = requireAnonSub(sock);
+  expect(sub.lastTotal).toBe(2);
+
+  // Two moves WITHIN the interval get throttled (baseline frozen at 2).
+  seedJob(db, "c", { last_event_id: 1 }); // total → 3
+  diffTick(db, [sock]);
+  seedJob(db, "d", { last_event_id: 1 }); // total → 4
+  diffTick(db, [sock]);
+  expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(1);
+  expect(sub.lastTotal).toBe(2);
+
+  // Interval elapses (simulate by pushing the emit clock into the past). The
+  // next tick re-detects the still-pending delta and emits the LATEST total
+  // (4), not the stale 3 — the membership delta persisted across throttles.
+  sub.lastMetaEmittedAt = Date.now() - META_MIN_INTERVAL_MS - 1;
+  diffTick(db, [sock]);
+
+  const metas = sock.frames.filter((f) => f.type === "meta") as MetaFrame[];
+  expect(metas).toHaveLength(2);
+  expect(metas[metas.length - 1].total).toBe(4); // final state converged
+  expect(sub.lastTotal).toBe(4);
+  db.close();
+});
+
+test("meta throttle: pollLoop convergence tick flushes a throttled-away delta", async () => {
+  // Two connections (mirrors the real worker + the existing pollLoop tests):
+  // `reader` runs the poll loop in autocommit so it observes the `writer`'s
+  // commits via PRAGMA data_version. `diffTick` runs against `reader`.
+  const { db: reader } = openDb(dbPath, { readonly: true });
+  const { db: writer } = openDb(dbPath, { readonly: false });
+  seedJob(writer, "a", { last_event_id: 1 });
+  const sock = fakeSock();
+  watch(writer, sock, { a: 1 });
+
+  // Force the sub into a "recently emitted, delta pending" state: a membership
+  // move with the emit clock stamped to now, so the meta pass throttles it.
+  const sub = requireAnonSub(sock);
+  sub.lastMetaEmittedAt = Date.now();
+  seedJob(writer, "b", { last_event_id: 1 }); // total → 2, but throttled
+  diffTick(reader, [sock]);
+  expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(0);
+  expect(sub.lastTotal).toBe(1); // frozen — delta persists
+
+  // The pollLoop is the convergence safety tick: once the interval elapses, its
+  // next data_version-gated diffTick emits the deferred latest state. Simulate
+  // the elapsed window, then drive a fresh cross-connection commit so the
+  // loop's gated diffTick fires.
+  sub.lastMetaEmittedAt = Date.now() - META_MIN_INTERVAL_MS - 1;
+  let shutdown = false;
+  const loop = pollLoop(
+    reader,
+    () => [sock],
+    () => shutdown,
+    25,
+  );
+  advanceJob(writer, "a", 9); // bumps data_version for the reader's poll conn
+  const flushed = await retryUntil(() =>
+    sock.frames.some((f) => f.type === "meta") ? true : null,
+  );
+  shutdown = true;
+  await loop;
+  expect(flushed).toBe(true);
+  expect(firstMeta(sock)?.total).toBe(2); // latest membership converged
+  expect(sub.lastTotal).toBe(2);
+  reader.close();
+  writer.close();
+}, 5_000);
+
+test("meta throttle never delays the patch pass: cell updates emit immediately under throttle", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  setWorldRev(db, 5);
+  const sock = fakeSock();
+  watch(db, sock, { a: 1 });
+
+  // Put the sub in a throttled state (recent emit clock) AND advance a watched
+  // cell. The meta pass is gated, but the patch pass must NOT be — the cell
+  // patch is the correctness-critical stream and is never throttled.
+  const sub = requireAnonSub(sock);
+  sub.lastMetaEmittedAt = Date.now();
+  // Also create a membership move so the meta pass has something to throttle.
+  seedJob(db, "b", { last_event_id: 1 }); // total → 2 (would-be meta, throttled)
+  advanceJob(db, "a", 2); // watched cell advance → patch
+  diffTick(db, [sock]);
+
+  const patches = sock.frames.filter((f) => f.type === "patch");
+  const metas = sock.frames.filter((f) => f.type === "meta");
+  expect(patches).toHaveLength(1); // patch delivered immediately
+  expect(metas).toHaveLength(0); // meta throttled away
+  expect(sub.lastTotal).toBe(1); // baseline frozen on the throttled move
+  db.close();
+});
+
+test("meta throttle is per-SubState: handleKick and pollLoop share one window", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 1 });
+  const sock = fakeSock();
+  watch(db, sock, { a: 1 });
+
+  // First move via a kick emits and stamps the per-sub clock.
+  seedJob(db, "b", { last_event_id: 1 }); // total → 2
+  handleKick(db, [sock]);
+  expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(1);
+  const sub = requireAnonSub(sock);
+  const stampedAt = sub.lastMetaEmittedAt;
+  expect(stampedAt).toBeGreaterThan(0);
+
+  // A SECOND move arrives via a poll-driven diffTick within the interval: it
+  // sees the SAME per-sub clock the kick stamped (the window is not split per
+  // wake path), so it throttles — proving the state lives on SubState.
+  seedJob(db, "c", { last_event_id: 1 }); // total → 3
+  diffTick(db, [sock]); // pollLoop's call shape
+  expect(sock.frames.filter((f) => f.type === "meta")).toHaveLength(1);
+  expect(sub.lastTotal).toBe(2); // frozen — kick's window still in force
+  expect(sub.lastMetaEmittedAt).toBe(stampedAt); // same clock, untouched
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
 // KEEPER_TRACE_SERVER gate (subprocess: module-level `const TRACE` reads
 // `process.env` exactly once at import, so each test spawns a fresh Bun
 // subprocess that boots a server-worker with the env var set/unset, opens a
@@ -2338,6 +2523,7 @@ test("diffTick: TRACE=1 emits op=diffTick line for a slow tick (>10ms total)", a
             where,
             lastTotal: total,
             lastToken: token,
+            lastMetaEmittedAt: 0,
           }]]),
           pending: null,
           buffer: "",

@@ -194,6 +194,16 @@ export interface PatchFrame<R extends Row = Row> {
  * query's `id`, routing the frame to the correct subscription on a multi-sub
  * connection. Absent when the originating query had no `id` (legacy single-sub
  * client).
+ *
+ * Server-side coalescing (fn-697 lever 1): the server may THROTTLE meta
+ * emission to one nudge per `META_MIN_INTERVAL_MS` per subscription, collapsing
+ * a fold burst into fewer refetch rounds. A throttled-away move is never lost —
+ * the latest membership state always converges on a subsequent tick (the
+ * server's poll loop is the convergence backstop), and `total` always reflects
+ * the set as of the emitted nudge. Patches (the cell stream) are never
+ * throttled. Clients must already treat `meta` as a coalesced nudge (re-query
+ * for current truth), so this is transparent: never assume one `meta` per
+ * membership change.
  */
 export interface MetaFrame {
   type: "meta";

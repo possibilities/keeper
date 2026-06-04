@@ -259,6 +259,26 @@ export const DEFAULT_POLL_MS = 50;
 const MIN_POLL_MS = 25;
 
 /**
+ * Minimum interval (ms) between `meta` membership-nudge emissions PER
+ * subscription (fn-697 lever 1). The meta pass fans a `meta{total,token}` frame
+ * to every board subscriber whenever the filtered-set total/membership token
+ * moves — which is on essentially every fold. Each nudge drives a full client
+ * refetch of the (large) subagent_invocations set, and the server answers all
+ * ~21 subscribers serially on its single event loop, so a fold burst becomes a
+ * 382-538ms refetch storm (diagnosed in fn-694.3 under KEEPER_TRACE_SERVER).
+ *
+ * This throttle COALESCES the meta EMISSION: within `META_MIN_INTERVAL_MS` of
+ * the last emit on a sub, a fresh total/token move is deferred — but the
+ * membership baseline (`lastTotal`/`lastToken`) and the emit clock
+ * (`lastMetaEmittedAt`) advance ONLY on an actual emit, so the delta persists
+ * and the next eligible `diffTick` (a kick or the `pollLoop` convergence tick)
+ * emits the LATEST state. No lost-final-update; the `pollLoop` is the
+ * convergence safety net. The throttle gates ONLY the meta pass — `patch`
+ * frames (the correctness-critical cell stream) are NEVER delayed.
+ */
+export const META_MIN_INTERVAL_MS = 150;
+
+/**
  * Hard upper bound on how long the async-RPC bridge waits for a
  * `replay-result` reply from main before rejecting (fn-643 task .4). A
  * healthy main answers in well under a millisecond on local UDS — even a
@@ -353,6 +373,15 @@ function formatStages(args: {
  *   fingerprint last reflected to this subscription (seeded from the same read
  *   that produced the `result`'s `total`); the diff emits a `meta` frame only
  *   when either moves.
+ * - `lastMetaEmittedAt` is the wall-clock (ms) of the last `meta` EMISSION on
+ *   this sub (fn-697 lever 1). The meta pass throttles to one emit per
+ *   `META_MIN_INTERVAL_MS`: a total/token move within that window is deferred,
+ *   and `lastTotal`/`lastToken`/`lastMetaEmittedAt` advance ONLY on an actual
+ *   emit — so the membership delta persists and the next eligible tick (kick or
+ *   `pollLoop` convergence tick) emits the latest state. Lives on `SubState`
+ *   (not `diffTick`-local) because BOTH `handleKick` and `pollLoop` drive
+ *   `diffTick`; a local clock would split the throttle window across the two
+ *   wake paths. Seeded to `0` so the first move on a fresh sub always emits.
  */
 export interface SubState {
   collection: string;
@@ -361,6 +390,7 @@ export interface SubState {
   where: ResolvedFilter;
   lastTotal: number;
   lastToken: string;
+  lastMetaEmittedAt: number;
 }
 
 /**
@@ -1095,6 +1125,10 @@ export function dispatchLine(
         where: seed.where,
         lastTotal: seed.total,
         lastToken: seed.token,
+        // Seeded to 0 so the FIRST membership move on this fresh sub always
+        // emits (Date.now() - 0 >= META_MIN_INTERVAL_MS). The throttle only
+        // bites on the SECOND+ move within the interval.
+        lastMetaEmittedAt: 0,
       };
       conn.subs.set(subId, subState);
       return [out];
@@ -1693,17 +1727,34 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
         continue;
       }
       if (total !== sub.lastTotal || token !== sub.lastToken) {
-        writeFrames(sock, [
-          {
-            type: "meta",
-            ...(subId !== null ? { id: subId } : {}),
-            collection: descriptor.name,
-            rev,
-            total,
-          },
-        ]);
-        sub.lastTotal = total;
-        sub.lastToken = token;
+        // Coalesce the meta EMISSION (fn-697 lever 1): a fresh membership move
+        // within `META_MIN_INTERVAL_MS` of this sub's last emit is DEFERRED so
+        // a fold burst collapses into fewer client-refetch rounds. `Date.now()`
+        // is fine here — the server-worker is the read/serve path, never a fold
+        // (no re-fold determinism concern). The patch pass above stays
+        // immediate; only this meta pass is gated.
+        if (Date.now() - sub.lastMetaEmittedAt >= META_MIN_INTERVAL_MS) {
+          writeFrames(sock, [
+            {
+              type: "meta",
+              ...(subId !== null ? { id: subId } : {}),
+              collection: descriptor.name,
+              rev,
+              total,
+            },
+          ]);
+          // CONVERGENCE INVARIANT: advance the baseline AND the emit clock
+          // ONLY on an actual emit. A throttled-away (deferred) move leaves
+          // `lastTotal`/`lastToken` stale on purpose, so the delta persists and
+          // the next eligible diffTick (a kick or the pollLoop convergence
+          // tick) re-detects it and emits the LATEST state — no lost-final-
+          // update.
+          sub.lastTotal = total;
+          sub.lastToken = token;
+          sub.lastMetaEmittedAt = Date.now();
+        }
+        // else: throttled — leave lastTotal/lastToken/lastMetaEmittedAt
+        // untouched so the membership delta survives to the next eligible tick.
       }
     }
   }
