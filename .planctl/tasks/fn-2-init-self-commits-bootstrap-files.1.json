@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "init self-commits without session id",
-  "updated_at": "2026-06-04T15:06:09.407063Z"
+  "updated_at": "2026-06-04T16:27:10.532865Z",
+  "worker_done_at": "2026-06-04T16:27:10.532865Z"
 }

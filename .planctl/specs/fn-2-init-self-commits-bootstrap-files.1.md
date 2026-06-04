@@ -98,5 +98,5 @@ idempotency test to assert a no-write re-run creates no new commit.
 - [ ] `uv run pytest tests/test_init.py`, `uv run ruff check .`, and `uv run ty check` pass
 
 ## Done summary
-
+init now self-commits its .planctl/ bootstrap set via a directly-built planctl_invocation payload (explicit file list, no CLAUDE_CODE_SESSION_ID), landing a clean chore(planctl): init <name> commit; registered init in VERB_TEMPLATES and documented it as the session-id-free mutating verb across the contract docs.
 ## Evidence
