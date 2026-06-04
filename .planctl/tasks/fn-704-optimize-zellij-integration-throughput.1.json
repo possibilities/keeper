@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-06-04T16:18:07.325177Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "diff-before-emit batched bridge writes",
-  "updated_at": "2026-06-04T17:36:50.878029Z",
+  "updated_at": "2026-06-04T17:38:05.872047Z",
   "worker_done_at": "2026-06-04T17:36:50.878029Z"
 }
