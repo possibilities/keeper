@@ -1,13 +1,8 @@
 """Public API: read-only views into keeper's projections.
 
-Eight readers; all stdlib-only and gated on
+Seven readers; all stdlib-only and gated on
 ``SUPPORTED_SCHEMA_VERSIONS``:
 
-- ``get_session_dirty_files(session_id, cwd)`` — which dirty files a
-  session is on the hook for, grouped by repo.  Reads
-  ``file_attributions`` for attribution, then intersects against a LIVE
-  ``git status`` (not the cached ``git_status`` projection) for dirtiness.
-  Consumed by ``jobctl commit-work`` and friends.
 - ``get_session_titles()`` — ``{session_id: title}`` for every titled
   job.  Reads ``jobs``.  Consumed by claudectl's session search.
 - ``get_session_name_history()`` — ``{session_id: [title, ...]}`` for
@@ -37,21 +32,8 @@ Eight readers; all stdlib-only and gated on
   render-approve-context`` to look up the target session's transcript
   path + cwd for the final-message read.
 
-Attribution rule for ``get_session_dirty_files`` (mirrors the reducer's
-discharge semantic): a session is on the hook for a file iff it has a
-mutation row whose ``last_commit_at`` is NULL or older than
-``last_mutation_at`` — editing puts you on the hook, committing what
-you edited takes you off.  We additionally intersect against a LIVE
-``git status`` so a file that was edited then reverted (still
-undischarged, but no longer dirty) does not surface.  Dirtiness is read
-live rather than from the cached ``git_status`` projection so a file
-edited then committed in quick succession is never dropped by a snapshot
-that hasn't caught up; an unreadable ``git status`` FAILS OPEN (keep the
-file) rather than fail closed (drop it).
-
 The import graph is stdlib-only (``sqlite3``, ``json``, ``os``,
-``subprocess``, ``pathlib``) — ``commit-work`` shells out to git
-repeatedly, so this module must not add cold-start weight.
+``pathlib``) so this module adds no cold-start weight.
 """
 
 from __future__ import annotations
@@ -59,7 +41,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import subprocess
 from pathlib import Path
 
 # keeper schema versions this reader understands.  keeper tracks its schema in
@@ -310,143 +291,6 @@ def _check_schema(conn: sqlite3.Connection) -> None:
             f"keeper DB schema v{version} is not supported by this keeper-py "
             f"(supports {sorted(SUPPORTED_SCHEMA_VERSIONS)}); upgrade keeper-py"
         )
-
-
-def _git_root(cwd: str | None) -> str | None:
-    """Return the git toplevel owning *cwd* via a live ``git rev-parse``, or None.
-
-    Resolved live (not from any cached projection) so a freshly-checked-out or
-    never-snapshotted repo still resolves correctly.  ``git`` already returns
-    the innermost worktree's toplevel, so nested checkouts resolve to the inner
-    repo without manual longest-prefix logic.  Returns ``None`` when *cwd* is
-    falsy, not inside a git repo, or ``git`` can't be run.
-    """
-    if not cwd:
-        return None
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return None
-    if result.returncode != 0:
-        return None
-    root = result.stdout.strip()
-    return root or None
-
-
-def _live_dirty_paths(project_dir: str) -> set[str] | None:
-    """Return the set of dirty repo-relative paths in *project_dir*, live.
-
-    Runs ``git status --porcelain -z --untracked-files=all`` at call time —
-    the ground-truth dirty set, never a cached snapshot that can lag behind a
-    just-landed edit.  Returns ``None`` when the dirty set can't be determined
-    (not a repo, ``git`` missing, non-zero exit, timeout) so the caller can
-    FAIL OPEN — keeping every on-hook file rather than silently dropping one.
-
-    Porcelain-v1 ``-z`` parse: each record is ``XY <path>\\0``; rename/copy
-    records carry the original path as the following NUL-separated field, so
-    both the new and original paths join the dirty set.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "git",
-                "-C",
-                project_dir,
-                "status",
-                "--porcelain",
-                "-z",
-                "--untracked-files=all",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return None
-    if result.returncode != 0:
-        return None
-    dirty: set[str] = set()
-    entries = result.stdout.split("\0")
-    i = 0
-    while i < len(entries):
-        entry = entries[i]
-        if len(entry) < 4:
-            i += 1
-            continue
-        status = entry[0]
-        dirty.add(entry[3:])
-        # Rename/copy records carry the original path in the next field.
-        if status in ("R", "C"):
-            i += 1
-            if i < len(entries) and entries[i]:
-                dirty.add(entries[i])
-        i += 1
-    return dirty
-
-
-def get_session_dirty_files(session_id: str, cwd: str) -> dict:
-    """Return the files *session_id* is on the hook for, grouped by repo.
-
-    Shape::
-
-        {
-          "files_by_repo": {"<repo abs path>": ["<repo-relative path>", ...]},
-          "cwd_repo": "<repo abs path>" | None,
-        }
-
-    A file qualifies when the session has an undischarged mutation row for it
-    (``last_commit_at IS NULL OR last_commit_at < last_mutation_at``) AND the
-    file is currently dirty per a LIVE ``git status`` in its repo.  Dirtiness
-    is verified live — never from a cached projection that can lag behind a
-    just-landed edit — and FAILS OPEN: a repo whose ``git status`` can't be
-    read keeps all its on-hook files rather than silently dropping them.
-    ``.planctl/`` exclusion is NOT done here — that is the caller's partition
-    (jobctl routes ``.planctl`` through the planctl-commit hook).
-
-    Raises ``KeeperDBMissing`` if ``keeper.db`` is absent and
-    ``KeeperSchemaError`` if its schema is unsupported — callers should treat
-    both as hard failures (build-forward: no silent fallback).
-    """
-    path = _resolve_db_path()
-    conn = _open_readonly(path)
-    try:
-        _check_schema(conn)
-        on_hook: list[tuple[str, str]] = list(
-            conn.execute(
-                "SELECT project_dir, file_path FROM file_attributions "
-                "WHERE session_id = ? "
-                "AND (last_commit_at IS NULL OR last_commit_at < last_mutation_at)",
-                (session_id,),
-            )
-        )
-    finally:
-        # Release the read-only handle before shelling out to git so the
-        # connection window stays narrow (git probes run lock-free).
-        conn.close()
-
-    on_hook_by_repo: dict[str, list[str]] = {}
-    for project_dir, file_path in on_hook:
-        on_hook_by_repo.setdefault(project_dir, []).append(file_path)
-
-    files_by_repo: dict[str, list[str]] = {}
-    for project_dir, candidates in on_hook_by_repo.items():
-        dirty = _live_dirty_paths(project_dir)
-        # dirty is None → git status unreadable → fail open (keep all).
-        kept = candidates if dirty is None else [p for p in candidates if p in dirty]
-        if kept:
-            # Stable order for deterministic output (callers may diff the list).
-            files_by_repo[project_dir] = sorted(kept)
-
-    # cwd_repo is resolved live so it is correct even when the cwd's repo has
-    # nothing on the hook and was never snapshotted by keeper's git-worker.
-    cwd_repo = _git_root(cwd)
-
-    return {"files_by_repo": files_by_repo, "cwd_repo": cwd_repo}
 
 
 def get_session_titles() -> dict[str, str]:

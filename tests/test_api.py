@@ -1,11 +1,8 @@
-"""Stdlib-only tests for keeper.api.get_session_dirty_files.
+"""Stdlib-only tests for keeper.api's read-only projection readers.
 
 Runs with ``python -m unittest`` from ``keeper-py/`` — no pytest, no deps,
-matching the package's stdlib-only contract.  Builds a temp DB with the
-v31-shaped ``meta`` / ``file_attributions`` tables plus REAL temp git repos,
-and exercises the attribution rule intersected against a live ``git status``
-(the reader confirms dirtiness live, not from the cached ``git_status``
-projection, and FAILS OPEN when ``git status`` can't be read).
+matching the package's stdlib-only contract.  Each test class builds a temp
+DB with the relevant v31-shaped projection tables and exercises one reader.
 """
 
 from __future__ import annotations
@@ -13,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,177 +20,11 @@ from keeper.api import (
     get_epic,
     get_job,
     get_latest_session,
-    get_session_dirty_files,
     get_session_for_pid,
     get_session_identity_for_pid,
     get_session_name_history,
     get_session_titles,
 )
-
-
-def _build_db(path: Path, *, schema_version: int = 31) -> None:
-    conn = sqlite3.connect(path)
-    # Real keeper shape: meta is a key/value table, version stored as TEXT.
-    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    conn.execute(
-        "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
-        (str(schema_version),),
-    )
-    conn.execute(
-        """CREATE TABLE file_attributions (
-            project_dir TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            file_path TEXT NOT NULL,
-            last_mutation_at REAL NOT NULL,
-            last_commit_at REAL,
-            op TEXT NOT NULL,
-            source TEXT NOT NULL,
-            last_event_id INTEGER,
-            updated_at REAL NOT NULL DEFAULT 0,
-            PRIMARY KEY (project_dir, session_id, file_path)
-        )"""
-    )
-    conn.execute(
-        """CREATE TABLE git_status (
-            project_dir TEXT PRIMARY KEY,
-            dirty_files TEXT NOT NULL DEFAULT '[]'
-        )"""
-    )
-    conn.commit()
-    conn.close()
-
-
-def _add_attrib(path, project_dir, session_id, file_path, mut, commit, src="tool"):
-    conn = sqlite3.connect(path)
-    conn.execute(
-        "INSERT INTO file_attributions "
-        "(project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (project_dir, session_id, file_path, mut, commit, src, src),
-    )
-    conn.commit()
-    conn.close()
-
-
-def _init_repo(repo: Path) -> str:
-    """Init a real git repo at *repo* with one seed commit; return its toplevel.
-
-    The toplevel is read back via ``git rev-parse --show-toplevel`` so it is
-    the canonical (realpath) form git itself reports — on macOS the tmp dir is
-    a symlink, and the reader's ``_git_root`` / ``_live_dirty_paths`` both work
-    against that canonical path.
-    """
-    repo.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "t@example.com"], cwd=repo, check=True
-    )
-    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
-    (repo / ".seed").write_text("seed\n")
-    subprocess.run(["git", "add", ".seed"], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-qm", "seed"], cwd=repo, check=True)
-    out = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return out.stdout.strip()
-
-
-def _dirty_file(repo: str, rel: str) -> None:
-    """Create an untracked file at *repo*/*rel* so ``git status`` reports it."""
-    p = Path(repo) / rel
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("dirty\n")
-
-
-class GetSessionDirtyFilesTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.db = Path(self._tmp.name) / "keeper.db"
-        _build_db(self.db)
-        # A real git repo standing in for a session's project_dir.
-        self.repo = _init_repo(Path(self._tmp.name) / "repo")
-        self._prev = os.environ.get("KEEPER_DB")
-        os.environ["KEEPER_DB"] = str(self.db)
-
-    def tearDown(self) -> None:
-        if self._prev is None:
-            os.environ.pop("KEEPER_DB", None)
-        else:
-            os.environ["KEEPER_DB"] = self._prev
-        self._tmp.cleanup()
-
-    def test_on_hook_and_dirty_is_returned(self):
-        _add_attrib(self.db, self.repo, "sess", "src/a.ts", mut=100, commit=None)
-        _dirty_file(self.repo, "src/a.ts")
-        result = get_session_dirty_files("sess", self.repo)
-        self.assertEqual(result["files_by_repo"], {self.repo: ["src/a.ts"]})
-        self.assertEqual(result["cwd_repo"], self.repo)
-
-    def test_discharged_file_excluded(self):
-        # last_commit_at > last_mutation_at → committed since the edit → off hook.
-        # Still dirty in the worktree, but the discharge filter drops it first.
-        _add_attrib(self.db, self.repo, "sess", "src/a.ts", mut=100, commit=200)
-        _dirty_file(self.repo, "src/a.ts")
-        result = get_session_dirty_files("sess", self.repo)
-        self.assertEqual(result["files_by_repo"], {})
-
-    def test_re_mutated_after_commit_back_on_hook(self):
-        _add_attrib(self.db, self.repo, "sess", "src/a.ts", mut=300, commit=200)
-        _dirty_file(self.repo, "src/a.ts")
-        result = get_session_dirty_files("sess", self.repo)
-        self.assertEqual(result["files_by_repo"], {self.repo: ["src/a.ts"]})
-
-    def test_on_hook_but_not_dirty_excluded(self):
-        # Undischarged but the file is clean in the live worktree (never
-        # created / reverted) → live `git status` omits it → excluded.
-        _add_attrib(self.db, self.repo, "sess", "src/a.ts", mut=100, commit=None)
-        result = get_session_dirty_files("sess", self.repo)
-        self.assertEqual(result["files_by_repo"], {})
-
-    def test_other_session_not_returned(self):
-        _add_attrib(self.db, self.repo, "other", "src/a.ts", mut=100, commit=None)
-        _dirty_file(self.repo, "src/a.ts")
-        result = get_session_dirty_files("sess", self.repo)
-        self.assertEqual(result["files_by_repo"], {})
-
-    def test_git_status_unreadable_fails_open(self):
-        # project_dir is NOT a git repo → live `git status` can't be read →
-        # FAIL OPEN: keep every on-hook file rather than silently dropping it.
-        nongit = os.path.realpath(str(Path(self._tmp.name) / "plain"))
-        Path(nongit).mkdir()
-        _add_attrib(self.db, nongit, "sess", "src/a.ts", mut=100, commit=None)
-        result = get_session_dirty_files("sess", nongit)
-        self.assertEqual(result["files_by_repo"], {nongit: ["src/a.ts"]})
-
-    def test_cwd_repo_resolves_innermost_repo(self):
-        # A nested real git repo inside self.repo resolves to the INNER repo.
-        inner = _init_repo(Path(self.repo) / "inner")
-        sub = Path(inner) / "sub"
-        sub.mkdir()
-        result = get_session_dirty_files("sess", str(sub))
-        self.assertEqual(result["cwd_repo"], inner)
-
-    def test_cwd_outside_any_repo_is_none(self):
-        plain = Path(self._tmp.name) / "plain"
-        plain.mkdir()
-        result = get_session_dirty_files("sess", str(plain))
-        self.assertIsNone(result["cwd_repo"])
-
-    def test_unsupported_schema_raises(self):
-        bad = Path(self._tmp.name) / "bad.db"
-        _build_db(bad, schema_version=30)
-        os.environ["KEEPER_DB"] = str(bad)
-        with self.assertRaises(KeeperSchemaError):
-            get_session_dirty_files("sess", self.repo)
-
-    def test_missing_db_raises(self):
-        os.environ["KEEPER_DB"] = str(Path(self._tmp.name) / "nope.db")
-        with self.assertRaises(KeeperDBMissing):
-            get_session_dirty_files("sess", self.repo)
 
 
 def _build_jobs_db(path: Path, *, schema_version: int = 31) -> None:
