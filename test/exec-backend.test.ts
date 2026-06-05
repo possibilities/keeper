@@ -255,11 +255,13 @@ test("createZellijBackend.launch: session already listed → new-tab; returns { 
     "action",
     "new-tab",
   ]);
-  // --cwd and --name were threaded through; argv landed after `--`.
+  // --cwd was threaded through; argv landed after `--`. The managed
+  // launch path is unnamed (epic fn-711) — `name` feeds logs/dedup
+  // only, never the zellij tab label.
   expect(calls[1]).toContain("--cwd");
   expect(calls[1]).toContain("/tmp/proj");
-  expect(calls[1]).toContain("--name");
-  expect(calls[1]).toContain("work::fn-1-x.1");
+  expect(calls[1]).not.toContain("--name");
+  expect(calls[1]).not.toContain("work::fn-1-x.1");
   const dashDashIdx = calls[1]?.indexOf("--") ?? -1;
   expect(dashDashIdx).toBeGreaterThan(0);
   expect(calls[1]?.slice(dashDashIdx + 1)).toEqual([
@@ -363,11 +365,12 @@ test("createZellijBackend.launch: stale memo — session dies, new-tab fails 'no
     expect(c).toEqual(["zellij", "attach", "-b", "--forget", "autopilot"]);
   }
   expect(notes.some((s) => s.includes("vanished"))).toBe(true);
-  // Two new-tab spawns for work::b (the failed one + the retry).
-  const bNewTabs = calls.filter(
-    (c) => c[4] === "new-tab" && c.includes("work::b"),
-  );
-  expect(bNewTabs.length).toBe(2);
+  // Three new-tab spawns total: one for work::a, plus the failed one
+  // + the retry for work::b. The tab is unnamed now (epic fn-711), so
+  // the new-tab argv no longer carries `work::b` to filter on; count
+  // the total instead.
+  const newTabs = calls.filter((c) => c[4] === "new-tab");
+  expect(newTabs.length).toBe(3);
 });
 
 test("createZellijBackend.launch: ENOENT (binary missing) → { ok: false, error }", async () => {

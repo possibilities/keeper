@@ -139,14 +139,14 @@ export type LaunchResult = { ok: true } | { ok: false; error: string };
  */
 export interface ExecBackend {
   /** Session-bound lifecycle. Spawn a terminal surface running `argv`
-   *  at `cwd` in a tab named exactly `name` (zellij `new-tab --name`)
-   *  inside the backend's managed session. Returns `{ ok: true }` on
-   *  exit code 0; `{ ok: false, error }` on spawn ENOENT or non-zero
-   *  exit. No pane id is captured — the reconciler correlates the
-   *  dispatch via the `--name verb::id` baked into `argv` plus the
-   *  resulting `SessionStart` hook event in the `jobs` projection, not
-   *  via a surface ref. The `name` is a freely-mutable cosmetic label
-   *  (epic fn-678) — no control path reads it back. */
+   *  at `cwd` in a new (unnamed) tab inside the backend's managed
+   *  session. Returns `{ ok: true }` on exit code 0; `{ ok: false,
+   *  error }` on spawn ENOENT or non-zero exit. No pane id is captured
+   *  — the reconciler correlates the dispatch via the `--name verb::id`
+   *  baked into `argv` plus the resulting `SessionStart` hook event in
+   *  the `jobs` projection, not via a surface ref. The `name` arg is
+   *  not forwarded to the zellij tab label (epic fn-711) — it feeds the
+   *  warn/log lines and is the autopilot dedup key only. */
   launch(argv: string[], name: string, cwd: string): Promise<LaunchResult>;
   /** Session-agnostic. Focus the pane `paneId` inside the external
    *  `session` via `zellij --session <session> action focus-pane-id
@@ -266,12 +266,11 @@ const defaultSpawn: SpawnFn = (cmd, options) =>
  * safe quoting seam (no injection surface). `dir` MUST be absolute —
  * zellij's `--cwd` does not expand `~`/`$HOME` (issue #2288).
  *
- * `name`, when non-empty, labels the new tab via `--name`. The
- * reconciler always passes the worker's `verb::id` spawn name so the
- * tab bar mirrors the `claude --name` baked into argv (a cosmetic
- * label, freely mutable — no control path reads it back). Omitted
- * entirely when absent so zellij assigns its default `Tab #N` (only used by
- * tests; the reconciler never launches unnamed).
+ * `name`, when non-empty, labels the new tab via `--name`. Omitted
+ * entirely when empty / absent so zellij assigns its default `Tab #N`.
+ * The managed `launch` and restore `ensureLaunched` paths both launch
+ * unnamed (epic fn-711); the param is retained for the builder's own
+ * unit tests covering both branches.
  */
 export function buildZellijNewTabArgs(
   session: string,
@@ -808,7 +807,7 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       cwd: string,
     ): Promise<LaunchResult> {
       await ensureSession();
-      const args = buildZellijNewTabArgs(session, cwd, argv, name);
+      const args = buildZellijNewTabArgs(session, cwd, argv);
       let res = await runCapture(args);
       // The memoized session can die out from under us — zellij exits a
       // session when its last tab closes, and a reboot/kill drops it too.
