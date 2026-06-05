@@ -153,6 +153,96 @@ function deliverFiveWithEpic(
   ]);
 }
 
+/**
+ * Deliver a five-collection readiness frame carrying explicit git + jobs
+ * rows (for AND combos that read git/jobs off the readiness snapshot).
+ */
+function deliverFiveWith(
+  sock: MockSocket,
+  idPrefix: string,
+  opts: {
+    epics?: Record<string, unknown>[];
+    jobs?: Record<string, unknown>[];
+    git?: Record<string, unknown>[];
+    rev?: number;
+  },
+): void {
+  const rev = opts.rev ?? 1;
+  sock.deliver([
+    resultFrame("epics", `${idPrefix}-epics`, opts.epics ?? [], rev),
+    resultFrame("jobs", `${idPrefix}-jobs`, opts.jobs ?? [], rev),
+    resultFrame(
+      "subagent_invocations",
+      `${idPrefix}-subagent-invocations`,
+      [],
+      rev,
+    ),
+    resultFrame("git", `${idPrefix}-git`, opts.git ?? [], rev),
+    resultFrame("dead_letters", `${idPrefix}-dead-letters`, [], rev),
+  ]);
+}
+
+function gitRow(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    project_dir: "/repo",
+    branch: "main",
+    head_oid: null,
+    upstream: null,
+    ahead: null,
+    behind: null,
+    dirty_count: 0,
+    orphaned_count: 0,
+    dirty_files: [],
+    orphaned_files: [],
+    jobs: [],
+    last_event_id: 0,
+    updated_at: 0,
+    ...overrides,
+  };
+}
+
+function jobRow(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    job_id: "j-1",
+    created_at: 0,
+    cwd: null,
+    pid: null,
+    state: "working",
+    last_event_id: 0,
+    updated_at: 0,
+    title: null,
+    title_source: null,
+    transcript_path: null,
+    ...overrides,
+  };
+}
+
+/**
+ * Each `subscribeCollection` opens its OWN connection, so a git+jobs AND
+ * spawns two mock sockets. Locate a socket by the collection of its
+ * outbound query frame (drains that socket's outbound buffer as a side
+ * effect — call once per socket).
+ */
+function findSockForCollection(
+  sockets: MockSocket[],
+  collection: string,
+): MockSocket | null {
+  for (const s of sockets) {
+    const parsed = s.outbound.map((line) => {
+      const trimmed = line.endsWith("\n") ? line.slice(0, -1) : line;
+      return JSON.parse(trimmed) as { collection?: string };
+    });
+    if (parsed.some((q) => q.collection === collection)) {
+      return s;
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Epic + Task fixture builders — wire shape (the readiness pipeline
 // reads `tasks` + `depends_on_epics` arrays directly).
@@ -270,10 +360,64 @@ function makeHarness(connect: ConnectFactory): AwaitHarness {
         handlers.deadline = null;
       },
       connect,
+      gitRoot: "/repo",
+      ownSessionId: null,
     },
   };
   return h;
 }
+
+// ---------------------------------------------------------------------------
+// ParsedArgs builders — the runner now takes an N-segment shape; these
+// helpers keep the single-condition call sites terse and add the
+// multi-condition / git / jobs shapes for the fn-713 tests.
+// ---------------------------------------------------------------------------
+
+type RunnerArgs = Parameters<typeof runAwait>[0];
+
+function singleArgs(
+  condition: "complete" | "unblocked",
+  id: string,
+  kind: "task" | "epic",
+  overrides: Partial<Omit<RunnerArgs, "segments">> = {},
+): RunnerArgs {
+  return {
+    segments: [{ condition, target: { id, kind, condition } }],
+    timeoutMs: null,
+    failOnStuck: false,
+    noArmedLine: false,
+    requireTransition: false,
+    json: false,
+    sock: "/tmp/keeper-mock.sock",
+    ...overrides,
+  };
+}
+
+/** Build an N-segment args from condition descriptors (fn-713 AND grammar). */
+function argsFor(
+  segments: RunnerArgs["segments"],
+  overrides: Partial<Omit<RunnerArgs, "segments">> = {},
+): RunnerArgs {
+  return {
+    segments,
+    timeoutMs: null,
+    failOnStuck: false,
+    noArmedLine: false,
+    requireTransition: false,
+    json: false,
+    sock: "/tmp/keeper-mock.sock",
+    ...overrides,
+  };
+}
+
+const planctlSeg = (
+  condition: "complete" | "unblocked",
+  id: string,
+  kind: "task" | "epic",
+): RunnerArgs["segments"][number] => ({
+  condition,
+  target: { id, kind, condition },
+});
 
 /**
  * Drive `runAwait`. The runner returns its `state.result` once
@@ -322,9 +466,13 @@ test("parseAwaitArgs: complete + task id classifies as task", () => {
   if (!r.ok) {
     throw new Error(`expected ok, got ${r.message}`);
   }
-  expect(r.args.condition).toBe("complete");
-  expect(r.args.id).toBe("fn-1-foo.1");
-  expect(r.args.kind).toBe("task");
+  expect(r.args.segments).toHaveLength(1);
+  const seg = r.args.segments[0];
+  if (seg?.condition !== "complete" || !("target" in seg)) {
+    throw new Error("expected a planctl complete segment");
+  }
+  expect(seg.target.id).toBe("fn-1-foo.1");
+  expect(seg.target.kind).toBe("task");
   expect(r.args.json).toBe(false);
   expect(r.args.timeoutMs).toBeNull();
 });
@@ -334,8 +482,11 @@ test("parseAwaitArgs: unblocked + bare epic id", () => {
   if (!r.ok) {
     throw new Error(`expected ok, got ${r.message}`);
   }
-  expect(r.args.condition).toBe("unblocked");
-  expect(r.args.kind).toBe("epic");
+  const seg = r.args.segments[0];
+  if (seg?.condition !== "unblocked" || !("target" in seg)) {
+    throw new Error("expected a planctl unblocked segment");
+  }
+  expect(seg.target.kind).toBe("epic");
 });
 
 test("parseAwaitArgs: flags wire through", () => {
@@ -367,13 +518,120 @@ test("parseAwaitArgs: bad condition → usage error", () => {
   expect(r.ok).toBe(false);
 });
 
-test("parseAwaitArgs: missing positionals → usage error", () => {
+test("parseAwaitArgs: missing positional id for planctl → usage error", () => {
   const r = parseAwaitArgs(["complete"]);
   expect(r.ok).toBe(false);
 });
 
 test("parseAwaitArgs: bad timeout → usage error", () => {
   const r = parseAwaitArgs(["complete", "fn-1-foo.1", "--timeout", "abc"]);
+  expect(r.ok).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// parseAwaitArgs — fn-713 grammar (segment tokenizer)
+// ---------------------------------------------------------------------------
+
+test("parseAwaitArgs: git-clean takes no id", () => {
+  const r = parseAwaitArgs(["git-clean"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.segments).toHaveLength(1);
+  expect(r.args.segments[0]?.condition).toBe("git-clean");
+});
+
+test("parseAwaitArgs: agents-idle takes no id", () => {
+  const r = parseAwaitArgs(["agents-idle"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.segments[0]?.condition).toBe("agents-idle");
+});
+
+test("parseAwaitArgs: git-clean with a stray id → usage error", () => {
+  const r = parseAwaitArgs(["git-clean", "fn-1-foo"]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: AND of two families parses both segments", () => {
+  const r = parseAwaitArgs(["git-clean", "and", "agents-idle"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.segments.map((s) => s.condition)).toEqual([
+    "git-clean",
+    "agents-idle",
+  ]);
+});
+
+test("parseAwaitArgs: AND of planctl + git parses id + nullary", () => {
+  const r = parseAwaitArgs(["complete", "fn-1-foo.1", "and", "git-clean"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.segments).toHaveLength(2);
+  const first = r.args.segments[0];
+  if (first?.condition !== "complete" || !("target" in first)) {
+    throw new Error("expected planctl first segment");
+  }
+  expect(first.target.id).toBe("fn-1-foo.1");
+  expect(r.args.segments[1]?.condition).toBe("git-clean");
+});
+
+test("parseAwaitArgs: three-way AND parses", () => {
+  const r = parseAwaitArgs([
+    "git-clean",
+    "and",
+    "agents-idle",
+    "and",
+    "complete",
+    "fn-1-foo.1",
+  ]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.segments).toHaveLength(3);
+});
+
+test("parseAwaitArgs: leading 'and' → empty segment usage error", () => {
+  const r = parseAwaitArgs(["and", "git-clean"]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: trailing 'and' → empty segment usage error", () => {
+  const r = parseAwaitArgs(["git-clean", "and"]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: double 'and' → empty segment usage error", () => {
+  const r = parseAwaitArgs(["git-clean", "and", "and", "agents-idle"]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: duplicate nullary condition → usage error", () => {
+  const r = parseAwaitArgs(["git-clean", "and", "git-clean"]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: duplicate planctl condition+id → usage error", () => {
+  const r = parseAwaitArgs([
+    "complete",
+    "fn-1-foo.1",
+    "and",
+    "complete",
+    "fn-1-foo.1",
+  ]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: unknown condition in a segment → usage error", () => {
+  const r = parseAwaitArgs(["git-clean", "and", "bogus"]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: no positionals → usage error", () => {
+  const r = parseAwaitArgs([]);
   expect(r.ok).toBe(false);
 });
 
@@ -388,20 +646,7 @@ test("task complete: armed line + met terminal (exit 0)", async () => {
   // the right subscription ids on the wire.
   const idPrefix = `await-${process.pid}`;
 
-  await runAndCatch(
-    {
-      condition: "complete",
-      id: "fn-1-foo.1",
-      kind: "task",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
-    h.deps,
-  );
+  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
 
   const sock = socketRef.current;
   if (!sock) {
@@ -448,20 +693,7 @@ test("task unblocked: armed + ready → met (exit 0)", async () => {
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
-  await runAndCatch(
-    {
-      condition: "unblocked",
-      id: "fn-1-foo.1",
-      kind: "task",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
-    h.deps,
-  );
+  await runAndCatch(singleArgs("unblocked", "fn-1-foo.1", "task"), h.deps);
 
   const sock = socketRef.current;
   if (!sock) {
@@ -505,20 +737,7 @@ test("epic unblocked: armed + ready task in epic → met (exit 0)", async () => 
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
-  await runAndCatch(
-    {
-      condition: "unblocked",
-      id: "fn-1-foo",
-      kind: "epic",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
-    h.deps,
-  );
+  await runAndCatch(singleArgs("unblocked", "fn-1-foo", "epic"), h.deps);
 
   const sock = socketRef.current;
   if (!sock) {
@@ -548,20 +767,7 @@ test("not-found at first paint: no armed line, failed reason=not-found exit 1", 
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
-  await runAndCatch(
-    {
-      condition: "complete",
-      id: "fn-999-missing.1",
-      kind: "task",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
-    h.deps,
-  );
+  await runAndCatch(singleArgs("complete", "fn-999-missing.1", "task"), h.deps);
 
   const sock = socketRef.current;
   if (!sock) {
@@ -588,20 +794,7 @@ test("SIGTERM → failed reason=timeout exit 3, exactly one terminal line", asyn
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
-  await runAndCatch(
-    {
-      condition: "complete",
-      id: "fn-1-foo.1",
-      kind: "task",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
-    h.deps,
-  );
+  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
 
   const sock = socketRef.current;
   if (!sock) {
@@ -639,17 +832,7 @@ test("--timeout deadline → failed reason=timeout exit 3", async () => {
   const idPrefix = `await-${process.pid}`;
 
   await runAndCatch(
-    {
-      condition: "complete",
-      id: "fn-1-foo.1",
-      kind: "task",
-      timeoutMs: 1000,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
+    singleArgs("complete", "fn-1-foo.1", "task", { timeoutMs: 1000 }),
     h.deps,
   );
 
@@ -680,20 +863,7 @@ test("stuck default: armed but no terminal — keep waiting", async () => {
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
-  await runAndCatch(
-    {
-      condition: "unblocked",
-      id: "fn-1-foo.1",
-      kind: "task",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
-    h.deps,
-  );
+  await runAndCatch(singleArgs("unblocked", "fn-1-foo.1", "task"), h.deps);
 
   const sock = socketRef.current;
   if (!sock) {
@@ -723,17 +893,7 @@ test("--fail-on-stuck: stuck verdict → failed reason=stuck exit 5", async () =
   const idPrefix = `await-${process.pid}`;
 
   await runAndCatch(
-    {
-      condition: "unblocked",
-      id: "fn-1-foo.1",
-      kind: "task",
-      timeoutMs: null,
-      failOnStuck: true,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
+    singleArgs("unblocked", "fn-1-foo.1", "task", { failOnStuck: true }),
     h.deps,
   );
 
@@ -769,17 +929,7 @@ test("--json: emits JSON-shaped lines", async () => {
   const idPrefix = `await-${process.pid}`;
 
   await runAndCatch(
-    {
-      condition: "complete",
-      id: "fn-1-foo.1",
-      kind: "task",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: true,
-      sock: "/tmp/keeper-mock.sock",
-    },
+    singleArgs("complete", "fn-1-foo.1", "task", { json: true }),
     h.deps,
   );
 
@@ -813,17 +963,7 @@ test("--no-armed-line: skips armed, still emits terminal", async () => {
   const idPrefix = `await-${process.pid}`;
 
   await runAndCatch(
-    {
-      condition: "complete",
-      id: "fn-1-foo.1",
-      kind: "task",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: true,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
+    singleArgs("complete", "fn-1-foo.1", "task", { noArmedLine: true }),
     h.deps,
   );
 
@@ -856,17 +996,7 @@ test("--require-transition: skip already-true first paint, fire on next snapshot
   const idPrefix = `await-${process.pid}`;
 
   await runAndCatch(
-    {
-      condition: "complete",
-      id: "fn-1-foo.1",
-      kind: "task",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: true,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
+    singleArgs("complete", "fn-1-foo.1", "task", { requireTransition: true }),
     h.deps,
   );
 
@@ -909,20 +1039,7 @@ test("epic complete: present-then-drop + re-query hit → met (exit 0)", async (
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
-  await runAndCatch(
-    {
-      condition: "complete",
-      id: "fn-1-foo",
-      kind: "epic",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
-    h.deps,
-  );
+  await runAndCatch(singleArgs("complete", "fn-1-foo", "epic"), h.deps);
 
   const sock = socketRef.current;
   if (!sock) {
@@ -986,20 +1103,7 @@ test("epic complete: present-then-drop + re-query MISS → deleted exit 4", asyn
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
-  await runAndCatch(
-    {
-      condition: "complete",
-      id: "fn-1-foo",
-      kind: "epic",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
-    h.deps,
-  );
+  await runAndCatch(singleArgs("complete", "fn-1-foo", "epic"), h.deps);
 
   const sock = socketRef.current;
   if (!sock) {
@@ -1043,20 +1147,7 @@ test("reconnect blip: post-reconnect first-paint absence is swallowed (no delete
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
-  await runAndCatch(
-    {
-      condition: "complete",
-      id: "fn-1-foo",
-      kind: "epic",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
-    h.deps,
-  );
+  await runAndCatch(singleArgs("complete", "fn-1-foo", "epic"), h.deps);
 
   const sock = socketRef.current;
   if (!sock) {
@@ -1106,20 +1197,7 @@ test("onFatal: connection-fatal error frame → failed reason=connect exit 1 (no
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
 
-  await runAndCatch(
-    {
-      condition: "complete",
-      id: "fn-1-foo.1",
-      kind: "task",
-      timeoutMs: null,
-      failOnStuck: false,
-      noArmedLine: false,
-      requireTransition: false,
-      json: false,
-      sock: "/tmp/keeper-mock.sock",
-    },
-    h.deps,
-  );
+  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
 
   const sock = socketRef.current;
   if (!sock) {
@@ -1141,4 +1219,357 @@ test("onFatal: connection-fatal error frame → failed reason=connect exit 1 (no
   const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
   expect(failed).toBeDefined();
   expect(failed).toContain("reason=connect");
+});
+
+// ===========================================================================
+// fn-713: git-clean / agents-idle / AND combinations
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// git-clean (dedicated git collection stream) — armed + met when clean.
+// ---------------------------------------------------------------------------
+
+test("git-clean: subscribes git collection, met when row clean", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(argsFor([{ condition: "git-clean" }]), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  // The runner should have opened ONLY a git collection subscription
+  // (idPrefix-git), not the full readiness five.
+  const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
+  expect(outbound).toHaveLength(1);
+  expect(outbound[0]?.collection).toBe("git");
+
+  // First paint: clean row for /repo (the harness's gitRoot) → armed + met.
+  sock.deliver([
+    resultFrame("git", `${idPrefix}-git`, [gitRow({ project_dir: "/repo" })]),
+  ]);
+
+  const lines = h.stdout.join("");
+  expect(lines).toContain("[keeper-await] armed");
+  expect(lines).toContain("[keeper-await] met");
+  expect(lines).toContain("condition=git-clean");
+  expect(h.exitCode).toBe(0);
+});
+
+test("git-clean: dirty row → armed, no terminal (keeps waiting)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(argsFor([{ condition: "git-clean" }]), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  sock.deliver([
+    resultFrame("git", `${idPrefix}-git`, [
+      gitRow({ project_dir: "/repo", dirty_count: 4 }),
+    ]),
+  ]);
+
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).toContain("armed");
+  expect(h.exitCode).toBeNull();
+
+  // Clean it up → met.
+  sock.deliver([
+    resultFrame(
+      "git",
+      `${idPrefix}-git`,
+      [gitRow({ project_dir: "/repo" })],
+      2,
+    ),
+  ]);
+  expect(h.stdout.some((l) => l.includes("[keeper-await] met"))).toBe(true);
+  expect(h.exitCode).toBe(0);
+});
+
+test("git-clean: no git_status row for root → met (clean)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(argsFor([{ condition: "git-clean" }]), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // A row for a DIFFERENT repo only → /repo has no row → met.
+  sock.deliver([
+    resultFrame("git", `${idPrefix}-git`, [
+      gitRow({ project_dir: "/other", dirty_count: 9 }),
+    ]),
+  ]);
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// agents-idle (dedicated jobs collection stream).
+// ---------------------------------------------------------------------------
+
+test("agents-idle: subscribes jobs collection, met when no other working job", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(argsFor([{ condition: "agents-idle" }]), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
+  expect(outbound).toHaveLength(1);
+  expect(outbound[0]?.collection).toBe("jobs");
+
+  // Empty jobs → idle → armed + met.
+  sock.deliver([resultFrame("jobs", `${idPrefix}-jobs`, [])]);
+  expect(h.stdout.join("")).toContain("[keeper-await] met");
+  expect(h.exitCode).toBe(0);
+});
+
+test("agents-idle: another working job in root → waiting, then idle → met", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(argsFor([{ condition: "agents-idle" }]), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // A busy job inside /repo → waiting (armed only).
+  sock.deliver([
+    resultFrame("jobs", `${idPrefix}-jobs`, [
+      jobRow({ job_id: "other", state: "working", cwd: "/repo/sub" }),
+    ]),
+  ]);
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).toContain("armed");
+  expect(h.exitCode).toBeNull();
+
+  // It ends → idle → met.
+  sock.deliver([resultFrame("jobs", `${idPrefix}-jobs`, [], 2)]);
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// no-git-root: failed reason=no-git-root exit 1 at arm time.
+// ---------------------------------------------------------------------------
+
+test("no-git-root: git-clean with null gitRoot → failed reason=no-git-root exit 1", async () => {
+  const { factory } = makeMockConnect();
+  const h = makeHarness(factory);
+  // Override the harness's default gitRoot to null.
+  h.deps.gitRoot = null;
+
+  await runAndCatch(argsFor([{ condition: "git-clean" }]), h.deps);
+
+  // Terminal fires synchronously at arm time — no subscription needed.
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).toContain("[keeper-await] failed");
+  expect(h.stdout[0]).toContain("reason=no-git-root");
+  expect(h.exitCode).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// AND of two families (git-clean and agents-idle): met only after BOTH hold.
+// Each family rides its OWN dedicated collection connection — the aggregate
+// first-paint gate holds armed until BOTH have painted.
+// ---------------------------------------------------------------------------
+
+test("AND git-clean + agents-idle: met only after both paint and hold", async () => {
+  const { factory, socketsAll } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "git-clean" }, { condition: "agents-idle" }]),
+    h.deps,
+  );
+
+  // Two dedicated subscriptions opened (git + jobs), each on its own
+  // connection.
+  expect(socketsAll.sockets).toHaveLength(2);
+  const gitSock = findSockForCollection(socketsAll.sockets, "git");
+  const jobsSock = findSockForCollection(socketsAll.sockets, "jobs");
+  if (!gitSock || !jobsSock) {
+    throw new Error("git/jobs sockets not both opened");
+  }
+
+  // Paint ONLY git (clean). Aggregate first-paint gate: jobs hasn't
+  // painted, so NO armed line yet and definitely no met.
+  gitSock.deliver([
+    resultFrame("git", `${idPrefix}-git`, [gitRow({ project_dir: "/repo" })]),
+  ]);
+  expect(h.stdout).toHaveLength(0);
+  expect(h.exitCode).toBeNull();
+
+  // Now paint jobs WITH a busy job → both painted, armed fires, but the
+  // AND is not met (agents-idle is waiting).
+  jobsSock.deliver([
+    resultFrame("jobs", `${idPrefix}-jobs`, [
+      jobRow({ job_id: "other", state: "working", cwd: "/repo" }),
+    ]),
+  ]);
+  expect(h.stdout.some((l) => l.includes("[keeper-await] armed"))).toBe(true);
+  expect(h.stdout.some((l) => l.includes("[keeper-await] met"))).toBe(false);
+  expect(h.exitCode).toBeNull();
+
+  // The busy job ends → agents-idle now met AND git-clean still met → the
+  // single aggregate terminal met fires.
+  jobsSock.deliver([resultFrame("jobs", `${idPrefix}-jobs`, [], 2)]);
+  const metLines = h.stdout.filter((l) => l.includes("[keeper-await] met"));
+  expect(metLines).toHaveLength(1);
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// AND with a planctl segment: reads git off the readiness snapshot (no
+// extra git subscribe), and a planctl `deleted` short-circuits the aggregate.
+// ---------------------------------------------------------------------------
+
+test("AND complete + git-clean: rides readiness snapshot (one connection, no extra git sub)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([
+      planctlSeg("complete", "fn-1-foo.1", "task"),
+      { condition: "git-clean" },
+    ]),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  // A planctl-bearing combo rides subscribeReadiness only — its five
+  // collections, NOT a sixth dedicated git sub.
+  const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
+  const cols = outbound.map((o) => o.collection).sort();
+  expect(cols).toEqual([
+    "dead_letters",
+    "epics",
+    "git",
+    "jobs",
+    "subagent_invocations",
+  ]);
+
+  // First paint: task not done + repo dirty → armed, no met.
+  deliverFiveWith(sock, idPrefix, {
+    epics: [
+      makeEpicRow({
+        tasks: [makeTaskRow({ worker_phase: "open", approval: "pending" })],
+      }),
+    ],
+    git: [gitRow({ project_dir: "/repo", dirty_count: 2 })],
+  });
+  expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
+  expect(h.exitCode).toBeNull();
+
+  // Task done+approved AND repo clean → aggregate met.
+  deliverFiveWith(sock, idPrefix, {
+    epics: [
+      makeEpicRow({
+        tasks: [makeTaskRow({ worker_phase: "done", approval: "approved" })],
+      }),
+    ],
+    git: [gitRow({ project_dir: "/repo", dirty_count: 0 })],
+    rev: 2,
+  });
+  expect(h.exitCode).toBe(0);
+  expect(h.stdout.filter((l) => l.includes("[keeper-await] met"))).toHaveLength(
+    1,
+  );
+});
+
+test("AND complete + git-clean: planctl not-found short-circuits aggregate (exit 1)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([
+      planctlSeg("complete", "fn-999-missing.1", "task"),
+      { condition: "git-clean" },
+    ]),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First paint: empty board (task absent) + clean git → the planctl
+  // not-found short-circuits the whole aggregate, NO armed line.
+  deliverFiveWith(sock, idPrefix, {
+    epics: [],
+    git: [gitRow({ project_dir: "/repo" })],
+  });
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).not.toContain("armed");
+  expect(h.stdout[0]).toContain("reason=not-found");
+  expect(h.stdout[0]).toContain("from=complete fn-999-missing.1");
+  expect(h.exitCode).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// Aggregate timeout: SIGTERM on a multi-condition wait → exit 3, one line.
+// ---------------------------------------------------------------------------
+
+test("AND aggregate: SIGTERM → failed reason=timeout exit 3, one terminal line", async () => {
+  const { factory, socketsAll } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "git-clean" }, { condition: "agents-idle" }]),
+    h.deps,
+  );
+
+  const gitSock = findSockForCollection(socketsAll.sockets, "git");
+  const jobsSock = findSockForCollection(socketsAll.sockets, "jobs");
+  if (!gitSock || !jobsSock) {
+    throw new Error("git/jobs sockets not both opened");
+  }
+
+  // Paint both so we arm but stay waiting (dirty git + busy job).
+  gitSock.deliver([
+    resultFrame("git", `${idPrefix}-git`, [
+      gitRow({ project_dir: "/repo", dirty_count: 1 }),
+    ]),
+  ]);
+  jobsSock.deliver([
+    resultFrame("jobs", `${idPrefix}-jobs`, [
+      jobRow({ job_id: "other", state: "working", cwd: "/repo" }),
+    ]),
+  ]);
+  expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
+
+  h.fireSignal();
+  const failed = h.stdout.filter((l) => l.includes("[keeper-await] failed"));
+  expect(failed).toHaveLength(1);
+  expect(failed[0]).toContain("reason=timeout");
+  expect(h.exitCode).toBe(3);
 });

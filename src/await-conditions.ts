@@ -77,7 +77,7 @@
  */
 
 import type { BlockReason, ReadinessSnapshot, Verdict } from "./readiness";
-import type { Epic, Task } from "./types";
+import type { Epic, GitStatus, Job, Task } from "./types";
 
 // ---------------------------------------------------------------------------
 // Target id classification
@@ -92,15 +92,36 @@ import type { Epic, Task } from "./types";
 export type TargetKind = "epic" | "task";
 
 /**
+ * The two planctl-board condition families — each takes exactly one
+ * planctl id (`fn-N-slug` epic or `fn-N-slug.M` task). Distinguished from
+ * {@link GitJobCondition} (which take NO id and read git/jobs rows
+ * directly) so the grammar's per-condition arity is type-driven.
+ */
+export type PlanctlCondition = "complete" | "unblocked";
+
+/**
+ * The two non-planctl condition families (fn-713). Neither carries a
+ * planctl id — `git-clean` reads the cwd's `git_status` row, `agents-idle`
+ * reads the `jobs` rows. Evaluated by {@link gitCleanState} /
+ * {@link agentsIdleState}, NOT {@link evaluateAwaitCondition}.
+ */
+export type GitJobCondition = "git-clean" | "agents-idle";
+
+/** Every awaitable condition family. */
+export type AwaitCondition = PlanctlCondition | GitJobCondition;
+
+/**
  * Discriminator the command hands to {@link evaluateAwaitCondition}. The
  * `kind` field decides which projection arm the predicate reads off; the
  * `condition` selects between the "complete" and "unblocked" semantics
- * defined in the module docblock.
+ * defined in the module docblock. Only the planctl families carry an
+ * {@link AwaitTarget}; `git-clean` / `agents-idle` use the dedicated
+ * predicates and need no id/kind.
  */
 export interface AwaitTarget {
   id: string;
   kind: TargetKind;
-  condition: "complete" | "unblocked";
+  condition: PlanctlCondition;
 }
 
 /**
@@ -506,4 +527,128 @@ function verdictPhrase(v: Verdict): string {
     case "running":
       return `verdict=running:${v.reason.kind}`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// git-clean / agents-idle pure predicates (fn-713)
+// ---------------------------------------------------------------------------
+
+/**
+ * cwd-containment: is `cwd` the root itself or a descendant of it? Mirrors
+ * the reducer's `(post.cwd = ? OR post.cwd LIKE ?)` containment at
+ * `src/reducer.ts:1856` — `cwd === root || cwd.startsWith(root + "/")`.
+ * Trailing slashes are normalized off both sides first so `/repo/` and
+ * `/repo` resolve identically and `/repo-sibling` never false-matches
+ * `/repo`. Pure — never touches the filesystem.
+ */
+function cwdInsideRoot(cwd: string, root: string): boolean {
+  const c = cwd.endsWith("/") ? cwd.replace(/\/+$/, "") : cwd;
+  const r = root.endsWith("/") ? root.replace(/\/+$/, "") : root;
+  if (c.length === 0 || r.length === 0) {
+    return false;
+  }
+  return c === r || c.startsWith(`${r}/`);
+}
+
+/**
+ * `git-clean` predicate (fn-713). Given the cwd's resolved git root and the
+ * board's `git_status` rows, the repo is clean (MET) when the row for that
+ * root has `dirty_count === 0 AND orphaned_count === 0`.
+ *
+ * No row for the root → MET (clean): a repo absent from the
+ * membership-gated `git_status` projection has no dirty/orphan facts, which
+ * is exactly the "nothing to commit" steady state — keeper only mints a
+ * `git_status` row for a worktree that is `.planctl`-backed, dirty, or
+ * ahead of upstream, so an absent row means none of those held at snapshot
+ * time.
+ *
+ * Orphan-metric choice is load-bearing: this uses the STRICT
+ * `orphaned_count` column (zero attribution from any session). If a future
+ * caller wants this to mirror autopilot's dispatch gate it would instead
+ * need the client-computed `unattributed_to_live_count` (the
+ * `projectGitStatusByProjectDir` math in `src/readiness-client.ts`) — a
+ * deliberate, human-confirmed default per the fn-713 decision log. SWAP
+ * POINT: change the `row.orphaned_count` read below.
+ *
+ * Returns the existing {@link AwaitState} union (`met` / `waiting` only —
+ * git has no `deleted` / `stuck` semantic; an absent row is MET, not gone).
+ * Pure: no I/O, no `Date.now()`.
+ */
+export function gitCleanState(
+  gitRoot: string,
+  gitStatusRows: readonly GitStatus[],
+): AwaitState {
+  const normRoot = gitRoot.endsWith("/")
+    ? gitRoot.replace(/\/+$/, "")
+    : gitRoot;
+  let row: GitStatus | undefined;
+  for (const r of gitStatusRows) {
+    const rd = r.project_dir.endsWith("/")
+      ? r.project_dir.replace(/\/+$/, "")
+      : r.project_dir;
+    if (rd === normRoot) {
+      row = r;
+      break;
+    }
+  }
+  if (row === undefined) {
+    return { kind: "met", detail: "no git_status row for root (clean)" };
+  }
+  // SWAP POINT (see docblock): strict `orphaned_count`, NOT the
+  // client-computed `unattributed_to_live_count`.
+  if (row.dirty_count === 0 && row.orphaned_count === 0) {
+    return { kind: "met", detail: "git clean (dirty=0 orphaned=0)" };
+  }
+  return {
+    kind: "waiting",
+    detail: `git dirty (dirty=${row.dirty_count} orphaned=${row.orphaned_count})`,
+  };
+}
+
+/**
+ * `agents-idle` predicate (fn-713). Given the cwd's resolved git root, the
+ * caller's OWN `session_id` (for self-exclusion), and the `jobs` rows, the
+ * repo is idle (MET) when no OTHER job (`job_id !== ownSessionId`) with
+ * `state === "working"` has a cwd inside the root.
+ *
+ * Zero such jobs → MET (idle). cwd containment mirrors the reducer's
+ * `src/reducer.ts:1856` prefix match (see {@link cwdInsideRoot}). A job
+ * with a null cwd can never be inside the root, so it's skipped.
+ *
+ * `ownSessionId` is `null` when `CLAUDE_CODE_SESSION_ID` is unset (the
+ * self-exclusion is then a no-op — every working job counts, including the
+ * caller's own if it somehow appears).
+ *
+ * Reads `state === "working"` directly: per `src/reducer.ts`'s job state
+ * machine the `working` state is held for the whole turn+subagent window,
+ * so there's no between-turn flap to debounce. Returns the existing
+ * {@link AwaitState} union (`met` / `waiting` only). Pure: no I/O.
+ */
+export function agentsIdleState(
+  gitRoot: string,
+  ownSessionId: string | null,
+  jobsRows: Iterable<Job>,
+): AwaitState {
+  let busy = 0;
+  for (const job of jobsRows) {
+    if (job.state !== "working") {
+      continue;
+    }
+    if (ownSessionId !== null && job.job_id === ownSessionId) {
+      continue;
+    }
+    if (job.cwd === null) {
+      continue;
+    }
+    if (cwdInsideRoot(job.cwd, gitRoot)) {
+      busy += 1;
+    }
+  }
+  if (busy === 0) {
+    return { kind: "met", detail: "no other agents working in root" };
+  }
+  return {
+    kind: "waiting",
+    detail: `${busy} other agent(s) working in root`,
+  };
 }

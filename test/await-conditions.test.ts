@@ -28,14 +28,17 @@
 import { expect, test } from "bun:test";
 import {
   type AwaitState,
+  agentsIdleState,
   classifyTargetId,
   evaluateAwaitCondition,
+  gitCleanState,
   workable,
 } from "../src/await-conditions";
 import { computeReadiness, type Verdict } from "../src/readiness";
 import type {
   EmbeddedJob,
   Epic,
+  GitStatus,
   Job,
   ResolvedEpicDep,
   SubagentInvocation,
@@ -770,4 +773,164 @@ test("not-found→met: task present-then-absent + priorPresence + reQueryHit →
     { id: "fn-1-foo.1", kind: "task", condition: "complete" },
   );
   expect(state.kind).toBe("met");
+});
+
+// ---------------------------------------------------------------------------
+// git-clean / agents-idle pure predicates (fn-713)
+// ---------------------------------------------------------------------------
+
+function makeGitStatus(overrides: Partial<GitStatus>): GitStatus {
+  return {
+    project_dir: "/repo",
+    branch: "main",
+    head_oid: null,
+    upstream: null,
+    ahead: null,
+    behind: null,
+    dirty_count: 0,
+    orphaned_count: 0,
+    dirty_files: [],
+    orphaned_files: [],
+    jobs: [],
+    last_event_id: 0,
+    updated_at: 0,
+    ...overrides,
+  };
+}
+
+function makeJob(overrides: Partial<Job>): Job {
+  return {
+    job_id: "j-1",
+    created_at: 0,
+    cwd: null,
+    pid: null,
+    state: "working",
+    last_event_id: 0,
+    updated_at: 0,
+    title: null,
+    title_source: null,
+    transcript_path: null,
+    start_time: null,
+    plan_verb: null,
+    plan_ref: null,
+    epic_links: [],
+    last_api_error_at: null,
+    last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
+    last_permission_prompt_at: null,
+    last_permission_prompt_kind: null,
+    git_dirty_count: 0,
+    git_unattributed_to_live_count: 0,
+    git_orphan_count: 0,
+    ...overrides,
+  } as Job;
+}
+
+test("git-clean: dirty=0 orphaned=0 → met", () => {
+  const rows = [makeGitStatus({ project_dir: "/repo" })];
+  expect(gitCleanState("/repo", rows).kind).toBe("met");
+});
+
+test("git-clean: no row for root → met (clean)", () => {
+  const rows = [makeGitStatus({ project_dir: "/other" })];
+  expect(gitCleanState("/repo", rows).kind).toBe("met");
+});
+
+test("git-clean: empty rows → met (clean)", () => {
+  expect(gitCleanState("/repo", []).kind).toBe("met");
+});
+
+test("git-clean: dirty>0 → waiting", () => {
+  const rows = [makeGitStatus({ project_dir: "/repo", dirty_count: 3 })];
+  expect(gitCleanState("/repo", rows).kind).toBe("waiting");
+});
+
+test("git-clean: orphaned>0 → waiting", () => {
+  const rows = [makeGitStatus({ project_dir: "/repo", orphaned_count: 1 })];
+  expect(gitCleanState("/repo", rows).kind).toBe("waiting");
+});
+
+test("git-clean: uses STRICT orphaned_count (not unattributed-to-live)", () => {
+  // A row clean on dirty + strict orphaned is met even if it had dirty
+  // files under another session — the predicate never reads dirty_files
+  // attributions (that's the swap-point for the autopilot-gate variant).
+  const rows = [
+    makeGitStatus({
+      project_dir: "/repo",
+      dirty_count: 0,
+      orphaned_count: 0,
+      dirty_files: [{ path: "x" }],
+    }),
+  ];
+  expect(gitCleanState("/repo", rows).kind).toBe("met");
+});
+
+test("git-clean: trailing-slash root normalizes against row project_dir", () => {
+  const rows = [makeGitStatus({ project_dir: "/repo", dirty_count: 2 })];
+  expect(gitCleanState("/repo/", rows).kind).toBe("waiting");
+});
+
+test("git-clean: sibling-dir root does NOT match (no false clean/dirty)", () => {
+  // `/repo-sibling` must not match the `/repo` row — it has no row, so
+  // it's met (clean) regardless of the /repo row being dirty.
+  const rows = [makeGitStatus({ project_dir: "/repo", dirty_count: 9 })];
+  expect(gitCleanState("/repo-sibling", rows).kind).toBe("met");
+});
+
+test("agents-idle: zero jobs → met", () => {
+  expect(agentsIdleState("/repo", null, []).kind).toBe("met");
+});
+
+test("agents-idle: another working job in root → waiting", () => {
+  const jobs = [makeJob({ job_id: "other", state: "working", cwd: "/repo" })];
+  expect(agentsIdleState("/repo", "me", jobs).kind).toBe("waiting");
+});
+
+test("agents-idle: excludes own session id (self → idle)", () => {
+  const jobs = [makeJob({ job_id: "me", state: "working", cwd: "/repo" })];
+  expect(agentsIdleState("/repo", "me", jobs).kind).toBe("met");
+});
+
+test("agents-idle: ownSessionId null → no self-exclusion (own job counts)", () => {
+  const jobs = [makeJob({ job_id: "me", state: "working", cwd: "/repo" })];
+  expect(agentsIdleState("/repo", null, jobs).kind).toBe("waiting");
+});
+
+test("agents-idle: non-working job in root → met (only working counts)", () => {
+  const jobs = [makeJob({ job_id: "other", state: "ended", cwd: "/repo" })];
+  expect(agentsIdleState("/repo", "me", jobs).kind).toBe("met");
+});
+
+test("agents-idle: cwd inside root (prefix descendant) → waiting", () => {
+  const jobs = [
+    makeJob({ job_id: "other", state: "working", cwd: "/repo/sub/dir" }),
+  ];
+  expect(agentsIdleState("/repo", "me", jobs).kind).toBe("waiting");
+});
+
+test("agents-idle: cwd in a SIBLING dir does NOT false-match the root", () => {
+  // `/repo-sibling` is NOT inside `/repo` — the prefix guard requires a
+  // `/` boundary, so this is idle.
+  const jobs = [
+    makeJob({ job_id: "other", state: "working", cwd: "/repo-sibling" }),
+  ];
+  expect(agentsIdleState("/repo", "me", jobs).kind).toBe("met");
+});
+
+test("agents-idle: cwd === root exactly → waiting", () => {
+  const jobs = [makeJob({ job_id: "other", state: "working", cwd: "/repo" })];
+  expect(agentsIdleState("/repo", "me", jobs).kind).toBe("waiting");
+});
+
+test("agents-idle: null cwd job is skipped (never inside root)", () => {
+  const jobs = [makeJob({ job_id: "other", state: "working", cwd: null })];
+  expect(agentsIdleState("/repo", "me", jobs).kind).toBe("met");
+});
+
+test("agents-idle: working job OUTSIDE root → met", () => {
+  const jobs = [
+    makeJob({ job_id: "other", state: "working", cwd: "/elsewhere" }),
+  ];
+  expect(agentsIdleState("/repo", "me", jobs).kind).toBe("met");
 });

@@ -44,7 +44,7 @@ Subcommands:
   git         Live git status frames
   usage       Live usage frames
   autopilot   Dispatch log viewer
-  await       Block until a planctl board condition holds
+  await       Block until a planctl/git/job condition holds
 
 Flags:
   --help, -h     Show this help
