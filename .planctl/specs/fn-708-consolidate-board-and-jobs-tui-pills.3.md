@@ -49,5 +49,5 @@ test that the legend line is present.
 - [ ] test/jobs.test.ts green; bun run typecheck clean
 
 ## Done summary
-
+Applied omit-default to the jobs view: projectJobRow drops [stopped] via the shared pillOrEmpty helper, monitorLinesFor removes the dead [status] slot (restore-comment), the JOBS_PILL_LEGEND footer rides bodyLines in live + sidecar output, and the jobs HELP was revised to the new row shape. test/jobs.test.ts updated and green; typecheck clean.
 ## Evidence
