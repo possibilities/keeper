@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-709-mint-seam-dedup-for-zellij-feed-consumer",
   "bundles": [],
   "closer_done_at": "2026-06-05T07:18:35.961792Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T07:18:35.961792Z"
+  "updated_at": "2026-06-05T11:08:00.709536Z"
 }
