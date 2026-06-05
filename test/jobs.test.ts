@@ -22,7 +22,11 @@ import {
   renderJobsBody,
   selectableJobIds,
 } from "../cli/jobs";
-import { colorizePillsInLine, renderDeadLetterPill } from "../src/board-render";
+import {
+  colorizePillsInLine,
+  pill,
+  renderDeadLetterPill,
+} from "../src/board-render";
 import type { SubagentInvocation } from "../src/types";
 import { SELECTED_LINE_PREFIX } from "../src/view-shell";
 
@@ -66,7 +70,9 @@ test("projectJobRow: full shape — cwd basename, title, role pill, state pill",
     plan_verb: "work",
     state: "working",
   });
-  expect(line).toBe("(keeper) do the thing [worker] [working]");
+  expect(line).toBe(
+    `(keeper) do the thing ${pill("worker")} ${pill("working")}`,
+  );
 });
 
 test("projectJobRow: null cwd drops the (cwd) prefix entirely", () => {
@@ -75,10 +81,10 @@ test("projectJobRow: null cwd drops the (cwd) prefix entirely", () => {
     plan_verb: null,
     state: "stopped",
   });
-  // No leading "() " — the empty basename suppresses the prefix. fn-708:
-  // `stopped` is the resting state, so its pill is omitted (absence ⇒
-  // stopped) — the row carries no [state] pill at all.
-  expect(line).toBe("ambient session");
+  // No leading "() " — the empty basename suppresses the prefix. fn-713
+  // follow-on: show-defaults reverses the fn-708 omit-default — `stopped`
+  // (the resting state) now renders its pill explicitly.
+  expect(line).toBe(`ambient session ${pill("stopped")}`);
 });
 
 test("projectJobRow: null plan_verb suppresses the [role] pill", () => {
@@ -88,9 +94,9 @@ test("projectJobRow: null plan_verb suppresses the [role] pill", () => {
     plan_verb: null,
     state: "working",
   });
-  // Inline shape carries no role pill — exactly two pills (no role pill
-  // means we go straight from title to state).
-  expect(line).toBe("(x) ad-hoc [working]");
+  // Inline shape carries no role pill — no role pill means we go straight
+  // from title to state.
+  expect(line).toBe(`(x) ad-hoc ${pill("working")}`);
 });
 
 test("projectJobRow: last_api_error_at appends [failed:<kind>] inline (same line)", () => {
@@ -102,9 +108,11 @@ test("projectJobRow: last_api_error_at appends [failed:<kind>] inline (same line
     last_api_error_at: 12345,
     last_api_error_kind: "rate_limit",
   });
-  // fn-708: `stopped` is the resting state → its pill is omitted; the
-  // [failed:<kind>] pill stays inline.
-  expect(line).toBe("(x) rate-limited [planner] [failed:rate_limit]");
+  // fn-713 follow-on: show-defaults renders the resting `[stopped]` pill
+  // explicitly; the [failed:<kind>] pill stays inline after it.
+  expect(line).toBe(
+    `(x) rate-limited ${pill("planner")} ${pill("stopped")} ${pill("failed:rate_limit")}`,
+  );
 });
 
 test("projectJobRow: last_input_request_at drops [awaiting:<kind>] onto its own continuation line", () => {
@@ -117,9 +125,11 @@ test("projectJobRow: last_input_request_at drops [awaiting:<kind>] onto its own 
     last_input_request_kind: "ask_user_question",
   });
   // Continuation line indented two spaces (matches the depth of the
-  // row's sub-agent lines, which the caller appends below). fn-708:
-  // `stopped` state pill is omitted (absence ⇒ stopped).
-  expect(line).toBe("(x) asking [worker]\n  [awaiting:ask_user_question]");
+  // row's sub-agent lines, which the caller appends below). fn-713
+  // follow-on: show-defaults renders the resting `[stopped]` state pill.
+  expect(line).toBe(
+    `(x) asking ${pill("worker")} ${pill("stopped")}\n  ${pill("awaiting:ask_user_question")}`,
+  );
 });
 
 test("projectJobRow: backend coords NEVER appear in the per-row output (collapse-controlled)", () => {
@@ -139,7 +149,7 @@ test("projectJobRow: backend coords NEVER appear in the per-row output (collapse
     backend_exec_tab_id: "3",
     backend_exec_tab_name: "main",
   });
-  expect(line).toBe("(keeper) live session [working]");
+  expect(line).toBe(`(keeper) live session ${pill("working")}`);
   expect(line).not.toContain("·");
   expect(line).not.toContain("[main");
 });
@@ -159,25 +169,28 @@ test("projectJobRow: awaiting drops to its own continuation line; backend never 
   });
   // Head + always-visible awaiting line only. The backend pill is
   // collapse-controlled and lives in `renderJobsBody`'s expanded region.
-  // fn-708: `stopped` state pill is omitted (absence ⇒ stopped).
-  expect(line).toBe("(x) asking [worker]\n  [awaiting:ask_user_question]");
+  // fn-713 follow-on: show-defaults renders the resting `[stopped]` pill.
+  expect(line).toBe(
+    `(x) asking ${pill("worker")} ${pill("stopped")}\n  ${pill("awaiting:ask_user_question")}`,
+  );
 });
 
-test("projectJobRow: non-resting state renders verbatim; stopped omits the pill", () => {
-  // The omit-default rule (J2) fires ONLY at `stopped`; working / ended /
-  // killed all still render a pill verbatim.
+test("projectJobRow: every state renders its pill, stopped (the default) included", () => {
+  // fn-713 follow-on: show-defaults reverses the fn-708 omit-default — every
+  // state now renders an explicit iconized pill, `stopped` (the resting
+  // value) included.
   expect(projectJobRow({ title: "a", plan_verb: null, state: "working" })).toBe(
-    "a [working]",
+    `a ${pill("working")}`,
   );
   expect(projectJobRow({ title: "a", plan_verb: null, state: "ended" })).toBe(
-    "a [ended]",
+    `a ${pill("ended")}`,
   );
   expect(projectJobRow({ title: "a", plan_verb: null, state: "killed" })).toBe(
-    "a [killed]",
+    `a ${pill("killed")}`,
   );
-  // `stopped` (the resting state) drops the pill entirely.
+  // `stopped` (the resting state) now renders its pill explicitly.
   expect(projectJobRow({ title: "a", plan_verb: null, state: "stopped" })).toBe(
-    "a",
+    `a ${pill("stopped")}`,
   );
 });
 
@@ -300,7 +313,9 @@ test("renderJobsBody: single session with one job → one section, one row", () 
     ],
   ]);
   const body = renderJobsBody(jobs, new Map());
-  expect(body).toBe(["--- ada ---", "(x) ambient [working]"].join("\n"));
+  expect(body).toBe(
+    ["--- ada ---", `(x) ambient ${pill("working")}`].join("\n"),
+  );
 });
 
 test("renderJobsBody: jobs with null session collect under '--- (no session) ---'", () => {
@@ -319,7 +334,7 @@ test("renderJobsBody: jobs with null session collect under '--- (no session) ---
   ]);
   const body = renderJobsBody(jobs, new Map());
   expect(body).toBe(
-    ["--- (no session) ---", "(x) ambient [working]"].join("\n"),
+    ["--- (no session) ---", `(x) ambient ${pill("working")}`].join("\n"),
   );
 });
 
@@ -355,10 +370,10 @@ test("renderJobsBody: multiple sessions render in first-seen wire order", () => 
   expect(body).toBe(
     [
       "--- session-b ---",
-      "(b) b-job [working]",
+      `(b) b-job ${pill("working")}`,
       "--- session-a ---",
-      // fn-708: `stopped` state pill omitted (absence ⇒ stopped).
-      "(a) a-job [worker]",
+      // fn-713 follow-on: show-defaults renders the resting `[stopped]` pill.
+      `(a) a-job ${pill("worker")} ${pill("stopped")}`,
     ].join("\n"),
   );
 });
@@ -390,7 +405,11 @@ test("renderJobsBody: jobs in the same session group together preserving wire or
   ]);
   const body = renderJobsBody(jobs, new Map());
   expect(body).toBe(
-    ["--- ada ---", "(a) first [working]", "(b) second [working]"].join("\n"),
+    [
+      "--- ada ---",
+      `(a) first ${pill("working")}`,
+      `(b) second ${pill("working")}`,
+    ].join("\n"),
   );
 });
 
@@ -437,11 +456,11 @@ test("renderJobsBody: interleaved sessions split into per-session sections, in f
   expect(body).toBe(
     [
       "--- session-a ---",
-      "(a1) a-first [working]",
-      "(a2) a-second [working]",
+      `(a1) a-first ${pill("working")}`,
+      `(a2) a-second ${pill("working")}`,
       "--- session-b ---",
-      // fn-708: `stopped` state pill omitted (absence ⇒ stopped).
-      "(b1) b-first [worker]",
+      // fn-713 follow-on: show-defaults renders the resting `[stopped]` pill.
+      `(b1) b-first ${pill("worker")} ${pill("stopped")}`,
     ].join("\n"),
   );
 });
@@ -472,7 +491,7 @@ test("renderJobsBody: backend pill is hidden by default (collapse-controlled)", 
   ]);
   const body = renderJobsBody(jobs, new Map());
   // No render opts → nothing in `expanded` → the pill stays hidden.
-  expect(body).toBe(["--- ada ---", "(x) live [working]"].join("\n"));
+  expect(body).toBe(["--- ada ---", `(x) live ${pill("working")}`].join("\n"));
   expect(body).not.toContain("[main");
 });
 
@@ -498,7 +517,7 @@ test("renderJobsBody: expanding a job reveals the backend pill (no sub-agents pr
     expanded: new Set(["j1"]),
   });
   expect(body).toBe(
-    ["--- ada ---", "(x) live [working]", "  [p11]"].join("\n"),
+    ["--- ada ---", `(x) live ${pill("working")}`, "  [p11]"].join("\n"),
   );
 });
 
@@ -539,7 +558,9 @@ const ambWithSub = (): {
 test("renderJobsBody: sub-agents are collapse-by-default (hidden with no render opts)", () => {
   const { jobs, subagentIndex } = ambWithSub();
   const body = renderJobsBody(jobs, subagentIndex);
-  expect(body).toBe(["--- ada ---", "(x) ambient [working]"].join("\n"));
+  expect(body).toBe(
+    ["--- ada ---", `(x) ambient ${pill("working")}`].join("\n"),
+  );
   expect(body).not.toContain("general-purpose");
 });
 
@@ -553,9 +574,9 @@ test("renderJobsBody: expanding shows backend pill BEFORE sub-agent lines", () =
   expect(body).toBe(
     [
       "--- ada ---",
-      "(x) ambient [working]",
+      `(x) ambient ${pill("working")}`,
       "  [p11]", // backend pill — rendered before sub-agent lines
-      "  general-purpose: investigate [running]",
+      `  general-purpose: investigate ${pill("running")}`,
     ].join("\n"),
   );
 });
@@ -585,9 +606,9 @@ test("renderJobsBody: awaiting line stays always-visible (NOT collapse-controlle
   expect(body).toBe(
     [
       "--- ada ---",
-      // fn-708: `stopped` state pill omitted (absence ⇒ stopped).
-      "(x) asking [worker]",
-      "  [awaiting:ask_user_question]",
+      // fn-713 follow-on: show-defaults renders the resting `[stopped]` pill.
+      `(x) asking ${pill("worker")} ${pill("stopped")}`,
+      `  ${pill("awaiting:ask_user_question")}`,
     ].join("\n"),
   );
 });
@@ -677,8 +698,8 @@ test("renderJobsBody insert mode: every job row gets a caret (even with no child
   expect(body).toBe(
     [
       "  --- ada ---",
-      `${SELECTED_LINE_PREFIX}${TRI_RIGHT} (a) first [working]`,
-      `${TRI_RIGHT} (b) second [working]`,
+      `${SELECTED_LINE_PREFIX}${TRI_RIGHT} (a) first ${pill("working")}`,
+      `${TRI_RIGHT} (b) second ${pill("working")}`,
     ].join("\n"),
   );
 });
@@ -720,10 +741,10 @@ test("renderJobsBody insert mode: selected + expanded → down-triangle, backend
   expect(body).toBe(
     [
       "  --- ada ---",
-      `${SELECTED_LINE_PREFIX}${TRI_DOWN} (a) first [working]`,
+      `${SELECTED_LINE_PREFIX}${TRI_DOWN} (a) first ${pill("working")}`,
       "    [p11]", // backend pill: 2 base + its own 2
-      // fn-708: subagent status=ok now omits the pill (absence ≡ ok).
-      "    scout: d", // sub-agent line: 2 base + its own 2
+      // fn-713 follow-on: show-defaults renders subagent status=ok explicitly.
+      `    scout: d ${pill("ok")}`, // sub-agent line: 2 base + its own 2
     ].join("\n"),
   );
 });
@@ -752,7 +773,7 @@ test("renderJobsBody insert mode: out-of-range selectedIndex clamps to last row"
     [
       "  --- ada ---",
       // Caret always present in insert mode now (no `hasChildren` gate).
-      `${SELECTED_LINE_PREFIX}${TRI_RIGHT} (a) first [working]`,
+      `${SELECTED_LINE_PREFIX}${TRI_RIGHT} (a) first ${pill("working")}`,
     ].join("\n"),
   );
 });
@@ -786,7 +807,7 @@ test("renderJobsBody insert mode: selectedIndex marks by selectableJobIds order,
     .find((l) => l.startsWith(SELECTED_LINE_PREFIX));
   // The highlight must land on a-second (a2), not b-first (the raw-index-1 row).
   expect(marked).toBe(
-    `${SELECTED_LINE_PREFIX}${TRI_RIGHT} (a2) a-second [working]`,
+    `${SELECTED_LINE_PREFIX}${TRI_RIGHT} (a2) a-second ${pill("working")}`,
   );
   // And exactly one row is selection-prefixed.
   expect(
@@ -802,8 +823,8 @@ test("renderJobsBody insert mode: selectedIndex marks by selectableJobIds order,
 // ---------------------------------------------------------------------------
 
 test("renderDeadLetterPill: positive N renders `[dead-letter:N]` verbatim", () => {
-  expect(renderDeadLetterPill(1)).toBe("[dead-letter:1]");
-  expect(renderDeadLetterPill(7)).toBe("[dead-letter:7]");
+  expect(renderDeadLetterPill(1)).toBe(pill("dead-letter:1"));
+  expect(renderDeadLetterPill(7)).toBe(pill("dead-letter:7"));
 });
 
 test("renderDeadLetterPill: zero / negative / NaN collapse to empty (banner drops the pill cleanly)", () => {
@@ -814,11 +835,15 @@ test("renderDeadLetterPill: zero / negative / NaN collapse to empty (banner drop
 
 test("colorizePillsInLine: dead-letter:<N> takes the warn bucket via prefix fallback", () => {
   // Same SGR contract test/board.test.ts asserts — yellow (warn) bucket
-  // via the `dead-letter:*` prefix branch in colorizePillsInLine.
+  // via the `dead-letter:*` prefix branch in colorizePillsInLine. fn-713
+  // follow-on: the pill is iconized, so the SGR wraps the WHOLE inner
+  // (glyph + `::` + token); derive the inner from `pill()` rather than
+  // hardcoding glyph bytes.
   const WARN = "\x1b[33m";
   const RESET = "\x1b[0m";
-  expect(colorizePillsInLine("[dead-letter:3]")).toBe(
-    `[${WARN}dead-letter:3${RESET}]`,
+  const inner = pill("dead-letter:3").slice(1, -1); // strip the brackets
+  expect(colorizePillsInLine(pill("dead-letter:3"))).toBe(
+    `[${WARN}${inner}${RESET}]`,
   );
 });
 
@@ -841,9 +866,9 @@ test("monitorLinesFor: id-only projection (task-1 shape) renders [kind] <id> per
     { id: "bt25vb1eo", kind: "bash-bg" },
   ]);
   expect(monitorLinesFor(json, "  ")).toEqual([
-    "  [ambient] b5217wols",
-    "  [monitor] bnamgymkh",
-    "  [bash-bg] bt25vb1eo",
+    `  ${pill("ambient")} b5217wols`,
+    `  ${pill("monitor")} bnamgymkh`,
+    `  ${pill("bash-bg")} bt25vb1eo`,
   ]);
 });
 
@@ -875,7 +900,7 @@ test("monitorLinesFor: future-enriched entry — command preferred over descript
     },
   ]);
   expect(monitorLinesFor(json, "  ")).toEqual([
-    "  [ambient] chatctl watch-chat",
+    `  ${pill("ambient")} chatctl watch-chat`,
   ]);
 });
 
@@ -890,12 +915,14 @@ test("monitorLinesFor: empty command falls back to description (per spec)", () =
     },
   ]);
   // fn-708 (J7): no [status] slot — see above.
-  expect(monitorLinesFor(json, "  ")).toEqual(["  [monitor] chatctl bus"]);
+  expect(monitorLinesFor(json, "  ")).toEqual([
+    `  ${pill("monitor")} chatctl bus`,
+  ]);
 });
 
 test("monitorLinesFor: missing command + missing description falls back to id", () => {
   const json = JSON.stringify([{ id: "abc123", kind: "ambient" }]);
-  expect(monitorLinesFor(json, "  ")).toEqual(["  [ambient] abc123"]);
+  expect(monitorLinesFor(json, "  ")).toEqual([`  ${pill("ambient")} abc123`]);
 });
 
 test("monitorLinesFor: multi-line command truncates to FIRST non-empty line", () => {
@@ -907,7 +934,9 @@ test("monitorLinesFor: multi-line command truncates to FIRST non-empty line", ()
     { id: "b1", kind: "bash-bg", command: heredoc, status: "running" },
   ]);
   // fn-708 (J7): no [status] slot — only the first-non-empty command line.
-  expect(monitorLinesFor(json, "  ")).toEqual(["  [bash-bg]   cat <<'EOF'"]);
+  expect(monitorLinesFor(json, "  ")).toEqual([
+    `  ${pill("bash-bg")}   cat <<'EOF'`,
+  ]);
 });
 
 test("monitorLinesFor: status is never rendered (J7 dead slot dropped)", () => {
@@ -920,9 +949,9 @@ test("monitorLinesFor: status is never rendered (J7 dead slot dropped)", () => {
     { id: "b3", kind: "ambient", command: "echo bye", status: "running" },
   ]);
   expect(monitorLinesFor(json, "  ")).toEqual([
-    "  [ambient] chatctl watch-chat",
-    "  [ambient] echo hi",
-    "  [ambient] echo bye",
+    `  ${pill("ambient")} chatctl watch-chat`,
+    `  ${pill("ambient")} echo hi`,
+    `  ${pill("ambient")} echo bye`,
   ]);
 });
 
@@ -932,12 +961,12 @@ test("monitorLinesFor: malformed entries (null / non-object) skip silently", () 
     "string-entry",
     { id: "ok", kind: "ambient" },
   ]);
-  expect(monitorLinesFor(json, "  ")).toEqual(["  [ambient] ok"]);
+  expect(monitorLinesFor(json, "  ")).toEqual([`  ${pill("ambient")} ok`]);
 });
 
 test("monitorLinesFor: missing kind defaults to ambient (defensive)", () => {
   const json = JSON.stringify([{ id: "x" }]);
-  expect(monitorLinesFor(json, "  ")).toEqual(["  [ambient] x"]);
+  expect(monitorLinesFor(json, "  ")).toEqual([`  ${pill("ambient")} x`]);
 });
 
 test("renderJobsBody: expanded job renders monitors BETWEEN backend pill and sub-agents", () => {
@@ -971,11 +1000,11 @@ test("renderJobsBody: expanded job renders monitors BETWEEN backend pill and sub
   expect(body).toBe(
     [
       "--- ada ---",
-      "(x) ambient [working]",
+      `(x) ambient ${pill("working")}`,
       "  [p11]",
-      "  [ambient] b5217wols",
-      "  [monitor] bnamgymkh",
-      "  general-purpose: investigate [running]",
+      `  ${pill("ambient")} b5217wols`,
+      `  ${pill("monitor")} bnamgymkh`,
+      `  general-purpose: investigate ${pill("running")}`,
     ].join("\n"),
   );
 });
@@ -996,8 +1025,10 @@ test("renderJobsBody: monitors are collapse-by-default (hidden when not expanded
     ],
   ]);
   const body = renderJobsBody(jobs, new Map());
-  expect(body).toBe(["--- ada ---", "(x) ambient [working]"].join("\n"));
-  expect(body).not.toContain("[ambient] b1");
+  expect(body).toBe(
+    ["--- ada ---", `(x) ambient ${pill("working")}`].join("\n"),
+  );
+  expect(body).not.toContain(`${pill("ambient")} b1`);
 });
 
 test("renderJobsBody: empty / missing monitors blob renders no Monitors section", () => {
@@ -1026,7 +1057,7 @@ test("renderJobsBody: empty / missing monitors blob renders no Monitors section"
       expanded: new Set(["j1"]),
     });
     expect(body).toBe(
-      ["--- ada ---", "(x) ambient [working]", "  [p11]"].join("\n"),
+      ["--- ada ---", `(x) ambient ${pill("working")}`, "  [p11]"].join("\n"),
     );
   }
 });

@@ -88,8 +88,10 @@ import { parseArgs } from "node:util";
 import {
   apiErrorPillSeg,
   epicHeaderLabel,
+  iconizePills,
   inputRequestPillSeg,
   permissionPromptPillSeg,
+  pill,
   pillOrEmpty,
   planVerbLabel,
   renderClosePills,
@@ -152,11 +154,18 @@ key) live in 'keeper jobs' (fn-658.3 split them out of board).
 Renders one block per epic; the frame is just the '---' lead when no
 epics match the default scope.
 
-Pills follow the OMIT-DEFAULT convention (fn-708): a pill renders only at
-its non-resting value, so absence of a pill encodes the default:
-  no [approval] => pending · no runtime pill => todo · no [worker-done] =>
-  open · no [validated] => unvalidated · no [state] => stopped · no subagent
-  pill => ok.
+Pills follow the SHOW-DEFAULTS + ICON convention (fn-713 follow-on; reverses
+the earlier fn-708 omit-default). Every fixed-slot enum renders an explicit
+pill at its current value, defaults included — [pending], [todo], [open],
+[unvalidated], [stopped], [ok] all show. Each themed pill carries a Nerd Font
+glyph inside the brackets, ahead of a '::' delimiter:
+  [<icon>::<text>]   e.g.  [<icon>::ready]   [<icon>::blocked:dep-on-task fn-2]
+The glyph is the source of truth; color (applied to the text half) is an
+orthogonal reinforcement. Non-state pills — dep refs [#2] / [name#3] — stay
+plain (no glyph). The icon set is the 'fa-classic' theme in src/icon-theme.ts;
+swap ACTIVE_THEME there to reskin. Presence-based pills ([failed:*],
+[awaiting:*], [task-repo:*], [slotted-after-closer], the role pill) still
+appear only when their condition holds.
 
 Each epic block opens with a header line of the form:
 
@@ -338,7 +347,7 @@ function taskRepoPillSeg(taskRepo: unknown, epicProjectDir: unknown): string {
   if (tr === epicDir) {
     return "";
   }
-  return ` [task-repo:${basename(tr)}]`;
+  return ` ${pill(`task-repo:${basename(tr)}`)}`;
 }
 
 /**
@@ -539,7 +548,7 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
       link.last_permission_prompt_kind,
     );
     out.push(
-      `  ${label} [${link.kind}]${stateSeg}${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}`,
+      `  ${label} ${pill(String(link.kind))}${stateSeg}${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}`,
     );
     // The [awaiting:<kind>] pill drops to its own continuation line (one
     // indent level deeper) so a long-running interactive stop reads
@@ -611,10 +620,13 @@ export async function main(argv: string[]): Promise<void> {
         job.last_permission_prompt_at,
         job.last_permission_prompt_kind,
       );
-      // fn-708 (T1): the job lifecycle pill follows the omit-default rule —
-      // the resting `stopped` value renders NO pill (absence ≡ stopped).
+      // fn-713 follow-on: the role pill is iconized; it is omitted only when
+      // there is no `plan_verb` (role is presence-based, no resting default).
+      // The lifecycle pill now SHOWS its value (`stopped` included).
+      const role = planVerbLabel(job.plan_verb);
+      const roleSeg = role == null ? "" : ` ${pill(role)}`;
       out.push(
-        `    ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}]${pillOrEmpty(job.state, "stopped")}${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}`,
+        `    ${seg(job.title)}${roleSeg}${pillOrEmpty(job.state, "stopped")}${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}`,
       );
       // [awaiting:<kind>] on its own continuation line (six-space indent —
       // same depth as this row's sub-agent lines below).
@@ -710,7 +722,9 @@ export async function main(argv: string[]): Promise<void> {
     // `epicDepsSeg` shape: empty string when absent, leading space when
     // present so the join reads cleanly).
     const slottedSeg =
-      row.created_by_closer_of == null ? "" : " [slotted-after-closer]";
+      row.created_by_closer_of == null
+        ? ""
+        : ` ${pill("slotted-after-closer")}`;
     // Same rule as the task/close rows: a [blocked:<reason>] verdict drops
     // to its own line (two-space indent) beneath the header; ready/
     // completed/running stay inline at the end of the header itself.
@@ -727,8 +741,8 @@ export async function main(argv: string[]): Promise<void> {
     const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg}${validatedPill(row.last_validated_at)}${slottedSeg}`;
     const epicHeaderLines =
       epicVerdict.tag === "blocked"
-        ? [epicHeader, `  ${formatPill(epicVerdict)}`]
-        : [`${epicHeader} ${formatPill(epicVerdict)}`];
+        ? [epicHeader, `  ${iconizePills(formatPill(epicVerdict))}`]
+        : [`${epicHeader} ${iconizePills(formatPill(epicVerdict))}`];
     lines.push(...epicHeaderLines, ...renderJobLinkLines(row.job_links));
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {
@@ -746,7 +760,7 @@ export async function main(argv: string[]): Promise<void> {
       // line. The `[task-repo:<basename>]` divergence pill follows the
       // verdict wherever it lands (it "surfaces next to the verdict that
       // references it" — see `taskRepoPillSeg`).
-      const taskPillSeg = `${formatPill(taskVerdict)}${taskRepoPillSeg(t.target_repo, row.project_dir)}`;
+      const taskPillSeg = `${iconizePills(formatPill(taskVerdict))}${taskRepoPillSeg(t.target_repo, row.project_dir)}`;
       const taskIdLines =
         taskVerdict.tag === "blocked"
           ? [`    [${taskId}]`, `    ${taskPillSeg}`]
@@ -771,8 +785,8 @@ export async function main(argv: string[]): Promise<void> {
     // own line beneath the [id]; ready/completed/running stay inline.
     const closeIdLines =
       closeVerdict.tag === "blocked"
-        ? [`    [${epicId}]`, `    ${formatPill(closeVerdict)}`]
-        : [`    [${epicId}] ${formatPill(closeVerdict)}`];
+        ? [`    [${epicId}]`, `    ${iconizePills(formatPill(closeVerdict))}`]
+        : [`    [${epicId}] ${iconizePills(formatPill(closeVerdict))}`];
     lines.push(
       // fn-708 (T2/T1/T3): the close-row `[status]` pill is dropped — the
       // board filter pins it to `[open]`, so it carries zero bits (a custom-

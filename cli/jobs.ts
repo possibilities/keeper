@@ -79,6 +79,7 @@ import {
   colorizePillsInLine,
   inputRequestPillSeg,
   permissionPromptPillSeg,
+  pill,
   pillOrEmpty,
   planVerbLabel,
   renderDeadLetterPill,
@@ -140,12 +141,14 @@ Row shape:
     [{kind}] {command|description|id}      (per live monitor, v51)
     {subagent_type}({annotations})?: {description} [{status}]?  (per sub-agent)
 
-Pills show only non-resting states (fn-708 omit-default). The [state]
-pill is OMITTED for a session at rest — absence ⇒ stopped; only
-working / ended / killed render a pill. A sub-agent line omits its
-[status] pill when the status is ok (absence ⇒ ok); the live-monitor
-line carries no status slot today (the projection never populates it).
-[failed:<kind>] stays inline.
+Pills SHOW DEFAULTS and carry icons (fn-713 follow-on; reverses the earlier
+fn-708 omit-default). The [state] pill always renders — stopped (a session at
+rest) included, alongside working / ended / killed. A sub-agent line always
+renders its [status] pill, ok included. Each themed pill carries a Nerd Font
+glyph inside the brackets ahead of a '::' delimiter — [<icon>::<text>] (e.g.
+[<icon>::stopped], [<icon>::worker]); the backend-coords pill [p<pane>] stays
+plain. The icon set is the 'fa-classic' theme in src/icon-theme.ts.
+[failed:<kind>] stays inline and appears only on a real failure.
 
 The optional [awaiting:<kind>] pill drops to its own indented
 continuation line beneath the row so a long-running interactive stop
@@ -207,7 +210,7 @@ export function projectJobRow(row: Record<string, unknown>): string {
   const cwd = row.cwd == null ? "" : basename(String(row.cwd));
   const cwdSeg = cwd === "" ? "" : `(${cwd}) `;
   const role = planVerbLabel(row.plan_verb);
-  const roleSeg = role == null ? "" : ` [${role}]`;
+  const roleSeg = role == null ? "" : ` ${pill(role)}`;
   const awaiting = inputRequestPillSeg(
     row.last_input_request_at,
     row.last_input_request_kind,
@@ -347,8 +350,8 @@ export function monitorLinesFor(
             : "(unknown)";
     // fn-708 (J7): no `[status]` slot — the projection never populates it.
     // See the JSDoc above for the restore recipe when `monitors[].status`
-    // lands.
-    lines.push(`${indent}[${kind}] ${label}`);
+    // lands. fn-713 follow-on: the monitor-kind pill is iconized.
+    lines.push(`${indent}${pill(kind)} ${label}`);
   }
   return lines;
 }

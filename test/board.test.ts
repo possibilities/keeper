@@ -37,6 +37,7 @@ import {
 } from "../cli/board";
 import {
   epicHeaderLabel,
+  pill,
   pillOrEmpty,
   renderClosePills,
   renderTaskPills,
@@ -612,7 +613,7 @@ test("renderJobLinkLines: one entry, all fields populated → one line, title + 
       state: "working",
     }),
   ]);
-  expect(out).toEqual(["  Plan epic 7 [creator] [working]"]);
+  expect(out).toEqual([`  Plan epic 7 ${pill("creator")} ${pill("working")}`]);
 });
 
 test("renderJobLinkLines: null title falls back to job_id (preserves line shape)", () => {
@@ -628,8 +629,10 @@ test("renderJobLinkLines: null title falls back to job_id (preserves line shape)
       state: "stopped",
     }),
   ]);
-  // fn-708 (T1): state='stopped' is the resting value → no [state] pill.
-  expect(out).toEqual(["  sess-no-title [refiner]"]);
+  // fn-713 follow-on (show-default): state='stopped' now renders its pill.
+  expect(out).toEqual([
+    `  sess-no-title ${pill("refiner")} ${pill("stopped")}`,
+  ]);
 });
 
 test("renderJobLinkLines: last_api_error_at non-null appends [failed:<kind>] pill (same line shape, live + terminal + off-page all)", () => {
@@ -649,8 +652,10 @@ test("renderJobLinkLines: last_api_error_at non-null appends [failed:<kind>] pil
       last_api_error_kind: "rate_limit",
     }),
   ]);
-  // fn-708 (T1): state='stopped' elides; [failed:<kind>] still stamps inline.
-  expect(out).toEqual(["  Plan epic 8 [creator] [failed:rate_limit]"]);
+  // fn-713 follow-on: state='stopped' renders; [failed:<kind>] stamps inline.
+  expect(out).toEqual([
+    `  Plan epic 8 ${pill("creator")} ${pill("stopped")} ${pill("failed:rate_limit")}`,
+  ]);
 });
 
 // One render test per ApiErrorKind. Six positive cases — every kind
@@ -677,7 +682,9 @@ test.each([
         last_api_error_kind: kind,
       }),
     ]);
-    expect(out).toEqual([`  Plan epic 9 [refiner] [failed:${kind}]`]);
+    expect(out).toEqual([
+      `  Plan epic 9 ${pill("refiner")} ${pill("stopped")} ${pill(`failed:${kind}`)}`,
+    ]);
   },
 );
 
@@ -697,7 +704,9 @@ test("renderJobLinkLines: at non-null, kind null defensively renders [failed:unk
       last_api_error_kind: null,
     }),
   ]);
-  expect(out).toEqual(["  Plan epic 10 [creator] [failed:unknown]"]);
+  expect(out).toEqual([
+    `  Plan epic 10 ${pill("creator")} ${pill("stopped")} ${pill("failed:unknown")}`,
+  ]);
 });
 
 // `last_input_request_at` non-null emits the `[awaiting:<kind>]` pill
@@ -722,8 +731,8 @@ test("renderJobLinkLines: last_input_request_at non-null appends [awaiting:<kind
     }),
   ]);
   expect(out).toEqual([
-    "  Plan epic 11 [creator]",
-    "    [awaiting:ask_user_question]",
+    `  Plan epic 11 ${pill("creator")} ${pill("stopped")}`,
+    `    ${pill("awaiting:ask_user_question")}`,
   ]);
 });
 
@@ -743,7 +752,10 @@ test("renderJobLinkLines: input_request_at non-null, kind null defensively rende
       last_input_request_kind: null,
     }),
   ]);
-  expect(out).toEqual(["  Plan epic 12 [refiner]", "    [awaiting:unknown]"]);
+  expect(out).toEqual([
+    `  Plan epic 12 ${pill("refiner")} ${pill("stopped")}`,
+    `    ${pill("awaiting:unknown")}`,
+  ]);
 });
 
 // Stacking snapshot — a row carrying BOTH api-error AND input-request
@@ -764,8 +776,8 @@ test("renderJobLinkLines: failed stays inline, awaiting drops to its own line", 
     }),
   ]);
   expect(out).toEqual([
-    "  Plan epic 13 [creator] [failed:rate_limit]",
-    "    [awaiting:ask_user_question]",
+    `  Plan epic 13 ${pill("creator")} ${pill("stopped")} ${pill("failed:rate_limit")}`,
+    `    ${pill("awaiting:ask_user_question")}`,
   ]);
 });
 
@@ -787,8 +799,8 @@ test("renderJobLinkLines: last_permission_prompt_at non-null with kind='permissi
     }),
   ]);
   expect(out).toEqual([
-    "  Plan epic 21 [creator] [working]",
-    "    [awaiting:permission]",
+    `  Plan epic 21 ${pill("creator")} ${pill("working")}`,
+    `    ${pill("awaiting:permission")}`,
   ]);
 });
 
@@ -804,8 +816,8 @@ test("renderJobLinkLines: last_permission_prompt_at non-null with kind='elicitat
     }),
   ]);
   expect(out).toEqual([
-    "  Plan epic 22 [creator] [working]",
-    "    [awaiting:elicitation]",
+    `  Plan epic 22 ${pill("creator")} ${pill("working")}`,
+    `    ${pill("awaiting:elicitation")}`,
   ]);
 });
 
@@ -824,8 +836,8 @@ test("renderJobLinkLines: permission_prompt_at non-null, kind null defensively r
     }),
   ]);
   expect(out).toEqual([
-    "  Plan epic 23 [refiner] [working]",
-    "    [awaiting:unknown]",
+    `  Plan epic 23 ${pill("refiner")} ${pill("working")}`,
+    `    ${pill("awaiting:unknown")}`,
   ]);
 });
 
@@ -850,9 +862,9 @@ test("renderJobLinkLines: api-error + input-request + permission all stack on in
     }),
   ]);
   expect(out).toEqual([
-    "  Plan epic 24 [creator] [working] [failed:rate_limit]",
-    "    [awaiting:ask_user_question]",
-    "    [awaiting:permission]",
+    `  Plan epic 24 ${pill("creator")} ${pill("working")} ${pill("failed:rate_limit")}`,
+    `    ${pill("awaiting:ask_user_question")}`,
+    `    ${pill("awaiting:permission")}`,
   ]);
 });
 
@@ -872,9 +884,9 @@ test("renderJobLinkLines: multiple entries iterate in provided order (projection
     }),
   ]);
   expect(out).toEqual([
-    "  First [creator] [working]",
-    // fn-708 (T1): the resting state='stopped' entry renders no [state] pill.
-    "  Second [refiner]",
+    `  First ${pill("creator")} ${pill("working")}`,
+    // fn-713 follow-on: the resting state='stopped' entry now renders its pill.
+    `  Second ${pill("refiner")} ${pill("stopped")}`,
   ]);
 });
 
@@ -918,13 +930,13 @@ test("renderJobLinkLines: many creator + refiner edges per epic each render thei
     }),
   ]);
   expect(out).toEqual([
-    // fn-708 (T1): resting state='stopped' entries render no [state] pill;
-    // the live state='working' entries keep theirs.
-    "  Creator one [creator]",
-    "  Creator two [creator] [working]",
-    "  Refiner one [refiner]",
-    "  Refiner two [refiner] [working]",
-    "  Refiner three [refiner]",
+    // fn-713 follow-on: every entry now renders its [state] pill, the resting
+    // state='stopped' included.
+    `  Creator one ${pill("creator")} ${pill("stopped")}`,
+    `  Creator two ${pill("creator")} ${pill("working")}`,
+    `  Refiner one ${pill("refiner")} ${pill("stopped")}`,
+    `  Refiner two ${pill("refiner")} ${pill("working")}`,
+    `  Refiner three ${pill("refiner")} ${pill("stopped")}`,
   ]);
 });
 
@@ -942,6 +954,17 @@ const ERROR = "\x1b[31m";
 const WARN = "\x1b[33m";
 const FADED = "\x1b[2;37m";
 const RESET = "\x1b[0m";
+
+// The colorizer wraps the WHOLE inner of an iconized pill (glyph + `::` +
+// token) in the bucket SGR, keying the bucket off the TEXT half. This mirrors
+// that: build the iconized pill via `pill(token)`, strip its brackets, and
+// re-wrap the inner in `sgr`…`RESET`. Use for asserting the rendered board
+// pill (iconized) under color, vs. the plain-pill inputs the legacy colorizer
+// contract tests still feed.
+function coloredPill(sgr: string, token: string): string {
+  const inner = pill(token).slice(1, -1);
+  return `[${sgr}${inner}${RESET}]`;
+}
 
 test("colorizePillsInLine: unknown tokens pass through verbatim", () => {
   expect(colorizePillsInLine("(dir) 12 Foo [planner] [pending]")).toBe(
@@ -1237,8 +1260,12 @@ test("colorizePillsInLine: regular blocked:dep-on-epic (amber/warn) stays warn",
   expect(colorizePillsInLine("[blocked:dep-on-epic fn-100-foo]")).toBe(
     `[${WARN}blocked:dep-on-epic fn-100-foo${RESET}]`,
   );
-  expect(colorizePillsInLine("[blocked:dep-on-epic arthack::fn-100]")).toBe(
-    `[${WARN}blocked:dep-on-epic arthack::fn-100${RESET}]`,
+  // The cross-project payload itself contains `::` (arthack::fn-100). On the
+  // board this renders iconized as `pill("blocked:dep-on-epic arthack::fn-100")`;
+  // the colorizer splits on the FIRST `::` (the icon delimiter), so the text
+  // half is the whole `blocked:…` token and still routes to warn.
+  expect(colorizePillsInLine(pill("blocked:dep-on-epic arthack::fn-100"))).toBe(
+    coloredPill(WARN, "blocked:dep-on-epic arthack::fn-100"),
   );
 });
 
@@ -1359,9 +1386,9 @@ test("byId-style collapse (legacy bug) would only deliver one row", () => {
 // ---------------------------------------------------------------------------
 
 test("renderDeadLetterPill: positive N renders `[dead-letter:N]` verbatim (native count)", () => {
-  expect(renderDeadLetterPill(1)).toBe("[dead-letter:1]");
-  expect(renderDeadLetterPill(3)).toBe("[dead-letter:3]");
-  expect(renderDeadLetterPill(42)).toBe("[dead-letter:42]");
+  expect(renderDeadLetterPill(1)).toBe(pill("dead-letter:1"));
+  expect(renderDeadLetterPill(3)).toBe(pill("dead-letter:3"));
+  expect(renderDeadLetterPill(42)).toBe(pill("dead-letter:42"));
 });
 
 test("renderDeadLetterPill: zero / negative / NaN collapse to empty (banner drops the pill cleanly)", () => {
@@ -1415,23 +1442,25 @@ test("colorizePillsInLine: fn-708 [rt:blocked] does NOT collide with verdict [bl
 // fn-708: pillOrEmpty — the omit-default primitive (T1)
 // ---------------------------------------------------------------------------
 
-test("pillOrEmpty: value == default → no pill", () => {
-  expect(pillOrEmpty("todo", "todo")).toBe("");
-  expect(pillOrEmpty("pending", "pending")).toBe("");
-  expect(pillOrEmpty("open", "open")).toBe("");
+// fn-713 follow-on inverts fn-708 omit-default: the resting/default value now
+// renders an explicit pill instead of "".
+test("pillOrEmpty: value == default → resting pill now shows", () => {
+  expect(pillOrEmpty("todo", "todo")).toBe(` ${pill("todo")}`);
+  expect(pillOrEmpty("pending", "pending")).toBe(` ${pill("pending")}`);
+  expect(pillOrEmpty("open", "open")).toBe(` ${pill("open")}`);
 });
 
 test("pillOrEmpty: value != default → leading-space pill", () => {
-  expect(pillOrEmpty("in_progress", "todo")).toBe(" [in_progress]");
-  expect(pillOrEmpty("approved", "pending")).toBe(" [approved]");
-  expect(pillOrEmpty("done", "open")).toBe(" [done]");
+  expect(pillOrEmpty("in_progress", "todo")).toBe(` ${pill("in_progress")}`);
+  expect(pillOrEmpty("approved", "pending")).toBe(` ${pill("approved")}`);
+  expect(pillOrEmpty("done", "open")).toBe(` ${pill("done")}`);
 });
 
-test("pillOrEmpty: null / non-string coalesces to no pill (never [null])", () => {
-  expect(pillOrEmpty(null, "todo")).toBe("");
-  expect(pillOrEmpty(undefined, "todo")).toBe("");
-  expect(pillOrEmpty(42, "todo")).toBe("");
-  expect(pillOrEmpty({}, "todo")).toBe("");
+test("pillOrEmpty: null / non-string coalesces to the default pill (never [null])", () => {
+  expect(pillOrEmpty(null, "todo")).toBe(` ${pill("todo")}`);
+  expect(pillOrEmpty(undefined, "todo")).toBe(` ${pill("todo")}`);
+  expect(pillOrEmpty(42, "todo")).toBe(` ${pill("todo")}`);
+  expect(pillOrEmpty({}, "todo")).toBe(` ${pill("todo")}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -1439,13 +1468,15 @@ test("pillOrEmpty: null / non-string coalesces to no pill (never [null])", () =>
 // ---------------------------------------------------------------------------
 
 test("validatedPill: non-null last_validated_at → ' [validated]'", () => {
-  expect(validatedPill("2026-06-05T00:00:00Z")).toBe(" [validated]");
-  expect(validatedPill(1234567890)).toBe(" [validated]");
+  expect(validatedPill("2026-06-05T00:00:00Z")).toBe(` ${pill("validated")}`);
+  expect(validatedPill(1234567890)).toBe(` ${pill("validated")}`);
 });
 
-test("validatedPill: null / undefined → '' (absence ≡ unvalidated)", () => {
-  expect(validatedPill(null)).toBe("");
-  expect(validatedPill(undefined)).toBe("");
+// fn-713 follow-on inverts fn-708 omit-default: the unvalidated state now
+// renders an explicit pill instead of "".
+test("validatedPill: null / undefined → ' [unvalidated]' (absence now shown)", () => {
+  expect(validatedPill(null)).toBe(` ${pill("unvalidated")}`);
+  expect(validatedPill(undefined)).toBe(` ${pill("unvalidated")}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -1491,41 +1522,51 @@ const EPIC_NOT_VALIDATED: Verdict = {
   reason: { kind: "epic-not-validated" },
 };
 
-test("renderTaskPills: all-resting task (todo/open/pending) → no pills", () => {
+// fn-713 follow-on: renderTaskPills now ALWAYS appends all three pills
+// (runtime_status, worker_phase, approval) at their current value — defaults
+// included, no verdict-aware suppression. The `_verdict` arg is retained for
+// arity but no longer consulted.
+test("renderTaskPills: all-resting task (todo/open/pending) now shows all three defaults", () => {
   expect(
     renderTaskPills(
       { runtime_status: "todo", worker_phase: "open", approval: "pending" },
       READY,
     ),
-  ).toBe("");
+  ).toBe(` ${pill("todo")} ${pill("open")} ${pill("pending")}`);
 });
 
-test("renderTaskPills: runtime_status omits todo, renders in_progress/done verbatim", () => {
+test("renderTaskPills: runtime_status renders todo/in_progress/done verbatim", () => {
   expect(renderTaskPills({ runtime_status: "in_progress" }, READY)).toBe(
-    " [in_progress]",
+    ` ${pill("in_progress")} ${pill("open")} ${pill("pending")}`,
   );
-  expect(renderTaskPills({ runtime_status: "done" }, READY)).toBe(" [done]");
-  expect(renderTaskPills({ runtime_status: "todo" }, READY)).toBe("");
+  expect(renderTaskPills({ runtime_status: "done" }, READY)).toBe(
+    ` ${pill("done")} ${pill("open")} ${pill("pending")}`,
+  );
+  expect(renderTaskPills({ runtime_status: "todo" }, READY)).toBe(
+    ` ${pill("todo")} ${pill("open")} ${pill("pending")}`,
+  );
 });
 
 test("renderTaskPills: runtime_status=blocked relabels to [rt:blocked]", () => {
   expect(renderTaskPills({ runtime_status: "blocked" }, READY)).toBe(
-    " [rt:blocked]",
+    ` ${pill("rt:blocked")} ${pill("open")} ${pill("pending")}`,
   );
   // never the bare [blocked] that would collide with the verdict family.
   expect(renderTaskPills({ runtime_status: "blocked" }, READY)).not.toContain(
-    "[blocked]",
+    pill("blocked"),
   );
 });
 
-test("renderTaskPills: worker_phase=open never renders (T1)", () => {
-  expect(renderTaskPills({ worker_phase: "open" }, READY)).toBe("");
-  expect(renderTaskPills({ worker_phase: "open" }, JOB_RUNNING)).toBe("");
+test("renderTaskPills: worker_phase=open renders [open] (default now shown)", () => {
+  expect(renderTaskPills({ worker_phase: "open" }, READY)).toBe(
+    ` ${pill("todo")} ${pill("open")} ${pill("pending")}`,
+  );
+  expect(renderTaskPills({ worker_phase: "open" }, JOB_RUNNING)).toBe(
+    ` ${pill("todo")} ${pill("open")} ${pill("pending")}`,
+  );
 });
 
-test("renderTaskPills: worker_phase=done renders [worker-done] in the 4 UNPINNED verdict classes", () => {
-  // job-running, sub-agent-running, sub-agent-stale, planner-running,
-  // epic-not-validated → done is genuinely surprising, must show.
+test("renderTaskPills: worker_phase=done renders [worker-done] in the previously-UNPINNED verdict classes", () => {
   for (const v of [
     JOB_RUNNING,
     SUBAGENT_RUNNING,
@@ -1534,55 +1575,66 @@ test("renderTaskPills: worker_phase=done renders [worker-done] in the 4 UNPINNED
     EPIC_NOT_VALIDATED,
     READY,
   ]) {
-    expect(renderTaskPills({ worker_phase: "done" }, v)).toBe(" [worker-done]");
+    expect(renderTaskPills({ worker_phase: "done" }, v)).toBe(
+      ` ${pill("todo")} ${pill("worker-done")} ${pill("pending")}`,
+    );
   }
 });
 
-test("renderTaskPills: worker_phase=done OMITS [worker-done] where the verdict PINS it", () => {
-  // completed, job-pending, git-uncommitted, git-orphans → verdict pins done.
+// fn-713 follow-on INVERTS the old fn-708 T3 behavior: where the verdict used
+// to PIN (suppress) [worker-done], the labeled survivor now ALWAYS shows.
+test("renderTaskPills: worker_phase=done now SHOWS [worker-done] even where the verdict formerly pinned it", () => {
   for (const v of [COMPLETED, JOB_PENDING, GIT_UNCOMMITTED, GIT_ORPHANS]) {
-    expect(renderTaskPills({ worker_phase: "done" }, v)).not.toContain(
-      "[worker-done]",
+    expect(renderTaskPills({ worker_phase: "done" }, v)).toBe(
+      ` ${pill("todo")} ${pill("worker-done")} ${pill("pending")}`,
     );
   }
 });
 
 test("renderTaskPills: never renders a bare [done] for worker_phase (de-ambiguation)", () => {
   // The worker survivor is ALWAYS labeled; a bare [done] only ever comes
-  // from runtime_status. With worker_phase=done + runtime_status absent,
-  // the only pill is [worker-done], not [done].
+  // from runtime_status. With worker_phase=done + runtime_status absent
+  // (defaults to todo), the worker slot is [worker-done], not [done].
   const out = renderTaskPills({ worker_phase: "done" }, JOB_RUNNING);
-  expect(out).toContain("[worker-done]");
-  expect(out).not.toBe(" [done]");
+  expect(out).toContain(pill("worker-done"));
+  expect(out).not.toContain(pill("done"));
 });
 
-test("renderTaskPills: approval omits pending; renders approved/rejected with T3 suppression", () => {
-  // pending → nothing.
-  expect(renderTaskPills({ approval: "pending" }, READY)).toBe("");
+test("renderTaskPills: approval renders pending/approved/rejected verbatim (no T3 suppression)", () => {
+  // pending → the default pill now shows.
+  expect(renderTaskPills({ approval: "pending" }, READY)).toBe(
+    ` ${pill("todo")} ${pill("open")} ${pill("pending")}`,
+  );
   // approved under a non-completed verdict → shown.
-  expect(renderTaskPills({ approval: "approved" }, READY)).toBe(" [approved]");
-  // approved under completed → T3-suppressed (the word is in [completed]).
-  expect(renderTaskPills({ approval: "approved" }, COMPLETED)).toBe("");
+  expect(renderTaskPills({ approval: "approved" }, READY)).toBe(
+    ` ${pill("todo")} ${pill("open")} ${pill("approved")}`,
+  );
+  // approved under completed → still shown (T3 suppression is gone).
+  expect(renderTaskPills({ approval: "approved" }, COMPLETED)).toBe(
+    ` ${pill("todo")} ${pill("open")} ${pill("approved")}`,
+  );
   // rejected under a non-rejected verdict → shown.
   expect(renderTaskPills({ approval: "rejected" }, EPIC_NOT_VALIDATED)).toBe(
-    " [rejected]",
+    ` ${pill("todo")} ${pill("open")} ${pill("rejected")}`,
   );
-  // rejected under blocked:job-rejected → T3-suppressed (word on screen).
-  expect(renderTaskPills({ approval: "rejected" }, JOB_REJECTED)).toBe("");
+  // rejected under blocked:job-rejected → still shown (T3 suppression is gone).
+  expect(renderTaskPills({ approval: "rejected" }, JOB_REJECTED)).toBe(
+    ` ${pill("todo")} ${pill("open")} ${pill("rejected")}`,
+  );
 });
 
-test("renderTaskPills: completed task collapses to runtime only (worker+approval pinned)", () => {
-  // [done][done][approved] + [completed] → just runtime [done].
+test("renderTaskPills: completed task shows all three (runtime done + worker-done + approved)", () => {
+  // [done][worker-done][approved] — all three render their literal value now.
   expect(
     renderTaskPills(
       { runtime_status: "done", worker_phase: "done", approval: "approved" },
       COMPLETED,
     ),
-  ).toBe(" [done]");
+  ).toBe(` ${pill("done")} ${pill("worker-done")} ${pill("approved")}`);
 });
 
-test("renderTaskPills: stacks surviving fields in fixed order rt → worker → approval", () => {
-  // in_progress runtime + worker done (unpinned) + approved (non-completed).
+test("renderTaskPills: stacks fields in fixed order rt → worker → approval", () => {
+  // in_progress runtime + worker done + approved.
   expect(
     renderTaskPills(
       {
@@ -1592,41 +1644,47 @@ test("renderTaskPills: stacks surviving fields in fixed order rt → worker → 
       },
       JOB_RUNNING,
     ),
-  ).toBe(" [in_progress] [worker-done] [approved]");
+  ).toBe(` ${pill("in_progress")} ${pill("worker-done")} ${pill("approved")}`);
 });
 
 // ---------------------------------------------------------------------------
 // fn-708: renderClosePills — close-row status (T2) + approval (T1+T3)
 // ---------------------------------------------------------------------------
 
-test("renderClosePills: drops the constant [status] pill (T2)", () => {
-  // status='open' is the board filter constant — never rendered, regardless
-  // of the verdict, and the approval default (pending) is omitted too, so the
-  // whole close row collapses to title + verdict.
+// fn-713 follow-on: renderClosePills now ALWAYS appends status (default open)
+// then approval (default pending) at their current value — reversing the
+// fn-708 T2 status-drop and T1/T3 suppressions.
+test("renderClosePills: now shows the [status] pill (default open) + approval", () => {
   expect(renderClosePills({ status: "open", approval: "pending" }, READY)).toBe(
-    "",
+    ` ${pill("open")} ${pill("pending")}`,
   );
   expect(
     renderClosePills({ status: "open", approval: "pending" }, COMPLETED),
-  ).not.toContain("[open]");
+  ).toContain(pill("open"));
 });
 
-test("renderClosePills: never emits [status] even for a non-open status value", () => {
-  // The capability is retained via a restore-comment, but the helper itself
-  // is hardwired to omit it on the board view.
+test("renderClosePills: renders a non-open status value verbatim", () => {
   expect(
     renderClosePills({ status: "closed", approval: "pending" }, READY),
-  ).not.toContain("[closed]");
+  ).toBe(` ${pill("closed")} ${pill("pending")}`);
 });
 
-test("renderClosePills: approval omits pending, T3-suppresses rejected under job-rejected", () => {
-  expect(renderClosePills({ approval: "pending" }, READY)).toBe("");
-  // approved never reaches the board (filter), so it is omitted here too.
-  expect(renderClosePills({ approval: "approved" }, READY)).toBe("");
+test("renderClosePills: approval renders pending/approved/rejected verbatim (no T3 suppression)", () => {
+  expect(renderClosePills({ approval: "pending" }, READY)).toBe(
+    ` ${pill("open")} ${pill("pending")}`,
+  );
+  // approved now renders (the filter no longer hides it from the helper).
+  expect(renderClosePills({ approval: "approved" }, READY)).toBe(
+    ` ${pill("open")} ${pill("approved")}`,
+  );
   // rejected under a non-rejected verdict → shown.
-  expect(renderClosePills({ approval: "rejected" }, READY)).toBe(" [rejected]");
-  // rejected under blocked:job-rejected → suppressed.
-  expect(renderClosePills({ approval: "rejected" }, JOB_REJECTED)).toBe("");
+  expect(renderClosePills({ approval: "rejected" }, READY)).toBe(
+    ` ${pill("open")} ${pill("rejected")}`,
+  );
+  // rejected under blocked:job-rejected → still shown (T3 suppression is gone).
+  expect(renderClosePills({ approval: "rejected" }, JOB_REJECTED)).toBe(
+    ` ${pill("open")} ${pill("rejected")}`,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -1656,31 +1714,37 @@ function subFixture(
   ]);
 }
 
-test("subagentLinesFor: drops the pill for status=ok (absence ≡ ok)", () => {
-  expect(subagentLinesFor(subFixture("ok"), "j", "  ")).toEqual(["  scout: d"]);
+// fn-713 follow-on inverts fn-708 omit-default: the status pill now ALWAYS
+// renders, `ok` included. Null / empty status coalesces to the resting `ok`.
+test("subagentLinesFor: shows the [ok] pill for status=ok (default now shown)", () => {
+  expect(subagentLinesFor(subFixture("ok"), "j", "  ")).toEqual([
+    `  scout: d ${pill("ok")}`,
+  ]);
 });
 
-test("subagentLinesFor: drops the pill for null status (no literal [])", () => {
+test("subagentLinesFor: null status coalesces to the [ok] pill (no literal [])", () => {
   const lines = subagentLinesFor(subFixture(null), "j", "  ");
-  expect(lines).toEqual(["  scout: d"]);
+  expect(lines).toEqual([`  scout: d ${pill("ok")}`]);
   expect(lines[0]).not.toContain("[]");
 });
 
-test("subagentLinesFor: drops the pill for empty-string status", () => {
-  expect(subagentLinesFor(subFixture(""), "j", "  ")).toEqual(["  scout: d"]);
+test("subagentLinesFor: empty-string status coalesces to the [ok] pill", () => {
+  expect(subagentLinesFor(subFixture(""), "j", "  ")).toEqual([
+    `  scout: d ${pill("ok")}`,
+  ]);
 });
 
 test("subagentLinesFor: keeps running / failed / unknown / superseded", () => {
   expect(subagentLinesFor(subFixture("running"), "j", "  ")).toEqual([
-    "  scout: d [running]",
+    `  scout: d ${pill("running")}`,
   ]);
   expect(subagentLinesFor(subFixture("failed"), "j", "  ")).toEqual([
-    "  scout: d [failed]",
+    `  scout: d ${pill("failed")}`,
   ]);
   expect(subagentLinesFor(subFixture("unknown"), "j", "  ")).toEqual([
-    "  scout: d [unknown]",
+    `  scout: d ${pill("unknown")}`,
   ]);
   expect(subagentLinesFor(subFixture("superseded"), "j", "  ")).toEqual([
-    "  scout: d [superseded]",
+    `  scout: d ${pill("superseded")}`,
   ]);
 });

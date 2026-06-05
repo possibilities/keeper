@@ -22,6 +22,7 @@
  * already import from it, so external import paths keep resolving.
  */
 
+import { glyphForToken } from "./icon-theme";
 import {
   type ClientFrame,
   encodeFrame,
@@ -31,6 +32,40 @@ import {
 import type { Verdict } from "./readiness";
 import { collapseSubagentsByName } from "./readiness-client";
 import type { SubagentInvocation } from "./types";
+
+// ---------------------------------------------------------------------------
+// Iconized pill core (fn-713 follow-on)
+// ---------------------------------------------------------------------------
+//
+// Every STATE pill is rendered as `[<glyph>::<token-text>]` — the `::`
+// delimiter separates the Nerd Font icon (from the active `IconTheme`) from
+// the text the colorizer still tints. A token the theme doesn't know (dep
+// refs `#2` / `arthack#633`, the backend-coords `p3` label, the grouped dep
+// summary) gets no icon and renders as a plain `[<token>]` pill — so the
+// icon layer is additive, never lossy. The companion change is "show
+// defaults": the resting value of every fixed-slot enum now renders an
+// explicit pill (reversing the fn-708 omit-default convention) so a viewer
+// sees every state, never an absence to decode.
+
+/** The body of an iconized pill (no brackets): `"<glyph>::<token>"` or, when
+ * the token isn't a themed state, the bare `"<token>"`. */
+export function iconizeToken(token: string): string {
+  const glyph = glyphForToken(token);
+  return glyph === null ? token : `${glyph}::${token}`;
+}
+
+/** A full bracketed, icon-prefixed pill for one token: `[<glyph>::<token>]`. */
+export function pill(token: string): string {
+  return `[${iconizeToken(token)}]`;
+}
+
+/** Re-wrap already-bracketed pill text (e.g. `formatPill`'s `"[ready]"`) into
+ * the iconized form, leaving non-themed pills (`[#2]`) untouched. Used so the
+ * pure verdict formatter in `readiness.ts` stays icon-free (its tests don't
+ * move) while the board still renders verdict glyphs. */
+export function iconizePills(bracketed: string): string {
+  return bracketed.replace(/\[([^\]]+)\]/g, (_m, inner: string) => pill(inner));
+}
 
 // ---------------------------------------------------------------------------
 // Role label
@@ -94,7 +129,7 @@ export function apiErrorPillSeg(at: unknown, kind: unknown): string {
     return "";
   }
   const k = typeof kind === "string" && kind.length > 0 ? kind : "unknown";
-  return ` [failed:${k}]`;
+  return ` ${pill(`failed:${k}`)}`;
 }
 
 /**
@@ -138,7 +173,7 @@ export function inputRequestPillSeg(at: unknown, kind: unknown): string {
     return "";
   }
   const k = typeof kind === "string" && kind.length > 0 ? kind : "unknown";
-  return ` [awaiting:${k}]`;
+  return ` ${pill(`awaiting:${k}`)}`;
 }
 
 /**
@@ -188,7 +223,7 @@ export function permissionPromptPillSeg(at: unknown, kind: unknown): string {
     return "";
   }
   const k = typeof kind === "string" && kind.length > 0 ? kind : "unknown";
-  return ` [awaiting:${k}]`;
+  return ` ${pill(`awaiting:${k}`)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,10 +246,13 @@ export function permissionPromptPillSeg(at: unknown, kind: unknown): string {
  * byte-compare and the existing test style hold.
  */
 export function pillOrEmpty(value: unknown, dflt: string): string {
-  if (typeof value !== "string" || value === dflt) {
-    return "";
-  }
-  return ` [${value}]`;
+  // fn-713 follow-on: SHOW the default (reverses fn-708 omit-default). The
+  // resting value now renders an explicit iconized pill so the viewer sees
+  // every state. A null / non-string / empty value coalesces to `dflt` (so a
+  // malformed projection cell renders the resting pill, never `[]`). The
+  // name is retained for import stability; it no longer returns empty.
+  const v = typeof value === "string" && value !== "" ? value : dflt;
+  return ` ${pill(v)}`;
 }
 
 /**
@@ -231,40 +269,11 @@ export function pillOrEmpty(value: unknown, dflt: string): string {
  * always emitted a bracket (`[validated]` / `[unvalidated]`).
  */
 export function validatedPill(lastValidatedAt: unknown): string {
-  return lastValidatedAt != null ? " [validated]" : "";
-}
-
-/**
- * The verdict classes that already PIN `worker_phase=done` — so a separate
- * `[worker-done]` pill would be redundant (the verdict's own existence, or
- * the recoverability ledger, says "done"). Drawn from `~/docs/pill-inventory.md`
- * Part 3: `completed` (≡ done+approved), `job-pending` ("done" implied by
- * predicate 6.5's gate), and the two `git-*` blocks (predicate 6.5-gated,
- * so `worker_phase=done`). In the OTHER classes (`job-running`,
- * `sub-agent-*`, `planner-running`, `epic-not-validated`) `worker_phase=done`
- * is genuinely surprising — "administratively done but still churning / not
- * yet validated" — and MUST stay visible.
- */
-const WORKER_DONE_PINNED_REASONS: ReadonlySet<string> = new Set([
-  "job-pending",
-  "git-uncommitted",
-  "git-orphans",
-]);
-
-/**
- * True when `verdict` already pins `worker_phase=done` (see
- * {@link WORKER_DONE_PINNED_REASONS}) — i.e. the `completed` tag or one of
- * the three pinning block reasons. Used by {@link renderTaskPills} to gate
- * the `[worker-done]` survivor pill.
- */
-function verdictPinsWorkerDone(verdict: Verdict): boolean {
-  if (verdict.tag === "completed") {
-    return true;
-  }
-  if (verdict.tag === "blocked") {
-    return WORKER_DONE_PINNED_REASONS.has(verdict.reason.kind);
-  }
-  return false;
+  // fn-713 follow-on: SHOW both states (reverses fn-708 omit-default) —
+  // `[validated]` when validated, `[unvalidated]` otherwise.
+  return lastValidatedAt != null
+    ? ` ${pill("validated")}`
+    : ` ${pill("unvalidated")}`;
 }
 
 /**
@@ -294,37 +303,29 @@ function verdictPinsWorkerDone(verdict: Verdict): boolean {
  */
 export function renderTaskPills(
   task: Record<string, unknown>,
-  verdict: Verdict,
+  _verdict: Verdict,
 ): string {
+  // fn-713 follow-on: SHOW every fixed-slot enum at its current value
+  // (reverses fn-708 omit-default AND drops the verdict-aware T3 suppression)
+  // — runtime_status / worker_phase / approval now render on every task row,
+  // defaults included, each as an iconized `[<glyph>::<token>]` pill. The
+  // `_verdict` arg is retained for call / test arity but no longer consulted.
   let out = "";
 
-  // runtime_status (B10): omit `todo`; relabel `blocked` → `rt:blocked`.
-  const rt = task.runtime_status;
-  if (typeof rt === "string" && rt !== "todo") {
-    out += rt === "blocked" ? " [rt:blocked]" : ` [${rt}]`;
-  }
+  // runtime_status (B10): `blocked` relabels to `rt:blocked` so it never
+  // collides with the verdict `[blocked:*]` family; everything else verbatim.
+  const rtRaw = task.runtime_status;
+  const rt = typeof rtRaw === "string" && rtRaw !== "" ? rtRaw : "todo";
+  out += ` ${pill(rt === "blocked" ? "rt:blocked" : rt)}`;
 
-  // worker_phase (B11): render `[worker-done]` ONLY at `done` AND only when
-  // the verdict does not already pin done. Never bare `[done]`, never `[open]`.
-  if (task.worker_phase === "done" && !verdictPinsWorkerDone(verdict)) {
-    out += " [worker-done]";
-  }
+  // worker_phase (B11): `done` renders the labeled `worker-done` (never bare
+  // `done`, which collides with runtime `done`); `open` is the resting value.
+  out += ` ${pill(task.worker_phase === "done" ? "worker-done" : "open")}`;
 
-  // approval (B12): omit `pending`; T3-suppress `rejected` under
-  // `blocked:job-rejected` and `approved` under `completed`.
-  const approval = task.approval;
-  if (approval === "approved") {
-    if (verdict.tag !== "completed") {
-      out += " [approved]";
-    }
-  } else if (approval === "rejected") {
-    const suppressed =
-      verdict.tag === "blocked" && verdict.reason.kind === "job-rejected";
-    if (!suppressed) {
-      out += " [rejected]";
-    }
-  }
-  // `pending` (and any non-string / unknown value) → no pill.
+  // approval (B12): pending / approved / rejected, all shown.
+  const apRaw = task.approval;
+  const ap = typeof apRaw === "string" && apRaw !== "" ? apRaw : "pending";
+  out += ` ${pill(ap)}`;
 
   return out;
 }
@@ -348,22 +349,21 @@ export function renderTaskPills(
  */
 export function renderClosePills(
   epicRow: Record<string, unknown>,
-  verdict: Verdict,
+  _verdict: Verdict,
 ): string {
-  // T2 restore note: the close-row `[status]` pill is intentionally dropped
-  // because the board filter pins it to `[open]`. A future custom-filtered
-  // view that surfaces non-open epics must restore it by re-appending
-  // ` [${seg(epicRow.status)}]` here (the capability is retained, not lost).
+  // fn-713 follow-on: SHOW the close-row status + approval at their current
+  // values (reverses fn-708 omit-default, the T2 status drop, and the T3
+  // suppression). On the default board filter `status` is the constant
+  // `open`; it renders anyway so every row carries the full state. The
+  // `_verdict` arg is retained for call / test arity.
   let out = "";
-  const approval = epicRow.approval;
-  if (approval === "rejected") {
-    const suppressed =
-      verdict.tag === "blocked" && verdict.reason.kind === "job-rejected";
-    if (!suppressed) {
-      out += " [rejected]";
-    }
-  }
-  // `pending` (default) and `approved` (never on the board filter) → no pill.
+  const statusRaw = epicRow.status;
+  const status =
+    typeof statusRaw === "string" && statusRaw !== "" ? statusRaw : "open";
+  out += ` ${pill(status)}`;
+  const apRaw = epicRow.approval;
+  const ap = typeof apRaw === "string" && apRaw !== "" ? apRaw : "pending";
+  out += ` ${pill(ap)}`;
   return out;
 }
 
@@ -489,56 +489,59 @@ const PILL_COLORS: Record<string, PillBucket> = {
  * byte-compare body stay plain — only the lines shipped to `pushFrame`
  * pass through this helper, gated on the TTY + NO_COLOR check in `main`.
  */
+/**
+ * Map a pill's TEXT token (the part after any `<glyph>::` icon prefix) to its
+ * color bucket, or `undefined` to leave it uncolored. Pure string lookup +
+ * the historical prefix fallbacks — unchanged routing, just lifted out of the
+ * `replace` callback so it keys on the text token rather than the whole inner
+ * (which now carries the icon).
+ */
+function bucketForToken(token: string): PillBucket | undefined {
+  let bucket = PILL_COLORS[token];
+  // fn-635: `blocked:dep-on-epic-dangling <id>` → red (distinct from the amber
+  // `blocked:*` family). MUST precede the generic `blocked:` → warn fallback.
+  if (
+    bucket === undefined &&
+    token.startsWith("blocked:dep-on-epic-dangling")
+  ) {
+    bucket = "error";
+  }
+  if (bucket === undefined && token.startsWith("blocked:")) {
+    bucket = "warn";
+  }
+  if (bucket === undefined && token.startsWith("failed:")) {
+    bucket = "error";
+  }
+  if (bucket === undefined && token.startsWith("awaiting:")) {
+    bucket = "warn";
+  }
+  if (bucket === undefined && token.startsWith("task-repo:")) {
+    bucket = "warn";
+  }
+  // fn-643.5: `dead-letter:N` banner pill → warn ("things to fix right now").
+  if (bucket === undefined && token.startsWith("dead-letter:")) {
+    bucket = "warn";
+  }
+  // fn-638.4: `running:sub-agent-stale` → warn (distinct from fresh
+  // `running:*` blue); MUST precede the generic `running:` fallback.
+  if (bucket === undefined && token === "running:sub-agent-stale") {
+    bucket = "warn";
+  }
+  if (bucket === undefined && token.startsWith("running:")) {
+    bucket = "blue";
+  }
+  return bucket;
+}
+
 export function colorizePillsInLine(line: string): string {
   return line.replace(/\[([^\]]+)\]/g, (match, inner: string) => {
-    let bucket = PILL_COLORS[inner];
-    // fn-635: route `blocked:dep-on-epic-dangling <id>` to the `error`
-    // bucket (red) — distinct from the amber `blocked:*` family. This
-    // check MUST precede the generic `blocked:` → `warn` fallback below,
-    // otherwise a dangling dep would render amber. The exact-match
-    // `PILL_COLORS["dep-on-epic-dangling"] = "error"` entry above
-    // handles the bare-token path; this prefix branch handles the
-    // wrapped `blocked:dep-on-epic-dangling <upstream>` payload.
-    if (
-      bucket === undefined &&
-      inner.startsWith("blocked:dep-on-epic-dangling")
-    ) {
-      bucket = "error";
-    }
-    if (bucket === undefined && inner.startsWith("blocked:")) {
-      bucket = "warn";
-    }
-    if (bucket === undefined && inner.startsWith("failed:")) {
-      bucket = "error";
-    }
-    if (bucket === undefined && inner.startsWith("awaiting:")) {
-      bucket = "warn";
-    }
-    if (bucket === undefined && inner.startsWith("task-repo:")) {
-      bucket = "warn";
-    }
-    // fn-643.5: `[dead-letter:N]` is the persistent banner pill the board
-    // stamps when the daemon's `dead_letters` collection has waiting rows.
-    // Warn/yellow bucket — "things to fix right now," same family as
-    // `[blocked]` / `[awaiting:*]` / `[task-repo:*]`. The pill is dropped
-    // entirely at count 0 (renderDeadLetterPill returns ""), so the
-    // colorizer only sees this branch when there is actually a backlog.
-    if (bucket === undefined && inner.startsWith("dead-letter:")) {
-      bucket = "warn";
-    }
-    // fn-638.4: route `running:sub-agent-stale` to the `warn` bucket
-    // (yellow) so a possibly-stuck orphan sub-agent renders distinctly
-    // from a fresh `running:*` (cyan). Placed BEFORE the generic
-    // `running:*` → `active` fallback so the more-specific staleness
-    // signal wins. The other three `RunningReason` kinds
-    // (`job-running`, `sub-agent-running`, `planner-running`) fall
-    // through to `active` as before.
-    if (bucket === undefined && inner === "running:sub-agent-stale") {
-      bucket = "warn";
-    }
-    if (bucket === undefined && inner.startsWith("running:")) {
-      bucket = "blue";
-    }
+    // fn-713 follow-on: iconized pills are `<glyph>::<token>`. Color keys on
+    // the TEXT token (after `::`); the SGR wraps the WHOLE inner so the glyph
+    // inherits the same hue. Plain pills (no `::` — dep refs, backend coords)
+    // key on the whole inner, exactly as before.
+    const sep = inner.indexOf("::");
+    const token = sep === -1 ? inner : inner.slice(sep + 2);
+    const bucket = bucketForToken(token);
     if (bucket === undefined) {
       return match;
     }
@@ -613,7 +616,7 @@ export function renderDeadLetterPill(waitingCount: number): string {
   if (!Number.isFinite(waitingCount) || waitingCount <= 0) {
     return "";
   }
-  return `[dead-letter:${waitingCount}]`;
+  return pill(`dead-letter:${waitingCount}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -687,11 +690,13 @@ export function subagentLinesFor(
     // arrive null/undefined (cf. the fn-697.2 safe-7 decode), so the guard is
     // read through `unknown` to keep the defensive null/empty drop honest —
     // same posture as the prior `g.row.status == null ? "" : String(...)`.
-    const status: unknown = g.row.status;
-    const statusSeg =
-      typeof status === "string" && status !== "" && status !== "ok"
-        ? ` [${status}]`
-        : "";
+    // fn-713 follow-on: SHOW the status at its current value, `ok` included
+    // (reverses fn-708 omit-default), as an iconized pill. A null / empty
+    // status coalesces to the resting `ok`.
+    const statusRaw: unknown = g.row.status;
+    const status =
+      typeof statusRaw === "string" && statusRaw !== "" ? statusRaw : "ok";
+    const statusSeg = ` ${pill(status)}`;
     return `${indent}${label}${statusSeg}`;
   });
 }
