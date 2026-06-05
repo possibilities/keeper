@@ -68,5 +68,5 @@ no-upstream exit-128 path, and that a session deletion stages as a removal.
 - [ ] `pnpm test` covers preview, lint_failed, success, no-upstream, deletion-staging.
 
 ## Done summary
-
+Filled the keeper commit-work verb: full stage→lint→commit→push pipeline (cli/commit-work.ts) with Python-byte-parity envelopes (compact two-line NDJSON, verified char-for-char incl. ensure_ascii unicode escaping), a new src/commit-work/lint-matrix.ts (concurrent polyglot matrix + new tsc --noEmit --project arm) and src/commit-work/push.ts (6-class push-error classifier, no-upstream path). 34 tests in test/commit-work.test.ts cover preview, lint_failed, success two-line NDJSON, no-upstream, deletion-as-removal, unicode paths, max-files, forbidden-trailer, Job-Id trailer.
 ## Evidence
