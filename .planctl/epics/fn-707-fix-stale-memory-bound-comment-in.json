@@ -1,0 +1,20 @@
+{
+  "approval": "pending",
+  "branch_name": "fn-707-fix-stale-memory-bound-comment-in",
+  "bundles": [],
+  "created_at": "2026-06-05T00:41:40.718685Z",
+  "depends_on_epics": [
+    "fn-706-fix-zellij-feed-cliff-and-tab-churn"
+  ],
+  "id": "fn-707-fix-stale-memory-bound-comment-in",
+  "last_validated_at": "2026-06-05T00:41:41.124834Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "fix stale memory-bound comment in zellij feed scan",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-05T00:41:40.718685Z"
+}
