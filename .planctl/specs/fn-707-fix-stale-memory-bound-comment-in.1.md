@@ -9,5 +9,5 @@ Update the comment to accurately say: the full file is materialized first; MAX_Z
 - [ ] Comment at daemon.ts:888-889 accurately describes that readFileSync reads the full file and the cap bounds only the tail-slice window.
 
 ## Done summary
-
+Rewrote the daemon.ts comment so it states readFileSync materializes the whole file and MAX_ZELLIJ_EVENTS_FILE_BYTES caps only the tail-slice window, with a note that fn-706.2 rotation keeps real feeds well under the cap.
 ## Evidence
