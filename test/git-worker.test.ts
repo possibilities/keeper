@@ -20,7 +20,9 @@ import {
   buildDiscoveryCandidates,
   buildGitSnapshot,
   COMMIT_ENUM_MAX_RETRIES,
+  type DataVersionWakeDecision,
   type DiscoveryContext,
+  decideDataVersionWake,
   decideHeadCacheAdvance,
   decideHeadDivergence,
   decideReconcileTransitions,
@@ -28,13 +30,16 @@ import {
   enumerateCommitsInDelta,
   filterPlanctlChanges,
   type GitDirtyFile,
+  type GitSnapshotPayload,
   isPlanctlChangedPath,
   parsePorcelainV2,
   probeWatchMembership,
   resolveHeadOidViaFs,
   selectVanishedRoots,
+  semanticSnapshotKey,
   shouldWatchRoot,
 } from "../src/git-worker";
+import { RescanScheduler, type SchedulerTimers } from "../src/rescan";
 
 // ---------------------------------------------------------------------------
 // parsePorcelainV2 — kept verbatim from pre-fn-633.5; the producer's
@@ -2708,4 +2713,271 @@ test("buildDiscoveryCandidates: fn-705 extraCandidates folded in unconditionally
   expect(without.has(nudgeRoot)).toBe(false);
 
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// semanticSnapshotKey — epic fn-716. The producer-side no-op dedupe gate. The
+// key must cover render-significant fields ONLY and EXCLUDE per-file mtime_ms,
+// so a save that doesn't change the dirty set / content / branch state does NOT
+// re-emit a GitSnapshot (the flood fix). It must still distinguish a genuinely
+// changed dirty set, content oid, branch, or ahead/behind.
+// ---------------------------------------------------------------------------
+
+function dirtyFile(over: Partial<GitDirtyFile> = {}): GitDirtyFile {
+  return {
+    path: "src/a.ts",
+    xy: ".M",
+    kind: "ordinary",
+    mtime_ms: 1000,
+    worktree_oid: "a".repeat(40),
+    index_oid: "b".repeat(40),
+    worktree_mode: "100644",
+    ...over,
+  };
+}
+
+function snap(over: Partial<GitSnapshotPayload> = {}): GitSnapshotPayload {
+  return {
+    project_dir: "/repo",
+    branch: "main",
+    head_oid: "c".repeat(40),
+    upstream: "origin/main",
+    ahead: 0,
+    behind: 0,
+    dirty_files: [dirtyFile()],
+    ...over,
+  };
+}
+
+test("semanticSnapshotKey: identical render-significant state with a DIFFERENT mtime_ms yields the SAME key (coalesced)", () => {
+  const a = snap({ dirty_files: [dirtyFile({ mtime_ms: 1000 })] });
+  const b = snap({ dirty_files: [dirtyFile({ mtime_ms: 9_999_999 })] });
+  expect(semanticSnapshotKey(a)).toBe(semanticSnapshotKey(b));
+});
+
+test("semanticSnapshotKey: a changed dirty SET (added file) yields a DIFFERENT key (emits)", () => {
+  const a = snap({ dirty_files: [dirtyFile()] });
+  const b = snap({
+    dirty_files: [dirtyFile(), dirtyFile({ path: "src/b.ts" })],
+  });
+  expect(semanticSnapshotKey(a)).not.toBe(semanticSnapshotKey(b));
+});
+
+test("semanticSnapshotKey: a content change (worktree_oid differs, same path/mtime) yields a DIFFERENT key", () => {
+  // worktree_oid is render-significant: the reducer's content-aware discharge
+  // keys on blob_oid === worktree_oid, so new bytes must re-emit.
+  const a = snap({
+    dirty_files: [dirtyFile({ worktree_oid: "a".repeat(40) })],
+  });
+  const b = snap({
+    dirty_files: [dirtyFile({ worktree_oid: "d".repeat(40) })],
+  });
+  expect(semanticSnapshotKey(a)).not.toBe(semanticSnapshotKey(b));
+});
+
+test("semanticSnapshotKey: branch / head_oid / ahead / behind / upstream changes each flip the key", () => {
+  const base = snap();
+  const baseKey = semanticSnapshotKey(base);
+  expect(semanticSnapshotKey(snap({ head_oid: "e".repeat(40) }))).not.toBe(
+    baseKey,
+  );
+  expect(semanticSnapshotKey(snap({ ahead: 1 }))).not.toBe(baseKey);
+  expect(semanticSnapshotKey(snap({ behind: 2 }))).not.toBe(baseKey);
+  expect(semanticSnapshotKey(snap({ upstream: "origin/other" }))).not.toBe(
+    baseKey,
+  );
+  // branch is NOT in the key (the board reads head/upstream/ahead/behind, not
+  // the human-facing branch name) — a pure branch rename with identical
+  // head/upstream/dirty state is not render-significant.
+  expect(semanticSnapshotKey(snap({ branch: "feature" }))).toBe(baseKey);
+});
+
+test("semanticSnapshotKey: a status (xy) or mode flip is render-significant (emits)", () => {
+  const baseKey = semanticSnapshotKey(snap());
+  expect(
+    semanticSnapshotKey(snap({ dirty_files: [dirtyFile({ xy: "A." })] })),
+  ).not.toBe(baseKey);
+  expect(
+    semanticSnapshotKey(
+      snap({ dirty_files: [dirtyFile({ worktree_mode: "100755" })] }),
+    ),
+  ).not.toBe(baseKey);
+});
+
+test("semanticSnapshotKey: a rename's orig_path is render-significant; absent vs explicit-null are equal", () => {
+  const noOrig = snap({ dirty_files: [dirtyFile()] });
+  const explicitNull = snap({
+    dirty_files: [{ ...dirtyFile(), orig_path: undefined }],
+  });
+  expect(semanticSnapshotKey(noOrig)).toBe(semanticSnapshotKey(explicitNull));
+  const renamed = snap({
+    dirty_files: [dirtyFile({ kind: "renamed", orig_path: "src/old.ts" })],
+  });
+  expect(semanticSnapshotKey(renamed)).not.toBe(semanticSnapshotKey(noOrig));
+});
+
+// ---------------------------------------------------------------------------
+// Per-root emission throttle under continuous churn — epic fn-716. The
+// git-worker passes GIT_SNAPSHOT_MAX_WAIT_MS into each RescanScheduler so a
+// root churning faster than the trailing debounce still flushes at the ceiling,
+// bounding the emit rate to ≤1 per window. Modelled with the same fake-clock
+// harness rescan.test.ts uses (the scheduler is the throttle primitive).
+// ---------------------------------------------------------------------------
+
+function fakeClock(): {
+  timers: SchedulerTimers;
+  flushDelay: (ms: number) => void;
+  pendingCount: () => number;
+} {
+  let next = 1;
+  const cbs = new Map<number, { cb: () => void; ms: number }>();
+  const timers: SchedulerTimers = {
+    setTimeout: (cb, ms) => {
+      const id = next++;
+      cbs.set(id, { cb, ms });
+      return id as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimeout: (handle) => {
+      cbs.delete(handle as unknown as number);
+    },
+  };
+  const fireSubset = (ids: number[]) => {
+    const ready: Array<() => void> = [];
+    for (const id of ids) {
+      const entry = cbs.get(id);
+      if (entry) {
+        ready.push(entry.cb);
+        cbs.delete(id);
+      }
+    }
+    for (const cb of ready) cb();
+  };
+  return {
+    timers,
+    flushDelay: (ms) =>
+      fireSubset(
+        [...cbs.entries()].filter(([, e]) => e.ms === ms).map(([id]) => id),
+      ),
+    pendingCount: () => cbs.size,
+  };
+}
+
+test("fn-716 throttle: continuous churn faster than the debounce emits ≤1 per ceiling window", () => {
+  const DEBOUNCE = 500;
+  const CEILING = 1500; // GIT_SNAPSHOT_MAX_WAIT_MS
+  const clock = fakeClock();
+  let emits = 0;
+  const sched = new RescanScheduler(
+    () => {
+      emits++;
+    },
+    DEBOUNCE,
+    () => {},
+    clock.timers,
+    CEILING,
+  );
+
+  // Simulate a long burst of saves arriving faster than the debounce can
+  // settle: re-schedule many times without ever flushing the debounce. The
+  // ceiling timer (armed on the first schedule) is the only thing that can
+  // flush this burst — exactly the "trailing debounce never fires" scenario.
+  for (let i = 0; i < 100; i++) sched.schedule();
+  expect(emits).toBe(0);
+
+  // One ceiling window elapses → exactly one flush, latest-wins.
+  clock.flushDelay(CEILING);
+  expect(emits).toBe(1);
+
+  // Another full burst within the next window → still bounded to one more emit.
+  for (let i = 0; i < 100; i++) sched.schedule();
+  clock.flushDelay(CEILING);
+  expect(emits).toBe(2);
+
+  // Two ceiling windows of continuous churn → at most two emits, NOT one per
+  // schedule() (the flood the epic fixes).
+  expect(emits).toBe(2);
+});
+
+test("fn-716 throttle: a bursty-then-quiet edit still flushes on the trailing debounce (no needless ceiling wait)", () => {
+  const DEBOUNCE = 500;
+  const CEILING = 1500;
+  const clock = fakeClock();
+  let emits = 0;
+  const sched = new RescanScheduler(
+    () => {
+      emits++;
+    },
+    DEBOUNCE,
+    () => {},
+    clock.timers,
+    CEILING,
+  );
+
+  // A short burst that then goes quiet — the common case. The trailing debounce
+  // settles first, so the snapshot lands at ~DEBOUNCE, not held to the ceiling.
+  sched.schedule();
+  sched.schedule();
+  clock.flushDelay(DEBOUNCE);
+  expect(emits).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// decideDataVersionWake — epic fn-716. The narrowed data_version poll. The
+// pre-fn-716 poll re-scheduled every subscribed root on every bump, and the
+// worker's own GitSnapshot insert bumps data_version → a self-feeding storm.
+// The fix: reconcile membership on any advance (so a foreign change is never
+// missed), but gate re-snapshot scheduling on advance + a min-elapsed floor.
+// ---------------------------------------------------------------------------
+
+const FLOOR = 1000; // DATA_VERSION_SCHEDULE_FLOOR_MS
+
+test("decideDataVersionWake: no advance → no reconcile, no schedule, floor unchanged", () => {
+  expect(decideDataVersionWake(5, 5, 10_000, 9_500, FLOOR)).toEqual({
+    reconcile: false,
+    schedule: false,
+    nextScheduleAtMs: 9_500,
+  } satisfies DataVersionWakeDecision);
+});
+
+test("decideDataVersionWake: advance past the floor → reconcile AND schedule, floor advances to now", () => {
+  expect(decideDataVersionWake(6, 5, 10_000, 8_000, FLOOR)).toEqual({
+    reconcile: true,
+    schedule: true,
+    nextScheduleAtMs: 10_000,
+  } satisfies DataVersionWakeDecision);
+});
+
+test("decideDataVersionWake: self-write inside the floor → reconcile but do NOT schedule (self-feed guard)", () => {
+  // The worker's own GitSnapshot insert bumped data_version a few ms after the
+  // last scheduling wake. Membership still reconciles (cheap, idempotent), but
+  // the re-snapshot scheduling is suppressed so the storm can't form.
+  const d = decideDataVersionWake(7, 6, 8_010, 8_000, FLOOR);
+  expect(d.reconcile).toBe(true);
+  expect(d.schedule).toBe(false);
+  // Floor carried forward unchanged — a later genuine foreign change still
+  // measures from the last real scheduling wake.
+  expect(d.nextScheduleAtMs).toBe(8_000);
+});
+
+test("decideDataVersionWake: a foreign change spaced past the floor schedules even after suppressed self-writes", () => {
+  // Self-write at t=8010 (suppressed, floor stays 8000), then a real foreign
+  // change at t=9100 — now >= FLOOR past 8000 → schedules.
+  const selfWrite = decideDataVersionWake(7, 6, 8_010, 8_000, FLOOR);
+  expect(selfWrite.schedule).toBe(false);
+  const foreign = decideDataVersionWake(
+    8,
+    7,
+    9_100,
+    selfWrite.nextScheduleAtMs,
+    FLOOR,
+  );
+  expect(foreign.reconcile).toBe(true);
+  expect(foreign.schedule).toBe(true);
+  expect(foreign.nextScheduleAtMs).toBe(9_100);
+});
+
+test("decideDataVersionWake: first advance after boot (lastSchedule = -Infinity) always schedules", () => {
+  const d = decideDataVersionWake(2, 1, 50, Number.NEGATIVE_INFINITY, FLOOR);
+  expect(d.schedule).toBe(true);
+  expect(d.nextScheduleAtMs).toBe(50);
 });

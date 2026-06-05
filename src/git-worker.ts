@@ -51,7 +51,7 @@ import {
   parseTaskTrailers,
 } from "./derivers";
 import { normalizePlanctlOp } from "./plan-classifier";
-import { isDropError, RescanScheduler } from "./rescan";
+import { DEFAULT_DEBOUNCE_MS, isDropError, RescanScheduler } from "./rescan";
 import type { ShutdownMessage } from "./wake-worker";
 
 export interface GitWorkerData {
@@ -342,6 +342,28 @@ interface ParsedGitStatus {
 const DB_POLL_MS = 100;
 /** Silent-watcher backstop, same shape as `transcript-worker.ts`. */
 const HEARTBEAT_MS = 60_000;
+/**
+ * Per-root GitSnapshot emission ceiling (epic fn-716). Passed into every
+ * {@link RescanScheduler} (the `maxWaitMs` ceiling added in task fn-716.1) so a
+ * root under CONTINUOUS churn emits ≤1 GitSnapshot per this window — a trailing
+ * debounce alone re-arms forever under sustained edits and never flushes, so
+ * staleness is unbounded; the ceiling caps it. The trailing debounce
+ * ({@link DEFAULT_DEBOUNCE_MS}, 500ms) still wins on a bursty-then-quiet edit
+ * (the common case), this only bites when edits land faster than the debounce.
+ * 1.5s sits inside the epic's "≤1 per ~1-2s" bar.
+ */
+const GIT_SNAPSHOT_MAX_WAIT_MS = 1500;
+/**
+ * Min elapsed between two `data_version`-poll SCHEDULING wakes (epic fn-716).
+ * The self-write guard: the worker's own GitSnapshot inserts bump
+ * `data_version`, and back-to-back round-trips land within a few ms; gating the
+ * re-snapshot scheduling on this floor means a self-write reconciles membership
+ * (cheap, idempotent) but does NOT re-arm the scheduler, breaking the
+ * self-feeding loop. A genuine foreign change spaced past the floor still
+ * schedules; the heartbeat ({@link HEARTBEAT_MS}) is the slow backstop for one
+ * that lands inside it with no other trigger.
+ */
+const DATA_VERSION_SCHEDULE_FLOOR_MS = 1000;
 const GIT_TIMEOUT_MS = 2000;
 /**
  * Per-root TTL on the watch-membership verdict ({@link probeWatchMembership})
@@ -1897,6 +1919,126 @@ export function buildGitSnapshot(
   };
 }
 
+/**
+ * SEMANTIC dedupe key for a {@link GitSnapshotPayload} (epic fn-716). The
+ * per-root no-op gate in `emitSnapshot` compares this key against the prior
+ * emit; an unchanged key short-circuits the emit so the reducer never folds a
+ * snapshot that says nothing new.
+ *
+ * Why a hand-built semantic key, NOT `JSON.stringify(snapshot)` (the pre-fn-716
+ * gate): the payload embeds per-file `mtime_ms` (and `worktree_oid`, which
+ * churns whenever the file's *bytes* change). Under continuous churn — exactly
+ * when a worker session is editing — `mtime_ms` advances on every save, so a
+ * payload-hash key is unique on every snapshot and the gate NEVER fires. The
+ * result was the ~13-20/sec GitSnapshot flood this epic fixes.
+ *
+ * The key covers ONLY render-significant fields — what the board / autopilot
+ * actually read off `git_status`: `project_dir`, `head_oid`, `upstream`,
+ * `ahead`, `behind`, and per-dirty-file `{path, xy, kind, orig_path,
+ * worktree_oid, index_oid, worktree_mode}`. It DELIBERATELY EXCLUDES `mtime_ms`
+ * (a pure file-system timestamp that changes without changing what's dirty) so
+ * a save that doesn't change the dirty SET / content does not re-emit.
+ *
+ * It KEEPS `worktree_oid` in the key on purpose: a content change to a dirty
+ * file IS render-significant (the reducer's content-aware discharge gate keys
+ * on `blob_oid === worktree_oid`, so the same path with new bytes must produce
+ * a fresh snapshot). `mtime_ms` and `worktree_oid` BOTH remain in the EMITTED
+ * payload regardless — the reducer's pass-2 inferred attribution
+ * (`last_mutation_at = mtime_ms / 1000`) and content-aware discharge
+ * (`worktree_oid`) read them off the folded event. Only `mtime_ms` is dropped
+ * from the *key*, never from the payload.
+ *
+ * The dirty-file projection is order-sensitive but `git status --porcelain=v2`
+ * (and thus `buildGitSnapshot`) yields a stable total order, so the key is a
+ * deterministic function of the parse — no sort needed here.
+ *
+ * Re-fold safety: this is a PRODUCER-side gate only. It changes WHETHER a
+ * snapshot event is appended, never the event's contents; a correct dedupe
+ * would have dropped exactly the snapshots this drops (same render-significant
+ * state). The event log a from-scratch re-fold replays is unchanged in shape,
+ * so projections stay byte-identical.
+ */
+export function semanticSnapshotKey(snapshot: GitSnapshotPayload): string {
+  const files = snapshot.dirty_files.map((f) => ({
+    path: f.path,
+    xy: f.xy,
+    kind: f.kind,
+    // `orig_path` is render-significant (a rename pair) — `??` to `null` so the
+    // key is stable whether the field is absent or explicitly null.
+    orig_path: f.orig_path ?? null,
+    // worktree_oid IN (content change is render-significant); mtime_ms OUT.
+    worktree_oid: f.worktree_oid,
+    index_oid: f.index_oid,
+    worktree_mode: f.worktree_mode,
+  }));
+  return JSON.stringify({
+    project_dir: snapshot.project_dir,
+    head_oid: snapshot.head_oid,
+    upstream: snapshot.upstream,
+    ahead: snapshot.ahead,
+    behind: snapshot.behind,
+    dirty_files: files,
+  });
+}
+
+/**
+ * Pure decision for the `data_version` poll wake (epic fn-716). The pre-fn-716
+ * poll re-scheduled EVERY subscribed root on EVERY `data_version` bump — and the
+ * worker's own `GitSnapshot` insert bumps `data_version`, so the poll fed itself
+ * a snapshot-per-root storm (one of the two flood defects this epic fixes).
+ *
+ * The narrowed wake separates two concerns:
+ *
+ * - **Membership** (`reconcile`) runs on any advance — a foreign write (a hook
+ *   tool event dirtying a repo, a new job row) may have changed which roots
+ *   should be watched, and that reconcile is cheap + idempotent. NEVER gated, so
+ *   a real foreign dirty-tree change is still observed (acceptance bar #4).
+ * - **Real-work scheduling** (re-snapshotting the already-subscribed roots) is
+ *   gated on BOTH (a) an actual version advance AND (b) a min-elapsed floor
+ *   since the last *scheduling* wake. The floor is the self-write guard: the
+ *   worker's own back-to-back GitSnapshot round-trips bump `data_version` within
+ *   a few ms of each other, well under the floor, so they reconcile membership
+ *   but do NOT re-trigger a snapshot storm. A genuine foreign change spaced past
+ *   the floor still schedules.
+ *
+ * The throttle (`schedulerFor`'s max-wait ceiling) is the second line of
+ * defense even when scheduling does fire — but gating here keeps the poll from
+ * arming the scheduler on every self-write in the first place.
+ *
+ * Returns `{ reconcile, schedule, nextScheduleAtMs }`: `reconcile` is true on
+ * any advance; `schedule` is true only when also past the floor;
+ * `nextScheduleAtMs` is the floor stamp to carry forward (unchanged when we
+ * don't schedule, `nowMs` when we do).
+ */
+export interface DataVersionWakeDecision {
+  reconcile: boolean;
+  schedule: boolean;
+  nextScheduleAtMs: number;
+}
+
+export function decideDataVersionWake(
+  curVersion: number,
+  lastVersion: number,
+  nowMs: number,
+  lastScheduleAtMs: number,
+  minScheduleElapsedMs: number,
+): DataVersionWakeDecision {
+  const advanced = curVersion !== lastVersion;
+  if (!advanced) {
+    return {
+      reconcile: false,
+      schedule: false,
+      nextScheduleAtMs: lastScheduleAtMs,
+    };
+  }
+  const pastFloor = nowMs - lastScheduleAtMs >= minScheduleElapsedMs;
+  return {
+    reconcile: true,
+    schedule: pastFloor,
+    nextScheduleAtMs: pastFloor ? nowMs : lastScheduleAtMs,
+  };
+}
+
 function startWorker(): void {
   if (parentPort == null) {
     console.error("[git-worker] no parentPort — not running as a Worker");
@@ -1954,6 +2096,14 @@ function startWorker(): void {
   }
   const subscriptions = new Map<string, RootSubscriptions>();
   const schedulers = new Map<string, RescanScheduler>();
+  /**
+   * Epic fn-716: count of GitSnapshot emits coalesced away by the semantic
+   * dedupe gate ({@link semanticSnapshotKey}) — i.e. a re-snapshot whose
+   * render-significant state matched the prior emit (typically pure mtime churn
+   * under continuous editing). Logged on the heartbeat so the flood reduction is
+   * observable without per-drop log spam. Reset to 0 after each log.
+   */
+  let coalescedDrops = 0;
   const cwdRootCache = new Map<string, string | null>();
   /**
    * Epic fn-690: per-root watch-membership verdict TTL memo. Distinct from
@@ -2018,6 +2168,12 @@ function startWorker(): void {
   let dbPollTimer: ReturnType<typeof setInterval> | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let lastDataVersion: number | null = null;
+  /**
+   * Epic fn-716: monotonic-clock stamp of the last data_version-poll SCHEDULING
+   * wake (the min-elapsed floor in {@link decideDataVersionWake}). Seeded to
+   * `-Infinity` so the first real advance after boot always schedules.
+   */
+  let lastDataVersionScheduleAtMs = Number.NEGATIVE_INFINITY;
   let shuttingDown = false;
 
   // Single-flight reconciler — DB poll + heartbeat + boot all call this and
@@ -2174,8 +2330,17 @@ function startWorker(): void {
       );
       return;
     }
-    const key = JSON.stringify(snapshot);
-    if (lastByRoot.get(root) === key) return;
+    // Epic fn-716: SEMANTIC dedupe key — render-significant fields only,
+    // EXCLUDING per-file mtime_ms (which churns on every save without changing
+    // what's dirty). The pre-fn-716 `JSON.stringify(snapshot)` key embedded
+    // mtime_ms, so it was unique on every snapshot under continuous editing and
+    // the gate never fired (the GitSnapshot flood). mtime_ms + worktree_oid
+    // stay in the EMITTED payload below — only the KEY drops mtime_ms.
+    const key = semanticSnapshotKey(snapshot);
+    if (lastByRoot.get(root) === key) {
+      coalescedDrops++;
+      return;
+    }
     lastByRoot.set(root, key);
     port.postMessage({
       kind: "git-snapshot",
@@ -2186,7 +2351,17 @@ function startWorker(): void {
   function schedulerFor(root: string): RescanScheduler {
     let s = schedulers.get(root);
     if (s != null) return s;
-    s = new RescanScheduler(() => emitSnapshot(root));
+    // Epic fn-716: pass the per-root max-wait ceiling (task fn-716.1's
+    // RescanScheduler `maxWaitMs` arg) so a root under continuous churn emits
+    // ≤1 GitSnapshot per GIT_SNAPSHOT_MAX_WAIT_MS, latest-wins — a trailing
+    // debounce alone re-arms forever under sustained edits and never flushes.
+    s = new RescanScheduler(
+      () => emitSnapshot(root),
+      DEFAULT_DEBOUNCE_MS,
+      (m) => console.error(m),
+      undefined,
+      GIT_SNAPSHOT_MAX_WAIT_MS,
+    );
     schedulers.set(root, s);
     return s;
   }
@@ -2528,9 +2703,20 @@ function startWorker(): void {
       // ONLY sanctioned DB change primitive — `wake-worker.ts` uses the same
       // pattern. A bump means SOMETHING committed (new tool event, new job
       // row, new epic/task snapshot) and the touched-set or root membership
-      // may have changed. Re-reconcile + schedule snapshots for every root;
-      // the per-root JSON dedupe absorbs no-ops (including our own
-      // GitSnapshot round-trips).
+      // may have changed.
+      //
+      // Epic fn-716 narrowing: the pre-fn-716 poll re-scheduled a re-snapshot
+      // for EVERY subscribed root on EVERY bump — and the worker's own
+      // GitSnapshot insert bumps `data_version`, so the poll fed itself a
+      // snapshot-per-root storm (one of the two flood defects). Now:
+      //   - membership reconcile runs on ANY advance (cheap, idempotent; a
+      //     foreign dirty-tree write may have changed which roots to watch — so
+      //     a real foreign change is never missed), but
+      //   - re-snapshot scheduling is gated on an actual advance PLUS a
+      //     min-elapsed floor ({@link DATA_VERSION_SCHEDULE_FLOOR_MS}) since the
+      //     last scheduling wake — the self-write guard, so the worker's own
+      //     back-to-back round-trips reconcile but don't re-arm the scheduler.
+      // See {@link decideDataVersionWake}.
       const dataVersionQuery = db.query("PRAGMA data_version");
       lastDataVersion = (dataVersionQuery.get() as { data_version: number })
         .data_version;
@@ -2538,11 +2724,21 @@ function startWorker(): void {
         if (shuttingDown) return;
         const cur = (dataVersionQuery.get() as { data_version: number })
           .data_version;
-        if (cur === lastDataVersion) return;
+        const decision = decideDataVersionWake(
+          cur,
+          lastDataVersion ?? cur,
+          performance.now(),
+          lastDataVersionScheduleAtMs,
+          DATA_VERSION_SCHEDULE_FLOOR_MS,
+        );
+        if (!decision.reconcile) return;
         lastDataVersion = cur;
         void reconcileRoots();
-        for (const root of subscriptions.keys()) {
-          schedulerFor(root).schedule();
+        if (decision.schedule) {
+          lastDataVersionScheduleAtMs = decision.nextScheduleAtMs;
+          for (const root of subscriptions.keys()) {
+            schedulerFor(root).schedule();
+          }
         }
       }, DB_POLL_MS);
 
@@ -2559,6 +2755,16 @@ function startWorker(): void {
         // the eventual restart. (The primary trigger is the live watcher/
         // db-poll emit path, since this 60s timer proved unreliable mid-wedge.)
         for (const root of subscriptions.keys()) emitSnapshot(root);
+        // Epic fn-716: surface the flood reduction. Log + reset the count of
+        // snapshots the semantic dedupe gate coalesced away this window (mostly
+        // pure-mtime churn under continuous editing) so the throttle's effect is
+        // observable in keeperd's stderr without per-drop spam.
+        if (coalescedDrops > 0) {
+          console.error(
+            `[git-worker] coalesced ${coalescedDrops} no-op GitSnapshot emit(s) in the last ${HEARTBEAT_MS}ms (semantic dedupe)`,
+          );
+          coalescedDrops = 0;
+        }
       }, HEARTBEAT_MS);
     })
     .catch((err) => {
