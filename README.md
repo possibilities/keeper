@@ -469,7 +469,8 @@ watches the `git` worktree collection; `keeper usage` watches the
 wait-for-condition client (emits a Monitor-shaped `armed`/`met`/`failed`
 event stream on stdout and exits when its condition holds — a planctl
 epic/task going `complete` or `unblocked`, the cwd's repo going
-`git-clean`, other agents going `agents-idle`, or any AND-combination
+`git-clean`, other agents going `agents-idle`, the caller's own background
+monitor finishing via `monitor-running <selector>`, or any AND-combination
 like `keeper await git-clean and agents-idle`); `keeper approve` is the
 RPC client (single-shot `rpc` →
 `rpc_result`, no subscription). The
@@ -796,29 +797,38 @@ collapses to plain stream output. Run any of them with
   ```
 
 - `await.ts` — the blocking wait-for-condition client (fn-647; conditions
-  + AND grammar widened in fn-713). Non-TUI: emits a Monitor-shaped event
+  + AND grammar widened in fn-713, `monitor-running` added in fn-718).
+  Non-TUI: emits a Monitor-shaped event
   stream on stdout — exactly one `[keeper-await] armed …` line after the
   on-board check, then exactly one terminal `[keeper-await] met …` or
   `[keeper-await] failed …` line — and exits when its condition holds.
-  Four conditions: `complete <id>` (epic/task pops off the board) and
+  Five conditions: `complete <id>` (epic/task pops off the board) and
   `unblocked <id>` (workable now) are planctl-id forms auto-detecting
   epic vs task by the `.N` suffix; `git-clean` blocks until the cwd's git
   root has `dirty_count=0 AND orphaned_count=0` (no `git_status` row for
   the root counts as clean); `agents-idle` blocks until no OTHER session
   (`job_id != CLAUDE_CODE_SESSION_ID`) with `state=working` has a cwd
-  inside the cwd's git root. `git-clean` / `agents-idle` take no id and
-  are project-scoped to the cwd's repo. Multiple conditions joined by the
+  inside the cwd's git root; `monitor-running <selector>` blocks until the
+  matching background monitor in the CALLER'S OWN session
+  (`job_id == CLAUDE_CODE_SESSION_ID`) is no longer running — the selector
+  is `cmd:<full command>`, `kind:<monitor|bash-bg|ambient>`, or a bare
+  token (= `cmd:<token>`), exact-matched against the v51 `jobs.monitors`
+  projection (a no-match at arm time refuses with `reason=no-match` exit 1
+  rather than firing an instant `met`). `git-clean` / `agents-idle` take no
+  id and are project-scoped to the cwd's repo; `monitor-running` takes one
+  selector and needs no git root. Multiple conditions joined by the
   literal `and` token block until ALL hold simultaneously (level-
   triggered, glitch-free); only the subscriptions a condition needs are
   opened. "unblocked" deliberately excludes autopilot's
   `single-task-per-epic` / `single-task-per-root` concurrency mutexes
   (every other blocker still blocks). Exit codes: 0 met, 1
-  not-found/usage/connection/`no-git-root`, 3 timeout (SIGTERM), 4
-  deleted, 5 stuck (only under `--fail-on-stuck`).
+  not-found/`no-match`/usage/connection/`no-git-root`, 3 timeout (SIGTERM),
+  4 deleted, 5 stuck (only under `--fail-on-stuck`).
 
   ```sh
   keeper await complete fn-646-keeper-cli-opentui-port.1   # task done
   keeper await git-clean                                   # repo clean
+  keeper await monitor-running cmd:bun run dev             # my dev server done
   keeper await git-clean and agents-idle                   # both, ANDed
   ```
 
