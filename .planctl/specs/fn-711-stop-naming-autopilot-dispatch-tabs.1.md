@@ -39,5 +39,5 @@ optional `name?` param (its own unit tests cover both branches).
 - [ ] `bun run typecheck` + `bun test test/exec-backend.test.ts` green
 
 ## Done summary
-
+Managed launch now calls buildZellijNewTabArgs without forwarding name, so dispatched zellij tabs are unnamed (mirrors restore ensureLaunched); the --name verb::id worker-argv correlator and the launch name param (logs/dedup) are retained. Flipped the integration test to assert --name is omitted and fixed the stale-memo retry test's name-based new-tab filter.
 ## Evidence
