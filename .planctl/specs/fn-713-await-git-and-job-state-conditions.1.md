@@ -142,5 +142,5 @@ update the `HELP` constant in `cli/await.ts` (it lives in this file).
 - [ ] `HELP` updated; `bun test test/await.test.ts test/await-conditions.test.ts` green.
 
 ## Done summary
-
+Added pure gitCleanState/agentsIdleState predicates plus the segment-tokenizer AND grammar and an N-slot level-triggered runner with aggregate first-paint gate; single complete/unblocked invocations stay byte-identical. 105 await tests green.
 ## Evidence
