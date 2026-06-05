@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-711-stop-naming-autopilot-dispatch-tabs",
   "bundles": [],
+  "closer_done_at": "2026-06-05T18:25:57.503957Z",
   "created_at": "2026-06-05T14:15:02.814779Z",
   "depends_on_epics": [],
   "id": "fn-711-stop-naming-autopilot-dispatch-tabs",
@@ -9,10 +10,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Stop naming autopilot dispatch tabs",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T14:15:02.814779Z"
+  "updated_at": "2026-06-05T18:25:57.503957Z"
 }
