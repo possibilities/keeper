@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Rename and rewrite await skill and docs",
-  "updated_at": "2026-06-05T16:35:33.808165Z"
+  "updated_at": "2026-06-05T17:53:35.201270Z",
+  "worker_done_at": "2026-06-05T17:53:35.201270Z"
 }

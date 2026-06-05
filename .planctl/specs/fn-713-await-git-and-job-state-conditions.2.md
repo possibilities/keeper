@@ -71,5 +71,5 @@ history; the SKILL.md frontmatter parses; the documented commands match
 - [ ] Documented condition list matches `keeper await --help` exactly.
 
 ## Done summary
-
+Renamed skills/keeper-await -> skills/await (name: await), broadened the description to git/jobs/combination phrasings, rewrote the body to document git-clean/agents-idle conditions, the AND grammar, the no-git-root failure, and the updated line/exit-code table with a minimal pruned example set. Updated README example-clients prose and the await.ts module-map bullet/examples to the full condition set with one AND example. Documented condition list matches keeper await --help.
 ## Evidence
