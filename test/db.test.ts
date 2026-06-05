@@ -565,6 +565,169 @@ test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL
   db2.close();
 });
 
+test("v57→v58 rebuild relaxes events.data to nullable; rows + seq + indexes preserved", () => {
+  // fn-717.2: the v57→v58 migration is a stop-the-world table rebuild that
+  // relaxes `events.data` from NOT NULL to nullable (bun:sqlite blocks the
+  // O(1) writable_schema edit). Build a genuine v57-shaped DB — current schema
+  // EXCEPT `events.data NOT NULL` and version '57' — then reopen through
+  // migrate() and assert: data is now nullable, every row preserved
+  // byte-for-byte, the AUTOINCREMENT high-water preserved, and all events
+  // indexes intact.
+
+  // Build the current schema first (so every projection table + every index
+  // exists), then downgrade ONLY the events.data constraint back to v57 shape.
+  const built = openDb(dbPath);
+  // Seed a couple of real events so the rebuild has rows to copy.
+  built.db.run(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, tool_name, data) VALUES (1, 'sess-x', 'PostToolUse', 'post_tool_use', 'Write', ?)",
+    [JSON.stringify({ tool_input: { file_path: "/repo/a.ts" } })],
+  );
+  built.db.run(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (2, 'sess-x', 'Stop', 'stop', '{}')",
+  );
+  // Bump the AUTOINCREMENT high-water well past the live MAX(id) so we can
+  // prove the rebuild PRESERVES it (rather than recomputing from MAX(id)).
+  built.db.run("UPDATE sqlite_sequence SET seq = 9999 WHERE name = 'events'");
+
+  // Capture the live events index set + the seeded rows for the post-migrate
+  // comparison.
+  const eventsIndexSqlBefore = built.db
+    .prepare(
+      "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='events' AND sql IS NOT NULL",
+    )
+    .all() as { name: string; sql: string }[];
+  const indexNamesBefore = new Set(eventsIndexSqlBefore.map((r) => r.name));
+  const rowsBefore = built.db
+    .prepare("SELECT id, session_id, hook_event, data FROM events ORDER BY id")
+    .all();
+
+  // Downgrade: rebuild events with `data NOT NULL` and stamp version 57. This
+  // reproduces the exact pre-fn-717.2 shape a v57 DB carried — including all
+  // its indexes (recreated from the captured SQL) AND a CLEAN `event_blobs` FK
+  // (`REFERENCES events`). Use the temp-new-table technique (NOT `RENAME TO
+  // events_old`) with FK enforcement OFF, exactly so the downgraded v57 DB is
+  // faithful to a real .1 DB — a `RENAME` here would rewrite event_blobs's FK
+  // to `events_old` and produce a CORRUPT fixture that the migration-under-test
+  // never sees in production.
+  built.db.run("PRAGMA foreign_keys = OFF");
+  built.db
+    .transaction(() => {
+      built.db.run(`
+      CREATE TABLE events_dn (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL, session_id TEXT NOT NULL, pid INTEGER,
+        hook_event TEXT NOT NULL, event_type TEXT NOT NULL, tool_name TEXT,
+        matcher TEXT, cwd TEXT, permission_mode TEXT, agent_id TEXT,
+        agent_type TEXT, stop_hook_active INTEGER, data TEXT NOT NULL,
+        subagent_agent_id TEXT, spawn_name TEXT, start_time TEXT,
+        slash_command TEXT, skill_name TEXT, planctl_op TEXT,
+        planctl_target TEXT, planctl_epic_id TEXT, planctl_task_id TEXT,
+        planctl_subject_present INTEGER, tool_use_id TEXT, config_dir TEXT,
+        planctl_queue_jump INTEGER, bash_mutation_kind TEXT,
+        bash_mutation_targets TEXT, planctl_files TEXT, backend_exec_type TEXT,
+        backend_exec_session_id TEXT, backend_exec_pane_id TEXT,
+        background_task_id TEXT
+      )
+    `);
+      built.db.run("INSERT INTO events_dn SELECT * FROM events");
+      built.db.run("DROP TABLE events");
+      built.db.run("ALTER TABLE events_dn RENAME TO events");
+      // Recreate every captured index on the downgraded table so the v57 DB is
+      // faithfully indexed (the rebuild-under-test must then carry them forward).
+      for (const idx of eventsIndexSqlBefore) {
+        built.db.run(idx.sql);
+      }
+      built.db.run(
+        "UPDATE sqlite_sequence SET seq = 9999 WHERE name = 'events'",
+      );
+      built.db.run("UPDATE meta SET value = '57' WHERE key = 'schema_version'");
+    })
+    .immediate();
+  built.db.run("PRAGMA foreign_keys = ON");
+  built.db.close();
+
+  // Reopen through migrate() — drives the v57→v58 rebuild.
+  const { db } = openDb(dbPath);
+
+  // Version stamped to current.
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe(String(SCHEMA_VERSION));
+
+  // events.data is now NULLABLE — the relocator's `UPDATE ... SET data = NULL`
+  // succeeds.
+  const dataCol = (
+    db.prepare("PRAGMA table_info(events)").all() as {
+      name: string;
+      notnull: number;
+    }[]
+  ).find((c) => c.name === "data");
+  expect(dataCol).toBeDefined();
+  expect(dataCol?.notnull).toBe(0);
+
+  // Every seeded row preserved byte-for-byte (id + values intact).
+  const rowsAfter = db
+    .prepare("SELECT id, session_id, hook_event, data FROM events ORDER BY id")
+    .all();
+  expect(rowsAfter).toEqual(rowsBefore);
+
+  // AUTOINCREMENT high-water preserved (not recomputed from MAX(id)=2).
+  const seq = (
+    db
+      .prepare("SELECT seq FROM sqlite_sequence WHERE name = 'events'")
+      .get() as { seq: number }
+  ).seq;
+  expect(seq).toBe(9999);
+
+  // Every events index the live schema requires is present after the rebuild.
+  const indexNamesAfter = new Set(
+    (
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='events' AND sql IS NOT NULL",
+        )
+        .all() as { name: string }[]
+    ).map((r) => r.name),
+  );
+  for (const name of indexNamesBefore) {
+    expect(indexNamesAfter.has(name)).toBe(true);
+  }
+
+  // REGRESSION GUARD (the FK-rewrite bug): the rebuild must NOT corrupt
+  // `event_blobs`'s FOREIGN KEY. A naive `ALTER TABLE events RENAME TO
+  // events_old` would rewrite it to `REFERENCES "events_old"(id)`, leaving it
+  // dangling after the drop and breaking every later `INSERT INTO event_blobs`
+  // (the compaction relocator). The temp-new-table + FK-off rebuild keeps it
+  // pointing at `events`.
+  const eventBlobsSql = (
+    db
+      .prepare("SELECT sql FROM sqlite_master WHERE name = 'event_blobs'")
+      .get() as { sql: string }
+  ).sql;
+  expect(eventBlobsSql).not.toContain("events_old");
+  expect(eventBlobsSql).not.toContain("events_dn");
+  expect(eventBlobsSql.replace(/\s+/g, " ")).toContain("REFERENCES events");
+  // And the FK actually works: an INSERT INTO event_blobs referencing a real
+  // events row succeeds (a dangling FK would throw on prepare/insert).
+  const someId = (
+    db.prepare("SELECT id FROM events LIMIT 1").get() as { id: number }
+  ).id;
+  expect(() =>
+    db.run("INSERT INTO event_blobs (event_id, data) VALUES (?, ?)", [
+      someId,
+      "relocated",
+    ]),
+  ).not.toThrow();
+
+  // The relocator's NULL update is now accepted (the whole point of the relax).
+  expect(() =>
+    db.run("UPDATE events SET data = NULL WHERE hook_event = 'Stop'"),
+  ).not.toThrow();
+
+  db.close();
+});
+
 test("v4 DB migrates to v5: jobs.transcript_path added, rows preserved NULL", () => {
   // Build a v4-shaped DB by hand: jobs with title_source but no
   // transcript_path, version '4'.

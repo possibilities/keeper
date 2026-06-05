@@ -16205,27 +16205,31 @@ test("fn-717.1 empty event_blobs: cursor=0 re-fold is byte-identical (lossless f
   expect(snapshotBlobDrivenProjections()).toEqual(live);
 });
 
-test("fn-717.1 events.data stays NOT NULL in .1 — the relocate-NULL is the .2 seam", () => {
-  // DECISION (per the task spec): keep the write-path `events.data NOT NULL`
-  // constraint in task .1; task .2 relaxes it when the compaction relocator
-  // actually NULLs the hot column. This test PINS that decision so a future
-  // change can't silently drop the constraint, and documents WHY the .2
-  // compaction (`UPDATE events SET data = NULL`) is out of scope here: the
-  // constraint forbids it today.
+test("fn-717.2 events.data is now nullable — the compaction relocator can NULL the hot column", () => {
+  // Task .1 PINNED `events.data NOT NULL`; task .2 RELAXES it (the v57→v58
+  // stop-the-world rebuild in `migrate()`) so the compaction relocator can
+  // `UPDATE events SET data = NULL` after copying the cold blob into
+  // `event_blobs`. This test flips the .1 pin: the relocation's two steps —
+  // copy into the side table, then NULL the hot column — both succeed now.
   const { dischargedPostToolUseId } = seedBlobReadStream();
   drainAll();
-  // A .2-style relocation copies the blob into event_blobs first — that side
-  // is fine (NOT NULL there is satisfied by the real bytes)...
+  // Step 1: copy the cold blob into event_blobs (the side-table NOT NULL is
+  // satisfied by the real bytes).
   db.run(
     "INSERT INTO event_blobs (event_id, data) SELECT id, data FROM events WHERE id = ?",
     [dischargedPostToolUseId],
   );
-  // ...but NULLing the hot column is REJECTED by the live schema in .1.
+  // Step 2: NULL the hot column — REJECTED in .1, now ACCEPTED under the
+  // relaxed v58 schema.
   expect(() =>
     db.run("UPDATE events SET data = NULL WHERE id = ?", [
       dischargedPostToolUseId,
     ]),
-  ).toThrow(/NOT NULL constraint failed: events.data/);
+  ).not.toThrow();
+  const row = db
+    .query("SELECT data FROM events WHERE id = ?")
+    .get(dischargedPostToolUseId) as { data: string | null };
+  expect(row.data).toBeNull();
 });
 
 test("fn-717.1 relocated blob (event_blobs): COALESCE drain read resolves the side-table value losslessly", () => {

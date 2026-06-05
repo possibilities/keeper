@@ -202,6 +202,12 @@ from pathlib import Path
 # ``COALESCE(events.data, event_blobs.data)``. keeper-py reads neither
 # ``events.data`` nor ``event_blobs`` (attribution surface only), so the bump
 # is whitelist-only with no reader logic change.
+#
+# v58 (fn-717.2) is also whitelist-only: it relaxes ``events.data`` from
+# NOT NULL to nullable (via a one-time stop-the-world table rebuild) so the
+# daemon-side compaction relocator can NULL the hot column after moving a cold
+# blob into ``event_blobs``. keeper-py still never reads ``events.data``, so no
+# reader logic changes — only the version whitelist gains 58.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -231,6 +237,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         55,
         56,
         57,
+        58,
     }
 )
 

@@ -2119,127 +2119,158 @@ function migrate(db: Database): void {
         )?.value ?? "0",
       )
     : 0;
-  db.transaction(() => {
-    db.run(CREATE_EVENTS);
-    for (const sql of CREATE_EVENTS_INDEXES) {
-      db.run(sql);
-    }
-    db.run(CREATE_JOBS);
-    db.run(CREATE_EPICS);
-    db.run(CREATE_GIT_STATUS);
-    db.run(CREATE_USAGE);
-    db.run(CREATE_REDUCER_STATE);
-    db.run(CREATE_META);
-    db.run(CREATE_SUBAGENT_INVOCATIONS);
-    for (const sql of CREATE_SUBAGENT_INVOCATIONS_INDEXES) {
-      db.run(sql);
-    }
-    db.run(CREATE_FILE_ATTRIBUTIONS);
-    for (const sql of CREATE_FILE_ATTRIBUTIONS_INDEXES) {
-      db.run(sql);
-    }
-    db.run(CREATE_PROFILES);
-    db.run(CREATE_EPIC_DEP_EDGES);
-    for (const sql of CREATE_EPIC_DEP_EDGES_INDEXES) {
-      db.run(sql);
-    }
-    db.run(CREATE_DEAD_LETTERS);
-    for (const sql of CREATE_DEAD_LETTERS_INDEXES) {
-      db.run(sql);
-    }
-    db.run(CREATE_DISPATCH_FAILURES);
-    db.run(CREATE_AUTOPILOT_STATE);
-    db.run(CREATE_PENDING_DISPATCHES);
-    db.run(CREATE_EPIC_TOMBSTONES);
-    db.run(CREATE_EVENT_BLOBS);
 
-    // Seed singleton cursor on first boot. Subsequent boots are no-ops.
-    db.run(
-      "INSERT OR IGNORE INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 0, unixepoch('now', 'subsec'))",
-    );
+  // fn-717.2: decide BEFORE the migrate transaction whether the v57→v58
+  // `events.data` NOT NULL → nullable rebuild will run, so we can toggle
+  // `PRAGMA foreign_keys` AROUND the transaction. The rebuild DROPs the
+  // FK-referenced `events` table, which requires FK enforcement OFF — and
+  // `PRAGMA foreign_keys` is a NO-OP inside a transaction (SQLite ignores it
+  // while one is active), so it MUST be set here, outside. Shape-driven (the
+  // live `events.data` is actually NOT NULL) so a fresh DB and an
+  // already-migrated v58 DB both skip it; `events` may not exist yet on a
+  // truly empty DB (probe returns no `data` row → false).
+  const eventsTableExists =
+    db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+      )
+      .get() != null;
+  const needsEventsRebuild =
+    eventsTableExists &&
+    (
+      db.prepare("PRAGMA table_info('events')").all() as {
+        name: string;
+        notnull: number;
+      }[]
+    ).find((c) => c.name === "data")?.notnull === 1;
+  // Toggle FK enforcement OFF only when the rebuild needs it (the DROP of the
+  // referenced `events`). Restored in the `finally` so a throw mid-migrate
+  // never leaves the connection with FK enforcement disabled.
+  if (needsEventsRebuild) {
+    db.run("PRAGMA foreign_keys = OFF");
+  }
+  try {
+    db.transaction(() => {
+      db.run(CREATE_EVENTS);
+      for (const sql of CREATE_EVENTS_INDEXES) {
+        db.run(sql);
+      }
+      db.run(CREATE_JOBS);
+      db.run(CREATE_EPICS);
+      db.run(CREATE_GIT_STATUS);
+      db.run(CREATE_USAGE);
+      db.run(CREATE_REDUCER_STATE);
+      db.run(CREATE_META);
+      db.run(CREATE_SUBAGENT_INVOCATIONS);
+      for (const sql of CREATE_SUBAGENT_INVOCATIONS_INDEXES) {
+        db.run(sql);
+      }
+      db.run(CREATE_FILE_ATTRIBUTIONS);
+      for (const sql of CREATE_FILE_ATTRIBUTIONS_INDEXES) {
+        db.run(sql);
+      }
+      db.run(CREATE_PROFILES);
+      db.run(CREATE_EPIC_DEP_EDGES);
+      for (const sql of CREATE_EPIC_DEP_EDGES_INDEXES) {
+        db.run(sql);
+      }
+      db.run(CREATE_DEAD_LETTERS);
+      for (const sql of CREATE_DEAD_LETTERS_INDEXES) {
+        db.run(sql);
+      }
+      db.run(CREATE_DISPATCH_FAILURES);
+      db.run(CREATE_AUTOPILOT_STATE);
+      db.run(CREATE_PENDING_DISPATCHES);
+      db.run(CREATE_EPIC_TOMBSTONES);
+      db.run(CREATE_EVENT_BLOBS);
 
-    // Apply forward-only schema changes, then stamp the new version. These run
-    // on EVERY boot and are NOT gated on the stored schema_version: each step is
-    // idempotent (addColumnIfMissing reads PRAGMA table_info and no-ops when the
-    // column exists), so schema convergence is driven by the table's actual
-    // shape, not by trusting the version number. This is deliberate — a version
-    // stamped ahead of the real schema (e.g. an interrupted/premature migration)
-    // would otherwise skip its ALTERs forever and wedge the reducer. A
-    // non-idempotent step (a data backfill, a destructive change) would still
-    // need a version guard; add that guard locally to the step that needs it.
-    //
-    // v1→v2: add the `title` column to `jobs`. ADD COLUMN does not rewrite
-    // existing rows, so prior `jobs` rows backfill to `title=NULL` — matching
-    // the zero-event projection. Column def matches CREATE_JOBS.
-    addColumnIfMissing(db, "jobs", "title", "TEXT");
+      // Seed singleton cursor on first boot. Subsequent boots are no-ops.
+      db.run(
+        "INSERT OR IGNORE INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 0, unixepoch('now', 'subsec'))",
+      );
 
-    // v2→v3: drop the `mode` and `title_history` columns from `jobs` — the
-    // plan/act mode projection and the title-history array are both retired.
-    // Idempotent (drops only if present), so this runs every boot and converges
-    // whether the DB is a fresh v3 (CREATE TABLE already omits them) or an older
-    // v1/v2 DB that still carries them. `events.permission_mode` and the
-    // `session_title` data-blob field are untouched — only the `jobs`
-    // projections of them are removed.
-    dropColumnIfPresent(db, "jobs", "mode");
-    dropColumnIfPresent(db, "jobs", "title_history");
+      // Apply forward-only schema changes, then stamp the new version. These run
+      // on EVERY boot and are NOT gated on the stored schema_version: each step is
+      // idempotent (addColumnIfMissing reads PRAGMA table_info and no-ops when the
+      // column exists), so schema convergence is driven by the table's actual
+      // shape, not by trusting the version number. This is deliberate — a version
+      // stamped ahead of the real schema (e.g. an interrupted/premature migration)
+      // would otherwise skip its ALTERs forever and wedge the reducer. A
+      // non-idempotent step (a data backfill, a destructive change) would still
+      // need a version guard; add that guard locally to the step that needs it.
+      //
+      // v1→v2: add the `title` column to `jobs`. ADD COLUMN does not rewrite
+      // existing rows, so prior `jobs` rows backfill to `title=NULL` — matching
+      // the zero-event projection. Column def matches CREATE_JOBS.
+      addColumnIfMissing(db, "jobs", "title", "TEXT");
 
-    // v3→v4: add `events.spawn_name` (the parent claude process's --name/-n
-    // session name, scraped by the hook at SessionStart) and `jobs.title_source`
-    // (title provenance: NULL = priority 0 = zero-event reading, 'spawn' = 1,
-    // 'payload' = 2). Both nullable, no backfill — ADD COLUMN leaves existing
-    // rows reading NULL, which is exactly the zero-event/lowest-priority value.
-    // Column defs match CREATE_EVENTS / CREATE_JOBS.
-    addColumnIfMissing(db, "events", "spawn_name", "TEXT");
-    addColumnIfMissing(db, "jobs", "title_source", "TEXT");
+      // v2→v3: drop the `mode` and `title_history` columns from `jobs` — the
+      // plan/act mode projection and the title-history array are both retired.
+      // Idempotent (drops only if present), so this runs every boot and converges
+      // whether the DB is a fresh v3 (CREATE TABLE already omits them) or an older
+      // v1/v2 DB that still carries them. `events.permission_mode` and the
+      // `session_title` data-blob field are untouched — only the `jobs`
+      // projections of them are removed.
+      dropColumnIfPresent(db, "jobs", "mode");
+      dropColumnIfPresent(db, "jobs", "title_history");
 
-    // v4→v5: add `jobs.transcript_path` (the absolute path to the session's
-    // transcript JSONL, seeded from the SessionStart payload's top-level
-    // `transcript_path` field — display/debug only, never sorted/filtered). The
-    // priority-3 'transcript' title source folds from a synthetic
-    // `TranscriptTitle` event (title in `data.session_title`); it needs no new
-    // `events` column. Nullable, no backfill — ADD COLUMN leaves prior rows NULL.
-    // Column def matches CREATE_JOBS.
-    addColumnIfMissing(db, "jobs", "transcript_path", "TEXT");
+      // v3→v4: add `events.spawn_name` (the parent claude process's --name/-n
+      // session name, scraped by the hook at SessionStart) and `jobs.title_source`
+      // (title provenance: NULL = priority 0 = zero-event reading, 'spawn' = 1,
+      // 'payload' = 2). Both nullable, no backfill — ADD COLUMN leaves existing
+      // rows reading NULL, which is exactly the zero-event/lowest-priority value.
+      // Column defs match CREATE_EVENTS / CREATE_JOBS.
+      addColumnIfMissing(db, "events", "spawn_name", "TEXT");
+      addColumnIfMissing(db, "jobs", "title_source", "TEXT");
 
-    // v5→v6: add the `epics` + `tasks` plan projection tables (created above via
-    // CREATE TABLE IF NOT EXISTS, naturally idempotent and forward-only). No
-    // ALTER, no backfill — the tables start empty and the plan reducer fills
-    // them from synthetic EpicSnapshot/TaskSnapshot events. A v5 DB gains the
-    // two empty tables on first open with all prior `jobs`/`events` rows intact.
+      // v4→v5: add `jobs.transcript_path` (the absolute path to the session's
+      // transcript JSONL, seeded from the SessionStart payload's top-level
+      // `transcript_path` field — display/debug only, never sorted/filtered). The
+      // priority-3 'transcript' title source folds from a synthetic
+      // `TranscriptTitle` event (title in `data.session_title`); it needs no new
+      // `events` column. Nullable, no backfill — ADD COLUMN leaves prior rows NULL.
+      // Column def matches CREATE_JOBS.
+      addColumnIfMissing(db, "jobs", "transcript_path", "TEXT");
 
-    // v6→v7: collapse the standalone `tasks` table into an embedded JSON-array
-    // column on `epics`. UNLIKE every step above, this carries a DATA BACKFILL
-    // + a DROP TABLE — neither is idempotent (re-running would re-backfill an
-    // already-emptied/dropped table, or splice nothing the second time). So the
-    // step is VERSION-GUARDED: it runs only when the stored schema_version is
-    // still < 7. The `tasks` column itself is added via the idempotent
-    // addColumnIfMissing so a fresh v7 DB (CREATE_EPICS already defines it) and a
-    // migrating v6 DB converge the same way; only the backfill + DROP are gated.
-    //
-    // The backfill's array ordering MUST equal the reducer's fold sort
-    // (ORDER BY task_number, task_id) — a migrated row that differs from a
-    // re-folded one would break the from-scratch re-fold determinism guard.
-    // Orphan task rows (NULL/unknown epic_id) are NOT embedded — they are
-    // dropped with the table (the per-epic subselect only matches t.epic_id =
-    // epics.epic_id).
-    addColumnIfMissing(db, "epics", "tasks", "TEXT NOT NULL DEFAULT '[]'");
-    const storedVersion = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersion < 7) {
-      const tasksTableExists =
-        db
-          .prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
-          )
-          .get() != null;
-      if (tasksTableExists) {
-        db.run(
-          `UPDATE epics SET tasks = COALESCE((
+      // v5→v6: add the `epics` + `tasks` plan projection tables (created above via
+      // CREATE TABLE IF NOT EXISTS, naturally idempotent and forward-only). No
+      // ALTER, no backfill — the tables start empty and the plan reducer fills
+      // them from synthetic EpicSnapshot/TaskSnapshot events. A v5 DB gains the
+      // two empty tables on first open with all prior `jobs`/`events` rows intact.
+
+      // v6→v7: collapse the standalone `tasks` table into an embedded JSON-array
+      // column on `epics`. UNLIKE every step above, this carries a DATA BACKFILL
+      // + a DROP TABLE — neither is idempotent (re-running would re-backfill an
+      // already-emptied/dropped table, or splice nothing the second time). So the
+      // step is VERSION-GUARDED: it runs only when the stored schema_version is
+      // still < 7. The `tasks` column itself is added via the idempotent
+      // addColumnIfMissing so a fresh v7 DB (CREATE_EPICS already defines it) and a
+      // migrating v6 DB converge the same way; only the backfill + DROP are gated.
+      //
+      // The backfill's array ordering MUST equal the reducer's fold sort
+      // (ORDER BY task_number, task_id) — a migrated row that differs from a
+      // re-folded one would break the from-scratch re-fold determinism guard.
+      // Orphan task rows (NULL/unknown epic_id) are NOT embedded — they are
+      // dropped with the table (the per-epic subselect only matches t.epic_id =
+      // epics.epic_id).
+      addColumnIfMissing(db, "epics", "tasks", "TEXT NOT NULL DEFAULT '[]'");
+      const storedVersion = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersion < 7) {
+        const tasksTableExists =
+          db
+            .prepare(
+              "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+            )
+            .get() != null;
+        if (tasksTableExists) {
+          db.run(
+            `UPDATE epics SET tasks = COALESCE((
              SELECT json_group_array(json_object(
                'task_id', task_id,
                'epic_id', epic_id,
@@ -2255,869 +2286,879 @@ function migrate(db: Database): void {
                )
            ), '[]')
            WHERE tasks IS NULL OR tasks = '[]'`,
-        );
-        db.run("DROP TABLE IF EXISTS tasks");
+          );
+          db.run("DROP TABLE IF EXISTS tasks");
+        }
       }
-    }
 
-    // v7→v8: add `epics.depends_on_epics` (epic-level dependency ids, a JSON-TEXT
-    // array). Idempotent ADD COLUMN, NO backfill — the NOT NULL DEFAULT '[]'
-    // matches the zero-event projection (an epic with no deps), and the plan
-    // reducer fills it from EpicSnapshot blobs. Task-level `depends_on` needs no
-    // schema change: it lives inside the embedded `tasks` JSON array. A migrating
-    // v7 DB gains the column reading '[]'; a plan-file re-scan then repopulates
-    // real deps. Column def matches CREATE_EPICS.
-    addColumnIfMissing(
-      db,
-      "epics",
-      "depends_on_epics",
-      "TEXT NOT NULL DEFAULT '[]'",
-    );
+      // v7→v8: add `epics.depends_on_epics` (epic-level dependency ids, a JSON-TEXT
+      // array). Idempotent ADD COLUMN, NO backfill — the NOT NULL DEFAULT '[]'
+      // matches the zero-event projection (an epic with no deps), and the plan
+      // reducer fills it from EpicSnapshot blobs. Task-level `depends_on` needs no
+      // schema change: it lives inside the embedded `tasks` JSON array. A migrating
+      // v7 DB gains the column reading '[]'; a plan-file re-scan then repopulates
+      // real deps. Column def matches CREATE_EPICS.
+      addColumnIfMissing(
+        db,
+        "epics",
+        "depends_on_epics",
+        "TEXT NOT NULL DEFAULT '[]'",
+      );
 
-    // v8→v9: add `events.start_time` (process start instant scraped at the
-    // SessionStart hook by task 3 — opaque platform-tagged string) and
-    // `jobs.start_time` (projection of the seeded value, surfaced to consumers
-    // for the (pid, start_time) recycle-safe identity used by the seed sweep and
-    // exit-watcher). Both nullable, no backfill — ADD COLUMN leaves prior rows
-    // reading NULL, matching the zero-event projection (a row whose SessionStart
-    // pre-dated the schema bump simply never gains liveness coverage; the Q7
-    // legacy-row rule documented in the epic handles that). Column defs match
-    // CREATE_EVENTS / CREATE_JOBS.
-    addColumnIfMissing(db, "events", "start_time", "TEXT");
-    addColumnIfMissing(db, "jobs", "start_time", "TEXT");
+      // v8→v9: add `events.start_time` (process start instant scraped at the
+      // SessionStart hook by task 3 — opaque platform-tagged string) and
+      // `jobs.start_time` (projection of the seeded value, surfaced to consumers
+      // for the (pid, start_time) recycle-safe identity used by the seed sweep and
+      // exit-watcher). Both nullable, no backfill — ADD COLUMN leaves prior rows
+      // reading NULL, matching the zero-event projection (a row whose SessionStart
+      // pre-dated the schema bump simply never gains liveness coverage; the Q7
+      // legacy-row rule documented in the epic handles that). Column defs match
+      // CREATE_EVENTS / CREATE_JOBS.
+      addColumnIfMissing(db, "events", "start_time", "TEXT");
+      addColumnIfMissing(db, "jobs", "start_time", "TEXT");
 
-    // v9→v10: index slash-command + Skill-tool invocations and project the
-    // canonical `{plan,work,close}::<ref>` spawn-name verb/ref pair onto jobs
-    // rows so consumers can associate planctl invocations with sessions
-    // without JSON-scanning `events.data` blobs. Four new columns, three new
-    // partial indexes (`events.slash_command`, `events.skill_name`,
-    // `jobs.plan_ref`), plus a same-transaction backfill of every existing
-    // row via the SAME pure derivers the hook + reducer use (single source
-    // of truth — guarantees migrated rows byte-match steady-state ones).
-    //
-    // Column defs match CREATE_EVENTS / CREATE_JOBS literals so a fresh v10
-    // DB and a migrated v9→v10 DB converge to identical schema (the
-    // addColumnIfMissing/literal lockstep convention). The partial indexes
-    // are CREATE INDEX IF NOT EXISTS above; a fresh DB picks them up via
-    // CREATE_EVENTS_INDEXES/CREATE_JOBS_INDEXES, and a migrating DB picks
-    // them up on the same boot — both paths converge to the same index set.
-    addColumnIfMissing(db, "events", "slash_command", "TEXT");
-    addColumnIfMissing(db, "events", "skill_name", "TEXT");
-    addColumnIfMissing(db, "jobs", "plan_verb", "TEXT");
-    addColumnIfMissing(db, "jobs", "plan_ref", "TEXT");
-
-    // CREATE the v10 partial indexes AFTER the ADD COLUMNs they depend on.
-    // A fresh v10 DB enters this block too — the addColumnIfMissing calls
-    // above no-op (the columns already exist via CREATE_EVENTS/CREATE_JOBS
-    // literals), and these CREATE INDEX IF NOT EXISTS calls land the same
-    // index set on both a fresh-v10 and a migrating-v9 DB.
-    for (const sql of CREATE_V10_INDEXES) {
-      db.run(sql);
-    }
-
-    // Same-transaction JS-driven backfill. The slash-command anchored regex
-    // and the skill-name shape-defensive read aren't expressible in SQLite
-    // without REGEXP, so we walk events in JS and write derived columns
-    // back via UPDATEs in the same BEGIN IMMEDIATE — if any UPDATE throws
-    // the entire migration rolls back (ALTERs included), no half-state
-    // possible.
-    //
-    // Version-guarded: a non-idempotent backfill must run AT MOST once. The
-    // guard reads the meta row written by a PRIOR migrate() — on a fresh
-    // DB (or one that crashed before stamping v10) `storedVersion < 10`
-    // and the backfill runs; on a steady-state v10+ DB it skips, so a
-    // second `openDb` is a clean no-op.
-    const storedVersionV10 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV10 < 10) {
-      // Backfill events: walk every row whose hook_event is a candidate for
-      // either deriver (UserPromptSubmit → slash_command, Pre/PostToolUse
-      // → skill_name), parse the stored `data` JSON, run the same derivers
-      // the hook uses, write the two columns back. A row that doesn't match
-      // either gate stays NULL — the derivers' gates short-circuit cleanly.
+      // v9→v10: index slash-command + Skill-tool invocations and project the
+      // canonical `{plan,work,close}::<ref>` spawn-name verb/ref pair onto jobs
+      // rows so consumers can associate planctl invocations with sessions
+      // without JSON-scanning `events.data` blobs. Four new columns, three new
+      // partial indexes (`events.slash_command`, `events.skill_name`,
+      // `jobs.plan_ref`), plus a same-transaction backfill of every existing
+      // row via the SAME pure derivers the hook + reducer use (single source
+      // of truth — guarantees migrated rows byte-match steady-state ones).
       //
-      // The blob is parsed defensively (try/catch → null on malformed JSON):
-      // historical rows include some malformed blobs, and a throw here would
-      // wedge the migration. The derivers themselves never throw — every
-      // shape-mismatch path returns null.
+      // Column defs match CREATE_EVENTS / CREATE_JOBS literals so a fresh v10
+      // DB and a migrated v9→v10 DB converge to identical schema (the
+      // addColumnIfMissing/literal lockstep convention). The partial indexes
+      // are CREATE INDEX IF NOT EXISTS above; a fresh DB picks them up via
+      // CREATE_EVENTS_INDEXES/CREATE_JOBS_INDEXES, and a migrating DB picks
+      // them up on the same boot — both paths converge to the same index set.
+      addColumnIfMissing(db, "events", "slash_command", "TEXT");
+      addColumnIfMissing(db, "events", "skill_name", "TEXT");
+      addColumnIfMissing(db, "jobs", "plan_verb", "TEXT");
+      addColumnIfMissing(db, "jobs", "plan_ref", "TEXT");
+
+      // CREATE the v10 partial indexes AFTER the ADD COLUMNs they depend on.
+      // A fresh v10 DB enters this block too — the addColumnIfMissing calls
+      // above no-op (the columns already exist via CREATE_EVENTS/CREATE_JOBS
+      // literals), and these CREATE INDEX IF NOT EXISTS calls land the same
+      // index set on both a fresh-v10 and a migrating-v9 DB.
+      for (const sql of CREATE_V10_INDEXES) {
+        db.run(sql);
+      }
+
+      // Same-transaction JS-driven backfill. The slash-command anchored regex
+      // and the skill-name shape-defensive read aren't expressible in SQLite
+      // without REGEXP, so we walk events in JS and write derived columns
+      // back via UPDATEs in the same BEGIN IMMEDIATE — if any UPDATE throws
+      // the entire migration rolls back (ALTERs included), no half-state
+      // possible.
       //
-      // IMPORTANT: We use `db.run(sql, params)` (sqlite3_prepare_v3 + step +
-      // finalize each call — see Bun docs `Database.run`), NOT a cached
-      // `db.prepare(...).run()` or `db.query(...).run()`. A prepared
-      // statement compiled inside the same transaction as the ALTER it
-      // depends on can pin the pre-ALTER schema metadata (the open
-      // oven-sh/bun#1332 statement-cache gotcha called out in the epic's
-      // Risks section). `db.run` is the documented uncached path and
-      // sidesteps the pin completely. Backfill volume is bounded by the
-      // historical event count, run only ONCE per DB upgrade.
-      const rows = db
-        .prepare(
-          `SELECT id, hook_event, tool_name, data
+      // Version-guarded: a non-idempotent backfill must run AT MOST once. The
+      // guard reads the meta row written by a PRIOR migrate() — on a fresh
+      // DB (or one that crashed before stamping v10) `storedVersion < 10`
+      // and the backfill runs; on a steady-state v10+ DB it skips, so a
+      // second `openDb` is a clean no-op.
+      const storedVersionV10 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV10 < 10) {
+        // Backfill events: walk every row whose hook_event is a candidate for
+        // either deriver (UserPromptSubmit → slash_command, Pre/PostToolUse
+        // → skill_name), parse the stored `data` JSON, run the same derivers
+        // the hook uses, write the two columns back. A row that doesn't match
+        // either gate stays NULL — the derivers' gates short-circuit cleanly.
+        //
+        // The blob is parsed defensively (try/catch → null on malformed JSON):
+        // historical rows include some malformed blobs, and a throw here would
+        // wedge the migration. The derivers themselves never throw — every
+        // shape-mismatch path returns null.
+        //
+        // IMPORTANT: We use `db.run(sql, params)` (sqlite3_prepare_v3 + step +
+        // finalize each call — see Bun docs `Database.run`), NOT a cached
+        // `db.prepare(...).run()` or `db.query(...).run()`. A prepared
+        // statement compiled inside the same transaction as the ALTER it
+        // depends on can pin the pre-ALTER schema metadata (the open
+        // oven-sh/bun#1332 statement-cache gotcha called out in the epic's
+        // Risks section). `db.run` is the documented uncached path and
+        // sidesteps the pin completely. Backfill volume is bounded by the
+        // historical event count, run only ONCE per DB upgrade.
+        const rows = db
+          .prepare(
+            `SELECT id, hook_event, tool_name, data
              FROM events
             WHERE hook_event IN ('UserPromptSubmit', 'PreToolUse', 'PostToolUse')`,
-        )
-        .all() as {
-        id: number;
-        hook_event: string;
-        tool_name: string | null;
-        data: string;
-      }[];
-      for (const row of rows) {
-        let parsed: Record<string, unknown> | null = null;
-        try {
-          parsed = JSON.parse(row.data) as Record<string, unknown>;
-        } catch {
-          // malformed blob — skip derivation, columns stay NULL
-        }
-        let slashCommand: string | null = null;
-        let skillName: string | null = null;
-        if (parsed != null) {
-          if (row.hook_event === "UserPromptSubmit") {
-            slashCommand = slashCommandFromPrompt(parsed.prompt);
+          )
+          .all() as {
+          id: number;
+          hook_event: string;
+          tool_name: string | null;
+          data: string;
+        }[];
+        for (const row of rows) {
+          let parsed: Record<string, unknown> | null = null;
+          try {
+            parsed = JSON.parse(row.data) as Record<string, unknown>;
+          } catch {
+            // malformed blob — skip derivation, columns stay NULL
           }
-          skillName = extractSkillName(row.hook_event, row.tool_name, parsed);
+          let slashCommand: string | null = null;
+          let skillName: string | null = null;
+          if (parsed != null) {
+            if (row.hook_event === "UserPromptSubmit") {
+              slashCommand = slashCommandFromPrompt(parsed.prompt);
+            }
+            skillName = extractSkillName(row.hook_event, row.tool_name, parsed);
+          }
+          if (slashCommand != null || skillName != null) {
+            db.run(
+              "UPDATE events SET slash_command = ?, skill_name = ? WHERE id = ?",
+              [slashCommand, skillName, row.id],
+            );
+          }
         }
-        if (slashCommand != null || skillName != null) {
-          db.run(
-            "UPDATE events SET slash_command = ?, skill_name = ? WHERE id = ?",
-            [slashCommand, skillName, row.id],
-          );
-        }
-      }
 
-      // Backfill jobs: for every job, look up its SessionStart event and run
-      // the spawn-name parser. A job with no SessionStart row in the log
-      // (orphan / hook crash) stays both-NULL. A job whose SessionStart
-      // spawn_name doesn't match the strict whitelist also stays both-NULL.
-      //
-      // The SELECT picks the EARLIEST SessionStart by ts then id — matches
-      // the reducer's first-sight upsert path (a duplicate SessionStart on
-      // ON CONFLICT RESUME doesn't touch title/title_source/plan_verb/
-      // plan_ref, so the FIRST row's spawn_name is what determines the
-      // derived pair). The UPDATE uses the same uncached `db.run` path as
-      // the events backfill above.
-      const jobRows = db.prepare("SELECT job_id FROM jobs").all() as {
-        job_id: string;
-      }[];
-      for (const job of jobRows) {
-        const ev = db
-          .prepare(
-            `SELECT spawn_name
+        // Backfill jobs: for every job, look up its SessionStart event and run
+        // the spawn-name parser. A job with no SessionStart row in the log
+        // (orphan / hook crash) stays both-NULL. A job whose SessionStart
+        // spawn_name doesn't match the strict whitelist also stays both-NULL.
+        //
+        // The SELECT picks the EARLIEST SessionStart by ts then id — matches
+        // the reducer's first-sight upsert path (a duplicate SessionStart on
+        // ON CONFLICT RESUME doesn't touch title/title_source/plan_verb/
+        // plan_ref, so the FIRST row's spawn_name is what determines the
+        // derived pair). The UPDATE uses the same uncached `db.run` path as
+        // the events backfill above.
+        const jobRows = db.prepare("SELECT job_id FROM jobs").all() as {
+          job_id: string;
+        }[];
+        for (const job of jobRows) {
+          const ev = db
+            .prepare(
+              `SELECT spawn_name
                FROM events
               WHERE session_id = ? AND hook_event = 'SessionStart'
               ORDER BY ts ASC, id ASC
               LIMIT 1`,
-          )
-          .get(job.job_id) as { spawn_name: string | null } | null;
-        const { plan_verb, plan_ref } = planVerbRefFromSpawnName(
-          ev?.spawn_name ?? null,
-        );
-        if (plan_verb != null && plan_ref != null) {
-          db.run(
-            "UPDATE jobs SET plan_verb = ?, plan_ref = ? WHERE job_id = ?",
-            [plan_verb, plan_ref, job.job_id],
+            )
+            .get(job.job_id) as { spawn_name: string | null } | null;
+          const { plan_verb, plan_ref } = planVerbRefFromSpawnName(
+            ev?.spawn_name ?? null,
           );
+          if (plan_verb != null && plan_ref != null) {
+            db.run(
+              "UPDATE jobs SET plan_verb = ?, plan_ref = ? WHERE job_id = ?",
+              [plan_verb, plan_ref, job.job_id],
+            );
+          }
         }
       }
-    }
 
-    // v10→v11: embed jobs into the `epics` projection. `epic.jobs` carries
-    // plan/close-verb jobs (`plan_ref == epic_id`); each task element inside
-    // `epic.tasks` carries its own `jobs` sub-array for work-verb jobs
-    // (`plan_ref == task_id`). The reducer fans every `plan_ref`-bearing jobs
-    // write into the correct array via `syncJobIntoEpic` (see
-    // `src/reducer.ts`). Stored as JSON-TEXT; decoded at the read boundary.
-    //
-    // Column defs match CREATE_EPICS so a fresh v11 DB and a migrated v10→v11
-    // DB converge to identical schema (the addColumnIfMissing/literal lockstep
-    // convention). Idempotent ADD COLUMN — `addColumnIfMissing` reads PRAGMA
-    // table_info and no-ops when the column exists.
-    addColumnIfMissing(db, "epics", "jobs", "TEXT NOT NULL DEFAULT '[]'");
+      // v10→v11: embed jobs into the `epics` projection. `epic.jobs` carries
+      // plan/close-verb jobs (`plan_ref == epic_id`); each task element inside
+      // `epic.tasks` carries its own `jobs` sub-array for work-verb jobs
+      // (`plan_ref == task_id`). The reducer fans every `plan_ref`-bearing jobs
+      // write into the correct array via `syncJobIntoEpic` (see
+      // `src/reducer.ts`). Stored as JSON-TEXT; decoded at the read boundary.
+      //
+      // Column defs match CREATE_EPICS so a fresh v11 DB and a migrated v10→v11
+      // DB converge to identical schema (the addColumnIfMissing/literal lockstep
+      // convention). Idempotent ADD COLUMN — `addColumnIfMissing` reads PRAGMA
+      // table_info and no-ops when the column exists.
+      addColumnIfMissing(db, "epics", "jobs", "TEXT NOT NULL DEFAULT '[]'");
 
-    // Version-guarded REWIND-AND-REDRAIN: rather than backfill the new
-    // embedded `jobs` arrays directly, we set the cursor back to 0 and
-    // `DELETE FROM jobs` / `DELETE FROM epics`. The boot drain (which runs
-    // unconditionally after `migrate()` returns) then replays the entire
-    // event log through the new v11 reducer — the SINGLE source of truth for
-    // the embedded-jobs composition. A migrated row equals a re-folded one
-    // byte-for-byte; no migration-specific composition logic to drift from
-    // the steady-state reducer.
-    //
-    // Non-idempotent: must run AT MOST once per DB. The guard reads the
-    // version stamped by a prior migrate() — on a fresh v11+ DB it skips
-    // cleanly, so a second `openDb` is a no-op. Cost: re-folding the entire
-    // event log inside the BEGIN IMMEDIATE — bounded by `events` row count,
-    // seconds to tens of seconds on a developer machine. One-time.
-    const storedVersionV11 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV11 < 11) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-    }
+      // Version-guarded REWIND-AND-REDRAIN: rather than backfill the new
+      // embedded `jobs` arrays directly, we set the cursor back to 0 and
+      // `DELETE FROM jobs` / `DELETE FROM epics`. The boot drain (which runs
+      // unconditionally after `migrate()` returns) then replays the entire
+      // event log through the new v11 reducer — the SINGLE source of truth for
+      // the embedded-jobs composition. A migrated row equals a re-folded one
+      // byte-for-byte; no migration-specific composition logic to drift from
+      // the steady-state reducer.
+      //
+      // Non-idempotent: must run AT MOST once per DB. The guard reads the
+      // version stamped by a prior migrate() — on a fresh v11+ DB it skips
+      // cleanly, so a second `openDb` is a no-op. Cost: re-folding the entire
+      // event log inside the BEGIN IMMEDIATE — bounded by `events` row count,
+      // seconds to tens of seconds on a developer machine. One-time.
+      const storedVersionV11 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV11 < 11) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+      }
 
-    // v11→v12: HISTORICAL ONLY. v12 added the `approvals` sidecar table — v13
-    // (below) drops it, so a fresh-v13 DB never creates it and a v11/v12 DB
-    // gets it dropped via the v12→v13 step. The DROP TABLE IF EXISTS is
-    // idempotent, so even a v11 DB skipping directly to v13 converges
-    // cleanly.
+      // v11→v12: HISTORICAL ONLY. v12 added the `approvals` sidecar table — v13
+      // (below) drops it, so a fresh-v13 DB never creates it and a v11/v12 DB
+      // gets it dropped via the v12→v13 step. The DROP TABLE IF EXISTS is
+      // idempotent, so even a v11 DB skipping directly to v13 converges
+      // cleanly.
 
-    // v12→v13: planctl-native approval. Two halves:
-    //   1) SQL: add `epics.approval` (NOT NULL DEFAULT 'pending'), drop the
-    //      schema-v12 `approvals` sidecar table.
-    //   2) Filesystem: backfill `approval: "approved"` to every existing
-    //      epic plan file that lacks the field, then overlay each existing
-    //      approvals-table row onto the matching epic/task file. The
-    //      filesystem half lives in `runPlanctlApprovalMigration` (called by
-    //      the daemon AFTER `openDb` returns) because the hook process opens
-    //      a writer connection per invocation and must NOT pay FS migration
-    //      cost. Daemon boot order: `openDb` (this SQL block runs, idempotent
-    //      ADD COLUMN + DROP TABLE) → `runPlanctlApprovalMigration` (the FS
-    //      half, also idempotent) → workers spawn.
-    //
-    // The SQL ADD COLUMN is idempotent (no-op when present); the DROP TABLE
-    // IF EXISTS is idempotent (no-op when absent). `NOT NULL DEFAULT
-    // 'pending'` matches CREATE_EPICS so a fresh v13 DB and a migrated v12→v13
-    // DB converge to identical schema. Existing rows backfill to `'pending'`;
-    // the plan-worker emits `'pending'` for any file whose `approval` field is
-    // missing, so a re-fold of an existing event log reproduces the same
-    // reading (re-fold determinism preserved).
-    addColumnIfMissing(
-      db,
-      "epics",
-      "approval",
-      "TEXT NOT NULL DEFAULT 'pending'",
-    );
+      // v12→v13: planctl-native approval. Two halves:
+      //   1) SQL: add `epics.approval` (NOT NULL DEFAULT 'pending'), drop the
+      //      schema-v12 `approvals` sidecar table.
+      //   2) Filesystem: backfill `approval: "approved"` to every existing
+      //      epic plan file that lacks the field, then overlay each existing
+      //      approvals-table row onto the matching epic/task file. The
+      //      filesystem half lives in `runPlanctlApprovalMigration` (called by
+      //      the daemon AFTER `openDb` returns) because the hook process opens
+      //      a writer connection per invocation and must NOT pay FS migration
+      //      cost. Daemon boot order: `openDb` (this SQL block runs, idempotent
+      //      ADD COLUMN + DROP TABLE) → `runPlanctlApprovalMigration` (the FS
+      //      half, also idempotent) → workers spawn.
+      //
+      // The SQL ADD COLUMN is idempotent (no-op when present); the DROP TABLE
+      // IF EXISTS is idempotent (no-op when absent). `NOT NULL DEFAULT
+      // 'pending'` matches CREATE_EPICS so a fresh v13 DB and a migrated v12→v13
+      // DB converge to identical schema. Existing rows backfill to `'pending'`;
+      // the plan-worker emits `'pending'` for any file whose `approval` field is
+      // missing, so a re-fold of an existing event log reproduces the same
+      // reading (re-fold determinism preserved).
+      addColumnIfMissing(
+        db,
+        "epics",
+        "approval",
+        "TEXT NOT NULL DEFAULT 'pending'",
+      );
 
-    // Snapshot the v12 `approvals` rows into a connection-scoped TEMP table
-    // BEFORE the DROP fires. The FS half (`runPlanctlApprovalMigration`,
-    // called by the daemon after `openDb` returns) needs to overlay those
-    // rows onto the matching epic/task plan files — but it runs OUTSIDE this
-    // transaction, after the DROP has already executed. Reading from the
-    // real `approvals` table from inside the FS pass therefore sees nothing,
-    // which silently dropped the overlay in prior boots (the bug this task
-    // fixes).
-    //
-    // TEMP tables in sqlite are connection-scoped: they live for the
-    // lifetime of THIS `db` handle and are invisible to every other
-    // connection. Creating one inside this `BEGIN IMMEDIATE` keeps the
-    // schema-migration atomicity invariant — if the transaction rolls back,
-    // the TEMP table goes with it and the DROP never landed either, so a
-    // retry re-snapshots from a still-present `approvals`. Idempotent on
-    // re-run: a fresh-v13 boot has no `approvals` (the table-exists guard
-    // skips the INSERT) and no rows to snapshot, so the FS pass overlays
-    // nothing — exactly the desired no-op.
-    //
-    // We always CREATE the TEMP table (even when `approvals` is absent) so
-    // the FS pass has a stable schema to read from; an empty table is a
-    // clean no-op. `DROP TABLE IF EXISTS` clears any leftover from a prior
-    // `migrate()` call on the same connection (e.g. tests that reopen).
-    db.run("DROP TABLE IF EXISTS temp._v13_overlay_pending");
-    db.run(`
+      // Snapshot the v12 `approvals` rows into a connection-scoped TEMP table
+      // BEFORE the DROP fires. The FS half (`runPlanctlApprovalMigration`,
+      // called by the daemon after `openDb` returns) needs to overlay those
+      // rows onto the matching epic/task plan files — but it runs OUTSIDE this
+      // transaction, after the DROP has already executed. Reading from the
+      // real `approvals` table from inside the FS pass therefore sees nothing,
+      // which silently dropped the overlay in prior boots (the bug this task
+      // fixes).
+      //
+      // TEMP tables in sqlite are connection-scoped: they live for the
+      // lifetime of THIS `db` handle and are invisible to every other
+      // connection. Creating one inside this `BEGIN IMMEDIATE` keeps the
+      // schema-migration atomicity invariant — if the transaction rolls back,
+      // the TEMP table goes with it and the DROP never landed either, so a
+      // retry re-snapshots from a still-present `approvals`. Idempotent on
+      // re-run: a fresh-v13 boot has no `approvals` (the table-exists guard
+      // skips the INSERT) and no rows to snapshot, so the FS pass overlays
+      // nothing — exactly the desired no-op.
+      //
+      // We always CREATE the TEMP table (even when `approvals` is absent) so
+      // the FS pass has a stable schema to read from; an empty table is a
+      // clean no-op. `DROP TABLE IF EXISTS` clears any leftover from a prior
+      // `migrate()` call on the same connection (e.g. tests that reopen).
+      db.run("DROP TABLE IF EXISTS temp._v13_overlay_pending");
+      db.run(`
       CREATE TEMP TABLE _v13_overlay_pending (
         epic_id TEXT NOT NULL,
         task_key TEXT NOT NULL,
         status TEXT NOT NULL
       )
     `);
-    const approvalsTableExists =
-      db
-        .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
-        )
-        .get() != null;
-    if (approvalsTableExists) {
-      db.run(
-        "INSERT INTO _v13_overlay_pending (epic_id, task_key, status) SELECT epic_id, task_key, status FROM approvals",
-      );
-    }
-
-    // DROP TABLE while readers live needs the EXCLUSIVE lock the surrounding
-    // `BEGIN IMMEDIATE` already holds. `IF EXISTS` keeps the step a no-op on
-    // a fresh-v13 DB (table never created) and on any re-run after a prior
-    // boot already dropped it. We use uncached `db.run` to sidestep the
-    // bun:sqlite statement-cache pin documented on the v9→v10 backfill above
-    // — a cached `db.prepare` compiled inside the same transaction as a DDL
-    // can pin the pre-DDL schema metadata (oven-sh/bun#1332).
-    db.run("DROP TABLE IF EXISTS approvals");
-
-    // v13→v14: index the per-session planctl-CLI invocation footprint and
-    // project per-job `epic_links` + per-epic `job_links` arrays so consumers
-    // can surface creator/refiner cross-references without re-running the
-    // classifier on every read. Seven new columns + one partial composite
-    // index, plus a same-transaction JS-driven backfill of every existing
-    // event + per-session/per-epic projection re-derive via the SAME pure
-    // classifier the live reducer fan-out (task .5) will use.
-    //
-    // Column defs match CREATE_EVENTS / CREATE_JOBS / CREATE_EPICS literals
-    // so a fresh v14 DB and a migrated v13→v14 DB converge to identical
-    // schema (the addColumnIfMissing/literal lockstep convention). The
-    // partial index lives in CREATE_V14_INDEXES; a fresh DB picks it up via
-    // the same block, and a migrating DB picks it up on the same boot —
-    // both paths converge to the same index set.
-    addColumnIfMissing(db, "events", "planctl_op", "TEXT");
-    addColumnIfMissing(db, "events", "planctl_target", "TEXT");
-    addColumnIfMissing(db, "events", "planctl_epic_id", "TEXT");
-    addColumnIfMissing(db, "events", "planctl_task_id", "TEXT");
-    addColumnIfMissing(db, "events", "planctl_subject_present", "INTEGER");
-    addColumnIfMissing(db, "jobs", "epic_links", "TEXT NOT NULL DEFAULT '[]'");
-    addColumnIfMissing(db, "epics", "job_links", "TEXT NOT NULL DEFAULT '[]'");
-
-    // CREATE the v14 partial index AFTER the ADD COLUMNs it depends on.
-    // A fresh v14 DB enters this block too — the addColumnIfMissing calls
-    // above no-op (the columns already exist via the CREATE_* literals) and
-    // these CREATE INDEX IF NOT EXISTS calls land the same index set on both
-    // a fresh-v14 and a migrating-v13 DB.
-    for (const sql of CREATE_V14_INDEXES) {
-      db.run(sql);
-    }
-
-    // Same-transaction JS-driven backfill. The Bash-command parser + the
-    // classifier's per-session windowing aren't expressible in SQLite without
-    // REGEXP and JSON arithmetic — we walk events in JS and write derived
-    // columns back via UPDATEs in the same BEGIN IMMEDIATE. Mirrors the
-    // v9→v10 backfill (db.ts:600-708) in shape: an `IS NULL` WHERE clause
-    // guards against re-touching already-backfilled rows on partial-run
-    // resume, the uncached `db.run` path sidesteps the bun:sqlite
-    // statement-cache pin (oven-sh/bun#1332), and a throw rolls the whole
-    // migration back (ALTERs included).
-    //
-    // Version-guarded: a non-idempotent projection re-derive must run AT
-    // MOST once. The guard reads the meta row written by a PRIOR migrate() —
-    // on a fresh v14 DB (or one that crashed before stamping v14)
-    // `storedVersionV14 < 14` and the backfill runs; on a steady-state v14+
-    // DB it skips, so a second `openDb` is a clean no-op. (The `planctl_*`
-    // events-side stamps are independently idempotent via the `WHERE
-    // planctl_op IS NULL` filter, so a partial-run resume is safe even
-    // without the version guard. The projection re-derive needs the guard
-    // because a re-run would have to re-walk every session.)
-    const storedVersionV14 = Number(
-      (
+      const approvalsTableExists =
         db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV14 < 14) {
-      // Pass 1 — stamp planctl_* columns on every un-backfilled
-      // PreToolUse:Bash event. The WHERE filter picks up only rows we
-      // haven't touched yet, so partial-run resume on a crash mid-backfill
-      // is safe (a row that already has `planctl_op` set is skipped).
-      // The deriver returns `null` for any non-planctl Bash command —
-      // we leave columns NULL on miss so the partial-index `WHERE
-      // planctl_op IS NOT NULL` predicate stays selective.
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
+          )
+          .get() != null;
+      if (approvalsTableExists) {
+        db.run(
+          "INSERT INTO _v13_overlay_pending (epic_id, task_key, status) SELECT epic_id, task_key, status FROM approvals",
+        );
+      }
+
+      // DROP TABLE while readers live needs the EXCLUSIVE lock the surrounding
+      // `BEGIN IMMEDIATE` already holds. `IF EXISTS` keeps the step a no-op on
+      // a fresh-v13 DB (table never created) and on any re-run after a prior
+      // boot already dropped it. We use uncached `db.run` to sidestep the
+      // bun:sqlite statement-cache pin documented on the v9→v10 backfill above
+      // — a cached `db.prepare` compiled inside the same transaction as a DDL
+      // can pin the pre-DDL schema metadata (oven-sh/bun#1332).
+      db.run("DROP TABLE IF EXISTS approvals");
+
+      // v13→v14: index the per-session planctl-CLI invocation footprint and
+      // project per-job `epic_links` + per-epic `job_links` arrays so consumers
+      // can surface creator/refiner cross-references without re-running the
+      // classifier on every read. Seven new columns + one partial composite
+      // index, plus a same-transaction JS-driven backfill of every existing
+      // event + per-session/per-epic projection re-derive via the SAME pure
+      // classifier the live reducer fan-out (task .5) will use.
       //
-      // LEGACY (fn-606 task .1 + .2): as of the v19→v20 step below, the
-      // live `extractPlanctlInvocation` deriver gates on
-      // `PostToolUse:Bash` (parsing the authoritative `planctl_invocation`
-      // envelope from `data.tool_response.stdout`), not PreToolUse:Bash
-      // — so this Pass 1 now stamps zero rows on a fresh chain run (the
-      // gate mismatch is intentional: the v20 block re-stamps from
-      // PostToolUse:Bash and supersedes whatever this would have done
-      // anyway). Kept in place because removing it would break the
-      // version-guarded re-fold contract on already-migrated v14+ DBs.
-      const bashRows = db
-        .prepare(
-          `SELECT id, hook_event, tool_name, data
+      // Column defs match CREATE_EVENTS / CREATE_JOBS / CREATE_EPICS literals
+      // so a fresh v14 DB and a migrated v13→v14 DB converge to identical
+      // schema (the addColumnIfMissing/literal lockstep convention). The
+      // partial index lives in CREATE_V14_INDEXES; a fresh DB picks it up via
+      // the same block, and a migrating DB picks it up on the same boot —
+      // both paths converge to the same index set.
+      addColumnIfMissing(db, "events", "planctl_op", "TEXT");
+      addColumnIfMissing(db, "events", "planctl_target", "TEXT");
+      addColumnIfMissing(db, "events", "planctl_epic_id", "TEXT");
+      addColumnIfMissing(db, "events", "planctl_task_id", "TEXT");
+      addColumnIfMissing(db, "events", "planctl_subject_present", "INTEGER");
+      addColumnIfMissing(
+        db,
+        "jobs",
+        "epic_links",
+        "TEXT NOT NULL DEFAULT '[]'",
+      );
+      addColumnIfMissing(
+        db,
+        "epics",
+        "job_links",
+        "TEXT NOT NULL DEFAULT '[]'",
+      );
+
+      // CREATE the v14 partial index AFTER the ADD COLUMNs it depends on.
+      // A fresh v14 DB enters this block too — the addColumnIfMissing calls
+      // above no-op (the columns already exist via the CREATE_* literals) and
+      // these CREATE INDEX IF NOT EXISTS calls land the same index set on both
+      // a fresh-v14 and a migrating-v13 DB.
+      for (const sql of CREATE_V14_INDEXES) {
+        db.run(sql);
+      }
+
+      // Same-transaction JS-driven backfill. The Bash-command parser + the
+      // classifier's per-session windowing aren't expressible in SQLite without
+      // REGEXP and JSON arithmetic — we walk events in JS and write derived
+      // columns back via UPDATEs in the same BEGIN IMMEDIATE. Mirrors the
+      // v9→v10 backfill (db.ts:600-708) in shape: an `IS NULL` WHERE clause
+      // guards against re-touching already-backfilled rows on partial-run
+      // resume, the uncached `db.run` path sidesteps the bun:sqlite
+      // statement-cache pin (oven-sh/bun#1332), and a throw rolls the whole
+      // migration back (ALTERs included).
+      //
+      // Version-guarded: a non-idempotent projection re-derive must run AT
+      // MOST once. The guard reads the meta row written by a PRIOR migrate() —
+      // on a fresh v14 DB (or one that crashed before stamping v14)
+      // `storedVersionV14 < 14` and the backfill runs; on a steady-state v14+
+      // DB it skips, so a second `openDb` is a clean no-op. (The `planctl_*`
+      // events-side stamps are independently idempotent via the `WHERE
+      // planctl_op IS NULL` filter, so a partial-run resume is safe even
+      // without the version guard. The projection re-derive needs the guard
+      // because a re-run would have to re-walk every session.)
+      const storedVersionV14 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV14 < 14) {
+        // Pass 1 — stamp planctl_* columns on every un-backfilled
+        // PreToolUse:Bash event. The WHERE filter picks up only rows we
+        // haven't touched yet, so partial-run resume on a crash mid-backfill
+        // is safe (a row that already has `planctl_op` set is skipped).
+        // The deriver returns `null` for any non-planctl Bash command —
+        // we leave columns NULL on miss so the partial-index `WHERE
+        // planctl_op IS NOT NULL` predicate stays selective.
+        //
+        // LEGACY (fn-606 task .1 + .2): as of the v19→v20 step below, the
+        // live `extractPlanctlInvocation` deriver gates on
+        // `PostToolUse:Bash` (parsing the authoritative `planctl_invocation`
+        // envelope from `data.tool_response.stdout`), not PreToolUse:Bash
+        // — so this Pass 1 now stamps zero rows on a fresh chain run (the
+        // gate mismatch is intentional: the v20 block re-stamps from
+        // PostToolUse:Bash and supersedes whatever this would have done
+        // anyway). Kept in place because removing it would break the
+        // version-guarded re-fold contract on already-migrated v14+ DBs.
+        const bashRows = db
+          .prepare(
+            `SELECT id, hook_event, tool_name, data
              FROM events
             WHERE hook_event = 'PreToolUse' AND tool_name = 'Bash'
               AND planctl_op IS NULL`,
-        )
-        .all() as {
-        id: number;
-        hook_event: string;
-        tool_name: string | null;
-        data: string;
-      }[];
-      for (const row of bashRows) {
-        let parsed: Record<string, unknown> | null = null;
-        try {
-          parsed = JSON.parse(row.data) as Record<string, unknown>;
-        } catch {
-          // malformed blob — skip derivation, columns stay NULL.
-        }
-        if (parsed == null) {
-          continue;
-        }
-        const inv = extractPlanctlInvocation(
-          row.hook_event,
-          row.tool_name,
-          parsed,
-        );
-        if (inv == null) {
-          continue;
-        }
-        db.run(
-          `UPDATE events SET
+          )
+          .all() as {
+          id: number;
+          hook_event: string;
+          tool_name: string | null;
+          data: string;
+        }[];
+        for (const row of bashRows) {
+          let parsed: Record<string, unknown> | null = null;
+          try {
+            parsed = JSON.parse(row.data) as Record<string, unknown>;
+          } catch {
+            // malformed blob — skip derivation, columns stay NULL.
+          }
+          if (parsed == null) {
+            continue;
+          }
+          const inv = extractPlanctlInvocation(
+            row.hook_event,
+            row.tool_name,
+            parsed,
+          );
+          if (inv == null) {
+            continue;
+          }
+          db.run(
+            `UPDATE events SET
              planctl_op = ?,
              planctl_target = ?,
              planctl_epic_id = ?,
              planctl_task_id = ?,
              planctl_subject_present = ?
            WHERE id = ?`,
-          [
-            inv.op,
-            inv.target,
-            inv.epic_id,
-            inv.task_id,
-            inv.subject_present ? 1 : 0,
-            row.id,
-          ],
-        );
-      }
+            [
+              inv.op,
+              inv.target,
+              inv.epic_id,
+              inv.task_id,
+              inv.subject_present ? 1 : 0,
+              row.id,
+            ],
+          );
+        }
 
-      // Pass 2 — per-session projection re-derive. For every session_id
-      // that has at least one stamped `planctl_op != NULL` event, compute
-      // its `/plan:plan` windows from `PreToolUse:Skill AND
-      // skill_name='plan:plan'` rows (the locked window-opener gate —
-      // see plan-classifier.ts), run `deriveEpicLinks`, and UPDATE
-      // `jobs.epic_links`. Then for each touched epic id, gather all
-      // sessions+windows touching that epic and run `deriveJobLinks`,
-      // UPDATEing `epics.job_links` (shell-insert the epic row if it
-      // doesn't exist — mirrors the syncJobIntoEpic shell-insert
-      // pattern in `src/reducer.ts`, so a re-fold from scratch
-      // reproduces every projection row).
-      //
-      // The output is byte-identical to what the live reducer fan-out
-      // (task .5 — `syncPlanctlLinks`) will produce on steady-state
-      // writes because both paths feed the SAME pure classifier
-      // functions in `src/plan-classifier.ts`.
-      const sessionRows = db
-        .prepare(
-          `SELECT DISTINCT session_id
+        // Pass 2 — per-session projection re-derive. For every session_id
+        // that has at least one stamped `planctl_op != NULL` event, compute
+        // its `/plan:plan` windows from `PreToolUse:Skill AND
+        // skill_name='plan:plan'` rows (the locked window-opener gate —
+        // see plan-classifier.ts), run `deriveEpicLinks`, and UPDATE
+        // `jobs.epic_links`. Then for each touched epic id, gather all
+        // sessions+windows touching that epic and run `deriveJobLinks`,
+        // UPDATEing `epics.job_links` (shell-insert the epic row if it
+        // doesn't exist — mirrors the syncJobIntoEpic shell-insert
+        // pattern in `src/reducer.ts`, so a re-fold from scratch
+        // reproduces every projection row).
+        //
+        // The output is byte-identical to what the live reducer fan-out
+        // (task .5 — `syncPlanctlLinks`) will produce on steady-state
+        // writes because both paths feed the SAME pure classifier
+        // functions in `src/plan-classifier.ts`.
+        const sessionRows = db
+          .prepare(
+            `SELECT DISTINCT session_id
              FROM events
             WHERE planctl_op IS NOT NULL`,
-        )
-        .all() as { session_id: string }[];
+          )
+          .all() as { session_id: string }[];
 
-      // Build a map of {session_id → ClassifierInvocation[]} and
-      // {session_id → opener-ts[]} once. The classifier needs both shapes
-      // to produce jobs.epic_links; for epics.job_links we additionally
-      // need the per-session aggregates.
-      const invocationsBySession = new Map<string, ClassifierInvocation[]>();
-      const openerTimestampsBySession = new Map<string, number[]>();
+        // Build a map of {session_id → ClassifierInvocation[]} and
+        // {session_id → opener-ts[]} once. The classifier needs both shapes
+        // to produce jobs.epic_links; for epics.job_links we additionally
+        // need the per-session aggregates.
+        const invocationsBySession = new Map<string, ClassifierInvocation[]>();
+        const openerTimestampsBySession = new Map<string, number[]>();
 
-      for (const { session_id } of sessionRows) {
-        // Load all planctl invocation rows for this session, ASC by id.
-        const invRows = db
-          .prepare(
-            `SELECT id, ts, planctl_op, planctl_target, planctl_epic_id,
+        for (const { session_id } of sessionRows) {
+          // Load all planctl invocation rows for this session, ASC by id.
+          const invRows = db
+            .prepare(
+              `SELECT id, ts, planctl_op, planctl_target, planctl_epic_id,
                     planctl_task_id, planctl_subject_present
                FROM events
               WHERE session_id = ? AND planctl_op IS NOT NULL
               ORDER BY id ASC`,
-          )
-          .all(session_id) as {
-          id: number;
-          ts: number;
-          planctl_op: string;
-          planctl_target: string | null;
-          planctl_epic_id: string | null;
-          planctl_task_id: string | null;
-          planctl_subject_present: number | null;
-        }[];
-        const invocations: ClassifierInvocation[] = invRows.map((r) => ({
-          ts: r.ts,
-          op: normalizePlanctlOp(r.planctl_op),
-          target: r.planctl_target,
-          epic_id: r.planctl_epic_id,
-          subject_present: r.planctl_subject_present === 1,
-        }));
-        invocationsBySession.set(session_id, invocations);
+            )
+            .all(session_id) as {
+            id: number;
+            ts: number;
+            planctl_op: string;
+            planctl_target: string | null;
+            planctl_epic_id: string | null;
+            planctl_task_id: string | null;
+            planctl_subject_present: number | null;
+          }[];
+          const invocations: ClassifierInvocation[] = invRows.map((r) => ({
+            ts: r.ts,
+            op: normalizePlanctlOp(r.planctl_op),
+            target: r.planctl_target,
+            epic_id: r.planctl_epic_id,
+            subject_present: r.planctl_subject_present === 1,
+          }));
+          invocationsBySession.set(session_id, invocations);
 
-        // Load `/plan:plan` window opener timestamps for this session.
-        // Locked gate: PreToolUse:Skill AND skill_name='plan:plan' only —
-        // slash_command='/plan:plan' UserPromptSubmit rows are NOT
-        // openers (they'd double-fire on slash-typed invocations).
-        const openerRows = db
-          .prepare(
-            `SELECT ts
+          // Load `/plan:plan` window opener timestamps for this session.
+          // Locked gate: PreToolUse:Skill AND skill_name='plan:plan' only —
+          // slash_command='/plan:plan' UserPromptSubmit rows are NOT
+          // openers (they'd double-fire on slash-typed invocations).
+          const openerRows = db
+            .prepare(
+              `SELECT ts
                FROM events
               WHERE session_id = ?
                 AND hook_event = 'PreToolUse'
                 AND skill_name = 'plan:plan'
               ORDER BY id ASC`,
-          )
-          .all(session_id) as { ts: number }[];
-        openerTimestampsBySession.set(
-          session_id,
-          openerRows.map((r) => r.ts),
-        );
-      }
+            )
+            .all(session_id) as { ts: number }[];
+          openerTimestampsBySession.set(
+            session_id,
+            openerRows.map((r) => r.ts),
+          );
+        }
 
-      // Pass 2a — compute and write `jobs.epic_links` per session. Also
-      // collect every (epic_id) that appears in any session's
-      // epic_links so pass 2b knows which epics need a job_links
-      // re-derive.
-      const windowsBySession = new Map<string, PlanWindow[]>();
-      const touchedEpicIds = new Set<string>();
-      for (const session_id of invocationsBySession.keys()) {
-        const opens = openerTimestampsBySession.get(session_id) ?? [];
-        const windows = computePlanWindows(opens);
-        windowsBySession.set(session_id, windows);
-        const invocations = invocationsBySession.get(session_id) ?? [];
-        const epicLinks = deriveEpicLinks(invocations, windows);
-        const epicLinksJson = JSON.stringify(epicLinks);
-        // Find the latest event id + ts for this session to stamp the
-        // jobs row's `last_event_id` + `updated_at`. Mirrors how a live
-        // reducer fan-out would attach the bump to its triggering event.
-        const latest = db
-          .prepare(
-            `SELECT id, ts
+        // Pass 2a — compute and write `jobs.epic_links` per session. Also
+        // collect every (epic_id) that appears in any session's
+        // epic_links so pass 2b knows which epics need a job_links
+        // re-derive.
+        const windowsBySession = new Map<string, PlanWindow[]>();
+        const touchedEpicIds = new Set<string>();
+        for (const session_id of invocationsBySession.keys()) {
+          const opens = openerTimestampsBySession.get(session_id) ?? [];
+          const windows = computePlanWindows(opens);
+          windowsBySession.set(session_id, windows);
+          const invocations = invocationsBySession.get(session_id) ?? [];
+          const epicLinks = deriveEpicLinks(invocations, windows);
+          const epicLinksJson = JSON.stringify(epicLinks);
+          // Find the latest event id + ts for this session to stamp the
+          // jobs row's `last_event_id` + `updated_at`. Mirrors how a live
+          // reducer fan-out would attach the bump to its triggering event.
+          const latest = db
+            .prepare(
+              `SELECT id, ts
                FROM events
               WHERE session_id = ? AND planctl_op IS NOT NULL
               ORDER BY id DESC
               LIMIT 1`,
-          )
-          .get(session_id) as { id: number; ts: number } | null;
-        if (latest == null) {
-          continue;
-        }
-        // UPDATE the jobs row if it exists. We do NOT shell-insert a
-        // missing jobs row: a session_id with planctl events but no
-        // backing jobs row is an orphan (no SessionStart), and the
-        // reducer's invariant is that jobs rows are created only by
-        // SessionStart. Mirrors the v9→v10 backfill's behavior.
-        db.run(
-          `UPDATE jobs SET epic_links = ?, last_event_id = ?, updated_at = ?
+            )
+            .get(session_id) as { id: number; ts: number } | null;
+          if (latest == null) {
+            continue;
+          }
+          // UPDATE the jobs row if it exists. We do NOT shell-insert a
+          // missing jobs row: a session_id with planctl events but no
+          // backing jobs row is an orphan (no SessionStart), and the
+          // reducer's invariant is that jobs rows are created only by
+          // SessionStart. Mirrors the v9→v10 backfill's behavior.
+          db.run(
+            `UPDATE jobs SET epic_links = ?, last_event_id = ?, updated_at = ?
             WHERE job_id = ?`,
-          [epicLinksJson, latest.id, latest.ts, session_id],
-        );
-        for (const link of epicLinks) {
-          touchedEpicIds.add(link.target);
+            [epicLinksJson, latest.id, latest.ts, session_id],
+          );
+          for (const link of epicLinks) {
+            touchedEpicIds.add(link.target);
+          }
         }
-      }
 
-      // Pass 2b — compute and write `epics.job_links` per epic. For each
-      // touched epic, run `deriveJobLinks` over the per-session
-      // invocations+windows maps (Read-Only Maps). Shell-insert the epic
-      // row if missing so a re-fold from scratch reproduces every
-      // projection row.
-      for (const epicId of touchedEpicIds) {
-        const jobLinks = deriveJobLinks(
-          invocationsBySession,
-          windowsBySession,
-          epicId,
-        );
-        const jobLinksJson = JSON.stringify(jobLinks);
-        // Latest stamp across all sessions touching this epic.
-        const latest = db
-          .prepare(
-            `SELECT MAX(id) AS id, MAX(ts) AS ts
+        // Pass 2b — compute and write `epics.job_links` per epic. For each
+        // touched epic, run `deriveJobLinks` over the per-session
+        // invocations+windows maps (Read-Only Maps). Shell-insert the epic
+        // row if missing so a re-fold from scratch reproduces every
+        // projection row.
+        for (const epicId of touchedEpicIds) {
+          const jobLinks = deriveJobLinks(
+            invocationsBySession,
+            windowsBySession,
+            epicId,
+          );
+          const jobLinksJson = JSON.stringify(jobLinks);
+          // Latest stamp across all sessions touching this epic.
+          const latest = db
+            .prepare(
+              `SELECT MAX(id) AS id, MAX(ts) AS ts
                FROM events
               WHERE planctl_op IS NOT NULL
                 AND (planctl_epic_id = ? OR planctl_target = ?)`,
-          )
-          .get(epicId, epicId) as { id: number | null; ts: number | null };
-        const stampId = latest.id ?? 0;
-        const stampTs = latest.ts ?? 0;
-        const existing = db
-          .prepare("SELECT epic_id FROM epics WHERE epic_id = ?")
-          .get(epicId) as { epic_id: string } | null;
-        if (existing != null) {
-          db.run(
-            `UPDATE epics SET job_links = ?, last_event_id = ?, updated_at = ?
+            )
+            .get(epicId, epicId) as { id: number | null; ts: number | null };
+          const stampId = latest.id ?? 0;
+          const stampTs = latest.ts ?? 0;
+          const existing = db
+            .prepare("SELECT epic_id FROM epics WHERE epic_id = ?")
+            .get(epicId) as { epic_id: string } | null;
+          if (existing != null) {
+            db.run(
+              `UPDATE epics SET job_links = ?, last_event_id = ?, updated_at = ?
               WHERE epic_id = ?`,
-            [jobLinksJson, stampId, stampTs, epicId],
-          );
-        } else {
-          // Shell-insert: no epic row yet (no EpicSnapshot has folded
-          // for this epic — e.g. an epic touched by a planctl
-          // invocation before the plan-worker observed its file).
-          // Mirrors syncJobIntoEpic's shell-insert pattern (epic_number,
-          // title, project_dir, status, approval default to their
-          // zero-event readings). A later EpicSnapshot fills the
-          // scalars; the ON CONFLICT carve-out (task .5) preserves
-          // `job_links`.
-          db.run(
-            `INSERT INTO epics (
+              [jobLinksJson, stampId, stampTs, epicId],
+            );
+          } else {
+            // Shell-insert: no epic row yet (no EpicSnapshot has folded
+            // for this epic — e.g. an epic touched by a planctl
+            // invocation before the plan-worker observed its file).
+            // Mirrors syncJobIntoEpic's shell-insert pattern (epic_number,
+            // title, project_dir, status, approval default to their
+            // zero-event readings). A later EpicSnapshot fills the
+            // scalars; the ON CONFLICT carve-out (task .5) preserves
+            // `job_links`.
+            db.run(
+              `INSERT INTO epics (
                epic_id, epic_number, title, project_dir, status,
                last_event_id, updated_at, tasks, jobs, job_links
              ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?)`,
-            [epicId, stampId, stampTs, jobLinksJson],
-          );
+              [epicId, stampId, stampTs, jobLinksJson],
+            );
+          }
         }
+
+        // Seed planner stats for the new partial composite index so the
+        // first post-upgrade query lands the index instead of a scan
+        // (sqlite.org/lang_analyze.html — ANALYZE refreshes the
+        // `sqlite_stat1` table the planner reads). One-shot; subsequent
+        // boots don't re-ANALYZE here.
+        db.run("ANALYZE events");
       }
 
-      // Seed planner stats for the new partial composite index so the
-      // first post-upgrade query lands the index instead of a scan
-      // (sqlite.org/lang_analyze.html — ANALYZE refreshes the
-      // `sqlite_stat1` table the planner reads). One-shot; subsequent
-      // boots don't re-ANALYZE here.
-      db.run("ANALYZE events");
-    }
+      // v14→v15: registers the `git_status` table (created above by the
+      // unconditional `CREATE_GIT_STATUS` bootstrap block). The CREATE TABLE
+      // IF NOT EXISTS is idempotent and runs on every boot — no ALTER step
+      // is required here, so this block is a comment-only no-op that
+      // documents what the v15 stamp gates. Without this note the bare
+      // SCHEMA_VERSION = 15 bump would violate the CLAUDE.md invariant
+      // ("Bump SCHEMA_VERSION only when adding an ALTER block to
+      // migrate()"); a future real v14→v15 ALTER would have to land
+      // alongside this comment's removal.
 
-    // v14→v15: registers the `git_status` table (created above by the
-    // unconditional `CREATE_GIT_STATUS` bootstrap block). The CREATE TABLE
-    // IF NOT EXISTS is idempotent and runs on every boot — no ALTER step
-    // is required here, so this block is a comment-only no-op that
-    // documents what the v15 stamp gates. Without this note the bare
-    // SCHEMA_VERSION = 15 bump would violate the CLAUDE.md invariant
-    // ("Bump SCHEMA_VERSION only when adding an ALTER block to
-    // migrate()"); a future real v14→v15 ALTER would have to land
-    // alongside this comment's removal.
+      // v15→v16: project `last_validated_at` through the epics row. Nullable
+      // (no DEFAULT) — a missing field on the planctl JSON is the honest
+      // zero-event reading. Idempotent ADD COLUMN, NO backfill, NO
+      // rewind-and-redrain: the plan-worker's per-boot re-scan repopulates
+      // every epic via the change-gate diff, so a v15 DB gains the column
+      // reading NULL and gets filled from disk on the next boot scan. Column
+      // def matches CREATE_EPICS so a fresh v16 DB and a migrated v15→v16 DB
+      // converge to identical schema.
+      addColumnIfMissing(db, "epics", "last_validated_at", "TEXT");
 
-    // v15→v16: project `last_validated_at` through the epics row. Nullable
-    // (no DEFAULT) — a missing field on the planctl JSON is the honest
-    // zero-event reading. Idempotent ADD COLUMN, NO backfill, NO
-    // rewind-and-redrain: the plan-worker's per-boot re-scan repopulates
-    // every epic via the change-gate diff, so a v15 DB gains the column
-    // reading NULL and gets filled from disk on the next boot scan. Column
-    // def matches CREATE_EPICS so a fresh v16 DB and a migrated v15→v16 DB
-    // converge to identical schema.
-    addColumnIfMissing(db, "epics", "last_validated_at", "TEXT");
+      // v16→v17: add the sparse `events.tool_use_id` bridge column + the
+      // `subagent_invocations` peer table + the partial index on the bridge
+      // column. Mirrors the v9→v10 / v13→v14 sparse-column + partial-index
+      // precedent: one new top-level events column, one CREATE INDEX gated on
+      // `IS NOT NULL`, and a same-transaction backfill via uncached `db.run`.
+      //
+      // Column def matches CREATE_EVENTS literal so a fresh v17 DB and a
+      // migrated v16→v17 DB converge to identical schema (the
+      // addColumnIfMissing/literal lockstep convention). The
+      // `subagent_invocations` table itself is created unconditionally via
+      // CREATE TABLE IF NOT EXISTS above; a fresh v17 DB picks it up there,
+      // and a migrating DB picks it up on the same boot — both paths
+      // converge to the same shape. The partial index lives in
+      // CREATE_V17_INDEXES; a fresh DB picks it up via the same block, and a
+      // migrating DB picks it up on the same boot.
+      //
+      // No reducer cases yet — task .3 supplies the SubagentStart/Stop +
+      // PreToolUse:Agent / PostToolUse:Agent folds that populate the
+      // projection. The intermediate post-task-.1 state is harmless: the
+      // table exists but is empty, the events.tool_use_id column is
+      // populated forward + backfilled, and the wire collection isn't
+      // registered (task .3 adds the descriptor).
+      addColumnIfMissing(db, "events", "tool_use_id", "TEXT");
 
-    // v16→v17: add the sparse `events.tool_use_id` bridge column + the
-    // `subagent_invocations` peer table + the partial index on the bridge
-    // column. Mirrors the v9→v10 / v13→v14 sparse-column + partial-index
-    // precedent: one new top-level events column, one CREATE INDEX gated on
-    // `IS NOT NULL`, and a same-transaction backfill via uncached `db.run`.
-    //
-    // Column def matches CREATE_EVENTS literal so a fresh v17 DB and a
-    // migrated v16→v17 DB converge to identical schema (the
-    // addColumnIfMissing/literal lockstep convention). The
-    // `subagent_invocations` table itself is created unconditionally via
-    // CREATE TABLE IF NOT EXISTS above; a fresh v17 DB picks it up there,
-    // and a migrating DB picks it up on the same boot — both paths
-    // converge to the same shape. The partial index lives in
-    // CREATE_V17_INDEXES; a fresh DB picks it up via the same block, and a
-    // migrating DB picks it up on the same boot.
-    //
-    // No reducer cases yet — task .3 supplies the SubagentStart/Stop +
-    // PreToolUse:Agent / PostToolUse:Agent folds that populate the
-    // projection. The intermediate post-task-.1 state is harmless: the
-    // table exists but is empty, the events.tool_use_id column is
-    // populated forward + backfilled, and the wire collection isn't
-    // registered (task .3 adds the descriptor).
-    addColumnIfMissing(db, "events", "tool_use_id", "TEXT");
+      // CREATE the v17 partial index AFTER the ADD COLUMN it depends on. A
+      // fresh v17 DB enters this block too — the addColumnIfMissing above
+      // no-ops (the column already exists via the CREATE_EVENTS literal),
+      // and this CREATE INDEX IF NOT EXISTS lands the same index set on
+      // both a fresh-v17 and a migrating-v16 DB.
+      for (const sql of CREATE_V17_INDEXES) {
+        db.run(sql);
+      }
 
-    // CREATE the v17 partial index AFTER the ADD COLUMN it depends on. A
-    // fresh v17 DB enters this block too — the addColumnIfMissing above
-    // no-ops (the column already exists via the CREATE_EVENTS literal),
-    // and this CREATE INDEX IF NOT EXISTS lands the same index set on
-    // both a fresh-v17 and a migrating-v16 DB.
-    for (const sql of CREATE_V17_INDEXES) {
-      db.run(sql);
-    }
-
-    // Same-transaction backfill of `events.tool_use_id` for historical
-    // rows. Unlike the v9→v10 / v13→v14 backfills (which run derivers in
-    // JS), the tool_use_id field is a verbatim json_extract — SQLite can
-    // do this entirely in SQL via `json_extract(data, '$.tool_use_id')`.
-    // The `WHERE tool_use_id IS NULL AND json_extract(...) IS NOT NULL`
-    // guard makes the UPDATE idempotent: a re-run after a partial crash
-    // skips already-stamped rows, and a clean re-run sees no work.
-    //
-    // Uses `db.run(sql)` (uncached path — no bound params, single
-    // statement) rather than `db.prepare(...).run()` to sidestep the
-    // bun:sqlite statement-cache pin (oven-sh/bun#1332) — the same
-    // pattern documented on the v9→v10 backfill above. A throw rolls the
-    // whole migration back (ALTERs included).
-    //
-    // Version-guarded: a non-idempotent backfill on a multi-million-row
-    // events log must run AT MOST once. The guard reads the meta row
-    // written by a PRIOR migrate() — on a fresh v17 DB (or one that
-    // crashed before stamping v17) `storedVersionV17 < 17` and the
-    // backfill runs; on a steady-state v17+ DB it skips, so a second
-    // `openDb` is a clean no-op. (The events.tool_use_id IS NULL filter
-    // would make the UPDATE safe to re-run even without the guard, but
-    // the rewind-and-redrain below is non-idempotent and must be gated.)
-    const storedVersionV17 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV17 < 17) {
-      // `json_valid(data)` gates the json_extract so a malformed historical
-      // `data` blob (one that pre-dated the hook's structured-JSON
-      // contract, or that the hook stored as a non-JSON best-effort
-      // string) skips cleanly — `json_extract` raises SQLITE_ERROR on
-      // malformed JSON, which would otherwise abort the transaction and
-      // wedge the migration. The `tool_use_id IS NULL` filter keeps the
-      // UPDATE idempotent across partial-crash resume.
-      db.run(
-        `UPDATE events
+      // Same-transaction backfill of `events.tool_use_id` for historical
+      // rows. Unlike the v9→v10 / v13→v14 backfills (which run derivers in
+      // JS), the tool_use_id field is a verbatim json_extract — SQLite can
+      // do this entirely in SQL via `json_extract(data, '$.tool_use_id')`.
+      // The `WHERE tool_use_id IS NULL AND json_extract(...) IS NOT NULL`
+      // guard makes the UPDATE idempotent: a re-run after a partial crash
+      // skips already-stamped rows, and a clean re-run sees no work.
+      //
+      // Uses `db.run(sql)` (uncached path — no bound params, single
+      // statement) rather than `db.prepare(...).run()` to sidestep the
+      // bun:sqlite statement-cache pin (oven-sh/bun#1332) — the same
+      // pattern documented on the v9→v10 backfill above. A throw rolls the
+      // whole migration back (ALTERs included).
+      //
+      // Version-guarded: a non-idempotent backfill on a multi-million-row
+      // events log must run AT MOST once. The guard reads the meta row
+      // written by a PRIOR migrate() — on a fresh v17 DB (or one that
+      // crashed before stamping v17) `storedVersionV17 < 17` and the
+      // backfill runs; on a steady-state v17+ DB it skips, so a second
+      // `openDb` is a clean no-op. (The events.tool_use_id IS NULL filter
+      // would make the UPDATE safe to re-run even without the guard, but
+      // the rewind-and-redrain below is non-idempotent and must be gated.)
+      const storedVersionV17 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV17 < 17) {
+        // `json_valid(data)` gates the json_extract so a malformed historical
+        // `data` blob (one that pre-dated the hook's structured-JSON
+        // contract, or that the hook stored as a non-JSON best-effort
+        // string) skips cleanly — `json_extract` raises SQLITE_ERROR on
+        // malformed JSON, which would otherwise abort the transaction and
+        // wedge the migration. The `tool_use_id IS NULL` filter keeps the
+        // UPDATE idempotent across partial-crash resume.
+        db.run(
+          `UPDATE events
             SET tool_use_id = json_extract(data, '$.tool_use_id')
           WHERE tool_use_id IS NULL
             AND json_valid(data) = 1
             AND json_extract(data, '$.tool_use_id') IS NOT NULL`,
-      );
+        );
 
-      // Seed planner stats for the new partial index so the first
-      // post-upgrade query lands the index instead of a scan
-      // (sqlite.org/lang_analyze.html — ANALYZE refreshes the
-      // `sqlite_stat1` table the planner reads). One-shot; subsequent
-      // boots don't re-ANALYZE here.
-      db.run("ANALYZE events");
+        // Seed planner stats for the new partial index so the first
+        // post-upgrade query lands the index instead of a scan
+        // (sqlite.org/lang_analyze.html — ANALYZE refreshes the
+        // `sqlite_stat1` table the planner reads). One-shot; subsequent
+        // boots don't re-ANALYZE here.
+        db.run("ANALYZE events");
 
-      // Rewind-and-redrain — same shape as the v10→v11 step. Task .3's
-      // reducer cases will populate `subagent_invocations` on the
-      // re-drain. The boot drain runs unconditionally after `migrate()`
-      // returns, so the projection is rebuilt from the event log in one
-      // pass. Until task .3 lands the live folds, the re-drain leaves
-      // `subagent_invocations` empty — the table exists but no rows
-      // populate (no cases yet). This is harmless: existing `jobs` /
-      // `epics` folds tolerate a fresh re-fold cleanly per the v10→v11
-      // precedent.
+        // Rewind-and-redrain — same shape as the v10→v11 step. Task .3's
+        // reducer cases will populate `subagent_invocations` on the
+        // re-drain. The boot drain runs unconditionally after `migrate()`
+        // returns, so the projection is rebuilt from the event log in one
+        // pass. Until task .3 lands the live folds, the re-drain leaves
+        // `subagent_invocations` empty — the table exists but no rows
+        // populate (no cases yet). This is harmless: existing `jobs` /
+        // `epics` folds tolerate a fresh re-fold cleanly per the v10→v11
+        // precedent.
+        //
+        // Non-idempotent: must run AT MOST once per DB. The version guard
+        // above ensures this. Cost: re-folding the entire event log
+        // inside the BEGIN IMMEDIATE — bounded by `events` row count,
+        // seconds to tens of seconds on a developer machine. One-time.
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
+      }
+
+      // v17→v18: add `jobs.rate_limited_at REAL` — nullable timestamp stamped
+      // by the reducer's `RateLimited` arm (synthetic event minted by main from
+      // a transcript-worker `rate-limited` message) and cleared on the next
+      // `UserPromptSubmit` revival. Column def matches CREATE_JOBS so a fresh
+      // v18 DB and a migrated v17→v18 DB converge to identical schema (the
+      // addColumnIfMissing/literal lockstep convention).
       //
-      // Non-idempotent: must run AT MOST once per DB. The version guard
-      // above ensures this. Cost: re-folding the entire event log
-      // inside the BEGIN IMMEDIATE — bounded by `events` row count,
-      // seconds to tens of seconds on a developer machine. One-time.
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM subagent_invocations");
-    }
+      // Pair-step: the same column is added to the embedded `jobs` array
+      // shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
+      // `EmbeddedJob` in `src/types.ts`), so the field appears on every
+      // embedded entry — not just newly-rate-limited ones. Historical
+      // serialized arrays from v17 do NOT have the field; without a rewind,
+      // incremental `syncJobIntoEpic` writes from later events would
+      // re-serialize entries WITH the field while neighbour entries in the
+      // same array stayed WITHOUT it, breaking the byte-identical re-fold
+      // invariant (CLAUDE.md). The rewind-and-redrain below harmonizes
+      // both sides to "new schema everywhere".
+      addColumnIfMissing(db, "jobs", "rate_limited_at", "REAL");
 
-    // v17→v18: add `jobs.rate_limited_at REAL` — nullable timestamp stamped
-    // by the reducer's `RateLimited` arm (synthetic event minted by main from
-    // a transcript-worker `rate-limited` message) and cleared on the next
-    // `UserPromptSubmit` revival. Column def matches CREATE_JOBS so a fresh
-    // v18 DB and a migrated v17→v18 DB converge to identical schema (the
-    // addColumnIfMissing/literal lockstep convention).
-    //
-    // Pair-step: the same column is added to the embedded `jobs` array
-    // shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
-    // `EmbeddedJob` in `src/types.ts`), so the field appears on every
-    // embedded entry — not just newly-rate-limited ones. Historical
-    // serialized arrays from v17 do NOT have the field; without a rewind,
-    // incremental `syncJobIntoEpic` writes from later events would
-    // re-serialize entries WITH the field while neighbour entries in the
-    // same array stayed WITHOUT it, breaking the byte-identical re-fold
-    // invariant (CLAUDE.md). The rewind-and-redrain below harmonizes
-    // both sides to "new schema everywhere".
-    addColumnIfMissing(db, "jobs", "rate_limited_at", "REAL");
+      // Non-idempotent rewind-and-redrain — same shape as the v16→v17 step.
+      // Version-guarded: re-open of an already-migrated v18+ DB skips it
+      // (the guard reads the meta row written by a PRIOR migrate(); on a
+      // fresh v18 DB or one that crashed before stamping v18,
+      // `storedVersionV18 < 18` and the rewind runs; on steady-state v18+
+      // DB it skips). The boot drain after migrate() returns rebuilds
+      // `jobs` / `epics` / `subagent_invocations` from the event log,
+      // re-emitting embedded `jobs` arrays with the new field present on
+      // every entry.
+      const storedVersionV18 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV18 < 18) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
+      }
 
-    // Non-idempotent rewind-and-redrain — same shape as the v16→v17 step.
-    // Version-guarded: re-open of an already-migrated v18+ DB skips it
-    // (the guard reads the meta row written by a PRIOR migrate(); on a
-    // fresh v18 DB or one that crashed before stamping v18,
-    // `storedVersionV18 < 18` and the rewind runs; on steady-state v18+
-    // DB it skips). The boot drain after migrate() returns rebuilds
-    // `jobs` / `epics` / `subagent_invocations` from the event log,
-    // re-emitting embedded `jobs` arrays with the new field present on
-    // every entry.
-    const storedVersionV18 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV18 < 18) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM subagent_invocations");
-    }
+      // v18→v19: rename the legacy `status` key on every `epics.tasks` embedded
+      // element to `worker_phase`, and add the planctl-native `runtime_status`
+      // sibling (defaults to `"todo"`). Both fields ride the embedded JSON
+      // array — there is no schema column to ALTER. The reducer is the SINGLE
+      // source of truth for the embedded shape (`projectPlanRow` +
+      // `syncJobIntoEpic`'s OLD-element carve-out); a rewind-and-redrain
+      // replays the event log through the v19 reducer and re-emits every
+      // embedded element with the new key shape.
+      //
+      // Why rewind-and-redrain (not an in-place UPDATE that hand-rewrites the
+      // JSON): historical pre-v19 TaskSnapshot events still carry `status` in
+      // their `data` blob (immutable event log). Without a re-fold, an in-place
+      // JSON rewrite would converge once, but the NEXT `syncJobIntoEpic`
+      // fan-out triggered by a `jobs` write would spread the OLD pre-rewrite
+      // shape from the row it read back (the carve-out preserves OLD scalars),
+      // re-introducing `status` on the touched task element while neighbours
+      // kept `worker_phase`. The re-fold guarantees one shape across every
+      // embedded element by deriving them all from the same v19 reducer pass.
+      // The reducer reads `worker_phase ?? status` so a pre-v19 blob still
+      // folds deterministically (re-fold determinism preserved across the
+      // boundary).
+      //
+      // Non-idempotent — version-guarded by the `meta` row written by a PRIOR
+      // migrate() so a re-open of an already-migrated v19+ DB skips cleanly.
+      // The boot drain after migrate() rebuilds `jobs` / `epics` /
+      // `subagent_invocations` from the event log.
+      const storedVersionV19 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV19 < 19) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
+      }
 
-    // v18→v19: rename the legacy `status` key on every `epics.tasks` embedded
-    // element to `worker_phase`, and add the planctl-native `runtime_status`
-    // sibling (defaults to `"todo"`). Both fields ride the embedded JSON
-    // array — there is no schema column to ALTER. The reducer is the SINGLE
-    // source of truth for the embedded shape (`projectPlanRow` +
-    // `syncJobIntoEpic`'s OLD-element carve-out); a rewind-and-redrain
-    // replays the event log through the v19 reducer and re-emits every
-    // embedded element with the new key shape.
-    //
-    // Why rewind-and-redrain (not an in-place UPDATE that hand-rewrites the
-    // JSON): historical pre-v19 TaskSnapshot events still carry `status` in
-    // their `data` blob (immutable event log). Without a re-fold, an in-place
-    // JSON rewrite would converge once, but the NEXT `syncJobIntoEpic`
-    // fan-out triggered by a `jobs` write would spread the OLD pre-rewrite
-    // shape from the row it read back (the carve-out preserves OLD scalars),
-    // re-introducing `status` on the touched task element while neighbours
-    // kept `worker_phase`. The re-fold guarantees one shape across every
-    // embedded element by deriving them all from the same v19 reducer pass.
-    // The reducer reads `worker_phase ?? status` so a pre-v19 blob still
-    // folds deterministically (re-fold determinism preserved across the
-    // boundary).
-    //
-    // Non-idempotent — version-guarded by the `meta` row written by a PRIOR
-    // migrate() so a re-open of an already-migrated v19+ DB skips cleanly.
-    // The boot drain after migrate() rebuilds `jobs` / `epics` /
-    // `subagent_invocations` from the event log.
-    const storedVersionV19 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV19 < 19) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM subagent_invocations");
-    }
-
-    // v19→v20: re-stamp the five sparse `events.planctl_*` columns from the
-    // authoritative PostToolUse:Bash `planctl_invocation` envelope on
-    // `data.tool_response.stdout`, replacing the structurally-wrong v13→v14
-    // stamps that came from the now-replaced input-command regex on the
-    // PreToolUse:Bash side. Per fn-606 task .1 the live deriver
-    // `extractPlanctlInvocation` gates on `PostToolUse:Bash` and parses the
-    // envelope; the v13→v14 backfill block above (src/db.ts:1010-1253) calls
-    // the SAME deriver against PreToolUse:Bash rows and now returns null for
-    // every row — a harmless no-op on a fresh chain run. We leave the v14
-    // block untouched (it stays as legacy context; v20 supersedes its
-    // output) and re-do the per-event stamps + projection re-derive from the
-    // correct shape here.
-    //
-    // Same structural template as the v13→v14 backfill:
-    //
-    //   Pass 0 — NULL-out every PreToolUse:Bash row's planctl_* stamps.
-    //   Pass 1 — re-stamp PostToolUse:Bash rows via the new deriver.
-    //   Pass 2a — per-session `jobs.epic_links` re-derive via deriveEpicLinks.
-    //   Pass 2b — per-touched-epic `epics.job_links` re-derive via
-    //             deriveJobLinks (shell-insert missing epic rows).
-    //   ANALYZE epilogue — refresh `sqlite_stat1` so the first post-upgrade
-    //                       query lands the partial composite index.
-    //
-    // Version-guarded: a non-idempotent projection re-derive must run AT
-    // MOST once. The guard reads the meta row written by a PRIOR migrate() —
-    // on a fresh v20 DB (or one that crashed before stamping v20)
-    // `storedVersionV20 < 20` and the backfill runs; on a steady-state v20+
-    // DB it skips. Pass 0's IS NOT NULL filter and Pass 1's IS NULL filter
-    // also make the events-side stamps independently idempotent for a
-    // partial-run resume; Pass 2a/b is full-replace re-derive (idempotent
-    // by construction).
-    //
-    // Uses `db.run(sql, params)` (uncached path) per bun:sqlite #1332 (still
-    // open as of 2026-01) — the v13→v14 / v16→v17 backfills follow the same
-    // discipline.
-    const storedVersionV20 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV20 < 20) {
-      // Pass 0 — wipe every PreToolUse:Bash row's structurally-wrong stamps.
-      // The v14 backfill stamped these via the now-replaced input-command
-      // regex; leaving them populated would have the reducer's
-      // hook-event-agnostic `planctl_op != NULL` gate fan-out from
-      // wrong-shaped data (e.g. `planctl epic close fn-N-foo` was stamped
-      // op='epic' target='close', because the regex captured the first
-      // two tokens instead of the two-word verb form). Idempotent re-run
-      // safe: the IS NOT NULL predicate becomes a no-op after the first
-      // pass.
-      db.run(
-        `UPDATE events
+      // v19→v20: re-stamp the five sparse `events.planctl_*` columns from the
+      // authoritative PostToolUse:Bash `planctl_invocation` envelope on
+      // `data.tool_response.stdout`, replacing the structurally-wrong v13→v14
+      // stamps that came from the now-replaced input-command regex on the
+      // PreToolUse:Bash side. Per fn-606 task .1 the live deriver
+      // `extractPlanctlInvocation` gates on `PostToolUse:Bash` and parses the
+      // envelope; the v13→v14 backfill block above (src/db.ts:1010-1253) calls
+      // the SAME deriver against PreToolUse:Bash rows and now returns null for
+      // every row — a harmless no-op on a fresh chain run. We leave the v14
+      // block untouched (it stays as legacy context; v20 supersedes its
+      // output) and re-do the per-event stamps + projection re-derive from the
+      // correct shape here.
+      //
+      // Same structural template as the v13→v14 backfill:
+      //
+      //   Pass 0 — NULL-out every PreToolUse:Bash row's planctl_* stamps.
+      //   Pass 1 — re-stamp PostToolUse:Bash rows via the new deriver.
+      //   Pass 2a — per-session `jobs.epic_links` re-derive via deriveEpicLinks.
+      //   Pass 2b — per-touched-epic `epics.job_links` re-derive via
+      //             deriveJobLinks (shell-insert missing epic rows).
+      //   ANALYZE epilogue — refresh `sqlite_stat1` so the first post-upgrade
+      //                       query lands the partial composite index.
+      //
+      // Version-guarded: a non-idempotent projection re-derive must run AT
+      // MOST once. The guard reads the meta row written by a PRIOR migrate() —
+      // on a fresh v20 DB (or one that crashed before stamping v20)
+      // `storedVersionV20 < 20` and the backfill runs; on a steady-state v20+
+      // DB it skips. Pass 0's IS NOT NULL filter and Pass 1's IS NULL filter
+      // also make the events-side stamps independently idempotent for a
+      // partial-run resume; Pass 2a/b is full-replace re-derive (idempotent
+      // by construction).
+      //
+      // Uses `db.run(sql, params)` (uncached path) per bun:sqlite #1332 (still
+      // open as of 2026-01) — the v13→v14 / v16→v17 backfills follow the same
+      // discipline.
+      const storedVersionV20 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV20 < 20) {
+        // Pass 0 — wipe every PreToolUse:Bash row's structurally-wrong stamps.
+        // The v14 backfill stamped these via the now-replaced input-command
+        // regex; leaving them populated would have the reducer's
+        // hook-event-agnostic `planctl_op != NULL` gate fan-out from
+        // wrong-shaped data (e.g. `planctl epic close fn-N-foo` was stamped
+        // op='epic' target='close', because the regex captured the first
+        // two tokens instead of the two-word verb form). Idempotent re-run
+        // safe: the IS NOT NULL predicate becomes a no-op after the first
+        // pass.
+        db.run(
+          `UPDATE events
             SET planctl_op = NULL,
                 planctl_target = NULL,
                 planctl_epic_id = NULL,
@@ -3126,1703 +3167,1719 @@ function migrate(db: Database): void {
           WHERE hook_event = 'PreToolUse'
             AND tool_name = 'Bash'
             AND planctl_op IS NOT NULL`,
-      );
+        );
 
-      // Pass 1 — re-stamp from PostToolUse:Bash rows via the new deriver.
-      // The WHERE filter picks up only rows we haven't touched yet, so a
-      // partial-run resume on a crash mid-backfill is safe (a row that
-      // already has `planctl_op` set is skipped). The deriver returns
-      // `null` for any non-envelope-bearing PostToolUse:Bash — we leave
-      // columns NULL on miss so the partial-index `WHERE planctl_op IS
-      // NOT NULL` predicate stays selective.
-      const bashPostRows = db
-        .prepare(
-          `SELECT id, hook_event, tool_name, data
+        // Pass 1 — re-stamp from PostToolUse:Bash rows via the new deriver.
+        // The WHERE filter picks up only rows we haven't touched yet, so a
+        // partial-run resume on a crash mid-backfill is safe (a row that
+        // already has `planctl_op` set is skipped). The deriver returns
+        // `null` for any non-envelope-bearing PostToolUse:Bash — we leave
+        // columns NULL on miss so the partial-index `WHERE planctl_op IS
+        // NOT NULL` predicate stays selective.
+        const bashPostRows = db
+          .prepare(
+            `SELECT id, hook_event, tool_name, data
              FROM events
             WHERE hook_event = 'PostToolUse' AND tool_name = 'Bash'
               AND planctl_op IS NULL`,
-        )
-        .all() as {
-        id: number;
-        hook_event: string;
-        tool_name: string | null;
-        data: string;
-      }[];
-      for (const row of bashPostRows) {
-        let parsed: Record<string, unknown> | null = null;
-        try {
-          parsed = JSON.parse(row.data) as Record<string, unknown>;
-        } catch {
-          // malformed blob — skip derivation, columns stay NULL.
-        }
-        if (parsed == null) {
-          continue;
-        }
-        const inv = extractPlanctlInvocation(
-          row.hook_event,
-          row.tool_name,
-          parsed,
-        );
-        if (inv == null) {
-          continue;
-        }
-        db.run(
-          `UPDATE events SET
+          )
+          .all() as {
+          id: number;
+          hook_event: string;
+          tool_name: string | null;
+          data: string;
+        }[];
+        for (const row of bashPostRows) {
+          let parsed: Record<string, unknown> | null = null;
+          try {
+            parsed = JSON.parse(row.data) as Record<string, unknown>;
+          } catch {
+            // malformed blob — skip derivation, columns stay NULL.
+          }
+          if (parsed == null) {
+            continue;
+          }
+          const inv = extractPlanctlInvocation(
+            row.hook_event,
+            row.tool_name,
+            parsed,
+          );
+          if (inv == null) {
+            continue;
+          }
+          db.run(
+            `UPDATE events SET
              planctl_op = ?,
              planctl_target = ?,
              planctl_epic_id = ?,
              planctl_task_id = ?,
              planctl_subject_present = ?
            WHERE id = ?`,
-          [
-            inv.op,
-            inv.target,
-            inv.epic_id,
-            inv.task_id,
-            inv.subject_present ? 1 : 0,
-            row.id,
-          ],
-        );
-      }
+            [
+              inv.op,
+              inv.target,
+              inv.epic_id,
+              inv.task_id,
+              inv.subject_present ? 1 : 0,
+              row.id,
+            ],
+          );
+        }
 
-      // Pass 2 — per-session projection re-derive. Mirrors the v13→v14
-      // Pass 2 shape exactly (see lines 1075-1246): for every session_id
-      // with at least one stamped `planctl_op != NULL` event, compute its
-      // `/plan:plan` windows from `PreToolUse:Skill AND
-      // skill_name='plan:plan'` rows, run `deriveEpicLinks`, and UPDATE
-      // `jobs.epic_links`. Then for each touched epic id, gather all
-      // sessions+windows touching that epic and run `deriveJobLinks`,
-      // UPDATEing `epics.job_links` (shell-insert the epic row if it
-      // doesn't exist — mirrors the syncJobIntoEpic shell-insert pattern
-      // in `src/reducer.ts`).
-      //
-      // The output is byte-identical to what the live reducer fan-out
-      // (`syncPlanctlLinks`) produces on steady-state writes because both
-      // paths feed the SAME pure classifier functions in
-      // `src/plan-classifier.ts` — including the scaffold-as-creator
-      // predicate extension from fn-606 task .1.
-      const sessionRowsV20 = db
-        .prepare(
-          `SELECT DISTINCT session_id
+        // Pass 2 — per-session projection re-derive. Mirrors the v13→v14
+        // Pass 2 shape exactly (see lines 1075-1246): for every session_id
+        // with at least one stamped `planctl_op != NULL` event, compute its
+        // `/plan:plan` windows from `PreToolUse:Skill AND
+        // skill_name='plan:plan'` rows, run `deriveEpicLinks`, and UPDATE
+        // `jobs.epic_links`. Then for each touched epic id, gather all
+        // sessions+windows touching that epic and run `deriveJobLinks`,
+        // UPDATEing `epics.job_links` (shell-insert the epic row if it
+        // doesn't exist — mirrors the syncJobIntoEpic shell-insert pattern
+        // in `src/reducer.ts`).
+        //
+        // The output is byte-identical to what the live reducer fan-out
+        // (`syncPlanctlLinks`) produces on steady-state writes because both
+        // paths feed the SAME pure classifier functions in
+        // `src/plan-classifier.ts` — including the scaffold-as-creator
+        // predicate extension from fn-606 task .1.
+        const sessionRowsV20 = db
+          .prepare(
+            `SELECT DISTINCT session_id
              FROM events
             WHERE planctl_op IS NOT NULL`,
-        )
-        .all() as { session_id: string }[];
+          )
+          .all() as { session_id: string }[];
 
-      const invocationsBySessionV20 = new Map<string, ClassifierInvocation[]>();
-      const openerTimestampsBySessionV20 = new Map<string, number[]>();
+        const invocationsBySessionV20 = new Map<
+          string,
+          ClassifierInvocation[]
+        >();
+        const openerTimestampsBySessionV20 = new Map<string, number[]>();
 
-      for (const { session_id } of sessionRowsV20) {
-        const invRows = db
-          .prepare(
-            `SELECT id, ts, planctl_op, planctl_target, planctl_epic_id,
+        for (const { session_id } of sessionRowsV20) {
+          const invRows = db
+            .prepare(
+              `SELECT id, ts, planctl_op, planctl_target, planctl_epic_id,
                     planctl_task_id, planctl_subject_present
                FROM events
               WHERE session_id = ? AND planctl_op IS NOT NULL
               ORDER BY id ASC`,
-          )
-          .all(session_id) as {
-          id: number;
-          ts: number;
-          planctl_op: string;
-          planctl_target: string | null;
-          planctl_epic_id: string | null;
-          planctl_task_id: string | null;
-          planctl_subject_present: number | null;
-        }[];
-        const invocations: ClassifierInvocation[] = invRows.map((r) => ({
-          ts: r.ts,
-          op: normalizePlanctlOp(r.planctl_op),
-          target: r.planctl_target,
-          epic_id: r.planctl_epic_id,
-          subject_present: r.planctl_subject_present === 1,
-        }));
-        invocationsBySessionV20.set(session_id, invocations);
+            )
+            .all(session_id) as {
+            id: number;
+            ts: number;
+            planctl_op: string;
+            planctl_target: string | null;
+            planctl_epic_id: string | null;
+            planctl_task_id: string | null;
+            planctl_subject_present: number | null;
+          }[];
+          const invocations: ClassifierInvocation[] = invRows.map((r) => ({
+            ts: r.ts,
+            op: normalizePlanctlOp(r.planctl_op),
+            target: r.planctl_target,
+            epic_id: r.planctl_epic_id,
+            subject_present: r.planctl_subject_present === 1,
+          }));
+          invocationsBySessionV20.set(session_id, invocations);
 
-        // Locked gate: PreToolUse:Skill AND skill_name='plan:plan' only —
-        // slash_command='/plan:plan' UserPromptSubmit rows are NOT
-        // openers (they'd double-fire on slash-typed invocations).
-        const openerRows = db
-          .prepare(
-            `SELECT ts
+          // Locked gate: PreToolUse:Skill AND skill_name='plan:plan' only —
+          // slash_command='/plan:plan' UserPromptSubmit rows are NOT
+          // openers (they'd double-fire on slash-typed invocations).
+          const openerRows = db
+            .prepare(
+              `SELECT ts
                FROM events
               WHERE session_id = ?
                 AND hook_event = 'PreToolUse'
                 AND skill_name = 'plan:plan'
               ORDER BY id ASC`,
-          )
-          .all(session_id) as { ts: number }[];
-        openerTimestampsBySessionV20.set(
-          session_id,
-          openerRows.map((r) => r.ts),
-        );
-      }
+            )
+            .all(session_id) as { ts: number }[];
+          openerTimestampsBySessionV20.set(
+            session_id,
+            openerRows.map((r) => r.ts),
+          );
+        }
 
-      // Pass 2a — compute and write `jobs.epic_links` per session. Also
-      // collect every (epic_id) that appears in any session's epic_links
-      // so Pass 2b knows which epics need a job_links re-derive.
-      const windowsBySessionV20 = new Map<string, PlanWindow[]>();
-      const touchedEpicIdsV20 = new Set<string>();
-      for (const session_id of invocationsBySessionV20.keys()) {
-        const opens = openerTimestampsBySessionV20.get(session_id) ?? [];
-        const windows = computePlanWindows(opens);
-        windowsBySessionV20.set(session_id, windows);
-        const invocations = invocationsBySessionV20.get(session_id) ?? [];
-        const epicLinks = deriveEpicLinks(invocations, windows);
-        const epicLinksJson = JSON.stringify(epicLinks);
-        const latest = db
-          .prepare(
-            `SELECT id, ts
+        // Pass 2a — compute and write `jobs.epic_links` per session. Also
+        // collect every (epic_id) that appears in any session's epic_links
+        // so Pass 2b knows which epics need a job_links re-derive.
+        const windowsBySessionV20 = new Map<string, PlanWindow[]>();
+        const touchedEpicIdsV20 = new Set<string>();
+        for (const session_id of invocationsBySessionV20.keys()) {
+          const opens = openerTimestampsBySessionV20.get(session_id) ?? [];
+          const windows = computePlanWindows(opens);
+          windowsBySessionV20.set(session_id, windows);
+          const invocations = invocationsBySessionV20.get(session_id) ?? [];
+          const epicLinks = deriveEpicLinks(invocations, windows);
+          const epicLinksJson = JSON.stringify(epicLinks);
+          const latest = db
+            .prepare(
+              `SELECT id, ts
                FROM events
               WHERE session_id = ? AND planctl_op IS NOT NULL
               ORDER BY id DESC
               LIMIT 1`,
-          )
-          .get(session_id) as { id: number; ts: number } | null;
-        if (latest == null) {
-          continue;
-        }
-        // Orphan sessions (planctl events with no SessionStart, hence no
-        // backing jobs row) skip — no shell-insert into `jobs`. Mirrors
-        // the v13→v14 Pass 2a invariant: jobs rows are created only by
-        // SessionStart.
-        db.run(
-          `UPDATE jobs SET epic_links = ?, last_event_id = ?, updated_at = ?
+            )
+            .get(session_id) as { id: number; ts: number } | null;
+          if (latest == null) {
+            continue;
+          }
+          // Orphan sessions (planctl events with no SessionStart, hence no
+          // backing jobs row) skip — no shell-insert into `jobs`. Mirrors
+          // the v13→v14 Pass 2a invariant: jobs rows are created only by
+          // SessionStart.
+          db.run(
+            `UPDATE jobs SET epic_links = ?, last_event_id = ?, updated_at = ?
             WHERE job_id = ?`,
-          [epicLinksJson, latest.id, latest.ts, session_id],
-        );
-        for (const link of epicLinks) {
-          touchedEpicIdsV20.add(link.target);
+            [epicLinksJson, latest.id, latest.ts, session_id],
+          );
+          for (const link of epicLinks) {
+            touchedEpicIdsV20.add(link.target);
+          }
         }
-      }
 
-      // Pass 2b — compute and write `epics.job_links` per touched epic.
-      // Shell-insert the epic row if missing so a re-fold from scratch
-      // reproduces every projection row. Mirrors the v13→v14 Pass 2b
-      // shell-insert pattern (the ON CONFLICT carve-out at the
-      // EpicSnapshot fold preserves `job_links`).
-      for (const epicId of touchedEpicIdsV20) {
-        const jobLinks = deriveJobLinks(
-          invocationsBySessionV20,
-          windowsBySessionV20,
-          epicId,
-        );
-        const jobLinksJson = JSON.stringify(jobLinks);
-        const latest = db
-          .prepare(
-            `SELECT MAX(id) AS id, MAX(ts) AS ts
+        // Pass 2b — compute and write `epics.job_links` per touched epic.
+        // Shell-insert the epic row if missing so a re-fold from scratch
+        // reproduces every projection row. Mirrors the v13→v14 Pass 2b
+        // shell-insert pattern (the ON CONFLICT carve-out at the
+        // EpicSnapshot fold preserves `job_links`).
+        for (const epicId of touchedEpicIdsV20) {
+          const jobLinks = deriveJobLinks(
+            invocationsBySessionV20,
+            windowsBySessionV20,
+            epicId,
+          );
+          const jobLinksJson = JSON.stringify(jobLinks);
+          const latest = db
+            .prepare(
+              `SELECT MAX(id) AS id, MAX(ts) AS ts
                FROM events
               WHERE planctl_op IS NOT NULL
                 AND (planctl_epic_id = ? OR planctl_target = ?)`,
-          )
-          .get(epicId, epicId) as { id: number | null; ts: number | null };
-        const stampId = latest.id ?? 0;
-        const stampTs = latest.ts ?? 0;
-        const existing = db
-          .prepare("SELECT epic_id FROM epics WHERE epic_id = ?")
-          .get(epicId) as { epic_id: string } | null;
-        if (existing != null) {
-          db.run(
-            `UPDATE epics SET job_links = ?, last_event_id = ?, updated_at = ?
+            )
+            .get(epicId, epicId) as { id: number | null; ts: number | null };
+          const stampId = latest.id ?? 0;
+          const stampTs = latest.ts ?? 0;
+          const existing = db
+            .prepare("SELECT epic_id FROM epics WHERE epic_id = ?")
+            .get(epicId) as { epic_id: string } | null;
+          if (existing != null) {
+            db.run(
+              `UPDATE epics SET job_links = ?, last_event_id = ?, updated_at = ?
               WHERE epic_id = ?`,
-            [jobLinksJson, stampId, stampTs, epicId],
-          );
-        } else {
-          db.run(
-            `INSERT INTO epics (
+              [jobLinksJson, stampId, stampTs, epicId],
+            );
+          } else {
+            db.run(
+              `INSERT INTO epics (
                epic_id, epic_number, title, project_dir, status,
                last_event_id, updated_at, tasks, jobs, job_links
              ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?)`,
-            [epicId, stampId, stampTs, jobLinksJson],
+              [epicId, stampId, stampTs, jobLinksJson],
+            );
+          }
+        }
+
+        // Seed planner stats for the partial composite index so the first
+        // post-upgrade query lands the index instead of a scan
+        // (sqlite.org/lang_analyze.html — ANALYZE refreshes the
+        // `sqlite_stat1` table the planner reads). One-shot; subsequent
+        // boots don't re-ANALYZE here.
+        db.run("ANALYZE events");
+      }
+
+      // v20→v21: widen `epics.job_links` entries from the thin classifier
+      // shape `{kind, job_id}` to the enriched projection shape
+      // `{kind, job_id, title, state, rate_limited_at}` per fn-612 task .1.
+      // The denormalized payload lets renderers (board) and predicates
+      // (readiness) read everything off `epics.job_links` with no live-jobs
+      // join — terminal sessions and off-page live sessions stop falling
+      // through to the degraded `[{job_id}] [{kind}]` render line.
+      //
+      // The column TYPE is unchanged (TEXT, JSON-array) — only the entry
+      // shape widens — so no `ALTER TABLE` runs here. The migration is a
+      // version-guarded re-derive of every epic's `job_links` using the
+      // SAME `enrichJobLink` + `sortJobLinks` helpers as the live reducer
+      // (`src/reducer.ts`). Byte-identical re-fold is non-negotiable
+      // (CLAUDE.md "byte-identical re-fold" invariant): if the migration
+      // backfill and the live reducer produced different JSON, a from-
+      // scratch re-fold would diverge from the migrated state and the
+      // server-worker's per-row diff would emit spurious `patch` frames.
+      //
+      // Single code path enforced by inlining the SAME `(title, state,
+      // rate_limited_at)` enrichment shape here — see `enrichJobLink` in
+      // `src/reducer.ts` for the live-reducer twin. Defaults on a missing
+      // `jobs` row at enrichment time: `{title: null, state: "stopped",
+      // rate_limited_at: null}` — preserves orphan entries with safe
+      // values so re-fold determinism holds (a from-scratch re-fold sees
+      // the same missing row at the same enrichment point and writes the
+      // same defaults).
+      //
+      // Version-guarded: a non-idempotent re-derive must run AT MOST
+      // once. The guard reads the meta row written by a PRIOR migrate() —
+      // on a fresh v21 DB (or one that crashed before stamping v21)
+      // `storedVersionV21 < 21` and the backfill runs; on a steady-state
+      // v21+ DB it skips. The re-derive itself is full-replace
+      // (idempotent by construction — re-running it on the same input
+      // produces byte-identical output), so even a partial-run resume on
+      // crash is safe; the guard exists to avoid the per-boot UPDATE
+      // storm on a long-lived DB.
+      const storedVersionV21 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV21 < 21) {
+        // Re-derive every epic's `job_links` in place. We don't need to
+        // re-run the classifier — the existing `job_links` already carries
+        // the right `(kind, job_id)` edges; we only need to enrich each
+        // entry with the linked `jobs` row's display fields.
+        //
+        // Re-using the SAME enrichment shape as the live reducer:
+        //   row.{title, state, rate_limited_at} — same column SELECT;
+        //   missing row → defaults {title: null, state: "stopped",
+        //                            rate_limited_at: null}
+        //
+        // The (kind, job_id) sort tiebreaker is re-applied for safety —
+        // a hand-written or otherwise-mis-sorted blob would otherwise ride
+        // through.
+        const epicRowsV21 = db
+          .prepare("SELECT epic_id, job_links FROM epics")
+          .all() as { epic_id: string; job_links: string | null }[];
+        for (const row of epicRowsV21) {
+          // Safe parse — a malformed blob folds to []. NEVER throw inside
+          // migrate() (a throw rolls back the surrounding BEGIN IMMEDIATE
+          // and wedges the upgrade).
+          let entries: { kind: string; job_id: string }[] = [];
+          if (row.job_links != null && row.job_links.length > 0) {
+            try {
+              const parsed = JSON.parse(row.job_links);
+              if (Array.isArray(parsed)) {
+                entries = parsed as { kind: string; job_id: string }[];
+              }
+            } catch {
+              // malformed blob — fold to []; the UPDATE below writes '[]'
+              // and the entry is gone (matches the zero-event reading).
+            }
+          }
+          const enriched: {
+            kind: string;
+            job_id: string;
+            title: string | null;
+            state: string;
+            rate_limited_at: number | null;
+          }[] = [];
+          for (const e of entries) {
+            if (
+              e == null ||
+              typeof e !== "object" ||
+              typeof e.kind !== "string" ||
+              typeof e.job_id !== "string"
+            ) {
+              continue; // malformed entry — drop.
+            }
+            const jobRow = db
+              .prepare(
+                "SELECT title, state, rate_limited_at FROM jobs WHERE job_id = ?",
+              )
+              .get(e.job_id) as {
+              title: string | null;
+              state: string;
+              rate_limited_at: number | null;
+            } | null;
+            if (jobRow == null) {
+              // Orphan entry (job_id with no `jobs` row) — retain with
+              // safe defaults so re-fold determinism holds.
+              enriched.push({
+                kind: e.kind,
+                job_id: e.job_id,
+                title: null,
+                state: "stopped",
+                rate_limited_at: null,
+              });
+            } else {
+              enriched.push({
+                kind: e.kind,
+                job_id: e.job_id,
+                title: jobRow.title,
+                state: jobRow.state,
+                rate_limited_at: jobRow.rate_limited_at,
+              });
+            }
+          }
+          // Total-order ASC sort on (kind, job_id) — mirrors `sortJobLinks`
+          // in `src/reducer.ts`. Re-apply for safety: a hand-written or
+          // otherwise-mis-sorted blob would otherwise produce a different
+          // post-migration JSON than a from-scratch re-fold.
+          enriched.sort((a, b) => {
+            if (a.kind < b.kind) return -1;
+            if (a.kind > b.kind) return 1;
+            if (a.job_id < b.job_id) return -1;
+            if (a.job_id > b.job_id) return 1;
+            return 0;
+          });
+          db.run("UPDATE epics SET job_links = ? WHERE epic_id = ?", [
+            JSON.stringify(enriched),
+            row.epic_id,
+          ]);
+        }
+      }
+
+      // v21→v22: add `events.config_dir` (the `CLAUDE_CONFIG_DIR` env value
+      // captured by the hook at SessionStart — the arthack-claude profile
+      // directory the session ran under) and `jobs.config_dir` (the projection
+      // of that capture, latest-non-NULL-wins via the SessionStart fold's
+      // `COALESCE(excluded.config_dir, jobs.config_dir)` ON CONFLICT SET).
+      // Both nullable, no backfill — pre-feature SessionStart events have no
+      // recoverable env, so ADD COLUMN leaves existing rows NULL, which is
+      // exactly the zero-event reading. Mirrors the v3→v4 spawn_name step:
+      // column defs match CREATE_EVENTS / CREATE_JOBS verbatim.
+      addColumnIfMissing(db, "events", "config_dir", "TEXT");
+      addColumnIfMissing(db, "jobs", "config_dir", "TEXT");
+
+      // v22→v23: register the `usage` table (created above by the unconditional
+      // `CREATE_USAGE` bootstrap block). Per-profile agentuse quota snapshots
+      // — one row per `~/.local/state/agentuse/<id>.json`. The CREATE TABLE
+      // IF NOT EXISTS is idempotent and runs on every boot — no ALTER step is
+      // required here, so this block is a comment-only no-op that documents
+      // what the v23 stamp gates. Without this note the bare SCHEMA_VERSION =
+      // 23 bump would violate the CLAUDE.md invariant ("Bump SCHEMA_VERSION
+      // only when adding an ALTER block to migrate()"); a future real v22→v23
+      // ALTER would have to land alongside this comment's removal. Mirrors the
+      // v14→v15 git_status registration step exactly.
+      //
+      // NO freshness columns: every `fetched_at` / `next_fetch_at` /
+      // `last_successful_fetch_at` / `last_skipped_fetch_at` field on the
+      // source envelope is read-and-discarded by the worker. See
+      // `src/usage-worker.ts` for the change-gate discipline that enforces the
+      // same exclusion on the producer side; a freshness column added here
+      // (or to the worker's change-gate hash) would churn every ~90s.
+
+      // v23→v24: generalize the rate-limit annotation column into a two-field
+      // signal. Replace `jobs.rate_limited_at REAL` with the pair
+      // `jobs.last_api_error_at REAL` + `jobs.last_api_error_kind TEXT`,
+      // matching the new {@link import("./types").ApiErrorKind} union. The
+      // reducer's pre-v24 `RateLimited` arm becomes a dual-case fold over
+      // `RateLimited | ApiError` (both labels route to one handler — the
+      // historical event log re-folds byte-deterministically; legacy events
+      // force `kind = "rate_limit"`, new events read `event.data.kind`).
+      //
+      // Pair-step: the same two columns are added to the embedded `jobs`
+      // array shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
+      // `EmbeddedJob` in `src/types.ts`) AND to the `JobLinkEntry` shape on
+      // `epics.job_links`. Historical serialized JSON arrays from v23 carry
+      // the OLD `rate_limited_at` field; without a rewind, incremental
+      // `syncJobIntoEpic` / `syncJobLinksOnJobWrite` writes from later events
+      // would re-serialize entries WITH the new field-pair while neighbour
+      // entries in the same array stayed WITH the old field, breaking the
+      // byte-identical re-fold invariant (CLAUDE.md). The rewind-and-redrain
+      // below harmonizes all three sides — `jobs` columns, `epics.jobs[]`,
+      // `epics.tasks[].jobs[]`, `epics.job_links[]` — to "new schema
+      // everywhere".
+      //
+      // Step 1: add the two new `jobs` columns. Both nullable, no DEFAULT —
+      // ADD COLUMN leaves prior rows reading NULL, which is exactly the
+      // zero-event / never-errored projection. Column defs match
+      // `CREATE_JOBS` so a fresh v24 DB and a migrated v23→v24 DB converge
+      // to identical schema (the addColumnIfMissing/literal lockstep
+      // convention).
+      addColumnIfMissing(db, "jobs", "last_api_error_at", "REAL");
+      addColumnIfMissing(db, "jobs", "last_api_error_kind", "TEXT");
+
+      // Step 2: drop the legacy `rate_limited_at` column. Idempotent
+      // (drops only if present), so this runs every boot and converges
+      // whether the DB is a fresh v24 (CREATE_JOBS already omits it) or
+      // an older v23 DB that still carries it. The historical fact is
+      // preserved in the immutable event log (every stored `RateLimited`
+      // event still mints the stamp on re-fold via the dual-case alias);
+      // the projection is rebuilt fresh by the rewind-and-redrain below,
+      // so we can safely drop the column without an explicit backfill.
+      dropColumnIfPresent(db, "jobs", "rate_limited_at");
+
+      // Step 3: rewind-and-redrain — same shape as the v17→v18 +
+      // v18→v19 steps. Version-guarded: re-open of an already-migrated
+      // v24+ DB skips it (the guard reads the meta row written by a
+      // PRIOR migrate(); on a fresh v24 DB or one that crashed before
+      // stamping v24, `storedVersionV24 < 24` and the rewind runs; on
+      // steady-state v24+ DB it skips). The boot drain after migrate()
+      // returns rebuilds `jobs` / `epics` / `subagent_invocations` from
+      // the event log, re-emitting embedded `jobs` arrays + `job_links`
+      // arrays with the new field-pair on every entry — legacy stored
+      // `RateLimited` events fold to `kind="rate_limit"` via the dual
+      // -case alias, so the post-rewind projection carries the new
+      // shape with the right semantic content.
+      const storedVersionV24 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV24 < 24) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
+      }
+
+      // v24→v25: surface "session blocked on AskUserQuestion" as a two-field
+      // signal mirroring the fn-616 (api-error) shape. Add the pair
+      // `jobs.last_input_request_at REAL` + `jobs.last_input_request_kind
+      // TEXT`, matching the new {@link import("./types").InputRequestKind}
+      // union. The reducer's `InputRequest` arm clones the v24 `ApiError`
+      // arm's shape: one terminal-guarded UPDATE that flips `state` to
+      // `'stopped'` AND stamps both columns together. Four clear arms zero
+      // both columns: `UserPromptSubmit` + `SessionStart` unconditionally,
+      // `PreToolUse` + `PostToolUse` gated on `last_input_request_at IS NOT
+      // NULL` (hot path — `AskUserQuestion` fires no hook of its own, so the
+      // closest "answered" signal is the next tool the agent uses).
+      //
+      // Pair-step: the same two columns are added to the embedded `jobs`
+      // array shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
+      // `EmbeddedJob` in `src/types.ts`) AND to the `JobLinkEntry` shape on
+      // `epics.job_links`. Historical serialized JSON arrays from v24 do
+      // NOT carry the new field-pair; without a rewind, incremental
+      // `syncJobIntoEpic` / `syncJobLinksOnJobWrite` writes from later
+      // events would re-serialize entries WITH the new pair while neighbour
+      // entries in the same array stayed WITHOUT it, breaking the
+      // byte-identical re-fold invariant (CLAUDE.md). The rewind-and-redrain
+      // below harmonizes all three sides — `jobs` columns, `epics.jobs[]`,
+      // `epics.tasks[].jobs[]`, `epics.job_links[]` — to "new schema
+      // everywhere".
+      //
+      // Step 1: add the two new `jobs` columns. Both nullable, no DEFAULT —
+      // ADD COLUMN leaves prior rows reading NULL, which is exactly the
+      // zero-event / never-blocked-on-input-request projection. Column defs
+      // match `CREATE_JOBS` so a fresh v25 DB and a migrated v24→v25 DB
+      // converge to identical schema (the addColumnIfMissing/literal
+      // lockstep convention).
+      addColumnIfMissing(db, "jobs", "last_input_request_at", "REAL");
+      addColumnIfMissing(db, "jobs", "last_input_request_kind", "TEXT");
+
+      // Step 2: rewind-and-redrain — same shape as the v17→v18, v18→v19,
+      // v23→v24 steps. Version-guarded: re-open of an already-migrated v25+
+      // DB skips it (the guard reads the meta row written by a PRIOR
+      // migrate(); on a fresh v25 DB or one that crashed before stamping
+      // v25, `storedVersionV25 < 25` and the rewind runs; on steady-state
+      // v25+ DB it skips). The boot drain after migrate() returns rebuilds
+      // `jobs` / `epics` / `subagent_invocations` from the event log,
+      // re-emitting embedded `jobs` arrays + `job_links` arrays with the
+      // new field-pair on every entry — the transcript matcher and the
+      // synthetic `InputRequest` mint arrive in the same task .1, so a
+      // re-fold of an event log that pre-dates fn-617 contains zero
+      // `InputRequest` events and the new columns simply read NULL
+      // everywhere (the zero-event projection — which is also the steady-
+      // state pre-fn-617 reading).
+      const storedVersionV25 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV25 < 25) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
+      }
+
+      // v26: widen `SPAWN_VERB_REF_RE` to accept the `approve` verb so
+      // sessions launched as `claude --name approve::<ref> '/plan:approve
+      // <ref>'` populate `jobs.plan_verb` / `jobs.plan_ref` and embed into
+      // the parent epic's / task's `jobs[]` array — uniform with `plan` /
+      // `work` / `close`. The regex change is data-incompatible: existing
+      // events with `spawn_name="approve::..."` folded under the old regex
+      // left `plan_verb` NULL on their jobs row and skipped the
+      // `syncJobIntoEpic` embed. Rewind the cursor + clear projections so
+      // boot drain re-folds every event under the widened regex and the
+      // existing approve sessions land in the right embedded arrays. Same
+      // shape as every prior version-guarded rewind in this file.
+      const storedVersionV26 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV26 < 26) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
+      }
+
+      // v26→v27: surface the agentuse `sonnet_week` quota window as a paired
+      // `(sonnet_week_percent, sonnet_week_resets_at)` field on the `usage`
+      // projection — third column alongside `session` and `week`. Only some
+      // profiles (currently the claude target) carry it, so both columns are
+      // nullable with no backfill. Idempotent ADD COLUMN matches the v3→v4
+      // shape — no rewind needed: existing `UsageSnapshot` events predate the
+      // worker's sonnet_week parse, so a re-fold would leave the columns NULL
+      // (which IS the steady-state zero-event reading). The next scrape from
+      // the producer surfaces the data via a fresh synthetic event.
+      addColumnIfMissing(db, "usage", "sonnet_week_percent", "REAL");
+      addColumnIfMissing(db, "usage", "sonnet_week_resets_at", "TEXT");
+
+      // v27→v28: denormalize the per-job dirty-file count and the project-wide
+      // orphan-file count onto the `jobs` projection so readiness predicates
+      // can branch on git cleanliness without joining `git_status`. Pair-step:
+      // add `jobs.git_dirty_count INTEGER NOT NULL DEFAULT 0` (per-job — from
+      // the producer's `snapshot.jobs[*].dirty.length`) and
+      // `jobs.git_orphan_count INTEGER NOT NULL DEFAULT 0` (project-broadcast
+      // — `snapshot.orphaned_files.length` stamped onto every job enumerated
+      // in the same snapshot). The reducer's `projectGitStatus` arm fans these
+      // out inside the same `BEGIN IMMEDIATE` transaction that writes
+      // `git_status`, then re-runs `syncJobIntoEpic` on each touched job so
+      // the embedded `jobs[]` arrays on epics + task elements carry the new
+      // counts as well (mirrors the schema v24/v25 fan-out shape:
+      // `last_api_error_*` / `last_input_request_*` rode the same RMW path).
+      //
+      // Pair-step: the same two fields are added to `EmbeddedJob` (typed in
+      // `src/types.ts`) and to `EmbeddedJobElement` (the reducer-internal
+      // mirror in `src/reducer.ts`). `buildEmbeddedJob` reads the new columns
+      // off the post-write `jobs` row so every `syncJobIntoEpic` caller (Stop,
+      // SessionEnd, UserPromptSubmit, RateLimited, ApiError, InputRequest
+      // arms, plus the new GitSnapshot fan-out) automatically lands the new
+      // counts in the embedded arrays — no caller audit-and-pass needed
+      // because the canonical input shape changes underneath.
+      //
+      // Step 1: add the two new `jobs` columns. Both `INTEGER NOT NULL
+      // DEFAULT 0` — a never-snapshotted job reads "0 dirty, 0 orphan", which
+      // is exactly the zero-event projection (no GitSnapshot has fanned in
+      // for this session). Column defs match `CREATE_JOBS` so a fresh v28 DB
+      // and a migrated v27→v28 DB converge to identical schema (the
+      // addColumnIfMissing/literal lockstep convention).
+      addColumnIfMissing(
+        db,
+        "jobs",
+        "git_dirty_count",
+        "INTEGER NOT NULL DEFAULT 0",
+      );
+      addColumnIfMissing(
+        db,
+        "jobs",
+        "git_orphan_count",
+        "INTEGER NOT NULL DEFAULT 0",
+      );
+
+      // Step 2: NO rewind. The migration window is "false-clean" — every
+      // pre-v28 jobs row reads 0/0 until the next `GitSnapshot` tick from the
+      // git-worker re-snapshots its watched roots (typically sub-second via
+      // `data_version` polling). A rewind would be expensive (touches every
+      // event) and the steady-state convergence is fast enough that the
+      // minimal-scope choice wins. The from-scratch re-fold path is
+      // unaffected: replaying every historical GitSnapshot event re-derives
+      // the counts byte-identically via the new fan-out, and an event log
+      // with zero GitSnapshot events leaves the columns at 0 (which IS the
+      // steady-state zero-event reading).
+
+      // v28→v29: surface the "this epic was created by another epic's closer
+      // session" relationship as first-class projection fields on `epics`.
+      // Two columns:
+      //   - `created_by_closer_of TEXT` — the raw closer→child link (the
+      //     closer's `plan_ref`, i.e. the id of the closed epic that spawned
+      //     this one). NULL for plain epics.
+      //   - `sort_path TEXT NOT NULL DEFAULT ''` — a zero-padded-6 dotted
+      //     lexicographic key like `"000003.000007"` driving the descriptor's
+      //     default sort. The dot (ASCII 46) is strictly less than the digits
+      //     (ASCII 48-57) so the prefix-sort invariant
+      //     `"000003" < "000003.000007" < "000004"` holds under SQLite BINARY
+      //     collation.
+      //
+      // The reducer's `syncPlanctlLinks` fan-out derives both columns inside
+      // the same `BEGIN IMMEDIATE` transaction as the existing `job_links`
+      // write, and cascades a `sort_path` change to every transitive
+      // descendant (cycle guard caps depth at 50 — defense-in-depth, since
+      // `created_by_closer_of` is immutable by construction). The
+      // `EPICS_DESCRIPTOR` in `src/collections.ts` flips its `defaultSort`
+      // from `epic_number` to `sort_path` so the existing generic ORDER BY
+      // template at `src/server-worker.ts` produces the slotted order with
+      // zero code change.
+      //
+      // Step 1: add the two new `epics` columns. `created_by_closer_of` is
+      // nullable TEXT with no DEFAULT (matches the reducer's NULL-for-plain-
+      // epic semantics). `sort_path` is `TEXT NOT NULL DEFAULT ''` — the
+      // empty-string default matches the schema's zero-event reading and the
+      // shell-INSERT branches in `syncPlanctlLinks` / `projectPlanRow` (the
+      // next `syncPlanctlLinks` call computes the real value). Both column
+      // defs match `CREATE_EPICS` so a fresh v29 DB and a migrated v28→v29
+      // DB converge to identical schema (the addColumnIfMissing/literal
+      // lockstep convention; mirrors the v27→v28 `git_dirty_count` /
+      // `git_orphan_count` pair-step shape).
+      addColumnIfMissing(db, "epics", "created_by_closer_of", "TEXT");
+      addColumnIfMissing(db, "epics", "sort_path", "TEXT NOT NULL DEFAULT ''");
+
+      // Step 2: rewind-and-redrain — same shape as the v25→v26 spawn-name
+      // widening. Both new columns are derived from the existing event log
+      // (closer-creator link via `jobs.plan_verb` / `plan_ref` of the
+      // creator session, surfaced through the v14 `job_links` projection;
+      // sort path composed transitively from `epic_number`s along the
+      // closer chain). A re-fold from cursor=0 under the new
+      // `syncPlanctlLinks` derivation rebuilds both columns byte-deterministic-
+      // ally from the same events the daemon already has. Version-guarded
+      // mirrors prior rewinds: re-open of an already-migrated v29+ DB skips
+      // the block.
+      const storedVersionV29 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV29 < 29) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
+      }
+
+      // v29→v30: thread the `/plan:queue` priority-jump signal through the
+      // existing planctl envelope → events sparse column → epics projection
+      // pipeline so root epics scaffolded via `/plan:queue` sort above all
+      // other root epics in the dashctl board.
+      //
+      // Two new columns:
+      //   - `events.planctl_queue_jump INTEGER` — sparse; mirrors the existing
+      //     `planctl_op` / `planctl_target` / `planctl_epic_id` / `planctl_task_id`
+      //     / `planctl_subject_present` five-column pattern. Lifted from
+      //     `data.tool_response.stdout`'s `planctl_invocation.queue_jump` boolean
+      //     by `extractPlanctlInvocation`. Stays NULL on every row whose
+      //     `planctl_op IS NULL`; stamped `0` / `1` whenever the envelope is
+      //     present. The deriver's `=== true` defensive check folds absent /
+      //     non-boolean / older-envelope shapes to `0`, which is what makes the
+      //     v29→v30 re-fold byte-identical: legacy events have no `queue_jump`
+      //     key, so they all fold to `0`.
+      //   - `epics.queue_jump INTEGER NOT NULL DEFAULT 0` — projected by
+      //     `syncPlanctlLinks` from the touched epic's events. Drives the
+      //     `!`-prefix `sort_path` branch for root epics (`created_by_closer_of
+      //     IS NULL`) so `sort_path = "!" + zeroPad6(epic_number)` lifts the
+      //     epic above every non-queued root under SQLite BINARY collation (`!`
+      //     is ASCII 33, strictly below the digits at 48-57). The prefix is
+      //     propagated through `parentPath` string concat to all transitive
+      //     closer-of descendants in `cascadeSortPath` — no separate child-flag
+      //     plumbing.
+      //
+      // Both column defs match `CREATE_EVENTS` / `CREATE_EPICS` so a fresh v30
+      // DB and a migrated v29→v30 DB converge to identical schema (the
+      // addColumnIfMissing/literal lockstep convention; mirrors the v28→v29
+      // pair-step shape one block up). SQLite has no native BOOLEAN; the column
+      // is INTEGER (0/1), matching the `planctl_subject_present` convention.
+      // No new index — the queue_jump signal is read off the planctl-event
+      // partial composite index (`(session_id, id) WHERE planctl_op IS NOT NULL`)
+      // already created by v14, since the column is only ever read inside the
+      // same per-session scan `syncPlanctlLinks` already runs.
+      addColumnIfMissing(db, "events", "planctl_queue_jump", "INTEGER");
+      addColumnIfMissing(
+        db,
+        "epics",
+        "queue_jump",
+        "INTEGER NOT NULL DEFAULT 0",
+      );
+
+      // Rewind-and-redrain — same shape as v28→v29 one block up. The
+      // `events.planctl_queue_jump` column is derived from the immutable event
+      // log (the envelope's `queue_jump` boolean lifted by `extractPlanctlInvocation`)
+      // and `epics.queue_jump` is projected from it via `syncPlanctlLinks`. A
+      // re-fold from cursor=0 under the new deriver + new projection rebuilds
+      // both byte-deterministically. Version-guarded mirrors prior rewinds:
+      // re-open of an already-migrated v30+ DB skips the block. The boot drain
+      // after migrate() returns rebuilds `jobs` / `epics` / `subagent_invocations`
+      // from the event log with the new field everywhere; legacy events fold to
+      // `0` via the deriver's `=== true` check (their envelope has no
+      // `queue_jump` key) so the post-rewind projection carries the new shape
+      // with the right semantic content.
+      const storedVersionV30 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV30 < 30) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
+      }
+
+      // v30→v31: rewrite the git-attribution surface from "files attributed to
+      // a live session, everything else is orphan" to honest per-(session, file)
+      // attribution with a commit-based discharge rule. This task lands the
+      // schema slot only — the reducer fold that fills `file_attributions` from
+      // events + the bash mutation deriver land in tasks .3 / .6.
+      //
+      // Three schema-level changes:
+      //   1. `events.bash_mutation_kind TEXT` + `events.bash_mutation_targets TEXT`
+      //      — two sparse columns, NULL on every row whose PostToolUse:Bash payload
+      //      didn't parse as a mutation. The deriver (task .3) populates them at
+      //      hook write time; this block adds the slot. Partial index on
+      //      `bash_mutation_kind` follows the schema-v10 / v14 / v17 pattern —
+      //      kept OUT of `CREATE_EVENTS_INDEXES` so a migrating v30 DB doesn't
+      //      try to index a column it hasn't gained yet, run AFTER the matching
+      //      addColumnIfMissing here.
+      //   2. `jobs.git_orphan_count` RENAME → `jobs.git_unattributed_to_live_count`
+      //      + fresh `jobs.git_orphan_count INTEGER NOT NULL DEFAULT 0` with the
+      //      new strict-mystery semantic. The legacy v28 `git_orphan_count`
+      //      column held "files-not-attributed-to-a-live-session" (which IS the
+      //      definition of `git_unattributed_to_live_count` under the new
+      //      vocabulary), so we rename the storage slot in place — that
+      //      preserves the column's pre-existing DEFAULT 0 zero-event reading
+      //      AND keeps the SQLite RENAME COLUMN cheap (just a catalog patch,
+      //      no row rewrite). The fresh `git_orphan_count` column carries the
+      //      new strict-mystery semantic (files with no attribution from any
+      //      session — past or present), populated by the new reducer fold
+      //      in task .6. Both columns land in `CREATE_JOBS` so a fresh v31 DB
+      //      and a migrated v30→v31 DB converge to the same schema. Readiness
+      //      predicate 6.5 flips to read `git_unattributed_to_live_count`
+      //      (the same numeric value it read before under the old name) in
+      //      task .6's client work; this task touches only the storage layer.
+      //   3. `file_attributions` table — one row per `(project_dir, session_id,
+      //      file_path)` triple, the discharge-aware attribution record the
+      //      new fold maintains. PK is the three-column composite (so multi-
+      //      attribution per file across sessions and worktrees lives as
+      //      distinct rows). Two non-partial indexes serve the per-file
+      //      multi-attribution read and the per-session retract sweep.
+      //
+      // Defensive SQLite version check: RENAME COLUMN requires 3.25+ and Bun
+      // ships 3.46+, so this is extremely unlikely to trip — but the
+      // sub-system invariant (forward-only migration, never-throw-inside-
+      // migrate) makes a cheap pre-check the right choice when the
+      // alternative is a half-applied schema. The check runs unconditionally
+      // (no version guard) so a future SQLite downgrade is caught even on a
+      // re-opened v31 DB.
+      const sqliteVer = (
+        db.prepare("SELECT sqlite_version() AS v").get() as { v: string }
+      ).v;
+      {
+        const parts = sqliteVer.split(".").map((n) => Number(n));
+        const major = parts[0] ?? 0;
+        const minor = parts[1] ?? 0;
+        if (major < 3 || (major === 3 && minor < 25)) {
+          throw new Error(
+            `schema v31 requires SQLite 3.25+ for RENAME COLUMN; found ${sqliteVer}`,
           );
         }
       }
 
-      // Seed planner stats for the partial composite index so the first
-      // post-upgrade query lands the index instead of a scan
-      // (sqlite.org/lang_analyze.html — ANALYZE refreshes the
-      // `sqlite_stat1` table the planner reads). One-shot; subsequent
-      // boots don't re-ANALYZE here.
-      db.run("ANALYZE events");
-    }
+      // Step 1: events sparse columns.
+      addColumnIfMissing(db, "events", "bash_mutation_kind", "TEXT");
+      addColumnIfMissing(db, "events", "bash_mutation_targets", "TEXT");
 
-    // v20→v21: widen `epics.job_links` entries from the thin classifier
-    // shape `{kind, job_id}` to the enriched projection shape
-    // `{kind, job_id, title, state, rate_limited_at}` per fn-612 task .1.
-    // The denormalized payload lets renderers (board) and predicates
-    // (readiness) read everything off `epics.job_links` with no live-jobs
-    // join — terminal sessions and off-page live sessions stop falling
-    // through to the degraded `[{job_id}] [{kind}]` render line.
-    //
-    // The column TYPE is unchanged (TEXT, JSON-array) — only the entry
-    // shape widens — so no `ALTER TABLE` runs here. The migration is a
-    // version-guarded re-derive of every epic's `job_links` using the
-    // SAME `enrichJobLink` + `sortJobLinks` helpers as the live reducer
-    // (`src/reducer.ts`). Byte-identical re-fold is non-negotiable
-    // (CLAUDE.md "byte-identical re-fold" invariant): if the migration
-    // backfill and the live reducer produced different JSON, a from-
-    // scratch re-fold would diverge from the migrated state and the
-    // server-worker's per-row diff would emit spurious `patch` frames.
-    //
-    // Single code path enforced by inlining the SAME `(title, state,
-    // rate_limited_at)` enrichment shape here — see `enrichJobLink` in
-    // `src/reducer.ts` for the live-reducer twin. Defaults on a missing
-    // `jobs` row at enrichment time: `{title: null, state: "stopped",
-    // rate_limited_at: null}` — preserves orphan entries with safe
-    // values so re-fold determinism holds (a from-scratch re-fold sees
-    // the same missing row at the same enrichment point and writes the
-    // same defaults).
-    //
-    // Version-guarded: a non-idempotent re-derive must run AT MOST
-    // once. The guard reads the meta row written by a PRIOR migrate() —
-    // on a fresh v21 DB (or one that crashed before stamping v21)
-    // `storedVersionV21 < 21` and the backfill runs; on a steady-state
-    // v21+ DB it skips. The re-derive itself is full-replace
-    // (idempotent by construction — re-running it on the same input
-    // produces byte-identical output), so even a partial-run resume on
-    // crash is safe; the guard exists to avoid the per-boot UPDATE
-    // storm on a long-lived DB.
-    const storedVersionV21 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV21 < 21) {
-      // Re-derive every epic's `job_links` in place. We don't need to
-      // re-run the classifier — the existing `job_links` already carries
-      // the right `(kind, job_id)` edges; we only need to enrich each
-      // entry with the linked `jobs` row's display fields.
+      // Step 2: jobs column rename + new column.
       //
-      // Re-using the SAME enrichment shape as the live reducer:
-      //   row.{title, state, rate_limited_at} — same column SELECT;
-      //   missing row → defaults {title: null, state: "stopped",
-      //                            rate_limited_at: null}
+      // The rename runs BEFORE the addColumnIfMissing for the new
+      // `git_orphan_count`. Order matters: if we ran `addColumnIfMissing` first
+      // against a v30 DB whose `git_orphan_count` was the LEGACY column, the
+      // add would no-op (column already present) and the rename below would
+      // fail (`hasOld && hasNew` → drift error). By renaming first, the
+      // legacy `git_orphan_count` becomes `git_unattributed_to_live_count`,
+      // freeing the name for the fresh DEFAULT 0 column the next call adds.
       //
-      // The (kind, job_id) sort tiebreaker is re-applied for safety —
-      // a hand-written or otherwise-mis-sorted blob would otherwise ride
-      // through.
-      const epicRowsV21 = db
-        .prepare("SELECT epic_id, job_links FROM epics")
-        .all() as { epic_id: string; job_links: string | null }[];
-      for (const row of epicRowsV21) {
-        // Safe parse — a malformed blob folds to []. NEVER throw inside
-        // migrate() (a throw rolls back the surrounding BEGIN IMMEDIATE
-        // and wedges the upgrade).
-        let entries: { kind: string; job_id: string }[] = [];
-        if (row.job_links != null && row.job_links.length > 0) {
+      // On a fresh v31 DB, CREATE_JOBS already carries both column names
+      // — the rename is a no-op (`!hasOld && hasNew`) and the
+      // addColumnIfMissing is a no-op (`git_orphan_count` is present).
+      // On a re-opened already-migrated v31 DB the same two no-ops hold:
+      // the migrate-once invariant is maintained without a version guard
+      // (the helpers' triple-state idempotence does the work).
+      renameColumnIfPresent(
+        db,
+        "jobs",
+        "git_orphan_count",
+        "git_unattributed_to_live_count",
+      );
+      addColumnIfMissing(
+        db,
+        "jobs",
+        "git_orphan_count",
+        "INTEGER NOT NULL DEFAULT 0",
+      );
+
+      // Step 3: partial index on the new bash_mutation_kind column. Pairs with
+      // the addColumnIfMissing above — runs AFTER the column exists, mirrors
+      // the v10/v14/v17 partial-index pattern.
+      for (const sql of CREATE_V31_INDEXES) {
+        db.run(sql);
+      }
+
+      // Step 3.5: same-transaction backfill of `bash_mutation_kind` /
+      // `bash_mutation_targets` on every stored `PostToolUse:Bash` event row.
+      // Mirrors the v9→v10 (slash_command/skill_name) + v13→v14 (planctl_*)
+      // + v16→v17 (tool_use_id) + v29→v30 (planctl_queue_jump) backfill
+      // precedents: the migration walks every candidate row, re-derives the
+      // new sparse columns via the SAME pure deriver the hook will call at
+      // steady-state, and UPDATEs them in place. Two invariants drive this
+      // shape:
+      //
+      //   1. Re-fold determinism (CLAUDE.md "byte-identical re-fold"):
+      //      historical rows and future hook writes must converge on the
+      //      same column values for the same payload. Sharing the deriver
+      //      function makes that mechanical — there is no second
+      //      implementation to drift against the first.
+      //   2. Reducer fold dependency: task .6's bash-attribution fold reads
+      //      `bash_mutation_kind IS NOT NULL` to know which events
+      //      contributed a mutation edge. Without the backfill, every
+      //      pre-v31 Bash event would read NULL on the new columns even
+      //      though the deriver, applied to its stored payload, would
+      //      stamp a kind. The post-rewind boot drain re-folds every event
+      //      from scratch — but the projection fold reads the BACKFILLED
+      //      `events` rows, not the live deriver, so the events table MUST
+      //      already carry the new columns before the boot drain starts.
+      //
+      // Version-guarded by the same `storedVersionV31 < 31` check that
+      // gates the rewind below: a re-open of an already-migrated v31+ DB
+      // skips the backfill (idempotence). The check is duplicated rather
+      // than hoisted because the rewind block reads the same `meta` row
+      // and we keep the two steps decoupled — task .6 may later move the
+      // rewind, and the backfill should ride with the migration shape
+      // regardless. (`SELECT value FROM meta WHERE key = 'schema_version'`
+      // costs ~microseconds per call; the duplication is free.)
+      //
+      // Performance: re-running the deriver per row is O(rows × command-
+      // length). Bash events on a hot keeper DB sit at ~10k-20k; the
+      // tokenizer is single-pass over a length-capped string. Wall-clock
+      // budget on a realistic event log is sub-second. If a future log
+      // grows past the 5s informal target, the row-walk would need
+      // chunking — the spec's "Risks" section flags this as future work.
+      const storedVersionV31Backfill = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV31Backfill < 31) {
+        const rows = db
+          .prepare(
+            `SELECT id, hook_event, tool_name, cwd, data FROM events
+             WHERE tool_name = 'Bash' AND hook_event = 'PostToolUse'`,
+          )
+          .all() as {
+          id: number;
+          hook_event: string;
+          tool_name: string | null;
+          cwd: string | null;
+          data: string;
+        }[];
+        const updateStmt = db.prepare(
+          `UPDATE events
+            SET bash_mutation_kind = ?, bash_mutation_targets = ?
+          WHERE id = ?`,
+        );
+        for (const row of rows) {
+          // Defensive parse — a malformed historical `data` blob folds to
+          // safe NULL (matching the CLAUDE.md "safe value on malformed
+          // payload" invariant); the deriver itself never throws on any
+          // parsed shape because every branch is a typeof guard. The
+          // try/catch around JSON.parse keeps a corrupt row from wedging
+          // the migration.
+          let parsed: Record<string, unknown>;
           try {
-            const parsed = JSON.parse(row.job_links);
-            if (Array.isArray(parsed)) {
-              entries = parsed as { kind: string; job_id: string }[];
+            parsed = JSON.parse(row.data) as Record<string, unknown>;
+            if (typeof parsed !== "object" || parsed === null) {
+              updateStmt.run(null, null, row.id);
+              continue;
             }
           } catch {
-            // malformed blob — fold to []; the UPDATE below writes '[]'
-            // and the entry is gone (matches the zero-event reading).
+            updateStmt.run(null, null, row.id);
+            continue;
           }
+          const mutation = extractBashMutation(
+            row.hook_event,
+            row.tool_name,
+            parsed,
+            row.cwd,
+          );
+          if (mutation === null) {
+            updateStmt.run(null, null, row.id);
+            continue;
+          }
+          updateStmt.run(
+            mutation.kind,
+            JSON.stringify(mutation.targets),
+            row.id,
+          );
         }
-        const enriched: {
-          kind: string;
+      }
+
+      // Step 4: version-guarded rewind-and-redrain. Required because the new
+      // `git_orphan_count` carries a fundamentally different semantic (strict
+      // mystery — populated by the new reducer fold in task .6), AND
+      // `file_attributions` rows are computed by the same fold from the event
+      // log. A pre-v31 jobs row carries the old legacy `git_orphan_count`
+      // value under the renamed column (`git_unattributed_to_live_count`),
+      // which is correct under the new vocabulary, but the new `git_orphan_count`
+      // column would read DEFAULT 0 — which means "no mystery files" — until
+      // the next `GitSnapshot` re-fans counts. The honest path is to wipe and
+      // re-fold: cursor=0, DELETE jobs/epics/git_status/file_attributions,
+      // boot drain re-derives every column byte-deterministically under the
+      // new schema. (`subagent_invocations` is unaffected by this migration
+      // but the prior rewind blocks all wipe it for symmetry with the
+      // "rebuild every projection table" pattern; v31 follows suit.)
+      //
+      // Version-guarded mirrors prior rewinds: a re-open of an already-
+      // migrated v31+ DB skips this block. The boot drain after migrate()
+      // returns rebuilds all four projections from the immutable event log
+      // under the new reducer fold (task .6 lands the fold; until that
+      // task ships, the post-rewind projection reads zero for the new
+      // strict-mystery column and `git_unattributed_to_live_count` reads
+      // whatever the existing reducer fold produces — which IS the legacy
+      // semantic the rename preserved).
+      const storedVersionV31 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV31 < 31) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM git_status");
+        db.run("DELETE FROM file_attributions");
+        db.run("DELETE FROM subagent_invocations");
+      }
+
+      // v31→v32: Tier 4.1 (fn-634) — `epics.default_visible` VIRTUAL generated
+      // column. Materializes the cross-column predicate
+      // `(status='open' OR approval!='approved')` as a single-column 0/1 derived
+      // value SQLite computes on every read. Paired with the partial index
+      // `idx_epics_default_visible WHERE default_visible = 1` in the always-run
+      // `CREATE_EPICS_INDEXES` block below, this collapses the OR-predicate
+      // SCAN (which Tier 4 measurement clocked at p95=3.1s on diffTick/metaCount)
+      // into a single-column SEARCH against an index that already covers the
+      // ORDER BY. No data backfill — VIRTUAL means SQLite recomputes on read,
+      // so existing rows automatically expose the correct value without an
+      // UPDATE pass.
+      //
+      // CASE-wrap is load-bearing: `status` is TEXT-nullable (no NOT NULL
+      // constraint on the column), and the bare `(status='open' OR
+      // approval!='approved')` returns NULL when status IS NULL AND
+      // approval='approved' — which would violate the column's NOT NULL
+      // constraint at scan time. CASE always returns 0 or 1, never NULL.
+      //
+      // Uses `addGeneratedColumnIfMissing` (NOT `addColumnIfMissing`): the
+      // helper reads `PRAGMA table_xinfo` so generated columns are visible to
+      // the idempotence check; `PRAGMA table_info` excludes generated columns
+      // entirely and would re-attempt the ALTER on every reopen, throwing
+      // "duplicate column" at the next boot.
+      //
+      // NOTE: the v55→v56 (fn-712) block below REWRITES this column's
+      // expression to `status IS NOT NULL AND (status='open' OR
+      // approval!='approved')` — the "epic is materialized" gate that hides
+      // a NULL-status shell row from the board. This literal here matches the
+      // v55→v56 form so a DB migrating straight from v31 → v56 lands the
+      // post-rework expression on the FIRST add (the drop+re-add in the
+      // v55→v56 block then no-ops via the xinfo presence check). A fresh DB
+      // lands it via the CREATE_EPICS literal, also kept in lockstep.
+      addGeneratedColumnIfMissing(
+        db,
+        "epics",
+        "default_visible",
+        "INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved') THEN 1 ELSE 0 END) VIRTUAL",
+      );
+
+      // Tier 2 (fn-628) always-run table-scoped indexes on epics + jobs +
+      // events. Placed AFTER the v28→v29 ADD COLUMN block stamps
+      // `epics.sort_path` so a migrating-from-v28 DB has the indexed column by
+      // the time the index runs. The remaining indexed columns (`epic_id`,
+      // `created_at`, `job_id`, `state`) all exist from schema v1; the
+      // planctl_* columns indexed here exist from schema v14. `CREATE INDEX IF
+      // NOT EXISTS` is idempotent — no SCHEMA_VERSION bump.
+      // `ANALYZE epics; ANALYZE jobs; ANALYZE events;` runs unconditionally on
+      // every boot so the planner picks the new indexes on first post-upgrade
+      // query — cost is negligible on tables under ~1.1k rows for epics/jobs;
+      // events sits at ~110k rows on the daemon's hot DB and ANALYZE costs
+      // ~10ms there. The fn-628.2 `CREATE_EVENTS_PLANCTL_INDEXES` block
+      // pairs with the OR→UNION rewrite at src/reducer.ts:~2371 so both new
+      // partial indexes are SEARCHed (not just one) at the hot-path sweep.
+      for (const sql of CREATE_EPICS_INDEXES) {
+        db.run(sql);
+      }
+      for (const sql of CREATE_JOBS_INDEXES) {
+        db.run(sql);
+      }
+      for (const sql of CREATE_EVENTS_PLANCTL_INDEXES) {
+        db.run(sql);
+      }
+      db.run("ANALYZE epics");
+      db.run("ANALYZE jobs");
+      db.run("ANALYZE events");
+
+      // v32→v33: fn-639 — `profiles` projection table keyed by `config_dir`.
+      // Maintained entirely by reducer fan-outs (SessionStart `INSERT OR IGNORE`
+      // seed + `RateLimited`/`ApiError(rate_limit)` UPSERT) inside the existing
+      // `BEGIN IMMEDIATE` transaction. No data backfill — the table populates
+      // from the event log on the next drain. A re-open of an already-migrated
+      // v33+ DB picks up the table via the unconditional `CREATE TABLE IF NOT
+      // EXISTS CREATE_PROFILES` in the bootstrap block above; this slot exists
+      // only to stamp the version bump deterministically alongside the existing
+      // ordering of migrate slots (the CREATE itself is idempotent and runs on
+      // every boot, so a fresh v33 DB picks it up via the bootstrap path).
+      //
+      // No rewind: a from-scratch re-fold (rewind cursor + `DELETE FROM
+      // profiles`) reproduces the table byte-deterministically from the event
+      // log, so an existing v32 DB transitioning to v33 will see `profiles`
+      // populate organically on the next SessionStart / rate_limit fold without
+      // disturbing the other projections.
+
+      // v33→v34: fn-637 — schema foundation for projecting cross-epic dependency
+      // resolution into the `epics` row. Two structural additions:
+      //   - `epics.resolved_epic_deps TEXT` (nullable JSON array) — carries the
+      //     resolved + enriched state of the epic's `depends_on_epics`. NULL is
+      //     load-bearing: it means "not-yet-computed" and is DISTINCT from
+      //     `'[]'` ("computed, no deps"). The zero-event projection (a freshly
+      //     created epics row) reads NULL until the reducer's task-.3 forward-
+      //     stamp computes the array. `decodeRow` returns `null` (not `[]`) for
+      //     a NULL column — clients branch on null-ness to distinguish "still
+      //     converging" from "empty by design".
+      //   - `epic_dep_edges (consumer_id, dep_token)` reverse-index table +
+      //     `idx_epic_dep_edges_dep_token` — the reverse adjacency list keying
+      //     off the raw token from each consumer's `depends_on_epics`. See the
+      //     `CREATE_EPIC_DEP_EDGES` literal for the raw-token-vs-resolved-id
+      //     rationale (ambiguity flips, dangling deps).
+      //
+      // Both column + table defs match the `CREATE_EPICS` / `CREATE_EPIC_DEP_EDGES`
+      // literals above so a fresh v34 DB and a migrated v33→v34 DB converge to
+      // identical schema (the addColumnIfMissing/literal lockstep convention).
+      // `addColumnIfMissing` is idempotent — a fresh v34 DB enters this block
+      // too and the helper no-ops because the column is already present from
+      // `CREATE_EPICS`. The `epic_dep_edges` table + index are picked up by the
+      // unconditional bootstrap CREATE block above; this slot exists for the
+      // version-bump stamp ordering and the column ALTER.
+      //
+      // No rewind: a from-scratch re-fold (rewind cursor + `DELETE FROM epics;
+      // DELETE FROM epic_dep_edges`) is the task-.3 determinism guarantee, but
+      // for the v33→v34 step itself we just leave `resolved_epic_deps` at NULL
+      // on existing rows (the "not-yet-computed" sentinel) — the next
+      // `EpicSnapshot` fold under the new reducer logic (task .3) will populate
+      // it. Forward-only: NULL on a pre-fold row is the correct zero-event
+      // shape. No backfill needed at this layer.
+      addColumnIfMissing(db, "epics", "resolved_epic_deps", "TEXT");
+
+      // v34→v35: fn-642 — colocate Claude rate-limit state into the `usage`
+      // projection. Three structural additions, all matching the CREATE_USAGE /
+      // CREATE_PROFILES literals above so a fresh v35 DB and a migrated v34→v35
+      // DB converge to identical schema (the addColumnIfMissing/literal lockstep
+      // convention):
+      //   - `usage.last_rate_limit_at REAL` (nullable) — colocated mirror of the
+      //     matching `profiles` row, populated by the schema-v35 forward
+      //     (RateLimited → usage) and reverse (UsageSnapshot ← profiles) fan-out
+      //     inside the existing `BEGIN IMMEDIATE`.
+      //   - `usage.last_rate_limit_session_id TEXT` (nullable) — paired with
+      //     `last_rate_limit_at`. Both NULL together (no rate-limit yet for the
+      //     matching profile) or both populated; the `RateLimited` arm stamps
+      //     them as a pair.
+      //   - `profiles.profile_name TEXT` (nullable) — the derived
+      //     `projectBasename(config_dir)` (last path segment), maintained by the
+      //     SessionStart seed arm in the reducer. Serves as the join key against
+      //     `usage.id` so the bidirectional fan-out lands on the matching row.
+      //
+      // The version-guarded one-time backfill below stamps `profile_name` on
+      // every existing `profiles` row, deriving the value via the same
+      // `projectBasename` helper the SessionStart seed uses (byte-identical
+      // derivation so a from-scratch re-fold and the backfilled row converge).
+      // The backfill is non-idempotent (an UPDATE that ran twice is a no-op,
+      // but the spec asks for it gated explicitly so a future re-run of this
+      // slot can't corrupt). The two `usage` columns need no backfill — they
+      // are NULL on every pre-v35 row and re-populated by the next fan-out fold
+      // (either a `RateLimited` arrival or a fresh `UsageSnapshot` joining
+      // against the matching profile row).
+      addColumnIfMissing(db, "usage", "last_rate_limit_at", "REAL");
+      addColumnIfMissing(db, "usage", "last_rate_limit_session_id", "TEXT");
+      addColumnIfMissing(db, "profiles", "profile_name", "TEXT");
+      if (preMigrateStoredVersion < 35) {
+        // Non-idempotent (version-guarded): read every `profiles` row, derive
+        // `profile_name` from `config_dir` via the SAME `projectBasename` helper
+        // the SessionStart seed uses, and UPDATE in-place. Re-fold determinism:
+        // a from-scratch re-fold drops the table and re-seeds via SessionStart,
+        // which also calls `projectBasename` — the converged shape matches.
+        // The `''` sentinel's basename is `""` — left in place as a valid
+        // (but non-joining) `profile_name`; the `profile_name != ''` guard on
+        // both sides of the join keeps it out of any usage join.
+        const rows = db.prepare("SELECT config_dir FROM profiles").all() as {
+          config_dir: string;
+        }[];
+        const updateStmt = db.prepare(
+          "UPDATE profiles SET profile_name = ? WHERE config_dir = ?",
+        );
+        for (const row of rows) {
+          updateStmt.run(projectBasename(row.config_dir), row.config_dir);
+        }
+      }
+
+      // v35→v36: stamp the derived profile name onto every `jobs` row so the
+      // usage surface's "recent sessions" log labels each job with its profile
+      // without a client-side join. `jobs.profile_name` mirrors the existing
+      // `profiles.profile_name` derivation (`projectBasename(config_dir)`),
+      // maintained by the reducer's SessionStart fold — the only arm that writes
+      // `jobs.config_dir`. Nullable and tracks `config_dir`'s OWN nullability: a
+      // NULL `config_dir` (default `~/.claude`, no `CLAUDE_CONFIG_DIR`) derives a
+      // NULL `profile_name` rather than the `''`-collapse the `profiles` seed
+      // uses — `jobs.config_dir` stays genuinely NULL (COALESCE-on-resume), so a
+      // matching-nullability `profile_name` keeps the resume precedence honest.
+      // The literal addition above (CREATE_JOBS) keeps a fresh v36 DB and a
+      // migrated v35→v36 DB converged on identical schema.
+      addColumnIfMissing(db, "jobs", "profile_name", "TEXT");
+      if (preMigrateStoredVersion < 36) {
+        // Version-guarded one-time backfill. Derive via the SAME `projectBasename`
+        // helper the SessionStart fold uses (byte-identical so a from-scratch
+        // re-fold — which drops `jobs` and re-seeds via SessionStart — converges
+        // on the same value). A NULL `config_dir` yields a NULL `profile_name`,
+        // matching the fold's `config_dir == null ? null : projectBasename(...)`
+        // derivation exactly. Non-idempotent, hence the explicit version guard so
+        // a future re-run of this slot can't re-stamp a since-cleared value.
+        const jobRows = db
+          .prepare("SELECT job_id, config_dir FROM jobs")
+          .all() as {
+          job_id: string;
+          config_dir: string | null;
+        }[];
+        const jobUpdateStmt = db.prepare(
+          "UPDATE jobs SET profile_name = ? WHERE job_id = ?",
+        );
+        for (const row of jobRows) {
+          jobUpdateStmt.run(
+            row.config_dir == null ? null : projectBasename(row.config_dir),
+            row.job_id,
+          );
+        }
+      }
+
+      // v36→v37: fn-643 — `dead_letters` OPERATIONAL sidecar table for
+      // recovering hook events the daemon-side INSERT dropped (transient
+      // SQLITE_BUSY, schema-transition window during a deploy). Picked up
+      // unconditionally by the `CREATE TABLE IF NOT EXISTS CREATE_DEAD_LETTERS`
+      // in the bootstrap block above; this slot exists only for the version-
+      // bump stamp ordering. No data backfill — the table populates exclusively
+      // from the daemon's import scan against the per-pid NDJSON dead-letter
+      // files (task .3), and stays empty on a fresh DB / a steady-state v37
+      // re-open with no dropped events on disk.
+      //
+      // The table is NOT a reducer projection — it is the daemon's operational
+      // record of events that NEVER MADE IT into the event log. The from-
+      // scratch re-fold reset path (`UPDATE reducer_state SET last_event_id =
+      // 0; DELETE FROM jobs; DELETE FROM epics`, see the v10→v11 slot above
+      // and any future rewind-and-redrain step) MUST NOT delete or touch
+      // `dead_letters`: re-folding the event log reproduces the projections
+      // byte-deterministically, but it cannot reproduce rows for events that
+      // were never appended in the first place. The replay verb (task .4) is
+      // the only way a `waiting` row transitions to `recovered`: it appends a
+      // plain real event (using the row's preserved `bindings` + `ts`) and
+      // flips `status`/stamps `recovered_at`/stamps `replayed_event_id` in
+      // ONE `BEGIN IMMEDIATE` — the recovered event then folds through the
+      // normal id-ordered drain. Re-fold determinism is preserved on the
+      // event-log side; the dead-letter sidecar is the daemon's separate
+      // audit log of what was never folded until the human recovered it.
+      //
+      // See `CREATE_DEAD_LETTERS` above for the column docstring.
+
+      // v37→v38: fn-645 — project the agentuse envelope's status /
+      // subscription_active / error axes onto the `usage` row so renderers can
+      // surface freshness, no-subscription gating, and stale-failure context.
+      // Five nullable columns, all matching the `CREATE_USAGE` literal above so
+      // a fresh v38 DB and a migrated v37→v38 DB converge to identical schema
+      // (the addColumnIfMissing/literal lockstep convention):
+      //   - `usage.status TEXT` (nullable) — `"active" | "idle" | "stale"`.
+      //   - `usage.subscription_active INTEGER` (nullable) — 1/0/NULL, the
+      //     plan-tier axis coerced from the envelope's bool|null.
+      //   - `usage.error_type TEXT` (nullable) — present only when status is
+      //     `"stale"`; carries the agentuse-side exception class name.
+      //   - `usage.error_message TEXT` (nullable) — the matching error message.
+      //   - `usage.error_at TEXT` (nullable) — ISO-8601 stamp of the failed
+      //     scrape. Projected but EXCLUDED from the worker change-gate
+      //     (`usageGateKey` in `src/usage-worker.ts`) since `error.at` advances
+      //     on every failed scrape (~90s during an outage) and including it
+      //     would force a synthetic event every cycle — the same discipline as
+      //     the four freshness fields, here applied per-field within an
+      //     otherwise-gated message.
+      //
+      // No data backfill — every column is NULL on pre-v38 rows and
+      // repopulated by the next `UsageSnapshot` fold against the new envelope
+      // (mirrors the v34→v35 `last_rate_limit_at` / `last_rate_limit_session_id`
+      // additions; same forward-only convention).
+      addColumnIfMissing(db, "usage", "status", "TEXT");
+      addColumnIfMissing(db, "usage", "subscription_active", "INTEGER");
+      addColumnIfMissing(db, "usage", "error_type", "TEXT");
+      addColumnIfMissing(db, "usage", "error_message", "TEXT");
+      addColumnIfMissing(db, "usage", "error_at", "TEXT");
+
+      // v38→v39: fn-648 — backfill `bash_mutation_kind` / `bash_mutation_targets`
+      // over every historical `PostToolUse:Bash` row via the SHARED
+      // `extractBashMutation` deriver, then rewind the reducer cursor and wipe
+      // the projection tables so a from-scratch re-fold reproduces healed
+      // attributions byte-deterministically.
+      //
+      // No schema-shape change: the two sparse columns already exist (added in
+      // the v30→v31 slot above). The bump exists to gate the backfill + rewind
+      // version-guards so a re-open of an already-migrated v39+ DB skips both
+      // (the idempotence invariant). A future SCHEMA_VERSION bump that doesn't
+      // change column shape is unusual but legitimate: the deriver's *output*
+      // changed (it now recognizes `git-rm` / `git-mv` and ignores redirect
+      // tokens), and stored historical column values are stale until re-derived.
+      //
+      // Two version-guarded steps mirror v30→v31's shape (src/db.ts:3445-3539):
+      //
+      //   1. Backfill: walk every `PostToolUse:Bash` event, JSON.parse the
+      //      payload (defensive: malformed → (null, null), matching the
+      //      CLAUDE.md "safe value on malformed payload" invariant), re-derive
+      //      via the SHARED deriver, and UPDATE the two sparse columns in
+      //      place. Re-fold determinism (CLAUDE.md "byte-identical re-fold"):
+      //      historical rows and future hook writes must converge on the same
+      //      column values for the same payload via the same deriver function.
+      //      The new `git-rm` / `git-mv` kinds and the redirect-token fix from
+      //      `.1` apply to every stored row, not just future writes.
+      //
+      //   2. Cursor-rewind + DELETE projections: the new reducer match logic
+      //      from `.2` (exact + directory-prefix + fnmatch against the
+      //      snapshot-known deleted/renamed paths) changes historical
+      //      attributions — files that were `<orphan>` under the old logic
+      //      become attributed under the new logic. Without rewinding, the
+      //      stored `jobs.git_unattributed_to_live_count` / `jobs.git_orphan_count`
+      //      / `git_status.dirty_files[].attributions` / `file_attributions`
+      //      values would diverge from a fresh re-fold, violating
+      //      determinism. The honest path is to wipe and re-fold: cursor=0,
+      //      DELETE the four projection tables (jobs/epics/git_status/
+      //      file_attributions/subagent_invocations — the last for symmetry
+      //      with v31's "rebuild every projection table" pattern), boot drain
+      //      re-derives every column under the new reducer logic.
+      //
+      // Performance: the backfill re-runs the deriver per row. The redirect
+      // fix widened the affected set beyond git — every `fs-remove` /
+      // `fs-move` / `fs-copy` / `git-*` row re-derives. v31's backfill was
+      // sub-second at ~10-20k rows on the hot DB; this one is the same shape
+      // (single-pass tokenizer over length-capped command strings).
+      const storedVersionV39Backfill = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV39Backfill < 39) {
+        const rows = db
+          .prepare(
+            `SELECT id, hook_event, tool_name, cwd, data FROM events
+             WHERE tool_name = 'Bash' AND hook_event = 'PostToolUse'`,
+          )
+          .all() as {
+          id: number;
+          hook_event: string;
+          tool_name: string | null;
+          cwd: string | null;
+          data: string;
+        }[];
+        const updateStmt = db.prepare(
+          `UPDATE events
+            SET bash_mutation_kind = ?, bash_mutation_targets = ?
+          WHERE id = ?`,
+        );
+        for (const row of rows) {
+          // Defensive parse — mirrors the v30→v31 backfill: a malformed
+          // historical `data` blob folds to safe NULL (CLAUDE.md "safe value
+          // on malformed payload" invariant); the deriver itself never
+          // throws because every branch is a typeof guard. The try/catch
+          // around JSON.parse keeps a corrupt row from wedging migrate().
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(row.data) as Record<string, unknown>;
+            if (typeof parsed !== "object" || parsed === null) {
+              updateStmt.run(null, null, row.id);
+              continue;
+            }
+          } catch {
+            updateStmt.run(null, null, row.id);
+            continue;
+          }
+          const mutation = extractBashMutation(
+            row.hook_event,
+            row.tool_name,
+            parsed,
+            row.cwd,
+          );
+          if (mutation === null) {
+            updateStmt.run(null, null, row.id);
+            continue;
+          }
+          updateStmt.run(
+            mutation.kind,
+            JSON.stringify(mutation.targets),
+            row.id,
+          );
+        }
+      }
+
+      // Version-guarded rewind: mirrors v30→v31's rewind block. A re-open of
+      // an already-migrated v39+ DB skips this. The boot drain after migrate()
+      // returns rebuilds all five projections from the immutable event log
+      // under the new reducer fold logic (`.2`).
+      const storedVersionV39Rewind = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV39Rewind < 39) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM git_status");
+        db.run("DELETE FROM file_attributions");
+        db.run("DELETE FROM subagent_invocations");
+      }
+
+      // v39→v40: fn-652 — `jobs.name_history` ordered JSON array of the distinct
+      // titles a job has carried (oldest→newest, current title last, deduped,
+      // capped at the most-recent 20). Maintained by the reducer's title
+      // precedence-write block — when the persisted `(title, title_source)`
+      // is promoted to a new distinct value, the new title is appended to the
+      // persisted array iff it is not already the last element. The cap is
+      // applied by slicing to the last 20 entries. Pure function of the
+      // persisted cell + the incoming title (no `Date.now`, no event-arrival
+      // ordering) so a from-scratch re-fold reproduces byte-identical
+      // `name_history` values. Seeded on the SessionStart spawn insert with
+      // `["<spawn name>"]` when `spawn_name != null`, else `'[]'` (the schema
+      // default).
+      //
+      // Mirrors `epic_links` (TEXT NOT NULL DEFAULT '[]') — same JSON-array
+      // convention. The literal addition above in CREATE_JOBS keeps a fresh
+      // v40 DB and a migrated v39→v40 DB converged on identical schema (the
+      // addColumnIfMissing/literal lockstep convention).
+      //
+      // The version-guarded one-time backfill below seeds `name_history` for
+      // every existing `jobs` row: `["<title>"]` when `title` is non-NULL,
+      // `'[]'` otherwise. A re-open of an already-migrated v40+ DB skips the
+      // backfill via the `preMigrateStoredVersion < 40` guard. Re-fold
+      // determinism: a from-scratch re-fold drops the `jobs` table and re-
+      // seeds via SessionStart's spawn-title insert and subsequent title-
+      // precedence writes — the backfilled `["<title>"]` matches what the
+      // fold would have produced (the current `title` was either seeded at
+      // SessionStart or promoted through the title rule, both of which the
+      // new append logic would record as the sole entry on a fresh fold).
+      addColumnIfMissing(
+        db,
+        "jobs",
+        "name_history",
+        "TEXT NOT NULL DEFAULT '[]'",
+      );
+      if (preMigrateStoredVersion < 40) {
+        // Non-idempotent (version-guarded): read every `jobs` row, derive the
+        // seed array from `title`, and UPDATE in-place. A NULL `title` keeps
+        // the schema-default `'[]'` (the column was added NOT NULL DEFAULT
+        // '[]' above, so the freshly-added cell is already `'[]'`; the UPDATE
+        // is a no-op write in that case but is explicit for symmetry).
+        const rows = db.prepare("SELECT job_id, title FROM jobs").all() as {
           job_id: string;
           title: string | null;
-          state: string;
-          rate_limited_at: number | null;
-        }[] = [];
-        for (const e of entries) {
-          if (
-            e == null ||
-            typeof e !== "object" ||
-            typeof e.kind !== "string" ||
-            typeof e.job_id !== "string"
-          ) {
-            continue; // malformed entry — drop.
-          }
-          const jobRow = db
-            .prepare(
-              "SELECT title, state, rate_limited_at FROM jobs WHERE job_id = ?",
-            )
-            .get(e.job_id) as {
-            title: string | null;
-            state: string;
-            rate_limited_at: number | null;
-          } | null;
-          if (jobRow == null) {
-            // Orphan entry (job_id with no `jobs` row) — retain with
-            // safe defaults so re-fold determinism holds.
-            enriched.push({
-              kind: e.kind,
-              job_id: e.job_id,
-              title: null,
-              state: "stopped",
-              rate_limited_at: null,
-            });
-          } else {
-            enriched.push({
-              kind: e.kind,
-              job_id: e.job_id,
-              title: jobRow.title,
-              state: jobRow.state,
-              rate_limited_at: jobRow.rate_limited_at,
-            });
-          }
-        }
-        // Total-order ASC sort on (kind, job_id) — mirrors `sortJobLinks`
-        // in `src/reducer.ts`. Re-apply for safety: a hand-written or
-        // otherwise-mis-sorted blob would otherwise produce a different
-        // post-migration JSON than a from-scratch re-fold.
-        enriched.sort((a, b) => {
-          if (a.kind < b.kind) return -1;
-          if (a.kind > b.kind) return 1;
-          if (a.job_id < b.job_id) return -1;
-          if (a.job_id > b.job_id) return 1;
-          return 0;
-        });
-        db.run("UPDATE epics SET job_links = ? WHERE epic_id = ?", [
-          JSON.stringify(enriched),
-          row.epic_id,
-        ]);
-      }
-    }
-
-    // v21→v22: add `events.config_dir` (the `CLAUDE_CONFIG_DIR` env value
-    // captured by the hook at SessionStart — the arthack-claude profile
-    // directory the session ran under) and `jobs.config_dir` (the projection
-    // of that capture, latest-non-NULL-wins via the SessionStart fold's
-    // `COALESCE(excluded.config_dir, jobs.config_dir)` ON CONFLICT SET).
-    // Both nullable, no backfill — pre-feature SessionStart events have no
-    // recoverable env, so ADD COLUMN leaves existing rows NULL, which is
-    // exactly the zero-event reading. Mirrors the v3→v4 spawn_name step:
-    // column defs match CREATE_EVENTS / CREATE_JOBS verbatim.
-    addColumnIfMissing(db, "events", "config_dir", "TEXT");
-    addColumnIfMissing(db, "jobs", "config_dir", "TEXT");
-
-    // v22→v23: register the `usage` table (created above by the unconditional
-    // `CREATE_USAGE` bootstrap block). Per-profile agentuse quota snapshots
-    // — one row per `~/.local/state/agentuse/<id>.json`. The CREATE TABLE
-    // IF NOT EXISTS is idempotent and runs on every boot — no ALTER step is
-    // required here, so this block is a comment-only no-op that documents
-    // what the v23 stamp gates. Without this note the bare SCHEMA_VERSION =
-    // 23 bump would violate the CLAUDE.md invariant ("Bump SCHEMA_VERSION
-    // only when adding an ALTER block to migrate()"); a future real v22→v23
-    // ALTER would have to land alongside this comment's removal. Mirrors the
-    // v14→v15 git_status registration step exactly.
-    //
-    // NO freshness columns: every `fetched_at` / `next_fetch_at` /
-    // `last_successful_fetch_at` / `last_skipped_fetch_at` field on the
-    // source envelope is read-and-discarded by the worker. See
-    // `src/usage-worker.ts` for the change-gate discipline that enforces the
-    // same exclusion on the producer side; a freshness column added here
-    // (or to the worker's change-gate hash) would churn every ~90s.
-
-    // v23→v24: generalize the rate-limit annotation column into a two-field
-    // signal. Replace `jobs.rate_limited_at REAL` with the pair
-    // `jobs.last_api_error_at REAL` + `jobs.last_api_error_kind TEXT`,
-    // matching the new {@link import("./types").ApiErrorKind} union. The
-    // reducer's pre-v24 `RateLimited` arm becomes a dual-case fold over
-    // `RateLimited | ApiError` (both labels route to one handler — the
-    // historical event log re-folds byte-deterministically; legacy events
-    // force `kind = "rate_limit"`, new events read `event.data.kind`).
-    //
-    // Pair-step: the same two columns are added to the embedded `jobs`
-    // array shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
-    // `EmbeddedJob` in `src/types.ts`) AND to the `JobLinkEntry` shape on
-    // `epics.job_links`. Historical serialized JSON arrays from v23 carry
-    // the OLD `rate_limited_at` field; without a rewind, incremental
-    // `syncJobIntoEpic` / `syncJobLinksOnJobWrite` writes from later events
-    // would re-serialize entries WITH the new field-pair while neighbour
-    // entries in the same array stayed WITH the old field, breaking the
-    // byte-identical re-fold invariant (CLAUDE.md). The rewind-and-redrain
-    // below harmonizes all three sides — `jobs` columns, `epics.jobs[]`,
-    // `epics.tasks[].jobs[]`, `epics.job_links[]` — to "new schema
-    // everywhere".
-    //
-    // Step 1: add the two new `jobs` columns. Both nullable, no DEFAULT —
-    // ADD COLUMN leaves prior rows reading NULL, which is exactly the
-    // zero-event / never-errored projection. Column defs match
-    // `CREATE_JOBS` so a fresh v24 DB and a migrated v23→v24 DB converge
-    // to identical schema (the addColumnIfMissing/literal lockstep
-    // convention).
-    addColumnIfMissing(db, "jobs", "last_api_error_at", "REAL");
-    addColumnIfMissing(db, "jobs", "last_api_error_kind", "TEXT");
-
-    // Step 2: drop the legacy `rate_limited_at` column. Idempotent
-    // (drops only if present), so this runs every boot and converges
-    // whether the DB is a fresh v24 (CREATE_JOBS already omits it) or
-    // an older v23 DB that still carries it. The historical fact is
-    // preserved in the immutable event log (every stored `RateLimited`
-    // event still mints the stamp on re-fold via the dual-case alias);
-    // the projection is rebuilt fresh by the rewind-and-redrain below,
-    // so we can safely drop the column without an explicit backfill.
-    dropColumnIfPresent(db, "jobs", "rate_limited_at");
-
-    // Step 3: rewind-and-redrain — same shape as the v17→v18 +
-    // v18→v19 steps. Version-guarded: re-open of an already-migrated
-    // v24+ DB skips it (the guard reads the meta row written by a
-    // PRIOR migrate(); on a fresh v24 DB or one that crashed before
-    // stamping v24, `storedVersionV24 < 24` and the rewind runs; on
-    // steady-state v24+ DB it skips). The boot drain after migrate()
-    // returns rebuilds `jobs` / `epics` / `subagent_invocations` from
-    // the event log, re-emitting embedded `jobs` arrays + `job_links`
-    // arrays with the new field-pair on every entry — legacy stored
-    // `RateLimited` events fold to `kind="rate_limit"` via the dual
-    // -case alias, so the post-rewind projection carries the new
-    // shape with the right semantic content.
-    const storedVersionV24 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV24 < 24) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM subagent_invocations");
-    }
-
-    // v24→v25: surface "session blocked on AskUserQuestion" as a two-field
-    // signal mirroring the fn-616 (api-error) shape. Add the pair
-    // `jobs.last_input_request_at REAL` + `jobs.last_input_request_kind
-    // TEXT`, matching the new {@link import("./types").InputRequestKind}
-    // union. The reducer's `InputRequest` arm clones the v24 `ApiError`
-    // arm's shape: one terminal-guarded UPDATE that flips `state` to
-    // `'stopped'` AND stamps both columns together. Four clear arms zero
-    // both columns: `UserPromptSubmit` + `SessionStart` unconditionally,
-    // `PreToolUse` + `PostToolUse` gated on `last_input_request_at IS NOT
-    // NULL` (hot path — `AskUserQuestion` fires no hook of its own, so the
-    // closest "answered" signal is the next tool the agent uses).
-    //
-    // Pair-step: the same two columns are added to the embedded `jobs`
-    // array shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
-    // `EmbeddedJob` in `src/types.ts`) AND to the `JobLinkEntry` shape on
-    // `epics.job_links`. Historical serialized JSON arrays from v24 do
-    // NOT carry the new field-pair; without a rewind, incremental
-    // `syncJobIntoEpic` / `syncJobLinksOnJobWrite` writes from later
-    // events would re-serialize entries WITH the new pair while neighbour
-    // entries in the same array stayed WITHOUT it, breaking the
-    // byte-identical re-fold invariant (CLAUDE.md). The rewind-and-redrain
-    // below harmonizes all three sides — `jobs` columns, `epics.jobs[]`,
-    // `epics.tasks[].jobs[]`, `epics.job_links[]` — to "new schema
-    // everywhere".
-    //
-    // Step 1: add the two new `jobs` columns. Both nullable, no DEFAULT —
-    // ADD COLUMN leaves prior rows reading NULL, which is exactly the
-    // zero-event / never-blocked-on-input-request projection. Column defs
-    // match `CREATE_JOBS` so a fresh v25 DB and a migrated v24→v25 DB
-    // converge to identical schema (the addColumnIfMissing/literal
-    // lockstep convention).
-    addColumnIfMissing(db, "jobs", "last_input_request_at", "REAL");
-    addColumnIfMissing(db, "jobs", "last_input_request_kind", "TEXT");
-
-    // Step 2: rewind-and-redrain — same shape as the v17→v18, v18→v19,
-    // v23→v24 steps. Version-guarded: re-open of an already-migrated v25+
-    // DB skips it (the guard reads the meta row written by a PRIOR
-    // migrate(); on a fresh v25 DB or one that crashed before stamping
-    // v25, `storedVersionV25 < 25` and the rewind runs; on steady-state
-    // v25+ DB it skips). The boot drain after migrate() returns rebuilds
-    // `jobs` / `epics` / `subagent_invocations` from the event log,
-    // re-emitting embedded `jobs` arrays + `job_links` arrays with the
-    // new field-pair on every entry — the transcript matcher and the
-    // synthetic `InputRequest` mint arrive in the same task .1, so a
-    // re-fold of an event log that pre-dates fn-617 contains zero
-    // `InputRequest` events and the new columns simply read NULL
-    // everywhere (the zero-event projection — which is also the steady-
-    // state pre-fn-617 reading).
-    const storedVersionV25 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV25 < 25) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM subagent_invocations");
-    }
-
-    // v26: widen `SPAWN_VERB_REF_RE` to accept the `approve` verb so
-    // sessions launched as `claude --name approve::<ref> '/plan:approve
-    // <ref>'` populate `jobs.plan_verb` / `jobs.plan_ref` and embed into
-    // the parent epic's / task's `jobs[]` array — uniform with `plan` /
-    // `work` / `close`. The regex change is data-incompatible: existing
-    // events with `spawn_name="approve::..."` folded under the old regex
-    // left `plan_verb` NULL on their jobs row and skipped the
-    // `syncJobIntoEpic` embed. Rewind the cursor + clear projections so
-    // boot drain re-folds every event under the widened regex and the
-    // existing approve sessions land in the right embedded arrays. Same
-    // shape as every prior version-guarded rewind in this file.
-    const storedVersionV26 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV26 < 26) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM subagent_invocations");
-    }
-
-    // v26→v27: surface the agentuse `sonnet_week` quota window as a paired
-    // `(sonnet_week_percent, sonnet_week_resets_at)` field on the `usage`
-    // projection — third column alongside `session` and `week`. Only some
-    // profiles (currently the claude target) carry it, so both columns are
-    // nullable with no backfill. Idempotent ADD COLUMN matches the v3→v4
-    // shape — no rewind needed: existing `UsageSnapshot` events predate the
-    // worker's sonnet_week parse, so a re-fold would leave the columns NULL
-    // (which IS the steady-state zero-event reading). The next scrape from
-    // the producer surfaces the data via a fresh synthetic event.
-    addColumnIfMissing(db, "usage", "sonnet_week_percent", "REAL");
-    addColumnIfMissing(db, "usage", "sonnet_week_resets_at", "TEXT");
-
-    // v27→v28: denormalize the per-job dirty-file count and the project-wide
-    // orphan-file count onto the `jobs` projection so readiness predicates
-    // can branch on git cleanliness without joining `git_status`. Pair-step:
-    // add `jobs.git_dirty_count INTEGER NOT NULL DEFAULT 0` (per-job — from
-    // the producer's `snapshot.jobs[*].dirty.length`) and
-    // `jobs.git_orphan_count INTEGER NOT NULL DEFAULT 0` (project-broadcast
-    // — `snapshot.orphaned_files.length` stamped onto every job enumerated
-    // in the same snapshot). The reducer's `projectGitStatus` arm fans these
-    // out inside the same `BEGIN IMMEDIATE` transaction that writes
-    // `git_status`, then re-runs `syncJobIntoEpic` on each touched job so
-    // the embedded `jobs[]` arrays on epics + task elements carry the new
-    // counts as well (mirrors the schema v24/v25 fan-out shape:
-    // `last_api_error_*` / `last_input_request_*` rode the same RMW path).
-    //
-    // Pair-step: the same two fields are added to `EmbeddedJob` (typed in
-    // `src/types.ts`) and to `EmbeddedJobElement` (the reducer-internal
-    // mirror in `src/reducer.ts`). `buildEmbeddedJob` reads the new columns
-    // off the post-write `jobs` row so every `syncJobIntoEpic` caller (Stop,
-    // SessionEnd, UserPromptSubmit, RateLimited, ApiError, InputRequest
-    // arms, plus the new GitSnapshot fan-out) automatically lands the new
-    // counts in the embedded arrays — no caller audit-and-pass needed
-    // because the canonical input shape changes underneath.
-    //
-    // Step 1: add the two new `jobs` columns. Both `INTEGER NOT NULL
-    // DEFAULT 0` — a never-snapshotted job reads "0 dirty, 0 orphan", which
-    // is exactly the zero-event projection (no GitSnapshot has fanned in
-    // for this session). Column defs match `CREATE_JOBS` so a fresh v28 DB
-    // and a migrated v27→v28 DB converge to identical schema (the
-    // addColumnIfMissing/literal lockstep convention).
-    addColumnIfMissing(
-      db,
-      "jobs",
-      "git_dirty_count",
-      "INTEGER NOT NULL DEFAULT 0",
-    );
-    addColumnIfMissing(
-      db,
-      "jobs",
-      "git_orphan_count",
-      "INTEGER NOT NULL DEFAULT 0",
-    );
-
-    // Step 2: NO rewind. The migration window is "false-clean" — every
-    // pre-v28 jobs row reads 0/0 until the next `GitSnapshot` tick from the
-    // git-worker re-snapshots its watched roots (typically sub-second via
-    // `data_version` polling). A rewind would be expensive (touches every
-    // event) and the steady-state convergence is fast enough that the
-    // minimal-scope choice wins. The from-scratch re-fold path is
-    // unaffected: replaying every historical GitSnapshot event re-derives
-    // the counts byte-identically via the new fan-out, and an event log
-    // with zero GitSnapshot events leaves the columns at 0 (which IS the
-    // steady-state zero-event reading).
-
-    // v28→v29: surface the "this epic was created by another epic's closer
-    // session" relationship as first-class projection fields on `epics`.
-    // Two columns:
-    //   - `created_by_closer_of TEXT` — the raw closer→child link (the
-    //     closer's `plan_ref`, i.e. the id of the closed epic that spawned
-    //     this one). NULL for plain epics.
-    //   - `sort_path TEXT NOT NULL DEFAULT ''` — a zero-padded-6 dotted
-    //     lexicographic key like `"000003.000007"` driving the descriptor's
-    //     default sort. The dot (ASCII 46) is strictly less than the digits
-    //     (ASCII 48-57) so the prefix-sort invariant
-    //     `"000003" < "000003.000007" < "000004"` holds under SQLite BINARY
-    //     collation.
-    //
-    // The reducer's `syncPlanctlLinks` fan-out derives both columns inside
-    // the same `BEGIN IMMEDIATE` transaction as the existing `job_links`
-    // write, and cascades a `sort_path` change to every transitive
-    // descendant (cycle guard caps depth at 50 — defense-in-depth, since
-    // `created_by_closer_of` is immutable by construction). The
-    // `EPICS_DESCRIPTOR` in `src/collections.ts` flips its `defaultSort`
-    // from `epic_number` to `sort_path` so the existing generic ORDER BY
-    // template at `src/server-worker.ts` produces the slotted order with
-    // zero code change.
-    //
-    // Step 1: add the two new `epics` columns. `created_by_closer_of` is
-    // nullable TEXT with no DEFAULT (matches the reducer's NULL-for-plain-
-    // epic semantics). `sort_path` is `TEXT NOT NULL DEFAULT ''` — the
-    // empty-string default matches the schema's zero-event reading and the
-    // shell-INSERT branches in `syncPlanctlLinks` / `projectPlanRow` (the
-    // next `syncPlanctlLinks` call computes the real value). Both column
-    // defs match `CREATE_EPICS` so a fresh v29 DB and a migrated v28→v29
-    // DB converge to identical schema (the addColumnIfMissing/literal
-    // lockstep convention; mirrors the v27→v28 `git_dirty_count` /
-    // `git_orphan_count` pair-step shape).
-    addColumnIfMissing(db, "epics", "created_by_closer_of", "TEXT");
-    addColumnIfMissing(db, "epics", "sort_path", "TEXT NOT NULL DEFAULT ''");
-
-    // Step 2: rewind-and-redrain — same shape as the v25→v26 spawn-name
-    // widening. Both new columns are derived from the existing event log
-    // (closer-creator link via `jobs.plan_verb` / `plan_ref` of the
-    // creator session, surfaced through the v14 `job_links` projection;
-    // sort path composed transitively from `epic_number`s along the
-    // closer chain). A re-fold from cursor=0 under the new
-    // `syncPlanctlLinks` derivation rebuilds both columns byte-deterministic-
-    // ally from the same events the daemon already has. Version-guarded
-    // mirrors prior rewinds: re-open of an already-migrated v29+ DB skips
-    // the block.
-    const storedVersionV29 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV29 < 29) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM subagent_invocations");
-    }
-
-    // v29→v30: thread the `/plan:queue` priority-jump signal through the
-    // existing planctl envelope → events sparse column → epics projection
-    // pipeline so root epics scaffolded via `/plan:queue` sort above all
-    // other root epics in the dashctl board.
-    //
-    // Two new columns:
-    //   - `events.planctl_queue_jump INTEGER` — sparse; mirrors the existing
-    //     `planctl_op` / `planctl_target` / `planctl_epic_id` / `planctl_task_id`
-    //     / `planctl_subject_present` five-column pattern. Lifted from
-    //     `data.tool_response.stdout`'s `planctl_invocation.queue_jump` boolean
-    //     by `extractPlanctlInvocation`. Stays NULL on every row whose
-    //     `planctl_op IS NULL`; stamped `0` / `1` whenever the envelope is
-    //     present. The deriver's `=== true` defensive check folds absent /
-    //     non-boolean / older-envelope shapes to `0`, which is what makes the
-    //     v29→v30 re-fold byte-identical: legacy events have no `queue_jump`
-    //     key, so they all fold to `0`.
-    //   - `epics.queue_jump INTEGER NOT NULL DEFAULT 0` — projected by
-    //     `syncPlanctlLinks` from the touched epic's events. Drives the
-    //     `!`-prefix `sort_path` branch for root epics (`created_by_closer_of
-    //     IS NULL`) so `sort_path = "!" + zeroPad6(epic_number)` lifts the
-    //     epic above every non-queued root under SQLite BINARY collation (`!`
-    //     is ASCII 33, strictly below the digits at 48-57). The prefix is
-    //     propagated through `parentPath` string concat to all transitive
-    //     closer-of descendants in `cascadeSortPath` — no separate child-flag
-    //     plumbing.
-    //
-    // Both column defs match `CREATE_EVENTS` / `CREATE_EPICS` so a fresh v30
-    // DB and a migrated v29→v30 DB converge to identical schema (the
-    // addColumnIfMissing/literal lockstep convention; mirrors the v28→v29
-    // pair-step shape one block up). SQLite has no native BOOLEAN; the column
-    // is INTEGER (0/1), matching the `planctl_subject_present` convention.
-    // No new index — the queue_jump signal is read off the planctl-event
-    // partial composite index (`(session_id, id) WHERE planctl_op IS NOT NULL`)
-    // already created by v14, since the column is only ever read inside the
-    // same per-session scan `syncPlanctlLinks` already runs.
-    addColumnIfMissing(db, "events", "planctl_queue_jump", "INTEGER");
-    addColumnIfMissing(db, "epics", "queue_jump", "INTEGER NOT NULL DEFAULT 0");
-
-    // Rewind-and-redrain — same shape as v28→v29 one block up. The
-    // `events.planctl_queue_jump` column is derived from the immutable event
-    // log (the envelope's `queue_jump` boolean lifted by `extractPlanctlInvocation`)
-    // and `epics.queue_jump` is projected from it via `syncPlanctlLinks`. A
-    // re-fold from cursor=0 under the new deriver + new projection rebuilds
-    // both byte-deterministically. Version-guarded mirrors prior rewinds:
-    // re-open of an already-migrated v30+ DB skips the block. The boot drain
-    // after migrate() returns rebuilds `jobs` / `epics` / `subagent_invocations`
-    // from the event log with the new field everywhere; legacy events fold to
-    // `0` via the deriver's `=== true` check (their envelope has no
-    // `queue_jump` key) so the post-rewind projection carries the new shape
-    // with the right semantic content.
-    const storedVersionV30 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV30 < 30) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM subagent_invocations");
-    }
-
-    // v30→v31: rewrite the git-attribution surface from "files attributed to
-    // a live session, everything else is orphan" to honest per-(session, file)
-    // attribution with a commit-based discharge rule. This task lands the
-    // schema slot only — the reducer fold that fills `file_attributions` from
-    // events + the bash mutation deriver land in tasks .3 / .6.
-    //
-    // Three schema-level changes:
-    //   1. `events.bash_mutation_kind TEXT` + `events.bash_mutation_targets TEXT`
-    //      — two sparse columns, NULL on every row whose PostToolUse:Bash payload
-    //      didn't parse as a mutation. The deriver (task .3) populates them at
-    //      hook write time; this block adds the slot. Partial index on
-    //      `bash_mutation_kind` follows the schema-v10 / v14 / v17 pattern —
-    //      kept OUT of `CREATE_EVENTS_INDEXES` so a migrating v30 DB doesn't
-    //      try to index a column it hasn't gained yet, run AFTER the matching
-    //      addColumnIfMissing here.
-    //   2. `jobs.git_orphan_count` RENAME → `jobs.git_unattributed_to_live_count`
-    //      + fresh `jobs.git_orphan_count INTEGER NOT NULL DEFAULT 0` with the
-    //      new strict-mystery semantic. The legacy v28 `git_orphan_count`
-    //      column held "files-not-attributed-to-a-live-session" (which IS the
-    //      definition of `git_unattributed_to_live_count` under the new
-    //      vocabulary), so we rename the storage slot in place — that
-    //      preserves the column's pre-existing DEFAULT 0 zero-event reading
-    //      AND keeps the SQLite RENAME COLUMN cheap (just a catalog patch,
-    //      no row rewrite). The fresh `git_orphan_count` column carries the
-    //      new strict-mystery semantic (files with no attribution from any
-    //      session — past or present), populated by the new reducer fold
-    //      in task .6. Both columns land in `CREATE_JOBS` so a fresh v31 DB
-    //      and a migrated v30→v31 DB converge to the same schema. Readiness
-    //      predicate 6.5 flips to read `git_unattributed_to_live_count`
-    //      (the same numeric value it read before under the old name) in
-    //      task .6's client work; this task touches only the storage layer.
-    //   3. `file_attributions` table — one row per `(project_dir, session_id,
-    //      file_path)` triple, the discharge-aware attribution record the
-    //      new fold maintains. PK is the three-column composite (so multi-
-    //      attribution per file across sessions and worktrees lives as
-    //      distinct rows). Two non-partial indexes serve the per-file
-    //      multi-attribution read and the per-session retract sweep.
-    //
-    // Defensive SQLite version check: RENAME COLUMN requires 3.25+ and Bun
-    // ships 3.46+, so this is extremely unlikely to trip — but the
-    // sub-system invariant (forward-only migration, never-throw-inside-
-    // migrate) makes a cheap pre-check the right choice when the
-    // alternative is a half-applied schema. The check runs unconditionally
-    // (no version guard) so a future SQLite downgrade is caught even on a
-    // re-opened v31 DB.
-    const sqliteVer = (
-      db.prepare("SELECT sqlite_version() AS v").get() as { v: string }
-    ).v;
-    {
-      const parts = sqliteVer.split(".").map((n) => Number(n));
-      const major = parts[0] ?? 0;
-      const minor = parts[1] ?? 0;
-      if (major < 3 || (major === 3 && minor < 25)) {
-        throw new Error(
-          `schema v31 requires SQLite 3.25+ for RENAME COLUMN; found ${sqliteVer}`,
+        }[];
+        const updateStmt = db.prepare(
+          "UPDATE jobs SET name_history = ? WHERE job_id = ?",
         );
-      }
-    }
-
-    // Step 1: events sparse columns.
-    addColumnIfMissing(db, "events", "bash_mutation_kind", "TEXT");
-    addColumnIfMissing(db, "events", "bash_mutation_targets", "TEXT");
-
-    // Step 2: jobs column rename + new column.
-    //
-    // The rename runs BEFORE the addColumnIfMissing for the new
-    // `git_orphan_count`. Order matters: if we ran `addColumnIfMissing` first
-    // against a v30 DB whose `git_orphan_count` was the LEGACY column, the
-    // add would no-op (column already present) and the rename below would
-    // fail (`hasOld && hasNew` → drift error). By renaming first, the
-    // legacy `git_orphan_count` becomes `git_unattributed_to_live_count`,
-    // freeing the name for the fresh DEFAULT 0 column the next call adds.
-    //
-    // On a fresh v31 DB, CREATE_JOBS already carries both column names
-    // — the rename is a no-op (`!hasOld && hasNew`) and the
-    // addColumnIfMissing is a no-op (`git_orphan_count` is present).
-    // On a re-opened already-migrated v31 DB the same two no-ops hold:
-    // the migrate-once invariant is maintained without a version guard
-    // (the helpers' triple-state idempotence does the work).
-    renameColumnIfPresent(
-      db,
-      "jobs",
-      "git_orphan_count",
-      "git_unattributed_to_live_count",
-    );
-    addColumnIfMissing(
-      db,
-      "jobs",
-      "git_orphan_count",
-      "INTEGER NOT NULL DEFAULT 0",
-    );
-
-    // Step 3: partial index on the new bash_mutation_kind column. Pairs with
-    // the addColumnIfMissing above — runs AFTER the column exists, mirrors
-    // the v10/v14/v17 partial-index pattern.
-    for (const sql of CREATE_V31_INDEXES) {
-      db.run(sql);
-    }
-
-    // Step 3.5: same-transaction backfill of `bash_mutation_kind` /
-    // `bash_mutation_targets` on every stored `PostToolUse:Bash` event row.
-    // Mirrors the v9→v10 (slash_command/skill_name) + v13→v14 (planctl_*)
-    // + v16→v17 (tool_use_id) + v29→v30 (planctl_queue_jump) backfill
-    // precedents: the migration walks every candidate row, re-derives the
-    // new sparse columns via the SAME pure deriver the hook will call at
-    // steady-state, and UPDATEs them in place. Two invariants drive this
-    // shape:
-    //
-    //   1. Re-fold determinism (CLAUDE.md "byte-identical re-fold"):
-    //      historical rows and future hook writes must converge on the
-    //      same column values for the same payload. Sharing the deriver
-    //      function makes that mechanical — there is no second
-    //      implementation to drift against the first.
-    //   2. Reducer fold dependency: task .6's bash-attribution fold reads
-    //      `bash_mutation_kind IS NOT NULL` to know which events
-    //      contributed a mutation edge. Without the backfill, every
-    //      pre-v31 Bash event would read NULL on the new columns even
-    //      though the deriver, applied to its stored payload, would
-    //      stamp a kind. The post-rewind boot drain re-folds every event
-    //      from scratch — but the projection fold reads the BACKFILLED
-    //      `events` rows, not the live deriver, so the events table MUST
-    //      already carry the new columns before the boot drain starts.
-    //
-    // Version-guarded by the same `storedVersionV31 < 31` check that
-    // gates the rewind below: a re-open of an already-migrated v31+ DB
-    // skips the backfill (idempotence). The check is duplicated rather
-    // than hoisted because the rewind block reads the same `meta` row
-    // and we keep the two steps decoupled — task .6 may later move the
-    // rewind, and the backfill should ride with the migration shape
-    // regardless. (`SELECT value FROM meta WHERE key = 'schema_version'`
-    // costs ~microseconds per call; the duplication is free.)
-    //
-    // Performance: re-running the deriver per row is O(rows × command-
-    // length). Bash events on a hot keeper DB sit at ~10k-20k; the
-    // tokenizer is single-pass over a length-capped string. Wall-clock
-    // budget on a realistic event log is sub-second. If a future log
-    // grows past the 5s informal target, the row-walk would need
-    // chunking — the spec's "Risks" section flags this as future work.
-    const storedVersionV31Backfill = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV31Backfill < 31) {
-      const rows = db
-        .prepare(
-          `SELECT id, hook_event, tool_name, cwd, data FROM events
-             WHERE tool_name = 'Bash' AND hook_event = 'PostToolUse'`,
-        )
-        .all() as {
-        id: number;
-        hook_event: string;
-        tool_name: string | null;
-        cwd: string | null;
-        data: string;
-      }[];
-      const updateStmt = db.prepare(
-        `UPDATE events
-            SET bash_mutation_kind = ?, bash_mutation_targets = ?
-          WHERE id = ?`,
-      );
-      for (const row of rows) {
-        // Defensive parse — a malformed historical `data` blob folds to
-        // safe NULL (matching the CLAUDE.md "safe value on malformed
-        // payload" invariant); the deriver itself never throws on any
-        // parsed shape because every branch is a typeof guard. The
-        // try/catch around JSON.parse keeps a corrupt row from wedging
-        // the migration.
-        let parsed: Record<string, unknown>;
-        try {
-          parsed = JSON.parse(row.data) as Record<string, unknown>;
-          if (typeof parsed !== "object" || parsed === null) {
-            updateStmt.run(null, null, row.id);
-            continue;
-          }
-        } catch {
-          updateStmt.run(null, null, row.id);
-          continue;
+        for (const row of rows) {
+          const seed = row.title != null ? JSON.stringify([row.title]) : "[]";
+          updateStmt.run(seed, row.job_id);
         }
-        const mutation = extractBashMutation(
-          row.hook_event,
-          row.tool_name,
-          parsed,
-          row.cwd,
-        );
-        if (mutation === null) {
-          updateStmt.run(null, null, row.id);
-          continue;
-        }
-        updateStmt.run(mutation.kind, JSON.stringify(mutation.targets), row.id);
       }
-    }
 
-    // Step 4: version-guarded rewind-and-redrain. Required because the new
-    // `git_orphan_count` carries a fundamentally different semantic (strict
-    // mystery — populated by the new reducer fold in task .6), AND
-    // `file_attributions` rows are computed by the same fold from the event
-    // log. A pre-v31 jobs row carries the old legacy `git_orphan_count`
-    // value under the renamed column (`git_unattributed_to_live_count`),
-    // which is correct under the new vocabulary, but the new `git_orphan_count`
-    // column would read DEFAULT 0 — which means "no mystery files" — until
-    // the next `GitSnapshot` re-fans counts. The honest path is to wipe and
-    // re-fold: cursor=0, DELETE jobs/epics/git_status/file_attributions,
-    // boot drain re-derives every column byte-deterministically under the
-    // new schema. (`subagent_invocations` is unaffected by this migration
-    // but the prior rewind blocks all wipe it for symmetry with the
-    // "rebuild every projection table" pattern; v31 follows suit.)
-    //
-    // Version-guarded mirrors prior rewinds: a re-open of an already-
-    // migrated v31+ DB skips this block. The boot drain after migrate()
-    // returns rebuilds all four projections from the immutable event log
-    // under the new reducer fold (task .6 lands the fold; until that
-    // task ships, the post-rewind projection reads zero for the new
-    // strict-mystery column and `git_unattributed_to_live_count` reads
-    // whatever the existing reducer fold produces — which IS the legacy
-    // semantic the rename preserved).
-    const storedVersionV31 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV31 < 31) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM git_status");
-      db.run("DELETE FROM file_attributions");
-      db.run("DELETE FROM subagent_invocations");
-    }
+      // v40→v41: fn-651 — agentuse rate-limit lift time + last-successful-fold
+      // freshness stamp on the `usage` projection. Two additive nullable columns
+      // riding the existing `UsageSnapshot` percentage path:
+      //   - `usage.rate_limit_lifts_at TEXT` — ISO-8601 string mirroring
+      //     `session_resets_at`. Folded from the envelope's top-level
+      //     `lift_at` field (agentuse derives it as the soonest `resets_at`
+      //     among windows at >=100%). Null when not over any limit.
+      //   - `usage.last_usage_fold_at REAL` — unix-seconds freshness stamp
+      //     equal to the event `ts` of the last SUCCESSFUL usage fold (status
+      //     `"active"` or any per-window usage present). NEVER bumped by an
+      //     idle/stale fold or the rate-limit fan-out — the renderer compares
+      //     this against the wall clock to surface a freshness warning when
+      //     ingestion has wedged. The determinism boundary is the event ts;
+      //     a wall-clock read inside the fold would break re-fold determinism.
+      //
+      // Both columns are NULL on existing rows (no data backfill — old
+      // events predate `lift_at` and predate "successful usage" semantics).
+      // The literals above in `CREATE_USAGE` keep a fresh v41 DB and a
+      // migrated v40→v41 DB converged on identical schema (the
+      // addColumnIfMissing/literal lockstep convention).
+      //
+      // The `projectUsageRow` UPSERT includes both columns in its
+      // `ON CONFLICT DO UPDATE SET` clause via the percentage path; the
+      // rate-limit fan-out's UPDATE EXCLUDES both (mirroring the v35
+      // `last_rate_limit_*` carve-out in the opposite direction) — a
+      // rate-limit fold must not write a lift time or freshness stamp, and a
+      // percentage-path fold owns them outright.
+      addColumnIfMissing(db, "usage", "rate_limit_lifts_at", "TEXT");
+      addColumnIfMissing(db, "usage", "last_usage_fold_at", "REAL");
 
-    // v31→v32: Tier 4.1 (fn-634) — `epics.default_visible` VIRTUAL generated
-    // column. Materializes the cross-column predicate
-    // `(status='open' OR approval!='approved')` as a single-column 0/1 derived
-    // value SQLite computes on every read. Paired with the partial index
-    // `idx_epics_default_visible WHERE default_visible = 1` in the always-run
-    // `CREATE_EPICS_INDEXES` block below, this collapses the OR-predicate
-    // SCAN (which Tier 4 measurement clocked at p95=3.1s on diffTick/metaCount)
-    // into a single-column SEARCH against an index that already covers the
-    // ORDER BY. No data backfill — VIRTUAL means SQLite recomputes on read,
-    // so existing rows automatically expose the correct value without an
-    // UPDATE pass.
-    //
-    // CASE-wrap is load-bearing: `status` is TEXT-nullable (no NOT NULL
-    // constraint on the column), and the bare `(status='open' OR
-    // approval!='approved')` returns NULL when status IS NULL AND
-    // approval='approved' — which would violate the column's NOT NULL
-    // constraint at scan time. CASE always returns 0 or 1, never NULL.
-    //
-    // Uses `addGeneratedColumnIfMissing` (NOT `addColumnIfMissing`): the
-    // helper reads `PRAGMA table_xinfo` so generated columns are visible to
-    // the idempotence check; `PRAGMA table_info` excludes generated columns
-    // entirely and would re-attempt the ALTER on every reopen, throwing
-    // "duplicate column" at the next boot.
-    //
-    // NOTE: the v55→v56 (fn-712) block below REWRITES this column's
-    // expression to `status IS NOT NULL AND (status='open' OR
-    // approval!='approved')` — the "epic is materialized" gate that hides
-    // a NULL-status shell row from the board. This literal here matches the
-    // v55→v56 form so a DB migrating straight from v31 → v56 lands the
-    // post-rework expression on the FIRST add (the drop+re-add in the
-    // v55→v56 block then no-ops via the xinfo presence check). A fresh DB
-    // lands it via the CREATE_EPICS literal, also kept in lockstep.
-    addGeneratedColumnIfMissing(
-      db,
-      "epics",
-      "default_visible",
-      "INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved') THEN 1 ELSE 0 END) VIRTUAL",
-    );
-
-    // Tier 2 (fn-628) always-run table-scoped indexes on epics + jobs +
-    // events. Placed AFTER the v28→v29 ADD COLUMN block stamps
-    // `epics.sort_path` so a migrating-from-v28 DB has the indexed column by
-    // the time the index runs. The remaining indexed columns (`epic_id`,
-    // `created_at`, `job_id`, `state`) all exist from schema v1; the
-    // planctl_* columns indexed here exist from schema v14. `CREATE INDEX IF
-    // NOT EXISTS` is idempotent — no SCHEMA_VERSION bump.
-    // `ANALYZE epics; ANALYZE jobs; ANALYZE events;` runs unconditionally on
-    // every boot so the planner picks the new indexes on first post-upgrade
-    // query — cost is negligible on tables under ~1.1k rows for epics/jobs;
-    // events sits at ~110k rows on the daemon's hot DB and ANALYZE costs
-    // ~10ms there. The fn-628.2 `CREATE_EVENTS_PLANCTL_INDEXES` block
-    // pairs with the OR→UNION rewrite at src/reducer.ts:~2371 so both new
-    // partial indexes are SEARCHed (not just one) at the hot-path sweep.
-    for (const sql of CREATE_EPICS_INDEXES) {
-      db.run(sql);
-    }
-    for (const sql of CREATE_JOBS_INDEXES) {
-      db.run(sql);
-    }
-    for (const sql of CREATE_EVENTS_PLANCTL_INDEXES) {
-      db.run(sql);
-    }
-    db.run("ANALYZE epics");
-    db.run("ANALYZE jobs");
-    db.run("ANALYZE events");
-
-    // v32→v33: fn-639 — `profiles` projection table keyed by `config_dir`.
-    // Maintained entirely by reducer fan-outs (SessionStart `INSERT OR IGNORE`
-    // seed + `RateLimited`/`ApiError(rate_limit)` UPSERT) inside the existing
-    // `BEGIN IMMEDIATE` transaction. No data backfill — the table populates
-    // from the event log on the next drain. A re-open of an already-migrated
-    // v33+ DB picks up the table via the unconditional `CREATE TABLE IF NOT
-    // EXISTS CREATE_PROFILES` in the bootstrap block above; this slot exists
-    // only to stamp the version bump deterministically alongside the existing
-    // ordering of migrate slots (the CREATE itself is idempotent and runs on
-    // every boot, so a fresh v33 DB picks it up via the bootstrap path).
-    //
-    // No rewind: a from-scratch re-fold (rewind cursor + `DELETE FROM
-    // profiles`) reproduces the table byte-deterministically from the event
-    // log, so an existing v32 DB transitioning to v33 will see `profiles`
-    // populate organically on the next SessionStart / rate_limit fold without
-    // disturbing the other projections.
-
-    // v33→v34: fn-637 — schema foundation for projecting cross-epic dependency
-    // resolution into the `epics` row. Two structural additions:
-    //   - `epics.resolved_epic_deps TEXT` (nullable JSON array) — carries the
-    //     resolved + enriched state of the epic's `depends_on_epics`. NULL is
-    //     load-bearing: it means "not-yet-computed" and is DISTINCT from
-    //     `'[]'` ("computed, no deps"). The zero-event projection (a freshly
-    //     created epics row) reads NULL until the reducer's task-.3 forward-
-    //     stamp computes the array. `decodeRow` returns `null` (not `[]`) for
-    //     a NULL column — clients branch on null-ness to distinguish "still
-    //     converging" from "empty by design".
-    //   - `epic_dep_edges (consumer_id, dep_token)` reverse-index table +
-    //     `idx_epic_dep_edges_dep_token` — the reverse adjacency list keying
-    //     off the raw token from each consumer's `depends_on_epics`. See the
-    //     `CREATE_EPIC_DEP_EDGES` literal for the raw-token-vs-resolved-id
-    //     rationale (ambiguity flips, dangling deps).
-    //
-    // Both column + table defs match the `CREATE_EPICS` / `CREATE_EPIC_DEP_EDGES`
-    // literals above so a fresh v34 DB and a migrated v33→v34 DB converge to
-    // identical schema (the addColumnIfMissing/literal lockstep convention).
-    // `addColumnIfMissing` is idempotent — a fresh v34 DB enters this block
-    // too and the helper no-ops because the column is already present from
-    // `CREATE_EPICS`. The `epic_dep_edges` table + index are picked up by the
-    // unconditional bootstrap CREATE block above; this slot exists for the
-    // version-bump stamp ordering and the column ALTER.
-    //
-    // No rewind: a from-scratch re-fold (rewind cursor + `DELETE FROM epics;
-    // DELETE FROM epic_dep_edges`) is the task-.3 determinism guarantee, but
-    // for the v33→v34 step itself we just leave `resolved_epic_deps` at NULL
-    // on existing rows (the "not-yet-computed" sentinel) — the next
-    // `EpicSnapshot` fold under the new reducer logic (task .3) will populate
-    // it. Forward-only: NULL on a pre-fold row is the correct zero-event
-    // shape. No backfill needed at this layer.
-    addColumnIfMissing(db, "epics", "resolved_epic_deps", "TEXT");
-
-    // v34→v35: fn-642 — colocate Claude rate-limit state into the `usage`
-    // projection. Three structural additions, all matching the CREATE_USAGE /
-    // CREATE_PROFILES literals above so a fresh v35 DB and a migrated v34→v35
-    // DB converge to identical schema (the addColumnIfMissing/literal lockstep
-    // convention):
-    //   - `usage.last_rate_limit_at REAL` (nullable) — colocated mirror of the
-    //     matching `profiles` row, populated by the schema-v35 forward
-    //     (RateLimited → usage) and reverse (UsageSnapshot ← profiles) fan-out
-    //     inside the existing `BEGIN IMMEDIATE`.
-    //   - `usage.last_rate_limit_session_id TEXT` (nullable) — paired with
-    //     `last_rate_limit_at`. Both NULL together (no rate-limit yet for the
-    //     matching profile) or both populated; the `RateLimited` arm stamps
-    //     them as a pair.
-    //   - `profiles.profile_name TEXT` (nullable) — the derived
-    //     `projectBasename(config_dir)` (last path segment), maintained by the
-    //     SessionStart seed arm in the reducer. Serves as the join key against
-    //     `usage.id` so the bidirectional fan-out lands on the matching row.
-    //
-    // The version-guarded one-time backfill below stamps `profile_name` on
-    // every existing `profiles` row, deriving the value via the same
-    // `projectBasename` helper the SessionStart seed uses (byte-identical
-    // derivation so a from-scratch re-fold and the backfilled row converge).
-    // The backfill is non-idempotent (an UPDATE that ran twice is a no-op,
-    // but the spec asks for it gated explicitly so a future re-run of this
-    // slot can't corrupt). The two `usage` columns need no backfill — they
-    // are NULL on every pre-v35 row and re-populated by the next fan-out fold
-    // (either a `RateLimited` arrival or a fresh `UsageSnapshot` joining
-    // against the matching profile row).
-    addColumnIfMissing(db, "usage", "last_rate_limit_at", "REAL");
-    addColumnIfMissing(db, "usage", "last_rate_limit_session_id", "TEXT");
-    addColumnIfMissing(db, "profiles", "profile_name", "TEXT");
-    if (preMigrateStoredVersion < 35) {
-      // Non-idempotent (version-guarded): read every `profiles` row, derive
-      // `profile_name` from `config_dir` via the SAME `projectBasename` helper
-      // the SessionStart seed uses, and UPDATE in-place. Re-fold determinism:
-      // a from-scratch re-fold drops the table and re-seeds via SessionStart,
-      // which also calls `projectBasename` — the converged shape matches.
-      // The `''` sentinel's basename is `""` — left in place as a valid
-      // (but non-joining) `profile_name`; the `profile_name != ''` guard on
-      // both sides of the join keeps it out of any usage join.
-      const rows = db.prepare("SELECT config_dir FROM profiles").all() as {
-        config_dir: string;
-      }[];
-      const updateStmt = db.prepare(
-        "UPDATE profiles SET profile_name = ? WHERE config_dir = ?",
+      // fn-649: COVERING indexes for the hoisted inferred-attribution window
+      // self-join (`computeRepoBashWindows`). Created HERE — after every column-
+      // adding version slot above — because they reference `tool_use_id` (added in
+      // the v16→v17 slot); placing them in the unconditional pre-migration
+      // `CREATE_EVENTS_INDEXES` block would fail "no such column" while migrating a
+      // pre-v17 DB. Idempotent `CREATE INDEX IF NOT EXISTS`, so no SCHEMA_VERSION
+      // bump is needed (and none claimed — v38 is taken by fn-645's `usage`
+      // envelope columns above, v39 by fn-648's backfill+rewind, v40 by
+      // fn-652's `jobs.name_history`, v41 by fn-651's `usage` lift/freshness
+      // columns).
+      //
+      // Without them the window join reads 64k bash-event full ROWS (~400MB of
+      // `data` blobs), which evicts even a 256MB cache and leaves a cold fold
+      // holding the write lock multi-second — starving hook INSERTs into dead-
+      // letters. These carry every column the query touches (filter + join +
+      // SELECT) so the planner uses COVERING INDEX and never visits a data page:
+      // measured 15ms on the live DB with an 8MB cache (cache-independent, scales
+      // with the log). `_pre` serves the PreToolUse:Bash driver; `_post` the
+      // tool_use_id-joined PostToolUse:Bash side (partial on the sparse column).
+      db.run(
+        "CREATE INDEX IF NOT EXISTS idx_events_bashwin_pre ON events(hook_event, tool_name, ts, tool_use_id, session_id)",
       );
-      for (const row of rows) {
-        updateStmt.run(projectBasename(row.config_dir), row.config_dir);
-      }
-    }
-
-    // v35→v36: stamp the derived profile name onto every `jobs` row so the
-    // usage surface's "recent sessions" log labels each job with its profile
-    // without a client-side join. `jobs.profile_name` mirrors the existing
-    // `profiles.profile_name` derivation (`projectBasename(config_dir)`),
-    // maintained by the reducer's SessionStart fold — the only arm that writes
-    // `jobs.config_dir`. Nullable and tracks `config_dir`'s OWN nullability: a
-    // NULL `config_dir` (default `~/.claude`, no `CLAUDE_CONFIG_DIR`) derives a
-    // NULL `profile_name` rather than the `''`-collapse the `profiles` seed
-    // uses — `jobs.config_dir` stays genuinely NULL (COALESCE-on-resume), so a
-    // matching-nullability `profile_name` keeps the resume precedence honest.
-    // The literal addition above (CREATE_JOBS) keeps a fresh v36 DB and a
-    // migrated v35→v36 DB converged on identical schema.
-    addColumnIfMissing(db, "jobs", "profile_name", "TEXT");
-    if (preMigrateStoredVersion < 36) {
-      // Version-guarded one-time backfill. Derive via the SAME `projectBasename`
-      // helper the SessionStart fold uses (byte-identical so a from-scratch
-      // re-fold — which drops `jobs` and re-seeds via SessionStart — converges
-      // on the same value). A NULL `config_dir` yields a NULL `profile_name`,
-      // matching the fold's `config_dir == null ? null : projectBasename(...)`
-      // derivation exactly. Non-idempotent, hence the explicit version guard so
-      // a future re-run of this slot can't re-stamp a since-cleared value.
-      const jobRows = db
-        .prepare("SELECT job_id, config_dir FROM jobs")
-        .all() as {
-        job_id: string;
-        config_dir: string | null;
-      }[];
-      const jobUpdateStmt = db.prepare(
-        "UPDATE jobs SET profile_name = ? WHERE job_id = ?",
+      db.run(
+        "CREATE INDEX IF NOT EXISTS idx_events_bashwin_post ON events(tool_use_id, hook_event, tool_name, ts, cwd, session_id) WHERE tool_use_id IS NOT NULL",
       );
-      for (const row of jobRows) {
-        jobUpdateStmt.run(
-          row.config_dir == null ? null : projectBasename(row.config_dir),
-          row.job_id,
-        );
+
+      // fn-649 follow-up: retire the pre-covering attribution indexes now that
+      // idx_events_tool_attr / idx_events_bash_attr (built above via the
+      // CREATE_EVENTS_INDEXES / CREATE_V31_INDEXES arrays at lines ~1681 / ~3508)
+      // carry every column the PASS-1 explicit-attribution scans touch. Ordered
+      // AFTER those CREATEs in the SAME migrate transaction, so an existing DB
+      // sheds the uncovered key (forcing the planner onto the covering one) and a
+      // fresh DB no-ops. DROP IF EXISTS is idempotent; no SCHEMA_VERSION bump
+      // (pure index swap — fold results, and thus re-fold determinism, unchanged).
+      db.run("DROP INDEX IF EXISTS idx_events_tool_file_path");
+      db.run("DROP INDEX IF EXISTS idx_events_bash_mutation_kind");
+
+      // v41→v42: fn-662 — shared directional mapping between keeper's `''`
+      // default-profile sentinel and agentuse's `"default"` usage id. The
+      // v35/fn-642 bidirectional rate-limit fan-out joined `usage.id =
+      // profiles.profile_name` with both arms guarding `profile_name != ''`,
+      // so a default-account rate limit never colocated onto `usage.default`
+      // — the `keeper usage` TUI rendered no `rate-limited` line for the
+      // default `~/.claude` profile even when the account was hard-rate-
+      // limited. v42 fixes both arms via a single pure helper
+      // (`usageIdForProfileName` / `profileNameForUsageId` in
+      // `src/epic-deps.ts`) that translates `''↔'default'` at the join
+      // boundary.
+      //
+      // No schema-shape change: this bump exists to gate the rewind-and-
+      // redrain that backfills the historically-stranded annotations.
+      // Same justification as v39/fn-648 (the deriver's output changed,
+      // stored projections are stale until re-derived). Future SCHEMA_VERSION
+      // bumps without column shape changes are legitimate when the reducer's
+      // fold output changed for stored events.
+      //
+      // The version-guarded rewind below mirrors v17→v18 / v18→v19's shape
+      // (cursor reset + DELETE projections in the same `.immediate()`
+      // transaction as the version stamp). A re-open of an already-migrated
+      // v42+ DB skips it (`preMigrateStoredVersion < 42`). The boot drain
+      // after migrate() returns re-folds the full event log through the v42
+      // reducer logic, healing the stranded annotation so a default-account
+      // RateLimited event colocates onto `usage.default`.
+      //
+      // Scope of the DELETE: the standard projection set the v39 rewind
+      // sweeps (jobs / epics / git_status / file_attributions /
+      // subagent_invocations) PLUS `usage` + `profiles`. The fold-output
+      // change is in those two projections, so wiping them is what makes the
+      // re-fold byte-identical-determinism-safe. The boot drain rebuilds
+      // both from `UsageSnapshot` / `RateLimited` / `ApiError` /
+      // `SessionStart` events in id order.
+      //
+      // MUST NOT touch `dead_letters`: that table is NOT a reducer projection
+      // (per CLAUDE.md "Migrations are forward-only" — `dead_letters` is the
+      // audit log of events that NEVER made it into the event log to be
+      // folded, so a re-fold cannot reproduce them).
+      if (preMigrateStoredVersion < 42) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM git_status");
+        db.run("DELETE FROM file_attributions");
+        db.run("DELETE FROM subagent_invocations");
+        db.run("DELETE FROM usage");
+        db.run("DELETE FROM profiles");
+        // fn-661 (schema v43): `dispatch_failures` is a reducer projection
+        // (epic fn-661); it joins the rewind-and-redrain set here so the
+        // canonical "wipe every reducer-owned projection table" list stays
+        // complete for any FUTURE rewind. Harmless on a v41→v42 upgrade
+        // (the table exists by the bootstrap CREATE that runs first in
+        // migrate(), but is empty — no `DispatchFailed` events have ever
+        // landed in a pre-v43 log).
+        db.run("DELETE FROM dispatch_failures");
+        // fn-667 (schema v47): `autopilot_state` is a reducer projection
+        // (epic fn-667); it joins the rewind-and-redrain set here so the
+        // canonical "wipe every reducer-owned projection table" list stays
+        // complete for any FUTURE rewind. Harmless on a v41→v42 upgrade
+        // (the table exists by the bootstrap CREATE that runs first in
+        // migrate(), but is empty — no `AutopilotPaused` events have ever
+        // landed in a pre-v47 log).
+        db.run("DELETE FROM autopilot_state");
+        // fn-678 (schema v50): `pending_dispatches` is a reducer projection
+        // (epic fn-678); it joins the rewind-and-redrain set here so the
+        // canonical "wipe every reducer-owned projection table" list stays
+        // complete for any FUTURE rewind. Harmless on a v41→v42 upgrade
+        // (the table exists by the bootstrap CREATE that runs first in
+        // migrate(), but is empty — no `Dispatched` events have ever
+        // landed in a pre-v50 log).
+        db.run("DELETE FROM pending_dispatches");
       }
-    }
 
-    // v36→v37: fn-643 — `dead_letters` OPERATIONAL sidecar table for
-    // recovering hook events the daemon-side INSERT dropped (transient
-    // SQLITE_BUSY, schema-transition window during a deploy). Picked up
-    // unconditionally by the `CREATE TABLE IF NOT EXISTS CREATE_DEAD_LETTERS`
-    // in the bootstrap block above; this slot exists only for the version-
-    // bump stamp ordering. No data backfill — the table populates exclusively
-    // from the daemon's import scan against the per-pid NDJSON dead-letter
-    // files (task .3), and stays empty on a fresh DB / a steady-state v37
-    // re-open with no dropped events on disk.
-    //
-    // The table is NOT a reducer projection — it is the daemon's operational
-    // record of events that NEVER MADE IT into the event log. The from-
-    // scratch re-fold reset path (`UPDATE reducer_state SET last_event_id =
-    // 0; DELETE FROM jobs; DELETE FROM epics`, see the v10→v11 slot above
-    // and any future rewind-and-redrain step) MUST NOT delete or touch
-    // `dead_letters`: re-folding the event log reproduces the projections
-    // byte-deterministically, but it cannot reproduce rows for events that
-    // were never appended in the first place. The replay verb (task .4) is
-    // the only way a `waiting` row transitions to `recovered`: it appends a
-    // plain real event (using the row's preserved `bindings` + `ts`) and
-    // flips `status`/stamps `recovered_at`/stamps `replayed_event_id` in
-    // ONE `BEGIN IMMEDIATE` — the recovered event then folds through the
-    // normal id-ordered drain. Re-fold determinism is preserved on the
-    // event-log side; the dead-letter sidecar is the daemon's separate
-    // audit log of what was never folded until the human recovered it.
-    //
-    // See `CREATE_DEAD_LETTERS` above for the column docstring.
+      // v42→v43: fn-661 — `dispatch_failures` projection table, the durable
+      // substrate the server-side autopilot reconciler writes to. Picked up
+      // unconditionally by the `CREATE TABLE IF NOT EXISTS
+      // CREATE_DISPATCH_FAILURES` in the bootstrap block above; this slot
+      // exists only for the version-bump stamp ordering. No data backfill —
+      // the table populates exclusively from the reducer's `DispatchFailed`
+      // / `DispatchCleared` fold arms (epic fn-661, downstream tasks), and
+      // stays empty on a fresh DB / a steady-state v43 re-open with no
+      // prior dispatch failures.
+      //
+      // The table IS a reducer projection (unlike `dead_letters`, which is
+      // the sidecar audit log of events that never made it into the event
+      // log to be folded). A from-scratch re-fold rebuilds it byte-
+      // identically from the synthetic `DispatchFailed` / `DispatchCleared`
+      // events in the log — so it MUST be included in any future rewind-
+      // and-redrain DELETE list (see the v41→v42 slot above) and in the
+      // v10→v11 from-scratch reset (the next time a slot needs to wipe and
+      // re-fold all projections together).
+      //
+      // No keeper-py reader change: keeper-py reads neither
+      // `dispatch_failures` nor any other autopilot surface, so the v43
+      // bump is whitelist-only on the Python side (`api.py`'s
+      // `SUPPORTED_SCHEMA_VERSIONS` frozenset adds 43 in the same change).
 
-    // v37→v38: fn-645 — project the agentuse envelope's status /
-    // subscription_active / error axes onto the `usage` row so renderers can
-    // surface freshness, no-subscription gating, and stale-failure context.
-    // Five nullable columns, all matching the `CREATE_USAGE` literal above so
-    // a fresh v38 DB and a migrated v37→v38 DB converge to identical schema
-    // (the addColumnIfMissing/literal lockstep convention):
-    //   - `usage.status TEXT` (nullable) — `"active" | "idle" | "stale"`.
-    //   - `usage.subscription_active INTEGER` (nullable) — 1/0/NULL, the
-    //     plan-tier axis coerced from the envelope's bool|null.
-    //   - `usage.error_type TEXT` (nullable) — present only when status is
-    //     `"stale"`; carries the agentuse-side exception class name.
-    //   - `usage.error_message TEXT` (nullable) — the matching error message.
-    //   - `usage.error_at TEXT` (nullable) — ISO-8601 stamp of the failed
-    //     scrape. Projected but EXCLUDED from the worker change-gate
-    //     (`usageGateKey` in `src/usage-worker.ts`) since `error.at` advances
-    //     on every failed scrape (~90s during an outage) and including it
-    //     would force a synthetic event every cycle — the same discipline as
-    //     the four freshness fields, here applied per-field within an
-    //     otherwise-gated message.
-    //
-    // No data backfill — every column is NULL on pre-v38 rows and
-    // repopulated by the next `UsageSnapshot` fold against the new envelope
-    // (mirrors the v34→v35 `last_rate_limit_at` / `last_rate_limit_session_id`
-    // additions; same forward-only convention).
-    addColumnIfMissing(db, "usage", "status", "TEXT");
-    addColumnIfMissing(db, "usage", "subscription_active", "INTEGER");
-    addColumnIfMissing(db, "usage", "error_type", "TEXT");
-    addColumnIfMissing(db, "usage", "error_message", "TEXT");
-    addColumnIfMissing(db, "usage", "error_at", "TEXT");
+      // v43→v44: fn-664 — additive nullable `file_attributions.worktree_oid`
+      // column carrying the filter-correct git blob oid of each dirty file's
+      // worktree bytes, frozen into the `GitSnapshot` event payload by the
+      // producer (`git hash-object --stdin-paths`, WITHOUT `--no-filters`, one
+      // batch per snapshot). Task .2 of the epic will switch `foldCommit`'s
+      // discharge rule to gate on `committed_oid == worktree_oid`; this slot
+      // ships only the column + producer plumbing so discharge behavior is
+      // UNCHANGED at v44. Forward-only, nullable, NO data backfill — pre-v44
+      // `file_attributions` rows keep `worktree_oid = null` (the oid cannot be
+      // re-derived from stored events; the producer paid for it at snapshot
+      // time only). The reducer's content-aware discharge in task .2 treats
+      // NULL as "cannot confirm content equality → keep attribution active"
+      // (the safer fall-back to today's timestamp-only discharge), so a NULL
+      // here never silently drops a claim.
+      //
+      // Idempotent via `addColumnIfMissing` (fresh v44 DBs land it via the
+      // CREATE_FILE_ATTRIBUTIONS literal above, migrating v43 DBs land it
+      // here); no version guard needed because both paths converge on the
+      // same column shape and ADD COLUMN never rewrites existing rows. No
+      // keeper-py reader change: keeper-py reads `file_attributions` only for
+      // the `session_id` / `file_path` / `last_mutation_at` / `last_commit_at`
+      // tuple via the existing query; `worktree_oid` is server-side fold
+      // input, not part of the wire surface — so v44 is whitelist-only on
+      // the Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset
+      // adds 44 in the same change).
+      addColumnIfMissing(db, "file_attributions", "worktree_oid", "TEXT");
 
-    // v38→v39: fn-648 — backfill `bash_mutation_kind` / `bash_mutation_targets`
-    // over every historical `PostToolUse:Bash` row via the SHARED
-    // `extractBashMutation` deriver, then rewind the reducer cursor and wipe
-    // the projection tables so a from-scratch re-fold reproduces healed
-    // attributions byte-deterministically.
-    //
-    // No schema-shape change: the two sparse columns already exist (added in
-    // the v30→v31 slot above). The bump exists to gate the backfill + rewind
-    // version-guards so a re-open of an already-migrated v39+ DB skips both
-    // (the idempotence invariant). A future SCHEMA_VERSION bump that doesn't
-    // change column shape is unusual but legitimate: the deriver's *output*
-    // changed (it now recognizes `git-rm` / `git-mv` and ignores redirect
-    // tokens), and stored historical column values are stale until re-derived.
-    //
-    // Two version-guarded steps mirror v30→v31's shape (src/db.ts:3445-3539):
-    //
-    //   1. Backfill: walk every `PostToolUse:Bash` event, JSON.parse the
-    //      payload (defensive: malformed → (null, null), matching the
-    //      CLAUDE.md "safe value on malformed payload" invariant), re-derive
-    //      via the SHARED deriver, and UPDATE the two sparse columns in
-    //      place. Re-fold determinism (CLAUDE.md "byte-identical re-fold"):
-    //      historical rows and future hook writes must converge on the same
-    //      column values for the same payload via the same deriver function.
-    //      The new `git-rm` / `git-mv` kinds and the redirect-token fix from
-    //      `.1` apply to every stored row, not just future writes.
-    //
-    //   2. Cursor-rewind + DELETE projections: the new reducer match logic
-    //      from `.2` (exact + directory-prefix + fnmatch against the
-    //      snapshot-known deleted/renamed paths) changes historical
-    //      attributions — files that were `<orphan>` under the old logic
-    //      become attributed under the new logic. Without rewinding, the
-    //      stored `jobs.git_unattributed_to_live_count` / `jobs.git_orphan_count`
-    //      / `git_status.dirty_files[].attributions` / `file_attributions`
-    //      values would diverge from a fresh re-fold, violating
-    //      determinism. The honest path is to wipe and re-fold: cursor=0,
-    //      DELETE the four projection tables (jobs/epics/git_status/
-    //      file_attributions/subagent_invocations — the last for symmetry
-    //      with v31's "rebuild every projection table" pattern), boot drain
-    //      re-derives every column under the new reducer logic.
-    //
-    // Performance: the backfill re-runs the deriver per row. The redirect
-    // fix widened the affected set beyond git — every `fs-remove` /
-    // `fs-move` / `fs-copy` / `git-*` row re-derives. v31's backfill was
-    // sub-second at ~10-20k rows on the hot DB; this one is the same shape
-    // (single-pass tokenizer over length-capped command strings).
-    const storedVersionV39Backfill = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV39Backfill < 39) {
-      const rows = db
-        .prepare(
-          `SELECT id, hook_event, tool_name, cwd, data FROM events
-             WHERE tool_name = 'Bash' AND hook_event = 'PostToolUse'`,
-        )
-        .all() as {
-        id: number;
-        hook_event: string;
-        tool_name: string | null;
-        cwd: string | null;
-        data: string;
-      }[];
-      const updateStmt = db.prepare(
-        `UPDATE events
-            SET bash_mutation_kind = ?, bash_mutation_targets = ?
-          WHERE id = ?`,
+      // v44→v45: fn-664.2 — additive nullable `file_attributions.worktree_mode`
+      // column pairing with `worktree_oid` on the content-aware discharge
+      // gate. The porcelain v2 `mW` mode (`100644` / `100755` / `120000` /
+      // `160000`) frozen by the producer at GitSnapshot time; reducer pass-1
+      // / pass-2 UPSERT stamps it alongside `worktree_oid`, post-pass refresh
+      // UPDATE keeps every row for a `(project_dir, file_path)` aligned on the
+      // freshest snapshot value. `foldCommit` reads both axes back and gates
+      // discharge on `committed_oid == worktree_oid AND committed_mode ==
+      // worktree_mode` (both pairs non-null) — so a chmod-only dirty file
+      // with `committed_oid == worktree_oid` but a differing mode is NOT
+      // wrongly discharged.
+      //
+      // Forward-only, nullable, NO data backfill — pre-v45 rows keep
+      // `worktree_mode = null` and the discharge gate falls back to today's
+      // UNCONDITIONAL timestamp discharge on a NULL mode (safer side,
+      // re-fold-deterministic over historical pre-v45 events whose payload
+      // never carried `worktree_mode` / `committed_mode`). Idempotent via
+      // `addColumnIfMissing` — fresh v45 DBs land it via the
+      // CREATE_FILE_ATTRIBUTIONS literal above, migrating v44 DBs land it
+      // here; no version guard needed because both paths converge on the
+      // same column shape and ADD COLUMN never rewrites existing rows.
+      //
+      // No keeper-py reader change: keeper-py reads `file_attributions` only
+      // for the `session_id` / `file_path` / `last_mutation_at` /
+      // `last_commit_at` tuple; `worktree_mode` is server-side fold input,
+      // not part of the wire surface — so v45 is whitelist-only on the
+      // Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset adds
+      // 45 in the same change).
+      addColumnIfMissing(db, "file_attributions", "worktree_mode", "TEXT");
+
+      // v45→v46: fn-666 — attribute planctl file writes. Three coordinated
+      // schema-level changes plus a backfill + cursor rewind:
+      //
+      //   1. Additive nullable `events.planctl_files TEXT` column carrying the
+      //      JSON-encoded repo-relative paths planctl wrote during a single op
+      //      (every JSON / spec under `.planctl/`). Lifted defensively by
+      //      `extractPlanctlInvocation` at hook write time (Array.isArray +
+      //      string filter + runaway cap; NULL on miss). Mirrors
+      //      `bash_mutation_targets`'s sparse-column pattern.
+      //   2. `file_attributions.source` CHECK widens to include `'planctl'`.
+      //      SQLite cannot ALTER a CHECK in place, so this is a row-preserving
+      //      TABLE REBUILD: create the new shape, INSERT…SELECT every existing
+      //      row byte-identical, DROP the old, RENAME the new. PRESERVES every
+      //      existing row's column tuple, primary key, indexes (re-created
+      //      against the new table via `CREATE_FILE_ATTRIBUTIONS_INDEXES`).
+      //   3. Backfill `events.planctl_files` over historical
+      //      `PostToolUse:Bash` planctl events from the stored envelope (same
+      //      pure deriver the hook calls steady-state, so re-fold determinism
+      //      is mechanical). Then cursor-rewind + DELETE the four projection
+      //      tables so the next boot drain re-folds the healed log under the
+      //      new mint path (the new reducer rule wouldn't otherwise re-attribute
+      //      historical planctl events). Mirrors fn-648's v38→v39 git-rm/mv
+      //      backfill + rewind shape exactly.
+      //
+      // The CHECK rebuild MUST run BEFORE the rewind (which DELETEs the table,
+      // not DROPs it — DELETE preserves the new CHECK shape) AND before the
+      // post-migrate boot drain re-folds (which writes `source='planctl'`
+      // rows that the OLD CHECK would reject). Three version-guarded steps so
+      // a re-open of an already-migrated v46+ DB skips them all (idempotence).
+      //
+      // No keeper-py reader change: keeper-py reads `file_attributions` only
+      // for the `session_id` / `file_path` / `last_mutation_at` /
+      // `last_commit_at` tuple — neither `planctl_files` (on events) nor the
+      // widened `source` enum changes that wire surface. The v46 bump is
+      // whitelist-only on the Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS`
+      // frozenset adds 46 in the same change — test/schema-version.test.ts
+      // enforces).
+      addColumnIfMissing(db, "events", "planctl_files", "TEXT");
+
+      // Read the stored version BEFORE any version-guarded step runs, so all
+      // three steps gate on the SAME pre-migrate value. We can't trust the
+      // pre-migrate guard the loop above used because that guard already
+      // raised the version (`INSERT INTO meta ... ON CONFLICT DO UPDATE`
+      // hasn't fired yet at this point — but the v44/v45 guards above used
+      // `storedVersionV39Backfill` reads, so following their precedent).
+      const storedVersionV46 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
       );
-      for (const row of rows) {
-        // Defensive parse — mirrors the v30→v31 backfill: a malformed
-        // historical `data` blob folds to safe NULL (CLAUDE.md "safe value
-        // on malformed payload" invariant); the deriver itself never
-        // throws because every branch is a typeof guard. The try/catch
-        // around JSON.parse keeps a corrupt row from wedging migrate().
-        let parsed: Record<string, unknown>;
-        try {
-          parsed = JSON.parse(row.data) as Record<string, unknown>;
-          if (typeof parsed !== "object" || parsed === null) {
-            updateStmt.run(null, null, row.id);
-            continue;
-          }
-        } catch {
-          updateStmt.run(null, null, row.id);
-          continue;
-        }
-        const mutation = extractBashMutation(
-          row.hook_event,
-          row.tool_name,
-          parsed,
-          row.cwd,
-        );
-        if (mutation === null) {
-          updateStmt.run(null, null, row.id);
-          continue;
-        }
-        updateStmt.run(mutation.kind, JSON.stringify(mutation.targets), row.id);
-      }
-    }
 
-    // Version-guarded rewind: mirrors v30→v31's rewind block. A re-open of
-    // an already-migrated v39+ DB skips this. The boot drain after migrate()
-    // returns rebuilds all five projections from the immutable event log
-    // under the new reducer fold logic (`.2`).
-    const storedVersionV39Rewind = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV39Rewind < 39) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM git_status");
-      db.run("DELETE FROM file_attributions");
-      db.run("DELETE FROM subagent_invocations");
-    }
-
-    // v39→v40: fn-652 — `jobs.name_history` ordered JSON array of the distinct
-    // titles a job has carried (oldest→newest, current title last, deduped,
-    // capped at the most-recent 20). Maintained by the reducer's title
-    // precedence-write block — when the persisted `(title, title_source)`
-    // is promoted to a new distinct value, the new title is appended to the
-    // persisted array iff it is not already the last element. The cap is
-    // applied by slicing to the last 20 entries. Pure function of the
-    // persisted cell + the incoming title (no `Date.now`, no event-arrival
-    // ordering) so a from-scratch re-fold reproduces byte-identical
-    // `name_history` values. Seeded on the SessionStart spawn insert with
-    // `["<spawn name>"]` when `spawn_name != null`, else `'[]'` (the schema
-    // default).
-    //
-    // Mirrors `epic_links` (TEXT NOT NULL DEFAULT '[]') — same JSON-array
-    // convention. The literal addition above in CREATE_JOBS keeps a fresh
-    // v40 DB and a migrated v39→v40 DB converged on identical schema (the
-    // addColumnIfMissing/literal lockstep convention).
-    //
-    // The version-guarded one-time backfill below seeds `name_history` for
-    // every existing `jobs` row: `["<title>"]` when `title` is non-NULL,
-    // `'[]'` otherwise. A re-open of an already-migrated v40+ DB skips the
-    // backfill via the `preMigrateStoredVersion < 40` guard. Re-fold
-    // determinism: a from-scratch re-fold drops the `jobs` table and re-
-    // seeds via SessionStart's spawn-title insert and subsequent title-
-    // precedence writes — the backfilled `["<title>"]` matches what the
-    // fold would have produced (the current `title` was either seeded at
-    // SessionStart or promoted through the title rule, both of which the
-    // new append logic would record as the sole entry on a fresh fold).
-    addColumnIfMissing(
-      db,
-      "jobs",
-      "name_history",
-      "TEXT NOT NULL DEFAULT '[]'",
-    );
-    if (preMigrateStoredVersion < 40) {
-      // Non-idempotent (version-guarded): read every `jobs` row, derive the
-      // seed array from `title`, and UPDATE in-place. A NULL `title` keeps
-      // the schema-default `'[]'` (the column was added NOT NULL DEFAULT
-      // '[]' above, so the freshly-added cell is already `'[]'`; the UPDATE
-      // is a no-op write in that case but is explicit for symmetry).
-      const rows = db.prepare("SELECT job_id, title FROM jobs").all() as {
-        job_id: string;
-        title: string | null;
-      }[];
-      const updateStmt = db.prepare(
-        "UPDATE jobs SET name_history = ? WHERE job_id = ?",
-      );
-      for (const row of rows) {
-        const seed = row.title != null ? JSON.stringify([row.title]) : "[]";
-        updateStmt.run(seed, row.job_id);
-      }
-    }
-
-    // v40→v41: fn-651 — agentuse rate-limit lift time + last-successful-fold
-    // freshness stamp on the `usage` projection. Two additive nullable columns
-    // riding the existing `UsageSnapshot` percentage path:
-    //   - `usage.rate_limit_lifts_at TEXT` — ISO-8601 string mirroring
-    //     `session_resets_at`. Folded from the envelope's top-level
-    //     `lift_at` field (agentuse derives it as the soonest `resets_at`
-    //     among windows at >=100%). Null when not over any limit.
-    //   - `usage.last_usage_fold_at REAL` — unix-seconds freshness stamp
-    //     equal to the event `ts` of the last SUCCESSFUL usage fold (status
-    //     `"active"` or any per-window usage present). NEVER bumped by an
-    //     idle/stale fold or the rate-limit fan-out — the renderer compares
-    //     this against the wall clock to surface a freshness warning when
-    //     ingestion has wedged. The determinism boundary is the event ts;
-    //     a wall-clock read inside the fold would break re-fold determinism.
-    //
-    // Both columns are NULL on existing rows (no data backfill — old
-    // events predate `lift_at` and predate "successful usage" semantics).
-    // The literals above in `CREATE_USAGE` keep a fresh v41 DB and a
-    // migrated v40→v41 DB converged on identical schema (the
-    // addColumnIfMissing/literal lockstep convention).
-    //
-    // The `projectUsageRow` UPSERT includes both columns in its
-    // `ON CONFLICT DO UPDATE SET` clause via the percentage path; the
-    // rate-limit fan-out's UPDATE EXCLUDES both (mirroring the v35
-    // `last_rate_limit_*` carve-out in the opposite direction) — a
-    // rate-limit fold must not write a lift time or freshness stamp, and a
-    // percentage-path fold owns them outright.
-    addColumnIfMissing(db, "usage", "rate_limit_lifts_at", "TEXT");
-    addColumnIfMissing(db, "usage", "last_usage_fold_at", "REAL");
-
-    // fn-649: COVERING indexes for the hoisted inferred-attribution window
-    // self-join (`computeRepoBashWindows`). Created HERE — after every column-
-    // adding version slot above — because they reference `tool_use_id` (added in
-    // the v16→v17 slot); placing them in the unconditional pre-migration
-    // `CREATE_EVENTS_INDEXES` block would fail "no such column" while migrating a
-    // pre-v17 DB. Idempotent `CREATE INDEX IF NOT EXISTS`, so no SCHEMA_VERSION
-    // bump is needed (and none claimed — v38 is taken by fn-645's `usage`
-    // envelope columns above, v39 by fn-648's backfill+rewind, v40 by
-    // fn-652's `jobs.name_history`, v41 by fn-651's `usage` lift/freshness
-    // columns).
-    //
-    // Without them the window join reads 64k bash-event full ROWS (~400MB of
-    // `data` blobs), which evicts even a 256MB cache and leaves a cold fold
-    // holding the write lock multi-second — starving hook INSERTs into dead-
-    // letters. These carry every column the query touches (filter + join +
-    // SELECT) so the planner uses COVERING INDEX and never visits a data page:
-    // measured 15ms on the live DB with an 8MB cache (cache-independent, scales
-    // with the log). `_pre` serves the PreToolUse:Bash driver; `_post` the
-    // tool_use_id-joined PostToolUse:Bash side (partial on the sparse column).
-    db.run(
-      "CREATE INDEX IF NOT EXISTS idx_events_bashwin_pre ON events(hook_event, tool_name, ts, tool_use_id, session_id)",
-    );
-    db.run(
-      "CREATE INDEX IF NOT EXISTS idx_events_bashwin_post ON events(tool_use_id, hook_event, tool_name, ts, cwd, session_id) WHERE tool_use_id IS NOT NULL",
-    );
-
-    // fn-649 follow-up: retire the pre-covering attribution indexes now that
-    // idx_events_tool_attr / idx_events_bash_attr (built above via the
-    // CREATE_EVENTS_INDEXES / CREATE_V31_INDEXES arrays at lines ~1681 / ~3508)
-    // carry every column the PASS-1 explicit-attribution scans touch. Ordered
-    // AFTER those CREATEs in the SAME migrate transaction, so an existing DB
-    // sheds the uncovered key (forcing the planner onto the covering one) and a
-    // fresh DB no-ops. DROP IF EXISTS is idempotent; no SCHEMA_VERSION bump
-    // (pure index swap — fold results, and thus re-fold determinism, unchanged).
-    db.run("DROP INDEX IF EXISTS idx_events_tool_file_path");
-    db.run("DROP INDEX IF EXISTS idx_events_bash_mutation_kind");
-
-    // v41→v42: fn-662 — shared directional mapping between keeper's `''`
-    // default-profile sentinel and agentuse's `"default"` usage id. The
-    // v35/fn-642 bidirectional rate-limit fan-out joined `usage.id =
-    // profiles.profile_name` with both arms guarding `profile_name != ''`,
-    // so a default-account rate limit never colocated onto `usage.default`
-    // — the `keeper usage` TUI rendered no `rate-limited` line for the
-    // default `~/.claude` profile even when the account was hard-rate-
-    // limited. v42 fixes both arms via a single pure helper
-    // (`usageIdForProfileName` / `profileNameForUsageId` in
-    // `src/epic-deps.ts`) that translates `''↔'default'` at the join
-    // boundary.
-    //
-    // No schema-shape change: this bump exists to gate the rewind-and-
-    // redrain that backfills the historically-stranded annotations.
-    // Same justification as v39/fn-648 (the deriver's output changed,
-    // stored projections are stale until re-derived). Future SCHEMA_VERSION
-    // bumps without column shape changes are legitimate when the reducer's
-    // fold output changed for stored events.
-    //
-    // The version-guarded rewind below mirrors v17→v18 / v18→v19's shape
-    // (cursor reset + DELETE projections in the same `.immediate()`
-    // transaction as the version stamp). A re-open of an already-migrated
-    // v42+ DB skips it (`preMigrateStoredVersion < 42`). The boot drain
-    // after migrate() returns re-folds the full event log through the v42
-    // reducer logic, healing the stranded annotation so a default-account
-    // RateLimited event colocates onto `usage.default`.
-    //
-    // Scope of the DELETE: the standard projection set the v39 rewind
-    // sweeps (jobs / epics / git_status / file_attributions /
-    // subagent_invocations) PLUS `usage` + `profiles`. The fold-output
-    // change is in those two projections, so wiping them is what makes the
-    // re-fold byte-identical-determinism-safe. The boot drain rebuilds
-    // both from `UsageSnapshot` / `RateLimited` / `ApiError` /
-    // `SessionStart` events in id order.
-    //
-    // MUST NOT touch `dead_letters`: that table is NOT a reducer projection
-    // (per CLAUDE.md "Migrations are forward-only" — `dead_letters` is the
-    // audit log of events that NEVER made it into the event log to be
-    // folded, so a re-fold cannot reproduce them).
-    if (preMigrateStoredVersion < 42) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM git_status");
-      db.run("DELETE FROM file_attributions");
-      db.run("DELETE FROM subagent_invocations");
-      db.run("DELETE FROM usage");
-      db.run("DELETE FROM profiles");
-      // fn-661 (schema v43): `dispatch_failures` is a reducer projection
-      // (epic fn-661); it joins the rewind-and-redrain set here so the
-      // canonical "wipe every reducer-owned projection table" list stays
-      // complete for any FUTURE rewind. Harmless on a v41→v42 upgrade
-      // (the table exists by the bootstrap CREATE that runs first in
-      // migrate(), but is empty — no `DispatchFailed` events have ever
-      // landed in a pre-v43 log).
-      db.run("DELETE FROM dispatch_failures");
-      // fn-667 (schema v47): `autopilot_state` is a reducer projection
-      // (epic fn-667); it joins the rewind-and-redrain set here so the
-      // canonical "wipe every reducer-owned projection table" list stays
-      // complete for any FUTURE rewind. Harmless on a v41→v42 upgrade
-      // (the table exists by the bootstrap CREATE that runs first in
-      // migrate(), but is empty — no `AutopilotPaused` events have ever
-      // landed in a pre-v47 log).
-      db.run("DELETE FROM autopilot_state");
-      // fn-678 (schema v50): `pending_dispatches` is a reducer projection
-      // (epic fn-678); it joins the rewind-and-redrain set here so the
-      // canonical "wipe every reducer-owned projection table" list stays
-      // complete for any FUTURE rewind. Harmless on a v41→v42 upgrade
-      // (the table exists by the bootstrap CREATE that runs first in
-      // migrate(), but is empty — no `Dispatched` events have ever
-      // landed in a pre-v50 log).
-      db.run("DELETE FROM pending_dispatches");
-    }
-
-    // v42→v43: fn-661 — `dispatch_failures` projection table, the durable
-    // substrate the server-side autopilot reconciler writes to. Picked up
-    // unconditionally by the `CREATE TABLE IF NOT EXISTS
-    // CREATE_DISPATCH_FAILURES` in the bootstrap block above; this slot
-    // exists only for the version-bump stamp ordering. No data backfill —
-    // the table populates exclusively from the reducer's `DispatchFailed`
-    // / `DispatchCleared` fold arms (epic fn-661, downstream tasks), and
-    // stays empty on a fresh DB / a steady-state v43 re-open with no
-    // prior dispatch failures.
-    //
-    // The table IS a reducer projection (unlike `dead_letters`, which is
-    // the sidecar audit log of events that never made it into the event
-    // log to be folded). A from-scratch re-fold rebuilds it byte-
-    // identically from the synthetic `DispatchFailed` / `DispatchCleared`
-    // events in the log — so it MUST be included in any future rewind-
-    // and-redrain DELETE list (see the v41→v42 slot above) and in the
-    // v10→v11 from-scratch reset (the next time a slot needs to wipe and
-    // re-fold all projections together).
-    //
-    // No keeper-py reader change: keeper-py reads neither
-    // `dispatch_failures` nor any other autopilot surface, so the v43
-    // bump is whitelist-only on the Python side (`api.py`'s
-    // `SUPPORTED_SCHEMA_VERSIONS` frozenset adds 43 in the same change).
-
-    // v43→v44: fn-664 — additive nullable `file_attributions.worktree_oid`
-    // column carrying the filter-correct git blob oid of each dirty file's
-    // worktree bytes, frozen into the `GitSnapshot` event payload by the
-    // producer (`git hash-object --stdin-paths`, WITHOUT `--no-filters`, one
-    // batch per snapshot). Task .2 of the epic will switch `foldCommit`'s
-    // discharge rule to gate on `committed_oid == worktree_oid`; this slot
-    // ships only the column + producer plumbing so discharge behavior is
-    // UNCHANGED at v44. Forward-only, nullable, NO data backfill — pre-v44
-    // `file_attributions` rows keep `worktree_oid = null` (the oid cannot be
-    // re-derived from stored events; the producer paid for it at snapshot
-    // time only). The reducer's content-aware discharge in task .2 treats
-    // NULL as "cannot confirm content equality → keep attribution active"
-    // (the safer fall-back to today's timestamp-only discharge), so a NULL
-    // here never silently drops a claim.
-    //
-    // Idempotent via `addColumnIfMissing` (fresh v44 DBs land it via the
-    // CREATE_FILE_ATTRIBUTIONS literal above, migrating v43 DBs land it
-    // here); no version guard needed because both paths converge on the
-    // same column shape and ADD COLUMN never rewrites existing rows. No
-    // keeper-py reader change: keeper-py reads `file_attributions` only for
-    // the `session_id` / `file_path` / `last_mutation_at` / `last_commit_at`
-    // tuple via the existing query; `worktree_oid` is server-side fold
-    // input, not part of the wire surface — so v44 is whitelist-only on
-    // the Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset
-    // adds 44 in the same change).
-    addColumnIfMissing(db, "file_attributions", "worktree_oid", "TEXT");
-
-    // v44→v45: fn-664.2 — additive nullable `file_attributions.worktree_mode`
-    // column pairing with `worktree_oid` on the content-aware discharge
-    // gate. The porcelain v2 `mW` mode (`100644` / `100755` / `120000` /
-    // `160000`) frozen by the producer at GitSnapshot time; reducer pass-1
-    // / pass-2 UPSERT stamps it alongside `worktree_oid`, post-pass refresh
-    // UPDATE keeps every row for a `(project_dir, file_path)` aligned on the
-    // freshest snapshot value. `foldCommit` reads both axes back and gates
-    // discharge on `committed_oid == worktree_oid AND committed_mode ==
-    // worktree_mode` (both pairs non-null) — so a chmod-only dirty file
-    // with `committed_oid == worktree_oid` but a differing mode is NOT
-    // wrongly discharged.
-    //
-    // Forward-only, nullable, NO data backfill — pre-v45 rows keep
-    // `worktree_mode = null` and the discharge gate falls back to today's
-    // UNCONDITIONAL timestamp discharge on a NULL mode (safer side,
-    // re-fold-deterministic over historical pre-v45 events whose payload
-    // never carried `worktree_mode` / `committed_mode`). Idempotent via
-    // `addColumnIfMissing` — fresh v45 DBs land it via the
-    // CREATE_FILE_ATTRIBUTIONS literal above, migrating v44 DBs land it
-    // here; no version guard needed because both paths converge on the
-    // same column shape and ADD COLUMN never rewrites existing rows.
-    //
-    // No keeper-py reader change: keeper-py reads `file_attributions` only
-    // for the `session_id` / `file_path` / `last_mutation_at` /
-    // `last_commit_at` tuple; `worktree_mode` is server-side fold input,
-    // not part of the wire surface — so v45 is whitelist-only on the
-    // Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset adds
-    // 45 in the same change).
-    addColumnIfMissing(db, "file_attributions", "worktree_mode", "TEXT");
-
-    // v45→v46: fn-666 — attribute planctl file writes. Three coordinated
-    // schema-level changes plus a backfill + cursor rewind:
-    //
-    //   1. Additive nullable `events.planctl_files TEXT` column carrying the
-    //      JSON-encoded repo-relative paths planctl wrote during a single op
-    //      (every JSON / spec under `.planctl/`). Lifted defensively by
-    //      `extractPlanctlInvocation` at hook write time (Array.isArray +
-    //      string filter + runaway cap; NULL on miss). Mirrors
-    //      `bash_mutation_targets`'s sparse-column pattern.
-    //   2. `file_attributions.source` CHECK widens to include `'planctl'`.
-    //      SQLite cannot ALTER a CHECK in place, so this is a row-preserving
-    //      TABLE REBUILD: create the new shape, INSERT…SELECT every existing
-    //      row byte-identical, DROP the old, RENAME the new. PRESERVES every
-    //      existing row's column tuple, primary key, indexes (re-created
-    //      against the new table via `CREATE_FILE_ATTRIBUTIONS_INDEXES`).
-    //   3. Backfill `events.planctl_files` over historical
-    //      `PostToolUse:Bash` planctl events from the stored envelope (same
-    //      pure deriver the hook calls steady-state, so re-fold determinism
-    //      is mechanical). Then cursor-rewind + DELETE the four projection
-    //      tables so the next boot drain re-folds the healed log under the
-    //      new mint path (the new reducer rule wouldn't otherwise re-attribute
-    //      historical planctl events). Mirrors fn-648's v38→v39 git-rm/mv
-    //      backfill + rewind shape exactly.
-    //
-    // The CHECK rebuild MUST run BEFORE the rewind (which DELETEs the table,
-    // not DROPs it — DELETE preserves the new CHECK shape) AND before the
-    // post-migrate boot drain re-folds (which writes `source='planctl'`
-    // rows that the OLD CHECK would reject). Three version-guarded steps so
-    // a re-open of an already-migrated v46+ DB skips them all (idempotence).
-    //
-    // No keeper-py reader change: keeper-py reads `file_attributions` only
-    // for the `session_id` / `file_path` / `last_mutation_at` /
-    // `last_commit_at` tuple — neither `planctl_files` (on events) nor the
-    // widened `source` enum changes that wire surface. The v46 bump is
-    // whitelist-only on the Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS`
-    // frozenset adds 46 in the same change — test/schema-version.test.ts
-    // enforces).
-    addColumnIfMissing(db, "events", "planctl_files", "TEXT");
-
-    // Read the stored version BEFORE any version-guarded step runs, so all
-    // three steps gate on the SAME pre-migrate value. We can't trust the
-    // pre-migrate guard the loop above used because that guard already
-    // raised the version (`INSERT INTO meta ... ON CONFLICT DO UPDATE`
-    // hasn't fired yet at this point — but the v44/v45 guards above used
-    // `storedVersionV39Backfill` reads, so following their precedent).
-    const storedVersionV46 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-
-    // Step 2: file_attributions CHECK rebuild. SQLite has no `ALTER TABLE …
-    // ALTER CONSTRAINT`, so the canonical pattern is create-new + copy +
-    // drop-old + rename. Row order in INSERT…SELECT is preserved
-    // byte-identical (we SELECT every column in CREATE order); a re-fold
-    // from cursor 0 would write the same rows again so the post-rebuild
-    // table converges with a from-scratch re-fold (the rewind below
-    // wipes the table anyway, so the copy is mostly a no-op in practice
-    // — but it MUST be byte-faithful on the chance the rewind ever
-    // gets removed). The indexes get re-created against the new table
-    // via the index DDL loop below — SQLite drops indexes when their
-    // base table is dropped.
-    if (storedVersionV46 < 46) {
-      // Use a temp name so the new table doesn't clash with the old one.
-      // Drop any leftover from an interrupted prior migration attempt
-      // first — defensive idempotence (a half-applied v45→v46 boot
-      // would leave the temp table dangling).
-      db.run("DROP TABLE IF EXISTS file_attributions_v46_tmp");
-      db.run(`
+      // Step 2: file_attributions CHECK rebuild. SQLite has no `ALTER TABLE …
+      // ALTER CONSTRAINT`, so the canonical pattern is create-new + copy +
+      // drop-old + rename. Row order in INSERT…SELECT is preserved
+      // byte-identical (we SELECT every column in CREATE order); a re-fold
+      // from cursor 0 would write the same rows again so the post-rebuild
+      // table converges with a from-scratch re-fold (the rewind below
+      // wipes the table anyway, so the copy is mostly a no-op in practice
+      // — but it MUST be byte-faithful on the chance the rewind ever
+      // gets removed). The indexes get re-created against the new table
+      // via the index DDL loop below — SQLite drops indexes when their
+      // base table is dropped.
+      if (storedVersionV46 < 46) {
+        // Use a temp name so the new table doesn't clash with the old one.
+        // Drop any leftover from an interrupted prior migration attempt
+        // first — defensive idempotence (a half-applied v45→v46 boot
+        // would leave the temp table dangling).
+        db.run("DROP TABLE IF EXISTS file_attributions_v46_tmp");
+        db.run(`
         CREATE TABLE file_attributions_v46_tmp (
             project_dir TEXT NOT NULL,
             session_id TEXT NOT NULL,
@@ -4838,11 +4895,11 @@ function migrate(db: Database): void {
             PRIMARY KEY (project_dir, session_id, file_path)
         )
       `);
-      // Byte-faithful copy. ORDER BY rowid to keep the physical-row order
-      // stable across the rebuild — re-fold determinism gates on row
-      // SET equality, not order, but matching the original order makes
-      // the migration easier to audit.
-      db.run(`
+        // Byte-faithful copy. ORDER BY rowid to keep the physical-row order
+        // stable across the rebuild — re-fold determinism gates on row
+        // SET equality, not order, but matching the original order makes
+        // the migration easier to audit.
+        db.run(`
         INSERT INTO file_attributions_v46_tmp
             (project_dir, session_id, file_path, last_mutation_at,
              last_commit_at, op, source, last_event_id, updated_at,
@@ -4853,722 +4910,767 @@ function migrate(db: Database): void {
             FROM file_attributions
         ORDER BY rowid
       `);
-      db.run("DROP TABLE file_attributions");
-      db.run(
-        "ALTER TABLE file_attributions_v46_tmp RENAME TO file_attributions",
-      );
-      // Re-create the indexes (SQLite drops indexes with their base table).
-      // Reads the same array the unconditional CREATE uses on fresh DBs so
-      // the migrated and fresh-v46 paths produce byte-identical schemas.
-      for (const sql of CREATE_FILE_ATTRIBUTIONS_INDEXES) {
-        db.run(sql);
+        db.run("DROP TABLE file_attributions");
+        db.run(
+          "ALTER TABLE file_attributions_v46_tmp RENAME TO file_attributions",
+        );
+        // Re-create the indexes (SQLite drops indexes with their base table).
+        // Reads the same array the unconditional CREATE uses on fresh DBs so
+        // the migrated and fresh-v46 paths produce byte-identical schemas.
+        for (const sql of CREATE_FILE_ATTRIBUTIONS_INDEXES) {
+          db.run(sql);
+        }
       }
-    }
 
-    // Step 3a: backfill `events.planctl_files` over historical planctl
-    // events. Mirrors v38→v39 git-rm/mv backfill shape: walk every
-    // `PostToolUse:Bash` row, JSON.parse the payload defensively, re-derive
-    // via the SHARED `extractPlanctlInvocation` deriver, UPDATE the new
-    // sparse column in place. The deriver returns `null` for non-planctl
-    // rows — we skip the UPDATE then (the column stays NULL).
-    if (storedVersionV46 < 46) {
-      const rows = db
-        .prepare(
-          `SELECT id, hook_event, tool_name, data FROM events
+      // Step 3a: backfill `events.planctl_files` over historical planctl
+      // events. Mirrors v38→v39 git-rm/mv backfill shape: walk every
+      // `PostToolUse:Bash` row, JSON.parse the payload defensively, re-derive
+      // via the SHARED `extractPlanctlInvocation` deriver, UPDATE the new
+      // sparse column in place. The deriver returns `null` for non-planctl
+      // rows — we skip the UPDATE then (the column stays NULL).
+      if (storedVersionV46 < 46) {
+        const rows = db
+          .prepare(
+            `SELECT id, hook_event, tool_name, data FROM events
              WHERE tool_name = 'Bash' AND hook_event = 'PostToolUse'`,
-        )
-        .all() as {
-        id: number;
-        hook_event: string;
-        tool_name: string | null;
-        data: string;
-      }[];
-      const updateStmt = db.prepare(
-        "UPDATE events SET planctl_files = ? WHERE id = ?",
-      );
-      for (const row of rows) {
-        let parsed: Record<string, unknown>;
-        try {
-          parsed = JSON.parse(row.data) as Record<string, unknown>;
-          if (typeof parsed !== "object" || parsed === null) {
+          )
+          .all() as {
+          id: number;
+          hook_event: string;
+          tool_name: string | null;
+          data: string;
+        }[];
+        const updateStmt = db.prepare(
+          "UPDATE events SET planctl_files = ? WHERE id = ?",
+        );
+        for (const row of rows) {
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(row.data) as Record<string, unknown>;
+            if (typeof parsed !== "object" || parsed === null) {
+              continue;
+            }
+          } catch {
+            // Malformed historical payload — leave planctl_files NULL.
             continue;
           }
-        } catch {
-          // Malformed historical payload — leave planctl_files NULL.
-          continue;
+          const inv = extractPlanctlInvocation(
+            row.hook_event,
+            row.tool_name,
+            parsed,
+          );
+          if (inv === null) continue;
+          // `files` is null when the deriver couldn't lift a non-empty
+          // string array. The UPDATE binds NULL in that case, matching
+          // the default — no need to clear; an UPDATE with NULL is a
+          // no-op on a NULL column. Keep the stmt run uniform.
+          const json = inv.files === null ? null : JSON.stringify(inv.files);
+          updateStmt.run(json, row.id);
         }
-        const inv = extractPlanctlInvocation(
-          row.hook_event,
-          row.tool_name,
-          parsed,
-        );
-        if (inv === null) continue;
-        // `files` is null when the deriver couldn't lift a non-empty
-        // string array. The UPDATE binds NULL in that case, matching
-        // the default — no need to clear; an UPDATE with NULL is a
-        // no-op on a NULL column. Keep the stmt run uniform.
-        const json = inv.files === null ? null : JSON.stringify(inv.files);
-        updateStmt.run(json, row.id);
       }
-    }
 
-    // Step 3b: cursor-rewind + DELETE projection tables. The new mint
-    // path in the planctl_op fold seam (`syncPlanctlLinks` arm) wouldn't
-    // otherwise re-attribute historical planctl events — the rewind
-    // forces a from-scratch re-fold over the immutable (now-backfilled)
-    // event log so historical .planctl orphans heal. Mirrors v38→v39
-    // rewind block exactly.
-    if (storedVersionV46 < 46) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM git_status");
-      db.run("DELETE FROM file_attributions");
-      db.run("DELETE FROM subagent_invocations");
-    }
+      // Step 3b: cursor-rewind + DELETE projection tables. The new mint
+      // path in the planctl_op fold seam (`syncPlanctlLinks` arm) wouldn't
+      // otherwise re-attribute historical planctl events — the rewind
+      // forces a from-scratch re-fold over the immutable (now-backfilled)
+      // event log so historical .planctl orphans heal. Mirrors v38→v39
+      // rewind block exactly.
+      if (storedVersionV46 < 46) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM git_status");
+        db.run("DELETE FROM file_attributions");
+        db.run("DELETE FROM subagent_invocations");
+      }
 
-    // v46→v47: fn-667 — `autopilot_state` singleton projection table, the
-    // durable substrate the `keeper autopilot` viewer subscribes to so its
-    // banner reflects the autopilot worker's real paused/playing state
-    // (pre-v47 the flag lived only in main's memory and the viewer
-    // hardcoded `paused = true`, a chronic divergence). Picked up
-    // unconditionally by the `CREATE TABLE IF NOT EXISTS
-    // CREATE_AUTOPILOT_STATE` in the bootstrap block above; this slot
-    // exists only for the version-bump stamp ordering. No data backfill —
-    // the table populates exclusively from the reducer's `AutopilotPaused`
-    // fold arm, and the daemon's boot drain appends a
-    // `AutopilotPaused{paused:true}` re-arm before `serverWorker` spawns so
-    // a viewer subscribing the instant the socket opens reads a real row
-    // (never an empty surface). Stays empty on a fresh DB until the first
-    // boot-append folds; steady-state v47 boots already carry rows.
-    //
-    // NO migration seed row: the boot-append folds the row through the same
-    // pure fold path a steady-state pause/play write uses, so seeding here
-    // would be redundant — and skipping it keeps `created_at` derived
-    // purely from the event log (re-fold determinism). The trade-off is
-    // ~1 extra event per daemon restart (the boot-append), accepted per
-    // CLAUDE.md's "Boot-event-every-start is generic-ES anti-pattern, but
-    // keeper's re-fold ≠ replay" carve-out — re-fold re-drains the
-    // existing log and never re-runs boot, so the boot-append is safe and
-    // matches the `seedKilledSweep` precedent.
-    //
-    // The table IS a reducer projection. A from-scratch re-fold rebuilds it
-    // byte-identically from the `AutopilotPaused` events in the log — so it
-    // MUST be included in any future rewind-and-redrain DELETE list (see
-    // the v41→v42 slot above which already collects the canonical "wipe
-    // every reducer-owned projection" set; future rewinds add
-    // `DELETE FROM autopilot_state` alongside).
-    //
-    // No keeper-py reader change: keeper-py reads neither `autopilot_state`
-    // nor `AutopilotPaused`, so the v47 bump is whitelist-only on the
-    // Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset adds
-    // 47 in the same change — test/schema-version.test.ts enforces).
+      // v46→v47: fn-667 — `autopilot_state` singleton projection table, the
+      // durable substrate the `keeper autopilot` viewer subscribes to so its
+      // banner reflects the autopilot worker's real paused/playing state
+      // (pre-v47 the flag lived only in main's memory and the viewer
+      // hardcoded `paused = true`, a chronic divergence). Picked up
+      // unconditionally by the `CREATE TABLE IF NOT EXISTS
+      // CREATE_AUTOPILOT_STATE` in the bootstrap block above; this slot
+      // exists only for the version-bump stamp ordering. No data backfill —
+      // the table populates exclusively from the reducer's `AutopilotPaused`
+      // fold arm, and the daemon's boot drain appends a
+      // `AutopilotPaused{paused:true}` re-arm before `serverWorker` spawns so
+      // a viewer subscribing the instant the socket opens reads a real row
+      // (never an empty surface). Stays empty on a fresh DB until the first
+      // boot-append folds; steady-state v47 boots already carry rows.
+      //
+      // NO migration seed row: the boot-append folds the row through the same
+      // pure fold path a steady-state pause/play write uses, so seeding here
+      // would be redundant — and skipping it keeps `created_at` derived
+      // purely from the event log (re-fold determinism). The trade-off is
+      // ~1 extra event per daemon restart (the boot-append), accepted per
+      // CLAUDE.md's "Boot-event-every-start is generic-ES anti-pattern, but
+      // keeper's re-fold ≠ replay" carve-out — re-fold re-drains the
+      // existing log and never re-runs boot, so the boot-append is safe and
+      // matches the `seedKilledSweep` precedent.
+      //
+      // The table IS a reducer projection. A from-scratch re-fold rebuilds it
+      // byte-identically from the `AutopilotPaused` events in the log — so it
+      // MUST be included in any future rewind-and-redrain DELETE list (see
+      // the v41→v42 slot above which already collects the canonical "wipe
+      // every reducer-owned projection" set; future rewinds add
+      // `DELETE FROM autopilot_state` alongside).
+      //
+      // No keeper-py reader change: keeper-py reads neither `autopilot_state`
+      // nor `AutopilotPaused`, so the v47 bump is whitelist-only on the
+      // Python side (`api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset adds
+      // 47 in the same change — test/schema-version.test.ts enforces).
 
-    // v47→v48: fn-668 — backend-exec coordinates on jobs. Three nullable
-    // TEXT columns on `events` (`backend_exec_{type,session_id,pane_id}`)
-    // carry the hook's pure-env capture of the terminal-multiplexer
-    // coordinates the parent Claude session ran under (the
-    // `ZELLIJ`/`ZELLIJ_SESSION_NAME`/`ZELLIJ_PANE_ID` env reads — added in
-    // T3, NULL on every row until then). Five nullable TEXT columns on
-    // `jobs` (`backend_exec_{type,session_id,pane_id,tab_id,tab_name}`)
-    // project those three plus the daemon worker's per-pane tab
-    // resolution (`backend_exec_tab_{id,name}` — added in T4 via
-    // synthetic events the reducer folds). Pre-feature events / jobs read
-    // NULL after the upgrade — no backfill, no surface change in this
-    // task; just the contract end-to-end so T3 and T4 land additively.
-    // Generic `backend_exec_*` naming lets a future tmux/wezterm backend
-    // slot in without a schema change.
-    //
-    // Lockstep ALTER vs CREATE: the column literals here byte-match the
-    // CREATE_EVENTS / CREATE_JOBS literals above so a fresh v48 DB and
-    // an upgraded v47-shaped DB produce byte-identical PRAGMA table_info
-    // rows. Mirrors the v21→v22 config_dir block. addColumnIfMissing is
-    // idempotent on column presence so a re-open after upgrade is a no-op.
-    //
-    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds
-    // 48 in the same change — whitelist-only (keeper-py reads neither
-    // events.backend_exec_* nor jobs.backend_exec_*), but the bump is
-    // required so keeper-py's Python readers (e.g. `planctl
-    // render-approve-context`) on this host don't fail-loud
-    // (test/schema-version.test.ts enforces).
-    addColumnIfMissing(db, "events", "backend_exec_type", "TEXT");
-    addColumnIfMissing(db, "events", "backend_exec_session_id", "TEXT");
-    addColumnIfMissing(db, "events", "backend_exec_pane_id", "TEXT");
-    addColumnIfMissing(db, "jobs", "backend_exec_type", "TEXT");
-    addColumnIfMissing(db, "jobs", "backend_exec_session_id", "TEXT");
-    addColumnIfMissing(db, "jobs", "backend_exec_pane_id", "TEXT");
-    addColumnIfMissing(db, "jobs", "backend_exec_tab_id", "TEXT");
-    addColumnIfMissing(db, "jobs", "backend_exec_tab_name", "TEXT");
+      // v47→v48: fn-668 — backend-exec coordinates on jobs. Three nullable
+      // TEXT columns on `events` (`backend_exec_{type,session_id,pane_id}`)
+      // carry the hook's pure-env capture of the terminal-multiplexer
+      // coordinates the parent Claude session ran under (the
+      // `ZELLIJ`/`ZELLIJ_SESSION_NAME`/`ZELLIJ_PANE_ID` env reads — added in
+      // T3, NULL on every row until then). Five nullable TEXT columns on
+      // `jobs` (`backend_exec_{type,session_id,pane_id,tab_id,tab_name}`)
+      // project those three plus the daemon worker's per-pane tab
+      // resolution (`backend_exec_tab_{id,name}` — added in T4 via
+      // synthetic events the reducer folds). Pre-feature events / jobs read
+      // NULL after the upgrade — no backfill, no surface change in this
+      // task; just the contract end-to-end so T3 and T4 land additively.
+      // Generic `backend_exec_*` naming lets a future tmux/wezterm backend
+      // slot in without a schema change.
+      //
+      // Lockstep ALTER vs CREATE: the column literals here byte-match the
+      // CREATE_EVENTS / CREATE_JOBS literals above so a fresh v48 DB and
+      // an upgraded v47-shaped DB produce byte-identical PRAGMA table_info
+      // rows. Mirrors the v21→v22 config_dir block. addColumnIfMissing is
+      // idempotent on column presence so a re-open after upgrade is a no-op.
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds
+      // 48 in the same change — whitelist-only (keeper-py reads neither
+      // events.backend_exec_* nor jobs.backend_exec_*), but the bump is
+      // required so keeper-py's Python readers (e.g. `planctl
+      // render-approve-context`) on this host don't fail-loud
+      // (test/schema-version.test.ts enforces).
+      addColumnIfMissing(db, "events", "backend_exec_type", "TEXT");
+      addColumnIfMissing(db, "events", "backend_exec_session_id", "TEXT");
+      addColumnIfMissing(db, "events", "backend_exec_pane_id", "TEXT");
+      addColumnIfMissing(db, "jobs", "backend_exec_type", "TEXT");
+      addColumnIfMissing(db, "jobs", "backend_exec_session_id", "TEXT");
+      addColumnIfMissing(db, "jobs", "backend_exec_pane_id", "TEXT");
+      addColumnIfMissing(db, "jobs", "backend_exec_tab_id", "TEXT");
+      addColumnIfMissing(db, "jobs", "backend_exec_tab_name", "TEXT");
 
-    // v48→v49: fn-670 (T2) — task→committing-session link. Adds a new
-    // `last_commit_for_task_at` field to the embedded job element shape
-    // stored inside the parent epic's `tasks[].jobs[]` JSON-TEXT cell on
-    // `epics.tasks`. NO new real column — the link rides FREE inside the
-    // opaque JSON-TEXT cell that the plan-snapshot fold already
-    // serialises; this is a whitelist-only schema bump (the field
-    // surfaces with no SQL change, the JSON-decoder reads it as
-    // `undefined` on pre-v49 stored elements and `buildEmbeddedJob`
-    // coerces to `null` for byte-deterministic re-fold).
-    //
-    // No ALTER step here. The bump's purpose is the cross-language
-    // version-gate handshake: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
-    // adds 49 in the SAME change so keeper-py's Python readers
-    // (`planctl render-approve-context`'s `get_epic` read) continue to
-    // pass after the daemon stamps v49 on this host. test/schema-
-    // version.test.ts enforces. The reducer's `foldCommit` per-session
-    // arm grows a new write site (the link stamp); a cursor=0 re-fold
-    // over a mixed pre-/post-v49 Commit event log reproduces
-    // byte-identical `epics` rows because the link write is a pure
-    // function of the Commit payload (which carries `task_ids: []` on
-    // every pre-fn-670 event via {@link extractCommit}'s default).
+      // v48→v49: fn-670 (T2) — task→committing-session link. Adds a new
+      // `last_commit_for_task_at` field to the embedded job element shape
+      // stored inside the parent epic's `tasks[].jobs[]` JSON-TEXT cell on
+      // `epics.tasks`. NO new real column — the link rides FREE inside the
+      // opaque JSON-TEXT cell that the plan-snapshot fold already
+      // serialises; this is a whitelist-only schema bump (the field
+      // surfaces with no SQL change, the JSON-decoder reads it as
+      // `undefined` on pre-v49 stored elements and `buildEmbeddedJob`
+      // coerces to `null` for byte-deterministic re-fold).
+      //
+      // No ALTER step here. The bump's purpose is the cross-language
+      // version-gate handshake: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
+      // adds 49 in the SAME change so keeper-py's Python readers
+      // (`planctl render-approve-context`'s `get_epic` read) continue to
+      // pass after the daemon stamps v49 on this host. test/schema-
+      // version.test.ts enforces. The reducer's `foldCommit` per-session
+      // arm grows a new write site (the link stamp); a cursor=0 re-fold
+      // over a mixed pre-/post-v49 Commit event log reproduces
+      // byte-identical `epics` rows because the link write is a pure
+      // function of the Commit payload (which carries `task_ids: []` on
+      // every pre-fn-670 event via {@link extractCommit}'s default).
 
-    // v49→v50: fn-678 — `pending_dispatches` projection table, the durable
-    // substrate that replaces the live zellij tab-name probe (fn-674's
-    // `liveTabKeys` / `tabExistsByName` / `liveTabNames`) for launch-window
-    // double-dispatch suppression. Picked up unconditionally by the
-    // `CREATE TABLE IF NOT EXISTS CREATE_PENDING_DISPATCHES` in the
-    // bootstrap block above; this slot exists only for the version-bump
-    // stamp ordering, mirroring the v46→v47 `autopilot_state` whitelist-
-    // only template. No data backfill — the table populates exclusively
-    // from the reducer's `Dispatched` / `DispatchExpired` fold arms (task
-    // .2 of this epic) plus the existing `DispatchFailed` arm's loop-out
-    // of the pending row, and stays empty on a fresh DB / a steady-state
-    // v50 re-open with no prior in-flight dispatch.
-    //
-    // The table IS a reducer projection (unlike `dead_letters`, the audit
-    // log of events that never made it into the event log). A from-
-    // scratch re-fold rebuilds it byte-identically from the synthetic
-    // `Dispatched` / `DispatchFailed` / `DispatchExpired` events in the
-    // log — so it MUST be included in any future rewind-and-redrain
-    // DELETE list (see the v41→v42 slot above which already collects the
-    // canonical "wipe every reducer-owned projection" set; this slot
-    // joins `pending_dispatches` to that list alongside
-    // `dispatch_failures` and `autopilot_state`). No `Dispatched` events
-    // exist in the historical pre-v50 log, so a cursor=0 re-fold over a
-    // pre-v50 event log reproduces an empty `pending_dispatches` table —
-    // matching the zero-event projection default.
-    //
-    // No keeper-py reader change: keeper-py reads neither
-    // `pending_dispatches` nor any other autopilot surface, so the v50
-    // bump is whitelist-only on the Python side (`api.py`'s
-    // `SUPPORTED_SCHEMA_VERSIONS` frozenset adds 50 in the same change
-    // — test/schema-version.test.ts enforces; a missing bump fails
-    // every keeper-py Python read host-wide).
+      // v49→v50: fn-678 — `pending_dispatches` projection table, the durable
+      // substrate that replaces the live zellij tab-name probe (fn-674's
+      // `liveTabKeys` / `tabExistsByName` / `liveTabNames`) for launch-window
+      // double-dispatch suppression. Picked up unconditionally by the
+      // `CREATE TABLE IF NOT EXISTS CREATE_PENDING_DISPATCHES` in the
+      // bootstrap block above; this slot exists only for the version-bump
+      // stamp ordering, mirroring the v46→v47 `autopilot_state` whitelist-
+      // only template. No data backfill — the table populates exclusively
+      // from the reducer's `Dispatched` / `DispatchExpired` fold arms (task
+      // .2 of this epic) plus the existing `DispatchFailed` arm's loop-out
+      // of the pending row, and stays empty on a fresh DB / a steady-state
+      // v50 re-open with no prior in-flight dispatch.
+      //
+      // The table IS a reducer projection (unlike `dead_letters`, the audit
+      // log of events that never made it into the event log). A from-
+      // scratch re-fold rebuilds it byte-identically from the synthetic
+      // `Dispatched` / `DispatchFailed` / `DispatchExpired` events in the
+      // log — so it MUST be included in any future rewind-and-redrain
+      // DELETE list (see the v41→v42 slot above which already collects the
+      // canonical "wipe every reducer-owned projection" set; this slot
+      // joins `pending_dispatches` to that list alongside
+      // `dispatch_failures` and `autopilot_state`). No `Dispatched` events
+      // exist in the historical pre-v50 log, so a cursor=0 re-fold over a
+      // pre-v50 event log reproduces an empty `pending_dispatches` table —
+      // matching the zero-event projection default.
+      //
+      // No keeper-py reader change: keeper-py reads neither
+      // `pending_dispatches` nor any other autopilot surface, so the v50
+      // bump is whitelist-only on the Python side (`api.py`'s
+      // `SUPPORTED_SCHEMA_VERSIONS` frozenset adds 50 in the same change
+      // — test/schema-version.test.ts enforces; a missing bump fails
+      // every keeper-py Python read host-wide).
 
-    // v50→v51: fn-682 — live monitors projection. Adds the sparse
-    // `events.background_task_id TEXT` deriver column (NULL on every
-    // row except PostToolUse:Monitor — where it carries
-    // `tool_response.taskId` — and PostToolUse:Bash with
-    // `run_in_background` — where it carries
-    // `tool_response.backgroundTaskId`), the
-    // `jobs.monitors TEXT NOT NULL DEFAULT '[]'` JSON-array projection
-    // column (live per-session background-shell snapshot folded from
-    // each Stop's `data.background_tasks` allowlist of `type:shell`
-    // entries, with three-way provenance — `monitor` / `bash-bg` /
-    // `ambient` — resolved by the reducer's in-fold scan against the
-    // new column), and the
-    // `idx_events_background_task_id (session_id, background_task_id,
-    // id, tool_name) WHERE background_task_id IS NOT NULL` partial
-    // composite index that makes the in-fold scan index-backed and
-    // covering for the projected `tool_name` read. Lockstep: literals
-    // above on CREATE_EVENTS / CREATE_JOBS / CREATE_V51_INDEXES match
-    // these addColumnIfMissing + CREATE INDEX statements so a fresh
-    // v51 DB and a migrated v50→v51 DB produce byte-identical PRAGMA
-    // table_info + sqlite_master rows.
-    //
-    // Mirrors the v30→v31 / v38→v39 bash_mutation_* pattern: an
-    // additive sparse column whose deriver fires only on a narrow
-    // PostToolUse subset, with a version-guarded one-time backfill
-    // that re-derives the column for historical rows via the SAME
-    // pure deriver the hook uses (so a cursor=0 re-fold against the
-    // backfilled column reproduces byte-identical `jobs.monitors`).
-    // The reducer NEVER reads wallclock/env/fs inside the fold, so the
-    // CLAUDE.md "every projection-driving fact lives in the immutable
-    // event log" + "re-fold determinism is sacred" invariants hold.
-    addColumnIfMissing(db, "events", "background_task_id", "TEXT");
-    addColumnIfMissing(db, "jobs", "monitors", "TEXT NOT NULL DEFAULT '[]'");
-    // The partial composite index lives in CREATE_V51_INDEXES (kept
-    // OUT of CREATE_EVENTS_INDEXES so a v50→v51 migrate doesn't
-    // reference the column before the ADD COLUMN above runs). Apply
-    // unconditionally — `CREATE INDEX IF NOT EXISTS` is idempotent on
-    // re-open of an already-migrated DB, and a fresh v51 bootstrap
-    // hits this slot too (the addColumnIfMissing no-ops on the
-    // freshly CREATE'd table).
-    for (const sql of CREATE_V51_INDEXES) {
-      db.run(sql);
-    }
+      // v50→v51: fn-682 — live monitors projection. Adds the sparse
+      // `events.background_task_id TEXT` deriver column (NULL on every
+      // row except PostToolUse:Monitor — where it carries
+      // `tool_response.taskId` — and PostToolUse:Bash with
+      // `run_in_background` — where it carries
+      // `tool_response.backgroundTaskId`), the
+      // `jobs.monitors TEXT NOT NULL DEFAULT '[]'` JSON-array projection
+      // column (live per-session background-shell snapshot folded from
+      // each Stop's `data.background_tasks` allowlist of `type:shell`
+      // entries, with three-way provenance — `monitor` / `bash-bg` /
+      // `ambient` — resolved by the reducer's in-fold scan against the
+      // new column), and the
+      // `idx_events_background_task_id (session_id, background_task_id,
+      // id, tool_name) WHERE background_task_id IS NOT NULL` partial
+      // composite index that makes the in-fold scan index-backed and
+      // covering for the projected `tool_name` read. Lockstep: literals
+      // above on CREATE_EVENTS / CREATE_JOBS / CREATE_V51_INDEXES match
+      // these addColumnIfMissing + CREATE INDEX statements so a fresh
+      // v51 DB and a migrated v50→v51 DB produce byte-identical PRAGMA
+      // table_info + sqlite_master rows.
+      //
+      // Mirrors the v30→v31 / v38→v39 bash_mutation_* pattern: an
+      // additive sparse column whose deriver fires only on a narrow
+      // PostToolUse subset, with a version-guarded one-time backfill
+      // that re-derives the column for historical rows via the SAME
+      // pure deriver the hook uses (so a cursor=0 re-fold against the
+      // backfilled column reproduces byte-identical `jobs.monitors`).
+      // The reducer NEVER reads wallclock/env/fs inside the fold, so the
+      // CLAUDE.md "every projection-driving fact lives in the immutable
+      // event log" + "re-fold determinism is sacred" invariants hold.
+      addColumnIfMissing(db, "events", "background_task_id", "TEXT");
+      addColumnIfMissing(db, "jobs", "monitors", "TEXT NOT NULL DEFAULT '[]'");
+      // The partial composite index lives in CREATE_V51_INDEXES (kept
+      // OUT of CREATE_EVENTS_INDEXES so a v50→v51 migrate doesn't
+      // reference the column before the ADD COLUMN above runs). Apply
+      // unconditionally — `CREATE INDEX IF NOT EXISTS` is idempotent on
+      // re-open of an already-migrated DB, and a fresh v51 bootstrap
+      // hits this slot too (the addColumnIfMissing no-ops on the
+      // freshly CREATE'd table).
+      for (const sql of CREATE_V51_INDEXES) {
+        db.run(sql);
+      }
 
-    // Version-guarded one-time backfill: re-derive
-    // `events.background_task_id` for every historical PostToolUse row
-    // whose tool_name is `Monitor` or `Bash`. The deriver is pure (no
-    // wallclock / env / fs reads) and the SAME function the live hook
-    // calls at INSERT time, so a from-scratch re-fold over the
-    // backfilled column reproduces byte-identical `jobs.monitors`.
-    // Defensive parse: a malformed historical `data` blob folds to
-    // NULL (the deriver's `typeof toolResponse !== "object"` /
-    // `typeof candidate !== "string"` guards short-circuit on every
-    // bad shape; the surrounding try/catch keeps a corrupt JSON
-    // payload from throwing inside the migrate transaction). Mirrors
-    // the v30→v31 / v38→v39 backfill loops above.
-    if (preMigrateStoredVersion < 51) {
-      const rows = db
-        .prepare(
-          `SELECT id, hook_event, tool_name, data FROM events
+      // Version-guarded one-time backfill: re-derive
+      // `events.background_task_id` for every historical PostToolUse row
+      // whose tool_name is `Monitor` or `Bash`. The deriver is pure (no
+      // wallclock / env / fs reads) and the SAME function the live hook
+      // calls at INSERT time, so a from-scratch re-fold over the
+      // backfilled column reproduces byte-identical `jobs.monitors`.
+      // Defensive parse: a malformed historical `data` blob folds to
+      // NULL (the deriver's `typeof toolResponse !== "object"` /
+      // `typeof candidate !== "string"` guards short-circuit on every
+      // bad shape; the surrounding try/catch keeps a corrupt JSON
+      // payload from throwing inside the migrate transaction). Mirrors
+      // the v30→v31 / v38→v39 backfill loops above.
+      if (preMigrateStoredVersion < 51) {
+        const rows = db
+          .prepare(
+            `SELECT id, hook_event, tool_name, data FROM events
              WHERE hook_event = 'PostToolUse'
                AND tool_name IN ('Monitor', 'Bash')`,
-        )
-        .all() as {
-        id: number;
-        hook_event: string;
-        tool_name: string | null;
-        data: string;
-      }[];
-      const updateStmt = db.prepare(
-        "UPDATE events SET background_task_id = ? WHERE id = ?",
-      );
-      for (const row of rows) {
-        let parsed: Record<string, unknown>;
-        try {
-          parsed = JSON.parse(row.data) as Record<string, unknown>;
-          if (typeof parsed !== "object" || parsed === null) {
+          )
+          .all() as {
+          id: number;
+          hook_event: string;
+          tool_name: string | null;
+          data: string;
+        }[];
+        const updateStmt = db.prepare(
+          "UPDATE events SET background_task_id = ? WHERE id = ?",
+        );
+        for (const row of rows) {
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(row.data) as Record<string, unknown>;
+            if (typeof parsed !== "object" || parsed === null) {
+              continue; // schema default NULL already in place.
+            }
+          } catch {
             continue; // schema default NULL already in place.
           }
-        } catch {
-          continue; // schema default NULL already in place.
-        }
-        const id = extractBackgroundTaskId(
-          row.hook_event,
-          row.tool_name,
-          parsed,
-        );
-        if (id !== null) {
-          updateStmt.run(id, row.id);
+          const id = extractBackgroundTaskId(
+            row.hook_event,
+            row.tool_name,
+            parsed,
+          );
+          if (id !== null) {
+            updateStmt.run(id, row.id);
+          }
         }
       }
-    }
-    //
-    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
-    // adds 51 in the same change — whitelist-only (keeper-py reads
-    // neither `events.background_task_id` nor `jobs.monitors`), but
-    // the bump is required so keeper-py's Python readers (e.g.
-    // `planctl render-approve-context`) on this host don't fail-loud
-    // (test/schema-version.test.ts enforces).
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
+      // adds 51 in the same change — whitelist-only (keeper-py reads
+      // neither `events.background_task_id` nor `jobs.monitors`), but
+      // the bump is required so keeper-py's Python readers (e.g.
+      // `planctl render-approve-context`) on this host don't fail-loud
+      // (test/schema-version.test.ts enforces).
 
-    // v51→v52: fn-686 — surface "session blocked on a Claude Code
-    // permission dialog or MCP elicitation prompt" as a two-field signal
-    // mirroring the schema-v25 (input-request) shape. Add the pair
-    // `jobs.last_permission_prompt_at REAL` +
-    // `jobs.last_permission_prompt_kind TEXT`, matching the new
-    // {@link import("./types").PermissionPromptKind} union (`'permission'`
-    // / `'elicitation'`).
-    //
-    // **One structural divergence from the v24→v25 input-request clone:**
-    // the source is a REAL `Notification` hook event whose `event_type`
-    // (= `notification_type` passthrough, set by
-    // `plugin/hooks/events-writer.ts`) discriminates the two whitelisted
-    // subtypes. NOT a synthetic mint. The reducer fold lives in a new
-    // `case "Notification"` that branches on `event_type` — strict gate,
-    // `idle_prompt` / `auth_success` / unknown / empty `event_type` are
-    // no-ops. The stamp does NOT flip `state` (unlike the InputRequest
-    // arm) — the pill layers on top of the live `[working]` state, which
-    // is the whole point. Five clear arms zero both columns
-    // unconditionally: `UserPromptSubmit` + `SessionStart` (mirroring
-    // the v25 unconditional clears), `PreToolUse` + `PostToolUse` gated
-    // on `last_permission_prompt_at IS NOT NULL` (hot path), AND `Stop`
-    // as the session-level backstop (the one new clear arm relative to
-    // v25).
-    //
-    // Pair-step: the same two columns are added to the embedded `jobs`
-    // array shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
-    // `EmbeddedJob` in `src/types.ts`) AND to the `JobLinkEntry` shape on
-    // `epics.job_links`. Historical serialized JSON arrays from v51 do
-    // NOT carry the new field-pair; without a rewind, incremental
-    // `syncJobIntoEpic` / `syncJobLinksOnJobWrite` writes from later
-    // events would re-serialize entries WITH the new pair while
-    // neighbour entries in the same array stayed WITHOUT it, breaking
-    // the byte-identical re-fold invariant (CLAUDE.md). The rewind-and-
-    // redrain below harmonizes all three sides — `jobs` columns,
-    // `epics.jobs[]`, `epics.tasks[].jobs[]`, `epics.job_links[]` — to
-    // "new schema everywhere".
-    //
-    // **Re-fold over historical `permission_prompt` rows is NOT a
-    // no-op.** Unlike the v25 rewind (zero historical `InputRequest`
-    // events → cols read NULL), the live log ALREADY contains real
-    // `permission_prompt` Notification rows. The cursor=0 rewind WILL
-    // fold them and stamp `last_permission_prompt_at` on whatever
-    // sessions were parked. This is intended — the stamp is a pure
-    // function of `event.ts` (no `Date.now()` / env / fs / process
-    // probes inside the fold), so a re-fold reproduces deterministic
-    // stamps.
-    //
-    // Step 1: add the two new `jobs` columns. Both nullable, no DEFAULT —
-    // ADD COLUMN leaves prior rows reading NULL, which is exactly the
-    // zero-event / never-blocked-on-permission projection. Column defs
-    // match `CREATE_JOBS` so a fresh v52 DB and a migrated v51→v52 DB
-    // converge to identical schema (the addColumnIfMissing/literal
-    // lockstep convention).
-    addColumnIfMissing(db, "jobs", "last_permission_prompt_at", "REAL");
-    addColumnIfMissing(db, "jobs", "last_permission_prompt_kind", "TEXT");
+      // v51→v52: fn-686 — surface "session blocked on a Claude Code
+      // permission dialog or MCP elicitation prompt" as a two-field signal
+      // mirroring the schema-v25 (input-request) shape. Add the pair
+      // `jobs.last_permission_prompt_at REAL` +
+      // `jobs.last_permission_prompt_kind TEXT`, matching the new
+      // {@link import("./types").PermissionPromptKind} union (`'permission'`
+      // / `'elicitation'`).
+      //
+      // **One structural divergence from the v24→v25 input-request clone:**
+      // the source is a REAL `Notification` hook event whose `event_type`
+      // (= `notification_type` passthrough, set by
+      // `plugin/hooks/events-writer.ts`) discriminates the two whitelisted
+      // subtypes. NOT a synthetic mint. The reducer fold lives in a new
+      // `case "Notification"` that branches on `event_type` — strict gate,
+      // `idle_prompt` / `auth_success` / unknown / empty `event_type` are
+      // no-ops. The stamp does NOT flip `state` (unlike the InputRequest
+      // arm) — the pill layers on top of the live `[working]` state, which
+      // is the whole point. Five clear arms zero both columns
+      // unconditionally: `UserPromptSubmit` + `SessionStart` (mirroring
+      // the v25 unconditional clears), `PreToolUse` + `PostToolUse` gated
+      // on `last_permission_prompt_at IS NOT NULL` (hot path), AND `Stop`
+      // as the session-level backstop (the one new clear arm relative to
+      // v25).
+      //
+      // Pair-step: the same two columns are added to the embedded `jobs`
+      // array shape (`EmbeddedJobElement` in `src/reducer.ts`, mirrored on
+      // `EmbeddedJob` in `src/types.ts`) AND to the `JobLinkEntry` shape on
+      // `epics.job_links`. Historical serialized JSON arrays from v51 do
+      // NOT carry the new field-pair; without a rewind, incremental
+      // `syncJobIntoEpic` / `syncJobLinksOnJobWrite` writes from later
+      // events would re-serialize entries WITH the new pair while
+      // neighbour entries in the same array stayed WITHOUT it, breaking
+      // the byte-identical re-fold invariant (CLAUDE.md). The rewind-and-
+      // redrain below harmonizes all three sides — `jobs` columns,
+      // `epics.jobs[]`, `epics.tasks[].jobs[]`, `epics.job_links[]` — to
+      // "new schema everywhere".
+      //
+      // **Re-fold over historical `permission_prompt` rows is NOT a
+      // no-op.** Unlike the v25 rewind (zero historical `InputRequest`
+      // events → cols read NULL), the live log ALREADY contains real
+      // `permission_prompt` Notification rows. The cursor=0 rewind WILL
+      // fold them and stamp `last_permission_prompt_at` on whatever
+      // sessions were parked. This is intended — the stamp is a pure
+      // function of `event.ts` (no `Date.now()` / env / fs / process
+      // probes inside the fold), so a re-fold reproduces deterministic
+      // stamps.
+      //
+      // Step 1: add the two new `jobs` columns. Both nullable, no DEFAULT —
+      // ADD COLUMN leaves prior rows reading NULL, which is exactly the
+      // zero-event / never-blocked-on-permission projection. Column defs
+      // match `CREATE_JOBS` so a fresh v52 DB and a migrated v51→v52 DB
+      // converge to identical schema (the addColumnIfMissing/literal
+      // lockstep convention).
+      addColumnIfMissing(db, "jobs", "last_permission_prompt_at", "REAL");
+      addColumnIfMissing(db, "jobs", "last_permission_prompt_kind", "TEXT");
 
-    // Step 2: rewind-and-redrain — same shape as the v17→v18, v18→v19,
-    // v23→v24, v24→v25 steps. Version-guarded: re-open of an already-
-    // migrated v52+ DB skips it (the guard reads the meta row written by
-    // a PRIOR migrate(); on a fresh v52 DB or one that crashed before
-    // stamping v52, `storedVersionV52 < 52` and the rewind runs; on
-    // steady-state v52+ DB it skips). The boot drain after migrate()
-    // returns rebuilds `jobs` / `epics` / `subagent_invocations` from
-    // the event log, re-emitting embedded `jobs` arrays + `job_links`
-    // arrays with the new field-pair on every entry. Historical
-    // `Notification:permission_prompt` / `Notification:elicitation_dialog`
-    // rows DO fold this time (unlike the v25 input-request rewind which
-    // saw zero historical events) — the stamps that result are honest
-    // re-derivations of what the projection would have read had the
-    // fold existed when those events landed, and the five clear arms
-    // (UPS / SessionStart / Pre+PostToolUse / Stop) on subsequent
-    // events sweep them up the same way a steady-state v52 install
-    // would.
-    const storedVersionV52 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV52 < 52) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM subagent_invocations");
-    }
-    //
-    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
-    // adds 52 in the same change — whitelist-only (keeper-py reads
-    // neither of the new `last_permission_prompt_*` columns; the pill
-    // surfaces only through the board renderer), but the bump is
-    // required so keeper-py's Python readers (e.g. `planctl
-    // render-approve-context`) on this host don't fail-loud
-    // (test/schema-version.test.ts enforces).
-
-    // v52→v53: fn-688 — `epic_tombstones` projection table guards every
-    // epic-shell-INSERT site against the deleted-epic resurrection bug
-    // (a later job-side fold whose `plan_ref` still points at the now-
-    // gone epic re-shells the row with NULL scalars, rendering as a
-    // headerless "ghost" block at the top of `keeper board`). The
-    // `EpicDeleted` arm mints a tombstone keyed by `epic_id`; the
-    // `EpicSnapshot` arm clears it on a re-create; every
-    // `epicRow == null` shell-INSERT site (`projectPlanRow`
-    // TaskSnapshot arm, both `syncJobIntoEpic` arms, `syncPlanctlLinks`)
-    // consults the table via a shared
-    // `insertEpicShellIfNotTombstoned` helper and skips the INSERT
-    // when a tombstone is present. The full-scalar EpicSnapshot INSERT
-    // is NOT a shell site — it is the clear site (a legitimate
-    // re-create reverts the deletion).
-    //
-    // Rewind-and-redrain: cursor=0 + DELETE projections + redrain so
-    // every existing `epics` ghost row sourced from a pre-fn-688
-    // resurrection is rebuilt from the immutable event log with the
-    // tombstone guard ENGAGED, evicting the ghost without any manual
-    // DELETE into the projection. `epic_tombstones` joins the
-    // projection-wipe list (jobs / epics / subagent_invocations) so a
-    // pre-existing rewind from v52 cannot strand a stale tombstone.
-    // Pure projection (`deleted_at_event_id = event.id`, no
-    // wallclock / env / fs reads); a from-scratch re-fold reproduces
-    // both `epics` and `epic_tombstones` byte-identically.
-    //
-    // Mirrors the v17→v18 / v18→v19 / v23→v24 / v24→v25 / v51→v52
-    // rewind-and-redrain pattern. Version-guarded on
-    // `storedVersionV53 < 53` so a steady-state v53+ re-open skips
-    // the rewind. The boot drain after `migrate()` returns rebuilds
-    // every projection from the event log.
-    //
-    // No new addColumnIfMissing on `events` / `jobs` / `epics` —
-    // `epic_tombstones` is a brand-new empty table (CREATE TABLE
-    // above), populated entirely from the immediately-following
-    // re-fold over the existing log.
-    const storedVersionV53 = Number(
-      (
-        db
-          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
-          .get() as { value: string } | null
-      )?.value ?? "0",
-    );
-    if (storedVersionV53 < 53) {
-      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-      db.run("DELETE FROM jobs");
-      db.run("DELETE FROM epics");
-      db.run("DELETE FROM subagent_invocations");
-      db.run("DELETE FROM epic_tombstones");
-    }
-    //
-    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
-    // adds 53 in the same change — whitelist-only (keeper-py reads
-    // neither `epic_tombstones` nor any guarded shell-INSERT site; the
-    // board renderer is the only consumer affected by the ghost-row
-    // fix), but the bump is required so keeper-py's Python readers
-    // (e.g. `planctl render-approve-context`) on this host don't
-    // fail-loud (test/schema-version.test.ts enforces).
-
-    // v53→v54: fn-695 (T3) — durable commit-derived creator/refiner
-    // edges. The reducer's `syncPlanctlLinks` now derives the
-    // `epics.job_links` / `jobs.epic_links` edges from the UNION of (a)
-    // today's `events.planctl_op` stdout-scrape rows and (b) commit-
-    // trailer facts lifted off `Commit` events (`Planctl-Op` /
-    // `Planctl-Target` / `Session-Id`, frozen on the payload by task
-    // .2), deduped by `(kind, job_id)` and classified through the
-    // EXISTING `deriveEpicLinks` / `deriveJobLinks` predicate.
-    // `foldCommit` TRIGGERS the per-session rebuild (it never writes the
-    // edge cells directly — the single-writer invariant is preserved).
-    //
-    // NO new real column — the union rides FREE inside the existing
-    // `jobs.epic_links` / `epics.job_links` JSON-TEXT cells that
-    // `syncPlanctlLinks` already serialises; this is a whitelist-only
-    // schema bump, mirroring the v48→v49 (fn-670 T2) template above.
-    //
-    // No ALTER step here, and (unlike the rewind-and-redrain v51→v52 /
-    // v52→v53 slots) no cursor rewind: this is a FIX-FORWARD epic. Both
-    // union inputs are immutable events, and every pre-fn-695 `Commit`
-    // event lacks the `planctl_op` / `planctl_target` payload fields —
-    // {@link import("./derivers").extractCommit} defaults each to
-    // `null`, so the commit-channel union is a no-op over the historical
-    // log and a from-scratch re-fold reproduces byte-identical
-    // `job_links` / `epic_links`. Existing orphaned edges (fn-635) are
-    // deliberately NOT backfilled; only commits landing post-upgrade
-    // mint the durable edge.
-    //
-    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
-    // adds 54 in the SAME change — whitelist-only (keeper-py reads
-    // neither the edge cells nor the commit-trailer payload; the board
-    // renderer is the only consumer), but the bump is required so
-    // keeper-py's Python readers (e.g. `planctl render-approve-context`)
-    // on this host don't fail-loud
-    // (test/schema-version.test.ts enforces).
-
-    // v54→v55: fn-710 (T2) — drop the two dead
-    // `jobs.backend_exec_{tab_id,tab_name}` columns. Their sole writer was
-    // the now-removed `foldBackendExecSnapshot` (Task 1 reaped the
-    // BackendExecSnapshot feed consumer + fold), so they are unwritten and
-    // unread. No indexes reference them (verified) → dropColumnIfPresent's
-    // B-tree rewrite needs no index rebuild. Idempotent (drops only if
-    // present), so this runs every boot and converges whether the DB is a
-    // fresh v55 (CREATE_JOBS already omits them) or an upgraded v54-shaped
-    // DB that still carries them.
-    //
-    // Re-fold safe: the columns are gone from the projection, Task 1 made
-    // the fold a no-op, and the historical `BackendExecSnapshot` events
-    // (the only source that ever populated these columns) now fold to an
-    // explicit no-op, so a from-scratch cursor=0 re-fold reproduces the new
-    // column-less `jobs` shape. The live backend coords
-    // (`backend_exec_{type,session_id,pane_id}`) STAY — they are hook-fed
-    // via the COALESCE fold arm and untouched here.
-    //
-    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 55
-    // in the SAME change — whitelist-only (keeper-py reads neither column),
-    // but the bump is required so keeper-py's Python readers (e.g. `planctl
-    // render-approve-context`) on this host don't fail-loud
-    // (test/schema-version.test.ts enforces).
-    dropColumnIfPresent(db, "jobs", "backend_exec_tab_id");
-    dropColumnIfPresent(db, "jobs", "backend_exec_tab_name");
-
-    // v55→v56: fn-712 — the "epic is materialized" gate. Rewrite the
-    // `epics.default_visible` VIRTUAL generated column to add the
-    // `status IS NOT NULL` guard:
-    //   CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved')
-    //        THEN 1 ELSE 0 END
-    // `status` is set to non-null at exactly ONE reducer site (the
-    // EpicSnapshot UPSERT) — all four shell-INSERTs write NULL — so
-    // `status IS NOT NULL` is an exact, re-fold-safe "EpicSnapshot has
-    // folded" discriminator. The board's default page filters
-    // `WHERE default_visible = 1`, so a freshly-scaffolded NULL-status
-    // shell row (which the prior expression surfaced via the
-    // `approval!='approved'` branch) is now hidden until its real
-    // EpicSnapshot folds. The mirror gate on the autopilot side is the
-    // read-time `epic-not-materialized` readiness verdict (no schema
-    // dependency). KEEP the CASE wrap: the column is `NOT NULL` and
-    // `status` is nullable, so a bare predicate would compute NULL and
-    // violate the constraint.
-    //
-    // SQLite cannot ALTER a generated-column expression in place, so the
-    // only forward-only path is DROP + re-ADD, all inside this one
-    // `BEGIN IMMEDIATE` so a mid-step throw rolls the whole transaction
-    // back cleanly (never a half-applied schema that wedges boot):
-    //   1. DROP the partial index `idx_epics_default_visible` FIRST — it
-    //      references the column, so SQLite refuses to drop the column
-    //      while the index stands.
-    //   2. DROP the VIRTUAL column. The presence check MUST read
-    //      `PRAGMA table_xinfo` — `table_info` (what `dropColumnIfPresent`
-    //      reads) EXCLUDES generated columns, so it would no-op wrongly and
-    //      strand the old expression forever.
-    //   3. re-ADD the column via `addGeneratedColumnIfMissing` with the new
-    //      expression (its own `table_xinfo` check sees the column gone and
-    //      runs the ALTER; on a fresh v56 DB the CREATE_EPICS literal
-    //      already landed the new form, so this no-ops).
-    //   4. recreate the index via the always-run `CREATE_EPICS_INDEXES`
-    //      block, which runs unconditionally below the migrate transaction's
-    //      version stamp on every boot — but the column must exist when it
-    //      runs, so recreate it here too for the upgrade boot (IF NOT EXISTS
-    //      makes both runs idempotent).
-    //
-    // Version-guarded on `preMigrateStoredVersion < 56` so the drop+re-add
-    // runs exactly once per upgrade — a fresh v56 DB (CREATE_EPICS already
-    // carries the new expression) and a steady-state re-open of an
-    // already-v56 DB both skip the rewrite. The `quick_check` is gated to
-    // the upgrade boot only (cheap on the ~1.1k-row epics table) as a
-    // post-rewrite integrity assertion; a corrupt result throws and rolls
-    // the transaction back rather than stamping v56 over damage.
-    //
-    // Re-fold safe: `default_visible` is a VIRTUAL column SQLite recomputes
-    // on every read — no stored data, no backfill, and a from-scratch
-    // cursor=0 re-fold reproduces byte-identical 0/1 values because the
-    // expression is a pure function of the (status, approval) columns the
-    // reducer already writes. NO reducer / event-log change.
-    //
-    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 56
-    // in the SAME change — whitelist-only (keeper-py reads neither the
-    // column nor the predicate), but the bump is required so
-    // keeper-py's Python readers (e.g. `planctl render-approve-context`)
-    // on this host don't fail-loud
-    // (test/schema-version.test.ts enforces).
-    if (preMigrateStoredVersion < 56) {
-      const xinfoCols = db.prepare("PRAGMA table_xinfo(epics)").all() as {
-        name: string;
-      }[];
-      if (xinfoCols.some((c) => c.name === "default_visible")) {
-        db.run("DROP INDEX IF EXISTS idx_epics_default_visible");
-        db.run("ALTER TABLE epics DROP COLUMN default_visible");
-      }
-      addGeneratedColumnIfMissing(
-        db,
-        "epics",
-        "default_visible",
-        "INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved') THEN 1 ELSE 0 END) VIRTUAL",
+      // Step 2: rewind-and-redrain — same shape as the v17→v18, v18→v19,
+      // v23→v24, v24→v25 steps. Version-guarded: re-open of an already-
+      // migrated v52+ DB skips it (the guard reads the meta row written by
+      // a PRIOR migrate(); on a fresh v52 DB or one that crashed before
+      // stamping v52, `storedVersionV52 < 52` and the rewind runs; on
+      // steady-state v52+ DB it skips). The boot drain after migrate()
+      // returns rebuilds `jobs` / `epics` / `subagent_invocations` from
+      // the event log, re-emitting embedded `jobs` arrays + `job_links`
+      // arrays with the new field-pair on every entry. Historical
+      // `Notification:permission_prompt` / `Notification:elicitation_dialog`
+      // rows DO fold this time (unlike the v25 input-request rewind which
+      // saw zero historical events) — the stamps that result are honest
+      // re-derivations of what the projection would have read had the
+      // fold existed when those events landed, and the five clear arms
+      // (UPS / SessionStart / Pre+PostToolUse / Stop) on subsequent
+      // events sweep them up the same way a steady-state v52 install
+      // would.
+      const storedVersionV52 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
       );
-      db.run(
-        "CREATE INDEX IF NOT EXISTS idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1",
-      );
-      const integrity = db.prepare("PRAGMA quick_check").get() as {
-        quick_check: string;
-      } | null;
-      if (integrity?.quick_check !== "ok") {
-        throw new Error(
-          `v55→v56 default_visible rewrite failed integrity quick_check: ${integrity?.quick_check ?? "no result"}`,
-        );
+      if (storedVersionV52 < 52) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
       }
-    }
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
+      // adds 52 in the same change — whitelist-only (keeper-py reads
+      // neither of the new `last_permission_prompt_*` columns; the pill
+      // surfaces only through the board renderer), but the bump is
+      // required so keeper-py's Python readers (e.g. `planctl
+      // render-approve-context`) on this host don't fail-loud
+      // (test/schema-version.test.ts enforces).
 
-    // v56→v57: fn-717.1 — add the `event_blobs` cold-blob relocation side
-    // table (created above via CREATE TABLE IF NOT EXISTS, naturally
-    // idempotent and forward-only — same pattern as the v5→v6 epics/tasks
-    // table add). No ALTER, no backfill, no data move: the table starts
-    // EMPTY and a future compaction pass (task .2) relocates cold blobs
-    // into it. A v56 DB gains the one empty table on first open with every
-    // prior `events`/`jobs`/`epics` row intact.
-    //
-    // Re-fold safe: the table is NOT a reducer projection — it is never
-    // folded and never written inside the BEGIN IMMEDIATE cursor-advance
-    // transaction. With it empty, every reducer
-    // `COALESCE(events.data, event_blobs.data)` blob read returns the
-    // inline `events.data` value (`COALESCE(data, NULL) = data`), so a
-    // from-scratch cursor=0 re-fold reproduces byte-identical projections.
-    // The `idx_events_tool_attr` expression index on `events.data` is
-    // UNCHANGED and still serves the file-attribution scan (that scan's
-    // WHERE filter stays on `events.data`, NOT COALESCE — see the .2 seam
-    // note in `src/reducer.ts` `findExplicitAttributions`).
-    //
-    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 57
-    // in the SAME change — whitelist-only (keeper-py never reads
-    // `events.data` nor `event_blobs`), but the bump is required so
-    // `keeper commit-work` on this host doesn't fail-loud
-    // (test/schema-version.test.ts enforces).
-    db.run(CREATE_EVENT_BLOBS);
+      // v52→v53: fn-688 — `epic_tombstones` projection table guards every
+      // epic-shell-INSERT site against the deleted-epic resurrection bug
+      // (a later job-side fold whose `plan_ref` still points at the now-
+      // gone epic re-shells the row with NULL scalars, rendering as a
+      // headerless "ghost" block at the top of `keeper board`). The
+      // `EpicDeleted` arm mints a tombstone keyed by `epic_id`; the
+      // `EpicSnapshot` arm clears it on a re-create; every
+      // `epicRow == null` shell-INSERT site (`projectPlanRow`
+      // TaskSnapshot arm, both `syncJobIntoEpic` arms, `syncPlanctlLinks`)
+      // consults the table via a shared
+      // `insertEpicShellIfNotTombstoned` helper and skips the INSERT
+      // when a tombstone is present. The full-scalar EpicSnapshot INSERT
+      // is NOT a shell site — it is the clear site (a legitimate
+      // re-create reverts the deletion).
+      //
+      // Rewind-and-redrain: cursor=0 + DELETE projections + redrain so
+      // every existing `epics` ghost row sourced from a pre-fn-688
+      // resurrection is rebuilt from the immutable event log with the
+      // tombstone guard ENGAGED, evicting the ghost without any manual
+      // DELETE into the projection. `epic_tombstones` joins the
+      // projection-wipe list (jobs / epics / subagent_invocations) so a
+      // pre-existing rewind from v52 cannot strand a stale tombstone.
+      // Pure projection (`deleted_at_event_id = event.id`, no
+      // wallclock / env / fs reads); a from-scratch re-fold reproduces
+      // both `epics` and `epic_tombstones` byte-identically.
+      //
+      // Mirrors the v17→v18 / v18→v19 / v23→v24 / v24→v25 / v51→v52
+      // rewind-and-redrain pattern. Version-guarded on
+      // `storedVersionV53 < 53` so a steady-state v53+ re-open skips
+      // the rewind. The boot drain after `migrate()` returns rebuilds
+      // every projection from the event log.
+      //
+      // No new addColumnIfMissing on `events` / `jobs` / `epics` —
+      // `epic_tombstones` is a brand-new empty table (CREATE TABLE
+      // above), populated entirely from the immediately-following
+      // re-fold over the existing log.
+      const storedVersionV53 = Number(
+        (
+          db
+            .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string } | null
+        )?.value ?? "0",
+      );
+      if (storedVersionV53 < 53) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
+        db.run("DELETE FROM epic_tombstones");
+      }
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
+      // adds 53 in the same change — whitelist-only (keeper-py reads
+      // neither `epic_tombstones` nor any guarded shell-INSERT site; the
+      // board renderer is the only consumer affected by the ghost-row
+      // fix), but the bump is required so keeper-py's Python readers
+      // (e.g. `planctl render-approve-context`) on this host don't
+      // fail-loud (test/schema-version.test.ts enforces).
 
-    // v57→v58: fn-717.2 — relax `events.data` from NOT NULL → nullable so the
-    // daemon-side compaction relocator (`src/compaction.ts`) can `UPDATE
-    // events SET data = NULL` after copying a cold blob into `event_blobs`.
-    //
-    // WHY A STOP-THE-WORLD TABLE REBUILD (not the O(1) `writable_schema` edit
-    // SQLite documents for dropping a column constraint): bun:sqlite enforces
-    // DEFENSIVE mode and HARD-BLOCKS any `UPDATE sqlite_master` even under
-    // `PRAGMA writable_schema=ON` (it silently resets the pragma to 0). So the
-    // schema-text edit is unavailable on this runtime and the only mechanism
-    // left is the canonical 12-step rebuild: rename the old table aside,
-    // CREATE the new (nullable-`data`) shape, copy every row, drop the old
-    // table, recreate every index. This carries a DATA COPY of the ENTIRE
-    // events table.
-    //
-    // OPERATIONAL CONTRACT — THE DAEMON MUST BE STOPPED FOR THIS MIGRATION.
-    // Measured on the production ~1.6 GB / ~566k-row DB the rebuild holds the
-    // single writer lock for ~3 MINUTES (the row copy + recreating all 20
-    // events indexes). That far exceeds the hook's 1.2s `busy_timeout`, so any
-    // concurrent hook INSERT during the rebuild WOULD dead-letter — a direct
-    // violation of the hook-never-starved invariant and the reliability
-    // mission's zero-dead-letters streak. This is therefore a ONE-TIME,
-    // shape-guarded, OFFLINE migration: the operator stops the LaunchAgent
-    // (so no hooks are racing the lock), the next `keeperd` boot runs this
-    // block exactly once (gated on `events.data` actually being NOT NULL, so a
-    // fresh DB and an already-migrated v58 DB both skip it), then the daemon
-    // comes up on the relaxed schema. BACK UP THE DB FIRST. Unlike the
-    // chunked v34 backfill, a table rebuild's final DROP+swap is inherently
-    // atomic and cannot be paced across lock-releasing chunks — there is no
-    // safe online variant on bun:sqlite, hence the offline contract.
-    //
-    // RE-FOLD DETERMINISM: untouched. `events` is the immutable event log, not
-    // a projection — the rebuild copies every column VALUE byte-for-byte
-    // (explicit column list, not `SELECT *`, so column order is pinned), so a
-    // from-scratch cursor=0 re-fold reads identical rows and reproduces
-    // identical projections. The AUTOINCREMENT high-water in `sqlite_sequence`
-    // is preserved so `events.id` never reuses a value. Crash-safe: the whole
-    // step is inside the one `.immediate()` migrate transaction, so an
-    // interrupted rebuild rolls back to the v57 table intact (the version is
-    // only stamped on COMMIT, so a re-boot re-runs the rebuild).
-    //
-    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 58 in
-    // the SAME change — whitelist-only (keeper-py never reads `events.data`),
-    // but required so `keeper commit-work` doesn't fail-loud
-    // (test/schema-version.test.ts enforces).
-    // Shape-driven idempotency guard: run the rebuild ONLY when `events.data`
-    // is actually NOT NULL on the live table. A fresh DB (CREATE_EVENTS above
-    // already makes `data` nullable) and a re-open of an already-migrated v58
-    // DB both read `notnull === 0` here and skip the rebuild — so the
-    // destructive RENAME/COPY/DROP never fires needlessly (and never on the
-    // empty-events fast path, which would otherwise churn the connection's
-    // prepared-statement cache for zero benefit). This matches the migrate()
-    // header's "convergence is driven by the table's actual shape, not by
-    // trusting the version number" contract — the `preMigrateStoredVersion <
-    // 58` version check is folded into the column-shape probe.
-    const eventsDataNotNull =
-      (
-        db.prepare("PRAGMA table_info('events')").all() as {
+      // v53→v54: fn-695 (T3) — durable commit-derived creator/refiner
+      // edges. The reducer's `syncPlanctlLinks` now derives the
+      // `epics.job_links` / `jobs.epic_links` edges from the UNION of (a)
+      // today's `events.planctl_op` stdout-scrape rows and (b) commit-
+      // trailer facts lifted off `Commit` events (`Planctl-Op` /
+      // `Planctl-Target` / `Session-Id`, frozen on the payload by task
+      // .2), deduped by `(kind, job_id)` and classified through the
+      // EXISTING `deriveEpicLinks` / `deriveJobLinks` predicate.
+      // `foldCommit` TRIGGERS the per-session rebuild (it never writes the
+      // edge cells directly — the single-writer invariant is preserved).
+      //
+      // NO new real column — the union rides FREE inside the existing
+      // `jobs.epic_links` / `epics.job_links` JSON-TEXT cells that
+      // `syncPlanctlLinks` already serialises; this is a whitelist-only
+      // schema bump, mirroring the v48→v49 (fn-670 T2) template above.
+      //
+      // No ALTER step here, and (unlike the rewind-and-redrain v51→v52 /
+      // v52→v53 slots) no cursor rewind: this is a FIX-FORWARD epic. Both
+      // union inputs are immutable events, and every pre-fn-695 `Commit`
+      // event lacks the `planctl_op` / `planctl_target` payload fields —
+      // {@link import("./derivers").extractCommit} defaults each to
+      // `null`, so the commit-channel union is a no-op over the historical
+      // log and a from-scratch re-fold reproduces byte-identical
+      // `job_links` / `epic_links`. Existing orphaned edges (fn-635) are
+      // deliberately NOT backfilled; only commits landing post-upgrade
+      // mint the durable edge.
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
+      // adds 54 in the SAME change — whitelist-only (keeper-py reads
+      // neither the edge cells nor the commit-trailer payload; the board
+      // renderer is the only consumer), but the bump is required so
+      // keeper-py's Python readers (e.g. `planctl render-approve-context`)
+      // on this host don't fail-loud
+      // (test/schema-version.test.ts enforces).
+
+      // v54→v55: fn-710 (T2) — drop the two dead
+      // `jobs.backend_exec_{tab_id,tab_name}` columns. Their sole writer was
+      // the now-removed `foldBackendExecSnapshot` (Task 1 reaped the
+      // BackendExecSnapshot feed consumer + fold), so they are unwritten and
+      // unread. No indexes reference them (verified) → dropColumnIfPresent's
+      // B-tree rewrite needs no index rebuild. Idempotent (drops only if
+      // present), so this runs every boot and converges whether the DB is a
+      // fresh v55 (CREATE_JOBS already omits them) or an upgraded v54-shaped
+      // DB that still carries them.
+      //
+      // Re-fold safe: the columns are gone from the projection, Task 1 made
+      // the fold a no-op, and the historical `BackendExecSnapshot` events
+      // (the only source that ever populated these columns) now fold to an
+      // explicit no-op, so a from-scratch cursor=0 re-fold reproduces the new
+      // column-less `jobs` shape. The live backend coords
+      // (`backend_exec_{type,session_id,pane_id}`) STAY — they are hook-fed
+      // via the COALESCE fold arm and untouched here.
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 55
+      // in the SAME change — whitelist-only (keeper-py reads neither column),
+      // but the bump is required so keeper-py's Python readers (e.g. `planctl
+      // render-approve-context`) on this host don't fail-loud
+      // (test/schema-version.test.ts enforces).
+      dropColumnIfPresent(db, "jobs", "backend_exec_tab_id");
+      dropColumnIfPresent(db, "jobs", "backend_exec_tab_name");
+
+      // v55→v56: fn-712 — the "epic is materialized" gate. Rewrite the
+      // `epics.default_visible` VIRTUAL generated column to add the
+      // `status IS NOT NULL` guard:
+      //   CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved')
+      //        THEN 1 ELSE 0 END
+      // `status` is set to non-null at exactly ONE reducer site (the
+      // EpicSnapshot UPSERT) — all four shell-INSERTs write NULL — so
+      // `status IS NOT NULL` is an exact, re-fold-safe "EpicSnapshot has
+      // folded" discriminator. The board's default page filters
+      // `WHERE default_visible = 1`, so a freshly-scaffolded NULL-status
+      // shell row (which the prior expression surfaced via the
+      // `approval!='approved'` branch) is now hidden until its real
+      // EpicSnapshot folds. The mirror gate on the autopilot side is the
+      // read-time `epic-not-materialized` readiness verdict (no schema
+      // dependency). KEEP the CASE wrap: the column is `NOT NULL` and
+      // `status` is nullable, so a bare predicate would compute NULL and
+      // violate the constraint.
+      //
+      // SQLite cannot ALTER a generated-column expression in place, so the
+      // only forward-only path is DROP + re-ADD, all inside this one
+      // `BEGIN IMMEDIATE` so a mid-step throw rolls the whole transaction
+      // back cleanly (never a half-applied schema that wedges boot):
+      //   1. DROP the partial index `idx_epics_default_visible` FIRST — it
+      //      references the column, so SQLite refuses to drop the column
+      //      while the index stands.
+      //   2. DROP the VIRTUAL column. The presence check MUST read
+      //      `PRAGMA table_xinfo` — `table_info` (what `dropColumnIfPresent`
+      //      reads) EXCLUDES generated columns, so it would no-op wrongly and
+      //      strand the old expression forever.
+      //   3. re-ADD the column via `addGeneratedColumnIfMissing` with the new
+      //      expression (its own `table_xinfo` check sees the column gone and
+      //      runs the ALTER; on a fresh v56 DB the CREATE_EPICS literal
+      //      already landed the new form, so this no-ops).
+      //   4. recreate the index via the always-run `CREATE_EPICS_INDEXES`
+      //      block, which runs unconditionally below the migrate transaction's
+      //      version stamp on every boot — but the column must exist when it
+      //      runs, so recreate it here too for the upgrade boot (IF NOT EXISTS
+      //      makes both runs idempotent).
+      //
+      // Version-guarded on `preMigrateStoredVersion < 56` so the drop+re-add
+      // runs exactly once per upgrade — a fresh v56 DB (CREATE_EPICS already
+      // carries the new expression) and a steady-state re-open of an
+      // already-v56 DB both skip the rewrite. The `quick_check` is gated to
+      // the upgrade boot only (cheap on the ~1.1k-row epics table) as a
+      // post-rewrite integrity assertion; a corrupt result throws and rolls
+      // the transaction back rather than stamping v56 over damage.
+      //
+      // Re-fold safe: `default_visible` is a VIRTUAL column SQLite recomputes
+      // on every read — no stored data, no backfill, and a from-scratch
+      // cursor=0 re-fold reproduces byte-identical 0/1 values because the
+      // expression is a pure function of the (status, approval) columns the
+      // reducer already writes. NO reducer / event-log change.
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 56
+      // in the SAME change — whitelist-only (keeper-py reads neither the
+      // column nor the predicate), but the bump is required so
+      // keeper-py's Python readers (e.g. `planctl render-approve-context`)
+      // on this host don't fail-loud
+      // (test/schema-version.test.ts enforces).
+      if (preMigrateStoredVersion < 56) {
+        const xinfoCols = db.prepare("PRAGMA table_xinfo(epics)").all() as {
           name: string;
-          notnull: number;
-        }[]
-      ).find((c) => c.name === "data")?.notnull === 1;
-    if (eventsDataNotNull) {
-      // Snapshot the AUTOINCREMENT high-water + every events index's stored
-      // SQL BEFORE the rename, so the rebuild recreates them exactly — no
-      // hardcoded index list to drift out of sync with the CREATE_*_INDEXES
-      // groups scattered across migrate(). Auto-indexes (PK / UNIQUE) have
-      // `sql IS NULL` and are recreated implicitly by the CREATE TABLE, so we
-      // skip them here.
-      const eventsIndexSql = (
-        db
-          .prepare(
-            "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events' AND sql IS NOT NULL",
-          )
-          .all() as { sql: string }[]
-      ).map((r) => r.sql);
-      const seqRow = db
-        .prepare("SELECT seq FROM sqlite_sequence WHERE name = 'events'")
-        .get() as { seq: number } | null;
+        }[];
+        if (xinfoCols.some((c) => c.name === "default_visible")) {
+          db.run("DROP INDEX IF EXISTS idx_epics_default_visible");
+          db.run("ALTER TABLE epics DROP COLUMN default_visible");
+        }
+        addGeneratedColumnIfMissing(
+          db,
+          "epics",
+          "default_visible",
+          "INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved') THEN 1 ELSE 0 END) VIRTUAL",
+        );
+        db.run(
+          "CREATE INDEX IF NOT EXISTS idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1",
+        );
+        const integrity = db.prepare("PRAGMA quick_check").get() as {
+          quick_check: string;
+        } | null;
+        if (integrity?.quick_check !== "ok") {
+          throw new Error(
+            `v55→v56 default_visible rewrite failed integrity quick_check: ${integrity?.quick_check ?? "no result"}`,
+          );
+        }
+      }
 
-      db.run("ALTER TABLE events RENAME TO events_old");
-      // CREATE_EVENTS now defines `data TEXT` (nullable). After the rename
-      // `events` does not exist, so the `IF NOT EXISTS` create makes the new
-      // nullable table.
-      db.run(CREATE_EVENTS);
-      // Explicit column list on BOTH sides pins column order independent of
-      // the old table's physical shape — a defensive choice over `SELECT *`.
-      db.run(
-        `INSERT INTO events (
+      // v56→v57: fn-717.1 — add the `event_blobs` cold-blob relocation side
+      // table (created above via CREATE TABLE IF NOT EXISTS, naturally
+      // idempotent and forward-only — same pattern as the v5→v6 epics/tasks
+      // table add). No ALTER, no backfill, no data move: the table starts
+      // EMPTY and a future compaction pass (task .2) relocates cold blobs
+      // into it. A v56 DB gains the one empty table on first open with every
+      // prior `events`/`jobs`/`epics` row intact.
+      //
+      // Re-fold safe: the table is NOT a reducer projection — it is never
+      // folded and never written inside the BEGIN IMMEDIATE cursor-advance
+      // transaction. With it empty, every reducer
+      // `COALESCE(events.data, event_blobs.data)` blob read returns the
+      // inline `events.data` value (`COALESCE(data, NULL) = data`), so a
+      // from-scratch cursor=0 re-fold reproduces byte-identical projections.
+      // The `idx_events_tool_attr` expression index on `events.data` is
+      // UNCHANGED and still serves the file-attribution scan (that scan's
+      // WHERE filter stays on `events.data`, NOT COALESCE — see the .2 seam
+      // note in `src/reducer.ts` `findExplicitAttributions`).
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 57
+      // in the SAME change — whitelist-only (keeper-py never reads
+      // `events.data` nor `event_blobs`), but the bump is required so
+      // `keeper commit-work` on this host doesn't fail-loud
+      // (test/schema-version.test.ts enforces).
+      db.run(CREATE_EVENT_BLOBS);
+
+      // v57→v58: fn-717.2 — relax `events.data` from NOT NULL → nullable so the
+      // daemon-side compaction relocator (`src/compaction.ts`) can `UPDATE
+      // events SET data = NULL` after copying a cold blob into `event_blobs`.
+      //
+      // WHY A STOP-THE-WORLD TABLE REBUILD (not the O(1) `writable_schema` edit
+      // SQLite documents for dropping a column constraint): bun:sqlite enforces
+      // DEFENSIVE mode and HARD-BLOCKS any `UPDATE sqlite_master` even under
+      // `PRAGMA writable_schema=ON` (it silently resets the pragma to 0). So the
+      // schema-text edit is unavailable on this runtime and the only mechanism
+      // left is a full table rebuild: CREATE a new (nullable-`data`) table under
+      // a TEMP name, copy every row, DROP the old `events`, RENAME the temp table
+      // to `events`, recreate every index. This carries a DATA COPY of the ENTIRE
+      // events table.
+      //
+      // WHY temp-new-table + DROP rather than `ALTER events RENAME TO events_old`:
+      // a modern-SQLite rename of `events` rewrites every REFERENCE to it,
+      // including `event_blobs`'s FK, leaving it dangling after the old table is
+      // dropped (the failure mode `no such table: events_old` on the relocator's
+      // INSERT). Renaming the NEW table (which nothing references) avoids the
+      // rewrite. The DROP of the FK-referenced `events` needs FK enforcement OFF,
+      // toggled via `PRAGMA foreign_keys` AROUND the migrate transaction (it is a
+      // no-op INSIDE one) — see `needsEventsRebuild` above the transaction.
+      //
+      // OPERATIONAL CONTRACT — THE DAEMON MUST BE STOPPED FOR THIS MIGRATION.
+      // Measured on the production ~1.6 GB / ~566k-row DB the rebuild holds the
+      // single writer lock for ~3 MINUTES (the row copy + recreating all 20
+      // events indexes). That far exceeds the hook's 1.2s `busy_timeout`, so any
+      // concurrent hook INSERT during the rebuild WOULD dead-letter — a direct
+      // violation of the hook-never-starved invariant and the reliability
+      // mission's zero-dead-letters streak. This is therefore a ONE-TIME,
+      // shape-guarded, OFFLINE migration: the operator stops the LaunchAgent
+      // (so no hooks are racing the lock), the next `keeperd` boot runs this
+      // block exactly once (gated on `events.data` actually being NOT NULL, so a
+      // fresh DB and an already-migrated v58 DB both skip it), then the daemon
+      // comes up on the relaxed schema. BACK UP THE DB FIRST. Unlike the
+      // chunked v34 backfill, a table rebuild's final DROP+swap is inherently
+      // atomic and cannot be paced across lock-releasing chunks — there is no
+      // safe online variant on bun:sqlite, hence the offline contract.
+      //
+      // RE-FOLD DETERMINISM: untouched. `events` is the immutable event log, not
+      // a projection — the rebuild copies every column VALUE byte-for-byte
+      // (explicit column list, not `SELECT *`, so column order is pinned), so a
+      // from-scratch cursor=0 re-fold reads identical rows and reproduces
+      // identical projections. The AUTOINCREMENT high-water in `sqlite_sequence`
+      // is preserved so `events.id` never reuses a value. Crash-safe: the whole
+      // step is inside the one `.immediate()` migrate transaction, so an
+      // interrupted rebuild rolls back to the v57 table intact (the version is
+      // only stamped on COMMIT, so a re-boot re-runs the rebuild).
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 58 in
+      // the SAME change — whitelist-only (keeper-py never reads `events.data`),
+      // but required so `keeper commit-work` doesn't fail-loud
+      // (test/schema-version.test.ts enforces).
+      // Shape-driven idempotency guard: run the rebuild ONLY when `events.data`
+      // was actually NOT NULL on the live table (probed BEFORE this transaction,
+      // alongside the `PRAGMA foreign_keys = OFF` toggle the DROP requires — see
+      // `needsEventsRebuild`). A fresh DB (CREATE_EVENTS makes `data` nullable)
+      // and a re-open of an already-migrated v58 DB both read `notnull === 0`
+      // and skip the rebuild, so the destructive COPY/DROP/RENAME never fires
+      // needlessly. This matches the migrate() header's "convergence is driven
+      // by the table's actual shape, not by trusting the version number"
+      // contract — the `preMigrateStoredVersion < 58` version check is folded
+      // into the column-shape probe.
+      if (needsEventsRebuild) {
+        // Snapshot the AUTOINCREMENT high-water + every events index's stored
+        // SQL BEFORE the rename, so the rebuild recreates them exactly — no
+        // hardcoded index list to drift out of sync with the CREATE_*_INDEXES
+        // groups scattered across migrate(). Auto-indexes (PK / UNIQUE) have
+        // `sql IS NULL` and are recreated implicitly by the CREATE TABLE, so we
+        // skip them here.
+        const eventsIndexSql = (
+          db
+            .prepare(
+              "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events' AND sql IS NOT NULL",
+            )
+            .all() as { sql: string }[]
+        ).map((r) => r.sql);
+        const seqRow = db
+          .prepare("SELECT seq FROM sqlite_sequence WHERE name = 'events'")
+          .get() as { seq: number } | null;
+
+        // CRITICAL — `PRAGMA legacy_alter_table=ON` AROUND the rename. SQLite's
+        // MODERN `ALTER TABLE events RENAME TO events_old` automatically rewrites
+        // every REFERENCE to `events` in OTHER objects' schema — including the
+        // FOREIGN KEY in `event_blobs` (`event_id … REFERENCES events(id)`),
+        // which it rewrites to `REFERENCES "events_old"(id)`. We then DROP
+        // `events_old`, leaving `event_blobs` with a DANGLING FK to a table that
+        // no longer exists; every subsequent `INSERT INTO event_blobs` (the
+        // compaction relocator!) then fails to prepare with `no such table:
+        // main.events_old`. `legacy_alter_table=ON` restores the pre-3.25
+        // behavior where RENAME touches ONLY the renamed table and leaves other
+        // objects' references verbatim — so `event_blobs` keeps pointing at
+        // `events`, and after we recreate `events` the FK resolves correctly.
+        // Set/reset OUTSIDE the rename pair but INSIDE the migrate transaction
+        // (connection-local, restored immediately after so nothing else in the
+        // process sees legacy ALTER semantics). The PRAGMA is the load-bearing
+        // fix here, NOT a query-cache workaround — the failure was a real schema
+        // corruption, not a bun cache artifact.
+        //
+        // Explicit column list on BOTH sides of the copy pins column order
+        // independent of the old table's physical shape (defensive over
+        // `SELECT *`). CREATE_EVENTS now defines `data TEXT` (nullable); after the
+        // rename `events` does not exist so its `IF NOT EXISTS` creates the new
+        // nullable table. The captured index SQL already names `ON events(...)`.
+        // Build the relaxed table under a TEMP name, copy, DROP the old `events`,
+        // then RENAME the temp table to `events`. This deliberately AVOIDS
+        // `ALTER TABLE events RENAME TO events_old`: a modern-SQLite rename of
+        // `events` rewrites every REFERENCE to it — including `event_blobs`'s
+        // FOREIGN KEY (`REFERENCES events(id)` → `REFERENCES "events_old"(id)`) —
+        // which then dangles when `events_old` is dropped and breaks every later
+        // `INSERT INTO event_blobs` (the compaction relocator) with `no such
+        // table: events_old`. By renaming the NEW table (which NOTHING
+        // references) TO `events`, no reference is rewritten and `event_blobs`
+        // keeps pointing at `events`. The DROP of the FK-referenced `events`
+        // requires FK enforcement OFF — handled by the caller toggling
+        // `PRAGMA foreign_keys = OFF` AROUND the whole migrate transaction (the
+        // pragma is a no-op INSIDE a transaction, so it cannot be toggled here).
+        //
+        // Explicit column list on BOTH sides of the copy pins column order
+        // independent of the old table's physical shape (defensive over
+        // `SELECT *`). CREATE_EVENTS now defines `data TEXT` (nullable); we
+        // create it under a temp name by retargeting CREATE_EVENTS's table name
+        // (the only `events` token in that DDL is the table name — the columns
+        // are `backend_exec_*` etc., never `events`). The captured index SQL
+        // names `ON events(...)`, recreated AFTER the temp table is renamed.
+        db.run(
+          CREATE_EVENTS.replace(
+            "CREATE TABLE IF NOT EXISTS events",
+            "CREATE TABLE events_v58_new",
+          ),
+        );
+        db.run(
+          `INSERT INTO events_v58_new (
            id, ts, session_id, pid, hook_event, event_type, tool_name, matcher,
            cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
            subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
@@ -5587,54 +5689,60 @@ function migrate(db: Database): void {
            bash_mutation_kind, bash_mutation_targets, planctl_files,
            backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
            background_task_id
-         FROM events_old`,
-      );
-      db.run("DROP TABLE events_old");
-      // Recreate every non-auto index from its captured SQL. The stored SQL
-      // already names `ON events(...)`; CREATE_EVENTS above (re-run by the
-      // unconditional top-of-migrate block on the NEXT boot too) would also
-      // recreate the static ones, but doing it here keeps the rebuilt table
-      // fully indexed within this same transaction — the unconditional block
-      // ran against the OLD table before the rename.
-      for (const sql of eventsIndexSql) {
-        db.run(sql);
-      }
-      // Preserve the AUTOINCREMENT high-water so a future INSERT never reuses
-      // an id even if rows were ever deleted (the event log is append-only, so
-      // MAX(id) == seq today, but pin it for correctness regardless). The
-      // `INSERT INTO events SELECT ...` above already (re)created the
-      // `sqlite_sequence` row for `events` at the max copied id, so a plain
-      // UPDATE restores the captured high-water. `sqlite_sequence` carries no
-      // declared PRIMARY KEY/UNIQUE, so an UPSERT's `ON CONFLICT(name)` would
-      // throw — UPDATE the existing row instead. (If the source table was
-      // empty, no row was created and there is nothing to preserve.)
-      if (seqRow != null) {
-        db.run("UPDATE sqlite_sequence SET seq = ? WHERE name = 'events'", [
-          seqRow.seq,
-        ]);
-      }
-      // Belt-and-suspenders: the rebuild is a destructive structural change, so
-      // verify the new table is structurally sound before the transaction
-      // COMMITs (a failed check throws → rolls back to the v57 table intact).
-      const integrity = db.prepare("PRAGMA quick_check").get() as {
-        quick_check: string;
-      } | null;
-      if (integrity?.quick_check !== "ok") {
-        throw new Error(
-          `v57→v58 events rebuild failed integrity quick_check: ${integrity?.quick_check ?? "no result"}`,
+         FROM events`,
         );
+        db.run("DROP TABLE events");
+        db.run("ALTER TABLE events_v58_new RENAME TO events");
+        // Recreate every captured non-auto index on the rebuilt table.
+        for (const sql of eventsIndexSql) {
+          db.run(sql);
+        }
+        // Preserve the AUTOINCREMENT high-water so a future INSERT never reuses
+        // an id even if rows were ever deleted (the event log is append-only, so
+        // MAX(id) == seq today, but pin it for correctness regardless). The
+        // `INSERT INTO events SELECT ...` above already (re)created the
+        // `sqlite_sequence` row for `events` at the max copied id, so a plain
+        // UPDATE restores the captured high-water. `sqlite_sequence` carries no
+        // declared PRIMARY KEY/UNIQUE, so an UPSERT's `ON CONFLICT(name)` would
+        // throw — UPDATE the existing row instead. (If the source table was
+        // empty, no row was created and there is nothing to preserve.)
+        if (seqRow != null) {
+          db.run("UPDATE sqlite_sequence SET seq = ? WHERE name = 'events'", [
+            seqRow.seq,
+          ]);
+        }
+        // Belt-and-suspenders: the rebuild is a destructive structural change, so
+        // verify the new table is structurally sound before the transaction
+        // COMMITs (a failed check throws → rolls back to the v57 table intact).
+        const integrity = db.prepare("PRAGMA quick_check").get() as {
+          quick_check: string;
+        } | null;
+        if (integrity?.quick_check !== "ok") {
+          throw new Error(
+            `v57→v58 events rebuild failed integrity quick_check: ${integrity?.quick_check ?? "no result"}`,
+          );
+        }
       }
-    }
 
-    db.prepare(
-      "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    ).run(String(SCHEMA_VERSION));
-    // `.immediate()` issues BEGIN IMMEDIATE — grab the writer lock at BEGIN, so
-    // a CREATE/ALTER/INSERT inside cannot lose the upgrade-to-writer race to a
-    // concurrent hook write and surface as SQLITE_BUSY half-way through migrate.
-    // Failure (lock unavailable past `busy_timeout`) is now clean and total at
-    // BEGIN, never half-applied. Pairs with the same fix in `applyEvent`.
-  }).immediate();
+      db.prepare(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      ).run(String(SCHEMA_VERSION));
+      // `.immediate()` issues BEGIN IMMEDIATE — grab the writer lock at BEGIN, so
+      // a CREATE/ALTER/INSERT inside cannot lose the upgrade-to-writer race to a
+      // concurrent hook write and surface as SQLITE_BUSY half-way through migrate.
+      // Failure (lock unavailable past `busy_timeout`) is now clean and total at
+      // BEGIN, never half-applied. Pairs with the same fix in `applyEvent`.
+    }).immediate();
+  } finally {
+    // fn-717.2: restore FK enforcement after the migrate transaction (it was
+    // toggled OFF only for the v57→v58 rebuild's DROP of the FK-referenced
+    // `events` table). The `finally` guarantees we never leave the connection
+    // with FK enforcement disabled even if migrate threw — `applyPragmas` set
+    // it ON at open, so restore that. No-op when the rebuild never ran.
+    if (needsEventsRebuild) {
+      db.run("PRAGMA foreign_keys = ON");
+    }
+  }
 
   // Schema v34 (fn-637): chunked backfill for `resolved_epic_deps` +
   // `epic_dep_edges`. Runs OUTSIDE the main migrate transaction so the

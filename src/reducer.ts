@@ -1591,27 +1591,42 @@ function findExplicitAttributions(
   // before the JSON probe. The reducer's BEGIN IMMEDIATE bounds this scan
   // to the writer lock window — kept narrow by the per-file iteration.
   //
-  // fn-717.1 cold-blob relocation — the .2 SEAM (DOCUMENTED, NOT BROKEN
-  // here). Unlike the drain SELECT and the commit-trailer reads (which
-  // resolve the blob VALUE via `COALESCE(events.data, event_blobs.data)`),
-  // this scan's `json_extract` filter STAYS on `events.data` — DO NOT
-  // COALESCE it. The expression index `idx_events_tool_attr` (src/db.ts) is
-  // defined ON `json_extract(data, '$.tool_input.file_path')`; rewriting the
-  // predicate to `json_extract(COALESCE(events.data, event_blobs.data), ...)`
-  // would defeat that index and regress the explicit-attribution scan from a
-  // sub-ms covering SEEK to a multi-second full scan of every PostToolUse row
-  // (the exact starvation this index was built to kill, per the
-  // `idx_events_tool_attr` docstring). It is also UNNECESSARY in this epic:
-  // the compaction relocator (task .2) only relocates a blob whose file
-  // attribution has ALREADY DISCHARGED (cold) — an event whose attribution
-  // can still be live keeps its blob inline. So a blob this scan could ever
-  // match is by construction still inline on `events.data`, and reading it
-  // through the index is lossless. Task .2 OWNS keeping that invariant true
-  // (compact only discharged blobs; never relocate one whose attribution can
-  // still match here) — it must NOT NULL `events.data` for any event a live
-  // attribution probe could still hit. In task .1 `event_blobs` is empty, so
-  // this is byte-identical to today regardless.
+  // fn-717.2 cold-blob relocation — the TWO-ARM resolution. This scan is the
+  // ONE reducer read of the blob VALUE that is NOT a plain
+  // `COALESCE(events.data, event_blobs.data)` (the drain SELECT + the
+  // commit-trailer reads are), because COALESCE-ing the `json_extract`
+  // predicate would defeat the expression index `idx_events_tool_attr` (defined
+  // ON `json_extract(data, '$.tool_input.file_path')`) and regress this from a
+  // sub-ms covering SEEK to a multi-second full scan of every PostToolUse row.
+  //
+  // The subtlety task .1 deferred and .2 had to solve: a relocated mutation
+  // blob is STILL needed here on a FROM-SCRATCH RE-FOLD. The discharging Commit
+  // replays AFTER the GitSnapshot, so at GitSnapshot-fold time a mutation whose
+  // attribution is CURRENTLY discharged is momentarily LIVE again and this scan
+  // must see its `tool_input.file_path`. "Currently discharged ⇒ safe to
+  // relocate" is therefore FALSE for the re-fold path — so the relocator does
+  // NOT try to keep matchable blobs inline by predicate. Instead we split the
+  // scan into two complementary arms that together equal the COALESCE'd scan
+  // while keeping the index on the common case:
+  //   ARM A — `events.data` (indexed SEEK): every INLINE blob (new events +
+  //           not-yet-relocated cold blobs). A relocated row has `data IS
+  //           NULL`, so `json_extract(NULL,…)` is NULL and ARM A misses it.
+  //   ARM B — `event_blobs.data` joined back to `events` where `e.data IS
+  //           NULL`: every RELOCATED blob. Scans only the (small) side table.
+  // The `e.data IS NULL` guard makes the two arms partition the rows (no
+  // double-count). So relocation is lossless for this scan regardless of
+  // discharge state, and re-fold stays byte-identical.
   for (const candidatePath of paths) {
+    // ARM A (inline, indexed): the hot path. Filters `events.data` directly so
+    // the expression index `idx_events_tool_attr` turns this into a sub-ms
+    // covering SEEK. Covers every blob still inline on `events.data` — i.e.
+    // every NEW event (the hook always writes `data` inline) plus every cold
+    // blob the compaction relocator (fn-717.2) has NOT moved. A relocated row
+    // has `events.data IS NULL`, so `json_extract(NULL, ...)` is NULL and this
+    // arm correctly MISSES it (handled by ARM B). This is why the predicate
+    // STAYS on `events.data` and is NOT COALESCE'd: COALESCE-ing it would
+    // defeat `idx_events_tool_attr` and regress this to a multi-second full
+    // scan of every PostToolUse row.
     const toolRows = db
       .prepare(
         `SELECT id, ts, session_id, tool_name
@@ -1626,7 +1641,37 @@ function findExplicitAttributions(
       session_id: string;
       tool_name: string;
     }>;
-    for (const row of toolRows) {
+    // ARM B (relocated): the fn-717.2 correctness arm. On a from-scratch
+    // re-fold the discharging Commit is replayed AFTER the GitSnapshot, so at
+    // GitSnapshot-fold time a mutation whose attribution is CURRENTLY
+    // discharged is momentarily LIVE again and THIS scan must still see its
+    // `tool_input.file_path`. The relocator therefore cannot rely on "currently
+    // discharged ⇒ never needed here"; instead, a relocated mutation blob stays
+    // matchable via its `event_blobs` copy. This arm reads
+    // `event_blobs.data` for rows whose hot column was NULLed, joining back to
+    // `events` for the `hook_event`/`tool_name`/`ts`/`session_id` facts. It
+    // scans only the (small) `event_blobs` side table — the cold tail — not the
+    // full `events` table, and the `events.data IS NULL` guard makes ARM A and
+    // ARM B partition the rows (no double-count). Together they are exactly the
+    // COALESCE'd scan, but split so the common inline case keeps the index.
+    const relocatedRows = db
+      .prepare(
+        `SELECT e.id AS id, e.ts AS ts, e.session_id AS session_id,
+                e.tool_name AS tool_name
+           FROM event_blobs b
+           JOIN events e ON e.id = b.event_id
+          WHERE e.data IS NULL
+            AND e.hook_event = 'PostToolUse'
+            AND e.tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
+            AND json_extract(b.data, '$.tool_input.file_path') = ?`,
+      )
+      .all(candidatePath) as Array<{
+      id: number;
+      ts: number;
+      session_id: string;
+      tool_name: string;
+    }>;
+    for (const row of [...toolRows, ...relocatedRows]) {
       if (row.session_id == null || row.session_id.length === 0) continue;
       const existing = perSession.get(row.session_id);
       if (existing == null || row.ts > existing.last_mutation_at) {

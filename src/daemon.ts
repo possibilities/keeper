@@ -77,6 +77,7 @@ import type {
   DispatchFailedMessage,
   Verb,
 } from "./autopilot-worker";
+import { compactColdBlobs, countAbsentBlobs } from "./compaction";
 import {
   openDb,
   resolveClaudeProjectsRoot,
@@ -265,6 +266,22 @@ export const PENDING_DISPATCH_TTL_MS = 120_000;
  * "60s heartbeat" reference.
  */
 export const PENDING_DISPATCH_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * Heartbeat cadence (ms) for the producer-side cold-blob compaction pass
+ * (fn-717.2). Runs on MAIN's writable connection, paced (a bounded number of
+ * small transactions per pass), so it relocates the long cold tail of inline
+ * `data` blobs into `event_blobs` over many passes without ever holding the
+ * writer lock long enough to starve a concurrent hook INSERT.
+ *
+ * 300s (5min) is deliberately slacker than the 60s dispatch sweep: compaction
+ * is pure space reclamation with no latency-sensitive consumer, the cold tail
+ * is not time-critical, and a slacker cadence keeps the steady-state write
+ * pressure (and the PASSIVE checkpoint that follows a pass) low. The first
+ * post-deploy passes drain the historical ~1 GB backlog gradually; once
+ * caught up, each pass relocates only the trickle that has newly gone cold.
+ */
+export const COMPACTION_INTERVAL_MS = 300_000;
 
 /**
  * Pure helper: select every `pending_dispatches` row aged past the TTL
@@ -2426,6 +2443,86 @@ function runDaemon(): void {
     sweepExpiredPendingDispatches();
   }, PENDING_DISPATCH_SWEEP_INTERVAL_MS);
 
+  // Producer-side cold-blob compaction pass (fn-717.2). Relocates the cold
+  // tail of inline `events.data` blobs into the `event_blobs` side table and
+  // NULLs the hot column, paced (a bounded number of small transactions per
+  // pass) so the writer lock is never held long enough to starve a concurrent
+  // hook INSERT.
+  //
+  // Runs ON THE MAIN THREAD against the writable connection — the same
+  // single-writer discipline as the dispatch sweep above. `event_blobs` is a
+  // content-preserving sidecar of the immutable event log, NOT a reducer
+  // projection: this never folds an event, never writes inside the reducer's
+  // BEGIN IMMEDIATE cursor-advance transaction, and the relocated blob's VALUE
+  // is preserved (read back via `COALESCE(events.data, event_blobs.data)`), so
+  // a from-scratch re-fold stays byte-identical. The cold predicate
+  // (`src/compaction.ts`) is provably conservative — it never relocates a blob
+  // the file-attribution scan could still need (keeps the recent/undischarged
+  // window inline), so `idx_events_tool_attr` keeps covering the only rows
+  // that scan reads.
+  function runCompactionPass(): void {
+    if (shuttingDown) return;
+    let relocated = 0;
+    try {
+      const result = compactColdBlobs(db);
+      relocated = result.relocated;
+      if (relocated > 0) {
+        console.error(
+          `[keeperd] compaction: relocated ${relocated} cold blob(s) in ${result.batches} batch(es) (watermark id<=${result.coldWatermark}${result.moreLikely ? ", more remain" : ""})`,
+        );
+      }
+      // Absent-in-both-places is a genuine data-loss BUG (a relocated blob is
+      // in `event_blobs`; a blob in NEITHER place is not legitimate
+      // compaction). Surface it distinctly and loudly — the relocation path
+      // cannot create it, so a positive count means a bug elsewhere. NOT
+      // fatal: we log and keep running (losing visibility on one blob must not
+      // wedge the daemon), but it is logged at every pass until resolved.
+      const absent = countAbsentBlobs(db);
+      if (absent > 0) {
+        console.error(
+          `[keeperd] compaction BUG: ${absent} event(s) have a blob in NEITHER events.data NOR event_blobs — data loss, NOT legitimate compaction`,
+        );
+      }
+    } catch (err) {
+      // A compaction failure is pure space-reclamation loss, never a
+      // correctness issue (the blob stays inline on a failed/rolled-back
+      // batch). Log non-fatally and let the next heartbeat retry — same crash
+      // policy as the dispatch sweep read above.
+      console.error(
+        `[keeperd] compaction pass threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
+    // Reclaim WAL space OUTSIDE the per-batch transactions and only when a
+    // pass actually moved bytes. PASSIVE never waits on writers (TRUNCATE
+    // would, starving a contending hook — forbidden by CLAUDE.md); it
+    // checkpoints what it can without blocking, so the bytes the relocation
+    // freed in the WAL fold back into the main DB without holding the lock.
+    // The main-DB page reclamation (VACUUM) is deliberately left to a separate
+    // offline maintenance step — an online VACUUM rewrites the whole DB under
+    // the writer lock, the exact hot-path hold this epic avoids.
+    if (relocated > 0) {
+      try {
+        db.run("PRAGMA wal_checkpoint(PASSIVE)");
+      } catch (err) {
+        console.error(
+          `[keeperd] compaction PASSIVE checkpoint threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+  }
+
+  // Schedule the compaction pass on its own slack heartbeat. Stored so the
+  // shutdown path can `clearInterval` it (an outstanding timer keeps a ref on
+  // the main loop). Fires on the MAIN THREAD against the writable connection.
+  const compactionTimer = setInterval(() => {
+    runCompactionPass();
+  }, COMPACTION_INTERVAL_MS);
+
   // Same crash policy as the other workers: any thread failure →
   // fatalExit → exit 1 → launchd restart.
   autopilotWorkerInstance.onerror = (err: ErrorEvent): void => {
@@ -2508,6 +2605,9 @@ function runDaemon(): void {
     // can't fire a mint into the writer connection mid-teardown.
     // (`clearInterval` is a no-op if the timer already fired.)
     clearInterval(pendingDispatchSweepTimer);
+    // Likewise clear the compaction heartbeat — a relocation batch must not
+    // fire into the writer connection mid-teardown.
+    clearInterval(compactionTimer);
 
     worker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     serverWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
