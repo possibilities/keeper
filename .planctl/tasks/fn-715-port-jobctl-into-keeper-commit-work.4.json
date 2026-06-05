@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Trim get_session_dirty_files from keeper-py",
-  "updated_at": "2026-06-05T17:04:30.830440Z"
+  "updated_at": "2026-06-05T19:28:28.159636Z",
+  "worker_done_at": "2026-06-05T19:28:28.159636Z"
 }

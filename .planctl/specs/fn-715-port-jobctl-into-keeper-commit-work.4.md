@@ -42,5 +42,5 @@ it no longer lists `get_session_dirty_files`.
 - [ ] test_api.py cases removed, keeper-py unittest green, docstring updated.
 
 ## Done summary
-
+Removed orphaned get_session_dirty_files reader and its private _git_root/_live_dirty_paths helpers from keeper/api.py, dropped it from __init__ __all__, updated module docstrings (now seven readers, stdlib-only note), and removed GetSessionDirtyFilesTest plus its git-repo helpers from tests/test_api.py. keeper-py unittest stays green (41 tests); kept readers (get_epic/get_job/get_session_identity_for_pid) unaffected.
 ## Evidence
