@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-706-fix-zellij-feed-cliff-and-tab-churn",
   "bundles": [],
   "closer_done_at": "2026-06-05T00:41:46.807153Z",
@@ -16,5 +16,5 @@
     "/Users/mike/code/keeper",
     "/Users/mike/code/zellij-tab-namer"
   ],
-  "updated_at": "2026-06-05T00:41:46.807153Z"
+  "updated_at": "2026-06-05T00:42:11.773769Z"
 }
