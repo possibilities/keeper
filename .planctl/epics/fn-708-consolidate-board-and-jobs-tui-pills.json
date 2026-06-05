@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-708-consolidate-board-and-jobs-tui-pills",
   "bundles": [],
   "closer_done_at": "2026-06-05T05:31:58.082145Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T05:31:58.082145Z"
+  "updated_at": "2026-06-05T05:54:03.069691Z"
 }
