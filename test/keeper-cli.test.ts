@@ -52,6 +52,10 @@ function makeHarness(): Harness {
       usage: mkHandler("usage"),
       autopilot: mkHandler("autopilot"),
       await: mkHandler("await"),
+      "commit-work": mkHandler("commit-work"),
+      "find-task-commit": mkHandler("find-task-commit"),
+      "session-state": mkHandler("session-state"),
+      "show-session-files": mkHandler("show-session-files"),
     },
     stdout: (s) => stdout.push(s),
     stderr: (s) => stderr.push(s),
@@ -168,6 +172,10 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("usage")).toBe(true);
     expect(isSubcommand("autopilot")).toBe(true);
     expect(isSubcommand("await")).toBe(true);
+    expect(isSubcommand("commit-work")).toBe(true);
+    expect(isSubcommand("find-task-commit")).toBe(true);
+    expect(isSubcommand("session-state")).toBe(true);
+    expect(isSubcommand("show-session-files")).toBe(true);
     expect(isSubcommand("bogus")).toBe(false);
     expect(isSubcommand("")).toBe(false);
   });
