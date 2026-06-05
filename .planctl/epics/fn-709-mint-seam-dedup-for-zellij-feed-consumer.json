@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-709-mint-seam-dedup-for-zellij-feed-consumer",
   "bundles": [],
+  "closer_done_at": "2026-06-05T07:18:35.961792Z",
   "created_at": "2026-06-05T04:26:02.872566Z",
   "depends_on_epics": [],
   "id": "fn-709-mint-seam-dedup-for-zellij-feed-consumer",
@@ -9,10 +10,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Mint-seam dedup for zellij feed consumer",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T04:26:02.872566Z"
+  "updated_at": "2026-06-05T07:18:35.961792Z"
 }
