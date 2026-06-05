@@ -44,34 +44,52 @@ test("isDropError is null-safe and rejects a non-drop err", () => {
   expect(isDropError({ message: "must be re-scanned" })).toBe(true);
 });
 
-/** A controllable fake clock: schedule()d callbacks fire only on flush(). */
+/**
+ * A controllable fake clock. `schedule()`d callbacks fire only on `flush()`
+ * (every armed timer, ignoring its delay — the trailing-only tests) or
+ * `flushDelay(ms)` (only timers armed for exactly `ms` — lets a ceiling test
+ * fire the ceiling timer without the debounce, and vice versa).
+ */
 function fakeClock(): {
   timers: SchedulerTimers;
   flush: () => void;
+  flushDelay: (ms: number) => void;
   pendingCount: () => number;
 } {
   let next = 1;
-  const cbs = new Map<number, () => void>();
+  const cbs = new Map<number, { cb: () => void; ms: number }>();
   const timers: SchedulerTimers = {
-    setTimeout: (cb) => {
+    setTimeout: (cb, ms) => {
       const id = next++;
-      cbs.set(id, cb);
+      cbs.set(id, { cb, ms });
       return id as unknown as ReturnType<typeof setTimeout>;
     },
     clearTimeout: (handle) => {
       cbs.delete(handle as unknown as number);
     },
   };
+  const fireSubset = (ids: number[]) => {
+    // Snapshot+delete before firing so a callback's own schedule() (which arms
+    // a fresh timer) is NOT re-fired in this same pass.
+    const ready: Array<() => void> = [];
+    for (const id of ids) {
+      const entry = cbs.get(id);
+      if (entry) {
+        ready.push(entry.cb);
+        cbs.delete(id);
+      }
+    }
+    for (const cb of ready) {
+      cb();
+    }
+  };
   return {
     timers,
-    flush: () => {
-      // Fire every currently-armed callback (drain in insertion order).
-      const snapshot = [...cbs.entries()];
-      cbs.clear();
-      for (const [, cb] of snapshot) {
-        cb();
-      }
-    },
+    flush: () => fireSubset([...cbs.keys()]),
+    flushDelay: (ms) =>
+      fireSubset(
+        [...cbs.entries()].filter(([, e]) => e.ms === ms).map(([id]) => id),
+      ),
     pendingCount: () => cbs.size,
   };
 }
@@ -161,4 +179,146 @@ test("RescanScheduler: a throwing scan is swallowed to onError, never propagates
   // flush() must not throw — the scheduler catches.
   expect(() => clock.flush()).not.toThrow();
   expect(errs.some((e) => e.includes("boom"))).toBe(true);
+});
+
+const CEILING_MS = 2000;
+
+test("RescanScheduler: ceiling UNSET = unchanged trailing-only behavior (no ceiling timer armed)", () => {
+  const clock = fakeClock();
+  let scans = 0;
+  // No maxWaitMs arg → default 0 → no ceiling.
+  const sched = new RescanScheduler(
+    () => {
+      scans++;
+    },
+    DEFAULT_DEBOUNCE_MS,
+    () => {},
+    clock.timers,
+  );
+
+  sched.schedule();
+  sched.schedule();
+  sched.schedule();
+  // Exactly ONE timer (the debounce) — no extra ceiling timer.
+  expect(clock.pendingCount()).toBe(1);
+  expect(scans).toBe(0);
+  clock.flush();
+  expect(scans).toBe(1);
+  // No straggler ceiling timer left armed after the flush.
+  expect(clock.pendingCount()).toBe(0);
+});
+
+test("RescanScheduler: ceiling set + continuous schedule() faster than debounce flushes at the ceiling", () => {
+  const clock = fakeClock();
+  let scans = 0;
+  const sched = new RescanScheduler(
+    () => {
+      scans++;
+    },
+    DEFAULT_DEBOUNCE_MS,
+    () => {},
+    clock.timers,
+    CEILING_MS,
+  );
+
+  // First schedule() arms BOTH a debounce timer and a ceiling timer.
+  sched.schedule();
+  expect(clock.pendingCount()).toBe(2);
+
+  // Simulate continuous churn: every re-arm replaces the debounce but the
+  // ceiling keeps its original deadline (so the debounce never settles).
+  for (let i = 0; i < 5; i++) {
+    sched.schedule();
+    // Still exactly two timers: the re-armed debounce + the untouched ceiling.
+    expect(clock.pendingCount()).toBe(2);
+  }
+  expect(scans).toBe(0);
+
+  // The ceiling fires (the debounce never would under continuous churn). It
+  // flushes the scan and cancels the still-armed debounce.
+  clock.flushDelay(CEILING_MS);
+  expect(scans).toBe(1);
+  // Both timers gone — ceiling fired, debounce was cancelled by the flush.
+  expect(clock.pendingCount()).toBe(0);
+});
+
+test("RescanScheduler: ceiling re-arms on the next idle→busy edge", () => {
+  const clock = fakeClock();
+  let scans = 0;
+  const sched = new RescanScheduler(
+    () => {
+      scans++;
+    },
+    DEFAULT_DEBOUNCE_MS,
+    () => {},
+    clock.timers,
+    CEILING_MS,
+  );
+
+  // First burst: debounce settles (trailing flush) and clears the ceiling.
+  sched.schedule();
+  expect(clock.pendingCount()).toBe(2);
+  clock.flushDelay(DEFAULT_DEBOUNCE_MS);
+  expect(scans).toBe(1);
+  expect(clock.pendingCount()).toBe(0);
+
+  // Next idle→busy edge re-arms a fresh ceiling alongside the debounce.
+  sched.schedule();
+  expect(clock.pendingCount()).toBe(2);
+  clock.flushDelay(CEILING_MS);
+  expect(scans).toBe(2);
+  expect(clock.pendingCount()).toBe(0);
+});
+
+test("RescanScheduler: single-flight + mid-scan dirty-bit re-run still hold under a ceiling", () => {
+  const clock = fakeClock();
+  let scans = 0;
+  let sched!: RescanScheduler;
+  sched = new RescanScheduler(
+    () => {
+      scans++;
+      if (scans === 1) {
+        // A drop lands WHILE the first scan runs (inFlight true) → dirty bit,
+        // NOT a concurrent timer. Must still re-run exactly once under a ceiling.
+        sched.schedule();
+      }
+    },
+    DEFAULT_DEBOUNCE_MS,
+    () => {},
+    clock.timers,
+    CEILING_MS,
+  );
+
+  sched.schedule();
+  // debounce + ceiling armed.
+  expect(clock.pendingCount()).toBe(2);
+  clock.flushDelay(DEFAULT_DEBOUNCE_MS);
+  // First scan ran, set the dirty bit, scheduler re-ran exactly once.
+  expect(scans).toBe(2);
+  // No straggler timers: the trailing flush cleared the ceiling, and the
+  // mid-scan schedule() took the dirty-bit path (armed nothing).
+  expect(clock.pendingCount()).toBe(0);
+});
+
+test("RescanScheduler: cancel() clears BOTH the debounce and the ceiling timers", () => {
+  const clock = fakeClock();
+  let scans = 0;
+  const sched = new RescanScheduler(
+    () => {
+      scans++;
+    },
+    DEFAULT_DEBOUNCE_MS,
+    () => {},
+    clock.timers,
+    CEILING_MS,
+  );
+
+  sched.schedule();
+  // Both timers armed.
+  expect(clock.pendingCount()).toBe(2);
+  sched.cancel();
+  // cancel() must clear BOTH (debounce + ceiling), leaving nothing armed.
+  expect(clock.pendingCount()).toBe(0);
+  clock.flush();
+  expect(scans).toBe(0);
 });

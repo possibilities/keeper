@@ -79,7 +79,8 @@ const realTimers: SchedulerTimers = {
 export const DEFAULT_DEBOUNCE_MS = 500;
 
 /**
- * Trailing-edge debounce + single-flight re-scan scheduler.
+ * Trailing-edge debounce + single-flight re-scan scheduler, with an OPTIONAL
+ * max-wait / latency ceiling.
  *
  * - `schedule()` (called once per matched drop) (re)arms a trailing-edge timer:
  *   a burst of N drops collapses into ONE timer fire after the window subsides.
@@ -87,13 +88,24 @@ export const DEFAULT_DEBOUNCE_MS = 500;
  *   single-flight `inFlight` guard. If a drop arrives WHILE a scan is running,
  *   `schedule()` sets a `pending` dirty bit; on completion the scheduler re-runs
  *   the scan exactly once to cover the change that landed mid-scan.
+ * - **Max-wait ceiling (optional).** A pure trailing-edge debounce re-arms
+ *   forever under continuous load that fires faster than the window — it never
+ *   flushes, so staleness is unbounded. When `maxWaitMs` is set (> 0), the FIRST
+ *   `schedule()` after an idle period also arms a one-shot ceiling timer; if the
+ *   debounce keeps slipping, the ceiling fires a flush within `maxWaitMs` of the
+ *   burst's start. Either flush path (trailing OR ceiling) clears the ceiling so
+ *   the next idle→busy edge re-arms it. With `maxWaitMs` UNSET (the default, 0 /
+ *   "no ceiling") the scheduler is byte-identical to the old trailing-only
+ *   behavior — the existing transcript-worker / plan-worker callers do not pass
+ *   a ceiling and therefore do not change.
  * - The `scan` callback is responsible for its own error handling — but as a
  *   belt-and-suspenders, the scheduler also wraps the invocation so a throw is
  *   reported via `onError` (stderr) and never propagates. A re-scan must never
  *   reach `fatalExit`.
- * - `cancel()` clears any armed timer (called from the worker's shutdown handler
- *   BEFORE `unsubscribe()`); the scan callback itself re-checks the worker's
- *   `shuttingDown` flag before touching a closing DB.
+ * - `cancel()` clears any armed timer — BOTH the debounce and the ceiling —
+ *   (called from the worker's shutdown handler BEFORE `unsubscribe()`); the scan
+ *   callback itself re-checks the worker's `shuttingDown` flag before touching a
+ *   closing DB.
  *
  * The scan callback is synchronous (both workers' boot-scan primitives are
  * synchronous file reads); single-flight is therefore mostly relevant for the
@@ -102,6 +114,7 @@ export const DEFAULT_DEBOUNCE_MS = 500;
  */
 export class RescanScheduler {
   private timer: TimerHandle | null = null;
+  private ceilingTimer: TimerHandle | null = null;
   private inFlight = false;
   private pending = false;
 
@@ -110,6 +123,11 @@ export class RescanScheduler {
     private readonly debounceMs: number = DEFAULT_DEBOUNCE_MS,
     private readonly onError: (msg: string) => void = (m) => console.error(m),
     private readonly timers: SchedulerTimers = realTimers,
+    /**
+     * Optional latency ceiling. `0` (the default) means "no ceiling" — pure
+     * trailing-edge debounce, byte-identical to the historical behavior.
+     */
+    private readonly maxWaitMs: number = 0,
   ) {}
 
   /** Arm (or re-arm) the trailing-edge timer; coalesces a burst into one fire. */
@@ -127,18 +145,45 @@ export class RescanScheduler {
       this.timer = null;
       this.run();
     }, this.debounceMs);
+    // First schedule() of an idle→busy burst arms the ceiling (if configured);
+    // subsequent schedule()s within the burst leave it running so it fires
+    // maxWaitMs after the burst STARTED, not after each re-arm.
+    if (this.maxWaitMs > 0 && this.ceilingTimer === null) {
+      this.ceilingTimer = this.timers.setTimeout(() => {
+        this.ceilingTimer = null;
+        // Ceiling reached before the debounce settled — flush now. Cancel the
+        // still-armed trailing timer so the burst flushes exactly once.
+        if (this.timer !== null) {
+          this.timers.clearTimeout(this.timer);
+          this.timer = null;
+        }
+        this.run();
+      }, this.maxWaitMs);
+    }
   }
 
-  /** Cancel any armed timer (shutdown). Idempotent. */
+  /** Cancel any armed timer — debounce AND ceiling — (shutdown). Idempotent. */
   cancel(): void {
     if (this.timer !== null) {
       this.timers.clearTimeout(this.timer);
       this.timer = null;
     }
+    this.clearCeiling();
+  }
+
+  /** Clear the ceiling timer so the next idle→busy edge re-arms it. Idempotent. */
+  private clearCeiling(): void {
+    if (this.ceilingTimer !== null) {
+      this.timers.clearTimeout(this.ceilingTimer);
+      this.ceilingTimer = null;
+    }
   }
 
   /** Run the scan under the single-flight guard, draining the dirty bit. */
   private run(): void {
+    // A flush (trailing OR ceiling) ends the current burst — clear the ceiling
+    // so the next idle→busy edge re-arms it from a fresh start.
+    this.clearCeiling();
     this.inFlight = true;
     try {
       this.scan();
