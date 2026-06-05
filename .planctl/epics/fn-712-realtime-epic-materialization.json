@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-712-realtime-epic-materialization",
   "bundles": [],
   "closer_done_at": "2026-06-05T20:12:49.004521Z",
@@ -18,5 +18,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T20:12:49.004521Z"
+  "updated_at": "2026-06-05T20:13:52.519308Z"
 }
