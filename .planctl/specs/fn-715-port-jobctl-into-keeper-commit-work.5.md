@@ -48,5 +48,5 @@ if a cli_common import is reintroduced.
 - [ ] planctl CLAUDE.md/README/commit-at-mutation-boundary.md renamed; bug-history untouched; tests green.
 
 ## Done summary
-
+Retargeted close-preflight's commit-lookup call site to shell keeper find-task-commit (fail-loud preserved; ~/.bun/bin confirmed on PATH), scrubbed inert cli_common provenance docstrings in test_util_vendored.py while preserving the cli_common guard test, and renamed jobctl->keeper across CLAUDE.md/README/commit-at-mutation-boundary.md plus the work/worker skill+agent templates (regenerated) and test mocks. 792 tests pass.
 ## Evidence

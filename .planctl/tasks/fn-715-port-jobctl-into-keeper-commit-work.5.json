@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Retarget planctl to keeper find-task-commit",
-  "updated_at": "2026-06-05T17:04:30.830440Z"
+  "updated_at": "2026-06-05T19:44:23.394771Z",
+  "worker_done_at": "2026-06-05T19:44:23.394771Z"
 }
