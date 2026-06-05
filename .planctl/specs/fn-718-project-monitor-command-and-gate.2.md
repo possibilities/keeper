@@ -45,5 +45,5 @@ Fixture tests mirroring `agentsIdleState`: own-session job with a matching monit
 - [ ] Prefix-collision and cross-session fixtures prove no false-positive match
 
 ## Done summary
-
+Added monitorRunningState pure predicate (own-session-scoped, exact kind/command match, defensive JSON parse) plus the monitors field on the Job interface, with fixture tests covering prefix-collision and cross-session negatives.
 ## Evidence
