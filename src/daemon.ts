@@ -885,9 +885,13 @@ export function scanZellijEventsDir(
     // bytes are discarded to the first `\n` below.
     const tailBase = Math.max(priorOffset, st.size - maxBytes);
 
-    // Tail from the window base. We re-read the whole file (simpler
-    // than a streaming seek; bounded by `MAX_ZELLIJ_EVENTS_FILE_BYTES`)
-    // and slice off everything before `tailBase`. The slice MUST be done
+    // Tail from the window base. `readFileSync` above materializes the
+    // WHOLE file unconditionally — `MAX_ZELLIJ_EVENTS_FILE_BYTES` bounds
+    // only the consumed tail window (`tailBase`), NOT the read itself.
+    // fn-706.2 rotation keeps real feeds well under the cap (~4 MiB), so
+    // the full-file read is not a memory concern in practice. We re-read
+    // the whole file (simpler than a streaming seek) and slice off
+    // everything before `tailBase`. The slice MUST be done
     // on the Buffer (byte-indexed) before decoding to UTF-8 — slicing
     // a JS string by the offset would mix byte offsets (the write side
     // advances via `Buffer.byteLength`, the file's `st.size` is in
