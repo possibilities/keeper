@@ -1,0 +1,18 @@
+{
+  "approval": "pending",
+  "branch_name": "fn-717-compact-cold-event-data-blobs",
+  "bundles": [],
+  "created_at": "2026-06-05T20:25:42.908755Z",
+  "depends_on_epics": [],
+  "id": "fn-717-compact-cold-event-data-blobs",
+  "last_validated_at": "2026-06-05T20:25:43.196348Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Compact cold event data blobs",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-05T20:25:42.908755Z"
+}

@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-05T20:25:42.908755Z",
+  "depends_on": [
+    "fn-717-compact-cold-event-data-blobs.1"
+  ],
+  "epic": "fn-717-compact-cold-event-data-blobs",
+  "id": "fn-717-compact-cold-event-data-blobs.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Compaction pass relocates cold blobs",
+  "updated_at": "2026-06-05T20:25:42.908755Z"
+}
