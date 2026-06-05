@@ -2,8 +2,7 @@
  * Restore-snapshot worker (epic fn-677 task .3). keeperd's tenth Bun Worker
  * thread, joining the producer / consumer fleet (`wake-worker`, `server-worker`,
  * `transcript-worker`, `plan-worker`, `exit-watcher`, `git-worker`,
- * `usage-worker`, `dead-letter-worker`, `autopilot-worker`, `backend-worker`,
- * `tab-namer-worker`).
+ * `usage-worker`, `dead-letter-worker`, `autopilot-worker`).
  *
  * On every `PRAGMA data_version` change (the same change-detection primitive
  * the wake worker and autopilot worker use), the worker reads the `jobs` +
@@ -670,8 +669,7 @@ function main(): void {
 
   // Initial pulse before the watch loop's first sleep so a freshly-spawned
   // worker writes a settled `restore.json` immediately rather than after
-  // the first data_version change. Mirrors the backend-worker's "one
-  // immediate tick" pattern.
+  // the first data_version change.
   try {
     restorePulse(db, restorePath, state);
   } catch (err) {

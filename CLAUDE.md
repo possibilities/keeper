@@ -65,7 +65,7 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   `TaskSnapshot` / `EpicDeleted` / `TaskDeleted`, `UsageSnapshot` /
   `UsageDeleted`, `Killed`, `GitSnapshot` / `GitRootDropped` / `Commit`,
   `DispatchFailed` / `DispatchCleared`, `Dispatched` / `DispatchExpired`,
-  `AutopilotPaused`, `BackendExecSnapshot`), of the
+  `AutopilotPaused`), of the
   `dead_letters` operational sidecar, and of the dead-letter replay path. The
   server-worker writes only the `approval` field on external `.planctl` JSON
   (atomic temp+rename) and bridges `replay_dead_letter`,
@@ -258,40 +258,24 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   extended fn-699):* main may `postMessage({type:"kick"})` to a reader worker
   straight after `drainToCompletion` returns (post-COMMIT) so it runs its
   reconcile without waiting for the next poll tick — sent to BOTH the
-  server-worker (runs `diffTick`) and the tab-namer worker (runs its rename
-  tick). The kick is an in-process message bus signal, NOT a file/DB watcher —
-  it does not observe the DB; it is fired by main precisely because main just
-  folded. The `data_version` poll remains the level-triggered backstop (the
-  kick is edge-triggered and subject to a lost-wakeup race); each kick handler
-  is idempotent (the diff / rename is version- or convergence-gated) so a
-  kick+poll double-fire is a harmless no-op. *The plan-worker now runs this
-  same `data_version` poll too (fn-705 — `PLAN_DB_POLL_MS`, 100ms):* every
-  keeper DB write (the close→approve fold included) drives a single-flight
-  gated rescan that drains the fn-629 `pending` set + re-ingests changed
-  `.planctl` files in ~50ms, so plan/epic emission is realtime end to end and
-  no longer bound by the 60s (now 5s) heartbeat. The poll is on keeper's OWN
-  DB — the sanctioned primitive, not a kernel watcher on it. *Carve-out
-  (files):* native `@parcel/watcher` on *external* trees written by other
-  processes IS permitted (transcript files, `.planctl` trees, the plan-worker's
-  per-repo `.git/logs/HEAD` reflog watch (fn-705 — an external git tree; a
-  commit always appends there, closing the brand-new/never-seen-repo tail where
-  the in-HEAD transition has no other realtime trigger), the zellij-events
-  plugin feed dir at `~/.local/state/keeper/zellij-events/` written by the
-  fn-684 wasm bridge plugin — one `<session>.ndjson` per zellij session that is
-  append-only *within an epoch* (fn-706.2): the plugin SELF-ROTATES the file at
-  a ~4 MiB `ROTATION_THRESHOLD` (well under the 16 MiB consumer cap) by
-  truncating to byte 0, minting a FRESH epoch nonce, and re-writing a
-  `plugin_start` epoch-header + the full current manifest in one `write_all` —
-  so a long-lived noisy session's feed never approaches the cliff (the
-  oversize-skip that froze the watermark). The plugin stays the SOLE writer
-  (keeperd must NEVER truncate the file); the consumer detects the rotation
-  via a cheap first-line epoch peek (`peekZellijEpoch`, distinct from
-  `parseZellijEventLine` which nulls the sentinel) and resets its
-  `(epoch, offset)` watermark to byte 0 — the recovery path that survives a
-  re-snapshot growing the file PAST the prior offset (where the `size <
-  watermark` shrink guard would miss it). Treat an event (or a drop-overrun
-  `err`) as "go look," never as the data — always `fstat` + safe-parse.
-  *Carve-out (processes):* kqueue
+  server-worker (runs `diffTick`) and the plan-worker. The kick is an
+  in-process message bus signal, NOT a file/DB watcher — it does not observe
+  the DB; it is fired by main precisely because main just folded. The
+  `data_version` poll remains the level-triggered backstop (the kick is
+  edge-triggered and subject to a lost-wakeup race); each kick handler is
+  idempotent (the diff is version-gated) so a kick+poll double-fire is a
+  harmless no-op. *The plan-worker now runs this same `data_version` poll too
+  (fn-705 — `PLAN_DB_POLL_MS`, 100ms):* every keeper DB write (the
+  close→approve fold included) drives a single-flight gated rescan that drains
+  the fn-629 `pending` set + re-ingests changed `.planctl` files in ~50ms, so
+  plan/epic emission is realtime end to end and no longer bound by the 60s
+  (now 5s) heartbeat. The poll is on keeper's OWN DB — the sanctioned
+  primitive, not a kernel watcher on it. *Carve-out (files):* native
+  `@parcel/watcher` on *external* trees written by other processes IS permitted
+  (transcript files, `.planctl` trees, the plan-worker's per-repo
+  `.git/logs/HEAD` reflog watch (fn-705 — an external git tree; a commit
+  always appends there, closing the brand-new/never-seen-repo tail where the
+  in-HEAD transition has no other realtime trigger)). *Carve-out (processes):* kqueue
   `EVFILT_PROC|NOTE_EXIT` / `pidfd_open`+`epoll` on EXTERNAL process descriptors
   is permitted (exit-watcher), with a post-register `kill(pid,0)` probe and
   `(pid, start_time)` identity guarding pid recycling.
@@ -344,11 +328,10 @@ Every keeper Worker thread follows the same durable contract:
 - **`isMainThread` guard** — a plain `import` of the worker module is inert.
 - **Own `openDb` connection** (read-only for readers); never shares main's.
 - **Typed message protocol** — `{ kind }` for worker→main, `{ type }` for
-  main→worker. Three workers accept a `{type:"kick"}` message from main as a
+  main→worker. Two workers accept a `{type:"kick"}` message from main as a
   supplementary fast-path wake (fn-694 lever B, extended fn-699/fn-705): the
-  server-worker (second thread, runs `diffTick`), the tab-namer worker (twelfth
-  thread, runs its rename reconcile tick) — both kicked after
-  `drainToCompletion` returns so they reconcile immediately — and the
+  server-worker (second thread, runs `diffTick`) — kicked after
+  `drainToCompletion` returns so it reconciles immediately — and the
   plan-worker (fourth thread; kicked off the `set_*_approval` RPC seam into a
   GATED `recheckPending`, fn-701). The kick handler is in the no-self-heal
   path, so the tick is wrapped in try/catch (log+continue, never propagate) —
@@ -362,56 +345,6 @@ Every keeper Worker thread follows the same durable contract:
   file, watcher subscription, re-scan timer, kqueue/pidfd fd) MUST release it in
   its own shutdown handler — `terminate()` alone leaks it.
 - **No in-process self-heal** — a worker's `error` event escalates to `fatalExit`.
-
-*Carve-out (out-of-process producers, fn-684).* Not every producer is a Bun
-postMessage worker. The fn-684 zellij bridge plugin is a Rust wasm module the
-human's dotfiles load into every zellij session; it runs INSIDE the zellij
-server (a different process from keeperd) under WASI sandbox, and it pushes
-data to keeper by appending NDJSON lines to its pinned `/host` mount (=
-`~/.local/state/keeper/zellij-events/<session>.ndjson`). Its keeperd-side
-counterpart is the `zellij-events-worker` (a normal `@parcel/watcher`
-producer-archetype Worker thread) plus the main-side `scanZellijEventsDir`
-ingestion, both of which still follow the rules above. The plugin itself is
-not bound by the Bun-thread contract — but it inherits two adjacent
-disciplines: lines are flushed per complete NDJSON record (the consumer holds
-a carry-buffer for trailing partial bytes), and the file is opened
-`O_APPEND` so a #5177 double-load shares one append stream instead of
-corrupting it. **Diff-before-emit (fn-704.1):** the plugin keeps a
-`last_emitted: pane_id -> (tab_id, tab_name)` map and a pure `diff_lines`
-gate; zellij delivers a FULL `PaneManifest` snapshot on every pane poll, so
-the plugin emits a pane line ONLY when its `(tab_id, tab_name)` tuple changed
-since last emit — a zero-delta event opens NO file at all (the fix for the
-20MB/30min feed-growth incident). The changed panes are written in ONE open +
-ONE batched `write_all` of the concatenated buffer + one `flush` (a single
-syscall keeps a #5177 double-load from interleaving mid-batch — O_APPEND
-atomicity is per-syscall), and `last_emitted` is folded ONLY after a
-successful flush (a pre-flush update + failed write would permanently
-false-suppress those panes) and pruned of closed panes so memory stays
-bounded. `SEQ` advances by the emitted-line count only (gaps are fine — the
-consumer dedups by byte-offset watermark — but it stays monotonic); the map
-starts empty (`Plugin::default()`) so the first post-grant flush and every
-epoch change (plugin reload = fresh `Plugin`) re-emit every pane. Sole-writer
-rules are preserved: the plugin is the sole writer of the `.ndjson` files,
-and main remains the sole writer of the synthetic `BackendExecSnapshot`
-events it mints from those lines. **Live-feed rotation (fn-706.2) — the
-SECOND-layer churn defense** under the diff gate: the diff gate keeps the feed
-QUIET, rotation keeps it BOUNDED. After every successful `append_batch` the
-plugin reads the on-disk size via `metadata().len()` (NOT a per-instance byte
-counter — a #5177 double-load's two instances each count only their own writes
-and would never agree, but they share the same file) and, once `should_rotate`
-fires at `ROTATION_THRESHOLD` (~4 MiB), rotates: truncate to 0 + force the WASI
-write cursor to 0 (open `write(true).truncate(true)` + explicit
-`seek(SeekFrom::Start(0))` to dodge the `O_APPEND`-after-ftruncate
-sparse-zeros-hole gotcha), bump `self.epoch` to a fresh `now_ms()`-derived
-nonce, then write a `plugin_start` epoch-header + the full re-snapshot in ONE
-`write_all` (the re-snapshot recovers quiescent panes the diff gate won't
-re-emit). `last_emitted` is cleared (and re-seeded from the snapshot) ONLY
-after the rotation write succeeds — same post-flush fold discipline as the diff
-gate, so a truncate-ok-but-write-fails leaves the file empty with the OLD epoch
-and the next emit re-snapshots. It stays a SINGLE plugin write path: the plugin
-is still the sole writer of the `.ndjson` (keeperd never truncates it), and the
-consumer's first-line epoch peek + watermark-reset-to-0 is the matching
-recovery on the read side.
 
 ## Autopilot dispatch gates
 
@@ -542,11 +475,5 @@ firing correctly — check them before concluding it is broken:
   or via a producer-side TTL sweep on the 60s heartbeat (120s ceiling,
   `DispatchExpired`) when the bind never arrives — so a phantom row from a
   crash between mint and launch self-clears without human intervention. The
-  tab name is now a purely cosmetic label as far as dispatch dedup and reap
-  are concerned (fn-678 stands — neither path reads it); `ExecBackend`
-  exposes `launch`, `closeByTabId`, `focusPane`, `resolveTabForPane`, and
-  `renameTab` — the focus-safe `rename-tab-by-id` op used by the
-  tab-namer worker (fn-680, the eleventh worker thread, the aesthetic
-  side-effector) to converge live job tabs onto transcript-derived
-  titles. Reap (`autoclose_windows`) uses `closeByTabId(session, tabId)`
-  off `jobs.backend_exec_{session_id,tab_id}` (fn-668), not the tab name.
+  tab name is a purely cosmetic label — no control path reads it back.
+  `ExecBackend` exposes `launch` and `focusPane`.

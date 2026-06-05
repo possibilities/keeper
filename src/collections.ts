@@ -136,14 +136,12 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // are captured by the hook on every event as pure `process.env` reads
     // (`ZELLIJ` / `ZELLIJ_SESSION_NAME` / `ZELLIJ_PANE_ID`) and folded onto
     // the row latest-non-NULL-wins via COALESCE. `backend_exec_tab_{id,name}`
-    // are stamped by the daemon's tab-resolver worker through a
-    // `BackendExecSnapshot` synthetic event (one `zellij action list-panes
-    // -a -j` per distinct session, deduped per tick). Generic `backend_exec_*`
-    // naming lets a future tmux/wezterm backend slot in without a schema
-    // change. Display-only — like `profile_name`, OUT of `sortable` /
-    // `filters` / `jsonColumns` (scalars the renderer reads, never a
-    // sort/filter key). `projectJobRow` composes the five into one
-    // present-only dim segment so absent coords render as nothing.
+    // are dead columns (fn-710 retired the BackendExecSnapshot feed; Task 2
+    // of fn-710 will DROP them). Generic `backend_exec_*` naming lets a
+    // future tmux/wezterm backend slot in without a schema change.
+    // Display-only — OUT of `sortable` / `filters` / `jsonColumns`.
+    // `projectJobRow` composes the five into one present-only dim segment so
+    // absent coords render as nothing.
     "backend_exec_type",
     "backend_exec_session_id",
     "backend_exec_pane_id",

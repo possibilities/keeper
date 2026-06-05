@@ -3715,104 +3715,6 @@ function foldAutopilotPaused(db: Database, event: Event): void {
 }
 
 /**
- * Schema v48 / fn-668: `BackendExecSnapshot` synthetic-event payload.
- * The backend-worker resolves a (session, pane) via one `zellij action
- * list-panes -a -j` per distinct session and posts one snapshot per
- * resolved pane; main mints a synthetic event whose `session_id` carries
- * the job pk and whose `data` carries this payload.
- *
- * Strict typing: `tab_id` may be a TEXT string ("3"), a literal `null`
- * (the pane is in `list-panes` output but the record carries no
- * `tab_id` field — preserve the prior value via COALESCE), or the
- * payload is malformed (fold to safe no-op). `tab_name` must be a
- * string — the resolver guarantees a string return (defaults to `""`
- * for the `tab_name` field of `ZellijPane`).
- */
-interface BackendExecSnapshotPayload {
-  tab_id: string | null;
-  tab_name: string;
-}
-
-/**
- * Parse a `BackendExecSnapshot` event payload. Returns null on any
- * structural miss — {@link foldBackendExecSnapshot} folds null to a
- * safe no-op (cursor still advances). NEVER throws.
- */
-function extractBackendExecSnapshot(
-  event: Event,
-): BackendExecSnapshotPayload | null {
-  if (event.data == null || event.data.length === 0) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(event.data) as Partial<{
-      tab_id: unknown;
-      tab_name: unknown;
-    }>;
-    const tabName =
-      typeof parsed.tab_name === "string" ? parsed.tab_name : null;
-    if (tabName == null) {
-      // tab_name is the required signal — without it the snapshot has
-      // nothing useful to fold. Drop to safe no-op.
-      return null;
-    }
-    const tabIdRaw = parsed.tab_id;
-    const tabId: string | null =
-      typeof tabIdRaw === "string" ? tabIdRaw : tabIdRaw === null ? null : null;
-    return { tab_id: tabId, tab_name: tabName };
-  } catch (err) {
-    console.error(
-      `keeper reducer: failed to parse BackendExecSnapshot payload for event id=${event.id} session=${event.session_id}: ${err}`,
-    );
-    return null;
-  }
-}
-
-/**
- * Fold one synthetic `BackendExecSnapshot` event (fn-668 / schema v48).
- * UPDATEs the matching `jobs` row (keyed by `job_id` == `event.session_id`)
- * to stamp `backend_exec_tab_{id,name}` from the resolved tab. NULL on the
- * incoming `tab_id` preserves the prior value via COALESCE — the producer
- * NEVER posts a clobbering snapshot (tab tombstone = last-known sticks
- * per the epic spec), so a NULL here means "couldn't read the field, but
- * the resolve itself landed."
- *
- * Pure function of the event payload + the persisted row:
- * - `tab_id` / `tab_name` from the immutable event payload.
- * - `last_event_id` from `event.id`.
- * - `updated_at` from `event.ts`.
- *
- * No `Date.now()`, no env read, no shell-out — re-fold determinism is
- * preserved. The reducer NEVER re-runs `list-panes`; the worker's
- * producer-time resolve is frozen into the event log.
- *
- * No-op when the keyed `jobs` row is missing (zero-rows UPDATE);
- * the SessionStart that inserts the job lands strictly before any
- * `BackendExecSnapshot` for that job, so this is mostly defense-in-
- * depth for a re-fold against a partial event log. Malformed payload →
- * safe no-op; the cursor still advances.
- */
-function foldBackendExecSnapshot(db: Database, event: Event): void {
-  const payload = extractBackendExecSnapshot(event);
-  if (payload == null) {
-    return;
-  }
-  const jobId = event.session_id;
-  if (jobId == null || jobId.length === 0) {
-    return;
-  }
-  db.run(
-    `UPDATE jobs SET
-       backend_exec_tab_id = COALESCE(?, backend_exec_tab_id),
-       backend_exec_tab_name = ?,
-       last_event_id = ?,
-       updated_at = ?
-     WHERE job_id = ?`,
-    [payload.tab_id, payload.tab_name, event.id, event.ts, jobId],
-  );
-}
-
-/**
  * Sweep open `status='running'` subagent_invocations rows for a job to
  * `status='unknown'` in a single bulk UPDATE. Called from the SessionEnd and
  * Killed arms of {@link projectJobsRow} on the proven write path (after the
@@ -7656,7 +7558,11 @@ export function applyEvent(
     } else if (event.hook_event === "AutopilotPaused") {
       foldAutopilotPaused(db, event);
     } else if (event.hook_event === "BackendExecSnapshot") {
-      foldBackendExecSnapshot(db, event);
+      // retired fn-684 — fold to no-op so historical events advance the
+      // cursor without touching the jobs projection. MUST stay an explicit
+      // empty arm: the final `else` runs projectJobsRow, so deleting this
+      // arm would route historical BackendExecSnapshot events into the jobs
+      // projection and break re-fold determinism.
     } else {
       projectJobsRow(db, event);
       // The `subagent_invocations` projection rides the same transaction +

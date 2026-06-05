@@ -15393,61 +15393,43 @@ test("config_dir fold unchanged: only SessionStart seeds it, subsequent events d
 });
 
 // ---------------------------------------------------------------------------
-// BackendExecSnapshot reducer arm — fn-668-backend-exec-coordinates-on-jobs T4
+// Retired `BackendExecSnapshot` arm (fn-710). The synthetic-event TYPE and its
+// historical rows persist in the immutable log, but the zellij feed that
+// produced them is gone and the dispatch arm is now an EXPLICIT empty no-op.
+// CRITICAL regression guard: the arm must NOT fall through to `projectJobsRow`
+// (the final `else`) — doing so would route a historical `BackendExecSnapshot`
+// into the jobs projection and break re-fold determinism. These tests pin the
+// no-op: the cursor advances, the jobs projection is untouched, and a cursor=0
+// re-fold over a log containing one reproduces byte-identical rows.
 // ---------------------------------------------------------------------------
 
-test("BackendExecSnapshot folds tab_id + tab_name onto the matching jobs row", () => {
+test("historical BackendExecSnapshot folds to a no-op: cursor advances, jobs projection untouched", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "job-1" });
+  // Snapshot of the jobs projection immediately AFTER SessionStart folds but
+  // BEFORE the BackendExecSnapshot — the no-op must leave this byte-identical.
+  expect(drainAll()).toBe(1);
+  const beforeRow = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("job-1");
+
   const snapId = insertEvent({
     hook_event: "BackendExecSnapshot",
     session_id: "job-1",
     data: JSON.stringify({ tab_id: "3", tab_name: "agent-a" }),
   });
-  expect(drainAll()).toBe(2);
-
-  const row = db
-    .query(
-      "SELECT backend_exec_tab_id, backend_exec_tab_name, last_event_id FROM jobs WHERE job_id = ?",
-    )
-    .get("job-1") as {
-    backend_exec_tab_id: string | null;
-    backend_exec_tab_name: string | null;
-    last_event_id: number;
-  } | null;
-  expect(row?.backend_exec_tab_id).toBe("3");
-  expect(row?.backend_exec_tab_name).toBe("agent-a");
-  expect(row?.last_event_id).toBe(snapId);
+  // The retired arm folds: the cursor advances (the event is consumed) but
+  // nothing is written to `jobs`.
+  expect(drainAll()).toBe(1);
   expect(getCursor()).toBe(snapId);
+
+  const afterRow = db.query("SELECT * FROM jobs WHERE job_id = ?").get("job-1");
+  // Byte-identical: the no-op arm did NOT touch the jobs row (no
+  // `last_event_id` bump, no projection write — proving it did not fall
+  // through to `projectJobsRow`).
+  expect(afterRow).toEqual(beforeRow);
 });
 
-test("BackendExecSnapshot with NULL tab_id preserves the prior tab_id (COALESCE; tombstone = last-known sticks)", () => {
-  insertEvent({ hook_event: "SessionStart", session_id: "job-1" });
-  insertEvent({
-    hook_event: "BackendExecSnapshot",
-    session_id: "job-1",
-    data: JSON.stringify({ tab_id: "3", tab_name: "agent-a" }),
-  });
-  // Second snapshot: name flipped, but tab_id null — prior tab_id sticks.
-  insertEvent({
-    hook_event: "BackendExecSnapshot",
-    session_id: "job-1",
-    data: JSON.stringify({ tab_id: null, tab_name: "agent-renamed" }),
-  });
-  expect(drainAll()).toBe(3);
-
-  const row = db
-    .query(
-      "SELECT backend_exec_tab_id, backend_exec_tab_name FROM jobs WHERE job_id = ?",
-    )
-    .get("job-1") as {
-    backend_exec_tab_id: string | null;
-    backend_exec_tab_name: string | null;
-  } | null;
-  expect(row?.backend_exec_tab_id).toBe("3"); // sticky
-  expect(row?.backend_exec_tab_name).toBe("agent-renamed"); // updated
-});
-
-test("BackendExecSnapshot against a missing job_id is a safe no-op (cursor still advances)", () => {
+test("BackendExecSnapshot against a missing job_id mints NO jobs row (no projectJobsRow fall-through)", () => {
   const id = insertEvent({
     hook_event: "BackendExecSnapshot",
     session_id: "no-such-job",
@@ -15455,36 +15437,15 @@ test("BackendExecSnapshot against a missing job_id is a safe no-op (cursor still
   });
   expect(drainAll()).toBe(1);
   expect(getCursor()).toBe(id);
-  // No jobs row was minted by the BackendExecSnapshot fold itself.
+  // If the arm had fallen through to `projectJobsRow`, this lone event would
+  // have minted a `no-such-job` jobs row. The no-op arm mints nothing.
   const row = db
     .query("SELECT job_id FROM jobs WHERE job_id = ?")
     .get("no-such-job");
   expect(row).toBeNull();
 });
 
-test("BackendExecSnapshot with malformed data blob is a safe no-op (cursor still advances)", () => {
-  insertEvent({ hook_event: "SessionStart", session_id: "job-1" });
-  const id = insertEvent({
-    hook_event: "BackendExecSnapshot",
-    session_id: "job-1",
-    data: "{not json",
-  });
-  expect(drainAll()).toBe(2);
-  expect(getCursor()).toBe(id);
-  // Prior tab_* cells (NULL by default) stay NULL.
-  const row = db
-    .query(
-      "SELECT backend_exec_tab_id, backend_exec_tab_name FROM jobs WHERE job_id = ?",
-    )
-    .get("job-1") as {
-    backend_exec_tab_id: string | null;
-    backend_exec_tab_name: string | null;
-  } | null;
-  expect(row?.backend_exec_tab_id).toBeNull();
-  expect(row?.backend_exec_tab_name).toBeNull();
-});
-
-test("BackendExecSnapshot is deterministic on re-fold (rewind cursor + re-drain reproduces row)", () => {
+test("cursor=0 re-fold over a log containing a historical BackendExecSnapshot stays byte-identical", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "job-1" });
   insertEvent({
     hook_event: "BackendExecSnapshot",
@@ -15492,22 +15453,15 @@ test("BackendExecSnapshot is deterministic on re-fold (rewind cursor + re-drain 
     data: JSON.stringify({ tab_id: "7", tab_name: "agent-X" }),
   });
   drainAll();
-  const before = db
-    .query(
-      "SELECT backend_exec_tab_id, backend_exec_tab_name FROM jobs WHERE job_id = ?",
-    )
-    .get("job-1");
+  const before = db.query("SELECT * FROM jobs WHERE job_id = ?").get("job-1");
 
-  // Rewind cursor + clear jobs, then re-drain — projection must rebuild
-  // byte-identical.
+  // Rewind cursor + clear jobs, then re-drain from scratch — the projection
+  // must rebuild byte-identical. A deleted (vs. no-op'd) arm would route the
+  // BackendExecSnapshot through `projectJobsRow` on this re-fold and diverge.
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   drainAll();
-  const after = db
-    .query(
-      "SELECT backend_exec_tab_id, backend_exec_tab_name FROM jobs WHERE job_id = ?",
-    )
-    .get("job-1");
+  const after = db.query("SELECT * FROM jobs WHERE job_id = ?").get("job-1");
 
   expect(after).toEqual(before);
 });

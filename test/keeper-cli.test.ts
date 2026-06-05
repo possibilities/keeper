@@ -52,7 +52,6 @@ function makeHarness(): Harness {
       usage: mkHandler("usage"),
       autopilot: mkHandler("autopilot"),
       await: mkHandler("await"),
-      "plugin-path": mkHandler("plugin-path"),
     },
     stdout: (s) => stdout.push(s),
     stderr: (s) => stderr.push(s),
@@ -169,7 +168,6 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("usage")).toBe(true);
     expect(isSubcommand("autopilot")).toBe(true);
     expect(isSubcommand("await")).toBe(true);
-    expect(isSubcommand("plugin-path")).toBe(true);
     expect(isSubcommand("bogus")).toBe(false);
     expect(isSubcommand("")).toBe(false);
   });

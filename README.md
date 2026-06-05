@@ -54,11 +54,8 @@ three terminal-multiplexer backend-exec coordinates
 synchronous `process.env` reads (`ZELLIJ` / `ZELLIJ_SESSION_NAME` /
 `ZELLIJ_PANE_ID`; no fork, no fs, no PPID-walk), folded onto
 `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins via
-`COALESCE` — and a daemon-side zellij-events watcher stamps the matched
-`jobs.backend_exec_tab_{id,name}` via a `BackendExecSnapshot` synthetic
-event (event-driven; the fn-684 wasm bridge plugin appends one NDJSON
-line per pane/tab delta to a session-scoped feed file, retiring the
-prior `zellij action list-panes -a -j` poller). Generic `backend_exec_*` naming lets a future
+`COALESCE`. (`jobs.backend_exec_tab_{id,name}` are dead columns — the fn-684
+feed was retired in fn-710; Task 2 will DROP them.) Generic `backend_exec_*` naming lets a future
 tmux/wezterm backend slot in without a schema change. Consumers can find
 `/plan:work` calls, `Skill` invocations, every Task-tool subagent
 lifecycle, every session's profile attribution, every planctl-CLI
@@ -296,17 +293,9 @@ Keeper has no `install` verb. Wire it up manually:
      session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
      Override only if your Claude Code transcripts live elsewhere.
    - `zellij_session` — the zellij session name keeperd's server-side
-     autopilot reconciler (the autopilot worker thread inside the daemon)
-     lazily ensures (and reuses) for every tab it spawns. Default:
-     `autopilot`. Each dispatch opens as a new tab inside that shared
+     autopilot reconciler lazily ensures (and reuses) for every tab it spawns.
+     Default: `autopilot`. Each dispatch opens as a new tab inside that shared
      background session.
-   - `autoclose_windows` — whether the reconciler reaps (kills the agent
-     and closes the zellij tab) a dispatch whose role is no longer needed.
-     Default: `false` (leave-open — finished windows stay open for
-     observe-after-the-fact). Set `true` to enable the reap. Only an explicit
-     boolean overrides the default (a string like `"true"` is ignored). The
-     completed-row bookkeeping still fires regardless; the flag only gates the
-     window reap.
 
    ```sh
    mkdir -p ~/.config/keeper
@@ -316,7 +305,6 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/src
    claude_projects_root: ~/.claude/projects
    zellij_session: autopilot
-   autoclose_windows: false
    YAML
    ```
 
@@ -326,9 +314,8 @@ Keeper has no `install` verb. Wire it up manually:
    All keys fall back independently — a missing/malformed one never disturbs
    the others; a missing or malformed config falls back to every default
    (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
-   `zellij_session: autopilot`, `autoclose_windows: false`). Unknown keys
-   are silently ignored — a legacy `exec_backend: ghostty` carried over
-   from a pre-fn-654 config has no effect.
+   `zellij_session: autopilot`). Unknown keys are silently ignored — a legacy
+   `exec_backend: ghostty` carried over from a pre-fn-654 config has no effect.
 
    (The legacy `KEEPER_WATCH_ROOT` env var is retired; if still set, the daemon
    logs a one-line deprecation warning and ignores it.)
@@ -461,203 +448,11 @@ Keeper has no `install` verb. Wire it up manually:
    `KEEPER_TRACE_SERVER=0`; flip to `1` then
    `launchctl kickstart -k gui/$UID/arthack.keeperd` to enable.
 
-   Two sibling flags (epic fn-704 task .2) trace the suspected zellij feed
-   amplification loop; both default OFF and cost ZERO when off (read once into
-   a module `const`, gated at the call site so the counter never even
-   increments). Each emits an awk-parseable rolling-window rate line to stderr
-   — `[<tag>] T=<epoch-ms> count=<N> window_ms=<W>` — once per ~10s window.
-   - `KEEPER_TRACE_TABNAMER=1` — tab-namer-worker counters:
-     `[trace-tabnamer-renames]` = REAL `rename-tab-by-id` shell-outs (past the
-     convergence / memo / empty-name gates), `[trace-tabnamer-kicks]` = kicks
-     received from main.
-   - `KEEPER_TRACE_ZELLIJ=1` — both ends of the feed→mint path:
-     `[trace-zellij-notifications]` = watcher notifications posted by the
-     zellij-events-worker (raw bridge write pressure), and `[trace-zellij-mints]`
-     = actual `BackendExecSnapshot` mints in main's `scanZellijEventsDir` (the
-     real `data_version`-bumping driver — the worker has no DB handle, so the
-     bump is only observable at main's mint site).
-
-   **How to read the trace (spotting the loop).** Run
-   `KEEPER_TRACE_TABNAMER=1 KEEPER_TRACE_ZELLIJ=1 keeperd` on a busy session and
-   compare the four rates. A high `notifications` rate with a LOW `mints` rate
-   means the feed is noisy-but-harmless (a producer-side / task .1 concern, not
-   a loop) — and since fn-709 added the mint-seam dedup, this is now the
-   EXPECTED shape: a line whose effective `(tab_id, tab_name)` equals the job's
-   projection is skipped before the INSERT, so `notifications` can run high
-   while `mints` collapses toward the real-transition rate. A high `mints` rate
-   that TRACKS the `renames` rate is the loop signature: each rename emits a
-   TabUpdate → bridge re-emit → feed line → mint → `data_version` bump →
-   tab-namer kick → another rename. With the dedup in place a `mints` rate still
-   tracking `renames` means real distinct tuples are churning (the dedup only
-   suppresses no-op repeats), so the loop is in the rename-producing tuple, not
-   the consumer. The `kicks` rate is the upstream pressure feeding the rename
-   ticks. Example
-   clients ship under the unified `keeper` CLI — `keeper board` /
+   Example clients ship under the unified `keeper` CLI — `keeper board` /
    `keeper jobs` / `keeper autopilot` / `keeper git` / `keeper usage`
    (subscribe; the readiness clients go through
    `src/readiness-client.ts`) and `keeper approve` (RPC) — see
    [Example clients](#example-clients).
-
-### Zellij bridge plugin (rebuild only)
-
-Keeper's zellij event-bridge plugin (`fn-684`) is committed in pre-built
-form at the canonical stable path
-
-```
-plugin/zellij-bridge/keeper-zellij-bridge.wasm
-```
-
-alongside a sidecar `VERSION` file pinning the `zellij-tile` version it was
-built against. **You do not need a Rust toolchain or `binaryen` to USE
-keeper or run a session** — the committed artifact ships with the repo.
-Toolchain prereqs apply ONLY when you want to rebuild the `.wasm` (e.g.
-after bumping the `zellij-tile` pin in `Cargo.toml`).
-
-Rebuild prereqs:
-
-- A Rust toolchain installed via `rustup` (the build script auto-adds the
-  `wasm32-wasip1` target on first run; `cargo` and `rustup` must be on PATH).
-- `binaryen` for size-optimised builds — `brew install binaryen` (provides
-  `wasm-opt`). When `wasm-opt` is missing the build script prints a loud
-  warning and ships the unoptimised cargo output verbatim; the `.wasm` is
-  still functional, just ~14% larger. CI / release builds should install
-  `binaryen`.
-
-Rebuild:
-
-```sh
-bun run build:plugin
-```
-
-This runs `rustup target add wasm32-wasip1` (idempotent), `cargo build
---release --target wasm32-wasip1`, optionally `wasm-opt -Oz`, and emits
-both the `.wasm` and the `VERSION` sidecar. Commit all four files together
-(`Cargo.toml`, `Cargo.lock`, `keeper-zellij-bridge.wasm`, `VERSION`).
-
-Canonical path lookup:
-
-```sh
-keeper plugin-path
-# → /Users/.../keeper/plugin/zellij-bridge/keeper-zellij-bridge.wasm
-```
-
-This is the **single source of truth** for the cross-repo path
-contract: the human's dotfiles `~/.config/zellij/config.kdl`
-`load_plugins { "file:..." { cwd "<events dir>" } }` block and the zellij
-permission cache (`permissions.kdl`) both reference this absolute path
-rather than hardcoding it. Note the two references are NOT byte-identical:
-`config.kdl` uses the `file:`-scheme URL, while the permission cache keys
-on the bare path WITHOUT the `file:` prefix (zellij strips the scheme when
-it stores/matches a grant). The dotfiles install scripts (separate repo;
-see `fn-684.3` for the wiring contract) consume this verb.
-
-Version-skew safety:
-
-`bun test test/plugin-version-skew.test.ts` reads the sidecar `VERSION`
-line and the host's `zellij --version` and fails loudly with rebuild
-instructions when they drift. Run it after every `brew upgrade zellij` —
-otherwise an agent will silently run a `.wasm` linked against the wrong
-host API.
-
-### Zellij bridge plugin (dotfiles wiring)
-
-Keeper is the PROVIDER of the bridge `.wasm` and ensures the events dir
-exists on daemon boot (`~/.local/state/keeper/zellij-events`, override
-via `KEEPER_ZELLIJ_EVENTS_DIR`). Keeper does NOT load the plugin into
-sessions itself — it never runs `zellij action start-or-reload-plugin`
-and never writes the zellij permission cache. That side is owned
-by your dotfiles / arthack install scripts (separate repo), which load
-the plugin GLOBALLY into every zellij session via a `config.kdl`
-`load_plugins` block. The result: every zellij session (whether
-keeper-launched or not) writes its `<session>.ndjson` event stream into
-one keeper-watched directory, and the keeperd daemon folds the lines
-through the existing `BackendExecSnapshot` synthetic event into
-`jobs.backend_exec_tab_*` (no schema bump).
-
-The wiring contract is a THREE-place path match: the committed `.wasm`
-file, the `config.kdl` `load_plugins` URL (`file:` scheme), and the
-zellij permission-cache key (bare path, NO `file:` scheme) must all point
-at the same absolute path. `keeper plugin-path` (above) is the single
-source of truth — derive both KDL references from it rather than
-hardcoding the path; otherwise a `~/code/keeper` checkout move silently
-strands the wiring.
-
-1. **`~/.config/zellij/config.kdl`** — add a `load_plugins` block that
-   pins the plugin's `cwd` to keeper's events dir. zellij maps the
-   plugin's `initial_cwd` to its WASI `/host` mount, so this `cwd` IS
-   where the plugin's `<session>.ndjson` lines land — and keeper
-   watches exactly that directory.
-
-   ```kdl
-   load_plugins {
-       "file:/Users/you/code/keeper/plugin/zellij-bridge/keeper-zellij-bridge.wasm" {
-           cwd "/Users/you/.local/state/keeper/zellij-events"
-       }
-   }
-   ```
-
-   Substitute the two paths from `keeper plugin-path` and your
-   `KEEPER_ZELLIJ_EVENTS_DIR` (default
-   `~/.local/state/keeper/zellij-events`). Arthack-style install
-   scripts should template this block from `keeper plugin-path` so a
-   checkout move regenerates the URL automatically.
-
-2. **`permissions.kdl`** — pre-seed BOTH a `ReadApplicationState` AND a
-   `ReadSessionEnvironmentVariables` grant. `ReadApplicationState` gates
-   the `PaneUpdate`/`TabUpdate` subscription; `ReadSessionEnvironmentVariables`
-   gates the `get_session_environment_variables()` call the plugin uses to
-   read `ZELLIJ_SESSION_NAME` (it names its `<session>.ndjson` after it).
-   The plugin requests both in `load()` and only reads the session env
-   after the grant lands (the async `PermissionRequestResult` arm), so a
-   missing seed does not crash it — but background plugins can't surface a
-   prompt reliably (upstream zellij#4982), so WITHOUT the pre-seed every
-   new session pops a `(y/n)` permission dialog (or silently no-ops the
-   subscription). The pre-seed is what makes the bridge load silently.
-
-   **Path is platform-specific.** zellij stores its permission cache in
-   its CACHE DIR, which is NOT `~/.cache/zellij` on macOS. Find it with:
-
-   ```sh
-   zellij setup --check | grep 'CACHE DIR'
-   # macOS:  ~/Library/Caches/org.Zellij-Contributors.Zellij
-   # Linux:  ~/.cache/zellij
-   ```
-
-   Seed `<CACHE DIR>/permissions.kdl`. **The key is the bare path WITHOUT
-   the `file:` scheme** — zellij strips the scheme before it stores/matches
-   a grant, so a `file:`-prefixed key never matches and the prompt fires
-   anyway:
-
-   ```kdl
-   "/Users/you/code/keeper/plugin/zellij-bridge/keeper-zellij-bridge.wasm" {
-       ReadApplicationState
-       ReadSessionEnvironmentVariables
-   }
-   ```
-
-   Each grant is the bare child-node NAME (`ReadApplicationState`), NOT
-   `allowed_permissions "ReadApplicationState"`. zellij's parser
-   (`PermissionCache::from_string`) reads each child node's *name* as a
-   `PermissionType` and ignores arguments — so the `allowed_permissions`
-   arg form parses to an EMPTY grant and the plugin silently no-ops.
-
-   The path MUST match the one in `config.kdl` above (minus the `file:`
-   scheme) and the output of `keeper plugin-path` — zellij keys
-   permissions by exact path, so a one-byte drift silently strips the
-   grant.
-
-3. **Restart your zellij sessions** to pick up the new `config.kdl` /
-   `permissions.kdl`. Long-lived existing sessions only acquire the
-   plugin on their next zellij (re)start. New sessions opened after
-   the dotfiles land bind the plugin immediately. Confirm with
-   `tail -f ~/.local/state/keeper/zellij-events/<session>.ndjson` —
-   lines should append as panes/tabs move.
-
-   The plugin's NDJSON feed is the daemon's sole tab-resolution source —
-   the legacy `zellij action list-panes` poller was retired (the
-   `KEEPER_ZELLIJ_FEED` gate is gone; the `zellij-events` worker is
-   always-on). keeperd folds each session's lines as they land, so a
-   freshly-loaded plugin's tab resolutions go live with no extra step.
 
 ## Example clients
 
@@ -1468,23 +1263,11 @@ fork, no fs, no PPID-walk; absent env ⇒ NULL coords, never bogus
 `type='zellij'`) — and the reducer's `applyEvent` arm folds the three
 onto `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins
 via `COALESCE`, so a re-fold from cursor=0 reproduces byte-identical
-rows. A daemon-side zellij-events watcher Worker thread (the ninth
-producer worker; see [Architecture](#architecture)) consumes a
-session-scoped NDJSON feed appended by the fn-684 Rust wasm bridge
-plugin (loaded into every zellij session by the human's dotfiles
-`config.kdl`), watching the feed dir with `@parcel/watcher`. Main
-tails each `<session>.ndjson` from a persisted byte-offset watermark,
-joins `(session, pane_id) -> job_id` via `readLiveJobsWithCoords`,
-and mints a `BackendExecSnapshot` synthetic event per joined line
-the reducer folds into `jobs.backend_exec_tab_{id,name}` (tab
-tombstone = last-known sticks; env absent ⇒ NULL coords). The legacy
-`zellij action list-panes -a -j` polling producer (`backend-worker`)
-was retired by fn-684 task .5 after the plugin feed soaked for
-multi-day parity — rollback is a single `git revert` of that commit.
-Generic
-`backend_exec_*` naming lets a future tmux/wezterm backend slot in
-without a schema change — only the hook's env-name table changes. The
-five `jobs.backend_exec_*` columns are display-only on
+rows. (`jobs.backend_exec_tab_{id,name}` are dead columns — the fn-684
+feed was retired in fn-710.) Generic `backend_exec_*` naming lets a
+future tmux/wezterm backend slot in without a schema change — only the
+hook's env-name table changes. The three live `jobs.backend_exec_*` columns
+(`type`, `session_id`, `pane_id`) are display-only on
 `JOBS_DESCRIPTOR` (like `profile_name` — read by the renderer, never
 a `sortable` / `filters` / `jsonColumns` key); the shared
 `projectJobRow` + `renderJobsBody` helpers append an optional trailing
@@ -1734,15 +1517,12 @@ and flips on the `set_autopilot_paused` RPC, which appends an
 `AutopilotPaused{paused}` event FIRST then flips the worker gate only
 on a successful insert (so the gate and the projection cannot diverge
 on partial failure). The terminal-surface mechanics live behind the
-`ExecBackend` (`src/exec-backend.ts`) — five ops: `launch`,
-`closeByTabId`, `focusPane`, `resolveTabForPane`, and `renameTab`
-(the focus-safe `rename-tab-by-id` op used by the tab-namer worker
-to converge zellij tab labels onto transcript titles). `ensureLaunched`
-(session-agnostic) get-or-creates the target session with its own
-per-call mint + orphan reap and launches an unnamed tab —
-`restore-agents.ts` is the consumer. Zellij is the only backend;
-each reconciler dispatch opens as a new tab in the lazily-created
-`zellij_session`. The session is FRESH-MINTED on every
+`ExecBackend` (`src/exec-backend.ts`) — two ops: `launch` and
+`focusPane`. `ensureLaunched` (session-agnostic) get-or-creates the
+target session with its own per-call mint + orphan reap and launches an
+unnamed tab — `restore-agents.ts` is the consumer. Zellij is the only
+backend; each reconciler dispatch opens as a new tab in the
+lazily-created `zellij_session`. The session is FRESH-MINTED on every
 keeper-initiated `attach -b --forget` (fn-675) — `--forget` deletes any
 saved/serialized session before connecting, so a stale/EXITED corpse is
 rebuilt from scratch rather than resurrected from a degraded
@@ -1760,82 +1540,9 @@ RPC → main → a synthetic `DispatchCleared` events row → the reducer DELETE
 the matching `dispatch_failures` row on the next drain. The only durable
 autopilot-owned state is the event-sourced `dispatch_failures` and
 `pending_dispatches` projections; a from-scratch re-fold reproduces both
-byte-identically. When the `autoclose_windows` config flag is on, the
-reconciler reaps a dispatch whose role is no longer needed via
-`ExecBackend.closeByTabId(session, tabId)` off the
-`jobs.backend_exec_{session_id,tab_id}` coordinates (fn-668); default-off
-preserves today's leave-open behavior.
+byte-identically.
 
-A **ninth** Worker thread is the zellij-events watcher (fn-684, schema
-v48 unchanged). It is the always-on event-driven replacement for the
-retired `backend-worker` poller: instead of shelling
-`zellij action list-panes -a -j` once per tick, keeper consumes a
-session-scoped NDJSON feed produced by a headless Rust wasm bridge
-plugin (`keeper-zellij-bridge.wasm`) that the human's dotfiles load
-into every zellij session via a `config.kdl` `load_plugins` block.
-The plugin subscribes to native `PaneUpdate` / `TabUpdate` events
-and joins `pane_id -> (tab_id, tab_name)` against the manifest. Since
-zellij delivers a FULL `PaneManifest` snapshot on every pane poll, the
-plugin diffs each freshly built manifest against a `last_emitted`
-`pane_id -> (tab_id, tab_name)` map (the pure `diff_lines` gate,
-fn-704.1) and appends a line ONLY for panes whose tuple changed — a
-zero-delta event does NO file I/O at all (the fix for the 20MB/30min
-feed-growth incident on a busy autopilot session). The changed panes
-land in one open + one batched `write_all` + one flush (was per-line
-open/flush/close), `last_emitted` is folded only after a successful
-flush and pruned of closed panes, and the file goes to
-`<events-dir>/<session>.ndjson` (its WASI `/host` is pinned to the
-keeper events dir by the dotfiles' per-plugin `cwd`). This worker uses `@parcel/watcher` on the events
-dir and posts a contentless `{kind:"zellij-events-changed"}` "go
-look" notification on every tree change. Main re-runs
-`scanZellijEventsDir`, which tails each file from its persisted
-byte-offset watermark, parses each new line, joins
-`(session, pane_id) -> job_id` via `readLiveJobsWithCoords` (the
-same projection-side helper the poller used, now also carrying the
-job's current `backend_exec_tab_id` / `backend_exec_tab_name` for the
-dedup seed), and mints one synthetic `BackendExecSnapshot` event per
-joined line whose effective `(tab_id, tab_name)` differs from the
-job's projection (fn-709 mint-seam dedup) — a line equal to the
-last-known tuple is skipped before the INSERT, so the consecutive
-no-op dupes that were 53.6% of the feed never pay the realtime
-pipeline. The mint flows through the EXACT same reducer fold the
-poller fed — last-known sticks tombstone semantics, schema-neutral
-(no SCHEMA_VERSION bump, no keeper-py change), no reducer change; the
-fold stays idempotent so the dedup is a wire-cost optimization, not a
-correctness dependency. The worker itself holds NO DB handle. It is the eighth `@parcel/watcher`
-producer instance and, like every keeper producer, feeds the log
-only via main's writable connection. The watermark sidecar advances
-in lockstep with each scan so a daemon restart re-tails from the
-last byte rather than re-folding the whole feed. The watermark is the
-`(epoch, offset)` TUPLE, not offset alone, and it resets to byte 0 on
-ANY epoch mismatch — a plugin reload (the `load()`-stamped load epoch)
-OR a live-feed rotation (fn-706.2, the `now_ms()`-stamped rotation
-epoch). Each scan cheaply peeks the FIRST line's epoch
-(`peekZellijEpoch`, distinct from `parseZellijEventLine` which nulls
-the `plugin_start` sentinel the rotation header IS): a first-line epoch
-differing from the persisted watermark means the file was rotated or
-reloaded, so the consumer resets the offset to 0 and re-reads the
-header + re-snapshot from byte 0. This is robust even when the
-re-snapshot already grew the file PAST the prior offset — the
-behind-consumer hole the `size < watermark` shrink guard misses; the
-shrink guard is retained as a secondary signal (a file shorter than the
-watermark is a rotation signal, not an error). An oversize feed (over
-the 16 MiB `MAX_ZELLIJ_EVENTS_FILE_BYTES` cap) is TAIL-READ instead of
-skipped (fn-706.1): the scan seeks to `max(priorOffset, size - cap)`,
-discards the partial leading line to the next `\n`, seeds the epoch
-from the first parsed line in the window, and advances the watermark
-from the actual window base (`tailBase + discardedPartialBytes +
-consumedBytesInTail`). A noisy session degrades to "tail-only" and
-keeps minting `BackendExecSnapshot` — the pre-fn-706 skip-and-log
-froze the watermark forever, silently stopping all mints for the
-session (the recurring hand-truncate mole). Post-fn-706.2 the feed
-self-bounds well under the cap via plugin-side rotation (see the
-zellij-bridge plugin's ~4 MiB `ROTATION_THRESHOLD`), so the tail-read
-is a never-frozen safety net rather than the steady state. Rollback to
-the poller is a single `git revert` of the fn-684 task .5 commit — the
-poller worker is retired, not gated.
-
-A **tenth** Worker thread is the restore-snapshot worker (epic fn-677,
+A **ninth** Worker thread is the restore-snapshot worker (epic fn-677,
 two-tier rework fn-702): a pure CONSUMER that opens its own read-only
 connection, polls `PRAGMA data_version` via the shared `watchLoop`
 primitive, and on every change reads the `jobs` + `epics` projections
@@ -1885,48 +1592,15 @@ the load-bearing coupling: the moment the worker writes
 `schema_version: 2`, the OLD reader treats it as "future" and refuses, so
 the v2 writer and v2 reader ship in the same commit.
 
-An **eleventh** Worker thread is the tab-namer worker (epic fn-680,
-reworked fn-699): a pure SIDE-EFFECTOR that opens its own read-only
-connection and — reactively, mirroring the server-worker — reads the
-live jobs that carry both a resolved
-`(backend_exec_session_id, backend_exec_tab_id)` pair and a non-NULL
-transcript-derived `title`. Its **fast path** is a `{type:"kick"}`
-message main posts after every `drainToCompletion` (a fold may have
-moved `title` or, on a zellij drift, `backend_exec_tab_name`); a
-`data_version` poll backstop (~2.5s, naked autocommit read) catches any
-lost kick. For each row whose sanitized title differs from the
-last-observed `backend_exec_tab_name` it shells the focus-safe
-`zellij action rename-tab-by-id <id> <name>` op via
-`ExecBackend.renameTab` — the `-t`/`--tab-id` flag form has an open
-focus-switch bug (zellij #4602) that would yank the human's visible
-focus to the renamed tab. The convergence is UNCONDITIONAL and
-self-terminating: there is no permanent "already-sent" suppression, so
-a tab that zellij resets to `Tab #N` on resume (or a tab-mate renames)
-re-converges to its session title within one kick/poll cycle. A narrow
-`SESSION::PANE_ID`-keyed memo suppresses only the redundant re-issue in
-the post-write observe window (between a rename success and the feed
-reporting the new name back) and is cleared the moment a tick observes
-`tab_name === sanitize(title)`, so a later drift re-fires. fn-678 made
-the tab name purely cosmetic (reap is by `backend_exec_tab_id`, launch
-dedup by `pending_dispatches`), so renaming every tab — autopilot's
-included — is safe; the zellij-events feed (worker nine) is the single
-reader of zellij tab state, closing the convergence loop. The worker
-writes NOTHING to the DB, mints no events, no schema bump, no reducer
-arm, no `keeper/api.py` whitelist change. It RECEIVES `{type:"kick"}`
-and `{type:"shutdown"}` from main but never posts back. Rename failures
-(tab gone, session dead, ENOENT) are silent no-ops; only an unhandled
-throw out of the tick escalates to `onerror`/`close` → fatalExit.
-
-The twelve workers are fully independent; main supervises all twelve
+The ten workers are fully independent; main supervises all ten
 lifecycles but routes none of their traffic, and any worker's `error`
 event escalates the whole process to a clean restart — with that single
 scoped exception, the recoverable drop signal on the transcript, plan,
-usage, dead-letter, and zellij-events watchers, which deliberately does
-NOT escalate (a re-scan throw is swallowed, never reaching the restart
-path).
+usage, and dead-letter watchers, which deliberately does NOT escalate
+(a re-scan throw is swallowed, never reaching the restart path).
 
-**`@parcel/watcher` load ordering (as of fn-701).** Six of the workers
-(transcript, plan, git, usage, dead-letter, zellij-events) each run their own
+**`@parcel/watcher` load ordering (as of fn-701).** Five of the workers
+(transcript, plan, git, usage, dead-letter) each run their own
 `import("@parcel/watcher")`. Spawned back-to-back, their FIRST dlopens of the
 native N-API addon race and crash with `symbol 'napi_register_module_v1' not
 found` — residual [Bun #15942](https://github.com/oven-sh/bun/issues/15942)

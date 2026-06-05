@@ -1816,7 +1816,7 @@ test("fn-651: an old event missing the fn-645 fields folds them to NULL without 
  *
  * Why a direct spawn rather than a full `runDaemon()` boot: the daemon
  * module is import-safe behind its `import.meta.main` guard, but a
- * full boot opens the writer DB, launches eight other workers, binds
+ * full boot opens the writer DB, launches nine other workers, binds
  * a UDS, and writes the LaunchAgent state dir — far outside the scope
  * of "does the autopilot worker accept its initial workerData and
  * shut down cleanly". Each test below targets one contract piece.

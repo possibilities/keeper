@@ -109,7 +109,7 @@ import {
   projectGitStatusByProjectDir,
 } from "./readiness-client";
 import { runQuery } from "./server-worker";
-import type { Epic, GitStatus, Job, SubagentInvocation, Task } from "./types";
+import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
 import { watchLoop } from "./wake-worker";
 
 /**
@@ -331,15 +331,6 @@ export interface ReconcileState {
 }
 
 /**
- * Reconcile config — only the live keeperd config knobs the reconciler
- * actually needs. `zellijSession` rides on the `ExecBackend` directly;
- * here we only need to know whether to reap.
- */
-export interface ReconcileConfig {
-  autocloseWindows: boolean;
-}
-
-/**
  * Per-launch decision the reconciler emits. Carries everything the
  * caller (`runReconcileCycle`) needs to call `confirmRunning`: the
  * `(verb, id)` pair, the `cwd` for the launch, and the constructed
@@ -361,10 +352,9 @@ export interface PlannedLaunch {
 
 /**
  * A live in-flight dispatch this reconciler still has confirm work for.
- * Tracked on the in-memory `liveDispatches` map keyed by
- * `${verb}::${id}` so the reap pass can call `closeByName(key)` when
- * the role goes away. The `controller` aborts the confirm's internal
- * sleeps on shutdown.
+ * Tracked on the in-memory `liveDispatches` map keyed by `${verb}::${id}`
+ * so a single dispatch's confirm can be targeted. The `controller`
+ * aborts the confirm's internal sleeps on shutdown.
  */
 export interface LiveDispatch {
   verb: Verb;
@@ -375,45 +365,13 @@ export interface LiveDispatch {
 }
 
 /**
- * Reasons the reconciler MAY surface for a reap pass.
- *
- * - `approved-complete` — the row this dispatch serves reached APPROVED
- *   completion (readiness verdict `completed`). Every live dispatch
- *   sharing the row's id is reaped together at this moment, so the
- *   worker/closer tab AND the approve tab close as a pair on approval.
- * - `row-gone` — the row vanished from the snapshot (deleted task/epic);
- *   reaped as cleanup so an orphaned tab does not leak.
- *
- * A merely job-terminal (worker ended but not yet approved) OR rejected
- * dispatch is intentionally NOT reaped — that window is left open for
- * human inspection (and reaped later on rerun or by hand).
- */
-export type ReapReason = "approved-complete" | "row-gone";
-
-/**
- * Reap decision the reconciler emits — one per `liveDispatches` entry
- * whose role is no longer needed. The autoclose flag is checked BEFORE
- * pushing into this list. `sessionId` / `tabId` carry the
- * `jobs.backend_exec_{session_id,tab_id}` coordinates so `runReconcileCycle`
- * can call `closeByTabId` without re-scanning the jobs map.
- */
-export interface PlannedReap {
-  key: DispatchKey;
-  reason: ReapReason;
-  /** `jobs.backend_exec_session_id` for the freshest occupying job, or null. */
-  sessionId: string | null;
-  /** `jobs.backend_exec_tab_id` for the freshest occupying job, or null. */
-  tabId: string | null;
-}
-
-/**
- * The output of `reconcile(snapshot, state, deps)`: the launches to
- * fire AND the reaps to invoke. Pure data — `runReconcileCycle` walks
- * the arrays and chains the side-effect deps.
+ * The output of `reconcile(snapshot, state)`: the launches to fire.
+ * Pure data — `runReconcileCycle` walks the array and chains the
+ * side-effect deps. (Window-reap was retired with the zellij feed in
+ * fn-710; the decision carries launches only.)
  */
 export interface ReconcileDecision {
   launches: PlannedLaunch[];
-  reaps: PlannedReap[];
 }
 
 /**
@@ -684,37 +642,18 @@ export function isOccupyingJob(
  *      SessionStart blind window the legacy `isOccupyingJob` arm
  *      could not see).
  *
- * Reap pass: for each entry in `liveDispatches`, mark it for
- * `closeByTabId` iff `config.autocloseWindows === true` AND:
- *   - the row this dispatch serves reached APPROVED completion (readiness
- *     verdict `completed` — `approval==="approved"` + done + idle), OR
- *   - the row vanished from the snapshot entirely (deleted task/epic).
- *
- * A finished worker/closer/approve window is NOT reaped on the worker's
- * own session ending, nor on rejection — those windows stay open through
- * the pending/rejected window for human inspection (reaped later on
- * rerun or by hand). Because the worker/closer dispatch and the approve
- * dispatch share the row's id (`live.id`), approval reaps BOTH tabs in
- * the same pass — the worker/closer surface and its approve surface close
- * together. Default-off preserves the leave-open observe-after-the-fact
- * behavior; opt-in (`autoclose_windows: true`) reaps on approval.
- *
- * Pure — exported for testing. Side effects (launch, closeByName,
- * emitDispatchFailed) live in `runReconcileCycle`.
+ * Pure — exported for testing. Side effects (launch, emitDispatchFailed)
+ * live in `runReconcileCycle`. (Window-reap was retired with the zellij
+ * feed in fn-710 — the durable `pending_dispatches` projection serves
+ * launch-window dedup and no tab close-out runs.)
  */
 export function reconcile(
   snapshot: ReconcileSnapshot,
   state: ReconcileState,
-  liveDispatches: Map<DispatchKey, LiveDispatch>,
-  config: ReconcileConfig,
   now: number,
 ): ReconcileDecision {
   const launches: PlannedLaunch[] = [];
-  const reaps: PlannedReap[] = [];
 
-  // Cap nothing: even when paused, we still need to compute reaps so an
-  // approved-complete / row-gone dispatch can be cleaned up on the next
-  // wake. But we never enqueue a NEW launch while paused.
   // Use `Number.NEGATIVE_INFINITY` for the sub-agent staleness `now`
   // when the caller didn't bother (matches `computeReadiness`'s default
   // — keeps the staleness branch inert if undefined).
@@ -725,19 +664,6 @@ export function reconcile(
     snapshot.gitStatusByProjectDir,
     now,
   );
-
-  // Pre-build a quick lookup: task_id → Task and epic_id → Epic for
-  // the reap pass (cheaper than scanning every epic each time).
-  const taskById = new Map<string, { task: Task; epic: Epic }>();
-  for (const epic of snapshot.epics) {
-    for (const task of epic.tasks) {
-      taskById.set(task.task_id, { task, epic });
-    }
-  }
-  const epicById = new Map<string, Epic>();
-  for (const epic of snapshot.epics) {
-    epicById.set(epic.epic_id, epic);
-  }
 
   // Walk every row. For each (kind, id), compute the wanted verb and
   // record whichever launches survive suppression.
@@ -818,84 +744,7 @@ export function reconcile(
     }
   }
 
-  // Reap pass. Iterates live dispatches AND ALSO already-failed in-flight
-  // confirmRunning entries that never made it to liveDispatches — those
-  // are handled at confirm time, not here. Only consult dispatches we're
-  // actively tracking as "running" post-confirm.
-  //
-  // A dispatch is reaped ONLY when the row it serves reached APPROVED
-  // completion (verdict `completed`) OR the row vanished from the
-  // snapshot. A finished-but-pending or rejected window is left OPEN for
-  // human inspection — the worker's own session ending is NOT a reap
-  // trigger. Because the worker/closer dispatch and the approve dispatch
-  // share the row id (`live.id`), the approval reap closes BOTH tabs in
-  // the same pass.
-  if (config.autocloseWindows) {
-    // Rows that reached approved completion this cycle — task verdicts
-    // keyed by task_id, close-row verdicts keyed by epic_id. The two id
-    // spaces are disjoint, so one set serves both dispatch families.
-    const completedRowIds = new Set<string>();
-    for (const [taskId, verdict] of readiness.perTask) {
-      if (verdict.tag === "completed") {
-        completedRowIds.add(taskId);
-      }
-    }
-    for (const [epicId, verdict] of readiness.perCloseRow) {
-      if (verdict.tag === "completed") {
-        completedRowIds.add(epicId);
-      }
-    }
-    // Every row id present in the snapshot — a `live.id` absent here is a
-    // deleted task/epic (or an epic that completed and dropped from
-    // default scope) and gets reaped as cleanup.
-    const presentRowIds = new Set<string>();
-    for (const epic of snapshot.epics) {
-      presentRowIds.add(epic.epic_id);
-      for (const task of epic.tasks) {
-        presentRowIds.add(task.task_id);
-      }
-    }
-
-    for (const live of liveDispatches.values()) {
-      const approvedComplete = completedRowIds.has(live.id);
-      const rowGone = !presentRowIds.has(live.id);
-      if (!approvedComplete && !rowGone) {
-        continue;
-      }
-      // Freshest jobs row for the pair carries the tab coords. Multiple
-      // jobs can share a (plan_verb, plan_ref) across resumes; pick the
-      // one with highest last_event_id (monotonic per DB).
-      let freshestEventId = -1;
-      let freshestSessionId: string | null = null;
-      let freshestTabId: string | null = null;
-      for (const job of snapshot.jobs.values()) {
-        if (job.plan_verb === live.verb && job.plan_ref === live.id) {
-          if (job.last_event_id > freshestEventId) {
-            freshestEventId = job.last_event_id;
-            freshestSessionId = job.backend_exec_session_id;
-            freshestTabId = job.backend_exec_tab_id;
-          }
-        }
-      }
-      reaps.push({
-        key: live.key,
-        // `approved-complete` wins when both apply (a completed row still
-        // present in scope) — the more informative reason.
-        reason: approvedComplete ? "approved-complete" : "row-gone",
-        sessionId: freshestSessionId,
-        tabId: freshestTabId,
-      });
-    }
-  }
-
-  // Suppress unused-locals lint until we wire epicById/taskById into a
-  // future per-reap-reason annotator. They are kept in scope because the
-  // reap pass would otherwise need to re-scan epics to recover the
-  // owning epic for a task-keyed dispatch.
-  void taskById;
-  void epicById;
-
-  return { launches, reaps };
+  return { launches };
 }
 
 /**
@@ -1003,20 +852,16 @@ export async function confirmRunning(
 
 /**
  * Run one reconcile + dispatch cycle. Pure-glue — drives the decision
- * from `reconcile`, fires reaps synchronously, then chains launches
- * one at a time through `confirmRunning` (preserving the fn-644
- * one-at-a-time stagger). Each launch flips its `key` into
- * `state.inFlight` BEFORE the await and removes it on resolution.
+ * from `reconcile`, then chains launches one at a time through
+ * `confirmRunning` (preserving the fn-644 one-at-a-time stagger). Each
+ * launch flips its `key` into `state.inFlight` BEFORE the await and
+ * removes it on resolution.
  *
  * Returns when every queued launch has resolved (success or failure)
  * OR the abort signal fired. The caller (worker `main()`) wakes again
  * on the next data_version pulse — a wake mid-cycle is coalesced via
  * the supervisor's `wakePending` flag (same shape as
  * `src/daemon.ts` keeps).
- *
- * `closeByTabId` is fire-and-forget (the ExecBackend contract); we
- * await it nevertheless so a flooded reap pass doesn't run unbounded
- * in parallel — the backend's noteLine warns drive forensic visibility.
  */
 export async function runReconcileCycle(
   decision: ReconcileDecision,
@@ -1024,29 +869,8 @@ export async function runReconcileCycle(
   liveDispatches: Map<DispatchKey, LiveDispatch>,
   shell: string,
   signal: AbortSignal,
-  deps: ConfirmRunningDeps & {
-    closeByTabId(session: string, tabId: string): Promise<void>;
-  },
+  deps: ConfirmRunningDeps,
 ): Promise<void> {
-  // Reaps first — they free up zellij tabs (and may make room for a
-  // new launch). closeByTabId is fire-and-forget but we await sequentially
-  // so the reconciler doesn't fan out unbounded concurrent zellij actions.
-  for (const reap of decision.reaps) {
-    if (signal.aborted) {
-      return;
-    }
-    if (reap.sessionId != null && reap.tabId != null) {
-      await deps.closeByTabId(reap.sessionId, reap.tabId);
-    } else {
-      // No resolved tab coordinates — the job either never received a
-      // BackendExecSnapshot or is pre-fn-668. Log and skip; the tab
-      // will linger until the user closes it manually.
-      console.error(
-        `[autopilot-worker] reap ${reap.key}: no tab coords, skipping closeByTabId`,
-      );
-    }
-    liveDispatches.delete(reap.key);
-  }
   // Launches: one-at-a-time. Each await covers the full confirm window
   // for that dispatch before the next launch even starts (~ up to
   // ceilingMs each, which IS the stagger).
@@ -1129,24 +953,11 @@ export interface AutopilotWorkerData {
   /** Poll cadence for the data_version wake loop (ms). */
   pollMs?: number;
   /**
-   * Whether the reconciler reaps a dispatch whose role is no longer
-   * needed (the `closeByName` path). Threaded in from
-   * `resolveConfig().autocloseWindows` so the worker doesn't read
+   * Zellij session name the in-worker `ExecBackend` lazily ensures
+   * before its first `new-tab`. Threaded in from
+   * `resolveConfig().zellijSession` so the worker doesn't read
    * `~/.config/keeper/config.yaml` itself — config I/O happens once on
-   * main, every worker receives the resolved value. Mirrors the
-   * `ReconcileConfig.autocloseWindows` field the pure `reconcile`
-   * function takes.
-   */
-  autocloseWindows?: boolean;
-  /**
-   * Zellij session name the (future) in-worker `ExecBackend` will lazily
-   * ensure before its first `new-tab`. Threaded in from
-   * `resolveConfig().zellijSession` for the same reason as
-   * `autocloseWindows`: keep config reads on main, hand workers the
-   * resolved values. Today the worker's `main()` is a no-op shell — the
-   * field is plumbed through workerData so the sibling reconcile-wiring
-   * task can build the backend inside the worker without re-reading
-   * config (and without needing main to round-trip every `launch`).
+   * main, every worker receives the resolved value.
    */
   zellijSession?: string;
 }
@@ -1384,9 +1195,6 @@ function main(): void {
     },
     session: data.zellijSession,
   });
-  const config: ReconcileConfig = {
-    autocloseWindows: data.autocloseWindows ?? false,
-  };
   // `$SHELL` for the launch argv (`buildLaunchArgv`). Resolved once.
   const shell = process.env.SHELL ?? "/bin/sh";
 
@@ -1394,11 +1202,8 @@ function main(): void {
   // worker's OWN read-only connection; the worker NEVER writes the DB —
   // a DispatchFailed is described to main via `postMessage` (main is the
   // sole writer of the synthetic event, mirroring the git-worker mint).
-  const deps: ConfirmRunningDeps & {
-    closeByTabId(session: string, tabId: string): Promise<void>;
-  } = {
+  const deps: ConfirmRunningDeps = {
     launch: (argv, name, cwd) => backend.launch(argv, name, cwd),
-    closeByTabId: (session, tabId) => backend.closeByTabId(session, tabId),
     emitDispatchFailed: (payload) => {
       parentPort?.postMessage({
         kind: "dispatch-failed",
@@ -1458,13 +1263,7 @@ function main(): void {
           return;
         }
         const snapshot = await loadReconcileSnapshot(db);
-        const decision = reconcile(
-          snapshot,
-          state,
-          liveDispatches,
-          config,
-          deps.now(),
-        );
+        const decision = reconcile(snapshot, state, deps.now());
         await runReconcileCycle(
           decision,
           state,
@@ -1487,8 +1286,8 @@ function main(): void {
 
   // Bind the unpause/boot kick now that `driveCycle` exists, then run one
   // cycle immediately. The boot cycle is a no-op for launches while paused
-  // (the safety default) but still computes reaps; the play-edge kick
-  // (above) is what dispatches ready work the instant the human unpauses.
+  // (the safety default); the play-edge kick (above) is what dispatches
+  // ready work the instant the human unpauses.
   requestCycle = () => {
     void driveCycle();
   };

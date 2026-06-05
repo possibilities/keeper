@@ -9,15 +9,9 @@
  *   2. Boot drain: `while (drain(db, BATCH) > 0) {}` — fold every unfolded event
  *      using the SAME code path as steady-state. After downtime this catches the
  *      projection up before the daemon goes live.
- *   3. Spawn TWELVE worker threads (all AFTER migrate + boot drain + seed sweep,
+ *   3. Spawn TEN worker threads (all AFTER migrate + boot drain + seed sweep,
  *      so their read-only `openDb` connections never race a missing/un-migrated
- *      DB and the exit-watcher's data_version diff sees a settled projection.
- *      Worker fleet as of fn-684 task .5: the legacy `backend-worker` poller
- *      (interval-driven `zellij action list-panes` tab resolver) is retired
- *      and replaced by the always-on zellij-events watcher + main-side
- *      `scanZellijEventsDir` ingestion, both feeding the existing
- *      `BackendExecSnapshot` synthetic event — same fold path, event-driven
- *      now instead of poll-driven):
+ *      DB and the exit-watcher's data_version diff sees a settled projection):
  *      - the wake worker — opens its own read-only connection, polls
  *        `PRAGMA data_version`, and posts a contentless `{ kind: "wake" }`
  *        whenever another connection commits.
@@ -51,30 +45,16 @@
  *        and posts `{ kind: "git-snapshot", ... }`. Main turns each into a
  *        synthetic `GitSnapshot` events row — the fourth producer-worker
  *        instance.
- *      - the zellij-events watcher worker (fn-684) — the always-on
- *        replacement for the retired `backend-worker` poller. Watches
- *        the keeper events dir with `@parcel/watcher` for plugin-written
- *        `<session>.ndjson` files (one per zellij session, append-only)
- *        and posts a contentless `{ kind: "zellij-events-changed" }`
- *        "go look" notification. Main re-runs `scanZellijEventsDir`,
- *        which tails each file from its persisted watermark, joins
- *        `(session, pane_id) -> job_id` via `readLiveJobsWithCoords`,
- *        and mints one synthetic `BackendExecSnapshot` event per
- *        resolved line through the EXACT same fold path the poller
- *        used — no reducer change, no schema change. Out-of-process
- *        producer carve-out: the data source is the zellij plugin (a
- *        different process), not a Bun postMessage worker — see
- *        CLAUDE.md "Worker contract".
  *   4. Steady state: every wake triggers a full drain loop. Wakes that arrive
  *      mid-drain coalesce into the next pass via a single "wake pending" flag —
  *      no event is missed (drain always re-reads from the cursor) and drain is
  *      never invoked re-entrantly. A `transcript-title` / `exit` message
  *      inserts the synthetic event then pumps a wake to fold it.
- *   5. SIGTERM: post `{ type: "shutdown" }` to ALL TWELVE workers, await their
+ *   5. SIGTERM: post `{ type: "shutdown" }` to ALL TEN workers, await their
  *      `close` events against a short deadline, terminate them, close the db,
  *      exit 0. This is the ONLY clean exit. The server worker releases its
- *      socket + lock, the transcript + plan + dead-letter + zellij-events
- *      workers unsubscribe their watchers, and the exit-watcher releases its
+ *      socket + lock, the transcript + plan + dead-letter workers unsubscribe
+ *      their watchers, and the exit-watcher releases its
  *      kqueue/pidfd fd — all inside their own shutdown handlers (those
  *      resources are process/thread-owned, so `terminate()` alone would leak
  *      them).
@@ -88,13 +68,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  statSync,
-} from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type {
   AutopilotWorkerData,
@@ -103,9 +77,7 @@ import type {
   DispatchFailedMessage,
   Verb,
 } from "./autopilot-worker";
-import { readLiveJobsWithCoords } from "./backend-worker";
 import {
-  atomicWriteFile,
   openDb,
   resolveClaudeProjectsRoot,
   resolveConfig,
@@ -113,9 +85,7 @@ import {
   resolveDeadLetterDir,
   resolvePlanRoots,
   resolveUsageRoot,
-  resolveZellijEventsDir,
   runPlanctlApprovalMigration,
-  type Stmts,
 } from "./db";
 import { parseDeadLetterLine } from "./dead-letter";
 import type {
@@ -164,17 +134,6 @@ import type {
   WakeMessage,
   WakeWorkerData,
 } from "./wake-worker";
-import {
-  parseZellijEventLine,
-  parseZellijWatermarks,
-  peekZellijEpoch,
-  serializeZellijWatermarks,
-  type ZellijWatermarkFile,
-} from "./zellij-events";
-import type {
-  ZellijEventsChangedMessage,
-  ZellijEventsWorkerData,
-} from "./zellij-events-worker";
 
 /** Grace period for the worker to exit on shutdown before we close the db anyway. */
 const WORKER_SHUTDOWN_DEADLINE_MS = 2000;
@@ -596,609 +555,6 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
 }
 
 /**
- * Cap how much of one `<session>.ndjson` file we'll read in one pass.
- * The plugin appends one ~200-byte line per pane/tab delta. Post-fn-706.2
- * it SELF-ROTATES the feed at a ~4 MiB threshold (truncate + fresh-epoch
- * header + full re-snapshot), so a session's live feed self-bounds well
- * under this cap — the consumer detects the rotation via a first-line
- * epoch peek and resets its watermark to byte 0. 16 MiB matches
- * `MAX_DEAD_LETTER_FILE_BYTES` and bounds the per-scan memory cost; it is
- * now a never-frozen safety net rather than the steady state. An oversized
- * file is TAIL-READ instead of skipped (fn-706.1): we seek to
- * `max(priorOffset, size - cap)`, discard the partial leading line to the
- * next `\n`, and parse complete lines only — so a noisy session degrades to
- * "tail-only" and never freezes forever. (Superseded the pre-fn-706
- * skip-and-hand-truncate path, which left the watermark frozen and silently
- * stopped minting `BackendExecSnapshot` for the whole session.) Still never
- * throws — bounded memory, one record lost at the resync seam, the rest of
- * the scan unaffected.
- *
- * Exported so a test can drive an oversize tail-read at a small
- * injected size without materializing a real 16 MiB feed.
- */
-export const MAX_ZELLIJ_EVENTS_FILE_BYTES = 16 * 1024 * 1024;
-
-// Env-gated tracing (epic fn-704 task .2). Mirrors the `KEEPER_TRACE_SERVER`
-// convention in `server-worker.ts`: read the flag ONCE at module load into a
-// `const`, gate AT THE CALL SITE so the increment never allocates when off,
-// and trace to `console.error` in an awk-parseable shape on a rolling window.
-// This is the MAIN side of `KEEPER_TRACE_ZELLIJ`: it counts actual
-// `BackendExecSnapshot` mints/sec inside `scanZellijEventsDir` — the real
-// `data_version`-bumping loop driver (the zellij-events worker has NO DB handle
-// by design, so the true bump is only observable here, not at the worker's
-// notification-post). Pairs with the worker-side notification counter: a high
-// notification rate with a LOW mint rate means the feed is noisy-but-harmless;
-// a high mint rate that tracks the tab-namer rename rate confirms the suspected
-// feed -> rename -> TabUpdate -> re-emit -> feed loop. ADDITIVE + fully gated —
-// touches no fold/projection logic, so re-fold determinism is untouched.
-const TRACE_ZELLIJ = process.env.KEEPER_TRACE_ZELLIJ === "1";
-
-/** Rolling trace window (ms). The counter flushes one rate line per window. */
-const TRACE_ZELLIJ_WINDOW_MS = 10_000;
-
-/**
- * Allocation-free rolling-window mint counter for `KEEPER_TRACE_ZELLIJ`. The
- * caller MUST gate `tick()` behind `TRACE_ZELLIJ`. Exception-free (integer
- * arithmetic + a `console.error` on a plain string), so it is safe inside the
- * scan loop which runs on main's drain path (no-self-heal: a throw here would
- * bounce the daemon).
- */
-const traceZellijMints = (() => {
-  let count = 0;
-  let windowStart = 0;
-  return {
-    tick(now: number): void {
-      if (windowStart === 0) windowStart = now;
-      count++;
-      if (now - windowStart >= TRACE_ZELLIJ_WINDOW_MS) {
-        console.error(
-          `[trace-zellij-mints] T=${now} count=${count} window_ms=${now - windowStart}`,
-        );
-        count = 0;
-        windowStart = now;
-      }
-    },
-  };
-})();
-
-/**
- * Hidden sidecar filename for the per-session watermark map. Lives at
- * `<events-dir>/.keeperd-watermarks.json` — a dot-prefixed sibling so
- * the plugin's `<session>.ndjson` glob (and the `.endsWith(".ndjson")`
- * filter in the scan loop below) never collides with it. Written
- * atomically (temp+rename) after each scan advances any session's tail.
- */
-const ZELLIJ_WATERMARK_BASENAME = ".keeperd-watermarks.json";
-
-/**
- * Scan the zellij events dir (fn-684 task .3) and mint one
- * `BackendExecSnapshot` synthetic event per new pane line whose
- * `(session, pane_id)` joins to a live job. This is the consumer half
- * of the plugin-feed pipeline: the Rust bridge plugin (task .1) appends
- * one NDJSON line per pane/tab delta to `<events-dir>/<session>.ndjson`;
- * this function tails each file from its persisted byte-offset
- * watermark, joins via the EXISTING {@link readLiveJobsWithCoords}, and
- * mints through the EXISTING {@link Stmts.insertEvent}. NO schema or
- * reducer change — the reducer's `foldBackendExecSnapshot` arm folds
- * the event identically whether the producer is the legacy poller or
- * this plugin path.
- *
- * Called once at boot (after the dead-letter import) and live on every
- * `{kind:"zellij-events-changed"}` message from the zellij-events
- * worker. Idempotent on re-call: the watermark sidecar advances every
- * file's tail, so a no-new-lines re-scan emits nothing. A daemon crash
- * mid-scan re-reads the same lines on next boot — the reducer's UPDATE
- * writes the same `(tab_id, tab_name)` values, so re-mint converges.
- *
- * Per-file isolation: every recoverable error (missing dir, missing
- * file mid-scan, read error, oversized file, malformed line, INSERT
- * throw) is swallowed to stderr — the import path MUST NOT throw out
- * of the scan, or a single bad file would wedge boot AND the live
- * message loop (both call this function).
- *
- * Epoch reset: the plugin stamps a fresh `epoch` nonce on every
- * `load()`. A line whose epoch differs from the persisted watermark
- * resets that session's offset to 0 — earlier `seq` values from a
- * prior epoch are not "already seen" after a reload. Without this,
- * a plugin reload would silently drop the first batch of post-reload
- * lines.
- *
- * No-clobber guard: the reducer's fold writes `tab_name = ?` (NOT
- * COALESCE), so a snapshot with an empty `tab_name` would clobber a
- * previously-known name. We skip lines with `tab_name === ""` — the
- * value-preserving fold for tab name is "skip the line", not "fold
- * the empty string".
- *
- * Cross-session pane-id collision: pane ids are unique only within a
- * zellij session. The join MUST stay `(session, pane_id)`, never just
- * `pane_id` — confirmed via the `readLiveJobsWithCoords` row shape
- * (carries `backend_exec_session_id` alongside `backend_exec_pane_id`).
- *
- * **Mint-seam dedup (fn-709):** a feed line whose effective
- * `(tab_id, tab_name)` already equals the job's last-known projection
- * state is skipped before the INSERT — the bulk of feed lines are exact
- * consecutive repeats that fold to no-ops, yet each otherwise pays the
- * full realtime pipeline (writer-lock INSERT → `data_version` bump →
- * wake worker → drain → fold → kick server-worker). The
- * per-scan `liveJobs` map seeds each job's last-known tab tuple from the
- * `backend_exec_tab_id` / `backend_exec_tab_name` columns
- * `readLiveJobsWithCoords` now carries, and the gate's predicate MIRRORS
- * the fold's COALESCE(`tab_id`)/hard-assign(`tab_name`) asymmetry so a
- * `tab_name` change riding a null `tab_id` still mints. Last-known is
- * advanced ONLY after a successful `insertEvent.run()` (inside the
- * `try`), so a failed INSERT re-attempts rather than deduping against a
- * never-folded tuple. The fold stays idempotent — this is an
- * optimization that keeps no-op mints off the wire, not a replacement
- * for the fold's convergence (cross-scan fold-lag may re-mint a boundary
- * dupe; the projection still converges).
- *
- * Exported so the test surface can drive it directly without spawning
- * the worker — mirrors `scanDeadLetterDir` next door.
- *
- * `maxBytes` is the per-file tail-read cap (fn-706.1), defaulting to
- * the production {@link MAX_ZELLIJ_EVENTS_FILE_BYTES}. It is a pure
- * function argument — NOT an env read (the scan stays env/wallclock-free
- * except the synthetic-event `ts`, per the event-sourcing invariants) —
- * so a test can drive the oversize tail-read path with a tiny injected
- * cap instead of materializing a real 16 MiB feed.
- */
-export function scanZellijEventsDir(
-  db: Database,
-  stmts: Stmts,
-  dir: string,
-  maxBytes: number = MAX_ZELLIJ_EVENTS_FILE_BYTES,
-): void {
-  // Missing-dir tolerance: task .4's daemon boot `mkdir` covers the
-  // production case, but a fresh test harness may not have created
-  // the dir. Returning early is the documented graceful-degradation
-  // path; the worker's existsSync guard mirrors this.
-  if (!existsSync(dir)) {
-    return;
-  }
-
-  // Load the per-session watermark sidecar. Missing / corrupt → empty
-  // map (tail from byte 0; re-mint converges on the projection side).
-  const watermarkPath = join(dir, ZELLIJ_WATERMARK_BASENAME);
-  let watermarks: ZellijWatermarkFile = {};
-  if (existsSync(watermarkPath)) {
-    try {
-      watermarks = parseZellijWatermarks(readFileSync(watermarkPath, "utf8"));
-    } catch (err) {
-      console.error(
-        `[keeperd] zellij-events watermark read failed for ${watermarkPath}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      watermarks = {};
-    }
-  }
-
-  let names: string[];
-  try {
-    names = readdirSync(dir);
-  } catch (err) {
-    console.error(
-      `[keeperd] zellij-events scan failed to readdir ${dir}: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return;
-  }
-
-  // Build the live-job join once per scan. The map is keyed by
-  // `${session}::${pane_id}` so the inner per-line lookup is O(1) and
-  // bursts of pane lines against the same session reuse the same
-  // projection read. The map is also stable for the whole scan — a
-  // session that ends mid-scan still resolves to its last known
-  // job_id (last-known sticks; the next scan's read will reflect the
-  // ended state via the projection's `state NOT IN (...)` filter
-  // inside `readLiveJobsWithCoords`).
-  //
-  // Each value also carries the job's CURRENT projected tab coordinates
-  // (fn-709) so the mint loop can dedup a feed line whose effective
-  // `(tab_id, tab_name)` already equals the projection — and so a real
-  // in-scan transition updates last-known after its mint, deduping the
-  // immediate consecutive repeats that dominate the feed. `tabId` is
-  // normalized to a string (`String(... ?? "")`); a NULL projected
-  // `tab_name` (job never folded a snapshot) becomes `null` here and is
-  // treated as "no last-known" so the first mint is always allowed.
-  let liveJobs: Map<
-    string,
-    { job_id: string; tabId: string; tabName: string | null }
-  >;
-  try {
-    const rows = readLiveJobsWithCoords(db);
-    liveJobs = new Map(
-      rows.map((r) => [
-        `${r.backend_exec_session_id}::${r.backend_exec_pane_id}`,
-        {
-          job_id: r.job_id,
-          tabId: String(r.backend_exec_tab_id ?? ""),
-          tabName: r.backend_exec_tab_name,
-        },
-      ]),
-    );
-  } catch (err) {
-    console.error(
-      `[keeperd] zellij-events scan failed to read live jobs: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return;
-  }
-
-  let anyWatermarkAdvanced = false;
-
-  for (const name of names) {
-    if (!name.endsWith(".ndjson")) {
-      // The plugin writes per-session `<session>.ndjson` files. Ignore
-      // the watermark sidecar (`.keeperd-watermarks.json` — dot-prefixed,
-      // doesn't end in `.ndjson` anyway) and anything else that might
-      // land in the dir.
-      continue;
-    }
-    const full = join(dir, name);
-    let st: ReturnType<typeof statSync>;
-    try {
-      st = statSync(full);
-    } catch (err) {
-      // Read-vs-delete race (the file vanished between readdir and
-      // stat): skip-and-log without throwing.
-      console.error(
-        `[keeperd] zellij-events scan stat failed for ${full}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      continue;
-    }
-    if (!st.isFile()) {
-      continue;
-    }
-    // The session key is the basename without the `.ndjson` suffix —
-    // matches the plugin's `/host/<session>.ndjson` naming.
-    const sessionKey = name.slice(0, -".ndjson".length);
-    const prior = watermarks[sessionKey];
-    let priorOffset =
-      prior && prior.offset >= 0 && prior.offset <= st.size ? prior.offset : 0;
-
-    let buf: Buffer;
-    try {
-      buf = readFileSync(full);
-    } catch (err) {
-      console.error(
-        `[keeperd] zellij-events scan read failed for ${full}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      continue;
-    }
-
-    // Rotation detection via a first-line epoch peek (fn-706.2). The bridge
-    // rotates its own feed at the ~4 MiB threshold by truncating to byte 0
-    // and writing a fresh-epoch `plugin_start` header + full re-snapshot. The
-    // re-snapshot can grow the file PAST `priorOffset`, so the `size <
-    // priorOffset` shrink guard (the `prior.offset <= st.size` clamp above)
-    // misses it — the behind-consumer hole. Peek the FIRST line's epoch each
-    // scan: if it differs from the persisted watermark epoch, the file was
-    // rotated (or reloaded), so reset the offset to 0 and re-read from byte 0
-    // (consuming the header + snapshot). Robust even when `size >=
-    // priorOffset`. The shrink guard is retained above as a secondary signal.
-    //
-    // `peekZellijEpoch` (NOT `parseZellijEventLine`) lifts the epoch even from
-    // the `plugin_start` sentinel header the rotation writes — the per-line
-    // parser nulls the sentinel, so it cannot serve this peek.
-    if (prior) {
-      const firstNl = buf.indexOf(0x0a); // `\n`
-      const firstLine =
-        firstNl === -1
-          ? buf.toString("utf8")
-          : buf.subarray(0, firstNl).toString("utf8");
-      const firstEpoch = peekZellijEpoch(firstLine);
-      if (firstEpoch !== null && firstEpoch !== prior.epoch) {
-        // Rotated (or reloaded) since the last scan — the file's first line
-        // carries a fresh epoch. Reset to byte 0 so we consume the new
-        // header + re-snapshot from the start.
-        priorOffset = 0;
-      }
-    }
-
-    if (st.size === priorOffset) {
-      // No new bytes since the last scan — nothing to do for this file.
-      continue;
-    }
-
-    // Tail-read cap (fn-706.1): an oversize feed is read from a bounded
-    // tail window, NOT skipped. The window base is
-    // `max(priorOffset, size - cap)` so a behind-consumer never reads
-    // more than `cap` bytes in one pass; a noisy session degrades to
-    // "tail-only" and the watermark keeps advancing (the pre-fn-706
-    // skip-and-log froze the watermark forever, stopping all
-    // `BackendExecSnapshot` mints for the session). When the base jumps
-    // PAST the prior offset we landed mid-line, so the leading partial
-    // bytes are discarded to the first `\n` below.
-    const tailBase = Math.max(priorOffset, st.size - maxBytes);
-
-    // Tail from the window base. `readFileSync` above materializes the
-    // WHOLE file unconditionally — `MAX_ZELLIJ_EVENTS_FILE_BYTES` bounds
-    // only the consumed tail window (`tailBase`), NOT the read itself.
-    // fn-706.2 rotation keeps real feeds well under the cap (~4 MiB), so
-    // the full-file read is not a memory concern in practice. We re-read
-    // the whole file (simpler than a streaming seek) and slice off
-    // everything before `tailBase`. The slice MUST be done
-    // on the Buffer (byte-indexed) before decoding to UTF-8 — slicing
-    // a JS string by the offset would mix byte offsets (the write side
-    // advances via `Buffer.byteLength`, the file's `st.size` is in
-    // bytes) with UTF-16 code-unit offsets and over-shoot the moment
-    // any consumed line contains a multi-byte character (e.g. an emoji
-    // in a tab name), silently truncating the next line and persisting
-    // the corrupt offset. If the file shrank (epoch-less truncation —
-    // not a pattern the plugin uses, but tolerated), the priorOffset>size
-    // guard above already reset to 0; we still detect a fresh epoch on
-    // the first new line to clear the persisted-epoch mismatch.
-    //
-    // Mid-line resync (fn-706.1): when `tailBase > priorOffset` we
-    // jumped past unconsumed bytes to honor the cap, so the window
-    // starts mid-record. Discard the leading partial line (bytes up to
-    // and including the first `\n`) and count those bytes as
-    // `discardedPartialBytes` — the new watermark accounts for them so
-    // the next scan resumes from the right absolute offset. One record
-    // is lost at the seam, which is safe: both consumers (tab-namer
-    // rename, autopilot reap) are last-writer-wins on per-pane facts
-    // and the latest line carries the current `(tab_id, tab_name)`.
-    let windowBuf = buf.subarray(tailBase);
-    let discardedPartialBytes = 0;
-    if (tailBase > priorOffset) {
-      const firstNl = windowBuf.indexOf(0x0a); // `\n`
-      if (firstNl === -1) {
-        // No newline in the entire tail window — the whole window is one
-        // incomplete record. Nothing complete to consume; defer the
-        // whole partial. Advance the watermark to the window base so we
-        // re-read this partial (and whatever completes it) next scan
-        // without re-reading the skipped-over prefix. The read-back guard
-        // only validates `offset`, so an empty carried-forward epoch is
-        // tolerated until a parseable line stamps the real one.
-        watermarks[sessionKey] = {
-          epoch: prior?.epoch ?? "",
-          offset: tailBase,
-        };
-        anyWatermarkAdvanced = true;
-        continue;
-      }
-      discardedPartialBytes = firstNl + 1; // include the `\n`
-      windowBuf = windowBuf.subarray(discardedPartialBytes);
-    }
-    const tail = windowBuf.toString("utf8");
-
-    // Forward-tail line walk. Split on `\n` and process every COMPLETE
-    // line (lines BEFORE the final `\n`). The last element of the
-    // split is either an empty string (file ends in `\n` — every line
-    // before it is complete) or a partial trailing line written
-    // mid-append; either way we leave it for the next scan by
-    // advancing the watermark only past the bytes we actually consumed.
-    const lines = tail.split("\n");
-    const trailingPartialBytes = Buffer.byteLength(
-      lines[lines.length - 1] ?? "",
-      "utf8",
-    );
-
-    // When the window jumped past the prior offset (an oversize tail-read),
-    // the persisted epoch is stale relative to the window content — we
-    // skipped over the bytes it described. Seed `sessionEpoch` from the
-    // FIRST successfully parsed line in the window instead, so a stale
-    // persisted epoch can't mis-trigger the reset path on line 0. We
-    // can't assume line 0 parses (it may be a `plugin_start` sentinel or
-    // garbage → `null`), so seeding happens lazily at the first non-null
-    // parse below, gated by `needsEpochSeed`.
-    const windowJumped = tailBase > priorOffset;
-    let sessionEpoch = windowJumped ? null : (prior?.epoch ?? null);
-    let needsEpochSeed = windowJumped;
-    let consumedBytesInTail = 0;
-    let pendingEpochReset = false;
-
-    // Process all elements EXCEPT the final one (which is either empty
-    // — a clean line break — or a partial trailing line not yet
-    // terminated by `\n`; in both cases it's not complete).
-    for (let i = 0; i < lines.length - 1; i++) {
-      const line = lines[i] ?? "";
-      // Advance the per-line consumption counter regardless of parse
-      // outcome — a malformed line still consumed those bytes, and the
-      // next scan must not re-read them.
-      consumedBytesInTail += Buffer.byteLength(line, "utf8") + 1; // +1 for the `\n`
-
-      const record = parseZellijEventLine(line);
-      if (record === null) {
-        continue;
-      }
-
-      // Seed the epoch from the first parsed line in a jumped window so
-      // the reset detection below doesn't mis-fire against a stale
-      // persisted epoch.
-      if (needsEpochSeed) {
-        sessionEpoch = record.epoch;
-        needsEpochSeed = false;
-      }
-
-      // Epoch reset detection: an incoming epoch that differs from the
-      // persisted one means a plugin reload. The reload restarts `seq`
-      // at 0 and may overlap byte offsets with the prior epoch's tail
-      // (zellij plugin reloads recreate the WASI sandbox; the append-
-      // only open at the same path means the old bytes are still
-      // there, but new bytes start with a fresh epoch). We detect the
-      // reset at the FIRST line whose epoch differs from prior; for
-      // the rest of this scan we treat the new epoch as authoritative
-      // and consume normally. The persisted watermark below will
-      // record the NEW epoch + the post-scan offset.
-      if (sessionEpoch !== null && record.epoch !== sessionEpoch) {
-        pendingEpochReset = true;
-      }
-      sessionEpoch = record.epoch;
-
-      // No-clobber: skip lines with an empty `tab_name`. The reducer
-      // writes `tab_name = ?` (non-COALESCE), so an empty value here
-      // would erase a previously-resolved name on the matching jobs
-      // row.
-      if (record.tab_name === "") {
-        continue;
-      }
-
-      // Cross-session-isolated join: `(session, pane_id)`. A pane id
-      // is unique only within a session; conflating across sessions
-      // would mint a snapshot against the wrong job.
-      const liveJob = liveJobs.get(`${record.session}::${record.pane_id}`);
-      if (liveJob === undefined) {
-        // No live job claims this pane right now. Acceptable — the
-        // SessionStart that binds the job's `(session, pane_id)` may
-        // not have landed yet (race), or this pane belongs to an
-        // unrelated zellij window. Skip without minting; the next
-        // pane delta will mint if the job has landed by then.
-        continue;
-      }
-      const jobId = liveJob.job_id;
-
-      // Mint-seam dedup (fn-709): skip the INSERT when this line's
-      // effective `(tab_id, tab_name)` already equals the job's
-      // last-known projection state. The bulk of feed lines are exact
-      // consecutive repeats that fold to no-ops, yet each still pays the
-      // full realtime pipeline (writer-lock INSERT → `data_version` bump
-      // → wake worker → drain → fold → kick server/tab-namer). The
-      // predicate MIRRORS `foldBackendExecSnapshot`'s COALESCE/hard-assign
-      // asymmetry (reducer.ts): the fold writes
-      // `tab_id = COALESCE(?, prior)` but `tab_name = ?` (non-COALESCE),
-      // so the line's EFFECTIVE tab_id is `record.tab_id ?? lastKnown`
-      // while tab_name is the line's own value. Compare is AND-of-both-
-      // axes — never name-only (would drop a name change riding a null
-      // tab_id) and never raw-tab_id-only. A NULL last-known tab_name
-      // (job never folded a snapshot) is "no last-known" → never
-      // suppress, so the first mint always lands.
-      const effectiveTabId = String(record.tab_id ?? "") || liveJob.tabId;
-      if (
-        liveJob.tabName !== null &&
-        record.tab_name === liveJob.tabName &&
-        effectiveTabId === liveJob.tabId
-      ) {
-        continue;
-      }
-
-      // Mint the synthetic `BackendExecSnapshot` event verbatim. This
-      // scan loop is the SOLE `BackendExecSnapshot` mint site (the
-      // legacy poller's `backend-worker` message handler is retired);
-      // the reducer's `foldBackendExecSnapshot` arm folds this and the
-      // projection update is idempotent on any re-mint that slips past
-      // the dedup gate above (e.g. cross-scan fold-lag).
-      try {
-        stmts.insertEvent.run({
-          $ts: Date.now() / 1000,
-          $session_id: jobId,
-          $pid: null,
-          $hook_event: "BackendExecSnapshot",
-          $event_type: "backend_exec_snapshot",
-          $tool_name: null,
-          $matcher: null,
-          $cwd: null,
-          $permission_mode: null,
-          $agent_id: null,
-          $agent_type: null,
-          $stop_hook_active: null,
-          $data: JSON.stringify({
-            tab_id: record.tab_id,
-            tab_name: record.tab_name,
-          }),
-          $subagent_agent_id: null,
-          $spawn_name: null,
-          $start_time: null,
-          $slash_command: null,
-          $skill_name: null,
-          $planctl_op: null,
-          $planctl_target: null,
-          $planctl_epic_id: null,
-          $planctl_task_id: null,
-          $planctl_subject_present: null,
-          $tool_use_id: null,
-          $config_dir: null,
-          $planctl_queue_jump: null,
-          $bash_mutation_kind: null,
-          $bash_mutation_targets: null,
-          $planctl_files: null,
-          $backend_exec_type: null,
-          $backend_exec_session_id: null,
-          $backend_exec_pane_id: null,
-          $background_task_id: null,
-        });
-        // fn-709: advance in-scan last-known to the just-minted effective
-        // tuple — ONLY here, inside the `try` AFTER `insertEvent.run()`
-        // returns. This catches the dominant in-scan consecutive-dupe case
-        // independent of the fold (the next equal line on this pane in the
-        // same scan now dedups). A failed INSERT (the catch below) leaves
-        // last-known UNCHANGED so the next equal line re-attempts the mint
-        // rather than deduping against a tuple that never folded.
-        liveJob.tabName = record.tab_name;
-        liveJob.tabId = effectiveTabId;
-        // fn-704.2 trace: count REAL mints (post-INSERT = the actual
-        // `data_version` bump) — the loop driver. Inside the `try` so a failed
-        // INSERT (counted in the catch's skip) is not tallied as a bump.
-        // Call-site gated so the counter is inert when the flag is off.
-        if (TRACE_ZELLIJ) traceZellijMints.tick(Date.now());
-      } catch (err) {
-        // A failed INSERT must not wedge the rest of the scan. The
-        // next watcher message will retry (the watermark still
-        // advances past this line — re-mint is idempotent on the
-        // projection but a partial-fail row already landed, so we
-        // do NOT want to re-attempt it; skipping forward is correct).
-        console.error(
-          `[keeperd] zellij-events INSERT failed for ${full} session=${record.session} pane=${record.pane_id}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
-    }
-    // If the file ended cleanly (no `\n` partial) the trailing partial
-    // count is 0 and the final element of the split was empty.
-    void trailingPartialBytes;
-
-    // Watermark advance: only update if we consumed any complete lines
-    // this pass. Even a no-parseable-records pass that consumed bytes
-    // counts — we don't want to re-scan the same garbage on every
-    // watcher event.
-    if (consumedBytesInTail > 0 || pendingEpochReset) {
-      // The watermark is the absolute byte position we've consumed up
-      // to, measured from the ACTUAL window base — not `priorOffset`.
-      // `tailBase` honors the oversize cap (== priorOffset on a normal
-      // in-cap scan), `discardedPartialBytes` accounts for the mid-line
-      // leading partial we dropped on a jumped window (0 on a normal
-      // scan), and `consumedBytesInTail` is the complete-line bytes
-      // walked this pass. Subsequent scans tail forward from here; the
-      // plugin's append-only open keeps writing at the file's tail
-      // across reloads (zellij#5177-style double-load is handled by the
-      // plugin's append-create mode).
-      const newOffset = tailBase + discardedPartialBytes + consumedBytesInTail;
-      const newEpoch = sessionEpoch ?? prior?.epoch ?? "";
-      if (newEpoch.length > 0) {
-        watermarks[sessionKey] = { epoch: newEpoch, offset: newOffset };
-        anyWatermarkAdvanced = true;
-      }
-    }
-  }
-
-  // Persist the watermark sidecar AFTER all files have been tailed —
-  // one atomic write per scan (not one per file). On any throw above
-  // we still hit this point because each per-file path swallows its
-  // own errors; in the truly catastrophic case the function returns
-  // early before we get here, and the next scan re-tails from the
-  // same prior offsets.
-  if (anyWatermarkAdvanced) {
-    try {
-      atomicWriteFile(watermarkPath, serializeZellijWatermarks(watermarks));
-    } catch (err) {
-      console.error(
-        `[keeperd] zellij-events watermark persist failed at ${watermarkPath}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-  }
-}
-
-/**
  * The full `events` table column list, in CREATE_EVENTS order. Used by
  * {@link recoverOneDeadLetter} to drive a dynamic INSERT against the
  * row's stored `bindings` blob: only the columns the dead-letter record
@@ -1402,8 +758,8 @@ export function recoverOneDeadLetter(db: Database): string | null {
  * Force the native `@parcel/watcher` N-API addon to dlopen ONCE on the main
  * thread before any watcher worker spawns (fn-701 task .3).
  *
- * The bug: the daemon spawns six `@parcel/watcher`-loading workers (transcript,
- * plan, git, usage, dead-letter, zellij-events) back-to-back. Each does its own
+ * The bug: the daemon spawns five `@parcel/watcher`-loading workers (transcript,
+ * plan, git, usage, dead-letter) back-to-back. Each does its own
  * `import("@parcel/watcher")` — and if those FIRST dlopens of the addon race
  * concurrently, Bun crashes the workers with `symbol 'napi_register_module_v1'
  * not found in native module` (residual Bun #15942 many-worker-spawn fragility;
@@ -1595,51 +951,6 @@ function runDaemon(): void {
   const deadLetterDir = resolveDeadLetterDir();
   scanDeadLetterDir(db, deadLetterDir);
 
-  // Step 2c — ensure the zellij-events dir exists on boot (fn-684 task .4).
-  // The bridge plugin is loaded GLOBALLY into every zellij session by the
-  // human's dotfiles `~/.config/zellij/config.kdl` `load_plugins` block,
-  // which pins the plugin's `cwd` (= its WASI `/host` mount) to this
-  // directory. zellij silently refuses to load a plugin whose `cwd` is
-  // missing, so the dir MUST exist before ANY session's plugin loads.
-  // The mkdir is the FIRST thing we do for the zellij-events pipeline so
-  // it runs before BOTH the boot scan below AND the live watcher worker
-  // spawned downstream. `recursive: true` makes it idempotent across
-  // daemon restarts (already-exists is a no-op); a failure is logged
-  // non-fatally — a broken events dir leaves the feed dormant rather
-  // than wedging the daemon.
-  const zellijEventsDir = resolveZellijEventsDir();
-  try {
-    mkdirSync(zellijEventsDir, { recursive: true });
-  } catch (err) {
-    console.error(
-      `[keeperd] failed to ensure zellij events dir ${zellijEventsDir}: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  }
-
-  // Step 2c.1 — zellij-events boot import (fn-684 task .3). Read every
-  // `<session>.ndjson` the bridge plugin wrote during downtime / since
-  // the last daemon run, tail each from its persisted byte-offset
-  // watermark, and mint one `BackendExecSnapshot` synthetic event per
-  // new pane line whose `(session, pane_id)` joins to a live job.
-  // Always-on as of fn-684 task .5 — the legacy `backend-worker`
-  // poller is retired; the plugin feed is now the sole producer of
-  // `jobs.backend_exec_tab_{id,name}`. MUST run before the
-  // zellij-events worker spawns: a watcher notification on a
-  // half-imported set of files would re-fold work we already have on
-  // disk — harmless but wasteful. The watermark sidecar makes the
-  // boot scan idempotent across restarts.
-  try {
-    scanZellijEventsDir(db, stmts, zellijEventsDir);
-  } catch (err) {
-    console.error(
-      `[keeperd] zellij-events boot scan threw (non-fatal): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  }
-
   // Coalescing flag: every wake sets it; the run loop resets it before each
   // drain pass. A wake arriving mid-drain leaves the flag set, so the loop runs
   // one more pass. No event is ever missed because drain re-reads from the
@@ -1719,8 +1030,8 @@ function runDaemon(): void {
   }
 
   // Step 2d — pre-warm the native @parcel/watcher addon ON MAIN before ANY
-  // worker spawns (fn-701 task .3). Six of the workers below
-  // (transcript / plan / git / usage / dead-letter / zellij-events) each run
+  // worker spawns (fn-701 task .3). Five of the workers below
+  // (transcript / plan / git / usage / dead-letter) each run
   // their own `import("@parcel/watcher")`; spawned back-to-back, their FIRST
   // dlopens race and crash with `napi_register_module_v1 not found` (residual
   // Bun #15942). A synchronous main-thread require forces a single serialized
@@ -2725,19 +2036,8 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
-  // (fn-684 task .5) The legacy backend-exec tab-resolver worker
-  // (fn-668 / schema v48) lived here and shelled
-  // `zellij action list-panes -a -j` once per tick per distinct session.
-  // It is retired in favor of the always-on zellij-events watcher worker
-  // (spawned just below) + main-side `scanZellijEventsDir` pipeline,
-  // which feeds the EXACT same `BackendExecSnapshot` synthetic event
-  // through the same reducer fold — event-driven now instead of
-  // poll-driven. Rollback: `git revert` the fn-684 task .5 commit
-  // restores this spawn block and the worker's body in
-  // `src/backend-worker.ts`.
-
   // Spawn the dead-letter worker (fn-643 task .3) in the SAME post-migration
-  // window — the seventh worker thread (and sixth file-watcher producer
+  // window — the eighth worker thread (and fifth file-watcher producer
   // instance). It watches the dead-letters dir for changes and posts a
   // contentless `{kind:"dead-letter-changed"}` message. The worker holds NO
   // DB handle — main is the sole DB writer here, just as it is for the
@@ -2801,87 +2101,6 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
-  // Spawn the zellij-events watcher worker (fn-684 task .3) — the
-  // TWELFTH worker thread (and EIGHTH `@parcel/watcher` producer
-  // instance). It watches the zellij events dir for changes and posts a
-  // contentless `{kind:"zellij-events-changed"}` message. The worker
-  // holds NO DB handle — main is the sole DB writer here, just as it
-  // is for the event log and the dead-letters table; on each worker
-  // message main re-runs `scanZellijEventsDir`, which tails each
-  // `<session>.ndjson` from its persisted byte-offset watermark and
-  // mints one `BackendExecSnapshot` synthetic event per new pane line
-  // whose `(session, pane_id)` joins to a live job (no reducer or
-  // schema change — same fold path the retired poller used).
-  //
-  // Always-on as of fn-684 task .5: the legacy `backend-worker`
-  // poller (`zellij action list-panes -a -j` per tick) is retired
-  // and removed. The plugin feed is now the sole producer of
-  // `jobs.backend_exec_tab_{id,name}`; rollback to the poller is a
-  // single `git revert` of the fn-684 task .5 commit.
-  //
-  // The boot scan above already imported every pre-existing file's
-  // post-watermark tail; this live path covers lines the plugin
-  // appends AFTER the daemon comes up. The worker spawns AFTER the
-  // boot import so the file state is settled before any live
-  // notification arrives — there is no race where a live message
-  // could fire against a half-imported boot state.
-  const zellijEventsWorker = new Worker(
-    new URL("./zellij-events-worker.ts", import.meta.url).href,
-    {
-      workerData: { dir: zellijEventsDir } satisfies ZellijEventsWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
-
-  // Main owns the actual scan + event mint: a worker
-  // `zellij-events-changed` message triggers a fresh
-  // `scanZellijEventsDir` against the on-disk dir (treating the
-  // watcher event as "go look", never as the data). The scan is
-  // idempotent (watermark sidecar advances per file), so a burst of
-  // watcher events collapses into the same converged tail. Pumps a
-  // wake after any mint so the reducer folds the new
-  // `BackendExecSnapshot` rows into `jobs.backend_exec_tab_*`
-  // without waiting for the wake worker's `data_version` poll.
-  zellijEventsWorker.onmessage = (
-    ev: MessageEvent<ZellijEventsChangedMessage | undefined>,
-  ): void => {
-    const msg = ev.data;
-    if (!msg || msg.kind !== "zellij-events-changed") {
-      return;
-    }
-    try {
-      scanZellijEventsDir(db, stmts, zellijEventsDir);
-    } catch (err) {
-      // Defense-in-depth: scanZellijEventsDir's design contract is
-      // "never throw out of the scan", but an unexpected internal
-      // throw must NOT crash the daemon. Log and continue — the
-      // next watcher event will retry the import.
-      console.error(
-        `[keeperd] zellij-events live import threw (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-    // Pump a wake so the synthetic events fold into the projection
-    // promptly; without this the reducer waits up to one wake-worker
-    // poll interval before folding the new rows.
-    wakePending = true;
-    pumpWakes();
-  };
-
-  // Same crash policy as the other workers: any thread failure →
-  // fatalExit.
-  zellijEventsWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] zellij-events worker error:", err.message ?? err);
-    fatalExit();
-  };
-
-  // Same crash-via-`close` gap: a zellij-events-worker `process.exit(1)`
-  // fires `close`, not `onerror`. `!shuttingDown` makes it inert on
-  // clean shutdown.
-  zellijEventsWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
-
   // Spawn the autopilot reconciler worker (fn-661 task .4) — the eighth
   // worker thread. It runs the level-triggered dispatch reconcile loop
   // server-side: data_version wake → desired-vs-observed verdict →
@@ -2898,10 +2117,10 @@ function runDaemon(): void {
   // The flag flips ONLY via the `set_autopilot_paused` RPC → bridge →
   // main → `{type:"set-paused"}` relay above.
   //
-  // Config (`autocloseWindows` / `zellijSession`) is read here on main
-  // and threaded into workerData so the worker doesn't open
-  // `~/.config/keeper/config.yaml` itself — every config I/O lives on
-  // main, every worker receives the resolved values.
+  // Config (`zellijSession`) is read here on main and threaded into
+  // workerData so the worker doesn't open `~/.config/keeper/config.yaml`
+  // itself — every config I/O lives on main, every worker receives the
+  // resolved values.
   const apConfig = resolveConfig();
   const autopilotWorkerInstance = new Worker(
     new URL("./autopilot-worker.ts", import.meta.url).href,
@@ -2909,7 +2128,6 @@ function runDaemon(): void {
       workerData: {
         dbPath,
         paused: autopilotPaused,
-        autocloseWindows: apConfig.autocloseWindows ?? false,
         zellijSession: apConfig.zellijSession,
       } satisfies AutopilotWorkerData,
     } as WorkerOptions & { workerData: unknown },
@@ -3303,13 +2521,10 @@ function runDaemon(): void {
     restoreWorker.postMessage({
       type: "shutdown",
     } satisfies ShutdownMessage);
-    zellijEventsWorker.postMessage({
-      type: "shutdown",
-    } satisfies ShutdownMessage);
 
-    // Bun surfaces worker exit via the "close" event. Await ALL ELEVEN
+    // Bun surfaces worker exit via the "close" event. Await ALL TEN
     // workers' close (the server worker releases its socket + lock, the
-    // transcript + plan + usage + dead-letter + zellij-events workers
+    // transcript + plan + usage + dead-letter workers
     // unsubscribe their watchers, the exit-watcher releases its
     // kqueue/pidfd fd, the autopilot worker aborts its in-flight
     // confirm, and the restore worker closes its read-only DB connection
@@ -3332,7 +2547,6 @@ function runDaemon(): void {
       exited(deadLetterWorker),
       exited(autopilotWorkerInstance),
       exited(restoreWorker),
-      exited(zellijEventsWorker),
     ];
     await Promise.race([
       Promise.all(exitWaits),
@@ -3386,11 +2600,6 @@ function runDaemon(): void {
     }
     try {
       restoreWorker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      zellijEventsWorker.terminate();
     } catch {
       // best-effort if it already exited
     }

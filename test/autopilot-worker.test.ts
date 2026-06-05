@@ -12,8 +12,6 @@
  *   - Dedup suppression: occupying job (working/stopped) / open
  *     dispatch_failures row / in-flight set all block re-dispatch.
  *   - No-op fast path: nothing ready → empty decision.
- *   - Reap path: autoclose flag on + role discharged → closeByName
- *     fires for the live dispatch.
  *   - `git_status` fed to computeReadiness (predicate 6.5 fires) —
  *     a dirty project_dir on a `done` close row blocks with
  *     `git-uncommitted` and stops the dispatch.
@@ -26,7 +24,7 @@
  * No real worker spawn anywhere. The `isMainThread` guard in the
  * worker module makes a plain `import` inert; we drive the pure
  * `reconcile` / `confirmRunning` / `runReconcileCycle` symbols
- * directly with fake `launch` / `findJob` / `now` / `sleep` / `closeByName`.
+ * directly with fake `launch` / `findJob` / `now` / `sleep`.
  */
 
 import { expect, test } from "bun:test";
@@ -42,7 +40,6 @@ import {
   isOccupyingJob,
   type LaunchResult,
   type LiveDispatch,
-  type ReconcileConfig,
   type ReconcileSnapshot,
   type ReconcileState,
   reconcile,
@@ -146,9 +143,6 @@ function makeState(overrides: Partial<ReconcileState> = {}): ReconcileState {
   };
 }
 
-const NO_AUTOCLOSE: ReconcileConfig = { autocloseWindows: false };
-const AUTOCLOSE: ReconcileConfig = { autocloseWindows: true };
-
 // A simple deps factory that records all interactions.
 interface FakeDepsLog {
   launches: Array<{ argv: string[]; name: string; cwd: string }>;
@@ -156,7 +150,6 @@ interface FakeDepsLog {
   dispatchedEmissions: DispatchedPayload[];
   findJobCalls: Array<{ verb: string; id: string; watermark: number }>;
   maxEventIdCalls: number;
-  closeByTabIdCalls: Array<{ session: string; tabId: string }>;
 }
 
 interface FakeDepsOptions {
@@ -183,9 +176,7 @@ interface FakeDepsOptions {
 }
 
 function makeFakeDeps(opts: FakeDepsOptions = {}): {
-  deps: ConfirmRunningDeps & {
-    closeByTabId(session: string, tabId: string): Promise<void>;
-  };
+  deps: ConfirmRunningDeps;
   log: FakeDepsLog;
   advanceMaxEventId(n: number): void;
   setJobByKey(verb: string, id: string, job: FoundJob): void;
@@ -196,7 +187,6 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     dispatchedEmissions: [],
     findJobCalls: [],
     maxEventIdCalls: 0,
-    closeByTabIdCalls: [],
   };
   let maxEventId = opts.maxEventId ?? 100;
   const jobsByKey = new Map<string, FoundJob>(opts.jobsByKey ?? []);
@@ -208,9 +198,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
           return () => v;
         })();
 
-  const deps: ConfirmRunningDeps & {
-    closeByTabId(session: string, tabId: string): Promise<void>;
-  } = {
+  const deps: ConfirmRunningDeps = {
     async launch(argv, name, cwd) {
       log.launches.push({ argv: [...argv], name, cwd });
       if (opts.launch) {
@@ -255,9 +243,6 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
     pollIntervalMs: opts.pollIntervalMs ?? 5,
     ceilingMs: opts.ceilingMs ?? 50,
-    async closeByTabId(session, tabId) {
-      log.closeByTabIdCalls.push({ session, tabId });
-    },
     ...(opts.checkWorkPlugin ? { checkWorkPlugin: opts.checkWorkPlugin } : {}),
   };
 
@@ -410,9 +395,8 @@ test("isOccupyingJob: plan_verb mismatch (approve vs work share plan_ref) → no
 test("reconcile: empty snapshot → empty decision (no-op fast path)", () => {
   const snap = makeSnapshot({});
   const state = makeState();
-  const decision = reconcile(snap, state, new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, state, 0);
   expect(decision.launches).toEqual([]);
-  expect(decision.reaps).toEqual([]);
 });
 
 test("reconcile: paused state suppresses every launch (boots-paused safety)", () => {
@@ -421,7 +405,7 @@ test("reconcile: paused state suppresses every launch (boots-paused safety)", ()
   });
   const snap = makeSnapshot({ epics: [epic] });
   const state = makeState({ paused: true });
-  const decision = reconcile(snap, state, new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, state, 0);
   expect(decision.launches).toEqual([]);
 });
 
@@ -434,7 +418,7 @@ test("reconcile: ready task → planned `work` launch with correct argv shape", 
     tasks: [makeTask({ task_id: "fn-1-foo.1" })],
   });
   const snap = makeSnapshot({ epics: [epic] });
-  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches.length).toBe(1);
   const plan = decision.launches[0];
   expect(plan).not.toBeUndefined();
@@ -463,7 +447,7 @@ test("reconcile: ready close row → planned `close` launch", () => {
   // predicate set for the close row reflects this. Force the case by
   // marking status="open" and the task `completed`-ready.
   const snap = makeSnapshot({ epics: [epic] });
-  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, makeState(), 0);
   // Close row should plan a `close` launch.
   const closePlan = decision.launches.find((p) => p.verb === "close");
   expect(closePlan).not.toBeUndefined();
@@ -477,7 +461,7 @@ test("reconcile: task target_repo override wins over epic project_dir for cwd", 
     tasks: [makeTask({ task_id: "fn-1-foo.1", target_repo: "/repo-task" })],
   });
   const snap = makeSnapshot({ epics: [epic] });
-  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches[0]?.cwd).toBe("/repo-task");
   // Tier null → no plugin-dir flag.
   expect(decision.launches[0]?.workerCommand).not.toContain("--plugin-dir");
@@ -488,7 +472,7 @@ test("reconcile: tier on a `work` row threads --plugin-dir into the command", ()
     tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max" })],
   });
   const snap = makeSnapshot({ epics: [epic] });
-  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches[0]?.tier).toBe("max");
   expect(decision.launches[0]?.workerCommand).toContain("/work-plugins/max");
 });
@@ -503,7 +487,7 @@ test("reconcile dedup: in-flight set blocks re-dispatch", () => {
   });
   const snap = makeSnapshot({ epics: [epic] });
   const state = makeState({ inFlight: new Set(["work::fn-1-foo.1"]) });
-  const decision = reconcile(snap, state, new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, state, 0);
   expect(decision.launches).toEqual([]);
 });
 
@@ -522,7 +506,7 @@ test("reconcile dedup: occupying job (working) blocks re-dispatch", () => {
     }),
   );
   const snap = makeSnapshot({ epics: [epic], jobs });
-  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches).toEqual([]);
 });
 
@@ -534,7 +518,7 @@ test("reconcile dedup: open dispatch_failures row blocks re-dispatch (sticky fai
     epics: [epic],
     failedKeys: new Set(["work::fn-1-foo.1"]),
   });
-  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches).toEqual([]);
 });
 
@@ -551,7 +535,7 @@ test("reconcile dedup (fn-674): liveTabKeys.has(key) blocks re-dispatch in the l
     epics: [epic],
     liveTabKeys: new Set(["work::fn-1-foo.1"]),
   });
-  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches).toEqual([]);
 });
 
@@ -567,7 +551,7 @@ test("reconcile dedup (fn-674): liveTabKeys on close::<epic> blocks the close-ro
     epics: [epic],
     liveTabKeys: new Set(["approve::fn-1-foo"]),
   });
-  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, makeState(), 0);
   // The `approve` verb dispatches for status=done + approval=pending,
   // and the liveTabKeys arm gates it identically to the task path.
   expect(decision.launches.find((p) => p.verb === "approve")).toBeUndefined();
@@ -599,7 +583,7 @@ test("reconcile: live git_status feeds computeReadiness (predicate 6.5 gates clo
     epics: [epic],
     gitStatusByProjectDir: gitStatus,
   });
-  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, makeState(), 0);
   // No close launch — git-uncommitted blocks it.
   const closeLaunch = decision.launches.find((p) => p.verb === "close");
   expect(closeLaunch).toBeUndefined();
@@ -614,7 +598,7 @@ test("reconcile: empty git_status map → predicate 6.5 stays inert (default sem
     approval: "pending",
   });
   const snap = makeSnapshot({ epics: [epic] });
-  const decision = reconcile(snap, makeState(), new Map(), NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, makeState(), 0);
   // Approve close should fire (status=done && approval=pending →
   // job-pending verdict → `approve` verb).
   const approveLaunch = decision.launches.find((p) => p.verb === "approve");
@@ -750,7 +734,7 @@ test("confirmRunning ABORTED: shutdown signal during poll → aborted, no emissi
 });
 
 // ---------------------------------------------------------------------------
-// runReconcileCycle — serialization + reap
+// runReconcileCycle — serialization
 // ---------------------------------------------------------------------------
 
 test("runReconcileCycle: two launches serialize one-at-a-time (fn-644 stagger)", async () => {
@@ -809,7 +793,7 @@ test("runReconcileCycle: two launches serialize one-at-a-time (fn-644 stagger)",
   const snap = makeSnapshot({ epics: [epicA, epicB] });
   const state = makeState();
   const liveDispatches = new Map<string, LiveDispatch>();
-  const decision = reconcile(snap, state, liveDispatches, NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, state, 0);
   expect(decision.launches.length).toBe(2);
 
   const ctrl = new AbortController();
@@ -863,7 +847,7 @@ test("runReconcileCycle: missing work-plugin manifest blocks the launch with a s
   const snap = makeSnapshot({ epics: [epic] });
   const state = makeState();
   const liveDispatches = new Map<string, LiveDispatch>();
-  const decision = reconcile(snap, state, liveDispatches, NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, state, 0);
   expect(decision.launches.length).toBe(1);
 
   await runReconcileCycle(
@@ -908,7 +892,7 @@ test("runReconcileCycle: present work-plugin manifest (guard ok) launches normal
   const snap = makeSnapshot({ epics: [epic] });
   const state = makeState();
   const liveDispatches = new Map<string, LiveDispatch>();
-  const decision = reconcile(snap, state, liveDispatches, NO_AUTOCLOSE, 0);
+  const decision = reconcile(snap, state, 0);
 
   await runReconcileCycle(
     decision,
@@ -932,238 +916,6 @@ test("checkWorkPluginManifest: missing dir → not ok with remediation hint", ()
     expect(res.reason).toContain("work-plugin manifest missing");
     expect(res.reason).toContain("render-plugin-templates");
   }
-});
-
-test("runReconcileCycle reap: autoclose=on + approved-complete → BOTH worker and approve tabs reaped together, coords per dispatch, live entries forgotten", async () => {
-  // The row reached APPROVED completion (worker_phase done + approval
-  // approved + idle → verdict `completed`). Both the work dispatch AND
-  // the approve dispatch share the task id, so the approval reaps both
-  // tabs in one pass — each with its own freshest jobs-row coords.
-  const liveDispatches = new Map<string, LiveDispatch>();
-  liveDispatches.set("work::fn-1-foo.1", {
-    verb: "work",
-    id: "fn-1-foo.1",
-    key: "work::fn-1-foo.1",
-    cwd: "/repo",
-    controller: new AbortController(),
-  });
-  liveDispatches.set("approve::fn-1-foo.1", {
-    verb: "approve",
-    id: "fn-1-foo.1",
-    key: "approve::fn-1-foo.1",
-    cwd: "/repo",
-    controller: new AbortController(),
-  });
-  const jobs = new Map<string, Job>();
-  jobs.set(
-    "j-work",
-    makeJob({
-      job_id: "j-work",
-      plan_verb: "work",
-      plan_ref: "fn-1-foo.1",
-      state: "ended",
-      last_event_id: 200,
-      backend_exec_session_id: "zellij-session-1",
-      backend_exec_tab_id: "42",
-    }),
-  );
-  jobs.set(
-    "j-approve",
-    makeJob({
-      job_id: "j-approve",
-      plan_verb: "approve",
-      plan_ref: "fn-1-foo.1",
-      state: "ended",
-      last_event_id: 201,
-      backend_exec_session_id: "zellij-session-1",
-      backend_exec_tab_id: "43",
-    }),
-  );
-  const epic = makeEpic({
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.1",
-        worker_phase: "done",
-        approval: "approved",
-      }),
-    ],
-  });
-  const snap = makeSnapshot({ epics: [epic], jobs });
-  const decision = reconcile(snap, makeState(), liveDispatches, AUTOCLOSE, 0);
-  expect(decision.reaps.length).toBe(2);
-  for (const r of decision.reaps) {
-    expect(r.reason).toBe("approved-complete");
-  }
-  const workReap = decision.reaps.find((x) => x.key === "work::fn-1-foo.1");
-  const approveReap = decision.reaps.find(
-    (x) => x.key === "approve::fn-1-foo.1",
-  );
-  expect(workReap?.tabId).toBe("42");
-  expect(approveReap?.tabId).toBe("43");
-
-  const { deps, log } = makeFakeDeps();
-  const ctrl = new AbortController();
-  await runReconcileCycle(
-    decision,
-    makeState(),
-    liveDispatches,
-    "/bin/zsh",
-    ctrl.signal,
-    deps,
-  );
-  expect(log.closeByTabIdCalls).toContainEqual({
-    session: "zellij-session-1",
-    tabId: "42",
-  });
-  expect(log.closeByTabIdCalls).toContainEqual({
-    session: "zellij-session-1",
-    tabId: "43",
-  });
-  expect(liveDispatches.has("work::fn-1-foo.1")).toBe(false);
-  expect(liveDispatches.has("approve::fn-1-foo.1")).toBe(false);
-});
-
-test("runReconcileCycle reap: autoclose=on + row gone from snapshot → reap fires with row-gone reason", () => {
-  // The row vanished from the snapshot (deleted task/epic). Cleanup reap
-  // so the orphaned tab does not leak.
-  const liveDispatches = new Map<string, LiveDispatch>();
-  liveDispatches.set("work::fn-1-foo.1", {
-    verb: "work",
-    id: "fn-1-foo.1",
-    key: "work::fn-1-foo.1",
-    cwd: "/repo",
-    controller: new AbortController(),
-  });
-  const jobs = new Map<string, Job>();
-  jobs.set(
-    "j-1",
-    makeJob({
-      job_id: "j-1",
-      plan_verb: "work",
-      plan_ref: "fn-1-foo.1",
-      state: "ended",
-      last_event_id: 200,
-      backend_exec_session_id: "zellij-session-1",
-      backend_exec_tab_id: "42",
-    }),
-  );
-  const snap = makeSnapshot({ epics: [], jobs });
-  const decision = reconcile(snap, makeState(), liveDispatches, AUTOCLOSE, 0);
-  expect(decision.reaps.length).toBe(1);
-  expect(decision.reaps[0]?.key).toBe("work::fn-1-foo.1");
-  expect(decision.reaps[0]?.reason).toBe("row-gone");
-  expect(decision.reaps[0]?.tabId).toBe("42");
-});
-
-test("runReconcileCycle reap: autoclose=on + worker ended but approval PENDING → NOT reaped (inspection window stays open)", () => {
-  // The worker session ended (state `ended`) but the row is still
-  // awaiting approval (worker_phase done + approval pending → verdict
-  // job-pending). The window stays OPEN — a finished-but-unapproved tab
-  // is the inspection surface, NOT a reap trigger.
-  const liveDispatches = new Map<string, LiveDispatch>();
-  liveDispatches.set("work::fn-1-foo.1", {
-    verb: "work",
-    id: "fn-1-foo.1",
-    key: "work::fn-1-foo.1",
-    cwd: "/repo",
-    controller: new AbortController(),
-  });
-  const jobs = new Map<string, Job>();
-  jobs.set(
-    "j-1",
-    makeJob({
-      job_id: "j-1",
-      plan_verb: "work",
-      plan_ref: "fn-1-foo.1",
-      state: "ended",
-      last_event_id: 999,
-    }),
-  );
-  const epic = makeEpic({
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.1",
-        worker_phase: "done",
-        approval: "pending",
-      }),
-    ],
-  });
-  const snap = makeSnapshot({ epics: [epic], jobs });
-  const decision = reconcile(snap, makeState(), liveDispatches, AUTOCLOSE, 0);
-  expect(decision.reaps).toEqual([]);
-});
-
-test("runReconcileCycle reap: autoclose=on + approval REJECTED → neither worker nor approve tab reaped (left open for inspection)", () => {
-  // Rejection is best-effort leave-open: both the worker tab and the
-  // approve tab stay open so the human can inspect the rejection
-  // reasoning and reap later (on rerun or by hand).
-  const liveDispatches = new Map<string, LiveDispatch>();
-  liveDispatches.set("work::fn-1-foo.1", {
-    verb: "work",
-    id: "fn-1-foo.1",
-    key: "work::fn-1-foo.1",
-    cwd: "/repo",
-    controller: new AbortController(),
-  });
-  liveDispatches.set("approve::fn-1-foo.1", {
-    verb: "approve",
-    id: "fn-1-foo.1",
-    key: "approve::fn-1-foo.1",
-    cwd: "/repo",
-    controller: new AbortController(),
-  });
-  const jobs = new Map<string, Job>();
-  jobs.set(
-    "j-1",
-    makeJob({
-      job_id: "j-1",
-      plan_verb: "work",
-      plan_ref: "fn-1-foo.1",
-      state: "ended",
-      last_event_id: 999,
-    }),
-  );
-  const epic = makeEpic({
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.1",
-        worker_phase: "done",
-        approval: "rejected",
-      }),
-    ],
-  });
-  const snap = makeSnapshot({ epics: [epic], jobs });
-  const decision = reconcile(snap, makeState(), liveDispatches, AUTOCLOSE, 0);
-  expect(decision.reaps).toEqual([]);
-});
-
-test("runReconcileCycle reap: autoclose=off → no reap even when approved-complete", () => {
-  const liveDispatches = new Map<string, LiveDispatch>();
-  liveDispatches.set("work::fn-1-foo.1", {
-    verb: "work",
-    id: "fn-1-foo.1",
-    key: "work::fn-1-foo.1",
-    cwd: "/repo",
-    controller: new AbortController(),
-  });
-  const epic = makeEpic({
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.1",
-        worker_phase: "done",
-        approval: "approved",
-      }),
-    ],
-  });
-  const snap = makeSnapshot({ epics: [epic] });
-  const decision = reconcile(
-    snap,
-    makeState(),
-    liveDispatches,
-    NO_AUTOCLOSE,
-    0,
-  );
-  expect(decision.reaps).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------

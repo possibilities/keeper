@@ -1,7 +1,7 @@
 /**
- * fn-701 task .3 boot-smoke fixture. A minimal stand-in for keeper's six
+ * fn-701 task .3 boot-smoke fixture. A minimal stand-in for keeper's five
  * `@parcel/watcher`-loading workers (transcript / plan / git / usage /
- * dead-letter / zellij-events): it does the SAME `import("@parcel/watcher")`
+ * dead-letter): it does the SAME `import("@parcel/watcher")`
  * then actually `subscribe()`s (forcing the full native N-API surface to
  * resolve, the path that exposed the `napi_register_module_v1` concurrent-dlopen
  * race), then reports success/failure back to the spawning test.
