@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-717-compact-cold-event-data-blobs",
   "bundles": [],
   "closer_done_at": "2026-06-05T22:44:31.393331Z",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T22:44:31.393331Z"
+  "updated_at": "2026-06-05T22:46:04.636861Z"
 }
