@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-717-compact-cold-event-data-blobs",
   "bundles": [],
+  "closer_done_at": "2026-06-05T22:44:31.393331Z",
   "created_at": "2026-06-05T20:25:42.908755Z",
   "depends_on_epics": [
     "fn-715-port-jobctl-into-keeper-commit-work"
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Compact cold event data blobs",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T20:25:56.377537Z"
+  "updated_at": "2026-06-05T22:44:31.393331Z"
 }
