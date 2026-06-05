@@ -87,11 +87,16 @@ import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   apiErrorPillSeg,
+  BOARD_PILL_LEGEND,
   epicHeaderLabel,
   inputRequestPillSeg,
   permissionPromptPillSeg,
+  pillOrEmpty,
   planVerbLabel,
+  renderClosePills,
+  renderTaskPills,
   subagentLinesFor,
+  validatedPill,
 } from "../src/board-render";
 import { resolveSockPath } from "../src/db";
 import type { EpicDepResolution } from "../src/epic-deps";
@@ -148,12 +153,21 @@ key) live in 'keeper jobs' (fn-658.3 split them out of board).
 Renders one block per epic; the frame is just the '---' lead when no
 epics match the default scope.
 
+Pills follow the OMIT-DEFAULT convention (fn-708): a pill renders only at
+its non-resting value, so absence of a pill encodes the default. The footer
+legend line states the rule and is captured in piped/sidecar output:
+  no [approval] => pending · no runtime pill => todo · no [worker-done] =>
+  open · no [validated] => unvalidated · no [state] => stopped · no subagent
+  pill => ok.
+
 Each epic block opens with a header line of the form:
 
-  ({dir}) {epic_number} {title} [name#dep,name#dep] [validated|unvalidated] [slotted-after-closer]? [<readiness>]
+  ({dir}) {epic_number} {title} [name#dep,name#dep] [validated]? [slotted-after-closer]? [<readiness>]
 
-(a [blocked:<reason>] readiness pill drops to its own indented line beneath
-the header instead of stamping at the end; ready/completed/running stay inline)
+The [validated] pill appears ONLY when the epic is validated; its absence
+encodes 'unvalidated' (flip with 'planctl validate --epic <id>'). A
+[blocked:<reason>] readiness pill drops to its own indented line beneath the
+header instead of stamping at the end; ready/completed/running stay inline.
 
 The {epic_number} {title} label falls back to {epic_id} when BOTH are null —
 a pre-EpicSnapshot stub row (a keeper epic and its tasks fold as two separate
@@ -174,7 +188,8 @@ directly below its parent in the default sort (sort_path ASC).
 
 followed (when the epic carries job_links) by one indented creator/refiner
 line per linked session —
-'{title} [creator|refiner] [state] [failed:<kind>]?' with an optional
+'{title} [creator|refiner] [state]? [failed:<kind>]?' where the [state] pill
+follows omit-default (no pill ≡ 'stopped'; only live states stamp one), with an optional
 [awaiting:<kind>] pill dropped onto its own indented continuation line
 beneath the row
 (title falls back to {job_id} when the embedded title is null; the
@@ -196,19 +211,30 @@ last_input_request_kind off the linked jobs row at the reducer's write
 boundary, so the same line shape renders for live, terminal, and
 off-page sessions — no live-jobs join, no off-page fallback branch — then the task lines
 (one per embedded task,
-'{n}. {title} [#dep,#dep] [runtime_status] [worker_phase] [approval]' —
-the three native pills side-by-side: planctl runtime status
-'todo|in_progress|done|blocked', derived worker-phase binary 'open|done',
-and approval 'approved|rejected|pending'), and a final "Quality audit and
-close" line for the epic itself. The [validated] / [unvalidated] pill
-reflects planctl's last_validated_at timestamp on the epic file — flipped
-by 'planctl validate --epic <id>'.
+'{n}. {title} [#dep,#dep] [<runtime>]? [worker-done]? [<approval>]?').
+The three native fields follow omit-default + de-ambiguation (fn-708):
+  - runtime_status: 'todo' elides (default); 'in_progress' / 'done' render
+    verbatim; 'blocked' renders as '[rt:blocked]' so the manual planctl block
+    flag never collides with the verdict '[blocked:*]' family.
+  - worker_phase: 'open' never renders; the 'done' survivor renders as the
+    LABELED '[worker-done]' (never bare '[done]', which would collide with
+    runtime 'done') and only when the verdict does not already pin done
+    (i.e. not 'completed' / 'job-pending' / 'git-uncommitted' / 'git-orphans').
+  - approval: 'pending' elides (default); '[rejected]' is dropped when the
+    verdict is already '[blocked:job-rejected]' and '[approved]' when the
+    verdict is '[completed]' (the word is already on screen).
+The block ends with a "Quality audit and close" line for the epic itself —
+its '[status]' pill is dropped (the board filter pins it to '[open]') and
+its approval pill follows the same omit-default + verdict-aware suppression,
+so it usually collapses to just the title + the '[id] <verdict>' line.
 
 Sub-agent invocations nest under their owning job row as one indented
-line each — '{subagent_type}{annotations}: {description} [<status>]' —
-where <status> is the raw 5-value projection enum
-'running|ok|failed|unknown|superseded'. 'superseded' is rendered verbatim
-(no hiding) so the audit trail of re-entrant attempts stays visible.
+line each — '{subagent_type}{annotations}: {description} [<status>]?' —
+where <status> is the raw projection enum and follows omit-default (fn-708):
+'ok' (and a null/empty status) renders NO pill (absence ≡ ok); the
+non-resting states 'running|failed|unknown|superseded' render verbatim.
+'superseded' is rendered (no hiding) so the audit trail of re-entrant
+attempts stays visible.
 
 Same-name invocations within one job COLLAPSE on the client to a single
 line representing the most recent (max turn_seq) row; the {annotations}
@@ -282,28 +308,6 @@ custom subscribe client against src/protocol.ts.
  * shim. New code should import from `src/readiness-client` directly.
  */
 export { projectRows } from "../src/readiness-client";
-
-/** Approval enum vocabulary, mirrored from `src/plan-worker.ts:Approval`. */
-const APPROVAL_VALUES = new Set(["approved", "rejected", "pending"]);
-
-function approvalPill(v: unknown): string {
-  if (typeof v === "string" && APPROVAL_VALUES.has(v)) {
-    return v;
-  }
-  return "pending";
-}
-
-/**
- * Map the epic's `last_validated_at` to a `[validated]` / `[unvalidated]`
- * pill — mirrors `approvalPill`'s shape. The producer-side `asString`
- * (`src/plan-worker.ts`) already collapses empty-string / non-string values
- * to `null`, so the predicate is simply `v != null`. The pill string is
- * fixed (not the raw timestamp); a future task may add a sortable mode if
- * a use case appears.
- */
-function validatedPill(v: unknown): "validated" | "unvalidated" {
-  return v != null ? "validated" : "unvalidated";
-}
 
 /**
  * Render the optional `[task-repo:<basename>]` pill segment when a task's
@@ -517,7 +521,11 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
   const out: string[] = [];
   for (const link of jobLinks as JobLinkEntry[]) {
     const label = link.title ?? link.job_id;
-    const state = link.state == null ? "" : String(link.state);
+    // fn-708 (T1): the session lifecycle pill follows the omit-default rule —
+    // the resting `stopped` value renders NO pill (absence ≡ stopped); only
+    // the live states (`working`, etc.) stamp one. `pillOrEmpty` returns the
+    // leading space and the brackets, so it appends self-delimited.
+    const stateSeg = pillOrEmpty(link.state, "stopped");
     const awaiting = inputRequestPillSeg(
       link.last_input_request_at,
       link.last_input_request_kind,
@@ -533,7 +541,7 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
       link.last_permission_prompt_kind,
     );
     out.push(
-      `  ${label} [${link.kind}] [${state}]${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}`,
+      `  ${label} [${link.kind}]${stateSeg}${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}`,
     );
     // The [awaiting:<kind>] pill drops to its own continuation line (one
     // indent level deeper) so a long-running interactive stop reads
@@ -546,6 +554,20 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
     }
   }
   return out;
+}
+
+/**
+ * fn-708: append the omit-default footer legend to the epic body lines.
+ * Pure `f(epicLines) → bodyLines` so `test/board.test.ts` can assert the
+ * legend reaches `bodyLines` (the frame text that `src/view-shell.ts`'s
+ * `emit` byte-compares and `sidecarFrameText` mirrors into piped output)
+ * without standing up the subscribe loop. A blank spacer separates the
+ * legend from the last epic block; the legend itself is the single-source
+ * {@link BOARD_PILL_LEGEND} constant from `src/board-render.ts`, so the
+ * absence-encodes-default convention can never drift from the renderer.
+ */
+export function appendBoardLegend(epicLines: string[]): string[] {
+  return [...epicLines, "", BOARD_PILL_LEGEND];
 }
 
 export async function main(argv: string[]): Promise<void> {
@@ -605,8 +627,10 @@ export async function main(argv: string[]): Promise<void> {
         job.last_permission_prompt_at,
         job.last_permission_prompt_kind,
       );
+      // fn-708 (T1): the job lifecycle pill follows the omit-default rule —
+      // the resting `stopped` value renders NO pill (absence ≡ stopped).
       out.push(
-        `    ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}] [${seg(job.state)}]${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}`,
+        `    ${seg(job.title)} [${planVerbLabel(job.plan_verb) ?? ""}]${pillOrEmpty(job.state, "stopped")}${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}`,
       );
       // [awaiting:<kind>] on its own continuation line (six-space indent —
       // same depth as this row's sub-agent lines below).
@@ -693,7 +717,6 @@ export async function main(argv: string[]): Promise<void> {
     // the lint by reading once.
     void epicIds;
     const epicId = seg(row.epic_id);
-    const epicApproval = approvalPill(row.approval);
     const lines: string[] = [];
     const epicVerdict = verdictFromMap(snap.readiness.perEpic, epicId);
     // Schema v29: `[slotted-after-closer]` pill — appears only when the
@@ -712,7 +735,12 @@ export async function main(argv: string[]): Promise<void> {
     // never the blank `(keeper)  [unvalidated]` line. The pure assembly
     // lives in `epicHeaderLabel` (`src/board-render.ts`) for testability;
     // `epicId` is the already-coalesced `seg(row.epic_id)` above.
-    const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg} [${validatedPill(row.last_validated_at)}]${slottedSeg}`;
+    // fn-708 (T1): `validatedPill` now omits the default — it emits
+    // ` [validated]` only when the epic is validated and `""` otherwise
+    // (absence ≡ unvalidated, per the footer legend). It returns its own
+    // leading space + brackets, so it appends self-delimited alongside the
+    // dep summary and the slotted-after-closer pill.
+    const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg}${validatedPill(row.last_validated_at)}${slottedSeg}`;
     const epicHeaderLines =
       epicVerdict.tag === "blocked"
         ? [epicHeader, `  ${formatPill(epicVerdict)}`]
@@ -727,7 +755,6 @@ export async function main(argv: string[]): Promise<void> {
         .filter((n): n is number => n != null);
       const taskDepsSeg =
         tnums.length === 0 ? "" : ` [${tnums.map((n) => `#${n}`).join(",")}]`;
-      const taskApproval = approvalPill(t.approval);
       const taskId = seg(t.task_id);
       const taskVerdict = verdictFromMap(snap.readiness.perTask, taskId);
       // A [blocked:<reason>] verdict drops to its own line beneath the
@@ -741,12 +768,16 @@ export async function main(argv: string[]): Promise<void> {
           ? [`    [${taskId}]`, `    ${taskPillSeg}`]
           : [`    [${taskId}] ${taskPillSeg}`];
       lines.push(
-        // Schema v19: task elements now carry both `runtime_status` (the
-        // planctl-native enum `todo|in_progress|done|blocked`) and
-        // `worker_phase` (the derived worker-phase binary `open|done`).
-        // Render both pills side-by-side with `[approval]` so the row
-        // surfaces the full native vocabulary — no client-side collapse.
-        `  ${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg} [${seg(t.runtime_status)}] [${seg(t.worker_phase)}] [${taskApproval}]`,
+        // fn-708 (T1/T3): the runtime_status / worker_phase / approval triple
+        // is consolidated by `renderTaskPills` (`src/board-render.ts`). Each
+        // field renders ONLY at its non-resting value: `todo` runtime / `open`
+        // phase / `pending` approval all elide; `worker_phase=done` renders the
+        // labeled `[worker-done]` (never bare, only when the verdict doesn't
+        // pin it); `runtime_status=blocked` renders `[rt:blocked]`; and the
+        // approval pill is suppressed where the adjacent verdict already names
+        // it (`completed` / `blocked:job-rejected`). Absence ≡ the default per
+        // the footer legend.
+        `  ${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg}${renderTaskPills(t, taskVerdict)}`,
         ...taskIdLines,
         ...renderJobLines(subagentIndex, t.jobs),
       );
@@ -759,7 +790,13 @@ export async function main(argv: string[]): Promise<void> {
         ? [`    [${epicId}]`, `    ${formatPill(closeVerdict)}`]
         : [`    [${epicId}] ${formatPill(closeVerdict)}`];
     lines.push(
-      `  X. Quality audit and close [${seg(row.status)}] [${epicApproval}]`,
+      // fn-708 (T2/T1/T3): the close-row `[status]` pill is dropped — the
+      // board filter pins it to `[open]`, so it carries zero bits (a custom-
+      // filtered view restores it; see the restore note in `renderClosePills`).
+      // The approval pill follows the same omit-default + verdict-aware
+      // suppression as the task line, so the row usually collapses to just the
+      // title + its `[id] <verdict>` reference line below.
+      `  X. Quality audit and close${renderClosePills(row, closeVerdict)}`,
       ...closeIdLines,
       ...renderJobLines(subagentIndex, row.jobs),
     );
@@ -802,7 +839,13 @@ export async function main(argv: string[]): Promise<void> {
     subagentIndex: Map<string, SubagentInvocation[]>,
   ): string[] {
     const body = renderEpicsBody(snap, subagentIndex);
-    return body === "" ? ["no epics"] : body.split("\n");
+    const epicLines = body === "" ? ["no epics"] : body.split("\n");
+    // fn-708: the footer legend documents the absence-encodes-default
+    // convention. It is appended to bodyLines (NOT `liveShell.setStatus`)
+    // so it is captured in BOTH the live frame and piped/sidecar output
+    // (`bodyLines` is the byte-compared frame text — see `src/view-shell.ts`).
+    // `appendBoardLegend` is the exported pure seam the tests assert against.
+    return appendBoardLegend(epicLines);
   }
 
   // fn-660.1: lifecycle + sidecars + copy key + SIGINT moved into

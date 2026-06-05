@@ -29,6 +29,7 @@
 
 import { expect, test } from "bun:test";
 import {
+  appendBoardLegend,
   colorizePillsInLine,
   epicNumFromIdOrBare,
   renderDeadLetterPill,
@@ -630,7 +631,8 @@ test("renderJobLinkLines: null title falls back to job_id (preserves line shape)
       state: "stopped",
     }),
   ]);
-  expect(out).toEqual(["  sess-no-title [refiner] [stopped]"]);
+  // fn-708 (T1): state='stopped' is the resting value → no [state] pill.
+  expect(out).toEqual(["  sess-no-title [refiner]"]);
 });
 
 test("renderJobLinkLines: last_api_error_at non-null appends [failed:<kind>] pill (same line shape, live + terminal + off-page all)", () => {
@@ -650,9 +652,8 @@ test("renderJobLinkLines: last_api_error_at non-null appends [failed:<kind>] pil
       last_api_error_kind: "rate_limit",
     }),
   ]);
-  expect(out).toEqual([
-    "  Plan epic 8 [creator] [stopped] [failed:rate_limit]",
-  ]);
+  // fn-708 (T1): state='stopped' elides; [failed:<kind>] still stamps inline.
+  expect(out).toEqual(["  Plan epic 8 [creator] [failed:rate_limit]"]);
 });
 
 // One render test per ApiErrorKind. Six positive cases — every kind
@@ -679,7 +680,7 @@ test.each([
         last_api_error_kind: kind,
       }),
     ]);
-    expect(out).toEqual([`  Plan epic 9 [refiner] [stopped] [failed:${kind}]`]);
+    expect(out).toEqual([`  Plan epic 9 [refiner] [failed:${kind}]`]);
   },
 );
 
@@ -699,7 +700,7 @@ test("renderJobLinkLines: at non-null, kind null defensively renders [failed:unk
       last_api_error_kind: null,
     }),
   ]);
-  expect(out).toEqual(["  Plan epic 10 [creator] [stopped] [failed:unknown]"]);
+  expect(out).toEqual(["  Plan epic 10 [creator] [failed:unknown]"]);
 });
 
 // `last_input_request_at` non-null emits the `[awaiting:<kind>]` pill
@@ -724,7 +725,7 @@ test("renderJobLinkLines: last_input_request_at non-null appends [awaiting:<kind
     }),
   ]);
   expect(out).toEqual([
-    "  Plan epic 11 [creator] [stopped]",
+    "  Plan epic 11 [creator]",
     "    [awaiting:ask_user_question]",
   ]);
 });
@@ -745,16 +746,13 @@ test("renderJobLinkLines: input_request_at non-null, kind null defensively rende
       last_input_request_kind: null,
     }),
   ]);
-  expect(out).toEqual([
-    "  Plan epic 12 [refiner] [stopped]",
-    "    [awaiting:unknown]",
-  ]);
+  expect(out).toEqual(["  Plan epic 12 [refiner]", "    [awaiting:unknown]"]);
 });
 
 // Stacking snapshot — a row carrying BOTH api-error AND input-request
-// annotations renders `[state] [failed:<kind>]` inline, then drops
-// `[awaiting:<kind>]` onto its own indented continuation line beneath the
-// row. Pins the inline-vs-continuation split so a future change is caught.
+// annotations renders `[failed:<kind>]` inline (state='stopped' elides per
+// fn-708 T1), then drops `[awaiting:<kind>]` onto its own indented
+// continuation line beneath the row. Pins the inline-vs-continuation split.
 test("renderJobLinkLines: failed stays inline, awaiting drops to its own line", () => {
   const out = renderJobLinkLines([
     makeLink({
@@ -769,7 +767,7 @@ test("renderJobLinkLines: failed stays inline, awaiting drops to its own line", 
     }),
   ]);
   expect(out).toEqual([
-    "  Plan epic 13 [creator] [stopped] [failed:rate_limit]",
+    "  Plan epic 13 [creator] [failed:rate_limit]",
     "    [awaiting:ask_user_question]",
   ]);
 });
@@ -878,7 +876,8 @@ test("renderJobLinkLines: multiple entries iterate in provided order (projection
   ]);
   expect(out).toEqual([
     "  First [creator] [working]",
-    "  Second [refiner] [stopped]",
+    // fn-708 (T1): the resting state='stopped' entry renders no [state] pill.
+    "  Second [refiner]",
   ]);
 });
 
@@ -922,11 +921,13 @@ test("renderJobLinkLines: many creator + refiner edges per epic each render thei
     }),
   ]);
   expect(out).toEqual([
-    "  Creator one [creator] [stopped]",
+    // fn-708 (T1): resting state='stopped' entries render no [state] pill;
+    // the live state='working' entries keep theirs.
+    "  Creator one [creator]",
     "  Creator two [creator] [working]",
-    "  Refiner one [refiner] [stopped]",
+    "  Refiner one [refiner]",
     "  Refiner two [refiner] [working]",
-    "  Refiner three [refiner] [stopped]",
+    "  Refiner three [refiner]",
   ]);
 });
 
@@ -1699,7 +1700,29 @@ test("BOARD_PILL_LEGEND / JOBS_PILL_LEGEND are non-empty single-source constants
   expect(BOARD_PILL_LEGEND).toContain("todo");
   expect(BOARD_PILL_LEGEND).toContain("worker-done");
   expect(BOARD_PILL_LEGEND).toContain("stopped");
+  // The board legend also documents the validated / runtime-todo defaults the
+  // header + task line now omit, so every absent pill is recoverable.
+  expect(BOARD_PILL_LEGEND).toContain("unvalidated");
   // The jobs legend is scoped to state + subagent.
   expect(JOBS_PILL_LEGEND).toContain("stopped");
   expect(JOBS_PILL_LEGEND).toContain("ok");
+});
+
+// fn-708: the footer legend reaches `bodyLines` (the frame text view-shell
+// byte-compares for the live frame and mirrors into piped/sidecar output via
+// `sidecarFrameText`). `appendBoardLegend` is the exported pure seam
+// `renderBody` calls; asserting it pins the "legend present in live + sidecar"
+// acceptance without standing up the subscribe loop.
+test("appendBoardLegend: appends the single-source legend (spacer-separated) to bodyLines", () => {
+  const epicLines = ["(keeper) 1 Foo [ready]", "  X. Quality audit and close"];
+  const out = appendBoardLegend(epicLines);
+  // The epic block is preserved verbatim, then a blank spacer, then the legend.
+  expect(out.slice(0, 2)).toEqual(epicLines);
+  expect(out.at(-1)).toBe(BOARD_PILL_LEGEND);
+  expect(out).toContain(BOARD_PILL_LEGEND);
+});
+
+test("appendBoardLegend: legend rides even the empty-board ('no epics') frame", () => {
+  const out = appendBoardLegend(["no epics"]);
+  expect(out).toContain(BOARD_PILL_LEGEND);
 });

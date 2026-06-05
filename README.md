@@ -695,34 +695,58 @@ collapses to plain stream output. Run any of them with
   SEARCH — `subagent_invocations` full per-job timeline, `jobs` live
   only (`working + stopped`). The flat bottom jobs list and the
   `[dead-letter:N]` banner (with the `r` replay-dead-letter key) moved
-  to `keeper jobs` in fn-658 — see the `jobs.ts` bullet below. Each
+  to `keeper jobs` in fn-658 — see the `jobs.ts` bullet below. Both the
+  board and `keeper jobs` follow the OMIT-DEFAULT pill convention
+  (fn-708): a pill renders only at its non-resting value, so the
+  ABSENCE of a pill encodes the field's one default — `no [approval]`
+  ⇒ `pending`, `no runtime pill` ⇒ `todo`, `no [worker-done]` ⇒ `open`,
+  `no [validated]` ⇒ `unvalidated`, `no [state]` ⇒ `stopped`, `no
+  subagent pill` ⇒ `ok`. A single-source footer-legend line
+  (`BOARD_PILL_LEGEND` / `JOBS_PILL_LEGEND` in `src/board-render.ts`) is
+  appended to each view's `bodyLines`, so the rule rides both the live
+  frame and the piped/sidecar output. Each
   epic renders as a header line —
-  `({dir}) {epic_number} {title} [#dep,#dep] [validated|unvalidated]
-  [slotted-after-closer]? [ready|completed|blocked:<reason>]` — followed by indented task lines
+  `({dir}) {epic_number} {title} [#dep,#dep] [validated]?
+  [slotted-after-closer]? [ready|completed|blocked:<reason>]` (the
+  `[validated]` pill appears ONLY when the epic is validated; its absence
+  encodes `unvalidated`) — followed by indented task lines
   (the `{epic_number} {title}` label falls back to `{epic_id}` when BOTH
   are null — a pre-`EpicSnapshot` stub row in the partial-projection
   window between the `EpicSnapshot` and `TaskSnapshot` folds — so the
-  header stays legible and identifiable instead of collapsing to a blank
-  `({dir})  [unvalidated]` line; the row is never hidden, fn-700)
+  header stays legible and identifiable instead of collapsing to a near-
+  blank `({dir})` line — under fn-708's omit-default an unvalidated stub
+  no longer even carries a trailing `[unvalidated]` pill; the row is
+  never hidden, fn-700)
   (the optional `[slotted-after-closer]` pill — schema v29, active/cyan
   bucket — appears only when the epic was minted by another epic's
   closer session, i.e. `epics.created_by_closer_of != null`; its
   presence is also what slots the row directly below its parent under
   the default `sort_path ASC` ordering)
-  (with `[{runtime_status}] [{worker_phase}] [{approval}]
-  [ready|completed|blocked:<reason>]` pills — three native vocabularies
-  side-by-side: the planctl runtime enum `todo|in_progress|done|blocked`,
-  the derived worker-phase binary `open|done`, and approval
-  `approved|rejected|pending`) and a final "Quality audit and close"
-  line for the epic itself. Sub-agent invocations nest one indent
-  level under their owning job row as `{type}: {desc} [<status>]`,
-  stamping the raw 5-value projection enum
-  `running|ok|failed|unknown|superseded` verbatim (no renderer-side
-  collapse or hiding — `superseded` is promoted natively by the
-  projection so the full audit trail of re-entrant attempts is visible).
-  The `[validated]` / `[unvalidated]` pill reflects planctl's
-  `last_validated_at` timestamp on the epic file (flipped by
-  `planctl validate --epic <id>`). The `[ready] / [completed] /
+  (with omit-default `[<runtime>]? [worker-done]? [<approval>]?
+  [ready|completed|blocked:<reason>]` pills — the three native fields
+  consolidated per fn-708: the planctl runtime enum elides its `todo`
+  default, renders `in_progress` / `done` verbatim, and relabels
+  `blocked` → `[rt:blocked]` so it never collides with the verdict
+  `[blocked:*]` family; the derived worker-phase binary never renders
+  `open` and surfaces its `done` survivor as the LABELED `[worker-done]`
+  (never bare `[done]`, and only when the verdict doesn't already pin it
+  — i.e. not `completed`/`job-pending`/`git-uncommitted`/`git-orphans`);
+  and approval elides `pending`, dropping `[rejected]`/`[approved]`
+  when the adjacent verdict already names it (`blocked:job-rejected` /
+  `completed`)) and a final "Quality audit and close" line for the epic
+  itself (its `[status]` pill is dropped — the board filter pins it to
+  `open` — and its approval follows the same omit-default + verdict-aware
+  suppression, so the close row usually collapses to just the title plus
+  its `[id] <verdict>` reference line). Sub-agent invocations nest one
+  indent level under their owning job row as `{type}: {desc} [<status>]?`,
+  stamping the raw projection enum verbatim BUT following omit-default —
+  `ok` (and a null/empty status) renders NO pill (absence ≡ `ok`); the
+  non-resting `running|failed|unknown|superseded` states render (no
+  hiding — `superseded` is promoted natively by the projection so the
+  full audit trail of re-entrant attempts is visible). The `[validated]`
+  pill reflects planctl's `last_validated_at` timestamp on the epic file
+  (flipped by `planctl validate --epic <id>`); its absence encodes
+  `unvalidated`. The `[ready] / [completed] /
   [blocked:<reason>]` pill is a pure-function readiness verdict computed
   from the three-collection snapshot (see `src/readiness.ts`); a
   blocked row is followed by a `   (reason: <reason>)` continuation
@@ -758,8 +782,8 @@ collapses to plain stream output. Run any of them with
   sees which candidates collided; the line is appended atomically
   (POSIX O_APPEND under PIPE_BUF) so board.ts and autopilot.ts can
   write concurrently without flock. Job/link rows also carry two
-  optional stoppage-annotation pills that stack after `[state]` in
-  lifecycle order: `[failed:<kind>]` (red /
+  optional stoppage-annotation pills that stack after the (omit-default)
+  `[state]` pill in lifecycle order: `[failed:<kind>]` (red /
   error bucket) when the session's last Claude-API request hit a
   terminal HTTP failure — the six rendered kinds are `rate_limit |
   authentication_failed | billing_error | server_error |
@@ -776,11 +800,15 @@ collapses to plain stream output. Run any of them with
   blocked/waiting, `faded` (dim) for historical — and prefix fallbacks
   (`failed:*` → `error`, `awaiting:*` → `warn`,
   `blocked:*` → `warn`, `running:*` → `active`, `task-repo:*` →
-  `warn`) so future kinds need no code change. Pills NOT in
-  `PILL_COLORS` render uncolored on purpose — the eye picks
-  `pending` / `todo` / `unvalidated` / `unknown` / `open` and the role
-  labels (`planner|worker|closer|creator|refiner`) out by absence of
-  color.
+  `warn`) so future kinds need no code change. The two fn-708
+  de-ambiguated tokens are colored: `[worker-done]` → `success` (green,
+  the same family as bare `[done]`) and `[rt:blocked]` → `warn` (yellow,
+  the same family as bare `[blocked]`). Pills NOT in `PILL_COLORS` render
+  uncolored on purpose — the eye picks `unknown` and the role labels
+  (`planner|worker|closer|creator|refiner`) out by absence of color (the
+  former resting defaults `pending` / `todo` / `unvalidated` / `open`
+  no longer render at all under fn-708's omit-default rule, so they need
+  no colorizer carve-out).
   The byte-compare emit gate keeps the stream quiet when row churn
   doesn't surface in the render. Reconnects across keeperd restarts;
   Ctrl-C unsubscribes cleanly. Every emitted frame is mirrored to three
@@ -1133,7 +1161,8 @@ mutating verb's `output.emit()` owns the write→commit transaction inline, so
 the file is in HEAD by the time the envelope `success: true` lands on stdout. As of schema v14, the `epics` projection adds
 `last_validated_at` (TEXT, nullable) — the validation timestamp planctl writes
 via `planctl validate --epic <id>` and the board client renders as a
-`[validated|unvalidated]` pill. As of schema v22, `jobs.config_dir` captures `CLAUDE_CONFIG_DIR` from the
+`[validated]` pill at the non-null (validated) value, omitting it otherwise
+per fn-708's omit-default rule (absence ≡ `unvalidated`). As of schema v22, `jobs.config_dir` captures `CLAUDE_CONFIG_DIR` from the
 SessionStart environment, projecting the arthack-claude profile a session
 ran under (latest-non-NULL-wins via `COALESCE(excluded.config_dir,
 jobs.config_dir)` on the SessionStart ON CONFLICT branch, so a resume
