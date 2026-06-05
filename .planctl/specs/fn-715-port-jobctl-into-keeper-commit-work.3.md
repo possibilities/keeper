@@ -55,5 +55,5 @@ the --repos branches. session-state: empty repo + detached HEAD null cases.
 - [ ] trailer parse reuses keeper's parser (no re-port of cli_common.git_trailers logic beyond the interpret-trailers shell-out).
 
 ## Done summary
-
+Ported the three read-only jobctl verbs (find-task-commit, session-state, show-session-files) natively into keeper, byte-identical to the retired Python envelopes (verified via diff against jobctl). find-task-commit preserves the planctl fail-loud contract with the two-stage Task: trailer match (reusing keeper's parseTaskTrailers), touched_repos walk-up + --repos override and its three branches/exit codes; session-state ports the four git reads with null parity and the session_files DB-hiccup swallow; show-session-files is the snake_case attribution pass-through. Added test/find-task-commit.test.ts and test/session-state.test.ts (17 cases, all green).
 ## Evidence
