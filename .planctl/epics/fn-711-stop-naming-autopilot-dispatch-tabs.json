@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-711-stop-naming-autopilot-dispatch-tabs",
   "bundles": [],
   "closer_done_at": "2026-06-05T18:25:57.503957Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T18:25:57.503957Z"
+  "updated_at": "2026-06-05T18:26:31.244855Z"
 }
