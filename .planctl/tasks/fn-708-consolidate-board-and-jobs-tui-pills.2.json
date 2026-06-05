@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-05T04:22:16.375873Z",
+  "depends_on": [
+    "fn-708-consolidate-board-and-jobs-tui-pills.1"
+  ],
+  "epic": "fn-708-consolidate-board-and-jobs-tui-pills",
+  "id": "fn-708-consolidate-board-and-jobs-tui-pills.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Wire board view to consolidated pills",
+  "updated_at": "2026-06-05T04:22:16.375873Z"
+}
