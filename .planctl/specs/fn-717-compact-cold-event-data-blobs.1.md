@@ -56,5 +56,5 @@ the index for the attribution query.
 - [ ] Hook write path untouched (single inline INSERT)
 
 ## Done summary
-
+Added event_blobs(event_id PK, data) side table (schema v57, CREATE literal + v56->v57 migration, empty in .1) and rewrote reducer blob VALUE reads (drain SELECT + both commit-trailer scans) to resolve via COALESCE(events.data, event_blobs.data). Kept events.data NOT NULL and left the file-attribution scan WHERE on events.data to preserve idx_events_tool_attr — documented as the .2 seam. keeper/api.py SUPPORTED_SCHEMA_VERSIONS gains 57. Re-fold determinism + EXPLAIN tests added; behavior is byte-identical to pre-v57 with event_blobs empty.
 ## Evidence
