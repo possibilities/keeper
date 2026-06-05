@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 54;
+export const SCHEMA_VERSION = 55;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -689,8 +689,6 @@ CREATE TABLE IF NOT EXISTS jobs (
     backend_exec_type TEXT,
     backend_exec_session_id TEXT,
     backend_exec_pane_id TEXT,
-    backend_exec_tab_id TEXT,
-    backend_exec_tab_name TEXT,
     monitors TEXT NOT NULL DEFAULT '[]',
     last_permission_prompt_at REAL,
     last_permission_prompt_kind TEXT
@@ -5275,6 +5273,31 @@ function migrate(db: Database): void {
     // renderer is the only consumer), but the bump is required so
     // `jobctl commit-work` on this host doesn't fail-loud
     // (test/schema-version.test.ts enforces).
+
+    // v54→v55: fn-710 (T2) — drop the two dead
+    // `jobs.backend_exec_{tab_id,tab_name}` columns. Their sole writer was
+    // the now-removed `foldBackendExecSnapshot` (Task 1 reaped the
+    // BackendExecSnapshot feed consumer + fold), so they are unwritten and
+    // unread. No indexes reference them (verified) → dropColumnIfPresent's
+    // B-tree rewrite needs no index rebuild. Idempotent (drops only if
+    // present), so this runs every boot and converges whether the DB is a
+    // fresh v55 (CREATE_JOBS already omits them) or an upgraded v54-shaped
+    // DB that still carries them.
+    //
+    // Re-fold safe: the columns are gone from the projection, Task 1 made
+    // the fold a no-op, and the historical `BackendExecSnapshot` events
+    // (the only source that ever populated these columns) now fold to an
+    // explicit no-op, so a from-scratch cursor=0 re-fold reproduces the new
+    // column-less `jobs` shape. The live backend coords
+    // (`backend_exec_{type,session_id,pane_id}`) STAY — they are hook-fed
+    // via the COALESCE fold arm and untouched here.
+    //
+    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 55
+    // in the SAME change — whitelist-only (keeper-py reads neither column),
+    // but the bump is required so `jobctl commit-work` on this host doesn't
+    // fail-loud (test/schema-version.test.ts enforces).
+    dropColumnIfPresent(db, "jobs", "backend_exec_tab_id");
+    dropColumnIfPresent(db, "jobs", "backend_exec_tab_name");
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

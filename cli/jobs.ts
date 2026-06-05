@@ -236,18 +236,18 @@ export function projectJobRow(row: Record<string, unknown>): string {
 }
 
 /**
- * Compose the backend-coords PILL for one jobs row: `[<tab> p<pane>]`.
+ * Compose the backend-coords PILL for one jobs row: `[p<pane>]`.
  *
  * Session-less and type-less by design — the row is already grouped under
  * its `--- <session> ---` heading (see `renderJobsBody`), and the only
  * backend keeper currently knows about is zellij, so the per-row pill
- * just identifies the tab + pane within that session. Bracketed so
- * `colorizePillsInLine` tints it like the other status pills.
+ * just identifies the pane within that session. Bracketed so
+ * `colorizePillsInLine` tints it like the other status pills. (The tab
+ * id/name slots were dropped in fn-710 T2 — their dead feed was reaped
+ * and the columns are gone from the projection.)
  *
- * Fallbacks (per task spec):
- *   - tab name preferred over raw tab id; both missing drops the tab.
- *   - missing pane drops the ` p<pane>` slot.
- *   - tab AND pane both missing → `""` (nothing left worth showing).
+ * Fallbacks:
+ *   - missing pane → `""` (nothing left worth showing).
  *
  * Emitted as plain text (no SGR codes baked in) — the pill colorizer
  * paints brackets at render time. Strings are bound from the projection;
@@ -257,21 +257,11 @@ export function projectJobRow(row: Record<string, unknown>): string {
  */
 export function backendCoordsSeg(row: Record<string, unknown>): string {
   const paneId = row.backend_exec_pane_id;
-  const tabName = row.backend_exec_tab_name;
-  const tabId = row.backend_exec_tab_id;
-  const tabLabel =
-    tabName != null ? String(tabName) : tabId != null ? String(tabId) : "";
   const paneSeg = paneId == null ? "" : `p${String(paneId)}`;
-  if (tabLabel === "" && paneSeg === "") {
+  if (paneSeg === "") {
     return "";
   }
-  if (tabLabel === "") {
-    return `[${paneSeg}]`;
-  }
-  if (paneSeg === "") {
-    return `[${tabLabel}]`;
-  }
-  return `[${tabLabel} ${paneSeg}]`;
+  return `[${paneSeg}]`;
 }
 
 // Nerd Font disclosure-triangle glyphs (the human's call): caret-right

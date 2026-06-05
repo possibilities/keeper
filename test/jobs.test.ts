@@ -182,27 +182,40 @@ test("projectJobRow: non-resting state renders verbatim; stopped omits the pill"
 });
 
 // ---------------------------------------------------------------------------
-// backendCoordsSeg — the session-less, type-less pill `[<tab> p<pane>]`.
+// backendCoordsSeg — the session-less, type-less pane pill `[p<pane>]`.
 // Bracketed so `colorizePillsInLine` tints it like other status pills.
-// Fallbacks: tab name → tab id → drop; missing pane drops ` p<pane>`;
-// tab AND pane both missing → "".
+// Fallback: missing pane → "". (The tab id/name slots were dropped in
+// fn-710 T2 — their dead feed was reaped and the columns are gone from
+// the projection, so the pill is pane-only.)
 // ---------------------------------------------------------------------------
 
-test("backendCoordsSeg: tab name + pane → '[<tab> p<pane>]'", () => {
+test("backendCoordsSeg: pane → '[p<pane>]'", () => {
   expect(
     backendCoordsSeg({
       backend_exec_type: "zellij",
       backend_exec_session_id: "ada",
       backend_exec_pane_id: "11",
-      backend_exec_tab_id: "3",
-      backend_exec_tab_name: "main",
     }),
-  ).toBe("[main p11]");
+  ).toBe("[p11]");
 });
 
 test("backendCoordsSeg: no `·`, no type, no session id in the pill output", () => {
-  // Belt-and-suspenders against the old shape. Confirm the new pill
+  // Belt-and-suspenders against the old shape. Confirm the pill
   // never carries the old free-text segments.
+  const out = backendCoordsSeg({
+    backend_exec_type: "zellij",
+    backend_exec_session_id: "ada",
+    backend_exec_pane_id: "11",
+  });
+  expect(out).not.toContain("·");
+  expect(out).not.toContain("zellij");
+  expect(out).not.toContain("ada");
+});
+
+test("backendCoordsSeg: stray tab fields on the row are ignored (columns dropped)", () => {
+  // The tab columns are gone from the projection, but the renderer must
+  // not crash or surface a tab slot even if a stale row somehow carries
+  // the fields — the pill reads ONLY `backend_exec_pane_id`.
   const out = backendCoordsSeg({
     backend_exec_type: "zellij",
     backend_exec_session_id: "ada",
@@ -210,79 +223,39 @@ test("backendCoordsSeg: no `·`, no type, no session id in the pill output", () 
     backend_exec_tab_id: "3",
     backend_exec_tab_name: "main",
   });
-  expect(out).not.toContain("·");
-  expect(out).not.toContain("zellij");
-  expect(out).not.toContain("ada");
+  expect(out).toBe("[p11]");
+  expect(out).not.toContain("main");
+  expect(out).not.toContain("3");
 });
 
-test("backendCoordsSeg: tab name missing → falls back to raw tab_id", () => {
-  expect(
-    backendCoordsSeg({
-      backend_exec_type: "zellij",
-      backend_exec_session_id: "ada",
-      backend_exec_pane_id: "11",
-      backend_exec_tab_id: "3",
-      backend_exec_tab_name: null,
-    }),
-  ).toBe("[3 p11]");
-});
-
-test("backendCoordsSeg: tab fully missing → drops the tab slot, pane-only pill", () => {
-  expect(
-    backendCoordsSeg({
-      backend_exec_type: "zellij",
-      backend_exec_session_id: "ada",
-      backend_exec_pane_id: "11",
-      backend_exec_tab_id: null,
-      backend_exec_tab_name: null,
-    }),
-  ).toBe("[p11]");
-});
-
-test("backendCoordsSeg: pane missing → drops the ' p<pane>' slot, tab-only pill", () => {
+test("backendCoordsSeg: pane missing → '' (nothing worth showing)", () => {
   expect(
     backendCoordsSeg({
       backend_exec_type: "zellij",
       backend_exec_session_id: "ada",
       backend_exec_pane_id: null,
-      backend_exec_tab_id: "3",
-      backend_exec_tab_name: "main",
-    }),
-  ).toBe("[main]");
-});
-
-test("backendCoordsSeg: tab AND pane both missing → '' (nothing worth showing)", () => {
-  expect(
-    backendCoordsSeg({
-      backend_exec_type: "zellij",
-      backend_exec_session_id: "ada",
-      backend_exec_pane_id: null,
-      backend_exec_tab_id: null,
-      backend_exec_tab_name: null,
     }),
   ).toBe("");
 });
 
-test("backendCoordsSeg: absent backend_exec_type still composes a pill from tab/pane", () => {
-  // The new shape is session-less AND type-less — the row is already
+test("backendCoordsSeg: absent backend_exec_type still composes a pill from pane", () => {
+  // The shape is session-less AND type-less — the row is already
   // grouped under its session heading by `renderJobsBody`, and the only
-  // backend keeper knows about is zellij. So a present tab/pane still
+  // backend keeper knows about is zellij. So a present pane still
   // produces a pill even when `backend_exec_type` is null. (Old shape
-  // gated on type; new shape doesn't need to.)
+  // gated on type; this shape doesn't need to.)
   expect(
     backendCoordsSeg({
       backend_exec_type: null,
       backend_exec_session_id: "ada",
       backend_exec_pane_id: "11",
-      backend_exec_tab_id: "3",
-      backend_exec_tab_name: "main",
     }),
-  ).toBe("[main p11]");
+  ).toBe("[p11]");
 });
 
 test("backendCoordsSeg: pill is bracketed so colorizePillsInLine can route it", () => {
   // The whole point of moving from ` · <type> <session>/<tab> p<pane>` to
-  // `[<tab> p<pane>]` is to put the segment inside the pill grid — the
+  // `[p<pane>]` is to put the segment inside the pill grid — the
   // colorizer's bracket-scoped regex now sees it as a candidate token.
   // (Whether it actually tints depends on `PILL_COLORS` entries; the
   // shape contract is just that it's bracketed.)
@@ -290,7 +263,6 @@ test("backendCoordsSeg: pill is bracketed so colorizePillsInLine can route it", 
     backend_exec_type: "zellij",
     backend_exec_session_id: "ada",
     backend_exec_pane_id: "11",
-    backend_exec_tab_name: "main",
   });
   expect(pill.startsWith("[")).toBe(true);
   expect(pill.endsWith("]")).toBe(true);
@@ -526,7 +498,7 @@ test("renderJobsBody: expanding a job reveals the backend pill (no sub-agents pr
     expanded: new Set(["j1"]),
   });
   expect(body).toBe(
-    ["--- ada ---", "(x) live [working]", "  [main p11]"].join("\n"),
+    ["--- ada ---", "(x) live [working]", "  [p11]"].join("\n"),
   );
 });
 
@@ -582,7 +554,7 @@ test("renderJobsBody: expanding shows backend pill BEFORE sub-agent lines", () =
     [
       "--- ada ---",
       "(x) ambient [working]",
-      "  [main p11]", // backend pill — rendered before sub-agent lines
+      "  [p11]", // backend pill — rendered before sub-agent lines
       "  general-purpose: investigate [running]",
     ].join("\n"),
   );
@@ -749,7 +721,7 @@ test("renderJobsBody insert mode: selected + expanded → down-triangle, backend
     [
       "  --- ada ---",
       `${SELECTED_LINE_PREFIX}${TRI_DOWN} (a) first [working]`,
-      "    [main p11]", // backend pill: 2 base + its own 2
+      "    [p11]", // backend pill: 2 base + its own 2
       // fn-708: subagent status=ok now omits the pill (absence ≡ ok).
       "    scout: d", // sub-agent line: 2 base + its own 2
     ].join("\n"),
@@ -1000,7 +972,7 @@ test("renderJobsBody: expanded job renders monitors BETWEEN backend pill and sub
     [
       "--- ada ---",
       "(x) ambient [working]",
-      "  [main p11]",
+      "  [p11]",
       "  [ambient] b5217wols",
       "  [monitor] bnamgymkh",
       "  general-purpose: investigate [running]",
@@ -1054,7 +1026,7 @@ test("renderJobsBody: empty / missing monitors blob renders no Monitors section"
       expanded: new Set(["j1"]),
     });
     expect(body).toBe(
-      ["--- ada ---", "(x) ambient [working]", "  [main p11]"].join("\n"),
+      ["--- ada ---", "(x) ambient [working]", "  [p11]"].join("\n"),
     );
   }
 });

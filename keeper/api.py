@@ -200,6 +200,13 @@ from pathlib import Path
 # trailer payload (attribution surface only — the board renderer is
 # the only consumer), so the bump is whitelist-only with no reader
 # logic change.
+#
+# v55 (fn-710 epic, T2) is a whitelist-only bump: the two dead
+# ``jobs.backend_exec_{tab_id,tab_name}`` columns are dropped via a
+# forward-only ``dropColumnIfPresent`` migration (their sole writer,
+# the ``BackendExecSnapshot`` fold, was reaped in T1). keeper-py read
+# neither column, so the bump is whitelist-only with no reader logic
+# change.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -226,6 +233,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         52,
         53,
         54,
+        55,
     }
 )
 

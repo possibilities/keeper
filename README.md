@@ -54,8 +54,7 @@ three terminal-multiplexer backend-exec coordinates
 synchronous `process.env` reads (`ZELLIJ` / `ZELLIJ_SESSION_NAME` /
 `ZELLIJ_PANE_ID`; no fork, no fs, no PPID-walk), folded onto
 `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins via
-`COALESCE`. (`jobs.backend_exec_tab_{id,name}` are dead columns — the fn-684
-feed was retired in fn-710; Task 2 will DROP them.) Generic `backend_exec_*` naming lets a future
+`COALESCE`. Generic `backend_exec_*` naming lets a future
 tmux/wezterm backend slot in without a schema change. Consumers can find
 `/plan:work` calls, `Skill` invocations, every Task-tool subagent
 lifecycle, every session's profile attribution, every planctl-CLI
@@ -649,15 +648,16 @@ collapses to plain stream output. Run any of them with
   re-stamped on every snapshot BEFORE the body byte-compare
   short-circuit, so the count tracks reality even when the rendered
   body is byte-stable. Each job row also carries an optional trailing
-  ` · <type> <session>/<tab> p<pane>` segment (schema v48 / fn-668) —
-  the terminal-multiplexer backend-exec coordinates lifted off the
-  five `jobs.backend_exec_*` columns by the shared `projectJobRow`
-  helper, so the CLI list and the TUI both surface where each live
-  session lives. Plain text (no SGR baked in) so sidecars and
-  non-TTY output stay clean; inner fields fall back gracefully (tab
-  name → raw id; tab missing → bare `<session>`; pane missing →
-  drop the ` p<…>` suffix); rows with no backend coords show nothing
-  at all (never `undefined`, never a placeholder). When the row is
+  `[p<pane>]` pane pill (schema v48 / fn-668) — the terminal-multiplexer
+  backend-exec pane coordinate lifted off the three live
+  `jobs.backend_exec_{type,session_id,pane_id}` columns by the shared
+  `projectJobRow` helper, so the CLI list and the TUI both surface which
+  pane each live session runs in (the row is already grouped under its
+  `--- <session> ---` heading). Plain text (no SGR baked in) so sidecars
+  and non-TTY output stay clean; a missing pane drops the pill entirely,
+  so rows with no backend coords show nothing at all (never `undefined`,
+  never a placeholder). The dead `backend_exec_tab_{id,name}` columns
+  that once fed a `<tab>` slot were dropped in fn-710 (T2). When the row is
   expanded in insert mode, a per-job Monitors section (schema v51 /
   fn-682) lists the live background shells the session is running —
   one indented line per entry parsed off the `jobs.monitors`
@@ -1263,20 +1263,19 @@ fork, no fs, no PPID-walk; absent env ⇒ NULL coords, never bogus
 `type='zellij'`) — and the reducer's `applyEvent` arm folds the three
 onto `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins
 via `COALESCE`, so a re-fold from cursor=0 reproduces byte-identical
-rows. (`jobs.backend_exec_tab_{id,name}` are dead columns — the fn-684
-feed was retired in fn-710.) Generic `backend_exec_*` naming lets a
+rows. Generic `backend_exec_*` naming lets a
 future tmux/wezterm backend slot in without a schema change — only the
 hook's env-name table changes. The three live `jobs.backend_exec_*` columns
 (`type`, `session_id`, `pane_id`) are display-only on
 `JOBS_DESCRIPTOR` (like `profile_name` — read by the renderer, never
 a `sortable` / `filters` / `jsonColumns` key); the shared
 `projectJobRow` + `renderJobsBody` helpers append an optional trailing
-` · <type> <session>/<tab> p<pane>` segment when `backend_exec_type`
-is non-null, gracefully showing nothing when coords are absent. The
-segment surfaces identically on `keeper jobs` (CLI list mode) and the
-TUI (the view-shell's shared `renderBody` callback). Tab/pane
-RENAMING is explicitly out of scope — this layer only gets the data in
-place and visible so the human can see where each live session lives.
+`[p<pane>]` pane pill, gracefully showing nothing when the pane is
+absent. The pill surfaces identically on `keeper jobs` (CLI list mode)
+and the TUI (the view-shell's shared `renderBody` callback). Two further
+`jobs.backend_exec_tab_{id,name}` columns once carried a daemon-resolved
+`<tab>` slot; that feed was retired and the columns dropped in fn-710
+(schema v55), leaving only the three hook-fed coords above.
 keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `48`
 (whitelist-only; keeper-py reads `jobs` / `git_status` / `meta`, not
 the `backend_exec_*` columns).
