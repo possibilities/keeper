@@ -148,7 +148,6 @@ import type {
   SetAutopilotPausedRequestMessage,
   SetAutopilotPausedResultMessage,
 } from "./server-worker";
-import type { TabNamerWorkerData } from "./tab-namer-worker";
 import type {
   ApiErrorMessage,
   InputRequestMessage,
@@ -720,7 +719,7 @@ const ZELLIJ_WATERMARK_BASENAME = ".keeperd-watermarks.json";
  * state is skipped before the INSERT — the bulk of feed lines are exact
  * consecutive repeats that fold to no-ops, yet each otherwise pays the
  * full realtime pipeline (writer-lock INSERT → `data_version` bump →
- * wake worker → drain → fold → kick server-/tab-namer-worker). The
+ * wake worker → drain → fold → kick server-worker). The
  * per-scan `liveJobs` map seeds each job's last-known tab tuple from the
  * `backend_exec_tab_id` / `backend_exec_tab_name` columns
  * `readLiveJobsWithCoords` now carries, and the gate's predicate MIRRORS
@@ -1716,14 +1715,6 @@ function runDaemon(): void {
     // nothing) and during shutdown.
     if (folded && !shuttingDown) {
       serverWorker.postMessage({ type: "kick" } satisfies KickMessage);
-      // fn-699: also kick the tab-namer so it runs its reconcile tick
-      // immediately. A fold may have moved `title` (transcript worker) or
-      // `backend_exec_tab_name` (zellij-events feed drift), and the renamer
-      // must re-converge the tab name. Same edge-triggered hint as the
-      // server-worker kick; the tab-namer's `data_version` poll is the
-      // lost-wakeup backstop, and its tick is idempotent so a kick+poll
-      // double-fire is a harmless no-op.
-      tabNamerWorker.postMessage({ type: "kick" } satisfies KickMessage);
     }
   }
 
@@ -3259,39 +3250,6 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
-  // Spawn the tab-namer worker (fn-680, reworked fn-699) — the TWELFTH
-  // worker thread. A PURE SIDE-EFFECTOR: it opens its own read-only
-  // connection and — reactively, kicked by main after every drain plus a
-  // `data_version` poll backstop (mirroring the server-worker) — reads the
-  // live jobs that carry a resolved
-  // `(backend_exec_session_id, backend_exec_tab_id)` pair AND a non-NULL
-  // transcript `title`, then shells the focus-safe zellij
-  // `action rename-tab-by-id` op via `ExecBackend.renameTab` UNCONDITIONALLY
-  // whenever the sanitized title differs from the last-observed
-  // `backend_exec_tab_name` (no permanent suppression — a tab that drifts
-  // back to `Tab #N` on resume re-converges within one kick/poll cycle).
-  // The worker writes NOTHING to the DB, mints no events, and posts nothing
-  // back to main — fn-678 made the tab name purely cosmetic (reap is by
-  // `backend_exec_tab_id`, launch dedup by `pending_dispatches`), so
-  // renaming every tab is safe and the convergence loop closes through the
-  // zellij-events feed's read-back of `backend_exec_tab_name`. It RECEIVES
-  // `{type:"kick"}` and `{type:"shutdown"}` from main; it sends nothing.
-  const tabNamerWorker = new Worker(
-    new URL("./tab-namer-worker.ts", import.meta.url).href,
-    {
-      workerData: { dbPath } satisfies TabNamerWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
-
-  tabNamerWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] tab-namer worker error:", err.message ?? err);
-    fatalExit();
-  };
-
-  tabNamerWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
-
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -3345,24 +3303,20 @@ function runDaemon(): void {
     restoreWorker.postMessage({
       type: "shutdown",
     } satisfies ShutdownMessage);
-    tabNamerWorker.postMessage({
-      type: "shutdown",
-    } satisfies ShutdownMessage);
     zellijEventsWorker.postMessage({
       type: "shutdown",
     } satisfies ShutdownMessage);
 
-    // Bun surfaces worker exit via the "close" event. Await ALL TWELVE
+    // Bun surfaces worker exit via the "close" event. Await ALL ELEVEN
     // workers' close (the server worker releases its socket + lock, the
     // transcript + plan + usage + dead-letter + zellij-events workers
     // unsubscribe their watchers, the exit-watcher releases its
     // kqueue/pidfd fd, the autopilot worker aborts its in-flight
-    // confirm, the restore worker closes its read-only DB connection,
-    // and the tab-namer worker clears its tick interval + closes its
-    // read-only DB connection in their own shutdown handlers — that
-    // teardown must land, or the socket / native watches / kernel fd
-    // leak into the next boot), raced against a single shared deadline
-    // so a wedged worker can't block our clean shutdown forever.
+    // confirm, and the restore worker closes its read-only DB connection
+    // in their own shutdown handlers — that teardown must land, or the
+    // socket / native watches / kernel fd leak into the next boot),
+    // raced against a single shared deadline so a wedged worker can't
+    // block our clean shutdown forever.
     const exited = (w: Worker): Promise<void> =>
       new Promise<void>((resolve) => {
         w.addEventListener("close", () => resolve());
@@ -3378,7 +3332,6 @@ function runDaemon(): void {
       exited(deadLetterWorker),
       exited(autopilotWorkerInstance),
       exited(restoreWorker),
-      exited(tabNamerWorker),
       exited(zellijEventsWorker),
     ];
     await Promise.race([
@@ -3433,11 +3386,6 @@ function runDaemon(): void {
     }
     try {
       restoreWorker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      tabNamerWorker.terminate();
     } catch {
       // best-effort if it already exited
     }
