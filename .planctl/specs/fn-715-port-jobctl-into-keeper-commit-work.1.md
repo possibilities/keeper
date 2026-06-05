@@ -67,5 +67,5 @@ verbs (extend the makeHarness SUBCOMMANDS loop in test/keeper-cli.test.ts).
 - [ ] cli/keeper.ts dispatches all four new verbs to stub modules; `pnpm lint` + `pnpm typecheck` green.
 
 ## Done summary
-
+Built the four shared commit-work primitives (write-capable git-exec, flock(2) FFI lock, get_session_dirty_files attribution reader via readonly DB, env-only session-id resolver) and wired the keeper dispatcher to route commit-work/find-task-commit/session-state/show-session-files to stub modules. 46 foundation+dispatch tests green; lint + typecheck clean.
 ## Evidence
