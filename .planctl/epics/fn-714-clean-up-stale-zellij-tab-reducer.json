@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-714-clean-up-stale-zellij-tab-reducer",
   "bundles": [],
   "closer_done_at": "2026-06-05T20:15:31.934604Z",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T20:15:31.934604Z"
+  "updated_at": "2026-06-05T20:16:17.491093Z"
 }
