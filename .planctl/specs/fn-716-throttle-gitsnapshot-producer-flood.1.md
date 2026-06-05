@@ -45,5 +45,5 @@ mid-scan dirty-bit re-run still hold with a ceiling.
 - [ ] `cancel()` clears both the debounce and ceiling timers
 
 ## Done summary
-
+Added an optional max-wait ceiling to RescanScheduler: default 0 preserves byte-identical trailing-only behavior; a set ceiling bounds staleness under continuous churn by flushing at maxWaitMs; cancel() clears both timers. Fake-clock harness gained flushDelay(ms).
 ## Evidence

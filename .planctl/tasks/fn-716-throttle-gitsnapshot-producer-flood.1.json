@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Add max-wait ceiling to RescanScheduler",
-  "updated_at": "2026-06-05T20:24:09.427914Z"
+  "updated_at": "2026-06-05T20:38:39.837781Z",
+  "worker_done_at": "2026-06-05T20:38:39.837781Z"
 }
