@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-716-throttle-gitsnapshot-producer-flood",
   "bundles": [],
   "closer_done_at": "2026-06-05T23:04:03.050237Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T23:04:03.050237Z"
+  "updated_at": "2026-06-05T23:04:27.610018Z"
 }
