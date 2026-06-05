@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-706-fix-zellij-feed-cliff-and-tab-churn",
   "bundles": [],
+  "closer_done_at": "2026-06-05T00:41:46.807153Z",
   "created_at": "2026-06-04T23:35:15.266144Z",
   "depends_on_epics": [],
   "id": "fn-706-fix-zellij-feed-cliff-and-tab-churn",
@@ -9,11 +10,11 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "fix zellij feed cliff and tab churn",
   "touched_repos": [
     "/Users/mike/code/keeper",
     "/Users/mike/code/zellij-tab-namer"
   ],
-  "updated_at": "2026-06-04T23:35:15.266144Z"
+  "updated_at": "2026-06-05T00:41:46.807153Z"
 }
