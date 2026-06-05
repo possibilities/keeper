@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Dedup BackendExecSnapshot mints at the seam",
-  "updated_at": "2026-06-05T04:26:02.872566Z"
+  "updated_at": "2026-06-05T05:20:14.750282Z",
+  "worker_done_at": "2026-06-05T05:20:14.750282Z"
 }

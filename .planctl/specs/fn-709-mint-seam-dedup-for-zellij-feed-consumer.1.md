@@ -123,5 +123,5 @@ plan:
 - [ ] No SCHEMA_VERSION bump and no keeper/api.py change (schema-neutral confirmed)
 
 ## Done summary
-
+Added a consumer-side mint-seam dedup to scanZellijEventsDir: a feed line whose effective (tab_id, tab_name) already equals the job's projection is skipped before the BackendExecSnapshot INSERT, eliminating the consecutive no-op mints that were 53.6% of the event log. Predicate mirrors the fold's COALESCE(tab_id)/hard-assign(tab_name) asymmetry; in-scan last-known advances only after a successful insert. readLiveJobsWithCoords/LiveJobRow now carry backend_exec_tab_id/_name and the liveJobs map value is {job_id,tabId,tabName}. Schema-neutral. 6 new tests (in-scan dedup, A→B→A flap=3, cross-scan seeded skip, null-tab_id COALESCE, null seeded name, mint→fold→seed loop); all 26 pass, typecheck clean.
 ## Evidence
