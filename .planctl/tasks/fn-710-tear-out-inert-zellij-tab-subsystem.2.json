@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-05T14:05:01.162060Z",
+  "depends_on": [
+    "fn-710-tear-out-inert-zellij-tab-subsystem.1"
+  ],
+  "epic": "fn-710-tear-out-inert-zellij-tab-subsystem",
+  "id": "fn-710-tear-out-inert-zellij-tab-subsystem.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Drop dead backend_exec tab columns",
+  "updated_at": "2026-06-05T14:05:01.162060Z"
+}
