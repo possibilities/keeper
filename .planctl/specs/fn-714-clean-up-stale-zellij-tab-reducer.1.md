@@ -19,5 +19,5 @@ The rest of the block (lines 7244-7253) is accurate and should be left intact.
 - [ ] `tsc --noEmit` still clean after the edit
 
 ## Done summary
-
+Removed stale comment lines referencing deleted backend_exec_tab_{id,name} columns and the T4 tab-resolver worker; comment-only edit, tsc clean.
 ## Evidence
