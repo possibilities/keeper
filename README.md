@@ -101,19 +101,19 @@ Every planctl CLI invocation emits a `planctl_invocation` NDJSON envelope on std
 
 `init` is the session-id-free mutating verb: it builds its own commit payload directly (an explicit list of the bootstrap files it created), so it needs neither the touched-paths log nor `CLAUDE_CODE_SESSION_ID`. It lands a `chore(planctl): init <project-name>` commit with no `Session-Id:` trailer, but only when it wrote something AND the cwd is inside a git work tree — an idempotent re-run or an `init` in a non-git dir takes the read-only path with no commit.
 
-For source-code commits from worker agents, use `jobctl commit-work`:
+For source-code commits from worker agents, use `keeper commit-work`:
 
 ```bash
 # Preview what will be staged
-jobctl commit-work --preview-files
+keeper commit-work --preview-files
 
 # Commit with a message (auto-pushes to origin on success)
-jobctl commit-work "feat(scope): add the feature
+keeper commit-work "feat(scope): add the feature
 
 Task: fn-N-slug.M"
 ```
 
-On success, `jobctl commit-work` emits two NDJSON envelopes on stdout — the
+On success, `keeper commit-work` emits two NDJSON envelopes on stdout — the
 commit envelope (`{success, commit_sha, files}`) and the push envelope
 (`{success, pushed, remote, branch}`). If the branch has no upstream, it is
 auto-set via `git push -u origin HEAD` on the first push. On push failure the

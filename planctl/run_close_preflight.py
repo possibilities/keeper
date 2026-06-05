@@ -16,7 +16,7 @@ fetch) into a single read-only verb that returns one envelope:
 Resolution is cwd-based via ``resolve_project`` — ``/plan:close`` already
 ``cd``s to ``primary_repo`` in Phase 0a, so no epic-keyed discovery is needed.
 
-**Fail-loud on the first ``jobctl find-task-commit`` failure** (replicating the
+**Fail-loud on the first ``keeper find-task-commit`` failure** (replicating the
 old pipeline's ``set -eo pipefail`` semantics) rather than truncating
 ``commit_groups``. The render and commit-group fetches are read-only shell-outs;
 any non-zero exit emits a typed ``{success:false, error:{code,message,details}}``
@@ -114,13 +114,13 @@ def _render_snippet_context(epic_id: str, primary_repo: str) -> str:
 
 
 def _commit_groups(task_ids: list[str], primary_repo: str) -> list[dict[str, Any]]:
-    """Group ``jobctl find-task-commit`` output by repo, fail-loud on first failure.
+    """Group ``keeper find-task-commit`` output by repo, fail-loud on first failure.
 
     Replicates the old skill pipeline's ``set -eo pipefail`` semantics + the
     ``group_by(.repo) | map({repo, shas})`` jq recipe: shell
-    ``jobctl find-task-commit <task_id>`` per task, collect every
+    ``keeper find-task-commit <task_id>`` per task, collect every
     ``{repo, sha}`` commit, and group into ``[{repo, shas:[...]}]`` in
-    first-seen repo order. The FIRST non-zero ``jobctl`` exit aborts with a
+    first-seen repo order. The FIRST non-zero ``keeper`` exit aborts with a
     typed ``COMMIT_LOOKUP_FAILED`` error rather than truncating the result.
     """
     import json
@@ -132,7 +132,7 @@ def _commit_groups(task_ids: list[str], primary_repo: str) -> list[dict[str, Any
     for task_id in task_ids:
         try:
             proc = subprocess.run(
-                ["jobctl", "find-task-commit", task_id],
+                ["keeper", "find-task-commit", task_id],
                 cwd=str(Path(primary_repo).resolve()),
                 capture_output=True,
                 text=True,
@@ -141,12 +141,12 @@ def _commit_groups(task_ids: list[str], primary_repo: str) -> list[dict[str, Any
         except OSError as exc:
             _emit_preflight_error(
                 "COMMIT_LOOKUP_FAILED",
-                f"failed to shell jobctl find-task-commit for {task_id}: {exc}",
+                f"failed to shell keeper find-task-commit for {task_id}: {exc}",
             )
         if proc.returncode != 0:
             _emit_preflight_error(
                 "COMMIT_LOOKUP_FAILED",
-                f"jobctl find-task-commit exited {proc.returncode} for {task_id}",
+                f"keeper find-task-commit exited {proc.returncode} for {task_id}",
                 details={"task_id": task_id, "stderr": (proc.stderr or "").strip()},
             )
         try:
@@ -154,7 +154,7 @@ def _commit_groups(task_ids: list[str], primary_repo: str) -> list[dict[str, Any
         except json.JSONDecodeError as exc:
             _emit_preflight_error(
                 "COMMIT_LOOKUP_FAILED",
-                f"jobctl find-task-commit returned unparseable JSON for {task_id}: {exc}",
+                f"keeper find-task-commit returned unparseable JSON for {task_id}: {exc}",
                 details={"task_id": task_id, "stdout": (proc.stdout or "").strip()},
             )
         for commit in payload.get("commits", []):

@@ -7,7 +7,7 @@ description: >-
   entry; no auto-invoke from free text. Use when the human types `/plan:close
   <epic_id>` once every task in the epic is `done`.
 argument-hint: "<epic_id> [instructions]"
-allowed-tools: Bash(planctl:*), Bash(jobctl:*), Bash(git rev-parse:*), Bash(git log:*), Bash(git status:*), Bash(git show:*), Bash(git diff:*), Read, Task
+allowed-tools: Bash(planctl:*), Bash(keeper:*), Bash(git rev-parse:*), Bash(git log:*), Bash(git status:*), Bash(git show:*), Bash(git diff:*), Read, Task
 disable-model-invocation: true
 ---
 
@@ -54,7 +54,7 @@ The success envelope carries five fields:
 - `primary_repo` — the resolved primary repo (absolute path).
 - `tasks` — `[{id, title, status}, ...]`, ordinal-ordered.
 - `all_done` — `true` iff every task is `status: done`.
-- `commit_groups` — `[{repo, shas: [...]}, ...]`, the auditor's commit set. The verb shells `jobctl find-task-commit` per task and groups by repo, **failing loud on the first failure** rather than truncating. Empty array is legal — the auditor handles it.
+- `commit_groups` — `[{repo, shas: [...]}, ...]`, the auditor's commit set. The verb shells `keeper find-task-commit` per task and groups by repo, **failing loud on the first failure** rather than truncating. Empty array is legal — the auditor handles it.
 - `snippet_context` — the `promptctl render-spec <epic_id> --format human` prose blob both the `quality-auditor` and `classifier` subagents read as-is.
 
 **`cd` into `primary_repo`** before any subsequent git operations or follow-up planctl mutating verbs (Phase 8 `scaffold`, Phase 10 `epic close`). All `.planctl/` state for this epic lives there. If the `cd` fails, stop: *"BLOCKED: TOOLING_FAILURE — primary_repo `<path>` does not exist or is not accessible."*

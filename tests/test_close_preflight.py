@@ -2,14 +2,14 @@
 
 The verb wraps the /plan:close Phase 0a/2 fetch behind one envelope:
 ``{primary_repo, tasks, all_done, commit_groups, snippet_context}``. It shells
-`jobctl find-task-commit` per task (grouped by repo, fail-loud) and
+`keeper find-task-commit` per task (grouped by repo, fail-loud) and
 `promptctl render-spec` for the snippet context — both are monkeypatched here
 via the module-level `subprocess.run` so the tests stay hermetic.
 
 Coverage (per the task's Test notes):
 - all_done true / false
 - empty commit set → commit_groups: []
-- jobctl failure → fail-loud typed COMMIT_LOOKUP_FAILED error (exit 1)
+- keeper failure → fail-loud typed COMMIT_LOOKUP_FAILED error (exit 1)
 - empty render → snippet_context: ""
 - bad / missing epic id → typed error
 """
@@ -77,7 +77,7 @@ def _fake_invoke(
 ):
     """Build a fake `subprocess.run` dispatching on the shelled command.
 
-    - `jobctl find-task-commit <tid>` → CompletedProcess with a `{commits:[...]}`
+    - `keeper find-task-commit <tid>` → CompletedProcess with a `{commits:[...]}`
       JSON stdout (from `commits_by_task[tid]`), or rc=1 when tid == commit_fail_task.
     - `promptctl render-spec ...` → CompletedProcess with `render_stdout` / `render_rc`.
     """
@@ -85,7 +85,7 @@ def _fake_invoke(
     real_run = subprocess.run
 
     def _run(cmd, *args, **kwargs):
-        if cmd[:2] == ["jobctl", "find-task-commit"]:
+        if cmd[:2] == ["keeper", "find-task-commit"]:
             tid = cmd[2]
             if tid == commit_fail_task:
                 return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
@@ -195,7 +195,7 @@ class TestCommitGroups:
             {"repo": "/r/b", "shas": ["bbb"]},
         ]
 
-    def test_jobctl_failure_is_fail_loud(self, project, monkeypatch):
+    def test_keeper_failure_is_fail_loud(self, project, monkeypatch):
         epic_id, task_ids = _make_epic(project, statuses=["done"])
         monkeypatch.setattr(
             run_close_preflight.subprocess,

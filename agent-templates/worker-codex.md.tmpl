@@ -58,10 +58,10 @@ Read those blocks from the brief. Do NOT shell `planctl cat` for either spec —
 Then load runtime state:
 
 ```bash
-jobctl session-state
+keeper session-state
 ```
 
-From `jobctl session-state` note `status_porcelain` (uncommitted files), `head_sha`, and `branch`. Use `$PLANCTL show $TASK_ID` only if you need the runtime status — usually you don't.
+From `keeper session-state` note `status_porcelain` (uncommitted files), `head_sha`, and `branch`. Use `$PLANCTL show $TASK_ID` only if you need the runtime status — usually you don't.
 
 **Target-repo sanity check:** if `TARGET_REPO` is set and `pwd` doesn't match it, stop with: *"BLOCKED: TOOLING_FAILURE — cwd `<pwd>` does not match TARGET_REPO `<TARGET_REPO>`."* State writes (`planctl done`, etc.) auto-route to `PRIMARY_REPO` via the planctl envelope; you do not need to chdir for them.
 
@@ -69,7 +69,7 @@ Parse the task spec for what matters: **Acceptance** (the bar you must clear), *
 
 **Codex tracks file changes (`tracks_file_changes: true`).** After `[pairctl] completed`, the working tree will be dirty with codex's edits. That is EXPECTED — not a harness-dropped predecessor. Do NOT `git stash` or `git restore` post-completion; that hides codex's work. The "harness-dropped predecessor" rule below applies only to dirty state seen at the very start of your turn, BEFORE you've invoked pairctl.
 
-**Harness-dropped predecessor (pre-invocation only).** If `status_porcelain` already contains files you'd expect codex to write, or `jobctl find-task-commit $TASK_ID` returns a commit, a previous worker on this task was cut short:
+**Harness-dropped predecessor (pre-invocation only).** If `status_porcelain` already contains files you'd expect codex to write, or `keeper find-task-commit $TASK_ID` returns a commit, a previous worker on this task was cut short:
 
 - Source commit already shipped → skip Phases 2–4, verify the diff covers the acceptance, jump to Phase 5.
 - Uncommitted work in `status_porcelain` (and `/tmp/pairctl-worker-<task_id>.yaml` exists and is well-formed) → the prior codex run landed work but the wrapper didn't commit. Read the YAML to understand what codex did, verify against acceptance, jump to Phase 4 (commit) and Phase 5 (done).
@@ -90,9 +90,9 @@ Include in the prompt:
 5. The epic's `## Quick commands` block — codex should run these as smoke tests before declaring done.
 6. A closing directive:
 
-   > Implement the task and stop. Do NOT run `jobctl commit-work`. Do NOT run `planctl done`. Do NOT touch `.planctl/` state. The wrapper handles all commits and state — your job is the source edits and a brief summary of what you changed.
+   > Implement the task and stop. Do NOT run `keeper commit-work`. Do NOT run `planctl done`. Do NOT touch `.planctl/` state. The wrapper handles all commits and state — your job is the source edits and a brief summary of what you changed.
 
-This boundary is load-bearing: codex must not call `jobctl` or `planctl done`, because the wrapper owns the two-commit contract. If codex commits anything, that's a `BLOCKED: TOOLING_FAILURE` because the wrapper can no longer enforce the trailer/state pairing cleanly.
+This boundary is load-bearing: codex must not call `keeper` or `planctl done`, because the wrapper owns the two-commit contract. If codex commits anything, that's a `BLOCKED: TOOLING_FAILURE` because the wrapper can no longer enforce the trailer/state pairing cleanly.
 
 ## Phase 3 — Invoke pairctl via Monitor
 
@@ -158,16 +158,16 @@ If the diff covers acceptance but smoke tests would catch regressions, run the e
 Two-commit-per-task contract identical to the native worker: this commit ships **source** (`feat(scope): ...`) carrying a `Task: $TASK_ID` trailer; the state commit lands automatically when `planctl done` fires at `emit()` (Phase 6).
 
 ```bash
-jobctl commit-work "<type>(<scope>): <summary>
+keeper commit-work "<type>(<scope>): <summary>
 
 <optional body — 1-3 bullets; you may quote codex's summary>
 
 Task: $TASK_ID"
 ```
 
-`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`; `<scope>` comes from the task's file list. `commit-work` scopes to session-touched files and hard-stops a runaway list (`file_list_too_large`) on its own — run `jobctl commit-work --preview-files` first only if you're unsure what's staged. Push to origin is automatic on success.
+`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`; `<scope>` comes from the task's file list. `commit-work` scopes to session-touched files and hard-stops a runaway list (`file_list_too_large`) on its own — run `keeper commit-work --preview-files` first only if you're unsure what's staged. Push to origin is automatic on success.
 
-**On `lint_failed`** (`{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>"}`): compose a follow-up prompt for codex listing the failed files and the stderr, invoke pairctl with `--chat-id <id>`, and loop. Do not edit codex's code yourself. After codex fixes it, re-stage with `git add` and re-invoke `jobctl commit-work` with the same message. The only `commit-work` failure you handle inline.
+**On `lint_failed`** (`{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>"}`): compose a follow-up prompt for codex listing the failed files and the stderr, invoke pairctl with `--chat-id <id>`, and loop. Do not edit codex's code yourself. After codex fixes it, re-stage with `git add` and re-invoke `keeper commit-work` with the same message. The only `commit-work` failure you handle inline.
 
 **Any other non-zero exit → `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope JSON (`commit_failed`, `push_*`, `lock_timeout`, sanitization, etc.). Don't patch the tool you're calling.
 
@@ -230,6 +230,6 @@ The parent stops the loop and surfaces this verbatim.
 - **Malformed YAML on resume → fresh invocation.** Don't try to repair `/tmp/pairctl-worker-$TASK_ID.yaml`; pairctl rewrites it.
 - **`tracks_file_changes: true` means post-`completed` dirty tree is EXPECTED.** Never `git stash` or `git restore` after Monitor returns — you'd be hiding codex's work.
 - **`[pairctl] failed` → `BLOCKED: TOOLING_FAILURE`.** Same contract as native workers; don't patch the tool you're calling.
-- **Verify before commit, commit before done.** Phase 4 → 5 → 6. Two commits per task in history: source first (your `jobctl commit-work` in Phase 5), state second (auto-committed inline by `planctl done` in Phase 6).
-- **`jobctl commit-work` failures surface as `BLOCKED: TOOLING_FAILURE`,** except `lint_failed` — write a follow-up prompt asking codex to fix per stderr, re-invoke pairctl, re-stage, re-invoke `commit-work`. Don't patch codex's code yourself.
+- **Verify before commit, commit before done.** Phase 4 → 5 → 6. Two commits per task in history: source first (your `keeper commit-work` in Phase 5), state second (auto-committed inline by `planctl done` in Phase 6).
+- **`keeper commit-work` failures surface as `BLOCKED: TOOLING_FAILURE`,** except `lint_failed` — write a follow-up prompt asking codex to fix per stderr, re-invoke pairctl, re-stage, re-invoke `commit-work`. Don't patch codex's code yourself.
 - **No `TodoWrite`.** Planctl tracks tasks.

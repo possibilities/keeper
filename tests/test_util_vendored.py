@@ -1,16 +1,9 @@
-"""Byte-identity smoke for the vendored ``planctl._util`` CLI mechanics.
+"""Byte-identity smoke for the ``planctl._util`` CLI mechanics.
 
-Epic ``fn-614`` task ``.1`` severed planctl's hard dependency on
-``cli_common.formatting`` / ``cli_common.atomic`` / ``cli_common.errors``
-by vendoring those modules into ``planctl/_util.py``. The acceptance bar
-is that ``--format {json,yaml}`` and ``--help-json`` output is stable.
-
-Originally this test asserted byte-identity against the upstream
-``cli_common`` helpers (still importable while both packages coexisted in
-the workspace). After ``cli_common`` was removed from planctl's declared
-deps (capstone commit ``c669f17``), this test would silently rely on an
-undeclared workspace transitive — so per epic ``fn-618`` we pin the
-expected output strings directly and invoke only the vendored helpers.
+``planctl/_util.py`` owns planctl's formatting / atomic-write / error
+helpers. The acceptance bar is that ``--format {json,yaml}`` and
+``--help-json`` output is byte-stable: the tests pin the expected output
+strings directly and invoke only the ``planctl._util`` helpers.
 """
 
 from __future__ import annotations
@@ -26,15 +19,15 @@ from planctl._util import (
 )
 
 
-def test_atomic_write_byte_identical_with_upstream(tmp_path):
-    """Vendored ``atomic_write`` produces the pinned byte sequence."""
+def test_atomic_write_byte_identical_pinned(tmp_path):
+    """``atomic_write`` produces the pinned byte sequence."""
     payload = "alpha\nbeta\ngamma\n"
     target = tmp_path / "vendored.txt"
     atomic_write(target, payload)
     assert target.read_bytes() == b"alpha\nbeta\ngamma\n"
 
 
-def test_json_dumps_byte_identical_with_upstream():
+def test_json_dumps_byte_identical_pinned():
     """JSON serialisation matches the pinned encoder output byte-for-byte."""
     data = {
         "string": "héllo",  # exercises ensure_ascii=False
@@ -58,7 +51,7 @@ def test_json_dumps_byte_identical_with_upstream():
     assert json_dumps(data) == expected
 
 
-def test_yaml_dump_byte_identical_with_upstream():
+def test_yaml_dump_byte_identical_pinned():
     """YAML serialisation matches the pinned encoder output byte-for-byte."""
     data = {
         "title": "single line",
@@ -86,7 +79,7 @@ def _build_cli():
     return cli
 
 
-def test_group_help_byte_identical_with_upstream():
+def test_group_help_byte_identical_pinned():
     """``--help`` output on a FormattedGroup matches the pinned string."""
     cli = _build_cli()
     result = CliRunner().invoke(cli, ["--help"])
@@ -106,7 +99,7 @@ def test_group_help_byte_identical_with_upstream():
     assert result.output == expected
 
 
-def test_subcommand_help_json_byte_identical_with_upstream():
+def test_subcommand_help_json_byte_identical_pinned():
     """``--help-json`` on an auto-injected subcommand matches the pinned string."""
     cli = _build_cli()
     result = CliRunner().invoke(cli, ["greet", "--help-json"])
@@ -146,7 +139,7 @@ def test_subcommand_help_json_byte_identical_with_upstream():
     assert result.output == expected
 
 
-def test_format_yaml_envelope_byte_identical_with_upstream():
+def test_format_yaml_envelope_byte_identical_pinned():
     """A subcommand emitting via ``format_output(...)`` under ``--format
     {json,yaml}`` must produce the pinned byte sequences.
     """

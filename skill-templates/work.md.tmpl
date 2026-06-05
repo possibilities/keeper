@@ -10,7 +10,7 @@ description: >-
   review gates, no worktree. Use when the human says "work", "/work", or
   invokes the planctl work workflow on an existing `fn-N-slug.M` task.
 argument-hint: "<fn-N-slug.M> [instructions]"
-allowed-tools: Bash(planctl:*), Bash(jobctl:*), Read, Glob, Task, SendMessage
+allowed-tools: Bash(planctl:*), Bash(keeper:*), Read, Glob, Task, SendMessage
 disable-model-invocation: true
 ---
 
@@ -30,7 +30,7 @@ The human said "work", "/work", or passed an existing planctl task id to run. Ac
 
 ## Phase 1 — Claim the task
 
-**Shared-tree principle (read first):** This repo runs concurrent agents and the human's in-progress work in parallel — at any moment the working tree may carry uncommitted changes that have nothing to do with this task. Any file you didn't write through this session belongs to someone else: never auto-stash it, never classify it as in-/out-of-scope for the worker, never commit it. Authoritative attribution comes from `jobctl session-state`'s `session_files` field (subagent writes share the parent session_id in hookctl's tracker, so the orchestrator's session_files already covers worker output) — anything in `status_porcelain` but not in `session_files` is someone else's territory.
+**Shared-tree principle (read first):** This repo runs concurrent agents and the human's in-progress work in parallel — at any moment the working tree may carry uncommitted changes that have nothing to do with this task. Any file you didn't write through this session belongs to someone else: never auto-stash it, never classify it as in-/out-of-scope for the worker, never commit it. Authoritative attribution comes from `keeper session-state`'s `session_files` field (subagent writes share the parent session_id in hookctl's tracker, so the orchestrator's session_files already covers worker output) — anything in `status_porcelain` but not in `session_files` is someone else's territory.
 
 One call asserts invariants, claims the task (`todo` → `in_progress`), and returns the full worker briefing — no `detect`, no separate `show`/`cat`, no `cd`, no standalone `render-spec`. `claim` resolves the owning project cwd-agnostically (scans configured `roots`), so this works from any directory:
 
@@ -122,7 +122,7 @@ Task(
 planctl show <task_id>
 ```
 
-**Two-commit-per-task shape:** Worker Phase 5 runs `jobctl commit-work "<msg>"` first → commit #1 is source (`feat(scope): ...` carrying `Task: <id>` trailer). Worker Phase 6 runs `planctl done`, which emits a `planctl_invocation` envelope; the hookctl-mutation hook lands commit #2 (`.planctl/` state, subject `chore(planctl): done <task_id>`). Source-before-state in history: source is "here's the work," state is "…and it's accepted." If `status: done` after the worker returns, both commits are guaranteed to be in place — `done` cannot fire before the source commit lands.
+**Two-commit-per-task shape:** Worker Phase 5 runs `keeper commit-work "<msg>"` first → commit #1 is source (`feat(scope): ...` carrying `Task: <id>` trailer). Worker Phase 6 runs `planctl done`, which emits a `planctl_invocation` envelope; the hookctl-mutation hook lands commit #2 (`.planctl/` state, subject `chore(planctl): done <task_id>`). Source-before-state in history: source is "here's the work," state is "…and it's accepted." If `status: done` after the worker returns, both commits are guaranteed to be in place — `done` cannot fire before the source commit lands.
 
 If `status: done`, continue to Phase 3. If not:
 
@@ -137,13 +137,13 @@ If `status: done`, continue to Phase 3. If not:
   1. Compute state-diff in one call:
 
      ```bash
-     jobctl find-task-commit <task_id>; planctl show <task_id>
+     keeper find-task-commit <task_id>; planctl show <task_id>
      ```
 
      A non-empty `commits` list means the source commit landed; only `planctl done` remains. Otherwise the worker dropped mid-implementation.
 
   2. Build a tight resume directive — imperative, no narrative:
-     - **No source commit landed:** *"Resume task `<id>`. Finish implementation, run tests, `jobctl commit-work`, `planctl done`."*
+     - **No source commit landed:** *"Resume task `<id>`. Finish implementation, run tests, `keeper commit-work`, `planctl done`."*
      - **Source commit landed but status still `in_progress`:** *"Source commit `<sha>` landed. Run `planctl done <task_id> --summary "..."` now."*
 
      The worker's agent spec already says "resume directives outrank phases" and "do not re-anchor" at the top — don't repeat those here. Keep the directive a one-liner that names the next concrete action.
@@ -170,7 +170,7 @@ If `status: done`, continue to Phase 3. If not:
      Task(subagent_type="work:worker", description="Resume <task_id>", prompt=<envelope.prompt>)
      ```
 
-     No `model=` kwarg — the agent file owns the model. The "harness-dropped predecessor" branch inside the worker agent spec's Phase 1 handles detection (uses `jobctl find-task-commit` + `jobctl session-state` to decide whether to skip ahead to `planctl done` or continue from Phase 3).
+     No `model=` kwarg — the agent file owns the model. The "harness-dropped predecessor" branch inside the worker agent spec's Phase 1 handles detection (uses `keeper find-task-commit` + `keeper session-state` to decide whether to skip ahead to `planctl done` or continue from Phase 3).
 
   3. Re-check `planctl show <task_id>` after the spawn returns:
      - `done` → continue to Phase 3.
@@ -207,18 +207,18 @@ If tests fail, surface the failure verbatim. Do not auto-fix — the human makes
 1. **Validate the epic and read tree state in one call.** `validate` exits non-zero on `valid: false`, so `&&` short-circuits — `session-state` only runs once the epic validates:
 
    ```bash
-   planctl validate --epic <epic_id> && jobctl session-state
+   planctl validate --epic <epic_id> && keeper session-state
    ```
 
    `valid: false` → surface errors verbatim and stop (no auto-fix; `session-state` never ran). Otherwise read the `session-state` envelope — never infer "everything committed" from the worker's narration alone (subagent result-overflow can truncate output).
 
    `status_porcelain` is the *whole tree's* uncommitted files; `session_files` is what this session (orchestrator + subagents, shared parent session_id) touched. **Trust `session_files` as your scope of authority** — anything dirty but not in it is concurrent-agent or human work; leave it alone (the Phase 1 shared-tree rule).
 
-   Under commit-before-done, `status: done` implies the source commit landed. So: every `session_files` path committed → continue. Any *still* dirty → unexpected state; surface `jobctl session-state` verbatim and **stop** (no auto-resume, no auto-commit — the human investigates).
+   Under commit-before-done, `status: done` implies the source commit landed. So: every `session_files` path committed → continue. Any *still* dirty → unexpected state; surface `keeper session-state` verbatim and **stop** (no auto-resume, no auto-commit — the human investigates).
 
 2. **Do NOT close the epic.** `planctl epic close` stays manual.
 
-3. **`jobctl commit-work` failures surface as BLOCKED.** Lint/commit/push failure → worker returns `BLOCKED: TOOLING_FAILURE` with the verbatim envelope; Phase 2b short-circuits. The human resolves and re-runs `/plan:work`; Phase 2b's harness-drop path picks up via `status: in_progress`.
+3. **`keeper commit-work` failures surface as BLOCKED.** Lint/commit/push failure → worker returns `BLOCKED: TOOLING_FAILURE` with the verbatim envelope; Phase 2b short-circuits. The human resolves and re-runs `/plan:work`; Phase 2b's harness-drop path picks up via `status: in_progress`.
 
 ## Phase 5 — Report
 
@@ -233,8 +233,8 @@ Include per-task commit sha from worker return. No menu, no follow-up prompts.
 ## Guardrails
 
 - **Never auto-closes the epic** — `planctl epic close` stays the human's call.
-- **Commit-then-done contract:** the worker commits source (`jobctl commit-work`) before stamping `planctl done`. `status: done` after the worker returns implies the source commit already landed.
-- **`jobctl commit-work` failures all surface as `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope. Workers never patch the tool they're calling — the human resolves and re-runs.
+- **Commit-then-done contract:** the worker commits source (`keeper commit-work`) before stamping `planctl done`. `status: done` after the worker returns implies the source commit already landed.
+- **`keeper commit-work` failures all surface as `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope. Workers never patch the tool they're calling — the human resolves and re-runs.
 - **Never auto-retries a semantic failure** (`BLOCKED: <CATEGORY>`) — surface and stop. Harness drops *do* auto-recover via Phase 2b's 5-attempt best-effort budget.
 - **Tier routing is owned by keeper + planner, not this skill** — spawn `work:worker` as a bare literal, no `model=`, no tier-read.
 - **Attribution is `session_files`, not `status_porcelain`** (Phase 1 shared-tree rule) — never inspect, classify, or commit dirty files this session didn't write. `done` + dirty session files is an off-happy-path state: surface and stop.

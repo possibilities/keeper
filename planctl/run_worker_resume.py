@@ -132,7 +132,7 @@ def run(args: SimpleNamespace) -> int:
     # Read task status. Under the commit-then-done worker contract, `done` is
     # the last thing the worker fires — observing `done` here means the source
     # commit already landed (the harness-dropped predecessor's trailer commit
-    # is discoverable via `jobctl find-task-commit`). The respawned worker just
+    # is discoverable via `keeper find-task-commit`). The respawned worker just
     # needs to verify and call `planctl done` (idempotent re-call is fine; the
     # planctl mutation hook handles state commits).
     task_path = data_dir / "tasks" / f"{task_id}.json"

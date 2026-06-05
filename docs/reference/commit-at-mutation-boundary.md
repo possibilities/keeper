@@ -296,32 +296,33 @@ changed.
 
 ---
 
-## 6. Source-Code Commits: `jobctl commit-work`
+## 6. Source-Code Commits: `keeper commit-work`
 
 Source-code commits are not auto-commit territory. Workers commit via
-`jobctl commit-work`:
+`keeper commit-work`:
 
 ```bash
-jobctl commit-work --preview-files
-jobctl commit-work "feat(scope): add the feature
+keeper commit-work --preview-files
+keeper commit-work "feat(scope): add the feature
 
 Task: fn-7-add-auth.2"
 ```
 
-`jobctl commit-work` uses its own flock at
-`$GIT_COMMON_DIR/jobctl-commit.lock`. Planctl's
-`auto_commit_from_invocation` takes NO flock — it scopes each commit to
-its own exact paths via `git commit -F - -- <files>` and absorbs git's
-index/ref lock contention with a bounded retry (§7). The two paths are
-independent: jobctl source commits and planctl `.planctl/` auto-commits
-target disjoint pathspecs, so they never cross-contaminate on the same
-host even when racing the shared index.
+`keeper commit-work` uses its own flock at
+`$GIT_COMMON_DIR/keeper-commit-work.lock` (an `flock(2)` whose fd is
+`FD_CLOEXEC`, so spawned children never inherit or hold the lock).
+Planctl's `auto_commit_from_invocation` takes NO flock — it scopes each
+commit to its own exact paths via `git commit -F - -- <files>` and
+absorbs git's index/ref lock contention with a bounded retry (§7). The
+two paths are independent: keeper source commits and planctl `.planctl/`
+auto-commits target disjoint pathspecs, so they never cross-contaminate
+on the same host even when racing the shared index.
 
 ### Push semantics
 
-`jobctl commit-work` **always pushes** to origin after a successful
+`keeper commit-work` **always pushes** to origin after a successful
 commit — no `--no-push` flag, no CLI-side retry, no rollback of the
-commit on push failure. The CLI emits two NDJSON envelopes:
+commit on push failure. The CLI emits two compact NDJSON envelopes:
 
 1. **Commit envelope**: `{"success": true, "commit_sha": "<sha>", "files": [...]}`
 2. **Push envelope (success)**: `{"success": true, "pushed": true, "remote": "origin", "branch": "<branch>"}`
@@ -353,17 +354,18 @@ possible and the human resolves them.
 
 ### Scoped lint policy
 
-`jobctl commit-work` runs lint inside the flock against the
-session-scoped file set:
+`keeper commit-work` runs the lint matrix inside the flock against the
+session-scoped file set, shelling the cwd-discovered external linters —
+**ruff check** + **ruff format --check** + **ty** + **cli-boundaries**
+(project-wide when any `.py` is staged), per-extension **shellcheck** /
+**zig** / **lua** / **hadolint**, **npm lint** per JS/TS package, plus a
+dedicated **`tsc --noEmit --project`** arm. Exit code is the sole
+pass/fail signal; stderr is captured verbatim.
 
-- **Ruff (Python)** when `pyproject.toml` exists and at least one staged
-  file has a `.py` suffix.
-- **npm lint (JS/TS)** when `package.json` exists with a `lint` script
-  and at least one staged file has a JS/TS suffix.
-
-Both linters run before raising. If either fails, the CLI emits
-`{"success": false, "error": "lint_failed", "linter": "ruff"|"npm"|"both", "stderr": "..."}`
-and exits 1.
+Every applicable arm runs before raising. On any failure the CLI emits
+`{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>"}`
+(`"linter": "multiple"` with aggregated stderr when more than one arm
+fails) and exits 1.
 
 ---
 
@@ -374,9 +376,9 @@ scoped to its own exact paths via `git commit -F - -- <files>`, so two
 same-repo verbs sharing one index never cross-contaminate — the loser's
 staged files never leak into the winner's commit. The committed surface is
 conflict-free by construction: per-epic-namespaced files, gitignored runtime
-state, exact-name `git add`. `jobctl commit-work` keeps its own independent
-flock at `$GIT_COMMON_DIR/jobctl-commit.lock` for its stage → lint → commit
-→ push window; that flock is untouched by this change.
+state, exact-name `git add`. `keeper commit-work` keeps its own independent
+flock at `$GIT_COMMON_DIR/keeper-commit-work.lock` for its stage → lint →
+commit → push window; that flock is untouched by this change.
 
 Two git lock domains can transiently lose a same-host race:
 
@@ -421,7 +423,7 @@ to cover acks because acks are not in git.
 
 ### Consumer derivation
 
-Consumers (keeperd, jobctl readers) read `.planctl/state/acks.db` and
+Consumers (keeperd, keeper readers) read `.planctl/state/acks.db` and
 merge the `worker_acked_at` / `closer_acked_at` values into their
 task/epic projections. The storage shape is the contract; the on-disk
 layout is implementation detail.
@@ -439,7 +441,7 @@ No commit covers the ack clear.
 Each completed task produces exactly two commits, in this order:
 
 1. **`feat(<scope>): <summary>`** (carrying `Task: <task_id>` trailer) —
-   the worker's `jobctl commit-work "<msg>"` commits source code and
+   the worker's `keeper commit-work "<msg>"` commits source code and
    tests. Auto-pushed to origin.
 
 2. **`chore(planctl): done <task_id>`** — landed inline by `planctl
@@ -456,12 +458,12 @@ last act; the state commit lands as a side effect.
 A harness drop can land at three places under this contract:
 
 - **Drop before source commit (mid-implementation):** task
-  `in_progress`, source uncommitted. `jobctl session-state` shows dirty
+  `in_progress`, source uncommitted. `keeper session-state` shows dirty
   `session_files`. Warm SendMessage resume asks the resumed worker to
   finish + commit + done. Cold spawn takes the HARNESS_DROPPED carve
   and continues from Phase 3.
 - **Drop between source commit and `planctl done` (source committed,
-  not done):** task `in_progress`, `jobctl find-task-commit $TASK_ID`
+  not done):** task `in_progress`, `keeper find-task-commit $TASK_ID`
   returns the trailer commit. Resume / fresh worker skips to `planctl
   done`; the state commit lands inline as the verb fires.
 - **Drop after `planctl done` (both commits in place):** task `done`,

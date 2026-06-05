@@ -56,16 +56,16 @@ Read those blocks from the brief. Do NOT shell `planctl cat` for either spec —
 Then load runtime state:
 
 ```bash
-jobctl session-state
+keeper session-state
 ```
 
-From `jobctl session-state` note `status_porcelain` (uncommitted files), `head_sha`, and `branch`. Use `$PLANCTL show $TASK_ID` only if you need the runtime status — usually you don't.
+From `keeper session-state` note `status_porcelain` (uncommitted files), `head_sha`, and `branch`. Use `$PLANCTL show $TASK_ID` only if you need the runtime status — usually you don't.
 
 **Target-repo sanity check:** if `TARGET_REPO` is set and `pwd` doesn't match it, stop with: *"BLOCKED: TOOLING_FAILURE — cwd `<pwd>` does not match TARGET_REPO `<TARGET_REPO>`."* State writes (`planctl done`, etc.) auto-route to `PRIMARY_REPO` via the planctl envelope; you do not need to chdir for them.
 
 Parse the task spec for what matters: **Acceptance** (the bar you must clear), **Approach** (hints), **Investigation targets** (files to look at), **Files** (expected paths). The epic's `## Quick commands` are smoke tests you'll run later.
 
-**Harness-dropped predecessor.** Occasionally `status_porcelain` already contains files you'd expect to write, or `jobctl find-task-commit $TASK_ID` returns a commit. That means a previous worker on this task was cut short. You're not blocked — pick up where they left off:
+**Harness-dropped predecessor.** Occasionally `status_porcelain` already contains files you'd expect to write, or `keeper find-task-commit $TASK_ID` returns a commit. That means a previous worker on this task was cut short. You're not blocked — pick up where they left off:
 
 - Source commit already shipped → skip Phases 2–4, verify the diff covers the acceptance, jump to Phase 5.
 - Uncommitted work in `status_porcelain` → continue from Phase 3 against the existing tree.
@@ -118,16 +118,16 @@ If tests fail on code you just wrote and the fix is small, fix and re-run. If th
 Two-commit-per-task contract: this commit ships **source** (`feat(scope): ...`) carrying a `Task: $TASK_ID` trailer; the state commit lands automatically when `planctl done` fires at `emit()` (Phase 5). `commit-work` runs the full check matrix internally — ruff check + ruff format --check + ty + cli-boundaries (project-wide when any `.py` is staged) + per-extension shellcheck/zig/lua/hadolint + npm lint per JS/TS package. Never invoke linters separately.
 
 ```bash
-jobctl commit-work "<type>(<scope>): <summary>
+keeper commit-work "<type>(<scope>): <summary>
 
 <optional body — 1-3 bullets>
 
 Task: $TASK_ID"
 ```
 
-`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`; `<scope>` comes from the task's file list. `commit-work` scopes to session-touched files and hard-stops a runaway list (`file_list_too_large`) on its own — run `jobctl commit-work --preview-files` first only if you're unsure what's staged. Push to origin is automatic on success.
+`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`; `<scope>` comes from the task's file list. `commit-work` scopes to session-touched files and hard-stops a runaway list (`file_list_too_large`) on its own — run `keeper commit-work --preview-files` first only if you're unsure what's staged. Push to origin is automatic on success.
 
-**On `lint_failed`** (`{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>"}`, or `"linter": "multiple"` with aggregated stderr): read the named files, fix per the stderr, re-stage with `git add`, re-invoke `jobctl commit-work` with the same message. The only `commit-work` failure you handle inline.
+**On `lint_failed`** (`{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>"}`, or `"linter": "multiple"` with aggregated stderr): read the named files, fix per the stderr, re-stage with `git add`, re-invoke `keeper commit-work` with the same message. The only `commit-work` failure you handle inline.
 
 **Any other non-zero exit → `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope JSON (`commit_failed`, `push_*`, `lock_timeout`, sanitization, etc.). Don't patch the tool you're calling.
 
@@ -184,6 +184,6 @@ The parent stops the loop and surfaces this verbatim.
 - **Resume directives outrank phases.** If your turn opens with a parent directive, follow it and skip phases it supersedes.
 - **One pass per file region.** Don't re-read a span you've already read in this turn.
 - **One task only.** Implement exactly the task you were given; don't touch sibling tasks.
-- **Test before commit, commit before done.** Phase 3 → 4 → 5. Two commits per task in history: source first (your `jobctl commit-work` in Phase 4), state second (auto-committed inline by `planctl done` in Phase 5).
-- **`jobctl commit-work` failures surface as `BLOCKED: TOOLING_FAILURE`,** except `lint_failed` — read the named files, fix per stderr, re-stage, re-invoke. Don't patch the tool you're calling.
+- **Test before commit, commit before done.** Phase 3 → 4 → 5. Two commits per task in history: source first (your `keeper commit-work` in Phase 4), state second (auto-committed inline by `planctl done` in Phase 5).
+- **`keeper commit-work` failures surface as `BLOCKED: TOOLING_FAILURE`,** except `lint_failed` — read the named files, fix per stderr, re-stage, re-invoke. Don't patch the tool you're calling.
 - **No `TodoWrite`.** Planctl tracks tasks.

@@ -3,7 +3,7 @@ name: defer
 description: >-
   Capture the currently actionable work in the conversation as a single-task epic queued in normal epic-number order (no priority jump). Use when the human says "defer", "/plan:defer", "defer this", "save for later", "put on the list", or wants a tiny follow-up tracked without interrupting current work. Stops and asks if the work won't fit in one task — never silently scales up.
 argument-hint: "[subject]"
-allowed-tools: Bash(planctl:*), Bash(jobctl:*), Read, Glob, Task
+allowed-tools: Bash(planctl:*), Bash(keeper:*), Read, Glob, Task
 ---
 
 # Defer
