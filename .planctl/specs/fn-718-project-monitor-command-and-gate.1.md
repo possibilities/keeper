@@ -50,5 +50,5 @@ Update `extractBackgroundTasks` tests for the object shape (preserve allowlist/s
 - [ ] JSDocs + README render spec / schema callout updated to the settled two-line / enriched shape
 
 ## Done summary
-
+Carried command/description through the v51 monitors projection: extractBackgroundTasks returns {id,command,description}[] (sort-by-id + cap-after-sort preserved), computeMonitors threads them through without widening the provenance SELECT, and monitorLinesFor renders [kind] <description-or-id> with the command on an indented continuation line. No SCHEMA_VERSION bump. All deriver/reducer/jobs tests updated and green.
 ## Evidence
