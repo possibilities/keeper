@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-05T21:41:25.012601Z",
+  "depends_on": [],
+  "epic": "fn-719-gate-autopilot-occupancy-on-live-worker",
+  "id": "fn-719-gate-autopilot-occupancy-on-live-worker.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Carry worker-monitor-live fact onto embedded job",
+  "updated_at": "2026-06-05T21:41:25.012601Z"
+}
