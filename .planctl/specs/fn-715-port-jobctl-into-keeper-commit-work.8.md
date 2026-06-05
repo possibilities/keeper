@@ -43,5 +43,5 @@ docs render correctly; `pnpm lint`/`typecheck` unaffected.
 - [ ] keeper repo `rg jobctl commit-work` clean of functional refs.
 
 ## Done summary
-
+Renamed live jobctl refs to keeper commit-work across CLAUDE.md (schema-coupling + Job-Id trailer callouts) and README (same Job-Id note), added the four new git-coordination subcommands to README's CLI list, and fixed the pyproject ty-gate comment. Remaining jobctl mentions are archival port-attribution / migration-history prose.
 ## Evidence
