@@ -53,5 +53,5 @@ Add git-worker tests: (a) same render-significant state + different mtime → no
 - [ ] From-scratch re-fold reproduces byte-identical projections
 
 ## Done summary
-
+Producer-side GitSnapshot throttle: semantic dedupe key (excludes mtime_ms, keeps it + worktree_oid in the payload), GIT_SNAPSHOT_MAX_WAIT_MS ceiling capping continuous-churn emission to <=1/~1.5s, narrowed data_version wake (membership-only on self-writes via a min-elapsed floor), and a coalesced-drop counter logged on the heartbeat. All producer-only; re-fold determinism preserved.
 ## Evidence
