@@ -467,8 +467,11 @@ command list plus a `===`-delimited "ready" block); `keeper git`
 watches the `git` worktree collection; `keeper usage` watches the
 `usage` collection; `keeper await` is the blocking
 wait-for-condition client (emits a Monitor-shaped `armed`/`met`/`failed`
-event stream on stdout and exits when an epic/task completes or
-unblocks); `keeper approve` is the RPC client (single-shot `rpc` →
+event stream on stdout and exits when its condition holds — a planctl
+epic/task going `complete` or `unblocked`, the cwd's repo going
+`git-clean`, other agents going `agents-idle`, or any AND-combination
+like `keeper await git-clean and agents-idle`); `keeper approve` is the
+RPC client (single-shot `rpc` →
 `rpc_result`, no subscription). The
 subscribe clients share helpers in `src/readiness-client.ts` —
 `subscribeReadiness` owns the three-collection lifecycle (board +
@@ -782,20 +785,31 @@ collapses to plain stream output. Run any of them with
   keeper usage --sock /tmp/x  # socket override
   ```
 
-- `await.ts` — the blocking wait-for-condition client (fn-647). Non-TUI:
-  emits a Monitor-shaped event stream on stdout — exactly one
-  `[keeper-await] armed …` line after the on-board check, then exactly
-  one terminal `[keeper-await] met …` or `[keeper-await] failed …` line
-  — and exits when the named epic/task completes (pops off the board) or
-  unblocks. Auto-detects epic vs task by the `.N` suffix; "unblocked"
-  deliberately excludes autopilot's `single-task-per-epic` /
-  `single-task-per-root` concurrency mutexes (every other blocker still
-  blocks). Exit codes: 0 met, 1 not-found/usage/connection, 3 timeout
-  (SIGTERM), 4 deleted, 5 stuck (only under `--fail-on-stuck`).
+- `await.ts` — the blocking wait-for-condition client (fn-647; conditions
+  + AND grammar widened in fn-713). Non-TUI: emits a Monitor-shaped event
+  stream on stdout — exactly one `[keeper-await] armed …` line after the
+  on-board check, then exactly one terminal `[keeper-await] met …` or
+  `[keeper-await] failed …` line — and exits when its condition holds.
+  Four conditions: `complete <id>` (epic/task pops off the board) and
+  `unblocked <id>` (workable now) are planctl-id forms auto-detecting
+  epic vs task by the `.N` suffix; `git-clean` blocks until the cwd's git
+  root has `dirty_count=0 AND orphaned_count=0` (no `git_status` row for
+  the root counts as clean); `agents-idle` blocks until no OTHER session
+  (`job_id != CLAUDE_CODE_SESSION_ID`) with `state=working` has a cwd
+  inside the cwd's git root. `git-clean` / `agents-idle` take no id and
+  are project-scoped to the cwd's repo. Multiple conditions joined by the
+  literal `and` token block until ALL hold simultaneously (level-
+  triggered, glitch-free); only the subscriptions a condition needs are
+  opened. "unblocked" deliberately excludes autopilot's
+  `single-task-per-epic` / `single-task-per-root` concurrency mutexes
+  (every other blocker still blocks). Exit codes: 0 met, 1
+  not-found/usage/connection/`no-git-root`, 3 timeout (SIGTERM), 4
+  deleted, 5 stuck (only under `--fail-on-stuck`).
 
   ```sh
   keeper await complete fn-646-keeper-cli-opentui-port.1   # task done
-  keeper await unblocked fn-650-some-epic                  # epic ready
+  keeper await git-clean                                   # repo clean
+  keeper await git-clean and agents-idle                   # both, ANDed
   ```
 
 - `approve.ts` — the RPC client. Single-shot: opens a `Bun.connect`, sends

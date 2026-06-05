@@ -1,0 +1,273 @@
+---
+name: await
+description: >-
+  Block until a condition holds — a planctl board state (epic/task complete
+  or unblocked), git state ("wait for the project to be clean", "wait until
+  everything's committed", "hold until there are no uncommitted changes"),
+  job state ("wait for the other agents to finish", "wait until everyone
+  else is done working", "block until no one else is editing the repo"), or
+  any AND-combination of these — then run a follow-up action. Use when the
+  user says "wait for", "wait until", "block until", "hold off until", "do
+  X when Y is done", "do X after fn-N finishes", "review when fn-… is
+  complete", "ping me when X completes", "once X is unblocked", "as soon as
+  X is ready", "after the build/epic/task is done", "wait until the repo is
+  clean", "once everything's committed", "when the other agents are done",
+  "after everyone else finishes", "wait until the project is clean and the
+  others are done", or any pushy "do X when Y is in state Z" intent — even
+  when they don't say "keeper", "epic", "task", or "await". The trigger is
+  the wait-then-act shape against a planctl id (`fn-N-slug` for an epic,
+  `fn-N-slug.M` for a task), against git cleanliness of the current repo,
+  against other agents finishing, or any AND-combination. Wires a
+  `Monitor(keeper await …)` invocation, listens for the terminal
+  `[keeper-await] met …` line, then runs the requested follow-up. Refuses
+  upfront if a planctl target is off-board (already completed / popped off)
+  or nonexistent.
+allowed-tools: Monitor Bash
+---
+
+# await
+
+Turn a "wait until <thing> happens, then do <follow-up>" request into a
+`Monitor(keeper await …)` invocation plus the follow-up action. The
+condition can be a planctl board state, the cleanliness of the current
+git repo, other agents going idle, or an AND-combination of these.
+
+## When this fires
+
+The user's ask has two shapes glued together:
+
+1. **A wait condition** — words like *wait*, *block*, *hold off*, *when …
+   is done*, *after … finishes*, *once … is ready*, *as soon as …*. The
+   condition is one (or more) of:
+   - a **planctl id** state — *"once fn-643-…-hook.4 is complete"*,
+     *"as soon as fn-650 is ready"*.
+   - a **git** state — *"when the project is clean"*, *"once everything's
+     committed"*, *"after there are no uncommitted changes"*.
+   - a **jobs** state — *"when the other agents finish"*, *"once everyone
+     else is done working"*, *"after no one else is editing the repo"*.
+   - a **combination** — *"wait until the repo is clean AND the other
+     agents are done"*.
+2. **A follow-up** to run when the condition holds — *then review it*,
+   *then run the tests*, *and ping me*, *and commit*, *and start the next
+   task*, etc.
+
+The user does NOT need to say "keeper" / "epic" / "task" / "await". A
+bare *"do a full review once fn-643-…-hook.4 is complete"* or *"commit
+once the project's clean and the others are done"* fires this skill.
+
+## Parse the request
+
+Extract the condition(s) and the follow-up. Each condition becomes one
+segment in the `keeper await` invocation; multiple segments are joined by
+the literal `and` token.
+
+| Condition | How to derive | `keeper await` form |
+|---|---|---|
+| `complete <id>` | Default for a planctl id. "done" / "finished" / "complete" all map here. `<id>` is `fn-N-slug` (epic) or `fn-N-slug.M` (task). | `complete fn-…` |
+| `unblocked <id>` | A planctl id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). | `unblocked fn-…` |
+| `git-clean` | Any "wait for the repo / project to be clean / committed / have no uncommitted changes" phrasing. **No id.** Project-scoped to the cwd's git root. | `git-clean` |
+| `agents-idle` | Any "wait for the other agents / everyone else to finish / be done / stop editing" phrasing. **No id.** Project-scoped to the cwd's git root; excludes THIS session. | `agents-idle` |
+
+| Field | How to derive | Example |
+|---|---|---|
+| `follow-up` | The clause after "then" / "and" / "and then" — what to run when the condition(s) hold. | "do a full review" |
+
+**The `and` grammar.** When the user names more than one condition,
+join them with the literal `and` token:
+`keeper await git-clean and agents-idle`,
+`keeper await complete fn-643-…-hook.4 and git-clean`. The process
+opens only the subscriptions its conditions need and emits the terminal
+`met` only when ALL conditions hold simultaneously (level-triggered,
+glitch-free).
+
+If the user gives multiple PLANCTL ids and it's ambiguous which to wait
+on (e.g. "wait for one of these"), ask. An explicit AND of distinct
+conditions ("wait for fn-X and the repo to be clean") is a single
+invocation, not an ambiguity.
+
+## Step 1 — Pre-check planctl targets are on-board (planctl conditions only)
+
+This pre-check applies **only to `complete` / `unblocked`**. The
+`git-clean` and `agents-idle` conditions have **no off-board pre-check** —
+they read live keeper projections that always exist, so there is nothing
+to refuse upfront; skip straight to step 2 for them.
+
+For each planctl segment, verify the id exists and is awaitable before
+wiring Monitor. `planctl show` is read-only and fast.
+
+```bash
+planctl show <target> --format json
+```
+
+Refuse to wire Monitor in any of these cases — the event will never fire:
+
+- **Nonexistent** — `planctl show` exits non-zero or returns `success:
+  false`. Tell the user the id doesn't exist; ask them to double-check.
+- **Already complete** (for `condition=complete`):
+  - Task: `task.runtime_status == "done"` AND `task.approval ==
+    "approved"`.
+  - Epic: `epic.status == "closed"` AND `epic.approval == "approved"`.
+  Tell the user the target has already popped off the board — there's
+  nothing to await — and offer to just run the follow-up now.
+
+If the target is on-board and the condition isn't already met, continue
+to step 2. (For `condition=unblocked` you may skip the
+already-unblocked check — `keeper await unblocked` with an already-
+workable target fires `met` immediately, which is the correct behavior.)
+
+## Step 2 — Wire the Monitor
+
+```
+Monitor({
+  command: "keeper await <condition> [<id>] [and <condition> [<id>]]...",
+  description: "wait for <conditions> then <follow-up>",
+  persistent: true,
+})
+```
+
+Examples of the `command` field:
+
+- `keeper await complete fn-643-keeper-hook-dead-letters.4`
+- `keeper await git-clean`
+- `keeper await agents-idle`
+- `keeper await git-clean and agents-idle`
+
+Defaults and overrides:
+
+- **`persistent: true` is the default.** Completion, a clean repo, or
+  every other agent going idle can take hours; an open-ended "whenever it
+  finishes" wait must outlive individual model turns. Only drop
+  `persistent` when the user gave a hard wall-clock bound.
+- **For a bounded wait** ("within the hour", "give it 30 minutes"), use
+  `timeout_ms` on the Monitor invocation instead of `keeper await
+  --timeout`. Let Monitor own the deadline. On timeout Monitor SIGTERMs
+  the process and `keeper await` emits `[keeper-await] failed
+  reason=timeout` exit 3 through the same flush path.
+- **Do NOT pass `keeper await --timeout`** — Monitor's `timeout_ms` is
+  the single source of truth for the deadline.
+- **Stuck verdicts** (job-rejected, dep-on-epic-dangling) keep waiting
+  by default. Add `--fail-on-stuck` only if the user explicitly wants
+  the wait to surrender on those.
+
+## Step 3 — Listen for the terminal line
+
+Monitor streams `keeper await`'s stdout to you, line by line. The
+`armed` line names the condition(s); its field shape depends on whether
+the wait is a single planctl id, a single git/jobs condition, or an AND
+aggregate:
+
+```
+# single planctl condition
+[keeper-await] armed target=<id> kind=<epic|task> condition=<…> state=<…>
+[keeper-await] met target=<id> kind=<…> condition=<…> detail=<…>
+
+# single git / jobs condition
+[keeper-await] armed condition=<git-clean|agents-idle> state=<…>
+[keeper-await] met condition=<git-clean|agents-idle> detail=<…>
+
+# AND aggregate (two or more conditions)
+[keeper-await] armed conditions=<c1 and c2 …> count=<N>
+[keeper-await] met conditions=<c1 and c2 …> count=<N>
+```
+
+…or a terminal `failed` instead of `met`:
+
+```
+[keeper-await] failed target=<id> reason=<reason> …
+[keeper-await] failed reason=<reason> conditions=<…> …   # aggregate
+```
+
+For an AND aggregate, a planctl sub-condition that fails names which
+condition fired via a `from=<condition-label>` field on the `failed`
+line.
+
+Reasons + exit codes:
+
+| Line | Exit | Meaning | Your action |
+|---|---|---|---|
+| `met …` | 0 | All conditions hold. | Run the follow-up. |
+| `failed reason=not-found …` | 1 | Planctl id absent at startup (pre-check missed it). | Tell the user, do NOT run the follow-up. |
+| `failed reason=no-git-root …` | 1 | A `git-clean` / `agents-idle` condition was requested but the cwd isn't inside a git worktree. | Tell the user; the wait can't be evaluated. Do NOT run the follow-up. |
+| `failed reason=connect …` | 1 | Could not connect to keeperd. | Tell the user the daemon is unreachable. |
+| `failed reason=deleted …` | 4 | Planctl target was on board, vanished, re-query miss. | Tell the user the target was deleted; do NOT run the follow-up. |
+| `failed reason=timeout …` | 3 | Monitor wall-clock deadline hit. | Tell the user it timed out; ask whether to extend or move on. |
+| `failed reason=stuck …` | 5 | Under `--fail-on-stuck` only. | Tell the user the target is stuck; surface the verdict. |
+
+The `armed` line is information only — proceed past it. The first
+`met` / `failed` line is terminal; act on it.
+
+**Already-satisfied-at-arm fires immediately.** If every condition
+already holds at arm time (a clean repo, no other agents, a complete
+target), `keeper await` emits `armed` and then `met` in quick
+succession. That's correct behavior — run the follow-up.
+
+## Step 4 — Run the follow-up
+
+On `met`, run the follow-up clause the user gave. If the follow-up is
+itself a Claude Code task ("do a full review", "implement the next
+task", "commit"), invoke whatever tools are appropriate for it. If it's a
+shell command, run it via Bash.
+
+On any `failed`, surface the terminal line to the user verbatim and ask
+how they want to proceed — do NOT silently run the follow-up.
+
+## Examples
+
+### Wait then review (planctl)
+
+> User: "Do a full review when fn-643-keeper-hook-dead-letters.4 is
+> complete."
+
+1. `planctl show fn-643-keeper-hook-dead-letters.4 --format json` →
+   task exists, `runtime_status != "done"`. Proceed.
+2. `Monitor({ command: "keeper await complete
+   fn-643-keeper-hook-dead-letters.4", description: "wait for fn-643.4
+   complete then review", persistent: true })`.
+3. On `[keeper-await] met …` → start the review.
+
+### Wait until the repo is clean (git-clean)
+
+> User: "Once everything's committed, push it."
+
+1. No pre-check — `git-clean` has no off-board state. Skip step 1.
+2. `Monitor({ command: "keeper await git-clean", description: "wait for
+   clean repo then push", persistent: true })`.
+3. On `met` → run the push.
+
+### Wait until other agents finish (agents-idle)
+
+> User: "When the other agents are done, run the full test suite."
+
+1. No pre-check — `agents-idle` has no off-board state. Skip step 1.
+2. `Monitor({ command: "keeper await agents-idle", description: "wait
+   for other agents idle then test", persistent: true })`.
+3. On `met` → run the tests.
+
+### Combination (AND)
+
+> User: "Wait until the project is clean and the other agents are done,
+> then commit."
+
+1. No planctl segment → no pre-check. Skip step 1.
+2. `Monitor({ command: "keeper await git-clean and agents-idle",
+   description: "wait for clean repo + idle agents then commit",
+   persistent: true })`.
+3. On `[keeper-await] met conditions=git-clean and agents-idle count=2`
+   → run the commit.
+
+## What NOT to do
+
+- Do not pass `keeper await --timeout`. Monitor's `timeout_ms` owns the
+  deadline.
+- Do not run the `planctl show` pre-check for `git-clean` / `agents-idle`
+  — they have no off-board state. The pre-check is for `complete` /
+  `unblocked` only.
+- Do not wire a planctl Monitor without the `planctl show` pre-check — a
+  doomed Monitor that immediately exits `failed reason=not-found` is bad
+  UX.
+- Do not pass an id to `git-clean` / `agents-idle` — they're nullary and
+  project-scoped to the cwd's git root.
+- Do not run the follow-up on `failed`. Surface the terminal line and
+  ask.
+- Do not invent ids. If the user gives a slug-less reference ("the
+  promotion epic") and you can't disambiguate, ask.
