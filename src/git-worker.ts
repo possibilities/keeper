@@ -1571,6 +1571,49 @@ export function decideReconcileTransitions(
 }
 
 /**
+ * Select `git_status` projection rows to tombstone because their worktree
+ * vanished from disk. Such a row is unreachable by {@link
+ * decideReconcileTransitions} (whose `toDrop` loop only walks
+ * `currentlyWatched`): a missing directory fails discovery's cwd→toplevel
+ * resolution, so the root is never re-added to `desired` and never enters the
+ * watched set — leaving the row strandable forever once a daemon restart drops
+ * it out of `currentlyWatched`. The producer emitting `GitRootDropped` off a
+ * live `existsSync` probe is allowed by the event-sourcing invariants (the
+ * probe runs in a producer, never inside a fold); the reducer's idempotent
+ * DELETE fold reconciles the projection.
+ *
+ * Pure & exported for unit reach (mirrors {@link buildDiscoveryCandidates} /
+ * {@link decideReconcileTransitions}). The `exists` probe is injected so the
+ * caller owns the one fs read per row.
+ *
+ * - Skips `currentlyWatched` roots — a live root whose dir vanishes is dropped
+ *   by the normal dwell path (it falls out of `desired`, dwells, then
+ *   `unsubscribeRoot` tombstones it); emitting here too would double-fire.
+ * - Mutates `alreadyTombstoned`: adds each newly-dropped root (so a row pending
+ *   its DELETE round-trip isn't re-emitted on the next sweep) and clears any
+ *   root whose dir has reappeared (so it can be tombstoned again later).
+ */
+export function selectVanishedRoots(
+  projectDirs: string[],
+  exists: (dir: string) => boolean,
+  currentlyWatched: Set<string>,
+  alreadyTombstoned: Set<string>,
+): string[] {
+  const drop: string[] = [];
+  for (const dir of projectDirs) {
+    if (exists(dir)) {
+      alreadyTombstoned.delete(dir);
+      continue;
+    }
+    if (currentlyWatched.has(dir)) continue;
+    if (alreadyTombstoned.has(dir)) continue;
+    alreadyTombstoned.add(dir);
+    drop.push(dir);
+  }
+  return drop;
+}
+
+/**
  * The dynamic watch-membership discoverer (epic fn-690). Replaces the
  * `.planctl`-only `gitRootFor`-filtered set with a probe-driven verdict
  * tiered by hot/cold TTL. Returns the sorted set of roots that
@@ -1961,6 +2004,16 @@ function startWorker(): void {
    */
   const headDivergentSinceByRoot = new Map<string, number>();
 
+  /**
+   * Roots already tombstoned by the vanished-worktree prune ({@link
+   * selectVanishedRoots}). A `GitRootDropped` round-trips through main →
+   * synthetic event → reducer DELETE, so the row lingers for a poll tick or
+   * two after we emit; this Set suppresses re-emitting it every full sweep in
+   * the interim. An entry is cleared the moment the dir reappears, so a
+   * re-created worktree can be tombstoned again if it vanishes a second time.
+   */
+  const vanishedTombstoned = new Set<string>();
+
   let watcherModule: typeof import("@parcel/watcher") | null = null;
   let dbPollTimer: ReturnType<typeof setInterval> | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -2349,6 +2402,29 @@ function startWorker(): void {
       if (runFullSweep) lastFullSweepMs = nowMs;
 
       const currentlyWatched = new Set(subscriptions.keys());
+
+      // Vanished-worktree prune. Gated to the full-sweep cadence (runs at boot
+      // — lastFullSweepMs === null — and every FULL_SWEEP_INTERVAL_MS), so a
+      // git_status row whose directory was deleted/moved sheds its ghost
+      // instead of lingering forever (decideReconcileTransitions can't reach an
+      // unwatched root). See selectVanishedRoots.
+      if (runFullSweep) {
+        const rows = db.query("SELECT project_dir FROM git_status").all() as {
+          project_dir: string;
+        }[];
+        for (const dir of selectVanishedRoots(
+          rows.map((r) => r.project_dir),
+          existsSync,
+          currentlyWatched,
+          vanishedTombstoned,
+        )) {
+          port.postMessage({
+            kind: "git-root-dropped",
+            project_dir: dir,
+          } satisfies GitRootDroppedMessage);
+        }
+      }
+
       const desired = new Set(
         discoverProjectRoots(db, {
           cwdRootCache,

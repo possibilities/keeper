@@ -32,6 +32,7 @@ import {
   parsePorcelainV2,
   probeWatchMembership,
   resolveHeadOidViaFs,
+  selectVanishedRoots,
   shouldWatchRoot,
 } from "../src/git-worker";
 
@@ -2333,6 +2334,62 @@ test("decideReconcileTransitions: simultaneous add + drop in one cycle", () => {
   );
   expect(result.toAdd).toEqual(["/repo-b"]);
   expect(result.toDrop).toEqual(["/repo-a"]);
+});
+
+// ---------------------------------------------------------------------------
+// selectVanishedRoots — the ghost-row prune. A git_status projection row
+// whose worktree was deleted/moved is unreachable by
+// decideReconcileTransitions (which only walks currentlyWatched), so this
+// producer-side existsSync probe tombstones it.
+// ---------------------------------------------------------------------------
+
+test("selectVanishedRoots: a missing dir is dropped and recorded as tombstoned", () => {
+  const tombstoned = new Set<string>();
+  const drop = selectVanishedRoots(
+    ["/code/gone", "/code/here"],
+    (d) => d === "/code/here",
+    new Set(),
+    tombstoned,
+  );
+  expect(drop).toEqual(["/code/gone"]);
+  expect(tombstoned.has("/code/gone")).toBe(true);
+});
+
+test("selectVanishedRoots: an existing dir is skipped and un-tombstoned", () => {
+  // /code/back vanished last sweep (still in tombstoned) but its dir is now
+  // present again — clear the dedupe entry so a future vanish can re-drop it.
+  const tombstoned = new Set<string>(["/code/back"]);
+  const drop = selectVanishedRoots(
+    ["/code/back"],
+    () => true,
+    new Set(),
+    tombstoned,
+  );
+  expect(drop).toEqual([]);
+  expect(tombstoned.has("/code/back")).toBe(false);
+});
+
+test("selectVanishedRoots: a currently-watched missing root is left to the dwell path", () => {
+  const tombstoned = new Set<string>();
+  const drop = selectVanishedRoots(
+    ["/code/watched-gone"],
+    () => false,
+    new Set(["/code/watched-gone"]),
+    tombstoned,
+  );
+  expect(drop).toEqual([]);
+  expect(tombstoned.has("/code/watched-gone")).toBe(false);
+});
+
+test("selectVanishedRoots: an already-tombstoned missing root is not re-emitted", () => {
+  const tombstoned = new Set<string>(["/code/gone"]);
+  const drop = selectVanishedRoots(
+    ["/code/gone"],
+    () => false,
+    new Set(),
+    tombstoned,
+  );
+  expect(drop).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------
