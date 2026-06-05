@@ -74,5 +74,5 @@ starving the message loop.
 - [ ] `bun test test/plan-worker.test.ts` green
 
 ## Done summary
-
+Batched + scoped recheckPending: one git cat-file --batch-check per repo (new isPathInHeadBatch) instead of a per-path spawn; recheck-pending posts and the reflog callback now scope to the originating repo, killing the ~74s cross-repo per-path git storm. db-poll drops its global recheck (reconcilePlanctlDirs stays for FSEvents-drop recovery); kick arm + triggeredByCommit bypass unchanged.
 ## Evidence
