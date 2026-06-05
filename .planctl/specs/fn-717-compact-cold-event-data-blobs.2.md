@@ -53,5 +53,5 @@ Test: (a) compact a cold batch → events.data NULL, event_blobs has it, reducer
 - [ ] `data` column relaxed to nullable
 
 ## Done summary
-
+Added daemon-side cold-blob compaction relocator: v57->v58 stop-the-world rebuild relaxes events.data to nullable (temp-new-table + foreign_keys OFF to avoid the FK-rewrite trap), src/compaction.ts paces atomic INSERT-into-event_blobs + UPDATE events.data=NULL per batch with a recent-retention watermark, absent-in-both bug counter, and PASSIVE checkpoint; reducer's explicit-attribution scan now reads both events.data (indexed) and event_blobs (relocated) so re-fold stays byte-identical. Validated on the real 1.6 GB prod DB: 30k blobs relocated, rows preserved, lossless COALESCE readback.
 ## Evidence
