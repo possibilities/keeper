@@ -826,6 +826,59 @@ collapses to plain stream output. Run any of them with
   keeper approve <epic_id>.<task_n> rejected # reject one task
   ```
 
+The next four subcommands are keeper's git-coordination verbs (epic
+fn-715, the native TypeScript port of the retired Python `jobctl`). Unlike
+every reader above, `commit-work` is the FIRST keeper subcommand that WRITES
+to git — it never touches the event log; it reads `file_attributions`
+through a fresh read-only `openDb({readonly:true})` connection and stages /
+commits only that session's attributed files. The other three are read-only.
+
+- `commit-work.ts` — stage the calling session's attributed dirty files,
+  run the polyglot lint matrix, commit with a `Job-Id:` trailer, and push.
+  Discovers session-attributed files via the `file_attributions` reader,
+  gitignore-filters them (`git check-ignore`), stages pathspec-scoped
+  (`git add -A -- <files>`, never tree-wide — deletions stage as removals),
+  serializes concurrent invocations on
+  `$GIT_COMMON_DIR/keeper-commit-work.lock` via an `FD_CLOEXEC` `flock(2)`,
+  then runs the lint matrix (ruff/ty/cli-boundaries/shellcheck/zig/lua/
+  hadolint/npm-lint + a `tsc --noEmit` arm) where exit-code is the sole
+  pass/fail signal. Emits a compact two-line NDJSON envelope (commit line +
+  push line); `--preview-files` lists the staged set with no lock and no
+  commit.
+
+  ```sh
+  keeper commit-work --preview-files          # list attributed dirty files
+  keeper commit-work "test(scope): msg"       # stage → lint → commit → push
+  ```
+
+- `find-task-commit.ts` — emit the commit(s) carrying a matching
+  `Task: <id>` trailer as a pretty JSON envelope (planctl consumes this as a
+  fail-loud contract). Pre-filters with `git log --grep -F`, then confirms a
+  real trailer via `git interpret-trailers`. Repo scope derives from the
+  epic's `touched_repos` (or `--repos` override), defaulting to the cwd repo.
+
+  ```sh
+  keeper find-task-commit fn-700-foo.1        # pretty {success, commits:[...]}
+  ```
+
+- `session-state.ts` — emit the current session's git context (branch, head
+  sha, porcelain status, recent log) plus its on-hook dirty file list as a
+  pretty JSON envelope. Purely informational — no lock, no commit; a DB
+  hiccup degrades `session_files` to `[]` rather than throwing.
+
+  ```sh
+  keeper session-state                        # {branch, head_sha, session_files, ...}
+  ```
+
+- `show-session-files.ts` — emit a session's on-hook dirty files grouped by
+  repo (`{files_by_repo, cwd_repo}`) as a pretty JSON envelope. A thin
+  exclusion-agnostic pass-through over the attribution reader;
+  `--session-id` is required.
+
+  ```sh
+  keeper show-session-files --session-id <id> # {files_by_repo, cwd_repo}
+  ```
+
 ## Uninstall
 
 Reverse of install:
@@ -1040,7 +1093,7 @@ committer_session_id, task_ids}` where `files` is
 `committer_session_id` is resolved from THREE possible trailer sources
 (take-last canonical UUID): the historical `Session-Id:` trailer stamped
 by the `plugin/bin/git` PATH wrapper when `CLAUDE_CODE_SESSION_ID` is
-set (preferred), then `Job-Id:` (fn-670 / T1 — the jobctl-stamped
+set (preferred), then `Job-Id:` (fn-670 / T1 — the `commit-work`
 trailer; `job_id === session_id` is a keeper invariant, so the value is
 the same UUID), and finally `null` (global discharge) when both are
 absent or malformed. A hand-edited `Session-Id:` wins by take-last

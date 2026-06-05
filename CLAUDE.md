@@ -114,10 +114,11 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   race from a total-drop window into a lossless-degraded one. **When you
   bump `SCHEMA_VERSION`, add the new version to keeper-py's
   `SUPPORTED_SCHEMA_VERSIONS` frozenset in `keeper/api.py` in the SAME
-  change** — the Python reader (used by `jobctl commit-work` and
-  `planctl render-approve-context`) is a hard whitelist, not a floor/ceiling,
-  and gates loud on any unrecognized version, failing *every* `commit-work`
-  on the host until updated. Additive bumps keeper-py never reads still must
+  change** — the Python reader (used by `planctl render-approve-context`;
+  `keeper commit-work` reads the DB directly via `src/db.ts` now, not
+  keeper-py) is a hard whitelist, not a floor/ceiling, and gates loud on
+  any unrecognized version, failing *every* `commit-work` on the host until
+  updated. Additive bumps keeper-py never reads still must
   be listed; `test/schema-version.test.ts` enforces it.
 - **Commit discharge is content-aware (schema v45 / fn-664.2).** The
   `GitSnapshot` payload's `dirty_files[]` carries per-file
@@ -130,8 +131,8 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   oid lifted off `git diff-tree -r --no-commit-id <oid>` — `null` on
   deletion / parse-miss). `committer_session_id` is the take-last
   canonical UUID lifted from a `Session-Id:` trailer (the historical
-  source — preferred), falling back to `Job-Id:` (fn-670 / T1, the
-  jobctl-stamped trailer — `job_id === session_id` is a keeper
+  source — preferred), falling back to `Job-Id:` (fn-670 / T1 — the
+  `commit-work` trailer; `job_id === session_id` is a keeper
   invariant, so `Job-Id:` carries the same UUID) when `Session-Id:` is
   absent or malformed; `null` when both are absent / malformed (global
   discharge). The hand-edited trailer wins per take-last policy if it
