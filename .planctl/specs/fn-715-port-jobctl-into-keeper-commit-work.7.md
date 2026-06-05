@@ -34,5 +34,5 @@ nothing; dotfiles still lint/parse (shellcheck on bootstrap.sh).
 - [ ] bootstrap.sh shellcheck-clean.
 
 ## Done summary
-
+Removed stale jobctl-server references from bootstrap.sh watchman comment; kept live shared-pidfile race rationale. shellcheck clean.
 ## Evidence
