@@ -82,5 +82,5 @@ don't churn these.
 - [ ] new helper unit tests green; bun run typecheck clean
 
 ## Done summary
-
+Extracted pure omit-default pill helpers into src/board-render.ts: pillOrEmpty primitive, renderTaskPills (runtime omit-todo + rt:blocked relabel, worker-done verdict-gated, approval T1+T3), renderClosePills (T2 status-drop + T3 approval), validatedPill omit-default, subagentLinesFor {ok,null,empty} drop, worker-done/rt:blocked color buckets, and board+jobs legend constants. Full unit coverage in test/board.test.ts; typecheck clean.
 ## Evidence
