@@ -91,5 +91,5 @@ discriminator with NO reducer/event-log change.
 - [ ] `bun test test/db.test.ts test/readiness.test.ts test/autopilot-worker.test.ts test/schema-version.test.ts` green
 
 ## Done summary
-
+Added a shared status-IS-NOT-NULL 'epic is materialized' gate: default_visible (CREATE_EPICS + v31->v32 literal) now hides NULL-status shell rows via a v55->v56 drop+re-add migration (one BEGIN IMMEDIATE, table_xinfo presence check, quick_check); SCHEMA_VERSION 55->56 with keeper/api.py lockstep; readiness gains epic-not-materialized ranked above epic-not-validated on both task and close-row paths, non-dispatchable via verbForVerdict (pinned).
 ## Evidence
