@@ -279,8 +279,12 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "resolved_epic_deps",
     // Schema v32: `default_visible` — VIRTUAL generated column SQLite
     // computes from `(status, approval)` on every read, materializing
-    // the cross-column `(status='open' OR approval!='approved')`
-    // predicate as a single-column 0/1 value. Served on the wire as
+    // the cross-column predicate as a single-column 0/1 value. As of
+    // fn-712 (schema v56) the expression carries a `status IS NOT NULL`
+    // "epic is materialized" guard: `status IS NOT NULL AND (status='open'
+    // OR approval!='approved')`, so a freshly-scaffolded NULL-status shell
+    // row (no EpicSnapshot folded yet) is hidden from the default page
+    // until it materializes. Served on the wire as
     // display-only — clients can SEE it (a debug aid for "would this
     // epic render on the default page?") but MUST NOT filter/sort by
     // it. Out of `sortable` / `filters` / `jsonColumns`: the column is
@@ -317,17 +321,19 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // below composes for free — no new composition machinery required.
     approval: "approval",
   },
-  // Default scope: an epics query with no wire filter shows every epic that
-  // is OPEN OR NOT-YET-APPROVED — the union, not the intersection. Open work
-  // (live) and unreviewed work (needs a human) are both interesting; only
-  // done-AND-approved epics fall off the page by default. ANY explicit wire
-  // filter — `--status done`, `--show-approved`, a pk subscribe — drops
-  // this clause entirely (the wire is the user's "I know what I want"
-  // override).
+  // Default scope: an epics query with no wire filter shows every
+  // MATERIALIZED epic that is OPEN OR NOT-YET-APPROVED — the union, not the
+  // intersection. Open work (live) and unreviewed work (needs a human) are
+  // both interesting; done-AND-approved epics fall off the page by default,
+  // and (fn-712) so do not-yet-materialized NULL-status shell rows. ANY
+  // explicit wire filter — `--status done`, `--show-approved`, a pk
+  // subscribe — drops this clause entirely (the wire is the user's "I know
+  // what I want" override).
   //
   // Schema v32 (fn-634): the cross-column OR is materialized as a single
   // VIRTUAL generated column `default_visible` computed by SQLite from
-  // `(status, approval)` on every read, and a partial index
+  // `(status, approval)` on every read (fn-712 added the `status IS NOT
+  // NULL` materialized guard to the expression), and a partial index
   // `idx_epics_default_visible WHERE default_visible = 1` makes the SEARCH
   // covering — no SCAN, no temp B-tree for the `sort_path ASC, epic_id ASC`
   // ORDER BY. The clause is the literal `default_visible = 1` (NOT a

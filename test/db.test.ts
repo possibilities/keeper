@@ -1221,11 +1221,15 @@ test("Tier 2 (fn-628) idx_epics_sort_path still serves the explicit-status epics
   db.close();
 });
 
-test("Tier 4.1 (fn-634) default_visible = 1 is semantically equivalent to the prior OR form (re-fold determinism guard)", () => {
+test("fn-712 default_visible = 1 is semantically equivalent to the materialized OR form (re-fold determinism guard)", () => {
   // Mirror of the fn-628.2 UNION-vs-OR equivalence test: both predicates
   // must return byte-identical ordered epic_id sets for the same fixture.
-  // Seeds the 6-corner cross product of (status, approval) — every cell
+  // Seeds the 7-corner cross product of (status, approval) — every cell
   // exercises a different branch of the generated-column CASE expression.
+  //
+  // fn-712 added the `status IS NOT NULL` "epic is materialized" guard, so
+  // the equivalent OR form now carries that guard too: a NULL-status shell
+  // row (no EpicSnapshot folded yet) is HIDDEN regardless of approval.
   const { db } = openDb(dbPath);
   const insert = db.prepare(
     "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1234,10 +1238,12 @@ test("Tier 4.1 (fn-634) default_visible = 1 is semantically equivalent to the pr
   //   open + approved        → default_visible=1 (open branch)
   //   open + pending         → 1 (both branches)
   //   open + rejected        → 1 (both branches)
-  //   done + approved        → 0 (HIDDEN — only combination matching neither)
+  //   done + approved        → 0 (HIDDEN — terminal + approved)
   //   done + pending         → 1 (!approved branch)
-  //   NULL-status + approved → 0 (HIDDEN — CASE-wrap collapses NULL to 0)
-  //   NULL-status + pending  → 1 (!approved branch)
+  //   NULL-status + approved → 0 (HIDDEN — not materialized)
+  //   NULL-status + pending  → 0 (HIDDEN — not materialized; the fn-712
+  //                                change: the prior expression surfaced
+  //                                this row via the !approved branch)
   insert.run("fn-1", 1, "open+approved", "open", "approved", 1, 1);
   insert.run("fn-2", 2, "open+pending", "open", "pending", 2, 1);
   insert.run("fn-3", 3, "open+rejected", "open", "rejected", 3, 1);
@@ -1253,29 +1259,35 @@ test("Tier 4.1 (fn-634) default_visible = 1 is semantically equivalent to the pr
     .all() as { epic_id: string }[];
   const orForm = db
     .prepare(
-      "SELECT epic_id FROM epics WHERE (status = 'open' OR approval != 'approved') ORDER BY epic_id",
+      "SELECT epic_id FROM epics WHERE (status IS NOT NULL AND (status = 'open' OR approval != 'approved')) ORDER BY epic_id",
     )
     .all() as { epic_id: string }[];
 
   expect(visible.map((r) => r.epic_id)).toEqual(orForm.map((r) => r.epic_id));
-  // Spot-check: fn-4 (done+approved) and fn-6 (null+approved) are the only
-  // hidden epics; the other five all match at least one branch.
+  // Spot-check: fn-4 (done+approved), fn-6 (null+approved), and fn-7
+  // (null+pending) are the hidden epics; the other four all materialized
+  // AND match at least one visibility branch.
   expect(visible.map((r) => r.epic_id)).toEqual([
     "fn-1",
     "fn-2",
     "fn-3",
     "fn-5",
-    "fn-7",
   ]);
   db.close();
 });
 
-test("Tier 4.1 (fn-634) default_visible generated column yields the expected 0/1 values across the 6 corners", () => {
+test("fn-712 default_visible generated column yields the expected 0/1 values across the 6 corners", () => {
   // Pins the CASE-wrapped expression semantics: every (status, approval)
   // pair must compute the expected 0 or 1 — and never NULL (the CASE-wrap
   // is load-bearing because `status` is TEXT-nullable, so a bare
   // `status='open' OR approval!='approved'` would return NULL on the
   // (NULL, approved) corner and violate the column's NOT NULL constraint).
+  //
+  // fn-712 added the `status IS NOT NULL` "materialized" guard: BOTH
+  // NULL-status corners (c5, c6) now compute 0 regardless of approval,
+  // because a shell row with no folded EpicSnapshot is hidden from the
+  // board until it materializes. The prior expression surfaced c6
+  // (null+pending) via the !approved branch — c6 flips 1 → 0 here.
   const { db } = openDb(dbPath);
   const insert = db.prepare(
     "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1291,12 +1303,12 @@ test("Tier 4.1 (fn-634) default_visible generated column yields the expected 0/1
     .prepare("SELECT epic_id, default_visible FROM epics ORDER BY epic_id ASC")
     .all() as { epic_id: string; default_visible: number }[];
   expect(rows).toEqual([
-    { epic_id: "c1", default_visible: 1 }, // open branch
-    { epic_id: "c2", default_visible: 1 }, // both branches
-    { epic_id: "c3", default_visible: 0 }, // HIDDEN
-    { epic_id: "c4", default_visible: 1 }, // !approved branch
-    { epic_id: "c5", default_visible: 0 }, // HIDDEN (CASE wraps NULL OR to 0)
-    { epic_id: "c6", default_visible: 1 }, // !approved branch
+    { epic_id: "c1", default_visible: 1 }, // open branch (materialized)
+    { epic_id: "c2", default_visible: 1 }, // both branches (materialized)
+    { epic_id: "c3", default_visible: 0 }, // HIDDEN (terminal + approved)
+    { epic_id: "c4", default_visible: 1 }, // !approved branch (materialized)
+    { epic_id: "c5", default_visible: 0 }, // HIDDEN (not materialized)
+    { epic_id: "c6", default_visible: 0 }, // HIDDEN (not materialized — fn-712)
   ]);
   // CASE-wrap invariant: never NULL.
   for (const row of rows) {
@@ -1341,6 +1353,163 @@ test("Tier 4.1 (fn-634) migrate() is boot-twice idempotent (addGeneratedColumnIf
   }[];
   expect(cols.some((c) => c.name === "default_visible")).toBe(true);
   db2.close();
+});
+
+test("fn-712 a status-NULL shell epic computes default_visible=0 and is excluded from WHERE default_visible=1", () => {
+  // The "epic is materialized" gate: a freshly-scaffolded shell row whose
+  // EpicSnapshot has not folded yet (status IS NULL) is hidden from the
+  // board's default page regardless of approval. A status-set (materialized)
+  // open epic still qualifies. Same `status IS NOT NULL` predicate the
+  // autopilot's `epic-not-materialized` readiness verdict uses.
+  const { db } = openDb(dbPath);
+  const insert = db.prepare(
+    "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  );
+  // shell rows: status NULL, both approval values → both hidden.
+  insert.run("shell-pending", 1, "shell", null, "pending", 1, 1);
+  insert.run("shell-approved", 2, "shell", null, "approved", 2, 1);
+  // materialized open row → visible.
+  insert.run("real-open", 3, "real", "open", "pending", 3, 1);
+
+  const dv = db
+    .prepare("SELECT epic_id, default_visible FROM epics ORDER BY epic_id ASC")
+    .all() as { epic_id: string; default_visible: number }[];
+  expect(dv).toEqual([
+    { epic_id: "real-open", default_visible: 1 },
+    { epic_id: "shell-approved", default_visible: 0 },
+    { epic_id: "shell-pending", default_visible: 0 },
+  ]);
+
+  // The shell rows fall out of the default board query; only the
+  // materialized one survives.
+  const visible = db
+    .prepare(
+      "SELECT epic_id FROM epics WHERE default_visible = 1 ORDER BY epic_id",
+    )
+    .all() as { epic_id: string }[];
+  expect(visible.map((r) => r.epic_id)).toEqual(["real-open"]);
+  db.close();
+});
+
+test("fn-712 idx_epics_default_visible still serves the default epics query with a status-NULL fixture (EXPLAIN QUERY PLAN)", () => {
+  // The added `status IS NOT NULL` guard must not regress the partial-index
+  // plan: the board query still SEARCHes idx_epics_default_visible (not a
+  // SCAN) with no temp B-tree for the ORDER BY, even when shell rows are
+  // present in the table.
+  const { db } = openDb(dbPath);
+  const insert = db.prepare(
+    "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  );
+  for (let i = 0; i < 40; i++) {
+    // Mix materialized + shell rows so the index is meaningfully populated.
+    const status = i % 3 === 0 ? null : "open";
+    insert.run(`fn-${i}`, i, `e${i}`, status, "pending", i + 1, 1);
+  }
+  db.run("ANALYZE epics");
+
+  const plan = db
+    .prepare(
+      "EXPLAIN QUERY PLAN SELECT epic_id FROM epics WHERE default_visible = 1 ORDER BY sort_path ASC, epic_id ASC",
+    )
+    .all() as { detail: string }[];
+  const detail = plan.map((r) => r.detail).join(" | ");
+  expect(detail).toMatch(
+    /SEARCH epics USING (COVERING )?INDEX idx_epics_default_visible/,
+  );
+  expect(detail).not.toMatch(/USE TEMP B-TREE/);
+  db.close();
+});
+
+test("fn-712 migration rewrites default_visible to the materialized expression (fresh-vs-migrated parity)", () => {
+  // Build a pre-v56 DB carrying the OLD `default_visible` expression (no
+  // `status IS NOT NULL` guard) + the partial index + a stamped version
+  // below 56, then reopen via openDb. The v55→v56 block must DROP the index,
+  // DROP the VIRTUAL column (via a table_xinfo presence check — table_info
+  // can't see generated columns), re-ADD it with the new expression, and
+  // recreate the index — all inside one BEGIN IMMEDIATE. The migrated schema
+  // must converge byte-identical with a fresh-DB CREATE: a null+pending row
+  // computes 0 (it computed 1 under the old expression).
+  const old = new Database(dbPath);
+  old.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  old.run(`
+    CREATE TABLE epics (
+      epic_id TEXT PRIMARY KEY,
+      epic_number INTEGER,
+      title TEXT,
+      project_dir TEXT,
+      status TEXT,
+      approval TEXT NOT NULL DEFAULT 'pending',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL DEFAULT 0,
+      tasks TEXT NOT NULL DEFAULT '[]',
+      depends_on_epics TEXT NOT NULL DEFAULT '[]',
+      jobs TEXT NOT NULL DEFAULT '[]',
+      job_links TEXT NOT NULL DEFAULT '[]',
+      last_validated_at TEXT,
+      created_by_closer_of TEXT,
+      sort_path TEXT NOT NULL DEFAULT '',
+      queue_jump INTEGER NOT NULL DEFAULT 0,
+      resolved_epic_deps TEXT,
+      default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status='open' OR approval!='approved' THEN 1 ELSE 0 END) VIRTUAL
+    )
+  `);
+  old.run(
+    "CREATE INDEX idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1",
+  );
+  // Seed a null+pending shell row: 1 under the OLD expression, 0 under the new.
+  old.run(
+    "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES ('shell', 1, 'shell', NULL, 'pending', 1, 1)",
+  );
+  // Sanity: the OLD expression surfaces the shell row.
+  const before = old
+    .prepare("SELECT default_visible AS dv FROM epics WHERE epic_id = 'shell'")
+    .get() as { dv: number };
+  expect(before.dv).toBe(1);
+  old.run("INSERT INTO meta (key, value) VALUES ('schema_version', '55')");
+  old.close();
+
+  // Reopen via openDb → the v55→v56 migration rewrites the column.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe(String(SCHEMA_VERSION));
+
+  // The shell row now computes 0 under the rewritten (materialized) expression.
+  const after = db
+    .prepare("SELECT default_visible AS dv FROM epics WHERE epic_id = 'shell'")
+    .get() as { dv: number };
+  expect(after.dv).toBe(0);
+
+  // The column is still a generated column (visible only to table_xinfo).
+  const xinfo = db.prepare("PRAGMA table_xinfo(epics)").all() as {
+    name: string;
+  }[];
+  expect(xinfo.some((c) => c.name === "default_visible")).toBe(true);
+
+  // The partial index was recreated.
+  const indexes = new Set(
+    (
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+        .all() as { name: string }[]
+    ).map((i) => i.name),
+  );
+  expect(indexes.has("idx_epics_default_visible")).toBe(true);
+
+  // Parity with a fresh DB: insert the same fixture into a fresh openDb and
+  // assert byte-identical default_visible.
+  const freshPath = join(tmpDir, "fresh.db");
+  const { db: fresh } = openDb(freshPath);
+  fresh.run(
+    "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES ('shell', 1, 'shell', NULL, 'pending', 1, 1)",
+  );
+  const freshDv = fresh
+    .prepare("SELECT default_visible AS dv FROM epics WHERE epic_id = 'shell'")
+    .get() as { dv: number };
+  expect(freshDv.dv).toBe(after.dv);
+  fresh.close();
+  db.close();
 });
 
 test("Tier 2 (fn-628) idx_jobs_created_state serves the default jobs query as COVERING (EXPLAIN QUERY PLAN)", () => {
@@ -5933,13 +6102,18 @@ test("v31 DB migrates to v32: epics.default_visible added as VIRTUAL generated c
   const rows = reopened
     .prepare("SELECT epic_id, default_visible FROM epics ORDER BY epic_id ASC")
     .all() as { epic_id: string; default_visible: number }[];
+  // fn-712 (v56): the migrated expression carries the `status IS NOT NULL`
+  // materialized guard, so BOTH null-status corners (e5, e6) compute 0 — a
+  // v31 DB migrating all the way to v56 lands the post-rework expression
+  // (proves the v31→v32 literal + the v55→v56 drop+re-add converge). e6
+  // (null+pending) flips 1 → 0 vs the pre-fn-712 expression.
   expect(rows).toEqual([
     { epic_id: "e1", default_visible: 1 }, // open + approved → 1 (open branch)
     { epic_id: "e2", default_visible: 1 }, // open + pending  → 1 (both)
     { epic_id: "e3", default_visible: 0 }, // done + approved → 0 (HIDDEN)
     { epic_id: "e4", default_visible: 1 }, // done + pending  → 1 (!approved)
-    { epic_id: "e5", default_visible: 0 }, // null + approved → 0 (CASE collapses NULL OR)
-    { epic_id: "e6", default_visible: 1 }, // null + pending  → 1 (!approved)
+    { epic_id: "e5", default_visible: 0 }, // null + approved → 0 (not materialized)
+    { epic_id: "e6", default_visible: 0 }, // null + pending  → 0 (not materialized — fn-712)
   ]);
 
   // Bonus: the partial index landed too.

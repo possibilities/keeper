@@ -210,11 +210,23 @@ export function resolveEpicDep(
  *                                        against an epic with no work (the fn-698 incident). Placed at
  *                                        rank 9.5 (after every more-specific verdict, before predicate
  *                                        10) so it catches ONLY that vacuous fall-through. Payload-less.
+ * - `epic-not-materialized`            — the epic's `status` is NULL ⇔ no `EpicSnapshot` has folded yet
+ *                                        (the shell row a scaffold commit mints before its real
+ *                                        snapshot lands; status is set non-null at exactly ONE reducer
+ *                                        site — the EpicSnapshot UPSERT). The EARLIEST predicate on both
+ *                                        the per-task and per-close-row paths (ranks above
+ *                                        `epic-not-validated`), so a freshly-scaffolded epic is
+ *                                        non-dispatchable (worker AND closer) until it materializes. The
+ *                                        same `status IS NOT NULL` notion that the board's
+ *                                        `default_visible` column uses to hide the shell row (fn-712) —
+ *                                        one shared predicate, both surfaces wait for the same state.
+ *                                        Payload-less.
  * - `unknown`                          — defensive default for verdict/renderer mismatch.
  */
 export type BlockReason =
   | { kind: "job-rejected" }
   | { kind: "job-pending" }
+  | { kind: "epic-not-materialized" }
   | { kind: "epic-not-validated" }
   | { kind: "git-uncommitted" }
   | { kind: "git-orphans" }
@@ -550,6 +562,20 @@ function evaluateTask(
     return { tag: "completed" };
   }
 
+  // 1.5. epic-not-materialized (fn-712). `epic.status === null` ⇔ no
+  // `EpicSnapshot` has folded yet — the shell row a scaffold commit mints
+  // before its real snapshot lands (status is set non-null at exactly one
+  // reducer site, the EpicSnapshot UPSERT). Ranked the EARLIEST blocked
+  // predicate (above epic-not-validated) so a not-yet-materialized epic is
+  // non-dispatchable until its snapshot folds — the same `status IS NOT
+  // NULL` notion the board's `default_visible` column uses to hide the
+  // shell row, so both surfaces wait for the same state. Above the terminal
+  // `completed` predicate 1 a NULL-status epic can't be done+approved
+  // anyway (both require the snapshot), so the ordering is safe.
+  if (epic.status == null) {
+    return { tag: "blocked", reason: { kind: "epic-not-materialized" } };
+  }
+
   // 2. epic-not-validated.
   if (epic.last_validated_at == null) {
     return { tag: "blocked", reason: { kind: "epic-not-validated" } };
@@ -805,6 +831,19 @@ function evaluateCloseRow(
   // 1. terminal-completed (close-row variant).
   if (epic.status === "done" && epic.approval === "approved") {
     return { tag: "completed" };
+  }
+
+  // 1.5. epic-not-materialized (fn-712). `epic.status === null` ⇔ no
+  // `EpicSnapshot` has folded yet — a scaffold commit's shell row before
+  // its real snapshot lands. Ranked the EARLIEST blocked predicate (above
+  // epic-not-validated) so the autopilot refuses to dispatch a CLOSER
+  // against a not-yet-materialized epic. Mirror of the per-task gate and of
+  // the board's `status IS NOT NULL` `default_visible` predicate — one
+  // shared notion of "this epic is real yet" across both surfaces.
+  // Below the terminal predicate 1 (a NULL-status epic can't be
+  // done+approved — both require the snapshot — so the ordering is safe).
+  if (epic.status == null) {
+    return { tag: "blocked", reason: { kind: "epic-not-materialized" } };
   }
 
   // 2. epic-not-validated.
@@ -1617,6 +1656,8 @@ function formatReasonShort(reason: BlockReason): string {
       return "job-rejected";
     case "job-pending":
       return "job-pending";
+    case "epic-not-materialized":
+      return "epic-not-materialized";
     case "epic-not-validated":
       return "epic-not-validated";
     case "git-uncommitted":

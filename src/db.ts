@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 55;
+export const SCHEMA_VERSION = 56;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -714,7 +714,7 @@ CREATE TABLE IF NOT EXISTS epics (
     sort_path TEXT NOT NULL DEFAULT '',
     queue_jump INTEGER NOT NULL DEFAULT 0,
     resolved_epic_deps TEXT,
-    default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status='open' OR approval!='approved' THEN 1 ELSE 0 END) VIRTUAL
+    default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved') THEN 1 ELSE 0 END) VIRTUAL
 )
 `;
 
@@ -4060,11 +4060,20 @@ function migrate(db: Database): void {
     // the idempotence check; `PRAGMA table_info` excludes generated columns
     // entirely and would re-attempt the ALTER on every reopen, throwing
     // "duplicate column" at the next boot.
+    //
+    // NOTE: the v55→v56 (fn-712) block below REWRITES this column's
+    // expression to `status IS NOT NULL AND (status='open' OR
+    // approval!='approved')` — the "epic is materialized" gate that hides
+    // a NULL-status shell row from the board. This literal here matches the
+    // v55→v56 form so a DB migrating straight from v31 → v56 lands the
+    // post-rework expression on the FIRST add (the drop+re-add in the
+    // v55→v56 block then no-ops via the xinfo presence check). A fresh DB
+    // lands it via the CREATE_EPICS literal, also kept in lockstep.
     addGeneratedColumnIfMissing(
       db,
       "epics",
       "default_visible",
-      "INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status='open' OR approval!='approved' THEN 1 ELSE 0 END) VIRTUAL",
+      "INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved') THEN 1 ELSE 0 END) VIRTUAL",
     );
 
     // Tier 2 (fn-628) always-run table-scoped indexes on epics + jobs +
@@ -5298,6 +5307,91 @@ function migrate(db: Database): void {
     // fail-loud (test/schema-version.test.ts enforces).
     dropColumnIfPresent(db, "jobs", "backend_exec_tab_id");
     dropColumnIfPresent(db, "jobs", "backend_exec_tab_name");
+
+    // v55→v56: fn-712 — the "epic is materialized" gate. Rewrite the
+    // `epics.default_visible` VIRTUAL generated column to add the
+    // `status IS NOT NULL` guard:
+    //   CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved')
+    //        THEN 1 ELSE 0 END
+    // `status` is set to non-null at exactly ONE reducer site (the
+    // EpicSnapshot UPSERT) — all four shell-INSERTs write NULL — so
+    // `status IS NOT NULL` is an exact, re-fold-safe "EpicSnapshot has
+    // folded" discriminator. The board's default page filters
+    // `WHERE default_visible = 1`, so a freshly-scaffolded NULL-status
+    // shell row (which the prior expression surfaced via the
+    // `approval!='approved'` branch) is now hidden until its real
+    // EpicSnapshot folds. The mirror gate on the autopilot side is the
+    // read-time `epic-not-materialized` readiness verdict (no schema
+    // dependency). KEEP the CASE wrap: the column is `NOT NULL` and
+    // `status` is nullable, so a bare predicate would compute NULL and
+    // violate the constraint.
+    //
+    // SQLite cannot ALTER a generated-column expression in place, so the
+    // only forward-only path is DROP + re-ADD, all inside this one
+    // `BEGIN IMMEDIATE` so a mid-step throw rolls the whole transaction
+    // back cleanly (never a half-applied schema that wedges boot):
+    //   1. DROP the partial index `idx_epics_default_visible` FIRST — it
+    //      references the column, so SQLite refuses to drop the column
+    //      while the index stands.
+    //   2. DROP the VIRTUAL column. The presence check MUST read
+    //      `PRAGMA table_xinfo` — `table_info` (what `dropColumnIfPresent`
+    //      reads) EXCLUDES generated columns, so it would no-op wrongly and
+    //      strand the old expression forever.
+    //   3. re-ADD the column via `addGeneratedColumnIfMissing` with the new
+    //      expression (its own `table_xinfo` check sees the column gone and
+    //      runs the ALTER; on a fresh v56 DB the CREATE_EPICS literal
+    //      already landed the new form, so this no-ops).
+    //   4. recreate the index via the always-run `CREATE_EPICS_INDEXES`
+    //      block, which runs unconditionally below the migrate transaction's
+    //      version stamp on every boot — but the column must exist when it
+    //      runs, so recreate it here too for the upgrade boot (IF NOT EXISTS
+    //      makes both runs idempotent).
+    //
+    // Version-guarded on `preMigrateStoredVersion < 56` so the drop+re-add
+    // runs exactly once per upgrade — a fresh v56 DB (CREATE_EPICS already
+    // carries the new expression) and a steady-state re-open of an
+    // already-v56 DB both skip the rewrite. The `quick_check` is gated to
+    // the upgrade boot only (cheap on the ~1.1k-row epics table) as a
+    // post-rewrite integrity assertion; a corrupt result throws and rolls
+    // the transaction back rather than stamping v56 over damage.
+    //
+    // Re-fold safe: `default_visible` is a VIRTUAL column SQLite recomputes
+    // on every read — no stored data, no backfill, and a from-scratch
+    // cursor=0 re-fold reproduces byte-identical 0/1 values because the
+    // expression is a pure function of the (status, approval) columns the
+    // reducer already writes. NO reducer / event-log change.
+    //
+    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 56
+    // in the SAME change — whitelist-only (keeper-py reads neither the
+    // column nor the predicate), but the bump is required so
+    // `jobctl commit-work` on this host doesn't fail-loud
+    // (test/schema-version.test.ts enforces).
+    if (preMigrateStoredVersion < 56) {
+      const xinfoCols = db.prepare("PRAGMA table_xinfo(epics)").all() as {
+        name: string;
+      }[];
+      if (xinfoCols.some((c) => c.name === "default_visible")) {
+        db.run("DROP INDEX IF EXISTS idx_epics_default_visible");
+        db.run("ALTER TABLE epics DROP COLUMN default_visible");
+      }
+      addGeneratedColumnIfMissing(
+        db,
+        "epics",
+        "default_visible",
+        "INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved') THEN 1 ELSE 0 END) VIRTUAL",
+      );
+      db.run(
+        "CREATE INDEX IF NOT EXISTS idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1",
+      );
+      const integrity = db.prepare("PRAGMA quick_check").get() as {
+        quick_check: string;
+      } | null;
+      if (integrity?.quick_check !== "ok") {
+        throw new Error(
+          `v55→v56 default_visible rewrite failed integrity quick_check: ${integrity?.quick_check ?? "no result"}`,
+        );
+      }
+    }
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

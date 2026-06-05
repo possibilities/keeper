@@ -1733,7 +1733,7 @@ export function isPathInHeadBatch(root: string, rels: string[]): boolean[] {
     const res = Bun.spawnSync(
       ["git", "-C", root, "cat-file", "--batch-check=%(objecttype)"],
       {
-        stdin: Buffer.from(refs.join("\n") + "\n"),
+        stdin: Buffer.from(`${refs.join("\n")}\n`),
         stdout: "pipe",
         stderr: "ignore",
         timeout: GIT_CHECK_TIMEOUT_MS,

@@ -394,6 +394,71 @@ test("predicate 2 (epic-not-validated) wins over 3 (planner-running)", () => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// fn-712: epic-not-materialized — the EARLIEST blocked predicate on both
+// the per-task and per-close-row paths. `epic.status === null` ⇔ no
+// EpicSnapshot has folded yet (the scaffold-commit shell row). Mirrors the
+// board's `status IS NOT NULL` `default_visible` gate — one shared notion of
+// "this epic is real yet" across both surfaces.
+// ---------------------------------------------------------------------------
+
+test("fn-712 perTask: status:null epic → blocked:epic-not-materialized", () => {
+  const task = makeTask({});
+  const epic = makeEpic({ tasks: [task], status: null });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "epic-not-materialized" }),
+  );
+});
+
+test("fn-712 perCloseRow: status:null epic → blocked:epic-not-materialized", () => {
+  const epic = makeEpic({ status: null });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "epic-not-materialized" }),
+  );
+});
+
+test("fn-712 perTask: status:'open' unblocks the materialized gate (falls through)", () => {
+  // A materialized but UNvalidated epic falls past epic-not-materialized to
+  // the next predicate — epic-not-validated — proving the materialized gate
+  // only fires on status:null, not on every not-yet-ready epic.
+  const task = makeTask({});
+  const epic = makeEpic({
+    tasks: [task],
+    status: "open",
+    last_validated_at: null,
+  });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "epic-not-validated" }),
+  );
+});
+
+test("fn-712 perTask: epic-not-materialized ranks ABOVE epic-not-validated", () => {
+  // Both predicates would fire (status null AND unvalidated); the earlier
+  // materialized gate wins — a not-yet-materialized epic reports the more
+  // specific "not real yet" reason, not the validation reason.
+  const task = makeTask({});
+  const epic = makeEpic({
+    tasks: [task],
+    status: null,
+    last_validated_at: null,
+  });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    blocked({ kind: "epic-not-materialized" }),
+  );
+});
+
+test("fn-712 perCloseRow: epic-not-materialized ranks ABOVE epic-not-validated", () => {
+  const epic = makeEpic({ status: null, last_validated_at: null });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "epic-not-materialized" }),
+  );
+});
+
 test("predicate 3 (planner-running) wins over 4 (own-approval-rejected)", () => {
   // Even an approved+done task blocks when a planner is working on the epic.
   // (Predicate 1 doesn't fire because approval is `pending`, not `approved`.)

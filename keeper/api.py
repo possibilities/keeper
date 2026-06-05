@@ -188,6 +188,13 @@ from pathlib import Path
 # the ``BackendExecSnapshot`` fold, was reaped in T1). keeper-py read
 # neither column, so the bump is whitelist-only with no reader logic
 # change.
+#
+# v56 (fn-712 epic) is a whitelist-only bump: the ``epics.default_visible``
+# VIRTUAL generated column is rewritten (drop + re-add) to add a
+# ``status IS NOT NULL`` "epic is materialized" guard so a freshly-scaffolded
+# NULL-status shell row is hidden from the board until its EpicSnapshot folds.
+# keeper-py reads neither the column nor the predicate (attribution surface
+# only), so the bump is whitelist-only with no reader logic change.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -215,6 +222,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         53,
         54,
         55,
+        56,
     }
 )
 

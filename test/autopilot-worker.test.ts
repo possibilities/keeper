@@ -315,6 +315,24 @@ test("fn-700: verbForVerdict('close', blocked:epic-no-tasks) → null (autopilot
   expect(verbForVerdict("close", v)).toBeNull();
 });
 
+test("fn-712: verbForVerdict('task'|'close', blocked:epic-not-materialized) → null (autopilot lock)", () => {
+  // Locks the autopilot side to the fn-712 readiness fix: a not-yet-
+  // materialized epic (status:null, no EpicSnapshot folded) reports
+  // `blocked:epic-not-materialized` on BOTH the per-task and per-close-row
+  // paths, and the only blocked reason that maps to a verb is `job-pending`.
+  // So neither a worker NOR a closer can be dispatched against the shell row
+  // — the autopilot waits for the same `status IS NOT NULL` materialized
+  // state the board uses to surface the epic. No code change in
+  // verbForVerdict (it already returns null for every blocked reason except
+  // job-pending); this pins the contract against a future verdict refactor.
+  const v: Verdict = {
+    tag: "blocked",
+    reason: { kind: "epic-not-materialized" },
+  };
+  expect(verbForVerdict("task", v)).toBeNull();
+  expect(verbForVerdict("close", v)).toBeNull();
+});
+
 // ---------------------------------------------------------------------------
 // isOccupyingJob
 // ---------------------------------------------------------------------------
