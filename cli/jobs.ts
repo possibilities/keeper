@@ -273,30 +273,25 @@ const GLYPH_COLLAPSED = "\uf0da"; // nf-fa-caret_right (U+F0DA) ▸
 const GLYPH_EXPANDED = "\uf0d7"; // nf-fa-caret_down (U+F0D7) ▾
 
 /**
- * Per-job live-monitor lines (schema v51 / fn-682). Reads from the
- * `jobs.monitors` JSON-array projection (snapshot-replace on each Stop —
- * see `src/reducer.ts:computeMonitors`); each entry is `{id, kind}`
- * where `kind` is the three-way provenance label `monitor` / `bash-bg`
- * / `ambient` (Monitor tool / Bash `run_in_background` / plugin- or
- * harness-armed).
+ * Per-job live-monitor lines (schema v51 / fn-682, enriched fn-718). Reads
+ * from the `jobs.monitors` JSON-array projection (snapshot-replace on each
+ * Stop — see `src/reducer.ts:computeMonitors`); each entry is
+ * `{id, kind, command?, description?}` where `kind` is the three-way
+ * provenance label `monitor` / `bash-bg` / `ambient` (Monitor tool / Bash
+ * `run_in_background` / plugin- or harness-armed).
  *
- * Output shape per entry: `<indent>[<kind>] <label>`. `<label>` prefers
- * `command`, falls back to `description`, falls back to the entry's id
- * (the only field guaranteed to be present in the task-1 projection —
- * the richer `command` / `description` fields are read defensively so
- * this helper renders correctly the moment a future projection-enrichment
- * carries them through). A multi-line command (1KB+ heredocs exist in the
- * wild) collapses to the FIRST non-empty line so the row stays one
- * terminal line tall; the spec's "truncate to one line" risk is
- * per-monitor, never propagated upward.
+ * Output shape per entry (fn-718, task 1): a PRIMARY line
+ * `<indent>[<kind>] <label>` where `<label>` is the entry's `description`
+ * (falling back to its `id` when description is empty), and — ONLY when
+ * `command` is non-empty — a CONTINUATION line at `<indent>    ` (four extra
+ * spaces) carrying the command/script. The command is NOT the primary
+ * label (avoid double-emit). An entry with no command renders a single
+ * line (today's id-only fallback). A multi-line command (1KB+ heredocs
+ * exist in the wild) collapses to the FIRST non-empty line so the
+ * continuation row stays one terminal line tall.
  *
- * fn-708 (J7): the trailing `[status]` slot is DROPPED — the task-1
- * `computeMonitors` projection never populates `monitors[].status`, so the
- * slot rendered as pure latent noise (always absent → never visible
- * anyway). RESTORE the slot when the projection actually carries a
- * non-null `status`: re-add `const status = typeof e.status === "string" ?
- * e.status : ""` and append `${status === "" ? "" : ` [${status}]`}` to
- * the pushed line so the pill colorizer tints it.
+ * `status` is deliberately NOT rendered — empirically always `"running"`,
+ * so the projection never carries it (fn-708 J7 precedent, fn-718 confirmed).
  *
  * Pure function of `monitorsJson` + `indent` — no SGR codes baked in
  * (the colorize-at-render convention; `colorizePillsInLine` paints
@@ -329,29 +324,26 @@ export function monitorLinesFor(
     }
     const e = raw as Record<string, unknown>;
     const kind = typeof e.kind === "string" ? e.kind : "ambient";
-    // Defensive lift of optional enrichment fields. Task 1's projection
-    // carries only `{id, kind}`; the command/description/status reads
-    // below are no-ops today but render correctly the moment the
-    // projection grows them.
+    // Defensive lift of the enrichment fields (fn-718). A pre-fn-718 v51
+    // monitors row lacks command/description → both fold to `""` and the
+    // entry renders id-only, never throwing.
     const command = typeof e.command === "string" ? e.command : "";
     const description = typeof e.description === "string" ? e.description : "";
     const id = typeof e.id === "string" ? e.id : "";
-    // Truncate a multi-line command to the first non-empty line — a
-    // 1KB+ heredoc must stay one terminal row. `\r` normalized too so
-    // a CRLF payload is not exempt.
-    const firstLine = command.split(/\r?\n/).find((s) => s.trim() !== "") ?? "";
+    // PRIMARY line: `[kind] <description>` (fall back to id when the
+    // description is empty). The command is NOT the primary label — it
+    // goes on the continuation line below so we never double-emit it.
     const label =
-      firstLine !== ""
-        ? firstLine
-        : description !== ""
-          ? description
-          : id !== ""
-            ? id
-            : "(unknown)";
-    // fn-708 (J7): no `[status]` slot — the projection never populates it.
-    // See the JSDoc above for the restore recipe when `monitors[].status`
-    // lands. fn-713 follow-on: the monitor-kind pill is iconized.
+      description !== "" ? description : id !== "" ? id : "(unknown)";
     lines.push(`${indent}${pill(kind)} ${label}`);
+    // CONTINUATION line: the command/script on its own indented line,
+    // emitted ONLY when command is non-empty. Truncate a multi-line
+    // command to the first non-empty line — a 1KB+ heredoc must stay one
+    // terminal row. `\r` normalized too so a CRLF payload is not exempt.
+    const firstLine = command.split(/\r?\n/).find((s) => s.trim() !== "") ?? "";
+    if (firstLine !== "") {
+      lines.push(`${indent}    ${firstLine}`);
+    }
   }
   return lines;
 }

@@ -662,15 +662,25 @@ collapses to plain stream output. Run any of them with
   never a placeholder). The dead `backend_exec_tab_{id,name}` columns
   that once fed a `<tab>` slot were dropped in fn-710 (T2). When the row is
   expanded in insert mode, a per-job Monitors section (schema v51 /
-  fn-682) lists the live background shells the session is running —
-  one indented line per entry parsed off the `jobs.monitors`
-  JSON-array column: `[<kind>] <label>[ [<status>]]`, where `<kind>`
-  is the three-way provenance pill `monitor` / `bash-bg` / `ambient`
-  and `<label>` prefers `command`, falls back to `description`,
-  falls back to the entry's id (a 1KB+ multi-line heredoc collapses
-  to its first non-empty line so the row stays one terminal line
-  tall). The section sits BETWEEN the backend-coords pill and the
-  sub-agent lines inside the collapse-controlled region; an empty
+  fn-682, enriched fn-718) lists the live background shells the
+  session is running, parsed off the `jobs.monitors` JSON-array
+  column. Each entry renders on up to two lines:
+
+  ```
+  [<kind>] <description-or-id>
+      <command first non-empty line>
+  ```
+
+  where `<kind>` is the three-way provenance pill `monitor` /
+  `bash-bg` / `ambient`, the primary label is the entry's
+  `description` (falling back to its id when empty), and the indented
+  continuation line carries the command/script — emitted ONLY when
+  the entry has a non-empty `command` (a 1KB+ multi-line heredoc
+  collapses to its first non-empty line so the row stays one terminal
+  line tall). An entry with no command renders a single line.
+  `status` is never shown — it is empirically always `"running"`
+  (fn-708 J7). The section sits BETWEEN the backend-coords pill and
+  the sub-agent lines inside the collapse-controlled region; an empty
   / missing / malformed `monitors` blob produces no Monitors lines
   and never crashes the render. Same sidecar / TUI / non-TTY
   contract as board.
@@ -1387,17 +1397,28 @@ existed). The scan is gated on `id < currentEventId` and rides the partial
 composite `idx_events_background_task_id (session_id, background_task_id,
 id, tool_name) WHERE background_task_id IS NOT NULL` covering index, so
 the fold stays index-backed and pure: no wallclock, no env, no fs probe,
-no liveness check. Snapshot-replace (NOT append): each Stop's snapshot IS
+no liveness check. As of fn-718 (task 1) each entry also carries
+`command` / `description`, lifted straight off the same Stop
+`background_tasks[]` snapshot (defensive string coerces — a non-string
+folds to `""`) and threaded through `computeMonitors` alongside the
+provenance `kind`; the provenance SELECT is UNCHANGED (it still reads only
+`(background_task_id, tool_name)`), so the covering index is unaffected.
+`status` is deliberately NOT projected — empirically always `"running"`
+(fn-708 J7). This is NOT a `SCHEMA_VERSION` bump: `jobs.monitors` is opaque
+JSON-TEXT and keeper-py does not read it, so the v51 whitelist entry is
+unchanged. Snapshot-replace (NOT append): each Stop's snapshot IS
 the new value, an empty / missing snapshot is AUTHORITATIVE (drop-when-
 dead per the CLAUDE.md "snapshot paradox" — a dead monitor must never
 linger), and SessionEnd / Killed clear the column to `'[]'` as part of the
 terminal write. A from-scratch cursor=0 re-fold reproduces the column
 byte-identically. The expanded `keeper jobs` row renders the live set as
-a per-entry line inside the same collapse-controlled region as the
-backend-coords pill and sub-agent lines (wire order: backend pill →
-monitors → sub-agents). keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
-gains `51` (whitelist-only; keeper-py reads neither `jobs.monitors` nor
-`background_tasks`).
+a two-line per-entry block inside the same collapse-controlled region as
+the backend-coords pill and sub-agent lines (wire order: backend pill →
+monitors → sub-agents): a primary `[<kind>] <description-or-id>` line plus,
+when the entry has a command, an indented continuation line carrying the
+command's first non-empty line. keeper-py's `SUPPORTED_SCHEMA_VERSIONS`
+frozenset gains `51` (whitelist-only; keeper-py reads neither
+`jobs.monitors` nor `background_tasks`).
 As of schema v50 (fn-678), the new `pending_dispatches` projection table
 (keyed by `(verb, id)`) is the durable launch-window occupancy signal that
 replaced the fn-674 live zellij tab-name probe. A `Dispatched` synthetic

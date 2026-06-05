@@ -15858,12 +15858,30 @@ test("fn-670 T2: cursor=0 re-fold reproduces byte-identical epics rows over a mi
 // ---------------------------------------------------------------------------
 
 /** Read the persisted `monitors` JSON for `jobId`, parsed. */
-function getMonitors(jobId = "sess-a"): { id: string; kind: string }[] | null {
+function getMonitors(
+  jobId = "sess-a",
+):
+  | { id: string; kind: string; command?: string; description?: string }[]
+  | null {
   const row = db
     .query("SELECT monitors FROM jobs WHERE job_id = ?")
     .get(jobId) as { monitors: string } | null;
   if (row == null) return null;
-  return JSON.parse(row.monitors) as { id: string; kind: string }[];
+  return JSON.parse(row.monitors) as {
+    id: string;
+    kind: string;
+    command?: string;
+    description?: string;
+  }[];
+}
+
+/**
+ * Shorthand for an expected projected monitor entry. fn-718 (task 1): the
+ * reducer always serializes command/description (default `""`) so the
+ * `.toEqual` assertions name them explicitly.
+ */
+function mon(id: string, kind: string, command = "", description = "") {
+  return { id, kind, command, description };
 }
 
 /**
@@ -15900,7 +15918,12 @@ function insertBashBgLaunch(taskId: string, sessionId = "sess-a"): number {
  * `(id, type)` entries.
  */
 function insertStopWithTasks(
-  tasks: { id: string; type: string }[],
+  tasks: {
+    id: string;
+    type: string;
+    command?: string;
+    description?: string;
+  }[],
   sessionId = "sess-a",
 ): number {
   return insertEvent({
@@ -15917,14 +15940,48 @@ test("v51 monitors: Stop seeds jobs.monitors from data.background_tasks (shell a
     { id: "subagent-x", type: "subagent" },
   ]);
   drainAll();
-  expect(getMonitors()).toEqual([{ id: "bash-a", kind: "ambient" }]);
+  expect(getMonitors()).toEqual([mon("bash-a", "ambient")]);
+});
+
+test("v51 monitors: command/description survive into jobs.monitors (fn-718)", () => {
+  // fn-718 (task 1): the Stop snapshot's command/description ride through
+  // computeMonitors into the projected entry; `kind` still comes from the
+  // provenance scan. A terminal-clear (SessionEnd) drops back to '[]'.
+  insertEvent({ hook_event: "SessionStart" });
+  insertMonitorLaunch("bash-m");
+  insertStopWithTasks([
+    {
+      id: "bash-amb",
+      type: "shell",
+      command: "keeper await gitCleanState",
+      description: "await clean",
+    },
+    {
+      id: "bash-m",
+      type: "shell",
+      command: "chatctl watch-chat",
+      description: "chatctl bus",
+    },
+  ]);
+  drainAll();
+  expect(getMonitors()).toEqual([
+    mon("bash-amb", "ambient", "keeper await gitCleanState", "await clean"),
+    mon("bash-m", "monitor", "chatctl watch-chat", "chatctl bus"),
+  ]);
+  // Terminal-clear still wins — the enriched entries drop to '[]'.
+  insertEvent({ hook_event: "SessionEnd" });
+  drainAll();
+  const row = db
+    .query("SELECT monitors FROM jobs WHERE job_id = ?")
+    .get("sess-a") as { monitors: string };
+  expect(row.monitors).toBe("[]");
 });
 
 test("v51 monitors: empty background_tasks drops to '[]' (snapshot paradox)", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertStopWithTasks([{ id: "bash-a", type: "shell" }]);
   drainAll();
-  expect(getMonitors()).toEqual([{ id: "bash-a", kind: "ambient" }]);
+  expect(getMonitors()).toEqual([mon("bash-a", "ambient")]);
   // Now a Stop with no live shells — the snapshot is authoritative.
   insertStopWithTasks([]);
   drainAll();
@@ -15960,9 +16017,9 @@ test("v51 monitors: three-way provenance (monitor / bash-bg / ambient)", () => {
   ]);
   drainAll();
   expect(getMonitors()).toEqual([
-    { id: "bash-amb", kind: "ambient" },
-    { id: "bash-b", kind: "bash-bg" },
-    { id: "bash-m", kind: "monitor" },
+    mon("bash-amb", "ambient"),
+    mon("bash-b", "bash-bg"),
+    mon("bash-m", "monitor"),
   ]);
 });
 
@@ -15974,14 +16031,14 @@ test("v51 monitors: provenance scan is session-scoped (a launch in another sessi
   insertMonitorLaunch("task-1", "sess-b");
   insertStopWithTasks([{ id: "task-1", type: "shell" }], "sess-a");
   drainAll();
-  expect(getMonitors("sess-a")).toEqual([{ id: "task-1", kind: "ambient" }]);
+  expect(getMonitors("sess-a")).toEqual([mon("task-1", "ambient")]);
 });
 
 test("v51 monitors: SessionEnd clears monitors to []", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertStopWithTasks([{ id: "bash-a", type: "shell" }]);
   drainAll();
-  expect(getMonitors()).toEqual([{ id: "bash-a", kind: "ambient" }]);
+  expect(getMonitors()).toEqual([mon("bash-a", "ambient")]);
   insertEvent({ hook_event: "SessionEnd" });
   drainAll();
   expect(getMonitors()).toEqual([]);
@@ -15995,7 +16052,7 @@ test("v51 monitors: Killed clears monitors to []", () => {
   });
   insertStopWithTasks([{ id: "bash-a", type: "shell" }]);
   drainAll();
-  expect(getMonitors()).toEqual([{ id: "bash-a", kind: "ambient" }]);
+  expect(getMonitors()).toEqual([mon("bash-a", "ambient")]);
   killedEvent(4242, "stamp-1");
   drainAll();
   expect(getMonitors()).toEqual([]);
@@ -16009,7 +16066,7 @@ test("v51 monitors: Stop on a still-live row refreshes monitors EVEN when the su
   insertEvent({ hook_event: "SessionStart" });
   insertStopWithTasks([{ id: "bash-a", type: "shell" }]);
   drainAll();
-  expect(getMonitors()).toEqual([{ id: "bash-a", kind: "ambient" }]);
+  expect(getMonitors()).toEqual([mon("bash-a", "ambient")]);
   // Inject a still-running subagent_invocations row so the guard fires.
   const subTs = tsCounter++;
   db.run(
@@ -16022,7 +16079,7 @@ test("v51 monitors: Stop on a still-live row refreshes monitors EVEN when the su
   // swallowed by the sub-agent guard, but monitors still refresh.
   insertStopWithTasks([{ id: "bash-b", type: "shell" }]);
   drainAll();
-  expect(getMonitors()).toEqual([{ id: "bash-b", kind: "ambient" }]);
+  expect(getMonitors()).toEqual([mon("bash-b", "ambient")]);
 });
 
 test("v51 monitors: cursor=0 re-fold reproduces byte-identical jobs.monitors", () => {
@@ -16060,9 +16117,9 @@ test("v51 monitors: stable sort by id (re-fold determinism)", () => {
   ]);
   drainAll();
   expect(getMonitors()).toEqual([
-    { id: "bash-a", kind: "ambient" },
-    { id: "bash-b", kind: "ambient" },
-    { id: "bash-c", kind: "ambient" },
+    mon("bash-a", "ambient"),
+    mon("bash-b", "ambient"),
+    mon("bash-c", "ambient"),
   ]);
 });
 
@@ -16075,7 +16132,7 @@ test("v51 monitors: a launch AFTER this Stop is NOT seen (id < current gate)", (
   insertMonitorLaunch("bash-late"); // arrives AFTER the Stop
   drainAll();
   // Provenance for the Stop is `ambient` — the launch came later.
-  expect(getMonitors()).toEqual([{ id: "bash-late", kind: "ambient" }]);
+  expect(getMonitors()).toEqual([mon("bash-late", "ambient")]);
 });
 
 // ---------------------------------------------------------------------------

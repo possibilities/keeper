@@ -269,6 +269,13 @@ export function extractBackgroundTaskId(
 export interface MonitorEntry {
   id: string;
   kind: "monitor" | "bash-bg" | "ambient";
+  // fn-718 (task 1): carried through from the Stop snapshot's
+  // `background_tasks[]` entry (both empty-string when the payload omits
+  // them — never `undefined`), so `keeper jobs` can render the script the
+  // monitor is running on an indented continuation line. `status` is
+  // deliberately NOT carried — empirically always `"running"` (fn-708 J7).
+  command?: string;
+  description?: string;
 }
 
 /**
@@ -287,8 +294,12 @@ const BACKGROUND_TASKS_CAP = 50;
  * `!== "subagent"` denylist — Claude Code may add new background-task
  * kinds in future and we want to drop them silently until we know how
  * to project them), stable-sort by id, cap at {@link BACKGROUND_TASKS_CAP}
- * entries. Each surviving entry returns its `id` only; provenance is
- * recomputed by the reducer's in-fold events scan, NOT carried here.
+ * entries. Each surviving entry returns `{id, command, description}` —
+ * fn-718 (task 1) carries `command` / `description` through as defensive
+ * string coerces (a non-string folds to `""`, never `undefined`) so the
+ * render layer can show the script the monitor is running. Provenance
+ * (`kind`) is NOT carried here; it is recomputed by the reducer's in-fold
+ * events scan.
  *
  * NEVER throws — the reducer's fold contract is non-negotiable (a throw
  * inside the open BEGIN IMMEDIATE rolls back the cursor and wedges the
@@ -302,7 +313,9 @@ const BACKGROUND_TASKS_CAP = 50;
  * persisted monitors with `[]` (drop-when-dead). A dead monitor must
  * never linger.
  */
-export function extractBackgroundTasks(data: unknown): string[] {
+export function extractBackgroundTasks(
+  data: unknown,
+): { id: string; command: string; description: string }[] {
   if (data === null || typeof data !== "object") {
     return [];
   }
@@ -310,7 +323,7 @@ export function extractBackgroundTasks(data: unknown): string[] {
   if (!Array.isArray(raw)) {
     return [];
   }
-  const ids: string[] = [];
+  const tasks: { id: string; command: string; description: string }[] = [];
   for (const entry of raw) {
     if (entry === null || typeof entry !== "object") {
       continue;
@@ -323,17 +336,21 @@ export function extractBackgroundTasks(data: unknown): string[] {
     if (typeof id !== "string" || id.length === 0) {
       continue;
     }
-    ids.push(id);
+    // Defensive string coerces — a non-string (or absent) field folds to
+    // `""`, never `undefined`, so the projected object shape is stable.
+    const command = typeof e.command === "string" ? e.command : "";
+    const description = typeof e.description === "string" ? e.description : "";
+    tasks.push({ id, command, description });
   }
-  // Stable sort by id (lexicographic). The cap MUST bite AFTER the sort
-  // so a re-fold over the same payload produces the byte-identical
-  // truncated set (the cap is purely defensive — a real session should
-  // never approach it).
-  ids.sort();
-  if (ids.length > BACKGROUND_TASKS_CAP) {
-    return ids.slice(0, BACKGROUND_TASKS_CAP);
+  // Stable sort by id (lexicographic) on the objects. The cap MUST bite
+  // AFTER the sort so a re-fold over the same payload produces the
+  // byte-identical truncated set (the cap is purely defensive — a real
+  // session should never approach it).
+  tasks.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  if (tasks.length > BACKGROUND_TASKS_CAP) {
+    return tasks.slice(0, BACKGROUND_TASKS_CAP);
   }
-  return ids;
+  return tasks;
 }
 
 /**

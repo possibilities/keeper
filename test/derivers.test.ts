@@ -1441,16 +1441,22 @@ test("extractBackgroundTaskId: round-trip determinism — same input → same ou
 });
 
 // ---------------------------------------------------------------------------
-// extractBackgroundTasks — schema v51 / fn-682
+// extractBackgroundTasks — schema v51 / fn-682, enriched fn-718 (task 1)
 //
 // Defensive lift of a Stop event payload's `data.background_tasks` array.
 // Allowlist `type === "shell"` (subagent entries drop silently), stable
-// sort by id, cap at 50 entries. NEVER throws — empty / missing /
-// malformed folds to `[]` (the snapshot paradox: an unreadable Stop is
-// drop-when-dead).
+// sort by id, cap at 50 entries. Returns `{id, command, description}` per
+// surviving entry (fn-718) — command/description are defensive string
+// coerces (non-string → `""`). NEVER throws — empty / missing / malformed
+// folds to `[]` (the snapshot paradox: an unreadable Stop is drop-when-dead).
 // ---------------------------------------------------------------------------
 
-test("extractBackgroundTasks: shell allowlist returns the ids", () => {
+/** Shorthand for the projected object shape (command/description default ""). */
+function bgTask(id: string, command = "", description = "") {
+  return { id, command, description };
+}
+
+test("extractBackgroundTasks: shell allowlist returns the entries", () => {
   expect(
     extractBackgroundTasks({
       background_tasks: [
@@ -1458,7 +1464,31 @@ test("extractBackgroundTasks: shell allowlist returns the ids", () => {
         { id: "bash-2", type: "shell" },
       ],
     }),
-  ).toEqual(["bash-1", "bash-2"]);
+  ).toEqual([bgTask("bash-1"), bgTask("bash-2")]);
+});
+
+test("extractBackgroundTasks: carries command/description (fn-718)", () => {
+  // fn-718 (task 1): the entry's command/description ride through so the
+  // render layer can show the script. Defensive string coerce — a
+  // non-string field folds to `""`, never `undefined`.
+  expect(
+    extractBackgroundTasks({
+      background_tasks: [
+        {
+          id: "bash-1",
+          type: "shell",
+          command: "chatctl watch-chat",
+          description: "chatctl bus",
+        },
+        { id: "bash-2", type: "shell", command: 42, description: null },
+        { id: "bash-3", type: "shell" },
+      ],
+    }),
+  ).toEqual([
+    bgTask("bash-1", "chatctl watch-chat", "chatctl bus"),
+    bgTask("bash-2", "", ""),
+    bgTask("bash-3", "", ""),
+  ]);
 });
 
 test("extractBackgroundTasks: subagent entries drop silently (allowlist not denylist)", () => {
@@ -1473,7 +1503,7 @@ test("extractBackgroundTasks: subagent entries drop silently (allowlist not deny
         { id: "future-1", type: "some-new-kind" },
       ],
     }),
-  ).toEqual(["bash-1"]);
+  ).toEqual([bgTask("bash-1")]);
 });
 
 test("extractBackgroundTasks: empty array returns []", () => {
@@ -1503,7 +1533,7 @@ test("extractBackgroundTasks: malformed entries (non-object, missing id, non-str
         { id: "bash-good", type: "shell" }, // the one good entry
       ],
     }),
-  ).toEqual(["bash-good"]);
+  ).toEqual([bgTask("bash-good")]);
 });
 
 test("extractBackgroundTasks: non-array background_tasks returns []", () => {
@@ -1523,7 +1553,7 @@ test("extractBackgroundTasks: stable sort by id (lexicographic)", () => {
         { id: "bash-2", type: "shell" },
       ],
     }),
-  ).toEqual(["bash-1", "bash-2", "bash-3"]);
+  ).toEqual([bgTask("bash-1"), bgTask("bash-2"), bgTask("bash-3")]);
 });
 
 test("extractBackgroundTasks: cap at 50 entries (defensive)", () => {
@@ -1538,8 +1568,8 @@ test("extractBackgroundTasks: cap at 50 entries (defensive)", () => {
   expect(got.length).toBe(50);
   // The sorted order is bash-000 … bash-074; the cap retains the first
   // 50 (bash-000 … bash-049).
-  expect(got[0]).toBe("bash-000");
-  expect(got[49]).toBe("bash-049");
+  expect(got[0]?.id).toBe("bash-000");
+  expect(got[49]?.id).toBe("bash-049");
 });
 
 test("extractBackgroundTasks: round-trip determinism — same input → same output", () => {

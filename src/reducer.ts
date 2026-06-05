@@ -7525,6 +7525,12 @@ function appendNameHistory(persisted: string, title: string): string {
  * read. Pure function of `(persistedJson, eventDataPayload, sessionId,
  * currentEventId, dbScan)` — `dbScan` reads only the event log.
  *
+ * fn-718 (task 1): each entry also carries `command` / `description`,
+ * which ride straight from the Stop payload via `extractBackgroundTasks`
+ * (NOT from the events scan) so the render layer can show the script the
+ * monitor is running. The provenance SELECT is UNCHANGED — only `kind`
+ * comes from the scan — so the covering index is unaffected.
+ *
  * NEVER throws — `extractBackgroundTasks` already swallows malformed
  * `background_tasks` shapes (returns `[]`), and the in-fold scan is
  * a strict SELECT against a known column shape.
@@ -7535,8 +7541,8 @@ function computeMonitors(
   currentEventId: number,
   data: unknown,
 ): string {
-  const ids = extractBackgroundTasks(data);
-  if (ids.length === 0) {
+  const tasks = extractBackgroundTasks(data);
+  if (tasks.length === 0) {
     return "[]";
   }
   // Index-backed provenance scan: the partial composite
@@ -7576,9 +7582,15 @@ function computeMonitors(
     // shape adds a third kind we leave it as `ambient` until the
     // deriver+projection learn how to name it.
   }
-  const entries: MonitorEntry[] = ids.map((id) => ({
-    id,
-    kind: provenance.get(id) ?? "ambient",
+  // fn-718 (task 1): command/description ride from the Stop payload via
+  // `extractBackgroundTasks`; only `kind` is merged from the provenance
+  // scan above. The provenance SELECT is UNCHANGED — it still reads only
+  // `(background_task_id, tool_name)`, so the covering index is unaffected.
+  const entries: MonitorEntry[] = tasks.map((t) => ({
+    id: t.id,
+    kind: provenance.get(t.id) ?? "ambient",
+    command: t.command,
+    description: t.description,
   }));
   return JSON.stringify(entries);
 }

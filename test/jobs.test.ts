@@ -848,18 +848,16 @@ test("colorizePillsInLine: dead-letter:<N> takes the warn bucket via prefix fall
 });
 
 // ---------------------------------------------------------------------------
-// monitorLinesFor — schema v51 / fn-682 per-job live-monitors rendering.
-// Pure JSON-parse with `[]` fallback; renders `[<kind>] <label>` per entry
-// (fn-708 J7: the trailing [status] slot is dropped — the projection never
-// populates it). `label` prefers `command`, falls back to `description`,
-// falls back to `id`. A multi-line `command` truncates to its first non-empty
-// line.
-// Today's task-1 projection ships only `{id, kind}` so most production rows
-// render with `id` as the label, but the helper is built to render the
-// future enrichment correctly the moment the projection grows.
+// monitorLinesFor — schema v51 / fn-682 per-job live-monitors rendering,
+// enriched fn-718 (task 1). Pure JSON-parse with `[]` fallback. Two-line
+// shape per entry: a PRIMARY line `[<kind>] <label>` where `<label>` is
+// `description` (falling back to `id` when empty), and — ONLY when `command`
+// is non-empty — a CONTINUATION line `<indent>    <command>` carrying the
+// command's first non-empty line. An entry with no command renders a single
+// line. `status` is never rendered (fn-708 J7 / fn-718 confirmed).
 // ---------------------------------------------------------------------------
 
-test("monitorLinesFor: id-only projection (task-1 shape) renders [kind] <id> per entry", () => {
+test("monitorLinesFor: id-only projection (no command/description) renders [kind] <id> single line", () => {
   const json = JSON.stringify([
     { id: "b5217wols", kind: "ambient" },
     { id: "bnamgymkh", kind: "monitor" },
@@ -884,12 +882,11 @@ test("monitorLinesFor: empty / missing / malformed JSON → no lines", () => {
   expect(monitorLinesFor('{"id":"x","kind":"ambient"}', "  ")).toEqual([]);
 });
 
-test("monitorLinesFor: future-enriched entry — command preferred over description over id", () => {
-  // Future projection shape: the deriver lifts command/description/status
-  // off the raw event payload alongside id+kind. The helper renders the
-  // richest available label without needing a separate code path. fn-708
-  // (J7): the trailing [status] slot is DROPPED — the projection never
-  // populates `status`, so even a present status renders no pill.
+test("monitorLinesFor: enriched entry — [kind] <description> primary + indented command continuation", () => {
+  // fn-718 (task 1): a fully-enriched entry renders TWO lines — the
+  // description on the primary `[kind]` line, the command on an indented
+  // continuation line (four extra spaces). The command is NOT the primary
+  // label (no double-emit). `status` is never rendered.
   const json = JSON.stringify([
     {
       id: "b1",
@@ -900,11 +897,13 @@ test("monitorLinesFor: future-enriched entry — command preferred over descript
     },
   ]);
   expect(monitorLinesFor(json, "  ")).toEqual([
-    `  ${pill("ambient")} chatctl watch-chat`,
+    `  ${pill("ambient")} chatctl bus`,
+    `      chatctl watch-chat`,
   ]);
 });
 
-test("monitorLinesFor: empty command falls back to description (per spec)", () => {
+test("monitorLinesFor: empty command renders a single [kind] <description> line", () => {
+  // No command → no continuation line; the description is the only label.
   const json = JSON.stringify([
     {
       id: "b1",
@@ -914,44 +913,70 @@ test("monitorLinesFor: empty command falls back to description (per spec)", () =
       status: "running",
     },
   ]);
-  // fn-708 (J7): no [status] slot — see above.
   expect(monitorLinesFor(json, "  ")).toEqual([
     `  ${pill("monitor")} chatctl bus`,
   ]);
 });
 
-test("monitorLinesFor: missing command + missing description falls back to id", () => {
+test("monitorLinesFor: no description falls back to id on the primary line, command still continues", () => {
+  // Description empty → id is the primary label; a non-empty command still
+  // emits its continuation line.
+  const json = JSON.stringify([
+    { id: "abc123", kind: "bash-bg", command: "bun test" },
+  ]);
+  expect(monitorLinesFor(json, "  ")).toEqual([
+    `  ${pill("bash-bg")} abc123`,
+    `      bun test`,
+  ]);
+});
+
+test("monitorLinesFor: missing command + missing description falls back to id (single line)", () => {
   const json = JSON.stringify([{ id: "abc123", kind: "ambient" }]);
   expect(monitorLinesFor(json, "  ")).toEqual([`  ${pill("ambient")} abc123`]);
 });
 
-test("monitorLinesFor: multi-line command truncates to FIRST non-empty line", () => {
-  // The risk: a 1KB+ heredoc would wreck the row. The helper collapses
-  // a multi-line command to its first non-empty line so the row stays
-  // one terminal-line tall. Leading-blank-line case covered too.
+test("monitorLinesFor: multi-line command truncates the continuation to its FIRST non-empty line", () => {
+  // The risk: a 1KB+ heredoc would wreck the row. The continuation line
+  // collapses a multi-line command to its first non-empty line so it stays
+  // one terminal-line tall. Leading-blank-line case covered too. With no
+  // description the primary line falls back to the id.
   const heredoc = "\n\n  cat <<'EOF'\nfirst body line\nsecond body line\nEOF";
   const json = JSON.stringify([
     { id: "b1", kind: "bash-bg", command: heredoc, status: "running" },
   ]);
-  // fn-708 (J7): no [status] slot — only the first-non-empty command line.
   expect(monitorLinesFor(json, "  ")).toEqual([
-    `  ${pill("bash-bg")}   cat <<'EOF'`,
+    `  ${pill("bash-bg")} b1`,
+    `        cat <<'EOF'`,
   ]);
 });
 
 test("monitorLinesFor: status is never rendered (J7 dead slot dropped)", () => {
-  // fn-708 (J7): the projection never populates `status` today, so the
-  // slot is dropped unconditionally — a present status produces no pill,
-  // and a missing/empty status is identical (no trailing slot ever).
+  // fn-708 (J7) / fn-718: the projection never populates `status`, so it is
+  // never rendered — a present status produces no slot, identical to absent.
   const json = JSON.stringify([
-    { id: "b1", kind: "ambient", command: "chatctl watch-chat" },
-    { id: "b2", kind: "ambient", command: "echo hi", status: "" },
-    { id: "b3", kind: "ambient", command: "echo bye", status: "running" },
+    { id: "b1", kind: "ambient", description: "a", command: "echo a" },
+    {
+      id: "b2",
+      kind: "ambient",
+      description: "b",
+      command: "echo b",
+      status: "",
+    },
+    {
+      id: "b3",
+      kind: "ambient",
+      description: "c",
+      command: "echo c",
+      status: "running",
+    },
   ]);
   expect(monitorLinesFor(json, "  ")).toEqual([
-    `  ${pill("ambient")} chatctl watch-chat`,
-    `  ${pill("ambient")} echo hi`,
-    `  ${pill("ambient")} echo bye`,
+    `  ${pill("ambient")} a`,
+    `      echo a`,
+    `  ${pill("ambient")} b`,
+    `      echo b`,
+    `  ${pill("ambient")} c`,
+    `      echo c`,
   ]);
 });
 
