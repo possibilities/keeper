@@ -86,5 +86,5 @@ Rebuild + commit the `.wasm`.
 - [ ] CLAUDE.md carve-out + fn-704.1 block + README ninth-worker updated (append-only-within-epoch, rotation as 2nd-layer churn defense, single-writer preserved).
 
 ## Done summary
-
+Bridge self-rotates its live .ndjson at a ~4 MiB ROTATION_THRESHOLD (truncate + force-cursor-0 + fresh now_ms-derived epoch nonce + cleared last_emitted + plugin_start header & full re-snapshot in one write_all), with last_emitted re-seeded only after a successful write and size measured via metadata().len(). Consumer peeks the first-line epoch each scan (peekZellijEpoch, distinct from the sentinel-nulling parser) and resets offset to 0 on epoch change even when size >= priorOffset, shrink guard retained as secondary. Rust should_rotate test + consumer rotation/peek tests green; existing epoch-reset + tail-read tests still green. .wasm rebuilt+committed, VERSION and [[bin]] unchanged, no schema bump. CLAUDE.md carve-out + fn-704.1 block + README ninth-worker updated.
 ## Evidence

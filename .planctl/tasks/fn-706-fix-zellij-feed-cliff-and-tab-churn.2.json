@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "live-feed rotation in bridge plus consumer detect",
-  "updated_at": "2026-06-04T23:35:15.266144Z"
+  "updated_at": "2026-06-05T00:22:46.314175Z",
+  "worker_done_at": "2026-06-05T00:22:46.314175Z"
 }
