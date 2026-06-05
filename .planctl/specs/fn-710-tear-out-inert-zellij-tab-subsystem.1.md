@@ -58,5 +58,5 @@ Task 2 to drop. Daemon must boot + shut down clean with one fewer worker.
 - [ ] code-adjacent CLAUDE.md/README zellij + reap + plugin-path sections removed; ZELLIJ env-capture rule KEPT; NO schema change in this task
 
 ## Done summary
-
+Removed zellij feed consumer (zellij-events.ts, zellij-events-worker.ts, backend-worker.ts, cli/plugin.ts), replaced BackendExecSnapshot dispatch arm with explicit no-op preserving re-fold determinism, removed renameTab/resolveTabForPane/closeByTabId from ExecBackend, stripped autopilot window-reap, removed plugin-path CLI, and updated CLAUDE.md/README.md to reflect the reduced ten-worker fleet.
 ## Evidence
