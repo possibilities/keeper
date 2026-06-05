@@ -279,6 +279,17 @@ export interface ShutdownMessage {
  */
 export interface RecheckPendingMessage {
   type: "recheck-pending";
+  /**
+   * Optional repo-root scope (fn-712). When set, the handler drains ONLY the
+   * pending paths whose {@link repoRootFromPlanctlPath} equals `repo` — main
+   * stamps it with the originating `GitSnapshot`/`Commit`'s `project_dir`, the
+   * single repo whose HEAD may have moved. Absent (the boot/heartbeat callers
+   * have none) → global drain over every {@link PlanScanner.pendingRepos}.
+   * Either way the drain probes each repo with ONE batched `git cat-file`
+   * instead of a per-path spawn, so a cross-repo pending set no longer starves
+   * the single-threaded message loop (the ~74s emission-lag fix).
+   */
+  repo?: string;
 }
 
 /**
@@ -798,6 +809,28 @@ export class PlanScanner {
      */
     private readonly isTracked: (path: string) => boolean = () => true,
     /**
+     * Optional BATCHED git-tracked predicate (fn-712). Given a repo `root`
+     * and the repo-relative paths `rels` of every pending file in that repo,
+     * returns a positional `boolean[]` (`result[i]` is "is `rels[i]` in
+     * HEAD") in ONE `git cat-file --batch-check` spawn — the per-repo probe
+     * {@link recheckPending} uses instead of one {@link isTracked} spawn per
+     * path. Defaults to a per-path fallback over {@link isTracked} so the
+     * pure-core unit tests (and any scanner constructed without it) still gate
+     * correctly, just unbatched; the live worker passes
+     * {@link isPathInHeadBatch}. Like {@link isTracked} it is producer-side
+     * ONLY — the reducer never reads git (re-fold determinism preserved).
+     *
+     * Fail-closed contract (inherited from {@link isPathInHead}): on any
+     * anomaly the predicate returns ALL-`false`, so a parse slip never wrongly
+     * announces a path as in-HEAD (the fn-627 duplicate-dispatch guard). An
+     * empty `rels` is a no-op (`[]`, no spawn).
+     */
+    private readonly isTrackedBatch: (
+      root: string,
+      rels: string[],
+    ) => boolean[] = (root, rels) =>
+      rels.map((rel) => this.isTracked(join(root, rel))),
+    /**
      * Optional observer fired AFTER any public mutation
      * ({@link onChange} / {@link onDelete} / {@link recheckPending}) that may
      * have changed the {@link pending} set. The live worker (fn-705) uses it
@@ -1231,22 +1264,75 @@ export class PlanScanner {
   }
 
   /**
-   * Re-run {@link onChange} for every path the gate has stashed in
-   * {@link pending}. Called by the worker on every git-worker snapshot
-   * pulse — a `git commit` does not change the file's content so FSEvents
-   * will not re-fire on commit, and without this drain a freshly-committed
-   * epic would sit in pending forever (projection-absent, never dispatched).
+   * Re-probe the gate over the paths it has stashed in {@link pending} and
+   * emit any that are now in HEAD. Called by the worker on every git-worker
+   * snapshot pulse / reflog fire — a `git commit` does not change the file's
+   * content so FSEvents will not re-fire on commit, and without this drain a
+   * freshly-committed epic would sit in pending forever (projection-absent,
+   * never dispatched).
    *
-   * `onChange` re-checks the gate, so a still-uncommitted path stays in
-   * pending. The set is iterated by snapshot (`[...]`) so an `onChange`
-   * mutation during the loop is safe.
+   * fn-712 — batched + scoped, the ~74s emission-lag fix. The OLD shape
+   * `for (path of pending) onChange(path)` spawned one synchronous
+   * `git cat-file` PER pending path across ALL repos on EVERY trigger; a
+   * cross-repo pending set of ~1292 abandoned `.planctl` files turned each
+   * trigger into a synchronous git storm that starved the single-threaded
+   * worker so the realtime `planctl-commit-changed` bypass queued behind it
+   * for tens of seconds. Two levers collapse it:
+   * - **Scope.** With `root`, drain ONLY the pending paths in that repo (main
+   *   stamps the originating `GitSnapshot`/`Commit`'s `project_dir`); without
+   *   `root` (the boot/heartbeat callers, and the kick — an uncommitted
+   *   approval may sit in ANY repo and must not be stranded), cover every
+   *   {@link pendingRepos}.
+   * - **Batch.** GROUP the in-scope pending paths by repo and probe each repo
+   *   with ONE {@link isTrackedBatch} call (a single
+   *   `git cat-file --batch-check`), then re-run {@link onChange} ONLY for the
+   *   paths the batch reports in-HEAD. A still-uncommitted path is left in
+   *   pending WITHOUT an `onChange` call (so it triggers no per-path spawn) —
+   *   exactly the storm the old loop caused. The batch fails closed (all
+   *   `false`) on any anomaly, so a parse slip leaves a path pending rather
+   *   than wrongly emitting it (the fn-627 dup-dispatch guard).
+   *
+   * `onChange` re-checks the per-path gate as a belt-and-suspenders, so even
+   * if a batch+onChange disagreed (they can't on a stable HEAD) the per-path
+   * predicate still governs the emit. The in-HEAD subset is snapshotted into
+   * an array before the loop so an `onChange`-driven `pending` mutation during
+   * the loop is safe.
    */
-  recheckPending(): void {
+  recheckPending(root?: string): void {
     if (this.pending.size === 0) {
       return;
     }
-    for (const path of [...this.pending]) {
-      this.onChange(path);
+    // Group the in-scope pending paths by repo root. `root` set → only that
+    // repo's paths; absent → every repo with at least one pending path. A path
+    // whose repo root can't be derived (shape drift) is skipped — it has no
+    // repo to batch-probe and would have failed `isPathInHead` anyway.
+    const byRepo = new Map<string, string[]>();
+    for (const path of this.pending) {
+      const repo = repoRootFromPlanctlPath(path);
+      if (repo === null) continue;
+      if (root !== undefined && repo !== root) continue;
+      const group = byRepo.get(repo);
+      if (group === undefined) {
+        byRepo.set(repo, [path]);
+      } else {
+        group.push(path);
+      }
+    }
+    // One batched probe per repo; re-run `onChange` only for the now-in-HEAD
+    // paths (the others stay pending with no per-path spawn).
+    for (const [repo, paths] of byRepo) {
+      const rels = paths.map((p) => relative(repo, p));
+      const inHead = this.isTrackedBatch(repo, rels);
+      const toEmit: string[] = [];
+      for (let i = 0; i < paths.length; i++) {
+        if (inHead[i] === true) {
+          const path = paths[i];
+          if (path !== undefined) toEmit.push(path);
+        }
+      }
+      for (const path of toEmit) {
+        this.onChange(path);
+      }
     }
   }
 
@@ -1605,6 +1691,76 @@ export function isPathInHead(path: string): boolean {
     return res.success && res.exitCode === 0;
   } catch {
     return false;
+  }
+}
+
+/**
+ * fn-712 batched sibling of {@link isPathInHead}: given a repo `root` and the
+ * repo-relative paths `rels`, returns a positional `boolean[]` (`result[i]` is
+ * "is `rels[i]` in HEAD") in ONE `git cat-file --batch-check` spawn. The
+ * scoped/batched {@link PlanScanner.recheckPending} drain uses it instead of
+ * one {@link isPathInHead} spawn per pending path — so a cross-repo pending
+ * set no longer turns every gate-drain trigger into a synchronous per-path git
+ * storm that starves the single-threaded worker (the ~74s emission lag).
+ *
+ * `git cat-file --batch-check=%(objecttype)` reads one ref per stdin line and
+ * prints one stdout line each, in input order. For an in-HEAD path the line is
+ * the object type (`blob`); for a missing ref git prints `<rev> missing`. We
+ * parse strictly 1:1-positional to `rels` and treat a `" missing"`-terminated
+ * (or empty) line as not-in-HEAD.
+ *
+ * Fail-closed, byte-identical posture to {@link isPathInHead}'s `catch →
+ * false`: on a non-zero exit, a timeout, a line-count mismatch, or a spawn
+ * throw we return ALL-`false`. A parse slip that wrongly announced a path as
+ * in-HEAD would re-open the fn-627 duplicate-dispatch harm, so any anomaly
+ * resolves to "not committed; the next pulse retries" rather than a guess.
+ *
+ * Empty `rels` is a no-op (`[]`, NO spawn) — an empty batch stdin yields a
+ * spurious `missing` line, so we must never feed git an empty input.
+ *
+ * Exported for unit reach.
+ */
+export function isPathInHeadBatch(root: string, rels: string[]): boolean[] {
+  if (rels.length === 0) {
+    return [];
+  }
+  const allFalse = (): boolean[] => rels.map(() => false);
+  // Normalize path separators to `/` for the git ref (moot on macOS where
+  // `sep === "/"`, but explicit so a future win32 build doesn't feed git a
+  // backslash ref it can't resolve).
+  const refs = rels.map((rel) => `HEAD:${rel.split(sep).join("/")}`);
+  try {
+    const res = Bun.spawnSync(
+      ["git", "-C", root, "cat-file", "--batch-check=%(objecttype)"],
+      {
+        stdin: Buffer.from(refs.join("\n") + "\n"),
+        stdout: "pipe",
+        stderr: "ignore",
+        timeout: GIT_CHECK_TIMEOUT_MS,
+      },
+    );
+    if (!res.success || res.exitCode !== 0) {
+      return allFalse();
+    }
+    const out = res.stdout.toString();
+    // Trailing newline yields a final empty element — drop it so the line
+    // count matches `rels` exactly.
+    const lines = out.split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") {
+      lines.pop();
+    }
+    if (lines.length !== rels.length) {
+      return allFalse(); // line-count mismatch → fail closed for the whole batch.
+    }
+    return lines.map((line) => {
+      // A missing ref prints `<rev> missing`; an in-HEAD ref prints its object
+      // type (e.g. `blob`). Anything ending in ` missing` (or empty) is
+      // not-in-HEAD.
+      const trimmed = line.trimEnd();
+      return trimmed.length > 0 && !trimmed.endsWith(" missing");
+    });
+  } catch {
+    return allFalse();
   }
 }
 
@@ -2261,7 +2417,10 @@ function main(): void {
             );
           }
           try {
-            scanner.recheckPending();
+            // fn-712: the reflog fire is repo-specific (this `root`'s
+            // `.git/logs/HEAD` moved), so scope the drain to it — ONE batched
+            // probe over only this repo's pending paths.
+            scanner.recheckPending(root);
           } catch (e) {
             console.error(
               `[plan-worker] reflog recheckPending failed for ${root}: ${stringifyErr(e)}`,
@@ -2328,6 +2487,10 @@ function main(): void {
     },
     (m) => console.error(m),
     isPathInHead,
+    // fn-712: the batched per-repo probe `recheckPending` uses to drain the
+    // gate without a per-path git spawn (kills the ~74s storm). The per-path
+    // `isPathInHead` above still governs the FSEvents `onChange` path.
+    isPathInHeadBatch,
     () => {
       // No-self-heal: a throw here would crash the worker and bounce the
       // daemon, so log+continue. Nudge BEFORE the reflog reconcile so a
@@ -2386,13 +2549,18 @@ function main(): void {
   parentPort.on("message", (msg: InboundMessage | undefined) => {
     if (!msg) return;
     if (msg.type === "recheck-pending") {
-      // fn-629: main observed a `GitSnapshot` events row land — HEAD may
-      // have advanced. Drain the observation gate's pending set so a
-      // freshly-committed epic/task file emits its snapshot. Idempotent
-      // and cheap when the set is empty.
+      // fn-629: main observed a `GitSnapshot`/`Commit` events row land — HEAD
+      // may have advanced. Drain the observation gate's pending set so a
+      // freshly-committed epic/task file emits its snapshot. Idempotent and
+      // cheap when the set is empty.
+      //
+      // fn-712: SCOPE to `msg.repo` — main stamps it with the originating
+      // snapshot's `project_dir`, the single repo whose HEAD moved — so we
+      // re-probe only that repo's pending paths (ONE batched git call) instead
+      // of every repo's. A cross-repo pending set no longer starves the loop.
       if (shuttingDown) return;
       try {
-        scanner.recheckPending();
+        scanner.recheckPending(msg.repo);
       } catch (err) {
         console.error(
           `[plan-worker] recheckPending failed: ${stringifyErr(err)}`,
@@ -2537,23 +2705,29 @@ function main(): void {
   // close→approve `Commit` fold that makes a planctl file "ready" IS such a
   // write, so polling the DB surfaces it without waiting on the 60s heartbeat.
   //
-  // The poll is a TRIGGER, not a data source: on a bump it runs the GATED
-  // `recheckPending()` (drains the pending set through `onChange`, preserving
-  // the fn-629 in-HEAD gate / fn-627 dup-dispatch guard) AND a change-gated
+  // The poll is a TRIGGER, not a data source: on a bump it runs a change-gated
   // `reconcilePlanctlDirs(..., "db-poll")` re-scan (so a `.planctl` change
   // whose FSEvent was dropped — and was therefore NEVER gated into pending —
-  // is still recovered; the recheck-only path cannot fix that). The poll NEVER
-  // writes the DB.
+  // is still recovered). The poll NEVER writes the DB.
+  //
+  // fn-712: the db-poll NO LONGER calls `recheckPending`. The old global
+  // recheck spawned one synchronous `git cat-file` per pending path across all
+  // repos on every DB bump — the per-path storm that starved the loop and let
+  // the realtime bypass queue for ~74s. The pending drain is now covered by
+  // the repo-SCOPED triggers (the `recheck-pending` post on every
+  // `GitSnapshot`/`Commit`, the per-repo reflog watch) plus the 5s heartbeat
+  // floor, all batched-per-repo. The `reconcilePlanctlDirs` re-scan STAYS — it
+  // is the FSEvents-drop recovery a recheck-only path cannot replace (a dropped
+  // FSEvent never gated the path into pending in the first place).
   //
   // Single-flight coalescing (cloned from `src/autopilot-worker.ts`): a bump
   // arriving while the wake body runs coalesces into exactly ONE trailing
-  // re-run, never a queue. The recheck stays gated (fn-629); the reconcile is
-  // change-gated so a quiescent board emits nothing across bumps. The body is
-  // try/catch-wrapped (log+continue, no self-heal) — a throw must not wedge
-  // the poll loop nor leak the in-flight guard.
+  // re-run, never a queue. The reconcile is change-gated so a quiescent board
+  // emits nothing across bumps. The body is try/catch-wrapped (log+continue,
+  // no self-heal) — a throw must not wedge the poll loop nor leak the in-flight
+  // guard.
   const onWake = makeSingleFlight(
     () => {
-      scanner.recheckPending();
       reconcilePlanctlDirs(data.roots, scanner, "db-poll", nudgeFromPlanctlDir);
     },
     () => shuttingDown,

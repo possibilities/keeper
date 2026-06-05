@@ -1927,6 +1927,12 @@ function runDaemon(): void {
     if (msg.kind === "git-snapshot" || msg.kind === "commit") {
       planWorker.postMessage({
         type: "recheck-pending",
+        // fn-712: scope the drain to the single repo whose HEAD may have moved
+        // (this snapshot's `project_dir`), so the plan-worker re-probes only
+        // that repo's pending paths in ONE batched git call instead of every
+        // repo's per-path — the fix for the cross-repo per-path git storm that
+        // starved the worker for ~74s.
+        repo: msg.project_dir,
       } satisfies RecheckPendingMessage);
     }
     wakePending = true;

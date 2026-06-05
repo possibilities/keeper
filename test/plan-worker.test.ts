@@ -24,7 +24,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { openDb } from "../src/db";
 import {
   buildEpicMessage,
@@ -34,6 +34,7 @@ import {
   discoverPlanctlDirs,
   epicNumberFromId,
   isPathInHead,
+  isPathInHeadBatch,
   isWithinRoots,
   makeSingleFlight,
   PLAN_DB_POLL_MS,
@@ -1918,6 +1919,7 @@ test("onPendingChange observer fires on every pending mutation (fn-705 reflog-wa
     () => {},
     () => {},
     () => false,
+    undefined, // fn-712: isTrackedBatch slot — default per-path fallback.
     () => {
       calls += 1;
     },
@@ -1996,12 +1998,24 @@ test("onChange(triggeredByCommit=false): an uncommitted file still bounces to pe
   expect(logs.some((l) => l.includes(epicPath))).toBe(true);
   expect(logs.some((l) => l.includes("gate bounced"))).toBe(true);
 
-  // recheckPending also passes false — the gate is preserved across the drain.
+  // recheckPending keeps the gate in force: still uncommitted → still pending,
+  // still no emit. fn-712 — the batched drain does NOT re-route a
+  // still-uncommitted path through `onChange`, so there is NO fresh bounce log
+  // here (the storm-killing change: a pending path that's still uncommitted
+  // costs zero per-path work on a recheck). It re-emits only once committed.
   logs.length = 0;
   scanner.recheckPending();
   expect(emitted).toEqual([]);
   expect(scanner.pendingSize()).toBe(1);
-  expect(logs.some((l) => l.includes(epicPath))).toBe(true);
+  expect(logs.some((l) => l.includes("gate bounced"))).toBe(false);
+
+  // Commit → the next recheck drains it through onChange (which re-confirms the
+  // per-path gate) and emits.
+  git(tmpDir, "add", epicPath);
+  git(tmpDir, "commit", "-q", "-m", "add gated epic");
+  scanner.recheckPending();
+  expect(emitted.length).toBe(1);
+  expect(scanner.pendingSize()).toBe(0);
 });
 
 test("reconcilePlanctlDirs(heartbeat): a backstop emit logs a trigger-tagged 'did real work' line (fn-701)", () => {
@@ -2949,6 +2963,186 @@ test("recheckPending: no-op when pending set is empty", () => {
   const before = emitted.length;
   scanner.recheckPending();
   expect(emitted.length).toBe(before);
+  expect(scanner.pendingSize()).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// fn-712: batched + scoped recheck. `isPathInHeadBatch` probes a whole repo's
+// pending paths in ONE `git cat-file --batch-check` spawn (fail-closed on any
+// anomaly), and `recheckPending(root?)` scopes the drain to a single repo and
+// batches one git call per repo instead of one per path (the ~74s storm fix).
+// ---------------------------------------------------------------------------
+
+test("isPathInHeadBatch: committed → true, uncommitted/untracked → false, positional 1:1", () => {
+  gitInit(tmpDir);
+
+  // Three epic files: one committed, one staged-not-committed, one untracked.
+  const committed = writeEpic("fn-1-committed", { title: "C" });
+  const staged = writeEpic("fn-2-staged", { title: "S" });
+  const untracked = writeEpic("fn-3-untracked", { title: "U" });
+
+  git(tmpDir, "add", committed);
+  git(tmpDir, "commit", "-q", "-m", "add committed");
+  git(tmpDir, "add", staged); // staged but NOT committed — the fn-629 window
+
+  const rels = [committed, staged, untracked].map((p) => relative(tmpDir, p));
+  // Positional 1:1: only the committed path is in HEAD.
+  expect(isPathInHeadBatch(tmpDir, rels)).toEqual([true, false, false]);
+
+  // Order independence — flip the input order, results track it.
+  const flipped = [untracked, committed, staged].map((p) =>
+    relative(tmpDir, p),
+  );
+  expect(isPathInHeadBatch(tmpDir, flipped)).toEqual([false, true, false]);
+});
+
+test("isPathInHeadBatch: empty input is a no-op (no spawn, empty result)", () => {
+  gitInit(tmpDir);
+  expect(isPathInHeadBatch(tmpDir, [])).toEqual([]);
+});
+
+test("isPathInHeadBatch: fails closed (all-false) on a non-git dir", () => {
+  // No git tree under tmpDir → `git cat-file` exits non-zero → ALL false,
+  // byte-identical to isPathInHead's catch→false posture.
+  const rels = ["fn-1-x.json", "fn-2-y.json"];
+  expect(isPathInHeadBatch(tmpDir, rels)).toEqual([false, false]);
+});
+
+test("isPathInHeadBatch: fails closed (all-false) on a bogus repo root (spawn throw/non-zero)", () => {
+  const bogus = join(tmpDir, "does-not-exist");
+  expect(isPathInHeadBatch(bogus, ["a", "b", "c"])).toEqual([
+    false,
+    false,
+    false,
+  ]);
+});
+
+test("recheckPending(root): batched, ONE git call per repo, not per path (fn-712 storm fix)", () => {
+  // Inject a SPY batch predicate so we can assert exactly how many times it
+  // fires and with how many rels — proving one batched call per repo, never a
+  // per-path spawn. The per-path `isTracked` is set to throw so a regression to
+  // the old per-path loop fails loudly.
+  const calls: { root: string; relCount: number }[] = [];
+  const emitted: PlanMessage[] = [];
+  // During setup the per-path predicate bounces files into pending (returns
+  // false). Once `forbidPerPath` flips, ANY per-path call is a regression to
+  // the old per-path loop and throws loudly.
+  let forbidPerPath = false;
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    () => {
+      if (forbidPerPath) {
+        throw new Error(
+          "per-path isTracked must NOT be called by recheckPending",
+        );
+      }
+      return false; // setup: bounce to pending
+    },
+    (root, rels) => {
+      // Record the call shape, then report NOTHING in-HEAD — so the drain
+      // never re-enters onChange (which would hit the throwing per-path
+      // predicate). This isolates the BATCH behavior: we assert one call per
+      // repo carrying all that repo's rels, never a per-path probe.
+      calls.push({ root, relCount: rels.length });
+      return rels.map(() => false);
+    },
+  );
+
+  // Two repos, three pending epics each (six files → would be six per-path
+  // spawns under the old loop).
+  const repoA = join(tmpDir, "repoA");
+  const repoB = join(tmpDir, "repoB");
+  for (const [repo, n] of [
+    [repoA, 3],
+    [repoB, 3],
+  ] as const) {
+    mkdirSync(join(repo, ".planctl", "epics"), { recursive: true });
+    for (let i = 1; i <= n; i++) {
+      const p = join(repo, ".planctl", "epics", `fn-${i}-x.json`);
+      writeFileSync(p, JSON.stringify({ id: `fn-${i}-x`, title: "X" }));
+      scanner.onChange(p); // bounces to pending (batch says false at drain time)
+    }
+  }
+  expect(scanner.pendingSize()).toBe(6);
+
+  // From here on, a per-path probe is forbidden — recheckPending must use the
+  // batch predicate ONLY.
+  forbidPerPath = true;
+
+  // Scoped recheck: ONLY repoA's pending — ONE batched call with all 3 rels.
+  calls.length = 0;
+  scanner.recheckPending(repoA);
+  expect(calls.length).toBe(1);
+  expect(calls[0]?.root).toBe(repoA);
+  expect(calls[0]?.relCount).toBe(3);
+
+  // Global recheck (no root): ONE batched call PER repo (two repos → two
+  // calls), each carrying its repo's 3 rels — never one call per path.
+  calls.length = 0;
+  scanner.recheckPending();
+  expect(calls.length).toBe(2);
+  expect(new Set(calls.map((c) => c.root))).toEqual(new Set([repoA, repoB]));
+  expect(calls.every((c) => c.relCount === 3)).toBe(true);
+});
+
+test("recheckPending(root): scopes the drain to the matching repo only (real git)", () => {
+  // Two real git repos. Commit repoA's epic; leave repoB's uncommitted. A
+  // scoped recheck(repoA) drains only repoA; a scoped recheck(repoB) drains
+  // nothing (still uncommitted); a global recheck after committing repoB
+  // drains it.
+  const repoA = join(tmpDir, "repoA");
+  const repoB = join(tmpDir, "repoB");
+  mkdirSync(repoA, { recursive: true });
+  mkdirSync(repoB, { recursive: true });
+  gitInit(repoA);
+  gitInit(repoB);
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isPathInHead,
+    isPathInHeadBatch,
+  );
+
+  const writeEpicIn = (repo: string, id: string): string => {
+    const dir = join(repo, ".planctl", "epics");
+    mkdirSync(dir, { recursive: true });
+    const p = join(dir, `${id}.json`);
+    writeFileSync(p, JSON.stringify({ id, title: id, primary_repo: repo }));
+    return p;
+  };
+
+  const epicA = writeEpicIn(repoA, "fn-1-a");
+  const epicB = writeEpicIn(repoB, "fn-2-b");
+  scanner.onChange(epicA); // uncommitted → pending
+  scanner.onChange(epicB); // uncommitted → pending
+  expect(scanner.pendingSize()).toBe(2);
+
+  // Commit repoA only.
+  git(repoA, "add", epicA);
+  git(repoA, "commit", "-q", "-m", "add A");
+
+  // Scoped recheck on repoB drains NOTHING (its epic is still uncommitted) and
+  // must NOT touch repoA's now-committed pending path.
+  scanner.recheckPending(repoB);
+  expect(emitted.length).toBe(0);
+  expect(scanner.pendingSize()).toBe(2);
+
+  // Scoped recheck on repoA drains exactly repoA's epic.
+  scanner.recheckPending(repoA);
+  expect(emitted.length).toBe(1);
+  expect((emitted[0] as { id: string }).id).toBe("fn-1-a");
+  expect(scanner.pendingSize()).toBe(1);
+
+  // Commit repoB; a GLOBAL recheck (no root) covers all pendingRepos and
+  // drains it.
+  git(repoB, "add", epicB);
+  git(repoB, "commit", "-q", "-m", "add B");
+  scanner.recheckPending();
+  expect(emitted.length).toBe(2);
+  expect((emitted[1] as { id: string }).id).toBe("fn-2-b");
   expect(scanner.pendingSize()).toBe(0);
 });
 
