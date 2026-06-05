@@ -5,7 +5,9 @@ description: >-
   or unblocked), git state ("wait for the project to be clean", "wait until
   everything's committed", "hold until there are no uncommitted changes"),
   job state ("wait for the other agents to finish", "wait until everyone
-  else is done working", "block until no one else is editing the repo"), or
+  else is done working", "block until no one else is editing the repo"),
+  own-session monitor state ("wait until my dev server / script / build
+  watcher finishes", "block until my background task is done"), or
   any AND-combination of these — then run a follow-up action. Use when the
   user says "wait for", "wait until", "block until", "hold off until", "do
   X when Y is done", "do X after fn-N finishes", "review when fn-… is
@@ -45,6 +47,9 @@ The user's ask has two shapes glued together:
      committed"*, *"after there are no uncommitted changes"*.
    - a **jobs** state — *"when the other agents finish"*, *"once everyone
      else is done working"*, *"after no one else is editing the repo"*.
+   - a **monitor** state — *"when my dev server finishes"*, *"once my
+     background script is done"*, *"after my build watcher stops"*. Scoped
+     to THIS session's own background monitors.
    - a **combination** — *"wait until the repo is clean AND the other
      agents are done"*.
 2. **A follow-up** to run when the condition holds — *then review it*,
@@ -67,6 +72,7 @@ the literal `and` token.
 | `unblocked <id>` | A planctl id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). | `unblocked fn-…` |
 | `git-clean` | Any "wait for the repo / project to be clean / committed / have no uncommitted changes" phrasing. **No id.** Project-scoped to the cwd's git root. | `git-clean` |
 | `agents-idle` | Any "wait for the other agents / everyone else to finish / be done / stop editing" phrasing. **No id.** Project-scoped to the cwd's git root; excludes THIS session. | `agents-idle` |
+| `monitor-running <selector>` | Any "wait until my dev server / script / background task / build watcher finishes" phrasing. Scoped to THIS session's own monitors. **Takes one selector token:** `cmd:<full command>`, `kind:<monitor\|bash-bg\|ambient>`, or a bare token (= `cmd:<token>`). Exact match, never substring. | `monitor-running cmd:bun run dev` |
 
 | Field | How to derive | Example |
 |---|---|---|
@@ -88,9 +94,19 @@ invocation, not an ambiguity.
 ## Step 1 — Pre-check planctl targets are on-board (planctl conditions only)
 
 This pre-check applies **only to `complete` / `unblocked`**. The
-`git-clean` and `agents-idle` conditions have **no off-board pre-check** —
-they read live keeper projections that always exist, so there is nothing
-to refuse upfront; skip straight to step 2 for them.
+`git-clean`, `agents-idle`, and `monitor-running` conditions have **no
+`planctl show` pre-check** — they read live keeper projections that always
+exist, so there is nothing to refuse upfront here; skip straight to step 2
+for them.
+
+**`monitor-running` self-refuses at arm time.** If the selector matches no
+running monitor in this session, `keeper await` emits `failed
+reason=no-match` exit 1 instead of an instant `met` (the premature-unblock
+guard). The catch: the own-session monitor list is snapshotted on each
+**Stop**, so arm `monitor-running` in a turn **after** a Stop has captured
+the monitor — NOT the same turn you launch it (that race trips the
+refusal). If you just launched the background task this turn, let it
+appear in a `keeper jobs` snapshot first, then wire the await.
 
 For each planctl segment, verify the id exists and is awaitable before
 wiring Monitor. `planctl show` is read-only and fast.
@@ -130,6 +146,7 @@ Examples of the `command` field:
 - `keeper await complete fn-643-keeper-hook-dead-letters.4`
 - `keeper await git-clean`
 - `keeper await agents-idle`
+- `keeper await monitor-running cmd:bun run dev`
 - `keeper await git-clean and agents-idle`
 
 Defaults and overrides:
@@ -165,6 +182,10 @@ aggregate:
 [keeper-await] armed condition=<git-clean|agents-idle> state=<…>
 [keeper-await] met condition=<git-clean|agents-idle> detail=<…>
 
+# single monitor-running condition (carries the selector)
+[keeper-await] armed condition=monitor-running selector=<…> state=<…>
+[keeper-await] met condition=monitor-running selector=<…> detail=<…>
+
 # AND aggregate (two or more conditions)
 [keeper-await] armed conditions=<c1 and c2 …> count=<N>
 [keeper-await] met conditions=<c1 and c2 …> count=<N>
@@ -188,6 +209,7 @@ Reasons + exit codes:
 | `met …` | 0 | All conditions hold. | Run the follow-up. |
 | `failed reason=not-found …` | 1 | Planctl id absent at startup (pre-check missed it). | Tell the user, do NOT run the follow-up. |
 | `failed reason=no-git-root …` | 1 | A `git-clean` / `agents-idle` condition was requested but the cwd isn't inside a git worktree. | Tell the user; the wait can't be evaluated. Do NOT run the follow-up. |
+| `failed reason=no-match …` | 1 | A `monitor-running` selector matched no running monitor in this session at arm time (likely armed the same turn the monitor launched, or the selector is wrong). | Tell the user nothing matched; suggest re-arming after the monitor shows in `keeper jobs`, or fixing the selector. Do NOT run the follow-up. |
 | `failed reason=connect …` | 1 | Could not connect to keeperd. | Tell the user the daemon is unreachable. |
 | `failed reason=deleted …` | 4 | Planctl target was on board, vanished, re-query miss. | Tell the user the target was deleted; do NOT run the follow-up. |
 | `failed reason=timeout …` | 3 | Monitor wall-clock deadline hit. | Tell the user it timed out; ask whether to extend or move on. |
@@ -243,6 +265,20 @@ how they want to proceed — do NOT silently run the follow-up.
    for other agents idle then test", persistent: true })`.
 3. On `met` → run the tests.
 
+### Wait until my background script finishes (monitor-running)
+
+> User: "Ping me when my dev server stops."
+
+1. No `planctl show` pre-check — `monitor-running` has no off-board state.
+   Confirm the monitor already shows in a `keeper jobs` snapshot (it must
+   have been captured by a prior Stop); if you just launched it THIS turn,
+   wait for the next snapshot before arming.
+2. `Monitor({ command: "keeper await monitor-running cmd:bun run dev",
+   description: "wait for dev server to stop then ping", persistent: true })`.
+3. On `[keeper-await] met condition=monitor-running …` → ping the user. On
+   `failed reason=no-match` → the selector matched nothing; re-check the
+   command string against `keeper jobs`.
+
 ### Combination (AND)
 
 > User: "Wait until the project is clean and the other agents are done,
@@ -267,6 +303,12 @@ how they want to proceed — do NOT silently run the follow-up.
   UX.
 - Do not pass an id to `git-clean` / `agents-idle` — they're nullary and
   project-scoped to the cwd's git root.
+- Do not arm `monitor-running` in the SAME turn you launch the background
+  task — the own-session monitor list is snapshotted on Stop, so a
+  same-turn arm races the snapshot and trips `failed reason=no-match`.
+  Arm it after the monitor appears in a `keeper jobs` snapshot.
+- Do not use a substring/partial command for a `monitor-running` selector —
+  matching is EXACT on the full command string (or use `kind:<kind>`).
 - Do not run the follow-up on `failed`. Surface the terminal line and
   ask.
 - Do not invent ids. If the user gives a slug-less reference ("the

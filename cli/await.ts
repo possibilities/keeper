@@ -49,9 +49,12 @@ import {
   classifyTargetId,
   evaluateAwaitCondition,
   gitCleanState,
+  type MonitorSelector,
+  monitorRunningState,
   type PlanctlCondition,
 } from "../src/await-conditions";
 import { resolveSockPath } from "../src/db";
+import type { MonitorEntry } from "../src/derivers";
 import {
   type ConnectFactory,
   type FatalError,
@@ -88,6 +91,16 @@ Conditions:
   agents-idle     No OTHER session (job_id != CLAUDE_CODE_SESSION_ID) with
                   state=working has a cwd inside the cwd's git root. Takes
                   no id.
+  monitor-running <selector>
+                  Block until the matching background monitor in YOUR OWN
+                  session (job_id == CLAUDE_CODE_SESSION_ID) is no longer
+                  running. Selector forms (exact match, never substring):
+                    cmd:<command>   the FULL command/script string
+                    kind:<kind>     monitor | bash-bg | ambient
+                    <bare token>    shorthand for cmd:<token>
+                  Refuses at arm time (reason=no-match exit 1) if nothing in
+                  your session matches — arm it in a turn AFTER a Stop has
+                  snapshotted the monitor, not the same turn you launch it.
 
 Multiple conditions joined by the literal 'and' token block until ALL hold
 simultaneously (level-triggered, glitch-free). A planctl sub-condition going
@@ -111,7 +124,7 @@ Flags:
   --help                 Show this help.
 
 Exit codes:
-  0 met   1 not-found/usage/connect   3 timeout   4 deleted   5 stuck
+  0 met   1 not-found/no-match/usage/connect   3 timeout   4 deleted   5 stuck
 `;
 
 // ---------------------------------------------------------------------------
@@ -173,7 +186,8 @@ function eventLine(
 export type ConditionSegment =
   | { condition: PlanctlCondition; target: AwaitTarget }
   | { condition: "git-clean" }
-  | { condition: "agents-idle" };
+  | { condition: "agents-idle" }
+  | { condition: "monitor-running"; selector: MonitorSelector; raw: string };
 
 export interface ParsedArgs {
   /** One or more condition segments, ANDed. Always >= 1. */
@@ -196,6 +210,51 @@ const NULLARY_CONDITIONS: ReadonlySet<string> = new Set([
   "git-clean",
   "agents-idle",
 ]);
+/** Conditions that take EXACTLY ONE selector token (a third arity bucket). */
+const SELECTOR_CONDITIONS: ReadonlySet<string> = new Set(["monitor-running"]);
+
+/** The three valid `kind:` provenance values for a monitor selector. */
+const MONITOR_KINDS: ReadonlySet<MonitorEntry["kind"]> = new Set([
+  "monitor",
+  "bash-bg",
+  "ambient",
+]);
+
+/**
+ * Parse one `monitor-running` selector token (fn-718, T3) into a
+ * {@link MonitorSelector}. Three accepted forms, all EXACT-match (the
+ * predicate never does substring/regex):
+ *
+ *   - `cmd:<command>` → match the FULL command string (`{ command }`).
+ *   - `kind:<kind>`   → match the provenance enum, one of `monitor` /
+ *                       `bash-bg` / `ambient` (`{ kind }`).
+ *   - `<bare token>`  → shorthand for `cmd:<token>` (command-match default).
+ *
+ * Returns `null` on a malformed selector — an empty token, an empty
+ * `cmd:`/`kind:` value, or a `kind:` whose value isn't one of the three
+ * enum members. The caller converts `null` to a usage error. A bare token
+ * is NEVER rejected here (any non-empty string is a valid command match);
+ * the arm-time refuse-upfront pre-check is what catches a command that
+ * matches no live monitor.
+ */
+export function parseMonitorSelector(token: string): MonitorSelector | null {
+  if (token.length === 0) {
+    return null;
+  }
+  if (token.startsWith("cmd:")) {
+    const command = token.slice("cmd:".length);
+    return command.length > 0 ? { command } : null;
+  }
+  if (token.startsWith("kind:")) {
+    const kind = token.slice("kind:".length);
+    if ((MONITOR_KINDS as ReadonlySet<string>).has(kind)) {
+      return { kind: kind as MonitorEntry["kind"] };
+    }
+    return null;
+  }
+  // Bare token → command-match default.
+  return { command: token };
+}
 
 /**
  * Parse a duration like `30s`, `5m`, `2h`, or a bare-ms integer
@@ -334,10 +393,35 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
       }
       seen.add(condRaw);
       segments.push({ condition: condRaw as "git-clean" | "agents-idle" });
+    } else if (SELECTOR_CONDITIONS.has(condRaw)) {
+      if (rest.length !== 1) {
+        return {
+          ok: false,
+          message: `condition '${condRaw}' takes exactly one selector (got ${rest.length})`,
+        };
+      }
+      const rawSelector = rest[0] ?? "";
+      const selector = parseMonitorSelector(rawSelector);
+      if (selector === null) {
+        return {
+          ok: false,
+          message: `invalid selector '${rawSelector}' for '${condRaw}' (expected cmd:<command>, kind:<monitor|bash-bg|ambient>, or a bare command token)`,
+        };
+      }
+      const dupKey = `${condRaw}:${rawSelector}`;
+      if (seen.has(dupKey)) {
+        return { ok: false, message: `duplicate condition '${dupKey}'` };
+      }
+      seen.add(dupKey);
+      segments.push({
+        condition: "monitor-running",
+        selector,
+        raw: rawSelector,
+      });
     } else {
       return {
         ok: false,
-        message: `unknown condition '${condRaw}' (expected complete, unblocked, git-clean, agents-idle)`,
+        message: `unknown condition '${condRaw}' (expected complete, unblocked, git-clean, agents-idle, monitor-running)`,
       };
     }
   }
@@ -468,7 +552,23 @@ interface GitJobSlotState {
   lastVerdictPhrase: string | null;
 }
 
-type SlotState = PlanctlSlotState | GitJobSlotState;
+/**
+ * Per-monitor-running-slot mutable state (fn-718, T3). Like
+ * {@link GitJobSlotState} it has no `deleted`/`stuck` semantic (absence ==
+ * done), but it carries the parsed {@link MonitorSelector} plus the raw
+ * selector token for the line render and the arm-time refuse-upfront
+ * pre-check.
+ */
+interface MonitorSlotState {
+  readonly kind: "monitor-running";
+  readonly selector: MonitorSelector;
+  readonly raw: string;
+  met: boolean;
+  lastEval: AwaitState | null;
+  lastVerdictPhrase: string | null;
+}
+
+type SlotState = PlanctlSlotState | GitJobSlotState | MonitorSlotState;
 
 interface RunnerState {
   terminating: boolean;
@@ -505,13 +605,20 @@ export async function runAwait(
   const hasAgentsIdle = args.segments.some(
     (s) => s.condition === "agents-idle",
   );
+  const hasMonitorRunning = args.segments.some(
+    (s) => s.condition === "monitor-running",
+  );
+  // `monitor-running` reads jobs rows but is own-session-scoped — it needs
+  // NO git root (unlike `agents-idle`, which scopes by cwd containment).
   const needsRoot = hasGitClean || hasAgentsIdle;
+  // Both `agents-idle` and `monitor-running` read the jobs collection.
+  const needsJobs = hasAgentsIdle || hasMonitorRunning;
   // Open the readiness stream when any planctl segment is present; it
   // already folds git + jobs so those families ride it. Otherwise open a
   // dedicated git / jobs collection stream per family used.
   const openReadiness = hasPlanctl;
   const openGitCollection = hasGitClean && !hasPlanctl;
-  const openJobsCollection = hasAgentsIdle && !hasPlanctl;
+  const openJobsCollection = needsJobs && !hasPlanctl;
 
   // Build the latched slots in segment order (the line render walks them).
   const slots: SlotState[] = args.segments.map((seg): SlotState => {
@@ -523,6 +630,16 @@ export async function runAwait(
         lastEval: null,
         presentThisConnection: false,
         everSeen: false,
+        lastVerdictPhrase: null,
+      };
+    }
+    if (seg.condition === "monitor-running") {
+      return {
+        kind: "monitor-running",
+        selector: seg.selector,
+        raw: seg.raw,
+        met: false,
+        lastEval: null,
         lastVerdictPhrase: null,
       };
     }
@@ -627,10 +744,15 @@ export async function runAwait(
   // Best-effort prose of a slot's condition for the line render. For a
   // planctl slot it's `<condition> <id>`; for git/jobs it's the bare
   // condition tag.
-  const slotLabel = (slot: SlotState): string =>
-    slot.kind === "planctl"
-      ? `${slot.target.condition} ${slot.target.id}`
-      : slot.kind;
+  const slotLabel = (slot: SlotState): string => {
+    if (slot.kind === "planctl") {
+      return `${slot.target.condition} ${slot.target.id}`;
+    }
+    if (slot.kind === "monitor-running") {
+      return `monitor-running ${slot.raw}`;
+    }
+    return slot.kind;
+  };
 
   const emitArmed = (initials: AwaitState[]): void => {
     if (args.noArmedLine || state.armed) {
@@ -647,6 +769,14 @@ export async function runAwait(
         target: t.id,
         kind: t.kind,
         condition: t.condition,
+        state: initial.detail ?? initial.kind,
+      };
+    } else if (single && slots[0]?.kind === "monitor-running") {
+      // Single monitor-running condition: bare condition + selector + state.
+      const initial = initials[0] ?? { kind: "waiting" as const };
+      fields = {
+        condition: "monitor-running",
+        selector: slots[0].raw,
         state: initial.detail ?? initial.kind,
       };
     } else if (single) {
@@ -678,6 +808,14 @@ export async function runAwait(
         target: t.id,
         kind: t.kind,
         condition: t.condition,
+        detail: slots[0].lastEval?.detail ?? "",
+      });
+      return;
+    }
+    if (single && slots[0]?.kind === "monitor-running") {
+      emitTerminal("met", 0, {
+        condition: "monitor-running",
+        selector: slots[0].raw,
         detail: slots[0].lastEval?.detail ?? "",
       });
       return;
@@ -718,6 +856,26 @@ export async function runAwait(
       base.from = slotLabel(slot);
     }
     emitTerminal("failed", code, base);
+  };
+
+  // Refuse-upfront for `monitor-running` (fn-718, T3): at arm time, if the
+  // selector matches NO running monitor in the caller's own session, the
+  // predicate would already read `met` — but firing `met` immediately on a
+  // never-started selector is premature-unblock. We instead refuse loudly
+  // (`reason=no-match` exit 1) — mirrors the planctl `not-found` refusal
+  // and the skill's off-board pre-check. Caveat: arm this in a turn AFTER a
+  // Stop has snapshotted the monitor; arming in the SAME turn you launch it
+  // races the snapshot and trips this refusal.
+  const emitMonitorNoMatch = (slot: MonitorSlotState): void => {
+    const base: Record<string, string> = {
+      reason: "no-match",
+      condition: "monitor-running",
+      selector: slot.raw,
+    };
+    if (!single) {
+      base.from = slotLabel(slot);
+    }
+    emitTerminal("failed", 1, base);
   };
 
   // Best-effort scope-exempt re-query for the deleted-vs-complete
@@ -914,7 +1072,12 @@ export async function runAwait(
     }
     const phrase = evalState.detail ?? evalState.kind;
     if (phrase !== slot.lastVerdictPhrase) {
-      const label = slot.kind === "planctl" ? slot.target.id : slot.kind;
+      const label =
+        slot.kind === "planctl"
+          ? slot.target.id
+          : slot.kind === "monitor-running"
+            ? `monitor-running ${slot.raw}`
+            : slot.kind;
       deps.writeStderr(
         `[keeper-await] progress target=${label} state=${sanitizeValue(phrase)}${suffix}\n`,
       );
@@ -995,8 +1158,7 @@ export async function runAwait(
         logProgress(slot, result);
         slot.met = result.kind === "met";
         evals[i] = result;
-      } else {
-        // agents-idle
+      } else if (slot.kind === "agents-idle") {
         if (latestJobRows === null || deps.gitRoot === null) {
           evals[i] = { kind: "waiting" };
           continue;
@@ -1004,6 +1166,22 @@ export async function runAwait(
         const result = agentsIdleState(
           deps.gitRoot,
           deps.ownSessionId,
+          latestJobRows,
+        );
+        slot.lastEval = result;
+        logProgress(slot, result);
+        slot.met = result.kind === "met";
+        evals[i] = result;
+      } else if (slot.kind === "monitor-running") {
+        // own-session-scoped; needs jobs rows + the caller's own session
+        // id, NO git root.
+        if (latestJobRows === null) {
+          evals[i] = { kind: "waiting" };
+          continue;
+        }
+        const result = monitorRunningState(
+          deps.ownSessionId,
+          slot.selector,
           latestJobRows,
         );
         slot.lastEval = result;
@@ -1024,6 +1202,13 @@ export async function runAwait(
         const ev = evals[i];
         if (slot?.kind === "planctl" && ev?.kind === "not-found") {
           emitPlanctlFailure(slot, "not-found", 1, undefined);
+          return;
+        }
+        // Refuse-upfront: a `monitor-running` slot that's already `met` at
+        // arm time matched no running monitor in this session — refuse
+        // loudly instead of an instant `met` (premature-unblock guard).
+        if (slot?.kind === "monitor-running" && ev?.kind === "met") {
+          emitMonitorNoMatch(slot);
           return;
         }
       }
@@ -1106,7 +1291,7 @@ export async function runAwait(
     if (hasGitClean) {
       latestGitRows = snap.gitStatus;
     }
-    if (hasAgentsIdle) {
+    if (needsJobs) {
       latestJobRows = Array.from(snap.jobs.values());
     }
     void evaluate();

@@ -23,6 +23,7 @@ import { expect, test } from "bun:test";
 import {
   parseAwaitArgs,
   parseDurationMs,
+  parseMonitorSelector,
   type RunDeps,
   runAwait,
 } from "../cli/await";
@@ -217,6 +218,7 @@ function jobRow(
     title: null,
     title_source: null,
     transcript_path: null,
+    monitors: null,
     ...overrides,
   };
 }
@@ -632,6 +634,128 @@ test("parseAwaitArgs: unknown condition in a segment → usage error", () => {
 
 test("parseAwaitArgs: no positionals → usage error", () => {
   const r = parseAwaitArgs([]);
+  expect(r.ok).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// parseMonitorSelector + monitor-running arg arity (fn-718, T3)
+// ---------------------------------------------------------------------------
+
+test("parseMonitorSelector: bare token → command-match default", () => {
+  expect(parseMonitorSelector("my-script.sh")).toEqual({
+    command: "my-script.sh",
+  });
+});
+
+test("parseMonitorSelector: cmd: prefix → command match", () => {
+  expect(parseMonitorSelector("cmd:bun run dev")).toEqual({
+    command: "bun run dev",
+  });
+});
+
+test("parseMonitorSelector: kind: prefix → kind match (all three enums)", () => {
+  expect(parseMonitorSelector("kind:monitor")).toEqual({ kind: "monitor" });
+  expect(parseMonitorSelector("kind:bash-bg")).toEqual({ kind: "bash-bg" });
+  expect(parseMonitorSelector("kind:ambient")).toEqual({ kind: "ambient" });
+});
+
+test("parseMonitorSelector: unknown kind value → null", () => {
+  expect(parseMonitorSelector("kind:bogus")).toBeNull();
+});
+
+test("parseMonitorSelector: empty cmd:/kind: value → null", () => {
+  expect(parseMonitorSelector("cmd:")).toBeNull();
+  expect(parseMonitorSelector("kind:")).toBeNull();
+});
+
+test("parseMonitorSelector: empty token → null", () => {
+  expect(parseMonitorSelector("")).toBeNull();
+});
+
+test("parseAwaitArgs: monitor-running with bare selector parses (new arity)", () => {
+  const r = parseAwaitArgs(["monitor-running", "my-script.sh"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.segments).toHaveLength(1);
+  const seg = r.args.segments[0];
+  if (seg?.condition !== "monitor-running") {
+    throw new Error("expected monitor-running segment");
+  }
+  expect(seg.selector).toEqual({ command: "my-script.sh" });
+  expect(seg.raw).toBe("my-script.sh");
+});
+
+test("parseAwaitArgs: monitor-running with kind: selector parses", () => {
+  const r = parseAwaitArgs(["monitor-running", "kind:bash-bg"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  const seg = r.args.segments[0];
+  if (seg?.condition !== "monitor-running") {
+    throw new Error("expected monitor-running segment");
+  }
+  expect(seg.selector).toEqual({ kind: "bash-bg" });
+});
+
+test("parseAwaitArgs: monitor-running with NO selector → usage error", () => {
+  const r = parseAwaitArgs(["monitor-running"]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: monitor-running with two selector tokens → usage error", () => {
+  const r = parseAwaitArgs(["monitor-running", "a", "b"]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: monitor-running with invalid kind selector → usage error", () => {
+  const r = parseAwaitArgs(["monitor-running", "kind:nope"]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: AND of monitor-running + git-clean parses both", () => {
+  const r = parseAwaitArgs([
+    "monitor-running",
+    "cmd:bun run dev",
+    "and",
+    "git-clean",
+  ]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.segments).toHaveLength(2);
+  const first = r.args.segments[0];
+  if (first?.condition !== "monitor-running") {
+    throw new Error("expected monitor-running first segment");
+  }
+  expect(first.selector).toEqual({ command: "bun run dev" });
+  expect(r.args.segments[1]?.condition).toBe("git-clean");
+});
+
+test("parseAwaitArgs: AND of monitor-running + agents-idle parses both", () => {
+  const r = parseAwaitArgs([
+    "monitor-running",
+    "my-script.sh",
+    "and",
+    "agents-idle",
+  ]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.segments.map((s) => s.condition)).toEqual([
+    "monitor-running",
+    "agents-idle",
+  ]);
+});
+
+test("parseAwaitArgs: duplicate monitor-running selector → usage error", () => {
+  const r = parseAwaitArgs([
+    "monitor-running",
+    "my-script.sh",
+    "and",
+    "monitor-running",
+    "my-script.sh",
+  ]);
   expect(r.ok).toBe(false);
 });
 
@@ -1366,6 +1490,256 @@ test("agents-idle: another working job in root → waiting, then idle → met", 
 
   // It ends → idle → met.
   sock.deliver([resultFrame("jobs", `${idPrefix}-jobs`, [], 2)]);
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// monitor-running (fn-718, T3) — own-session-scoped; rides the jobs
+// collection but matches ONLY the caller's own job row. The harness's
+// default ownSessionId is null, so these tests set it explicitly.
+// ---------------------------------------------------------------------------
+
+/** A jobs row carrying a JSON `monitors` array (one own-session monitor). */
+function monitorsJson(
+  entries: Array<{ id: string; kind: string; command?: string }>,
+): string {
+  return JSON.stringify(entries);
+}
+
+test("monitor-running: own monitor still running → armed, no terminal", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  h.deps.ownSessionId = "me";
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([
+      {
+        condition: "monitor-running",
+        selector: { command: "dev" },
+        raw: "dev",
+      },
+    ]),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
+  expect(outbound).toHaveLength(1);
+  expect(outbound[0]?.collection).toBe("jobs");
+
+  // Own job has a matching running monitor → armed, waiting.
+  sock.deliver([
+    resultFrame("jobs", `${idPrefix}-jobs`, [
+      jobRow({
+        job_id: "me",
+        monitors: monitorsJson([{ id: "m1", kind: "monitor", command: "dev" }]),
+      }),
+    ]),
+  ]);
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).toContain("[keeper-await] armed");
+  expect(h.stdout[0]).toContain("condition=monitor-running");
+  expect(h.stdout[0]).toContain("selector=dev");
+  expect(h.exitCode).toBeNull();
+
+  // The monitor drops out of the snapshot (drop-when-dead) → met.
+  sock.deliver([
+    resultFrame(
+      "jobs",
+      `${idPrefix}-jobs`,
+      [jobRow({ job_id: "me", monitors: monitorsJson([]) })],
+      2,
+    ),
+  ]);
+  expect(h.stdout.some((l) => l.includes("[keeper-await] met"))).toBe(true);
+  expect(h.exitCode).toBe(0);
+});
+
+test("monitor-running: kind selector matches by provenance", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  h.deps.ownSessionId = "me";
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([
+      {
+        condition: "monitor-running",
+        selector: { kind: "bash-bg" },
+        raw: "kind:bash-bg",
+      },
+    ]),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // A bash-bg monitor is running → waiting.
+  sock.deliver([
+    resultFrame("jobs", `${idPrefix}-jobs`, [
+      jobRow({
+        job_id: "me",
+        monitors: monitorsJson([{ id: "m1", kind: "bash-bg", command: "x" }]),
+      }),
+    ]),
+  ]);
+  expect(h.stdout[0]).toContain("armed");
+  expect(h.exitCode).toBeNull();
+
+  // It ends → met.
+  sock.deliver([
+    resultFrame(
+      "jobs",
+      `${idPrefix}-jobs`,
+      [jobRow({ job_id: "me", monitors: monitorsJson([]) })],
+      2,
+    ),
+  ]);
+  expect(h.exitCode).toBe(0);
+});
+
+test("monitor-running: no matching monitor at arm → refuse (no-match exit 1, not instant met)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  h.deps.ownSessionId = "me";
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([
+      {
+        condition: "monitor-running",
+        selector: { command: "never-launched" },
+        raw: "never-launched",
+      },
+    ]),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // Own job exists but no monitor matches → refuse upfront, NOT instant met.
+  sock.deliver([
+    resultFrame("jobs", `${idPrefix}-jobs`, [
+      jobRow({
+        job_id: "me",
+        monitors: monitorsJson([{ id: "m1", kind: "monitor", command: "dev" }]),
+      }),
+    ]),
+  ]);
+  // Exactly one terminal line, and it's a `failed reason=no-match`, NOT a
+  // `met` and NOT an `armed`.
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).toContain("[keeper-await] failed");
+  expect(h.stdout[0]).toContain("reason=no-match");
+  expect(h.stdout[0]).not.toContain("[keeper-await] met");
+  expect(h.stdout[0]).not.toContain("[keeper-await] armed");
+  expect(h.exitCode).toBe(1);
+});
+
+test("monitor-running: own job absent at arm → refuse (no-match, vacuously done)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  h.deps.ownSessionId = "me";
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([
+      {
+        condition: "monitor-running",
+        selector: { command: "dev" },
+        raw: "dev",
+      },
+    ]),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // No own job row at all → predicate is vacuously `met`, so the refuse
+  // -upfront pre-check fires (no monitor matched).
+  sock.deliver([
+    resultFrame("jobs", `${idPrefix}-jobs`, [
+      jobRow({ job_id: "other", monitors: monitorsJson([]) }),
+    ]),
+  ]);
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).toContain("reason=no-match");
+  expect(h.exitCode).toBe(1);
+});
+
+test("monitor-running AND git-clean: met only after monitor ends AND repo clean", async () => {
+  const { factory, socketsAll } = makeMockConnect();
+  const h = makeHarness(factory);
+  h.deps.ownSessionId = "me";
+  // monitor-running + git-clean → planctl-less combo opens BOTH dedicated
+  // collection streams (git + jobs); the aggregate first-paint gate holds
+  // armed until BOTH have painted.
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([
+      {
+        condition: "monitor-running",
+        selector: { command: "dev" },
+        raw: "dev",
+      },
+      { condition: "git-clean" },
+    ]),
+    h.deps,
+  );
+
+  expect(socketsAll.sockets).toHaveLength(2);
+  const gitSock = findSockForCollection(socketsAll.sockets, "git");
+  const jobsSock = findSockForCollection(socketsAll.sockets, "jobs");
+  if (!gitSock || !jobsSock) {
+    throw new Error("git/jobs sockets not both opened");
+  }
+
+  // Paint jobs WITH a running monitor; paint git clean. Both painted →
+  // armed, but the monitor is still running → not met.
+  jobsSock.deliver([
+    resultFrame("jobs", `${idPrefix}-jobs`, [
+      jobRow({
+        job_id: "me",
+        monitors: monitorsJson([{ id: "m1", kind: "monitor", command: "dev" }]),
+      }),
+    ]),
+  ]);
+  gitSock.deliver([
+    resultFrame("git", `${idPrefix}-git`, [gitRow({ project_dir: "/repo" })]),
+  ]);
+  expect(h.stdout.some((l) => l.includes("[keeper-await] armed"))).toBe(true);
+  expect(h.stdout.some((l) => l.includes("[keeper-await] met"))).toBe(false);
+  expect(h.exitCode).toBeNull();
+
+  // The monitor ends → monitor-running met AND git-clean still met → the
+  // single aggregate terminal met fires.
+  jobsSock.deliver([
+    resultFrame(
+      "jobs",
+      `${idPrefix}-jobs`,
+      [jobRow({ job_id: "me", monitors: monitorsJson([]) })],
+      2,
+    ),
+  ]);
+  const metLines = h.stdout.filter((l) => l.includes("[keeper-await] met"));
+  expect(metLines).toHaveLength(1);
   expect(h.exitCode).toBe(0);
 });
 
