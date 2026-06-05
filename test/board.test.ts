@@ -35,11 +35,21 @@ import {
   renderEpicDepPills,
   renderJobLinkLines,
 } from "../cli/board";
-import { epicHeaderLabel } from "../src/board-render";
+import {
+  BOARD_PILL_LEGEND,
+  epicHeaderLabel,
+  JOBS_PILL_LEGEND,
+  pillOrEmpty,
+  renderClosePills,
+  renderTaskPills,
+  subagentLinesFor,
+  validatedPill,
+} from "../src/board-render";
 import {
   computeReadiness,
   type EpicDepResolution,
   formatPill,
+  type Verdict,
 } from "../src/readiness";
 import { collapseSubagentsByName, projectRows } from "../src/readiness-client";
 import type {
@@ -956,6 +966,13 @@ test("colorizePillsInLine: each bucket colors its representative tokens", () => 
   );
   expect(colorizePillsInLine("[ready]")).toBe(`[${SUCCESS}ready${RESET}]`);
   expect(colorizePillsInLine("[done]")).toBe(`[${SUCCESS}done${RESET}]`);
+  // fn-708: the two new disambiguating tokens.
+  expect(colorizePillsInLine("[worker-done]")).toBe(
+    `[${SUCCESS}worker-done${RESET}]`,
+  );
+  expect(colorizePillsInLine("[rt:blocked]")).toBe(
+    `[${WARN}rt:blocked${RESET}]`,
+  );
   expect(colorizePillsInLine("[failed]")).toBe(`[${ERROR}failed${RESET}]`);
   expect(colorizePillsInLine("[rejected]")).toBe(`[${ERROR}rejected${RESET}]`);
   expect(colorizePillsInLine("[killed]")).toBe(`[${ERROR}killed${RESET}]`);
@@ -1367,4 +1384,322 @@ test("colorizePillsInLine: dead-letter:<N> takes the warn bucket via prefix fall
   expect(colorizePillsInLine("[dead-letter:42]")).toBe(
     `[${WARN}dead-letter:42${RESET}]`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-708: token-collision matrix — the two relabeled tokens must NOT decode
+// to the same color path as the fields they were split away from when both
+// co-render on one row.
+// ---------------------------------------------------------------------------
+
+test("colorizePillsInLine: fn-708 [worker-done] and runtime [done] color independently on one row", () => {
+  // worker_phase survivor + runtime_status=done co-render. Both green, but
+  // they are DISTINCT tokens (positional ambiguity is impossible — the
+  // label `worker-done` carries the field name).
+  expect(colorizePillsInLine("[done] [worker-done]")).toBe(
+    `[${SUCCESS}done${RESET}] [${SUCCESS}worker-done${RESET}]`,
+  );
+});
+
+test("colorizePillsInLine: fn-708 [rt:blocked] does NOT collide with verdict [blocked:*]", () => {
+  // The manual runtime block flag and a computed readiness block co-render.
+  // `rt:blocked` resolves via exact-match (warn); `blocked:single-task-per-root`
+  // resolves via the `blocked:` prefix (also warn) — same color, distinct
+  // tokens, no positional ambiguity.
+  expect(
+    colorizePillsInLine("[rt:blocked] [blocked:single-task-per-root]"),
+  ).toBe(
+    `[${WARN}rt:blocked${RESET}] [${WARN}blocked:single-task-per-root${RESET}]`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// fn-708: pillOrEmpty — the omit-default primitive (T1)
+// ---------------------------------------------------------------------------
+
+test("pillOrEmpty: value == default → no pill", () => {
+  expect(pillOrEmpty("todo", "todo")).toBe("");
+  expect(pillOrEmpty("pending", "pending")).toBe("");
+  expect(pillOrEmpty("open", "open")).toBe("");
+});
+
+test("pillOrEmpty: value != default → leading-space pill", () => {
+  expect(pillOrEmpty("in_progress", "todo")).toBe(" [in_progress]");
+  expect(pillOrEmpty("approved", "pending")).toBe(" [approved]");
+  expect(pillOrEmpty("done", "open")).toBe(" [done]");
+});
+
+test("pillOrEmpty: null / non-string coalesces to no pill (never [null])", () => {
+  expect(pillOrEmpty(null, "todo")).toBe("");
+  expect(pillOrEmpty(undefined, "todo")).toBe("");
+  expect(pillOrEmpty(42, "todo")).toBe("");
+  expect(pillOrEmpty({}, "todo")).toBe("");
+});
+
+// ---------------------------------------------------------------------------
+// fn-708: validatedPill — omit-default behavior (render [validated] only)
+// ---------------------------------------------------------------------------
+
+test("validatedPill: non-null last_validated_at → ' [validated]'", () => {
+  expect(validatedPill("2026-06-05T00:00:00Z")).toBe(" [validated]");
+  expect(validatedPill(1234567890)).toBe(" [validated]");
+});
+
+test("validatedPill: null / undefined → '' (absence ≡ unvalidated)", () => {
+  expect(validatedPill(null)).toBe("");
+  expect(validatedPill(undefined)).toBe("");
+});
+
+// ---------------------------------------------------------------------------
+// fn-708: renderTaskPills — runtime_status / worker_phase / approval (T1+T3)
+// ---------------------------------------------------------------------------
+
+const READY: Verdict = { tag: "ready" };
+const COMPLETED: Verdict = { tag: "completed" };
+const JOB_RUNNING: Verdict = {
+  tag: "running",
+  reason: { kind: "job-running" },
+};
+const PLANNER_RUNNING: Verdict = {
+  tag: "running",
+  reason: { kind: "planner-running" },
+};
+const SUBAGENT_RUNNING: Verdict = {
+  tag: "running",
+  reason: { kind: "sub-agent-running" },
+};
+const SUBAGENT_STALE: Verdict = {
+  tag: "running",
+  reason: { kind: "sub-agent-stale" },
+};
+const JOB_PENDING: Verdict = {
+  tag: "blocked",
+  reason: { kind: "job-pending" },
+};
+const JOB_REJECTED: Verdict = {
+  tag: "blocked",
+  reason: { kind: "job-rejected" },
+};
+const GIT_UNCOMMITTED: Verdict = {
+  tag: "blocked",
+  reason: { kind: "git-uncommitted" },
+};
+const GIT_ORPHANS: Verdict = {
+  tag: "blocked",
+  reason: { kind: "git-orphans" },
+};
+const EPIC_NOT_VALIDATED: Verdict = {
+  tag: "blocked",
+  reason: { kind: "epic-not-validated" },
+};
+
+test("renderTaskPills: all-resting task (todo/open/pending) → no pills", () => {
+  expect(
+    renderTaskPills(
+      { runtime_status: "todo", worker_phase: "open", approval: "pending" },
+      READY,
+    ),
+  ).toBe("");
+});
+
+test("renderTaskPills: runtime_status omits todo, renders in_progress/done verbatim", () => {
+  expect(renderTaskPills({ runtime_status: "in_progress" }, READY)).toBe(
+    " [in_progress]",
+  );
+  expect(renderTaskPills({ runtime_status: "done" }, READY)).toBe(" [done]");
+  expect(renderTaskPills({ runtime_status: "todo" }, READY)).toBe("");
+});
+
+test("renderTaskPills: runtime_status=blocked relabels to [rt:blocked]", () => {
+  expect(renderTaskPills({ runtime_status: "blocked" }, READY)).toBe(
+    " [rt:blocked]",
+  );
+  // never the bare [blocked] that would collide with the verdict family.
+  expect(renderTaskPills({ runtime_status: "blocked" }, READY)).not.toContain(
+    "[blocked]",
+  );
+});
+
+test("renderTaskPills: worker_phase=open never renders (T1)", () => {
+  expect(renderTaskPills({ worker_phase: "open" }, READY)).toBe("");
+  expect(renderTaskPills({ worker_phase: "open" }, JOB_RUNNING)).toBe("");
+});
+
+test("renderTaskPills: worker_phase=done renders [worker-done] in the 4 UNPINNED verdict classes", () => {
+  // job-running, sub-agent-running, sub-agent-stale, planner-running,
+  // epic-not-validated → done is genuinely surprising, must show.
+  for (const v of [
+    JOB_RUNNING,
+    SUBAGENT_RUNNING,
+    SUBAGENT_STALE,
+    PLANNER_RUNNING,
+    EPIC_NOT_VALIDATED,
+    READY,
+  ]) {
+    expect(renderTaskPills({ worker_phase: "done" }, v)).toBe(" [worker-done]");
+  }
+});
+
+test("renderTaskPills: worker_phase=done OMITS [worker-done] where the verdict PINS it", () => {
+  // completed, job-pending, git-uncommitted, git-orphans → verdict pins done.
+  for (const v of [COMPLETED, JOB_PENDING, GIT_UNCOMMITTED, GIT_ORPHANS]) {
+    expect(renderTaskPills({ worker_phase: "done" }, v)).not.toContain(
+      "[worker-done]",
+    );
+  }
+});
+
+test("renderTaskPills: never renders a bare [done] for worker_phase (de-ambiguation)", () => {
+  // The worker survivor is ALWAYS labeled; a bare [done] only ever comes
+  // from runtime_status. With worker_phase=done + runtime_status absent,
+  // the only pill is [worker-done], not [done].
+  const out = renderTaskPills({ worker_phase: "done" }, JOB_RUNNING);
+  expect(out).toContain("[worker-done]");
+  expect(out).not.toBe(" [done]");
+});
+
+test("renderTaskPills: approval omits pending; renders approved/rejected with T3 suppression", () => {
+  // pending → nothing.
+  expect(renderTaskPills({ approval: "pending" }, READY)).toBe("");
+  // approved under a non-completed verdict → shown.
+  expect(renderTaskPills({ approval: "approved" }, READY)).toBe(" [approved]");
+  // approved under completed → T3-suppressed (the word is in [completed]).
+  expect(renderTaskPills({ approval: "approved" }, COMPLETED)).toBe("");
+  // rejected under a non-rejected verdict → shown.
+  expect(renderTaskPills({ approval: "rejected" }, EPIC_NOT_VALIDATED)).toBe(
+    " [rejected]",
+  );
+  // rejected under blocked:job-rejected → T3-suppressed (word on screen).
+  expect(renderTaskPills({ approval: "rejected" }, JOB_REJECTED)).toBe("");
+});
+
+test("renderTaskPills: completed task collapses to runtime only (worker+approval pinned)", () => {
+  // [done][done][approved] + [completed] → just runtime [done].
+  expect(
+    renderTaskPills(
+      { runtime_status: "done", worker_phase: "done", approval: "approved" },
+      COMPLETED,
+    ),
+  ).toBe(" [done]");
+});
+
+test("renderTaskPills: stacks surviving fields in fixed order rt → worker → approval", () => {
+  // in_progress runtime + worker done (unpinned) + approved (non-completed).
+  expect(
+    renderTaskPills(
+      {
+        runtime_status: "in_progress",
+        worker_phase: "done",
+        approval: "approved",
+      },
+      JOB_RUNNING,
+    ),
+  ).toBe(" [in_progress] [worker-done] [approved]");
+});
+
+// ---------------------------------------------------------------------------
+// fn-708: renderClosePills — close-row status (T2) + approval (T1+T3)
+// ---------------------------------------------------------------------------
+
+test("renderClosePills: drops the constant [status] pill (T2)", () => {
+  // status='open' is the board filter constant — never rendered, regardless
+  // of the verdict, and the approval default (pending) is omitted too, so the
+  // whole close row collapses to title + verdict.
+  expect(renderClosePills({ status: "open", approval: "pending" }, READY)).toBe(
+    "",
+  );
+  expect(
+    renderClosePills({ status: "open", approval: "pending" }, COMPLETED),
+  ).not.toContain("[open]");
+});
+
+test("renderClosePills: never emits [status] even for a non-open status value", () => {
+  // The capability is retained via a restore-comment, but the helper itself
+  // is hardwired to omit it on the board view.
+  expect(
+    renderClosePills({ status: "closed", approval: "pending" }, READY),
+  ).not.toContain("[closed]");
+});
+
+test("renderClosePills: approval omits pending, T3-suppresses rejected under job-rejected", () => {
+  expect(renderClosePills({ approval: "pending" }, READY)).toBe("");
+  // approved never reaches the board (filter), so it is omitted here too.
+  expect(renderClosePills({ approval: "approved" }, READY)).toBe("");
+  // rejected under a non-rejected verdict → shown.
+  expect(renderClosePills({ approval: "rejected" }, READY)).toBe(" [rejected]");
+  // rejected under blocked:job-rejected → suppressed.
+  expect(renderClosePills({ approval: "rejected" }, JOB_REJECTED)).toBe("");
+});
+
+// ---------------------------------------------------------------------------
+// fn-708: subagentLinesFor — status pill omit-default ({ok, null, empty})
+// ---------------------------------------------------------------------------
+
+function subFixture(
+  status: string | null,
+  over: Partial<SubagentInvocation> = {},
+): Map<string, SubagentInvocation[]> {
+  return new Map([
+    [
+      "j",
+      [
+        {
+          job_id: "j",
+          subagent_type: "scout",
+          turn_seq: 0,
+          ts: 1,
+          status,
+          description: "d",
+          last_event_id: 1,
+          ...over,
+        } as unknown as SubagentInvocation,
+      ],
+    ],
+  ]);
+}
+
+test("subagentLinesFor: drops the pill for status=ok (absence ≡ ok)", () => {
+  expect(subagentLinesFor(subFixture("ok"), "j", "  ")).toEqual(["  scout: d"]);
+});
+
+test("subagentLinesFor: drops the pill for null status (no literal [])", () => {
+  const lines = subagentLinesFor(subFixture(null), "j", "  ");
+  expect(lines).toEqual(["  scout: d"]);
+  expect(lines[0]).not.toContain("[]");
+});
+
+test("subagentLinesFor: drops the pill for empty-string status", () => {
+  expect(subagentLinesFor(subFixture(""), "j", "  ")).toEqual(["  scout: d"]);
+});
+
+test("subagentLinesFor: keeps running / failed / unknown / superseded", () => {
+  expect(subagentLinesFor(subFixture("running"), "j", "  ")).toEqual([
+    "  scout: d [running]",
+  ]);
+  expect(subagentLinesFor(subFixture("failed"), "j", "  ")).toEqual([
+    "  scout: d [failed]",
+  ]);
+  expect(subagentLinesFor(subFixture("unknown"), "j", "  ")).toEqual([
+    "  scout: d [unknown]",
+  ]);
+  expect(subagentLinesFor(subFixture("superseded"), "j", "  ")).toEqual([
+    "  scout: d [superseded]",
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-708: footer-legend constants are single-source and present
+// ---------------------------------------------------------------------------
+
+test("BOARD_PILL_LEGEND / JOBS_PILL_LEGEND are non-empty single-source constants", () => {
+  expect(BOARD_PILL_LEGEND.length).toBeGreaterThan(0);
+  expect(JOBS_PILL_LEGEND.length).toBeGreaterThan(0);
+  // The board legend documents every omit-default field the view carries.
+  expect(BOARD_PILL_LEGEND).toContain("pending");
+  expect(BOARD_PILL_LEGEND).toContain("todo");
+  expect(BOARD_PILL_LEGEND).toContain("worker-done");
+  expect(BOARD_PILL_LEGEND).toContain("stopped");
+  // The jobs legend is scoped to state + subagent.
+  expect(JOBS_PILL_LEGEND).toContain("stopped");
+  expect(JOBS_PILL_LEGEND).toContain("ok");
 });

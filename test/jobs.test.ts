@@ -727,7 +727,8 @@ test("renderJobsBody insert mode: selected + expanded → down-triangle, backend
       "  --- ada ---",
       `${SELECTED_LINE_PREFIX}${TRI_DOWN} (a) first [working]`,
       "    [main p11]", // backend pill: 2 base + its own 2
-      "    scout: d [ok]", // sub-agent line: 2 base + its own 2
+      // fn-708: subagent status=ok now omits the pill (absence ≡ ok).
+      "    scout: d", // sub-agent line: 2 base + its own 2
     ].join("\n"),
   );
 });

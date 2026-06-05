@@ -28,6 +28,7 @@ import {
   LineBuffer,
   type ServerFrame,
 } from "./protocol";
+import type { Verdict } from "./readiness";
 import { collapseSubagentsByName } from "./readiness-client";
 import type { SubagentInvocation } from "./types";
 
@@ -191,6 +192,204 @@ export function permissionPromptPillSeg(at: unknown, kind: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
+// Omit-default pill helpers (T1) + verdict-aware suppression (T2/T3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The lossless-consolidation primitive (epic fn-708, transform T1
+ * "omit-default"). Render a ` [value]` pill segment ONLY when `value`
+ * differs from its single resting/default value; render `""` (no pill)
+ * at the default. Absence of the pill ≡ the default — a uniform rule a
+ * one-line footer legend ({@link BOARD_PILL_LEGEND} / {@link JOBS_PILL_LEGEND})
+ * makes recoverable.
+ *
+ * Returns the leading `' '` so callers append unconditionally (same
+ * self-delimiting convention as {@link apiErrorPillSeg} /
+ * {@link inputRequestPillSeg}). A non-string / null value coalesces to the
+ * default (→ `""`) so a malformed projection cell never emits `[null]`.
+ *
+ * Pure function of its args (no wall-clock, no env) — the live-shell
+ * byte-compare and the existing test style hold.
+ */
+export function pillOrEmpty(value: unknown, dflt: string): string {
+  if (typeof value !== "string" || value === dflt) {
+    return "";
+  }
+  return ` [${value}]`;
+}
+
+/**
+ * Footer-legend string for `keeper board`. Defined here — beside the
+ * omit-default rules it documents — so the convention lives in ONE place
+ * and cannot drift from the renderer. The view tasks (fn-708.2/.3) append
+ * it to `bodyLines` so the absence-encodes-default rule is captured in
+ * BOTH the live frame and piped/sidecar output. Plain text; the board
+ * colorizer leaves it untouched (no bracket tokens).
+ */
+export const BOARD_PILL_LEGEND =
+  "Pills show only non-resting states. No [approval] ⇒ pending · no runtime pill ⇒ todo · no [worker-done] ⇒ open · no [validated] ⇒ unvalidated · no [state] ⇒ stopped · no subagent pill ⇒ ok.";
+
+/**
+ * Footer-legend string for `keeper jobs`. Single-source sibling of
+ * {@link BOARD_PILL_LEGEND}, scoped to the job-row vocabulary (state +
+ * subagent status; no approval / runtime / validated columns surface in
+ * the jobs view). Defined here so both TUIs read their legend from the
+ * same module as the omit rules.
+ */
+export const JOBS_PILL_LEGEND =
+  "Pills show only non-resting states. No [state] pill ⇒ stopped · no subagent pill ⇒ ok.";
+
+/**
+ * Map the epic's `last_validated_at` to the omit-default `[validated]`
+ * pill segment (epic fn-708, T1). The producer-side `asString`
+ * (`src/plan-worker.ts`) already collapses empty-string / non-string
+ * values to `null`, so the predicate is simply `v != null`: render
+ * ` [validated]` when validated, `""` otherwise (absence ≡ `unvalidated`).
+ * Reinforced by the verdict (`epic-not-validated` covers the visible
+ * blocked case).
+ *
+ * Returns the leading `' '` so the caller appends unconditionally. Pure
+ * function — supersedes the old `cli/board.ts` `validatedPill` that
+ * always emitted a bracket (`[validated]` / `[unvalidated]`).
+ */
+export function validatedPill(lastValidatedAt: unknown): string {
+  return lastValidatedAt != null ? " [validated]" : "";
+}
+
+/**
+ * The verdict classes that already PIN `worker_phase=done` — so a separate
+ * `[worker-done]` pill would be redundant (the verdict's own existence, or
+ * the recoverability ledger, says "done"). Drawn from `~/docs/pill-inventory.md`
+ * Part 3: `completed` (≡ done+approved), `job-pending` ("done" implied by
+ * predicate 6.5's gate), and the two `git-*` blocks (predicate 6.5-gated,
+ * so `worker_phase=done`). In the OTHER classes (`job-running`,
+ * `sub-agent-*`, `planner-running`, `epic-not-validated`) `worker_phase=done`
+ * is genuinely surprising — "administratively done but still churning / not
+ * yet validated" — and MUST stay visible.
+ */
+const WORKER_DONE_PINNED_REASONS: ReadonlySet<string> = new Set([
+  "job-pending",
+  "git-uncommitted",
+  "git-orphans",
+]);
+
+/**
+ * True when `verdict` already pins `worker_phase=done` (see
+ * {@link WORKER_DONE_PINNED_REASONS}) — i.e. the `completed` tag or one of
+ * the three pinning block reasons. Used by {@link renderTaskPills} to gate
+ * the `[worker-done]` survivor pill.
+ */
+function verdictPinsWorkerDone(verdict: Verdict): boolean {
+  if (verdict.tag === "completed") {
+    return true;
+  }
+  if (verdict.tag === "blocked") {
+    return WORKER_DONE_PINNED_REASONS.has(verdict.reason.kind);
+  }
+  return false;
+}
+
+/**
+ * Render the trailing pill segment for a board TASK LINE (epic fn-708) —
+ * the consolidated successor to the old triple
+ * `[${runtime_status}] [${worker_phase}] [${approval}]` closure in
+ * `cli/board.ts:renderEpicBlock`. Pure `f(task, verdict)` — no readiness
+ * recompute, no wall-clock, no env; `verdict` is already in scope at the
+ * call site.
+ *
+ * Three fields, each lossless-consolidated per `~/docs/pill-inventory.md`
+ * Part 4:
+ *   - **runtime_status (B10, T1 + de-ambiguate)** — omit `todo` (default);
+ *     render `in_progress` / `done` verbatim; relabel `blocked` →
+ *     `[rt:blocked]` so the manual planctl block flag never collides with
+ *     the verdict `[blocked:*]` family.
+ *   - **worker_phase (B11, T1 + de-ambiguate)** — never render `[open]`;
+ *     render the survivor as the LABELED `[worker-done]` (never bare
+ *     `[done]`, which would collide with runtime `done`) and ONLY when the
+ *     verdict does not already pin it (see {@link verdictPinsWorkerDone}).
+ *   - **approval (B12, T1 + T3)** — never render `[pending]`; drop
+ *     `[rejected]` when the verdict is `blocked:job-rejected` (the word is
+ *     on screen); drop `[approved]` when the verdict is `completed`.
+ *
+ * Returns a string beginning with `' '` per appended pill (or `""` when all
+ * three fields are at rest), so the caller appends unconditionally.
+ */
+export function renderTaskPills(
+  task: Record<string, unknown>,
+  verdict: Verdict,
+): string {
+  let out = "";
+
+  // runtime_status (B10): omit `todo`; relabel `blocked` → `rt:blocked`.
+  const rt = task.runtime_status;
+  if (typeof rt === "string" && rt !== "todo") {
+    out += rt === "blocked" ? " [rt:blocked]" : ` [${rt}]`;
+  }
+
+  // worker_phase (B11): render `[worker-done]` ONLY at `done` AND only when
+  // the verdict does not already pin done. Never bare `[done]`, never `[open]`.
+  if (task.worker_phase === "done" && !verdictPinsWorkerDone(verdict)) {
+    out += " [worker-done]";
+  }
+
+  // approval (B12): omit `pending`; T3-suppress `rejected` under
+  // `blocked:job-rejected` and `approved` under `completed`.
+  const approval = task.approval;
+  if (approval === "approved") {
+    if (verdict.tag !== "completed") {
+      out += " [approved]";
+    }
+  } else if (approval === "rejected") {
+    const suppressed =
+      verdict.tag === "blocked" && verdict.reason.kind === "job-rejected";
+    if (!suppressed) {
+      out += " [rejected]";
+    }
+  }
+  // `pending` (and any non-string / unknown value) → no pill.
+
+  return out;
+}
+
+/**
+ * Render the trailing pill segment for a board CLOSE ROW (epic fn-708) —
+ * the consolidated successor to the old `[${status}] [${approval}]` closure
+ * in `cli/board.ts:renderEpicBlock`. Pure `f(epicRow, verdict)`.
+ *
+ *   - **close status (B15, T2 drop-constant)** — the board filter is
+ *     `status='open'`, so this pill is the constant `[open]` and carries
+ *     zero bits. Dropped here. A custom-filtered view that surfaces
+ *     non-open epics must restore it via `seg(epicRow.status)` (kept
+ *     available; see the restore note below).
+ *   - **close approval (B16, T1 + T3)** — never `[approved]` on the board
+ *     (the filter excludes it); omit `[pending]` (default); render
+ *     `[rejected]` only when the verdict is not already `blocked:job-rejected`.
+ *
+ * In practice the close row collapses to just its title + `[id] <verdict>`.
+ * Returns `""` when nothing survives, else a `' '`-prefixed pill string.
+ */
+export function renderClosePills(
+  epicRow: Record<string, unknown>,
+  verdict: Verdict,
+): string {
+  // T2 restore note: the close-row `[status]` pill is intentionally dropped
+  // because the board filter pins it to `[open]`. A future custom-filtered
+  // view that surfaces non-open epics must restore it by re-appending
+  // ` [${seg(epicRow.status)}]` here (the capability is retained, not lost).
+  let out = "";
+  const approval = epicRow.approval;
+  if (approval === "rejected") {
+    const suppressed =
+      verdict.tag === "blocked" && verdict.reason.kind === "job-rejected";
+    if (!suppressed) {
+      out += " [rejected]";
+    }
+  }
+  // `pending` (default) and `approved` (never on the board filter) → no pill.
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Pill colorization
 // ---------------------------------------------------------------------------
 
@@ -255,6 +454,16 @@ const PILL_COLORS: Record<string, PillBucket> = {
   validated: "success",
   ready: "success",
   done: "success",
+  // fn-708: the labeled worker-phase survivor pill. `[worker-done]` is the
+  // de-ambiguated render of `worker_phase=done` (never bare `[done]`, to
+  // avoid collision with runtime `done`). Green/success — it is a done
+  // signal, same family as bare `[done]`.
+  "worker-done": "success",
+  // fn-708: the relabeled manual runtime block flag. `[rt:blocked]` is
+  // `runtime_status=blocked` rendered with the `rt:` prefix so it never
+  // collides with the verdict `[blocked:*]` family. Yellow/warn — same
+  // "something is in the way" family as bare `[blocked]`.
+  "rt:blocked": "warn",
   failed: "error",
   rejected: "error",
   killed: "error",
@@ -440,9 +649,14 @@ export function renderDeadLetterPill(waitingCount: number): string {
  * line via `collapseSubagentsByName` — see that helper's docstring
  * for the operating assumption (no parallel like-named sub-agents
  * in practice). Each line carries
- * `{subagent_type}{annotations}: {description} [pill]` — `description`
- * is dropped when null/empty so the pill stays anchored next to the
- * type. `annotations` is a parenthesized comma-joined block that
+ * `{subagent_type}{annotations}: {description}{ status-pill}` —
+ * `description` is dropped when null/empty so any status pill stays
+ * anchored next to the type. The status pill follows the fn-708
+ * omit-default rule (T1, B18): it is rendered ONLY for the non-resting
+ * states (`running` / `failed` / `unknown` / `superseded`); `ok`, a
+ * null/missing status, and the empty string all encode the resting value
+ * and render NO pill (absence ≡ ok). `annotations` is a parenthesized
+ * comma-joined block that
  * appears only when there's something to say:
  *   - `×N` when the group folded more than one row
  *   - `N stuck` when one or more non-surviving rows are still
@@ -483,8 +697,24 @@ export function subagentLinesFor(
       annotations.length === 0 ? "" : ` (${annotations.join(", ")})`;
     const head = `${type}${annSeg}`;
     const label = desc === "" ? head : `${head}: ${desc}`;
-    const status = g.row.status == null ? "" : String(g.row.status);
-    return `${indent}${label} [${status}]`;
+    // fn-708 (T1, B18): omit the status pill at its resting/absent values —
+    // `ok` (the chosen resting-success value), a null/missing status, and the
+    // empty string all fold to NO pill (absence ≡ ok). Previously a null
+    // status emitted a literal empty `[]`; that latent noise is gone here.
+    // Keep the four non-resting states visible: `running` (blue),
+    // `failed` (red), `unknown` (uncolored), `superseded` (faded).
+    //
+    // The static `SubagentInvocation.status` type is the five-member union
+    // (no null / empty), but the runtime value off a narrowed wire frame can
+    // arrive null/undefined (cf. the fn-697.2 safe-7 decode), so the guard is
+    // read through `unknown` to keep the defensive null/empty drop honest —
+    // same posture as the prior `g.row.status == null ? "" : String(...)`.
+    const status: unknown = g.row.status;
+    const statusSeg =
+      typeof status === "string" && status !== "" && status !== "ok"
+        ? ` [${status}]`
+        : "";
+    return `${indent}${label}${statusSeg}`;
   });
 }
 
