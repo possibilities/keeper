@@ -54,5 +54,5 @@ bodyLines.
 - [ ] test/board.test.ts green; bun run typecheck clean
 
 ## Done summary
-
+Rewired cli/board.ts renderEpicBlock to consume the task-.1 omit-default pill helpers (renderTaskPills, renderClosePills, validatedPill, pillOrEmpty): close-row [status], [unvalidated], and [stopped] dropped; appended BOARD_PILL_LEGEND to bodyLines via an exported appendBoardLegend seam so it rides live + sidecar output; revised board HELP + README passages. board/jobs tests green, typecheck clean.
 ## Evidence
