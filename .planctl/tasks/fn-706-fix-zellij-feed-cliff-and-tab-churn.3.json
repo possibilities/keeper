@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-06-04T23:35:15.266144Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/zellij-tab-namer",
   "tier": "high",
   "title": "debounce process-name renames in zellij-tab-namer",
-  "updated_at": "2026-06-05T00:31:53.496039Z",
+  "updated_at": "2026-06-05T00:37:05.869323Z",
   "worker_done_at": "2026-06-05T00:31:53.496039Z"
 }
