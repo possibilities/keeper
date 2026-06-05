@@ -1,15 +1,13 @@
 /**
  * Plan-classifier parity tests. Loads the golden fixture at
- * `test/fixtures/plan_classifier_cases.jsonl` (regenerated from the Python
- * source by `scripts/gen-plan-classifier-fixture.py`) and asserts that the
- * TS port (`src/plan-classifier.ts`) produces byte-identical output per
- * case.
+ * `test/fixtures/plan_classifier_cases.jsonl` and asserts that the TS port
+ * (`src/plan-classifier.ts`) produces byte-identical output per case.
  *
- * The strategy mirrors the epic's "Best practices" section: a Python script
- * imports jobctl's source-of-truth derivers and writes one JSONL line per
- * case; this test loads the file and compares the TS port's output to the
- * captured `expected` array. A future Python-side change that breaks parity
- * surfaces as a regeneration diff (deliberate, never auto).
+ * The fixture is a FROZEN golden: its Python generator and the upstream
+ * `cli_common` classifier derivers it was captured from were both retired, so
+ * `src/plan-classifier.ts` is now the sole implementation. The test loads the
+ * file and compares the TS port's output to the captured `expected` array;
+ * update the JSONL by hand if the TS port's behavior deliberately changes.
  *
  * Fixture row shape (mode-tagged):
  * - `mode: "epic_links"` — `{desc, openers, invocations, windows, expected}`.

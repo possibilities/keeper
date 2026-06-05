@@ -1,8 +1,9 @@
 /**
- * Pure per-event helpers for the `subagent_invocations` projection — the
- * TypeScript port of jobctl's `apps/cli_common/cli_common/subagent_invocations.py`
- * reference parser (minus the billing-flavored `tokens` / `tool_use_count`
- * fields, which belong in usagectl, not keeper).
+ * Pure per-event helpers for the `subagent_invocations` projection — a
+ * TypeScript port of the Python `subagent_invocations` reference parser
+ * (formerly arthack `cli_common`; since retired upstream — keeper's TS is now
+ * the sole implementation), minus the billing-flavored `tokens` /
+ * `tool_use_count` fields, which belong in usagectl, not keeper.
  *
  * The Python reference does ONE-PASS bulk parsing with three in-memory
  * buffers (`entry_map`, `turn_counter`, `pending_pre_by_tool_use_id`). The
@@ -47,10 +48,9 @@ import type { Database } from "bun:sqlite";
 
 /**
  * Description-field max chars — defense-in-depth against bloated metadata.
- * Mirrors Python's `_DESCRIPTION_MAX_CHARS` constant
- * (`apps/cli_common/cli_common/subagent_invocations.py:78`). Single source of
- * truth on the TS side; the reducer (task .3) imports this constant when
- * folding PreToolUse description payloads.
+ * Mirrors the retired Python parser's `_DESCRIPTION_MAX_CHARS` constant.
+ * Single source of truth on the TS side; the reducer (task .3) imports this
+ * constant when folding PreToolUse description payloads.
  */
 export const DESCRIPTION_MAX_CHARS = 200;
 
@@ -77,8 +77,8 @@ export interface BridgePreToolUseRow {
 }
 
 /**
- * Canonical row shape for golden-fixture parity. Mirrors the Python
- * `_make_turn_entry` output (`subagent_invocations.py:288-300`) MINUS the
+ * Canonical row shape for golden-fixture parity. Mirrors the retired Python
+ * `_make_turn_entry` output MINUS the
  * `tokens` / `tool_use_count` fields. The fields are listed alphabetically
  * here for readability; {@link canonicalizeRow} sorts on serialization to
  * match Python's `sort_keys=True`.
@@ -406,8 +406,7 @@ export function findPendingPreToolUseForStart(
 
 /**
  * Resolve the `subagent_agent_id` bridge with column-then-JSON fallback.
- * Mirrors Python's `_resolve_bridge_agent_id`
- * (`subagent_invocations.py:240-258`).
+ * Mirrors the retired Python `_resolve_bridge_agent_id`.
  *
  * Post-fn-390 rows have `events.subagent_agent_id` populated by the hook's
  * `extractSubagentAgentId` deriver. Pre-fn-390 historical rows have NULL
@@ -467,8 +466,8 @@ export function resolveBridgeAgentId(event: BridgeEventInput): string | null {
 
 /**
  * Truncate a description string to {@link DESCRIPTION_MAX_CHARS}. Port of
- * Python's `str(description_raw)[:_DESCRIPTION_MAX_CHARS]`
- * (`subagent_invocations.py:339`). Pure: no mutation of `s`.
+ * the retired Python's `str(description_raw)[:_DESCRIPTION_MAX_CHARS]`
+ * truncation. Pure: no mutation of `s`.
  *
  * UTF-16 code unit count matches Python's character count for the BMP; for
  * astral-plane characters the byte counts diverge — but description fields

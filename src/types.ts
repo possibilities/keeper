@@ -947,8 +947,8 @@ export interface EmbeddedJob {
  * stays empty until task .3 lands the live folds + the v16→v17 rewind
  * re-drains).
  *
- * Composite primary key `(job_id, agent_id, turn_seq)` mirrors jobctl's
- * Python reference (`apps/cli_common/cli_common/subagent_invocations.py`)
+ * Composite primary key `(job_id, agent_id, turn_seq)` mirrors the retired
+ * jobctl Python reference parser
  * minus the `tokens` / `tool_use_count` fields. `turn_seq` is the per-job
  * monotone turn counter so re-entrant subagents within a session land on
  * distinct rows.

@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 57;
+export const SCHEMA_VERSION = 58;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -386,7 +386,19 @@ CREATE TABLE IF NOT EXISTS events (
     agent_id TEXT,
     agent_type TEXT,
     stop_hook_active INTEGER,
-    data TEXT NOT NULL,
+    -- fn-717.2: data relaxed from NOT NULL to nullable. The hook still always
+    -- writes a non-null data inline (single INSERT, must-exit-0 contract
+    -- unchanged); nullability exists so the daemon-side compaction relocator
+    -- (src/compaction.ts) can NULL the hot column AFTER copying the cold blob
+    -- into the event_blobs side table. Every reducer data VALUE read resolves
+    -- via COALESCE(events.data, event_blobs.data), so a relocated (now-NULL
+    -- inline) blob folds byte-identically. A migrating pre-v58 DB gets the same
+    -- relax via the stop-the-world rebuild in the v57->v58 migrate block
+    -- (bun:sqlite hard-blocks the O(1) writable_schema schema-text edit, so the
+    -- only mechanism is a full table rebuild -- a one-time, version-guarded,
+    -- daemon-must-be-stopped migration; see the v57->v58 block for the measured
+    -- multi-minute writer-lock hold on a ~1.6 GB DB).
+    data TEXT,
     subagent_agent_id TEXT,
     spawn_name TEXT,
     start_time TEXT,
@@ -543,8 +555,8 @@ const CREATE_V51_INDEXES = [
 
 /**
  * Schema-v17 `subagent_invocations` projection table. Composite primary key
- * `(job_id, agent_id, turn_seq)` mirrors the jobctl Python reference
- * (`apps/cli_common/cli_common/subagent_invocations.py`) minus the
+ * `(job_id, agent_id, turn_seq)` mirrors the retired jobctl Python reference
+ * parser minus the
  * `tokens` / `tool_use_count` fields. `turn_seq` is the per-job monotone
  * turn counter so re-entrant subagents in a session land on distinct rows.
  *
@@ -5468,6 +5480,151 @@ function migrate(db: Database): void {
     // `keeper commit-work` on this host doesn't fail-loud
     // (test/schema-version.test.ts enforces).
     db.run(CREATE_EVENT_BLOBS);
+
+    // v57→v58: fn-717.2 — relax `events.data` from NOT NULL → nullable so the
+    // daemon-side compaction relocator (`src/compaction.ts`) can `UPDATE
+    // events SET data = NULL` after copying a cold blob into `event_blobs`.
+    //
+    // WHY A STOP-THE-WORLD TABLE REBUILD (not the O(1) `writable_schema` edit
+    // SQLite documents for dropping a column constraint): bun:sqlite enforces
+    // DEFENSIVE mode and HARD-BLOCKS any `UPDATE sqlite_master` even under
+    // `PRAGMA writable_schema=ON` (it silently resets the pragma to 0). So the
+    // schema-text edit is unavailable on this runtime and the only mechanism
+    // left is the canonical 12-step rebuild: rename the old table aside,
+    // CREATE the new (nullable-`data`) shape, copy every row, drop the old
+    // table, recreate every index. This carries a DATA COPY of the ENTIRE
+    // events table.
+    //
+    // OPERATIONAL CONTRACT — THE DAEMON MUST BE STOPPED FOR THIS MIGRATION.
+    // Measured on the production ~1.6 GB / ~566k-row DB the rebuild holds the
+    // single writer lock for ~3 MINUTES (the row copy + recreating all 20
+    // events indexes). That far exceeds the hook's 1.2s `busy_timeout`, so any
+    // concurrent hook INSERT during the rebuild WOULD dead-letter — a direct
+    // violation of the hook-never-starved invariant and the reliability
+    // mission's zero-dead-letters streak. This is therefore a ONE-TIME,
+    // shape-guarded, OFFLINE migration: the operator stops the LaunchAgent
+    // (so no hooks are racing the lock), the next `keeperd` boot runs this
+    // block exactly once (gated on `events.data` actually being NOT NULL, so a
+    // fresh DB and an already-migrated v58 DB both skip it), then the daemon
+    // comes up on the relaxed schema. BACK UP THE DB FIRST. Unlike the
+    // chunked v34 backfill, a table rebuild's final DROP+swap is inherently
+    // atomic and cannot be paced across lock-releasing chunks — there is no
+    // safe online variant on bun:sqlite, hence the offline contract.
+    //
+    // RE-FOLD DETERMINISM: untouched. `events` is the immutable event log, not
+    // a projection — the rebuild copies every column VALUE byte-for-byte
+    // (explicit column list, not `SELECT *`, so column order is pinned), so a
+    // from-scratch cursor=0 re-fold reads identical rows and reproduces
+    // identical projections. The AUTOINCREMENT high-water in `sqlite_sequence`
+    // is preserved so `events.id` never reuses a value. Crash-safe: the whole
+    // step is inside the one `.immediate()` migrate transaction, so an
+    // interrupted rebuild rolls back to the v57 table intact (the version is
+    // only stamped on COMMIT, so a re-boot re-runs the rebuild).
+    //
+    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 58 in
+    // the SAME change — whitelist-only (keeper-py never reads `events.data`),
+    // but required so `keeper commit-work` doesn't fail-loud
+    // (test/schema-version.test.ts enforces).
+    // Shape-driven idempotency guard: run the rebuild ONLY when `events.data`
+    // is actually NOT NULL on the live table. A fresh DB (CREATE_EVENTS above
+    // already makes `data` nullable) and a re-open of an already-migrated v58
+    // DB both read `notnull === 0` here and skip the rebuild — so the
+    // destructive RENAME/COPY/DROP never fires needlessly (and never on the
+    // empty-events fast path, which would otherwise churn the connection's
+    // prepared-statement cache for zero benefit). This matches the migrate()
+    // header's "convergence is driven by the table's actual shape, not by
+    // trusting the version number" contract — the `preMigrateStoredVersion <
+    // 58` version check is folded into the column-shape probe.
+    const eventsDataNotNull =
+      (
+        db.prepare("PRAGMA table_info('events')").all() as {
+          name: string;
+          notnull: number;
+        }[]
+      ).find((c) => c.name === "data")?.notnull === 1;
+    if (eventsDataNotNull) {
+      // Snapshot the AUTOINCREMENT high-water + every events index's stored
+      // SQL BEFORE the rename, so the rebuild recreates them exactly — no
+      // hardcoded index list to drift out of sync with the CREATE_*_INDEXES
+      // groups scattered across migrate(). Auto-indexes (PK / UNIQUE) have
+      // `sql IS NULL` and are recreated implicitly by the CREATE TABLE, so we
+      // skip them here.
+      const eventsIndexSql = (
+        db
+          .prepare(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events' AND sql IS NOT NULL",
+          )
+          .all() as { sql: string }[]
+      ).map((r) => r.sql);
+      const seqRow = db
+        .prepare("SELECT seq FROM sqlite_sequence WHERE name = 'events'")
+        .get() as { seq: number } | null;
+
+      db.run("ALTER TABLE events RENAME TO events_old");
+      // CREATE_EVENTS now defines `data TEXT` (nullable). After the rename
+      // `events` does not exist, so the `IF NOT EXISTS` create makes the new
+      // nullable table.
+      db.run(CREATE_EVENTS);
+      // Explicit column list on BOTH sides pins column order independent of
+      // the old table's physical shape — a defensive choice over `SELECT *`.
+      db.run(
+        `INSERT INTO events (
+           id, ts, session_id, pid, hook_event, event_type, tool_name, matcher,
+           cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
+           subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+           planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+           planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+           bash_mutation_kind, bash_mutation_targets, planctl_files,
+           backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+           background_task_id
+         )
+         SELECT
+           id, ts, session_id, pid, hook_event, event_type, tool_name, matcher,
+           cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
+           subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+           planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+           planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+           bash_mutation_kind, bash_mutation_targets, planctl_files,
+           backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+           background_task_id
+         FROM events_old`,
+      );
+      db.run("DROP TABLE events_old");
+      // Recreate every non-auto index from its captured SQL. The stored SQL
+      // already names `ON events(...)`; CREATE_EVENTS above (re-run by the
+      // unconditional top-of-migrate block on the NEXT boot too) would also
+      // recreate the static ones, but doing it here keeps the rebuilt table
+      // fully indexed within this same transaction — the unconditional block
+      // ran against the OLD table before the rename.
+      for (const sql of eventsIndexSql) {
+        db.run(sql);
+      }
+      // Preserve the AUTOINCREMENT high-water so a future INSERT never reuses
+      // an id even if rows were ever deleted (the event log is append-only, so
+      // MAX(id) == seq today, but pin it for correctness regardless). The
+      // `INSERT INTO events SELECT ...` above already (re)created the
+      // `sqlite_sequence` row for `events` at the max copied id, so a plain
+      // UPDATE restores the captured high-water. `sqlite_sequence` carries no
+      // declared PRIMARY KEY/UNIQUE, so an UPSERT's `ON CONFLICT(name)` would
+      // throw — UPDATE the existing row instead. (If the source table was
+      // empty, no row was created and there is nothing to preserve.)
+      if (seqRow != null) {
+        db.run("UPDATE sqlite_sequence SET seq = ? WHERE name = 'events'", [
+          seqRow.seq,
+        ]);
+      }
+      // Belt-and-suspenders: the rebuild is a destructive structural change, so
+      // verify the new table is structurally sound before the transaction
+      // COMMITs (a failed check throws → rolls back to the v57 table intact).
+      const integrity = db.prepare("PRAGMA quick_check").get() as {
+        quick_check: string;
+      } | null;
+      if (integrity?.quick_check !== "ok") {
+        throw new Error(
+          `v57→v58 events rebuild failed integrity quick_check: ${integrity?.quick_check ?? "no result"}`,
+        );
+      }
+    }
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

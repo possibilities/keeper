@@ -11,16 +11,3 @@ packages = ["keeper"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.ty.analysis]
-# Allow imports ty can't resolve from keeper's own environment. The fixture-
-# generation scripts under scripts/ import arthack's ``cli_common`` from the
-# sibling checkout (guarded by a runtime existence check + sys.path fallback),
-# so it's resolved at runtime, never by keeper's venv. Without this, ``uvx ty
-# check`` (the ``keeper commit-work`` lint gate) fails every Python commit on
-# unresolved-import. The mypy-style ``# type: ignore[import-not-found]`` on
-# those lines does not suppress ty's ``unresolved-import`` rule.
-allowed-unresolved-imports = [
-    "cli_common",
-    "cli_common.*",
-]
