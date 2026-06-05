@@ -7,11 +7,16 @@
  * worker thread; this CLI does NOT dispatch, dedup, suppress, settle,
  * confirm, reap, or persist anything. Its only jobs are:
  *
- *   1. Render four sections of state, refreshed on every subscribe edge:
+ *   1. Render six sections of state, refreshed on every subscribe edge:
  *        --- current ---   live `working` `jobs` rows (the reconciler's
  *                          observed in-flight dispatches), ordered for scan
  *        --- predicted --- `predictNextDispatches` over the live readiness
- *                          snapshot — pure preview, NO dispatch behind it
+ *                          snapshot — pure ONE-STEP preview, NO dispatch
+ *                          behind it
+ *        --- schedule ---  `predictFullSchedule` — the SAME simulation
+ *                          iterated to a fixed point: every dispatch the
+ *                          reconciler will fire, round by round, until the
+ *                          queue drains. Pure preview, NO dispatch behind it
  *        --- stopped ---   `jobs` rows whose turn has ended (state
  *                          `stopped`) but whose session may still be alive
  *                          — the same working+stopped stream as `current`,
@@ -19,6 +24,10 @@
  *        --- failed ---    rows from the `dispatch_failures` projection
  *                          (the only durable autopilot-owned state, fed by
  *                          the reducer's `DispatchFailed` fold arm)
+ *        --- dependencies --- `renderDependencyGraph` — an ASCII DAG of the
+ *                          open tasks keyed off `depends_on` (intra-epic)
+ *                          and `depends_on_epics` (cross-epic). Reference
+ *                          view, no dispatch behind it
  *      plus a `[paused]` / `[playing]` banner indicator.
  *
  *   2. Three control subcommands that round-trip a single RPC each:
@@ -82,7 +91,7 @@ import {
   LineBuffer,
   type ServerFrame,
 } from "../src/protocol";
-import { computeReadiness } from "../src/readiness";
+import { computeReadiness, type Verdict } from "../src/readiness";
 import {
   type ReadinessClientSnapshot,
   subscribeCollection,
@@ -420,6 +429,322 @@ export function predictNextDispatches(
 }
 
 // ---------------------------------------------------------------------------
+// Full-schedule preview — iterate the one-step simulation to a fixed point.
+// ---------------------------------------------------------------------------
+
+/** The three dispatch verbs the reconciler emits. No `git-dirty` here — the
+ * schedule lists ACTUAL dispatches, not informational blockers. */
+type DispatchVerb = "work" | "approve" | "close";
+
+/**
+ * One dispatch in the predicted run order. `round` is the simulation wave
+ * (1-based): every step in the same round becomes dispatchable at the same
+ * time, so rows in one round may run concurrently subject to the live
+ * per-root mutex; rows in a later round only unblock after the prior round's
+ * work completes. Within an epic the per-epic mutex serializes tasks across
+ * rounds automatically (one `ready` task per epic per `computeReadiness`).
+ */
+export interface ScheduleStep {
+  round: number;
+  verb: DispatchVerb;
+  id: string;
+  /** Basename of the cd target — empty when none. */
+  dir: string;
+  /** Full cd target path — empty when none. */
+  dirFull: string;
+  /** Task tier (work rows only); `null` otherwise. */
+  tier: string | null;
+}
+
+const asArray = <T>(x: unknown): T[] => (Array.isArray(x) ? (x as T[]) : []);
+
+/** Map a task verdict to the verb the reconciler would dispatch, or null.
+ * Mirrors `verbForVerdict("task", …)` in the autopilot worker — inlined to
+ * keep cli → worker import coupling out (same stance as `predictNextDispatches`). */
+function taskVerb(v: Verdict | undefined): DispatchVerb | null {
+  if (v === undefined) {
+    return null;
+  }
+  if (v.tag === "ready") {
+    return "work";
+  }
+  if (v.tag === "blocked" && v.reason.kind === "job-pending") {
+    return "approve";
+  }
+  return null;
+}
+
+/** Map a close-row verdict to its dispatch verb, or null. Mirrors
+ * `verbForVerdict("close", …)`. */
+function closeVerb(v: Verdict | undefined): DispatchVerb | null {
+  if (v === undefined) {
+    return null;
+  }
+  if (v.tag === "ready") {
+    return "close";
+  }
+  if (v.tag === "blocked" && v.reason.kind === "job-pending") {
+    return "approve";
+  }
+  return null;
+}
+
+/** End every `working` embedded job and zero its git counters — the
+ * post-completion shape the live readiness pass expects. */
+function endWorkingJobs<J extends { state?: unknown }>(jobs: J[]): J[] {
+  return jobs.map((j) =>
+    j.state === "working"
+      ? {
+          ...j,
+          state: "ended",
+          git_dirty_count: 0,
+          git_unattributed_to_live_count: 0,
+          git_orphan_count: 0,
+        }
+      : j,
+  );
+}
+
+/** Apply a completed dispatch verb's effect to a task. */
+function applyTaskVerb(task: Task, verb: DispatchVerb): Task {
+  return {
+    ...task,
+    worker_phase: verb === "work" ? "done" : task.worker_phase,
+    approval: verb === "approve" ? "approved" : task.approval,
+    jobs: endWorkingJobs(asArray(task.jobs)),
+  };
+}
+
+/** Apply a completed dispatch verb's effect to an epic (close row). */
+function applyEpicVerb(epic: Epic, verb: DispatchVerb): Epic {
+  return {
+    ...epic,
+    status: verb === "close" ? "done" : epic.status,
+    approval: verb === "approve" ? "approved" : epic.approval,
+    jobs: endWorkingJobs(asArray(epic.jobs)),
+  };
+}
+
+/**
+ * Round-0 setup: complete every currently-`working` embedded job (mirror its
+ * `plan_verb` effect) WITHOUT emitting it to the schedule — those are already
+ * running and surface under `--- current ---`. Their completion is what
+ * unblocks the first predicted wave.
+ */
+function completeInFlight(epics: Epic[]): Epic[] {
+  return epics.map((epic) => {
+    let e = epic;
+    for (const j of asArray<{ state?: unknown; plan_verb?: unknown }>(
+      epic.jobs,
+    )) {
+      if (j.state !== "working") {
+        continue;
+      }
+      if (j.plan_verb === "close" || j.plan_verb === "approve") {
+        e = applyEpicVerb(e, j.plan_verb);
+      }
+    }
+    const tasks = asArray<Task>(epic.tasks).map((task) => {
+      let t = task;
+      for (const j of asArray<{ state?: unknown; plan_verb?: unknown }>(
+        task.jobs,
+      )) {
+        if (j.state !== "working") {
+          continue;
+        }
+        if (j.plan_verb === "work" || j.plan_verb === "approve") {
+          t = applyTaskVerb(t, j.plan_verb);
+        }
+      }
+      return t;
+    });
+    return { ...e, tasks };
+  });
+}
+
+/**
+ * Predict the FULL run order — every dispatch the reconciler will fire,
+ * round by round, until the queue drains.
+ *
+ * Drives the SAME verb-aware simulation `predictNextDispatches` uses for one
+ * step, wrapped in a fixed-point loop: complete the in-flight work (round 0),
+ * then repeatedly (a) `computeReadiness` over the simulated tree, (b) collect
+ * every row that yields a dispatch verb, (c) emit them as the next round, and
+ * (d) mirror each one's completion back into the tree. A `verb::id` seen-set
+ * plus a hard iteration cap (each row emits at most work+approve / approve+
+ * close, so `rows * 3 + slack` can never be reached) guard against a dep
+ * cycle spinning forever.
+ *
+ * Same simplifications as the one-step preview: it models the plan/dependency
+ * order, not live git-dirty stalls — the empty `git_status` map and the fixed
+ * top-level `jobs` argument mean a `git-uncommitted` blocker that the worker
+ * would hit in reality is NOT simulated here. Pure: reads only the snapshot,
+ * no clock / state / I/O.
+ */
+export function predictFullSchedule(
+  snap: ReadinessClientSnapshot,
+): ScheduleStep[] {
+  let sim = completeInFlight(snap.epics);
+  const seen = new Set<string>();
+  const steps: ScheduleStep[] = [];
+
+  const cap =
+    snap.epics.reduce((n, e) => n + 1 + asArray(e.tasks).length, 0) * 3 + 10;
+
+  for (let round = 1; round <= cap; round++) {
+    const r = computeReadiness(sim, snap.jobs, [], new Map());
+    const taskVerbs = new Map<string, DispatchVerb>();
+    const epicVerbs = new Map<string, DispatchVerb>();
+    const emitted: ScheduleStep[] = [];
+
+    for (const epic of sim) {
+      const projectDir = seg(epic.project_dir);
+      for (const task of asArray<Task>(epic.tasks)) {
+        const id = seg(task.task_id);
+        if (id === "") {
+          continue;
+        }
+        const verb = taskVerb(r.perTask.get(id));
+        if (verb === null) {
+          continue;
+        }
+        const key = `${verb}::${id}`;
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        taskVerbs.set(id, verb);
+        const dirFull = taskCdDir(task, projectDir);
+        emitted.push({
+          round,
+          verb,
+          id,
+          dir: dirFull === "" ? "" : basename(dirFull),
+          dirFull,
+          tier: verb === "work" ? task.tier : null,
+        });
+      }
+      const epicId = seg(epic.epic_id);
+      if (epicId === "") {
+        continue;
+      }
+      const verb = closeVerb(r.perCloseRow.get(epicId));
+      if (verb === null) {
+        continue;
+      }
+      const key = `${verb}::${epicId}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      epicVerbs.set(epicId, verb);
+      emitted.push({
+        round,
+        verb,
+        id: epicId,
+        dir: projectDir === "" ? "" : basename(projectDir),
+        dirFull: projectDir,
+        tier: null,
+      });
+    }
+
+    if (emitted.length === 0) {
+      break;
+    }
+    steps.push(...emitted);
+
+    sim = sim.map((epic) => {
+      let e = epic;
+      const ev = epicVerbs.get(seg(epic.epic_id));
+      if (ev !== undefined) {
+        e = applyEpicVerb(e, ev);
+      }
+      const tasks = asArray<Task>(e.tasks).map((t) => {
+        const tv = taskVerbs.get(seg(t.task_id));
+        return tv === undefined ? t : applyTaskVerb(t, tv);
+      });
+      return { ...e, tasks };
+    });
+  }
+
+  return steps;
+}
+
+// ---------------------------------------------------------------------------
+// Dependency graph — ASCII DAG of open tasks (epic + task deps).
+// ---------------------------------------------------------------------------
+
+/** Per-task status glyph keyed off the live verdict. Pure scan key, not a
+ * dispatch decision — purely for the dependency-graph legend. */
+function statusGlyph(v: Verdict | undefined): string {
+  if (v === undefined) {
+    return "·";
+  }
+  if (v.tag === "completed") {
+    return "✓";
+  }
+  if (v.tag === "running") {
+    return "▸";
+  }
+  if (v.tag === "ready") {
+    return "○";
+  }
+  return "·";
+}
+
+/** Strip the owning-epic prefix from a task id so intra-epic ids render as
+ * the short `.M` suffix; ids that don't belong to `epicId` pass through whole
+ * (a cross-epic dep, should not happen for `depends_on` but rendered honestly). */
+function shortTaskId(taskId: string, epicId: string): string {
+  return epicId !== "" && taskId.startsWith(`${epicId}.`)
+    ? taskId.slice(epicId.length)
+    : taskId;
+}
+
+/**
+ * Render the open-task dependency graph as an ASCII DAG. One block per epic
+ * in board (`sort_path`) order; within a block, one line per task carrying a
+ * status glyph, the short `.M` id, and a `← <deps>` clause naming the
+ * `depends_on` upstreams it waits for. An epic that itself waits on other
+ * epics annotates its header with `← epic:<id>` per `depends_on_epics`.
+ *
+ * Pure transform — returns the section body lines (the `--- dependencies ---`
+ * header is added by `renderBody`). Empty array when there is nothing open.
+ */
+export function renderDependencyGraph(snap: ReadinessClientSnapshot): string[] {
+  const out: string[] = [];
+  for (const epic of snap.epics) {
+    const epicId = seg(epic.epic_id);
+    const tasks = asArray<Task>(epic.tasks);
+    if (tasks.length === 0) {
+      continue;
+    }
+    const epicDeps = asArray<string>(epic.depends_on_epics)
+      .map((d) => seg(d))
+      .filter((d) => d !== "");
+    const header =
+      epicDeps.length === 0
+        ? epicId
+        : `${epicId}  ← epic:${epicDeps.join(", epic:")}`;
+    out.push(header);
+    for (const task of tasks) {
+      const taskId = seg(task.task_id);
+      if (taskId === "") {
+        continue;
+      }
+      const glyph = statusGlyph(snap.readiness.perTask.get(taskId));
+      const deps = asArray<string>(task.depends_on)
+        .map((d) => seg(d))
+        .filter((d) => d !== "")
+        .map((d) => shortTaskId(d, epicId));
+      const depClause = deps.length === 0 ? "" : `  ← ${deps.join(", ")}`;
+      out.push(`  ${glyph} ${shortTaskId(taskId, epicId)}${depClause}`);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Live + failed row shapes — the viewer's internal projections.
 // ---------------------------------------------------------------------------
 
@@ -547,6 +872,12 @@ export function projectAutopilotPaused(
 export interface RenderInput {
   current: CurrentRow[];
   predicted: PreviewSections;
+  /** Full predicted run order, round by round (`predictFullSchedule`).
+   * Optional — an absent section renders nothing. */
+  schedule?: ScheduleStep[];
+  /** Pre-rendered ASCII DAG body lines (`renderDependencyGraph`).
+   * Optional — an absent section renders nothing. */
+  dependencies?: string[];
   failed: FailedRow[];
   paused: boolean;
 }
@@ -611,6 +942,20 @@ export function renderBody(input: RenderInput): string[] {
     }
   }
 
+  const schedule = input.schedule ?? [];
+  if (schedule.length > 0) {
+    out.push("--- schedule ---");
+    const maxRound = schedule.reduce((m, s) => Math.max(m, s.round), 0);
+    const roundColWidth = String(maxRound).length;
+    const maxDirLen = schedule.reduce((m, s) => Math.max(m, s.dir.length), 0);
+    const dirColWidth = maxDirLen === 0 ? 0 : maxDirLen + 3;
+    for (const s of schedule) {
+      const roundSeg = String(s.round).padStart(roundColWidth);
+      const dirSeg = (s.dir === "" ? "" : `(${s.dir}) `).padEnd(dirColWidth);
+      out.push(`${roundSeg}  ${dirSeg}${s.verb}::${s.id}`);
+    }
+  }
+
   if (stopped.length > 0) {
     out.push("--- stopped ---");
     for (const r of stopped) {
@@ -624,6 +969,13 @@ export function renderBody(input: RenderInput): string[] {
       const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
       out.push(`${dirSeg}${r.verb}::${r.id} — ${r.reason}`);
     }
+  }
+
+  const dependencies = input.dependencies ?? [];
+  if (dependencies.length > 0) {
+    out.push("--- dependencies ---");
+    out.push("legend: ✓ done  ▸ running  ○ ready  · blocked   (← waits for)");
+    out.push(...dependencies);
   }
 
   return out;
@@ -836,10 +1188,15 @@ async function runViewer(sockPath: string): Promise<void> {
         snap.snap === null
           ? { approvals: [], informational: [], workers: [], closers: [] }
           : predictNextDispatches(snap.snap);
+      const schedule = snap.snap === null ? [] : predictFullSchedule(snap.snap);
+      const dependencies =
+        snap.snap === null ? [] : renderDependencyGraph(snap.snap);
       return {
         bodyLines: renderBody({
           current,
           predicted,
+          schedule,
+          dependencies,
           failed: snap.failed,
           paused: snap.paused,
         }),
@@ -847,6 +1204,8 @@ async function runViewer(sockPath: string): Promise<void> {
           paused: snap.paused,
           current,
           predicted,
+          schedule,
+          dependencies,
           failed: snap.failed,
         },
       };

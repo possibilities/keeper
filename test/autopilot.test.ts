@@ -31,10 +31,12 @@ import {
   buildRetryFrame,
   buildSetPausedFrame,
   type FailedRow,
+  predictFullSchedule,
   predictNextDispatches,
   projectAutopilotPaused,
   projectFailedRows,
   renderBody,
+  renderDependencyGraph,
 } from "../cli/autopilot";
 import { computeReadiness } from "../src/readiness";
 import type {
@@ -851,4 +853,125 @@ test("renderBody — paused=false does NOT emit a banner line into the body eith
     expect(line).not.toContain("[paused]");
     expect(line).not.toContain("[playing]");
   }
+});
+
+// ---------------------------------------------------------------------------
+// predictFullSchedule — iterate the one-step sim to a fixed point.
+// ---------------------------------------------------------------------------
+
+test("predictFullSchedule — a dependency chain serializes work then closes the epic", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "approved",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        worker_phase: "open",
+        approval: "approved",
+        depends_on: ["fn-1-foo.1"],
+      }),
+    ],
+  });
+  const steps = predictFullSchedule(buildSnap([epic]));
+  expect(steps.map((s) => `${s.round}:${s.verb}::${s.id}`)).toEqual([
+    "1:work::fn-1-foo.1",
+    "2:work::fn-1-foo.2",
+    "3:close::fn-1-foo",
+  ]);
+});
+
+test("predictFullSchedule — a pending approval surfaces an approve step before the dependent unblocks", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "done",
+        approval: "pending",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        worker_phase: "open",
+        approval: "approved",
+        depends_on: ["fn-1-foo.1"],
+      }),
+    ],
+  });
+  const steps = predictFullSchedule(buildSnap([epic]));
+  expect(steps.map((s) => `${s.round}:${s.verb}::${s.id}`)).toEqual([
+    "1:approve::fn-1-foo.1",
+    "2:work::fn-1-foo.2",
+    "3:close::fn-1-foo",
+  ]);
+});
+
+test("predictFullSchedule — empty when nothing is dispatchable", () => {
+  const epic = makeEpic({
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        worker_phase: "done",
+        approval: "approved",
+      }),
+    ],
+  });
+  expect(predictFullSchedule(buildSnap([epic]))).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// renderDependencyGraph — ASCII DAG of open tasks.
+// ---------------------------------------------------------------------------
+
+test("renderDependencyGraph — emits per-epic blocks with task dep arrows and epic-level annotation", () => {
+  const epic = makeEpic({
+    depends_on_epics: ["fn-0-base"],
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "approved",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        worker_phase: "open",
+        approval: "approved",
+        depends_on: ["fn-1-foo.1"],
+      }),
+    ],
+  });
+  const lines = renderDependencyGraph(buildSnap([epic]));
+  expect(lines).toEqual([
+    "fn-1-foo  ← epic:fn-0-base",
+    "  ○ .1",
+    "  · .2  ← .1",
+  ]);
+});
+
+test("renderDependencyGraph — skips epics with no tasks, omits the dep clause when none", () => {
+  const epic = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    tasks: [
+      makeTask({
+        task_id: "fn-2-bar.1",
+        epic_id: "fn-2-bar",
+        task_number: 1,
+        worker_phase: "open",
+        approval: "approved",
+      }),
+    ],
+  });
+  const empty = makeEpic({ epic_id: "fn-3-baz", epic_number: 3, tasks: [] });
+  const lines = renderDependencyGraph(buildSnap([epic, empty]));
+  expect(lines).toEqual(["fn-2-bar", "  ○ .1"]);
 });
