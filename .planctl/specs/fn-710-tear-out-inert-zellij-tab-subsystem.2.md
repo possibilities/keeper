@@ -50,5 +50,5 @@ columns are truly unwritten/unread before the drop.
 - [ ] README v48 block + coord-pill prose trimmed to session/pane only; daemon migrates a real DB copy clean and projections rebuild
 
 ## Done summary
-
+Dropped the two dead jobs.backend_exec_{tab_id,tab_name} columns via a forward-only v54→v55 dropColumnIfPresent migration; removed every reader (collections wire SELECT, Job interface, pane-only backendCoordsSeg) and co-bumped keeper-py SUPPORTED_SCHEMA_VERSIONS to 55. Flipped the db.test.ts shape assertion, added a v54→v55 drop-migration test, pane-only jobs.test.ts cases, and retracked ~60 stale schema-version assertions to String(SCHEMA_VERSION). Real-DB copy migrates clean (2336 jobs rows preserved, three live coords remain).
 ## Evidence
