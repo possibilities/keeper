@@ -7236,11 +7236,6 @@ function projectJobsRow(db: Database, event: Event): void {
   // non-NULL fields advance and the NULL field preserves whatever was
   // previously stamped — never clobbers a prior captured value.
   //
-  // The UPDATE leaves `backend_exec_tab_{id,name}` untouched — those
-  // columns are stamped only by the T4 tab-resolver worker's synthetic
-  // event (a separate fold arm). The tombstone semantics for the tab
-  // pair (last-known sticks) live there, not here.
-  //
   // Re-fold determinism: the fold reads only `event.backend_exec_*`
   // (frozen onto the row at hook time) and the persisted `jobs` cell
   // (COALESCE inside SQL). NO env reads, NO wall-clock, NO process
