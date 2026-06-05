@@ -277,9 +277,21 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   commit always appends there, closing the brand-new/never-seen-repo tail where
   the in-HEAD transition has no other realtime trigger), the zellij-events
   plugin feed dir at `~/.local/state/keeper/zellij-events/` written by the
-  fn-684 wasm bridge plugin — one append-only `<session>.ndjson` per zellij
-  session); treat an event (or a drop-overrun `err`) as "go look," never as the
-  data — always `fstat` + safe-parse. *Carve-out (processes):* kqueue
+  fn-684 wasm bridge plugin — one `<session>.ndjson` per zellij session that is
+  append-only *within an epoch* (fn-706.2): the plugin SELF-ROTATES the file at
+  a ~4 MiB `ROTATION_THRESHOLD` (well under the 16 MiB consumer cap) by
+  truncating to byte 0, minting a FRESH epoch nonce, and re-writing a
+  `plugin_start` epoch-header + the full current manifest in one `write_all` —
+  so a long-lived noisy session's feed never approaches the cliff (the
+  oversize-skip that froze the watermark). The plugin stays the SOLE writer
+  (keeperd must NEVER truncate the file); the consumer detects the rotation
+  via a cheap first-line epoch peek (`peekZellijEpoch`, distinct from
+  `parseZellijEventLine` which nulls the sentinel) and resets its
+  `(epoch, offset)` watermark to byte 0 — the recovery path that survives a
+  re-snapshot growing the file PAST the prior offset (where the `size <
+  watermark` shrink guard would miss it). Treat an event (or a drop-overrun
+  `err`) as "go look," never as the data — always `fstat` + safe-parse.
+  *Carve-out (processes):* kqueue
   `EVFILT_PROC|NOTE_EXIT` / `pidfd_open`+`epoll` on EXTERNAL process descriptors
   is permitted (exit-watcher), with a post-register `kill(pid,0)` probe and
   `(pid, start_time)` identity guarding pid recycling.
@@ -381,7 +393,25 @@ starts empty (`Plugin::default()`) so the first post-grant flush and every
 epoch change (plugin reload = fresh `Plugin`) re-emit every pane. Sole-writer
 rules are preserved: the plugin is the sole writer of the `.ndjson` files,
 and main remains the sole writer of the synthetic `BackendExecSnapshot`
-events it mints from those lines.
+events it mints from those lines. **Live-feed rotation (fn-706.2) — the
+SECOND-layer churn defense** under the diff gate: the diff gate keeps the feed
+QUIET, rotation keeps it BOUNDED. After every successful `append_batch` the
+plugin reads the on-disk size via `metadata().len()` (NOT a per-instance byte
+counter — a #5177 double-load's two instances each count only their own writes
+and would never agree, but they share the same file) and, once `should_rotate`
+fires at `ROTATION_THRESHOLD` (~4 MiB), rotates: truncate to 0 + force the WASI
+write cursor to 0 (open `write(true).truncate(true)` + explicit
+`seek(SeekFrom::Start(0))` to dodge the `O_APPEND`-after-ftruncate
+sparse-zeros-hole gotcha), bump `self.epoch` to a fresh `now_ms()`-derived
+nonce, then write a `plugin_start` epoch-header + the full re-snapshot in ONE
+`write_all` (the re-snapshot recovers quiescent panes the diff gate won't
+re-emit). `last_emitted` is cleared (and re-seeded from the snapshot) ONLY
+after the rotation write succeeds — same post-flush fold discipline as the diff
+gate, so a truncate-ok-but-write-fails leaves the file empty with the OLD epoch
+and the next emit re-snapshots. It stays a SINGLE plugin write path: the plugin
+is still the sole writer of the `.ndjson` (keeperd never truncates it), and the
+consumer's first-line epoch peek + watermark-reset-to-0 is the matching
+recovery on the read side.
 
 ## Autopilot dispatch gates
 

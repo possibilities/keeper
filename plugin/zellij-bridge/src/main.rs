@@ -39,10 +39,26 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use zellij_tile::prelude::*;
+
+/// Live-feed rotation threshold (fn-706.2). After a successful append the
+/// plugin reads the on-disk size; once it crosses this it truncates the file,
+/// bumps to a fresh epoch nonce, and re-snapshots the full manifest. Chosen at
+/// ~4 MiB — well under the consumer's 16 MiB oversize cap — so a session's feed
+/// self-bounds far below the cliff (the pre-fn-706 oversize-skip that froze the
+/// watermark forever) AND well under the cap's tail-read fallback. The bridge
+/// is the SOLE writer of the `.ndjson` (keeperd must never truncate it), so
+/// rotation is plugin-side.
+const ROTATION_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+/// Pure rotation gate — `true` once the on-disk feed size crosses the
+/// threshold. Split out so it unit-tests on the host target with no I/O.
+fn should_rotate(size: u64) -> bool {
+    size >= ROTATION_THRESHOLD
+}
 
 /// One NDJSON line per pane: metadata only — never pane title/content
 /// (titles can echo secrets per the epic's "Security" best-practice).
@@ -410,6 +426,96 @@ impl Plugin {
         // is a closed pane.
         let live: std::collections::BTreeSet<u32> = full.iter().map(|l| l.pane_id).collect();
         self.last_emitted.retain(|pane_id, _| live.contains(pane_id));
+
+        // Live-feed rotation (fn-706.2). Measure the on-disk size via
+        // `metadata().len()` — NOT a running byte counter: under a #5177
+        // double-load two instances each count only their OWN writes and would
+        // never agree, but they share the same on-disk file. Once it crosses
+        // the threshold, rotate so the feed never approaches the consumer's
+        // 16 MiB oversize cap. We pass the current full manifest so the
+        // re-snapshot re-emits every live pane (a naive truncate would lose a
+        // quiescent pane the diff gate won't re-emit).
+        if let Some(size) = file_size(&self.session) {
+            if should_rotate(size) {
+                self.rotate(&full);
+            }
+        }
+    }
+
+    /// Rotate the live feed: truncate to 0 (forcing the WASI write cursor to
+    /// byte 0), mint a FRESH epoch nonce, re-seed `last_emitted` to the
+    /// just-written snapshot, and write a `plugin_start`-style epoch-header
+    /// line + the full current manifest in ONE `write_all`. The consumer
+    /// detects the rotation via a first-line epoch peek and resets its
+    /// watermark to byte 0.
+    ///
+    /// Ordering discipline (mirrors the post-flush fold): mint the new epoch
+    /// and build the header+snapshot buffer, write it, and ONLY on a
+    /// successful write commit the new epoch + re-seed `last_emitted` (clear,
+    /// then re-insert exactly the re-snapshotted panes) + advance `SEQ`. If the
+    /// write fails the file is left empty (truncate already landed) with the
+    /// OLD epoch still in `self.epoch` and `last_emitted` untouched — the next
+    /// `emit_lines` re-snapshots and recovers; we never false-suppress panes by
+    /// mutating the map before the write succeeds.
+    fn rotate(&mut self, full: &[PaneLine]) {
+        // Fresh epoch nonce distinct from the `plugin_id`-derived load epoch.
+        // Derive from `now_ms()` so it differs from BOTH the prior load epoch
+        // and the prior rotation epoch; add a small monotonic counter
+        // component so two rotations in the same millisecond can't collide.
+        let new_epoch = next_rotation_epoch();
+
+        // Build the header + full re-snapshot against the NEW epoch, numbered
+        // densely from seq 0 (the consumer keys on byte offset, so a SEQ reset
+        // is harmless; we reset rather than carry forward for clarity).
+        let header = format!(
+            "{{\"seq\":0,\"event\":\"plugin_start\",\"epoch\":{},\"session\":{}}}",
+            new_epoch,
+            json_string(&self.session),
+        );
+        // Re-snapshot the FULL current manifest the caller already built
+        // (`full` is post `is_plugin`-skip), renumbered against the new epoch
+        // with a dense seq from 1 (seq 0 is the header). Each `full` line
+        // already carries the current `ts_ms` from this emit.
+        let mut batch = String::new();
+        batch.push_str(&header);
+        batch.push('\n');
+        let mut seq = 1_u64;
+        for line in full {
+            let mut emitted = line.clone();
+            emitted.epoch = new_epoch;
+            emitted.seq = seq;
+            batch.push_str(&emitted.to_json());
+            batch.push('\n');
+            seq = seq.wrapping_add(1);
+        }
+
+        // Truncate + force-position-0 in one open, then write the
+        // header+snapshot in ONE `write_all`. We open with
+        // `write(true).truncate(true)` (NOT append) and an explicit
+        // `seek(SeekFrom::Start(0))` to dodge the WASI `O_APPEND`-after-
+        // truncate sparse-zeros-hole gotcha — don't trust the runtime's
+        // append cursor after an ftruncate. A single `write_all` keeps a
+        // #5177 double-loaded instance from interleaving mid-batch (O_APPEND
+        // atomicity is per-syscall; here we are the truncating writer).
+        if !rotate_write(&self.session, &batch) {
+            // Truncate may have landed but the write failed — file is empty,
+            // no header, OLD epoch retained. Do NOT clear `last_emitted` or
+            // bump the epoch; the next emit re-snapshots and recovers.
+            return;
+        }
+
+        // Write succeeded — NOW commit the rotation state. Bump the epoch,
+        // clear `last_emitted` so the NEXT diff re-emits the full manifest
+        // (the re-snapshot above already seeded the file, but clearing keeps
+        // the diff gate honest against the new baseline), and reset SEQ past
+        // the header + snapshot lines we just wrote.
+        self.epoch = new_epoch;
+        self.last_emitted.clear();
+        for line in full {
+            self.last_emitted
+                .insert(line.pane_id, (line.tab_id, line.tab_name.clone()));
+        }
+        SEQ.with(|s| s.set(seq));
     }
 }
 
@@ -469,6 +575,76 @@ fn append_line(session: &str, line: &str) {
     buf.push_str(line);
     buf.push('\n');
     let _ = append_batch(session, &buf);
+}
+
+/// On-disk size of the session feed via `metadata().len()`, or `None` if the
+/// file can't be stat'd (missing / FS wedged). Used by the rotation gate AFTER
+/// a successful append — measuring the file, NOT a per-instance byte counter,
+/// so a #5177 double-load (two instances writing the same file) agrees on the
+/// size that crosses the threshold.
+fn file_size(session: &str) -> Option<u64> {
+    let path = ndjson_path(session);
+    std::fs::metadata(&path).ok().map(|m| m.len())
+}
+
+/// Rotation write: truncate the feed to 0 AND force the write position to 0,
+/// then write `batch` (epoch header + full re-snapshot) in ONE `write_all` +
+/// flush. Returns `true` only when truncate + write + flush all succeed.
+///
+/// Opens with `write(true).create(true).truncate(true)` — NOT `append(true)` —
+/// and an explicit `seek(SeekFrom::Start(0))` after the open. This dodges the
+/// WASI `O_APPEND`-after-truncate sparse-zeros-hole gotcha: an append-mode
+/// handle's implicit "seek to end" can land the first post-truncate write past
+/// byte 0, leaving an unparseable zeros hole. The explicit truncate+seek pins
+/// the first byte at 0. The single `write_all` keeps a #5177 double-loaded
+/// instance from interleaving mid-batch.
+fn rotate_write(session: &str, batch: &str) -> bool {
+    let path = ndjson_path(session);
+    let open_res = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path);
+    let Ok(mut file) = open_res else {
+        return false;
+    };
+    // Belt-and-suspenders against the WASI append/truncate cursor gotcha:
+    // `truncate(true)` zeroes the length, but we ALSO force the cursor to 0 so
+    // the first write lands at byte 0 even on a runtime whose truncate leaves a
+    // stale offset.
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    let mut w = BufWriter::new(file);
+    if w.write_all(batch.as_bytes()).is_err() {
+        return false;
+    }
+    if w.flush().is_err() {
+        return false;
+    }
+    true
+}
+
+thread_local! {
+    /// Monotonic counter folded into the rotation epoch nonce so two rotations
+    /// in the same millisecond can't collide on the `now_ms()` component.
+    static ROTATION_COUNTER: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Mint a fresh rotation epoch nonce — distinct from the `plugin_id`-derived
+/// load epoch AND from any prior rotation epoch. Derived from `now_ms()` with a
+/// small monotonic counter folded into the low bits so a same-millisecond
+/// double rotation still produces distinct values. The consumer treats the
+/// epoch as opaque — only the CHANGE of epoch is meaningful.
+fn next_rotation_epoch() -> u64 {
+    let n = ROTATION_COUNTER.with(|c| {
+        let v = c.get().wrapping_add(1);
+        c.set(v);
+        v
+    });
+    // Shift the millis up and OR the counter into the low 8 bits so the value
+    // is monotone within a process and collision-free across same-ms rotations.
+    (now_ms() << 8) | (n & 0xff)
 }
 
 /// Current UNIX time in milliseconds. WASI preview1 exposes the host clock
@@ -778,6 +954,20 @@ mod tests {
         };
         let s = l.to_json();
         assert!(s.contains("\\n\\r\\t\\u0001"));
+    }
+
+    #[test]
+    fn should_rotate_gate_fires_at_threshold() {
+        // Below the threshold: no rotation.
+        assert!(!should_rotate(0));
+        assert!(!should_rotate(ROTATION_THRESHOLD - 1));
+        // At or above: rotate.
+        assert!(should_rotate(ROTATION_THRESHOLD));
+        assert!(should_rotate(ROTATION_THRESHOLD + 1));
+        assert!(should_rotate(u64::MAX));
+        // The threshold sits well under the consumer's 16 MiB oversize cap so
+        // the live feed self-bounds far below the cliff.
+        assert!(ROTATION_THRESHOLD < 16 * 1024 * 1024);
     }
 
     #[test]

@@ -176,6 +176,49 @@ export function parseZellijEventLine(line: string): ZellijPaneEvent | null {
 }
 
 /**
+ * Cheaply peek the `epoch` of a feed's FIRST line for rotation detection
+ * (fn-706.2). The bridge rotates its own feed at a ~4 MiB threshold by
+ * truncating to byte 0 and writing a fresh-epoch `plugin_start` header +
+ * full re-snapshot; the re-snapshot can grow the file PAST the consumer's
+ * prior offset, so the `size < priorOffset` shrink guard misses it. Reading
+ * the first line's epoch each scan catches the rotation regardless of size:
+ * a first-line epoch differing from the persisted watermark epoch means the
+ * file was rotated (or reloaded) and the consumer must reset to byte 0.
+ *
+ * Distinct from {@link parseZellijEventLine}, which returns `null` for the
+ * `plugin_start` sentinel — that helper is for the per-line mint walk, and
+ * the rotation header IS a sentinel, so we cannot route the peek through it.
+ * This helper accepts the sentinel shape (and a normal pane line) and lifts
+ * just `epoch`, normalized to its decimal-string form. Returns `null` on a
+ * blank line, unparseable JSON, a non-object, or a missing/invalid `epoch`
+ * — the caller treats `null` as "no rotation signal" and falls back to the
+ * shrink guard + in-window epoch detection.
+ */
+export function peekZellijEpoch(line: string): string | null {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (typeof obj.epoch === "string" && obj.epoch.length > 0) {
+    return obj.epoch;
+  }
+  if (typeof obj.epoch === "number" && Number.isFinite(obj.epoch)) {
+    return String(obj.epoch);
+  }
+  return null;
+}
+
+/**
  * Per-session forward-tail watermark. Keyed by `session` (the
  * `<session>.ndjson` basename without extension). `epoch` is the
  * last-seen `ZellijPaneEvent.epoch` for that session; an incoming

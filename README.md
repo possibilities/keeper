@@ -1765,20 +1765,34 @@ itself holds NO DB handle. It is the eighth `@parcel/watcher`
 producer instance and, like every keeper producer, feeds the log
 only via main's writable connection. The watermark sidecar advances
 in lockstep with each scan so a daemon restart re-tails from the
-last byte rather than re-folding the whole feed; an epoch nonce
-stamped by every plugin `load()` resets the watermark cleanly when
-the plugin reloads. An oversize feed (over the 16 MiB
-`MAX_ZELLIJ_EVENTS_FILE_BYTES` cap) is TAIL-READ instead of skipped
-(fn-706.1): the scan seeks to `max(priorOffset, size - cap)`,
+last byte rather than re-folding the whole feed. The watermark is the
+`(epoch, offset)` TUPLE, not offset alone, and it resets to byte 0 on
+ANY epoch mismatch — a plugin reload (the `load()`-stamped load epoch)
+OR a live-feed rotation (fn-706.2, the `now_ms()`-stamped rotation
+epoch). Each scan cheaply peeks the FIRST line's epoch
+(`peekZellijEpoch`, distinct from `parseZellijEventLine` which nulls
+the `plugin_start` sentinel the rotation header IS): a first-line epoch
+differing from the persisted watermark means the file was rotated or
+reloaded, so the consumer resets the offset to 0 and re-reads the
+header + re-snapshot from byte 0. This is robust even when the
+re-snapshot already grew the file PAST the prior offset — the
+behind-consumer hole the `size < watermark` shrink guard misses; the
+shrink guard is retained as a secondary signal (a file shorter than the
+watermark is a rotation signal, not an error). An oversize feed (over
+the 16 MiB `MAX_ZELLIJ_EVENTS_FILE_BYTES` cap) is TAIL-READ instead of
+skipped (fn-706.1): the scan seeks to `max(priorOffset, size - cap)`,
 discards the partial leading line to the next `\n`, seeds the epoch
 from the first parsed line in the window, and advances the watermark
 from the actual window base (`tailBase + discardedPartialBytes +
 consumedBytesInTail`). A noisy session degrades to "tail-only" and
 keeps minting `BackendExecSnapshot` — the pre-fn-706 skip-and-log
 froze the watermark forever, silently stopping all mints for the
-session (the recurring hand-truncate mole). Rollback to the poller is
-a single `git revert` of the fn-684 task .5 commit — the poller
-worker is retired, not gated.
+session (the recurring hand-truncate mole). Post-fn-706.2 the feed
+self-bounds well under the cap via plugin-side rotation (see the
+zellij-bridge plugin's ~4 MiB `ROTATION_THRESHOLD`), so the tail-read
+is a never-frozen safety net rather than the steady state. Rollback to
+the poller is a single `git revert` of the fn-684 task .5 commit — the
+poller worker is retired, not gated.
 
 A **tenth** Worker thread is the restore-snapshot worker (epic fn-677,
 two-tier rework fn-702): a pure CONSUMER that opens its own read-only

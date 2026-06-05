@@ -168,6 +168,7 @@ import type {
 import {
   parseZellijEventLine,
   parseZellijWatermarks,
+  peekZellijEpoch,
   serializeZellijWatermarks,
   type ZellijWatermarkFile,
 } from "./zellij-events";
@@ -597,17 +598,21 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
 
 /**
  * Cap how much of one `<session>.ndjson` file we'll read in one pass.
- * The plugin appends one ~200-byte line per pane/tab delta, never
- * truncates; over weeks a busy session's file can grow to MiB. 16 MiB
- * matches `MAX_DEAD_LETTER_FILE_BYTES` and bounds the per-scan memory
- * cost. An oversized file is TAIL-READ instead of skipped (fn-706.1):
- * we seek to `max(priorOffset, size - cap)`, discard the partial
- * leading line to the next `\n`, and parse complete lines only — so a
- * noisy session degrades to "tail-only" and never freezes forever.
- * (Superseded the pre-fn-706 skip-and-hand-truncate path, which left
- * the watermark frozen and silently stopped minting `BackendExecSnapshot`
- * for the whole session.) Still never throws — bounded memory, one
- * record lost at the resync seam, the rest of the scan unaffected.
+ * The plugin appends one ~200-byte line per pane/tab delta. Post-fn-706.2
+ * it SELF-ROTATES the feed at a ~4 MiB threshold (truncate + fresh-epoch
+ * header + full re-snapshot), so a session's live feed self-bounds well
+ * under this cap — the consumer detects the rotation via a first-line
+ * epoch peek and resets its watermark to byte 0. 16 MiB matches
+ * `MAX_DEAD_LETTER_FILE_BYTES` and bounds the per-scan memory cost; it is
+ * now a never-frozen safety net rather than the steady state. An oversized
+ * file is TAIL-READ instead of skipped (fn-706.1): we seek to
+ * `max(priorOffset, size - cap)`, discard the partial leading line to the
+ * next `\n`, and parse complete lines only — so a noisy session degrades to
+ * "tail-only" and never freezes forever. (Superseded the pre-fn-706
+ * skip-and-hand-truncate path, which left the watermark frozen and silently
+ * stopped minting `BackendExecSnapshot` for the whole session.) Still never
+ * throws — bounded memory, one record lost at the resync seam, the rest of
+ * the scan unaffected.
  *
  * Exported so a test can drive an oversize tail-read at a small
  * injected size without materializing a real 16 MiB feed.
@@ -820,8 +825,50 @@ export function scanZellijEventsDir(
     // matches the plugin's `/host/<session>.ndjson` naming.
     const sessionKey = name.slice(0, -".ndjson".length);
     const prior = watermarks[sessionKey];
-    const priorOffset =
+    let priorOffset =
       prior && prior.offset >= 0 && prior.offset <= st.size ? prior.offset : 0;
+
+    let buf: Buffer;
+    try {
+      buf = readFileSync(full);
+    } catch (err) {
+      console.error(
+        `[keeperd] zellij-events scan read failed for ${full}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      continue;
+    }
+
+    // Rotation detection via a first-line epoch peek (fn-706.2). The bridge
+    // rotates its own feed at the ~4 MiB threshold by truncating to byte 0
+    // and writing a fresh-epoch `plugin_start` header + full re-snapshot. The
+    // re-snapshot can grow the file PAST `priorOffset`, so the `size <
+    // priorOffset` shrink guard (the `prior.offset <= st.size` clamp above)
+    // misses it — the behind-consumer hole. Peek the FIRST line's epoch each
+    // scan: if it differs from the persisted watermark epoch, the file was
+    // rotated (or reloaded), so reset the offset to 0 and re-read from byte 0
+    // (consuming the header + snapshot). Robust even when `size >=
+    // priorOffset`. The shrink guard is retained above as a secondary signal.
+    //
+    // `peekZellijEpoch` (NOT `parseZellijEventLine`) lifts the epoch even from
+    // the `plugin_start` sentinel header the rotation writes — the per-line
+    // parser nulls the sentinel, so it cannot serve this peek.
+    if (prior) {
+      const firstNl = buf.indexOf(0x0a); // `\n`
+      const firstLine =
+        firstNl === -1
+          ? buf.toString("utf8")
+          : buf.subarray(0, firstNl).toString("utf8");
+      const firstEpoch = peekZellijEpoch(firstLine);
+      if (firstEpoch !== null && firstEpoch !== prior.epoch) {
+        // Rotated (or reloaded) since the last scan — the file's first line
+        // carries a fresh epoch. Reset to byte 0 so we consume the new
+        // header + re-snapshot from the start.
+        priorOffset = 0;
+      }
+    }
+
     if (st.size === priorOffset) {
       // No new bytes since the last scan — nothing to do for this file.
       continue;
@@ -837,18 +884,6 @@ export function scanZellijEventsDir(
     // PAST the prior offset we landed mid-line, so the leading partial
     // bytes are discarded to the first `\n` below.
     const tailBase = Math.max(priorOffset, st.size - maxBytes);
-
-    let buf: Buffer;
-    try {
-      buf = readFileSync(full);
-    } catch (err) {
-      console.error(
-        `[keeperd] zellij-events scan read failed for ${full}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      continue;
-    }
 
     // Tail from the window base. We re-read the whole file (simpler
     // than a streaming seek; bounded by `MAX_ZELLIJ_EVENTS_FILE_BYTES`)

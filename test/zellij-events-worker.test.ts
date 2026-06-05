@@ -24,6 +24,7 @@ import { scanZellijEventsDir } from "../src/daemon";
 import { openDb } from "../src/db";
 import {
   parseZellijEventLine,
+  peekZellijEpoch,
   type ZellijPaneEvent,
 } from "../src/zellij-events";
 
@@ -311,6 +312,127 @@ test("scanZellijEventsDir resets the watermark on an epoch change (plugin reload
     { epoch: string; offset: number }
   >;
   expect(sidecar["sess-a"]?.epoch).toBe("epoch-new");
+
+  db.close();
+});
+
+test("peekZellijEpoch lifts the epoch from a pane line AND the plugin_start sentinel (fn-706.2)", () => {
+  // A normal pane line — numeric epoch normalized to decimal string.
+  expect(
+    peekZellijEpoch(
+      JSON.stringify(makePaneEvent({ epoch: "epoch-A", pane_id: "1" })),
+    ),
+  ).toBe("epoch-A");
+  expect(
+    peekZellijEpoch('{"seq":1,"epoch":42,"session":"s","pane_id":1}'),
+  ).toBe("42");
+
+  // The rotation header IS a `plugin_start` sentinel — `parseZellijEventLine`
+  // nulls it, but the peek MUST still read its epoch (it's the rotation
+  // signal). This is the load-bearing difference between the two helpers.
+  const header = JSON.stringify({
+    seq: 0,
+    event: "plugin_start",
+    epoch: "epoch-B",
+    session: "s",
+  });
+  expect(parseZellijEventLine(header)).toBeNull();
+  expect(peekZellijEpoch(header)).toBe("epoch-B");
+
+  // Garbage / blank / missing-epoch → null (caller falls back to the shrink
+  // guard + in-window detection).
+  expect(peekZellijEpoch("")).toBeNull();
+  expect(peekZellijEpoch("   ")).toBeNull();
+  expect(peekZellijEpoch("not json")).toBeNull();
+  expect(peekZellijEpoch("[1,2,3]")).toBeNull();
+  expect(peekZellijEpoch('{"session":"s"}')).toBeNull();
+  expect(peekZellijEpoch('{"epoch":""}')).toBeNull();
+});
+
+test("scanZellijEventsDir detects a plugin-side rotation via the first-line epoch peek (fn-706.2)", () => {
+  const { db, stmts } = openDb(dbPath);
+  mkdirSync(eventsDir, { recursive: true });
+  seedJob(db, "job-1", "sess-a", "1");
+
+  // Epoch-A run: a header sentinel + a pane line. Note the consumer skips
+  // the sentinel (no pane fields) and mints from the pane line.
+  const file = join(eventsDir, "sess-a.ndjson");
+  const headerA = `${JSON.stringify({
+    seq: 0,
+    event: "plugin_start",
+    epoch: "epoch-A",
+    session: "sess-a",
+  })}\n`;
+  const paneA = serializeLine(
+    makePaneEvent({
+      seq: 1,
+      pane_id: "1",
+      tab_id: "5",
+      tab_name: "tab-before-aaa",
+      epoch: "epoch-A",
+    }),
+  );
+  writeFileSync(file, headerA + paneA);
+  scanZellijEventsDir(db, stmts, eventsDir);
+  expect(readBackendExecEvents(db).count).toBe(1);
+
+  const watermarkPath = join(eventsDir, ".keeperd-watermarks.json");
+  const afterA = JSON.parse(readFileSync(watermarkPath, "utf8")) as Record<
+    string,
+    { epoch: string; offset: number }
+  >;
+  expect(afterA["sess-a"]?.epoch).toBe("epoch-A");
+  const priorOffset = afterA["sess-a"]?.offset ?? 0;
+
+  // Plugin rotates: truncate to byte 0, write a FRESH-epoch header + full
+  // re-snapshot. The re-snapshot grows the file PAST the prior offset, so the
+  // `size < priorOffset` shrink guard would MISS this — only the first-line
+  // epoch peek catches it. We pad the re-snapshot so its total size exceeds
+  // the prior offset, defeating the shrink guard deliberately.
+  const headerB = `${JSON.stringify({
+    seq: 0,
+    event: "plugin_start",
+    epoch: "epoch-B",
+    session: "sess-a",
+  })}\n`;
+  const paneB = serializeLine(
+    makePaneEvent({
+      seq: 1,
+      pane_id: "1",
+      tab_id: "9",
+      tab_name: "tab-after-bbbb",
+      epoch: "epoch-B",
+    }),
+  );
+  writeFileSync(file, headerB + paneB);
+  // Sanity: the rotated file is at least as large as the prior offset, so the
+  // shrink guard alone cannot detect the rotation — the epoch peek is
+  // load-bearing.
+  const rotatedSize = headerB.length + paneB.length;
+  expect(rotatedSize).toBeGreaterThanOrEqual(priorOffset);
+
+  scanZellijEventsDir(db, stmts, eventsDir);
+
+  // The consumer reset to byte 0, consumed the new header + snapshot, and
+  // re-minted the pane against the NEW epoch.
+  const { count, rows } = readBackendExecEvents(db);
+  expect(count).toBe(2);
+  expect(JSON.parse(rows[rows.length - 1]?.data ?? "{}").tab_name).toBe(
+    "tab-after-bbbb",
+  );
+
+  // Watermark now carries the NEW epoch + the post-rotation offset.
+  const afterB = JSON.parse(readFileSync(watermarkPath, "utf8")) as Record<
+    string,
+    { epoch: string; offset: number }
+  >;
+  expect(afterB["sess-a"]?.epoch).toBe("epoch-B");
+  expect(afterB["sess-a"]?.offset).toBe(rotatedSize);
+
+  // Re-scan is idempotent — no new bytes, no new mints, no spurious reset.
+  const before = readBackendExecEvents(db).count;
+  scanZellijEventsDir(db, stmts, eventsDir);
+  expect(readBackendExecEvents(db).count).toBe(before);
 
   db.close();
 });
