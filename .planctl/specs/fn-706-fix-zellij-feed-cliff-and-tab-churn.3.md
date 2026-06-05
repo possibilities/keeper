@@ -60,5 +60,5 @@ Rebuild the wasm and confirm it loads (no permission/instantiation change).
 - [ ] `tab_namer.wasm` rebuilt; loads cleanly in a zellij session.
 
 ## Done summary
-
+Added a per-tab debounce (DEBOUNCE_TICKS=2) as a pre-filter in front of decide() in reconcile_with: a candidate [process] label must persist 2 consecutive reconcile ticks before any rename fires, killing transient flaps. Ownership/disown model unchanged; existing tests updated to tick across the window plus new flap/stable-window tests; wasm rebuilt in place at the config.kdl path.
 ## Evidence
