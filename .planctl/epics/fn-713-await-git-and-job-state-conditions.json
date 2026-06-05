@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-713-await-git-and-job-state-conditions",
   "bundles": [],
+  "closer_done_at": "2026-06-05T17:58:28.015578Z",
   "created_at": "2026-06-05T16:35:33.808165Z",
   "depends_on_epics": [],
   "id": "fn-713-await-git-and-job-state-conditions",
@@ -9,10 +10,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "await git and job state conditions",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T16:35:33.808165Z"
+  "updated_at": "2026-06-05T17:58:28.015578Z"
 }
