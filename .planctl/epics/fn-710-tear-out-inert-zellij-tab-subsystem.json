@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-710-tear-out-inert-zellij-tab-subsystem",
   "bundles": [],
   "closer_done_at": "2026-06-05T17:04:31.121208Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-05T17:04:31.121208Z"
+  "updated_at": "2026-06-05T17:05:00.342797Z"
 }
