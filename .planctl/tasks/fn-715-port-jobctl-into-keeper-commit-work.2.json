@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-05T17:04:30.830440Z",
+  "depends_on": [
+    "fn-715-port-jobctl-into-keeper-commit-work.1"
+  ],
+  "epic": "fn-715-port-jobctl-into-keeper-commit-work",
+  "id": "fn-715-port-jobctl-into-keeper-commit-work.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "max",
+  "title": "Implement keeper commit-work",
+  "updated_at": "2026-06-05T17:04:30.830440Z"
+}
