@@ -43,5 +43,5 @@ Arg-parse tests for the new selector arity (valid selector; missing selector →
 - [ ] Arg-parse + eval-arm tests green
 
 ## Done summary
-
+Wired the monitorRunningState predicate into a new 'keeper await monitor-running <selector>' condition — a third arg arity taking one selector token (cmd:<command>, kind:<monitor|bash-bg|ambient>, or bare token = command-match). Refuses upfront with reason=no-match exit 1 when nothing matches at arm time rather than firing an instant met; the same-turn-arm caveat is documented. Updated HELP, SKILL.md, and README to read as five conditions; CLAUDE.md had no await-condition content to revise. Arg-parse + eval-arm tests green.
 ## Evidence
