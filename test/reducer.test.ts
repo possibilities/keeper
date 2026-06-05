@@ -16077,3 +16077,224 @@ test("v51 monitors: a launch AFTER this Stop is NOT seen (id < current gate)", (
   // Provenance for the Stop is `ambient` — the launch came later.
   expect(getMonitors()).toEqual([{ id: "bash-late", kind: "ambient" }]);
 });
+
+// ---------------------------------------------------------------------------
+// fn-717.1 — cold-blob relocation (event_blobs) read plumbing
+// ---------------------------------------------------------------------------
+
+// Snapshot the three projections a `data`-blob read feeds: file_attributions
+// + git_status (drain SELECT + file-attribution scan) and the jobs.epic_links
+// / epics.job_links cells (the commit-trailer reads). Returned as plain JSON
+// rows so an `expect(...).toEqual(...)` is a byte-for-byte diff.
+function snapshotBlobDrivenProjections() {
+  return {
+    attributions: db
+      .query(
+        "SELECT project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at, worktree_oid, worktree_mode FROM file_attributions ORDER BY project_dir, session_id, file_path",
+      )
+      .all(),
+    gitStatus: db.query("SELECT * FROM git_status ORDER BY project_dir").all(),
+    jobLinks: db
+      .query("SELECT job_id, epic_links FROM jobs ORDER BY job_id")
+      .all(),
+    epicLinks: db
+      .query("SELECT epic_id, job_links FROM epics ORDER BY epic_id")
+      .all(),
+  };
+}
+
+// Seed one mixed stream exercising EVERY rewritten `data`-blob read site:
+// PostToolUse mutations (drain SELECT + file-attribution scan), a GitSnapshot
+// + Commit pair that discharges the attribution (drain SELECT), and a
+// `chore(planctl)` Commit carrying planctl trailers (loadCommitTrailer{
+// Invocations,SessionsForEpics}). Returns the discharged PostToolUse event id
+// so a test can relocate its now-cold blob.
+function seedBlobReadStream(): { dischargedPostToolUseId: number } {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  const dischargedPostToolUseId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/cold.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 150,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        {
+          path: "cold.ts",
+          xy: " M",
+          mtime_ms: null,
+          worktree_oid: null,
+          worktree_mode: null,
+        },
+      ],
+    }),
+  });
+  // Legacy-shape Commit (NULL-axis fall-back) discharges cold.ts — its
+  // PostToolUse attribution goes cold, the realistic relocation candidate.
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID,
+      parent_oid: null,
+      files: ["cold.ts"],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 200_000,
+    }),
+  });
+  // A `chore(planctl)` Commit carrying the fn-695 trailer facts so the
+  // commit-trailer reads (loadCommitTrailer*) have a row to resolve.
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 210,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: TEST_OID_2,
+      parent_oid: TEST_OID,
+      files: [],
+      committer_session_id: TEST_UUID,
+      committed_at_ms: 210_000,
+      planctl_op: "create",
+      planctl_target: "fn-1-demo",
+      session_id_trailer: TEST_UUID,
+    }),
+  });
+  return { dischargedPostToolUseId };
+}
+
+test("fn-717.1 empty event_blobs: cursor=0 re-fold is byte-identical (lossless foundation)", () => {
+  // The provably-lossless foundation: with event_blobs EMPTY, every
+  // COALESCE(events.data, event_blobs.data) returns the inline value
+  // (COALESCE(data, NULL) = data), so a from-scratch re-fold reproduces
+  // byte-identical projections — behavior is unchanged from pre-v57.
+  seedBlobReadStream();
+  drainAll();
+  const live = snapshotBlobDrivenProjections();
+
+  // event_blobs must be empty in task .1 (no compaction yet).
+  const blobCount = db.query("SELECT COUNT(*) AS n FROM event_blobs").get() as {
+    n: number;
+  };
+  expect(blobCount.n).toBe(0);
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM file_attributions");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  drainAll();
+
+  expect(snapshotBlobDrivenProjections()).toEqual(live);
+});
+
+test("fn-717.1 events.data stays NOT NULL in .1 — the relocate-NULL is the .2 seam", () => {
+  // DECISION (per the task spec): keep the write-path `events.data NOT NULL`
+  // constraint in task .1; task .2 relaxes it when the compaction relocator
+  // actually NULLs the hot column. This test PINS that decision so a future
+  // change can't silently drop the constraint, and documents WHY the .2
+  // compaction (`UPDATE events SET data = NULL`) is out of scope here: the
+  // constraint forbids it today.
+  const { dischargedPostToolUseId } = seedBlobReadStream();
+  drainAll();
+  // A .2-style relocation copies the blob into event_blobs first — that side
+  // is fine (NOT NULL there is satisfied by the real bytes)...
+  db.run(
+    "INSERT INTO event_blobs (event_id, data) SELECT id, data FROM events WHERE id = ?",
+    [dischargedPostToolUseId],
+  );
+  // ...but NULLing the hot column is REJECTED by the live schema in .1.
+  expect(() =>
+    db.run("UPDATE events SET data = NULL WHERE id = ?", [
+      dischargedPostToolUseId,
+    ]),
+  ).toThrow(/NOT NULL constraint failed: events.data/);
+});
+
+test("fn-717.1 relocated blob (event_blobs): COALESCE drain read resolves the side-table value losslessly", () => {
+  // Prove the rewritten read plumbing is lossless ACROSS relocation — the
+  // property task .2's compaction relies on — WITHOUT depending on a NULLable
+  // `events.data` (still NOT NULL in .1). Fold the stream inline, snapshot,
+  // then build the post-relocation read shape on a scratch table whose
+  // `data` IS nullable (the .2 schema shape) and assert the EXACT drain
+  // COALESCE expression resolves the blob from `event_blobs` when the hot
+  // column is NULL, byte-for-byte equal to the inline value.
+  const { dischargedPostToolUseId } = seedBlobReadStream();
+  drainAll();
+  const inlineValue = db
+    .query("SELECT data FROM events WHERE id = ?")
+    .get(dischargedPostToolUseId) as { data: string };
+
+  // Relocate the cold blob into the side table (the .2 INSERT step, which IS
+  // allowed in .1 — only the subsequent hot-column NULL is gated).
+  db.run(
+    "INSERT INTO event_blobs (event_id, data) SELECT id, data FROM events WHERE id = ?",
+    [dischargedPostToolUseId],
+  );
+
+  // .2 schema preview: a nullable-`data` events shape so we can NULL the hot
+  // column and observe the COALESCE fall through to event_blobs. Mirrors the
+  // exact LEFT JOIN + COALESCE the drain SELECT uses.
+  db.run(
+    "CREATE TABLE events_nullable (id INTEGER PRIMARY KEY, data TEXT, hook_event TEXT)",
+  );
+  db.run(
+    "INSERT INTO events_nullable (id, data, hook_event) SELECT id, NULL, hook_event FROM events WHERE id = ?",
+    [dischargedPostToolUseId],
+  );
+  const resolved = db
+    .query(
+      `SELECT COALESCE(events_nullable.data, event_blobs.data) AS data
+         FROM events_nullable
+         LEFT JOIN event_blobs ON event_blobs.event_id = events_nullable.id
+        WHERE events_nullable.id = ?`,
+    )
+    .get(dischargedPostToolUseId) as { data: string };
+
+  // The relocated value is recovered byte-for-byte from the side table.
+  expect(resolved.data).toBe(inlineValue.data);
+  expect(resolved.data).toBe(
+    JSON.stringify({ tool_input: { file_path: "/repo/cold.ts" } }),
+  );
+});
+
+test("fn-717.1 idx_events_tool_attr still serves the file-attribution scan (EXPLAIN-verified)", () => {
+  // The file-attribution scan's WHERE filter STAYS on events.data (NOT
+  // COALESCE), so the expression index idx_events_tool_attr keeps serving it
+  // as a SEARCH (sub-ms SEEK), never a full table SCAN. EXPLAIN QUERY PLAN
+  // must name the index — proving the .2 seam is documented, not broken.
+  const plan = db
+    .query(
+      `EXPLAIN QUERY PLAN
+         SELECT id, ts, session_id, tool_name
+           FROM events
+          WHERE hook_event = 'PostToolUse'
+            AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
+            AND json_extract(data, '$.tool_input.file_path') = ?`,
+    )
+    .all("/repo/cold.ts") as { detail: string }[];
+  const details = plan.map((r) => r.detail);
+  const joined = details.join("\n");
+  // The index is named (a SEARCH/SEEK, not a full scan).
+  expect(joined).toContain("idx_events_tool_attr");
+  // No plan line is a bare full SCAN of the events table (a covered SEARCH
+  // line reads "SEARCH events USING ... idx_events_tool_attr").
+  expect(details.some((d) => /^SCAN events\b/.test(d.trim()))).toBe(false);
+});

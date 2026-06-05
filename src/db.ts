@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 56;
+export const SCHEMA_VERSION = 57;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1288,6 +1288,48 @@ CREATE TABLE IF NOT EXISTS epic_tombstones (
 `;
 
 /**
+ * Schema-v57 `event_blobs` cold-blob relocation side table (fn-717.1).
+ *
+ * The `events` table has grown ~1.6 GB, dominated by ~1 GB of inline
+ * `PostToolUse` `data` blobs that go cold the instant their file
+ * attribution discharges yet stay in the hot, heavily-indexed `events`
+ * table forever. This companion table is the relocation target: a future
+ * compaction pass (task .2, daemon-side) MOVEs a cold/discharged event's
+ * blob here (`INSERT INTO event_blobs SELECT id, data ...` then `UPDATE
+ * events SET data = NULL`) — the `events` row is NEVER deleted; only the
+ * blob's LOCATION moves. Every reducer blob VALUE read resolves via
+ * `COALESCE(events.data, event_blobs.data)` so a relocated blob folds
+ * byte-identically whether it lives inline or here.
+ *
+ * **Task .1 (this change) leaves this table EMPTY** — no compaction yet. So
+ * every `COALESCE(events.data, event_blobs.data)` returns the inline value
+ * (`COALESCE(data, NULL) = data`) and behavior + from-scratch re-fold are
+ * byte-identical to the pre-v57 reducer. This is the provably-lossless
+ * foundation the compaction relocator builds on.
+ *
+ * `event_id` is a 1:1 FK to `events(id)` (PRIMARY KEY enforces at-most-one
+ * relocated blob per event). `data TEXT NOT NULL` mirrors the write-path
+ * `events.data NOT NULL` constraint — KEPT NOT NULL here deliberately: in
+ * task .1 nothing ever NULLs it, and a relocated blob is by definition the
+ * non-null bytes lifted off `events.data`. (Task .2 owns the question of
+ * whether the relocator NULLs `events.data` in place vs. needs a nullable
+ * side column — it does not, since it INSERTs the real bytes here and
+ * NULLs the HOT column, not this one.)
+ *
+ * NOT a reducer projection: it is never folded, never written inside the
+ * BEGIN IMMEDIATE cursor-advance transaction, and does NOT go in the
+ * rewind-and-redrain DELETE list — it is a content-preserving sidecar of
+ * the immutable event log, not derived state. keeper-py never reads it
+ * (the v56→v57 bump is whitelist-only).
+ */
+const CREATE_EVENT_BLOBS = `
+CREATE TABLE IF NOT EXISTS event_blobs (
+    event_id INTEGER PRIMARY KEY REFERENCES events(id),
+    data TEXT NOT NULL
+)
+`;
+
+/**
  * Schema-v47 `autopilot_state` projection table (fn-667) — a SINGLETON row
  * (`id INTEGER PRIMARY KEY CHECK (id = 1)`) carrying the autopilot worker's
  * paused/playing flag as durable, viewer-readable state. Before v47 the flag
@@ -2097,6 +2139,7 @@ function migrate(db: Database): void {
     db.run(CREATE_AUTOPILOT_STATE);
     db.run(CREATE_PENDING_DISPATCHES);
     db.run(CREATE_EPIC_TOMBSTONES);
+    db.run(CREATE_EVENT_BLOBS);
 
     // Seed singleton cursor on first boot. Subsequent boots are no-ops.
     db.run(
@@ -5392,6 +5435,32 @@ function migrate(db: Database): void {
         );
       }
     }
+
+    // v56→v57: fn-717.1 — add the `event_blobs` cold-blob relocation side
+    // table (created above via CREATE TABLE IF NOT EXISTS, naturally
+    // idempotent and forward-only — same pattern as the v5→v6 epics/tasks
+    // table add). No ALTER, no backfill, no data move: the table starts
+    // EMPTY and a future compaction pass (task .2) relocates cold blobs
+    // into it. A v56 DB gains the one empty table on first open with every
+    // prior `events`/`jobs`/`epics` row intact.
+    //
+    // Re-fold safe: the table is NOT a reducer projection — it is never
+    // folded and never written inside the BEGIN IMMEDIATE cursor-advance
+    // transaction. With it empty, every reducer
+    // `COALESCE(events.data, event_blobs.data)` blob read returns the
+    // inline `events.data` value (`COALESCE(data, NULL) = data`), so a
+    // from-scratch cursor=0 re-fold reproduces byte-identical projections.
+    // The `idx_events_tool_attr` expression index on `events.data` is
+    // UNCHANGED and still serves the file-attribution scan (that scan's
+    // WHERE filter stays on `events.data`, NOT COALESCE — see the .2 seam
+    // note in `src/reducer.ts` `findExplicitAttributions`).
+    //
+    // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 57
+    // in the SAME change — whitelist-only (keeper-py never reads
+    // `events.data` nor `event_blobs`), but the bump is required so
+    // `keeper commit-work` on this host doesn't fail-loud
+    // (test/schema-version.test.ts enforces).
+    db.run(CREATE_EVENT_BLOBS);
 
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

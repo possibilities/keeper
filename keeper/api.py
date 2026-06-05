@@ -195,6 +195,13 @@ from pathlib import Path
 # NULL-status shell row is hidden from the board until its EpicSnapshot folds.
 # keeper-py reads neither the column nor the predicate (attribution surface
 # only), so the bump is whitelist-only with no reader logic change.
+#
+# v57 (fn-717.1 epic) is a whitelist-only bump: the ``event_blobs(event_id,
+# data)`` cold-blob relocation side table is added (empty in .1 — the
+# compaction relocator lands in .2). Reducer blob reads resolve via
+# ``COALESCE(events.data, event_blobs.data)``. keeper-py reads neither
+# ``events.data`` nor ``event_blobs`` (attribution surface only), so the bump
+# is whitelist-only with no reader logic change.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -223,6 +230,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         54,
         55,
         56,
+        57,
     }
 )
 

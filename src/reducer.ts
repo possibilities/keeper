@@ -1590,6 +1590,27 @@ function findExplicitAttributions(
   // SQL's perspective, and the `tool_name` filter narrows the index-seek
   // before the JSON probe. The reducer's BEGIN IMMEDIATE bounds this scan
   // to the writer lock window — kept narrow by the per-file iteration.
+  //
+  // fn-717.1 cold-blob relocation — the .2 SEAM (DOCUMENTED, NOT BROKEN
+  // here). Unlike the drain SELECT and the commit-trailer reads (which
+  // resolve the blob VALUE via `COALESCE(events.data, event_blobs.data)`),
+  // this scan's `json_extract` filter STAYS on `events.data` — DO NOT
+  // COALESCE it. The expression index `idx_events_tool_attr` (src/db.ts) is
+  // defined ON `json_extract(data, '$.tool_input.file_path')`; rewriting the
+  // predicate to `json_extract(COALESCE(events.data, event_blobs.data), ...)`
+  // would defeat that index and regress the explicit-attribution scan from a
+  // sub-ms covering SEEK to a multi-second full scan of every PostToolUse row
+  // (the exact starvation this index was built to kill, per the
+  // `idx_events_tool_attr` docstring). It is also UNNECESSARY in this epic:
+  // the compaction relocator (task .2) only relocates a blob whose file
+  // attribution has ALREADY DISCHARGED (cold) — an event whose attribution
+  // can still be live keeps its blob inline. So a blob this scan could ever
+  // match is by construction still inline on `events.data`, and reading it
+  // through the index is lossless. Task .2 OWNS keeping that invariant true
+  // (compact only discharged blobs; never relocate one whose attribution can
+  // still match here) — it must NOT NULL `events.data` for any event a live
+  // attribution probe could still hit. In task .1 `event_blobs` is empty, so
+  // this is byte-identical to today regardless.
   for (const candidatePath of paths) {
     const toolRows = db
       .prepare(
@@ -5144,14 +5165,23 @@ function loadCommitTrailerInvocations(
   db: Database,
   sessionId: string,
 ): ClassifierInvocation[] {
+  // fn-717.1: the `Commit` blob VALUE AND the two `json_extract` filters
+  // resolve via `COALESCE(events.data, event_blobs.data)`, so a Commit blob
+  // the compaction relocator (task .2) MOVEs into `event_blobs` still
+  // matches the filter and re-parses byte-identically. The LEFT JOIN is
+  // empty in .1, so this is byte-identical to the pre-v57 `events`-only
+  // form. No expression index covers these Commit `json_extract` probes
+  // (`idx_events_tool_attr` is a PostToolUse partial index), so COALESCE-ing
+  // the WHERE breaks no index here.
   const rows = db
     .query(
-      `SELECT data
+      `SELECT COALESCE(events.data, event_blobs.data) AS data
          FROM events
+         LEFT JOIN event_blobs ON event_blobs.event_id = events.id
         WHERE hook_event = 'Commit'
-          AND json_extract(data, '$.committer_session_id') = ?
-          AND json_extract(data, '$.planctl_op') IS NOT NULL
-        ORDER BY id ASC`,
+          AND json_extract(COALESCE(events.data, event_blobs.data), '$.committer_session_id') = ?
+          AND json_extract(COALESCE(events.data, event_blobs.data), '$.planctl_op') IS NOT NULL
+        ORDER BY events.id ASC`,
     )
     .all(sessionId) as { data: string }[];
   const out: ClassifierInvocation[] = [];
@@ -5210,14 +5240,20 @@ function loadCommitTrailerSessionsForEpics(
   if (epicIds.size === 0) {
     return sessions;
   }
+  // fn-717.1: same COALESCE(events.data, event_blobs.data) resolution as
+  // loadCommitTrailerInvocations — the Commit blob VALUE and both
+  // `json_extract` filters read through the empty-in-.1 LEFT JOIN so a
+  // relocated Commit blob (task .2) stays matchable + re-parsable, and this
+  // is byte-identical to the pre-v57 form while `event_blobs` is empty.
   const rows = db
     .query(
-      `SELECT data
+      `SELECT COALESCE(events.data, event_blobs.data) AS data
          FROM events
+         LEFT JOIN event_blobs ON event_blobs.event_id = events.id
         WHERE hook_event = 'Commit'
-          AND json_extract(data, '$.planctl_op') IS NOT NULL
-          AND json_extract(data, '$.committer_session_id') IS NOT NULL
-        ORDER BY id ASC`,
+          AND json_extract(COALESCE(events.data, event_blobs.data), '$.planctl_op') IS NOT NULL
+          AND json_extract(COALESCE(events.data, event_blobs.data), '$.committer_session_id') IS NOT NULL
+        ORDER BY events.id ASC`,
     )
     .all() as { data: string }[];
   for (const r of rows) {
@@ -7681,18 +7717,30 @@ export function drain(
     .get() as { last_event_id: number } | null;
   const cursor = cursorRow?.last_event_id ?? 0;
 
+  // fn-717.1: the `data` blob resolves via `COALESCE(events.data,
+  // event_blobs.data)` so a blob the compaction relocator (task .2) has
+  // MOVEd into the `event_blobs` side table folds byte-identically to one
+  // still inline. The LEFT JOIN is empty in .1 (no compaction yet), so
+  // COALESCE returns the inline `events.data` for every row and this drain
+  // is byte-identical to the pre-v57 form. `event_blobs` carries only
+  // `(event_id, data)`, so every other projected column is unambiguous;
+  // `id` is qualified to `events.id` for the join key (the side table has
+  // no `id`).
   const rows = db
     .query(
-      `SELECT id, ts, session_id, pid, hook_event, event_type, tool_name,
-              matcher, cwd, permission_mode, agent_id, agent_type,
-              stop_hook_active, data, subagent_agent_id, spawn_name,
+      `SELECT events.id AS id, ts, session_id, pid, hook_event, event_type,
+              tool_name, matcher, cwd, permission_mode, agent_id, agent_type,
+              stop_hook_active,
+              COALESCE(events.data, event_blobs.data) AS data,
+              subagent_agent_id, spawn_name,
               start_time, slash_command, skill_name,
               planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
               planctl_subject_present, tool_use_id, config_dir, planctl_files,
               backend_exec_type, backend_exec_session_id, backend_exec_pane_id
          FROM events
-        WHERE id > ?
-        ORDER BY id ASC
+         LEFT JOIN event_blobs ON event_blobs.event_id = events.id
+        WHERE events.id > ?
+        ORDER BY events.id ASC
         LIMIT ?`,
     )
     .all(cursor, batchSize) as Event[];
