@@ -4976,7 +4976,8 @@ function migrate(db: Database): void {
     // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds
     // 48 in the same change — whitelist-only (keeper-py reads neither
     // events.backend_exec_* nor jobs.backend_exec_*), but the bump is
-    // required so jobctl commit-work on this host doesn't fail-loud
+    // required so keeper-py's Python readers (e.g. `planctl
+    // render-approve-context`) on this host don't fail-loud
     // (test/schema-version.test.ts enforces).
     addColumnIfMissing(db, "events", "backend_exec_type", "TEXT");
     addColumnIfMissing(db, "events", "backend_exec_session_id", "TEXT");
@@ -4999,8 +5000,8 @@ function migrate(db: Database): void {
     //
     // No ALTER step here. The bump's purpose is the cross-language
     // version-gate handshake: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
-    // adds 49 in the SAME change so `jobctl commit-work` (and
-    // `planctl render-approve-context`'s `get_epic` read) continue to
+    // adds 49 in the SAME change so keeper-py's Python readers
+    // (`planctl render-approve-context`'s `get_epic` read) continue to
     // pass after the daemon stamps v49 on this host. test/schema-
     // version.test.ts enforces. The reducer's `foldCommit` per-session
     // arm grows a new write site (the link stamp); a cursor=0 re-fold
@@ -5040,7 +5041,7 @@ function migrate(db: Database): void {
     // bump is whitelist-only on the Python side (`api.py`'s
     // `SUPPORTED_SCHEMA_VERSIONS` frozenset adds 50 in the same change
     // — test/schema-version.test.ts enforces; a missing bump fails
-    // every `jobctl commit-work` host-wide).
+    // every keeper-py Python read host-wide).
 
     // v50→v51: fn-682 — live monitors projection. Adds the sparse
     // `events.background_task_id TEXT` deriver column (NULL on every
@@ -5137,8 +5138,9 @@ function migrate(db: Database): void {
     // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS
     // adds 51 in the same change — whitelist-only (keeper-py reads
     // neither `events.background_task_id` nor `jobs.monitors`), but
-    // the bump is required so `jobctl commit-work` on this host
-    // doesn't fail-loud (test/schema-version.test.ts enforces).
+    // the bump is required so keeper-py's Python readers (e.g.
+    // `planctl render-approve-context`) on this host don't fail-loud
+    // (test/schema-version.test.ts enforces).
 
     // v51→v52: fn-686 — surface "session blocked on a Claude Code
     // permission dialog or MCP elicitation prompt" as a two-field signal
@@ -5231,7 +5233,8 @@ function migrate(db: Database): void {
     // adds 52 in the same change — whitelist-only (keeper-py reads
     // neither of the new `last_permission_prompt_*` columns; the pill
     // surfaces only through the board renderer), but the bump is
-    // required so `jobctl commit-work` on this host doesn't fail-loud
+    // required so keeper-py's Python readers (e.g. `planctl
+    // render-approve-context`) on this host don't fail-loud
     // (test/schema-version.test.ts enforces).
 
     // v52→v53: fn-688 — `epic_tombstones` projection table guards every
@@ -5289,8 +5292,9 @@ function migrate(db: Database): void {
     // adds 53 in the same change — whitelist-only (keeper-py reads
     // neither `epic_tombstones` nor any guarded shell-INSERT site; the
     // board renderer is the only consumer affected by the ghost-row
-    // fix), but the bump is required so `jobctl commit-work` on this
-    // host doesn't fail-loud (test/schema-version.test.ts enforces).
+    // fix), but the bump is required so keeper-py's Python readers
+    // (e.g. `planctl render-approve-context`) on this host don't
+    // fail-loud (test/schema-version.test.ts enforces).
 
     // v53→v54: fn-695 (T3) — durable commit-derived creator/refiner
     // edges. The reducer's `syncPlanctlLinks` now derives the
@@ -5323,7 +5327,8 @@ function migrate(db: Database): void {
     // adds 54 in the SAME change — whitelist-only (keeper-py reads
     // neither the edge cells nor the commit-trailer payload; the board
     // renderer is the only consumer), but the bump is required so
-    // `jobctl commit-work` on this host doesn't fail-loud
+    // keeper-py's Python readers (e.g. `planctl render-approve-context`)
+    // on this host don't fail-loud
     // (test/schema-version.test.ts enforces).
 
     // v54→v55: fn-710 (T2) — drop the two dead
@@ -5346,8 +5351,9 @@ function migrate(db: Database): void {
     //
     // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 55
     // in the SAME change — whitelist-only (keeper-py reads neither column),
-    // but the bump is required so `jobctl commit-work` on this host doesn't
-    // fail-loud (test/schema-version.test.ts enforces).
+    // but the bump is required so keeper-py's Python readers (e.g. `planctl
+    // render-approve-context`) on this host don't fail-loud
+    // (test/schema-version.test.ts enforces).
     dropColumnIfPresent(db, "jobs", "backend_exec_tab_id");
     dropColumnIfPresent(db, "jobs", "backend_exec_tab_name");
 
@@ -5407,7 +5413,8 @@ function migrate(db: Database): void {
     // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 56
     // in the SAME change — whitelist-only (keeper-py reads neither the
     // column nor the predicate), but the bump is required so
-    // `jobctl commit-work` on this host doesn't fail-loud
+    // keeper-py's Python readers (e.g. `planctl render-approve-context`)
+    // on this host don't fail-loud
     // (test/schema-version.test.ts enforces).
     if (preMigrateStoredVersion < 56) {
       const xinfoCols = db.prepare("PRAGMA table_xinfo(epics)").all() as {

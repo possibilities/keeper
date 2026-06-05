@@ -263,7 +263,7 @@ export interface CommitMessage {
    * `%(trailers:key=Task,valueonly,unfold,separator=%x00)`. Multi-
    * valued by design — `Task:` is collect-all, distinct from
    * {@link committer_session_id} which is take-last canonical — so
-   * one `jobctl commit-work` closing two tasks lights both entries.
+   * one `keeper commit-work` closing two tasks lights both entries.
    * Empty `[]` on the common path (no `Task:` trailer present, or
    * every collected value was malformed). Rides the {@link
    * daemon.ts:onmessage} spread-serialize into the synthetic `Commit`

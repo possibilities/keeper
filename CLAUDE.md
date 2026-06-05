@@ -117,8 +117,9 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   change** — the Python reader (used by `planctl render-approve-context`;
   `keeper commit-work` reads the DB directly via `src/db.ts` now, not
   keeper-py) is a hard whitelist, not a floor/ceiling, and gates loud on
-  any unrecognized version, failing *every* `commit-work` on the host until
-  updated. Additive bumps keeper-py never reads still must
+  any unrecognized version, failing *every* keeper-py Python read (e.g.
+  `planctl render-approve-context`) on the host until updated. Additive
+  bumps keeper-py never reads still must
   be listed; `test/schema-version.test.ts` enforces it.
 - **Commit discharge is content-aware (schema v45 / fn-664.2).** The
   `GitSnapshot` payload's `dirty_files[]` carries per-file
