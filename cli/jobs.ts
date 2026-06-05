@@ -78,7 +78,9 @@ import {
   apiErrorPillSeg,
   colorizePillsInLine,
   inputRequestPillSeg,
+  JOBS_PILL_LEGEND,
   permissionPromptPillSeg,
+  pillOrEmpty,
   planVerbLabel,
   renderDeadLetterPill,
   sendReplayDeadLetterRpc,
@@ -133,20 +135,28 @@ Sessions render in first-seen wire order.
 
 Row shape:
 
-  ({basename(cwd)}) {title} [{role}]? [{state}]{[failed:<kind>]}?
+  ({basename(cwd)}) {title} [{role}]? [{state}]?{[failed:<kind>]}?
     [awaiting:<kind>]?                     (always-visible continuation line)
     [{tab} p{pane}]?                       (collapse-controlled, when expanded)
-    [{kind}] {command|description|id} [{status}]?  (per live monitor, v51)
-    {subagent_type}({annotations})?: {description} [{status}]   (per sub-agent)
+    [{kind}] {command|description|id}      (per live monitor, v51)
+    {subagent_type}({annotations})?: {description} [{status}]?  (per sub-agent)
+
+Pills show only non-resting states (fn-708 omit-default). The [state]
+pill is OMITTED for a session at rest — absence ⇒ stopped; only
+working / ended / killed render a pill. A sub-agent line omits its
+[status] pill when the status is ok (absence ⇒ ok); the live-monitor
+line carries no status slot today (the projection never populates it).
+A persistent footer legend states the convention. [failed:<kind>] stays
+inline.
 
 The optional [awaiting:<kind>] pill drops to its own indented
 continuation line beneath the row so a long-running interactive stop
-reads without wrapping; [state] / [failed:<kind>] stay inline. Nested
-sub-agent lines collapse same-name invocations within one job to a
-single line representing the most-recent (max turn_seq) row; (×N) and
-'N stuck' annotations surface the folded count and any non-surviving
-'running' rows. Sub-agent lines are COLLAPSE-BY-DEFAULT — hidden until
-their job is expanded (space, in insert mode).
+reads without wrapping. Nested sub-agent lines collapse same-name
+invocations within one job to a single line representing the most-recent
+(max turn_seq) row; (×N) and 'N stuck' annotations surface the folded
+count and any non-surviving 'running' rows. Sub-agent lines are
+COLLAPSE-BY-DEFAULT — hidden until their job is expanded (space, in
+insert mode).
 
 A persistent [dead-letter:N] warn pill stamps in the banner whenever the
 daemon's dead_letters collection has waiting rows (events the hook
@@ -160,6 +170,12 @@ shared helper). An empty section renders as NOTHING — neither its
 heading nor a placeholder — when its partition is empty. A new
 frame prints only when the rendered body changes; the dead-letter
 banner re-stamps on every snapshot regardless of body stability.
+
+A single-source footer legend (the JOBS_PILL_LEGEND constant) is
+appended to the body on every frame — spacer-separated, after the last
+job row — so the omit-default convention is documented in BOTH the live
+frame and the piped/sidecar output. It rides even the empty ('no jobs')
+frame.
 
 Sidecars: three indexed files per emitted frame
 (/tmp/keeper-jobs.<pid>.state.<n>.json, .frame.<n>.txt, .diff.<n>.txt)
@@ -175,7 +191,7 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
  * `test/jobs.test.ts` can assert the row shape directly without standing
  * up the subscribe loop.
  *
- * Shape: `({cwd-basename}) {title} [{role}]? [{state}]{[failed:<kind>]}?`
+ * Shape: `({cwd-basename}) {title} [{role}]? [{state}]?{[failed:<kind>]}?`
  * with the optional `[awaiting:<kind>]` segment dropped onto a continuation
  * line (two-space indent — same depth as the row's sub-agent lines, which
  * are appended by the caller via `subagentLinesFor`). The `(cwd)` prefix
@@ -188,6 +204,11 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
  * in insert mode (alongside sub-agent lines). The `[awaiting:<kind>]`
  * continuation line, by contrast, stays always-visible: an awaiting prompt
  * is something the human needs to see at a glance.
+ *
+ * fn-708 (T1, J2): the `[state]` pill is omit-default — `stopped` (a
+ * session at rest, the common idle-worker case) renders NO pill; absence
+ * ≡ `stopped`, recoverable via the {@link JOBS_PILL_LEGEND} footer.
+ * `working` / `ended` / `killed` still render verbatim.
  */
 export function projectJobRow(row: Record<string, unknown>): string {
   const title = seg(row.title);
@@ -207,7 +228,7 @@ export function projectJobRow(row: Record<string, unknown>): string {
     row.last_permission_prompt_at,
     row.last_permission_prompt_kind,
   );
-  const head = `${cwdSeg}${title}${roleSeg} [${seg(row.state)}]${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
+  const head = `${cwdSeg}${title}${roleSeg}${pillOrEmpty(row.state, "stopped")}${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
   // Continuation lines under the head, at the 2-space depth shared with
   // sub-agent lines. Only the always-visible `awaiting` pills ride here;
   // the backend-coords pill moved out to `renderJobsBody`'s
@@ -274,18 +295,23 @@ const GLYPH_EXPANDED = "\uf0d7"; // nf-fa-caret_down (U+F0D7) ▾
  * / `ambient` (Monitor tool / Bash `run_in_background` / plugin- or
  * harness-armed).
  *
- * Output shape per entry: `<indent>[<kind>] <label>[ <status-pill>]`.
- * `<label>` prefers `command`, falls back to `description`, falls back
- * to the entry's id (the only field guaranteed to be present in the
- * task-1 projection — the richer `command` / `description` / `status`
- * fields are read defensively so this helper renders correctly the
- * moment a future projection-enrichment carries them through). A
- * multi-line command (1KB+ heredocs exist in the wild) collapses to
- * the FIRST non-empty line so the row stays one terminal line tall;
- * the spec's "truncate to one line" risk is per-monitor, never
- * propagated upward. `status` is bracketed as `[status]` for the
- * pill colorizer; absent / empty `status` drops the trailing slot
- * entirely.
+ * Output shape per entry: `<indent>[<kind>] <label>`. `<label>` prefers
+ * `command`, falls back to `description`, falls back to the entry's id
+ * (the only field guaranteed to be present in the task-1 projection —
+ * the richer `command` / `description` fields are read defensively so
+ * this helper renders correctly the moment a future projection-enrichment
+ * carries them through). A multi-line command (1KB+ heredocs exist in the
+ * wild) collapses to the FIRST non-empty line so the row stays one
+ * terminal line tall; the spec's "truncate to one line" risk is
+ * per-monitor, never propagated upward.
+ *
+ * fn-708 (J7): the trailing `[status]` slot is DROPPED — the task-1
+ * `computeMonitors` projection never populates `monitors[].status`, so the
+ * slot rendered as pure latent noise (always absent → never visible
+ * anyway). RESTORE the slot when the projection actually carries a
+ * non-null `status`: re-add `const status = typeof e.status === "string" ?
+ * e.status : ""` and append `${status === "" ? "" : ` [${status}]`}` to
+ * the pushed line so the pill colorizer tints it.
  *
  * Pure function of `monitorsJson` + `indent` — no SGR codes baked in
  * (the colorize-at-render convention; `colorizePillsInLine` paints
@@ -337,9 +363,10 @@ export function monitorLinesFor(
           : id !== ""
             ? id
             : "(unknown)";
-    const status = typeof e.status === "string" ? e.status : "";
-    const statusSeg = status === "" ? "" : ` [${status}]`;
-    lines.push(`${indent}[${kind}] ${label}${statusSeg}`);
+    // fn-708 (J7): no `[status]` slot — the projection never populates it.
+    // See the JSDoc above for the restore recipe when `monitors[].status`
+    // lands.
+    lines.push(`${indent}[${kind}] ${label}`);
   }
   return lines;
 }
@@ -554,6 +581,22 @@ export function renderJobsBody(
     sections.push([decorateHeadingOrChild(heading), ...blocks].join("\n"));
   }
   return sections.join("\n");
+}
+
+/**
+ * fn-708: append the omit-default footer legend to the jobs body lines.
+ * Pure `f(bodyLines) → bodyLines` so `test/jobs.test.ts` can assert the
+ * legend reaches `bodyLines` (the frame text `src/view-shell.ts`'s `emit`
+ * byte-compares and `sidecarFrameText` mirrors into piped output) without
+ * standing up the subscribe loop. A blank spacer separates the legend from
+ * the last job row; the legend itself is the single-source
+ * {@link JOBS_PILL_LEGEND} constant from `src/board-render.ts`, so the
+ * absence-encodes-default convention can never drift from the renderer.
+ * Mirrors `cli/board.ts:appendBoardLegend` so both TUIs carry the legend in
+ * live + sidecar output identically.
+ */
+export function appendJobsLegend(bodyLines: string[]): string[] {
+  return [...bodyLines, "", JOBS_PILL_LEGEND];
 }
 
 export async function main(argv: string[]): Promise<void> {
@@ -859,7 +902,14 @@ export async function main(argv: string[]): Promise<void> {
         { insertMode, selectedIndex, expanded },
       );
       return {
-        bodyLines: body === "" ? ["no jobs"] : body.split("\n"),
+        // fn-708: the omit-default footer legend rides `bodyLines` (NOT
+        // `liveShell.setStatus`) so it lands in BOTH the live frame and the
+        // piped/sidecar frame text (`bodyLines` is the byte-compared frame
+        // text — see `src/view-shell.ts`). It rides even the empty-board
+        // ("no jobs") frame so the convention is always documented.
+        bodyLines: appendJobsLegend(
+          body === "" ? ["no jobs"] : body.split("\n"),
+        ),
         // State JSON carries the inputs this view actually rendered
         // against — jobs (the row source), subagentInvocations (the
         // nested-line source), and the dead-letter backlog (the banner

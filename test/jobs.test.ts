@@ -16,13 +16,18 @@
 
 import { expect, test } from "bun:test";
 import {
+  appendJobsLegend,
   backendCoordsSeg,
   monitorLinesFor,
   projectJobRow,
   renderJobsBody,
   selectableJobIds,
 } from "../cli/jobs";
-import { colorizePillsInLine, renderDeadLetterPill } from "../src/board-render";
+import {
+  colorizePillsInLine,
+  JOBS_PILL_LEGEND,
+  renderDeadLetterPill,
+} from "../src/board-render";
 import type { SubagentInvocation } from "../src/types";
 import { SELECTED_LINE_PREFIX } from "../src/view-shell";
 
@@ -75,8 +80,10 @@ test("projectJobRow: null cwd drops the (cwd) prefix entirely", () => {
     plan_verb: null,
     state: "stopped",
   });
-  // No leading "() " — the empty basename suppresses the prefix.
-  expect(line).toBe("ambient session [stopped]");
+  // No leading "() " — the empty basename suppresses the prefix. fn-708:
+  // `stopped` is the resting state, so its pill is omitted (absence ⇒
+  // stopped) — the row carries no [state] pill at all.
+  expect(line).toBe("ambient session");
 });
 
 test("projectJobRow: null plan_verb suppresses the [role] pill", () => {
@@ -100,7 +107,9 @@ test("projectJobRow: last_api_error_at appends [failed:<kind>] inline (same line
     last_api_error_at: 12345,
     last_api_error_kind: "rate_limit",
   });
-  expect(line).toBe("(x) rate-limited [planner] [stopped] [failed:rate_limit]");
+  // fn-708: `stopped` is the resting state → its pill is omitted; the
+  // [failed:<kind>] pill stays inline.
+  expect(line).toBe("(x) rate-limited [planner] [failed:rate_limit]");
 });
 
 test("projectJobRow: last_input_request_at drops [awaiting:<kind>] onto its own continuation line", () => {
@@ -113,10 +122,9 @@ test("projectJobRow: last_input_request_at drops [awaiting:<kind>] onto its own 
     last_input_request_kind: "ask_user_question",
   });
   // Continuation line indented two spaces (matches the depth of the
-  // row's sub-agent lines, which the caller appends below).
-  expect(line).toBe(
-    "(x) asking [worker] [stopped]\n  [awaiting:ask_user_question]",
-  );
+  // row's sub-agent lines, which the caller appends below). fn-708:
+  // `stopped` state pill is omitted (absence ⇒ stopped).
+  expect(line).toBe("(x) asking [worker]\n  [awaiting:ask_user_question]");
 });
 
 test("projectJobRow: backend coords NEVER appear in the per-row output (collapse-controlled)", () => {
@@ -156,8 +164,25 @@ test("projectJobRow: awaiting drops to its own continuation line; backend never 
   });
   // Head + always-visible awaiting line only. The backend pill is
   // collapse-controlled and lives in `renderJobsBody`'s expanded region.
-  expect(line).toBe(
-    "(x) asking [worker] [stopped]\n  [awaiting:ask_user_question]",
+  // fn-708: `stopped` state pill is omitted (absence ⇒ stopped).
+  expect(line).toBe("(x) asking [worker]\n  [awaiting:ask_user_question]");
+});
+
+test("projectJobRow: non-resting state renders verbatim; stopped omits the pill", () => {
+  // The omit-default rule (J2) fires ONLY at `stopped`; working / ended /
+  // killed all still render a pill verbatim.
+  expect(projectJobRow({ title: "a", plan_verb: null, state: "working" })).toBe(
+    "a [working]",
+  );
+  expect(projectJobRow({ title: "a", plan_verb: null, state: "ended" })).toBe(
+    "a [ended]",
+  );
+  expect(projectJobRow({ title: "a", plan_verb: null, state: "killed" })).toBe(
+    "a [killed]",
+  );
+  // `stopped` (the resting state) drops the pill entirely.
+  expect(projectJobRow({ title: "a", plan_verb: null, state: "stopped" })).toBe(
+    "a",
   );
 });
 
@@ -365,7 +390,8 @@ test("renderJobsBody: multiple sessions render in first-seen wire order", () => 
       "--- session-b ---",
       "(b) b-job [working]",
       "--- session-a ---",
-      "(a) a-job [worker] [stopped]",
+      // fn-708: `stopped` state pill omitted (absence ⇒ stopped).
+      "(a) a-job [worker]",
     ].join("\n"),
   );
 });
@@ -447,7 +473,8 @@ test("renderJobsBody: interleaved sessions split into per-session sections, in f
       "(a1) a-first [working]",
       "(a2) a-second [working]",
       "--- session-b ---",
-      "(b1) b-first [worker] [stopped]",
+      // fn-708: `stopped` state pill omitted (absence ⇒ stopped).
+      "(b1) b-first [worker]",
     ].join("\n"),
   );
 });
@@ -591,7 +618,8 @@ test("renderJobsBody: awaiting line stays always-visible (NOT collapse-controlle
   expect(body).toBe(
     [
       "--- ada ---",
-      "(x) asking [worker] [stopped]",
+      // fn-708: `stopped` state pill omitted (absence ⇒ stopped).
+      "(x) asking [worker]",
       "  [awaiting:ask_user_question]",
     ].join("\n"),
   );
@@ -829,9 +857,11 @@ test("colorizePillsInLine: dead-letter:<N> takes the warn bucket via prefix fall
 
 // ---------------------------------------------------------------------------
 // monitorLinesFor — schema v51 / fn-682 per-job live-monitors rendering.
-// Pure JSON-parse with `[]` fallback; renders `[<kind>] <label>[ [<status>]]`
-// per entry. `label` prefers `command`, falls back to `description`, falls
-// back to `id`. A multi-line `command` truncates to its first non-empty line.
+// Pure JSON-parse with `[]` fallback; renders `[<kind>] <label>` per entry
+// (fn-708 J7: the trailing [status] slot is dropped — the projection never
+// populates it). `label` prefers `command`, falls back to `description`,
+// falls back to `id`. A multi-line `command` truncates to its first non-empty
+// line.
 // Today's task-1 projection ships only `{id, kind}` so most production rows
 // render with `id` as the label, but the helper is built to render the
 // future enrichment correctly the moment the projection grows.
@@ -865,7 +895,9 @@ test("monitorLinesFor: empty / missing / malformed JSON → no lines", () => {
 test("monitorLinesFor: future-enriched entry — command preferred over description over id", () => {
   // Future projection shape: the deriver lifts command/description/status
   // off the raw event payload alongside id+kind. The helper renders the
-  // richest available label without needing a separate code path.
+  // richest available label without needing a separate code path. fn-708
+  // (J7): the trailing [status] slot is DROPPED — the projection never
+  // populates `status`, so even a present status renders no pill.
   const json = JSON.stringify([
     {
       id: "b1",
@@ -876,7 +908,7 @@ test("monitorLinesFor: future-enriched entry — command preferred over descript
     },
   ]);
   expect(monitorLinesFor(json, "  ")).toEqual([
-    "  [ambient] chatctl watch-chat [running]",
+    "  [ambient] chatctl watch-chat",
   ]);
 });
 
@@ -890,9 +922,8 @@ test("monitorLinesFor: empty command falls back to description (per spec)", () =
       status: "running",
     },
   ]);
-  expect(monitorLinesFor(json, "  ")).toEqual([
-    "  [monitor] chatctl bus [running]",
-  ]);
+  // fn-708 (J7): no [status] slot — see above.
+  expect(monitorLinesFor(json, "  ")).toEqual(["  [monitor] chatctl bus"]);
 });
 
 test("monitorLinesFor: missing command + missing description falls back to id", () => {
@@ -908,19 +939,23 @@ test("monitorLinesFor: multi-line command truncates to FIRST non-empty line", ()
   const json = JSON.stringify([
     { id: "b1", kind: "bash-bg", command: heredoc, status: "running" },
   ]);
-  expect(monitorLinesFor(json, "  ")).toEqual([
-    "  [bash-bg]   cat <<'EOF' [running]",
-  ]);
+  // fn-708 (J7): no [status] slot — only the first-non-empty command line.
+  expect(monitorLinesFor(json, "  ")).toEqual(["  [bash-bg]   cat <<'EOF'"]);
 });
 
-test("monitorLinesFor: missing / empty status drops the trailing [status] slot", () => {
+test("monitorLinesFor: status is never rendered (J7 dead slot dropped)", () => {
+  // fn-708 (J7): the projection never populates `status` today, so the
+  // slot is dropped unconditionally — a present status produces no pill,
+  // and a missing/empty status is identical (no trailing slot ever).
   const json = JSON.stringify([
     { id: "b1", kind: "ambient", command: "chatctl watch-chat" },
     { id: "b2", kind: "ambient", command: "echo hi", status: "" },
+    { id: "b3", kind: "ambient", command: "echo bye", status: "running" },
   ]);
   expect(monitorLinesFor(json, "  ")).toEqual([
     "  [ambient] chatctl watch-chat",
     "  [ambient] echo hi",
+    "  [ambient] echo bye",
   ]);
 });
 
@@ -1027,4 +1062,30 @@ test("renderJobsBody: empty / missing monitors blob renders no Monitors section"
       ["--- ada ---", "(x) ambient [working]", "  [main p11]"].join("\n"),
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// appendJobsLegend — fn-708: the omit-default footer legend reaches
+// `bodyLines` (the frame text view-shell byte-compares for the live frame +
+// mirrors into the piped/sidecar frame text). `appendJobsLegend` is the
+// exported pure seam `renderBody` calls; asserting it pins "legend present
+// in live + sidecar" without standing up the subscribe loop.
+// ---------------------------------------------------------------------------
+
+test("appendJobsLegend: appends the single-source legend (spacer-separated) to bodyLines", () => {
+  const out = appendJobsLegend(["--- ada ---", "(x) ambient [working]"]);
+  // The body is preserved verbatim, then a blank spacer, then the legend.
+  expect(out).toEqual([
+    "--- ada ---",
+    "(x) ambient [working]",
+    "",
+    JOBS_PILL_LEGEND,
+  ]);
+  expect(out.at(-1)).toBe(JOBS_PILL_LEGEND);
+});
+
+test("appendJobsLegend: legend rides even the empty ('no jobs') frame", () => {
+  const out = appendJobsLegend(["no jobs"]);
+  expect(out).toContain(JOBS_PILL_LEGEND);
+  expect(out.at(-1)).toBe(JOBS_PILL_LEGEND);
 });
