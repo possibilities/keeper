@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-06-05T15:00:11.135827Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Shared epic-materialized gate on board and autopilot",
-  "updated_at": "2026-06-05T20:05:08.617489Z",
+  "updated_at": "2026-06-05T20:07:23.145971Z",
   "worker_done_at": "2026-06-05T20:05:08.617489Z"
 }
