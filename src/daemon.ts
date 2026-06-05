@@ -1083,10 +1083,16 @@ function runDaemon(): void {
 
   // Worker `error` event is NOT a message — it signals the worker thread itself
   // failed. Per the single-recovery-path policy: crash → exit 1 → launchd
-  // restarts. Do NOT attempt to respawn the worker in-process.
+  // restarts. Do NOT attempt to respawn the worker in-process. The
+  // `!shuttingDown` guard mirrors the `close` handler below (and every other
+  // worker's onerror): once shutdown() is underway a worker erroring
+  // mid-teardown is moot — the worker-exit race in shutdown() already
+  // backstops a wedge — so it must NOT clobber the clean `exit(0)`. Without
+  // it, a SIGTERM landing while a worker was mid-operation intermittently
+  // failed the integration suite (daemon exited 1, not 0) under parallel load.
   worker.onerror = (err: ErrorEvent): void => {
     console.error("[keeperd] wake worker error:", err.message ?? err);
-    fatalExit();
+    if (!shuttingDown) fatalExit();
   };
 
   // A worker `process.exit(1)` (e.g. its own fatalExit) fires `close`, NOT
@@ -1352,7 +1358,7 @@ function runDaemon(): void {
   // 1 → launchd restart. No in-process respawn.
   serverWorker.onerror = (err: ErrorEvent): void => {
     console.error("[keeperd] server worker error:", err.message ?? err);
-    fatalExit();
+    if (!shuttingDown) fatalExit();
   };
 
   // Same crash-via-`close` gap as the wake worker: a server-worker
@@ -1559,7 +1565,7 @@ function runDaemon(): void {
   // Same crash policy as the other workers: any thread failure → fatalExit.
   transcriptWorker.onerror = (err: ErrorEvent): void => {
     console.error("[keeperd] transcript worker error:", err.message ?? err);
-    fatalExit();
+    if (!shuttingDown) fatalExit();
   };
 
   // Same crash-via-`close` gap: a transcript-worker `process.exit(1)` fires
@@ -1712,7 +1718,7 @@ function runDaemon(): void {
   // Same crash policy as the other workers: any thread failure → fatalExit.
   planWorker.onerror = (err: ErrorEvent): void => {
     console.error("[keeperd] plan worker error:", err.message ?? err);
-    fatalExit();
+    if (!shuttingDown) fatalExit();
   };
 
   // Same crash-via-`close` gap: a plan-worker `process.exit(1)` fires `close`,
@@ -1830,7 +1836,7 @@ function runDaemon(): void {
   // Same crash policy as the other workers: any thread failure → fatalExit.
   exitWorker.onerror = (err: ErrorEvent): void => {
     console.error("[keeperd] exit-watcher worker error:", err.message ?? err);
-    fatalExit();
+    if (!shuttingDown) fatalExit();
   };
 
   // Same crash-via-`close` gap: an exit-watcher `process.exit(1)` fires
@@ -1958,7 +1964,7 @@ function runDaemon(): void {
 
   gitWorker.onerror = (err: ErrorEvent): void => {
     console.error("[keeperd] git worker error:", err.message ?? err);
-    fatalExit();
+    if (!shuttingDown) fatalExit();
   };
 
   gitWorker.addEventListener("close", () => {
@@ -2052,7 +2058,7 @@ function runDaemon(): void {
 
   usageWorker.onerror = (err: ErrorEvent): void => {
     console.error("[keeperd] usage worker error:", err.message ?? err);
-    fatalExit();
+    if (!shuttingDown) fatalExit();
   };
 
   usageWorker.addEventListener("close", () => {
@@ -2114,7 +2120,7 @@ function runDaemon(): void {
   // Same crash policy as the other workers: any thread failure → fatalExit.
   deadLetterWorker.onerror = (err: ErrorEvent): void => {
     console.error("[keeperd] dead-letter worker error:", err.message ?? err);
-    fatalExit();
+    if (!shuttingDown) fatalExit();
   };
 
   // Same crash-via-`close` gap: a dead-letter-worker `process.exit(1)`
@@ -2527,7 +2533,7 @@ function runDaemon(): void {
   // fatalExit → exit 1 → launchd restart.
   autopilotWorkerInstance.onerror = (err: ErrorEvent): void => {
     console.error("[keeperd] autopilot worker error:", err.message ?? err);
-    fatalExit();
+    if (!shuttingDown) fatalExit();
   };
 
   // Same crash-via-`close` gap as every other worker: a
@@ -2564,7 +2570,7 @@ function runDaemon(): void {
 
   restoreWorker.onerror = (err: ErrorEvent): void => {
     console.error("[keeperd] restore worker error:", err.message ?? err);
-    fatalExit();
+    if (!shuttingDown) fatalExit();
   };
 
   restoreWorker.addEventListener("close", () => {
