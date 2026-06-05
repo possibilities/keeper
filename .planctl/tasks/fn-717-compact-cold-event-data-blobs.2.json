@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-06-05T20:25:42.908755Z",
   "depends_on": [
@@ -11,6 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Compaction pass relocates cold blobs",
-  "updated_at": "2026-06-05T22:28:55.927199Z",
+  "updated_at": "2026-06-05T22:37:49.711542Z",
   "worker_done_at": "2026-06-05T22:28:55.927199Z"
 }
