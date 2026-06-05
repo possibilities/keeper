@@ -32,6 +32,7 @@ import {
   classifyTargetId,
   evaluateAwaitCondition,
   gitCleanState,
+  monitorRunningState,
   workable,
 } from "../src/await-conditions";
 import { computeReadiness, type Verdict } from "../src/readiness";
@@ -823,6 +824,7 @@ function makeJob(overrides: Partial<Job>): Job {
     git_dirty_count: 0,
     git_unattributed_to_live_count: 0,
     git_orphan_count: 0,
+    monitors: null,
     ...overrides,
   } as Job;
 }
@@ -933,4 +935,169 @@ test("agents-idle: working job OUTSIDE root → met", () => {
     makeJob({ job_id: "other", state: "working", cwd: "/elsewhere" }),
   ];
   expect(agentsIdleState("/repo", "me", jobs).kind).toBe("met");
+});
+
+// ---------------------------------------------------------------------------
+// monitor-running pure predicate (fn-718) — own-session liveness, EXACT match
+// ---------------------------------------------------------------------------
+
+test("monitor-running: own-session matching monitor present → waiting", () => {
+  const jobs = [
+    makeJob({
+      job_id: "me",
+      monitors: JSON.stringify([
+        { id: "m1", kind: "bash-bg", command: "watch.sh" },
+      ]),
+    }),
+  ];
+  expect(monitorRunningState("me", { command: "watch.sh" }, jobs).kind).toBe(
+    "waiting",
+  );
+});
+
+test("monitor-running: own-session no matching monitor → met (done)", () => {
+  const jobs = [
+    makeJob({
+      job_id: "me",
+      monitors: JSON.stringify([
+        { id: "m1", kind: "bash-bg", command: "other.sh" },
+      ]),
+    }),
+  ];
+  expect(monitorRunningState("me", { command: "watch.sh" }, jobs).kind).toBe(
+    "met",
+  );
+});
+
+test("monitor-running: kind-match present → waiting (works without command)", () => {
+  const jobs = [
+    makeJob({
+      job_id: "me",
+      monitors: JSON.stringify([{ id: "m1", kind: "monitor" }]),
+    }),
+  ];
+  expect(monitorRunningState("me", { kind: "monitor" }, jobs).kind).toBe(
+    "waiting",
+  );
+});
+
+test("monitor-running: kind-match absent → met (done)", () => {
+  const jobs = [
+    makeJob({
+      job_id: "me",
+      monitors: JSON.stringify([{ id: "m1", kind: "bash-bg" }]),
+    }),
+  ];
+  expect(monitorRunningState("me", { kind: "monitor" }, jobs).kind).toBe("met");
+});
+
+test("monitor-running: both kind AND command must match (AND) → waiting", () => {
+  const jobs = [
+    makeJob({
+      job_id: "me",
+      monitors: JSON.stringify([
+        { id: "m1", kind: "bash-bg", command: "watch.sh" },
+      ]),
+    }),
+  ];
+  expect(
+    monitorRunningState("me", { kind: "bash-bg", command: "watch.sh" }, jobs)
+      .kind,
+  ).toBe("waiting");
+  // Same command, WRONG kind → no match → met.
+  expect(
+    monitorRunningState("me", { kind: "monitor", command: "watch.sh" }, jobs)
+      .kind,
+  ).toBe("met");
+});
+
+test("monitor-running: prefix collision does NOT match (exact command only)", () => {
+  // selector `my-script` must NOT match the running `my-script-v2`.
+  const jobs = [
+    makeJob({
+      job_id: "me",
+      monitors: JSON.stringify([
+        { id: "m1", kind: "bash-bg", command: "my-script-v2" },
+      ]),
+    }),
+  ];
+  expect(monitorRunningState("me", { command: "my-script" }, jobs).kind).toBe(
+    "met",
+  );
+});
+
+test("monitor-running: a DIFFERENT session's matching monitor is ignored (own-session scope)", () => {
+  const jobs = [
+    makeJob({
+      job_id: "other",
+      monitors: JSON.stringify([
+        { id: "m1", kind: "bash-bg", command: "watch.sh" },
+      ]),
+    }),
+    makeJob({ job_id: "me", monitors: JSON.stringify([]) }),
+  ];
+  expect(monitorRunningState("me", { command: "watch.sh" }, jobs).kind).toBe(
+    "met",
+  );
+});
+
+test("monitor-running: terminal own job with monitors='[]' → met", () => {
+  const jobs = [
+    makeJob({ job_id: "me", state: "ended", monitors: JSON.stringify([]) }),
+  ];
+  expect(monitorRunningState("me", { command: "watch.sh" }, jobs).kind).toBe(
+    "met",
+  );
+});
+
+test("monitor-running: malformed monitors JSON → met (safe, no throw)", () => {
+  const jobs = [makeJob({ job_id: "me", monitors: "{not valid json" })];
+  expect(() =>
+    monitorRunningState("me", { command: "watch.sh" }, jobs),
+  ).not.toThrow();
+  expect(monitorRunningState("me", { command: "watch.sh" }, jobs).kind).toBe(
+    "met",
+  );
+});
+
+test("monitor-running: monitors JSON not an array → met (safe)", () => {
+  const jobs = [makeJob({ job_id: "me", monitors: JSON.stringify({ x: 1 }) })];
+  expect(monitorRunningState("me", { command: "watch.sh" }, jobs).kind).toBe(
+    "met",
+  );
+});
+
+test("monitor-running: own job's monitors null → met (done)", () => {
+  const jobs = [makeJob({ job_id: "me", monitors: null })];
+  expect(monitorRunningState("me", { command: "watch.sh" }, jobs).kind).toBe(
+    "met",
+  );
+});
+
+test("monitor-running: own job absent from rows → met (vacuously done)", () => {
+  const jobs = [
+    makeJob({
+      job_id: "other",
+      monitors: JSON.stringify([
+        { id: "m1", kind: "bash-bg", command: "watch.sh" },
+      ]),
+    }),
+  ];
+  expect(monitorRunningState("me", { command: "watch.sh" }, jobs).kind).toBe(
+    "met",
+  );
+});
+
+test("monitor-running: ownSessionId null → met (no own row, vacuously done)", () => {
+  const jobs = [
+    makeJob({
+      job_id: "me",
+      monitors: JSON.stringify([
+        { id: "m1", kind: "bash-bg", command: "watch.sh" },
+      ]),
+    }),
+  ];
+  expect(monitorRunningState(null, { command: "watch.sh" }, jobs).kind).toBe(
+    "met",
+  );
 });

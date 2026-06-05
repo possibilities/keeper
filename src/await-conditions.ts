@@ -76,6 +76,7 @@
  * "approved"`.
  */
 
+import type { MonitorEntry } from "./derivers";
 import type { BlockReason, ReadinessSnapshot, Verdict } from "./readiness";
 import type { Epic, GitStatus, Job, Task } from "./types";
 
@@ -650,5 +651,105 @@ export function agentsIdleState(
   return {
     kind: "waiting",
     detail: `${busy} other agent(s) working in root`,
+  };
+}
+
+/**
+ * Selector for the {@link monitorRunningState} `monitor-running` predicate
+ * (fn-718). An EXACT matcher over a single {@link MonitorEntry}: a `kind`
+ * field (exact equality on the three-way provenance enum) and/or a `command`
+ * field (exact equality on the FULL command string). At least one should be
+ * set; an all-empty selector matches every entry (the CLI-wiring layer in T3
+ * is responsible for rejecting an empty selector upfront). Both set → an entry
+ * must satisfy BOTH (AND).
+ */
+export interface MonitorSelector {
+  kind?: MonitorEntry["kind"];
+  command?: string;
+}
+
+/**
+ * `monitor-running` predicate (fn-718). Answers "is a background monitor
+ * matching `selector` still running in the CALLER'S OWN session?" — the
+ * own-session binding is the chosen scope (a monitor's liveness is a
+ * per-session fact; the v51 `jobs.monitors` projection is snapshot-replaced on
+ * each Stop and drops dead entries, so absence == done).
+ *
+ * INVERTS {@link agentsIdleState}'s self-exclusion: that predicate skips
+ * `ownSessionId` to ask about OTHER agents; this one looks at ONLY the caller's
+ * own row (`job.job_id === ownSessionId`). A terminal own-session job already
+ * carries `monitors='[]'` (drop-when-dead), so the absence of a matching entry
+ * is the single source of "done" — no separate non-terminal check is needed.
+ *
+ * RUNNING (`waiting`) iff >=1 entry in the own job's `monitors` array EXACTLY
+ * matches the selector; DONE (`met`) iff zero matching entries remain (or the
+ * own job is absent / its `monitors` is null / malformed). The own job's
+ * `monitors` JSON is parsed defensively — malformed → treated as no monitors,
+ * NEVER throws (mirrors `monitorLinesFor`'s `[]` fallback). Pure: no I/O, no
+ * `Date.now()`.
+ *
+ * `ownSessionId` is `null` when `CLAUDE_CODE_SESSION_ID` is unset — there is
+ * then no own row to find, so the result is always MET (vacuously done). The
+ * arm-time "no match means already-done vs never-started" disambiguation is
+ * T3's job (the refuse-upfront pre-check), NOT this predicate's — here a
+ * no-match is uniformly `met`.
+ *
+ * SWAP POINT — match fields: the selector matches EXACTLY on `kind` and/or the
+ * FULL `command` string, never substring / `includes` / `RegExp`. The exact
+ * choice is deliberate: substring would prefix-collide (`my-script` matching
+ * `my-script-v2`), match a wrapper shell's inner command, or open a
+ * regex-injection trap. To widen later (e.g. a `description` match or a
+ * prefix-anchored command), add a field to {@link MonitorSelector} and a clause
+ * below — keep every clause an exact equality.
+ */
+export function monitorRunningState(
+  ownSessionId: string | null,
+  selector: MonitorSelector,
+  jobsRows: Iterable<Job>,
+): AwaitState {
+  if (ownSessionId === null) {
+    return { kind: "met", detail: "no own session id (vacuously done)" };
+  }
+  let ownJob: Job | undefined;
+  for (const job of jobsRows) {
+    if (job.job_id === ownSessionId) {
+      ownJob = job;
+      break;
+    }
+  }
+  if (ownJob === undefined || ownJob.monitors === null) {
+    return { kind: "met", detail: "no own monitors (done)" };
+  }
+  let entries: unknown;
+  try {
+    entries = JSON.parse(ownJob.monitors);
+  } catch {
+    // Mirror `monitorLinesFor`'s `[]` fallback — malformed JSON is treated as
+    // no monitors, never throws.
+    return { kind: "met", detail: "malformed monitors (treated as done)" };
+  }
+  if (!Array.isArray(entries)) {
+    return { kind: "met", detail: "monitors not an array (treated as done)" };
+  }
+  let matches = 0;
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== "object") {
+      continue;
+    }
+    const e = entry as Partial<MonitorEntry>;
+    if (selector.kind !== undefined && e.kind !== selector.kind) {
+      continue;
+    }
+    if (selector.command !== undefined && e.command !== selector.command) {
+      continue;
+    }
+    matches += 1;
+  }
+  if (matches === 0) {
+    return { kind: "met", detail: "no matching monitor running (done)" };
+  }
+  return {
+    kind: "waiting",
+    detail: `${matches} matching monitor(s) still running`,
   };
 }

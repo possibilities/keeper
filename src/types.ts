@@ -667,6 +667,24 @@ export interface Job {
    * the `keeper jobs` coord pill (see `cli/jobs.ts:backendCoordsSeg`).
    */
   backend_exec_pane_id: string | null;
+  /**
+   * Schema v51 / fn-682: JSON-TEXT array of the session's LIVE background
+   * monitors, snapshot-REPLACED on each `Stop` (drop-when-dead). Each entry
+   * is a {@link import("./derivers").MonitorEntry} —
+   * `{id, kind, command?, description?}` — where fn-718 (task 1) carries the
+   * `command` / `description` through from the Stop `background_tasks[]`
+   * snapshot. A terminal job (`ended` / `killed`) carries `'[]'`; a job a
+   * Stop has never enumerated carries the schema default (`'[]'`). NULL only
+   * on rows from before the v51 bump.
+   *
+   * Stays a raw TEXT scalar at the projection boundary (NOT in the
+   * collection's `jsonColumns`): `cli/jobs.ts`'s `monitorLinesFor` and the
+   * fn-718 `monitor-running` await predicate
+   * ({@link import("./await-conditions").monitorRunningState}) each parse the
+   * raw string defensively (malformed → `[]`, never throw), so no decode is
+   * forced at the wire layer for callers that don't need it.
+   */
+  monitors: string | null;
 }
 
 /**
