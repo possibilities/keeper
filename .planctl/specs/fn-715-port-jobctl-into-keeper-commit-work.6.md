@@ -47,5 +47,5 @@ returns only the shim + archival.
 - [ ] arthack lint + tests green.
 
 ## Done summary
-
+Retired the Python jobctl package: removed apps/jobctl/, scrubbed it from the uv workspace + root pyproject + uv.lock + pnpm-lock + install.sh, dropped chatctl's dead jobctl dep, and installed a thin jobctl shim (system/arthack/.local/bin/jobctl) that re-execs keeper so stale agent prompts still work. Swept docs/skills/prompts/hooks/cli-boundaries from jobctl commit-work to keeper commit-work and renamed the commit-via-jobctl-default snippet to commit-via-keeper-default. arthack lints + edited-surface tests green.
 ## Evidence
