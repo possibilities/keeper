@@ -39,6 +39,13 @@
  * advances the tail, so a daemon crash mid-scan re-reads the same
  * lines on next boot — re-mint is idempotent on the projection side
  * (the reducer's UPDATE writes the same `(tab_id, tab_name)` values).
+ *
+ * Mint-seam dedup (fn-709): on top of that fold idempotency, the
+ * consumer skips a line whose effective `(tab_id, tab_name)` already
+ * equals the joined job's projection state, BEFORE the INSERT — so fewer
+ * no-op mints reach the reducer. The fold stays idempotent; this is an
+ * optimization that keeps consecutive-dupe mints off the wire, NOT a
+ * replacement for that idempotency.
  */
 
 /**

@@ -715,6 +715,24 @@ const ZELLIJ_WATERMARK_BASENAME = ".keeperd-watermarks.json";
  * `pane_id` — confirmed via the `readLiveJobsWithCoords` row shape
  * (carries `backend_exec_session_id` alongside `backend_exec_pane_id`).
  *
+ * **Mint-seam dedup (fn-709):** a feed line whose effective
+ * `(tab_id, tab_name)` already equals the job's last-known projection
+ * state is skipped before the INSERT — the bulk of feed lines are exact
+ * consecutive repeats that fold to no-ops, yet each otherwise pays the
+ * full realtime pipeline (writer-lock INSERT → `data_version` bump →
+ * wake worker → drain → fold → kick server-/tab-namer-worker). The
+ * per-scan `liveJobs` map seeds each job's last-known tab tuple from the
+ * `backend_exec_tab_id` / `backend_exec_tab_name` columns
+ * `readLiveJobsWithCoords` now carries, and the gate's predicate MIRRORS
+ * the fold's COALESCE(`tab_id`)/hard-assign(`tab_name`) asymmetry so a
+ * `tab_name` change riding a null `tab_id` still mints. Last-known is
+ * advanced ONLY after a successful `insertEvent.run()` (inside the
+ * `try`), so a failed INSERT re-attempts rather than deduping against a
+ * never-folded tuple. The fold stays idempotent — this is an
+ * optimization that keeps no-op mints off the wire, not a replacement
+ * for the fold's convergence (cross-scan fold-lag may re-mint a boundary
+ * dupe; the projection still converges).
+ *
  * Exported so the test surface can drive it directly without spawning
  * the worker — mirrors `scanDeadLetterDir` next door.
  *
@@ -776,13 +794,29 @@ export function scanZellijEventsDir(
   // job_id (last-known sticks; the next scan's read will reflect the
   // ended state via the projection's `state NOT IN (...)` filter
   // inside `readLiveJobsWithCoords`).
-  let liveJobs: Map<string, string>;
+  //
+  // Each value also carries the job's CURRENT projected tab coordinates
+  // (fn-709) so the mint loop can dedup a feed line whose effective
+  // `(tab_id, tab_name)` already equals the projection — and so a real
+  // in-scan transition updates last-known after its mint, deduping the
+  // immediate consecutive repeats that dominate the feed. `tabId` is
+  // normalized to a string (`String(... ?? "")`); a NULL projected
+  // `tab_name` (job never folded a snapshot) becomes `null` here and is
+  // treated as "no last-known" so the first mint is always allowed.
+  let liveJobs: Map<
+    string,
+    { job_id: string; tabId: string; tabName: string | null }
+  >;
   try {
     const rows = readLiveJobsWithCoords(db);
     liveJobs = new Map(
       rows.map((r) => [
         `${r.backend_exec_session_id}::${r.backend_exec_pane_id}`,
-        r.job_id,
+        {
+          job_id: r.job_id,
+          tabId: String(r.backend_exec_tab_id ?? ""),
+          tabName: r.backend_exec_tab_name,
+        },
       ]),
     );
   } catch (err) {
@@ -1011,8 +1045,8 @@ export function scanZellijEventsDir(
       // Cross-session-isolated join: `(session, pane_id)`. A pane id
       // is unique only within a session; conflating across sessions
       // would mint a snapshot against the wrong job.
-      const jobId = liveJobs.get(`${record.session}::${record.pane_id}`);
-      if (jobId === undefined) {
+      const liveJob = liveJobs.get(`${record.session}::${record.pane_id}`);
+      if (liveJob === undefined) {
         // No live job claims this pane right now. Acceptable — the
         // SessionStart that binds the job's `(session, pane_id)` may
         // not have landed yet (race), or this pane belongs to an
@@ -1020,12 +1054,38 @@ export function scanZellijEventsDir(
         // pane delta will mint if the job has landed by then.
         continue;
       }
+      const jobId = liveJob.job_id;
 
-      // Mint the synthetic `BackendExecSnapshot` event verbatim — same
-      // binding shape as `backend-worker`'s message handler at
-      // `daemon.ts:~1914`. The reducer's `foldBackendExecSnapshot`
-      // arm folds this identically; the projection update is
-      // idempotent on re-mint.
+      // Mint-seam dedup (fn-709): skip the INSERT when this line's
+      // effective `(tab_id, tab_name)` already equals the job's
+      // last-known projection state. The bulk of feed lines are exact
+      // consecutive repeats that fold to no-ops, yet each still pays the
+      // full realtime pipeline (writer-lock INSERT → `data_version` bump
+      // → wake worker → drain → fold → kick server/tab-namer). The
+      // predicate MIRRORS `foldBackendExecSnapshot`'s COALESCE/hard-assign
+      // asymmetry (reducer.ts): the fold writes
+      // `tab_id = COALESCE(?, prior)` but `tab_name = ?` (non-COALESCE),
+      // so the line's EFFECTIVE tab_id is `record.tab_id ?? lastKnown`
+      // while tab_name is the line's own value. Compare is AND-of-both-
+      // axes — never name-only (would drop a name change riding a null
+      // tab_id) and never raw-tab_id-only. A NULL last-known tab_name
+      // (job never folded a snapshot) is "no last-known" → never
+      // suppress, so the first mint always lands.
+      const effectiveTabId = String(record.tab_id ?? "") || liveJob.tabId;
+      if (
+        liveJob.tabName !== null &&
+        record.tab_name === liveJob.tabName &&
+        effectiveTabId === liveJob.tabId
+      ) {
+        continue;
+      }
+
+      // Mint the synthetic `BackendExecSnapshot` event verbatim. This
+      // scan loop is the SOLE `BackendExecSnapshot` mint site (the
+      // legacy poller's `backend-worker` message handler is retired);
+      // the reducer's `foldBackendExecSnapshot` arm folds this and the
+      // projection update is idempotent on any re-mint that slips past
+      // the dedup gate above (e.g. cross-scan fold-lag).
       try {
         stmts.insertEvent.run({
           $ts: Date.now() / 1000,
@@ -1065,6 +1125,15 @@ export function scanZellijEventsDir(
           $backend_exec_pane_id: null,
           $background_task_id: null,
         });
+        // fn-709: advance in-scan last-known to the just-minted effective
+        // tuple — ONLY here, inside the `try` AFTER `insertEvent.run()`
+        // returns. This catches the dominant in-scan consecutive-dupe case
+        // independent of the fold (the next equal line on this pane in the
+        // same scan now dedups). A failed INSERT (the catch below) leaves
+        // last-known UNCHANGED so the next equal line re-attempts the mint
+        // rather than deduping against a tuple that never folded.
+        liveJob.tabName = record.tab_name;
+        liveJob.tabId = effectiveTabId;
         // fn-704.2 trace: count REAL mints (post-INSERT = the actual
         // `data_version` bump) — the loop driver. Inside the `try` so a failed
         // INSERT (counted in the catch's skip) is not tallied as a bump.

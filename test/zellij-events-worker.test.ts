@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { scanZellijEventsDir } from "../src/daemon";
 import { openDb } from "../src/db";
+import { drain } from "../src/reducer";
 import {
   parseZellijEventLine,
   peekZellijEpoch,
@@ -82,6 +83,31 @@ function seedJob(
                        backend_exec_session_id, backend_exec_pane_id)
      VALUES (?, 0, 'running', 0, ?, ?)`,
     [job_id, session, pane_id],
+  );
+}
+
+/**
+ * Like {@link seedJob} but also seeds the job's CURRENT projected tab
+ * coordinates (`backend_exec_tab_id` / `backend_exec_tab_name`). Drives
+ * the fn-709 cross-scan mint-seam dedup: a feed line whose effective
+ * `(tab_id, tab_name)` equals this seed must NOT mint. Either coordinate
+ * may be `null` (mirrors a job that folded a snapshot whose `tab_id` was
+ * missing — the reducer's COALESCE preserved a null prior).
+ */
+function seedJobWithTabState(
+  db: ReturnType<typeof openDb>["db"],
+  job_id: string,
+  session: string,
+  pane_id: string,
+  tab_id: string | null,
+  tab_name: string | null,
+): void {
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, state, updated_at,
+                       backend_exec_session_id, backend_exec_pane_id,
+                       backend_exec_tab_id, backend_exec_tab_name)
+     VALUES (?, 0, 'running', 0, ?, ?, ?, ?)`,
+    [job_id, session, pane_id, tab_id, tab_name],
   );
 }
 
@@ -190,6 +216,223 @@ test("scanZellijEventsDir is idempotent — a re-scan with no new lines mints no
   // Second pass: no new bytes appended → no new mints.
   scanZellijEventsDir(db, stmts, eventsDir);
   expect(readBackendExecEvents(db).count).toBe(1);
+
+  db.close();
+});
+
+// --- fn-709 mint-seam dedup ---------------------------------------------
+
+test("fn-709: in-scan dedup — a run of identical lines mints only on the first", () => {
+  const { db, stmts } = openDb(dbPath);
+  mkdirSync(eventsDir, { recursive: true });
+  seedJob(db, "job-1", "sess-a", "1");
+
+  // Five identical pane lines for the same (session, pane). The first
+  // mints; the in-scan last-known update after that mint dedups the
+  // remaining four — independent of any fold (the harness never drains).
+  const dup = makePaneEvent({ pane_id: "1", tab_id: "5", tab_name: "alpha" });
+  writeFileSync(join(eventsDir, "sess-a.ndjson"), serializeLine(dup).repeat(5));
+
+  scanZellijEventsDir(db, stmts, eventsDir);
+
+  const { count, rows } = readBackendExecEvents(db);
+  expect(count).toBe(1);
+  expect(JSON.parse(rows[0]?.data ?? "{}").tab_name).toBe("alpha");
+
+  db.close();
+});
+
+test("fn-709: A→B→A flap in one scan mints exactly 3 (in-scan last-known tracks transitions)", () => {
+  const { db, stmts } = openDb(dbPath);
+  mkdirSync(eventsDir, { recursive: true });
+  seedJob(db, "job-1", "sess-a", "1");
+
+  // alpha → beta → alpha — every step is a real transition off the
+  // PRECEDING line, so all three mint. A name-only or stale last-known
+  // would wrongly suppress the third (back to alpha).
+  const lines = [
+    makePaneEvent({ seq: 1, pane_id: "1", tab_id: "5", tab_name: "alpha" }),
+    makePaneEvent({ seq: 2, pane_id: "1", tab_id: "5", tab_name: "beta" }),
+    makePaneEvent({ seq: 3, pane_id: "1", tab_id: "5", tab_name: "alpha" }),
+  ]
+    .map(serializeLine)
+    .join("");
+  writeFileSync(join(eventsDir, "sess-a.ndjson"), lines);
+
+  scanZellijEventsDir(db, stmts, eventsDir);
+
+  const { count, rows } = readBackendExecEvents(db);
+  expect(count).toBe(3);
+  expect(rows.map((r) => JSON.parse(r.data).tab_name)).toEqual([
+    "alpha",
+    "beta",
+    "alpha",
+  ]);
+
+  db.close();
+});
+
+test("fn-709: cross-scan projection-seeded skip — a line equal to the seed mints 0, a differing line mints 1", () => {
+  // The seed proxies a job whose projection already carries
+  // (tab_id=5, tab_name=alpha). A feed line equal to that tuple is a
+  // no-op re-mint and must be suppressed; a differing line mints.
+  {
+    const { db, stmts } = openDb(dbPath);
+    mkdirSync(eventsDir, { recursive: true });
+    seedJobWithTabState(db, "job-1", "sess-a", "1", "5", "alpha");
+    writeFileSync(
+      join(eventsDir, "sess-a.ndjson"),
+      serializeLine(
+        makePaneEvent({ pane_id: "1", tab_id: "5", tab_name: "alpha" }),
+      ),
+    );
+    scanZellijEventsDir(db, stmts, eventsDir);
+    expect(readBackendExecEvents(db).count).toBe(0);
+    db.close();
+  }
+
+  // Fresh dir + DB: a differing tab_name against the same seed mints.
+  rmSync(eventsDir, { recursive: true, force: true });
+  const { db, stmts } = openDb(`${dbPath}.2`);
+  mkdirSync(eventsDir, { recursive: true });
+  seedJobWithTabState(db, "job-1", "sess-a", "1", "5", "alpha");
+  writeFileSync(
+    join(eventsDir, "sess-a.ndjson"),
+    serializeLine(
+      makePaneEvent({ pane_id: "1", tab_id: "5", tab_name: "renamed" }),
+    ),
+  );
+  scanZellijEventsDir(db, stmts, eventsDir);
+  expect(readBackendExecEvents(db).count).toBe(1);
+  db.close();
+});
+
+test("fn-709: COALESCE asymmetry — null tab_id + changed tab_name mints; null tab_id + same name suppresses", () => {
+  // The fold writes tab_id = COALESCE(?, prior) but tab_name = ? (hard
+  // assign). So a line {tab_id:null, tab_name:changed} has an EFFECTIVE
+  // tab_id equal to the prior (preserved) but a changed name → it MUST
+  // mint (never false-suppressed). The same null tab_id with the SAME
+  // name is a true no-op → suppressed.
+  {
+    const { db, stmts } = openDb(dbPath);
+    mkdirSync(eventsDir, { recursive: true });
+    seedJobWithTabState(db, "job-1", "sess-a", "1", "7", "before");
+    writeFileSync(
+      join(eventsDir, "sess-a.ndjson"),
+      serializeLine(
+        makePaneEvent({ pane_id: "1", tab_id: null, tab_name: "after" }),
+      ),
+    );
+    scanZellijEventsDir(db, stmts, eventsDir);
+    // tab_id null COALESCE-preserves "7", but the name changed → mints.
+    const { count, rows } = readBackendExecEvents(db);
+    expect(count).toBe(1);
+    const data = JSON.parse(rows[0]?.data ?? "{}") as {
+      tab_id: string | null;
+      tab_name: string;
+    };
+    expect(data.tab_id).toBeNull(); // the line's literal value is persisted
+    expect(data.tab_name).toBe("after");
+    db.close();
+  }
+
+  // Fresh: null tab_id + SAME name as the seed → effective tuple equals
+  // the seed (effectiveTabId falls back to the seed's "7") → suppressed.
+  rmSync(eventsDir, { recursive: true, force: true });
+  const { db, stmts } = openDb(`${dbPath}.3`);
+  mkdirSync(eventsDir, { recursive: true });
+  seedJobWithTabState(db, "job-1", "sess-a", "1", "7", "before");
+  writeFileSync(
+    join(eventsDir, "sess-a.ndjson"),
+    serializeLine(
+      makePaneEvent({ pane_id: "1", tab_id: null, tab_name: "before" }),
+    ),
+  );
+  scanZellijEventsDir(db, stmts, eventsDir);
+  expect(readBackendExecEvents(db).count).toBe(0);
+  db.close();
+});
+
+test("fn-709: null seeded tab_name is 'no last-known' — the first line always mints", () => {
+  // A job that has never folded a snapshot carries tab_name = NULL. Even
+  // a line whose tab_id matches the seeded tab_id must mint (we never
+  // suppress against a never-known name).
+  const { db, stmts } = openDb(dbPath);
+  mkdirSync(eventsDir, { recursive: true });
+  seedJobWithTabState(db, "job-1", "sess-a", "1", "5", null);
+  writeFileSync(
+    join(eventsDir, "sess-a.ndjson"),
+    serializeLine(
+      makePaneEvent({ pane_id: "1", tab_id: "5", tab_name: "alpha" }),
+    ),
+  );
+  scanZellijEventsDir(db, stmts, eventsDir);
+  expect(readBackendExecEvents(db).count).toBe(1);
+  db.close();
+});
+
+test("fn-709: mint → fold → seed-next-scan loop dedups end-to-end (real cross-scan path)", () => {
+  // The realistic production loop: scan mints → reducer folds the
+  // synthetic event into the projection → the NEXT scan seeds last-known
+  // from that projection → an identical line is skipped. Proven via a
+  // real `drain()` between two scans, not the hand-seeded proxy.
+  const { db, stmts } = openDb(dbPath);
+  mkdirSync(eventsDir, { recursive: true });
+  // A SessionStart-shaped job row the fold's UPDATE targets by job_id.
+  seedJob(db, "job-1", "sess-a", "1");
+
+  const file = join(eventsDir, "sess-a.ndjson");
+  writeFileSync(
+    file,
+    serializeLine(
+      makePaneEvent({ seq: 1, pane_id: "1", tab_id: "5", tab_name: "alpha" }),
+    ),
+  );
+
+  // Scan 1: mints once (NULL projected tab_name → first mint allowed).
+  scanZellijEventsDir(db, stmts, eventsDir);
+  expect(readBackendExecEvents(db).count).toBe(1);
+
+  // Fold the minted event into the projection.
+  drain(db);
+  const folded = db
+    .query(
+      "SELECT backend_exec_tab_id AS id, backend_exec_tab_name AS name FROM jobs WHERE job_id = 'job-1'",
+    )
+    .get() as { id: string | null; name: string | null };
+  expect(folded.id).toBe("5");
+  expect(folded.name).toBe("alpha");
+
+  // Scan 2: append an IDENTICAL line. The watermark moved past line 1, so
+  // only the new line is read; its effective tuple now equals the folded
+  // projection → skipped, no second mint.
+  writeFileSync(
+    file,
+    serializeLine(
+      makePaneEvent({ seq: 1, pane_id: "1", tab_id: "5", tab_name: "alpha" }),
+    ) +
+      serializeLine(
+        makePaneEvent({ seq: 2, pane_id: "1", tab_id: "5", tab_name: "alpha" }),
+      ),
+  );
+  scanZellijEventsDir(db, stmts, eventsDir);
+  expect(readBackendExecEvents(db).count).toBe(1);
+
+  // Scan 3: a real transition still mints across the fold boundary.
+  writeFileSync(
+    file,
+    serializeLine(
+      makePaneEvent({ seq: 1, pane_id: "1", tab_id: "5", tab_name: "alpha" }),
+    ) +
+      serializeLine(
+        makePaneEvent({ seq: 2, pane_id: "1", tab_id: "5", tab_name: "alpha" }),
+      ) +
+      serializeLine(
+        makePaneEvent({ seq: 3, pane_id: "1", tab_id: "5", tab_name: "beta" }),
+      ),
+  );
+  scanZellijEventsDir(db, stmts, eventsDir);
+  expect(readBackendExecEvents(db).count).toBe(2);
 
   db.close();
 });

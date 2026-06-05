@@ -481,10 +481,17 @@ Keeper has no `install` verb. Wire it up manually:
    `KEEPER_TRACE_TABNAMER=1 KEEPER_TRACE_ZELLIJ=1 keeperd` on a busy session and
    compare the four rates. A high `notifications` rate with a LOW `mints` rate
    means the feed is noisy-but-harmless (a producer-side / task .1 concern, not
-   a loop). A high `mints` rate that TRACKS the `renames` rate is the loop
-   signature: each rename emits a TabUpdate → bridge re-emit → feed line → mint
-   → `data_version` bump → tab-namer kick → another rename. The `kicks` rate is
-   the upstream pressure feeding the rename ticks. Example
+   a loop) — and since fn-709 added the mint-seam dedup, this is now the
+   EXPECTED shape: a line whose effective `(tab_id, tab_name)` equals the job's
+   projection is skipped before the INSERT, so `notifications` can run high
+   while `mints` collapses toward the real-transition rate. A high `mints` rate
+   that TRACKS the `renames` rate is the loop signature: each rename emits a
+   TabUpdate → bridge re-emit → feed line → mint → `data_version` bump →
+   tab-namer kick → another rename. With the dedup in place a `mints` rate still
+   tracking `renames` means real distinct tuples are churning (the dedup only
+   suppresses no-op repeats), so the loop is in the rename-producing tuple, not
+   the consumer. The `kicks` rate is the upstream pressure feeding the rename
+   ticks. Example
    clients ship under the unified `keeper` CLI — `keeper board` /
    `keeper jobs` / `keeper autopilot` / `keeper git` / `keeper usage`
    (subscribe; the readiness clients go through
@@ -1786,11 +1793,18 @@ look" notification on every tree change. Main re-runs
 `scanZellijEventsDir`, which tails each file from its persisted
 byte-offset watermark, parses each new line, joins
 `(session, pane_id) -> job_id` via `readLiveJobsWithCoords` (the
-same projection-side helper the poller used), and mints one
-synthetic `BackendExecSnapshot` event per joined line through the
-EXACT same reducer fold the poller fed — last-known sticks
-tombstone semantics, no schema change, no reducer change. The worker
-itself holds NO DB handle. It is the eighth `@parcel/watcher`
+same projection-side helper the poller used, now also carrying the
+job's current `backend_exec_tab_id` / `backend_exec_tab_name` for the
+dedup seed), and mints one synthetic `BackendExecSnapshot` event per
+joined line whose effective `(tab_id, tab_name)` differs from the
+job's projection (fn-709 mint-seam dedup) — a line equal to the
+last-known tuple is skipped before the INSERT, so the consecutive
+no-op dupes that were 53.6% of the feed never pay the realtime
+pipeline. The mint flows through the EXACT same reducer fold the
+poller fed — last-known sticks tombstone semantics, schema-neutral
+(no SCHEMA_VERSION bump, no keeper-py change), no reducer change; the
+fold stays idempotent so the dedup is a wire-cost optimization, not a
+correctness dependency. The worker itself holds NO DB handle. It is the eighth `@parcel/watcher`
 producer instance and, like every keeper producer, feeds the log
 only via main's writable connection. The watermark sidecar advances
 in lockstep with each scan so a daemon restart re-tails from the

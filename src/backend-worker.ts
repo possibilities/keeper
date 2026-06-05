@@ -52,6 +52,16 @@ export interface LiveJobRow {
   job_id: string;
   backend_exec_session_id: string;
   backend_exec_pane_id: string;
+  /**
+   * The job's CURRENT projected tab coordinates (fn-709). Both are
+   * nullable TEXT — a job that has not yet folded a `BackendExecSnapshot`
+   * carries `null` for both, which `scanZellijEventsDir` treats as "no
+   * last-known" so the first mint is always allowed. The consumer's
+   * mint-seam dedup gate compares an incoming line's effective
+   * `(tab_id, tab_name)` against these to skip no-op re-mints.
+   */
+  backend_exec_tab_id: string | null;
+  backend_exec_tab_name: string | null;
 }
 
 /**
@@ -64,14 +74,21 @@ export interface LiveJobRow {
  *
  * The plugin-feed consumer (`scanZellijEventsDir` in `src/daemon.ts`)
  * calls this once per scan to build a `${session}::${pane_id}` ->
- * `job_id` map; an NDJSON line whose pane has no live job is dropped
- * (non-keeper session, or job already ended) and never mints a
- * snapshot.
+ * `{job_id, tabId, tabName}` map; an NDJSON line whose pane has no live
+ * job is dropped (non-keeper session, or job already ended) and never
+ * mints a snapshot.
+ *
+ * The SELECT also carries the job's CURRENT `backend_exec_tab_id` /
+ * `backend_exec_tab_name` (fn-709, additive) so the consumer can seed a
+ * per-scan last-known tab tuple and dedup feed lines whose effective
+ * `(tab_id, tab_name)` already equals the projection — eliminating the
+ * no-op `BackendExecSnapshot` mints that were the bulk of the event log.
  */
 export function readLiveJobsWithCoords(db: Database): LiveJobRow[] {
   return db
     .query(
-      `SELECT job_id, backend_exec_session_id, backend_exec_pane_id
+      `SELECT job_id, backend_exec_session_id, backend_exec_pane_id,
+              backend_exec_tab_id, backend_exec_tab_name
          FROM jobs
         WHERE backend_exec_session_id IS NOT NULL
           AND backend_exec_pane_id IS NOT NULL
