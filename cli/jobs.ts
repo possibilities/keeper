@@ -78,7 +78,6 @@ import {
   apiErrorPillSeg,
   colorizePillsInLine,
   inputRequestPillSeg,
-  JOBS_PILL_LEGEND,
   permissionPromptPillSeg,
   pillOrEmpty,
   planVerbLabel,
@@ -146,8 +145,7 @@ pill is OMITTED for a session at rest — absence ⇒ stopped; only
 working / ended / killed render a pill. A sub-agent line omits its
 [status] pill when the status is ok (absence ⇒ ok); the live-monitor
 line carries no status slot today (the projection never populates it).
-A persistent footer legend states the convention. [failed:<kind>] stays
-inline.
+[failed:<kind>] stays inline.
 
 The optional [awaiting:<kind>] pill drops to its own indented
 continuation line beneath the row so a long-running interactive stop
@@ -170,12 +168,6 @@ shared helper). An empty section renders as NOTHING — neither its
 heading nor a placeholder — when its partition is empty. A new
 frame prints only when the rendered body changes; the dead-letter
 banner re-stamps on every snapshot regardless of body stability.
-
-A single-source footer legend (the JOBS_PILL_LEGEND constant) is
-appended to the body on every frame — spacer-separated, after the last
-job row — so the omit-default convention is documented in BOTH the live
-frame and the piped/sidecar output. It rides even the empty ('no jobs')
-frame.
 
 Sidecars: three indexed files per emitted frame
 (/tmp/keeper-jobs.<pid>.state.<n>.json, .frame.<n>.txt, .diff.<n>.txt)
@@ -207,8 +199,8 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
  *
  * fn-708 (T1, J2): the `[state]` pill is omit-default — `stopped` (a
  * session at rest, the common idle-worker case) renders NO pill; absence
- * ≡ `stopped`, recoverable via the {@link JOBS_PILL_LEGEND} footer.
- * `working` / `ended` / `killed` still render verbatim.
+ * ≡ `stopped` (the omit-default convention, documented in `keeper jobs
+ * --help`). `working` / `ended` / `killed` still render verbatim.
  */
 export function projectJobRow(row: Record<string, unknown>): string {
   const title = seg(row.title);
@@ -583,22 +575,6 @@ export function renderJobsBody(
   return sections.join("\n");
 }
 
-/**
- * fn-708: append the omit-default footer legend to the jobs body lines.
- * Pure `f(bodyLines) → bodyLines` so `test/jobs.test.ts` can assert the
- * legend reaches `bodyLines` (the frame text `src/view-shell.ts`'s `emit`
- * byte-compares and `sidecarFrameText` mirrors into piped output) without
- * standing up the subscribe loop. A blank spacer separates the legend from
- * the last job row; the legend itself is the single-source
- * {@link JOBS_PILL_LEGEND} constant from `src/board-render.ts`, so the
- * absence-encodes-default convention can never drift from the renderer.
- * Mirrors `cli/board.ts:appendBoardLegend` so both TUIs carry the legend in
- * live + sidecar output identically.
- */
-export function appendJobsLegend(bodyLines: string[]): string[] {
-  return [...bodyLines, "", JOBS_PILL_LEGEND];
-}
-
 export async function main(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
@@ -902,14 +878,7 @@ export async function main(argv: string[]): Promise<void> {
         { insertMode, selectedIndex, expanded },
       );
       return {
-        // fn-708: the omit-default footer legend rides `bodyLines` (NOT
-        // `liveShell.setStatus`) so it lands in BOTH the live frame and the
-        // piped/sidecar frame text (`bodyLines` is the byte-compared frame
-        // text — see `src/view-shell.ts`). It rides even the empty-board
-        // ("no jobs") frame so the convention is always documented.
-        bodyLines: appendJobsLegend(
-          body === "" ? ["no jobs"] : body.split("\n"),
-        ),
+        bodyLines: body === "" ? ["no jobs"] : body.split("\n"),
         // State JSON carries the inputs this view actually rendered
         // against — jobs (the row source), subagentInvocations (the
         // nested-line source), and the dead-letter backlog (the banner

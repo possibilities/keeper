@@ -16,18 +16,13 @@
 
 import { expect, test } from "bun:test";
 import {
-  appendJobsLegend,
   backendCoordsSeg,
   monitorLinesFor,
   projectJobRow,
   renderJobsBody,
   selectableJobIds,
 } from "../cli/jobs";
-import {
-  colorizePillsInLine,
-  JOBS_PILL_LEGEND,
-  renderDeadLetterPill,
-} from "../src/board-render";
+import { colorizePillsInLine, renderDeadLetterPill } from "../src/board-render";
 import type { SubagentInvocation } from "../src/types";
 import { SELECTED_LINE_PREFIX } from "../src/view-shell";
 
@@ -1062,30 +1057,4 @@ test("renderJobsBody: empty / missing monitors blob renders no Monitors section"
       ["--- ada ---", "(x) ambient [working]", "  [main p11]"].join("\n"),
     );
   }
-});
-
-// ---------------------------------------------------------------------------
-// appendJobsLegend — fn-708: the omit-default footer legend reaches
-// `bodyLines` (the frame text view-shell byte-compares for the live frame +
-// mirrors into the piped/sidecar frame text). `appendJobsLegend` is the
-// exported pure seam `renderBody` calls; asserting it pins "legend present
-// in live + sidecar" without standing up the subscribe loop.
-// ---------------------------------------------------------------------------
-
-test("appendJobsLegend: appends the single-source legend (spacer-separated) to bodyLines", () => {
-  const out = appendJobsLegend(["--- ada ---", "(x) ambient [working]"]);
-  // The body is preserved verbatim, then a blank spacer, then the legend.
-  expect(out).toEqual([
-    "--- ada ---",
-    "(x) ambient [working]",
-    "",
-    JOBS_PILL_LEGEND,
-  ]);
-  expect(out.at(-1)).toBe(JOBS_PILL_LEGEND);
-});
-
-test("appendJobsLegend: legend rides even the empty ('no jobs') frame", () => {
-  const out = appendJobsLegend(["no jobs"]);
-  expect(out).toContain(JOBS_PILL_LEGEND);
-  expect(out.at(-1)).toBe(JOBS_PILL_LEGEND);
 });

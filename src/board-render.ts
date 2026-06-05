@@ -199,9 +199,8 @@ export function permissionPromptPillSeg(at: unknown, kind: unknown): string {
  * The lossless-consolidation primitive (epic fn-708, transform T1
  * "omit-default"). Render a ` [value]` pill segment ONLY when `value`
  * differs from its single resting/default value; render `""` (no pill)
- * at the default. Absence of the pill ≡ the default — a uniform rule a
- * one-line footer legend ({@link BOARD_PILL_LEGEND} / {@link JOBS_PILL_LEGEND})
- * makes recoverable.
+ * at the default. Absence of the pill ≡ the default — a uniform rule
+ * documented in each view's `--help` (the omit-default convention).
  *
  * Returns the leading `' '` so callers append unconditionally (same
  * self-delimiting convention as {@link apiErrorPillSeg} /
@@ -217,27 +216,6 @@ export function pillOrEmpty(value: unknown, dflt: string): string {
   }
   return ` [${value}]`;
 }
-
-/**
- * Footer-legend string for `keeper board`. Defined here — beside the
- * omit-default rules it documents — so the convention lives in ONE place
- * and cannot drift from the renderer. The view tasks (fn-708.2/.3) append
- * it to `bodyLines` so the absence-encodes-default rule is captured in
- * BOTH the live frame and piped/sidecar output. Plain text; the board
- * colorizer leaves it untouched (no bracket tokens).
- */
-export const BOARD_PILL_LEGEND =
-  "Pills show only non-resting states. No [approval] ⇒ pending · no runtime pill ⇒ todo · no [worker-done] ⇒ open · no [validated] ⇒ unvalidated · no [state] ⇒ stopped · no subagent pill ⇒ ok.";
-
-/**
- * Footer-legend string for `keeper jobs`. Single-source sibling of
- * {@link BOARD_PILL_LEGEND}, scoped to the job-row vocabulary (state +
- * subagent status; no approval / runtime / validated columns surface in
- * the jobs view). Defined here so both TUIs read their legend from the
- * same module as the omit rules.
- */
-export const JOBS_PILL_LEGEND =
-  "Pills show only non-resting states. No [state] pill ⇒ stopped · no subagent pill ⇒ ok.";
 
 /**
  * Map the epic's `last_validated_at` to the omit-default `[validated]`

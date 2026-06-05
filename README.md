@@ -708,10 +708,8 @@ collapses to plain stream output. Run any of them with
   ABSENCE of a pill encodes the field's one default — `no [approval]`
   ⇒ `pending`, `no runtime pill` ⇒ `todo`, `no [worker-done]` ⇒ `open`,
   `no [validated]` ⇒ `unvalidated`, `no [state]` ⇒ `stopped`, `no
-  subagent pill` ⇒ `ok`. A single-source footer-legend line
-  (`BOARD_PILL_LEGEND` / `JOBS_PILL_LEGEND` in `src/board-render.ts`) is
-  appended to each view's `bodyLines`, so the rule rides both the live
-  frame and the piped/sidecar output. Each
+  subagent pill` ⇒ `ok`. The convention is documented in each view's
+  `--help` (`keeper board --help` / `keeper jobs --help`). Each
   epic renders as a header line —
   `({dir}) {epic_number} {title} [#dep,#dep] [validated]?
   [slotted-after-closer]? [ready|completed|blocked:<reason>]` (the

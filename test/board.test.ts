@@ -29,7 +29,6 @@
 
 import { expect, test } from "bun:test";
 import {
-  appendBoardLegend,
   colorizePillsInLine,
   epicNumFromIdOrBare,
   renderDeadLetterPill,
@@ -37,9 +36,7 @@ import {
   renderJobLinkLines,
 } from "../cli/board";
 import {
-  BOARD_PILL_LEGEND,
   epicHeaderLabel,
-  JOBS_PILL_LEGEND,
   pillOrEmpty,
   renderClosePills,
   renderTaskPills,
@@ -1686,43 +1683,4 @@ test("subagentLinesFor: keeps running / failed / unknown / superseded", () => {
   expect(subagentLinesFor(subFixture("superseded"), "j", "  ")).toEqual([
     "  scout: d [superseded]",
   ]);
-});
-
-// ---------------------------------------------------------------------------
-// fn-708: footer-legend constants are single-source and present
-// ---------------------------------------------------------------------------
-
-test("BOARD_PILL_LEGEND / JOBS_PILL_LEGEND are non-empty single-source constants", () => {
-  expect(BOARD_PILL_LEGEND.length).toBeGreaterThan(0);
-  expect(JOBS_PILL_LEGEND.length).toBeGreaterThan(0);
-  // The board legend documents every omit-default field the view carries.
-  expect(BOARD_PILL_LEGEND).toContain("pending");
-  expect(BOARD_PILL_LEGEND).toContain("todo");
-  expect(BOARD_PILL_LEGEND).toContain("worker-done");
-  expect(BOARD_PILL_LEGEND).toContain("stopped");
-  // The board legend also documents the validated / runtime-todo defaults the
-  // header + task line now omit, so every absent pill is recoverable.
-  expect(BOARD_PILL_LEGEND).toContain("unvalidated");
-  // The jobs legend is scoped to state + subagent.
-  expect(JOBS_PILL_LEGEND).toContain("stopped");
-  expect(JOBS_PILL_LEGEND).toContain("ok");
-});
-
-// fn-708: the footer legend reaches `bodyLines` (the frame text view-shell
-// byte-compares for the live frame and mirrors into piped/sidecar output via
-// `sidecarFrameText`). `appendBoardLegend` is the exported pure seam
-// `renderBody` calls; asserting it pins the "legend present in live + sidecar"
-// acceptance without standing up the subscribe loop.
-test("appendBoardLegend: appends the single-source legend (spacer-separated) to bodyLines", () => {
-  const epicLines = ["(keeper) 1 Foo [ready]", "  X. Quality audit and close"];
-  const out = appendBoardLegend(epicLines);
-  // The epic block is preserved verbatim, then a blank spacer, then the legend.
-  expect(out.slice(0, 2)).toEqual(epicLines);
-  expect(out.at(-1)).toBe(BOARD_PILL_LEGEND);
-  expect(out).toContain(BOARD_PILL_LEGEND);
-});
-
-test("appendBoardLegend: legend rides even the empty-board ('no epics') frame", () => {
-  const out = appendBoardLegend(["no epics"]);
-  expect(out).toContain(BOARD_PILL_LEGEND);
 });

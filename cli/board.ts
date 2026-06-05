@@ -87,7 +87,6 @@ import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   apiErrorPillSeg,
-  BOARD_PILL_LEGEND,
   epicHeaderLabel,
   inputRequestPillSeg,
   permissionPromptPillSeg,
@@ -154,8 +153,7 @@ Renders one block per epic; the frame is just the '---' lead when no
 epics match the default scope.
 
 Pills follow the OMIT-DEFAULT convention (fn-708): a pill renders only at
-its non-resting value, so absence of a pill encodes the default. The footer
-legend line states the rule and is captured in piped/sidecar output:
+its non-resting value, so absence of a pill encodes the default:
   no [approval] => pending · no runtime pill => todo · no [worker-done] =>
   open · no [validated] => unvalidated · no [state] => stopped · no subagent
   pill => ok.
@@ -556,20 +554,6 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
   return out;
 }
 
-/**
- * fn-708: append the omit-default footer legend to the epic body lines.
- * Pure `f(epicLines) → bodyLines` so `test/board.test.ts` can assert the
- * legend reaches `bodyLines` (the frame text that `src/view-shell.ts`'s
- * `emit` byte-compares and `sidecarFrameText` mirrors into piped output)
- * without standing up the subscribe loop. A blank spacer separates the
- * legend from the last epic block; the legend itself is the single-source
- * {@link BOARD_PILL_LEGEND} constant from `src/board-render.ts`, so the
- * absence-encodes-default convention can never drift from the renderer.
- */
-export function appendBoardLegend(epicLines: string[]): string[] {
-  return [...epicLines, "", BOARD_PILL_LEGEND];
-}
-
 export async function main(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
@@ -737,7 +721,7 @@ export async function main(argv: string[]): Promise<void> {
     // `epicId` is the already-coalesced `seg(row.epic_id)` above.
     // fn-708 (T1): `validatedPill` now omits the default — it emits
     // ` [validated]` only when the epic is validated and `""` otherwise
-    // (absence ≡ unvalidated, per the footer legend). It returns its own
+    // (absence ≡ unvalidated, per the omit-default convention). It returns its own
     // leading space + brackets, so it appends self-delimited alongside the
     // dep summary and the slotted-after-closer pill.
     const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg}${validatedPill(row.last_validated_at)}${slottedSeg}`;
@@ -776,7 +760,7 @@ export async function main(argv: string[]): Promise<void> {
         // pin it); `runtime_status=blocked` renders `[rt:blocked]`; and the
         // approval pill is suppressed where the adjacent verdict already names
         // it (`completed` / `blocked:job-rejected`). Absence ≡ the default per
-        // the footer legend.
+        // the omit-default convention (documented in `keeper board --help`).
         `  ${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg}${renderTaskPills(t, taskVerdict)}`,
         ...taskIdLines,
         ...renderJobLines(subagentIndex, t.jobs),
@@ -839,13 +823,7 @@ export async function main(argv: string[]): Promise<void> {
     subagentIndex: Map<string, SubagentInvocation[]>,
   ): string[] {
     const body = renderEpicsBody(snap, subagentIndex);
-    const epicLines = body === "" ? ["no epics"] : body.split("\n");
-    // fn-708: the footer legend documents the absence-encodes-default
-    // convention. It is appended to bodyLines (NOT `liveShell.setStatus`)
-    // so it is captured in BOTH the live frame and piped/sidecar output
-    // (`bodyLines` is the byte-compared frame text — see `src/view-shell.ts`).
-    // `appendBoardLegend` is the exported pure seam the tests assert against.
-    return appendBoardLegend(epicLines);
+    return body === "" ? ["no epics"] : body.split("\n");
   }
 
   // fn-660.1: lifecycle + sidecars + copy key + SIGINT moved into
