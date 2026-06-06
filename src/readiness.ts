@@ -645,8 +645,10 @@ function evaluateTask(
     return { tag: "blocked", reason: { kind: "epic-not-validated" } };
   }
 
-  // 3. planner-running.
-  if (anyJobLinkRunning(epic)) {
+  // 3. planner-running. Discharges once real work has landed on the epic
+  //    (`epicWorkStarted`) — so a planner restarted for followup in the same
+  //    session can't re-block an epic it already released to a worker.
+  if (!epicWorkStarted(epic) && anyJobLinkRunning(epic)) {
     return { tag: "running", reason: { kind: "planner-running" } };
   }
 
@@ -955,8 +957,10 @@ function evaluateCloseRow(
     return { tag: "blocked", reason: { kind: "epic-not-validated" } };
   }
 
-  // 3. planner-running.
-  if (anyJobLinkRunning(epic)) {
+  // 3. planner-running. Discharges once real work has landed on the epic
+  //    (`epicWorkStarted`) — so a planner restarted for followup in the same
+  //    session can't re-block an epic it already released to a worker.
+  if (!epicWorkStarted(epic) && anyJobLinkRunning(epic)) {
     return { tag: "running", reason: { kind: "planner-running" } };
   }
 
@@ -1579,6 +1583,40 @@ function rollupEpicHeader(
 function anyJobLinkRunning(epic: Epic): boolean {
   for (const link of epic.job_links) {
     if (link.state === "working") {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Discharge condition for the `planner-running` gate (predicate 3 at both
+ * the task-row and close-row sites). Returns `true` once real work has
+ * landed on the epic — any embedded worker job under a task, or an embedded
+ * closer job at epic level.
+ *
+ * Rationale: `anyJobLinkRunning` reads the LIVE denormalized state of the
+ * planner's creator/refiner `job_links` entry, which the reducer re-stamps
+ * on every job-state write. A planner session that is restarted for followup
+ * work (a different plan, or just chatting in the same session) flips back to
+ * `working`, which would otherwise re-fire `planner-running` on every epic it
+ * ever created — re-blocking an epic the planner already finished. Once a
+ * worker (or closer) has been dispatched against the epic, the plan is
+ * committed-to and the planner no longer gates it. Embedded jobs persist
+ * across the worker's lifetime (they stay as `ended`/`killed`), so this latch
+ * is sticky once set.
+ *
+ * The planner itself is a creator/refiner edge in `job_links`, never an
+ * embedded `jobs[]` element, so a working planner never trips this check.
+ * Pure over the projection — `epic.jobs` / `task.jobs` are folded facts, so
+ * no schema or reducer change is involved.
+ */
+function epicWorkStarted(epic: Epic): boolean {
+  if (epic.jobs !== undefined && epic.jobs.length > 0) {
+    return true;
+  }
+  for (const task of epic.tasks) {
+    if (task.jobs !== undefined && task.jobs.length > 0) {
       return true;
     }
   }

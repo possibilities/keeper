@@ -2340,6 +2340,111 @@ test("planner-running: job_links entry on a stopped job → not running", () => 
 });
 
 // ---------------------------------------------------------------------------
+// planner-restart: the planner-running gate discharges once real work has
+// landed on the epic (`epicWorkStarted`). A planner restarted for followup in
+// the same session flips its creator/refiner link back to `working`; without
+// the latch that would re-block an epic the planner already released to a worker.
+// ---------------------------------------------------------------------------
+
+test("planner-restart: a working planner link still gates an epic with NO work yet", () => {
+  // First-time behavior preserved: before any worker lands, a working planner
+  // link blocks the epic's tasks (the wanted "don't pick up a newly minted
+  // epic while the planner is in motion" gate).
+  const t = makeTask({ jobs: [] });
+  const epic = makeEpic({
+    tasks: [t],
+    job_links: [
+      makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
+    ],
+  });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t.task_id)).toEqual(
+    running({ kind: "planner-running" }),
+  );
+});
+
+test("planner-restart: a working planner link no longer gates once a worker has landed", () => {
+  // A worker is in flight on the task AND the planner link is working.
+  // Previously predicate 3 would mislabel this `planner-running`; now
+  // `epicWorkStarted` is
+  // true so predicate 3 is skipped and the accurate `job-running` surfaces.
+  const t = makeTask({ jobs: [makeEmbeddedJob({ state: "working" })] });
+  const epic = makeEpic({
+    tasks: [t],
+    job_links: [
+      makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
+    ],
+  });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t.task_id)).toEqual(running({ kind: "job-running" }));
+});
+
+test("planner-restart: a restarted planner doesn't re-block an epic whose worker has stopped", () => {
+  // The reported bug. The epic was released to a worker, that worker session
+  // stopped (embedded job `stopped`), then the planner was restarted for
+  // followup → its link flips back to `working`. The latch keeps predicate 3
+  // discharged, so the task reads `ready` instead of `planner-running`.
+  const t = makeTask({ jobs: [makeEmbeddedJob({ state: "stopped" })] });
+  const epic = makeEpic({
+    tasks: [t],
+    job_links: [
+      makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
+    ],
+  });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t.task_id)).toEqual({ tag: "ready" });
+});
+
+test("planner-restart: work landing on one task discharges the gate for a sibling task", () => {
+  // `epicWorkStarted` is epic-scoped: a worker on task 1 releases the planner
+  // gate across the whole epic, so a fresh sibling (task 2) is no longer
+  // `planner-running`. (Task 1 occupies the per-epic mutex, so the sibling is
+  // demoted to `single-task-per-epic` — NOT planner-running.)
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    jobs: [makeEmbeddedJob({ state: "working" })],
+  });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2, jobs: [] });
+  const epic = makeEpic({
+    tasks: [t1, t2],
+    job_links: [
+      makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
+    ],
+  });
+  const snap = run([epic]);
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("planner-restart: a working planner link still gates a close row with no work", () => {
+  const epic = makeEpic({
+    jobs: [],
+    job_links: [
+      makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
+    ],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    running({ kind: "planner-running" }),
+  );
+});
+
+test("planner-restart: a landed closer discharges the planner-running gate", () => {
+  // A close-verb embedded job at epic level counts as work started, so a
+  // restarted planner no longer re-blocks the close row.
+  const epic = makeEpic({
+    jobs: [makeEmbeddedJob({ plan_verb: "close", state: "stopped" })],
+    job_links: [
+      makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
+    ],
+  });
+  const snap = run([epic]);
+  const v = snap.perCloseRow.get(epic.epic_id);
+  expect(v).not.toEqual(running({ kind: "planner-running" }));
+});
+
+// ---------------------------------------------------------------------------
 // Post-pass mutex direct tests
 // ---------------------------------------------------------------------------
 
