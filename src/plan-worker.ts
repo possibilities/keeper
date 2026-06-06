@@ -98,6 +98,7 @@ import {
 import { dirname, join, relative, sep } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
+import type { BackstopMessage } from "./backstop-telemetry";
 import { openDb } from "./db";
 import { isDropError, RescanScheduler } from "./rescan";
 
@@ -260,8 +261,17 @@ export interface PlanDiscoveryNudgeMessage {
   root: string;
 }
 
-/** Every shape the plan-worker posts to main (snapshots + the fn-705 nudge). */
-export type PlanWorkerOutbound = PlanMessage | PlanDiscoveryNudgeMessage;
+/**
+ * Every shape the plan-worker posts to main (snapshots + the fn-705 nudge +
+ * the fn-720 backstop-telemetry channel). The `{kind:"backstop"}` record is
+ * routed to main as the sole sidecar writer; the worker does not yet EMIT one
+ * (that wiring — counters + `last_fast_path_at` stamping — lands in tasks
+ * `.2`/`.3`), but main handles it from this union today.
+ */
+export type PlanWorkerOutbound =
+  | PlanMessage
+  | PlanDiscoveryNudgeMessage
+  | BackstopMessage;
 
 /** Message the parent sends to ask the worker to stop. */
 export interface ShutdownMessage {

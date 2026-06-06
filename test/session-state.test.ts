@@ -47,7 +47,7 @@ afterEach(() => {
   rmSync(repo, { recursive: true, force: true });
 });
 
-/** Sandboxed base env overriding ALL FOUR keeper state paths + clearing ids. */
+/** Sandboxed base env overriding ALL FIVE keeper state paths + clearing ids. */
 function sandboxEnv(
   extra: Record<string, string | undefined> = {},
 ): Record<string, string> {
@@ -62,6 +62,7 @@ function sandboxEnv(
   env.KEEPER_DEAD_LETTER_DIR = join(tmpDir, "dead-letters");
   env.KEEPER_DROP_LOG = join(tmpDir, "hook-drops.ndjson");
   env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
+  env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;
   return out;

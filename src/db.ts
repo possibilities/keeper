@@ -362,6 +362,27 @@ export function resolveDeadLetterDir(): string {
 }
 
 /**
+ * Resolve the keeper backstop-telemetry sidecar path (epic fn-720).
+ * `KEEPER_BACKSTOP_LOG` env wins (hermetic tests + every spawn-test sandbox
+ * point it at a tmp file so the suite never writes the user's real state dir,
+ * mirroring `KEEPER_DB` / `KEEPER_DEAD_LETTER_DIR` / `KEEPER_DROP_LOG` /
+ * `KEEPER_RESTORE_FILE`); otherwise default to
+ * `~/.local/state/keeper/backstop.ndjson`, a sibling of the DB file. Main is
+ * the SOLE writer (workers postMessage rescue/rollup records up); the sidecar
+ * is a pure consumer-side side-file — never read by the reducer, never feeds a
+ * projection. Pure — does no I/O; the writer
+ * (`appendBackstopRecord`) opens for append per-call and tolerates a missing
+ * parent dir by swallowing the error (the DB dir normally already exists).
+ */
+export function resolveBackstopLogPath(): string {
+  const override = process.env.KEEPER_BACKSTOP_LOG;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "backstop.ndjson");
+}
+
+/**
  * SQLite default `SQLITE_MAX_VARIABLE_NUMBER` is 999 — `IN (?,?,...)` binds
  * one variable per id. Callers of `selectByIds` (`src/collections.ts`) must
  * chunk past this cap or cap their input. The server-worker page sizes

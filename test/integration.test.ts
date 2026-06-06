@@ -182,9 +182,9 @@ async function readStream(
  * Shared sandboxed base env for every test spawn that fires the real hook.
  * Routes the state-bearing env vars (`KEEPER_DB`,
  * `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`,
- * `KEEPER_ZELLIJ_EVENTS_DIR`) under the live per-test `tmpDir` so no
- * spawn falls through to the production `~/.local/state/keeper/` paths.
- * fn-657 / fn-684.
+ * `KEEPER_ZELLIJ_EVENTS_DIR`, `KEEPER_BACKSTOP_LOG`) under the live
+ * per-test `tmpDir` so no spawn falls through to the production
+ * `~/.local/state/keeper/` paths. fn-657 / fn-684 / fn-720.
  */
 function sandboxedBaseEnv(): Record<string, string> {
   return {
@@ -193,6 +193,7 @@ function sandboxedBaseEnv(): Record<string, string> {
     KEEPER_DEAD_LETTER_DIR: join(tmpDir, "dead-letters"),
     KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
     KEEPER_ZELLIJ_EVENTS_DIR: join(tmpDir, "zellij-events"),
+    KEEPER_BACKSTOP_LOG: join(tmpDir, "backstop.ndjson"),
   };
 }
 

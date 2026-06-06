@@ -56,7 +56,7 @@ afterEach(() => {
 });
 
 /**
- * Sandboxed base env: overrides ALL FOUR keeper state paths under the per-test
+ * Sandboxed base env: overrides ALL FIVE keeper state paths under the per-test
  * tmpDir AND clears every ambient session/job id source so the test fully
  * controls attribution + the Job-Id trailer. Applied AFTER the clear loop so a
  * caller can't reopen the leak (CLAUDE.md isolation rule).
@@ -77,6 +77,7 @@ function sandboxEnv(
   env.KEEPER_DEAD_LETTER_DIR = join(tmpDir, "dead-letters");
   env.KEEPER_DROP_LOG = join(tmpDir, "hook-drops.ndjson");
   env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
+  env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");
   // Drop any key whose value was cleared to undefined.
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;
