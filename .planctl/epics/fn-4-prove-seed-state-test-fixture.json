@@ -1,0 +1,18 @@
+{
+  "approval": "pending",
+  "branch_name": "fn-4-prove-seed-state-test-fixture",
+  "bundles": [],
+  "created_at": "2026-06-06T22:24:03.008064Z",
+  "depends_on_epics": [],
+  "id": "fn-4-prove-seed-state-test-fixture",
+  "last_validated_at": "2026-06-06T22:24:03.109550Z",
+  "primary_repo": "/Users/mike/code/planctl",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Prove seed_state test fixture",
+  "touched_repos": [
+    "/Users/mike/code/planctl"
+  ],
+  "updated_at": "2026-06-06T22:24:03.008064Z"
+}
