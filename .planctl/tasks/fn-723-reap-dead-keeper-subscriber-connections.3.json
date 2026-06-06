@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-06T23:09:40.217583Z",
+  "depends_on": [
+    "fn-723-reap-dead-keeper-subscriber-connections.1",
+    "fn-723-reap-dead-keeper-subscriber-connections.2"
+  ],
+  "epic": "fn-723-reap-dead-keeper-subscriber-connections",
+  "id": "fn-723-reap-dead-keeper-subscriber-connections.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Document connection reaping",
+  "updated_at": "2026-06-06T23:09:40.217583Z"
+}
