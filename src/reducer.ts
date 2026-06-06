@@ -3005,6 +3005,151 @@ function foldCommitTaskLinks(
 }
 
 /**
+ * Schema v59 / fn-719 (task 1): stamp the provenance-filtered
+ * `has_live_worker_monitor` occupancy fact onto THIS session's embedded
+ * job element under its bound task.
+ *
+ * Why a dedicated write site (not just the `buildEmbeddedJob` derive):
+ * the Stop fold's `jobs.monitors` UPDATE is the ONLY seam that refreshes
+ * the monitor set, and it is HOISTED ABOVE the sub-agent guard — so a
+ * mid-Task-yield Stop refreshes `jobs.monitors` but SKIPS the
+ * `state='stopped'` UPDATE and its `syncIfPlanRef` fan-out. Without this
+ * explicit stamp, the embedded job's occupancy fact would go stale exactly
+ * in the guard-swallow case (a worker yielded to a sub-agent with a live
+ * suite still backgrounded — the fn-715.2 incident shape). So we mirror
+ * {@link foldCommitTaskLinks}: read the session's `plan_ref`, resolve its
+ * task element, RMW the embedded job by `job_id`, stamping the boolean +
+ * the `last_event_id`/`updated_at` (the lease anchor task 2 reads). The
+ * `buildEmbeddedJob` carve-out then PRESERVES this value across later
+ * job-tick re-syncs.
+ *
+ * Re-fold deterministic: the boolean is a pure function of `nextMonitors`
+ * (itself a pure function of the event log up to `eventId`), and every RMW
+ * input is event-derived. NEVER throws inside the open transaction — a
+ * malformed `tasks` cell / missing task / commit-before-claim job is a
+ * deterministic skip, cursor still advances. `hasLiveWorkerMonitor`
+ * already folds a malformed `monitors` string to `false`.
+ *
+ * Only fires for verb `work` (`plan_ref` parses to `{kind: "task"}`) — a
+ * planner / closer session (`{kind: "epic"}`) holds no working tree, so
+ * its embedded job carries no monitor-occupancy fact (left at the
+ * carve-out's `false` default).
+ */
+function stampEmbeddedMonitorFact(
+  db: Database,
+  opts: {
+    jobId: string;
+    planRef: string | null;
+    hasLiveWorkerMonitor: boolean;
+    eventId: number;
+    eventTs: number;
+  },
+): void {
+  const { jobId, planRef, hasLiveWorkerMonitor, eventId, eventTs } = opts;
+  if (planRef == null) {
+    return;
+  }
+  const parsed = parsePlanRef(planRef);
+  if (parsed == null || parsed.kind !== "task") {
+    return; // not a work session — no per-task monitor occupancy to stamp.
+  }
+  // Minimal opaque-passthrough shape mirroring `foldCommitTaskLinks`: only
+  // the `jobs` sub-array is touched, every other task field rides through
+  // `unknownFields` so a re-serialise round-trips byte-identically.
+  interface TaskElementJson {
+    task_id: string;
+    jobs?: EmbeddedJobElement[];
+    [key: string]: unknown;
+  }
+  const epicRow = db
+    .query("SELECT tasks FROM epics WHERE epic_id = ?")
+    .get(parsed.epic_id) as { tasks: string | null } | null;
+  if (epicRow == null || epicRow.tasks == null || epicRow.tasks.length === 0) {
+    return;
+  }
+  let tasksArr: TaskElementJson[];
+  try {
+    const parsedTasks = JSON.parse(epicRow.tasks);
+    if (!Array.isArray(parsedTasks)) {
+      return;
+    }
+    tasksArr = parsedTasks as TaskElementJson[];
+  } catch {
+    return; // malformed JSON cell — skip, never throw inside the fold tx.
+  }
+  const taskIdx = tasksArr.findIndex((t) => t.task_id === parsed.task_id);
+  if (taskIdx < 0) {
+    return; // task not yet known — skip, cursor advances.
+  }
+  const oldTask = tasksArr[taskIdx];
+  const oldJobs =
+    oldTask != null && Array.isArray(oldTask.jobs) ? oldTask.jobs : [];
+  const jobIdx = oldJobs.findIndex((j) => j.job_id === jobId);
+  if (jobIdx < 0) {
+    // No embedded job element yet (the session's own SessionStart fan-out
+    // hasn't landed it under this task) — the carve-out will pick up the
+    // fresh `false` default when it does. Lose the stamp deterministically.
+    return;
+  }
+  const oldJob = oldJobs[jobIdx];
+  // No-op short-circuit: if the value is unchanged AND nothing else needs a
+  // stamp bump, skip the write so a Stop that didn't change occupancy stays
+  // byte-stable. The monitors UPDATE already bumped the jobs-row stamp; the
+  // embedded element is what we're keeping honest here. (We still write when
+  // the boolean changed.) `?? false` handles the pre-v59 absent-field case.
+  if ((oldJob.has_live_worker_monitor ?? false) === hasLiveWorkerMonitor) {
+    return;
+  }
+  const newJob: EmbeddedJobElement = {
+    ...oldJob,
+    has_live_worker_monitor: hasLiveWorkerMonitor,
+    last_event_id: eventId,
+    updated_at: eventTs,
+  };
+  const newJobs = oldJobs.slice();
+  newJobs[jobIdx] = newJob;
+  sortEmbeddedJobs(newJobs);
+  // OLD-element carve-out spread: preserve EVERY other task scalar field.
+  const newTask: TaskElementJson = { ...oldTask, jobs: newJobs };
+  const newTasksArr = tasksArr.slice();
+  newTasksArr[taskIdx] = newTask;
+  db.run(
+    "UPDATE epics SET tasks = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+    [JSON.stringify(newTasksArr), eventId, eventTs, parsed.epic_id],
+  );
+}
+
+/**
+ * Schema v59 / fn-719 (task 1): the terminal-clear counterpart to
+ * {@link stampEmbeddedMonitorFact}. A SessionEnd / Killed write clears
+ * `jobs.monitors` to `'[]'` and runs `syncIfPlanRef`, but the
+ * `buildEmbeddedJob` carve-out PRESERVES whatever `has_live_worker_monitor`
+ * the prior embedded element held — so a job that stopped with a live
+ * worker monitor would carry a stale `true` into its terminal element. This
+ * forces the fact to `false` (the no-op short-circuit in the stamp helper
+ * keeps an already-`false` element byte-stable). Reads the session's
+ * `plan_ref` from the now-terminal jobs row; deterministic no-op for a
+ * non-work session.
+ */
+function clearEmbeddedMonitorFactOnTerminal(
+  db: Database,
+  jobId: string,
+  eventId: number,
+  eventTs: number,
+): void {
+  const planRow = db
+    .query("SELECT plan_ref FROM jobs WHERE job_id = ?")
+    .get(jobId) as { plan_ref: string | null } | null;
+  stampEmbeddedMonitorFact(db, {
+    jobId,
+    planRef: planRow?.plan_ref ?? null,
+    hasLiveWorkerMonitor: false,
+    eventId,
+    eventTs,
+  });
+}
+
+/**
  * Pre-flattened agentuse usage snapshot. The usage-worker carries every
  * projection-meaningful field in the synthetic `UsageSnapshot` event's
  * `data` blob; the reducer never re-reads the on-disk file. **Freshness
@@ -4226,6 +4371,32 @@ interface EmbeddedJobElement {
    * no job committed.
    */
   last_commit_for_task_at?: number | null;
+  /**
+   * Schema v59 / fn-719 (task 1): the provenance-filtered live-worker-
+   * monitor occupancy fact for THIS session, derived from `jobs.monitors`
+   * by {@link hasLiveWorkerMonitor} (`true` iff a `monitor`/`bash-bg`
+   * entry is present — `ambient` watchers never count). Readiness (task 2)
+   * reads it off the embedded job to hold the per-epic / per-root mutex
+   * while a work session's backgrounded suite is still running, so the
+   * closer/approve cannot dispatch into a not-actually-idle session.
+   *
+   * Lives FREE on the JSON-TEXT `jobs` cell on `epics` (the `kind ===
+   * "task"` path inside `tasks[].jobs[]`); NO new real column. The v58→v59
+   * bump is whitelist-only (mirrors the v48→v49 / fn-670 T2 template).
+   *
+   * **Stop-event fact, NOT a jobs-row field.** It's stamped at the Stop
+   * fold's monitors-write site (the only seam that refreshes
+   * `jobs.monitors`), and the monitors-only write does NOT always run
+   * {@link syncJobIntoEpic} (the sub-agent-guard-swallow path skips the
+   * state UPDATE + its `syncIfPlanRef`). So {@link buildEmbeddedJob} lifts
+   * the field forward off the PRIOR embedded element (the OLD-element
+   * carve-out — exactly like `last_commit_for_task_at`): a later job-tick
+   * re-sync MUST preserve it rather than clobber it with a stale default.
+   * Optional + nullish-coalesced to `false` so a pre-v59 stored element
+   * (decoded from JSON-TEXT, field absent → `undefined`) round-trips
+   * byte-deterministically across a re-fold.
+   */
+  has_live_worker_monitor?: boolean;
 }
 
 /**
@@ -4335,6 +4506,12 @@ function buildEmbeddedJob(
   // pre-v49 stored element decoded from JSON-TEXT; nullish-coalesce to
   // `null` so the field round-trips byte-deterministically.
   const lastCommitForTaskAt = prior?.last_commit_for_task_at ?? null;
+  // v59 / fn-719 (task 1): preserve the Stop-event monitor-occupancy fact
+  // across a jobs-row re-sync — same carve-out as `last_commit_for_task_at`.
+  // `prior == null` (first-sight) → false; `prior?.has_live_worker_monitor`
+  // may be `undefined` on a pre-v59 stored element decoded from JSON-TEXT,
+  // so nullish-coalesce to `false` for byte-deterministic round-trip.
+  const hasLiveWorkerMonitor = prior?.has_live_worker_monitor ?? false;
   return {
     job_id: row.job_id,
     plan_verb: row.plan_verb ?? "",
@@ -4353,6 +4530,7 @@ function buildEmbeddedJob(
     git_unattributed_to_live_count: row.git_unattributed_to_live_count,
     git_orphan_count: row.git_orphan_count,
     last_commit_for_task_at: lastCommitForTaskAt,
+    has_live_worker_monitor: hasLiveWorkerMonitor,
   };
 }
 
@@ -6721,11 +6899,36 @@ function projectJobsRow(db: Database, event: Event): void {
       // sub-agent-yielded Stop on a STILL-LIVE row reaches here and
       // refreshes monitors. A terminal row has no live monitors by
       // definition; the no-op is correct.
-      db.run(
+      const monitorsRes = db.run(
         `UPDATE jobs SET monitors = ?, last_event_id = ?, updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
         [nextMonitors, event.id, ts, jobId],
       );
+      // Schema v59 / fn-719 (task 1): stamp the provenance-filtered
+      // `has_live_worker_monitor` occupancy fact onto this session's
+      // embedded job element. Gated on `changes > 0` so a guarded no-op on
+      // a terminal row does NOT re-fan a stale stamp — the terminal write
+      // already cleared `monitors='[]'`, which yields `false`. Stamped HERE
+      // (not via `syncIfPlanRef`) because the monitors-only write is
+      // hoisted ABOVE the sub-agent guard: a mid-Task-yield Stop refreshes
+      // `jobs.monitors` but skips the `state='stopped'` UPDATE and its
+      // `syncIfPlanRef` fan-out, so without this explicit stamp the
+      // embedded occupancy fact would go stale exactly in the
+      // guard-swallow case (the fn-715.2 incident shape). The helper reads
+      // the session's `plan_ref` to resolve the bound task and is a
+      // deterministic no-op for non-work sessions / missing task elements.
+      if (monitorsRes.changes > 0) {
+        const planRow = db
+          .query("SELECT plan_ref FROM jobs WHERE job_id = ?")
+          .get(jobId) as { plan_ref: string | null } | null;
+        stampEmbeddedMonitorFact(db, {
+          jobId,
+          planRef: planRow?.plan_ref ?? null,
+          hasLiveWorkerMonitor: hasLiveWorkerMonitor(nextMonitors),
+          eventId: event.id,
+          eventTs: ts,
+        });
+      }
       // Keeps the terminal guard: a stray Stop landing on a still-terminal job
       // (no intervening re-open) must not resurrect it. The guard now covers
       // BOTH terminal states — 'ended' (from SessionEnd) and 'killed' (from a
@@ -6848,6 +7051,14 @@ function projectJobsRow(db: Database, event: Event): void {
       if (res.changes > 0) {
         sweepRunningSubagentsToUnknown(db, jobId, event.id, ts);
         syncIfPlanRef(db, jobId, event.id, ts);
+        // Schema v59 / fn-719 (task 1): force the embedded occupancy fact
+        // to `false` on the terminal write. The `monitors='[]'` clear above
+        // makes the fact-source false, but `syncIfPlanRef`'s
+        // `buildEmbeddedJob` carve-out PRESERVES the prior value forward —
+        // so without this explicit clear, a job that stopped with a live
+        // worker monitor would carry a stale `true` into its terminal
+        // element. `stampEmbeddedMonitorFact` no-ops when already false.
+        clearEmbeddedMonitorFactOnTerminal(db, jobId, event.id, ts);
       }
       break;
     }
@@ -6908,6 +7119,10 @@ function projectJobsRow(db: Database, event: Event): void {
         // NOT sync — no write happened, the embedded entry would otherwise
         // re-write with a stale-but-unchanged element keyed to this event id.
         syncIfPlanRef(db, jobId, event.id, ts);
+        // Schema v59 / fn-719 (task 1): force the embedded occupancy fact to
+        // `false` on the proven-kill terminal write — same carve-out-override
+        // reasoning as the SessionEnd arm above.
+        clearEmbeddedMonitorFactOnTerminal(db, jobId, event.id, ts);
       }
       break;
 
@@ -7593,6 +7808,44 @@ function computeMonitors(
     description: t.description,
   }));
   return JSON.stringify(entries);
+}
+
+/**
+ * Schema v59 (fn-719 task 1): the provenance-filtered occupancy fact
+ * derived from a `jobs.monitors` JSON-array value. `true` when ANY entry
+ * is a WORKER-LAUNCHED monitor (`kind in {monitor, bash-bg}`); `ambient`
+ * session-watchers (the plugin/harness-armed chatctl bus, a never-claimed
+ * background shell) NEVER count — they were not launched by the work
+ * session's own turn, so they must not occupy the autopilot mutex.
+ *
+ * Pure function of the serialized monitors string `computeMonitors`
+ * produces — same input bytes always yield the same boolean, so the
+ * embedded-fact stamp at the Stop fold's monitors-write site is re-fold
+ * deterministic. NEVER throws inside the open BEGIN IMMEDIATE transaction:
+ * a malformed / non-array cell folds to `false` (no live worker monitor),
+ * mirroring `computeMonitors`'s own `'[]'`-on-malformed contract.
+ *
+ * `'[]'` (the drop-when-dead empty snapshot, the terminal-clear write on
+ * SessionEnd / Killed) yields `false` — so a terminal job auto-resolves
+ * the fact to `false` for free, riding the existing `monitors='[]'` clear.
+ */
+function hasLiveWorkerMonitor(monitorsJson: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(monitorsJson);
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(parsed)) {
+    return false;
+  }
+  return parsed.some(
+    (entry) =>
+      entry != null &&
+      typeof entry === "object" &&
+      (entry as { kind?: unknown }).kind !== "ambient" &&
+      typeof (entry as { kind?: unknown }).kind === "string",
+  );
 }
 
 /**

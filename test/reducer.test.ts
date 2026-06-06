@@ -16136,6 +16136,290 @@ test("v51 monitors: a launch AFTER this Stop is NOT seen (id < current gate)", (
 });
 
 // ---------------------------------------------------------------------------
+// Schema v59 (fn-719 task 1): has_live_worker_monitor occupancy fact on the
+// embedded epics.tasks[].jobs[] element. Derived from jobs.monitors
+// (provenance-filtered: monitor/bash-bg occupy, ambient never does), stamped
+// at the Stop fold's monitors-write site, preserved across job-tick re-syncs
+// via the buildEmbeddedJob carve-out, cleared to false on terminal.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the embedded job element's `has_live_worker_monitor` for a (taskId,
+ * jobId) pair, or `undefined` when the task / job is missing.
+ */
+function getEmbeddedMonitorFact(
+  taskId: string,
+  jobId: string,
+): boolean | undefined {
+  const task = getTask(taskId);
+  if (task == null || !Array.isArray(task.jobs)) {
+    return undefined;
+  }
+  const j = (task.jobs as { job_id: string }[]).find((j) => j.job_id === jobId);
+  return (j as { has_live_worker_monitor?: boolean } | undefined)
+    ?.has_live_worker_monitor;
+}
+
+/**
+ * Insert one Stop event whose `data.background_tasks` carries the given
+ * entries, scoped to a work session bound to a task (`session_id` defaults to
+ * TEST_UUID so it matches the `work::` spawn-name binding the test seeds).
+ */
+function insertStopWithTasksFor(
+  tasks: { id: string; type: string }[],
+  sessionId = TEST_UUID,
+): number {
+  return insertEvent({
+    hook_event: "Stop",
+    session_id: sessionId,
+    data: JSON.stringify({ background_tasks: tasks }),
+  });
+}
+
+test("v59 monitor fact: a bash-bg monitor on a stopped work job sets has_live_worker_monitor=true on the embedded element", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.1",
+  });
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.1", TEST_UUID)).toBe(false);
+
+  // A backgrounded Bash launch precedes the Stop → provenance `bash-bg`.
+  insertBashBgLaunch("suite-1", TEST_UUID);
+  insertStopWithTasksFor([{ id: "suite-1", type: "shell" }]);
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.1", TEST_UUID)).toBe(true);
+});
+
+test("v59 monitor fact: a Monitor-kind entry also occupies (kind=monitor → true)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.2",
+  });
+  drainAll();
+  insertMonitorLaunch("mon-1", TEST_UUID);
+  insertStopWithTasksFor([{ id: "mon-1", type: "shell" }]);
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.2", TEST_UUID)).toBe(true);
+});
+
+test("v59 monitor fact: an ambient-only job NEVER occupies (has_live_worker_monitor stays false)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.3",
+  });
+  drainAll();
+  // No launch event → provenance `ambient` (the plugin-armed chatctl bus
+  // shape). The embedded occupancy fact must stay false.
+  insertStopWithTasksFor([{ id: "amb-1", type: "shell" }]);
+  drainAll();
+  // The top-level monitors column DID record the ambient entry...
+  expect(getMonitors(TEST_UUID)).toEqual([mon("amb-1", "ambient")]);
+  // ...but the embedded occupancy fact is false (ambient never occupies).
+  expect(getEmbeddedMonitorFact("fn-1-foo.3", TEST_UUID)).toBe(false);
+});
+
+test("v59 monitor fact: a mixed ambient+bash-bg snapshot still occupies (any worker monitor → true)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.4",
+  });
+  drainAll();
+  insertBashBgLaunch("suite-mix", TEST_UUID);
+  insertStopWithTasksFor([
+    { id: "amb-mix", type: "shell" },
+    { id: "suite-mix", type: "shell" },
+  ]);
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.4", TEST_UUID)).toBe(true);
+});
+
+test("v59 monitor fact: a later Stop dropping the worker monitor flips it back to false", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.5",
+  });
+  drainAll();
+  insertBashBgLaunch("suite-drop", TEST_UUID);
+  insertStopWithTasksFor([{ id: "suite-drop", type: "shell" }]);
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.5", TEST_UUID)).toBe(true);
+  // The suite finished — the next Stop's snapshot drops it (drop-when-dead).
+  insertStopWithTasksFor([]);
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.5", TEST_UUID)).toBe(false);
+});
+
+test("v59 monitor fact: SessionEnd (terminal) forces has_live_worker_monitor=false even with a stale live monitor", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.6",
+  });
+  drainAll();
+  insertBashBgLaunch("suite-end", TEST_UUID);
+  insertStopWithTasksFor([{ id: "suite-end", type: "shell" }]);
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.6", TEST_UUID)).toBe(true);
+  // Terminal write clears jobs.monitors to '[]'; the embedded fact must
+  // resolve to false (the carve-out would otherwise preserve a stale true).
+  insertEvent({ hook_event: "SessionEnd", session_id: TEST_UUID });
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.6", TEST_UUID)).toBe(false);
+});
+
+test("v59 monitor fact: Killed (terminal) forces has_live_worker_monitor=false even with a stale live monitor", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.7",
+    pid: 5151,
+    start_time: "stamp-k",
+  });
+  drainAll();
+  insertBashBgLaunch("suite-kill", TEST_UUID);
+  insertStopWithTasksFor([{ id: "suite-kill", type: "shell" }]);
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.7", TEST_UUID)).toBe(true);
+  killedEvent(5151, "stamp-k", TEST_UUID);
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.7", TEST_UUID)).toBe(false);
+});
+
+test("v59 monitor fact: clobber guard — a later syncJobIntoEpic re-sync PRESERVES has_live_worker_monitor", () => {
+  // The headline-risk test (mirrors the fn-670 T2 clobber-guard test). Stamp
+  // the fact via the Stop fold, then drive a jobs-row re-sync via
+  // UserPromptSubmit (flips state → working AND fires syncJobIntoEpic) and
+  // assert the fact survives. Without the buildEmbeddedJob carve-out, the
+  // jobs-row re-emit would clobber it back to the false default.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.8",
+  });
+  drainAll();
+  insertBashBgLaunch("suite-clob", TEST_UUID);
+  insertStopWithTasksFor([{ id: "suite-clob", type: "shell" }]);
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.8", TEST_UUID)).toBe(true);
+
+  // Drive a jobs-row re-sync (flips state → working AND fires syncJobIntoEpic).
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: TEST_UUID });
+  drainAll();
+
+  const after = getEmbeddedTaskJob("fn-1-foo.8", TEST_UUID);
+  expect(after?.state).toBe("working"); // proves the re-sync path fired
+  // The fact survived the clobber.
+  expect(getEmbeddedMonitorFact("fn-1-foo.8", TEST_UUID)).toBe(true);
+});
+
+test("v59 monitor fact: a planner session (kind=epic) never carries the occupancy fact", () => {
+  // A close/plan session binds to an epic, not a task — it holds no working
+  // tree, so its embedded epic-side job stays at the false default.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "close::fn-1-foo",
+  });
+  drainAll();
+  insertBashBgLaunch("suite-epic", TEST_UUID);
+  insertStopWithTasksFor([{ id: "suite-epic", type: "shell" }]);
+  drainAll();
+  // The epic-side embedded job exists, but the per-task stamp helper skips
+  // kind=epic, so the field stays at the carve-out false default.
+  const row = db
+    .query("SELECT jobs FROM epics WHERE epic_id = ?")
+    .get("fn-1-foo") as { jobs: string } | null;
+  const jobs = JSON.parse(row?.jobs ?? "[]") as {
+    job_id: string;
+    has_live_worker_monitor?: boolean;
+  }[];
+  const j = jobs.find((j) => j.job_id === TEST_UUID);
+  expect(j).not.toBeUndefined();
+  expect(j?.has_live_worker_monitor).toBe(false);
+});
+
+test("v59 monitor fact: cursor=0 re-fold reproduces byte-identical epics rows (fact converges)", () => {
+  // Re-fold determinism: the embedded fact is a pure function of the event
+  // log (derived from the event-derived jobs.monitors snapshot), so a
+  // from-scratch re-fold (rewind cursor, wipe projections, re-drain)
+  // reproduces byte-identical epics rows — the same convergence a
+  // hypothetical rewind-and-redrain backfill would yield, proven WITHOUT
+  // the migration needing to force one (v59 is fix-forward).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.9",
+  });
+  insertBashBgLaunch("suite-refold", TEST_UUID);
+  insertStopWithTasksFor([{ id: "suite-refold", type: "shell" }]);
+  drainAll();
+  expect(getEmbeddedMonitorFact("fn-1-foo.9", TEST_UUID)).toBe(true);
+
+  const before = db
+    .query("SELECT epic_id, tasks, jobs FROM epics ORDER BY epic_id ASC")
+    .all() as { epic_id: string; tasks: string; jobs: string }[];
+  expect(before.length).toBeGreaterThan(0);
+
+  // Rewind + wipe the rewind-list projections; re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM subagent_invocations");
+  db.run("DELETE FROM epic_tombstones");
+  drainAll();
+
+  const after = db
+    .query("SELECT epic_id, tasks, jobs FROM epics ORDER BY epic_id ASC")
+    .all() as { epic_id: string; tasks: string; jobs: string }[];
+  expect(after).toEqual(before);
+  // And the fact is still true after the re-fold.
+  expect(getEmbeddedMonitorFact("fn-1-foo.9", TEST_UUID)).toBe(true);
+});
+
+test("v59 monitor fact: refreshes the embedded element EVEN when the sub-agent guard swallows the state flip", () => {
+  // The keystone for the dedicated write site: the monitors snapshot-replace
+  // is hoisted ABOVE the sub-agent guard, so a mid-Task-yield Stop refreshes
+  // jobs.monitors but SKIPS the state='stopped' UPDATE + its syncIfPlanRef
+  // fan-out. The explicit stampEmbeddedMonitorFact call must still update the
+  // embedded occupancy fact in that swallow case.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: TEST_UUID,
+    spawn_name: "work::fn-1-foo.10",
+  });
+  // Drive the job to `working` so the guard has a non-stopped state to
+  // PROTECT (a SessionStart alone lands the job at `stopped`).
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: TEST_UUID });
+  drainAll();
+  expect(getEmbeddedTaskJob("fn-1-foo.10", TEST_UUID)?.state).toBe("working");
+  // Inject a still-running subagent_invocations row so the guard fires.
+  const subTs = tsCounter++;
+  db.run(
+    `INSERT INTO subagent_invocations (job_id, agent_id, turn_seq,
+      subagent_type, status, ts, last_event_id, updated_at)
+     VALUES (?, 'sub-g', 1, 'general', 'running', ?, ?, ?)`,
+    [TEST_UUID, subTs, getCursor(), subTs],
+  );
+  // A Stop carrying a live bash-bg monitor. The state flip is swallowed by
+  // the sub-agent guard (state stays `working`), but the embedded occupancy
+  // fact must still update — proving the dedicated stamp site, not
+  // syncIfPlanRef (which the guard skips), keeps the fact honest.
+  insertBashBgLaunch("suite-guard", TEST_UUID);
+  insertStopWithTasksFor([{ id: "suite-guard", type: "shell" }]);
+  drainAll();
+  // State NOT flipped to stopped (guard swallowed the flip)...
+  expect(getEmbeddedTaskJob("fn-1-foo.10", TEST_UUID)?.state).toBe("working");
+  // ...but the occupancy fact IS honest.
+  expect(getEmbeddedMonitorFact("fn-1-foo.10", TEST_UUID)).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
 // fn-717.1 — cold-blob relocation (event_blobs) read plumbing
 // ---------------------------------------------------------------------------
 

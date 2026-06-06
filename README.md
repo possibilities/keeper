@@ -1428,7 +1428,47 @@ monitors → sub-agents): a primary `[<kind>] <description-or-id>` line plus,
 when the entry has a command, an indented continuation line carrying the
 command's first non-empty line. keeper-py's `SUPPORTED_SCHEMA_VERSIONS`
 frozenset gains `51` (whitelist-only; keeper-py reads neither
-`jobs.monitors` nor `background_tasks`).
+`jobs.monitors` nor `background_tasks`). The top-level `jobs.monitors`
+column is the render-layer view; readiness consumes a *provenance-filtered*
+derivative of it carried onto the embedded job (see schema v59 below) — so
+v51 is no longer purely display-only.
+
+As of schema v59 (fn-719 task 1), a provenance-filtered
+`has_live_worker_monitor` occupancy fact rides onto the embedded
+`epics.tasks[].jobs[]` element so the autopilot's readiness pipeline can see
+it (the top-level `jobs.monitors` column from v51 is a render-only
+projection `src/readiness.ts` never reads, and the embedded job shape
+readiness operates on did not carry it). The boolean is derived by
+`hasLiveWorkerMonitor(jobs.monitors)`: `true` iff ANY entry is a
+WORKER-LAUNCHED monitor (`kind in {monitor, bash-bg}`) — `ambient`
+session-watchers (the plugin-armed chatctl bus, a never-claimed background
+shell) NEVER count, because they were not launched by the work session's
+own turn and must not occupy the autopilot mutex. It is stamped at the Stop
+fold's `jobs.monitors`-write site (the only seam that refreshes the monitor
+set, and hoisted ABOVE the sub-agent guard — so a mid-Task-yield Stop that
+refreshes monitors but skips the `state='stopped'` UPDATE still keeps the
+embedded fact honest), then PRESERVED across later job-tick re-syncs by the
+`buildEmbeddedJob` OLD-element carve-out (the fn-670 T2
+`last_commit_for_task_at` precedent). A SessionEnd / Killed terminal write
+clears `jobs.monitors` to `'[]'`, and an explicit terminal stamp forces the
+embedded fact to `false` (the carve-out would otherwise preserve a stale
+`true` forward) — so a terminal job auto-resolves the fact for free. The
+field rides FREE inside the existing opaque JSON-TEXT `tasks` cell: NO new
+real column, a whitelist-only v58→v59 bump. The bump is FIX-FORWARD (no
+cursor rewind — the v53→v54 / fn-695 precedent): the field is purely
+additive with a safe absent ≡ `false` default (`buildEmbeddedJob`
+nullish-coalesces a pre-v59 stored element's missing field to `false`), and
+the next Stop event re-stamps the real value, so an existing row needs no
+backfill. Every input is event-derived (no fold-time wall clock / env / fs /
+liveness probe), so a from-scratch cursor=0 re-fold reproduces byte-identical
+`epics` rows. A later readiness change (epic fn-719 task 2) reads the
+embedded fact to hold
+the per-epic / per-root mutex while a stopped session's backgrounded suite
+is still running, with the embedded job's `updated_at` (bumped by the
+monitors-only Stop write) as the staleness lease anchor.
+keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `59`
+(whitelist-only; keeper-py reads neither `jobs.monitors` nor the embedded
+occupancy fact).
 As of schema v50 (fn-678), the new `pending_dispatches` projection table
 (keyed by `(verb, id)`) is the durable launch-window occupancy signal that
 replaced the fn-674 live zellij tab-name probe. A `Dispatched` synthetic

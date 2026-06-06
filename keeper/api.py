@@ -208,6 +208,14 @@ from pathlib import Path
 # daemon-side compaction relocator can NULL the hot column after moving a cold
 # blob into ``event_blobs``. keeper-py still never reads ``events.data``, so no
 # reader logic changes — only the version whitelist gains 58.
+#
+# v59 (fn-719 task 1) is also whitelist-only: it carries a provenance-filtered
+# ``has_live_worker_monitor`` occupancy fact onto the embedded
+# ``epics.tasks[].jobs[]`` element (riding FREE inside the opaque JSON-TEXT
+# ``tasks`` cell — no new real column). keeper-py reads neither
+# ``jobs.monitors`` nor the embedded occupancy fact; readiness + the autopilot
+# reconciler are the only consumers — so no reader logic changes, only the
+# version whitelist gains 59.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -238,6 +246,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         56,
         57,
         58,
+        59,
     }
 )
 

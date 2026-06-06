@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 58;
+export const SCHEMA_VERSION = 59;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -5723,6 +5723,48 @@ function migrate(db: Database): void {
           );
         }
       }
+
+      // v58→v59: fn-719 (task 1) — carry a provenance-filtered
+      // `has_live_worker_monitor` occupancy fact onto the embedded
+      // `epics.tasks[].jobs[]` element. The reducer derives it via
+      // `hasLiveWorkerMonitor(jobs.monitors)` (`true` iff a worker-launched
+      // `monitor`/`bash-bg` entry is present — `ambient` watchers never
+      // count) and stamps it at the Stop fold's monitors-write site,
+      // preserving it across job-tick re-syncs through the `buildEmbeddedJob`
+      // OLD-element carve-out (the fn-670 T2 `last_commit_for_task_at`
+      // precedent). Readiness (task 2) reads the embedded fact to hold the
+      // autopilot mutex while a stopped session's backgrounded suite is
+      // still live.
+      //
+      // WHITELIST-ONLY: the fact rides FREE inside the existing opaque
+      // JSON-TEXT `epics.tasks` cell — NO new real column, NO
+      // `addColumnIfMissing`. Mirrors the v48→v49 (fn-670 T2) whitelist-only
+      // template.
+      //
+      // NO cursor rewind — this is a FIX-FORWARD bump (the v53→v54 / fn-695
+      // precedent, NOT the rewind-and-redrain v51→v52 / v52→v53 slots). The
+      // field is purely ADDITIVE with a safe absent ≡ `false` default:
+      // `buildEmbeddedJob` nullish-coalesces a pre-v59 stored element's
+      // missing field to `false` (the correct "no live worker monitor"
+      // reading), and the very next Stop event re-stamps the real value via
+      // `stampEmbeddedMonitorFact`. So an existing row needs no backfill —
+      // it reads `false` until its session next Stops, exactly as a
+      // steady-state v59 install would have it before that Stop. A
+      // rewind-and-redrain WOULD also converge (every derive input is
+      // event-derived), but it is unnecessary here and would nuke the
+      // direct-seeded projection rows that the column-shape migration tests
+      // (v54→v55 drop, v55→v56 default_visible rewrite) assert survive their
+      // own migration. Re-fold determinism is preserved either way: a
+      // from-scratch cursor=0 re-fold reproduces the field byte-identically
+      // because `hasLiveWorkerMonitor` is a pure function of the
+      // event-derived `jobs.monitors` snapshot.
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds
+      // 59 in the SAME change — whitelist-only (keeper-py reads neither
+      // `jobs.monitors` nor the embedded occupancy fact; readiness +
+      // autopilot are the only consumers), but the bump is required so
+      // keeper-py's Python readers (e.g. `planctl render-approve-context`)
+      // on this host don't fail-loud (test/schema-version.test.ts enforces).
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
