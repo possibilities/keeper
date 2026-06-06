@@ -113,5 +113,5 @@ tests in this task — that is expected.
 - [ ] `conftest.py` module docstring updated (present tense, no backward-facing advice); `uv run pytest -q` all-green; collection clean under `--strict-markers`.
 
 ## Done summary
-
+Built the seed_state() git-free .planctl/ builder routing epic/task dicts through normalize_epic/normalize_task + atomic_write_json + _task_spec, plus isolated_roots/mock_sketch_refs/fixed_clock fixtures, the integration marker, --strict-markers, pytest-asyncio removal, and a round-trip fidelity self-test. Suite stays all-green (799 passed, 2 skipped).
 ## Evidence
