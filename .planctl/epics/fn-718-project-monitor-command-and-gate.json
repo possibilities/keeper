@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-718-project-monitor-command-and-gate",
   "bundles": [],
   "closer_done_at": "2026-06-06T00:19:14.402594Z",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-06T00:19:14.402594Z"
+  "updated_at": "2026-06-06T00:20:20.348373Z"
 }
