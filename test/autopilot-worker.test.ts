@@ -150,6 +150,10 @@ interface FakeDepsLog {
   dispatchedEmissions: DispatchedPayload[];
   findJobCalls: Array<{ verb: string; id: string; watermark: number }>;
   maxEventIdCalls: number;
+  // fn-720: every `recordTimeoutBackstop` call from confirmRunning — a
+  // pre-ceiling confirm posts `{rescued:false, stalenessMs:null}`, a
+  // ceiling-hit posts `{rescued:true, stalenessMs:<elapsedMs>}`.
+  timeoutBackstops: Array<{ rescued: boolean; stalenessMs: number | null }>;
 }
 
 interface FakeDepsOptions {
@@ -187,6 +191,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     dispatchedEmissions: [],
     findJobCalls: [],
     maxEventIdCalls: 0,
+    timeoutBackstops: [],
   };
   let maxEventId = opts.maxEventId ?? 100;
   const jobsByKey = new Map<string, FoundJob>(opts.jobsByKey ?? []);
@@ -240,6 +245,9 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
           { once: true },
         );
       });
+    },
+    recordTimeoutBackstop(args) {
+      log.timeoutBackstops.push({ ...args });
     },
     pollIntervalMs: opts.pollIntervalMs ?? 5,
     ceilingMs: opts.ceilingMs ?? 50,
@@ -696,6 +704,99 @@ test("confirmRunning BAD (fn-674 dead launch): ceiling elapses, NO tab and NO jo
   expect(emission?.id).toBe("fn-1-foo.1");
   expect(emission?.reason).toContain("confirm timeout");
   expect(emission?.dir).toBe("/repo");
+});
+
+// ---------------------------------------------------------------------------
+// fn-720: confirmRunning timeout-class backstop telemetry
+// ---------------------------------------------------------------------------
+
+test("confirmRunning ceiling-hit: posts a timeout rescue with elapsedMs staleness; DispatchFailed unchanged", async () => {
+  // Ceiling elapses with NO jobs row → the `timeout`-class backstop RESCUED a
+  // stuck dispatch. The telemetry record carries rescued:true and
+  // stalenessMs = the elapsed-since-dispatch poll duration (= ceilingMs, since
+  // the loop runs full pollIntervalMs ticks up to the ceiling). The existing
+  // DispatchFailed emit must be unchanged.
+  const { deps, log } = makeFakeDeps({
+    maxEventId: 100,
+    pollIntervalMs: 5,
+    ceilingMs: 20,
+  });
+  const ctrl = new AbortController();
+  const outcome = await confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh", "-c", "true"],
+    ctrl.signal,
+    deps,
+  );
+  expect(outcome).toBe("failed");
+  // DispatchFailed emit unchanged (the telemetry is strictly additive).
+  expect(log.emissions.length).toBe(1);
+  expect(log.emissions[0]?.reason).toContain("confirm timeout");
+  // Exactly one timeout-backstop record, the rescue.
+  expect(log.timeoutBackstops.length).toBe(1);
+  const rec = log.timeoutBackstops[0];
+  expect(rec?.rescued).toBe(true);
+  // elapsedMs accumulates pollIntervalMs ticks to the ceiling → 20ms.
+  expect(rec?.stalenessMs).toBe(20);
+});
+
+test("confirmRunning pre-ceiling confirm: bumps the rescued:false denominator (no DispatchFailed)", async () => {
+  // The jobs row lands before the ceiling → the ceiling did NOT have to
+  // rescue. confirmRunning still calls recordTimeoutBackstop, but with
+  // rescued:false and stalenessMs:null — the denominator the rescue RATE
+  // divides into. No DispatchFailed emit on the happy path.
+  const { deps, log, setJobByKey } = makeFakeDeps({
+    maxEventId: 100,
+    pollIntervalMs: 5,
+    ceilingMs: 100,
+  });
+  setJobByKey("work", "fn-1-foo.1", {
+    job_id: "j-1",
+    last_event_id: 150, // > watermark 100
+  });
+  const ctrl = new AbortController();
+  const outcome = await confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh", "-c", "true"],
+    ctrl.signal,
+    deps,
+  );
+  expect(outcome).toBe("ok");
+  expect(log.emissions).toEqual([]); // no DispatchFailed
+  expect(log.timeoutBackstops.length).toBe(1);
+  const rec = log.timeoutBackstops[0];
+  expect(rec?.rescued).toBe(false);
+  expect(rec?.stalenessMs).toBeNull();
+});
+
+test("confirmRunning aborted: no timeout-backstop record (shutdown is not a rescue)", async () => {
+  // A shutdown during the poll resolves "aborted" WITHOUT emitting
+  // DispatchFailed — and likewise must NOT post a timeout rescue (the
+  // dispatch was never confirmed nor genuinely failed).
+  const { deps, log } = makeFakeDeps({
+    maxEventId: 100,
+    pollIntervalMs: 5,
+    ceilingMs: 1000,
+  });
+  const ctrl = new AbortController();
+  const promise = confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh", "-c", "true"],
+    ctrl.signal,
+    deps,
+  );
+  // Abort mid-poll.
+  setTimeout(() => ctrl.abort(), 8);
+  const outcome = await promise;
+  expect(outcome).toBe("aborted");
+  expect(log.emissions).toEqual([]);
+  expect(log.timeoutBackstops).toEqual([]);
 });
 
 test("confirmRunning BAD: launch returns {ok:false} → failed immediately with surfaced reason", async () => {

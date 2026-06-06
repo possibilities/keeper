@@ -81,6 +81,8 @@ import {
   appendBackstopRecord,
   BackstopCounters,
   type BackstopMessage,
+  type BackstopRecord,
+  buildTimeoutRecord,
 } from "./backstop-telemetry";
 import { compactColdBlobs, countAbsentBlobs } from "./compaction";
 import {
@@ -330,6 +332,40 @@ export function selectExpiredPendingDispatches(
   // column and `event.ts` everywhere else in keeper). Compare in
   // milliseconds for a clean TTL constant.
   return rows.filter((r) => r.dispatched_at * 1000 < cutoffMs);
+}
+
+/**
+ * Build the fn-720 `timeout`-class {@link BackstopRecord} for every
+ * pending-dispatch row the TTL sweep expired. Each aged row is a
+ * `rescued:true` rescue — the sweep ceiling reclaimed a `pending_dispatches`
+ * slot the launch→SessionStart fast path never discharged — carrying
+ * `staleness_ms = elapsed-since-dispatch` (`dispatched_at` is unix SECONDS;
+ * the sidecar uses ms) and the `{verb,id}` triage detail. `backstop` is
+ * `pending-dispatch-sweep`, `worker` is `main` (main is the SOLE sidecar
+ * writer here — no Worker round-trip). The `timeout` class carries
+ * `fast_path:null` / `last_fast_path_at:null` (no fast-path notion), keeping
+ * it categorically distinct from the missed-wake heartbeats so the
+ * aggregation script never mixes their staleness histograms.
+ *
+ * Pure — `nowMs` is injected (a producer wall-clock read, legal outside any
+ * fold; tests pass a synthetic clock). The denominator (rescued:false for an
+ * empty sweep) is a counter bump the caller does directly, not a record line,
+ * so this returns `[]` for an empty `aged` set.
+ */
+export function buildPendingDispatchSweepRecords(
+  aged: { verb: string; id: string; dispatched_at: number }[],
+  nowMs: number,
+): BackstopRecord[] {
+  return aged.map((row) =>
+    buildTimeoutRecord({
+      backstop: "pending-dispatch-sweep",
+      worker: "main",
+      rescued: true,
+      now: nowMs,
+      stalenessMs: nowMs - row.dispatched_at * 1000,
+      detail: { verb: row.verb, id: row.id },
+    }),
+  );
 }
 
 /**
@@ -2241,11 +2277,20 @@ function runDaemon(): void {
       | DispatchFailedMessage
       | DispatchedMessage
       | DispatchExpiredMessage
+      | BackstopMessage
       | undefined
     >,
   ): void => {
     const msg = ev.data;
     if (!msg) return;
+    if (msg.kind === "backstop") {
+      // Epic fn-720: a `timeout`-class backstop rescue/rollup from the
+      // autopilot `confirmRunning` ceiling. Main is the SOLE sidecar writer —
+      // append the line and return. NOT an event fold (a pure consumer-side
+      // side-file, never read by the reducer).
+      handleBackstopMessage(msg);
+      return;
+    }
     if (msg.kind === "dispatch-failed") {
       handleDispatchFailedMint(msg.payload);
     } else if (msg.kind === "dispatched") {
@@ -2475,12 +2520,33 @@ function runDaemon(): void {
       );
       return;
     }
-    if (aged.length === 0) return;
+    if (aged.length === 0) {
+      // fn-720: the sweep fired but found nothing to expire — the
+      // `rescued:false` denominator. Bump the counter only (no line); the
+      // periodic + on-shutdown rollup carries it. `pending-dispatch-sweep` is
+      // a `timeout`-class backstop (elapsed-since-dispatch, no fast-path
+      // notion).
+      mainBackstopCounters.bump("pending-dispatch-sweep", "timeout", false);
+      return;
+    }
+    // fn-720: each expired row is a `rescued:true` timeout rescue — the TTL
+    // ceiling reclaimed a stuck `pending_dispatches` slot the
+    // launch→SessionStart fast path never discharged. Build the records ONCE
+    // off a single `Date.now()` so every row in this pass shares the sweep's
+    // wall-clock (the pure helper is unit-tested in daemon.test.ts). Strictly
+    // ADDITIVE — rides ALONGSIDE the `DispatchExpired` mint below without
+    // changing it. Main is the SOLE sidecar writer here, so the lines are
+    // written directly (no Worker round-trip).
+    const sweepRecords = buildPendingDispatchSweepRecords(aged, Date.now());
     for (const row of aged) {
       // Mint the expire event. Failures inside the helper are logged
       // and swallowed (non-fatal), so a per-row throw does not abort
       // the sweep — every aged row gets its own shot.
       handleDispatchExpiredMint({ verb: row.verb as Verb, id: row.id });
+      mainBackstopCounters.bump("pending-dispatch-sweep", "timeout", true);
+    }
+    for (const rec of sweepRecords) {
+      appendBackstopRecord(rec, backstopLogPath);
     }
     // `handleDispatchExpiredMint` already pumps wakes on each mint;
     // the trailing flag is defense-in-depth in case the helper ever

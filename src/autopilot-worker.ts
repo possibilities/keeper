@@ -101,6 +101,11 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import {
+  BackstopCounters,
+  type BackstopMessage,
+  buildTimeoutRecord,
+} from "./backstop-telemetry";
 import { openDb } from "./db";
 import { resolveExecBackend } from "./exec-backend";
 import { computeReadiness, type Verdict } from "./readiness";
@@ -445,6 +450,26 @@ export interface ConfirmRunningDeps {
    * a worker that registers under the wrong plugin name and dies.
    */
   checkWorkPlugin?(tier: string): WorkPluginCheck;
+  /**
+   * Report the autopilot `confirmRunning` ceiling backstop fire (epic
+   * fn-720, `timeout` class). Called exactly once per confirm: on a
+   * SessionStart that lands BEFORE the ceiling with `rescued:false`,
+   * `stalenessMs:null` (the denominator — a healthy fast path) and on a
+   * ceiling-hit with `rescued:true`, `stalenessMs:elapsedMs` (the
+   * rescue — SessionStart never arrived, so the ceiling failed the
+   * dispatch). The live worker bumps its {@link BackstopCounters} and, on
+   * a rescue, posts the {@link buildTimeoutRecord} `timeout` record up to
+   * main (the sole sidecar writer); the record carries `fast_path:null` /
+   * `last_fast_path_at:null` (timeout has no fast-path notion).
+   *
+   * Optional: when absent the call is a no-op (tests that don't exercise
+   * telemetry skip wiring it). STRICTLY ADDITIVE — it never perturbs the
+   * existing `DispatchFailed` emit or the dispatch gates.
+   */
+  recordTimeoutBackstop?(args: {
+    rescued: boolean;
+    stalenessMs: number | null;
+  }): void;
   /**
    * Tuning knobs — exposed as deps so tests can drive a 5ms / 50ms
    * cadence instead of seconds. Defaults applied in `runConfirmCycle`
@@ -833,6 +858,11 @@ export async function confirmRunning(
     elapsedMs += sleepMs;
     const hit = deps.findJob(verb, id, watermark);
     if (hit != null) {
+      // fn-720: the ceiling did NOT have to rescue this dispatch — the
+      // SessionStart jobs row landed before the ceiling. Counted as the
+      // `rescued:false` denominator so the rescue RATE is honest; no record
+      // line is written for the no-op (the counter rollup carries it).
+      deps.recordTimeoutBackstop?.({ rescued: false, stalenessMs: null });
       return "ok";
     }
     if (signal.aborted) {
@@ -847,6 +877,12 @@ export async function confirmRunning(
     dir: cwd === "" ? null : cwd,
     ts: deps.now(),
   });
+  // fn-720: the ceiling RESCUED a stuck dispatch (SessionStart never arrived).
+  // `stalenessMs` is the elapsed-since-dispatch poll duration in ms — distinct
+  // from the missed-wake class's now−last_fast_path_at semantics. Strictly
+  // additive: this rides ALONGSIDE the DispatchFailed emit above without
+  // changing it.
+  deps.recordTimeoutBackstop?.({ rescued: true, stalenessMs: elapsedMs });
   return "failed";
 }
 
@@ -1198,6 +1234,46 @@ function main(): void {
   // `$SHELL` for the launch argv (`buildLaunchArgv`). Resolved once.
   const shell = process.env.SHELL ?? "/bin/sh";
 
+  // ── fn-720 backstop telemetry (timeout class) ──────────────────────────────
+  // The autopilot `confirmRunning` ceiling is a `timeout`-class backstop — it
+  // measures elapsed-since-dispatch, has NO fast-path notion (so the record
+  // carries `fast_path:null` / `last_fast_path_at:null`), and already emits a
+  // `DispatchFailed` on ceiling-hit. This adds the uniform telemetry record
+  // ALONGSIDE that emit without changing dispatch behavior: every confirm bumps
+  // the counter (a pre-ceiling confirm as `rescued:false`, the denominator; a
+  // ceiling-hit as `rescued:true`, the numerator), and a rescue ALSO posts the
+  // `buildTimeoutRecord` line up to main (the SOLE sidecar writer). A periodic
+  // + on-shutdown rollup flushes the denominator so a slow worker's metric
+  // survives without a line per no-op confirm.
+  const BACKSTOP_ROLLUP_FLUSH_MS = 5 * 60_000;
+  const backstopCounters = new BackstopCounters();
+  const flushBackstopRollups = (): void => {
+    for (const rollup of backstopCounters.snapshot(Date.now())) {
+      parentPort?.postMessage({
+        kind: "backstop",
+        record: rollup,
+      } satisfies BackstopMessage);
+    }
+  };
+  const recordTimeoutBackstop = (args: {
+    rescued: boolean;
+    stalenessMs: number | null;
+  }): void => {
+    backstopCounters.bump("autopilot-ceiling", "timeout", args.rescued);
+    if (args.rescued) {
+      parentPort?.postMessage({
+        kind: "backstop",
+        record: buildTimeoutRecord({
+          backstop: "autopilot-ceiling",
+          worker: "autopilot-worker",
+          rescued: true,
+          now: Date.now(),
+          stalenessMs: args.stalenessMs,
+        }),
+      } satisfies BackstopMessage);
+    }
+  };
+
   // Side-effect deps for the reconcile + confirm cycle. Reads run on the
   // worker's OWN read-only connection; the worker NEVER writes the DB —
   // a DispatchFailed is described to main via `postMessage` (main is the
@@ -1239,6 +1315,7 @@ function main(): void {
     now: () => Math.floor(Date.now() / 1000),
     sleep: (ms, signal) => abortableSleep(ms, signal),
     checkWorkPlugin: (tier) => checkWorkPluginManifest(tier),
+    recordTimeoutBackstop,
   };
 
   // Single-flight reconcile drive. `watchLoop` fires this callback on
@@ -1284,6 +1361,18 @@ function main(): void {
     }
   };
 
+  // fn-720: periodic backstop-rollup flush — checkpoint the denominator
+  // (fires_total / rescues_total) so the metric survives a crash without a
+  // line per no-op confirm. Final-flushed on either watch-loop exit below.
+  const rollupTimer = setInterval(() => {
+    if (shutdown) return;
+    try {
+      flushBackstopRollups();
+    } catch (err) {
+      console.error("[autopilot-worker] backstop rollup flush failed:", err);
+    }
+  }, BACKSTOP_ROLLUP_FLUSH_MS);
+
   // Bind the unpause/boot kick now that `driveCycle` exists, then run one
   // cycle immediately. The boot cycle is a no-op for launches while paused
   // (the safety default); the play-edge kick (above) is what dispatches
@@ -1302,11 +1391,16 @@ function main(): void {
     data.pollMs,
   )
     .then(() => {
+      clearInterval(rollupTimer);
+      // Final rollup flush so the on-shutdown denominator lands before exit.
+      flushBackstopRollups();
       closeDb();
       process.exit(0);
     })
     .catch((err) => {
       console.error("[autopilot-worker] watch loop crashed:", err);
+      clearInterval(rollupTimer);
+      flushBackstopRollups();
       closeDb();
       process.exit(1);
     });

@@ -7,12 +7,17 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  appendBackstopRecord,
+  BackstopCounters,
+} from "../src/backstop-telemetry";
+import {
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
+  buildPendingDispatchSweepRecords,
   drainToCompletion,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
@@ -2020,6 +2025,91 @@ test("selectExpiredPendingDispatches on an empty pending_dispatches table return
   const { db } = openDb(dbPath);
   expect(selectExpiredPendingDispatches(db, 1_700_000_000_000)).toEqual([]);
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// fn-720 task .3 — pending-dispatch sweep backstop telemetry (timeout class)
+// ---------------------------------------------------------------------------
+
+test("buildPendingDispatchSweepRecords: an expired row posts a timeout rescue with elapsed-since-dispatch staleness", () => {
+  // The sweep's per-row telemetry is a `timeout`-class rescue: fast_path and
+  // last_fast_path_at are ALWAYS null (no fast-path notion), staleness_ms is
+  // elapsed-since-dispatch (now − dispatched_at*1000), and the {verb,id}
+  // triage detail rides along. backstop/worker pin to the sweep + main.
+  const dispatchedAtSec = 1_699_000_000;
+  const nowMs = dispatchedAtSec * 1000 + 150_000; // 150s after dispatch
+  const aged = [
+    { verb: "work", id: "fn-1-foo.1", dispatched_at: dispatchedAtSec },
+  ];
+  const recs = buildPendingDispatchSweepRecords(aged, nowMs);
+  expect(recs.length).toBe(1);
+  const rec = recs[0];
+  expect(rec?.kind).toBe("backstop-rescue");
+  expect(rec?.class).toBe("timeout");
+  expect(rec?.backstop).toBe("pending-dispatch-sweep");
+  expect(rec?.worker).toBe("main");
+  expect(rec?.rescued).toBe(true);
+  expect(rec?.staleness_ms).toBe(150_000);
+  // timeout class carries null fast_path / last_fast_path_at (epic acceptance).
+  expect(rec?.fast_path).toBeNull();
+  expect(rec?.last_fast_path_at).toBeNull();
+  expect(rec?.detail).toEqual({ verb: "work", id: "fn-1-foo.1" });
+});
+
+test("buildPendingDispatchSweepRecords: an empty sweep yields no records (denominator-only)", () => {
+  // An empty sweep writes NO line — it only bumps the rescued:false
+  // denominator (a counter bump the caller does directly). The helper returns
+  // [] so the no-op sweep never spams the sidecar.
+  expect(buildPendingDispatchSweepRecords([], 1_700_000_000_000)).toEqual([]);
+});
+
+test("pending-dispatch sweep telemetry round-trips to the sidecar; empty sweep bumps the rescued:false denominator", () => {
+  // Mirrors the daemon-side sweep composition end to end: aged rows →
+  // buildPendingDispatchSweepRecords → appendBackstopRecord (main is the SOLE
+  // sidecar writer); an EMPTY sweep bumps the rescued:false denominator on the
+  // shared BackstopCounters. Asserts the rescue line lands on disk and the
+  // rollup carries fires_total > rescues_total once a no-op sweep is counted.
+  const logPath = join(tmpDir, "backstop.ndjson");
+  const counters = new BackstopCounters();
+
+  // Rescue pass: one aged row → one record line + a rescued:true counter bump.
+  const dispatchedAtSec = 1_699_000_000;
+  const nowMs = dispatchedAtSec * 1000 + 200_000;
+  const aged = [
+    { verb: "work", id: "fn-2-bar.3", dispatched_at: dispatchedAtSec },
+  ];
+  const recs = buildPendingDispatchSweepRecords(aged, nowMs);
+  for (const rec of recs) {
+    appendBackstopRecord(rec, logPath);
+    counters.bump("pending-dispatch-sweep", "timeout", true);
+  }
+
+  // Empty sweep: no record line, just the rescued:false denominator bump.
+  expect(buildPendingDispatchSweepRecords([], nowMs)).toEqual([]);
+  counters.bump("pending-dispatch-sweep", "timeout", false);
+
+  // The sidecar has exactly the one rescue line, parseable as the timeout
+  // record (reader tolerates the trailing newline → final empty segment).
+  const lines = readFileSync(logPath, "utf8")
+    .split("\n")
+    .filter((l) => l.length > 0);
+  expect(lines.length).toBe(1);
+  const parsed = JSON.parse(lines[0] ?? "{}");
+  expect(parsed.class).toBe("timeout");
+  expect(parsed.backstop).toBe("pending-dispatch-sweep");
+  expect(parsed.rescued).toBe(true);
+  expect(parsed.staleness_ms).toBe(200_000);
+  expect(parsed.fast_path).toBeNull();
+  expect(parsed.last_fast_path_at).toBeNull();
+
+  // The rollup denominator reflects BOTH fires (one rescue + one no-op) so
+  // scripts/backstop-stats.ts can compute a true rescue RATE (1/2).
+  const rollups = counters.snapshot(nowMs);
+  expect(rollups.length).toBe(1);
+  expect(rollups[0]?.backstop).toBe("pending-dispatch-sweep");
+  expect(rollups[0]?.class).toBe("timeout");
+  expect(rollups[0]?.fires_total).toBe(2);
+  expect(rollups[0]?.rescues_total).toBe(1);
 });
 
 // fn-701 task .3 — @parcel/watcher pre-warm. The native-addon dlopen race is
