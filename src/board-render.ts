@@ -524,7 +524,13 @@ function bucketForToken(token: string): PillBucket | undefined {
   }
   // fn-638.4: `running:sub-agent-stale` → warn (distinct from fresh
   // `running:*` blue); MUST precede the generic `running:` fallback.
-  if (bucket === undefined && token === "running:sub-agent-stale") {
+  // fn-719: `running:monitor-stale` joins it — a past-soft-TTL live-worker
+  // monitor still occupies the mutex but renders distinctly so a human sees
+  // the possibly-abandoned slot.
+  if (
+    bucket === undefined &&
+    (token === "running:sub-agent-stale" || token === "running:monitor-stale")
+  ) {
     bucket = "warn";
   }
   if (bucket === undefined && token.startsWith("running:")) {

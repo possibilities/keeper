@@ -96,6 +96,11 @@ export const FA_CLASSIC: IconTheme = {
     "running:planner-running": FA.pencil,
     "running:sub-agent-running": FA.cogs,
     "running:sub-agent-stale": FA.exclTriangle,
+    // fn-719: a live worker-launched monitor (backgrounded suite) occupying
+    // the mutex — `eye` mirrors the `monitor` SessionLifecycle glyph; the
+    // stale variant shares the warn triangle with `sub-agent-stale`.
+    "running:monitor-running": FA.eye,
+    "running:monitor-stale": FA.exclTriangle,
     // (every `blocked:<reason>` → FA.ban via the prefix map below.)
 
     // --- SessionLifecycle ---

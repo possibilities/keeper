@@ -270,6 +270,8 @@ export type RunningReason =
   | { kind: "job-running" }
   | { kind: "sub-agent-running" }
   | { kind: "sub-agent-stale" }
+  | { kind: "monitor-running" }
+  | { kind: "monitor-stale" }
   | { kind: "planner-running" };
 
 /**
@@ -302,6 +304,56 @@ export type RunningReason =
  * surviving sub-agent is suspect.
  */
 export const SUBAGENT_STALENESS_SEC = 120;
+
+/**
+ * Soft staleness lease for the `monitor-running` → `monitor-stale`
+ * `RunningReason` split (fn-719 task 2). A task whose embedded work job
+ * carries the task-1 `has_live_worker_monitor` fact occupies the per-epic /
+ * per-root mutex; once the freshest occupying embedded job's `updated_at` is
+ * older than the caller-injected `now` by strictly more than this many
+ * seconds, the verdict surfaces `monitor-stale` instead of `monitor-running`
+ * — STILL occupying (a human-visible "this slot's monitor may be abandoned"
+ * affordance), but flagged.
+ *
+ * Lease, NOT heartbeat (the Temporal `HeartbeatTimeout` discipline): the
+ * anchor is the embedded job's `updated_at`, which bumps on every job-tick /
+ * turn-end seam — NOT the backgrounded suite's own runtime. A multi-hour
+ * suite still re-stamps `updated_at` once per agent turn-end, so this lease
+ * is calibrated to the gap between turn-ends (a few minutes), with a 3–5×
+ * safety factor — 600s (10 min) ≈ a generous turn-end cadence × ~5. Too
+ * short would false-kill a legitimately long, quietly-running suite; the
+ * hard ceiling {@link MONITOR_RELEASE_SEC} below catches the genuinely
+ * abandoned case.
+ *
+ * Determinism: the comparison `now - updated_at > MONITOR_STALENESS_SEC` is a
+ * pure function of the injected `now` and the embedded element's `updated_at`
+ * — read-time, NEVER folded (the sanctioned re-fold-determinism exception,
+ * mirroring {@link SUBAGENT_STALENESS_SEC}). Live callers pass
+ * `Math.floor(Date.now()/1000)`; the autopilot simulator and don't-care tests
+ * pass `Number.NEGATIVE_INFINITY` (the parameter default) so the staleness /
+ * release branches never fire for them.
+ */
+export const MONITOR_STALENESS_SEC = 600;
+
+/**
+ * Hard release ceiling for a live-worker-monitor occupant (fn-719 task 2).
+ * The second of the two lease knobs ("whichever fires first"): once the
+ * freshest occupying embedded job's `updated_at` is older than the injected
+ * `now` by strictly more than this many seconds, the monitor fact NO LONGER
+ * occupies the mutex at all — the slot is released so a stopped-but-abandoned
+ * session can't wedge it forever (a single long "to-be-safe" TTL becomes a
+ * dead resource lock; the soft TTL above gives visibility, this ceiling
+ * guarantees liveness). 1800s (30 min) ≫ MONITOR_STALENESS_SEC so the
+ * `monitor-stale` window is wide enough to be seen before the slot frees.
+ *
+ * Terminal `ended`/`killed` already clears the fact for free (task 1 forces
+ * `has_live_worker_monitor=false` on SessionEnd/Killed), so this ceiling only
+ * matters for a session that Stopped, was approved, but whose Stop snapshot
+ * still listed a live monitor that then never updated — the genuinely-
+ * abandoned slot. Same read-time / never-folded determinism as
+ * {@link MONITOR_STALENESS_SEC}.
+ */
+export const MONITOR_RELEASE_SEC = 1800;
 
 export type Verdict =
   | { tag: "ready" }
@@ -553,11 +605,23 @@ function evaluateTask(
   // so the `sub-agent-stale` verdict (predicate 6) keeps occupying the
   // per-root mutex by design — correctness over throughput; cleared by
   // autopilot pause + manual replay rather than auto-reaped.
+  //
+  // fn-719: the THIRD liveness clause — `!anyEmbeddedJobHasLiveMonitor`. A
+  // work session that backgrounded a test suite and yielded its turn flips
+  // its embedded job to `stopped` (so `anyEmbeddedJobWorking` is false) with
+  // no sub-agent in flight (so `anyEmbeddedJobHasRunningSubagent` is false),
+  // yet the suite is STILL RUNNING — the exact gate that collapsed
+  // `approve::fn-715.2` to `completed` while its suite ran, freeing the mutex
+  // and letting approve dispatch ~7s after the Stop. ANDing the task-1
+  // monitor fact holds the task at `running:monitor-running` (predicate 6.6
+  // below) until the monitor clears or its lease ages out, the same way the
+  // first two clauses hold it at `job-running` / `sub-agent-running`.
   if (
     task.worker_phase === "done" &&
     task.approval === "approved" &&
     !anyEmbeddedJobWorking(task.jobs) &&
-    !anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId)
+    !anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId) &&
+    !embeddedMonitorOccupies(task.jobs, now)
   ) {
     return { tag: "completed" };
   }
@@ -631,6 +695,46 @@ function evaluateTask(
       return { tag: "running", reason: { kind: "sub-agent-stale" } };
     }
     return { tag: "running", reason: { kind: "sub-agent-running" } };
+  }
+
+  // 6.6. monitor-running / monitor-stale (fn-719). A work session that
+  // backgrounded a test suite (`pnpm test` via Bash `run_in_background`) and
+  // then yielded its turn flips the embedded job to `stopped`, so predicates 5
+  // and 6 have both cleared — but the suite is STILL RUNNING. Task 1 carries
+  // the provenance-filtered `has_live_worker_monitor` fact (true only for
+  // worker-launched `monitor`/`bash-bg` monitors; `ambient` watchers never
+  // count) onto the embedded element; this predicate consumes it as an
+  // occupant verdict that holds the per-epic AND per-root mutex but is
+  // non-dispatchable (`verbForVerdict → null`). Without it the closer/approve
+  // dispatches into a not-actually-idle session — the live fn-715.2 incident
+  // (approve dispatched ~7s after the work Stop whose snapshot still listed a
+  // running suite).
+  //
+  // Placed AFTER predicate 6 (sub-agent) and BEFORE the git-6.5 predicate, the
+  // same race-window slot the sub-agent / git verdicts occupy: a more-specific
+  // running verdict (a still-`working` main job, a running sub-agent) wins, and
+  // a not-yet-validated / not-yet-materialized epic or an in-flight planner
+  // still outranks it (predicates 1.5/2/3 are above predicate 5).
+  //
+  // Lease/TTL staleness floor (`occupying = monitor-present AND snapshot-fresh`,
+  // two knobs, whichever fires first): the freshness anchor is the embedded
+  // job's `updated_at`, which re-stamps per agent turn-end (NOT the suite's own
+  // runtime). Past the soft `MONITOR_STALENESS_SEC` lease → `monitor-stale`
+  // (still occupying, human-visible "may be abandoned"); past the hard
+  // `MONITOR_RELEASE_SEC` ceiling → NO LONGER occupies (the slot frees so an
+  // abandoned session can't wedge it forever). Read-time, `now`-injected,
+  // never folded — same sanctioned determinism exception as the sub-agent
+  // split. Terminal SessionEnd/Killed already clears the fact for free at
+  // task 1, so the ceiling only matters for the Stop-then-never-updated case.
+  if (embeddedMonitorOccupies(task.jobs, now)) {
+    // Occupying (monitor present, within the hard ceiling). Split on the
+    // soft lease: past it → `monitor-stale` (still occupies, flagged);
+    // within it → `monitor-running`. The past-hard-ceiling release case is
+    // already excluded by `embeddedMonitorOccupies` — it falls through here.
+    if (allLiveMonitorsAreStale(task.jobs, now, MONITOR_STALENESS_SEC)) {
+      return { tag: "running", reason: { kind: "monitor-stale" } };
+    }
+    return { tag: "running", reason: { kind: "monitor-running" } };
   }
 
   // 6.5. git-uncommitted / git-orphans — mechanical gate that blocks autopilot's
@@ -927,6 +1031,21 @@ function evaluateCloseRow(
       return { tag: "running", reason: { kind: "sub-agent-stale" } };
     }
     return { tag: "running", reason: { kind: "sub-agent-running" } };
+  }
+
+  // 6.6. monitor-running / monitor-stale (fn-719) — close-row twin of the
+  // task-path predicate 6.6. Holds the close row at `running:monitor-*`
+  // while a live worker-launched monitor occupies any pooled scope (epic-
+  // level close-verb jobs — the PRIMARY case — or a completed task's work
+  // jobs, the backstop), so the closer/approve cannot dispatch into a
+  // not-actually-idle close session. Same soft-TTL → `monitor-stale` /
+  // hard-ceiling → release lease as the task path; the release boundary is
+  // shared via `closeRowMonitorOccupies` → `embeddedMonitorOccupies`.
+  if (closeRowMonitorOccupies(epic, perTask, now)) {
+    if (allCloseRowMonitorsAreStale(epic, perTask, now)) {
+      return { tag: "running", reason: { kind: "monitor-stale" } };
+    }
+    return { tag: "running", reason: { kind: "monitor-running" } };
   }
 
   // 6.5. git-uncommitted / git-orphans — close-row variant. Gated on
@@ -1537,6 +1656,100 @@ function allRunningSubagentsAreStale(
 }
 
 /**
+ * fn-719 (task 2): predicate-6.6 entry — does any embedded job carry the
+ * task-1 `has_live_worker_monitor` occupancy fact? `true` iff at least one
+ * element has a TRUE (non-`undefined`, non-`false`) flag. A pre-v59 stored
+ * element decodes the field as `undefined` → nullish-coalesced `false`, so
+ * the historical log reads "no live monitor" exactly as a steady-state v59
+ * install would before the session's next Stop re-stamps it.
+ *
+ * Provenance is already filtered at task 1: the reducer only stamps the flag
+ * `true` for worker-launched `monitor`/`bash-bg` monitors — an `ambient`
+ * session-watcher (e.g. the chatctl bus) NEVER sets it, so an ambient-only
+ * job reads `false` here and stays dispatchable. Mirrors
+ * {@link anyEmbeddedJobHasRunningSubagent} structurally.
+ */
+function anyEmbeddedJobHasLiveMonitor(
+  embedded: { has_live_worker_monitor?: boolean }[] | undefined,
+): boolean {
+  if (embedded === undefined) {
+    return false;
+  }
+  for (const job of embedded) {
+    if (job.has_live_worker_monitor === true) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * fn-719 (task 2): the soft-TTL staleness companion to
+ * {@link anyEmbeddedJobHasLiveMonitor}. Returns `true` iff EVERY embedded job
+ * carrying a live monitor has `now - updated_at > threshold` — i.e. the only
+ * occupying monitors are all past the soft lease. A single fresh live-monitor
+ * job keeps the verdict at `monitor-running` (the same "every, not any"
+ * discipline as {@link allRunningSubagentsAreStale}: if any monitor's session
+ * is still re-stamping `updated_at` per turn-end, the slot is genuinely live
+ * somewhere). Vacuous-truth on no live-monitor jobs — callers MUST gate on
+ * {@link anyEmbeddedJobHasLiveMonitor} first. Strict `>` so the boundary tick
+ * doesn't yet flip the pill, matching the sub-agent split.
+ *
+ * Read-time, never folded: `now` is caller-injected and compared against the
+ * embedded element's own `updated_at`; no `Date.now()` here.
+ */
+function allLiveMonitorsAreStale(
+  embedded:
+    | { has_live_worker_monitor?: boolean; updated_at: number }[]
+    | undefined,
+  now: number,
+  threshold: number,
+): boolean {
+  if (embedded === undefined) {
+    return false;
+  }
+  for (const job of embedded) {
+    if (job.has_live_worker_monitor !== true) {
+      continue;
+    }
+    if (now - job.updated_at <= threshold) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * fn-719 (task 2): the load-bearing OCCUPANCY predicate for a live worker
+ * monitor — `occupying = (monitor present) AND (snapshot not past the hard
+ * ceiling)`. Returns `true` iff some embedded job carries the task-1
+ * `has_live_worker_monitor` fact AND those monitors have NOT all aged past
+ * {@link MONITOR_RELEASE_SEC} (the hard release ceiling). A `monitor-stale`
+ * occupant (past the SOFT lease but within the ceiling) STILL occupies — the
+ * staleness split is a visibility affordance, not a release.
+ *
+ * Used in BOTH seams so the predicate-1 terminal-completed gate and the
+ * predicate-6.6 verdict release on the SAME boundary: if this returns false
+ * (no monitor, or every monitor past the hard ceiling), predicate 1 is free
+ * to collapse `done+approved` → `completed` and predicate 6.6 falls through —
+ * a single notion of "this slot is held by a live monitor". Threading the
+ * raw `anyEmbeddedJobHasLiveMonitor` into predicate 1 instead would wedge a
+ * past-ceiling abandoned monitor at `job-pending` forever (still an
+ * occupant), defeating the hard ceiling for the done+approved case.
+ */
+function embeddedMonitorOccupies(
+  embedded:
+    | { has_live_worker_monitor?: boolean; updated_at: number }[]
+    | undefined,
+  now: number,
+): boolean {
+  return (
+    anyEmbeddedJobHasLiveMonitor(embedded) &&
+    !allLiveMonitorsAreStale(embedded, now, MONITOR_RELEASE_SEC)
+  );
+}
+
+/**
  * fn-638.4: close-row variant of
  * {@link anyEmbeddedJobHasRunningSubagent}, pooling the
  * epic-level jobs AND every ALREADY-COMPLETED task-level jobs sub-array.
@@ -1616,6 +1829,71 @@ function allCloseRowRunningSubagentsAreStale(
         SUBAGENT_STALENESS_SEC,
       )
     ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * fn-719 (task 2): close-row variant of {@link embeddedMonitorOccupies},
+ * pooling every contributing scope (epic-level close jobs + every
+ * ALREADY-COMPLETED task's work jobs) — the same scopes
+ * {@link closeRowHasRunningSubagent} pools. Returns `true` iff SOME job in
+ * any pooled scope carries a live monitor that is NOT past the hard
+ * {@link MONITOR_RELEASE_SEC} ceiling. The task-level scan is scoped to
+ * `completed` tasks via `perTask` so it mirrors the sub-agent close-row
+ * scope exactly (a not-yet-completed task is already blocked-on by predicate
+ * 10's `dep-on-task`).
+ *
+ * After fn-719's per-task predicate 1 + 6.6, a `done+approved` task with a
+ * live monitor stays `running:monitor-*` (not `completed`), so the
+ * completed-task scan here is normally unreachable — the PRIMARY value is
+ * the epic-level close-verb monitor case (a `close` session that
+ * backgrounded its own suite). The completed-task scan is retained as a
+ * re-fold-determinism backstop, exactly like the sub-agent twin.
+ */
+function closeRowMonitorOccupies(
+  epic: Epic,
+  perTask: Map<string, Verdict>,
+  now: number,
+): boolean {
+  if (embeddedMonitorOccupies(epic.jobs, now)) {
+    return true;
+  }
+  for (const task of epic.tasks) {
+    if (perTask.get(task.task_id)?.tag !== "completed") {
+      continue;
+    }
+    if (embeddedMonitorOccupies(task.jobs, now)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * fn-719 (task 2): close-row variant of {@link allLiveMonitorsAreStale},
+ * pooling every contributing scope (epic-level close jobs + every
+ * ALREADY-COMPLETED task's work jobs). Returns `true` iff EVERY live monitor
+ * across every pooled scope is past `MONITOR_STALENESS_SEC` — one fresh
+ * monitor anywhere keeps the close row at `monitor-running`. Callers MUST
+ * gate on {@link closeRowMonitorOccupies} first; vacuous-truth otherwise.
+ * Same `completed`-scoped task scan as {@link closeRowMonitorOccupies}.
+ */
+function allCloseRowMonitorsAreStale(
+  epic: Epic,
+  perTask: Map<string, Verdict>,
+  now: number,
+): boolean {
+  if (!allLiveMonitorsAreStale(epic.jobs, now, MONITOR_STALENESS_SEC)) {
+    return false;
+  }
+  for (const task of epic.tasks) {
+    if (perTask.get(task.task_id)?.tag !== "completed") {
+      continue;
+    }
+    if (!allLiveMonitorsAreStale(task.jobs, now, MONITOR_STALENESS_SEC)) {
       return false;
     }
   }

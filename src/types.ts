@@ -955,6 +955,21 @@ export interface EmbeddedJob {
    * fn-633.6 lands.
    */
   git_orphan_count: number;
+  /**
+   * Schema v59 / fn-719: the provenance-filtered live-worker-monitor
+   * occupancy fact for THIS session, carried onto the embedded element by
+   * the reducer's `buildEmbeddedJob` (task 1). `true` iff a worker-launched
+   * `monitor`/`bash-bg` entry is present in `jobs.monitors` (`ambient`
+   * session-watchers like the chatctl bus NEVER count); terminal
+   * SessionEnd/Killed force it `false`. Optional + absent ≡ `false` so a
+   * pre-v59 stored element (decoded from the JSON-TEXT `tasks` cell, field
+   * absent → `undefined`) round-trips deterministically. Readiness (task 2)
+   * reads it to hold the per-epic / per-root mutex via the
+   * `monitor-running` / `monitor-stale` occupant verdicts while a work
+   * session's backgrounded suite is still live, so the closer/approve
+   * cannot dispatch into a not-actually-idle session (the fn-715.2 fix).
+   */
+  has_live_worker_monitor?: boolean;
 }
 
 /**

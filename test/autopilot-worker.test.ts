@@ -333,6 +333,23 @@ test("fn-712: verbForVerdict('task'|'close', blocked:epic-not-materialized) → 
   expect(verbForVerdict("close", v)).toBeNull();
 });
 
+test("fn-719: verbForVerdict(monitor-running | monitor-stale) → null (held slot stays undispatchable)", () => {
+  // Locks the autopilot side to the fn-719 readiness occupant: a task whose
+  // embedded work job carries a live worker-launched monitor renders
+  // `running:monitor-running` (or `running:monitor-stale` past the soft TTL).
+  // Both are `running` verdicts, so `verbForVerdict` already returns null (it
+  // only maps `ready` → work/close and `blocked:job-pending` → approve) — the
+  // occupied root holds the mutex but is NEVER handed an approve/work/close
+  // dispatch. This pins that occupancy never leaks into a dispatch, guarding
+  // against a future refactor that might map a `running` verdict to a verb.
+  const mr: Verdict = { tag: "running", reason: { kind: "monitor-running" } };
+  const ms: Verdict = { tag: "running", reason: { kind: "monitor-stale" } };
+  expect(verbForVerdict("task", mr)).toBeNull();
+  expect(verbForVerdict("close", mr)).toBeNull();
+  expect(verbForVerdict("task", ms)).toBeNull();
+  expect(verbForVerdict("close", ms)).toBeNull();
+});
+
 // ---------------------------------------------------------------------------
 // isOccupyingJob
 // ---------------------------------------------------------------------------

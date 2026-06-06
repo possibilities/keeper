@@ -383,15 +383,16 @@ firing correctly — check them before concluding it is broken:
   `output.emit()` seam (one transaction per mutating verb), so the gate
   trusts that an envelope `success: true` on stdout means the file is in
   HEAD.
-- **The mutex occupancy definition (one canonical set — fn-663 / fn-671 / fn-703).**
+- **The mutex occupancy definition (one canonical set — fn-663 / fn-671 / fn-703 / fn-719).**
   Both the per-epic mutex (`applySingleTaskPerEpicMutex`) and the per-root
   mutex (predicate 12) decide which verdicts CLAIM a slot via two shared
   predicates in `src/readiness.ts`: `isLiveWorkOccupant` (per-epic) and the
   narrower `isRootOccupant` (per-root, exempts `planner-running` — a planner
   holds no working tree, fn-663). The occupant set is: every `running` verdict
-  (job-running, sub-agent-running, sub-agent-stale, planner-running) PLUS the
-  three approval-pending blocked verdicts `job-pending`, `git-uncommitted`, and
-  `git-orphans`. Two facets fall out of that set:
+  (job-running, sub-agent-running, sub-agent-stale, monitor-running,
+  monitor-stale, planner-running) PLUS the three approval-pending blocked
+  verdicts `job-pending`, `git-uncommitted`, and `git-orphans`. Three facets
+  fall out of that set:
   - *Won't dispatch into a dirty repo.* Predicate 6.5 (block reason
     `git-uncommitted` / `git-orphans`) suppresses every approve dispatch whose
     target repo has `git_status.dirty_count > 0` (or unattributed-to-live
@@ -404,9 +405,11 @@ firing correctly — check them before concluding it is broken:
     to process liveness AND to repo cleanliness, and both race the mutex.
     Predicate 1 only collapses a task to `{tag:"completed"}` when
     `worker_phase==="done"` AND `approval==="approved"` AND no embedded job is
-    `working` AND no running sub-agent is bound — so until the Claude session
-    Stop/SessionEnd lands AND every sub-agent finishes, the task stays
-    `running:*` and occupies both mutexes (fn-671). And once the worker is idle
+    `working` AND no running sub-agent is bound AND no live worker-launched
+    monitor occupies (`embeddedMonitorOccupies`, fn-719) — so until the Claude
+    session Stop/SessionEnd lands AND every sub-agent finishes AND every
+    backgrounded worker suite clears (or ages past its hard lease), the task
+    stays `running:*` and occupies both mutexes (fn-671 / fn-719). And once the worker is idle
     but approval is still pending, the task renders `job-pending` OR — if its
     target repo is dirty — a predicate-6.5 git verdict; ALL THREE occupy, so the
     WHOLE done+approval-pending window holds the slot and a depless ready
@@ -423,6 +426,29 @@ firing correctly — check them before concluding it is broken:
     `Killed`-equivalent backstop and surfaces as `sub-agent-stale` (still
     mutex-occupying — correctness over throughput); clear by autopilot pause +
     manual replay rather than auto-reaper.
+  - *Won't release while a backgrounded worker suite is still live (fn-719).*
+    A work/close session that backgrounds a test suite (`pnpm test` via Bash
+    `run_in_background`) and yields its turn flips its embedded job to
+    `stopped` — so the `working` and sub-agent clauses both clear — while the
+    suite RUNS ON. Schema v59 / fn-719 carries a provenance-filtered
+    `has_live_worker_monitor` fact onto the embedded `tasks[].jobs[]` element
+    (true ONLY for worker-launched `monitor`/`bash-bg` monitors; `ambient`
+    session-watchers like the chatctl bus NEVER occupy). Readiness reads it as
+    the `monitor-running` occupant verdict (predicate 6.6, ranked after the
+    sub-agent predicate 6 and before git-6.5) which holds BOTH mutexes —
+    fixing the fn-715.2 incident where approve dispatched ~7s after the work
+    Stop whose snapshot still listed a running suite. Lease/TTL floor
+    (`occupying = monitor-present AND snapshot-fresh`, two knobs anchored on
+    the embedded job's `updated_at`, read-time and NEVER folded — the
+    sanctioned determinism exception): past the soft `MONITOR_STALENESS_SEC`
+    (600s) lease → `monitor-stale` (still occupies, a human-visible
+    "possibly-abandoned" affordance, the `sub-agent-stale` analogue); past the
+    hard `MONITOR_RELEASE_SEC` (1800s) ceiling → the slot is RELEASED so an
+    abandoned session can't wedge it forever (terminal SessionEnd/Killed clears
+    the fact for free at task 1). The held slot stays UNDISPATCHABLE:
+    `verbForVerdict` returns `null` for both `monitor-running` and
+    `monitor-stale` (a test pins it, the fn-700/fn-703 precedent), so occupancy
+    never leaks into a dispatch.
 - **Won't dispatch the closer against a taskless epic (fn-700).** A keeper
   epic and its tasks fold as two separate single-event transactions
   (`EpicSnapshot`, then `TaskSnapshot`); between them the epic exists with

@@ -131,6 +131,11 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     git_dirty_count: 0,
     git_unattributed_to_live_count: 0,
     git_orphan_count: 0,
+    // fn-719 (task 2): the task-1 live-worker-monitor occupancy fact.
+    // Default `false` (no backgrounded worker suite) so existing fixtures
+    // keep their pre-fn-719 verdicts; the monitor-occupancy tests below
+    // override it to `true`.
+    has_live_worker_monitor: false,
     ...overrides,
   };
 }
@@ -367,6 +372,249 @@ test("fn-671 regression: T1 done+approved with session-still-working; T2 depends
   );
   expect(snap.perTask.get(t2.task_id)).toEqual(
     blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// fn-719: live-worker-monitor occupancy. A work session that backgrounded a
+// test suite and yielded its turn flips its embedded job to `stopped` (so
+// predicates 5/6 clear) while the suite is STILL RUNNING. Task 1 carries the
+// provenance-filtered `has_live_worker_monitor` fact; predicate 1 ANDs in the
+// live-monitor check (so it can't collapse to `completed`) and predicate 6.6
+// surfaces `running:monitor-running` (a mutex occupant that NEVER dispatches).
+// MONITOR_STALENESS_SEC=600 (soft → `monitor-stale`), MONITOR_RELEASE_SEC=1800
+// (hard → release). The direct fn-715.2 repro is the first test.
+// ---------------------------------------------------------------------------
+
+test("fn-719: done+approved task with live worker monitor → running:monitor-running, NOT completed (fn-715.2 repro+fix)", () => {
+  // The exact fn-715.2 incident: the work session Stopped (embedded job
+  // `stopped`, no running sub-agent), planctl `done` + human approved, but
+  // the backgrounded `bash-bg` suite is still running. Pre-fn-719 predicate
+  // 1 collapsed this to `completed`, freeing the mutex; approve dispatched
+  // ~7s later while the suite ran. Post-fn-719 predicate 1's third liveness
+  // clause holds it at `running:monitor-running` via predicate 6.6.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [
+      makeEmbeddedJob({ state: "stopped", has_live_worker_monitor: true }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "monitor-running" }),
+  );
+});
+
+test("fn-719: ambient-only monitor (has_live_worker_monitor=false) → completed (dispatchable, defense-in-depth)", () => {
+  // Provenance is filtered at task 1: an `ambient` session-watcher (chatctl
+  // bus) NEVER sets `has_live_worker_monitor`, so the embedded fact reads
+  // `false`. This task is a clean done+approved with no live work — it MUST
+  // collapse to `completed` and free the mutex. Pins that an ambient-only
+  // job never occupies (the load-bearing distinction from the test above —
+  // identical shape, only the flag flips).
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [
+      makeEmbeddedJob({ state: "stopped", has_live_worker_monitor: false }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
+});
+
+test("fn-719: live worker monitor occupies BOTH per-epic and per-root mutex (blocks sibling on same root)", () => {
+  // T1 done+approved with a live `bash-bg` monitor holds `monitor-running`,
+  // which is a `running` verdict → occupant via `isLiveWorkOccupant`
+  // (per-epic) AND `isRootOccupant` (per-root; no planner exemption — the
+  // worker holds the working tree). A ready sibling T2 on the same root is
+  // demoted, exactly like the fn-671 job-running case.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-1",
+        state: "stopped",
+        has_live_worker_monitor: true,
+      }),
+    ],
+  });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+  });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t1.task_id)).toEqual(
+    running({ kind: "monitor-running" }),
+  );
+  // Per-epic mutex demotes the ready sibling (same epic).
+  expect(snap.perTask.get(t2.task_id)).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("fn-719: live worker monitor in epic A occupies the root, demotes a same-root ready task in epic B (per-root mutex)", () => {
+  // Cross-epic same-root collision — the per-root mutex narrows to
+  // `isRootOccupant`. `monitor-running` is a `running` verdict that is NOT
+  // `planner-running`, so it claims the root and a ready task in a different
+  // epic on the same project_dir is demoted to `single-task-per-root`.
+  const a1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-a",
+        state: "stopped",
+        has_live_worker_monitor: true,
+      }),
+    ],
+  });
+  const epicA = makeEpic({ epic_id: "fn-1-foo", tasks: [a1] });
+  const b1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+  });
+  const epicB = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    // Same project_dir as epic A → same root.
+    project_dir: "/repo",
+    tasks: [b1],
+  });
+  const snap = run([epicA, epicB]);
+  expect(snap.perTask.get(a1.task_id)).toEqual(
+    running({ kind: "monitor-running" }),
+  );
+  expect(snap.perTask.get(b1.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("fn-719: live worker monitor past soft TTL (within hard ceiling) → running:monitor-stale, still occupies", () => {
+  // updated_at=1000, now=1700 → age=700 > MONITOR_STALENESS_SEC(600), and
+  // 700 < MONITOR_RELEASE_SEC(1800). Surfaces `monitor-stale` for human
+  // visibility but STILL occupies the mutex (no auto-release until the hard
+  // ceiling) — same correctness-over-throughput stance as `sub-agent-stale`.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [
+      makeEmbeddedJob({
+        state: "stopped",
+        has_live_worker_monitor: true,
+        updated_at: 1000,
+      }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = runWithNow([epic], [], 1700);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "monitor-stale" }),
+  );
+});
+
+test("fn-719: live worker monitor past hard ceiling → slot RELEASED (collapses to completed)", () => {
+  // updated_at=1000, now=3000 → age=2000 > MONITOR_RELEASE_SEC(1800). The
+  // hard ceiling fires: the monitor fact NO LONGER occupies, so predicate 1
+  // is free to collapse the done+approved task to `completed` and free the
+  // mutex. An abandoned session can't wedge the slot forever.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [
+      makeEmbeddedJob({
+        state: "stopped",
+        has_live_worker_monitor: true,
+        updated_at: 1000,
+      }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = runWithNow([epic], [], 3000);
+  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
+});
+
+test("fn-719: a fresh live monitor alongside a stale one keeps the task at monitor-running (every, not any)", () => {
+  // Two embedded work jobs both carrying the monitor fact: one stale
+  // (updated_at=1000, age=700 > soft TTL), one fresh (updated_at=1690,
+  // age=10). `allLiveMonitorsAreStale` is "every", so a single fresh
+  // monitor keeps the verdict at `monitor-running` — the slot is genuinely
+  // live somewhere.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-stale",
+        state: "stopped",
+        has_live_worker_monitor: true,
+        updated_at: 1000,
+      }),
+      makeEmbeddedJob({
+        job_id: "worker-fresh",
+        state: "stopped",
+        has_live_worker_monitor: true,
+        updated_at: 1690,
+      }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = runWithNow([epic], [], 1700);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "monitor-running" }),
+  );
+});
+
+test("fn-719: a still-working job outranks the monitor fact (predicate 5 wins over 6.6)", () => {
+  // A genuinely-`working` embedded job already holds `job-running` at
+  // predicate 5 (above 6.6). The monitor fact only matters once the main
+  // job has Stopped — this pins the predicate ordering.
+  const task = makeTask({
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [
+      makeEmbeddedJob({ state: "working", has_live_worker_monitor: true }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "job-running" }),
+  );
+});
+
+test("fn-719 close-row: epic-level close-verb job with a live monitor → close row running:monitor-running", () => {
+  // The PRIMARY close-row case: a `close` session that backgrounded its own
+  // suite, Stopped (embedded job `stopped`), planctl stamped epic status
+  // `done`, but approval is still `pending` — the approval window that
+  // bypasses close-row predicate 1 and reaches the 5/6/6.6 session-liveness
+  // checks (same window the close-row git predicate 6.5 fires in). The
+  // close-row predicate-6.6 twin holds it at `running:monitor-running`, so
+  // the closer/approve cannot dispatch into a not-actually-idle close session.
+  const epic = makeEpic({
+    status: "done",
+    approval: "pending",
+    tasks: [],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "stopped",
+        has_live_worker_monitor: true,
+      }),
+    ],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    running({ kind: "monitor-running" }),
   );
 });
 
