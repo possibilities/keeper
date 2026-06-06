@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-719-gate-autopilot-occupancy-on-live-worker",
   "bundles": [],
   "closer_done_at": "2026-06-06T01:22:05.390653Z",
@@ -18,5 +18,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-06T01:22:05.390653Z"
+  "updated_at": "2026-06-06T01:22:40.721110Z"
 }
