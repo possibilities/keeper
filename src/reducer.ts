@@ -1654,6 +1654,19 @@ function findExplicitAttributions(
     // full `events` table, and the `events.data IS NULL` guard makes ARM A and
     // ARM B partition the rows (no double-count). Together they are exactly the
     // COALESCE'd scan, but split so the common inline case keeps the index.
+    //
+    // The `CASE WHEN json_valid(b.data) THEN json_extract(...) END` form (NOT a
+    // bare `json_extract`) does double duty: (1) it MATCHES the expression
+    // index `idx_event_blobs_tool_attr` (`src/db.ts`, same guarded expression)
+    // so this becomes a sub-ms SEEK instead of a full JSON-parse scan of the
+    // entire ~1.3 GB side table per dirty file per GitSnapshot fold — the
+    // fn-717.2 omission that wedged the reducer (a 137-dirty-file GitSnapshot
+    // ran ~137 full scans and never folded); and (2) a bare `json_extract` over
+    // a malformed relocated blob THROWS "malformed JSON" at query time — the
+    // reducer tolerates malformed `data`, so the guard skips it (yields NULL,
+    // never matches) instead of crashing the fold. A malformed blob has no
+    // parseable file_path so it can never be a real attribution — skipping is
+    // re-fold-deterministic.
     const relocatedRows = db
       .prepare(
         `SELECT e.id AS id, e.ts AS ts, e.session_id AS session_id,
@@ -1663,7 +1676,9 @@ function findExplicitAttributions(
           WHERE e.data IS NULL
             AND e.hook_event = 'PostToolUse'
             AND e.tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-            AND json_extract(b.data, '$.tool_input.file_path') = ?`,
+            AND CASE WHEN json_valid(b.data)
+                     THEN json_extract(b.data, '$.tool_input.file_path')
+                END = ?`,
       )
       .all(candidatePath) as Array<{
       id: number;

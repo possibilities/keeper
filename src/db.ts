@@ -1342,6 +1342,49 @@ CREATE TABLE IF NOT EXISTS event_blobs (
 `;
 
 /**
+ * Expression index mirroring {@link CREATE_EVENTS_INDEXES}'s
+ * `idx_events_tool_attr` onto the relocation side table — the missing half of
+ * the fn-717.2 two-arm explicit-attribution scan.
+ *
+ * `findExplicitAttributions` (`src/reducer.ts`) resolves a dirty file to its
+ * mutating sessions in TWO arms: ARM A probes `events.data` (inline blobs) via
+ * the covering `idx_events_tool_attr`; ARM B probes `event_blobs.data` (cold
+ * blobs the compaction relocator moved). ARM A was indexed; ARM B was NOT, so
+ * the instant compaction relocated the cold tail every relocated-blob probe
+ * became `json_extract(b.data,'$.tool_input.file_path') = ?` over the WHOLE
+ * ~1.3 GB side table — a full JSON-parse scan PER dirty file PER GitSnapshot
+ * fold. A 137-dirty-file GitSnapshot then takes ~137 such scans and the fold
+ * effectively never completes, holding the writer lock and dead-lettering
+ * every hook INSERT. This index turns ARM B's full scan into a sub-ms SEEK
+ * (the PK join back to `events` carries the hook_event/tool_name/ts/session_id
+ * facts). Pure performance — index choice never changes fold results, so
+ * re-fold determinism is untouched and no SCHEMA_VERSION bump is needed
+ * (idempotent `IF NOT EXISTS`, same as every other index here).
+ *
+ * **`CASE WHEN json_valid(data)` guard — load-bearing, not cosmetic.** ARM A's
+ * index dodges malformed blobs via its partial `WHERE hook_event='PostToolUse'
+ * AND tool_name IN (...)` (those rows are always valid JSON). event_blobs
+ * carries no hook_event/tool_name columns, so this index can't be partial that
+ * way — and a bare `json_extract(data, ...)` THROWS "malformed JSON" at
+ * BUILD time on any non-JSON blob. The reducer deliberately TOLERATES malformed
+ * `data` (folds it to a safe value), so a relocated malformed blob is a real
+ * possibility; a bare expression index would crash the daemon on boot when it
+ * built the index over one. Wrapping in `CASE WHEN json_valid(data) THEN
+ * json_extract(...) END` yields NULL (not a throw) for malformed/no-path rows,
+ * so the build is total. `findExplicitAttributions` ARM B (`src/reducer.ts`)
+ * probes with the IDENTICAL guarded expression so SQLite matches this index and
+ * turns the scan into a seek — and the guard also makes ARM B itself
+ * malformed-safe (skips the bad blob instead of throwing at query time; a
+ * malformed blob has no parseable file_path so it can never be a real
+ * attribution — re-fold-deterministic). event_blobs has no other columns to
+ * cover, so unlike ARM A's covering key this is a plain expression index; the
+ * seek + PK join back to `events` is the load-bearing win.
+ */
+const CREATE_EVENT_BLOBS_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_event_blobs_tool_attr ON event_blobs(CASE WHEN json_valid(data) THEN json_extract(data, '$.tool_input.file_path') END)",
+];
+
+/**
  * Schema-v47 `autopilot_state` projection table (fn-667) — a SINGLETON row
  * (`id INTEGER PRIMARY KEY CHECK (id = 1)`) carrying the autopilot worker's
  * paused/playing flag as durable, viewer-readable state. Before v47 the flag
@@ -2183,6 +2226,9 @@ function migrate(db: Database): void {
       db.run(CREATE_PENDING_DISPATCHES);
       db.run(CREATE_EPIC_TOMBSTONES);
       db.run(CREATE_EVENT_BLOBS);
+      for (const sql of CREATE_EVENT_BLOBS_INDEXES) {
+        db.run(sql);
+      }
 
       // Seed singleton cursor on first boot. Subsequent boots are no-ops.
       db.run(
