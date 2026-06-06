@@ -77,9 +77,15 @@ import type {
   DispatchFailedMessage,
   Verb,
 } from "./autopilot-worker";
+import {
+  appendBackstopRecord,
+  BackstopCounters,
+  type BackstopMessage,
+} from "./backstop-telemetry";
 import { compactColdBlobs, countAbsentBlobs } from "./compaction";
 import {
   openDb,
+  resolveBackstopLogPath,
   resolveClaudeProjectsRoot,
   resolveConfig,
   resolveDbPath,
@@ -968,6 +974,24 @@ function runDaemon(): void {
   const deadLetterDir = resolveDeadLetterDir();
   scanDeadLetterDir(db, deadLetterDir);
 
+  // Backstop-telemetry sidecar (epic fn-720). Main is the SOLE writer — each
+  // backstop-emitting worker (wired in tasks .2/.3) maintains its own
+  // in-memory counters + `last_fast_path_at` and posts a built
+  // `{kind:"backstop"}` record/rollup up; `handleBackstopMessage` writes the
+  // single NDJSON line. The path is resolved once at boot; the writer opens
+  // for append per-call. `mainBackstopCounters` is held by main for any
+  // main-produced backstop (e.g. the future pending-dispatch sweep) and is
+  // flushed as an on-shutdown rollup so the denominator survives a clean stop.
+  const backstopLogPath = resolveBackstopLogPath();
+  const mainBackstopCounters = new BackstopCounters();
+  // Sole-writer entry point: write whatever record/rollup a worker posted up.
+  // Best-effort + swallow-to-stderr lives in `appendBackstopRecord`; this
+  // wrapper exists so the daemon's worker `onmessage` handlers (tasks .2/.3)
+  // route a `{kind:"backstop"}` message through one place.
+  const handleBackstopMessage = (msg: BackstopMessage): void => {
+    appendBackstopRecord(msg.record, backstopLogPath);
+  };
+
   // Coalescing flag: every wake sets it; the run loop resets it before each
   // drain pass. A wake arriving mid-drain leaves the flag set, so the loop runs
   // one more pass. No event is ever missed because drain re-reads from the
@@ -1609,6 +1633,15 @@ function runDaemon(): void {
   ): void => {
     const msg = ev.data;
     if (!msg) {
+      return;
+    }
+    if (msg.kind === "backstop") {
+      // Epic fn-720: a worker posted a backstop rescue/rollup record up. Main
+      // is the SOLE sidecar writer — append the line and return. NOT an event
+      // fold; the sidecar is a pure consumer-side side-file. Workers do not
+      // yet EMIT this (counters + last_fast_path_at wiring lands in .2/.3),
+      // but main handles it today so the topology is proven end to end.
+      handleBackstopMessage(msg);
       return;
     }
     if (msg.kind === "nudge-discovery") {
@@ -2606,6 +2639,16 @@ function runDaemon(): void {
       return;
     }
     shuttingDown = true;
+
+    // Flush any main-produced backstop counters as on-shutdown rollup records
+    // (epic fn-720) so the rescue-RATE denominator survives a clean stop.
+    // Best-effort: `appendBackstopRecord` swallows to stderr, so a write
+    // failure here can never block teardown. Worker-side counters are flushed
+    // by the workers' own shutdown handlers (tasks .2/.3) before they post
+    // their final `{kind:"backstop"}` rollup up.
+    for (const rollup of mainBackstopCounters.snapshot(Date.now())) {
+      appendBackstopRecord(rollup, backstopLogPath);
+    }
 
     // Clear the producer-side TTL sweep timer FIRST so the heartbeat
     // can't fire a mint into the writer connection mid-teardown.
