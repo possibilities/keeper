@@ -64,7 +64,7 @@ def test_seed_state_round_trip_zero_drift(tmp_path):
     assert epic_on_disk == normalize_epic(dict(epic_on_disk))
 
     # Tasks: same idempotence assertion per task.
-    for i, task_id in enumerate(task_ids, start=1):
+    for _, task_id in enumerate(task_ids, start=1):
         task_on_disk = load_json(planctl_dir / "tasks" / f"{task_id}.json")
         assert task_on_disk == normalize_task(dict(task_on_disk))
         assert task_on_disk["id"] == task_id
@@ -114,7 +114,7 @@ def test_isolated_roots_stubs_discovery(isolated_roots):
 
 def test_mock_sketch_refs_fakes_spawn(mock_sketch_refs):
     """``mock_sketch_refs`` intercepts the inline-sketch-refs spawn."""
-    from planctl.sketch_refs import inline_sketch_refs_batch
+    from planctl.sketch_refs import SketchRefError, inline_sketch_refs_batch
 
     slots = inline_sketch_refs_batch(
         [{"bundles": ["sketch/x", "bundle/y"], "snippets": ["snippet/a"]}],
@@ -122,5 +122,6 @@ def test_mock_sketch_refs_fakes_spawn(mock_sketch_refs):
     )
     assert len(mock_sketch_refs) == 1  # spawn happened
     # The sketch/ ref was dropped; bundle/ ref + snippet survived.
+    assert not isinstance(slots[0], SketchRefError)
     assert slots[0].remaining_bundles == ["bundle/y"]
     assert slots[0].merged_snippets == ["snippet/a"]
