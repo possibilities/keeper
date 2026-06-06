@@ -59,5 +59,5 @@ Confirm a write failure is swallowed (no throw / no fatalExit).
 - [ ] `bun run lint` + `bun run typecheck` + new unit tests green; no schema/reducer/keeper-py change.
 
 ## Done summary
-
+Built the backstop-telemetry foundation: src/backstop-telemetry.ts exports BackstopRecord/BackstopRollup types, BackstopCounters (fires/rescues per backstop,class), BackstopRateLimiter (per-key cooldown gating only the stderr ALARM), and appendBackstopRecord (0600 NDJSON, swallow-to-stderr, never throws). Added resolveBackstopLogPath/KEEPER_BACKSTOP_LOG to db.ts, main {kind:'backstop'} sole-writer handler + shutdown rollup flush in daemon.ts, the PlanWorkerOutbound union extension, and KEEPER_BACKSTOP_LOG in all five spawn-test sandbox helpers. Observability-only; no schema/reducer/keeper-py change. 17/17 new unit tests pass; lint+typecheck green.
 ## Evidence
