@@ -51,5 +51,5 @@ DispatchFailed/DispatchExpired behavior unchanged.
 - [ ] `class:"timeout"` records carry null fast_path/last_fast_path_at; `bun test` green.
 
 ## Done summary
-
+Wired the two timeout-class backstops to the fn-720 telemetry channel: the autopilot confirmRunning ceiling posts a timeout rescue (elapsedMs staleness, null fast_path/last_fast_path_at) on ceiling-hit and bumps the rescued:false denominator on a pre-ceiling confirm; the pending-dispatch TTL sweep posts a timeout rescue per expired row (main is sole sidecar writer) and bumps the denominator on an empty sweep. Added buildTimeoutRecord + buildPendingDispatchSweepRecords helpers; DispatchFailed/DispatchExpired emits and all dispatch gates strictly unchanged.
 ## Evidence
