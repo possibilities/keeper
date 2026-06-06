@@ -211,6 +211,10 @@ test("workable: other blocked kinds are NOT workable", () => {
       tag: "blocked",
       reason: { kind: "dep-on-epic-dangling", upstream: "fn-99" },
     },
+    // fn-721: a launched-but-not-yet-bound worker's own row is NOT workable —
+    // it self-resolves (the row is effectively in motion), so it's `waiting`,
+    // not actionable.
+    { tag: "blocked", reason: { kind: "dispatch-pending" } },
     { tag: "blocked", reason: { kind: "unknown" } },
   ];
   for (const v of others) {
@@ -654,6 +658,64 @@ test("stuck (task): dep-on-epic-dangling → stuck", () => {
     { id: t.task_id, kind: "task", condition: "unblocked" },
   );
   expect(state.kind).toBe("stuck");
+});
+
+test("fn-721 (task): dispatch-pending row → waiting, NOT stuck (self-resolves)", () => {
+  // A worker was launched against this task (an open `pending_dispatches`
+  // row) but its SessionStart hasn't bound yet. The row renders
+  // `dispatch-pending`, which is NOT workable and NOT in STUCK_REASON_KINDS,
+  // so an `unblocked` await on it returns `waiting` — it self-resolves on the
+  // bind / DispatchFailed / DispatchExpired discharge, no human action needed.
+  const t = makeTask({ task_id: "fn-1-foo.1", approval: "pending" });
+  const epic = makeEpic({ tasks: [t] });
+  const snap = computeReadiness(
+    [epic],
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [{ verb: "work", id: "fn-1-foo.1", dir: "/repo" }],
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({
+    tag: "blocked",
+    reason: { kind: "dispatch-pending" },
+  });
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: "fn-1-foo.1", kind: "task", condition: "unblocked" },
+  );
+  expect(state.kind).toBe("waiting");
+});
+
+test("fn-721 (task): a sibling demoted by a dispatch-pending occupant stays workable → met", () => {
+  // The dispatched task 1 renders `dispatch-pending` (occupant); the
+  // same-epic ready sibling task 2 is demoted to `single-task-per-epic`,
+  // which IS workable (held back ONLY by the concurrency mutex). An
+  // `unblocked` await on task 2 therefore returns `met`.
+  const t1 = makeTask({ task_id: "fn-1-foo.1", approval: "pending" });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    approval: "pending",
+  });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const snap = computeReadiness(
+    [epic],
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [{ verb: "work", id: "fn-1-foo.1", dir: "/repo" }],
+  );
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual({
+    tag: "blocked",
+    reason: { kind: "single-task-per-epic" },
+  });
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: "fn-1-foo.2", kind: "task", condition: "unblocked" },
+  );
+  expect(state.kind).toBe("met");
 });
 
 test("stuck (epic): every row in the epic is rejected → stuck", () => {

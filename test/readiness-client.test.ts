@@ -183,7 +183,7 @@ function errorFrame(
 //     collections produce a result.
 // ---------------------------------------------------------------------------
 
-test("subscribeReadiness: first-paint gate withholds onSnapshot until all five collections have a result", () => {
+test("subscribeReadiness: first-paint gate withholds onSnapshot until all six collections have a result", () => {
   const { factory, socketRef } = makeMockConnect();
   const snapshots: ReadinessClientSnapshot[] = [];
   const handle = subscribeReadiness({
@@ -198,48 +198,64 @@ test("subscribeReadiness: first-paint gate withholds onSnapshot until all five c
     throw new Error("mock socket never installed");
   }
 
-  // Five initial queries fired on open — fn-626 widened the readiness
-  // composition with `git_status`; fn-643.5 added `dead_letters`. fn-637's
+  // Six initial queries fired on open — fn-626 widened the readiness
+  // composition with `git_status`; fn-643.5 added `dead_letters`; fn-721
+  // added `pending_dispatches` (the launch-window occupancy feed). fn-637's
   // resolver-only completed-epics subscription was deleted by fn-637.4
   // (predicate 9 and the board pill now read `epic.resolved_epic_deps` off
   // the projection).
   const initial = sock.takeOutbound();
-  expect(initial).toHaveLength(5);
+  expect(initial).toHaveLength(6);
   expect(
     initial.map((f) => (f as { collection: string }).collection).sort(),
-  ).toEqual(["dead_letters", "epics", "git", "jobs", "subagent_invocations"]);
+  ).toEqual([
+    "dead_letters",
+    "epics",
+    "git",
+    "jobs",
+    "pending_dispatches",
+    "subagent_invocations",
+  ]);
 
   // Deliver only `epics` first: gate must hold.
   sock.deliver([emptyResult("epics", "test-paintgate-epics")]);
   expect(snapshots).toHaveLength(0);
 
-  // Add `jobs`: gate still holds (need all five).
+  // Add `jobs`: gate still holds (need all six).
   sock.deliver([emptyResult("jobs", "test-paintgate-jobs")]);
   expect(snapshots).toHaveLength(0);
 
-  // Add `subagent_invocations`: still missing `git` and `dead_letters`.
+  // Add `subagent_invocations`: still missing `git`, `dead_letters`,
+  // `pending_dispatches`.
   sock.deliver([
     emptyResult("subagent_invocations", "test-paintgate-subagent-invocations"),
   ]);
   expect(snapshots).toHaveLength(0);
 
-  // Add `git`: still missing `dead_letters` — the empty-steady-state
-  // collection is still load-bearing on the gate.
+  // Add `git`: still missing `dead_letters` and `pending_dispatches` — the
+  // empty-steady-state collections are still load-bearing on the gate.
   sock.deliver([emptyResult("git", "test-paintgate-git")]);
   expect(snapshots).toHaveLength(0);
 
-  // Add `dead_letters` (empty result — the happy steady state, zero
-  // waiting rows): gate clears, snapshot fires exactly once. The empty
-  // result is what clears the gate — the descriptor's
-  // `defaultFilter: { status: "waiting" }` scope returns `rows: []` in
-  // the happy case.
+  // Add `dead_letters` (empty result — the happy steady state): still
+  // missing `pending_dispatches`.
   sock.deliver([emptyResult("dead_letters", "test-paintgate-dead-letters")]);
+  expect(snapshots).toHaveLength(0);
+
+  // Add `pending_dispatches` (empty result — the common no-in-flight-launch
+  // case): gate clears, snapshot fires exactly once. The empty result is
+  // what clears the gate (the dead_letters precedent — an empty
+  // steady-state collection still produces a `result` frame).
+  sock.deliver([
+    emptyResult("pending_dispatches", "test-paintgate-pending-dispatches"),
+  ]);
   expect(snapshots).toHaveLength(1);
   expect(snapshots[0]?.epics).toEqual([]);
   expect(snapshots[0]?.jobs.size).toBe(0);
   expect(snapshots[0]?.subagentInvocations).toEqual([]);
   expect(snapshots[0]?.gitStatus).toEqual([]);
   expect(snapshots[0]?.deadLetters).toEqual([]);
+  expect(snapshots[0]?.pendingDispatches).toEqual([]);
 
   handle.dispose();
 });
@@ -265,9 +281,10 @@ test("subscribeReadiness: refetch fired while queryInFlight is coalesced into on
     throw new Error("mock socket never installed");
   }
 
-  // Discard the five initial queries (fn-626 added `git`; fn-637.4 deleted
-  // the completed-epics resolver-only sub; fn-643.5 added `dead_letters`).
-  expect(sock.takeOutbound()).toHaveLength(5);
+  // Discard the six initial queries (fn-626 added `git`; fn-637.4 deleted
+  // the completed-epics resolver-only sub; fn-643.5 added `dead_letters`;
+  // fn-721 added `pending_dispatches`).
+  expect(sock.takeOutbound()).toHaveLength(6);
 
   // BEFORE the `epics` result resolves the in-flight query, deliver TWO
   // `meta` nudges for `epics` — both should fold into one pending
@@ -330,6 +347,7 @@ test("subscribeReadiness: dispose() is idempotent — second call is a no-op", (
     emptyResult("subagent_invocations", "test-dispose-subagent-invocations"),
     emptyResult("git", "test-dispose-git"),
     emptyResult("dead_letters", "test-dispose-dead-letters"),
+    emptyResult("pending_dispatches", "test-dispose-pending-dispatches"),
   ]);
   expect(snapshots).toHaveLength(1);
 
@@ -404,9 +422,10 @@ test("subscribeReadiness: terminal error frame (no prior result) invokes onFatal
       throw new Error("mock socket never installed");
     }
 
-    // Burn the five initial queries (fn-626 added `git`; fn-637.4 deleted
-    // the completed-epics resolver-only sub; fn-643.5 added `dead_letters`).
-    expect(sock.takeOutbound()).toHaveLength(5);
+    // Burn the six initial queries (fn-626 added `git`; fn-637.4 deleted
+    // the completed-epics resolver-only sub; fn-643.5 added `dead_letters`;
+    // fn-721 added `pending_dispatches`).
+    expect(sock.takeOutbound()).toHaveLength(6);
     // The helper installed its steady-poll `setInterval` in `open`; the
     // spy must have observed it.
     expect(pending.size).toBe(1);
@@ -708,15 +727,16 @@ test("subscribeReadiness: Path B (1–5 s) — slow-flight latches once, timeout
     harness.pollHandler()();
 
     const slowAt1s = lifecycle.filter((e) => e.event === "query_slow_flight");
-    // Five collections all in flight, all crossed 1 s — five emits (fn-626
+    // Six collections all in flight, all crossed 1 s — six emits (fn-626
     // added `git`; fn-637.4 deleted the completed-epics resolver-only sub;
-    // fn-643.5 added `dead_letters`).
-    expect(slowAt1s).toHaveLength(5);
+    // fn-643.5 added `dead_letters`; fn-721 added `pending_dispatches`).
+    expect(slowAt1s).toHaveLength(6);
     expect(slowAt1s.map((e) => e.detail?.collection).sort()).toEqual([
       "dead_letters",
       "epics",
       "git",
       "jobs",
+      "pending_dispatches",
       "subagent_invocations",
     ]);
 
@@ -725,7 +745,7 @@ test("subscribeReadiness: Path B (1–5 s) — slow-flight latches once, timeout
     harness.pollHandler()();
     expect(
       lifecycle.filter((e) => e.event === "query_slow_flight"),
-    ).toHaveLength(5);
+    ).toHaveLength(6);
 
     // t=5001 ms: timeout fires. Single-flight `reconnecting` guard means
     // exactly one `query_timeout` event for the FIRST stuck state.
@@ -849,10 +869,10 @@ test("subscribeReadiness: Path C — reconnect clears slow-flight state, fresh w
     const slowCountAfter = lifecycle.filter(
       (e) => e.event === "query_slow_flight",
     ).length;
-    // Five collections in the new window, five fresh emits (fn-626 added
+    // Six collections in the new window, six fresh emits (fn-626 added
     // `git`; fn-637.4 deleted the completed-epics resolver-only sub;
-    // fn-643.5 added `dead_letters`).
-    expect(slowCountAfter - slowCountBefore).toBe(5);
+    // fn-643.5 added `dead_letters`; fn-721 added `pending_dispatches`).
+    expect(slowCountAfter - slowCountBefore).toBe(6);
 
     handle.dispose();
   } finally {
@@ -883,14 +903,15 @@ test("subscribeReadiness: single-flight — two stuck collections produce ONE re
     }
     sock.takeOutbound();
 
-    // All four collections are still in flight (no `result` delivered).
-    // At t=5001 ms all four cross the deadline on the same poll tick.
+    // All six collections are still in flight (no `result` delivered).
+    // At t=5001 ms all six cross the deadline on the same poll tick.
     harness.advance(5001);
     harness.pollHandler()();
 
     // Exactly ONE `query_timeout` event, named after the FIRST state
     // (`epics` — the order in `states[]` matches the makeState calls in
-    // `subscribeReadiness`: epics, jobs, subagent_invocations, git).
+    // `subscribeReadiness`: epics, jobs, subagent_invocations, git,
+    // dead_letters, pending_dispatches).
     const timeouts = lifecycle.filter((e) => e.event === "query_timeout");
     expect(timeouts).toHaveLength(1);
     expect(timeouts[0]?.detail?.collection).toBe("epics");
@@ -1000,15 +1021,16 @@ test("subscribeReadiness: id-first routing — patch{id} triggers a refetch on t
     throw new Error("mock socket never installed");
   }
 
-  // Resolve the five initial queries so subsequent in-flight tracking
+  // Resolve the six initial queries so subsequent in-flight tracking
   // is clean — refetch coalesce is exercised here, not first-paint.
-  expect(sock.takeOutbound()).toHaveLength(5);
+  expect(sock.takeOutbound()).toHaveLength(6);
   sock.deliver([
     emptyResult("epics", "test-idroute-epics"),
     emptyResult("jobs", "test-idroute-jobs"),
     emptyResult("subagent_invocations", "test-idroute-subagent-invocations"),
     emptyResult("git", "test-idroute-git"),
     emptyResult("dead_letters", "test-idroute-dead-letters"),
+    emptyResult("pending_dispatches", "test-idroute-pending-dispatches"),
   ]);
   sock.takeOutbound();
 
@@ -1040,13 +1062,14 @@ test("subscribeReadiness: legacy server compat — patch with no id falls back t
     throw new Error("mock socket never installed");
   }
 
-  expect(sock.takeOutbound()).toHaveLength(5);
+  expect(sock.takeOutbound()).toHaveLength(6);
   sock.deliver([
     emptyResult("epics", "test-legacy-epics"),
     emptyResult("jobs", "test-legacy-jobs"),
     emptyResult("subagent_invocations", "test-legacy-subagent-invocations"),
     emptyResult("git", "test-legacy-git"),
     emptyResult("dead_letters", "test-legacy-dead-letters"),
+    emptyResult("pending_dispatches", "test-legacy-pending-dispatches"),
   ]);
   sock.takeOutbound();
 
@@ -1130,13 +1153,14 @@ test("subscribeReadiness: reconnect re-issues queries with the same stable subId
     throw new Error("mock socket #1 never installed");
   }
   const initial1 = sock1.takeOutbound();
-  expect(initial1).toHaveLength(5);
+  expect(initial1).toHaveLength(6);
   const initialIds1 = initial1.map((f) => (f as { id: string }).id).sort();
   expect(initialIds1).toEqual([
     "test-reconnect-dead-letters",
     "test-reconnect-epics",
     "test-reconnect-git",
     "test-reconnect-jobs",
+    "test-reconnect-pending-dispatches",
     "test-reconnect-subagent-invocations",
   ]);
 
@@ -1151,7 +1175,7 @@ test("subscribeReadiness: reconnect re-issues queries with the same stable subId
     throw new Error("mock socket #2 never installed");
   }
   const initial2 = sock2.takeOutbound();
-  expect(initial2).toHaveLength(5);
+  expect(initial2).toHaveLength(6);
   const initialIds2 = initial2.map((f) => (f as { id: string }).id).sort();
   // EXACT same subIds — they're constants in subscribeReadiness, and the
   // states[] list is built once at the top of the helper and reused
@@ -1180,7 +1204,7 @@ test("subscribeReadiness: pollAll no longer schedules per-state refetches — fr
     }
     sock.takeOutbound();
 
-    // Resolve all four initial queries so every state has gotResult and
+    // Resolve all initial queries so every state has gotResult and
     // queryInFlight cleared. With the second-pass refetch removed,
     // pollAll over a fully-resolved state list should fire ZERO new
     // outbound writes.
@@ -1194,6 +1218,10 @@ test("subscribeReadiness: pollAll no longer schedules per-state refetches — fr
       ),
       emptyResult("git", "test-no-poll-refetch-git"),
       emptyResult("dead_letters", "test-no-poll-refetch-dead-letters"),
+      emptyResult(
+        "pending_dispatches",
+        "test-no-poll-refetch-pending-dispatches",
+      ),
     ]);
     sock.takeOutbound();
 

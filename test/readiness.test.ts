@@ -24,6 +24,7 @@ import {
   type BlockReason,
   computeReadiness,
   formatPill,
+  type PendingDispatch,
   type RunningReason,
   type Verdict,
 } from "../src/readiness";
@@ -3364,5 +3365,267 @@ test("fn-671: completed-racing worker holds per-task running, close row blocks o
   );
   expect(snapRacing.perCloseRow.get(epicRacing.epic_id)).toEqual(
     blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// fn-721 — dispatch-pending occupant (launch → SessionStart blind window)
+// ---------------------------------------------------------------------------
+
+// Variant that threads the new `pendingDispatches` param into
+// `computeReadiness` (appended after `now`). The other inputs default.
+function runWithPending(epics: Epic[], pendingDispatches: PendingDispatch[]) {
+  return computeReadiness(
+    epics,
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    pendingDispatches,
+  );
+}
+
+test("dispatch-pending: a work:: pending row demotes a same-epic ready sibling", () => {
+  // The core occupancy proof. A `work::fn-1-foo.1` pending dispatch (a worker
+  // launched but not yet SessionStart-bound) sets `dispatch-pending` on task
+  // 1; that occupant claims the per-epic mutex via `isLiveWorkOccupant`, so
+  // the same-epic ready sibling task 2 is demoted to single-task-per-epic.
+  const t1 = makeTask({ task_id: "fn-1-foo.1" });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const snap = runWithPending(
+    [epic],
+    [{ verb: "work", id: "fn-1-foo.1", dir: "/repo" }],
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dispatch-pending" }),
+  );
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("dispatch-pending: a work:: pending row demotes a same-ROOT sibling in another epic", () => {
+  // Per-root occupancy proof. The pending row's task occupies root /r via the
+  // per-row `dispatch-pending` verdict (auto-covered by `isRootOccupant`'s
+  // delegation to `isLiveWorkOccupant`), so a ready sibling in a DIFFERENT
+  // epic on the same root is demoted to single-task-per-root.
+  const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/r",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [e2t1],
+  });
+  const snap = runWithPending(
+    [e1, e2],
+    [{ verb: "work", id: "fn-1-foo.1", dir: "/r" }],
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dispatch-pending" }),
+  );
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("dispatch-pending: demotion lifts when the pending row discharges (empty set)", () => {
+  // Discharge proof: with the same fixtures but NO pending row (the
+  // `SessionStart` bind / DispatchFailed / DispatchExpired discharged it),
+  // task 1 is the first ready row and wins, task 2 loses the per-epic slot
+  // the ORDINARY way — neither carries `dispatch-pending`.
+  const t1 = makeTask({ task_id: "fn-1-foo.1" });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const snap = runWithPending([epic], []);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("dispatch-pending: a close:: pending row demotes a same-root ready task in another epic", () => {
+  // Close-row arm: a `close::fn-1-foo` pending dispatch sets `dispatch-pending`
+  // on the close row (every task already completed so the close row would be
+  // ready), occupying root /r so a ready task in a different epic on the same
+  // root is demoted.
+  const e1t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [makeEmbeddedJob({ job_id: "w1", state: "ended" })],
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/r",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [e2t1],
+  });
+  const snap = runWithPending(
+    [e1, e2],
+    [{ verb: "close", id: "fn-1-foo", dir: "/r" }],
+  );
+  expect(snap.perCloseRow.get("fn-1-foo")).toEqual(
+    blocked({ kind: "dispatch-pending" }),
+  );
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("dispatch-pending: a real running verdict still WINS over dispatch-pending (rank check)", () => {
+  // Rank guard (the fn-700 anti-pattern): dispatch-pending is set at a LATE
+  // per-row rank, so a row that is genuinely `running` (a working embedded
+  // job) keeps `job-running` even when a pending row also names it. The truer
+  // state is never masked.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    jobs: [makeEmbeddedJob({ job_id: "w1", state: "working" })],
+  });
+  const epic = makeEpic({ tasks: [t1] });
+  const snap = runWithPending(
+    [epic],
+    [{ verb: "work", id: "fn-1-foo.1", dir: "/repo" }],
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    running({ kind: "job-running" }),
+  );
+});
+
+test("dispatch-pending: epic-not-materialized still WINS over dispatch-pending (rank check)", () => {
+  // A NULL-status epic (no EpicSnapshot folded yet) must keep
+  // `epic-not-materialized` even when a pending row names its task — the
+  // structural-not-ready verdict outranks the late dispatch-pending rank.
+  const t1 = makeTask({ task_id: "fn-1-foo.1" });
+  const epic = makeEpic({ tasks: [t1], status: null });
+  const snap = runWithPending(
+    [epic],
+    [{ verb: "work", id: "fn-1-foo.1", dir: "/repo" }],
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "epic-not-materialized" }),
+  );
+});
+
+test("dispatch-pending root-fallback: an UNMATCHED pending row occupies its dir root", () => {
+  // Decision-b proof: a pending row whose `verb::id` matches NO task or close
+  // row (launch→materialize lag or deleted target) still occupies its own
+  // `dir` root, so a ready sibling in an existing epic on that root is demoted
+  // — without any per-row verdict to attach to.
+  const t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/r",
+    tasks: [t1],
+  });
+  const snap = runWithPending(
+    [epic],
+    // No `fn-9-ghost.1` task exists in the snapshot.
+    [{ verb: "work", id: "fn-9-ghost.1", dir: "/r" }],
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("dispatch-pending root-fallback: a null-dir unmatched row degrades without crash", () => {
+  // The unmatched row has a null `dir`, so it contributes NO root occupant —
+  // the existing ready task is unaffected and nothing throws.
+  const t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/r",
+    tasks: [t1],
+  });
+  const snap = runWithPending(
+    [epic],
+    [{ verb: "work", id: "fn-9-ghost.1", dir: null }],
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+});
+
+test("dispatch-pending root-fallback: a MATCHED row does not double-count into the root-fallback", () => {
+  // A pending row that DID match a task carries its occupancy via the per-row
+  // `dispatch-pending` verdict; it must NOT also feed the root-fallback. The
+  // dir column on a matched row is irrelevant — point it at an unrelated root
+  // and assert a ready task on THAT other root is NOT demoted.
+  const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/r",
+    tasks: [e1t1],
+  });
+  const e2t1 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/other",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/other",
+    tasks: [e2t1],
+  });
+  const snap = runWithPending(
+    [e1, e2],
+    // Matched row for fn-1-foo.1 but with a stale `dir` of /other. Since it
+    // matched, the root-fallback must NOT seed /other, so fn-2-bar.1 stays
+    // ready.
+    [{ verb: "work", id: "fn-1-foo.1", dir: "/other" }],
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dispatch-pending" }),
+  );
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+});
+
+test("dispatch-pending: a dep-on-task row does NOT claim via the occupant (negative control)", () => {
+  // Negative control: a task that is dep-blocked is NOT made an occupant by a
+  // pending row — the dep verdict wins at its earlier rank, so the late
+  // dispatch-pending branch never runs and the dep block (which is NOT an
+  // `isLiveWorkOccupant`) does not claim the epic slot. A ready sibling stays
+  // ready. (Autopilot would never launch against a dep-blocked row anyway;
+  // this pins that the occupant is verdict-driven, not key-driven.)
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    depends_on: ["fn-1-foo.2"],
+  });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
+  // Order tasks so t1 (dep-blocked) is evaluated; t2 is ready and should win
+  // the slot. Place t2 first so it claims the slot in pass-2.
+  const epic = makeEpic({ tasks: [t2, t1] });
+  const snap = runWithPending(
+    [epic],
+    [{ verb: "work", id: "fn-1-foo.1", dir: "/repo" }],
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.2" }),
+  );
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual({ tag: "ready" });
+});
+
+test("dispatch-pending: formatPill renders the bracket pill", () => {
+  expect(formatPill(blocked({ kind: "dispatch-pending" }))).toBe(
+    "[blocked:dispatch-pending]",
   );
 });

@@ -46,7 +46,12 @@ import {
   runReconcileCycle,
   verbForVerdict,
 } from "../src/autopilot-worker";
-import type { Verdict } from "../src/readiness";
+import {
+  computeReadiness,
+  type PendingDispatch,
+  type Verdict,
+} from "../src/readiness";
+import { projectPendingDispatches } from "../src/readiness-client";
 import type { Epic, Job, Task } from "../src/types";
 
 // ---------------------------------------------------------------------------
@@ -131,6 +136,10 @@ function makeSnapshot(
     gitStatusByProjectDir: new Map(),
     failedKeys: new Set(),
     liveTabKeys: new Set(),
+    // fn-721: the launch-window occupancy set feeding the cross-sibling
+    // `dispatch-pending` occupant. Default empty; tests that exercise the
+    // occupant override it.
+    pendingDispatches: [],
     ...overrides,
   };
 }
@@ -356,6 +365,19 @@ test("fn-719: verbForVerdict(monitor-running | monitor-stale) → null (held slo
   expect(verbForVerdict("close", mr)).toBeNull();
   expect(verbForVerdict("task", ms)).toBeNull();
   expect(verbForVerdict("close", ms)).toBeNull();
+});
+
+test("fn-721: verbForVerdict(dispatch-pending) → null (launch-window slot stays undispatchable)", () => {
+  // Locks the autopilot side to the fn-721 readiness occupant: a launched-
+  // but-not-yet-bound worker renders `blocked:dispatch-pending` on its row.
+  // The only blocked reason `verbForVerdict` maps to a verb is `job-pending`,
+  // so dispatch-pending returns null on BOTH paths — the held mutex slot is
+  // never handed a work/approve/close dispatch (occupancy must never leak
+  // into a dispatch; the fn-700/fn-703/fn-719 precedent). This pins the
+  // contract against a future verdict-refactor regression.
+  const v: Verdict = { tag: "blocked", reason: { kind: "dispatch-pending" } };
+  expect(verbForVerdict("task", v)).toBeNull();
+  expect(verbForVerdict("close", v)).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
@@ -598,6 +620,138 @@ test("reconcile dedup (fn-674): liveTabKeys on close::<epic> blocks the close-ro
   // The `approve` verb dispatches for status=done + approval=pending,
   // and the liveTabKeys arm gates it identically to the task path.
   expect(decision.launches.find((p) => p.verb === "approve")).toBeUndefined();
+});
+
+// ---------------------------------------------------------------------------
+// fn-721 — pending_dispatches as a cross-sibling readiness occupant
+// ---------------------------------------------------------------------------
+
+test("fn-721 reconcile: a pending dispatch demotes a same-epic ready sibling (no double-dispatch)", () => {
+  // The cross-sibling occupant fed through `reconcile`'s computeReadiness
+  // call. Task 1 has an open `pending_dispatches` row (a worker launched but
+  // not yet SessionStart-bound). The new `pendingDispatches` field demotes
+  // the same-epic ready sibling task 2 to `dispatch-pending` →
+  // single-task-per-epic, so reconcile launches NOTHING for task 2. (Task 1's
+  // own key is also suppressed by the same-key `liveTabKeys` arm — set here
+  // too, matching how the real loader populates BOTH from one read — so the
+  // whole epic produces zero launches while the dispatch is in flight.)
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", approval: "pending" }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        approval: "pending",
+      }),
+    ],
+  });
+  const pending: PendingDispatch[] = [
+    { verb: "work", id: "fn-1-foo.1", dir: "/repo" },
+  ];
+  const snap = makeSnapshot({
+    epics: [epic],
+    pendingDispatches: pending,
+    liveTabKeys: new Set(["work::fn-1-foo.1"]),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches).toEqual([]);
+});
+
+test("fn-721 reconcile: without the pending row the sibling is NOT demoted (control)", () => {
+  // Control for the test above: with an empty `pendingDispatches`, the
+  // ordinary per-epic mutex lets the FIRST ready task launch. Proves the
+  // demotion above is driven by the pending occupant, not the base mutex.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", approval: "pending" }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        approval: "pending",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], pendingDispatches: [] });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches.map((l) => l.key)).toEqual(["work::fn-1-foo.1"]);
+});
+
+test("fn-721 parity: autopilot reconcile path and the board/CLI computeReadiness path agree", () => {
+  // BOTH paths must compute identical verdicts for the same pending set. The
+  // autopilot path projects via `projectPendingDispatches` in
+  // `loadReconcileSnapshot` then calls `computeReadiness`; the board/CLI path
+  // (`subscribeReadiness`) projects via the SAME helper then calls the SAME
+  // function. Here we drive both ends through the shared helper from one set
+  // of raw wire rows and assert the resulting verdict maps are equal.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", approval: "pending" }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        approval: "pending",
+      }),
+    ],
+  });
+  // Raw wire rows as both consumers receive them from the
+  // `pending_dispatches` collection.
+  const wireRows: Record<string, unknown>[] = [
+    {
+      verb: "work",
+      id: "fn-1-foo.1",
+      dir: "/repo",
+      dispatched_at: 0,
+      last_event_id: 1,
+    },
+  ];
+  const projected = projectPendingDispatches(wireRows);
+
+  // Autopilot reconcile path: the ReconcileSnapshot carries the projected
+  // rows; reconcile() forwards them into computeReadiness.
+  const snap = makeSnapshot({ epics: [epic], pendingDispatches: projected });
+  const autopilotReadiness = computeReadiness(
+    snap.epics,
+    snap.jobs,
+    snap.subagentInvocations,
+    snap.gitStatusByProjectDir,
+    Number.NEGATIVE_INFINITY,
+    snap.pendingDispatches,
+  );
+
+  // Board/CLI path: subscribeReadiness builds the same projected set and
+  // calls computeReadiness with the same args (modulo the live `now`, which
+  // doesn't affect dispatch-pending). Use the same fixed `now` for an exact
+  // map comparison.
+  const boardReadiness = computeReadiness(
+    [epic],
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    projected,
+  );
+
+  expect([...autopilotReadiness.perTask.entries()]).toEqual([
+    ...boardReadiness.perTask.entries(),
+  ]);
+  expect([...autopilotReadiness.perCloseRow.entries()]).toEqual([
+    ...boardReadiness.perCloseRow.entries(),
+  ]);
+  // And the verdict is the expected dispatch-pending + demoted sibling.
+  expect(autopilotReadiness.perTask.get("fn-1-foo.1")).toEqual({
+    tag: "blocked",
+    reason: { kind: "dispatch-pending" },
+  });
+  expect(autopilotReadiness.perTask.get("fn-1-foo.2")).toEqual({
+    tag: "blocked",
+    reason: { kind: "single-task-per-epic" },
+  });
 });
 
 // ---------------------------------------------------------------------------

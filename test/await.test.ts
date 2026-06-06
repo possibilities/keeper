@@ -124,8 +124,9 @@ function resultFrame(
 }
 
 /**
- * Deliver a single readiness "all-five-empty" frame batch under the
- * given idPrefix so the helper's first-paint gate clears.
+ * Deliver a single readiness "all-six-empty" frame batch under the
+ * given idPrefix so the helper's first-paint gate clears. fn-721 added
+ * `pending_dispatches` as the 6th gated collection.
  */
 function deliverFiveEmpty(sock: MockSocket, idPrefix: string): void {
   sock.deliver([
@@ -134,11 +135,12 @@ function deliverFiveEmpty(sock: MockSocket, idPrefix: string): void {
     resultFrame("subagent_invocations", `${idPrefix}-subagent-invocations`, []),
     resultFrame("git", `${idPrefix}-git`, []),
     resultFrame("dead_letters", `${idPrefix}-dead-letters`, []),
+    resultFrame("pending_dispatches", `${idPrefix}-pending-dispatches`, []),
   ]);
 }
 
 /**
- * Deliver a five-collection frame where `epics` carries one row.
+ * Deliver a six-collection frame where `epics` carries one row.
  */
 function deliverFiveWithEpic(
   sock: MockSocket,
@@ -151,11 +153,12 @@ function deliverFiveWithEpic(
     resultFrame("subagent_invocations", `${idPrefix}-subagent-invocations`, []),
     resultFrame("git", `${idPrefix}-git`, []),
     resultFrame("dead_letters", `${idPrefix}-dead-letters`, []),
+    resultFrame("pending_dispatches", `${idPrefix}-pending-dispatches`, []),
   ]);
 }
 
 /**
- * Deliver a five-collection readiness frame carrying explicit git + jobs
+ * Deliver a six-collection readiness frame carrying explicit git + jobs
  * rows (for AND combos that read git/jobs off the readiness snapshot).
  */
 function deliverFiveWith(
@@ -180,6 +183,12 @@ function deliverFiveWith(
     ),
     resultFrame("git", `${idPrefix}-git`, opts.git ?? [], rev),
     resultFrame("dead_letters", `${idPrefix}-dead-letters`, [], rev),
+    resultFrame(
+      "pending_dispatches",
+      `${idPrefix}-pending-dispatches`,
+      [],
+      rev,
+    ),
   ]);
 }
 
@@ -1836,8 +1845,9 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
   if (!sock) {
     throw new Error("mock socket never installed");
   }
-  // A planctl-bearing combo rides subscribeReadiness only — its five
-  // collections, NOT a sixth dedicated git sub.
+  // A planctl-bearing combo rides subscribeReadiness only — its six
+  // collections (fn-721 added `pending_dispatches`), NOT a separate
+  // dedicated git sub.
   const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
   const cols = outbound.map((o) => o.collection).sort();
   expect(cols).toEqual([
@@ -1845,6 +1855,7 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
     "epics",
     "git",
     "jobs",
+    "pending_dispatches",
     "subagent_invocations",
   ]);
 

@@ -95,7 +95,11 @@ import {
   type QuerySort,
   type ServerFrame,
 } from "./protocol";
-import { computeReadiness, type ReadinessSnapshot } from "./readiness";
+import {
+  computeReadiness,
+  type PendingDispatch,
+  type ReadinessSnapshot,
+} from "./readiness";
 import type {
   DeadLetter,
   Epic,
@@ -135,6 +139,12 @@ const GIT_PAGE_LIMIT = 0;
 // limit 0 streams them all — there is no scroll affordance and the
 // renderer needs the full native count to surface as a warn pill.
 const DEAD_LETTERS_PAGE_LIMIT = 0;
+// Full set (fn-721) — one row per launched-but-not-yet-bound worker
+// (`pending_dispatches`, schema v50). The in-flight set is bounded by the
+// concurrent launch-window count (typically 0–1 under the one-at-a-time
+// stagger). Page limit 0 streams them all; readiness needs every row to hold
+// the right launch-window mutex slots.
+const PENDING_DISPATCHES_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
@@ -175,6 +185,13 @@ export interface ReadinessClientSnapshot {
   readonly subagentInvocations: SubagentInvocation[];
   readonly gitStatus: GitStatus[];
   readonly deadLetters: DeadLetter[];
+  // fn-721: the open `pending_dispatches` rows projected into the plain
+  // `PendingDispatch[]` shape (the 6th subscribed collection). Fed into
+  // `computeReadiness` so the board/CLI path agrees with the autopilot
+  // reconciler on the `dispatch-pending` occupant. Rides on the snapshot so a
+  // renderer can surface the in-flight launch list if it wants; `readiness`
+  // already reflects the occupancy.
+  readonly pendingDispatches: PendingDispatch[];
   readonly readiness: ReadinessSnapshot;
 }
 
@@ -467,6 +484,39 @@ export function projectGitStatusByProjectDir(
       dirty_count: row.dirty_count,
       unattributed_to_live_count: unattributedToLive,
     });
+  }
+  return out;
+}
+
+/**
+ * Project the wire `pending_dispatches` rows (schema v50, fn-678) into the
+ * plain {@link PendingDispatch}[] shape `computeReadiness` consumes for the
+ * fn-721 `dispatch-pending` occupant. The SOLE builder of this shape —
+ * imported by BOTH consumers (the autopilot reconciler's
+ * `loadReconcileSnapshot` in `src/autopilot-worker.ts` AND the board/CLI path
+ * `subscribeReadiness` below) so the two readiness paths never diverge on the
+ * launch-window occupancy set. Mirrors {@link projectGitStatusByProjectDir}'s
+ * one-place-only discipline.
+ *
+ * Defensive parsing at the wire boundary: `verb` / `id` are required strings
+ * (a row missing either can't form a `verb::id` key, so it's dropped — it
+ * could never match a row anyway). `dir` is nullable on the column; a
+ * non-string value normalises to `null` (the root-fallback degrades safely on
+ * a null `dir`, contributing no root occupant). Same "malformed rows fall
+ * through to a safe value" discipline as the git projection.
+ */
+export function projectPendingDispatches(
+  rows: Record<string, unknown>[],
+): PendingDispatch[] {
+  const out: PendingDispatch[] = [];
+  for (const row of rows) {
+    const verb = row.verb;
+    const id = row.id;
+    if (typeof verb !== "string" || typeof id !== "string") {
+      continue;
+    }
+    const dir = typeof row.dir === "string" ? row.dir : null;
+    out.push({ verb, id, dir });
   }
   return out;
 }
@@ -1249,6 +1299,7 @@ export function subscribeReadiness(
   const subsSubId = `${idPrefix}-subagent-invocations`;
   const gitSubId = `${idPrefix}-git`;
   const deadLettersSubId = `${idPrefix}-dead-letters`;
+  const pendingDispatchesSubId = `${idPrefix}-pending-dispatches`;
   const epics = makeState("epics", epicsSubId, "epic_id", {
     type: "query",
     collection: "epics",
@@ -1317,12 +1368,33 @@ export function subscribeReadiness(
     id: deadLettersSubId,
     limit: DEAD_LETTERS_PAGE_LIMIT,
   });
+  // fn-721: the `pending_dispatches` collection — the 6th subscribed
+  // collection. Feeds the `dispatch-pending` occupant (a launched-but-not-yet-
+  // bound worker holds its mutex slot). The wire pk is `verb` (the descriptor's
+  // composite-pk workaround — `id` rides in `columns`/`filters`), but readiness
+  // reads from `state.rows` via `projectRows`, so every row reaches the
+  // projection regardless of the single-column wire pk collapsing on `verb`.
+  // First-paint gate widened to this collection — an empty steady state (zero
+  // in-flight launches, the common case) still produces a `result` frame with
+  // `rows: []` so the gate clears (the `dead_letters` precedent).
+  const pendingDispatches = makeState(
+    "pending_dispatches",
+    pendingDispatchesSubId,
+    "verb",
+    {
+      type: "query",
+      collection: "pending_dispatches",
+      id: pendingDispatchesSubId,
+      limit: PENDING_DISPATCHES_PAGE_LIMIT,
+    },
+  );
   const states: CollectionState[] = [
     epics,
     jobs,
     subagentInvocations,
     gitStatus,
     deadLetters,
+    pendingDispatches,
   ];
 
   function emitSnapshotIfReady(): void {
@@ -1331,7 +1403,12 @@ export function subscribeReadiness(
       !jobs.gotResult ||
       !subagentInvocations.gotResult ||
       !gitStatus.gotResult ||
-      !deadLetters.gotResult
+      !deadLetters.gotResult ||
+      // fn-721: gate on the 6th collection too — a partial snapshot must not
+      // flip the `dispatch-pending` occupancy on the pre-paint blank state.
+      // An empty `pending_dispatches` still produces a `result` frame with
+      // `rows: []`, so this clears in the common (no in-flight launch) case.
+      !pendingDispatches.gotResult
     ) {
       return;
     }
@@ -1386,6 +1463,17 @@ export function subscribeReadiness(
     // both numbers reconcile.
     const gitTyped = projectRows<GitStatus>(gitStatus);
     const gitStatusByProjectDir = projectGitStatusByProjectDir(gitTyped);
+    // fn-721: project the `pending_dispatches` rows into the plain
+    // `PendingDispatch[]` shape via the SOLE shared helper (the SAME one the
+    // autopilot reconciler's `loadReconcileSnapshot` uses) so the board/CLI
+    // readiness pass and the autopilot reconciler agree byte-for-byte on the
+    // `dispatch-pending` occupancy set. Read from `state.rows` (not
+    // `byId.values()`) — the descriptor's wire pk is the composite-workaround
+    // `verb`, so `byId` would collapse same-`verb` rows; every in-flight
+    // dispatch must reach the projection.
+    const pendingDispatchesTyped = projectPendingDispatches(
+      projectRows<Record<string, unknown>>(pendingDispatches),
+    );
     const readiness = computeReadiness(
       epicsTyped,
       jobsTyped,
@@ -1400,6 +1488,8 @@ export function subscribeReadiness(
       // for the full rationale (mirrors fn-637.1's injected-`now`
       // resolver pattern in `epic-deps.ts`).
       Math.floor(Date.now() / 1000),
+      // fn-721: the launch-window occupancy set.
+      pendingDispatchesTyped,
     );
     // `dead_letters` is a flat row stream — typed projection from
     // `state.rows` so the wire diff (each `result` re-snapshots `rows`)
@@ -1417,6 +1507,7 @@ export function subscribeReadiness(
       subagentInvocations: subsTyped,
       gitStatus: gitTyped,
       deadLetters: deadLettersTyped,
+      pendingDispatches: pendingDispatchesTyped,
       readiness,
     });
   }

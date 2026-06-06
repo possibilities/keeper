@@ -221,6 +221,23 @@ export function resolveEpicDep(
  *                                        `default_visible` column uses to hide the shell row (fn-712) —
  *                                        one shared predicate, both surfaces wait for the same state.
  *                                        Payload-less.
+ * - `dispatch-pending`                 — a worker autopilot LAUNCHED against this row but whose
+ *                                        `SessionStart` has not folded yet — i.e. an open
+ *                                        `pending_dispatches` row (schema v50, fn-678) keyed
+ *                                        `work::<task_id>` / `approve::<task_id>` (task path) or
+ *                                        `close::<epic_id>` (close-row path) exists. The launch →
+ *                                        SessionStart blind window has no `jobs` row yet, so the only
+ *                                        durable signal that the slot is taken is this projection.
+ *                                        Set at a LATE per-row rank (after every real `running` /
+ *                                        structural-not-ready / dep verdict — those still win — but
+ *                                        BEFORE the post-pass mutexes) so it occupies BOTH the per-epic
+ *                                        and per-root mutex via `isLiveWorkOccupant` (→ auto-covers
+ *                                        `isRootOccupant`), demoting a same-epic OR same-root ready
+ *                                        sibling to `single-task-per-*`. Non-dispatchable
+ *                                        (`verbForVerdict → null`) and self-resolving (the row
+ *                                        discharges on SessionStart bind / DispatchFailed /
+ *                                        DispatchExpired), so it is `waiting`, NOT stuck (fn-721).
+ *                                        Payload-less.
  * - `unknown`                          — defensive default for verdict/renderer mismatch.
  */
 export type BlockReason =
@@ -236,6 +253,7 @@ export type BlockReason =
   | { kind: "single-task-per-epic" }
   | { kind: "single-task-per-root" }
   | { kind: "epic-no-tasks" }
+  | { kind: "dispatch-pending" }
   | { kind: "unknown" };
 
 /**
@@ -383,6 +401,33 @@ export interface ReadinessSnapshot {
   diagnostics: ResolutionDiagnostic[];
 }
 
+/**
+ * A single open `pending_dispatches` row (schema v50, fn-678) projected into
+ * the plain shape `computeReadiness` consumes for the `dispatch-pending`
+ * occupant (fn-721). Deliberately a STRUCTURAL type, NOT autopilot's
+ * `DispatchKey` / `Verb` — `src/readiness.ts` is the import LEAF
+ * (`readiness-client.ts` and `autopilot-worker.ts` import it, never the
+ * reverse), so it cannot reference autopilot's vocabulary. `computeReadiness`
+ * constructs the canonical `verb::id` key locally.
+ *
+ * - `verb` / `id`     — the `(verb, id)` composite pk of the row. Matched
+ *                       against `work::<task_id>` / `approve::<task_id>` per
+ *                       task and `close::<epic_id>` per close row.
+ * - `dir`             — the row's launch directory (the `pending_dispatches.dir`
+ *                       column, nullable). Used ONLY for the root-fallback: a
+ *                       pending row matching no snapshot row occupies this `dir`
+ *                       as a per-root mutex slot. A null `dir` contributes no
+ *                       root occupant (degrades safely — the row's TTL/discharge
+ *                       still clears it).
+ *
+ * A shared projection helper at/below the client layer
+ * (`projectPendingDispatches` in `src/readiness-client.ts`, mirroring
+ * `projectGitStatusByProjectDir`) is the SOLE builder of this shape, imported
+ * by BOTH consumers (the autopilot reconciler and `subscribeReadiness`) so the
+ * two paths never diverge.
+ */
+export type PendingDispatch = { verb: string; id: string; dir: string | null };
+
 // ---------------------------------------------------------------------------
 // Inputs
 // ---------------------------------------------------------------------------
@@ -449,7 +494,38 @@ export function computeReadiness(
   // releasing the worker; this predicate does the VISIBILITY work of
   // surfacing a sub-agent that survives that release).
   now: number = Number.NEGATIVE_INFINITY,
+  // fn-721: the open `pending_dispatches` rows (schema v50, fn-678) — workers
+  // autopilot LAUNCHED but whose `SessionStart` has not folded yet. Appended
+  // AFTER `now` (low blast radius — the 9+ call sites that rely on defaults
+  // stay valid; the simulator/preview paths in `cli/autopilot.ts` pass `[]`,
+  // correctly modelling "no launch-window occupancy in a what-if"). Each row
+  // is matched to a task (`work::<id>` / `approve::<id>`) or close row
+  // (`close::<id>`) and sets the `dispatch-pending` occupant verdict on THAT
+  // row at a LATE per-row rank (below every real `running` / structural /
+  // dep verdict, above the post-pass mutexes), so the launch → SessionStart
+  // blind window holds BOTH the per-epic and per-root mutex via
+  // `isLiveWorkOccupant` (→ auto-covers `isRootOccupant`). A row matching NO
+  // snapshot row falls back to occupying its own `dir` root (decision b) —
+  // seeded into `applySingleTaskPerRootMutex` outside the per-row walk so the
+  // launch→materialize lag + deleted-target window stays covered. Built by
+  // the SOLE shared helper `projectPendingDispatches` so both consumers (the
+  // autopilot reconciler and `subscribeReadiness`) build it identically.
+  // Default `[]` so the pre-fn-721 "no launch-window occupancy" semantics
+  // hold for callers that don't subscribe to `pending_dispatches`.
+  pendingDispatches: PendingDispatch[] = [],
 ): ReadinessSnapshot {
+  // fn-721: index the pending dispatches by their canonical `verb::id` key
+  // (the SAME `${verb}::${id}` shape `dispatchKey` builds in autopilot, but
+  // constructed locally — readiness is the import LEAF and must not reference
+  // autopilot's vocabulary). The per-row evaluators consume `pendingKeys` and
+  // record every key they MATCH into `matchedPendingKeys`, so the unmatched
+  // remainder drives the root-fallback after the per-row walk.
+  const pendingKeys = new Set<string>();
+  for (const pd of pendingDispatches) {
+    pendingKeys.add(`${pd.verb}::${pd.id}`);
+  }
+  const matchedPendingKeys = new Set<string>();
+
   // Build a job_id → SubagentInvocation[] index so predicate 6 is O(1) per row.
   // Filtered to `status === "running"` at index time — the only status that
   // can block; ok/error rows pass silently.
@@ -510,6 +586,8 @@ export function computeReadiness(
         perCloseRow,
         gitStatusByProjectDir,
         now,
+        pendingKeys,
+        matchedPendingKeys,
       );
       perTask.set(task.task_id, verdict);
     }
@@ -522,19 +600,44 @@ export function computeReadiness(
       perTask,
       gitStatusByProjectDir,
       now,
+      pendingKeys,
+      matchedPendingKeys,
     );
     perCloseRow.set(epic.epic_id, closeVerdict);
   }
 
+  // fn-721 root-fallback (decision b): a pending dispatch whose `verb::id`
+  // matched NO task or close row in the per-row walk above — the
+  // launch→materialize lag (a worker launched before its `.planctl` snapshot
+  // folded into `epics`) or a deleted-target window. Its slot must still be
+  // held so a sibling on the same root can't double-dispatch into it, but
+  // there's no per-row verdict to set, so we seed the row's own `dir` into
+  // the per-root mutex's occupied set. A null `dir` contributes nothing
+  // (degrades safely — the row's own TTL/discharge still clears it; it just
+  // can't claim a root without a path). Built outside the per-row walk
+  // because, by definition, these rows have no row to attach to.
+  const fallbackRoots = new Set<string>();
+  for (const pd of pendingDispatches) {
+    const key = `${pd.verb}::${pd.id}`;
+    if (matchedPendingKeys.has(key)) {
+      continue;
+    }
+    if (pd.dir != null && pd.dir !== "") {
+      fallbackRoots.add(pd.dir);
+    }
+  }
+
   // Post-pass mutexes — mutate `perTask` / `perCloseRow` in board traversal
   // order. Per-epic FIRST so its tighter scope reports the reason when both
-  // would apply; per-root SECOND over the same maps.
+  // would apply; per-root SECOND over the same maps (seeded with the
+  // root-fallback occupants above).
   applySingleTaskPerEpicMutex(epicsArr, perTask);
   applySingleTaskPerRootMutex(
     epicsArr,
     perTask,
     perCloseRow,
     subRunningByJobId,
+    fallbackRoots,
   );
 
   // Epic header rollup.
@@ -575,7 +678,35 @@ function evaluateTask(
   // sub-agent staleness check at predicate 6. See `computeReadiness`'s
   // `now` doc for the determinism rationale.
   now: number,
+  // fn-721: the canonical `verb::id` keys of every open `pending_dispatches`
+  // row, and the running set of keys MATCHED so far. The task arm matches
+  // `work::<task_id>` and `approve::<task_id>`; a match records the key into
+  // `matchedPendingKeys` (so it does NOT also drive the root-fallback) and
+  // sets the late-rank `dispatch-pending` occupant verdict below.
+  pendingKeys: Set<string>,
+  matchedPendingKeys: Set<string>,
 ): Verdict {
+  // fn-721: a pending dispatch keyed on THIS task's `work::` or `approve::`
+  // verb MATCHED a real snapshot row — record it so the post-pass
+  // root-fallback does NOT also synthesize a root occupant for it (the
+  // late-rank `dispatch-pending` verdict below, or the earlier-winning
+  // `running` / `job-pending` predicate, already holds the slot via the
+  // per-row pass). Computed once, BEFORE the predicate pipeline returns, so
+  // the match is recorded even when a higher-rank verdict (e.g. a live
+  // `running`) wins and the late-rank dispatch-pending branch never runs.
+  const taskHasPending =
+    pendingKeys.size > 0 &&
+    (pendingKeys.has(`work::${task.task_id}`) ||
+      pendingKeys.has(`approve::${task.task_id}`));
+  if (taskHasPending) {
+    if (pendingKeys.has(`work::${task.task_id}`)) {
+      matchedPendingKeys.add(`work::${task.task_id}`);
+    }
+    if (pendingKeys.has(`approve::${task.task_id}`)) {
+      matchedPendingKeys.add(`approve::${task.task_id}`);
+    }
+  }
+
   // 1. terminal-completed. Schema v19: read the derived worker-phase binary
   // under its new key — the legacy `status` was renamed to `worker_phase`
   // to free up `runtime_status` for the planctl-native enum. Semantics:
@@ -872,6 +1003,32 @@ function evaluateTask(
 
   // 10. dep-on-task-synthetic-close — not applicable to a real task.
 
+  // 10.5. dispatch-pending (fn-721) — a worker autopilot LAUNCHED against this
+  // task (a `work::` / `approve::` row in `pending_dispatches`) but whose
+  // SessionStart has not folded yet, so no `jobs` row exists to make the slot
+  // visible as a real `running` occupant. Set the occupant verdict at this
+  // LATE per-row rank — AFTER every real `running` verdict (predicates 1–7,
+  // which return earlier), the structural-not-ready verdicts
+  // (epic-not-materialized / epic-not-validated / planner-running), AND the
+  // dep verdicts (8/9): each of those still WINS so a truer state is never
+  // masked (the fn-700 anti-pattern). It runs BEFORE the post-pass mutexes,
+  // so pass-1 of both `applySingleTaskPerEpicMutex` and
+  // `applySingleTaskPerRootMutex` sees it as an occupant via
+  // `isLiveWorkOccupant`, demoting a same-epic OR same-root ready sibling.
+  // Non-dispatchable (`verbForVerdict → null`) and self-resolving (the row
+  // discharges on SessionStart bind / DispatchFailed / DispatchExpired). The
+  // match was already recorded into `matchedPendingKeys` at the top of this
+  // function so the root-fallback never double-counts a matched row.
+  //
+  // Note: an `approve` dispatch's row is normally already `job-pending`
+  // (predicate 7, an occupant + `verbForVerdict → approve`) and wins above,
+  // with the same-key `liveTabKeys` arm suppressing its re-dispatch — so this
+  // branch typically fires for a `work` dispatch whose row would otherwise
+  // read `ready`. Either way the dispatched row occupies its mutex.
+  if (taskHasPending) {
+    return { tag: "blocked", reason: { kind: "dispatch-pending" } };
+  }
+
   // 11. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
   // 12. single-task-per-root — deferred to applySingleTaskPerRootMutex.
 
@@ -933,7 +1090,24 @@ function evaluateCloseRow(
   // sub-agent staleness check at predicate 6. See `computeReadiness`'s
   // `now` doc for the determinism rationale.
   now: number,
+  // fn-721: the canonical `verb::id` keys of every open `pending_dispatches`
+  // row, and the running matched-key set. The close-row arm matches
+  // `close::<epic_id>`; a match records the key (so it does NOT drive the
+  // root-fallback) and sets the late-rank `dispatch-pending` verdict below.
+  pendingKeys: Set<string>,
+  matchedPendingKeys: Set<string>,
 ): Verdict {
+  // fn-721: a pending `close::<epic_id>` dispatch MATCHED this close row —
+  // record it (computed before the pipeline returns, so the match is logged
+  // even when a higher-rank verdict wins and the late-rank branch never
+  // runs) so the root-fallback never double-synthesizes a root occupant for
+  // it.
+  const closeHasPending =
+    pendingKeys.size > 0 && pendingKeys.has(`close::${epic.epic_id}`);
+  if (closeHasPending) {
+    matchedPendingKeys.add(`close::${epic.epic_id}`);
+  }
+
   // 1. terminal-completed (close-row variant).
   if (epic.status === "done" && epic.approval === "approved") {
     return { tag: "completed" };
@@ -1135,6 +1309,18 @@ function evaluateCloseRow(
     }
   }
 
+  // 10.5. dispatch-pending (fn-721) — close-row twin of the task-path
+  // predicate. A `close::<epic_id>` worker was LAUNCHED but its SessionStart
+  // has not folded yet. Set at this LATE rank — after the close row's own
+  // terminal/structural/dep verdicts (which still win), before the post-pass
+  // mutexes — so it occupies BOTH the per-epic and per-root mutex while the
+  // launch → SessionStart window is open. Non-dispatchable and self-resolving,
+  // same as the task path. The match was recorded at the top of this function
+  // so the root-fallback never double-counts it.
+  if (closeHasPending) {
+    return { tag: "blocked", reason: { kind: "dispatch-pending" } };
+  }
+
   // 11. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
   // 12. single-task-per-root — deferred to applySingleTaskPerRootMutex.
 
@@ -1191,6 +1377,17 @@ function evaluateCloseRow(
  *     class as fn-671, one rank lower. Holding the slot keeps a depless ready
  *     sibling from jumping the queue while the dirty repo blocks the approve
  *     dispatch (fn-703).
+ *   - `dispatch-pending` — fn-721. A worker autopilot LAUNCHED but whose
+ *     SessionStart has not folded yet (an open `pending_dispatches` row). No
+ *     `jobs` row exists in the launch → SessionStart blind window, so this is
+ *     the ONLY signal the slot is taken. Holding the mutex demotes a same-epic
+ *     OR same-root ready sibling, closing the launch→SessionStart safety gap
+ *     so the next epic (step 3) can drop the serial `confirmRunning` wait
+ *     without reopening the fn-627 double-dispatch class. Non-dispatchable
+ *     (`verbForVerdict → null`); the row self-resolves on bind / DispatchFailed
+ *     / DispatchExpired. Per-EPIC AND per-root (no planner exemption — a
+ *     pending dispatch is a real launched worker holding a working tree,
+ *     unlike a planner), so `isRootOccupant`'s delegation auto-covers it.
  *
  * Excluded: dependency blocks (`dep-on-task`, `dep-on-epic`), admin blocks
  * (`epic-not-validated`, `job-rejected`), mutex-synthesized blocks
@@ -1215,7 +1412,11 @@ function isLiveWorkOccupant(verdict: Verdict): boolean {
         // pill — holds the mutex. Additive, placed AFTER `job-pending`; never
         // outranks `running`.
         verdict.reason.kind === "git-uncommitted" ||
-        verdict.reason.kind === "git-orphans"))
+        verdict.reason.kind === "git-orphans" ||
+        // fn-721: a launched-but-not-yet-bound worker (open `pending_dispatches`
+        // row) holds the mutex through the launch → SessionStart blind window
+        // — the ONE signal the slot is taken before a `jobs` row exists.
+        verdict.reason.kind === "dispatch-pending"))
   );
 }
 
@@ -1351,6 +1552,14 @@ export function applySingleTaskPerEpicMutex(
  * preserved (the git state is the epic's own project_dir fact). Mirrors the
  * task-level fn-703 widening of `isLiveWorkOccupant`.
  *
+ * fn-721 close-row mirror: same shape again for a `close::<epic_id>` launched
+ * but not-yet-bound closer — the close row renders `dispatch-pending` with NO
+ * live epic-level job, so `epicLevelRunning` is false yet the launch-window
+ * occupancy is the epic's OWN project_dir fact and must hold the epic's own
+ * root. The gate also claims on the `dispatch-pending` close kind, strictly
+ * scoped to `effectiveRoot(null, epic.project_dir)` — the same cross-root
+ * phantom-lock narrowing as the git case.
+ *
  * Pass 2 — ready tiebreak: walk tasks and close rows in iteration order. If
  * the root is already claimed by pass-1, every `{ tag: "ready" }` row on
  * that root is mutated to `{ kind: "single-task-per-root" }`. Otherwise the
@@ -1365,8 +1574,20 @@ export function applySingleTaskPerRootMutex(
   perTask: Map<string, Verdict>,
   perCloseRow: Map<string, Verdict>,
   subRunningByJobId: Map<string, SubagentInvocation[]> = new Map(),
+  // fn-721 root-fallback (decision b): roots claimed by an open
+  // `pending_dispatches` row whose `verb::id` matched NO task or close row in
+  // the per-row walk (launch→materialize lag or deleted target). Seeded into
+  // `occupiedRoots` BEFORE pass-1 so a sibling ready task on the same root is
+  // demoted to `single-task-per-root` even though the dispatched target has no
+  // row to carry a per-row `dispatch-pending` verdict. Each entry is a non-
+  // empty `dir`; null/empty dirs were dropped by the caller (degrade safely).
+  // Default empty so callers that don't model launch-window occupancy (tests,
+  // the simulator) keep the pre-fn-721 behaviour.
+  fallbackRoots: Set<string> = new Set(),
 ): void {
-  const occupiedRoots = new Set<string>();
+  // Seed the root-fallback occupants first — a pending dispatch with no
+  // matching snapshot row still holds its `dir` root.
+  const occupiedRoots = new Set<string>(fallbackRoots);
 
   // Pass 1: every root-occupant verdict (task OR close row) claims its
   // root regardless of iteration order relative to ready siblings in
@@ -1414,7 +1635,17 @@ export function applySingleTaskPerRootMutex(
         closeVerdict.tag === "blocked" &&
         (closeVerdict.reason.kind === "git-uncommitted" ||
           closeVerdict.reason.kind === "git-orphans");
-      if (epicLevelRunning || closeRowGitVerdict) {
+      // fn-721: a `close::<epic_id>` closer was LAUNCHED but not yet bound, so
+      // the close row renders `dispatch-pending` with NO live epic-level job —
+      // `epicLevelRunning` is false. Same close-row mirror as the fn-703 git
+      // case: the launch-window occupancy is the epic's OWN project_dir fact
+      // (the closer was launched against THIS epic), so it must hold the
+      // epic's own root. Strictly scoped to `effectiveRoot(null, projectDir)`
+      // — preserving the fn-655/fn-663 no-cross-root-phantom-lock narrowing.
+      const closeRowDispatchPending =
+        closeVerdict.tag === "blocked" &&
+        closeVerdict.reason.kind === "dispatch-pending";
+      if (epicLevelRunning || closeRowGitVerdict || closeRowDispatchPending) {
         const root = effectiveRoot(null, projectDir);
         occupiedRoots.add(root);
       }
@@ -1999,6 +2230,8 @@ function formatReasonShort(reason: BlockReason): string {
       return "single-task-per-root";
     case "epic-no-tasks":
       return "epic-no-tasks";
+    case "dispatch-pending":
+      return "dispatch-pending";
     case "unknown":
       return "unknown";
     default: {

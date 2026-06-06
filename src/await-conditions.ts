@@ -160,11 +160,19 @@ export function classifyTargetId(id: string): TargetKind | null {
  *
  * Every other `blocked` kind — including `epic-not-validated`,
  * `git-uncommitted`, `git-orphans`, `dep-on-task`, `dep-on-epic`,
- * `dep-on-epic-dangling`, `job-pending`, `job-rejected`, `unknown` — is
- * NOT workable. `running` verdicts are never workable (the row is
- * already in motion). `completed` is the terminal positive for
- * `complete` checks and is also not workable (it's done, not "available
- * to start").
+ * `dep-on-epic-dangling`, `job-pending`, `job-rejected`,
+ * `dispatch-pending`, `unknown` — is NOT workable. `running` verdicts are
+ * never workable (the row is already in motion). `completed` is the
+ * terminal positive for `complete` checks and is also not workable (it's
+ * done, not "available to start").
+ *
+ * fn-721 note: `dispatch-pending` on the DISPATCHED row is NOT workable —
+ * a worker has already been launched against it (the row is effectively in
+ * motion, just not yet SessionStart-bound), so it self-resolves and is
+ * `waiting`, NOT actionable. Its DEMOTED siblings, however, render
+ * `single-task-per-*` (the occupant claimed their mutex slot), so they
+ * KEEP their workable status — the await semantics for "held back only by
+ * the concurrency mutex" are unchanged.
  *
  * Reads correctly off the post-mutation snapshot per the doc invariant:
  * predicates 11 / 12 in `computeReadiness` (`applySingleTaskPerEpicMutex`
@@ -203,6 +211,11 @@ export function workable(v: Verdict): boolean {
  * ambiguity with no same-project disambiguator). Resolution is reducer-
  * fold-time off the schema-v34 `resolved_epic_deps` projection — the
  * human has to either land the missing upstream or remove the dep.
+ *
+ * fn-721: `dispatch-pending` is deliberately NOT in this set — it
+ * SELF-RESOLVES (the `pending_dispatches` row discharges on the worker's
+ * SessionStart bind, or on DispatchFailed / DispatchExpired), so it is
+ * plain `waiting`, never `stuck`. No human action is required.
  */
 const STUCK_REASON_KINDS: ReadonlySet<BlockReason["kind"]> = new Set([
   "job-rejected",

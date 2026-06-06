@@ -108,10 +108,15 @@ import {
 } from "./backstop-telemetry";
 import { openDb } from "./db";
 import { resolveExecBackend } from "./exec-backend";
-import { computeReadiness, type Verdict } from "./readiness";
+import {
+  computeReadiness,
+  type PendingDispatch,
+  type Verdict,
+} from "./readiness";
 import {
   collapseSubagentsByName,
   projectGitStatusByProjectDir,
+  projectPendingDispatches,
 } from "./readiness-client";
 import { runQuery } from "./server-worker";
 import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
@@ -314,8 +319,26 @@ export interface ReconcileSnapshot {
    * presence means a `Dispatched` event was minted BEFORE `launch()` and
    * the corresponding `SessionStart` (which deletes the row) has not
    * folded yet — i.e., the launch → SessionStart blind window is occupied.
+   *
+   * This is the SAME-`(verb,id)` re-dispatch dedup arm. fn-721 ADDS a
+   * separate, orthogonal use of the same projection — the
+   * `pendingDispatches` field below feeds `computeReadiness`'s
+   * cross-sibling `dispatch-pending` occupant. The two are deliberately
+   * kept distinct (this set suppresses re-dispatch of the SAME key; the
+   * occupant demotes a DIFFERENT sibling on the same epic/root); both are
+   * needed.
    */
   liveTabKeys: Set<DispatchKey>;
+  /**
+   * The open `pending_dispatches` rows (fn-721) projected into the plain
+   * {@link PendingDispatch}[] shape `computeReadiness` consumes for the
+   * cross-sibling `dispatch-pending` occupant. Built by the SAME shared
+   * helper (`projectPendingDispatches`) the board/CLI path uses, so the
+   * autopilot reconciler and `subscribeReadiness` compute identical
+   * verdicts for the same pending set. Distinct from `liveTabKeys` above
+   * (same-key dedup vs cross-sibling demotion — see that field's doc).
+   */
+  pendingDispatches: PendingDispatch[];
 }
 
 /**
@@ -688,6 +711,11 @@ export function reconcile(
     snapshot.subagentInvocations,
     snapshot.gitStatusByProjectDir,
     now,
+    // fn-721: the launch-window occupancy set — feeds the cross-sibling
+    // `dispatch-pending` occupant so a same-epic / same-root sibling is
+    // demoted while a dispatch is in flight. The same-key `liveTabKeys`
+    // dedup arms below are orthogonal and stay untouched.
+    snapshot.pendingDispatches,
   );
 
   // Walk every row. For each (kind, id), compute the wanted verb and
@@ -1115,19 +1143,26 @@ async function loadReconcileSnapshot(
     }
   }
 
-  // fn-678: read `pending_dispatches` for the launch-window occupancy
-  // signal. Each row represents a dispatched-but-not-yet-bound worker;
-  // a row's presence (minted via `Dispatched` BEFORE `launch()`) keeps
-  // the `liveTabKeys` arm of `reconcile()` fired until `SessionStart`
-  // folds and discharges the row. No backend probe needed.
+  // fn-678 / fn-721: read `pending_dispatches` ONCE for its TWO orthogonal
+  // uses. Each row represents a dispatched-but-not-yet-bound worker (minted
+  // via `Dispatched` BEFORE `launch()`, discharged when `SessionStart` folds).
+  //   1. `liveTabKeys` — the SAME-`(verb,id)` re-dispatch dedup arm of
+  //      `reconcile()` (fn-678): suppress re-launching the same slot.
+  //   2. `pendingDispatches` — the CROSS-sibling `dispatch-pending` occupant
+  //      fed into `computeReadiness` (fn-721): demote a DIFFERENT ready
+  //      sibling on the same epic/root. Built via the SAME shared
+  //      `projectPendingDispatches` helper the board/CLI path uses, so the
+  //      two readiness paths agree byte-for-byte.
+  const pendingRows = read("pending_dispatches");
   const liveTabKeys = new Set<DispatchKey>();
-  for (const row of read("pending_dispatches")) {
+  for (const row of pendingRows) {
     const verb = (row as { verb?: unknown }).verb;
     const id = (row as { id?: unknown }).id;
     if (typeof verb === "string" && typeof id === "string") {
       liveTabKeys.add(dispatchKey(verb as Verb, id));
     }
   }
+  const pendingDispatches = projectPendingDispatches(pendingRows);
 
   return {
     epics,
@@ -1136,6 +1171,7 @@ async function loadReconcileSnapshot(
     gitStatusByProjectDir,
     failedKeys,
     liveTabKeys,
+    pendingDispatches,
   };
 }
 
