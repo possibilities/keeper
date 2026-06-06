@@ -1,0 +1,18 @@
+{
+  "approval": "pending",
+  "branch_name": "fn-720-unify-backstop-telemetry-for-daemon",
+  "bundles": [],
+  "created_at": "2026-06-06T18:07:37.077064Z",
+  "depends_on_epics": [],
+  "id": "fn-720-unify-backstop-telemetry-for-daemon",
+  "last_validated_at": "2026-06-06T18:07:37.132457Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Unify backstop telemetry for daemon stalls",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-06T18:07:37.077064Z"
+}
