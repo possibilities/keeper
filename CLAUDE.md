@@ -295,8 +295,10 @@ binary or a derived label is the renderer's job, and only if it ever needs to.
   BUSY exhaustion).
 - **Test isolation: never spread `...process.env` for state-bearing vars.** Every
   test that spawns the real hook MUST route through a shared sandboxed base-env
-  helper overriding ALL four state paths (`KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`,
-  `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`) under the per-test `tmpDir`. A bare
+  helper overriding ALL five state paths (`KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`,
+  `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG` — the last
+  added by epic fn-720's backstop-telemetry sidecar) under the per-test
+  `tmpDir`. A bare
   `{ ...process.env, KEEPER_DB: ... }` strands the others at production defaults
   and pollutes the user's real `~/.local/state/keeper/` feed. Apply the sandbox
   AFTER any `undefined`-clears-key loop so a caller can't re-open the leak.
@@ -347,6 +349,20 @@ Every keeper Worker thread follows the same durable contract:
   file, watcher subscription, re-scan timer, kqueue/pidfd fd) MUST release it in
   its own shutdown handler — `terminate()` alone leaks it.
 - **No in-process self-heal** — a worker's `error` event escalates to `fatalExit`.
+- **Uniform backstop telemetry (epic fn-720).** Every worker that backs a fast
+  path (`data_version` poll / post-fold kick / FSEvents) with a slow
+  heartbeat or ceiling/TTL fallback emits a uniform structured record when
+  that backstop fires — `{kind:"backstop-rescue", class:"missed-wake"|"timeout",
+  backstop, worker, fast_path, rescued, staleness_ms, last_fast_path_at}` —
+  by `postMessage({kind:"backstop", record})` up to main, the SOLE writer of
+  the `KEEPER_BACKSTOP_LOG` sidecar (`src/backstop-telemetry.ts`,
+  `appendBackstopRecord`). The worker keeps `last_fast_path_at` + per-(backstop,
+  class) `fires_total`/`rescues_total` counters in-memory and flushes periodic
+  + on-shutdown `backstop-rollup` denominator records; `scripts/backstop-stats.ts`
+  reports rescue count, rescue RATE, and staleness percentiles. The loud stderr
+  ALARM is rate-limited per-key; the NDJSON record + counters are NEVER
+  rate-limited. Observability-only — never a synthetic event, never a fold input
+  (the sidecar is a pure consumer-side side-file).
 
 ## Autopilot dispatch gates
 

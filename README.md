@@ -430,7 +430,20 @@ Keeper has no `install` verb. Wire it up manually:
    `KEEPER_DEAD_LETTER_DIR` (directory for per-pid dead-letter NDJSON
    recovery files, default `~/.local/state/keeper/dead-letters/`) — tests
    that spawn the real hook MUST override both to keep production
-   diagnostic feeds clean. The restore worker (epic fn-677, two-tier
+   diagnostic feeds clean. The daemon also honors `KEEPER_BACKSTOP_LOG`
+   (path to the backstop-telemetry sidecar NDJSON, default
+   `~/.local/state/keeper/backstop.ndjson`; epic fn-720) — the append-only
+   feed every change-propagation backstop writes a uniform record to when
+   it fires, tagged with whether it actually RESCUED a missed fast path.
+   Main is the SOLE writer (workers `postMessage` rescue/rollup records up);
+   it is a pure consumer-side side-file — never read by the reducer, never
+   feeds a projection — so a write failure is best-effort/swallowed.
+   `scripts/backstop-stats.ts` aggregates it into per-(backstop,class)
+   rescue count, rescue RATE (rescues ÷ total fires, from the rollup
+   denominator), and staleness p50/p95/p99. Spawn-tests MUST override this
+   path too (alongside `KEEPER_DB` / `KEEPER_DROP_LOG` /
+   `KEEPER_DEAD_LETTER_DIR` / `KEEPER_RESTORE_FILE`) so the suite never
+   writes the user's real state dir. The restore worker (epic fn-677, two-tier
    rework fn-702) writes `~/.local/state/keeper/restore.json` (the
    Chrome-style "restore previous session" snapshot — agents + zellij
    metadata for `scripts/restore-agents.ts` to replay against) as a
@@ -1033,10 +1046,23 @@ write and no `recheck-pending` post — the worker reconciles those external
 reflog watches against its live `pending` repo set. The two remaining drain
 triggers are main's `recheck-pending` post on every `GitSnapshot` / `Commit`
 it writes, and the heartbeat — DEMOTED from a 60s latency floor to a 5s
-should-never-fire paranoia backstop (`RECONCILE_HEARTBEAT_MS`); a
-`"heartbeat"`-tagged backstop emit is now a loud ALARM that every fast path
-missed a change (or a `.planctl` file is genuinely abandoned-uncommitted),
-never normal operation. The poll is a TRIGGER only — it never writes the DB
+should-never-fire paranoia backstop (`RECONCILE_HEARTBEAT_MS`); when the
+heartbeat actually re-converges a change a fast path dropped it is a
+genuine RESCUE, never normal operation. Epic fn-720 generalized that
+single plan-worker ALARM into a UNIFORM backstop-telemetry channel across
+every change-propagation backstop (plan/git/transcript heartbeats, the
+FSEvents-drop rescan, the autopilot `confirmRunning` ceiling, and the
+pending-dispatch TTL sweep): each fire emits a structured
+`{kind:"backstop-rescue", class:"missed-wake"|"timeout", backstop, worker,
+fast_path, rescued, staleness_ms, last_fast_path_at}` record (plus periodic
+`backstop-rollup` denominator records) to the `KEEPER_BACKSTOP_LOG`
+sidecar via main-the-sole-writer, so a missed-wake rescue is COUNTABLE
+(rescue rate = rescues ÷ total fires) rather than only stderr-visible. The
+loud human stderr ALARM stays for genuine rescues but is rate-limited
+per-key so `server.stderr` can't flood — the NDJSON record + counters are
+NEVER rate-limited, so the metric stays complete. It is observability-only:
+zero behavior change, no synthetic events, no schema/keeper-py bump, no
+reducer change. The poll is a TRIGGER only — it never writes the DB
 nor drives a synthetic event from anything but a parsed `.planctl` file, so
 re-fold determinism is intact. Every drain trigger re-runs the in-HEAD probe
 and a still-uncommitted path stays in `pending` (no fn-627 regression — the
