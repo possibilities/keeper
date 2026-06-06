@@ -68,5 +68,5 @@ Negative control: a dep-on-task does NOT claim (occupant-only).
 - [ ] No reducer/schema/keeper-py change; no import cycle; `bun run lint` + `typecheck` + `bun test` green.
 
 ## Done summary
-
+Added the dispatch-pending BlockReason as a per-epic + per-root mutex occupant via isLiveWorkOccupant (auto-covering isRootOccupant), with per-row matching (work::/approve:: tasks, close:: epics) at a late rank plus a dir-column root-fallback for unmatched pending rows. Threaded pending_dispatches through both readiness paths via a shared projectPendingDispatches helper (6th subscribed collection + first-paint gate); verbForVerdict->null and await waiting-not-stuck semantics pinned. No reducer/schema/keeper-py change.
 ## Evidence
