@@ -28,8 +28,11 @@ build-backend = "hatchling.build"
 # real `scaffold` work (git init + `promptctl inline-sketch-refs` subprocess
 # + multiple commit subprocesses under flock). 30s still catches genuine
 # hangs without flagging routine subprocess-heavy paths under xdist load.
-addopts = "--import-mode=importlib --timeout=30 -n auto"
-asyncio_mode = "auto"
+# --strict-markers turns a typo'd or unregistered @pytest.mark into a
+# collection error, so every marker must be registered (see
+# tests/conftest.py::pytest_configure) — guards the `real_git` / `integration`
+# split against silent no-op misspellings.
+addopts = "--import-mode=importlib --timeout=30 -n auto --strict-markers"
 testpaths = ["tests"]
 
 [tool.ty.src]
@@ -65,7 +68,6 @@ allowed-unresolved-imports = [
 [dependency-groups]
 dev = [
     "pytest>=8",
-    "pytest-asyncio>=1.3.0",
     "pytest-timeout>=2.3.1",
     "pytest-xdist>=3.8.0",
     "ruff>=0.14.14",

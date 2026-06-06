@@ -1,4 +1,14 @@
-"""Shared pytest fixtures for planctl tests."""
+"""Shared pytest fixtures for planctl tests.
+
+Beyond the git-backed ``scaffold`` seeds (``seed_epic`` / ``add_task``), this
+module ships ``seed_state`` — a git-free, CLI-free builder that writes a full
+``.planctl/`` tree through the same ``normalize_epic`` / ``normalize_task`` +
+``atomic_write_json`` seams the read path runs, so a seeded tree carries zero
+schema drift. Three fixtures support it: ``isolated_roots`` stubs project
+discovery to ``[]`` so re-stamping verbs skip the real ``~/code`` scan,
+``mock_sketch_refs`` fakes the ``promptctl inline-sketch-refs`` spawn, and
+``fixed_clock`` pins ``now_iso()`` for deterministic timestamp assertions.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +27,11 @@ def pytest_configure(config):
         "markers",
         "real_git: exercise the real .planctl/ auto-commit (status+add+commit+"
         "rev-parse). Default tests no-op it — git is tested only where asserted.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "integration: heavy end-to-end test (git init + CliRunner scaffold + "
+        "subprocesses). Excluded from the fast gate via `-m 'not integration'`.",
     )
 
 
@@ -351,6 +366,165 @@ def seed_epic(
     assert result.exit_code == 0, result.output
     payload = _first_json_payload(result.output)
     return payload["epic_id"], payload["task_ids"]
+
+
+def seed_state(
+    tmp_path,
+    *,
+    epic_id: str,
+    title: str = "Seed epic",
+    epic_spec: str = "## Overview\nseed overview\n",
+    n_tasks: int = 1,
+    epic_snippets: list[str] | None = None,
+    epic_bundles: list[str] | None = None,
+    task_snippets: dict[int, list[str]] | None = None,
+    task_bundles: dict[int, list[str]] | None = None,
+    task_deps: dict[int, list[int]] | None = None,
+    primary_repo: str | None = None,
+) -> tuple[str, list[str]]:
+    """Build a full ``.planctl/`` tree on disk without git, CLI, or flock.
+
+    Mirrors ``planctl init`` for the skeleton + ``meta.json`` and
+    ``planctl scaffold`` for the epic/task on-disk key set, but routes every
+    record through :func:`planctl.models.normalize_epic` /
+    :func:`planctl.models.normalize_task` before persisting via
+    :func:`planctl.store.atomic_write_json` — the SAME normalization the read
+    path runs, so a seeded tree carries no schema drift (the round-trip
+    self-test below is the standing proof).
+
+    The caller supplies the ``fn-N`` ``epic_id`` directly: there is no
+    ``scan_epic_ids_global``, no flock, no ``git init``, and no ``CliRunner``.
+    Returns ``(epic_id, task_ids)`` where ``task_ids`` are the ordered
+    ``<epic_id>.<M>`` ids.
+    """
+    from planctl.models import SCHEMA_VERSION, normalize_epic, normalize_task
+    from planctl.store import atomic_write, atomic_write_json, now_iso
+
+    epic_snippets = epic_snippets or []
+    epic_bundles = epic_bundles or []
+    task_snippets = task_snippets or {}
+    task_bundles = task_bundles or {}
+    task_deps = task_deps or {}
+
+    planctl_dir = tmp_path / ".planctl"
+    for subdir in ("epics", "specs", "tasks", "state"):
+        (planctl_dir / subdir).mkdir(parents=True, exist_ok=True)
+    atomic_write_json(planctl_dir / "meta.json", {"schema_version": SCHEMA_VERSION})
+    (planctl_dir / ".gitignore").write_text("state/\n", encoding="utf-8")
+
+    now = now_iso()
+
+    epic_def = normalize_epic(
+        {
+            "id": epic_id,
+            "title": title,
+            "status": "open",
+            "primary_repo": primary_repo,
+            "snippets": list(epic_snippets),
+            "bundles": list(epic_bundles),
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    atomic_write_json(planctl_dir / "epics" / f"{epic_id}.json", epic_def)
+    atomic_write(planctl_dir / "specs" / f"{epic_id}.md", epic_spec)
+
+    task_ids: list[str] = []
+    for i in range(1, n_tasks + 1):
+        task_id = f"{epic_id}.{i}"
+        task_ids.append(task_id)
+        depends_on = [f"{epic_id}.{d}" for d in task_deps.get(i, [])]
+        task_def = normalize_task(
+            {
+                "id": task_id,
+                "epic": epic_id,
+                "title": f"Task {i}",
+                "depends_on": depends_on,
+                "tier": "medium",
+                "target_repo": primary_repo,
+                "snippets": list(task_snippets.get(i, [])),
+                "bundles": list(task_bundles.get(i, [])),
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        atomic_write_json(planctl_dir / "tasks" / f"{task_id}.json", task_def)
+        atomic_write(planctl_dir / "specs" / f"{task_id}.md", _task_spec(f"seed-{i}"))
+
+    return epic_id, task_ids
+
+
+@pytest.fixture
+def isolated_roots(monkeypatch):
+    """Stub project discovery to ``[]`` so re-stamping verbs skip the real scan.
+
+    ``restamp_epic_or_fail`` calls ``discover_projects()`` -> ``load_roots()``,
+    which scans the machine's configured ``~/code`` tree. Forcing an empty
+    discovery keeps ``seed_state`` tests hermetic and fast (single-project
+    semantics, no cross-machine leakage).
+    """
+    monkeypatch.setattr("planctl.discovery.discover_projects", lambda: [])
+    monkeypatch.setattr("planctl.config.load_roots", lambda: [])
+
+
+class _FakeProc:
+    """Mimic the bits of ``CompletedProcess`` that callers read."""
+
+    def __init__(self, *, returncode: int, stdout: str, stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+@pytest.fixture
+def mock_sketch_refs(monkeypatch):
+    """Fake the ``promptctl inline-sketch-refs`` spawn in ``planctl.sketch_refs``.
+
+    Lifts the ``_FakeProc`` / subprocess-patch pattern from
+    ``tests/test_sketch_refs_helper.py``. Replaces
+    ``planctl.sketch_refs.subprocess.run`` with a fake returning a real-shaped
+    ``CompletedProcess``-like object: its stdout is the per-group success-slot
+    JSON array the verb expects (``remaining_bundles`` with every ``sketch/``
+    ref dropped, ``merged_snippets`` echoing the group's snippets unchanged —
+    no real inlining). Only tests that drive ``sketch/`` refs need this:
+    ``bundle/`` and ``arc/`` refs short-circuit before any spawn.
+    """
+    calls: list[dict] = []
+
+    def _fake_run(argv, **kwargs):
+        calls.append({"argv": argv, "kwargs": kwargs})
+        groups = json.loads(kwargs["input"]) if kwargs.get("input") else []
+        slots = [
+            {
+                "remaining_bundles": [
+                    ref
+                    for ref in group.get("bundles", [])
+                    if not ref.startswith("sketch/")
+                ],
+                "merged_snippets": list(group.get("snippets", [])),
+            }
+            for group in groups
+        ]
+        return _FakeProc(returncode=0, stdout=json.dumps(slots))
+
+    monkeypatch.setattr("planctl.sketch_refs.subprocess.run", _fake_run)
+    return calls
+
+
+@pytest.fixture
+def fixed_clock(monkeypatch):
+    """Pin ``now_iso()`` to a fixed microsecond-precision UTC timestamp.
+
+    Every caller resolves the seam via a function-scoped
+    ``from planctl.store import now_iso``, so the name is re-bound from
+    ``planctl.store`` on each call — patching ``planctl.store.now_iso`` is the
+    single correct target (a module-namespace patch would miss nothing because
+    nothing binds the symbol at module scope). The frozen value matches
+    ``now_iso()``'s exact ``%Y-%m-%dT%H:%M:%S.%fZ`` format. Returns the value.
+    """
+    frozen = "2026-06-06T00:00:00.000000Z"
+    monkeypatch.setattr("planctl.store.now_iso", lambda: frozen)
+    return frozen
 
 
 def add_task(
