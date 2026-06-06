@@ -80,5 +80,5 @@ backfill converges to the same value.
 - [ ] README schema narrative updated (v59 paragraph added; v51 "display-only" implication revised)
 
 ## Done summary
-
+Carry a provenance-filtered has_live_worker_monitor occupancy fact onto the embedded epics.tasks[].jobs[] element (schema v59, whitelist-only fix-forward): derived from jobs.monitors (monitor/bash-bg occupy, ambient never), stamped at the Stop fold's monitors-write site, preserved across job-tick re-syncs via the buildEmbeddedJob carve-out, forced false on terminal. Readiness (task 2) consumes it.
 ## Evidence

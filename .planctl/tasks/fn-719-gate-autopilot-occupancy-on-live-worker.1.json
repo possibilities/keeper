@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Carry worker-monitor-live fact onto embedded job",
-  "updated_at": "2026-06-05T21:41:25.012601Z"
+  "updated_at": "2026-06-06T00:50:43.462170Z",
+  "worker_done_at": "2026-06-06T00:50:43.462170Z"
 }
