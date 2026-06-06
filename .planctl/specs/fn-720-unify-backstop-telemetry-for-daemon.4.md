@@ -49,5 +49,5 @@ partial-line tolerance.
 - [ ] Script has a fixture-driven test; `bun test` green.
 
 ## Done summary
-
+Added scripts/backstop-stats.ts: a pure NDJSON aggregator reporting per-(backstop,class) rescue count, rescue rate from the rollup denominator (n/a when no rollup landed), and staleness p50/p95/p99; tolerates a torn partial final line. Fixture-driven test (5 cases) green. Generalized the plan-worker ALARM prose into the unified backstop channel in README ## Architecture, added backstop.ndjson + KEEPER_BACKSTOP_LOG to the sidecar/env file-map, and updated CLAUDE.md's test-isolation rule + worker-contract note.
 ## Evidence
