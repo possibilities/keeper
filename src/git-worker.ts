@@ -44,6 +44,11 @@ import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
+import {
+  BackstopCounters,
+  type BackstopMessage,
+  buildMissedWakeRecord,
+} from "./backstop-telemetry";
 import { openDb } from "./db";
 import {
   parsePlanRef,
@@ -327,7 +332,11 @@ export type GitWorkerMessage =
   | GitSnapshotMessage
   | GitRootDroppedMessage
   | CommitMessage
-  | PlanctlCommitChangedMessage;
+  | PlanctlCommitChangedMessage
+  // Epic fn-720: a backstop rescue/rollup record posted up to main (the SOLE
+  // sidecar writer). NOT folded into the event log — a pure consumer-side
+  // side-file. Routed straight to `handleBackstopMessage`.
+  | BackstopMessage;
 
 interface ParsedGitStatus {
   branch: string | null;
@@ -342,6 +351,14 @@ interface ParsedGitStatus {
 const DB_POLL_MS = 100;
 /** Silent-watcher backstop, same shape as `transcript-worker.ts`. */
 const HEARTBEAT_MS = 60_000;
+/**
+ * Cadence (ms) at which the worker flushes its backstop counters as
+ * {@link BackstopRollup} records (epic fn-720) — the denominator
+ * (fires_total / rescues_total) `scripts/backstop-stats.ts` divides into the
+ * rescue records for a true RATE. Slow (5 min); a clean shutdown also flushes
+ * one final rollup so a quiescent daemon still records a complete denominator.
+ */
+const BACKSTOP_ROLLUP_FLUSH_MS = 5 * 60_000;
 /**
  * Per-root GitSnapshot emission ceiling (epic fn-716). Passed into every
  * {@link RescanScheduler} (the `maxWaitMs` ceiling added in task fn-716.1) so a
@@ -2176,13 +2193,40 @@ function startWorker(): void {
   let lastDataVersionScheduleAtMs = Number.NEGATIVE_INFINITY;
   let shuttingDown = false;
 
+  // ── fn-720 backstop telemetry ──────────────────────────────────────────────
+  // `lastFastPathAt` is stamped at every confirmed FAST-path fire (the FSEvents
+  // scheduler debounced emit, the `data_version`-poll re-snapshot); the 60s
+  // heartbeat (the slow backstop) reads it to compute staleness. `null` until
+  // the first fast path fires — the cold-boot sentinel that keeps a giant false
+  // staleness off the histogram (buildMissedWakeRecord nulls staleness then).
+  // The counters accumulate fires/rescues per (backstop,class) for the
+  // denominator; a periodic + on-shutdown rollup flushes them up to main.
+  let lastFastPathAt: number | null = null;
+  const backstopCounters = new BackstopCounters();
+  let rollupTimer: ReturnType<typeof setInterval> | null = null;
+  const markFastPath = (): void => {
+    lastFastPathAt = Date.now();
+  };
+  const flushBackstopRollups = (): void => {
+    for (const rollup of backstopCounters.snapshot(Date.now())) {
+      port.postMessage({
+        kind: "backstop",
+        record: rollup,
+      } satisfies BackstopMessage);
+    }
+  };
+
   // Single-flight reconciler — DB poll + heartbeat + boot all call this and
   // must not double-subscribe across an `await`.
   let reconciling = false;
   let reconcilePending = false;
 
-  function emitSnapshot(root: string): void {
-    if (shuttingDown) return;
+  // Returns `true` iff this call emitted a fresh GitSnapshot through `port`
+  // (fn-720) — the `rescued` boolean the heartbeat backstop folds into one
+  // uniform `missed-wake` record. Every early-return / divergence-suppress /
+  // semantic-dedupe coalesce path returns `false`.
+  function emitSnapshot(root: string): boolean {
+    if (shuttingDown) return false;
     let status: ParsedGitStatus | null;
     try {
       status = readStatus(root);
@@ -2190,9 +2234,9 @@ function startWorker(): void {
       console.error(
         `[git-worker] readStatus failed for ${root}: ${stringifyErr(err)}`,
       );
-      return;
+      return false;
     }
-    if (status == null) return;
+    if (status == null) return false;
 
     // Wedge guard (data-integrity gate). The long-lived git subprocess can
     // start returning a STALE view (frozen head + dirty set) while fs reads in
@@ -2204,7 +2248,7 @@ function startWorker(): void {
     // live emit path because the 60s heartbeat proved unreliable during a real
     // wedge (it never fired).
     if (snapshotSuppressedByDivergence(root, status.head_oid)) {
-      return;
+      return false;
     }
 
     // HEAD-oid delta detection — runs BEFORE the snapshot emission so a
@@ -2328,7 +2372,7 @@ function startWorker(): void {
       console.error(
         `[git-worker] buildGitSnapshot failed for ${root}: ${stringifyErr(err)}`,
       );
-      return;
+      return false;
     }
     // Epic fn-716: SEMANTIC dedupe key — render-significant fields only,
     // EXCLUDING per-file mtime_ms (which churns on every save without changing
@@ -2339,13 +2383,14 @@ function startWorker(): void {
     const key = semanticSnapshotKey(snapshot);
     if (lastByRoot.get(root) === key) {
       coalescedDrops++;
-      return;
+      return false;
     }
     lastByRoot.set(root, key);
     port.postMessage({
       kind: "git-snapshot",
       ...snapshot,
     } satisfies GitSnapshotMessage);
+    return true;
   }
 
   function schedulerFor(root: string): RescanScheduler {
@@ -2356,7 +2401,15 @@ function startWorker(): void {
     // ≤1 GitSnapshot per GIT_SNAPSHOT_MAX_WAIT_MS, latest-wins — a trailing
     // debounce alone re-arms forever under sustained edits and never flushes.
     s = new RescanScheduler(
-      () => emitSnapshot(root),
+      () => {
+        // fn-720: a debounced scheduler fire IS the fast path (FSEvents change
+        // or db-poll re-snapshot) — stamp `last_fast_path_at` so a later
+        // heartbeat measures staleness against it. The heartbeat calls
+        // `emitSnapshot` DIRECTLY (not through the scheduler), so it never
+        // stamps — exactly the fast-path/backstop distinction we want.
+        markFastPath();
+        emitSnapshot(root);
+      },
       DEFAULT_DEBOUNCE_MS,
       (m) => console.error(m),
       undefined,
@@ -2664,6 +2717,14 @@ function startWorker(): void {
     shuttingDown = true;
     if (dbPollTimer != null) clearInterval(dbPollTimer);
     if (heartbeatTimer != null) clearInterval(heartbeatTimer);
+    // fn-720: cancel the periodic rollup flush, then flush ONE final rollup so
+    // the denominator survives a clean stop. postMessage is synchronous; main
+    // is still reading (it sends `shutdown` and awaits `close`).
+    if (rollupTimer != null) {
+      clearInterval(rollupTimer);
+      rollupTimer = null;
+    }
+    flushBackstopRollups();
     // Cancel every armed scheduler BEFORE unsubscribe + db.close so a queued
     // re-scan can't fire against a closing connection. Mirrors plan-worker.
     for (const sched of schedulers.values()) sched.cancel();
@@ -2754,7 +2815,28 @@ function startWorker(): void {
         // even with no file/commit activity it re-checks divergence and drives
         // the eventual restart. (The primary trigger is the live watcher/
         // db-poll emit path, since this 60s timer proved unreliable mid-wedge.)
-        for (const root of subscriptions.keys()) emitSnapshot(root);
+        // fn-720: this IS the slow backstop — OR the per-root emitted-booleans
+        // into one `rescued` flag. A `true` means a watcher went mute and the
+        // heartbeat re-delivered a snapshot the FSEvents/db-poll fast paths
+        // missed. The shutdown guard above gates the telemetry emit too.
+        let rescued = false;
+        for (const root of subscriptions.keys()) {
+          if (emitSnapshot(root)) rescued = true;
+        }
+        backstopCounters.bump("git-heartbeat", "missed-wake", rescued);
+        if (rescued) {
+          port.postMessage({
+            kind: "backstop",
+            record: buildMissedWakeRecord({
+              backstop: "git-heartbeat",
+              worker: "git-worker",
+              fastPath: "fsevents",
+              rescued: true,
+              now: Date.now(),
+              lastFastPathAt,
+            }),
+          } satisfies BackstopMessage);
+        }
         // Epic fn-716: surface the flood reduction. Log + reset the count of
         // snapshots the semantic dedupe gate coalesced away this window (mostly
         // pure-mtime churn under continuous editing) so the throttle's effect is
@@ -2766,6 +2848,21 @@ function startWorker(): void {
           coalescedDrops = 0;
         }
       }, HEARTBEAT_MS);
+
+      // fn-720: periodic backstop-rollup flush — checkpoint the denominator
+      // (fires_total / rescues_total) so the metric survives a crash without a
+      // line per no-op heartbeat. Cleared + final-flushed in the shutdown
+      // handler.
+      rollupTimer = setInterval(() => {
+        if (shuttingDown) return;
+        try {
+          flushBackstopRollups();
+        } catch (err) {
+          console.error(
+            `[git-worker] backstop rollup flush failed: ${stringifyErr(err)}`,
+          );
+        }
+      }, BACKSTOP_ROLLUP_FLUSH_MS);
     })
     .catch((err) => {
       // Addon load failure is the sole unrecoverable surface. Exit non-zero →

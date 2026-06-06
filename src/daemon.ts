@@ -1425,11 +1425,22 @@ function runDaemon(): void {
   // everything else is NULL (synthetic — never carries a process identity).
   transcriptWorker.onmessage = (
     ev: MessageEvent<
-      TranscriptTitleMessage | ApiErrorMessage | InputRequestMessage | undefined
+      | TranscriptTitleMessage
+      | ApiErrorMessage
+      | InputRequestMessage
+      | BackstopMessage
+      | undefined
     >,
   ): void => {
     const msg = ev.data;
     if (!msg) {
+      return;
+    }
+    if (msg.kind === "backstop") {
+      // Epic fn-720: a backstop rescue/rollup record. Main is the SOLE sidecar
+      // writer — append the line and return. NOT an event fold (a pure
+      // consumer-side side-file, never read by the reducer).
+      handleBackstopMessage(msg);
       return;
     }
     if (msg.kind === "transcript-title") {
@@ -1899,6 +1910,13 @@ function runDaemon(): void {
   ): void => {
     const msg = ev.data;
     if (!msg) return;
+    if (msg.kind === "backstop") {
+      // Epic fn-720: a backstop rescue/rollup record. Main is the SOLE sidecar
+      // writer — append the line and return. NOT an event fold (a pure
+      // consumer-side side-file, never read by the reducer).
+      handleBackstopMessage(msg);
+      return;
+    }
     if (msg.kind === "planctl-commit-changed") {
       // Epic fn-681: authoritative commit-driven planctl ingest. The
       // git-worker observed a commit in `msg.project_dir` carrying

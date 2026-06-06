@@ -47,6 +47,11 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
+import {
+  BackstopCounters,
+  type BackstopMessage,
+  buildMissedWakeRecord,
+} from "./backstop-telemetry";
 import { openDb } from "./db";
 import { isDropError, RescanScheduler } from "./rescan";
 import type { ApiErrorKind, InputRequestKind } from "./types";
@@ -477,13 +482,18 @@ export class TranscriptLineStream {
    * the event log. A title already folded (seeded into `lastEmitted` by
    * `seedFromDb`) is suppressed by the change-gate. Per-file errors skip-and-log;
    * the scan never throws.
+   *
+   * Returns `true` iff this scan emitted at least one (changed) title through
+   * `onTitle` (fn-720) — the `rescued` signal {@link scanJobsForTitles} ORs
+   * across every scanned file so the heartbeat / FSEvents-drop backstop can
+   * report whether the slow scan actually rescued a title the live tail missed.
    */
-  scanFile(path: string): void {
+  scanFile(path: string): boolean {
     let size: number;
     try {
       const st = statSync(path);
       if (!st.isFile()) {
-        return;
+        return false;
       }
       size = st.size;
     } catch (err) {
@@ -499,10 +509,10 @@ export class TranscriptLineStream {
           `[transcript-worker] boot scan stat failed for ${path}: ${stringifyErr(err)}`,
         );
       }
-      return;
+      return false;
     }
     if (size <= 0) {
-      return;
+      return false;
     }
 
     let fd: number;
@@ -512,7 +522,7 @@ export class TranscriptLineStream {
       this.log(
         `[transcript-worker] boot scan open failed for ${path}: ${stringifyErr(err)}`,
       );
-      return;
+      return false;
     }
 
     // Transient per-scan state — NOT stored in pathState, so the live tail still
@@ -558,7 +568,7 @@ export class TranscriptLineStream {
           this.log(
             `[transcript-worker] boot scan read failed for ${path}: ${stringifyErr(err)}`,
           );
-          return;
+          return false;
         }
         if (got <= 0) {
           break;
@@ -583,6 +593,7 @@ export class TranscriptLineStream {
     // Emit the current title per session through the shared change-gate: a title
     // already folded (seeded by seedFromDb) is suppressed; a changed one emits
     // once and advances the gate so the live tail won't re-emit it.
+    let emitted = false;
     for (const [sessionId, title] of lastPerSession) {
       const prev = this.lastEmitted.get(sessionId);
       if (prev === title) {
@@ -590,7 +601,9 @@ export class TranscriptLineStream {
       }
       this.lastEmitted.set(sessionId, title);
       this.onTitle(sessionId, title);
+      emitted = true;
     }
+    return emitted;
   }
 
   /**
@@ -845,15 +858,20 @@ export function seedFromDb(db: Database, stream: TranscriptLineStream): void {
  * suppressed by the change-gate (no duplicate event on restart). Per-file errors
  * skip-and-log inside `scanFile`; this is non-fatal.
  *
+ * Returns `true` iff at least one scanned file emitted a (changed) title
+ * (fn-720) — the `rescued` boolean the heartbeat / FSEvents-drop backstop folds
+ * into one uniform `missed-wake` record. Boot / live callers ignore the return.
+ *
  * Read-only — uses the worker's own read-only connection. Exported for unit reach.
  */
 export function scanJobsForTitles(
   db: Database,
   stream: TranscriptLineStream,
-): void {
+): boolean {
   const rows = db
     .query("SELECT transcript_path FROM jobs WHERE transcript_path IS NOT NULL")
     .all() as { transcript_path: string }[];
+  let emittedAny = false;
   for (const row of rows) {
     if (
       typeof row.transcript_path !== "string" ||
@@ -861,8 +879,11 @@ export function scanJobsForTitles(
     ) {
       continue;
     }
-    stream.scanFile(row.transcript_path);
+    if (stream.scanFile(row.transcript_path)) {
+      emittedAny = true;
+    }
   }
+  return emittedAny;
 }
 
 /**
@@ -929,6 +950,26 @@ function main(): void {
   let subscription: AsyncSubscription | null = null;
   let shuttingDown = false;
 
+  // ── fn-720 backstop telemetry ──────────────────────────────────────────────
+  // `lastFastPathAt` is stamped at every confirmed FAST-path fire (the live
+  // `onChange` tail driven by a real FSEvents batch); the 60s heartbeat (the
+  // slow backstop) reads it to compute staleness. `null` until the first fast
+  // path fires — the cold-boot sentinel that keeps a giant false staleness off
+  // the histogram. The counters accumulate fires/rescues per (backstop,class)
+  // for the denominator; a periodic + on-shutdown rollup flushes them up to main
+  // (the SOLE sidecar writer).
+  let lastFastPathAt: number | null = null;
+  const backstopCounters = new BackstopCounters();
+  let rollupTimer: ReturnType<typeof setInterval> | null = null;
+  const flushBackstopRollups = (): void => {
+    for (const rollup of backstopCounters.snapshot(Date.now())) {
+      port.postMessage({
+        kind: "backstop",
+        record: rollup,
+      } satisfies BackstopMessage);
+    }
+  };
+
   // Drop-recovery scheduler (single root): a recoverable FSEvents drop schedules
   // a debounced, single-flight re-scan via the change-gated boot-scan primitive
   // (scanJobsForTitles, which routes through scanFile's TRANSIENT decoder — NEVER
@@ -940,7 +981,25 @@ function main(): void {
     if (shuttingDown) {
       return;
     }
-    scanJobsForTitles(db, stream);
+    // fn-720: this is the FSEvents-drop backstop — fold the emitted-boolean into
+    // one `rescan-drop` missed-wake record (rescued = the change-gated scan
+    // recovered a title the dropped FSEvents change would otherwise have lost).
+    // The shutdown guard above gates both the scan and the telemetry emit.
+    const rescued = scanJobsForTitles(db, stream);
+    backstopCounters.bump("rescan-drop", "missed-wake", rescued);
+    if (rescued) {
+      port.postMessage({
+        kind: "backstop",
+        record: buildMissedWakeRecord({
+          backstop: "rescan-drop",
+          worker: "transcript-worker",
+          fastPath: "fsevents",
+          rescued: true,
+          now: Date.now(),
+          lastFastPathAt,
+        }),
+      } satisfies BackstopMessage);
+    }
   });
 
   // Heartbeat / silent-watcher recovery. Observed (May 2026, daemon pid 83205):
@@ -964,6 +1023,9 @@ function main(): void {
   //      path uses, so the contract (TRANSIENT decoder, never `onChange`) is
   //      preserved.
   const HEARTBEAT_MS = 60_000;
+  // fn-720: cadence at which the worker flushes its backstop counters as rollup
+  // records — the denominator survives a crash without a line per no-op fire.
+  const BACKSTOP_ROLLUP_FLUSH_MS = 5 * 60_000;
   let eventsReceived = 0;
   let lastEventAt = 0;
   const heartbeatTimer = setInterval(() => {
@@ -977,13 +1039,47 @@ function main(): void {
       `[transcript-worker] heartbeat events_received=${eventsReceived} last_event_at=${lastSeen}`,
     );
     try {
-      scanJobsForTitles(db, stream);
+      // fn-720: this IS the slow backstop — fold the emitted-boolean into one
+      // uniform `transcript-heartbeat` missed-wake record. A `true` means the
+      // watcher went mute and the heartbeat re-folded a title the live tail
+      // missed. The shutdown guard above gates the telemetry emit too.
+      const rescued = scanJobsForTitles(db, stream);
+      backstopCounters.bump("transcript-heartbeat", "missed-wake", rescued);
+      if (rescued) {
+        port.postMessage({
+          kind: "backstop",
+          record: buildMissedWakeRecord({
+            backstop: "transcript-heartbeat",
+            worker: "transcript-worker",
+            fastPath: "fsevents",
+            rescued: true,
+            now: Date.now(),
+            lastFastPathAt,
+          }),
+        } satisfies BackstopMessage);
+      }
     } catch (err) {
       console.error(
         `[transcript-worker] heartbeat scan failed: ${stringifyErr(err)}`,
       );
     }
   }, HEARTBEAT_MS);
+
+  // fn-720: periodic backstop-rollup flush — checkpoint the denominator so it
+  // survives a crash without a line per no-op heartbeat. Cleared + final-flushed
+  // in the shutdown handler.
+  rollupTimer = setInterval(() => {
+    if (shuttingDown) {
+      return;
+    }
+    try {
+      flushBackstopRollups();
+    } catch (err) {
+      console.error(
+        `[transcript-worker] backstop rollup flush failed: ${stringifyErr(err)}`,
+      );
+    }
+  }, BACKSTOP_ROLLUP_FLUSH_MS);
 
   const closeDb = (): void => {
     try {
@@ -1001,6 +1097,14 @@ function main(): void {
       // heartbeat timer carries the same constraint (its body runs scanJobsForTitles).
       rescan.cancel();
       clearInterval(heartbeatTimer);
+      // fn-720: cancel the periodic rollup flush, then flush ONE final rollup so
+      // the denominator survives a clean stop. postMessage is synchronous; main
+      // is still reading (it sends `shutdown` and awaits `close`).
+      if (rollupTimer != null) {
+        clearInterval(rollupTimer);
+        rollupTimer = null;
+      }
+      flushBackstopRollups();
       // Release the subscription (external resource), then the db, then exit
       // clean. Mirrors server-worker's socket teardown.
       void (async () => {
@@ -1062,6 +1166,11 @@ function main(): void {
         // not just our matched-file slice.
         eventsReceived += events.length;
         lastEventAt = Date.now();
+        // fn-720: a confirmed FSEvents batch IS the fast path for transcript
+        // titles — stamp `last_fast_path_at` so a later heartbeat measures
+        // staleness against it (a working watcher keeps the heartbeat a
+        // perpetual no-op rescue).
+        lastFastPathAt = Date.now();
         for (const ev of events) {
           // Treat every event as "go look" — create/update both tail from the
           // stored offset; a delete just drops tracking. The in-callback

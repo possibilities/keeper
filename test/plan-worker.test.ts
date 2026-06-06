@@ -25,6 +25,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import type {
+  BackstopMessage,
+  BackstopRecord,
+  BackstopRollup,
+} from "../src/backstop-telemetry";
 import { openDb } from "../src/db";
 import {
   buildEpicMessage,
@@ -3235,4 +3240,183 @@ test("spawned Worker shuts down cleanly on shutdown message", async () => {
   ]);
 
   expect(result).toBe("exited");
+});
+
+// ---------------------------------------------------------------------------
+// (z) fn-720 backstop telemetry — the plan-heartbeat / rescan-drop missed-wake
+//     records + the denominator. Drives the pure `PlanScanner` primitives with
+//     a synthetic clock + a captured `postBackstop` sink (no Worker, no bus).
+// ---------------------------------------------------------------------------
+
+/** A PlanScanner wired with a synthetic clock + record sink for backstop tests. */
+function backstopScanner(): {
+  scanner: PlanScanner;
+  records: BackstopRecord[];
+  rollups: BackstopRollup[];
+  setNow: (ms: number) => void;
+} {
+  let now = 0;
+  const records: BackstopRecord[] = [];
+  const rollups: BackstopRollup[] = [];
+  const post = (msg: BackstopMessage): void => {
+    if (msg.record.kind === "backstop-rescue") records.push(msg.record);
+    else rollups.push(msg.record);
+  };
+  const scanner = new PlanScanner(
+    () => {},
+    () => {},
+    isPathInHead,
+    isPathInHeadBatch,
+    () => {},
+    post,
+    () => now,
+  );
+  const setNow = (ms: number): void => {
+    now = ms;
+  };
+  return { scanner, records, rollups, setNow };
+}
+
+test("fn-720 plan-heartbeat: a fast-path stamp then a heartbeat rescue posts a missed-wake record with correct staleness", () => {
+  const { scanner, records, setNow } = backstopScanner();
+  // A db-poll fast path fired at t=1000.
+  setNow(1000);
+  scanner.markFastPath();
+  // Heartbeat fires at t=61240 and the change-gated scan rescued (rescued=true).
+  setNow(61240);
+  scanner.fireBackstop("plan-heartbeat", "data_version_poll", true);
+
+  expect(records).toHaveLength(1);
+  expect(records[0]).toEqual({
+    ts: 61240,
+    kind: "backstop-rescue",
+    class: "missed-wake",
+    backstop: "plan-heartbeat",
+    worker: "plan-worker",
+    fast_path: "data_version_poll",
+    rescued: true,
+    staleness_ms: 60240, // 61240 - 1000
+    last_fast_path_at: 1000,
+  });
+});
+
+test("fn-720 plan-heartbeat: a no-op heartbeat posts NO record but still bumps the denominator", () => {
+  const { scanner, records, rollups, setNow } = backstopScanner();
+  setNow(5000);
+  scanner.markFastPath();
+  // A no-op heartbeat fire (rescued=false) writes no NDJSON line...
+  setNow(10000);
+  scanner.fireBackstop("plan-heartbeat", "data_version_poll", false);
+  expect(records).toHaveLength(0);
+
+  // ...but the denominator counts it (one no-op fire, zero rescues).
+  setNow(10001);
+  scanner.flushBackstopRollups();
+  expect(rollups).toHaveLength(1);
+  expect(rollups[0]).toEqual({
+    ts: 10001,
+    kind: "backstop-rollup",
+    backstop: "plan-heartbeat",
+    class: "missed-wake",
+    fires_total: 1,
+    rescues_total: 0,
+  });
+});
+
+test("fn-720 plan-heartbeat: cold-boot heartbeat (no fast path yet) reports NULL staleness, not a giant false alarm", () => {
+  const { scanner, records, setNow } = backstopScanner();
+  // No markFastPath() ever — lastFastPathAt is null.
+  setNow(999999);
+  scanner.fireBackstop("plan-heartbeat", "data_version_poll", true);
+  expect(records).toHaveLength(1);
+  expect(records[0]?.staleness_ms).toBeNull();
+  expect(records[0]?.last_fast_path_at).toBeNull();
+});
+
+test("fn-720 rescan-drop: an FSEvents-drop rescue posts a rescan-drop missed-wake record", () => {
+  const { scanner, records, setNow } = backstopScanner();
+  setNow(2000);
+  scanner.markFastPath();
+  setNow(7000);
+  scanner.fireBackstop("rescan-drop", "fsevents", true);
+  expect(records).toHaveLength(1);
+  expect(records[0]?.backstop).toBe("rescan-drop");
+  expect(records[0]?.fast_path).toBe("fsevents");
+  expect(records[0]?.staleness_ms).toBe(5000);
+});
+
+test("fn-720 denominator: fires across both backstops snapshot to one rollup per (backstop,class)", () => {
+  const { scanner, rollups, setNow } = backstopScanner();
+  setNow(0);
+  scanner.fireBackstop("plan-heartbeat", "data_version_poll", true);
+  scanner.fireBackstop("plan-heartbeat", "data_version_poll", false);
+  scanner.fireBackstop("rescan-drop", "fsevents", false);
+  setNow(100);
+  scanner.flushBackstopRollups();
+  expect(rollups).toHaveLength(2);
+  const plan = rollups.find((r) => r.backstop === "plan-heartbeat");
+  const drop = rollups.find((r) => r.backstop === "rescan-drop");
+  expect(plan).toEqual({
+    ts: 100,
+    kind: "backstop-rollup",
+    backstop: "plan-heartbeat",
+    class: "missed-wake",
+    fires_total: 2,
+    rescues_total: 1,
+  });
+  expect(drop?.fires_total).toBe(1);
+  expect(drop?.rescues_total).toBe(0);
+});
+
+test("fn-720: reconcilePlanctlDirs returns whether it emitted (the rescued boolean)", () => {
+  const proj = join(tmpDir, "proj");
+  const epicDir = join(proj, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+  gitInit(proj);
+  const scanner = new PlanScanner(
+    () => {},
+    () => {},
+    isPathInHead,
+  );
+  const epicPath = join(epicDir, "fn-9-ret.json");
+  writeFileSync(
+    epicPath,
+    JSON.stringify({
+      id: "fn-9-ret",
+      title: "Ret",
+      status: "open",
+      primary_repo: proj,
+    }),
+  );
+  git(proj, "add", epicPath);
+  git(proj, "commit", "-q", "-m", "add epic");
+
+  // First reconcile emits the never-seen epic → true.
+  expect(reconcilePlanctlDirs([tmpDir], scanner, "heartbeat")).toBe(true);
+  // Second reconcile is change-gate-suppressed → false (a no-op fire).
+  expect(reconcilePlanctlDirs([tmpDir], scanner, "heartbeat")).toBe(false);
+});
+
+test("fn-720: recheckPending stamps a fast path (so a later heartbeat measures staleness against it)", () => {
+  gitInit(tmpDir);
+  const { scanner, records, setNow } = backstopScanner();
+  // An uncommitted epic lands in pending.
+  const epicPath = writeEpic("fn-6-fast", {
+    title: "Fast",
+    status: "open",
+    primary_repo: tmpDir,
+  });
+  scanner.onChange(epicPath);
+  expect(scanner.pendingSize()).toBe(1);
+
+  // A reflog/recheck fast-path drain at t=3000 stamps lastFastPathAt (pending
+  // is non-empty, so it counts as a confirmed fast-path fire).
+  setNow(3000);
+  scanner.recheckPending();
+
+  // A heartbeat rescue at t=9000 measures staleness against that stamp.
+  setNow(9000);
+  scanner.fireBackstop("plan-heartbeat", "data_version_poll", true);
+  expect(records[0]?.last_fast_path_at).toBe(3000);
+  expect(records[0]?.staleness_ms).toBe(6000);
 });

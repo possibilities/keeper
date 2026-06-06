@@ -12,6 +12,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BackstopCounters,
+  type BackstopMessage,
+  type BackstopRecord,
+  type BackstopRollup,
+  buildMissedWakeRecord,
+} from "../src/backstop-telemetry";
+import {
   extractCommit,
   parseSessionIdTrailer,
   parseTaskTrailers,
@@ -2980,4 +2987,100 @@ test("decideDataVersionWake: first advance after boot (lastSchedule = -Infinity)
   const d = decideDataVersionWake(2, 1, 50, Number.NEGATIVE_INFINITY, FLOOR);
   expect(d.schedule).toBe(true);
   expect(d.nextScheduleAtMs).toBe(50);
+});
+
+// ---------------------------------------------------------------------------
+// fn-720 backstop telemetry — git-heartbeat missed-wake record + denominator.
+// emitSnapshot + the heartbeat body live inside the worker `main` closure, so
+// (per the established emitSnapshot-delta test pattern above) we faithfully
+// re-create the heartbeat body — the SAME `BackstopCounters.bump` +
+// `buildMissedWakeRecord` calls the worker makes — driving it with a synthetic
+// clock + per-root emitted-booleans. The fast-path stamp (`lastFastPathAt`) is
+// set only by the scheduler fire, NOT the heartbeat, exactly as in the worker.
+// ---------------------------------------------------------------------------
+
+/** Faithful re-creation of git-worker's heartbeat backstop body (fn-720). */
+function stepGitHeartbeat(
+  counters: BackstopCounters,
+  emittedByRoot: boolean[],
+  now: number,
+  lastFastPathAt: number | null,
+): BackstopMessage[] {
+  const out: BackstopMessage[] = [];
+  let rescued = false;
+  for (const emitted of emittedByRoot) {
+    if (emitted) rescued = true;
+  }
+  counters.bump("git-heartbeat", "missed-wake", rescued);
+  if (rescued) {
+    out.push({
+      kind: "backstop",
+      record: buildMissedWakeRecord({
+        backstop: "git-heartbeat",
+        worker: "git-worker",
+        fastPath: "fsevents",
+        rescued: true,
+        now,
+        lastFastPathAt,
+      }),
+    });
+  }
+  return out;
+}
+
+test("fn-720 git-heartbeat: a mute-watcher rescue (a root re-emitted) posts a missed-wake record with correct staleness", () => {
+  const counters = new BackstopCounters();
+  // The FSEvents/db-poll fast path last fired (scheduler emit) at t=1000.
+  const lastFastPathAt = 1000;
+  // Heartbeat at t=62240: one subscribed root re-emitted a snapshot the live
+  // path missed (watcher went mute), so rescued=true.
+  const msgs = stepGitHeartbeat(counters, [false, true], 62240, lastFastPathAt);
+  expect(msgs).toHaveLength(1);
+  const rec = msgs[0]?.record as BackstopRecord;
+  expect(rec).toEqual({
+    ts: 62240,
+    kind: "backstop-rescue",
+    class: "missed-wake",
+    backstop: "git-heartbeat",
+    worker: "git-worker",
+    fast_path: "fsevents",
+    rescued: true,
+    staleness_ms: 61240, // 62240 - 1000
+    last_fast_path_at: 1000,
+  });
+});
+
+test("fn-720 git-heartbeat: a no-op heartbeat (every root coalesced) posts NO record but bumps the denominator", () => {
+  const counters = new BackstopCounters();
+  const msgs = stepGitHeartbeat(counters, [false, false], 70000, 1000);
+  expect(msgs).toHaveLength(0);
+  const rollups = counters.snapshot(70001);
+  expect(rollups).toHaveLength(1);
+  expect(rollups[0]).toEqual({
+    ts: 70001,
+    kind: "backstop-rollup",
+    backstop: "git-heartbeat",
+    class: "missed-wake",
+    fires_total: 1,
+    rescues_total: 0,
+  });
+});
+
+test("fn-720 git-heartbeat: cold-boot heartbeat (no fast path yet) reports NULL staleness", () => {
+  const counters = new BackstopCounters();
+  const msgs = stepGitHeartbeat(counters, [true], 999999, null);
+  expect(msgs).toHaveLength(1);
+  const rec = msgs[0]?.record as BackstopRecord;
+  expect(rec.staleness_ms).toBeNull();
+  expect(rec.last_fast_path_at).toBeNull();
+});
+
+test("fn-720 git-heartbeat: denominator accumulates across fires (rate => rescues/fires)", () => {
+  const counters = new BackstopCounters();
+  stepGitHeartbeat(counters, [true], 1000, 0); // rescue
+  stepGitHeartbeat(counters, [false], 2000, 0); // no-op
+  stepGitHeartbeat(counters, [false], 3000, 0); // no-op
+  const rollups = counters.snapshot(4000) as BackstopRollup[];
+  expect(rollups[0]?.fires_total).toBe(3);
+  expect(rollups[0]?.rescues_total).toBe(1);
 });

@@ -98,7 +98,12 @@ import {
 import { dirname, join, relative, sep } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
-import type { BackstopMessage } from "./backstop-telemetry";
+import {
+  BackstopCounters,
+  type BackstopMessage,
+  BackstopRateLimiter,
+  buildMissedWakeRecord,
+} from "./backstop-telemetry";
 import { openDb } from "./db";
 import { isDropError, RescanScheduler } from "./rescan";
 
@@ -390,6 +395,18 @@ export type InboundMessage =
  * planctl epic/task JSON.
  */
 const MAX_PLAN_FILE_BYTES = 1024 * 1024;
+
+/**
+ * Per-key cooldown (ms) for the loud per-path backstop ALARM prose in
+ * {@link PlanScanner.logBackstopEmit} (epic fn-720). A broken fast path makes
+ * the 5s heartbeat rescue EVERY cycle, which would flood `server.stderr` with
+ * the ALARM line; the rate-limiter caps it to ≤1 line per key per this window.
+ * The NDJSON record + the in-memory counters are NEVER gated through this — a
+ * suppressed ALARM still bumps the denominator and still writes the rescue line
+ * (the metric stays complete). 60s matches the cadence at which a human tailing
+ * stderr would want a re-reminder without the firehose.
+ */
+const BACKSTOP_ALARM_COOLDOWN_MS = 60_000;
 
 /**
  * Aggressive POSITIVE ignore globs — the #1 perf lever for broad roots like
@@ -862,7 +879,104 @@ export class PlanScanner {
      * inside the gate logic.
      */
     private readonly onPendingChange: () => void = () => {},
+    /**
+     * Epic fn-720 backstop-telemetry sink. Posts a built `{kind:"backstop"}`
+     * message UP to main (the SOLE sidecar writer) on every heartbeat /
+     * FSEvents-drop fire — a rescue record when the change-gated scan actually
+     * emitted, a periodic + on-shutdown rollup for the denominator. Defaults to
+     * a no-op so the pure-core unit tests need no message bus; the live worker
+     * passes `(msg) => port.postMessage(msg)`.
+     */
+    private readonly postBackstop: (msg: BackstopMessage) => void = () => {},
+    /**
+     * Injected wall-clock (epoch ms) the backstop telemetry stamps for
+     * `last_fast_path_at`, staleness, and rollup `ts`. A producer-side read —
+     * NEVER consulted inside a fold (re-fold determinism is unaffected; the
+     * sidecar is a pure consumer-side side-file). Defaults to `Date.now`; tests
+     * inject a synthetic clock.
+     */
+    private readonly now: () => number = () => Date.now(),
   ) {}
+
+  /**
+   * Epic fn-720 backstop-telemetry state. `lastFastPathAt` is stamped at every
+   * confirmed fast-path fire ({@link markFastPath} — live FSEvents `onChange`,
+   * the `data_version` poll re-scan, the reflog-driven `recheckPending`); the
+   * heartbeat / FSEvents-drop backstops read it to compute staleness. `null`
+   * until the first fast path fires (the cold-boot sentinel that keeps a giant
+   * false staleness off the histogram). Counters accumulate fires/rescues per
+   * (backstop,class) for the denominator; the rate-limiter gates ONLY the loud
+   * per-path ALARM prose in {@link logBackstopEmit} (the NDJSON record +
+   * counters are NEVER gated, so the metric stays complete).
+   */
+  private lastFastPathAt: number | null = null;
+  private readonly backstopCounters = new BackstopCounters();
+  private readonly backstopAlarmLimiter = new BackstopRateLimiter(
+    BACKSTOP_ALARM_COOLDOWN_MS,
+  );
+
+  /**
+   * Stamp the in-memory `last_fast_path_at` from the injected clock. Called at
+   * every confirmed FAST-path fire (live FSEvents `onChange`, the
+   * `data_version`-poll re-scan, the reflog-driven `recheckPending` drain) — NOT
+   * on a heartbeat / FSEvents-drop fire (those are the BACKSTOPS that READ this
+   * value to compute staleness). Pure in-memory; no I/O.
+   */
+  markFastPath(): void {
+    this.lastFastPathAt = this.now();
+  }
+
+  /**
+   * Record one backstop fire (the heartbeat or the FSEvents-drop rescan). Always
+   * bumps the (backstop,`missed-wake`) counter; on a genuine RESCUE
+   * (`rescued === true`, i.e. the change-gated scan emitted at least one
+   * snapshot) ALSO posts a full {@link buildMissedWakeRecord} line up to main.
+   * A no-op fire (`rescued === false`) bumps the denominator only — no NDJSON
+   * line (the plan heartbeat is 5s; a line per no-op would write ~17k/day). The
+   * cold-boot sentinel lives in {@link buildMissedWakeRecord} (null staleness
+   * when `lastFastPathAt` is still `null`). Producer-side only; never a
+   * synthetic event.
+   */
+  fireBackstop(
+    backstop: "plan-heartbeat" | "rescan-drop",
+    fastPath: string,
+    rescued: boolean,
+  ): void {
+    this.backstopCounters.bump(backstop, "missed-wake", rescued);
+    if (!rescued) return;
+    this.postBackstop({
+      kind: "backstop",
+      record: buildMissedWakeRecord({
+        backstop,
+        worker: "plan-worker",
+        fastPath,
+        rescued: true,
+        now: this.now(),
+        lastFastPathAt: this.lastFastPathAt,
+      }),
+    });
+  }
+
+  /**
+   * Flush the in-memory backstop counters as {@link BackstopRollup} records up
+   * to main (the denominator survives without a line per no-op fire). Called
+   * periodically and on shutdown by the worker. Posts nothing when no backstop
+   * has fired this process life.
+   */
+  flushBackstopRollups(): void {
+    for (const rollup of this.backstopCounters.snapshot(this.now())) {
+      this.postBackstop({ kind: "backstop", record: rollup });
+    }
+  }
+
+  /**
+   * The per-key cooldown gate for the loud per-path ALARM prose only — exposed
+   * so {@link logBackstopEmit} can suppress a flood while the NDJSON record +
+   * counters (routed through {@link fireBackstop}) stay complete.
+   */
+  private alarmAllowed(key: string): boolean {
+    return this.backstopAlarmLimiter.allow(key, this.now());
+  }
 
   /**
    * The set of repo roots that currently own at least one path in the fn-629
@@ -1312,6 +1426,12 @@ export class PlanScanner {
     if (this.pending.size === 0) {
       return;
     }
+    // fn-720: a confirmed realtime drain (driven by the reflog watch, the
+    // GitSnapshot/Commit `recheck-pending` post, or the approval kick) is a
+    // FAST path — stamp `last_fast_path_at` so a later heartbeat measures
+    // staleness against it. Stamped after the empty-check so a no-op recheck
+    // (nothing pending) does NOT pretend a fast path delivered work.
+    this.markFastPath();
     // Group the in-scope pending paths by repo root. `root` set → only that
     // repo's paths; absent → every repo with at least one pending path. A path
     // whose repo root can't be derived (shape drift) is skipped — it has no
@@ -1399,14 +1519,23 @@ export class PlanScanner {
       // Paranoia floor fired in normal operation: every realtime fast path
       // (data_version poll, reflog watch, FSEvents) missed this change. Loudest
       // wording so a grep on the alarm count surfaces a broken fast path.
-      this.log(
-        `[plan-worker] ALARM: backstop (heartbeat) emitted ${path} — every fast path missed it; the realtime path is broken or the file is abandoned-uncommitted`,
-      );
+      // fn-720: rate-limit ONLY this stderr line (per backstop key) so a broken
+      // fast path rescuing every 5s heartbeat can't flood server.stderr — the
+      // NDJSON record + counters route through `fireBackstop` and stay complete.
+      if (this.alarmAllowed("plan-heartbeat")) {
+        this.log(
+          `[plan-worker] ALARM: backstop (heartbeat) emitted ${path} — every fast path missed it; the realtime path is broken or the file is abandoned-uncommitted`,
+        );
+      }
       return;
     }
-    this.log(
-      `[plan-worker] backstop (${reason}) emitted ${path} — a fast path missed it`,
-    );
+    // `fswatcher-drop`: a known macOS FSEvents overrun rescued via the drop
+    // rescan — loud but expected, so rate-limit the prose under the same gate.
+    if (this.alarmAllowed("rescan-drop")) {
+      this.log(
+        `[plan-worker] backstop (${reason}) emitted ${path} — a fast path missed it`,
+      );
+    }
   }
 
   /**
@@ -1805,6 +1934,17 @@ const GIT_CHECK_TIMEOUT_MS = 1000;
 export const RECONCILE_HEARTBEAT_MS = 5_000;
 
 /**
+ * Cadence (ms) at which the worker flushes its in-memory backstop counters as
+ * {@link BackstopRollup} records (epic fn-720) — the denominator
+ * (fires_total / rescues_total) `scripts/backstop-stats.ts` divides into the
+ * rescue records for a true RATE. Slow (5 min) because a rollup is a periodic
+ * checkpoint, NOT a per-fire line; a clean shutdown also flushes one final
+ * rollup, so a quiescent daemon still records a complete denominator. Exported
+ * for unit reach.
+ */
+export const BACKSTOP_ROLLUP_FLUSH_MS = 5 * 60_000;
+
+/**
  * Fast `PRAGMA data_version` poll cadence (fn-705) — same value as
  * `git-worker.ts` `DB_POLL_MS` / `wake-worker.ts` so all producer/reader
  * workers share one schedule. A bump means SOMETHING committed to keeper's DB
@@ -1946,12 +2086,22 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
  * `db-poll` emit is a normal fast-path success). The boot scan
  * ({@link scanRoot}) passes `undefined` and stays silent — a first-time boot
  * emit is expected, not a noteworthy event.
+ *
+ * Returns `true` iff at least one definition-file `onChange` emitted a snapshot
+ * during this scan (fn-720) — the `rescued` boolean the backstop caller folds
+ * into one uniform `missed-wake` record per fire (the heartbeat / FSEvents-drop
+ * backstop did real work a fast path missed). Boot / `db-poll` callers ignore
+ * the return (boot isn't a backstop; `db-poll` IS a fast path, stamped
+ * separately via {@link PlanScanner.markFastPath}).
  */
 function scanPlanctlDir(
   planctlDir: string,
   scanner: PlanScanner,
   triggerReason?: "heartbeat" | "fswatcher-drop" | "db-poll",
-): void {
+): boolean {
+  // fn-720: track whether ANY definition-file onChange emitted this scan so the
+  // backstop caller can fold it into one `rescued` boolean per fire.
+  let emittedAny = false;
   // Pass 1: prime `runtimeStatusCache` from `state/tasks/*.state.json`. A
   // missing dir is fine (fresh clone with no state files yet). Each file is
   // bounded-read + safe-parsed + coerced through the same guard as the live
@@ -2051,12 +2201,16 @@ function scanPlanctlDir(
         // actually emitted, surface it: a backstop delivering work means a
         // fast path missed it (fn-701).
         const emitted = scanner.onChange(full);
-        if (emitted && triggerReason !== undefined) {
-          scanner.logBackstopEmit(full, triggerReason);
+        if (emitted) {
+          emittedAny = true;
+          if (triggerReason !== undefined) {
+            scanner.logBackstopEmit(full, triggerReason);
+          }
         }
       }
     }
   }
+  return emittedAny;
 }
 
 /**
@@ -2148,20 +2302,29 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
  * discovery for a newly-seen `.planctl` repo (de-duped worker-side). The walk
  * already paid for the directory enumeration, so this rides free; pure unit
  * tests omit it.
+ *
+ * Returns `true` iff at least one `.planctl` dir's scan emitted a snapshot
+ * (fn-720) — the `rescued` boolean the backstop caller (heartbeat / FSEvents-
+ * drop) folds into one uniform `missed-wake` record per fire. The `db-poll`
+ * (fast-path) and boot callers ignore the return.
  */
 export function reconcilePlanctlDirs(
   roots: readonly string[],
   scanner: PlanScanner,
   triggerReason?: "heartbeat" | "fswatcher-drop" | "db-poll",
   onPlanctlDir?: (planctlDir: string) => void,
-): void {
+): boolean {
   const dirs = discoverPlanctlDirs(roots);
+  let emittedAny = false;
   for (const dir of dirs) {
     if (onPlanctlDir !== undefined) {
       onPlanctlDir(dir);
     }
-    scanPlanctlDir(dir, scanner, triggerReason);
+    if (scanPlanctlDir(dir, scanner, triggerReason)) {
+      emittedAny = true;
+    }
   }
+  return emittedAny;
 }
 
 /**
@@ -2517,6 +2680,9 @@ function main(): void {
         );
       }
     },
+    // fn-720: post built backstop records/rollups UP to main (the SOLE sidecar
+    // writer). Default clock (Date.now) is fine for the live worker.
+    (m) => port.postMessage(m),
   );
 
   // Restart-seed: don't re-emit a snapshot already folded into the projection.
@@ -2545,6 +2711,11 @@ function main(): void {
   // shutdown alongside the heartbeat. Declared here so the shutdown handler
   // (registered before the timer is armed) can close over it.
   let dbPollTimer: ReturnType<typeof setInterval> | null = null;
+  // fn-720 periodic backstop-rollup flush timer — emits the denominator
+  // (fires_total / rescues_total per backstop) on a slow cadence so the metric
+  // survives a crash/restart without a line per no-op fire. Cleared in shutdown
+  // alongside the heartbeat, with one final flush.
+  let rollupTimer: ReturnType<typeof setInterval> | null = null;
   // (fn-705) `shuttingDown` is declared at the top of `main` so the reflog
   // reconcile + nudge callbacks can close over it.
 
@@ -2657,6 +2828,15 @@ function main(): void {
         clearInterval(dbPollTimer);
         dbPollTimer = null;
       }
+      // fn-720: cancel the periodic rollup flush, then flush ONE final rollup so
+      // the denominator (fires_total / rescues_total per backstop) survives a
+      // clean stop. postMessage is synchronous; main is still reading at this
+      // point (it sends `shutdown` and awaits `close`).
+      if (rollupTimer != null) {
+        clearInterval(rollupTimer);
+        rollupTimer = null;
+      }
+      scanner.flushBackstopRollups();
       // Release every subscription (external resources), then the db, then exit
       // clean. Mirrors transcript-worker's teardown but over an array.
       void (async () => {
@@ -2697,18 +2877,37 @@ function main(): void {
       // fn-701: tag as "heartbeat" so an emission here (a snapshot the
       // commit/FSEvents fast path missed) logs a "did real work" line —
       // the signature of the fast path being broken.
-      reconcilePlanctlDirs(
+      // fn-720: this IS the slow backstop — fold the aggregate emitted-boolean
+      // into one uniform `missed-wake` record (rescued = did the change-gated
+      // scan deliver work the fast paths missed). The shutdown guard above
+      // gates both the scan AND the telemetry emit.
+      const rescued = reconcilePlanctlDirs(
         data.roots,
         scanner,
         "heartbeat",
         nudgeFromPlanctlDir,
       );
+      scanner.fireBackstop("plan-heartbeat", "data_version_poll", rescued);
     } catch (err) {
       console.error(
         `[plan-worker] periodic reconcile failed: ${stringifyErr(err)}`,
       );
     }
   }, RECONCILE_HEARTBEAT_MS);
+
+  // fn-720: periodic backstop-rollup flush — checkpoint the denominator so it
+  // survives a crash without a line per no-op fire. The shutdown handler clears
+  // this and flushes one final rollup.
+  rollupTimer = setInterval(() => {
+    if (shuttingDown) return;
+    try {
+      scanner.flushBackstopRollups();
+    } catch (err) {
+      console.error(
+        `[plan-worker] backstop rollup flush failed: ${stringifyErr(err)}`,
+      );
+    }
+  }, BACKSTOP_ROLLUP_FLUSH_MS);
 
   // fn-705 fast `data_version` poll — the realtime trigger that collapses
   // close→emit to ~50ms. A bump means SOMETHING committed to keeper's DB; the
@@ -2738,6 +2937,10 @@ function main(): void {
   // guard.
   const onWake = makeSingleFlight(
     () => {
+      // fn-720: the `data_version` poll IS a fast path — stamp `last_fast_path_at`
+      // so a later heartbeat can compute staleness against it. NOT a missed-wake
+      // record (a db-poll emit is a normal fast-path success, never a rescue).
+      scanner.markFastPath();
       reconcilePlanctlDirs(data.roots, scanner, "db-poll", nudgeFromPlanctlDir);
     },
     () => shuttingDown,
@@ -2839,12 +3042,16 @@ function main(): void {
           // fn-701: tag as "fswatcher-drop" so a snapshot recovered here
           // (one the dropped FSEvents change would otherwise have lost) logs
           // a "did real work" line.
-          reconcilePlanctlDirs(
+          // fn-720: this is the FSEvents-drop backstop — fold the emitted-
+          // boolean into one `rescan-drop` missed-wake record. The shutdown
+          // guard above gates both the scan and the telemetry emit.
+          const rescued = reconcilePlanctlDirs(
             [root],
             scanner,
             "fswatcher-drop",
             nudgeFromPlanctlDir,
           );
+          scanner.fireBackstop("rescan-drop", "fsevents", rescued);
         });
         schedulers.push(rescan);
         watcher
@@ -2867,6 +3074,11 @@ function main(): void {
                 }
                 return;
               }
+              // fn-720: a confirmed FSEvents batch is THE fast path for plan
+              // files — stamp `last_fast_path_at` so a later heartbeat measures
+              // staleness against it (and a working watcher keeps the heartbeat
+              // a perpetual no-op rescue).
+              scanner.markFastPath();
               for (const ev of events) {
                 // The in-callback `.planctl/{epics,tasks}/*.json` filter (via
                 // classifyPlanPath, applied inside onChange) is what guarantees

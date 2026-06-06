@@ -26,6 +26,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  BackstopCounters,
+  type BackstopMessage,
+  type BackstopRecord,
+  type BackstopRollup,
+  buildMissedWakeRecord,
+} from "../src/backstop-telemetry";
 import { openDb } from "../src/db";
 import {
   matchApiError,
@@ -1183,4 +1190,101 @@ test("spawned Worker shuts down cleanly on shutdown message", async () => {
   ]);
 
   expect(result).toBe("exited");
+});
+
+// ---------------------------------------------------------------------------
+// fn-720 backstop telemetry — the emitted-boolean denominator out of
+// scanJobsForTitles + the transcript-heartbeat missed-wake record. The
+// heartbeat body lives inside the worker `main` closure, so (per the
+// emitSnapshot-delta test pattern in git-worker.test.ts) we faithfully
+// re-create it: the SAME `BackstopCounters.bump` + `buildMissedWakeRecord`
+// calls the worker makes, driven by the real `scanJobsForTitles` return value.
+// ---------------------------------------------------------------------------
+
+test("fn-720: scanJobsForTitles returns true when it emits, false on a change-gated no-op", () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  try {
+    const transcriptPath = join(tmpDir, "ret-sess.jsonl");
+    writeFileSync(transcriptPath, `${titleLine("ret-sess", "A Title")}\n`);
+    db.query(
+      "INSERT INTO jobs (job_id, created_at, updated_at, transcript_path) VALUES (?, ?, ?, ?)",
+    ).run("ret-sess", 1, 1, transcriptPath);
+
+    const stream = new TranscriptLineStream(
+      () => {},
+      () => {},
+    );
+    seedFromDb(db, stream);
+    // First scan emits the never-folded title → true (a real rescue).
+    expect(scanJobsForTitles(db, stream)).toBe(true);
+    // A re-scan over the unchanged file is change-gate-suppressed → false (a
+    // no-op fire — the denominator the git/transcript heartbeats lacked).
+    expect(scanJobsForTitles(db, stream)).toBe(false);
+  } finally {
+    db.close();
+  }
+});
+
+/** Faithful re-creation of transcript-worker's heartbeat backstop body (fn-720). */
+function stepTranscriptHeartbeat(
+  counters: BackstopCounters,
+  rescued: boolean,
+  now: number,
+  lastFastPathAt: number | null,
+): BackstopMessage[] {
+  const out: BackstopMessage[] = [];
+  counters.bump("transcript-heartbeat", "missed-wake", rescued);
+  if (rescued) {
+    out.push({
+      kind: "backstop",
+      record: buildMissedWakeRecord({
+        backstop: "transcript-heartbeat",
+        worker: "transcript-worker",
+        fastPath: "fsevents",
+        rescued: true,
+        now,
+        lastFastPathAt,
+      }),
+    });
+  }
+  return out;
+}
+
+test("fn-720 transcript-heartbeat: a mute-watcher rescue posts a missed-wake record with correct staleness", () => {
+  const counters = new BackstopCounters();
+  // The live tail's FSEvents fast path last fired at t=1000; the heartbeat at
+  // t=61000 re-folded a title the live tail missed (rescued=true).
+  const msgs = stepTranscriptHeartbeat(counters, true, 61000, 1000);
+  expect(msgs).toHaveLength(1);
+  const rec = msgs[0]?.record as BackstopRecord;
+  expect(rec).toEqual({
+    ts: 61000,
+    kind: "backstop-rescue",
+    class: "missed-wake",
+    backstop: "transcript-heartbeat",
+    worker: "transcript-worker",
+    fast_path: "fsevents",
+    rescued: true,
+    staleness_ms: 60000,
+    last_fast_path_at: 1000,
+  });
+});
+
+test("fn-720 transcript-heartbeat: a no-op heartbeat posts NO record but bumps the denominator", () => {
+  const counters = new BackstopCounters();
+  const msgs = stepTranscriptHeartbeat(counters, false, 70000, 1000);
+  expect(msgs).toHaveLength(0);
+  const rollups = counters.snapshot(70001) as BackstopRollup[];
+  expect(rollups).toHaveLength(1);
+  expect(rollups[0]?.fires_total).toBe(1);
+  expect(rollups[0]?.rescues_total).toBe(0);
+});
+
+test("fn-720 transcript-heartbeat: cold-boot heartbeat (no fast path yet) reports NULL staleness", () => {
+  const counters = new BackstopCounters();
+  const msgs = stepTranscriptHeartbeat(counters, true, 999999, null);
+  const rec = msgs[0]?.record as BackstopRecord;
+  expect(rec.staleness_ms).toBeNull();
+  expect(rec.last_fast_path_at).toBeNull();
 });
