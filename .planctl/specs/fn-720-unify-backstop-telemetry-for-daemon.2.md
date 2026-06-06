@@ -56,5 +56,5 @@ Assert db-poll/fswatcher fast-path triggers stay non-alarm.
 - [ ] No behavior change to any scan/emit result; `bun test` green for all four workers.
 
 ## Done summary
-
+Wired the four missed-wake backstops (plan/git/transcript heartbeats + FSEvents-drop rescans) to the fn-720 telemetry channel: each posts a uniform missed-wake record with staleness + rescued boolean and bumps per-(backstop,class) counters flushed as periodic/on-shutdown rollups. Threaded the emitted-boolean denominator out of git emitSnapshot / transcript scanJobsForTitles / plan reconcilePlanctlDirs, added the buildMissedWakeRecord cold-boot sentinel helper, preserved (but rate-limited) the plan ALARM, and kept db-poll/fswatcher fast-path stamps non-alarm.
 ## Evidence
