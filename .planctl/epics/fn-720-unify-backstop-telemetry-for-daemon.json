@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-720-unify-backstop-telemetry-for-daemon",
   "bundles": [],
   "closer_done_at": "2026-06-06T21:19:55.238683Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-06T21:19:55.238683Z"
+  "updated_at": "2026-06-06T21:20:22.977517Z"
 }
