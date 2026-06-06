@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Add monitor-running occupant verdict and dispatch gate",
-  "updated_at": "2026-06-05T21:41:25.012601Z"
+  "updated_at": "2026-06-06T01:12:57.776450Z",
+  "worker_done_at": "2026-06-06T01:12:57.776450Z"
 }

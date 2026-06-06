@@ -76,5 +76,5 @@ returns `null` for both verdicts (null-lock).
 - [ ] CLAUDE.md mutex-occupancy bullet revised to include the new verdicts + staleness analogue + the `verbForVerdict`-null callout
 
 ## Done summary
-
+Added monitor-running/monitor-stale occupant verdicts (predicate 6.6 + close-row twin) consuming task-1's has_live_worker_monitor fact; ANDed embeddedMonitorOccupies into the predicate-1 terminal-completed gate to fix the fn-715.2 premature collapse. Lease/TTL floor: MONITOR_STALENESS_SEC soft->monitor-stale (occupies), MONITOR_RELEASE_SEC hard ceiling->release, now-injected read-time. verbForVerdict returns null for both (running verdicts), pinned by a null-lock test; ambient-only monitors stay dispatchable.
 ## Evidence
