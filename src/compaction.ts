@@ -266,15 +266,29 @@ export function compactColdBlobs(
  * (large, legitimate) relocated count.
  *
  * A legitimately-relocated row has `events.data IS NULL` AND a matching
- * `event_blobs` row, so the COALESCE resolves non-null and it is NOT counted.
+ * `event_blobs` row WITH non-null `data`, so it fails the "absent in both"
+ * predicate and is NOT counted. The predicate is written to test nullness via
+ * headers/keys only (NOT `COALESCE`, which would materialize the full blob —
+ * see the query comment).
  */
 export function countAbsentBlobs(db: Database): number {
   const row = db
     .query(
+      // Test nullness via the hot column's header and the side table's PK +
+      // header — NEVER via `COALESCE(events.data, event_blobs.data)`. COALESCE
+      // must MATERIALIZE the first non-null argument's VALUE into a register
+      // before the outer `IS NULL` test, so on a fully-relocated DB (every
+      // `events.data IS NULL`) it reads the ENTIRE `event_blobs.data` payload —
+      // ~1.3 GB of ~12 KB overflow blobs — through random overflow I/O on EVERY
+      // heartbeat pass, pegging main and starving hook writes (the fn-717.2
+      // post-deploy peg). `col IS NULL` reads only the record-header serial
+      // type, never the overflow payload, so this form is the same logical
+      // "absent in both" predicate at header/key cost (≈0.4 s vs minutes).
       `SELECT COUNT(*) AS n
          FROM events
          LEFT JOIN event_blobs ON event_blobs.event_id = events.id
-        WHERE COALESCE(events.data, event_blobs.data) IS NULL`,
+        WHERE events.data IS NULL
+          AND (event_blobs.event_id IS NULL OR event_blobs.data IS NULL)`,
     )
     .get() as { n: number };
   return row.n;
