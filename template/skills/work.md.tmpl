@@ -60,7 +60,7 @@ The task is already claimed and the briefing is in working memory (Phase 1). The
 
 ### 2a. Spawn worker subagent
 
-Use the Task tool to invoke the `work:worker` subagent with a minimal config-only prompt. The worker's shared body lives in `apps/planctl/agent-templates/worker.md.tmpl` (rendered into `claude/work-plugins/<tier>/agents/worker.md` per tier — exactly one tier-plugin loads per session, set by keeper pre-boot). Do **not** paraphrase those phases here.
+Use the Task tool to invoke the `work:worker` subagent with a minimal config-only prompt. The worker's shared body lives in `template/agents/worker.md.tmpl` (rendered into `claude/work-plugins/<tier>/agents/worker.md` per tier — exactly one tier-plugin loads per session, set by keeper pre-boot). Do **not** paraphrase those phases here.
 
 **Tier is already chosen and loaded** (see the intro) — this skill never picks or persists one. By the time it runs, exactly one `work:worker` is in scope, pinned to its tier's model + `effort:` by the agent file. Spawn it as a bare literal, no `model=`.
 

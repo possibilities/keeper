@@ -115,12 +115,12 @@ def test_pre_hook_marked_file_emits_deny(tmp_path: Path) -> None:
     envelope = {
         "marked": True,
         "mode": "block",
-        "source_template": "/path/to/agent-templates/worker.md.tmpl",
-        "source_template_relative": "agent-templates/worker.md.tmpl",
+        "source_template": "/path/to/template/agents/worker.md.tmpl",
+        "source_template_relative": "template/agents/worker.md.tmpl",
         "regenerate_cmd": "promptctl render-plugin-templates --project-root /repo",
         "message": (
             "BLOCKED: this is a generated file. "
-            "Edit /path/to/agent-templates/worker.md.tmpl instead."
+            "Edit /path/to/template/agents/worker.md.tmpl instead."
         ),
     }
     bin_dir = _make_stub_promptctl(tmp_path, envelope)
@@ -143,10 +143,7 @@ def test_pre_hook_marked_file_emits_deny(tmp_path: Path) -> None:
     assert spec["hookEventName"] == "PreToolUse"
     assert spec["permissionDecision"] == "deny"
     assert "BLOCKED" in spec["permissionDecisionReason"]
-    assert (
-        "/path/to/agent-templates/worker.md.tmpl"
-        in spec["permissionDecisionReason"]
-    )
+    assert "/path/to/template/agents/worker.md.tmpl" in spec["permissionDecisionReason"]
 
 
 def test_pre_hook_unmarked_file_passes_silently(tmp_path: Path) -> None:
@@ -169,9 +166,7 @@ def test_pre_hook_unmarked_file_passes_silently(tmp_path: Path) -> None:
 
 def test_pre_hook_no_file_path_passes(tmp_path: Path) -> None:
     """Missing file_path → silent pass-through, no subprocess call."""
-    bin_dir = _make_stub_promptctl(
-        tmp_path, {"marked": True, "message": "irrelevant"}
-    )
+    bin_dir = _make_stub_promptctl(tmp_path, {"marked": True, "message": "irrelevant"})
     result = _run_hook(
         PRE_HOOK,
         {"tool_name": "Write", "tool_input": {}},
@@ -216,12 +211,12 @@ def test_post_hook_marked_file_emits_additional_context(tmp_path: Path) -> None:
     envelope = {
         "marked": True,
         "mode": "warn",
-        "source_template": "/repo/agent-templates/worker.md.tmpl",
-        "source_template_relative": "agent-templates/worker.md.tmpl",
+        "source_template": "/repo/template/agents/worker.md.tmpl",
+        "source_template_relative": "template/agents/worker.md.tmpl",
         "regenerate_cmd": "promptctl render-plugin-templates --project-root /repo",
         "message": (
             "Heads-up: this is a generated file. "
-            "Source: /repo/agent-templates/worker.md.tmpl."
+            "Source: /repo/template/agents/worker.md.tmpl."
         ),
     }
     bin_dir = _make_stub_promptctl(tmp_path, envelope)
@@ -242,17 +237,12 @@ def test_post_hook_marked_file_emits_additional_context(tmp_path: Path) -> None:
     spec = output["hookSpecificOutput"]
     assert spec["hookEventName"] == "PostToolUse"
     assert "Heads-up" in spec["additionalContext"]
-    assert (
-        "/repo/agent-templates/worker.md.tmpl"
-        in spec["additionalContext"]
-    )
+    assert "/repo/template/agents/worker.md.tmpl" in spec["additionalContext"]
 
 
 def test_post_hook_non_read_tool_passes(tmp_path: Path) -> None:
     """post-hook only fires on Read — anything else is a no-op."""
-    bin_dir = _make_stub_promptctl(
-        tmp_path, {"marked": True, "message": "x"}
-    )
+    bin_dir = _make_stub_promptctl(tmp_path, {"marked": True, "message": "x"})
     result = _run_hook(
         POST_HOOK,
         {

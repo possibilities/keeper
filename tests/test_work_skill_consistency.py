@@ -40,7 +40,7 @@ _MULTIWORD_PREFIXES: frozenset[str] = frozenset(
 )
 
 _TMPL_PATH: Path = (
-    Path(__file__).resolve().parents[1] / "skill-templates" / "work.md.tmpl"
+    Path(__file__).resolve().parents[1] / "template" / "skills" / "work.md.tmpl"
 )
 
 
@@ -230,7 +230,7 @@ def test_old_tier_suffixed_agent_files_removed(basename: str):
         f"agents from planctl's plugin. The fan-out now emits to "
         f"`claude/work-plugins/<tier>/agents/worker.md` via the template's "
         f"`render_to:` frontmatter. Delete this file and check that "
-        f"`apps/planctl/agent-templates/worker[-codex].md.tmpl` still carries "
+        f"`template/agents/worker[-codex].md.tmpl` still carries "
         f"the cross-boundary `render_to:` directive."
     )
 
@@ -241,7 +241,7 @@ def test_work_plugin_worker_agent_rendered_and_pinned(tier: str):
     itself `worker`, sets `model: opus`, and declares the matching effort.
 
     If this fails with "file not rendered," run `scripts/install.sh` to
-    regenerate from `apps/planctl/agent-templates/worker.md.tmpl`.
+    regenerate from `template/agents/worker.md.tmpl`.
     """
     path = _WORK_PLUGINS_DIR / tier / "agents" / "worker.md"
     assert path.exists(), f"{path} not rendered — run scripts/install.sh"
