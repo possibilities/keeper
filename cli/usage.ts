@@ -93,6 +93,7 @@ import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
 import { subscribeCollection } from "../src/readiness-client";
+import { armViewerExitTriggers } from "../src/view-shell";
 
 const COLLECTION = "usage";
 
@@ -1008,7 +1009,16 @@ export async function main(argv: string[]): Promise<void> {
     onLifecycle: emitLifecycle,
   });
 
-  process.on("SIGINT", () => {
+  // Idempotency guard: SIGINT, SIGHUP, stdin-EOF and the ppid-poll can
+  // all fire (and overlap) for one dying viewer. The tick-clear + dispose
+  // calls are individually idempotent, but the log-then-exit tail must run
+  // AT MOST ONCE so we don't double-print the banner or re-enter exit.
+  let toreDown = false;
+  const exitCleanly = (): void => {
+    if (toreDown) {
+      return;
+    }
+    toreDown = true;
     // Stop the relative-time tick FIRST so it can't fire against a
     // disposed shell (refreshLive is no-op post-dispose, but skipping
     // the rendered-rows + lines-equal work is cleaner).
@@ -1025,7 +1035,13 @@ export async function main(argv: string[]): Promise<void> {
     log(`lifecycle: ${lifecycleSidecar}`);
     log("...");
     process.exit(0);
-  });
+  };
+  // usage.ts owns its own SIGINT handler (it can't route through the
+  // shared `installSigintHandler` — see the fn-660.1 deferral header).
+  // SIGINT here, plus the parent-death / TTY-close triggers shared with
+  // every other viewer (fn-723): SIGHUP, stdin-EOF, and the ppid===1 poll.
+  process.on("SIGINT", exitCleanly);
+  armViewerExitTriggers(exitCleanly);
 }
 
 // `import.meta.main` guard neutralized — `cli/keeper.ts` is the

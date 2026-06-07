@@ -74,6 +74,112 @@ import {
  */
 export const SELECTED_LINE_PREFIX = "\u{E000}";
 
+/**
+ * Arm the full set of "my parent / TTY died → exit and close the socket"
+ * triggers for a long-lived UDS subscriber (`keeper board|jobs|git|
+ * autopilot|usage`). The load-bearing fix for the orphan-accumulation
+ * class: an alive orphan can ONLY be reaped by itself — no server probe
+ * can tell a quietly-watching live viewer from a ponging headless orphan
+ * (fn-723).
+ *
+ * `exitCleanly` is the caller's teardown tail. It MUST be idempotent —
+ * several of these triggers can fire (and overlap) for one dying viewer.
+ * It does the dispose + log + `process.exit(0)`.
+ *
+ * Triggers armed (additive to the caller's own SIGINT handler):
+ *   - `SIGHUP`: controlling process / session leader went away.
+ *   - stdin `'end'` / `'error'`: the controlling pty closed (EOF). We
+ *     `resume()` stdin so the `'end'` actually fires on pty teardown —
+ *     a paused stdin never emits EOF. Skipped on a non-TTY / piped run
+ *     (stdin there is a file/pipe whose natural EOF is NOT a death
+ *     signal and would mis-fire an immediate exit).
+ *   - a ~2s `process.ppid === 1` poll: the ONLY trigger that catches
+ *     zellij's `on_force_close "detach"`, where the pane pty stays OPEN
+ *     (no SIGHUP, no stdin EOF) but the viewer reparents to init. We
+ *     capture the launch-time ppid and only treat `ppid === 1` as death
+ *     if it WASN'T 1 at launch — a legitimately detached launch (e.g.
+ *     started under a process that's already init-owned) must not
+ *     self-exit on the first tick.
+ *
+ * Returns a `disarm()` that clears the poll interval + detaches the
+ * stdin listeners — exposed so tests can tear the triggers down without
+ * leaking a real 2s interval into the runner. Production callers never
+ * disarm (the process is exiting).
+ */
+/** The slice of `process` {@link armViewerExitTriggers} touches. */
+export type ViewerExitProc = Pick<NodeJS.Process, "on" | "ppid"> & {
+  readonly stdin: Pick<
+    NodeJS.ReadStream,
+    "on" | "removeListener" | "resume" | "isTTY"
+  >;
+};
+
+/** Test-injection knobs for {@link armViewerExitTriggers}. */
+export interface ViewerExitTriggerDeps {
+  /** Override for tests; defaults to the real `process`. */
+  readonly proc?: ViewerExitProc;
+  /** Override the poll cadence (ms) in tests. Default ~2000. */
+  readonly ppidPollMs?: number;
+  /** Override the captured launch ppid in tests. */
+  readonly initialPpid?: number;
+}
+
+export function armViewerExitTriggers(
+  exitCleanly: () => void,
+  deps: ViewerExitTriggerDeps = {},
+): { disarm: () => void } {
+  const proc = deps.proc ?? process;
+  const pollMs = deps.ppidPollMs ?? 2_000;
+  // Capture the launch-time parent. If we were ALREADY init-owned at
+  // launch, the ppid===1 poll can never distinguish "born detached"
+  // from "reparented after death" — so we disable it (set the baseline
+  // so the poll's guard never trips).
+  const initialPpid = deps.initialPpid ?? proc.ppid;
+  const ppidGuardArmed = initialPpid !== 1;
+
+  proc.on("SIGHUP", () => {
+    exitCleanly();
+  });
+
+  const stdin = proc.stdin;
+  // Only arm stdin-EOF on a real controlling TTY. A piped/non-TTY stdin
+  // hits natural EOF immediately, which is NOT a viewer-death signal.
+  if (stdin.isTTY === true) {
+    const onEnd = (): void => {
+      exitCleanly();
+    };
+    const onError = (): void => {
+      exitCleanly();
+    };
+    stdin.on("end", onEnd);
+    stdin.on("error", onError);
+    // A paused stdin never emits `'end'` — `resume()` so the pty-close
+    // EOF actually surfaces. (The live shell reads keys via its own
+    // raw-mode handle; resuming here is additive and harmless.)
+    stdin.resume();
+  }
+
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  if (ppidGuardArmed) {
+    pollTimer = setInterval(() => {
+      if (proc.ppid === 1) {
+        exitCleanly();
+      }
+    }, pollMs);
+    // Don't let the poll interval pin the event loop alive on its own.
+    (pollTimer as { unref?: () => void }).unref?.();
+  }
+
+  return {
+    disarm(): void {
+      if (pollTimer != null) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    },
+  };
+}
+
 /** Output of one render pass — the body the view wants to emit. */
 export interface ViewRender {
   /** Body lines, one per output row. Empty array yields a `---`-only frame. */
@@ -539,15 +645,25 @@ export function createViewShell<TSnap>(
     const log = (s: string): void => {
       process.stdout.write(`${s}\n`);
     };
-    process.on("SIGINT", () => {
+    // Idempotency guard: SIGINT, SIGHUP, stdin-EOF and the ppid-poll can
+    // all fire (even overlap) for a single dying viewer. `dispose()` /
+    // `stopConnectingSpinner()` are themselves idempotent, but the
+    // log-then-exit tail must run AT MOST ONCE so we don't double-print
+    // the sidecar banner or re-enter `process.exit`.
+    let toreDown = false;
+    const exitCleanly = (): void => {
+      if (toreDown) {
+        return;
+      }
+      toreDown = true;
       // Terminal restoration before subscription teardown. Also tear
       // down the connecting-spinner interval + close its readonly DB
-      // fd here so neither leaks across a Ctrl-C exit. Bun
-      // `setInterval` has no `.unref()` — an explicit `clearInterval`
-      // on every teardown path is load-bearing for a clean TUI exit,
-      // not cosmetic. Both `stopConnectingSpinner` and
-      // `refoldPoller.close()` are idempotent so the first-frame
-      // self-stop + this SIGINT path are safe to co-fire.
+      // fd here so neither leaks across an exit. Bun `setInterval` has
+      // no `.unref()` — an explicit `clearInterval` on every teardown
+      // path is load-bearing for a clean TUI exit, not cosmetic. Both
+      // `stopConnectingSpinner` and `refoldPoller.close()` are
+      // idempotent so the first-frame self-stop + these teardown paths
+      // are safe to co-fire.
       stopConnectingSpinner();
       liveShell.dispose();
       onDispose();
@@ -556,7 +672,13 @@ export function createViewShell<TSnap>(
       log(`lifecycle: ${lifecycleSidecar}`);
       log("...");
       process.exit(0);
-    });
+    };
+    // SIGINT (Ctrl-C) is this view's canonical interactive exit; the
+    // parent-death / TTY-close triggers (SIGHUP, stdin-EOF, ppid===1
+    // poll) are the fn-723 self-reap path. All route through the one
+    // idempotent `exitCleanly`.
+    process.on("SIGINT", exitCleanly);
+    armViewerExitTriggers(exitCleanly);
   }
 
   return {

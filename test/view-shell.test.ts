@@ -36,7 +36,9 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { RefoldProgressPoller } from "../src/refold-progress";
 import {
+  armViewerExitTriggers,
   createViewShell,
+  type ViewerExitProc,
   type ViewRender,
   type ViewShell,
 } from "../src/view-shell";
@@ -503,4 +505,187 @@ test("poller.close() is NOT double-called across self-stop + SIGINT", () => {
     (process as unknown as { exit: typeof process.exit }).exit = realExit;
     (process as unknown as { on: typeof process.on }).on = realOn;
   }
+});
+
+// ---------------------------------------------------------------------------
+// fn-723: viewer self-exit triggers (SIGHUP / stdin-EOF / ppid===1 poll).
+// `armViewerExitTriggers` takes an injectable `proc` so we never register
+// real process-level handlers (which would tear the runner down) and can
+// drive a faked ppid synchronously. The poll arms a real `globalThis.
+// setInterval`, captured by the per-test `intervals` monkeypatch.
+// ---------------------------------------------------------------------------
+
+interface FakeProc {
+  on: (event: string, handler: (...a: unknown[]) => void) => unknown;
+  ppid: number;
+  stdin: {
+    on: (event: string, handler: (...a: unknown[]) => void) => unknown;
+    removeListener: (event: string, handler: (...a: unknown[]) => void) => void;
+    resume: () => void;
+    isTTY?: boolean;
+  };
+  /** Fire a captured top-level handler (SIGHUP). */
+  fire: (event: string, ...args: unknown[]) => void;
+  /** Fire a captured stdin handler ('end' / 'error'). */
+  fireStdin: (event: string, ...args: unknown[]) => void;
+  resumed: boolean;
+}
+
+function makeFakeProc(opts: { ppid: number; isTTY?: boolean }): FakeProc {
+  const handlers = new Map<string, (...a: unknown[]) => void>();
+  const stdinHandlers = new Map<string, (...a: unknown[]) => void>();
+  const proc: FakeProc = {
+    ppid: opts.ppid,
+    resumed: false,
+    on(event, handler) {
+      handlers.set(event, handler);
+      return proc;
+    },
+    stdin: {
+      isTTY: opts.isTTY,
+      on(event, handler) {
+        stdinHandlers.set(event, handler);
+        return proc.stdin;
+      },
+      removeListener(event) {
+        stdinHandlers.delete(event);
+      },
+      resume() {
+        proc.resumed = true;
+      },
+    },
+    fire(event, ...args) {
+      handlers.get(event)?.(...args);
+    },
+    fireStdin(event, ...args) {
+      stdinHandlers.get(event)?.(...args);
+    },
+  };
+  return proc;
+}
+
+test("SIGHUP triggers a clean exit exactly once (idempotent tail)", () => {
+  const proc = makeFakeProc({ ppid: 4242, isTTY: true });
+  let exits = 0;
+  // Mirror the real teardown shape: an idempotent tail.
+  let toreDown = false;
+  const exitCleanly = (): void => {
+    if (toreDown) return;
+    toreDown = true;
+    exits++;
+  };
+  const { disarm } = armViewerExitTriggers(exitCleanly, {
+    proc: proc as unknown as ViewerExitProc,
+  });
+  try {
+    proc.fire("SIGHUP");
+    proc.fire("SIGHUP"); // overlapping re-fire must NOT double-exit
+    expect(exits).toBe(1);
+  } finally {
+    disarm();
+  }
+});
+
+test("stdin-EOF triggers exit on a TTY (and resumes stdin so EOF fires)", () => {
+  const proc = makeFakeProc({ ppid: 4242, isTTY: true });
+  let exits = 0;
+  const { disarm } = armViewerExitTriggers(() => exits++, {
+    proc: proc as unknown as ViewerExitProc,
+  });
+  try {
+    // A paused stdin never emits 'end'; the installer must resume it.
+    expect(proc.resumed).toBe(true);
+    proc.fireStdin("end");
+    expect(exits).toBe(1);
+  } finally {
+    disarm();
+  }
+});
+
+test("stdin-EOF is NOT armed on a non-TTY run (no mis-fire)", () => {
+  const proc = makeFakeProc({ ppid: 4242, isTTY: false });
+  let exits = 0;
+  const { disarm } = armViewerExitTriggers(() => exits++, {
+    proc: proc as unknown as ViewerExitProc,
+  });
+  try {
+    // Non-TTY: stdin neither resumed nor wired — a natural pipe EOF must
+    // not be treated as viewer death.
+    expect(proc.resumed).toBe(false);
+    proc.fireStdin("end");
+    expect(exits).toBe(0);
+  } finally {
+    disarm();
+  }
+});
+
+test("ppid===1 poll triggers exit when the viewer reparents to init", () => {
+  const proc = makeFakeProc({ ppid: 4242, isTTY: true });
+  let exits = 0;
+  const { disarm } = armViewerExitTriggers(() => exits++, {
+    proc: proc as unknown as ViewerExitProc,
+    ppidPollMs: 2000,
+  });
+  try {
+    // The poll arms via the captured global setInterval. The last-armed
+    // interval is the ppid poll.
+    expect(intervals.callbacks.length).toBeGreaterThanOrEqual(1);
+    expect(intervals.delays[intervals.delays.length - 1]).toBe(2000);
+
+    // Still parented to a live shell → tick is a no-op.
+    intervals.tick();
+    expect(exits).toBe(0);
+
+    // Parent dies → reparent to init → next tick self-exits.
+    proc.ppid = 1;
+    intervals.tick();
+    expect(exits).toBe(1);
+  } finally {
+    disarm();
+  }
+});
+
+test("a live, attached viewer (ppid!=1, TTY) does NOT exit on a poll tick", () => {
+  const proc = makeFakeProc({ ppid: 4242, isTTY: true });
+  let exits = 0;
+  const { disarm } = armViewerExitTriggers(() => exits++, {
+    proc: proc as unknown as ViewerExitProc,
+  });
+  try {
+    intervals.tick();
+    intervals.tick();
+    expect(exits).toBe(0);
+  } finally {
+    disarm();
+  }
+});
+
+test("launch-time ppid===1 guard disables the poll (no false-exit on detached launch)", () => {
+  // A legitimately detached launch is born init-owned. The ppid poll can't
+  // tell that apart from a post-death reparent, so it must be disabled.
+  const proc = makeFakeProc({ ppid: 1, isTTY: true });
+  let exits = 0;
+  const armedBefore = intervals.callbacks.length;
+  const { disarm } = armViewerExitTriggers(() => exits++, {
+    proc: proc as unknown as ViewerExitProc,
+  });
+  try {
+    // No new poll interval armed (SIGHUP + stdin still wired).
+    expect(intervals.callbacks.length).toBe(armedBefore);
+    // SIGHUP still works — only the ppid poll is suppressed.
+    proc.fire("SIGHUP");
+    expect(exits).toBe(1);
+  } finally {
+    disarm();
+  }
+});
+
+test("disarm() clears the ppid poll interval", () => {
+  const proc = makeFakeProc({ ppid: 4242, isTTY: true });
+  const clearedBefore = intervals.cleared.length;
+  const { disarm } = armViewerExitTriggers(() => {}, {
+    proc: proc as unknown as ViewerExitProc,
+  });
+  disarm();
+  expect(intervals.cleared.length).toBe(clearedBefore + 1);
 });
