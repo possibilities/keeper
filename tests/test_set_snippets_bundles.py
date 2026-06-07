@@ -11,6 +11,12 @@ regex rejects path-traversal / bad shapes; envelope shape (planctl_invocation
 present); VALIDATION_CLEAR side-effect (last_validated_at cleared). `show`
 JSON + human output includes the new fields when set, omits the human row
 when empty.
+
+The world is built by ``seed_state`` (git-free, CLI-free) so each test runs in
+sub-millisecond setup; the verb under test stays REAL (driven via ``run_cli``)
+so the test still proves the production code path. ``isolated_roots`` keeps the
+verb's ``restamp_epic_or_fail`` -> ``discover_projects()`` from scanning
+``~/code``; ``fixed_clock`` pins the marker-restamp timestamp.
 """
 
 from __future__ import annotations
@@ -18,46 +24,26 @@ from __future__ import annotations
 import json
 import os
 
-from click.testing import CliRunner  # type: ignore[import-untyped]
-from planctl.cli import cli
+import pytest
 
-from .conftest import run_cli
+from .conftest import run_cli, seed_state
 
 _ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-set-snippets-bundles-fixture"}
 
-
-def _create_project(tmp_path, monkeypatch):
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-set-snippets-bundles-fixture")
-    monkeypatch.chdir(tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
-    assert result.exit_code == 0, result.output
-    return tmp_path
+# The frozen value ``fixed_clock`` pins ``now_iso()`` to. Marker-restamp
+# assertions compare against this exact string (deterministic), and against the
+# pre-stamped sentinel below to prove the restamp fired.
+_FROZEN = "2026-06-06T00:00:00.000000Z"
+_STALE_MARKER = "2020-01-01T00:00:00Z"
 
 
-def _create_epic(project_path) -> str:
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        ["epic", "create", "--title", "Snippet metadata test epic"],
-        env=_ENV,
-    )
-    assert result.exit_code == 0, result.output
-    epic_id = json.loads(result.output.strip())["epic"]["id"]
+def _seed(tmp_path, *, n_tasks: int = 1):
+    """Build a one-epic tree via ``seed_state`` and return ``(epic_id, task_ids)``.
 
-    # Null multi-repo fields so the test dir (no .git/) does not trip validate.
-    epic_path = project_path / ".planctl" / "epics" / f"{epic_id}.json"
-    data = json.loads(epic_path.read_text())
-    data["primary_repo"] = None
-    data["touched_repos"] = None
-    epic_path.write_text(json.dumps(data))
-    return epic_id
-
-
-def _create_task(project_path, epic_id) -> str:
-    from .conftest import add_task
-
-    return add_task(project_path, epic_id, title="Snippet test task", env=_ENV)
+    The verb under test is driven separately via ``run_cli`` against this tree;
+    ``seed_state`` only stands up the world (no ``git init``, no CliRunner).
+    """
+    return seed_state(tmp_path, epic_id="fn-1-snippet-metadata", n_tasks=n_tasks)
 
 
 def _run(args: list[str], cwd: str):
@@ -76,7 +62,7 @@ def _read_epic_json(project_path, epic_id) -> dict:
     )
 
 
-def _stamp_marker(project_path, epic_id, ts="2020-01-01T00:00:00Z") -> None:
+def _stamp_marker(project_path, epic_id, ts=_STALE_MARKER) -> None:
     epic_path = project_path / ".planctl" / "epics" / f"{epic_id}.json"
     data = json.loads(epic_path.read_text())
     data["last_validated_at"] = ts
@@ -117,23 +103,45 @@ def _invocation(result) -> dict | None:
     return None
 
 
+# Every test drives the real re-stamping verb, whose
+# ``restamp_epic_or_fail`` -> ``discover_projects()`` would otherwise scan the
+# machine's ``~/code`` tree. ``isolated_roots`` stubs that to ``[]``.
+pytestmark = pytest.mark.usefixtures("isolated_roots")
+
+
+@pytest.fixture(autouse=True)
+def _no_dirty_git_scan(monkeypatch):
+    """Stub the ``git status`` spawn inside the verb's invocation-build.
+
+    ``output.emit()`` -> ``build_planctl_invocation()`` shells ``git status``
+    via ``_dirty_planctl_paths`` to compute the envelope's ``files`` list. The
+    ``seed_state`` tree carries no ``.git/`` (no ``git init`` here, by design),
+    so that subprocess returns nothing useful yet still costs a process spawn
+    per mutating verb call — the dominant residual cost once the heavy CLI
+    ``scaffold`` setup is gone. ``_mock_autocommit`` (conftest, autouse)
+    already no-ops the commit subprocess, so the computed ``files`` list is
+    unused; stubbing it to empty keeps the verb's CORE logic (normalize,
+    write, marker-restamp, integrity check) fully real while dropping the
+    last git spawn. No test here asserts on the envelope's ``files`` field.
+    """
+    monkeypatch.setattr("planctl.invocation._dirty_planctl_paths", lambda _root: set())
+
+
 # ---------------------------------------------------------------------------
 # task set-snippets
 # ---------------------------------------------------------------------------
 
 
-def test_task_set_snippets_success(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
+def test_task_set_snippets_success(tmp_path):
+    epic_id, (task_id,) = _seed(tmp_path)
 
     result = _run(
         ["task", "set-snippets", task_id, "--snippets", "api-py-pattern,boundary-lint"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
 
-    task_data = _read_task_json(project_path, task_id)
+    task_data = _read_task_json(tmp_path, task_id)
     assert task_data["snippets"] == ["api-py-pattern", "boundary-lint"]
 
     env = _envelope(result)
@@ -141,78 +149,67 @@ def test_task_set_snippets_success(tmp_path, monkeypatch):
     assert env["task_id"] == task_id
 
 
-def test_task_set_snippets_empty_clears(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
+def test_task_set_snippets_empty_clears(tmp_path):
+    epic_id, (task_id,) = _seed(tmp_path)
 
     _run(
         ["task", "set-snippets", task_id, "--snippets", "a,b,c"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     result = _run(
         ["task", "set-snippets", task_id, "--snippets", ""],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert _read_task_json(project_path, task_id)["snippets"] == []
+    assert _read_task_json(tmp_path, task_id)["snippets"] == []
 
     # Omitting --snippets entirely also clears (default="").
-    _run(["task", "set-snippets", task_id, "--snippets", "x"], cwd=str(project_path))
-    result2 = _run(["task", "set-snippets", task_id], cwd=str(project_path))
+    _run(["task", "set-snippets", task_id, "--snippets", "x"], cwd=str(tmp_path))
+    result2 = _run(["task", "set-snippets", task_id], cwd=str(tmp_path))
     assert result2.returncode == 0, f"{result2.stdout}\n{result2.stderr}"
-    assert _read_task_json(project_path, task_id)["snippets"] == []
+    assert _read_task_json(tmp_path, task_id)["snippets"] == []
 
 
-def test_task_set_snippets_replaces_not_appends(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
+def test_task_set_snippets_replaces_not_appends(tmp_path):
+    epic_id, (task_id,) = _seed(tmp_path)
 
-    _run(["task", "set-snippets", task_id, "--snippets", "a,b"], cwd=str(project_path))
-    _run(["task", "set-snippets", task_id, "--snippets", "c"], cwd=str(project_path))
-    assert _read_task_json(project_path, task_id)["snippets"] == ["c"]
+    _run(["task", "set-snippets", task_id, "--snippets", "a,b"], cwd=str(tmp_path))
+    _run(["task", "set-snippets", task_id, "--snippets", "c"], cwd=str(tmp_path))
+    assert _read_task_json(tmp_path, task_id)["snippets"] == ["c"]
 
 
-def test_task_set_snippets_rejects_bad_id(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
+def test_task_set_snippets_rejects_bad_id(tmp_path):
+    epic_id, (task_id,) = _seed(tmp_path)
 
     # Uppercase / path-traversal-ish / empty segments are rejected.
     for bad in ["Bad-Id", "../etc", "a/b", "a--b", "-lead", "trail-"]:
         result = _run(
             ["task", "set-snippets", task_id, "--snippets", bad],
-            cwd=str(project_path),
+            cwd=str(tmp_path),
         )
         assert result.returncode != 0, f"Expected reject for {bad!r}: {result.stdout}"
     # The list was never written (key absent on a never-set task → []).
-    assert _read_task_json(project_path, task_id).get("snippets", []) == []
+    assert _read_task_json(tmp_path, task_id).get("snippets", []) == []
 
 
-def test_task_set_snippets_restamps_epic_marker(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
-    _stamp_marker(project_path, epic_id)
+def test_task_set_snippets_restamps_epic_marker(tmp_path, fixed_clock):
+    epic_id, (task_id,) = _seed(tmp_path)
+    _stamp_marker(tmp_path, epic_id)
 
     result = _run(
         ["task", "set-snippets", task_id, "--snippets", "x"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    _marker = _read_epic_json(project_path, epic_id)["last_validated_at"]
-    assert isinstance(_marker, str) and _marker > "2020-01-01T00:00:00Z", _marker
+    assert _read_epic_json(tmp_path, epic_id)["last_validated_at"] == fixed_clock
 
 
-def test_task_set_snippets_emits_invocation(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
+def test_task_set_snippets_emits_invocation(tmp_path):
+    epic_id, (task_id,) = _seed(tmp_path)
 
     result = _run(
         ["task", "set-snippets", task_id, "--snippets", "x"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0
     inv = _invocation(result)
@@ -226,16 +223,14 @@ def test_task_set_snippets_emits_invocation(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_task_set_bundles_success(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
+def test_task_set_bundles_success(tmp_path):
+    epic_id, (task_id,) = _seed(tmp_path)
 
     # fn-610: ``sketch/`` refs now resolve at write time and inline their
     # snippet ids into the persisted ``snippets``; the ref is dropped from
-    # ``bundles``. Test only the ``bundle/`` + ``arc/`` passthrough here;
-    # the sketch-inlining happy path lives in
-    # ``test_cross_project_sketch_inline.py``.
+    # ``bundles``. Test only the ``bundle/`` + ``arc/`` passthrough here (which
+    # hit the sketch-free fast path and need no ``mock_sketch_refs``); the
+    # sketch-inlining happy path lives in ``test_cross_project_sketch_inline.py``.
     result = _run(
         [
             "task",
@@ -244,52 +239,46 @@ def test_task_set_bundles_success(tmp_path, monkeypatch):
             "--bundles",
             "bundle/dev-env,arc/snippeting/main",
         ],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert _read_task_json(project_path, task_id)["bundles"] == [
+    assert _read_task_json(tmp_path, task_id)["bundles"] == [
         "bundle/dev-env",
         "arc/snippeting/main",
     ]
 
 
-def test_task_set_bundles_empty_clears(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
+def test_task_set_bundles_empty_clears(tmp_path):
+    epic_id, (task_id,) = _seed(tmp_path)
 
     _run(
         ["task", "set-bundles", task_id, "--bundles", "bundle/dev-env"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     result = _run(
         ["task", "set-bundles", task_id, "--bundles", ""],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert _read_task_json(project_path, task_id)["bundles"] == []
+    assert _read_task_json(tmp_path, task_id)["bundles"] == []
 
 
-def test_task_set_bundles_replaces_not_appends(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
+def test_task_set_bundles_replaces_not_appends(tmp_path):
+    epic_id, (task_id,) = _seed(tmp_path)
 
     _run(
         ["task", "set-bundles", task_id, "--bundles", "bundle/a,bundle/b"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     _run(
         ["task", "set-bundles", task_id, "--bundles", "arc/x/y"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
-    assert _read_task_json(project_path, task_id)["bundles"] == ["arc/x/y"]
+    assert _read_task_json(tmp_path, task_id)["bundles"] == ["arc/x/y"]
 
 
-def test_task_set_bundles_rejects_path_traversal(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
+def test_task_set_bundles_rejects_path_traversal(tmp_path):
+    epic_id, (task_id,) = _seed(tmp_path)
 
     for bad in [
         "arc/foo/../etc",
@@ -302,25 +291,22 @@ def test_task_set_bundles_rejects_path_traversal(tmp_path, monkeypatch):
     ]:
         result = _run(
             ["task", "set-bundles", task_id, "--bundles", bad],
-            cwd=str(project_path),
+            cwd=str(tmp_path),
         )
         assert result.returncode != 0, f"Expected reject for {bad!r}: {result.stdout}"
-    assert _read_task_json(project_path, task_id).get("bundles", []) == []
+    assert _read_task_json(tmp_path, task_id).get("bundles", []) == []
 
 
-def test_task_set_bundles_restamps_epic_marker(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
-    _stamp_marker(project_path, epic_id)
+def test_task_set_bundles_restamps_epic_marker(tmp_path, fixed_clock):
+    epic_id, (task_id,) = _seed(tmp_path)
+    _stamp_marker(tmp_path, epic_id)
 
     result = _run(
         ["task", "set-bundles", task_id, "--bundles", "bundle/dev-env"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    _marker = _read_epic_json(project_path, epic_id)["last_validated_at"]
-    assert isinstance(_marker, str) and _marker > "2020-01-01T00:00:00Z", _marker
+    assert _read_epic_json(tmp_path, epic_id)["last_validated_at"] == fixed_clock
 
 
 # ---------------------------------------------------------------------------
@@ -328,77 +314,66 @@ def test_task_set_bundles_restamps_epic_marker(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_epic_set_snippets_success_and_marker(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    _stamp_marker(project_path, epic_id)
+def test_epic_set_snippets_success_and_marker(tmp_path, fixed_clock):
+    epic_id, _ = _seed(tmp_path)
+    _stamp_marker(tmp_path, epic_id)
 
     result = _run(
         ["epic", "set-snippets", epic_id, "--snippets", "a-one,b-two"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    epic_data = _read_epic_json(project_path, epic_id)
+    epic_data = _read_epic_json(tmp_path, epic_id)
     assert epic_data["snippets"] == ["a-one", "b-two"]
-    assert (
-        isinstance(epic_data["last_validated_at"], str)
-        and epic_data["last_validated_at"] > "2020-01-01T00:00:00Z"
-    ), epic_data["last_validated_at"]
+    assert epic_data["last_validated_at"] == fixed_clock
 
     env = _envelope(result)
     assert env["snippets"] == ["a-one", "b-two"]
 
 
-def test_epic_set_snippets_empty_clears(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
+def test_epic_set_snippets_empty_clears(tmp_path):
+    epic_id, _ = _seed(tmp_path)
 
-    _run(["epic", "set-snippets", epic_id, "--snippets", "x,y"], cwd=str(project_path))
+    _run(["epic", "set-snippets", epic_id, "--snippets", "x,y"], cwd=str(tmp_path))
     result = _run(
         ["epic", "set-snippets", epic_id, "--snippets", ""],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert _read_epic_json(project_path, epic_id)["snippets"] == []
+    assert _read_epic_json(tmp_path, epic_id)["snippets"] == []
 
 
-def test_epic_set_bundles_success_and_marker(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    _stamp_marker(project_path, epic_id)
+def test_epic_set_bundles_success_and_marker(tmp_path, fixed_clock):
+    epic_id, _ = _seed(tmp_path)
+    _stamp_marker(tmp_path, epic_id)
 
     result = _run(
         ["epic", "set-bundles", epic_id, "--bundles", "arc/snippeting/main"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    epic_data = _read_epic_json(project_path, epic_id)
+    epic_data = _read_epic_json(tmp_path, epic_id)
     assert epic_data["bundles"] == ["arc/snippeting/main"]
-    assert (
-        isinstance(epic_data["last_validated_at"], str)
-        and epic_data["last_validated_at"] > "2020-01-01T00:00:00Z"
-    ), epic_data["last_validated_at"]
+    assert epic_data["last_validated_at"] == fixed_clock
 
 
-def test_epic_set_bundles_rejects_path_traversal(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
+def test_epic_set_bundles_rejects_path_traversal(tmp_path):
+    epic_id, _ = _seed(tmp_path)
 
     result = _run(
         ["epic", "set-bundles", epic_id, "--bundles", "arc/foo/../etc"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode != 0, f"Expected reject: {result.stdout}"
-    assert _read_epic_json(project_path, epic_id).get("bundles", []) == []
+    assert _read_epic_json(tmp_path, epic_id).get("bundles", []) == []
 
 
-def test_epic_set_bundles_emits_invocation(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
+def test_epic_set_bundles_emits_invocation(tmp_path):
+    epic_id, _ = _seed(tmp_path)
 
     result = _run(
         ["epic", "set-bundles", epic_id, "--bundles", "bundle/dev-env"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0
     inv = _invocation(result)
@@ -412,22 +387,20 @@ def test_epic_set_bundles_emits_invocation(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_show_task_surfaces_snippets_bundles(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
+def test_show_task_surfaces_snippets_bundles(tmp_path):
+    epic_id, (task_id,) = _seed(tmp_path)
 
     _run(
         ["task", "set-snippets", task_id, "--snippets", "snip-one"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     _run(
         ["task", "set-bundles", task_id, "--bundles", "bundle/dev-env"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
 
     # JSON (pretty-printed doc + trailing invocation doc).
-    result = _run(["show", task_id], cwd=str(project_path))
+    result = _run(["show", task_id], cwd=str(tmp_path))
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     payload = _parse_json_stream(result.stdout)[0]
     assert payload["task"]["snippets"] == ["snip-one"]
@@ -436,47 +409,44 @@ def test_show_task_surfaces_snippets_bundles(tmp_path, monkeypatch):
     # Human.
     human = _run(
         ["show", task_id, "--format", "human"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert human.returncode == 0, f"{human.stdout}\n{human.stderr}"
     assert "Snippets: snip-one" in human.stdout
     assert "Bundles: bundle/dev-env" in human.stdout
 
 
-def test_show_task_omits_human_rows_when_empty(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
-    task_id = _create_task(project_path, epic_id)
+def test_show_task_omits_human_rows_when_empty(tmp_path):
+    epic_id, (task_id,) = _seed(tmp_path)
 
     human = _run(
         ["show", task_id, "--format", "human"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert human.returncode == 0, f"{human.stdout}\n{human.stderr}"
     assert "Snippets:" not in human.stdout
     assert "Bundles:" not in human.stdout
 
     # JSON still carries the empty lists.
-    result = _run(["show", task_id], cwd=str(project_path))
+    result = _run(["show", task_id], cwd=str(tmp_path))
     payload = _parse_json_stream(result.stdout)[0]
     assert payload["task"]["snippets"] == []
     assert payload["task"]["bundles"] == []
 
 
-def test_show_epic_surfaces_snippets_bundles(tmp_path, monkeypatch):
-    project_path = _create_project(tmp_path, monkeypatch)
-    epic_id = _create_epic(project_path)
+def test_show_epic_surfaces_snippets_bundles(tmp_path):
+    epic_id, _ = _seed(tmp_path)
 
     _run(
         ["epic", "set-snippets", epic_id, "--snippets", "epic-snip"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     _run(
         ["epic", "set-bundles", epic_id, "--bundles", "arc/snippeting/main"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
 
-    result = _run(["show", epic_id], cwd=str(project_path))
+    result = _run(["show", epic_id], cwd=str(tmp_path))
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     payload = _parse_json_stream(result.stdout)[0]
     assert payload["epic"]["snippets"] == ["epic-snip"]
@@ -484,7 +454,7 @@ def test_show_epic_surfaces_snippets_bundles(tmp_path, monkeypatch):
 
     human = _run(
         ["show", epic_id, "--format", "human"],
-        cwd=str(project_path),
+        cwd=str(tmp_path),
     )
     assert human.returncode == 0, f"{human.stdout}\n{human.stderr}"
     assert "Snippets: epic-snip" in human.stdout
