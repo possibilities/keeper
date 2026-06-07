@@ -30,10 +30,6 @@ from .conftest import run_cli, seed_state
 
 _ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-set-snippets-bundles-fixture"}
 
-# The frozen value ``fixed_clock`` pins ``now_iso()`` to. Marker-restamp
-# assertions compare against this exact string (deterministic), and against the
-# pre-stamped sentinel below to prove the restamp fired.
-_FROZEN = "2026-06-06T00:00:00.000000Z"
 _STALE_MARKER = "2020-01-01T00:00:00Z"
 
 
@@ -110,7 +106,7 @@ pytestmark = pytest.mark.usefixtures("isolated_roots")
 
 
 @pytest.fixture(autouse=True)
-def _no_dirty_git_scan(monkeypatch):
+def no_dirty_git_scan(monkeypatch):
     """Stub the ``git status`` spawn inside the verb's invocation-build.
 
     ``output.emit()`` -> ``build_planctl_invocation()`` shells ``git status``
@@ -124,7 +120,7 @@ def _no_dirty_git_scan(monkeypatch):
     write, marker-restamp, integrity check) fully real while dropping the
     last git spawn. No test here asserts on the envelope's ``files`` field.
     """
-    monkeypatch.setattr("planctl.invocation._dirty_planctl_paths", lambda _root: set())
+    monkeypatch.setattr("planctl.invocation._dirty_planctl_paths", lambda _: set())
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +129,7 @@ def _no_dirty_git_scan(monkeypatch):
 
 
 def test_task_set_snippets_success(tmp_path):
-    epic_id, (task_id,) = _seed(tmp_path)
+    _, (task_id,) = _seed(tmp_path)
 
     result = _run(
         ["task", "set-snippets", task_id, "--snippets", "api-py-pattern,boundary-lint"],
@@ -150,7 +146,7 @@ def test_task_set_snippets_success(tmp_path):
 
 
 def test_task_set_snippets_empty_clears(tmp_path):
-    epic_id, (task_id,) = _seed(tmp_path)
+    _, (task_id,) = _seed(tmp_path)
 
     _run(
         ["task", "set-snippets", task_id, "--snippets", "a,b,c"],
@@ -171,7 +167,7 @@ def test_task_set_snippets_empty_clears(tmp_path):
 
 
 def test_task_set_snippets_replaces_not_appends(tmp_path):
-    epic_id, (task_id,) = _seed(tmp_path)
+    _, (task_id,) = _seed(tmp_path)
 
     _run(["task", "set-snippets", task_id, "--snippets", "a,b"], cwd=str(tmp_path))
     _run(["task", "set-snippets", task_id, "--snippets", "c"], cwd=str(tmp_path))
@@ -179,7 +175,7 @@ def test_task_set_snippets_replaces_not_appends(tmp_path):
 
 
 def test_task_set_snippets_rejects_bad_id(tmp_path):
-    epic_id, (task_id,) = _seed(tmp_path)
+    _, (task_id,) = _seed(tmp_path)
 
     # Uppercase / path-traversal-ish / empty segments are rejected.
     for bad in ["Bad-Id", "../etc", "a/b", "a--b", "-lead", "trail-"]:
@@ -205,7 +201,7 @@ def test_task_set_snippets_restamps_epic_marker(tmp_path, fixed_clock):
 
 
 def test_task_set_snippets_emits_invocation(tmp_path):
-    epic_id, (task_id,) = _seed(tmp_path)
+    _, (task_id,) = _seed(tmp_path)
 
     result = _run(
         ["task", "set-snippets", task_id, "--snippets", "x"],
@@ -224,7 +220,7 @@ def test_task_set_snippets_emits_invocation(tmp_path):
 
 
 def test_task_set_bundles_success(tmp_path):
-    epic_id, (task_id,) = _seed(tmp_path)
+    _, (task_id,) = _seed(tmp_path)
 
     # fn-610: ``sketch/`` refs now resolve at write time and inline their
     # snippet ids into the persisted ``snippets``; the ref is dropped from
@@ -249,7 +245,7 @@ def test_task_set_bundles_success(tmp_path):
 
 
 def test_task_set_bundles_empty_clears(tmp_path):
-    epic_id, (task_id,) = _seed(tmp_path)
+    _, (task_id,) = _seed(tmp_path)
 
     _run(
         ["task", "set-bundles", task_id, "--bundles", "bundle/dev-env"],
@@ -264,7 +260,7 @@ def test_task_set_bundles_empty_clears(tmp_path):
 
 
 def test_task_set_bundles_replaces_not_appends(tmp_path):
-    epic_id, (task_id,) = _seed(tmp_path)
+    _, (task_id,) = _seed(tmp_path)
 
     _run(
         ["task", "set-bundles", task_id, "--bundles", "bundle/a,bundle/b"],
@@ -278,7 +274,7 @@ def test_task_set_bundles_replaces_not_appends(tmp_path):
 
 
 def test_task_set_bundles_rejects_path_traversal(tmp_path):
-    epic_id, (task_id,) = _seed(tmp_path)
+    _, (task_id,) = _seed(tmp_path)
 
     for bad in [
         "arc/foo/../etc",
@@ -388,7 +384,7 @@ def test_epic_set_bundles_emits_invocation(tmp_path):
 
 
 def test_show_task_surfaces_snippets_bundles(tmp_path):
-    epic_id, (task_id,) = _seed(tmp_path)
+    _, (task_id,) = _seed(tmp_path)
 
     _run(
         ["task", "set-snippets", task_id, "--snippets", "snip-one"],
@@ -417,7 +413,7 @@ def test_show_task_surfaces_snippets_bundles(tmp_path):
 
 
 def test_show_task_omits_human_rows_when_empty(tmp_path):
-    epic_id, (task_id,) = _seed(tmp_path)
+    _, (task_id,) = _seed(tmp_path)
 
     human = _run(
         ["show", task_id, "--format", "human"],
