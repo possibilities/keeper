@@ -77,5 +77,5 @@ auto-commit.
 - [ ] pytest green incl. new sidecar + merge + concurrent-writer cases.
 
 ## Done summary
-
+Moved planctl approval off the tracked def files into gitignored runtime sidecars: approve RMW-writes the task sidecar under lock_task (preserving a concurrent status write) and writes a new epic sidecar, reclassified runtime-state-only (no auto-commit). The pending-default and sidecar>def>pending ladder now live only in merge_task_state/merge_epic_state; normalize_* no longer defaults approval; load_epic merges the epic sidecar and the epic gate reads merged approval.
 ## Evidence

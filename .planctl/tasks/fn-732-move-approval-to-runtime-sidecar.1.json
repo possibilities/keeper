@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "planctl approval write+read moves to sidecar",
-  "updated_at": "2026-06-07T21:41:16.435863Z"
+  "updated_at": "2026-06-07T22:08:13.994520Z",
+  "worker_done_at": "2026-06-07T22:08:13.994520Z"
 }
