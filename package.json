@@ -11,9 +11,10 @@
     "dev": "exec bun --watch run src/daemon.ts",
     "lint": "biome check --no-errors-on-unmatched cli src test",
     "typecheck": "tsc --noEmit",
-    "test:isolated": "bun test --isolate --path-ignore-patterns='test/ansi-to-styled.test.ts' --path-ignore-patterns='test/live-shell.test.ts'",
+    "test:fast": "bun test --parallel --timeout=30000 --path-ignore-patterns='test/ansi-to-styled.test.ts' --path-ignore-patterns='test/live-shell.test.ts' --path-ignore-patterns='test/integration.test.ts' --path-ignore-patterns='test/daemon.test.ts' --path-ignore-patterns='test/plan-worker.test.ts'",
+    "test:slow": "bun test test/integration.test.ts test/daemon.test.ts test/plan-worker.test.ts",
     "test:opentui": "bun test test/ansi-to-styled.test.ts test/live-shell.test.ts",
-    "test": "bun run test:isolated && bun run test:opentui"
+    "test": "bun run test:fast && bun run test:slow && bun run test:opentui"
   },
   "devDependencies": {
     "@biomejs/biome": "2.2.0",
