@@ -135,31 +135,36 @@ most important thing (highest severity / the dup-approve or daemon-down classes
 first), then a short list of the rest. Keep it collaborative and short.
 
 You write a follow-up prompt file per PAGED finding FIRST (next section) so the
-artifact exists before you name its path here. Both surfaces append that path —
-`~/.local/state/keeper-watch/followups/latest.md` — so the human can pick the
-file up and hand it to a fresh agent (`claude < followups/latest.md`).
+artifact exists before you name its path here. Both surfaces name the LEAD
+finding's UNIQUE per-finding file — the immutable `<sanitized-key>-<ts>-<sha1>.md`
+you just wrote (substitute its actual name) — NEVER `latest.md`. `latest.md` is
+overwritten by the next tick's lead, so a notification that named it would point
+at the WRONG brief by the time you open it; the unique file never moves. (`latest.md`
+still exists as a convenience for grabbing the most recent at the host — it is just
+not what an alert points at.)
 
 Desktop + phone (notifyctl):
 ```
-notifyctl show-message -t "keeper: <lead headline>" -m "<concise body> → prompt ready: ~/.local/state/keeper-watch/followups/latest.md" --sound <by-severity>
+notifyctl show-message -t "keeper: <lead headline>" -m "<concise body> → prompt: ~/.local/state/keeper-watch/followups/<lead unique filename>" --sound <by-severity>
 ```
 Pick `--sound` by the top severity: critical → a prominent sound (e.g. `Sosumi`),
 warning → a softer one (e.g. `Funk`), info-only → omit `--sound` or use `Pop`.
 
 Telegram (botctl):
 ```
-botctl send-message --topic Chat "keeper babysitter: <same lead>, plus <n> more → prompt ready: ~/.local/state/keeper-watch/followups/latest.md"
+botctl send-message --topic Chat "keeper babysitter: <same lead>, plus <n> more → prompt: ~/.local/state/keeper-watch/followups/<lead unique filename>"
 ```
 
 Phrase it as an invitation to collaborate on a fix ("noticed dup-approve on
 fn-728-….2 across 3 sessions — prompt ready at the path below"), not a raw alarm.
-Do not dump the full JSON; summarize. The `latest.md` path always names the
-self-contained brief, so the human never has to reconstruct context by hand.
+Do not dump the full JSON; summarize. Naming the unique per-finding file (never
+`latest.md`) means the brief the human opens always matches the alert, even hours
+later, so they never reconstruct context by hand.
 
 ## Write follow-up prompt file — one self-contained brief per PAGED finding
 
-Run this step BEFORE the notify commands above (so `latest.md` exists when you
-name its path) and ONLY for the findings you actually PAGE about — the same
+Run this step BEFORE the notify commands above (so each per-finding file exists
+when you name its path) and ONLY for the findings you actually PAGE about — the same
 subset you're escalating in the Notify step, NOT the full ack set. A merited
 approval is acked-but-not-paged, so it gets NO follow-up file. If you page about
 nothing this tick (e.g. the only findings were merited approvals), skip this
